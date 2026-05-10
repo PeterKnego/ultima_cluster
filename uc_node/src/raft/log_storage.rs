@@ -135,14 +135,30 @@ fn map_journal_write_logs(e: ultima_journal::JournalError) -> StorageError<NodeI
     StorageIOError::write_logs(&e).into()
 }
 
+fn map_journal_read_logs(e: ultima_journal::JournalError) -> StorageError<NodeId> {
+    StorageIOError::read_logs(&e).into()
+}
+
 impl RaftLogReader<TypeConfig> for JournalLogStorage {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,
         range: RB,
     ) -> Result<Vec<openraft::Entry<TypeConfig>>, StorageError<NodeId>> {
-        // Implemented in Task 10.
-        let _ = range;
-        unimplemented!("Task 10")
+        let iter = self.journal.iter_range(range).map_err(map_journal_read_logs)?;
+        let mut entries = Vec::new();
+        for record in iter {
+            let (_seq, _meta, payload) = record.map_err(map_journal_read_logs)?;
+            let (entry, _) = bincode::serde::decode_from_slice::<openraft::Entry<TypeConfig>, _>(
+                &payload,
+                bincode::config::standard(),
+            )
+            .map_err(|e| {
+                let io_err = std::io::Error::other(e.to_string());
+                StorageIOError::<NodeId>::read_logs(&io_err)
+            })?;
+            entries.push(entry);
+        }
+        Ok(entries)
     }
 }
 
@@ -150,8 +166,39 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
-        // Implemented in Task 10.
-        unimplemented!("Task 10")
+        let last_seq = self.journal.last_seq();
+        let last_purged_log_id = self.last_purged.load().map_err(map_sv_read_logs)?;
+
+        let last_log_id = if let Some(seq) = last_seq {
+            let rec = self
+                .journal
+                .read(seq)
+                .map_err(map_journal_read_logs)?
+                .ok_or_else(|| {
+                    let io_err = std::io::Error::other(format!(
+                        "missing last record at seq {seq}"
+                    ));
+                    StorageIOError::<NodeId>::read_logs(&io_err)
+                })?;
+            let (term, _payload) = rec;
+            // CommittedLeaderId<NID> is LeaderId<NID> = { term, node_id }; node_id is
+            // recorded in the entry payload (bincode-encoded), but the fast-path
+            // log-state lookup only needs term + index. Use 0 as the node-id
+            // placeholder — openraft uses get_log_state purely for term/index
+            // comparisons during election bootstrap.
+            Some(openraft::LogId::new(
+                openraft::CommittedLeaderId::new(term, 0),
+                seq,
+            ))
+        } else {
+            // Empty journal: last_log_id falls back to last_purged (or None).
+            last_purged_log_id
+        };
+
+        Ok(LogState {
+            last_purged_log_id,
+            last_log_id,
+        })
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -217,26 +264,75 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
     where
         I: IntoIterator<Item = openraft::Entry<TypeConfig>> + OptionalSend,
     {
-        // Implemented in Task 10.
-        let _ = (entries, callback);
-        unimplemented!("Task 10")
+        let _guard = self.append_lock.lock().unwrap();
+
+        let mut last_notifier: Option<ultima_journal::Notifier> = None;
+
+        for entry in entries {
+            let payload = bincode::serde::encode_to_vec(&entry, bincode::config::standard())
+                .map_err(|e| {
+                    let io_err = std::io::Error::other(e.to_string());
+                    StorageIOError::<NodeId>::write_logs(&io_err)
+                })?;
+
+            let term: u64 = entry.log_id.leader_id.term;
+            let seq: u64 = entry.log_id.index;
+
+            let notifier = self
+                .journal
+                .append(seq, term, &payload)
+                .map_err(map_journal_write_logs)?;
+            last_notifier = Some(notifier);
+        }
+
+        if let Some(notifier) = last_notifier {
+            // Chain LogFlushed completion onto the final entry's Notifier.
+            // ultima_journal's bg fsync thread calls our callback after sync_all() —
+            // zero thread hop. openraft 0.9.24's `LogFlushed::log_io_completed` takes
+            // `Result<(), io::Error>` (NOT `Result<(), StorageIOError<NodeId>>` as the
+            // original spec hinted), so we map JournalError → io::Error here.
+            notifier.on_complete(move |result| {
+                let io_result: Result<(), std::io::Error> = result
+                    .map_err(|e| std::io::Error::other(e.to_string()));
+                callback.log_io_completed(io_result);
+            });
+        } else {
+            // No entries → fire the callback immediately as Ok.
+            callback.log_io_completed(Ok(()));
+        }
+
+        Ok(())
     }
 
     async fn truncate(
         &mut self,
         log_id: LogId<NodeId>,
     ) -> Result<(), StorageError<NodeId>> {
-        // Implemented in Task 10.
-        let _ = log_id;
-        unimplemented!("Task 10")
+        // Remove entries with index >= log_id.index (i.e., keep entries with
+        // index < log_id.index). `truncate_after(keep_seq)` retains records with
+        // seq <= keep_seq. For log_id.index == 0, keep_seq saturates at 0 which
+        // (per Journal::truncate_after's docs) drops every record with seq > 0.
+        let keep_seq = log_id.index.saturating_sub(1);
+        self.journal
+            .truncate_after(keep_seq)
+            .map_err(map_journal_write_logs)?
+            .wait()
+            .map_err(map_journal_write_logs)?;
+        Ok(())
     }
 
     async fn purge(
         &mut self,
         log_id: LogId<NodeId>,
     ) -> Result<(), StorageError<NodeId>> {
-        // Implemented in Task 10.
-        let _ = log_id;
-        unimplemented!("Task 10")
+        self.journal
+            .purge_before(log_id.index + 1)
+            .map_err(map_journal_write_logs)?;
+        self.last_purged
+            .store(&log_id)
+            .map_err(map_sv_write_logs)?
+            .wait()
+            .map_err(map_journal_write_logs)?;
+        Ok(())
     }
 }
