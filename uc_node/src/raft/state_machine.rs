@@ -155,10 +155,20 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
         let mut g = self.inner.lock().await;
 
         let mut cursor = Cursor::new(bytes.clone());
-        g.sm.install_snapshot(&mut cursor).map_err(|e| {
+        let user_last_applied = g.sm.install_snapshot(&mut cursor).map_err(|e| {
             let io_err = std::io::Error::other(e.to_string());
             StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &io_err)
         })?;
+
+        // Sanity check: user's reported last_applied after install must match
+        // the openraft-supplied meta.last_log_id.index. Mismatch = user's
+        // install_snapshot is buggy or the wire bytes don't match the meta.
+        let meta_index = meta.last_log_id.map(|l| l.index).unwrap_or(0);
+        debug_assert_eq!(
+            user_last_applied,
+            meta_index,
+            "user install_snapshot returned index {user_last_applied} but meta.last_log_id.index is {meta_index}",
+        );
 
         g.last_applied = meta.last_log_id;
         g.last_membership = meta.last_membership.clone();
@@ -195,10 +205,20 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for AdaptedSnapshotBuilder
         let last_membership = g.last_membership.clone();
 
         let mut buf: Vec<u8> = Vec::new();
-        g.sm.build_snapshot(&mut buf).map_err(|e| {
+        let user_index = g.sm.build_snapshot(&mut buf).map_err(|e| {
             let io_err = std::io::Error::other(e.to_string());
             StorageIOError::<NodeId>::write_snapshot(None, &io_err)
         })?;
+
+        // Sanity check: with the Mutex held across apply and build, the user's returned
+        // index MUST equal our last_applied.index. M3 moves apply to a ring buffer and
+        // this invariant will need to be re-evaluated.
+        debug_assert_eq!(
+            user_index,
+            last_applied.map(|l| l.index).unwrap_or(0),
+            "user build_snapshot returned index {user_index} but adapter has last_applied {:?}",
+            last_applied
+        );
 
         g.snapshot_idx += 1;
         let meta = SnapshotMeta {
