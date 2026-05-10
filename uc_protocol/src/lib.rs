@@ -10,4 +10,4 @@ pub mod magic;
 pub mod version;
 
 pub use error_codes::ErrorCode;
-pub use version::{ProtocolVersion, MIN_COMPATIBLE};
+pub use version::{MIN_COMPATIBLE, ProtocolVersion};

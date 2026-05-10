@@ -4,8 +4,8 @@
 //! own when restarted. This module just verifies the durable state is consistent
 //! before handing off to openraft.
 
-use crate::raft::log_storage::JournalLogStorage;
 use crate::ClusterError;
+use crate::raft::log_storage::JournalLogStorage;
 
 /// Sanity-check the durable state of [`JournalLogStorage`] before handing off
 /// to openraft. Catches obvious corruption (manual file deletion, partial dir

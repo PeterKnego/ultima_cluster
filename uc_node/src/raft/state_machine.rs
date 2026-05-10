@@ -67,7 +67,9 @@ impl<S: StateMachine> AdaptedStateMachine<S> {
 
 impl<S: StateMachine> Clone for AdaptedStateMachine<S> {
     fn clone(&self) -> Self {
-        Self { inner: self.inner.clone() }
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -94,10 +96,8 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<
-        (Option<LogId<NodeId>>, StoredMembership<NodeId, NodeAddr>),
-        StorageError<NodeId>,
-    > {
+    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, NodeAddr>), StorageError<NodeId>>
+    {
         let g = self.inner.lock().await;
         Ok((g.last_applied, g.last_membership.clone()))
     }
@@ -131,14 +131,13 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
 
                     let resp = g.sm.apply(log_index, cmd);
 
-                    let resp_bytes = bincode::serde::encode_to_vec(
-                        &resp,
-                        bincode::config::standard(),
-                    )
-                    .map_err(|e| {
-                        let io_err = std::io::Error::other(e.to_string());
-                        StorageIOError::<NodeId>::apply(log_id, &io_err)
-                    })?;
+                    let resp_bytes =
+                        bincode::serde::encode_to_vec(&resp, bincode::config::standard()).map_err(
+                            |e| {
+                                let io_err = std::io::Error::other(e.to_string());
+                                StorageIOError::<NodeId>::apply(log_id, &io_err)
+                            },
+                        )?;
                     responses.push(bytes::Bytes::from(resp_bytes));
                 }
                 EntryPayload::Membership(m) => {
@@ -151,7 +150,9 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        AdaptedSnapshotBuilder { inner: self.inner.clone() }
+        AdaptedSnapshotBuilder {
+            inner: self.inner.clone(),
+        }
     }
 
     async fn begin_receiving_snapshot(
@@ -179,14 +180,16 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
         // install_snapshot is buggy or the wire bytes don't match the meta.
         let meta_index = meta.last_log_id.map(|l| l.index).unwrap_or(0);
         debug_assert_eq!(
-            user_last_applied,
-            meta_index,
+            user_last_applied, meta_index,
             "user install_snapshot returned index {user_last_applied} but meta.last_log_id.index is {meta_index}",
         );
 
         g.last_applied = meta.last_log_id;
         g.last_membership = meta.last_membership.clone();
-        g.current_snapshot = Some(StoredSnapshot { meta: meta.clone(), data: bytes });
+        g.current_snapshot = Some(StoredSnapshot {
+            meta: meta.clone(),
+            data: bytes,
+        });
         Ok(())
     }
 
@@ -240,7 +243,10 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for AdaptedSnapshotBuilder
             last_membership,
             snapshot_id: format!("snap-{}", g.snapshot_idx),
         };
-        let stored = StoredSnapshot { meta: meta.clone(), data: buf.clone() };
+        let stored = StoredSnapshot {
+            meta: meta.clone(),
+            data: buf.clone(),
+        };
         g.current_snapshot = Some(stored);
 
         Ok(Snapshot {

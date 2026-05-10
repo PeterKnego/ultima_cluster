@@ -1,9 +1,9 @@
 //! Verifies that JournalLogStorage::open is idempotent and survives restart
 //! with empty state.
 
+use openraft::RaftLogReader as _;
 use openraft::storage::RaftLogStorage as _;
 use openraft::storage::RaftLogStorageExt as _;
-use openraft::RaftLogReader as _;
 use openraft::{Entry, EntryPayload, Vote};
 use tempfile::TempDir;
 use uc_node::raft::log_storage::JournalLogStorage;
@@ -16,9 +16,27 @@ fn reopen_observes_empty_state() {
 
     // Reopen — must succeed and observe the same empty state.
     let storage = JournalLogStorage::open(dir.path()).expect("reopen");
-    assert!(storage._testonly_vote().load().expect("load vote").is_none());
-    assert!(storage._testonly_committed().load().expect("load committed").is_none());
-    assert!(storage._testonly_last_purged().load().expect("load last_purged").is_none());
+    assert!(
+        storage
+            ._testonly_vote()
+            .load()
+            .expect("load vote")
+            .is_none()
+    );
+    assert!(
+        storage
+            ._testonly_committed()
+            .load()
+            .expect("load committed")
+            .is_none()
+    );
+    assert!(
+        storage
+            ._testonly_last_purged()
+            .load()
+            .expect("load last_purged")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -80,19 +98,18 @@ async fn save_and_read_committed_round_trip() {
     let mut storage = JournalLogStorage::open(dir.path()).expect("open");
 
     // Initially None.
-    assert!(storage
-        .read_committed()
-        .await
-        .expect("read empty")
-        .is_none());
+    assert!(
+        storage
+            .read_committed()
+            .await
+            .expect("read empty")
+            .is_none()
+    );
 
     // Save a LogId, read back.
     let lid = openraft::LogId::new(openraft::CommittedLeaderId::new(5, 0), 42);
     storage.save_committed(Some(lid)).await.expect("save");
-    assert_eq!(
-        storage.read_committed().await.expect("read"),
-        Some(lid)
-    );
+    assert_eq!(storage.read_committed().await.expect("read"), Some(lid));
 
     // Survives reopen.
     drop(storage);
@@ -104,19 +121,23 @@ async fn save_and_read_committed_round_trip() {
 
     // Clear, read None, survive reopen.
     storage.save_committed(None).await.expect("clear");
-    assert!(storage
-        .read_committed()
-        .await
-        .expect("read after clear")
-        .is_none());
+    assert!(
+        storage
+            .read_committed()
+            .await
+            .expect("read after clear")
+            .is_none()
+    );
 
     drop(storage);
     let mut storage = JournalLogStorage::open(dir.path()).expect("reopen 2");
-    assert!(storage
-        .read_committed()
-        .await
-        .expect("read after reopen 2")
-        .is_none());
+    assert!(
+        storage
+            .read_committed()
+            .await
+            .expect("read after reopen 2")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -151,7 +172,11 @@ async fn purge_retains_higher_indices() {
         .try_get_log_entries(4u64..=5u64)
         .await
         .expect("read");
-    assert_eq!(read.len(), 2, "records 4 and 5 must survive purge through 3");
+    assert_eq!(
+        read.len(),
+        2,
+        "records 4 and 5 must survive purge through 3"
+    );
     assert_eq!(read[0].log_id.index, 4);
     assert_eq!(read[1].log_id.index, 5);
 

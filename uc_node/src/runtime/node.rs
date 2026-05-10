@@ -6,15 +6,15 @@
 //! same.
 
 use bytes::Bytes;
-use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
+use openraft::error::{ClientWriteError, RaftError};
 
 use uc_service::StateMachine;
 
-use crate::config::{NodeConfig, NodeId};
-use crate::raft::state_machine::AdaptedStateMachine;
-use crate::raft::TypeConfig;
 use crate::ClusterError;
+use crate::config::{NodeConfig, NodeId};
+use crate::raft::TypeConfig;
+use crate::raft::state_machine::AdaptedStateMachine;
 
 /// Public handle returned by [`NodeBuilder::start`](super::builder::NodeBuilder::start).
 pub struct NodeHandle<S: StateMachine> {
@@ -46,12 +46,18 @@ impl<S: StateMachine> NodeHandle<S> {
         let bytes = bincode::serde::encode_to_vec(&cmd, bincode::config::standard())?;
         let app_command: Bytes = Bytes::from(bytes);
 
-        let result = self.raft.client_write(app_command).await.map_err(map_client_write_error)?;
+        let result = self
+            .raft
+            .client_write(app_command)
+            .await
+            .map_err(map_client_write_error)?;
 
         // result.data is the bincode-encoded S::Response (per TypeConfig: R = Bytes).
         let resp_bytes: Bytes = result.data;
-        let (resp, _) =
-            bincode::serde::decode_from_slice::<S::Response, _>(&resp_bytes, bincode::config::standard())?;
+        let (resp, _) = bincode::serde::decode_from_slice::<S::Response, _>(
+            &resp_bytes,
+            bincode::config::standard(),
+        )?;
         Ok(resp)
     }
 
@@ -85,7 +91,9 @@ fn map_client_write_error(
     e: RaftError<NodeId, ClientWriteError<NodeId, crate::raft::NodeAddr>>,
 ) -> ClusterError {
     if let RaftError::APIError(ClientWriteError::ForwardToLeader(f)) = &e {
-        return ClusterError::NotLeader { leader_id: f.leader_id };
+        return ClusterError::NotLeader {
+            leader_id: f.leader_id,
+        };
     }
     ClusterError::Raft(e.to_string())
 }

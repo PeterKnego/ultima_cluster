@@ -15,9 +15,9 @@ use crate::error::SnapshotError;
 ///     the build-vs-apply race).
 ///   * install_snapshot returns the new last_applied after a successful install.
 pub trait StateMachine: Send + Sync + 'static {
-    type Command:       Serialize + DeserializeOwned + Send + Sync + 'static;
-    type Response:      Serialize + DeserializeOwned + Send + 'static;
-    type Query:         Serialize + DeserializeOwned + Send + Sync + 'static;
+    type Command: Serialize + DeserializeOwned + Send + Sync + 'static;
+    type Response: Serialize + DeserializeOwned + Send + 'static;
+    type Query: Serialize + DeserializeOwned + Send + Sync + 'static;
     type QueryResponse: Serialize + DeserializeOwned + Send + 'static;
 
     fn apply(&mut self, log_index: u64, cmd: Self::Command) -> Self::Response;

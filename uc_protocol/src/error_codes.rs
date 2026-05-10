@@ -3,23 +3,25 @@
 #[repr(u16)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum ErrorCode {
-    Unknown            = 0,
-    AppIdMismatch      = 1,
-    ProtocolMismatch   = 2,
-    InstanceIdChanged  = 3,
-    NotLeader          = 10,
-    Stalled            = 11,
-    ApplyFailed        = 20,
-    QueryFailed        = 21,
-    SnapshotFailed     = 30,
-    OutputRetryable    = 40,
-    OutputPermanent    = 41,
-    BadFrame           = 50,
-    Timeout            = 60,
+    Unknown = 0,
+    AppIdMismatch = 1,
+    ProtocolMismatch = 2,
+    InstanceIdChanged = 3,
+    NotLeader = 10,
+    Stalled = 11,
+    ApplyFailed = 20,
+    QueryFailed = 21,
+    SnapshotFailed = 30,
+    OutputRetryable = 40,
+    OutputPermanent = 41,
+    BadFrame = 50,
+    Timeout = 60,
 }
 
 impl ErrorCode {
-    pub const fn as_u16(self) -> u16 { self as u16 }
+    pub const fn as_u16(self) -> u16 {
+        self as u16
+    }
 
     pub const fn from_u16(v: u16) -> Self {
         match v {

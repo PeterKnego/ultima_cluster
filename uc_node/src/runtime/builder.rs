@@ -13,11 +13,11 @@ use openraft::{Config as RaftConfigOpenraft, Raft};
 use uc_service::StateMachine;
 
 use super::node::NodeHandle;
+use crate::ClusterError;
 use crate::config::{BootstrapConfig, NodeConfig};
 use crate::raft::log_storage::JournalLogStorage;
 use crate::raft::state_machine::AdaptedStateMachine;
 use crate::raft::{NodeAddr, NodeId};
-use crate::ClusterError;
 
 /// Builds an embedded-mode ultima_cluster node.
 /// Generic over S; non-generic shmem-fronted variant arrives in M3.

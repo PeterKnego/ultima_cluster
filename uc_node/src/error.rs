@@ -30,8 +30,12 @@ pub enum ClusterError {
 }
 
 impl From<bincode::error::EncodeError> for ClusterError {
-    fn from(e: bincode::error::EncodeError) -> Self { Self::Bincode(e.to_string()) }
+    fn from(e: bincode::error::EncodeError) -> Self {
+        Self::Bincode(e.to_string())
+    }
 }
 impl From<bincode::error::DecodeError> for ClusterError {
-    fn from(e: bincode::error::DecodeError) -> Self { Self::Bincode(e.to_string()) }
+    fn from(e: bincode::error::DecodeError) -> Self {
+        Self::Bincode(e.to_string())
+    }
 }

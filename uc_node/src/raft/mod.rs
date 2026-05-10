@@ -1,11 +1,11 @@
 //! openraft TypeConfig and supporting types for ultima_cluster.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use serde::{Deserialize, Serialize};
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
-pub mod log_storage;       // Task 7
-pub mod state_machine;     // Task 11
+pub mod log_storage; // Task 7
+pub mod state_machine; // Task 11
 
 pub type NodeId = u64;
 

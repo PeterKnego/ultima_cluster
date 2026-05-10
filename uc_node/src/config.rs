@@ -7,7 +7,7 @@ pub type NodeId = u64;
 pub struct NodeConfig {
     pub node_id: NodeId,
     pub data_dir: PathBuf,
-    pub raft_listen_addr: SocketAddr,        // unused in M1 (no QUIC yet); reserved
+    pub raft_listen_addr: SocketAddr, // unused in M1 (no QUIC yet); reserved
     pub app_id: String,
     pub bootstrap: BootstrapConfig,
     pub raft: RaftTuning,
@@ -17,7 +17,7 @@ pub struct NodeConfig {
 pub enum BootstrapConfig {
     Resume,
     SingleNode,
-    Peers { peers: Vec<PeerSeed> },          // unused in M1
+    Peers { peers: Vec<PeerSeed> }, // unused in M1
 }
 
 #[derive(Debug, Clone)]
@@ -47,8 +47,12 @@ impl Default for RaftTuning {
 
 impl NodeConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if self.app_id.is_empty() { return Err("app_id must not be empty".into()); }
-        if self.app_id.len() > 64 { return Err("app_id must be <= 64 bytes".into()); }
+        if self.app_id.is_empty() {
+            return Err("app_id must not be empty".into());
+        }
+        if self.app_id.len() > 64 {
+            return Err("app_id must be <= 64 bytes".into());
+        }
         if self.raft.election_timeout_min_ms >= self.raft.election_timeout_max_ms {
             return Err("election_timeout_min_ms must be < max".into());
         }

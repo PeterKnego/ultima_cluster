@@ -6,9 +6,15 @@ impl ProtocolVersion {
     pub const fn new(major: u8, minor: u8, patch: u16) -> Self {
         Self(((major as u32) << 24) | ((minor as u32) << 16) | (patch as u32))
     }
-    pub const fn major(self) -> u8 { (self.0 >> 24) as u8 }
-    pub const fn minor(self) -> u8 { ((self.0 >> 16) & 0xFF) as u8 }
-    pub const fn patch(self) -> u16 { (self.0 & 0xFFFF) as u16 }
+    pub const fn major(self) -> u8 {
+        (self.0 >> 24) as u8
+    }
+    pub const fn minor(self) -> u8 {
+        ((self.0 >> 16) & 0xFF) as u8
+    }
+    pub const fn patch(self) -> u16 {
+        (self.0 & 0xFFFF) as u16
+    }
 
     /// Compatible if same major and `other.minor <= self.minor`.
     pub const fn compatible_with(self, other: ProtocolVersion) -> bool {

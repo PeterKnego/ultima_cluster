@@ -13,12 +13,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use openraft::{LogId, Vote};
-use ultima_journal::{
-    Durability, Journal, JournalConfig, StableValue, StableValueConfig,
-};
+use ultima_journal::{Durability, Journal, JournalConfig, StableValue, StableValueConfig};
 
-use crate::ClusterError;
 use super::NodeId;
+use crate::ClusterError;
 
 const SEGMENT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -70,11 +68,17 @@ impl JournalLogStorage {
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn _testonly_vote(&self) -> &StableValue<Vote<NodeId>> { &self.vote }
+    pub fn _testonly_vote(&self) -> &StableValue<Vote<NodeId>> {
+        &self.vote
+    }
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn _testonly_committed(&self) -> &StableValue<LogId<NodeId>> { &self.committed }
+    pub fn _testonly_committed(&self) -> &StableValue<LogId<NodeId>> {
+        &self.committed
+    }
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn _testonly_last_purged(&self) -> &StableValue<LogId<NodeId>> { &self.last_purged }
+    pub fn _testonly_last_purged(&self) -> &StableValue<LogId<NodeId>> {
+        &self.last_purged
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -101,13 +105,13 @@ impl JournalLogStorage {
 use std::fmt::Debug;
 use std::ops::RangeBounds;
 
-use openraft::storage::LogFlushed;
-use openraft::storage::LogState;
-use openraft::storage::RaftLogStorage;
 use openraft::OptionalSend;
 use openraft::RaftLogReader;
 use openraft::StorageError;
 use openraft::StorageIOError;
+use openraft::storage::LogFlushed;
+use openraft::storage::LogState;
+use openraft::storage::RaftLogStorage;
 
 use super::TypeConfig;
 
@@ -144,7 +148,10 @@ impl RaftLogReader<TypeConfig> for JournalLogStorage {
         &mut self,
         range: RB,
     ) -> Result<Vec<openraft::Entry<TypeConfig>>, StorageError<NodeId>> {
-        let iter = self.journal.iter_range(range).map_err(map_journal_read_logs)?;
+        let iter = self
+            .journal
+            .iter_range(range)
+            .map_err(map_journal_read_logs)?;
         let mut entries = Vec::new();
         for record in iter {
             let (_seq, _meta, payload) = record.map_err(map_journal_read_logs)?;
@@ -175,9 +182,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
                 .read(seq)
                 .map_err(map_journal_read_logs)?
                 .ok_or_else(|| {
-                    let io_err = std::io::Error::other(format!(
-                        "missing last record at seq {seq}"
-                    ));
+                    let io_err = std::io::Error::other(format!("missing last record at seq {seq}"));
                     StorageIOError::<NodeId>::read_logs(&io_err)
                 })?;
             let (term, _payload) = rec;
@@ -211,10 +216,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
         }
     }
 
-    async fn save_vote(
-        &mut self,
-        vote: &Vote<NodeId>,
-    ) -> Result<(), StorageError<NodeId>> {
+    async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
         self.vote
             .store(vote)
             .map_err(map_sv_write_vote)?
@@ -250,9 +252,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
         Ok(())
     }
 
-    async fn read_committed(
-        &mut self,
-    ) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
+    async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
         self.committed.load().map_err(map_sv_read_logs)
     }
 
@@ -292,8 +292,8 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             // `Result<(), io::Error>` (NOT `Result<(), StorageIOError<NodeId>>` as the
             // original spec hinted), so we map JournalError → io::Error here.
             notifier.on_complete(move |result| {
-                let io_result: Result<(), std::io::Error> = result
-                    .map_err(|e| std::io::Error::other(e.to_string()));
+                let io_result: Result<(), std::io::Error> =
+                    result.map_err(|e| std::io::Error::other(e.to_string()));
                 callback.log_io_completed(io_result);
             });
         } else {
@@ -304,10 +304,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
         Ok(())
     }
 
-    async fn truncate(
-        &mut self,
-        log_id: LogId<NodeId>,
-    ) -> Result<(), StorageError<NodeId>> {
+    async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         // Remove entries with index >= log_id.index (i.e., keep entries with
         // index < log_id.index). `truncate_after(keep_seq)` retains records with
         // seq <= keep_seq. For log_id.index == 0, keep_seq saturates at 0 which
@@ -321,10 +318,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
         Ok(())
     }
 
-    async fn purge(
-        &mut self,
-        log_id: LogId<NodeId>,
-    ) -> Result<(), StorageError<NodeId>> {
+    async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         // openraft's `purge(log_id)` contract is "remove records with index <=
         // log_id.index, retain records with index > log_id.index".
         // `Journal::purge_before(N)` retains records with seq > N. So with
