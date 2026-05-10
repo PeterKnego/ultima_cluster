@@ -2,7 +2,7 @@
 
 pub mod config;
 pub mod error;
-// pub mod raft;       // enabled in Task 6
+pub mod raft;
 // pub mod runtime;    // enabled in Task 12
 
 pub use config::{BootstrapConfig, NodeConfig, NodeId, PeerSeed, RaftTuning};

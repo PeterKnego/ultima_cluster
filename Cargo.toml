@@ -12,7 +12,7 @@ authors = ["Peter Knego"]
 # core
 serde = { version = "1", features = ["derive"] }
 bincode = { version = "2", features = ["serde"] }
-bytes = "1"
+bytes = { version = "1", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
 
