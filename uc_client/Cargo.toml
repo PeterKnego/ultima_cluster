@@ -1,0 +1,11 @@
+[package]
+name = "uc_client"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ultima_cluster local-shmem client SDK (M1 stub)"
+
+[dependencies]
+thiserror = { workspace = true }
+uc_protocol = { path = "../uc_protocol" }

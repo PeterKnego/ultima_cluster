@@ -93,6 +93,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "uc_client"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "uc_protocol",
+]
+
+[[package]]
 name = "uc_protocol"
 version = "0.1.0"
 
