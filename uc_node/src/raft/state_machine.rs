@@ -336,7 +336,9 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
 
         // 4. Now mutate the user's state machine. If this fails, the durable
         //    record points at a snapshot the user can't install — surface as
-        //    a hard error. Subsequent restarts will hit the C2 panic path.
+        //    a hard error. Subsequent restarts will surface this as
+        //    `ClusterError::Recovery` from `AdaptedStateMachine::new`
+        //    (snapshot replay path).
         let mut cursor = Cursor::new(bytes.clone());
         let user_last_applied = g.sm.install_snapshot(&mut cursor).map_err(|e| {
             let io_err = std::io::Error::other(e.to_string());
