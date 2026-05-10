@@ -57,7 +57,7 @@ pub(crate) struct StoredSnapshot {
 }
 
 impl<S: StateMachine> AdaptedStateMachine<S> {
-    pub fn new(sm: S, handles: LogStorageHandles) -> Self {
+    pub fn new(sm: S, handles: LogStorageHandles) -> Result<Self, crate::ClusterError> {
         // Recover persisted state on startup.
         let loaded_last_applied = handles.last_applied.load().ok().flatten();
         let loaded_snapshot_meta = handles.snapshot_meta.load().ok().flatten();
@@ -90,20 +90,53 @@ impl<S: StateMachine> AdaptedStateMachine<S> {
         let mut sm = sm;
         if let Some(ref snap) = current_snapshot {
             let mut cursor = std::io::Cursor::new(snap.data.clone());
-            // C2 fix: errors here are NOT recoverable. The journal has been
-            // purged below the snapshot index, so there's nothing for openraft
-            // to "resync" from. If we silently swallowed the error, the
+            // Errors here are NOT recoverable. The journal has been purged
+            // below the snapshot index, so there's nothing for openraft to
+            // "resync" from. If we silently swallowed the error, the
             // framework would report last_applied = Some(N) while the user's
             // sm sits at default — subsequent applies would corrupt state.
-            // Panic loudly so the operator sees the cause.
-            // M2 Task 3 will replace this with proper Result-propagation when
-            // it changes the function signature for the startup cross-check.
-            sm.install_snapshot(&mut cursor).expect(
-                "snapshot replay failed at startup — durable record points to a snapshot the user state machine cannot install",
-            );
+            // Surface as a hard ClusterError::Recovery so the operator sees
+            // the cause and the node fails to start.
+            sm.install_snapshot(&mut cursor).map_err(|e| {
+                crate::ClusterError::Recovery(format!("snapshot replay at startup: {e}"))
+            })?;
         }
 
-        Self {
+        // Cross-check user-reported last_applied against framework's durable
+        // last_applied. Disagreement = data corruption.
+        let user_la = sm.last_applied();
+        let framework_la = loaded_last_applied.map(|l| l.index);
+
+        match (user_la, framework_la) {
+            (Some(u), Some(f)) if u != f => {
+                return Err(crate::ClusterError::DriftDetected {
+                    user: Some(u),
+                    framework: Some(f),
+                });
+            }
+            (None, Some(_)) => {
+                // User says fresh state but framework has persisted history.
+                // Allowed: install_snapshot may leave user's last_applied None if
+                // they couldn't re-derive it from the snapshot bytes alone.
+                // Logged at warn; framework's value is treated as authoritative.
+                tracing::warn!(
+                    framework_last_applied = ?framework_la,
+                    "user reports None last_applied but framework has persisted value; assuming framework authoritative",
+                );
+            }
+            (Some(u), None) => {
+                // User says caught up but framework has no record.
+                // This indicates the user has applied entries the framework doesn't
+                // know about — surface as drift.
+                return Err(crate::ClusterError::DriftDetected {
+                    user: Some(u),
+                    framework: None,
+                });
+            }
+            _ => {} // both None or both Some-with-equal-value — fine
+        }
+
+        Ok(Self {
             inner: Arc::new(Mutex::new(Inner {
                 sm,
                 last_applied: loaded_last_applied,
@@ -113,7 +146,7 @@ impl<S: StateMachine> AdaptedStateMachine<S> {
                 snapshot_meta_sv: handles.snapshot_meta,
                 snapshot_bytes_dir: handles.data_dir,
             })),
-        }
+        })
     }
 }
 
@@ -231,8 +264,9 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
         // metadata. If any durable write fails, the user's state machine and
         // adapter metadata are both unchanged — the caller sees Err and the
         // adapter's invariants are preserved. If the user-sm install fails
-        // after the durable record is written, we panic-via-expect at next
-        // startup recovery (see C2 fix in `new`); this is loud-but-safe.
+        // after the durable record is written, the next startup recovery
+        // surfaces it as `ClusterError::Recovery` (see snapshot replay path
+        // in `new`); the node fails to start — loud-but-safe.
 
         // 1. Write snapshot bytes to a uniquely-named file in data_dir.
         let bytes_filename = format!(

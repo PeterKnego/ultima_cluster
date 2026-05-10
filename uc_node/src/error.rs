@@ -9,6 +9,11 @@ pub enum ClusterError {
     Config(String),
     #[error("recovery: {0}")]
     Recovery(String),
+    #[error("state drift: user last_applied={user:?} but framework last_applied={framework:?}")]
+    DriftDetected {
+        user: Option<u64>,
+        framework: Option<u64>,
+    },
     #[error("journal: {0}")]
     Journal(#[from] ultima_journal::JournalError),
     #[error("stable value: {0}")]
