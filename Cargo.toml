@@ -22,7 +22,7 @@ async-trait = "0.1"
 futures = "0.3"
 
 # raft + storage
-openraft = { version = "0.9", features = ["serde"] }
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 ultima-journal = { path = "../ultima_db/ultima_journal" }
 # ultima_db deliberately omitted in M1; arrives in M3 as a uc_service feature
 
