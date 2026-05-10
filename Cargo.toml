@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = ["uc_protocol", "uc_service", "uc_node", "uc_client"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "Apache-2.0"
+authors = ["Peter Knego"]
+
+[workspace.dependencies]
+# core
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+bytes = { version = "1", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"
+
+# async
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "fs", "io-util"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# raft + storage
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+ultima-journal = { path = "../ultima_db/ultima_journal" }
+# ultima_db deliberately omitted in M1; arrives in M3 as a uc_service feature
+
+# dev
+tempfile = "3"
+anyhow = "1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1

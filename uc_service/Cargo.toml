@@ -1,0 +1,13 @@
+[package]
+name = "uc_service"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ultima_cluster service-side SDK — StateMachine + OutputHandler traits"
+
+[dependencies]
+serde = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+uc_protocol = { path = "../uc_protocol" }
