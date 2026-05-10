@@ -1,0 +1,26 @@
+[package]
+name = "uc_node"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "ultima_cluster engine — Raft, journal, network (M1: embedded only)"
+
+[dependencies]
+serde = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+openraft = { workspace = true }
+ultima-journal = { workspace = true }
+uc_protocol = { path = "../uc_protocol" }
+uc_service = { path = "../uc_service" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
