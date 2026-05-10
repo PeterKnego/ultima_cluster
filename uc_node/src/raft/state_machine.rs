@@ -90,8 +90,17 @@ impl<S: StateMachine> AdaptedStateMachine<S> {
         let mut sm = sm;
         if let Some(ref snap) = current_snapshot {
             let mut cursor = std::io::Cursor::new(snap.data.clone());
-            // Errors here are non-fatal; openraft will resync if needed.
-            let _ = sm.install_snapshot(&mut cursor);
+            // C2 fix: errors here are NOT recoverable. The journal has been
+            // purged below the snapshot index, so there's nothing for openraft
+            // to "resync" from. If we silently swallowed the error, the
+            // framework would report last_applied = Some(N) while the user's
+            // sm sits at default — subsequent applies would corrupt state.
+            // Panic loudly so the operator sees the cause.
+            // M2 Task 3 will replace this with proper Result-propagation when
+            // it changes the function signature for the startup cross-check.
+            sm.install_snapshot(&mut cursor).expect(
+                "snapshot replay failed at startup — durable record points to a snapshot the user state machine cannot install",
+            );
         }
 
         Self {
@@ -156,6 +165,12 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
         for entry in entries {
             let log_id = entry.log_id;
             let log_index = log_id.index;
+            // NOTE (M2 Task 3): apply() updates the in-memory `g.last_applied`
+            // only. `last_applied_sv` (the durable StableValue) is updated only
+            // on install_snapshot. On restart, framework reads `last_applied_sv`
+            // (which may be None or the snapshot index); user's sm.last_applied()
+            // is the actual user-visible last_applied. Task 3's startup
+            // cross-check reconciles these.
             g.last_applied = Some(log_id);
 
             match entry.payload {
@@ -212,30 +227,21 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
         let bytes = snapshot.into_inner();
         let mut g = self.inner.lock().await;
 
-        let mut cursor = Cursor::new(bytes.clone());
-        let user_last_applied = g.sm.install_snapshot(&mut cursor).map_err(|e| {
-            let io_err = std::io::Error::other(e.to_string());
-            StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &io_err)
-        })?;
+        // C1 fix: durable writes FIRST, then user-sm mutation, then adapter
+        // metadata. If any durable write fails, the user's state machine and
+        // adapter metadata are both unchanged — the caller sees Err and the
+        // adapter's invariants are preserved. If the user-sm install fails
+        // after the durable record is written, we panic-via-expect at next
+        // startup recovery (see C2 fix in `new`); this is loud-but-safe.
 
-        // Sanity check: user's reported last_applied after install must match
-        // the openraft-supplied meta.last_log_id.index. Mismatch = user's
-        // install_snapshot is buggy or the wire bytes don't match the meta.
-        let meta_index = meta.last_log_id.map(|l| l.index).unwrap_or(0);
-        debug_assert_eq!(
-            user_last_applied, meta_index,
-            "user install_snapshot returned index {user_last_applied} but meta.last_log_id.index is {meta_index}",
-        );
-
-        // Durable-first: persist bytes + last_applied + snapshot_meta BEFORE
-        // touching in-memory state, so a crash anywhere after this point
-        // recovers to a consistent installed snapshot.
-
-        // Write snapshot bytes to a uniquely-named file in data_dir.
+        // 1. Write snapshot bytes to a uniquely-named file in data_dir.
         let bytes_filename = format!(
             "snapshot_{}.bin",
             meta.last_log_id.map(|l| l.index).unwrap_or(0)
         );
+        // TODO(M5): when the new snapshot lands, the previous snapshot's bytes
+        // file (if any) becomes orphaned. Implement cleanup when M5 hardens
+        // snapshot lifecycle (e.g. via the snapshot.region mmap'd transport).
         let bytes_path = g.snapshot_bytes_dir.join(&bytes_filename);
         std::fs::write(&bytes_path, &bytes).map_err(|e| {
             StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e)
@@ -247,8 +253,13 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
             StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e)
         })?;
         drop(f);
+        // M5 hardening: also fsync the parent directory to guarantee the
+        // directory entry is durable, not just the file inode. For now we
+        // accept the small crash window between f.sync_all() and
+        // snapshot_meta_sv.store() — if a crash hits there, snapshot_meta_sv
+        // is None on restart so the orphan bytes file is never read.
 
-        // Persist last_applied (if present).
+        // 2. Persist last_applied (if present).
         if let Some(lid) = meta.last_log_id {
             g.last_applied_sv
                 .store(&lid)
@@ -267,7 +278,7 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
                 })?;
         }
 
-        // Persist snapshot meta (atomic pointer to the bytes file).
+        // 3. Persist snapshot meta (atomic pointer to the bytes file).
         let stored_meta = StoredSnapshotMeta {
             last_log_id: meta.last_log_id,
             last_membership: meta.last_membership.clone(),
@@ -289,6 +300,25 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
                 )
             })?;
 
+        // 4. Now mutate the user's state machine. If this fails, the durable
+        //    record points at a snapshot the user can't install — surface as
+        //    a hard error. Subsequent restarts will hit the C2 panic path.
+        let mut cursor = Cursor::new(bytes.clone());
+        let user_last_applied = g.sm.install_snapshot(&mut cursor).map_err(|e| {
+            let io_err = std::io::Error::other(e.to_string());
+            StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &io_err)
+        })?;
+
+        // Sanity check: user's reported last_applied after install must match
+        // the openraft-supplied meta.last_log_id.index. Mismatch = user's
+        // install_snapshot is buggy or the wire bytes don't match the meta.
+        let meta_index = meta.last_log_id.map(|l| l.index).unwrap_or(0);
+        debug_assert_eq!(
+            user_last_applied, meta_index,
+            "user install_snapshot returned index {user_last_applied} but meta.last_log_id.index is {meta_index}",
+        );
+
+        // 5. Update adapter metadata.
         g.last_applied = meta.last_log_id;
         g.last_membership = meta.last_membership.clone();
         g.current_snapshot = Some(StoredSnapshot {
