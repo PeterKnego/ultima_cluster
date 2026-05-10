@@ -325,8 +325,14 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
         &mut self,
         log_id: LogId<NodeId>,
     ) -> Result<(), StorageError<NodeId>> {
+        // openraft's `purge(log_id)` contract is "remove records with index <=
+        // log_id.index, retain records with index > log_id.index".
+        // `Journal::purge_before(N)` retains records with seq > N. So with
+        // seq == index, the boundary is `log_id.index` — NOT `log_id.index + 1`
+        // (which would also discard the record at log_id.index + 1, the first
+        // record raft expects to retain).
         self.journal
-            .purge_before(log_id.index + 1)
+            .purge_before(log_id.index)
             .map_err(map_journal_write_logs)?;
         self.last_purged
             .store(&log_id)

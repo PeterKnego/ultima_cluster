@@ -118,3 +118,45 @@ async fn save_and_read_committed_round_trip() {
         .expect("read after reopen 2")
         .is_none());
 }
+
+#[tokio::test]
+async fn purge_retains_higher_indices() {
+    // Regression for off-by-one in purge: with segment-aligned purge_before,
+    // calling purge(log_id{idx=N}) MUST retain records with index > N, never
+    // drop record N+1. The bug was purge_before(N+1) which would drop record
+    // N+1 if it happened to be the terminal record of a segment.
+    //
+    // Note: M1's hardcoded 64 MiB segment size means this test cannot
+    // reproduce the segment-boundary case directly; it instead verifies the
+    // semantic via the public RaftLogStorage API. The bug-catching power
+    // strengthens once the journal config is configurable in M2+.
+    let dir = TempDir::new().unwrap();
+    let mut storage = JournalLogStorage::open(dir.path()).expect("open");
+
+    // Append 5 entries.
+    let entries: Vec<Entry<uc_node::raft::TypeConfig>> = (1..=5u64)
+        .map(|i| Entry {
+            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), i),
+            payload: EntryPayload::Normal(bytes::Bytes::from(format!("cmd-{i}"))),
+        })
+        .collect();
+    storage.blocking_append(entries).await.expect("append");
+
+    // Purge through index 3.
+    let purge_thru = openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 3);
+    storage.purge(purge_thru).await.expect("purge");
+
+    // Records 4 and 5 must still be readable.
+    let read = storage
+        .try_get_log_entries(4u64..=5u64)
+        .await
+        .expect("read");
+    assert_eq!(read.len(), 2, "records 4 and 5 must survive purge through 3");
+    assert_eq!(read[0].log_id.index, 4);
+    assert_eq!(read[1].log_id.index, 5);
+
+    // get_log_state should report last_log_id at index 5.
+    let state = storage.get_log_state().await.expect("get_log_state");
+    assert_eq!(state.last_log_id.map(|l| l.index), Some(5));
+    assert_eq!(state.last_purged_log_id.map(|l| l.index), Some(3));
+}
