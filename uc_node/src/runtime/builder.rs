@@ -5,7 +5,6 @@
 //! openraft 0.9.24 deviations from the original spec are documented inline.
 
 use std::collections::BTreeMap;
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use openraft::{Config as RaftConfigOpenraft, Raft};
@@ -24,7 +23,6 @@ use crate::raft::{NodeAddr, NodeId};
 pub struct NodeBuilder<S: StateMachine> {
     config: NodeConfig,
     state_machine: S,
-    _phantom: PhantomData<S>,
 }
 
 impl<S: StateMachine> NodeBuilder<S> {
@@ -32,7 +30,6 @@ impl<S: StateMachine> NodeBuilder<S> {
         Self {
             config,
             state_machine,
-            _phantom: PhantomData,
         }
     }
 
