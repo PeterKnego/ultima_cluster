@@ -42,6 +42,9 @@ impl<S: StateMachine> NodeBuilder<S> {
         // Open log storage (journal + StableValues).
         let log_storage = JournalLogStorage::open(&self.config.data_dir)?;
 
+        // Sanity-check durable state before handing off to openraft.
+        crate::runtime::recovery::assert_consistent(&log_storage)?;
+
         // Adapter over user's state machine. Clone (Arc<Mutex<_>>-shared) so
         // NodeHandle can keep a handle for the M1.b query path.
         let sm_adapter = AdaptedStateMachine::new(self.state_machine);
