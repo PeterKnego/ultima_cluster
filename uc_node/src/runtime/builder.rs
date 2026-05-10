@@ -118,7 +118,6 @@ impl<S: StateMachine> NodeBuilder<S> {
             raft,
             config: self.config,
             sm: sm_adapter_handle,
-            _phantom: PhantomData,
         })
     }
 }

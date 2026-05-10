@@ -5,8 +5,6 @@
 //! worker. The shape (submit / current_leader / node_id / shutdown) stays the
 //! same.
 
-use std::marker::PhantomData;
-
 use bytes::Bytes;
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::Raft;
@@ -24,11 +22,9 @@ pub struct NodeHandle<S: StateMachine> {
     pub(crate) config: NodeConfig,
     /// Cloned handle to the user state-machine adapter. The Raft engine owns
     /// another clone internally; both share the same `Arc<Mutex<Inner<S>>>`.
-    /// Kept here so that Task 13 (`query`) can reach the user SM directly
-    /// without going through Raft.
-    #[allow(dead_code)] // wired up in Task 13 (query closure).
+    /// Used by `query_snapshot` to reach the user SM directly without going
+    /// through Raft.
     pub(crate) sm: AdaptedStateMachine<S>,
-    pub(crate) _phantom: PhantomData<S>,
 }
 
 impl<S: StateMachine> NodeHandle<S> {
@@ -57,6 +53,20 @@ impl<S: StateMachine> NodeHandle<S> {
         let (resp, _) =
             bincode::serde::decode_from_slice::<S::Response, _>(&resp_bytes, bincode::config::standard())?;
         Ok(resp)
+    }
+
+    /// Embedded-mode snapshot read: run a closure against the applied state.
+    /// Holds the same Mutex that `apply` takes, so it sees a consistent
+    /// view (no torn state across multiple reads inside the closure).
+    /// Returns the closure's value.
+    ///
+    /// M1 only — M3 introduces typed Query types over a shmem ring.
+    pub async fn query_snapshot<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&S) -> R + Send,
+        R: Send,
+    {
+        self.sm.with_state(f).await
     }
 
     pub async fn shutdown(self) -> Result<(), ClusterError> {

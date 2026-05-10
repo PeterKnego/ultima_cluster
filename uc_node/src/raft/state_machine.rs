@@ -71,6 +71,20 @@ impl<S: StateMachine> Clone for AdaptedStateMachine<S> {
     }
 }
 
+impl<S: StateMachine> AdaptedStateMachine<S> {
+    /// Run a closure against the locked applied state.
+    /// Used by embedded `NodeHandle::query_snapshot` (M1).
+    /// M3 will replace this with typed Query types over a shmem ring.
+    pub async fn with_state<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce(&S) -> R + Send,
+        R: Send,
+    {
+        let g = self.inner.lock().await;
+        f(&g.sm)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RaftStateMachine impl
 // ---------------------------------------------------------------------------
