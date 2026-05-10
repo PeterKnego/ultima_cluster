@@ -41,7 +41,6 @@ pub(crate) struct Inner<S: StateMachine> {
     pub(crate) sm: S,
     pub(crate) last_applied: Option<LogId<NodeId>>,
     pub(crate) last_membership: StoredMembership<NodeId, NodeAddr>,
-    pub(crate) snapshot_idx: u64,
     pub(crate) current_snapshot: Option<StoredSnapshot>,
 }
 
@@ -58,7 +57,6 @@ impl<S: StateMachine> AdaptedStateMachine<S> {
                 sm,
                 last_applied: None,
                 last_membership: StoredMembership::default(),
-                snapshot_idx: 0,
                 current_snapshot: None,
             })),
         }
@@ -237,11 +235,11 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for AdaptedSnapshotBuilder
             last_applied
         );
 
-        g.snapshot_idx += 1;
+        let snapshot_id_index = last_applied.map(|l| l.index).unwrap_or(0);
         let meta = SnapshotMeta {
             last_log_id: last_applied,
             last_membership,
-            snapshot_id: format!("snap-{}", g.snapshot_idx),
+            snapshot_id: format!("snap-{snapshot_id_index}"),
         };
         let stored = StoredSnapshot {
             meta: meta.clone(),
