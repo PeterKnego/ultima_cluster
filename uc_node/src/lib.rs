@@ -3,9 +3,9 @@
 pub mod config;
 pub mod error;
 pub mod raft;
-// pub mod runtime;    // enabled in Task 12
+pub mod runtime;
 
 pub use config::{BootstrapConfig, NodeConfig, NodeId, PeerSeed, RaftTuning};
 pub use error::ClusterError;
-// pub use runtime::builder::NodeBuilder;     // enabled in Task 12
-// pub use runtime::node::NodeHandle;         // enabled in Task 12
+pub use runtime::builder::NodeBuilder;
+pub use runtime::node::NodeHandle;
