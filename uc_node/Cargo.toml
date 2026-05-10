@@ -23,6 +23,7 @@ quinn = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
+crc32fast = "1"
 
 [dev-dependencies]
 uc_node = { path = ".", features = ["test-helpers"] }
