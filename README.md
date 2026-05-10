@@ -4,7 +4,7 @@ SMR cluster implementation on top of openraft.
 
 **Status:** M1 — embedded single-node skeleton complete. See
 `docs/superpowers/specs/2026-05-10-ultima-cluster-design.md` for the
-canonical design and `docs/superpowers/plans/` for milestone plans.
+canonical design and `docs/tasks/` for per-milestone records.
 
 ## Workspace
 
