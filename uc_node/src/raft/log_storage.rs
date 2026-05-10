@@ -9,22 +9,43 @@
 //!   * try_get_log_entries → Journal::iter_range
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use openraft::{LogId, Vote};
+use openraft::{LogId, StoredMembership, Vote};
 use ultima_journal::{Durability, Journal, JournalConfig, StableValue, StableValueConfig};
 
-use super::NodeId;
+use super::{NodeAddr, NodeId};
 use crate::ClusterError;
 
 const SEGMENT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Persisted snapshot meta (the last installed snapshot's metadata + a
+/// pointer to its bytes file under data_dir).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredSnapshotMeta {
+    pub last_log_id: Option<LogId<NodeId>>,
+    pub last_membership: StoredMembership<NodeId, NodeAddr>,
+    /// Filename (relative to data_dir) of the snapshot bytes.
+    pub bytes_filename: String,
+}
+
+/// Bundle of durable handles + data_dir, passed to `AdaptedStateMachine::new`
+/// so it can persist install_snapshot state and recover on startup.
+pub struct LogStorageHandles {
+    pub last_applied: Arc<StableValue<LogId<NodeId>>>,
+    pub snapshot_meta: Arc<StableValue<StoredSnapshotMeta>>,
+    pub data_dir: PathBuf,
+}
 
 pub struct JournalLogStorage {
     pub(crate) journal: Arc<Journal>,
     pub(crate) vote: Arc<StableValue<Vote<NodeId>>>,
     pub(crate) committed: Arc<StableValue<LogId<NodeId>>>,
     pub(crate) last_purged: Arc<StableValue<LogId<NodeId>>>,
+    pub(crate) last_applied: Arc<StableValue<LogId<NodeId>>>,
+    pub(crate) snapshot_meta: Arc<StableValue<StoredSnapshotMeta>>,
     /// Serializes seq assignment per the journal's caller-coordination requirement.
     /// openraft already serializes appends, so this is a no-contention guarantee.
     pub(crate) append_lock: Arc<Mutex<()>>,
@@ -58,13 +79,35 @@ impl JournalLogStorage {
             max_payload_bytes: 4096 - 17,
         })?);
 
+        let last_applied = Arc::new(StableValue::open(StableValueConfig {
+            path: data_dir.join("last_applied.state"),
+            durability: Durability::Consistent,
+            max_payload_bytes: 4096 - 17,
+        })?);
+
+        let snapshot_meta = Arc::new(StableValue::open(StableValueConfig {
+            path: data_dir.join("snapshot_meta.state"),
+            durability: Durability::Consistent,
+            max_payload_bytes: 4096 - 17,
+        })?);
+
         Ok(Self {
             journal,
             vote,
             committed,
             last_purged,
+            last_applied,
+            snapshot_meta,
             append_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    pub fn handles(&self, data_dir: PathBuf) -> LogStorageHandles {
+        LogStorageHandles {
+            last_applied: self.last_applied.clone(),
+            snapshot_meta: self.snapshot_meta.clone(),
+            data_dir,
+        }
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
@@ -78,6 +121,14 @@ impl JournalLogStorage {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn _testonly_last_purged(&self) -> &StableValue<LogId<NodeId>> {
         &self.last_purged
+    }
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn _testonly_last_applied(&self) -> &StableValue<LogId<NodeId>> {
+        &self.last_applied
+    }
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn _testonly_snapshot_meta(&self) -> &StableValue<StoredSnapshotMeta> {
+        &self.snapshot_meta
     }
 }
 
@@ -239,6 +290,8 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             vote: self.vote.clone(),
             committed: self.committed.clone(),
             last_purged: self.last_purged.clone(),
+            last_applied: self.last_applied.clone(),
+            snapshot_meta: self.snapshot_meta.clone(),
             append_lock: self.append_lock.clone(),
         }
     }

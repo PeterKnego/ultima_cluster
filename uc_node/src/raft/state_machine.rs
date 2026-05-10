@@ -21,14 +21,17 @@
 //!     because we don't have a snapshot-id at the failure point).
 
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot, SnapshotMeta};
 use openraft::{EntryPayload, LogId, StorageError, StorageIOError, StoredMembership};
 use tokio::sync::Mutex;
+use ultima_journal::StableValue;
 
 use uc_service::StateMachine;
 
+use super::log_storage::{LogStorageHandles, StoredSnapshotMeta};
 use super::{NodeAddr, NodeId, TypeConfig};
 
 /// Adapter from openraft's `RaftStateMachine` to the user-supplied
@@ -42,6 +45,9 @@ pub(crate) struct Inner<S: StateMachine> {
     pub(crate) last_applied: Option<LogId<NodeId>>,
     pub(crate) last_membership: StoredMembership<NodeId, NodeAddr>,
     pub(crate) current_snapshot: Option<StoredSnapshot>,
+    pub(crate) last_applied_sv: Arc<StableValue<LogId<NodeId>>>,
+    pub(crate) snapshot_meta_sv: Arc<StableValue<StoredSnapshotMeta>>,
+    pub(crate) snapshot_bytes_dir: PathBuf,
 }
 
 #[derive(Clone)]
@@ -51,13 +57,52 @@ pub(crate) struct StoredSnapshot {
 }
 
 impl<S: StateMachine> AdaptedStateMachine<S> {
-    pub fn new(sm: S) -> Self {
+    pub fn new(sm: S, handles: LogStorageHandles) -> Self {
+        // Recover persisted state on startup.
+        let loaded_last_applied = handles.last_applied.load().ok().flatten();
+        let loaded_snapshot_meta = handles.snapshot_meta.load().ok().flatten();
+
+        let (last_membership, current_snapshot) = match loaded_snapshot_meta {
+            Some(meta) => {
+                let bytes_path = handles.data_dir.join(&meta.bytes_filename);
+                let bytes = std::fs::read(&bytes_path).unwrap_or_default();
+                let openraft_meta = SnapshotMeta {
+                    last_log_id: meta.last_log_id,
+                    last_membership: meta.last_membership.clone(),
+                    snapshot_id: format!(
+                        "snap-{}",
+                        meta.last_log_id.map(|l| l.index).unwrap_or(0)
+                    ),
+                };
+                (
+                    meta.last_membership,
+                    Some(StoredSnapshot {
+                        meta: openraft_meta,
+                        data: bytes,
+                    }),
+                )
+            }
+            None => (StoredMembership::default(), None),
+        };
+
+        // If a snapshot exists, install it into the user's state machine so its
+        // in-memory state matches the durable snapshot at startup.
+        let mut sm = sm;
+        if let Some(ref snap) = current_snapshot {
+            let mut cursor = std::io::Cursor::new(snap.data.clone());
+            // Errors here are non-fatal; openraft will resync if needed.
+            let _ = sm.install_snapshot(&mut cursor);
+        }
+
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 sm,
-                last_applied: None,
-                last_membership: StoredMembership::default(),
-                current_snapshot: None,
+                last_applied: loaded_last_applied,
+                last_membership,
+                current_snapshot,
+                last_applied_sv: handles.last_applied,
+                snapshot_meta_sv: handles.snapshot_meta,
+                snapshot_bytes_dir: handles.data_dir,
             })),
         }
     }
@@ -181,6 +226,68 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
             user_last_applied, meta_index,
             "user install_snapshot returned index {user_last_applied} but meta.last_log_id.index is {meta_index}",
         );
+
+        // Durable-first: persist bytes + last_applied + snapshot_meta BEFORE
+        // touching in-memory state, so a crash anywhere after this point
+        // recovers to a consistent installed snapshot.
+
+        // Write snapshot bytes to a uniquely-named file in data_dir.
+        let bytes_filename = format!(
+            "snapshot_{}.bin",
+            meta.last_log_id.map(|l| l.index).unwrap_or(0)
+        );
+        let bytes_path = g.snapshot_bytes_dir.join(&bytes_filename);
+        std::fs::write(&bytes_path, &bytes).map_err(|e| {
+            StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e)
+        })?;
+        let f = std::fs::File::open(&bytes_path).map_err(|e| {
+            StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e)
+        })?;
+        f.sync_all().map_err(|e| {
+            StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e)
+        })?;
+        drop(f);
+
+        // Persist last_applied (if present).
+        if let Some(lid) = meta.last_log_id {
+            g.last_applied_sv
+                .store(&lid)
+                .map_err(|e| {
+                    StorageIOError::<NodeId>::read_snapshot(
+                        Some(meta.signature()),
+                        &std::io::Error::other(e.to_string()),
+                    )
+                })?
+                .wait()
+                .map_err(|e| {
+                    StorageIOError::<NodeId>::read_snapshot(
+                        Some(meta.signature()),
+                        &std::io::Error::other(e.to_string()),
+                    )
+                })?;
+        }
+
+        // Persist snapshot meta (atomic pointer to the bytes file).
+        let stored_meta = StoredSnapshotMeta {
+            last_log_id: meta.last_log_id,
+            last_membership: meta.last_membership.clone(),
+            bytes_filename: bytes_filename.clone(),
+        };
+        g.snapshot_meta_sv
+            .store(&stored_meta)
+            .map_err(|e| {
+                StorageIOError::<NodeId>::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(e.to_string()),
+                )
+            })?
+            .wait()
+            .map_err(|e| {
+                StorageIOError::<NodeId>::read_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(e.to_string()),
+                )
+            })?;
 
         g.last_applied = meta.last_log_id;
         g.last_membership = meta.last_membership.clone();

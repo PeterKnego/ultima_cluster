@@ -6,7 +6,7 @@ use openraft::storage::RaftLogStorage as _;
 use openraft::storage::RaftLogStorageExt as _;
 use openraft::{Entry, EntryPayload, Vote};
 use tempfile::TempDir;
-use uc_node::raft::log_storage::JournalLogStorage;
+use uc_node::raft::log_storage::{JournalLogStorage, StoredSnapshotMeta};
 
 #[test]
 fn reopen_observes_empty_state() {
@@ -184,4 +184,47 @@ async fn purge_retains_higher_indices() {
     let state = storage.get_log_state().await.expect("get_log_state");
     assert_eq!(state.last_log_id.map(|l| l.index), Some(5));
     assert_eq!(state.last_purged_log_id.map(|l| l.index), Some(3));
+}
+
+#[tokio::test]
+async fn snapshot_meta_survives_reopen() {
+    let dir = TempDir::new().unwrap();
+    let storage = JournalLogStorage::open(dir.path()).expect("open");
+
+    // Initially None.
+    assert!(
+        storage
+            ._testonly_snapshot_meta()
+            .load()
+            .expect("load")
+            .is_none()
+    );
+
+    // Store a snapshot meta.
+    let meta = StoredSnapshotMeta {
+        last_log_id: Some(openraft::LogId::new(
+            openraft::CommittedLeaderId::new(5, 0),
+            100,
+        )),
+        last_membership: openraft::StoredMembership::default(),
+        bytes_filename: "snapshot_100.bin".into(),
+    };
+    storage
+        ._testonly_snapshot_meta()
+        .store(&meta)
+        .expect("store")
+        .wait()
+        .expect("wait");
+
+    // Reopen and verify.
+    drop(storage);
+    let storage = JournalLogStorage::open(dir.path()).expect("reopen");
+    let loaded = storage
+        ._testonly_snapshot_meta()
+        .load()
+        .expect("load after reopen");
+    assert!(loaded.is_some());
+    let loaded = loaded.unwrap();
+    assert_eq!(loaded.bytes_filename, "snapshot_100.bin");
+    assert_eq!(loaded.last_log_id.map(|l| l.index), Some(100));
 }

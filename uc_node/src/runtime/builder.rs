@@ -44,7 +44,8 @@ impl<S: StateMachine> NodeBuilder<S> {
 
         // Adapter over user's state machine. Clone (Arc<Mutex<_>>-shared) so
         // NodeHandle can keep a handle for the M1.b query path.
-        let sm_adapter = AdaptedStateMachine::new(self.state_machine);
+        let handles = log_storage.handles(self.config.data_dir.clone());
+        let sm_adapter = AdaptedStateMachine::new(self.state_machine, handles);
         let sm_adapter_handle = sm_adapter.clone();
 
         // openraft::Config — fields are u64 (millis), not Duration. Validate
