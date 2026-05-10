@@ -24,3 +24,6 @@ uc_service = { path = "../uc_service" }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[features]
+test-helpers = []
