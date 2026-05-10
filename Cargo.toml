@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["uc_protocol"]
+members = ["uc_protocol", "uc_service"]
 
 [workspace.package]
 edition = "2024"
