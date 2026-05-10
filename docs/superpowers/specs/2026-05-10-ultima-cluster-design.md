@@ -238,8 +238,15 @@ pub trait StateMachine: Send + Sync + 'static {
     /// StoreStateMachine derives this from Store::latest_version automatically.
     fn last_applied(&self) -> Option<u64>;
 
-    fn build_snapshot(&self, dst: &mut dyn Write) -> Result<(), SnapshotError>;
-    fn install_snapshot(&mut self, src: &mut dyn Read) -> Result<(), SnapshotError>;
+    /// Write a self-contained snapshot of current state to `dst`.
+    /// Returns the log_index this snapshot represents (resolves the build-vs-apply race
+    /// where last_applied may advance between the framework's decision and the call).
+    /// MUST NOT block the apply path; use a frozen view of state internally.
+    fn build_snapshot(&self, dst: &mut dyn Write) -> Result<u64, SnapshotError>;
+
+    /// Atomically replace state with the snapshot bytes from `src`.
+    /// Returns the new last_applied. On any error, existing state MUST be untouched.
+    fn install_snapshot(&mut self, src: &mut dyn Read) -> Result<u64, SnapshotError>;
 }
 ```
 
@@ -266,20 +273,94 @@ pub struct NoopOutput;   // OutputHandler<S> for any S
 
 Delivery is at-least-once with a durable progress marker (`output_progress.state` on node side). On leader transition, the new leader scans `(last_completed, last_applied]` and re-runs `on_committed` for each — `log_index` is the natural idempotency key; user's responsibility to make `on_committed` idempotent.
 
-### `uc_service::StoreStateMachine` (the ultima_db convenience adapter)
+### `uc_service::ultima_db` — the canonical ultima_db adapter module
+
+`ultima_db` is the default state/snapshotting engine for UC. The `uc_service::ultima_db` module ships a complete `StateMachine` implementation against `ultima_db::Store` so that users adopting the default path implement zero snapshot logic and zero version-pinning logic. Gated behind the `ultima_db` Cargo feature (on by default); turn it off and the dep drops.
+
+**Module layout:**
+
+```
+uc_service/src/ultima_db/
+├── mod.rs                      # public re-exports
+├── store_state_machine.rs      # the adapter struct + impl StateMachine
+├── builder.rs                  # fluent StoreStateMachineBuilder
+├── snapshot.rs                 # build/install wiring over Store::snapshot_stream
+└── recovery.rs                 # startup helper: Store::recover() + last_applied derivation
+```
+
+**Adapter:**
 
 ```rust
-pub struct StoreStateMachine<C, R, Q, QR, FA, FQ> { /* … */ }
+pub struct StoreStateMachine<C, R, Q, QR> { /* … */ }
 
-impl<C, R, Q, QR, FA, FQ> StoreStateMachine<C, R, Q, QR, FA, FQ>
+impl<C, R, Q, QR> StoreStateMachine<C, R, Q, QR>
 where
-    FA: Fn(&mut WriteTx<'_>, C) -> R + Send + Sync + 'static,
-    FQ: Fn(&ReadTx<'_>, Q) -> QR + Send + Sync + 'static,
+    C: Serialize + DeserializeOwned + Send + Sync + 'static,
+    R: Serialize + DeserializeOwned + Send + 'static,
+    Q: Serialize + DeserializeOwned + Send + Sync + 'static,
+    QR: Serialize + DeserializeOwned + Send + 'static,
 {
-    pub fn new(store: Store, apply_fn: FA, query_fn: FQ) -> Self;
+    pub fn builder(store: Store) -> StoreStateMachineBuilder<C, R, Q, QR>;
 }
-// + impl StateMachine — pins ultima_db version to log_index, wires snapshot_stream end-to-end.
+
+pub struct StoreStateMachineBuilder<C, R, Q, QR> { /* … */ }
+impl<C, R, Q, QR> StoreStateMachineBuilder<C, R, Q, QR> {
+    pub fn apply_fn<F>(self, f: F) -> Self
+        where F: Fn(&mut WriteTx<'_>, C) -> R + Send + Sync + 'static;
+    pub fn query_fn<F>(self, f: F) -> Self
+        where F: Fn(&ReadTx<'_>, Q) -> QR + Send + Sync + 'static;
+    pub fn build(self) -> Result<StoreStateMachine<C, R, Q, QR>, BuildError>;
+}
 ```
+
+**StateMachine method coverage** — all wired automatically:
+
+| `StateMachine` method | Adapter implementation |
+|---|---|
+| `apply(log_index, cmd)` | `store.begin_write(Some(log_index))` → user's `apply_fn(&mut tx, cmd)` → `tx.commit()` (auto version-pinned to log_index) |
+| `query(q)` | `store.begin_read(None)` → user's `query_fn(&tx, q)` |
+| `last_applied()` | `Some(store.latest_version())` after recovery, else None |
+| `build_snapshot(dst)` | `let r = store.snapshot_stream(None)?; io::copy(&mut r, dst)?; Ok(store.latest_version())` |
+| `install_snapshot(src)` | `store.install_snapshot_stream(src, InstallOptions::default())?; store.checkpoint()?; Ok(store.latest_version())` |
+
+**User code** (entire ultima_db service binary):
+
+```rust
+use uc_service::ultima_db::StoreStateMachine;
+use uc_service::{ServiceBuilder, ServiceConfig};
+use ultima_db::{Store, StoreConfig, Persistence};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut store = Store::new(StoreConfig {
+        persistence: Persistence::Smr { dir: "/var/lib/myapp/db".into() },
+        ..Default::default()
+    });
+    store.register_table::<MyRecord>("my_table")?;
+    store.recover()?;
+
+    let sm = StoreStateMachine::builder(store)
+        .apply_fn(|tx, cmd: MyCommand| -> MyResponse { /* … */ })
+        .query_fn(|tx, q: MyQuery| -> MyQueryResponse { /* … */ })
+        .build()?;
+
+    ServiceBuilder::new(ServiceConfig::from_env()?, sm).run().await?;
+    Ok(())
+}
+```
+
+**Snapshot integration leans entirely on task27:**
+- `Store::snapshot_stream(None)` — non-blocking build via frozen `Arc<Snapshot>`. MVCC keeps the snapshot valid as new writers commit. Verified in ultima_db's `snapshot_build_does_not_block_concurrent_writes` test. **This is what makes "build snapshot during steady-state apply" not stall the cluster.**
+- `Store::install_snapshot_stream(reader, opts)` — atomic install via single `Arc` swap. Either fully visible or destination Store untouched on any error. Crash mid-install drops in-memory build state with no on-disk effect (until next checkpoint).
+- `Store::checkpoint()` is called immediately after install so a subsequent `Store::recover()` reads back the just-installed state.
+- `InstallOptions::commit_version` — task27 left this field for SMR deployments. Currently the adapter ignores it (per task27's v1 limitation) and uses `store.checkpoint()` for version durability. When ultima_db gains version-pinned install support, the adapter switches to passing `commit_version: Some(log_index)` directly.
+
+**Recovery integration** (`recovery.rs`):
+- On `ServiceBuilder::run`, the adapter's startup hook calls `store.recover()` (loads latest checkpoint), reports `last_applied = store.latest_version()` to the framework during shmem handshake, and is ready to receive backfill via `apply.ring`.
+- If the framework determines `service.last_applied < node.last_purged`, it triggers a snapshot install via the standard `service/snapshot.region` flow — adapter handles it transparently.
+
+**Why this lives in `uc_service` (not a separate crate):**
+The dep is opt-out (Cargo feature, default-on); users avoiding ultima_db turn it off and the dep doesn't link. A separate crate would force users into a second `use ultima_cluster_service_db::…` import for the canonical path — friction without compensating benefit. The feature gate gives clean dep control without splitting the workspace further.
 
 ### `uc_service::ServiceBuilder` (entry point)
 
