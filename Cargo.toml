@@ -26,6 +26,12 @@ openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 ultima-journal = { path = "../ultima_db/ultima_journal" }
 # ultima_db deliberately omitted in M1; arrives in M3 as a uc_service feature
 
+# QUIC + TLS (M2)
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+rustls-pemfile = "2"
+
 # dev
 tempfile = "3"
 anyhow = "1"

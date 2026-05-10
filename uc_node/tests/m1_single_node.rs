@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
-use uc_node::{BootstrapConfig, NodeBuilder, NodeConfig, RaftTuning};
+use uc_node::{BootstrapConfig, NodeBuilder, NodeConfig, RaftTuning, TlsConfig};
 use uc_service::{SnapshotError, StateMachine};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -86,6 +86,7 @@ fn cfg(data_dir: PathBuf, bootstrap: BootstrapConfig) -> NodeConfig {
         app_id: "counter-test".into(),
         bootstrap,
         raft: RaftTuning::default(),
+        tls: TlsConfig::default(),
     }
 }
 

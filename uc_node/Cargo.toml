@@ -19,6 +19,10 @@ openraft = { workspace = true }
 ultima-journal = { workspace = true }
 uc_protocol = { path = "../uc_protocol" }
 uc_service = { path = "../uc_service" }
+quinn = { workspace = true }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 uc_node = { path = ".", features = ["test-helpers"] }

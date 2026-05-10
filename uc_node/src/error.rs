@@ -30,6 +30,8 @@ pub enum ClusterError {
     ShutDown,
     #[error("io: {0}")]
     Io(#[from] io::Error),
+    #[error("network: {0}")]
+    Network(#[from] crate::network::NetworkError),
     #[error("bincode: {0}")]
     Bincode(String),
 }

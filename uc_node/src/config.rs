@@ -11,6 +11,20 @@ pub struct NodeConfig {
     pub app_id: String,
     pub bootstrap: BootstrapConfig,
     pub raft: RaftTuning,
+    /// TLS configuration for inter-node QUIC. M2 supports `SelfSigned`;
+    /// `Files` (operator-provided certs) arrives in M5.
+    pub tls: TlsConfig,
+}
+
+/// TLS configuration for inter-node QUIC.
+///
+/// M2 supports `SelfSigned`. `Files` (operator-provided certs) and
+/// `Insecure` (no TLS) arrive in M5 production polish.
+#[derive(Debug, Clone, Default)]
+pub enum TlsConfig {
+    /// Generate a self-signed cert at first start; persist to `data_dir/tls.{crt,key}`.
+    #[default]
+    SelfSigned,
 }
 
 #[derive(Debug, Clone)]
