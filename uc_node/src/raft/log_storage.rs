@@ -185,16 +185,43 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
                     let io_err = std::io::Error::other(format!("missing last record at seq {seq}"));
                     StorageIOError::<NodeId>::read_logs(&io_err)
                 })?;
-            let (term, _payload) = rec;
-            // CommittedLeaderId<NID> is LeaderId<NID> = { term, node_id }; node_id is
-            // recorded in the entry payload (bincode-encoded), but the fast-path
-            // log-state lookup only needs term + index. Use 0 as the node-id
-            // placeholder — openraft uses get_log_state purely for term/index
-            // comparisons during election bootstrap.
-            Some(openraft::LogId::new(
-                openraft::CommittedLeaderId::new(term, 0),
-                seq,
-            ))
+            let (_term, payload) = rec;
+            // M2 Task 1 audit (openraft 0.9.24):
+            //
+            // openraft's default leader_id mode is `leader_id_adv` (selected by
+            // `#[cfg(not(feature = "single-term-leader"))]` at
+            // src/vote/leader_id/mod.rs). Our workspace enables openraft features
+            // = ["serde", "storage-v2"] only — `single-term-leader` is OFF — so
+            // the adv mode is in use.
+            //
+            // In adv mode (src/vote/leader_id/leader_id_adv.rs):
+            //   pub struct LeaderId<NID> { pub term: u64, pub node_id: NID }
+            //   #[derive(PartialOrd, Ord)]
+            //   pub type CommittedLeaderId<NID> = LeaderId<NID>;
+            //
+            // `node_id` IS stored and IS part of the lexicographic (term, node_id)
+            // ordering. Synthesizing `CommittedLeaderId::new(term, 0)` would give
+            // wrong comparison results when the real leader's node_id != 0
+            // (which is the multi-node M2 case).
+            //
+            // Recover the real leader_id by bincode-decoding the entry payload —
+            // append() stored it via `encode_to_vec(&entry, ...)`. The journal's
+            // meta(=term) is now redundant for this path; we keep it as an
+            // integrity check below.
+            let (entry, _) = bincode::serde::decode_from_slice::<openraft::Entry<TypeConfig>, _>(
+                &payload,
+                bincode::config::standard(),
+            )
+            .map_err(|e| {
+                let io_err = std::io::Error::other(e.to_string());
+                StorageIOError::<NodeId>::read_logs(&io_err)
+            })?;
+            // Defensive: journal meta(term) and decoded entry term must agree.
+            // `seq` (journal sequence) and `entry.log_id.index` are likewise
+            // append()-coupled — divergence indicates corruption.
+            debug_assert_eq!(entry.log_id.leader_id.term, _term);
+            debug_assert_eq!(entry.log_id.index, seq);
+            Some(entry.log_id)
         } else {
             // Empty journal: last_log_id falls back to last_purged (or None).
             last_purged_log_id
