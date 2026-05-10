@@ -12,6 +12,10 @@ pub type NodeId = u64;
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeAddr {
     pub raft_addr: SocketAddr,
+    /// Reserved for M2: client-facing address.
+    /// Always None in M1 (no QUIC, no remote clients yet).
+    #[serde(default)]
+    pub client_addr: Option<SocketAddr>,
 }
 
 // openraft's `Node` supertrait requires `Default`. `SocketAddr` itself has no `Default`,
@@ -22,6 +26,7 @@ impl Default for NodeAddr {
     fn default() -> Self {
         Self {
             raft_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)),
+            client_addr: None,
         }
     }
 }

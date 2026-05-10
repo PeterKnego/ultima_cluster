@@ -88,6 +88,7 @@ impl<S: StateMachine> NodeBuilder<S> {
                     self.config.node_id,
                     NodeAddr {
                         raft_addr: self.config.raft_listen_addr,
+                        client_addr: None,
                     },
                 );
                 // openraft's `initialize()` returns InitializeError::NotAllowed when
