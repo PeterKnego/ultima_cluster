@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use uc_node::raft::log_storage::JournalLogStorage;
 
 #[test]
-fn open_creates_fresh_data_dir() {
+fn reopen_observes_empty_state() {
     let dir = TempDir::new().unwrap();
     let storage = JournalLogStorage::open(dir.path()).expect("open");
     drop(storage);

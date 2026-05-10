@@ -1346,6 +1346,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uc_node",
  "uc_protocol",
  "uc_service",
  "ultima-journal",

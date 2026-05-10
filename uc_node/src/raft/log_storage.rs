@@ -68,9 +68,7 @@ impl JournalLogStorage {
             append_lock: Arc::new(Mutex::new(())),
         })
     }
-}
 
-impl JournalLogStorage {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn _testonly_vote(&self) -> &StableValue<Vote<NodeId>> { &self.vote }
     #[cfg(any(test, feature = "test-helpers"))]
