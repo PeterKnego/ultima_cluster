@@ -17,9 +17,9 @@ use uc_service::StateMachine;
 use crate::ClusterError;
 use crate::config::{NodeConfig, NodeId};
 use crate::network::server::ServerHandle;
+use crate::raft::NodeAddr;
 use crate::raft::TypeConfig;
 use crate::raft::state_machine::AdaptedStateMachine;
-use crate::raft::NodeAddr;
 
 /// Public handle returned by [`NodeBuilder::start`](super::builder::NodeBuilder::start).
 pub struct NodeHandle<S: StateMachine> {
@@ -105,10 +105,7 @@ impl<S: StateMachine> NodeHandle<S> {
     /// Change the membership to the given set of voters.
     /// Uses openraft 0.9.24 `change_membership(members, retain=false)`: nodes
     /// not in `voters` are removed from the cluster (not retained as learners).
-    pub async fn change_membership(
-        &self,
-        voters: BTreeSet<NodeId>,
-    ) -> Result<(), ClusterError> {
+    pub async fn change_membership(&self, voters: BTreeSet<NodeId>) -> Result<(), ClusterError> {
         self.raft
             .change_membership(voters, false)
             .await

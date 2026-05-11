@@ -416,4 +416,3 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
         Ok(())
     }
 }
-

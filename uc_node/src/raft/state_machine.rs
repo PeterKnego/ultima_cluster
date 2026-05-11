@@ -69,10 +69,7 @@ impl<S: StateMachine> AdaptedStateMachine<S> {
                 let openraft_meta = SnapshotMeta {
                     last_log_id: meta.last_log_id,
                     last_membership: meta.last_membership.clone(),
-                    snapshot_id: format!(
-                        "snap-{}",
-                        meta.last_log_id.map(|l| l.index).unwrap_or(0)
-                    ),
+                    snapshot_id: format!("snap-{}", meta.last_log_id.map(|l| l.index).unwrap_or(0)),
                 };
                 (
                     meta.last_membership,
@@ -277,15 +274,12 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
         // file (if any) becomes orphaned. Implement cleanup when M5 hardens
         // snapshot lifecycle (e.g. via the snapshot.region mmap'd transport).
         let bytes_path = g.snapshot_bytes_dir.join(&bytes_filename);
-        std::fs::write(&bytes_path, &bytes).map_err(|e| {
-            StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e)
-        })?;
-        let f = std::fs::File::open(&bytes_path).map_err(|e| {
-            StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e)
-        })?;
-        f.sync_all().map_err(|e| {
-            StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e)
-        })?;
+        std::fs::write(&bytes_path, &bytes)
+            .map_err(|e| StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e))?;
+        let f = std::fs::File::open(&bytes_path)
+            .map_err(|e| StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e))?;
+        f.sync_all()
+            .map_err(|e| StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e))?;
         drop(f);
         // M5 hardening: also fsync the parent directory to guarantee the
         // directory entry is durable, not just the file inode. For now we

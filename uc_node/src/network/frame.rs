@@ -21,14 +21,14 @@ use super::NetworkError;
 #[repr(u8)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum MessageType {
-    AppendEntriesReq    = 1,
-    AppendEntriesResp   = 2,
-    VoteReq             = 3,
-    VoteResp            = 4,
-    InstallSnapshotReq  = 5,
+    AppendEntriesReq = 1,
+    AppendEntriesResp = 2,
+    VoteReq = 3,
+    VoteResp = 4,
+    InstallSnapshotReq = 5,
     InstallSnapshotResp = 6,
-    Handshake           = 10,
-    HandshakeAck        = 11,
+    Handshake = 10,
+    HandshakeAck = 11,
 }
 
 impl MessageType {
@@ -48,8 +48,8 @@ impl MessageType {
     }
 }
 
-const HEADER_LEN: usize = 1 + 1 + 8 + 4;     // 14 bytes
-const TRAILER_LEN: usize = 4;                 // body_crc32
+const HEADER_LEN: usize = 1 + 1 + 8 + 4; // 14 bytes
+const TRAILER_LEN: usize = 4; // body_crc32
 
 /// Maximum allowed body length on a single frame, to bound memory
 /// allocations from attacker-controlled `body_len` headers. 16 MiB is
@@ -66,12 +66,24 @@ pub struct Frame {
 
 impl Frame {
     pub fn new_request(msg_type: MessageType, request_id: u64, body: Bytes) -> Self {
-        Self { msg_type, flags: 0, request_id, body }
+        Self {
+            msg_type,
+            flags: 0,
+            request_id,
+            body,
+        }
     }
     pub fn new_response(msg_type: MessageType, request_id: u64, body: Bytes) -> Self {
-        Self { msg_type, flags: 1, request_id, body }
+        Self {
+            msg_type,
+            flags: 1,
+            request_id,
+            body,
+        }
     }
-    pub fn is_response(&self) -> bool { self.flags & 1 != 0 }
+    pub fn is_response(&self) -> bool {
+        self.flags & 1 != 0
+    }
 
     /// Encode the frame as a `BytesMut`. Includes header + body + CRC32 trailer.
     pub fn encode(&self) -> BytesMut {
@@ -91,7 +103,9 @@ impl Frame {
     pub fn decode(buf: &mut Bytes) -> Result<Frame, NetworkError> {
         if buf.len() < HEADER_LEN {
             return Err(NetworkError::Decode(format!(
-                "need {HEADER_LEN} bytes for header, have {}", buf.len())));
+                "need {HEADER_LEN} bytes for header, have {}",
+                buf.len()
+            )));
         }
         let msg_type_byte = buf.get_u8();
         let msg_type = MessageType::from_u8(msg_type_byte)
@@ -101,25 +115,35 @@ impl Frame {
         let body_len = buf.get_u32() as usize;
         if body_len > MAX_BODY_LEN {
             return Err(NetworkError::Decode(format!(
-                "body_len {body_len} exceeds maximum {MAX_BODY_LEN}")));
+                "body_len {body_len} exceeds maximum {MAX_BODY_LEN}"
+            )));
         }
         if buf.len() < body_len + TRAILER_LEN {
             return Err(NetworkError::Decode(format!(
-                "need {body_len}+{TRAILER_LEN} body bytes, have {}", buf.len())));
+                "need {body_len}+{TRAILER_LEN} body bytes, have {}",
+                buf.len()
+            )));
         }
         let body = buf.copy_to_bytes(body_len);
         let crc_actual = buf.get_u32();
         let crc_expected = crc32fast::hash(&body);
         if crc_actual != crc_expected {
             return Err(NetworkError::Decode(format!(
-                "crc mismatch: expected {crc_expected}, got {crc_actual}")));
+                "crc mismatch: expected {crc_expected}, got {crc_actual}"
+            )));
         }
-        Ok(Frame { msg_type, flags, request_id, body })
+        Ok(Frame {
+            msg_type,
+            flags,
+            request_id,
+            body,
+        })
     }
 
     /// Read a frame from an `AsyncRead` source (e.g., `quinn::RecvStream`).
     pub async fn read_async<R>(reader: &mut R) -> Result<Frame, NetworkError>
-    where R: tokio::io::AsyncRead + Unpin
+    where
+        R: tokio::io::AsyncRead + Unpin,
     {
         use tokio::io::AsyncReadExt;
         let mut header = [0u8; HEADER_LEN];
@@ -133,7 +157,8 @@ impl Frame {
         let body_len = header_buf.get_u32() as usize;
         if body_len > MAX_BODY_LEN {
             return Err(NetworkError::Decode(format!(
-                "body_len {body_len} exceeds maximum {MAX_BODY_LEN}")));
+                "body_len {body_len} exceeds maximum {MAX_BODY_LEN}"
+            )));
         }
 
         let mut body_vec = vec![0u8; body_len];
@@ -144,8 +169,14 @@ impl Frame {
         let crc_expected = crc32fast::hash(&body_vec);
         if crc_actual != crc_expected {
             return Err(NetworkError::Decode(format!(
-                "crc mismatch: expected {crc_expected}, got {crc_actual}")));
+                "crc mismatch: expected {crc_expected}, got {crc_actual}"
+            )));
         }
-        Ok(Frame { msg_type, flags, request_id, body: Bytes::from(body_vec) })
+        Ok(Frame {
+            msg_type,
+            flags,
+            request_id,
+            body: Bytes::from(body_vec),
+        })
     }
 }

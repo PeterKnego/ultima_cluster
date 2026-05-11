@@ -9,7 +9,7 @@ use quinn::{Endpoint, ServerConfig as QuicServerConfig};
 use tokio::task::JoinHandle;
 
 use super::frame::{Frame, MessageType};
-use super::{codec, NetworkError};
+use super::{NetworkError, codec};
 use crate::raft::TypeConfig;
 
 pub struct ServerHandle {
@@ -33,10 +33,9 @@ pub fn spawn_server(
     rustls_server_cfg: Arc<rustls::ServerConfig>,
     raft: Raft<TypeConfig>,
 ) -> Result<ServerHandle, NetworkError> {
-    let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(
-        rustls_server_cfg.as_ref().clone(),
-    )
-    .map_err(|e| NetworkError::Tls(format!("quic server cfg: {e}")))?;
+    let crypto =
+        quinn::crypto::rustls::QuicServerConfig::try_from(rustls_server_cfg.as_ref().clone())
+            .map_err(|e| NetworkError::Tls(format!("quic server cfg: {e}")))?;
     let server_cfg = QuicServerConfig::with_crypto(Arc::new(crypto));
     let endpoint = Endpoint::server(server_cfg, listen_addr)
         .map_err(|e| NetworkError::Connect(format!("endpoint: {e}")))?;
@@ -54,7 +53,10 @@ pub fn spawn_server(
         }
     });
 
-    Ok(ServerHandle { endpoint, accept_task })
+    Ok(ServerHandle {
+        endpoint,
+        accept_task,
+    })
 }
 
 async fn handle_connection(conn: quinn::Connection, raft: Raft<TypeConfig>) {
@@ -110,7 +112,11 @@ async fn dispatch(req: Frame, raft: &Raft<TypeConfig>) -> Result<Frame, NetworkE
                 .await
                 .map_err(|e| NetworkError::Stream(format!("append_entries: {e}")))?;
             let body = codec::encode_append_entries_resp(&resp)?;
-            Ok(Frame::new_response(MessageType::AppendEntriesResp, request_id, body))
+            Ok(Frame::new_response(
+                MessageType::AppendEntriesResp,
+                request_id,
+                body,
+            ))
         }
         MessageType::VoteReq => {
             let decoded = codec::decode_vote_req(&req.body)?;
@@ -128,7 +134,11 @@ async fn dispatch(req: Frame, raft: &Raft<TypeConfig>) -> Result<Frame, NetworkE
                 .await
                 .map_err(|e| NetworkError::Stream(format!("install_snapshot: {e}")))?;
             let body = codec::encode_install_snapshot_resp(&resp)?;
-            Ok(Frame::new_response(MessageType::InstallSnapshotResp, request_id, body))
+            Ok(Frame::new_response(
+                MessageType::InstallSnapshotResp,
+                request_id,
+                body,
+            ))
         }
         other => Err(NetworkError::Decode(format!(
             "server got non-request msg_type {other:?}"

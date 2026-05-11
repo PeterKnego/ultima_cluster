@@ -41,7 +41,7 @@ fn corrupted_crc_rejected() {
 #[test]
 fn unknown_msg_type_rejected() {
     let mut encoded = Frame::new_request(MessageType::VoteReq, 1, Bytes::new()).encode();
-    encoded[0] = 99;                            // unknown msg type
+    encoded[0] = 99; // unknown msg type
     let mut bytes = encoded.freeze();
     let result = Frame::decode(&mut bytes);
     assert!(result.is_err());
@@ -64,10 +64,10 @@ fn oversized_body_len_rejected() {
     // Manually construct a header claiming a 100 MiB body — exceeds the 16 MiB cap.
     use bytes::BufMut;
     let mut buf = bytes::BytesMut::with_capacity(14);
-    buf.put_u8(MessageType::VoteReq as u8);   // msg_type
-    buf.put_u8(0);                             // flags
-    buf.put_u64(1);                            // request_id
-    buf.put_u32(100 * 1024 * 1024);            // body_len = 100 MiB
+    buf.put_u8(MessageType::VoteReq as u8); // msg_type
+    buf.put_u8(0); // flags
+    buf.put_u64(1); // request_id
+    buf.put_u32(100 * 1024 * 1024); // body_len = 100 MiB
     // (no body bytes — decode should reject before getting that far)
     let mut bytes = buf.freeze();
     let result = Frame::decode(&mut bytes);
@@ -79,15 +79,18 @@ fn oversized_body_len_rejected() {
     assert!(msg.contains("exceeds maximum"), "unexpected error: {msg}");
 }
 
-use openraft::raft::VoteRequest;
 use openraft::Vote;
+use openraft::raft::VoteRequest;
 use uc_node::network::codec;
 
 #[test]
 fn vote_req_roundtrip() {
     let req: VoteRequest<u64> = VoteRequest::new(
         Vote::new(7, 3),
-        Some(openraft::LogId::new(openraft::CommittedLeaderId::new(5, 0), 42)),
+        Some(openraft::LogId::new(
+            openraft::CommittedLeaderId::new(5, 0),
+            42,
+        )),
     );
     let bytes = codec::encode_vote_req(&req).expect("encode");
     let decoded = codec::decode_vote_req(&bytes).expect("decode");

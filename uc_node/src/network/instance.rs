@@ -22,7 +22,7 @@ use rustls::ClientConfig;
 use super::client::PeerConn;
 use super::factory::PeerPool;
 use super::frame::MessageType;
-use super::{codec, NetworkError};
+use super::{NetworkError, codec};
 use crate::raft::{NodeAddr, NodeId, TypeConfig};
 
 pub struct QuicRaftNetwork {

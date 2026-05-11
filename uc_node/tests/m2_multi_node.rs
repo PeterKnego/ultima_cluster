@@ -235,7 +235,10 @@ async fn three_node_replication() {
     for i in 1..=5u64 {
         let resp = leader_handle.submit(Cmd::Inc(i)).await.expect("submit");
         let expected: u64 = (1..=i).sum();
-        assert_eq!(resp.value, expected, "leader submit {i}: expected sum {expected}");
+        assert_eq!(
+            resp.value, expected,
+            "leader submit {i}: expected sum {expected}"
+        );
     }
 
     // Give followers time to apply.
@@ -331,7 +334,10 @@ async fn leader_failover() {
 
     // Submit one command before failover.
     {
-        let leader = nodes.iter().find(|n| n.node_id == initial_leader_id).unwrap();
+        let leader = nodes
+            .iter()
+            .find(|n| n.node_id == initial_leader_id)
+            .unwrap();
         leader
             .handle
             .as_ref()
@@ -439,15 +445,24 @@ async fn membership_change_remove_node() {
     let leader_handle = leader.handle.as_ref().unwrap();
 
     // Submit one command with 3 voters.
-    let r1 = leader_handle.submit(Cmd::Inc(10)).await.expect("submit pre-removal");
+    let r1 = leader_handle
+        .submit(Cmd::Inc(10))
+        .await
+        .expect("submit pre-removal");
     assert_eq!(r1.value, 10);
 
     // Pick a non-leader node to remove.
     let victim = (1..=3u64).find(|i| *i != leader_id).unwrap();
-    leader_handle.remove_node(victim).await.expect("remove_node");
+    leader_handle
+        .remove_node(victim)
+        .await
+        .expect("remove_node");
 
     // Submit another command with the reduced membership (2 voters).
-    let r2 = leader_handle.submit(Cmd::Inc(5)).await.expect("submit post-removal");
+    let r2 = leader_handle
+        .submit(Cmd::Inc(5))
+        .await
+        .expect("submit post-removal");
     assert_eq!(r2.value, 15);
 
     shutdown_all(nodes).await;
