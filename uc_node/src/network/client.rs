@@ -2,9 +2,8 @@
 //!
 //! Each RPC opens a fresh bidirectional stream on the shared QUIC connection,
 //! sends the request frame, reads the response frame, and closes the stream.
-//! No request_id correlator is needed because each stream carries exactly one
-//! request → one response pair (matches the server's lockstep-per-stream
-//! dispatch model in `server.rs`).
+//! No out-of-order correlation is needed; request_id is verified defensively
+//! against the response frame.
 //!
 //! Approach choice: "one stream per RPC" (vs. "persistent per-class streams").
 //! QUIC stream open/close is cheap (small frame, no handshake). Future perf
@@ -29,8 +28,14 @@ struct PeerConnInner {
 }
 
 impl PeerConn {
-    /// Establish a new QUIC connection to a peer.
+    /// Establish a new QUIC connection to a peer using a shared client endpoint.
+    ///
+    /// The endpoint is owned by the factory (one UDP socket per process). This
+    /// method builds a per-connect `quinn::ClientConfig` from the supplied
+    /// rustls config and uses `Endpoint::connect_with` to attach it to a new
+    /// connection without mutating the endpoint's default client config.
     pub async fn connect(
+        endpoint: &Endpoint,
         rustls_client_cfg: Arc<rustls::ClientConfig>,
         peer_addr: SocketAddr,
         server_name: &str,
@@ -48,12 +53,8 @@ impl PeerConn {
         ));
         client_cfg.transport_config(Arc::new(transport));
 
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
-            .map_err(|e| NetworkError::Connect(format!("client endpoint: {e}")))?;
-        endpoint.set_default_client_config(client_cfg);
-
         let conn = endpoint
-            .connect(peer_addr, server_name)
+            .connect_with(client_cfg, peer_addr, server_name)
             .map_err(|e| NetworkError::Connect(format!("connect: {e}")))?
             .await
             .map_err(|e| NetworkError::Connect(format!("handshake: {e}")))?;

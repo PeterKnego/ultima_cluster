@@ -13,8 +13,8 @@ pub mod server;
 pub mod tls;
 
 // Re-exports added by Task 9:
-// pub use factory::QuicRaftNetworkFactory;
-// pub use instance::QuicRaftNetwork;
+pub use factory::QuicRaftNetworkFactory;
+pub use instance::QuicRaftNetwork;
 
 use thiserror::Error;
 
