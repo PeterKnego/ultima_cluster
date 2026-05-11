@@ -13,6 +13,7 @@ use uc_service::StateMachine;
 
 use crate::ClusterError;
 use crate::config::{NodeConfig, NodeId};
+use crate::network::server::ServerHandle;
 use crate::raft::TypeConfig;
 use crate::raft::state_machine::AdaptedStateMachine;
 
@@ -25,6 +26,9 @@ pub struct NodeHandle<S: StateMachine> {
     /// Used by `query_snapshot` to reach the user SM directly without going
     /// through Raft.
     pub(crate) sm: AdaptedStateMachine<S>,
+    /// QUIC server handle. Closes the inbound endpoint and awaits the accept
+    /// task during [`shutdown`].
+    pub(crate) server: ServerHandle,
 }
 
 impl<S: StateMachine> NodeHandle<S> {
@@ -76,10 +80,13 @@ impl<S: StateMachine> NodeHandle<S> {
     }
 
     pub async fn shutdown(self) -> Result<(), ClusterError> {
+        // Shut down raft first so it stops issuing outbound RPCs.
         self.raft
             .shutdown()
             .await
             .map_err(|e| ClusterError::Raft(format!("shutdown: {e}")))?;
+        // Then shut down the QUIC server (closes endpoint, awaits accept task).
+        self.server.shutdown().await;
         Ok(())
     }
 }

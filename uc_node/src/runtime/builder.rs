@@ -14,6 +14,9 @@ use uc_service::StateMachine;
 use super::node::NodeHandle;
 use crate::ClusterError;
 use crate::config::{BootstrapConfig, NodeConfig};
+use crate::network::server::spawn_server;
+use crate::network::tls;
+use crate::network::QuicRaftNetworkFactory;
 use crate::raft::log_storage::JournalLogStorage;
 use crate::raft::state_machine::AdaptedStateMachine;
 use crate::raft::{NodeAddr, NodeId};
@@ -64,9 +67,24 @@ impl<S: StateMachine> NodeBuilder<S> {
             .map_err(|e| ClusterError::Config(format!("raft config: {e}")))?;
         let raft_config = Arc::new(validated);
 
-        // M1: no real network. NoopNetwork's RaftNetwork methods all
-        // unreachable!() — single-node mode never sends RPCs.
-        let network = crate::raft::log_storage::test_helpers::NoopNetwork;
+        // TLS infrastructure: load-or-create the self-signed cert and build
+        // rustls configs. `PrivateKeyDer` is not `Clone`, so we consume
+        // `key_der` into the server config and reload from disk if we ever
+        // need it again (we don't, here).
+        let (cert_der, key_der) = tls::load_or_init(&self.config.data_dir, &self.config.app_id)?;
+        let server_tls_cfg = tls::build_server_config(cert_der, key_der)?;
+        let client_tls_cfg = tls::build_client_config()?;
+
+        // Shared client QUIC endpoint (one UDP socket for all outbound peer
+        // connections). Bind to 0.0.0.0:0 — kernel picks an ephemeral port.
+        let client_endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+
+        // Real network factory replacing M1's NoopNetwork.
+        let network = QuicRaftNetworkFactory::new(
+            client_endpoint,
+            client_tls_cfg,
+            self.config.app_id.clone(),
+        );
 
         let raft = Raft::new(
             self.config.node_id,
@@ -77,6 +95,10 @@ impl<S: StateMachine> NodeBuilder<S> {
         )
         .await
         .map_err(|e| ClusterError::Raft(format!("Raft::new: {e}")))?;
+
+        // Spawn the QUIC server. Binds `raft_listen_addr` and starts accepting
+        // peer connections that dispatch into `raft`.
+        let server = spawn_server(self.config.raft_listen_addr, server_tls_cfg, raft.clone())?;
 
         // Apply bootstrap.
         match &self.config.bootstrap {
@@ -120,6 +142,7 @@ impl<S: StateMachine> NodeBuilder<S> {
             raft,
             config: self.config,
             sm: sm_adapter_handle,
+            server,
         })
     }
 }
