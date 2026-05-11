@@ -4,7 +4,7 @@
 //!
 //! openraft 0.9.24 deviations from the original spec are documented inline.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use openraft::{Config as RaftConfigOpenraft, Raft};
@@ -131,10 +131,69 @@ impl<S: StateMachine> NodeBuilder<S> {
                     }
                 }
             }
-            BootstrapConfig::Peers { .. } => {
-                return Err(ClusterError::Config(
-                    "BootstrapConfig::Peers requires QUIC network (M2)".into(),
-                ));
+            BootstrapConfig::Peers { peers } => {
+                // Split-brain-safe bootstrap: the node with the lowest id in
+                // the peer list is the bootstrapper; everyone else waits to be
+                // added as a learner.
+                let min_id = peers
+                    .iter()
+                    .map(|p| p.node_id)
+                    .min()
+                    .ok_or_else(|| ClusterError::Config("Peers list is empty".into()))?;
+                let self_id = self.config.node_id;
+
+                if self_id == min_id {
+                    // I am the bootstrapper.
+                    let mut members: BTreeMap<NodeId, NodeAddr> = BTreeMap::new();
+                    members.insert(
+                        self_id,
+                        NodeAddr {
+                            raft_addr: self.config.raft_listen_addr,
+                            client_addr: None,
+                        },
+                    );
+                    use openraft::error::{InitializeError, RaftError};
+                    match raft.initialize(members).await {
+                        Ok(()) => {}
+                        Err(RaftError::APIError(InitializeError::NotAllowed(_))) => {
+                            // Already initialized on a prior run — idempotent.
+                        }
+                        Err(e) => {
+                            return Err(ClusterError::Raft(format!("initialize: {e}")));
+                        }
+                    }
+
+                    // Add the other peers as learners (blocking until they
+                    // catch up). A transient peer failure here is warn-logged,
+                    // not fatal: a partial cluster is recoverable via the
+                    // membership-change methods on NodeHandle.
+                    for peer in peers.iter().filter(|p| p.node_id != self_id) {
+                        let node = NodeAddr {
+                            raft_addr: peer.raft_addr,
+                            client_addr: None,
+                        };
+                        if let Err(e) = raft.add_learner(peer.node_id, node, true).await {
+                            tracing::warn!(
+                                node_id = peer.node_id,
+                                error = ?e,
+                                "add_learner failed; peer may need to be added manually after startup"
+                            );
+                        }
+                    }
+
+                    // Promote all peers to voters via change_membership.
+                    let voters: BTreeSet<NodeId> = peers.iter().map(|p| p.node_id).collect();
+                    if let Err(e) = raft.change_membership(voters, false).await {
+                        tracing::warn!(
+                            error = ?e,
+                            "change_membership failed; manual recovery may be needed"
+                        );
+                    }
+                } else {
+                    // Not the bootstrapper — idle until added as learner by
+                    // the min-id node.
+                    tracing::info!(self_id, min_id, "waiting for bootstrap node to add me");
+                }
             }
         }
 

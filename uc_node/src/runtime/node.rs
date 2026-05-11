@@ -5,6 +5,9 @@
 //! worker. The shape (submit / current_leader / node_id / shutdown) stays the
 //! same.
 
+use std::collections::BTreeSet;
+use std::net::SocketAddr;
+
 use bytes::Bytes;
 use openraft::Raft;
 use openraft::error::{ClientWriteError, RaftError};
@@ -16,6 +19,7 @@ use crate::config::{NodeConfig, NodeId};
 use crate::network::server::ServerHandle;
 use crate::raft::TypeConfig;
 use crate::raft::state_machine::AdaptedStateMachine;
+use crate::raft::NodeAddr;
 
 /// Public handle returned by [`NodeBuilder::start`](super::builder::NodeBuilder::start).
 pub struct NodeHandle<S: StateMachine> {
@@ -77,6 +81,59 @@ impl<S: StateMachine> NodeHandle<S> {
         R: Send,
     {
         self.sm.with_state(f).await
+    }
+
+    /// Add a learner (non-voting follower) to the cluster.
+    /// Returns once the learner has caught up via log replication / snapshot
+    /// install (openraft 0.9.24 `add_learner(id, node, blocking=true)`).
+    pub async fn add_learner(
+        &self,
+        node_id: NodeId,
+        raft_addr: SocketAddr,
+    ) -> Result<(), ClusterError> {
+        let node = NodeAddr {
+            raft_addr,
+            client_addr: None,
+        };
+        self.raft
+            .add_learner(node_id, node, true)
+            .await
+            .map_err(|e| ClusterError::Raft(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Change the membership to the given set of voters.
+    /// Uses openraft 0.9.24 `change_membership(members, retain=false)`: nodes
+    /// not in `voters` are removed from the cluster (not retained as learners).
+    pub async fn change_membership(
+        &self,
+        voters: BTreeSet<NodeId>,
+    ) -> Result<(), ClusterError> {
+        self.raft
+            .change_membership(voters, false)
+            .await
+            .map_err(|e| ClusterError::Raft(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Remove a node from the cluster. Convenience wrapper over
+    /// [`change_membership`]: snapshots the current voter set from openraft
+    /// metrics, drops `node_id`, and applies the result.
+    pub async fn remove_node(&self, node_id: NodeId) -> Result<(), ClusterError> {
+        // `metrics()` returns a cloned `watch::Receiver`; `.borrow()` is sync.
+        // `voter_ids()` on `StoredMembership` yields owned `NID` values.
+        let current: BTreeSet<NodeId> = {
+            let metrics = self.raft.metrics();
+            let m = metrics.borrow();
+            m.membership_config.voter_ids().collect()
+        };
+        let mut next = current;
+        next.remove(&node_id);
+        self.raft
+            .change_membership(next, false)
+            .await
+            .map_err(|e| ClusterError::Raft(e.to_string()))?;
+        Ok(())
     }
 
     pub async fn shutdown(self) -> Result<(), ClusterError> {
