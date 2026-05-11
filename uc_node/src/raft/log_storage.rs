@@ -9,22 +9,43 @@
 //!   * try_get_log_entries → Journal::iter_range
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use openraft::{LogId, Vote};
+use openraft::{LogId, StoredMembership, Vote};
 use ultima_journal::{Durability, Journal, JournalConfig, StableValue, StableValueConfig};
 
-use super::NodeId;
+use super::{NodeAddr, NodeId};
 use crate::ClusterError;
 
 const SEGMENT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Persisted snapshot meta (the last installed snapshot's metadata + a
+/// pointer to its bytes file under data_dir).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredSnapshotMeta {
+    pub last_log_id: Option<LogId<NodeId>>,
+    pub last_membership: StoredMembership<NodeId, NodeAddr>,
+    /// Filename (relative to data_dir) of the snapshot bytes.
+    pub bytes_filename: String,
+}
+
+/// Bundle of durable handles + data_dir, passed to `AdaptedStateMachine::new`
+/// so it can persist install_snapshot state and recover on startup.
+pub struct LogStorageHandles {
+    pub last_applied: Arc<StableValue<LogId<NodeId>>>,
+    pub snapshot_meta: Arc<StableValue<StoredSnapshotMeta>>,
+    pub data_dir: PathBuf,
+}
 
 pub struct JournalLogStorage {
     pub(crate) journal: Arc<Journal>,
     pub(crate) vote: Arc<StableValue<Vote<NodeId>>>,
     pub(crate) committed: Arc<StableValue<LogId<NodeId>>>,
     pub(crate) last_purged: Arc<StableValue<LogId<NodeId>>>,
+    pub(crate) last_applied: Arc<StableValue<LogId<NodeId>>>,
+    pub(crate) snapshot_meta: Arc<StableValue<StoredSnapshotMeta>>,
     /// Serializes seq assignment per the journal's caller-coordination requirement.
     /// openraft already serializes appends, so this is a no-contention guarantee.
     pub(crate) append_lock: Arc<Mutex<()>>,
@@ -58,13 +79,35 @@ impl JournalLogStorage {
             max_payload_bytes: 4096 - 17,
         })?);
 
+        let last_applied = Arc::new(StableValue::open(StableValueConfig {
+            path: data_dir.join("last_applied.state"),
+            durability: Durability::Consistent,
+            max_payload_bytes: 4096 - 17,
+        })?);
+
+        let snapshot_meta = Arc::new(StableValue::open(StableValueConfig {
+            path: data_dir.join("snapshot_meta.state"),
+            durability: Durability::Consistent,
+            max_payload_bytes: 4096 - 17,
+        })?);
+
         Ok(Self {
             journal,
             vote,
             committed,
             last_purged,
+            last_applied,
+            snapshot_meta,
             append_lock: Arc::new(Mutex::new(())),
         })
+    }
+
+    pub fn handles(&self, data_dir: PathBuf) -> LogStorageHandles {
+        LogStorageHandles {
+            last_applied: self.last_applied.clone(),
+            snapshot_meta: self.snapshot_meta.clone(),
+            data_dir,
+        }
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
@@ -78,6 +121,14 @@ impl JournalLogStorage {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn _testonly_last_purged(&self) -> &StableValue<LogId<NodeId>> {
         &self.last_purged
+    }
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn _testonly_last_applied(&self) -> &StableValue<LogId<NodeId>> {
+        &self.last_applied
+    }
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn _testonly_snapshot_meta(&self) -> &StableValue<StoredSnapshotMeta> {
+        &self.snapshot_meta
     }
 }
 
@@ -185,16 +236,43 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
                     let io_err = std::io::Error::other(format!("missing last record at seq {seq}"));
                     StorageIOError::<NodeId>::read_logs(&io_err)
                 })?;
-            let (term, _payload) = rec;
-            // CommittedLeaderId<NID> is LeaderId<NID> = { term, node_id }; node_id is
-            // recorded in the entry payload (bincode-encoded), but the fast-path
-            // log-state lookup only needs term + index. Use 0 as the node-id
-            // placeholder — openraft uses get_log_state purely for term/index
-            // comparisons during election bootstrap.
-            Some(openraft::LogId::new(
-                openraft::CommittedLeaderId::new(term, 0),
-                seq,
-            ))
+            let (_term, payload) = rec;
+            // M2 Task 1 audit (openraft 0.9.24):
+            //
+            // openraft's default leader_id mode is `leader_id_adv` (selected by
+            // `#[cfg(not(feature = "single-term-leader"))]` at
+            // src/vote/leader_id/mod.rs). Our workspace enables openraft features
+            // = ["serde", "storage-v2"] only — `single-term-leader` is OFF — so
+            // the adv mode is in use.
+            //
+            // In adv mode (src/vote/leader_id/leader_id_adv.rs):
+            //   pub struct LeaderId<NID> { pub term: u64, pub node_id: NID }
+            //   #[derive(PartialOrd, Ord)]
+            //   pub type CommittedLeaderId<NID> = LeaderId<NID>;
+            //
+            // `node_id` IS stored and IS part of the lexicographic (term, node_id)
+            // ordering. Synthesizing `CommittedLeaderId::new(term, 0)` would give
+            // wrong comparison results when the real leader's node_id != 0
+            // (which is the multi-node M2 case).
+            //
+            // Recover the real leader_id by bincode-decoding the entry payload —
+            // append() stored it via `encode_to_vec(&entry, ...)`. The journal's
+            // meta(=term) is now redundant for this path; we keep it as an
+            // integrity check below.
+            let (entry, _) = bincode::serde::decode_from_slice::<openraft::Entry<TypeConfig>, _>(
+                &payload,
+                bincode::config::standard(),
+            )
+            .map_err(|e| {
+                let io_err = std::io::Error::other(e.to_string());
+                StorageIOError::<NodeId>::read_logs(&io_err)
+            })?;
+            // Defensive: journal meta(term) and decoded entry term must agree.
+            // `seq` (journal sequence) and `entry.log_id.index` are likewise
+            // append()-coupled — divergence indicates corruption.
+            debug_assert_eq!(entry.log_id.leader_id.term, _term);
+            debug_assert_eq!(entry.log_id.index, seq);
+            Some(entry.log_id)
         } else {
             // Empty journal: last_log_id falls back to last_purged (or None).
             last_purged_log_id
@@ -212,6 +290,8 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             vote: self.vote.clone(),
             committed: self.committed.clone(),
             last_purged: self.last_purged.clone(),
+            last_applied: self.last_applied.clone(),
+            snapshot_meta: self.snapshot_meta.clone(),
             append_lock: self.append_lock.clone(),
         }
     }
@@ -334,67 +414,5 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             .wait()
             .map_err(map_journal_write_logs)?;
         Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// M1-only no-op network. Replaced by QuicRaftNetwork in M2.
-//
-// Lives under `test_helpers` for naming continuity with the original spec, but
-// is always compiled (the runtime builder uses it as the concrete network in
-// single-node mode). All RaftNetwork methods are `unreachable!()` — single-node
-// raft never sends RPCs to peers.
-// ---------------------------------------------------------------------------
-
-pub mod test_helpers {
-    //! M1-only no-op RaftNetwork. Replaced by QuicRaftNetwork in M2.
-    use openraft::error::{InstallSnapshotError, RPCError, RaftError};
-    use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
-    use openraft::raft::{
-        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-        InstallSnapshotResponse, VoteRequest, VoteResponse,
-    };
-
-    use crate::raft::{NodeAddr, NodeId, TypeConfig};
-
-    pub struct NoopNetwork;
-
-    impl RaftNetworkFactory<TypeConfig> for NoopNetwork {
-        type Network = NoopNetworkInstance;
-        async fn new_client(&mut self, _target: NodeId, _node: &NodeAddr) -> Self::Network {
-            NoopNetworkInstance
-        }
-    }
-
-    pub struct NoopNetworkInstance;
-
-    impl RaftNetwork<TypeConfig> for NoopNetworkInstance {
-        async fn append_entries(
-            &mut self,
-            _rpc: AppendEntriesRequest<TypeConfig>,
-            _option: RPCOption,
-        ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, NodeAddr, RaftError<NodeId>>>
-        {
-            unreachable!("M1 single-node — no network calls")
-        }
-
-        async fn install_snapshot(
-            &mut self,
-            _rpc: InstallSnapshotRequest<TypeConfig>,
-            _option: RPCOption,
-        ) -> Result<
-            InstallSnapshotResponse<NodeId>,
-            RPCError<NodeId, NodeAddr, RaftError<NodeId, InstallSnapshotError>>,
-        > {
-            unreachable!("M1 single-node — no network calls")
-        }
-
-        async fn vote(
-            &mut self,
-            _rpc: VoteRequest<NodeId>,
-            _option: RPCOption,
-        ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, NodeAddr, RaftError<NodeId>>> {
-            unreachable!("M1 single-node — no network calls")
-        }
     }
 }

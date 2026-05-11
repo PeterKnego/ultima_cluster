@@ -24,6 +24,15 @@ pub trait StateMachine: Send + Sync + 'static {
 
     fn query(&self, q: Self::Query) -> Self::QueryResponse;
 
+    /// Returns the highest log_index the user's state machine has DURABLY applied.
+    /// MUST agree with the framework's persisted `last_applied` at startup.
+    ///
+    /// The framework cross-checks this method at startup against the durable
+    /// `last_applied.state`. Disagreement is treated as data corruption and
+    /// surfaced as `ClusterError::DriftDetected`. Allowed exceptions:
+    ///   * User says `None` while framework has persisted history — treated as
+    ///     "fresh state after install_snapshot, framework value is authoritative."
+    ///     Logged at warn level; not an error.
     fn last_applied(&self) -> Option<u64>;
 
     fn build_snapshot(&self, dst: &mut dyn Write) -> Result<u64, SnapshotError>;

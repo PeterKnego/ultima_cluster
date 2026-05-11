@@ -11,6 +11,20 @@ pub struct NodeConfig {
     pub app_id: String,
     pub bootstrap: BootstrapConfig,
     pub raft: RaftTuning,
+    /// TLS configuration for inter-node QUIC. M2 supports `SelfSigned`;
+    /// `Files` (operator-provided certs) arrives in M5.
+    pub tls: TlsConfig,
+}
+
+/// TLS configuration for inter-node QUIC.
+///
+/// M2 supports `SelfSigned`. `Files` (operator-provided certs) and
+/// `Insecure` (no TLS) arrive in M5 production polish.
+#[derive(Debug, Clone, Default)]
+pub enum TlsConfig {
+    /// Generate a self-signed cert at first start; persist to `data_dir/tls.{crt,key}`.
+    #[default]
+    SelfSigned,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +46,8 @@ pub struct RaftTuning {
     pub election_timeout_min_ms: u64,
     pub election_timeout_max_ms: u64,
     pub max_in_snapshot_log_to_keep: u64,
+    /// Trigger snapshot every N applied log entries. openraft default is 5000.
+    pub snapshot_policy_logs_since_last: u64,
 }
 
 impl Default for RaftTuning {
@@ -41,6 +57,7 @@ impl Default for RaftTuning {
             election_timeout_min_ms: 1000,
             election_timeout_max_ms: 2000,
             max_in_snapshot_log_to_keep: 1000,
+            snapshot_policy_logs_since_last: 5000,
         }
     }
 }

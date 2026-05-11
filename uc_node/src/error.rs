@@ -9,6 +9,11 @@ pub enum ClusterError {
     Config(String),
     #[error("recovery: {0}")]
     Recovery(String),
+    #[error("state drift: user last_applied={user:?} but framework last_applied={framework:?}")]
+    DriftDetected {
+        user: Option<u64>,
+        framework: Option<u64>,
+    },
     #[error("journal: {0}")]
     Journal(#[from] ultima_journal::JournalError),
     #[error("stable value: {0}")]
@@ -25,6 +30,8 @@ pub enum ClusterError {
     ShutDown,
     #[error("io: {0}")]
     Io(#[from] io::Error),
+    #[error("network: {0}")]
+    Network(#[from] crate::network::NetworkError),
     #[error("bincode: {0}")]
     Bincode(String),
 }
