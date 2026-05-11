@@ -21,3 +21,37 @@ pub fn encode_extra_snapshot_built(log_index: u64) -> [u8; 8] {
 pub fn decode_extra_snapshot_built(extra: [u8; 8]) -> u64 {
     u64::from_le_bytes(extra)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msg_type_constants_are_stable() {
+        // These discriminants are part of the wire protocol — bumping them
+        // requires a protocol version bump and a coordinated SDK release.
+        assert_eq!(MSG_TYPE_BUILD_SNAPSHOT, 100);
+        assert_eq!(MSG_TYPE_SNAPSHOT_BUILT, 101);
+    }
+
+    #[test]
+    fn snapshot_built_round_trip() {
+        for li in [0u64, 1, 42, 1 << 40, u64::MAX] {
+            assert_eq!(
+                decode_extra_snapshot_built(encode_extra_snapshot_built(li)),
+                li
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_built_is_little_endian() {
+        // Pin the wire byte order so a cross-architecture/cross-language SDK
+        // implementation can rely on it.
+        assert_eq!(encode_extra_snapshot_built(0x01), [1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            encode_extra_snapshot_built(0x0102_0304_0506_0708),
+            [8, 7, 6, 5, 4, 3, 2, 1]
+        );
+    }
+}

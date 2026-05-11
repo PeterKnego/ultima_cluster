@@ -243,9 +243,7 @@ pub fn init_cnc(
 /// parties (service, clients).
 pub fn validate_cnc(mmap: &[u8]) -> Result<&CncHeader, RingError> {
     if mmap.len() < CNC_HEADER_LEN {
-        return Err(RingError::Corrupt(
-            "cnc mmap too small for header".into(),
-        ));
+        return Err(RingError::Corrupt("cnc mmap too small for header".into()));
     }
     // SAFETY: mmap is at least CNC_HEADER_LEN bytes and page-aligned.
     let header = unsafe { &*mmap.as_ptr().cast::<CncHeader>() };
@@ -297,10 +295,7 @@ mod tests {
         assert_eq!(header.node_id, 42);
         assert_eq!(header.instance_id(), 0xdeadbeef_cafebabe);
         assert_eq!(header.cnc_size_bytes as usize, cnc_file_size());
-        assert_eq!(
-            header.protocol_version,
-            ProtocolVersion::new(0, 1, 0).0
-        );
+        assert_eq!(header.protocol_version, ProtocolVersion::new(0, 1, 0).0);
         // Sub-buffer offsets are populated.
         assert_eq!(
             header.sub_buffer_offsets[sub::NODE_STATUS],

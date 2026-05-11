@@ -31,8 +31,8 @@ use memmap2::MmapMut;
 
 use crate::ring::common::{
     FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, RING_HEADER_LEN, RecordHeader,
-    RingError, RingHeader, init_ring_header, try_read_record_at, validate_ring_header,
-    write_padding_marker_at, write_record_at,
+    RingError, RingHeader, align_record_size, init_ring_header, try_read_record_at,
+    validate_ring_header, write_padding_marker_at, write_record_at,
 };
 
 pub struct MpscInner {
@@ -95,6 +95,9 @@ impl MpscProducer {
                 max: self.inner.max_msg_size(),
             });
         }
+        // Positions advance in RECORD_ALIGN-sized steps; the length field still
+        // stores the unaligned `total` so the consumer can decode payload_len.
+        let advance = align_record_size(total);
 
         let header = self.inner.header();
         let capacity = self.inner.capacity();
@@ -105,22 +108,24 @@ impl MpscProducer {
 
             let used = producer_pos - consumer_pos;
             let free = capacity.saturating_sub(used as usize);
-            if free < total {
+            if free < advance {
                 return Err(RingError::Full);
             }
 
             let slot_offset = (producer_pos as usize) & (capacity - 1);
+            // bytes_to_tail is a multiple of RECORD_ALIGN (see SPSC for proof),
+            // so the padding marker's 6-byte write always fits.
             let bytes_to_tail = capacity - slot_offset;
 
             // If straddling tail, first claim the tail-bytes for a padding
             // marker, then retry the real record claim.
-            let claim_size = if bytes_to_tail < total {
-                if free < bytes_to_tail + total {
+            let claim_size = if bytes_to_tail < advance {
+                if free < bytes_to_tail + advance {
                     return Err(RingError::Full);
                 }
                 bytes_to_tail
             } else {
-                total
+                advance
             };
 
             let target_pos = producer_pos + claim_size as u64;
@@ -138,14 +143,11 @@ impl MpscProducer {
             }
 
             // CAS succeeded: we own `[slot_offset, slot_offset + claim_size)`.
-            if claim_size != total {
-                // SAFETY: exclusive ownership of the claimed range.
+            if claim_size != advance {
+                // SAFETY: exclusive ownership of the claimed range;
+                // claim_size == bytes_to_tail >= RECORD_ALIGN >= 6.
                 unsafe {
-                    write_padding_marker_at(
-                        self.inner.slot_region_mut(),
-                        slot_offset,
-                        claim_size,
-                    );
+                    write_padding_marker_at(self.inner.slot_region_mut(), slot_offset, claim_size);
                 }
                 continue; // claim real record on next iteration
             }
@@ -276,7 +278,10 @@ mod tests {
         producer.try_write(9, 0, [9; 8], b"world").expect("write");
 
         let mut buf = Vec::new();
-        let rec = consumer.try_read(&mut buf).expect("read").expect("non-empty");
+        let rec = consumer
+            .try_read(&mut buf)
+            .expect("read")
+            .expect("non-empty");
         assert_eq!(rec.msg_type, 9);
         assert_eq!(rec.header_extra, [9; 8]);
         assert_eq!(&buf[..], b"world");

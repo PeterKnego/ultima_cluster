@@ -24,8 +24,8 @@ use memmap2::MmapMut;
 
 use crate::ring::common::{
     FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, RING_HEADER_LEN, RecordHeader,
-    RingError, RingHeader, init_ring_header, try_read_record_at, validate_ring_header,
-    write_padding_marker_at, write_record_at,
+    RingError, RingHeader, align_record_size, init_ring_header, try_read_record_at,
+    validate_ring_header, write_padding_marker_at, write_record_at,
 };
 
 /// Shared inner state — owns the mmap and exposes the header + slot region.
@@ -97,6 +97,9 @@ impl SpscProducer {
                 max: self.inner.max_msg_size(),
             });
         }
+        // Positions advance in RECORD_ALIGN-sized steps; the length field still
+        // stores the unaligned `total` so the consumer can decode payload_len.
+        let advance = align_record_size(total);
 
         let header = self.inner.header();
         let capacity = self.inner.capacity();
@@ -107,22 +110,27 @@ impl SpscProducer {
 
         let used = producer_pos - consumer_pos;
         let free = capacity.saturating_sub(used as usize);
-        if free < total {
+        if free < advance {
             return Err(RingError::Full);
         }
 
         let slot_offset = (producer_pos as usize) & (capacity - 1);
+        // bytes_to_tail is a multiple of RECORD_ALIGN because slot_offset is
+        // (producer_pos is RECORD_ALIGN-aligned and capacity is a power of two
+        // ≥ RECORD_ALIGN), so the padding marker's 6-byte write fits.
         let bytes_to_tail = capacity - slot_offset;
-        if bytes_to_tail < total {
+        if bytes_to_tail < advance {
             // Not enough contiguous space at the tail — emit a padding marker
             // and recurse from the freshly-wrapped position. The padding
             // marker takes the rest of the buffer's tail.
-            if free < bytes_to_tail + total {
+            if free < bytes_to_tail + advance {
                 // Wrap would leave too little room after the padding.
                 return Err(RingError::Full);
             }
             // SAFETY: we are the sole producer; the slot bytes from
-            // `slot_offset` to capacity belong to us.
+            // `slot_offset` to capacity belong to us. `bytes_to_tail >=
+            // RECORD_ALIGN >= 6` (padding marker size) by the alignment
+            // invariant.
             unsafe {
                 write_padding_marker_at(self.inner.slot_region_mut(), slot_offset, bytes_to_tail);
             }
@@ -133,7 +141,7 @@ impl SpscProducer {
         }
 
         // SAFETY: free-space + tail-wrap checks above ensure
-        // `[slot_offset, slot_offset + total)` lies entirely within the slot
+        // `[slot_offset, slot_offset + advance)` lies entirely within the slot
         // region and is not currently being read by the consumer.
         unsafe {
             write_record_at(
@@ -148,7 +156,7 @@ impl SpscProducer {
         }
         header
             .producer_position
-            .store(producer_pos + total as u64, Ordering::Release);
+            .store(producer_pos + advance as u64, Ordering::Release);
         Ok(())
     }
 }
@@ -177,9 +185,8 @@ impl SpscConsumer {
             // SAFETY: producer_pos > consumer_pos and the slot offset is
             // within `[0, capacity)`. The producer has done a Release store
             // on `producer_position`, so all writes to the slot are visible.
-            let read = unsafe {
-                try_read_record_at(self.inner.slot_region(), slot_offset, payload_buf)
-            }?;
+            let read =
+                unsafe { try_read_record_at(self.inner.slot_region(), slot_offset, payload_buf) }?;
             let Some((rec, total_size)) = read else {
                 // Length is zero — producer claimed but hasn't committed.
                 // In SPSC this only happens on first generation before the
@@ -285,7 +292,10 @@ mod tests {
             .expect("write");
 
         let mut buf = Vec::new();
-        let rec = consumer.try_read(&mut buf).expect("read").expect("non-empty");
+        let rec = consumer
+            .try_read(&mut buf)
+            .expect("read")
+            .expect("non-empty");
         assert_eq!(rec.msg_type, 7);
         assert_eq!(rec.header_extra, [1, 2, 3, 4, 0, 0, 0, 0]);
         assert_eq!(&buf[..], b"hello");
@@ -336,8 +346,42 @@ mod tests {
                 .try_write(1, 0, [i as u8; 8], &payload)
                 .expect("write");
             let mut buf = Vec::new();
-            let rec = consumer.try_read(&mut buf).expect("read").expect("non-empty");
+            let rec = consumer
+                .try_read(&mut buf)
+                .expect("read")
+                .expect("non-empty");
             assert_eq!(rec.header_extra[0], i as u8);
+        }
+    }
+
+    /// Regression: with tiny payloads, the unaligned record size used to let
+    /// `bytes_to_tail` drop below the padding-marker's 6-byte minimum, causing
+    /// `write_padding_marker_at` to write past the slot region. With record
+    /// advances forced to `RECORD_ALIGN`-multiples, `bytes_to_tail` is always
+    /// `>= RECORD_ALIGN >= 6` whenever wrap is needed. This test drives
+    /// dozens of wraps with the smallest possible payload.
+    #[test]
+    fn tiny_payload_tail_wrap_no_oob() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = SpscRing::create(tmp.path(), 64, 32).expect("create");
+        let (mut producer, mut consumer) = ring.into_split();
+
+        // 200 cycles of write-one, read-one. With capacity 64 and aligned
+        // record size 24 (header 16 + payload 1 + trailer 4 = 21 → align 24),
+        // each cycle's slot_offset rotates 24 mod 64, so tail-wrap padding
+        // fires regularly with bytes_to_tail ∈ {16, 8}.
+        for i in 0..200u8 {
+            producer
+                .try_write(7, 0, [i; 8], std::slice::from_ref(&i))
+                .expect("write");
+            let mut buf = Vec::new();
+            let rec = consumer
+                .try_read(&mut buf)
+                .expect("read")
+                .expect("non-empty");
+            assert_eq!(rec.msg_type, 7);
+            assert_eq!(rec.header_extra, [i; 8]);
+            assert_eq!(buf, [i]);
         }
     }
 

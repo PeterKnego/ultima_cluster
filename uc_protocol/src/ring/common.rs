@@ -86,6 +86,27 @@ pub struct FrameHeader {
 pub const FRAME_HEADER_LEN: usize = std::mem::size_of::<FrameHeader>();
 pub const FRAME_TRAILER_LEN: usize = 4; // crc32
 
+/// All record advancements (producer_position / consumer_position increments)
+/// are rounded up to this many bytes. Two properties depend on it:
+///
+///   * `producer_position & (capacity - 1)` is always a multiple of
+///     `RECORD_ALIGN`, so `bytes_to_tail = capacity - slot_offset` is also a
+///     multiple of `RECORD_ALIGN` and is therefore ≥ `RECORD_ALIGN` whenever a
+///     tail-wrap padding marker is needed.
+///   * The padding marker writes 6 bytes (4-byte length + 2-byte msg_type),
+///     which fits in the guaranteed `RECORD_ALIGN ≥ 8` tail window.
+///
+/// The length field in the record header stores the *unaligned* record size
+/// (so the consumer can decode `payload_len` directly); position advances use
+/// [`align_record_size`].
+pub const RECORD_ALIGN: usize = 8;
+
+/// Round a record size up to [`RECORD_ALIGN`].
+#[inline]
+pub const fn align_record_size(total: usize) -> usize {
+    (total + RECORD_ALIGN - 1) & !(RECORD_ALIGN - 1)
+}
+
 /// Returned by consumer `try_read` on success. Mirrors the per-record header
 /// fields that the caller cares about. The `length` is not exposed because
 /// it's redundant with the payload length the caller already has.
@@ -135,6 +156,11 @@ pub fn init_ring_header(
     if !capacity_bytes.is_power_of_two() {
         return Err(RingError::Corrupt(format!(
             "capacity_bytes must be power of two, got {capacity_bytes}"
+        )));
+    }
+    if (capacity_bytes as usize) < RECORD_ALIGN {
+        return Err(RingError::Corrupt(format!(
+            "capacity_bytes must be >= RECORD_ALIGN ({RECORD_ALIGN}), got {capacity_bytes}"
         )));
     }
     // SAFETY: mmap'd buffers from `MmapMut::map_mut` are page-aligned, which
@@ -257,8 +283,9 @@ pub unsafe fn write_padding_marker_at(
 /// not yet committed (length field reads as zero), `Ok(Some(...))` on success.
 ///
 /// On success, `payload_buf` is cleared and filled with the record payload.
-/// The returned `(RecordHeader, total_record_size)` lets the caller advance
-/// its consumer position.
+/// The returned `(RecordHeader, advance)` lets the caller advance its consumer
+/// position — `advance` is the [`align_record_size`]-rounded record size, so
+/// consumer positions stay aligned to [`RECORD_ALIGN`].
 ///
 /// # Safety
 ///
@@ -293,6 +320,8 @@ pub unsafe fn try_read_record_at(
     let msg_type = u16::from_le_bytes(msg_type_bytes);
 
     if msg_type == PADDING_MSG_TYPE {
+        // Padding length is always a multiple of RECORD_ALIGN by construction
+        // (bytes_to_tail at an aligned producer position is aligned).
         return Ok(Some((
             RecordHeader {
                 msg_type,
@@ -347,7 +376,7 @@ pub unsafe fn try_read_record_at(
             flags,
             header_extra,
         },
-        length as usize,
+        align_record_size(length as usize),
     )))
 }
 

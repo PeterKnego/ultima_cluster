@@ -57,7 +57,10 @@ mod tests {
     #[test]
     fn service_ready_round_trip() {
         for la in [0u64, 1, 42, 1 << 40, u64::MAX] {
-            assert_eq!(decode_extra_service_ready(encode_extra_service_ready(la)), la);
+            assert_eq!(
+                decode_extra_service_ready(encode_extra_service_ready(la)),
+                la
+            );
         }
     }
 

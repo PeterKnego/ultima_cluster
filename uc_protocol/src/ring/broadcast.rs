@@ -26,8 +26,8 @@ use memmap2::MmapMut;
 
 use crate::ring::common::{
     FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, RING_HEADER_LEN, RecordHeader,
-    RingError, RingHeader, init_ring_header, try_read_record_at, validate_ring_header,
-    write_padding_marker_at, write_record_at,
+    RingError, RingHeader, align_record_size, init_ring_header, try_read_record_at,
+    validate_ring_header, write_padding_marker_at, write_record_at,
 };
 
 pub struct BroadcastInner {
@@ -80,15 +80,21 @@ impl BroadcastProducer {
                 max: self.inner.max_msg_size(),
             });
         }
+        // Positions advance in RECORD_ALIGN-sized steps; the length field still
+        // stores the unaligned `total` so the consumer can decode payload_len.
+        let advance = align_record_size(total);
 
         let header = self.inner.header();
         let capacity = self.inner.capacity();
         let producer_pos = header.producer_position.load(Ordering::Relaxed);
         let slot_offset = (producer_pos as usize) & (capacity - 1);
+        // bytes_to_tail is a multiple of RECORD_ALIGN (see SPSC for proof),
+        // so the padding marker's 6-byte write always fits.
         let bytes_to_tail = capacity - slot_offset;
 
-        if bytes_to_tail < total {
+        if bytes_to_tail < advance {
             // SAFETY: single producer; we own the tail of the slot region.
+            // bytes_to_tail >= RECORD_ALIGN >= 6 (padding marker size).
             unsafe {
                 write_padding_marker_at(self.inner.slot_region_mut(), slot_offset, bytes_to_tail);
             }
@@ -112,7 +118,7 @@ impl BroadcastProducer {
         }
         header
             .producer_position
-            .store(producer_pos + total as u64, Ordering::Release);
+            .store(producer_pos + advance as u64, Ordering::Release);
         Ok(())
     }
 }
