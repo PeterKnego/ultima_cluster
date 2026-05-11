@@ -206,3 +206,31 @@ async fn three_node_cluster_elects_leader() {
     assert!((1..=3).contains(&leader), "leader {leader} out of range");
     shutdown_all(nodes).await;
 }
+
+#[tokio::test]
+async fn three_node_replication() {
+    let nodes = spawn_3_node_cluster().await;
+    let leader_id = wait_for_leader(&nodes, Duration::from_secs(10)).await;
+    let leader = nodes.iter().find(|n| n.node_id == leader_id).unwrap();
+    let leader_handle = leader.handle.as_ref().unwrap();
+
+    // Submit 5 increments via the leader.
+    // Cumulative responses: 1, 3, 6, 10, 15.
+    for i in 1..=5u64 {
+        let resp = leader_handle.submit(Cmd::Inc(i)).await.expect("submit");
+        let expected: u64 = (1..=i).sum();
+        assert_eq!(resp.value, expected, "leader submit {i}: expected sum {expected}");
+    }
+
+    // Give followers time to apply.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Every node's query_snapshot should return 15.
+    for n in &nodes {
+        if let Some(h) = &n.handle {
+            let v = h.query_snapshot(|c: &Counter| c.value).await;
+            assert_eq!(v, 15, "node {} value", n.node_id);
+        }
+    }
+    shutdown_all(nodes).await;
+}
