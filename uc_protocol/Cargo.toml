@@ -7,4 +7,13 @@ authors.workspace = true
 description = "ultima_cluster wire protocol — shared-memory layouts, frames, versions"
 
 [dependencies]
-# no_std-friendly; nothing pulled in for M1 stub
+# M3: ring buffer primitives need std (atomics + mmap). Pure data types
+# (version, magic, error_codes) remain core-only-compatible.
+memmap2 = { workspace = true }
+parking_lot = { workspace = true }
+page_size = { workspace = true }
+thiserror = { workspace = true }
+crc32fast = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

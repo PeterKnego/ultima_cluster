@@ -1,0 +1,410 @@
+//! Shared ring buffer types: header layout, per-record frame layout, and
+//! low-level record-write/record-read helpers used by SPSC/MPSC/Broadcast.
+//!
+//! # Layout
+//!
+//! Every ring file is laid out as:
+//!
+//! ```text
+//! offset   contents
+//! ──────   ─────────────────────────────────────────────────────────────────
+//!  0       RingHeader (192 bytes, cache-padded so the two atomics live on
+//!          separate cache lines)
+//!  192     slot region of `capacity_bytes` bytes (must be a power of two so
+//!          that wrap-around indexing reduces to a mask)
+//! ```
+//!
+//! Per-record framing inside the slot region:
+//!
+//! ```text
+//!  length_inclusive_header  u32   total record size (header + payload + crc)
+//!  msg_type                 u16
+//!  flags                    u16
+//!  header_extra             [u8; 8]   per-msg-type metadata
+//!  payload                  variable
+//!  crc32                    u32   over (msg_type..end-of-payload)
+//! ```
+//!
+//! ## Torn-record protection — SPSC only
+//!
+//! For SPSC, the producer writes the record bytes first, then advances
+//! `producer_position` with a `Release` store. The consumer loads
+//! `producer_position` with `Acquire`; if it has moved past `consumer_position`,
+//! the slot is guaranteed to be fully written.
+//!
+//! For MPSC and Broadcast, the producer claims its slot range *before* writing
+//! the record. The consumer can therefore observe a non-zero
+//! `producer_position` while the record bytes are still partially written. The
+//! `length == 0 → not yet committed` check works on the first generation
+//! (mmap is zero-initialized) but **does not work after wrap-around** — the
+//! stale length bytes from the previous generation can spoof a commit. This is
+//! a known limitation tracked for M4 (when the client→node submit ring will
+//! see real wrap traffic). In M3, MPSC is only used for the cnc control rings
+//! (very low traffic, wrap not expected) and Broadcast is unused.
+
+use std::sync::atomic::AtomicU64;
+use thiserror::Error;
+
+/// Padding-marker `msg_type` — consumer skips to the start of the slot
+/// region when it encounters this in a record header.
+pub const PADDING_MSG_TYPE: u16 = 0xffff;
+
+/// Fixed-size header at the start of every ring file. 192 bytes,
+/// cache-padded so producer and consumer atomics live on separate cache
+/// lines.
+#[repr(C, align(64))]
+pub struct RingHeader {
+    pub magic: [u8; 8],
+    pub capacity_bytes: u64,
+    pub max_msg_size: u32,
+    pub msg_kind_filter: u32,
+    pub _pad_1: [u8; 40],
+    pub producer_position: AtomicU64,
+    pub _pad_2: [u8; 56],
+    pub consumer_position: AtomicU64,
+    pub _pad_3: [u8; 56],
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<RingHeader>() == 192);
+    assert!(std::mem::align_of::<RingHeader>() == 64);
+};
+
+pub const RING_HEADER_LEN: usize = std::mem::size_of::<RingHeader>();
+
+/// Per-record frame header. Layout matches the wire format exactly
+/// (`#[repr(C)]` keeps field order).
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct FrameHeader {
+    pub length_inclusive_header: u32,
+    pub msg_type: u16,
+    pub flags: u16,
+    pub header_extra: [u8; 8],
+}
+
+pub const FRAME_HEADER_LEN: usize = std::mem::size_of::<FrameHeader>();
+pub const FRAME_TRAILER_LEN: usize = 4; // crc32
+
+/// Returned by consumer `try_read` on success. Mirrors the per-record header
+/// fields that the caller cares about. The `length` is not exposed because
+/// it's redundant with the payload length the caller already has.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordHeader {
+    pub msg_type: u16,
+    pub flags: u16,
+    pub header_extra: [u8; 8],
+}
+
+#[derive(Debug, Error)]
+pub enum RingError {
+    #[error("ring full")]
+    Full,
+    #[error("ring empty")]
+    Empty,
+    #[error("frame too large: {len} > {max}")]
+    TooLarge { len: usize, max: usize },
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("corrupt: {0}")]
+    Corrupt(String),
+    #[error("magic mismatch")]
+    BadMagic,
+    #[error("crc mismatch")]
+    BadCrc,
+    #[error("consumer fell behind; producer overwrote unread records")]
+    Overwritten,
+}
+
+/// Initialize the header of a freshly mmap'd ring file in place.
+///
+/// Safe iff the caller holds exclusive access to `buf` (typical: just-created
+/// mmap'd file before any concurrent access).
+pub fn init_ring_header(
+    buf: &mut [u8],
+    capacity_bytes: u64,
+    max_msg_size: u32,
+    msg_kind_filter: u32,
+) -> Result<(), RingError> {
+    if buf.len() < RING_HEADER_LEN {
+        return Err(RingError::Corrupt(format!(
+            "buffer too small for ring header: {} < {RING_HEADER_LEN}",
+            buf.len()
+        )));
+    }
+    if !capacity_bytes.is_power_of_two() {
+        return Err(RingError::Corrupt(format!(
+            "capacity_bytes must be power of two, got {capacity_bytes}"
+        )));
+    }
+    // SAFETY: mmap'd buffers from `MmapMut::map_mut` are page-aligned, which
+    // exceeds the 64-byte alignment required by `RingHeader`. The buffer is
+    // at least `RING_HEADER_LEN` bytes per the check above. No other thread
+    // can observe the bytes until this function returns.
+    unsafe {
+        let header_ptr = buf.as_mut_ptr().cast::<RingHeader>();
+        std::ptr::write(
+            header_ptr,
+            RingHeader {
+                magic: crate::magic::RING_MAGIC,
+                capacity_bytes,
+                max_msg_size,
+                msg_kind_filter,
+                _pad_1: [0; 40],
+                producer_position: AtomicU64::new(0),
+                _pad_2: [0; 56],
+                consumer_position: AtomicU64::new(0),
+                _pad_3: [0; 56],
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Validate an existing ring file's header (e.g., on attach). Returns a
+/// shared reference into `buf`.
+pub fn validate_ring_header(buf: &[u8]) -> Result<&RingHeader, RingError> {
+    if buf.len() < RING_HEADER_LEN {
+        return Err(RingError::Corrupt(format!(
+            "buffer too small: {} < {RING_HEADER_LEN}",
+            buf.len()
+        )));
+    }
+    // SAFETY: buf is at least RING_HEADER_LEN bytes; mmap is properly aligned.
+    let header = unsafe { &*buf.as_ptr().cast::<RingHeader>() };
+    if header.magic != crate::magic::RING_MAGIC {
+        return Err(RingError::BadMagic);
+    }
+    Ok(header)
+}
+
+/// Write a complete record (header + payload + crc32) at `slot_offset` within
+/// the slot region. The length field is written **last** with a Release
+/// fence/store so that consumers using Acquire on `producer_position` observe
+/// the fully-written record.
+///
+/// # Safety
+///
+/// The caller must guarantee:
+///   * `slot_region` points to the start of a slot region of at least
+///     `slot_offset + total_record_size` bytes.
+///   * The byte range `[slot_offset, slot_offset + total_record_size)` is not
+///     concurrently read or written by any other thread.
+///   * `total_record_size == FRAME_HEADER_LEN + payload.len() + FRAME_TRAILER_LEN`.
+pub unsafe fn write_record_at(
+    slot_region: *mut u8,
+    slot_offset: usize,
+    msg_type: u16,
+    flags: u16,
+    header_extra: [u8; 8],
+    payload: &[u8],
+    total_record_size: usize,
+) {
+    let dst = unsafe { slot_region.add(slot_offset) };
+    unsafe {
+        // bytes 4..6 — msg_type
+        std::ptr::copy_nonoverlapping((&msg_type as *const u16).cast::<u8>(), dst.add(4), 2);
+        // bytes 6..8 — flags
+        std::ptr::copy_nonoverlapping((&flags as *const u16).cast::<u8>(), dst.add(6), 2);
+        // bytes 8..16 — header_extra
+        std::ptr::copy_nonoverlapping(header_extra.as_ptr(), dst.add(8), 8);
+        // payload
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), dst.add(FRAME_HEADER_LEN), payload.len());
+        // crc32 over (msg_type..end-of-payload)
+        let crc_input =
+            std::slice::from_raw_parts(dst.add(4), FRAME_HEADER_LEN - 4 + payload.len());
+        let crc = crc32fast::hash(crc_input);
+        let crc_bytes = crc.to_le_bytes();
+        std::ptr::copy_nonoverlapping(
+            crc_bytes.as_ptr(),
+            dst.add(FRAME_HEADER_LEN + payload.len()),
+            4,
+        );
+        // Commit: write length last with Release ordering.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        let len_bytes = (total_record_size as u32).to_le_bytes();
+        std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), dst, 4);
+    }
+}
+
+/// Write a tail-wrap padding marker at `slot_offset`. The padding record's
+/// length field is the number of bytes from `slot_offset` to the end of the
+/// slot region, so the consumer can skip past it cleanly.
+///
+/// # Safety
+///
+/// Same as [`write_record_at`].
+pub unsafe fn write_padding_marker_at(
+    slot_region: *mut u8,
+    slot_offset: usize,
+    padding_bytes: usize,
+) {
+    let dst = unsafe { slot_region.add(slot_offset) };
+    unsafe {
+        // bytes 4..6 — msg_type = PADDING_MSG_TYPE
+        std::ptr::copy_nonoverlapping(
+            (&PADDING_MSG_TYPE as *const u16).cast::<u8>(),
+            dst.add(4),
+            2,
+        );
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        let len_bytes = (padding_bytes as u32).to_le_bytes();
+        std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), dst, 4);
+    }
+}
+
+/// Read a single record at `slot_offset`. Returns `Ok(None)` if the record is
+/// not yet committed (length field reads as zero), `Ok(Some(...))` on success.
+///
+/// On success, `payload_buf` is cleared and filled with the record payload.
+/// The returned `(RecordHeader, total_record_size)` lets the caller advance
+/// its consumer position.
+///
+/// # Safety
+///
+/// `slot_region` must point to a valid slot region of at least
+/// `slot_offset + max_msg_size` bytes, and the producer must have already
+/// committed (i.e., the caller observed `producer_position > consumer_position`
+/// with Acquire ordering).
+pub unsafe fn try_read_record_at(
+    slot_region: *const u8,
+    slot_offset: usize,
+    payload_buf: &mut Vec<u8>,
+) -> Result<Option<(RecordHeader, usize)>, RingError> {
+    let dst = unsafe { slot_region.add(slot_offset) };
+    // SAFETY: length field is the first 4 bytes; the caller guarantees the
+    // slot is in-range.
+    let length_bytes: [u8; 4] = unsafe {
+        let mut buf = [0u8; 4];
+        std::ptr::copy_nonoverlapping(dst, buf.as_mut_ptr(), 4);
+        buf
+    };
+    let length = u32::from_le_bytes(length_bytes);
+    if length == 0 {
+        return Ok(None); // not yet committed
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+
+    let msg_type_bytes: [u8; 2] = unsafe {
+        let mut buf = [0u8; 2];
+        std::ptr::copy_nonoverlapping(dst.add(4), buf.as_mut_ptr(), 2);
+        buf
+    };
+    let msg_type = u16::from_le_bytes(msg_type_bytes);
+
+    if msg_type == PADDING_MSG_TYPE {
+        return Ok(Some((
+            RecordHeader {
+                msg_type,
+                flags: 0,
+                header_extra: [0; 8],
+            },
+            length as usize,
+        )));
+    }
+
+    let flags_bytes: [u8; 2] = unsafe {
+        let mut buf = [0u8; 2];
+        std::ptr::copy_nonoverlapping(dst.add(6), buf.as_mut_ptr(), 2);
+        buf
+    };
+    let flags = u16::from_le_bytes(flags_bytes);
+
+    let mut header_extra = [0u8; 8];
+    unsafe {
+        std::ptr::copy_nonoverlapping(dst.add(8), header_extra.as_mut_ptr(), 8);
+    }
+
+    let payload_len = (length as usize)
+        .checked_sub(FRAME_HEADER_LEN + FRAME_TRAILER_LEN)
+        .ok_or_else(|| RingError::Corrupt(format!("record length {length} too small")))?;
+
+    payload_buf.clear();
+    payload_buf.reserve(payload_len);
+    unsafe {
+        let src = dst.add(FRAME_HEADER_LEN);
+        std::ptr::copy_nonoverlapping(src, payload_buf.as_mut_ptr(), payload_len);
+        payload_buf.set_len(payload_len);
+    }
+
+    // Validate CRC over (msg_type..end-of-payload).
+    let crc_actual_bytes: [u8; 4] = unsafe {
+        let mut buf = [0u8; 4];
+        std::ptr::copy_nonoverlapping(dst.add(FRAME_HEADER_LEN + payload_len), buf.as_mut_ptr(), 4);
+        buf
+    };
+    let crc_actual = u32::from_le_bytes(crc_actual_bytes);
+    let crc_input =
+        unsafe { std::slice::from_raw_parts(dst.add(4), FRAME_HEADER_LEN - 4 + payload_len) };
+    let crc_expected = crc32fast::hash(crc_input);
+    if crc_actual != crc_expected {
+        return Err(RingError::BadCrc);
+    }
+
+    Ok(Some((
+        RecordHeader {
+            msg_type,
+            flags,
+            header_extra,
+        },
+        length as usize,
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use memmap2::MmapMut;
+    use std::sync::atomic::Ordering;
+    use tempfile::NamedTempFile;
+
+    /// Allocate an mmap-backed buffer for tests. Real callers always pass
+    /// mmap'd memory (page-aligned, far exceeds the 64-byte alignment we
+    /// need). A plain `Vec<u8>` only guarantees byte alignment and would
+    /// hit UB when reinterpreted as `RingHeader`.
+    fn mmap_buf(len: usize) -> (MmapMut, NamedTempFile) {
+        let tmp = NamedTempFile::new().unwrap();
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path())
+            .unwrap();
+        f.set_len(len as u64).unwrap();
+        let mmap = unsafe { MmapMut::map_mut(&f).unwrap() };
+        (mmap, tmp)
+    }
+
+    #[test]
+    fn init_then_validate_round_trip() {
+        let (mut mmap, _tmp) = mmap_buf(RING_HEADER_LEN * 2);
+        init_ring_header(&mut mmap[..], 65536, 4096, 0xff).expect("init");
+        let header = validate_ring_header(&mmap[..]).expect("validate");
+        assert_eq!(header.magic, crate::magic::RING_MAGIC);
+        assert_eq!(header.capacity_bytes, 65536);
+        assert_eq!(header.max_msg_size, 4096);
+        assert_eq!(header.msg_kind_filter, 0xff);
+        assert_eq!(header.producer_position.load(Ordering::Relaxed), 0);
+        assert_eq!(header.consumer_position.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn validate_rejects_bad_magic() {
+        let (mmap, _tmp) = mmap_buf(RING_HEADER_LEN);
+        let result = validate_ring_header(&mmap[..]);
+        assert!(matches!(result, Err(RingError::BadMagic)));
+    }
+
+    #[test]
+    fn init_rejects_non_power_of_two_capacity() {
+        let (mut mmap, _tmp) = mmap_buf(RING_HEADER_LEN * 2);
+        let r = init_ring_header(&mut mmap[..], 1000, 4096, 0);
+        assert!(matches!(r, Err(RingError::Corrupt(_))));
+    }
+
+    #[test]
+    fn init_rejects_undersized_buffer() {
+        let (mut mmap, _tmp) = mmap_buf(4096);
+        let r = init_ring_header(&mut mmap[..10], 65536, 4096, 0);
+        assert!(matches!(r, Err(RingError::Corrupt(_))));
+    }
+}

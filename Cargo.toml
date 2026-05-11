@@ -32,6 +32,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "tls1
 rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
 rustls-pemfile = "2"
 
+# M3 — shmem IPC
+memmap2 = "0.9"
+parking_lot = "0.12"
+page_size = "0.6"
+crc32fast = "1"
+
 # dev
 tempfile = "3"
 anyhow = "1"
