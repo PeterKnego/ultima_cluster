@@ -251,6 +251,79 @@ async fn three_node_replication() {
     shutdown_all(nodes).await;
 }
 
+fn tight_raft_tuning() -> RaftTuning {
+    RaftTuning {
+        heartbeat_interval_ms: 100,
+        election_timeout_min_ms: 500,
+        election_timeout_max_ms: 1000,
+        max_in_snapshot_log_to_keep: 50,
+        snapshot_policy_logs_since_last: 50, // trigger snapshot every 50 applied entries
+    }
+}
+
+/// Brings up 2 nodes with tight snapshot policy for testing snapshot install.
+async fn spawn_2_node_cluster_tight_snapshot() -> Vec<TestNode> {
+    let addrs: Vec<SocketAddr> = (0..2)
+        .map(|_| {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let a = s.local_addr().unwrap();
+            drop(s);
+            a
+        })
+        .collect();
+
+    let peer_seeds: Vec<PeerSeed> = (1..=2u64)
+        .zip(addrs.iter())
+        .map(|(id, a)| PeerSeed {
+            node_id: id,
+            raft_addr: *a,
+        })
+        .collect();
+
+    let mut prep: Vec<(NodeId, Arc<TempDir>, SocketAddr, NodeConfig)> = Vec::new();
+    for (i, addr) in addrs.iter().enumerate() {
+        let node_id = (i as u64) + 1;
+        let dir = Arc::new(TempDir::new().unwrap());
+        let cfg = NodeConfig {
+            node_id,
+            data_dir: dir.path().to_owned(),
+            raft_listen_addr: *addr,
+            app_id: "m2-test-snap".into(),
+            bootstrap: BootstrapConfig::Peers {
+                peers: peer_seeds.clone(),
+            },
+            raft: tight_raft_tuning(),
+            tls: TlsConfig::default(),
+        };
+        prep.push((node_id, dir, *addr, cfg));
+    }
+
+    let mut join_handles = Vec::new();
+    for (node_id, dir, addr, cfg) in prep {
+        let dir_for_task = dir.clone();
+        let h = tokio::spawn(async move {
+            let handle = NodeBuilder::new(cfg, Counter::default())
+                .start()
+                .await
+                .unwrap_or_else(|e| panic!("node {node_id} start: {e:?}"));
+            (node_id, handle, dir_for_task, addr)
+        });
+        join_handles.push(h);
+    }
+
+    let mut nodes = Vec::new();
+    for h in join_handles {
+        let (node_id, handle, dir, addr) = h.await.expect("spawn task");
+        nodes.push(TestNode {
+            node_id,
+            handle: Some(handle),
+            data_dir: dir,
+            addr,
+        });
+    }
+    nodes
+}
+
 #[tokio::test]
 async fn leader_failover() {
     let mut nodes = spawn_3_node_cluster().await;
@@ -295,5 +368,65 @@ async fn leader_failover() {
         .expect("submit post-failover");
     assert_eq!(resp.value, 150);
 
+    shutdown_all(nodes).await;
+}
+
+#[tokio::test]
+async fn snapshot_install_on_new_follower() {
+    let nodes = spawn_2_node_cluster_tight_snapshot().await;
+    let leader_id = wait_for_leader(&nodes, Duration::from_secs(10)).await;
+    let leader = nodes.iter().find(|n| n.node_id == leader_id).unwrap();
+    let leader_handle = leader.handle.as_ref().unwrap();
+
+    // Submit lots of commands to force at least one snapshot.
+    let total: u64 = 200;
+    for _ in 0..total {
+        leader_handle.submit(Cmd::Inc(1)).await.expect("submit");
+    }
+
+    // Wait for the snapshot to land.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Add a 3rd node as a learner.
+    let new_addr = {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let a = s.local_addr().unwrap();
+        drop(s);
+        a
+    };
+    let new_dir = Arc::new(TempDir::new().unwrap());
+    let new_cfg = NodeConfig {
+        node_id: 3,
+        data_dir: new_dir.path().to_owned(),
+        raft_listen_addr: new_addr,
+        app_id: "m2-test-snap".into(),
+        bootstrap: BootstrapConfig::Resume, // wait to be added by the leader
+        raft: tight_raft_tuning(),
+        tls: TlsConfig::default(),
+    };
+    let new_handle = NodeBuilder::new(new_cfg, Counter::default())
+        .start()
+        .await
+        .expect("new node start");
+
+    // Leader adds it as a learner.
+    leader_handle
+        .add_learner(3, new_addr)
+        .await
+        .expect("add_learner");
+
+    // Wait for the new node to catch up.
+    let mut caught_up = false;
+    for _ in 0..50 {
+        let v = new_handle.query_snapshot(|c: &Counter| c.value).await;
+        if v == total {
+            caught_up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(caught_up, "new node never caught up");
+
+    new_handle.shutdown().await.expect("shutdown new node");
     shutdown_all(nodes).await;
 }

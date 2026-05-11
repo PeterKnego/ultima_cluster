@@ -60,6 +60,9 @@ impl<S: StateMachine> NodeBuilder<S> {
             election_timeout_min: self.config.raft.election_timeout_min_ms,
             election_timeout_max: self.config.raft.election_timeout_max_ms,
             max_in_snapshot_log_to_keep: self.config.raft.max_in_snapshot_log_to_keep,
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
+                self.config.raft.snapshot_policy_logs_since_last,
+            ),
             ..Default::default()
         };
         let validated = raft_config_unvalidated

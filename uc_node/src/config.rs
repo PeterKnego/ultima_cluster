@@ -46,6 +46,8 @@ pub struct RaftTuning {
     pub election_timeout_min_ms: u64,
     pub election_timeout_max_ms: u64,
     pub max_in_snapshot_log_to_keep: u64,
+    /// Trigger snapshot every N applied log entries. openraft default is 5000.
+    pub snapshot_policy_logs_since_last: u64,
 }
 
 impl Default for RaftTuning {
@@ -55,6 +57,7 @@ impl Default for RaftTuning {
             election_timeout_min_ms: 1000,
             election_timeout_max_ms: 2000,
             max_in_snapshot_log_to_keep: 1000,
+            snapshot_policy_logs_since_last: 5000,
         }
     }
 }
