@@ -165,28 +165,39 @@ impl<S: StateMachine> NodeBuilder<S> {
 
                     // Add the other peers as learners (blocking until they
                     // catch up). A transient peer failure here is warn-logged,
-                    // not fatal: a partial cluster is recoverable via the
-                    // membership-change methods on NodeHandle.
+                    // not fatal: track which peers successfully became learners
+                    // so we only promote those to voters. openraft requires
+                    // every voter in `change_membership` to first be a learner,
+                    // so promoting a peer that failed `add_learner` would fail
+                    // the whole membership change and leave us as a degenerate
+                    // single-voter cluster.
+                    let mut promotable: BTreeSet<NodeId> = BTreeSet::from([self_id]);
                     for peer in peers.iter().filter(|p| p.node_id != self_id) {
                         let node = NodeAddr {
                             raft_addr: peer.raft_addr,
                             client_addr: None,
                         };
-                        if let Err(e) = raft.add_learner(peer.node_id, node, true).await {
-                            tracing::warn!(
-                                node_id = peer.node_id,
-                                error = ?e,
-                                "add_learner failed; peer may need to be added manually after startup"
-                            );
+                        match raft.add_learner(peer.node_id, node, true).await {
+                            Ok(_) => {
+                                promotable.insert(peer.node_id);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    node_id = peer.node_id,
+                                    error = ?e,
+                                    "add_learner failed; peer will not be promoted to voter"
+                                );
+                            }
                         }
                     }
 
-                    // Promote all peers to voters via change_membership.
-                    let voters: BTreeSet<NodeId> = peers.iter().map(|p| p.node_id).collect();
-                    if let Err(e) = raft.change_membership(voters, false).await {
+                    // Promote only the subset of peers that successfully joined
+                    // as learners. Best-effort partial quorum beats a single
+                    // degenerate voter.
+                    if let Err(e) = raft.change_membership(promotable, false).await {
                         tracing::warn!(
                             error = ?e,
-                            "change_membership failed; manual recovery may be needed"
+                            "change_membership failed; cluster may remain as single voter"
                         );
                     }
                 } else {
