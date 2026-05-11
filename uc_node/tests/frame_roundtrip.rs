@@ -78,3 +78,19 @@ fn oversized_body_len_rejected() {
     let msg = format!("{err}");
     assert!(msg.contains("exceeds maximum"), "unexpected error: {msg}");
 }
+
+use openraft::raft::VoteRequest;
+use openraft::Vote;
+use uc_node::network::codec;
+
+#[test]
+fn vote_req_roundtrip() {
+    let req: VoteRequest<u64> = VoteRequest::new(
+        Vote::new(7, 3),
+        Some(openraft::LogId::new(openraft::CommittedLeaderId::new(5, 0), 42)),
+    );
+    let bytes = codec::encode_vote_req(&req).expect("encode");
+    let decoded = codec::decode_vote_req(&bytes).expect("decode");
+    assert_eq!(decoded.vote, req.vote);
+    assert_eq!(decoded.last_log_id, req.last_log_id);
+}
