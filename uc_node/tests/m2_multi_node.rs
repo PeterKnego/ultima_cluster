@@ -430,3 +430,25 @@ async fn snapshot_install_on_new_follower() {
     new_handle.shutdown().await.expect("shutdown new node");
     shutdown_all(nodes).await;
 }
+
+#[tokio::test]
+async fn membership_change_remove_node() {
+    let nodes = spawn_3_node_cluster().await;
+    let leader_id = wait_for_leader(&nodes, Duration::from_secs(10)).await;
+    let leader = nodes.iter().find(|n| n.node_id == leader_id).unwrap();
+    let leader_handle = leader.handle.as_ref().unwrap();
+
+    // Submit one command with 3 voters.
+    let r1 = leader_handle.submit(Cmd::Inc(10)).await.expect("submit pre-removal");
+    assert_eq!(r1.value, 10);
+
+    // Pick a non-leader node to remove.
+    let victim = (1..=3u64).find(|i| *i != leader_id).unwrap();
+    leader_handle.remove_node(victim).await.expect("remove_node");
+
+    // Submit another command with the reduced membership (2 voters).
+    let r2 = leader_handle.submit(Cmd::Inc(5)).await.expect("submit post-removal");
+    assert_eq!(r2.value, 15);
+
+    shutdown_all(nodes).await;
+}
