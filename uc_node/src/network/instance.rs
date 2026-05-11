@@ -80,9 +80,18 @@ impl QuicRaftNetwork {
 
     /// Drop a stale connection from the pool. Called after a request fails so
     /// the next attempt opens a fresh connection.
-    async fn evict(&self) {
+    ///
+    /// Compare-and-evict: only remove the entry if it still points at the
+    /// same underlying `PeerConnInner` as the failed connection. If another
+    /// concurrent caller already evicted and reconnected, the pool now holds
+    /// a fresh connection that we must not drop.
+    async fn evict(&self, failed: &PeerConn) {
         let mut pool = self.pool.lock().await;
-        pool.remove(&self.target);
+        if let Some(current) = pool.get(&self.target)
+            && Arc::ptr_eq(&current.inner, &failed.inner)
+        {
+            pool.remove(&self.target);
+        }
     }
 }
 
@@ -98,21 +107,23 @@ impl RaftNetwork<TypeConfig> for QuicRaftNetwork {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, NodeAddr, RaftError<NodeId>>> {
         let body = codec::encode_append_entries_req(&rpc).map_err(rpc_err)?;
+        let timeout = option.hard_ttl();
         let conn = self.get_or_connect().await.map_err(rpc_err)?;
         match conn
             .request(
                 MessageType::AppendEntriesReq,
                 body,
                 MessageType::AppendEntriesResp,
+                timeout,
             )
             .await
         {
             Ok(resp_body) => codec::decode_append_entries_resp(&resp_body).map_err(rpc_err),
             Err(e) => {
-                self.evict().await;
+                self.evict(&conn).await;
                 Err(rpc_err(e))
             }
         }
@@ -121,24 +132,26 @@ impl RaftNetwork<TypeConfig> for QuicRaftNetwork {
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, NodeAddr, RaftError<NodeId, InstallSnapshotError>>,
     > {
         let body = codec::encode_install_snapshot_req(&rpc).map_err(rpc_err)?;
+        let timeout = option.hard_ttl();
         let conn = self.get_or_connect().await.map_err(rpc_err)?;
         match conn
             .request(
                 MessageType::InstallSnapshotReq,
                 body,
                 MessageType::InstallSnapshotResp,
+                timeout,
             )
             .await
         {
             Ok(resp_body) => codec::decode_install_snapshot_resp(&resp_body).map_err(rpc_err),
             Err(e) => {
-                self.evict().await;
+                self.evict(&conn).await;
                 Err(rpc_err(e))
             }
         }
@@ -147,17 +160,18 @@ impl RaftNetwork<TypeConfig> for QuicRaftNetwork {
     async fn vote(
         &mut self,
         rpc: VoteRequest<NodeId>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, NodeAddr, RaftError<NodeId>>> {
         let body = codec::encode_vote_req(&rpc).map_err(rpc_err)?;
+        let timeout = option.hard_ttl();
         let conn = self.get_or_connect().await.map_err(rpc_err)?;
         match conn
-            .request(MessageType::VoteReq, body, MessageType::VoteResp)
+            .request(MessageType::VoteReq, body, MessageType::VoteResp, timeout)
             .await
         {
             Ok(resp_body) => codec::decode_vote_resp(&resp_body).map_err(rpc_err),
             Err(e) => {
-                self.evict().await;
+                self.evict(&conn).await;
                 Err(rpc_err(e))
             }
         }

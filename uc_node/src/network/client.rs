@@ -19,10 +19,10 @@ use super::frame::{Frame, MessageType};
 use super::NetworkError;
 
 pub struct PeerConn {
-    inner: Arc<PeerConnInner>,
+    pub(crate) inner: Arc<PeerConnInner>,
 }
 
-struct PeerConnInner {
+pub(crate) struct PeerConnInner {
     conn: quinn::Connection,
     request_id: AtomicU64,
 }
@@ -75,6 +75,7 @@ impl PeerConn {
         msg_type: MessageType,
         body: bytes::Bytes,
         response_type: MessageType,
+        timeout: std::time::Duration,
     ) -> Result<bytes::Bytes, NetworkError> {
         let request_id = self.inner.request_id.fetch_add(1, Ordering::Relaxed);
 
@@ -95,13 +96,10 @@ impl PeerConn {
         send.finish()
             .map_err(|e| NetworkError::Stream(format!("finish: {e}")))?;
 
-        // Read the response frame with a timeout.
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            Frame::read_async(&mut recv),
-        )
-        .await
-        .map_err(|_| NetworkError::Timeout)??;
+        // Read the response frame with the caller-supplied timeout.
+        let response = tokio::time::timeout(timeout, Frame::read_async(&mut recv))
+            .await
+            .map_err(|_| NetworkError::Timeout)??;
 
         if response.msg_type != response_type {
             return Err(NetworkError::Decode(format!(
