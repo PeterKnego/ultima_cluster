@@ -17,5 +17,6 @@ pub mod mpsc;
 pub mod spsc;
 
 pub use common::{FrameHeader, RecordHeader, RingError, RingHeader};
+pub use mpsc::{MpscConsumer, MpscProducer, MpscRing};
 pub use spsc::{SpscConsumer, SpscProducer, SpscRing};
-// MpscRing / BroadcastRing re-exported once Tasks 3 + 4 land.
+// BroadcastRing re-exported once Task 4 lands.
