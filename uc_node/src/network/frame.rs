@@ -51,6 +51,12 @@ impl MessageType {
 const HEADER_LEN: usize = 1 + 1 + 8 + 4;     // 14 bytes
 const TRAILER_LEN: usize = 4;                 // body_crc32
 
+/// Maximum allowed body length on a single frame, to bound memory
+/// allocations from attacker-controlled `body_len` headers. 16 MiB is
+/// well above any expected single Raft RPC and any individual
+/// install_snapshot chunk; senders that need larger payloads must split.
+const MAX_BODY_LEN: usize = 16 * 1024 * 1024;
+
 pub struct Frame {
     pub msg_type: MessageType,
     pub flags: u8,
@@ -93,6 +99,10 @@ impl Frame {
         let flags = buf.get_u8();
         let request_id = buf.get_u64();
         let body_len = buf.get_u32() as usize;
+        if body_len > MAX_BODY_LEN {
+            return Err(NetworkError::Decode(format!(
+                "body_len {body_len} exceeds maximum {MAX_BODY_LEN}")));
+        }
         if buf.len() < body_len + TRAILER_LEN {
             return Err(NetworkError::Decode(format!(
                 "need {body_len}+{TRAILER_LEN} body bytes, have {}", buf.len())));
@@ -121,6 +131,10 @@ impl Frame {
         let flags = header_buf.get_u8();
         let request_id = header_buf.get_u64();
         let body_len = header_buf.get_u32() as usize;
+        if body_len > MAX_BODY_LEN {
+            return Err(NetworkError::Decode(format!(
+                "body_len {body_len} exceeds maximum {MAX_BODY_LEN}")));
+        }
 
         let mut body_vec = vec![0u8; body_len];
         reader.read_exact(&mut body_vec).await?;

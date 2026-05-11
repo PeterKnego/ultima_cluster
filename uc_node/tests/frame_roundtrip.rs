@@ -58,3 +58,23 @@ async fn read_async_round_trip() {
     assert_eq!(decoded.request_id, 7);
     assert_eq!(decoded.body, body);
 }
+
+#[test]
+fn oversized_body_len_rejected() {
+    // Manually construct a header claiming a 100 MiB body — exceeds the 16 MiB cap.
+    use bytes::BufMut;
+    let mut buf = bytes::BytesMut::with_capacity(14);
+    buf.put_u8(MessageType::VoteReq as u8);   // msg_type
+    buf.put_u8(0);                             // flags
+    buf.put_u64(1);                            // request_id
+    buf.put_u32(100 * 1024 * 1024);            // body_len = 100 MiB
+    // (no body bytes — decode should reject before getting that far)
+    let mut bytes = buf.freeze();
+    let result = Frame::decode(&mut bytes);
+    let err = match result {
+        Ok(_) => panic!("oversized body_len should be rejected"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(msg.contains("exceeds maximum"), "unexpected error: {msg}");
+}
