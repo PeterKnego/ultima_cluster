@@ -65,7 +65,16 @@ impl<S: StateMachine> AdaptedStateMachine<S> {
         let (last_membership, current_snapshot) = match loaded_snapshot_meta {
             Some(meta) => {
                 let bytes_path = handles.data_dir.join(&meta.bytes_filename);
-                let bytes = std::fs::read(&bytes_path).unwrap_or_default();
+                // FAIL-HARD (I1 fix): if snapshot_meta points at a bytes file,
+                // that file MUST be present and readable. Silently substituting
+                // an empty Vec would let user SMs whose install_snapshot([])
+                // returns Ok start in default state while framework claims the
+                // snapshot index — silent corruption.
+                let bytes = std::fs::read(&bytes_path).map_err(|e| {
+                    crate::ClusterError::Recovery(format!(
+                        "snapshot_meta points to {bytes_path:?} but read failed: {e}"
+                    ))
+                })?;
                 let openraft_meta = SnapshotMeta {
                     last_log_id: meta.last_log_id,
                     last_membership: meta.last_membership.clone(),
@@ -112,14 +121,23 @@ impl<S: StateMachine> AdaptedStateMachine<S> {
                 });
             }
             (None, Some(_)) => {
-                // User says fresh state but framework has persisted history.
-                // Allowed: install_snapshot may leave user's last_applied None if
-                // they couldn't re-derive it from the snapshot bytes alone.
-                // Logged at warn; framework's value is treated as authoritative.
-                tracing::warn!(
-                    framework_last_applied = ?framework_la,
-                    "user reports None last_applied but framework has persisted value; assuming framework authoritative",
-                );
+                // I2 fix: only tolerate user=None / framework=Some when a
+                // snapshot was actually loaded — the user's install_snapshot
+                // may not have been able to re-derive last_applied from the
+                // bytes alone, so framework's value is authoritative. Without
+                // a loaded snapshot, framework claiming index N with the user
+                // SM at default is silent corruption: surface as drift.
+                if current_snapshot.is_some() {
+                    tracing::warn!(
+                        framework_last_applied = ?framework_la,
+                        "user reports None last_applied after snapshot install; framework authoritative",
+                    );
+                } else {
+                    return Err(crate::ClusterError::DriftDetected {
+                        user: None,
+                        framework: framework_la,
+                    });
+                }
             }
             (Some(u), None) => {
                 // User says caught up but framework has no record.
@@ -287,26 +305,17 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
         // snapshot_meta_sv.store() — if a crash hits there, snapshot_meta_sv
         // is None on restart so the orphan bytes file is never read.
 
-        // 2. Persist last_applied (if present).
-        if let Some(lid) = meta.last_log_id {
-            g.last_applied_sv
-                .store(&lid)
-                .map_err(|e| {
-                    StorageIOError::<NodeId>::read_snapshot(
-                        Some(meta.signature()),
-                        &std::io::Error::other(e.to_string()),
-                    )
-                })?
-                .wait()
-                .map_err(|e| {
-                    StorageIOError::<NodeId>::read_snapshot(
-                        Some(meta.signature()),
-                        &std::io::Error::other(e.to_string()),
-                    )
-                })?;
-        }
-
-        // 3. Persist snapshot meta (atomic pointer to the bytes file).
+        // 2. Persist snapshot meta FIRST (atomic pointer to the bytes file).
+        //    Ordering rationale (I1 fix): snapshot_meta is the "I have a snapshot
+        //    at index N" pointer. By writing it before last_applied_sv we keep
+        //    the on-disk state consistent across crash windows:
+        //      * crash between bytes-write and meta-write: meta=None → restart
+        //        sees no snapshot, no last_applied; user SM stays default.
+        //      * crash between meta-write and last_applied-write: meta=Some(N)
+        //        → restart re-installs the snapshot; user's install_snapshot
+        //        returns N and that becomes the authoritative last_applied.
+        //    The previous ordering allowed last_applied=Some(N) with meta=None,
+        //    yielding silent corruption (framework at N, user SM at default).
         let stored_meta = StoredSnapshotMeta {
             last_log_id: meta.last_log_id,
             last_membership: meta.last_membership.clone(),
@@ -327,6 +336,25 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
                     &std::io::Error::other(e.to_string()),
                 )
             })?;
+
+        // 3. Persist last_applied (if present).
+        if let Some(lid) = meta.last_log_id {
+            g.last_applied_sv
+                .store(&lid)
+                .map_err(|e| {
+                    StorageIOError::<NodeId>::read_snapshot(
+                        Some(meta.signature()),
+                        &std::io::Error::other(e.to_string()),
+                    )
+                })?
+                .wait()
+                .map_err(|e| {
+                    StorageIOError::<NodeId>::read_snapshot(
+                        Some(meta.signature()),
+                        &std::io::Error::other(e.to_string()),
+                    )
+                })?;
+        }
 
         // 4. Now mutate the user's state machine. If this fails, the durable
         //    record points at a snapshot the user can't install — surface as
