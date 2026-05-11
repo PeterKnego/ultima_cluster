@@ -189,6 +189,22 @@ pub async fn wait_for_leader(nodes: &[TestNode], timeout: Duration) -> NodeId {
     panic!("no leader within {timeout:?}");
 }
 
+async fn wait_for_leader_among(handles: &[&NodeHandle<Counter>], timeout: Duration) -> NodeId {
+    let surviving_ids: Vec<NodeId> = handles.iter().map(|h| h.node_id()).collect();
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        for h in handles {
+            if let Some(l) = h.current_leader().await
+                && surviving_ids.contains(&l)
+            {
+                return l;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("no leader among surviving nodes within {timeout:?}");
+}
+
 pub async fn shutdown_all(mut nodes: Vec<TestNode>) {
     for n in nodes.iter_mut() {
         if let Some(handle) = n.handle.take() {
@@ -232,5 +248,52 @@ async fn three_node_replication() {
             assert_eq!(v, 15, "node {} value", n.node_id);
         }
     }
+    shutdown_all(nodes).await;
+}
+
+#[tokio::test]
+async fn leader_failover() {
+    let mut nodes = spawn_3_node_cluster().await;
+    let initial_leader_id = wait_for_leader(&nodes, Duration::from_secs(10)).await;
+
+    // Submit one command before failover.
+    {
+        let leader = nodes.iter().find(|n| n.node_id == initial_leader_id).unwrap();
+        leader
+            .handle
+            .as_ref()
+            .unwrap()
+            .submit(Cmd::Inc(100))
+            .await
+            .expect("submit pre-failover");
+    }
+
+    // Kill the leader.
+    {
+        let leader_idx = nodes
+            .iter()
+            .position(|n| n.node_id == initial_leader_id)
+            .unwrap();
+        let leader = nodes[leader_idx].handle.take().unwrap();
+        leader.shutdown().await.expect("shutdown leader");
+    }
+
+    // Wait for a new leader among surviving nodes.
+    let surviving: Vec<&NodeHandle<Counter>> =
+        nodes.iter().filter_map(|n| n.handle.as_ref()).collect();
+    let new_leader_id = wait_for_leader_among(&surviving, Duration::from_secs(15)).await;
+    assert_ne!(new_leader_id, initial_leader_id, "must elect a new leader");
+
+    // Submit through the new leader.
+    let new_leader = nodes.iter().find(|n| n.node_id == new_leader_id).unwrap();
+    let resp = new_leader
+        .handle
+        .as_ref()
+        .unwrap()
+        .submit(Cmd::Inc(50))
+        .await
+        .expect("submit post-failover");
+    assert_eq!(resp.value, 150);
+
     shutdown_all(nodes).await;
 }
