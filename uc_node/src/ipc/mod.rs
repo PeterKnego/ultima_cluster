@@ -22,6 +22,7 @@
 pub mod handshake;
 pub mod instance;
 pub mod liveness;
+pub mod query_link;
 pub mod service_link;
 
 pub use handshake::HandshakeError;

@@ -16,6 +16,7 @@ use crate::ClusterError;
 use crate::config::{BootstrapConfig, IpcMode, NodeConfig};
 use crate::ipc::handshake::wait_for_service_ready;
 use crate::ipc::liveness::spawn_liveness;
+use crate::ipc::query_link::ShmemQueryLink;
 use crate::ipc::service_link::ServiceLink;
 use crate::ipc::{HandshakeError, Instance};
 use crate::network::QuicRaftNetworkFactory;
@@ -58,7 +59,7 @@ impl<S: StateMachine> NodeBuilder<S> {
             IpcMode::Embedded => {
                 let adapter = AdaptedStateMachine::new(self.state_machine, handles)?;
                 let handle_sm = SmAdapter::Embedded(adapter.clone());
-                finish(self.config, log_storage, adapter, handle_sm, None, None).await
+                finish(self.config, log_storage, adapter, handle_sm, None, None, None).await
             }
             IpcMode::Shmem { instance_dir } => {
                 let instance =
@@ -92,6 +93,8 @@ impl<S: StateMachine> NodeBuilder<S> {
                     link.apply_producer,
                     link.apply_resp_consumer,
                 )?;
+                let query_link =
+                    ShmemQueryLink::new(link.query_producer, link.query_resp_consumer);
                 let handle_sm = SmAdapter::Shmem(adapter.clone());
                 finish(
                     self.config,
@@ -100,6 +103,7 @@ impl<S: StateMachine> NodeBuilder<S> {
                     handle_sm,
                     Some(instance),
                     Some(node_liveness),
+                    Some(query_link),
                 )
                 .await
             }
@@ -117,6 +121,7 @@ async fn finish<A, S>(
     handle_sm: SmAdapter<S>,
     instance: Option<Instance>,
     node_liveness: Option<crate::ipc::liveness::LivenessHandle>,
+    query_link: Option<ShmemQueryLink>,
 ) -> Result<NodeHandle<S>, ClusterError>
 where
     S: StateMachine,
@@ -260,6 +265,7 @@ where
         server,
         _instance: instance,
         node_liveness,
+        query_link,
     })
 }
 

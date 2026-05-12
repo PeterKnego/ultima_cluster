@@ -18,6 +18,7 @@ use crate::ClusterError;
 use crate::config::{NodeConfig, NodeId};
 use crate::ipc::Instance;
 use crate::ipc::liveness::LivenessHandle;
+use crate::ipc::query_link::ShmemQueryLink;
 use crate::network::server::ServerHandle;
 use crate::raft::NodeAddr;
 use crate::raft::TypeConfig;
@@ -51,6 +52,9 @@ pub struct NodeHandle<S: StateMachine> {
     /// Shmem-mode only: node-side heartbeat ticker handle. Stop+joined on
     /// shutdown before the cnc mmap is dropped.
     pub(crate) node_liveness: Option<LivenessHandle>,
+    /// Shmem-mode only: query.ring producer + query_resp.ring consumer,
+    /// wrapped in the publish/await helper used by [`Self::submit_query`].
+    pub(crate) query_link: Option<ShmemQueryLink>,
 }
 
 impl<S: StateMachine> NodeHandle<S> {
@@ -106,6 +110,43 @@ impl<S: StateMachine> NodeHandle<S> {
                 "query_snapshot is embedded-only; in shmem mode submit a typed Query \
                  through uc_service's query.ring path"
             ),
+        }
+    }
+
+    /// Submit a typed `S::Query`. Works in both IPC modes:
+    ///
+    /// * **Embedded** — takes the same mutex `apply` does and calls
+    ///   `state_machine.query(q)` in-process. Equivalent to
+    ///   [`Self::query_snapshot`] but with the user's typed `Query` rather
+    ///   than a closure.
+    /// * **Shmem** — bincode-encodes `q`, publishes a [`QueryFrame`] on
+    ///   `service/query.ring`, awaits the matching `QueryRespFrame` on
+    ///   `service/query_resp.ring`, decodes the response payload.
+    ///
+    /// All M3 queries are routed as [`QueryKind::Snapshot`]. Linearizable
+    /// reads (round-trip through raft) arrive in M4.
+    ///
+    /// [`QueryFrame`]: uc_protocol::frames::query
+    /// [`QueryKind::Snapshot`]: uc_protocol::frames::query::QueryKind::Snapshot
+    pub async fn submit_query(&self, q: S::Query) -> Result<S::QueryResponse, ClusterError> {
+        match &self.sm {
+            SmAdapter::Embedded(a) => Ok(a.with_state(|s| s.query(q)).await),
+            SmAdapter::Shmem(_) => {
+                use uc_protocol::frames::query::QueryKind;
+                let link = self.query_link.as_ref().ok_or_else(|| {
+                    ClusterError::Config(
+                        "shmem-mode NodeHandle missing query_link (builder bug)".into(),
+                    )
+                })?;
+                let payload =
+                    bincode::serde::encode_to_vec(&q, bincode::config::standard())?;
+                let resp_bytes = link.submit(&payload, QueryKind::Snapshot).await?;
+                let (resp, _) = bincode::serde::decode_from_slice::<S::QueryResponse, _>(
+                    &resp_bytes,
+                    bincode::config::standard(),
+                )?;
+                Ok(resp)
+            }
         }
     }
 

@@ -80,7 +80,7 @@ async fn wait_for_path(path: &std::path::Path, timeout: Duration) {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn shmem_single_node_submit_apply() {
     let instance_tempdir = TempDir::new().unwrap();
     let node_data_tempdir = TempDir::new().unwrap();
@@ -159,6 +159,100 @@ async fn shmem_single_node_submit_apply() {
     // Service first: stop its loops + drop the cnc mmap. Then the node,
     // whose `_instance` field still holds the cnc mmap — its shutdown
     // joins the heartbeat ticker before that drop.
+    service.shutdown().await.expect("service shutdown");
+    node.shutdown().await.expect("node shutdown");
+}
+
+/// Same harness as [`shmem_single_node_submit_apply`], but exercises the
+/// query path:
+///
+/// ```text
+/// handle.submit_query(())
+///   → bincode-encode `()`
+///   → push QueryFrame on service/query.ring
+///   → uc_service query_loop consumes
+///     → user SM.query(())
+///     → publish QueryRespFrame on service/query_resp.ring
+///   → ShmemQueryLink decodes the response payload
+/// ```
+///
+/// Verifies that an apply changes what a subsequent query observes.
+#[tokio::test]
+async fn shmem_single_node_query_roundtrip() {
+    let instance_tempdir = TempDir::new().unwrap();
+    let node_data_tempdir = TempDir::new().unwrap();
+    let service_data_tempdir = TempDir::new().unwrap();
+    let instance_dir = instance_tempdir.path().to_owned();
+    let app_id = "m3-shmem-query".to_string();
+
+    let node_cfg = NodeConfig {
+        node_id: 1,
+        data_dir: node_data_tempdir.path().to_owned(),
+        raft_listen_addr: "127.0.0.1:0".parse().unwrap(),
+        app_id: app_id.clone(),
+        bootstrap: BootstrapConfig::SingleNode,
+        raft: RaftTuning::default(),
+        tls: TlsConfig::default(),
+        ipc_mode: IpcMode::Shmem {
+            instance_dir: instance_dir.clone(),
+        },
+    };
+    let node_task =
+        tokio::spawn(async move { NodeBuilder::new(node_cfg, Counter::default()).start().await });
+
+    wait_for_path(&instance_dir.join("cnc.dat"), Duration::from_secs(5)).await;
+
+    let svc_cfg = ServiceConfig {
+        instance_dir: instance_dir.clone(),
+        app_id: app_id.clone(),
+        data_dir: service_data_tempdir.path().to_owned(),
+        ..ServiceConfig::default()
+    };
+    let svc_task = tokio::spawn(async move {
+        ServiceBuilder::new(svc_cfg, Counter::default())
+            .run()
+            .await
+    });
+
+    let node = tokio::time::timeout(Duration::from_secs(15), node_task)
+        .await
+        .expect("node start timed out")
+        .expect("node task panic")
+        .expect("node start error");
+    let service = tokio::time::timeout(Duration::from_secs(15), svc_task)
+        .await
+        .expect("service start timed out")
+        .expect("service task panic")
+        .expect("service start error");
+
+    for _ in 0..50 {
+        if node.current_leader().await == Some(1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(node.current_leader().await, Some(1), "leader did not converge");
+
+    // Empty SM observes 0 before any apply lands.
+    let v = node.submit_query(()).await.expect("query #1");
+    assert_eq!(v, 0);
+
+    // Apply two increments, then re-query. Both ring paths share nothing —
+    // a stale or torn read here would surface as a wrong value or as a
+    // request_id mismatch inside ShmemQueryLink.
+    node.submit(Cmd::Inc(7)).await.expect("submit Inc(7)");
+    node.submit(Cmd::Inc(4)).await.expect("submit Inc(4)");
+
+    let v = node.submit_query(()).await.expect("query #2");
+    assert_eq!(v, 11);
+
+    // Concurrent queries: the link serializes via its internal mutex, so
+    // both should resolve cleanly without interleaving responses.
+    let n1 = &node;
+    let (a, b) = tokio::join!(n1.submit_query(()), n1.submit_query(()));
+    assert_eq!(a.expect("concurrent query a"), 11);
+    assert_eq!(b.expect("concurrent query b"), 11);
+
     service.shutdown().await.expect("service shutdown");
     node.shutdown().await.expect("node shutdown");
 }
