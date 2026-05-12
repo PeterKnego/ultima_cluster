@@ -24,4 +24,5 @@ pub mod instance;
 pub mod liveness;
 pub mod service_link;
 
+pub use handshake::HandshakeError;
 pub use instance::{Instance, IpcError};
