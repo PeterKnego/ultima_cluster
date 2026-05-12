@@ -24,7 +24,8 @@ futures = "0.3"
 # raft + storage
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 ultima-journal = { path = "../ultima_db/ultima_journal" }
-# ultima_db deliberately omitted in M1; arrives in M3 as a uc_service feature
+# `persistence` is required for snapshot_stream / install_snapshot_stream.
+ultima-db = { path = "../ultima_db", features = ["persistence"] }
 
 # QUIC + TLS (M2)
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
