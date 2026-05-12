@@ -2,15 +2,24 @@
 
 SMR cluster implementation on top of openraft.
 
-**Status:** M2 — multi-node + QUIC inter-node transport complete. See
+**Status:** M3 — shmem IPC + `uc_service` process split complete. The
+state machine now lives behind a shared-memory ring boundary (apply +
+query rings, node→service heartbeat both ways), with a service-crash
+liveness watcher on the node. See
 `docs/superpowers/specs/2026-05-10-ultima-cluster-design.md` for the
 canonical design and `docs/tasks/` for per-milestone records.
 
 ## Workspace
 
-- `uc_protocol` — wire spec (`no_std`-friendly).
-- `uc_service` — service-side SDK (`StateMachine`, `OutputHandler` traits).
-- `uc_node` — cluster engine (Raft, log storage, QUIC inter-node network).
+- `uc_protocol` — wire spec (`no_std`-friendly): ring buffer primitives
+  (SPSC / MPSC / Broadcast), `cnc.dat` layout, per-RPC frame types,
+  liveness + handshake helpers.
+- `uc_service` — service-side SDK (`StateMachine`, `OutputHandler`
+  traits) + the `uc_service::ultima_db` adapter
+  (`StoreStateMachine`).
+- `uc_node` — cluster engine (Raft, log storage, QUIC inter-node
+  network, shmem IPC owner: `instance.lock`, `cnc.dat`, service rings,
+  liveness ticker, service watcher).
 - `uc_client` — local-shmem client SDK (M1 stub; full impl in M4).
 
 ## Build & test
