@@ -18,6 +18,7 @@ use crate::ipc::handshake::wait_for_service_ready;
 use crate::ipc::liveness::spawn_liveness;
 use crate::ipc::query_link::ShmemQueryLink;
 use crate::ipc::service_link::ServiceLink;
+use crate::ipc::service_watcher::{DEFAULT_LIVENESS_TIMEOUT, spawn_service_watcher};
 use crate::ipc::{HandshakeError, Instance};
 use crate::network::QuicRaftNetworkFactory;
 use crate::network::server::spawn_server;
@@ -59,7 +60,8 @@ impl<S: StateMachine> NodeBuilder<S> {
             IpcMode::Embedded => {
                 let adapter = AdaptedStateMachine::new(self.state_machine, handles)?;
                 let handle_sm = SmAdapter::Embedded(adapter.clone());
-                finish(self.config, log_storage, adapter, handle_sm, None, None, None).await
+                finish(self.config, log_storage, adapter, handle_sm, None, None, None)
+                    .await
             }
             IpcMode::Shmem { instance_dir } => {
                 let instance =
@@ -70,6 +72,11 @@ impl<S: StateMachine> NodeBuilder<S> {
                 // service-side handshake watcher. Lifetimes are upheld by
                 // `instance` (moved into the NodeHandle) outliving both.
                 let (node_status_ptr, service_status_ptr) = status_ptrs(&instance.cnc_mmap);
+                // SendPtr lets us hold service_status_ptr across the awaits
+                // below; raw `*const T` is not `Send` on its own. The mmap
+                // backing the target outlives every consumer (cf. SAFETY
+                // notes on each `unsafe` block below).
+                let service_status = SendPtr(service_status_ptr);
 
                 // SAFETY: `instance.cnc_mmap` is moved into the NodeHandle
                 // below and stays alive until shutdown stops + joins this
@@ -82,7 +89,7 @@ impl<S: StateMachine> NodeBuilder<S> {
                 // outer timeout if needed.
                 // SAFETY: see node_status_ptr SAFETY above; same mmap.
                 unsafe {
-                    wait_for_service_ready(service_status_ptr, std::time::Duration::from_secs(30))
+                    wait_for_service_ready(service_status.0, std::time::Duration::from_secs(30))
                         .await
                 }
                 .map_err(map_handshake_err)?;
@@ -96,7 +103,8 @@ impl<S: StateMachine> NodeBuilder<S> {
                 let query_link =
                     ShmemQueryLink::new(link.query_producer, link.query_resp_consumer);
                 let handle_sm = SmAdapter::Shmem(adapter.clone());
-                finish(
+                let node_id_for_watcher = self.config.node_id;
+                let mut handle = finish(
                     self.config,
                     log_storage,
                     adapter,
@@ -105,7 +113,24 @@ impl<S: StateMachine> NodeBuilder<S> {
                     Some(node_liveness),
                     Some(query_link),
                 )
-                .await
+                .await?;
+
+                // Service-liveness watcher: shuts raft down if this node
+                // is leader when the service stalls. Spawned post-finish
+                // because it needs a `Raft<TypeConfig>` clone.
+                // SAFETY: see service_status_ptr SAFETY above. The mmap
+                // lives in `handle._instance`, which `handle.shutdown()`
+                // drops only after joining this watcher.
+                let watcher = unsafe {
+                    spawn_service_watcher(
+                        service_status.0,
+                        handle.raft.clone(),
+                        node_id_for_watcher,
+                        DEFAULT_LIVENESS_TIMEOUT,
+                    )
+                };
+                handle.service_watcher = Some(watcher);
+                Ok(handle)
             }
         }
     }
@@ -266,6 +291,7 @@ where
         _instance: instance,
         node_liveness,
         query_link,
+        service_watcher: None,
     })
 }
 
@@ -294,3 +320,14 @@ fn status_ptrs(
 fn map_handshake_err(e: HandshakeError) -> ClusterError {
     ClusterError::Config(format!("service handshake: {e}"))
 }
+
+/// `Send`-carrier for a `*const ServiceStatus` used across the
+/// `start()` await chain. `ServiceStatus` is `Sync` (all-atomic fields),
+/// so the pointer is logically safe to send between threads as long as
+/// the underlying mmap is pinned — which the caller ensures by keeping
+/// `Instance` alive until every consumer joins.
+#[derive(Copy, Clone)]
+struct SendPtr(*const uc_protocol::cnc::ServiceStatus);
+
+// SAFETY: see SendPtr docs — invariant upheld at every consumer call site.
+unsafe impl Send for SendPtr {}

@@ -19,6 +19,7 @@ use crate::config::{NodeConfig, NodeId};
 use crate::ipc::Instance;
 use crate::ipc::liveness::LivenessHandle;
 use crate::ipc::query_link::ShmemQueryLink;
+use crate::ipc::service_watcher::ServiceWatcherHandle;
 use crate::network::server::ServerHandle;
 use crate::raft::NodeAddr;
 use crate::raft::TypeConfig;
@@ -55,6 +56,9 @@ pub struct NodeHandle<S: StateMachine> {
     /// Shmem-mode only: query.ring producer + query_resp.ring consumer,
     /// wrapped in the publish/await helper used by [`Self::submit_query`].
     pub(crate) query_link: Option<ShmemQueryLink>,
+    /// Shmem-mode only: watches the service's heartbeat. Joined on
+    /// shutdown before the cnc mmap drops.
+    pub(crate) service_watcher: Option<ServiceWatcherHandle>,
 }
 
 impl<S: StateMachine> NodeHandle<S> {
@@ -200,17 +204,33 @@ impl<S: StateMachine> NodeHandle<S> {
         Ok(())
     }
 
+    /// Shmem-mode only: `true` once the service-liveness watcher has
+    /// detected a stall (heartbeat_seq did not advance within its
+    /// configured timeout). Returns `false` in embedded mode and before
+    /// the first stall observation.
+    pub fn service_stalled(&self) -> bool {
+        self.service_watcher
+            .as_ref()
+            .is_some_and(|w| w.stalled.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     pub async fn shutdown(self) -> Result<(), ClusterError> {
         // Shut down raft first so it stops issuing outbound RPCs.
+        // Idempotent on second call (e.g. if the service watcher already
+        // shut raft down on a stalled-leader event).
         self.raft
             .shutdown()
             .await
             .map_err(|e| ClusterError::Raft(format!("shutdown: {e}")))?;
         // Then the QUIC server (closes endpoint, awaits accept task).
         self.server.shutdown().await;
-        // Finally, the node-side heartbeat ticker (shmem mode only). Must
-        // join before `_instance` drops because the ticker holds a
-        // `&'static NodeStatus` into the cnc mmap that lives there.
+        // Shmem-mode only: stop+join both cnc-mmap-holding tasks before
+        // `_instance` drops. Both hold `&'static` references into the
+        // cnc mmap that lives in `_instance`.
+        if let Some(w) = self.service_watcher {
+            w.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = w.join.await;
+        }
         if let Some(lv) = self.node_liveness {
             lv.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = lv.join.await;
