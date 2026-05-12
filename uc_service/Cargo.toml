@@ -23,6 +23,7 @@ bincode = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 memmap2 = { workspace = true }
+parking_lot = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
