@@ -1722,6 +1722,7 @@ dependencies = [
  "uc_node",
  "uc_protocol",
  "uc_service",
+ "ultima-db",
  "ultima-journal",
 ]
 

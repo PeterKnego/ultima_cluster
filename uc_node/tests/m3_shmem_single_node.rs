@@ -121,11 +121,8 @@ async fn shmem_single_node_submit_apply() {
         data_dir: service_data_tempdir.path().to_owned(),
         ..ServiceConfig::default()
     };
-    let svc_task = tokio::spawn(async move {
-        ServiceBuilder::new(svc_cfg, Counter::default())
-            .run()
-            .await
-    });
+    let svc_task =
+        tokio::spawn(async move { ServiceBuilder::new(svc_cfg, Counter::default()).run().await });
 
     let node = tokio::time::timeout(Duration::from_secs(15), node_task)
         .await
@@ -146,7 +143,11 @@ async fn shmem_single_node_submit_apply() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert_eq!(node.current_leader().await, Some(1), "leader did not converge");
+    assert_eq!(
+        node.current_leader().await,
+        Some(1),
+        "leader did not converge"
+    );
 
     // ── Submit + verify the increment round-tripped through the rings ──
     let resp = node.submit(Cmd::Inc(5)).await.expect("submit Inc(5)");
@@ -208,11 +209,8 @@ async fn shmem_single_node_query_roundtrip() {
         data_dir: service_data_tempdir.path().to_owned(),
         ..ServiceConfig::default()
     };
-    let svc_task = tokio::spawn(async move {
-        ServiceBuilder::new(svc_cfg, Counter::default())
-            .run()
-            .await
-    });
+    let svc_task =
+        tokio::spawn(async move { ServiceBuilder::new(svc_cfg, Counter::default()).run().await });
 
     let node = tokio::time::timeout(Duration::from_secs(15), node_task)
         .await
@@ -231,7 +229,11 @@ async fn shmem_single_node_query_roundtrip() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert_eq!(node.current_leader().await, Some(1), "leader did not converge");
+    assert_eq!(
+        node.current_leader().await,
+        Some(1),
+        "leader did not converge"
+    );
 
     // Empty SM observes 0 before any apply lands.
     let v = node.submit_query(()).await.expect("query #1");

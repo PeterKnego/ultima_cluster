@@ -168,7 +168,11 @@ async fn three_node_shmem_cluster() {
     // ── For each node, wait for cnc.dat, then spawn its service ─────────
     let mut svc_tasks = Vec::new();
     for instance_dir in instance_dirs.iter() {
-        wait_for_path(&instance_dir.path().join("cnc.dat"), Duration::from_secs(10)).await;
+        wait_for_path(
+            &instance_dir.path().join("cnc.dat"),
+            Duration::from_secs(10),
+        )
+        .await;
 
         let svc_data_dir = Arc::new(TempDir::new().unwrap());
         _svc_data_dirs.push(svc_data_dir.clone());
@@ -207,7 +211,10 @@ async fn three_node_shmem_cluster() {
     // ── Wait for a leader, submit 5 increments through it ───────────────
     let leader_id = wait_for_leader(&node_handles, Duration::from_secs(15)).await;
     assert!((1..=3).contains(&leader_id));
-    let leader = node_handles.iter().find(|h| h.node_id() == leader_id).unwrap();
+    let leader = node_handles
+        .iter()
+        .find(|h| h.node_id() == leader_id)
+        .unwrap();
 
     // Cumulative sums: 1, 3, 6, 10, 15.
     for i in 1..=5u64 {

@@ -26,8 +26,8 @@ use tempfile::TempDir;
 use ultima_db::Store;
 
 use uc_node::{BootstrapConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning, TlsConfig};
-use uc_service::runtime::ServiceConfig;
 use uc_service::ServiceBuilder;
+use uc_service::runtime::ServiceConfig;
 use uc_service::ultima_db::StoreStateMachine;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -96,9 +96,8 @@ async fn ultima_db_adapter_end_to_end() {
         },
     };
     // Node-side SM is degenerate in shmem mode (snapshot trait surface only).
-    let node_task = tokio::spawn(async move {
-        NodeBuilder::new(node_cfg, build_store_sm()).start().await
-    });
+    let node_task =
+        tokio::spawn(async move { NodeBuilder::new(node_cfg, build_store_sm()).start().await });
 
     wait_for_path(&instance_dir.join("cnc.dat"), Duration::from_secs(5)).await;
 
@@ -109,9 +108,8 @@ async fn ultima_db_adapter_end_to_end() {
         data_dir: service_data_tempdir.path().to_owned(),
         ..ServiceConfig::default()
     };
-    let svc_task = tokio::spawn(async move {
-        ServiceBuilder::new(svc_cfg, build_store_sm()).run().await
-    });
+    let svc_task =
+        tokio::spawn(async move { ServiceBuilder::new(svc_cfg, build_store_sm()).run().await });
 
     let node = tokio::time::timeout(Duration::from_secs(15), node_task)
         .await

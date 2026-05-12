@@ -63,10 +63,12 @@ impl ShmemQueryLink {
         g.next_request_id = g.next_request_id.wrapping_add(1);
 
         loop {
-            match g
-                .producer
-                .try_write(MSG_TYPE_QUERY, 0, encode_extra_query(request_id, kind), payload)
-            {
+            match g.producer.try_write(
+                MSG_TYPE_QUERY,
+                0,
+                encode_extra_query(request_id, kind),
+                payload,
+            ) {
                 Ok(()) => break,
                 Err(RingError::Full) => tokio::time::sleep(FULL_BACKOFF).await,
                 Err(e) => {

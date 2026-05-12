@@ -142,8 +142,7 @@ impl<S: StateMachine> NodeHandle<S> {
                         "shmem-mode NodeHandle missing query_link (builder bug)".into(),
                     )
                 })?;
-                let payload =
-                    bincode::serde::encode_to_vec(&q, bincode::config::standard())?;
+                let payload = bincode::serde::encode_to_vec(&q, bincode::config::standard())?;
                 let resp_bytes = link.submit(&payload, QueryKind::Snapshot).await?;
                 let (resp, _) = bincode::serde::decode_from_slice::<S::QueryResponse, _>(
                     &resp_bytes,

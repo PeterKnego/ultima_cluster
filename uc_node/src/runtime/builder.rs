@@ -60,8 +60,16 @@ impl<S: StateMachine> NodeBuilder<S> {
             IpcMode::Embedded => {
                 let adapter = AdaptedStateMachine::new(self.state_machine, handles)?;
                 let handle_sm = SmAdapter::Embedded(adapter.clone());
-                finish(self.config, log_storage, adapter, handle_sm, None, None, None)
-                    .await
+                finish(
+                    self.config,
+                    log_storage,
+                    adapter,
+                    handle_sm,
+                    None,
+                    None,
+                    None,
+                )
+                .await
             }
             IpcMode::Shmem { instance_dir } => {
                 let instance =
@@ -100,8 +108,7 @@ impl<S: StateMachine> NodeBuilder<S> {
                     link.apply_producer,
                     link.apply_resp_consumer,
                 )?;
-                let query_link =
-                    ShmemQueryLink::new(link.query_producer, link.query_resp_consumer);
+                let query_link = ShmemQueryLink::new(link.query_producer, link.query_resp_consumer);
                 let handle_sm = SmAdapter::Shmem(adapter.clone());
                 let node_id_for_watcher = self.config.node_id;
                 let mut handle = finish(

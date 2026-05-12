@@ -221,8 +221,14 @@ async fn service_crash_on_leader_transfers_leadership() {
 
     // ── Elect a leader, submit one command to establish baseline state ──
     let leader_id = wait_for_leader(&node_handles, Duration::from_secs(15)).await;
-    let leader = node_handles.iter().find(|h| h.node_id() == leader_id).unwrap();
-    let r = leader.submit(Cmd::Inc(100)).await.expect("submit pre-crash");
+    let leader = node_handles
+        .iter()
+        .find(|h| h.node_id() == leader_id)
+        .unwrap();
+    let r = leader
+        .submit(Cmd::Inc(100))
+        .await
+        .expect("submit pre-crash");
     assert_eq!(r.value, 100);
 
     // ── Crash the leader's service ──────────────────────────────────────
@@ -250,8 +256,7 @@ async fn service_crash_on_leader_transfers_leadership() {
         .iter()
         .filter(|h| h.node_id() != leader_id)
         .collect();
-    let new_leader_id =
-        wait_for_new_leader(&surviving, leader_id, Duration::from_secs(15)).await;
+    let new_leader_id = wait_for_new_leader(&surviving, leader_id, Duration::from_secs(15)).await;
     assert_ne!(new_leader_id, leader_id);
 
     let new_leader = node_handles
