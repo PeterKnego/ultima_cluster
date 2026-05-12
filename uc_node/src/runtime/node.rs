@@ -16,23 +16,41 @@ use uc_service::StateMachine;
 
 use crate::ClusterError;
 use crate::config::{NodeConfig, NodeId};
+use crate::ipc::Instance;
+use crate::ipc::liveness::LivenessHandle;
 use crate::network::server::ServerHandle;
 use crate::raft::NodeAddr;
 use crate::raft::TypeConfig;
 use crate::raft::state_machine::AdaptedStateMachine;
+use crate::raft::state_machine_shmem::ShmemAdaptedStateMachine;
+
+/// Which state-machine adapter the node is driving.
+pub(crate) enum SmAdapter<S: StateMachine> {
+    Embedded(AdaptedStateMachine<S>),
+    /// Shmem-mode handle. The `ShmemAdaptedStateMachine` is held here for
+    /// future query/snapshot routing through the service; M3 doesn't
+    /// reach into it (apply traffic flows entirely through openraft's
+    /// internal clone of the adapter).
+    #[allow(dead_code)]
+    Shmem(ShmemAdaptedStateMachine<S>),
+}
 
 /// Public handle returned by [`NodeBuilder::start`](super::builder::NodeBuilder::start).
 pub struct NodeHandle<S: StateMachine> {
     pub(crate) raft: Raft<TypeConfig>,
     pub(crate) config: NodeConfig,
     /// Cloned handle to the user state-machine adapter. The Raft engine owns
-    /// another clone internally; both share the same `Arc<Mutex<Inner<S>>>`.
-    /// Used by `query_snapshot` to reach the user SM directly without going
-    /// through Raft.
-    pub(crate) sm: AdaptedStateMachine<S>,
+    /// another clone internally. Used by [`Self::query_snapshot`] in
+    /// embedded mode; in shmem mode the closure path is unavailable.
+    pub(crate) sm: SmAdapter<S>,
     /// QUIC server handle. Closes the inbound endpoint and awaits the accept
     /// task during [`shutdown`].
     pub(crate) server: ServerHandle,
+    /// Shmem-mode only: keeps the cnc.dat mapping + `instance.lock` alive.
+    pub(crate) _instance: Option<Instance>,
+    /// Shmem-mode only: node-side heartbeat ticker handle. Stop+joined on
+    /// shutdown before the cnc mmap is dropped.
+    pub(crate) node_liveness: Option<LivenessHandle>,
 }
 
 impl<S: StateMachine> NodeHandle<S> {
@@ -72,15 +90,23 @@ impl<S: StateMachine> NodeHandle<S> {
     /// Embedded-mode snapshot read: run a closure against the applied state.
     /// Holds the same Mutex that `apply` takes, so it sees a consistent
     /// view (no torn state across multiple reads inside the closure).
-    /// Returns the closure's value.
     ///
-    /// M1 only — M3 introduces typed Query types over a shmem ring.
+    /// **Embedded mode only.** In shmem mode the user SM lives in
+    /// `uc_service::ServiceBuilder::run` and is not reachable via a
+    /// closure across the IPC boundary — submit a typed `Query` through
+    /// the query ring instead. Calling this in shmem mode panics.
     pub async fn query_snapshot<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&S) -> R + Send,
         R: Send,
     {
-        self.sm.with_state(f).await
+        match &self.sm {
+            SmAdapter::Embedded(a) => a.with_state(f).await,
+            SmAdapter::Shmem(_) => panic!(
+                "query_snapshot is embedded-only; in shmem mode submit a typed Query \
+                 through uc_service's query.ring path"
+            ),
+        }
     }
 
     /// Add a learner (non-voting follower) to the cluster.
@@ -139,8 +165,15 @@ impl<S: StateMachine> NodeHandle<S> {
             .shutdown()
             .await
             .map_err(|e| ClusterError::Raft(format!("shutdown: {e}")))?;
-        // Then shut down the QUIC server (closes endpoint, awaits accept task).
+        // Then the QUIC server (closes endpoint, awaits accept task).
         self.server.shutdown().await;
+        // Finally, the node-side heartbeat ticker (shmem mode only). Must
+        // join before `_instance` drops because the ticker holds a
+        // `&'static NodeStatus` into the cnc mmap that lives there.
+        if let Some(lv) = self.node_liveness {
+            lv.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = lv.join.await;
+        }
         Ok(())
     }
 }

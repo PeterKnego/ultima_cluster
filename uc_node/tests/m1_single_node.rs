@@ -87,6 +87,7 @@ fn cfg(data_dir: PathBuf, bootstrap: BootstrapConfig) -> NodeConfig {
         bootstrap,
         raft: RaftTuning::default(),
         tls: TlsConfig::default(),
+        ipc_mode: uc_node::IpcMode::default(),
     }
 }
 

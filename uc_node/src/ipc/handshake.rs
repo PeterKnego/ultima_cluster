@@ -9,6 +9,7 @@
 //! in-process test harness — the service-side runtime sets the state
 //! to `Ready` immediately after spawning its loops.
 
+use std::future::Future;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -24,30 +25,35 @@ pub enum HandshakeError {
 
 /// Wait for the service to publish `state = Ready` on its `ServiceStatus`.
 ///
+/// Returns an `impl Future + Send`. The sync entry point lifts the raw
+/// pointer to a `&'static ServiceStatus` (sound because `ServiceStatus`
+/// is `Sync` and the caller pins the cnc mmap for the future's lifetime,
+/// see Safety); the future then only holds a `Send` reference across
+/// awaits.
+///
 /// # Safety
 ///
 /// `status_ptr` must point to a `ServiceStatus` that stays valid for the
 /// entire wait. Typically the caller holds the cnc.dat mapping in the
 /// node-side `Instance` handle.
-pub async unsafe fn wait_for_service_ready(
+pub unsafe fn wait_for_service_ready(
     status_ptr: *const ServiceStatus,
     timeout: Duration,
-) -> Result<(), HandshakeError> {
-    // Lift to `&'static ServiceStatus` so the future stays `Send`.
-    // ServiceStatus is `Sync` (all atomic fields). Caller upholds the
-    // lifetime contract above.
+) -> impl Future<Output = Result<(), HandshakeError>> + Send {
     // SAFETY: see function-level # Safety.
     let status: &'static ServiceStatus = unsafe { &*status_ptr };
 
-    let start = std::time::Instant::now();
-    loop {
-        if status.state.load(std::sync::atomic::Ordering::Acquire) == service_state::READY {
-            return Ok(());
+    async move {
+        let start = std::time::Instant::now();
+        loop {
+            if status.state.load(std::sync::atomic::Ordering::Acquire) == service_state::READY {
+                return Ok(());
+            }
+            if start.elapsed() >= timeout {
+                return Err(HandshakeError::TimedOut(timeout));
+            }
+            tokio::time::sleep(POLL_PERIOD).await;
         }
-        if start.elapsed() >= timeout {
-            return Err(HandshakeError::TimedOut(timeout));
-        }
-        tokio::time::sleep(POLL_PERIOD).await;
     }
 }
 

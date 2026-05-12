@@ -123,6 +123,7 @@ pub fn node_config(
         bootstrap: BootstrapConfig::Peers { peers },
         raft: RaftTuning::default(),
         tls: TlsConfig::default(),
+        ipc_mode: uc_node::IpcMode::default(),
     }
 }
 
@@ -297,6 +298,7 @@ async fn spawn_2_node_cluster_tight_snapshot() -> Vec<TestNode> {
             },
             raft: tight_raft_tuning(),
             tls: TlsConfig::default(),
+            ipc_mode: uc_node::IpcMode::default(),
         };
         prep.push((node_id, dir, *addr, cfg));
     }
@@ -409,6 +411,7 @@ async fn snapshot_install_on_new_follower() {
         bootstrap: BootstrapConfig::Resume, // wait to be added by the leader
         raft: tight_raft_tuning(),
         tls: TlsConfig::default(),
+        ipc_mode: uc_node::IpcMode::default(),
     };
     let new_handle = NodeBuilder::new(new_cfg, Counter::default())
         .start()

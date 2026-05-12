@@ -14,6 +14,28 @@ pub struct NodeConfig {
     /// TLS configuration for inter-node QUIC. M2 supports `SelfSigned`;
     /// `Files` (operator-provided certs) arrives in M5.
     pub tls: TlsConfig,
+    /// In-process apply vs shmem-fronted apply. Default `Embedded` matches
+    /// M1/M2 behavior; `Shmem` activates the M3 service-process split.
+    pub ipc_mode: IpcMode,
+}
+
+/// Selects how `apply()` is dispatched.
+///
+/// * [`IpcMode::Embedded`] (default) — the user's [`uc_service::StateMachine`]
+///   runs in-process; `AdaptedStateMachine` calls `apply()` directly under a
+///   tokio mutex. This is the M1/M2 path.
+/// * [`IpcMode::Shmem`] — `apply()` publishes onto `<instance_dir>/service/apply.ring`
+///   and awaits the response on `apply_resp.ring`. The user's state machine
+///   runs in `uc_service::ServiceBuilder::run` (typically a separate tokio
+///   task or process). The node-side state machine handed to `NodeBuilder`
+///   is degenerate in this mode — used only for snapshot codec.
+#[derive(Debug, Clone, Default)]
+pub enum IpcMode {
+    #[default]
+    Embedded,
+    Shmem {
+        instance_dir: PathBuf,
+    },
 }
 
 /// TLS configuration for inter-node QUIC.

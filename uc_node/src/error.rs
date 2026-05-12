@@ -32,6 +32,8 @@ pub enum ClusterError {
     Io(#[from] io::Error),
     #[error("network: {0}")]
     Network(#[from] crate::network::NetworkError),
+    #[error("ipc: {0}")]
+    Ipc(#[from] crate::ipc::IpcError),
     #[error("bincode: {0}")]
     Bincode(String),
 }
