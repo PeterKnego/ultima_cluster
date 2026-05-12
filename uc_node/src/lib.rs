@@ -1,12 +1,15 @@
-//! ultima_cluster engine. M1 = embedded single-node.
+//! ultima_cluster engine. M1 = embedded single-node, M2 = multi-node QUIC,
+//! M3 adds the shmem IPC layer (Phase 2: `ipc` module).
 
 pub mod config;
 pub mod error;
+pub mod ipc;
 pub mod network;
 pub mod raft;
 pub mod runtime;
 
 pub use config::{BootstrapConfig, NodeConfig, NodeId, PeerSeed, RaftTuning, TlsConfig};
 pub use error::ClusterError;
+pub use ipc::{Instance, IpcError};
 pub use runtime::builder::NodeBuilder;
 pub use runtime::node::NodeHandle;

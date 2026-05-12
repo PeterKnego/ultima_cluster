@@ -24,6 +24,11 @@ rustls = { workspace = true }
 rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
 crc32fast = "1"
+# M3 — shmem IPC
+memmap2 = { workspace = true }
+fs2 = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 uc_node = { path = ".", features = ["test-helpers"] }
