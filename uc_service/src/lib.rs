@@ -6,6 +6,7 @@
 
 pub mod error;
 pub mod output_handler;
+pub mod runtime;
 pub mod state_machine;
 
 #[cfg(feature = "ultima_db")]
@@ -13,4 +14,5 @@ pub mod ultima_db;
 
 pub use error::{OutputError, SnapshotError};
 pub use output_handler::{NoopOutput, OutputHandler};
+pub use runtime::{Service, ServiceBuilder, ServiceConfig, ServiceError};
 pub use state_machine::StateMachine;

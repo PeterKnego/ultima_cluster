@@ -17,3 +17,8 @@ async-trait = { workspace = true }
 thiserror = { workspace = true }
 uc_protocol = { path = "../uc_protocol" }
 ultima-db = { workspace = true, optional = true }
+# M3 Phase 2 — runtime
+tokio = { workspace = true }
+bincode = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }

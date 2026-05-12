@@ -1728,8 +1728,12 @@ name = "uc_service"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bincode",
+ "bytes",
  "serde",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "uc_protocol",
  "ultima-db",
 ]
