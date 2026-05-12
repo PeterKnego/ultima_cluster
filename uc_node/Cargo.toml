@@ -35,6 +35,8 @@ uc_node = { path = ".", features = ["test-helpers"] }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Needed by m3_ultima_db_adapter test (constructs ultima_db::Store directly).
+ultima-db = { workspace = true }
 
 [features]
 test-helpers = []
