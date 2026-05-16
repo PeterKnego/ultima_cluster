@@ -4,9 +4,20 @@
 use openraft::RaftLogReader as _;
 use openraft::storage::RaftLogStorage as _;
 use openraft::storage::RaftLogStorageExt as _;
+use openraft::vote::RaftLeaderId as _;
 use openraft::{Entry, EntryPayload, Vote};
 use tempfile::TempDir;
 use uc_node::raft::log_storage::{JournalLogStorage, StoredSnapshotMeta};
+
+// Type aliases matching log_storage.rs internal types.
+type LeaderId = openraft::impls::leader_id_adv::LeaderId<u64, u64>;
+type RaftLogId = openraft::LogId<LeaderId>;
+type RaftVote = Vote<LeaderId>;
+type RaftEntry = Entry<LeaderId, uc_node::raft::AppCommand, u64, uc_node::raft::NodeAddr>;
+
+fn make_log_id(term: u64, node_id: u64, index: u64) -> RaftLogId {
+    openraft::LogId::new(LeaderId::new(term, node_id), index)
+}
 
 #[test]
 fn reopen_observes_empty_state() {
@@ -44,7 +55,7 @@ async fn save_and_read_vote_round_trip() {
     let dir = TempDir::new().unwrap();
     let mut storage = JournalLogStorage::open(dir.path()).expect("open");
 
-    let v: Vote<u64> = Vote::new(7, 3);
+    let v: RaftVote = Vote::new(7, 3);
     storage.save_vote(&v).await.expect("save");
 
     let loaded = storage.read_vote().await.expect("read");
@@ -62,10 +73,10 @@ async fn append_then_read_round_trip() {
     let mut storage = JournalLogStorage::open(dir.path()).expect("open");
 
     // Build 3 simple entries.
-    let entries: Vec<Entry<uc_node::raft::TypeConfig>> = (1..=3u64)
+    let entries: Vec<RaftEntry> = (1..=3u64)
         .map(|i| Entry {
-            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), i),
-            payload: EntryPayload::Normal(bytes::Bytes::from(format!("cmd-{i}"))),
+            log_id: make_log_id(1, 0, i),
+            payload: EntryPayload::Normal(uc_node::raft::AppCommand(bytes::Bytes::from(format!("cmd-{i}")))),
         })
         .collect();
 
@@ -84,8 +95,8 @@ async fn append_then_read_round_trip() {
     for (i, entry) in read.iter().enumerate() {
         assert_eq!(entry.log_id.index, (i as u64) + 1);
         match &entry.payload {
-            EntryPayload::Normal(bytes) => {
-                assert_eq!(bytes.as_ref(), format!("cmd-{}", i + 1).as_bytes());
+            EntryPayload::Normal(cmd) => {
+                assert_eq!(cmd.0.as_ref(), format!("cmd-{}", i + 1).as_bytes());
             }
             _ => panic!("unexpected payload kind"),
         }
@@ -107,7 +118,7 @@ async fn save_and_read_committed_round_trip() {
     );
 
     // Save a LogId, read back.
-    let lid = openraft::LogId::new(openraft::CommittedLeaderId::new(5, 0), 42);
+    let lid = make_log_id(5, 0, 42);
     storage.save_committed(Some(lid)).await.expect("save");
     assert_eq!(storage.read_committed().await.expect("read"), Some(lid));
 
@@ -155,16 +166,16 @@ async fn purge_retains_higher_indices() {
     let mut storage = JournalLogStorage::open(dir.path()).expect("open");
 
     // Append 5 entries.
-    let entries: Vec<Entry<uc_node::raft::TypeConfig>> = (1..=5u64)
+    let entries: Vec<RaftEntry> = (1..=5u64)
         .map(|i| Entry {
-            log_id: openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), i),
-            payload: EntryPayload::Normal(bytes::Bytes::from(format!("cmd-{i}"))),
+            log_id: make_log_id(1, 0, i),
+            payload: EntryPayload::Normal(uc_node::raft::AppCommand(bytes::Bytes::from(format!("cmd-{i}")))),
         })
         .collect();
     storage.blocking_append(entries).await.expect("append");
 
     // Purge through index 3.
-    let purge_thru = openraft::LogId::new(openraft::CommittedLeaderId::new(1, 0), 3);
+    let purge_thru = make_log_id(1, 0, 3);
     storage.purge(purge_thru).await.expect("purge");
 
     // Records 4 and 5 must still be readable.
@@ -202,10 +213,7 @@ async fn snapshot_meta_survives_reopen() {
 
     // Store a snapshot meta.
     let meta = StoredSnapshotMeta {
-        last_log_id: Some(openraft::LogId::new(
-            openraft::CommittedLeaderId::new(5, 0),
-            100,
-        )),
+        last_log_id: Some(make_log_id(5, 0, 100)),
         last_membership: openraft::StoredMembership::default(),
         bytes_filename: "snapshot_100.bin".into(),
     };

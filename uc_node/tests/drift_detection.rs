@@ -4,7 +4,9 @@
 
 use std::io::{Read, Write};
 
-use openraft::{CommittedLeaderId, LogId};
+use openraft::vote::RaftLeaderId as _;
+use openraft::LogId;
+type LeaderId = openraft::impls::leader_id_adv::LeaderId<u64, u64>;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use uc_node::ClusterError;
@@ -51,7 +53,7 @@ async fn drift_detected_when_user_and_framework_disagree() {
     let storage = JournalLogStorage::open(dir.path()).expect("open");
 
     // Manually populate framework's durable last_applied with index = 100.
-    let lid = LogId::new(CommittedLeaderId::new(1, 0), 100);
+    let lid = LogId::new(LeaderId::new(1, 0), 100);
     storage
         ._testonly_last_applied()
         .store(&lid)

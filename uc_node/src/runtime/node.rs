@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 use openraft::Raft;
 use openraft::error::{ClientWriteError, RaftError};
+use openraft::rt::WatchReceiver as _;
 
 use uc_service::StateMachine;
 
@@ -37,9 +38,98 @@ pub(crate) enum SmAdapter<S: StateMachine> {
     Shmem(ShmemAdaptedStateMachine<S>),
 }
 
+/// Type-erased Raft handle over the two concrete SM adapters.
+///
+/// `openraft::Raft<C, SM>` is generic over `SM` (the state machine adapter);
+/// embedded mode uses `AdaptedStateMachine<S>` and shmem mode uses
+/// `ShmemAdaptedStateMachine<S>`.  We store either variant in this enum so
+/// that `NodeHandle<S>` can remain a single public type.
+pub(crate) enum RaftHandle<S: StateMachine> {
+    Embedded(Raft<TypeConfig, AdaptedStateMachine<S>>),
+    Shmem(Raft<TypeConfig, ShmemAdaptedStateMachine<S>>),
+}
+
+impl<S: StateMachine> Clone for RaftHandle<S> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Embedded(r) => Self::Embedded(r.clone()),
+            Self::Shmem(r) => Self::Shmem(r.clone()),
+        }
+    }
+}
+
+impl<S: StateMachine> RaftHandle<S> {
+    pub(crate) async fn client_write(
+        &self,
+        app_command: crate::raft::AppCommand,
+    ) -> Result<
+        openraft::raft::ClientWriteResponse<TypeConfig>,
+        RaftError<TypeConfig, ClientWriteError<TypeConfig>>,
+    > {
+        match self {
+            Self::Embedded(r) => r.client_write(app_command).await,
+            Self::Shmem(r) => r.client_write(app_command).await,
+        }
+    }
+
+    pub(crate) async fn current_leader(&self) -> Option<NodeId> {
+        match self {
+            Self::Embedded(r) => r.current_leader().await,
+            Self::Shmem(r) => r.current_leader().await,
+        }
+    }
+
+    pub(crate) async fn add_learner(
+        &self,
+        id: NodeId,
+        node: NodeAddr,
+        blocking: bool,
+    ) -> Result<
+        openraft::raft::ClientWriteResponse<TypeConfig>,
+        RaftError<TypeConfig, openraft::error::ClientWriteError<TypeConfig>>,
+    > {
+        match self {
+            Self::Embedded(r) => r.add_learner(id, node, blocking).await,
+            Self::Shmem(r) => r.add_learner(id, node, blocking).await,
+        }
+    }
+
+    pub(crate) async fn change_membership(
+        &self,
+        members: std::collections::BTreeSet<NodeId>,
+        retain: bool,
+    ) -> Result<
+        openraft::raft::ClientWriteResponse<TypeConfig>,
+        RaftError<TypeConfig, openraft::error::ClientWriteError<TypeConfig>>,
+    > {
+        match self {
+            Self::Embedded(r) => r.change_membership(members, retain).await,
+            Self::Shmem(r) => r.change_membership(members, retain).await,
+        }
+    }
+
+    pub(crate) async fn shutdown(
+        &self,
+    ) -> Result<(), openraft::type_config::alias::JoinErrorOf<TypeConfig>> {
+        match self {
+            Self::Embedded(r) => r.shutdown().await,
+            Self::Shmem(r) => r.shutdown().await,
+        }
+    }
+
+    pub(crate) fn metrics(
+        &self,
+    ) -> openraft::type_config::alias::WatchReceiverOf<TypeConfig, openraft::RaftMetrics<TypeConfig>> {
+        match self {
+            Self::Embedded(r) => r.metrics(),
+            Self::Shmem(r) => r.metrics(),
+        }
+    }
+}
+
 /// Public handle returned by [`NodeBuilder::start`](super::builder::NodeBuilder::start).
 pub struct NodeHandle<S: StateMachine> {
-    pub(crate) raft: Raft<TypeConfig>,
+    pub(crate) raft: RaftHandle<S>,
     pub(crate) config: NodeConfig,
     /// Cloned handle to the user state-machine adapter. The Raft engine owns
     /// another clone internally. Used by [`Self::query_snapshot`] in
@@ -77,8 +167,9 @@ impl<S: StateMachine> NodeHandle<S> {
     /// leader hint extracted from the openraft error. All other Raft / Fatal
     /// errors are stringified into [`ClusterError::Raft`].
     pub async fn submit(&self, cmd: S::Command) -> Result<S::Response, ClusterError> {
+        use crate::raft::AppCommand;
         let bytes = bincode::serde::encode_to_vec(&cmd, bincode::config::standard())?;
-        let app_command: Bytes = Bytes::from(bytes);
+        let app_command: AppCommand = AppCommand::from(Bytes::from(bytes));
 
         let result = self
             .raft
@@ -168,7 +259,7 @@ impl<S: StateMachine> NodeHandle<S> {
         self.raft
             .add_learner(node_id, node, true)
             .await
-            .map_err(|e| ClusterError::Raft(e.to_string()))?;
+            .map_err(|e| ClusterError::Raft(format!("{:?}", e)))?;
         Ok(())
     }
 
@@ -179,7 +270,7 @@ impl<S: StateMachine> NodeHandle<S> {
         self.raft
             .change_membership(voters, false)
             .await
-            .map_err(|e| ClusterError::Raft(e.to_string()))?;
+            .map_err(|e| ClusterError::Raft(format!("{:?}", e)))?;
         Ok(())
     }
 
@@ -191,7 +282,7 @@ impl<S: StateMachine> NodeHandle<S> {
         // `voter_ids()` on `StoredMembership` yields owned `NID` values.
         let current: BTreeSet<NodeId> = {
             let metrics = self.raft.metrics();
-            let m = metrics.borrow();
+            let m = metrics.borrow_watched();
             m.membership_config.voter_ids().collect()
         };
         let mut next = current;
@@ -199,7 +290,7 @@ impl<S: StateMachine> NodeHandle<S> {
         self.raft
             .change_membership(next, false)
             .await
-            .map_err(|e| ClusterError::Raft(e.to_string()))?;
+            .map_err(|e| ClusterError::Raft(format!("{:?}", e)))?;
         Ok(())
     }
 
@@ -220,7 +311,7 @@ impl<S: StateMachine> NodeHandle<S> {
         self.raft
             .shutdown()
             .await
-            .map_err(|e| ClusterError::Raft(format!("shutdown: {e}")))?;
+            .map_err(|e| ClusterError::Raft(format!("shutdown: {:?}", e)))?;
         // Then the QUIC server (closes endpoint, awaits accept task).
         self.server.shutdown().await;
         // Shmem-mode only: stop+join both cnc-mmap-holding tasks before
@@ -238,16 +329,16 @@ impl<S: StateMachine> NodeHandle<S> {
     }
 }
 
-/// Map openraft 0.9.24's `RaftError<NodeId, ClientWriteError<NodeId, NodeAddr>>`
+/// Map openraft 0.10's `RaftError<TypeConfig, ClientWriteError<TypeConfig>>`
 /// into our `ClusterError`. ForwardToLeader yields `NotLeader { leader_id }`;
 /// everything else stringifies into `Raft(_)`.
 fn map_client_write_error(
-    e: RaftError<NodeId, ClientWriteError<NodeId, crate::raft::NodeAddr>>,
+    e: RaftError<crate::raft::TypeConfig, ClientWriteError<crate::raft::TypeConfig>>,
 ) -> ClusterError {
     if let RaftError::APIError(ClientWriteError::ForwardToLeader(f)) = &e {
         return ClusterError::NotLeader {
             leader_id: f.leader_id,
         };
     }
-    ClusterError::Raft(e.to_string())
+    ClusterError::Raft(format!("{:?}", e))
 }

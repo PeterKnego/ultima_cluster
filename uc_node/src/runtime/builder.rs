@@ -11,7 +11,7 @@ use openraft::{Config as RaftConfigOpenraft, Raft};
 
 use uc_service::StateMachine;
 
-use super::node::{NodeHandle, SmAdapter};
+use super::node::{NodeHandle, RaftHandle, SmAdapter};
 use crate::ClusterError;
 use crate::config::{BootstrapConfig, IpcMode, NodeConfig};
 use crate::ipc::handshake::wait_for_service_ready;
@@ -26,7 +26,7 @@ use crate::network::tls;
 use crate::raft::log_storage::JournalLogStorage;
 use crate::raft::state_machine::AdaptedStateMachine;
 use crate::raft::state_machine_shmem::ShmemAdaptedStateMachine;
-use crate::raft::{NodeAddr, NodeId};
+use crate::raft::{NodeAddr, NodeId, TypeConfig};
 
 /// Builds an embedded-mode ultima_cluster node.
 /// Generic over S; non-generic shmem-fronted variant arrives in M3.
@@ -68,6 +68,7 @@ impl<S: StateMachine> NodeBuilder<S> {
                     None,
                     None,
                     None,
+                    RaftHandle::Embedded,
                 )
                 .await
             }
@@ -119,6 +120,7 @@ impl<S: StateMachine> NodeBuilder<S> {
                     Some(instance),
                     Some(node_liveness),
                     Some(query_link),
+                    RaftHandle::Shmem,
                 )
                 .await?;
 
@@ -144,8 +146,14 @@ impl<S: StateMachine> NodeBuilder<S> {
 }
 
 /// Common openraft + QUIC setup. Generic over whichever SM adapter the
-/// caller built; the resulting `Raft<TypeConfig>` is a single opaque type
-/// from openraft's point of view.
+/// caller built.
+///
+/// `wrap_raft` converts the concrete `Raft<TypeConfig, A>` (produced by
+/// `Raft::new`) into the mode-erased `RaftHandle<S>` enum that
+/// `NodeHandle<S>` stores. This is needed because the two IPC modes use
+/// different SM adapter types, but the public `NodeHandle<S>` must be a
+/// single type.
+#[allow(clippy::too_many_arguments)]
 async fn finish<A, S>(
     config: NodeConfig,
     log_storage: JournalLogStorage,
@@ -154,6 +162,7 @@ async fn finish<A, S>(
     instance: Option<Instance>,
     node_liveness: Option<crate::ipc::liveness::LivenessHandle>,
     query_link: Option<ShmemQueryLink>,
+    wrap_raft: impl FnOnce(Raft<TypeConfig, A>) -> RaftHandle<S>,
 ) -> Result<NodeHandle<S>, ClusterError>
 where
     S: StateMachine,
@@ -290,8 +299,10 @@ where
         }
     }
 
+    let raft_handle = wrap_raft(raft);
+
     Ok(NodeHandle {
-        raft,
+        raft: raft_handle,
         config,
         sm: handle_sm,
         server,

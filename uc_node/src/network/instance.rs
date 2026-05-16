@@ -24,7 +24,7 @@ use super::client::PeerConn;
 use super::factory::PeerPool;
 use super::frame::MessageType;
 use super::{NetworkError, codec};
-use crate::raft::{NodeAddr, NodeId, TypeConfig};
+use crate::raft::{NodeId, TypeConfig};
 
 pub struct QuicRaftNetwork {
     target: NodeId,
@@ -97,9 +97,7 @@ impl QuicRaftNetwork {
 }
 
 /// Map a transport-level [`NetworkError`] to openraft's [`RPCError`].
-fn rpc_err<E>(e: NetworkError) -> RPCError<NodeId, NodeAddr, RaftError<NodeId, E>>
-where
-    E: std::error::Error,
+fn rpc_err<E: std::error::Error>(e: NetworkError) -> RPCError<TypeConfig, RaftError<TypeConfig, E>>
 {
     RPCError::Network(openraft::error::NetworkError::new(&e))
 }
@@ -109,7 +107,7 @@ impl RaftNetwork<TypeConfig> for QuicRaftNetwork {
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, NodeAddr, RaftError<NodeId>>> {
+    ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig, RaftError<TypeConfig>>> {
         let body = codec::encode_append_entries_req(&rpc).map_err(rpc_err)?;
         let timeout = option.hard_ttl();
         let conn = self.get_or_connect().await.map_err(rpc_err)?;
@@ -135,8 +133,8 @@ impl RaftNetwork<TypeConfig> for QuicRaftNetwork {
         rpc: InstallSnapshotRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<
-        InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, NodeAddr, RaftError<NodeId, InstallSnapshotError>>,
+        InstallSnapshotResponse<TypeConfig>,
+        RPCError<TypeConfig, RaftError<TypeConfig, InstallSnapshotError>>,
     > {
         let body = codec::encode_install_snapshot_req(&rpc).map_err(rpc_err)?;
         let timeout = option.hard_ttl();
@@ -160,9 +158,9 @@ impl RaftNetwork<TypeConfig> for QuicRaftNetwork {
 
     async fn vote(
         &mut self,
-        rpc: VoteRequest<NodeId>,
+        rpc: VoteRequest<TypeConfig>,
         option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, NodeAddr, RaftError<NodeId>>> {
+    ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig, RaftError<TypeConfig>>> {
         let body = codec::encode_vote_req(&rpc).map_err(rpc_err)?;
         let timeout = option.hard_ttl();
         let conn = self.get_or_connect().await.map_err(rpc_err)?;

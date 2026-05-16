@@ -251,11 +251,11 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
         );
         let bytes_path = g.snapshot_bytes_dir.join(&bytes_filename);
         std::fs::write(&bytes_path, &bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         let f = std::fs::File::open(&bytes_path)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         f.sync_all()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         drop(f);
 
         let stored_meta = StoredSnapshotMeta {
@@ -265,16 +265,16 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
         };
         g.snapshot_meta_sv
             .store(&stored_meta)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .wait()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         if let Some(lid) = meta.last_log_id {
             g.last_applied_sv
                 .store(&lid)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                .map_err(io::Error::other)?
                 .wait()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
         }
 
         let mut cursor = Cursor::new(bytes.clone());
@@ -325,10 +325,7 @@ async fn publish_apply(
             Ok(()) => return Ok(()),
             Err(RingError::Full) => tokio::time::sleep(FULL_BACKOFF).await,
             Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("apply ring write at {log_index}: {e}"),
-                ));
+                return Err(io::Error::other(format!("apply ring write at {log_index}: {e}")));
             }
         }
     }
@@ -369,10 +366,7 @@ async fn await_apply_resp(
             }
             Ok(None) => tokio::time::sleep(EMPTY_BACKOFF).await,
             Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("apply_resp ring read: {e}"),
-                ));
+                return Err(io::Error::other(format!("apply_resp ring read: {e}")));
             }
         }
     }
@@ -396,7 +390,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S
         // produces whatever the user's default `build_snapshot` returns.
         let mut buf: Vec<u8> = Vec::new();
         let _user_index = g.sm.build_snapshot(&mut buf).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, e.to_string())
+            io::Error::other(e.to_string())
         })?;
 
         let snapshot_id_index = last_applied.map(|l| l.index).unwrap_or(0);

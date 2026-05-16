@@ -81,14 +81,18 @@ fn oversized_body_len_rejected() {
 
 use openraft::Vote;
 use openraft::raft::VoteRequest;
+use openraft::vote::RaftLeaderId as _;
 use uc_node::network::codec;
+use uc_node::raft::TypeConfig;
+
+type LeaderId = openraft::impls::leader_id_adv::LeaderId<u64, u64>;
 
 #[test]
 fn vote_req_roundtrip() {
-    let req: VoteRequest<u64> = VoteRequest::new(
+    let req: VoteRequest<TypeConfig> = VoteRequest::new(
         Vote::new(7, 3),
         Some(openraft::LogId::new(
-            openraft::CommittedLeaderId::new(5, 0),
+            LeaderId::new(5, 0),
             42,
         )),
     );

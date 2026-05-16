@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use openraft::network::RaftNetworkFactory;
+use openraft_legacy::network_v1::Adapter;
+use openraft_legacy::network_v1::RaftNetwork as _;
 use quinn::Endpoint;
 use rustls::ClientConfig;
 use tokio::sync::Mutex;
@@ -56,7 +58,9 @@ impl QuicRaftNetworkFactory {
 }
 
 impl RaftNetworkFactory<TypeConfig> for QuicRaftNetworkFactory {
-    type Network = QuicRaftNetwork;
+    /// `Adapter` wraps our V1 `QuicRaftNetwork` to satisfy the `RaftNetworkV2`
+    /// bound that `RaftNetworkFactory::Network` requires in openraft 0.10.
+    type Network = Adapter<TypeConfig, QuicRaftNetwork>;
 
     async fn new_client(&mut self, target: NodeId, node: &NodeAddr) -> Self::Network {
         // Do NOT connect here. `RaftNetworkFactory::new_client` can't return a
@@ -71,5 +75,6 @@ impl RaftNetworkFactory<TypeConfig> for QuicRaftNetworkFactory {
             self.pool.clone(),
             self.app_id.clone(),
         )
+        .into_v2()
     }
 }

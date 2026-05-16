@@ -297,11 +297,11 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
         // snapshot lifecycle (e.g. via the snapshot.region mmap'd transport).
         let bytes_path = g.snapshot_bytes_dir.join(&bytes_filename);
         std::fs::write(&bytes_path, &bytes)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         let f = std::fs::File::open(&bytes_path)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         f.sync_all()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         drop(f);
         // M5 hardening: also fsync the parent directory to guarantee the
         // directory entry is durable, not just the file inode. For now we
@@ -327,17 +327,17 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
         };
         g.snapshot_meta_sv
             .store(&stored_meta)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .map_err(io::Error::other)?
             .wait()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         // 3. Persist last_applied (if present).
         if let Some(lid) = meta.last_log_id {
             g.last_applied_sv
                 .store(&lid)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                .map_err(io::Error::other)?
                 .wait()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
         }
 
         // 4. Now mutate the user's state machine. If this fails, the durable
@@ -399,7 +399,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for AdaptedSnapshotBuilder
 
         let mut buf: Vec<u8> = Vec::new();
         let user_index = g.sm.build_snapshot(&mut buf).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, e.to_string())
+            io::Error::other(e.to_string())
         })?;
 
         // Sanity check: with the Mutex held across apply and build, the user's returned

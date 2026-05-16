@@ -31,17 +31,17 @@ pub fn decode<T: serde::de::DeserializeOwned>(bytes: &Bytes) -> Result<T, Networ
 
 // Convenience wrappers per RPC kind.
 
-pub fn encode_vote_req(req: &VoteRequest<u64>) -> Result<Bytes, NetworkError> {
+pub fn encode_vote_req(req: &VoteRequest<TypeConfig>) -> Result<Bytes, NetworkError> {
     encode(req)
 }
-pub fn decode_vote_req(b: &Bytes) -> Result<VoteRequest<u64>, NetworkError> {
+pub fn decode_vote_req(b: &Bytes) -> Result<VoteRequest<TypeConfig>, NetworkError> {
     decode(b)
 }
 
-pub fn encode_vote_resp(resp: &VoteResponse<u64>) -> Result<Bytes, NetworkError> {
+pub fn encode_vote_resp(resp: &VoteResponse<TypeConfig>) -> Result<Bytes, NetworkError> {
     encode(resp)
 }
-pub fn decode_vote_resp(b: &Bytes) -> Result<VoteResponse<u64>, NetworkError> {
+pub fn decode_vote_resp(b: &Bytes) -> Result<VoteResponse<TypeConfig>, NetworkError> {
     decode(b)
 }
 
@@ -57,11 +57,13 @@ pub fn decode_append_entries_req(
 }
 
 pub fn encode_append_entries_resp(
-    resp: &AppendEntriesResponse<u64>,
+    resp: &AppendEntriesResponse<TypeConfig>,
 ) -> Result<Bytes, NetworkError> {
     encode(resp)
 }
-pub fn decode_append_entries_resp(b: &Bytes) -> Result<AppendEntriesResponse<u64>, NetworkError> {
+pub fn decode_append_entries_resp(
+    b: &Bytes,
+) -> Result<AppendEntriesResponse<TypeConfig>, NetworkError> {
     decode(b)
 }
 
@@ -77,12 +79,12 @@ pub fn decode_install_snapshot_req(
 }
 
 pub fn encode_install_snapshot_resp(
-    resp: &InstallSnapshotResponse<u64>,
+    resp: &InstallSnapshotResponse<TypeConfig>,
 ) -> Result<Bytes, NetworkError> {
     encode(resp)
 }
 pub fn decode_install_snapshot_resp(
     b: &Bytes,
-) -> Result<InstallSnapshotResponse<u64>, NetworkError> {
+) -> Result<InstallSnapshotResponse<TypeConfig>, NetworkError> {
     decode(b)
 }

@@ -5,6 +5,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use openraft::Raft;
+use openraft::storage::RaftStateMachine;
+// Extension trait — adds `install_snapshot` to `Raft<C, SM>`. Imported for its
+// method, not its name.
+use openraft_legacy::network_v1::ChunkedSnapshotReceiver as _;
 use quinn::{Endpoint, ServerConfig as QuicServerConfig};
 use tokio::task::JoinHandle;
 
@@ -28,11 +32,14 @@ impl ServerHandle {
     }
 }
 
-pub fn spawn_server(
+pub fn spawn_server<SM>(
     listen_addr: SocketAddr,
     rustls_server_cfg: Arc<rustls::ServerConfig>,
-    raft: Raft<TypeConfig>,
-) -> Result<ServerHandle, NetworkError> {
+    raft: Raft<TypeConfig, SM>,
+) -> Result<ServerHandle, NetworkError>
+where
+    SM: RaftStateMachine<TypeConfig>,
+{
     let crypto =
         quinn::crypto::rustls::QuicServerConfig::try_from(rustls_server_cfg.as_ref().clone())
             .map_err(|e| NetworkError::Tls(format!("quic server cfg: {e}")))?;
@@ -59,7 +66,10 @@ pub fn spawn_server(
     })
 }
 
-async fn handle_connection(conn: quinn::Connection, raft: Raft<TypeConfig>) {
+async fn handle_connection<SM>(conn: quinn::Connection, raft: Raft<TypeConfig, SM>)
+where
+    SM: RaftStateMachine<TypeConfig>,
+{
     loop {
         match conn.accept_bi().await {
             Ok((mut send, mut recv)) => {
@@ -81,11 +91,14 @@ async fn handle_connection(conn: quinn::Connection, raft: Raft<TypeConfig>) {
     }
 }
 
-async fn handle_stream(
+async fn handle_stream<SM>(
     send: &mut quinn::SendStream,
     recv: &mut quinn::RecvStream,
-    raft: Raft<TypeConfig>,
-) -> Result<(), NetworkError> {
+    raft: Raft<TypeConfig, SM>,
+) -> Result<(), NetworkError>
+where
+    SM: RaftStateMachine<TypeConfig>,
+{
     loop {
         let request = match Frame::read_async(recv).await {
             Ok(f) => f,
@@ -102,7 +115,10 @@ async fn handle_stream(
     Ok(())
 }
 
-async fn dispatch(req: Frame, raft: &Raft<TypeConfig>) -> Result<Frame, NetworkError> {
+async fn dispatch<SM>(req: Frame, raft: &Raft<TypeConfig, SM>) -> Result<Frame, NetworkError>
+where
+    SM: RaftStateMachine<TypeConfig>,
+{
     let request_id = req.request_id;
     match req.msg_type {
         MessageType::AppendEntriesReq => {

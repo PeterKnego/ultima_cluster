@@ -36,13 +36,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use openraft::Raft;
 use tokio::task::JoinHandle;
+use uc_service::StateMachine;
 
 use uc_protocol::cnc::ServiceStatus;
 use uc_protocol::liveness::HeartbeatWatcher;
 
-use crate::raft::{NodeId, TypeConfig};
+use crate::raft::NodeId;
+use crate::runtime::node::RaftHandle;
 
 const POLL_PERIOD: Duration = Duration::from_millis(100);
 
@@ -66,12 +67,13 @@ pub struct ServiceWatcherHandle {
 ///
 /// `status_ptr` must point at a `ServiceStatus` that stays valid until the
 /// returned task is joined.
-pub unsafe fn spawn_service_watcher(
+pub(crate) unsafe fn spawn_service_watcher<S: StateMachine>(
     status_ptr: *const ServiceStatus,
-    raft: Raft<TypeConfig>,
+    raft: RaftHandle<S>,
     node_id: NodeId,
     timeout: Duration,
-) -> ServiceWatcherHandle {
+) -> ServiceWatcherHandle
+{
     let stop = Arc::new(AtomicBool::new(false));
     let stalled = Arc::new(AtomicBool::new(false));
     let stop_for_task = Arc::clone(&stop);

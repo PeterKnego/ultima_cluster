@@ -164,11 +164,11 @@ use openraft::storage::RaftLogStorage;
 use super::TypeConfig;
 
 fn sv_io(e: ultima_journal::StableValueError) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e)
+    io::Error::other(e)
 }
 
 fn journal_io(e: ultima_journal::JournalError) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e)
+    io::Error::other(e)
 }
 
 impl RaftLogReader<TypeConfig> for JournalLogStorage {
@@ -344,7 +344,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             // `Result<(), io::Error>`, so we map JournalError → io::Error here.
             notifier.on_complete(move |result| {
                 let io_result: Result<(), io::Error> =
-                    result.map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+                    result.map_err(io::Error::other);
                 callback.io_completed(io_result);
             });
         } else {
