@@ -289,4 +289,4 @@ Total: ~15-20 commits.
 - Canonical design: `docs/superpowers/specs/2026-05-10-ultima-cluster-design.md` (§4 cnc/rings, §5 public APIs, §8 pipelines, §11 errors).
 - M3 record: `docs/tasks/task03_m3_shmem_service_split.md`.
 - Aeron pattern references (read during brainstorming, kept for the future-option E note): `aeron/aeron-client/src/main/java/io/aeron/ConcurrentPublication.java` (CAS-claim + length-last-release), `aeron/aeron-client/src/main/java/io/aeron/logbuffer/LogBufferDescriptor.java:48` (PARTITION_COUNT = 3), `aeron/aeron-driver/src/main/java/io/aeron/driver/IpcPublication.java:646` (cleaner zeroing stale terms).
-- openraft 0.9.24 (still pinned; 0.10 upgrade tracked for M5).
+- openraft 0.10 (shipped in M3.5, `docs/tasks/task04_m3_5_openraft_0_10_upgrade.md`).
