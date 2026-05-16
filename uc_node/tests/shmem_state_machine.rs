@@ -137,7 +137,9 @@ async fn apply_round_trips_through_shmem_rings() {
             payload: EntryPayload::Normal(uc_node::raft::AppCommand(Bytes::from(cmd))),
         }
     }
-    let entries: Vec<Result<openraft::storage::EntryResponder<uc_node::raft::TypeConfig>, std::io::Error>> = vec![
+    let entries: Vec<
+        Result<openraft::storage::EntryResponder<uc_node::raft::TypeConfig>, std::io::Error>,
+    > = vec![
         Ok((make_entry(1, 1, 41), None)),
         Ok((make_entry(1, 2, 99), None)),
         Ok((make_entry(1, 3, 7), None)),
@@ -183,12 +185,15 @@ async fn blank_and_membership_entries_emit_empty_response_without_touching_ring(
         SpscRing::open(&instance_dir.path().join("service").join("apply.ring")).unwrap();
     let (_, mut svc_apply_consumer) = service_apply.into_split();
 
-    let entries: Vec<Result<openraft::storage::EntryResponder<uc_node::raft::TypeConfig>, std::io::Error>> = vec![
-        Ok((Entry {
+    let entries: Vec<
+        Result<openraft::storage::EntryResponder<uc_node::raft::TypeConfig>, std::io::Error>,
+    > = vec![Ok((
+        Entry {
             log_id: LogId::new(LeaderId::new(1, 1), 5),
             payload: EntryPayload::Blank,
-        }, None)),
-    ];
+        },
+        None,
+    ))];
     let entry_stream = stream::iter(entries);
 
     sm.apply(entry_stream).await.expect("apply");

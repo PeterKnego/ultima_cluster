@@ -82,3 +82,19 @@ openraft::declare_raft_types!(
         SnapshotData = std::io::Cursor<Vec<u8>>, // M1: in-memory; M5 swaps to snapshot.region reader
         AsyncRuntime = openraft::impls::TokioRuntime,
 );
+
+// ---------------------------------------------------------------------------
+// Shared concrete type aliases for openraft 0.10 with our TypeConfig.
+//
+// TypeConfig uses leader_id_adv, where CommittedLeaderId == LeaderId.
+// Defined here once; imported via `use super::*` or named imports in
+// log_storage.rs, state_machine.rs, state_machine_shmem.rs.
+// ---------------------------------------------------------------------------
+
+pub(crate) type LeaderId = openraft::impls::leader_id_adv::LeaderId<u64, u64>;
+pub(crate) type RaftLogId = openraft::LogId<LeaderId>;
+pub(crate) type RaftVote = openraft::Vote<LeaderId>;
+pub(crate) type RaftStoredMembership = openraft::StoredMembership<LeaderId, NodeId, NodeAddr>;
+pub(crate) type RaftSnapshotMeta = openraft::storage::SnapshotMeta<LeaderId, NodeId, NodeAddr>;
+pub(crate) type RaftSnapshot =
+    openraft::storage::Snapshot<LeaderId, NodeId, NodeAddr, std::io::Cursor<Vec<u8>>>;

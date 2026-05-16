@@ -91,10 +91,7 @@ type LeaderId = openraft::impls::leader_id_adv::LeaderId<u64, u64>;
 fn vote_req_roundtrip() {
     let req: VoteRequest<TypeConfig> = VoteRequest::new(
         Vote::new(7, 3),
-        Some(openraft::LogId::new(
-            LeaderId::new(5, 0),
-            42,
-        )),
+        Some(openraft::LogId::new(LeaderId::new(5, 0), 42)),
     );
     let bytes = codec::encode_vote_req(&req).expect("encode");
     let decoded = codec::decode_vote_req(&bytes).expect("decode");

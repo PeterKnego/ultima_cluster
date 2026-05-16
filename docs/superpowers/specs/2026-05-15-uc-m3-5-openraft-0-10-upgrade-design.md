@@ -28,7 +28,7 @@ This is intentionally a small, mechanical milestone — bounded blast radius, al
 
 **Out (deferred):**
 
-- **Custom `Responder<T>` for `client_dispatcher`** that publishes directly to `response.broadcast`. M4 work (depends on the broadcast existing).
+- **Custom `Responder<T>` for `client_dispatcher`** that publishes directly to `response.broadcast`. M4 work (depends on the broadcast existing). **Note (discovered during Task 2):** `declare_raft_types!` does not support a `Responder<T>` line — the macro grammar doesn't include it (documented in openraft's own `declare_raft_types_test.rs:27`). The default `ProgressResponder<Self, T>` is used and works identically through `Raft::client_write().await`.
 - **`SnapshotData` swap to `snapshot.region` mmap.** M5.
 - **`Raft::data_metrics()` / `server_metrics()` migration.** Current `metrics()` keeps working; deferred to M5 when observability sub-buffers in `cnc.dat` get wired.
 - **`generic-snapshot-data` feature flag.** Only useful alongside the mmap swap; M5.
@@ -188,7 +188,7 @@ This test is the canary that the upgrade preserves M3 behavior *and* improves it
 | 4 | `ipc::service_watcher`: replace `raft.shutdown()` with `raft.trigger().transfer_leader(target)` + 5 s fallback. Add `pick_transfer_target` helper. Update `m3_service_crash.rs` assertions. | 1 |
 | 5 | Polish: clippy / fmt; update `docs/tasks/task03_m3_shmem_service_split.md` follow-ups; bump README pointer if needed. | 1 |
 
-Total: **5-7 commits**, ~200-300 line diff, no behavior change in steady-state paths (only `service_watcher` action under stall changes).
+Total: **8 commits + 1 polish = 9 total**, ~600-700 line diff, no behavior change in steady-state paths (only `service_watcher` action under stall changes).
 
 ## Verification checklist
 

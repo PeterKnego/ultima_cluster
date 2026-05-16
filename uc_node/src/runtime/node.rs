@@ -129,7 +129,8 @@ impl<S: StateMachine> RaftHandle<S> {
 
     pub(crate) fn metrics(
         &self,
-    ) -> openraft::type_config::alias::WatchReceiverOf<TypeConfig, openraft::RaftMetrics<TypeConfig>> {
+    ) -> openraft::type_config::alias::WatchReceiverOf<TypeConfig, openraft::RaftMetrics<TypeConfig>>
+    {
         match self {
             Self::Embedded(r) => r.metrics(),
             Self::Shmem(r) => r.metrics(),
@@ -256,7 +257,7 @@ impl<S: StateMachine> NodeHandle<S> {
 
     /// Add a learner (non-voting follower) to the cluster.
     /// Returns once the learner has caught up via log replication / snapshot
-    /// install (openraft 0.9.24 `add_learner(id, node, blocking=true)`).
+    /// install (`add_learner(id, node, blocking=true)`).
     pub async fn add_learner(
         &self,
         node_id: NodeId,
@@ -274,8 +275,8 @@ impl<S: StateMachine> NodeHandle<S> {
     }
 
     /// Change the membership to the given set of voters.
-    /// Uses openraft 0.9.24 `change_membership(members, retain=false)`: nodes
-    /// not in `voters` are removed from the cluster (not retained as learners).
+    /// Uses `change_membership(members, retain=false)`: nodes not in `voters`
+    /// are removed from the cluster (not retained as learners).
     pub async fn change_membership(&self, voters: BTreeSet<NodeId>) -> Result<(), ClusterError> {
         self.raft
             .change_membership(voters, false)

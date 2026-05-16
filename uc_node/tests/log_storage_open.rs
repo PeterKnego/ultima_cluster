@@ -76,7 +76,9 @@ async fn append_then_read_round_trip() {
     let entries: Vec<RaftEntry> = (1..=3u64)
         .map(|i| Entry {
             log_id: make_log_id(1, 0, i),
-            payload: EntryPayload::Normal(uc_node::raft::AppCommand(bytes::Bytes::from(format!("cmd-{i}")))),
+            payload: EntryPayload::Normal(uc_node::raft::AppCommand(bytes::Bytes::from(format!(
+                "cmd-{i}"
+            )))),
         })
         .collect();
 
@@ -169,7 +171,9 @@ async fn purge_retains_higher_indices() {
     let entries: Vec<RaftEntry> = (1..=5u64)
         .map(|i| Entry {
             log_id: make_log_id(1, 0, i),
-            payload: EntryPayload::Normal(uc_node::raft::AppCommand(bytes::Bytes::from(format!("cmd-{i}")))),
+            payload: EntryPayload::Normal(uc_node::raft::AppCommand(bytes::Bytes::from(format!(
+                "cmd-{i}"
+            )))),
         })
         .collect();
     storage.blocking_append(entries).await.expect("append");

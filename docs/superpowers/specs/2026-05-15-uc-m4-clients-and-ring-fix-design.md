@@ -1,7 +1,7 @@
 # M4 design — MPSC/Broadcast wrap-fix + `uc_client` end-to-end
 
 **Status:** design (brainstormed 2026-05-15, awaiting plan).
-**Predecessors:** M3 (`docs/tasks/task03_m3_shmem_service_split.md`) — shmem IPC + `uc_service` process split.
+**Predecessors:** M3.5 (`docs/tasks/task04_m3_5_openraft_0_10_upgrade.md`) — openraft 0.10 upgrade + `transfer_leader` cutover, which builds on M3 (`docs/tasks/task03_m3_shmem_service_split.md`) — shmem IPC + `uc_service` process split.
 **Workspace:** `ultima_cluster/`.
 
 ## Goal
@@ -23,7 +23,7 @@ After M4, an out-of-process `uc_client` binary on the same host as a `uc_node` +
 
 ## Out of scope for M4 (carried forward)
 
-- **openraft 0.10 upgrade + real `Raft::trigger_leader_transfer`.** M3's `raft.shutdown()` substitute stays. Tracked as an M5 polish item.
+- **openraft 0.10 upgrade + real `Raft::trigger_leader_transfer`.** Shipped in M3.5 (`docs/tasks/task04_m3_5_openraft_0_10_upgrade.md`).
 - **Service-recovery handshake** (cnc-sub-mmap MPSC attach so the node can consume `ServiceReady{last_applied}` frames). Tracked for M5.
 - **`output.ring` + at-least-once OutputHandler dispatch.** M5.
 - **`snapshot.region` mmap.** M5.

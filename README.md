@@ -2,10 +2,8 @@
 
 SMR cluster implementation on top of openraft.
 
-**Status:** M3 — shmem IPC + `uc_service` process split complete. The
-state machine now lives behind a shared-memory ring boundary (apply +
-query rings, node→service heartbeat both ways), with a service-crash
-liveness watcher on the node. See
+**Status:** M3.5 — openraft 0.10 upgrade + `transfer_leader` cutover.
+Builds on M3's shmem IPC + `uc_service` process split. See
 `docs/superpowers/specs/2026-05-10-ultima-cluster-design.md` for the
 canonical design and `docs/tasks/` for per-milestone records.
 

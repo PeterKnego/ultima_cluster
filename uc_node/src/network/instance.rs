@@ -97,8 +97,9 @@ impl QuicRaftNetwork {
 }
 
 /// Map a transport-level [`NetworkError`] to openraft's [`RPCError`].
-fn rpc_err<E: std::error::Error>(e: NetworkError) -> RPCError<TypeConfig, RaftError<TypeConfig, E>>
-{
+fn rpc_err<E: std::error::Error>(
+    e: NetworkError,
+) -> RPCError<TypeConfig, RaftError<TypeConfig, E>> {
     RPCError::Network(openraft::error::NetworkError::new(&e))
 }
 
@@ -107,7 +108,8 @@ impl RaftNetwork<TypeConfig> for QuicRaftNetwork {
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
         option: RPCOption,
-    ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig, RaftError<TypeConfig>>> {
+    ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig, RaftError<TypeConfig>>>
+    {
         let body = codec::encode_append_entries_req(&rpc).map_err(rpc_err)?;
         let timeout = option.hard_ttl();
         let conn = self.get_or_connect().await.map_err(rpc_err)?;

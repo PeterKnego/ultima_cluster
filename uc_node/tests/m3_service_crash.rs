@@ -117,7 +117,6 @@ async fn wait_for_leader(handles: &[NodeHandle<Counter>], timeout: Duration) -> 
     panic!("no leader within {timeout:?}");
 }
 
-
 #[tokio::test]
 async fn service_crash_on_leader_transfers_leadership() {
     let addrs = pick_three_addrs();
@@ -242,6 +241,16 @@ async fn service_crash_on_leader_transfers_leadership() {
     // peer briefly reports a transient intermediate winner before the cluster
     // fully converges.  Once all three agree, the new_leader_id is stable
     // and the old leader is confirmed alive as a follower.
+    //
+    // NOTE on flakiness risk: the test's 15 s convergence deadline AND the
+    // service_watcher's 15 s `raft.shutdown()` fallback fire at the same
+    // wall-clock moment (both started from stall-detection time). On a
+    // pathologically slow host the fallback could fire before convergence,
+    // shutting down the old leader's raft → `current_leader() == None`
+    // → assertion below fails. The risk is small under normal load (5 runs
+    // in CI showed 5/5 ok, ~6 s wall each). If this test flakes in M4+,
+    // either bump the fallback timeout or peer-health-aware target selection
+    // (deferred per task04_m3_5_openraft_0_10_upgrade.md).
     let old_leader = node_handles
         .iter()
         .find(|h| h.node_id() == leader_id)
@@ -251,7 +260,9 @@ async fn service_crash_on_leader_transfers_leadership() {
         let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
             if std::time::Instant::now() >= deadline {
-                panic!("cluster did not converge on a new leader within 15 s (old leader={leader_id})");
+                panic!(
+                    "cluster did not converge on a new leader within 15 s (old leader={leader_id})"
+                );
             }
             // Collect current_leader() from all three nodes.
             let mut views: Vec<Option<NodeId>> = Vec::new();
@@ -268,7 +279,10 @@ async fn service_crash_on_leader_transfers_leadership() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     };
-    assert_ne!(new_leader_id, leader_id, "leadership must transfer off the stalled node");
+    assert_ne!(
+        new_leader_id, leader_id,
+        "leadership must transfer off the stalled node"
+    );
 
     // Since the old leader was one of the three nodes polled above and it
     // already agreed on new_leader_id, this assertion is stable.

@@ -13,20 +13,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use openraft::{LogId, StoredMembership, Vote};
 use ultima_journal::{Durability, Journal, JournalConfig, StableValue, StableValueConfig};
 
-use super::{NodeAddr, NodeId};
+use super::{RaftLogId, RaftStoredMembership, RaftVote};
 use crate::ClusterError;
 
 const SEGMENT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
-
-// Concrete openraft 0.10 types for our TypeConfig.
-// TypeConfig uses leader_id_adv, where CommittedLeaderId == LeaderId.
-type LeaderId = openraft::impls::leader_id_adv::LeaderId<u64, u64>;
-type RaftLogId = LogId<LeaderId>;
-type RaftVote = Vote<LeaderId>;
-type RaftStoredMembership = StoredMembership<LeaderId, NodeId, NodeAddr>;
 
 /// Persisted snapshot meta (the last installed snapshot's metadata + a
 /// pointer to its bytes file under data_dir).
@@ -144,7 +136,7 @@ impl JournalLogStorage {
 //
 // All methods fully implemented for openraft 0.10's storage-v2 trait surface.
 //
-// openraft 0.10 notes (deviations from 0.9.24):
+// openraft 0.10 vs 0.9.24 changes (already applied here):
 //   * All trait methods return io::Error (StorageError / StorageIOError dropped).
 //   * The append callback type is `IOFlushed<C>` (LogFlushed is a deprecated alias).
 //   * `truncate` is renamed to `truncate_after` and takes `Option<LogIdOf<C>>`.
@@ -176,27 +168,21 @@ impl RaftLogReader<TypeConfig> for JournalLogStorage {
         &mut self,
         range: RB,
     ) -> Result<Vec<<TypeConfig as openraft::RaftTypeConfig>::Entry>, io::Error> {
-        let iter = self
-            .journal
-            .iter_range(range)
-            .map_err(journal_io)?;
+        let iter = self.journal.iter_range(range).map_err(journal_io)?;
         let mut entries = Vec::new();
         for record in iter {
             let (_seq, _meta, payload) = record.map_err(journal_io)?;
-            let (entry, _) =
-                bincode::serde::decode_from_slice::<<TypeConfig as openraft::RaftTypeConfig>::Entry, _>(
-                    &payload,
-                    bincode::config::standard(),
-                )
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let (entry, _) = bincode::serde::decode_from_slice::<
+                <TypeConfig as openraft::RaftTypeConfig>::Entry,
+                _,
+            >(&payload, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             entries.push(entry);
         }
         Ok(entries)
     }
 
-    async fn read_vote(
-        &mut self,
-    ) -> Result<Option<RaftVote>, io::Error> {
+    async fn read_vote(&mut self) -> Result<Option<RaftVote>, io::Error> {
         self.vote.load().map_err(sv_io)
     }
 }
@@ -213,22 +199,21 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
                 .journal
                 .read(seq)
                 .map_err(journal_io)?
-                .ok_or_else(|| {
-                    io::Error::other(format!("missing last record at seq {seq}"))
-                })?;
+                .ok_or_else(|| io::Error::other(format!("missing last record at seq {seq}")))?;
             let (_term, payload) = rec;
-            // M2 Task 1 audit (openraft 0.9.24):
+            // M2 Task 1 audit (confirmed unchanged in openraft 0.10):
             //
             // openraft's default leader_id mode is `leader_id_adv` (selected by
             // `#[cfg(not(feature = "single-term-leader"))]` at
-            // src/vote/leader_id/mod.rs). Our workspace enables openraft features
-            // = ["serde", "storage-v2"] only — `single-term-leader` is OFF — so
-            // the adv mode is in use.
+            // src/vote/leader_id/mod.rs). Our workspace does not enable
+            // `single-term-leader` — the adv mode is in use.
             //
-            // In adv mode (src/vote/leader_id/leader_id_adv.rs):
-            //   pub struct LeaderId<NID> { pub term: u64, pub node_id: NID }
-            //   #[derive(PartialOrd, Ord)]
-            //   pub type CommittedLeaderId<NID> = LeaderId<NID>;
+            // In adv mode (src/vote/leader_id/leader_id_adv.rs), now in
+            // openraft 0.10 with `Term` and `NID` as separate type params:
+            //   pub struct LeaderId<Term, NID> { pub term: Term, pub node_id: NID }
+            //   pub type CommittedLeaderId<Term, NID> = LeaderId<Term, NID>;
+            // For us `Term = NID = u64`, identical field layout to 0.9 → bincode
+            // bytes unchanged (the M3.5 on-disk-compat guarantee).
             //
             // `node_id` IS stored and IS part of the lexicographic (term, node_id)
             // ordering. Synthesizing `CommittedLeaderId::new(term, 0)` would give
@@ -239,12 +224,11 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             // append() stored it via `encode_to_vec(&entry, ...)`. The journal's
             // meta(=term) is now redundant for this path; we keep it as an
             // integrity check below.
-            let (entry, _) =
-                bincode::serde::decode_from_slice::<<TypeConfig as openraft::RaftTypeConfig>::Entry, _>(
-                    &payload,
-                    bincode::config::standard(),
-                )
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let (entry, _) = bincode::serde::decode_from_slice::<
+                <TypeConfig as openraft::RaftTypeConfig>::Entry,
+                _,
+            >(&payload, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             // Defensive: journal meta(term) and decoded entry term must agree.
             // `seq` (journal sequence) and `entry.log_id.index` are likewise
             // append()-coupled — divergence indicates corruption.
@@ -283,10 +267,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
         Ok(())
     }
 
-    async fn save_committed(
-        &mut self,
-        committed: Option<RaftLogId>,
-    ) -> Result<(), io::Error> {
+    async fn save_committed(&mut self, committed: Option<RaftLogId>) -> Result<(), io::Error> {
         match committed {
             Some(id) => {
                 self.committed
@@ -343,8 +324,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             // zero thread hop. IOFlushed::io_completed takes
             // `Result<(), io::Error>`, so we map JournalError → io::Error here.
             notifier.on_complete(move |result| {
-                let io_result: Result<(), io::Error> =
-                    result.map_err(io::Error::other);
+                let io_result: Result<(), io::Error> = result.map_err(io::Error::other);
                 callback.io_completed(io_result);
             });
         } else {
@@ -355,10 +335,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
         Ok(())
     }
 
-    async fn truncate_after(
-        &mut self,
-        log_id: Option<RaftLogId>,
-    ) -> Result<(), io::Error> {
+    async fn truncate_after(&mut self, log_id: Option<RaftLogId>) -> Result<(), io::Error> {
         // Remove entries with index > log_id.index (i.e., keep entries up to and
         // including log_id.index). `Journal::truncate_after(keep_seq)` retains
         // records with seq <= keep_seq.

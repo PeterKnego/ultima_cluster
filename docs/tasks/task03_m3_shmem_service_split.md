@@ -259,7 +259,7 @@ Total: **~91 tests** workspace-wide, all green at M3 close (commit `bd4ca23`). M
 ## Follow-ups tracked for M4+
 
 - **MPSC/Broadcast post-wrap fix** (M4): published-up-to position or per-slot generation counters. Tracked in `ring::mpsc` and `ring::broadcast` module headers.
-- **`Raft::trigger_leader_transfer` via openraft 0.10 upgrade.** Replaces the M3 `raft.shutdown()` substitute in `service_watcher`.
+- **~~`Raft::trigger_leader_transfer` via openraft 0.10 upgrade.~~** Shipped in M3.5 (`docs/tasks/task04_m3_5_openraft_0_10_upgrade.md`).
 - **Service-recovery handshake.** Needs the cnc-sub-mmap MPSC attach API so the node can consume `ServiceReady{last_applied}` frames after a restart. After that lands, the node-side last_applied cross-check (currently skipped in `ShmemAdaptedStateMachine::new` with a warn-log) can run.
 - **Snapshot via `snapshot.region` mmap** (M5). Current path keeps the M2 `Cursor<Vec<u8>>` storage.
 - **`clients/*.ring` + `uc_client` real impl** (M4): MPSC for client submit, Broadcast for responses, session files for client identity.

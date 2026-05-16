@@ -1,8 +1,6 @@
 //! NodeBuilder<S>: constructs the JournalLogStorage + AdaptedStateMachine<S>
-//! pair, builds an `openraft::Raft<TypeConfig>`, applies bootstrap, and returns
-//! a NodeHandle.
-//!
-//! openraft 0.9.24 deviations from the original spec are documented inline.
+//! pair, builds an `openraft::Raft<TypeConfig, SM>`, applies bootstrap, and
+//! returns a NodeHandle.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -279,9 +277,10 @@ where
                     // `InProgress`. Retry with backoff until the init
                     // membership commits (typically < 10 ms in a single-voter
                     // cluster) or the overall deadline is reached.
-                    use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError as OR};
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    use openraft::error::{
+                        ChangeMembershipError, ClientWriteError, RaftError as OR,
+                    };
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
                     loop {
                         match raft.add_learner(peer.node_id, node.clone(), true).await {
                             Ok(_) => {

@@ -4,8 +4,8 @@
 
 use std::io::{Read, Write};
 
-use openraft::vote::RaftLeaderId as _;
 use openraft::LogId;
+use openraft::vote::RaftLeaderId as _;
 type LeaderId = openraft::impls::leader_id_adv::LeaderId<u64, u64>;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
