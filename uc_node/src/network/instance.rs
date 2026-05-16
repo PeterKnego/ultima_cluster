@@ -11,11 +11,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use openraft::error::{InstallSnapshotError, RPCError, RaftError};
-use openraft::network::{RPCOption, RaftNetwork};
+use openraft::network::RPCOption;
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
+use openraft_legacy::network_v1::RaftNetwork;
 use quinn::Endpoint;
 use rustls::ClientConfig;
 
