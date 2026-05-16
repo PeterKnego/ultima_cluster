@@ -6,26 +6,24 @@
 //! call with a publish to `service/apply.ring` (shared-memory ring), but the
 //! adapter shape stays the same.
 //!
-//! Implementation notes (openraft 0.9.24):
+//! Implementation notes (openraft 0.10):
 //!   * Trait uses `#[add_async_trait]` (native async fn) — no `#[async_trait]`
 //!     attribute on the impl.
-//!   * `C::D` and `C::R` are both `bytes::Bytes` (see `super::TypeConfig`). So
+//!   * `C::D = AppCommand`, `C::R = AppResponse = bytes::Bytes` (see `super::TypeConfig`).
 //!     `EntryPayload::Normal(d)` carries the user's bincode-encoded `Command`,
-//!     and we return bincode-encoded `Response` bytes.
-//!   * `C::SnapshotData = std::io::Cursor<Vec<u8>>` — tokio implements its
-//!     async-IO traits for `std::io::Cursor<Vec<u8>>`, so the bound is
-//!     satisfied without a wrapper.
-//!   * Errors from decode/encode/apply paths are wrapped via
-//!     `StorageIOError::apply(log_id, &io_err)`. Snapshot build/install errors
-//!     use `write_snapshot` / `read_snapshot` respectively (signature=None
-//!     because we don't have a snapshot-id at the failure point).
+//!     and we return bincode-encoded `Response` bytes via `ApplyResponder::send`.
+//!   * `C::SnapshotData = std::io::Cursor<Vec<u8>>` — no Box wrapping in 0.10.
+//!   * Errors use `io::Error` throughout (StorageError removed from public trait surface).
 
+use std::io;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot, SnapshotMeta};
-use openraft::{EntryPayload, LogId, StorageError, StorageIOError, StoredMembership};
+use futures::StreamExt;
+use openraft::EntryPayload;
+use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine, Snapshot, SnapshotMeta};
+use openraft::{LogId, StoredMembership};
 use tokio::sync::Mutex;
 use ultima_journal::StableValue;
 
@@ -33,6 +31,14 @@ use uc_service::StateMachine;
 
 use super::log_storage::{LogStorageHandles, StoredSnapshotMeta};
 use super::{NodeAddr, NodeId, TypeConfig};
+
+// Concrete openraft 0.10 types for our TypeConfig.
+// TypeConfig uses leader_id_adv, where CommittedLeaderId == LeaderId.
+type LeaderId = openraft::impls::leader_id_adv::LeaderId<u64, u64>;
+type RaftLogId = LogId<LeaderId>;
+type RaftStoredMembership = StoredMembership<LeaderId, NodeId, NodeAddr>;
+type RaftSnapshotMeta = SnapshotMeta<LeaderId, NodeId, NodeAddr>;
+type RaftSnapshot = Snapshot<LeaderId, NodeId, NodeAddr, Cursor<Vec<u8>>>;
 
 /// Adapter from openraft's `RaftStateMachine` to the user-supplied
 /// `uc_service::StateMachine`.
@@ -42,17 +48,17 @@ pub struct AdaptedStateMachine<S: StateMachine> {
 
 pub(crate) struct Inner<S: StateMachine> {
     pub(crate) sm: S,
-    pub(crate) last_applied: Option<LogId<NodeId>>,
-    pub(crate) last_membership: StoredMembership<NodeId, NodeAddr>,
+    pub(crate) last_applied: Option<RaftLogId>,
+    pub(crate) last_membership: RaftStoredMembership,
     pub(crate) current_snapshot: Option<StoredSnapshot>,
-    pub(crate) last_applied_sv: Arc<StableValue<LogId<NodeId>>>,
+    pub(crate) last_applied_sv: Arc<StableValue<RaftLogId>>,
     pub(crate) snapshot_meta_sv: Arc<StableValue<StoredSnapshotMeta>>,
     pub(crate) snapshot_bytes_dir: PathBuf,
 }
 
 #[derive(Clone)]
 pub(crate) struct StoredSnapshot {
-    pub meta: SnapshotMeta<NodeId, NodeAddr>,
+    pub meta: RaftSnapshotMeta,
     pub data: Vec<u8>,
 }
 
@@ -75,7 +81,7 @@ impl<S: StateMachine> AdaptedStateMachine<S> {
                         "snapshot_meta points to {bytes_path:?} but read failed: {e}"
                     ))
                 })?;
-                let openraft_meta = SnapshotMeta {
+                let openraft_meta = RaftSnapshotMeta {
                     last_log_id: meta.last_log_id,
                     last_membership: meta.last_membership.clone(),
                     snapshot_id: format!("snap-{}", meta.last_log_id.map(|l| l.index).unwrap_or(0)),
@@ -88,7 +94,7 @@ impl<S: StateMachine> AdaptedStateMachine<S> {
                     }),
                 )
             }
-            None => (StoredMembership::default(), None),
+            None => (RaftStoredMembership::default(), None),
         };
 
         // If a snapshot exists, install it into the user's state machine so its
@@ -196,63 +202,61 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, NodeAddr>), StorageError<NodeId>>
-    {
+    ) -> Result<(Option<RaftLogId>, RaftStoredMembership), io::Error> {
         let g = self.inner.lock().await;
         Ok((g.last_applied, g.last_membership.clone()))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<bytes::Bytes>, StorageError<NodeId>>
+    async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
     where
-        I: IntoIterator<Item = openraft::Entry<TypeConfig>> + Send,
-        I::IntoIter: Send,
+        Strm: futures::Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>>
+            + Unpin
+            + Send,
     {
-        let mut g = self.inner.lock().await;
-        let mut responses = Vec::new();
-
-        for entry in entries {
+        while let Some(item) = entries.next().await {
+            let (entry, responder) = item?;
             let log_id = entry.log_id;
             let log_index = log_id.index;
+
             // NOTE (M2 Task 3): apply() updates the in-memory `g.last_applied`
             // only. `last_applied_sv` (the durable StableValue) is updated only
             // on install_snapshot. On restart, framework reads `last_applied_sv`
             // (which may be None or the snapshot index); user's sm.last_applied()
             // is the actual user-visible last_applied. Task 3's startup
             // cross-check reconciles these.
+            let mut g = self.inner.lock().await;
             g.last_applied = Some(log_id);
 
-            match entry.payload {
-                EntryPayload::Blank => {
-                    responses.push(bytes::Bytes::new());
+            // Three payload cases — see openraft::EntryPayload.
+            let resp_bytes = match entry.payload {
+                EntryPayload::Blank => bytes::Bytes::new(),
+                EntryPayload::Membership(m) => {
+                    g.last_membership = RaftStoredMembership::new(Some(log_id), m);
+                    bytes::Bytes::new()
                 }
                 EntryPayload::Normal(cmd_bytes) => {
+                    // Normal app-data entry.
                     let (cmd, _) = bincode::serde::decode_from_slice::<S::Command, _>(
                         cmd_bytes.as_ref(),
                         bincode::config::standard(),
                     )
-                    .map_err(|e| {
-                        let io_err = std::io::Error::other(e.to_string());
-                        StorageIOError::<NodeId>::apply(log_id, &io_err)
-                    })?;
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
                     let resp = g.sm.apply(log_index, cmd);
 
-                    let resp_bytes =
-                        bincode::serde::encode_to_vec(&resp, bincode::config::standard()).map_err(
-                            |e| {
-                                let io_err = std::io::Error::other(e.to_string());
-                                StorageIOError::<NodeId>::apply(log_id, &io_err)
-                            },
-                        )?;
-                    responses.push(bytes::Bytes::from(resp_bytes));
+                    let encoded =
+                        bincode::serde::encode_to_vec(&resp, bincode::config::standard())
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    bytes::Bytes::from(encoded)
                 }
-                EntryPayload::Membership(m) => {
-                    g.last_membership = StoredMembership::new(Some(log_id), m);
-                    responses.push(bytes::Bytes::new());
-                }
+            };
+            drop(g);
+
+            if let Some(r) = responder {
+                r.send(resp_bytes);
             }
         }
-        Ok(responses)
+        Ok(())
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
@@ -263,15 +267,15 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
 
     async fn begin_receiving_snapshot(
         &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    ) -> Result<Cursor<Vec<u8>>, io::Error> {
+        Ok(Cursor::new(Vec::new()))
     }
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<NodeId, NodeAddr>,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), StorageError<NodeId>> {
+        meta: &RaftSnapshotMeta,
+        snapshot: Cursor<Vec<u8>>,
+    ) -> Result<(), io::Error> {
         let bytes = snapshot.into_inner();
         let mut g = self.inner.lock().await;
 
@@ -293,11 +297,11 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
         // snapshot lifecycle (e.g. via the snapshot.region mmap'd transport).
         let bytes_path = g.snapshot_bytes_dir.join(&bytes_filename);
         std::fs::write(&bytes_path, &bytes)
-            .map_err(|e| StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let f = std::fs::File::open(&bytes_path)
-            .map_err(|e| StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         f.sync_all()
-            .map_err(|e| StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         drop(f);
         // M5 hardening: also fsync the parent directory to guarantee the
         // directory entry is durable, not just the file inode. For now we
@@ -323,37 +327,17 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
         };
         g.snapshot_meta_sv
             .store(&stored_meta)
-            .map_err(|e| {
-                StorageIOError::<NodeId>::read_snapshot(
-                    Some(meta.signature()),
-                    &std::io::Error::other(e.to_string()),
-                )
-            })?
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
             .wait()
-            .map_err(|e| {
-                StorageIOError::<NodeId>::read_snapshot(
-                    Some(meta.signature()),
-                    &std::io::Error::other(e.to_string()),
-                )
-            })?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         // 3. Persist last_applied (if present).
         if let Some(lid) = meta.last_log_id {
             g.last_applied_sv
                 .store(&lid)
-                .map_err(|e| {
-                    StorageIOError::<NodeId>::read_snapshot(
-                        Some(meta.signature()),
-                        &std::io::Error::other(e.to_string()),
-                    )
-                })?
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
                 .wait()
-                .map_err(|e| {
-                    StorageIOError::<NodeId>::read_snapshot(
-                        Some(meta.signature()),
-                        &std::io::Error::other(e.to_string()),
-                    )
-                })?;
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         }
 
         // 4. Now mutate the user's state machine. If this fails, the durable
@@ -363,8 +347,7 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
         //    (snapshot replay path).
         let mut cursor = Cursor::new(bytes.clone());
         let user_last_applied = g.sm.install_snapshot(&mut cursor).map_err(|e| {
-            let io_err = std::io::Error::other(e.to_string());
-            StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &io_err)
+            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
         })?;
 
         // Sanity check: user's reported last_applied after install must match
@@ -388,12 +371,12 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for AdaptedStateMachine<S> {
 
     async fn get_current_snapshot(
         &mut self,
-    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
+    ) -> Result<Option<RaftSnapshot>, io::Error> {
         let g = self.inner.lock().await;
         match &g.current_snapshot {
             Some(s) => Ok(Some(Snapshot {
                 meta: s.meta.clone(),
-                snapshot: Box::new(Cursor::new(s.data.clone())),
+                snapshot: Cursor::new(s.data.clone()),
             })),
             None => Ok(None),
         }
@@ -409,15 +392,14 @@ pub struct AdaptedSnapshotBuilder<S: StateMachine> {
 }
 
 impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for AdaptedSnapshotBuilder<S> {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
+    async fn build_snapshot(&mut self) -> Result<RaftSnapshot, io::Error> {
         let mut g = self.inner.lock().await;
         let last_applied = g.last_applied;
         let last_membership = g.last_membership.clone();
 
         let mut buf: Vec<u8> = Vec::new();
         let user_index = g.sm.build_snapshot(&mut buf).map_err(|e| {
-            let io_err = std::io::Error::other(e.to_string());
-            StorageIOError::<NodeId>::write_snapshot(None, &io_err)
+            io::Error::new(io::ErrorKind::Other, e.to_string())
         })?;
 
         // Sanity check: with the Mutex held across apply and build, the user's returned
@@ -431,7 +413,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for AdaptedSnapshotBuilder
         );
 
         let snapshot_id_index = last_applied.map(|l| l.index).unwrap_or(0);
-        let meta = SnapshotMeta {
+        let meta = RaftSnapshotMeta {
             last_log_id: last_applied,
             last_membership,
             snapshot_id: format!("snap-{snapshot_id_index}"),
@@ -444,7 +426,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for AdaptedSnapshotBuilder
 
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(buf)),
+            snapshot: Cursor::new(buf),
         })
     }
 }
