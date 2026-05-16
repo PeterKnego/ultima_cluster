@@ -108,6 +108,16 @@ impl<S: StateMachine> RaftHandle<S> {
         }
     }
 
+    pub(crate) async fn transfer_leader(
+        &self,
+        target: NodeId,
+    ) -> Result<(), openraft::error::Fatal<TypeConfig>> {
+        match self {
+            Self::Embedded(r) => r.trigger().transfer_leader(target).await,
+            Self::Shmem(r) => r.trigger().transfer_leader(target).await,
+        }
+    }
+
     pub(crate) async fn shutdown(
         &self,
     ) -> Result<(), openraft::type_config::alias::JoinErrorOf<TypeConfig>> {

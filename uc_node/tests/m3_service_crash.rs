@@ -1,4 +1,4 @@
-//! Service-crash → leadership-transfer test (M3 Task 20).
+//! Service-crash → leadership-transfer test (M3.5 Task 8 upgrade).
 //!
 //! Brings up a 3-node shmem cluster, identifies the leader, and shuts
 //! down that leader's `uc_service::Service` (stopping its heartbeat
@@ -7,11 +7,9 @@
 //! [`uc_node::ipc::service_watcher`] should:
 //!
 //! 1. Observe the missed heartbeats and flip `service_stalled()` to true.
-//! 2. Call `raft.shutdown()` on the leader (M3 substitute for
-//!    `Raft::trigger_leader_transfer`, which openraft 0.9.24 doesn't
-//!    expose).
-//! 3. The remaining two voters re-elect; a fresh submit through the new
-//!    leader succeeds.
+//! 2. Call `raft.trigger().transfer_leader(target)` (real openraft 0.10 API).
+//! 3. The cluster re-elects; the original leader stays alive as a follower.
+//! 4. A fresh submit through the new leader succeeds.
 
 use std::io::{Read, Write};
 use std::net::SocketAddr;
@@ -119,26 +117,6 @@ async fn wait_for_leader(handles: &[NodeHandle<Counter>], timeout: Duration) -> 
     panic!("no leader within {timeout:?}");
 }
 
-async fn wait_for_new_leader(
-    handles: &[&NodeHandle<Counter>],
-    excluded: NodeId,
-    timeout: Duration,
-) -> NodeId {
-    let surviving: Vec<NodeId> = handles.iter().map(|h| h.node_id()).collect();
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        for h in handles {
-            if let Some(l) = h.current_leader().await
-                && l != excluded
-                && surviving.contains(&l)
-            {
-                return l;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("no new leader (excluding {excluded}) within {timeout:?}");
-}
 
 #[tokio::test]
 async fn service_crash_on_leader_transfers_leadership() {
@@ -251,13 +229,54 @@ async fn service_crash_on_leader_transfers_leadership() {
     }
     assert!(stalled, "leader's service_stalled flag never flipped");
 
-    // ── Cluster should re-elect among the surviving 2 nodes ─────────────
-    let surviving: Vec<&NodeHandle<Counter>> = node_handles
+    // ── Cluster should transfer leadership ───────────────────────────────
+    // M3.5: leader stays alive as a follower (M3 had it raft-shutdown).
+    //
+    // Two invariants:
+    //   1. The original leader is still alive (raft NOT shut down): its
+    //      current_leader() must be Some(x), not None.
+    //   2. Leadership actually moved: current_leader() != Some(leader_id).
+    //
+    // Strategy: wait until ALL three nodes agree on the SAME leader that is
+    // not the original leader.  Polling all three avoids the race where one
+    // peer briefly reports a transient intermediate winner before the cluster
+    // fully converges.  Once all three agree, the new_leader_id is stable
+    // and the old leader is confirmed alive as a follower.
+    let old_leader = node_handles
         .iter()
-        .filter(|h| h.node_id() != leader_id)
-        .collect();
-    let new_leader_id = wait_for_new_leader(&surviving, leader_id, Duration::from_secs(15)).await;
-    assert_ne!(new_leader_id, leader_id);
+        .find(|h| h.node_id() == leader_id)
+        .unwrap();
+
+    let new_leader_id = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if std::time::Instant::now() >= deadline {
+                panic!("cluster did not converge on a new leader within 15 s (old leader={leader_id})");
+            }
+            // Collect current_leader() from all three nodes.
+            let mut views: Vec<Option<NodeId>> = Vec::new();
+            for h in &node_handles {
+                views.push(h.current_leader().await);
+            }
+            // All three must agree on the same non-None, non-excluded leader.
+            if let Some(first) = views[0]
+                && first != leader_id
+                && views.iter().all(|v| *v == Some(first))
+            {
+                break first;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    assert_ne!(new_leader_id, leader_id, "leadership must transfer off the stalled node");
+
+    // Since the old leader was one of the three nodes polled above and it
+    // already agreed on new_leader_id, this assertion is stable.
+    assert_eq!(
+        old_leader.current_leader().await,
+        Some(new_leader_id),
+        "stalled leader should report the new leader (it's now a follower, not dead)"
+    );
 
     let new_leader = node_handles
         .iter()
@@ -274,8 +293,8 @@ async fn service_crash_on_leader_transfers_leadership() {
         s.shutdown().await.expect("svc shutdown");
     }
     for n in node_handles.into_iter() {
-        // The stalled leader's raft was already shut down by the watcher;
-        // node.shutdown() calls raft.shutdown() again (idempotent).
+        // M3.5: the stalled leader's raft transferred leadership (still
+        // alive as a follower); node.shutdown() shuts it down cleanly.
         n.shutdown().await.expect("node shutdown");
     }
 }

@@ -273,16 +273,50 @@ where
                         raft_addr: peer.raft_addr,
                         client_addr: None,
                     };
-                    match raft.add_learner(peer.node_id, node, true).await {
-                        Ok(_) => {
-                            promotable.insert(peer.node_id);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                node_id = peer.node_id,
-                                error = ?e,
-                                "add_learner failed; peer will not be promoted to voter"
-                            );
+                    // openraft 0.10: `initialize()` returns after the init log
+                    // is FLUSHED, not committed. `add_learner` called too soon
+                    // races with the ongoing membership change and fails with
+                    // `InProgress`. Retry with backoff until the init
+                    // membership commits (typically < 10 ms in a single-voter
+                    // cluster) or the overall deadline is reached.
+                    use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError as OR};
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    loop {
+                        match raft.add_learner(peer.node_id, node.clone(), true).await {
+                            Ok(_) => {
+                                promotable.insert(peer.node_id);
+                                break;
+                            }
+                            Err(OR::APIError(ClientWriteError::ChangeMembershipError(
+                                ChangeMembershipError::InProgress(_),
+                            ))) if std::time::Instant::now() < deadline => {
+                                // Race: init membership not yet committed.
+                                tracing::trace!(
+                                    node_id = peer.node_id,
+                                    "add_learner saw InProgress; retrying after 5ms"
+                                );
+                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                continue;
+                            }
+                            Err(OR::APIError(ClientWriteError::ChangeMembershipError(
+                                ChangeMembershipError::InProgress(_),
+                            ))) => {
+                                tracing::warn!(
+                                    node_id = peer.node_id,
+                                    "add_learner timed out (InProgress past 10s deadline); \
+                                     peer will not be promoted to voter"
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    node_id = peer.node_id,
+                                    error = ?e,
+                                    "add_learner failed; peer will not be promoted to voter"
+                                );
+                                break;
+                            }
                         }
                     }
                 }
