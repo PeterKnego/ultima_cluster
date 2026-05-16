@@ -7,6 +7,14 @@
 //! user's actual `StateMachine` lives on the *service* side (driven by
 //! `uc_service::ServiceBuilder::run`).
 //!
+//! Implementation notes (openraft 0.10):
+//!   * Trait uses `#[add_async_trait]` (native async fn) — no `#[async_trait]`
+//!     attribute on the impl.
+//!   * `apply()` takes `Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>>`
+//!     instead of the 0.9 `IntoIterator<Item = Entry<TypeConfig>>`.
+//!   * `C::SnapshotData = std::io::Cursor<Vec<u8>>` — no Box wrapping in 0.10.
+//!   * Errors use `io::Error` throughout (StorageError removed from public trait surface).
+//!
 //! # M3 limitations (intentionally accepted; M5 fixes)
 //!
 //! The node-side `sm: S` is **degenerate**: its job is to satisfy openraft's
@@ -25,14 +33,17 @@
 //!   M3 tests don't exercise snapshot install, so this is unobserved in
 //!   practice.
 
+use std::io;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine, Snapshot, SnapshotMeta};
-use openraft::{EntryPayload, LogId, StorageError, StorageIOError, StoredMembership};
+use futures::StreamExt;
+use openraft::EntryPayload;
+use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine, Snapshot, SnapshotMeta};
+use openraft::{LogId, StoredMembership};
 use parking_lot::Mutex as PlMutex;
 use tokio::sync::Mutex as TokioMutex;
 use uc_protocol::frames::apply::{
@@ -47,6 +58,15 @@ use super::log_storage::{LogStorageHandles, StoredSnapshotMeta};
 use super::state_machine::StoredSnapshot;
 use super::{NodeAddr, NodeId, TypeConfig};
 
+// Concrete openraft 0.10 types for our TypeConfig.
+// TypeConfig uses leader_id_adv, where CommittedLeaderId == LeaderId.
+// (Duplicated from state_machine.rs; Task 9 will consolidate into mod.rs.)
+type LeaderId = openraft::impls::leader_id_adv::LeaderId<u64, u64>;
+type RaftLogId = LogId<LeaderId>;
+type RaftStoredMembership = StoredMembership<LeaderId, NodeId, NodeAddr>;
+type RaftSnapshotMeta = SnapshotMeta<LeaderId, NodeId, NodeAddr>;
+type RaftSnapshot = Snapshot<LeaderId, NodeId, NodeAddr, Cursor<Vec<u8>>>;
+
 const FULL_BACKOFF: Duration = Duration::from_micros(100);
 const EMPTY_BACKOFF: Duration = Duration::from_micros(100);
 
@@ -58,10 +78,10 @@ pub(crate) struct ShmemInner<S: StateMachine> {
     /// Node-side user-SM. Degenerate in shmem mode (see module docs); used
     /// only by the snapshot trait methods.
     pub(crate) sm: S,
-    pub(crate) last_applied: Option<LogId<NodeId>>,
-    pub(crate) last_membership: StoredMembership<NodeId, NodeAddr>,
+    pub(crate) last_applied: Option<RaftLogId>,
+    pub(crate) last_membership: RaftStoredMembership,
     pub(crate) current_snapshot: Option<StoredSnapshot>,
-    pub(crate) last_applied_sv: Arc<StableValue<LogId<NodeId>>>,
+    pub(crate) last_applied_sv: Arc<StableValue<RaftLogId>>,
     pub(crate) snapshot_meta_sv: Arc<StableValue<StoredSnapshotMeta>>,
     pub(crate) snapshot_bytes_dir: PathBuf,
     /// Wrapped in `parking_lot::Mutex` so we can take it across an `await`
@@ -93,7 +113,7 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
                         "snapshot_meta points to {bytes_path:?} but read failed: {e}"
                     ))
                 })?;
-                let openraft_meta = SnapshotMeta {
+                let openraft_meta = RaftSnapshotMeta {
                     last_log_id: meta.last_log_id,
                     last_membership: meta.last_membership.clone(),
                     snapshot_id: format!("snap-{}", meta.last_log_id.map(|l| l.index).unwrap_or(0)),
@@ -106,7 +126,7 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
                     }),
                 )
             }
-            None => (StoredMembership::default(), None),
+            None => (RaftStoredMembership::default(), None),
         };
 
         // Best-effort: install the snapshot into the (degenerate) node-side
@@ -152,44 +172,53 @@ impl<S: StateMachine> Clone for ShmemAdaptedStateMachine<S> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RaftStateMachine impl
+// ---------------------------------------------------------------------------
+
 impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<S> {
     type SnapshotBuilder = ShmemSnapshotBuilder<S>;
 
     async fn applied_state(
         &mut self,
-    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, NodeAddr>), StorageError<NodeId>>
-    {
+    ) -> Result<(Option<RaftLogId>, RaftStoredMembership), io::Error> {
         let g = self.inner.lock().await;
         Ok((g.last_applied, g.last_membership.clone()))
     }
 
-    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Bytes>, StorageError<NodeId>>
+    async fn apply<Strm>(&mut self, mut entries: Strm) -> Result<(), io::Error>
     where
-        I: IntoIterator<Item = openraft::Entry<TypeConfig>> + Send,
-        I::IntoIter: Send,
+        Strm: futures::Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>>
+            + Unpin
+            + Send,
     {
-        let mut g = self.inner.lock().await;
-        let mut responses = Vec::new();
-
-        for entry in entries {
+        while let Some(item) = entries.next().await {
+            let (entry, responder) = item?;
             let log_id = entry.log_id;
             let log_index = log_id.index;
+
+            let mut g = self.inner.lock().await;
             g.last_applied = Some(log_id);
 
-            match entry.payload {
-                EntryPayload::Blank => responses.push(Bytes::new()),
-                EntryPayload::Normal(cmd_bytes) => {
-                    publish_apply(&g.apply_producer, log_index, cmd_bytes.as_ref(), log_id).await?;
-                    let resp = await_apply_resp(&g.apply_resp_consumer, log_index, log_id).await?;
-                    responses.push(resp);
-                }
+            let resp_bytes: Bytes = match entry.payload {
+                EntryPayload::Blank => Bytes::new(),
                 EntryPayload::Membership(m) => {
-                    g.last_membership = StoredMembership::new(Some(log_id), m);
-                    responses.push(Bytes::new());
+                    g.last_membership = RaftStoredMembership::new(Some(log_id), m);
+                    Bytes::new()
                 }
+                EntryPayload::Normal(cmd_bytes) => {
+                    // Normal app-data: publish to apply.ring, await response from apply_resp.ring.
+                    publish_apply(&g.apply_producer, log_index, cmd_bytes.as_ref(), log_id).await?;
+                    await_apply_resp(&g.apply_resp_consumer, log_index, log_id).await?
+                }
+            };
+            drop(g);
+
+            if let Some(r) = responder {
+                r.send(resp_bytes);
             }
         }
-        Ok(responses)
+        Ok(())
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
@@ -200,15 +229,15 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
 
     async fn begin_receiving_snapshot(
         &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    ) -> Result<Cursor<Vec<u8>>, io::Error> {
+        Ok(Cursor::new(Vec::new()))
     }
 
     async fn install_snapshot(
         &mut self,
-        meta: &SnapshotMeta<NodeId, NodeAddr>,
-        snapshot: Box<Cursor<Vec<u8>>>,
-    ) -> Result<(), StorageError<NodeId>> {
+        meta: &RaftSnapshotMeta,
+        snapshot: Cursor<Vec<u8>>,
+    ) -> Result<(), io::Error> {
         // Same durable-writes-first ordering as `AdaptedStateMachine`. The
         // node-side `sm` is degenerate in shmem mode but we still run its
         // `install_snapshot` so its in-memory state matches whatever the
@@ -222,11 +251,11 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
         );
         let bytes_path = g.snapshot_bytes_dir.join(&bytes_filename);
         std::fs::write(&bytes_path, &bytes)
-            .map_err(|e| StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let f = std::fs::File::open(&bytes_path)
-            .map_err(|e| StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         f.sync_all()
-            .map_err(|e| StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &e))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         drop(f);
 
         let stored_meta = StoredSnapshotMeta {
@@ -236,42 +265,21 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
         };
         g.snapshot_meta_sv
             .store(&stored_meta)
-            .map_err(|e| {
-                StorageIOError::<NodeId>::read_snapshot(
-                    Some(meta.signature()),
-                    &std::io::Error::other(e.to_string()),
-                )
-            })?
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
             .wait()
-            .map_err(|e| {
-                StorageIOError::<NodeId>::read_snapshot(
-                    Some(meta.signature()),
-                    &std::io::Error::other(e.to_string()),
-                )
-            })?;
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         if let Some(lid) = meta.last_log_id {
             g.last_applied_sv
                 .store(&lid)
-                .map_err(|e| {
-                    StorageIOError::<NodeId>::read_snapshot(
-                        Some(meta.signature()),
-                        &std::io::Error::other(e.to_string()),
-                    )
-                })?
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
                 .wait()
-                .map_err(|e| {
-                    StorageIOError::<NodeId>::read_snapshot(
-                        Some(meta.signature()),
-                        &std::io::Error::other(e.to_string()),
-                    )
-                })?;
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         }
 
         let mut cursor = Cursor::new(bytes.clone());
         let _user_last_applied = g.sm.install_snapshot(&mut cursor).map_err(|e| {
-            let io_err = std::io::Error::other(e.to_string());
-            StorageIOError::<NodeId>::read_snapshot(Some(meta.signature()), &io_err)
+            io::Error::new(io::ErrorKind::InvalidData, e.to_string())
         })?;
 
         g.last_applied = meta.last_log_id;
@@ -285,12 +293,12 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
 
     async fn get_current_snapshot(
         &mut self,
-    ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
+    ) -> Result<Option<RaftSnapshot>, io::Error> {
         let g = self.inner.lock().await;
         match &g.current_snapshot {
             Some(s) => Ok(Some(Snapshot {
                 meta: s.meta.clone(),
-                snapshot: Box::new(Cursor::new(s.data.clone())),
+                snapshot: Cursor::new(s.data.clone()),
             })),
             None => Ok(None),
         }
@@ -305,8 +313,9 @@ async fn publish_apply(
     producer: &PlMutex<SpscProducer>,
     log_index: u64,
     cmd_bytes: &[u8],
-    log_id: LogId<NodeId>,
-) -> Result<(), StorageError<NodeId>> {
+    log_id: RaftLogId,
+) -> Result<(), io::Error> {
+    let _ = log_id; // kept for parity with the 0.9 error-context site
     loop {
         let result = {
             let mut p = producer.lock();
@@ -316,8 +325,10 @@ async fn publish_apply(
             Ok(()) => return Ok(()),
             Err(RingError::Full) => tokio::time::sleep(FULL_BACKOFF).await,
             Err(e) => {
-                let io_err = std::io::Error::other(format!("apply ring write: {e}"));
-                return Err(StorageIOError::<NodeId>::apply(log_id, &io_err).into());
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("apply ring write at {log_index}: {e}"),
+                ));
             }
         }
     }
@@ -326,8 +337,9 @@ async fn publish_apply(
 async fn await_apply_resp(
     consumer: &PlMutex<SpscConsumer>,
     expected_log_index: u64,
-    log_id: LogId<NodeId>,
-) -> Result<Bytes, StorageError<NodeId>> {
+    log_id: RaftLogId,
+) -> Result<Bytes, io::Error> {
+    let _ = log_id; // kept for parity with the 0.9 error-context site
     let mut payload_buf: Vec<u8> = Vec::with_capacity(1024);
     loop {
         let read_result = {
@@ -340,10 +352,12 @@ async fn await_apply_resp(
                 if li != expected_log_index {
                     // The service apply loop emits responses in publish order,
                     // so a mismatch here is unrecoverable corruption.
-                    let io_err = std::io::Error::other(format!(
-                        "apply_resp log_index mismatch: got {li}, expected {expected_log_index}"
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "apply_resp log_index mismatch: got {li}, expected {expected_log_index}"
+                        ),
                     ));
-                    return Err(StorageIOError::<NodeId>::apply(log_id, &io_err).into());
                 }
                 return Ok(Bytes::from(std::mem::take(&mut payload_buf)));
             }
@@ -355,8 +369,10 @@ async fn await_apply_resp(
             }
             Ok(None) => tokio::time::sleep(EMPTY_BACKOFF).await,
             Err(e) => {
-                let io_err = std::io::Error::other(format!("apply_resp ring read: {e}"));
-                return Err(StorageIOError::<NodeId>::apply(log_id, &io_err).into());
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("apply_resp ring read: {e}"),
+                ));
             }
         }
     }
@@ -371,7 +387,7 @@ pub struct ShmemSnapshotBuilder<S: StateMachine> {
 }
 
 impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S> {
-    async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
+    async fn build_snapshot(&mut self) -> Result<RaftSnapshot, io::Error> {
         let mut g = self.inner.lock().await;
         let last_applied = g.last_applied;
         let last_membership = g.last_membership.clone();
@@ -380,12 +396,11 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S
         // produces whatever the user's default `build_snapshot` returns.
         let mut buf: Vec<u8> = Vec::new();
         let _user_index = g.sm.build_snapshot(&mut buf).map_err(|e| {
-            let io_err = std::io::Error::other(e.to_string());
-            StorageIOError::<NodeId>::write_snapshot(None, &io_err)
+            io::Error::new(io::ErrorKind::Other, e.to_string())
         })?;
 
         let snapshot_id_index = last_applied.map(|l| l.index).unwrap_or(0);
-        let meta = SnapshotMeta {
+        let meta = RaftSnapshotMeta {
             last_log_id: last_applied,
             last_membership,
             snapshot_id: format!("snap-{snapshot_id_index}"),
@@ -398,7 +413,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S
 
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(buf)),
+            snapshot: Cursor::new(buf),
         })
     }
 }
