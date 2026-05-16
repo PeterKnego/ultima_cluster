@@ -16,6 +16,7 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 openraft = { workspace = true }
+openraft-legacy = { workspace = true }
 ultima-journal = { workspace = true }
 uc_protocol = { path = "../uc_protocol" }
 uc_service = { path = "../uc_service" }

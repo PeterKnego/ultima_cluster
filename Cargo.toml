@@ -22,7 +22,8 @@ async-trait = "0.1"
 futures = "0.3"
 
 # raft + storage
-openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+openraft = { version = "0.10.0-alpha.20", features = ["serde"] }
+openraft-legacy = { version = "0.10.0-alpha.20" }
 ultima-journal = { path = "../ultima_db/ultima_journal" }
 # `persistence` is required for snapshot_stream / install_snapshot_stream.
 ultima-db = { path = "../ultima_db", features = ["persistence"] }
