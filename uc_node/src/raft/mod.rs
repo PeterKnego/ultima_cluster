@@ -44,7 +44,10 @@ openraft::declare_raft_types!(
         R = AppResponse,
         NodeId = NodeId,
         Node = NodeAddr,
-        Entry = openraft::Entry<TypeConfig>,
-        SnapshotData = std::io::Cursor<Vec<u8>>,    // M1: in-memory; M5 swaps to snapshot.region reader
-        AsyncRuntime = openraft::TokioRuntime,
+        Term = u64,
+        LeaderId = openraft::impls::leader_id_adv::LeaderId<Self::Term, Self::NodeId>,
+        Vote = openraft::impls::Vote<Self::LeaderId>,
+        Entry = openraft::impls::Entry<Self>,
+        SnapshotData = std::io::Cursor<Vec<u8>>, // M1: in-memory; M5 swaps to snapshot.region reader
+        AsyncRuntime = openraft::impls::TokioRuntime,
 );
