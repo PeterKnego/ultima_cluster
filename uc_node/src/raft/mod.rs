@@ -33,7 +33,38 @@ impl Default for NodeAddr {
 }
 
 /// User-Command bytes, refcounted for zero-copy flow through the apply pipeline.
-pub type AppCommand = Bytes;
+///
+/// Newtype over `bytes::Bytes` so that openraft 0.10's `AppData: Display` bound is
+/// satisfied.  `Deref<Target = Bytes>` / `From<Bytes>` / `Into<Bytes>` keep it
+/// transparent in the apply pipeline.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct AppCommand(pub Bytes);
+
+impl std::fmt::Display for AppCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<{} bytes>", self.0.len())
+    }
+}
+
+impl std::ops::Deref for AppCommand {
+    type Target = Bytes;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Bytes> for AppCommand {
+    fn from(b: Bytes) -> Self {
+        Self(b)
+    }
+}
+
+impl From<AppCommand> for Bytes {
+    fn from(c: AppCommand) -> Self {
+        c.0
+    }
+}
 
 /// User-Response bytes, also refcounted.
 pub type AppResponse = Bytes;
@@ -47,7 +78,7 @@ openraft::declare_raft_types!(
         Term = u64,
         LeaderId = openraft::impls::leader_id_adv::LeaderId<Self::Term, Self::NodeId>,
         Vote = openraft::impls::Vote<Self::LeaderId>,
-        Entry = openraft::impls::Entry<Self>,
+        Entry = openraft::Entry<<Self::LeaderId as openraft::vote::RaftLeaderId>::Committed, Self::D, Self::NodeId, Self::Node>,
         SnapshotData = std::io::Cursor<Vec<u8>>, // M1: in-memory; M5 swaps to snapshot.region reader
         AsyncRuntime = openraft::impls::TokioRuntime,
 );
