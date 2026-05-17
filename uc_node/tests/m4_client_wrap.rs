@@ -5,9 +5,11 @@
 //! submit ring wraps ~6+ times, exercising the Phase 1 wrap-fix end-to-end.
 //!
 //! The increments are deterministic:
-//!   - client 1: Inc(0), Inc(1), …, Inc(499)     → sum = 0+1+…+499 = 124_750
-//!   - client 2: Inc(10_000), Inc(10_001), …      → sum = 10_000+…+10_499 = 5_124_750
-//!   total expected = 124_750 + 5_124_750 = 5_249_500
+//!
+//! - client 1: Inc(0), Inc(1), …, Inc(499)     → sum = 0+1+…+499 = 124_750
+//! - client 2: Inc(10_000), Inc(10_001), …      → sum = 10_000+…+10_499 = 5_124_750
+//!
+//! Total expected = 124_750 + 5_124_750 = 5_249_500
 //!
 //! Final value via `query_snapshot` must equal that sum regardless of
 //! interleaving order (all increments are additive and commutative).

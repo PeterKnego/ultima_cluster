@@ -442,8 +442,7 @@ mod tests {
         init_cnc(&mut mmap[..], "x", 0, 0).expect("init");
         let base = mmap.as_ptr();
         let ptr = unsafe { next_client_id_ptr(base) };
-        let counter: &'static std::sync::atomic::AtomicU64 =
-            unsafe { &*(ptr as *const std::sync::atomic::AtomicU64) };
+        let counter: &'static std::sync::atomic::AtomicU64 = unsafe { &*ptr };
 
         const THREADS: u64 = 8;
         const OPS_PER_THREAD: u64 = 1000;

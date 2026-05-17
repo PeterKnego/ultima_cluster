@@ -1875,7 +1875,16 @@ dependencies = [
 name = "uc_client"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "bytes",
+ "dashmap",
+ "memmap2",
+ "parking_lot",
+ "serde",
+ "tempfile",
  "thiserror",
+ "tokio",
+ "tracing",
  "uc_protocol",
 ]
 
@@ -1905,6 +1914,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uc_client",
  "uc_node",
  "uc_protocol",
  "uc_service",
