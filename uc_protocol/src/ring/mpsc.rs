@@ -9,6 +9,14 @@
 //!
 //! The consumer reads with Relaxed loads on its own `consumer_position`
 //! (single reader).
+//!
+//! ## Producer-panic invariant
+//!
+//! Producers must not panic between claim and publish: a panicking
+//! producer leaves a claimed-but-unpublished slot, and every subsequent
+//! producer will spin forever waiting for that slot to publish. In our
+//! deployment model an in-process panic implies an unrecoverable node
+//! state and process restart; ride along with that assumption.
 
 use std::path::Path;
 use std::sync::Arc;

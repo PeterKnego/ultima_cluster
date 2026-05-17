@@ -42,9 +42,9 @@
 //! limitation: a consumer can never see a slot offset whose bytes are
 //! still being written.
 //!
-//! The length-last-Release commit inside `write_record_at` remains —
-//! between `publish_position` advance and the consumer's record read,
-//! the in-record length-zero check is the final guard.
+//! The length-last-Release commit inside `write_record_at` remains as
+//! defense-in-depth; the primary torn-record guard is now the
+//! `publish_position` Release → consumer Acquire edge.
 
 use std::sync::atomic::AtomicU64;
 use thiserror::Error;
