@@ -89,11 +89,12 @@ impl<S: StateMachine> NodeBuilder<S> {
                 // service-side handshake watcher. Lifetimes are upheld by
                 // `instance` (moved into the NodeHandle) outliving both.
                 let (node_status_ptr, service_status_ptr) = status_ptrs(&instance.cnc_mmap);
-                // SendPtr lets us hold service_status_ptr across the awaits
-                // below; raw `*const T` is not `Send` on its own. The mmap
-                // backing the target outlives every consumer (cf. SAFETY
-                // notes on each `unsafe` block below).
+                // SendPtr lets us hold service_status_ptr and node_status_ptr
+                // across the awaits below; raw `*const T` is not `Send` on
+                // its own. The mmap backing the target outlives every consumer
+                // (cf. SAFETY notes on each `unsafe` block below).
                 let service_status = SendPtr(service_status_ptr);
+                let node_status = NodeSendPtr(node_status_ptr);
 
                 // SAFETY: `instance.cnc_mmap` is moved into the NodeHandle
                 // below and stays alive until shutdown stops + joins this
@@ -150,6 +151,21 @@ impl<S: StateMachine> NodeBuilder<S> {
                     )
                 };
                 handle.service_watcher = Some(watcher);
+
+                // Metrics publisher: copies raft metrics (term, leader,
+                // role, last_applied, last_committed) into NodeStatus cnc
+                // fields on every metrics change. Spawned after finish so
+                // we have a RaftHandle clone.
+                // SAFETY: node_status lives in `handle._instance` (the same
+                // mmap as service_status above); joined before `_instance`
+                // drops in shutdown().
+                let metrics_publisher = unsafe {
+                    crate::ipc::metrics_publisher::spawn_metrics_publisher(
+                        node_status.0,
+                        handle.raft.clone(),
+                    )
+                };
+                handle.metrics_publisher = Some(metrics_publisher);
 
                 // Client-facing dispatchers + session GC. Spawned after
                 // finish (need handle.raft clone) and after service_watcher
@@ -392,6 +408,7 @@ where
         node_liveness,
         query_link,
         service_watcher: None,
+        metrics_publisher: None,
         client_dispatcher: None,
         client_query_dispatcher: None,
         session_gc: None,
@@ -434,3 +451,13 @@ struct SendPtr(*const uc_protocol::cnc::ServiceStatus);
 
 // SAFETY: see SendPtr docs — invariant upheld at every consumer call site.
 unsafe impl Send for SendPtr {}
+
+/// `Send`-carrier for a `*const NodeStatus` used across the `start()`
+/// await chain. Same invariant as `SendPtr`: mmap stays pinned for the
+/// lifetime of every consumer.
+#[derive(Copy, Clone)]
+struct NodeSendPtr(*const uc_protocol::cnc::NodeStatus);
+
+// SAFETY: invariant upheld at every consumer call site — mmap lives in
+// `Instance` which is moved into `NodeHandle` and outlives all users.
+unsafe impl Send for NodeSendPtr {}

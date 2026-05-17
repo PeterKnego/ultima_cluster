@@ -24,6 +24,7 @@ pub mod client_link;
 pub mod handshake;
 pub mod instance;
 pub mod liveness;
+pub mod metrics_publisher;
 pub mod query_link;
 pub mod service_link;
 pub mod service_watcher;

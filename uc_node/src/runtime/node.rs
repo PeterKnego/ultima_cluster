@@ -19,6 +19,7 @@ use crate::ClusterError;
 use crate::config::{NodeConfig, NodeId};
 use crate::ipc::Instance;
 use crate::ipc::liveness::LivenessHandle;
+use crate::ipc::metrics_publisher::MetricsPublisherHandle;
 use crate::ipc::query_link::ShmemQueryLink;
 use crate::ipc::client_dispatcher::ClientDispatcherHandle;
 use crate::ipc::session_gc::SessionGcHandle;
@@ -162,6 +163,9 @@ pub struct NodeHandle<S: StateMachine> {
     /// Shmem-mode only: watches the service's heartbeat. Joined on
     /// shutdown before the cnc mmap drops.
     pub(crate) service_watcher: Option<ServiceWatcherHandle>,
+    /// Shmem-mode only: copies raft metrics into NodeStatus cnc fields.
+    /// Joined on shutdown before the cnc mmap drops.
+    pub(crate) metrics_publisher: Option<MetricsPublisherHandle>,
     /// Shmem-mode only: submit-ring dispatcher.
     pub(crate) client_dispatcher: Option<ClientDispatcherHandle>,
     /// Shmem-mode only: query-ring dispatcher.
@@ -333,9 +337,13 @@ impl<S: StateMachine> NodeHandle<S> {
             .map_err(|e| ClusterError::Raft(format!("shutdown: {:?}", e)))?;
         // Then the QUIC server (closes endpoint, awaits accept task).
         self.server.shutdown().await;
-        // Shmem-mode only: stop+join both cnc-mmap-holding tasks before
-        // `_instance` drops. Both hold `&'static` references into the
+        // Shmem-mode only: stop+join all cnc-mmap-holding tasks before
+        // `_instance` drops. These hold `&'static` references into the
         // cnc mmap that lives in `_instance`.
+        if let Some(p) = self.metrics_publisher {
+            p.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = p.join.await;
+        }
         if let Some(w) = self.service_watcher {
             w.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = w.join.await;
