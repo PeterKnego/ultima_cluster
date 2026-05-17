@@ -18,5 +18,9 @@ memmap2 = { workspace = true }
 tracing = { workspace = true }
 uc_protocol = { path = "../uc_protocol" }
 
+[features]
+default = []
+test-helpers = []
+
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -33,7 +33,7 @@ rand = { workspace = true }
 
 [dev-dependencies]
 uc_node = { path = ".", features = ["test-helpers"] }
-uc_client = { path = "../uc_client" }
+uc_client = { path = "../uc_client", features = ["test-helpers"] }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
 tracing-subscriber = { workspace = true }

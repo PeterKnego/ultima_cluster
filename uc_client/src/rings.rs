@@ -64,6 +64,10 @@ impl ClientRings {
 pub struct BroadcastReaderHandle {
     pub join: JoinHandle<()>,
     pub stop: Arc<AtomicBool>,
+    /// Pause flag for test-only slow-consumer simulation.
+    /// Read by the `_test_pause/resume_broadcast_reader` helpers on `Client`.
+    #[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
+    pub paused: Arc<AtomicBool>,
 }
 
 pub fn spawn_broadcast_reader(
@@ -72,11 +76,17 @@ pub fn spawn_broadcast_reader(
     in_flight: InFlight,
 ) -> BroadcastReaderHandle {
     let stop = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
     let stop_for_task = Arc::clone(&stop);
+    let paused_for_task = Arc::clone(&paused);
 
     let join = tokio::spawn(async move {
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
         while !stop_for_task.load(Ordering::Relaxed) {
+            if paused_for_task.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
             match consumer.try_read(&mut buf) {
                 Ok(Some(rec)) => {
                     let (cid, local_seq) = decode_extra_client(rec.header_extra);
@@ -116,5 +126,5 @@ pub fn spawn_broadcast_reader(
         }
     });
 
-    BroadcastReaderHandle { join, stop }
+    BroadcastReaderHandle { join, stop, paused }
 }

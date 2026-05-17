@@ -314,6 +314,25 @@ impl Client {
     }
 }
 
+#[cfg(any(test, feature = "test-helpers"))]
+impl Client {
+    /// Test-only: pause the broadcast reader so responses pile up in the
+    /// broadcast ring without being consumed. Simulates a slow consumer.
+    pub fn _test_pause_broadcast_reader(&self) {
+        if let Some(r) = self.broadcast_reader.lock().as_ref() {
+            r.paused.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Test-only: resume the broadcast reader paused via
+    /// `_test_pause_broadcast_reader`.
+    pub fn _test_resume_broadcast_reader(&self) {
+        if let Some(r) = self.broadcast_reader.lock().as_ref() {
+            r.paused.store(false, Ordering::Relaxed);
+        }
+    }
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
         // Signal all background tasks to stop. For the stall watchers we must

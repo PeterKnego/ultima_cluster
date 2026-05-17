@@ -301,11 +301,11 @@ async fn m4_client_leader_failover() {
     let mut new_leader_id: Option<u64> = None;
     'outer: while std::time::Instant::now() < new_leader_deadline {
         for &si in &surviving_indices {
-            if let Some(l) = clients[si].current_leader() {
-                if l != leader_id {
-                    new_leader_id = Some(l);
-                    break 'outer;
-                }
+            if let Some(l) = clients[si].current_leader()
+                && l != leader_id
+            {
+                new_leader_id = Some(l);
+                break 'outer;
             }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
