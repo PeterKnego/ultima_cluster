@@ -43,7 +43,8 @@
 | `uc_protocol/src/ring/spsc.rs` | Producer writes record then `publish_position.store(Release)`. Consumer reads up to `publish_position` (was `producer_position`). Header comment updated. |
 | `uc_protocol/src/ring/mpsc.rs` | Producer CAS-advances `claim_position` (was `producer_position`), writes record, spins until `publish_position == my_slot_start`, then advances `publish_position`. Consumer reads up to `publish_position`. Header comment loses the "do not use under wrap" warning. |
 | `uc_protocol/src/ring/broadcast.rs` | Single producer advances `claim_position` (claim), writes, then `publish_position.store(Release)`. Consumer reads up to `publish_position`; fall-behind check still uses publish position. Header comment loses the "wrap-race torn-record" caveat. |
-| `uc_protocol/src/cnc.rs` | Adds `sub::NEXT_CLIENT_ID = 4` index (renumbers M5 indices: `COUNTERS_METADATA = 5`, etc.); 16-byte sub-region (`AtomicU64` + 8-byte pad) appended after the two control rings; `cnc_file_size()` grows accordingly; `init_cnc` initializes counter to 1. **Renames the current `sub::CONTROL_TO_CLIENTS = 4` constant — it was an M5 placeholder, repurposed for `NEXT_CLIENT_ID` here.** |
+| `uc_protocol/src/cnc.rs` | Adds `sub::NEXT_CLIENT_ID = 4` index (renumbers M5 indices: `COUNTERS_METADATA = 5`, etc.); 16-byte sub-region (`AtomicU64` + 8-byte pad) appended after the two control rings; `cnc_file_size()` grows accordingly; `init_cnc` initializes counter to 1. **Renames the current `sub::CONTROL_TO_CLIENTS = 4` constant — it was an M5 placeholder, repurposed for `NEXT_CLIENT_ID` here.** Also widens `sub::SERVICE_STATUS` sub-buffer from 64 B to 512 B (8-slot services-table; slot 0 = today's `ServiceStatus`); adds `service_status_slot_ptr` accessor. |
+| `uc_protocol/src/frames/apply.rs`, `uc_protocol/src/frames/query.rs` | Retrofit with `service_id: u8` in `flags` byte 0; new `encode_flags_*`/`decode_flags_*` helpers; `ApplyFrameError::UnknownServiceId`/`QueryFrameError::UnknownServiceId` variants. M3 callsites updated to write `encode_flags_*(0)` explicitly. |
 | `uc_protocol/src/frames/mod.rs` | `pub mod client;`. |
 | `uc_node/src/ipc/mod.rs` | `pub mod client_link;` + `pub mod client_dispatcher;` + `pub mod session_gc;`. |
 | `uc_node/src/runtime/builder.rs` | Phase 3 wiring: `ClientLink::create`, spawn three dispatcher tasks, attach handles to `NodeHandle`. Bootstrap retry loop changes from fixed 5 ms to exponential backoff (M3.5 follow-up #2). |
@@ -526,11 +527,81 @@ git commit -m "test(uc_protocol): enable MPSC/Broadcast wrap regressions; drop s
 
 ## Phase 2 — `cnc.dat` extensions + `uc_protocol::frames::client`
 
-### Task 2.1: Add `next_client_id` sub-region to `cnc.dat`
+> **Multi-service shape addendum (2026-05-17 decision).** Phase 2 also widens `sub::SERVICE_STATUS` from a single 64 B slot to an 8-slot services-table (512 B total; slot 0 = today's `ServiceStatus`), and retrofits `service_id: u8` in `flags` byte 0 across all multi-service-bearing frames. v1 always writes `service_id = 0`; decoders reject non-zero with `UnknownServiceId(u8)`. See spec §"Forward compatibility: multi-service" for rationale. Concretely:
+> - **Task 2.1** also widens `sub::SERVICE_STATUS` sub-buffer size to `8 * STATUS_BLOCK_LEN` (Step 0 below, before the existing renumber).
+> - **Task 2.2** adds `encode_flags_client` / `decode_flags_client` and includes `service_id` in every new client frame's roundtrip test.
+> - **New Task 2.3** retrofits `frames::apply` and `frames::query` with `service_id` `flags`-byte helpers + decoder rejection.
+
+### Task 2.1: Widen `sub::SERVICE_STATUS` to services-table + add `next_client_id` sub-region to `cnc.dat`
 
 **Files:**
 - Modify: `uc_protocol/src/cnc.rs`
 - Test: `uc_protocol/src/cnc.rs` (tests module)
+
+- [ ] **Step 0: Widen `sub::SERVICE_STATUS` to a services-table**
+
+The single 64 B `ServiceStatus` slot becomes an 8-slot table; slot 0 holds today's status, slots 1..7 are zero-reserved for future multi-service rollout.
+
+Add a constant near `STATUS_BLOCK_LEN`:
+
+```rust
+/// Number of reserved slots in the services-table. v1 uses slot 0 only.
+pub const SERVICES_TABLE_SLOTS: usize = 8;
+
+/// Total size of the services-table sub-region.
+pub const SERVICES_TABLE_LEN: usize = SERVICES_TABLE_SLOTS * STATUS_BLOCK_LEN;
+```
+
+Add an accessor helper near `validate_cnc`:
+
+```rust
+/// Return a stable pointer to the `ServiceStatus` slot for `service_id`.
+/// Returns `None` if `service_id >= SERVICES_TABLE_SLOTS`.
+///
+/// # Safety
+///
+/// `cnc_base` must point at a fully-initialized cnc.dat mapping that
+/// outlives the returned reference.
+pub unsafe fn service_status_slot_ptr(
+    cnc_base: *const u8,
+    service_id: u8,
+) -> Option<*const ServiceStatus> {
+    if (service_id as usize) >= SERVICES_TABLE_SLOTS {
+        return None;
+    }
+    let header = unsafe { &*cnc_base.cast::<CncHeader>() };
+    let base_off = header.sub_buffer_offsets[sub::SERVICE_STATUS] as usize;
+    let slot_off = base_off + (service_id as usize) * STATUS_BLOCK_LEN;
+    Some(unsafe { cnc_base.add(slot_off) as *const ServiceStatus })
+}
+```
+
+Update `init_cnc`: `sub_buffer_sizes[sub::SERVICE_STATUS] = SERVICES_TABLE_LEN as u64` (was `STATUS_BLOCK_LEN as u64`); the offset stays where it is, but `off_control_to_service` must shift forward by `(SERVICES_TABLE_LEN - STATUS_BLOCK_LEN)` bytes. Zero-init the entire `SERVICES_TABLE_LEN` region. All existing `ServiceStatus` writers in `uc_node` and `uc_service` continue to write at the same base offset because they target slot 0.
+
+Step 3 (`cnc_file_size`) below must add `(SERVICES_TABLE_LEN - STATUS_BLOCK_LEN)` to the total (or restructure the formula to use `SERVICES_TABLE_LEN` directly — see updated formula in Step 3).
+
+Existing callers of `ServiceStatus` (in `uc_node::ipc`, `uc_service`): no immediate change. Convert callsites to `service_status_slot_ptr(base, 0)` opportunistically; an `unsafe { &*service_status_slot_ptr(base, 0).unwrap() }` is acceptable until M5 introduces multi-service runtime.
+
+Add a unit test:
+
+```rust
+#[test]
+fn services_table_has_eight_slots() {
+    let (mut mmap, _tmp) = mmap_file(cnc_file_size());
+    init_cnc(&mut mmap[..], "x", 0, 0).expect("init");
+    let base = mmap.as_ptr();
+    // SAFETY: just-initialized cnc.
+    for i in 0..SERVICES_TABLE_SLOTS as u8 {
+        let p = unsafe { service_status_slot_ptr(base, i) }
+            .unwrap_or_else(|| panic!("slot {i} should exist"));
+        // freshly zeroed
+        let s: &ServiceStatus = unsafe { &*p };
+        assert_eq!(s.last_applied.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(s.state.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+    assert!(unsafe { service_status_slot_ptr(base, SERVICES_TABLE_SLOTS as u8) }.is_none());
+}
+```
 
 - [ ] **Step 1: Renumber sub-buffer indices**
 
@@ -567,7 +638,7 @@ pub const NEXT_CLIENT_ID_REGION_LEN: usize = 16;
 pub const fn cnc_file_size() -> usize {
     CNC_HEADER_LEN
         + STATUS_BLOCK_LEN // node_status
-        + STATUS_BLOCK_LEN // service_status
+        + SERVICES_TABLE_LEN // M4: services-table (8 × STATUS_BLOCK_LEN; slot 0 = today's service_status)
         + RING_HEADER_LEN + CNC_CONTROL_RING_CAP as usize // control_to_service
         + RING_HEADER_LEN + CNC_CONTROL_RING_CAP as usize // control_to_node
         + NEXT_CLIENT_ID_REGION_LEN // M4: client identity allocator
@@ -576,17 +647,32 @@ pub const fn cnc_file_size() -> usize {
 
 - [ ] **Step 4: Init the region in `init_cnc`**
 
-In `init_cnc`, after computing `off_control_to_node`, add:
+Update the offset chain to account for the widened services-table:
 
 ```rust
+let off_node_status = CNC_HEADER_LEN as u64;
+let off_service_status = off_node_status + STATUS_BLOCK_LEN as u64;
+let off_control_to_service = off_service_status + SERVICES_TABLE_LEN as u64; // was + STATUS_BLOCK_LEN
+let off_control_to_node =
+    off_control_to_service + RING_HEADER_LEN as u64 + CNC_CONTROL_RING_CAP;
 let off_next_client_id = off_control_to_node + RING_HEADER_LEN as u64 + CNC_CONTROL_RING_CAP;
 ```
 
-Populate the sub-buffer table:
+Update the sub-buffer table:
 
 ```rust
+sub_buffer_offsets[sub::SERVICE_STATUS] = off_service_status;
+sub_buffer_sizes[sub::SERVICE_STATUS] = SERVICES_TABLE_LEN as u64; // was STATUS_BLOCK_LEN
+// ... (NODE_STATUS, CONTROL_TO_SERVICE, CONTROL_TO_NODE unchanged) ...
 sub_buffer_offsets[sub::NEXT_CLIENT_ID] = off_next_client_id;
 sub_buffer_sizes[sub::NEXT_CLIENT_ID] = NEXT_CLIENT_ID_REGION_LEN as u64;
+```
+
+Update the zero-fill: zero the full services-table, not just slot 0:
+
+```rust
+let ss_lo = off_service_status as usize;
+mmap[ss_lo..ss_lo + SERVICES_TABLE_LEN].fill(0); // was ..+ STATUS_BLOCK_LEN
 ```
 
 After the two `init_ring_header` calls, initialize the counter:
@@ -722,11 +808,19 @@ git commit -m "feat(uc_protocol): add next_client_id sub-region to cnc.dat (M4)"
 //!     client process; allocated via cnc.dat's `next_client_id` slot).
 //!   * bytes 4..8 — `local_seq` (u32 LE; per-client monotonic).
 //!
-//! Client query frames pack `QueryKind` into the 16-bit `flags` field
-//! (bit 0 = Linearizable | Snapshot; remaining bits reserved). The
-//! service-side query frame (`frames::query`) keeps a different
-//! `header_extra` shape — see that module — because it does not carry
-//! `client_id`.
+//! Client query frames pack `QueryKind` into bit 8 of the 16-bit `flags`
+//! field; bits 0..7 carry the multi-service `service_id: u8` (always `0`
+//! in v1). The service-side query frame (`frames::query`) keeps a
+//! different `header_extra` shape — see that module — because it does
+//! not carry `client_id`.
+//!
+//! `flags` layout (uniform across client frames and the M4-retrofit
+//! service frames):
+//!   * bits 0..7  — `service_id: u8` (always `0` in v1; decoders error
+//!     on `!= 0` with `UnknownServiceId`).
+//!   * bits 8..15 — type-specific. For `ClientQueryFrame`: bit 8 =
+//!     `QueryKind` (0 = Linearizable, 1 = Snapshot). For all other
+//!     frames: reserved (must be zero).
 //!
 //! `msg_type`:
 //!   * `5` — `SubmitFrame` (clients → node, MPSC `clients/submit.ring`)
@@ -744,8 +838,16 @@ pub const MSG_TYPE_CLIENT_QUERY: u16 = 7;
 pub const MSG_TYPE_CLIENT_QUERY_RESP: u16 = 8;
 pub const MSG_TYPE_NOT_LEADER_RESP: u16 = 9;
 
-/// `flags` bit assignments for client-query frames.
-pub const FLAG_QUERY_KIND_BIT: u16 = 1;
+/// `flags` bit assignments shared across all M4+ frames.
+pub const FLAGS_SERVICE_ID_MASK: u16 = 0x00FF;
+/// `flags` bit assignments for client-query frames (bit 8 of `flags`).
+pub const FLAG_QUERY_KIND_BIT: u16 = 0x0100;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClientFrameError {
+    #[error("unknown service_id: {0}")]
+    UnknownServiceId(u8),
+}
 
 #[inline]
 pub fn encode_extra_client(client_id: u32, local_seq: u32) -> [u8; 8] {
@@ -762,21 +864,35 @@ pub fn decode_extra_client(extra: [u8; 8]) -> (u32, u32) {
     (client_id, local_seq)
 }
 
+/// Encode `flags` for a client frame.
+///
+/// `service_id` rides in the low byte; `kind` (only meaningful for
+/// `ClientQueryFrame`) rides in bit 8. v1 always writes `service_id = 0`.
 #[inline]
-pub fn encode_flags_query_kind(kind: QueryKind) -> u16 {
-    match kind {
-        QueryKind::Linearizable => 0,
-        QueryKind::Snapshot => FLAG_QUERY_KIND_BIT,
+pub fn encode_flags_client(service_id: u8, kind: Option<QueryKind>) -> u16 {
+    let mut flags = service_id as u16;
+    if let Some(QueryKind::Snapshot) = kind {
+        flags |= FLAG_QUERY_KIND_BIT;
     }
+    flags
 }
 
+/// Decode the (service_id, kind) tuple from a client frame's `flags`.
+///
+/// Returns `UnknownServiceId(n)` on `service_id != 0` (v1 contract; M5+
+/// loosens this).
 #[inline]
-pub fn decode_flags_query_kind(flags: u16) -> QueryKind {
-    if flags & FLAG_QUERY_KIND_BIT == 0 {
+pub fn decode_flags_client(flags: u16) -> Result<(u8, QueryKind), ClientFrameError> {
+    let service_id = (flags & FLAGS_SERVICE_ID_MASK) as u8;
+    if service_id != 0 {
+        return Err(ClientFrameError::UnknownServiceId(service_id));
+    }
+    let kind = if flags & FLAG_QUERY_KIND_BIT == 0 {
         QueryKind::Linearizable
     } else {
         QueryKind::Snapshot
-    }
+    };
+    Ok((service_id, kind))
 }
 
 #[cfg(test)]
@@ -794,16 +910,27 @@ mod tests {
     }
 
     #[test]
-    fn flags_query_kind_round_trip() {
+    fn flags_round_trip_v1_service_zero() {
         for k in [QueryKind::Linearizable, QueryKind::Snapshot] {
-            let f = encode_flags_query_kind(k);
-            assert_eq!(decode_flags_query_kind(f), k);
+            let f = encode_flags_client(0, Some(k));
+            let (sid, got_k) = decode_flags_client(f).expect("v1 decode");
+            assert_eq!(sid, 0);
+            assert_eq!(got_k, k);
         }
-        // Other flag bits must be ignored:
-        assert_eq!(
-            decode_flags_query_kind(FLAG_QUERY_KIND_BIT | 0xfffe),
-            QueryKind::Snapshot
-        );
+        // No kind specified: defaults to Linearizable on decode.
+        let f = encode_flags_client(0, None);
+        let (sid, got_k) = decode_flags_client(f).expect("v1 decode");
+        assert_eq!(sid, 0);
+        assert_eq!(got_k, QueryKind::Linearizable);
+    }
+
+    #[test]
+    fn flags_rejects_nonzero_service_id() {
+        let f = encode_flags_client(7, Some(QueryKind::Linearizable));
+        assert!(matches!(
+            decode_flags_client(f),
+            Err(ClientFrameError::UnknownServiceId(7))
+        ));
     }
 }
 ```
@@ -828,9 +955,101 @@ git add uc_protocol/src/frames/client.rs uc_protocol/src/frames/mod.rs
 git commit -m "feat(uc_protocol): add frames::client (M4 wire types + header_extra codec)"
 ```
 
+### Task 2.3: Retrofit `frames::{apply, query}` with `service_id` (multi-service shape)
+
+**Files:**
+- Modify: `uc_protocol/src/frames/apply.rs`
+- Modify: `uc_protocol/src/frames/query.rs`
+
+Both modules currently leave `flags: u16` unused. This task adds `service_id: u8` in `flags` byte 0, matching the uniform convention introduced in Task 2.2. v1 callers always pass `service_id = 0`; decoders error on `!= 0`.
+
+- [ ] **Step 1: Extend `frames::apply`**
+
+Add to `uc_protocol/src/frames/apply.rs`:
+
+```rust
+/// Mask for the low byte of `flags`, where `service_id` lives.
+pub const FLAGS_SERVICE_ID_MASK: u16 = 0x00FF;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApplyFrameError {
+    #[error("unknown service_id: {0}")]
+    UnknownServiceId(u8),
+}
+
+#[inline]
+pub fn encode_flags_apply(service_id: u8) -> u16 {
+    service_id as u16
+}
+
+/// Decode `service_id` from an `ApplyFrame`/`ApplyRespFrame` `flags` field.
+/// Returns `UnknownServiceId(n)` on `service_id != 0` (v1 contract).
+#[inline]
+pub fn decode_flags_apply(flags: u16) -> Result<u8, ApplyFrameError> {
+    let service_id = (flags & FLAGS_SERVICE_ID_MASK) as u8;
+    if service_id != 0 {
+        return Err(ApplyFrameError::UnknownServiceId(service_id));
+    }
+    Ok(service_id)
+}
+
+#[cfg(test)]
+mod flags_tests {
+    use super::*;
+
+    #[test]
+    fn flags_round_trip_v1() {
+        let f = encode_flags_apply(0);
+        assert_eq!(decode_flags_apply(f).unwrap(), 0);
+    }
+
+    #[test]
+    fn flags_rejects_nonzero() {
+        let f = encode_flags_apply(3);
+        assert!(matches!(
+            decode_flags_apply(f),
+            Err(ApplyFrameError::UnknownServiceId(3))
+        ));
+    }
+}
+```
+
+Update the module header doc to mention the new `flags` layout (service_id in byte 0; high byte reserved).
+
+- [ ] **Step 2: Extend `frames::query`**
+
+Add the same `FLAGS_SERVICE_ID_MASK`, `QueryFrameError::UnknownServiceId(u8)` variant, and `encode_flags_query` / `decode_flags_query` helpers (mirror of apply). Update module doc header to note that `header_extra` still carries `(request_id, kind)` for backwards compatibility with the M3 `ipc::query_link` codec, and that the new `flags` byte 0 = `service_id`.
+
+Add unit tests mirroring `frames::apply`'s `flags_tests`.
+
+- [ ] **Step 3: Update M3 callsites to write `service_id = 0`**
+
+Search for `flags:` initializers in `uc_node` and `uc_service` for apply/query frame writes. Each should explicitly pass `encode_flags_apply(0)` / `encode_flags_query(0)` instead of the literal `0`, both to document the field and to centralize the encoding. (Functionally identical; readability + retrofit-completeness.)
+
+Run `rg "msg_type:\s*MSG_TYPE_(APPLY|QUERY)" uc_node uc_service` to enumerate writers; update each.
+
+Update the corresponding readers (`apply_loop`, `query_loop`, dispatcher consumers) to call `decode_flags_apply` / `decode_flags_query` and propagate the error path — for v1 this never fires, but the validation must exist now (otherwise M5+ migration to multi-service silently accepts garbage from older callers).
+
+- [ ] **Step 4: Run the tests**
+
+Run: `cargo test -p uc_protocol --lib frames`
+Expected: PASS (new tests + existing ones).
+
+Run: `cargo test --workspace`
+Expected: PASS — the `encode_flags_apply(0)`/`encode_flags_query(0)` retrofits must not regress M3 capstone tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add uc_protocol/src/frames/apply.rs uc_protocol/src/frames/query.rs uc_node uc_service
+git commit -m "feat(uc_protocol): add service_id flags-byte to apply/query frames (M4 multi-service shape)"
+```
+
 ---
 
 ## Phase 3 — node-side wiring
+
+> **Multi-service shape addendum.** Every dispatcher introduced in this phase MUST `decode_flags_client` (or `decode_flags_apply` / `decode_flags_query` for the service-side forwarding paths) on consumed frames. On `Err(UnknownServiceId(n))`: publish a `SubmitResponse` / `ClientQueryResp` carrying a bincode-encoded error payload (decoded by the client SDK as `ClientError::Submission("unknown service_id {n}")`). For v1 this path is unreachable in correct callers; the validation exists to make later multi-service rollout non-breaking.
 
 ### Task 3.1: `ipc::client_link` — create the three client-facing rings + `sessions.dir`
 

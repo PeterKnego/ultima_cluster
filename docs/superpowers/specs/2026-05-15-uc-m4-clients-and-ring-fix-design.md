@@ -29,6 +29,22 @@ After M4, an out-of-process `uc_client` binary on the same host as a `uc_node` +
 - **`snapshot.region` mmap.** M5.
 - **Multi-process (separate-OS-process) client tests.** M4 tests run all roles as tokio tasks in one process; the protocol works identically across process boundaries.
 - **Client SDK that auto-routes across multiple nodes** (option C from brainstorming). v1 surfaces `NotLeader { hint }` and lets callers decide; a `TestClient` helper that owns several handles can come later if helpful.
+- **Multi-service (multi-SMR on one log) runtime.** UC v1 is one `uc_service` per cluster. Aeron Sequencer's "multiple independently-deployed SMRs sharing one ordered log" is not a v1 goal; full parity (independent snapshot cadence, canary SMRs, active/active) is a 3–6 month effort tracked separately. **M4 reserves the protocol *shape*** (`service_id: u8` in `flags`; services-table in `cnc.dat`); see "Forward compatibility: multi-service" below. The runtime work — per-service dispatchers, per-service `StableValue`s, snapshot demux — stays deferred.
+
+## Forward compatibility: multi-service (decided 2026-05-17)
+
+UC may one day grow multi-SMR support (multiple `uc_service` processes sharing one Raft log, each with its own apply cursor and snapshot lineage — the Aeron Sequencer model). The full feature is out of scope for v1, but M4 reserves the shape so a future multi-service rollout is a *non-breaking* protocol bump rather than a wire-format major break. Two shape decisions:
+
+**`service_id: u8` in the low byte of `flags` on every multi-service-bearing frame.** Concretely:
+- `SubmitFrame`, `SubmitResponse`, `ClientQueryFrame`, `ClientQueryResp`, `NotLeaderResp` (client frames defined in M4).
+- `ApplyFrame`, `ApplyRespFrame`, `QueryFrame`, `QueryRespFrame` (service frames; `flags` field already unused).
+- `OutputFrame` (M5; reserved now).
+
+Encoding: `service_id = (flags & 0x00FF) as u8`. Type-specific bits live in `flags >> 8` (top byte). For `QueryFrame`/`ClientQueryFrame`, `QueryKind` moves from byte 4 of `header_extra` (current location for service-side query) into bit 8 of `flags` — uniform across both modules. v1: every encoder writes `service_id = 0`; every decoder errors on `service_id != 0` with `UnknownServiceId(u8)`. Rationale for low-byte: cnc services-table slot indices are byte-sized, so the field naturally indexes into the table. Rationale for `flags` (not `header_extra`): `ApplyFrame::header_extra` is fully consumed by `log_index: u64` with no room for a new field, and putting `service_id` in `flags` for all frames keeps the encoding uniform.
+
+**Services-table layout in `cnc.dat`.** `sub::SERVICE_STATUS` becomes a fixed-N-slot array (N = 8 reserved, sized = 8 × `STATUS_BLOCK_LEN` = 512 B) where slot `i` is a `ServiceStatus` for `service_id = i`. v1 reads/writes slot 0 only; multi-service later widens the active slot count without moving the sub-region or growing `cnc_file_size()`. `sub::SERVICE_STATUS` still names the same sub-buffer index — only the sub-buffer *size* changes (512 B vs 64 B today). New helper `service_status_slot(&cnc, service_id: u8) -> &ServiceStatus` returns the right slot pointer; callers indexed at `0` today.
+
+Neither change requires the multi-service runtime work (per-service dispatchers, per-service `StableValue`s, snapshot demux). The cost is one validated byte per frame and 448 B of extra `/dev/shm` in `cnc.dat`. Recorded as M4-shape, not M4-runtime: the dispatchers in Phase 3 still target a single service.
 
 ## Top-level decisions
 
@@ -38,6 +54,7 @@ After M4, an out-of-process `uc_client` binary on the same host as a `uc_node` +
 | Client identity | **`client_id: u32` from a `next_client_id: AtomicU64` slot in `cnc.dat`** (option A′; Aeron-style allocator) | One global counter, `fetch_add` at connect, no coordination beyond an atomic on an already-mapped page. Correlation `(client_id: u32, local_seq: u32)` packs into the existing 8-byte `header_extra` exactly — no payload-prefix steal, no wire-format growth. |
 | Leader routing in `Client` | **Surface `NotLeader { hint: Option<NodeId> }`; no auto-retry, no multi-handle SDK** (option A) | Matches the existing `ClientError` enum in §11 of the canonical design. Smallest SDK surface. Callers running multi-host typically don't have shared local access to all instance_dirs anyway. |
 | Response routing | **Broadcast filter by `client_id` in `header_extra`** | One reader task per Client, a `DashMap<local_seq, oneshot::Sender>` for in-flight submits, frames where `client_id != self.client_id` are discarded. |
+| Multi-service shape | **`service_id: u8` in low byte of `flags` on all bearing frames; `sub::SERVICE_STATUS` becomes an 8-slot table (slot 0 = today's status)** | Reserves a non-breaking multi-service bump. v1 encoders write 0; decoders error on `service_id != 0`. See the "Forward compatibility: multi-service" section. |
 
 ## Phase 1 — `uc_protocol::ring` wrap-fix
 
@@ -91,13 +108,17 @@ The existing `OverwrittenByProducer` signal (slow-consumer detection) stays unch
 
 ### `cnc.dat`
 
-Add one sub-buffer index: `sub::NEXT_CLIENT_ID` → 16-byte sub-region (8 bytes `AtomicU64` + 8 bytes `_pad`).
+Two changes vs M3:
+
+1. **`sub::SERVICE_STATUS` becomes an 8-slot services-table.** Sub-buffer size grows from `STATUS_BLOCK_LEN` (64 B) to `8 * STATUS_BLOCK_LEN` (512 B). The sub-buffer index (`sub::SERVICE_STATUS = 1`) is unchanged. Slot 0 holds today's `ServiceStatus`; slots 1..7 are zero-initialized and reserved for future multi-service rollout. New helper `service_status_slot(cnc_header: &CncHeader, mmap: &[u8], service_id: u8) -> Option<&ServiceStatus>` returns slot pointers; v1 call sites pass `0`. `cnc_file_size()` grows by 448 B.
+
+2. **`sub::NEXT_CLIENT_ID` → 16-byte sub-region** (8 bytes `AtomicU64` + 8 bytes `_pad`):
 
 ```
-[9: next_client_id]   AtomicU64 + pad   (16 bytes; clients fetch_add to allocate identity)
+[index sub::NEXT_CLIENT_ID]   AtomicU64 + pad   (16 bytes; clients fetch_add to allocate identity)
 ```
 
-`init_cnc` initializes the counter to 1 (so `client_id = 0` can mean "not allocated yet" in any future use). All other cnc layout stays identical to M3.
+`init_cnc` initializes the counter to 1 (so `client_id = 0` can mean "not allocated yet" in any future use). `sub::NEXT_CLIENT_ID` slots in at index 4 (taking the slot the M5 placeholder `CONTROL_TO_CLIENTS` used to hold; M5 indices renumber).
 
 This is the first cnc.dat region clients *write* (only via `fetch_add`). All other client-side cnc accesses remain read-only (status fields).
 
@@ -105,15 +126,27 @@ This is the first cnc.dat region clients *write* (only via `fetch_add`). All oth
 
 | `msg_type` | Frame | Ring | Direction |
 |---|---|---|---|
-| 5 | `SubmitFrame { client_id, local_seq → header_extra; cmd → payload }` | `clients/submit.ring` (MPSC) | clients → node |
-| 6 | `SubmitResponse { client_id, local_seq → header_extra; resp → payload }` | `clients/response.broadcast` | node → clients |
-| 7 | `ClientQueryFrame { client_id, local_seq → header_extra; kind in flags; query → payload }` | `clients/query.ring` (MPSC) | clients → node |
-| 8 | `ClientQueryResp { client_id, local_seq → header_extra; resp → payload }` | `clients/response.broadcast` | node → clients |
-| 9 | `NotLeaderResp { client_id, local_seq → header_extra; leader_hint → payload (Option<NodeId>) }` | `clients/response.broadcast` | node → clients |
+| 5 | `SubmitFrame { client_id, local_seq → header_extra; service_id → flags low byte; cmd → payload }` | `clients/submit.ring` (MPSC) | clients → node |
+| 6 | `SubmitResponse { client_id, local_seq → header_extra; service_id → flags low byte; resp → payload }` | `clients/response.broadcast` | node → clients |
+| 7 | `ClientQueryFrame { client_id, local_seq → header_extra; service_id → flags low byte; kind → flags bit 8; query → payload }` | `clients/query.ring` (MPSC) | clients → node |
+| 8 | `ClientQueryResp { client_id, local_seq → header_extra; service_id → flags low byte; resp → payload }` | `clients/response.broadcast` | node → clients |
+| 9 | `NotLeaderResp { client_id, local_seq → header_extra; service_id → flags low byte; leader_hint → payload (Option<NodeId>) }` | `clients/response.broadcast` | node → clients |
 
-`QueryKind` (Linearizable / Snapshot) rides in the 16-bit `flags` field (1 bit used; rest reserved). `header_extra` encoding helper: `encode_extra_client(client_id: u32, local_seq: u32) -> [u8; 8]` (LE).
+`flags` field layout (uniform across client and service frames going forward):
+- bits 0..7  — `service_id: u8` (always `0` in v1; decoders error on `!= 0`).
+- bits 8..15 — type-specific. For `ClientQueryFrame`: bit 8 = `QueryKind` (0 = Linearizable, 1 = Snapshot). For all other frames: reserved (must be zero).
 
-**Note on `header_extra` convention asymmetry** vs the M3 `frames::query` module: the service-side query frame packs `(request_id: u32, kind: u8, _pad: 3)` in `header_extra` because the service path has no `client_id` to carry. Client frames need both identity *and* sequence in the 8 bytes, so `kind` moves to `flags`. Different shapes, same 8-byte budget, isolated by module.
+`header_extra` encoding helper: `encode_extra_client(client_id: u32, local_seq: u32) -> [u8; 8]` (LE). `flags` helpers: `encode_flags_client(service_id: u8, kind: Option<QueryKind>) -> u16`, and `decode_flags_client(flags: u16) -> Result<(u8, Option<QueryKind>), ClientFrameError>`.
+
+### Service-side frame changes (`uc_protocol::frames::{apply, query}`)
+
+Both modules existed pre-M4 and use `header_extra` for `log_index` (apply) or `(request_id, kind, _pad)` (query). The `flags` field has been unused. M4 adds:
+
+- **`frames::apply`** (`ApplyFrame`, `ApplyRespFrame`): `service_id: u8` in `flags` low byte. `header_extra` unchanged (`log_index: u64`). New helpers `encode_flags_apply(service_id: u8) -> u16`, `decode_flags_apply(flags: u16) -> Result<u8, ApplyFrameError>` returning `ApplyFrameError::UnknownServiceId(u8)` on non-zero.
+- **`frames::query`** (`QueryFrame`, `QueryRespFrame`): `service_id: u8` in `flags` low byte. `QueryKind` *stays* in `header_extra` byte 4 for backwards compatibility with the M3 codec — moving it to `flags` would force a same-PR change to the M3 `ipc::query_link` codepath and isn't worth the churn. New helpers `encode_flags_query(service_id: u8) -> u16`, `decode_flags_query(flags: u16) -> Result<u8, QueryFrameError>`.
+- **`frames::snapshot`** (`BuildSnapshot`, `SnapshotBuilt`, M5): documented as `service_id` in flags low byte once snapshot wiring lands. Not implemented in M4.
+
+**Convention note:** every client- or service-side frame defined in M4+ reserves `flags` byte 0 for `service_id`. The pre-M3 `apply`/`query` frames are retrofitted to match.
 
 ## Phase 3 — node-side wiring (`uc_node`)
 
@@ -133,15 +166,16 @@ Also creates the `clients/sessions.dir/` directory at startup. Returns a struct 
 
 **`client_dispatcher`** (tokio task on the node):
 - Loop: read next frame from `clients/submit.ring` (MPSC consumer half).
-- If `raft.current_leader().await != Some(self.node_id)`: synthesize `NotLeaderResp { hint = raft.current_leader().await }`, publish to `response.broadcast` with the submitter's `header_extra`. Continue.
-- Else: bincode-decode is unnecessary — payload is already an opaque `Bytes` to `raft.client_write`. Await the response. On success: publish `SubmitResponse{client_id, local_seq, payload}` to `response.broadcast`.
+- Decode `service_id` from `flags`. If `service_id != 0`: publish `SubmitResponse` with an error payload encoding `Submission("unknown service_id {n}")` (v1 has only slot 0). The client's broadcast reader surfaces this as `ClientError::Submission`. Continue.
+- If `raft.current_leader().await != Some(self.node_id)`: synthesize `NotLeaderResp { hint = raft.current_leader().await }`, publish to `response.broadcast` with the submitter's `header_extra` and `service_id` preserved in `flags`. Continue.
+- Else: bincode-decode is unnecessary — payload is already an opaque `Bytes` to `raft.client_write`. Await the response. On success: publish `SubmitResponse{client_id, local_seq, payload}` to `response.broadcast` with `service_id = 0`.
 
 **`client_query_dispatcher`** (tokio task):
 - Loop: read next frame from `clients/query.ring`.
-- Decode `QueryKind` from `flags`.
-- If `Linearizable`: leader-only — `NotLeaderResp` if not leader; else `raft.ensure_linearizable().await`; then forward through the existing `ShmemQueryLink` to `service/query.ring`; relay response.
+- Decode `(service_id, QueryKind)` from `flags`. On `service_id != 0`: publish `ClientQueryResp` carrying an error-payload (same shape as `client_dispatcher` above). Continue.
+- If `Linearizable`: leader-only — `NotLeaderResp` if not leader; else `raft.ensure_linearizable().await`; then forward through the existing `ShmemQueryLink` to `service/query.ring` (passing `service_id = 0` in the service-side query frame's `flags`); relay response.
 - If `Snapshot`: forward directly through `ShmemQueryLink`; relay response.
-- Publish `ClientQueryResp` to `response.broadcast`.
+- Publish `ClientQueryResp` to `response.broadcast` with `service_id = 0`.
 
 Both dispatchers share the response Broadcast producer via a `parking_lot::Mutex` — Broadcast is single-producer-by-design, and the mutex enforces that at the type level. Lock is held briefly across one record write; no awaits.
 
@@ -276,7 +310,7 @@ All M3 capstone tests stay unchanged and pass.
 | Phase | Scope | Commits |
 |---|---|---|
 | 1 | `uc_protocol::ring::{mpsc, broadcast}` published-up-to / committed-head fix + regression tests. | 2-3 |
-| 2 | `uc_protocol::cnc` next_client_id slot + sub::NEXT_CLIENT_ID index. `uc_protocol::frames::client` module with the five new frame types + codec helpers. | 1-2 |
+| 2 | `uc_protocol::cnc`: 8-slot services-table (widens `sub::SERVICE_STATUS`); `next_client_id` slot + `sub::NEXT_CLIENT_ID` index. `uc_protocol::frames::client` module with the five new frame types + codec helpers. `service_id` retrofit on existing `frames::{apply, query}` (`flags`-byte helpers + decoder rejection). | 2-3 |
 | 3 | `uc_node::ipc::client_link` (rings + sessions.dir creation). `client_dispatcher`, `client_query_dispatcher`, `session_gc` tasks. NodeHandle/builder/shutdown wiring. | 3-4 |
 | 4 | `uc_client::Client` SDK: handshake, submit, query_linearizable, query_snapshot, broadcast reader, session ticker, stall watchers, shutdown. New `uc_client/Cargo.toml` deps: `tokio`, `bincode`, `bytes`, `serde`, `parking_lot`, `dashmap` (in-flight oneshot map), `memmap2`, `thiserror`, `tracing`. | 3-4 |
 | 5 | Integration tests `m4_client_*` (seven scenarios). | 4-5 |

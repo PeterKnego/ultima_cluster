@@ -30,3 +30,4 @@ target
 /target
 /.claude/settings.local.json
 /.idea/
+/.private/
