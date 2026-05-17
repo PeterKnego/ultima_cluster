@@ -5,7 +5,7 @@
 //! `validate_cnc` returns; only the `next_client_id` sub-region is mutated.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use memmap2::MmapMut;
 use uc_protocol::ProtocolVersion;
@@ -19,7 +19,9 @@ pub struct CncAttach {
     pub _mmap: MmapMut,
     pub base: *const u8,
     pub instance_id: u128,
+    #[allow(dead_code)]
     pub app_id: String,
+    #[allow(dead_code)]
     pub protocol_version: u32,
     pub client_id: u32,
 }

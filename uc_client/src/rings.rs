@@ -21,6 +21,7 @@ use uc_protocol::ring::mpsc::{MpscProducer, MpscRing};
 use crate::ClientError;
 
 pub type ResponseSender = oneshot::Sender<RawResponse>;
+#[allow(dead_code)]
 pub type ResponseReceiver = oneshot::Receiver<RawResponse>;
 pub type InFlight = Arc<DashMap<u32, ResponseSender>>;
 
