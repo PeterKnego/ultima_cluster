@@ -267,9 +267,15 @@ async fn m4_client_leader_failover() {
     // instance_dirs keeps the same order; retain it for directory access.
 
     // Shut down the leader's node first (raft shuts down; heartbeat stops).
-    dead_leader_node.shutdown().await.expect("dead leader node shutdown");
+    dead_leader_node
+        .shutdown()
+        .await
+        .expect("dead leader node shutdown");
     // Also shut down its service (it's now orphaned).
-    dead_leader_svc.shutdown().await.expect("dead leader svc shutdown");
+    dead_leader_svc
+        .shutdown()
+        .await
+        .expect("dead leader svc shutdown");
 
     // ── Dead-leader's client should detect NodeStalled ─────────────────────
     // The heartbeat ticker on the dead node has stopped. The client's stall
@@ -310,9 +316,12 @@ async fn m4_client_leader_failover() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let new_leader_id = new_leader_id
-        .expect("surviving nodes should elect a new leader within 30s");
-    assert_ne!(new_leader_id, leader_id, "new leader must differ from the old one");
+    let new_leader_id =
+        new_leader_id.expect("surviving nodes should elect a new leader within 30s");
+    assert_ne!(
+        new_leader_id, leader_id,
+        "new leader must differ from the old one"
+    );
 
     // ── Submit through a surviving client, retrying until the new leader
     // confirms quorum (it may briefly return NotLeader while stabilising). ──
@@ -345,7 +354,10 @@ async fn m4_client_leader_failover() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(post_failover_ok, "post-failover submit did not succeed within 15s");
+    assert!(
+        post_failover_ok,
+        "post-failover submit did not succeed within 15s"
+    );
 
     // ── Shutdown ────────────────────────────────────────────────────────────
     // Clients (all three, including the dead-leader's — it's just connected

@@ -130,7 +130,12 @@ mod tests {
         let (_, mut consumer) = service_side.into_split();
 
         link.apply_producer
-            .try_write(MSG_TYPE_APPLY, encode_flags_apply(0), encode_extra_apply(99), b"hello")
+            .try_write(
+                MSG_TYPE_APPLY,
+                encode_flags_apply(0),
+                encode_extra_apply(99),
+                b"hello",
+            )
             .expect("write");
 
         let mut buf = Vec::new();
@@ -156,7 +161,12 @@ mod tests {
         let (mut producer, _) = service_side.into_split();
 
         producer
-            .try_write(MSG_TYPE_APPLY_RESP, encode_flags_apply(0), encode_extra_apply(42), b"ok")
+            .try_write(
+                MSG_TYPE_APPLY_RESP,
+                encode_flags_apply(0),
+                encode_extra_apply(42),
+                b"ok",
+            )
             .expect("write");
 
         let mut buf = Vec::new();

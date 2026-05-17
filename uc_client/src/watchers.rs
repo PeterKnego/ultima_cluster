@@ -47,10 +47,8 @@ pub unsafe fn spawn_stall_watchers(
         let stop = Arc::clone(&stop);
         tokio::spawn(async move {
             let init_ns = now_ns();
-            let mut w = HeartbeatWatcher::new(
-                node_ref.heartbeat_seq.load(Ordering::Relaxed),
-                init_ns,
-            );
+            let mut w =
+                HeartbeatWatcher::new(node_ref.heartbeat_seq.load(Ordering::Relaxed), init_ns);
             while !stop.load(Ordering::Relaxed) {
                 let alive = w.poll_node(node_ref, now_ns(), DEFAULT_TIMEOUT.as_nanos() as u64);
                 stalled.store(!alive, Ordering::Relaxed);
@@ -63,13 +61,10 @@ pub unsafe fn spawn_stall_watchers(
         let stop = Arc::clone(&stop);
         tokio::spawn(async move {
             let init_ns = now_ns();
-            let mut w = HeartbeatWatcher::new(
-                svc_ref.heartbeat_seq.load(Ordering::Relaxed),
-                init_ns,
-            );
+            let mut w =
+                HeartbeatWatcher::new(svc_ref.heartbeat_seq.load(Ordering::Relaxed), init_ns);
             while !stop.load(Ordering::Relaxed) {
-                let alive =
-                    w.poll_service(svc_ref, now_ns(), DEFAULT_TIMEOUT.as_nanos() as u64);
+                let alive = w.poll_service(svc_ref, now_ns(), DEFAULT_TIMEOUT.as_nanos() as u64);
                 stalled.store(!alive, Ordering::Relaxed);
                 tokio::time::sleep(POLL_PERIOD).await;
             }

@@ -114,9 +114,8 @@ async fn m4_client_wrap() {
         },
     };
 
-    let node_task = tokio::spawn(async move {
-        NodeBuilder::new(cfg, Counter::default()).start().await
-    });
+    let node_task =
+        tokio::spawn(async move { NodeBuilder::new(cfg, Counter::default()).start().await });
     wait_for_path(&instance_dir.join("cnc.dat"), Duration::from_secs(5)).await;
 
     let svc_cfg = ServiceConfig {
@@ -125,9 +124,8 @@ async fn m4_client_wrap() {
         data_dir: svc_data.path().to_owned(),
         ..ServiceConfig::default()
     };
-    let svc_task = tokio::spawn(async move {
-        ServiceBuilder::new(svc_cfg, Counter::default()).run().await
-    });
+    let svc_task =
+        tokio::spawn(async move { ServiceBuilder::new(svc_cfg, Counter::default()).run().await });
 
     let node = tokio::time::timeout(Duration::from_secs(15), node_task)
         .await

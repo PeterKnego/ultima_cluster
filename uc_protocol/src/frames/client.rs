@@ -98,7 +98,13 @@ mod tests {
 
     #[test]
     fn header_extra_round_trip() {
-        for (cid, seq) in [(0u32, 0u32), (1, 0), (0, 1), (0xdead_beef, 0xcafe_babe), (u32::MAX, u32::MAX)] {
+        for (cid, seq) in [
+            (0u32, 0u32),
+            (1, 0),
+            (0, 1),
+            (0xdead_beef, 0xcafe_babe),
+            (u32::MAX, u32::MAX),
+        ] {
             let extra = encode_extra_client(cid, seq);
             let (got_cid, got_seq) = decode_extra_client(extra);
             assert_eq!(got_cid, cid);

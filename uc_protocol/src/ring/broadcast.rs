@@ -96,9 +96,7 @@ impl BroadcastProducer {
             }
             let padded_pos = producer_pos + bytes_to_tail as u64;
             header.claim_position.store(padded_pos, Ordering::Relaxed);
-            header
-                .publish_position
-                .store(padded_pos, Ordering::Release);
+            header.publish_position.store(padded_pos, Ordering::Release);
             return self.write(msg_type, flags, header_extra, payload);
         }
 
@@ -231,11 +229,7 @@ impl BroadcastRing {
     /// subscribers do not see historical records (broadcast is
     /// "join-and-listen").
     pub fn subscribe(&self) -> BroadcastConsumer {
-        let head = self
-            .inner
-            .header()
-            .publish_position
-            .load(Ordering::Acquire);
+        let head = self.inner.header().publish_position.load(Ordering::Acquire);
         BroadcastConsumer {
             inner: self.inner.clone(),
             head,

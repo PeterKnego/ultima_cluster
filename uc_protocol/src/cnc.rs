@@ -177,8 +177,7 @@ pub fn init_cnc(
     let off_control_to_service = off_service_status + SERVICES_TABLE_LEN as u64;
     let off_control_to_node =
         off_control_to_service + RING_HEADER_LEN as u64 + CNC_CONTROL_RING_CAP;
-    let off_next_client_id =
-        off_control_to_node + RING_HEADER_LEN as u64 + CNC_CONTROL_RING_CAP;
+    let off_next_client_id = off_control_to_node + RING_HEADER_LEN as u64 + CNC_CONTROL_RING_CAP;
 
     let mut sub_buffer_offsets = [0u64; 8];
     let mut sub_buffer_sizes = [0u64; 8];
@@ -462,9 +461,6 @@ mod tests {
         }
         // Started at 1; each of THREADS * OPS_PER_THREAD increments applied.
         let expected = 1 + THREADS * OPS_PER_THREAD;
-        assert_eq!(
-            counter.load(std::sync::atomic::Ordering::Relaxed),
-            expected
-        );
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), expected);
     }
 }

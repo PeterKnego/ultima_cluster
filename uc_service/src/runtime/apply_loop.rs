@@ -16,8 +16,8 @@ use std::time::Duration;
 use bincode::config::standard as bincode_standard;
 use parking_lot::Mutex;
 use uc_protocol::frames::apply::{
-    MSG_TYPE_APPLY, MSG_TYPE_APPLY_RESP, decode_extra_apply, decode_flags_apply, encode_extra_apply,
-    encode_flags_apply,
+    MSG_TYPE_APPLY, MSG_TYPE_APPLY_RESP, decode_extra_apply, decode_flags_apply,
+    encode_extra_apply, encode_flags_apply,
 };
 use uc_protocol::ring::RingError;
 use uc_protocol::ring::spsc::{SpscConsumer, SpscProducer};

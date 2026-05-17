@@ -43,8 +43,8 @@ impl CncAttach {
         // read-only after validate_cnc returns.
         let mmap = unsafe { MmapMut::map_mut(&file)? };
 
-        let header = validate_cnc(&mmap)
-            .map_err(|e| ClientError::Decode(format!("cnc validate: {e}")))?;
+        let header =
+            validate_cnc(&mmap).map_err(|e| ClientError::Decode(format!("cnc validate: {e}")))?;
         let actual_app_id = header.app_id_str().to_owned();
         if actual_app_id != expected_app_id {
             return Err(ClientError::AppIdMismatch {
@@ -82,7 +82,8 @@ impl CncAttach {
         // SAFETY: header validated; sub-buffer offsets are within the mmap.
         unsafe {
             let header = &*self.base.cast::<CncHeader>();
-            self.base.add(header.sub_buffer_offsets[sub::NODE_STATUS] as usize)
+            self.base
+                .add(header.sub_buffer_offsets[sub::NODE_STATUS] as usize)
                 as *const NodeStatus
         }
     }

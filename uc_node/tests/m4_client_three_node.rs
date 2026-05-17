@@ -258,17 +258,12 @@ async fn m4_client_three_node() {
         if i == leader_idx {
             continue;
         }
-        let err = c
-            .submit::<Cmd, Resp>(&Cmd::Inc(10))
-            .await
-            .unwrap_err();
+        let err = c.submit::<Cmd, Resp>(&Cmd::Inc(10)).await.unwrap_err();
         match err {
             ClientError::NotLeader { hint: Some(l) } => {
                 assert_eq!(l, leader_id, "follower {i}: wrong leader hint")
             }
-            e => panic!(
-                "follower {i}: expected NotLeader{{hint: Some({leader_id})}}, got {e:?}"
-            ),
+            e => panic!("follower {i}: expected NotLeader{{hint: Some({leader_id})}}, got {e:?}"),
         }
     }
 

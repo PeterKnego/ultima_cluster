@@ -50,15 +50,10 @@ impl ClientLink {
         let clients_dir = instance_dir.join("clients");
         std::fs::create_dir_all(clients_dir.join("sessions.dir"))?;
 
-        let submit =
-            MpscRing::create(&clients_dir.join("submit.ring"), cap_bytes, max_msg)?;
-        let query =
-            MpscRing::create(&clients_dir.join("query.ring"), cap_bytes, max_msg)?;
-        let response = BroadcastRing::create(
-            &clients_dir.join("response.broadcast"),
-            cap_bytes,
-            max_msg,
-        )?;
+        let submit = MpscRing::create(&clients_dir.join("submit.ring"), cap_bytes, max_msg)?;
+        let query = MpscRing::create(&clients_dir.join("query.ring"), cap_bytes, max_msg)?;
+        let response =
+            BroadcastRing::create(&clients_dir.join("response.broadcast"), cap_bytes, max_msg)?;
 
         let (_, submit_consumer) = submit.into_split();
         let (_, query_consumer) = query.into_split();

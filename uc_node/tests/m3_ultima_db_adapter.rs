@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use ultima_db::Store;
 
-use uc_node::{BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning, TlsConfig};
+use uc_node::{
+    BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning, TlsConfig,
+};
 use uc_service::ServiceBuilder;
 use uc_service::runtime::ServiceConfig;
 use uc_service::ultima_db::StoreStateMachine;

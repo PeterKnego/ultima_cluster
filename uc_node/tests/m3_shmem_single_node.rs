@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
-use uc_node::{BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning, TlsConfig};
+use uc_node::{
+    BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning, TlsConfig,
+};
 use uc_service::runtime::ServiceConfig;
 use uc_service::{ServiceBuilder, SnapshotError, StateMachine};
 

@@ -126,12 +126,7 @@ impl MpscProducer {
             let target_pos = claim_pos + claim_size as u64;
             if header
                 .claim_position
-                .compare_exchange_weak(
-                    claim_pos,
-                    target_pos,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(claim_pos, target_pos, Ordering::AcqRel, Ordering::Relaxed)
                 .is_err()
             {
                 continue; // raced with another producer; retry
@@ -166,9 +161,7 @@ impl MpscProducer {
             while header.publish_position.load(Ordering::Acquire) != claim_pos {
                 std::hint::spin_loop();
             }
-            header
-                .publish_position
-                .store(target_pos, Ordering::Release);
+            header.publish_position.store(target_pos, Ordering::Release);
 
             if claim_size != advance {
                 // Padding marker published; loop to claim the real record.

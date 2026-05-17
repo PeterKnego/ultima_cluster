@@ -6,10 +6,10 @@
 pub mod error;
 pub use error::ClientError;
 
+mod client;
 mod cnc;
 mod rings;
 mod session;
 mod watchers;
-mod client;
 
 pub use client::Client;

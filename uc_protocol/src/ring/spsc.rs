@@ -137,9 +137,7 @@ impl SpscProducer {
             }
             let padded_pos = producer_pos + bytes_to_tail as u64;
             header.claim_position.store(padded_pos, Ordering::Relaxed);
-            header
-                .publish_position
-                .store(padded_pos, Ordering::Release);
+            header.publish_position.store(padded_pos, Ordering::Release);
             return self.try_write(msg_type, flags, header_extra, payload);
         }
 

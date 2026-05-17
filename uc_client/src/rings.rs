@@ -97,7 +97,9 @@ pub fn spawn_broadcast_reader(
                     let msg_type = rec.msg_type;
                     let ok = matches!(
                         msg_type,
-                        MSG_TYPE_SUBMIT_RESPONSE | MSG_TYPE_CLIENT_QUERY_RESP | MSG_TYPE_NOT_LEADER_RESP
+                        MSG_TYPE_SUBMIT_RESPONSE
+                            | MSG_TYPE_CLIENT_QUERY_RESP
+                            | MSG_TYPE_NOT_LEADER_RESP
                     );
                     if !ok {
                         continue;
@@ -110,8 +112,7 @@ pub fn spawn_broadcast_reader(
                 Ok(None) => tokio::time::sleep(Duration::from_micros(100)).await,
                 Err(RingError::Overwritten) => {
                     // Drain every in-flight with Overwritten.
-                    let drained: Vec<u32> =
-                        in_flight.iter().map(|e| *e.key()).collect();
+                    let drained: Vec<u32> = in_flight.iter().map(|e| *e.key()).collect();
                     for k in drained {
                         if let Some((_, tx)) = in_flight.remove(&k) {
                             let _ = tx.send(RawResponse::Overwritten);

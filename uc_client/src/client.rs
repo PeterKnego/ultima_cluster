@@ -54,9 +54,7 @@ impl Client {
 
         // SAFETY: cnc Arc keeps the mmap alive until shutdown joins
         // the watchers via Drop or explicit shutdown().
-        let watchers = unsafe {
-            spawn_stall_watchers(cnc.node_status(), cnc.service_status())
-        };
+        let watchers = unsafe { spawn_stall_watchers(cnc.node_status(), cnc.service_status()) };
 
         Ok(Client {
             cnc,
@@ -100,17 +98,28 @@ impl Client {
         let payload = bincode::serde::encode_to_vec(cmd, bincode::config::standard())?;
         let flags = encode_flags_client(0, None);
         let raw = self
-            .send_and_await(MSG_TYPE_SUBMIT, payload, flags, /*on_query_ring*/ false)
+            .send_and_await(
+                MSG_TYPE_SUBMIT,
+                payload,
+                flags,
+                /*on_query_ring*/ false,
+            )
             .await?;
         match raw {
-            RawResponse::Record { msg_type: MSG_TYPE_SUBMIT_RESPONSE, payload } => {
+            RawResponse::Record {
+                msg_type: MSG_TYPE_SUBMIT_RESPONSE,
+                payload,
+            } => {
                 let (resp, _) = bincode::serde::decode_from_slice::<R, _>(
                     payload.as_ref(),
                     bincode::config::standard(),
                 )?;
                 Ok(resp)
             }
-            RawResponse::Record { msg_type: MSG_TYPE_NOT_LEADER_RESP, payload } => {
+            RawResponse::Record {
+                msg_type: MSG_TYPE_NOT_LEADER_RESP,
+                payload,
+            } => {
                 let (hint, _) = bincode::serde::decode_from_slice::<Option<u64>, _>(
                     payload.as_ref(),
                     bincode::config::standard(),
@@ -150,17 +159,28 @@ impl Client {
         let payload = bincode::serde::encode_to_vec(q, bincode::config::standard())?;
         let flags = encode_flags_client(0, Some(kind));
         let raw = self
-            .send_and_await(MSG_TYPE_CLIENT_QUERY, payload, flags, /*on_query_ring*/ true)
+            .send_and_await(
+                MSG_TYPE_CLIENT_QUERY,
+                payload,
+                flags,
+                /*on_query_ring*/ true,
+            )
             .await?;
         match raw {
-            RawResponse::Record { msg_type: MSG_TYPE_CLIENT_QUERY_RESP, payload } => {
+            RawResponse::Record {
+                msg_type: MSG_TYPE_CLIENT_QUERY_RESP,
+                payload,
+            } => {
                 let (resp, _) = bincode::serde::decode_from_slice::<QR, _>(
                     payload.as_ref(),
                     bincode::config::standard(),
                 )?;
                 Ok(resp)
             }
-            RawResponse::Record { msg_type: MSG_TYPE_NOT_LEADER_RESP, payload } => {
+            RawResponse::Record {
+                msg_type: MSG_TYPE_NOT_LEADER_RESP,
+                payload,
+            } => {
                 let (hint, _) = bincode::serde::decode_from_slice::<Option<u64>, _>(
                     payload.as_ref(),
                     bincode::config::standard(),
@@ -195,8 +215,7 @@ impl Client {
             let result = {
                 let g = self.rings.lock();
                 if on_query_ring {
-                    g.query_producer
-                        .try_write(msg_type, flags, extra, &payload)
+                    g.query_producer.try_write(msg_type, flags, extra, &payload)
                 } else {
                     g.submit_producer
                         .try_write(msg_type, flags, extra, &payload)

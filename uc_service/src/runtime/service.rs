@@ -365,7 +365,12 @@ mod tests {
         // ── apply round-trip: send delta=5 at log_index=1 ────────────────
         let cmd_bytes = bincode::serde::encode_to_vec(5u64, bincode::config::standard()).unwrap();
         apply_producer
-            .try_write(MSG_TYPE_APPLY, encode_flags_apply(0), encode_extra_apply(1), &cmd_bytes)
+            .try_write(
+                MSG_TYPE_APPLY,
+                encode_flags_apply(0),
+                encode_extra_apply(1),
+                &cmd_bytes,
+            )
             .expect("apply write");
 
         let resp_rec = poll_blocking_read(&mut apply_resp_consumer).await;
@@ -378,7 +383,12 @@ mod tests {
         // Apply again at log_index=2 to confirm the loop keeps draining.
         let cmd_bytes = bincode::serde::encode_to_vec(3u64, bincode::config::standard()).unwrap();
         apply_producer
-            .try_write(MSG_TYPE_APPLY, encode_flags_apply(0), encode_extra_apply(2), &cmd_bytes)
+            .try_write(
+                MSG_TYPE_APPLY,
+                encode_flags_apply(0),
+                encode_extra_apply(2),
+                &cmd_bytes,
+            )
             .expect("apply write");
         let resp_rec = poll_blocking_read(&mut apply_resp_consumer).await;
         let (resp_value, _): (u64, _) =

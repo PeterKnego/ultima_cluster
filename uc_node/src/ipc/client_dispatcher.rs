@@ -100,12 +100,7 @@ where
                         Err(e) => {
                             use openraft::error::{ClientWriteError, RaftError};
                             if let RaftError::APIError(ClientWriteError::ForwardToLeader(f)) = &e {
-                                broadcast_not_leader(
-                                    &response_producer,
-                                    extra,
-                                    f.leader_id,
-                                )
-                                .await;
+                                broadcast_not_leader(&response_producer, extra, f.leader_id).await;
                             } else {
                                 tracing::warn!(node_id, error = ?e, "client_write failed; dropping");
                             }

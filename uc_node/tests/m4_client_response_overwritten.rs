@@ -121,9 +121,8 @@ async fn m4_client_response_overwritten() {
         },
     };
 
-    let node_task = tokio::spawn(async move {
-        NodeBuilder::new(cfg, Counter::default()).start().await
-    });
+    let node_task =
+        tokio::spawn(async move { NodeBuilder::new(cfg, Counter::default()).start().await });
     wait_for_path(&instance_dir.join("cnc.dat"), Duration::from_secs(5)).await;
 
     let svc_cfg = ServiceConfig {
@@ -132,9 +131,8 @@ async fn m4_client_response_overwritten() {
         data_dir: svc_data.path().to_owned(),
         ..ServiceConfig::default()
     };
-    let svc_task = tokio::spawn(async move {
-        ServiceBuilder::new(svc_cfg, Counter::default()).run().await
-    });
+    let svc_task =
+        tokio::spawn(async move { ServiceBuilder::new(svc_cfg, Counter::default()).run().await });
 
     let node = tokio::time::timeout(Duration::from_secs(15), node_task)
         .await
@@ -158,7 +156,9 @@ async fn m4_client_response_overwritten() {
 
     // ── Connect clients ─────────────────────────────────────────────────────
     let slow = Client::connect(&instance_dir, &app_id).await.expect("slow");
-    let driver = Client::connect(&instance_dir, &app_id).await.expect("driver");
+    let driver = Client::connect(&instance_dir, &app_id)
+        .await
+        .expect("driver");
 
     // Warm-up: a few driver submits to confirm the pipeline is live.
     for _ in 0..3 {
@@ -173,9 +173,8 @@ async fn m4_client_response_overwritten() {
     // task without moving ownership prematurely.
     let slow_arc = Arc::new(slow);
     let slow_for_task = Arc::clone(&slow_arc);
-    let pending_submit = tokio::spawn(async move {
-        slow_for_task.submit::<Cmd, Resp>(&Cmd::Inc(42)).await
-    });
+    let pending_submit =
+        tokio::spawn(async move { slow_for_task.submit::<Cmd, Resp>(&Cmd::Inc(42)).await });
 
     // Give the submit time to write its SubmitFrame and for the dispatcher to
     // publish the SubmitResponse into the broadcast ring.
