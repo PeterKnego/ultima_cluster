@@ -27,6 +27,7 @@ pub mod liveness;
 pub mod query_link;
 pub mod service_link;
 pub mod service_watcher;
+pub mod session_gc;
 
 pub use handshake::HandshakeError;
 pub use instance::{Instance, IpcError};
