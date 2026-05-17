@@ -316,10 +316,7 @@ mod tests {
     /// Single producer + 2 consumers; wrap several times. Both consumers must
     /// see every record that the producer has not yet lapped them on.
     ///
-    /// NOTE: this race is timing-dependent and reliably reproduces only under
-    /// `--release`. Run with `cargo test --release -p uc_protocol -- --ignored
-    /// ring::broadcast::tests::wrap_no_torn_read` to validate.
-    #[ignore = "regression for M4 wrap-fix; un-ignore in Task 1.5"]
+    /// NOTE: this race is timing-dependent and most visible under `--release`.
     #[test]
     fn wrap_no_torn_read() {
         let tmp = NamedTempFile::new().unwrap();
@@ -370,10 +367,13 @@ mod tests {
         let b_handle = reader(sub_b, stop.clone());
 
         // Writer: 1000 records, ~24 B each => ~6 wraps on a 4 KiB ring.
+        // yield_now between writes gives reader threads schedule time so they
+        // can keep pace and meaningfully exercise the wrap-race code path.
         let writer = std::thread::spawn(move || {
             for i in 0..1000u32 {
                 let payload = i.to_le_bytes();
                 producer.write(1, 0, [0; 8], &payload).expect("write");
+                std::thread::yield_now();
             }
         });
 

@@ -300,9 +300,8 @@ mod tests {
 
     #[test]
     fn many_producers_one_consumer_no_wrap() {
-        // Stays comfortably within the first generation to avoid the
-        // documented post-wrap torn-record race. 8 threads × 50 msgs ×
-        // ~24 bytes ≈ 10 KB, ring is 64 KB.
+        // Stays comfortably within the first generation (no wrap).
+        // 8 threads × 50 msgs × ~24 bytes ≈ 10 KB, ring is 64 KB.
         let tmp = NamedTempFile::new().unwrap();
         let ring = MpscRing::create(tmp.path(), 65536, 1024).expect("create");
         let (producer, mut consumer) = ring.into_split();
@@ -350,10 +349,7 @@ mod tests {
     /// capacity) forces many wraps. Verifies the post-wrap torn-record race
     /// is gone: every record written is read back exactly once, no panics.
     ///
-    /// NOTE: this race is timing-dependent and reliably reproduces only under
-    /// `--release`. Run with `cargo test --release -p uc_protocol -- --ignored
-    /// ring::mpsc::tests::wrap_under_many_producers_no_torn_read` to validate.
-    #[ignore = "regression for M4 wrap-fix; un-ignore in Task 1.5"]
+    /// NOTE: this race is timing-dependent and most visible under `--release`.
     #[test]
     fn wrap_under_many_producers_no_torn_read() {
         let tmp = NamedTempFile::new().unwrap();
