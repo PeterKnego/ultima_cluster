@@ -334,4 +334,55 @@ mod tests {
         }
         assert_eq!(received.len(), N_THREADS * PER_THREAD);
     }
+
+    /// 8 producers × 200 records on a tiny ring (~64 records' worth of
+    /// capacity) forces many wraps. Verifies the post-wrap torn-record race
+    /// is gone: every record written is read back exactly once, no panics.
+    #[ignore = "regression for M4 wrap-fix; un-ignore in Task 1.5"]
+    #[test]
+    fn wrap_under_many_producers_no_torn_read() {
+        let tmp = NamedTempFile::new().unwrap();
+        // 4 KiB capacity, ~24 B/record => ~170 records/generation;
+        // 8 × 200 = 1600 records forces ~9 wraps.
+        let ring = MpscRing::create(tmp.path(), 4096, 128).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+
+        const N_THREADS: usize = 8;
+        const PER_THREAD: usize = 200;
+
+        let handles: Vec<_> = (0..N_THREADS)
+            .map(|t| {
+                let p = producer.clone();
+                thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        let payload = format!("t{t}-i{i}").into_bytes();
+                        loop {
+                            match p.try_write(1, 0, [0; 8], &payload) {
+                                Ok(()) => break,
+                                Err(RingError::Full) => thread::yield_now(),
+                                Err(e) => panic!("write: {e}"),
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let mut received: HashSet<Vec<u8>> = HashSet::new();
+        let total = N_THREADS * PER_THREAD;
+        while received.len() < total {
+            let mut buf = Vec::new();
+            match consumer.try_read(&mut buf) {
+                Ok(Some(_)) => {
+                    assert!(received.insert(buf), "duplicate or torn record read");
+                }
+                Ok(None) => thread::yield_now(),
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(received.len(), total);
+    }
 }
