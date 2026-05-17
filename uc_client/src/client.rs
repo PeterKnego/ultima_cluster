@@ -255,6 +255,30 @@ impl Client {
         }
     }
 
+    /// Stop background tasks without cleaning up the session file.
+    ///
+    /// Called automatically by `Drop`. Also called at the start of
+    /// `shutdown()` so the async join can proceed on the already-stopped tasks.
+    fn stop_background_tasks(&self) {
+        self.shut_down.store(true, Ordering::Relaxed);
+
+        // Stop the session heartbeat ticker. The session *file* is NOT removed
+        // here — that is the caller's responsibility (done in `shutdown()`).
+        // Stopping the ticker means the heartbeat_seq stops advancing, so the
+        // node-side session_gc will unlink the file after STALE_AFTER.
+        if let Some(s) = self.session.lock().as_ref() {
+            s.stop.store(true, Ordering::Relaxed);
+        }
+
+        // Stop the broadcast reader and stall watchers.
+        if let Some(r) = self.broadcast_reader.lock().as_ref() {
+            r.stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(w) = self.watchers.lock().as_ref() {
+            w.stop.store(true, Ordering::Relaxed);
+        }
+    }
+
     pub async fn shutdown(self) -> Result<(), ClientError> {
         self.shut_down.store(true, Ordering::Relaxed);
 
@@ -287,5 +311,34 @@ impl Client {
             }
         }
         Ok(())
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Signal all background tasks to stop. For the stall watchers we must
+        // also abort their JoinHandles: the watchers hold `&'static` raw
+        // pointers into the cnc mmap, and the mmap (owned by `self.cnc`) is
+        // freed when *this* Drop returns. Setting the stop flag is not enough —
+        // the tasks are polling in a sleep loop and might not observe the flag
+        // before the next `await` yields control back to them after the mmap
+        // has been freed. `JoinHandle::abort()` is sync and immediately
+        // cancels the task at its next await point.
+        self.stop_background_tasks();
+
+        // Abort the watcher tasks to prevent use-after-free of the cnc mmap.
+        if let Some(w) = self.watchers.lock().as_ref() {
+            w.join_node.abort();
+            w.join_service.abort();
+        }
+        // Abort the broadcast reader and session ticker as well (belt-and-
+        // suspenders: their data is on the heap so the segfault risk is lower,
+        // but aborting them avoids spurious wakeups after the client is gone).
+        if let Some(r) = self.broadcast_reader.lock().as_ref() {
+            r.join.abort();
+        }
+        if let Some(s) = self.session.lock().as_ref() {
+            s.join.abort();
+        }
     }
 }
