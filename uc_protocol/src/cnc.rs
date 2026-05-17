@@ -8,17 +8,18 @@
 //! ──────   ──────────────────────────────────    ────
 //!   0      CncHeader                              256
 //! 256      NodeStatus (atomic counters)            64
-//! 320      ServiceStatus (atomic counters)         64
-//! 384      control_to_service ring (RingHeader + slot region)
+//! 320      services-table (8 × ServiceStatus)     512  ← M4: widened from 1 slot
+//! 832      control_to_service ring (RingHeader + slot region)
 //!  …       control_to_node ring (RingHeader + slot region)
+//!  …       next_client_id (AtomicU64 + 8-byte pad)  16  ← M4
 //! ```
 //!
 //! Sub-buffer offsets and sizes are recorded in `CncHeader::sub_buffer_*` so
 //! future versions can shift the layout without breaking attached parties
 //! (subject to the protocol-version handshake).
 //!
-//! M5 additions (not populated in M3): counters_metadata, counters_values,
-//! error_log, and the clients/* sub-buffers.
+//! M5 additions (not populated in M4): counters_metadata, counters_values,
+//! and the clients/* sub-buffers.
 
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
@@ -27,10 +28,16 @@ use crate::ring::common::{RING_HEADER_LEN, RingError, init_ring_header};
 
 pub const CNC_HEADER_LEN: usize = 256;
 pub const STATUS_BLOCK_LEN: usize = 64;
+/// Number of reserved slots in the services-table. v1 uses slot 0 only.
+pub const SERVICES_TABLE_SLOTS: usize = 8;
+/// Total size of the services-table sub-region.
+pub const SERVICES_TABLE_LEN: usize = SERVICES_TABLE_SLOTS * STATUS_BLOCK_LEN;
 /// Capacity (slot-region bytes) for the two cnc control rings. Power of two
 /// to keep wrap-mask math cheap.
 pub const CNC_CONTROL_RING_CAP: u64 = 16 * 1024;
 pub const CNC_CONTROL_RING_MAX_MSG: u32 = 1024;
+/// Size of the `next_client_id` sub-region (8-byte AtomicU64 + 8-byte pad).
+pub const NEXT_CLIENT_ID_REGION_LEN: usize = 16;
 
 /// Offset of the `header_crc32` field within `CncHeader`. The CRC covers
 /// bytes `[0..CNC_HEADER_CRC_OFFSET)` — everything in the header except the
@@ -100,10 +107,11 @@ pub mod sub {
     pub const SERVICE_STATUS: usize = 1;
     pub const CONTROL_TO_SERVICE: usize = 2;
     pub const CONTROL_TO_NODE: usize = 3;
-    pub const CONTROL_TO_CLIENTS: usize = 4; // M4
-    pub const COUNTERS_METADATA: usize = 5; // M5
-    pub const COUNTERS_VALUES: usize = 6; // M5
-    pub const ERROR_LOG: usize = 7; // M5
+    pub const NEXT_CLIENT_ID: usize = 4; // M4
+    pub const CONTROL_TO_CLIENTS: usize = 5; // M5 (placeholder; was index 4 in M3)
+    pub const COUNTERS_METADATA: usize = 6; // M5
+    pub const COUNTERS_VALUES: usize = 7; // M5
+    // ERROR_LOG: M5; would require widening sub_buffer_* arrays past 8.
 }
 
 /// Service-state encoding for `ServiceStatus::state`.
@@ -124,14 +132,14 @@ pub mod node_role {
     pub const SHUTTING: u32 = 4;
 }
 
-/// Compute the total cnc.dat file size for the M3 layout (header + two
-/// status blocks + two control rings).
+/// Compute the total cnc.dat file size for the M4 layout.
 pub const fn cnc_file_size() -> usize {
     CNC_HEADER_LEN
         + STATUS_BLOCK_LEN // node_status
-        + STATUS_BLOCK_LEN // service_status
+        + SERVICES_TABLE_LEN // M4: services-table (8 × STATUS_BLOCK_LEN; slot 0 = today's service_status)
         + RING_HEADER_LEN + CNC_CONTROL_RING_CAP as usize // control_to_service
         + RING_HEADER_LEN + CNC_CONTROL_RING_CAP as usize // control_to_node
+        + NEXT_CLIENT_ID_REGION_LEN // M4: client identity allocator
 }
 
 /// Initialize a freshly-created cnc.dat mmap.
@@ -166,20 +174,24 @@ pub fn init_cnc(
 
     let off_node_status = CNC_HEADER_LEN as u64;
     let off_service_status = off_node_status + STATUS_BLOCK_LEN as u64;
-    let off_control_to_service = off_service_status + STATUS_BLOCK_LEN as u64;
+    let off_control_to_service = off_service_status + SERVICES_TABLE_LEN as u64;
     let off_control_to_node =
         off_control_to_service + RING_HEADER_LEN as u64 + CNC_CONTROL_RING_CAP;
+    let off_next_client_id =
+        off_control_to_node + RING_HEADER_LEN as u64 + CNC_CONTROL_RING_CAP;
 
     let mut sub_buffer_offsets = [0u64; 8];
     let mut sub_buffer_sizes = [0u64; 8];
     sub_buffer_offsets[sub::NODE_STATUS] = off_node_status;
     sub_buffer_sizes[sub::NODE_STATUS] = STATUS_BLOCK_LEN as u64;
     sub_buffer_offsets[sub::SERVICE_STATUS] = off_service_status;
-    sub_buffer_sizes[sub::SERVICE_STATUS] = STATUS_BLOCK_LEN as u64;
+    sub_buffer_sizes[sub::SERVICE_STATUS] = SERVICES_TABLE_LEN as u64;
     sub_buffer_offsets[sub::CONTROL_TO_SERVICE] = off_control_to_service;
     sub_buffer_sizes[sub::CONTROL_TO_SERVICE] = RING_HEADER_LEN as u64 + CNC_CONTROL_RING_CAP;
     sub_buffer_offsets[sub::CONTROL_TO_NODE] = off_control_to_node;
     sub_buffer_sizes[sub::CONTROL_TO_NODE] = RING_HEADER_LEN as u64 + CNC_CONTROL_RING_CAP;
+    sub_buffer_offsets[sub::NEXT_CLIENT_ID] = off_next_client_id;
+    sub_buffer_sizes[sub::NEXT_CLIENT_ID] = NEXT_CLIENT_ID_REGION_LEN as u64;
 
     let header = CncHeader {
         magic: crate::magic::CNC_MAGIC,
@@ -219,8 +231,9 @@ pub fn init_cnc(
     // Zero out the status blocks (atomics start at zero).
     let ns_lo = off_node_status as usize;
     mmap[ns_lo..ns_lo + STATUS_BLOCK_LEN].fill(0);
+    // Zero-fill the entire services-table (all 8 slots).
     let ss_lo = off_service_status as usize;
-    mmap[ss_lo..ss_lo + STATUS_BLOCK_LEN].fill(0);
+    mmap[ss_lo..ss_lo + SERVICES_TABLE_LEN].fill(0);
 
     // Initialize the two MPSC control rings in place.
     init_ring_header(
@@ -235,6 +248,20 @@ pub fn init_cnc(
         CNC_CONTROL_RING_MAX_MSG,
         0,
     )?;
+
+    // Initialize the next_client_id counter to 1 (0 is reserved as "no id").
+    let next_id_off = off_next_client_id as usize;
+    mmap[next_id_off..next_id_off + NEXT_CLIENT_ID_REGION_LEN].fill(0);
+    let counter_init: u64 = 1;
+    // SAFETY: cnc mmap is page-aligned; AtomicU64 has alignof 8; offset is
+    // 8-byte-aligned by construction (preceded by a power-of-two ring).
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            counter_init.to_le_bytes().as_ptr(),
+            mmap.as_mut_ptr().add(next_id_off),
+            8,
+        );
+    }
 
     Ok(())
 }
@@ -255,6 +282,39 @@ pub fn validate_cnc(mmap: &[u8]) -> Result<&CncHeader, RingError> {
         return Err(RingError::BadCrc);
     }
     Ok(header)
+}
+
+/// Return a stable pointer to the `ServiceStatus` slot for `service_id`.
+/// Returns `None` if `service_id >= SERVICES_TABLE_SLOTS`.
+///
+/// # Safety
+///
+/// `cnc_base` must point at a fully-initialized cnc.dat mapping that
+/// outlives the returned reference.
+pub unsafe fn service_status_slot_ptr(
+    cnc_base: *const u8,
+    service_id: u8,
+) -> Option<*const ServiceStatus> {
+    if (service_id as usize) >= SERVICES_TABLE_SLOTS {
+        return None;
+    }
+    let header = unsafe { &*cnc_base.cast::<CncHeader>() };
+    let base_off = header.sub_buffer_offsets[sub::SERVICE_STATUS] as usize;
+    let slot_off = base_off + (service_id as usize) * STATUS_BLOCK_LEN;
+    Some(unsafe { cnc_base.add(slot_off) as *const ServiceStatus })
+}
+
+/// Return a stable pointer to the `next_client_id` `AtomicU64` slot.
+///
+/// # Safety
+///
+/// `cnc_base` must point at a fully-initialized cnc.dat mapping that
+/// outlives the returned reference. The sub-buffer offset is read from
+/// the header, which is `#[repr(C)]` and validated by [`validate_cnc`].
+pub unsafe fn next_client_id_ptr(cnc_base: *const u8) -> *const std::sync::atomic::AtomicU64 {
+    let header = unsafe { &*cnc_base.cast::<CncHeader>() };
+    let off = header.sub_buffer_offsets[sub::NEXT_CLIENT_ID] as usize;
+    unsafe { cnc_base.add(off) as *const std::sync::atomic::AtomicU64 }
 }
 
 impl CncHeader {
@@ -337,11 +397,75 @@ mod tests {
     #[test]
     fn status_blocks_zeroed_on_init() {
         let (mut mmap, _tmp) = mmap_file(cnc_file_size());
-        // Pre-fill the status region with garbage.
+        // Pre-fill the status region with garbage (node_status + full services-table).
         let ns_lo = CNC_HEADER_LEN;
-        let ss_hi = CNC_HEADER_LEN + 2 * STATUS_BLOCK_LEN;
+        let ss_hi = CNC_HEADER_LEN + STATUS_BLOCK_LEN + SERVICES_TABLE_LEN;
         mmap[ns_lo..ss_hi].fill(0xaa);
         init_cnc(&mut mmap[..], "x", 0, 0).expect("init");
         assert!(mmap[ns_lo..ss_hi].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn services_table_has_eight_slots() {
+        let (mut mmap, _tmp) = mmap_file(cnc_file_size());
+        init_cnc(&mut mmap[..], "x", 0, 0).expect("init");
+        let base = mmap.as_ptr();
+        for i in 0..SERVICES_TABLE_SLOTS as u8 {
+            let p = unsafe { service_status_slot_ptr(base, i) }
+                .unwrap_or_else(|| panic!("slot {i} should exist"));
+            let s: &ServiceStatus = unsafe { &*p };
+            assert_eq!(s.last_applied.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert_eq!(s.state.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        assert!(unsafe { service_status_slot_ptr(base, SERVICES_TABLE_SLOTS as u8) }.is_none());
+    }
+
+    #[test]
+    fn next_client_id_starts_at_one_and_increments() {
+        let (mut mmap, _tmp) = mmap_file(cnc_file_size());
+        init_cnc(&mut mmap[..], "x", 0, 0).expect("init");
+        let base = mmap.as_ptr();
+        let ptr = unsafe { next_client_id_ptr(base) };
+        let counter: &std::sync::atomic::AtomicU64 = unsafe { &*ptr };
+        // Starts at 1 (0 is reserved as "no id").
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // Can be incremented atomically.
+        let old = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(old, 1);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn next_client_id_fetch_add_concurrent() {
+        use std::sync::Arc;
+        let (mut mmap, _tmp) = mmap_file(cnc_file_size());
+        init_cnc(&mut mmap[..], "x", 0, 0).expect("init");
+        let base = mmap.as_ptr();
+        let ptr = unsafe { next_client_id_ptr(base) };
+        let counter: &'static std::sync::atomic::AtomicU64 =
+            unsafe { &*(ptr as *const std::sync::atomic::AtomicU64) };
+
+        const THREADS: u64 = 8;
+        const OPS_PER_THREAD: u64 = 1000;
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS as usize));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let b = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                b.wait();
+                for _ in 0..OPS_PER_THREAD {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // Started at 1; each of THREADS * OPS_PER_THREAD increments applied.
+        let expected = 1 + THREADS * OPS_PER_THREAD;
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            expected
+        );
     }
 }
