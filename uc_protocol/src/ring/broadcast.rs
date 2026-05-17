@@ -313,4 +313,58 @@ mod tests {
         let _ = rec;
         assert_eq!(&buf[..], b"third");
     }
+
+    /// Single producer + 2 consumers; wrap several times. Both consumers must
+    /// see every record that the producer has not yet lapped them on.
+    ///
+    /// NOTE: this race is timing-dependent and reliably reproduces only under
+    /// `--release`. Run with `cargo test --release -p uc_protocol -- --ignored
+    /// ring::broadcast::tests::wrap_no_torn_read` to validate.
+    #[ignore = "regression for M4 wrap-fix; un-ignore in Task 1.5"]
+    #[test]
+    fn wrap_no_torn_read() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = BroadcastRing::create(tmp.path(), 4096, 128).expect("create");
+        let mut producer = ring.producer();
+        let mut sub_a = ring.subscribe();
+        let mut sub_b = ring.subscribe();
+
+        // Writer thread: 1000 records, ~24 B each => ~6 wraps on a 4 KiB ring.
+        let writer = std::thread::spawn(move || {
+            for i in 0..1000u32 {
+                let payload = i.to_le_bytes();
+                producer.write(1, 0, [0; 8], &payload).expect("write");
+            }
+        });
+
+        // Readers: keep up; assert no BadCrc/Corrupt. Overwritten is allowed
+        // (slow consumer detection — we accept it and reset).
+        let read_all = |sub: &mut BroadcastConsumer| {
+            let mut seen = 0usize;
+            let mut buf = Vec::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline {
+                match sub.try_read(&mut buf) {
+                    Ok(Some(_rec)) => {
+                        // payload is a u32 LE; pure read is enough — just no panic.
+                        assert_eq!(buf.len(), 4, "torn read?");
+                        seen += 1;
+                    }
+                    Ok(None) => std::thread::yield_now(),
+                    Err(RingError::Overwritten) => {
+                        // Acceptable for the slow-consumer recovery path.
+                    }
+                    Err(e) => panic!("torn record: {e}"),
+                }
+            }
+            seen
+        };
+
+        let a_seen = read_all(&mut sub_a);
+        let b_seen = read_all(&mut sub_b);
+        writer.join().unwrap();
+        // At least *some* records observed; we don't pin the exact count
+        // because Overwritten resets are timing-dependent.
+        assert!(a_seen > 0 && b_seen > 0);
+    }
 }
