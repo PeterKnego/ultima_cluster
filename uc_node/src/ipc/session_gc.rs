@@ -15,8 +15,6 @@
 //! is unlinked. No further node-side state needs cleanup — in-flight
 //! broadcasts for the dead client are no-ops (no consumer reads them).
 
-#![allow(dead_code)] // wired into NodeBuilder in Task 3.4
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

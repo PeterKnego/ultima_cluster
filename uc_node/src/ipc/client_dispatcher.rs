@@ -5,9 +5,7 @@
 //! and the mutex enforces that across the two tasks. Each broadcast write
 //! is one record; no awaits are held under the lock.
 //!
-//! These dispatchers are wired into the runtime in Task 3.3 (NodeBuilder
-//! shmem path). Until then the items are unused at the crate level.
-#![allow(dead_code)]
+//! These dispatchers are wired into the NodeBuilder shmem path (Task 3.4).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

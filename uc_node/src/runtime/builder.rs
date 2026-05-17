@@ -15,6 +15,7 @@ use crate::config::{BootstrapConfig, IpcMode, NodeConfig};
 use crate::ipc::handshake::wait_for_service_ready;
 use crate::ipc::liveness::spawn_liveness;
 use crate::ipc::query_link::ShmemQueryLink;
+use crate::ipc::client_link::ClientLink;
 use crate::ipc::service_link::ServiceLink;
 use crate::ipc::service_watcher::{DEFAULT_LIVENESS_TIMEOUT, spawn_service_watcher};
 use crate::ipc::{HandshakeError, Instance};
@@ -74,6 +75,11 @@ impl<S: StateMachine> NodeBuilder<S> {
                 let instance =
                     Instance::create(&instance_dir, &self.config.app_id, self.config.node_id)?;
                 let link = ServiceLink::create(&instance_dir)?;
+                let ClientLink {
+                    submit_consumer,
+                    query_consumer,
+                    response_producer,
+                } = ClientLink::create(&instance_dir)?;
 
                 // Pointers into the cnc mmap for the heartbeat ticker + the
                 // service-side handshake watcher. Lifetimes are upheld by
@@ -107,7 +113,10 @@ impl<S: StateMachine> NodeBuilder<S> {
                     link.apply_producer,
                     link.apply_resp_consumer,
                 )?;
-                let query_link = ShmemQueryLink::new(link.query_producer, link.query_resp_consumer);
+                let query_link = Arc::new(ShmemQueryLink::new(
+                    link.query_producer,
+                    link.query_resp_consumer,
+                ));
                 let handle_sm = SmAdapter::Shmem(adapter.clone());
                 let node_id_for_watcher = self.config.node_id;
                 let mut handle = finish(
@@ -117,7 +126,7 @@ impl<S: StateMachine> NodeBuilder<S> {
                     handle_sm,
                     Some(instance),
                     Some(node_liveness),
-                    Some(query_link),
+                    Some(query_link.clone()),
                     RaftHandle::Shmem,
                 )
                 .await?;
@@ -137,6 +146,38 @@ impl<S: StateMachine> NodeBuilder<S> {
                     )
                 };
                 handle.service_watcher = Some(watcher);
+
+                // Client-facing dispatchers + session GC. Spawned after
+                // finish (need handle.raft clone) and after service_watcher
+                // attach. The shared response_producer is wrapped in a
+                // Mutex so both dispatchers can write to the Broadcast ring
+                // without a second producer split.
+                let response_producer =
+                    Arc::new(parking_lot::Mutex::new(response_producer));
+
+                let client_dispatcher =
+                    crate::ipc::client_dispatcher::spawn_client_dispatcher(
+                        submit_consumer,
+                        response_producer.clone(),
+                        handle.raft.clone(),
+                        node_id_for_watcher,
+                    );
+                let client_query_dispatcher =
+                    crate::ipc::client_dispatcher::spawn_client_query_dispatcher(
+                        query_consumer,
+                        response_producer.clone(),
+                        handle.raft.clone(),
+                        query_link.clone(),
+                        node_id_for_watcher,
+                    );
+                let session_gc = crate::ipc::session_gc::spawn_session_gc(
+                    instance_dir.join("clients").join("sessions.dir"),
+                );
+
+                handle.client_dispatcher = Some(client_dispatcher);
+                handle.client_query_dispatcher = Some(client_query_dispatcher);
+                handle.session_gc = Some(session_gc);
+
                 Ok(handle)
             }
         }
@@ -159,7 +200,7 @@ async fn finish<A, S>(
     handle_sm: SmAdapter<S>,
     instance: Option<Instance>,
     node_liveness: Option<crate::ipc::liveness::LivenessHandle>,
-    query_link: Option<ShmemQueryLink>,
+    query_link: Option<Arc<ShmemQueryLink>>,
     wrap_raft: impl FnOnce(Raft<TypeConfig, A>) -> RaftHandle<S>,
 ) -> Result<NodeHandle<S>, ClusterError>
 where
@@ -343,6 +384,9 @@ where
         node_liveness,
         query_link,
         service_watcher: None,
+        client_dispatcher: None,
+        client_query_dispatcher: None,
+        session_gc: None,
     })
 }
 

@@ -20,6 +20,8 @@ use crate::config::{NodeConfig, NodeId};
 use crate::ipc::Instance;
 use crate::ipc::liveness::LivenessHandle;
 use crate::ipc::query_link::ShmemQueryLink;
+use crate::ipc::client_dispatcher::ClientDispatcherHandle;
+use crate::ipc::session_gc::SessionGcHandle;
 use crate::ipc::service_watcher::ServiceWatcherHandle;
 use crate::network::server::ServerHandle;
 use crate::raft::NodeAddr;
@@ -156,10 +158,16 @@ pub struct NodeHandle<S: StateMachine> {
     pub(crate) node_liveness: Option<LivenessHandle>,
     /// Shmem-mode only: query.ring producer + query_resp.ring consumer,
     /// wrapped in the publish/await helper used by [`Self::submit_query`].
-    pub(crate) query_link: Option<ShmemQueryLink>,
+    pub(crate) query_link: Option<std::sync::Arc<ShmemQueryLink>>,
     /// Shmem-mode only: watches the service's heartbeat. Joined on
     /// shutdown before the cnc mmap drops.
     pub(crate) service_watcher: Option<ServiceWatcherHandle>,
+    /// Shmem-mode only: submit-ring dispatcher.
+    pub(crate) client_dispatcher: Option<ClientDispatcherHandle>,
+    /// Shmem-mode only: query-ring dispatcher.
+    pub(crate) client_query_dispatcher: Option<ClientDispatcherHandle>,
+    /// Shmem-mode only: session-file GC.
+    pub(crate) session_gc: Option<SessionGcHandle>,
 }
 
 impl<S: StateMachine> NodeHandle<S> {
@@ -331,6 +339,18 @@ impl<S: StateMachine> NodeHandle<S> {
         if let Some(w) = self.service_watcher {
             w.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = w.join.await;
+        }
+        if let Some(d) = self.client_dispatcher {
+            d.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = d.join.await;
+        }
+        if let Some(d) = self.client_query_dispatcher {
+            d.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = d.join.await;
+        }
+        if let Some(g) = self.session_gc {
+            g.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = g.join.await;
         }
         if let Some(lv) = self.node_liveness {
             lv.stop.store(true, std::sync::atomic::Ordering::Relaxed);
