@@ -9,5 +9,6 @@
 //! different codecs.
 
 pub mod apply;
+pub mod client;
 pub mod query;
 pub mod snapshot;
