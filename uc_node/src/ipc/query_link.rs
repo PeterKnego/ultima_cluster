@@ -22,7 +22,8 @@ use bytes::Bytes;
 use tokio::sync::Mutex as TokioMutex;
 
 use uc_protocol::frames::query::{
-    MSG_TYPE_QUERY, MSG_TYPE_QUERY_RESP, QueryKind, decode_extra_query, encode_extra_query,
+    MSG_TYPE_QUERY, MSG_TYPE_QUERY_RESP, QueryKind, decode_extra_query, decode_flags_query,
+    encode_extra_query, encode_flags_query,
 };
 use uc_protocol::ring::RingError;
 use uc_protocol::ring::spsc::{SpscConsumer, SpscProducer};
@@ -65,7 +66,7 @@ impl ShmemQueryLink {
         loop {
             match g.producer.try_write(
                 MSG_TYPE_QUERY,
-                0,
+                encode_flags_query(0),
                 encode_extra_query(request_id, kind),
                 payload,
             ) {
@@ -83,6 +84,10 @@ impl ShmemQueryLink {
         loop {
             match g.consumer.try_read(&mut payload_buf) {
                 Ok(Some(rec)) if rec.msg_type == MSG_TYPE_QUERY_RESP => {
+                    if let Err(e) = decode_flags_query(rec.flags) {
+                        tracing::warn!("dropping query_resp frame with bad flags: {e}");
+                        continue;
+                    }
                     let (req, _kind) = decode_extra_query(rec.header_extra).map_err(|e| {
                         ClusterError::Io(std::io::Error::other(format!(
                             "query_resp decode header_extra: {e}"

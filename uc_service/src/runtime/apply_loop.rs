@@ -16,7 +16,8 @@ use std::time::Duration;
 use bincode::config::standard as bincode_standard;
 use parking_lot::Mutex;
 use uc_protocol::frames::apply::{
-    MSG_TYPE_APPLY, MSG_TYPE_APPLY_RESP, decode_extra_apply, encode_extra_apply,
+    MSG_TYPE_APPLY, MSG_TYPE_APPLY_RESP, decode_extra_apply, decode_flags_apply, encode_extra_apply,
+    encode_flags_apply,
 };
 use uc_protocol::ring::RingError;
 use uc_protocol::ring::spsc::{SpscConsumer, SpscProducer};
@@ -65,6 +66,10 @@ fn apply_thread_body<S>(
     while !stop.load(Ordering::Relaxed) {
         match consumer.try_read(&mut payload_buf) {
             Ok(Some(rec)) if rec.msg_type == MSG_TYPE_APPLY => {
+                if let Err(e) = decode_flags_apply(rec.flags) {
+                    tracing::warn!("dropping apply frame with bad flags: {e}");
+                    continue;
+                }
                 let log_index = decode_extra_apply(rec.header_extra);
                 let (cmd, _) = match bincode::serde::decode_from_slice::<S::Command, _>(
                     &payload_buf,
@@ -109,7 +114,7 @@ fn publish_response(
     loop {
         match producer.try_write(
             MSG_TYPE_APPLY_RESP,
-            0,
+            encode_flags_apply(0),
             encode_extra_apply(log_index),
             resp_bytes,
         ) {

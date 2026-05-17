@@ -1,5 +1,9 @@
 //! Query ring frame types.
 //!
+//! `flags` field: bits 0..7 = `service_id: u8` (v1 always 0); bits 8..15
+//! reserved (must be zero). Note: `QueryKind` remains in `header_extra` byte 4
+//! for backwards compatibility — it is NOT moved to flags.
+//!
 //! `header_extra` layout (8 bytes):
 //!   * bytes 0..4 — `request_id` (u32 LE, allocated by node, lifetime-scoped
 //!     to the ring; rolls over when it hits `u32::MAX`).
@@ -24,6 +28,27 @@ pub enum QueryKind {
 pub enum QueryFrameError {
     #[error("unknown query kind byte: {0}")]
     UnknownKind(u8),
+    #[error("unknown service_id: {0}")]
+    UnknownServiceId(u8),
+}
+
+/// Mask for the low byte of `flags`, where `service_id` lives.
+pub const FLAGS_SERVICE_ID_MASK: u16 = 0x00FF;
+
+#[inline]
+pub fn encode_flags_query(service_id: u8) -> u16 {
+    service_id as u16
+}
+
+/// Decode `service_id` from a `QueryFrame`/`QueryRespFrame` `flags` field.
+/// Returns `UnknownServiceId(n)` on `service_id != 0` (v1 contract).
+#[inline]
+pub fn decode_flags_query(flags: u16) -> Result<u8, QueryFrameError> {
+    let service_id = (flags & FLAGS_SERVICE_ID_MASK) as u8;
+    if service_id != 0 {
+        return Err(QueryFrameError::UnknownServiceId(service_id));
+    }
+    Ok(service_id)
 }
 
 #[inline]
@@ -77,5 +102,20 @@ mod tests {
     fn reserved_bytes_remain_zero() {
         let extra = encode_extra_query(1, QueryKind::Linearizable);
         assert_eq!(&extra[5..], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn flags_query_round_trip_v1() {
+        let f = encode_flags_query(0);
+        assert_eq!(decode_flags_query(f).unwrap(), 0);
+    }
+
+    #[test]
+    fn flags_query_rejects_nonzero() {
+        let f = encode_flags_query(3);
+        assert!(matches!(
+            decode_flags_query(f),
+            Err(QueryFrameError::UnknownServiceId(3))
+        ));
     }
 }

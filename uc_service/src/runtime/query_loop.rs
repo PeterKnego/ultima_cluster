@@ -16,7 +16,8 @@ use bincode::config::standard as bincode_standard;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 use uc_protocol::frames::query::{
-    MSG_TYPE_QUERY, MSG_TYPE_QUERY_RESP, QueryKind, decode_extra_query, encode_extra_query,
+    MSG_TYPE_QUERY, MSG_TYPE_QUERY_RESP, QueryKind, decode_extra_query, decode_flags_query,
+    encode_extra_query, encode_flags_query,
 };
 use uc_protocol::ring::RingError;
 use uc_protocol::ring::spsc::{SpscConsumer, SpscProducer};
@@ -62,6 +63,10 @@ async fn query_task_body<S>(
     while !stop.load(Ordering::Relaxed) {
         match consumer.try_read(&mut payload_buf) {
             Ok(Some(rec)) if rec.msg_type == MSG_TYPE_QUERY => {
+                if let Err(e) = decode_flags_query(rec.flags) {
+                    tracing::warn!("dropping query frame with bad flags: {e}");
+                    continue;
+                }
                 let (request_id, kind) = match decode_extra_query(rec.header_extra) {
                     Ok(p) => p,
                     Err(e) => {
@@ -109,7 +114,7 @@ async fn publish_response(
     loop {
         match producer.try_write(
             MSG_TYPE_QUERY_RESP,
-            0,
+            encode_flags_query(0),
             encode_extra_query(request_id, kind),
             resp_bytes,
         ) {

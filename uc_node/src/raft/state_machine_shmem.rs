@@ -46,7 +46,8 @@ use openraft::storage::{EntryResponder, RaftSnapshotBuilder, RaftStateMachine, S
 use parking_lot::Mutex as PlMutex;
 use tokio::sync::Mutex as TokioMutex;
 use uc_protocol::frames::apply::{
-    MSG_TYPE_APPLY, MSG_TYPE_APPLY_RESP, decode_extra_apply, encode_extra_apply,
+    MSG_TYPE_APPLY, MSG_TYPE_APPLY_RESP, decode_extra_apply, decode_flags_apply, encode_extra_apply,
+    encode_flags_apply,
 };
 use uc_protocol::ring::RingError;
 use uc_protocol::ring::spsc::{SpscConsumer, SpscProducer};
@@ -300,7 +301,7 @@ async fn publish_apply(
     loop {
         let result = {
             let mut p = producer.lock();
-            p.try_write(MSG_TYPE_APPLY, 0, encode_extra_apply(log_index), cmd_bytes)
+            p.try_write(MSG_TYPE_APPLY, encode_flags_apply(0), encode_extra_apply(log_index), cmd_bytes)
         };
         match result {
             Ok(()) => return Ok(()),
@@ -328,6 +329,10 @@ async fn await_apply_resp(
         };
         match read_result {
             Ok(Some(rec)) if rec.msg_type == MSG_TYPE_APPLY_RESP => {
+                if let Err(e) = decode_flags_apply(rec.flags) {
+                    tracing::warn!("dropping apply_resp frame with bad flags: {e}");
+                    continue;
+                }
                 let li = decode_extra_apply(rec.header_extra);
                 if li != expected_log_index {
                     // The service apply loop emits responses in publish order,
