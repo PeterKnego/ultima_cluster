@@ -7,12 +7,13 @@
 //!
 //! # Memory ordering
 //!
-//! * Producer writes the record bytes first, then does a `Release` store on
-//!   `producer_position`. The Release store synchronizes with the consumer's
+//! * Producer writes the record bytes first, advances `claim_position`
+//!   (single-producer; Relaxed store) and then does a `Release` store on
+//!   `publish_position`. The Release store synchronizes with the consumer's
 //!   `Acquire` load — by the time the consumer observes the new
-//!   `producer_position`, the record bytes are fully written.
+//!   `publish_position`, the record bytes are fully written.
 //! * Consumer reads with relaxed `consumer_position` (only the consumer
-//!   mutates it) and Acquire on `producer_position`. After processing, it
+//!   mutates it) and Acquire on `publish_position`. After processing, it
 //!   advances `consumer_position` with Release so the producer's next
 //!   free-space check sees the freed slot.
 
@@ -105,7 +106,7 @@ impl SpscProducer {
         let capacity = self.inner.capacity();
         // We're the only producer; Relaxed is fine for the load of our own
         // position (no other thread mutates it).
-        let producer_pos = header.producer_position.load(Ordering::Relaxed);
+        let producer_pos = header.claim_position.load(Ordering::Relaxed);
         let consumer_pos = header.consumer_position.load(Ordering::Acquire);
 
         let used = producer_pos - consumer_pos;
@@ -116,7 +117,7 @@ impl SpscProducer {
 
         let slot_offset = (producer_pos as usize) & (capacity - 1);
         // bytes_to_tail is a multiple of RECORD_ALIGN because slot_offset is
-        // (producer_pos is RECORD_ALIGN-aligned and capacity is a power of two
+        // (claim_position is RECORD_ALIGN-aligned and capacity is a power of two
         // ≥ RECORD_ALIGN), so the padding marker's 6-byte write fits.
         let bytes_to_tail = capacity - slot_offset;
         if bytes_to_tail < advance {
@@ -134,9 +135,11 @@ impl SpscProducer {
             unsafe {
                 write_padding_marker_at(self.inner.slot_region_mut(), slot_offset, bytes_to_tail);
             }
+            let padded_pos = producer_pos + bytes_to_tail as u64;
+            header.claim_position.store(padded_pos, Ordering::Relaxed);
             header
-                .producer_position
-                .store(producer_pos + bytes_to_tail as u64, Ordering::Release);
+                .publish_position
+                .store(padded_pos, Ordering::Release);
             return self.try_write(msg_type, flags, header_extra, payload);
         }
 
@@ -154,9 +157,9 @@ impl SpscProducer {
                 total,
             );
         }
-        header
-            .producer_position
-            .store(producer_pos + advance as u64, Ordering::Release);
+        let new_pos = producer_pos + advance as u64;
+        header.claim_position.store(new_pos, Ordering::Relaxed);
+        header.publish_position.store(new_pos, Ordering::Release);
         Ok(())
     }
 }
@@ -175,7 +178,7 @@ impl SpscConsumer {
         loop {
             let header = self.inner.header();
             let capacity = self.inner.capacity();
-            let producer_pos = header.producer_position.load(Ordering::Acquire);
+            let producer_pos = header.publish_position.load(Ordering::Acquire);
             let consumer_pos = header.consumer_position.load(Ordering::Relaxed);
             if producer_pos == consumer_pos {
                 return Ok(None);
@@ -184,13 +187,13 @@ impl SpscConsumer {
             let slot_offset = (consumer_pos as usize) & (capacity - 1);
             // SAFETY: producer_pos > consumer_pos and the slot offset is
             // within `[0, capacity)`. The producer has done a Release store
-            // on `producer_position`, so all writes to the slot are visible.
+            // on `publish_position`, so all writes to the slot are visible.
             let read =
                 unsafe { try_read_record_at(self.inner.slot_region(), slot_offset, payload_buf) }?;
             let Some((rec, total_size)) = read else {
                 // Length is zero — producer claimed but hasn't committed.
                 // In SPSC this only happens on first generation before the
-                // producer's `Release` store on `producer_position` becomes
+                // producer's `Release` store on `publish_position` becomes
                 // visible; the `Acquire` load above happens-after the
                 // producer's earlier writes, so we should not reach here in
                 // practice. Return Empty to let the caller retry.

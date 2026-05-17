@@ -8,15 +8,11 @@
 //!
 //! # Known limitations
 //!
-//! * **Wrap-race torn-record on slow-consumer recovery.** Same shape as the
-//!   MPSC race documented in `ring::mpsc`: after the producer wraps, a
-//!   consumer that lands within capacity but on a slot that's mid-write
-//!   could read stale length bytes. M3 doesn't use Broadcast — it's
-//!   implemented here for M4's client response ring. Fix tracked for M4.
 //! * **No producer↔consumer happens-before across overwrite.** A consumer
 //!   that's recovering from `Overwritten` should reset its head to the
-//!   producer's *current* position (which the consumer's logic does); it
-//!   cannot rewind to consume records the producer has already overwritten.
+//!   producer's *current* `publish_position` (which the consumer's logic
+//!   does); it cannot rewind to consume records the producer has already
+//!   overwritten.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -86,7 +82,7 @@ impl BroadcastProducer {
 
         let header = self.inner.header();
         let capacity = self.inner.capacity();
-        let producer_pos = header.producer_position.load(Ordering::Relaxed);
+        let producer_pos = header.claim_position.load(Ordering::Relaxed);
         let slot_offset = (producer_pos as usize) & (capacity - 1);
         // bytes_to_tail is a multiple of RECORD_ALIGN (see SPSC for proof),
         // so the padding marker's 6-byte write always fits.
@@ -98,9 +94,11 @@ impl BroadcastProducer {
             unsafe {
                 write_padding_marker_at(self.inner.slot_region_mut(), slot_offset, bytes_to_tail);
             }
+            let padded_pos = producer_pos + bytes_to_tail as u64;
+            header.claim_position.store(padded_pos, Ordering::Relaxed);
             header
-                .producer_position
-                .store(producer_pos + bytes_to_tail as u64, Ordering::Release);
+                .publish_position
+                .store(padded_pos, Ordering::Release);
             return self.write(msg_type, flags, header_extra, payload);
         }
 
@@ -116,9 +114,9 @@ impl BroadcastProducer {
                 total,
             );
         }
-        header
-            .producer_position
-            .store(producer_pos + advance as u64, Ordering::Release);
+        let new_pos = producer_pos + advance as u64;
+        header.claim_position.store(new_pos, Ordering::Relaxed);
+        header.publish_position.store(new_pos, Ordering::Release);
         Ok(())
     }
 }
@@ -141,7 +139,7 @@ impl BroadcastConsumer {
         loop {
             let header = self.inner.header();
             let capacity = self.inner.capacity();
-            let producer_pos = header.producer_position.load(Ordering::Acquire);
+            let producer_pos = header.publish_position.load(Ordering::Acquire);
 
             if self.head == producer_pos {
                 return Ok(None);
@@ -149,7 +147,7 @@ impl BroadcastConsumer {
 
             // Check for fall-behind: producer has lapped us by >= capacity.
             if (producer_pos - self.head) as usize > capacity {
-                // Reset to current producer position so subsequent reads
+                // Reset to current publish position so subsequent reads
                 // resume from "now."
                 self.head = producer_pos;
                 return Err(RingError::Overwritten);
@@ -157,8 +155,9 @@ impl BroadcastConsumer {
 
             let slot_offset = (self.head as usize) & (capacity - 1);
             // SAFETY: head < producer_pos and head is within `capacity` of
-            // producer_pos, so the slot is within the active region. See
-            // module docs for the wrap-race caveat (M3 doesn't use this).
+            // producer_pos, so the slot is within the active region.
+            // `publish_position` advances only after record bytes are
+            // committed, so no torn-read on wrap.
             let read =
                 unsafe { try_read_record_at(self.inner.slot_region(), slot_offset, payload_buf) }?;
             let Some((rec, total_size)) = read else {
@@ -235,7 +234,7 @@ impl BroadcastRing {
         let head = self
             .inner
             .header()
-            .producer_position
+            .publish_position
             .load(Ordering::Acquire);
         BroadcastConsumer {
             inner: self.inner.clone(),

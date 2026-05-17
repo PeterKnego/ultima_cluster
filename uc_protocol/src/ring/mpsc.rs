@@ -1,27 +1,14 @@
 //! Many-producer single-consumer ring buffer.
 //!
 //! Producers claim a slot range via `compare_exchange_weak` on
-//! `producer_position`, then write the record. The consumer reads with
-//! Relaxed loads on its own `consumer_position` (single reader).
+//! `claim_position`, write the record bytes, then publish in claim order by
+//! spinning until `publish_position == my_slot_start` before advancing
+//! `publish_position` (Release). Consumers load `publish_position` with
+//! Acquire and read only fully-published records, so the post-wrap
+//! torn-record race the M3 design documented is eliminated.
 //!
-//! # Known limitation: post-wrap torn-record race
-//!
-//! After the producer CAS succeeds, the consumer can observe the advanced
-//! `producer_position` *before* the producer has finished writing the record
-//! bytes. The `length == 0 → not yet committed` check protects against this
-//! on the **first generation** (mmap is zero-initialized), but **not after
-//! wrap-around** — the stale length bytes from the previous generation at
-//! the same offset can spoof a commit.
-//!
-//! Fixing this correctly requires either (a) a separate "published-up-to"
-//! position that producers advance in claim order (LMAX-Disruptor-style), or
-//! (b) per-slot generation counters. Both are tracked for M4 when the
-//! client→node submit ring will see real wrap traffic.
-//!
-//! In M3, MPSC is only used for the cnc control rings (handshake +
-//! occasional role-change frames — very low traffic, wrap not expected) and
-//! the tests below stay within the first generation. **Do not use MPSC for
-//! high-traffic rings until M4 lands the fix.**
+//! The consumer reads with Relaxed loads on its own `consumer_position`
+//! (single reader).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -104,15 +91,15 @@ impl MpscProducer {
 
         loop {
             let consumer_pos = header.consumer_position.load(Ordering::Acquire);
-            let producer_pos = header.producer_position.load(Ordering::Acquire);
+            let claim_pos = header.claim_position.load(Ordering::Acquire);
 
-            let used = producer_pos - consumer_pos;
+            let used = claim_pos - consumer_pos;
             let free = capacity.saturating_sub(used as usize);
             if free < advance {
                 return Err(RingError::Full);
             }
 
-            let slot_offset = (producer_pos as usize) & (capacity - 1);
+            let slot_offset = (claim_pos as usize) & (capacity - 1);
             // bytes_to_tail is a multiple of RECORD_ALIGN (see SPSC for proof),
             // so the padding marker's 6-byte write always fits.
             let bytes_to_tail = capacity - slot_offset;
@@ -128,11 +115,11 @@ impl MpscProducer {
                 advance
             };
 
-            let target_pos = producer_pos + claim_size as u64;
+            let target_pos = claim_pos + claim_size as u64;
             if header
-                .producer_position
+                .claim_position
                 .compare_exchange_weak(
-                    producer_pos,
+                    claim_pos,
                     target_pos,
                     Ordering::AcqRel,
                     Ordering::Relaxed,
@@ -149,20 +136,35 @@ impl MpscProducer {
                 unsafe {
                     write_padding_marker_at(self.inner.slot_region_mut(), slot_offset, claim_size);
                 }
-                continue; // claim real record on next iteration
+            } else {
+                // SAFETY: exclusive ownership of the claimed range.
+                unsafe {
+                    write_record_at(
+                        self.inner.slot_region_mut(),
+                        slot_offset,
+                        msg_type,
+                        flags,
+                        header_extra,
+                        payload,
+                        total,
+                    );
+                }
             }
 
-            // SAFETY: exclusive ownership of the claimed range.
-            unsafe {
-                write_record_at(
-                    self.inner.slot_region_mut(),
-                    slot_offset,
-                    msg_type,
-                    flags,
-                    header_extra,
-                    payload,
-                    total,
-                );
+            // Publish in claim order: wait until our predecessor has
+            // advanced `publish_position` up to our slot start, then bump
+            // it to cover our claimed range. Consumers only read records
+            // whose bytes are below `publish_position`.
+            while header.publish_position.load(Ordering::Acquire) != claim_pos {
+                std::hint::spin_loop();
+            }
+            header
+                .publish_position
+                .store(target_pos, Ordering::Release);
+
+            if claim_size != advance {
+                // Padding marker published; loop to claim the real record.
+                continue;
             }
             return Ok(());
         }
@@ -177,7 +179,7 @@ impl MpscConsumer {
         loop {
             let header = self.inner.header();
             let capacity = self.inner.capacity();
-            let producer_pos = header.producer_position.load(Ordering::Acquire);
+            let producer_pos = header.publish_position.load(Ordering::Acquire);
             let consumer_pos = header.consumer_position.load(Ordering::Relaxed);
             if producer_pos == consumer_pos {
                 return Ok(None);
@@ -185,7 +187,8 @@ impl MpscConsumer {
 
             let slot_offset = (consumer_pos as usize) & (capacity - 1);
             // SAFETY: same as SPSC — slot offset within `[0, capacity)`, mmap
-            // outlives the borrow. See module docs for the wrap-race caveat.
+            // outlives the borrow. `publish_position` advances only after
+            // record bytes are committed, so no torn-read on wrap.
             let read =
                 unsafe { try_read_record_at(self.inner.slot_region(), slot_offset, payload_buf) }?;
             let Some((rec, total_size)) = read else {

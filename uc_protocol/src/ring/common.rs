@@ -8,9 +8,9 @@
 //! ```text
 //! offset   contents
 //! ──────   ─────────────────────────────────────────────────────────────────
-//!  0       RingHeader (192 bytes, cache-padded so the two atomics live on
+//!  0       RingHeader (256 bytes, cache-padded so the three atomics live on
 //!          separate cache lines)
-//!  192     slot region of `capacity_bytes` bytes (must be a power of two so
+//!  256     slot region of `capacity_bytes` bytes (must be a power of two so
 //!          that wrap-around indexing reduces to a mask)
 //! ```
 //!
@@ -25,22 +25,26 @@
 //!  crc32                    u32   over (msg_type..end-of-payload)
 //! ```
 //!
-//! ## Torn-record protection — SPSC only
+//! ## Torn-record protection
 //!
-//! For SPSC, the producer writes the record bytes first, then advances
-//! `producer_position` with a `Release` store. The consumer loads
-//! `producer_position` with `Acquire`; if it has moved past `consumer_position`,
-//! the slot is guaranteed to be fully written.
+//! Producers split a write into two atomic steps:
 //!
-//! For MPSC and Broadcast, the producer claims its slot range *before* writing
-//! the record. The consumer can therefore observe a non-zero
-//! `producer_position` while the record bytes are still partially written. The
-//! `length == 0 → not yet committed` check works on the first generation
-//! (mmap is zero-initialized) but **does not work after wrap-around** — the
-//! stale length bytes from the previous generation can spoof a commit. This is
-//! a known limitation tracked for M4 (when the client→node submit ring will
-//! see real wrap traffic). In M3, MPSC is only used for the cnc control rings
-//! (very low traffic, wrap not expected) and Broadcast is unused.
+//!   1. Claim — bump `claim_position` to reserve a slot range. MPSC uses
+//!      `compare_exchange_weak` so producers can claim in parallel; SPSC
+//!      and Broadcast use a single `store` (single producer per ring).
+//!   2. Publish — write the record bytes, then `publish_position.store(…,
+//!      Release)` (MPSC spins until `publish_position == my_slot_start` so
+//!      the publication order matches the claim order).
+//!
+//! Consumers load `publish_position` with Acquire and read only records
+//! whose `[slot, slot+size)` is fully below `publish_position`. This
+//! eliminates the post-wrap torn-record race documented as an M3
+//! limitation: a consumer can never see a slot offset whose bytes are
+//! still being written.
+//!
+//! The length-last-Release commit inside `write_record_at` remains —
+//! between `publish_position` advance and the consumer's record read,
+//! the in-record length-zero check is the final guard.
 
 use std::sync::atomic::AtomicU64;
 use thiserror::Error;
@@ -49,9 +53,17 @@ use thiserror::Error;
 /// region when it encounters this in a record header.
 pub const PADDING_MSG_TYPE: u16 = 0xffff;
 
-/// Fixed-size header at the start of every ring file. 192 bytes,
-/// cache-padded so producer and consumer atomics live on separate cache
+/// Fixed-size header at the start of every ring file. 256 bytes,
+/// cache-padded so claim/publish/consumer atomics live on separate cache
 /// lines.
+///
+/// * `claim_position` — producers atomically claim slot ranges here
+///   (CAS for MPSC; single producer for SPSC/Broadcast).
+/// * `publish_position` — producer advances this only after the record's
+///   bytes are visible. Consumers read records up to this position.
+///   Eliminates the post-wrap torn-record race that plagued M3.
+/// * `consumer_position` — single reader's progress marker (unused on
+///   Broadcast; each consumer keeps its own in-memory `head`).
 #[repr(C, align(64))]
 pub struct RingHeader {
     pub magic: [u8; 8],
@@ -59,14 +71,16 @@ pub struct RingHeader {
     pub max_msg_size: u32,
     pub msg_kind_filter: u32,
     pub _pad_1: [u8; 40],
-    pub producer_position: AtomicU64,
+    pub claim_position: AtomicU64,
     pub _pad_2: [u8; 56],
-    pub consumer_position: AtomicU64,
+    pub publish_position: AtomicU64,
     pub _pad_3: [u8; 56],
+    pub consumer_position: AtomicU64,
+    pub _pad_4: [u8; 56],
 }
 
 const _: () = {
-    assert!(std::mem::size_of::<RingHeader>() == 192);
+    assert!(std::mem::size_of::<RingHeader>() == 256);
     assert!(std::mem::align_of::<RingHeader>() == 64);
 };
 
@@ -86,10 +100,11 @@ pub struct FrameHeader {
 pub const FRAME_HEADER_LEN: usize = std::mem::size_of::<FrameHeader>();
 pub const FRAME_TRAILER_LEN: usize = 4; // crc32
 
-/// All record advancements (producer_position / consumer_position increments)
-/// are rounded up to this many bytes. Two properties depend on it:
+/// All record advancements (claim_position / publish_position /
+/// consumer_position increments) are rounded up to this many bytes. Two
+/// properties depend on it:
 ///
-///   * `producer_position & (capacity - 1)` is always a multiple of
+///   * `claim_position & (capacity - 1)` is always a multiple of
 ///     `RECORD_ALIGN`, so `bytes_to_tail = capacity - slot_offset` is also a
 ///     multiple of `RECORD_ALIGN` and is therefore ≥ `RECORD_ALIGN` whenever a
 ///     tail-wrap padding marker is needed.
@@ -177,10 +192,12 @@ pub fn init_ring_header(
                 max_msg_size,
                 msg_kind_filter,
                 _pad_1: [0; 40],
-                producer_position: AtomicU64::new(0),
+                claim_position: AtomicU64::new(0),
                 _pad_2: [0; 56],
-                consumer_position: AtomicU64::new(0),
+                publish_position: AtomicU64::new(0),
                 _pad_3: [0; 56],
+                consumer_position: AtomicU64::new(0),
+                _pad_4: [0; 56],
             },
         );
     }
@@ -206,7 +223,7 @@ pub fn validate_ring_header(buf: &[u8]) -> Result<&RingHeader, RingError> {
 
 /// Write a complete record (header + payload + crc32) at `slot_offset` within
 /// the slot region. The length field is written **last** with a Release
-/// fence/store so that consumers using Acquire on `producer_position` observe
+/// fence/store so that consumers using Acquire on `publish_position` observe
 /// the fully-written record.
 ///
 /// # Safety
@@ -291,7 +308,7 @@ pub unsafe fn write_padding_marker_at(
 ///
 /// `slot_region` must point to a valid slot region of at least
 /// `slot_offset + max_msg_size` bytes, and the producer must have already
-/// committed (i.e., the caller observed `producer_position > consumer_position`
+/// committed (i.e., the caller observed `publish_position > consumer_position`
 /// with Acquire ordering).
 pub unsafe fn try_read_record_at(
     slot_region: *const u8,
@@ -412,7 +429,8 @@ mod tests {
         assert_eq!(header.capacity_bytes, 65536);
         assert_eq!(header.max_msg_size, 4096);
         assert_eq!(header.msg_kind_filter, 0xff);
-        assert_eq!(header.producer_position.load(Ordering::Relaxed), 0);
+        assert_eq!(header.claim_position.load(Ordering::Relaxed), 0);
+        assert_eq!(header.publish_position.load(Ordering::Relaxed), 0);
         assert_eq!(header.consumer_position.load(Ordering::Relaxed), 0);
     }
 
