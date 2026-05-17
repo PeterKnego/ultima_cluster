@@ -41,6 +41,7 @@ page_size = "0.6"
 crc32fast = "1"
 fs2 = "0.4"
 rand = "0.9"
+dashmap = "6"
 
 # dev
 tempfile = "3"
