@@ -322,6 +322,7 @@ where
                         ChangeMembershipError, ClientWriteError, RaftError as OR,
                     };
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    let mut backoff_ms: u64 = 5;
                     loop {
                         match raft.add_learner(peer.node_id, node.clone(), true).await {
                             Ok(_) => {
@@ -334,9 +335,12 @@ where
                                 // Race: init membership not yet committed.
                                 tracing::trace!(
                                     node_id = peer.node_id,
-                                    "add_learner saw InProgress; retrying after 5ms"
+                                    backoff_ms,
+                                    "add_learner saw InProgress; retrying after backoff"
                                 );
-                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms))
+                                    .await;
+                                backoff_ms = backoff_ms.saturating_mul(2).min(200);
                                 continue;
                             }
                             Err(OR::APIError(ClientWriteError::ChangeMembershipError(
