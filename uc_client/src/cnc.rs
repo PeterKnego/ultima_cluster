@@ -61,7 +61,7 @@ impl CncAttach {
         let protocol_version = header.protocol_version;
 
         // SAFETY: cnc validated above.
-        let counter = unsafe { &*(next_client_id_ptr(mmap.as_ptr()) as *const AtomicU64) };
+        let counter = unsafe { &*next_client_id_ptr(mmap.as_ptr()) };
         let raw = counter.fetch_add(1, Ordering::Relaxed);
         let client_id = raw as u32;
 
