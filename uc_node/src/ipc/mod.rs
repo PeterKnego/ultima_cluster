@@ -19,6 +19,7 @@
 //! live inside `cnc.dat` itself; node-side construction of MPSC producers
 //! over those sub-regions arrives with the sub-mmap attach API.
 
+pub mod client_link;
 pub mod handshake;
 pub mod instance;
 pub mod liveness;

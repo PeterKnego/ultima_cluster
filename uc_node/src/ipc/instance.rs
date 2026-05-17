@@ -44,6 +44,7 @@ impl Instance {
     pub fn create(instance_dir: &Path, app_id: &str, node_id: u64) -> Result<Self, IpcError> {
         std::fs::create_dir_all(instance_dir)?;
         std::fs::create_dir_all(instance_dir.join("service"))?;
+        std::fs::create_dir_all(instance_dir.join("clients"))?;
 
         // Exclusive flock — one node per instance directory.
         let lock_path = instance_dir.join("instance.lock");
@@ -106,8 +107,9 @@ mod tests {
         assert_eq!(header.node_id, 7);
         assert_eq!(header.instance_id(), inst.instance_id);
 
-        // service/ subdir exists.
+        // service/ and clients/ subdirs exist.
         assert!(tmp.path().join("service").is_dir());
+        assert!(tmp.path().join("clients").is_dir());
         // instance.lock exists.
         assert!(tmp.path().join("instance.lock").exists());
     }
