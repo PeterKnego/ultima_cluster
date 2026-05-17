@@ -79,7 +79,11 @@ impl<S: StateMachine> NodeBuilder<S> {
                     submit_consumer,
                     query_consumer,
                     response_producer,
-                } = ClientLink::create(&instance_dir)?;
+                } = ClientLink::create_with_cap(
+                    &instance_dir,
+                    self.config.client_rings.cap_bytes,
+                    self.config.client_rings.max_msg,
+                )?;
 
                 // Pointers into the cnc mmap for the heartbeat ticker + the
                 // service-side handshake watcher. Lifetimes are upheld by

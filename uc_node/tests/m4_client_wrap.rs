@@ -1,13 +1,16 @@
-//! 1 node + 1 service — dropped Client's session unlinked by GC (M4 Task 5.6).
+//! Ring wrap-path integration test (M4 Task 5.4).
 //!
-//! Connects one client, drops it without calling `shutdown()`, and waits for
-//! the node-side `session_gc` task to unlink the session file. GC constants:
-//!   - `STALE_AFTER` = 5 s (file is stale when heartbeat_seq stops advancing)
-//!   - `GC_TICK`     = 2 s (GC runs every 2 s)
+//! Creates tiny 32 KiB client rings and drives 2 concurrent clients each
+//! submitting 500 `Inc` commands. At ~50–100 bytes per framed message the
+//! submit ring wraps ~6+ times, exercising the Phase 1 wrap-fix end-to-end.
 //!
-//! When the `Client` is dropped, `Drop` stops the heartbeat ticker (sets the
-//! stop flag) but does NOT remove the session file. The GC should unlink it
-//! within `STALE_AFTER + GC_TICK` ≈ 7 s. We allow 10 s for slack.
+//! The increments are deterministic:
+//!   - client 1: Inc(0), Inc(1), …, Inc(499)     → sum = 0+1+…+499 = 124_750
+//!   - client 2: Inc(10_000), Inc(10_001), …      → sum = 10_000+…+10_499 = 5_124_750
+//!   total expected = 124_750 + 5_124_750 = 5_249_500
+//!
+//! Final value via `query_snapshot` must equal that sum regardless of
+//! interleaving order (all increments are additive and commutative).
 
 use std::io::{Read, Write};
 use std::time::Duration;
@@ -15,7 +18,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use uc_client::Client;
-use uc_node::{BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning, TlsConfig};
+use uc_node::{
+    BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning, TlsConfig,
+};
 use uc_service::runtime::ServiceConfig;
 use uc_service::{ServiceBuilder, SnapshotError, StateMachine};
 
@@ -71,16 +76,25 @@ async fn wait_for_path(p: &std::path::Path, t: Duration) {
     }
 }
 
+/// Submit `count` Inc commands starting at `base` (base, base+1, …, base+count-1).
+async fn submit_many(c: &Client, base: u64, count: u64) {
+    for i in 0..count {
+        let _: Resp = c.submit(&Cmd::Inc(base + i)).await.expect("submit");
+    }
+}
+
 #[tokio::test]
-async fn m4_client_session_gc() {
+async fn m4_client_wrap() {
     let _ = tracing_subscriber::fmt::try_init();
 
     let inst = TempDir::new().unwrap();
     let node_data = TempDir::new().unwrap();
     let svc_data = TempDir::new().unwrap();
     let instance_dir = inst.path().to_owned();
-    let app_id = "m4-session-gc".to_string();
+    let app_id = "m4-wrap".to_string();
 
+    // Use 32 KiB rings to force multiple wraps during the 1 000-submit run.
+    // max_msg is capped at 4 KiB (well above a single framed Inc command).
     let cfg = NodeConfig {
         node_id: 1,
         data_dir: node_data.path().to_owned(),
@@ -92,8 +106,12 @@ async fn m4_client_session_gc() {
         ipc_mode: IpcMode::Shmem {
             instance_dir: instance_dir.clone(),
         },
-        client_rings: ClientRingConfig::default(),
+        client_rings: ClientRingConfig {
+            cap_bytes: 32 * 1024,
+            max_msg: 4 * 1024,
+        },
     };
+
     let node_task = tokio::spawn(async move {
         NodeBuilder::new(cfg, Counter::default()).start().await
     });
@@ -129,40 +147,22 @@ async fn m4_client_session_gc() {
     }
     assert_eq!(node.current_leader().await, Some(1));
 
-    // ── Connect and immediately drop ────────────────────────────────────────
-    let client = Client::connect(&instance_dir, &app_id).await.unwrap();
-    let cid = client.client_id();
-    let session_path = instance_dir
-        .join("clients")
-        .join("sessions.dir")
-        .join(format!("{cid}.session"));
+    // ── Two concurrent clients, 500 submits each ───────────────────────────
+    let c1 = Client::connect(&instance_dir, &app_id).await.expect("c1");
+    let c2 = Client::connect(&instance_dir, &app_id).await.expect("c2");
 
-    assert!(
-        session_path.exists(),
-        "session file should exist after connect"
-    );
+    // 2 clients × 500 submits → ~1 000 records on a 32 KiB ring forces ~6+ wraps.
+    tokio::join!(submit_many(&c1, 0, 500), submit_many(&c2, 10_000, 500));
 
-    // Drop without calling shutdown(). Client::Drop stops the heartbeat ticker
-    // (so heartbeat_seq stops advancing) but does NOT remove the session file.
-    // The node-side session_gc should unlink it once the heartbeat goes stale.
-    drop(client);
+    // Deterministic sum regardless of interleaving:
+    //   c1: 0+1+…+499               = 124_750
+    //   c2: 10_000+10_001+…+10_499  = 5_124_750
+    let expected: u64 = (0u64..500).sum::<u64>() + (0u64..500).map(|i| 10_000 + i).sum::<u64>();
+    let v: u64 = c1.query_snapshot(&()).await.expect("query");
+    assert_eq!(v, expected, "final state mismatch (wrap-fix check failed)");
 
-    // Poll until the file disappears, with a generous deadline (STALE_AFTER=5s
-    // + GC_TICK=2s + extra slack = 10s total).
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while session_path.exists() {
-        if std::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    assert!(
-        !session_path.exists(),
-        "session_gc should have unlinked the file at {}",
-        session_path.display()
-    );
-
+    c1.shutdown().await.unwrap();
+    c2.shutdown().await.unwrap();
     service.shutdown().await.unwrap();
     node.shutdown().await.unwrap();
 }

@@ -30,27 +30,34 @@ pub struct ClientLink {
 }
 
 impl ClientLink {
-    /// Create the three ring files and `sessions.dir/`. Caller must
-    /// ensure `<instance_dir>/clients/` already exists (Instance::create
-    /// handles that).
+    /// Create the three ring files and `sessions.dir/` using the default
+    /// production sizing ([`CLIENT_RING_CAP`] / [`CLIENT_RING_MAX_MSG`]).
+    ///
+    /// Caller must ensure `<instance_dir>/clients/` already exists
+    /// (`Instance::create` handles that).
     pub fn create(instance_dir: &Path) -> Result<Self, IpcError> {
+        Self::create_with_cap(instance_dir, CLIENT_RING_CAP, CLIENT_RING_MAX_MSG)
+    }
+
+    /// Create the three ring files and `sessions.dir/` with caller-specified
+    /// ring sizing. Used by [`NodeBuilder`] when `NodeConfig::client_rings`
+    /// overrides the defaults (e.g. small rings for wrap-path tests).
+    pub fn create_with_cap(
+        instance_dir: &Path,
+        cap_bytes: u64,
+        max_msg: u32,
+    ) -> Result<Self, IpcError> {
         let clients_dir = instance_dir.join("clients");
         std::fs::create_dir_all(clients_dir.join("sessions.dir"))?;
 
-        let submit = MpscRing::create(
-            &clients_dir.join("submit.ring"),
-            CLIENT_RING_CAP,
-            CLIENT_RING_MAX_MSG,
-        )?;
-        let query = MpscRing::create(
-            &clients_dir.join("query.ring"),
-            CLIENT_RING_CAP,
-            CLIENT_RING_MAX_MSG,
-        )?;
+        let submit =
+            MpscRing::create(&clients_dir.join("submit.ring"), cap_bytes, max_msg)?;
+        let query =
+            MpscRing::create(&clients_dir.join("query.ring"), cap_bytes, max_msg)?;
         let response = BroadcastRing::create(
             &clients_dir.join("response.broadcast"),
-            CLIENT_RING_CAP,
-            CLIENT_RING_MAX_MSG,
+            cap_bytes,
+            max_msg,
         )?;
 
         let (_, submit_consumer) = submit.into_split();

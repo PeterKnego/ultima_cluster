@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use uc_client::{Client, ClientError};
 use uc_node::{
-    BootstrapConfig, IpcMode, NodeBuilder, NodeConfig, NodeHandle, NodeId, PeerSeed, RaftTuning,
-    TlsConfig,
+    BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, NodeHandle, NodeId,
+    PeerSeed, RaftTuning, TlsConfig,
 };
 use uc_service::runtime::ServiceConfig;
 use uc_service::{ServiceBuilder, SnapshotError, StateMachine};
@@ -157,6 +157,7 @@ async fn m4_client_three_node() {
             ipc_mode: IpcMode::Shmem {
                 instance_dir: instance_dir.path().to_owned(),
             },
+            client_rings: ClientRingConfig::default(),
         };
         node_tasks.push(tokio::spawn(async move {
             NodeBuilder::new(cfg, Counter::default()).start().await

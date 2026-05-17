@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use ultima_db::Store;
 
-use uc_node::{BootstrapConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning, TlsConfig};
+use uc_node::{BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning, TlsConfig};
 use uc_service::ServiceBuilder;
 use uc_service::runtime::ServiceConfig;
 use uc_service::ultima_db::StoreStateMachine;
@@ -94,6 +94,7 @@ async fn ultima_db_adapter_end_to_end() {
         ipc_mode: IpcMode::Shmem {
             instance_dir: instance_dir.clone(),
         },
+        client_rings: ClientRingConfig::default(),
     };
     // Node-side SM is degenerate in shmem mode (snapshot trait surface only).
     let node_task =

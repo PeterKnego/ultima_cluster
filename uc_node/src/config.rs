@@ -3,6 +3,29 @@ use std::path::PathBuf;
 
 pub type NodeId = u64;
 
+/// Ring-buffer sizing for the client-facing rings
+/// (`submit.ring`, `query.ring`, `response.broadcast`).
+///
+/// Production defaults: 16 MiB cap, 4 MiB max single frame.
+/// Tests that want to exercise wrap behaviour can reduce `cap_bytes`
+/// to e.g. 32 KiB.
+#[derive(Debug, Clone)]
+pub struct ClientRingConfig {
+    /// Capacity of each ring file in bytes.
+    pub cap_bytes: u64,
+    /// Maximum single-message frame size in bytes.
+    pub max_msg: u32,
+}
+
+impl Default for ClientRingConfig {
+    fn default() -> Self {
+        Self {
+            cap_bytes: 16 * 1024 * 1024,
+            max_msg: 4 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     pub node_id: NodeId,
@@ -17,6 +40,9 @@ pub struct NodeConfig {
     /// In-process apply vs shmem-fronted apply. Default `Embedded` matches
     /// M1/M2 behavior; `Shmem` activates the M3 service-process split.
     pub ipc_mode: IpcMode,
+    /// Sizing for the three client-facing ring files. Defaults to 16 MiB /
+    /// 4 MiB. Override in tests to force wrap-path coverage.
+    pub client_rings: ClientRingConfig,
 }
 
 /// Selects how `apply()` is dispatched.
