@@ -326,10 +326,51 @@ mod tests {
         let tmp = NamedTempFile::new().unwrap();
         let ring = BroadcastRing::create(tmp.path(), 4096, 128).expect("create");
         let mut producer = ring.producer();
-        let mut sub_a = ring.subscribe();
-        let mut sub_b = ring.subscribe();
+        let sub_a = ring.subscribe();
+        let sub_b = ring.subscribe();
 
-        // Writer thread: 1000 records, ~24 B each => ~6 wraps on a 4 KiB ring.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Reader closure: reads until `stop` is set, then drains a bit more.
+        // Asserts every observed record is a 4-byte u32 (no torn payloads).
+        // `Overwritten` is acceptable (slow-consumer recovery).
+        let reader = |mut sub: BroadcastConsumer,
+                      stop: std::sync::Arc<std::sync::atomic::AtomicBool>| {
+            std::thread::spawn(move || {
+                let mut seen = 0usize;
+                let mut buf = Vec::new();
+                let drain_until =
+                    || std::time::Instant::now() + std::time::Duration::from_millis(50);
+                let mut deadline = None;
+                loop {
+                    match sub.try_read(&mut buf) {
+                        Ok(Some(_rec)) => {
+                            assert_eq!(buf.len(), 4, "torn read?");
+                            seen += 1;
+                        }
+                        Ok(None) => {
+                            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                if deadline.is_none() {
+                                    deadline = Some(drain_until());
+                                }
+                                if std::time::Instant::now() >= deadline.unwrap() {
+                                    break;
+                                }
+                            }
+                            std::thread::yield_now();
+                        }
+                        Err(RingError::Overwritten) => { /* slow-consumer reset path */ }
+                        Err(e) => panic!("torn record: {e}"),
+                    }
+                }
+                seen
+            })
+        };
+
+        let a_handle = reader(sub_a, stop.clone());
+        let b_handle = reader(sub_b, stop.clone());
+
+        // Writer: 1000 records, ~24 B each => ~6 wraps on a 4 KiB ring.
         let writer = std::thread::spawn(move || {
             for i in 0..1000u32 {
                 let payload = i.to_le_bytes();
@@ -337,34 +378,13 @@ mod tests {
             }
         });
 
-        // Readers: keep up; assert no BadCrc/Corrupt. Overwritten is allowed
-        // (slow consumer detection — we accept it and reset).
-        let read_all = |sub: &mut BroadcastConsumer| {
-            let mut seen = 0usize;
-            let mut buf = Vec::new();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while std::time::Instant::now() < deadline {
-                match sub.try_read(&mut buf) {
-                    Ok(Some(_rec)) => {
-                        // payload is a u32 LE; pure read is enough — just no panic.
-                        assert_eq!(buf.len(), 4, "torn read?");
-                        seen += 1;
-                    }
-                    Ok(None) => std::thread::yield_now(),
-                    Err(RingError::Overwritten) => {
-                        // Acceptable for the slow-consumer recovery path.
-                    }
-                    Err(e) => panic!("torn record: {e}"),
-                }
-            }
-            seen
-        };
-
-        let a_seen = read_all(&mut sub_a);
-        let b_seen = read_all(&mut sub_b);
         writer.join().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let a_seen = a_handle.join().unwrap();
+        let b_seen = b_handle.join().unwrap();
+
         // At least *some* records observed; we don't pin the exact count
         // because Overwritten resets are timing-dependent.
-        assert!(a_seen > 0 && b_seen > 0);
+        assert!(a_seen > 0 && b_seen > 0, "a={a_seen} b={b_seen}");
     }
 }
