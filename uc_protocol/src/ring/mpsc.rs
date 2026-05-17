@@ -338,6 +338,10 @@ mod tests {
     /// 8 producers × 200 records on a tiny ring (~64 records' worth of
     /// capacity) forces many wraps. Verifies the post-wrap torn-record race
     /// is gone: every record written is read back exactly once, no panics.
+    ///
+    /// NOTE: this race is timing-dependent and reliably reproduces only under
+    /// `--release`. Run with `cargo test --release -p uc_protocol -- --ignored
+    /// ring::mpsc::tests::wrap_under_many_producers_no_torn_read` to validate.
     #[ignore = "regression for M4 wrap-fix; un-ignore in Task 1.5"]
     #[test]
     fn wrap_under_many_producers_no_torn_read() {
