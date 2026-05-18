@@ -2,8 +2,8 @@
 
 SMR cluster implementation on top of openraft.
 
-**Status:** M3.5 — openraft 0.10 upgrade + `transfer_leader` cutover.
-Builds on M3's shmem IPC + `uc_service` process split. See
+**Status:** M4 — MPSC/Broadcast wrap-fix + `uc_client` SDK end-to-end.
+Builds on M3.5's openraft 0.10 + `transfer_leader` cutover. See
 `docs/superpowers/specs/2026-05-10-ultima-cluster-design.md` for the
 canonical design and `docs/tasks/` for per-milestone records.
 
@@ -18,7 +18,9 @@ canonical design and `docs/tasks/` for per-milestone records.
 - `uc_node` — cluster engine (Raft, log storage, QUIC inter-node
   network, shmem IPC owner: `instance.lock`, `cnc.dat`, service rings,
   liveness ticker, service watcher).
-- `uc_client` — local-shmem client SDK (M1 stub; full impl in M4).
+- `uc_client` — local-shmem client SDK (`Client::{connect, submit,
+  query_linearizable, query_snapshot, shutdown}`; session liveness; node
+  + service stall detection; `NotLeader` hint surfaced to callers).
 
 ## Build & test
 
