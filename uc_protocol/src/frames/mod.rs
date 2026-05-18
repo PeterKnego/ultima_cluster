@@ -10,5 +10,6 @@
 
 pub mod apply;
 pub mod client;
+pub mod output;
 pub mod query;
 pub mod snapshot;
