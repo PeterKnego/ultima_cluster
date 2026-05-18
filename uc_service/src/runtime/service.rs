@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use memmap2::MmapMut;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use uc_protocol::cnc::{CncHeader, ServiceStatus, service_state, sub};
 use uc_protocol::ring::RingError;
 
@@ -105,9 +105,10 @@ impl<S: StateMachine> ServiceBuilder<S> {
         let service_status_ptr = service_status_ptr(&attached.cnc_mmap);
 
         // Wrap the user SM so apply (sync thread) and query (tokio task)
-        // can share it. parking_lot::Mutex is fine because the lock is
-        // never held across an await.
-        let sm_shared = Arc::new(Mutex::new(self.state_machine));
+        // can share it. parking_lot::RwLock allows query to take a shared
+        // read lock concurrently; apply takes an exclusive write lock.
+        // Neither is ever held across an await.
+        let sm_shared = Arc::new(RwLock::new(self.state_machine));
 
         let apply = spawn_apply_loop(
             Arc::clone(&sm_shared),

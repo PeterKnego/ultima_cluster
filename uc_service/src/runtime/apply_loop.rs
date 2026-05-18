@@ -3,8 +3,11 @@
 //! Runs on a dedicated `std::thread` (NOT a tokio task) because
 //! [`crate::StateMachine::apply`] is sync and may be CPU-bound; we don't
 //! want to block a tokio worker. Drains `service/apply.ring`, invokes
-//! `state_machine.apply(log_index, cmd)` while holding the SM mutex, then
+//! `state_machine.apply(log_index, cmd)` while holding the SM write lock, then
 //! publishes `ApplyRespFrame` into `service/apply_resp.ring`.
+//!
+//! Using `RwLock` (instead of `Mutex`) allows the future output_loop to hold
+//! a read lock for state inspection while apply owns the exclusive write lock.
 //!
 //! Shutdown: caller sets [`ApplyLoopHandle::stop`] and joins.
 
@@ -14,7 +17,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use bincode::config::standard as bincode_standard;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use uc_protocol::frames::apply::{
     MSG_TYPE_APPLY, MSG_TYPE_APPLY_RESP, decode_extra_apply, decode_flags_apply,
     encode_extra_apply, encode_flags_apply,
@@ -36,7 +39,7 @@ pub struct ApplyLoopHandle {
 }
 
 pub fn spawn_apply_loop<S>(
-    sm: Arc<Mutex<S>>,
+    sm: Arc<RwLock<S>>,
     mut consumer: SpscConsumer,
     mut resp_producer: SpscProducer,
 ) -> ApplyLoopHandle
@@ -55,7 +58,7 @@ where
 }
 
 fn apply_thread_body<S>(
-    sm: Arc<Mutex<S>>,
+    sm: Arc<RwLock<S>>,
     consumer: &mut SpscConsumer,
     resp_producer: &mut SpscProducer,
     stop: Arc<AtomicBool>,
@@ -86,7 +89,7 @@ fn apply_thread_body<S>(
                     }
                 };
                 let resp = {
-                    let mut guard = sm.lock();
+                    let mut guard = sm.write();
                     guard.apply(log_index, cmd)
                 };
                 let resp_bytes = bincode::serde::encode_to_vec(&resp, bincode_standard())

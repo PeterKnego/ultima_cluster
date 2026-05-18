@@ -1,10 +1,11 @@
 //! Async query loop.
 //!
-//! Runs as a tokio task. Drains `service/query.ring`, takes the SM mutex
+//! Runs as a tokio task. Drains `service/query.ring`, takes the SM read lock
 //! (cheap, parking_lot), calls `state_machine.query(q)`, publishes
 //! `QueryRespFrame` into `service/query_resp.ring`. The lock is never held
 //! across an `await`, so queries from many tokio callers can interleave
-//! cooperatively.
+//! cooperatively. Using `RwLock::read` allows concurrent reads while apply
+//! holds an exclusive write lock.
 //!
 //! Shutdown: caller sets [`QueryLoopHandle::stop`] and `await`s the join.
 
@@ -13,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bincode::config::standard as bincode_standard;
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use tokio::task::JoinHandle;
 use uc_protocol::frames::query::{
     MSG_TYPE_QUERY, MSG_TYPE_QUERY_RESP, QueryKind, decode_extra_query, decode_flags_query,
@@ -33,7 +34,7 @@ pub struct QueryLoopHandle {
 }
 
 pub fn spawn_query_loop<S>(
-    sm: Arc<Mutex<S>>,
+    sm: Arc<RwLock<S>>,
     consumer: SpscConsumer,
     resp_producer: SpscProducer,
 ) -> QueryLoopHandle
@@ -52,7 +53,7 @@ where
 }
 
 async fn query_task_body<S>(
-    sm: Arc<Mutex<S>>,
+    sm: Arc<RwLock<S>>,
     mut consumer: SpscConsumer,
     mut resp_producer: SpscProducer,
     stop: Arc<AtomicBool>,
@@ -85,7 +86,7 @@ async fn query_task_body<S>(
                     }
                 };
                 let resp = {
-                    let guard = sm.lock();
+                    let guard = sm.read();
                     guard.query(q)
                 };
                 let resp_bytes = bincode::serde::encode_to_vec(&resp, bincode_standard())
