@@ -32,12 +32,20 @@ pub enum OutputFrameError {
 ///
 /// Wire-encoded by `uc_service` and decoded by `uc_node`'s
 /// output_dispatcher to decide retry vs advance.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, thiserror::Error)]
 pub enum OutputError {
     /// Retry while still leader. Backoff bounded by output_dispatcher.
+    #[error("retryable: {0}")]
     Retryable(String),
     /// Log warn, advance output_progress anyway, move on.
+    #[error("permanent: {0}")]
     Permanent(String),
+}
+
+impl OutputError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, OutputError::Retryable(_))
+    }
 }
 
 #[inline]

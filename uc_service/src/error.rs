@@ -8,17 +8,3 @@ pub enum SnapshotError {
     #[error("snapshot codec: {0}")]
     Codec(String),
 }
-
-#[derive(Debug, Error)]
-pub enum OutputError {
-    #[error("retryable: {0}")]
-    Retryable(String),
-    #[error("permanent: {0}")]
-    Permanent(String),
-}
-
-impl OutputError {
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, OutputError::Retryable(_))
-    }
-}

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::error::OutputError;
+pub use uc_protocol::frames::output::OutputError;
 use crate::state_machine::StateMachine;
 
 /// Leader-only post-commit hook. At-least-once delivery via durable progress
