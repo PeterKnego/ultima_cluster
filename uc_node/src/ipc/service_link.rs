@@ -26,14 +26,21 @@ pub const APPLY_RING_MAX_MSG: u32 = 16 * 1024 * 1024;
 /// 16 MiB cap, 4 MiB max single frame.
 pub const QUERY_RING_CAP: u64 = 16 * 1024 * 1024;
 pub const QUERY_RING_MAX_MSG: u32 = 4 * 1024 * 1024;
+/// 16 MiB cap, 4 MiB max single frame. (M5)
+pub const OUTPUT_RING_CAP: u64 = 16 * 1024 * 1024;
+pub const OUTPUT_RING_MAX_MSG: u32 = 4 * 1024 * 1024;
 
-/// Node-side halves of the four service rings. The matching halves
+/// Node-side halves of the six service rings. The matching halves
 /// (consumer/producer pairs) live on the service side.
 pub struct ServiceLink {
     pub apply_producer: SpscProducer,
     pub apply_resp_consumer: SpscConsumer,
     pub query_producer: SpscProducer,
     pub query_resp_consumer: SpscConsumer,
+    /// M5: node publishes OutputFrame here; service consumes.
+    pub output_producer: SpscProducer,
+    /// M5: service publishes OutputResp here; node consumes.
+    pub output_resp_consumer: SpscConsumer,
 }
 
 impl ServiceLink {
@@ -66,17 +73,32 @@ impl ServiceLink {
             QUERY_RING_CAP,
             QUERY_RING_MAX_MSG,
         )?;
+        // M5: output rings.
+        let output = SpscRing::create(
+            &service_dir.join("output.ring"),
+            OUTPUT_RING_CAP,
+            OUTPUT_RING_MAX_MSG,
+        )?;
+        let output_resp = SpscRing::create(
+            &service_dir.join("output_resp.ring"),
+            OUTPUT_RING_CAP,
+            OUTPUT_RING_MAX_MSG,
+        )?;
 
         let (apply_producer, _) = apply.into_split();
         let (_, apply_resp_consumer) = apply_resp.into_split();
         let (query_producer, _) = query.into_split();
         let (_, query_resp_consumer) = query_resp.into_split();
+        let (output_producer, _) = output.into_split();
+        let (_, output_resp_consumer) = output_resp.into_split();
 
         Ok(ServiceLink {
             apply_producer,
             apply_resp_consumer,
             query_producer,
             query_resp_consumer,
+            output_producer,
+            output_resp_consumer,
         })
     }
 }
@@ -99,7 +121,7 @@ mod tests {
     }
 
     #[test]
-    fn create_writes_four_ring_files() {
+    fn create_writes_six_ring_files() {
         let tmp = fresh_instance_dir();
         let _link = ServiceLink::create(tmp.path()).expect("create");
 
@@ -109,6 +131,8 @@ mod tests {
             "apply_resp.ring",
             "query.ring",
             "query_resp.ring",
+            "output.ring",
+            "output_resp.ring",
         ] {
             let p = service_dir.join(name);
             assert!(p.is_file(), "{} not created", p.display());
