@@ -175,6 +175,11 @@ pub struct NodeHandle<S: StateMachine> {
     /// Shmem-mode only: output ring dispatcher (M5). Stopped before client
     /// dispatchers so the output side drains before the client side closes.
     pub(crate) output_dispatcher: Option<crate::runtime::output_dispatcher::OutputDispatcherHandle>,
+    /// Shmem-mode only: leader-transition watcher that spawns output_replay
+    /// one-shots (M5 Task 4.1). Stopped before output_dispatcher so no new
+    /// replay tasks are spawned while the dispatcher is draining.
+    pub(crate) output_replay_watcher:
+        Option<crate::runtime::output_replay::OutputReplayWatcherHandle>,
 }
 
 impl<S: StateMachine> NodeHandle<S> {
@@ -346,6 +351,7 @@ impl<S: StateMachine> NodeHandle<S> {
             client_query_dispatcher,
             session_gc,
             output_dispatcher,
+            output_replay_watcher,
         } = self;
 
         // Shut down raft first so it stops issuing outbound RPCs.
@@ -364,6 +370,13 @@ impl<S: StateMachine> NodeHandle<S> {
             let _ = p.join.await;
         }
         if let Some(w) = service_watcher {
+            w.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = w.join.await;
+        }
+        // M5 Task 4.1: stop output_replay_watcher first so no new replay tasks
+        // are spawned while we drain. The watcher holds a clone of
+        // `output_chan_tx`; stopping it here releases that clone.
+        if let Some(w) = output_replay_watcher {
             w.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = w.join.await;
         }

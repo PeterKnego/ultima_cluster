@@ -131,6 +131,15 @@ impl<S: StateMachine> NodeBuilder<S> {
                     output_resp_consumer,
                 } = link;
 
+                // Clone journal before finish() consumes log_storage, so the
+                // output_replay watcher can scan the journal on leader transition
+                // (M5 Task 4.1).
+                let journal_for_replay = log_storage.journal.clone();
+
+                // Clone before passing into the adapter so the builder
+                // retains a sender for the output_replay watcher (M5 Task 4.1).
+                let output_chan_tx_for_replay = output_chan_tx.clone();
+
                 let adapter = ShmemAdaptedStateMachine::new(
                     self.state_machine,
                     handles,
@@ -198,9 +207,28 @@ impl<S: StateMachine> NodeBuilder<S> {
                         output_producer,
                         output_resp_consumer,
                         output_progress.clone(),
-                        leader_rx,
+                        leader_rx.clone(),
                     );
                 handle.output_dispatcher = Some(output_dispatcher);
+
+                // M5 Task 4.1: leader-transition watcher that fires a one-shot
+                // output_replay whenever this node becomes leader.
+                let raft_for_replay = handle.raft.clone();
+                let last_applied_provider = move || -> u64 {
+                    use openraft::rt::WatchReceiver as _;
+                    let metrics = raft_for_replay.metrics();
+                    let m = metrics.borrow_watched();
+                    m.last_applied.as_ref().map(|l| l.index).unwrap_or(0)
+                };
+                let output_replay_watcher =
+                    crate::runtime::output_replay::spawn_output_replay_watcher(
+                        journal_for_replay,
+                        output_progress.clone(),
+                        output_chan_tx_for_replay,
+                        leader_rx,
+                        last_applied_provider,
+                    );
+                handle.output_replay_watcher = Some(output_replay_watcher);
 
                 // Client-facing dispatchers + session GC. Spawned after
                 // finish (need handle.raft clone) and after service_watcher
@@ -446,6 +474,7 @@ where
         client_query_dispatcher: None,
         session_gc: None,
         output_dispatcher: None,
+        output_replay_watcher: None,
     })
 }
 
