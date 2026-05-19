@@ -70,11 +70,14 @@ async fn apply_round_trips_through_shmem_rings() {
     let link = ServiceLink::create(instance_dir.path()).expect("service link");
 
     // Build the shmem-mode SM adapter.
+    // M5: pass a dummy output channel; this test doesn't exercise the output path.
+    let (_dummy_tx, _dummy_rx) = tokio::sync::mpsc::channel::<(u64, bytes::Bytes)>(8);
     let mut sm = ShmemAdaptedStateMachine::new(
         StubSm,
         handles,
         link.apply_producer,
         link.apply_resp_consumer,
+        _dummy_tx,
     )
     .expect("ShmemAdaptedStateMachine::new");
 
@@ -173,11 +176,14 @@ async fn blank_and_membership_entries_emit_empty_response_without_touching_ring(
     let _instance = Instance::create(instance_dir.path(), "app", 1).expect("instance");
     let link = ServiceLink::create(instance_dir.path()).expect("link");
 
+    // M5: pass a dummy output channel; this test doesn't exercise the output path.
+    let (_dummy_tx, _dummy_rx) = tokio::sync::mpsc::channel::<(u64, bytes::Bytes)>(8);
     let mut sm = ShmemAdaptedStateMachine::new(
         StubSm,
         handles,
         link.apply_producer,
         link.apply_resp_consumer,
+        _dummy_tx,
     )
     .expect("ShmemAdaptedStateMachine::new");
 

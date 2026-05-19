@@ -52,6 +52,8 @@ impl<S: StateMachine> NodeBuilder<S> {
         crate::runtime::recovery::assert_consistent(&log_storage)?;
 
         let handles = log_storage.handles(self.config.data_dir.clone());
+        // M5: capture output_progress before handles is moved into the SM adapter.
+        let output_progress = handles.output_progress.clone();
 
         // Branch on ipc_mode and call the parameterized `finish` helper with
         // whichever concrete SM adapter we built.
@@ -85,6 +87,12 @@ impl<S: StateMachine> NodeBuilder<S> {
                     self.config.client_rings.max_msg,
                 )?;
 
+                // M5: in-process channel from apply (ShmemAdaptedStateMachine)
+                // to output_dispatcher. Buffer of 1024 entries; try_send on the
+                // producer side never blocks apply.
+                let (output_chan_tx, output_chan_rx) =
+                    tokio::sync::mpsc::channel::<(u64, bytes::Bytes)>(1024);
+
                 // Pointers into the cnc mmap for the heartbeat ticker + the
                 // service-side handshake watcher. Lifetimes are upheld by
                 // `instance` (moved into the NodeHandle) outliving both.
@@ -112,15 +120,27 @@ impl<S: StateMachine> NodeBuilder<S> {
                 }
                 .map_err(map_handshake_err)?;
 
+                // Destructure link upfront so all fields are moved by name
+                // (avoids partial-move issues with the struct).
+                let ServiceLink {
+                    apply_producer,
+                    apply_resp_consumer,
+                    query_producer,
+                    query_resp_consumer,
+                    output_producer,
+                    output_resp_consumer,
+                } = link;
+
                 let adapter = ShmemAdaptedStateMachine::new(
                     self.state_machine,
                     handles,
-                    link.apply_producer,
-                    link.apply_resp_consumer,
+                    apply_producer,
+                    apply_resp_consumer,
+                    output_chan_tx,
                 )?;
                 let query_link = Arc::new(ShmemQueryLink::new(
-                    link.query_producer,
-                    link.query_resp_consumer,
+                    query_producer,
+                    query_resp_consumer,
                 ));
                 let handle_sm = SmAdapter::Shmem(adapter.clone());
                 let node_id_for_watcher = self.config.node_id;
@@ -165,7 +185,22 @@ impl<S: StateMachine> NodeBuilder<S> {
                         handle.raft.clone(),
                     )
                 };
+                // M5: grab leader_rx before storing the publisher handle.
+                let leader_rx = metrics_publisher.leader_rx.clone();
                 handle.metrics_publisher = Some(metrics_publisher);
+
+                // M5: output_dispatcher — receives (log_index, cmd_bytes) from
+                // apply, publishes OutputFrame on output.ring, awaits OutputResp,
+                // advances output_progress durably.
+                let output_dispatcher =
+                    crate::runtime::output_dispatcher::spawn_output_dispatcher(
+                        output_chan_rx,
+                        output_producer,
+                        output_resp_consumer,
+                        output_progress.clone(),
+                        leader_rx,
+                    );
+                handle.output_dispatcher = Some(output_dispatcher);
 
                 // Client-facing dispatchers + session GC. Spawned after
                 // finish (need handle.raft clone) and after service_watcher
@@ -410,6 +445,7 @@ where
         client_dispatcher: None,
         client_query_dispatcher: None,
         session_gc: None,
+        output_dispatcher: None,
     })
 }
 

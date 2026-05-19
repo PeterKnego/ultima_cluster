@@ -172,6 +172,9 @@ pub struct NodeHandle<S: StateMachine> {
     pub(crate) client_query_dispatcher: Option<ClientDispatcherHandle>,
     /// Shmem-mode only: session-file GC.
     pub(crate) session_gc: Option<SessionGcHandle>,
+    /// Shmem-mode only: output ring dispatcher (M5). Stopped before client
+    /// dispatchers so the output side drains before the client side closes.
+    pub(crate) output_dispatcher: Option<crate::runtime::output_dispatcher::OutputDispatcherHandle>,
 }
 
 impl<S: StateMachine> NodeHandle<S> {
@@ -328,42 +331,70 @@ impl<S: StateMachine> NodeHandle<S> {
     }
 
     pub async fn shutdown(self) -> Result<(), ClusterError> {
+        // Destructure so we can control drop order precisely.
+        let NodeHandle {
+            raft,
+            config: _,
+            sm,
+            server,
+            _instance,
+            node_liveness,
+            query_link: _,
+            service_watcher,
+            metrics_publisher,
+            client_dispatcher,
+            client_query_dispatcher,
+            session_gc,
+            output_dispatcher,
+        } = self;
+
         // Shut down raft first so it stops issuing outbound RPCs.
         // Idempotent on second call (e.g. if the service watcher already
         // shut raft down on a stalled-leader event).
-        self.raft
-            .shutdown()
+        raft.shutdown()
             .await
             .map_err(|e| ClusterError::Raft(format!("shutdown: {:?}", e)))?;
         // Then the QUIC server (closes endpoint, awaits accept task).
-        self.server.shutdown().await;
+        server.shutdown().await;
         // Shmem-mode only: stop+join all cnc-mmap-holding tasks before
         // `_instance` drops. These hold `&'static` references into the
         // cnc mmap that lives in `_instance`.
-        if let Some(p) = self.metrics_publisher {
+        if let Some(p) = metrics_publisher {
             p.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = p.join.await;
         }
-        if let Some(w) = self.service_watcher {
+        if let Some(w) = service_watcher {
             w.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = w.join.await;
         }
-        if let Some(d) = self.client_dispatcher {
+        // M5: drop the SM adapter (closing `output_chan_tx`) BEFORE joining
+        // the output_dispatcher. The dispatcher blocks in `rx.recv().await`;
+        // dropping the last sender unblocks it so the join can complete.
+        drop(sm);
+        // M5: stop output_dispatcher before client dispatchers so the output
+        // side drains before the client side closes.
+        if let Some(d) = output_dispatcher {
             d.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = d.join.await;
         }
-        if let Some(d) = self.client_query_dispatcher {
+        if let Some(d) = client_dispatcher {
             d.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = d.join.await;
         }
-        if let Some(g) = self.session_gc {
+        if let Some(d) = client_query_dispatcher {
+            d.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = d.join.await;
+        }
+        if let Some(g) = session_gc {
             g.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = g.join.await;
         }
-        if let Some(lv) = self.node_liveness {
+        if let Some(lv) = node_liveness {
             lv.stop.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = lv.join.await;
         }
+        // _instance drops here after all tasks referencing the cnc mmap are joined.
+        drop(_instance);
         Ok(())
     }
 }

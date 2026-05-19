@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use openraft::ServerState;
 use openraft::rt::WatchReceiver as _;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use uc_protocol::cnc::{NodeStatus, node_role};
@@ -20,6 +21,9 @@ use crate::runtime::node::RaftHandle;
 pub struct MetricsPublisherHandle {
     pub join: JoinHandle<()>,
     pub stop: Arc<AtomicBool>,
+    /// M5: watch channel emitting whether this node currently sees itself as
+    /// raft Leader. Subscribed by `output_dispatcher` / `output_replay`.
+    pub leader_rx: watch::Receiver<bool>,
 }
 
 /// Spawn a task that watches `raft.metrics()` and copies the latest
@@ -39,11 +43,16 @@ pub(crate) unsafe fn spawn_metrics_publisher<S: StateMachine>(
     // SAFETY: see function-level # Safety.
     let status: &'static NodeStatus = unsafe { &*status_ptr };
 
+    // M5: watch channel that mirrors the node's leader state. Seeded false
+    // until the first publish_once fires. `watch::send` is a no-op when the
+    // value is identical, so steady-state overhead is minimal.
+    let (leader_tx, leader_rx) = watch::channel(false);
+
     let join = tokio::spawn(async move {
         let mut rx = raft.metrics();
         // Publish once on entry (avoid waiting for the first .changed() if
         // metrics already settled).
-        publish_once(status, &rx);
+        publish_once(status, &rx, &leader_tx);
 
         while !stop_for_task.load(Ordering::Relaxed) {
             // Wait for the next change. If the channel closes (raft
@@ -51,10 +60,10 @@ pub(crate) unsafe fn spawn_metrics_publisher<S: StateMachine>(
             if rx.changed().await.is_err() {
                 break;
             }
-            publish_once(status, &rx);
+            publish_once(status, &rx, &leader_tx);
         }
     });
-    MetricsPublisherHandle { join, stop }
+    MetricsPublisherHandle { join, stop, leader_rx }
 }
 
 fn publish_once(
@@ -63,6 +72,7 @@ fn publish_once(
         crate::raft::TypeConfig,
         openraft::RaftMetrics<crate::raft::TypeConfig>,
     >,
+    leader_tx: &watch::Sender<bool>,
 ) {
     let m = rx.borrow_watched();
 
@@ -90,4 +100,9 @@ fn publish_once(
     // committed: Option<LogId<...>>; the highest locally-committed index.
     let committed = m.committed.as_ref().map(|l| l.index()).unwrap_or(0);
     status.last_committed.store(committed, Ordering::Relaxed);
+
+    // M5: notify output_dispatcher of leader state. `send` is a no-op when
+    // the value is unchanged (watch channel semantics), so this is cheap in
+    // steady state.
+    let _ = leader_tx.send(role == node_role::LEADER);
 }
