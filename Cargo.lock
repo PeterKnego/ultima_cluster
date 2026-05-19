@@ -1926,10 +1926,12 @@ dependencies = [
 name = "uc_protocol"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "crc32fast",
  "memmap2",
  "page_size",
  "parking_lot",
+ "serde",
  "tempfile",
  "thiserror",
 ]

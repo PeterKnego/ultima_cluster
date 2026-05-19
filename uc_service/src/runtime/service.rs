@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use memmap2::MmapMut;
-use parking_lot::RwLock;
+use tokio::sync::RwLock;
 use uc_protocol::cnc::{CncHeader, ServiceStatus, service_state, sub};
 use uc_protocol::ring::RingError;
 
@@ -104,10 +104,11 @@ impl<S: StateMachine> ServiceBuilder<S> {
 
         let service_status_ptr = service_status_ptr(&attached.cnc_mmap);
 
-        // Wrap the user SM so apply (sync thread) and query (tokio task)
-        // can share it. parking_lot::RwLock allows query to take a shared
-        // read lock concurrently; apply takes an exclusive write lock.
-        // Neither is ever held across an await.
+        // Wrap the user SM so apply (sync thread), query (tokio task), and
+        // output_loop (tokio task) can share it. tokio::sync::RwLock is used
+        // because its read guard is Send, allowing output_loop to hold the
+        // read lock across the on_committed .await. apply uses blocking_write();
+        // query and output_loop use read().await.
         let sm_shared = Arc::new(RwLock::new(self.state_machine));
 
         let apply = spawn_apply_loop(

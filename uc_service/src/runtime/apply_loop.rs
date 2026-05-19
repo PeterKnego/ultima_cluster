@@ -6,8 +6,10 @@
 //! `state_machine.apply(log_index, cmd)` while holding the SM write lock, then
 //! publishes `ApplyRespFrame` into `service/apply_resp.ring`.
 //!
-//! Using `RwLock` (instead of `Mutex`) allows the future output_loop to hold
-//! a read lock for state inspection while apply owns the exclusive write lock.
+//! Using `tokio::sync::RwLock` (instead of `Mutex`) allows output_loop to
+//! hold a `Send` read guard across the on_committed await while apply owns
+//! the exclusive write lock. Apply acquires via `blocking_write()` since it
+//! runs on a plain `std::thread` outside any tokio runtime.
 //!
 //! Shutdown: caller sets [`ApplyLoopHandle::stop`] and joins.
 
@@ -17,7 +19,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use bincode::config::standard as bincode_standard;
-use parking_lot::RwLock;
+use tokio::sync::RwLock;
 use uc_protocol::frames::apply::{
     MSG_TYPE_APPLY, MSG_TYPE_APPLY_RESP, decode_extra_apply, decode_flags_apply,
     encode_extra_apply, encode_flags_apply,
@@ -89,7 +91,7 @@ fn apply_thread_body<S>(
                     }
                 };
                 let resp = {
-                    let mut guard = sm.write();
+                    let mut guard = sm.blocking_write();
                     guard.apply(log_index, cmd)
                 };
                 let resp_bytes = bincode::serde::encode_to_vec(&resp, bincode_standard())

@@ -17,6 +17,7 @@ pub mod apply_loop;
 pub mod attach;
 pub mod handshake;
 pub mod liveness;
+pub mod output_loop;
 pub mod query_loop;
 pub mod service;
 
