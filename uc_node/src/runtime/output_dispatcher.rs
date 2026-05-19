@@ -90,10 +90,20 @@ pub fn spawn_output_dispatcher(
                     PublishOutcome::FatalError => break 'outer,
                 }
 
-                // 2) Await response.
-                let resp = match await_output_resp(&mut output_resp_consumer, log_index).await {
+                // 2) Await response. Honors `stop` so shutdown isn't gated
+                // on the 30s timeout when no service-side consumer is wired.
+                let resp = match await_output_resp(
+                    &mut output_resp_consumer,
+                    log_index,
+                    &stop_for_task,
+                )
+                .await
+                {
                     Some(r) => r,
                     None => {
+                        if stop_for_task.load(Ordering::Relaxed) {
+                            break 'outer;
+                        }
                         tracing::warn!(
                             log_index,
                             "output_resp timeout; skipping; replay will catch"
@@ -178,10 +188,14 @@ async fn publish_output_frame(
 async fn await_output_resp(
     consumer: &mut SpscConsumer,
     expected_log_index: u64,
+    stop: &AtomicBool,
 ) -> Option<Result<(), OutputError>> {
     let deadline = std::time::Instant::now() + RESPONSE_TIMEOUT;
     let mut buf: Vec<u8> = Vec::with_capacity(256);
     while std::time::Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
         match consumer.try_read(&mut buf) {
             Ok(Some(rec)) if rec.msg_type == MSG_TYPE_OUTPUT_RESP => {
                 if let Err(e) = decode_flags_output(rec.flags) {
