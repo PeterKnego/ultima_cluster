@@ -444,6 +444,17 @@ impl<S: StateMachine> NodeHandle<S> {
             });
     }
 
+    /// Test-only: trigger graceful raft `transfer_leader` to `target`.
+    /// Returns the openraft `Fatal` error if the call fails; otherwise
+    /// the local node initiates the transfer and the target eventually
+    /// becomes leader on a new term.
+    pub async fn _test_transfer_leader(
+        &self,
+        target: crate::raft::NodeId,
+    ) -> Result<(), openraft::error::Fatal<crate::raft::TypeConfig>> {
+        self.raft.transfer_leader(target).await
+    }
+
     /// Test-only: set the leader watch channel to `value`. Combined with a
     /// `tokio::task::yield_now().await` between calls to `false` then `true`,
     /// this triggers the output_replay_watcher to spawn a replay sweep without
