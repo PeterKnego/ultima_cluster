@@ -444,13 +444,25 @@ impl<S: StateMachine> NodeHandle<S> {
             });
     }
 
-    /// Test-only: re-emit `false → true` on the leader_rx watch channel
-    /// to trigger an output_replay sweep without an actual leader flip.
-    /// Returns false if there's no metrics_publisher (embedded mode).
-    pub fn _test_force_leader_replay(&self) -> bool {
+    /// Test-only: set the leader watch channel to `value`. Combined with a
+    /// `tokio::task::yield_now().await` between calls to `false` then `true`,
+    /// this triggers the output_replay_watcher to spawn a replay sweep without
+    /// an actual Raft leader flip.
+    ///
+    /// Returns false if there's no metrics_publisher (embedded mode has no
+    /// leader watch channel).
+    ///
+    /// # Usage
+    ///
+    /// ```ignore
+    /// node._test_set_leader_state(false);
+    /// tokio::task::yield_now().await;   // let watcher see false
+    /// node._test_set_leader_state(true);
+    /// tokio::task::yield_now().await;   // let watcher see true and spawn replay
+    /// ```
+    pub fn _test_set_leader_state(&self, value: bool) -> bool {
         if let Some(mp) = self.metrics_publisher.as_ref() {
-            mp.leader_tx.send_replace(false);
-            mp.leader_tx.send_replace(true);
+            mp.leader_tx.send_replace(value);
             true
         } else {
             false
