@@ -2,9 +2,9 @@
 
 SMR cluster implementation on top of openraft.
 
-**Status:** M4 — MPSC/Broadcast wrap-fix + `uc_client` SDK end-to-end.
-Builds on M3.5's openraft 0.10 + `transfer_leader` cutover. See
-`docs/superpowers/specs/2026-05-10-ultima-cluster-design.md` for the
+**Status:** M5 — `OutputHandler` at-least-once dispatch (steady-state +
+leader-transition replay). Builds on M4's `uc_client` SDK + ring wrap-fix.
+See `docs/superpowers/specs/2026-05-10-ultima-cluster-design.md` for the
 canonical design and `docs/tasks/` for per-milestone records.
 
 ## Workspace
@@ -12,9 +12,10 @@ canonical design and `docs/tasks/` for per-milestone records.
 - `uc_protocol` — wire spec (`no_std`-friendly): ring buffer primitives
   (SPSC / MPSC / Broadcast), `cnc.dat` layout, per-RPC frame types,
   liveness + handshake helpers.
-- `uc_service` — service-side SDK (`StateMachine`, `OutputHandler`
-  traits) + the `uc_service::ultima_db` adapter
-  (`StoreStateMachine`).
+- `uc_service` — service-side SDK: sync `StateMachine` (apply, query,
+  snapshot) + async leader-only `OutputHandler::on_committed` with
+  at-least-once durability via node-side `output_progress.state`. Ships
+  the `uc_service::ultima_db` adapter (`StoreStateMachine`).
 - `uc_node` — cluster engine (Raft, log storage, QUIC inter-node
   network, shmem IPC owner: `instance.lock`, `cnc.dat`, service rings,
   liveness ticker, service watcher).
