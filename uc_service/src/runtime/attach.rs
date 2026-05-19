@@ -10,6 +10,8 @@
 //! <instance_dir>/service/apply_resp.ring    # service→node  (we produce)
 //! <instance_dir>/service/query.ring         # node→service  (we consume)
 //! <instance_dir>/service/query_resp.ring    # service→node  (we produce)
+//! <instance_dir>/service/output.ring        # node→service  (we consume)
+//! <instance_dir>/service/output_resp.ring   # service→node  (we produce)
 //! ```
 //!
 //! The `instance_id` check (the third leg of Hard Rule 11) is the service's
@@ -45,6 +47,8 @@ pub struct AttachedRings {
     pub apply_resp_producer: SpscProducer,
     pub query_consumer: SpscConsumer,
     pub query_resp_producer: SpscProducer,
+    pub output_consumer: SpscConsumer,
+    pub output_resp_producer: SpscProducer,
 }
 
 /// Open the node's `cnc.dat`, validate `(app_id, protocol_version)`, and
@@ -88,6 +92,8 @@ pub fn attach(instance_dir: &Path, expected_app_id: &str) -> Result<AttachedRing
     let apply_resp_ring = SpscRing::open(&service_dir.join("apply_resp.ring"))?;
     let query_ring = SpscRing::open(&service_dir.join("query.ring"))?;
     let query_resp_ring = SpscRing::open(&service_dir.join("query_resp.ring"))?;
+    let output_ring = SpscRing::open(&service_dir.join("output.ring"))?;
+    let output_resp_ring = SpscRing::open(&service_dir.join("output_resp.ring"))?;
 
     // For each ring we only need one half; the other half's `Arc<Inner>` is
     // dropped immediately and the kept half keeps the underlying mmap alive.
@@ -95,6 +101,8 @@ pub fn attach(instance_dir: &Path, expected_app_id: &str) -> Result<AttachedRing
     let (apply_resp_producer, _) = apply_resp_ring.into_split();
     let (_, query_consumer) = query_ring.into_split();
     let (query_resp_producer, _) = query_resp_ring.into_split();
+    let (_, output_consumer) = output_ring.into_split();
+    let (output_resp_producer, _) = output_resp_ring.into_split();
 
     Ok(AttachedRings {
         cnc_mmap,
@@ -104,6 +112,8 @@ pub fn attach(instance_dir: &Path, expected_app_id: &str) -> Result<AttachedRing
         apply_resp_producer,
         query_consumer,
         query_resp_producer,
+        output_consumer,
+        output_resp_producer,
     })
 }
 
@@ -142,6 +152,8 @@ mod tests {
             "apply_resp.ring",
             "query.ring",
             "query_resp.ring",
+            "output.ring",
+            "output_resp.ring",
         ] {
             SpscRing::create(&service_dir.join(name), CAP, MAX).unwrap();
         }

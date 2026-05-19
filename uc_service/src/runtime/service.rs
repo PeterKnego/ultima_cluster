@@ -22,7 +22,9 @@ use uc_protocol::ring::RingError;
 use super::apply_loop::{ApplyLoopHandle, spawn_apply_loop};
 use super::handshake::set_service_state;
 use super::liveness::{LivenessHandle, spawn_liveness};
+use super::output_loop::OutputLoopHandle;
 use super::query_loop::{QueryLoopHandle, spawn_query_loop};
+use crate::output_handler::OutputHandler;
 use crate::state_machine::StateMachine;
 
 /// Service-side configuration. Mirrors the IPC contract: every field maps
@@ -65,11 +67,48 @@ impl Default for ServiceConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Type-erased output handler
+// ---------------------------------------------------------------------------
+
+/// Type-erased `OutputHandler` that knows how to spawn its own `output_loop`.
+/// Stored in `ServiceBuilder` without requiring a second generic parameter
+/// over the concrete handler type `O`.
+pub(crate) trait ErasedOutputHandler<S: StateMachine>: Send + 'static {
+    fn spawn(
+        self: Box<Self>,
+        state: Arc<RwLock<S>>,
+        consumer: uc_protocol::ring::spsc::SpscConsumer,
+        producer: uc_protocol::ring::spsc::SpscProducer,
+    ) -> OutputLoopHandle;
+}
+
+pub(crate) struct ErasedHandler<S: StateMachine, O: OutputHandler<S>> {
+    inner: Arc<O>,
+    _marker: std::marker::PhantomData<S>,
+}
+
+impl<S: StateMachine, O: OutputHandler<S>> ErasedOutputHandler<S> for ErasedHandler<S, O> {
+    fn spawn(
+        self: Box<Self>,
+        state: Arc<RwLock<S>>,
+        consumer: uc_protocol::ring::spsc::SpscConsumer,
+        producer: uc_protocol::ring::spsc::SpscProducer,
+    ) -> OutputLoopHandle {
+        super::output_loop::spawn_output_loop(state, self.inner, consumer, producer)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ServiceBuilder
+// ---------------------------------------------------------------------------
+
 /// Fluent builder. Currently parks the configuration + user state machine;
 /// `run()` is unimplemented until Task 11.
 pub struct ServiceBuilder<S: StateMachine> {
     pub(crate) config: ServiceConfig,
     pub(crate) state_machine: S,
+    pub(crate) output_handler: Option<Box<dyn ErasedOutputHandler<S>>>,
 }
 
 impl<S: StateMachine> ServiceBuilder<S> {
@@ -77,15 +116,17 @@ impl<S: StateMachine> ServiceBuilder<S> {
         Self {
             config,
             state_machine,
+            output_handler: None,
         }
     }
 
-    /// Attach a leader-only `OutputHandler`. Currently a no-op — wired in
-    /// M5 along with the durable `output_progress.state` marker.
-    pub fn output_handler<O>(self, _handler: O) -> Self
-    where
-        O: crate::output_handler::OutputHandler<S>,
-    {
+    /// Attach a leader-only `OutputHandler`. Stored inside the builder and
+    /// spawned as an `output_loop` tokio task when `run()` is called.
+    pub fn output_handler<O: OutputHandler<S>>(mut self, handler: O) -> Self {
+        self.output_handler = Some(Box::new(ErasedHandler {
+            inner: Arc::new(handler),
+            _marker: std::marker::PhantomData,
+        }));
         self
     }
 
@@ -126,6 +167,24 @@ impl<S: StateMachine> ServiceBuilder<S> {
         // until `Service::shutdown` joins this task.
         let liveness = unsafe { spawn_liveness(service_status_ptr) };
 
+        // Extract the output ring halves before consuming the handler option
+        // so the borrow checker sees a clear split between the two branches.
+        let output_consumer = attached.output_consumer;
+        let output_resp_producer = attached.output_resp_producer;
+
+        // Spawn output_loop if a handler was wired. When None, the output
+        // rings are dropped harmlessly here; the node-side dispatcher
+        // (Task 3.3) will observe Full and skip.
+        let output = match self.output_handler {
+            Some(eh) => Some(eh.spawn(Arc::clone(&sm_shared), output_consumer, output_resp_producer)),
+            None => {
+                // Explicitly drop the unused halves to make the intent clear.
+                drop(output_consumer);
+                drop(output_resp_producer);
+                None
+            }
+        };
+
         // Mark ourselves ready. The node side picks this up via Acquire on
         // ServiceStatus.state. The full `ServiceReady` frame publish
         // lands when the cnc-sub-region MPSC attach API exists.
@@ -140,6 +199,7 @@ impl<S: StateMachine> ServiceBuilder<S> {
             apply,
             query,
             liveness,
+            output,
         })
     }
 }
@@ -159,7 +219,7 @@ fn service_status_ptr(cnc_mmap: &MmapMut) -> *const ServiceStatus {
     unsafe { base.add(offset) as *const ServiceStatus }
 }
 
-/// Running-service handle. Owns the cnc mmap and the three loop handles.
+/// Running-service handle. Owns the cnc mmap and all loop handles.
 /// Call [`Service::shutdown`] before drop; drop without shutdown leaks
 /// the loops (the std::thread and tokio tasks keep running).
 pub struct Service {
@@ -169,12 +229,24 @@ pub struct Service {
     apply: ApplyLoopHandle,
     query: QueryLoopHandle,
     liveness: LivenessHandle,
+    output: Option<OutputLoopHandle>,
 }
 
 impl Service {
-    /// Set all stop flags and join every loop. Returns once all three are
+    /// Set all stop flags and join every loop. Returns once all loops are
     /// done. Cnc mmap is unmapped on the drop that follows.
+    ///
+    /// Shutdown order matters: output_loop holds the read lock during
+    /// `on_committed`; stopping it first releases that lock before
+    /// apply_loop's join, so the std::thread can complete without blocking.
     pub async fn shutdown(self) -> Result<(), ServiceError> {
+        // Stop output_loop first — it holds a read lock that would block
+        // apply_loop's blocking_write() from completing.
+        if let Some(o) = self.output {
+            o.stop.store(true, Ordering::Relaxed);
+            let _ = o.join.await;
+        }
+
         self.apply.stop.store(true, Ordering::Relaxed);
         self.query.stop.store(true, Ordering::Relaxed);
         self.liveness.stop.store(true, Ordering::Relaxed);
@@ -310,6 +382,8 @@ mod tests {
             "apply_resp.ring",
             "query.ring",
             "query_resp.ring",
+            "output.ring",
+            "output_resp.ring",
         ] {
             SpscRing::create(&service_dir.join(name), 8192, 1024).unwrap();
         }
