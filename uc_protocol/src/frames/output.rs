@@ -105,8 +105,8 @@ mod tests {
             OutputError::Permanent("invalid record".to_string()),
         ];
         for err in cases {
-            let bytes = bincode::serde::encode_to_vec(&err, bincode::config::standard())
-                .expect("encode");
+            let bytes =
+                bincode::serde::encode_to_vec(&err, bincode::config::standard()).expect("encode");
             let (got, _) = bincode::serde::decode_from_slice::<OutputError, _>(
                 &bytes,
                 bincode::config::standard(),

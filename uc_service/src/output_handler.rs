@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
-pub use uc_protocol::frames::output::OutputError;
 use crate::state_machine::StateMachine;
+pub use uc_protocol::frames::output::OutputError;
 
 /// Leader-only post-commit hook. At-least-once delivery via durable progress
 /// marker on the node side; user MUST make on_committed idempotent.

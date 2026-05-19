@@ -92,25 +92,22 @@ pub fn spawn_output_dispatcher(
 
                 // 2) Await response. Honors `stop` so shutdown isn't gated
                 // on the 30s timeout when no service-side consumer is wired.
-                let resp = match await_output_resp(
-                    &mut output_resp_consumer,
-                    log_index,
-                    &stop_for_task,
-                )
-                .await
-                {
-                    Some(r) => r,
-                    None => {
-                        if stop_for_task.load(Ordering::Relaxed) {
+                let resp =
+                    match await_output_resp(&mut output_resp_consumer, log_index, &stop_for_task)
+                        .await
+                    {
+                        Some(r) => r,
+                        None => {
+                            if stop_for_task.load(Ordering::Relaxed) {
+                                break 'outer;
+                            }
+                            tracing::warn!(
+                                log_index,
+                                "output_resp timeout; skipping; replay will catch"
+                            );
                             break 'outer;
                         }
-                        tracing::warn!(
-                            log_index,
-                            "output_resp timeout; skipping; replay will catch"
-                        );
-                        break 'outer;
-                    }
-                };
+                    };
 
                 // 3) Decide.
                 match resp {
@@ -119,7 +116,11 @@ pub fn spawn_output_dispatcher(
                         break 'outer;
                     }
                     Err(OutputError::Permanent(ref msg)) => {
-                        tracing::warn!(log_index, msg, "OutputError::Permanent — advancing marker anyway");
+                        tracing::warn!(
+                            log_index,
+                            msg,
+                            "OutputError::Permanent — advancing marker anyway"
+                        );
                         advance_output_progress(&output_progress, log_index);
                         break 'outer;
                     }
@@ -225,7 +226,10 @@ async fn await_output_resp(
                 return Some(result);
             }
             Ok(Some(rec)) => {
-                tracing::warn!(msg_type = rec.msg_type, "unexpected frame on output_resp.ring");
+                tracing::warn!(
+                    msg_type = rec.msg_type,
+                    "unexpected frame on output_resp.ring"
+                );
             }
             Ok(None) => tokio::time::sleep(RESPONSE_POLL_IDLE).await,
             Err(e) => {

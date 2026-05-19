@@ -207,7 +207,10 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                     let resp = await_apply_resp(&g.apply_resp_consumer, log_index, log_id).await?;
                     // M5: hand off to output_dispatcher. try_send so apply never blocks
                     // on a full output channel — the skip path catches it during replay.
-                    if let Err(e) = g.output_chan_tx.try_send((log_index, cmd_bytes.clone().into())) {
+                    if let Err(e) = g
+                        .output_chan_tx
+                        .try_send((log_index, cmd_bytes.clone().into()))
+                    {
                         tracing::warn!(log_index, ?e, "output_chan full; replay will catch this");
                     }
                     resp

@@ -235,7 +235,10 @@ async fn m5_output_leader_transition_replay() {
 
     // ── Wait for leader convergence ─────────────────────────────────────────
     let leader_id = wait_for_leader(&node_handles, Duration::from_secs(15)).await;
-    assert!((1..=3).contains(&leader_id), "leader_id out of range: {leader_id}");
+    assert!(
+        (1..=3).contains(&leader_id),
+        "leader_id out of range: {leader_id}"
+    );
     let leader_idx = (leader_id as usize) - 1;
 
     tracing::info!(leader_id, "initial leader elected");

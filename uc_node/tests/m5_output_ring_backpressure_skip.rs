@@ -126,11 +126,8 @@ async fn m5_output_ring_backpressure_skip() {
     // so nothing drains output.ring. The node-side dispatcher publishes
     // one frame, then either times out on OutputResp or sees the ring
     // Full and skips after the 1 s grace.
-    let svc_task = tokio::spawn(async move {
-        ServiceBuilder::new(svc_cfg, Counter::default())
-            .run()
-            .await
-    });
+    let svc_task =
+        tokio::spawn(async move { ServiceBuilder::new(svc_cfg, Counter::default()).run().await });
 
     let node = tokio::time::timeout(Duration::from_secs(15), node_task)
         .await

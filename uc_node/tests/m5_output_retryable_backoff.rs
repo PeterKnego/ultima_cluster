@@ -87,7 +87,9 @@ impl OutputHandler<Counter> for FlakyOutput {
     ) -> Result<(), OutputError> {
         let n = self.tries.fetch_add(1, Ordering::Relaxed);
         if n < 3 {
-            Err(OutputError::Retryable(format!("transient failure attempt {n}")))
+            Err(OutputError::Retryable(format!(
+                "transient failure attempt {n}"
+            )))
         } else {
             Ok(())
         }

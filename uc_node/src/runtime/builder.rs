@@ -154,10 +154,7 @@ impl<S: StateMachine> NodeBuilder<S> {
                     apply_resp_consumer,
                     output_chan_tx,
                 )?;
-                let query_link = Arc::new(ShmemQueryLink::new(
-                    query_producer,
-                    query_resp_consumer,
-                ));
+                let query_link = Arc::new(ShmemQueryLink::new(query_producer, query_resp_consumer));
                 let handle_sm = SmAdapter::Shmem(adapter.clone());
                 let node_id_for_watcher = self.config.node_id;
                 let mut handle = finish(
@@ -209,14 +206,13 @@ impl<S: StateMachine> NodeBuilder<S> {
                 // M5: output_dispatcher — receives (log_index, cmd_bytes) from
                 // apply, publishes OutputFrame on output.ring, awaits OutputResp,
                 // advances output_progress durably.
-                let output_dispatcher =
-                    crate::runtime::output_dispatcher::spawn_output_dispatcher(
-                        output_chan_rx,
-                        output_producer,
-                        output_resp_consumer,
-                        output_progress.clone(),
-                        leader_rx.clone(),
-                    );
+                let output_dispatcher = crate::runtime::output_dispatcher::spawn_output_dispatcher(
+                    output_chan_rx,
+                    output_producer,
+                    output_resp_consumer,
+                    output_progress.clone(),
+                    leader_rx.clone(),
+                );
                 handle.output_dispatcher = Some(output_dispatcher);
 
                 // M5 Task 4.1: leader-transition watcher that fires a one-shot

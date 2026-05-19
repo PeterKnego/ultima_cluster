@@ -176,7 +176,11 @@ impl<S: StateMachine> ServiceBuilder<S> {
         // rings are dropped harmlessly here; the node-side dispatcher
         // (Task 3.3) will observe Full and skip.
         let output = match self.output_handler {
-            Some(eh) => Some(eh.spawn(Arc::clone(&sm_shared), output_consumer, output_resp_producer)),
+            Some(eh) => Some(eh.spawn(
+                Arc::clone(&sm_shared),
+                output_consumer,
+                output_resp_producer,
+            )),
             None => {
                 // Explicitly drop the unused halves to make the intent clear.
                 drop(output_consumer);
