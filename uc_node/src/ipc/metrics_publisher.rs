@@ -24,6 +24,9 @@ pub struct MetricsPublisherHandle {
     /// M5: watch channel emitting whether this node currently sees itself as
     /// raft Leader. Subscribed by `output_dispatcher` / `output_replay`.
     pub leader_rx: watch::Receiver<bool>,
+    /// Test-only: retained sender so tests can force a `false → true`
+    /// transition to trigger output_replay without an actual leader flip.
+    pub leader_tx: Arc<watch::Sender<bool>>,
 }
 
 /// Spawn a task that watches `raft.metrics()` and copies the latest
@@ -46,13 +49,15 @@ pub(crate) unsafe fn spawn_metrics_publisher<S: StateMachine>(
     // M5: watch channel that mirrors the node's leader state. Seeded false
     // until the first publish_once fires. `watch::send` is a no-op when the
     // value is identical, so steady-state overhead is minimal.
-    let (leader_tx, leader_rx) = watch::channel(false);
+    let (leader_tx_raw, leader_rx) = watch::channel(false);
+    let leader_tx = Arc::new(leader_tx_raw);
+    let leader_tx_for_task = Arc::clone(&leader_tx);
 
     let join = tokio::spawn(async move {
         let mut rx = raft.metrics();
         // Publish once on entry (avoid waiting for the first .changed() if
         // metrics already settled).
-        publish_once(status, &rx, &leader_tx);
+        publish_once(status, &rx, &leader_tx_for_task);
 
         while !stop_for_task.load(Ordering::Relaxed) {
             // Wait for the next change. If the channel closes (raft
@@ -60,10 +65,15 @@ pub(crate) unsafe fn spawn_metrics_publisher<S: StateMachine>(
             if rx.changed().await.is_err() {
                 break;
             }
-            publish_once(status, &rx, &leader_tx);
+            publish_once(status, &rx, &leader_tx_for_task);
         }
     });
-    MetricsPublisherHandle { join, stop, leader_rx }
+    MetricsPublisherHandle {
+        join,
+        stop,
+        leader_rx,
+        leader_tx,
+    }
 }
 
 fn publish_once(
@@ -72,7 +82,7 @@ fn publish_once(
         crate::raft::TypeConfig,
         openraft::RaftMetrics<crate::raft::TypeConfig>,
     >,
-    leader_tx: &watch::Sender<bool>,
+    leader_tx: &Arc<watch::Sender<bool>>,
 ) {
     let m = rx.borrow_watched();
 

@@ -22,7 +22,7 @@ use crate::ipc::{HandshakeError, Instance};
 use crate::network::QuicRaftNetworkFactory;
 use crate::network::server::spawn_server;
 use crate::network::tls;
-use crate::raft::log_storage::JournalLogStorage;
+use crate::raft::log_storage::{JournalLogStorage, LogStorageHandles};
 use crate::raft::state_machine::AdaptedStateMachine;
 use crate::raft::state_machine_shmem::ShmemAdaptedStateMachine;
 use crate::raft::{NodeAddr, NodeId, TypeConfig};
@@ -54,6 +54,8 @@ impl<S: StateMachine> NodeBuilder<S> {
         let handles = log_storage.handles(self.config.data_dir.clone());
         // M5: capture output_progress before handles is moved into the SM adapter.
         let output_progress = handles.output_progress.clone();
+        // Keep a separate clone of handles for the NodeHandle (test helpers).
+        let handles_for_node = log_storage.handles(self.config.data_dir.clone());
 
         // Branch on ipc_mode and call the parameterized `finish` helper with
         // whichever concrete SM adapter we built.
@@ -64,6 +66,7 @@ impl<S: StateMachine> NodeBuilder<S> {
                 finish(
                     self.config,
                     log_storage,
+                    handles_for_node,
                     adapter,
                     handle_sm,
                     None,
@@ -156,6 +159,7 @@ impl<S: StateMachine> NodeBuilder<S> {
                 let mut handle = finish(
                     self.config,
                     log_storage,
+                    handles_for_node,
                     adapter,
                     handle_sm,
                     Some(instance),
@@ -277,6 +281,7 @@ impl<S: StateMachine> NodeBuilder<S> {
 async fn finish<A, S>(
     config: NodeConfig,
     log_storage: JournalLogStorage,
+    log_storage_handles: LogStorageHandles,
     sm_adapter: A,
     handle_sm: SmAdapter<S>,
     instance: Option<Instance>,
@@ -463,6 +468,7 @@ where
     Ok(NodeHandle {
         raft: raft_handle,
         config,
+        log_storage_handles,
         sm: handle_sm,
         server,
         _instance: instance,

@@ -27,6 +27,7 @@ use crate::ipc::session_gc::SessionGcHandle;
 use crate::network::server::ServerHandle;
 use crate::raft::NodeAddr;
 use crate::raft::TypeConfig;
+use crate::raft::log_storage::LogStorageHandles;
 use crate::raft::state_machine::AdaptedStateMachine;
 use crate::raft::state_machine_shmem::ShmemAdaptedStateMachine;
 
@@ -145,6 +146,10 @@ impl<S: StateMachine> RaftHandle<S> {
 pub struct NodeHandle<S: StateMachine> {
     pub(crate) raft: RaftHandle<S>,
     pub(crate) config: NodeConfig,
+    /// Durable log storage handles (output_progress, last_applied, snapshot_meta).
+    /// Kept here for test-only helpers that inspect or mutate durable state.
+    #[cfg_attr(not(any(test, feature = "test-helpers")), allow(dead_code))]
+    pub(crate) log_storage_handles: LogStorageHandles,
     /// Cloned handle to the user state-machine adapter. The Raft engine owns
     /// another clone internally. Used by [`Self::query_snapshot`] in
     /// embedded mode; in shmem mode the closure path is unavailable.
@@ -340,6 +345,7 @@ impl<S: StateMachine> NodeHandle<S> {
         let NodeHandle {
             raft,
             config: _,
+            log_storage_handles: _,
             sm,
             server,
             _instance,
@@ -409,6 +415,46 @@ impl<S: StateMachine> NodeHandle<S> {
         // _instance drops here after all tasks referencing the cnc mmap are joined.
         drop(_instance);
         Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl<S: StateMachine> NodeHandle<S> {
+    /// Test-only: read the current `output_progress.state`. Returns 0 if
+    /// the StableValue is absent or load fails.
+    pub fn _test_output_progress(&self) -> u64 {
+        self.log_storage_handles
+            .output_progress
+            .load()
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
+    /// Test-only: force `output_progress.state` to a specific value. Used
+    /// by `m5_output_idempotent_replay` to simulate a partial-output crash.
+    pub fn _test_reset_output_progress(&self, value: u64) {
+        let _ = self
+            .log_storage_handles
+            .output_progress
+            .store(&value)
+            .map(|n| {
+                // best-effort wait; ignore wait errors in tests
+                let _ = n.wait();
+            });
+    }
+
+    /// Test-only: re-emit `false → true` on the leader_rx watch channel
+    /// to trigger an output_replay sweep without an actual leader flip.
+    /// Returns false if there's no metrics_publisher (embedded mode).
+    pub fn _test_force_leader_replay(&self) -> bool {
+        if let Some(mp) = self.metrics_publisher.as_ref() {
+            mp.leader_tx.send_replace(false);
+            mp.leader_tx.send_replace(true);
+            true
+        } else {
+            false
+        }
     }
 }
 
