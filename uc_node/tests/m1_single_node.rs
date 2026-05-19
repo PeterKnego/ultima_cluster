@@ -8,7 +8,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 
-use uc_node::{BootstrapConfig, ClientRingConfig, NodeBuilder, NodeConfig, RaftTuning, TlsConfig};
+use uc_node::{
+    BootstrapConfig, ClientRingConfig, NodeBuilder, NodeConfig, RaftTuning, ServiceRingConfig,
+    TlsConfig,
+};
 use uc_service::{SnapshotError, StateMachine};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -89,6 +92,7 @@ fn cfg(data_dir: PathBuf, bootstrap: BootstrapConfig) -> NodeConfig {
         tls: TlsConfig::default(),
         ipc_mode: uc_node::IpcMode::default(),
         client_rings: ClientRingConfig::default(),
+        service_rings: ServiceRingConfig::default(),
     }
 }
 

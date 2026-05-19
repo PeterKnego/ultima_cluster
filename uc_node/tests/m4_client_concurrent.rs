@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use uc_client::Client;
 use uc_node::{
-    BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning, TlsConfig,
+    BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning,
+    ServiceRingConfig, TlsConfig,
 };
 use uc_service::runtime::ServiceConfig;
 use uc_service::{ServiceBuilder, SnapshotError, StateMachine};
@@ -96,6 +97,7 @@ async fn m4_client_concurrent() {
             instance_dir: instance_dir.clone(),
         },
         client_rings: ClientRingConfig::default(),
+        service_rings: ServiceRingConfig::default(),
     };
     let node_task =
         tokio::spawn(async move { NodeBuilder::new(cfg, Counter::default()).start().await });

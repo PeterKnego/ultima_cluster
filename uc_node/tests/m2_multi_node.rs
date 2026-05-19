@@ -20,7 +20,7 @@ use tempfile::TempDir;
 
 use uc_node::{
     BootstrapConfig, ClientRingConfig, NodeBuilder, NodeConfig, NodeHandle, NodeId, PeerSeed,
-    RaftTuning, TlsConfig,
+    RaftTuning, ServiceRingConfig, TlsConfig,
 };
 use uc_service::{SnapshotError, StateMachine};
 
@@ -126,6 +126,7 @@ pub fn node_config(
         tls: TlsConfig::default(),
         ipc_mode: uc_node::IpcMode::default(),
         client_rings: ClientRingConfig::default(),
+        service_rings: ServiceRingConfig::default(),
     }
 }
 
@@ -302,6 +303,7 @@ async fn spawn_2_node_cluster_tight_snapshot() -> Vec<TestNode> {
             tls: TlsConfig::default(),
             ipc_mode: uc_node::IpcMode::default(),
             client_rings: ClientRingConfig::default(),
+            service_rings: ServiceRingConfig::default(),
         };
         prep.push((node_id, dir, *addr, cfg));
     }
@@ -416,6 +418,7 @@ async fn snapshot_install_on_new_follower() {
         tls: TlsConfig::default(),
         ipc_mode: uc_node::IpcMode::default(),
         client_rings: ClientRingConfig::default(),
+        service_rings: ServiceRingConfig::default(),
     };
     let new_handle = NodeBuilder::new(new_cfg, Counter::default())
         .start()

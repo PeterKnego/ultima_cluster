@@ -79,7 +79,11 @@ impl<S: StateMachine> NodeBuilder<S> {
             IpcMode::Shmem { instance_dir } => {
                 let instance =
                     Instance::create(&instance_dir, &self.config.app_id, self.config.node_id)?;
-                let link = ServiceLink::create(&instance_dir)?;
+                let link = ServiceLink::create_with_output_cap(
+                    &instance_dir,
+                    self.config.service_rings.output_cap_bytes,
+                    self.config.service_rings.output_max_msg,
+                )?;
                 let ClientLink {
                     submit_consumer,
                     query_consumer,

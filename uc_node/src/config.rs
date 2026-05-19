@@ -26,6 +26,26 @@ impl Default for ClientRingConfig {
     }
 }
 
+/// M5: knob for the service-side output ring caps. Default sized for
+/// production; tests can shrink it to force the dispatcher's skip path.
+#[derive(Debug, Clone)]
+pub struct ServiceRingConfig {
+    /// Capacity (slot-region bytes) for `service/output.ring` and
+    /// `service/output_resp.ring`. Power of 2 ≥ RECORD_ALIGN.
+    pub output_cap_bytes: u64,
+    /// Max single message size on the output rings.
+    pub output_max_msg: u32,
+}
+
+impl Default for ServiceRingConfig {
+    fn default() -> Self {
+        Self {
+            output_cap_bytes: 16 * 1024 * 1024,
+            output_max_msg: 4 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     pub node_id: NodeId,
@@ -43,6 +63,9 @@ pub struct NodeConfig {
     /// Sizing for the three client-facing ring files. Defaults to 16 MiB /
     /// 4 MiB. Override in tests to force wrap-path coverage.
     pub client_rings: ClientRingConfig,
+    /// Sizing for the service-side output ring files. Defaults to 16 MiB /
+    /// 4 MiB. Override in tests to force the dispatcher's skip path.
+    pub service_rings: ServiceRingConfig,
 }
 
 /// Selects how `apply()` is dispatched.

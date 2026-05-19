@@ -21,7 +21,7 @@ use tempfile::TempDir;
 
 use uc_node::{
     BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, NodeHandle, NodeId,
-    PeerSeed, RaftTuning, TlsConfig,
+    PeerSeed, RaftTuning, ServiceRingConfig, TlsConfig,
 };
 use uc_service::runtime::ServiceConfig;
 use uc_service::{Service, ServiceBuilder, SnapshotError, StateMachine};
@@ -155,6 +155,7 @@ async fn service_crash_on_leader_transfers_leadership() {
                 instance_dir: instance_dir.path().to_owned(),
             },
             client_rings: ClientRingConfig::default(),
+            service_rings: ServiceRingConfig::default(),
         };
         node_tasks.push(tokio::spawn(async move {
             NodeBuilder::new(cfg, Counter::default()).start().await

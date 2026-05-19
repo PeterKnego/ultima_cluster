@@ -26,7 +26,8 @@ use tempfile::TempDir;
 use ultima_db::Store;
 
 use uc_node::{
-    BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning, TlsConfig,
+    BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning,
+    ServiceRingConfig, TlsConfig,
 };
 use uc_service::ServiceBuilder;
 use uc_service::runtime::ServiceConfig;
@@ -97,6 +98,7 @@ async fn ultima_db_adapter_end_to_end() {
             instance_dir: instance_dir.clone(),
         },
         client_rings: ClientRingConfig::default(),
+        service_rings: ServiceRingConfig::default(),
     };
     // Node-side SM is degenerate in shmem mode (snapshot trait surface only).
     let node_task =

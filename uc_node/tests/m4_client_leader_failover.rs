@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use uc_client::{Client, ClientError};
 use uc_node::{
     BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, NodeHandle, NodeId,
-    PeerSeed, RaftTuning, TlsConfig,
+    PeerSeed, RaftTuning, ServiceRingConfig, TlsConfig,
 };
 use uc_service::runtime::ServiceConfig;
 use uc_service::{ServiceBuilder, SnapshotError, StateMachine};
@@ -176,6 +176,7 @@ async fn m4_client_leader_failover() {
                 instance_dir: instance_dir.path().to_owned(),
             },
             client_rings: ClientRingConfig::default(),
+            service_rings: ServiceRingConfig::default(),
         };
         node_tasks.push(tokio::spawn(async move {
             NodeBuilder::new(cfg, Counter::default()).start().await

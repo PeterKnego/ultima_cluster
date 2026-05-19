@@ -24,7 +24,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tempfile::TempDir;
 use uc_node::{
-    BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning, TlsConfig,
+    BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning,
+    ServiceRingConfig, TlsConfig,
 };
 use uc_service::runtime::ServiceConfig;
 use uc_service::{ServiceBuilder, SnapshotError, StateMachine};
@@ -104,6 +105,7 @@ async fn shmem_single_node_submit_apply() {
             instance_dir: instance_dir.clone(),
         },
         client_rings: ClientRingConfig::default(),
+        service_rings: ServiceRingConfig::default(),
     };
     let node_task = tokio::spawn(async move {
         // Counter passed to the node is degenerate in shmem mode (used
@@ -201,6 +203,7 @@ async fn shmem_single_node_query_roundtrip() {
             instance_dir: instance_dir.clone(),
         },
         client_rings: ClientRingConfig::default(),
+        service_rings: ServiceRingConfig::default(),
     };
     let node_task =
         tokio::spawn(async move { NodeBuilder::new(node_cfg, Counter::default()).start().await });

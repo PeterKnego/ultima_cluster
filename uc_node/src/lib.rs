@@ -9,7 +9,8 @@ pub mod raft;
 pub mod runtime;
 
 pub use config::{
-    BootstrapConfig, ClientRingConfig, IpcMode, NodeConfig, NodeId, PeerSeed, RaftTuning, TlsConfig,
+    BootstrapConfig, ClientRingConfig, IpcMode, NodeConfig, NodeId, PeerSeed, RaftTuning,
+    ServiceRingConfig, TlsConfig,
 };
 pub use error::ClusterError;
 pub use ipc::{Instance, IpcError};

@@ -44,13 +44,29 @@ pub struct ServiceLink {
 }
 
 impl ServiceLink {
-    /// Create all four ring files under `<instance_dir>/service/` and take
+    /// Create all six ring files under `<instance_dir>/service/` and take
     /// the node-side halves. The service-side process picks up its halves
     /// via `uc_service::runtime::attach::attach`.
+    ///
+    /// Output ring caps default to [`OUTPUT_RING_CAP`] / [`OUTPUT_RING_MAX_MSG`].
     ///
     /// Caller must ensure `<instance_dir>/service/` exists — typically
     /// created by [`super::instance::Instance::create`] just before this.
     pub fn create(instance_dir: &Path) -> Result<Self, IpcError> {
+        Self::create_with_output_cap(instance_dir, OUTPUT_RING_CAP, OUTPUT_RING_MAX_MSG)
+    }
+
+    /// Like [`create`](Self::create) but with configurable output ring caps.
+    /// Apply and query rings always use their production constants.
+    ///
+    /// Used by [`crate::runtime::builder::NodeBuilder::start`] in shmem mode
+    /// when [`crate::config::ServiceRingConfig`] has been tuned (e.g. tiny
+    /// rings in tests to force the dispatcher's 1 s grace-then-skip path).
+    pub fn create_with_output_cap(
+        instance_dir: &Path,
+        output_cap_bytes: u64,
+        output_max_msg: u32,
+    ) -> Result<Self, IpcError> {
         let service_dir = instance_dir.join("service");
 
         let apply = SpscRing::create(
@@ -73,16 +89,16 @@ impl ServiceLink {
             QUERY_RING_CAP,
             QUERY_RING_MAX_MSG,
         )?;
-        // M5: output rings.
+        // M5: output rings — sized by caller (production or test caps).
         let output = SpscRing::create(
             &service_dir.join("output.ring"),
-            OUTPUT_RING_CAP,
-            OUTPUT_RING_MAX_MSG,
+            output_cap_bytes,
+            output_max_msg,
         )?;
         let output_resp = SpscRing::create(
             &service_dir.join("output_resp.ring"),
-            OUTPUT_RING_CAP,
-            OUTPUT_RING_MAX_MSG,
+            output_cap_bytes,
+            output_max_msg,
         )?;
 
         let (apply_producer, _) = apply.into_split();
