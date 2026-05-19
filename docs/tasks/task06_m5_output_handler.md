@@ -128,7 +128,7 @@ All commands green at M5 close:
 
 ```bash
 cargo build --workspace                                    # clean
-cargo test  --workspace                                    # all M1/M2/M3/M3.5/M4/M5 pass; 1 ignored (M4 failover)
+cargo test  --workspace                                    # all M1/M2/M3/M3.5/M4/M5 pass (M4 failover now passing via remove_node fix)
 cargo clippy --workspace --all-targets -- -D warnings      # zero warnings
 cargo fmt --check                                          # clean
 ```
@@ -149,7 +149,7 @@ m5_output_ring_backpressure_skip      ~ 4.2 s
 
 - **`snapshot.region` mmap + openraft V2 `generic-snapshot-data`.** Snapshots still ride through the existing apply/journal path; the dedicated mmap region awaits the openraft cutover.
 - **Service-recovery handshake** (cnc-sub-mmap MPSC attach for `ServiceReady{last_applied}` frames). M3.5 follow-up #1.
-- **M4 failover test fix** (auto-remove unreachable voters after N failed AppendEntries). M4 follow-up; `m4_client_leader_failover` remains `#[ignore]`.
+- **Auto-remove unreachable voters in `uc_node`** (after N failed AppendEntries). The M4 `m4_client_leader_failover` test was un-ignored using the test-side workaround — the new leader's `NodeHandle` calls `remove_node(dead_leader_id)` before client-write retries. The framework-side automatic version would let production callers stop caring about membership during a hard leader crash.
 - **`raft.ensure_linearizable()` plumbing** on the query path. Two-line follow-up; defer until a test demands stricter semantics.
 - **Multi-process integration tests.** All M5 tests run in-process tokio tasks; the protocol works identically across process boundaries; cross-process harness is M6+.
 - **Multi-service runtime.** Protocol shape (`service_id` in `flags`, services-table in `cnc.dat`) was reserved in M4. The runtime — per-service dispatchers, per-service `StableValue`s, snapshot demux — is the multi-month feature tracked separately.

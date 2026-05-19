@@ -126,13 +126,6 @@ async fn wait_for_leader(handles: &[NodeHandle<Counter>], timeout: Duration) -> 
 
 // ── Test ───────────────────────────────────────────────────────────────────
 
-#[ignore = "flaky on slower machines / under load — post-failover client_write times out \
-              because openraft keeps retrying replication to the (dead, unreachable) old leader \
-              before accepting the new leader's quorum. Reliable fix requires either: \
-              (a) auto-remove unreachable members after N failed AppendEntries, or \
-              (b) the test pre-emptively calling node.remove_node(dead_leader_id) via a \
-              surviving handle before submitting. M4 follow-up — leader election itself \
-              works (NodeStalled detection + new-leader convergence both verified)."]
 #[tokio::test]
 async fn m4_client_leader_failover() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -331,21 +324,44 @@ async fn m4_client_leader_failover() {
         "new leader must differ from the old one"
     );
 
+    // ── Preemptively remove the dead voter from the membership ─────────────
+    // Without this, openraft keeps retrying AppendEntries to the dead
+    // node and post-failover client_writes time out. The new leader has
+    // quorum with itself + the other survivor, so the change_membership
+    // call commits without needing the dead leader.
+    //
+    // Find the NodeHandle whose node_id == new_leader_id (the surviving
+    // handles are in node_handles after the leader_idx removal above).
+    let new_leader_handle = node_handles
+        .iter()
+        .find(|h| h.node_id() == new_leader_id)
+        .expect("new leader handle missing from surviving set");
+    new_leader_handle
+        .remove_node(leader_id)
+        .await
+        .expect("remove dead leader from voter set");
+
     // ── Submit through a surviving client, retrying until the new leader
-    // confirms quorum (it may briefly return NotLeader while stabilising). ──
-    let submit_deadline = std::time::Instant::now() + Duration::from_secs(15);
+    // confirms quorum. After `remove_node` the new leader may briefly
+    // return NotLeader while it stabilises post-membership-change. Allow
+    // up to 30 s — change_membership can churn for a while as openraft
+    // processes the joint-consensus transition. ──
+    let submit_deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut post_failover_ok = false;
+    let mut last_observed_leader: Vec<Option<u64>> = vec![None; 3];
     while std::time::Instant::now() < submit_deadline {
-        // Re-read current_leader from all surviving clients to find whoever
-        // now knows the new leader.
-        let active_idx_opt = surviving_indices
-            .iter()
-            .find(|&&si| clients[si].current_leader() == Some(new_leader_id))
-            .copied();
-        if let Some(active_idx) = active_idx_opt {
-            match clients[active_idx].submit::<Cmd, Resp>(&Cmd::Inc(1)).await {
+        // Try every surviving client whose cnc-visible leader is non-None
+        // (it may have flipped to something other than new_leader_id post-
+        // membership-change; the new leader id is whoever the surviving
+        // clients agree on now).
+        for &si in &surviving_indices {
+            let leader = clients[si].current_leader();
+            last_observed_leader[si] = leader;
+            if leader.is_none() {
+                continue;
+            }
+            match clients[si].submit::<Cmd, Resp>(&Cmd::Inc(1)).await {
                 Ok(r) => {
-                    // Counter was at 1 before failover; new submit adds 1 → ≥ 2.
                     assert!(
                         r.value >= 2,
                         "post-failover value should be >= 2, got {}",
@@ -354,17 +370,24 @@ async fn m4_client_leader_failover() {
                     post_failover_ok = true;
                     break;
                 }
-                Err(ClientError::NotLeader { .. }) => {
-                    // New leader hasn't stabilised yet; retry.
-                }
+                // Stabilisation: NotLeader (membership change in flight),
+                // ResponseOverwritten (broadcast lap during stabilisation),
+                // Timeout (transient). All retryable.
+                Err(ClientError::NotLeader { .. })
+                | Err(ClientError::ResponseOverwritten)
+                | Err(ClientError::Timeout(_)) => {}
                 Err(e) => panic!("post-failover submit unexpected error: {e:?}"),
             }
+        }
+        if post_failover_ok {
+            break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     assert!(
         post_failover_ok,
-        "post-failover submit did not succeed within 15s"
+        "post-failover submit did not succeed within 30s; \
+         last observed clients[*].current_leader() = {last_observed_leader:?}"
     );
 
     // ── Shutdown ────────────────────────────────────────────────────────────

@@ -108,7 +108,7 @@ Seven integration tests under `uc_node/tests/`:
 - **`m4_client_three_node`** — 3 nodes + 3 services + 3 clients; leader's client submits, followers' clients converge via `query_snapshot`, followers' submits get `NotLeader { hint: Some(leader_id) }`. ~6.4 s.
 - **`m4_client_concurrent`** — 4 clients × 50 submits via `tokio::join!`, final value = 50×(1+2+3+4) = 500. ~4.3 s.
 - **`m4_client_wrap`** — 32 KiB rings, 2 clients × 500 submits → ~6+ wraps. End-to-end validation of Phase 1's wrap-fix. ~10.3 s.
-- **`m4_client_leader_failover`** — 3 nodes; shut down the leader; old-leader's client fires `NodeStalled` within ~2 s; surviving clients elect a new leader; post-failover submit through the new leader. **`#[ignore]`** — passes on the implementer's host but flakes consistently elsewhere because openraft keeps retrying replication to the (dead, unreachable) old-leader voter before accepting quorum. Election + `NodeStalled` detection are both verified; the post-failover client_write is what times out. Reliable fix needs either auto-remove of unreachable voters after N failed AppendEntries (openraft feature work) or the test pre-emptively calling `node.remove_node(dead_leader_id)` via a surviving handle before submitting. M4 follow-up. ~20 s when un-ignored.
+- **`m4_client_leader_failover`** — 3 nodes; shut down the leader; old-leader's client fires `NodeStalled` within ~2 s; surviving clients elect a new leader; the new-leader's `NodeHandle` calls `remove_node(dead_leader_id)` to drop the unreachable voter from the membership; post-failover submit succeeds. ~38 s. Now passing (M5-era fix — option (b) from the original deferral). The 30 s tail is openraft's internal joint-consensus replication retry to the dead voter inside `change_membership`; harmless once the membership commits.
 - **`m4_client_session_gc`** — drop `Client` without `shutdown()`; node's `session_gc` unlinks the stale session file within 10 s.
 - **`m4_client_response_overwritten`** — slow client with broadcast reader paused (`_test_pause_broadcast_reader` behind `test-helpers` feature); driver client floods 4 KiB broadcast ring to lap; resume reader; in-flight submit resolves to `ClientError::ResponseOverwritten`. ~6.3 s.
 
@@ -159,7 +159,7 @@ m4_client_single_node           ~ 2.3 s
 m4_client_three_node            ~ 6.4 s
 m4_client_concurrent            ~ 4.3 s
 m4_client_wrap                  ~ 10.3 s
-m4_client_leader_failover       (#[ignore] — see Phase 5 notes)
+m4_client_leader_failover       ~ 38 s    (M5-era fix; see Phase 5 notes)
 m4_client_session_gc            ~ 10.2 s  (stale-after window)
 m4_client_response_overwritten  ~ 6.3 s
 ```
