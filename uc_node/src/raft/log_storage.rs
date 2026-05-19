@@ -35,6 +35,10 @@ pub struct StoredSnapshotMeta {
 pub struct LogStorageHandles {
     pub last_applied: Arc<StableValue<RaftLogId>>,
     pub snapshot_meta: Arc<StableValue<StoredSnapshotMeta>>,
+    /// M5: durable marker for "last log_index whose `on_committed` completed
+    /// (Ok or Permanent)." Advanced per-record by the output_dispatcher.
+    /// Recovery scans `(load(), last_applied]` on leader-acquisition.
+    pub output_progress: Arc<StableValue<u64>>,
     pub data_dir: PathBuf,
 }
 
@@ -45,6 +49,8 @@ pub struct JournalLogStorage {
     pub(crate) last_purged: Arc<StableValue<RaftLogId>>,
     pub(crate) last_applied: Arc<StableValue<RaftLogId>>,
     pub(crate) snapshot_meta: Arc<StableValue<StoredSnapshotMeta>>,
+    /// M5: see `LogStorageHandles::output_progress`.
+    pub(crate) output_progress: Arc<StableValue<u64>>,
     /// Serializes seq assignment per the journal's caller-coordination requirement.
     /// openraft already serializes appends, so this is a no-contention guarantee.
     pub(crate) append_lock: Arc<Mutex<()>>,
@@ -90,6 +96,12 @@ impl JournalLogStorage {
             max_payload_bytes: 4096 - 17,
         })?);
 
+        let output_progress = Arc::new(StableValue::open(StableValueConfig {
+            path: data_dir.join("output_progress.state"),
+            durability: Durability::Consistent,
+            max_payload_bytes: 4096 - 17,
+        })?);
+
         Ok(Self {
             journal,
             vote,
@@ -97,6 +109,7 @@ impl JournalLogStorage {
             last_purged,
             last_applied,
             snapshot_meta,
+            output_progress,
             append_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -105,6 +118,7 @@ impl JournalLogStorage {
         LogStorageHandles {
             last_applied: self.last_applied.clone(),
             snapshot_meta: self.snapshot_meta.clone(),
+            output_progress: self.output_progress.clone(),
             data_dir,
         }
     }
@@ -254,6 +268,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             last_purged: self.last_purged.clone(),
             last_applied: self.last_applied.clone(),
             snapshot_meta: self.snapshot_meta.clone(),
+            output_progress: self.output_progress.clone(),
             append_lock: self.append_lock.clone(),
         }
     }

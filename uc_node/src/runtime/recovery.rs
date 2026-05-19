@@ -30,5 +30,25 @@ pub fn assert_consistent(storage: &JournalLogStorage) -> Result<(), ClusterError
             purged.index
         )));
     }
+
+    // M5 invariant: output_progress must not race ahead of last_applied.
+    // If the output marker is past what's been applied, replay would skip
+    // committed-but-unoutput entries.
+    let last_applied_idx = storage
+        .last_applied
+        .load()
+        .map_err(|e| ClusterError::Recovery(format!("read last_applied: {e}")))?
+        .map(|l| l.index)
+        .unwrap_or(0);
+    let output_progress = storage
+        .output_progress
+        .load()
+        .map_err(|e| ClusterError::Recovery(format!("read output_progress: {e}")))?
+        .unwrap_or(0);
+    if output_progress > last_applied_idx {
+        return Err(ClusterError::Recovery(format!(
+            "output_progress ({output_progress}) > last_applied ({last_applied_idx}) — data dir corrupt"
+        )));
+    }
     Ok(())
 }
