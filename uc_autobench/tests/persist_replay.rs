@@ -43,7 +43,10 @@ fn replay_tolerates_trailing_garbage() {
 
     // Append garbage at the end.
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
     f.write_all(b"{not-json\n").unwrap();
     drop(f);
 

@@ -1,4 +1,4 @@
-use uc_autobench::leaderboard::{normalize_source, Entry, Leaderboard};
+use uc_autobench::leaderboard::{Entry, Leaderboard, normalize_source};
 use uc_autobench::task::Direction;
 
 fn ent(id: &str, primary: f64, source: &str) -> Entry {
