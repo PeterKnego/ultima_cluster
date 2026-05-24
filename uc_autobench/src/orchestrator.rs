@@ -199,17 +199,26 @@ pub fn run_loop(
             tracing::warn!(error=%e, "failed to write summary.md");
         }
 
-        // Temperature schedule.
-        if plateau_count >= spec.budget.plateau_window {
-            let new_temp = if temperature < 0.7 { 0.7 } else { 0.9 };
-            if new_temp != temperature {
-                temperature = new_temp;
-                log.append(&LoopEvent::PlateauTemperature {
-                    t: now_iso(),
-                    new_temp,
-                    reason: format!("{plateau_count} iters without improvement"),
-                })?;
-            }
+        // Temperature schedule (spec §4.3): 0.4 default; 0.7 after
+        // `plateau_window` stale iters; 0.9 after `2 * plateau_window`. Use u64
+        // for the doubled threshold so a large `plateau_window` (u32) can't
+        // overflow.
+        let window = spec.budget.plateau_window as u64;
+        let stale = plateau_count as u64;
+        let new_temp = if stale >= window.saturating_mul(2) && temperature < 0.9 {
+            Some(0.9_f32)
+        } else if stale >= window && temperature < 0.7 {
+            Some(0.7_f32)
+        } else {
+            None
+        };
+        if let Some(new_temp) = new_temp {
+            temperature = new_temp;
+            log.append(&LoopEvent::PlateauTemperature {
+                t: now_iso(),
+                new_temp,
+                reason: format!("{plateau_count} iters without improvement"),
+            })?;
         }
 
         iter += 1;
@@ -281,13 +290,40 @@ fn run_one_variant(
         }
     }
     let snap = snapshot_files(&cfg.repo_root, &snap_paths)?;
-    apply_patch(&cfg.repo_root, proposal)?;
+
+    // Best-effort: persist each subprocess's output to `logs/<name>.log` for
+    // debugging the real shmem run (spec §7.1 directory layout). Failures here
+    // are non-fatal, like the summary.md write.
+    let logs_dir = variant_dir.join("logs");
+    let write_log = |name: &str, outcome: &SandboxOutcome| {
+        let body = match outcome {
+            SandboxOutcome::Completed { stdout, stderr, .. } => {
+                format!("{stdout}\n--- stderr ---\n{stderr}")
+            }
+            SandboxOutcome::TimedOut { duration } => {
+                format!("timed out after {duration:?}")
+            }
+        };
+        if let Err(e) = fs::write(logs_dir.join(format!("{name}.log")), body) {
+            tracing::warn!(error=%e, name, "failed to persist subprocess log");
+        }
+    };
 
     let result = (|| -> anyhow::Result<Outcome> {
+        // Apply the patch INSIDE the restore-bearing closure: if apply_patch
+        // fails partway (some files written, then an fs error), the `?` here
+        // still leaves the unconditional `restore_snapshot` below to revert the
+        // partial application.
+        apply_patch(&cfg.repo_root, proposal)?;
+
         // 3. Correctness gate.
         let gate_start = Instant::now();
-        for gate_cmd in [&spec.gates.test_cmd, &spec.gates.torture_cmd] {
+        for (name, gate_cmd) in [
+            ("cargo-test", &spec.gates.test_cmd),
+            ("ring-torture", &spec.gates.torture_cmd),
+        ] {
             let r = run_subprocess(gate_cmd, Duration::from_secs(spec.gates.test_timeout_s))?;
+            write_log(name, &r);
             let ok = matches!(&r, SandboxOutcome::Completed { exit_code: 0, .. });
             if !ok {
                 let reason = match r {
@@ -322,6 +358,7 @@ fn run_one_variant(
             &spec.microbench.cmd,
             Duration::from_secs(spec.gates.test_timeout_s),
         )?;
+        write_log("microbench", &bench);
         let (stdout, _) = match bench {
             SandboxOutcome::Completed {
                 exit_code: 0,
@@ -380,9 +417,6 @@ fn run_one_variant(
 
     // Always restore.
     restore_snapshot(&cfg.repo_root, &snap)?;
-
-    // Persist logs into variant dir for debugging.
-    let _ = variant_dir.join("logs");
 
     result
 }
