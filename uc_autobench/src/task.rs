@@ -97,3 +97,46 @@ impl BenchResult {
         self.metrics.get(name).copied()
     }
 }
+
+use std::collections::HashMap;
+use std::path::Path;
+
+pub trait OptimizationTask: Send + Sync {
+    fn id(&self) -> &str;
+    /// The TOML spec the task was loaded with.
+    fn spec(&self) -> &TaskSpec;
+    /// Source files the LLM sees as "current state" each iteration. Keys are
+    /// repo-relative paths matching `contract.mutable_paths`.
+    fn read_state(&self, root: &Path) -> anyhow::Result<HashMap<PathBuf, String>>;
+    /// Parse microbench JSON stdout into a `BenchResult`.
+    fn parse_microbench(&self, stdout: &str) -> anyhow::Result<BenchResult>;
+    /// Parse e2e JSON stdout into a `BenchResult`. Default impl reuses microbench parser.
+    fn parse_e2e(&self, stdout: &str) -> anyhow::Result<BenchResult> {
+        self.parse_microbench(stdout)
+    }
+    /// Task-specific extra prompt context (e.g. lock-free invariants).
+    fn extra_prompt_context(&self) -> &str;
+}
+
+/// Test-only task that does nothing useful. Used by `tests/orchestrator_stub_loop.rs`.
+pub struct NoopTask {
+    pub spec: TaskSpec,
+}
+
+impl OptimizationTask for NoopTask {
+    fn id(&self) -> &str {
+        &self.spec.task.id
+    }
+    fn spec(&self) -> &TaskSpec {
+        &self.spec
+    }
+    fn read_state(&self, _root: &Path) -> anyhow::Result<HashMap<PathBuf, String>> {
+        Ok(HashMap::new())
+    }
+    fn parse_microbench(&self, stdout: &str) -> anyhow::Result<BenchResult> {
+        BenchResult::from_json_line(stdout)
+    }
+    fn extra_prompt_context(&self) -> &str {
+        ""
+    }
+}

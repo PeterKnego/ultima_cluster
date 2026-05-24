@@ -19,3 +19,13 @@ fn bench_result_parses_json_line() {
     assert_eq!(r.primary("spsc_p99_ns"), Some(1180.0));
     assert_eq!(r.primary("missing"), None);
 }
+
+#[test]
+fn noop_task_implements_trait() {
+    use uc_autobench::task::{NoopTask, OptimizationTask};
+    let spec_str = std::fs::read_to_string("tasks/shmem/task.toml").unwrap();
+    let spec = uc_autobench::task::TaskSpec::from_toml_str(&spec_str).unwrap();
+    let t: Box<dyn OptimizationTask> = Box::new(NoopTask { spec });
+    assert_eq!(t.id(), "shmem-rings");
+    assert_eq!(t.extra_prompt_context(), "");
+}
