@@ -5,5 +5,6 @@
 pub mod leaderboard;
 pub mod outcome;
 pub mod persist;
+pub mod proposal;
 pub mod sandbox;
 pub mod task;
