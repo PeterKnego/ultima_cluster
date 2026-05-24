@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use uc_autobench::proposal::{static_checks, StaticCheckResult, VariantProposal};
+use uc_autobench::proposal::{StaticCheckResult, VariantProposal, static_checks};
 
 fn proposal_touching(paths: &[&str]) -> VariantProposal {
     let mut files = BTreeMap::new();

@@ -36,8 +36,7 @@ pub fn static_checks(
     }
     let mutable_set: std::collections::HashSet<&Path> =
         mutable.iter().map(|p| p.as_path()).collect();
-    let frozen_set: std::collections::HashSet<&Path> =
-        frozen.iter().map(|p| p.as_path()).collect();
+    let frozen_set: std::collections::HashSet<&Path> = frozen.iter().map(|p| p.as_path()).collect();
     for path in proposal.files.keys() {
         if frozen_set.contains(path.as_path()) {
             return StaticCheckResult::Reject {

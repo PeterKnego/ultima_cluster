@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tempfile::TempDir;
-use uc_autobench::proposal::{apply_patch, restore_snapshot, snapshot_files, VariantProposal};
+use uc_autobench::proposal::{VariantProposal, apply_patch, restore_snapshot, snapshot_files};
 
 fn write(root: &std::path::Path, rel: &str, content: &str) {
     let abs = root.join(rel);
@@ -46,7 +46,10 @@ fn snapshot_handles_missing_files_by_marking_them() {
     write(root, "exists.rs", "X\n");
     let snap = snapshot_files(
         root,
-        &[PathBuf::from("exists.rs"), PathBuf::from("does_not_exist.rs")],
+        &[
+            PathBuf::from("exists.rs"),
+            PathBuf::from("does_not_exist.rs"),
+        ],
     )
     .unwrap();
     // Mutate exists and create does_not_exist
