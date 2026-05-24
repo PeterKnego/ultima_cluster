@@ -82,7 +82,7 @@ impl TaskSpec {
 }
 
 /// Output of one bench invocation. Keys are metric names; values are f64.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
 pub struct BenchResult {
     pub metrics: BTreeMap<String, f64>,
 }
