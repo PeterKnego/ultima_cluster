@@ -1,0 +1,42 @@
+[task]
+id          = "shmem-rings"
+description = "Optimize uc_protocol shmem ring buffers for latency and throughput"
+
+[contract]
+mode          = "rust_api_plus_wire"
+mutable_paths = [
+  "uc_protocol/src/ring/spsc.rs",
+  "uc_protocol/src/ring/mpsc.rs",
+  "uc_protocol/src/ring/broadcast.rs",
+  "uc_protocol/src/ring/common.rs",
+]
+frozen_paths = [
+  "uc_protocol/src/lib.rs",
+  "uc_protocol/src/ring/mod.rs",
+]
+
+[gates]
+test_cmd        = "cargo test -p uc_protocol --release"
+torture_cmd     = "cargo test -p uc_autobench --test ring_torture --release"
+build_timeout_s = 120
+test_timeout_s  = 180
+
+[microbench]
+cmd          = "cargo run -p uc_autobench --bin shmem-microbench --release -- --json"
+metrics      = ["spsc_p50_ns", "spsc_p99_ns", "spsc_throughput_msgs",
+                "mpsc_4p_p99_ns", "mpsc_4p_throughput",
+                "broadcast_4sub_p99_ns", "large_payload_p99_ns",
+                "wrap_throughput"]
+primary      = "spsc_p99_ns"
+primary_dir  = "minimize"
+
+[e2e_gate]
+cmd          = "cargo run -p uc_autobench --bin shmem-e2e --release -- --json"
+primary      = "submit_to_resp_p99_ns"
+primary_dir  = "minimize"
+regress_pct  = 5.0
+
+[budget]
+max_iterations   = 200
+plateau_window   = 30
+wall_clock_hours = 12
