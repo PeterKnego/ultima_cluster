@@ -31,3 +31,4 @@ target
 /.claude/settings.local.json
 /.idea/
 /.private/
+auto-bench-runs/
