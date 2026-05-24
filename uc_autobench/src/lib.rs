@@ -4,6 +4,7 @@
 
 pub mod leaderboard;
 pub mod llm;
+pub mod orchestrator;
 pub mod outcome;
 pub mod persist;
 pub mod prompt;
