@@ -11,3 +11,4 @@ pub mod prompt;
 pub mod proposal;
 pub mod sandbox;
 pub mod task;
+pub mod tasks;

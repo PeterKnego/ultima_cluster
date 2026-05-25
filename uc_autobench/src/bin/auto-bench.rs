@@ -4,6 +4,9 @@
 
 use clap::Parser;
 use std::path::PathBuf;
+use uc_autobench::llm::AnthropicClient;
+use uc_autobench::orchestrator::{OrchestratorConfig, run_loop};
+use uc_autobench::tasks::shmem::ShmemTask;
 
 #[derive(Parser)]
 struct Args {
@@ -26,10 +29,34 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    if args.resume.is_some() {
+        anyhow::bail!("--resume not yet implemented (planned for v1.1)");
+    }
+    let repo_root = std::env::current_dir()?;
+    let git_head = std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()?
+        .stdout;
+    let git_head = String::from_utf8(git_head)?.trim().to_string();
+    let run_id = jiff::Timestamp::now().to_string().replace([':', '.'], "-");
+
     match args.task.as_str() {
         "shmem" => {
-            // Filled in by Task 18.
-            anyhow::bail!("shmem task not yet registered (filled in by Task 18)");
+            let task = Box::new(ShmemTask::load()?);
+            let client = Box::new(AnthropicClient::from_env()?);
+            let cfg = OrchestratorConfig {
+                repo_root,
+                runs_dir: args.runs_dir,
+                run_id,
+                git_head,
+            };
+            let outcome = run_loop(task, client, cfg)?;
+            println!(
+                "Done. iterations={} best={:?}",
+                outcome.iterations_run, outcome.best_variant_id
+            );
+            Ok(())
         }
         other => anyhow::bail!("unknown task: {other}"),
     }
