@@ -18,6 +18,10 @@ sha2 = { workspace = true }
 clap = { workspace = true }
 jiff = { workspace = true }
 uc_protocol = { path = "../uc_protocol" }
+uc_node = { path = "../uc_node", features = ["test-support"] }
+uc_service = { path = "../uc_service" }
+uc_client = { path = "../uc_client" }
+tokio = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
@@ -31,3 +35,7 @@ path = "src/bin/auto-bench.rs"
 [[bin]]
 name = "shmem-microbench"
 path = "src/bin/shmem-microbench.rs"
+
+[[bin]]
+name = "shmem-e2e"
+path = "src/bin/shmem-e2e.rs"
