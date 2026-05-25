@@ -20,6 +20,9 @@ jiff = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+uc_protocol = { path = "../uc_protocol" }
+crc32fast = { workspace = true }
+bytes = { workspace = true }
 
 [[bin]]
 name = "auto-bench"
