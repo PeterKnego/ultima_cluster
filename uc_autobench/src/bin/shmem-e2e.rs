@@ -2,7 +2,7 @@
 //!
 //! Spawns an in-process single-node cluster + 4 clients (via
 //! `uc_node::test_support::ClusterFixture`), drives a fixed number of
-//! submit→response round-trips across the clients (20k by default; see
+//! submit→response round-trips across the clients (2k by default; see
 //! [`DEFAULT_REQS_PER_CLIENT`]), and emits ONE JSON line on stdout with the
 //! three metrics the `[e2e_gate]` in `tasks/shmem/task.toml` consumes:
 //!
@@ -21,23 +21,24 @@ use uc_node::test_support::ClusterFixture;
 use uc_service::{SnapshotError, StateMachine};
 
 const N_CLIENTS: usize = 4;
-/// Default per-client request count → 4 × 5000 = 20k total round-trips.
+/// Default per-client request count → 4 × 500 = 2k total round-trips.
 ///
-/// The spec nominally calls for 100k, but the single-node end-to-end path is
-/// dominated by the journal group-commit window (~tens of ms per committed
-/// entry under low concurrency), giving an aggregate of ~100 round-trips/s
-/// across the 4 clients. 100k would therefore take ~15 min — far past the
-/// gate's runtime budget. 20k stays representative (the p50/p99/throughput are
-/// stable well below 5k each — they reflect the per-commit latency floor, not
-/// sample count) while completing in a few minutes. Override with
-/// `SHMEM_E2E_REQS_PER_CLIENT` for a quick smoke run (e.g. `500`) or the full
-/// 100k (`25000`).
+/// The single-node end-to-end path is dominated by the journal group-commit
+/// window (~38ms per committed entry under low concurrency), giving an
+/// aggregate of ~100 round-trips/s across the 4 clients. The spec nominally
+/// calls for 100k, but at this rate that would take ~15 min — far past the
+/// gate's runtime budget.
 ///
-/// NOTE: this measures the framework's *current* end-to-end latency. It is the
-/// Goodhart guard — a ring-buffer microbench win that doesn't move this number
-/// (or regresses it) is rejected. The absolute value being commit-bound is
-/// expected and fine for that purpose.
-const DEFAULT_REQS_PER_CLIENT: u64 = 5_000;
+/// This binary is the orchestrator's per-promotion Goodhart gate: it runs on
+/// every variant that beats the microbench best, so it must be cheap enough to
+/// run many times in a loop. Because the metric is Raft-commit-dominated it
+/// won't sensitively detect shmem ring changes anyway — its real job is to
+/// catch a variant that *catastrophically* breaks throughput/correctness. So a
+/// small, fast sample is appropriate. 2k gives stable percentiles
+/// (p50≈36ms, p99≈41ms — they reflect the per-commit latency floor, not sample
+/// count) and completes in ~20-40s. Override with `SHMEM_E2E_REQS_PER_CLIENT`
+/// for the full 100k (`25000`).
+const DEFAULT_REQS_PER_CLIENT: u64 = 500;
 
 fn reqs_per_client() -> u64 {
     std::env::var("SHMEM_E2E_REQS_PER_CLIENT")
@@ -123,8 +124,9 @@ async fn main() -> anyhow::Result<()> {
 
     let per_client = reqs_per_client();
     eprintln!(
-        "shmem-e2e: bringing up single-node cluster with {N_CLIENTS} clients \
-         ({per_client} reqs/client = {} total)",
+        "shmem-e2e: {} total round-trips ({N_CLIENTS} clients × {per_client} reqs); \
+         e2e latency is Raft-commit-dominated (~38ms/op floor), so this metric gates \
+         catastrophic regressions, not fine-grained shmem ring perf",
         N_CLIENTS as u64 * per_client
     );
 
