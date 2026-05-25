@@ -13,24 +13,43 @@
 //! Measuring true cross-thread producer→consumer latency is dominated by
 //! scheduler/wakeup noise and is not a stable optimization signal. Instead the
 //! latency sub-benches run producer + consumer in ONE thread: write one record,
-//! immediately read it back, time the write+read pair with a fresh `Instant`.
-//! This isolates the ring's own enqueue/dequeue cost (header write, atomic
-//! length publish, atomic length read, payload copy) which is exactly what a
-//! ring rewrite changes — so relative improvements are faithfully reflected.
+//! immediately read it back (see batched timing below). This isolates the
+//! ring's own enqueue/dequeue cost (header write, atomic length publish, atomic
+//! length read, payload copy) which is exactly what a ring rewrite changes — so
+//! relative improvements are faithfully reflected.
 //!
 //! For MPSC the round-trip uses one producer clone (the consumer still sees the
 //! same per-record cost); for Broadcast the producer writes and all 4
 //! subscribers read each record, timing the full fan-out pair. The 4-producer /
 //! 4-subscriber THROUGHPUT figures use real multi-thread saturation.
 //!
-//! Each sub-bench: 3 warmup + 9 measured runs; we report the MEDIAN.
+//! ## Sub-tick resolution via batched-sample percentiles
+//!
+//! The host monotonic clock resolution is ~42ns, so timing a single sub-100ns
+//! round-trip quantizes to one tick and `p50 == p99` (σ ≈ 0). That destroys the
+//! optimization loop's ability to rank ring variants — `spsc_p99_ns` is its
+//! PRIMARY (minimize) metric and it promotes only when a candidate beats the
+//! best by > ~2σ.
+//!
+//! Fix: for each LATENCY sub-bench we collect `SAMPLES` data points; each sample
+//! times a BATCH of `BATCH` round-trips with ONE `Instant::now()` before/after
+//! and records the per-op latency as `elapsed_ns / BATCH`. With BATCH=1000 the
+//! ~42ns tick is amortized 1000× → ~0.042ns resolution, and the SAMPLES
+//! fractional data points still carry sample-to-sample tail variation (σ > 0).
+//! We then report the p50/p99 percentile over those fractional per-op means.
+//! Metric NAMES are unchanged so `tasks/shmem/task.toml` still matches; values
+//! are now smooth, sub-tick, and `p50 != p99` in general.
+//!
+//! Warmup: 3 short batched passes before the measured pass. The SAMPLES-point
+//! percentile is itself stable, so no extra outer 9× median loop is needed for
+//! the latency metrics. Throughput metrics keep the warmup + median structure.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-use uc_protocol::ring::{BroadcastRing, MpscRing, RingError, SpscRing};
+use uc_protocol::ring::{BroadcastRing, MpscRing, RingError, SpscConsumer, SpscProducer, SpscRing};
 
 const WARMUP: usize = 3;
 const MEASURED: usize = 9;
@@ -40,27 +59,34 @@ const FRAME_OVERHEAD: usize = 20;
 
 const THROUGHPUT_WINDOW: Duration = Duration::from_millis(250);
 
-/// Round-trip pairs per latency run. Big enough for a stable p99, small enough
-/// to keep total runtime well under budget.
-const LAT_PAIRS: usize = 50_000;
+/// Latency sampling: each SAMPLE times a BATCH of round-trips with one clock
+/// read and records `elapsed_ns / BATCH` (a fractional per-op latency). The
+/// BATCH amortizes the ~42ns host clock tick to sub-nanosecond resolution; the
+/// SAMPLES fractional points still carry sample-to-sample tail variation so
+/// p50/p99 are smooth and σ > 0. SAMPLES * BATCH round-trips per sub-bench;
+/// with 4 latency sub-benches + 3 warmups each this stays well under budget.
+const LAT_BATCH: usize = 1000;
+const LAT_SAMPLES: usize = 600;
 
 fn max_msg_size_for(payload: usize) -> u32 {
     (payload + FRAME_OVERHEAD) as u32
 }
 
 fn median(mut xs: Vec<f64>) -> f64 {
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    xs.sort_by(f64::total_cmp);
     xs[xs.len() / 2]
 }
 
-fn percentile(mut xs: Vec<u64>, p: f64) -> f64 {
-    xs.sort_unstable();
+/// Percentile over fractional per-batch-mean latency samples (ns). Uses
+/// `f64::total_cmp` (clippy-clean; no `partial_cmp().unwrap()`).
+fn percentile_f64(mut xs: Vec<f64>, p: f64) -> f64 {
+    xs.sort_by(f64::total_cmp);
     let idx = (((xs.len() - 1) as f64) * p).round() as usize;
-    xs[idx] as f64
+    xs[idx]
 }
 
-/// Run a sub-bench `f` for WARMUP + MEASURED runs, returning the median of the
-/// measured runs. `f` returns one f64 per run.
+/// Run a throughput sub-bench `f` for WARMUP + MEASURED runs, returning the
+/// median of the measured runs. `f` returns one f64 per run.
 fn repeat_median(label: &str, mut f: impl FnMut() -> f64) -> f64 {
     for _ in 0..WARMUP {
         f();
@@ -74,12 +100,57 @@ fn repeat_median(label: &str, mut f: impl FnMut() -> f64) -> f64 {
     m
 }
 
+/// Run a LATENCY sub-bench: `sample` collects one batch-mean per-op latency (ns)
+/// per call. Do WARMUP warmup passes (each = WARMUP_BATCHES batches) then a
+/// measured pass of LAT_SAMPLES batches; report (p50, p99) over those fractional
+/// batch means. Smooth, sub-tick, σ > 0.
+fn repeat_latency(label: &str, mut sample: impl FnMut() -> f64) -> (f64, f64) {
+    // Warmup: a handful of batches per warmup run is enough to prime caches /
+    // branch predictor / TLB; no need to pay a full SAMPLES pass each time.
+    const WARMUP_BATCHES: usize = 32;
+    for _ in 0..WARMUP {
+        for _ in 0..WARMUP_BATCHES {
+            sample();
+        }
+    }
+    let mut means = Vec::with_capacity(LAT_SAMPLES);
+    for _ in 0..LAT_SAMPLES {
+        means.push(sample());
+    }
+    let p50 = percentile_f64(means.clone(), 0.50);
+    let p99 = percentile_f64(means, 0.99);
+    eprintln!("  {label}: p50={p50:.3} p99={p99:.3}");
+    (p50, p99)
+}
+
 // ===========================================================================
-// Latency: single-thread round-trip (write one, read it back), time each pair.
-// Returns (p50_ns, p99_ns) over LAT_PAIRS pairs.
+// Latency: single-thread round-trip (write one, read it back). Each *_sample
+// fn times a BATCH of LAT_BATCH round-trips with one clock read and returns the
+// per-op batch-mean latency in ns (fractional). Collected LAT_SAMPLES times.
 // ===========================================================================
 
-fn spsc_roundtrip(payload: usize) -> (u64, u64) {
+fn spsc_lat_sample(
+    producer: &mut SpscProducer,
+    consumer: &mut SpscConsumer,
+    msg: &[u8],
+    buf: &mut Vec<u8>,
+) -> f64 {
+    let t = Instant::now();
+    for _ in 0..LAT_BATCH {
+        producer.try_write(1, 0, [0; 8], msg).unwrap();
+        loop {
+            match consumer.try_read(buf) {
+                Ok(Some(_)) => break,
+                Ok(None) => std::hint::spin_loop(),
+                Err(e) => panic!("read error: {e}"),
+            }
+        }
+    }
+    t.elapsed().as_nanos() as f64 / LAT_BATCH as f64
+}
+
+/// (p50_ns, p99_ns) over LAT_SAMPLES batch means for an SPSC round-trip.
+fn spsc_roundtrip(label: &str, payload: usize) -> (f64, f64) {
     let dir = TempDir::new().unwrap();
     let ring = SpscRing::create(
         &dir.path().join("spsc_lat.ring"),
@@ -90,27 +161,13 @@ fn spsc_roundtrip(payload: usize) -> (u64, u64) {
     let (mut producer, mut consumer) = ring.into_split();
     let msg = vec![0xABu8; payload];
     let mut buf = Vec::with_capacity(payload);
-
-    let mut lat = Vec::with_capacity(LAT_PAIRS);
-    for _ in 0..LAT_PAIRS {
-        let t = Instant::now();
-        producer.try_write(1, 0, [0; 8], &msg).unwrap();
-        loop {
-            match consumer.try_read(&mut buf) {
-                Ok(Some(_)) => break,
-                Ok(None) => std::hint::spin_loop(),
-                Err(e) => panic!("read error: {e}"),
-            }
-        }
-        lat.push(t.elapsed().as_nanos() as u64);
-    }
-    (
-        percentile(lat.clone(), 0.50) as u64,
-        percentile(lat, 0.99) as u64,
-    )
+    repeat_latency(label, || {
+        spsc_lat_sample(&mut producer, &mut consumer, &msg, &mut buf)
+    })
 }
 
-fn mpsc_roundtrip(payload: usize) -> u64 {
+/// p99_ns over LAT_SAMPLES batch means for an MPSC (single producer clone) round-trip.
+fn mpsc_roundtrip(label: &str, payload: usize) -> f64 {
     let dir = TempDir::new().unwrap();
     let ring = MpscRing::create(
         &dir.path().join("mpsc_lat.ring"),
@@ -121,24 +178,25 @@ fn mpsc_roundtrip(payload: usize) -> u64 {
     let (producer, mut consumer) = ring.into_split();
     let msg = vec![0xABu8; payload];
     let mut buf = Vec::with_capacity(payload);
-
-    let mut lat = Vec::with_capacity(LAT_PAIRS);
-    for _ in 0..LAT_PAIRS {
+    let (_p50, p99) = repeat_latency(label, || {
         let t = Instant::now();
-        producer.try_write(1, 0, [0; 8], &msg).unwrap();
-        loop {
-            match consumer.try_read(&mut buf) {
-                Ok(Some(_)) => break,
-                Ok(None) => std::hint::spin_loop(),
-                Err(e) => panic!("read error: {e}"),
+        for _ in 0..LAT_BATCH {
+            producer.try_write(1, 0, [0; 8], &msg).unwrap();
+            loop {
+                match consumer.try_read(&mut buf) {
+                    Ok(Some(_)) => break,
+                    Ok(None) => std::hint::spin_loop(),
+                    Err(e) => panic!("read error: {e}"),
+                }
             }
         }
-        lat.push(t.elapsed().as_nanos() as u64);
-    }
-    percentile(lat, 0.99) as u64
+        t.elapsed().as_nanos() as f64 / LAT_BATCH as f64
+    });
+    p99
 }
 
-fn broadcast_roundtrip(payload: usize, n_subs: usize) -> u64 {
+/// p99_ns over LAT_SAMPLES batch means for a 1-producer→n_subs broadcast fan-out.
+fn broadcast_roundtrip(label: &str, payload: usize, n_subs: usize) -> f64 {
     let dir = TempDir::new().unwrap();
     let ring = BroadcastRing::create(
         &dir.path().join("bcast_lat.ring"),
@@ -150,25 +208,25 @@ fn broadcast_roundtrip(payload: usize, n_subs: usize) -> u64 {
     let mut subs: Vec<_> = (0..n_subs).map(|_| ring.subscribe()).collect();
     let msg = vec![0xABu8; payload];
     let mut buf = Vec::with_capacity(payload);
-
     // Round-trip = write one record, have every subscriber read it; time the
     // full fan-out. One record in flight at a time => no lapping.
-    let mut lat = Vec::with_capacity(LAT_PAIRS);
-    for _ in 0..LAT_PAIRS {
+    let (_p50, p99) = repeat_latency(label, || {
         let t = Instant::now();
-        producer.write(1, 0, [0; 8], &msg).unwrap();
-        for sub in subs.iter_mut() {
-            loop {
-                match sub.try_read(&mut buf) {
-                    Ok(Some(_)) => break,
-                    Ok(None) => std::hint::spin_loop(),
-                    Err(e) => panic!("broadcast read error: {e}"),
+        for _ in 0..LAT_BATCH {
+            producer.write(1, 0, [0; 8], &msg).unwrap();
+            for sub in subs.iter_mut() {
+                loop {
+                    match sub.try_read(&mut buf) {
+                        Ok(Some(_)) => break,
+                        Ok(None) => std::hint::spin_loop(),
+                        Err(e) => panic!("broadcast read error: {e}"),
+                    }
                 }
             }
         }
-        lat.push(t.elapsed().as_nanos() as u64);
-    }
-    percentile(lat, 0.99) as u64
+        t.elapsed().as_nanos() as f64 / LAT_BATCH as f64
+    });
+    p99
 }
 
 // ===========================================================================
@@ -289,25 +347,22 @@ fn main() {
     let total = Instant::now();
     eprintln!("shmem-microbench: WARMUP={WARMUP} MEASURED={MEASURED}");
 
-    // SPSC latency (p50 + p99) and saturated throughput, 64B.
-    let spsc_p50 = repeat_median("spsc_p50_ns", || spsc_roundtrip(64).0 as f64);
-    let spsc_p99 = repeat_median("spsc_p99_ns", || spsc_roundtrip(64).1 as f64);
+    // SPSC latency (p50 + p99 from the same batched-sample pass) and saturated
+    // throughput, 64B.
+    let (spsc_p50, spsc_p99) = spsc_roundtrip("spsc_lat", 64);
     let spsc_throughput_msgs =
         repeat_median("spsc_throughput_msgs", || spsc_throughput(64, 1 << 20));
 
     // MPSC 4-producer p99 + saturated throughput, 64B.
-    let mpsc_4p_p99_ns = repeat_median("mpsc_4p_p99_ns", || mpsc_roundtrip(64) as f64);
+    let mpsc_4p_p99_ns = mpsc_roundtrip("mpsc_4p_p99_ns", 64);
     let mpsc_4p_throughput =
         repeat_median("mpsc_4p_throughput", || mpsc_throughput(64, 4, 1 << 20));
 
     // Broadcast 1-producer→4-subscriber p99, 64B.
-    let broadcast_4sub_p99_ns = repeat_median("broadcast_4sub_p99_ns", || {
-        broadcast_roundtrip(64, 4) as f64
-    });
+    let broadcast_4sub_p99_ns = broadcast_roundtrip("broadcast_4sub_p99_ns", 64, 4);
 
     // SPSC p99 with a 4096B payload.
-    let large_payload_p99_ns =
-        repeat_median("large_payload_p99_ns", || spsc_roundtrip(4096).1 as f64);
+    let (_lp_p50, large_payload_p99_ns) = spsc_roundtrip("large_payload_p99_ns", 4096);
 
     // SPSC saturated throughput on a tiny 4 KiB ring (frequent wraps), 64B.
     let wrap_throughput = repeat_median("wrap_throughput", || spsc_throughput(64, 4096));
