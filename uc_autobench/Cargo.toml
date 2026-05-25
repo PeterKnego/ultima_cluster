@@ -17,13 +17,17 @@ reqwest = { workspace = true }
 sha2 = { workspace = true }
 clap = { workspace = true }
 jiff = { workspace = true }
+uc_protocol = { path = "../uc_protocol" }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
-uc_protocol = { path = "../uc_protocol" }
 crc32fast = { workspace = true }
 bytes = { workspace = true }
 
 [[bin]]
 name = "auto-bench"
 path = "src/bin/auto-bench.rs"
+
+[[bin]]
+name = "shmem-microbench"
+path = "src/bin/shmem-microbench.rs"
