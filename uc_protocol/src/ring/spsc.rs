@@ -7,11 +7,14 @@
 //!
 //! # Memory ordering
 //!
-//! * Producer writes the record bytes first, advances `claim_position`
-//!   (single-producer; Relaxed store) and then does a `Release` store on
-//!   `publish_position`. The Release store synchronizes with the consumer's
-//!   `Acquire` load — by the time the consumer observes the new
-//!   `publish_position`, the record bytes are fully written.
+//! * Producer writes the record bytes first, then does a single `Release`
+//!   store on `publish_position`. The Release store synchronizes with the
+//!   consumer's `Acquire` load — by the time the consumer observes the new
+//!   `publish_position`, the record bytes are fully written. `claim_position`
+//!   is unused in SPSC (only the MPSC producer needs a separate claim phase);
+//!   the producer tracks its own position by reloading `publish_position`
+//!   (Relaxed — it is the sole writer), so the hot path does exactly one
+//!   atomic store per record.
 //! * Consumer reads with relaxed `consumer_position` (only the consumer
 //!   mutates it) and Acquire on `publish_position`. After processing, it
 //!   advances `consumer_position` with Release so the producer's next
@@ -104,9 +107,11 @@ impl SpscProducer {
 
         let header = self.inner.header();
         let capacity = self.inner.capacity();
-        // We're the only producer; Relaxed is fine for the load of our own
-        // position (no other thread mutates it).
-        let producer_pos = header.claim_position.load(Ordering::Relaxed);
+        // We're the only writer of `publish_position`; Relaxed is fine for the
+        // load of our own position (no other thread mutates it). `publish_position`
+        // doubles as the producer's claim cursor in SPSC, so we never touch
+        // `claim_position` on the hot path.
+        let producer_pos = header.publish_position.load(Ordering::Relaxed);
         let consumer_pos = header.consumer_position.load(Ordering::Acquire);
 
         let used = producer_pos - consumer_pos;
@@ -136,7 +141,6 @@ impl SpscProducer {
                 write_padding_marker_at(self.inner.slot_region_mut(), slot_offset, bytes_to_tail);
             }
             let padded_pos = producer_pos + bytes_to_tail as u64;
-            header.claim_position.store(padded_pos, Ordering::Relaxed);
             header.publish_position.store(padded_pos, Ordering::Release);
             return self.try_write(msg_type, flags, header_extra, payload);
         }
@@ -156,7 +160,6 @@ impl SpscProducer {
             );
         }
         let new_pos = producer_pos + advance as u64;
-        header.claim_position.store(new_pos, Ordering::Relaxed);
         header.publish_position.store(new_pos, Ordering::Release);
         Ok(())
     }
