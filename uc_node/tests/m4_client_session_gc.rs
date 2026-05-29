@@ -13,14 +13,9 @@ use std::io::{Read, Write};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tempfile::TempDir;
 use uc_client::Client;
-use uc_node::{
-    BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning,
-    ServiceRingConfig, TlsConfig,
-};
-use uc_service::runtime::ServiceConfig;
-use uc_service::{ServiceBuilder, SnapshotError, StateMachine};
+use uc_node::test_support::ClusterFixture;
+use uc_service::{SnapshotError, StateMachine};
 
 #[derive(Default)]
 struct Counter {
@@ -64,75 +59,22 @@ impl StateMachine for Counter {
     }
 }
 
-async fn wait_for_path(p: &std::path::Path, t: Duration) {
-    let deadline = std::time::Instant::now() + t;
-    while !p.exists() {
-        if std::time::Instant::now() >= deadline {
-            panic!("timed out waiting for {}", p.display());
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
 #[tokio::test]
 async fn m4_client_session_gc() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let inst = TempDir::new().unwrap();
-    let node_data = TempDir::new().unwrap();
-    let svc_data = TempDir::new().unwrap();
-    let instance_dir = inst.path().to_owned();
-    let app_id = "m4-session-gc".to_string();
-
-    let cfg = NodeConfig {
-        node_id: 1,
-        data_dir: node_data.path().to_owned(),
-        raft_listen_addr: "127.0.0.1:0".parse().unwrap(),
-        app_id: app_id.clone(),
-        bootstrap: BootstrapConfig::SingleNode,
-        raft: RaftTuning::default(),
-        tls: TlsConfig::default(),
-        ipc_mode: IpcMode::Shmem {
-            instance_dir: instance_dir.clone(),
-        },
-        client_rings: ClientRingConfig::default(),
-        service_rings: ServiceRingConfig::default(),
-    };
-    let node_task =
-        tokio::spawn(async move { NodeBuilder::new(cfg, Counter::default()).start().await });
-    wait_for_path(&instance_dir.join("cnc.dat"), Duration::from_secs(5)).await;
-
-    let svc_cfg = ServiceConfig {
-        instance_dir: instance_dir.clone(),
-        app_id: app_id.clone(),
-        data_dir: svc_data.path().to_owned(),
-        ..ServiceConfig::default()
-    };
-    let svc_task =
-        tokio::spawn(async move { ServiceBuilder::new(svc_cfg, Counter::default()).run().await });
-
-    let node = tokio::time::timeout(Duration::from_secs(15), node_task)
+    // Bring up node + service via the shared fixture, but manage the client's
+    // lifecycle in the test (this test deliberately *drops* a client without
+    // calling shutdown(), so it must own it rather than let the fixture do so).
+    let fixture = ClusterFixture::<Counter>::single_node(0)
         .await
-        .expect("node timeout")
-        .expect("node panic")
-        .expect("node start");
-    let service = tokio::time::timeout(Duration::from_secs(15), svc_task)
-        .await
-        .expect("svc timeout")
-        .expect("svc panic")
-        .expect("svc start");
-
-    // Wait for single-node leader election.
-    for _ in 0..50 {
-        if node.current_leader().await == Some(1) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert_eq!(node.current_leader().await, Some(1));
+        .expect("spawn single-node cluster");
+    let instance_dir = fixture.instance_path().to_owned();
 
     // ── Connect and immediately drop ────────────────────────────────────────
-    let client = Client::connect(&instance_dir, &app_id).await.unwrap();
+    let client = Client::connect(&instance_dir, fixture.app_id())
+        .await
+        .unwrap();
     let cid = client.client_id();
     let session_path = instance_dir
         .join("clients")
@@ -165,6 +107,5 @@ async fn m4_client_session_gc() {
         session_path.display()
     );
 
-    service.shutdown().await.unwrap();
-    node.shutdown().await.unwrap();
+    fixture.shutdown().await.expect("cluster shutdown");
 }

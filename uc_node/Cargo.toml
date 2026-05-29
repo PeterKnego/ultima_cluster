@@ -30,9 +30,13 @@ memmap2 = { workspace = true }
 fs2 = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
+# `test-support` fixture deps (optional; enabled by the feature).
+uc_client = { path = "../uc_client", optional = true }
+tempfile = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
 
 [dev-dependencies]
-uc_node = { path = ".", features = ["test-helpers"] }
+uc_node = { path = ".", features = ["test-helpers", "test-support"] }
 uc_client = { path = "../uc_client", features = ["test-helpers"] }
 tempfile = { workspace = true }
 anyhow = { workspace = true }
@@ -42,3 +46,6 @@ ultima-db = { workspace = true }
 
 [features]
 test-helpers = []
+# Reusable in-process node+service+client fixtures (see src/test_support.rs).
+# Used by uc_node's own M4 integration tests and by the uc_autobench shmem-e2e binary.
+test-support = ["dep:uc_client", "dep:tempfile", "dep:anyhow"]

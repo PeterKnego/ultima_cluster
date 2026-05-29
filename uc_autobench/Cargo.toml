@@ -1,0 +1,36 @@
+[package]
+name = "uc_autobench"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+wait-timeout = { workspace = true }
+uc_protocol = { path = "../uc_protocol" }
+uc_node = { path = "../uc_node", features = ["test-support"] }
+uc_service = { path = "../uc_service" }
+uc_client = { path = "../uc_client" }
+
+[dev-dependencies]
+crc32fast = { workspace = true }
+bytes = { workspace = true }
+
+[[bin]]
+name = "shmem-microbench"
+path = "src/bin/shmem-microbench.rs"
+
+[[bin]]
+name = "shmem-e2e"
+path = "src/bin/shmem-e2e.rs"
+
+[[bin]]
+name = "run-iter"
+path = "src/bin/run-iter.rs"

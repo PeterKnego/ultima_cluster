@@ -7,6 +7,8 @@ pub mod ipc;
 pub mod network;
 pub mod raft;
 pub mod runtime;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 pub use config::{
     BootstrapConfig, ClientRingConfig, IpcMode, NodeConfig, NodeId, PeerSeed, RaftTuning,
