@@ -87,6 +87,7 @@ impl SpscProducer {
     /// Try to publish a record. Returns `Err(RingError::Full)` if there isn't
     /// enough free space (caller can retry after the consumer makes progress)
     /// or `Err(RingError::TooLarge)` if the record exceeds `max_msg_size`.
+    #[inline]
     pub fn try_write(
         &mut self,
         msg_type: u16,
@@ -172,6 +173,7 @@ impl SpscConsumer {
     ///
     /// On success, `payload_buf` is cleared and filled with the record's
     /// payload bytes.
+    #[inline]
     pub fn try_read(
         &mut self,
         payload_buf: &mut Vec<u8>,
