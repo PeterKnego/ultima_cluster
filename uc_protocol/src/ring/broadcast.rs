@@ -82,7 +82,11 @@ impl BroadcastProducer {
 
         let header = self.inner.header();
         let capacity = self.inner.capacity();
-        let producer_pos = header.claim_position.load(Ordering::Relaxed);
+        // Single producer: `publish_position` is our sole cursor. `claim_position`
+        // is unused in Broadcast (consumers track their own in-memory `head` and
+        // only read `publish_position`), so we never touch it on the hot path.
+        // Relaxed load is fine — we are the only writer of `publish_position`.
+        let producer_pos = header.publish_position.load(Ordering::Relaxed);
         let slot_offset = (producer_pos as usize) & (capacity - 1);
         // bytes_to_tail is a multiple of RECORD_ALIGN (see SPSC for proof),
         // so the padding marker's 6-byte write always fits.
@@ -95,7 +99,6 @@ impl BroadcastProducer {
                 write_padding_marker_at(self.inner.slot_region_mut(), slot_offset, bytes_to_tail);
             }
             let padded_pos = producer_pos + bytes_to_tail as u64;
-            header.claim_position.store(padded_pos, Ordering::Relaxed);
             header.publish_position.store(padded_pos, Ordering::Release);
             return self.write(msg_type, flags, header_extra, payload);
         }
@@ -113,7 +116,6 @@ impl BroadcastProducer {
             );
         }
         let new_pos = producer_pos + advance as u64;
-        header.claim_position.store(new_pos, Ordering::Relaxed);
         header.publish_position.store(new_pos, Ordering::Release);
         Ok(())
     }
