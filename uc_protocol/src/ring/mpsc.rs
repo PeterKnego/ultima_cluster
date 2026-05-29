@@ -18,6 +18,7 @@
 //! deployment model an in-process panic implies an unrecoverable node
 //! state and process restart; ride along with that assumption.
 
+use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -69,6 +70,20 @@ impl MpscInner {
 #[derive(Clone)]
 pub struct MpscProducer {
     inner: Arc<MpscInner>,
+    /// Per-producer cached lower bound on the shared `consumer_position`. The
+    /// consumer only ever advances `consumer_position`, so a cached copy is
+    /// always ≤ the true value; free space computed from it is therefore an
+    /// UNDER-estimate (never an over-estimate), so a write admitted by the
+    /// cached check can never claim into unread territory. We pay the
+    /// cross-core `Acquire` load of the real `consumer_position` only when the
+    /// cached value reports the ring full, then re-check. In steady state this
+    /// removes one `ldar` per CAS attempt on the write hot path.
+    ///
+    /// `Cell` because `try_write` takes `&self` (the producer is `Clone` and
+    /// fanned out across threads); each clone owns its own cache. This makes
+    /// `MpscProducer` `!Sync` (still `Send`): the supported usage is to clone
+    /// per producer thread, not to share one `&MpscProducer` across threads.
+    cached_consumer_pos: Cell<u64>,
 }
 
 pub struct MpscConsumer {
@@ -98,26 +113,39 @@ impl MpscProducer {
         let capacity = self.inner.capacity();
 
         loop {
-            let consumer_pos = header.consumer_position.load(Ordering::Acquire);
             let claim_pos = header.claim_position.load(Ordering::Acquire);
-
-            let used = claim_pos - consumer_pos;
-            let free = capacity.saturating_sub(used as usize);
-            if free < advance {
-                return Err(RingError::Full);
-            }
 
             let slot_offset = (claim_pos as usize) & (capacity - 1);
             // bytes_to_tail is a multiple of RECORD_ALIGN (see SPSC for proof),
             // so the padding marker's 6-byte write always fits.
             let bytes_to_tail = capacity - slot_offset;
+            // Total contiguous bytes this iteration must reserve: `advance`, or
+            // — if the record straddles the tail — a padding marker filling
+            // `bytes_to_tail` plus `advance` after the wrap.
+            let needed = if bytes_to_tail < advance {
+                bytes_to_tail + advance
+            } else {
+                advance
+            };
 
-            // If straddling tail, first claim the tail-bytes for a padding
-            // marker, then retry the real record claim.
-            let claim_size = if bytes_to_tail < advance {
-                if free < bytes_to_tail + advance {
+            // Free space from the cached consumer position (a lower bound, so
+            // `free` is under-estimated — safe). Only when the cache reports
+            // too little room do we pay the `Acquire` load of the real
+            // `consumer_position` and re-check.
+            let mut consumer_pos = self.cached_consumer_pos.get();
+            let mut free = capacity.saturating_sub((claim_pos - consumer_pos) as usize);
+            if free < needed {
+                consumer_pos = header.consumer_position.load(Ordering::Acquire);
+                self.cached_consumer_pos.set(consumer_pos);
+                free = capacity.saturating_sub((claim_pos - consumer_pos) as usize);
+                if free < needed {
                     return Err(RingError::Full);
                 }
+            }
+
+            // If straddling tail, claim only the tail-bytes for a padding
+            // marker this iteration, then retry the real record claim.
+            let claim_size = if bytes_to_tail < advance {
                 bytes_to_tail
             } else {
                 advance
@@ -261,6 +289,7 @@ impl MpscRing {
         (
             MpscProducer {
                 inner: self.inner.clone(),
+                cached_consumer_pos: Cell::new(0),
             },
             MpscConsumer { inner: self.inner },
         )
