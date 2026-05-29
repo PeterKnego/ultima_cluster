@@ -72,7 +72,6 @@ struct Gate {
 /// (~40s); we skip it when the microbench shows the variant clearly isn't
 /// a winner — saves wall time per iteration.
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)] // wired into main() in Task 7
 enum GateDecision {
     Run,
     Skip(String),
@@ -85,7 +84,6 @@ enum GateDecision {
 ///   (i.e. not a clear regression). The agent's TSV decision logic also
 ///   requires `spsc_p99_ns < baseline` for a KEEP, so this threshold is
 ///   intentionally permissive: it filters obvious losers, not marginal ones.
-#[allow(dead_code)] // wired into main() in Task 7
 fn gate_decision(spsc_p99_ns: u64, baseline_spsc_p99_ns: Option<u64>) -> GateDecision {
     match baseline_spsc_p99_ns {
         None => GateDecision::Run,
@@ -103,7 +101,6 @@ fn gate_decision(spsc_p99_ns: u64, baseline_spsc_p99_ns: Option<u64>) -> GateDec
 
 /// Percent change of `value` relative to `baseline`. Positive = regression
 /// (assuming minimize-direction metrics). Returns 0.0 when baseline is 0.
-#[allow(dead_code)] // wired into main() in Task 7
 fn regress_pct(value: u64, baseline: u64) -> f64 {
     if baseline == 0 {
         return 0.0;
@@ -207,7 +204,13 @@ struct StageRun {
 
 /// Spawn a command, capture stdout+stderr, enforce a hard wall-clock timeout.
 /// On timeout, kill the process tree and return `timed_out = true`.
+///
+/// stdout and stderr are drained concurrently in background threads so the
+/// child can't block on a full pipe buffer. shmem-e2e in particular emits
+/// torrential WARN traces on stderr; without concurrent drainage the child
+/// runs ~10× slower and overshoots the 300s gate budget.
 fn run_stage(mut cmd: Command, timeout: Duration) -> StageRun {
+    use std::io::Read;
     let started = Instant::now();
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match cmd.spawn() {
@@ -223,6 +226,19 @@ fn run_stage(mut cmd: Command, timeout: Duration) -> StageRun {
         }
     };
 
+    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let stdout_handle = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stdout_pipe.read_to_string(&mut s);
+        s
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr_pipe.read_to_string(&mut s);
+        s
+    });
+
     let status = match child.wait_timeout(timeout).expect("wait_timeout") {
         Some(s) => Some(s),
         None => {
@@ -232,26 +248,8 @@ fn run_stage(mut cmd: Command, timeout: Duration) -> StageRun {
         }
     };
 
-    let stdout = child
-        .stdout
-        .take()
-        .map(|mut p| {
-            use std::io::Read;
-            let mut s = String::new();
-            let _ = p.read_to_string(&mut s);
-            s
-        })
-        .unwrap_or_default();
-    let stderr = child
-        .stderr
-        .take()
-        .map(|mut p| {
-            use std::io::Read;
-            let mut s = String::new();
-            let _ = p.read_to_string(&mut s);
-            s
-        })
-        .unwrap_or_default();
+    let stdout = stdout_handle.join().unwrap_or_default();
+    let stderr = stderr_handle.join().unwrap_or_default();
 
     StageRun {
         exit_ok: matches!(status, Some(s) if s.success()),
@@ -265,6 +263,22 @@ fn run_stage(mut cmd: Command, timeout: Duration) -> StageRun {
 fn emit_and_exit(out: &Output) -> ! {
     println!("{}", serde_json::to_string(out).expect("serialize Output"));
     std::process::exit(0);
+}
+
+/// Extract a u64 from a JSON value. Accepts an integer (`u64`) or a float
+/// that is rounded to the nearest integer (the microbench emits its
+/// percentile timings as fractional nanoseconds).
+fn extract_u64(v: &serde_json::Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    if let Some(f) = v.as_f64()
+        && f.is_finite()
+        && f >= 0.0
+    {
+        return Some(f.round() as u64);
+    }
+    None
 }
 
 fn main() {
@@ -373,8 +387,105 @@ fn main() {
     };
     out.metrics = Some(mb_json);
 
-    // E2E gate lands in Task 7.
-    out.status = "pass".into();
-    out.stage = "microbench".into();
-    emit_and_exit(&out);
+    // Stage 4: e2e Goodhart gate (conditional)
+    //
+    // Pull spsc_p99_ns out of the microbench metrics for the gate decision.
+    // The microbench emits this as a float; round to u64 for gate_decision().
+    let spsc_p99_ns = out
+        .metrics
+        .as_ref()
+        .and_then(|m| m.get("spsc_p99_ns"))
+        .and_then(extract_u64);
+    let Some(spsc_p99_ns) = spsc_p99_ns else {
+        // Microbench succeeded but didn't emit the primary metric — treat
+        // as a microbench failure rather than running the gate blind.
+        out.status = "microbench_failed".into();
+        out.stage = "microbench".into();
+        out.stderr_tail = Some(
+            "microbench stdout JSON missing required key `spsc_p99_ns`".to_string(),
+        );
+        emit_and_exit(&out);
+    };
+
+    match gate_decision(spsc_p99_ns, args.baseline_spsc_p99_ns) {
+        GateDecision::Skip(reason) => {
+            out.gate = Gate {
+                ran: false,
+                e2e_passed: None,
+                submit_to_resp_p99_ns: None,
+                baseline: args.baseline_e2e_p99_ns,
+                regress_pct: None,
+                reason: Some(reason),
+            };
+            out.status = "pass".into();
+            out.stage = "microbench".into();
+            emit_and_exit(&out);
+        }
+        GateDecision::Run => {
+            let mut e2e_cmd = Command::new("cargo");
+            e2e_cmd.args([
+                "run",
+                "-p",
+                "uc_autobench",
+                "--bin",
+                "shmem-e2e",
+                "--release",
+                "--quiet",
+                "--",
+                "--json",
+            ]);
+            let e2e = run_stage(e2e_cmd, Duration::from_secs(300));
+            out.duration_s.e2e = e2e.duration_s;
+            if e2e.timed_out {
+                out.status = "timeout".into();
+                out.stage = "e2e".into();
+                out.stderr_tail = Some(tail_lines(&e2e.stderr, 50));
+                emit_and_exit(&out);
+            }
+            if !e2e.exit_ok {
+                out.status = "e2e_failed".into();
+                out.stage = "e2e".into();
+                out.stderr_tail = Some(tail_lines(&e2e.stderr, 50));
+                emit_and_exit(&out);
+            }
+            let e2e_json: serde_json::Value = match serde_json::from_str(e2e.stdout.trim()) {
+                Ok(v) => v,
+                Err(e) => {
+                    out.status = "e2e_failed".into();
+                    out.stage = "e2e".into();
+                    out.stderr_tail = Some(format!(
+                        "e2e stdout was not valid JSON: {e}\n--- raw ---\n{}",
+                        tail_lines(&e2e.stdout, 30)
+                    ));
+                    emit_and_exit(&out);
+                }
+            };
+
+            let submit_to_resp_p99_ns = e2e_json
+                .get("submit_to_resp_p99_ns")
+                .and_then(extract_u64);
+            let regress_pct_val = match (submit_to_resp_p99_ns, args.baseline_e2e_p99_ns) {
+                (Some(v), Some(baseline)) => Some(regress_pct(v, baseline)),
+                _ => None,
+            };
+            let e2e_passed = match regress_pct_val {
+                // No baseline (first iter): gate is informational; passes by default.
+                None => Some(true),
+                // 5% regression tolerance per the spec.
+                Some(p) => Some(p <= 5.0),
+            };
+
+            out.gate = Gate {
+                ran: true,
+                e2e_passed,
+                submit_to_resp_p99_ns,
+                baseline: args.baseline_e2e_p99_ns,
+                regress_pct: regress_pct_val,
+                reason: None,
+            };
+            out.status = "pass".into();
+            out.stage = "e2e".into();
+            emit_and_exit(&out);
+        }
+    }
 }
