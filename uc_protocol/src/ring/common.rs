@@ -327,7 +327,12 @@ pub unsafe fn try_read_record_at(
     if length == 0 {
         return Ok(None); // not yet committed
     }
-    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    // No Acquire fence here: every caller (SPSC/MPSC/Broadcast `try_read`)
+    // performs an Acquire load of `publish_position` and only reads slots that
+    // lie fully below it. That Acquire load synchronizes-with the producer's
+    // `publish_position` Release store (made after the whole frame is written),
+    // so all slot bytes are already visible. A separate fence here is redundant
+    // — and on arm64 it would emit an extra `dmb ishld` on every read.
 
     let msg_type_bytes: [u8; 2] = unsafe {
         let mut buf = [0u8; 2];
