@@ -21,18 +21,25 @@ Optimize uc_protocol shared-memory ring buffers for latency and throughput.
 
 ## Metric
 
-- Primary: `spsc_p99_ns` (minimize)
+- Primary: `spsc_p99_ns` (minimize).
+- Secondary: `spsc_throughput_msgs` (maximize). A variant is a KEEP if it
+  clearly beats the current best on EITHER `spsc_p99_ns` OR
+  `spsc_throughput_msgs` (beyond run-to-run noise) **without regressing the
+  other** beyond noise. Latency-only and throughput-only wins both count.
 - Goodhart gate: `submit_to_resp_p99_ns` from shmem-e2e
-  (5% regression tolerance vs current branch best)
-- Floor: ring_torture must pass (6 tests, zero failures)
+  (5% regression tolerance vs current branch best).
+- Floor: ring_torture must pass (6 tests, zero failures).
+- Noise: `spsc_p99_ns` has large between-process variance (~14%); compare
+  MEDIAN-of-5 (or more), not single samples.
 
 ## TSV schema
 
 `uc_autobench/tasks/shmem/results.tsv`, tab-separated:
 
-    commit	spsc_p99_ns	e2e_p99_ns	memory_kb	status	description
+    commit	spsc_p99_ns	spsc_throughput_msgs	e2e_p99_ns	memory_kb	status	description
 
-Statuses: keep, discard, crash. Use 0 for metrics that didn't run.
+Statuses: keep, discard, crash. Use 0 for metrics that didn't run / weren't
+measured. Metric values are median-of-N where noted in the description.
 
 ## Constraints specific to this task
 
