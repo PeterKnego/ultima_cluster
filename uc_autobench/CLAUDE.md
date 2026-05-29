@@ -1,107 +1,73 @@
 # uc_autobench
 
-Leaderboard+hypothesis LLM optimization loop for ultima_cluster / ultima_db. Subprocess-sandboxed, Goodhart-resistant via two-tier (microbench + e2e) gating.
+Claude-Code-driven autoresearch loop for ultima_cluster / ultima_db. Karpathy/autoresearch shape: Claude Code (you) edits a target file, runs a fixed harness (`run-iter`), commits or reverts via plain git, and iterates indefinitely.
 
-For design rationale, see `../docs/superpowers/specs/2026-05-24-uc-autobench-design.md`.
+For design rationale, see `../docs/superpowers/specs/2026-05-29-uc-autobench-cc-driven-design.md`.
 
-## Running an existing task
+## Running a task
 
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-cargo run -p uc_autobench --bin auto-bench --release -- --task <id>
+Start a new run interactively from Claude Code:
+
+```
+Read uc_autobench/program.md and uc_autobench/tasks/shmem/program.md, then start a run.
 ```
 
-Optional: set `UC_AUTOBENCH_MODEL` to override the model (defaults to an Opus build).
-
-Output lands under `auto-bench-runs/<task-id>/<run-id>/`. The run id is an ISO timestamp.
-
-Resume a prior run (planned, not in v1 — the CLI currently rejects `--resume`):
-```bash
-cargo run -p uc_autobench --bin auto-bench -- --task <id> --resume <run-id>
-```
+That's it. There is no `auto-bench` binary, no API key, no orchestration daemon. The loop is the conversation: Claude Code reads `program.md`, executes the loop, the human watches and interrupts when satisfied.
 
 ## Reading a run
 
-```
-auto-bench-runs/
-└── <task-id>/
-    └── <run-id>/
-        ├── events.jsonl        canonical log (tail -f | jq)
-        ├── task.toml.snapshot  the task spec this run used
-        ├── git.head            repo HEAD at run start
-        ├── summary.md          human-readable status (rewritten each iteration)
-        └── variants/
-            └── NNNN-<slug>/
-                ├── proposal.json  LLM's hypothesis + rationale + files
-                ├── outcome.json   {status, microbench, e2e?}
-                └── logs/          <name>.log per subprocess (cargo-test,
-                                   ring-torture, microbench, e2e)
-```
+A run is one branch (`autoresearch/<task>-<tag>`) and one TSV (`tasks/<task>/results.tsv`).
 
-The log file names mirror the gate/bench step that produced them and therefore depend on the task's `task.toml`. Two planned artifacts are **not** written by v1: a derived `leaderboard.jsonl` and a `best/` symlink — read the leaderboard from `summary.md` and the winner from its `variants/NNNN-<slug>/` entry instead.
-
-- **What won?** The current best is named in `summary.md`; open its `variants/NNNN-<slug>/proposal.json` and read `hypothesis` + `rationale`.
-- **Why was variant X rejected?** `variants/X/outcome.json`.status + `logs/` for raw output.
-- **What did the loop try?** `events.jsonl` is the truth; `summary.md` is friendlier.
+- **What won?** The current best: the row in `results.tsv` with the lowest primary metric (`spsc_p99_ns` for shmem) and `status=keep`. The commit hash points to the source state.
+- **Why was variant X rejected?** Read the row with `status=discard` or `status=crash` and the matching commit message in `git log`.
+- **What did the loop try?** Tail the TSV: every iteration appended a row.
 
 ## Adding a new task
 
-Use the project skill:
+There is no scaffolding skill (yet). To add task `<id>`:
+
+1. Write `tasks/<id>/program.md` — task overlay (see `tasks/shmem/program.md` as a reference).
+2. Add a per-task fitness binary `src/bin/<id>-microbench.rs` (emits one JSON object on stdout, keys per the metric list in the overlay).
+3. Add a per-task Goodhart gate `src/bin/<id>-e2e.rs` (also JSON-emitting). Skip if your task genuinely cannot be e2e-benched, but say so explicitly in the task overlay.
+4. Add a frozen behavioral suite `tests/<id>_torture.rs`. **Do not skip this.**
+5. Extend `src/bin/run-iter.rs`'s `--task` match arm to dispatch to the new bench binaries.
+6. Initialize `tasks/<id>/results.tsv` with the header row matching the TSV schema declared in the overlay.
+
+## The `run-iter` consolidation helper
 
 ```
-/create-autobench-task
+cargo run -p uc_autobench --bin run-iter --release -- \
+  --task shmem --json \
+  --baseline-spsc-p99-ns <n> --baseline-e2e-p99-ns <n>
 ```
 
-It scaffolds `tasks/<id>/`, `src/tasks/<id>.rs`, `src/bin/<id>-microbench.rs`, optional `src/bin/<id>-e2e.rs`, and `tests/<id>_torture.rs`. Then implement them — the skill prints a closing checklist.
-
-Manual steps if you skip the skill:
-1. `tasks/<id>/task.toml` — see `tasks/shmem/task.toml` as the reference schema.
-2. `src/tasks/<id>.rs` — implement `OptimizationTask`.
-3. `src/bin/<id>-microbench.rs` — emit one JSON line; keys must match `metrics` in `task.toml`.
-4. (Optional) `src/bin/<id>-e2e.rs` — Goodhart gate.
-5. `tests/<id>_torture.rs` — behavioral conformance suite. **Do not skip this.**
-6. Register the task in `src/bin/auto-bench.rs`.
-
-## The contract
-
-`contract.mode` chooses the freedom level given to the LLM:
-
-| Mode | LLM may change | LLM must preserve |
-|------|---------------|-------------------|
-| `rust_api` | Internal layout, on-disk format, framing | Public Rust API of mutable_paths |
-| `rust_api_plus_wire` | Internal layout only | Public Rust API + on-disk byte layout (verified by torture suite) |
-| `behavior_only` | Public Rust API too (orchestrator regenerates adapters) | Behavior (verified by torture suite) |
-
-`frozen_paths` is a hard reject pre-build. `mutable_paths` is what the LLM is shown as "current state".
+Drives build → ring_torture → shmem-microbench → conditional shmem-e2e. Emits one JSON object on stdout. The e2e gate is skipped if the microbench result is clearly not a winner (>5% over baseline). See the design spec §4 for the full output schema.
 
 ## The Goodhart gate
 
-Every task should have an `e2e_gate`. Without it, the LLM will exploit any quirk of the microbench. The gate runs only on variants that beat current best, so its cost amortizes.
+Every task should have an e2e gate. Without it, the LLM (you) will exploit any quirk of the microbench. The gate runs only on variants that microbench-plausibly win, so the cost amortizes.
 
-If your task genuinely cannot be e2e-benched, document why in the task's `extra_prompt_context()` so the LLM is at least asked to avoid known cheap-shots.
+If your task genuinely cannot be e2e-benched, document why in the task overlay so the loop is at least asked to avoid known cheap-shots.
 
 ## Cost & runtime expectations
 
-These are rough estimates — measure your own task.
-
-- **API cost:** ~$0.05–$0.15 per iteration with Opus.
-- **Walltime:** dominated by build+test+microbench. Estimate 3–5 min/iter for shmem; varies by task.
-- **Total run:** 200 iterations × 3–5 min ≈ 10–17 h. The `wall_clock_hours` budget often bites first.
-
-Lower cost by reducing `max_iterations` or by writing a faster microbench (the LLM doesn't need 1M-sample p99 to learn).
+- **API cost:** $0 — the loop uses your existing Claude Code subscription.
+- **Walltime per iter:** dominated by build + test + microbench + e2e. ~2–4 min/iter for shmem, varies by task.
 
 ## Failure modes
 
-The `status` field in `outcome.json` (and in the `outcome` of each `outcome_recorded` event) is one of:
+The `status` field in the run-iter JSON output is one of:
 
-| Outcome | Meaning | Where to look |
-|---------|---------|---------------|
-| `static_reject` | LLM touched a frozen path or path outside `mutable_paths` | `outcome.json`.reason; tighten/clarify the system prompt if rate >30% |
-| `test_fail` | `cargo test` or torture suite failed; OR a subprocess timed out | `logs/cargo-test.log`, `logs/ring-torture.log` |
-| `bench_regression` | Microbench ran but didn't beat current best by > noise threshold | Normal — most variants land here |
-| `goodhart_reject` | Won microbench but e2e regressed > regress_pct | Microbench is being exploited; consider strengthening the gate or e2e bench |
-| `promoted` | Beat current best (and passed e2e if configured) | The new winner; `proposal.json` has the hypothesis |
-| `resumed_aborted` | Iteration was killed mid-flight by a crash/Ctrl-C; resume found the dangling state | Diagnostic only; loop continues |
+| Status | Meaning | Action |
+|--------|---------|--------|
+| `pass` | All stages ran; check `gate.e2e_passed` and `metrics.spsc_p99_ns` to decide keep/discard |
+| `build_failed` | `cargo build` failed | Read `stderr_tail`; usually a syntax error |
+| `torture_failed` | `ring_torture` correctness suite failed | The proposal broke ring semantics; revert |
+| `microbench_failed` | Microbench spawn/exit/JSON-parse failed | Read `stderr_tail`; if it's a panic in your edited code, that's a crash |
+| `e2e_failed` | Same as above for the e2e gate | Usually a panic in the in-process node |
+| `timeout` | Some stage exceeded its hard wall-clock budget | Stage is in `stage`; either your code spins forever or the timeout needs raising |
+
+`build_failed` / `torture_failed` / `microbench_failed` / `e2e_failed` / `timeout` all map to TSV `status=crash`. `pass` with no improvement or failed gate maps to `status=discard`. `pass` with improvement + passed gate maps to `status=keep`.
 
 ## When NOT to use this framework
 
@@ -112,14 +78,14 @@ The `status` field in `outcome.json` (and in the `outcome` of each `outcome_reco
 
 ## Conventions
 
-- Microbench binary name: `<task-id>-microbench`.
-- E2E binary name: `<task-id>-e2e`.
-- Torture test file: `tests/<task-id>_torture.rs`.
-- All bench binaries emit one JSON line on stdout; everything else goes to stderr.
-- Metric keys in JSON output must match `task.toml`'s `metrics` exactly (typo = silent NaN).
+- Microbench binary name: `<task>-microbench`.
+- E2E binary name: `<task>-e2e`.
+- Torture test file: `tests/<task>_torture.rs`.
+- All bench binaries emit one JSON object on stdout; everything else goes to stderr.
+- Metric keys in JSON output must match what the task overlay declares (typo = silent miss).
 
 ## Pointers
 
-- **Design:** `docs/superpowers/specs/2026-05-24-uc-autobench-design.md`
-- **First task config:** `tasks/shmem/task.toml`
-- **First task impl:** `src/tasks/shmem.rs`
+- **Design:** `../docs/superpowers/specs/2026-05-29-uc-autobench-cc-driven-design.md`
+- **Loop spec:** `program.md`
+- **First task overlay:** `tasks/shmem/program.md`
