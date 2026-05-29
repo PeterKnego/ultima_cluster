@@ -263,8 +263,12 @@ pub unsafe fn write_record_at(
             dst.add(FRAME_HEADER_LEN + payload.len()),
             4,
         );
-        // Commit: write length last with Release ordering.
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        // Write length last (legacy "length != 0 means committed" guard). No
+        // Release fence is needed here: the caller advances `publish_position`
+        // with a Release store after this function returns, which orders ALL of
+        // these slot writes before any reader can observe the slot (readers
+        // only touch slots below `publish_position`, loaded with Acquire). On
+        // arm64 the removed fence was a per-write `dmb ish`.
         let len_bytes = (total_record_size as u32).to_le_bytes();
         std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), dst, 4);
     }
@@ -290,7 +294,9 @@ pub unsafe fn write_padding_marker_at(
             dst.add(4),
             2,
         );
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        // No Release fence (see `write_record_at`): the caller's subsequent
+        // `publish_position` Release store orders this write before any reader
+        // can observe the padding slot.
         let len_bytes = (padding_bytes as u32).to_le_bytes();
         std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), dst, 4);
     }
