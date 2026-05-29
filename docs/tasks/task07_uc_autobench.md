@@ -1,44 +1,52 @@
-# Task 07 — uc_autobench: auto-optimization framework + shmem task
+# Task 07 — uc_autobench: Claude-Code-driven autoresearch loop + shmem task
 
-**Status:** Framework + shmem-task scaffolding shipped on branch `auto_bench_shmem`. The first real shmem optimization run has **not** yet been executed (it requires `ANTHROPIC_API_KEY` and incurs API cost; see "Running the first shmem run" below).
+**Status:** Reworked on branch `auto_bench_shmem` (supersedes the prior API-driven design). The first real shmem autoresearch run has **not** yet been executed — it requires a human to kick off a Claude Code session, point it at `program.md`, and let it iterate.
 
-`uc_autobench` is a leaderboard+hypothesis LLM optimization loop ("autoresearcher" in the spirit of Karpathy's `autoresearch`): each iteration the LLM proposes a full rewrite of the target files, the harness builds + runs a frozen correctness suite + a microbench in sandboxed subprocesses, and a variant is promoted only if it beats the current best and passes an end-to-end Goodhart gate. Its first task optimizes the `uc_protocol` shmem ring buffers.
+`uc_autobench` is a karpathy/autoresearch-shape loop where Claude Code itself is the orchestrator: it reads `uc_autobench/program.md` + `uc_autobench/tasks/<task>/program.md`, edits the mutable target files, runs `cargo run -p uc_autobench --bin run-iter -- --task <task> --json`, parses the consolidated JSON, commits on win and `git checkout --` reverts on loss, appends a row to the committed per-task `results.tsv`, and loops indefinitely until the human interrupts. The first task optimizes the `uc_protocol` shmem ring buffers.
 
-## Working artifacts (not yet consolidated here)
+## Why the rework
 
-Per the project workflow (consolidate into `docs/tasks/` and delete the superpowers scaffolding once the feature ships), these will be folded into this file after the first real run + the framework retrospective land:
+The original design (`docs/superpowers/specs/2026-05-24-uc-autobench-design.md`) had a Rust orchestrator drive an Anthropic API client directly, which required a separately-billed `ANTHROPIC_API_KEY` outside the human's Claude Code subscription. The reworked design (`docs/superpowers/specs/2026-05-29-uc-autobench-cc-driven-design.md`) has Claude Code itself drive the loop, eliminating the separate API spend and ~2000 lines of orchestrator/LLM-client/proposal/sandbox/leaderboard/persist code in favor of a 50-line markdown loop spec plus a tiny `run-iter` consolidation helper.
 
-- Design spec: `docs/superpowers/specs/2026-05-24-uc-autobench-design.md`
-- Implementation plan: `docs/superpowers/plans/2026-05-24-uc-autobench.md`
+## Working artifacts (consolidate, then delete, per project workflow)
 
-## Code shipped
+Per CLAUDE.md's "Feature Development Workflow", these are ephemeral scaffolding. Once the rework lands and the first real run produces evidence, consolidate the design + plan into this file and delete the scaffolding:
+
+- Design spec: `docs/superpowers/specs/2026-05-29-uc-autobench-cc-driven-design.md`
+- Implementation plan: `docs/superpowers/plans/2026-05-29-uc-autobench-cc-driven.md`
+- Historical record (do not delete): `docs/superpowers/specs/2026-05-24-uc-autobench-design.md` — the original API-driven design
+
+## Code shipped (post-rework)
 
 - `uc_autobench/` crate:
-  - Orchestrator state machine (`src/orchestrator.rs`), task spec + trait (`src/task.rs`), proposal apply/revert + static checks (`src/proposal.rs`), subprocess sandbox with hard timeout (`src/sandbox.rs`), append-only JSONL event log (`src/persist.rs`), top-K diversity-aware leaderboard (`src/leaderboard.rs`), prompt rendering (`src/prompt.rs`), Anthropic tool-use client + deterministic stub (`src/llm.rs`), outcome/event types (`src/outcome.rs`).
-  - Shmem task: `src/tasks/shmem.rs` + `tasks/shmem/task.toml`.
-  - Fitness binaries (human-owned, never LLM-edited): `src/bin/shmem-microbench.rs` (8 metrics, batched-sample sub-tick latency), `src/bin/shmem-e2e.rs` (Goodhart gate via in-process node+service+4 clients).
-  - Correctness floor: `tests/ring_torture.rs` (6 behavioral conformance tests against the public ring API; frozen).
-  - CLI: `src/bin/auto-bench.rs`.
-  - Operator manual: `uc_autobench/CLAUDE.md`.
-- `uc_node/src/test_support.rs` — `ClusterFixture` (behind the `test-support` feature), extracted from the M4 integration tests and reused by `shmem-e2e`.
-- `.claude/skills/create-autobench-task/` — skill for scaffolding additional optimization tasks.
+  - `program.md` — generic loop instructions (operator-facing).
+  - `tasks/shmem/program.md` — per-task overlay (mutable paths, metric, TSV schema, task-specific constraints).
+  - `tasks/shmem/results.tsv` — committed run log (header-only at init; grows row-per-iter).
+  - `src/bin/run-iter.rs` — consolidation helper (build → ring_torture → microbench → conditional e2e gate → one JSON). Drains child stdout/stderr in background threads so verbose binaries (the e2e gate's tracing-subscriber output, in particular) don't block on pipe pressure.
+  - `src/bin/shmem-microbench.rs` — frozen fitness binary (8 metrics, batched-sample sub-tick latency).
+  - `src/bin/shmem-e2e.rs` — frozen Goodhart gate (in-process node+service+4 clients via the M4 fixture).
+  - `tests/ring_torture.rs` — frozen 7-test behavioral conformance suite.
+  - `CLAUDE.md` — operator manual.
+- `uc_node/src/test_support.rs` — `ClusterFixture` (behind the `test-support` feature), unchanged from the M4 extract; reused by `shmem-e2e`.
 
 ## Running the first shmem run
 
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-cargo run -p uc_autobench --bin auto-bench --release -- --task shmem
+In a Claude Code session at this repo:
+
+```
+Read uc_autobench/program.md and uc_autobench/tasks/shmem/program.md, then start a run.
 ```
 
-Artifacts land under `auto-bench-runs/shmem-rings/<run-id>/` (gitignored). Read `summary.md` for the leaderboard and `variants/<best>/proposal.json` for the winning hypothesis. The loop never auto-merges — a human reviews and applies the winner.
+Claude Code will propose a run tag, create `autoresearch/shmem-<tag>` from `main`, run a baseline iteration to populate `results.tsv`, and then iterate. The branch + TSV are the only state. Interrupt with Ctrl-C when satisfied; review the winning row's commit; PR to `main`.
 
 ## Known limitations / retrospective inputs
 
-These were surfaced during implementation and should be revisited in the framework retrospective (the deferred Tranche 4 / future task):
+These were surfaced during the original implementation and remain true under the rework. They should be revisited after the first real run:
 
 - **The e2e Goodhart gate is Raft-commit-dominated.** End-to-end submit→response latency (~38 ms) is dominated by the journal group-commit window, not by ns-scale shmem ring time. So the e2e gate functions as a *throughput-collapse / correctness guard*, not a sensitive latency-regression detector for shmem changes. The microbench is the real fitness signal for the ring; the e2e gate's default sample is small (2k round-trips) accordingly.
 - **Microbench latency resolution.** The host monotonic clock is coarse (~42 ns), so latency sub-benches use batched-sample timing (per-batch mean over many samples) to get sub-tick resolution. Run-to-run `spsc_p99_ns` is sensitive to background machine load; for trustworthy comparisons the loop should run benches without concurrent compilation.
-- **Not yet implemented (deferred to v1.1):** `--resume` of a prior run (the event log is replayable, the CLI surface is not wired), a `leaderboard.jsonl` snapshot file (the leaderboard is in memory + reflected in `summary.md`), a `best/` symlink, Ctrl-C clean shutdown, parallel variant execution, opt-in loom verification of the champion, and core-pinning for bench reproducibility.
+- **Microbench emits floats.** Percentile timings come out as fractional nanoseconds; `run-iter`'s `extract_u64` rounds them so the `u64`-typed `gate_decision` / `regress_pct` interface keeps working. Don't accidentally re-type the metrics as ints in the microbench — float resolution is real.
+- **Not yet implemented (deferred):** parallel variant execution (would need per-variant branches), opt-in loom verification of the champion, core-pinning for bench reproducibility, and a task-scaffolding skill (defer until a second task actually exists).
 
 ## Out of scope here
 
