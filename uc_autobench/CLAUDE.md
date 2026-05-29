@@ -14,6 +14,17 @@ Read uc_autobench/program.md and uc_autobench/tasks/shmem/program.md, then start
 
 That's it. There is no `auto-bench` binary, no API key, no orchestration daemon. The loop is the conversation: Claude Code reads `program.md`, executes the loop, the human watches and interrupts when satisfied.
 
+## This loop is autonomous — never ask questions, never pause
+
+**The human is not at the keyboard.** Once a run is started, Claude Code runs the loop unattended until the human presses Ctrl-C. This is the single most important operating rule, and it is the one most easily violated:
+
+- **Do not ask the user any question** — not for clarification, not for which variant to try, not "should I keep going?". Resolve ambiguity yourself by picking the best untried hypothesis from the task's idea backlog and proceeding.
+- **Do not stop to summarize or wait for approval** between iterations. Commit a win or revert a loss per the loop's decision rule, append the TSV row, and immediately begin the next iteration.
+- **The only stop signal is Ctrl-C.** Treat every place you'd normally hand control back to the user as "start the next iteration" instead.
+- If the *setup* is broken (harness build error, missing TSV, wrong branch), fix it and continue — still without asking.
+
+The full statement of this rule, with rationale, is in `program.md` under "Autonomy — DO NOT ASK QUESTIONS, DO NOT PAUSE".
+
 ## Reading a run
 
 A run is one branch (`autoresearch/<task>-<tag>`) and one TSV (`tasks/<task>/results.tsv`).
