@@ -331,8 +331,50 @@ fn main() {
         emit_and_exit(&out);
     }
 
-    // Microbench + e2e gate land in Tasks 6 and 7.
+    // Stage 3: shmem-microbench
+    let mut mb_cmd = Command::new("cargo");
+    mb_cmd.args([
+        "run",
+        "-p",
+        "uc_autobench",
+        "--bin",
+        "shmem-microbench",
+        "--release",
+        "--quiet",
+        "--",
+        "--json",
+    ]);
+    let mb = run_stage(mb_cmd, Duration::from_secs(180));
+    out.duration_s.microbench = mb.duration_s;
+    if mb.timed_out {
+        out.status = "timeout".into();
+        out.stage = "microbench".into();
+        out.stderr_tail = Some(tail_lines(&mb.stderr, 50));
+        emit_and_exit(&out);
+    }
+    if !mb.exit_ok {
+        out.status = "microbench_failed".into();
+        out.stage = "microbench".into();
+        out.stderr_tail = Some(tail_lines(&mb.stderr, 50));
+        emit_and_exit(&out);
+    }
+    // The microbench writes one JSON object to stdout. Parse it.
+    let mb_json: serde_json::Value = match serde_json::from_str(mb.stdout.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            out.status = "microbench_failed".into();
+            out.stage = "microbench".into();
+            out.stderr_tail = Some(format!(
+                "microbench stdout was not valid JSON: {e}\n--- raw ---\n{}",
+                tail_lines(&mb.stdout, 30)
+            ));
+            emit_and_exit(&out);
+        }
+    };
+    out.metrics = Some(mb_json);
+
+    // E2E gate lands in Task 7.
     out.status = "pass".into();
-    out.stage = "torture".into();
+    out.stage = "microbench".into();
     emit_and_exit(&out);
 }
