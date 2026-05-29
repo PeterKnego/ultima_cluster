@@ -1,3 +1,4 @@
 commit	spsc_p99_ns	e2e_p99_ns	memory_kb	status	description
 502b552	29	41424958	0	keep	baseline
 abe9b78	21.708	40612250	0	keep	spsc: drop redundant claim_position store (publish_position is sole producer cursor)
+d4f9c89	19.667	40115416	0	keep	spsc: #[inline] hot path (try_write/try_read/write_record_at/try_read_record_at) for cross-crate inlining
