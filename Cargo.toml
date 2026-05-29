@@ -47,6 +47,7 @@ dashmap = "6"
 tempfile = "3"
 anyhow = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wait-timeout = "0.2"
 
 # uc_autobench
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
