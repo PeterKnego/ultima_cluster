@@ -1,2 +1,3 @@
 commit	spsc_p99_ns	e2e_p99_ns	memory_kb	status	description
 502b552	29	41424958	0	keep	baseline
+abe9b78	21.708	40612250	0	keep	spsc: drop redundant claim_position store (publish_position is sole producer cursor)
