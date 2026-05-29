@@ -1,6 +1,4 @@
 commit	spsc_p99_ns	e2e_p99_ns	memory_kb	status	description
-502b552	29	41424958	0	keep	baseline
-abe9b78	21.708	40612250	0	keep	spsc: drop redundant claim_position store (publish_position is sole producer cursor)
-d4f9c89	19.667	40115416	0	keep	spsc: #[inline] hot path (try_write/try_read/write_record_at/try_read_record_at) for cross-crate inlining
-d4f9c89	19.75	40395000	0	discard	spsc: cache capacity/max_msg_size in Producer/Consumer structs — no gain (config line already hot in L1), reverted
--	18.62	0	0	discard	common: coalesce frame-header read(16B) + write(12B tail) into single copies — median 18.62 vs best 18.71, within noise (no gain)
+502b552	29	41424958	0	keep	baseline (single-sample; true median unknown)
+541dc6d	18.71	40612250	0	keep	spsc: drop redundant claim_position store (publish_position is sole producer cursor); spsc_p99 median-of-5 18.71 (17.83-19.46), e2e gate -1.96%, torture green
+-	18.62	0	0	discard	common: coalesce frame-header read(16B)+write(12B tail) into single copies — median-of-5 18.62 vs best 18.71, within noise (no gain), reverted
