@@ -7,8 +7,12 @@
 //!
 //! See `docs/superpowers/specs/2026-05-29-uc-autobench-cc-driven-design.md`.
 
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
 use clap::Parser;
 use serde::Serialize;
+use wait_timeout::ChildExt;
 
 #[derive(Parser, Debug)]
 #[command(name = "run-iter")]
@@ -109,7 +113,6 @@ fn regress_pct(value: u64, baseline: u64) -> f64 {
 
 /// Return the last `n` lines of `s`. If `s` has fewer than `n` lines, the
 /// whole input is returned. A trailing newline is preserved if present.
-#[allow(dead_code)] // wired into main() in Task 7
 fn tail_lines(s: &str, n: usize) -> String {
     let mut lines: Vec<&str> = s.split_inclusive('\n').collect();
     if lines.len() > n {
@@ -188,6 +191,82 @@ mod tests {
     }
 }
 
+/// Result of running a subprocess.
+struct StageRun {
+    /// Process exit status, or None if killed by timeout.
+    exit_ok: bool,
+    /// Combined stderr (and stdout for non-JSON stages).
+    stderr: String,
+    /// Stdout, captured separately so JSON-emitting stages can parse it.
+    stdout: String,
+    /// Wall-clock duration.
+    duration_s: f64,
+    /// True if the process was killed by the watchdog.
+    timed_out: bool,
+}
+
+/// Spawn a command, capture stdout+stderr, enforce a hard wall-clock timeout.
+/// On timeout, kill the process tree and return `timed_out = true`.
+fn run_stage(mut cmd: Command, timeout: Duration) -> StageRun {
+    let started = Instant::now();
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return StageRun {
+                exit_ok: false,
+                stderr: format!("failed to spawn: {e}"),
+                stdout: String::new(),
+                duration_s: 0.0,
+                timed_out: false,
+            };
+        }
+    };
+
+    let status = match child.wait_timeout(timeout).expect("wait_timeout") {
+        Some(s) => Some(s),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    };
+
+    let stdout = child
+        .stdout
+        .take()
+        .map(|mut p| {
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = p.read_to_string(&mut s);
+            s
+        })
+        .unwrap_or_default();
+    let stderr = child
+        .stderr
+        .take()
+        .map(|mut p| {
+            use std::io::Read;
+            let mut s = String::new();
+            let _ = p.read_to_string(&mut s);
+            s
+        })
+        .unwrap_or_default();
+
+    StageRun {
+        exit_ok: matches!(status, Some(s) if s.success()),
+        stderr,
+        stdout,
+        duration_s: started.elapsed().as_secs_f64(),
+        timed_out: status.is_none(),
+    }
+}
+
+fn emit_and_exit(out: &Output) -> ! {
+    println!("{}", serde_json::to_string(out).expect("serialize Output"));
+    std::process::exit(0);
+}
+
 fn main() {
     let args = Args::parse();
 
@@ -200,12 +279,60 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Placeholder: emit an empty stub object so the JSON shape can be
-    // verified before the real stages land.
-    let out = Output {
-        status: "pass".to_string(),
-        stage: "microbench".to_string(),
-        ..Output::default()
-    };
-    println!("{}", serde_json::to_string(&out).expect("serialize Output"));
+    let mut out = Output::default();
+
+    // Stage 1: build
+    let mut build_cmd = Command::new("cargo");
+    build_cmd
+        .args(["build", "-p", "uc_protocol", "-p", "uc_autobench", "--release"]);
+    let build = run_stage(build_cmd, Duration::from_secs(600));
+    out.duration_s.build = build.duration_s;
+    if build.timed_out {
+        out.status = "timeout".into();
+        out.stage = "build".into();
+        out.stderr_tail = Some(tail_lines(&build.stderr, 50));
+        emit_and_exit(&out);
+    }
+    if !build.exit_ok {
+        out.status = "build_failed".into();
+        out.stage = "build".into();
+        out.stderr_tail = Some(tail_lines(&build.stderr, 50));
+        emit_and_exit(&out);
+    }
+
+    // Stage 2: ring_torture conformance
+    let mut torture_cmd = Command::new("cargo");
+    torture_cmd.args([
+        "test",
+        "-p",
+        "uc_autobench",
+        "--test",
+        "ring_torture",
+        "--release",
+    ]);
+    let torture = run_stage(torture_cmd, Duration::from_secs(300));
+    out.duration_s.torture = torture.duration_s;
+    if torture.timed_out {
+        out.status = "timeout".into();
+        out.stage = "torture".into();
+        out.stderr_tail = Some(tail_lines(
+            &format!("{}\n--- stdout ---\n{}", torture.stderr, torture.stdout),
+            50,
+        ));
+        emit_and_exit(&out);
+    }
+    if !torture.exit_ok {
+        out.status = "torture_failed".into();
+        out.stage = "torture".into();
+        out.stderr_tail = Some(tail_lines(
+            &format!("{}\n--- stdout ---\n{}", torture.stderr, torture.stdout),
+            50,
+        ));
+        emit_and_exit(&out);
+    }
+
+    // Microbench + e2e gate land in Tasks 6 and 7.
+    out.status = "pass".into();
+    out.stage = "torture".into();
+    emit_and_exit(&out);
 }
