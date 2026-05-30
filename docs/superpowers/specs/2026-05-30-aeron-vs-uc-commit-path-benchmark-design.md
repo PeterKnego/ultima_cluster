@@ -171,10 +171,16 @@ efficiency — which is also the #1 optimization target.
 
 - **Loopback ≠ real NIC.** 3-node numbers over-credit the network layer; stated
   as a caveat, not corrected for.
-- **In-process fixture vs real processes.** This effort **starts in-process**
-  using the existing `ClusterFixture` (decided). Real cross-process shmem may
-  differ; the multi-process path (`--features multi-process-tests`) is a
-  follow-on fidelity extension, flagged but explicitly not in scope here.
+- **In-process fixture vs real processes.** Phase 1 (single-node) runs
+  **in-process** via the existing `ClusterFixture` (single-node only — verified).
+  Phase 2 (3-node) uses **real multi-process** launch. NOTE (corrected during
+  planning recon): there is **no `multi-process-tests` cargo feature** and there
+  are **no standalone `uc_node`/`uc_service`/`uc_client` binaries** — those
+  references in `CLAUDE.md` and earlier specs are stale. Phase 2 therefore
+  requires authoring a small `uc-node-launch` binary wrapping `NodeBuilder` with
+  `BootstrapConfig::Peers` + `IpcMode::Shmem` (pattern from
+  `uc_node/tests/m2_multi_node.rs` + `examples/counter_loop`). See the plan's
+  Phase 2 for the verified `NodeConfig`/`ServiceConfig` fields.
 - **Aeron apples-to-apples.** Aeron carries bytes only; the report must never
   present the Aeron line as if it included a state machine.
 - **io_uring is Linux-only.** Any group-commit/fsync optimization that depends on

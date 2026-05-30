@@ -886,38 +886,302 @@ git commit -m "bench: Aeron-vs-UC commit-path report + decomposition (Phase 1)"
 
 ## Phase 2 — 3-node replication layer (multi-process)
 
-> Phase 2 adds the replication/quorum layer via a REAL 3-process cluster. The in-process `ClusterFixture` cannot do multi-node (verified: single-node only). Because the multi-process launch infrastructure was not fully verified during planning, **Task 11 is recon** — do it before writing the remaining Phase 2 steps. Do not fabricate node/service CLI args; derive them from the code.
+> Phase 2 adds the replication/quorum layer via a REAL 3-process cluster. **Recon completed during planning** corrected the spec's assumptions:
+> - **There is no `multi-process-tests` cargo feature** — it appears only in prose (CLAUDE.md + specs). The real features are `uc_node`'s `test-support`/`test-helpers`.
+> - **There are no standalone `uc_node`/`uc_service`/`uc_client` binaries and no `kv_*` examples** (the CLAUDE.md `cargo run -p uc_node --example kv_node` lines are stale). The only runnable bins are `counter_loop_service` (node+service in ONE process, hardcoded `BootstrapConfig::SingleNode`) and `counter_loop_client`.
+> - A real 3-node QUIC cluster exists today **only as in-process tests** (`uc_node/tests/m2_multi_node.rs`). To run 3 separate processes we must **author a node launcher binary**.
+>
+> Verified facts the Phase 2 tasks rely on:
+> - `NodeConfig { node_id, data_dir, raft_listen_addr, app_id, bootstrap, raft, tls, ipc_mode, client_rings, service_rings }` (`uc_node/src/config.rs:49`).
+> - `BootstrapConfig::Peers { peers: Vec<PeerSeed> }` with `PeerSeed { node_id, raft_addr }` (`config.rs:101,108`). All nodes get the SAME peers list; the node with the **minimum node_id** calls `raft.initialize` + `add_learner(blocking=true)` per peer + `change_membership` (`builder.rs:367-463`). Nodes must start concurrently (bootstrapper blocks on peer reachability).
+> - `IpcMode::Shmem { instance_dir }` (one dir per node) is required for external client/service attach; `TlsConfig::SelfSigned` is the only variant (persists to `data_dir`).
+> - `NodeBuilder::new(config, state_machine).start().await` is the only constructor (`builder.rs:38,45`); `NodeHandle::{current_leader, submit, shutdown}` for control.
+> - `ServiceBuilder::new(ServiceConfig{ instance_dir, app_id, data_dir, .. }, sm).run().await` attaches by `instance_dir`+`app_id` only (`uc_service/src/runtime/service.rs:32,115`).
+> - `Client::connect(instance_dir, app_id)` discovers the node via the instance dir; `current_leader()` reads the cnc `NodeStatus`. `NotLeader { hint }` is surfaced when a client hits a follower.
+> - Journal/raft-log dir is `NodeConfig.data_dir` (arbitrary path → RAM disk for tmpfs runs); shmem rings live under the separate `instance_dir`. `m2_multi_node.rs::pick_three_addrs()` binds ephemeral `127.0.0.1:0` UDP sockets for per-node loopback ports.
 
-### Task 11: Recon the multi-process launch path (no code)
+### Task 11: Author a `uc-node-launch` binary
 
-**Files:** none (investigation; write findings into the plan before proceeding)
+A small binary wrapping `NodeBuilder` (+ optional in-process `ServiceBuilder`) so a node can be started from the CLI. Modeled on `examples/counter_loop/src/bin/counter_loop_service.rs` but with `BootstrapConfig::Peers` and `IpcMode::Shmem`.
 
-- [ ] **Step 1: Map the feature + binaries**
+**Files:**
+- Create: `uc_autobench/src/bin/uc-node-launch.rs`
+- Modify: `uc_autobench/Cargo.toml` (add `[[bin]]`)
+
+- [ ] **Step 1: Add the bin target**
+
+In `uc_autobench/Cargo.toml`, after the `commit-path-load` `[[bin]]` block add:
+```toml
+[[bin]]
+name = "uc-node-launch"
+path = "src/bin/uc-node-launch.rs"
+```
+
+- [ ] **Step 2: Write the launcher**
+
+Create `uc_autobench/src/bin/uc-node-launch.rs`:
+```rust
+//! uc-node-launch — start one real uc_node (+ co-located service) as a process,
+//! for multi-process N-node benchmarks. Uses BootstrapConfig::Peers + Shmem IPC.
+//! The min-node_id peer bootstraps (initialize + add_learner + change_membership)
+//! per uc_node/src/runtime/builder.rs; start all peers concurrently.
+
+use std::io::{Read, Write};
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use clap::Parser;
+use serde::{Deserialize, Serialize};
+use uc_node::config::{BootstrapConfig, IpcMode, NodeConfig, PeerSeed};
+use uc_node::NodeBuilder;
+use uc_service::{ServiceBuilder, ServiceConfig, SnapshotError, StateMachine};
+
+// KvSm must match commit-path-load's SM wire shape (Command/Response/Query).
+#[derive(Serialize, Deserialize)]
+enum KvCmd { Put { key: u64, val: Vec<u8> } }
+
+#[derive(Default)]
+struct KvSm { map: std::collections::HashMap<u64, Vec<u8>>, last_applied: Option<u64> }
+
+impl StateMachine for KvSm {
+    type Command = KvCmd; type Response = u64; type Query = u64; type QueryResponse = Option<Vec<u8>>;
+    fn apply(&mut self, log_index: u64, cmd: KvCmd) -> u64 {
+        let KvCmd::Put { key, val } = cmd; self.map.insert(key, val);
+        self.last_applied = Some(log_index); self.map.len() as u64
+    }
+    fn query(&self, key: u64) -> Option<Vec<u8>> { self.map.get(&key).cloned() }
+    fn last_applied(&self) -> Option<u64> { self.last_applied }
+    fn build_snapshot(&self, _d: &mut dyn Write) -> Result<u64, SnapshotError> { Ok(self.last_applied.unwrap_or(0)) }
+    fn install_snapshot(&mut self, _s: &mut dyn Read) -> Result<u64, SnapshotError> { Ok(self.last_applied.unwrap_or(0)) }
+}
+
+#[derive(Parser)]
+struct Args {
+    #[arg(long)] node_id: u64,
+    #[arg(long)] listen: SocketAddr,
+    /// repeated: --peer 1@127.0.0.1:7001 --peer 2@127.0.0.1:7002 ...
+    #[arg(long = "peer")] peers: Vec<String>,
+    #[arg(long)] instance_dir: PathBuf,
+    #[arg(long)] data_dir: PathBuf,
+    #[arg(long, default_value = "uc-bench-3node")] app_id: String,
+    /// if set, run a co-located service in this process
+    #[arg(long, default_value_t = true)] with_service: bool,
+}
+
+fn parse_peer(s: &str) -> PeerSeed {
+    let (id, addr) = s.split_once('@').expect("peer must be id@addr");
+    PeerSeed { node_id: id.parse().unwrap(), raft_addr: addr.parse().unwrap() }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
+    let args = Args::parse();
+    let peers: Vec<PeerSeed> = args.peers.iter().map(|s| parse_peer(s)).collect();
+    std::fs::create_dir_all(&args.instance_dir)?;
+    std::fs::create_dir_all(&args.data_dir)?;
+
+    let cfg = NodeConfig {
+        node_id: args.node_id,
+        data_dir: args.data_dir.clone(),
+        raft_listen_addr: args.listen,
+        app_id: args.app_id.clone(),
+        bootstrap: BootstrapConfig::Peers { peers },
+        ipc_mode: IpcMode::Shmem { instance_dir: args.instance_dir.clone() },
+        ..Default::default()
+    };
+    let node = NodeBuilder::new(cfg, KvSm::default()).start().await?;
+    eprintln!("node {} listening on {}", args.node_id, args.listen);
+
+    if args.with_service {
+        let svc_cfg = ServiceConfig {
+            instance_dir: args.instance_dir.clone(),
+            app_id: args.app_id.clone(),
+            data_dir: args.data_dir.join("service"),
+            ..Default::default()
+        };
+        tokio::spawn(async move { ServiceBuilder::new(svc_cfg, KvSm::default()).run().await });
+    }
+
+    tokio::signal::ctrl_c().await?;
+    node.shutdown().await?;
+    Ok(())
+}
+```
+> NOTE for implementer: field names in `NodeConfig`/`ServiceConfig` literal init must match `config.rs:49` / `service.rs:32` exactly; if `..Default::default()` isn't derivable on `NodeConfig`, build it field-by-field from the `m2_multi_node.rs::node_config` helper. Verify `uc_node::config` re-exports (`NodeConfig`, `BootstrapConfig`, `PeerSeed`, `IpcMode`) and `uc_node::NodeBuilder` are public; adjust `use` paths to match.
+
+- [ ] **Step 3: Build**
+
+Run: `cargo build -p uc_autobench --bin uc-node-launch`
+Expected: builds. Fix `use`/field mismatches against `config.rs` until clean.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add uc_autobench/src/bin/uc-node-launch.rs uc_autobench/Cargo.toml
+git commit -m "bench: uc-node-launch binary for multi-process N-node clusters"
+```
+
+### Task 12: Add `--connect` mode to `commit-path-load`
+
+So the load driver can attach to an already-running multi-process cluster instead of spawning the in-process fixture.
+
+**Files:**
+- Modify: `uc_autobench/src/bin/commit-path-load.rs`
+
+- [ ] **Step 1: Add the flag + branch in main**
+
+In `Args`, add:
+```rust
+    /// Attach to a running cluster at this instance dir instead of spawning the
+    /// in-process single-node fixture. For multi-process N-node runs.
+    #[arg(long)]
+    connect: Option<std::path::PathBuf>,
+    /// app_id of the running cluster (used with --connect)
+    #[arg(long, default_value = "uc-bench-3node")]
+    app_id: String,
+```
+In `main`, replace the fixture creation + client acquisition with:
+```rust
+    // Either attach to a running cluster (--connect) or spawn the in-process
+    // single-node fixture. The fixture must outlive the run, so bind it.
+    let fixture;
+    let owned_client;
+    let client: &uc_client::Client = if let Some(dir) = &args.connect {
+        owned_client = uc_client::Client::connect(dir, &args.app_id).await?;
+        &owned_client
+    } else {
+        fixture = ClusterFixture::<KvSm>::single_node(1).await?;
+        fixture.client(0)
+    };
+```
+> NOTE: this changes binding lifetimes — keep `let fixture;` / `let owned_client;` declared before the `if` so both live to end of `main`. With `--connect`, leader routing matters: `Client::submit` against a follower returns `ClientError::NotLeader { hint }`. Handle it: on `NotLeader`, reconnect to the hinted node's instance dir (the run script maps node_id→instance_dir) or retry. Implement a small retry that skips the request on `NotLeader` and logs, so the bench targets the leader's instance dir directly (simplest: point `--connect` at the leader, discovered in the run script via `current_leader()`).
+
+- [ ] **Step 2: Build**
+
+Run: `cargo build -p uc_autobench --bin commit-path-load`
+Expected: builds clean.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add uc_autobench/src/bin/commit-path-load.rs
+git commit -m "bench: --connect mode to drive a running multi-process cluster"
+```
+
+### Task 13: 3-node loopback run script
+
+**Files:**
+- Create: `uc_autobench/scripts/run-uc-3node.sh`
+
+- [ ] **Step 1: Write the script**
+
+Create `uc_autobench/scripts/run-uc-3node.sh`:
+```bash
+#!/usr/bin/env bash
+# Launch a real 3-node uc cluster on loopback, then drive the commit-path load
+# bench against the leader. Journal dirs on real disk by default; set
+# DATA_ROOT=/dev/shm (Linux) for the tmpfs variant.
+set -euo pipefail
+cd "$(dirname "$0")/../.."   # repo root
+
+APP_ID="${APP_ID:-uc-bench-3node}"
+DATA_ROOT="${DATA_ROOT:-/tmp/uc3}"        # journal (raft log)
+IPC_ROOT="${IPC_ROOT:-/tmp/uc3-ipc}"      # shmem rings
+OUT_DIR="${OUT_DIR:-bench-out}"
+RATES="${RATES:-100,500,1000,2000,5000,10000}"
+INFLIGHT="${INFLIGHT:-1,8,32,128}"
+PAYLOAD="${PAYLOAD:-64}"
+rm -rf "$DATA_ROOT" "$IPC_ROOT"; mkdir -p "$DATA_ROOT" "$IPC_ROOT" "$OUT_DIR"
+
+cargo build -p uc_autobench --bin uc-node-launch --bin commit-path-load --release
+
+# Fixed loopback ports for the 3 peers.
+P1=127.0.0.1:7001; P2=127.0.0.1:7002; P3=127.0.0.1:7003
+PEERS=(--peer "1@$P1" --peer "2@$P2" --peer "3@$P3")
+
+pids=()
+for n in 1 2 3; do
+  addr_var="P$n"; addr="${!addr_var}"
+  ./target/release/uc-node-launch \
+    --node-id "$n" --listen "$addr" "${PEERS[@]}" \
+    --app-id "$APP_ID" \
+    --instance-dir "$IPC_ROOT/node$n" \
+    --data-dir "$DATA_ROOT/node$n" &
+  pids+=($!)
+done
+trap 'kill "${pids[@]}" 2>/dev/null || true' EXIT
+
+# Wait for the cluster to elect a leader & accept clients. node1 (min id)
+# bootstraps; clients attach to node1's instance dir, which surfaces the leader
+# hint if node1 isn't leader. Simplest: drive against node1; --connect handles
+# NotLeader by following the hint.
+sleep 8
+
+./target/release/commit-path-load \
+  --connect "$IPC_ROOT/node1" --app-id "$APP_ID" \
+  --config 3node_loopback --rates "$RATES" --inflight "$INFLIGHT" \
+  --payload-bytes "$PAYLOAD" --out "$OUT_DIR/uc_3node_loopback.csv"
+
+echo "wrote $OUT_DIR/uc_3node_loopback.csv" >&2
+```
+
+- [ ] **Step 2: Smoke-run a tiny ladder**
 
 Run:
 ```bash
-grep -rn "multi-process-tests\|multi_process" --include=*.toml --include=*.rs .
-ls examples/*/src/bin 2>/dev/null; ls uc_node/examples uc_service/examples uc_client/examples 2>/dev/null
-grep -rn "BootstrapConfig\|NodeBuilder\|NodeConfig\|ServiceBuilder\|ServiceConfig" uc_node/src uc_service/src | head -40
+chmod +x uc_autobench/scripts/run-uc-3node.sh
+RATES=50,200 INFLIGHT=1,16 OUT_DIR=/tmp/uc3-bench \
+  uc_autobench/scripts/run-uc-3node.sh
+cat /tmp/uc3-bench/uc_3node_loopback.csv
 ```
-Record: which crate defines `multi-process-tests`, what example/bin binaries exist to launch a node/service/client from the CLI (and their arg parsing), the `BootstrapConfig` variants for multi-node membership, how the QUIC listen addr + node_id + peer list are set, and how the instance/journal dir is chosen (for tmpfs-vs-disk and for client discovery).
+Expected: 3 nodes start, a leader is elected, and the CSV has 4 rows. **Sanity:** p99 should be ≥ the single-node disk p99 (replication adds quorum round-trips). If clients can't connect or only `NotLeader` errors appear, increase the `sleep`, and confirm `--connect` follows the leader hint; if node startup races, the min-id bootstrap may need the other nodes up first (they are — all spawned before the sleep).
 
-- [ ] **Step 2: Find the existing multi-node bring-up test**
+- [ ] **Step 3: Commit**
+
+```bash
+git add uc_autobench/scripts/run-uc-3node.sh
+git commit -m "bench: 3-node loopback multi-process run script"
+```
+
+### Task 14: Full 3-node run + extend the report
+
+**Files:**
+- Modify: `docs/tasks/task09_aeron_vs_uc_commit_path.md`
+
+- [ ] **Step 1: Full 3-node run (disk, then tmpfs on Linux)**
 
 Run:
 ```bash
-ls uc_node/tests; grep -rln "node_id: 2\|three.node\|3.node\|quic\|membership\|add_learner\|change_membership" uc_node/tests
+uc_autobench/scripts/run-uc-3node.sh
+# tmpfs journal variant (Linux only):
+[ -d /dev/shm ] && DATA_ROOT=/dev/shm/uc3 OUT_DIR=bench-out \
+  bash -c 'sed-not-needed'; DATA_ROOT=/dev/shm/uc3 uc_autobench/scripts/run-uc-3node.sh || true
 ```
-Read the multi-node integration test (e.g. `m2_*`) and record exactly how it constructs 3 nodes, passes membership/addresses, and awaits leader election. This is the template for the launch script.
+Expected: `bench-out/uc_3node_loopback.csv` populated across the full grid.
 
-- [ ] **Step 3: Write the remaining Phase 2 tasks**
+- [ ] **Step 2: Regenerate plots with all configs**
 
-Using the recon, append concrete tasks to this plan:
-- a launch script `uc_autobench/scripts/run-uc-3node.sh` that starts 3 `uc_node` + 1 `uc_service` + waits for leader,
-- a `--connect <instance_dir>` mode added to `commit-path-load` (attach to a running cluster via `Client::connect` instead of spawning the fixture; gate the fixture path behind the absence of `--connect`),
-- a full 3-node run + extend the report's decomposition with the replication layer (+ loopback caveat).
+Run:
+```bash
+/tmp/benchvenv/bin/python uc_autobench/scripts/plot_decomposition.py \
+  bench-out/uc_*.csv bench-out/aeron_ipc.csv --out-dir bench-out/plots
+```
+Expected: curves now include `uc/3node_loopback`.
 
-Then execute them.
+- [ ] **Step 3: Extend the report**
+
+Add to `docs/tasks/task09_aeron_vs_uc_commit_path.md`:
+- The replication layer row in the decomposition (single-node disk → 3-node loopback delta = quorum/replication cost).
+- The **loopback caveat** explicitly: loopback is not real-NIC latency, so the replication delta is a lower bound on real-network cost.
+- Update the prioritized backlog: where replication adds cost (batching AppendEntries, pipelining commit, fsync-vs-replication overlap), and which items the autoresearch loop can drive vs which need cross-host hardware to measure.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add docs/tasks/task09_aeron_vs_uc_commit_path.md bench-out
+git commit -m "bench: 3-node replication layer added to commit-path report (Phase 2)"
+```
 
 ---
 
