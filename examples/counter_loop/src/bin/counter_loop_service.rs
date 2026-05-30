@@ -11,7 +11,8 @@
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use clap::Parser;
@@ -33,6 +34,19 @@ use uc_service::runtime::ServiceConfig;
 use uc_service::{OutputError, OutputHandler, ServiceBuilder, StateMachine};
 
 const SUBSCRIBER_BUFFER: usize = 4096;
+
+// Diagnostic counters for the 1000-counter hang investigation.
+// Hypothesis: under high concurrency the bounded mpsc(SUBSCRIBER_BUFFER) fills,
+// `tx.send().await` blocks, on_committed never returns, output_loop stalls,
+// node-side output.ring fills, apply stalls, raft commits halt. Confirmed by
+// SLOW_SENDS climbing in lockstep with submit-side timeouts.
+static OC_CALLS: AtomicU64 = AtomicU64::new(0);
+static OC_NO_SUB: AtomicU64 = AtomicU64::new(0);
+static OC_CLOSED: AtomicU64 = AtomicU64::new(0);
+static OC_SLOW_SENDS: AtomicU64 = AtomicU64::new(0);
+static OC_OK: AtomicU64 = AtomicU64::new(0);
+const STATS_EVERY: u64 = 1000;
+const SLOW_SEND_THRESHOLD: Duration = Duration::from_millis(100);
 
 #[derive(Parser, Debug)]
 #[command(about = "counter_loop benchmark — service side (node + service + gRPC server)")]
@@ -59,6 +73,19 @@ struct CounterOutput {
     slot: SubscriberSlot,
 }
 
+fn maybe_log_stats(n: u64) {
+    if n % STATS_EVERY == 0 {
+        tracing::info!(
+            calls = n,
+            ok = OC_OK.load(Ordering::Relaxed),
+            no_sub = OC_NO_SUB.load(Ordering::Relaxed),
+            closed = OC_CLOSED.load(Ordering::Relaxed),
+            slow_sends = OC_SLOW_SENDS.load(Ordering::Relaxed),
+            "on_committed stats"
+        );
+    }
+}
+
 #[async_trait]
 impl OutputHandler<CounterSm> for CounterOutput {
     async fn on_committed(
@@ -67,6 +94,7 @@ impl OutputHandler<CounterSm> for CounterOutput {
         cmd: &Cmd,
         state: &CounterSm,
     ) -> Result<(), OutputError> {
+        let n = OC_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
         let Cmd::Inc { name } = cmd;
         let QueryResp { value } = state.query(Query::Get(name.clone()));
         let value = value
@@ -74,7 +102,11 @@ impl OutputHandler<CounterSm> for CounterOutput {
 
         let tx = match self.slot.lock().clone() {
             Some(tx) => tx,
-            None => return Err(OutputError::Retryable("no subscriber attached".into())),
+            None => {
+                OC_NO_SUB.fetch_add(1, Ordering::Relaxed);
+                maybe_log_stats(n);
+                return Err(OutputError::Retryable("no subscriber attached".into()));
+            }
         };
 
         let event = IncrementEvent {
@@ -83,9 +115,26 @@ impl OutputHandler<CounterSm> for CounterOutput {
             log_index,
         };
 
-        match tx.send(Ok(event)).await {
-            Ok(()) => Ok(()),
+        let send_start = Instant::now();
+        let send_result = tx.send(Ok(event)).await;
+        let send_elapsed = send_start.elapsed();
+        if send_elapsed >= SLOW_SEND_THRESHOLD {
+            OC_SLOW_SENDS.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                ?send_elapsed,
+                log_index,
+                "tx.send slow — mpsc backpressure"
+            );
+        }
+        maybe_log_stats(n);
+
+        match send_result {
+            Ok(()) => {
+                OC_OK.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
             Err(_closed) => {
+                OC_CLOSED.fetch_add(1, Ordering::Relaxed);
                 *self.slot.lock() = None;
                 Err(OutputError::Retryable("subscriber dropped".into()))
             }

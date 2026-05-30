@@ -138,8 +138,9 @@ efficiency — which is also the #1 optimization target.
 
 ### Shared / analysis
 
-- A plotting/aggregation script: overlay latency-vs-throughput curves; per-layer
-  decomposition bar at a fixed offered load.
+- A plotting/aggregation script (**Python + matplotlib**): overlay
+  latency-vs-throughput curves; per-layer decomposition bar at a fixed offered
+  load. Consumes the shared-schema CSVs from both sides.
 - **Report** in `docs/tasks/` (UC convention — superpowers specs are ephemeral
   scaffolding, consolidated into a `taskNN_*.md` on completion). Contains: the
   gap-decomposition table, overlay plots, and the **prioritized optimization
@@ -170,10 +171,10 @@ efficiency — which is also the #1 optimization target.
 
 - **Loopback ≠ real NIC.** 3-node numbers over-credit the network layer; stated
   as a caveat, not corrected for.
-- **In-process fixture vs real processes.** The existing harness uses an
-  in-process `ClusterFixture`. Real cross-process shmem may differ; if the
-  multi-process path (`--features multi-process-tests`) is needed for fidelity,
-  that is a build-sequence extension, flagged but not assumed.
+- **In-process fixture vs real processes.** This effort **starts in-process**
+  using the existing `ClusterFixture` (decided). Real cross-process shmem may
+  differ; the multi-process path (`--features multi-process-tests`) is a
+  follow-on fidelity extension, flagged but explicitly not in scope here.
 - **Aeron apples-to-apples.** Aeron carries bytes only; the report must never
   present the Aeron line as if it included a state machine.
 - **io_uring is Linux-only.** Any group-commit/fsync optimization that depends on
