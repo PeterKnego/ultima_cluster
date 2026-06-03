@@ -118,76 +118,6 @@ fn tail_lines(s: &str, n: usize) -> String {
     lines.concat()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gate_runs_when_no_baseline_supplied() {
-        // First iteration of a new run: no committed best yet, so the gate
-        // always runs to establish baseline.
-        let d = gate_decision(195, None);
-        assert_eq!(d, GateDecision::Run);
-    }
-
-    #[test]
-    fn gate_runs_when_microbench_plausibly_wins() {
-        // 195 ns vs 200 ns baseline: clear improvement, gate runs.
-        let d = gate_decision(195, Some(200));
-        assert_eq!(d, GateDecision::Run);
-    }
-
-    #[test]
-    fn gate_runs_when_microbench_within_5pct_of_baseline() {
-        // 209 ns vs 200 ns baseline: 4.5% over, still plausibly noise, gate runs.
-        let d = gate_decision(209, Some(200));
-        assert_eq!(d, GateDecision::Run);
-    }
-
-    #[test]
-    fn gate_skips_when_microbench_clearly_regresses() {
-        // 215 ns vs 200 ns baseline: 7.5% over, not a winner, skip gate.
-        match gate_decision(215, Some(200)) {
-            GateDecision::Skip(reason) => {
-                assert!(reason.contains("not_plausible"), "reason={reason}");
-            }
-            GateDecision::Run => panic!("expected Skip, got Run"),
-        }
-    }
-
-    #[test]
-    fn regress_pct_basic() {
-        assert!((regress_pct(105, 100) - 5.0).abs() < 1e-9);
-        assert!((regress_pct(100, 100) - 0.0).abs() < 1e-9);
-        assert!((regress_pct(95, 100) - (-5.0)).abs() < 1e-9);
-    }
-
-    #[test]
-    fn regress_pct_zero_baseline_is_zero() {
-        // Defensive: if baseline is somehow 0, return 0.0 instead of NaN/inf.
-        assert_eq!(regress_pct(100, 0), 0.0);
-    }
-
-    #[test]
-    fn tail_lines_short_input_returned_whole() {
-        let s = "a\nb\nc\n";
-        assert_eq!(tail_lines(s, 50), "a\nb\nc\n");
-    }
-
-    #[test]
-    fn tail_lines_returns_last_n_lines() {
-        let s = "a\nb\nc\nd\ne\nf\n";
-        // Last 3 lines: d, e, f
-        assert_eq!(tail_lines(s, 3), "d\ne\nf\n");
-    }
-
-    #[test]
-    fn tail_lines_no_trailing_newline() {
-        let s = "a\nb\nc";
-        assert_eq!(tail_lines(s, 2), "b\nc");
-    }
-}
-
 /// Result of running a subprocess.
 struct StageRun {
     /// Process exit status, or None if killed by timeout.
@@ -510,5 +440,75 @@ fn main() {
             out.stage = "e2e".into();
             emit_and_exit(&out);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate_runs_when_no_baseline_supplied() {
+        // First iteration of a new run: no committed best yet, so the gate
+        // always runs to establish baseline.
+        let d = gate_decision(195, None);
+        assert_eq!(d, GateDecision::Run);
+    }
+
+    #[test]
+    fn gate_runs_when_microbench_plausibly_wins() {
+        // 195 ns vs 200 ns baseline: clear improvement, gate runs.
+        let d = gate_decision(195, Some(200));
+        assert_eq!(d, GateDecision::Run);
+    }
+
+    #[test]
+    fn gate_runs_when_microbench_within_5pct_of_baseline() {
+        // 209 ns vs 200 ns baseline: 4.5% over, still plausibly noise, gate runs.
+        let d = gate_decision(209, Some(200));
+        assert_eq!(d, GateDecision::Run);
+    }
+
+    #[test]
+    fn gate_skips_when_microbench_clearly_regresses() {
+        // 215 ns vs 200 ns baseline: 7.5% over, not a winner, skip gate.
+        match gate_decision(215, Some(200)) {
+            GateDecision::Skip(reason) => {
+                assert!(reason.contains("not_plausible"), "reason={reason}");
+            }
+            GateDecision::Run => panic!("expected Skip, got Run"),
+        }
+    }
+
+    #[test]
+    fn regress_pct_basic() {
+        assert!((regress_pct(105, 100) - 5.0).abs() < 1e-9);
+        assert!((regress_pct(100, 100) - 0.0).abs() < 1e-9);
+        assert!((regress_pct(95, 100) - (-5.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn regress_pct_zero_baseline_is_zero() {
+        // Defensive: if baseline is somehow 0, return 0.0 instead of NaN/inf.
+        assert_eq!(regress_pct(100, 0), 0.0);
+    }
+
+    #[test]
+    fn tail_lines_short_input_returned_whole() {
+        let s = "a\nb\nc\n";
+        assert_eq!(tail_lines(s, 50), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn tail_lines_returns_last_n_lines() {
+        let s = "a\nb\nc\nd\ne\nf\n";
+        // Last 3 lines: d, e, f
+        assert_eq!(tail_lines(s, 3), "d\ne\nf\n");
+    }
+
+    #[test]
+    fn tail_lines_no_trailing_newline() {
+        let s = "a\nb\nc";
+        assert_eq!(tail_lines(s, 2), "b\nc");
     }
 }

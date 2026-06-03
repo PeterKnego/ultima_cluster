@@ -74,7 +74,7 @@ struct CounterOutput {
 }
 
 fn maybe_log_stats(n: u64) {
-    if n % STATS_EVERY == 0 {
+    if n.is_multiple_of(STATS_EVERY) {
         tracing::info!(
             calls = n,
             ok = OC_OK.load(Ordering::Relaxed),
