@@ -5,6 +5,11 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# Turns on uc_protocol's probe sink across the whole dependency graph (feature
+# unification makes uc_node/uc_service/uc_client use the same instrumented build).
+uc-bench-probes = ["uc_protocol/uc-bench-probes"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -14,6 +19,8 @@ tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 wait-timeout = { workspace = true }
+hdrhistogram = { workspace = true }
+futures = { workspace = true }
 uc_protocol = { path = "../uc_protocol" }
 uc_node = { path = "../uc_node", features = ["test-support"] }
 uc_service = { path = "../uc_service" }
@@ -34,3 +41,10 @@ path = "src/bin/shmem-e2e.rs"
 [[bin]]
 name = "run-iter"
 path = "src/bin/run-iter.rs"
+
+[[bin]]
+name = "attribution-bench"
+path = "src/bin/attribution-bench.rs"
+# Uses uc_protocol's probe-sink drain API, which only exists with the feature.
+# Without this, a default `cargo build --workspace` would fail to compile the bin.
+required-features = ["uc-bench-probes"]
