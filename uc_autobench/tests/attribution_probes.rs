@@ -73,8 +73,8 @@ async fn full_path_probes_capture_every_checkpoint() {
     // Every joined row must have all checkpoints, and `total` must be the
     // largest stage.
     for row in &rows {
-        for i in 0..uc_protocol::probes::N_CHECKPOINTS {
-            assert!(row[i].is_some(), "checkpoint {i} missing in a joined row");
+        for (i, cp) in row.iter().enumerate() {
+            assert!(cp.is_some(), "checkpoint {i} missing in a joined row");
         }
         let deltas = uc_protocol::probes::stage_deltas(row);
         let total = deltas.iter().find(|(n, _)| *n == "total").unwrap().1;

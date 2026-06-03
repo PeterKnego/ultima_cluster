@@ -167,8 +167,16 @@ pub use imp::{drain_joined, reset, stage_deltas};
 mod tests {
     use super::*;
 
+    // The probe sink is a process-global (`OnceLock<Sink>`); cargo runs unit
+    // tests multi-threaded by default, so without serialization one test's
+    // `reset()` can wipe another's stamps mid-flight. Hold this across each
+    // test body. `unwrap_or_else(into_inner)` tolerates poisoning from a prior
+    // failing test so we still see the real assertion, not a cascade.
+    static SINK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn join_and_stage_deltas_cover_full_path() {
+        let _serial = SINK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         // One request: client_id=7, local_seq=0, log_index=100.
         stamp_client(7, 0, Checkpoint::Submit);
@@ -186,8 +194,8 @@ mod tests {
         let rows = drain_joined();
         assert_eq!(rows.len(), 1, "one joined request");
         let row = &rows[0];
-        for i in 0..N_CHECKPOINTS {
-            assert!(row[i].is_some(), "checkpoint {i} present after join");
+        for (i, cp) in row.iter().enumerate() {
+            assert!(cp.is_some(), "checkpoint {i} present after join");
         }
         let deltas = stage_deltas(row);
         let names: Vec<&str> = deltas.iter().map(|(n, _)| *n).collect();
@@ -205,6 +213,7 @@ mod tests {
 
     #[test]
     fn request_without_bridge_is_dropped() {
+        let _serial = SINK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         stamp_client(9, 1, Checkpoint::Submit);
         stamp_client(9, 1, Checkpoint::ClientRecv);
