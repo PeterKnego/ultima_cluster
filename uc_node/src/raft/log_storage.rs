@@ -318,6 +318,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
         let _guard = self.append_lock.lock().unwrap();
 
         let mut last_notifier: Option<ultima_journal::Notifier> = None;
+        let mut probe_last_seq: Option<u64> = None;
 
         for entry in entries {
             let payload = bincode::serde::encode_to_vec(&entry, bincode::config::standard())
@@ -331,14 +332,20 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
                 .append(seq, term, &payload)
                 .map_err(journal_io)?;
             last_notifier = Some(notifier);
+            uc_protocol::probes::stamp_log(seq, uc_protocol::probes::Checkpoint::JournalAppended);
+            probe_last_seq = Some(seq);
         }
 
-        if let Some(notifier) = last_notifier {
+        if let (Some(notifier), Some(probe_seq)) = (last_notifier, probe_last_seq) {
             // Chain IOFlushed completion onto the final entry's Notifier.
             // ultima_journal's bg fsync thread calls our callback after sync_all() —
             // zero thread hop. IOFlushed::io_completed takes
             // `Result<(), io::Error>`, so we map JournalError → io::Error here.
             notifier.on_complete(move |result| {
+                uc_protocol::probes::stamp_log(
+                    probe_seq,
+                    uc_protocol::probes::Checkpoint::JournalFsynced,
+                );
                 let io_result: Result<(), io::Error> = result.map_err(io::Error::other);
                 callback.io_completed(io_result);
             });
