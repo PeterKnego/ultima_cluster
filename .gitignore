@@ -32,3 +32,8 @@ target
 /.idea/
 /.private/
 auto-bench-runs/
+
+# Transient benchmark outputs. The committed baseline lives in
+# bench-out/reference/; everything else under bench-out/ is per-run scratch.
+/bench-out/*
+!/bench-out/reference/

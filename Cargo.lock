@@ -2449,6 +2449,8 @@ dependencies = [
  "bytes",
  "clap",
  "crc32fast",
+ "futures",
+ "hdrhistogram",
  "serde",
  "serde_json",
  "tempfile",
