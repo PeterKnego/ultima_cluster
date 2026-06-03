@@ -64,6 +64,13 @@ where
             match consumer.try_read(&mut payload_buf) {
                 Ok(Some(rec)) if rec.msg_type == MSG_TYPE_SUBMIT => {
                     let extra = rec.header_extra;
+                    let (probe_cid, probe_seq) =
+                        uc_protocol::frames::client::decode_extra_client(extra);
+                    uc_protocol::probes::stamp_client(
+                        probe_cid,
+                        probe_seq,
+                        uc_protocol::probes::Checkpoint::NodeDequeue,
+                    );
                     let flags = rec.flags;
                     let payload = std::mem::take(&mut payload_buf);
 
@@ -88,6 +95,7 @@ where
                     let app_command = AppCommand::from(Bytes::from(payload));
                     match raft.client_write(app_command).await {
                         Ok(resp) => {
+                            uc_protocol::probes::bridge(probe_cid, probe_seq, resp.log_id.index);
                             broadcast_record(
                                 &response_producer,
                                 MSG_TYPE_SUBMIT_RESPONSE,
@@ -96,6 +104,11 @@ where
                                 resp.data.as_ref(),
                             )
                             .await;
+                            uc_protocol::probes::stamp_client(
+                                probe_cid,
+                                probe_seq,
+                                uc_protocol::probes::Checkpoint::Broadcast,
+                            );
                         }
                         Err(e) => {
                             use openraft::error::{ClientWriteError, RaftError};
