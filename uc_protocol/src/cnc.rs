@@ -271,7 +271,20 @@ pub fn validate_cnc(mmap: &[u8]) -> Result<&CncHeader, RingError> {
     if mmap.len() < CNC_HEADER_LEN {
         return Err(RingError::Corrupt("cnc mmap too small for header".into()));
     }
-    // SAFETY: mmap is at least CNC_HEADER_LEN bytes and page-aligned.
+    // `CncHeader` is `#[repr(C, align(64))]`; forming `&CncHeader` from a pointer
+    // that isn't 64-byte aligned is undefined behavior. Memory-mapped cnc.dat
+    // files are page-aligned and always satisfy this, but a caller passing an
+    // arbitrary buffer (e.g. a heap `Vec` from `fs::read`) would not — reject it
+    // cleanly rather than dereferencing a misaligned pointer.
+    if !(mmap.as_ptr() as usize).is_multiple_of(std::mem::align_of::<CncHeader>()) {
+        return Err(RingError::Corrupt(
+            "cnc buffer not aligned to CncHeader (expected a page-aligned mmap)".into(),
+        ));
+    }
+    // SAFETY: mmap is at least CNC_HEADER_LEN bytes (length checked above) and
+    // 64-byte aligned (alignment checked above), so the pointer is valid for a
+    // `CncHeader` read; the bytes are a `#[repr(C)]` header whose magic + CRC are
+    // verified immediately below.
     let header = unsafe { &*mmap.as_ptr().cast::<CncHeader>() };
     if header.magic != crate::magic::CNC_MAGIC {
         return Err(RingError::BadMagic);

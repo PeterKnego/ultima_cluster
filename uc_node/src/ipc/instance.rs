@@ -98,11 +98,16 @@ mod tests {
         assert_eq!(inst.node_id, 7);
         assert_ne!(inst.instance_id, 0);
 
-        // cnc.dat exists and validates.
+        // cnc.dat exists and validates. Validate through a real read-only mmap
+        // (page-aligned, as attachers do) rather than a heap `Vec` from
+        // `fs::read` — `validate_cnc` borrows the bytes as a 64-byte-aligned
+        // `CncHeader`, which a heap buffer would not satisfy.
         let cnc_path = tmp.path().join("cnc.dat");
         assert!(cnc_path.exists());
-        let cnc_bytes = std::fs::read(&cnc_path).unwrap();
-        let header = validate_cnc(&cnc_bytes).expect("validate");
+        let cnc_file = std::fs::File::open(&cnc_path).unwrap();
+        // SAFETY: cnc.dat is not mutated for the duration of this mapping.
+        let cnc_mmap = unsafe { memmap2::Mmap::map(&cnc_file).unwrap() };
+        let header = validate_cnc(&cnc_mmap[..]).expect("validate");
         assert_eq!(header.app_id_str(), "kv-app");
         assert_eq!(header.node_id, 7);
         assert_eq!(header.instance_id(), inst.instance_id);
