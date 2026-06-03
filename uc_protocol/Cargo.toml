@@ -18,5 +18,11 @@ crc32fast = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 
+[features]
+# Commit-path latency probes. OFF by default: when off, every `stamp_*` is a
+# zero-cost inline no-op and frame layout is unchanged. Enabled only for bench
+# builds (e.g. uc_autobench's attribution-bench).
+uc-bench-probes = []
+
 [dev-dependencies]
 tempfile = { workspace = true }

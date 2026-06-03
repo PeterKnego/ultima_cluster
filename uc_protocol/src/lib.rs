@@ -16,6 +16,7 @@ pub mod frames;
 pub mod handshake;
 pub mod liveness;
 pub mod magic;
+pub mod probes;
 pub mod ring;
 pub mod version;
 
