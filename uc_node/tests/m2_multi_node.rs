@@ -97,6 +97,26 @@ pub struct TestNode {
     pub addr: SocketAddr,
 }
 
+/// Serializes the multi-node cluster tests against each other so the default
+/// (parallel) `cargo test` is deterministic — the equivalent of `#[serial]`.
+///
+/// Each test stands up a full 2–3 node cluster (QUIC endpoints + raft), and
+/// concurrent execution is flaky for two reasons. First, `pick_*_addrs` binds
+/// ephemeral UDP ports then releases them before the nodes re-bind, a TOCTOU
+/// window where a parallel test grabs the same port and causes cross-cluster
+/// QUIC collisions. Second, running all five clusters (~15 raft nodes) at once
+/// saturates the machine, so fixed apply/election timeouts expire and openraft's
+/// timing invariants trip (seen as flaky `three_node_replication` /
+/// `leader_failover`). Acquiring this for each test's whole body means exactly
+/// one cluster runs at a time — the same condition under which the suite is green
+/// with `--test-threads=1`.
+///
+/// An async (`tokio`) mutex is used so the guard can be held across the test's
+/// `await`s without tripping `clippy::await_holding_lock`; it does not poison, so
+/// a failed test won't cascade. Hold it as the first statement of each test:
+/// `let _serial = CLUSTER_SERIAL.lock().await;`.
+static CLUSTER_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Pick three loopback addresses by binding ephemeral UDP sockets, capturing
 /// the addresses, and releasing the sockets.
 pub fn pick_three_addrs() -> Vec<SocketAddr> {
@@ -221,6 +241,7 @@ pub async fn shutdown_all(mut nodes: Vec<TestNode>) {
 
 #[tokio::test]
 async fn three_node_cluster_elects_leader() {
+    let _serial = CLUSTER_SERIAL.lock().await;
     let nodes = spawn_3_node_cluster().await;
     let leader = wait_for_leader(&nodes, Duration::from_secs(10)).await;
     assert!((1..=3).contains(&leader), "leader {leader} out of range");
@@ -229,6 +250,7 @@ async fn three_node_cluster_elects_leader() {
 
 #[tokio::test]
 async fn three_node_replication() {
+    let _serial = CLUSTER_SERIAL.lock().await;
     let nodes = spawn_3_node_cluster().await;
     let leader_id = wait_for_leader(&nodes, Duration::from_secs(10)).await;
     let leader = nodes.iter().find(|n| n.node_id == leader_id).unwrap();
@@ -336,6 +358,7 @@ async fn spawn_2_node_cluster_tight_snapshot() -> Vec<TestNode> {
 
 #[tokio::test]
 async fn leader_failover() {
+    let _serial = CLUSTER_SERIAL.lock().await;
     let mut nodes = spawn_3_node_cluster().await;
     let initial_leader_id = wait_for_leader(&nodes, Duration::from_secs(10)).await;
 
@@ -386,6 +409,7 @@ async fn leader_failover() {
 
 #[tokio::test]
 async fn snapshot_install_on_new_follower() {
+    let _serial = CLUSTER_SERIAL.lock().await;
     let nodes = spawn_2_node_cluster_tight_snapshot().await;
     let leader_id = wait_for_leader(&nodes, Duration::from_secs(10)).await;
     let leader = nodes.iter().find(|n| n.node_id == leader_id).unwrap();
@@ -449,6 +473,7 @@ async fn snapshot_install_on_new_follower() {
 
 #[tokio::test]
 async fn membership_change_remove_node() {
+    let _serial = CLUSTER_SERIAL.lock().await;
     let nodes = spawn_3_node_cluster().await;
     let leader_id = wait_for_leader(&nodes, Duration::from_secs(10)).await;
     let leader = nodes.iter().find(|n| n.node_id == leader_id).unwrap();
