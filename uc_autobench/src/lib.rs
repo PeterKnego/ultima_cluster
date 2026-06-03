@@ -7,3 +7,5 @@
 //! the consolidation helper (`run-iter`), and the frozen `ring_torture`
 //! conformance suite. The orchestration loop itself lives in `program.md`
 //! and is executed directly by Claude Code.
+
+pub mod task_spec;
