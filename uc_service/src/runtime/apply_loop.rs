@@ -76,6 +76,10 @@ fn apply_thread_body<S>(
                     continue;
                 }
                 let log_index = decode_extra_apply(rec.header_extra);
+                uc_protocol::probes::stamp_log(
+                    log_index,
+                    uc_protocol::probes::Checkpoint::ApplyStart,
+                );
                 let (cmd, _) = match bincode::serde::decode_from_slice::<S::Command, _>(
                     &payload_buf,
                     bincode_standard(),
@@ -94,6 +98,10 @@ fn apply_thread_body<S>(
                     let mut guard = sm.blocking_write();
                     guard.apply(log_index, cmd)
                 };
+                uc_protocol::probes::stamp_log(
+                    log_index,
+                    uc_protocol::probes::Checkpoint::ApplyDone,
+                );
                 let resp_bytes = bincode::serde::encode_to_vec(&resp, bincode_standard())
                     .expect("apply response encode");
                 publish_response(resp_producer, log_index, &resp_bytes, &stop);
