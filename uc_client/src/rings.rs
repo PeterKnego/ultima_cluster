@@ -93,6 +93,11 @@ pub fn spawn_broadcast_reader(
                     if cid != my_client_id {
                         continue;
                     }
+                    uc_protocol::probes::stamp_client(
+                        cid,
+                        local_seq,
+                        uc_protocol::probes::Checkpoint::ClientRecv,
+                    );
                     // Recognized types only.
                     let msg_type = rec.msg_type;
                     let ok = matches!(

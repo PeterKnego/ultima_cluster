@@ -204,6 +204,11 @@ impl Client {
     ) -> Result<RawResponse, ClientError> {
         let local_seq = self.next_local_seq.fetch_add(1, Ordering::Relaxed);
         let extra = encode_extra_client(self.cnc.client_id, local_seq);
+        uc_protocol::probes::stamp_client(
+            self.cnc.client_id,
+            local_seq,
+            uc_protocol::probes::Checkpoint::Submit,
+        );
 
         let (tx, mut rx): (oneshot::Sender<RawResponse>, oneshot::Receiver<RawResponse>) =
             oneshot::channel();
