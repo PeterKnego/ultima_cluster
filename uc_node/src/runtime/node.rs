@@ -360,6 +360,13 @@ impl<S: StateMachine> NodeHandle<S> {
             output_replay_watcher,
         } = self;
 
+        // Shmem mode: signal the state-machine adapter to abort any apply()
+        // that is parked waiting on the service rings (e.g. the service has
+        // crashed). Otherwise raft.shutdown() — which drains openraft's
+        // state-machine worker — would deadlock on that wedged apply.
+        if let SmAdapter::Shmem(a) = &sm {
+            a.signal_shutdown();
+        }
         // Shut down raft first so it stops issuing outbound RPCs.
         // Idempotent on second call (e.g. if the service watcher already
         // shut raft down on a stalled-leader event).

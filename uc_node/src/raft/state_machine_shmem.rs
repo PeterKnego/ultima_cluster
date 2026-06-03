@@ -37,6 +37,7 @@ use std::io;
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -63,6 +64,26 @@ const EMPTY_BACKOFF: Duration = Duration::from_micros(100);
 
 pub struct ShmemAdaptedStateMachine<S: StateMachine> {
     pub(crate) inner: Arc<TokioMutex<ShmemInner<S>>>,
+    /// Set by `node.shutdown()` (via [`Self::signal_shutdown`]) just before
+    /// `raft.shutdown()`. `apply()` waits on the service apply/resp rings
+    /// indefinitely so it can resume when a crashed service reconnects; that
+    /// same indefinite wait would otherwise deadlock shutdown, because
+    /// `raft.shutdown()` drains the openraft state-machine worker that is
+    /// parked inside `apply()`. The ring-wait loops poll this flag and abort.
+    ///
+    /// Lives OUTSIDE `inner` on purpose: a wedged `apply()` holds the `inner`
+    /// lock, so the flag must be settable without acquiring it. Shared across
+    /// `Clone` (openraft's worker copy and the `NodeHandle` copy) via the `Arc`.
+    pub(crate) shutdown: Arc<AtomicBool>,
+}
+
+impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
+    /// Signal any in-flight `apply()` to stop waiting on the service rings and
+    /// return an error, so openraft's state-machine worker can finish and
+    /// `raft.shutdown()` can complete even when the service has crashed.
+    pub(crate) fn signal_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
 }
 
 pub(crate) struct ShmemInner<S: StateMachine> {
@@ -157,6 +178,7 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
                 apply_resp_consumer: PlMutex::new(apply_resp_consumer),
                 output_chan_tx,
             })),
+            shutdown: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -165,6 +187,7 @@ impl<S: StateMachine> Clone for ShmemAdaptedStateMachine<S> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            shutdown: self.shutdown.clone(),
         }
     }
 }
@@ -187,6 +210,9 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
     where
         Strm: futures::Stream<Item = Result<EntryResponder<TypeConfig>, io::Error>> + Unpin + Send,
     {
+        // Shared with `node.shutdown()`; read lock-free in the ring-wait loops
+        // so a service crash can't wedge shutdown.
+        let shutdown = self.shutdown.clone();
         while let Some(item) = entries.next().await {
             let (entry, responder) = item?;
             let log_id = entry.log_id;
@@ -203,8 +229,11 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                 }
                 EntryPayload::Normal(cmd_bytes) => {
                     // Normal app-data: publish to apply.ring, await response from apply_resp.ring.
-                    publish_apply(&g.apply_producer, log_index, cmd_bytes.as_ref(), log_id).await?;
-                    let resp = await_apply_resp(&g.apply_resp_consumer, log_index, log_id).await?;
+                    publish_apply(&g.apply_producer, log_index, cmd_bytes.as_ref(), log_id, &shutdown)
+                        .await?;
+                    let resp =
+                        await_apply_resp(&g.apply_resp_consumer, log_index, log_id, &shutdown)
+                            .await?;
                     // M5: hand off to output_dispatcher. try_send so apply never blocks
                     // on a full output channel — the skip path catches it during replay.
                     if let Err(e) = g
@@ -311,9 +340,16 @@ async fn publish_apply(
     log_index: u64,
     cmd_bytes: &[u8],
     log_id: RaftLogId,
+    shutdown: &AtomicBool,
 ) -> Result<(), io::Error> {
     let _ = log_id; // kept for parity with the 0.9 error-context site
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "apply publish interrupted: node shutting down",
+            ));
+        }
         let result = {
             let mut p = producer.lock();
             p.try_write(
@@ -345,10 +381,21 @@ async fn await_apply_resp(
     consumer: &PlMutex<SpscConsumer>,
     expected_log_index: u64,
     log_id: RaftLogId,
+    shutdown: &AtomicBool,
 ) -> Result<Bytes, io::Error> {
     let _ = log_id; // kept for parity with the 0.9 error-context site
     let mut payload_buf: Vec<u8> = Vec::with_capacity(1024);
     loop {
+        if shutdown.load(Ordering::Acquire) {
+            // Service crashed and we're shutting down: stop waiting for a
+            // response that will never come so raft.shutdown() can proceed.
+            // The entry is NOT durably applied (no last_applied advance), so
+            // it is re-applied on restart once the service is back.
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "apply interrupted: node shutting down",
+            ));
+        }
         let read_result = {
             let mut c = consumer.lock();
             c.try_read(&mut payload_buf)
