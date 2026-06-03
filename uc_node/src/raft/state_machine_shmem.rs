@@ -324,7 +324,13 @@ async fn publish_apply(
             )
         };
         match result {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                uc_protocol::probes::stamp_log(
+                    log_index,
+                    uc_protocol::probes::Checkpoint::ApplyEnqueue,
+                );
+                return Ok(());
+            }
             Err(RingError::Full) => tokio::time::sleep(FULL_BACKOFF).await,
             Err(e) => {
                 return Err(io::Error::other(format!(
@@ -364,6 +370,10 @@ async fn await_apply_resp(
                         ),
                     ));
                 }
+                uc_protocol::probes::stamp_log(
+                    expected_log_index,
+                    uc_protocol::probes::Checkpoint::RespDequeue,
+                );
                 return Ok(Bytes::from(std::mem::take(&mut payload_buf)));
             }
             Ok(Some(rec)) => {
