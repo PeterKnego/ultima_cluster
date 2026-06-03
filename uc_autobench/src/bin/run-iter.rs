@@ -284,10 +284,21 @@ fn extract_u64(v: &serde_json::Value) -> Option<u64> {
 fn main() {
     let args = Args::parse();
 
-    if args.task != "shmem" {
-        eprintln!("run-iter: unknown task {:?}; v1 supports only `shmem`", args.task);
-        std::process::exit(2);
-    }
+    let spec = match uc_autobench::task_spec::task_spec(&args.task) {
+        Some(s) => s,
+        None => {
+            let out = Output {
+                status: "unknown_task".to_string(),
+                stage: "setup".to_string(),
+                stderr_tail: Some(format!(
+                    "unknown task {:?}; known tasks: shmem",
+                    args.task
+                )),
+                ..Default::default()
+            };
+            emit_and_exit(&out);
+        }
+    };
     if !args.json {
         eprintln!("run-iter: only --json output mode is supported in v1");
         std::process::exit(2);
@@ -352,7 +363,7 @@ fn main() {
         "-p",
         "uc_autobench",
         "--bin",
-        "shmem-microbench",
+        spec.microbench_bin,
         "--release",
         "--quiet",
         "--",
@@ -394,7 +405,7 @@ fn main() {
     let spsc_p99_ns = out
         .metrics
         .as_ref()
-        .and_then(|m| m.get("spsc_p99_ns"))
+        .and_then(|m| m.get(spec.primary_metric))
         .and_then(extract_u64);
     let Some(spsc_p99_ns) = spsc_p99_ns else {
         // Microbench succeeded but didn't emit the primary metric — treat
@@ -422,13 +433,24 @@ fn main() {
             emit_and_exit(&out);
         }
         GateDecision::Run => {
+            let Some(gate_bin) = spec.gate_bin else {
+                // No Goodhart gate for this task: pass through with gate.ran = false.
+                out.gate = Gate {
+                    ran: false,
+                    reason: Some("no_gate_bin_for_task".to_string()),
+                    ..Default::default()
+                };
+                out.status = "pass".to_string();
+                out.stage = "microbench".to_string();
+                emit_and_exit(&out);
+            };
             let mut e2e_cmd = Command::new("cargo");
             e2e_cmd.args([
                 "run",
                 "-p",
                 "uc_autobench",
                 "--bin",
-                "shmem-e2e",
+                gate_bin,
                 "--release",
                 "--quiet",
                 "--",
@@ -461,8 +483,9 @@ fn main() {
                 }
             };
 
+            let gate_metric = spec.gate_metric.unwrap_or("submit_to_resp_p99_ns");
             let submit_to_resp_p99_ns = e2e_json
-                .get("submit_to_resp_p99_ns")
+                .get(gate_metric)
                 .and_then(extract_u64);
             let regress_pct_val = match (submit_to_resp_p99_ns, args.baseline_e2e_p99_ns) {
                 (Some(v), Some(baseline)) => Some(regress_pct(v, baseline)),
