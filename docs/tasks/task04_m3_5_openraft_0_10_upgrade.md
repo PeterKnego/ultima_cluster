@@ -61,6 +61,65 @@ cargo clippy --workspace --all-targets -- -D warnings   # zero warnings
 cargo fmt --check                # clean
 ```
 
+## Follow-ups (2026-06-04): shutdown deadlock + test isolation
+
+Running the full suite under load surfaced an intermittent **hang** (not a panic)
+in `m3_service_crash::service_crash_on_leader_transfers_leadership`. The test's
+own NOTE anticipated *timing* flakiness (bump the fallback / smarter target
+selection); the real cause was deeper — a genuine product deadlock in the
+0.10 shmem shutdown path — plus two unrelated pre-existing test-isolation bugs.
+All fixed and pushed.
+
+1. **Shmem shutdown deadlock** (`4fca5fd`, real bug). `ShmemAdaptedStateMachine::apply`
+   (§6) publishes a Normal entry to `apply.ring` then blocks in `await_apply_resp`
+   on `apply_resp.ring` — **indefinitely by design**, so apply resumes when a
+   crashed service reconnects (it also holds the SM `inner` mutex throughout).
+   But `node.shutdown()` begins with `raft.shutdown().await`, and openraft 0.10's
+   shutdown *drains the state-machine worker*; if that worker is parked in our
+   wedged `apply()`, shutdown never returns. Triggered whenever a node whose
+   service has crashed must apply a committed Normal entry — e.g. the ex-leader
+   from the `service_watcher` transfer (§8), now a follower, applying the new
+   leader's write. Timing-dependent ⇒ intermittent under load, clean in isolation.
+   **Fix:** an `Arc<AtomicBool>` shutdown flag on `ShmemAdaptedStateMachine`,
+   placed *outside* the `inner` mutex (a wedged apply holds that lock) and shared
+   across `Clone` (openraft's worker copy + the `NodeHandle` copy). `node.shutdown()`
+   sets it before `raft.shutdown()`; `publish_apply` / `await_apply_resp` poll it
+   each iteration and return `io::ErrorKind::Interrupted`. openraft accepts the
+   apply error and `raft.shutdown()` returns `Ok`. The entry is **not** durably
+   applied (no `last_applied` advance), so it re-applies on restart once the
+   service is back — the service store is the source of truth. Embedded mode is
+   unaffected (in-process apply never blocks on an external service). Steady-state
+   cost: one atomic load per ring-wait iteration. Deterministic regression test:
+   `uc_node/tests/m3_shutdown_dead_service.rs` (single node: crash service, wedge
+   an apply, assert `node.shutdown()` completes within 10 s — hangs pre-fix,
+   ~2 s post-fix).
+
+2. **`m2_multi_node` parallel contention** (`2f4ad6c`, test isolation). The five
+   multi-node tests each stand up a 2–3 node loopback-QUIC cluster; run
+   concurrently (cargo's default within a binary) they raced two ways:
+   `pick_*_addrs` binds ephemeral UDP ports then releases them before the nodes
+   re-bind (TOCTOU → cross-cluster QUIC collisions), and ~15 raft nodes at once
+   saturate the box so fixed apply/election timeouts expire and openraft timing
+   invariants trip. Serialized all five on a shared `tokio::sync::Mutex`
+   (`CLUSTER_SERIAL`) held for each test's whole body (the `#[serial]` pattern;
+   tokio mutex avoids `clippy::await_holding_lock`) — exactly the known-good
+   `--test-threads=1` condition, now automatic under default `cargo test`.
+
+3. **`validate_cnc` misaligned-pointer UB** (`a11a911`, latent bug). `validate_cnc`
+   is a safe `fn(&[u8])` but formed `&CncHeader` (`#[repr(C, align(64))]`) from the
+   buffer pointer — UB unless 64-byte aligned. Production attachers pass
+   page-aligned mmaps (fine); a heap `Vec` from `fs::read` (in a test) tripped
+   the debug misalignment check nondeterministically. Fix: reject non-aligned
+   buffers with `RingError::Corrupt`; the zero-copy `&CncHeader` return is
+   unchanged for the mmap path.
+
+Net: plain `cargo test --workspace` (no flags) is now deterministically green
+(149 tests, verified across repeated runs). Related cleanups in the same sweep:
+`61d0dc8` (serialize the process-global probe-sink unit tests) and `2ca8995`
+(pre-existing clippy lints under newer toolchain). The deferred "smarter
+`transfer_leader` target selection" item below is unchanged — it was never the
+cause of the hang.
+
 ## Pointers
 
 - M3.5 design spec: `docs/superpowers/specs/2026-05-15-uc-m3-5-openraft-0-10-upgrade-design.md`.
