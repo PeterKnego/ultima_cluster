@@ -18,6 +18,7 @@ pub enum Outcome {
 
 #[derive(Clone, Debug)]
 pub struct Entry {
+    #[allow(dead_code)]
     pub client: u32,
     pub op: Op,
     pub invoke: u64,
@@ -61,6 +62,7 @@ impl History {
         self.entries.into_inner().unwrap()
     }
     /// Count of Ok outcomes (for the liveness gate).
+    #[allow(dead_code)]
     pub fn ok_count(entries: &[Entry]) -> usize {
         entries
             .iter()
