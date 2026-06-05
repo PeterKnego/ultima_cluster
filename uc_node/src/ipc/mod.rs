@@ -26,6 +26,7 @@ pub mod instance;
 pub mod liveness;
 pub mod metrics_publisher;
 pub mod query_link;
+pub(crate) mod ring_bridge;
 pub mod service_link;
 pub mod service_watcher;
 pub mod session_gc;
