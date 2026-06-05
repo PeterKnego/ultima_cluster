@@ -121,6 +121,7 @@ async fn m4_client_response_overwritten() {
             max_msg: 512,
         },
         service_rings: ServiceRingConfig::default(),
+        log_durability: ultima_journal::Durability::Eventual,
     };
 
     let node_task =

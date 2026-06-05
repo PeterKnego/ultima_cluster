@@ -93,6 +93,7 @@ fn cfg(data_dir: PathBuf, bootstrap: BootstrapConfig) -> NodeConfig {
         ipc_mode: uc_node::IpcMode::default(),
         client_rings: ClientRingConfig::default(),
         service_rings: ServiceRingConfig::default(),
+        log_durability: ultima_journal::Durability::Eventual,
     }
 }
 

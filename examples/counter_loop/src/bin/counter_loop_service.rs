@@ -210,6 +210,7 @@ async fn main() -> anyhow::Result<()> {
         },
         client_rings: ClientRingConfig::default(),
         service_rings: ServiceRingConfig::default(),
+        log_durability: uc_node::Durability::Eventual,
     };
     // Node + service start concurrently: in shmem mode `NodeBuilder::start`
     // blocks waiting for the service handshake, and `ServiceBuilder::run`

@@ -110,6 +110,7 @@ async fn m5_output_ring_backpressure_skip() {
             output_cap_bytes: 4 * 1024,
             output_max_msg: 1024,
         },
+        log_durability: ultima_journal::Durability::Eventual,
     };
 
     let node_task =

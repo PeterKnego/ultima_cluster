@@ -125,6 +125,7 @@ async fn m5_output_idempotent_replay() {
         },
         client_rings: ClientRingConfig::default(),
         service_rings: ServiceRingConfig::default(),
+        log_durability: ultima_journal::Durability::Eventual,
     };
     let node_task =
         tokio::spawn(async move { NodeBuilder::new(cfg, Counter::default()).start().await });

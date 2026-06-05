@@ -98,6 +98,7 @@ async fn node_shutdown_with_crashed_service_does_not_hang() {
         },
         client_rings: ClientRingConfig::default(),
         service_rings: ServiceRingConfig::default(),
+        log_durability: ultima_journal::Durability::Eventual,
     };
     let node_task =
         tokio::spawn(async move { NodeBuilder::new(node_cfg, Counter::default()).start().await });

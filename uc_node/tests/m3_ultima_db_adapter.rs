@@ -99,6 +99,7 @@ async fn ultima_db_adapter_end_to_end() {
         },
         client_rings: ClientRingConfig::default(),
         service_rings: ServiceRingConfig::default(),
+        log_durability: ultima_journal::Durability::Eventual,
     };
     // Node-side SM is degenerate in shmem mode (snapshot trait surface only).
     let node_task =

@@ -14,6 +14,7 @@ pub use config::{
     BootstrapConfig, ClientRingConfig, IpcMode, NodeConfig, NodeId, PeerSeed, RaftTuning,
     ServiceRingConfig, TlsConfig,
 };
+pub use ultima_journal::Durability;
 pub use error::ClusterError;
 pub use ipc::{Instance, IpcError};
 pub use runtime::builder::NodeBuilder;

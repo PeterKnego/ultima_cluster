@@ -46,7 +46,10 @@ impl<S: StateMachine> NodeBuilder<S> {
         self.config.validate().map_err(ClusterError::Config)?;
 
         // Open log storage (journal + StableValues).
-        let log_storage = JournalLogStorage::open(&self.config.data_dir)?;
+        let log_storage = JournalLogStorage::open_with_durability(
+            &self.config.data_dir,
+            self.config.log_durability,
+        )?;
 
         // Sanity-check durable state before handing off to openraft.
         crate::runtime::recovery::assert_consistent(&log_storage)?;

@@ -66,6 +66,13 @@ pub struct NodeConfig {
     /// Sizing for the service-side output ring files. Defaults to 16 MiB /
     /// 4 MiB. Override in tests to force the dispatcher's skip path.
     pub service_rings: ServiceRingConfig,
+    /// Durability for the Raft log journal. `Eventual` (recommended/default) acks
+    /// an append at the page-cache write, with fsync off the commit critical path
+    /// — durability via quorum replication; survives process crash, **not**
+    /// simultaneous quorum power loss (Aeron `fileSyncLevel=0`). `Consistent`
+    /// fsyncs before ack (power-loss safe; Aeron `fileSyncLevel>=1`). Aeron sync
+    /// levels 1 and 2 both map to `Consistent` (the journal fsyncs data+metadata).
+    pub log_durability: ultima_journal::Durability,
 }
 
 /// Selects how `apply()` is dispatched.

@@ -161,6 +161,7 @@ async fn three_node_shmem_cluster() {
             },
             client_rings: ClientRingConfig::default(),
             service_rings: ServiceRingConfig::default(),
+            log_durability: ultima_journal::Durability::Eventual,
         };
         node_tasks.push(tokio::spawn(async move {
             NodeBuilder::new(cfg, Counter::default()).start().await

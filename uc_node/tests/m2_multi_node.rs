@@ -147,6 +147,7 @@ pub fn node_config(
         ipc_mode: uc_node::IpcMode::default(),
         client_rings: ClientRingConfig::default(),
         service_rings: ServiceRingConfig::default(),
+        log_durability: ultima_journal::Durability::Eventual,
     }
 }
 
@@ -326,6 +327,7 @@ async fn spawn_2_node_cluster_tight_snapshot() -> Vec<TestNode> {
             ipc_mode: uc_node::IpcMode::default(),
             client_rings: ClientRingConfig::default(),
             service_rings: ServiceRingConfig::default(),
+            log_durability: ultima_journal::Durability::Eventual,
         };
         prep.push((node_id, dir, *addr, cfg));
     }
@@ -443,6 +445,7 @@ async fn snapshot_install_on_new_follower() {
         ipc_mode: uc_node::IpcMode::default(),
         client_rings: ClientRingConfig::default(),
         service_rings: ServiceRingConfig::default(),
+        log_durability: ultima_journal::Durability::Eventual,
     };
     let new_handle = NodeBuilder::new(new_cfg, Counter::default())
         .start()

@@ -106,6 +106,7 @@ async fn shmem_single_node_submit_apply() {
         },
         client_rings: ClientRingConfig::default(),
         service_rings: ServiceRingConfig::default(),
+        log_durability: ultima_journal::Durability::Eventual,
     };
     let node_task = tokio::spawn(async move {
         // Counter passed to the node is degenerate in shmem mode (used
@@ -204,6 +205,7 @@ async fn shmem_single_node_query_roundtrip() {
         },
         client_rings: ClientRingConfig::default(),
         service_rings: ServiceRingConfig::default(),
+        log_durability: ultima_journal::Durability::Eventual,
     };
     let node_task =
         tokio::spawn(async move { NodeBuilder::new(node_cfg, Counter::default()).start().await });
