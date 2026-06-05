@@ -126,6 +126,28 @@ impl JournalLogStorage {
         })
     }
 
+    /// The `RaftLogId` of the record at `seq` (the entry's own `log_id`), or
+    /// `None` if `seq == 0` or no record exists there. Used by recovery to clamp
+    /// a power-loss-inverted `committed` down to the durable log tail.
+    pub(crate) fn last_log_id_at(&self, seq: u64) -> Result<Option<RaftLogId>, ClusterError> {
+        if seq == 0 {
+            return Ok(None);
+        }
+        let Some((_term, payload)) = self
+            .journal
+            .read(seq)
+            .map_err(|e| ClusterError::Recovery(format!("read seq {seq}: {e}")))?
+        else {
+            return Ok(None);
+        };
+        let (entry, _) = bincode::serde::decode_from_slice::<
+            <TypeConfig as openraft::RaftTypeConfig>::Entry,
+            _,
+        >(&payload, bincode::config::standard())
+        .map_err(|e| ClusterError::Recovery(format!("decode seq {seq}: {e}")))?;
+        Ok(Some(entry.log_id))
+    }
+
     pub fn handles(&self, data_dir: PathBuf) -> LogStorageHandles {
         LogStorageHandles {
             last_applied: self.last_applied.clone(),

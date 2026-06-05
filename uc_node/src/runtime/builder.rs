@@ -52,7 +52,7 @@ impl<S: StateMachine> NodeBuilder<S> {
         )?;
 
         // Sanity-check durable state before handing off to openraft.
-        crate::runtime::recovery::assert_consistent(&log_storage)?;
+        crate::runtime::recovery::reconcile(&log_storage)?;
 
         let handles = log_storage.handles(self.config.data_dir.clone());
         // M5: capture output_progress before handles is moved into the SM adapter.

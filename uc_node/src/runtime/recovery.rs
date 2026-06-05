@@ -7,7 +7,7 @@
 use crate::ClusterError;
 use crate::raft::log_storage::JournalLogStorage;
 
-/// Sanity-check the durable state of [`JournalLogStorage`] before handing off
+/// Reconcile the durable state of [`JournalLogStorage`] before handing off
 /// to openraft. Catches obvious corruption (manual file deletion, partial dir
 /// copy, etc.) by verifying:
 ///
@@ -15,7 +15,12 @@ use crate::raft::log_storage::JournalLogStorage;
 ///
 /// If the journal's last sequence number is lower than what we claim to have
 /// purged through, the data dir is internally inconsistent.
-pub fn assert_consistent(storage: &JournalLogStorage) -> Result<(), ClusterError> {
+///
+/// Also repairs the Eventual-log / Consistent-committed power-loss inversion:
+/// a fsynced `committed` can exceed the journal's recovered tail after a crash.
+/// In that case, `committed` is clamped down to the durable log tail; the node
+/// re-learns the true commit from the leader via normal Raft catch-up.
+pub fn reconcile(storage: &JournalLogStorage) -> Result<(), ClusterError> {
     let last_seq = storage.journal.last_seq();
     let last_purged = storage
         .last_purged
@@ -49,6 +54,34 @@ pub fn assert_consistent(storage: &JournalLogStorage) -> Result<(), ClusterError
         return Err(ClusterError::Recovery(format!(
             "output_progress ({output_progress}) > last_applied ({last_applied_idx}) — data dir corrupt"
         )));
+    }
+
+    // Eventual-log / Consistent-committed inversion repair: a power loss can leave
+    // a fsynced `committed` ahead of the eventual log's recovered (page-cache-lost)
+    // tail. Clamp committed down to the durable log tail; the node re-learns the
+    // true commit from the leader via normal Raft catch-up. Lowering committed is
+    // always safe.
+    let durable_last = storage.journal.last_seq().unwrap_or(0);
+    if let Some(c) = storage
+        .committed
+        .load()
+        .map_err(|e| ClusterError::Recovery(format!("read committed: {e}")))?
+        && c.index > durable_last
+    {
+        match storage.last_log_id_at(durable_last)? {
+            Some(id) => storage
+                .committed
+                .store(&id)
+                .map_err(|e| ClusterError::Recovery(format!("clamp committed: {e}")))?
+                .wait()
+                .map_err(|e| ClusterError::Recovery(format!("clamp committed wait: {e}")))?,
+            None => storage
+                .committed
+                .clear()
+                .map_err(|e| ClusterError::Recovery(format!("clear committed: {e}")))?
+                .wait()
+                .map_err(|e| ClusterError::Recovery(format!("clear committed wait: {e}")))?,
+        }
     }
     Ok(())
 }
