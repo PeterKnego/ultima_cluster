@@ -59,7 +59,7 @@ pub struct JournalLogStorage {
 impl JournalLogStorage {
     /// Open with the default log durability (`Eventual` — Aeron `fileSyncLevel=0`
     /// model: ack on page-cache write, background fsync, durability via quorum
-    /// replication). Use [`open_with_durability`] to choose `Consistent`.
+    /// replication). Use [`Self::open_with_durability`] to choose `Consistent`.
     pub fn open(data_dir: &Path) -> Result<Self, ClusterError> {
         Self::open_with_durability(data_dir, Durability::Eventual)
     }
