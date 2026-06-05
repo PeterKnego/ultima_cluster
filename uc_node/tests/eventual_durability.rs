@@ -134,3 +134,36 @@ async fn eventual_mode_durability_lag_drains_to_zero() {
     }
     assert!(ok, "durability_lag never drained to 0");
 }
+
+#[tokio::test]
+async fn measure_append_ack_latency_by_mode() {
+    use std::time::Instant;
+    use ultima_journal::Durability;
+
+    async fn median_ack_us(durability: Durability) -> u128 {
+        let dir = TempDir::new().unwrap();
+        let mut storage =
+            JournalLogStorage::open_with_durability(dir.path(), durability).expect("open");
+        let mut samples = Vec::new();
+        for i in 1..=200u64 {
+            let e = vec![RaftEntry {
+                log_id: make_log_id(1, 0, i),
+                payload: EntryPayload::Normal(uc_node::raft::AppCommand(bytes::Bytes::from(
+                    vec![0xABu8; 256],
+                ))),
+            }];
+            let t = Instant::now();
+            storage.blocking_append(e).await.expect("append");
+            samples.push(t.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    let consistent = median_ack_us(Durability::Consistent).await;
+    let eventual = median_ack_us(Durability::Eventual).await;
+    println!(
+        "append-ack median µs: Consistent={consistent} Eventual={eventual} \
+         (storage-dependent; fsync cost dominates on real disk)"
+    );
+}
