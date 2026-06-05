@@ -379,10 +379,13 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
         }
 
         if let (Some(notifier), Some(probe_seq)) = (last_notifier, probe_last_seq) {
-            // Chain IOFlushed completion onto the final entry's Notifier.
-            // ultima_journal's bg fsync thread calls our callback after sync_all() —
-            // zero thread hop. IOFlushed::io_completed takes
-            // `Result<(), io::Error>`, so we map JournalError → io::Error here.
+            // Chain IOFlushed completion onto the final entry's Notifier. The
+            // Notifier resolves at the durability boundary for the configured mode:
+            // in `Consistent` after the bg writer's sync_all(); in `Eventual` after
+            // the buffered page-cache write, before the background fsync (durability
+            // then comes from quorum replication). Zero thread hop either way.
+            // IOFlushed::io_completed takes `Result<(), io::Error>`, so we map
+            // JournalError → io::Error here.
             notifier.on_complete(move |result| {
                 uc_protocol::probes::stamp_log(
                     probe_seq,
