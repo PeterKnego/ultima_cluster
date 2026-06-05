@@ -81,6 +81,7 @@ pub fn spawn_broadcast_reader(
     let paused_for_task = Arc::clone(&paused);
 
     let join = tokio::spawn(async move {
+        let bcast_bridge = crate::ring_bridge::NotifyBridge::spawn(consumer.wait_handle(), "broadcast");
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
         while !stop_for_task.load(Ordering::Relaxed) {
             if paused_for_task.load(Ordering::Relaxed) {
@@ -114,7 +115,7 @@ pub fn spawn_broadcast_reader(
                         let _ = tx.send(RawResponse::Record { msg_type, payload });
                     }
                 }
-                Ok(None) => tokio::time::sleep(Duration::from_micros(100)).await,
+                Ok(None) => bcast_bridge.notified().await,
                 Err(RingError::Overwritten) => {
                     // Drain every in-flight with Overwritten.
                     let drained: Vec<u32> = in_flight.iter().map(|e| *e.key()).collect();

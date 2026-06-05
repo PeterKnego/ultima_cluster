@@ -59,6 +59,10 @@ where
 
     let join = tokio::spawn(async move {
         let mut consumer = submit_consumer;
+        let submit_bridge = crate::ipc::ring_bridge::NotifyBridge::spawn(
+            consumer.wait_handle(),
+            "submit",
+        );
         let mut payload_buf: Vec<u8> = Vec::with_capacity(4096);
         while !stop_for_task.load(Ordering::Relaxed) {
             match consumer.try_read(&mut payload_buf) {
@@ -123,7 +127,7 @@ where
                 Ok(Some(rec)) => {
                     tracing::warn!(msg_type = rec.msg_type, "unexpected frame on submit.ring");
                 }
-                Ok(None) => tokio::time::sleep(POLL_BACKOFF).await,
+                Ok(None) => submit_bridge.notified().await,
                 Err(e) => {
                     tracing::error!(error = ?e, "submit.ring read error");
                     tokio::time::sleep(POLL_BACKOFF).await;

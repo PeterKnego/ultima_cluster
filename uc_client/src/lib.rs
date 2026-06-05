@@ -8,6 +8,7 @@ pub use error::ClientError;
 
 mod client;
 mod cnc;
+pub(crate) mod ring_bridge;
 mod rings;
 mod session;
 mod watchers;
