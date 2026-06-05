@@ -36,7 +36,7 @@ returns a `Notifier` that fires **after the buffered page-cache write** (not
 fsync), and fsync is **batched/coalesced periodically (~50 ms idle-fsync)** on
 the writer thread, advancing a separate `durable_seq` watermark (durability via
 quorum replication). **Net effect on this work:** fsync is now *off* the commit
-critical path, so `journal_fsync` ≈ 0 on the path and the inflight=1 floor is
+critical path, so `journal_durable` ≈ 0 on the path and the inflight=1 floor is
 **almost entirely IPC poll-sleep wakeup latency** — this change *strengthens* the
 case for event-driven wakeups rather than competing with it. The two are
 **orthogonal and complementary**: the journal change removes fsync from the log
@@ -47,11 +47,10 @@ Two consequences for measurement:
 - The committed `bench-out/reference/attribution.csv` is a **stale (Consistent)**
   baseline. Re-capture it under the current Eventual default *before* the wakeup
   work so the wakeup win is isolated from the journal-durability win.
-- The `JournalFsynced` probe now fires at the buffered write, so the
-  `journal_fsync` attribution row no longer measures an fsync (it measures the
-  bg-writer hand-off). It should be read as "journal durable (page-cache)" and is
-  a candidate for the `JournalFsynced → JournalDurable` rename the
-  eventual-durability work owns (out of scope here; noted in the task doc).
+- The probe was renamed `JournalFsynced → JournalDurable` (`92f9bca`, task10
+  work) and the attribution stage is now `journal_durable` — it fires at the
+  buffered write, measuring the bg-writer hand-off, not an fsync. The plan's
+  measurement `awk` filters use `journal_durable`.
 
 ## Scope decisions (from brainstorming)
 
@@ -237,7 +236,7 @@ Acquire/Release pairing as shown above; `waiters` on the consumer cache line.
 **Success criterion (measured via the harness):**
 **First re-capture the reference under the current Eventual default** (it is
 currently a stale Consistent capture) so the wakeup win is isolated from the
-journal-durability win — expect `journal_fsync` ≈ 0 and the floor essentially all
+journal-durability win — expect `journal_durable` ≈ 0 and the floor essentially all
 IPC poll-sleep. Then re-run `attribution-bench` at **inflight=1** and diff
 against that fresh Eventual reference. Target: per-hop wakeup latency collapses
 from ~2 ms to tens of µs; **total p99 at inflight=1 from ~3–4 ms (Eventual, IPC
