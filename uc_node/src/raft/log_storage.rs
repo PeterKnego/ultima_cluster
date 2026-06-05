@@ -57,13 +57,25 @@ pub struct JournalLogStorage {
 }
 
 impl JournalLogStorage {
+    /// Open with the default log durability (`Eventual` — Aeron `fileSyncLevel=0`
+    /// model: ack on page-cache write, background fsync, durability via quorum
+    /// replication). Use [`open_with_durability`] to choose `Consistent`.
     pub fn open(data_dir: &Path) -> Result<Self, ClusterError> {
+        Self::open_with_durability(data_dir, Durability::Eventual)
+    }
+
+    /// Open the Raft log + metadata. `log_durability` controls ONLY the log
+    /// journal; the metadata `StableValue`s are always `Consistent`.
+    pub fn open_with_durability(
+        data_dir: &Path,
+        log_durability: Durability,
+    ) -> Result<Self, ClusterError> {
         std::fs::create_dir_all(data_dir.join("journal"))?;
 
         let journal = Arc::new(Journal::open(JournalConfig {
             dir: data_dir.join("journal"),
             segment_size_bytes: SEGMENT_SIZE_BYTES,
-            durability: Durability::Consistent,
+            durability: log_durability,
         })?);
 
         let vote = Arc::new(StableValue::open(StableValueConfig {
