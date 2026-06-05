@@ -46,8 +46,24 @@
 //! defense-in-depth; the primary torn-record guard is now the
 //! `publish_position` Release → consumer Acquire edge.
 
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use thiserror::Error;
+
+// The wakeup word is the low 32 bits of `publish_position`; reinterpreting an
+// `AtomicU64` as its low `AtomicU32` is only correct on little-endian targets
+// (all Linux targets we run). Make it a hard compile error elsewhere.
+#[cfg(not(target_endian = "little"))]
+compile_error!("ring wakeup word assumes little-endian publish_position");
+
+/// Upper bound on a single park; the timeout backstop. With wakeups working
+/// this is never hit in steady state — it bounds the rare lost-wakeup race and
+/// shutdown latency to the old poll-sleep behavior.
+pub const PARK_CEIL: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Spin-then-park: number of `try_read` spins before a sync consumer parks.
+/// Catches an in-flight publish at ~zero latency without a syscall (Aeron-style
+/// idle strategy); only after these fail do we arm + futex-wait.
+pub const SPIN_TRIES: u32 = 64;
 
 /// Padding-marker `msg_type` — consumer skips to the start of the slot
 /// region when it encounters this in a record header.
@@ -90,6 +106,127 @@ const _: () = {
 };
 
 pub const RING_HEADER_LEN: usize = std::mem::size_of::<RingHeader>();
+
+/// Local (per-process) choice of wakeup mechanism. The shared-memory state
+/// (`publish_position`, `waiters`) is identical either way; only how a consumer
+/// blocks differs. `Futex` is the default on Linux; `Poll` is the portable
+/// fallback and the test oracle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParkMode {
+    Futex,
+    Poll,
+}
+
+impl Default for ParkMode {
+    fn default() -> Self {
+        if cfg!(target_os = "linux") { ParkMode::Futex } else { ParkMode::Poll }
+    }
+}
+
+impl RingHeader {
+    /// The 32-bit wakeup word: the low half of `publish_position`. Changes on
+    /// every publish (modulo 2^32 wrap, which is benign for wait-and-recheck).
+    #[inline]
+    pub fn wake_word(&self) -> &std::sync::atomic::AtomicU32 {
+        // SAFETY: little-endian (asserted above): the low 32 bits occupy the
+        // first 4 bytes of the 8-byte, 8-aligned `publish_position`.
+        unsafe {
+            &*(&self.publish_position as *const AtomicU64 as *const std::sync::atomic::AtomicU32)
+        }
+    }
+
+    /// Current value of the wakeup word (snapshot for a subsequent `park`).
+    #[inline]
+    pub fn current_seq(&self) -> u32 {
+        self.publish_position.load(Ordering::Acquire) as u32
+    }
+
+    /// Register a parked consumer (before parking).
+    #[inline]
+    pub fn arm(&self) {
+        self.waiters.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Unregister after waking.
+    #[inline]
+    pub fn disarm(&self) {
+        self.waiters.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Producer-side wake: only syscalls if a consumer is parked. `all` wakes
+    /// every waiter (Broadcast); otherwise wakes one (SPSC/MPSC).
+    #[inline]
+    pub fn signal(&self, mode: ParkMode, all: bool) {
+        if self.waiters.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        match mode {
+            ParkMode::Futex => {
+                super::futex::futex_wake(self.wake_word(), if all { i32::MAX } else { 1 })
+            }
+            ParkMode::Poll => {}
+        }
+    }
+
+    /// Consumer-side block until the wakeup word leaves `expected` or `timeout`.
+    #[inline]
+    pub fn park(&self, mode: ParkMode, expected: u32, timeout: std::time::Duration) {
+        match mode {
+            ParkMode::Futex => super::futex::futex_wait(self.wake_word(), expected, timeout),
+            ParkMode::Poll => std::thread::sleep(timeout.min(PARK_CEIL)),
+        }
+    }
+}
+
+use std::sync::Arc;
+
+/// A cloneable handle that lets a parker thread block on a ring's wakeup word
+/// while the owning (async) consumer reads. Holds an `Arc` keepalive so the
+/// ring mmap outlives the handle, plus a raw `RingHeader` pointer into it.
+/// Constructed by each consumer's `wait_handle()`.
+pub struct RingWaitHandle {
+    _keepalive: Arc<dyn std::any::Any + Send + Sync>,
+    header: *const RingHeader,
+    mode: ParkMode,
+}
+
+// SAFETY: `header` points into the mmap owned by `_keepalive` (kept alive for
+// the handle's lifetime); all access goes through the `RingHeader` atomics.
+unsafe impl Send for RingWaitHandle {}
+unsafe impl Sync for RingWaitHandle {}
+
+impl RingWaitHandle {
+    /// Build from any ring `Inner` (held in an `Arc`) and its header pointer.
+    /// `keepalive` and `header` MUST come from the same `Inner`.
+    pub fn new(
+        keepalive: Arc<dyn std::any::Any + Send + Sync>,
+        header: *const RingHeader,
+        mode: ParkMode,
+    ) -> Self {
+        Self { _keepalive: keepalive, header, mode }
+    }
+    #[inline]
+    fn header(&self) -> &RingHeader {
+        // SAFETY: valid for the handle's lifetime (keepalive holds the mmap).
+        unsafe { &*self.header }
+    }
+    #[inline]
+    pub fn current_seq(&self) -> u32 {
+        self.header().current_seq()
+    }
+    #[inline]
+    pub fn arm(&self) {
+        self.header().arm()
+    }
+    #[inline]
+    pub fn disarm(&self) {
+        self.header().disarm()
+    }
+    #[inline]
+    pub fn park(&self, expected: u32, timeout: std::time::Duration) {
+        self.header().park(self.mode, expected, timeout)
+    }
+}
 
 /// Per-record frame header. Layout matches the wire format exactly
 /// (`#[repr(C)]` keeps field order).

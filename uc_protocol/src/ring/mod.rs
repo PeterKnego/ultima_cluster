@@ -18,6 +18,6 @@ pub mod mpsc;
 pub mod spsc;
 
 pub use broadcast::{BroadcastConsumer, BroadcastProducer, BroadcastRing};
-pub use common::{FrameHeader, RecordHeader, RingError, RingHeader};
+pub use common::{FrameHeader, ParkMode, RecordHeader, RingError, RingHeader, RingWaitHandle, PARK_CEIL, SPIN_TRIES};
 pub use mpsc::{MpscConsumer, MpscProducer, MpscRing};
 pub use spsc::{SpscConsumer, SpscProducer, SpscRing};
