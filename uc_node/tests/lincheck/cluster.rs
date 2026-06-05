@@ -1,0 +1,380 @@
+//! 3-node shmem cluster with leader-kill/restart + service-crash faults,
+//! keeping a quorum at all times. Built on the m2/m3 spawn patterns.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tempfile::TempDir;
+use uc_client::Client;
+use uc_node::{
+    BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, NodeHandle, NodeId,
+    PeerSeed, RaftTuning, ServiceRingConfig, TlsConfig,
+};
+use uc_service::runtime::ServiceConfig;
+use uc_service::{Service, ServiceBuilder};
+
+use crate::lincheck::register_sm::{Cmd, CmdResp, RegisterSm};
+
+/// Serialize cluster bring-up across tests in this binary (mirrors m2).
+static CLUSTER_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+const APP_ID: &str = "lincheck";
+
+/// Type alias to avoid a too-complex-type lint in the start_3 local variable.
+type NodeMeta = (NodeId, SocketAddr, Arc<TempDir>, Arc<TempDir>, Arc<TempDir>);
+
+#[allow(dead_code)] // fields kept for lifetime (TempDirs) + restart (addr, peers)
+struct Node {
+    id: NodeId,
+    addr: SocketAddr,
+    instance_dir: Arc<TempDir>,
+    data_dir: Arc<TempDir>,
+    svc_data_dir: Arc<TempDir>,
+    peers: Vec<PeerSeed>,
+    handle: Option<NodeHandle<RegisterSm>>,
+    service: Option<Service>,
+    /// Arc so submit/read can clone-out and release the lock before .await
+    client: Option<Arc<Client>>,
+}
+
+pub struct LinCluster {
+    /// All methods are &self; faults + workers share Arc<LinCluster>.
+    nodes: tokio::sync::Mutex<Vec<Node>>,
+    _serial: tokio::sync::MutexGuard<'static, ()>,
+}
+
+fn pick_addrs(n: usize) -> Vec<SocketAddr> {
+    (0..n)
+        .map(|_| {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let a = s.local_addr().unwrap();
+            drop(s);
+            a
+        })
+        .collect()
+}
+
+fn node_config(
+    id: NodeId,
+    instance: &TempDir,
+    data: &TempDir,
+    addr: SocketAddr,
+    peers: Vec<PeerSeed>,
+) -> NodeConfig {
+    NodeConfig {
+        node_id: id,
+        data_dir: data.path().to_owned(),
+        raft_listen_addr: addr,
+        app_id: APP_ID.into(),
+        bootstrap: BootstrapConfig::Peers { peers },
+        raft: RaftTuning::default(),
+        tls: TlsConfig::default(),
+        ipc_mode: IpcMode::Shmem {
+            instance_dir: instance.path().to_owned(),
+        },
+        client_rings: ClientRingConfig::default(),
+        service_rings: ServiceRingConfig::default(),
+        log_durability: ultima_journal::Durability::Eventual,
+    }
+}
+
+async fn wait_for_cnc(dir: &std::path::Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !dir.join("cnc.dat").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "cnc.dat never appeared in {dir:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn spawn_service(instance_dir: &std::path::Path, data_dir: &std::path::Path) -> Service {
+    let cfg = ServiceConfig {
+        instance_dir: instance_dir.to_owned(),
+        app_id: APP_ID.into(),
+        data_dir: data_dir.to_owned(),
+        ..ServiceConfig::default()
+    };
+    ServiceBuilder::new(cfg, RegisterSm::default())
+        .run()
+        .await
+        .expect("service start")
+}
+
+impl LinCluster {
+    /// Bring up a 3-node shmem cluster + one service + one client per node.
+    ///
+    /// Follows the m3_service_crash/m3_three_node_shmem boot dance:
+    ///   1. Spawn all 3 node start() tasks in parallel.
+    ///   2. For each node, wait for cnc.dat then spawn its service task.
+    ///      The node's start() blocks internally on wait_for_service_ready, so
+    ///      the service must be spawned (and reach Ready) before we collect the
+    ///      node handle.
+    ///   3. Collect all node + service handles (with timeout).
+    ///   4. Connect one client per node.
+    ///   5. Wait for a stable leader.
+    pub async fn start_3() -> Self {
+        let serial = CLUSTER_SERIAL.lock().await;
+        // SAFETY: CLUSTER_SERIAL is 'static, so the guard is 'static.
+        // We transmute to 'static so it can be stored in the struct.
+        let serial: tokio::sync::MutexGuard<'static, ()> =
+            unsafe { std::mem::transmute(serial) };
+
+        let addrs = pick_addrs(3);
+        let peers: Vec<PeerSeed> = (1..=3u64)
+            .zip(addrs.iter())
+            .map(|(id, a)| PeerSeed {
+                node_id: id,
+                raft_addr: *a,
+            })
+            .collect();
+
+        // ── Step 1: spawn all 3 node tasks in parallel ──────────────────────
+        // We must keep instance_dir / data_dir / svc_data_dir alive here so
+        // they persist until we can move them into the Node structs.
+        let mut node_meta: Vec<NodeMeta> = Vec::new();
+        let mut node_tasks = Vec::new();
+        for (i, addr) in addrs.iter().enumerate() {
+            let id = (i as u64) + 1;
+            let instance = Arc::new(TempDir::new().unwrap());
+            let data = Arc::new(TempDir::new().unwrap());
+            let svc_data = Arc::new(TempDir::new().unwrap());
+            let cfg = node_config(id, &instance, &data, *addr, peers.clone());
+            let task = tokio::spawn(async move {
+                NodeBuilder::new(cfg, RegisterSm::default()).start().await
+            });
+            node_tasks.push(task);
+            node_meta.push((id, *addr, instance, data, svc_data));
+        }
+
+        // ── Step 2: for each node, wait for cnc.dat then spawn its service ──
+        // Node start() waits internally for the service to reach Ready before
+        // returning, so the service MUST be spawned before we collect the
+        // node handle.
+        let mut svc_tasks = Vec::new();
+        for (_, _, instance, _, svc_data) in &node_meta {
+            wait_for_cnc(instance.path(), Duration::from_secs(10)).await;
+            let instance_path = instance.path().to_owned();
+            let svc_data_path = svc_data.path().to_owned();
+            svc_tasks.push(tokio::spawn(async move {
+                spawn_service(&instance_path, &svc_data_path).await
+            }));
+        }
+
+        // ── Step 3: collect node handles ────────────────────────────────────
+        let mut node_handles: Vec<NodeHandle<RegisterSm>> = Vec::new();
+        for (i, task) in node_tasks.into_iter().enumerate() {
+            let id = node_meta[i].0;
+            let handle = tokio::time::timeout(Duration::from_secs(30), task)
+                .await
+                .unwrap_or_else(|_| panic!("node {id} start timed out"))
+                .expect("node task panic")
+                .unwrap_or_else(|e| panic!("node {id} start: {e:?}"));
+            node_handles.push(handle);
+        }
+
+        // ── Step 3b: collect service handles ────────────────────────────────
+        let mut svc_handles: Vec<Service> = Vec::new();
+        for (i, task) in svc_tasks.into_iter().enumerate() {
+            let id = node_meta[i].0;
+            let svc = tokio::time::timeout(Duration::from_secs(30), task)
+                .await
+                .unwrap_or_else(|_| panic!("svc {id} start timed out"))
+                .expect("svc task panic");
+            svc_handles.push(svc);
+        }
+
+        // ── Step 4: connect one client per node ─────────────────────────────
+        let mut nodes: Vec<Node> = Vec::new();
+        for (id, addr, instance, data, svc_data) in node_meta {
+            let client = Arc::new(
+                Client::connect(instance.path(), APP_ID)
+                    .await
+                    .expect("client connect"),
+            );
+            nodes.push(Node {
+                id,
+                addr,
+                instance_dir: instance,
+                data_dir: data,
+                svc_data_dir: svc_data,
+                peers: peers.clone(),
+                handle: Some(node_handles.remove(0)),
+                service: Some(svc_handles.remove(0)),
+                client: Some(client),
+            });
+        }
+
+        // ── Step 5: wait for a stable leader ────────────────────────────────
+        let cluster = LinCluster {
+            nodes: tokio::sync::Mutex::new(nodes),
+            _serial: serial,
+        };
+        cluster.wait_for_stable_leader(Duration::from_secs(15)).await;
+        cluster
+    }
+
+    /// node_id of the current leader, found by querying live node handles.
+    /// Locks briefly; `current_leader()` is a fast async call, so holding
+    /// the lock across it (not across submit/read) is fine.
+    pub async fn leader_id(&self) -> Option<NodeId> {
+        let nodes = self.nodes.lock().await;
+        for n in nodes.iter() {
+            if let Some(h) = &n.handle
+                && let Some(l) = h.current_leader().await
+            {
+                return Some(l);
+            }
+        }
+        None
+    }
+
+    /// Clone out the `Arc<Client>` for `id` (caller drops the guard before await).
+    async fn client_for(&self, id: NodeId) -> Option<Arc<Client>> {
+        let nodes = self.nodes.lock().await;
+        nodes
+            .iter()
+            .find(|n| n.id == id)
+            .and_then(|n| n.client.clone())
+    }
+
+    pub async fn wait_for_stable_leader(&self, timeout: Duration) -> NodeId {
+        let deadline = Instant::now() + timeout;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "no stable leader within {timeout:?}"
+            );
+            // All live nodes must agree on the same leader id.
+            let mut seen: Option<NodeId> = None;
+            let mut agree = true;
+            let mut count = 0;
+            {
+                let nodes = self.nodes.lock().await;
+                for n in nodes.iter() {
+                    if let Some(h) = &n.handle {
+                        count += 1;
+                        match h.current_leader().await {
+                            Some(l) => match seen {
+                                None => seen = Some(l),
+                                Some(s) if s == l => {}
+                                Some(_) => agree = false,
+                            },
+                            None => agree = false,
+                        }
+                    }
+                }
+            }
+            if agree && count >= 2 && let Some(l) = seen {
+                return l;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Submit a command to the current leader, retrying on did-not-execute
+    /// errors. Returns Ok(resp) | "indeterminate" | propagates fatal.
+    pub async fn submit_cmd(&self, cmd: &Cmd) -> SubmitOutcome {
+        use uc_client::ClientError as CE;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if Instant::now() > deadline {
+                // gave up routing; treat as in-limbo
+                return SubmitOutcome::Indeterminate;
+            }
+            let Some(lid) = self.leader_id().await else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            };
+            // Clone the Arc<Client> and DROP the lock before the network await.
+            let Some(client) = self.client_for(lid).await else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            };
+            match client.submit::<Cmd, CmdResp>(cmd).await {
+                Ok(r) => return SubmitOutcome::Ok(r),
+                // did-not-execute → retry against the (new) leader
+                Err(CE::NotLeader { .. }) | Err(CE::BackpressureFull) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                // indeterminate → may have committed; do not retry
+                Err(CE::Timeout(_))
+                | Err(CE::ResponseOverwritten)
+                | Err(CE::NodeStalled)
+                | Err(CE::ServiceStalled) => {
+                    return SubmitOutcome::Indeterminate;
+                }
+                Err(other) => return SubmitOutcome::Fatal(format!("{other:?}")),
+            }
+        }
+    }
+
+    /// Linearizable read against the current leader.
+    pub async fn read(&self) -> ReadOutcome {
+        use uc_client::ClientError as CE;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if Instant::now() > deadline {
+                return ReadOutcome::Indeterminate;
+            }
+            let Some(lid) = self.leader_id().await else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            };
+            let Some(client) = self.client_for(lid).await else {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            };
+            match client.query_linearizable::<(), Option<u64>>(&()).await {
+                Ok(v) => return ReadOutcome::Ok(v),
+                Err(CE::NotLeader { .. }) | Err(CE::BackpressureFull) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(CE::Timeout(_))
+                | Err(CE::ResponseOverwritten)
+                | Err(CE::NodeStalled)
+                | Err(CE::ServiceStalled) => {
+                    return ReadOutcome::Indeterminate;
+                }
+                Err(other) => return ReadOutcome::Fatal(format!("{other:?}")),
+            }
+        }
+    }
+
+    pub async fn shutdown(self) {
+        // Take everything out under the lock, then await teardown unlocked.
+        let mut drained = std::mem::take(&mut *self.nodes.lock().await);
+        for n in &mut drained {
+            if let Some(c) = n.client.take() {
+                // Last Arc owner here; unwrap to call the by-value shutdown.
+                if let Ok(c) = Arc::try_unwrap(c) {
+                    let _ = c.shutdown().await;
+                }
+            }
+            if let Some(s) = n.service.take() {
+                let _ = s.shutdown().await;
+            }
+            if let Some(h) = n.handle.take() {
+                let _ = h.shutdown().await;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Ok(CmdResp) and Fatal(String) used by callers/future tests
+pub enum SubmitOutcome {
+    Ok(CmdResp),
+    Indeterminate,
+    Fatal(String),
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Ok(Option<u64>) and Fatal(String) used by callers/future tests
+pub enum ReadOutcome {
+    Ok(Option<u64>),
+    Indeterminate,
+    Fatal(String),
+}
