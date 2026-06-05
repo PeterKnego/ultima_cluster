@@ -46,6 +46,7 @@
 //! defense-in-depth; the primary torn-record guard is now the
 //! `publish_position` Release → consumer Acquire edge.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use thiserror::Error;
 
@@ -129,7 +130,11 @@ impl RingHeader {
     #[inline]
     pub fn wake_word(&self) -> &std::sync::atomic::AtomicU32 {
         // SAFETY: little-endian (asserted above): the low 32 bits occupy the
-        // first 4 bytes of the 8-byte, 8-aligned `publish_position`.
+        // first 4 bytes of the 8-byte, 8-aligned `publish_position`. The returned
+        // `&AtomicU32` is only used to take its address for the `SYS_futex`
+        // syscall (see `futex.rs`); no Rust-level atomic load/store is ever
+        // performed on it, so the mixed-size overlapping-atomic UB concern does
+        // not apply.
         unsafe {
             &*(&self.publish_position as *const AtomicU64 as *const std::sync::atomic::AtomicU32)
         }
@@ -164,6 +169,8 @@ impl RingHeader {
             ParkMode::Futex => {
                 super::futex::futex_wake(self.wake_word(), if all { i32::MAX } else { 1 })
             }
+            // Poll consumers have no parked syscall to wake; the `PARK_CEIL`
+            // timeout backstop in `park` is their sole wakeup mechanism.
             ParkMode::Poll => {}
         }
     }
@@ -178,8 +185,6 @@ impl RingHeader {
     }
 }
 
-use std::sync::Arc;
-
 /// A cloneable handle that lets a parker thread block on a ring's wakeup word
 /// while the owning (async) consumer reads. Holds an `Arc` keepalive so the
 /// ring mmap outlives the handle, plus a raw `RingHeader` pointer into it.
@@ -188,6 +193,16 @@ pub struct RingWaitHandle {
     _keepalive: Arc<dyn std::any::Any + Send + Sync>,
     header: *const RingHeader,
     mode: ParkMode,
+}
+
+impl Clone for RingWaitHandle {
+    fn clone(&self) -> Self {
+        Self {
+            _keepalive: self._keepalive.clone(),
+            header: self.header,
+            mode: self.mode,
+        }
+    }
 }
 
 // SAFETY: `header` points into the mmap owned by `_keepalive` (kept alive for
