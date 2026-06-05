@@ -68,3 +68,38 @@ async fn reconcile_leaves_consistent_committed_untouched() {
     uc_node::runtime::recovery::reconcile(&storage).expect("reconcile");
     assert_eq!(storage.read_committed().await.unwrap(), Some(make_log_id(1, 0, 3)));
 }
+
+#[tokio::test]
+async fn reconcile_preserves_committed_at_snapshot_floor_with_empty_log() {
+    // Fresh follower after install_snapshot: no log entries (last_seq None),
+    // last_purged + committed both at the snapshot's last log id. reconcile must
+    // NOT clear committed — it is durable via the snapshot.
+    let dir = TempDir::new().unwrap();
+    let mut storage = JournalLogStorage::open(dir.path()).expect("open");
+    let snap = make_log_id(2, 0, 100);
+    storage.save_committed(Some(snap)).await.expect("save_committed");
+    storage.purge(snap).await.expect("purge"); // last_purged = snap, log empty
+    assert_eq!(storage.read_committed().await.unwrap(), Some(snap));
+
+    uc_node::runtime::recovery::reconcile(&storage).expect("reconcile");
+    assert_eq!(storage.read_committed().await.unwrap(), Some(snap)); // unchanged
+}
+
+#[tokio::test]
+async fn reconcile_clamps_committed_to_purge_floor_when_log_empty() {
+    // committed fsynced AHEAD of both the (empty) log and the snapshot floor →
+    // clamp down to last_purged, NOT clear.
+    let dir = TempDir::new().unwrap();
+    let mut storage = JournalLogStorage::open(dir.path()).expect("open");
+    storage.purge(make_log_id(2, 0, 100)).await.expect("purge"); // last_purged = 100, log empty
+    storage
+        .save_committed(Some(make_log_id(2, 0, 150)))
+        .await
+        .expect("save_committed");
+
+    uc_node::runtime::recovery::reconcile(&storage).expect("reconcile");
+    assert_eq!(
+        storage.read_committed().await.unwrap(),
+        Some(make_log_id(2, 0, 100))
+    );
+}

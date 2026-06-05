@@ -5,6 +5,7 @@
 //! before handing off to openraft.
 
 use crate::ClusterError;
+use crate::raft::RaftLogId;
 use crate::raft::log_storage::JournalLogStorage;
 
 /// Reconcile the durable state of [`JournalLogStorage`] before handing off
@@ -17,8 +18,9 @@ use crate::raft::log_storage::JournalLogStorage;
 /// purged through, the data dir is internally inconsistent.
 ///
 /// Also repairs the Eventual-log / Consistent-committed power-loss inversion:
-/// a fsynced `committed` can exceed the journal's recovered tail after a crash.
-/// In that case, `committed` is clamped down to the durable log tail; the node
+/// a fsynced `committed` can exceed the durable state after a crash. In that
+/// case, `committed` is clamped down to the durable floor — the greater of the
+/// log tail (`last_seq`) and the purge/snapshot point (`last_purged`); the node
 /// re-learns the true commit from the leader via normal Raft catch-up.
 pub fn reconcile(storage: &JournalLogStorage) -> Result<(), ClusterError> {
     let last_seq = storage.journal.last_seq();
@@ -57,18 +59,28 @@ pub fn reconcile(storage: &JournalLogStorage) -> Result<(), ClusterError> {
     }
 
     // Eventual-log / Consistent-committed inversion repair: a power loss can leave
-    // a fsynced `committed` ahead of the eventual log's recovered (page-cache-lost)
-    // tail. Clamp committed down to the durable log tail; the node re-learns the
-    // true commit from the leader via normal Raft catch-up. Lowering committed is
-    // always safe.
-    let durable_last = storage.journal.last_seq().unwrap_or(0);
+    // a fsynced `committed` ahead of the durable state. The durable floor is the
+    // greater of the log tail (`last_seq`) and the purge/snapshot point
+    // (`last_purged`) — entries at/below `last_purged` are durable via the snapshot.
+    // Clamp committed down to that floor; lowering committed is always safe (the
+    // node re-learns the true commit from the leader via normal Raft catch-up).
+    let last_seq_idx = last_seq.unwrap_or(0);
+    let last_purged_idx = last_purged.as_ref().map(|p| p.index).unwrap_or(0);
+    let durable_last = last_seq_idx.max(last_purged_idx);
     if let Some(c) = storage
         .committed
         .load()
         .map_err(|e| ClusterError::Recovery(format!("read committed: {e}")))?
         && c.index > durable_last
     {
-        match storage.last_log_id_at(durable_last)? {
+        // The log_id at the durable floor: prefer the log tail's own record; when
+        // the log is empty/shorter than the snapshot point, use `last_purged`.
+        let target: Option<RaftLogId> = if last_seq_idx >= last_purged_idx && last_seq_idx > 0 {
+            storage.last_log_id_at(last_seq_idx)?
+        } else {
+            last_purged
+        };
+        match target {
             Some(id) => storage
                 .committed
                 .store(&id)
