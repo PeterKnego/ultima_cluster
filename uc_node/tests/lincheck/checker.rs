@@ -96,9 +96,11 @@ fn search<M: Model<State = Option<u64>, Op = Op, Resp = RegResp>>(
         return SearchResult::Ok;
     }
 
-    // Memo: skip states (remaining-set, model-state) we've explored before.
+    // Memo: skip (remaining-set, model-state) we've already PROVEN unlinearizable.
+    // We only cache a key after a *complete* exploration (below) — never a
+    // budget-truncated one — so a memo hit always means a real dead end.
     let key = (remaining.clone(), state);
-    if !visited.insert(key) {
+    if visited.contains(&key) {
         return SearchResult::NoLinearization;
     }
 
@@ -150,8 +152,11 @@ fn search<M: Model<State = Option<u64>, Op = Op, Resp = RegResp>>(
         }
     }
     if hit_budget {
+        // Don't cache budget-truncated states — they weren't fully explored.
         SearchResult::BudgetExceeded
     } else {
+        // Fully explored with no linearization: safe to memoize as a dead end.
+        visited.insert(key);
         SearchResult::NoLinearization
     }
 }
