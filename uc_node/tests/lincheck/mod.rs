@@ -4,3 +4,4 @@
 pub mod model;
 pub mod history;
 pub mod checker;
+pub mod register_sm;
