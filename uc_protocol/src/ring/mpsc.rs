@@ -26,8 +26,8 @@ use std::sync::atomic::Ordering;
 use memmap2::MmapMut;
 
 use crate::ring::common::{
-    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, RING_HEADER_LEN, RecordHeader,
-    RingError, RingHeader, align_record_size, init_ring_header, try_read_record_at,
+    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, RING_HEADER_LEN, ParkMode, RecordHeader,
+    RingError, RingHeader, RingWaitHandle, align_record_size, init_ring_header, try_read_record_at,
     validate_ring_header, write_padding_marker_at, write_record_at,
 };
 
@@ -84,10 +84,17 @@ pub struct MpscProducer {
     /// `MpscProducer` `!Sync` (still `Send`): the supported usage is to clone
     /// per producer thread, not to share one `&MpscProducer` across threads.
     cached_consumer_pos: Cell<u64>,
+    /// Wakeup mechanism. Must match the consumer's `mode`: a producer in
+    /// `Poll` won't `FUTEX_WAKE` a `Futex`-parked consumer (and vice versa) —
+    /// mismatched modes silently degrade to poll-sleep latency but are not
+    /// unsound. `into_split` sets both to `ParkMode::default()`.
+    pub mode: ParkMode,
 }
 
 pub struct MpscConsumer {
     inner: Arc<MpscInner>,
+    /// Wakeup mechanism; must match the producer's `mode` (see `MpscProducer::mode`).
+    pub mode: ParkMode,
 }
 
 impl MpscProducer {
@@ -195,12 +202,18 @@ impl MpscProducer {
                 // Padding marker published; loop to claim the real record.
                 continue;
             }
+            header.signal(self.mode, false); // MPSC: single consumer -> wake one
             return Ok(());
         }
     }
 }
 
 impl MpscConsumer {
+    /// Handle for a parker thread to block on this ring while the owner reads.
+    pub fn wait_handle(&self) -> RingWaitHandle {
+        RingWaitHandle::new(self.inner.clone(), self.inner.header(), self.mode)
+    }
+
     pub fn try_read(
         &mut self,
         payload_buf: &mut Vec<u8>,
@@ -290,8 +303,9 @@ impl MpscRing {
             MpscProducer {
                 inner: self.inner.clone(),
                 cached_consumer_pos: Cell::new(0),
+                mode: ParkMode::default(),
             },
-            MpscConsumer { inner: self.inner },
+            MpscConsumer { inner: self.inner, mode: ParkMode::default() },
         )
     }
 }

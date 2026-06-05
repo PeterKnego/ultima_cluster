@@ -21,8 +21,8 @@ use std::sync::atomic::Ordering;
 use memmap2::MmapMut;
 
 use crate::ring::common::{
-    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, RING_HEADER_LEN, RecordHeader,
-    RingError, RingHeader, align_record_size, init_ring_header, try_read_record_at,
+    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, RING_HEADER_LEN, ParkMode, RecordHeader,
+    RingError, RingHeader, RingWaitHandle, align_record_size, init_ring_header, try_read_record_at,
     validate_ring_header, write_padding_marker_at, write_record_at,
 };
 
@@ -58,6 +58,9 @@ impl BroadcastInner {
 
 pub struct BroadcastProducer {
     inner: Arc<BroadcastInner>,
+    /// Wakeup mechanism. Must match consumers' `mode`. `producer()` sets
+    /// `ParkMode::default()`; override per-instance if needed.
+    pub mode: ParkMode,
 }
 
 impl BroadcastProducer {
@@ -117,6 +120,7 @@ impl BroadcastProducer {
         }
         let new_pos = producer_pos + advance as u64;
         header.publish_position.store(new_pos, Ordering::Release);
+        header.signal(self.mode, true); // Broadcast: wake ALL parked consumers
         Ok(())
     }
 }
@@ -124,12 +128,19 @@ impl BroadcastProducer {
 pub struct BroadcastConsumer {
     inner: Arc<BroadcastInner>,
     head: u64,
+    /// Wakeup mechanism; must match the producer's `mode` (see `BroadcastProducer::mode`).
+    pub mode: ParkMode,
 }
 
 impl BroadcastConsumer {
     /// Current head position. Diagnostic only.
     pub fn head(&self) -> u64 {
         self.head
+    }
+
+    /// Handle for a parker thread to block on this ring while the owner reads.
+    pub fn wait_handle(&self) -> RingWaitHandle {
+        RingWaitHandle::new(self.inner.clone(), self.inner.header(), self.mode)
     }
 
     pub fn try_read(
@@ -224,6 +235,7 @@ impl BroadcastRing {
     pub fn producer(&self) -> BroadcastProducer {
         BroadcastProducer {
             inner: self.inner.clone(),
+            mode: ParkMode::default(),
         }
     }
 
@@ -235,6 +247,7 @@ impl BroadcastRing {
         BroadcastConsumer {
             inner: self.inner.clone(),
             head,
+            mode: ParkMode::default(),
         }
     }
 }
@@ -243,6 +256,39 @@ impl BroadcastRing {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn wake_all_unblocks_two_consumers() {
+        use crate::ring::common::ParkMode;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let ring = BroadcastRing::create(tmp.path(), 4096, 256).expect("create");
+        let mut producer = ring.producer();
+        producer.mode = ParkMode::Futex;
+        let mk = || {
+            let mut c = ring.subscribe();
+            c.mode = ParkMode::Futex;
+            c.wait_handle()
+        };
+        let (h1, h2) = (mk(), mk());
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut threads = Vec::new();
+        for h in [h1, h2] {
+            let d = done.clone();
+            threads.push(std::thread::spawn(move || {
+                let seq = h.current_seq();
+                h.arm();
+                h.park(seq, std::time::Duration::from_secs(5));
+                h.disarm();
+                d.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        producer.write(1, 0, [0; 8], b"x").expect("write"); // signals wake-all
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(done.load(std::sync::atomic::Ordering::Acquire), 2);
+    }
 
     #[test]
     fn one_producer_two_consumers_same_records() {
