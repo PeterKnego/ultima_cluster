@@ -270,16 +270,28 @@ mod tests {
             c.wait_handle()
         };
         let (h1, h2) = (mk(), mk());
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        // Count only consumers woken *promptly* (by the signal, not by their own
+        // park timeout). A wake-one regression (`signal(.., false)`) would wake
+        // one thread immediately and leave the other parked until `park_to`,
+        // so it would NOT be counted and the assert would fail.
+        let park_to = std::time::Duration::from_millis(2000);
+        let prompt = std::time::Duration::from_millis(500);
+        let woke_promptly = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let mut threads = Vec::new();
         for h in [h1, h2] {
-            let d = done.clone();
+            let w = woke_promptly.clone();
             threads.push(std::thread::spawn(move || {
-                let seq = h.current_seq();
+                // arm before snapshotting seq so the producer reliably observes
+                // this waiter; the futex `expected` value guards the gap.
                 h.arm();
-                h.park(seq, std::time::Duration::from_secs(5));
+                let seq = h.current_seq();
+                let t0 = std::time::Instant::now();
+                h.park(seq, park_to);
+                let elapsed = t0.elapsed();
                 h.disarm();
-                d.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                if elapsed < prompt {
+                    w.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
             }));
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -287,7 +299,12 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
-        assert_eq!(done.load(std::sync::atomic::Ordering::Acquire), 2);
+        assert_eq!(
+            woke_promptly.load(std::sync::atomic::Ordering::Acquire),
+            2,
+            "wake-all must wake BOTH parked consumers promptly (a wake-one \
+             regression would leave one parked until its timeout)"
+        );
     }
 
     #[test]
