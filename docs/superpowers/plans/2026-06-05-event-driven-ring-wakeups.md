@@ -10,6 +10,8 @@
 
 **Scope:** commit-path hops only — submit (MPSC client→node), apply (SPSC node→service), apply_resp (SPSC service→node), response (Broadcast node→clients). Pipeline de-serialization and the query/read path are out of scope (deferred). Spec: `docs/superpowers/specs/2026-06-04-event-driven-ring-wakeups-design.md`.
 
+**Baseline note (important):** the Raft **log** journal now defaults to `Durability::Eventual` (`d55922c` + `ultima_journal` bg-writer): `append`'s `Notifier` (→ openraft commit ack) fires at the **buffered page-cache write**, with fsync batched ~50 ms off the critical path. So `journal_fsync` ≈ 0 on the commit path and the inflight=1 floor is now essentially *all* IPC poll-sleep — this work is orthogonal to and complementary with the journal change (different crates; no code overlap). Consequence: the committed attribution reference is a stale *Consistent* capture and is re-baselined under Eventual in **Task 0.0** before any wakeup work, so the win is isolated.
+
 ---
 
 ## File Structure
@@ -37,6 +39,41 @@
 ---
 
 ## Phase 0 — Wakeup primitive (TDD in isolation)
+
+### Task 0.0: Re-baseline attribution under the Eventual default
+
+Establish the true *current* baseline (Eventual journal, pre-wakeups) so the
+wakeup win is isolated from the journal-durability win already on `main`.
+
+**Files:**
+- Modify: `bench-out/reference/attribution.csv`
+
+- [ ] **Step 1: Capture the Eventual baseline (disk + tmpfs, inflight=1 and 8)**
+
+```bash
+mkdir -p /tmp/wk
+TMPDIR=/home/$(whoami)/uc-bench-data cargo run -p uc_autobench --features uc-bench-probes \
+  --bin attribution-bench --release -- --config single_disk --inflight 1 --count 5000 --out /tmp/wk/base_disk_if1.csv
+TMPDIR=/home/$(whoami)/uc-bench-data cargo run -p uc_autobench --features uc-bench-probes \
+  --bin attribution-bench --release -- --config single_disk --inflight 8 --count 5000 --out /tmp/wk/base_disk_if8.csv
+cargo run -p uc_autobench --features uc-bench-probes \
+  --bin attribution-bench --release -- --config single_tmpfs --inflight 8 --count 5000 --out /tmp/wk/base_tmpfs_if8.csv
+```
+
+- [ ] **Step 2: Confirm fsync left the path; commit the Eventual baseline**
+
+Run: `awk -F, '$5=="journal_fsync"||$5=="total"||$5=="submit_to_node"{print FILENAME,$1,$5,$7}' /tmp/wk/base_*.csv`
+Expected: `journal_fsync` p99 is now small (sub-100 µs, not ~0.85 ms — fsync is batched off-path under Eventual), and the floor is dominated by `submit_to_node`/`resp_ring`/`broadcast_to_client`. Then:
+
+```bash
+{ head -1 /tmp/wk/base_disk_if8.csv; tail -n+2 /tmp/wk/base_disk_if8.csv; tail -n+2 /tmp/wk/base_tmpfs_if8.csv; } > bench-out/reference/attribution.csv
+git add bench-out/reference/attribution.csv
+git commit -m "bench: re-baseline attribution reference under Eventual journal default (pre-wakeups)"
+```
+
+Keep `/tmp/wk/base_disk_if1.csv` — Task 3.2 diffs the post-wakeup inflight=1 run against it.
+
+---
 
 ### Task 0.1: `waiters` field in `RingHeader` (no size change)
 
@@ -1039,10 +1076,10 @@ cargo run -p uc_autobench --features uc-bench-probes \
   --bin attribution-bench --release -- --config single_tmpfs --inflight 1 --count 5000 --out /tmp/wk/tmpfs_if1.csv
 ```
 
-- [ ] **Step 2: Verify the floor collapsed**
+- [ ] **Step 2: Verify the floor collapsed vs the Eventual baseline (Task 0.0)**
 
-Run: `awk -F, '$5=="total"||$5=="submit_to_node"{print FILENAME,$1,$5,$7}' /tmp/wk/*_if1.csv`
-Expected: `submit_to_node` and `total` p99 at inflight=1 drop from ~2.1 ms / ~4.5 ms toward sub-millisecond (tens–hundreds of µs per hop). If they did NOT drop, STOP — a bridge isn't wired (check each consumer actually calls `notified().await`, and each producer's ring is in `Futex` mode).
+Run: `awk -F, '$5=="total"||$5=="submit_to_node"||$5=="resp_ring"||$5=="broadcast_to_client"{print FILENAME,$1,$5,$7}' /tmp/wk/base_disk_if1.csv /tmp/wk/disk_if1.csv`
+Expected: the IPC hops (`submit_to_node`, `resp_ring`, `broadcast_to_client`) and `total` p99 at inflight=1 drop from the Eventual baseline (~3–4 ms total, IPC-dominated since `journal_fsync` ≈ 0) toward sub-millisecond (tens–hundreds of µs per hop). If they did NOT drop, STOP — a bridge isn't wired (check each consumer actually calls `notified().await`, and each producer's ring is in `Futex` mode).
 
 - [ ] **Step 3: Refresh the committed reference (disk + tmpfs, inflight=8 to match the old shape, plus inflight=1)**
 
@@ -1071,7 +1108,7 @@ git commit -m "bench: refresh attribution reference after event-driven wakeups"
 
 - [ ] **Step 1: Write `docs/tasks/task11_event_driven_ring_wakeups.md`**
 
-Record: the wakeup mechanism (publish_position low-32 word + reclaimed `waiters`, no protocol bump); the `ParkMode` seam + `FutexParker`/`Poll`; the sync `read_or_park` arm-recheck vs the async `NotifyBridge` + timeout backstop; cross-process futex (no `FUTEX_PRIVATE_FLAG`); the per-ring wiring table; the before/after attribution numbers (inflight=1 floor: ~4.5 ms → measured); and what stayed deferred (pipeline de-serialization, query path, non-Linux parker). Note tokio's ~1 ms timer granularity as the reason the old 100 µs sleeps cost ~1 ms/hop.
+Record: the wakeup mechanism (publish_position low-32 word + reclaimed `waiters`, no protocol bump); the `ParkMode` seam + `FutexParker`/`Poll`; the sync `read_or_park` arm-recheck vs the async `NotifyBridge` + timeout backstop; cross-process futex (no `FUTEX_PRIVATE_FLAG`); the per-ring wiring table; the before/after attribution numbers (Eventual inflight=1 baseline ~3–4 ms, IPC-dominated → measured post-wakeup); the interaction with the Eventual+batched journal (`d55922c`: fsync off the commit path, so this work attacks the remaining IPC floor — orthogonal/complementary); the stale `JournalFsynced` probe label (now fires at the buffered write, not fsync — flag the `→ JournalDurable` rename the eventual-durability work owns); and what stayed deferred (pipeline de-serialization, query path, non-Linux parker). Note tokio's ~1 ms timer granularity as the reason the old 100 µs sleeps cost ~1 ms/hop.
 
 - [ ] **Step 2: Delete the ephemeral artifacts**
 
@@ -1096,5 +1133,5 @@ git commit -m "docs(task11): consolidate event-driven ring wakeups + reference n
 - [ ] Primitive tests green (both modes): `cargo test -p uc_protocol ring::` → green; run 3× for the lost-wakeup race.
 - [ ] Full suite green: `cargo test --workspace` (default) and `cargo test --workspace -- --test-threads=1` → both green, no hangs.
 - [ ] Clippy: `cargo clippy --workspace --all-targets -- -D warnings` → zero warnings.
-- [ ] Attribution shows the inflight=1 latency floor collapsed from ~4.5 ms toward sub-millisecond, captured in `bench-out/reference/attribution.csv`; high-inflight queueing (the deferred pipeline work) now stands isolated.
+- [ ] Attribution shows the inflight=1 latency floor collapsed from the Eventual baseline (~3–4 ms, IPC-dominated since `journal_fsync` ≈ 0 off-path) toward sub-millisecond, captured in `bench-out/reference/attribution.csv`; high-inflight queueing (the deferred pipeline work) now stands isolated.
 ```

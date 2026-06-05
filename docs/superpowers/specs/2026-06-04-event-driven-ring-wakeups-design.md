@@ -27,6 +27,32 @@ wakeups** (Aeron-style): the consumer parks on a futex over a shared-memory word
 and the producer wakes it on publish. Goal: collapse the per-hop wakeup latency
 from ~2 ms to the underlying hand-off cost (tens of µs).
 
+### Updated baseline — the Eventual + batched journal (d55922c + ultima_journal)
+
+The numbers above were captured under `Durability::Consistent`. Since then,
+`uc_node` defaults the Raft **log** journal to `Durability::Eventual`
+(`d55922c`), backed by `ultima_journal`'s background-writer model: `append`
+returns a `Notifier` that fires **after the buffered page-cache write** (not
+fsync), and fsync is **batched/coalesced periodically (~50 ms idle-fsync)** on
+the writer thread, advancing a separate `durable_seq` watermark (durability via
+quorum replication). **Net effect on this work:** fsync is now *off* the commit
+critical path, so `journal_fsync` ≈ 0 on the path and the inflight=1 floor is
+**almost entirely IPC poll-sleep wakeup latency** — this change *strengthens* the
+case for event-driven wakeups rather than competing with it. The two are
+**orthogonal and complementary**: the journal change removes fsync from the log
+path (`ultima_journal`); this design removes poll-sleep from the four IPC commit
+rings (`uc_protocol`). No code overlap.
+
+Two consequences for measurement:
+- The committed `bench-out/reference/attribution.csv` is a **stale (Consistent)**
+  baseline. Re-capture it under the current Eventual default *before* the wakeup
+  work so the wakeup win is isolated from the journal-durability win.
+- The `JournalFsynced` probe now fires at the buffered write, so the
+  `journal_fsync` attribution row no longer measures an fsync (it measures the
+  bg-writer hand-off). It should be read as "journal durable (page-cache)" and is
+  a candidate for the `JournalFsynced → JournalDurable` rename the
+  eventual-durability work owns (out of scope here; noted in the task doc).
+
 ## Scope decisions (from brainstorming)
 
 - **Target:** the low-concurrency *latency floor*. Throughput under concurrency is
@@ -209,11 +235,15 @@ Acquire/Release pairing as shown above; `waiters` on the consumer cache line.
 - *Idle CPU*: an idle node+service is parked, not busy-polling (assert/inspect).
 
 **Success criterion (measured via the harness):**
-Re-run `attribution-bench` at **inflight=1** and diff against
-`bench-out/reference/attribution.csv`. Target: per-hop wakeup latency collapses
-from ~2 ms to tens of µs; **total p99 at inflight=1 from ~4.5 ms toward
-sub-millisecond.** Capture a new committed reference. At high inflight the
-queueing term remains (the deferred pipeline work) — and the attribution will now
+**First re-capture the reference under the current Eventual default** (it is
+currently a stale Consistent capture) so the wakeup win is isolated from the
+journal-durability win — expect `journal_fsync` ≈ 0 and the floor essentially all
+IPC poll-sleep. Then re-run `attribution-bench` at **inflight=1** and diff
+against that fresh Eventual reference. Target: per-hop wakeup latency collapses
+from ~2 ms to tens of µs; **total p99 at inflight=1 from ~3–4 ms (Eventual, IPC
+floor) toward sub-millisecond.** Capture the post-wakeup reference. At high
+inflight the queueing term remains (the deferred pipeline work) — and the
+attribution will now
 show it isolated, which is the data we want before starting that follow-up.
 
 ## Deliverables
