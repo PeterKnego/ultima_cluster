@@ -120,7 +120,11 @@ pub enum ParkMode {
 
 impl Default for ParkMode {
     fn default() -> Self {
-        if cfg!(target_os = "linux") { ParkMode::Futex } else { ParkMode::Poll }
+        if cfg!(target_os = "linux") {
+            ParkMode::Futex
+        } else {
+            ParkMode::Poll
+        }
     }
 }
 
@@ -218,7 +222,11 @@ impl RingWaitHandle {
         header: *const RingHeader,
         mode: ParkMode,
     ) -> Self {
-        Self { _keepalive: keepalive, header, mode }
+        Self {
+            _keepalive: keepalive,
+            header,
+            mode,
+        }
     }
     #[inline]
     fn header(&self) -> &RingHeader {

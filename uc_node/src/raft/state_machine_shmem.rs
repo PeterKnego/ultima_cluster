@@ -171,7 +171,8 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
         }
 
         // Build the apply_resp bridge BEFORE moving the consumer into ShmemInner.
-        let apply_resp_bridge = NotifyBridge::spawn(apply_resp_consumer.wait_handle(), "apply_resp");
+        let apply_resp_bridge =
+            NotifyBridge::spawn(apply_resp_consumer.wait_handle(), "apply_resp");
 
         Ok(Self {
             inner: Arc::new(TokioMutex::new(ShmemInner {
@@ -238,8 +239,14 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                 }
                 EntryPayload::Normal(cmd_bytes) => {
                     // Normal app-data: publish to apply.ring, await response from apply_resp.ring.
-                    publish_apply(&g.apply_producer, log_index, cmd_bytes.as_ref(), log_id, &shutdown)
-                        .await?;
+                    publish_apply(
+                        &g.apply_producer,
+                        log_index,
+                        cmd_bytes.as_ref(),
+                        log_id,
+                        &shutdown,
+                    )
+                    .await?;
                     let resp = await_apply_resp(
                         &g.apply_resp_consumer,
                         log_index,

@@ -51,7 +51,12 @@ impl NotifyBridge {
                 handle.disarm();
             })
             .expect("spawn ring parker thread");
-        Self { notify, stop, waker, join: Some(join) }
+        Self {
+            notify,
+            stop,
+            waker,
+            join: Some(join),
+        }
     }
 
     /// Await the next wakeup (or a stored permit if one is pending).

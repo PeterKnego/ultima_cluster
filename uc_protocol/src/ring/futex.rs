@@ -73,7 +73,10 @@ mod tests {
         word.store(1, Ordering::Release);
         futex_wake(&word, 1);
         h.join().unwrap();
-        assert!(start.elapsed() < Duration::from_secs(2), "wake should be prompt, not timeout");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "wake should be prompt, not timeout"
+        );
     }
 
     #[test]

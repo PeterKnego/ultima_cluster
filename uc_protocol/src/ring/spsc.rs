@@ -27,10 +27,10 @@ use std::sync::atomic::Ordering;
 use memmap2::MmapMut;
 
 use crate::ring::common::{
-    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, PARK_CEIL, RING_HEADER_LEN,
+    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, PARK_CEIL, ParkMode, RING_HEADER_LEN,
     RecordHeader, RingError, RingHeader, RingWaitHandle, SPIN_TRIES, align_record_size,
     init_ring_header, try_read_record_at, validate_ring_header, write_padding_marker_at,
-    write_record_at, ParkMode,
+    write_record_at,
 };
 
 /// Shared inner state — owns the mmap and exposes the header + slot region.
@@ -345,7 +345,10 @@ impl SpscRing {
                 cached_consumer_pos: 0,
                 mode: ParkMode::default(),
             },
-            SpscConsumer { inner: self.inner, mode: ParkMode::default() },
+            SpscConsumer {
+                inner: self.inner,
+                mode: ParkMode::default(),
+            },
         )
     }
 }
@@ -520,7 +523,10 @@ mod tests {
         let mut buf = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while got < n {
-            assert!(std::time::Instant::now() < deadline, "stalled at {got}/{n} ({mode:?})");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stalled at {got}/{n} ({mode:?})"
+            );
             if let Some(_rec) = consumer.read_or_park(&mut buf).expect("read") {
                 let v = u32::from_le_bytes(buf.as_slice().try_into().unwrap());
                 assert_eq!(v, got, "ordering ({mode:?})");

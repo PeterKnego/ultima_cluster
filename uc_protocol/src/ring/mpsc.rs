@@ -26,7 +26,7 @@ use std::sync::atomic::Ordering;
 use memmap2::MmapMut;
 
 use crate::ring::common::{
-    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, RING_HEADER_LEN, ParkMode, RecordHeader,
+    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, ParkMode, RING_HEADER_LEN, RecordHeader,
     RingError, RingHeader, RingWaitHandle, align_record_size, init_ring_header, try_read_record_at,
     validate_ring_header, write_padding_marker_at, write_record_at,
 };
@@ -305,7 +305,10 @@ impl MpscRing {
                 cached_consumer_pos: Cell::new(0),
                 mode: ParkMode::default(),
             },
-            MpscConsumer { inner: self.inner, mode: ParkMode::default() },
+            MpscConsumer {
+                inner: self.inner,
+                mode: ParkMode::default(),
+            },
         )
     }
 }
