@@ -11,11 +11,6 @@
 //! change and the consumer is re-notified within `PARK_CEIL` (the backstop).
 //! Correctness never depends on the wake; only sub-`PARK_CEIL` latency does.
 
-// Will be wired to consumer call sites in Tasks 2.3 + 2.4 (apply_resp,
-// submit, broadcast). The dead-code lint fires in the interim; suppress it
-// here so that `-D warnings` passes throughout the phase.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

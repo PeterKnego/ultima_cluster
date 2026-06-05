@@ -40,6 +40,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::ipc::ring_bridge::NotifyBridge;
+
 use bytes::Bytes;
 use futures::StreamExt;
 use openraft::EntryPayload;
@@ -60,7 +62,6 @@ use super::state_machine::StoredSnapshot;
 use super::{RaftLogId, RaftSnapshot, RaftSnapshotMeta, RaftStoredMembership, TypeConfig};
 
 const FULL_BACKOFF: Duration = Duration::from_micros(100);
-const EMPTY_BACKOFF: Duration = Duration::from_micros(100);
 
 pub struct ShmemAdaptedStateMachine<S: StateMachine> {
     pub(crate) inner: Arc<TokioMutex<ShmemInner<S>>>,
@@ -103,6 +104,10 @@ pub(crate) struct ShmemInner<S: StateMachine> {
     /// `Sync`-friendly inside `Arc`s if we ever need to.
     pub(crate) apply_producer: PlMutex<SpscProducer>,
     pub(crate) apply_resp_consumer: PlMutex<SpscConsumer>,
+    /// Bridge that wakes `await_apply_resp` when the service publishes a
+    /// response. The parker thread is stopped and joined when `ShmemInner`
+    /// is dropped (via `NotifyBridge::Drop`).
+    pub(crate) apply_resp_bridge: Arc<NotifyBridge>,
     /// M5: in-process channel to the output_dispatcher. Normal entries are
     /// forwarded here after apply_resp returns. `try_send` keeps apply from
     /// blocking on a full output channel — the replay sweep covers any gaps.
@@ -165,6 +170,12 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
             );
         }
 
+        // Build the apply_resp bridge BEFORE moving the consumer into ShmemInner.
+        let apply_resp_bridge = Arc::new(NotifyBridge::spawn(
+            apply_resp_consumer.wait_handle(),
+            "apply_resp",
+        ));
+
         Ok(Self {
             inner: Arc::new(TokioMutex::new(ShmemInner {
                 sm,
@@ -176,6 +187,7 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
                 snapshot_bytes_dir: handles.data_dir,
                 apply_producer: PlMutex::new(apply_producer),
                 apply_resp_consumer: PlMutex::new(apply_resp_consumer),
+                apply_resp_bridge,
                 output_chan_tx,
             })),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -231,9 +243,14 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                     // Normal app-data: publish to apply.ring, await response from apply_resp.ring.
                     publish_apply(&g.apply_producer, log_index, cmd_bytes.as_ref(), log_id, &shutdown)
                         .await?;
-                    let resp =
-                        await_apply_resp(&g.apply_resp_consumer, log_index, log_id, &shutdown)
-                            .await?;
+                    let resp = await_apply_resp(
+                        &g.apply_resp_consumer,
+                        log_index,
+                        log_id,
+                        &shutdown,
+                        &g.apply_resp_bridge,
+                    )
+                    .await?;
                     // M5: hand off to output_dispatcher. try_send so apply never blocks
                     // on a full output channel — the skip path catches it during replay.
                     if let Err(e) = g
@@ -382,6 +399,7 @@ async fn await_apply_resp(
     expected_log_index: u64,
     log_id: RaftLogId,
     shutdown: &AtomicBool,
+    bridge: &NotifyBridge,
 ) -> Result<Bytes, io::Error> {
     let _ = log_id; // kept for parity with the 0.9 error-context site
     let mut payload_buf: Vec<u8> = Vec::with_capacity(1024);
@@ -429,7 +447,7 @@ async fn await_apply_resp(
                     "unexpected frame on apply_resp ring"
                 );
             }
-            Ok(None) => tokio::time::sleep(EMPTY_BACKOFF).await,
+            Ok(None) => bridge.notified().await,
             Err(e) => {
                 return Err(io::Error::other(format!("apply_resp ring read: {e}")));
             }
