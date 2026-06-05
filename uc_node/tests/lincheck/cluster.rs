@@ -381,22 +381,31 @@ impl LinCluster {
                 n.handle.take(),
             )
         };
-        // Teardown unlocked.
-        if let Some(c) = client
-            && let Ok(c) = Arc::try_unwrap(c)
-        {
-            let _ = c.shutdown().await;
+        // Teardown unlocked. Order matters under concurrent load: shut the NODE
+        // down FIRST, while its service is still alive. A worker may have an
+        // in-flight client_write being applied; if we killed the service first,
+        // the node's apply loop would block forever awaiting an apply_resp from
+        // the dead service and node.shutdown() would hang. With the service still
+        // up, raft shutdown drains/cancels the in-flight apply cleanly. Then the
+        // service, then the (already-taken) client.
+        //
+        // Reuse-the-persisted-data-dir rejoin (the design intent): on restart the
+        // node re-applies the replayed log and recovery clamps the durable
+        // `output_progress` (which leads `last_applied` until the first snapshot)
+        // down to `last_applied`, re-running outputs at-least-once. See
+        // uc_node/src/runtime/recovery.rs.
+        if let Some(h) = handle {
+            let _ = h.shutdown().await;
         }
         if let Some(s) = service {
             let _ = s.shutdown().await;
         }
-        if let Some(h) = handle {
-            // Reuse-the-persisted-data-dir rejoin (the design intent): on restart
-            // the node re-applies the replayed log and recovery clamps the durable
-            // `output_progress` (which leads `last_applied` until the first
-            // snapshot) down to `last_applied`, re-running outputs at-least-once.
-            // See uc_node/src/runtime/recovery.rs.
-            let _ = h.shutdown().await;
+        // The client is usually still cloned by an in-flight worker; if we happen
+        // to be the sole owner, shut it down (otherwise it's retired on drop).
+        if let Some(c) = client
+            && let Ok(c) = Arc::try_unwrap(c)
+        {
+            let _ = c.shutdown().await;
         }
         drop(instance); // retire the old shmem instance_dir (fresh one below)
         // Survivors re-elect (quorum 2/3 holds).

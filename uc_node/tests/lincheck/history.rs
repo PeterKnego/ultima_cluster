@@ -61,6 +61,11 @@ impl History {
     pub fn into_entries(self) -> Vec<Entry> {
         self.entries.into_inner().unwrap()
     }
+    /// Clone the entries recorded so far (for the in-progress liveness check,
+    /// which must read the history without consuming it).
+    pub fn snapshot(&self) -> Vec<Entry> {
+        self.entries.lock().unwrap().clone()
+    }
     /// Count of Ok outcomes (for the liveness gate).
     #[allow(dead_code)]
     pub fn ok_count(entries: &[Entry]) -> usize {
