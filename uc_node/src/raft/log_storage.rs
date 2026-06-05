@@ -126,6 +126,14 @@ impl JournalLogStorage {
         })
     }
 
+    /// Log entries written but not yet fsync-durable — the Eventual-mode window
+    /// (`last_seq - durable_seq`). Always 0 in Consistent mode. This is the health
+    /// signal for Eventual durability; surface it via node telemetry.
+    pub fn durability_lag(&self) -> u64 {
+        let last = self.journal.last_seq().unwrap_or(0);
+        last.saturating_sub(self.journal.durable_seq())
+    }
+
     /// The `RaftLogId` of the record at `seq` (the entry's own `log_id`), or
     /// `None` if `seq == 0` or no record exists there. Used by recovery to clamp
     /// a power-loss-inverted `committed` down to the durable log tail.

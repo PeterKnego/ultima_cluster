@@ -103,3 +103,34 @@ async fn reconcile_clamps_committed_to_purge_floor_when_log_empty() {
         Some(make_log_id(2, 0, 100))
     );
 }
+
+#[tokio::test]
+async fn consistent_mode_has_zero_durability_lag() {
+    use ultima_journal::Durability;
+    let dir = TempDir::new().unwrap();
+    let mut storage =
+        JournalLogStorage::open_with_durability(dir.path(), Durability::Consistent).expect("open");
+    append_1_to(&mut storage, 3).await;
+    // Consistent fsyncs before ack, so the durable watermark == last_seq.
+    assert_eq!(storage.durability_lag(), 0);
+}
+
+#[tokio::test]
+async fn eventual_mode_durability_lag_drains_to_zero() {
+    use ultima_journal::Durability;
+    let dir = TempDir::new().unwrap();
+    let mut storage =
+        JournalLogStorage::open_with_durability(dir.path(), Durability::Eventual).expect("open");
+    append_1_to(&mut storage, 3).await;
+    // The background idle-fsync eventually flushes; lag drains to 0. Spin with a
+    // bound (mirrors ultima_journal's own watermark tests).
+    let mut ok = false;
+    for _ in 0..200 {
+        if storage.durability_lag() == 0 {
+            ok = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(ok, "durability_lag never drained to 0");
+}
