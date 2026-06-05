@@ -9,6 +9,7 @@ description = "ultima_cluster wire protocol — shared-memory layouts, frames, v
 [dependencies]
 # M3: ring buffer primitives need std (atomics + mmap). Pure data types
 # (version, magic, error_codes) remain core-only-compatible.
+libc = "0.2"
 memmap2 = { workspace = true }
 parking_lot = { workspace = true }
 page_size = { workspace = true }

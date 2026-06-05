@@ -13,6 +13,7 @@
 
 pub mod broadcast;
 pub mod common;
+mod futex;
 pub mod mpsc;
 pub mod spsc;
 
