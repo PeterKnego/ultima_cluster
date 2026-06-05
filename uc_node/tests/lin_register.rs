@@ -140,10 +140,11 @@ fn dump_history(entries: &[lincheck::history::Entry], seed: u64) {
     eprintln!("history ({} entries) dumped to {path}", entries.len());
 }
 
-/// The capstone: 8 seeded workers drive a concurrent CAS-register workload while
-/// a seeded scheduler injects one quorum-preserving fault at a time (leader
-/// kill/restart or service crash/restart), waiting for recovery between faults.
-/// The recorded history must be linearizable.
+/// The capstone: a few seeded, throttled workers drive a concurrent CAS-register
+/// workload while a seeded scheduler injects one quorum-preserving fault at a
+/// time (leader node-kill+restart), waiting for recovery between faults. The
+/// recorded history must be linearizable. (Service-crash is excluded here — it
+/// needs a self-persisting SM; see the fault-loop comment below and task12.)
 ///
 /// Multi-thread runtime (the default): the 3-node shmem boot deadlocks under the
 /// current_thread runtime — see `smoke_3node_submit_read`.
