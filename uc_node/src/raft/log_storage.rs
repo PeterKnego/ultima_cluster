@@ -356,7 +356,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             notifier.on_complete(move |result| {
                 uc_protocol::probes::stamp_log(
                     probe_seq,
-                    uc_protocol::probes::Checkpoint::JournalFsynced,
+                    uc_protocol::probes::Checkpoint::JournalDurable,
                 );
                 let io_result: Result<(), io::Error> = result.map_err(io::Error::other);
                 callback.io_completed(io_result);

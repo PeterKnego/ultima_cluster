@@ -13,7 +13,7 @@ pub enum Checkpoint {
     Submit = 0,
     NodeDequeue = 1,
     JournalAppended = 2,
-    JournalFsynced = 3,
+    JournalDurable = 3,
     ApplyEnqueue = 4,
     ApplyStart = 5,
     ApplyDone = 6,
@@ -137,8 +137,8 @@ mod imp {
         const STAGES: &[(&str, Checkpoint, Checkpoint)] = &[
             ("submit_to_node", Submit, NodeDequeue),
             ("node_to_append", NodeDequeue, JournalAppended),
-            ("journal_fsync", JournalAppended, JournalFsynced),
-            ("commit_to_apply_enq", JournalFsynced, ApplyEnqueue),
+            ("journal_durable", JournalAppended, JournalDurable),
+            ("commit_to_apply_enq", JournalDurable, ApplyEnqueue),
             ("apply_ring", ApplyEnqueue, ApplyStart),
             ("apply", ApplyStart, ApplyDone),
             ("resp_ring", ApplyDone, RespDequeue),
@@ -183,7 +183,7 @@ mod tests {
         stamp_client(7, 0, Checkpoint::NodeDequeue);
         bridge(7, 0, 100);
         stamp_log(100, Checkpoint::JournalAppended);
-        stamp_log(100, Checkpoint::JournalFsynced);
+        stamp_log(100, Checkpoint::JournalDurable);
         stamp_log(100, Checkpoint::ApplyEnqueue);
         stamp_log(100, Checkpoint::ApplyStart);
         stamp_log(100, Checkpoint::ApplyDone);
@@ -199,7 +199,7 @@ mod tests {
         }
         let deltas = stage_deltas(row);
         let names: Vec<&str> = deltas.iter().map(|(n, _)| *n).collect();
-        assert!(names.contains(&"journal_fsync"));
+        assert!(names.contains(&"journal_durable"));
         assert!(names.contains(&"apply"));
         assert!(names.contains(&"total"));
         // total spans the whole path: >= every sub-stage individually.
