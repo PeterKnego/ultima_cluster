@@ -396,6 +396,8 @@ impl<S: StateMachine> NodeHandle<S> {
         // M5: drop the SM adapter (closing `output_chan_tx`) BEFORE joining
         // the output_dispatcher. The dispatcher blocks in `rx.recv().await`;
         // dropping the last sender unblocks it so the join can complete.
+        // Dropping the shmem SM adapter also drops `apply_resp_bridge`, whose
+        // Drop wakes + joins its parker thread (bounded by PARK_CEIL).
         drop(sm);
         // M5: stop output_dispatcher before client dispatchers so the output
         // side drains before the client side closes.
