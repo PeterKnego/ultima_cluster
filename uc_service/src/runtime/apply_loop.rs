@@ -29,10 +29,6 @@ use uc_protocol::ring::spsc::{SpscConsumer, SpscProducer};
 
 use crate::StateMachine;
 
-/// Backoff when the ring is empty. Tight enough that latency stays in the
-/// hundreds of microseconds; loose enough that an idle service doesn't spin
-/// a core.
-const IDLE_BACKOFF: Duration = Duration::from_micros(100);
 const ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
 pub struct ApplyLoopHandle {
@@ -69,7 +65,7 @@ fn apply_thread_body<S>(
 {
     let mut payload_buf: Vec<u8> = Vec::with_capacity(4096);
     while !stop.load(Ordering::Relaxed) {
-        match consumer.try_read(&mut payload_buf) {
+        match consumer.read_or_park(&mut payload_buf) {
             Ok(Some(rec)) if rec.msg_type == MSG_TYPE_APPLY => {
                 if let Err(e) = decode_flags_apply(rec.flags) {
                     tracing::warn!("dropping apply frame with bad flags: {e}");
@@ -109,7 +105,7 @@ fn apply_thread_body<S>(
             Ok(Some(rec)) => {
                 tracing::warn!(msg_type = rec.msg_type, "apply ring: unexpected frame");
             }
-            Ok(None) => std::thread::sleep(IDLE_BACKOFF),
+            Ok(None) => {} // parked up to PARK_CEIL; loop re-checks stop flag
             Err(e) => {
                 tracing::warn!(error = %e, "apply ring read error");
                 std::thread::sleep(ERROR_BACKOFF);
