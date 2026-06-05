@@ -27,9 +27,10 @@ use std::sync::atomic::Ordering;
 use memmap2::MmapMut;
 
 use crate::ring::common::{
-    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, RING_HEADER_LEN, RecordHeader,
-    RingError, RingHeader, align_record_size, init_ring_header, try_read_record_at,
-    validate_ring_header, write_padding_marker_at, write_record_at,
+    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, PARK_CEIL, RING_HEADER_LEN,
+    RecordHeader, RingError, RingHeader, RingWaitHandle, SPIN_TRIES, align_record_size,
+    init_ring_header, try_read_record_at, validate_ring_header, write_padding_marker_at,
+    write_record_at, ParkMode,
 };
 
 /// Shared inner state — owns the mmap and exposes the header + slot region.
@@ -89,10 +90,12 @@ pub struct SpscProducer {
     /// roughly doubles saturated throughput (the line stops bouncing between
     /// the producer and consumer cores on every write).
     cached_consumer_pos: u64,
+    pub mode: ParkMode,
 }
 
 pub struct SpscConsumer {
     inner: Arc<SpscInner>,
+    pub mode: ParkMode,
 }
 
 impl SpscProducer {
@@ -185,11 +188,46 @@ impl SpscProducer {
         }
         let new_pos = producer_pos + advance as u64;
         header.publish_position.store(new_pos, Ordering::Release);
+        header.signal(self.mode, false); // SPSC: wake the single consumer
         Ok(())
     }
 }
 
 impl SpscConsumer {
+    /// Handle for a parker thread to block on this ring while the owner reads.
+    pub fn wait_handle(&self) -> RingWaitHandle {
+        RingWaitHandle::new(self.inner.clone(), self.inner.header(), self.mode)
+    }
+
+    /// Blocking read: returns a record, or `Ok(None)` only after parking up to
+    /// `PARK_CEIL` with nothing available. Arm-then-recheck closes the
+    /// lost-wakeup race: we snapshot the wakeup word, register as a waiter,
+    /// re-check the ring, and only then park on the snapshot — if the producer
+    /// published in between, `publish_position != seq` and the futex returns
+    /// immediately. For SYNC (std::thread) consumers only.
+    pub fn read_or_park(
+        &mut self,
+        payload_buf: &mut Vec<u8>,
+    ) -> Result<Option<RecordHeader>, RingError> {
+        // Spin-then-park: catch an in-flight publish without a syscall first.
+        for _ in 0..SPIN_TRIES {
+            if let Some(rec) = self.try_read(payload_buf)? {
+                return Ok(Some(rec));
+            }
+            std::hint::spin_loop();
+        }
+        let seq = self.inner.header().current_seq();
+        self.inner.header().arm();
+        let recheck = self.try_read(payload_buf);
+        if !matches!(recheck, Ok(None)) {
+            self.inner.header().disarm();
+            return recheck;
+        }
+        self.inner.header().park(self.mode, seq, PARK_CEIL);
+        self.inner.header().disarm();
+        self.try_read(payload_buf)
+    }
+
     /// Try to consume a record. Returns `Ok(None)` if the ring is empty
     /// (producer hasn't published anything since the last call), `Ok(Some)`
     /// on a successful read.
@@ -300,8 +338,9 @@ impl SpscRing {
             SpscProducer {
                 inner: self.inner.clone(),
                 cached_consumer_pos: 0,
+                mode: ParkMode::default(),
             },
-            SpscConsumer { inner: self.inner },
+            SpscConsumer { inner: self.inner, mode: ParkMode::default() },
         )
     }
 }
@@ -446,5 +485,65 @@ mod tests {
             }
         }
         h.join().unwrap();
+    }
+
+    fn lost_wakeup_stress(mode: ParkMode) {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = SpscRing::create(tmp.path(), 4096, 256).expect("create");
+        let (mut producer, mut consumer) = ring.into_split();
+        producer.mode = mode;
+        consumer.mode = mode;
+
+        let n = 2000u32;
+        let h = std::thread::spawn(move || {
+            for i in 0..n {
+                let payload = i.to_le_bytes();
+                loop {
+                    match producer.try_write(2, 0, [0; 8], &payload) {
+                        Ok(()) => break,
+                        Err(RingError::Full) => std::thread::yield_now(),
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+                if i % 7 == 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+            }
+        });
+
+        let mut got = 0u32;
+        let mut buf = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while got < n {
+            assert!(std::time::Instant::now() < deadline, "stalled at {got}/{n} ({mode:?})");
+            if let Some(_rec) = consumer.read_or_park(&mut buf).expect("read") {
+                let v = u32::from_le_bytes(buf.as_slice().try_into().unwrap());
+                assert_eq!(v, got, "ordering ({mode:?})");
+                got += 1;
+            }
+        }
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn lost_wakeup_stress_futex() {
+        lost_wakeup_stress(ParkMode::Futex);
+    }
+
+    #[test]
+    fn lost_wakeup_stress_poll() {
+        lost_wakeup_stress(ParkMode::Poll);
+    }
+
+    #[test]
+    fn read_or_park_times_out_when_empty() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = SpscRing::create(tmp.path(), 4096, 256).expect("create");
+        let (_producer, mut consumer) = ring.into_split();
+        let mut buf = Vec::new();
+        let start = std::time::Instant::now();
+        let r = consumer.read_or_park(&mut buf).expect("read");
+        assert!(r.is_none());
+        assert!(start.elapsed() >= std::time::Duration::from_millis(1)); // parked ~PARK_CEIL
     }
 }
