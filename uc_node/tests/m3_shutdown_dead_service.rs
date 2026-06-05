@@ -131,7 +131,11 @@ async fn node_shutdown_with_crashed_service_does_not_hang() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert_eq!(node.current_leader().await, Some(1), "leader did not converge");
+    assert_eq!(
+        node.current_leader().await,
+        Some(1),
+        "leader did not converge"
+    );
 
     // ── Baseline: a write applies cleanly while the service is alive ─────
     let client = Client::connect(&instance_dir, &app_id)

@@ -64,7 +64,13 @@ pub fn check_register_with_budget(entries: &[Entry], budget: u64) -> Verdict {
     let mut remaining: Vec<bool> = vec![true; n];
     let mut visited: HashSet<(Vec<bool>, Option<u64>)> = HashSet::new();
     let mut budget_left = budget;
-    let res = search::<RegisterModel>(&ops, &mut remaining, RegisterModel::init(), &mut visited, &mut budget_left);
+    let res = search::<RegisterModel>(
+        &ops,
+        &mut remaining,
+        RegisterModel::init(),
+        &mut visited,
+        &mut budget_left,
+    );
     match res {
         SearchResult::Ok => Verdict::Linearizable,
         SearchResult::NoLinearization => Verdict::Violation,
@@ -168,7 +174,13 @@ mod tests {
     use crate::lincheck::model::{Op, RegResp};
 
     fn e(client: u32, op: Op, invoke: u64, ret: u64, outcome: Outcome) -> Entry {
-        Entry { client, op, invoke, ret, outcome }
+        Entry {
+            client,
+            op,
+            invoke,
+            ret,
+            outcome,
+        }
     }
 
     #[test]
@@ -177,7 +189,13 @@ mod tests {
         let h = vec![
             e(0, Op::Write(1), 0, 1, Outcome::Ok(RegResp::Ack)),
             e(0, Op::Read, 2, 3, Outcome::Ok(RegResp::Value(Some(1)))),
-            e(0, Op::Cas { old: 1, new: 2 }, 4, 5, Outcome::Ok(RegResp::CasOk(true))),
+            e(
+                0,
+                Op::Cas { old: 1, new: 2 },
+                4,
+                5,
+                Outcome::Ok(RegResp::CasOk(true)),
+            ),
             e(0, Op::Read, 6, 7, Outcome::Ok(RegResp::Value(Some(2)))),
         ];
         assert_eq!(check_register(&h), Verdict::Linearizable);
@@ -198,8 +216,20 @@ mod tests {
         // write(1); two concurrent cas(1,2)->true BOTH succeed — impossible.
         let h = vec![
             e(0, Op::Write(1), 0, 1, Outcome::Ok(RegResp::Ack)),
-            e(1, Op::Cas { old: 1, new: 2 }, 2, 5, Outcome::Ok(RegResp::CasOk(true))),
-            e(2, Op::Cas { old: 1, new: 2 }, 2, 5, Outcome::Ok(RegResp::CasOk(true))),
+            e(
+                1,
+                Op::Cas { old: 1, new: 2 },
+                2,
+                5,
+                Outcome::Ok(RegResp::CasOk(true)),
+            ),
+            e(
+                2,
+                Op::Cas { old: 1, new: 2 },
+                2,
+                5,
+                Outcome::Ok(RegResp::CasOk(true)),
+            ),
         ];
         assert_eq!(check_register(&h), Verdict::Violation);
     }
