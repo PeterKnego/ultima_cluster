@@ -90,11 +90,16 @@ pub struct SpscProducer {
     /// roughly doubles saturated throughput (the line stops bouncing between
     /// the producer and consumer cores on every write).
     cached_consumer_pos: u64,
+    /// Wakeup mechanism. Must match the consumer's `mode`: a producer in
+    /// `Poll` won't `FUTEX_WAKE` a `Futex`-parked consumer (and vice versa) —
+    /// mismatched modes silently degrade to poll-sleep latency but are not
+    /// unsound. `into_split` sets both to `ParkMode::default()`.
     pub mode: ParkMode,
 }
 
 pub struct SpscConsumer {
     inner: Arc<SpscInner>,
+    /// Wakeup mechanism; must match the producer's `mode` (see `SpscProducer::mode`).
     pub mode: ParkMode,
 }
 
@@ -544,6 +549,6 @@ mod tests {
         let start = std::time::Instant::now();
         let r = consumer.read_or_park(&mut buf).expect("read");
         assert!(r.is_none());
-        assert!(start.elapsed() >= std::time::Duration::from_millis(1)); // parked ~PARK_CEIL
+        assert!(start.elapsed() >= PARK_CEIL); // parked the full backstop with no producer
     }
 }
