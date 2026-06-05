@@ -107,7 +107,7 @@ pub(crate) struct ShmemInner<S: StateMachine> {
     /// Bridge that wakes `await_apply_resp` when the service publishes a
     /// response. The parker thread is stopped and joined when `ShmemInner`
     /// is dropped (via `NotifyBridge::Drop`).
-    pub(crate) apply_resp_bridge: Arc<NotifyBridge>,
+    pub(crate) apply_resp_bridge: NotifyBridge,
     /// M5: in-process channel to the output_dispatcher. Normal entries are
     /// forwarded here after apply_resp returns. `try_send` keeps apply from
     /// blocking on a full output channel — the replay sweep covers any gaps.
@@ -171,10 +171,7 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
         }
 
         // Build the apply_resp bridge BEFORE moving the consumer into ShmemInner.
-        let apply_resp_bridge = Arc::new(NotifyBridge::spawn(
-            apply_resp_consumer.wait_handle(),
-            "apply_resp",
-        ));
+        let apply_resp_bridge = NotifyBridge::spawn(apply_resp_consumer.wait_handle(), "apply_resp");
 
         Ok(Self {
             inner: Arc::new(TokioMutex::new(ShmemInner {

@@ -10,6 +10,11 @@
 //! `try_read == None` and the parker's snapshot, the parker waits for the NEXT
 //! change and the consumer is re-notified within `PARK_CEIL` (the backstop).
 //! Correctness never depends on the wake; only sub-`PARK_CEIL` latency does.
+//!
+//! Shutdown is prompt: `shutdown()` keeps a cloned `RingWaitHandle` (`waker`) and
+//! force-wakes the parker's `FUTEX_WAIT` so the join returns immediately rather
+//! than blocking for the full `PARK_CEIL` — important because the bridge can be
+//! dropped from an `async fn` on a current_thread runtime (e.g. node shutdown).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +25,9 @@ use uc_protocol::ring::{PARK_CEIL, RingWaitHandle};
 pub struct NotifyBridge {
     notify: Arc<Notify>,
     stop: Arc<AtomicBool>,
+    /// Clone of the parker's handle, retained so `shutdown()` can force-wake the
+    /// parker's `FUTEX_WAIT` (the thread itself owns the other clone).
+    waker: RingWaitHandle,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -28,6 +36,7 @@ impl NotifyBridge {
     pub fn spawn(handle: RingWaitHandle, name: &'static str) -> Self {
         let notify = Arc::new(Notify::new());
         let stop = Arc::new(AtomicBool::new(false));
+        let waker = handle.clone();
         let n = notify.clone();
         let s = stop.clone();
         let join = std::thread::Builder::new()
@@ -42,7 +51,7 @@ impl NotifyBridge {
                 handle.disarm();
             })
             .expect("spawn ring parker thread");
-        Self { notify, stop, join: Some(join) }
+        Self { notify, stop, waker, join: Some(join) }
     }
 
     /// Await the next wakeup (or a stored permit if one is pending).
@@ -50,10 +59,13 @@ impl NotifyBridge {
         self.notify.notified().await;
     }
 
-    /// Stop the parker thread and join it. Idempotent.
+    /// Stop the parker thread and join it promptly. Idempotent.
     pub fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Release);
-        self.notify.notify_one(); // unblock any awaiter
+        // Force-wake the parker out of FUTEX_WAIT so join() doesn't block up to
+        // PARK_CEIL, then unblock any async awaiter.
+        self.waker.wake();
+        self.notify.notify_one();
         if let Some(j) = self.join.take() {
             let _ = j.join();
         }

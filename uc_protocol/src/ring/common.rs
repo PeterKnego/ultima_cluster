@@ -241,6 +241,17 @@ impl RingWaitHandle {
     pub fn park(&self, expected: u32, timeout: std::time::Duration) {
         self.header().park(self.mode, expected, timeout)
     }
+    /// Force-wake anything parked on this ring's wakeup word, regardless of the
+    /// `waiters` count or whether the word changed. Used to interrupt a parker
+    /// thread's `park()` promptly at shutdown so its join doesn't block for the
+    /// full `PARK_CEIL`. No-op in `Poll` mode (a `Poll` parker is in `sleep` and
+    /// resolves within `PARK_CEIL` on its own).
+    #[inline]
+    pub fn wake(&self) {
+        if self.mode == ParkMode::Futex {
+            super::futex::futex_wake(self.header().wake_word(), i32::MAX);
+        }
+    }
 }
 
 /// Per-record frame header. Layout matches the wire format exactly
