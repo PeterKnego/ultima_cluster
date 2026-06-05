@@ -46,7 +46,7 @@
 //! defense-in-depth; the primary torn-record guard is now the
 //! `publish_position` Release → consumer Acquire edge.
 
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use thiserror::Error;
 
 /// Padding-marker `msg_type` — consumer skips to the start of the slot
@@ -76,7 +76,12 @@ pub struct RingHeader {
     pub publish_position: AtomicU64,
     pub _pad_3: [u8; 56],
     pub consumer_position: AtomicU64,
-    pub _pad_4: [u8; 56],
+    /// Count of consumers currently parked on this ring's wakeup word. Written
+    /// by the consumer side (same cache line as `consumer_position`), read by
+    /// the producer to skip the `FUTEX_WAKE` syscall when nobody is parked.
+    /// Reclaimed from `_pad_4` so `RING_HEADER_LEN` is unchanged (no protocol bump).
+    pub waiters: AtomicU32,
+    pub _pad_4: [u8; 52],
 }
 
 const _: () = {
@@ -197,7 +202,8 @@ pub fn init_ring_header(
                 publish_position: AtomicU64::new(0),
                 _pad_3: [0; 56],
                 consumer_position: AtomicU64::new(0),
-                _pad_4: [0; 56],
+                waiters: AtomicU32::new(0),
+                _pad_4: [0; 52],
             },
         );
     }
