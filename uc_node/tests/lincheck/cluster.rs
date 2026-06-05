@@ -116,11 +116,9 @@ impl LinCluster {
     ///   4. Connect one client per node.
     ///   5. Wait for a stable leader.
     pub async fn start_3() -> Self {
-        let serial = CLUSTER_SERIAL.lock().await;
-        // SAFETY: CLUSTER_SERIAL is 'static, so the guard is 'static.
-        // We transmute to 'static so it can be stored in the struct.
-        let serial: tokio::sync::MutexGuard<'static, ()> =
-            unsafe { std::mem::transmute(serial) };
+        // `CLUSTER_SERIAL` is a `static`, so the guard is already `'static` — no
+        // transmute needed to store it in the struct.
+        let serial: tokio::sync::MutexGuard<'static, ()> = CLUSTER_SERIAL.lock().await;
 
         let addrs = pick_addrs(3);
         let peers: Vec<PeerSeed> = (1..=3u64)
@@ -216,15 +214,23 @@ impl LinCluster {
         cluster
     }
 
-    /// node_id of the current leader, found by querying live node handles.
-    /// Locks briefly; `current_leader()` is a fast async call, so holding
-    /// the lock across it (not across submit/read) is fine.
+    /// Clone the live (connected) clients out under a brief lock so callers can
+    /// read leader status without holding the nodes lock across anything.
+    async fn live_clients(&self) -> Vec<Arc<Client>> {
+        self.nodes
+            .lock()
+            .await
+            .iter()
+            .filter_map(|n| n.client.clone())
+            .collect()
+    }
+
+    /// node_id of the current leader, from any live client's NodeStatus.
+    /// Uses the SYNC `Client::current_leader()` on cloned `Arc<Client>`s, so the
+    /// nodes lock is never held across an await — safe under concurrent faults.
     pub async fn leader_id(&self) -> Option<NodeId> {
-        let nodes = self.nodes.lock().await;
-        for n in nodes.iter() {
-            if let Some(h) = &n.handle
-                && let Some(l) = h.current_leader().await
-            {
+        for c in self.live_clients().await {
+            if let Some(l) = c.current_leader() {
                 return Some(l);
             }
         }
@@ -247,24 +253,21 @@ impl LinCluster {
                 Instant::now() < deadline,
                 "no stable leader within {timeout:?}"
             );
-            // All live nodes must agree on the same leader id.
+            // All live nodes must agree on the same leader id. Read each via the
+            // SYNC `Client::current_leader()` on cloned `Arc<Client>`s — the nodes
+            // lock is dropped by `live_clients()` before any of this runs.
+            let clients = self.live_clients().await;
+            let count = clients.len();
             let mut seen: Option<NodeId> = None;
             let mut agree = true;
-            let mut count = 0;
-            {
-                let nodes = self.nodes.lock().await;
-                for n in nodes.iter() {
-                    if let Some(h) = &n.handle {
-                        count += 1;
-                        match h.current_leader().await {
-                            Some(l) => match seen {
-                                None => seen = Some(l),
-                                Some(s) if s == l => {}
-                                Some(_) => agree = false,
-                            },
-                            None => agree = false,
-                        }
-                    }
+            for c in &clients {
+                match c.current_leader() {
+                    Some(l) => match seen {
+                        None => seen = Some(l),
+                        Some(s) if s == l => {}
+                        Some(_) => agree = false,
+                    },
+                    None => agree = false,
                 }
             }
             if agree && count >= 2 && let Some(l) = seen {
