@@ -19,9 +19,9 @@ async fn append_1_to(storage: &mut JournalLogStorage, n: u64) {
     let entries: Vec<RaftEntry> = (1..=n)
         .map(|i| Entry {
             log_id: make_log_id(1, 0, i),
-            payload: EntryPayload::Normal(uc_node::raft::AppCommand(bytes::Bytes::from(
-                format!("cmd-{i}"),
-            ))),
+            payload: EntryPayload::Normal(uc_node::raft::AppCommand(bytes::Bytes::from(format!(
+                "cmd-{i}"
+            )))),
         })
         .collect();
     storage.blocking_append(entries).await.expect("append");
@@ -47,11 +47,64 @@ async fn reconcile_clamps_committed_ahead_of_log() {
         .expect("truncate");
 
     // Inversion now present: committed.index (5) > last_seq (3).
-    assert_eq!(storage.read_committed().await.unwrap(), Some(make_log_id(1, 0, 5)));
+    assert_eq!(
+        storage.read_committed().await.unwrap(),
+        Some(make_log_id(1, 0, 5))
+    );
 
     // Reconcile clamps committed down to the durable tail (index 3).
     uc_node::runtime::recovery::reconcile(&storage).expect("reconcile");
-    assert_eq!(storage.read_committed().await.unwrap(), Some(make_log_id(1, 0, 3)));
+    assert_eq!(
+        storage.read_committed().await.unwrap(),
+        Some(make_log_id(1, 0, 3))
+    );
+}
+
+#[tokio::test]
+async fn reconcile_clamps_output_progress_ahead_of_last_applied() {
+    let dir = TempDir::new().unwrap();
+    let storage = JournalLogStorage::open(dir.path()).expect("open");
+
+    // Shmem-lag scenario: output_progress fsynced per-output up to 5, but the
+    // durable last_applied only advances at snapshot time → still 0 here. This
+    // is NOT corruption: the applied entries are in the log and openraft will
+    // re-apply them on startup.
+    storage
+        ._testonly_output_progress()
+        .store(&5)
+        .expect("store output_progress")
+        .wait()
+        .expect("wait");
+    assert_eq!(storage._testonly_output_progress().load().unwrap(), Some(5));
+    assert_eq!(storage._testonly_last_applied().load().unwrap(), None); // index 0
+
+    // Reconcile must NOT error; it clamps output_progress down to last_applied
+    // (0) so outputs in the gap re-run on replay (at-least-once).
+    uc_node::runtime::recovery::reconcile(&storage).expect("reconcile");
+    assert_eq!(storage._testonly_output_progress().load().unwrap(), Some(0));
+}
+
+#[tokio::test]
+async fn reconcile_leaves_output_progress_below_last_applied_untouched() {
+    let dir = TempDir::new().unwrap();
+    let storage = JournalLogStorage::open(dir.path()).expect("open");
+
+    // Normal steady state: output_progress (3) trails the durable last_applied (5).
+    storage
+        ._testonly_last_applied()
+        .store(&make_log_id(1, 0, 5))
+        .expect("store last_applied")
+        .wait()
+        .expect("wait");
+    storage
+        ._testonly_output_progress()
+        .store(&3)
+        .expect("store output_progress")
+        .wait()
+        .expect("wait");
+
+    uc_node::runtime::recovery::reconcile(&storage).expect("reconcile");
+    assert_eq!(storage._testonly_output_progress().load().unwrap(), Some(3)); // unchanged
 }
 
 #[tokio::test]
@@ -66,7 +119,10 @@ async fn reconcile_leaves_consistent_committed_untouched() {
 
     // committed.index (3) <= last_seq (5): no clamp.
     uc_node::runtime::recovery::reconcile(&storage).expect("reconcile");
-    assert_eq!(storage.read_committed().await.unwrap(), Some(make_log_id(1, 0, 3)));
+    assert_eq!(
+        storage.read_committed().await.unwrap(),
+        Some(make_log_id(1, 0, 3))
+    );
 }
 
 #[tokio::test]
@@ -77,7 +133,10 @@ async fn reconcile_preserves_committed_at_snapshot_floor_with_empty_log() {
     let dir = TempDir::new().unwrap();
     let mut storage = JournalLogStorage::open(dir.path()).expect("open");
     let snap = make_log_id(2, 0, 100);
-    storage.save_committed(Some(snap)).await.expect("save_committed");
+    storage
+        .save_committed(Some(snap))
+        .await
+        .expect("save_committed");
     storage.purge(snap).await.expect("purge"); // last_purged = snap, log empty
     assert_eq!(storage.read_committed().await.unwrap(), Some(snap));
 

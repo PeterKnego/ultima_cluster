@@ -22,6 +22,11 @@ use crate::raft::log_storage::JournalLogStorage;
 /// case, `committed` is clamped down to the durable floor — the greater of the
 /// log tail (`last_seq`) and the purge/snapshot point (`last_purged`); the node
 /// re-learns the true commit from the leader via normal Raft catch-up.
+///
+/// Finally, clamps `output_progress` down to the durable `last_applied` when it
+/// has raced ahead (the durable `last_applied` only advances at snapshot time,
+/// so it legitimately lags the per-output `output_progress` on a restart before
+/// the first snapshot). Outputs in the gap re-run on replay (at-least-once).
 pub fn reconcile(storage: &JournalLogStorage) -> Result<(), ClusterError> {
     let last_seq = storage.journal.last_seq();
     let last_purged = storage
@@ -38,9 +43,27 @@ pub fn reconcile(storage: &JournalLogStorage) -> Result<(), ClusterError> {
         )));
     }
 
-    // M5 invariant: output_progress must not race ahead of last_applied.
-    // If the output marker is past what's been applied, replay would skip
-    // committed-but-unoutput entries.
+    // M5: reconcile output_progress against the durable last_applied.
+    //
+    // The durable `last_applied` StableValue lags `output_progress`: in shmem
+    // mode it is only persisted at snapshot time (`SnapshotPolicy::LogsSinceLast`,
+    // default 5000), whereas `output_progress` is fsynced per committed output.
+    // So after a restart before the first snapshot, the durable `last_applied`
+    // can sit well below `output_progress` even though nothing is corrupt — the
+    // applied entries live in the log and openraft re-applies them on startup.
+    //
+    // Clamp `output_progress` down to the durable `last_applied`. After openraft
+    // replays the log, the output dispatcher re-drives `on_committed` for the
+    // (clamped, last_applied] gap — at-least-once, idempotent by the user's
+    // contract — so no committed-but-unoutput entry is ever skipped. Raising the
+    // marker (output_progress < last_applied) is the normal steady state and is
+    // left untouched.
+    //
+    // Cost note: durable `last_applied` advances only on snapshot install, so on
+    // a cold restart before the first snapshot the clamp can re-drive up to
+    // `snapshot_policy_logs_since_last` (default 5000) outputs. Correct (at-least-
+    // once) but a surprise for heavy side-effects; persisting `last_applied` more
+    // frequently would bound it — tracked as a follow-up.
     let last_applied_idx = storage
         .last_applied
         .load()
@@ -53,9 +76,18 @@ pub fn reconcile(storage: &JournalLogStorage) -> Result<(), ClusterError> {
         .map_err(|e| ClusterError::Recovery(format!("read output_progress: {e}")))?
         .unwrap_or(0);
     if output_progress > last_applied_idx {
-        return Err(ClusterError::Recovery(format!(
-            "output_progress ({output_progress}) > last_applied ({last_applied_idx}) — data dir corrupt"
-        )));
+        tracing::warn!(
+            output_progress,
+            last_applied = last_applied_idx,
+            "output_progress ahead of durable last_applied (snapshot-lag); clamping down — \
+             outputs in the gap re-run on replay (at-least-once)"
+        );
+        storage
+            .output_progress
+            .store(&last_applied_idx)
+            .map_err(|e| ClusterError::Recovery(format!("clamp output_progress: {e}")))?
+            .wait()
+            .map_err(|e| ClusterError::Recovery(format!("clamp output_progress wait: {e}")))?;
     }
 
     // Eventual-log / Consistent-committed inversion repair: a power loss can leave

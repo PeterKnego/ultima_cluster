@@ -185,6 +185,10 @@ impl JournalLogStorage {
     pub fn _testonly_snapshot_meta(&self) -> &StableValue<StoredSnapshotMeta> {
         &self.snapshot_meta
     }
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn _testonly_output_progress(&self) -> &StableValue<u64> {
+        &self.output_progress
+    }
 }
 
 // ---------------------------------------------------------------------------

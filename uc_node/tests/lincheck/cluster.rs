@@ -140,9 +140,10 @@ impl LinCluster {
             let data = Arc::new(TempDir::new().unwrap());
             let svc_data = Arc::new(TempDir::new().unwrap());
             let cfg = node_config(id, &instance, &data, *addr, peers.clone());
-            let task = tokio::spawn(async move {
-                NodeBuilder::new(cfg, RegisterSm::default()).start().await
-            });
+            let task =
+                tokio::spawn(
+                    async move { NodeBuilder::new(cfg, RegisterSm::default()).start().await },
+                );
             node_tasks.push(task);
             node_meta.push((id, *addr, instance, data, svc_data));
         }
@@ -210,7 +211,9 @@ impl LinCluster {
             nodes: tokio::sync::Mutex::new(nodes),
             _serial: serial,
         };
-        cluster.wait_for_stable_leader(Duration::from_secs(15)).await;
+        cluster
+            .wait_for_stable_leader(Duration::from_secs(15))
+            .await;
         cluster
     }
 
@@ -270,7 +273,10 @@ impl LinCluster {
                     None => agree = false,
                 }
             }
-            if agree && count >= 2 && let Some(l) = seen {
+            if agree
+                && count >= 2
+                && let Some(l) = seen
+            {
                 return l;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -343,6 +349,127 @@ impl LinCluster {
                 }
                 Err(other) => return ReadOutcome::Fatal(format!("{other:?}")),
             }
+        }
+    }
+
+    /// Kill the current leader's node + service (graceful), then restart the
+    /// node (rejoin via persisted data_dir) + a fresh service, and reconnect
+    /// its client (restart → new instance_id invalidates the old client).
+    /// `&self`: takes handles out under a brief lock, awaits teardown/restart
+    /// UNLOCKED, then re-locks to install — so workers aren't blocked on the lock
+    /// across the multi-second failover.
+    pub async fn kill_and_restart_leader(&self) {
+        let Some(lid) = self.leader_id().await else {
+            return;
+        };
+        let (idx, id, addr, instance, data, svc_data, peers, client, service, handle) = {
+            let mut nodes = self.nodes.lock().await;
+            let Some(i) = nodes.iter().position(|n| n.id == lid) else {
+                return;
+            };
+            let n = &mut nodes[i];
+            (
+                i,
+                n.id,
+                n.addr,
+                n.instance_dir.clone(),
+                n.data_dir.clone(),
+                n.svc_data_dir.clone(),
+                n.peers.clone(),
+                n.client.take(),
+                n.service.take(),
+                n.handle.take(),
+            )
+        };
+        // Teardown unlocked.
+        if let Some(c) = client
+            && let Ok(c) = Arc::try_unwrap(c)
+        {
+            let _ = c.shutdown().await;
+        }
+        if let Some(s) = service {
+            let _ = s.shutdown().await;
+        }
+        if let Some(h) = handle {
+            // Reuse-the-persisted-data-dir rejoin (the design intent): on restart
+            // the node re-applies the replayed log and recovery clamps the durable
+            // `output_progress` (which leads `last_applied` until the first
+            // snapshot) down to `last_applied`, re-running outputs at-least-once.
+            // See uc_node/src/runtime/recovery.rs.
+            let _ = h.shutdown().await;
+        }
+        drop(instance); // retire the old shmem instance_dir (fresh one below)
+        // Survivors re-elect (quorum 2/3 holds).
+        self.wait_for_stable_leader(Duration::from_secs(15)).await;
+        // Restart the killed node against its PERSISTED raft data_dir (so it
+        // rejoins the existing 3-node membership under the same node_id) but a
+        // FRESH shmem instance_dir. The shmem control/ring files (cnc.dat etc.)
+        // are volatile per-process IPC, not cluster state; reusing the old
+        // instance_dir would leave a stale cnc.dat that makes `wait_for_cnc`
+        // return before the new node has reinitialized it, racing the service
+        // handshake. A clean instance_dir avoids that.
+        let instance = Arc::new(TempDir::new().unwrap());
+        let cfg = node_config(id, &instance, &data, addr, peers);
+        // Node start() blocks internally on the service handshake (waits for the
+        // service to reach Ready before returning), so we must spawn start() as a
+        // task, bring the service up once cnc.dat appears, THEN collect the node
+        // handle — mirroring the start_3 boot dance.
+        let cnc_instance = instance.clone();
+        let node_task =
+            tokio::spawn(async move { NodeBuilder::new(cfg, RegisterSm::default()).start().await });
+        wait_for_cnc(cnc_instance.path(), Duration::from_secs(10)).await;
+        let new_service = spawn_service(instance.path(), svc_data.path()).await;
+        let new_handle = tokio::time::timeout(Duration::from_secs(30), node_task)
+            .await
+            .unwrap_or_else(|_| panic!("node {id} restart timed out"))
+            .expect("node restart task panic")
+            .unwrap_or_else(|e| panic!("node {id} restart: {e:?}"));
+        let new_client = Arc::new(
+            Client::connect(instance.path(), APP_ID)
+                .await
+                .expect("client reconnect after restart"),
+        );
+        {
+            let mut nodes = self.nodes.lock().await;
+            let n = &mut nodes[idx];
+            n.instance_dir = instance;
+            n.handle = Some(new_handle);
+            n.service = Some(new_service);
+            n.client = Some(new_client);
+        }
+        self.wait_for_stable_leader(Duration::from_secs(15)).await;
+    }
+
+    /// Crash the current leader's SERVICE only (node stays up); the service
+    /// watcher transfers leadership. Then restart a fresh service on the same
+    /// instance_dir so that node is fully functional again.
+    pub async fn crash_and_restart_leader_service(&self) {
+        let Some(lid) = self.leader_id().await else {
+            return;
+        };
+        let (idx, instance, svc_data, service) = {
+            let mut nodes = self.nodes.lock().await;
+            let Some(i) = nodes.iter().position(|n| n.id == lid) else {
+                return;
+            };
+            let n = &mut nodes[i];
+            (
+                i,
+                n.instance_dir.clone(),
+                n.svc_data_dir.clone(),
+                n.service.take(),
+            )
+        };
+        if let Some(s) = service {
+            let _ = s.shutdown().await;
+        }
+        // Leadership transfers away from the stalled node (m3 path).
+        self.wait_for_stable_leader(Duration::from_secs(15)).await;
+        // Restart the service so the node can serve again.
+        let new_service = spawn_service(instance.path(), svc_data.path()).await;
+        {
+            let mut nodes = self.nodes.lock().await;
+            nodes[idx].service = Some(new_service);
         }
     }
 
