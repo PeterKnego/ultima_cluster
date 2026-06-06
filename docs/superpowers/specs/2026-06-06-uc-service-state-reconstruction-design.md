@@ -294,6 +294,70 @@ The service is gated (not yet caught up) so this is exclusive — no concurrent 
 2. Service `install_snapshot(Cursor over region)`, acks on `control_to_node`.
 3. Node then log-replays the tail `(snapshot_index, node_frontier]` per §2.
 
+## 5a. Phase 2a concrete design (functional path, no trait change — 2026-06-06)
+
+Implementation-shape decisions for 2a, grounded in the snapshot-machinery
+investigation. (2b later swaps the blocking build for the §6 freeze/stream trait.)
+
+**Command channel — a dedicated SPSC control-ring file PAIR** (not the cnc
+`control_to_service`/`control_to_node` rings, which need the deferred sub-mmap MPSC
+attach API). `service/snapshot.ring` (node→service) + `service/snapshot_resp.ring`
+(service→node), created in `service_link.rs` + opened in `attach.rs` exactly like the
+apply/query/output ring pairs. The service spawns a **snapshot-control loop** thread
+that consumes `snapshot.ring`. This is the same lean choice as Phase 1's channel A:
+reuse the established per-stream-ring-file pattern, avoid the deferred cnc-ring infra.
+
+**Frames** (`uc_protocol/src/frames/snapshot.rs`): reuse `MSG_TYPE_BUILD_SNAPSHOT`
+(100) + `MSG_TYPE_SNAPSHOT_BUILT` (101); ADD `MSG_TYPE_INSTALL_SNAPSHOT` +
+`MSG_TYPE_SNAPSHOT_INSTALLED` (next free constants). `header_extra` carries the
+relevant `last_log_id` index (built index for BUILT; install target for INSTALL).
+
+**`snapshot.region`** — separate file `service/snapshot.region`. A small
+`SnapshotRegion` helper: write = build bytes to a `Vec`, `ftruncate` the file to
+`HEADER_LEN + len`, write `{magic, format_ver, byte_len, last_log_id (idx+term),
+crc32}` + bytes; read = open, validate header+crc, return the bytes (or a `Cursor`).
+**Cross-process ordering comes from the control-ring ack** (writer fills region →
+sends BUILT/INSTALL → reader reads region only after receiving the frame), so no
+atomic fencing on the region itself. One op at a time (request/ack is serial).
+
+**Service-side snapshot-control loop** (new thread, shares the `Arc<RwLock<S>>`):
+- on `BUILD_SNAPSHOT`: `sm.read()`, **blocking** `build_snapshot(&mut Vec)` (2a
+  accepts the apply stall here; 2b removes it), write the region, reply
+  `SNAPSHOT_BUILT{built_index}`.
+- on `INSTALL_SNAPSHOT`: `sm.write()`, `install_snapshot(Cursor over region)`, reply
+  `SNAPSHOT_INSTALLED{new_last_applied}`. The `RwLock<S>` serializes build/install
+  against `apply()`.
+
+**Node-side BUILD** (`ShmemSnapshotBuilder::build_snapshot`, currently degenerate):
+send `BUILD_SNAPSHOT` on `snapshot.ring`, await `SNAPSHOT_BUILT`, read
+`snapshot.region`, return the real bytes as the openraft `Snapshot`
+(`Cursor<Vec<u8>>`) + persist via the existing `snapshot_meta`/on-disk store. Now
+openraft snapshots reflect real service state ⇒ **log purge is safe**, and the same
+bytes feed the node→node InstallSnapshot RPC. Runs on openraft's snapshot-builder
+task (separate from the apply worker; uses the snapshot ring, not the apply ring).
+
+**Node-side INSTALL** (in `drive_catchup`, replacing the `NeedsSnapshot` error): write
+the node's persisted snapshot bytes into `snapshot.region`, send `INSTALL_SNAPSHOT`,
+await `SNAPSHOT_INSTALLED`, then set the effective `service_last = snapshot_index`
+(the snapshot's `last_log_id.index`, from `snapshot_meta`) and **replay the tail
+`(snapshot_index, up_to]`** via the existing apply-ring replay loop. Ordering: the
+install ack precedes any tail apply publish, so the service installs before it
+consumes tail entries.
+
+**`plan_replay` extension:** `NeedsSnapshot` now carries the `snapshot_index` to
+replay from after install (or `drive_catchup` reads it from `snapshot_meta`). Keep
+the variant; just wire its consumer to install-then-replay instead of erroring.
+
+**Concurrency note:** node-side, BUILD (snapshot-builder task, snapshot ring) and
+apply (SM worker, apply ring) use disjoint rings → no node-side contention. Service
+-side, the `RwLock<S>` is the single serialization point across apply/build/install.
+
+**Open items for the plan / a spike:** (a) is the node's `build_snapshot` call path
+`async` enough to do ring send + await without blocking openraft's snapshot worker
+loop (it returns `Snapshot` from an async fn — confirm); (b) the snapshot-control
+loop's interaction with `apply_loop` shutdown ordering (join on `Service::shutdown`);
+(c) sizing/cleanup of `snapshot.region` across repeated ops (truncate-on-write).
+
 ## 6. `StateMachine` trait change
 
 Breaking change (all impls updated): replace `build_snapshot(&self, dst)` with a
