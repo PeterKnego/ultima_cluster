@@ -17,6 +17,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root
 
+# Resolve cargo's target dir (honors $CARGO_TARGET_DIR and .cargo/config.toml's
+# build.target-dir), falling back to ./target if cargo/jq are unavailable.
+resolve_target_dir() {
+  local d="${CARGO_TARGET_DIR:-}"
+  if [[ -z "$d" ]] && command -v cargo >/dev/null && command -v jq >/dev/null; then
+    d="$(cargo metadata --format-version 1 --no-deps 2>/dev/null | jq -r '.target_directory // empty')"
+  fi
+  printf '%s' "${d:-./target}"
+}
+TARGET_DIR="$(resolve_target_dir)"
+
 APP_ID="${APP_ID:-uc-bench-3node}"
 DATA_ROOT="${DATA_ROOT:-/tmp/uc3}"        # journal (raft log)
 IPC_ROOT="${IPC_ROOT:-/tmp/uc3-ipc}"      # shmem rings
@@ -29,8 +40,8 @@ rm -rf "$DATA_ROOT" "$IPC_ROOT"; mkdir -p "$DATA_ROOT" "$IPC_ROOT" "$OUT_DIR"
 
 cargo build -p uc_autobench --bin uc-node-launch --bin commit-path-load --release
 
-NODE_BIN=./target/release/uc-node-launch
-LOAD_BIN=./target/release/commit-path-load
+NODE_BIN="$TARGET_DIR/release/uc-node-launch"
+LOAD_BIN="$TARGET_DIR/release/commit-path-load"
 
 P1=127.0.0.1:7001; P2=127.0.0.1:7002; P3=127.0.0.1:7003
 PEERS=(--peer "1@$P1" --peer "2@$P2" --peer "3@$P3")

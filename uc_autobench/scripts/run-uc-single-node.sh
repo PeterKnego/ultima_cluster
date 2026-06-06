@@ -5,6 +5,18 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."   # repo root
 
+# Resolve cargo's target dir (honors $CARGO_TARGET_DIR and .cargo/config.toml's
+# build.target-dir), falling back to ./target if cargo/jq are unavailable.
+resolve_target_dir() {
+  local d="${CARGO_TARGET_DIR:-}"
+  if [[ -z "$d" ]] && command -v cargo >/dev/null && command -v jq >/dev/null; then
+    d="$(cargo metadata --format-version 1 --no-deps 2>/dev/null | jq -r '.target_directory // empty')"
+  fi
+  printf '%s' "${d:-./target}"
+}
+TARGET_DIR="$(resolve_target_dir)"
+BIN="$TARGET_DIR/release/commit-path-load"
+
 OUT_DIR="${OUT_DIR:-bench-out}"
 mkdir -p "$OUT_DIR"
 RATES="${RATES:-100,500,1000,2000,5000,10000,20000}"
@@ -13,7 +25,7 @@ PAYLOAD="${PAYLOAD:-64}"
 
 build() { cargo build -p uc_autobench --bin commit-path-load --release; }
 run() { # $1=config-label $2=tmpdir
-  TMPDIR="$2" ./target/release/commit-path-load \
+  TMPDIR="$2" "$BIN" \
     --config "$1" --rates "$RATES" --inflight "$INFLIGHT" \
     --payload-bytes "$PAYLOAD" --out "$OUT_DIR/uc_$1.csv"
 }

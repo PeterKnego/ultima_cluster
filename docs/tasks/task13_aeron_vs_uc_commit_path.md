@@ -32,9 +32,9 @@ corrected "poll-sleep, not fsync" verdict from the field.
   64-byte payload, `KvSm` apply, `log_durability` left at the fixture default.
   Two journal targets: **ext** (real disk, `TMPDIR=/home/claude/...`) and
   **tmpfs** (`/dev/shm`). Rate ladder 100→20000/s × in-flight {1,8,32,128}.
-  Reproduce: `RATES=... INFLIGHT=... TMPDIR=<ext-path> ./<target>/release/commit-path-load --config single_disk ...`
-  (the committed `run-uc-single-node.sh` assumes `./target/`; this host relocates
-  `CARGO_TARGET_DIR`, so the driver was invoked directly).
+  Reproduce: `RATES=... INFLIGHT=... TMPDIR=<ext-path> bash uc_autobench/scripts/run-uc-single-node.sh`
+  (the script resolves the cargo target dir via `cargo metadata`, so it works
+  under a relocated `CARGO_TARGET_DIR`).
   **Note:** on this host both `/tmp` and `/dev/shm` are tmpfs — the "disk" run
   must point `TMPDIR` at a real ext path or it silently measures tmpfs.
 
