@@ -92,11 +92,25 @@ PR** (Phase 2 is large enough to warrant separation, and each phase is
 independently shippable + testable). They are sequenced; later phases build on
 earlier ones.
 
-1. **Phase 1 — handshake + log-replay catch-up.** Channel A, the
-   `reconstruct` driver, catch-up apply gating. Fixes the common-case contract gap
-   (service-only restart / cold reattach when the gap is still in the log). Small:
-   one cnc read, one new node-side module, one service-side write, **no wire-format
-   change** (`ApplyFrame` already carries `{log_index, payload}`).
+1. **Phase 1 — handshake + log-replay catch-up.** Channel A, the `reconstruct`
+   driver, log-replay. **No wire-format change** (`ApplyFrame` already carries
+   `{log_index, payload}`). Split into two plans/PRs along the attach-scenario seam
+   discovered during planning:
+   - **Phase 1a — cold-start / initial-attach catch-up.** Catch-up runs at node
+     startup in the builder, *before* `finish()` starts openraft — so there is **no
+     concurrent live apply and no gate needed**. The service publishes its
+     `last_applied` (channel A); the node replays `(service_last_applied,
+     node_frontier]` from the journal before openraft begins. Defers to Phase 2 (an
+     explicit error for now) if the gap is below the purge boundary. Fully additive.
+   - **Phase 1b — mid-life reattach reconstruction.** The task12 gap: service
+     crashes and reconnects while the node keeps running. This is **not** additive —
+     today the node's `apply()` parks indefinitely on the apply rings and a
+     reattached service resumes the persistent SPSC cursor mid-stream (which is
+     exactly what loses in-memory state). 1b redesigns the reconnect path:
+     reattach/epoch detection, **apply-ring cursor reset** to feed from
+     `service_last_applied+1`, abandoning the parked apply, and the **gate** holding
+     live applies until catch-up completes. Needs its own focused design pass before
+     planning.
 2. **Phase 2 — real snapshot path** via `snapshot.region` (§5). Both directions:
    BUILD (service→node) and INSTALL (node→service). The bulk of the effort; also
    closes a latent safe-purge hole (see §5).
