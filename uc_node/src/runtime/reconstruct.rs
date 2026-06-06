@@ -4,32 +4,36 @@
 //! committed entries `(service_last_applied, node_frontier]` from the journal to
 //! the reattached (possibly fresh in-memory) service. `node_frontier` is the
 //! node's LIVE in-memory applied index — the range openraft will not re-drive.
+//!
+//! The pure replay decision lives in [`plan_replay`], which the live apply-path
+//! (`state_machine_shmem::drive_catchup`) calls directly. The `NeedsSnapshot`
+//! branch is surfaced as a loud error in Phase 1 and wired to snapshot-install
+//! in Phase 2.
 
-// Phase-1 scaffolding: the pure catch-up-source decision is exercised by the
-// unit tests below; the live apply-path (`state_machine_shmem::drive_catchup`)
-// computes the replay range directly, so the lib build has no caller yet. The
-// `NeedsSnapshot` branch is wired in Phase 2.
-#[allow(dead_code)]
+/// What to replay to bring a reattached service up to `up_to` (the node's live
+/// frontier / the parked entry). The replay ALWAYS includes `up_to` — it must be
+/// (re-)applied and acked even if the service claims to be at/above it (idempotent;
+/// log_index is the idempotency key).
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum CatchupSource {
-    Nothing,
-    LogReplay { from: u64, to: u64 },
-    NeedsSnapshot { service_last_applied: u64, last_purged: u64 },
+pub(crate) enum ReplayPlan {
+    /// Replay committed entries with index in `(from, to]` from the journal.
+    Replay { from: u64, to: u64 },
+    /// The gap is below the purge boundary; needs snapshot-install (Phase 2).
+    NeedsSnapshot { service_last: u64, last_purged: u64 },
 }
 
-/// Pure decision. `last_purged` is the highest purged log index (0 if none).
-#[allow(dead_code)]
-pub(crate) fn decide_catchup_source(
-    service_last_applied: u64,
-    node_frontier: u64,
-    last_purged: u64,
-) -> CatchupSource {
-    if service_last_applied >= node_frontier {
-        CatchupSource::Nothing
-    } else if service_last_applied < last_purged {
-        CatchupSource::NeedsSnapshot { service_last_applied, last_purged }
+/// Pure decision. `service_last` = the reattached service's reported last_applied,
+/// `up_to` = the node's live frontier (the parked entry, always >= 1),
+/// `last_purged` = highest purged log index (0 if none).
+pub(crate) fn plan_replay(service_last: u64, up_to: u64, last_purged: u64) -> ReplayPlan {
+    debug_assert!(up_to >= 1, "up_to is a Normal entry index, always >= 1");
+    if service_last < last_purged {
+        ReplayPlan::NeedsSnapshot { service_last, last_purged }
     } else {
-        CatchupSource::LogReplay { from: service_last_applied, to: node_frontier }
+        // Always include up_to: if the service is already at/above it, still
+        // replay just up_to (idempotent re-apply of the parked entry).
+        let from = if service_last >= up_to { up_to - 1 } else { service_last };
+        ReplayPlan::Replay { from, to: up_to }
     }
 }
 
@@ -37,19 +41,21 @@ pub(crate) fn decide_catchup_source(
 mod tests {
     use super::*;
     #[test]
-    fn nothing_when_current_or_ahead_or_empty() {
-        assert_eq!(decide_catchup_source(10, 10, 0), CatchupSource::Nothing);
-        assert_eq!(decide_catchup_source(12, 10, 0), CatchupSource::Nothing);
-        assert_eq!(decide_catchup_source(0, 0, 0), CatchupSource::Nothing);
+    fn replays_full_range_for_fresh_service() {
+        assert_eq!(plan_replay(0, 5, 0), ReplayPlan::Replay { from: 0, to: 5 });
+        assert_eq!(plan_replay(3, 5, 0), ReplayPlan::Replay { from: 3, to: 5 });
     }
     #[test]
-    fn log_replay_above_purge_incl_boundary() {
-        assert_eq!(decide_catchup_source(3, 10, 0), CatchupSource::LogReplay { from: 3, to: 10 });
-        assert_eq!(decide_catchup_source(5, 10, 5), CatchupSource::LogReplay { from: 5, to: 10 });
+    fn always_includes_up_to_when_service_at_or_above() {
+        assert_eq!(plan_replay(5, 5, 0), ReplayPlan::Replay { from: 4, to: 5 });
+        assert_eq!(plan_replay(7, 5, 0), ReplayPlan::Replay { from: 4, to: 5 });
+    }
+    #[test]
+    fn replayable_at_purge_boundary() {
+        assert_eq!(plan_replay(3, 5, 3), ReplayPlan::Replay { from: 3, to: 5 });
     }
     #[test]
     fn needs_snapshot_below_purge() {
-        assert_eq!(decide_catchup_source(2, 10, 5),
-            CatchupSource::NeedsSnapshot { service_last_applied: 2, last_purged: 5 });
+        assert_eq!(plan_replay(2, 5, 5), ReplayPlan::NeedsSnapshot { service_last: 2, last_purged: 5 });
     }
 }

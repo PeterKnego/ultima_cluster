@@ -543,12 +543,23 @@ async fn await_apply_resp(
 /// the already-held inner lock (no concurrent apply). Returns `(resp_for_up_to,
 /// reconciled_epoch)`. An outer loop restarts if the service reattaches AGAIN
 /// mid-catch-up.
+///
+/// Safety: the re-applied response captured for `up_to` is what we hand back to
+/// openraft's responder for the parked entry. This is safe because the node
+/// broadcasts to the client only AFTER `await_apply_resp`/catch-up returns — a
+/// resp the node never consumed (e.g. from the dead incarnation) was never
+/// observed by any client, and re-applying `up_to` is idempotent by log_index.
+///
+/// Note: `iter_range` is eager — it buffers the whole `(from, up_to]` span into a
+/// Vec. Fine for Phase 1; it becomes bounded once the Phase 2 snapshot cutover
+/// lands (catch-up below the purge boundary installs a snapshot instead).
 async fn drive_catchup<S: StateMachine>(
     g: &ShmemInner<S>,
     shutdown: &AtomicBool,
     up_to_log_id: RaftLogId,
 ) -> Result<(Bytes, u64), io::Error> {
     let up_to = up_to_log_id.index;
+    debug_assert!(up_to >= 1, "up_to is a Normal entry index, always >= 1");
     let ss_ptr = g.service_status_ptr;
     let last_purged = g
         .last_purged
@@ -562,33 +573,30 @@ async fn drive_catchup<S: StateMachine>(
         let epoch = epoch_of(ss_ptr);
         let service_last = service_last_of(ss_ptr);
 
-        if service_last < last_purged {
-            return Err(io::Error::other(format!(
-                "reconstruct: service at {service_last} below purge boundary {last_purged}; \
-                 snapshot-install is Phase 2"
-            )));
-        }
+        // Decide the replay span. The plan always includes up_to (the parked
+        // entry must be applied + acked, idempotently — log_index is the key).
+        // Fresh in-memory service => service_last == 0.
+        let (from, to) = match crate::runtime::reconstruct::plan_replay(service_last, up_to, last_purged) {
+            crate::runtime::reconstruct::ReplayPlan::NeedsSnapshot { service_last, last_purged } => {
+                return Err(io::Error::other(format!(
+                    "reconstruct: service at {service_last} below purge boundary {last_purged}; \
+                     snapshot-install is Phase 2"
+                )));
+            }
+            crate::runtime::reconstruct::ReplayPlan::Replay { from, to } => (from, to),
+        };
 
         // Drop any stale resps left by the dead incarnation (node owns the resp
         // ring's consumer_position).
         g.apply_resp_consumer.lock().discard_backlog();
 
-        // Replay (from, up_to], always including up_to (the parked entry must be
-        // applied + acked). Fresh in-memory service => service_last == 0. A
-        // self-persisting service already at/above up_to => replay just up_to
-        // (idempotent re-apply; log_index is the idempotency key).
-        let from = if service_last >= up_to {
-            up_to - 1
-        } else {
-            service_last
-        };
-
         let iter = g
             .journal
-            .iter_range((from + 1)..(up_to + 1))
+            .iter_range((from + 1)..(to + 1))
             .map_err(|e| io::Error::other(format!("reconstruct: iter_range: {e}")))?;
 
         let mut last_resp = Bytes::new();
+        let mut saw_up_to = false;
         let mut restart = false;
         for record in iter {
             let (seq, _meta, payload) = record
@@ -618,6 +626,7 @@ async fn drive_catchup<S: StateMachine>(
                 ApplyOutcome::Resp(b) => {
                     if seq == up_to {
                         last_resp = b;
+                        saw_up_to = true;
                     }
                 }
                 ApplyOutcome::Reattach => {
@@ -628,6 +637,12 @@ async fn drive_catchup<S: StateMachine>(
         }
         if restart {
             continue;
+        }
+        if !saw_up_to {
+            return Err(io::Error::other(format!(
+                "reconstruct: parked entry {up_to} missing from journal during catch-up \
+                 (gap/corruption)"
+            )));
         }
         return Ok((last_resp, epoch));
     }
