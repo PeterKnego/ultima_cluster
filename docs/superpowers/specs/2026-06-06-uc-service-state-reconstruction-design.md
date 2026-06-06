@@ -178,10 +178,17 @@ Grounded in the SPSC ring + apply-pipeline internals:
 
 ### Open implementation risks (resolve in the plan / a spike)
 
-- **Waking `await_apply_resp` on epoch change.** The await currently parks on
-  `bridge.notified().await`. It must also wake on the epoch signal — needs a
-  select over (resp-ring notify, epoch notify) or a periodic epoch poll. A small
-  feasibility spike on this wakeup is warranted before committing the full plan.
+- **Waking `await_apply_resp` on epoch change — RESOLVED by spike (2026-06-06).**
+  No new wakeup plumbing or `select!` cancel-safety is needed. `NotifyBridge`'s
+  parker fires `notify_one` at least every `PARK_CEIL` (2 ms) as a backstop
+  (`ring_bridge.rs` module doc: "correctness never depends on the wake"), so the
+  await loop just adds an `if epoch_changed() { return Reattach }` check at the top
+  and rides the existing backstop. A throwaway spike (real `SpscRing` +
+  `NotifyBridge`, epoch bumped with zero ring traffic) detected the change in
+  **~8 ms** (bump @5 ms + ~one backstop) — fine for a recovery path. The epoch
+  atomic is the source of truth; the Notify is only for liveness, so a lost wakeup
+  is non-fatal (the next backstop re-checks). An optional reattach `Notify` could
+  cut the latency but is not required for correctness.
 - **Idempotent re-apply of N for self-persisting SMs.** The dead incarnation may have
   applied N before crashing. Re-applying N is safe for `StoreStateMachine` (version
   pinned to `log_index`) and for in-memory SMs (deterministic); document the
