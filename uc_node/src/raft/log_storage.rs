@@ -189,6 +189,14 @@ impl JournalLogStorage {
     pub fn _testonly_output_progress(&self) -> &StableValue<u64> {
         &self.output_progress
     }
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn _testonly_journal(&self) -> Arc<Journal> {
+        self.journal.clone()
+    }
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn _testonly_last_purged_arc(&self) -> Arc<StableValue<RaftLogId>> {
+        self.last_purged.clone()
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -41,6 +41,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::ipc::ring_bridge::NotifyBridge;
+use uc_protocol::cnc::ServiceStatus;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -60,6 +61,31 @@ use ultima_journal::StableValue;
 use super::log_storage::{LogStorageHandles, StoredSnapshotMeta};
 use super::state_machine::StoredSnapshot;
 use super::{RaftLogId, RaftSnapshot, RaftSnapshotMeta, RaftStoredMembership, TypeConfig};
+
+/// `Send`/`Sync` wrapper for a `*const ServiceStatus` into the cnc mmap. The cnc
+/// mmap is owned by the node `Instance`/handle and outlives the adapter; all
+/// `ServiceStatus` fields are atomics (so `Sync`) and the node only reads them.
+#[derive(Clone, Copy)]
+pub(crate) struct ServiceStatusPtr(pub(crate) *const ServiceStatus);
+// SAFETY: see doc — points into a Sync, longer-lived mmap; read-only.
+unsafe impl Send for ServiceStatusPtr {}
+unsafe impl Sync for ServiceStatusPtr {}
+
+/// Current service epoch (0 if no pointer). SAFETY: live cnc mmap.
+fn epoch_of(p: Option<ServiceStatusPtr>) -> u64 {
+    match p {
+        Some(ServiceStatusPtr(s)) => unsafe { (*s).service_epoch.load(Ordering::Acquire) },
+        None => 0,
+    }
+}
+
+/// The reattached service's reported last_applied (0 if no pointer). SAFETY: live cnc mmap.
+fn service_last_of(p: Option<ServiceStatusPtr>) -> u64 {
+    match p {
+        Some(ServiceStatusPtr(s)) => unsafe { (*s).last_applied.load(Ordering::Acquire) },
+        None => 0,
+    }
+}
 
 const FULL_BACKOFF: Duration = Duration::from_micros(100);
 
@@ -112,15 +138,27 @@ pub(crate) struct ShmemInner<S: StateMachine> {
     /// forwarded here after apply_resp returns. `try_send` keeps apply from
     /// blocking on a full output channel — the replay sweep covers any gaps.
     pub(crate) output_chan_tx: tokio::sync::mpsc::Sender<(u64, Bytes)>,
+    /// Pointer to the cnc ServiceStatus (epoch + last_applied). None in tests.
+    pub(crate) service_status_ptr: Option<ServiceStatusPtr>,
+    /// Epoch last reconciled by reconstruction; a change means a service reattach.
+    pub(crate) last_seen_epoch: u64,
+    /// Journal handle for replaying committed entries during catch-up.
+    pub(crate) journal: Arc<ultima_journal::Journal>,
+    /// Purge boundary, for the below-purge -> NeedsSnapshot (Phase 2) decision.
+    pub(crate) last_purged: Arc<StableValue<RaftLogId>>,
 }
 
 impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
+    #[allow(private_interfaces)] // ServiceStatusPtr is pub(crate); fn is pub(crate) in practice
     pub fn new(
         sm: S,
         handles: LogStorageHandles,
         apply_producer: SpscProducer,
         apply_resp_consumer: SpscConsumer,
         output_chan_tx: tokio::sync::mpsc::Sender<(u64, Bytes)>,
+        journal: Arc<ultima_journal::Journal>,
+        last_purged: Arc<StableValue<RaftLogId>>,
+        service_status_ptr: Option<ServiceStatusPtr>,
     ) -> Result<Self, crate::ClusterError> {
         // Recover the framework-durable values; skip the user-side
         // cross-check (see module docs).
@@ -174,6 +212,7 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
         let apply_resp_bridge =
             NotifyBridge::spawn(apply_resp_consumer.wait_handle(), "apply_resp");
 
+        let last_seen_epoch = epoch_of(service_status_ptr);
         Ok(Self {
             inner: Arc::new(TokioMutex::new(ShmemInner {
                 sm,
@@ -187,6 +226,10 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
                 apply_resp_consumer: PlMutex::new(apply_resp_consumer),
                 apply_resp_bridge,
                 output_chan_tx,
+                service_status_ptr,
+                last_seen_epoch,
+                journal,
+                last_purged,
             })),
             shutdown: Arc::new(AtomicBool::new(false)),
         })
