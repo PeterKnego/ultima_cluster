@@ -1,5 +1,18 @@
 # Service-State Reconstruction — Phase 1a (cold-start catch-up) Implementation Plan
 
+> **⚠️ SUPERSEDED (2026-06-06) — DO NOT IMPLEMENT.** Execution of this plan
+> (Units 1-3 built + reviewed green) surfaced that its premise is a mirage:
+> **openraft already reconstructs a fresh in-memory service on cold restart** when
+> no snapshot exists (it re-applies `(durable_applied, committed]`, and durable
+> `last_applied` only advances at snapshot cadence). So this plan's cold-start
+> log-replay path is unreachable/inert (catch-up = `Nothing`), and its integration
+> test would have passed via openraft, not via the new code. The real task12 gap is
+> **mid-life reattach**, now Phase 1 in the spec. The handshake channel + catch-up
+> driver this plan prototyped are sound and will be re-derived in the reattach
+> context. Retained as the record of how the decomposition was corrected. See the
+> spec's §2 callout and §3 for the revised phasing. The feature branch was reset to
+> main; nothing from this plan is merged.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** At node startup, reconstruct a fresh/recovered service's in-memory state machine by replaying committed log entries `(service_last_applied, node_frontier]` from the journal before openraft begins live applies.

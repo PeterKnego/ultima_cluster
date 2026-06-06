@@ -45,7 +45,21 @@ openraft only ever drives the *live* apply frontier forward; rebuilding a laggin
 service from history is the node's job, sourced from the journal/snapshot, gated so
 live applies never overtake catch-up.
 
-Sequence on (re)attach:
+> **What openraft already handles (do not rebuild) — corrected 2026-06-06.**
+> The durable `last_applied` `StableValue` only advances at **snapshot cadence**,
+> not per-apply (`state_machine.rs` / `recovery.rs`). On a **full cold restart with
+> no snapshot yet**, openraft recovers `committed` from the journal, sees it exceeds
+> the durable `applied`, and **re-applies `(applied, committed]` through the normal
+> apply path** — which reconstructs a fresh in-memory service for free. So cold-start
+> reconstruction is **already correct when no snapshot has been taken**; the only
+> cold-start gap is when a snapshot exists and the prefix is purged (→ Phase 2
+> snapshot-install). The node-driven catch-up below is therefore meaningful **only
+> when `node_frontier` (the node's *live in-memory* applied index) is ahead of the
+> service AND openraft will not re-drive that range** — i.e. the **mid-life reattach**
+> case (service crashes and reconnects while the node keeps running and stays at its
+> in-memory frontier). That is the real task12 gap and the primary target of Phase 1.
+
+Sequence on (re)attach (the mid-life reattach case):
 
 1. **Service attaches** (existing `attach.rs` flow). Before flipping `READY`, it
    reads its SM's `last_applied()` (in-memory → `None`/`0`; persistent → its durable
@@ -88,33 +102,36 @@ Sequence on (re)attach:
 ## 3. Phasing
 
 All phases are in scope. **Each phase is its own implementation plan and its own
-PR** (Phase 2 is large enough to warrant separation, and each phase is
-independently shippable + testable). They are sequenced; later phases build on
-earlier ones.
+PR.** Sequenced; later phases build on earlier ones.
 
-1. **Phase 1 — handshake + log-replay catch-up.** Channel A, the `reconstruct`
-   driver, log-replay. **No wire-format change** (`ApplyFrame` already carries
-   `{log_index, payload}`). Split into two plans/PRs along the attach-scenario seam
-   discovered during planning:
-   - **Phase 1a — cold-start / initial-attach catch-up.** Catch-up runs at node
-     startup in the builder, *before* `finish()` starts openraft — so there is **no
-     concurrent live apply and no gate needed**. The service publishes its
-     `last_applied` (channel A); the node replays `(service_last_applied,
-     node_frontier]` from the journal before openraft begins. Defers to Phase 2 (an
-     explicit error for now) if the gap is below the purge boundary. Fully additive.
-   - **Phase 1b — mid-life reattach reconstruction.** The task12 gap: service
-     crashes and reconnects while the node keeps running. This is **not** additive —
-     today the node's `apply()` parks indefinitely on the apply rings and a
-     reattached service resumes the persistent SPSC cursor mid-stream (which is
-     exactly what loses in-memory state). 1b redesigns the reconnect path:
-     reattach/epoch detection, **apply-ring cursor reset** to feed from
-     `service_last_applied+1`, abandoning the parked apply, and the **gate** holding
-     live applies until catch-up completes. Needs its own focused design pass before
-     planning.
+> **Decomposition corrected 2026-06-06** (after an aborted "Phase 1a cold-start
+> log-replay" attempt — see `…/plans/2026-06-06-uc-service-state-reconstruction-phase1a.md`,
+> now SUPERSEDED). That attempt revealed cold-start is already handled by openraft
+> (§2 callout), so a standalone cold-start log-replay phase was a mirage. The real
+> task12 gap is **mid-life reattach**, which is now Phase 1.
+
+1. **Phase 1 — mid-life reattach reconstruction.** The task12 gap: a service
+   crashes and reconnects while the node keeps running. **Not additive** — today the
+   node's `apply()` parks indefinitely on the apply rings and a reattached service
+   resumes the persistent SPSC cursor mid-stream (exactly what loses in-memory
+   state). Reuses the **channel-A handshake** (service publishes `last_applied`) and
+   the **node-driven catch-up driver** (`decide_catchup_source` + replay over the
+   apply ring) — both prototyped in the aborted attempt and to be re-derived here in
+   the reattach context. Adds the reconnect-path redesign: **reattach/epoch
+   detection**, **apply-ring cursor reset** to feed from `service_last_applied+1`,
+   abandoning the parked apply, and the **gate** holding live applies until catch-up
+   completes. `node_frontier` is the node's *live in-memory* applied index (the value
+   openraft will not re-drive). **Needs a focused design pass on the reconnect
+   mechanics (cursor reset is the crux) before planning.** No wire-format change.
 2. **Phase 2 — real snapshot path** via `snapshot.region` (§5). Both directions:
-   BUILD (service→node) and INSTALL (node→service). The bulk of the effort; also
-   closes a latent safe-purge hole (see §5).
+   BUILD (service→node) and INSTALL (node→service). Closes the cold-start+snapshot
+   gap, the below-purge reattach case, and the latent safe-purge hole (see §5). The
+   bulk of the effort.
 3. **Phase 3 — contract flip + parity cleanups + proof** (§6, §8).
+
+**Not a phase (already works):** cold-start reconstruction when no snapshot has been
+taken — openraft re-applies `(applied, committed]` itself (§2 callout). A loud error
+on the unsupported cold-start+snapshot+in-memory case lands naturally with Phase 2.
 
 ## 4. Channel: how the node learns `service_last_applied` (Decision: A)
 
