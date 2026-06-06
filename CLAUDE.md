@@ -87,12 +87,12 @@ Service crash → node keeps replicating, voluntarily transfers leadership if le
 
 ## Feature Development Workflow
 
-Using superpowers (brainstorming, writing-plans, executing-plans) during feature development is fine — the generated plans/notes under `docs/superpowers/` are working artifacts, not deliverables. Before finishing and committing the feature:
+Using superpowers (brainstorming, writing-plans, executing-plans) during feature development is fine — the generated plans/notes under `docs/superpowers/` are working artifacts. Before finishing and committing the feature:
 
-1. Consolidate the architectural decisions and implementation details into `docs/tasks/taskXX_feature_name.md` (the canonical per-feature doc).
-2. Delete the corresponding superpowers artifacts (`docs/superpowers/plans/*.md`, `docs/superpowers/specs/*.md`) for that feature. They must not be committed alongside the `taskXX_feature_name.md`.
+1. Consolidate the architectural decisions and implementation details into `docs/tasks/taskXX_feature_name.md` (the canonical per-feature doc). This is the permanent record — it must stand on its own, folding in the essential design rationale so it does not depend on the superpowers artifacts.
+2. **Leave the corresponding superpowers artifacts (`docs/superpowers/plans/*.md`, `docs/superpowers/specs/*.md`) in place.** Do NOT delete them as part of consolidation — they are retained as historical scaffolding and the maintainer removes them manually if ever. Committing them alongside the `taskXX_feature_name.md` is fine.
 
-Superpowers artifacts are ephemeral scaffolding; `docs/tasks/` is the permanent record. The current `2026-05-10-ultima-cluster-design.md` spec will be consolidated into `docs/tasks/task01_initial_implementation.md` (or similar) once v1 ships.
+`docs/tasks/` is the canonical permanent record; the superpowers artifacts are retained design history. The current `2026-05-10-ultima-cluster-design.md` spec will be consolidated into `docs/tasks/task01_initial_implementation.md` (or similar) once v1 ships.
 
 ## Pointers to dependent crates
 
