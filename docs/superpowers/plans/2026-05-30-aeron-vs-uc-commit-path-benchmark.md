@@ -507,7 +507,7 @@ async fn main() -> anyhow::Result<()> {
 Run: `cargo build -p uc_autobench --bin commit-path-load`
 Expected: builds clean (warnings OK).
 
-- [ ] **Step 3: Smoke-run a tiny ladder (sanity vs the known ~38ms floor)**
+- [ ] **Step 3: Smoke-run a tiny ladder (sanity vs the VERIFIED baseline)**
 
 Run:
 ```bash
@@ -516,7 +516,12 @@ cargo run -p uc_autobench --bin commit-path-load --release -- \
   --out /tmp/uc-smoke.csv
 cat /tmp/uc-smoke.csv
 ```
-Expected: 4 data rows. **Sanity check:** at `inflight=1`, `p50_ns` should be on the order of tens of millions (~36–41 ms — the known group-commit floor from `shmem-e2e.rs`). At `inflight=16`, `achieved_rate` should be markedly higher and per-op latency similar or higher — confirming the group-commit batching effect. If `inflight=1` p50 is microseconds, the commit path isn't actually being exercised — STOP and investigate before trusting any numbers.
+Expected: 4 data rows. **Sanity check (VERIFIED 2026-05-30, in-process single-node, Apple Silicon — these are real measured numbers, not the earlier mistaken "~38ms floor"):**
+- At `inflight=1, rate=50`: `p50_ns` ≈ **11–12 ms** (11_000_000–12_000_000), `achieved_rate` ≈ 50 (below the knee), `count` = 150 over a 3s window. This is the UC single-client unloaded commit latency.
+- At `inflight=1, rate=200` (above the ~87/s knee): coordinated-omission backlog makes `p50` explode to hundreds of ms and `achieved_rate` plateaus at ~85–88/s. This is correct open-loop behavior past saturation, not a bug.
+- At `inflight=8`: `achieved_rate` at the saturated rate rises to ~110/s (higher than inflight=1's ~87/s) — the concurrency/batching effect.
+- **NOTE on the earlier mistaken floor:** `shmem-e2e.rs`'s "~37ms" is its **4-concurrent-client queueing** figure, NOT the unloaded latency. The true single-request latency is ~11ms; UC is throughput-bound (~80 commits/s, one serialized writer), so latency scales ~linearly with concurrency (c=1≈11ms, c=2≈24ms, c=4≈56ms). The real bottleneck is commit *throughput*, not a per-op latency floor.
+- **STOP only if** `inflight=1` p50 is in the microseconds (single/low-thousands of ns) — that would mean the commit path is bypassed. ~11ms is correct.
 
 - [ ] **Step 4: Commit**
 

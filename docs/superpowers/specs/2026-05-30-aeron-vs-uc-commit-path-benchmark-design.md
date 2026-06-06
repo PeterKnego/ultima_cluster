@@ -18,15 +18,21 @@ Nx slower than Aeron."
 
 ### Why decomposition, not a single number
 
-UC's own e2e gate already establishes the dominant cost. From
-`uc_autobench/src/bin/shmem-e2e.rs` and task08:
+UC's own measurements establish the dominant cost. From
+`uc_autobench/src/bin/shmem-e2e.rs`, task08, and a controlled concurrency probe
+(2026-05-30, in-process single-node, Apple Silicon):
 
-- Full single-node commit path: **p50 ≈ 36 ms, p99 ≈ 40–41 ms**,
-  **~100 round-trips/s** aggregate (4 clients × 500 reqs, in-process fixture).
-- This is **Raft-commit-dominated** — attributed to the journal group-commit
-  window (~38 ms/committed entry). **This floor has never been optimized** (only
-  flagged). task08 optimized the shmem rings to a ~15 ns SPSC p99 floor — a
-  layer that is currently <0.001% of the commit-path latency budget.
+- **Single client, closed-loop: p50 ≈ 11 ms, p99 ≈ 37 ms, ~80/s.**
+- 2 clients: p50 ≈ 24 ms; 4 clients: p50 ≈ 56 ms — latency scales ~linearly with
+  concurrency while throughput stays pinned at **~75–90 commits/s**.
+- **CORRECTION:** the "~38 ms commit floor" attributed to `shmem-e2e` here in an
+  earlier draft is NOT the unloaded latency — it is `shmem-e2e`'s
+  **4-concurrent-client queueing** figure. UC is **throughput-bound** by a single
+  serialized journal commit stage (one writer thread behind one mutex,
+  timer/tick-gated), not by a fixed per-request latency floor. The real
+  bottleneck is commit *throughput* (~80/s). This stage has never been optimized
+  (only flagged). task08 optimized the shmem rings to a ~15 ns SPSC p99 floor — a
+  layer that is currently a rounding error in the commit-path budget.
 
 Aeron IPC round-trips are single-digit microseconds. So the raw transport gap is
 ~1000–10000×, and essentially **all** of it is consensus + journal fsync, not
@@ -35,7 +41,7 @@ transport. The benchmark's value is in attributing the gap to layers:
 | Layer | Representative measurement | Expected scale |
 |---|---|---|
 | Pure transport (same-host RT) | Aeron C IPC RT; UC ring RT (existing microbench) | ~1–15 µs / ~15 ns ring |
-| + Consensus + journal fsync | UC single-node commit path (tmpfs, then real disk) | ~tens of ms |
+| + Consensus + journal fsync | UC single-node commit path (tmpfs, then real disk) | ~11 ms unloaded, throughput-bound ~80/s |
 | + Replication / quorum | UC 3-node loopback commit path | + network/quorum |
 | + Real state machine | KV workload (ultima_db writes) layered on UC | apply cost |
 
@@ -109,11 +115,12 @@ out as its own layer.
 
 ### Concurrency sweep (critical)
 
-At ~38 ms/commit with a single in-flight request, an open-loop ladder saturates
-UC almost immediately. UC must pipeline/batch concurrent in-flight commits
-(group commit). The UC driver therefore **sweeps in-flight concurrency** as a
-parameter; the achievable-throughput knee is set by group-commit batching
-efficiency — which is also the #1 optimization target.
+UC is throughput-bound at ~80 commits/s (single serialized writer), so an
+open-loop ladder saturates it at low offered load and added concurrency raises
+latency without raising throughput (c=1≈11 ms, c=2≈24 ms, c=4≈56 ms). The UC
+driver therefore **sweeps in-flight concurrency** as a parameter; the
+achievable-throughput knee is set by group-commit batching efficiency — raising
+the commit *throughput* ceiling is the #1 optimization target.
 
 ## 4. Components & build sequence
 
@@ -150,8 +157,8 @@ efficiency — which is also the #1 optimization target.
 
 1. Aeron C IPC latency tool; verify CSV schema. Establishes the floor number
    early.
-2. UC single-node load driver; sanity-check against the known ~38 ms commit
-   floor.
+2. UC single-node load driver; sanity-check against the verified baseline
+   (single-client p50 ≈ 11 ms, throughput-bound ~80/s).
 3. Add tmpfs vs real-disk fsync runs; add 3-node loopback mode.
 4. Wire KV workload (`StoreStateMachine`) into the UC driver; concurrency sweep.
 5. Run both; collect CSVs; generate overlay plots + decomposition table.
@@ -164,8 +171,9 @@ efficiency — which is also the #1 optimization target.
 - A decomposition table attributing the commit-path latency to transport /
   consensus / fsync / replication / apply layers, with numbers.
 - A prioritized optimization backlog ranked by measured layer contribution
-  (expectation: journal group-commit / fsync pipelining dominates; shmem-ring
-  work is already near its floor per task08).
+  (expectation: journal commit *throughput* (~80/s) dominates — group-commit
+  batching width / commit cadence / fsync pipelining; shmem-ring work is already
+  near its floor per task08).
 
 ## 6. Risks & open questions
 
