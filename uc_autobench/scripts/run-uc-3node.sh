@@ -56,7 +56,24 @@ for n in 1 2 3; do
     --data-dir "$DATA_ROOT/node$n" > "/tmp/uc3-node$n.log" 2>&1 &
   pids+=($!)
 done
-trap 'kill "${pids[@]}" 2>/dev/null || true' EXIT
+# Hardened teardown: SIGINT for an ordered shutdown (uc-node-launch catches
+# ctrl_c → service-then-node), wait up to ~5s, SIGKILL any survivor, then `wait`
+# to reap zombies. Runs once (the EXIT path clears its own + signal traps).
+cleanup() {
+  trap - EXIT INT TERM
+  local pid
+  for pid in "${pids[@]}"; do kill -INT "$pid" 2>/dev/null || true; done
+  for _ in $(seq 1 10); do
+    local alive=0
+    for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    [[ "$alive" -eq 0 ]] && break
+    sleep 0.5
+  done
+  for pid in "${pids[@]}"; do kill -KILL "$pid" 2>/dev/null || true; done
+  wait "${pids[@]}" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
 
 # Wait for the cluster to elect a leader & accept clients.
 echo "waiting ${SLEEP}s for leader election..." >&2
