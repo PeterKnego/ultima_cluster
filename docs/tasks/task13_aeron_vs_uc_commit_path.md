@@ -20,6 +20,74 @@
 > numbers below were produced by that now-removed instrumentation and are kept
 > as the historical record, not as something re-runnable from this tree.
 
+## Linux re-run (2026-06-06, post-task11)
+
+The original investigation (everything below this section) ran on **Apple Silicon
+/ macOS, pre-task11**. Re-running the single-node `commit-path-load` driver on
+**Linux** with the current `main` (which includes task11 event-driven ring
+wakeups) shows the predicted collapse of the latency floor — confirming the
+corrected "poll-sleep, not fsync" verdict from the field.
+
+- **Setup:** in-process `ClusterFixture` single-node, `--release`, `RUST_LOG=off`,
+  64-byte payload, `KvSm` apply, `log_durability` left at the fixture default.
+  Two journal targets: **ext** (real disk, `TMPDIR=/home/claude/...`) and
+  **tmpfs** (`/dev/shm`). Rate ladder 100→20000/s × in-flight {1,8,32,128}.
+  Reproduce: `RATES=... INFLIGHT=... TMPDIR=<ext-path> ./<target>/release/commit-path-load --config single_disk ...`
+  (the committed `run-uc-single-node.sh` assumes `./target/`; this host relocates
+  `CARGO_TARGET_DIR`, so the driver was invoked directly).
+  **Note:** on this host both `/tmp` and `/dev/shm` are tmpfs — the "disk" run
+  must point `TMPDIR` at a real ext path or it silently measures tmpfs.
+
+### Unloaded latency floor (inflight=1, below the knee)
+
+| target rate | ext disk p50 | ext disk p99 | tmpfs p50 | tmpfs p99 |
+|--:|--:|--:|--:|--:|
+| 1000/s | 1.03 ms | 2.28 ms | 0.76 ms | 1.76 ms |
+| 2000/s | 1.13 ms | 7.11 ms | 0.78 ms | 2.98 ms |
+| 5000/s | *(saturated)* | — | 0.76 ms | 6.79 ms |
+
+**Unloaded commit latency: ext disk ≈ 1.0 ms, tmpfs ≈ 0.76 ms.** fsync adds only
+**~0.25 ms** here — not the ~7.5 ms seen on macOS HFS+.
+
+### Throughput ceiling (achieved rate at/above the knee)
+
+| target rate | ext disk achieved | tmpfs achieved (if=1 / if=8) |
+|--:|--:|--:|
+| 2000/s  | 2000/s (below knee) | 1999/s / 1999/s |
+| 5000/s  | **~2460/s** (saturated) | 4998/s / 4996/s (sustained) |
+| 10000/s | **~2500/s** (saturated) | **~6190/s** / **~8180/s** |
+
+- **ext disk: hard ceiling ≈ 2500/s**, flat across inflight 1→128 (same
+  single-serialized-writer signature as macOS).
+- **tmpfs: ≈ 6000/s at inflight=1, ≈ 8000/s at inflight=8** — fsync caps
+  throughput **~2.5–3×** on this host.
+
+### What changed vs the macOS investigation
+
+| metric | macOS (pre-task11) | **Linux (post-task11)** | delta |
+|---|--:|--:|--:|
+| Unloaded p50, disk | ~11 ms | **~1.0 ms** | ~10× lower |
+| Unloaded p50, tmpfs | ~3.5 ms | **~0.76 ms** | ~4.6× lower |
+| Throughput ceiling, disk | ~85–110/s | **~2500/s** | ~25× higher |
+| fsync latency cost | ~7.5 ms | **~0.25 ms** | host-dependent |
+
+The **~3.5 ms → ~0.76 ms tmpfs floor collapse** is the task11 poll-sleep removal,
+landing exactly where this investigation said the real lever was (~4.6×, matching
+task11's own measurement). The much smaller fsync *latency* cost is platform: this
+host's ext filesystem fsyncs in sub-millisecond, versus macOS HFS+ at ~7.5 ms.
+fsync still **caps throughput** (~2500 vs ~6000–8000/s), so journal group-commit
+remains the next throughput lever — but it is no longer a latency wall.
+
+> **Caveat:** the "disk" target is the container's ext2/3 on `/home/claude`
+> (likely SSD/overlay-backed) — real *non-tmpfs* durability, but the absolute
+> fsync cost is host-specific and not representative of a spinning disk or a
+> networked block device. The relative disk-vs-tmpfs gap is the portable signal.
+
+---
+
+*The remainder of this document is the original macOS investigation, preserved
+as the historical record.*
+
 ## TL;DR
 
 UC's single-node commit path delivers **p50 ≈ 11 ms / throughput-ceiling ≈ 85–110 commits/s** on real disk, versus Aeron same-host IPC at **p50 ≈ 0.17 µs**. The ~65,000× gap is **entirely consensus + journal durability — transport is a rounding error.** The decisive finding: running the journal on a RAM disk (tmpfs) drops p50 to **~3.5 ms** *and removes the throughput ceiling within the tested range* (sustains 250/s with no knee). **`fsync` durability is responsible for both ~7.5 ms of per-op latency and the entire ~100/s throughput wall.** Optimizing group-commit/fsync batching is the single highest-leverage UC perf lever; shmem rings (task08, ~15 ns) and transport are already far below the noise floor.
