@@ -5,6 +5,11 @@
 //! the reattached (possibly fresh in-memory) service. `node_frontier` is the
 //! node's LIVE in-memory applied index — the range openraft will not re-drive.
 
+// Phase-1 scaffolding: the pure catch-up-source decision is exercised by the
+// unit tests below; the live apply-path (`state_machine_shmem::drive_catchup`)
+// computes the replay range directly, so the lib build has no caller yet. The
+// `NeedsSnapshot` branch is wired in Phase 2.
+#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CatchupSource {
     Nothing,
@@ -13,6 +18,7 @@ pub(crate) enum CatchupSource {
 }
 
 /// Pure decision. `last_purged` is the highest purged log index (0 if none).
+#[allow(dead_code)]
 pub(crate) fn decide_catchup_source(
     service_last_applied: u64,
     node_frontier: u64,

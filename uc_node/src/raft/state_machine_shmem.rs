@@ -66,7 +66,7 @@ use super::{RaftLogId, RaftSnapshot, RaftSnapshotMeta, RaftStoredMembership, Typ
 /// mmap is owned by the node `Instance`/handle and outlives the adapter; all
 /// `ServiceStatus` fields are atomics (so `Sync`) and the node only reads them.
 #[derive(Clone, Copy)]
-pub(crate) struct ServiceStatusPtr(pub(crate) *const ServiceStatus);
+pub struct ServiceStatusPtr(pub(crate) *const ServiceStatus);
 // SAFETY: see doc — points into a Sync, longer-lived mmap; read-only.
 unsafe impl Send for ServiceStatusPtr {}
 unsafe impl Sync for ServiceStatusPtr {}
@@ -150,10 +150,11 @@ pub(crate) struct ShmemInner<S: StateMachine> {
 
 impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
     // `new` is `pub` because the integration tests (external crates) construct it;
-    // `ServiceStatusPtr` is `pub(crate)`, hence the private-interfaces allow. The
-    // arg count grew with the reconstruction context (journal/last_purged/status
-    // ptr) — these are cohesive constructor inputs, so allow rather than bundle.
-    #[allow(private_interfaces, clippy::too_many_arguments)]
+    // `ServiceStatusPtr` is `pub` for the same reason (it appears in this public
+    // signature). The arg count grew with the reconstruction context
+    // (journal/last_purged/status ptr) — these are cohesive constructor inputs,
+    // so allow rather than bundle.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sm: S,
         handles: LogStorageHandles,
@@ -285,25 +286,44 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                     Bytes::new()
                 }
                 EntryPayload::Normal(cmd_bytes) => {
-                    // Normal app-data: publish to apply.ring, await response from apply_resp.ring.
-                    publish_apply(
-                        &g.apply_producer,
-                        log_index,
-                        cmd_bytes.as_ref(),
-                        log_id,
-                        &shutdown,
-                    )
-                    .await?;
-                    let resp = await_apply_resp(
-                        &g.apply_resp_consumer,
-                        log_index,
-                        log_id,
-                        &shutdown,
-                        &g.apply_resp_bridge,
-                    )
-                    .await?;
-                    // M5: hand off to output_dispatcher. try_send so apply never blocks
-                    // on a full output channel — the skip path catches it during replay.
+                    // Copy the epoch context out before the field borrows below.
+                    let ss_ptr = g.service_status_ptr;
+                    let expected_epoch = g.last_seen_epoch;
+                    let resp: Bytes = if epoch_of(ss_ptr) != expected_epoch {
+                        // Service reattached since we last reconciled: catch up
+                        // (replays incl. this entry) before publishing it live.
+                        let (b, epoch) = drive_catchup(&g, &shutdown, log_id).await?;
+                        g.last_seen_epoch = epoch;
+                        b
+                    } else {
+                        publish_apply(
+                            &g.apply_producer,
+                            log_index,
+                            cmd_bytes.as_ref(),
+                            log_id,
+                            &shutdown,
+                        )
+                        .await?;
+                        match await_apply_resp(
+                            &g.apply_resp_consumer,
+                            log_index,
+                            log_id,
+                            &shutdown,
+                            &g.apply_resp_bridge,
+                            ss_ptr,
+                            expected_epoch,
+                        )
+                        .await?
+                        {
+                            ApplyOutcome::Resp(b) => b,
+                            ApplyOutcome::Reattach => {
+                                let (b, epoch) = drive_catchup(&g, &shutdown, log_id).await?;
+                                g.last_seen_epoch = epoch;
+                                b
+                            }
+                        }
+                    };
+                    // M5: hand off to output_dispatcher exactly once for this entry.
                     if let Err(e) = g
                         .output_chan_tx
                         .try_send((log_index, cmd_bytes.clone().into()))
@@ -445,13 +465,21 @@ async fn publish_apply(
     }
 }
 
+enum ApplyOutcome {
+    Resp(Bytes),
+    /// The service reattached (epoch changed) before this resp arrived.
+    Reattach,
+}
+
 async fn await_apply_resp(
     consumer: &PlMutex<SpscConsumer>,
     expected_log_index: u64,
     log_id: RaftLogId,
     shutdown: &AtomicBool,
     bridge: &NotifyBridge,
-) -> Result<Bytes, io::Error> {
+    service_status_ptr: Option<ServiceStatusPtr>,
+    expected_epoch: u64,
+) -> Result<ApplyOutcome, io::Error> {
     let _ = log_id; // kept for parity with the 0.9 error-context site
     let mut payload_buf: Vec<u8> = Vec::with_capacity(1024);
     loop {
@@ -464,6 +492,9 @@ async fn await_apply_resp(
                 io::ErrorKind::Interrupted,
                 "apply interrupted: node shutting down",
             ));
+        }
+        if epoch_of(service_status_ptr) != expected_epoch {
+            return Ok(ApplyOutcome::Reattach);
         }
         let read_result = {
             let mut c = consumer.lock();
@@ -490,7 +521,7 @@ async fn await_apply_resp(
                     expected_log_index,
                     uc_protocol::probes::Checkpoint::RespDequeue,
                 );
-                return Ok(Bytes::from(std::mem::take(&mut payload_buf)));
+                return Ok(ApplyOutcome::Resp(Bytes::from(std::mem::take(&mut payload_buf))));
             }
             Ok(Some(rec)) => {
                 tracing::warn!(
@@ -503,6 +534,102 @@ async fn await_apply_resp(
                 return Err(io::Error::other(format!("apply_resp ring read: {e}")));
             }
         }
+    }
+}
+
+/// Replay committed entries to a reattached service. Called from `apply()` when a
+/// reattach is observed (the parked entry `up_to` is, by the single-in-flight
+/// invariant, the node's live frontier). Reuses the apply ring + resp ring under
+/// the already-held inner lock (no concurrent apply). Returns `(resp_for_up_to,
+/// reconciled_epoch)`. An outer loop restarts if the service reattaches AGAIN
+/// mid-catch-up.
+async fn drive_catchup<S: StateMachine>(
+    g: &ShmemInner<S>,
+    shutdown: &AtomicBool,
+    up_to_log_id: RaftLogId,
+) -> Result<(Bytes, u64), io::Error> {
+    let up_to = up_to_log_id.index;
+    let ss_ptr = g.service_status_ptr;
+    let last_purged = g
+        .last_purged
+        .load()
+        .ok()
+        .flatten()
+        .map(|l| l.index)
+        .unwrap_or(0);
+
+    loop {
+        let epoch = epoch_of(ss_ptr);
+        let service_last = service_last_of(ss_ptr);
+
+        if service_last < last_purged {
+            return Err(io::Error::other(format!(
+                "reconstruct: service at {service_last} below purge boundary {last_purged}; \
+                 snapshot-install is Phase 2"
+            )));
+        }
+
+        // Drop any stale resps left by the dead incarnation (node owns the resp
+        // ring's consumer_position).
+        g.apply_resp_consumer.lock().discard_backlog();
+
+        // Replay (from, up_to], always including up_to (the parked entry must be
+        // applied + acked). Fresh in-memory service => service_last == 0. A
+        // self-persisting service already at/above up_to => replay just up_to
+        // (idempotent re-apply; log_index is the idempotency key).
+        let from = if service_last >= up_to {
+            up_to - 1
+        } else {
+            service_last
+        };
+
+        let iter = g
+            .journal
+            .iter_range((from + 1)..(up_to + 1))
+            .map_err(|e| io::Error::other(format!("reconstruct: iter_range: {e}")))?;
+
+        let mut last_resp = Bytes::new();
+        let mut restart = false;
+        for record in iter {
+            let (seq, _meta, payload) = record
+                .map_err(|e| io::Error::other(format!("reconstruct: journal read: {e}")))?;
+            let (entry, _) = bincode::serde::decode_from_slice::<
+                <TypeConfig as openraft::RaftTypeConfig>::Entry,
+                _,
+            >(&payload, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let log_id = entry.log_id;
+            let cmd = match entry.payload {
+                EntryPayload::Normal(cmd) => cmd,
+                _ => continue, // Blank/Membership were never delivered to the service
+            };
+            publish_apply(&g.apply_producer, seq, cmd.as_ref(), log_id, shutdown).await?;
+            match await_apply_resp(
+                &g.apply_resp_consumer,
+                seq,
+                log_id,
+                shutdown,
+                &g.apply_resp_bridge,
+                ss_ptr,
+                epoch,
+            )
+            .await?
+            {
+                ApplyOutcome::Resp(b) => {
+                    if seq == up_to {
+                        last_resp = b;
+                    }
+                }
+                ApplyOutcome::Reattach => {
+                    restart = true;
+                    break;
+                }
+            }
+        }
+        if restart {
+            continue;
+        }
+        return Ok((last_resp, epoch));
     }
 }
 
