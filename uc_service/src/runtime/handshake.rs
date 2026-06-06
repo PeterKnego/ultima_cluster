@@ -45,10 +45,11 @@ pub fn publish_service_last_applied(status: &ServiceStatus, last_applied: u64) {
 }
 
 /// Bump `service_epoch` so the node detects this incarnation as a reattach.
-/// Call BEFORE `set_service_state(.., READY)`. Single live service writes it.
+/// Call BEFORE `set_service_state(.., READY)`. Uses an atomic `fetch_add` so
+/// monotonicity holds unconditionally (not merely under the single-live-service
+/// flock invariant) even if two incarnations briefly overlap during a crash.
 pub fn bump_service_epoch(status: &ServiceStatus) {
-    let prev = status.service_epoch.load(Ordering::Relaxed);
-    status.service_epoch.store(prev + 1, Ordering::Release);
+    status.service_epoch.fetch_add(1, Ordering::AcqRel);
 }
 
 #[cfg(test)]
