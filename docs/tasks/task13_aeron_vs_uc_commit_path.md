@@ -83,6 +83,37 @@ remains the next throughput lever — but it is no longer a latency wall.
 > fsync cost is host-specific and not representative of a spinning disk or a
 > networked block device. The relative disk-vs-tmpfs gap is the portable signal.
 
+### Phase 2 — 3-node QUIC loopback (Linux, ext disk)
+
+Three real `uc-node-launch` processes over QUIC on `127.0.0.1`, node1 the
+bootstrap leader, journal on ext disk (`DATA_ROOT` on `/home/claude`), shmem
+rings on `/dev/shm`; load via `commit-path-load --connect` against the leader.
+Reproduce: `DATA_ROOT=<ext-path> RATES=... INFLIGHT=... bash uc_autobench/scripts/run-uc-3node.sh`.
+
+| target rate | 3-node p50 | 3-node achieved | (single-node disk p50 / achieved) |
+|--:|--:|--:|--:|
+| 100/s  | 3.0 ms  | 100/s              | (~1.0 ms / 100/s) |
+| 500/s  | 4.0 ms* | ~500/s (sustained) | (~1.0 ms / 500/s) |
+| 1000/s | *(saturated)* | ~590/s       | (~1.0 ms / 1000/s) |
+| 2000/s | *(saturated)* | ~600/s       | (~1.1 ms / 2000/s) |
+
+\* inflight=8; at inflight=1 the 500/s step is right at the edge (p50 ~10 ms,
+heavy p99 tail). Sustainable throughput is **~500–600/s** across inflight
+{1,8,32}; above that, achieved pins ~600/s and p50 climbs into seconds
+(coordinated-omission backlog).
+
+- **Unloaded latency ≈ 3.0 ms** (vs ~1.0 ms single-node) — **replication adds
+  ~2 ms**, one QUIC round-trip to a 2/3 quorum on loopback.
+- **Throughput ceiling ≈ 600/s** (vs ~2500/s single-node) — replication cuts
+  throughput **~4×** on this host.
+
+Versus the macOS Phase 2 (p50 ~16 ms, ceiling ~48/s): Linux is ~5× lower latency
+and ~12× higher throughput. Note the single→3-node *throughput* drop is steeper on
+Linux (~4×) than macOS (~2×): with the fsync latency wall gone (task11), the QUIC
+quorum round-trip + replica append is now the **dominant** commit cost, not a
+second-order add-on. Same loopback caveat as the macOS run — a real NIC adds
+tens-to-hundreds of µs per replication round-trip, so these are lower bounds.
+
 ---
 
 *The remainder of this document is the original macOS investigation, preserved
