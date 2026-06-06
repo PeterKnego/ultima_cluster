@@ -158,7 +158,9 @@ impl<S: StateMachine> NodeBuilder<S> {
                     output_chan_tx,
                     journal_for_replay.clone(),
                     log_storage.last_purged.clone(),
-                    Some(crate::raft::state_machine_shmem::ServiceStatusPtr(service_status.0)),
+                    Some(crate::raft::state_machine_shmem::ServiceStatusPtr(
+                        service_status.0,
+                    )),
                 )?;
                 let query_link = Arc::new(ShmemQueryLink::new(query_producer, query_resp_consumer));
                 let handle_sm = SmAdapter::Shmem(adapter.clone());

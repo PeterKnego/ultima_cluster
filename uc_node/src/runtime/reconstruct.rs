@@ -28,11 +28,18 @@ pub(crate) enum ReplayPlan {
 pub(crate) fn plan_replay(service_last: u64, up_to: u64, last_purged: u64) -> ReplayPlan {
     debug_assert!(up_to >= 1, "up_to is a Normal entry index, always >= 1");
     if service_last < last_purged {
-        ReplayPlan::NeedsSnapshot { service_last, last_purged }
+        ReplayPlan::NeedsSnapshot {
+            service_last,
+            last_purged,
+        }
     } else {
         // Always include up_to: if the service is already at/above it, still
         // replay just up_to (idempotent re-apply of the parked entry).
-        let from = if service_last >= up_to { up_to - 1 } else { service_last };
+        let from = if service_last >= up_to {
+            up_to - 1
+        } else {
+            service_last
+        };
         ReplayPlan::Replay { from, to: up_to }
     }
 }
@@ -56,6 +63,12 @@ mod tests {
     }
     #[test]
     fn needs_snapshot_below_purge() {
-        assert_eq!(plan_replay(2, 5, 5), ReplayPlan::NeedsSnapshot { service_last: 2, last_purged: 5 });
+        assert_eq!(
+            plan_replay(2, 5, 5),
+            ReplayPlan::NeedsSnapshot {
+                service_last: 2,
+                last_purged: 5
+            }
+        );
     }
 }

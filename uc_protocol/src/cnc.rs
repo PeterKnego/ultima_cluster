@@ -86,19 +86,19 @@ const _: () = {
 
 #[repr(C, align(64))]
 pub struct ServiceStatus {
-    pub state: AtomicU32,            // 0..4  (0=Disconnected 1=Handshaking 2=Ready 3=Snapshotting 4=Stalled)
-    pub _pad_1: u32,                 // 4..8
-    pub last_applied: AtomicU64,     // 8..16
-    pub last_output_ack: AtomicU64,  // 16..24
-    pub heartbeat_seq: AtomicU64,    // 24..32
-    pub heartbeat_at_ns: AtomicU64,  // 32..40
-    pub service_pid: AtomicU32,      // 40..44
-    pub _pad_2a: u32,                // 44..48  (align service_epoch to 8)
+    pub state: AtomicU32, // 0..4  (0=Disconnected 1=Handshaking 2=Ready 3=Snapshotting 4=Stalled)
+    pub _pad_1: u32,      // 4..8
+    pub last_applied: AtomicU64, // 8..16
+    pub last_output_ack: AtomicU64, // 16..24
+    pub heartbeat_seq: AtomicU64, // 24..32
+    pub heartbeat_at_ns: AtomicU64, // 32..40
+    pub service_pid: AtomicU32, // 40..44
+    pub _pad_2a: u32,     // 44..48  (align service_epoch to 8)
     /// Bumped by each new service incarnation at attach (before READY). The node
     /// tracks the last-seen value; a change signals a reattach (Phase 1
     /// reconstruction). Monotonic.
-    pub service_epoch: AtomicU64,    // 48..56
-    pub _pad_2: [u8; 8],             // 56..64
+    pub service_epoch: AtomicU64, // 48..56
+    pub _pad_2: [u8; 8],  // 56..64
 }
 
 const _: () = {

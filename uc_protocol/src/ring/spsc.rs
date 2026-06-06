@@ -290,7 +290,9 @@ impl SpscConsumer {
     pub fn discard_backlog(&mut self) {
         let header = self.inner.header();
         let producer_pos = header.publish_position.load(Ordering::Acquire);
-        header.consumer_position.store(producer_pos, Ordering::Release);
+        header
+            .consumer_position
+            .store(producer_pos, Ordering::Release);
     }
 }
 
@@ -566,7 +568,10 @@ mod tests {
         producer.try_write(1, 0, [0u8; 8], b"b").unwrap();
         consumer.discard_backlog();
         let mut buf = Vec::new();
-        assert!(consumer.try_read(&mut buf).unwrap().is_none(), "backlog discarded");
+        assert!(
+            consumer.try_read(&mut buf).unwrap().is_none(),
+            "backlog discarded"
+        );
         producer.try_write(1, 0, [0u8; 8], b"c").unwrap();
         let rec = consumer.try_read(&mut buf).unwrap().expect("c readable");
         assert_eq!(rec.msg_type, 1);

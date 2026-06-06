@@ -9,5 +9,5 @@ pub mod builder;
 pub mod node;
 pub mod output_dispatcher;
 pub mod output_replay;
-pub mod recovery;
 pub(crate) mod reconstruct;
+pub mod recovery;

@@ -110,7 +110,9 @@ async fn in_memory_sm_reconstructed_on_service_restart() {
         log_durability: ultima_journal::Durability::Eventual,
     };
     let node_task = tokio::spawn(async move {
-        NodeBuilder::new(node_cfg, CounterSm::default()).start().await
+        NodeBuilder::new(node_cfg, CounterSm::default())
+            .start()
+            .await
     });
 
     // Node start() blocks internally on wait_for_service_ready; spawn the
@@ -128,7 +130,9 @@ async fn in_memory_sm_reconstructed_on_service_restart() {
     };
     let svc_cfg1 = mk_svc_cfg();
     let svc_task = tokio::spawn(async move {
-        ServiceBuilder::new(svc_cfg1, CounterSm::default()).run().await
+        ServiceBuilder::new(svc_cfg1, CounterSm::default())
+            .run()
+            .await
     });
 
     let node = tokio::time::timeout(Duration::from_secs(15), node_task)

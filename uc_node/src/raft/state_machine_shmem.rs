@@ -521,7 +521,9 @@ async fn await_apply_resp(
                     expected_log_index,
                     uc_protocol::probes::Checkpoint::RespDequeue,
                 );
-                return Ok(ApplyOutcome::Resp(Bytes::from(std::mem::take(&mut payload_buf))));
+                return Ok(ApplyOutcome::Resp(Bytes::from(std::mem::take(
+                    &mut payload_buf,
+                ))));
             }
             Ok(Some(rec)) => {
                 tracing::warn!(
@@ -576,8 +578,15 @@ async fn drive_catchup<S: StateMachine>(
         // Decide the replay span. The plan always includes up_to (the parked
         // entry must be applied + acked, idempotently — log_index is the key).
         // Fresh in-memory service => service_last == 0.
-        let (from, to) = match crate::runtime::reconstruct::plan_replay(service_last, up_to, last_purged) {
-            crate::runtime::reconstruct::ReplayPlan::NeedsSnapshot { service_last, last_purged } => {
+        let (from, to) = match crate::runtime::reconstruct::plan_replay(
+            service_last,
+            up_to,
+            last_purged,
+        ) {
+            crate::runtime::reconstruct::ReplayPlan::NeedsSnapshot {
+                service_last,
+                last_purged,
+            } => {
                 return Err(io::Error::other(format!(
                     "reconstruct: service at {service_last} below purge boundary {last_purged}; \
                      snapshot-install is Phase 2"
@@ -599,8 +608,8 @@ async fn drive_catchup<S: StateMachine>(
         let mut saw_up_to = false;
         let mut restart = false;
         for record in iter {
-            let (seq, _meta, payload) = record
-                .map_err(|e| io::Error::other(format!("reconstruct: journal read: {e}")))?;
+            let (seq, _meta, payload) =
+                record.map_err(|e| io::Error::other(format!("reconstruct: journal read: {e}")))?;
             let (entry, _) = bincode::serde::decode_from_slice::<
                 <TypeConfig as openraft::RaftTypeConfig>::Entry,
                 _,
