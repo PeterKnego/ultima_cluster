@@ -87,7 +87,10 @@ Sequence on (re)attach:
 
 ## 3. Phasing
 
-All phases are in scope; the plan sequences them.
+All phases are in scope. **Each phase is its own implementation plan and its own
+PR** (Phase 2 is large enough to warrant separation, and each phase is
+independently shippable + testable). They are sequenced; later phases build on
+earlier ones.
 
 1. **Phase 1 — handshake + log-replay catch-up.** Channel A, the
    `reconstruct` driver, catch-up apply gating. Fixes the common-case contract gap
