@@ -89,6 +89,9 @@ Three real `uc-node-launch` processes over QUIC on `127.0.0.1`, node1 the
 bootstrap leader, journal on ext disk (`DATA_ROOT` on `/home/claude`), shmem
 rings on `/dev/shm`; load via `commit-path-load --connect` against the leader.
 Reproduce: `DATA_ROOT=<ext-path> RATES=... INFLIGHT=... bash uc_autobench/scripts/run-uc-3node.sh`.
+The script tears the cluster down on exit (and on Ctrl-C) via a hardened cleanup —
+SIGINT for an ordered shutdown, a bounded wait, a SIGKILL fallback, then `wait`
+to reap — so no node processes are left behind after a run.
 
 | target rate | 3-node p50 | 3-node achieved | (single-node disk p50 / achieved) |
 |--:|--:|--:|--:|
