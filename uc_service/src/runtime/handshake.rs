@@ -37,6 +37,20 @@ pub fn set_service_state(status: &ServiceStatus, state: u32) {
     status.state.store(state, Ordering::Release);
 }
 
+/// Publish the service's recovered `last_applied` (channel A). Call BEFORE
+/// `set_service_state(.., READY)`; the state-flag Release carries it to the node.
+/// A restarted service MUST overwrite it (0 for a fresh in-memory SM).
+pub fn publish_service_last_applied(status: &ServiceStatus, last_applied: u64) {
+    status.last_applied.store(last_applied, Ordering::Release);
+}
+
+/// Bump `service_epoch` so the node detects this incarnation as a reattach.
+/// Call BEFORE `set_service_state(.., READY)`. Single live service writes it.
+pub fn bump_service_epoch(status: &ServiceStatus) {
+    let prev = status.service_epoch.load(Ordering::Relaxed);
+    status.service_epoch.store(prev + 1, Ordering::Release);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,5 +108,43 @@ mod tests {
         };
         set_service_state(&status, service_state::READY);
         assert_eq!(status.state.load(Ordering::Acquire), service_state::READY);
+    }
+
+    #[test]
+    fn publish_service_last_applied_stores_value() {
+        let status = ServiceStatus {
+            state: AtomicU32::new(service_state::HANDSHAKING),
+            _pad_1: 0,
+            last_applied: AtomicU64::new(0),
+            last_output_ack: AtomicU64::new(0),
+            heartbeat_seq: AtomicU64::new(0),
+            heartbeat_at_ns: AtomicU64::new(0),
+            service_pid: AtomicU32::new(0),
+            _pad_2a: 0,
+            service_epoch: AtomicU64::new(0),
+            _pad_2: [0; 8],
+        };
+        publish_service_last_applied(&status, 99);
+        assert_eq!(status.last_applied.load(Ordering::Acquire), 99);
+    }
+
+    #[test]
+    fn bump_service_epoch_increments() {
+        let status = ServiceStatus {
+            state: AtomicU32::new(service_state::HANDSHAKING),
+            _pad_1: 0,
+            last_applied: AtomicU64::new(0),
+            last_output_ack: AtomicU64::new(0),
+            heartbeat_seq: AtomicU64::new(0),
+            heartbeat_at_ns: AtomicU64::new(0),
+            service_pid: AtomicU32::new(0),
+            _pad_2a: 0,
+            service_epoch: AtomicU64::new(0),
+            _pad_2: [0; 8],
+        };
+        bump_service_epoch(&status);
+        assert_eq!(status.service_epoch.load(Ordering::Acquire), 1);
+        bump_service_epoch(&status);
+        assert_eq!(status.service_epoch.load(Ordering::Acquire), 2);
     }
 }

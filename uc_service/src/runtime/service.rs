@@ -141,7 +141,7 @@ impl<S: StateMachine> ServiceBuilder<S> {
     /// tests, setting `ServiceStatus::state = Ready` is enough for the
     /// node side to proceed.
     pub async fn run(self) -> Result<Service, ServiceError> {
-        let attached = super::attach::attach(&self.config.instance_dir, &self.config.app_id)?;
+        let mut attached = super::attach::attach(&self.config.instance_dir, &self.config.app_id)?;
 
         let service_status_ptr = service_status_ptr(&attached.cnc_mmap);
 
@@ -151,6 +151,11 @@ impl<S: StateMachine> ServiceBuilder<S> {
         // read lock across the on_committed .await. apply uses blocking_write();
         // query and output_loop use read().await.
         let sm_shared = Arc::new(RwLock::new(self.state_machine));
+
+        // Discard any stale apply backlog from a crashed prior incarnation before
+        // the apply_loop starts consuming (on reattach our SM is fresh, so
+        // mid-stream frames would apply on empty state). No-op on first attach.
+        attached.apply_consumer.discard_backlog();
 
         let apply = spawn_apply_loop(
             Arc::clone(&sm_shared),
@@ -189,11 +194,14 @@ impl<S: StateMachine> ServiceBuilder<S> {
             }
         };
 
-        // Mark ourselves ready. The node side picks this up via Acquire on
-        // ServiceStatus.state. The full `ServiceReady` frame publish
-        // lands when the cnc-sub-region MPSC attach API exists.
+        // Reconstruction handshake (Phase 1): publish recovered last_applied,
+        // bump the epoch (so the node detects this (re)attach), THEN flip READY.
+        // All Release; ordered before the state→READY Release the node Acquires.
         // SAFETY: cnc mmap owned by `Service` for the loop lifetime.
         let status = unsafe { &*service_status_ptr };
+        let recovered = sm_shared.read().await.last_applied().unwrap_or(0);
+        super::handshake::publish_service_last_applied(status, recovered);
+        super::handshake::bump_service_epoch(status);
         set_service_state(status, service_state::READY);
 
         Ok(Service {
