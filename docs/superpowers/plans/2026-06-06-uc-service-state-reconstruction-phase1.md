@@ -294,67 +294,77 @@ git commit -m "feat(uc_node): catch-up source decision (reconstruct, Phase 1)"
 
 ---
 
-## Task 5: Plumb the service_epoch pointer + last-seen epoch into the adapter
+## Task 5: Plumb the ServiceStatus pointer + journal + last_purged into the adapter
 
 **Files:** Modify `uc_node/src/raft/state_machine_shmem.rs`, `uc_node/src/runtime/builder.rs`.
 
-The node-side `apply()` must observe `ServiceStatus.service_epoch`. Plumb a `Send`-able pointer + a tracked last-seen value into `ShmemInner`.
+The node-side `apply()` must read `ServiceStatus.{service_epoch,last_applied}` and replay from the journal. Plumb one `Send` pointer to the cnc `ServiceStatus`, the journal, the `last_purged` handle, and a tracked last-seen epoch into `ShmemInner`.
 
-- [ ] **Step 1: Add fields to `ShmemInner` + constructor param**
+- [ ] **Step 1: Add the `Send` pointer wrapper + module-level epoch/last-applied readers**
 
-In `state_machine_shmem.rs`, add to `ShmemInner`:
+Near the top of `state_machine_shmem.rs` (after imports), add:
 ```rust
-    /// Raw pointer to the cnc ServiceStatus.service_epoch atomic. The cnc mmap
-    /// is owned by the node Instance/handle and outlives the adapter. Used to
-    /// detect a service reattach. None in non-shmem/test paths.
-    pub(crate) service_epoch_ptr: Option<EpochPtr>,
-    /// The epoch value last reconciled by reconstruction. A change means reattach.
-    pub(crate) last_seen_epoch: u64,
-```
-Add a `Send` wrapper near the top of the file (mirror the existing `SendPtr` pattern in builder.rs):
-```rust
-/// Send wrapper for the `*const AtomicU64` service_epoch pointer (the AtomicU64
-/// is Sync; the cnc mmap outlives the adapter).
+/// `Send`/`Sync` wrapper for a `*const ServiceStatus` into the cnc mmap. The
+/// cnc mmap is owned by the node `Instance`/handle and outlives the adapter; all
+/// `ServiceStatus` fields are atomics (so `Sync`) and the node only reads them.
 #[derive(Clone, Copy)]
-pub(crate) struct EpochPtr(pub(crate) *const std::sync::atomic::AtomicU64);
-// SAFETY: points into the cnc mmap, which is Sync and outlives the adapter.
-unsafe impl Send for EpochPtr {}
-unsafe impl Sync for EpochPtr {}
-```
-Add a constructor parameter `service_epoch_ptr: Option<EpochPtr>` to `ShmemAdaptedStateMachine::new` and initialize `service_epoch_ptr` + `last_seen_epoch: 0` in the `ShmemInner { .. }` literal. (Seed `last_seen_epoch` to 0; the first reattach bump makes epoch ≥ 1, and a fresh first-attach catch-up is `Nothing` anyway.)
+pub(crate) struct ServiceStatusPtr(pub(crate) *const uc_protocol::cnc::ServiceStatus);
+// SAFETY: see doc comment — points into a Sync, longer-lived mmap; read-only.
+unsafe impl Send for ServiceStatusPtr {}
+unsafe impl Sync for ServiceStatusPtr {}
 
-- [ ] **Step 2: Add an epoch read helper**
-```rust
-impl<S: StateMachine> ShmemInner<S> {
-    /// Current service epoch (0 if no pointer). SAFETY: pointer into the live
-    /// cnc mmap.
-    fn current_epoch(&self) -> u64 {
-        match self.service_epoch_ptr {
-            Some(EpochPtr(p)) => unsafe { (*p).load(std::sync::atomic::Ordering::Acquire) },
-            None => 0,
-        }
+/// Current service epoch (0 if no pointer). SAFETY: live cnc mmap.
+fn epoch_of(p: Option<ServiceStatusPtr>) -> u64 {
+    match p {
+        Some(ServiceStatusPtr(s)) => unsafe { (*s).service_epoch.load(Ordering::Acquire) },
+        None => 0,
+    }
+}
+
+/// The reattached service's reported last_applied (0 if no pointer). SAFETY: live cnc mmap.
+fn service_last_of(p: Option<ServiceStatusPtr>) -> u64 {
+    match p {
+        Some(ServiceStatusPtr(s)) => unsafe { (*s).last_applied.load(Ordering::Acquire) },
+        None => 0,
     }
 }
 ```
+(`Ordering` is already imported; `uc_protocol::cnc::ServiceStatus` may need a `use`.)
 
-- [ ] **Step 3: Pass the pointer from the builder**
+- [ ] **Step 2: Add fields to `ShmemInner` + constructor params**
 
-In `builder.rs`, where `ShmemAdaptedStateMachine::new(...)` is called, compute the epoch pointer from `service_status.0` and pass `Some(EpochPtr(&(*service_status.0).service_epoch as *const _))`. Concretely, just before the `new(...)` call:
+Add to `ShmemInner`:
 ```rust
-                // SAFETY: same cnc mmap as service_status; outlives the adapter.
-                let service_epoch_ptr = {
-                    let status = unsafe { &*service_status.0 };
-                    crate::raft::state_machine_shmem::EpochPtr(
-                        &status.service_epoch as *const std::sync::atomic::AtomicU64,
-                    )
-                };
+    /// Pointer to the cnc ServiceStatus (epoch + last_applied). None in tests.
+    pub(crate) service_status_ptr: Option<ServiceStatusPtr>,
+    /// Epoch last reconciled by reconstruction; a change means a service reattach.
+    pub(crate) last_seen_epoch: u64,
+    /// Journal handle for replaying committed entries during catch-up.
+    pub(crate) journal: Arc<ultima_journal::Journal>,
+    /// Purge boundary, for the below-purge → NeedsSnapshot (Phase 2) decision.
+    pub(crate) last_purged: Arc<StableValue<RaftLogId>>,
 ```
-and add `Some(service_epoch_ptr)` as the new final arg to `ShmemAdaptedStateMachine::new(...)`. Any other caller of `new` (tests) passes `None`.
+Add constructor params to `ShmemAdaptedStateMachine::new`:
+`journal: Arc<ultima_journal::Journal>`, `last_purged: Arc<StableValue<RaftLogId>>`, `service_status_ptr: Option<ServiceStatusPtr>`. Initialize the fields in the `ShmemInner { .. }` literal, seeding **`last_seen_epoch: epoch_of(service_status_ptr)`** — i.e. the CURRENT cnc epoch at construction (the service already bumped it to 1 before READY, since `new()` runs after `wait_for_service_ready`). This is important: seeding to the current epoch means a cold start's first live apply takes the normal path (openraft already reconstructs the cold-start range), and ONLY a genuine mid-life re-bump (1→2) triggers catch-up. Seeding to 0 would cause a harmless-but-redundant catch-up on the first cold-start apply. (`Arc`, `StableValue`, `RaftLogId` are already in scope; `ultima_journal::Journal` likewise — it's the journal type used by `LogStorageHandles`/`JournalLogStorage`.)
 
-- [ ] **Step 4: Build** — `cargo build -p uc_node` (expect dead-code warnings for `current_epoch`/fields until Task 6; that's fine). **Commit:**
+- [ ] **Step 3: Pass them from the builder**
+
+In `builder.rs`, the shmem path already has `let journal_for_replay = log_storage.journal.clone();` and `log_storage.last_purged` is `pub(crate)`. At the `ShmemAdaptedStateMachine::new(...)` call, add the three new args:
+```rust
+                    journal_for_replay.clone(),
+                    log_storage.last_purged.clone(),
+                    Some(crate::raft::state_machine_shmem::ServiceStatusPtr(service_status.0)),
+```
+(`service_status.0` is the existing `*const ServiceStatus` SendPtr payload.)
+
+- [ ] **Step 4: Fix any other `new()` caller**
+
+Run: `rg -n "ShmemAdaptedStateMachine::new" --type rust`. For any non-builder caller (e.g. a shmem state-machine test), pass that caller's journal + last_purged handles and `None` for `service_status_ptr`.
+
+- [ ] **Step 5: Build** — `cargo build -p uc_node` (dead-code warnings for the new fields/readers are expected until Task 6). **Commit:**
 ```bash
 git add uc_node/src/raft/state_machine_shmem.rs uc_node/src/runtime/builder.rs
-git commit -m "feat(uc_node): plumb service_epoch pointer into the shmem adapter"
+git commit -m "feat(uc_node): plumb ServiceStatus ptr + journal + last_purged into the adapter"
 ```
 
 ---
@@ -363,11 +373,11 @@ git commit -m "feat(uc_node): plumb service_epoch pointer into the shmem adapter
 
 **Files:** Modify `uc_node/src/raft/state_machine_shmem.rs`.
 
-The core. `await_apply_resp` returns a `Reattach` outcome instead of a resp when the epoch changes; `apply()`'s Normal branch, on `Reattach`, runs catch-up and uses the replay of entry N to satisfy the original wait. Needs a journal reader — pass an `Arc<Journal>` (already cloned as `journal_for_replay` in the builder) into the adapter, or read via a stored handle.
+The core. `await_apply_resp` returns `Reattach` (not an error → openraft stays happy) when the epoch changes; `apply()`'s Normal branch, on `Reattach` (or a lazy epoch check before publishing), runs `drive_catchup`, which replays `(service_last, N]` from the journal — consuming each resp itself — and returns N's resp.
 
 - [ ] **Step 1: Add `ApplyOutcome` and make `await_apply_resp` epoch-aware**
 
-Define near the helpers:
+Add near the ring helpers:
 ```rust
 enum ApplyOutcome {
     Resp(Bytes),
@@ -375,105 +385,173 @@ enum ApplyOutcome {
     Reattach,
 }
 ```
-Change `await_apply_resp` to take the current epoch context and return `Result<ApplyOutcome, io::Error>`. Add an `epoch_changed: &dyn Fn() -> bool` (or pass `service_epoch_ptr: Option<EpochPtr>` + `expected_epoch: u64`) parameter; at the TOP of the loop, before/after the shutdown check:
+Change `await_apply_resp`'s signature to add two Copy params and return `ApplyOutcome`:
 ```rust
-        if epoch_changed() {
+async fn await_apply_resp(
+    consumer: &PlMutex<SpscConsumer>,
+    expected_log_index: u64,
+    log_id: RaftLogId,
+    shutdown: &AtomicBool,
+    bridge: &NotifyBridge,
+    service_status_ptr: Option<ServiceStatusPtr>,
+    expected_epoch: u64,
+) -> Result<ApplyOutcome, io::Error> {
+```
+At the TOP of the loop, right after the existing `shutdown` check, add the epoch check (rides the existing `bridge.notified()` PARK_CEIL backstop — spike-proven, no new wakeup plumbing):
+```rust
+        if epoch_of(service_status_ptr) != expected_epoch {
             return Ok(ApplyOutcome::Reattach);
         }
 ```
-Keep the existing resp path but wrap the success return as `Ok(ApplyOutcome::Resp(...))`. The epoch check rides the existing `bridge.notified()` PARK_CEIL backstop (spike-proven ~8ms), so the parked await wakes and re-checks within ~2ms even with no resp traffic — no new wakeup plumbing.
-
-- [ ] **Step 2: Add a journal handle to the adapter**
-
-Add `pub(crate) journal: Arc<ultima_journal::Journal>` to `ShmemInner`, a constructor param, and pass `journal_for_replay.clone()` from the builder (it is already cloned there for the output-replay watcher). (Reading entries directly via the journal avoids needing a `&mut JournalLogStorage`; decode the same way `try_get_log_entries` does — see `log_storage.rs:226-243` for the bincode decode of an `Entry`.)
-
-- [ ] **Step 3: Catch-up driver method on the adapter**
+Change the success return from `return Ok(Bytes::from(std::mem::take(&mut payload_buf)));` to:
 ```rust
-    /// Replay committed entries to a reattached service. Called from apply() when
-    /// a Reattach is observed. Holds the inner lock for the duration (gating any
-    /// concurrent apply). Returns the resp bytes for `up_to` (the entry apply()
-    /// was waiting on), or an error.
-    async fn drive_catchup(
-        &self,
-        g: &mut tokio::sync::MutexGuard<'_, ShmemInner<S>>,
-        up_to_log_id: RaftLogId,
-    ) -> Result<Bytes, io::Error> {
-        let up_to = up_to_log_id.index;
-        // Reconcile epoch + read the reattached service's reported last_applied.
-        let new_epoch = g.current_epoch();
-        let service_last = /* read ServiceStatus.last_applied via a plumbed ptr,
-            mirroring service_epoch_ptr; add a `service_last_applied_ptr` field the
-            same way in Task 5 */ 0u64;
-        let last_purged = /* g.journal / last_purged index — plumb the last_purged
-            StableValue handle like the journal, or read from a stored LogStorageHandles */ 0u64;
-        // Drop stale resps from the dead incarnation (node owns resp consumer_position).
+                return Ok(ApplyOutcome::Resp(Bytes::from(std::mem::take(&mut payload_buf))));
+```
+Leave the mismatch and ring-error `Err(...)` paths unchanged.
+
+- [ ] **Step 2: Add the `drive_catchup` free function**
+
+Add after `await_apply_resp` (free function, borrows `&ShmemInner` shared so the caller can `&mut` after it returns; returns the resp for `up_to` plus the reconciled epoch):
+```rust
+/// Replay committed entries to a reattached service. Called from `apply()` when a
+/// reattach is observed (the parked entry `up_to` is, by the single-in-flight
+/// invariant, the node's live frontier). Reuses the apply ring + resp ring under
+/// the already-held inner lock (no concurrent apply). Returns `(resp_for_up_to,
+/// reconciled_epoch)`. An outer loop restarts if the service reattaches AGAIN
+/// mid-catch-up.
+async fn drive_catchup<S: StateMachine>(
+    g: &ShmemInner<S>,
+    shutdown: &AtomicBool,
+    up_to_log_id: RaftLogId,
+) -> Result<(Bytes, u64), io::Error> {
+    let up_to = up_to_log_id.index;
+    let ss_ptr = g.service_status_ptr;
+    let last_purged = g.last_purged.load().ok().flatten().map(|l| l.index).unwrap_or(0);
+
+    loop {
+        let epoch = epoch_of(ss_ptr);
+        let service_last = service_last_of(ss_ptr);
+
+        // Below the purge boundary: needs snapshot-install (Phase 2).
+        if service_last < last_purged {
+            return Err(io::Error::other(format!(
+                "reconstruct: service at {service_last} below purge boundary {last_purged}; \
+                 snapshot-install is Phase 2"
+            )));
+        }
+
+        // Drop any stale resps left by the dead incarnation (node owns the resp
+        // ring's consumer_position).
         g.apply_resp_consumer.lock().discard_backlog();
 
-        let node_frontier = up_to; // single-in-flight: the parked entry IS the frontier
+        // Replay `(from, up_to]`, always including up_to (the parked entry must be
+        // applied + acked). Fresh in-memory service => service_last == 0. A
+        // self-persisting service already at/above up_to => replay just up_to
+        // (idempotent re-apply; log_index is the idempotency key).
+        let from = if service_last >= up_to { up_to - 1 } else { service_last };
+
+        let iter = g
+            .journal
+            .iter_range((from + 1)..(up_to + 1))
+            .map_err(|e| io::Error::other(format!("reconstruct: iter_range: {e}")))?;
+
         let mut last_resp = Bytes::new();
-        match crate::runtime::reconstruct::decide_catchup_source(service_last, node_frontier, last_purged) {
-            crate::runtime::reconstruct::CatchupSource::Nothing => {}
-            crate::runtime::reconstruct::CatchupSource::NeedsSnapshot { .. } => {
-                return Err(io::Error::other(
-                    "reconstruct: service below purge boundary; snapshot-install is Phase 2",
-                ));
-            }
-            crate::runtime::reconstruct::CatchupSource::LogReplay { from, to } => {
-                for idx in (from + 1)..=to {
-                    // read entry `idx` from the journal, decode, skip non-Normal
-                    let cmd_bytes: Bytes = /* journal read + decode at idx; Normal only */ todo!();
-                    publish_apply(&g.apply_producer, idx, cmd_bytes.as_ref(), up_to_log_id, &self.shutdown).await?;
-                    match await_apply_resp(&g.apply_resp_consumer, idx, up_to_log_id,
-                        &self.shutdown, &g.apply_resp_bridge, /* epoch ctx */).await? {
-                        ApplyOutcome::Resp(b) => last_resp = b,
-                        ApplyOutcome::Reattach => {
-                            // Service crashed AGAIN mid-catch-up: restart catch-up.
-                            // (bounded recursion / loop; reconcile epoch and retry)
-                            todo!("re-enter catch-up for the newer epoch");
-                        }
+        let mut restart = false;
+        for record in iter {
+            let (seq, _meta, payload) = record
+                .map_err(|e| io::Error::other(format!("reconstruct: journal read: {e}")))?;
+            let (entry, _) = bincode::serde::decode_from_slice::<
+                <TypeConfig as openraft::RaftTypeConfig>::Entry,
+                _,
+            >(&payload, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let log_id = entry.log_id;
+            // Only Normal entries were ever delivered to the service; Blank /
+            // Membership never publish to apply.ring (mirror live apply()).
+            let cmd = match entry.payload {
+                EntryPayload::Normal(cmd) => cmd,
+                _ => continue,
+            };
+            publish_apply(&g.apply_producer, seq, cmd.as_ref(), log_id, shutdown).await?;
+            match await_apply_resp(
+                &g.apply_resp_consumer,
+                seq,
+                log_id,
+                shutdown,
+                &g.apply_resp_bridge,
+                ss_ptr,
+                epoch,
+            )
+            .await?
+            {
+                ApplyOutcome::Resp(b) => {
+                    if seq == up_to {
+                        last_resp = b;
                     }
+                }
+                ApplyOutcome::Reattach => {
+                    // Service reattached AGAIN mid-catch-up: restart from the new
+                    // epoch/service_last. Progress is guaranteed once it stays up.
+                    restart = true;
+                    break;
                 }
             }
         }
-        g.last_seen_epoch = new_epoch;
-        Ok(last_resp)
+        if restart {
+            continue;
+        }
+        return Ok((last_resp, epoch));
     }
+}
 ```
-> **IMPLEMENTER NOTE — this method has two `todo!()`s that MUST be filled, they are not optional:**
-> 1. **journal read+decode at `idx`** — mirror `JournalLogStorage::try_get_log_entries` (`log_storage.rs:226-243`): `g.journal.read(idx)` (or `iter_range`), bincode-decode to `Entry<TypeConfig>`, match `EntryPayload::Normal(cmd) => cmd.0`, skip `Blank`/`Membership` (advance the loop without publishing). If non-Normal, `continue` without publishing (the service's `last_applied` jumps over them, matching live apply).
-> 2. **second-reattach handling** — if a `Reattach` is observed mid-catch-up, reconcile the new epoch + new `service_last`, reset the apply-resp backlog again, and restart the replay loop from the new `service_last`. Implement as an outer `loop` around the replay with a re-read of epoch/service_last at the top, rather than recursion. Bound is natural (each restart makes progress once the service stays up).
->
-> These are genuinely intricate; if the journal-read API or the entry decode is unclear, STOP and report NEEDS_CONTEXT with the actual `log_storage.rs` decode code rather than guessing.
+Notes verified against the codebase: `entry.log_id` is a field and `entry.payload` matches `EntryPayload::Normal(cmd)` exactly as in the existing `apply()`; `cmd.as_ref()` yields `&[u8]` (the `AppCommand`→`Bytes` newtype); the decode mirrors `try_get_log_entries` (`log_storage.rs:235-239`); `iter_range` yields `Result<(seq, meta, payload), _>`. `EntryPayload`, `TypeConfig`, `RaftLogId`, `bincode` are already used in this file.
 
-- [ ] **Step 4: Wire `apply()`'s Normal branch to handle Reattach**
+- [ ] **Step 3: Restructure `apply()`'s Normal arm**
 
-In `apply()`, the `EntryPayload::Normal(cmd_bytes)` arm currently does `publish_apply` then `await_apply_resp`. Restructure:
+Current arm (≈ lines 240-267): publishes, awaits a `Bytes`, sends to `output_chan_tx`, returns the bytes. Replace the `EntryPayload::Normal(cmd_bytes) => { .. }` arm body with:
 ```rust
                 EntryPayload::Normal(cmd_bytes) => {
-                    // Lazy reattach check: if the service reattached since we last
-                    // reconciled, catch it up before applying this entry.
-                    if g.current_epoch() != g.last_seen_epoch {
-                        let resp = self.drive_catchup(&mut g, log_id).await?;
-                        // drive_catchup replayed up to and including this entry.
-                        if let Some(r) = responder { r.send(resp); }
-                        continue; // or fall through appropriately
+                    // Copy the epoch context out before the field borrows below.
+                    let ss_ptr = g.service_status_ptr;
+                    let expected_epoch = g.last_seen_epoch;
+                    let resp: Bytes = if epoch_of(ss_ptr) != expected_epoch {
+                        // Service reattached since we last reconciled: catch up
+                        // (replays incl. this entry) before publishing it live.
+                        let (b, epoch) = drive_catchup(&g, &shutdown, log_id).await?;
+                        g.last_seen_epoch = epoch;
+                        b
+                    } else {
+                        publish_apply(&g.apply_producer, log_index, cmd_bytes.as_ref(), log_id, &shutdown).await?;
+                        match await_apply_resp(
+                            &g.apply_resp_consumer, log_index, log_id, &shutdown,
+                            &g.apply_resp_bridge, ss_ptr, expected_epoch,
+                        )
+                        .await?
+                        {
+                            ApplyOutcome::Resp(b) => b,
+                            ApplyOutcome::Reattach => {
+                                let (b, epoch) = drive_catchup(&g, &shutdown, log_id).await?;
+                                g.last_seen_epoch = epoch;
+                                b
+                            }
+                        }
+                    };
+                    // M5: hand off to output_dispatcher exactly once for this entry
+                    // (unchanged from the original arm).
+                    if let Err(e) = g.output_chan_tx.try_send((log_index, cmd_bytes.clone().into())) {
+                        tracing::warn!(log_index, ?e, "output_chan full; replay will catch this");
                     }
-                    publish_apply(&g.apply_producer, log_index, cmd_bytes.as_ref(), log_id, &self.shutdown).await?;
-                    match await_apply_resp(&g.apply_resp_consumer, log_index, log_id,
-                        &self.shutdown, &g.apply_resp_bridge, /* epoch ctx */).await? {
-                        ApplyOutcome::Resp(b) => b,
-                        ApplyOutcome::Reattach => self.drive_catchup(&mut g, log_id).await?,
-                    }
+                    resp
                 }
 ```
-> **IMPLEMENTER NOTE:** the control flow here (the `continue` vs producing `resp_bytes`, the output_chan_tx `try_send` still applying to the entry, the `g.last_applied = Some(log_id)` already set earlier) needs care to match the existing arm's post-processing. Keep the existing `output_chan_tx.try_send` for the entry and the `responder.send` exactly once. Prefer restructuring so `drive_catchup` returns the resp and the arm's tail (`output_chan_tx`, `responder.send`) runs once for `log_index`. If this restructure fights the borrow checker (holding `&mut g` across `drive_catchup` which also takes `&mut g`), pass the already-held guard into `drive_catchup` (as the signature shows) rather than re-locking.
+Borrow notes: `drive_catchup(&g, ..)` takes `&ShmemInner` (deref-coerced from `&MutexGuard`) and returns owned values, so the subsequent `g.last_seen_epoch = epoch` and `g.output_chan_tx.try_send(..)` (`&mut g`) compile cleanly — the shared borrow ends at the call's return. `ss_ptr`/`expected_epoch` are `Copy`, captured before the field borrows. Do NOT change the `g.last_applied = Some(log_id)` line above the match (it stays).
 
-- [ ] **Step 5: Build + run the existing shmem tests (regression)**
+- [ ] **Step 4: Build + regression**
 
 Run: `cargo build -p uc_node && cargo test -p uc_node --test m3_shmem_single_node`
-Expected: builds; existing single-node tests pass (no reattach occurs, epoch stays 1 after first attach so the lazy check is false).
+Expected: builds; existing single-node tests pass. Because `last_seen_epoch` is seeded to the current epoch (Task 5), the first live apply after attach takes the normal path (epoch unchanged) — no spurious catch-up. A reattach (epoch re-bump) is the only trigger.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 ```bash
 git add uc_node/src/raft/state_machine_shmem.rs
 git commit -m "feat(uc_node): reattach-aware apply — self-driving catch-up (Phase 1 core)"
@@ -549,4 +627,13 @@ Expected: all PASS.
 - **§3a wakeup** → Task 6 epoch check rides the PARK_CEIL backstop (spike-proven).
 - **§7 errors** → `NeedsSnapshot` → loud error; replay/journal errors → `io::Error` out of `apply()` only after exhausting reattach handling. NOTE: an `apply()` error is fatal to openraft — ensure only genuinely-unrecoverable conditions error; `Reattach` is an outcome, not an error.
 - **Risk — `apply()` returning Err is fatal:** the `NeedsSnapshot` path errors `apply()`, which shuts openraft down. For Phase 1 (no snapshot support) that is the honest behavior (can't reconstruct), but call it out in the test/docs; Phase 2 removes this path.
-- **Tasks 6's two `todo!()`s and the apply() restructure are the risk centers** — they are explicitly flagged with IMPLEMENTER NOTEs and NEEDS_CONTEXT escalation guidance, not left as silent placeholders.
+- **Task 6 is now fully concretized** (no `todo!()`s): `drive_catchup` and the
+  `apply()` arm restructure are written out with verified APIs (`entry.log_id` field,
+  `EntryPayload::Normal`, `iter_range` + bincode decode mirroring `try_get_log_entries`,
+  borrow-sound `&ShmemInner` + Copy epoch context). The remaining real risk is the
+  `apply()` arm restructure compiling against the borrow checker exactly as written —
+  the implementer should build incrementally and, if it fights, keep the documented
+  shape (Copy the epoch context first; `drive_catchup` returns owned values).
+- **Single-in-flight invariant is load-bearing:** `drive_catchup` assumes `up_to` (the
+  parked entry) is the node frontier. If `apply()` is ever made to publish more than one
+  entry concurrently in the future, revisit `drive_catchup`'s range logic.
