@@ -142,9 +142,10 @@ fn dump_history(entries: &[lincheck::history::Entry], seed: u64) {
 
 /// The capstone: a few seeded, throttled workers drive a concurrent CAS-register
 /// workload while a seeded scheduler injects one quorum-preserving fault at a
-/// time (leader node-kill+restart), waiting for recovery between faults. The
-/// recorded history must be linearizable. (Service-crash is excluded here — it
-/// needs a self-persisting SM; see the fault-loop comment below and task12.)
+/// time — leader node-kill+restart OR leader service-crash+restart — waiting for
+/// recovery between faults. The recorded history must be linearizable. Both fault
+/// kinds are safe because RegisterSm persists its own state (register_sm.rs), so
+/// a reconnecting service recovers from disk rather than serving stale state.
 ///
 /// Multi-thread runtime (the default): the 3-node shmem boot deadlocks under the
 /// current_thread runtime — see `smoke_3node_submit_read`.
@@ -193,24 +194,26 @@ async fn linearizable_under_failover() {
         )));
     }
 
-    // Fault scheduler: inject one fault at a time (the method is &self and locks
-    // internally), waiting for recovery between faults, until enough ops have
-    // completed Ok. Workers keep running against the shared Arc<LinCluster>.
-    //
-    // Only leader node-kill+restart is injected here. A full node restart replays
-    // the committed log from the durable last_applied (0 before the first
-    // snapshot) back into a fresh service, so the in-memory RegisterSm is rebuilt
-    // correctly. A *service*-only crash+restart is NOT linearizable-testable with
-    // an in-memory SM: uc does not rebuild a reconnecting service's state (it
-    // assumes the StateMachine persists its own durable state, as the production
-    // StoreStateMachine does via ultima_db), so a fresh RegisterSm would serve
-    // stale state. Service-crash liveness is covered by fault_roundtrip_keeps_
-    // serving; service-crash linearizability needs a self-persisting SM — see
-    // docs/tasks/task12_linearizability_harness.md.
+    // Fault scheduler: inject one quorum-preserving fault at a time (the methods
+    // are &self and lock internally), waiting for recovery between faults, until
+    // enough ops have completed Ok. Workers keep running against the shared
+    // Arc<LinCluster>. The seeded RNG picks between the two fault kinds:
+    //   - leader node-kill+restart (full process down, rejoin via persisted
+    //     data_dir), and
+    //   - leader service-crash+restart (node stays up; the service watcher
+    //     transfers leadership; a fresh service reloads its durable state).
+    // Both are linearizable-safe now that RegisterSm persists its own state
+    // (register_sm.rs): a reconnecting service recovers from disk rather than
+    // serving stale/empty state (uc does not replay history into it).
+    let mut fault_rng = StdRng::seed_from_u64(seed ^ 0xFA17);
     let mut faults = 0u32;
     while History::ok_count(&history.snapshot()) < target_ops {
         tokio::time::sleep(fault_period).await;
-        cluster.kill_and_restart_leader().await;
+        if fault_rng.random_bool(0.5) {
+            cluster.kill_and_restart_leader().await;
+        } else {
+            cluster.crash_and_restart_leader_service().await;
+        }
         faults += 1;
     }
 

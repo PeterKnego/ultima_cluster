@@ -97,7 +97,10 @@ async fn spawn_service(instance_dir: &std::path::Path, data_dir: &std::path::Pat
         data_dir: data_dir.to_owned(),
         ..ServiceConfig::default()
     };
-    ServiceBuilder::new(cfg, RegisterSm::default())
+    // Service-side SM persists its state to `data_dir` (see register_sm.rs) so a
+    // service-only restart recovers — the node does not replay history into a
+    // reconnecting service.
+    ServiceBuilder::new(cfg, RegisterSm::new(data_dir.to_owned()))
         .run()
         .await
         .expect("service start")

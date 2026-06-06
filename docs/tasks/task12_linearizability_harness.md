@@ -33,10 +33,15 @@ cluster/tokio deps so they unit-test in milliseconds:
   `Model`.
 - `register_sm.rs` — `RegisterSm`, the replicated SM the cluster actually runs
   (`uc_service::StateMachine`): `Command = Write|Cas`, `Response = WriteAck|
-  CasResult`, `Query = ()`, `QueryResponse = Option<u64>`. **In-memory** (value
-  in a field; snapshot in/out (de)serialize `(value,last_applied)`). This
-  in-memory choice is the reason service-crash faults are out of scope — see
-  Findings.
+  CasResult`, `Query = ()`, `QueryResponse = Option<u64>`. **Self-persisting**:
+  it writes `(value, last_applied)` durably to its `data_dir` on every apply
+  (fsync before returning the response, so the framework only ever acks durable
+  state), reloads it on startup, and guards on `log_index` so recovery replays
+  are idempotent (CAS is not). This mirrors the production `StoreStateMachine`
+  contract (persist to `ultima_db`) and is what lets a *service-only* restart
+  recover — uc does not replay history into a reconnecting service (Finding #2).
+  The degenerate node-side SM is `RegisterSm::default()` (no `data_dir`, never
+  persists; in shmem mode it doesn't apply app data).
 - `cluster.rs` — `LinCluster`, a 3-node shmem fault harness (one
   `instance_dir`/`data_dir`/`svc_data_dir` per node). All methods take `&self`
   with an internal `tokio::sync::Mutex<Vec<Node>>` + `Arc<Client>` per node so
@@ -81,10 +86,10 @@ double-applied CAS, concurrent overlap, an indeterminate write that may be
 present-or-absent, and one that must have happened) and assert `Linearizable` vs
 `Violation` — validating the checker independent of the cluster.
 
-## Fault model — leader node-kill+restart only
+## Fault model — leader node-kill+restart AND service-crash+restart
 
-The capstone injects one quorum-preserving fault at a time, waiting for a stable
-leader between faults:
+The capstone injects one quorum-preserving fault at a time (seeded 50/50 choice),
+waiting for a stable leader between faults:
 
 - `kill_and_restart_leader`: gracefully shut down the leader's node **and**
   service; survivors (2/3) re-elect; then restart the node against its
@@ -92,19 +97,23 @@ leader between faults:
   change) but a **fresh shmem `instance_dir`** (the control/ring files are
   volatile per-process IPC, not cluster state; a stale `cnc.dat` would race the
   service handshake), with a fresh service + reconnected client (a restarted
-  node has a new `instance_id`, invalidating the old client).
+  node has a new `instance_id`, invalidating the old client). Teardown is
+  node-first, then service (Finding #3).
+- `crash_and_restart_leader_service`: gracefully shut down only the leader's
+  **service**; the node stays up, its service-watcher transfers leadership; a
+  fresh service is started on the same `svc_data_dir`.
 
-A full node restart re-applies the committed log from the durable `last_applied`
-(which is 0 before the first snapshot) back into the fresh service, so the
-in-memory `RegisterSm` is rebuilt correctly — this fault is linearizable-safe.
+Both faults are linearizable-safe because `RegisterSm` **persists its own state**
+(see "What it is"). A node restart re-applies the committed log into the fresh
+service, whose `log_index` guard makes the replay idempotent; a service restart
+reloads durable state from `svc_data_dir`. This is the production
+`StoreStateMachine` contract — uc does not replay history into a reconnecting
+service, so the SM must own its durability (Finding #2).
 
-**Service-crash+restart is deliberately excluded from the linearizability
-capstone** (it remains covered for *liveness* by `fault_roundtrip_keeps_
-serving`). See Findings #2: uc does not rebuild a reconnecting service's state,
-so a service crash with an in-memory SM serves stale state. Testing
-linearizability under service-crash requires a **self-persisting** SM (the
-production `StoreStateMachine`, which persists to `ultima_db`) and is future
-work.
+Note: faults are **graceful** shutdowns (`shutdown().await`), so the in-flight
+apply completes before teardown. A true hard crash (e.g. `kill -9`) of a service
+mid-apply — where an entry is read off the SPSC ring but not acked — is **not**
+exercised yet; see Deferred.
 
 ## Findings (surfaced by building the harness)
 
@@ -130,17 +139,27 @@ often to bound it. Regression tests:
 `reconcile_leaves_output_progress_below_last_applied_untouched`.
 
 **2. A reconnecting service is NOT rebuilt — the SM must persist its own state
-(documented design, NOT a bug).** When a service crashes and a fresh service
-reconnects to a still-running node, uc does not replay history or install a
-snapshot into it (`uc_service/src/runtime/service.rs` passes the user SM straight
-to the apply loop; `uc_node/src/raft/state_machine_shmem.rs` never queries the
-service's `last_applied`). The service resumes applying only **new** entries.
-This is fine for the production `StoreStateMachine` (state is durable in
-`ultima_db`) but means a purely in-memory SM returns with amnesia. The
-linearizability capstone therefore restricts itself to node-kill+restart (full
-log replay rebuilds the SM). This is the contract worth stating loudly: **a
-custom `StateMachine` must persist its own durable state to survive a
-service-only restart.**
+(documented design, NOT a bug; resolved by making `RegisterSm` persistent).**
+When a service crashes and a fresh service reconnects to a still-running node, uc
+does not replay history or install a snapshot into it
+(`uc_service/src/runtime/service.rs` passes the user SM straight to the apply
+loop; `uc_node/src/raft/state_machine_shmem.rs` never queries the service's
+`last_applied`). The service resumes applying only **new** entries. This is fine
+for the production `StoreStateMachine` (state is durable in `ultima_db`) but means
+a purely in-memory SM returns with amnesia. An early version of `RegisterSm` was
+in-memory, and the capstone caught the resulting violation: a linearizable read
+returned `None` (empty register) long after the register had been written —
+because a reconnecting service served fresh/empty state.
+
+**Resolution:** `RegisterSm` was made **self-persisting** (writes `(value,
+last_applied)` per apply, fsync-before-ack, reload on startup, `log_index`
+idempotency guard) — mirroring the `StoreStateMachine` contract. With that, the
+capstone exercises **both** node-kill+restart and service-crash+restart and stays
+linearizable across seeds. The contract worth stating loudly: **a custom
+`StateMachine` must persist its own durable state to survive a service-only
+restart** — uc does not reconstruct it for you. (Making uc reconstruct a
+reconnecting service from the log — the deferred `ServiceReady{last_applied}`
+cross-check — would make in-memory SMs first-class; see Deferred.)
 
 **3. Node shutdown hangs if the service is torn down first while a client write
 is in-flight (worked around in the harness; possible uc robustness follow-up).**
@@ -193,8 +212,18 @@ capstone takes ~1–2 minutes.
 
 ## Deferred / future work
 
-- **Linearizability under service-crash** — needs a self-persisting SM (the
-  `StoreStateMachine` ultima_db adapter); a distinct, heavier test.
+- **Hard service crash (`kill -9` mid-apply).** Faults today are *graceful*
+  shutdowns, so the in-flight apply completes before teardown. A true crash that
+  drops an entry already read off the SPSC apply ring but not yet acked is not
+  exercised; whether uc re-drives that entry on reconnect (vs. the node stalling
+  awaiting its ack) is untested. Needs an abrupt task-abort fault primitive.
+- **uc-side service-state reconstruction** — make the node rebuild a reconnecting
+  service from the log (drive replay from the already-defined
+  `ServiceReady{last_applied}` handshake; snapshot-install for purged ranges).
+  This would make purely in-memory SMs first-class (no per-SM persistence
+  needed) and subsumes the manual persistence in `RegisterSm`. Bigger, own spec.
+- **Linearizability with the real `StoreStateMachine`** (ultima_db adapter)
+  rather than the test `RegisterSm` — maximal production realism; heavier test.
 - **Network partition / quorum-loss / packet loss** — needs a lossy QUIC test
   transport; deferred from the original design.
 - **Deterministic simulation (sim-clock + sim-net)** — the cluster runs on real
