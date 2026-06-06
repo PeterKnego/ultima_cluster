@@ -317,6 +317,18 @@ Principle: **reconstruction is best-effort-with-retry; failure never corrupts
 node/raft state** — the service is simply not marked usable until it catches up.
 Everything logs loudly.
 
+> **Phase 1 implementation reality (2026-06-06):** because the reattach catch-up
+> runs *inside* `apply()` (the self-driving design, §3a), an unrecoverable
+> reconstruction error there returns `Err` from `apply()`, which **openraft treats
+> as fatal → the node shuts down** — it does NOT degrade to "service not marked
+> usable" as the principle above envisions. The two error paths that hit this in
+> Phase 1: (a) the **`NeedsSnapshot`** case (service below the purge boundary —
+> only reachable on a long-running cluster after a snapshot+purge, since
+> snapshot-install is Phase 2), and (b) a **journal gap** (the `saw_up_to` guard).
+> Both are loud, fail-stop, and non-corrupting, but node-killing rather than
+> service-scoped. Phase 2 (snapshot-install) removes (a); revisiting the
+> in-apply error surface to degrade gracefully is follow-up work.
+
 - Snapshot-install / log-replay failure (crc mismatch, `install_snapshot` error,
   journal IO): abort reconstruction, don't mark the service ready; service retries
   attach; node keeps replicating (and transfers leadership if leader, per existing
