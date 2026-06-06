@@ -72,7 +72,9 @@ mod tests {
             heartbeat_seq: AtomicU64::new(0),
             heartbeat_at_ns: AtomicU64::new(0),
             service_pid: AtomicU32::new(0),
-            _pad_2: [0; 20],
+            _pad_2a: 0,
+            service_epoch: AtomicU64::new(0),
+            _pad_2: [0; 8],
         })
     }
 
