@@ -126,7 +126,24 @@ PR.** Sequenced; later phases build on earlier ones.
 2. **Phase 2 — real snapshot path** via `snapshot.region` (§5). Both directions:
    BUILD (service→node) and INSTALL (node→service). Closes the cold-start+snapshot
    gap, the below-purge reattach case, and the latent safe-purge hole (see §5). The
-   bulk of the effort.
+   bulk of the effort. **Split (decided 2026-06-06) into correctness-first / opt-second:**
+   - **Phase 2a — functional snapshot path.** Real bidirectional BUILD+INSTALL over
+     `snapshot.region`, using the **existing blocking** `build_snapshot(&self,dst)` /
+     `install_snapshot(&mut self,src)` — **NO trait change**. Wires the reattach
+     `NeedsSnapshot` path to install-then-tail-replay, and backs log-purge with real
+     snapshots. Closes all the correctness gaps. `StoreStateMachine` already
+     implements these methods over `ultima_db::snapshot_stream`.
+   - **Phase 2b — async build.** The `freeze`/`stream_snapshot`/`SnapshotHandle`
+     trait change (§6) so snapshot BUILD doesn't stall applies. Pure optimization;
+     maps cleanly onto `ultima_db` (`freeze` = `store.snapshot_stream(version)`'s
+     reader, which already pins an MVCC version under a brief lock). Separate PR.
+
+   **Transport decision (2026-06-06): `snapshot.region` is a SEPARATE
+   dynamically-sized mmap file** under `instance_dir/service/` (like the ring files —
+   NOT a fixed-size cnc sub-buffer). Investigation note: there's no existing
+   dynamic-mmap precedent, so the writer builds bytes to a buffer, `ftruncate`s the
+   region to length, then writes; the reader mmaps that length and validates a header
+   (magic, len, snapshot `last_log_id`, crc).
 3. **Phase 3 — contract flip + parity cleanups + proof** (§6, §8).
 
 **Not a phase (already works):** cold-start reconstruction when no snapshot has been
