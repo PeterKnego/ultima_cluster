@@ -133,6 +133,65 @@ PR.** Sequenced; later phases build on earlier ones.
 taken — openraft re-applies `(applied, committed]` itself (§2 callout). A loud error
 on the unsupported cold-start+snapshot+in-memory case lands naturally with Phase 2.
 
+## 3a. Phase 1 reattach mechanics (design pass, 2026-06-06)
+
+Grounded in the SPSC ring + apply-pipeline internals:
+
+- **Ring cursors are in the shared header** (`publish_position`, `consumer_position`,
+  both `AtomicU64`), so they survive a service restart — a fresh `SpscConsumer`
+  resumes from the persisted `consumer_position` (the bug). A "reset" = advance
+  `consumer_position` to `publish_position` (discard stale unconsumed frames).
+- **`apply()` is strictly serial: at most ONE entry in flight.** It publishes N, then
+  `await_apply_resp(N)`, then loops. So on a mid-apply crash there is exactly one
+  unacked frame and `node_frontier = N` (apply sets `last_applied = Some(N)` *before*
+  publishing). This single-in-flight invariant is what makes the design tractable.
+- **The parked `apply()` holds the `inner` lock** while awaiting resp N, so a
+  separate task cannot drive catch-up concurrently — the parked apply must handle it.
+- **`await_apply_resp` treats any log_index mismatch as fatal**, and openraft treats
+  an `apply()` `Err` as fatal — so we must NOT abandon the parked apply with an error,
+  and replayed resps must not trip the ordering check.
+
+### Decisions
+
+1. **Detection — explicit `service_epoch` (default; overridable).** Add
+   `service_epoch: AtomicU64` to `ServiceStatus`. Each new service incarnation bumps
+   it at attach **before** flipping `READY` (Release, ordered with the state flag like
+   `last_applied` in channel A). The node tracks the last-seen epoch; a change = a
+   reattach. Monotonic and unambiguous (vs. `service_pid` reuse).
+2. **Reattach-aware, self-driving apply.** `await_apply_resp` wakes not only on the
+   resp-ring signal but on an epoch change. When the parked `apply(N)` observes a
+   reattach, *that same call*: (a) resets the apply + resp ring cursors (discard the
+   stale frame N and any stale resp from the dead incarnation), (b) replays
+   `(service_last_applied, N-1]` from the journal — publishing each and consuming its
+   resp **itself** (it owns the ring exclusively, so the strict ordering check holds
+   within the replay and there is no contention), (c) re-publishes N, awaits resp N,
+   returns it. openraft never sees an error; the single-in-flight invariant guarantees
+   one coordinator. For the **idle** case (crash with no apply parked), the next
+   `apply()` checks the epoch at the top and runs the same catch-up before publishing.
+3. **Proactive + lazy trigger.** A reattach watcher (extend `service_watcher`)
+   detects the epoch change and signals "reconstruction needed". If an `apply()` is
+   parked (holds the lock), it self-drives (decision 2). If the node is idle (no lock
+   held), the watcher-triggered coordinator takes the `inner` lock and drives catch-up
+   `(service_last_applied, node_frontier]` proactively — so queries to the
+   reattached service aren't answered from stale/empty state while waiting for the
+   next commit. Both paths take the same lock, so they serialize; exactly one runs.
+
+### Open implementation risks (resolve in the plan / a spike)
+
+- **Waking `await_apply_resp` on epoch change.** The await currently parks on
+  `bridge.notified().await`. It must also wake on the epoch signal — needs a
+  select over (resp-ring notify, epoch notify) or a periodic epoch poll. A small
+  feasibility spike on this wakeup is warranted before committing the full plan.
+- **Idempotent re-apply of N for self-persisting SMs.** The dead incarnation may have
+  applied N before crashing. Re-applying N is safe for `StoreStateMachine` (version
+  pinned to `log_index`) and for in-memory SMs (deterministic); document the
+  requirement. `log_index` remains the idempotency key.
+- **Resp-ring reset vs. a late resp from the dead incarnation.** Resetting the resp
+  `consumer_position` to its `publish_position` discards any straggler resp; confirm
+  no torn read across the reset.
+- **`node_frontier` source.** Must be the **in-memory** `last_applied` (current), not
+  the durable StableValue — correct here because the node stayed up.
+
 ## 4. Channel: how the node learns `service_last_applied` (Decision: A)
 
 The service publishes its recovered `last_applied` into the **existing**
