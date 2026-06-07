@@ -24,6 +24,7 @@ use super::handshake::set_service_state;
 use super::liveness::{LivenessHandle, spawn_liveness};
 use super::output_loop::OutputLoopHandle;
 use super::query_loop::{QueryLoopHandle, spawn_query_loop};
+use super::snapshot_loop::{SnapshotLoopHandle, spawn_snapshot_loop};
 use crate::output_handler::OutputHandler;
 use crate::state_machine::StateMachine;
 
@@ -194,6 +195,18 @@ impl<S: StateMachine> ServiceBuilder<S> {
             }
         };
 
+        let snapshot_region_path = self
+            .config
+            .instance_dir
+            .join("service")
+            .join("snapshot.region");
+        let snapshot_control = spawn_snapshot_loop(
+            Arc::clone(&sm_shared),
+            attached.snapshot_consumer,
+            attached.snapshot_resp_producer,
+            snapshot_region_path,
+        );
+
         // Reconstruction handshake (Phase 1): publish recovered last_applied,
         // bump the epoch (so the node detects this (re)attach), THEN flip READY.
         // All Release; ordered before the state→READY Release the node Acquires.
@@ -212,6 +225,7 @@ impl<S: StateMachine> ServiceBuilder<S> {
             query,
             liveness,
             output,
+            snapshot_control,
         })
     }
 }
@@ -242,6 +256,7 @@ pub struct Service {
     query: QueryLoopHandle,
     liveness: LivenessHandle,
     output: Option<OutputLoopHandle>,
+    snapshot_control: SnapshotLoopHandle,
 }
 
 impl Service {
@@ -262,6 +277,7 @@ impl Service {
         self.apply.stop.store(true, Ordering::Relaxed);
         self.query.stop.store(true, Ordering::Relaxed);
         self.liveness.stop.store(true, Ordering::Relaxed);
+        self.snapshot_control.stop.store(true, Ordering::Relaxed);
 
         // Join the std::thread on a blocking task so we don't pin a tokio
         // worker.
@@ -274,6 +290,7 @@ impl Service {
 
         let _ = self.query.join.await;
         let _ = self.liveness.join.await;
+        let _ = self.snapshot_control.join.await;
         Ok(())
     }
 }

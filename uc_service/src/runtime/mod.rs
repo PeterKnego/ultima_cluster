@@ -20,5 +20,7 @@ pub mod liveness;
 pub mod output_loop;
 pub mod query_loop;
 pub mod service;
+pub mod snapshot_loop;
 
 pub use service::{Service, ServiceBuilder, ServiceConfig, ServiceError};
+pub use snapshot_loop::{SnapshotLoopHandle, spawn_snapshot_loop};
