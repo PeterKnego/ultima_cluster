@@ -167,8 +167,24 @@ impl<S: StateMachine> NodeBuilder<S> {
                     snapshot_resp_consumer,
                     instance_dir.join("service").join("snapshot.region"),
                 )?;
-                let query_link = Arc::new(ShmemQueryLink::new(query_producer, query_resp_consumer));
-                let handle_sm = SmAdapter::Shmem(adapter.clone());
+                // Reconcile wiring (driver-redesign): the read-gate holds only
+                // lightweight signals (no adapter clone); the proactive driver owns
+                // the repurposed 2nd adapter clone so the live-clone count stays at
+                // two (openraft's + driver's) and the extra-clone freeze is avoided.
+                let reconcile_request = std::sync::Arc::new(tokio::sync::Notify::new());
+                let read_gate = adapter.reconcile_gate(reconcile_request.clone());
+                let driver_adapter = adapter.clone(); // the (only) 2nd clone
+                let reconcile_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                // NodeHandle only needs the shared shutdown flag (to abort a parked
+                // apply on shutdown) — not a full adapter clone.
+                let shutdown_flag = adapter.shutdown.clone();
+
+                let query_link = Arc::new(ShmemQueryLink::with_gate(
+                    query_producer,
+                    query_resp_consumer,
+                    Some(read_gate),
+                ));
+                let handle_sm = SmAdapter::Shmem(shutdown_flag);
                 let node_id_for_watcher = self.config.node_id;
                 let mut handle = finish(
                     self.config,
@@ -272,9 +288,17 @@ impl<S: StateMachine> NodeBuilder<S> {
                     instance_dir.join("clients").join("sessions.dir"),
                 );
 
+                // Proactive reconcile driver — owns `driver_adapter` (the 2nd clone).
+                let reconcile_driver = crate::raft::state_machine_shmem::spawn_reconcile_driver(
+                    driver_adapter,
+                    reconcile_request,
+                    reconcile_stop,
+                );
+
                 handle.client_dispatcher = Some(client_dispatcher);
                 handle.client_query_dispatcher = Some(client_query_dispatcher);
                 handle.session_gc = Some(session_gc);
+                handle.reconcile_driver = Some(reconcile_driver);
 
                 Ok(handle)
             }
@@ -494,6 +518,7 @@ where
         session_gc: None,
         output_dispatcher: None,
         output_replay_watcher: None,
+        reconcile_driver: None,
     })
 }
 

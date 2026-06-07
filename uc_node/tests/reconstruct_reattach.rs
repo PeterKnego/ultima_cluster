@@ -211,3 +211,111 @@ async fn in_memory_sm_reconstructed_on_service_restart() {
     service2.shutdown().await.expect("service2 shutdown");
     node.shutdown().await.expect("node shutdown");
 }
+
+/// Phase-3 proof of the READ-GATE / proactive trigger: a READ issued immediately
+/// after a service restart — with NO intervening write to drive the lazy apply
+/// trigger — must still observe the reconstructed state, not the fresh SM's empty
+/// value. Without the read-gate this returns 0 (the fresh in-memory CounterSm).
+///
+/// This is the gap the lincheck capstone caught: reconstruction was lazy-only
+/// (triggered by the next apply), so reads in the reattach→next-commit window saw
+/// the empty service. The query path now calls `ensure_reconciled()` first.
+#[tokio::test(flavor = "current_thread")]
+async fn in_memory_sm_reconstructed_before_read_after_restart() {
+    let instance_tempdir = TempDir::new().unwrap();
+    let node_data_tempdir = TempDir::new().unwrap();
+    let service_data_tempdir = TempDir::new().unwrap();
+    let instance_dir = instance_tempdir.path().to_owned();
+    let app_id = "reconstruct-reattach-read".to_string();
+
+    let node_cfg = NodeConfig {
+        node_id: 1,
+        data_dir: node_data_tempdir.path().to_owned(),
+        raft_listen_addr: "127.0.0.1:0".parse().unwrap(),
+        app_id: app_id.clone(),
+        bootstrap: BootstrapConfig::SingleNode,
+        raft: RaftTuning::default(),
+        tls: TlsConfig::default(),
+        ipc_mode: IpcMode::Shmem {
+            instance_dir: instance_dir.clone(),
+        },
+        client_rings: ClientRingConfig::default(),
+        service_rings: ServiceRingConfig::default(),
+        log_durability: ultima_journal::Durability::Eventual,
+    };
+    let node_task = tokio::spawn(async move {
+        NodeBuilder::new(node_cfg, CounterSm::default())
+            .start()
+            .await
+    });
+    wait_for_path(&instance_dir.join("cnc.dat"), Duration::from_secs(5)).await;
+
+    let mk_svc_cfg = || ServiceConfig {
+        instance_dir: instance_dir.clone(),
+        app_id: app_id.clone(),
+        data_dir: service_data_tempdir.path().to_owned(),
+        ..ServiceConfig::default()
+    };
+    let svc_cfg1 = mk_svc_cfg();
+    let svc_task = tokio::spawn(async move {
+        ServiceBuilder::new(svc_cfg1, CounterSm::default())
+            .run()
+            .await
+    });
+    let node = tokio::time::timeout(Duration::from_secs(15), node_task)
+        .await
+        .expect("node start timed out")
+        .expect("node task panic")
+        .expect("node start error");
+    let service = tokio::time::timeout(Duration::from_secs(15), svc_task)
+        .await
+        .expect("service start timed out")
+        .expect("service task panic")
+        .expect("service start error");
+
+    for _ in 0..50 {
+        if node.current_leader().await == Some(1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(node.current_leader().await, Some(1), "leader did not converge");
+
+    // Establish state: counter == 6.
+    assert_eq!(node.submit(1u64).await.expect("submit 1"), 1);
+    assert_eq!(node.submit(2u64).await.expect("submit 2"), 3);
+    assert_eq!(node.submit(3u64).await.expect("submit 3"), 6);
+
+    // Crash ONLY the service, then restart with a FRESH (zeroed) in-memory SM.
+    service.shutdown().await.expect("crash service");
+    let svc_cfg2 = mk_svc_cfg();
+    let service2 = tokio::time::timeout(
+        Duration::from_secs(15),
+        tokio::spawn(async move {
+            ServiceBuilder::new(svc_cfg2, CounterSm::default())
+                .run()
+                .await
+        }),
+    )
+    .await
+    .expect("service restart timed out")
+    .expect("service restart task panic")
+    .expect("service restart error");
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // ── The proof: a READ with NO preceding write must see the reconstructed
+    //    value 6, NOT the fresh SM's 0. ───────────────────────────────────
+    let q = node
+        .submit_query(())
+        .await
+        .expect("query post-restart (no prior write)");
+    assert_eq!(
+        q, 6,
+        "read-gate must reconstruct the fresh service before serving the query; \
+         got {q} (0 means the empty SM answered — stale read)"
+    );
+
+    service2.shutdown().await.expect("service2 shutdown");
+    node.shutdown().await.expect("node shutdown");
+}

@@ -34,12 +34,12 @@ use crate::raft::state_machine_shmem::ShmemAdaptedStateMachine;
 /// Which state-machine adapter the node is driving.
 pub(crate) enum SmAdapter<S: StateMachine> {
     Embedded(AdaptedStateMachine<S>),
-    /// Shmem-mode handle. The `ShmemAdaptedStateMachine` is held here for
-    /// future query/snapshot routing through the service; M3 doesn't
-    /// reach into it (apply traffic flows entirely through openraft's
-    /// internal clone of the adapter).
-    #[allow(dead_code)]
-    Shmem(ShmemAdaptedStateMachine<S>),
+    /// Shmem mode. We deliberately do NOT hold a `ShmemAdaptedStateMachine` clone
+    /// here: an extra live adapter clone triggers a reconstruction freeze (see the
+    /// driver-redesign plan), and the only thing shutdown needs from the adapter is
+    /// to set its `shutdown` flag (so a parked `apply()` aborts). So we keep just
+    /// that shared flag. The repurposed 2nd clone lives in the reconcile driver.
+    Shmem(std::sync::Arc<std::sync::atomic::AtomicBool>),
 }
 
 /// Type-erased Raft handle over the two concrete SM adapters.
@@ -185,6 +185,11 @@ pub struct NodeHandle<S: StateMachine> {
     /// replay tasks are spawned while the dispatcher is draining.
     pub(crate) output_replay_watcher:
         Option<crate::runtime::output_replay::OutputReplayWatcherHandle>,
+    /// Shmem-mode only: proactive reconcile driver (owns the repurposed 2nd
+    /// adapter clone). Rebuilds a reattached service to the node frontier so reads
+    /// don't observe stale state. Stopped + joined on shutdown.
+    pub(crate) reconcile_driver:
+        Option<crate::raft::state_machine_shmem::ReconcileDriverHandle>,
 }
 
 impl<S: StateMachine> NodeHandle<S> {
@@ -358,14 +363,23 @@ impl<S: StateMachine> NodeHandle<S> {
             session_gc,
             output_dispatcher,
             output_replay_watcher,
+            reconcile_driver,
         } = self;
 
         // Shmem mode: signal the state-machine adapter to abort any apply()
         // that is parked waiting on the service rings (e.g. the service has
         // crashed). Otherwise raft.shutdown() — which drains openraft's
         // state-machine worker — would deadlock on that wedged apply.
-        if let SmAdapter::Shmem(a) = &sm {
-            a.signal_shutdown();
+        if let SmAdapter::Shmem(shutdown_flag) = &sm {
+            shutdown_flag.store(true, std::sync::atomic::Ordering::Release);
+        }
+        // Stop + join the reconcile driver (owns the 2nd adapter clone) BEFORE
+        // raft.shutdown(), so its clone drops and its in-flight ensure_reconciled
+        // (which checks the shared shutdown flag set above) unwinds promptly.
+        if let Some(d) = reconcile_driver {
+            d.stop.store(true, std::sync::atomic::Ordering::Release);
+            d.request.notify_one(); // wake it out of its select! immediately
+            let _ = d.join.await;
         }
         // Shut down raft first so it stops issuing outbound RPCs.
         // Idempotent on second call (e.g. if the service watcher already

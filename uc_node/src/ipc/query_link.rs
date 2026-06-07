@@ -35,6 +35,11 @@ const EMPTY_BACKOFF: Duration = Duration::from_micros(100);
 
 pub struct ShmemQueryLink {
     inner: TokioMutex<ShmemQueryInner>,
+    /// Read-gate: reconstruct a reattached service to the node frontier before
+    /// serving a query, so a freshly-restarted in-memory service can't answer
+    /// with stale/empty state. Holds only shared signals (no adapter clone).
+    /// `None` in unit tests that drive the rings directly.
+    gate: Option<crate::raft::state_machine_shmem::ReconcileGate>,
 }
 
 struct ShmemQueryInner {
@@ -45,12 +50,24 @@ struct ShmemQueryInner {
 
 impl ShmemQueryLink {
     pub fn new(producer: SpscProducer, consumer: SpscConsumer) -> Self {
+        Self::with_gate(producer, consumer, None)
+    }
+
+    /// Construct with a reconciliation read-[`ReconcileGate`](crate::raft::state_machine_shmem::ReconcileGate).
+    /// The production builder passes one so reads reconstruct a reattached service
+    /// before being served; tests use [`Self::new`] (no gate).
+    pub(crate) fn with_gate(
+        producer: SpscProducer,
+        consumer: SpscConsumer,
+        gate: Option<crate::raft::state_machine_shmem::ReconcileGate>,
+    ) -> Self {
         Self {
             inner: TokioMutex::new(ShmemQueryInner {
                 producer,
                 consumer,
                 next_request_id: 0,
             }),
+            gate,
         }
     }
 
@@ -59,6 +76,14 @@ impl ShmemQueryLink {
     /// responsible for bincode-encoding the typed `Query` and decoding the
     /// returned `QueryResponse`.
     pub async fn submit(&self, payload: &[u8], kind: QueryKind) -> Result<Bytes, ClusterError> {
+        // Read-gate: if the service reattached, wait until the reconcile driver has
+        // rebuilt it to the node frontier before serving — else a fresh in-memory
+        // SM would answer stale (a linearizability violation). Fast path returns
+        // immediately when the current incarnation is already reconciled. Done
+        // BEFORE taking the query-link lock so a wait doesn't serialize queries.
+        if let Some(gate) = &self.gate {
+            gate.wait_until_reconciled().await;
+        }
         let mut g = self.inner.lock().await;
         let request_id = g.next_request_id;
         g.next_request_id = g.next_request_id.wrapping_add(1);
