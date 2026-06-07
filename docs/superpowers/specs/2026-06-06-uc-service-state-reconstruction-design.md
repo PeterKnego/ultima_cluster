@@ -365,34 +365,78 @@ loop's interaction with `apply_loop` shutdown ordering (join on `Service::shutdo
 Breaking change (all impls updated): replace `build_snapshot(&self, dst)` with a
 freeze/stream split, and make `last_applied()` load-bearing.
 
+Final signatures (refined for Phase 2b — `freeze` returns the index + is fallible;
+`stream_snapshot` consumes the handle by value, runs lock-free / off-thread):
 ```rust
 trait StateMachine {
     type Command; type Response; type Query; type QueryResponse;
-    type SnapshotHandle: Send;                          // NEW
+    type SnapshotHandle: Send + 'static;                // NEW
 
     fn apply(&mut self, log_index: u64, cmd: Self::Command) -> Self::Response;
     fn query(&self, q: Self::Query) -> Self::QueryResponse;
-
-    /// MUST report the SM's true applied frontier. Published to
-    /// ServiceStatus.last_applied at attach; now a correctness requirement.
     fn last_applied(&self) -> Option<u64>;
 
-    /// Capture a cheap, consistent point-in-time view at the current last_applied.
-    /// O(1) for MVCC stores; a clone for trivial in-memory SMs. Called under the
-    /// brief apply-write-lock; the returned handle is streamed lock-free.
-    fn freeze(&self) -> Self::SnapshotHandle;
+    /// Capture a cheap, consistent point-in-time view at the current applied
+    /// frontier. Returns (handle, snapshot_index). O(1) for an MVCC store (pin the
+    /// version); a clone/serialize for trivial in-memory SMs. Called under a BRIEF
+    /// SM read lock; the handle is then streamed lock-free.
+    fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), SnapshotError>;
 
-    /// Stream a frozen handle to dst (background thread, no SM lock). Returns the
-    /// log_index represented (resolves the last_applied-vs-snapshot-call race).
-    fn stream_snapshot(handle: &Self::SnapshotHandle, dst: &mut dyn Write)
-        -> Result<u64, SnapshotError>;
+    /// Stream a frozen handle to dst. Consumes the handle (by value), holds NO SM
+    /// lock — runs on a background/blocking thread while apply() proceeds.
+    fn stream_snapshot(handle: Self::SnapshotHandle, dst: &mut dyn Write)
+        -> Result<(), SnapshotError>;
 
     fn install_snapshot(&mut self, src: &mut dyn Read) -> Result<u64, SnapshotError>;
 }
 ```
+- **`StoreStateMachine`** (the only real impl): `type SnapshotHandle = ultima_db::SnapshotReader`
+  (Send); `freeze` = `(store.snapshot_stream(Some(store.latest_version()))?, version)` (O(1)
+  MVCC pin); `stream_snapshot` = `io::copy(&mut reader, dst)`.
+- **~31 trivial test/example SMs**: `type SnapshotHandle = Vec<u8>`; `freeze` serializes the
+  state into a `Vec` (the old `build_snapshot` body) + returns `(buf, last_applied)`;
+  `stream_snapshot` = `dst.write_all(&handle)`. Near-mechanical transform.
 
-Impls to update: `StoreStateMachine` (ultima_db, MVCC freeze), lincheck `RegisterSm`
-(clone), `KvSm` (autobench, clone), `kv_service` / `counter_loop` examples.
+## 6a. Phase 2b node-side concurrency redesign (the real win)
+
+The trait change alone is **inert** — the node-side `ShmemSnapshotBuilder::build_snapshot`
+holds the `inner` TokioMutex across the whole BUILD round-trip, so `apply()` (which also
+needs `inner`) is blocked for the full stream regardless of the service-side freeze. Since
+the node feeds the service's apply ring, a blocked node ⇒ an idle service ⇒ the service
+freeze buys nothing. 2b must also free the node side:
+
+- **Move the snapshot channel OUT of `inner`.** Put `{snapshot_producer, snapshot_resp_consumer,
+  snapshot_resp_bridge, snapshot_region_path}` behind an `Arc<tokio::Mutex<SnapshotChannel>>`
+  on the adapter (NOT inside the `inner` TokioMutex). The snapshot ring is used only by
+  `build_snapshot` (snapshot worker) and `drive_catchup` INSTALL (apply worker); a dedicated
+  `snapshot_op` mutex serializes those two (SPSC single-producer safety) WITHOUT coupling to
+  `inner`.
+- **`build_snapshot` no longer holds `inner` during the round-trip:**
+  1. brief `inner` lock → capture `frontier`, `epoch_before` (the cnc service epoch); release.
+  2. lock `snapshot_op` → publish BUILD, await BUILT, read region; release. (`apply()` runs
+     concurrently — it only needs `inner`, which is free.)
+  3. brief `inner` lock → re-check `epoch_after`; persist + set `current_snapshot`; release.
+- **Race guard becomes EPOCH-based, not frontier-based.** With `inner` released during the
+  round-trip, normal applies legitimately advance the frontier, so `built_index == frontier`
+  no longer holds. Instead reject (return last-good non-advancing snapshot, per the verified
+  openraft-Err-is-fatal constraint) iff `epoch_after != epoch_before` — i.e. a service
+  reattach happened during the build (the actual data-loss case). The `built_index` is just
+  recorded in the meta.
+- **Lock ordering / no deadlock.** `build_snapshot` NEVER holds `snapshot_op` and `inner`
+  simultaneously (inner-brief → release → snapshot_op → release → inner-brief). `drive_catchup`
+  INSTALL holds `inner` (it runs inside `apply()`) and nests `snapshot_op` under it. Because
+  build releases `snapshot_op` before re-taking `inner`, there is no inner↔snapshot_op cycle.
+- **Service side:** `snapshot_loop` BUILD = `sm.read()` → `freeze()` (brief) → release →
+  `spawn_blocking(move || { S::stream_snapshot(handle, &mut buf); region::write })` → reply
+  BUILT. apply (separate std::thread, write lock) runs during the stream against the frozen
+  MVCC view. INSTALL stays as-is (exclusive write lock; it's a rare recovery path, stall OK).
+
+Net: a snapshot no longer stalls applies on either side. INSTALL (reconstruction) keeps its
+stall — acceptable (rare, and the reattached service can't serve until caught up anyway).
+
+Impls to update: `StoreStateMachine` (MVCC freeze) + ~31 trivial test/example sites
+(`m*_*.rs` Counters, lincheck `RegisterSm`, autobench `KvSm`/`Echo`, reconstruct-test SMs,
+`StubSm`/`ControllableSM`/`NoopSm`, `kv_service`/`counter_loop`).
 
 ## 7. Error handling
 
