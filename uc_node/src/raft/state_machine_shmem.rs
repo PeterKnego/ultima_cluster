@@ -157,12 +157,11 @@ pub(crate) struct ShmemInner<S: StateMachine> {
 }
 
 impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
-    // `new` is `pub` because the integration tests (external crates) construct it;
-    // `ServiceStatusPtr` is `pub` for the same reason (it appears in this public
-    // signature). The arg count grew with the reconstruction context
-    // (journal/last_purged/status ptr) — these are cohesive constructor inputs,
+    // `new` is `pub` because the integration tests (external crates) construct it.
+    // The arg count grew with the reconstruction + snapshot context
+    // (journal/last_purged/status ptr/snapshot ring) — cohesive constructor inputs,
     // so allow rather than bundle.
-    #[allow(private_interfaces, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         sm: S,
         handles: LogStorageHandles,
