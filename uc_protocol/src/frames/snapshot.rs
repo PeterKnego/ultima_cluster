@@ -22,9 +22,38 @@ pub fn decode_extra_snapshot_built(extra: [u8; 8]) -> u64 {
     u64::from_le_bytes(extra)
 }
 
+/// node → service: "install the snapshot now in `snapshot.region`." `header_extra`
+/// carries the snapshot's last_log_id index (the index the service will be at after).
+pub const MSG_TYPE_INSTALL_SNAPSHOT: u16 = 102;
+/// service → node: "snapshot installed." `header_extra` carries the new last_applied.
+pub const MSG_TYPE_SNAPSHOT_INSTALLED: u16 = 103;
+
+#[inline]
+pub fn encode_extra_install_snapshot(snapshot_index: u64) -> [u8; 8] {
+    snapshot_index.to_le_bytes()
+}
+#[inline]
+pub fn decode_extra_install_snapshot(extra: [u8; 8]) -> u64 {
+    u64::from_le_bytes(extra)
+}
+#[inline]
+pub fn encode_extra_snapshot_installed(new_last_applied: u64) -> [u8; 8] {
+    new_last_applied.to_le_bytes()
+}
+#[inline]
+pub fn decode_extra_snapshot_installed(extra: [u8; 8]) -> u64 {
+    u64::from_le_bytes(extra)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_extra_round_trip() {
+        assert_eq!(decode_extra_install_snapshot(encode_extra_install_snapshot(42)), 42);
+        assert_eq!(decode_extra_snapshot_installed(encode_extra_snapshot_installed(99)), 99);
+    }
 
     #[test]
     fn msg_type_constants_are_stable() {
