@@ -747,6 +747,10 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S
         // Phase 2b removes this). The lock serializes vs apply() and drive_catchup.
         let mut g = self.inner.lock().await;
         let region_path = g.snapshot_region_path.clone();
+        // Defensive (parity with drive_catchup): drop any stale resp left by a
+        // prior build that was aborted by shutdown after sending BUILD but before
+        // consuming BUILT, so we never match a stale frame to this request.
+        g.snapshot_resp_consumer.lock().discard_backlog();
         publish_snapshot_cmd(
             &g.snapshot_producer,
             MSG_TYPE_BUILD_SNAPSHOT,
@@ -776,7 +780,9 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S
         let meta = RaftSnapshotMeta {
             last_log_id,
             last_membership: last_membership.clone(),
-            snapshot_id: format!("snap-{built_index}"),
+            // Derive from last_log_id (matches recovery's reconstruction in `new()`),
+            // not built_index, so the snapshot_id is stable across a restart.
+            snapshot_id: format!("snap-{}", last_log_id.map(|l| l.index).unwrap_or(0)),
         };
 
         // REQUIRED: persist to disk so a node restart after purge can still
