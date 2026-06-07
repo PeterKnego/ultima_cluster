@@ -357,3 +357,182 @@ async fn below_purge_service_reconstructed_via_snapshot_install() {
     service2.shutdown().await.expect("service2 shutdown");
     node.shutdown().await.expect("node shutdown");
 }
+
+/// Phase-2b epoch-guard correctness: concurrent apply stream with epoch STABLE.
+///
+/// This test exercises the "benign concurrent apply, epoch stable → accept" path of
+/// the Phase-2b epoch-guard in `ShmemSnapshotBuilder::build_snapshot`. The 2b guard
+/// rejects a snapshot build (returns the last-good snapshot unchanged) only when the
+/// service epoch CHANGES during the build round-trip (a reattach happened). When the
+/// epoch is stable — applies are simply advancing the frontier concurrently — the
+/// guard must ACCEPT the snapshot and let openraft advance the snapshot pointer and
+/// purge the log.
+///
+/// Sequence:
+///   1. Bring up node + service (CounterSm). NO crash/reattach in this test (epoch
+///      stable the whole time).
+///   2. Submit 1..=20 (await each) — 20 commands, sum == 210. With
+///      `snapshot_policy_logs_since_last = 4` this crosses the snapshot threshold
+///      FIVE times during the stream, so at least one build fires while the submit
+///      loop is still producing new commands (concurrent apply, epoch stable).
+///   3. Poll `_test_last_purged() >= 1` (timeout 15s) — confirms a snapshot+purge
+///      completed; if the 2b guard had wrongly rejected benign concurrent applies
+///      (treating an advancing frontier as an epoch change), openraft would never
+///      advance the snapshot pointer and purge would never fire.
+///   4. Assert final counter == 210 via `submit_query(())` — the snapshot and all
+///      subsequent applies are intact; the concurrent build neither lost state nor
+///      double-counted any command.
+///   5. Clean teardown (service then node).
+///
+/// regression: Phase-2b epoch-guard must NOT conflate "frontier advanced by concurrent
+/// apply" with "epoch changed by reattach" — only a real epoch change triggers the
+/// non-advancing return.
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_build_epoch_stable_snapshot_accepted() {
+    let instance_tempdir = TempDir::new().unwrap();
+    let node_data_tempdir = TempDir::new().unwrap();
+    let service_data_tempdir = TempDir::new().unwrap();
+    let instance_dir = instance_tempdir.path().to_owned();
+
+    let app_id = "reconstruct-concurrent-build".to_string();
+
+    // ── Node (single-node shmem), SMALL snapshot policy ─────────────────
+    // snapshot_policy_logs_since_last = 4: a snapshot fires every ~4 applied
+    // entries. With 20 submits the threshold is crossed ~5 times, so a build
+    // is virtually certain to be in-flight while the submit loop continues.
+    // max_in_snapshot_log_to_keep = 1: purge boundary actually advances (same
+    // reasoning as the install test above).
+    let node_cfg = NodeConfig {
+        node_id: 1,
+        data_dir: node_data_tempdir.path().to_owned(),
+        raft_listen_addr: "127.0.0.1:0".parse().unwrap(),
+        app_id: app_id.clone(),
+        bootstrap: BootstrapConfig::SingleNode,
+        raft: RaftTuning {
+            snapshot_policy_logs_since_last: 4,
+            max_in_snapshot_log_to_keep: 1,
+            ..RaftTuning::default()
+        },
+        tls: TlsConfig::default(),
+        ipc_mode: IpcMode::Shmem {
+            instance_dir: instance_dir.clone(),
+        },
+        client_rings: ClientRingConfig::default(),
+        service_rings: ServiceRingConfig::default(),
+        log_durability: ultima_journal::Durability::Eventual,
+    };
+    let node_task = tokio::spawn(async move {
+        NodeBuilder::new(node_cfg, CounterSm::default())
+            .start()
+            .await
+    });
+
+    // Spawn the service once cnc.dat exists.
+    wait_for_path(&instance_dir.join("cnc.dat"), Duration::from_secs(5)).await;
+
+    let svc_cfg = ServiceConfig {
+        instance_dir: instance_dir.clone(),
+        app_id: app_id.clone(),
+        data_dir: service_data_tempdir.path().to_owned(),
+        ..ServiceConfig::default()
+    };
+    let svc_task = tokio::spawn(async move {
+        ServiceBuilder::new(svc_cfg, CounterSm::default())
+            .run()
+            .await
+    });
+
+    let node = tokio::time::timeout(Duration::from_secs(15), node_task)
+        .await
+        .expect("node start timed out")
+        .expect("node task panic")
+        .expect("node start error");
+    let service = tokio::time::timeout(Duration::from_secs(15), svc_task)
+        .await
+        .expect("service start timed out")
+        .expect("service task panic")
+        .expect("service start error");
+
+    // ── Wait for leader ─────────────────────────────────────────────────
+    for _ in 0..50 {
+        if node.current_leader().await == Some(1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        node.current_leader().await,
+        Some(1),
+        "leader did not converge"
+    );
+
+    // ── Step 2: submit 1..=20 while snapshots fire concurrently ──────────
+    // With policy=4 and 20 commands, the threshold crosses at ~log-index 5,
+    // 9, 13, 17 — builds fire while the loop is still submitting. No
+    // crash/reattach → epoch is stable throughout.
+    const N: u64 = 20;
+    const EXPECTED_SUM: u64 = N * (N + 1) / 2; // 210
+    let mut running_sum = 0u64;
+    for n in 1..=N {
+        running_sum += n;
+        let got = node
+            .submit(n)
+            .await
+            .expect("submit during concurrent build");
+        assert_eq!(
+            got, running_sum,
+            "submit {n}: expected running sum {running_sum}, got {got}"
+        );
+    }
+    assert_eq!(running_sum, EXPECTED_SUM);
+
+    // ── Step 3: confirm purge fired (epoch-stable build was accepted) ────
+    // If the 2b guard wrongly rejected concurrent applies as if they were an
+    // epoch change, `last_purged` would stay at 0 forever: openraft would never
+    // advance the snapshot pointer, so the log would never be purged.
+    let purged = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let p = node._test_last_purged();
+            if p >= 1 {
+                break p;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out (15s) waiting for snapshot+purge with \
+                 snapshot_policy_logs_since_last=4 after {N} submits; \
+                 last_purged is still 0. This likely means the Phase-2b \
+                 epoch guard is spuriously rejecting epoch-stable concurrent \
+                 applies (treating advancing frontier as a reattach). Purge \
+                 would never advance if every build is rejected."
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    println!(
+        "[concurrent_build] CONFIRMED purge: last_purged = {purged} (>= 1). \
+         Epoch-stable concurrent build was accepted by the 2b guard."
+    );
+
+    // ── Step 4: assert final state == 210 ───────────────────────────────
+    // The snapshot + subsequent applies must all be accounted for — no state
+    // was lost or double-counted by the concurrent build.
+    let final_sum = node
+        .submit_query(())
+        .await
+        .expect("query after concurrent build");
+    assert_eq!(
+        final_sum, EXPECTED_SUM,
+        "expected final counter {EXPECTED_SUM} (sum 1..={N}); got {final_sum}. \
+         A discrepancy means the concurrent snapshot build corrupted state \
+         (e.g. double-applied entries or lost pre-snapshot state)."
+    );
+    println!(
+        "[concurrent_build] final counter = {final_sum} == {EXPECTED_SUM} ✓ \
+         (no corruption from concurrent build)"
+    );
+
+    // ── Step 5: clean teardown (service first, then node) ───────────────
+    service.shutdown().await.expect("service shutdown");
+    node.shutdown().await.expect("node shutdown");
+}

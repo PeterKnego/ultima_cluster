@@ -378,10 +378,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for AdaptedSnapshotBuilder
         let last_applied = g.last_applied;
         let last_membership = g.last_membership.clone();
 
-        let (handle, user_index) = g
-            .sm
-            .freeze()
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let (handle, user_index) = g.sm.freeze().map_err(|e| io::Error::other(e.to_string()))?;
         let mut buf: Vec<u8> = Vec::new();
         S::stream_snapshot(handle, &mut buf).map_err(|e| io::Error::other(e.to_string()))?;
 

@@ -188,7 +188,8 @@ async fn main() -> anyhow::Result<()> {
     // the service, then join both. In Shmem mode start() blocks in
     // wait_for_service_ready until the service publishes Ready.
     let instance_dir = args.instance_dir.clone();
-    let node_task = tokio::spawn(async move { NodeBuilder::new(node_cfg, KvSm::default()).start().await });
+    let node_task =
+        tokio::spawn(async move { NodeBuilder::new(node_cfg, KvSm::default()).start().await });
 
     let service = if args.with_service {
         wait_for_path(&instance_dir.join("cnc.dat"), Duration::from_secs(30)).await?;

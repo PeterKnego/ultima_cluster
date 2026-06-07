@@ -104,8 +104,10 @@ where
         Ok((reader, v))
     }
 
-    fn stream_snapshot(mut handle: Self::SnapshotHandle, dst: &mut dyn Write)
-        -> Result<(), SnapshotError> {
+    fn stream_snapshot(
+        mut handle: Self::SnapshotHandle,
+        dst: &mut dyn Write,
+    ) -> Result<(), SnapshotError> {
         std::io::copy(&mut handle, dst)?;
         Ok(())
     }

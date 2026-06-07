@@ -96,8 +96,7 @@ impl StepRow {
     }
 }
 
-const CSV_HEADER: &str =
-    "system,config,workload,payload_bytes,inflight,target_rate,achieved_rate,\
+const CSV_HEADER: &str = "system,config,workload,payload_bytes,inflight,target_rate,achieved_rate,\
 p50_ns,p99_ns,p99_9_ns,p99_99_ns,max_ns,count";
 
 /// Run one ladder step: open-loop at `target_rate` msgs/s, at most `inflight`
@@ -167,7 +166,10 @@ async fn run_step(
         // Launch all sends whose intended time has arrived, up to the cap.
         while now >= next_send && inflight_set.len() < inflight && next_send < deadline {
             let intended = next_send;
-            let cmd = KvCmd::Put { key: seq % 4096, val: val.clone() };
+            let cmd = KvCmd::Put {
+                key: seq % 4096,
+                val: val.clone(),
+            };
             seq += 1;
             next_send += period;
             inflight_set.push(async move {
@@ -243,7 +245,9 @@ where
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init();
     let args = Args::parse();
     let rates: Vec<f64> = parse_list(&args.rates);
     let inflights: Vec<usize> = parse_list(&args.inflight);
@@ -345,7 +349,13 @@ mod tests {
     #[test]
     fn kv_apply_inserts_and_counts() {
         let mut sm = KvSm::default();
-        let n = sm.apply(1, KvCmd::Put { key: 7, val: vec![1, 2, 3] });
+        let n = sm.apply(
+            1,
+            KvCmd::Put {
+                key: 7,
+                val: vec![1, 2, 3],
+            },
+        );
         assert_eq!(n, 1);
         assert_eq!(sm.query(7), Some(vec![1, 2, 3]));
         assert_eq!(sm.last_applied(), Some(1));

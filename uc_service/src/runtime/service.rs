@@ -357,7 +357,10 @@ mod tests {
         fn freeze(&self) -> Result<(Vec<u8>, u64), crate::SnapshotError> {
             Ok((Vec::new(), 0))
         }
-        fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn Write) -> Result<(), crate::SnapshotError> {
+        fn stream_snapshot(
+            handle: Vec<u8>,
+            dst: &mut dyn Write,
+        ) -> Result<(), crate::SnapshotError> {
             dst.write_all(&handle)?;
             Ok(())
         }
@@ -395,7 +398,10 @@ mod tests {
         fn freeze(&self) -> Result<(Vec<u8>, u64), crate::SnapshotError> {
             Ok((Vec::new(), self.last_applied.unwrap_or(0)))
         }
-        fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn Write) -> Result<(), crate::SnapshotError> {
+        fn stream_snapshot(
+            handle: Vec<u8>,
+            dst: &mut dyn Write,
+        ) -> Result<(), crate::SnapshotError> {
             dst.write_all(&handle)?;
             Ok(())
         }

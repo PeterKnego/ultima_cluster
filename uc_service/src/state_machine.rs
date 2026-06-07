@@ -47,8 +47,10 @@ pub trait StateMachine: Send + Sync + 'static {
     fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), SnapshotError>;
 
     /// Stream a frozen handle to `dst`. Consumes the handle; holds NO SM lock.
-    fn stream_snapshot(handle: Self::SnapshotHandle, dst: &mut dyn Write)
-        -> Result<(), SnapshotError>;
+    fn stream_snapshot(
+        handle: Self::SnapshotHandle,
+        dst: &mut dyn Write,
+    ) -> Result<(), SnapshotError>;
 
     fn install_snapshot(&mut self, src: &mut dyn Read) -> Result<u64, SnapshotError>;
 }

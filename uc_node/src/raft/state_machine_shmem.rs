@@ -947,8 +947,7 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S
         // REQUIRED: persist to disk so a node restart after purge can still
         // reconstruct (openraft purges the log right after snapshotting). Mirror
         // install_snapshot's persist block.
-        let bytes_filename =
-            format!("snapshot_{}.bin", last_log_id.map(|l| l.index).unwrap_or(0));
+        let bytes_filename = format!("snapshot_{}.bin", last_log_id.map(|l| l.index).unwrap_or(0));
         let bytes_path = g.snapshot_bytes_dir.join(&bytes_filename);
         std::fs::write(&bytes_path, &bytes).map_err(io::Error::other)?;
         let f = std::fs::File::open(&bytes_path).map_err(io::Error::other)?;

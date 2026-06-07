@@ -86,7 +86,10 @@ async fn snapshot_task_body<S>(
                 };
                 let (handle, built_index) = match frozen {
                     Ok(f) => f,
-                    Err(e) => { tracing::error!(error = %e, "snapshot freeze failed"); continue; }
+                    Err(e) => {
+                        tracing::error!(error = %e, "snapshot freeze failed");
+                        continue;
+                    }
                 };
                 // Stream off the tokio worker (handle: Send). Writes the region file.
                 let region_path2 = region_path.clone();
@@ -99,8 +102,14 @@ async fn snapshot_task_body<S>(
                 .await;
                 match stream_res {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => { tracing::error!(error = %e, "snapshot stream/region write failed"); continue; }
-                    Err(e) => { tracing::error!(error = %e, "snapshot stream task panicked"); continue; }
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "snapshot stream/region write failed");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "snapshot stream task panicked");
+                        continue;
+                    }
                 }
                 publish_resp(
                     &mut resp_producer,

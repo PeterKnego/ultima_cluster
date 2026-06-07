@@ -220,10 +220,7 @@ fn main() {
             let out = Output {
                 status: "unknown_task".to_string(),
                 stage: "setup".to_string(),
-                stderr_tail: Some(format!(
-                    "unknown task {:?}; known tasks: shmem",
-                    args.task
-                )),
+                stderr_tail: Some(format!("unknown task {:?}; known tasks: shmem", args.task)),
                 ..Default::default()
             };
             emit_and_exit(&out);
@@ -238,8 +235,14 @@ fn main() {
 
     // Stage 1: build
     let mut build_cmd = Command::new("cargo");
-    build_cmd
-        .args(["build", "-p", "uc_protocol", "-p", "uc_autobench", "--release"]);
+    build_cmd.args([
+        "build",
+        "-p",
+        "uc_protocol",
+        "-p",
+        "uc_autobench",
+        "--release",
+    ]);
     let build = run_stage(build_cmd, Duration::from_secs(600));
     out.duration_s.build = build.duration_s;
     if build.timed_out {
@@ -342,9 +345,8 @@ fn main() {
         // as a microbench failure rather than running the gate blind.
         out.status = "microbench_failed".into();
         out.stage = "microbench".into();
-        out.stderr_tail = Some(
-            "microbench stdout JSON missing required key `spsc_p99_ns`".to_string(),
-        );
+        out.stderr_tail =
+            Some("microbench stdout JSON missing required key `spsc_p99_ns`".to_string());
         emit_and_exit(&out);
     };
 
@@ -414,9 +416,7 @@ fn main() {
             };
 
             let gate_metric = spec.gate_metric.unwrap_or("submit_to_resp_p99_ns");
-            let submit_to_resp_p99_ns = e2e_json
-                .get(gate_metric)
-                .and_then(extract_u64);
+            let submit_to_resp_p99_ns = e2e_json.get(gate_metric).and_then(extract_u64);
             let regress_pct_val = match (submit_to_resp_p99_ns, args.baseline_e2e_p99_ns) {
                 (Some(v), Some(baseline)) => Some(regress_pct(v, baseline)),
                 _ => None,
