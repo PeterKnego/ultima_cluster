@@ -704,13 +704,23 @@ async fn drive_catchup<S: StateMachine>(
                     shutdown,
                 )
                 .await?;
-                let _installed = await_snapshot_resp(
+                let installed = await_snapshot_resp(
                     &g.snapshot_resp_consumer,
                     MSG_TYPE_SNAPSHOT_INSTALLED,
                     shutdown,
                     &g.snapshot_resp_bridge,
                 )
                 .await?;
+                if installed != snap_index {
+                    // The service's install_snapshot reported a different index than
+                    // the snapshot we sent — a user-SM bug. We trust snap_index for
+                    // the tail boundary regardless. (Mirrors the build-path warn.)
+                    tracing::warn!(
+                        snap_index,
+                        reported = installed,
+                        "service install_snapshot reported index != installed snapshot index"
+                    );
+                }
                 // Service is now at snap_index; replay the tail (snap_index, up_to].
                 (snap_index, up_to)
             }
