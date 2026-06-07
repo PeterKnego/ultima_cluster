@@ -139,6 +139,9 @@ impl<S: StateMachine> NodeBuilder<S> {
                     query_resp_consumer,
                     output_producer,
                     output_resp_consumer,
+                    // Phase 2a fields not yet wired into the runtime.
+                    snapshot_producer: _,
+                    snapshot_resp_consumer: _,
                 } = link;
 
                 // Clone journal before finish() consumes log_storage, so the

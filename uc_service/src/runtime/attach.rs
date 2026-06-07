@@ -12,6 +12,8 @@
 //! <instance_dir>/service/query_resp.ring    # service→node  (we produce)
 //! <instance_dir>/service/output.ring        # node→service  (we consume)
 //! <instance_dir>/service/output_resp.ring   # service→node  (we produce)
+//! <instance_dir>/service/snapshot.ring      # node→service  (we consume)
+//! <instance_dir>/service/snapshot_resp.ring # service→node  (we produce)
 //! ```
 //!
 //! The `instance_id` check (the third leg of Hard Rule 11) is the service's
@@ -32,10 +34,10 @@ use uc_protocol::version;
 use super::service::ServiceError;
 
 /// Everything the service needs to drive its loops after a successful
-/// handshake. The four ring halves are the ones the service actually
-/// reads/writes; the unused halves of each ring (e.g. the producer half of
-/// `apply.ring`) live on the node side. The `Arc<Inner>` inside each SPSC
-/// half keeps the ring mmap alive for as long as we hold it.
+/// handshake. The ring halves are the ones the service actually reads/writes;
+/// the unused halves of each ring (e.g. the producer half of `apply.ring`)
+/// live on the node side. The `Arc<Inner>` inside each SPSC half keeps the
+/// ring mmap alive for as long as we hold it.
 pub struct AttachedRings {
     /// Keeps the cnc.dat mapping alive so `NodeStatus` / `ServiceStatus`
     /// reads through the header's sub-buffer offsets stay valid for the
@@ -49,6 +51,10 @@ pub struct AttachedRings {
     pub query_resp_producer: SpscProducer,
     pub output_consumer: SpscConsumer,
     pub output_resp_producer: SpscProducer,
+    /// Phase 2a: node→service snapshot control ring (we consume).
+    pub snapshot_consumer: SpscConsumer,
+    /// Phase 2a: service→node snapshot response ring (we produce).
+    pub snapshot_resp_producer: SpscProducer,
 }
 
 /// Open the node's `cnc.dat`, validate `(app_id, protocol_version)`, and
@@ -94,6 +100,8 @@ pub fn attach(instance_dir: &Path, expected_app_id: &str) -> Result<AttachedRing
     let query_resp_ring = SpscRing::open(&service_dir.join("query_resp.ring"))?;
     let output_ring = SpscRing::open(&service_dir.join("output.ring"))?;
     let output_resp_ring = SpscRing::open(&service_dir.join("output_resp.ring"))?;
+    let snapshot_ring = SpscRing::open(&service_dir.join("snapshot.ring"))?;
+    let snapshot_resp_ring = SpscRing::open(&service_dir.join("snapshot_resp.ring"))?;
 
     // For each ring we only need one half; the other half's `Arc<Inner>` is
     // dropped immediately and the kept half keeps the underlying mmap alive.
@@ -103,6 +111,8 @@ pub fn attach(instance_dir: &Path, expected_app_id: &str) -> Result<AttachedRing
     let (query_resp_producer, _) = query_resp_ring.into_split();
     let (_, output_consumer) = output_ring.into_split();
     let (output_resp_producer, _) = output_resp_ring.into_split();
+    let (_, snapshot_consumer) = snapshot_ring.into_split();
+    let (snapshot_resp_producer, _) = snapshot_resp_ring.into_split();
 
     Ok(AttachedRings {
         cnc_mmap,
@@ -114,6 +124,8 @@ pub fn attach(instance_dir: &Path, expected_app_id: &str) -> Result<AttachedRing
         query_resp_producer,
         output_consumer,
         output_resp_producer,
+        snapshot_consumer,
+        snapshot_resp_producer,
     })
 }
 
@@ -154,6 +166,8 @@ mod tests {
             "query_resp.ring",
             "output.ring",
             "output_resp.ring",
+            "snapshot.ring",
+            "snapshot_resp.ring",
         ] {
             SpscRing::create(&service_dir.join(name), CAP, MAX).unwrap();
         }

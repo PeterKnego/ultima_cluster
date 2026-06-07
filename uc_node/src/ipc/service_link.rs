@@ -1,5 +1,6 @@
-//! Node-side ownership of the four service-side SPSC ring files
-//! (`apply.ring`, `apply_resp.ring`, `query.ring`, `query_resp.ring`)
+//! Node-side ownership of the eight service-side SPSC ring files
+//! (`apply.ring`, `apply_resp.ring`, `query.ring`, `query_resp.ring`,
+//! `output.ring`, `output_resp.ring`, `snapshot.ring`, `snapshot_resp.ring`)
 //! under `<instance_dir>/service/`.
 //!
 //! Ring sizing (chosen to keep one IPC hop's worth of buffering on each):
@@ -29,8 +30,11 @@ pub const QUERY_RING_MAX_MSG: u32 = 4 * 1024 * 1024;
 /// 16 MiB cap, 4 MiB max single frame. (M5)
 pub const OUTPUT_RING_CAP: u64 = 16 * 1024 * 1024;
 pub const OUTPUT_RING_MAX_MSG: u32 = 4 * 1024 * 1024;
+/// 16 MiB cap, 4 MiB max single frame. (Phase 2a)
+pub const SNAPSHOT_RING_CAP: u64 = 16 * 1024 * 1024;
+pub const SNAPSHOT_RING_MAX_MSG: u32 = 4 * 1024 * 1024;
 
-/// Node-side halves of the six service rings. The matching halves
+/// Node-side halves of the eight service rings. The matching halves
 /// (consumer/producer pairs) live on the service side.
 pub struct ServiceLink {
     pub apply_producer: SpscProducer,
@@ -41,10 +45,14 @@ pub struct ServiceLink {
     pub output_producer: SpscProducer,
     /// M5: service publishes OutputResp here; node consumes.
     pub output_resp_consumer: SpscConsumer,
+    /// Phase 2a: node publishes SnapshotFrame here; service consumes.
+    pub snapshot_producer: SpscProducer,
+    /// Phase 2a: service publishes SnapshotResp here; node consumes.
+    pub snapshot_resp_consumer: SpscConsumer,
 }
 
 impl ServiceLink {
-    /// Create all six ring files under `<instance_dir>/service/` and take
+    /// Create all eight ring files under `<instance_dir>/service/` and take
     /// the node-side halves. The service-side process picks up its halves
     /// via `uc_service::runtime::attach::attach`.
     ///
@@ -100,6 +108,17 @@ impl ServiceLink {
             output_cap_bytes,
             output_max_msg,
         )?;
+        // Phase 2a: snapshot rings.
+        let snapshot = SpscRing::create(
+            &service_dir.join("snapshot.ring"),
+            SNAPSHOT_RING_CAP,
+            SNAPSHOT_RING_MAX_MSG,
+        )?;
+        let snapshot_resp = SpscRing::create(
+            &service_dir.join("snapshot_resp.ring"),
+            SNAPSHOT_RING_CAP,
+            SNAPSHOT_RING_MAX_MSG,
+        )?;
 
         let (apply_producer, _) = apply.into_split();
         let (_, apply_resp_consumer) = apply_resp.into_split();
@@ -107,6 +126,8 @@ impl ServiceLink {
         let (_, query_resp_consumer) = query_resp.into_split();
         let (output_producer, _) = output.into_split();
         let (_, output_resp_consumer) = output_resp.into_split();
+        let (snapshot_producer, _) = snapshot.into_split();
+        let (_, snapshot_resp_consumer) = snapshot_resp.into_split();
 
         Ok(ServiceLink {
             apply_producer,
@@ -115,6 +136,8 @@ impl ServiceLink {
             query_resp_consumer,
             output_producer,
             output_resp_consumer,
+            snapshot_producer,
+            snapshot_resp_consumer,
         })
     }
 }
@@ -137,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn create_writes_six_ring_files() {
+    fn create_writes_eight_ring_files() {
         let tmp = fresh_instance_dir();
         let _link = ServiceLink::create(tmp.path()).expect("create");
 
@@ -149,6 +172,8 @@ mod tests {
             "query_resp.ring",
             "output.ring",
             "output_resp.ring",
+            "snapshot.ring",
+            "snapshot_resp.ring",
         ] {
             let p = service_dir.join(name);
             assert!(p.is_file(), "{} not created", p.display());
