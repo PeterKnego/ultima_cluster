@@ -107,6 +107,20 @@ pub struct ShmemAdaptedStateMachine<S: StateMachine> {
     /// lock, so the flag must be settable without acquiring it. Shared across
     /// `Clone` (openraft's worker copy and the `NodeHandle` copy) via the `Arc`.
     pub(crate) shutdown: Arc<AtomicBool>,
+    /// Snapshot control channel — OUTSIDE `inner` so `build_snapshot` does the
+    /// BUILD round-trip without holding the apply lock. See [`SnapshotChannel`].
+    pub(crate) snapshot_op: Arc<TokioMutex<SnapshotChannel>>,
+}
+
+/// Snapshot control channel — OUTSIDE `inner` so `build_snapshot` does the BUILD
+/// round-trip without holding the apply lock. A dedicated `tokio::Mutex` serializes
+/// its two users (build_snapshot, drive_catchup INSTALL) for SPSC single-producer
+/// safety, decoupled from `inner`.
+pub(crate) struct SnapshotChannel {
+    pub(crate) producer: SpscProducer,
+    pub(crate) resp_consumer: SpscConsumer,
+    pub(crate) resp_bridge: NotifyBridge,
+    pub(crate) region_path: std::path::PathBuf,
 }
 
 impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
@@ -139,14 +153,6 @@ pub(crate) struct ShmemInner<S: StateMachine> {
     /// response. The parker thread is stopped and joined when `ShmemInner`
     /// is dropped (via `NotifyBridge::Drop`).
     pub(crate) apply_resp_bridge: NotifyBridge,
-    /// Phase 2a snapshot control ring (node→service BUILD/INSTALL commands).
-    pub(crate) snapshot_producer: PlMutex<SpscProducer>,
-    /// Phase 2a snapshot resp ring (service→node BUILT/INSTALLED acks).
-    pub(crate) snapshot_resp_consumer: PlMutex<SpscConsumer>,
-    /// Wakes the snapshot-resp await (mirrors apply_resp_bridge).
-    pub(crate) snapshot_resp_bridge: NotifyBridge,
-    /// Path to `service/snapshot.region` (the snapshot byte transport file).
-    pub(crate) snapshot_region_path: std::path::PathBuf,
     /// M5: in-process channel to the output_dispatcher. Normal entries are
     /// forwarded here after apply_resp returns. `try_send` keeps apply from
     /// blocking on a full output channel — the replay sweep covers any gaps.
@@ -248,10 +254,6 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
                 apply_producer: PlMutex::new(apply_producer),
                 apply_resp_consumer: PlMutex::new(apply_resp_consumer),
                 apply_resp_bridge,
-                snapshot_producer: PlMutex::new(snapshot_producer),
-                snapshot_resp_consumer: PlMutex::new(snapshot_resp_consumer),
-                snapshot_resp_bridge,
-                snapshot_region_path,
                 output_chan_tx,
                 service_status_ptr,
                 last_seen_epoch,
@@ -259,6 +261,12 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
                 last_purged,
             })),
             shutdown: Arc::new(AtomicBool::new(false)),
+            snapshot_op: Arc::new(TokioMutex::new(SnapshotChannel {
+                producer: snapshot_producer,
+                resp_consumer: snapshot_resp_consumer,
+                resp_bridge: snapshot_resp_bridge,
+                region_path: snapshot_region_path,
+            })),
         })
     }
 }
@@ -268,6 +276,7 @@ impl<S: StateMachine> Clone for ShmemAdaptedStateMachine<S> {
         Self {
             inner: self.inner.clone(),
             shutdown: self.shutdown.clone(),
+            snapshot_op: self.snapshot_op.clone(),
         }
     }
 }
@@ -314,7 +323,8 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                     let resp: Bytes = if epoch_of(ss_ptr) != expected_epoch {
                         // Service reattached since we last reconciled: catch up
                         // (replays incl. this entry) before publishing it live.
-                        let (b, epoch) = drive_catchup(&g, &shutdown, log_id).await?;
+                        let (b, epoch) =
+                            drive_catchup(&g, &self.snapshot_op, &shutdown, log_id).await?;
                         g.last_seen_epoch = epoch;
                         b
                     } else {
@@ -339,7 +349,8 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                         {
                             ApplyOutcome::Resp(b) => b,
                             ApplyOutcome::Reattach => {
-                                let (b, epoch) = drive_catchup(&g, &shutdown, log_id).await?;
+                                let (b, epoch) =
+                                    drive_catchup(&g, &self.snapshot_op, &shutdown, log_id).await?;
                                 g.last_seen_epoch = epoch;
                                 b
                             }
@@ -368,6 +379,7 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
         ShmemSnapshotBuilder {
             inner: self.inner.clone(),
             shutdown: self.shutdown.clone(),
+            snapshot_op: self.snapshot_op.clone(),
         }
     }
 
@@ -567,7 +579,7 @@ async fn await_apply_resp(
 // ---------------------------------------------------------------------------
 
 async fn publish_snapshot_cmd(
-    producer: &PlMutex<SpscProducer>,
+    producer: &mut SpscProducer,
     msg_type: u16,
     extra: [u8; 8],
     shutdown: &AtomicBool,
@@ -579,7 +591,7 @@ async fn publish_snapshot_cmd(
                 "snapshot cmd: shutting down",
             ));
         }
-        let r = { producer.lock().try_write(msg_type, 0, extra, &[]) };
+        let r = producer.try_write(msg_type, 0, extra, &[]);
         match r {
             Ok(()) => return Ok(()),
             Err(RingError::Full) => tokio::time::sleep(FULL_BACKOFF).await,
@@ -590,7 +602,7 @@ async fn publish_snapshot_cmd(
 
 /// Await a snapshot resp frame of `expected_msg_type`; returns its header_extra u64.
 async fn await_snapshot_resp(
-    consumer: &PlMutex<SpscConsumer>,
+    consumer: &mut SpscConsumer,
     expected_msg_type: u16,
     shutdown: &AtomicBool,
     bridge: &NotifyBridge,
@@ -603,7 +615,7 @@ async fn await_snapshot_resp(
                 "snapshot resp: shutting down",
             ));
         }
-        let read = { consumer.lock().try_read(&mut buf) };
+        let read = consumer.try_read(&mut buf);
         match read {
             Ok(Some(rec)) if rec.msg_type == expected_msg_type => {
                 return Ok(u64::from_le_bytes(rec.header_extra));
@@ -638,6 +650,7 @@ async fn await_snapshot_resp(
 /// lands (catch-up below the purge boundary installs a snapshot instead).
 async fn drive_catchup<S: StateMachine>(
     g: &ShmemInner<S>,
+    snapshot_op: &Arc<TokioMutex<SnapshotChannel>>,
     shutdown: &AtomicBool,
     up_to_log_id: RaftLogId,
 ) -> Result<(Bytes, u64), io::Error> {
@@ -693,24 +706,37 @@ async fn drive_catchup<S: StateMachine>(
                             }
                         }
                     };
-                    let region_path = g.snapshot_region_path.clone();
-                    snapshot_region::write(&region_path, snap_index, &snap_bytes)
-                        .map_err(|e| io::Error::other(e.to_string()))?;
-                    g.snapshot_resp_consumer.lock().discard_backlog();
-                    publish_snapshot_cmd(
-                        &g.snapshot_producer,
-                        MSG_TYPE_INSTALL_SNAPSHOT,
-                        encode_extra_install_snapshot(snap_index),
-                        shutdown,
-                    )
-                    .await?;
-                    let installed = await_snapshot_resp(
-                        &g.snapshot_resp_consumer,
-                        MSG_TYPE_SNAPSHOT_INSTALLED,
-                        shutdown,
-                        &g.snapshot_resp_bridge,
-                    )
-                    .await?;
+                    // Lock ordering: we already hold `inner` (caller's `g`); nest
+                    // `snapshot_op` here. This is the allowed order — build_snapshot
+                    // never holds snapshot_op while awaiting inner, so no cycle.
+                    let installed = {
+                        let mut ch = snapshot_op.lock().await;
+                        // Split-borrow distinct fields so `&mut resp_consumer` and
+                        // `&resp_bridge` can be passed together (disjoint borrows).
+                        let SnapshotChannel {
+                            producer,
+                            resp_consumer,
+                            resp_bridge,
+                            region_path,
+                        } = &mut *ch;
+                        snapshot_region::write(region_path, snap_index, &snap_bytes)
+                            .map_err(|e| io::Error::other(e.to_string()))?;
+                        resp_consumer.discard_backlog();
+                        publish_snapshot_cmd(
+                            producer,
+                            MSG_TYPE_INSTALL_SNAPSHOT,
+                            encode_extra_install_snapshot(snap_index),
+                            shutdown,
+                        )
+                        .await?;
+                        await_snapshot_resp(
+                            resp_consumer,
+                            MSG_TYPE_SNAPSHOT_INSTALLED,
+                            shutdown,
+                            resp_bridge,
+                        )
+                        .await?
+                    };
                     if installed != snap_index {
                         // The service's install_snapshot reported a different index than
                         // the snapshot we sent — a user-SM bug. We trust snap_index for
@@ -796,44 +822,76 @@ async fn drive_catchup<S: StateMachine>(
 pub struct ShmemSnapshotBuilder<S: StateMachine> {
     inner: Arc<TokioMutex<ShmemInner<S>>>,
     shutdown: Arc<AtomicBool>,
+    snapshot_op: Arc<TokioMutex<SnapshotChannel>>,
 }
 
 impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S> {
     async fn build_snapshot(&mut self) -> Result<RaftSnapshot, io::Error> {
-        // Hold the inner lock across the round-trip (2a: blocking — stalls apply;
-        // Phase 2b removes this). The lock serializes vs apply() and drive_catchup.
-        let mut g = self.inner.lock().await;
-        let region_path = g.snapshot_region_path.clone();
-        // Defensive (parity with drive_catchup): drop any stale resp left by a
-        // prior build that was aborted by shutdown after sending BUILD but before
-        // consuming BUILT, so we never match a stale frame to this request.
-        g.snapshot_resp_consumer.lock().discard_backlog();
-        publish_snapshot_cmd(
-            &g.snapshot_producer,
-            MSG_TYPE_BUILD_SNAPSHOT,
-            [0u8; 8],
-            &self.shutdown,
-        )
-        .await?;
-        let built_index = await_snapshot_resp(
-            &g.snapshot_resp_consumer,
-            MSG_TYPE_SNAPSHOT_BUILT,
-            &self.shutdown,
-            &g.snapshot_resp_bridge,
-        )
-        .await?;
-        let (_idx, bytes) =
-            snapshot_region::read(&region_path).map_err(|e| io::Error::other(e.to_string()))?;
+        // LOCK ORDERING (critical — the three scopes are kept separate on purpose):
+        //   (1) take + drop `inner` (frontier/membership/epoch capture);
+        //   (2) take + drop `snapshot_op` (the BUILD round-trip — NO inner held,
+        //       so apply() runs concurrently);
+        //   (3) take `inner` again (epoch race guard + persist).
+        // build NEVER holds `snapshot_op` while awaiting `inner`. drive_catchup
+        // (Task 4) holds `inner` then nests `snapshot_op` (the allowed order);
+        // because build releases `snapshot_op` before re-taking `inner`, there is
+        // no inner↔snapshot_op cycle.
 
-        let last_log_id = g.last_applied;
-        let last_membership = g.last_membership.clone();
+        // (1) Brief inner lock: capture frontier + membership + epoch_before.
+        let (frontier, last_membership, epoch_before, ss_ptr) = {
+            let g = self.inner.lock().await;
+            (
+                g.last_applied,
+                g.last_membership.clone(),
+                epoch_of(g.service_status_ptr),
+                g.service_status_ptr,
+            )
+        };
+
+        // (2) snapshot_op round-trip — NO inner held → apply() runs concurrently.
+        let (built_index, bytes) = {
+            let mut ch = self.snapshot_op.lock().await;
+            // Split-borrow distinct fields so `&mut resp_consumer` and
+            // `&resp_bridge` can be passed together (disjoint borrows).
+            let SnapshotChannel {
+                producer,
+                resp_consumer,
+                resp_bridge,
+                region_path,
+            } = &mut *ch;
+            // Defensive (parity with drive_catchup): drop any stale resp left by a
+            // prior build that was aborted by shutdown after sending BUILD but before
+            // consuming BUILT, so we never match a stale frame to this request.
+            resp_consumer.discard_backlog();
+            publish_snapshot_cmd(producer, MSG_TYPE_BUILD_SNAPSHOT, [0u8; 8], &self.shutdown)
+                .await?;
+            let bi = await_snapshot_resp(
+                resp_consumer,
+                MSG_TYPE_SNAPSHOT_BUILT,
+                &self.shutdown,
+                resp_bridge,
+            )
+            .await?;
+            let (_i, b) =
+                snapshot_region::read(region_path).map_err(|e| io::Error::other(e.to_string()))?;
+            (bi, b)
+        };
+
+        // (3) Brief inner lock: EPOCH race guard + persist.
+        let mut g = self.inner.lock().await;
 
         // RACE GUARD (data-loss): the service may have crashed and a FRESH,
         // not-yet-reconstructed service reattached while this BUILD was in flight.
-        // A fresh service answers BUILD with built_index=0 (empty bytes). If we
-        // persisted that with meta.last_log_id = the node frontier, openraft would
-        // advance the snapshot pointer and purge the log below the frontier; a
-        // later install of that empty snapshot is silent durable data loss.
+        // With the round-trip now OFF the inner lock, apply()/drive_catchup may
+        // legitimately advance the frontier during a build — so a frontier-vs-
+        // built_index comparison would false-positive. We instead key the guard on
+        // the service EPOCH: a change means a reattach (crash) happened across the
+        // BUILD, and the bytes we just read may be from a fresh, degenerate service.
+        //
+        // A fresh service answers BUILD with empty bytes. If we persisted that with
+        // meta.last_log_id = the node frontier, openraft would advance the snapshot
+        // pointer and purge the log below the frontier; a later install of that
+        // empty snapshot is silent durable data loss.
         //
         // We CANNOT signal "retry" by returning Err: in openraft 0.10.0-alpha.20 a
         // build_snapshot Err is wrapped into StorageError and surfaced via
@@ -849,16 +907,13 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S
         // greater, so it advances nothing and purges nothing. The node stays up,
         // the log stays intact, and the SnapshotPolicy re-triggers a build later —
         // by which point apply()/drive_catchup has reconstructed the reattached
-        // service to the frontier and the retried build returns built_index ==
-        // frontier with real bytes.
-        let frontier = last_log_id.map(|l| l.index).unwrap_or(0);
-        if built_index != frontier {
+        // service to the frontier and the retried build returns real bytes.
+        let epoch_after = epoch_of(ss_ptr);
+        if epoch_after != epoch_before {
             tracing::warn!(
-                node_frontier = ?last_log_id,
-                built_index,
-                "snapshot build raced a crash/reattach (service not yet \
-                 reconstructed); returning last good snapshot, not persisting the \
-                 degenerate one (openraft will retry)"
+                epoch_before,
+                epoch_after,
+                "snapshot build raced a reattach; returning last-good (no persist)"
             );
             if let Some(s) = &g.current_snapshot {
                 return Ok(Snapshot {
@@ -878,18 +933,22 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S
                 snapshot: Cursor::new(Vec::new()),
             });
         }
+
+        let _ = built_index; // informational; the snapshot represents `frontier`
+        let last_log_id = frontier;
         let meta = RaftSnapshotMeta {
             last_log_id,
             last_membership: last_membership.clone(),
-            // Derive from last_log_id (matches recovery's reconstruction in `new()`),
-            // not built_index, so the snapshot_id is stable across a restart.
+            // Derive from last_log_id (matches recovery's reconstruction in `new()`)
+            // so the snapshot_id is stable across a restart.
             snapshot_id: format!("snap-{}", last_log_id.map(|l| l.index).unwrap_or(0)),
         };
 
         // REQUIRED: persist to disk so a node restart after purge can still
         // reconstruct (openraft purges the log right after snapshotting). Mirror
         // install_snapshot's persist block.
-        let bytes_filename = format!("snapshot_{built_index}.bin");
+        let bytes_filename =
+            format!("snapshot_{}.bin", last_log_id.map(|l| l.index).unwrap_or(0));
         let bytes_path = g.snapshot_bytes_dir.join(&bytes_filename);
         std::fs::write(&bytes_path, &bytes).map_err(io::Error::other)?;
         let f = std::fs::File::open(&bytes_path).map_err(io::Error::other)?;
