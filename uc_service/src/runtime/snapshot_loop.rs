@@ -1,16 +1,21 @@
-//! Service-side snapshot control loop (Phase 2a). Consumes `snapshot.ring`:
+//! Service-side snapshot control loop (Phase 2b). Consumes `snapshot.ring`:
 //! BUILD_SNAPSHOT → build into snapshot.region; INSTALL_SNAPSHOT → install from it.
-//! Blocking build/install under the SM RwLock (2a; Phase 2b makes build async).
 //!
-//! Phase-2a limitations (intentional; revisited in 2b):
+//! Phase-2b BUILD is async: `freeze()` runs under a BRIEF read lock (O(1) MVCC
+//! version pin), the lock is released immediately, then `stream_snapshot` +
+//! `snapshot_region::write` run off-thread via `spawn_blocking`. The apply_loop
+//! (a separate std::thread holding the write lock) therefore runs concurrently
+//! with the streaming phase — the SM is not stalled during snapshot I/O.
+//!
+//! INSTALL_SNAPSHOT still acquires the write lock for the duration of the install
+//! (snapshots are rare; install is bounded by network delivery, not SM size).
+//!
+//! Remaining limitation (revisited later):
 //! * **No nack on error.** A failed build/install (or a region read/write error)
 //!   logs and skips WITHOUT replying. The node side awaits the ack and only bails
 //!   on shutdown, so a snapshot error stalls the node's snapshot/reconstruction
 //!   await until shutdown. Rare (build/install rarely fail), but a real liveness
-//!   gap — an explicit error frame is deferred to 2b.
-//! * **Blocking I/O on the task.** `build_snapshot` (under the read lock) and the
-//!   `snapshot_region` file read/write run inline on the tokio worker; a large
-//!   snapshot stalls the runtime for that duration. 2b moves these off-thread.
+//!   gap — an explicit error frame is deferred to a future phase.
 
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -73,22 +78,29 @@ async fn snapshot_task_body<S>(
     while !stop.load(Ordering::Relaxed) {
         match consumer.try_read(&mut payload_buf) {
             Ok(Some(rec)) if rec.msg_type == MSG_TYPE_BUILD_SNAPSHOT => {
-                let (built_index, bytes) = {
+                // Freeze under a BRIEF read lock (O(1) for ultima_db), then release
+                // before streaming so apply() (write lock) runs concurrently.
+                let frozen = {
                     let guard = sm.read().await;
-                    match guard.freeze() {
-                        Ok((handle, idx)) => {
-                            let mut buf = Vec::new();
-                            match S::stream_snapshot(handle, &mut buf) {
-                                Ok(()) => (idx, buf),
-                                Err(e) => { tracing::error!(error = %e, "snapshot stream failed"); continue; }
-                            }
-                        }
-                        Err(e) => { tracing::error!(error = %e, "snapshot freeze failed"); continue; }
-                    }
+                    guard.freeze()
                 };
-                if let Err(e) = snapshot_region::write(&region_path, built_index, &bytes) {
-                    tracing::error!(error = %e, "snapshot.region write failed");
-                    continue;
+                let (handle, built_index) = match frozen {
+                    Ok(f) => f,
+                    Err(e) => { tracing::error!(error = %e, "snapshot freeze failed"); continue; }
+                };
+                // Stream off the tokio worker (handle: Send). Writes the region file.
+                let region_path2 = region_path.clone();
+                let stream_res = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    let mut buf = Vec::new();
+                    S::stream_snapshot(handle, &mut buf).map_err(|e| e.to_string())?;
+                    uc_protocol::snapshot_region::write(&region_path2, built_index, &buf)
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+                match stream_res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => { tracing::error!(error = %e, "snapshot stream/region write failed"); continue; }
+                    Err(e) => { tracing::error!(error = %e, "snapshot stream task panicked"); continue; }
                 }
                 publish_resp(
                     &mut resp_producer,
