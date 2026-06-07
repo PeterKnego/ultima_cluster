@@ -139,9 +139,8 @@ impl<S: StateMachine> NodeBuilder<S> {
                     query_resp_consumer,
                     output_producer,
                     output_resp_consumer,
-                    // Phase 2a fields not yet wired into the runtime.
-                    snapshot_producer: _,
-                    snapshot_resp_consumer: _,
+                    snapshot_producer,
+                    snapshot_resp_consumer,
                 } = link;
 
                 // Clone journal before finish() consumes log_storage, so the
@@ -164,6 +163,9 @@ impl<S: StateMachine> NodeBuilder<S> {
                     Some(crate::raft::state_machine_shmem::ServiceStatusPtr(
                         service_status.0,
                     )),
+                    snapshot_producer,
+                    snapshot_resp_consumer,
+                    instance_dir.join("service").join("snapshot.region"),
                 )?;
                 let query_link = Arc::new(ShmemQueryLink::new(query_producer, query_resp_consumer));
                 let handle_sm = SmAdapter::Shmem(adapter.clone());

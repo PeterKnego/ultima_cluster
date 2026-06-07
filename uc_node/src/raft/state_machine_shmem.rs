@@ -134,6 +134,14 @@ pub(crate) struct ShmemInner<S: StateMachine> {
     /// response. The parker thread is stopped and joined when `ShmemInner`
     /// is dropped (via `NotifyBridge::Drop`).
     pub(crate) apply_resp_bridge: NotifyBridge,
+    /// Phase 2a snapshot control ring (node→service BUILD/INSTALL commands).
+    pub(crate) snapshot_producer: PlMutex<SpscProducer>,
+    /// Phase 2a snapshot resp ring (service→node BUILT/INSTALLED acks).
+    pub(crate) snapshot_resp_consumer: PlMutex<SpscConsumer>,
+    /// Wakes the snapshot-resp await (mirrors apply_resp_bridge).
+    pub(crate) snapshot_resp_bridge: NotifyBridge,
+    /// Path to `service/snapshot.region` (the snapshot byte transport file).
+    pub(crate) snapshot_region_path: std::path::PathBuf,
     /// M5: in-process channel to the output_dispatcher. Normal entries are
     /// forwarded here after apply_resp returns. `try_send` keeps apply from
     /// blocking on a full output channel — the replay sweep covers any gaps.
@@ -154,7 +162,7 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
     // signature). The arg count grew with the reconstruction context
     // (journal/last_purged/status ptr) — these are cohesive constructor inputs,
     // so allow rather than bundle.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(private_interfaces, clippy::too_many_arguments)]
     pub fn new(
         sm: S,
         handles: LogStorageHandles,
@@ -164,6 +172,9 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
         journal: Arc<ultima_journal::Journal>,
         last_purged: Arc<StableValue<RaftLogId>>,
         service_status_ptr: Option<ServiceStatusPtr>,
+        snapshot_producer: SpscProducer,
+        snapshot_resp_consumer: SpscConsumer,
+        snapshot_region_path: std::path::PathBuf,
     ) -> Result<Self, crate::ClusterError> {
         // Recover the framework-durable values; skip the user-side
         // cross-check (see module docs).
@@ -216,6 +227,9 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
         // Build the apply_resp bridge BEFORE moving the consumer into ShmemInner.
         let apply_resp_bridge =
             NotifyBridge::spawn(apply_resp_consumer.wait_handle(), "apply_resp");
+        // Build the snapshot_resp bridge BEFORE moving the consumer into ShmemInner.
+        let snapshot_resp_bridge =
+            NotifyBridge::spawn(snapshot_resp_consumer.wait_handle(), "snapshot_resp");
 
         let last_seen_epoch = epoch_of(service_status_ptr);
         Ok(Self {
@@ -230,6 +244,10 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
                 apply_producer: PlMutex::new(apply_producer),
                 apply_resp_consumer: PlMutex::new(apply_resp_consumer),
                 apply_resp_bridge,
+                snapshot_producer: PlMutex::new(snapshot_producer),
+                snapshot_resp_consumer: PlMutex::new(snapshot_resp_consumer),
+                snapshot_resp_bridge,
+                snapshot_region_path,
                 output_chan_tx,
                 service_status_ptr,
                 last_seen_epoch,

@@ -74,6 +74,9 @@ async fn apply_round_trips_through_shmem_rings() {
     let (_dummy_tx, _dummy_rx) = tokio::sync::mpsc::channel::<(u64, bytes::Bytes)>(8);
     let journal = storage._testonly_journal();
     let last_purged = storage._testonly_last_purged_arc();
+
+    let snapshot_region_path = instance_dir.path().join("service").join("snapshot.region");
+
     let mut sm = ShmemAdaptedStateMachine::new(
         StubSm,
         handles,
@@ -83,6 +86,9 @@ async fn apply_round_trips_through_shmem_rings() {
         journal,
         last_purged,
         None,
+        link.snapshot_producer,
+        link.snapshot_resp_consumer,
+        snapshot_region_path,
     )
     .expect("ShmemAdaptedStateMachine::new");
 
@@ -185,6 +191,9 @@ async fn blank_and_membership_entries_emit_empty_response_without_touching_ring(
     let (_dummy_tx, _dummy_rx) = tokio::sync::mpsc::channel::<(u64, bytes::Bytes)>(8);
     let journal = storage._testonly_journal();
     let last_purged = storage._testonly_last_purged_arc();
+
+    let snapshot_region_path2 = instance_dir.path().join("service").join("snapshot.region");
+
     let mut sm = ShmemAdaptedStateMachine::new(
         StubSm,
         handles,
@@ -194,6 +203,9 @@ async fn blank_and_membership_entries_emit_empty_response_without_touching_ring(
         journal,
         last_purged,
         None,
+        link.snapshot_producer,
+        link.snapshot_resp_consumer,
+        snapshot_region_path2,
     )
     .expect("ShmemAdaptedStateMachine::new");
 
