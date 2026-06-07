@@ -396,6 +396,8 @@ mod tests {
             "query_resp.ring",
             "output.ring",
             "output_resp.ring",
+            "snapshot.ring",
+            "snapshot_resp.ring",
         ] {
             SpscRing::create(&service_dir.join(name), 8192, 1024).unwrap();
         }
