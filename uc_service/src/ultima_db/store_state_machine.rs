@@ -15,7 +15,7 @@
 //!
 //! # Snapshot path
 //!
-//! `build_snapshot` / `install_snapshot` delegate to ultima_db's
+//! `freeze` / `stream_snapshot` / `install_snapshot` delegate to ultima_db's
 //! `snapshot_stream` / `install_snapshot_stream`, which use the wire format
 //! documented in `ultima_db/docs/tasks/task27_snapshot_stream.md`. Both
 //! methods require the `persistence` Cargo feature on `ultima-db` (already

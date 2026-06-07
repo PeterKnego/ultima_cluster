@@ -285,7 +285,7 @@ async fn below_purge_service_reconstructed_via_snapshot_install() {
     );
     // Belt-and-suspenders: a snapshot_*.bin in the node data_dir is direct
     // evidence BUILD produced real snapshot bytes (Task 6). Require at least one
-    // NON-DEGENERATE snapshot file — `CounterSm::build_snapshot` writes
+    // NON-DEGENERATE snapshot file — `CounterSm::freeze` writes
     // `sum(8) || last_applied(8)` little-endian, so a valid populated snapshot has
     // a non-zero leading sum. An all-zero snapshot is the empty-build mirage; we
     // assert against it so a degenerate snapshot can't masquerade as BUILD proof.
