@@ -440,6 +440,35 @@ impl<S: StateMachine> NodeHandle<S> {
             .unwrap_or(0)
     }
 
+    /// Test-only: read the highest purged log index from `last_purged.state`.
+    /// Returns 0 if the StableValue is absent or load fails (i.e. no purge has
+    /// happened yet). Used by `reconstruct_snapshot` to confirm a snapshot+purge
+    /// actually fired before a below-purge service reattach — the gate that makes
+    /// the reattach take the snapshot-INSTALL path rather than Phase-1 replay.
+    ///
+    /// Opens an independent read-only [`StableValue`] over the node's durable
+    /// `last_purged.state` file (the live writer is owned by the log-storage
+    /// task). StableValue's two-slot scheme makes a concurrent read safe: it
+    /// returns the highest-sequence committed slot, so a torn read only ever
+    /// yields the previous committed value — never a spurious larger one — which
+    /// for a monotonic `>= 1` poll merely delays detection.
+    pub fn _test_last_purged(&self) -> u64 {
+        use ultima_journal::{Durability, StableValue, StableValueConfig};
+        let sv: StableValue<crate::raft::RaftLogId> = match StableValue::open(StableValueConfig {
+            path: self.log_storage_handles.data_dir.join("last_purged.state"),
+            durability: Durability::Consistent,
+            max_payload_bytes: 4096 - 17,
+        }) {
+            Ok(sv) => sv,
+            Err(_) => return 0,
+        };
+        sv.load()
+            .ok()
+            .flatten()
+            .map(|log_id| log_id.index)
+            .unwrap_or(0)
+    }
+
     /// Test-only: force `output_progress.state` to a specific value. Used
     /// by `m5_output_idempotent_replay` to simulate a partial-output crash.
     pub fn _test_reset_output_progress(&self, value: u64) {
