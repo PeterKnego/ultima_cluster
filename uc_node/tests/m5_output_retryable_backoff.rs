@@ -46,6 +46,7 @@ impl StateMachine for Counter {
     type Response = Resp;
     type Query = ();
     type QueryResponse = u64;
+    type SnapshotHandle = Vec<u8>;
 
     fn apply(&mut self, log_index: u64, cmd: Cmd) -> Resp {
         let Cmd::Inc(d) = cmd;
@@ -59,8 +60,12 @@ impl StateMachine for Counter {
     fn last_applied(&self) -> Option<u64> {
         self.last_applied
     }
-    fn build_snapshot(&self, _: &mut dyn Write) -> Result<u64, SnapshotError> {
-        Ok(self.last_applied.unwrap_or(0))
+    fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError> {
+        Ok((Vec::new(), self.last_applied.unwrap_or(0)))
+    }
+    fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn Write) -> Result<(), SnapshotError> {
+        dst.write_all(&handle)?;
+        Ok(())
     }
     fn install_snapshot(&mut self, _: &mut dyn Read) -> Result<u64, SnapshotError> {
         Ok(self.last_applied.unwrap_or(0))

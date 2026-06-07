@@ -47,6 +47,7 @@ impl StateMachine for Counter {
     type Response = Resp;
     type Query = ();
     type QueryResponse = u64;
+    type SnapshotHandle = Vec<u8>;
 
     fn apply(&mut self, idx: u64, c: Cmd) -> Resp {
         match c {
@@ -64,14 +65,18 @@ impl StateMachine for Counter {
         self.last_applied
     }
 
-    fn build_snapshot(&self, dst: &mut dyn Write) -> Result<u64, SnapshotError> {
-        let bytes = bincode::serde::encode_to_vec(
+    fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError> {
+        let buf = bincode::serde::encode_to_vec(
             (self.value, self.last_applied),
             bincode::config::standard(),
         )
         .map_err(|e| SnapshotError::Codec(e.to_string()))?;
-        dst.write_all(&bytes)?;
-        Ok(self.last_applied.unwrap_or(0))
+        Ok((buf, self.last_applied.unwrap_or(0)))
+    }
+
+    fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn Write) -> Result<(), SnapshotError> {
+        dst.write_all(&handle)?;
+        Ok(())
     }
 
     fn install_snapshot(&mut self, src: &mut dyn Read) -> Result<u64, SnapshotError> {

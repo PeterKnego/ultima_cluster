@@ -75,13 +75,15 @@ async fn snapshot_task_body<S>(
             Ok(Some(rec)) if rec.msg_type == MSG_TYPE_BUILD_SNAPSHOT => {
                 let (built_index, bytes) = {
                     let guard = sm.read().await;
-                    let mut buf: Vec<u8> = Vec::new();
-                    match guard.build_snapshot(&mut buf) {
-                        Ok(idx) => (idx, buf),
-                        Err(e) => {
-                            tracing::error!(error = %e, "snapshot build failed");
-                            continue;
+                    match guard.freeze() {
+                        Ok((handle, idx)) => {
+                            let mut buf = Vec::new();
+                            match S::stream_snapshot(handle, &mut buf) {
+                                Ok(()) => (idx, buf),
+                                Err(e) => { tracing::error!(error = %e, "snapshot stream failed"); continue; }
+                            }
                         }
+                        Err(e) => { tracing::error!(error = %e, "snapshot freeze failed"); continue; }
                     }
                 };
                 if let Err(e) = snapshot_region::write(&region_path, built_index, &bytes) {

@@ -32,6 +32,7 @@ impl StateMachine for KvSm {
     type Response = u64; // returns current map.len()
     type Query = u64; // key to read
     type QueryResponse = Option<Vec<u8>>;
+    type SnapshotHandle = Vec<u8>;
 
     fn apply(&mut self, log_index: u64, cmd: KvCmd) -> u64 {
         match cmd {
@@ -51,8 +52,13 @@ impl StateMachine for KvSm {
         self.last_applied
     }
 
-    fn build_snapshot(&self, _dst: &mut dyn Write) -> Result<u64, SnapshotError> {
-        Ok(self.last_applied.unwrap_or(0))
+    fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError> {
+        Ok((Vec::new(), self.last_applied.unwrap_or(0)))
+    }
+
+    fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn Write) -> Result<(), SnapshotError> {
+        dst.write_all(&handle)?;
+        Ok(())
     }
 
     fn install_snapshot(&mut self, _src: &mut dyn Read) -> Result<u64, SnapshotError> {

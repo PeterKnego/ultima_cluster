@@ -44,6 +44,7 @@ impl StateMachine for CounterSm {
     type Response = u64;
     type Query = ();
     type QueryResponse = u64;
+    type SnapshotHandle = Vec<u8>;
 
     fn apply(&mut self, log_index: u64, cmd: u64) -> u64 {
         self.sum += cmd;
@@ -56,11 +57,16 @@ impl StateMachine for CounterSm {
     fn last_applied(&self) -> Option<u64> {
         self.last_applied
     }
-    fn build_snapshot(&self, dst: &mut dyn Write) -> Result<u64, SnapshotError> {
+    fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError> {
         let li = self.last_applied.unwrap_or(0);
-        dst.write_all(&self.sum.to_le_bytes())?;
-        dst.write_all(&li.to_le_bytes())?;
-        Ok(li)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&self.sum.to_le_bytes());
+        buf.extend_from_slice(&li.to_le_bytes());
+        Ok((buf, li))
+    }
+    fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn Write) -> Result<(), SnapshotError> {
+        dst.write_all(&handle)?;
+        Ok(())
     }
     fn install_snapshot(&mut self, src: &mut dyn Read) -> Result<u64, SnapshotError> {
         let mut b = [0u8; 8];

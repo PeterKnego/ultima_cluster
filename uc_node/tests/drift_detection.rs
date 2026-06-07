@@ -29,6 +29,7 @@ impl StateMachine for ControllableSM {
     type Response = NoCmd;
     type Query = NoCmd;
     type QueryResponse = u64;
+    type SnapshotHandle = Vec<u8>;
 
     fn apply(&mut self, _: u64, _: NoCmd) -> NoCmd {
         NoCmd
@@ -39,8 +40,12 @@ impl StateMachine for ControllableSM {
     fn last_applied(&self) -> Option<u64> {
         self.forced_last_applied
     }
-    fn build_snapshot(&self, _: &mut dyn Write) -> Result<u64, SnapshotError> {
-        Ok(0)
+    fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError> {
+        Ok((Vec::new(), 0))
+    }
+    fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn Write) -> Result<(), SnapshotError> {
+        dst.write_all(&handle)?;
+        Ok(())
     }
     fn install_snapshot(&mut self, _: &mut dyn Read) -> Result<u64, SnapshotError> {
         Ok(0)

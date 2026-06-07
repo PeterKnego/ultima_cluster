@@ -378,18 +378,20 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for AdaptedSnapshotBuilder
         let last_applied = g.last_applied;
         let last_membership = g.last_membership.clone();
 
+        let (handle, user_index) = g
+            .sm
+            .freeze()
+            .map_err(|e| io::Error::other(e.to_string()))?;
         let mut buf: Vec<u8> = Vec::new();
-        let user_index =
-            g.sm.build_snapshot(&mut buf)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+        S::stream_snapshot(handle, &mut buf).map_err(|e| io::Error::other(e.to_string()))?;
 
-        // Sanity check: with the Mutex held across apply and build, the user's returned
+        // Sanity check: with the Mutex held across apply and freeze, the user's returned
         // index MUST equal our last_applied.index. M3 moves apply to a ring buffer and
         // this invariant will need to be re-evaluated.
         debug_assert_eq!(
             user_index,
             last_applied.map(|l| l.index).unwrap_or(0),
-            "user build_snapshot returned index {user_index} but adapter has last_applied {:?}",
+            "user freeze returned index {user_index} but adapter has last_applied {:?}",
             last_applied
         );
 

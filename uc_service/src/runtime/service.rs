@@ -340,14 +340,19 @@ mod tests {
         type Response = ();
         type Query = ();
         type QueryResponse = ();
+        type SnapshotHandle = Vec<u8>;
 
         fn apply(&mut self, _log_index: u64, _cmd: ()) {}
         fn query(&self, _q: ()) {}
         fn last_applied(&self) -> Option<u64> {
             None
         }
-        fn build_snapshot(&self, _dst: &mut dyn Write) -> Result<u64, crate::SnapshotError> {
-            Ok(0)
+        fn freeze(&self) -> Result<(Vec<u8>, u64), crate::SnapshotError> {
+            Ok((Vec::new(), 0))
+        }
+        fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn Write) -> Result<(), crate::SnapshotError> {
+            dst.write_all(&handle)?;
+            Ok(())
         }
         fn install_snapshot(&mut self, _src: &mut dyn Read) -> Result<u64, crate::SnapshotError> {
             Ok(0)
@@ -367,6 +372,7 @@ mod tests {
         type Response = u64;
         type Query = ();
         type QueryResponse = u64;
+        type SnapshotHandle = Vec<u8>;
 
         fn apply(&mut self, log_index: u64, delta: u64) -> u64 {
             self.value = self.value.wrapping_add(delta);
@@ -379,8 +385,12 @@ mod tests {
         fn last_applied(&self) -> Option<u64> {
             self.last_applied
         }
-        fn build_snapshot(&self, _dst: &mut dyn Write) -> Result<u64, crate::SnapshotError> {
-            Ok(self.last_applied.unwrap_or(0))
+        fn freeze(&self) -> Result<(Vec<u8>, u64), crate::SnapshotError> {
+            Ok((Vec::new(), self.last_applied.unwrap_or(0)))
+        }
+        fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn Write) -> Result<(), crate::SnapshotError> {
+            dst.write_all(&handle)?;
+            Ok(())
         }
         fn install_snapshot(&mut self, _src: &mut dyn Read) -> Result<u64, crate::SnapshotError> {
             Ok(self.last_applied.unwrap_or(0))

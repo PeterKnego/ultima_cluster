@@ -32,7 +32,7 @@
 use std::io::{Read, Write};
 
 use serde::{Serialize, de::DeserializeOwned};
-use ultima_db::{ReadTx, Store, WriteTx};
+use ultima_db::{ReadTx, SnapshotReader, Store, WriteTx};
 
 use crate::error::SnapshotError;
 use crate::state_machine::StateMachine;
@@ -70,6 +70,7 @@ where
     type Response = R;
     type Query = Q;
     type QueryResponse = QR;
+    type SnapshotHandle = SnapshotReader;
 
     fn apply(&mut self, log_index: u64, cmd: Self::Command) -> Self::Response {
         let mut tx = self
@@ -94,13 +95,19 @@ where
         if v == 0 { None } else { Some(v) }
     }
 
-    fn build_snapshot(&self, dst: &mut dyn Write) -> Result<u64, SnapshotError> {
-        let mut reader = self
+    fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), SnapshotError> {
+        let v = self.store.latest_version();
+        let reader = self
             .store
-            .snapshot_stream(None)
+            .snapshot_stream(Some(v))
             .map_err(|e| SnapshotError::Codec(format!("snapshot_stream: {e}")))?;
-        std::io::copy(&mut reader, dst)?;
-        Ok(self.store.latest_version())
+        Ok((reader, v))
+    }
+
+    fn stream_snapshot(mut handle: Self::SnapshotHandle, dst: &mut dyn Write)
+        -> Result<(), SnapshotError> {
+        std::io::copy(&mut handle, dst)?;
+        Ok(())
     }
 
     fn install_snapshot(&mut self, src: &mut dyn Read) -> Result<u64, SnapshotError> {
