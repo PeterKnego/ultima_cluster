@@ -915,29 +915,44 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S
                 epoch_after,
                 "snapshot build raced a reattach; returning last-good (no persist)"
             );
-            if let Some(s) = &g.current_snapshot {
-                return Ok(Snapshot {
-                    meta: s.meta.clone(),
-                    snapshot: Cursor::new(s.data.clone()),
-                });
-            }
-            // No prior snapshot: return an empty, non-advancing one (last_log_id =
-            // None can never be greater than the current None pointer, so openraft
-            // neither advances the snapshot nor purges the log).
-            return Ok(Snapshot {
-                meta: RaftSnapshotMeta {
-                    last_log_id: None,
-                    last_membership: Default::default(),
-                    snapshot_id: "snap-0".to_string(),
-                },
-                snapshot: Cursor::new(Vec::new()),
-            });
+            // last-good (or empty) is non-advancing: openraft's update_snapshot only
+            // advances/purges when last_log_id is STRICTLY GREATER than the current
+            // pointer, so neither result advances the snapshot or purges the log.
+            return Ok(last_good_or_empty(&g));
         }
 
-        let _ = built_index; // informational; the snapshot represents `frontier`
-        let last_log_id = frontier;
+        // The snapshot BYTES describe the service's freeze-time applied index
+        // (`built_index`, reported in the BUILT frame). Because the BUILD round-trip
+        // in scope 2 ran with `inner` FREE, apply() may have advanced the service
+        // PAST the `frontier` we captured in scope 1 (or the service may lag behind
+        // it). meta.last_log_id MUST describe the bytes, so we resolve the TRUE
+        // LogId at `built_index` from the journal — the same source drive_catchup
+        // replays from. Labeling with `frontier` instead mislabels the snapshot, so
+        // the reconstruction tail-replay re-applies (or skips) the span between
+        // built_index and frontier — the regression that produced reconstructed
+        // sums like 43/49 instead of 31.
+        let _ = frontier; // superseded by built_index for the snapshot label
+        let last_log_id: Option<RaftLogId> = if built_index == 0 {
+            None
+        } else {
+            match log_id_at(g.journal.as_ref(), built_index) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    tracing::warn!(
+                        built_index,
+                        error = %e,
+                        "snapshot: cannot resolve LogId for freeze index; \
+                         returning last-good (no persist)"
+                    );
+                    return Ok(last_good_or_empty(&g));
+                }
+            }
+        };
         let meta = RaftSnapshotMeta {
             last_log_id,
+            // Membership is captured at `frontier`. v1 establishes membership once at
+            // init and never reconfigures at runtime, so it is stable across the
+            // build window (revisit if runtime membership changes land).
             last_membership: last_membership.clone(),
             // Derive from last_log_id (matches recovery's reconstruction in `new()`)
             // so the snapshot_id is stable across a restart.
@@ -972,5 +987,52 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S
             meta,
             snapshot: Cursor::new(bytes),
         })
+    }
+}
+
+/// Resolve the full Raft [`RaftLogId`] (term + index) for committed log `index`
+/// by reading that record from the journal. `build_snapshot` uses this to label a
+/// snapshot with the index its bytes actually represent (the service's freeze-time
+/// index), which the async build can move off the node's scope-1 frontier. The
+/// journal seq IS the raft log index (see `drive_catchup`'s replay loop).
+fn log_id_at(journal: &ultima_journal::Journal, index: u64) -> Result<RaftLogId, io::Error> {
+    let mut iter = journal
+        .iter_range(index..(index + 1))
+        .map_err(|e| io::Error::other(format!("snapshot: iter_range({index}): {e}")))?;
+    let record = iter.next().ok_or_else(|| {
+        io::Error::other(format!(
+            "snapshot: journal has no record at index {index} (purged or gap)"
+        ))
+    })?;
+    let (_seq, _meta, payload) =
+        record.map_err(|e| io::Error::other(format!("snapshot: journal read at {index}: {e}")))?;
+    let (entry, _) = bincode::serde::decode_from_slice::<
+        <TypeConfig as openraft::RaftTypeConfig>::Entry,
+        _,
+    >(&payload, bincode::config::standard())
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(entry.log_id)
+}
+
+/// The "non-advancing" snapshot returned when a build cannot safely persist (the
+/// epoch raced a reattach, or the freeze index can't be resolved): the last-good
+/// persisted snapshot unchanged, or an empty `last_log_id = None` snapshot if none
+/// exists. openraft's `update_snapshot` only advances/purges when `last_log_id` is
+/// STRICTLY GREATER than the current pointer, so neither result advances the
+/// snapshot or purges the log.
+fn last_good_or_empty<S: StateMachine>(g: &ShmemInner<S>) -> RaftSnapshot {
+    if let Some(s) = &g.current_snapshot {
+        return Snapshot {
+            meta: s.meta.clone(),
+            snapshot: Cursor::new(s.data.clone()),
+        };
+    }
+    Snapshot {
+        meta: RaftSnapshotMeta {
+            last_log_id: None,
+            last_membership: Default::default(),
+            snapshot_id: "snap-0".to_string(),
+        },
+        snapshot: Cursor::new(Vec::new()),
     }
 }
