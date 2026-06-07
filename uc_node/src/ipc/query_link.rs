@@ -75,14 +75,20 @@ impl ShmemQueryLink {
     /// frame on `query_resp.ring`, return its payload bytes. Caller is
     /// responsible for bincode-encoding the typed `Query` and decoding the
     /// returned `QueryResponse`.
-    pub async fn submit(&self, payload: &[u8], kind: QueryKind) -> Result<Bytes, ClusterError> {
-        // Read-gate: if the service reattached, wait until the reconcile driver has
-        // rebuilt it to the node frontier before serving — else a fresh in-memory
-        // SM would answer stale (a linearizability violation). Fast path returns
-        // immediately when the current incarnation is already reconciled. Done
-        // BEFORE taking the query-link lock so a wait doesn't serialize queries.
+    pub async fn submit(
+        &self,
+        payload: &[u8],
+        kind: QueryKind,
+        read_index: u64,
+    ) -> Result<Bytes, ClusterError> {
+        // Read barrier: wait until the current service incarnation has caught up to
+        // `read_index` (the linearizable read point from `ensure_linearizable`)
+        // before serving — else a fresh/empty service after a crash or node restart
+        // would answer stale. `read_index == 0` (e.g. snapshot reads) waits only for
+        // the current incarnation to exist. Done BEFORE taking the query-link lock
+        // so a wait doesn't serialize queries.
         if let Some(gate) = &self.gate {
-            gate.wait_until_reconciled().await;
+            gate.wait_until_caught_up(read_index).await;
         }
         let mut g = self.inner.lock().await;
         let request_id = g.next_request_id;

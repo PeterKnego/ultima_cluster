@@ -182,16 +182,29 @@ where
                         }
                     };
 
-                    if let QueryKind::Linearizable = kind {
-                        let leader = raft.current_leader().await;
-                        if leader != Some(node_id) {
-                            broadcast_not_leader(&response_producer, extra, leader).await;
-                            continue;
+                    // Linearizable reads go through the ReadIndex barrier: confirm
+                    // leadership + get the read index (openraft applied up to it).
+                    // The query link then waits for the service to catch up to that
+                    // index before serving. Snapshot reads skip the barrier
+                    // (read_index 0 = serve from the current incarnation as-is).
+                    let read_index = if let QueryKind::Linearizable = kind {
+                        match raft.ensure_linearizable().await {
+                            Ok(idx) => idx,
+                            Err(crate::ClusterError::NotLeader { leader_id }) => {
+                                broadcast_not_leader(&response_producer, extra, leader_id).await;
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::warn!(node_id, error = ?e, "ensure_linearizable failed");
+                                broadcast_not_leader(&response_producer, extra, None).await;
+                                continue;
+                            }
                         }
-                        // TODO(M5): raft.ensure_linearizable().await once plumbed through RaftHandle.
-                    }
+                    } else {
+                        0
+                    };
 
-                    match query_link.submit(&payload, kind).await {
+                    match query_link.submit(&payload, kind, read_index).await {
                         Ok(resp_bytes) => {
                             broadcast_record(
                                 &response_producer,

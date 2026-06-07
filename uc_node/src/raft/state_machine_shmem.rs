@@ -120,9 +120,15 @@ pub struct ShmemAdaptedStateMachine<S: StateMachine> {
     /// `ShmemInner::last_seen_epoch`. Updated by `apply()` (lazy) and by the
     /// reconcile driver via [`Self::ensure_reconciled`] (proactive).
     pub(crate) reconciled_epoch: Arc<AtomicU64>,
-    /// Fired after `reconciled_epoch` advances, to wake reads parked in
-    /// [`ReconcileGate::wait_until_reconciled`].
+    /// Fired after the service catch-up frontier advances, to wake reads parked
+    /// in [`ReconcileGate::wait_until_ready`].
     pub(crate) reconcile_done: Arc<Notify>,
+    /// Highest all-entry log index the CURRENT service incarnation has caught up
+    /// to (Normal entries applied+acked; Blank/Membership trivially passed). The
+    /// read-gate waits until this reaches the node's committed index, so a node
+    /// that is mid-replay after a restart (service still empty) doesn't serve a
+    /// stale read. Reset implicitly per incarnation via the epoch check.
+    pub(crate) service_caught_up_to: Arc<AtomicU64>,
     /// Cached cnc `ServiceStatus` pointer (also in `inner`); duplicated here so the
     /// read-gate reads the live service epoch without taking `inner`.
     pub(crate) service_status_ptr: Option<ServiceStatusPtr>,
@@ -161,31 +167,36 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
             // apply() (or a prior driver pass) reconciled while we waited.
             return Ok(());
         }
-        let reconciled = match g.last_applied {
+        let (reconciled, caught_up) = match g.last_applied {
             // Replay (service_last, frontier] into the fresh service. `drive_catchup`
-            // borrows `&g` (interior-mutable rings) and returns the reconciled epoch.
+            // borrows `&g` (interior-mutable rings) and returns the reconciled epoch;
+            // the service is then caught up to `frontier`.
             Some(frontier) => {
                 let (_resp, epoch) =
                     drive_catchup(&g, &self.snapshot_op, &self.shutdown, frontier).await?;
-                epoch
+                (epoch, frontier.index)
             }
             // Nothing applied yet: the empty service already matches the node's
-            // (empty) frontier — just mark this incarnation reconciled.
-            None => cur,
+            // (empty) frontier — mark this incarnation reconciled at index 0.
+            None => (cur, 0),
         };
         g.last_seen_epoch = reconciled;
         self.reconciled_epoch.store(reconciled, Ordering::Release);
+        self.service_caught_up_to.store(caught_up, Ordering::Release);
         self.reconcile_done.notify_waiters();
         Ok(())
     }
 
     /// Build a lightweight [`ReconcileGate`] for the query read-path. It shares
-    /// this adapter's `reconciled_epoch` / `reconcile_done` / `service_status_ptr`
-    /// but holds NO adapter clone (so it does not inflate the live-clone count —
-    /// see the driver-redesign plan), and pokes `request` to wake the driver.
+    /// this adapter's reconcile signals but holds NO adapter clone (so it does not
+    /// inflate the live-clone count — see the driver-redesign plan), and pokes
+    /// `request` to wake the driver. The read catch-up target (`read_index`) is
+    /// supplied per-read by `ensure_linearizable`, so the gate needs no committed
+    /// pointer of its own.
     pub(crate) fn reconcile_gate(&self, request: Arc<Notify>) -> ReconcileGate {
         ReconcileGate {
             reconciled_epoch: self.reconciled_epoch.clone(),
+            service_caught_up_to: self.service_caught_up_to.clone(),
             done: self.reconcile_done.clone(),
             request,
             service_status_ptr: self.service_status_ptr,
@@ -199,32 +210,44 @@ const GATE_BACKSTOP: Duration = Duration::from_millis(25);
 const DRIVER_BACKSTOP: Duration = Duration::from_millis(50);
 
 /// Lightweight read-gate handed to the query path. Holds only shared signals
-/// (no adapter clone): the `reconciled_epoch` counter, a `done` notifier woken
-/// when it advances, a `request` notifier that pokes the reconcile driver, and
-/// the cnc `ServiceStatus` pointer to read the live service epoch.
+/// (no adapter clone): `reconciled_epoch` (current incarnation reconstructed),
+/// `service_caught_up_to` (the all-entry index the service has caught up to), a
+/// `done` notifier woken when either advances, a `request` notifier that pokes the
+/// reconcile driver, and the cnc `ServiceStatus` pointer (live service epoch).
 #[derive(Clone)]
 pub(crate) struct ReconcileGate {
     reconciled_epoch: Arc<AtomicU64>,
+    service_caught_up_to: Arc<AtomicU64>,
     done: Arc<Notify>,
     request: Arc<Notify>,
     service_status_ptr: Option<ServiceStatusPtr>,
 }
 
 impl ReconcileGate {
-    /// Block until the current service incarnation has been reconstructed to the
-    /// node frontier. Fast path returns immediately when already reconciled;
-    /// otherwise pokes the driver and waits (with a backstop so a missed wakeup
-    /// can't hang the read). Holds no lock on the fast path.
-    pub(crate) async fn wait_until_reconciled(&self) {
+    /// Block until it is safe to serve a read at `read_index` (the linearizable
+    /// read point from `ensure_linearizable`). Two conditions, both required:
+    ///
+    /// 1. the CURRENT service incarnation has been reconstructed (`service epoch ==
+    ///    reconciled_epoch`) — catches a mid-life service crash/reattach, where a
+    ///    stale-high `service_caught_up_to` from before the crash must not count; and
+    /// 2. the service has caught up to `read_index` — catches a node restart where
+    ///    the service is empty until the committed log is replayed into it.
+    ///
+    /// Fast path returns immediately in steady state; otherwise pokes the driver
+    /// and waits, with a backstop so a missed wakeup can't hang the read.
+    pub(crate) async fn wait_until_caught_up(&self, read_index: u64) {
         loop {
-            // Register interest BEFORE the check so a `done` fired between the
-            // check and the await is not lost.
+            // Register interest BEFORE the checks so a `done` fired in between is
+            // not lost.
             let done_fut = self.done.notified();
-            if epoch_of(self.service_status_ptr) == self.reconciled_epoch.load(Ordering::Acquire) {
+            let incarnation_ok =
+                epoch_of(self.service_status_ptr) == self.reconciled_epoch.load(Ordering::Acquire);
+            let caught_up = self.service_caught_up_to.load(Ordering::Acquire) >= read_index;
+            if incarnation_ok && caught_up {
                 return;
             }
-            // Poke the driver to reconcile this incarnation now (proactive),
-            // then wait for it — or re-check after the backstop.
+            // Poke the driver to reconcile a reattached incarnation now (proactive),
+            // then wait for progress — or re-check after the backstop.
             self.request.notify_one();
             tokio::select! {
                 _ = done_fut => {}
@@ -425,6 +448,7 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
             shutdown: Arc::new(AtomicBool::new(false)),
             reconciled_epoch: Arc::new(AtomicU64::new(last_seen_epoch)),
             reconcile_done: Arc::new(Notify::new()),
+            service_caught_up_to: Arc::new(AtomicU64::new(0)),
             service_status_ptr,
             snapshot_op: Arc::new(TokioMutex::new(SnapshotChannel {
                 producer: snapshot_producer,
@@ -443,6 +467,7 @@ impl<S: StateMachine> Clone for ShmemAdaptedStateMachine<S> {
             shutdown: self.shutdown.clone(),
             reconciled_epoch: self.reconciled_epoch.clone(),
             reconcile_done: self.reconcile_done.clone(),
+            service_caught_up_to: self.service_caught_up_to.clone(),
             service_status_ptr: self.service_status_ptr,
             snapshot_op: self.snapshot_op.clone(),
         }
@@ -495,7 +520,6 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                             drive_catchup(&g, &self.snapshot_op, &shutdown, log_id).await?;
                         g.last_seen_epoch = epoch;
                         self.reconciled_epoch.store(epoch, Ordering::Release);
-                        self.reconcile_done.notify_waiters();
                         b
                     } else {
                         publish_apply(
@@ -523,7 +547,6 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                                     drive_catchup(&g, &self.snapshot_op, &shutdown, log_id).await?;
                                 g.last_seen_epoch = epoch;
                                 self.reconciled_epoch.store(epoch, Ordering::Release);
-                                self.reconcile_done.notify_waiters();
                                 b
                             }
                         }
@@ -538,6 +561,11 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                     resp
                 }
             };
+            // The service is now caught up to this entry (Normal: applied + acked;
+            // Blank/Membership: nothing to deliver, so trivially caught up). Publish
+            // the all-entry frontier for the read-gate and wake any parked reads.
+            self.service_caught_up_to.store(log_index, Ordering::Release);
+            self.reconcile_done.notify_waiters();
             drop(g);
 
             if let Some(r) = responder {

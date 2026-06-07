@@ -83,6 +83,31 @@ impl<S: StateMachine> RaftHandle<S> {
         }
     }
 
+    /// Linearizable read barrier (ReadIndex). Confirms this node is still the
+    /// leader by contacting a quorum, waits until openraft has applied up to the
+    /// read point, and returns that `read_log_id` index (the index a read must
+    /// observe). `NotLeader` if leadership can't be confirmed (caller should
+    /// retry against the new leader). 0 means "nothing committed yet".
+    pub(crate) async fn ensure_linearizable(&self) -> Result<u64, ClusterError> {
+        use openraft::ReadPolicy;
+        let res = match self {
+            Self::Embedded(r) => r.ensure_linearizable(ReadPolicy::ReadIndex).await,
+            Self::Shmem(r) => r.ensure_linearizable(ReadPolicy::ReadIndex).await,
+        };
+        match res {
+            Ok(read_log_id) => Ok(read_log_id.map(|l| l.index()).unwrap_or(0)),
+            Err(e) => {
+                if let Some(f) = e.forward_to_leader() {
+                    Err(ClusterError::NotLeader {
+                        leader_id: f.leader_id,
+                    })
+                } else {
+                    Err(ClusterError::Raft(format!("ensure_linearizable: {e:?}")))
+                }
+            }
+        }
+    }
+
     pub(crate) async fn add_learner(
         &self,
         id: NodeId,
@@ -269,13 +294,20 @@ impl<S: StateMachine> NodeHandle<S> {
             SmAdapter::Embedded(a) => Ok(a.with_state(|s| s.query(q)).await),
             SmAdapter::Shmem(_) => {
                 use uc_protocol::frames::query::QueryKind;
+                // Linearizable read barrier: confirm leadership + get the read index
+                // (openraft has applied up to it); the query link then waits for the
+                // service to catch up to it before serving. NotLeader surfaces to the
+                // caller to retry against the new leader.
+                let read_index = self.raft.ensure_linearizable().await?;
                 let link = self.query_link.as_ref().ok_or_else(|| {
                     ClusterError::Config(
                         "shmem-mode NodeHandle missing query_link (builder bug)".into(),
                     )
                 })?;
                 let payload = bincode::serde::encode_to_vec(&q, bincode::config::standard())?;
-                let resp_bytes = link.submit(&payload, QueryKind::Snapshot).await?;
+                let resp_bytes = link
+                    .submit(&payload, QueryKind::Snapshot, read_index)
+                    .await?;
                 let (resp, _) = bincode::serde::decode_from_slice::<S::QueryResponse, _>(
                     &resp_bytes,
                     bincode::config::standard(),
