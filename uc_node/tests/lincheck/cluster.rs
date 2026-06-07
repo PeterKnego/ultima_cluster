@@ -97,10 +97,10 @@ async fn spawn_service(instance_dir: &std::path::Path, data_dir: &std::path::Pat
         data_dir: data_dir.to_owned(),
         ..ServiceConfig::default()
     };
-    // Service-side SM persists its state to `data_dir` (see register_sm.rs) so a
-    // service-only restart recovers — the node does not replay history into a
-    // reconnecting service.
-    ServiceBuilder::new(cfg, RegisterSm::new(data_dir.to_owned()))
+    // Service-side SM is plain in-memory (register_sm.rs persists nothing). A
+    // service-only restart therefore comes back EMPTY; the node reconstructs it
+    // from the replicated log — that recovery is exactly what the capstone proves.
+    ServiceBuilder::new(cfg, RegisterSm::default())
         .run()
         .await
         .expect("service start")
