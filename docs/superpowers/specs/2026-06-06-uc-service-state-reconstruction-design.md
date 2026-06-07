@@ -313,9 +313,11 @@ reuse the established per-stream-ring-file pattern, avoid the deferred cnc-ring 
 relevant `last_log_id` index (built index for BUILT; install target for INSTALL).
 
 **`snapshot.region`** — separate file `service/snapshot.region`. A small
-`SnapshotRegion` helper: write = build bytes to a `Vec`, `ftruncate` the file to
-`HEADER_LEN + len`, write `{magic, format_ver, byte_len, last_log_id (idx+term),
-crc32}` + bytes; read = open, validate header+crc, return the bytes (or a `Cursor`).
+`SnapshotRegion` helper: write = build bytes to a `Vec`, truncate the file to
+`HEADER_LEN + len`, write `{magic, format_ver, byte_len, snapshot_index, crc32}` +
+bytes; read = open, validate header+crc, return `(snapshot_index, bytes)`.
+(Implemented with the snapshot's `last_log_id` **index** only — the term is recovered
+node-side from `snapshot_meta`, so it need not be in the region header.)
 **Cross-process ordering comes from the control-ring ack** (writer fills region →
 sends BUILT/INSTALL → reader reads region only after receiving the frame), so no
 atomic fencing on the region itself. One op at a time (request/ack is serial).

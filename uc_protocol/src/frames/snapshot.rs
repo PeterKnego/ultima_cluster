@@ -1,9 +1,12 @@
-//! Snapshot control frames — flow over the cnc control rings, NOT the
-//! service↔node SPSC rings.
+//! Snapshot control frames (Phase 2a). These flow over the dedicated
+//! `service/snapshot.ring` (node→service: BUILD/INSTALL) and
+//! `service/snapshot_resp.ring` (service→node: BUILT/INSTALLED) SPSC pair.
 //!
-//! M3 uses these for the build/install handshake; the actual snapshot bytes
-//! flow via the existing M2 path (`Cursor<Vec<u8>>` + openraft's
-//! `InstallSnapshot` RPC over QUIC). M5 swaps to a `snapshot.region` mmap.
+//! The snapshot BYTES travel separately through the `service/snapshot.region`
+//! file (see `uc_protocol::snapshot_region`); these control frames only carry
+//! the command + the relevant `last_log_id` index in `header_extra`. Ordering
+//! between the region write and the frame is the caller's responsibility (write
+//! region → send frame → peer reads region after receiving the frame).
 
 /// node → service: "please build a snapshot at your current `last_applied`."
 pub const MSG_TYPE_BUILD_SNAPSHOT: u16 = 100;
