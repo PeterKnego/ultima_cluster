@@ -53,8 +53,10 @@ use uc_protocol::frames::apply::{
     MSG_TYPE_APPLY, MSG_TYPE_APPLY_RESP, decode_extra_apply, decode_flags_apply,
     encode_extra_apply, encode_flags_apply,
 };
+use uc_protocol::frames::snapshot::{MSG_TYPE_BUILD_SNAPSHOT, MSG_TYPE_SNAPSHOT_BUILT};
 use uc_protocol::ring::RingError;
 use uc_protocol::ring::spsc::{SpscConsumer, SpscProducer};
+use uc_protocol::snapshot_region;
 use uc_service::StateMachine;
 use ultima_journal::StableValue;
 
@@ -362,6 +364,7 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         ShmemSnapshotBuilder {
             inner: self.inner.clone(),
+            shutdown: self.shutdown.clone(),
         }
     }
 
@@ -556,6 +559,61 @@ async fn await_apply_resp(
     }
 }
 
+// ---------------------------------------------------------------------------
+// snapshot ring publish / await helpers (Phase 2a)
+// ---------------------------------------------------------------------------
+
+async fn publish_snapshot_cmd(
+    producer: &PlMutex<SpscProducer>,
+    msg_type: u16,
+    extra: [u8; 8],
+    shutdown: &AtomicBool,
+) -> Result<(), io::Error> {
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "snapshot cmd: shutting down",
+            ));
+        }
+        let r = { producer.lock().try_write(msg_type, 0, extra, &[]) };
+        match r {
+            Ok(()) => return Ok(()),
+            Err(RingError::Full) => tokio::time::sleep(FULL_BACKOFF).await,
+            Err(e) => return Err(io::Error::other(format!("snapshot cmd write: {e}"))),
+        }
+    }
+}
+
+/// Await a snapshot resp frame of `expected_msg_type`; returns its header_extra u64.
+async fn await_snapshot_resp(
+    consumer: &PlMutex<SpscConsumer>,
+    expected_msg_type: u16,
+    shutdown: &AtomicBool,
+    bridge: &NotifyBridge,
+) -> Result<u64, io::Error> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "snapshot resp: shutting down",
+            ));
+        }
+        let read = { consumer.lock().try_read(&mut buf) };
+        match read {
+            Ok(Some(rec)) if rec.msg_type == expected_msg_type => {
+                return Ok(u64::from_le_bytes(rec.header_extra));
+            }
+            Ok(Some(rec)) => {
+                tracing::warn!(msg_type = rec.msg_type, "unexpected frame on snapshot_resp ring")
+            }
+            Ok(None) => bridge.notified().await,
+            Err(e) => return Err(io::Error::other(format!("snapshot_resp read: {e}"))),
+        }
+    }
+}
+
 /// Replay committed entries to a reattached service. Called from `apply()` when a
 /// reattach is observed (the parked entry `up_to` is, by the single-in-flight
 /// invariant, the node's live frontier). Reuses the apply ring + resp ring under
@@ -680,36 +738,74 @@ async fn drive_catchup<S: StateMachine>(
 
 pub struct ShmemSnapshotBuilder<S: StateMachine> {
     inner: Arc<TokioMutex<ShmemInner<S>>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S> {
     async fn build_snapshot(&mut self) -> Result<RaftSnapshot, io::Error> {
+        // Hold the inner lock across the round-trip (2a: blocking — stalls apply;
+        // Phase 2b removes this). The lock serializes vs apply() and drive_catchup.
         let mut g = self.inner.lock().await;
-        let last_applied = g.last_applied;
+        let region_path = g.snapshot_region_path.clone();
+        publish_snapshot_cmd(
+            &g.snapshot_producer,
+            MSG_TYPE_BUILD_SNAPSHOT,
+            [0u8; 8],
+            &self.shutdown,
+        )
+        .await?;
+        let built_index = await_snapshot_resp(
+            &g.snapshot_resp_consumer,
+            MSG_TYPE_SNAPSHOT_BUILT,
+            &self.shutdown,
+            &g.snapshot_resp_bridge,
+        )
+        .await?;
+        let (_idx, bytes) =
+            snapshot_region::read(&region_path).map_err(|e| io::Error::other(e.to_string()))?;
+
+        let last_log_id = g.last_applied;
         let last_membership = g.last_membership.clone();
-
-        // Degenerate (see module docs): the node-side sm is empty. Build
-        // produces whatever the user's default `build_snapshot` returns.
-        let mut buf: Vec<u8> = Vec::new();
-        let _user_index =
-            g.sm.build_snapshot(&mut buf)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-
-        let snapshot_id_index = last_applied.map(|l| l.index).unwrap_or(0);
+        if last_log_id.map(|l| l.index).unwrap_or(0) != built_index {
+            tracing::warn!(
+                node_frontier = ?last_log_id,
+                built_index,
+                "snapshot built_index != node frontier"
+            );
+        }
         let meta = RaftSnapshotMeta {
-            last_log_id: last_applied,
-            last_membership,
-            snapshot_id: format!("snap-{snapshot_id_index}"),
+            last_log_id,
+            last_membership: last_membership.clone(),
+            snapshot_id: format!("snap-{built_index}"),
         };
-        let stored = StoredSnapshot {
-            meta: meta.clone(),
-            data: buf.clone(),
-        };
-        g.current_snapshot = Some(stored);
 
+        // REQUIRED: persist to disk so a node restart after purge can still
+        // reconstruct (openraft purges the log right after snapshotting). Mirror
+        // install_snapshot's persist block.
+        let bytes_filename = format!("snapshot_{built_index}.bin");
+        let bytes_path = g.snapshot_bytes_dir.join(&bytes_filename);
+        std::fs::write(&bytes_path, &bytes).map_err(io::Error::other)?;
+        let f = std::fs::File::open(&bytes_path).map_err(io::Error::other)?;
+        f.sync_all().map_err(io::Error::other)?;
+        drop(f);
+        let stored_meta = StoredSnapshotMeta {
+            last_log_id,
+            last_membership,
+            bytes_filename,
+        };
+        g.snapshot_meta_sv
+            .store(&stored_meta)
+            .map_err(io::Error::other)?
+            .wait()
+            .map_err(io::Error::other)?;
+
+        g.current_snapshot = Some(StoredSnapshot {
+            meta: meta.clone(),
+            data: bytes.clone(),
+        });
         Ok(Snapshot {
             meta,
-            snapshot: Cursor::new(buf),
+            snapshot: Cursor::new(bytes),
         })
     }
 }
