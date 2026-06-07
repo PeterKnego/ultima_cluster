@@ -53,7 +53,10 @@ use uc_protocol::frames::apply::{
     MSG_TYPE_APPLY, MSG_TYPE_APPLY_RESP, decode_extra_apply, decode_flags_apply,
     encode_extra_apply, encode_flags_apply,
 };
-use uc_protocol::frames::snapshot::{MSG_TYPE_BUILD_SNAPSHOT, MSG_TYPE_SNAPSHOT_BUILT};
+use uc_protocol::frames::snapshot::{
+    MSG_TYPE_BUILD_SNAPSHOT, MSG_TYPE_INSTALL_SNAPSHOT, MSG_TYPE_SNAPSHOT_BUILT,
+    MSG_TYPE_SNAPSHOT_INSTALLED, encode_extra_install_snapshot,
+};
 use uc_protocol::ring::RingError;
 use uc_protocol::ring::spsc::{SpscConsumer, SpscProducer};
 use uc_protocol::snapshot_region;
@@ -662,10 +665,54 @@ async fn drive_catchup<S: StateMachine>(
                 service_last,
                 last_purged,
             } => {
-                return Err(io::Error::other(format!(
-                    "reconstruct: service at {service_last} below purge boundary {last_purged}; \
-                     snapshot-install is Phase 2"
-                )));
+                // Install the node's snapshot into the fresh service, then tail-replay.
+                let (snap_index, snap_bytes) = match &g.current_snapshot {
+                    Some(s) => (
+                        s.meta.last_log_id.map(|l| l.index).unwrap_or(0),
+                        s.data.clone(),
+                    ),
+                    None => {
+                        // Durable snapshot on disk (e.g. after a node restart).
+                        let meta = g.snapshot_meta_sv.load().ok().flatten();
+                        match meta {
+                            Some(m) => {
+                                let path = g.snapshot_bytes_dir.join(&m.bytes_filename);
+                                let bytes = std::fs::read(&path).map_err(|e| {
+                                    io::Error::other(format!(
+                                        "reconstruct: read snapshot {path:?}: {e}"
+                                    ))
+                                })?;
+                                (m.last_log_id.map(|l| l.index).unwrap_or(0), bytes)
+                            }
+                            None => {
+                                return Err(io::Error::other(format!(
+                                    "reconstruct: service at {service_last} below purge \
+                                     {last_purged} but node has no snapshot to install"
+                                )));
+                            }
+                        }
+                    }
+                };
+                let region_path = g.snapshot_region_path.clone();
+                snapshot_region::write(&region_path, snap_index, &snap_bytes)
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                g.snapshot_resp_consumer.lock().discard_backlog();
+                publish_snapshot_cmd(
+                    &g.snapshot_producer,
+                    MSG_TYPE_INSTALL_SNAPSHOT,
+                    encode_extra_install_snapshot(snap_index),
+                    shutdown,
+                )
+                .await?;
+                let _installed = await_snapshot_resp(
+                    &g.snapshot_resp_consumer,
+                    MSG_TYPE_SNAPSHOT_INSTALLED,
+                    shutdown,
+                    &g.snapshot_resp_bridge,
+                )
+                .await?;
+                // Service is now at snap_index; replay the tail (snap_index, up_to].
+                (snap_index, up_to)
             }
             crate::runtime::reconstruct::ReplayPlan::Replay { from, to } => (from, to),
         };
