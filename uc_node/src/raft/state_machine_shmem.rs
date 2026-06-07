@@ -609,7 +609,10 @@ async fn await_snapshot_resp(
                 return Ok(u64::from_le_bytes(rec.header_extra));
             }
             Ok(Some(rec)) => {
-                tracing::warn!(msg_type = rec.msg_type, "unexpected frame on snapshot_resp ring")
+                tracing::warn!(
+                    msg_type = rec.msg_type,
+                    "unexpected frame on snapshot_resp ring"
+                )
             }
             Ok(None) => bridge.notified().await,
             Err(e) => return Err(io::Error::other(format!("snapshot_resp read: {e}"))),
@@ -656,76 +659,73 @@ async fn drive_catchup<S: StateMachine>(
         // Decide the replay span. The plan always includes up_to (the parked
         // entry must be applied + acked, idempotently — log_index is the key).
         // Fresh in-memory service => service_last == 0.
-        let (from, to) = match crate::runtime::reconstruct::plan_replay(
-            service_last,
-            up_to,
-            last_purged,
-        ) {
-            crate::runtime::reconstruct::ReplayPlan::NeedsSnapshot {
-                service_last,
-                last_purged,
-            } => {
-                // Install the node's snapshot into the fresh service, then tail-replay.
-                let (snap_index, snap_bytes) = match &g.current_snapshot {
-                    Some(s) => (
-                        s.meta.last_log_id.map(|l| l.index).unwrap_or(0),
-                        s.data.clone(),
-                    ),
-                    None => {
-                        // Durable snapshot on disk (e.g. after a node restart).
-                        let meta = g.snapshot_meta_sv.load().ok().flatten();
-                        match meta {
-                            Some(m) => {
-                                let path = g.snapshot_bytes_dir.join(&m.bytes_filename);
-                                let bytes = std::fs::read(&path).map_err(|e| {
-                                    io::Error::other(format!(
-                                        "reconstruct: read snapshot {path:?}: {e}"
-                                    ))
-                                })?;
-                                (m.last_log_id.map(|l| l.index).unwrap_or(0), bytes)
-                            }
-                            None => {
-                                return Err(io::Error::other(format!(
-                                    "reconstruct: service at {service_last} below purge \
+        let (from, to) =
+            match crate::runtime::reconstruct::plan_replay(service_last, up_to, last_purged) {
+                crate::runtime::reconstruct::ReplayPlan::NeedsSnapshot {
+                    service_last,
+                    last_purged,
+                } => {
+                    // Install the node's snapshot into the fresh service, then tail-replay.
+                    let (snap_index, snap_bytes) = match &g.current_snapshot {
+                        Some(s) => (
+                            s.meta.last_log_id.map(|l| l.index).unwrap_or(0),
+                            s.data.clone(),
+                        ),
+                        None => {
+                            // Durable snapshot on disk (e.g. after a node restart).
+                            let meta = g.snapshot_meta_sv.load().ok().flatten();
+                            match meta {
+                                Some(m) => {
+                                    let path = g.snapshot_bytes_dir.join(&m.bytes_filename);
+                                    let bytes = std::fs::read(&path).map_err(|e| {
+                                        io::Error::other(format!(
+                                            "reconstruct: read snapshot {path:?}: {e}"
+                                        ))
+                                    })?;
+                                    (m.last_log_id.map(|l| l.index).unwrap_or(0), bytes)
+                                }
+                                None => {
+                                    return Err(io::Error::other(format!(
+                                        "reconstruct: service at {service_last} below purge \
                                      {last_purged} but node has no snapshot to install"
-                                )));
+                                    )));
+                                }
                             }
                         }
+                    };
+                    let region_path = g.snapshot_region_path.clone();
+                    snapshot_region::write(&region_path, snap_index, &snap_bytes)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    g.snapshot_resp_consumer.lock().discard_backlog();
+                    publish_snapshot_cmd(
+                        &g.snapshot_producer,
+                        MSG_TYPE_INSTALL_SNAPSHOT,
+                        encode_extra_install_snapshot(snap_index),
+                        shutdown,
+                    )
+                    .await?;
+                    let installed = await_snapshot_resp(
+                        &g.snapshot_resp_consumer,
+                        MSG_TYPE_SNAPSHOT_INSTALLED,
+                        shutdown,
+                        &g.snapshot_resp_bridge,
+                    )
+                    .await?;
+                    if installed != snap_index {
+                        // The service's install_snapshot reported a different index than
+                        // the snapshot we sent — a user-SM bug. We trust snap_index for
+                        // the tail boundary regardless. (Mirrors the build-path warn.)
+                        tracing::warn!(
+                            snap_index,
+                            reported = installed,
+                            "service install_snapshot reported index != installed snapshot index"
+                        );
                     }
-                };
-                let region_path = g.snapshot_region_path.clone();
-                snapshot_region::write(&region_path, snap_index, &snap_bytes)
-                    .map_err(|e| io::Error::other(e.to_string()))?;
-                g.snapshot_resp_consumer.lock().discard_backlog();
-                publish_snapshot_cmd(
-                    &g.snapshot_producer,
-                    MSG_TYPE_INSTALL_SNAPSHOT,
-                    encode_extra_install_snapshot(snap_index),
-                    shutdown,
-                )
-                .await?;
-                let installed = await_snapshot_resp(
-                    &g.snapshot_resp_consumer,
-                    MSG_TYPE_SNAPSHOT_INSTALLED,
-                    shutdown,
-                    &g.snapshot_resp_bridge,
-                )
-                .await?;
-                if installed != snap_index {
-                    // The service's install_snapshot reported a different index than
-                    // the snapshot we sent — a user-SM bug. We trust snap_index for
-                    // the tail boundary regardless. (Mirrors the build-path warn.)
-                    tracing::warn!(
-                        snap_index,
-                        reported = installed,
-                        "service install_snapshot reported index != installed snapshot index"
-                    );
+                    // Service is now at snap_index; replay the tail (snap_index, up_to].
+                    (snap_index, up_to)
                 }
-                // Service is now at snap_index; replay the tail (snap_index, up_to].
-                (snap_index, up_to)
-            }
-            crate::runtime::reconstruct::ReplayPlan::Replay { from, to } => (from, to),
-        };
+                crate::runtime::reconstruct::ReplayPlan::Replay { from, to } => (from, to),
+            };
 
         // Drop any stale resps left by the dead incarnation (node owns the resp
         // ring's consumer_position).

@@ -51,8 +51,14 @@ mod tests {
 
     #[test]
     fn install_extra_round_trip() {
-        assert_eq!(decode_extra_install_snapshot(encode_extra_install_snapshot(42)), 42);
-        assert_eq!(decode_extra_snapshot_installed(encode_extra_snapshot_installed(99)), 99);
+        assert_eq!(
+            decode_extra_install_snapshot(encode_extra_install_snapshot(42)),
+            42
+        );
+        assert_eq!(
+            decode_extra_snapshot_installed(encode_extra_snapshot_installed(99)),
+            99
+        );
     }
 
     #[test]

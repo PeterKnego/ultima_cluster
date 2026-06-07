@@ -31,7 +31,11 @@ pub enum SnapshotRegionError {
 /// content. Truncates the file to exactly HEADER_LEN + bytes.len().
 pub fn write(path: &Path, snapshot_index: u64, bytes: &[u8]) -> Result<(), SnapshotRegionError> {
     let crc = crc32fast::hash(bytes);
-    let mut f = OpenOptions::new().create(true).write(true).truncate(true).open(path)?;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
     let mut header = [0u8; HEADER_LEN];
     header[0..8].copy_from_slice(&MAGIC);
     header[8..12].copy_from_slice(&FORMAT_VER.to_le_bytes());
@@ -66,11 +70,17 @@ pub fn read(path: &Path) -> Result<(u64, Vec<u8>), SnapshotRegionError> {
     let mut bytes = Vec::with_capacity(cap_hint);
     f.read_to_end(&mut bytes)?;
     if bytes.len() as u64 != byte_len {
-        return Err(SnapshotRegionError::Truncated { expected: byte_len, actual: bytes.len() as u64 });
+        return Err(SnapshotRegionError::Truncated {
+            expected: byte_len,
+            actual: bytes.len() as u64,
+        });
     }
     let computed = crc32fast::hash(&bytes);
     if computed != crc {
-        return Err(SnapshotRegionError::CrcMismatch { header: crc, computed });
+        return Err(SnapshotRegionError::CrcMismatch {
+            header: crc,
+            computed,
+        });
     }
     Ok((snapshot_index, bytes))
 }
@@ -95,7 +105,10 @@ mod tests {
         let n = buf.len();
         buf[n - 1] ^= 0xFF;
         std::fs::write(tmp.path(), &buf).unwrap();
-        assert!(matches!(read(tmp.path()), Err(SnapshotRegionError::CrcMismatch { .. })));
+        assert!(matches!(
+            read(tmp.path()),
+            Err(SnapshotRegionError::CrcMismatch { .. })
+        ));
     }
     #[test]
     fn rewrite_shrinks() {
