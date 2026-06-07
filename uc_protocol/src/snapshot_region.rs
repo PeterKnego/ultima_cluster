@@ -59,7 +59,11 @@ pub fn read(path: &Path) -> Result<(u64, Vec<u8>), SnapshotRegionError> {
     let byte_len = u64::from_le_bytes(header[16..24].try_into().unwrap());
     let snapshot_index = u64::from_le_bytes(header[24..32].try_into().unwrap());
     let crc = u32::from_le_bytes(header[32..36].try_into().unwrap());
-    let mut bytes = Vec::with_capacity(byte_len as usize);
+    // Cap the pre-allocation hint: a corrupt header `byte_len` must not trigger a
+    // multi-GB allocation (OOM abort) before the Truncated/CrcMismatch checks fire.
+    // `read_to_end` grows past the hint for legitimately larger snapshots.
+    let cap_hint = (byte_len as usize).min(256 * 1024 * 1024);
+    let mut bytes = Vec::with_capacity(cap_hint);
     f.read_to_end(&mut bytes)?;
     if bytes.len() as u64 != byte_len {
         return Err(SnapshotRegionError::Truncated { expected: byte_len, actual: bytes.len() as u64 });

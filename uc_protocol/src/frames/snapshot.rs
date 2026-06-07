@@ -61,6 +61,8 @@ mod tests {
         // requires a protocol version bump and a coordinated SDK release.
         assert_eq!(MSG_TYPE_BUILD_SNAPSHOT, 100);
         assert_eq!(MSG_TYPE_SNAPSHOT_BUILT, 101);
+        assert_eq!(MSG_TYPE_INSTALL_SNAPSHOT, 102);
+        assert_eq!(MSG_TYPE_SNAPSHOT_INSTALLED, 103);
     }
 
     #[test]
