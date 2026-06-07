@@ -18,6 +18,7 @@ pub mod liveness;
 pub mod magic;
 pub mod probes;
 pub mod ring;
+pub mod snapshot_region;
 pub mod version;
 
 pub use error_codes::ErrorCode;
