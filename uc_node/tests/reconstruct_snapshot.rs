@@ -45,32 +45,31 @@
 //!   node frontier (e.g. 7). openraft would advance the snapshot pointer and
 //!   PURGE the log below the frontier; a later INSTALL of that empty snapshot is
 //!   silent durable data loss (and meta index 7 disagrees with bytes index 0).
-//!   THE GUARD: `build_snapshot` now computes `frontier = last_applied.index`
-//!   and, when `built_index != frontier`, returns the LAST GOOD snapshot
-//!   unchanged (or an empty `last_log_id = None` snapshot if none exists) instead
-//!   of persisting the degenerate one. openraft's `update_snapshot` only advances
-//!   / purges when the new `last_log_id` is STRICTLY GREATER than the current
-//!   snapshot pointer, so a non-greater meta advances nothing and purges nothing;
-//!   the SnapshotPolicy re-triggers the build later, by which point
-//!   apply()/drive_catchup has reconstructed service #2 to the frontier and the
-//!   retried build returns `built_index == frontier` with real bytes.
+//!   THE GUARD (Phase 2b — EPOCH-based): `build_snapshot` runs the BUILD round-trip
+//!   off the `inner` lock (under `snapshot_op`) so applies proceed concurrently;
+//!   it captures `epoch_before` (the cnc service epoch) before the round-trip and
+//!   `epoch_after` after, and when they DIFFER (a reattach happened during the
+//!   build) returns the LAST GOOD snapshot unchanged (or an empty
+//!   `last_log_id = None` snapshot if none exists) instead of persisting the
+//!   degenerate one. (The 2a frontier-based check `built_index == frontier` no
+//!   longer works in 2b: concurrent applies legitimately advance the frontier
+//!   during a build, so only an epoch change reliably marks a real reattach.) The
+//!   service bumps its epoch BEFORE spawning its snapshot loop, so any incarnation
+//!   that can answer a BUILD has already bumped — the node always observes it.
+//!   openraft's `update_snapshot` only advances/purges when the new `last_log_id`
+//!   is STRICTLY GREATER than the current snapshot pointer, so the non-advancing
+//!   return purges nothing; SnapshotPolicy re-triggers the build later, by which
+//!   point apply()/drive_catchup has reconstructed the reattached service and the
+//!   retried build (same epoch start-to-finish) persists real bytes.
 //!   WHY ERR IS NOT USED: in openraft 0.10.0-alpha.20 a `build_snapshot` Err is
 //!   wrapped into `StorageError` and surfaced via `command_result.result?` in
 //!   `RaftCore::handle_notification`, which converts it to `Fatal::StorageError`
 //!   and SHUTS THE NODE DOWN — it is NOT rescheduled (unlike a transient retry).
-//!   WHY NO DETERMINISTIC TEST: provoking the race requires a snapshot build to
-//!   be suspended precisely between sending BUILD and receiving BUILT at the
-//!   exact instant service #1 crashes and #2 attaches. The build round-trip holds
-//!   the inner lock that apply()/drive_catchup also take, so the build either
-//!   completes against the live service #1 or has not started — there is no
-//!   reliable injection point to freeze it mid-flight. Crashing "immediately"
-//!   after the 6 submits with no settle does not deterministically land a build
-//!   in flight, so a regression test built that way would mostly pass via the
-//!   normal path WITHOUT exercising the guard (a flaky/false-green test). Per
-//!   project policy we do not ship a flaky test; the guard is covered by
-//!   reasoning above plus the happy-path test below (which settles, so its build
-//!   sees `built_index == frontier` and is unaffected by the guard). The 1500ms
-//!   settle at step 2 is what keeps THIS test off the race.
+//!   WHY NO DETERMINISTIC TEST: provoking the race requires a reattach to land
+//!   precisely during an in-flight build. It's timing-dependent; per project
+//!   policy we don't ship a flaky test. The guard is covered by the reasoning
+//!   above + the happy-path test below (which settles 1500ms so its build runs
+//!   with a stable epoch and is unaffected by the guard).
 
 use std::io::{Read, Write};
 use std::time::Duration;

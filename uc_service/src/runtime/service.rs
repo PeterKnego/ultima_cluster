@@ -195,6 +195,21 @@ impl<S: StateMachine> ServiceBuilder<S> {
             }
         };
 
+        // Reconstruction handshake (Phase 1): publish recovered last_applied + bump
+        // the epoch. CRITICAL ORDERING (Phase 2b): the epoch bump MUST happen BEFORE
+        // the snapshot loop is spawned. Otherwise a reattached incarnation's snapshot
+        // loop could serve a stale BUILD frame (with degenerate empty bytes) BEFORE
+        // its epoch bump is observable, defeating the node's epoch race guard in
+        // build_snapshot and persisting a degenerate snapshot (silent data loss).
+        // Bumping first guarantees any incarnation that can serve a BUILD has already
+        // bumped, so the node observes the change and rejects the degenerate snapshot.
+        // All stores here are Release; READY (also Release, flipped last) carries them.
+        // SAFETY: cnc mmap owned by `Service` for the loop lifetime.
+        let status = unsafe { &*service_status_ptr };
+        let recovered = sm_shared.read().await.last_applied().unwrap_or(0);
+        super::handshake::publish_service_last_applied(status, recovered);
+        super::handshake::bump_service_epoch(status);
+
         let snapshot_region_path = self
             .config
             .instance_dir
@@ -207,14 +222,6 @@ impl<S: StateMachine> ServiceBuilder<S> {
             snapshot_region_path,
         );
 
-        // Reconstruction handshake (Phase 1): publish recovered last_applied,
-        // bump the epoch (so the node detects this (re)attach), THEN flip READY.
-        // All Release; ordered before the state→READY Release the node Acquires.
-        // SAFETY: cnc mmap owned by `Service` for the loop lifetime.
-        let status = unsafe { &*service_status_ptr };
-        let recovered = sm_shared.read().await.last_applied().unwrap_or(0);
-        super::handshake::publish_service_last_applied(status, recovered);
-        super::handshake::bump_service_epoch(status);
         set_service_state(status, service_state::READY);
 
         Ok(Service {
