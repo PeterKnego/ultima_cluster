@@ -21,11 +21,14 @@
 //! snapshot trait surface (`build_snapshot` / `install_snapshot`), not to
 //! mirror the service-side state. Consequences:
 //!
-//! * The startup user-vs-framework `last_applied` cross-check
-//!   (`AdaptedStateMachine::new`) cannot run here — the node-side `sm` has no
-//!   real last_applied. Skipped, with a tracing warning. Real cross-check
-//!   needs the service's last_applied via the cnc handshake (the ServiceReady
-//!   frame), which requires the cnc-sub-mmap MPSC attach API.
+//! * The startup `last_applied` cross-check now runs here as an UPPER-BOUND
+//!   check (Phase 3). `new()` reads the service's reported `last_applied` from
+//!   the cnc `ServiceStatus.last_applied` atomic (via `service_last_of`) and
+//!   refuses (`ClusterError::DriftDetected`) only if it exceeds the node's
+//!   journal tail (`journal.last_seq()`) — a service can only have applied
+//!   entries this node logged, so a higher index means corruption or a wrong
+//!   incarnation. A service at-or-below the tail (including a fresh in-memory
+//!   service at 0) is the normal reconstruction case and is allowed through.
 //! * Snapshot build/install at runtime still call the node-side `sm`'s
 //!   `build_snapshot` / `install_snapshot`. Until M5 routes them through the
 //!   service via `snapshot.region`, the produced snapshots reflect the
@@ -186,8 +189,7 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
         snapshot_resp_consumer: SpscConsumer,
         snapshot_region_path: std::path::PathBuf,
     ) -> Result<Self, crate::ClusterError> {
-        // Recover the framework-durable values; skip the user-side
-        // cross-check (see module docs).
+        // Recover the framework-durable values.
         let loaded_last_applied = handles.last_applied.load().ok().flatten();
         let loaded_snapshot_meta = handles.snapshot_meta.load().ok().flatten();
 
@@ -237,6 +239,12 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
         let service_last = service_last_of(service_status_ptr);
         let log_tail = journal.last_seq().unwrap_or(0);
         if let Err(d) = crate::runtime::reconstruct::service_not_ahead(service_last, log_tail) {
+            tracing::error!(
+                service_last,
+                log_tail,
+                "shmem startup cross-check: service reports last_applied above the \
+                 journal tail; refusing as drift (corruption or wrong incarnation)"
+            );
             return Err(crate::ClusterError::DriftDetected {
                 user: Some(d.service_last),
                 framework: Some(d.frontier),
