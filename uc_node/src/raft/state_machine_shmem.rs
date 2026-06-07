@@ -827,12 +827,56 @@ impl<S: StateMachine> RaftSnapshotBuilder<TypeConfig> for ShmemSnapshotBuilder<S
 
         let last_log_id = g.last_applied;
         let last_membership = g.last_membership.clone();
-        if last_log_id.map(|l| l.index).unwrap_or(0) != built_index {
+
+        // RACE GUARD (data-loss): the service may have crashed and a FRESH,
+        // not-yet-reconstructed service reattached while this BUILD was in flight.
+        // A fresh service answers BUILD with built_index=0 (empty bytes). If we
+        // persisted that with meta.last_log_id = the node frontier, openraft would
+        // advance the snapshot pointer and purge the log below the frontier; a
+        // later install of that empty snapshot is silent durable data loss.
+        //
+        // We CANNOT signal "retry" by returning Err: in openraft 0.10.0-alpha.20 a
+        // build_snapshot Err is wrapped into StorageError and surfaced via
+        // `command_result.result?` in RaftCore::handle_notification, which converts
+        // it to Fatal::StorageError and SHUTS THE NODE DOWN (verified in
+        // src/core/sm/worker.rs + src/core/raft_core.rs + src/errors/fatal.rs).
+        // It is exactly as fatal as an apply() error — NOT rescheduled.
+        //
+        // Instead we return the LAST GOOD snapshot unchanged (its real persisted
+        // meta+bytes). openraft's SnapshotHandler::update_snapshot only advances /
+        // purges when the new meta.last_log_id is STRICTLY GREATER than the current
+        // snapshot pointer; returning the existing (or an empty/None) meta is not
+        // greater, so it advances nothing and purges nothing. The node stays up,
+        // the log stays intact, and the SnapshotPolicy re-triggers a build later —
+        // by which point apply()/drive_catchup has reconstructed the reattached
+        // service to the frontier and the retried build returns built_index ==
+        // frontier with real bytes.
+        let frontier = last_log_id.map(|l| l.index).unwrap_or(0);
+        if built_index != frontier {
             tracing::warn!(
                 node_frontier = ?last_log_id,
                 built_index,
-                "snapshot built_index != node frontier"
+                "snapshot build raced a crash/reattach (service not yet \
+                 reconstructed); returning last good snapshot, not persisting the \
+                 degenerate one (openraft will retry)"
             );
+            if let Some(s) = &g.current_snapshot {
+                return Ok(Snapshot {
+                    meta: s.meta.clone(),
+                    snapshot: Cursor::new(s.data.clone()),
+                });
+            }
+            // No prior snapshot: return an empty, non-advancing one (last_log_id =
+            // None can never be greater than the current None pointer, so openraft
+            // neither advances the snapshot nor purges the log).
+            return Ok(Snapshot {
+                meta: RaftSnapshotMeta {
+                    last_log_id: None,
+                    last_membership: Default::default(),
+                    snapshot_id: "snap-0".to_string(),
+                },
+                snapshot: Cursor::new(Vec::new()),
+            });
         }
         let meta = RaftSnapshotMeta {
             last_log_id,

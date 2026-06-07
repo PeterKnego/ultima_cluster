@@ -33,6 +33,44 @@
 //! the snapshot/tail split falls. A `10` means reconstruction never ran; a value
 //! that is missing the pre-snapshot increments means INSTALL didn't apply the
 //! snapshot (BUILD produced empty/degenerate bytes).
+//!
+//! regression: snapshot-build/reattach data-loss race (guard in
+//! `state_machine_shmem::ShmemSnapshotBuilder::build_snapshot`).
+//!   THE RACE: openraft's snapshot worker fires a `build_snapshot` that sends
+//!   BUILD on the snapshot ring and awaits BUILT. If service #1 crashes and a
+//!   FRESH (empty, not-yet-reconstructed) service #2 reattaches while that BUILD
+//!   is in flight, service #2 answers BUILD with `built_index = 0` and empty
+//!   bytes. The old code only `tracing::warn!`d on `built_index != frontier` and
+//!   then PERSISTED the degenerate snapshot anyway with `meta.last_log_id =` the
+//!   node frontier (e.g. 7). openraft would advance the snapshot pointer and
+//!   PURGE the log below the frontier; a later INSTALL of that empty snapshot is
+//!   silent durable data loss (and meta index 7 disagrees with bytes index 0).
+//!   THE GUARD: `build_snapshot` now computes `frontier = last_applied.index`
+//!   and, when `built_index != frontier`, returns the LAST GOOD snapshot
+//!   unchanged (or an empty `last_log_id = None` snapshot if none exists) instead
+//!   of persisting the degenerate one. openraft's `update_snapshot` only advances
+//!   / purges when the new `last_log_id` is STRICTLY GREATER than the current
+//!   snapshot pointer, so a non-greater meta advances nothing and purges nothing;
+//!   the SnapshotPolicy re-triggers the build later, by which point
+//!   apply()/drive_catchup has reconstructed service #2 to the frontier and the
+//!   retried build returns `built_index == frontier` with real bytes.
+//!   WHY ERR IS NOT USED: in openraft 0.10.0-alpha.20 a `build_snapshot` Err is
+//!   wrapped into `StorageError` and surfaced via `command_result.result?` in
+//!   `RaftCore::handle_notification`, which converts it to `Fatal::StorageError`
+//!   and SHUTS THE NODE DOWN — it is NOT rescheduled (unlike a transient retry).
+//!   WHY NO DETERMINISTIC TEST: provoking the race requires a snapshot build to
+//!   be suspended precisely between sending BUILD and receiving BUILT at the
+//!   exact instant service #1 crashes and #2 attaches. The build round-trip holds
+//!   the inner lock that apply()/drive_catchup also take, so the build either
+//!   completes against the live service #1 or has not started — there is no
+//!   reliable injection point to freeze it mid-flight. Crashing "immediately"
+//!   after the 6 submits with no settle does not deterministically land a build
+//!   in flight, so a regression test built that way would mostly pass via the
+//!   normal path WITHOUT exercising the guard (a flaky/false-green test). Per
+//!   project policy we do not ship a flaky test; the guard is covered by
+//!   reasoning above plus the happy-path test below (which settles, so its build
+//!   sees `built_index == frontier` and is unaffected by the guard). The 1500ms
+//!   settle at step 2 is what keeps THIS test off the race.
 
 use std::io::{Read, Write};
 use std::time::Duration;
