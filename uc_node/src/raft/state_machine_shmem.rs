@@ -226,11 +226,28 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
             })?;
         }
 
+        // Phase 3 cross-check (upper-bound / Option A). By the time the node builds
+        // the adapter, the builder has already awaited `wait_for_service_ready`, so
+        // the service has published `ServiceStatus.last_applied`. The service can
+        // only have applied entries this node logged, so a reported index ABOVE the
+        // journal tail is impossible — corruption or a wrong incarnation. Refuse.
+        // A service at-or-below the tail (incl. a fresh in-memory service at 0) is
+        // the normal reconstruction case and is allowed through; reconstruction (the
+        // apply/reattach path) brings it up to the node frontier.
+        let service_last = service_last_of(service_status_ptr);
+        let log_tail = journal.last_seq().unwrap_or(0);
+        if let Err(d) = crate::runtime::reconstruct::service_not_ahead(service_last, log_tail) {
+            return Err(crate::ClusterError::DriftDetected {
+                user: Some(d.service_last),
+                framework: Some(d.frontier),
+            });
+        }
         if loaded_last_applied.is_some() {
-            tracing::warn!(
+            tracing::debug!(
                 framework_last_applied = ?loaded_last_applied,
-                "shmem mode: skipping user/framework last_applied cross-check \
-                 (deferred until cnc-sub-mmap MPSC attach lands)"
+                service_last,
+                log_tail,
+                "shmem startup cross-check passed (service at-or-below log tail)"
             );
         }
 
@@ -668,6 +685,17 @@ async fn drive_catchup<S: StateMachine>(
     loop {
         let epoch = epoch_of(ss_ptr);
         let service_last = service_last_of(ss_ptr);
+
+        // Phase 3 cross-check at reattach: the live node frontier (`up_to`) is the
+        // upper bound. A reattached service reporting an index above it claims state
+        // the node has not applied — refuse (drive_catchup errors are node-fatal,
+        // which IS the intended refusal). At-or-below is replayed/reconstructed.
+        if let Err(d) = crate::runtime::reconstruct::service_not_ahead(service_last, up_to) {
+            return Err(io::Error::other(format!(
+                "service reattach drift: service last_applied={} > node frontier={}",
+                d.service_last, d.frontier
+            )));
+        }
 
         // Decide the replay span. The plan always includes up_to (the parked
         // entry must be applied + acked, idempotently — log_index is the key).

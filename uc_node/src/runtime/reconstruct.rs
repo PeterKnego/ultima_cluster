@@ -44,6 +44,31 @@ pub(crate) fn plan_replay(service_last: u64, up_to: u64, last_purged: u64) -> Re
     }
 }
 
+/// Upper-bound divergence signal: the reattached/booting service reports a
+/// `last_applied` (`service_last`) STRICTLY ABOVE the node's known log
+/// `frontier` (the journal tail at startup, or the live apply frontier at
+/// reattach). That is impossible in correct operation — the service only ever
+/// applies entries this node delivered — so it indicates corruption or a service
+/// from a different incarnation/cluster. A service at-or-below the frontier is
+/// the normal reconstruction case and is NOT a divergence.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DriftBound {
+    pub(crate) service_last: u64,
+    pub(crate) frontier: u64,
+}
+
+/// Refuse iff the service is ahead of the node's log frontier. See [`DriftBound`].
+pub(crate) fn service_not_ahead(service_last: u64, frontier: u64) -> Result<(), DriftBound> {
+    if service_last > frontier {
+        Err(DriftBound {
+            service_last,
+            frontier,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +94,31 @@ mod tests {
                 service_last: 2,
                 last_purged: 5
             }
+        );
+    }
+    #[test]
+    fn service_not_ahead_ok_when_at_or_below_frontier() {
+        assert!(service_not_ahead(0, 5).is_ok());
+        assert!(service_not_ahead(5, 5).is_ok());
+        assert!(service_not_ahead(3, 5).is_ok());
+        assert!(service_not_ahead(0, 0).is_ok());
+    }
+
+    #[test]
+    fn service_not_ahead_refuses_when_above_frontier() {
+        assert_eq!(
+            service_not_ahead(6, 5),
+            Err(DriftBound {
+                service_last: 6,
+                frontier: 5
+            })
+        );
+        assert_eq!(
+            service_not_ahead(1, 0),
+            Err(DriftBound {
+                service_last: 1,
+                frontier: 0
+            })
         );
     }
 }
