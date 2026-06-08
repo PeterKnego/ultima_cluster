@@ -15,26 +15,24 @@
 //!   * `C::SnapshotData = std::io::Cursor<Vec<u8>>` — no Box wrapping in 0.10.
 //!   * Errors use `io::Error` throughout (StorageError removed from public trait surface).
 //!
-//! # M3 limitations (intentionally accepted; M5 fixes)
+//! # Node-side SM role
 //!
-//! The node-side `sm: S` is **degenerate**: its job is to satisfy openraft's
-//! snapshot trait surface (`build_snapshot` / `install_snapshot`), not to
-//! mirror the service-side state. Consequences:
+//! The node-side `sm: S` is **degenerate**: it exists only to satisfy openraft's
+//! trait surface. The user's real state lives in the *service*; the node drives
+//! it over the apply/snapshot rings and reconstructs it on (re)attach. Notes:
 //!
-//! * The startup `last_applied` cross-check now runs here as an UPPER-BOUND
-//!   check (Phase 3). `new()` reads the service's reported `last_applied` from
-//!   the cnc `ServiceStatus.last_applied` atomic (via `service_last_of`) and
-//!   refuses (`ClusterError::DriftDetected`) only if it exceeds the node's
-//!   journal tail (`journal.last_seq()`) — a service can only have applied
-//!   entries this node logged, so a higher index means corruption or a wrong
-//!   incarnation. A service at-or-below the tail (including a fresh in-memory
-//!   service at 0) is the normal reconstruction case and is allowed through.
-//! * Snapshot build/install at runtime still call the node-side `sm`'s
-//!   `build_snapshot` / `install_snapshot`. Until M5 routes them through the
-//!   service via `snapshot.region`, the produced snapshots reflect the
-//!   degenerate node-side state — i.e., empty / default. The in-process
-//!   M3 tests don't exercise snapshot install, so this is unobserved in
-//!   practice.
+//! * The startup `last_applied` cross-check runs here as an UPPER-BOUND check
+//!   (Phase 3). `new()` reads the service's reported `last_applied` from the cnc
+//!   `ServiceStatus.last_applied` atomic (via `service_last_of`) and refuses
+//!   (`ClusterError::DriftDetected`) only if it exceeds the node's journal tail
+//!   (`journal.last_seq()`) — a service can only have applied entries this node
+//!   logged, so a higher index means corruption or a wrong incarnation. A service
+//!   at-or-below the tail (including a fresh in-memory service at 0) is the normal
+//!   reconstruction case and is allowed through.
+//! * Snapshots are REAL and service-driven (Phase 2a/2b): `build_snapshot` drives
+//!   the service to BUILD via `snapshot.region`; `drive_catchup` INSTALLs the
+//!   node's snapshot into a below-purge service then tail-replays. Exercised by
+//!   `tests/reconstruct_snapshot.rs`.
 
 use std::io;
 use std::io::Cursor;

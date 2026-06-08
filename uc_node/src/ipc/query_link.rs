@@ -13,8 +13,12 @@
 //! a mismatch indicates corruption (the service publishes responses in the
 //! same order it consumes requests).
 //!
-//! M3 only emits `QueryKind::Snapshot`. `Linearizable` is reserved for the
-//! M4+ raft-read path.
+//! `QueryKind::Snapshot` (any node) and `QueryKind::Linearizable` are both wired:
+//! linearizable reads go through the client dispatcher's `ensure_linearizable`
+//! (ReadIndex barrier), and `submit` then waits via the [`ReconcileGate`] for the
+//! service to catch up to the read index before serving.
+//!
+//! [`ReconcileGate`]: crate::raft::state_machine_shmem::ReconcileGate
 
 use std::time::Duration;
 
