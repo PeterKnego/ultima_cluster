@@ -96,9 +96,14 @@ impl ShmemQueryLink {
             // No gate (unit tests drive the rings directly): single-shot.
             return self.serve_once(payload, kind).await;
         };
+        let mut retries: u32 = 0;
         loop {
             // Gate done BEFORE the query-link lock so a wait doesn't serialize
-            // queries. `reconciled` is the incarnation epoch the gate validated.
+            // queries. Capturing the live `reconciled_epoch` here (rather than the
+            // exact value the gate observed) is safe: `reconciled_epoch` is only ever
+            // advanced AFTER reconstruction has caught the service up to the frontier
+            // (>= any read_index), so any epoch we treat as reconciled is already
+            // read-barrier-valid.
             gate.wait_until_caught_up(read_index).await;
             let reconciled = gate.reconciled_epoch();
             let resp = self.serve_once(payload, kind).await?;
@@ -109,7 +114,12 @@ impl ShmemQueryLink {
             }
             // Service restarted mid-query; the response may be from a fresh/empty
             // incarnation. Retry (the next gate wait blocks until the new incarnation
-            // is reconstructed).
+            // is reconstructed). Bounded in practice by the caller's deadline; a
+            // restart storm would otherwise be silent, so make it observable.
+            retries += 1;
+            if retries.is_multiple_of(64) {
+                tracing::warn!(retries, "query seqlock retrying: service restarting repeatedly");
+            }
         }
     }
 
