@@ -2442,6 +2442,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "uc-crashtest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "clap",
+ "rand 0.9.4",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tracing-subscriber",
+ "uc-lincheck",
+ "uc_client",
+ "uc_node",
+ "uc_service",
+ "ultima-journal",
+]
+
+[[package]]
 name = "uc-lincheck"
 version = "0.1.0"
 dependencies = [

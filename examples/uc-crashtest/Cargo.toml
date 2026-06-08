@@ -1,0 +1,37 @@
+[package]
+name = "uc-crashtest"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "uc-crashtest-node"
+path = "src/bin/uc-crashtest-node.rs"
+
+[[bin]]
+name = "uc-crashtest-service"
+path = "src/bin/uc-crashtest-service.rs"
+
+[features]
+hard-crash-tests = []
+
+[dependencies]
+uc_node     = { path = "../../uc_node" }
+uc_service  = { path = "../../uc_service" }
+uc-lincheck = { path = "../../uc-lincheck" }
+ultima-journal = { workspace = true }
+tokio       = { workspace = true }
+clap        = { version = "4", features = ["derive"] }
+anyhow      = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+uc_client   = { path = "../../uc_client" }
+uc-lincheck = { path = "../../uc-lincheck" }
+tokio       = { workspace = true }
+tempfile    = { workspace = true }
+rand        = { workspace = true }
+bincode     = { workspace = true }
+serde       = { workspace = true }
