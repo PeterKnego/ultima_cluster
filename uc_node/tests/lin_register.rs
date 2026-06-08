@@ -143,11 +143,9 @@ fn dump_history(entries: &[lincheck::history::Entry], seed: u64) {
 /// The capstone: a few seeded, throttled workers drive a concurrent CAS-register
 /// workload while a seeded scheduler injects one quorum-preserving fault at a
 /// time — leader node-kill+restart OR leader service-crash+restart — waiting for
-/// recovery between faults. The recorded history must be linearizable. RegisterSm
-/// is plain in-memory (register_sm.rs persists nothing): after a service crash it
-/// restarts EMPTY and the node reconstructs it from the replicated log (mid-life
-/// reattach replay, or snapshot-install + tail replay below the purge boundary).
-/// That reconstruction is exactly what the capstone proves.
+/// recovery between faults. The recorded history must be linearizable. Both fault
+/// kinds are safe because RegisterSm persists its own state (register_sm.rs), so
+/// a reconnecting service recovers from disk rather than serving stale state.
 ///
 /// Multi-thread runtime (the default): the 3-node shmem boot deadlocks under the
 /// current_thread runtime — see `smoke_3node_submit_read`.
@@ -203,12 +201,10 @@ async fn linearizable_under_failover() {
     //   - leader node-kill+restart (full process down, rejoin via persisted
     //     data_dir), and
     //   - leader service-crash+restart (node stays up; the service watcher
-    //     transfers leadership; a fresh, EMPTY service is reconstructed by the
-    //     node from the replicated log).
-    // Both are linearizable-safe because RegisterSm is plain in-memory
-    // (register_sm.rs persists nothing): a restarted service comes back empty and
-    // the node reconstructs it from the replicated log (mid-life reattach replay,
-    // or snapshot-install + tail replay below the purge boundary).
+    //     transfers leadership; a fresh service reloads its durable state).
+    // Both are linearizable-safe now that RegisterSm persists its own state
+    // (register_sm.rs): a reconnecting service recovers from disk rather than
+    // serving stale/empty state (uc does not replay history into it).
     let mut fault_rng = StdRng::seed_from_u64(seed ^ 0xFA17);
     let mut faults = 0u32;
     while History::ok_count(&history.snapshot()) < target_ops {
