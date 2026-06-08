@@ -91,6 +91,14 @@ and linearizable reads.
   then `ShmemQueryLink::submit` waits until the **service** has caught up to that
   index before serving. Finishes the M5/M4 read TODO. No adapter clone / no
   `inner` lock in the read path (freeze-safe).
+- **Seqlock read validation** (`98cf6e8`). Closes a TOCTOU between checking
+  readiness on the node and querying the separately-crashable service: under rapid
+  service-restart churn the service could crash+restart between the gate check and
+  answering, so a fresh empty incarnation answered (`None`) while the node still
+  believed it caught up. `ShmemQueryLink::submit` now captures the reconciled
+  incarnation epoch after the gate, serves, and accepts the response only if the
+  service is STILL at that epoch (didn't restart during the query); else retries.
+  This is what lets the capstone run the **in-memory** `RegisterSm` (below).
 - **Reconstruct on a prefix GAP, not just an epoch change** (`aa010e3`). Root
   cause of node-restart stale reads (confirmed by tracing): a node restart whose
   log was purged below committed replays only the post-snapshot *tail* to the
@@ -117,23 +125,12 @@ and linearizable reads.
 - `tests/reconstruct_snapshot.rs` — below-purge reattach reconstructed via
   snapshot-install + tail replay; concurrent-build epoch-stability.
 - `tests/lin_register.rs` — the WGL lincheck capstone (node-kill + service-crash,
-  heavy concurrent churn). Runs a **self-persisting** `RegisterSm` (see Known
-  limitations); Linearizable across seeds 4359/1/88888/7/42/13/999.
+  heavy concurrent churn) runs the **non-persisting in-memory** `RegisterSm` — the
+  end-to-end proof that the node reconstructs a non-persisting service. Linearizable
+  across seeds 4359/1/88888/7/42/13/999/2/100/31337.
 
 ## Known limitations
 
-- **Residual in-memory reconstruction race under heavy concurrent fault churn.**
-  With a *non-persisting* SM, the lincheck capstone still occasionally produces a
-  stale read under sustained concurrent node-kill + service-crash + leadership
-  churn: tracing shows the read-gate passing (`service_caught_up_to >=
-  read_index`, `epoch == reconciled`) while the service answers empty — i.e.
-  either `service_caught_up_to` is briefly wrong on a node, or a stale leader
-  serves across a transition. The deterministic cold-start and single-fault cases
-  are fixed; this rare multi-fault interleaving is **deferred**. The capstone
-  therefore runs a self-persisting `RegisterSm` (durable state across a node
-  restart sidesteps it); in-memory reconstruction is proven by the focused
-  `reconstruct_*` tests. Resolving it likely needs node-disambiguated tracing and
-  tightening the cross-node read-readiness signal.
 - `snapshot_loop` has no nack-on-error frame (a failed build/install logs + skips;
   the node's await only bails on shutdown). Rare; deferred.
 - In-`apply()` reconstruction errors are node-fatal (openraft contract), not

@@ -166,10 +166,10 @@ reconnecting/fresh service from the log (mid-life reattach replay; snapshot-inst
 + tail-replay below purge; reconstruct on epoch-change OR prefix-gap), with a
 ReadIndex read barrier. So in-memory SMs are first-class — proven by the
 `reconstruct_reattach` (incl. read-after-restart) and `reconstruct_snapshot` tests.
-The lincheck capstone here **keeps the self-persisting `RegisterSm`** because a
-rare in-memory reconstruction race remains under heavy concurrent fault churn
-(documented in `docs/tasks/task14_service_state_reconstruction.md` → Known
-limitations); self-persistence sidesteps it and keeps the capstone green.
+The lincheck capstone here now runs the **non-persisting in-memory `RegisterSm`**
+again — the true end-to-end reconstruction proof — and stays linearizable under
+both faults + heavy churn (the residual race was fixed by the ReadIndex barrier +
+a seqlock read validation; see `docs/tasks/task14_service_state_reconstruction.md`).
 
 **3. Node shutdown hangs if the service is torn down first while a client write
 is in-flight (worked around in the harness; possible uc robustness follow-up).**
