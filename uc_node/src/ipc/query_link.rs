@@ -75,25 +75,46 @@ impl ShmemQueryLink {
         }
     }
 
-    /// Publish `payload` onto `query.ring`, await the matching response
-    /// frame on `query_resp.ring`, return its payload bytes. Caller is
-    /// responsible for bincode-encoding the typed `Query` and decoding the
-    /// returned `QueryResponse`.
+    /// Publish `payload` onto `query.ring`, await the matching response frame on
+    /// `query_resp.ring`, return its payload bytes. Caller bincode-encodes the
+    /// typed `Query` and decodes the `QueryResponse`.
+    ///
+    /// Read barrier + seqlock: wait until the current service incarnation is
+    /// reconstructed to `read_index` (`read_index == 0` = current incarnation only,
+    /// for snapshot reads), serve, then ACCEPT only if the service stayed at that
+    /// same reconciled incarnation throughout the query. If the service crashed and
+    /// restarted between the gate check and the answer (a fresh/empty incarnation
+    /// could have answered), retry. This closes the TOCTOU between checking
+    /// readiness on the node and querying a separately-crashable service process.
     pub async fn submit(
         &self,
         payload: &[u8],
         kind: QueryKind,
         read_index: u64,
     ) -> Result<Bytes, ClusterError> {
-        // Read barrier: wait until the current service incarnation has caught up to
-        // `read_index` (the linearizable read point from `ensure_linearizable`)
-        // before serving — else a fresh/empty service after a crash or node restart
-        // would answer stale. `read_index == 0` (e.g. snapshot reads) waits only for
-        // the current incarnation to exist. Done BEFORE taking the query-link lock
-        // so a wait doesn't serialize queries.
-        if let Some(gate) = &self.gate {
+        let Some(gate) = &self.gate else {
+            // No gate (unit tests drive the rings directly): single-shot.
+            return self.serve_once(payload, kind).await;
+        };
+        loop {
+            // Gate done BEFORE the query-link lock so a wait doesn't serialize
+            // queries. `reconciled` is the incarnation epoch the gate validated.
             gate.wait_until_caught_up(read_index).await;
+            let reconciled = gate.reconciled_epoch();
+            let resp = self.serve_once(payload, kind).await?;
+            if gate.current_epoch() == reconciled {
+                // Service did not restart during the query → the answer is from the
+                // reconstructed incarnation the gate validated. Accept.
+                return Ok(resp);
+            }
+            // Service restarted mid-query; the response may be from a fresh/empty
+            // incarnation. Retry (the next gate wait blocks until the new incarnation
+            // is reconstructed).
         }
+    }
+
+    /// One publish → await round-trip on the query rings (no read barrier).
+    async fn serve_once(&self, payload: &[u8], kind: QueryKind) -> Result<Bytes, ClusterError> {
         let mut g = self.inner.lock().await;
         let request_id = g.next_request_id;
         g.next_request_id = g.next_request_id.wrapping_add(1);

@@ -224,6 +224,16 @@ pub(crate) struct ReconcileGate {
 }
 
 impl ReconcileGate {
+    /// The live service-incarnation epoch (cnc `service_epoch`).
+    pub(crate) fn current_epoch(&self) -> u64 {
+        epoch_of(self.service_status_ptr)
+    }
+
+    /// The epoch up to which the service has been reconstructed.
+    pub(crate) fn reconciled_epoch(&self) -> u64 {
+        self.reconciled_epoch.load(Ordering::Acquire)
+    }
+
     /// Block until it is safe to serve a read at `read_index` (the linearizable
     /// read point from `ensure_linearizable`). Two conditions, both required:
     ///
