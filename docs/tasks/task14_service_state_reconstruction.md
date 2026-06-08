@@ -5,8 +5,9 @@ makes the service's user state machine — including a **non-persisting in-memor
 SM** — recoverable after a service crash or a node restart, driven by the node
 from the replicated log, and makes reads linearizable via a ReadIndex barrier.
 
-Design history (retained, not required reading): `docs/superpowers/specs/2026-06-06-uc-service-state-reconstruction-design.md`
-and `docs/superpowers/plans/2026-06-0*-*.md`.
+Design history (retained, not required reading): `docs/superpowers/specs/2026-06-06-uc-service-state-reconstruction-design.md`,
+`docs/superpowers/specs/2026-06-08-hard-crash-validation-design.md`, and
+`docs/superpowers/plans/2026-06-0*-*.md`.
 
 ## Problem
 
@@ -116,6 +117,51 @@ and linearizable reads.
 `apply` (sync, deterministic) · `query` · `last_applied` (load-bearing) ·
 `type SnapshotHandle: Send` + `freeze`/`stream_snapshot` · `install_snapshot`.
 `StoreStateMachine` (ultima_db) implements freeze/stream via `snapshot_stream`.
+
+## Hard-crash validation (multi-process)
+
+The in-process capstone runs node + service as two tokio tasks in **one** OS
+process, so its faults are graceful task shutdowns — nothing can `kill -9` the
+service while the node survives. The shmem architecture is *designed* for the
+split, so a true-crash test just needs reference binaries that each run one half
+plus a harness that hard-kills the service. This is what proves the
+reconstruction + read barrier above against an uncatchable crash (a SPSC
+in-flight entry abandoned mid-apply), not just a cooperative shutdown.
+
+- **`uc-lincheck` library crate.** The WGL checker (`checker`/`history`/`model`)
+  and the CAS-register SM (`register`: `Cmd`/`CmdResp`/`RegisterSm`) were test
+  modules under `uc_node/tests/lincheck/` — unreachable from another crate. They
+  are extracted verbatim (logic-preserving) into `uc-lincheck` (depends on
+  `uc_service` for the `StateMachine` trait `RegisterSm` impls) so the in-process
+  capstone and the multi-process test share **one** checker/SM source of truth.
+- **Reference bins** (`examples/uc-crashtest/src/bin/`): `uc-crashtest-node`
+  (single-node `NodeBuilder::start`; creates the instance_dir/`cnc.dat`, runs raft,
+  runs until killed) and `uc-crashtest-service` (waits for `cnc.dat`,
+  `ServiceBuilder::run` over the **non-persisting** in-memory `RegisterSm`;
+  restartable on the same instance_dir). This realizes the split-process path the
+  design always intended (the old CLAUDE.md `--features multi-process-tests` claim
+  was aspirational and never existed).
+- **Topology v1: single-node** — 1 node proc + 1 service proc + an in-process
+  `uc_client` driver. Multi-node (N node procs + cross-process QUIC) is much larger
+  orchestration, deferred.
+- **Crash mechanism.** The test spawns the service via `std::process::Command`
+  (path from `env!("CARGO_BIN_EXE_uc-crashtest-service")`) and crashes it with
+  `Child::kill()` = SIGKILL on Unix — uncatchable, no graceful shutdown / no
+  in-flight-apply completion — *during* sustained load so a kill lands mid-apply,
+  then respawns on the same instance_dir. A `Reap(Child)` guard whose `Drop` does
+  `kill()+wait()` makes teardown panic-safe (an assert failure can't orphan
+  processes or leak `/dev/shm` rings); reassigning a `Reap` IS the hard
+  crash-then-restart.
+- **Correctness check.** The `uc_client` driver records its own op `History`
+  (invoke ts + outcome, incl. `Indeterminate`) and runs `check_register` on it; a
+  `kill -9` mid-`submit` makes that op `Indeterminate` (may or may not have
+  committed) — never `Ok`, so a worker never panics on a client error, and the
+  checker already models the uncertainty. Two non-obvious points: (1) the WGL
+  model's init state is `None` (never written), so a warm-up `Write(1)` issued for
+  write-readiness must be **recorded as the first history entry**, not discarded —
+  a discarded warm-up leaves a phantom value later reads observe but the checker
+  can't account for (a false `Violation`); (2) a liveness gate (`ok >= 50`) guards
+  against a vacuous pass where everything errored to `Indeterminate`.
 
 ## Tests
 
