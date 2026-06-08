@@ -157,14 +157,16 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
     /// driver logs and retries, so a transient reconstruction failure degrades
     /// to "reads wait a bit longer" rather than crashing the node.
     pub(crate) async fn ensure_reconciled(&self) -> io::Result<()> {
-        // Fast path: this incarnation is already reconciled.
-        if epoch_of(self.service_status_ptr) == self.reconciled_epoch.load(Ordering::Acquire) {
-            return Ok(());
-        }
         let mut g = self.inner.lock().await;
         let cur = epoch_of(g.service_status_ptr);
-        if cur == self.reconciled_epoch.load(Ordering::Acquire) {
-            // apply() (or a prior driver pass) reconciled while we waited.
+        let frontier_idx = g.last_applied.map(|l| l.index).unwrap_or(0);
+        // Reconstruct if the service reattached (epoch changed) OR the service is
+        // behind the node's applied frontier (a node restart whose log was purged
+        // below committed leaves a fresh service missing the snapshot'd prefix even
+        // with the SAME epoch). Otherwise nothing to do.
+        let needs = cur != self.reconciled_epoch.load(Ordering::Acquire)
+            || self.service_caught_up_to.load(Ordering::Acquire) < frontier_idx;
+        if !needs {
             return Ok(());
         }
         let (reconciled, caught_up) = match g.last_applied {
@@ -503,6 +505,11 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
             let mut g = self.inner.lock().await;
             g.last_applied = Some(log_id);
 
+            // Catch-up bookkeeping (see the post-match store): `filled_to_here` is
+            // set by the Normal arm, which always brings the service to `log_index`
+            // (publish when contiguous, or drive_catchup which fills any prefix gap).
+            let prev_caught = self.service_caught_up_to.load(Ordering::Acquire);
+            let mut filled_to_here = false;
             let resp_bytes: Bytes = match entry.payload {
                 EntryPayload::Blank => Bytes::new(),
                 EntryPayload::Membership(m) => {
@@ -513,9 +520,21 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                     // Copy the epoch context out before the field borrows below.
                     let ss_ptr = g.service_status_ptr;
                     let expected_epoch = g.last_seen_epoch;
-                    let resp: Bytes = if epoch_of(ss_ptr) != expected_epoch {
-                        // Service reattached since we last reconciled: catch up
-                        // (replays incl. this entry) before publishing it live.
+                    // Reconstruct when the service reattached (epoch changed) OR when
+                    // the node has not delivered up to `log_index - 1` to this service
+                    // incarnation — a GAP. The gap arises on a node restart whose log
+                    // was purged below committed: openraft replays only the post-
+                    // snapshot tail, so the fresh service is missing the snapshot'd
+                    // prefix `(service_caught_up_to, log_index-1]`. `drive_catchup`'s
+                    // NeedsSnapshot branch installs the node snapshot into the service
+                    // then tail-replays, filling the prefix. `service_caught_up_to` is
+                    // node-local (no cnc-publish lag), so it never false-positives in
+                    // steady state (it equals the previous entry's index).
+                    let gap = self.service_caught_up_to.load(Ordering::Acquire) + 1 < log_index;
+                    let resp: Bytes = if epoch_of(ss_ptr) != expected_epoch || gap {
+                        // Service reattached or has a prefix gap: catch up (replays
+                        // incl. this entry, installing a snapshot if below purge)
+                        // before publishing it live.
                         let (b, epoch) =
                             drive_catchup(&g, &self.snapshot_op, &shutdown, log_id).await?;
                         g.last_seen_epoch = epoch;
@@ -558,14 +577,21 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                     {
                         tracing::warn!(log_index, ?e, "output_chan full; replay will catch this");
                     }
+                    filled_to_here = true;
                     resp
                 }
             };
-            // The service is now caught up to this entry (Normal: applied + acked;
-            // Blank/Membership: nothing to deliver, so trivially caught up). Publish
-            // the all-entry frontier for the read-gate and wake any parked reads.
-            self.service_caught_up_to.store(log_index, Ordering::Release);
-            self.reconcile_done.notify_waiters();
+            // Advance the service catch-up frontier ONLY when the service is actually
+            // at `log_index` now: the Normal arm always brings it there (publish or
+            // drive_catchup → `filled_to_here`); a Blank/Membership delivers nothing,
+            // so it advances the frontier only when it was already contiguous
+            // (`prev_caught == log_index - 1`). Otherwise an unfilled prefix gap must
+            // be preserved — advancing here would let a Blank/Membership entry mask
+            // the gap and a read be served against a service still missing its prefix.
+            if filled_to_here || prev_caught + 1 == log_index {
+                self.service_caught_up_to.store(log_index, Ordering::Release);
+                self.reconcile_done.notify_waiters();
+            }
             drop(g);
 
             if let Some(r) = responder {
