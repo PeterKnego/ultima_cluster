@@ -33,7 +33,11 @@ use common::*;
 /// One worker: until `stop`, pick a seeded op, fire it via the client, classify
 /// the outcome, record it. A worker must NEVER panic on a client error — the
 /// service WILL be dead mid-op during a fault — so every error (transient or not)
-/// is classified `Indeterminate`, which the checker tolerates.
+/// is classified `Indeterminate`, which the checker tolerates. We deliberately
+/// swallow *all* errors rather than gating on `is_transient`: a hard crash may
+/// surface error variants we don't want to enumerate, and a systemic failure
+/// (nothing ever commits) is caught downstream by the `ok >= 50` liveness gate,
+/// not by panicking a worker.
 async fn worker(
     id: u32,
     client: Arc<Client>,
@@ -87,7 +91,9 @@ async fn worker(
                         }
                         Outcome::Ok(RegResp::CasOk(b))
                     }
-                    Ok(_) => unreachable!("cas returned non-cas response"),
+                    // A wrong-typed response to a CAS is a genuine framework/SM
+                    // contract break, not crash fallout — surface the value.
+                    Ok(other) => panic!("cas returned non-cas response: {other:?}"),
                     Err(_) => Outcome::Indeterminate,
                 };
                 history.record(id, Op::Cas { old, new }, inv, outcome);
@@ -150,6 +156,11 @@ async fn linearizable_under_hard_crash() {
     // client stays connected to the NODE; submits during the down/reconstruct
     // window become Indeterminate. After respawn the node reconstructs the fresh
     // (empty) service from the replicated log.
+    //
+    // 700ms between crashes is comfortably longer than single-node reconstruction
+    // (replay/snapshot-install of a tiny register) so the cluster fully recovers
+    // and lands committed ops between faults; 5 iterations gives several distinct
+    // crash/recover cycles within the test's runtime budget.
     for _ in 0..5 {
         tokio::time::sleep(Duration::from_millis(700)).await;
         let mut g = svc.lock().await;
