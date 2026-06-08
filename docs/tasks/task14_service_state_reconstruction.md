@@ -127,7 +127,18 @@ and linearizable reads.
 - `tests/lin_register.rs` — the WGL lincheck capstone (node-kill + service-crash,
   heavy concurrent churn) runs the **non-persisting in-memory** `RegisterSm` — the
   end-to-end proof that the node reconstructs a non-persisting service. Linearizable
-  across seeds 4359/1/88888/7/42/13/999/2/100/31337.
+  across seeds 4359/1/88888/7/42/13/999/2/100/31337. In-process (node + service as
+  two tokio tasks); faults are graceful task shutdowns.
+- `examples/uc-crashtest/tests/hard_crash.rs` — the **true `kill -9`** counterpart:
+  node and service run as separate OS processes (`uc-crashtest-{node,service}`
+  bins) over a shared instance_dir; the test SIGKILLs the service process mid-load
+  (5 crash/recover cycles) while 3 seeded `uc_client` workers drive Write/Cas/Read,
+  recording a `uc_lincheck::History`, then asserts no WGL `Violation`. Proves
+  node-driven reconstruction + the ReadIndex/seqlock read barrier survive an
+  uncatchable hard crash, not just graceful shutdown. Gated behind the
+  `hard-crash-tests` feature (spawns real processes); Linearizable across seeds
+  1/7/42/88888/4359. The checker and `RegisterSm` are shared with the in-process
+  capstone via the `uc-lincheck` library crate (one source of truth).
 
 ## Known limitations
 
@@ -135,5 +146,3 @@ and linearizable reads.
   the node's await only bails on shutdown). Rare; deferred.
 - In-`apply()` reconstruction errors are node-fatal (openraft contract), not
   service-scoped.
-- A hard `kill -9` of the service mid-apply is not exercised (faults are graceful
-  shutdowns).

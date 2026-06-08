@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo build                                      # build all workspace crates
 cargo test                                       # in-process integration tests (default)
-cargo test --features multi-process-tests        # spawn real uc_node + uc_service binaries
+cargo test -p uc-crashtest --features hard-crash-tests   # spawn real node+service procs; SIGKILL service mid-load, assert linearizable
 cargo clippy --workspace -- -D warnings          # lint (must pass with zero warnings)
 cargo bench                                      # criterion benchmarks
 cargo run -p uc_node --example kv_node           # reference node binary
@@ -29,6 +29,8 @@ Workspace crates (per the design spec):
 - `uc_node` — cluster engine binary + library. Owns Raft (via `openraft`), log storage (`ultima_journal` + raft `StableValue`s), QUIC inter-node network (`quinn`), discovery directory, `cnc.dat`, dispatchers.
 - `uc_service` — service-side SDK. User implements `StateMachine` (sync apply, sync query, snapshot in/out) + optionally `OutputHandler` (async, leader-only). Provides `uc_service::ultima_db::StoreStateMachine` adapter (Cargo feature `ultima_db`, default-on).
 - `uc_client` — local-shmem input-client SDK. Small dep set (no openraft, no quinn).
+- `uc-lincheck` — test/verification library: WGL linearizability `checker`, op `history` recorder, `model`, and the in-memory CAS-`register` SM (`Cmd`/`CmdResp`/`RegisterSm`). One source of truth shared by the in-process lincheck capstone (`uc_node/tests/lin_register.rs`) and the multi-process hard-crash test.
+- `examples/uc-crashtest` — multi-process test harness: `uc-crashtest-{node,service}` reference bins (each runs one half over a shared instance_dir) + the `hard_crash.rs` / `smoke.rs` tests behind the `hard-crash-tests` feature. The real `kill -9` path for service-reconstruction validation (task14).
 
 ## Architecture overview
 
