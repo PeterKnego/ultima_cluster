@@ -5,7 +5,7 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use crate::lincheck::model::{Op, RegResp};
+pub use crate::model::{Op, RegResp};
 
 /// Observed outcome of one operation.
 #[derive(Clone, Debug)]

@@ -1,0 +1,9 @@
+//! Reusable WGL linearizability harness: the CAS-register sequential model, an
+//! operation-history recorder, the linearizability checker, and the in-memory
+//! `RegisterSm` (a `uc_service::StateMachine`). Used by the in-process lincheck
+//! capstone (`uc_node` tests) and the multi-process hard-crash test
+//! (`examples/uc-crashtest`).
+pub mod checker;
+pub mod history;
+pub mod model;
+pub mod register;

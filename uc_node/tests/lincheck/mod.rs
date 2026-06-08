@@ -1,7 +1,3 @@
-//! Test-only linearizability harness: pure model/history/checker + a 3-node
-//! shmem fault cluster. See docs/tasks/task12_linearizability_harness.md.
-pub mod checker;
+//! In-process 3-node lincheck cluster harness (capstone-only). The checker,
+//! history, model, and register SM now live in the `uc-lincheck` crate.
 pub mod cluster;
-pub mod history;
-pub mod model;
-pub mod register_sm;

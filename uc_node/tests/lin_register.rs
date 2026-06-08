@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use lincheck::checker::{Verdict, check_register};
 use lincheck::cluster::{LinCluster, ReadOutcome, SubmitOutcome};
-use lincheck::history::{History, Outcome};
-use lincheck::model::{Op, RegResp};
-use lincheck::register_sm::{Cmd, CmdResp};
+use uc_lincheck::checker::{Verdict, check_register};
+use uc_lincheck::history::{History, Outcome};
+use uc_lincheck::model::{Op, RegResp};
+use uc_lincheck::register::{Cmd, CmdResp};
 
 /// One worker: until `stop`, pick a seeded op, submit/read via the leader,
 /// classify the outcome, and record it. `last_seen` is shared across workers so
@@ -130,7 +130,7 @@ async fn fault_roundtrip_keeps_serving() {
 /// Dump the full history to a file so a `Violation` is reproducible offline
 /// (the checker is deterministic on a captured history even though the cluster
 /// interleaving is not).
-fn dump_history(entries: &[lincheck::history::Entry], seed: u64) {
+fn dump_history(entries: &[uc_lincheck::history::Entry], seed: u64) {
     let path = format!("/tmp/lincheck_history_{seed}.txt");
     let mut s = String::new();
     for e in entries {
@@ -144,7 +144,7 @@ fn dump_history(entries: &[lincheck::history::Entry], seed: u64) {
 /// workload while a seeded scheduler injects one quorum-preserving fault at a
 /// time — leader node-kill+restart OR leader service-crash+restart — waiting for
 /// recovery between faults. The recorded history must be linearizable. RegisterSm
-/// is plain in-memory (register_sm.rs persists nothing): after a service crash it
+/// is plain in-memory (register.rs persists nothing): after a service crash it
 /// restarts EMPTY and the node reconstructs it from the replicated log (mid-life
 /// reattach replay, or snapshot-install + tail replay below the purge boundary).
 /// That reconstruction is exactly what the capstone proves.
@@ -206,7 +206,7 @@ async fn linearizable_under_failover() {
     //     transfers leadership; a fresh, EMPTY service is reconstructed by the
     //     node from the replicated log).
     // Both are linearizable-safe because RegisterSm is plain in-memory
-    // (register_sm.rs persists nothing): a restarted service comes back empty and
+    // (register.rs persists nothing): a restarted service comes back empty and
     // the node reconstructs it from the replicated log (mid-life reattach replay,
     // or snapshot-install + tail replay below the purge boundary).
     let mut fault_rng = StdRng::seed_from_u64(seed ^ 0xFA17);

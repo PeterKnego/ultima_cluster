@@ -14,8 +14,8 @@
 
 use std::collections::HashSet;
 
-use crate::lincheck::history::{Entry, Outcome};
-use crate::lincheck::model::{Model, Op, RegResp, RegisterModel};
+use crate::history::{Entry, Outcome};
+use crate::model::{Model, Op, RegResp, RegisterModel};
 
 #[derive(Debug, PartialEq)]
 pub enum Verdict {
@@ -170,8 +170,8 @@ fn search<M: Model<State = Option<u64>, Op = Op, Resp = RegResp>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lincheck::history::{Entry, Outcome};
-    use crate::lincheck::model::{Op, RegResp};
+    use crate::history::{Entry, Outcome};
+    use crate::model::{Op, RegResp};
 
     fn e(client: u32, op: Op, invoke: u64, ret: u64, outcome: Outcome) -> Entry {
         Entry {

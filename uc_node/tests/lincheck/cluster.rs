@@ -14,7 +14,7 @@ use uc_node::{
 use uc_service::runtime::ServiceConfig;
 use uc_service::{Service, ServiceBuilder};
 
-use crate::lincheck::register_sm::{Cmd, CmdResp, RegisterSm};
+use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 
 /// Serialize cluster bring-up across tests in this binary (mirrors m2).
 static CLUSTER_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -97,7 +97,7 @@ async fn spawn_service(instance_dir: &std::path::Path, data_dir: &std::path::Pat
         data_dir: data_dir.to_owned(),
         ..ServiceConfig::default()
     };
-    // Service-side SM is plain in-memory (register_sm.rs persists nothing). A
+    // Service-side SM is plain in-memory (register.rs persists nothing). A
     // service-only restart therefore comes back EMPTY; the node reconstructs it
     // from the replicated log — that recovery is exactly what the capstone proves.
     ServiceBuilder::new(cfg, RegisterSm::default())
