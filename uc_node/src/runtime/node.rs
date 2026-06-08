@@ -294,20 +294,20 @@ impl<S: StateMachine> NodeHandle<S> {
             SmAdapter::Embedded(a) => Ok(a.with_state(|s| s.query(q)).await),
             SmAdapter::Shmem(_) => {
                 use uc_protocol::frames::query::QueryKind;
-                // Linearizable read barrier: confirm leadership + get the read index
-                // (openraft has applied up to it); the query link then waits for the
-                // service to catch up to it before serving. NotLeader surfaces to the
-                // caller to retry against the new leader.
-                let read_index = self.raft.ensure_linearizable().await?;
+                // Snapshot read: usable on ANY node (no leadership requirement — the
+                // m3/m4 tests query followers directly), so we do NOT take the
+                // ReadIndex barrier here. `read_index = 0` still makes the query link
+                // wait for the current service incarnation to be reconciled (so a
+                // freshly-restarted/empty service doesn't answer stale). Linearizable
+                // reads go through the client dispatcher, which DOES call
+                // `ensure_linearizable`.
                 let link = self.query_link.as_ref().ok_or_else(|| {
                     ClusterError::Config(
                         "shmem-mode NodeHandle missing query_link (builder bug)".into(),
                     )
                 })?;
                 let payload = bincode::serde::encode_to_vec(&q, bincode::config::standard())?;
-                let resp_bytes = link
-                    .submit(&payload, QueryKind::Snapshot, read_index)
-                    .await?;
+                let resp_bytes = link.submit(&payload, QueryKind::Snapshot, 0).await?;
                 let (resp, _) = bincode::serde::decode_from_slice::<S::QueryResponse, _>(
                     &resp_bytes,
                     bincode::config::standard(),
