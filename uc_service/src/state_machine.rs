@@ -33,15 +33,24 @@ pub trait StateMachine: Send + Sync + 'static {
 
     fn query(&self, q: Self::Query) -> Self::QueryResponse;
 
-    /// Returns the highest log_index the user's state machine has DURABLY applied.
-    /// MUST agree with the framework's persisted `last_applied` at startup.
+    /// Returns the highest log_index the user's state machine has DURABLY applied
+    /// (or held in memory, for a non-persisting SM). MUST be accurate: it is
+    /// **load-bearing for reconstruction**.
     ///
-    /// The framework cross-checks this method at startup against the durable
-    /// `last_applied.state`. Disagreement is treated as data corruption and
-    /// surfaced as `ClusterError::DriftDetected`. Allowed exceptions:
-    ///   * User says `None` while framework has persisted history — treated as
-    ///     "fresh state after install_snapshot, framework value is authoritative."
-    ///     Logged at warn level; not an error.
+    /// On (re)attach the service publishes this value into the cnc
+    /// `ServiceStatus.last_applied` atomic before going `Ready`. The node reads it
+    /// to (a) cross-check against its log frontier — a value ABOVE the node's
+    /// journal tail is impossible and is refused as `ClusterError::DriftDetected`
+    /// — and (b) choose how to rebuild a behind/empty service: replay
+    /// `(last_applied, frontier]` from the journal, or install a snapshot + tail
+    /// replay when the gap is below the purge boundary.
+    ///
+    /// A non-persisting (in-memory) SM correctly reports `None`/`0` after a restart;
+    /// the node then reconstructs it. A self-persisting SM (e.g.
+    /// `StoreStateMachine`) reports its reloaded index and is reconstructed only for
+    /// any residual gap (re-apply is idempotent by `log_index`). Under-reporting is
+    /// safe (the node over-replays idempotently); OVER-reporting above the node
+    /// frontier is refused as drift.
     fn last_applied(&self) -> Option<u64>;
 
     fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), SnapshotError>;
