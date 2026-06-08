@@ -6,106 +6,37 @@
 //! foundation for the later hard-crash (SIGKILL) tests.
 #![cfg(feature = "hard-crash-tests")]
 
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use uc_client::Client;
 use uc_lincheck::register::{Cmd, CmdResp};
 
-const NODE_BIN: &str = env!("CARGO_BIN_EXE_uc-crashtest-node");
-const SERVICE_BIN: &str = env!("CARGO_BIN_EXE_uc-crashtest-service");
-const APP_ID: &str = "uc-crashtest";
-
-/// Spawn the node-only binary. stdout/stderr inherited for debuggability.
-fn spawn_node(instance_dir: &Path, data_dir: &Path) -> Child {
-    Command::new(NODE_BIN)
-        .arg("--instance-dir")
-        .arg(instance_dir)
-        .arg("--data-dir")
-        .arg(data_dir)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn node binary")
-}
-
-/// Spawn the service-only binary. stdout/stderr inherited for debuggability.
-fn spawn_service(instance_dir: &Path, data_dir: &Path) -> Child {
-    Command::new(SERVICE_BIN)
-        .arg("--instance-dir")
-        .arg(instance_dir)
-        .arg("--data-dir")
-        .arg(data_dir)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn service binary")
-}
-
-/// Poll for `path` to exist, up to `timeout`.
-async fn wait_for_path(path: &Path, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while !path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {}",
-            path.display()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// Connect a client, retrying until the service is READY (connect can fail before
-/// the handshake completes).
-async fn connect_with_retry(instance_dir: &Path, timeout: Duration) -> Client {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match Client::connect(instance_dir, APP_ID).await {
-            Ok(c) => return c,
-            Err(e) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out connecting client: {e}"
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
-}
+mod common;
+use common::{connect_with_retry, spawn_node, spawn_service, submit_until_ok, wait_for_path};
 
 #[tokio::test]
 async fn write_then_read_across_processes() {
     let tmp = tempfile::tempdir().unwrap();
     let inst = tmp.path().join("inst");
-    let nodedata = tmp.path().join("nodedata");
-    let svcdata = tmp.path().join("svcdata");
     std::fs::create_dir_all(&inst).unwrap();
 
-    // ── Spawn node, wait for cnc.dat, then spawn service ────────────────────
-    let mut node = spawn_node(&inst, &nodedata);
+    // ── Spawn node, wait for cnc.dat, then spawn service. `Reap` guards tear the
+    //    children down on Drop (incl. on panic), so no orphaned processes. ──────
+    let _node = spawn_node(&inst, &tmp.path().join("nodedata"));
     wait_for_path(&inst.join("cnc.dat"), Duration::from_secs(10)).await;
-    let mut svc = spawn_service(&inst, &svcdata);
+    let _svc = spawn_service(&inst, &tmp.path().join("svcdata"));
 
-    // ── Connect client; wait for leadership ─────────────────────────────────
     let client = connect_with_retry(&inst, Duration::from_secs(10)).await;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while client.current_leader().is_none() {
-        assert!(Instant::now() < deadline, "leader never converged");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 
-    // ── Write 7, read 7 ─────────────────────────────────────────────────────
-    let r: CmdResp = client.submit(&Cmd::Write(7)).await.unwrap();
+    // Write 7, read 7. `current_leader()` going Some is necessary but NOT
+    // sufficient for write-readiness (the leader's initial blank entry must commit
+    // first), so submit/read retry transient `NotLeader` until a deadline.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let r = submit_until_ok(&client, &Cmd::Write(7), deadline).await;
     assert!(matches!(r, CmdResp::WriteAck), "expected WriteAck, got {r:?}");
 
-    let v: Option<u64> = client.query_linearizable(&()).await.unwrap();
+    let v = common::read_until_ok(&client, deadline).await;
     assert_eq!(v, Some(7), "read should observe the committed write");
 
-    // ── Teardown: client, then service, then node; reap children ────────────
     client.shutdown().await.ok();
-    svc.kill().ok();
-    node.kill().ok();
-    svc.wait().ok();
-    node.wait().ok();
+    // _node / _svc dropped here → killed + reaped.
 }

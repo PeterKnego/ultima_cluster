@@ -2446,10 +2446,8 @@ name = "uc-crashtest"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bincode",
  "clap",
  "rand 0.9.4",
- "serde",
  "tempfile",
  "tokio",
  "tracing-subscriber",

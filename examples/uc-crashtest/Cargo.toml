@@ -27,11 +27,10 @@ clap        = { version = "4", features = ["derive"] }
 anyhow      = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# uc-lincheck is already a [dependency] (used by the bins) and is therefore
+# available to the integration tests too — no dev-dep needed.
 [dev-dependencies]
-uc_client   = { path = "../../uc_client" }
-uc-lincheck = { path = "../../uc-lincheck" }
-tokio       = { workspace = true }
-tempfile    = { workspace = true }
-rand        = { workspace = true }
-bincode     = { workspace = true }
-serde       = { workspace = true }
+uc_client = { path = "../../uc_client" }
+tokio     = { workspace = true }
+tempfile  = { workspace = true }
+rand      = { workspace = true } # seeded op selection in hard_crash.rs
