@@ -213,10 +213,36 @@ async fn linearizable_under_failover() {
     let mut faults = 0u32;
     while History::ok_count(&history.snapshot()) < target_ops {
         tokio::time::sleep(fault_period).await;
-        if fault_rng.random_bool(0.5) {
-            cluster.kill_and_restart_leader().await;
-        } else {
-            cluster.crash_and_restart_leader_service().await;
+        #[cfg(feature = "fault-injection")]
+        {
+            match fault_rng.random_range(0..3u8) {
+                0 => cluster.kill_and_restart_leader().await,
+                1 => cluster.crash_and_restart_leader_service().await,
+                _ => {
+                    match fault_rng.random_range(0..3u8) {
+                        0 => {
+                            let _ = cluster.partition_minority().await;
+                        }
+                        1 => {
+                            let _ = cluster.partition_leader().await;
+                        }
+                        _ => cluster.partition_quorum_loss().await,
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+                    cluster.heal().await;
+                    cluster
+                        .wait_for_stable_leader(std::time::Duration::from_secs(15))
+                        .await;
+                }
+            }
+        }
+        #[cfg(not(feature = "fault-injection"))]
+        {
+            if fault_rng.random_bool(0.5) {
+                cluster.kill_and_restart_leader().await;
+            } else {
+                cluster.crash_and_restart_leader_service().await;
+            }
         }
         faults += 1;
     }
