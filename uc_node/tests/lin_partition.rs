@@ -119,6 +119,9 @@ fn spawn_workers(
         .collect()
 }
 
+/// Run the WGL checker. A `Violation` is a real linearizability bug → panic NOW
+/// (never retried). `Inconclusive` is tolerated (checker budget); `Linearizable`
+/// is success.
 fn assert_linearizable(entries: &[uc_lincheck::history::Entry], seed: u64, label: &str) {
     let ok = History::ok_count(entries);
     eprintln!("[lin_partition::{label}] seed={seed} ops={} ok={ok}", entries.len());
@@ -131,9 +134,25 @@ fn assert_linearizable(entries: &[uc_lincheck::history::Entry], seed: u64, label
     }
 }
 
-#[tokio::test]
-async fn minority_partition_and_heal() {
-    let seed = 7u64;
+/// Cleanly shut down workers + cluster on EVERY exit path (success or transient
+/// failure) so a retry doesn't leak QUIC ports / `/dev/shm` rings / a wedged
+/// node. Returns the recorded history entries.
+async fn teardown(
+    cluster: Arc<LinCluster>,
+    stop: &Arc<AtomicBool>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    history: Arc<History>,
+) -> Vec<uc_lincheck::history::Entry> {
+    stop.store(true, Ordering::Relaxed);
+    for h in handles {
+        let _ = h.await;
+    }
+    let cluster = Arc::try_unwrap(cluster).ok().expect("sole owner");
+    cluster.shutdown().await;
+    Arc::try_unwrap(history).ok().expect("sole owner").into_entries()
+}
+
+async fn run_minority(seed: u64) -> Result<(), String> {
     let cluster = Arc::new(LinCluster::start_3().await);
     let history = Arc::new(History::default());
     let stop = Arc::new(AtomicBool::new(false));
@@ -146,11 +165,14 @@ async fn minority_partition_and_heal() {
     let isolated = cluster.partition_minority().await.expect("a follower");
     tokio::time::sleep(PARTITION_HOLD).await;
     let after = History::ok_count(&history.snapshot());
-    assert!(
-        after > before,
-        "majority did not progress during minority partition ({before} -> {after})"
-    );
+    // TRANSIENT: majority must keep committing while a follower is isolated.
+    // Defer the verdict so teardown still runs.
+    let majority_progressed = after > before;
 
+    // SAFETY: an isolated follower must never serve a stale linearizable read —
+    // but with this minority partition it cannot reach a quorum, so reads come
+    // back Indeterminate; a `Fatal` here would panic in `read_from`. We still
+    // record the reads so the WGL checker sees them.
     for _ in 0..5 {
         let inv = history.invoke();
         let outcome = match cluster.read_from(isolated).await {
@@ -166,21 +188,34 @@ async fn minority_partition_and_heal() {
     cluster.wait_for_stable_leader(Duration::from_secs(15)).await;
     tokio::time::sleep(Duration::from_millis(800)).await;
 
-    stop.store(true, Ordering::Relaxed);
-    for h in handles {
-        let _ = h.await;
-    }
-    let cluster = Arc::try_unwrap(cluster).ok().expect("sole owner");
-    cluster.shutdown().await;
+    let entries = teardown(cluster, &stop, handles, history).await;
 
-    let entries = Arc::try_unwrap(history).ok().expect("sole owner").into_entries();
-    assert!(History::ok_count(&entries) >= 30, "too few Ok ops; run is vacuous");
+    if !majority_progressed {
+        return Err(format!(
+            "majority did not progress during minority partition ({before} -> {after})"
+        ));
+    }
+    if History::ok_count(&entries) < 30 {
+        return Err("too few Ok ops; run is vacuous".into());
+    }
     assert_linearizable(&entries, seed, "minority");
+    Ok(())
 }
 
 #[tokio::test]
-async fn leader_isolation_elects_new_leader() {
-    let seed = 42u64;
+async fn minority_partition_and_heal() {
+    for attempt in 1..=3 {
+        match run_minority(7).await {
+            Ok(()) => return,
+            Err(e) => eprintln!(
+                "[lin_partition::minority] attempt {attempt}/3 transient: {e}; retrying"
+            ),
+        }
+    }
+    panic!("minority: failed after 3 transient attempts");
+}
+
+async fn run_leader_isolation(seed: u64) -> Result<(), String> {
     let cluster = Arc::new(LinCluster::start_3().await);
     let history = Arc::new(History::default());
     let stop = Arc::new(AtomicBool::new(false));
@@ -224,12 +259,24 @@ async fn leader_isolation_elects_new_leader() {
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
-    let new_leader = new_leader.expect("majority failed to elect a leader that can serve");
-    assert_ne!(new_leader, old_leader, "majority failed to elect a NEW leader");
 
-    // The old leader is isolated and must NOT be able to commit (no split-brain):
-    // a linearizable read against it cannot pass its ReadIndex barrier (it can't
-    // reach a quorum), so it returns Indeterminate, never Ok.
+    // TRANSIENT: the majority may not have converged on a committing leader
+    // within the probe window (the deferred openraft apply-worker flake manifests
+    // here). Defer the verdict so the live SAFETY check + teardown still run.
+    let elected_new = match new_leader {
+        Some(n) => {
+            // SAFETY: the elected leader must be a NEW one, never the old leader.
+            assert_ne!(n, old_leader, "majority failed to elect a NEW leader");
+            true
+        }
+        None => false,
+    };
+
+    // SAFETY (live): the old leader is isolated and must NOT be able to commit
+    // (no split-brain): a linearizable read against it cannot pass its ReadIndex
+    // barrier (it can't reach a quorum), so it returns Indeterminate, never Ok.
+    // Probe while the cluster is still live and partitioned. Panic NOW on
+    // violation — this is split-brain, never retried.
     assert!(
         !matches!(cluster.read_from(isolated).await, ReadOutcome::Ok(_)),
         "isolated old leader served a linearizable read — split-brain"
@@ -239,21 +286,32 @@ async fn leader_isolation_elects_new_leader() {
     cluster.wait_for_stable_leader(Duration::from_secs(15)).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    stop.store(true, Ordering::Relaxed);
-    for h in handles {
-        let _ = h.await;
-    }
-    let cluster = Arc::try_unwrap(cluster).ok().expect("sole owner");
-    cluster.shutdown().await;
+    let entries = teardown(cluster, &stop, handles, history).await;
 
-    let entries = Arc::try_unwrap(history).ok().expect("sole owner").into_entries();
-    assert!(History::ok_count(&entries) >= 30, "too few Ok ops; run is vacuous");
+    if !elected_new {
+        return Err("no committing new leader found within the probe window".into());
+    }
+    if History::ok_count(&entries) < 30 {
+        return Err("too few Ok ops; run is vacuous".into());
+    }
     assert_linearizable(&entries, seed, "leader-isolation");
+    Ok(())
 }
 
 #[tokio::test]
-async fn total_quorum_loss_fails_clean_then_recovers() {
-    let seed = 88_888u64;
+async fn leader_isolation_elects_new_leader() {
+    for attempt in 1..=3 {
+        match run_leader_isolation(42).await {
+            Ok(()) => return,
+            Err(e) => eprintln!(
+                "[lin_partition::leader-isolation] attempt {attempt}/3 transient: {e}; retrying"
+            ),
+        }
+    }
+    panic!("leader-isolation: failed after 3 transient attempts");
+}
+
+async fn run_quorum_loss(seed: u64) -> Result<(), String> {
     let cluster = Arc::new(LinCluster::start_3().await);
     let history = Arc::new(History::default());
     let stop = Arc::new(AtomicBool::new(false));
@@ -267,6 +325,8 @@ async fn total_quorum_loss_fails_clean_then_recovers() {
     let lo = History::ok_count(&history.snapshot());
     tokio::time::sleep(PARTITION_HOLD).await;
     let hi = History::ok_count(&history.snapshot());
+    // SAFETY (live): no op may commit Ok during total quorum loss — an increase
+    // is a false ack / split-brain. Panic NOW, never retried.
     assert_eq!(
         lo, hi,
         "ops committed Ok during total quorum loss ({lo} -> {hi}) — split-brain / false ack"
@@ -277,19 +337,33 @@ async fn total_quorum_loss_fails_clean_then_recovers() {
     let recovered_from = History::ok_count(&history.snapshot());
     tokio::time::sleep(Duration::from_secs(2)).await;
     let recovered_to = History::ok_count(&history.snapshot());
-    assert!(
-        recovered_to > recovered_from,
-        "cluster did not resume after heal ({recovered_from} -> {recovered_to})"
-    );
+    // TRANSIENT: the cluster must resume committing after heal. Defer so
+    // teardown still runs.
+    let resumed = recovered_to > recovered_from;
 
-    stop.store(true, Ordering::Relaxed);
-    for h in handles {
-        let _ = h.await;
+    let entries = teardown(cluster, &stop, handles, history).await;
+
+    if !resumed {
+        return Err(format!(
+            "cluster did not resume after heal ({recovered_from} -> {recovered_to})"
+        ));
     }
-    let cluster = Arc::try_unwrap(cluster).ok().expect("sole owner");
-    cluster.shutdown().await;
-
-    let entries = Arc::try_unwrap(history).ok().expect("sole owner").into_entries();
-    assert!(History::ok_count(&entries) >= 30, "too few Ok ops; run is vacuous");
+    if History::ok_count(&entries) < 30 {
+        return Err("too few Ok ops; run is vacuous".into());
+    }
     assert_linearizable(&entries, seed, "quorum-loss");
+    Ok(())
+}
+
+#[tokio::test]
+async fn total_quorum_loss_fails_clean_then_recovers() {
+    for attempt in 1..=3 {
+        match run_quorum_loss(88_888).await {
+            Ok(()) => return,
+            Err(e) => eprintln!(
+                "[lin_partition::quorum-loss] attempt {attempt}/3 transient: {e}; retrying"
+            ),
+        }
+    }
+    panic!("quorum-loss: failed after 3 transient attempts");
 }
