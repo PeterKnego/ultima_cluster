@@ -14,6 +14,9 @@ use uc_node::{
 use uc_service::runtime::ServiceConfig;
 use uc_service::{Service, ServiceBuilder};
 
+#[cfg(feature = "fault-injection")]
+use uc_node::network::fault::FaultTable;
+
 use uc_lincheck::register::{Cmd, CmdResp, RegisterSm};
 
 /// Serialize cluster bring-up across tests in this binary (mirrors m2).
@@ -42,6 +45,8 @@ pub struct LinCluster {
     /// All methods are &self; faults + workers share Arc<LinCluster>.
     nodes: tokio::sync::Mutex<Vec<Node>>,
     _serial: tokio::sync::MutexGuard<'static, ()>,
+    #[cfg(feature = "fault-injection")]
+    fault_table: std::sync::Arc<FaultTable>,
 }
 
 fn pick_addrs(n: usize) -> Vec<SocketAddr> {
@@ -135,6 +140,9 @@ impl LinCluster {
         // ── Step 1: spawn all 3 node tasks in parallel ──────────────────────
         // We must keep instance_dir / data_dir / svc_data_dir alive here so
         // they persist until we can move them into the Node structs.
+        #[cfg(feature = "fault-injection")]
+        let fault_table = std::sync::Arc::new(FaultTable::new());
+
         let mut node_meta: Vec<NodeMeta> = Vec::new();
         let mut node_tasks = Vec::new();
         for (i, addr) in addrs.iter().enumerate() {
@@ -143,10 +151,10 @@ impl LinCluster {
             let data = Arc::new(TempDir::new().unwrap());
             let svc_data = Arc::new(TempDir::new().unwrap());
             let cfg = node_config(id, &instance, &data, *addr, peers.clone());
-            let task =
-                tokio::spawn(
-                    async move { NodeBuilder::new(cfg, RegisterSm::default()).start().await },
-                );
+            let builder = NodeBuilder::new(cfg, RegisterSm::default());
+            #[cfg(feature = "fault-injection")]
+            let builder = builder.with_fault_table(fault_table.clone());
+            let task = tokio::spawn(async move { builder.start().await });
             node_tasks.push(task);
             node_meta.push((id, *addr, instance, data, svc_data));
         }
@@ -213,6 +221,8 @@ impl LinCluster {
         let cluster = LinCluster {
             nodes: tokio::sync::Mutex::new(nodes),
             _serial: serial,
+            #[cfg(feature = "fault-injection")]
+            fault_table,
         };
         cluster
             .wait_for_stable_leader(Duration::from_secs(15))
@@ -422,13 +432,15 @@ impl LinCluster {
         // handshake. A clean instance_dir avoids that.
         let instance = Arc::new(TempDir::new().unwrap());
         let cfg = node_config(id, &instance, &data, addr, peers);
+        let builder = NodeBuilder::new(cfg, RegisterSm::default());
+        #[cfg(feature = "fault-injection")]
+        let builder = builder.with_fault_table(self.fault_table.clone());
         // Node start() blocks internally on the service handshake (waits for the
         // service to reach Ready before returning), so we must spawn start() as a
         // task, bring the service up once cnc.dat appears, THEN collect the node
         // handle — mirroring the start_3 boot dance.
         let cnc_instance = instance.clone();
-        let node_task =
-            tokio::spawn(async move { NodeBuilder::new(cfg, RegisterSm::default()).start().await });
+        let node_task = tokio::spawn(async move { builder.start().await });
         wait_for_cnc(cnc_instance.path(), Duration::from_secs(10)).await;
         let new_service = spawn_service(instance.path(), svc_data.path()).await;
         let new_handle = tokio::time::timeout(Duration::from_secs(30), node_task)
@@ -483,6 +495,93 @@ impl LinCluster {
             let mut nodes = self.nodes.lock().await;
             nodes[idx].service = Some(new_service);
         }
+    }
+
+    /// Linearizable read addressed to a specific node's client (not leader-routed).
+    /// Used to probe a partitioned-away node — it must NOT return a stale `Ok`.
+    #[cfg(feature = "fault-injection")]
+    #[allow(dead_code)] // called by partition scenario tests / capstone (later tasks)
+    pub async fn read_from(&self, node_id: NodeId) -> ReadOutcome {
+        use uc_client::ClientError as CE;
+        let Some(client) = self.client_for(node_id).await else {
+            return ReadOutcome::Indeterminate;
+        };
+        match client.query_linearizable::<(), Option<u64>>(&()).await {
+            Ok(v) => ReadOutcome::Ok(v),
+            Err(CE::NotLeader { .. }) | Err(CE::BackpressureFull) => ReadOutcome::Indeterminate,
+            Err(CE::Timeout(_))
+            | Err(CE::ResponseOverwritten)
+            | Err(CE::NodeStalled)
+            | Err(CE::ServiceStalled) => ReadOutcome::Indeterminate,
+            Err(other) => ReadOutcome::Fatal(format!("{other:?}")),
+        }
+    }
+
+    /// A current follower id (any live node that isn't the leader), if known.
+    #[cfg(feature = "fault-injection")]
+    #[allow(dead_code)] // called by partition scenario tests / capstone (later tasks)
+    pub async fn a_follower_id(&self) -> Option<NodeId> {
+        let lid = self.leader_id().await?;
+        let ids: Vec<NodeId> = self.nodes.lock().await.iter().map(|n| n.id).collect();
+        ids.into_iter().find(|&id| id != lid)
+    }
+
+    /// All live node ids.
+    #[cfg(feature = "fault-injection")]
+    #[allow(dead_code)] // called by partition scenario tests / capstone (later tasks)
+    pub async fn node_ids(&self) -> Vec<NodeId> {
+        self.nodes.lock().await.iter().map(|n| n.id).collect()
+    }
+
+    /// Isolate one follower from the other two (minority partition).
+    #[cfg(feature = "fault-injection")]
+    #[allow(dead_code)] // called by partition scenario tests / capstone (later tasks)
+    pub async fn partition_minority(&self) -> Option<NodeId> {
+        let all = self.node_ids().await;
+        let follower = self.a_follower_id().await?;
+        self.fault_table.set_partition(&[
+            vec![follower],
+            all.iter().copied().filter(|&n| n != follower).collect(),
+        ]);
+        Some(follower)
+    }
+
+    /// Isolate the current leader into the minority; the other two elect a new leader.
+    #[cfg(feature = "fault-injection")]
+    #[allow(dead_code)] // called by partition scenario tests / capstone (later tasks)
+    pub async fn partition_leader(&self) -> Option<NodeId> {
+        let all = self.node_ids().await;
+        let lid = self.leader_id().await?;
+        self.fault_table.set_partition(&[
+            vec![lid],
+            all.iter().copied().filter(|&n| n != lid).collect(),
+        ]);
+        Some(lid)
+    }
+
+    /// Three-way split — no side has a majority (total quorum loss).
+    #[cfg(feature = "fault-injection")]
+    #[allow(dead_code)] // called by partition scenario tests / capstone (later tasks)
+    pub async fn partition_quorum_loss(&self) {
+        let groups: Vec<Vec<NodeId>> =
+            self.node_ids().await.into_iter().map(|n| vec![n]).collect();
+        self.fault_table.set_partition(&groups);
+    }
+
+    /// Heal all partitions.
+    #[cfg(feature = "fault-injection")]
+    #[allow(dead_code)] // called by partition scenario tests / capstone (later tasks)
+    pub async fn heal(&self) {
+        self.fault_table.heal();
+    }
+
+    /// `last_applied` reported by a specific node's client (cnc `NodeStatus`),
+    /// to confirm catch-up after a heal. `None` if that node has no live client.
+    #[cfg(feature = "fault-injection")]
+    #[allow(dead_code)] // called by partition scenario tests / capstone (later tasks)
+    pub async fn last_applied_of(&self, node_id: NodeId) -> Option<u64> {
+        let client = self.client_for(node_id).await?;
+        Some(client.last_applied())
     }
 
     pub async fn shutdown(self) {
