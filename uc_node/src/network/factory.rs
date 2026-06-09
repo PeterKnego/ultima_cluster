@@ -30,6 +30,10 @@ pub struct QuicRaftNetworkFactory {
     /// TLS SNI / `server_name` presented to peers. Treated as an opaque
     /// application identifier; must match the server cert's SAN.
     app_id: String,
+    #[cfg(feature = "fault-injection")]
+    source: NodeId,
+    #[cfg(feature = "fault-injection")]
+    fault_table: Option<Arc<super::fault::FaultTable>>,
 }
 
 impl QuicRaftNetworkFactory {
@@ -41,6 +45,10 @@ impl QuicRaftNetworkFactory {
             client_cfg,
             pool: Arc::new(Mutex::new(HashMap::new())),
             app_id,
+            #[cfg(feature = "fault-injection")]
+            source: 0,
+            #[cfg(feature = "fault-injection")]
+            fault_table: None,
         }
     }
 
@@ -55,6 +63,16 @@ impl QuicRaftNetworkFactory {
             .map_err(|e| super::NetworkError::Connect(format!("client endpoint: {e}")))?;
         Ok(Self::new(endpoint, client_cfg, app_id))
     }
+
+    #[cfg(feature = "fault-injection")]
+    pub fn set_fault_injection(
+        &mut self,
+        source: NodeId,
+        fault_table: Option<Arc<super::fault::FaultTable>>,
+    ) {
+        self.source = source;
+        self.fault_table = fault_table;
+    }
 }
 
 impl RaftNetworkFactory<TypeConfig> for QuicRaftNetworkFactory {
@@ -67,14 +85,16 @@ impl RaftNetworkFactory<TypeConfig> for QuicRaftNetworkFactory {
         // Result; a failed connection at this point would force panic-or-Box-Err.
         // Defer connection to first request — `RaftNetwork::*` methods CAN
         // return Err, and openraft retries.
-        QuicRaftNetwork::new(
+        let net = QuicRaftNetwork::new(
             target,
             node.raft_addr,
             self.endpoint.clone(),
             self.client_cfg.clone(),
             self.pool.clone(),
             self.app_id.clone(),
-        )
-        .into_v2()
+        );
+        #[cfg(feature = "fault-injection")]
+        let net = net.with_fault(self.source, self.fault_table.clone());
+        net.into_v2()
     }
 }

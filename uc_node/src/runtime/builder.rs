@@ -32,6 +32,8 @@ use crate::raft::{NodeAddr, NodeId, TypeConfig};
 pub struct NodeBuilder<S: StateMachine> {
     config: NodeConfig,
     state_machine: S,
+    #[cfg(feature = "fault-injection")]
+    fault_table: Option<std::sync::Arc<crate::network::fault::FaultTable>>,
 }
 
 impl<S: StateMachine> NodeBuilder<S> {
@@ -39,7 +41,19 @@ impl<S: StateMachine> NodeBuilder<S> {
         Self {
             config,
             state_machine,
+            #[cfg(feature = "fault-injection")]
+            fault_table: None,
         }
+    }
+
+    /// Test-only: attach a shared network fault table (partition injection).
+    #[cfg(feature = "fault-injection")]
+    pub fn with_fault_table(
+        mut self,
+        fault_table: std::sync::Arc<crate::network::fault::FaultTable>,
+    ) -> Self {
+        self.fault_table = Some(fault_table);
+        self
     }
 
     pub async fn start(self) -> Result<NodeHandle<S>, ClusterError> {
@@ -76,6 +90,8 @@ impl<S: StateMachine> NodeBuilder<S> {
                     None,
                     None,
                     RaftHandle::Embedded,
+                    #[cfg(feature = "fault-injection")]
+                    self.fault_table.clone(),
                 )
                 .await
             }
@@ -196,6 +212,8 @@ impl<S: StateMachine> NodeBuilder<S> {
                     Some(node_liveness),
                     Some(query_link.clone()),
                     RaftHandle::Shmem,
+                    #[cfg(feature = "fault-injection")]
+                    self.fault_table.clone(),
                 )
                 .await?;
 
@@ -325,6 +343,9 @@ async fn finish<A, S>(
     node_liveness: Option<crate::ipc::liveness::LivenessHandle>,
     query_link: Option<Arc<ShmemQueryLink>>,
     wrap_raft: impl FnOnce(Raft<TypeConfig, A>) -> RaftHandle<S>,
+    #[cfg(feature = "fault-injection")] fault_table: Option<
+        std::sync::Arc<crate::network::fault::FaultTable>,
+    >,
 ) -> Result<NodeHandle<S>, ClusterError>
 where
     S: StateMachine,
@@ -359,8 +380,11 @@ where
     // connections). Bind to 0.0.0.0:0 — kernel picks an ephemeral port.
     let client_endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
 
-    let network =
+    #[allow(unused_mut)]
+    let mut network =
         QuicRaftNetworkFactory::new(client_endpoint, client_tls_cfg, config.app_id.clone());
+    #[cfg(feature = "fault-injection")]
+    network.set_fault_injection(config.node_id, fault_table);
 
     let raft = Raft::new(
         config.node_id,

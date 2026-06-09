@@ -33,6 +33,10 @@ pub struct QuicRaftNetwork {
     client_cfg: Arc<ClientConfig>,
     pool: PeerPool,
     app_id: String,
+    #[cfg(feature = "fault-injection")]
+    source: NodeId,
+    #[cfg(feature = "fault-injection")]
+    fault_table: Option<Arc<super::fault::FaultTable>>,
 }
 
 impl QuicRaftNetwork {
@@ -51,7 +55,22 @@ impl QuicRaftNetwork {
             client_cfg,
             pool,
             app_id,
+            #[cfg(feature = "fault-injection")]
+            source: 0,
+            #[cfg(feature = "fault-injection")]
+            fault_table: None,
         }
+    }
+
+    #[cfg(feature = "fault-injection")]
+    pub(crate) fn with_fault(
+        mut self,
+        source: NodeId,
+        fault_table: Option<Arc<super::fault::FaultTable>>,
+    ) -> Self {
+        self.source = source;
+        self.fault_table = fault_table;
+        self
     }
 
     /// Get the cached connection or establish a new one.
@@ -110,6 +129,12 @@ impl RaftNetwork<TypeConfig> for QuicRaftNetwork {
         option: RPCOption,
     ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError<TypeConfig, RaftError<TypeConfig>>>
     {
+        #[cfg(feature = "fault-injection")]
+        if let Some(t) = &self.fault_table
+            && t.is_blocked(self.source, self.target)
+        {
+            return Err(rpc_err(NetworkError::Disconnected));
+        }
         let body = codec::encode_append_entries_req(&rpc).map_err(rpc_err)?;
         let timeout = option.hard_ttl();
         let conn = self.get_or_connect().await.map_err(rpc_err)?;
@@ -138,6 +163,12 @@ impl RaftNetwork<TypeConfig> for QuicRaftNetwork {
         InstallSnapshotResponse<TypeConfig>,
         RPCError<TypeConfig, RaftError<TypeConfig, InstallSnapshotError>>,
     > {
+        #[cfg(feature = "fault-injection")]
+        if let Some(t) = &self.fault_table
+            && t.is_blocked(self.source, self.target)
+        {
+            return Err(rpc_err(NetworkError::Disconnected));
+        }
         let body = codec::encode_install_snapshot_req(&rpc).map_err(rpc_err)?;
         let timeout = option.hard_ttl();
         let conn = self.get_or_connect().await.map_err(rpc_err)?;
@@ -163,6 +194,12 @@ impl RaftNetwork<TypeConfig> for QuicRaftNetwork {
         rpc: VoteRequest<TypeConfig>,
         option: RPCOption,
     ) -> Result<VoteResponse<TypeConfig>, RPCError<TypeConfig, RaftError<TypeConfig>>> {
+        #[cfg(feature = "fault-injection")]
+        if let Some(t) = &self.fault_table
+            && t.is_blocked(self.source, self.target)
+        {
+            return Err(rpc_err(NetworkError::Disconnected));
+        }
         let body = codec::encode_vote_req(&rpc).map_err(rpc_err)?;
         let timeout = option.hard_ttl();
         let conn = self.get_or_connect().await.map_err(rpc_err)?;
