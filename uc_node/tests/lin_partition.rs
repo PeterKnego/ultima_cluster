@@ -169,10 +169,11 @@ async fn run_minority(seed: u64) -> Result<(), String> {
     // Defer the verdict so teardown still runs.
     let majority_progressed = after > before;
 
-    // SAFETY: an isolated follower must never serve a stale linearizable read —
-    // but with this minority partition it cannot reach a quorum, so reads come
-    // back Indeterminate; a `Fatal` here would panic in `read_from`. We still
-    // record the reads so the WGL checker sees them.
+    // Drive reads against the isolated node so the WGL checker sees them — the
+    // checker (post-teardown) is the oracle for "no stale read". With this
+    // minority partition the isolated node can't reach a quorum, so reads come
+    // back Indeterminate; an `Ok` carrying a stale value would surface as a WGL
+    // Violation. A `Fatal` is unexpected and panics immediately in `read_from`.
     for _ in 0..5 {
         let inv = history.invoke();
         let outcome = match cluster.read_from(isolated).await {
