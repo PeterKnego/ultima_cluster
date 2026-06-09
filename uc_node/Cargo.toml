@@ -50,3 +50,7 @@ test-helpers = []
 # Reusable in-process node+service+client fixtures (see src/test_support.rs).
 # Used by uc_node's own M4 integration tests and by the uc_autobench shmem-e2e binary.
 test-support = ["dep:uc_client", "dep:tempfile", "dep:anyhow"]
+# Test-only in-process network fault injection (partition / quorum-loss).
+# Off by default: zero production surface. Enable for partition tests:
+#   cargo test -p uc_node --features fault-injection
+fault-injection = []

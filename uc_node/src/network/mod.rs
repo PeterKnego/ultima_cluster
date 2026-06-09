@@ -5,6 +5,8 @@
 //! RPC class). TLS self-signed by default.
 
 pub mod client;
+#[cfg(feature = "fault-injection")]
+pub mod fault;
 pub mod codec;
 pub mod factory;
 pub mod frame;
