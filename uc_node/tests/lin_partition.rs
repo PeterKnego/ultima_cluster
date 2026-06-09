@@ -145,7 +145,15 @@ async fn teardown(
 ) -> Vec<uc_lincheck::history::Entry> {
     stop.store(true, Ordering::Relaxed);
     for h in handles {
-        let _ = h.await;
+        // A worker only ever panics on an unexpected `Fatal` client error or a
+        // wrong CAS response — both genuine bugs. Re-raise it here so a worker
+        // `Fatal` fails the test (a panic propagates past the retry loop, so it
+        // is NOT silently absorbed as a transient retry).
+        if let Err(e) = h.await
+            && e.is_panic()
+        {
+            std::panic::resume_unwind(e.into_panic());
+        }
     }
     let cluster = Arc::try_unwrap(cluster).ok().expect("sole owner");
     cluster.shutdown().await;
