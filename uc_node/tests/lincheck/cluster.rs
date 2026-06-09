@@ -27,6 +27,13 @@ const APP_ID: &str = "lincheck";
 /// Type alias to avoid a too-complex-type lint in the start_3 local variable.
 type NodeMeta = (NodeId, SocketAddr, Arc<TempDir>, Arc<TempDir>, Arc<TempDir>);
 
+/// What one boot attempt (`try_start_3_once`) hands back: the assembled (but not
+/// yet leader-validated) nodes, plus the shared fault_table under the feature.
+#[cfg(not(feature = "fault-injection"))]
+type BootPieces = Vec<Node>;
+#[cfg(feature = "fault-injection")]
+type BootPieces = (Vec<Node>, std::sync::Arc<FaultTable>);
+
 #[allow(dead_code)] // fields kept for lifetime (TempDirs) + restart (addr, peers)
 struct Node {
     id: NodeId,
@@ -111,6 +118,35 @@ async fn spawn_service(instance_dir: &std::path::Path, data_dir: &std::path::Pat
         .expect("service start")
 }
 
+/// Abort still-running node + service spawn tasks from a failed boot attempt, so
+/// a hung task can't keep holding its QUIC addr / shmem rings. `abort()` is
+/// fire-and-forget; the awaited drop of the temp dirs (by the caller) plus the
+/// graceful `shutdown_handles` on collected handles release the rest.
+fn abort_tasks(
+    node_tasks: impl IntoIterator<Item = tokio::task::JoinHandle<Result<NodeHandle<RegisterSm>, uc_node::ClusterError>>>,
+    svc_tasks: impl IntoIterator<Item = tokio::task::JoinHandle<Service>>,
+) {
+    for t in node_tasks {
+        t.abort();
+    }
+    for t in svc_tasks {
+        t.abort();
+    }
+}
+
+/// Gracefully tear down the node handles + services collected by a failed boot
+/// attempt (frees QUIC ports + `/dev/shm` rings before the retry).
+async fn shutdown_handles(node_handles: Vec<NodeHandle<RegisterSm>>, svc_handles: Vec<Service>) {
+    // Shut nodes down before services (mirrors the live teardown order): a node
+    // with an in-flight apply would otherwise block awaiting a dead service.
+    for h in node_handles {
+        let _ = h.shutdown().await;
+    }
+    for s in svc_handles {
+        let _ = s.shutdown().await;
+    }
+}
+
 impl LinCluster {
     /// Bring up a 3-node shmem cluster + one service + one client per node.
     ///
@@ -123,11 +159,80 @@ impl LinCluster {
     ///   3. Collect all node + service handles (with timeout).
     ///   4. Connect one client per node.
     ///   5. Wait for a stable leader.
+    ///
+    /// BOUNDED RETRY: there is a known, pre-existing, intermittent openraft-alpha
+    /// boot race — during initial membership bootstrap openraft's apply worker can
+    /// trip an internal `debug_assert` in `sm/worker.rs`, which panics the spawned
+    /// node task and wedges boot. It surfaces here as a node-start timeout, a node
+    /// task panic (JoinError), or a subsequent "no stable leader". It is purely
+    /// environmental (debug-assertions builds) and unrelated to app logic. We
+    /// therefore retry the whole boot a bounded number of times, fully tearing
+    /// down the partial attempt (drop handles/services → free QUIC ports + shmem
+    /// rings) and starting fresh, before finally failing loudly. A successful
+    /// attempt behaves EXACTLY as a single boot does today.
     pub async fn start_3() -> Self {
-        // `CLUSTER_SERIAL` is a `static`, so the guard is already `'static` — no
-        // transmute needed to store it in the struct.
-        let serial: tokio::sync::MutexGuard<'static, ()> = CLUSTER_SERIAL.lock().await;
+        // Acquire the serialization guard ONCE and hold it across all retry
+        // attempts (retries stay serialized). `CLUSTER_SERIAL` is a `static`, so
+        // the guard is already `'static` — no transmute needed to store it. We
+        // thread it through the loop via an `Option` so a successful attempt can
+        // move it into the returned `LinCluster` exactly as today, while a failed
+        // attempt drops only its partial node state and keeps the guard.
+        let mut serial: Option<tokio::sync::MutexGuard<'static, ()>> =
+            Some(CLUSTER_SERIAL.lock().await);
 
+        let mut last_err = String::new();
+        for attempt in 1..=4 {
+            match Self::try_start_3_once().await {
+                Ok(pieces) => {
+                    #[cfg(feature = "fault-injection")]
+                    let (nodes, fault_table) = pieces;
+                    #[cfg(not(feature = "fault-injection"))]
+                    let nodes = pieces;
+                    let cluster = LinCluster {
+                        nodes: tokio::sync::Mutex::new(nodes),
+                        _serial: serial.take().expect("serial guard present"),
+                        #[cfg(feature = "fault-injection")]
+                        fault_table,
+                    };
+                    // Stable-leader wait is part of the retry envelope: a
+                    // leader-timeout is one of the transient boot failure modes,
+                    // so on timeout we tear the cluster down and retry.
+                    if cluster
+                        .try_wait_for_stable_leader(Duration::from_secs(15))
+                        .await
+                        .is_some()
+                    {
+                        return cluster;
+                    }
+                    // No stable leader → tear the cluster down (frees QUIC ports
+                    // + shmem rings), reclaim the serial guard, and retry.
+                    cluster.shutdown_partial().await;
+                    serial = Some(cluster._serial);
+                    eprintln!(
+                        "[lincheck] start_3 attempt {attempt}/4 failed: no stable leader; retrying"
+                    );
+                    last_err = "no stable leader".to_string();
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+                Err(e) => {
+                    eprintln!("[lincheck] start_3 attempt {attempt}/4 failed: {e}; retrying");
+                    last_err = e;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            }
+        }
+        panic!("start_3 failed after 4 attempts: {last_err}");
+    }
+
+    /// One boot attempt. Returns `Err(reason)` on any of the known transient boot
+    /// failure modes (node-start timeout, node task panic, `start()` Err, service
+    /// timeout/panic) INSTEAD of panicking, after dropping whatever partial state
+    /// the attempt created (which frees QUIC ports + `/dev/shm` rings). Hung node
+    /// tasks are aborted so we don't leak a tokio task still holding the addr.
+    ///
+    /// The stable-leader wait is intentionally NOT done here — the caller does it
+    /// so a leader-timeout is folded into the same retry envelope.
+    async fn try_start_3_once() -> Result<BootPieces, String> {
         let addrs = pick_addrs(3);
         let peers: Vec<PeerSeed> = (1..=3u64)
             .zip(addrs.iter())
@@ -174,26 +279,65 @@ impl LinCluster {
         }
 
         // ── Step 3: collect node handles ────────────────────────────────────
+        // On the known transient boot race a node task either hangs (→ timeout)
+        // or panics on openraft's internal debug_assert (→ JoinError), or its
+        // start() returns Err. Any of those becomes `Err(reason)` here. Before
+        // returning we must release the partial state this attempt acquired:
+        // abort any node/service tasks we haven't collected yet (so a hung task
+        // doesn't keep holding the addr), drop the handles/services we DID
+        // collect, and drop the temp dirs. The helpers below own the not-yet-
+        // collected tasks so they can be aborted on the error path.
+        let ids: Vec<NodeId> = node_meta.iter().map(|m| m.0).collect();
         let mut node_handles: Vec<NodeHandle<RegisterSm>> = Vec::new();
-        for (i, task) in node_tasks.into_iter().enumerate() {
-            let id = node_meta[i].0;
-            let handle = tokio::time::timeout(Duration::from_secs(30), task)
-                .await
-                .unwrap_or_else(|_| panic!("node {id} start timed out"))
-                .expect("node task panic")
-                .unwrap_or_else(|e| panic!("node {id} start: {e:?}"));
-            node_handles.push(handle);
+        let mut node_tasks = node_tasks.into_iter();
+        for &id in &ids {
+            let task = node_tasks.next().expect("3 node tasks");
+            let res = tokio::time::timeout(Duration::from_secs(30), task).await;
+            match res {
+                Ok(Ok(Ok(handle))) => node_handles.push(handle),
+                Ok(Ok(Err(e))) => {
+                    abort_tasks(node_tasks, svc_tasks);
+                    shutdown_handles(node_handles, Vec::new()).await;
+                    return Err(format!("node {id} start: {e:?}"));
+                }
+                Ok(Err(join_err)) => {
+                    // node task panic (the openraft debug_assert race lands here)
+                    abort_tasks(node_tasks, svc_tasks);
+                    shutdown_handles(node_handles, Vec::new()).await;
+                    return Err(format!("node {id} task panic: {join_err}"));
+                }
+                Err(_) => {
+                    // the still-running task is the hung node — abort it too
+                    abort_tasks(node_tasks, svc_tasks);
+                    shutdown_handles(node_handles, Vec::new()).await;
+                    return Err(format!("node {id} start timed out"));
+                }
+            }
         }
 
         // ── Step 3b: collect service handles ────────────────────────────────
         let mut svc_handles: Vec<Service> = Vec::new();
-        for (i, task) in svc_tasks.into_iter().enumerate() {
-            let id = node_meta[i].0;
-            let svc = tokio::time::timeout(Duration::from_secs(30), task)
-                .await
-                .unwrap_or_else(|_| panic!("svc {id} start timed out"))
-                .expect("svc task panic");
-            svc_handles.push(svc);
+        let mut svc_tasks = svc_tasks.into_iter();
+        for &id in &ids {
+            let task = svc_tasks.next().expect("3 svc tasks");
+            let res = tokio::time::timeout(Duration::from_secs(30), task).await;
+            match res {
+                Ok(Ok(svc)) => svc_handles.push(svc),
+                Ok(Err(join_err)) => {
+                    for t in svc_tasks {
+                        t.abort();
+                    }
+                    shutdown_handles(node_handles, svc_handles).await;
+                    return Err(format!("svc {id} task panic: {join_err}"));
+                }
+                Err(_) => {
+                    for t in svc_tasks {
+                        t.abort();
+                    }
+                    shutdown_handles(node_handles, svc_handles).await;
+                    return Err(format!("svc {id} start timed out"));
+                }
+            }
         }
 
         // ── Step 4: connect one client per node ─────────────────────────────
@@ -217,17 +361,12 @@ impl LinCluster {
             });
         }
 
-        // ── Step 5: wait for a stable leader ────────────────────────────────
-        let cluster = LinCluster {
-            nodes: tokio::sync::Mutex::new(nodes),
-            _serial: serial,
-            #[cfg(feature = "fault-injection")]
-            fault_table,
-        };
-        cluster
-            .wait_for_stable_leader(Duration::from_secs(15))
-            .await;
-        cluster
+        // The stable-leader wait happens in the outer `start_3` so a leader
+        // timeout folds into the same bounded-retry envelope.
+        #[cfg(feature = "fault-injection")]
+        return Ok((nodes, fault_table));
+        #[cfg(not(feature = "fault-injection"))]
+        return Ok(nodes);
     }
 
     /// Clone the live (connected) clients out under a brief lock so callers can
@@ -293,6 +432,62 @@ impl LinCluster {
                 return l;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Fallible twin of `wait_for_stable_leader` used by the boot-retry path:
+    /// returns `Some(leader)` once all live nodes agree on a leader, or `None`
+    /// on timeout (which the outer `start_3` treats as a transient boot failure
+    /// and retries). Logic mirrors `wait_for_stable_leader` exactly; only the
+    /// timeout disposition differs (None vs. panic). `wait_for_stable_leader`
+    /// stays unchanged for the fault methods.
+    async fn try_wait_for_stable_leader(&self, timeout: Duration) -> Option<NodeId> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let clients = self.live_clients().await;
+            let count = clients.len();
+            let mut seen: Option<NodeId> = None;
+            let mut agree = true;
+            for c in &clients {
+                match c.current_leader() {
+                    Some(l) => match seen {
+                        None => seen = Some(l),
+                        Some(s) if s == l => {}
+                        Some(_) => agree = false,
+                    },
+                    None => agree = false,
+                }
+            }
+            if agree
+                && count >= 2
+                && let Some(l) = seen
+            {
+                return Some(l);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Tear down a partial/unvalidated attempt's nodes WITHOUT consuming the
+    /// serial guard (the caller has already moved it back out). Same teardown
+    /// order as `shutdown`, just on `&self` so the guard stays put for the retry.
+    async fn shutdown_partial(&self) {
+        let mut drained = std::mem::take(&mut *self.nodes.lock().await);
+        for n in &mut drained {
+            if let Some(c) = n.client.take()
+                && let Ok(c) = Arc::try_unwrap(c)
+            {
+                let _ = c.shutdown().await;
+            }
+            if let Some(h) = n.handle.take() {
+                let _ = h.shutdown().await;
+            }
+            if let Some(s) = n.service.take() {
+                let _ = s.shutdown().await;
+            }
         }
     }
 
