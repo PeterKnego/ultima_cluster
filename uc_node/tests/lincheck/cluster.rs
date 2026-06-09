@@ -371,6 +371,7 @@ impl LinCluster {
     /// `&self`: takes handles out under a brief lock, awaits teardown/restart
     /// UNLOCKED, then re-locks to install — so workers aren't blocked on the lock
     /// across the multi-second failover.
+    #[allow(dead_code)] // used by the lin_register capstone, not the partition tests
     pub async fn kill_and_restart_leader(&self) {
         let Some(lid) = self.leader_id().await else {
             return;
@@ -467,6 +468,7 @@ impl LinCluster {
     /// Crash the current leader's SERVICE only (node stays up); the service
     /// watcher transfers leadership. Then restart a fresh service on the same
     /// instance_dir so that node is fully functional again.
+    #[allow(dead_code)] // used by the lin_register capstone, not the partition tests
     pub async fn crash_and_restart_leader_service(&self) {
         let Some(lid) = self.leader_id().await else {
             return;
