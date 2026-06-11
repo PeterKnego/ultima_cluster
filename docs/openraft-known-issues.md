@@ -75,12 +75,15 @@ around it with retry+backoff in `runtime/builder.rs`. Deterministic and easy to
 describe. **Status: cleanest thing to report upstream — a doc clarification or
 small API note would help others.**
 
-## 4. m3 convergence / fallback flake (task04-deferred)
+## 4. m3 convergence / fallback flake (task04-deferred) — RESOLVED 2026-06-11
 
-Intermittent election-convergence failure in `m3_service_crash` (and kin). Likely
-the same as #1 (the read-after-append visibility bug surfacing during convergence).
-**Status: now that #1 is fixed (`1de711a`), re-check whether this flake is gone; if
-so, close it out.**
+Intermittent election-convergence failure in `m3_service_crash` (and kin) —
+historically "passes ~8/8 in retries". It was the same as #1 (the read-after-append
+visibility bug surfacing during convergence). **Re-checked after the `1de711a` fix:
+`m3_service_crash` 25/25 clean and `m3_three_node_shmem` 10/10 clean, with 0
+`sm/worker.rs:214` apply-assert hits across all 35 runs.** Considered resolved by the
+journal fix. (A rare flake can't be proven absent by 35 runs, but the suspected cause
+— the apply-assert — did not fire once where it previously did.)
 
 ---
 
