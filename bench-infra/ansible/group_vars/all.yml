@@ -1,0 +1,36 @@
+# --- Matched sweep (identical for UC and Aeron) ---
+rate_ladder: [100, 500, 1000, 2000, 5000, 10000, 20000]  # msgs/s, one run per rung
+payload_bytes: 64
+warmup_seconds: 2
+measure_seconds: 10
+batch_size: 1            # per-message pacing (Aeron); UC is open-loop per-message
+inflight: 128            # UC --inflight for compared points; Aeron is open-loop
+durability: consistent   # 'consistent' = both fsync; 'none' = both non-durable. NEVER mixed.
+aeron_ingress: udp       # 'udp' (proven) | 'ipc' (gated behind task13 §11 fix, do not use yet)
+idle_strategy: busyspin
+
+# --- Build sources ---
+aeron_benchmarks_repo: "https://github.com/aeron-io/benchmarks.git"
+aeron_benchmarks_ref: "master"          # pin to a SHA for canonical runs
+jdk_version: "21"
+uc_src_mode: "rsync"                     # 'rsync' local working tree | 'git'
+uc_git_ref: ""                           # used when uc_src_mode=git
+uc_repo_url: ""                          # used when uc_src_mode=git
+uc_local_path: "{{ playbook_dir }}/../.."  # repo root, for rsync mode
+
+# --- Layout on hosts ---
+remote_home: "/opt/bench"
+aeron_deploy_dir: "/opt/bench/aeron-deploy"
+uc_src_dir: "/opt/bench/uc"
+uc_target_bin: "/opt/bench/uc/target/release"
+
+# --- Aeron port bases (matches canonical cluster_localhost ranges) ---
+# member fields: ingress, consensus, log, catchup, archive-control
+aeron_port_base: { node0: 20000, node1: 21000, node2: 22000 }
+
+# --- UC ports (per node) ---
+uc_raft_port: { node0: 7001, node1: 7002, node2: 7003 }
+uc_app_id: "uc-bench-dist"
+
+# --- Results ---
+results_local_dir: "{{ playbook_dir }}/../../bench-out/dist"

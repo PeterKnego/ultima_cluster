@@ -1,0 +1,11 @@
+---
+- name: Provision bench hosts (tune, build, configure)
+  hosts: cluster
+  become: true
+  gather_facts: true
+  roles:
+    - os_tune
+    - toolchains
+    - build_aeron
+    - build_uc
+    - config
