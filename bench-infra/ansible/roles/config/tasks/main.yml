@@ -1,0 +1,39 @@
+---
+- name: Create cluster + results dirs
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ remote_home }}/aeron-cfg"
+    - "{{ remote_home }}/results"
+    - "{{ remote_home }}/cluster/{{ node_role }}"
+
+- name: Render Aeron cluster.properties (all nodes)
+  ansible.builtin.template:
+    src: cluster.properties.j2
+    dest: "{{ remote_home }}/aeron-cfg/cluster.properties"
+    mode: "0644"
+
+- name: Render Aeron node.properties (all nodes)
+  ansible.builtin.template:
+    src: node.properties.j2
+    dest: "{{ remote_home }}/aeron-cfg/node.properties"
+    mode: "0644"
+
+- name: Render Aeron client.properties (node0 only)
+  ansible.builtin.template:
+    src: client.properties.j2
+    dest: "{{ remote_home }}/aeron-cfg/client.properties"
+    mode: "0644"
+  when: node_role == "node0"
+
+- name: Write UC peer args fragment (consumed by run role)
+  ansible.builtin.copy:
+    dest: "{{ remote_home }}/uc-peers.env"
+    mode: "0644"
+    content: |
+      UC_APP_ID={{ uc_app_id }}
+      UC_NODE_ID={{ node_id }}
+      UC_LISTEN={{ private_ip }}:{{ uc_raft_port[node_role] }}
+      UC_PEERS={% for h in groups['cluster'] %}--peer {{ hostvars[h].node_id }}@{{ hostvars[h].private_ip }}:{{ uc_raft_port[hostvars[h].node_role] }} {% endfor %}

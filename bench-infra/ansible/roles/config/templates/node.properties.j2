@@ -1,0 +1,6 @@
+# Per-node config for {{ node_role }} ({{ inventory_hostname }})
+aeron.dir=/dev/shm/{{ node_role }}-driver
+aeron.cluster.dir={{ remote_home }}/cluster/{{ node_role }}/cluster
+aeron.cluster.member.id={{ node_id }}
+aeron.archive.dir={{ remote_home }}/cluster/{{ node_role }}/archive
+aeron.archive.control.channel=aeron:udp?endpoint={{ private_ip }}:{{ aeron_port_base[node_role] + 4 }}

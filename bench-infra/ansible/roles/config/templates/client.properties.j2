@@ -1,0 +1,6 @@
+# Client co-located with node0; shares node0's media driver.
+aeron.dir=/dev/shm/node0-driver
+aeron.cluster.egress.channel=aeron:udp?endpoint={{ private_ip }}:0
+io.aeron.benchmarks.batch.size={{ batch_size }}
+io.aeron.benchmarks.message.length={{ payload_bytes }}
+io.aeron.benchmarks.output.directory={{ remote_home }}/results
