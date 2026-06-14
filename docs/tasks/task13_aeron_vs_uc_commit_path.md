@@ -357,3 +357,55 @@ A/B CSVs: `bench-out/ab/{before,after}_disk_if{8,32,64}.csv` (untracked working
 artifacts). Reproduce by checking out the two journal files at each ref,
 rebuilding `attribution-bench --features uc-bench-probes` and
 `ultima-autobench --bin journal-microbench`, both pointed at a real-disk path.
+
+---
+
+## 10. Follow-up (2026-06-14) — `max_payload_entries` replication-batch lever: NULL result on 3-node
+
+Tested §6 lever #2's first knob: does raising openraft's `max_payload_entries`
+(entries packed per AppendEntries RPC) lift the 3-node throughput ceiling? The
+knob was plumbed through `RaftTuning` → openraft `Config` (`builder.rs`),
+env-overridable via `UC_MAX_PAYLOAD_ENTRIES` in `uc-node-launch` (commit
+`4336e2d`). Sweep harness: `uc_autobench/scripts/sweep-max-payload.sh` — fresh
+3-node QUIC-loopback cluster per value, **real-disk ext4 journal**
+(`log_durability = Consistent`), open-loop ladder driven against the leader.
+
+Swept `max_payload_entries ∈ {300 (default), 1024, 4096}` at `inflight {64, 512}`,
+rate ladder 500→10000 msgs/s, 64 B payload:
+
+| inflight | target msgs/s | achieved (300 / 1024 / 4096) | p99 ms (300 / 1024 / 4096) |
+|---|---|---|---|
+| 64  | 500   | 500 / 500 / 500 | 82.4 / 13.6 / **5.6** |
+| 64  | 1000  | 563 / 578 / 599 | 3844 / 3607 / 3318 |
+| 64  | 5000  | 598 / 567 / 592 | 36474 / 38722 / 36910 |
+| 512 | 500   | 500 / 500 / 500 | 18.9 / 5.0 / **4.5** |
+| 512 | 1000  | 604 / 582 / 594 | 3181 / 3486 / 3314 |
+| 512 | 10000 | 582 / 581 / 585 | 80128 / 80262 / 79725 |
+
+**Peak achieved per config: 604 / 590 / 600 msgs/s — within noise.** The 3-node
+ceiling is ~600 msgs/s regardless of the knob; past the ~500–600/s knee, p99
+hockey-sticks into seconds (open-loop backlog) identically across all three.
+
+**Why it's inert.** `max_payload_entries` caps the replication batch, but the
+actual batch is `min(entries_pending_replication, cap)`. On fast loopback the
+consensus+apply+IPC pipeline gates entries *before* the replication stage, so
+fewer than 300 entries are ever pending for a single AppendEntries — even at
+`inflight = 512`. The default 300 never binds; raising it cannot help. The knob
+would only matter if the leader could append far faster than the network
+round-trips (slow / high-latency NIC), which loopback is not. The 3-node ceiling
+is set by **per-commit pipeline latency**, the same `submit_to_node` poll-sleep +
+apply floor as single-node — not replication payload size.
+
+**Minor real effect:** below the knee (target = 500/s, unsaturated) a larger cap
+trimmed the p99 tail (82 → 5.6 ms at inflight=64) — a brief burst draining in one
+RPC. It does not move the ceiling.
+
+**Conclusion.** Neither `max_payload_entries` (this §) nor `api_batch_capacity`
+(already 4096, `linger = 0`, rarely fills — analyzed, not swept) is the throughput
+limiter in the same-host/loopback regime. The knob stays exposed (`4336e2d`) as a
+real lever for a future high-latency-network deployment, but is a no-op here. §6
+lever #2's *latency* half (AppendEntries fan-out / pipelining) is untouched and
+remains the open question for 3-node; replication **payload size** is settled-null.
+
+Sweep CSVs: `bench-out/maxpayload/mpe_{300,1024,4096}.csv` (untracked). Reproduce:
+`bash uc_autobench/scripts/sweep-max-payload.sh` (real-disk `DATA_ROOT`).
