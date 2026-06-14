@@ -99,6 +99,66 @@ impl StepRow {
 const CSV_HEADER: &str = "system,config,workload,payload_bytes,inflight,target_rate,achieved_rate,\
 p50_ns,p99_ns,p99_9_ns,p99_99_ns,max_ns,count";
 
+/// ns→µs: matches Aeron's default `outputTimeUnit=MICROSECONDS`, so both
+/// systems' .hgrm files share the same value axis on the HdrHistogram plotter.
+const HGRM_SCALE: f64 = 1000.0;
+/// HdrHistogram default `percentileTicksPerHalfDistance` (Aeron uses the default).
+const HGRM_TICKS: u32 = 5;
+
+/// Write `hist` as an HdrHistogram percentile-distribution text file (.hgrm),
+/// byte-compatible with Java HdrHistogram's
+/// `outputPercentileDistribution(out, ticksPerHalfDistance=5, scalingRatio, csv=false)`
+/// — the exact format Aeron's `LoadTestRig` prints. Values are divided by
+/// `scale` (1000.0 = ns→µs). Drop the resulting files (both systems') onto
+/// <https://hdrhistogram.github.io/HdrHistogram/plotFiles.html> to overlay them.
+///
+/// Note: the 3-decimal value precision below mirrors the 3 significant figures
+/// the histogram is created with (`new_with_bounds(.., 3)`); keep them in sync.
+fn write_hgrm(hist: &Histogram<u64>, path: &std::path::Path, scale: f64) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+
+    // Header (Java prints "...\n\n" — a header row then a blank line).
+    writeln!(
+        f,
+        "{:>12} {:>14} {:>10} {:>14}",
+        "Value", "Percentile", "TotalCount", "1/(1-Percentile)"
+    )?;
+    writeln!(f)?;
+
+    // One row per percentile tick. `count_since_last_iteration` summed in visit
+    // order == Java's getTotalCountToThisValue (the iterator walks values up).
+    let mut total: u64 = 0;
+    for v in hist.iter_quantiles(HGRM_TICKS) {
+        total += v.count_since_last_iteration();
+        let value = v.value_iterated_to() as f64 / scale;
+        let q = v.quantile_iterated_to();
+        if q < 1.0 {
+            // Java: "%12.3f %2.12f %10d %14.2f"
+            writeln!(f, "{:12.3} {:2.12} {:10} {:14.2}", value, q, total, 1.0 / (1.0 - q))?;
+        } else {
+            // 100th percentile: 1/(1-p) is infinite, so the column is dropped.
+            // Java: "%12.3f %2.12f %10d"
+            writeln!(f, "{:12.3} {:2.12} {:10}", value, q, total)?;
+        }
+    }
+
+    // Footer comment lines (parsed for Mean/Max by the plotter; '#'-prefixed).
+    writeln!(
+        f,
+        "#[Mean    = {:12.3}, StdDeviation   = {:12.3}]",
+        hist.mean() / scale,
+        hist.stdev() / scale
+    )?;
+    writeln!(
+        f,
+        "#[Max     = {:12.3}, Total count    = {:12}]",
+        hist.max() as f64 / scale,
+        hist.len()
+    )?;
+    f.flush()
+}
+
 /// Run one ladder step: open-loop at `target_rate` msgs/s, at most `inflight`
 /// concurrent submits, for `duration`. Records intended-send→response latency
 /// (coordinated-omission-free: latency is measured from the request's INTENDED
@@ -227,6 +287,10 @@ struct Args {
     /// output CSV path
     #[arg(long, default_value = "bench-out/uc.csv")]
     out: String,
+    /// directory for per-step .hgrm files (HdrHistogram text, µs-scaled, format-
+    /// identical to Aeron's LoadTestRig output, for one-chart overlay). Omit to skip.
+    #[arg(long)]
+    hgrm_dir: Option<std::path::PathBuf>,
     /// Attach to a running cluster at this instance dir instead of spawning the
     /// in-process single-node fixture. For multi-process N-node (Phase 2) runs.
     #[arg(long)]
@@ -259,6 +323,10 @@ async fn main() -> anyhow::Result<()> {
     }
     let mut csv = std::fs::File::create(&args.out)?;
     writeln!(csv, "{CSV_HEADER}")?;
+
+    if let Some(dir) = &args.hgrm_dir {
+        std::fs::create_dir_all(dir)?;
+    }
 
     eprintln!(
         "commit-path-load: config={} rates={:?} inflight={:?} payload={}B",
@@ -310,6 +378,15 @@ async fn main() -> anyhow::Result<()> {
             writeln!(csv, "{line}")?;
             csv.flush()?;
             eprintln!("  {line}");
+
+            if let Some(dir) = &args.hgrm_dir {
+                let path = dir.join(format!(
+                    "{}_{}_r{}_if{}.hgrm",
+                    args.config, row.workload, rate as u64, inflight
+                ));
+                write_hgrm(&row.hist, &path, HGRM_SCALE)?;
+                eprintln!("  wrote {}", path.display());
+            }
         }
     }
 
@@ -344,6 +421,34 @@ mod tests {
         let s = ConcurrencyGauge::default().finish();
         assert_eq!(s.max, 0);
         assert_eq!(s.mean, 0.0);
+    }
+
+    #[test]
+    fn hgrm_matches_hdrhistogram_text_format() {
+        let mut h = Histogram::<u64>::new_with_bounds(1, 600_000_000_000, 3).unwrap();
+        // Record in ns; exporter scales ÷1000 to µs.
+        for &v in &[1_000u64, 2_000, 3_000, 50_000, 1_000_000] {
+            h.record(v).unwrap();
+        }
+        let path = std::env::temp_dir().join(format!("uc_hgrm_{}.hgrm", std::process::id()));
+        write_hgrm(&h, &path, HGRM_SCALE).unwrap();
+        let s = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // Header columns (HdrHistogram / Aeron text format).
+        assert!(s.contains("Value"));
+        assert!(s.contains("Percentile"));
+        assert!(s.contains("TotalCount"));
+        assert!(s.contains("1/(1-Percentile)"));
+        // Footer comment lines.
+        assert!(s.contains("#[Mean"));
+        assert!(s.contains("#[Max"));
+        // 1000 ns scaled to µs -> "1.000" appears as the smallest value.
+        assert!(s.contains("1.000"));
+        // Final row reaches the 100th percentile (quantile 1.0).
+        assert!(s.contains("1.000000000000"));
+        // Total count reaches the number of recorded samples.
+        assert!(s.lines().any(|l| l.split_whitespace().nth(2) == Some("5")));
     }
 
     #[test]
