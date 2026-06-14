@@ -243,7 +243,10 @@ collapsing the floor ~4.6× — exactly as predicted (see §3).
    ~2500 vs ~6000–8000/s tmpfs). Widening the group-commit window so concurrent
    in-flight commits share one fsync should lift the disk ceiling toward the tmpfs
    curve. The `uc_autobench` autoresearch loop can drive this (add a
-   commit-throughput fitness metric).
+   commit-throughput fitness metric). **→ Implemented and measured (2026-06-13);
+   see §9. The journal change is real (+275% on its own group-commit microbench
+   here) but does NOT move the UC commit floor — that floor is gated by the
+   `submit_to_node` poll-sleep stage, not journal durability.**
 2. **Replication batching (3-node).** Now the dominant 3-node cost (~4× throughput
    drop, ~2 ms latency). Batching AppendEntries so one fsync + one quorum round
    covers N client commits lifts the 3-node ceiling — the same group-commit lever
@@ -292,3 +295,65 @@ framings are:
 - **UC rings vs Aeron IPC (transport-level).** Add a raw-ring echo mode to
   `commit-path-load` (bypass Raft) and compare against the Aeron IPC data. Modest
   effort; expected to show UC rings are µs-competitive (task08: ~15 ns SPSC).
+
+---
+
+## 9. Follow-up (2026-06-13) — journal group-commit lever: implemented, measured, doesn't move the UC floor
+
+`ultima_journal` landed the §6 lever #1 work (autoresearch run, merged as
+`ultima_db` `eabe345`). The champion commit `4fcb939` *"fsync dup'd fd, release
+`state.lock` across `sync_all`"* (preceded by `fec3094`, fsync re-drain
+coalescing, +21%) drops the journal's state lock while a writer thread is blocked
+in `sync_all`, so concurrent in-flight appends coalesce into the same fsync
+instead of serializing behind it. It touches only `segment.rs` + `writer.rs`.
+
+I re-ran benchmarks as a **controlled A/B on this host** rather than comparing
+against `bench-out/reference/` (that reference was captured on a different,
+real-disk machine — a direct compare would be confounded). BEFORE = journal at
+`2249b81` (pre-optimization); AFTER = `ultima_db` `main` (`eabe345`). Method:
+roll just the two changed files back/forward, rebuild each side, run on **real
+disk** (`/dev/sda1` ext4 — note `/tmp` *and* `/dev/shm` are both tmpfs on this
+host, where fsync is a no-op and the lever is invisible by construction).
+
+**Journal's own group-commit microbench** (`ultima-autobench journal-microbench`,
+256-entry bursts, `Durability::Consistent`, ext4, median-of-5):
+
+| | `group_commit_throughput` (entries/s, median) |
+|---|---|
+| BEFORE (`2249b81`) | **53,266** |
+| AFTER  (`eabe345`) | **200,038** |
+
+**≈ 3.8× / +275%** — even larger than the +213% the autoresearch loop recorded,
+because this VM's fsync is slow enough to make the lock-release coalescing pay
+off strongly. The win at the journal layer is unambiguous.
+
+**ultima_cluster commit path** (`attribution-bench`, in-process single-node
+fixture, real-disk ext4, `journal_durable` stage, ns p50 / p99):
+
+| inflight | BEFORE p50 / p99 | AFTER p50 / p99 |
+|---|---|---|
+| 8  | 12983 / 59423 | 12791 / 114111 |
+| 32 | 12647 / 43871 | 12687 / 164735 |
+| 64 | 12903 / 41503 | 12871 / 157823 |
+
+`journal_durable` p50 is **flat (~12.7 µs)** both ways; the p99 swings are noise
+bleeding in from the saturated submit stage. The dominant stage is
+**`submit_to_node`** (3.8–27 ms p99, growing with inflight = saturation),
+outweighing `journal_durable` by ~100–1000×.
+
+**Why the layer win doesn't propagate.** The microbench fires a 256-entry burst
+and waits only the last notifier — maximal append concurrency, so fsync
+coalescing is fully exercised. In the UC fixture the commit path is gated by the
+`submit_to_node` poll-sleep stage, so entries reach the journal already batched;
+openraft amortizes many entries per fsync (hence ~12.7 µs/entry attributed durable
+cost despite a single ext4 fsync being ms-scale here). The +275% throughput lets
+the journal *sustain* more load, but the journal is not on UC's critical latency
+path — confirming the standing headline that **durability is a rounding error in
+UC's commit budget; the floor is the IPC/poll-sleep + consensus path.** The next
+real lever for UC commit latency remains the submit/apply enqueue stages, not the
+journal.
+
+A/B CSVs: `bench-out/ab/{before,after}_disk_if{8,32,64}.csv` (untracked working
+artifacts). Reproduce by checking out the two journal files at each ref,
+rebuilding `attribution-bench --features uc-bench-probes` and
+`ultima-autobench --bin journal-microbench`, both pointed at a real-disk path.
