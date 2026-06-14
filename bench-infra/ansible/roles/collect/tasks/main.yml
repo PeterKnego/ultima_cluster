@@ -1,0 +1,36 @@
+---
+- name: Compute run timestamp (once)
+  ansible.builtin.command: date +%Y%m%dT%H%M%SZ
+  register: run_ts
+  run_once: true
+  changed_when: false
+
+- name: Write provenance manifest on node0
+  ansible.builtin.copy:
+    dest: "{{ remote_home }}/results/manifest.txt"
+    mode: "0644"
+    content: |
+      timestamp={{ run_ts.stdout }}
+      cloud_role={{ node_role }}
+      instance={{ ansible_processor_vcpus | default('?') }}vcpu {{ ansible_memtotal_mb | default('?') }}MB
+      kernel={{ ansible_kernel }}
+      durability={{ durability }}
+      aeron_ingress={{ aeron_ingress }}
+      rate_ladder={{ rate_ladder | join(',') }}
+      payload_bytes={{ payload_bytes }}
+      inflight={{ inflight }}
+      uc_provenance={{ hostvars[groups['node0'][0]].uc_provenance.stdout | default('n/a') }}
+      aeron_benchmarks_ref={{ aeron_benchmarks_ref }}
+  when: node_role == "node0"
+
+- name: Fetch results to local bench-out/dist/<ts>
+  ansible.posix.synchronize:
+    mode: pull
+    src: "{{ remote_home }}/results/"
+    dest: "{{ results_local_dir }}/{{ hostvars[groups['node0'][0]].run_ts.stdout }}/{{ node_role }}/"
+  changed_when: true
+
+- name: Report collected location
+  ansible.builtin.debug:
+    msg: "Results pulled to {{ results_local_dir }}/{{ hostvars[groups['node0'][0]].run_ts.stdout }}/"
+  run_once: true
