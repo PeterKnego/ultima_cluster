@@ -185,10 +185,19 @@ async fn main() -> anyhow::Result<()> {
         },
         client_rings: ClientRingConfig::default(),
         service_rings: ServiceRingConfig::default(),
-        // Durable commit path: block until fsync. This benchmark measures the
-        // real consensus+durability commit cost, so don't let the log return
-        // before the write barrier completes.
-        log_durability: uc_node::Durability::Consistent,
+        // Durability is read from UC_DURABILITY env var so the bench-infra
+        // `durability` knob (group_vars/all.yml) is threaded all the way down
+        // to the UC node — mirrors the UC_MAX_PAYLOAD_ENTRIES pattern above.
+        // "eventual" (case-insensitive) → Eventual; anything else → Consistent.
+        log_durability: match std::env::var("UC_DURABILITY")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("eventual") => uc_node::Durability::Eventual,
+            _ => uc_node::Durability::Consistent,
+        },
     };
 
     // Node + service rendezvous: spawn the node, wait for cnc.dat, then spawn

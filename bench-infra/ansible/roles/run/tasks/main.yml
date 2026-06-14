@@ -36,6 +36,7 @@
     {{ remote_home }}
     {{ rate_ladder | join(',') }}
     {{ payload_bytes }} {{ warmup_seconds }} {{ measure_seconds }}
+    {{ batch_size }}
   when: node_role == "node0"
   changed_when: true
 
@@ -47,6 +48,7 @@
 - name: Start UC node
   ansible.builtin.shell: |
     source {{ remote_home }}/uc-peers.env
+    export UC_DURABILITY={{ 'eventual' if durability == 'none' else 'consistent' }}
     setsid {{ uc_target_bin }}/uc-node-launch \
       --node-id $UC_NODE_ID --listen $UC_LISTEN $UC_PEERS \
       --app-id $UC_APP_ID --with-service \
@@ -75,6 +77,7 @@
     {{ uc_app_id }}
     {{ rate_ladder | join(',') }}
     {{ payload_bytes }} {{ inflight }} {{ measure_seconds }}
+    {{ warmup_seconds }}
     {{ remote_home }}/results/uc_sweep.csv
   when: node_role == "node0"
   changed_when: true

@@ -12,6 +12,8 @@ pulls results to `bench-out/dist/<ts>/`. See the design at
   - AWS: standard provider chain (`AWS_PROFILE` / env).
   - GCP: `GOOGLE_APPLICATION_CREDENTIALS` + `GOOGLE_PROJECT`.
 
+> Note: `terraform init` downloads all three provider plugins (hcloud, aws, google) regardless of `cloud`. For `cloud=gcp` you must also set `GOOGLE_PROJECT`. A Hetzner-only run needs only `HCLOUD_TOKEN`.
+
 ## Quickstart
     cp example.tfvars terraform.tfvars   # edit ssh + allow_ssh_cidr
     make init

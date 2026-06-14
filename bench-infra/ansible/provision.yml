@@ -3,6 +3,11 @@
   hosts: cluster
   become: true
   gather_facts: true
+  pre_tasks:
+    - name: Wait for SSH to come up
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 180
   roles:
     - os_tune
     - toolchains
