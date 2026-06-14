@@ -1,0 +1,47 @@
+---
+- name: Install tuning tools
+  ansible.builtin.apt:
+    name: [linux-tools-common, util-linux, tuned]
+    update_cache: true
+    state: present
+  failed_when: false   # linux-tools-common naming varies; non-fatal
+
+- name: Set CPU governor to performance
+  ansible.builtin.shell: |
+    if command -v cpupower >/dev/null; then cpupower frequency-set -g performance || true; fi
+    for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+      [ -w "$c" ] && echo performance > "$c" || true
+    done
+  changed_when: false
+
+- name: Disable transparent hugepages
+  ansible.builtin.shell: |
+    echo never > /sys/kernel/mm/transparent_hugepage/enabled || true
+    echo never > /sys/kernel/mm/transparent_hugepage/defrag || true
+  changed_when: false
+
+- name: Apply low-latency sysctls
+  ansible.posix.sysctl:
+    name: "{{ item.k }}"
+    value: "{{ item.v }}"
+    sysctl_set: true
+    reload: true
+  loop:
+    - { k: "vm.swappiness", v: "0" }
+    - { k: "net.core.rmem_max", v: "16777216" }
+    - { k: "net.core.wmem_max", v: "16777216" }
+    - { k: "net.core.rmem_default", v: "1048576" }
+    - { k: "net.core.wmem_default", v: "1048576" }
+
+- name: Raise open-file limits
+  ansible.builtin.copy:
+    dest: /etc/security/limits.d/99-bench.conf
+    content: |
+      * soft nofile 1048576
+      * hard nofile 1048576
+    mode: "0644"
+
+- name: Apply tuned latency profile (best effort)
+  ansible.builtin.command: tuned-adm profile latency-performance
+  changed_when: false
+  failed_when: false
