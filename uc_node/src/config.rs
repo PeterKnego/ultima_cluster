@@ -126,6 +126,10 @@ pub struct RaftTuning {
     pub max_in_snapshot_log_to_keep: u64,
     /// Trigger snapshot every N applied log entries. openraft default is 5000.
     pub snapshot_policy_logs_since_last: u64,
+    /// Max entries packed into one AppendEntries replication RPC. openraft
+    /// default is 300; raising it amortizes the quorum round-trip + per-batch
+    /// follower fsync over more entries (the 3-node throughput lever).
+    pub max_payload_entries: u64,
 }
 
 impl Default for RaftTuning {
@@ -136,6 +140,7 @@ impl Default for RaftTuning {
             election_timeout_max_ms: 2000,
             max_in_snapshot_log_to_keep: 1000,
             snapshot_policy_logs_since_last: 5000,
+            max_payload_entries: 300,
         }
     }
 }

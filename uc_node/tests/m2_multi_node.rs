@@ -293,6 +293,7 @@ fn tight_raft_tuning() -> RaftTuning {
         election_timeout_max_ms: 1000,
         max_in_snapshot_log_to_keep: 50,
         snapshot_policy_logs_since_last: 50, // trigger snapshot every 50 applied entries
+        ..RaftTuning::default()
     }
 }
 

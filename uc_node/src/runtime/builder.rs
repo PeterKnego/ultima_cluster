@@ -363,6 +363,7 @@ where
         snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
             config.raft.snapshot_policy_logs_since_last,
         ),
+        max_payload_entries: config.raft.max_payload_entries,
         ..Default::default()
     };
     let validated = raft_config_unvalidated

@@ -171,7 +171,14 @@ async fn main() -> anyhow::Result<()> {
         bootstrap: BootstrapConfig::Peers {
             peers: peers.clone(),
         },
-        raft: RaftTuning::default(),
+        raft: RaftTuning {
+            // Sweep knob for the 3-node throughput experiment; default 300.
+            max_payload_entries: std::env::var("UC_MAX_PAYLOAD_ENTRIES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
+            ..RaftTuning::default()
+        },
         tls: TlsConfig::default(),
         ipc_mode: IpcMode::Shmem {
             instance_dir: args.instance_dir.clone(),
