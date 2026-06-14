@@ -1,0 +1,84 @@
+---
+# ---- Aeron: start drivers + nodes on every host, sweep on node0, then tear down ----
+- name: Start Aeron media driver
+  ansible.builtin.shell: |
+    export JAVA_HOME="$(dirname $(dirname $(readlink -f $(which javac))))"
+    export JVM_OPTS="-Xms16M"
+    setsid {{ aeron_deploy_dir }}/scripts/aeron/media-driver \
+      {{ remote_home }}/aeron-cfg/cluster.properties \
+      {{ remote_home }}/aeron-cfg/node.properties > {{ remote_home }}/md.out 2>&1 < /dev/null &
+  changed_when: false
+
+- name: Start Aeron cluster node
+  ansible.builtin.shell: |
+    export JAVA_HOME="$(dirname $(dirname $(readlink -f $(which javac))))"
+    export JVM_OPTS="-Xms16M -Dio.aeron.benchmarks.output.directory={{ remote_home }}/results"
+    setsid {{ aeron_deploy_dir }}/scripts/aeron/cluster-node \
+      {{ remote_home }}/aeron-cfg/cluster.properties \
+      {{ remote_home }}/aeron-cfg/node.properties > {{ remote_home }}/node.out 2>&1 < /dev/null &
+  changed_when: false
+
+- name: Wait for cluster election to settle
+  ansible.builtin.pause:
+    seconds: 20
+  run_once: true
+
+- name: Copy Aeron sweep script to node0
+  ansible.builtin.copy:
+    src: run_aeron_sweep.sh
+    dest: "{{ remote_home }}/run_aeron_sweep.sh"
+    mode: "0755"
+  when: node_role == "node0"
+
+- name: Drive Aeron rate ladder (node0)
+  ansible.builtin.command: >
+    {{ remote_home }}/run_aeron_sweep.sh
+    {{ remote_home }}
+    {{ rate_ladder | join(',') }}
+    {{ payload_bytes }} {{ warmup_seconds }} {{ measure_seconds }}
+  when: node_role == "node0"
+  changed_when: true
+
+- name: Stop Aeron JVMs
+  ansible.builtin.shell: "pkill -9 -f 'io.aeron' || true"
+  changed_when: false
+
+# ---- UC: start one uc-node per host, sweep on node0, then tear down ----
+- name: Start UC node
+  ansible.builtin.shell: |
+    source {{ remote_home }}/uc-peers.env
+    setsid {{ uc_target_bin }}/uc-node-launch \
+      --node-id $UC_NODE_ID --listen $UC_LISTEN $UC_PEERS \
+      --app-id $UC_APP_ID --with-service \
+      --instance-dir /dev/shm/uc-{{ node_role }} \
+      --data-dir {{ remote_home }}/uc-data \
+      > {{ remote_home }}/uc-node.out 2>&1 < /dev/null &
+  changed_when: false
+
+- name: Wait for UC leader election
+  ansible.builtin.pause:
+    seconds: 15
+  run_once: true
+
+- name: Copy UC sweep script to node0
+  ansible.builtin.copy:
+    src: run_uc_sweep.sh
+    dest: "{{ remote_home }}/run_uc_sweep.sh"
+    mode: "0755"
+  when: node_role == "node0"
+
+- name: Drive UC rate ladder (node0)
+  ansible.builtin.command: >
+    {{ remote_home }}/run_uc_sweep.sh
+    {{ uc_target_bin }}/commit-path-load
+    /dev/shm/uc-node0
+    {{ uc_app_id }}
+    {{ rate_ladder | join(',') }}
+    {{ payload_bytes }} {{ inflight }} {{ measure_seconds }}
+    {{ remote_home }}/results/uc_sweep.csv
+  when: node_role == "node0"
+  changed_when: true
+
+- name: Stop UC JVMs/procs
+  ansible.builtin.shell: "pkill -9 -f 'uc-node-launch' || true; pkill -9 -f 'kv_service' || true"
+  changed_when: false
