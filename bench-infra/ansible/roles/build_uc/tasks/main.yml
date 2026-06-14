@@ -1,0 +1,43 @@
+---
+- name: (rsync mode) Sync local UC working tree to host
+  ansible.posix.synchronize:
+    src: "{{ uc_local_path }}/"
+    dest: "{{ uc_src_dir }}/"
+    rsync_opts:
+      - "--exclude=target"
+      - "--exclude=.git"
+      - "--exclude=bench-out"
+  when: uc_src_mode == "rsync"
+
+- name: (git mode) Clone UC at pinned ref
+  ansible.builtin.git:
+    repo: "{{ uc_repo_url }}"
+    dest: "{{ uc_src_dir }}"
+    version: "{{ uc_git_ref }}"
+  when: uc_src_mode == "git"
+
+- name: Build uc_autobench release bins
+  ansible.builtin.command: >
+    {{ remote_home }}/.cargo/bin/cargo build --release
+    -p uc_autobench --bin uc-node-launch --bin commit-path-load
+  args:
+    chdir: "{{ uc_src_dir }}"
+  environment:
+    CARGO_HOME: "{{ remote_home }}/.cargo"
+    RUSTUP_HOME: "{{ remote_home }}/.rustup"
+  register: uc_build
+  changed_when: "'Compiling' in uc_build.stderr or 'Finished' in uc_build.stderr"
+
+- name: Verify UC bins exist
+  ansible.builtin.shell: |
+    test -x {{ uc_target_bin }}/uc-node-launch
+    test -x {{ uc_target_bin }}/commit-path-load
+  changed_when: false
+
+- name: Record UC source provenance
+  ansible.builtin.shell: |
+    cd {{ uc_src_dir }} && (git rev-parse HEAD 2>/dev/null || echo "rsync-no-git"); \
+    git status --porcelain 2>/dev/null | head -1 | grep -q . && echo "dirty" || echo "clean"
+  register: uc_provenance
+  changed_when: false
+  run_once: true
