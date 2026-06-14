@@ -25,8 +25,11 @@ cheaply, and across clouds.
 **Goals**
 - One command to stand up a 3-host fleet, configure it, run the parity sweep, and
   pull results back — plus a persistent mode for iterative debugging.
-- **Hetzner first**, structured so **AWS and GCP** drop in later behind a common
-  interface. **No bare-metal.**
+- **AWS and GCP are the primary targets** — both bill **per-second (60 s minimum)**,
+  which makes the ephemeral one-shot mode (`up → run → destroy`) cheap. **Hetzner is
+  a secondary target** — it bills a **1-hour minimum per VPS**, so it only amortizes
+  in persistent mode; wasteful for short one-shot runs. All three sit behind a common
+  interface; **no bare-metal.**
 - Topology **B**: one cluster node per host; client co-located with node0 (the
   leader). Real NIC between nodes (UDP for Aeron, QUIC for UC), shmem client edge
   on node0 (UC always; Aeron gated — see §9).
@@ -51,7 +54,7 @@ tuning, run, collect). The handoff is a single artifact: `terraform output -json
 sees host IPs + a `node0` marker. That decoupling is what makes adding a cloud cheap.
 
 ```
-local machine ──terraform apply──▶ 3 dedicated-vCPU hosts (Hetzner now)
+local machine ──terraform apply──▶ 3 dedicated-vCPU hosts (AWS/GCP primary)
       │                                  │  public IP = SSH/control
       │  terraform output -json          │  private IP = intra-node UDP/QUIC
       ▼                                  ▼
@@ -70,9 +73,9 @@ bench-infra/
     variables.tf                 # cloud, node_count(=3), instance_type, region, ssh_public_key, ttl_hours, allow_ssh_cidr
     outputs.tf                   # nodes = [{name, role, public_ip, private_ip}] — IDENTICAL across clouds
     modules/
-      hetzner/                   # hcloud: 3 servers + private network + firewall + ssh key
-      aws/    (later)            # same contract → EC2 + VPC + SG
-      gcp/    (later)            # same contract → GCE + VPC
+      aws/                       # primary: EC2 + VPC + SG + placement group (per-second billing)
+      gcp/                       # primary: GCE + VPC + compact placement (per-second billing)
+      hetzner/ (later)           # secondary: hcloud servers + private network (1-hour-min billing)
   inventory/
     hosts.yml                    # GENERATED from terraform output (gitignored)
     terraform_to_inventory.sh    # terraform output -json → hosts.yml
@@ -96,16 +99,31 @@ untouched when a cloud is added.
 - **Module inputs:** `{ node_count, instance_type, region, ssh_public_key, ttl_hours, allow_ssh_cidr }`
 - **Module output:** `nodes = [{ name, role, public_ip, private_ip }]`
   where `role ∈ {node0, node1, node2}`; **node0 = leader + co-located client host**.
+- **Default `var.cloud = aws`** (per-second billing). Each module sets a sane
+  per-cloud default `instance_type`; common cross-cloud invariants below.
 
-**Hetzner module (defaults; all variables):**
-- 3× **CCX dedicated-vCPU** instances (default `ccx33`: 8 dedicated vCPU / 32 GB) —
-  dedicated so Aeron busy-spin threads are not starved (the exact local failure).
-  Sizable up via `instance_type`.
-- A **Hetzner private network**; cluster members bind intra-node traffic to private
-  IPs (no public-internet hop between nodes).
-- **Firewall:** SSH (22) only from `allow_ssh_cidr`; private network open among the 3.
-- SSH key uploaded by Terraform; `HCLOUD_TOKEN` supplied via environment.
-- Instances **tagged/labeled** `owner` + `ttl_hours` for the cost guard (§8).
+Common to every module: a VPC/private network so intra-node traffic uses private IPs
+(no public-internet hop); SSH (22) open only from `allow_ssh_cidr`, private subnet
+open among the 3; SSH key uploaded by Terraform; instances tagged `owner` +
+`ttl_hours` for the cost guard (§8). Sizing must keep cores ≥ Aeron busy-spin thread
+count so the cluster is not starved (the local failure).
+
+**AWS module (primary):**
+- 3× compute-optimized instances in one **placement group** (low intra-node latency),
+  default `c7i.4xlarge` (16 vCPU). For zero hyperthread contention prefer a `.metal`
+  size; `instance_type` is a variable. VPC + subnet + security group.
+- Auth via the standard AWS provider chain (env/profile); per-second billing.
+
+**GCP module (primary):**
+- 3× `c3-highcpu` (or `c4`) instances with a **compact placement policy**, default
+  `c3-highcpu-8`; VPC + firewall. `instance_type`/`machine_type` is a variable.
+- Auth via `GOOGLE_APPLICATION_CREDENTIALS` / gcloud ADC; per-second billing.
+
+**Hetzner module (secondary, added later):**
+- 3× **CCX dedicated-vCPU** instances (default `ccx33`: 8 dedicated vCPU / 32 GB) +
+  a Hetzner private network; `HCLOUD_TOKEN` via environment.
+- Billed at a **1-hour minimum per VPS** — acceptable for persistent mode, wasteful
+  for short one-shot runs, hence secondary.
 
 ## 6. Ansible layer
 
@@ -164,7 +182,9 @@ runs. Aeron always builds from a pinned `aeron-io/benchmarks` ref recorded in va
   SSH in to investigate anomalies (as we had to for the 100 ms floor), `make destroy`
   when done. Fast iteration.
 - **One-shot mode (end-state "2"):** `make bench-oneshot` for a reproducible
-  clean-room run with auto-teardown.
+  clean-room run with auto-teardown. Cheapest on **AWS/GCP** (per-second billing);
+  on Hetzner each one-shot still costs a full hour minimum, so prefer persistent mode
+  there.
 - **Cost guard for the persistence risk:** TTL label + `make status` warning, plus an
   optional on-host self-`poweroff` timer at `ttl_hours` as a backstop against
   forgotten dedicated-vCPU instances.
@@ -194,19 +214,21 @@ up is flagged invalid, not compared.
 
 ## 11. Success criteria
 
-1. `make up` on a clean Hetzner account → 3 dedicated-vCPU hosts, tuned, both systems
-   built, configs templated with real private IPs. Idempotent on re-run.
+1. `make up` on a clean AWS (or GCP) account → 3 hosts (cores ≥ spin-thread count),
+   tuned, both systems built, configs templated with real private IPs. Idempotent on
+   re-run.
 2. `make bench` → valid sweeps for UC and Aeron (no `.FAIL` rungs), results +
    provenance manifest in `bench-out/dist/<ts>/`.
 3. `make bench-oneshot` → same, then hosts destroyed; no lingering instances.
 4. `make destroy` and the TTL guard leave no forgotten billable resources.
-5. Adding AWS later = one new `modules/aws/` satisfying the contract; root + Ansible
-   unchanged.
+5. Switching `var.cloud` between `aws` and `gcp` changes only the module; root +
+   Ansible unchanged. Adding Hetzner later = one new `modules/hetzner/` satisfying the
+   same contract.
 6. The Aeron latency floor seen locally (busy-spin starvation) is **absent** on the
    provisioned dedicated-vCPU fleet — numbers are rate-responsive and comparable.
 
 ## 12. Future / out of scope
 
-- `modules/aws/`, `modules/gcp/` (the contract is designed for this).
+- `modules/hetzner/` (secondary cloud; the contract is designed for this).
 - Adopting the IPC-ingress shmem client edge for Aeron once §11 is fixed.
 - Cross-region / real-WAN topology; failover scenarios; CI wiring.
