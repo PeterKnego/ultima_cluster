@@ -1,0 +1,45 @@
+---
+- name: Ensure bench home exists
+  ansible.builtin.file:
+    path: "{{ remote_home }}"
+    state: directory
+    mode: "0755"
+
+- name: Clone aeron-benchmarks
+  ansible.builtin.git:
+    repo: "{{ aeron_benchmarks_repo }}"
+    dest: "{{ remote_home }}/aeron-benchmarks"
+    version: "{{ aeron_benchmarks_ref }}"
+    depth: 1
+  register: aeron_clone
+
+- name: Build deployTar
+  ansible.builtin.shell: ./gradlew clean deployTar -x test --no-daemon --console=plain
+  args:
+    chdir: "{{ remote_home }}/aeron-benchmarks"
+  environment:
+    JAVA_HOME: "{{ java_home_detect.stdout | default('/usr/lib/jvm/java-' + jdk_version + '-openjdk-amd64') }}"
+  register: deploytar
+  changed_when: "'BUILD SUCCESSFUL' in deploytar.stdout"
+  failed_when: "'BUILD SUCCESSFUL' not in deploytar.stdout"
+
+- name: Ensure deploy dir exists (pre-extract)
+  ansible.builtin.file:
+    path: "{{ aeron_deploy_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Extract deployTar
+  ansible.builtin.unarchive:
+    src: "{{ remote_home }}/aeron-benchmarks/build/distributions/benchmarks.tar"
+    dest: "{{ aeron_deploy_dir }}"
+    remote_src: true
+    creates: "{{ aeron_deploy_dir }}/scripts/aeron/cluster-node"
+
+- name: Verify launchers + LoadTestRig present
+  ansible.builtin.shell: |
+    test -x {{ aeron_deploy_dir }}/scripts/aeron/cluster-node
+    test -x {{ aeron_deploy_dir }}/scripts/aeron/media-driver
+    test -x {{ aeron_deploy_dir }}/scripts/aeron/cluster-client
+    {{ java_home_detect.stdout }}/bin/jar tf {{ aeron_deploy_dir }}/benchmarks-all/build/libs/benchmarks.jar | grep -q 'io/aeron/benchmarks/LoadTestRig.class'
+  changed_when: false
