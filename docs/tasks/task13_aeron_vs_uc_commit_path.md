@@ -409,3 +409,60 @@ remains the open question for 3-node; replication **payload size** is settled-nu
 
 Sweep CSVs: `bench-out/maxpayload/mpe_{300,1024,4096}.csv` (untracked). Reproduce:
 `bash uc_autobench/scripts/sweep-max-payload.sh` (real-disk `DATA_ROOT`).
+
+---
+
+## 11. Follow-up (2026-06-14) — Aeron-Cluster head-to-head: pipeline runnable end-to-end, but this host can't produce valid numbers
+
+First attempt at §8's "fair framing #1" (UC vs Aeron Cluster, SMR-level). The
+`uc_autobench/bench-parity/` infra (config + `RUN-PARAMS.md` + the `commit-path-load`
+`.hgrm` exporter) was driven against a real Aeron cluster.
+
+**What was proven — the full pipeline is runnable.** On this host: cloned
+`aeron-io/benchmarks`, built `./gradlew deployTar` (works on both JDK 26 and the
+installed Temurin **JDK 21 LTS**), brought up a real **3-node Aeron cluster**, and
+ran `LoadTestRig` producing HdrHistograms. Wiring issues cleared along the way:
+`io.aeron.benchmarks.output.directory` must be `-D`-set; archive requires
+`catalog.file.sync.level ≥ file.sync.level`; stale JVMs must be reaped between runs
+(port `Address already in use`); a backgrounded cluster must outlive the launching
+shell (`setsid`/persistent task — the harness reaps the foreground process group).
+
+**Config bug found — the repo's IPC-ingress variant does not work multi-node.**
+`bench-parity/aeron-cluster-ipc/` sets a global `aeron.cluster.ingress.channel=aeron:ipc`
+while the members list still carries per-member ingress endpoints; at election
+complete a **follower crashes** in `connectIngress`:
+`InvalidChannelException: UdpChannel only supports UDP media: aeron:ipc?endpoint=localhost:21000`.
+So the shmem client-edge config (the whole point of that variant) is not yet
+viable on current aeron-benchmarks. Fell back to the canonical **UDP-ingress**
+`cluster_localhost` (client edge = UDP loopback, not shmem — a known, small caveat
+per §3: transport is a rounding error vs ms-scale consensus).
+
+**Numbers obtained — and why they are INVALID here.** 3-node, 500 msgs/s, 64 B,
+matched durability:
+
+| System | durability | p50 | p99 | valid |
+|---|---|---|---|---|
+| UC (openraft), inflight 512 | Consistent (fsync) | 2.1 ms | 18.9 ms | ✅ achieved 500/s |
+| UC, inflight 64 | Consistent | 2.4 ms | 82.4 ms | ✅ achieved 500/s |
+| Aeron | fsync (sync.level=2) | 107 ms | 202 ms | ❌ `.FAIL` (0.04% loss) |
+| Aeron | non-durable (sync.level=0) | 101 ms | 161 ms | ❌ `.FAIL` |
+
+Aeron shows a flat **~100 ms latency floor proven independent of rate (500 vs 1000),
+durability (fsync vs none), and heartbeat interval (200 ms vs 10 ms)**. Root cause:
+**the host is 4 vCPUs and ran at load average ~28** (154 Java threads across 7 JVMs).
+Aeron **busy-spins every agent thread** (driver sender/receiver/conductor +
+consensus + archive + service, ×3 nodes +4 drivers); on 4 cores those spin threads
+starve and every round-trip waits ~100 ms for a scheduler slice — that IS the floor.
+UC's `tokio` async runtime parks rather than spins, so it tolerates oversubscription
+(its 2 ms p50 is plausible), but UC's own 3-node also saturated at ~600/s here. **Both
+sides are host-limited and the comparison is actively unfair to Aeron** (engineered
+for single-digit-µs on a provisioned box). Reporting "UC 2 ms vs Aeron 100 ms" would
+be misleading and is NOT a result.
+
+**Verdict.** Runnability: ✅ proven end-to-end. Valid parity data: ❌ not obtainable
+on a 4-vCPU shared VM — Aeron's busy-spin model needs **physical cores ≥ its spin-thread
+count** on a quiet dedicated machine (as `RUN-PARAMS.md` already stipulates). Open
+work before a real run: (1) fix the IPC-ingress follower crash if the shmem client
+edge is wanted; (2) run on a host with enough cores; (3) confirm `achieved == target`
+(no `.FAIL`) at every rung. Build/run recipe and the `.FAIL` histograms were scratch
+under `/home/claude/` (aeron-benchmarks clone, deployTar, parity-run) — not committed.
