@@ -19,7 +19,7 @@
       {{ remote_home }}/aeron-cfg/cluster.properties \
       {{ remote_home }}/aeron-cfg/node.properties > {{ remote_home }}/md.out 2>&1 < /dev/null &
   changed_when: false
-  when: aeron_enabled | default(true)
+  when: aeron_enabled | default(true) | bool
 
 - name: Start Aeron cluster node
   ansible.builtin.shell: |
@@ -29,20 +29,20 @@
       {{ remote_home }}/aeron-cfg/cluster.properties \
       {{ remote_home }}/aeron-cfg/node.properties > {{ remote_home }}/node.out 2>&1 < /dev/null &
   changed_when: false
-  when: aeron_enabled | default(true)
+  when: aeron_enabled | default(true) | bool
 
 - name: Wait for cluster election to settle
   ansible.builtin.pause:
     seconds: 20
   run_once: true
-  when: aeron_enabled | default(true)
+  when: aeron_enabled | default(true) | bool
 
 - name: Copy Aeron sweep script to node0
   ansible.builtin.copy:
     src: run_aeron_sweep.sh
     dest: "{{ remote_home }}/run_aeron_sweep.sh"
     mode: "0755"
-  when: aeron_enabled | default(true) and node_role == "node0"
+  when: aeron_enabled | default(true) | bool and node_role == "node0"
 
 - name: Drive Aeron rate ladder (node0)
   ansible.builtin.command: >
@@ -51,14 +51,14 @@
     {{ rate_ladder | join(',') }}
     {{ payload_bytes }} {{ warmup_seconds }} {{ measure_seconds }}
     {{ batch_size }}
-  when: aeron_enabled | default(true) and node_role == "node0"
+  when: aeron_enabled | default(true) | bool and node_role == "node0"
   changed_when: true
 
 - name: Stop Aeron JVMs
   ansible.builtin.shell: "pkill -9 -f '[i]o.aeron' || true"
   changed_when: false
   failed_when: false
-  when: aeron_enabled | default(true)
+  when: aeron_enabled | default(true) | bool
 
 # ---- UC: start one uc-node per host, sweep on node0, then tear down ----
 - name: Start UC node
