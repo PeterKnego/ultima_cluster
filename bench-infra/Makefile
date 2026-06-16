@@ -16,7 +16,7 @@ TFVARS  ?= terraform.tfvars
 ANSIBLE := ansible-playbook
 SSH_KEY := $(shell awk -F'"' '/ssh_private_key_file/{print $$2}' $(TFVARS))
 
-.PHONY: init up provision bench bench-oneshot status destroy ssh-node0 inventory
+.PHONY: init up up-uc provision bench bench-oneshot status destroy ssh-node0 inventory iterate
 
 init:
 	$(TF) init
@@ -25,6 +25,15 @@ up: ## provision infra + configure hosts
 	$(TF) apply -auto-approve -var-file=../$(TFVARS)
 	$(MAKE) inventory
 	cd ansible && SSH_PRIVATE_KEY_FILE=$(SSH_KEY) $(ANSIBLE) provision.yml
+
+up-uc: ## provision a UC-only fleet (no Aeron) for the throughput loop
+	$(TF) apply -auto-approve -var-file=../$(TFVARS)
+	$(MAKE) inventory
+	cd ansible && SSH_PRIVATE_KEY_FILE=$(SSH_KEY) $(ANSIBLE) provision.yml -e aeron_enabled=false
+
+iterate: ## one loop iteration on the live fleet: rebuild UC + UC sweep, print fitness JSON
+	cd ansible && $(ANSIBLE) iterate.yml -e aeron_enabled=false
+	@python3 scripts/uc_fitness.py ../bench-out/iterate/uc_sweep.csv
 
 inventory:
 	SSH_PRIVATE_KEY_FILE=$(SSH_KEY) ./inventory/terraform_to_inventory.sh
