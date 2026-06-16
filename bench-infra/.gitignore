@@ -13,3 +13,6 @@ inventory/hosts.yml
 
 # Ansible
 ansible/*.retry
+
+#env vars
+.env

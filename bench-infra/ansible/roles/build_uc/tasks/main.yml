@@ -7,6 +7,20 @@
       - "--exclude=target"
       - "--exclude=.git"
       - "--exclude=bench-out"
+      - "--exclude=bench-infra"   # don't ship .env secret or .terraform bloat
+  when: uc_src_mode == "rsync"
+
+# ultima_cluster's Cargo.toml has external path deps ../ultima_db (+ its
+# ultima_journal). Ship the sibling repo to {{ ud_src_dir }} so that, with the
+# UC tree at {{ uc_src_dir }} (= /opt/bench/uc), `../ultima_db` resolves to
+# /opt/bench/ultima_db on the host. Without this, cargo build fails.
+- name: (rsync mode) Sync sibling ultima_db (external path dep) to host
+  ansible.posix.synchronize:
+    src: "{{ ud_local_path }}/"
+    dest: "{{ ud_src_dir }}/"
+    rsync_opts:
+      - "--exclude=target"
+      - "--exclude=.git"
   when: uc_src_mode == "rsync"
 
 - name: (git mode) Clone UC at pinned ref

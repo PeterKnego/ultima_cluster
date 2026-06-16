@@ -8,13 +8,27 @@ locals {
   gcp_region = var.region != "" ? var.region : "us-central1"
 }
 
+# Terraform configures EVERY declared provider even when its module is count=0,
+# so the non-active clouds must configure without real credentials. When a cloud
+# is NOT selected we feed throwaway static creds + skip the validation/metadata
+# probes; its module has no resources, so the provider is never actually used.
+# When the cloud IS selected, the dummies become null and the normal credential
+# chain (env / profile / ADC) applies.
 provider "aws" {
-  region = local.aws_region
+  region                      = local.aws_region
+  access_key                  = local.enable_aws ? null : "unused-dummy"
+  secret_key                  = local.enable_aws ? null : "unused-dummy"
+  skip_credentials_validation = !local.enable_aws
+  skip_requesting_account_id  = !local.enable_aws
+  skip_metadata_api_check     = !local.enable_aws
 }
 
 provider "google" {
   region = local.gcp_region
   zone   = "${local.gcp_region}-a"
+  # A static access_token short-circuits the Application Default Credentials
+  # lookup; unused when count=0. Null when GCP is active → normal ADC/env path.
+  access_token = local.enable_gcp ? null : "unused-dummy-token"
 }
 
 module "hetzner" {

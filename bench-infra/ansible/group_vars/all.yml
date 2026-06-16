@@ -16,12 +16,14 @@ jdk_version: "21"
 uc_src_mode: "rsync"                     # 'rsync' local working tree | 'git'
 uc_git_ref: ""                           # used when uc_src_mode=git
 uc_repo_url: ""                          # used when uc_src_mode=git
-uc_local_path: "{{ playbook_dir }}/../.."  # repo root, for rsync mode
+uc_local_path: "{{ playbook_dir }}/../.."  # repo root (ultima_cluster), for rsync mode
+ud_local_path: "{{ playbook_dir }}/../../../ultima_db"  # sibling repo (external path dep)
 
 # --- Layout on hosts ---
 remote_home: "/opt/bench"
 aeron_deploy_dir: "/opt/bench/aeron-deploy"
 uc_src_dir: "/opt/bench/uc"
+ud_src_dir: "/opt/bench/ultima_db"   # so /opt/bench/uc/../ultima_db resolves on the host
 uc_target_bin: "/opt/bench/uc/target/release"
 
 # --- Aeron port bases (matches canonical cluster_localhost ranges) ---
