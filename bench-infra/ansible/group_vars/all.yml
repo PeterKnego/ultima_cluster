@@ -7,6 +7,7 @@ batch_size: 1            # per-message pacing (Aeron); UC is open-loop per-messa
 inflight: 128            # UC --inflight for compared points; Aeron is open-loop
 durability: consistent   # 'consistent' = both fsync; 'none' = both non-durable. NEVER mixed.
 aeron_ingress: udp       # 'udp' (proven) | 'ipc' (gated behind task13 §11 fix, do not use yet)
+aeron_enabled: true      # false = UC-only fleet (skip Aeron build + Aeron sweep), used by the throughput loop
 idle_strategy: busyspin
 
 # --- Build sources ---

@@ -11,6 +11,7 @@
   roles:
     - os_tune
     - toolchains
-    - build_aeron
+    - role: build_aeron
+      when: aeron_enabled | default(true)
     - build_uc
     - config
