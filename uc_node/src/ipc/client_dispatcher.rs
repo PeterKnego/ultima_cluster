@@ -95,32 +95,42 @@ where
                     }
 
                     let app_command = AppCommand::from(Bytes::from(payload));
-                    match raft.client_write(app_command).await {
-                        Ok(resp) => {
-                            uc_protocol::probes::bridge(probe_cid, probe_seq, resp.log_id.index);
-                            broadcast_record(
-                                &response_producer,
-                                MSG_TYPE_SUBMIT_RESPONSE,
-                                encode_flags_client(0, None),
-                                extra,
-                                resp.data.as_ref(),
-                            )
-                            .await;
-                            uc_protocol::probes::stamp_client(
-                                probe_cid,
-                                probe_seq,
-                                uc_protocol::probes::Checkpoint::Broadcast,
-                            );
-                        }
-                        Err(e) => {
-                            use openraft::error::{ClientWriteError, RaftError};
-                            if let RaftError::APIError(ClientWriteError::ForwardToLeader(f)) = &e {
-                                broadcast_not_leader(&response_producer, extra, f.leader_id).await;
-                            } else {
-                                tracing::warn!(node_id, error = ?e, "client_write failed; dropping");
+                    // Dispatch the commit CONCURRENTLY: spawn so the read loop
+                    // keeps pulling submits instead of awaiting each full Raft
+                    // round-trip inline. Serial await capped throughput at
+                    // ~1/commit-latency; spawning lets many ClientWrites be in
+                    // flight so openraft batches them. The submit ring + client
+                    // in-flight window bound the number of concurrent tasks.
+                    let raft_c = raft.clone();
+                    let resp_c = Arc::clone(&response_producer);
+                    tokio::spawn(async move {
+                        match raft_c.client_write(app_command).await {
+                            Ok(resp) => {
+                                uc_protocol::probes::bridge(probe_cid, probe_seq, resp.log_id.index);
+                                broadcast_record(
+                                    &resp_c,
+                                    MSG_TYPE_SUBMIT_RESPONSE,
+                                    encode_flags_client(0, None),
+                                    extra,
+                                    resp.data.as_ref(),
+                                )
+                                .await;
+                                uc_protocol::probes::stamp_client(
+                                    probe_cid,
+                                    probe_seq,
+                                    uc_protocol::probes::Checkpoint::Broadcast,
+                                );
+                            }
+                            Err(e) => {
+                                use openraft::error::{ClientWriteError, RaftError};
+                                if let RaftError::APIError(ClientWriteError::ForwardToLeader(f)) = &e {
+                                    broadcast_not_leader(&resp_c, extra, f.leader_id).await;
+                                } else {
+                                    tracing::warn!(node_id, error = ?e, "client_write failed; dropping");
+                                }
                             }
                         }
-                    }
+                    });
                 }
                 Ok(Some(rec)) => {
                     tracing::warn!(msg_type = rec.msg_type, "unexpected frame on submit.ring");
