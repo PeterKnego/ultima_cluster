@@ -41,6 +41,11 @@
   ansible.builtin.shell: |
     javac -version 2>&1
     {{ remote_home }}/.cargo/bin/rustc --version
+  environment:
+    # rustup proxy needs RUSTUP_HOME to find the toolchain installed above
+    # (non-login shells don't source /etc/profile.d/cargo.sh).
+    CARGO_HOME: "{{ remote_home }}/.cargo"
+    RUSTUP_HOME: "{{ remote_home }}/.rustup"
   register: tool_versions
   changed_when: false
 

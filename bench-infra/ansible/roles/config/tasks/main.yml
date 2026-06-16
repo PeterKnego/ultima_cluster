@@ -33,7 +33,7 @@
     dest: "{{ remote_home }}/uc-peers.env"
     mode: "0644"
     content: |
-      UC_APP_ID={{ uc_app_id }}
-      UC_NODE_ID={{ node_id }}
-      UC_LISTEN={{ private_ip }}:{{ uc_raft_port[node_role] }}
-      UC_PEERS={% for h in groups['cluster'] %}--peer {{ hostvars[h].node_id }}@{{ hostvars[h].private_ip }}:{{ uc_raft_port[hostvars[h].node_role] }} {% endfor %}
+      UC_APP_ID="{{ uc_app_id }}"
+      UC_NODE_ID="{{ node_id }}"
+      UC_LISTEN="{{ private_ip }}:{{ uc_raft_port[node_role] }}"
+      UC_PEERS="{% for h in groups['cluster'] %}--peer {{ hostvars[h].node_id }}@{{ hostvars[h].private_ip }}:{{ uc_raft_port[hostvars[h].node_role] }} {% endfor %}"

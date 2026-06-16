@@ -28,6 +28,8 @@
     mode: pull
     src: "{{ remote_home }}/results/"
     dest: "{{ results_local_dir }}/{{ hostvars[groups['node0'][0]].run_ts.stdout }}/{{ node_role }}/"
+    rsync_opts:
+      - "--mkpath"   # create dest parent dirs (rsync only makes the leaf otherwise)
   changed_when: true
 
 - name: Report collected location

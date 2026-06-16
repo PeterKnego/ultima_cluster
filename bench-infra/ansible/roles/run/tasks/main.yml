@@ -1,4 +1,15 @@
 ---
+# Clean stale cluster state so re-runs start fresh (stale drivers / cluster dirs
+# / leftover JVMs would break election or bind ports). Bracket trick on pkill
+# ('[i]o.aeron') so the pattern does not match pkill's own shell command line.
+- name: Clean stale cluster state
+  ansible.builtin.shell: |
+    pkill -9 -f '[i]o.aeron' || true
+    pkill -9 -f '[u]c-node-launch' || true
+    rm -rf /dev/shm/*-driver /dev/shm/uc-* {{ remote_home }}/cluster {{ remote_home }}/uc-data {{ remote_home }}/results
+    mkdir -p {{ remote_home }}/results
+  changed_when: false
+
 # ---- Aeron: start drivers + nodes on every host, sweep on node0, then tear down ----
 - name: Start Aeron media driver
   ansible.builtin.shell: |
@@ -41,13 +52,14 @@
   changed_when: true
 
 - name: Stop Aeron JVMs
-  ansible.builtin.shell: "pkill -9 -f 'io.aeron' || true"
+  ansible.builtin.shell: "pkill -9 -f '[i]o.aeron' || true"
   changed_when: false
+  failed_when: false
 
 # ---- UC: start one uc-node per host, sweep on node0, then tear down ----
 - name: Start UC node
   ansible.builtin.shell: |
-    source {{ remote_home }}/uc-peers.env
+    . {{ remote_home }}/uc-peers.env
     export UC_DURABILITY={{ 'eventual' if durability == 'none' else 'consistent' }}
     setsid {{ uc_target_bin }}/uc-node-launch \
       --node-id $UC_NODE_ID --listen $UC_LISTEN $UC_PEERS \
@@ -83,5 +95,6 @@
   changed_when: true
 
 - name: Stop UC JVMs/procs
-  ansible.builtin.shell: "pkill -9 -f 'uc-node-launch' || true; pkill -9 -f 'kv_service' || true"
+  ansible.builtin.shell: "pkill -9 -f '[u]c-node-launch' || true; pkill -9 -f '[k]v_service' || true"
   changed_when: false
+  failed_when: false
