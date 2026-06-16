@@ -1,3 +1,16 @@
+# Load cloud credentials (HCLOUD_TOKEN / AWS_* / GOOGLE_*) from a gitignored
+# .env if present, and export them into every recipe's environment so
+# terraform/ansible pick them up automatically. Leading '-' makes .env optional.
+# .env lines are KEY=value (bare value recommended).
+-include .env
+# Safety net: make's -include keeps surrounding quotes LITERALLY (unlike shell
+# dotenv loaders), so a value like HCLOUD_TOKEN="abc" would be passed to
+# terraform as `"abc"` (with quotes) and fail auth. Strip surrounding double
+# quotes from known cred vars so both `KEY=abc` and `KEY="abc"` work.
+_ENV_CREDS := HCLOUD_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN GOOGLE_PROJECT
+$(foreach v,$(_ENV_CREDS),$(eval $(v) := $$(patsubst "%",%,$$($(v)))))
+export
+
 TF      := terraform -chdir=terraform
 TFVARS  ?= terraform.tfvars
 ANSIBLE := ansible-playbook

@@ -49,9 +49,21 @@ With root available, the simpler path is `apt-get install -y terraform ansible j
 (terraform via the HashiCorp apt repo) and `ansible-galaxy collection install ...`.
 
 ## Credentials (per chosen cloud)
-- Hetzner: `export HCLOUD_TOKEN=...`
-- AWS: standard provider chain (`AWS_PROFILE` / env).
-- GCP: `GOOGLE_APPLICATION_CREDENTIALS` + `GOOGLE_PROJECT`.
+Put them in a gitignored `bench-infra/.env` — the Makefile auto-loads it and
+exports the vars into terraform/ansible, so no manual `export` is needed:
+
+    cp .env.example .env   # then fill in
+    # .env: bare KEY=value, e.g.  HCLOUD_TOKEN=abc123...   (no surrounding quotes)
+
+- Hetzner: `HCLOUD_TOKEN=...`
+- AWS: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` (or just use `AWS_PROFILE` / the standard provider chain).
+- GCP: `GOOGLE_PROJECT=...` + `GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa.json`.
+
+> `.env` uses `KEY=value` (Make include syntax, not shell-sourced). Prefer bare
+> values: unlike shell dotenv loaders, Make keeps surrounding quotes literally, so
+> `HCLOUD_TOKEN="abc"` would reach terraform *with* the quotes. The Makefile strips
+> surrounding double-quotes from the known cred vars as a safety net, but bare is
+> cleanest. You can still `export HCLOUD_TOKEN=...` in your shell instead of `.env`.
 
 > Note: `terraform init` downloads all three provider plugins (hcloud, aws, google) regardless of `cloud`. For `cloud=gcp` you must also set `GOOGLE_PROJECT`. A Hetzner-only run needs only `HCLOUD_TOKEN`.
 
