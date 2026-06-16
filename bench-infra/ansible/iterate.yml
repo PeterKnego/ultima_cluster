@@ -1,0 +1,25 @@
+---
+# One loop iteration against the LIVE UC-only fleet: re-sync + incremental rebuild,
+# run the UC-only 3-node sweep, fetch node0's uc_sweep.csv to a fixed local path.
+# No re-provision, no Aeron. Run with: ansible-playbook iterate.yml -e aeron_enabled=false
+- name: Rebuild UC and run the UC-only sweep
+  hosts: cluster
+  become: true
+  gather_facts: true
+  vars:
+    aeron_enabled: false
+  pre_tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        delay: 5
+        timeout: 120
+  roles:
+    - build_uc
+    - run
+  post_tasks:
+    - name: Fetch node0 UC sweep CSV to the fixed loop path
+      ansible.builtin.fetch:
+        src: "{{ remote_home }}/results/uc_sweep.csv"
+        dest: "{{ iterate_local_csv }}"
+        flat: true
+      when: node_role == "node0"
