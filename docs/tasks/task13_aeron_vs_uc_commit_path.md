@@ -466,3 +466,65 @@ work before a real run: (1) fix the IPC-ingress follower crash if the shmem clie
 edge is wanted; (2) run on a host with enough cores; (3) confirm `achieved == target`
 (no `.FAIL`) at every rung. Build/run recipe and the `.FAIL` histograms were scratch
 under `/home/claude/` (aeron-benchmarks clone, deployTar, parity-run) — not committed.
+
+---
+
+## 12. Follow-up (2026-06-16) — FIRST VALID Aeron-vs-UC parity result (provisioned 3-node Hetzner)
+
+§11's run was host-invalid (Aeron busy-spin starved on a shared 4-vCPU box → flat
+~100 ms floor). This run used the `bench-infra/` Terraform+Ansible rig (see
+`docs/superpowers/specs/2026-06-14-bench-infra-terraform-ansible-design.md`) to
+provision **3 dedicated 8-vCPU Hetzner CCX33 nodes** (one cluster node per host,
+client co-located with node0), build both systems, and drive the matched sweep.
+
+**Config:** 3-node cross-host (real UDP for Aeron / QUIC for UC), 64 B payload,
+**durable** (UC `Durability::Consistent`; Aeron `archive.file.sync.level=1`), rate
+ladder 100→20000 msgs/s, 10 s measure + 2 s warmup per rung. UC `--inflight 128`;
+Aeron `LoadTestRig` open-loop. Aeron client edge = UDP-loopback on node0 (the shmem
+IPC-ingress variant is still gated behind §11's follower-crash bug); UC client edge =
+shmem. kernel 6.8, ext4.
+
+| target/s | UC achieved | UC p50 | UC p99 | Aeron p50 | Aeron p99 | Aeron sent |
+|---:|---:|---:|---:|---:|---:|---:|
+| 100 | 100 | 2.4 ms | 3.4 ms | 3.1 ms | 15.9 ms | 1 000 ✓ |
+| 500 | 500 | 1.9 ms | 2.9 ms | 3.5 ms | 15.4 ms | 5 000 ✓ |
+| 1 000 | 804 (sat) | 1 264 ms | 2 422 ms | 2.8 ms | 14.0 ms | 10 000 ✓ |
+| 2 000 | 781 (sat) | 7.7 s | 15.4 s | 2.0 ms | 14.3 ms | 20 000 ✓ |
+| 5 000 | 777 (sat) | 27 s | 54 s | 1.0 ms | 14.7 ms | 50 000 ✓ |
+| 10 000 | 775 (sat) | 59 s | 118 s | 0.27 ms | 8.3 ms | 100 000 ✓ |
+| 20 000 | 759 (sat) | 128 s | 251 s | 0.30 ms | 6.9 ms | 200 000 ✓ |
+
+**Findings (valid):**
+- **Throughput:** UC saturates at **~800 msgs/s** (achieved caps 760–804 regardless
+  of offered load); **Aeron sustained all rungs through 20 000/s with zero loss** and
+  never reached its knee → **Aeron ≳25× UC's throughput ceiling** on identical hardware.
+- **Latency below UC's knee (≤500/s): UC is competitive / tighter** — UC p99 ~3 ms vs
+  Aeron ~15 ms. Aeron's low-rate latency is its idle path; under load its pipeline
+  warms and p50 drops to **0.27 ms** (vs UC's best 1.9 ms). Past ~800/s UC's numbers
+  are saturation backlog (coordinated-omission), not steady state.
+- Matches the architecture: Aeron is a mature batching/pipelining SMR; UC is early and
+  throughput-gated by its submit/apply path (task13 floor). UC's ~800/s here vs ~600/s
+  on the local 4-vCPU box shows it scales modestly with hardware but is pipeline-, not
+  host-, limited.
+
+**Aeron is NOT starved here** (p50 sub-ms, max ~20–43 ms, full counts) — the §11
+host-artifact floor is gone, confirming the rig + dedicated cores produce trustworthy
+numbers. This is the first apples-to-apples (matched durability, same hosts, one axis =
+the system) UC-vs-Aeron data point.
+
+**Rig bugs this live run surfaced and fixed** (now on `main`): non-active cloud
+provider blocks demanded creds (dummy-cred fix); `build_uc` didn't ship the external
+path-dep `../ultima_db`; `ansible.cfg` used the removed `community.general.yaml`
+callback; toolchains provenance task missed `RUSTUP_HOME`; `run` role `pkill -f
+'io.aeron'` self-killed its own shell (bracket-trick fix) + no pre-run cleanup; UC
+`uc-peers.env` used `source` (bashism, dash-incompatible) with unquoted space-bearing
+values; collect rsync lacked `--mkpath`. Also added `UC_DURABILITY` env to
+`uc-node-launch` so the matched-durability knob reaches UC.
+
+Results: `bench-out/dist/20260616T192626Z/` — `node0/uc_sweep.csv`, 7 Aeron `.hdr`,
+`manifest.txt`, and `summary_uc_vs_aeron.csv` (combined). Reproduce: `cd bench-infra &&
+make up && make bench` (needs the Hetzner dedicated-vCPU quota for 3×CCX33).
+
+**Open:** find Aeron's actual knee (rungs >20 000/s); fix §11 IPC-ingress to match the
+shmem client edge; sweep the non-durable posture; raise UC's throughput ceiling (its
+submit/apply path remains the lever, per §6).
