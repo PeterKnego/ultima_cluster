@@ -14,7 +14,8 @@ import sys
 
 
 def main(path: str) -> int:
-    rows = list(csv.DictReader(open(path)))
+    with open(path) as f:
+        rows = list(csv.DictReader(f))
     if not rows:
         print(json.dumps({"error": "empty csv"}))
         return 1
