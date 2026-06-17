@@ -1,3 +1,4 @@
 commit	uc_throughput_msgs	knee_rate	p99_at_knee_ms	lincheck_passed	status	description
 -	153.1	100	13.279231	true	discard	api_batch_linger_ms=2 — worse (153 vs 204 baseline), p99 2x; batch not filling (arrival-gated)
 d0c7856	1995.7	1000	12.107775	true	keep	concurrent client_write dispatch (spawn per submit) — 205→1996/s (9.7x), knee 100→1000/s; lincheck green
+1ad22fd	4467.5	2000	29.589503	true	keep	api_batch_linger_ms=2 (batches now fill via concurrent dispatch) — 1996→4468/s (2.24x), knee 1000→2000/s
