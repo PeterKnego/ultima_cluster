@@ -15,6 +15,10 @@
       instance={{ ansible_processor_vcpus | default('?') }}vcpu {{ ansible_memtotal_mb | default('?') }}MB
       kernel={{ ansible_kernel }}
       durability={{ durability }}
+      transport={{ transport }}
+      netem_loss_pct={{ netem_loss_pct }}
+      netem_delay_ms={{ netem_delay_ms }}
+      netem_iface={{ netem_iface }}
       aeron_ingress={{ aeron_ingress }}
       rate_ladder={{ rate_ladder | join(',') }}
       payload_bytes={{ payload_bytes }}

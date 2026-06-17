@@ -61,44 +61,64 @@
   when: aeron_enabled | default(true) | bool
 
 # ---- UC: start one uc-node per host, sweep on node0, then tear down ----
-- name: Start UC node
-  ansible.builtin.shell: |
-    . {{ remote_home }}/uc-peers.env
-    export UC_DURABILITY={{ 'eventual' if durability == 'none' else 'consistent' }}
-    setsid {{ uc_target_bin }}/uc-node-launch \
-      --node-id $UC_NODE_ID --listen $UC_LISTEN $UC_PEERS \
-      --app-id $UC_APP_ID --with-service \
-      --instance-dir /dev/shm/uc-{{ node_role }} \
-      --data-dir {{ remote_home }}/uc-data \
-      > {{ remote_home }}/uc-node.out 2>&1 < /dev/null &
-  changed_when: false
-
-- name: Wait for UC leader election
-  ansible.builtin.pause:
-    seconds: 15
-  run_once: true
-
-- name: Copy UC sweep script to node0
-  ansible.builtin.copy:
-    src: run_uc_sweep.sh
-    dest: "{{ remote_home }}/run_uc_sweep.sh"
-    mode: "0755"
-  when: node_role == "node0"
-
-- name: Drive UC rate ladder (node0)
+# Wrap in a block so netem is always removed even if the sweep fails.
+- name: Apply netem shaping (when loss or delay > 0)
   ansible.builtin.command: >
-    {{ remote_home }}/run_uc_sweep.sh
-    {{ uc_target_bin }}/commit-path-load
-    /dev/shm/uc-node0
-    {{ uc_app_id }}
-    {{ rate_ladder | join(',') }}
-    {{ payload_bytes }} {{ inflight }} {{ measure_seconds }}
-    {{ warmup_seconds }}
-    {{ remote_home }}/results/uc_sweep.csv
-  when: node_role == "node0"
+    tc qdisc add dev {{ netem_iface }} root netem
+    loss {{ netem_loss_pct }}%
+    delay {{ netem_delay_ms }}ms
+  become: true
+  when: netem_loss_pct | int > 0 or netem_delay_ms | int > 0
   changed_when: true
 
-- name: Stop UC JVMs/procs
-  ansible.builtin.shell: "pkill -9 -f '[u]c-node-launch' || true; pkill -9 -f '[k]v_service' || true"
-  changed_when: false
-  failed_when: false
+- block:
+    - name: Start UC node
+      ansible.builtin.shell: |
+        . {{ remote_home }}/uc-peers.env
+        export UC_DURABILITY={{ 'eventual' if durability == 'none' else 'consistent' }}
+        export UC_TRANSPORT={{ transport }}
+        setsid {{ uc_target_bin }}/uc-node-launch \
+          --node-id $UC_NODE_ID --listen $UC_LISTEN $UC_PEERS \
+          --app-id $UC_APP_ID --with-service \
+          --instance-dir /dev/shm/uc-{{ node_role }} \
+          --data-dir {{ remote_home }}/uc-data \
+          > {{ remote_home }}/uc-node.out 2>&1 < /dev/null &
+      changed_when: false
+
+    - name: Wait for UC leader election
+      ansible.builtin.pause:
+        seconds: 15
+      run_once: true
+
+    - name: Copy UC sweep script to node0
+      ansible.builtin.copy:
+        src: run_uc_sweep.sh
+        dest: "{{ remote_home }}/run_uc_sweep.sh"
+        mode: "0755"
+      when: node_role == "node0"
+
+    - name: Drive UC rate ladder (node0)
+      ansible.builtin.command: >
+        {{ remote_home }}/run_uc_sweep.sh
+        {{ uc_target_bin }}/commit-path-load
+        /dev/shm/uc-node0
+        {{ uc_app_id }}
+        {{ rate_ladder | join(',') }}
+        {{ payload_bytes }} {{ inflight }} {{ measure_seconds }}
+        {{ warmup_seconds }}
+        {{ remote_home }}/results/uc_sweep.csv
+      when: node_role == "node0"
+      changed_when: true
+
+    - name: Stop UC JVMs/procs
+      ansible.builtin.shell: "pkill -9 -f '[u]c-node-launch' || true; pkill -9 -f '[k]v_service' || true"
+      changed_when: false
+      failed_when: false
+
+  always:
+    - name: Remove netem shaping (always, idempotent)
+      ansible.builtin.command: tc qdisc del dev {{ netem_iface }} root
+      become: true
+      failed_when: false
+      changed_when: false
+      when: netem_loss_pct | int > 0 or netem_delay_ms | int > 0
