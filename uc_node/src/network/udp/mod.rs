@@ -6,6 +6,7 @@
 //! in-memory window, receiver-window flow control, MTU fragmentation. The
 //! existing `frame.rs` Frame/MessageType is the RPC payload above this layer.
 
+pub mod instance;
 pub mod server_stub;
 pub use server_stub::UdpServerHandle;
 pub mod fragment;
