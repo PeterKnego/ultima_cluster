@@ -604,3 +604,48 @@ number (~5808) matches §13's prior-fleet ~5790, confirming the fleets are compa
 lincheck-green. Absolute numbers remain this RTT-bound fleet's; the wins are
 architectural. The next ceiling (~7820/s here) is likely the single RaftCore loop or
 QUIC replication — a deeper investigation than the apply/consensus batching done so far.
+
+---
+
+## 15. Follow-up (2026-06-17) — RaftCore loop profile: the loop is NOT the ceiling
+
+Profiled the RaftCore commit pipeline under load using openraft 0.10's built-in
+`runtime-stats` (enabled via the openraft `runtime-stats` cargo feature; exposed
+through `RaftHandle::runtime_stats_display` + a periodic dump in `uc-node-launch` —
+on the **`profile/raftcore-stats`** debug branch, NOT merged). Captured node0's
+per-stage `log_stages(us)` + batch histograms during a UC-only 3-node sweep
+(throughput ~9522/s on this fleet — a faster box than §14's; the **stage
+proportions**, not the absolute, are the finding).
+
+**Per-entry log-lifecycle (P50 / P99, µs):**
+
+| stage | P50 | P99 | what it is |
+|---|---:|---:|---|
+| proposed→received | **6478** | 7153 | client_write waiting in the api channel = the **`api_batch_linger=5ms`** |
+| received→submitted | 2 | 6 | engine step (trivial) |
+| submitted→persisted | 976 | **171517** | leader journal append + fsync — **severe P99 tail** |
+| persisted→committed | 2715 | 22009 | quorum replication round-trip |
+| committed→applied | 1145 | 1489 | apply pipeline (our §14 win — fast) |
+| proposed→applied | 10776 | 202485 | total |
+
+**Batches** (append/apply/write): P50 12, **P90 ~145, P99 158** — batching is working
+(openraft coalesces ~145 entries/round). **RaftCore-loop budget:** `raft_msg_per_run`
+P50≈0–1 with `raft_msg_budget`≈960 and usage **≈0‰**, despite a notification flood
+(50k ReplicationProgress + 51k HeartbeatProgress vs 11.7k ClientWrites).
+
+**Finding: the RaftCore loop is NOT the next ceiling.** It has ~1000 msg/run of budget
+and uses ~0‰ — it absorbs the 100k-notification flood with capacity to spare. The
+residual costs are physical, not loop-bound:
+- **Dominant latency = `api_batch_linger=5ms`** (proposed→received ~6.5ms), a
+  throughput-for-latency trade we chose (§13); reduce it only to trade throughput back.
+- **Leader journal fsync P99 tail = 171ms** (submitted→persisted) — the one clearly
+  *actionable, in-our-code* lever: tighten the `ultima_journal` group-commit / fsync
+  tail (the P50 is ~1ms, so it's a tail problem, not steady-state).
+- **Quorum replication round-trip ~2.7ms** (persisted→committed) — network /
+  openraft-replication territory (alpha.21 has no in-flight pipelining knob).
+- **apply ~1.1ms** — confirms §14's apply pipeline removed that stage as a cost.
+
+So the next throughput lever is **not** the RaftCore loop (spare capacity) and **not**
+apply (fixed) — it's the **leader fsync tail** (ours) and the **replication round-trip**
+(openraft/network). The instrument (`runtime-stats` dump) is reusable from the
+`profile/raftcore-stats` branch for any future commit-path profiling.
