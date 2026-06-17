@@ -512,17 +512,157 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
         // Shared with `node.shutdown()`; read lock-free in the ring-wait loops
         // so a service crash can't wedge shutdown.
         let shutdown = self.shutdown.clone();
+
+        // PIPELINE: collect the whole committed batch first, then process it as
+        // maximal fast-path runs (publish many, await many in FIFO order) to
+        // amortize the per-entry shmem round-trip. Catch-up / Blank / Membership
+        // entries break a run and are handled one-at-a-time (the slow path),
+        // exactly as the per-entry code did.
+        // Each slot is `Option`-wrapped so the slow path can move the whole
+        // `(entry, responder)` out by value, while the fast path only needs the
+        // borrow + `take` of the responder field.
+        let mut items: Vec<Option<EntryResponder<TypeConfig>>> = Vec::new();
         while let Some(item) = entries.next().await {
-            let (entry, responder) = item?;
+            items.push(Some(item?));
+        }
+
+        let mut i = 0usize;
+        while i < items.len() {
+            // Decide whether the entry at `i` starts a fast-path run. A run is a
+            // maximal slice of consecutive `Normal` entries where, per candidate,
+            // the epoch matches, the index is contiguous with the service frontier,
+            // and the run length is below `apply_pipeline_depth`.
+            let mut g = self.inner.lock().await;
+
+            // Determine the run length starting at `i` under the held lock.
+            let mut run_len = 0usize;
+            {
+                let ss_ptr = g.service_status_ptr;
+                let expected_epoch = g.last_seen_epoch;
+                let depth = g.apply_pipeline_depth.max(1);
+                if epoch_of(ss_ptr) == expected_epoch {
+                    while i + run_len < items.len() && run_len < depth {
+                        let (entry, _) = items[i + run_len]
+                            .as_ref()
+                            .expect("unconsumed item");
+                        if !matches!(entry.payload, EntryPayload::Normal(_)) {
+                            break;
+                        }
+                        let log_index = entry.log_id.index;
+                        // Contiguous: service is at `log_index - 1` accounting for
+                        // the entries already published earlier in this same run.
+                        let frontier = self.service_caught_up_to.load(Ordering::Acquire)
+                            + run_len as u64;
+                        if frontier + 1 < log_index {
+                            break;
+                        }
+                        run_len += 1;
+                    }
+                }
+            }
+
+            if run_len > 0 {
+                // ---- FAST-PATH RUN ----
+                let ss_ptr = g.service_status_ptr;
+                let expected_epoch = g.last_seen_epoch;
+
+                // PUBLISH PHASE: publish every entry in the run in log order.
+                for k in 0..run_len {
+                    let (entry, _) = items[i + k].as_ref().expect("unconsumed item");
+                    let log_id = entry.log_id;
+                    let log_index = log_id.index;
+                    let cmd_bytes = match &entry.payload {
+                        EntryPayload::Normal(b) => b,
+                        _ => unreachable!("run only contains Normal entries"),
+                    };
+                    publish_apply(
+                        &g.apply_producer,
+                        log_index,
+                        cmd_bytes.as_ref(),
+                        log_id,
+                        &shutdown,
+                    )
+                    .await?;
+                }
+
+                // AWAIT PHASE (FIFO): await each resp in publish order. On Reattach
+                // the service crashed mid-run; stop awaiting (the crashed service
+                // won't answer the rest) and let the next outer iteration route the
+                // unconfirmed entries through the slow path.
+                type Responder = openraft::storage::ApplyResponder<TypeConfig>;
+                let mut stash: Vec<(Option<Responder>, Bytes)> = Vec::with_capacity(run_len);
+                let mut confirmed = 0usize;
+                for k in 0..run_len {
+                    let (entry, _) = items[i + k].as_ref().expect("unconsumed item");
+                    let log_id = entry.log_id;
+                    let log_index = log_id.index;
+                    match await_apply_resp(
+                        &g.apply_resp_consumer,
+                        log_index,
+                        log_id,
+                        &shutdown,
+                        &g.apply_resp_bridge,
+                        ss_ptr,
+                        expected_epoch,
+                    )
+                    .await?
+                    {
+                        ApplyOutcome::Resp(b) => {
+                            let slot = items[i + k].as_mut().expect("unconsumed item");
+                            let cmd_bytes = match &slot.0.payload {
+                                EntryPayload::Normal(cb) => cb.clone(),
+                                _ => unreachable!(),
+                            };
+                            // Per-entry bookkeeping, performed only after this entry's
+                            // resp is CONFIRMED (never optimistically for the run).
+                            if let Err(e) =
+                                g.output_chan_tx.try_send((log_index, cmd_bytes.into()))
+                            {
+                                tracing::warn!(
+                                    log_index,
+                                    ?e,
+                                    "output_chan full; replay will catch this"
+                                );
+                            }
+                            self.service_caught_up_to.store(log_index, Ordering::Release);
+                            self.reconcile_done.notify_waiters();
+                            g.last_applied = Some(log_id);
+
+                            let responder = items[i + k].as_mut().expect("unconsumed item").1.take();
+                            stash.push((responder, b));
+                            confirmed += 1;
+                        }
+                        ApplyOutcome::Reattach => {
+                            // Mid-run service crash: do NOT await resps for the rest
+                            // of the published entries — they will never arrive. The
+                            // reattach entry + the rest are re-handled next iteration.
+                            break;
+                        }
+                    }
+                }
+
+                drop(g);
+                for (responder, b) in stash {
+                    if let Some(r) = responder {
+                        r.send(b);
+                    }
+                }
+                // Advance only past CONFIRMED entries. Unconfirmed ones (after a
+                // mid-run reattach) are reprocessed; the epoch/gap check then routes
+                // them to the slow path (drive_catchup).
+                i += confirmed;
+                continue;
+            }
+
+            // ---- SLOW PATH (single entry: Blank / Membership / needs catch-up) ----
+            // The current entry is Blank/Membership, or the fast-path check declined
+            // it (epoch changed or prefix gap). Handle it exactly as the original
+            // per-entry code did: flush-then-handle one entry, then `i += 1`.
+            let (entry, responder) = items[i].take().expect("unconsumed item");
             let log_id = entry.log_id;
             let log_index = log_id.index;
-
-            let mut g = self.inner.lock().await;
             g.last_applied = Some(log_id);
 
-            // Catch-up bookkeeping (see the post-match store): `filled_to_here` is
-            // set by the Normal arm, which always brings the service to `log_index`
-            // (publish when contiguous, or drive_catchup which fills any prefix gap).
             let prev_caught = self.service_caught_up_to.load(Ordering::Acquire);
             let mut filled_to_here = false;
             let resp_bytes: Bytes = match entry.payload {
@@ -537,14 +677,8 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                     let expected_epoch = g.last_seen_epoch;
                     // Reconstruct when the service reattached (epoch changed) OR when
                     // the node has not delivered up to `log_index - 1` to this service
-                    // incarnation — a GAP. The gap arises on a node restart whose log
-                    // was purged below committed: openraft replays only the post-
-                    // snapshot tail, so the fresh service is missing the snapshot'd
-                    // prefix `(service_caught_up_to, log_index-1]`. `drive_catchup`'s
-                    // NeedsSnapshot branch installs the node snapshot into the service
-                    // then tail-replays, filling the prefix. `service_caught_up_to` is
-                    // node-local (no cnc-publish lag), so it never false-positives in
-                    // steady state (it equals the previous entry's index).
+                    // incarnation — a GAP. (See task14 for the full prefix-gap
+                    // rationale: a node restart whose log was purged below committed.)
                     let gap = self.service_caught_up_to.load(Ordering::Acquire) + 1 < log_index;
                     let resp: Bytes = if epoch_of(ss_ptr) != expected_epoch || gap {
                         // Service reattached or has a prefix gap: catch up (replays
@@ -597,12 +731,10 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                 }
             };
             // Advance the service catch-up frontier ONLY when the service is actually
-            // at `log_index` now: the Normal arm always brings it there (publish or
-            // drive_catchup → `filled_to_here`); a Blank/Membership delivers nothing,
-            // so it advances the frontier only when it was already contiguous
-            // (`prev_caught == log_index - 1`). Otherwise an unfilled prefix gap must
-            // be preserved — advancing here would let a Blank/Membership entry mask
-            // the gap and a read be served against a service still missing its prefix.
+            // at `log_index` now (see the original per-entry rationale): the Normal
+            // arm always brings it there; a Blank/Membership delivers nothing, so it
+            // advances the frontier only when it was already contiguous. Otherwise an
+            // unfilled prefix gap must be preserved.
             if filled_to_here || prev_caught + 1 == log_index {
                 self.service_caught_up_to.store(log_index, Ordering::Release);
                 self.reconcile_done.notify_waiters();
@@ -612,6 +744,7 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
             if let Some(r) = responder {
                 r.send(resp_bytes);
             }
+            i += 1;
         }
         Ok(())
     }
