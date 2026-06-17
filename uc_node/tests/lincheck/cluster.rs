@@ -82,7 +82,10 @@ fn node_config(
         bootstrap: BootstrapConfig::Peers { peers },
         raft: RaftTuning::default(),
         tls: TlsConfig::default(),
-        transport: Transport::Quic,
+        transport: match std::env::var("UC_TEST_TRANSPORT").ok().as_deref() {
+            Some("udp") => Transport::Udp(uc_node::UdpTuning::default()),
+            _ => Transport::Quic,
+        },
         ipc_mode: IpcMode::Shmem {
             instance_dir: instance.path().to_owned(),
         },
