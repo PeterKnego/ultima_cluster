@@ -528,3 +528,50 @@ make up && make bench` (needs the Hetzner dedicated-vCPU quota for 3×CCX33).
 **Open:** find Aeron's actual knee (rungs >20 000/s); fix §11 IPC-ingress to match the
 shmem client edge; sweep the non-durable posture; raise UC's throughput ceiling (its
 submit/apply path remains the lever, per §6).
+
+---
+
+## 13. Follow-up (2026-06-17) — autoresearch loop raised UC 3-node throughput ~28×
+
+Using the `uc_autobench` distributed-throughput loop (spec
+`docs/superpowers/specs/2026-06-16-uc-autobench-distributed-throughput-loop-design.md`),
+driven against a persistent UC-only Hetzner fleet via `bench-infra` `make up-uc` +
+`make iterate` (each iteration: edit → local compile → lincheck capstone gate →
+cloud 3-node sweep → fitness = `max(achieved_rate)`). UC-only, durable, 64 B,
+inflight 128. **Every kept change stayed linearizable (lincheck gate green).**
+
+This fleet's baseline was ~205 msgs/s — ~4× below §12's fleet (inter-node RTT
+varies; Hetzner has no low-latency placement group), but **stable to ~2%** (a
+re-run baseline gave 207), so single-run keep/discard signals were trustworthy.
+
+| iter | change | throughput | knee | verdict |
+|---|---|---:|---:|---|
+| baseline | — | 205/s | 100/s | stable |
+| 1 | `api_batch_linger_ms=2` (alone) | 153/s | 100/s | ❌ discard |
+| 2 | **concurrent `client_write` dispatch** (`d0c7856`) | **1996/s** | 1000/s | ✅ 9.7× |
+| 3 | + `api_batch_linger_ms=2` (`1ad22fd`) | **4468/s** | 2000/s | ✅ +2.24× |
+| 4 | `api_batch_linger_ms=5` (`77c5d7d`) | **5790/s** | 5000/s | ✅ +30% |
+| 5 | `api_batch_linger_ms=10` | 4641/s | 2000/s | ❌ discard (overshoot) |
+
+**Net: 205 → 5790 msgs/s ≈ 28×; knee 100/s → 5000/s.**
+
+**Root cause & fix.** `uc_node/src/ipc/client_dispatcher.rs` awaited
+`raft.client_write()` **inline** in the submit read-loop, fully serializing
+commits at ~1/commit-latency (≈205/s here). Spawning the commit+broadcast per
+submit (`d0c7856`) keeps many `ClientWrite`s in flight → openraft batches them →
+9.7×. This *also* explains why the config levers had failed in isolation:
+`api_batch_linger_ms` (iter 1) and `max_payload_entries` (§10) had nothing to
+batch when only one write was ever in flight. Once concurrency fills the pipeline,
+a small RaftCore batch-linger (5 ms) coalesces writes into larger append/replicate
+rounds, amortizing the quorum round-trip + follower fsync — another 2.9× on top.
+`linger=10` overshoots (over-batches + adds latency), confirming 5 ms as the knee.
+
+**Caveats.** Absolute numbers are this RTT-bound fleet's; the wins are
+architectural (serial-commit removal + consensus-batch coalescing) and should
+carry to a faster fleet, likely pushing it well past its §12 ~800/s too. The
+linger trades low-load p99 up (~9 → 18 ms) for throughput — acceptable per the
+throughput objective; revisit if a latency target is added. Both perf commits are
+on `main`. The next ceiling (~5790/s here) is the apply/response pipeline or the
+single RaftCore loop — a deeper change than config tuning (§6 lever territory).
+
+Loop record: `uc_autobench/tasks/uc-throughput/results.tsv`.
