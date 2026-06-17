@@ -418,7 +418,7 @@ impl<S: StateMachine> NodeHandle<S> {
         raft.shutdown()
             .await
             .map_err(|e| ClusterError::Raft(format!("shutdown: {:?}", e)))?;
-        // Then the QUIC server (closes endpoint, awaits accept task).
+        // Then the transport server (closes endpoint, awaits accept task).
         server.shutdown().await;
         // Shmem-mode only: stop+join all cnc-mmap-holding tasks before
         // `_instance` drops. These hold `&'static` references into the

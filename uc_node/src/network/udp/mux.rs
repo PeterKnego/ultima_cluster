@@ -109,7 +109,7 @@ impl UdpMux {
         let mux = Arc::new(Self {
             sock: parking_lot::Mutex::new(Some(sock)),
             tuning,
-            epoch: rand::random::<u32>(),
+            epoch: rand::random::<u32>().max(1), // never 0: epoch==0 ⇒ session_id==base ⇒ restart reuses stale session
             sessions: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             handler: parking_lot::Mutex::new(None),
@@ -298,14 +298,28 @@ impl UdpMux {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(request_id, tx);
         let encoded = req.encode().freeze();
-        if let Err(e) = sess.send_message(encoded).await {
-            self.pending.lock().await.remove(&request_id);
-            return Err(e);
-        }
-        match tokio::time::timeout(timeout, rx).await {
+        // Both the send AND the response wait are bounded by `timeout`. Without
+        // this, `send_message` can park indefinitely in its flow-control spin
+        // (waiting for an inbound Sm ack to drain the window) if the peer goes
+        // silent with a full send window — the RPC would wedge with no escape.
+        // If `timeout` fires while `send_message` is parked, nothing was
+        // transmitted and cancellation is clean. If it fires mid-fragmentation
+        // a partial run may have been sent; the peer reassembler holds an
+        // incomplete message that is never completed — acceptable, because
+        // openraft retries the whole AppendEntries as a fresh RPC with new
+        // fragment IDs, and the orphaned partial is bounded.
+        let outcome = tokio::time::timeout(timeout, async move {
+            sess.send_message(encoded).await?;
+            rx.await.map_err(|_| NetworkError::Disconnected)
+        })
+        .await;
+        match outcome {
             Ok(Ok(frame)) => Ok(frame),
-            Ok(Err(_)) => Err(NetworkError::Disconnected),
-            Err(_) => {
+            Ok(Err(e)) => {
+                self.pending.lock().await.remove(&request_id);
+                Err(e)
+            }
+            Err(_elapsed) => {
                 self.pending.lock().await.remove(&request_id);
                 Err(NetworkError::Timeout)
             }
