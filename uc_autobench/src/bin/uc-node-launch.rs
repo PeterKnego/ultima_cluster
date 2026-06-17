@@ -1,7 +1,8 @@
 //! uc-node-launch — start one real uc_node (+ co-located uc_service) as a
 //! process, for multi-process N-node benchmarks. Uses
-//! `BootstrapConfig::Peers` + `IpcMode::Shmem`. Three of these launched
-//! concurrently form a real 3-node QUIC cluster.
+//! `BootstrapConfig::Peers` + `IpcMode::Shmem`. N of these launched
+//! concurrently form a real N-node cluster. Transport is selectable via the
+//! `UC_TRANSPORT` env var (`"udp"` → UDP, anything else / unset → QUIC).
 //!
 //! The min node_id peer bootstraps (initialize + add_learner +
 //! change_membership); every peer must be started concurrently because the
@@ -180,7 +181,17 @@ async fn main() -> anyhow::Result<()> {
             ..RaftTuning::default()
         },
         tls: TlsConfig::default(),
-        transport: uc_node::Transport::Quic,
+        // Transport is selectable via UC_TRANSPORT env var; default QUIC.
+        // "udp" (case-insensitive) → UDP with default tuning; anything else → QUIC.
+        transport: match std::env::var("UC_TRANSPORT")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("udp") => uc_node::Transport::Udp(uc_node::UdpTuning::default()),
+            _ => uc_node::Transport::Quic,
+        },
         ipc_mode: IpcMode::Shmem {
             instance_dir: args.instance_dir.clone(),
         },
