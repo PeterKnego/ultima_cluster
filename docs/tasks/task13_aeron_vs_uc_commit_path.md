@@ -575,3 +575,32 @@ on `main`. The next ceiling (~5790/s here) is the apply/response pipeline or the
 single RaftCore loop — a deeper change than config tuning (§6 lever territory).
 
 Loop record: `uc_autobench/tasks/uc-throughput/results.tsv`.
+
+---
+
+## 14. Follow-up (2026-06-17) — pipelined apply: +35% (same-fleet A/B), cumulative ~38×
+
+The apply pipeline (spec `docs/superpowers/specs/2026-06-17-pipelined-apply-design.md`)
+removed the serial per-entry cross-process apply round-trip identified as the
+~5790/s ceiling in §13: node `apply()` now publishes a run of committed entries to
+the service then awaits the run (FIFO), instead of one publish→await round-trip per
+entry. No wire-protocol change; per-entry frontier + `Reattach`-mid-run flush
+preserved; lincheck capstone (×3 seeds) + hard-crash + the m1/m2/m3/partition/
+ring_torture gates all green.
+
+**Validated by a same-fleet A/B** (UC-only 3-node Hetzner CCX33, durable, 64 B,
+inflight 128 — provision once, swap only the `uc_node` lib between runs):
+
+| `uc_node` lib | throughput | knee | p99@knee |
+|---|---:|---:|---:|
+| pre-pipeline (`8ccb049`: concurrent dispatch + linger=5) | 5808/s | 5000/s | 68.6 ms |
+| **+ pipelined apply** (`7ea3dad`) | **7820/s** | 5000/s | 75.9 ms |
+
+**+34.6%** isolated to the apply-pipeline change (same hosts/params). The WITHOUT
+number (~5808) matches §13's prior-fleet ~5790, confirming the fleets are comparable.
+
+**Cumulative on this 3-node path: ~205 → ~7820 msgs/s ≈ 38×** (concurrent
+`client_write` dispatch 9.7× → `api_batch_linger=5` → pipelined apply +35%), all
+lincheck-green. Absolute numbers remain this RTT-bound fleet's; the wins are
+architectural. The next ceiling (~7820/s here) is likely the single RaftCore loop or
+QUIC replication — a deeper investigation than the apply/consensus batching done so far.
