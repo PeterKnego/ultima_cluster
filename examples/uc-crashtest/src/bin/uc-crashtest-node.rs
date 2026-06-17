@@ -41,7 +41,15 @@ async fn main() -> anyhow::Result<()> {
         bootstrap: BootstrapConfig::SingleNode,
         raft: RaftTuning::default(),
         tls: TlsConfig::default(),
-        transport: uc_node::Transport::Quic,
+        transport: match std::env::var("UC_TRANSPORT")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("udp") => uc_node::Transport::Udp(uc_node::UdpTuning::default()),
+            _ => uc_node::Transport::Quic,
+        },
         ipc_mode: IpcMode::Shmem {
             instance_dir: args.instance_dir,
         },
