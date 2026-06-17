@@ -21,7 +21,7 @@ pub struct UdpServerHandle {
 
 impl UdpServerHandle {
     pub async fn shutdown(self) {
-        self.mux.shutdown();
+        self.mux.shutdown().await;
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
