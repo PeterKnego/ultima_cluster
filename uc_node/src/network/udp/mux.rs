@@ -124,7 +124,10 @@ impl UdpMux {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(request_id, tx);
         let encoded = req.encode().freeze();
-        sess.send_message(encoded).await?;
+        if let Err(e) = sess.send_message(encoded).await {
+            self.pending.lock().await.remove(&request_id);
+            return Err(e);
+        }
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(frame)) => Ok(frame),
             Ok(Err(_)) => Err(NetworkError::Disconnected),
