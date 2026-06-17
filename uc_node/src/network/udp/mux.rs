@@ -337,6 +337,8 @@ impl UdpMux {
                 // DATA segment creates a gap → the receiver NAKs → the sender
                 // retransmits, genuinely exercising the recovery path. A map
                 // miss (peer not yet registered) ⇒ no fault (fail-open).
+                // Faults ALL inbound segment types (DATA, NAK, SM, Heartbeat) —
+                // realistic; restrict via seg.seg_type here if a test needs it.
                 #[cfg(feature = "fault-injection")]
                 {
                     let (source, table) = {

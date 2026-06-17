@@ -74,9 +74,11 @@ impl FaultTable {
         }
     }
 
-    /// Clear all blocks — heal the network.
+    /// Clear partition blocks AND segment-level loss/delay faults — heal the network completely.
     pub fn heal(&self) {
         self.blocked.lock().unwrap().clear();
+        self.loss.lock().unwrap().clear();
+        self.delay_ms.lock().unwrap().clear();
     }
 
     /// Set the inbound-segment drop probability for the `src → dst` link.
@@ -188,5 +190,11 @@ mod tests {
         assert!(t.is_blocked(1, 2));
         t.heal();
         assert!(!t.is_blocked(1, 2));
+        // Also verify heal() clears loss and delay
+        t.set_loss(1, 2, 0.5);
+        t.set_delay(1, 2, 25);
+        t.heal();
+        assert!(!t.should_drop(1, 2, 0.4));
+        assert_eq!(t.delay(1, 2), 0);
     }
 }
