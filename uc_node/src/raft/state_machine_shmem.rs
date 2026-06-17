@@ -339,9 +339,8 @@ pub(crate) struct ShmemInner<S: StateMachine> {
     /// Purge boundary, for the below-purge -> NeedsSnapshot (Phase 2) decision.
     pub(crate) last_purged: Arc<StableValue<RaftLogId>>,
     /// Max apply entries in-flight before awaiting responses. Set from
-    /// `NodeConfig::service_rings::apply_pipeline_depth`; readable inside `apply()`.
-    /// Used by the pipelined-apply implementation (later task).
-    #[allow(dead_code)]
+    /// `NodeConfig::service_rings::apply_pipeline_depth`; read by `apply()` to
+    /// bound the pipelined fast-path run length.
     pub(crate) apply_pipeline_depth: usize,
 }
 
@@ -539,6 +538,8 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
             {
                 let ss_ptr = g.service_status_ptr;
                 let expected_epoch = g.last_seen_epoch;
+                // .max(1): a misconfigured depth of 0 falls back to runs of 1
+                // (non-pipelined), never an empty run that would stall.
                 let depth = g.apply_pipeline_depth.max(1);
                 if epoch_of(ss_ptr) == expected_epoch {
                     while i + run_len < items.len() && run_len < depth {
