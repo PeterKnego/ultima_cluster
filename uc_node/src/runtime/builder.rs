@@ -364,6 +364,7 @@ where
             config.raft.snapshot_policy_logs_since_last,
         ),
         max_payload_entries: config.raft.max_payload_entries,
+        api_batch_linger_ms: 2,
         ..Default::default()
     };
     let validated = raft_config_unvalidated
