@@ -28,7 +28,7 @@ use tempfile::TempDir;
 use uc_client::{Client, ClientError};
 use uc_node::{
     BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning,
-    ServiceRingConfig, TlsConfig,
+    ServiceRingConfig, TlsConfig, Transport,
 };
 use uc_service::runtime::ServiceConfig;
 use uc_service::{ServiceBuilder, SnapshotError, StateMachine};
@@ -118,6 +118,7 @@ async fn m4_client_response_overwritten() {
         bootstrap: BootstrapConfig::SingleNode,
         raft: RaftTuning::default(),
         tls: TlsConfig::default(),
+        transport: Transport::Quic,
         ipc_mode: IpcMode::Shmem {
             instance_dir: instance_dir.clone(),
         },

@@ -77,7 +77,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 use uc_node::{
     BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning,
-    ServiceRingConfig, TlsConfig,
+    ServiceRingConfig, TlsConfig, Transport,
 };
 use uc_service::runtime::ServiceConfig;
 use uc_service::{ServiceBuilder, SnapshotError, StateMachine};
@@ -174,6 +174,7 @@ async fn below_purge_service_reconstructed_via_snapshot_install() {
             ..RaftTuning::default()
         },
         tls: TlsConfig::default(),
+        transport: Transport::Quic,
         ipc_mode: IpcMode::Shmem {
             instance_dir: instance_dir.clone(),
         },
@@ -414,6 +415,7 @@ async fn concurrent_build_epoch_stable_snapshot_accepted() {
             ..RaftTuning::default()
         },
         tls: TlsConfig::default(),
+        transport: Transport::Quic,
         ipc_mode: IpcMode::Shmem {
             instance_dir: instance_dir.clone(),
         },

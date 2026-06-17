@@ -10,7 +10,7 @@ use tempfile::TempDir;
 
 use uc_node::{
     BootstrapConfig, ClientRingConfig, NodeBuilder, NodeConfig, RaftTuning, ServiceRingConfig,
-    TlsConfig,
+    TlsConfig, Transport,
 };
 use uc_service::{SnapshotError, StateMachine};
 
@@ -95,6 +95,7 @@ fn cfg(data_dir: PathBuf, bootstrap: BootstrapConfig) -> NodeConfig {
         bootstrap,
         raft: RaftTuning::default(),
         tls: TlsConfig::default(),
+        transport: Transport::Quic,
         ipc_mode: uc_node::IpcMode::default(),
         client_rings: ClientRingConfig::default(),
         service_rings: ServiceRingConfig::default(),

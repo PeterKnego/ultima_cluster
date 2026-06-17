@@ -180,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
             ..RaftTuning::default()
         },
         tls: TlsConfig::default(),
+        transport: uc_node::Transport::Quic,
         ipc_mode: IpcMode::Shmem {
             instance_dir: args.instance_dir.clone(),
         },

@@ -16,9 +16,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use clap::Parser;
-use counter_loop::proto::increment_notifier_server::{
-    IncrementNotifier, IncrementNotifierServer,
-};
+use counter_loop::proto::increment_notifier_server::{IncrementNotifier, IncrementNotifierServer};
 use counter_loop::proto::{IncrementEvent, SubscribeReq};
 use counter_loop::{Cmd, CounterSm, Query, QueryResp, build_state_machine};
 use futures::Stream;
@@ -120,11 +118,7 @@ impl OutputHandler<CounterSm> for CounterOutput {
         let send_elapsed = send_start.elapsed();
         if send_elapsed >= SLOW_SEND_THRESHOLD {
             OC_SLOW_SENDS.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                ?send_elapsed,
-                log_index,
-                "tx.send slow — mpsc backpressure"
-            );
+            tracing::warn!(?send_elapsed, log_index, "tx.send slow — mpsc backpressure");
         }
         maybe_log_stats(n);
 
@@ -205,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
         bootstrap: BootstrapConfig::SingleNode,
         raft: RaftTuning::default(),
         tls: TlsConfig::default(),
+        transport: uc_node::Transport::Quic,
         ipc_mode: IpcMode::Shmem {
             instance_dir: args.instance_dir.clone(),
         },
@@ -274,7 +269,10 @@ async fn main() -> anyhow::Result<()> {
     if node.current_leader().await != Some(1) {
         anyhow::bail!("node never became leader");
     }
-    tracing::info!("counter_loop_service ready: instance_dir={}", instance_dir.display());
+    tracing::info!(
+        "counter_loop_service ready: instance_dir={}",
+        instance_dir.display()
+    );
 
     // ── Run until Ctrl-C ────────────────────────────────────────────────
     tokio::select! {

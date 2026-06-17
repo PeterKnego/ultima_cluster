@@ -29,7 +29,7 @@ use uc_service::{Service, ServiceBuilder, ServiceConfig, StateMachine};
 
 use crate::config::{
     BootstrapConfig, ClientRingConfig, IpcMode, NodeConfig, RaftTuning, ServiceRingConfig,
-    TlsConfig,
+    TlsConfig, Transport,
 };
 use crate::runtime::builder::NodeBuilder;
 use crate::runtime::node::NodeHandle;
@@ -80,6 +80,7 @@ impl<S: StateMachine + Default> ClusterFixture<S> {
             bootstrap: BootstrapConfig::SingleNode,
             raft: RaftTuning::default(),
             tls: TlsConfig::default(),
+            transport: Transport::Quic,
             ipc_mode: IpcMode::Shmem {
                 instance_dir: instance_path.clone(),
             },

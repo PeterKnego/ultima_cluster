@@ -19,7 +19,7 @@ use tempfile::TempDir;
 use uc_client::Client;
 use uc_node::{
     BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning,
-    ServiceRingConfig, TlsConfig,
+    ServiceRingConfig, TlsConfig, Transport,
 };
 use uc_service::runtime::ServiceConfig;
 use uc_service::{ServiceBuilder, SnapshotError, StateMachine};
@@ -98,6 +98,7 @@ async fn node_shutdown_with_crashed_service_does_not_hang() {
         bootstrap: BootstrapConfig::SingleNode,
         raft: RaftTuning::default(),
         tls: TlsConfig::default(),
+        transport: Transport::Quic,
         ipc_mode: IpcMode::Shmem {
             instance_dir: instance_dir.clone(),
         },

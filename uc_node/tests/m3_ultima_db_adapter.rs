@@ -27,7 +27,7 @@ use ultima_db::Store;
 
 use uc_node::{
     BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, RaftTuning,
-    ServiceRingConfig, TlsConfig,
+    ServiceRingConfig, TlsConfig, Transport,
 };
 use uc_service::ServiceBuilder;
 use uc_service::runtime::ServiceConfig;
@@ -94,6 +94,7 @@ async fn ultima_db_adapter_end_to_end() {
         bootstrap: BootstrapConfig::SingleNode,
         raft: RaftTuning::default(),
         tls: TlsConfig::default(),
+        transport: Transport::Quic,
         ipc_mode: IpcMode::Shmem {
             instance_dir: instance_dir.clone(),
         },

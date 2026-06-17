@@ -62,6 +62,8 @@ pub struct NodeConfig {
     /// TLS configuration for inter-node QUIC. M2 supports `SelfSigned`;
     /// `Files` (operator-provided certs) arrives in M5.
     pub tls: TlsConfig,
+    /// Inter-node transport. Defaults to `Quic` (unchanged behavior).
+    pub transport: Transport,
     /// In-process apply vs shmem-fronted apply. Default `Embedded` matches
     /// M1/M2 behavior; `Shmem` activates the M3 service-process split.
     pub ipc_mode: IpcMode,
@@ -97,6 +99,15 @@ pub enum IpcMode {
     Shmem {
         instance_dir: PathBuf,
     },
+}
+
+/// Inter-node transport selector. `Quic` (default) is the existing QUIC path;
+/// `Udp` is the Aeron-style reliable-unicast UDP transport.
+#[derive(Debug, Clone, Default)]
+pub enum Transport {
+    #[default]
+    Quic,
+    Udp(crate::network::UdpTuning),
 }
 
 /// TLS configuration for inter-node QUIC.
@@ -162,5 +173,20 @@ impl NodeConfig {
             return Err("election_timeout_min_ms must be < max".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    #[test]
+    fn transport_defaults_to_quic() {
+        assert!(matches!(Transport::default(), Transport::Quic));
+    }
+    #[test]
+    fn udp_tuning_defaults() {
+        let t = crate::network::UdpTuning::default();
+        assert_eq!(t.mtu, 1408);
+        assert_eq!(t.flow_window_bytes, 128 * 1024);
     }
 }

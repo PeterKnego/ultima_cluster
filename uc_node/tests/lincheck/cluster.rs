@@ -9,7 +9,7 @@ use tempfile::TempDir;
 use uc_client::Client;
 use uc_node::{
     BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, NodeHandle, NodeId,
-    PeerSeed, RaftTuning, ServiceRingConfig, TlsConfig,
+    PeerSeed, RaftTuning, ServiceRingConfig, TlsConfig, Transport,
 };
 use uc_service::runtime::ServiceConfig;
 use uc_service::{Service, ServiceBuilder};
@@ -82,6 +82,7 @@ fn node_config(
         bootstrap: BootstrapConfig::Peers { peers },
         raft: RaftTuning::default(),
         tls: TlsConfig::default(),
+        transport: Transport::Quic,
         ipc_mode: IpcMode::Shmem {
             instance_dir: instance.path().to_owned(),
         },

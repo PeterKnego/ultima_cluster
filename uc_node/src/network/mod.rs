@@ -9,9 +9,11 @@ pub mod codec;
 pub mod fault;
 pub mod frame;
 pub mod quic;
+pub mod udp;
 
 // Top-level re-exports so existing call-sites keep working unchanged.
 pub use quic::{QuicRaftNetwork, QuicRaftNetworkFactory};
+pub use udp::UdpTuning;
 
 use thiserror::Error;
 

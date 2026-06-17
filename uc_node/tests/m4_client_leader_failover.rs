@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use uc_client::{Client, ClientError};
 use uc_node::{
     BootstrapConfig, ClientRingConfig, IpcMode, NodeBuilder, NodeConfig, NodeHandle, NodeId,
-    PeerSeed, RaftTuning, ServiceRingConfig, TlsConfig,
+    PeerSeed, RaftTuning, ServiceRingConfig, TlsConfig, Transport,
 };
 use uc_service::runtime::ServiceConfig;
 use uc_service::{ServiceBuilder, SnapshotError, StateMachine};
@@ -169,6 +169,7 @@ async fn m4_client_leader_failover() {
             },
             raft: RaftTuning::default(),
             tls: TlsConfig::default(),
+            transport: Transport::Quic,
             ipc_mode: IpcMode::Shmem {
                 instance_dir: instance_dir.path().to_owned(),
             },
