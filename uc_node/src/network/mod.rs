@@ -4,6 +4,11 @@
 //! peer-pair, multiple bidirectional streams per connection (one per RPC
 //! class). TLS self-signed by default.
 
+/// Public shim for the inter-node transport microbench (`uc_autobench`).
+/// Exposes uniform echo-RPC pairs for QUIC and UDP so the bench can measure
+/// pure transport RPC cost. Test/bench-only surface.
+#[doc(hidden)]
+pub mod bench_support;
 pub mod codec;
 #[cfg(feature = "fault-injection")]
 pub mod fault;

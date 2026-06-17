@@ -21,6 +21,7 @@ tracing-subscriber = { workspace = true }
 wait-timeout = { workspace = true }
 hdrhistogram = { workspace = true }
 futures = { workspace = true }
+bytes = { workspace = true }
 uc_protocol = { path = "../uc_protocol" }
 uc_node = { path = "../uc_node", features = ["test-support"] }
 uc_service = { path = "../uc_service" }
@@ -56,3 +57,7 @@ path = "src/bin/commit-path-load.rs"
 [[bin]]
 name = "uc-node-launch"
 path = "src/bin/uc-node-launch.rs"
+
+[[bin]]
+name = "internode-rpc-bench"
+path = "src/bin/internode-rpc-bench.rs"
