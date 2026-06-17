@@ -47,7 +47,10 @@ impl UdpRaftNetworkFactory {
         fault_table: Option<Arc<crate::network::fault::FaultTable>>,
     ) {
         self.source = source;
-        self.fault_table = fault_table;
+        self.fault_table = fault_table.clone();
+        // Thread the fault config into the mux so the recv loop can drop/delay
+        // inbound segments (exercising NAK/retransmit, not just whole-RPC fail).
+        self.mux.set_fault_injection(source, fault_table);
     }
 }
 
@@ -64,6 +67,10 @@ impl RaftNetworkFactory<TypeConfig> for UdpRaftNetworkFactory {
             self.app_id.clone(),
             self.request_id.clone(),
         );
+        // Register peer addr → src NodeId so the mux recv loop can key inbound
+        // segments from this peer against the NodeId-keyed fault table.
+        #[cfg(feature = "fault-injection")]
+        self.mux.register_peer(node.raft_addr, target);
         #[cfg(feature = "fault-injection")]
         let net = net.with_fault(self.source, self.fault_table.clone());
         net.into_v2()

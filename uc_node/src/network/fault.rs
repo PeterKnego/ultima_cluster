@@ -10,16 +10,25 @@
 //! insert both directions, so blocking A↔B drops A→B and B→A. The whole module is
 //! compiled out without the `fault-injection` feature.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use crate::raft::NodeId;
 
 /// Shared table of blocked ordered node-pairs. Clone the `Arc` into every node in
 /// a test cluster so the harness can change the partition for all nodes at once.
+///
+/// Beyond whole-link partitions (`blocked`), the table also carries per-link
+/// *segment-level* faults — a drop probability (`loss`) and a fixed added
+/// latency (`delay_ms`) — applied at the UDP mux receive chokepoint so they
+/// exercise the channel's NAK/retransmit path rather than failing the whole RPC.
 #[derive(Debug, Default)]
 pub struct FaultTable {
     blocked: Mutex<HashSet<(NodeId, NodeId)>>,
+    /// Per-link inbound-segment drop probability in `[0.0, 1.0]`. Unset ⇒ 0.0.
+    loss: Mutex<HashMap<(NodeId, NodeId), f64>>,
+    /// Per-link added inbound-segment latency in milliseconds. Unset ⇒ 0.
+    delay_ms: Mutex<HashMap<(NodeId, NodeId), u64>>,
 }
 
 impl FaultTable {
@@ -69,6 +78,43 @@ impl FaultTable {
     pub fn heal(&self) {
         self.blocked.lock().unwrap().clear();
     }
+
+    /// Set the inbound-segment drop probability for the `src → dst` link.
+    pub fn set_loss(&self, src: NodeId, dst: NodeId, drop_prob: f64) {
+        self.loss.lock().unwrap().insert((src, dst), drop_prob);
+    }
+
+    /// Drop probability for `src → dst` (0.0 if unset).
+    pub fn loss(&self, src: NodeId, dst: NodeId) -> f64 {
+        self.loss
+            .lock()
+            .unwrap()
+            .get(&(src, dst))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// Set the added inbound-segment latency (ms) for the `src → dst` link.
+    pub fn set_delay(&self, src: NodeId, dst: NodeId, ms: u64) {
+        self.delay_ms.lock().unwrap().insert((src, dst), ms);
+    }
+
+    /// Added latency (ms) for `src → dst` (0 if unset).
+    pub fn delay(&self, src: NodeId, dst: NodeId) -> u64 {
+        self.delay_ms
+            .lock()
+            .unwrap()
+            .get(&(src, dst))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// True if a segment on `src → dst` should be dropped given a random draw
+    /// `roll` in `[0.0, 1.0)`. The caller supplies the draw so the decision is
+    /// deterministic/seedable for tests.
+    pub fn should_drop(&self, src: NodeId, dst: NodeId, roll: f64) -> bool {
+        roll < self.loss(src, dst)
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +159,23 @@ mod tests {
         for (a, b) in [(1, 2), (2, 1), (1, 3), (3, 1), (2, 3), (3, 2)] {
             assert!(t.is_blocked(a, b), "({a},{b}) should be blocked");
         }
+    }
+
+    #[test]
+    fn loss_probability_threshold() {
+        let t = FaultTable::new();
+        t.set_loss(1, 2, 0.5);
+        assert!(t.should_drop(1, 2, 0.4)); // below prob → drop
+        assert!(!t.should_drop(1, 2, 0.6)); // above prob → pass
+        assert!(!t.should_drop(2, 1, 0.1)); // unset pair → never drop
+    }
+
+    #[test]
+    fn delay_lookup() {
+        let t = FaultTable::new();
+        t.set_delay(1, 2, 25);
+        assert_eq!(t.delay(1, 2), 25);
+        assert_eq!(t.delay(2, 1), 0);
     }
 
     #[test]

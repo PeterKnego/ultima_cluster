@@ -25,6 +25,8 @@ use super::session::{SessionTx, UdpSession};
 use super::wire::Segment;
 use crate::network::NetworkError;
 use crate::network::frame::Frame;
+#[cfg(feature = "fault-injection")]
+use crate::raft::NodeId;
 
 /// Server-side inbound-request handler. Sync to set (pull-forward of a later
 /// fix that avoids a set-race and lets the round-trip test register without
@@ -90,6 +92,15 @@ pub struct UdpMux {
     /// pin the socket fd unless aborted. Tracked here so `shutdown` can abort
     /// them; finished handles are pruned on each spawn to bound the vec.
     route_tasks: parking_lot::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// (test-only) This node's id (= `dst` for inbound segments) and the shared
+    /// fault table. Consulted in the recv loop to drop/delay inbound DATA
+    /// segments so the channel's NAK/retransmit path is exercised.
+    #[cfg(feature = "fault-injection")]
+    fault: parking_lot::Mutex<(NodeId, Option<Arc<crate::network::fault::FaultTable>>)>,
+    /// (test-only) Maps a peer socket-addr to the source NodeId so an inbound
+    /// segment can be keyed against the NodeId-keyed fault table.
+    #[cfg(feature = "fault-injection")]
+    peer_nodes: parking_lot::Mutex<HashMap<SocketAddr, NodeId>>,
 }
 
 impl UdpMux {
@@ -104,6 +115,10 @@ impl UdpMux {
             handler: parking_lot::Mutex::new(None),
             recv_task: parking_lot::Mutex::new(None),
             route_tasks: parking_lot::Mutex::new(Vec::new()),
+            #[cfg(feature = "fault-injection")]
+            fault: parking_lot::Mutex::new((0, None)),
+            #[cfg(feature = "fault-injection")]
+            peer_nodes: parking_lot::Mutex::new(HashMap::new()),
         });
         let recv_task = mux.clone().spawn_recv_loop();
         *mux.recv_task.lock() = Some(recv_task);
@@ -178,6 +193,25 @@ impl UdpMux {
     /// Register the server-side inbound-request handler. Sync.
     pub fn set_request_handler(&self, h: Handler) {
         *self.handler.lock() = Some(h);
+    }
+
+    /// (test-only) Install this node's id and the shared fault table so the
+    /// recv loop can drop/delay inbound segments. Interior mutability, since
+    /// the mux is held behind an `Arc` by the factory.
+    #[cfg(feature = "fault-injection")]
+    pub fn set_fault_injection(
+        &self,
+        source: NodeId,
+        fault_table: Option<Arc<crate::network::fault::FaultTable>>,
+    ) {
+        *self.fault.lock() = (source, fault_table);
+    }
+
+    /// (test-only) Record `addr → node` so an inbound segment from `addr` can be
+    /// keyed against the NodeId-keyed fault table.
+    #[cfg(feature = "fault-injection")]
+    pub fn register_peer(&self, addr: SocketAddr, node: NodeId) {
+        self.peer_nodes.lock().insert(addr, node);
     }
 
     /// Order-independent session id so both ends agree: sort the addr pair,
@@ -298,6 +332,30 @@ impl UdpMux {
                     Ok(s) => s,
                     Err(_) => continue,
                 };
+                // (test-only) Segment-level fault injection: drop or delay the
+                // inbound segment per the NodeId-keyed fault table. Dropping a
+                // DATA segment creates a gap → the receiver NAKs → the sender
+                // retransmits, genuinely exercising the recovery path. A map
+                // miss (peer not yet registered) ⇒ no fault (fail-open).
+                #[cfg(feature = "fault-injection")]
+                {
+                    let (source, table) = {
+                        let g = self.fault.lock();
+                        (g.0, g.1.clone())
+                    };
+                    if let Some(table) = table {
+                        let src_node = self.peer_nodes.lock().get(&peer).copied();
+                        if let Some(src_node) = src_node {
+                            if table.should_drop(src_node, source, rand::random::<f64>()) {
+                                continue;
+                            }
+                            let d = table.delay(src_node, source);
+                            if d > 0 {
+                                tokio::time::sleep(Duration::from_millis(d)).await;
+                            }
+                        }
+                    }
+                }
                 let sid = seg.session_id;
                 let sess = self.get_or_create_session(sid, peer).await;
                 // Drive the session, then drain any completed inbound messages.
