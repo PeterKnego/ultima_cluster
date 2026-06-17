@@ -279,7 +279,11 @@ async fn in_memory_sm_reconstructed_before_read_after_restart() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert_eq!(node.current_leader().await, Some(1), "leader did not converge");
+    assert_eq!(
+        node.current_leader().await,
+        Some(1),
+        "leader did not converge"
+    );
 
     // Establish state: counter == 6.
     assert_eq!(node.submit(1u64).await.expect("submit 1"), 1);

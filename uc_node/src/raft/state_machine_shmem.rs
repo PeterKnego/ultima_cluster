@@ -182,7 +182,8 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
         };
         g.last_seen_epoch = reconciled;
         self.reconciled_epoch.store(reconciled, Ordering::Release);
-        self.service_caught_up_to.store(caught_up, Ordering::Release);
+        self.service_caught_up_to
+            .store(caught_up, Ordering::Release);
         self.reconcile_done.notify_waiters();
         Ok(())
     }
@@ -302,7 +303,11 @@ pub(crate) fn spawn_reconcile_driver<S: StateMachine>(
             }
         }
     });
-    ReconcileDriverHandle { join, stop, request }
+    ReconcileDriverHandle {
+        join,
+        stop,
+        request,
+    }
 }
 
 pub(crate) struct ShmemInner<S: StateMachine> {
@@ -543,17 +548,15 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                 let depth = g.apply_pipeline_depth.max(1);
                 if epoch_of(ss_ptr) == expected_epoch {
                     while i + run_len < items.len() && run_len < depth {
-                        let (entry, _) = items[i + run_len]
-                            .as_ref()
-                            .expect("unconsumed item");
+                        let (entry, _) = items[i + run_len].as_ref().expect("unconsumed item");
                         if !matches!(entry.payload, EntryPayload::Normal(_)) {
                             break;
                         }
                         let log_index = entry.log_id.index;
                         // Contiguous: service is at `log_index - 1` accounting for
                         // the entries already published earlier in this same run.
-                        let frontier = self.service_caught_up_to.load(Ordering::Acquire)
-                            + run_len as u64;
+                        let frontier =
+                            self.service_caught_up_to.load(Ordering::Acquire) + run_len as u64;
                         if frontier + 1 < log_index {
                             break;
                         }
@@ -616,8 +619,7 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                             };
                             // Per-entry bookkeeping, performed only after this entry's
                             // resp is CONFIRMED (never optimistically for the run).
-                            if let Err(e) =
-                                g.output_chan_tx.try_send((log_index, cmd_bytes.into()))
+                            if let Err(e) = g.output_chan_tx.try_send((log_index, cmd_bytes.into()))
                             {
                                 tracing::warn!(
                                     log_index,
@@ -625,11 +627,13 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
                                     "output_chan full; replay will catch this"
                                 );
                             }
-                            self.service_caught_up_to.store(log_index, Ordering::Release);
+                            self.service_caught_up_to
+                                .store(log_index, Ordering::Release);
                             self.reconcile_done.notify_waiters();
                             g.last_applied = Some(log_id);
 
-                            let responder = items[i + k].as_mut().expect("unconsumed item").1.take();
+                            let responder =
+                                items[i + k].as_mut().expect("unconsumed item").1.take();
                             stash.push((responder, b));
                             confirmed += 1;
                         }
@@ -737,7 +741,8 @@ impl<S: StateMachine> RaftStateMachine<TypeConfig> for ShmemAdaptedStateMachine<
             // advances the frontier only when it was already contiguous. Otherwise an
             // unfilled prefix gap must be preserved.
             if filled_to_here || prev_caught + 1 == log_index {
-                self.service_caught_up_to.store(log_index, Ordering::Release);
+                self.service_caught_up_to
+                    .store(log_index, Ordering::Release);
                 self.reconcile_done.notify_waiters();
             }
             drop(g);

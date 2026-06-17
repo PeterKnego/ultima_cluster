@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, ServerConfig};
 
-use super::NetworkError;
+use super::super::NetworkError;
 
 /// rustls 0.23 requires a process-wide default crypto provider. Install the
 /// ring-backed provider exactly once, lazily, the first time we build a config.

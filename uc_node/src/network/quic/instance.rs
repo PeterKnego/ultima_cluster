@@ -20,10 +20,10 @@ use openraft_legacy::network_v1::RaftNetwork;
 use quinn::Endpoint;
 use rustls::ClientConfig;
 
+use super::super::frame::MessageType;
+use super::super::{NetworkError, codec};
 use super::client::PeerConn;
 use super::factory::PeerPool;
-use super::frame::MessageType;
-use super::{NetworkError, codec};
 use crate::raft::{NodeId, TypeConfig};
 
 pub struct QuicRaftNetwork {
@@ -36,7 +36,7 @@ pub struct QuicRaftNetwork {
     #[cfg(feature = "fault-injection")]
     source: NodeId,
     #[cfg(feature = "fault-injection")]
-    fault_table: Option<Arc<super::fault::FaultTable>>,
+    fault_table: Option<Arc<super::super::fault::FaultTable>>,
 }
 
 impl QuicRaftNetwork {
@@ -66,7 +66,7 @@ impl QuicRaftNetwork {
     pub(crate) fn with_fault(
         mut self,
         source: NodeId,
-        fault_table: Option<Arc<super::fault::FaultTable>>,
+        fault_table: Option<Arc<super::super::fault::FaultTable>>,
     ) -> Self {
         self.source = source;
         self.fault_table = fault_table;

@@ -106,7 +106,11 @@ where
                     tokio::spawn(async move {
                         match raft_c.client_write(app_command).await {
                             Ok(resp) => {
-                                uc_protocol::probes::bridge(probe_cid, probe_seq, resp.log_id.index);
+                                uc_protocol::probes::bridge(
+                                    probe_cid,
+                                    probe_seq,
+                                    resp.log_id.index,
+                                );
                                 broadcast_record(
                                     &resp_c,
                                     MSG_TYPE_SUBMIT_RESPONSE,
@@ -123,7 +127,9 @@ where
                             }
                             Err(e) => {
                                 use openraft::error::{ClientWriteError, RaftError};
-                                if let RaftError::APIError(ClientWriteError::ForwardToLeader(f)) = &e {
+                                if let RaftError::APIError(ClientWriteError::ForwardToLeader(f)) =
+                                    &e
+                                {
                                     broadcast_not_leader(&resp_c, extra, f.leader_id).await;
                                 } else {
                                     tracing::warn!(node_id, error = ?e, "client_write failed; dropping");

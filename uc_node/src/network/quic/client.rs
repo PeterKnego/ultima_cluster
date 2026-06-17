@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use quinn::{ClientConfig as QuicClientConfig, Endpoint};
 
-use super::NetworkError;
-use super::frame::{Frame, MessageType};
+use super::super::NetworkError;
+use super::super::frame::{Frame, MessageType};
 
 pub struct PeerConn {
     pub(crate) inner: Arc<PeerConnInner>,

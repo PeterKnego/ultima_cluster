@@ -24,7 +24,7 @@ use crate::ipc::metrics_publisher::MetricsPublisherHandle;
 use crate::ipc::query_link::ShmemQueryLink;
 use crate::ipc::service_watcher::ServiceWatcherHandle;
 use crate::ipc::session_gc::SessionGcHandle;
-use crate::network::server::ServerHandle;
+use crate::network::quic::ServerHandle;
 use crate::raft::NodeAddr;
 use crate::raft::TypeConfig;
 use crate::raft::log_storage::LogStorageHandles;
@@ -213,8 +213,7 @@ pub struct NodeHandle<S: StateMachine> {
     /// Shmem-mode only: proactive reconcile driver (owns the repurposed 2nd
     /// adapter clone). Rebuilds a reattached service to the node frontier so reads
     /// don't observe stale state. Stopped + joined on shutdown.
-    pub(crate) reconcile_driver:
-        Option<crate::raft::state_machine_shmem::ReconcileDriverHandle>,
+    pub(crate) reconcile_driver: Option<crate::raft::state_machine_shmem::ReconcileDriverHandle>,
 }
 
 impl<S: StateMachine> NodeHandle<S> {

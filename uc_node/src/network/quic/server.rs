@@ -12,8 +12,8 @@ use openraft_legacy::network_v1::ChunkedSnapshotReceiver as _;
 use quinn::{Endpoint, ServerConfig as QuicServerConfig};
 use tokio::task::JoinHandle;
 
-use super::frame::{Frame, MessageType};
-use super::{NetworkError, codec};
+use super::super::frame::{Frame, MessageType};
+use super::super::{NetworkError, codec};
 use crate::raft::TypeConfig;
 
 pub struct ServerHandle {

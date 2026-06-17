@@ -118,7 +118,10 @@ impl ShmemQueryLink {
             // restart storm would otherwise be silent, so make it observable.
             retries += 1;
             if retries.is_multiple_of(64) {
-                tracing::warn!(retries, "query seqlock retrying: service restarting repeatedly");
+                tracing::warn!(
+                    retries,
+                    "query seqlock retrying: service restarting repeatedly"
+                );
             }
         }
     }

@@ -124,7 +124,10 @@ fn spawn_workers(
 /// is success.
 fn assert_linearizable(entries: &[uc_lincheck::history::Entry], seed: u64, label: &str) {
     let ok = History::ok_count(entries);
-    eprintln!("[lin_partition::{label}] seed={seed} ops={} ok={ok}", entries.len());
+    eprintln!(
+        "[lin_partition::{label}] seed={seed} ops={} ok={ok}",
+        entries.len()
+    );
     match check_register(entries) {
         Verdict::Linearizable => {}
         Verdict::Inconclusive => {
@@ -157,7 +160,10 @@ async fn teardown(
     }
     let cluster = Arc::try_unwrap(cluster).ok().expect("sole owner");
     cluster.shutdown().await;
-    Arc::try_unwrap(history).ok().expect("sole owner").into_entries()
+    Arc::try_unwrap(history)
+        .ok()
+        .expect("sole owner")
+        .into_entries()
 }
 
 async fn run_minority(seed: u64) -> Result<(), String> {
@@ -194,7 +200,9 @@ async fn run_minority(seed: u64) -> Result<(), String> {
     }
 
     cluster.heal().await;
-    cluster.wait_for_stable_leader(Duration::from_secs(15)).await;
+    cluster
+        .wait_for_stable_leader(Duration::from_secs(15))
+        .await;
     tokio::time::sleep(Duration::from_millis(800)).await;
 
     let entries = teardown(cluster, &stop, handles, history).await;
@@ -216,9 +224,9 @@ async fn minority_partition_and_heal() {
     for attempt in 1..=3 {
         match run_minority(7).await {
             Ok(()) => return,
-            Err(e) => eprintln!(
-                "[lin_partition::minority] attempt {attempt}/3 transient: {e}; retrying"
-            ),
+            Err(e) => {
+                eprintln!("[lin_partition::minority] attempt {attempt}/3 transient: {e}; retrying")
+            }
         }
     }
     panic!("minority: failed after 3 transient attempts");
@@ -292,7 +300,9 @@ async fn run_leader_isolation(seed: u64) -> Result<(), String> {
     );
 
     cluster.heal().await;
-    cluster.wait_for_stable_leader(Duration::from_secs(15)).await;
+    cluster
+        .wait_for_stable_leader(Duration::from_secs(15))
+        .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let entries = teardown(cluster, &stop, handles, history).await;
@@ -342,7 +352,9 @@ async fn run_quorum_loss(seed: u64) -> Result<(), String> {
     );
 
     cluster.heal().await;
-    cluster.wait_for_stable_leader(Duration::from_secs(15)).await;
+    cluster
+        .wait_for_stable_leader(Duration::from_secs(15))
+        .await;
     let recovered_from = History::ok_count(&history.snapshot());
     tokio::time::sleep(Duration::from_secs(2)).await;
     let recovered_to = History::ok_count(&history.snapshot());

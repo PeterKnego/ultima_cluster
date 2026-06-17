@@ -33,7 +33,7 @@ pub struct QuicRaftNetworkFactory {
     #[cfg(feature = "fault-injection")]
     source: NodeId,
     #[cfg(feature = "fault-injection")]
-    fault_table: Option<Arc<super::fault::FaultTable>>,
+    fault_table: Option<Arc<super::super::fault::FaultTable>>,
 }
 
 impl QuicRaftNetworkFactory {
@@ -58,9 +58,9 @@ impl QuicRaftNetworkFactory {
     pub fn new_with_default_endpoint(
         client_cfg: Arc<ClientConfig>,
         app_id: String,
-    ) -> Result<Self, super::NetworkError> {
+    ) -> Result<Self, super::super::NetworkError> {
         let endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
-            .map_err(|e| super::NetworkError::Connect(format!("client endpoint: {e}")))?;
+            .map_err(|e| super::super::NetworkError::Connect(format!("client endpoint: {e}")))?;
         Ok(Self::new(endpoint, client_cfg, app_id))
     }
 
@@ -68,7 +68,7 @@ impl QuicRaftNetworkFactory {
     pub fn set_fault_injection(
         &mut self,
         source: NodeId,
-        fault_table: Option<Arc<super::fault::FaultTable>>,
+        fault_table: Option<Arc<super::super::fault::FaultTable>>,
     ) {
         self.source = source;
         self.fault_table = fault_table;

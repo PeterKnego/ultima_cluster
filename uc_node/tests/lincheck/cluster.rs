@@ -123,7 +123,9 @@ async fn spawn_service(instance_dir: &std::path::Path, data_dir: &std::path::Pat
 /// fire-and-forget; the awaited drop of the temp dirs (by the caller) plus the
 /// graceful `shutdown_handles` on collected handles release the rest.
 fn abort_tasks(
-    node_tasks: impl IntoIterator<Item = tokio::task::JoinHandle<Result<NodeHandle<RegisterSm>, uc_node::ClusterError>>>,
+    node_tasks: impl IntoIterator<
+        Item = tokio::task::JoinHandle<Result<NodeHandle<RegisterSm>, uc_node::ClusterError>>,
+    >,
     svc_tasks: impl IntoIterator<Item = tokio::task::JoinHandle<Service>>,
 ) {
     for t in node_tasks {
@@ -760,8 +762,7 @@ impl LinCluster {
     #[cfg(feature = "fault-injection")]
     #[allow(dead_code)] // called by partition scenario tests / capstone (later tasks)
     pub async fn partition_quorum_loss(&self) {
-        let groups: Vec<Vec<NodeId>> =
-            self.node_ids().await.into_iter().map(|n| vec![n]).collect();
+        let groups: Vec<Vec<NodeId>> = self.node_ids().await.into_iter().map(|n| vec![n]).collect();
         self.fault_table.set_partition(&groups);
     }
 

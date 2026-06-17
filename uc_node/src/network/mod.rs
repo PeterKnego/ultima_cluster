@@ -1,22 +1,17 @@
-//! QUIC inter-node transport for ultima_cluster.
+//! Inter-node transport for ultima_cluster.
 //!
-//! Replaces M1's `NoopNetwork` placeholder. One persistent QUIC connection
-//! per peer-pair, multiple bidirectional streams per connection (one per
-//! RPC class). TLS self-signed by default.
+//! The default transport is QUIC (`quic/`). One persistent connection per
+//! peer-pair, multiple bidirectional streams per connection (one per RPC
+//! class). TLS self-signed by default.
 
-pub mod client;
+pub mod codec;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
-pub mod codec;
-pub mod factory;
 pub mod frame;
-pub mod instance;
-pub mod server;
-pub mod tls;
+pub mod quic;
 
-// Re-exports added by Task 9:
-pub use factory::QuicRaftNetworkFactory;
-pub use instance::QuicRaftNetwork;
+// Top-level re-exports so existing call-sites keep working unchanged.
+pub use quic::{QuicRaftNetwork, QuicRaftNetworkFactory};
 
 use thiserror::Error;
 
