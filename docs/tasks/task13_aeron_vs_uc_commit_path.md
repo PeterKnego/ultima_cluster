@@ -649,3 +649,60 @@ So the next throughput lever is **not** the RaftCore loop (spare capacity) and *
 apply (fixed) — it's the **leader fsync tail** (ours) and the **replication round-trip**
 (openraft/network). The instrument (`runtime-stats` dump) is reusable from the
 `profile/raftcore-stats` branch for any future commit-path profiling.
+
+## 16. Follow-up (2026-06-17) — journal fdatasync (`sync_data`): NULL end-to-end result
+
+Acted on §15's "leader fsync tail" lever: changed the journal's hot per-commit fsync
+from `sync_all` (full fsync) to **`sync_data` (fdatasync)** in
+`ultima_journal/src/journal/writer.rs::fsync_active_segment` (full `sync_all` retained
+on segment-create, where the new directory entry must be durable). fdatasync flushes
+data + the `i_size` growth and skips only inode timestamps — the standard WAL commit
+primitive; `Durability::Consistent`'s power-loss guarantee is preserved. One line, no
+dep, no on-disk-format change. Shipped to `ultima_db` main (`3181393`), guarded by a new
+`consistent_durability_survives_reopen` test + the full journal suite (99) + the cluster
+lincheck capstone (3/3) + the hard-crash `kill -9` gate — all green. (Spec/plan:
+`docs/superpowers/specs|plans/2026-06-17-journal-fdatasync*.md`.)
+
+**Local microbench (real ext4, interleaved A/B ×10):** `group_commit_throughput`
+before (sync_all) median 81077/s vs after (sync_data) 84064/s — median +3.7% / mean
+−1.1%, fully overlapping (CV ~11–16%). **Inconclusive** — a throughput-median over
+256-entry bursts amortizes the per-fsync metadata cost and can't isolate an fsync-*tail*
+effect; dev-host disks (tmpfs/noisy ext4) don't expose it either.
+
+**Same-fleet cloud A/B (fresh 3× ccx33 Hetzner, interleaved B,A,B,A; UC = `main`,
+sole variable = `writer.rs`):**
+
+| metric | A `sync_all` (median) | B `sync_data` (median) | B vs A |
+|---|---:|---:|---|
+| `uc_throughput_msgs` | 9266.9 | 9206.6 | **−0.7%** |
+| `p99_at_knee_ms` (end-to-end, knee=5000) | 64.18 | 67.22 | **+4.7% (worse)** |
+
+Per-run: A {9230.7, 9303.1} / {63.24, 65.11 ms}; B {9065.5, 9347.7} / {67.63, 66.81 ms}.
+
+**Finding: no measurable end-to-end effect.** Both deltas are tiny and within (throughput)
+or near (p99) run-to-run noise — the p99 even slightly favors `sync_all`. This is exactly
+what §15 predicts: `submitted→persisted` is a P99 **tail** (P50 ~1 ms), while the
+*end-to-end* commit latency is gated by `api_batch_linger=5ms` (proposed→received ~6.5 ms)
+and the replication round-trip (~2.7 ms) — **not** the fsync stage's steady state. And per
+[[unified-bench-harness-done]], fsync is only ~4% of the commit path (submit→node
+poll-sleep ~81%). So even a large reduction in the journal-fsync metadata cost is invisible
+at the throughput/knee-p99 level.
+
+**Scope caveat (honest):** this measured the *end-to-end* sweep, not the `submitted→persisted`
+P50/P99 decomposition the plan's Task 5 named. Capturing that on a fleet needs the
+`profile/raftcore-stats` branch **plus** node0-stderr `RAFT_RUNTIME_STATS` log-scraping
+during the sweep (the standard `run` role does not collect node logs) — extra plumbing +
+a re-provision. Not run, because the conclusion wouldn't change: a tail that doesn't gate
+steady-state throughput won't move the user-visible numbers regardless of what fdatasync
+does to it internally.
+
+**Decisions:**
+- **Keep the change merged.** It is correct, zero-risk, zero-cost, and the right WAL
+  primitive — a hygiene/correctness improvement even with no measurable perf win.
+- **§5 segment-preallocation follow-up: NOT pursued (YAGNI).** It targets the same
+  fsync-tail stage that this A/B shows doesn't gate end-to-end performance; it would add
+  format/recovery surface for no user-visible gain.
+- **Real next levers** (per §15 + the ~81% poll-sleep finding): the `api_batch_linger`
+  latency/throughput trade, the replication round-trip (openraft/network), and the
+  submit→node IPC poll-sleep (already partly addressed by event-driven ring wakeups,
+  task11). Journal fsync is not where the commit-path budget is spent.
