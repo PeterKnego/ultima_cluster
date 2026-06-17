@@ -11,7 +11,7 @@
 //!   arg         u64  (le)
 //!   payload_len u32  (le)
 //!   payload     [u8; payload_len]
-//!   crc32       u32  (le, over header[..24] + payload)
+//!   crc32       u32  (le, over the full 28-byte header + payload)
 //! ```
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -118,7 +118,6 @@ impl Segment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
 
     #[test]
     fn data_round_trip() {
