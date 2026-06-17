@@ -6,6 +6,9 @@
 //! in-memory window, receiver-window flow control, MTU fragmentation. The
 //! existing `frame.rs` Frame/MessageType is the RPC payload above this layer.
 
+pub mod server_stub;
+pub use server_stub::UdpServerHandle;
+
 #[derive(Debug, Clone)]
 pub struct UdpTuning {
     /// Max UDP datagram size (header + payload). Aeron default 1408.

@@ -6,7 +6,9 @@ pub mod factory;
 pub mod instance;
 pub mod server;
 pub mod tls;
+pub mod transport_impl;
 
 pub use factory::QuicRaftNetworkFactory;
 pub use instance::QuicRaftNetwork;
 pub use server::{ServerHandle, spawn_server};
+pub use transport_impl::QuicTransport;

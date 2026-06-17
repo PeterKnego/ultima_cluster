@@ -24,7 +24,7 @@ use crate::ipc::metrics_publisher::MetricsPublisherHandle;
 use crate::ipc::query_link::ShmemQueryLink;
 use crate::ipc::service_watcher::ServiceWatcherHandle;
 use crate::ipc::session_gc::SessionGcHandle;
-use crate::network::quic::ServerHandle;
+use crate::network::TransportServer;
 use crate::raft::NodeAddr;
 use crate::raft::TypeConfig;
 use crate::raft::log_storage::LogStorageHandles;
@@ -179,9 +179,9 @@ pub struct NodeHandle<S: StateMachine> {
     /// another clone internally. Used by [`Self::query_snapshot`] in
     /// embedded mode; in shmem mode the closure path is unavailable.
     pub(crate) sm: SmAdapter<S>,
-    /// QUIC server handle. Closes the inbound endpoint and awaits the accept
-    /// task during [`shutdown`].
-    pub(crate) server: ServerHandle,
+    /// Inter-node transport server handle. Closes the inbound endpoint and
+    /// awaits the accept task during [`shutdown`].
+    pub(crate) server: TransportServer,
     /// Shmem-mode only: keeps the cnc.dat mapping + `instance.lock` alive.
     pub(crate) _instance: Option<Instance>,
     /// Shmem-mode only: node-side heartbeat ticker handle. Stop+joined on

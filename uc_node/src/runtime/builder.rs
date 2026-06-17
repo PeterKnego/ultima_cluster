@@ -19,9 +19,6 @@ use crate::ipc::query_link::ShmemQueryLink;
 use crate::ipc::service_link::ServiceLink;
 use crate::ipc::service_watcher::{DEFAULT_LIVENESS_TIMEOUT, spawn_service_watcher};
 use crate::ipc::{HandshakeError, Instance};
-use crate::network::QuicRaftNetworkFactory;
-use crate::network::quic::spawn_server;
-use crate::network::quic::tls;
 use crate::raft::log_storage::{JournalLogStorage, LogStorageHandles};
 use crate::raft::state_machine::AdaptedStateMachine;
 use crate::raft::state_machine_shmem::ShmemAdaptedStateMachine;
@@ -373,35 +370,46 @@ where
         .map_err(|e| ClusterError::Config(format!("raft config: {e}")))?;
     let raft_config = Arc::new(validated);
 
-    // TLS infrastructure: load-or-create the self-signed cert and build
-    // rustls configs.
-    let (cert_der, key_der) = tls::load_or_init(&config.data_dir, &config.app_id)?;
-    let server_tls_cfg = tls::build_server_config(cert_der, key_der)?;
-    let client_tls_cfg = tls::build_client_config()?;
+    use crate::network::transport::{ClusterTransport, TransportCtx, TransportServer};
 
-    // Shared client QUIC endpoint (one UDP socket for all outbound peer
-    // connections). Bind to 0.0.0.0:0 — kernel picks an ephemeral port.
-    let client_endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())?;
+    let ctx = TransportCtx {
+        node_id: config.node_id,
+        listen_addr: config.raft_listen_addr,
+        app_id: config.app_id.clone(),
+        data_dir: config.data_dir.clone(),
+        #[cfg(feature = "fault-injection")]
+        fault_table,
+    };
 
-    #[allow(unused_mut)]
-    let mut network =
-        QuicRaftNetworkFactory::new(client_endpoint, client_tls_cfg, config.app_id.clone());
-    #[cfg(feature = "fault-injection")]
-    network.set_fault_injection(config.node_id, fault_table);
-
-    let raft = Raft::new(
-        config.node_id,
-        raft_config,
-        network,
-        log_storage,
-        sm_adapter,
-    )
-    .await
-    .map_err(|e| ClusterError::Raft(format!("Raft::new: {e}")))?;
-
-    // Spawn the QUIC server. Binds `raft_listen_addr` and starts accepting
-    // peer connections that dispatch into `raft`.
-    let server = spawn_server(config.raft_listen_addr, server_tls_cfg, raft.clone())?;
+    // Build the factory + raft + server for the selected transport. Both arms
+    // produce the same `Raft<TypeConfig, A>` (network type is erased into
+    // RaftCore) so bootstrap below is transport-agnostic.
+    let (raft, server) = match &config.transport {
+        crate::config::Transport::Quic => {
+            let t = crate::network::quic::QuicTransport;
+            let network = t
+                .build_factory(&ctx)
+                .map_err(|e| ClusterError::Config(format!("transport factory: {e}")))?;
+            let raft = Raft::new(
+                config.node_id,
+                raft_config,
+                network,
+                log_storage,
+                sm_adapter,
+            )
+            .await
+            .map_err(|e| ClusterError::Raft(format!("Raft::new: {e}")))?;
+            let server = t
+                .spawn_server(&ctx, raft.clone())
+                .map_err(|e| ClusterError::Config(format!("transport server: {e}")))?;
+            (raft, TransportServer::Quic(server))
+        }
+        // UDP transport lands in Phase C (Task 13 restores the real body, which
+        // is exactly the QUIC arm with `UdpTransport::new(tuning.clone())`).
+        crate::config::Transport::Udp(_tuning) => {
+            unreachable!("UDP transport lands in Phase C")
+        }
+    };
 
     // Apply bootstrap.
     match &config.bootstrap {
