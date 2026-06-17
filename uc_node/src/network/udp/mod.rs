@@ -8,6 +8,7 @@
 
 pub mod server_stub;
 pub use server_stub::UdpServerHandle;
+pub mod wire;
 
 #[derive(Debug, Clone)]
 pub struct UdpTuning {
