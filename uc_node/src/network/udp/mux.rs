@@ -114,6 +114,7 @@ impl UdpMux {
         tokio::spawn(async move {
             let mut ticker_int =
                 tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+            ticker_int.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticker_int.tick().await; // first tick fires immediately; skip it
             loop {
                 ticker_int.tick().await;
