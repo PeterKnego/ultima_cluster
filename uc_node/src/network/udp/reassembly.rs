@@ -7,6 +7,7 @@ use bytes::{Bytes, BytesMut};
 
 use super::wire::{FLAG_BEGIN, FLAG_END};
 
+#[derive(Debug)]
 pub struct Reassembler {
     /// Buffered segments not yet consumed, keyed by seq.
     pending: BTreeMap<u64, (u8, Bytes)>,
@@ -49,7 +50,12 @@ impl Reassembler {
             // a BEGIN segment and run contiguously to an END segment.
             let (flags0, _) = self.pending.get(&self.next).cloned().unwrap();
             if flags0 & FLAG_BEGIN == 0 {
-                // Shouldn't happen for a well-formed stream; drop to avoid stall.
+                // Malformed stream: a non-BEGIN segment sits at the consume
+                // cursor (our fragmenter always starts a message with BEGIN, so
+                // this is unreachable in practice). Best-effort: drop it and
+                // advance to avoid a permanent stall. NOTE: this advances
+                // `highest_contiguous()` past a slot that was never delivered —
+                // acceptable only because it cannot occur for a well-formed sender.
                 self.pending.remove(&self.next);
                 self.next += 1;
                 self.consumed_any = true;
@@ -163,5 +169,27 @@ mod tests {
         let _ = r.accept(0, FLAG_BEGIN | FLAG_END, b("a"));
         let out = r.accept(0, FLAG_BEGIN | FLAG_END, b("a"));
         assert!(out.is_empty()); // already delivered, no double-deliver
+    }
+
+    #[test]
+    fn two_complete_messages_delivered_in_one_drain() {
+        let mut r = Reassembler::new();
+        // Buffer seq 1 (a complete single-seg msg) first — gap at 0, nothing drains yet.
+        assert!(r.accept(1, FLAG_BEGIN | FLAG_END, b("second")).is_empty());
+        // seq 0 arrives → one drain call delivers BOTH messages, in order.
+        let out = r.accept(0, FLAG_BEGIN | FLAG_END, b("first"));
+        assert_eq!(out.len(), 2);
+        assert_eq!(&out[0][..], b"first");
+        assert_eq!(&out[1][..], b"second");
+    }
+
+    #[test]
+    fn gaps_reports_multiple_disjoint_holes() {
+        let mut r = Reassembler::new();
+        // Receive seqs 1, 3, 5 (single-seg msgs); 0, 2, 4 are missing.
+        r.accept(1, FLAG_BEGIN | FLAG_END, b("a"));
+        r.accept(3, FLAG_BEGIN | FLAG_END, b("b"));
+        r.accept(5, FLAG_BEGIN | FLAG_END, b("c"));
+        assert_eq!(r.gaps(), vec![(0, 1), (2, 1), (4, 1)]);
     }
 }
