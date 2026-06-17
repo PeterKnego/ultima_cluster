@@ -9,6 +9,7 @@
 pub mod server_stub;
 pub use server_stub::UdpServerHandle;
 pub mod fragment;
+pub mod mux;
 pub mod reassembly;
 pub mod send_window;
 pub mod session;

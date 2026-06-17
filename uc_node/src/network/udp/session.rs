@@ -137,6 +137,12 @@ impl UdpSession {
     pub async fn recv_message(&self) -> Option<Bytes> {
         self.inbound_rx.lock().await.recv().await
     }
+
+    /// Non-blocking drain of one completed inbound message, if any is ready.
+    /// Used by the mux's receive loop after `process` to route messages.
+    pub fn try_recv_message(&self) -> Option<bytes::Bytes> {
+        self.inbound_rx.try_lock().ok()?.try_recv().ok()
+    }
 }
 
 #[cfg(test)]
