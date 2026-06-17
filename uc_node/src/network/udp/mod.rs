@@ -9,8 +9,10 @@
 pub mod factory;
 pub use factory::UdpRaftNetworkFactory;
 pub mod instance;
-pub mod server_stub;
-pub use server_stub::UdpServerHandle;
+pub mod server;
+pub use server::UdpServerHandle;
+pub mod transport_impl;
+pub use transport_impl::UdpTransport;
 pub mod fragment;
 pub mod mux;
 pub mod reassembly;

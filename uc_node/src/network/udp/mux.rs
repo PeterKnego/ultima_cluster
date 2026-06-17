@@ -50,6 +50,8 @@ pub struct UdpMux {
     pending: Mutex<HashMap<u64, oneshot::Sender<Frame>>>,
     /// Server-side request handler. `parking_lot` so set/read are sync.
     handler: parking_lot::Mutex<Option<Handler>>,
+    /// Recv-loop task handle, so `shutdown` can abort it and free the socket.
+    recv_task: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl UdpMux {
@@ -61,13 +63,25 @@ impl UdpMux {
             sessions: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             handler: parking_lot::Mutex::new(None),
+            recv_task: parking_lot::Mutex::new(None),
         });
-        mux.clone().spawn_recv_loop();
+        let recv_task = mux.clone().spawn_recv_loop();
+        *mux.recv_task.lock() = Some(recv_task);
         Ok(mux)
     }
 
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.sock.local_addr()
+    }
+
+    /// Abort the recv loop so a stopped node stops processing inbound segments.
+    /// (Per-session ticker tasks and the socket `Arc` persist until process
+    /// exit — an accepted v1 leak for a fixed peer set; aborting the recv loop
+    /// is what matters to stop processing.)
+    pub fn shutdown(&self) {
+        if let Some(h) = self.recv_task.lock().take() {
+            h.abort();
+        }
     }
 
     /// Register the server-side inbound-request handler. Sync.
@@ -160,7 +174,7 @@ impl UdpMux {
         }
     }
 
-    fn spawn_recv_loop(self: Arc<Self>) {
+    fn spawn_recv_loop(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
@@ -180,7 +194,7 @@ impl UdpMux {
                     self.clone().route_inbound_message(sess.clone(), msg);
                 }
             }
-        });
+        })
     }
 
     fn route_inbound_message(self: Arc<Self>, sess: Arc<UdpSession>, msg: Bytes) {

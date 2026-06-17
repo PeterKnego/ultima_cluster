@@ -35,13 +35,19 @@ pub struct TransportCtx {
 }
 
 /// A pluggable inter-node transport.
+///
+/// The `async fn` methods are intentionally not `+ Send`-desugared: this trait
+/// is internal to `uc_node` (only `QuicTransport`/`UdpTransport` impl it and
+/// only the builder calls it on the runtime thread), so the auto-trait
+/// flexibility the lint warns about is not needed here.
+#[allow(async_fn_in_trait)]
 pub trait ClusterTransport {
     type Factory: RaftNetworkFactory<TypeConfig>;
     type Server;
 
-    fn build_factory(&self, ctx: &TransportCtx) -> Result<Self::Factory, NetworkError>;
+    async fn build_factory(&self, ctx: &TransportCtx) -> Result<Self::Factory, NetworkError>;
 
-    fn spawn_server<SM>(
+    async fn spawn_server<SM>(
         &self,
         ctx: &TransportCtx,
         raft: Raft<TypeConfig, SM>,

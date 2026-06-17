@@ -389,6 +389,7 @@ where
             let t = crate::network::quic::QuicTransport;
             let network = t
                 .build_factory(&ctx)
+                .await
                 .map_err(|e| ClusterError::Config(format!("transport factory: {e}")))?;
             let raft = Raft::new(
                 config.node_id,
@@ -401,13 +402,30 @@ where
             .map_err(|e| ClusterError::Raft(format!("Raft::new: {e}")))?;
             let server = t
                 .spawn_server(&ctx, raft.clone())
+                .await
                 .map_err(|e| ClusterError::Config(format!("transport server: {e}")))?;
             (raft, TransportServer::Quic(server))
         }
-        // UDP transport lands in Phase C (Task 13 restores the real body, which
-        // is exactly the QUIC arm with `UdpTransport::new(tuning.clone())`).
-        crate::config::Transport::Udp(_tuning) => {
-            unreachable!("UDP transport lands in Phase C")
+        crate::config::Transport::Udp(tuning) => {
+            let t = crate::network::udp::UdpTransport::new(tuning.clone());
+            let network = t
+                .build_factory(&ctx)
+                .await
+                .map_err(|e| ClusterError::Config(format!("transport factory: {e}")))?;
+            let raft = Raft::new(
+                config.node_id,
+                raft_config,
+                network,
+                log_storage,
+                sm_adapter,
+            )
+            .await
+            .map_err(|e| ClusterError::Raft(format!("Raft::new: {e}")))?;
+            let server = t
+                .spawn_server(&ctx, raft.clone())
+                .await
+                .map_err(|e| ClusterError::Config(format!("transport server: {e}")))?;
+            (raft, TransportServer::Udp(server))
         }
     };
 

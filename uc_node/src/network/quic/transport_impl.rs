@@ -13,7 +13,7 @@ impl ClusterTransport for QuicTransport {
     type Factory = QuicRaftNetworkFactory;
     type Server = ServerHandle;
 
-    fn build_factory(&self, ctx: &TransportCtx) -> Result<Self::Factory, NetworkError> {
+    async fn build_factory(&self, ctx: &TransportCtx) -> Result<Self::Factory, NetworkError> {
         let client_tls_cfg = tls::build_client_config()?;
         let endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap())
             .map_err(|e| NetworkError::Connect(format!("client endpoint: {e}")))?;
@@ -24,7 +24,7 @@ impl ClusterTransport for QuicTransport {
         Ok(f)
     }
 
-    fn spawn_server<SM>(
+    async fn spawn_server<SM>(
         &self,
         ctx: &TransportCtx,
         raft: Raft<TypeConfig, SM>,
