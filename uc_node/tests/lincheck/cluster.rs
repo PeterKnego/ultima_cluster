@@ -770,6 +770,24 @@ impl LinCluster {
         self.fault_table.set_partition(&groups);
     }
 
+    /// Set the inbound-segment drop probability on EVERY ordered link of the
+    /// cluster (each `src → dst` pair, `src != dst`). Exercises the UDP channel's
+    /// NAK/retransmit under sustained loss. NOTE: only the UDP transport consults
+    /// `set_loss` (loss is injected at the UDP mux recv loop); under QUIC this is a
+    /// harmless no-op (QUIC never reads the loss table).
+    #[cfg(feature = "fault-injection")]
+    #[allow(dead_code)] // called by partition scenario tests / capstone (later tasks)
+    pub async fn set_loss_all(&self, prob: f64) {
+        let ids = self.node_ids().await;
+        for &src in &ids {
+            for &dst in &ids {
+                if src != dst {
+                    self.fault_table.set_loss(src, dst, prob);
+                }
+            }
+        }
+    }
+
     /// Heal all partitions.
     #[cfg(feature = "fault-injection")]
     #[allow(dead_code)] // called by partition scenario tests / capstone (later tasks)

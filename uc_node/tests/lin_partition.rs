@@ -388,3 +388,68 @@ async fn total_quorum_loss_fails_clean_then_recovers() {
     }
     panic!("quorum-loss: failed after 3 transient attempts");
 }
+
+/// Sustained packet loss on every link (no partition), driving the UDP channel's
+/// NAK + ticker re-NAK retransmit path. The cluster must stay linearizable AND
+/// keep making progress (retransmit recovers ordinary loss; the cluster is not
+/// wedged).
+///
+/// MEANINGFUL ONLY OVER UDP: loss is injected at the UDP mux recv loop, so
+/// `set_loss_all` only bites under `UC_TEST_TRANSPORT=udp`. On the default QUIC
+/// run `set_loss_all` is a harmless no-op (QUIC never consults the loss table),
+/// so this becomes a plain linearizable+progress run on a clean network — still a
+/// valid pass. The scenario is intentionally un-gated so both transports run it.
+async fn run_lossy_links(seed: u64) -> Result<(), String> {
+    let cluster = Arc::new(LinCluster::start_3().await);
+    let history = Arc::new(History::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let last_seen = Arc::new(AtomicU64::new(0));
+    let handles = spawn_workers(&cluster, &history, &stop, &last_seen, seed);
+
+    // Warm up briefly on a clean network so a leader is firmly established.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let before = History::ok_count(&history.snapshot());
+
+    // 10% inbound segment drop on every ordered link. Under UDP this forces NAK
+    // retransmit on roughly 1-in-10 segments; under QUIC it is a no-op.
+    cluster.set_loss_all(0.1).await;
+
+    // Run long enough that retransmit clearly engages but the test stays bounded.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let after = History::ok_count(&history.snapshot());
+    // TRANSIENT: the cluster must keep committing under loss (NAK retransmit is
+    // working, not wedged). Defer the verdict so teardown still runs.
+    let progressed = after > before;
+
+    cluster.heal().await;
+    cluster
+        .wait_for_stable_leader(Duration::from_secs(15))
+        .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let entries = teardown(cluster, &stop, handles, history).await;
+
+    if !progressed {
+        return Err(format!(
+            "cluster did not progress under 10% link loss ({before} -> {after}) — NAK retransmit may be wedged"
+        ));
+    }
+    if History::ok_count(&entries) < 30 {
+        return Err("too few Ok ops; run is vacuous".into());
+    }
+    assert_linearizable(&entries, seed, "lossy");
+    Ok(())
+}
+
+#[tokio::test]
+async fn linearizable_under_lossy_links() {
+    for attempt in 1..=3 {
+        match run_lossy_links(31_337).await {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("[lin_partition::lossy] attempt {attempt}/3 transient: {e}; retrying")
+            }
+        }
+    }
+    panic!("lossy: failed after 3 transient attempts");
+}
