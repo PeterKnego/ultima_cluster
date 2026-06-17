@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use bytes::Bytes;
 
+#[derive(Debug)]
 pub struct SendWindow {
     capacity_bytes: u64,
     in_flight: u64,
@@ -32,12 +33,19 @@ impl SendWindow {
 
     pub fn push(&mut self, seq: u64, encoded: Bytes) {
         self.in_flight += encoded.len() as u64;
-        self.retained.insert(seq, encoded);
+        // If this seq was already retained (e.g. an accidental re-push), the
+        // BTreeMap overwrites it — subtract the replaced entry's bytes so
+        // in_flight stays equal to the sum of currently-retained datagrams.
+        if let Some(old) = self.retained.insert(seq, encoded) {
+            self.in_flight -= old.len() as u64;
+        }
     }
 
     pub fn on_ack(&mut self, highest_contiguous: u64) {
         // Drop all seq <= highest_contiguous.
-        let keep = self.retained.split_off(&(highest_contiguous + 1));
+        let keep = self
+            .retained
+            .split_off(&highest_contiguous.saturating_add(1));
         for (_, v) in std::mem::replace(&mut self.retained, keep) {
             self.in_flight -= v.len() as u64;
         }
@@ -100,5 +108,13 @@ mod tests {
         w.on_ack(0);
         let r = w.resend(0, 2); // 0 is gone, 1 remains
         assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_push_does_not_leak_in_flight() {
+        let mut w = SendWindow::new(1000);
+        w.push(0, d(40));
+        w.push(0, d(40)); // re-push same seq → in_flight must stay 40, not 80
+        assert_eq!(w.in_flight_bytes(), 40);
     }
 }
