@@ -19,7 +19,9 @@ use crate::network::{NetworkError, codec};
 use crate::raft::{NodeId, TypeConfig};
 
 pub struct UdpRaftNetwork {
-    #[allow(dead_code)]
+    // Only read inside the fault-injection is_blocked check; genuinely unused
+    // under default features.
+    #[cfg_attr(not(feature = "fault-injection"), allow(dead_code))]
     target: NodeId,
     peer_addr: SocketAddr,
     mux: Arc<UdpMux>,
@@ -32,7 +34,6 @@ pub struct UdpRaftNetwork {
 }
 
 impl UdpRaftNetwork {
-    #[allow(dead_code)]
     pub(crate) fn new(
         target: NodeId,
         peer_addr: SocketAddr,
@@ -54,7 +55,6 @@ impl UdpRaftNetwork {
     }
 
     #[cfg(feature = "fault-injection")]
-    #[allow(dead_code)]
     pub(crate) fn with_fault(
         mut self,
         source: NodeId,
