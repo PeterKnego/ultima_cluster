@@ -11,6 +11,7 @@ pub use server_stub::UdpServerHandle;
 pub mod fragment;
 pub mod reassembly;
 pub mod send_window;
+pub mod session;
 pub mod wire;
 
 #[derive(Debug, Clone)]
