@@ -100,6 +100,27 @@ impl UdpMux {
         });
         let sess = UdpSession::new(sid, tx, self.tuning.clone());
         s.insert(sid, (sess.clone(), peer));
+
+        // Spawn a detached periodic ticker for this session. The task holds an
+        // Arc<UdpSession> clone and lives until the Arc's refcount drops to zero.
+        // v1 has no session eviction; the fixed small peer set bounds the number
+        // of live ticker tasks — a documented tradeoff.
+        let ticker = sess.clone();
+        let interval_ms = self
+            .tuning
+            .heartbeat_ms
+            .min(self.tuning.sm_interval_ms)
+            .max(1);
+        tokio::spawn(async move {
+            let mut ticker_int =
+                tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+            ticker_int.tick().await; // first tick fires immediately; skip it
+            loop {
+                ticker_int.tick().await;
+                ticker.tick().await;
+            }
+        });
+
         sess
     }
 

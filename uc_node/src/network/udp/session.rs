@@ -143,6 +143,43 @@ impl UdpSession {
     pub fn try_recv_message(&self) -> Option<bytes::Bytes> {
         self.inbound_rx.try_lock().ok()?.try_recv().ok()
     }
+
+    /// Periodic maintenance: re-NAK any still-open receive gap (recovers
+    /// tail-loss where no further DATA would otherwise arrive to trigger a
+    /// reactive NAK), re-advertise the flow-control window (also a
+    /// receiver->sender keepalive), and send a heartbeat (sender->receiver
+    /// keepalive). Driven by a per-session task spawned in the mux.
+    pub async fn tick(&self) {
+        let (gaps, hc, next_seq) = {
+            let st = self.state.lock().await;
+            (
+                st.reasm.gaps(),
+                st.reasm.highest_contiguous(),
+                st.next_send_seq,
+            )
+        };
+        for (start, count) in gaps {
+            self.tx
+                .send_to(self.mk(SegType::Nak, 0, start, count, Bytes::new()))
+                .await;
+        }
+        if let Some(hc) = hc {
+            self.tx
+                .send_to(self.mk(
+                    SegType::Sm,
+                    0,
+                    hc,
+                    self.tuning.flow_window_bytes,
+                    Bytes::new(),
+                ))
+                .await;
+        }
+        // Heartbeat carries our next send seq so an otherwise-idle peer keeps
+        // the session alive and learns our position.
+        self.tx
+            .send_to(self.mk(SegType::Heartbeat, 0, next_seq, 0, Bytes::new()))
+            .await;
+    }
 }
 
 #[cfg(test)]
@@ -211,6 +248,37 @@ mod tests {
         }
         let msg = b.recv_message().await.unwrap();
         assert_eq!(&msg[..], b"hello world");
+    }
+
+    #[tokio::test]
+    async fn tick_re_naks_open_gap() {
+        use crate::network::udp::wire::{FLAG_END, WIRE_VERSION};
+        let inbox = Arc::new(Mutex::new(Vec::<Bytes>::new()));
+        let tx = LinkTx {
+            peer_inbox: inbox.clone(),
+            drop_seqs: Arc::new(Mutex::new(vec![])),
+        };
+        let s = UdpSession::new(7, Arc::new(tx), UdpTuning::default());
+        // Deliver seq 1 as the END fragment of a 2-fragment message → a gap at seq 0.
+        s.process(Segment {
+            version: WIRE_VERSION,
+            seg_type: SegType::Data,
+            flags: FLAG_END,
+            session_id: 7,
+            seq: 1,
+            arg: 0,
+            payload: Bytes::from_static(b"tail"),
+        })
+        .await;
+        inbox.lock().await.clear(); // discard the reactive NAK/SM process() already emitted
+        // tick() must re-NAK the still-open gap (0, 1).
+        s.tick().await;
+        let sent = inbox.lock().await;
+        let re_nak = sent.iter().any(|dg| {
+            let seg = Segment::decode(dg).unwrap();
+            seg.seg_type == SegType::Nak && seg.seq == 0 && seg.arg == 1
+        });
+        assert!(re_nak, "tick should re-NAK the open gap (0,1)");
     }
 
     #[tokio::test]
