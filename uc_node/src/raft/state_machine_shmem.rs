@@ -338,6 +338,11 @@ pub(crate) struct ShmemInner<S: StateMachine> {
     pub(crate) journal: Arc<ultima_journal::Journal>,
     /// Purge boundary, for the below-purge -> NeedsSnapshot (Phase 2) decision.
     pub(crate) last_purged: Arc<StableValue<RaftLogId>>,
+    /// Max apply entries in-flight before awaiting responses. Set from
+    /// `NodeConfig::service_rings::apply_pipeline_depth`; readable inside `apply()`.
+    /// Used by the pipelined-apply implementation (later task).
+    #[allow(dead_code)]
+    pub(crate) apply_pipeline_depth: usize,
 }
 
 impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
@@ -358,6 +363,7 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
         snapshot_producer: SpscProducer,
         snapshot_resp_consumer: SpscConsumer,
         snapshot_region_path: std::path::PathBuf,
+        apply_pipeline_depth: usize,
     ) -> Result<Self, crate::ClusterError> {
         // Recover the framework-durable values.
         let loaded_last_applied = handles.last_applied.load().ok().flatten();
@@ -454,6 +460,7 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
                 last_seen_epoch,
                 journal,
                 last_purged,
+                apply_pipeline_depth,
             })),
             shutdown: Arc::new(AtomicBool::new(false)),
             reconciled_epoch: Arc::new(AtomicU64::new(last_seen_epoch)),

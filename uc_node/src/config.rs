@@ -35,6 +35,10 @@ pub struct ServiceRingConfig {
     pub output_cap_bytes: u64,
     /// Max single message size on the output rings.
     pub output_max_msg: u32,
+    /// Max apply entries published before awaiting responses (apply pipeline depth).
+    /// Bounds in-flight apply frames so the apply/apply_resp rings never overflow.
+    /// Must be <= the apply ring's frame capacity. Default 256.
+    pub apply_pipeline_depth: usize,
 }
 
 impl Default for ServiceRingConfig {
@@ -42,6 +46,7 @@ impl Default for ServiceRingConfig {
         Self {
             output_cap_bytes: 16 * 1024 * 1024,
             output_max_msg: 4 * 1024 * 1024,
+            apply_pipeline_depth: 256,
         }
     }
 }

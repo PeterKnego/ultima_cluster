@@ -94,6 +94,7 @@ async fn apply_round_trips_through_shmem_rings() {
         link.snapshot_producer,
         link.snapshot_resp_consumer,
         snapshot_region_path,
+        256,
     )
     .expect("ShmemAdaptedStateMachine::new");
 
@@ -211,6 +212,7 @@ async fn blank_and_membership_entries_emit_empty_response_without_touching_ring(
         link.snapshot_producer,
         link.snapshot_resp_consumer,
         snapshot_region_path2,
+        256,
     )
     .expect("ShmemAdaptedStateMachine::new");
 

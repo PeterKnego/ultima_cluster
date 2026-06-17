@@ -182,6 +182,7 @@ impl<S: StateMachine> NodeBuilder<S> {
                     snapshot_producer,
                     snapshot_resp_consumer,
                     instance_dir.join("service").join("snapshot.region"),
+                    self.config.service_rings.apply_pipeline_depth,
                 )?;
                 // Reconcile wiring (driver-redesign): the read-gate holds only
                 // lightweight signals (no adapter clone); the proactive driver owns
