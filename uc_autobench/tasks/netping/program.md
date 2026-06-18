@@ -78,7 +78,7 @@ All results append to `uc_autobench/tasks/netping/results.tsv`.
 | `INFLIGHT`      | `128`                              | Inflight cap for ladder mode        |
 | `NETEM_DELAYS`  | `0 1 5`                            | One-way delay values (ms)           |
 | `NETEM_LOSS`    | `0 1`                              | Packet loss values (pct)            |
-| `NETEM_IFACE`   | `eth0`                             | NIC to shape on both node0 and node1|
+| `NETEM_IFACE`   | `enp7s0`                           | NIC to shape on both node0 and node1 (Hetzner private-network iface; override per cloud, e.g. `NETEM_IFACE=eth0`)|
 | `SSH_USER`      | from inventory `ansible_user`      | SSH login user                      |
 | `SSH_KEY`       | from inventory key file            | SSH private key path                |
 | `UC_TARGET_BIN` | `/opt/bench/uc/target/release`     | Binary dir on both hosts            |
@@ -129,12 +129,19 @@ launcher names match the built `aeron-io/benchmarks` dist.
 
 ## Notes
 
-- netem is applied **symmetrically on both node0 and node1** (`NETEM_IFACE`,
-  default eth0).  `delay=D ms` adds ~D to each leg (≈2D to RTT); `loss=L%` is
-  applied per-direction.  This means "delay=5ms" produces a clean ≈10ms RTT
-  increase, and the impairment is identical across all transports so the A/B
-  comparison is apples-to-apples.  The baseline cell (delay=0, loss=0) applies
-  no shaping on either host.
+- The driver connects clients to node0's **private IP** (`private_ip` field in
+  the inventory, e.g. `10.10.1.10` on Hetzner) rather than the public
+  `ansible_host`.  SSH for running commands and applying netem still uses the
+  public IPs.  If `private_ip` is absent from the inventory the driver falls
+  back to `ansible_host` with a stderr warning.
+- netem is applied **symmetrically on both node0 and node1** on `NETEM_IFACE`
+  (default `enp7s0` — the Hetzner private-network iface; override per cloud).
+  `delay=D ms` adds ~D to each leg (≈2D to RTT); `loss=L%` is applied
+  per-direction.  This means "delay=5ms" produces a clean ≈10ms RTT increase,
+  and the impairment is identical across all transports so the A/B comparison
+  is apples-to-apples.  The baseline cell (delay=0, loss=0) applies no shaping
+  on either host.  Because netem and `--connect` both target the same private
+  iface, the shaped impairment is exactly what the benchmark measures.
 - The cleanup trap in the driver ensures netem is always removed from **both**
   node0 and node1 on EXIT/INT/TERM, so a failed run never leaves either host
   shaped.

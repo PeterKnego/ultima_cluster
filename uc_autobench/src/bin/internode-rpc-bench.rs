@@ -128,27 +128,43 @@ async fn run_step(
 /// one request → response at a time, as fast as possible, for `duration`,
 /// recording each RTT into the histogram. This is the canonical transport ping
 /// — no open-loop pacing, so it measures raw serial round-trip latency.
-/// Returns the histogram (ns) and the achieved rate (count / wall-seconds).
+///
+/// Loss-tolerant: each RPC is wrapped in a 1s timeout. On error or timeout
+/// the failure is counted and the loop continues — the run is NOT aborted.
+/// The caller always gets a histogram (possibly empty) + failure tally.
+///
+/// Returns `(histogram_ns, achieved_rate, failed_count)`.
 async fn run_ping(
     client: &EchoClient,
     duration: Duration,
     payload: usize,
-) -> anyhow::Result<(Histogram<u64>, f64)> {
+) -> anyhow::Result<(Histogram<u64>, f64, u64)> {
     let mut hist = Histogram::<u64>::new_with_bounds(1, 600_000_000_000, 3)?;
     let start = Instant::now();
     let deadline = start + duration;
     let body = Bytes::from(vec![0u8; payload]);
     let mut completed: u64 = 0;
+    let mut failed: u64 = 0;
+    // Per-RPC timeout: keeps the sequential loop bounded under packet loss or
+    // a wedged transport that never returns an error.
+    let rpc_timeout = Duration::from_secs(1);
 
     while Instant::now() < deadline {
         let t0 = Instant::now();
-        client.rpc(body.clone()).await?;
-        hist.record((t0.elapsed().as_nanos() as u64).min(600_000_000_000))?;
-        completed += 1;
+        match tokio::time::timeout(rpc_timeout, client.rpc(body.clone())).await {
+            Ok(Ok(_)) => {
+                hist.record((t0.elapsed().as_nanos() as u64).min(600_000_000_000))?;
+                completed += 1;
+            }
+            Ok(Err(_)) | Err(_) => {
+                // RPC error or per-RPC timeout: count the failure, keep going.
+                failed += 1;
+            }
+        }
     }
 
     let achieved = completed as f64 / start.elapsed().as_secs_f64();
-    Ok((hist, achieved))
+    Ok((hist, achieved, failed))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -244,8 +260,9 @@ async fn main() -> anyhow::Result<()> {
         "ping" => {
             // Sequential single-inflight RTT probe. inflight is forced to 1.
             // Warmup (discarded): connection setup, TLS handshake, page-ins.
-            let _ = run_ping(&client, Duration::from_secs_f64(1.0), args.payload).await?;
-            let (hist, achieved) = run_ping(
+            // Warmup failures are silently ignored — they're expected under loss.
+            let _ = run_ping(&client, Duration::from_secs_f64(1.0), args.payload).await;
+            let (hist, achieved, failed) = run_ping(
                 &client,
                 Duration::from_secs_f64(args.duration),
                 args.payload,
@@ -257,6 +274,19 @@ async fn main() -> anyhow::Result<()> {
                 "quic" => "quic-ping",
                 _ => unreachable!(),
             };
+            let ok = hist.len();
+            let total = ok + failed;
+            let loss_pct = if total > 0 {
+                100.0 * failed as f64 / total as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "ping: {} ok, {} failed ({:.1}% loss-affected)",
+                ok, failed, loss_pct
+            );
+            // Always emit a row — even if count=0 — so the sweep never gets a
+            // missing cell. Latency columns are 0 when the histogram is empty.
             csv_row(
                 ping_system,
                 &args.config,

@@ -8,7 +8,11 @@
 #      (idempotent del-first).  delay=D ms adds ~D to each leg (≈2D to RTT);
 #      loss=L% is applied per-direction.  Shaping is identical across all
 #      transports so the A/B comparison is apples-to-apples.
-#   2. SSHs node1 to run the client binary against node0.
+#      Shaping is applied to NETEM_IFACE (default: enp7s0, Hetzner private-
+#      network iface) — the same iface the clients use to talk to node0.
+#   2. SSHs node1 to run the client binary against node0's PRIVATE IP
+#      (NODE0_CONNECT = private_ip from inventory, or ansible_host fallback).
+#      SSH itself still uses the public ansible_host IPs.
 #   3. Captures the 13-column CSV row from stdout; normalises Aeron output into
 #      the same schema.
 #   4. Appends a TSV row (with netem columns folded into `config`) to results.
@@ -28,7 +32,8 @@
 #   INFLIGHT         inflight cap for ladder mode (default: 128)
 #   NETEM_DELAYS     space-separated one-way delay values in ms (default: "0 1 5")
 #   NETEM_LOSS       space-separated loss values in pct (default: "0 1")
-#   NETEM_IFACE      NIC to shape on node0 (default: eth0)
+#   NETEM_IFACE      NIC to shape on both node0 and node1 (default: enp7s0 —
+#                    Hetzner private-network iface; override per cloud)
 #   SSH_USER         SSH login user (default: read from inventory ansible_user)
 #   SSH_KEY          path to SSH private key (default: read from inventory)
 #   SSH_OPTS         extra SSH options (default: -o StrictHostKeyChecking=accept-new)
@@ -64,20 +69,34 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 DEFAULT_INVENTORY="${REPO_ROOT}/bench-infra/inventory/hosts.yml"
 INVENTORY="${INVENTORY:-$DEFAULT_INVENTORY}"
 
+# parse_inventory <file>
+# Parses ansible_host (public), private_ip (private), ansible_user, and key
+# from hosts.yml.  Sets NODE0_IP, NODE1_IP (public/SSH), NODE0_PRIVATE_IP,
+# NODE1_PRIVATE_IP (private; empty if not present), INVENTORY_SSH_USER,
+# INVENTORY_SSH_KEY.
+parse_inventory() {
+  local inv="$1"
+  NODE0_IP="$(grep -A5 'node_role: node0' "$inv" | grep 'ansible_host' | head -1 | awk '{print $2}')"
+  NODE1_IP="$(grep -A5 'node_role: node1' "$inv" | grep 'ansible_host' | head -1 | awk '{print $2}')"
+  NODE0_PRIVATE_IP="$(grep -A5 'node_role: node0' "$inv" | grep 'private_ip' | head -1 | awk '{print $2}')"
+  NODE1_PRIVATE_IP="$(grep -A5 'node_role: node1' "$inv" | grep 'private_ip' | head -1 | awk '{print $2}')"
+  INVENTORY_SSH_USER="$(grep 'ansible_user:' "$inv" | head -1 | awk '{print $2}')"
+  INVENTORY_SSH_KEY="$(grep 'ansible_ssh_private_key_file:' "$inv" | head -1 | awk '{print $2}')"
+}
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
   # Dry-run: use a synthetic inventory if the real one is absent.
   if [[ ! -f "$INVENTORY" ]]; then
     echo "[dry-run] Inventory not found at $INVENTORY — using FAKE addresses for expansion." >&2
-    NODE0_IP="10.0.0.100"
-    NODE1_IP="10.0.0.101"
+    NODE0_IP="203.0.113.10"
+    NODE1_IP="203.0.113.11"
+    NODE0_PRIVATE_IP="10.10.1.10"
+    NODE1_PRIVATE_IP="10.10.1.11"
     INVENTORY_SSH_USER="bench"
     INVENTORY_SSH_KEY="/dev/null"
   else
     # Parse the real inventory even in dry-run.
-    NODE0_IP="$(grep -A5 'node_role: node0' "$INVENTORY" | grep 'ansible_host' | head -1 | awk '{print $2}')"
-    NODE1_IP="$(grep -A5 'node_role: node1' "$INVENTORY" | grep 'ansible_host' | head -1 | awk '{print $2}')"
-    INVENTORY_SSH_USER="$(grep 'ansible_user:' "$INVENTORY" | head -1 | awk '{print $2}')"
-    INVENTORY_SSH_KEY="$(grep 'ansible_ssh_private_key_file:' "$INVENTORY" | head -1 | awk '{print $2}')"
+    parse_inventory "$INVENTORY"
   fi
 else
   # Real run: inventory MUST exist (fleet not up → clear error).
@@ -87,17 +106,30 @@ else
     echo "  Or set INVENTORY=<path/to/hosts.yml>" >&2
     exit 1
   fi
-  NODE0_IP="$(grep -A5 'node_role: node0' "$INVENTORY" | grep 'ansible_host' | head -1 | awk '{print $2}')"
-  NODE1_IP="$(grep -A5 'node_role: node1' "$INVENTORY" | grep 'ansible_host' | head -1 | awk '{print $2}')"
-  INVENTORY_SSH_USER="$(grep 'ansible_user:' "$INVENTORY" | head -1 | awk '{print $2}')"
-  INVENTORY_SSH_KEY="$(grep 'ansible_ssh_private_key_file:' "$INVENTORY" | head -1 | awk '{print $2}')"
+  parse_inventory "$INVENTORY"
 fi
 
-# Validate we got both IPs.
+# Validate we got both public IPs (SSH).
 if [[ -z "${NODE0_IP:-}" || -z "${NODE1_IP:-}" ]]; then
   echo "ERROR: could not parse node0/node1 IPs from inventory at $INVENTORY" >&2
   echo "  Expected YAML fields: node_role: node0 / node1, ansible_host: <ip>" >&2
   exit 1
+fi
+
+# NODE0_CONNECT / NODE1_CONNECT: the address the client uses for --connect.
+# Use private_ip (the realistic inter-node path, e.g. enp7s0 on Hetzner) when
+# available; fall back to ansible_host (public) with a warning.
+if [[ -n "${NODE0_PRIVATE_IP:-}" ]]; then
+  NODE0_CONNECT="$NODE0_PRIVATE_IP"
+else
+  echo "[warn] no private_ip for node0 in inventory — using public ansible_host for --connect" >&2
+  NODE0_CONNECT="$NODE0_IP"
+fi
+if [[ -n "${NODE1_PRIVATE_IP:-}" ]]; then
+  NODE1_CONNECT="$NODE1_PRIVATE_IP"
+else
+  echo "[warn] no private_ip for node1 in inventory — using public ansible_host for --connect" >&2
+  NODE1_CONNECT="$NODE1_IP"
 fi
 
 # ---------------------------------------------------------------------------
@@ -133,7 +165,9 @@ RATE="${RATE:-20000}"
 INFLIGHT="${INFLIGHT:-128}"
 NETEM_DELAYS="${NETEM_DELAYS:-0 1 5}"    # one-way delay ms; 0 = no shaping
 NETEM_LOSS="${NETEM_LOSS:-0 1}"          # packet loss pct; 0 = no shaping
-NETEM_IFACE="${NETEM_IFACE:-eth0}"   # NIC to shape on BOTH node0 and node1
+NETEM_IFACE="${NETEM_IFACE:-enp7s0}"  # NIC to shape on BOTH node0 and node1
+                                       # (enp7s0 = Hetzner private-network iface;
+                                       #  override per cloud, e.g. NETEM_IFACE=eth0)
 
 # ---------------------------------------------------------------------------
 # Remote binary paths (match group_vars/all.yml defaults)
@@ -244,7 +278,7 @@ _NETEM_ACTIVE=0
 # Returns: sets global _CSV_ROW to the raw CSV row from the binary.
 # ---------------------------------------------------------------------------
 run_uc_experiment() {
-  local transport="$1" node0_ip="$2" payload="$3" config_label="$4"
+  local transport="$1" payload="$2" config_label="$3"
   local port
   case "$transport" in
     udp)  port="$UDP_PORT"  ;;
@@ -252,11 +286,14 @@ run_uc_experiment() {
     *) echo "ERROR: unknown UC transport $transport" >&2; return 1 ;;
   esac
 
+  # NODE0_CONNECT = private_ip (or public fallback) — the realistic inter-node
+  # path on Hetzner.  netem shapes enp7s0, so --connect must target that iface.
+  # SSH (node1 runner + node0 netem) still uses the public NODE1_IP / NODE0_IP.
   local client_cmd
   client_cmd="${UC_TARGET_BIN}/internode-rpc-bench \
     --role client \
     --transport ${transport} \
-    --connect ${node0_ip}:${port} \
+    --connect ${NODE0_CONNECT}:${port} \
     --mode ${MODE} \
     --payload ${payload} \
     --duration ${DURATION} \
@@ -301,7 +338,9 @@ run_uc_experiment() {
 # If a field is unavailable, 0 is emitted and noted in a comment.
 # ---------------------------------------------------------------------------
 run_aeron_experiment() {
-  local node0_ip="$1" payload="$2" config_label="$3"
+  local payload="$1" config_label="$2"
+  # NODE0_CONNECT (global) = private_ip of node0 — pass to the Aeron launcher
+  # when wiring in the remote address (see VERIFY comment below).
 
   # Aeron ping launcher typically needs the target cluster/media-driver address.
   # Adjust these JVM_OPTS if the launcher takes a properties file instead.
@@ -317,7 +356,7 @@ run_aeron_experiment() {
     ${AERON_PING_CMD}"
   # *** VERIFY: some launchers accept the remote address as an arg or via a
   #     properties file (e.g. ${AERON_DEPLOY_DIR}/cfg/ping.properties).
-  #     Add the remote node0 address here when confirmed. ***
+  #     Use ${NODE0_CONNECT} (private ip) as the remote node0 address. ***
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "[dry-run] SSH ${SSH_USER}@${NODE1_IP}: ${aeron_cmd}" >&2
@@ -396,7 +435,8 @@ netem_label() {
 # ---------------------------------------------------------------------------
 # Main sweep loop
 # ---------------------------------------------------------------------------
-echo "=== netping-sweep: node0=${NODE0_IP} node1=${NODE1_IP} ===" >&2
+echo "=== netping-sweep: node0 ssh=${NODE0_IP} connect=${NODE0_CONNECT} ===" >&2
+echo "===                node1 ssh=${NODE1_IP} connect=${NODE1_CONNECT} ===" >&2
 echo "    transports=${TRANSPORTS}" >&2
 echo "    payloads=${PAYLOADS}  mode=${MODE}  duration=${DURATION}s" >&2
 echo "    netem_delays=${NETEM_DELAYS}  netem_loss=${NETEM_LOSS}  iface=${NETEM_IFACE}" >&2
@@ -430,10 +470,10 @@ for t in $TRANSPORTS; do
         _CSV_ROW=""
         case "$t" in
           udp|quic)
-            run_uc_experiment "$t" "${NODE0_IP}" "$p" "$label"
+            run_uc_experiment "$t" "$p" "$label"
             ;;
           aeron)
-            run_aeron_experiment "${NODE0_IP}" "$p" "$label"
+            run_aeron_experiment "$p" "$label"
             ;;
           *)
             echo "WARNING: unknown transport '${t}', skipping" >&2
