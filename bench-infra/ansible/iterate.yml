@@ -5,7 +5,10 @@
 - name: Rebuild UC and run the UC-only sweep
   hosts: cluster
   become: true
-  gather_facts: true
+  # Defer fact-gathering until AFTER wait_for_connection — play-level
+  # gather_facts:true would SSH (to gather) before pre_tasks, racing a
+  # cold-booted host's sshd. Gather explicitly once the wait succeeds.
+  gather_facts: false
   vars:
     aeron_enabled: false
   pre_tasks:
@@ -13,6 +16,8 @@
       ansible.builtin.wait_for_connection:
         delay: 5
         timeout: 120
+    - name: Gather facts (after SSH is reachable)
+      ansible.builtin.setup:
   roles:
     - build_uc
     - run

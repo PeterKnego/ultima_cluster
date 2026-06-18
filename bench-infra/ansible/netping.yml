@@ -10,12 +10,18 @@
 - name: Stand up persistent cross-host echo responders
   hosts: cluster
   become: true
-  gather_facts: true
+  # Defer fact-gathering until AFTER wait_for_connection. With play-level
+  # gather_facts:true, Ansible makes its first SSH (fact gathering) BEFORE
+  # pre_tasks, so a freshly-booted host whose sshd isn't up yet fails
+  # ("connection refused") before the wait ever runs. Gather explicitly below.
+  gather_facts: false
   pre_tasks:
     - name: Wait for SSH to come up
       ansible.builtin.wait_for_connection:
         delay: 10
         timeout: 180
+    - name: Gather facts (after SSH is reachable)
+      ansible.builtin.setup:
   roles:
     - toolchains
     - build_uc

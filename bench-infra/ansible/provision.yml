@@ -2,12 +2,17 @@
 - name: Provision bench hosts (tune, build, configure)
   hosts: cluster
   become: true
-  gather_facts: true
+  # Defer fact-gathering until AFTER wait_for_connection — play-level
+  # gather_facts:true would SSH (to gather) before pre_tasks, racing a
+  # cold-booted host's sshd. Gather explicitly once the wait succeeds.
+  gather_facts: false
   pre_tasks:
     - name: Wait for SSH to come up
       ansible.builtin.wait_for_connection:
         delay: 10
         timeout: 180
+    - name: Gather facts (after SSH is reachable)
+      ansible.builtin.setup:
   roles:
     - os_tune
     - toolchains
