@@ -100,12 +100,27 @@ INVENTORY="${INVENTORY:-$DEFAULT_INVENTORY}"
 # present), INVENTORY_SSH_USER, INVENTORY_SSH_KEY.
 parse_inventory() {
   local inv="$1"
-  NODE0_IP="$(grep -A5 'node_role: node0' "$inv" | grep 'ansible_host' | head -1 | awk '{print $2}')"
-  NODE1_IP="$(grep -A5 'node_role: node1' "$inv" | grep 'ansible_host' | head -1 | awk '{print $2}')"
-  NODE2_IP="$(grep -A5 'node_role: node2' "$inv" | grep 'ansible_host' | head -1 | awk '{print $2}')"
-  NODE0_PRIVATE_IP="$(grep -A5 'node_role: node0' "$inv" | grep 'private_ip' | head -1 | awk '{print $2}')"
-  NODE1_PRIVATE_IP="$(grep -A5 'node_role: node1' "$inv" | grep 'private_ip' | head -1 | awk '{print $2}')"
-  NODE2_PRIVATE_IP="$(grep -A5 'node_role: node2' "$inv" | grep 'private_ip' | head -1 | awk '{print $2}')"
+  # Map node_role -> ansible_host/private_ip by host BLOCK, robust to field
+  # order within a block. (The old `grep -A5 node_role` read fields from the
+  # NEXT block, since the generator emits ansible_host/private_ip BEFORE
+  # node_role — node0 picked up node1's IP and node1 came up empty, killing the
+  # script under `set -e`/pipefail.) Host entries are 8-space-indented names;
+  # the trailing `nodeN: {}` group sections carry no fields, so they don't
+  # clobber. Defaults keep `set -u` happy when a role is absent (2-node fleet).
+  NODE0_IP="" NODE1_IP="" NODE2_IP=""
+  NODE0_PRIVATE_IP="" NODE1_PRIVATE_IP="" NODE2_PRIVATE_IP=""
+  eval "$(awk '
+    /^        [^ ][^:]*:/ { host=$1; sub(/:$/,"",host) }
+    /ansible_host:/        { ah[host]=$2 }
+    /private_ip:/          { pip[host]=$2 }
+    /node_role:/           { role[host]=$2 }
+    END {
+      for (h in role) {
+        if (role[h]=="node0") { print "NODE0_IP=" ah[h]; print "NODE0_PRIVATE_IP=" pip[h] }
+        if (role[h]=="node1") { print "NODE1_IP=" ah[h]; print "NODE1_PRIVATE_IP=" pip[h] }
+        if (role[h]=="node2") { print "NODE2_IP=" ah[h]; print "NODE2_PRIVATE_IP=" pip[h] }
+      }
+    }' "$inv")"
   INVENTORY_SSH_USER="$(grep 'ansible_user:' "$inv" | head -1 | awk '{print $2}')"
   INVENTORY_SSH_KEY="$(grep 'ansible_ssh_private_key_file:' "$inv" | head -1 | awk '{print $2}')"
 }
