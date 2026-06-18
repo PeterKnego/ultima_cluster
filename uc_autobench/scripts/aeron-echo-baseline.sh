@@ -123,10 +123,24 @@ INVENTORY="${INVENTORY:-$DEFAULT_INVENTORY}"
 # NODE0_PRIVATE_IP/NODE1_PRIVATE_IP (channels), INVENTORY_SSH_USER/KEY.
 parse_inventory() {
   local inv="$1"
-  NODE0_IP="$(grep -A5 'node_role: node0' "$inv" | grep 'ansible_host' | head -1 | awk '{print $2}')"
-  NODE1_IP="$(grep -A5 'node_role: node1' "$inv" | grep 'ansible_host' | head -1 | awk '{print $2}')"
-  NODE0_PRIVATE_IP="$(grep -A5 'node_role: node0' "$inv" | grep 'private_ip' | head -1 | awk '{print $2}')"
-  NODE1_PRIVATE_IP="$(grep -A5 'node_role: node1' "$inv" | grep 'private_ip' | head -1 | awk '{print $2}')"
+  # Map node_role -> ansible_host/private_ip by host BLOCK, robust to field
+  # order within a block. The old `grep -A5 node_role` read fields from the
+  # NEXT block (the generator emits ansible_host/private_ip BEFORE node_role),
+  # so node0 got node1's IP and node1 came up empty — and the empty grep tripped
+  # set -e/pipefail, killing the script with zero output. (Same fix as
+  # netping-sweep.sh.) The trailing `nodeN: {}` group sections carry no fields.
+  NODE0_IP="" NODE1_IP="" NODE0_PRIVATE_IP="" NODE1_PRIVATE_IP=""
+  eval "$(awk '
+    /^        [^ ][^:]*:/ { host=$1; sub(/:$/,"",host) }
+    /ansible_host:/        { ah[host]=$2 }
+    /private_ip:/          { pip[host]=$2 }
+    /node_role:/           { role[host]=$2 }
+    END {
+      for (h in role) {
+        if (role[h]=="node0") { print "NODE0_IP=" ah[h]; print "NODE0_PRIVATE_IP=" pip[h] }
+        if (role[h]=="node1") { print "NODE1_IP=" ah[h]; print "NODE1_PRIVATE_IP=" pip[h] }
+      }
+    }' "$inv")"
   INVENTORY_SSH_USER="$(grep 'ansible_user:' "$inv" | head -1 | awk '{print $2}')"
   INVENTORY_SSH_KEY="$(grep 'ansible_ssh_private_key_file:' "$inv" | head -1 | awk '{print $2}')"
 }
