@@ -1,0 +1,24 @@
+---
+# netping.yml — bring up a small fleet ONCE with PERSISTENT echo responders so a
+# separate uc_autobench driver can run many cross-host ping experiments without
+# re-provisioning. Tear down with `make destroy` (responders die with the hosts;
+# the ttl_hours backstop also applies).
+#
+# Typical use:  make up-ping        # 2-host ccx13 fleet + this playbook
+#               <run driver pings against node0:9100 / :9101 / aeron>
+#               make destroy
+- name: Stand up persistent cross-host echo responders
+  hosts: cluster
+  become: true
+  gather_facts: true
+  pre_tasks:
+    - name: Wait for SSH to come up
+      ansible.builtin.wait_for_connection:
+        delay: 10
+        timeout: 180
+  roles:
+    - toolchains
+    - build_uc
+    - role: build_aeron
+      when: aeron_enabled | default(true) | bool
+    - netping_serve

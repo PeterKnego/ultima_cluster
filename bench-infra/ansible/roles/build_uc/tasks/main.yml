@@ -33,7 +33,7 @@
 - name: Build uc_autobench release bins
   ansible.builtin.command: >
     {{ remote_home }}/.cargo/bin/cargo build --release
-    -p uc_autobench --bin uc-node-launch --bin commit-path-load
+    -p uc_autobench --bin uc-node-launch --bin commit-path-load --bin internode-rpc-bench
   args:
     chdir: "{{ uc_src_dir }}"
   environment:
@@ -46,6 +46,7 @@
   ansible.builtin.shell: |
     test -x {{ uc_target_bin }}/uc-node-launch
     test -x {{ uc_target_bin }}/commit-path-load
+    test -x {{ uc_target_bin }}/internode-rpc-bench
   changed_when: false
 
 - name: Record UC source provenance

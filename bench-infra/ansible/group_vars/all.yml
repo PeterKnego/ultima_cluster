@@ -39,6 +39,19 @@ aeron_port_base: { node0: 20000, node1: 21000, node2: 22000 }
 uc_raft_port: { node0: 7001, node1: 7002, node2: 7003 }
 uc_app_id: "uc-bench-dist"
 
+# --- Net-ping harness (cross-host transport RTT) ---
+# A 2-host fleet (see `make up-ping`) stands up PERSISTENT echo responders on
+# node0 via the netping_serve role; a separate uc_autobench driver points its
+# clients at node0's IP:port and runs many ping experiments without re-provision.
+netping_udp_port: 9100   # internode-rpc-bench --transport udp  --listen 0.0.0.0:9100
+netping_quic_port: 9101  # internode-rpc-bench --transport quic --listen 0.0.0.0:9101
+# Aeron-benchmarks "echo" responder launcher under the built dist's
+# {{ aeron_deploy_dir }}/scripts/aeron/. VERIFY against the built dist on first
+# provision — the aeron-io/benchmarks repo names the remote echo responder
+# launcher 'echo' (older trees may call it 'remote'); netping_serve checks the
+# script is present and fails fast with a hint if this name is wrong.
+aeron_echo_launcher: "echo"
+
 # --- Results ---
 results_local_dir: "{{ playbook_dir }}/../../bench-out/dist"
 iterate_local_csv: "{{ playbook_dir }}/../../bench-out/iterate/uc_sweep.csv"  # fixed path the loop reads

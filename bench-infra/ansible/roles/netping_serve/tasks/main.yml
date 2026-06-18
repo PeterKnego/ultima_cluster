@@ -1,0 +1,135 @@
+---
+# netping_serve — stand up PERSISTENT cross-host echo responders on node0.
+#
+# A separate uc_autobench driver (built elsewhere) points its --role client
+# --connect at node0's IP:port and runs many ping experiments WITHOUT
+# re-provisioning. This role only stands up the long-lived servers; it never
+# starts a client. Responders are detached via `setsid ... < /dev/null &` so
+# the task returns immediately and they survive the SSH session / playbook end.
+#
+# All tasks gate on `node_role == "node0"` (node0 = the server host; node1 runs
+# the driver's clients per-experiment). Mirrors the run role's node0 gating and
+# its Aeron media-driver start pattern.
+
+# --- Idempotent cleanup so re-running netping.yml is safe -------------------
+# Bracket trick on pkill ('[i]nternode' / '[i]o.aeron') so the pattern does not
+# match pkill's own shell command line.
+- name: Clean stale netping responders
+  ansible.builtin.shell: |
+    pkill -9 -f '[i]nternode-rpc-bench' || true
+    pkill -9 -f '[i]o.aeron' || true
+  changed_when: false
+  failed_when: false
+  when: node_role == "node0"
+
+- name: Brief settle after cleanup (ports release)
+  ansible.builtin.pause:
+    seconds: 2
+  run_once: true
+  when: node_role == "node0"
+
+# --- UC UDP echo responder --------------------------------------------------
+- name: Start UC UDP echo responder
+  ansible.builtin.shell: |
+    setsid {{ uc_target_bin }}/internode-rpc-bench \
+      --role server --transport udp \
+      --listen 0.0.0.0:{{ netping_udp_port }} \
+      > {{ remote_home }}/netping-udp.out 2>&1 < /dev/null &
+  changed_when: false
+  when: node_role == "node0"
+
+# --- UC QUIC echo responder -------------------------------------------------
+- name: Start UC QUIC echo responder
+  ansible.builtin.shell: |
+    setsid {{ uc_target_bin }}/internode-rpc-bench \
+      --role server --transport quic \
+      --listen 0.0.0.0:{{ netping_quic_port }} \
+      > {{ remote_home }}/netping-quic.out 2>&1 < /dev/null &
+  changed_when: false
+  when: node_role == "node0"
+
+# --- Aeron echo responder (media driver + benchmarks echo launcher) ---------
+# Reuses the existing media-driver launcher under {{ aeron_deploy_dir }} and the
+# benchmarks "echo" responder. The echo launcher name is parameterized
+# (aeron_echo_launcher, default "echo") — VERIFY against the built dist; the
+# pre-check below fails fast with a hint if the script is missing.
+- name: Verify Aeron echo launcher exists in the built dist
+  ansible.builtin.stat:
+    path: "{{ aeron_deploy_dir }}/scripts/aeron/{{ aeron_echo_launcher }}"
+  register: aeron_echo_stat
+  when: aeron_enabled | default(true) | bool and node_role == "node0"
+
+- name: Fail if the configured Aeron echo launcher is absent
+  ansible.builtin.fail:
+    msg: >-
+      Aeron echo launcher '{{ aeron_echo_launcher }}' not found under
+      {{ aeron_deploy_dir }}/scripts/aeron/. List that dir on the host and set
+      `aeron_echo_launcher` in group_vars to the correct script name
+      (commonly 'echo' or 'remote').
+  when:
+    - aeron_enabled | default(true) | bool
+    - node_role == "node0"
+    - not aeron_echo_stat.stat.exists
+
+- name: Start Aeron media driver (for echo responder)
+  ansible.builtin.shell: |
+    export JAVA_HOME="$(dirname $(dirname $(readlink -f $(which javac))))"
+    export JVM_OPTS="-Xms16M"
+    setsid {{ aeron_deploy_dir }}/scripts/aeron/media-driver \
+      > {{ remote_home }}/netping-aeron-md.out 2>&1 < /dev/null &
+  changed_when: false
+  when: aeron_enabled | default(true) | bool and node_role == "node0"
+
+- name: Brief settle for media driver
+  ansible.builtin.pause:
+    seconds: 3
+  run_once: true
+  when: aeron_enabled | default(true) | bool and node_role == "node0"
+
+- name: Start Aeron echo responder
+  ansible.builtin.shell: |
+    export JAVA_HOME="$(dirname $(dirname $(readlink -f $(which javac))))"
+    export JVM_OPTS="-Xms16M -Dio.aeron.benchmarks.output.directory={{ remote_home }}/results"
+    setsid {{ aeron_deploy_dir }}/scripts/aeron/{{ aeron_echo_launcher }} \
+      > {{ remote_home }}/netping-aeron-echo.out 2>&1 < /dev/null &
+  changed_when: false
+  when: aeron_enabled | default(true) | bool and node_role == "node0"
+
+# --- Up-verification: catch a failed start at `up` time ---------------------
+- name: Wait for responders to bind
+  ansible.builtin.pause:
+    seconds: 3
+  run_once: true
+  when: node_role == "node0"
+
+- name: Verify UC UDP responder bound its port
+  ansible.builtin.shell: |
+    set -o pipefail
+    ss -lunH 'sport = :{{ netping_udp_port }}' | grep -q ':{{ netping_udp_port }}'
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when: node_role == "node0"
+
+- name: Verify UC QUIC responder bound its (UDP) port
+  ansible.builtin.shell: |
+    set -o pipefail
+    ss -lunH 'sport = :{{ netping_quic_port }}' | grep -q ':{{ netping_quic_port }}'
+  args:
+    executable: /bin/bash
+  changed_when: false
+  when: node_role == "node0"
+
+- name: Verify Aeron echo responder process is alive
+  ansible.builtin.shell: "pgrep -f '[i]o.aeron' >/dev/null"
+  changed_when: false
+  when: aeron_enabled | default(true) | bool and node_role == "node0"
+
+- name: Report responder endpoints
+  ansible.builtin.debug:
+    msg: >-
+      netping responders up on {{ private_ip }} (node0):
+      UC-UDP={{ private_ip }}:{{ netping_udp_port }}
+      UC-QUIC={{ private_ip }}:{{ netping_quic_port }}
+      {{ 'Aeron-echo via ' + aeron_echo_launcher if (aeron_enabled | default(true) | bool) else 'Aeron disabled' }}
+  when: node_role == "node0"

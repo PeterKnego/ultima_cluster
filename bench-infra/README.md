@@ -78,6 +78,12 @@ One-shot: `make bench-oneshot` (up → bench → destroy). Persistent: `make up`
 `make bench` repeatedly, `make ssh-node0` to investigate, `make destroy` when done.
 `make status` lists hosts + uptime (cost guard).
 
+Cross-host ping harness: `make up-ping` provisions a 2-host `ccx13` fleet and runs
+`netping.yml`, standing up PERSISTENT UC UDP/QUIC + Aeron echo responders on node0
+(ports `netping_udp_port` / `netping_quic_port` in `group_vars/all.yml`). A separate
+uc_autobench driver points its ping clients at node0's IP:port; no re-provision
+between experiments. `make destroy` tears it down (responders die with the hosts).
+
 ## Switching cloud
 Set `cloud = "aws"` (or `"gcp"`) in `terraform.tfvars`. Everything else is identical;
 Ansible is cloud-agnostic.

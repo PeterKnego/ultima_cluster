@@ -16,7 +16,7 @@ TFVARS  ?= terraform.tfvars
 ANSIBLE := ansible-playbook
 SSH_KEY := $(shell awk -F'"' '/ssh_private_key_file/{print $$2}' $(TFVARS))
 
-.PHONY: init up up-uc provision bench bench-oneshot status destroy ssh-node0 inventory iterate
+.PHONY: init up up-uc up-ping provision bench bench-oneshot status destroy ssh-node0 inventory iterate
 
 init:
 	$(TF) init
@@ -30,6 +30,11 @@ up-uc: ## provision a UC-only fleet (no Aeron) for the throughput loop
 	$(TF) apply -auto-approve -var-file=../$(TFVARS)
 	$(MAKE) inventory
 	cd ansible && SSH_PRIVATE_KEY_FILE=$(SSH_KEY) $(ANSIBLE) provision.yml -e aeron_enabled=false
+
+up-ping: ## provision a 2-host ccx13 fleet + persistent UC/Aeron echo responders (cross-host ping harness)
+	TF_VAR_node_count=2 TF_VAR_instance_type=ccx13 $(TF) apply -auto-approve -var-file=../$(TFVARS)
+	$(MAKE) inventory
+	cd ansible && SSH_PRIVATE_KEY_FILE=$(SSH_KEY) $(ANSIBLE) netping.yml
 
 iterate: ## one loop iteration on the live fleet: rebuild UC + UC sweep, print fitness JSON
 	cd ansible && $(ANSIBLE) iterate.yml -e aeron_enabled=false
