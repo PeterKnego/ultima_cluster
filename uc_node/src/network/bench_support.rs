@@ -102,6 +102,18 @@ enum EchoServerInner {
 }
 
 impl EchoServer {
+    /// The socket address the server is actually bound to. Useful when the
+    /// caller bound `:0` (ephemeral port) and needs to tell a client where to
+    /// connect (the loopback `_pair()` path, and SIGINT-driven harness logs).
+    pub fn local_addr(&self) -> Result<SocketAddr, NetworkError> {
+        match &self.inner {
+            EchoServerInner::Udp(mux) => mux.local_addr().map_err(NetworkError::Io),
+            EchoServerInner::Quic { endpoint, .. } => {
+                endpoint.local_addr().map_err(NetworkError::Io)
+            }
+        }
+    }
+
     /// Stop the echo server and free its socket / listener.
     pub async fn shutdown(self) {
         match self.inner {
@@ -117,40 +129,60 @@ impl EchoServer {
     }
 }
 
-/// Bind a UDP echo server + client on loopback. The server echoes each request
-/// body back as a response frame; the returned [`EchoClient`] already knows the
-/// server's bound address.
-pub async fn udp_echo_pair() -> Result<(EchoClient, EchoServer), NetworkError> {
-    let server = UdpMux::bind("127.0.0.1:0".parse().unwrap(), UdpTuning::default()).await?;
-    let server_addr = server.local_addr().map_err(NetworkError::Io)?;
+/// Bind a UDP echo server on `listen`. The server echoes each request body
+/// back as a response frame. Use [`EchoServer::local_addr`] to discover the
+/// bound port when `listen` uses an ephemeral (`:0`) port. Pairs with
+/// [`udp_echo_client`] (possibly in a different process / on a different host).
+pub async fn udp_echo_server(listen: SocketAddr) -> Result<EchoServer, NetworkError> {
+    let server = UdpMux::bind(listen, UdpTuning::default()).await?;
     // Echo handler: reply with the same body, response flag set.
     server.set_request_handler(Arc::new(|req: Frame| {
         Box::pin(async move {
             Frame::new_response(MessageType::AppendEntriesResp, req.request_id, req.body)
         })
     }));
-
-    let client = UdpMux::bind("127.0.0.1:0".parse().unwrap(), UdpTuning::default()).await?;
-
-    let echo_client = EchoClient {
-        inner: EchoClientInner::Udp {
-            client,
-            server_addr,
-        },
-        next_id: AtomicU64::new(1),
-    };
-    Ok((
-        echo_client,
-        EchoServer {
-            inner: EchoServerInner::Udp(server),
-        },
-    ))
+    Ok(EchoServer {
+        inner: EchoServerInner::Udp(server),
+    })
 }
 
-/// Bind a QUIC echo server + connect a client, on loopback. Mirrors the real
-/// QUIC machinery (self-signed cert, `quinn` server/client endpoints, `Frame`
-/// stream round-trip) but echoes frames instead of dispatching to Raft.
-pub async fn quic_echo_pair() -> Result<(EchoClient, EchoServer), NetworkError> {
+/// Build a UDP echo client that `rpc`s to `connect`. The client binds its own
+/// ephemeral local socket and remembers `connect` as its fixed RPC target.
+pub async fn udp_echo_client(connect: SocketAddr) -> Result<EchoClient, NetworkError> {
+    // Bind a wildcard local socket in the same address family as the target.
+    let bind: SocketAddr = if connect.is_ipv6() {
+        "[::]:0".parse().unwrap()
+    } else {
+        "0.0.0.0:0".parse().unwrap()
+    };
+    let client = UdpMux::bind(bind, UdpTuning::default()).await?;
+    Ok(EchoClient {
+        inner: EchoClientInner::Udp {
+            client,
+            server_addr: connect,
+        },
+        next_id: AtomicU64::new(1),
+    })
+}
+
+/// Bind a UDP echo server + client on loopback. Convenience for the in-process
+/// (`--role both`) bench path: starts a server on `127.0.0.1:0`, reads its bound
+/// address, and connects a client to it. Reimplemented in terms of
+/// [`udp_echo_server`] / [`udp_echo_client`].
+pub async fn udp_echo_pair() -> Result<(EchoClient, EchoServer), NetworkError> {
+    let server = udp_echo_server("127.0.0.1:0".parse().unwrap()).await?;
+    let server_addr = server.local_addr()?;
+    let client = udp_echo_client(server_addr).await?;
+    Ok((client, server))
+}
+
+/// Bind a QUIC echo server on `listen`. Mirrors the real QUIC machinery (fresh
+/// self-signed cert, `quinn` server endpoint, accept → bi-stream `Frame`-echo
+/// loop) but echoes frames instead of dispatching to Raft. Use
+/// [`EchoServer::local_addr`] to discover the bound port when `listen` is `:0`.
+/// Pairs with [`quic_echo_client`] (possibly cross-process / cross-host — the
+/// client trusts the self-signed cert via an accept-any verifier).
+pub async fn quic_echo_server(listen: SocketAddr) -> Result<EchoServer, NetworkError> {
     use super::quic::tls;
 
     // Fresh throwaway self-signed cert (in-memory; no files on disk).
@@ -171,15 +203,12 @@ pub async fn quic_echo_pair() -> Result<(EchoClient, EchoServer), NetworkError> 
         rustls::pki_types::PrivateKeyDer::Pkcs8(k)
     };
     let server_cfg = tls::build_server_config(cert, key)?;
-    let client_cfg = tls::build_client_config()?;
 
-    // --- Server endpoint: accept connections, echo each bi-stream's frames. ---
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_cfg.as_ref().clone())
         .map_err(|e| NetworkError::Tls(format!("quic server cfg: {e}")))?;
     let quic_server_cfg = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-    let server_ep = quinn::Endpoint::server(quic_server_cfg, "127.0.0.1:0".parse().unwrap())
+    let server_ep = quinn::Endpoint::server(quic_server_cfg, listen)
         .map_err(|e| NetworkError::Connect(format!("endpoint: {e}")))?;
-    let server_addr = server_ep.local_addr().map_err(NetworkError::Io)?;
 
     let accept_ep = server_ep.clone();
     let accept_task = tokio::spawn(async move {
@@ -212,34 +241,56 @@ pub async fn quic_echo_pair() -> Result<(EchoClient, EchoServer), NetworkError> 
         }
     });
 
-    // --- Client endpoint: connect to the server. ---
-    let mut client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
+    Ok(EchoServer {
+        inner: EchoServerInner::Quic {
+            endpoint: server_ep,
+            accept_task,
+        },
+    })
+}
+
+/// Build a QUIC echo client connected to `connect`. Uses
+/// [`tls::build_client_config`] (accept-any-cert verifier) so it trusts a
+/// remote self-signed echo server. Each [`EchoClient::rpc`] opens a fresh
+/// bi-stream and round-trips one `Frame`.
+pub async fn quic_echo_client(connect: SocketAddr) -> Result<EchoClient, NetworkError> {
+    use super::quic::tls;
+
+    let client_cfg = tls::build_client_config()?;
+    // Bind a wildcard local socket in the same address family as the target.
+    let bind: SocketAddr = if connect.is_ipv6() {
+        "[::]:0".parse().unwrap()
+    } else {
+        "0.0.0.0:0".parse().unwrap()
+    };
+    let mut client_ep = quinn::Endpoint::client(bind)
         .map_err(|e| NetworkError::Connect(format!("client endpoint: {e}")))?;
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_cfg.as_ref().clone())
         .map_err(|e| NetworkError::Tls(format!("quic client cfg: {e}")))?;
     client_ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
     let conn = client_ep
-        .connect(server_addr, "uc-bench")
+        .connect(connect, "uc-bench")
         .map_err(|e| NetworkError::Connect(format!("connect: {e}")))?
         .await
         .map_err(|e| NetworkError::Connect(format!("handshake: {e}")))?;
 
-    let echo_client = EchoClient {
+    Ok(EchoClient {
         inner: EchoClientInner::Quic {
             conn,
             _endpoint: client_ep,
         },
         next_id: AtomicU64::new(1),
-    };
-    Ok((
-        echo_client,
-        EchoServer {
-            inner: EchoServerInner::Quic {
-                endpoint: server_ep,
-                accept_task,
-            },
-        },
-    ))
+    })
+}
+
+/// Bind a QUIC echo server + connect a client, on loopback. Convenience for the
+/// in-process (`--role both`) bench path. Reimplemented in terms of
+/// [`quic_echo_server`] / [`quic_echo_client`].
+pub async fn quic_echo_pair() -> Result<(EchoClient, EchoServer), NetworkError> {
+    let server = quic_echo_server("127.0.0.1:0".parse().unwrap()).await?;
+    let server_addr = server.local_addr()?;
+    let client = quic_echo_client(server_addr).await?;
+    Ok((client, server))
 }
 
 #[cfg(test)]

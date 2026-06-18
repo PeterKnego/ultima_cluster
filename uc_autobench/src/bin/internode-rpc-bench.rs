@@ -7,16 +7,29 @@
 //! (advance `next_send` by 1/rate regardless of actual dispatch; latency is
 //! measured from each request's INTENDED send time).
 //!
-//! Emits one CSV row to stdout with the exact 13-column task13 schema, with
-//! `system = "udp-rpc" | "quic-rpc"` and `workload = "rpc-echo"`.
+//! Emits one CSV row to stdout with the exact 13-column task13 schema. In
+//! `ladder` mode: `system = "udp-rpc" | "quic-rpc"`, `workload = "rpc-echo"`.
+//! In `ping` mode (sequential single-inflight RTT probe):
+//! `system = "udp-ping" | "quic-ping"`, `workload = "rpc-ping"`.
+//!
+//! Split-role: `--role server` is a persistent responder (runs until SIGINT,
+//! prints status to STDERR, nothing to STDOUT); `--role client` drives the
+//! experiment against a remote `--connect` addr and emits CSV to STDOUT;
+//! `--role both` (default) runs both endpoints in-process over loopback
+//! (today's behavior). STDOUT carries CSV, STDERR carries logs/status so a
+//! cross-host harness can capture the client's CSV cleanly.
 
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use clap::Parser;
 use futures::stream::{FuturesUnordered, StreamExt};
 use hdrhistogram::Histogram;
-use uc_node::network::bench_support::{EchoClient, quic_echo_pair, udp_echo_pair};
+use uc_node::network::bench_support::{
+    EchoClient, quic_echo_client, quic_echo_pair, quic_echo_server, udp_echo_client, udp_echo_pair,
+    udp_echo_server,
+};
 
 const CSV_HEADER: &str = "system,config,workload,payload_bytes,inflight,target_rate,achieved_rate,\
 p50_ns,p99_ns,p99_9_ns,p99_99_ns,max_ns,count";
@@ -27,6 +40,18 @@ struct Args {
     /// transport under test
     #[arg(long, value_parser = ["quic", "udp"])]
     transport: String,
+    /// process role: server (persistent responder), client (driver), or both (in-process loopback)
+    #[arg(long, value_parser = ["server", "client", "both"], default_value = "both")]
+    role: String,
+    /// experiment mode: ladder (open-loop rate driver) or ping (sequential single-inflight RTT probe)
+    #[arg(long, value_parser = ["ladder", "ping"], default_value = "ladder")]
+    mode: String,
+    /// listen address (role=server)
+    #[arg(long, default_value = "0.0.0.0:9000")]
+    listen: SocketAddr,
+    /// server address to connect to (role=client; required)
+    #[arg(long)]
+    connect: Option<SocketAddr>,
     /// echo payload size in bytes
     #[arg(long, default_value_t = 64)]
     payload: usize,
@@ -99,10 +124,38 @@ async fn run_step(
     Ok((hist, achieved))
 }
 
+/// Sequential single-inflight RTT probe ("ping"). Forces inflight=1: strictly
+/// one request → response at a time, as fast as possible, for `duration`,
+/// recording each RTT into the histogram. This is the canonical transport ping
+/// — no open-loop pacing, so it measures raw serial round-trip latency.
+/// Returns the histogram (ns) and the achieved rate (count / wall-seconds).
+async fn run_ping(
+    client: &EchoClient,
+    duration: Duration,
+    payload: usize,
+) -> anyhow::Result<(Histogram<u64>, f64)> {
+    let mut hist = Histogram::<u64>::new_with_bounds(1, 600_000_000_000, 3)?;
+    let start = Instant::now();
+    let deadline = start + duration;
+    let body = Bytes::from(vec![0u8; payload]);
+    let mut completed: u64 = 0;
+
+    while Instant::now() < deadline {
+        let t0 = Instant::now();
+        client.rpc(body.clone()).await?;
+        hist.record((t0.elapsed().as_nanos() as u64).min(600_000_000_000))?;
+        completed += 1;
+    }
+
+    let achieved = completed as f64 / start.elapsed().as_secs_f64();
+    Ok((hist, achieved))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn csv_row(
     system: &str,
     config: &str,
+    workload: &str,
     payload: usize,
     inflight: usize,
     target_rate: f64,
@@ -110,9 +163,10 @@ fn csv_row(
     hist: &Histogram<u64>,
 ) -> String {
     format!(
-        "{},{},rpc-echo,{},{},{:.0},{:.1},{},{},{},{},{},{}",
+        "{},{},{},{},{},{:.0},{:.1},{},{},{},{},{},{}",
         system,
         config,
+        workload,
         payload,
         inflight,
         target_rate,
@@ -133,56 +187,125 @@ async fn main() -> anyhow::Result<()> {
         .try_init();
     let args = Args::parse();
 
-    let (system, client, server) = match args.transport.as_str() {
-        "udp" => {
-            let (c, s) = udp_echo_pair().await?;
-            ("udp-rpc", c, s)
-        }
-        "quic" => {
-            let (c, s) = quic_echo_pair().await?;
-            ("quic-rpc", c, s)
-        }
+    // --- role=server: persistent responder until SIGINT. CSV→stdout (none here),
+    //     all status/logs→stderr so a harness can capture client CSV cleanly. ---
+    if args.role == "server" {
+        let server = match args.transport.as_str() {
+            "udp" => udp_echo_server(args.listen).await?,
+            "quic" => quic_echo_server(args.listen).await?,
+            other => anyhow::bail!("unknown transport {other}"),
+        };
+        let local = server.local_addr()?;
+        eprintln!(
+            "internode-rpc-bench: {} echo server listening on {}",
+            args.transport, local
+        );
+        tokio::signal::ctrl_c().await?;
+        eprintln!("internode-rpc-bench: SIGINT received, shutting down server");
+        server.shutdown().await;
+        return Ok(());
+    }
+
+    // --- client / both: build the echo client (+ owned server for `both`). ---
+    let (system, client, server): (&str, EchoClient, Option<_>) = match args.transport.as_str() {
+        "udp" => match args.role.as_str() {
+            "client" => {
+                let connect = args
+                    .connect
+                    .ok_or_else(|| anyhow::anyhow!("--connect is required for role=client"))?;
+                ("udp-rpc", udp_echo_client(connect).await?, None)
+            }
+            _ => {
+                let (c, s) = udp_echo_pair().await?;
+                ("udp-rpc", c, Some(s))
+            }
+        },
+        "quic" => match args.role.as_str() {
+            "client" => {
+                let connect = args
+                    .connect
+                    .ok_or_else(|| anyhow::anyhow!("--connect is required for role=client"))?;
+                ("quic-rpc", quic_echo_client(connect).await?, None)
+            }
+            _ => {
+                let (c, s) = quic_echo_pair().await?;
+                ("quic-rpc", c, Some(s))
+            }
+        },
         other => anyhow::bail!("unknown transport {other}"),
     };
 
     eprintln!(
-        "internode-rpc-bench: transport={} payload={}B inflight={} rate={} duration={}s",
-        args.transport, args.payload, args.inflight, args.rate, args.duration
+        "internode-rpc-bench: role={} mode={} transport={} payload={}B inflight={} rate={} duration={}s",
+        args.role, args.mode, args.transport, args.payload, args.inflight, args.rate, args.duration
     );
 
-    // Warmup (discarded): connection setup, TLS handshake, page-ins.
-    let _ = run_step(
-        &client,
-        args.rate,
-        args.inflight,
-        Duration::from_secs_f64(1.0),
-        args.payload,
-    )
-    .await?;
+    let row = match args.mode.as_str() {
+        "ping" => {
+            // Sequential single-inflight RTT probe. inflight is forced to 1.
+            // Warmup (discarded): connection setup, TLS handshake, page-ins.
+            let _ = run_ping(&client, Duration::from_secs_f64(1.0), args.payload).await?;
+            let (hist, achieved) = run_ping(
+                &client,
+                Duration::from_secs_f64(args.duration),
+                args.payload,
+            )
+            .await?;
+            // ping system label = "{transport}-ping"; workload = "rpc-ping".
+            let ping_system = match args.transport.as_str() {
+                "udp" => "udp-ping",
+                "quic" => "quic-ping",
+                _ => unreachable!(),
+            };
+            csv_row(
+                ping_system,
+                &args.config,
+                "rpc-ping",
+                args.payload,
+                1,
+                args.rate,
+                achieved,
+                &hist,
+            )
+        }
+        _ => {
+            // ladder: open-loop CO-free rate driver (today's behavior).
+            // Warmup (discarded): connection setup, TLS handshake, page-ins.
+            let _ = run_step(
+                &client,
+                args.rate,
+                args.inflight,
+                Duration::from_secs_f64(1.0),
+                args.payload,
+            )
+            .await?;
+            let (hist, achieved) = run_step(
+                &client,
+                args.rate,
+                args.inflight,
+                Duration::from_secs_f64(args.duration),
+                args.payload,
+            )
+            .await?;
+            csv_row(
+                system,
+                &args.config,
+                "rpc-echo",
+                args.payload,
+                args.inflight,
+                args.rate,
+                achieved,
+                &hist,
+            )
+        }
+    };
 
-    // Measured window.
-    let (hist, achieved) = run_step(
-        &client,
-        args.rate,
-        args.inflight,
-        Duration::from_secs_f64(args.duration),
-        args.payload,
-    )
-    .await?;
-
-    let row = csv_row(
-        system,
-        &args.config,
-        args.payload,
-        args.inflight,
-        args.rate,
-        achieved,
-        &hist,
-    );
     println!("{CSV_HEADER}");
     println!("{row}");
 
-    server.shutdown().await;
+    if let Some(server) = server {
+        server.shutdown().await;
+    }
     Ok(())
 }
 
@@ -196,9 +319,25 @@ mod tests {
         for v in [100u64, 200, 300, 400, 500] {
             hist.record(v).unwrap();
         }
-        let row = csv_row("udp-rpc", "loopback", 64, 8, 5000.0, 4987.6, &hist);
+        let row = csv_row(
+            "udp-rpc", "loopback", "rpc-echo", 64, 8, 5000.0, 4987.6, &hist,
+        );
         assert_eq!(row.split(',').count(), 13);
         assert!(row.starts_with("udp-rpc,loopback,rpc-echo,64,8,5000,4987.6,"));
         assert_eq!(CSV_HEADER.split(',').count(), 13);
+    }
+
+    #[test]
+    fn ping_csv_row_has_13_columns_and_ping_labels() {
+        let mut hist = Histogram::<u64>::new(3).unwrap();
+        for v in [100u64, 200, 300, 400, 500] {
+            hist.record(v).unwrap();
+        }
+        // ping mode: system="{transport}-ping", workload="rpc-ping", inflight=1.
+        let row = csv_row(
+            "udp-ping", "host-a", "rpc-ping", 64, 1, 20000.0, 31234.5, &hist,
+        );
+        assert_eq!(row.split(',').count(), 13);
+        assert!(row.starts_with("udp-ping,host-a,rpc-ping,64,1,20000,31234.5,"));
     }
 }
