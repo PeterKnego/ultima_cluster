@@ -433,6 +433,58 @@ single-inflight, no Aeron floor, and the loss axis unmeasured for UDP. **Keep QU
 the UDP-favorable LAN signal warrants a deeper cross-host run (throughput/inflight sweep + a
 loss-tolerant ping + the Aeron baseline on dedicated cores) before the default is reconsidered.
 
+### 6.5 Cross-host FAN-OUT / Raft-replication results (run 2026-06-18, 3× ccx33)
+
+A fan-out mode (`internode-rpc-bench --mode fanout --connect a,b --quorum K`) models a Raft
+leader replicating a log entry to N followers and committing on majority ack: the leader fires
+concurrent RPCs to all followers each round and records the **K-of-N quorum latency** (K=1 =
+3-node commit = faster follower; K=2 = all-acks). Run on a **3× ccx33** fleet (8 dedicated
+vCPU — sized for the Aeron baseline) over the private network, node0 leader → node1+node2,
+64 B, symmetric netem on all three.
+
+| netem (per leg) | udp-fanout K=1 / K=2 | quic-fanout K=1 / K=2 |
+|---|--:|--:|
+| **clean** | **p50 257 µs** / —* | p50 319 µs / 324 µs |
+| +1 ms | 2.34 ms / 2.39 ms | 2.42 ms / 2.44 ms |
+| +5 ms | 10.6 ms / 10.7 ms | 10.7 ms / 10.7 ms |
+| 1 % loss | p50 316 µs, p99 755 µs (105 rounds) | p50 329 µs, p99 28.6 ms (K=2; 2213 rounds) |
+
+\* one transient miss (udp clean K=2); the impaired K=2 cells succeeded.
+
+**Findings:**
+- **Clean: UDP fan-out commit latency (K=1) 257 µs beats QUIC 319 µs (~20 %)** — the same UDP
+  win as the per-link ping (§6.4), now in the replicate-to-2-followers model. K=2 (all-acks)
+  is marginally above K=1, as expected (slower follower).
+- **Added delay: ~even** — link delay dominates; transport difference washes out.
+- **Loss is nuanced:** the loss-tolerant ping fix means UDP now produces rows under loss. UDP
+  holds a **tighter tail** (p99 755 µs) but completes **far fewer rounds** (105 vs QUIC's 2213
+  in the window) — NAK + 1 s-timeout recovery is slower *per round* than QUIC's in the raw,
+  un-pipelined ping; QUIC completes many rounds but with a brutal p99 tail (28.6 ms). In the
+  real cluster, openraft's pipelining/retry hides this per-round cost (the transport stays
+  linearizable under 10 % loss, §5).
+
+**Aeron per-link baseline: attempted, not completed.** On ccx33 the Aeron echo got
+substantially wired — channels overridden to the private IPs, all required `LoadTestRig`
+parameters resolved (`message.rate`/`message.length`/`iterations`/`warmup`/`batch.size`/
+`output.file`), `BusySpinIdleStrategy`, and the `echo-server` (EchoNode) confirmed alive on the
+follower — but the cross-host Aeron **connection never established** (`awaitConnected` 60 s
+timeout). The remaining blocker is Aeron's cross-host channel/driver wiring (likely the client
+sharing the node's existing media driver and/or the non-canonical port/endpoint setup), which
+is exactly what the upstream **`remote-echo-benchmarks` orchestrator** manages — but that needs
+its full ~20-variable env (CPU-core pinning per driver/app thread + `*_DESTINATION_CHANNEL` /
+`*_SOURCE_CHANNEL` for both ends). Wiring that orchestrator into the harness is the right way to
+get a canonical Aeron floor and is left as a dedicated follow-up; an ad-hoc `echo-server` +
+`echo-client` launch is not sufficient. Note: a *true* Aeron leader→2-follower **quorum**
+number would additionally require custom Aeron-client Java (publish-to-N + quorum logic) — the
+benchmarks echo is point-to-point only.
+
+**Verdict (updated): keep QUIC default.** The fan-out result reinforces §6.4 — UDP wins
+latency-bound commit RTT on a clean LAN (257 vs 319 µs) — but the loss behavior (slow per-round
+recovery in the raw ping), the still-missing Aeron floor, and the single-inflight/one-payload
+scope all argue against changing the default on this evidence. The harness (split-role ping +
+fan-out + netem + the `up-fanout FANOUT_INSTANCE_TYPE=` knob) is now in place to run the deeper
+comparison cheaply.
+
 ---
 
 ## 7. What's deferred / future work
