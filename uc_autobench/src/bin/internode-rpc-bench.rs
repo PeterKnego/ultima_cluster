@@ -43,15 +43,21 @@ struct Args {
     /// process role: server (persistent responder), client (driver), or both (in-process loopback)
     #[arg(long, value_parser = ["server", "client", "both"], default_value = "both")]
     role: String,
-    /// experiment mode: ladder (open-loop rate driver) or ping (sequential single-inflight RTT probe)
-    #[arg(long, value_parser = ["ladder", "ping"], default_value = "ladder")]
+    /// experiment mode: ladder (open-loop rate driver), ping (sequential single-inflight RTT probe),
+    /// or fanout (one leader → N followers, K-of-N quorum latency; Raft-replication-style)
+    #[arg(long, value_parser = ["ladder", "ping", "fanout"], default_value = "ladder")]
     mode: String,
     /// listen address (role=server)
     #[arg(long, default_value = "0.0.0.0:9000")]
     listen: SocketAddr,
-    /// server address to connect to (role=client; required)
-    #[arg(long)]
-    connect: Option<SocketAddr>,
+    /// server address(es) to connect to (role=client; required). Comma-separated list of
+    /// SocketAddr — ping/ladder use the first; fanout requires ≥2 targets (the N followers).
+    #[arg(long, value_delimiter = ',')]
+    connect: Vec<SocketAddr>,
+    /// fanout quorum K (K-of-N acks to commit a round). 0 = AUTO: Raft majority of an
+    /// (N+1)-node cluster minus the leader's own vote = floor((N+1)/2). Validated 1 ≤ K ≤ N.
+    #[arg(long, default_value_t = 0)]
+    quorum: usize,
     /// echo payload size in bytes
     #[arg(long, default_value_t = 64)]
     payload: usize,
@@ -167,6 +173,116 @@ async fn run_ping(
     Ok((hist, achieved, failed))
 }
 
+/// Per-target ok/fail tally for the fanout summary line.
+#[derive(Clone, Copy, Default)]
+struct TargetStats {
+    ok: u64,
+    fail: u64,
+}
+
+/// Outcome of a fanout run: quorum-latency histogram (PRIMARY), all-acks
+/// histogram (SECONDARY), and round/per-target accounting for the stderr summary.
+struct FanoutResult {
+    quorum_hist: Histogram<u64>,
+    all_acks_hist: Histogram<u64>,
+    rounds: u64,
+    quorum_miss: u64,
+    per_target: Vec<TargetStats>,
+    achieved: f64,
+}
+
+/// Fan-out (Raft-replication-style) round loop. One "leader" client fans the
+/// same payload out to N "follower" `EchoClient`s CONCURRENTLY each round and
+/// measures the time to reach QUORUM (K-of-N acks) — modeling a Raft leader
+/// replicating a log entry and committing on majority ack.
+///
+/// Rounds are SEQUENTIAL (single round in flight, Raft-faithful: the leader
+/// sends one entry, waits for commit, then sends the next). Within a round:
+///   - capture `t0`, fire N concurrent RPCs (each wrapped in a 1s per-RPC
+///     timeout, like `run_ping`),
+///   - drain completions via `FuturesUnordered`; on the K-th SUCCESS record
+///     `t0.elapsed()` into the PRIMARY (quorum) histogram,
+///   - keep draining; when all N have completed-or-failed record the slowest
+///     SUCCESS's `t0.elapsed()` into the SECONDARY (all-acks) histogram.
+///   - if fewer than K succeed (loss/timeout) → count a quorum-miss, record no
+///     quorum latency, continue. Loss-tolerant: the run is never aborted.
+async fn run_fanout(
+    clients: &[EchoClient],
+    quorum_k: usize,
+    duration: Duration,
+    payload: usize,
+) -> anyhow::Result<FanoutResult> {
+    let n = clients.len();
+    let mut quorum_hist = Histogram::<u64>::new_with_bounds(1, 600_000_000_000, 3)?;
+    let mut all_acks_hist = Histogram::<u64>::new_with_bounds(1, 600_000_000_000, 3)?;
+    let mut per_target = vec![TargetStats::default(); n];
+    let body = Bytes::from(vec![0u8; payload]);
+    let rpc_timeout = Duration::from_secs(1);
+
+    let start = Instant::now();
+    let deadline = start + duration;
+    let mut rounds: u64 = 0;
+    let mut quorum_miss: u64 = 0;
+
+    while Instant::now() < deadline {
+        let t0 = Instant::now();
+        // Fire N concurrent RPCs, one per follower, tagging each with its index
+        // so per-target stats are attributable as completions stream in.
+        let mut inflight = FuturesUnordered::new();
+        for (idx, client) in clients.iter().enumerate() {
+            let body = body.clone();
+            inflight.push(async move {
+                let res = tokio::time::timeout(rpc_timeout, client.rpc(body)).await;
+                let ok = matches!(res, Ok(Ok(_)));
+                (idx, ok, t0.elapsed())
+            });
+        }
+
+        let mut successes: usize = 0;
+        let mut quorum_recorded = false;
+        let mut slowest_success: Option<Duration> = None;
+
+        while let Some((idx, ok, elapsed)) = inflight.next().await {
+            if ok {
+                per_target[idx].ok += 1;
+                successes += 1;
+                // K-th success → quorum reached: record quorum latency once.
+                if successes == quorum_k && !quorum_recorded {
+                    quorum_hist.record((elapsed.as_nanos() as u64).min(600_000_000_000))?;
+                    quorum_recorded = true;
+                }
+                // Track the slowest success for the all-acks histogram. Since
+                // completions arrive in time order, the last success is slowest.
+                slowest_success = Some(elapsed);
+            } else {
+                per_target[idx].fail += 1;
+            }
+        }
+
+        rounds += 1;
+        if quorum_recorded {
+            // All N done; if any succeeded, record the slowest-success latency
+            // as the "all-acks" (responses-for-all) latency.
+            if let Some(slow) = slowest_success {
+                all_acks_hist.record((slow.as_nanos() as u64).min(600_000_000_000))?;
+            }
+        } else {
+            // Fewer than K succeeded → quorum miss. No quorum latency recorded.
+            quorum_miss += 1;
+        }
+    }
+
+    let achieved = quorum_hist.len() as f64 / start.elapsed().as_secs_f64();
+    Ok(FanoutResult {
+        quorum_hist,
+        all_acks_hist,
+        rounds,
+        quorum_miss,
+        per_target,
+        achieved,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn csv_row(
     system: &str,
@@ -222,27 +338,123 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // --- client / both: build the echo client (+ owned server for `both`). ---
+    // --- fanout mode: client-only, multi-target. Build N EchoClients (the
+    //     followers), resolve the quorum K, run the round loop, emit CSV. ---
+    if args.mode == "fanout" {
+        if args.role != "client" {
+            anyhow::bail!("--mode fanout requires --role client");
+        }
+        let targets = &args.connect;
+        if targets.len() < 2 {
+            anyhow::bail!(
+                "--mode fanout requires ≥2 --connect targets (got {}); pass a comma-separated list, e.g. --connect host1:9500,host2:9501",
+                targets.len()
+            );
+        }
+        let n = targets.len();
+        // AUTO quorum: Raft majority of an (N+1)-node cluster (leader + N
+        // followers) minus the leader's own vote = floor((N+1)/2).
+        let quorum_k = if args.quorum == 0 {
+            // floor((N+1)/2) == ceil(N/2) for all N ≥ 1.
+            n.div_ceil(2)
+        } else {
+            args.quorum
+        };
+        if quorum_k < 1 || quorum_k > n {
+            anyhow::bail!("--quorum K={quorum_k} out of range; require 1 ≤ K ≤ N (N={n})");
+        }
+
+        // Build one EchoClient per target up front.
+        let mut clients = Vec::with_capacity(n);
+        for &target in targets {
+            let c = match args.transport.as_str() {
+                "udp" => udp_echo_client(target).await?,
+                "quic" => quic_echo_client(target).await?,
+                other => anyhow::bail!("unknown transport {other}"),
+            };
+            clients.push(c);
+        }
+        let fanout_system = match args.transport.as_str() {
+            "udp" => "udp-fanout",
+            "quic" => "quic-fanout",
+            _ => unreachable!(),
+        };
+
+        eprintln!(
+            "internode-rpc-bench: role=client mode=fanout transport={} N={} K={} payload={}B duration={}s targets={:?}",
+            args.transport, n, quorum_k, args.payload, args.duration, targets
+        );
+
+        // Warmup (discarded): connection setup, TLS handshake, page-ins.
+        let _ = run_fanout(
+            &clients,
+            quorum_k,
+            Duration::from_secs_f64(1.0),
+            args.payload,
+        )
+        .await;
+        let r = run_fanout(
+            &clients,
+            quorum_k,
+            Duration::from_secs_f64(args.duration),
+            args.payload,
+        )
+        .await?;
+
+        // STDERR summary: per-target ok/fail + the all-acks p50/p99 (so
+        // "responses for all" is visible alongside the quorum-latency CSV).
+        let per_target_str: Vec<String> = r
+            .per_target
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("target[{i}] ok={} fail={}", s.ok, s.fail))
+            .collect();
+        eprintln!(
+            "fanout: N={} K={} rounds={} quorum_miss={} | {} | all-acks p50={}us p99={}us",
+            n,
+            quorum_k,
+            r.rounds,
+            r.quorum_miss,
+            per_target_str.join(" | "),
+            r.all_acks_hist.value_at_quantile(0.50) / 1000,
+            r.all_acks_hist.value_at_quantile(0.99) / 1000,
+        );
+
+        // PRIMARY CSV row: quorum-latency histogram; inflight column = N (the
+        // fan-out width); count = rounds that reached quorum. Always emitted.
+        let row = csv_row(
+            fanout_system,
+            &args.config,
+            "rpc-fanout",
+            args.payload,
+            n,
+            args.rate,
+            r.achieved,
+            &r.quorum_hist,
+        );
+        println!("{CSV_HEADER}");
+        println!("{row}");
+        return Ok(());
+    }
+
+    // --- client / both (ping/ladder): build the echo client (+ owned server
+    //     for `both`). These modes use the FIRST --connect target. ---
+    let first_connect = || -> anyhow::Result<SocketAddr> {
+        args.connect
+            .first()
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("--connect is required for role=client"))
+    };
     let (system, client, server): (&str, EchoClient, Option<_>) = match args.transport.as_str() {
         "udp" => match args.role.as_str() {
-            "client" => {
-                let connect = args
-                    .connect
-                    .ok_or_else(|| anyhow::anyhow!("--connect is required for role=client"))?;
-                ("udp-rpc", udp_echo_client(connect).await?, None)
-            }
+            "client" => ("udp-rpc", udp_echo_client(first_connect()?).await?, None),
             _ => {
                 let (c, s) = udp_echo_pair().await?;
                 ("udp-rpc", c, Some(s))
             }
         },
         "quic" => match args.role.as_str() {
-            "client" => {
-                let connect = args
-                    .connect
-                    .ok_or_else(|| anyhow::anyhow!("--connect is required for role=client"))?;
-                ("quic-rpc", quic_echo_client(connect).await?, None)
-            }
+            "client" => ("quic-rpc", quic_echo_client(first_connect()?).await?, None),
             _ => {
                 let (c, s) = quic_echo_pair().await?;
                 ("quic-rpc", c, Some(s))
