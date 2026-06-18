@@ -19,8 +19,9 @@
 #   1. Applies tc-netem SYMMETRICALLY on all relevant nodes via SSH (idempotent
 #      del-first). delay=D ms adds ~D to each leg (≈2D to RTT); loss=L% is
 #      applied per-direction. Shaping is identical across all transports so
-#      the A/B comparison is apples-to-apples. Applied to NETEM_IFACE (default:
-#      enp7s0, Hetzner private-network iface).
+#      the A/B comparison is apples-to-apples. Applied to NETEM_IFACE, which is
+#      auto-detected per cloud (the iface owning the private inter-node IP —
+#      enp7s0 on Hetzner, ens5 on AWS) unless explicitly overridden.
 #   2. SSHs the client node to run the internode-rpc-bench binary:
 #      - ping:   node1 → node0's PRIVATE IP (NODE0_CONNECT).
 #      - fanout: node0 → node1's + node2's PRIVATE IPs (comma-separated
@@ -48,8 +49,9 @@
 #   INFLIGHT         inflight cap for ladder mode (default: 128)
 #   NETEM_DELAYS     space-separated one-way delay values in ms (default: "0 1 5")
 #   NETEM_LOSS       space-separated loss values in pct (default: "0 1")
-#   NETEM_IFACE      NIC to shape on all nodes (default: enp7s0 —
-#                    Hetzner private-network iface; override per cloud)
+#   NETEM_IFACE      NIC to shape on all nodes. Default: auto-detected as the
+#                    iface owning the private inter-node IP (enp7s0 on Hetzner,
+#                    ens5 on AWS); set explicitly to override.
 #   SSH_USER         SSH login user (default: read from inventory ansible_user)
 #   SSH_KEY          path to SSH private key (default: read from inventory)
 #   SSH_OPTS         extra SSH options (default: -o StrictHostKeyChecking=accept-new)
@@ -212,9 +214,33 @@ RATE="${RATE:-20000}"
 INFLIGHT="${INFLIGHT:-128}"
 NETEM_DELAYS="${NETEM_DELAYS:-0 1 5}"    # one-way delay ms; 0 = no shaping
 NETEM_LOSS="${NETEM_LOSS:-0 1}"          # packet loss pct; 0 = no shaping
-NETEM_IFACE="${NETEM_IFACE:-enp7s0}"  # NIC to shape on all relevant nodes
-                                       # (enp7s0 = Hetzner private-network iface;
-                                       #  override per cloud, e.g. NETEM_IFACE=eth0)
+# NIC to shape with netem on every node in the experiment.  Cloud-agnostic:
+# an explicit NETEM_IFACE wins; otherwise we auto-detect the iface that OWNS the
+# private inter-node IP (enp7s0 on Hetzner, ens5 on AWS Nitro, eth0 elsewhere).
+# Detection SSHes node0 — all nodes share one image, so one answer applies to
+# all.  In dry-run (no SSH) we fall back to the Hetzner default.
+detect_netem_iface() {
+  local priv="${NODE0_PRIVATE_IP:-}"
+  [[ -z "$priv" ]] && return 1
+  # `ip -o -4 addr show` field $4 is "<addr>/<prefix>"; match the one starting
+  # with the private IP and print its iface (field $2).  index()==1 avoids
+  # treating the dots in the IP as regex wildcards.
+  ssh_run "${NODE0_IP}" \
+    "ip -o -4 addr show | awk -v ip='${priv}' 'index(\$4, ip\"/\")==1 {print \$2; exit}'" 2>/dev/null
+}
+if [[ -n "${NETEM_IFACE:-}" ]]; then
+  :  # explicit override — trust it as-is
+elif [[ "$DRY_RUN" -eq 1 ]]; then
+  NETEM_IFACE="enp7s0"  # cannot SSH in dry-run; assume Hetzner default
+else
+  NETEM_IFACE="$(detect_netem_iface || true)"
+  if [[ -z "${NETEM_IFACE:-}" ]]; then
+    echo "[warn] could not auto-detect netem iface from node0 (private IP ${NODE0_PRIVATE_IP:-<none>}); falling back to enp7s0 — override with NETEM_IFACE=<iface>" >&2
+    NETEM_IFACE="enp7s0"
+  else
+    echo "[info] auto-detected NETEM_IFACE=${NETEM_IFACE} (owns private IP ${NODE0_PRIVATE_IP})" >&2
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # Remote binary paths (match group_vars/all.yml defaults)
