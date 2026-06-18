@@ -78,7 +78,7 @@ All results append to `uc_autobench/tasks/netping/results.tsv`.
 | `INFLIGHT`      | `128`                              | Inflight cap for ladder mode        |
 | `NETEM_DELAYS`  | `0 1 5`                            | One-way delay values (ms)           |
 | `NETEM_LOSS`    | `0 1`                              | Packet loss values (pct)            |
-| `NETEM_IFACE`   | `eth0`                             | NIC to shape on node0               |
+| `NETEM_IFACE`   | `eth0`                             | NIC to shape on both node0 and node1|
 | `SSH_USER`      | from inventory `ansible_user`      | SSH login user                      |
 | `SSH_KEY`       | from inventory key file            | SSH private key path                |
 | `UC_TARGET_BIN` | `/opt/bench/uc/target/release`     | Binary dir on both hosts            |
@@ -129,10 +129,14 @@ launcher names match the built `aeron-io/benchmarks` dist.
 
 ## Notes
 
-- netem is applied to node0's uplink (`NETEM_IFACE`); this shapes traffic in
-  one direction.  For symmetric shaping, apply to node1 as well (not yet
-  implemented — extend `netem_apply` if needed).
-- The cleanup trap in the driver ensures netem is always removed from node0 on
-  EXIT/INT/TERM, so a failed run never leaves shaping applied.
+- netem is applied **symmetrically on both node0 and node1** (`NETEM_IFACE`,
+  default eth0).  `delay=D ms` adds ~D to each leg (≈2D to RTT); `loss=L%` is
+  applied per-direction.  This means "delay=5ms" produces a clean ≈10ms RTT
+  increase, and the impairment is identical across all transports so the A/B
+  comparison is apples-to-apples.  The baseline cell (delay=0, loss=0) applies
+  no shaping on either host.
+- The cleanup trap in the driver ensures netem is always removed from **both**
+  node0 and node1 on EXIT/INT/TERM, so a failed run never leaves either host
+  shaped.
 - The driver is idempotent: re-running appends new rows; it does not overwrite.
   To reset, truncate `results.tsv` to the header row.
