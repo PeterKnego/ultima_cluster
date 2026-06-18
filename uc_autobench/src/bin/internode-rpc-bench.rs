@@ -251,9 +251,9 @@ async fn run_fanout(
                     quorum_hist.record((elapsed.as_nanos() as u64).min(600_000_000_000))?;
                     quorum_recorded = true;
                 }
-                // Track the slowest success for the all-acks histogram. Since
-                // completions arrive in time order, the last success is slowest.
-                slowest_success = Some(elapsed);
+                // FuturesUnordered does not guarantee completions resume in wall-clock
+                // order, so take the max rather than trusting the last write.
+                slowest_success = Some(slowest_success.map_or(elapsed, |prev| prev.max(elapsed)));
             } else {
                 per_target[idx].fail += 1;
             }
@@ -401,8 +401,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
 
-        // STDERR summary: per-target ok/fail + the all-acks p50/p99 (so
-        // "responses for all" is visible alongside the quorum-latency CSV).
+        // STDERR summary: per-target ok/fail + the all-acks p50/p99 (recorded
+        // only on quorum-reached rounds; rounds that miss quorum contribute nothing).
         let per_target_str: Vec<String> = r
             .per_target
             .iter()
@@ -410,7 +410,7 @@ async fn main() -> anyhow::Result<()> {
             .map(|(i, s)| format!("target[{i}] ok={} fail={}", s.ok, s.fail))
             .collect();
         eprintln!(
-            "fanout: N={} K={} rounds={} quorum_miss={} | {} | all-acks p50={}us p99={}us",
+            "fanout: N={} K={} rounds={} quorum_miss={} | {} | all-acks p50={}us p99={}us (quorum-reached only)",
             n,
             quorum_k,
             r.rounds,
