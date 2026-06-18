@@ -388,6 +388,51 @@ and is competitive at larger payloads; whether it wins on a real LAN is an open 
 settled by the cross-host A/B above **before** the default is reconsidered. Don't oversell the
 loopback numbers in either direction.
 
+### 6.4 Cross-host results (REAL LAN — the deciding A/B, run 2026-06-18)
+
+Ran on **2× Hetzner `ccx13`** (2 dedicated vCPU), node↔node over the **private network**
+(`enp7s0`), single-inflight `ping` mode (sequential RTT — the latency-bound regime), 64 B,
+symmetric `tc netem` applied per leg on both hosts. This is the cross-host run §6.3 deferred to
+the operator, executed via the split-role harness (`internode-rpc-bench --role server` on
+node0, `--role client` on node1; `make up-ping` → sweep → `make destroy`).
+
+| netem (per leg) | UDP p50 / p99 | QUIC p50 / p99 |
+|---|--:|--:|
+| **clean** | **0.305 ms / 0.413 ms** | 0.339 ms / 0.467 ms |
+| +1 ms (~2 ms RTT) | 2.42 ms / 3.97 ms | 2.49 ms / 3.08 ms |
+| +5 ms (~10 ms RTT) | 10.76 ms / 11.58 ms | 10.83 ms / 13.10 ms |
+| 1 % loss | *(no row — harness gap)* | 0.356 ms / **28.5 ms** |
+| +5 ms, 1 % loss | *(no row)* | 10.78 ms / **59 ms** |
+
+**Findings:**
+- **Clean LAN: UDP wins** — p50 305 vs 339 µs (~10 % lower) *and* p99 413 vs 467 µs. The
+  leaner-path advantage loopback could not show **does** appear once there's a real network.
+  This **inverts the loopback small-payload verdict** (§6.3) for the latency-bound, single-
+  inflight case.
+- **Under added delay: ~even** — link delay dominates and the transport difference washes out
+  (both ≈2.4 ms at +1 ms, ≈10.8 ms at +5 ms; QUIC slightly better p99 at +1 ms).
+- **Under loss: incomplete on the UDP side — a HARNESS gap, not a transport defect.** The
+  single-inflight echo-`ping` has no retry layer, so the first loss-hit RPC errors and aborts
+  the run → no UDP row. The UDP *transport* recovers loss fine in the actual cluster
+  (linearizable under 10 % loss, §5) because openraft retries; the raw ping doesn't. QUIC's
+  ping survives loss but with a severe p99 tail (28–59 ms — head-of-line + retransmit). To
+  measure UDP-under-loss fairly the ping client needs a per-RPC timeout-and-count (or use the
+  open-loop `ladder` mode, which tolerates drops). Tracked as harness follow-up.
+
+**Aeron baseline: deferred (infeasible on the cheap fleet).** The canonical Aeron RTT harness
+(`remote-echo-benchmarks` → `echo-server` / `echo-client`) requires **≥4 isolated busy-spin CPU
+cores per host** (driver conductor/sender/receiver + load-rig/echo) — which does not fit
+2-vCPU `ccx13`. Launchers were identified on the live dist and `aeron_echo_launcher` corrected
+to `echo-server`; a fair Aeron floor needs a ≥4-dedicated-core instance (e.g. `ccx33`) — a
+future run.
+
+**Updated verdict:** the cross-host clean-LAN result is the first evidence UDP's design pays
+off where it is meant to (latency-bound, real network), and it inverts the loopback small-
+payload finding. It is **not yet a mandate to switch the default**: one fleet, one payload,
+single-inflight, no Aeron floor, and the loss axis unmeasured for UDP. **Keep QUIC default**;
+the UDP-favorable LAN signal warrants a deeper cross-host run (throughput/inflight sweep + a
+loss-tolerant ping + the Aeron baseline on dedicated cores) before the default is reconsidered.
+
 ---
 
 ## 7. What's deferred / future work

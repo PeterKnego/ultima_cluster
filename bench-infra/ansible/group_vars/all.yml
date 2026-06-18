@@ -50,7 +50,7 @@ netping_quic_port: 9101  # internode-rpc-bench --transport quic --listen 0.0.0.0
 # provision — the aeron-io/benchmarks repo names the remote echo responder
 # launcher 'echo' (older trees may call it 'remote'); netping_serve checks the
 # script is present and fails fast with a hint if this name is wrong.
-aeron_echo_launcher: "echo"
+aeron_echo_launcher: "echo-server"   # verified on live aeron-io/benchmarks dist 2026-06-18 (was "echo"; RTT client = "echo-client"). NOTE: a FAIR Aeron baseline needs >=4 isolated busy-spin cores/host (remote-echo-benchmarks pins driver conductor/sender/receiver + load-rig) — ccx13 (2 vCPU) is too small; use ccx33 for the Aeron run.
 
 # --- Results ---
 results_local_dir: "{{ playbook_dir }}/../../bench-out/dist"
