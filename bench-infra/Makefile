@@ -13,9 +13,12 @@ export
 
 TF      := terraform -chdir=terraform
 TFVARS  ?= terraform.tfvars
-# Instance type for the fan-out fleet. Default ccx13 (cheap, fine for UC-only);
-# override to a >=4-dedicated-core type (e.g. ccx33) when running the Aeron
-# baseline, which needs ~4 isolated busy-spin cores/host:  make up-fanout FANOUT_INSTANCE_TYPE=ccx33
+# Instance type for the ping / fan-out fleets. Default ccx13 = the Hetzner
+# default; override per cloud, e.g. on AWS:
+#   make up-ping   PING_INSTANCE_TYPE=c7i.4xlarge
+#   make up-fanout FANOUT_INSTANCE_TYPE=c7i.4xlarge
+# For the fan-out Aeron baseline use a >=4-dedicated-core type (ccx33 on Hetzner).
+PING_INSTANCE_TYPE   ?= ccx13
 FANOUT_INSTANCE_TYPE ?= ccx13
 ANSIBLE := ansible-playbook
 SSH_KEY := $(shell awk -F'"' '/ssh_private_key_file/{print $$2}' $(TFVARS))
@@ -36,7 +39,7 @@ up-uc: ## provision a UC-only fleet (no Aeron) for the throughput loop
 	cd ansible && SSH_PRIVATE_KEY_FILE=$(SSH_KEY) $(ANSIBLE) provision.yml -e aeron_enabled=false
 
 up-ping: ## provision a 2-host ccx13 fleet + persistent UC/Aeron echo responders (cross-host ping harness)
-	TF_VAR_node_count=2 TF_VAR_instance_type=ccx13 $(TF) apply -auto-approve -var-file=../$(TFVARS)
+	TF_VAR_node_count=2 TF_VAR_instance_type=$(PING_INSTANCE_TYPE) $(TF) apply -auto-approve -var-file=../$(TFVARS)
 	$(MAKE) inventory
 	cd ansible && SSH_PRIVATE_KEY_FILE=$(SSH_KEY) $(ANSIBLE) netping.yml
 
