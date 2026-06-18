@@ -277,6 +277,15 @@ build_env() {
     "SERVER_CPU_NODE=${SERVER_CPU_NODE_OVR}"
     "SERVER_DESTINATION_CHANNEL=${DEST_CHANNEL}"
     "SERVER_SOURCE_CHANNEL=${SRC_CHANNEL}"
+    # DPDK driver vars: the orchestrator substitutes driver_aeron_dpdk_*_var
+    # UNCONDITIONALLY for every driver (line ~273) and dereferences these under
+    # `set -u`, so they must merely EXIST even when --client/server-drivers=java
+    # (which contains no DPDK placeholder, so the values are never used). Set
+    # them so a non-DPDK host doesn't abort with an unbound-variable error.
+    "CLIENT_AERON_DPDK_GATEWAY_IPV4_ADDRESS="
+    "CLIENT_AERON_DPDK_LOCAL_IPV4_ADDRESS="
+    "SERVER_AERON_DPDK_GATEWAY_IPV4_ADDRESS="
+    "SERVER_AERON_DPDK_LOCAL_IPV4_ADDRESS="
     # remote-benchmarks-runner required_vars (SSH targets). node0 = client,
     # node1 = server. SSH uses the PUBLIC ansible_host IP.
     "SSH_CLIENT_USER=${SSH_USER}"
