@@ -120,7 +120,7 @@ All results append to `uc_autobench/tasks/netping/results.tsv`.
 | `INFLIGHT`      | `128`                              | Inflight cap for ladder mode        |
 | `NETEM_DELAYS`  | `0 1 5`                            | One-way delay values (ms)           |
 | `NETEM_LOSS`    | `0 1`                              | Packet loss values (pct)            |
-| `NETEM_IFACE`   | `enp7s0`                           | NIC to shape on all nodes (Hetzner private-network iface; override per cloud, e.g. `NETEM_IFACE=eth0`) |
+| `NETEM_IFACE`   | _auto-detected_                    | NIC to shape on all nodes. Auto-detected as the iface owning the private inter-node IP (`enp7s0` on Hetzner, `ens5` on AWS); set explicitly to override |
 | `SSH_USER`      | from inventory `ansible_user`      | SSH login user                      |
 | `SSH_KEY`       | from inventory key file            | SSH private key path                |
 | `UC_TARGET_BIN` | `/opt/bench/uc/target/release`     | Binary dir on both hosts            |
@@ -173,6 +173,92 @@ Aeron fanout is not implemented (the `aeron-io/benchmarks` echo launcher is
 designed for sequential ping, not fan-out). Aeron transport is silently skipped
 when `EXPERIMENT=fanout`.
 
+## Aeron per-link RTT floor (canonical orchestrator)
+
+`uc_autobench/scripts/aeron-echo-baseline.sh` wires the **canonical
+aeron-io/benchmarks orchestrator** (`remote-echo-benchmarks`, built into
+`/opt/bench/aeron-deploy/` by the `build_aeron` role, ref pinned by
+`aeron_benchmarks_ref` in `group_vars/all.yml`) to produce a turnkey
+point-to-point Aeron echo RTT floor over the same node0<->node1 link.
+
+This replaces the ad-hoc `echo-server` + `echo-client` launch that FAILED
+cross-host (`awaitConnected` 60s timeout) even with channels + all LoadTestRig
+params set: the orchestrator manages the media-driver lifecycle, channels, CPU
+pinning, SSH, and result collection, which the ad-hoc launch did not.
+
+### How to run
+
+```bash
+make -C bench-infra up-fanout FANOUT_INSTANCE_TYPE=ccx33   # 3x ccx33 (8 vCPU)
+bash uc_autobench/scripts/aeron-echo-baseline.sh           # control-side driver
+# inspect: DRY_RUN=1 bash uc_autobench/scripts/aeron-echo-baseline.sh
+```
+
+It resolves node0 = client/leader and node1 = server/follower from
+`bench-infra/inventory/hosts.yml` (public `ansible_host` for SSH, `private_ip`
+for the Aeron channels), exports every orchestrator env var, and runs the
+orchestrator. HDR result tarballs land in `bench-out/aeron-echo/`; normalize
+p50/p99 with `uc_autobench/scripts/aeron_hdr_to_csv.py`.
+
+### Why ccx33 (>=4 isolated cores)
+
+A FAIR Aeron baseline pins the media-driver **conductor / sender / receiver**
+threads (3 busy-spin cores) plus the **app thread** (LoadTestRig on the client,
+EchoNode on the server) = 4 isolated cores/host. The script assigns cores
+1/2/3 to the driver threads and core 4 to the app; cores 0,5,6,7 stay
+non-isolated for the JVM/numactl/GC/OS. `CPU_NODE=0` (single NUMA node on
+ccx33). ccx13 (2 vCPU) is too small — provision ccx33.
+
+### PER-LINK, not a quorum number
+
+Aeron echo is point-to-point (one client, one server). This is a per-link RTT
+floor, NOT a Raft commit/quorum latency. For the K-of-N quorum model use the UC
+`EXPERIMENT=fanout` path above.
+
+### Upstream contract confirmed (aeron-io/benchmarks @ master, 2026-06-18)
+
+- **SSH / invocation model**: `remote-echo-benchmarks` sources
+  `remote-benchmarks-helper`, which sources `../remote-benchmarks-runner`. The
+  orchestrator runs from a **control box** and SSHes BOTH hosts itself via
+  `execute_remote_command` (`ssh -i $SSH_*_KEY_FILE $SSH_*_USER@$SSH_*_NODE`).
+  It starts the server (EchoNode) then the client (LoadTestRig), each behind its
+  own media driver, pins threads with `taskset`, then `scp`s an HDR results
+  tarball back to `--download-dir`. **There is NO client<->server SSH
+  requirement** — only control->each-host.
+- **Required env** (the script's own `required_vars` array): the 20
+  `CLIENT_*`/`SERVER_*` vars (JAVA_HOME, BENCHMARKS_PATH, the 3 driver cores,
+  the app core [`LOAD_TEST_RIG_MAIN`/`ECHO`], NON_ISOLATED_CPU_CORES, CPU_NODE,
+  DESTINATION_CHANNEL, SOURCE_CHANNEL). The sourced runner adds 6 more it
+  validates itself: `SSH_{CLIENT,SERVER}_{USER,KEY_FILE,NODE}`.
+- **Channels**: `DESTINATION_CHANNEL` = where the client publishes / the server
+  subscribes (the SERVER's endpoint, node1). `SOURCE_CHANNEL` = where the server
+  echoes / the client subscribes (the CLIENT's endpoint, node0). Form
+  `aeron:udp?endpoint=IP:PORT|mtu=MTU`.
+- **Run matrix** (runner env): `RUNS`, `ITERATIONS`, `WARMUP_ITERATIONS`,
+  `WARMUP_MESSAGE_RATE`, `MESSAGE_RATE` (csv), `MESSAGE_LENGTH` (csv, MUST be the
+  same length as MESSAGE_RATE — runner asserts), `BURST_SIZE` (csv = batch.size).
+- **Invocation args**: `remote-echo-benchmarks --client-drivers <csv>
+  --server-drivers <csv> [--mtu csv] [--context label] [--download-dir dir]`.
+  Supported drivers include `java` (used here), `c`, `c-ef-vi`, `c-dpdk`, etc.
+
+### VERIFY on first provision
+
+1. **`node0 -> node1` SSH**: the script runs the orchestrator ON node0 over SSH
+   (node0 has the dist), and the orchestrator then SSHes node1 as the server.
+   So node0 needs the deployed PRIVATE key to reach node1. The fleet deploys the
+   same key to all hosts; confirm the private key is present on node0 (or push
+   it / run the orchestrator from a control box that has the scripts dir
+   locally). The bench key is `/home/claude/.ssh/id_ed25519`.
+2. **`JAVA_HOME_REMOTE`**: defaults to `/usr/lib/jvm/java-21-openjdk-amd64`
+   (jdk_version 21). Confirm with
+   `ssh node0 'dirname $(dirname $(readlink -f $(which javac)))'`; override
+   `JAVA_HOME_REMOTE=` if it differs.
+3. **Driver list**: `--client-drivers java --server-drivers java` is the safe
+   default; switch to `c` only if the C media driver was built into the dist.
+4. **HDR parse schema**: confirm `aeron_hdr_to_csv.py`'s percentile-table regex
+   matches the LoadTestRig HDR output layout (it was written for the cping
+   classic table); adjust if the columns differ.
+
 ## Frozen paths (never edit)
 
 - `uc_autobench/tasks/netping/results.tsv`  (append-only; owned by the driver)
@@ -192,7 +278,7 @@ when `EXPERIMENT=fanout`.
   all three nodes (node0 + node1 + node2) on `NETEM_IFACE`. This ensures all
   legs of the fan-out are uniformly impaired, giving an apples-to-apples
   comparison with the ping experiment.
-- netem is applied **symmetrically** on `NETEM_IFACE` (default `enp7s0`).
+- netem is applied **symmetrically** on `NETEM_IFACE` (auto-detected per cloud).
   `delay=D ms` adds ~D to each leg (≈2D to RTT); `loss=L%` is applied
   per-direction. The baseline cell (delay=0, loss=0) applies no shaping.
 - The cleanup trap ensures netem is always removed from **all** shaped nodes
