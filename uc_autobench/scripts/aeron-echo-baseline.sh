@@ -288,12 +288,18 @@ build_env() {
     "SERVER_AERON_DPDK_LOCAL_IPV4_ADDRESS="
     # remote-benchmarks-runner required_vars (SSH targets). node0 = client,
     # node1 = server. SSH uses the PUBLIC ansible_host IP.
+    # These SSH targets are used BY THE ORCHESTRATOR, which runs ON node0 — not
+    # from the control box. So they must be reachable node->node: use the
+    # PRIVATE IPs (allowed by the intra-cluster SG rule; the public IPs are only
+    # open to the control box) and a key path that exists ON node0
+    # (ORCH_REMOTE_KEY — the control box's SSH_KEY path generally does not exist
+    # on the node). Overridable; default to private IPs with a public fallback.
     "SSH_CLIENT_USER=${SSH_USER}"
-    "SSH_CLIENT_KEY_FILE=${SSH_KEY}"
-    "SSH_CLIENT_NODE=${NODE0_IP}"
+    "SSH_CLIENT_KEY_FILE=${ORCH_REMOTE_KEY:-${SSH_KEY}}"
+    "SSH_CLIENT_NODE=${ORCH_CLIENT_NODE:-${NODE0_PRIVATE_IP:-${NODE0_IP}}}"
     "SSH_SERVER_USER=${SSH_USER}"
-    "SSH_SERVER_KEY_FILE=${SSH_KEY}"
-    "SSH_SERVER_NODE=${NODE1_IP}"
+    "SSH_SERVER_KEY_FILE=${ORCH_REMOTE_KEY:-${SSH_KEY}}"
+    "SSH_SERVER_NODE=${ORCH_SERVER_NODE:-${NODE1_PRIVATE_IP:-${NODE1_IP}}}"
     # run matrix consumed by the runner
     "RUNS=${RUNS_KNOB}"
     "ITERATIONS=${ITERATIONS_KNOB}"
