@@ -1,15 +1,16 @@
 ---
-# netping_serve — stand up PERSISTENT cross-host echo responders on node0.
+# netping_serve — stand up PERSISTENT cross-host echo responders.
 #
-# A separate uc_autobench driver (built elsewhere) points its --role client
-# --connect at node0's IP:port and runs many ping experiments WITHOUT
-# re-provisioning. This role only stands up the long-lived servers; it never
-# starts a client. Responders are detached via `setsid ... < /dev/null &` so
-# the task returns immediately and they survive the SSH session / playbook end.
+# UC UDP + QUIC responders start on EVERY node so any node can act as a
+# follower in the fan-out (3-node Raft-replication) experiment while also
+# acting as the single server in the 2-node single-target ping experiment.
+# Idle echo servers on the leader (node0) are harmless.
 #
-# All tasks gate on `node_role == "node0"` (node0 = the server host; node1 runs
-# the driver's clients per-experiment). Mirrors the run role's node0 gating and
-# its Aeron media-driver start pattern.
+# Aeron responder gates on `node_role == "node0"` (unchanged — Aeron is
+# deferred; the 2 vCPU ccx13 is too small for a fair Aeron baseline anyway).
+#
+# Responders are detached via `setsid ... < /dev/null &` so the task returns
+# immediately and they survive the SSH session / playbook end.
 
 # --- Idempotent cleanup so re-running netping.yml is safe -------------------
 # Bracket trick on pkill ('[i]nternode' / '[i]o.aeron') so the pattern does not
@@ -20,15 +21,13 @@
     pkill -9 -f '[i]o.aeron' || true
   changed_when: false
   failed_when: false
-  when: node_role == "node0"
 
 - name: Brief settle after cleanup (ports release)
   ansible.builtin.pause:
     seconds: 2
   run_once: true
-  when: node_role == "node0"
 
-# --- UC UDP echo responder --------------------------------------------------
+# --- UC UDP echo responder (all nodes) --------------------------------------
 - name: Start UC UDP echo responder
   ansible.builtin.shell: |
     setsid {{ uc_target_bin }}/internode-rpc-bench \
@@ -36,9 +35,8 @@
       --listen 0.0.0.0:{{ netping_udp_port }} \
       > {{ remote_home }}/netping-udp.out 2>&1 < /dev/null &
   changed_when: false
-  when: node_role == "node0"
 
-# --- UC QUIC echo responder -------------------------------------------------
+# --- UC QUIC echo responder (all nodes) -------------------------------------
 - name: Start UC QUIC echo responder
   ansible.builtin.shell: |
     setsid {{ uc_target_bin }}/internode-rpc-bench \
@@ -46,9 +44,8 @@
       --listen 0.0.0.0:{{ netping_quic_port }} \
       > {{ remote_home }}/netping-quic.out 2>&1 < /dev/null &
   changed_when: false
-  when: node_role == "node0"
 
-# --- Aeron echo responder (media driver + benchmarks echo launcher) ---------
+# --- Aeron echo responder (node0 only — deferred; ccx13 too small) ----------
 # Reuses the existing media-driver launcher under {{ aeron_deploy_dir }} and the
 # benchmarks "echo" responder. The echo launcher name is parameterized
 # (aeron_echo_launcher, default "echo") — VERIFY against the built dist; the
@@ -100,7 +97,6 @@
   ansible.builtin.pause:
     seconds: 3
   run_once: true
-  when: node_role == "node0"
 
 - name: Verify UC UDP responder bound its port
   ansible.builtin.shell: |
@@ -109,7 +105,6 @@
   args:
     executable: /bin/bash
   changed_when: false
-  when: node_role == "node0"
 
 - name: Verify UC QUIC responder bound its (UDP) port
   ansible.builtin.shell: |
@@ -118,7 +113,6 @@
   args:
     executable: /bin/bash
   changed_when: false
-  when: node_role == "node0"
 
 - name: Verify Aeron echo responder process is alive
   ansible.builtin.shell: "pgrep -f '[i]o.aeron' >/dev/null"
@@ -128,8 +122,7 @@
 - name: Report responder endpoints
   ansible.builtin.debug:
     msg: >-
-      netping responders up on {{ private_ip }} (node0):
+      netping responders up on {{ private_ip }} ({{ node_role }}):
       UC-UDP={{ private_ip }}:{{ netping_udp_port }}
       UC-QUIC={{ private_ip }}:{{ netping_quic_port }}
-      {{ 'Aeron-echo via ' + aeron_echo_launcher if (aeron_enabled | default(true) | bool) else 'Aeron disabled' }}
-  when: node_role == "node0"
+      {{ 'Aeron-echo via ' + aeron_echo_launcher if (node_role == "node0" and (aeron_enabled | default(true) | bool)) else 'Aeron: N/A (follower or disabled)' }}
