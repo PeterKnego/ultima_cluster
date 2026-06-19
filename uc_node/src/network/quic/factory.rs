@@ -10,14 +10,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use openraft::network::RaftNetworkFactory;
-use openraft_legacy::network_v1::Adapter;
-use openraft_legacy::network_v1::RaftNetwork as _;
 use quinn::Endpoint;
 use rustls::ClientConfig;
 use tokio::sync::Mutex;
 
 use super::client::PeerConn;
 use super::instance::QuicRaftNetwork;
+use crate::network::{PIPELINE_DEPTH, PipelinedNet};
 use crate::raft::{NodeAddr, NodeId, TypeConfig};
 
 /// Shared map of established peer connections, keyed by NodeId.
@@ -76,9 +75,11 @@ impl QuicRaftNetworkFactory {
 }
 
 impl RaftNetworkFactory<TypeConfig> for QuicRaftNetworkFactory {
-    /// `Adapter` wraps our V1 `QuicRaftNetwork` to satisfy the `RaftNetworkV2`
-    /// bound that `RaftNetworkFactory::Network` requires in openraft 0.10.
-    type Network = Adapter<TypeConfig, QuicRaftNetwork>;
+    /// `PipelinedNet` wraps our V1 `QuicRaftNetwork`, satisfying the
+    /// `RaftNetworkV2` bound that `RaftNetworkFactory::Network` requires in
+    /// openraft 0.10 while overriding `stream_append` with a bounded in-order
+    /// pipeline (see [`crate::network::PipelinedNet`]).
+    type Network = PipelinedNet<QuicRaftNetwork>;
 
     async fn new_client(&mut self, target: NodeId, node: &NodeAddr) -> Self::Network {
         // Do NOT connect here. `RaftNetworkFactory::new_client` can't return a
@@ -95,6 +96,6 @@ impl RaftNetworkFactory<TypeConfig> for QuicRaftNetworkFactory {
         );
         #[cfg(feature = "fault-injection")]
         let net = net.with_fault(self.source, self.fault_table.clone());
-        net.into_v2()
+        PipelinedNet::new(net, PIPELINE_DEPTH)
     }
 }

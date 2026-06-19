@@ -8,11 +8,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use openraft::network::RaftNetworkFactory;
-use openraft_legacy::network_v1::Adapter;
-use openraft_legacy::network_v1::RaftNetwork as _;
 
 use super::instance::UdpRaftNetwork;
 use super::mux::UdpMux;
+use crate::network::{PIPELINE_DEPTH, PipelinedNet};
 use crate::raft::{NodeAddr, NodeId, TypeConfig};
 
 pub struct UdpRaftNetworkFactory {
@@ -55,9 +54,11 @@ impl UdpRaftNetworkFactory {
 }
 
 impl RaftNetworkFactory<TypeConfig> for UdpRaftNetworkFactory {
-    /// `Adapter` wraps our V1 `UdpRaftNetwork` to satisfy the `RaftNetworkV2`
-    /// bound that `RaftNetworkFactory::Network` requires in openraft 0.10.
-    type Network = Adapter<TypeConfig, UdpRaftNetwork>;
+    /// `PipelinedNet` wraps our V1 `UdpRaftNetwork`, satisfying the
+    /// `RaftNetworkV2` bound that `RaftNetworkFactory::Network` requires in
+    /// openraft 0.10 while overriding `stream_append` with a bounded in-order
+    /// pipeline (see [`crate::network::PipelinedNet`]).
+    type Network = PipelinedNet<UdpRaftNetwork>;
 
     async fn new_client(&mut self, target: NodeId, node: &NodeAddr) -> Self::Network {
         let net = UdpRaftNetwork::new(
@@ -73,6 +74,6 @@ impl RaftNetworkFactory<TypeConfig> for UdpRaftNetworkFactory {
         self.mux.register_peer(node.raft_addr, target);
         #[cfg(feature = "fault-injection")]
         let net = net.with_fault(self.source, self.fault_table.clone());
-        net.into_v2()
+        PipelinedNet::new(net, PIPELINE_DEPTH)
     }
 }

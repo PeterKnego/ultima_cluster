@@ -13,6 +13,7 @@ pub mod codec;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
 pub mod frame;
+pub mod pipelined;
 pub mod quic;
 pub mod transport;
 pub mod udp;
@@ -20,9 +21,17 @@ pub mod udp;
 // Top-level re-exports so existing call-sites keep working unchanged.
 pub use quic::{QuicRaftNetwork, QuicRaftNetworkFactory};
 pub use transport::{ClusterTransport, TransportCtx, TransportServer};
+pub use pipelined::PipelinedNet;
 pub use udp::UdpTuning;
 
 use thiserror::Error;
+
+/// Default look-ahead depth for the pipelined `RaftNetworkV2::stream_append`
+/// override ([`PipelinedNet`]). The leader keeps up to this many
+/// AppendEntries RPCs in flight to a single peer at once (ordered), rather
+/// than the openraft default of strictly one-at-a-time. Bounded so a slow or
+/// lossy peer cannot make the leader buffer unboundedly.
+pub const PIPELINE_DEPTH: usize = 8;
 
 #[derive(Debug, Error)]
 pub enum NetworkError {
