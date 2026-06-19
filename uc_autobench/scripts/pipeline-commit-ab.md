@@ -116,10 +116,11 @@ is still applying load. You can trigger it manually from a third terminal:
 
 # 2. Start sustained open-loop load on node0:
 SSH_KEY=$(awk -F'"' '/ssh_private_key_file/{print $2}' bench-infra/terraform.tfvars)
+SSH_USER=$(cd bench-infra && terraform -chdir=terraform output -raw ssh_user)   # "ubuntu" on AWS, "root" on Hetzner
 NODE0_IP=$(cd bench-infra && terraform -chdir=terraform output -json nodes \
   | jq -r '.[]|select(.role=="node0").public_ip')
 
-ssh -i "$SSH_KEY" root@"$NODE0_IP" \
+ssh -i "$SSH_KEY" "$SSH_USER"@"$NODE0_IP" \
   "/opt/bench/uc/target/release/commit-path-load \
     --connect /dev/shm/uc-node0 --app-id uc-bench-dist \
     --config dist_3node --rates 5000 --inflight 128 \
@@ -129,10 +130,10 @@ ssh -i "$SSH_KEY" root@"$NODE0_IP" \
 # 3. While load is running, SSH into node1 and kill the UC node:
 NODE1_IP=$(cd bench-infra && terraform -chdir=terraform output -json nodes \
   | jq -r '.[]|select(.role=="node1").public_ip')
-ssh -i "$SSH_KEY" root@"$NODE1_IP" "pkill -9 -f '[u]c-node-launch'; pkill -9 -f '[k]v_service'"
+ssh -i "$SSH_KEY" "$SSH_USER"@"$NODE1_IP" "pkill -9 -f '[u]c-node-launch'; pkill -9 -f '[k]v_service'"
 
 # 4. Restart node1 (it will reconstruct from journal, then rejoin):
-ssh -i "$SSH_KEY" root@"$NODE1_IP" bash << 'REMOTE'
+ssh -i "$SSH_KEY" "$SSH_USER"@"$NODE1_IP" bash << 'REMOTE'
   . /opt/bench/uc-peers.env
   export UC_DURABILITY=consistent
   export UC_TRANSPORT=quic
@@ -148,7 +149,7 @@ REMOTE
 # 5. Wait for node1 to catch up (watch /opt/bench/uc-node.out on node1 for
 #    "reconstruction complete" / "follower applied up to ...").
 # 6. Retrieve the load-run CSV:
-scp -i "$SSH_KEY" root@"$NODE0_IP":/opt/bench/results/catchup_under_load.csv \
+scp -i "$SSH_KEY" "$SSH_USER"@"$NODE0_IP":/opt/bench/results/catchup_under_load.csv \
   bench-out/ab-depth8/catchup_under_load.csv
 ```
 
