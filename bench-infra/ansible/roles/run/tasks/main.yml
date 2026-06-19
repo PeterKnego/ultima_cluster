@@ -84,7 +84,7 @@
         . {{ remote_home }}/uc-peers.env
         export UC_DURABILITY={{ 'eventual' if durability == 'none' else 'consistent' }}
         export UC_TRANSPORT={{ transport }}
-        setsid {{ uc_target_bin }}/uc-node-launch \
+        setsid UC_PIPELINE_DEPTH={{ uc_pipeline_depth }} {{ uc_target_bin }}/uc-node-launch \
           --node-id $UC_NODE_ID --listen $UC_LISTEN $UC_PEERS \
           --app-id $UC_APP_ID --with-service \
           --instance-dir /dev/shm/uc-{{ node_role }} \
