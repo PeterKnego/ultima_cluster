@@ -76,6 +76,9 @@ impl JournalLogStorage {
             dir: data_dir.join("journal"),
             segment_size_bytes: SEGMENT_SIZE_BYTES,
             durability: log_durability,
+            // Opt-out for now: segment preallocation (ultima_journal task36) stays
+            // off until the operator cloud A/B on prod NVMe justifies flipping it.
+            preallocate_segments: false,
         })?);
 
         let vote = Arc::new(StableValue::open(StableValueConfig {
