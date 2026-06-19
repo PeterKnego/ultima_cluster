@@ -150,11 +150,11 @@ instance.do_rpc()
 
 File:line references for each contributor:
 
-1. **`sessions.lock().await` on send path** — `mux.rs:232` (`get_or_create_session`) and
-   `mux.rs:297` (`open_session` → `get_or_create_session`). A `tokio::sync::Mutex` async
-   lock acquisition on every RPC, even for an already-open session. The happy path hits the
-   `s.get(&sid)` branch and returns quickly, but the async lock yield is still a tokio task
-   switch point.
+1. **`sessions.lock().await` on send path** — `mux.rs:232` (`get_or_create_session`). A
+   `tokio::sync::Mutex` async lock acquisition on every RPC, even for an already-open
+   session. The happy path hits the `s.get(&sid)` branch and returns quickly, but the async
+   lock yield is still a tokio task switch point. (`mux.rs:297` is the `open_session`
+   call-site that delegates into `get_or_create_session`, not a separate lock.)
 
 2. **`pending.lock().await.insert()` on send path** — `mux.rs:299`. A second async tokio
    mutex acquisition on every RPC to register the oneshot correlator before transmitting.
@@ -260,4 +260,114 @@ These are all structural costs of the current v1 UC-UDP design, not accidental r
 
 ---
 
-*Part B (cross-host ladder, Phase B) will append §8+ to this document.*
+---
+
+## 8. Part B — V1→V2 streaming (`PipelinedNet`) + Gate-A closure
+
+**Date:** 2026-06-19. **Commit:** `e02a524`.
+
+### 8.1 What was built (Tasks 5–8)
+
+The V2 streaming path replaces the `openraft_legacy::network_v1::Adapter` shim (one-at-a-time
+sequential `AppendEntries`) with `PipelinedNet<N>` — a bounded, in-order pipeline that holds
+up to `PIPELINE_DEPTH` (default 8) concurrent `AppendEntries` RPCs in flight to a single peer.
+
+Implementation:
+
+- **Task 5 (spike).** Read `RaftNetworkV2::stream_append` and `StreamAppendResult` from
+  openraft alpha.21. Confirmed the API: `stream_append` receives a
+  `BoxStream<'static, AppendEntriesRequest<TypeConfig>>` and returns
+  `BoxStream<'static, StreamAppendResult<TypeConfig>>`. No compat shim needed — the V2
+  trait is directly implementable over the existing `RaftNetwork` methods.
+
+- **Task 6 (Clone for V1 impls).** Made `UdpRaftNetwork` and `QuicRaftNetwork` cheaply
+  clonable (Arc-wrapped handles) so a single `PipelinedNet` instance can fan work to the
+  underlying V1 transport without ownership issues.
+
+- **Task 7 (PipelinedNet).** `uc_node/src/network/pipelined.rs` — `PipelinedNet<N: Clone>`
+  implements `RaftNetworkV2::stream_append` by spawning a driver task that pulls requests
+  from the stream, dispatches them concurrently via `FuturesUnordered` (bounded to
+  `pipeline_depth()`), and yields `StreamAppendResult` responses in submission order. The
+  V1 methods (`append_entries`, `vote`, `install_snapshot`) delegate through to the wrapped
+  `N`. Both `UdpRaftNetworkFactory` and `QuicRaftNetworkFactory` now mint
+  `PipelinedNet<UdpRaftNetwork>` / `PipelinedNet<QuicRaftNetwork>` respectively.
+
+- **Task 8 (this task).** Added `UC_PIPELINE_DEPTH` env override via `parse_pipeline_depth`
+  (pure helper) + `pipeline_depth()` (env reader). Factories call `pipeline_depth()` instead
+  of the bare `PIPELINE_DEPTH` const, enabling depth sweeps without recompile.
+
+### 8.2 Correctness gate
+
+All three suites green on commit `e02a524`:
+
+| Suite | Command | Result |
+|-------|---------|--------|
+| `uc_node` integration | `cargo test -p uc_node` | **PASS** (all tests, including `udp_three_node_replicates`, `lin_register`, reconstruction, output suites) |
+| fault-injection + partition | `cargo test -p uc_node --features fault-injection -- --test-threads=1` | **PASS** (lin_partition, all fault-injection scenarios) |
+| hard-crash linearizability | `cargo test -p uc-crashtest --features hard-crash-tests` | **PASS** (`linearizable_under_hard_crash`, `write_then_read_across_processes`) |
+
+The pipeline introduces no reordering or data loss under fault injection: `PipelinedNet`'s
+bounded concurrency is over independent RPCs to separate followers; per-follower ordering is
+maintained by the `FuturesUnordered` response queue, which preserves submission order.
+
+### 8.3 Pipelining measurement (local loopback)
+
+**Measurement limitation: the `internode-rpc-bench` echo bench does not exercise `stream_append`.**
+
+The bench exercises the transport echo path (`EchoClient.rpc`) directly — no openraft, no
+`PipelinedNet`, no `stream_append`. `UC_PIPELINE_DEPTH` controls `PipelinedNet::new_client`
+which is invoked only through openraft's replication network, not through the echo bench.
+
+A depth-1 vs depth-8 sweep with `--mode ladder --inflight 8 --rate 10000` yields virtually
+identical numbers (p50 ≈ 538–545 µs loopback) because the variable being swept (`UC_PIPELINE_DEPTH`)
+has no effect on this code path.
+
+**Why local loopback cannot size the pipeline win:**
+
+1. `PipelinedNet` amortises per-RPC latency across multiple concurrent in-flight calls.
+   Loopback RTT (~12–30 µs) is so low that even depth-1 sequential commit saturates at tens
+   of thousands of req/s — there is no latency budget to win back by overlapping.
+2. The realistic pipeline win appears at cross-host wire latency (100–400 µs per hop on a
+   Hetzner LAN): depth-8 overlapping commits cuts effective per-entry latency from
+   `1 × RTT` toward `RTT / 8` for a pipelined batch, saving ~87% in the fully-pipelined
+   steady state.
+3. The `commit-path-load` bench does run through openraft (and thus `PipelinedNet`) but
+   requires a live cluster with at least two nodes and a service process — it is a
+   cross-process bench that cannot run without real infrastructure.
+
+**Indicative-only numbers (loopback, depth 1 vs 8, echo bench):**
+
+| Depth | p50 (µs) | p99 (µs) | Achieved rate |
+|-------|----------|----------|---------------|
+| 1 (sequential) | 538 | 1 344 | 9 999 req/s |
+| 8 (pipelined) | 545 | 1 312 | 9 998 req/s |
+
+These numbers are transport-layer echo only. They confirm the transport path is unchanged
+and the `UC_PIPELINE_DEPTH` env knob compiles and runs without regression, but they do not
+show the Raft replication pipeline benefit. A real measurement requires the cross-host
+fleet (task16 §6.4/6.5 harness) with `commit-path-load` at depth 1 vs 8.
+
+### 8.4 Gate-A final recommendation
+
+**V2 streaming (`PipelinedNet`) ADOPTED.**
+
+- The implementation is complete, correct, and correctness-gate clean (§8.2).
+- The approach is ecosystem-proven: openraft explicitly provides `RaftNetworkV2::stream_append`
+  for exactly this purpose (pipelined commit, not single-inflight RTT reduction).
+- `UC_PIPELINE_DEPTH` is now a runtime knob, enabling A/B on the cross-host fleet without
+  recompilation.
+- QUIC remains the default transport. Nothing in Phase A or Part B changes the task 16
+  conclusion.
+
+**Phase B (cross-host AF_XDP + `SO_BUSY_POLL`) remains WARRANTED** because:
+
+- The local ladder (Part A) could not rule out the busy-spin / kernel-bypass win: loopback
+  suppresses the hardware-interrupt-avoidance phenomenon that motivates them (§5).
+- The real absolute-latency floor (100–400 µs cross-host vs. 12 µs loopback) determines
+  whether the +13 µs UC-bookkeeping tax is material (6.5% vs. 26%) — a cross-host
+  measurement is the only honest instrument.
+- The `UC_PIPELINE_DEPTH` knob enables a clean depth-1 vs depth-8 A/B on the cross-host
+  harness as Phase B's first sub-task.
+
+**Phase B is a separate plan** gated on this Gate-A decision, consistent with the task 17
+spec §4. It will append §9+ to this document when executed.
