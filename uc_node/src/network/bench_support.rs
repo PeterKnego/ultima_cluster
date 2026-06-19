@@ -528,6 +528,84 @@ fn set_so_busy_poll(sock: &std::net::UdpSocket, usecs: u32) -> std::io::Result<(
     if rc == -1 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
 }
 
+/// Bind a busy-poll UDP echo server on `listen` (BLOCKING socket + SO_BUSY_POLL,
+/// dedicated core-pinned blocking-recv thread echoing each datagram back to its
+/// sender). Cross-host responder for `--role server`. Pairs with
+/// [`busypoll_udp_echo_client`]. On a kernel/NIC without SO_BUSY_POLL it logs and
+/// continues (still round-trips, just without the busy-poll benefit).
+pub async fn busypoll_udp_echo_server(listen: SocketAddr) -> Result<EchoServer, NetworkError> {
+    let srv_sock = std::net::UdpSocket::bind(listen).map_err(NetworkError::Io)?;
+    if let Err(e) = set_so_busy_poll(&srv_sock, 50) {
+        eprintln!("busypoll-udp: SO_BUSY_POLL not supported on server socket ({}); continuing without busy-poll", e);
+    }
+    let local = srv_sock.local_addr().map_err(NetworkError::Io)?;
+    let server_core = core_affinity::get_core_ids().unwrap_or_default().first().copied();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let stop_flag = std::sync::Arc::new(std::sync::Mutex::new(Some(stop_rx)));
+    let server_thread = std::thread::spawn(move || {
+        if let Some(core) = server_core {
+            core_affinity::set_for_current(core);
+        }
+        let _ = srv_sock.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match srv_sock.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    let _ = srv_sock.send_to(&buf[..n], from);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    if let Ok(mut guard) = stop_flag.lock()
+                        && let Some(ref mut rx) = *guard
+                        && rx.try_recv().is_ok()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    Ok(EchoServer {
+        inner: EchoServerInner::BusyPollUdp { stop_tx, thread: server_thread, local },
+    })
+}
+
+/// Build a busy-poll UDP echo client that `rpc`s to `connect` (BLOCKING socket +
+/// SO_BUSY_POLL on a dedicated core-pinned thread; the async `rpc()` hands each
+/// request to that thread via mpsc and awaits a oneshot reply). Cross-host driver
+/// for `--role client`. Pairs with [`busypoll_udp_echo_server`].
+pub async fn busypoll_udp_echo_client(connect: SocketAddr) -> Result<EchoClient, NetworkError> {
+    let client_core = core_affinity::get_core_ids().unwrap_or_default().get(1).copied();
+    let (req_tx, mut req_rx) =
+        tokio::sync::mpsc::channel::<(bytes::Bytes, tokio::sync::oneshot::Sender<bytes::Bytes>)>(16);
+    let client_thread = std::thread::spawn(move || {
+        if let Some(core) = client_core {
+            core_affinity::set_for_current(core);
+        }
+        let bind: &str = if connect.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let cli_sock = std::net::UdpSocket::bind(bind).expect("client bind");
+        if let Err(e) = set_so_busy_poll(&cli_sock, 50) {
+            eprintln!("busypoll-udp: SO_BUSY_POLL not supported on client socket ({}); continuing without busy-poll", e);
+        }
+        cli_sock.connect(connect).expect("client connect");
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Some((body, reply_tx)) = req_rx.blocking_recv() {
+            let _ = cli_sock.send(&body);
+            let echoed = match cli_sock.recv(&mut buf) {
+                Ok(n) => bytes::Bytes::copy_from_slice(&buf[..n]),
+                Err(_) => bytes::Bytes::new(),
+            };
+            let _ = reply_tx.send(echoed);
+        }
+    });
+    Ok(EchoClient {
+        inner: EchoClientInner::BusyPollUdp { tx: req_tx, thread: client_thread },
+        next_id: AtomicU64::new(1),
+    })
+}
+
 /// Bind a bare SO_BUSY_POLL UDP echo server + client on loopback.
 ///
 /// Both sides use a **blocking** `std::net::UdpSocket` in a dedicated
@@ -543,104 +621,9 @@ fn set_so_busy_poll(sock: &std::net::UdpSocket, usecs: u32) -> std::io::Result<(
 /// logged to stderr once and the rung continues — it still round-trips, just
 /// without the busy-poll benefit.
 pub async fn busypoll_udp_echo_pair() -> Result<(EchoClient, EchoServer), NetworkError> {
-    // Bind the server socket on an ephemeral port (BLOCKING — no set_nonblocking).
-    let srv_sock = std::net::UdpSocket::bind("127.0.0.1:0").map_err(NetworkError::Io)?;
-    // Set SO_BUSY_POLL on the server socket; log and continue on failure.
-    if let Err(e) = set_so_busy_poll(&srv_sock, 50) {
-        eprintln!("busypoll-udp: SO_BUSY_POLL not supported on server socket ({}); continuing without busy-poll", e);
-    }
-    let local = srv_sock.local_addr().map_err(NetworkError::Io)?;
-
-    // Collect core ids for pinning; fall back to unpinned if <2 cores.
-    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-    let server_core = core_ids.first().copied();
-    let client_core = core_ids.get(1).copied();
-
-    // ── Server thread ──────────────────────────────────────────────────────
-    // Receives a oneshot stop signal; after receiving it, sets a read timeout
-    // so the blocking recv_from returns periodically to check the flag.
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    // Wrap the stop receiver in an Arc<Mutex<>> so the server thread can poll it.
-    let stop_flag = std::sync::Arc::new(std::sync::Mutex::new(Some(stop_rx)));
-
-    let server_thread = std::thread::spawn(move || {
-        if let Some(core) = server_core {
-            core_affinity::set_for_current(core);
-        }
-        // Set a read timeout so the blocking recv_from returns periodically to
-        // check the stop signal.
-        let _ = srv_sock.set_read_timeout(Some(std::time::Duration::from_millis(50)));
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match srv_sock.recv_from(&mut buf) {
-                Ok((n, from)) => {
-                    let _ = srv_sock.send_to(&buf[..n], from);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    // Check for stop signal.
-                    if let Ok(mut guard) = stop_flag.lock()
-                        && let Some(ref mut rx) = *guard
-                        && rx.try_recv().is_ok()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    // ── Client thread ──────────────────────────────────────────────────────
-    // Owns its own BLOCKING socket (already `connect`ed to the server).
-    // Receives (payload, reply_tx) from the async side via mpsc; does a
-    // blocking send + blocking recv, then fires the oneshot back.
-    let (req_tx, mut req_rx) =
-        tokio::sync::mpsc::channel::<(bytes::Bytes, tokio::sync::oneshot::Sender<bytes::Bytes>)>(
-            16,
-        );
-
-    let client_thread = std::thread::spawn(move || {
-        if let Some(core) = client_core {
-            core_affinity::set_for_current(core);
-        }
-        let cli_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("client bind");
-        // Set SO_BUSY_POLL on the client socket; log and continue on failure.
-        if let Err(e) = set_so_busy_poll(&cli_sock, 50) {
-            eprintln!("busypoll-udp: SO_BUSY_POLL not supported on client socket ({}); continuing without busy-poll", e);
-        }
-        cli_sock.connect(local).expect("client connect");
-        let mut buf = vec![0u8; 64 * 1024];
-
-        // Process requests until the mpsc sender is dropped (client dropped).
-        while let Some((body, reply_tx)) = req_rx.blocking_recv() {
-            // Blocking send.
-            let _ = cli_sock.send(&body);
-            // Blocking recv — SO_BUSY_POLL makes this busy-poll the NAPI ring
-            // before sleeping, reducing wakeup latency on a real NIC.
-            let echoed = match cli_sock.recv(&mut buf) {
-                Ok(n) => bytes::Bytes::copy_from_slice(&buf[..n]),
-                Err(_) => bytes::Bytes::new(),
-            };
-            let _ = reply_tx.send(echoed);
-        }
-    });
-
-    let client = EchoClient {
-        inner: EchoClientInner::BusyPollUdp {
-            tx: req_tx,
-            thread: client_thread,
-        },
-        next_id: AtomicU64::new(1),
-    };
-    let server = EchoServer {
-        inner: EchoServerInner::BusyPollUdp {
-            stop_tx,
-            thread: server_thread,
-            local,
-        },
-    };
+    let server = busypoll_udp_echo_server("127.0.0.1:0".parse().unwrap()).await?;
+    let server_addr = server.local_addr()?;
+    let client = busypoll_udp_echo_client(server_addr).await?;
     Ok((client, server))
 }
 
@@ -688,6 +671,17 @@ mod tests {
         let (client, server) = busypoll_udp_echo_pair().await.unwrap();
         let resp = client.rpc(bytes::Bytes::from_static(b"busypoll-payload")).await.unwrap();
         assert_eq!(&resp[..], b"busypoll-payload");
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn busypoll_udp_split_role_roundtrips() {
+        // Build server and client SEPARATELY (the cross-host path), not via the pair.
+        let server = busypoll_udp_echo_server("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = busypoll_udp_echo_client(addr).await.unwrap();
+        let resp = client.rpc(bytes::Bytes::from_static(b"split-busypoll")).await.unwrap();
+        assert_eq!(&resp[..], b"split-busypoll");
         server.shutdown().await;
     }
 }

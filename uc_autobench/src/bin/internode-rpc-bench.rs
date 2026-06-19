@@ -27,9 +27,9 @@ use clap::Parser;
 use futures::stream::{FuturesUnordered, StreamExt};
 use hdrhistogram::Histogram;
 use uc_node::network::bench_support::{
-    EchoClient, bare_busyspin_udp_echo_pair, bare_tokio_udp_echo_pair, busypoll_udp_echo_pair,
-    quic_echo_client, quic_echo_pair, quic_echo_server, udp_echo_client, udp_echo_pair,
-    udp_echo_server,
+    EchoClient, bare_busyspin_udp_echo_pair, bare_tokio_udp_echo_pair, busypoll_udp_echo_client,
+    busypoll_udp_echo_pair, busypoll_udp_echo_server, quic_echo_client, quic_echo_pair,
+    quic_echo_server, udp_echo_client, udp_echo_pair, udp_echo_server,
 };
 
 const CSV_HEADER: &str = "system,config,workload,payload_bytes,inflight,target_rate,achieved_rate,\
@@ -328,7 +328,7 @@ async fn main() -> anyhow::Result<()> {
             "quic" => quic_echo_server(args.listen).await?,
             "bare-udp" => anyhow::bail!("bare-udp does not support --role server; use --role both"),
             "busyspin-udp" => anyhow::bail!("busyspin-udp does not support --role server; use --role both"),
-            "busypoll-udp" => anyhow::bail!("busypoll-udp does not support --role server; use --role both"),
+            "busypoll-udp" => busypoll_udp_echo_server(args.listen).await?,
             other => anyhow::bail!("unknown transport {other}"),
         };
         let local = server.local_addr()?;
@@ -481,13 +481,13 @@ async fn main() -> anyhow::Result<()> {
             let (c, s) = bare_busyspin_udp_echo_pair().await?;
             ("busyspin-udp-rpc", c, Some(s))
         }
-        "busypoll-udp" => {
-            if args.role == "client" {
-                anyhow::bail!("busypoll-udp does not support --role client; use --role both");
+        "busypoll-udp" => match args.role.as_str() {
+            "client" => ("busypoll-udp-rpc", busypoll_udp_echo_client(first_connect()?).await?, None),
+            _ => {
+                let (c, s) = busypoll_udp_echo_pair().await?;
+                ("busypoll-udp-rpc", c, Some(s))
             }
-            let (c, s) = busypoll_udp_echo_pair().await?;
-            ("busypoll-udp-rpc", c, Some(s))
-        }
+        },
         other => anyhow::bail!("unknown transport {other}"),
     };
 
