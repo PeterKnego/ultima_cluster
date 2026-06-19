@@ -371,3 +371,61 @@ fleet (task16 §6.4/6.5 harness) with `commit-path-load` at depth 1 vs 8.
 
 **Phase B is a separate plan** gated on this Gate-A decision, consistent with the task 17
 spec §4. It will append §9+ to this document when executed.
+
+## 9. Part C — Phase B Stage 1 cross-host run (2026-06-19)
+
+Fleet: **3× AWS `c7i.4xlarge`** (ENA, single-AZ + cluster placement group), `os_tune` (perf
+governor + `net.core.busy_poll=50`). Provisioned via `make -C bench-infra up-uc`, run, then
+**DESTROYED** (11 resources, billing stopped). The Phase A cold-boot SSH-wait fix held — all
+3 nodes came up clean (`failed=0, unreachable=0`).
+
+### 9.1 B-V2 — cross-host pipelined-commit A/B (the decisive V2-streaming number)
+
+`commit-path-load` open-loop, 3-node, inflight 128, 64 B, `UC_PIPELINE_DEPTH=1` (sequential)
+vs `8` (pipelined), rate ladder 100–20 000 msg/s.
+
+| target rate | depth=1 achieved | depth=8 achieved | depth=1 p50 / p99 | depth=8 p50 / p99 |
+|---|--:|--:|--:|--:|
+| 100–5000/s | ≈target | ≈target (identical) | ~17–19 ms / ~21–64 ms | ~17–20 ms / ~22–64 ms |
+| **10000/s (knee)** | **6815/s** | **7238/s** | 2611 ms / 4559 ms | **1869 ms / 3708 ms** |
+| 20000/s (deep sat) | 6356/s | 6461/s | 10687 ms / 21123 ms | 10310 ms / 20821 ms |
+
+**Finding — pipelining helps under backlog, exactly as predicted, and cross-host shows what
+loopback (§8.3) could not.** At low–moderate rates depth-1 and depth-8 are identical (no
+backlog → nothing to pipeline). **At the saturation knee (10 000/s target): depth=8 gives
++6.2 % commit throughput (7238 vs 6815/s), −28 % p50 (1869 vs 2611 ms), −19 % p99.** Neutral at
+low load, no regression anywhere. On real cross-host RTT the leader's replication backlog gives
+the 8-deep pipeline real RTT-wait to hide; loopback's µs RTT had none. **The Phase A V2
+`stream_append` change is validated cross-host: a measurable throughput-and-latency win under
+load, at no cost when idle.**
+
+### 9.2 B1 — busy-poll datapath RTT: BLOCKED this run
+
+The cross-host `SO_BUSY_POLL` RTT could **not** be measured: the `busypoll-udp` rung (like the
+Phase A `bare-udp`/`busyspin-udp` rungs) is a **loopback-only echo-pair** — `--role server`
+returns *"busypoll-udp does not support --role server; use --role both"*. Busy-poll's benefit is
+a real-NIC phenomenon that only appears cross-host (server on node0, client on node1), so a
+loopback-only rung cannot measure it. **A split-role (server/client) busy-poll implementation is
+required** — a code follow-up, not doable live on a billing fleet.
+
+### 9.3 Harness bug found + fixed (the run blocker)
+
+First Pass-1 attempt failed: every node logged `setsid: failed to execute UC_PIPELINE_DEPTH=1:
+No such file or directory`. The Task-4 env-prefix `setsid UC_PIPELINE_DEPTH=1 uc-node-launch`
+is wrong — `setsid` is not a shell, so it tried to *exec* a program named `UC_PIPELINE_DEPTH=1`
+(the `VAR=val cmd` form only applies before the command word, and `setsid` *was* the command
+word). Fixed in `roles/run/tasks/main.yml` to `export UC_PIPELINE_DEPTH=…` (its own line, matching
+the existing `UC_DURABILITY`/`UC_TRANSPORT` exports) before `setsid`. Re-ran clean. (Both the
+per-task and whole-branch reviews missed this — they reasoned "POSIX `ENV=val cmd`" without
+accounting for `setsid` consuming the assignment as an argv.)
+
+### 9.4 Gate-B status
+
+- **Gate-A / V2 streaming: CLOSED, positive.** B-V2 confirms the pipelined `stream_append`
+  helps under cross-host load. No further action — it's already merged + default.
+- **Gate-B1 (busy-poll vs AF_XDP): DEFERRED** — un-evaluable until the split-role busy-poll rung
+  exists. Follow-up: (1) add `--role server`/`client` support to the busy-poll rung (small code
+  task), (2) a short, cheaper B1-only fleet run (2-node suffices for per-link RTT) comparing
+  busy-poll vs UC-UDP/QUIC vs the known Aeron 47 µs floor (task16 §6.6, same hardware).
+- **AF_XDP (Stage 2):** still gated on Gate-B1; not started.
+- **QUIC stays the default transport.**
