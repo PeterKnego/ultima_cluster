@@ -18,6 +18,7 @@ use crate::network::frame::{Frame, MessageType};
 use crate::network::{NetworkError, codec};
 use crate::raft::{NodeId, TypeConfig};
 
+#[derive(Clone)]
 pub struct UdpRaftNetwork {
     // Only read inside the fault-injection is_blocked check; genuinely unused
     // under default features.
@@ -93,6 +94,59 @@ fn rpc_err<E: std::error::Error>(
     e: NetworkError,
 ) -> RPCError<TypeConfig, RaftError<TypeConfig, E>> {
     RPCError::Network(openraft::error::NetworkError::new(&e))
+}
+
+#[cfg(test)]
+impl UdpRaftNetwork {
+    /// Returns the shared `Arc<UdpMux>` handle (for Clone-sharing assertions).
+    pub(crate) fn mux_arc(&self) -> &Arc<UdpMux> {
+        &self.mux
+    }
+
+    /// Returns the shared `Arc<AtomicU64>` request-id counter (for Clone-sharing assertions).
+    pub(crate) fn request_id_arc(&self) -> &Arc<AtomicU64> {
+        &self.request_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    use super::UdpRaftNetwork;
+    use crate::network::udp::UdpTuning;
+    use crate::network::udp::mux::UdpMux;
+
+    async fn make_udp_raft_network() -> UdpRaftNetwork {
+        let mux = UdpMux::bind("127.0.0.1:0".parse().unwrap(), UdpTuning::default())
+            .await
+            .expect("UdpMux::bind");
+        let peer_addr: SocketAddr = "127.0.0.1:19999".parse().unwrap();
+        let request_id = Arc::new(AtomicU64::new(1));
+        UdpRaftNetwork::new(1, peer_addr, mux, "test-app".to_string(), request_id)
+    }
+
+    #[tokio::test]
+    async fn udp_raft_network_clone_shares_mux() {
+        let net = make_udp_raft_network().await;
+        let net2 = net.clone();
+        assert!(
+            Arc::ptr_eq(net.mux_arc(), net2.mux_arc()),
+            "clone must share the same underlying UdpMux Arc"
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_raft_network_clone_shares_request_id() {
+        let net = make_udp_raft_network().await;
+        let net2 = net.clone();
+        assert!(
+            Arc::ptr_eq(net.request_id_arc(), net2.request_id_arc()),
+            "clone must share the same Arc<AtomicU64> request-id counter"
+        );
+    }
 }
 
 impl RaftNetwork<TypeConfig> for UdpRaftNetwork {

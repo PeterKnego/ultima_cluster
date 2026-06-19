@@ -26,6 +26,7 @@ use super::client::PeerConn;
 use super::factory::PeerPool;
 use crate::raft::{NodeId, TypeConfig};
 
+#[derive(Clone)]
 pub struct QuicRaftNetwork {
     target: NodeId,
     peer_addr: SocketAddr,
@@ -120,6 +121,55 @@ fn rpc_err<E: std::error::Error>(
     e: NetworkError,
 ) -> RPCError<TypeConfig, RaftError<TypeConfig, E>> {
     RPCError::Network(openraft::error::NetworkError::new(&e))
+}
+
+#[cfg(test)]
+impl QuicRaftNetwork {
+    /// Returns the shared `PeerPool` Arc (for Clone-sharing assertions).
+    pub(crate) fn pool_arc(&self) -> &super::factory::PeerPool {
+        &self.pool
+    }
+
+    /// Returns the `quinn::Endpoint` (for Clone-sharing assertions via pointer
+    /// comparison on the underlying connection pool pointer).
+    pub(crate) fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use super::QuicRaftNetwork;
+    use crate::network::quic::factory::PeerPool;
+
+    fn make_quic_raft_network() -> QuicRaftNetwork {
+        // Build a minimal client endpoint; no connections are opened in these tests.
+        let endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())
+            .expect("client endpoint");
+        let pool: PeerPool = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let peer_addr: SocketAddr = "127.0.0.1:19998".parse().unwrap();
+        // Use a placeholder rustls client config (no actual TLS handshake needed).
+        let root_store = rustls::RootCertStore::empty();
+        let tls_cfg = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth(),
+        );
+        QuicRaftNetwork::new(1, peer_addr, endpoint, tls_cfg, pool, "test-app".to_string())
+    }
+
+    #[tokio::test]
+    async fn quic_raft_network_clone_shares_pool() {
+        let net = make_quic_raft_network();
+        let net2 = net.clone();
+        assert!(
+            Arc::ptr_eq(net.pool_arc(), net2.pool_arc()),
+            "clone must share the same underlying PeerPool Arc"
+        );
+    }
 }
 
 impl RaftNetwork<TypeConfig> for QuicRaftNetwork {
