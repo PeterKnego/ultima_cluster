@@ -130,11 +130,6 @@ impl QuicRaftNetwork {
         &self.pool
     }
 
-    /// Returns the `quinn::Endpoint` (for Clone-sharing assertions via pointer
-    /// comparison on the underlying connection pool pointer).
-    pub(crate) fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
-    }
 }
 
 #[cfg(test)]

@@ -52,7 +52,7 @@ fn parse_pipeline_depth(s: Option<&str>) -> usize {
 /// [`PIPELINE_DEPTH`] on missing or non-numeric values. Always returns at
 /// least 1.
 pub(crate) fn pipeline_depth() -> usize {
-    parse_pipeline_depth(std::env::var("UC_PIPELINE_DEPTH").ok().as_deref()).max(1)
+    parse_pipeline_depth(std::env::var("UC_PIPELINE_DEPTH").ok().as_deref())
 }
 
 #[cfg(test)]
