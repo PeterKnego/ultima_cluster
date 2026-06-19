@@ -467,3 +467,41 @@ accounting for `setsid` consuming the assignment as an argv.)
   streaming addressed), not single-shot latency.
 - **QUIC stays the default transport** (encrypted-by-default, mature; ~20 µs behind UC-UDP on
   single-inflight RTT but that is not the bottleneck for replication throughput).
+
+## 10. The network was never the bottleneck — fsync and IPC dwarf the RTT
+
+The B1 numbers (§9.2) put UC's per-link RTT at ~50 µs (AWS) / ~200 µs (Hetzner). Set against the
+rest of the commit path, the network is a *small* term — which is the deepest reason the busy-poll /
+AF_XDP branch was a dead end. The measured commit-path stages (task09 per-stage histograms;
+task13 `aeron_vs_uc_commit_path`; task11 IPC fix):
+
+| stage | latency | vs ~50 µs RTT |
+|---|--:|--:|
+| network RTT (per-link, AWS placement group) | ~50 µs | 1× |
+| `journal_fsync`, **tmpfs** (no real durability) | ~42 µs | ~1× |
+| `journal_fsync`, **real ext4 / disk, single op** | **~0.85 ms** | **~17×** |
+| `journal_fsync`, **amortized under group-commit / load** | ~12.7 µs/entry | ~0.25× |
+
+(task13 also recorded a historical **171 ms p99 fsync tail** — an `i_size`/metadata-sync artifact,
+fixed by the `sync_all → fdatasync` change — and ~7.5 ms on macOS HFS+: fsync is wildly
+host/storage-dependent.)
+
+**Reading:**
+- **Single isolated commit → durability-bound, not network-bound.** One real-disk fsync (~0.85 ms)
+  is ~17× the ~50 µs RTT, so shaving the network toward Aeron's 47 µs (or AF_XDP's hypothetical
+  lower) is noise against the fsync. This is a *third* independent reason AF_XDP was cancelled
+  (after: UC-UDP already ≈ Aeron, §9.2; and busy-poll loses on both fabrics, §9.2).
+- **Under load it inverts via two amortizations.** Group commit batches many log entries into one
+  fsync (→ ~12.7 µs/entry, *below* the RTT); and pipelining — the V2 streaming this task shipped —
+  keeps more entries in flight, growing the fsync batch. Part of V2's +6 % throughput (§9.1) is
+  exactly this better fsync amortization.
+- **The real historical floor was neither network nor fsync.** task09 found the commit path was
+  dominated by **poll-sleep IPC (~81 %), with fsync only ~4 %**; that IPC was fixed in task11
+  (event-driven futex wakeups, 4.6× commit-floor improvement).
+
+**Gating hierarchy (highest first):** IPC wakeups (was the floor, fixed task11) > fsync durability
+(~0.85 ms single, amortized to ~tens of µs/entry under load, storage-dependent) ≫ network RTT
+(~50–200 µs, already in Aeron's class). The network transport — the thing the busy-poll / AF_XDP
+work targeted — sits at the *bottom* of this hierarchy. That is the single sentence that explains
+why the whole datapath branch correctly dead-ended, and why the durable wins came from the IPC fix
+(task11) and pipelined streaming (this task).
