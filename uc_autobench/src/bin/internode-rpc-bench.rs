@@ -27,8 +27,8 @@ use clap::Parser;
 use futures::stream::{FuturesUnordered, StreamExt};
 use hdrhistogram::Histogram;
 use uc_node::network::bench_support::{
-    EchoClient, bare_tokio_udp_echo_pair, quic_echo_client, quic_echo_pair, quic_echo_server,
-    udp_echo_client, udp_echo_pair, udp_echo_server,
+    EchoClient, bare_busyspin_udp_echo_pair, bare_tokio_udp_echo_pair, quic_echo_client,
+    quic_echo_pair, quic_echo_server, udp_echo_client, udp_echo_pair, udp_echo_server,
 };
 
 const CSV_HEADER: &str = "system,config,workload,payload_bytes,inflight,target_rate,achieved_rate,\
@@ -38,7 +38,7 @@ p50_ns,p99_ns,p99_9_ns,p99_99_ns,max_ns,count";
 #[command(about = "Transport-isolated QUIC-vs-UDP RPC echo A/B (open-loop, CO-free)")]
 struct Args {
     /// transport under test
-    #[arg(long, value_parser = ["quic", "udp", "bare-udp"])]
+    #[arg(long, value_parser = ["quic", "udp", "bare-udp", "busyspin-udp"])]
     transport: String,
     /// process role: server (persistent responder), client (driver), or both (in-process loopback)
     #[arg(long, value_parser = ["server", "client", "both"], default_value = "both")]
@@ -326,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
             "udp" => udp_echo_server(args.listen).await?,
             "quic" => quic_echo_server(args.listen).await?,
             "bare-udp" => anyhow::bail!("bare-udp does not support --role server; use --role both"),
+            "busyspin-udp" => anyhow::bail!("busyspin-udp does not support --role server; use --role both"),
             other => anyhow::bail!("unknown transport {other}"),
         };
         let local = server.local_addr()?;
@@ -379,6 +380,7 @@ async fn main() -> anyhow::Result<()> {
             "udp" => "udp-fanout",
             "quic" => "quic-fanout",
             "bare-udp" => "bare-udp-fanout",
+            "busyspin-udp" => "busyspin-udp-fanout",
             _ => unreachable!(),
         };
 
@@ -469,6 +471,13 @@ async fn main() -> anyhow::Result<()> {
             let (c, s) = bare_tokio_udp_echo_pair().await?;
             ("bare-udp-rpc", c, Some(s))
         }
+        "busyspin-udp" => {
+            if args.role == "client" {
+                anyhow::bail!("busyspin-udp does not support --role client; use --role both");
+            }
+            let (c, s) = bare_busyspin_udp_echo_pair().await?;
+            ("busyspin-udp-rpc", c, Some(s))
+        }
         other => anyhow::bail!("unknown transport {other}"),
     };
 
@@ -494,6 +503,7 @@ async fn main() -> anyhow::Result<()> {
                 "udp" => "udp-ping",
                 "quic" => "quic-ping",
                 "bare-udp" => "bare-udp-ping",
+                "busyspin-udp" => "busyspin-udp-ping",
                 _ => unreachable!(),
             };
             let ok = hist.len();

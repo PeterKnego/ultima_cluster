@@ -50,6 +50,15 @@ enum EchoClientInner {
         #[allow(dead_code)]
         peer: std::net::SocketAddr,
     },
+    /// Busy-spin UDP: requests are sent to a pinned thread over an mpsc; replies
+    /// come back over a per-call oneshot. The pinned thread owns a non-blocking
+    /// socket and busy-polls for responses.
+    BareBusyspinUdp {
+        tx: tokio::sync::mpsc::Sender<(bytes::Bytes, tokio::sync::oneshot::Sender<bytes::Bytes>)>,
+        /// Held so the thread handle joins on drop.
+        #[allow(dead_code)]
+        thread: std::thread::JoinHandle<()>,
+    },
 }
 
 impl EchoClient {
@@ -96,6 +105,13 @@ impl EchoClient {
                 let n = sock.recv(&mut buf).await.map_err(NetworkError::Io)?;
                 Ok(bytes::Bytes::copy_from_slice(&buf[..n]))
             }
+            EchoClientInner::BareBusyspinUdp { tx, .. } => {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                tx.send((body, reply_tx))
+                    .await
+                    .map_err(|_| NetworkError::Disconnected)?;
+                reply_rx.await.map_err(|_| NetworkError::Disconnected)
+            }
         }
     }
 }
@@ -115,6 +131,12 @@ enum EchoServerInner {
         handle: tokio::task::JoinHandle<()>,
         local: std::net::SocketAddr,
     },
+    BareBusyspinUdp {
+        /// Sending a value signals the server thread to stop.
+        stop_tx: tokio::sync::oneshot::Sender<()>,
+        thread: std::thread::JoinHandle<()>,
+        local: std::net::SocketAddr,
+    },
 }
 
 impl EchoServer {
@@ -128,6 +150,7 @@ impl EchoServer {
                 endpoint.local_addr().map_err(NetworkError::Io)
             }
             EchoServerInner::BareTokioUdp { local, .. } => Ok(*local),
+            EchoServerInner::BareBusyspinUdp { local, .. } => Ok(*local),
         }
     }
 
@@ -145,6 +168,11 @@ impl EchoServer {
             EchoServerInner::BareTokioUdp { handle, .. } => {
                 handle.abort();
                 let _ = handle.await;
+            }
+            EchoServerInner::BareBusyspinUdp { stop_tx, thread, .. } => {
+                // Signal the server thread to exit, then join.
+                let _ = stop_tx.send(());
+                let _ = tokio::task::spawn_blocking(|| thread.join()).await;
             }
         }
     }
@@ -344,9 +372,127 @@ pub async fn bare_tokio_udp_echo_pair() -> Result<(EchoClient, EchoServer), Netw
     Ok((client, server))
 }
 
+/// Bind a bare busy-spin UDP echo server + client on loopback.
+///
+/// Both sides use a blocking `std::net::UdpSocket` (`set_nonblocking(true)`)
+/// in a dedicated `std::thread` pinned to a core via `core_affinity`. The
+/// server thread echoes every received datagram back to the sender. The client
+/// thread owns its socket; [`EchoClient::rpc`] hands the request over a
+/// `tokio::sync::mpsc` channel, the pinned thread busy-polls for the response,
+/// and sends the reply back via a `tokio::sync::oneshot`.
+///
+/// This is the userspace busy-spin latency floor: the cheapest possible
+/// round-trip without any async task scheduler overhead on the hot path.
+pub async fn bare_busyspin_udp_echo_pair() -> Result<(EchoClient, EchoServer), NetworkError> {
+    // Bind the server socket on an ephemeral port.
+    let srv_sock = std::net::UdpSocket::bind("127.0.0.1:0").map_err(NetworkError::Io)?;
+    srv_sock.set_nonblocking(true).map_err(NetworkError::Io)?;
+    let local = srv_sock.local_addr().map_err(NetworkError::Io)?;
+
+    // Collect core ids for pinning; fall back to unpinned if <2 cores.
+    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+    let server_core = core_ids.first().copied();
+    let client_core = core_ids.get(1).copied();
+
+    // ── Server thread ──────────────────────────────────────────────────────
+    // Receives a oneshot stop signal; checks it each spin iteration via
+    // `try_recv` so we can exit cleanly without blocking forever.
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server_thread = std::thread::spawn(move || {
+        if let Some(core) = server_core {
+            core_affinity::set_for_current(core);
+        }
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match srv_sock.recv_from(&mut buf) {
+                Ok((n, from)) => {
+                    let _ = srv_sock.send_to(&buf[..n], from);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Check for stop signal without blocking.
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // ── Client thread ──────────────────────────────────────────────────────
+    // Owns its own non-blocking socket (already `connect`ed to the server).
+    // Receives (payload, reply_tx) from the async side; busy-sends and
+    // busy-recvs, then fires the oneshot back to the awaiting async task.
+    let (req_tx, mut req_rx) =
+        tokio::sync::mpsc::channel::<(bytes::Bytes, tokio::sync::oneshot::Sender<bytes::Bytes>)>(
+            16,
+        );
+
+    let client_thread = std::thread::spawn(move || {
+        if let Some(core) = client_core {
+            core_affinity::set_for_current(core);
+        }
+        let cli_sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("client bind");
+        cli_sock.set_nonblocking(true).expect("set_nonblocking");
+        cli_sock.connect(local).expect("client connect");
+        let mut buf = vec![0u8; 64 * 1024];
+
+        // Process requests until the mpsc sender is dropped (client dropped).
+        while let Some((body, reply_tx)) = req_rx.blocking_recv() {
+            // Busy-send (retry on WouldBlock, which is rare on loopback).
+            loop {
+                match cli_sock.send(&body) {
+                    Ok(_) => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::hint::spin_loop();
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Busy-recv until we get the echoed datagram back.
+            let echoed = loop {
+                match cli_sock.recv(&mut buf) {
+                    Ok(n) => break bytes::Bytes::copy_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::hint::spin_loop();
+                    }
+                    Err(_) => break bytes::Bytes::new(),
+                }
+            };
+            let _ = reply_tx.send(echoed);
+        }
+    });
+
+    let client = EchoClient {
+        inner: EchoClientInner::BareBusyspinUdp {
+            tx: req_tx,
+            thread: client_thread,
+        },
+        next_id: AtomicU64::new(1),
+    };
+    let server = EchoServer {
+        inner: EchoServerInner::BareBusyspinUdp {
+            stop_tx,
+            thread: server_thread,
+            local,
+        },
+    };
+    Ok((client, server))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bare_busyspin_udp_echo_roundtrips() {
+        let (client, server) = bare_busyspin_udp_echo_pair().await.unwrap();
+        let resp = client.rpc(bytes::Bytes::from_static(b"spin-payload")).await.unwrap();
+        assert_eq!(&resp[..], b"spin-payload");
+        server.shutdown().await;
+    }
 
     #[tokio::test]
     async fn bare_tokio_udp_echo_roundtrips() {

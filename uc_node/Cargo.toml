@@ -25,6 +25,7 @@ rustls = { workspace = true }
 rcgen = { workspace = true }
 rustls-pemfile = { workspace = true }
 crc32fast = "1"
+core_affinity = "0.8"
 # M3 — shmem IPC
 memmap2 = { workspace = true }
 fs2 = { workspace = true }
