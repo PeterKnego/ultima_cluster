@@ -2,9 +2,10 @@
 
 **Date:** 2026-06-17.
 **Status:** Closed. Transport built, proven linearizable (failover / partition / 10% loss /
-hard-crash) over UDP, transport-isolated microbench landed, QUIC-vs-UDP A/B captured. QUIC
-remains the default.
-**Branch:** `feat/inter-node-udp-transport`.
+hard-crash) over UDP, transport-isolated microbench landed, QUIC-vs-UDP A/B captured across
+Hetzner LAN (§6.4), 3-node fan-out (§6.5), and an AWS placement group + first Aeron floor
+(§6.6, run 2026-06-18/19). QUIC remains the default.
+**Branch:** `feat/inter-node-udp-transport` (AWS bench-infra + Aeron-harness fixes landed on `main`).
 
 **Provenance / scaffolding.** Design rationale and the full phasing live in the retained
 superpowers artifacts —
@@ -424,7 +425,7 @@ node0, `--role client` on node1; `make up-ping` → sweep → `make destroy`).
 cores per host** (driver conductor/sender/receiver + load-rig/echo) — which does not fit
 2-vCPU `ccx13`. Launchers were identified on the live dist and `aeron_echo_launcher` corrected
 to `echo-server`; a fair Aeron floor needs a ≥4-dedicated-core instance (e.g. `ccx33`) — a
-future run.
+future run. **(Now captured on a 16-vCPU AWS `c7i.4xlarge` — see §6.6.)**
 
 **Updated verdict:** the cross-host clean-LAN result is the first evidence UDP's design pays
 off where it is meant to (latency-bound, real network), and it inverts the loopback small-
@@ -485,6 +486,63 @@ scope all argue against changing the default on this evidence. The harness (spli
 fan-out + netem + the `up-fanout FANOUT_INSTANCE_TYPE=` knob) is now in place to run the deeper
 comparison cheaply.
 
+### 6.6 Cross-host results on AWS (placement group — first Aeron floor, run 2026-06-18/19)
+
+Ran on **2× AWS `c7i.4xlarge`** (16 vCPU) in a single AZ + **cluster placement group**, node↔node
+over the **private network**, single-inflight `ping` mode, **no `tc netem`**. The no-shaping choice
+is deliberate: intra-AZ loss is ~0.01–0.1 % and RTT is sub-100 µs, so the *baseline* cell already
+**is** the realistic same-placement-group number — adding distance/loss would emulate a different
+topology, not this one. This is also the run that finally captured the **Aeron floor** §6.4
+deferred (the 16-vCPU box has the ≥4 isolated busy-spin cores `ccx13` lacked).
+
+UC ping A/B (`internode-rpc-bench`, single-inflight):
+
+| transport | payload | p50 | p99 | p99.9 |
+|---|--:|--:|--:|--:|
+| **UC-QUIC** | 64 B | **0.091 ms** | 0.530 ms | 0.631 ms |
+| UC-UDP | 64 B | 0.098 ms | 0.557 ms | 0.644 ms |
+| UC-QUIC | 1024 B | 0.097 ms | 0.440 ms | 0.563 ms |
+| UC-UDP | 1024 B | 0.105 ms | 0.567 ms | 0.662 ms |
+
+Aeron echo floor (`aeron-echo-baseline.sh` → canonical `remote-echo-benchmarks`, java media driver,
+conductor/sender/receiver+app **busy-spin-pinned to cores 1–4**, open-loop **10 K msg/s**, 64 B,
+50 000 samples):
+
+| transport | p50 | p99 | p99.9 | max |
+|---|--:|--:|--:|--:|
+| **Aeron** | **0.047 ms** | 0.066 ms | 0.076 ms | 0.286 ms |
+
+**Findings:**
+- **Placement group is ~3× faster than the Hetzner LAN** — UC p50 ~90–105 µs vs ~305–339 µs
+  (§6.4). Nitro + same-AZ cluster placement is a much lower-latency fabric.
+- **Here QUIC edges UDP — the opposite of Hetzner's clean LAN.** QUIC wins p50 (91 vs 98 µs @64 B;
+  97 vs 105 µs @1024 B) *and* p99. So the §6.4 UDP clean-LAN advantage is **not universal** — it is
+  network/NIC-dependent, which further weakens any case for flipping the default on LAN p50 alone.
+- **Aeron floor ≈ 2× faster than UC p50 (47 vs ~91–98 µs), and far tighter p99 (66 µs vs ~530 µs).**
+  But this is **not apples-to-apples**: Aeron ran open-loop at a fixed 10 K/s with busy-spin threads
+  pinned to dedicated cores; UC ran single-inflight closed-loop with **no core pinning / no busy-spin
+  isolation** (`up-ping` fleet, no `os_tune`). The wide p99 gap is mostly UC threads absorbing
+  scheduler jitter without pinned cores — a tuning gap, not demonstrably a protocol gap. The number
+  is a real *reference floor*, not a like-for-like UC-vs-Aeron verdict.
+
+**Harness work this run required** (all committed to `main`; the AWS path was previously untested):
+`NETEM_IFACE` auto-detect (this c7i's private ENI is **`enp39s0`**, not `ens5` — hardcoding would
+have silently no-op'd shaping); order-robust inventory parsing (the `grep -A5 node_role` parser read
+the wrong host block and silently `exit 1`'d under `set -e`); `PING_INSTANCE_TYPE` knob (`up-ping`
+hardcoded the Hetzner `ccx13`); Ansible cold-boot `wait_for_connection` ordering; and the
+`aeron-echo-baseline.sh` chain to make the canonical orchestrator run on a non-DPDK AWS fleet —
+DPDK env vars set so `set -u` doesn't abort, orchestrator SSH switched to **private IPs** + an
+on-node key (`ORCH_REMOTE_KEY`). Two follow-ups remain (noted in commits, not yet automated): the
+`build_aeron` role should `chown` `/opt/bench/aeron-deploy` to the run user so the JVM can write
+results, and `download_results` runs on node0 so it can't scp back to the control box (results stay
+on the node; histogram was read from the streamed orchestrator log).
+
+**Verdict (updated): keep QUIC default.** AWS *reverses* the UDP clean-LAN edge (QUIC wins here), and
+the first Aeron floor shows UC ~2× off a fully-tuned Aeron — both cut against switching on current
+evidence. A *fair* UC-vs-Aeron comparison needs UC on the same footing: isolated busy-spin cores
+(`os_tune` + an `up-fanout`-class fleet) and a busy-spin UC ping mode. Until then the Aeron number is
+a floor to close toward, not a like-for-like loss.
+
 ---
 
 ## 7. What's deferred / future work
@@ -507,6 +565,12 @@ comparison cheaply.
   the ticker off the hot path / batching SM updates is the lever to close it.
 - **Cross-host LAN A/B** — the deciding measurement (§6.3) is the operator's to run on real
   hardware via `run-uc-Nnode.sh` + the `bench-infra` netem knobs.
+- **Fair UC-vs-Aeron A/B** — §6.6 captured the Aeron floor (47 µs p50) but against an *untuned*
+  UC (no core pinning). To compare like-for-like, put UC on the same footing: `os_tune` core
+  isolation on an `up-fanout`-class fleet + a busy-spin UC ping mode. Two `aeron-echo-baseline.sh`
+  rough edges to automate first: the `build_aeron` role should `chown` `/opt/bench/aeron-deploy` to
+  the run user (else the JVM can't write results), and `download_results` runs on node0 so it can't
+  scp back to the control box (results land on the node).
 
 Design scaffolding retained per CLAUDE.md:
 `docs/superpowers/specs/2026-06-17-inter-node-udp-transport-design.md` and
