@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 
 use super::client::PeerConn;
 use super::instance::QuicRaftNetwork;
-use crate::network::{PIPELINE_DEPTH, PipelinedNet};
+use crate::network::{pipeline_depth, PipelinedNet};
 use crate::raft::{NodeAddr, NodeId, TypeConfig};
 
 /// Shared map of established peer connections, keyed by NodeId.
@@ -96,6 +96,6 @@ impl RaftNetworkFactory<TypeConfig> for QuicRaftNetworkFactory {
         );
         #[cfg(feature = "fault-injection")]
         let net = net.with_fault(self.source, self.fault_table.clone());
-        PipelinedNet::new(net, PIPELINE_DEPTH)
+        PipelinedNet::new(net, pipeline_depth())
     }
 }

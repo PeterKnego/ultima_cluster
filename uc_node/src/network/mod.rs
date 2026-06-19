@@ -33,6 +33,53 @@ use thiserror::Error;
 /// lossy peer cannot make the leader buffer unboundedly.
 pub const PIPELINE_DEPTH: usize = 8;
 
+/// Parse a pipeline depth from an optional string (e.g. from env).
+///
+/// - `None`          → `PIPELINE_DEPTH` (default 8)
+/// - `Some("0")`     → 1 (clamped; zero is not useful)
+/// - `Some("1")`     → 1
+/// - `Some("bad")`   → `PIPELINE_DEPTH` (fallback on parse error)
+fn parse_pipeline_depth(s: Option<&str>) -> usize {
+    match s {
+        None => PIPELINE_DEPTH,
+        Some(v) => v.parse::<usize>().unwrap_or(PIPELINE_DEPTH).max(1),
+    }
+}
+
+/// Runtime-configurable pipeline depth.
+///
+/// Reads `UC_PIPELINE_DEPTH` from the environment; falls back to
+/// [`PIPELINE_DEPTH`] on missing or non-numeric values. Always returns at
+/// least 1.
+pub(crate) fn pipeline_depth() -> usize {
+    parse_pipeline_depth(std::env::var("UC_PIPELINE_DEPTH").ok().as_deref()).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_pipeline_depth_none_returns_default() {
+        assert_eq!(parse_pipeline_depth(None), PIPELINE_DEPTH);
+    }
+
+    #[test]
+    fn parse_pipeline_depth_one() {
+        assert_eq!(parse_pipeline_depth(Some("1")), 1);
+    }
+
+    #[test]
+    fn parse_pipeline_depth_zero_clamped_to_one() {
+        assert_eq!(parse_pipeline_depth(Some("0")), 1);
+    }
+
+    #[test]
+    fn parse_pipeline_depth_garbage_returns_default() {
+        assert_eq!(parse_pipeline_depth(Some("garbage")), PIPELINE_DEPTH);
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum NetworkError {
     #[error("io: {0}")]

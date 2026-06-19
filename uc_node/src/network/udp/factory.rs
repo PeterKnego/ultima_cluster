@@ -11,7 +11,7 @@ use openraft::network::RaftNetworkFactory;
 
 use super::instance::UdpRaftNetwork;
 use super::mux::UdpMux;
-use crate::network::{PIPELINE_DEPTH, PipelinedNet};
+use crate::network::{pipeline_depth, PipelinedNet};
 use crate::raft::{NodeAddr, NodeId, TypeConfig};
 
 pub struct UdpRaftNetworkFactory {
@@ -74,6 +74,6 @@ impl RaftNetworkFactory<TypeConfig> for UdpRaftNetworkFactory {
         self.mux.register_peer(node.raft_addr, target);
         #[cfg(feature = "fault-injection")]
         let net = net.with_fault(self.source, self.fault_table.clone());
-        PipelinedNet::new(net, PIPELINE_DEPTH)
+        PipelinedNet::new(net, pipeline_depth())
     }
 }
