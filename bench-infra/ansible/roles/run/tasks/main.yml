@@ -10,6 +10,13 @@
     mkdir -p {{ remote_home }}/results
   changed_when: false
 
+- name: Ensure results dir is owned by the run user
+  ansible.builtin.file:
+    path: "{{ remote_home }}/results"
+    state: directory
+    owner: "{{ ansible_user_id }}"
+    mode: "0755"
+
 # ---- Aeron: start drivers + nodes on every host, sweep on node0, then tear down ----
 - name: Start Aeron media driver
   ansible.builtin.shell: |

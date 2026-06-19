@@ -36,6 +36,14 @@
     remote_src: true
     creates: "{{ aeron_deploy_dir }}/scripts/aeron/cluster-node"
 
+- name: Make aeron-deploy writable by the run user (non-root JVM writes results here)
+  ansible.builtin.file:
+    path: "{{ aeron_deploy_dir }}"
+    owner: "{{ ansible_user_id }}"
+    group: "{{ ansible_user_gid }}"
+    recurse: true
+  when: ansible_user_id != 'root'
+
 - name: Verify launchers + LoadTestRig present
   ansible.builtin.shell: |
     test -x {{ aeron_deploy_dir }}/scripts/aeron/cluster-node

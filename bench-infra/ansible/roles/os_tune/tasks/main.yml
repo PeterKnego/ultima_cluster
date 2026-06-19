@@ -32,6 +32,8 @@
     - { k: "net.core.wmem_max", v: "16777216" }
     - { k: "net.core.rmem_default", v: "1048576" }
     - { k: "net.core.wmem_default", v: "1048576" }
+    - { k: "net.core.busy_poll", v: "50" }
+    - { k: "net.core.busy_read", v: "50" }
 
 - name: Raise open-file limits
   ansible.builtin.copy:
