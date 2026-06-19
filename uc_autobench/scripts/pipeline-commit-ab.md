@@ -5,8 +5,8 @@ commit (depth 1) on a live 3-node UC cluster over a real cross-host network, usi
 existing `bench-infra` run role and `commit-path-load` open-loop harness.
 
 This document is the procedure for Task 7 (billable cloud run). Do **not** start it without
-an explicit go-ahead — it provisions real hosts (~$2/hr on Hetzner ccx13 or ~$0.70/hr on
-AWS c7i.xlarge).
+an explicit go-ahead — it provisions real hosts (~$0.70/hr per node on AWS c7i.4xlarge,
+~$2.10/hr for 3 nodes).
 
 ---
 
@@ -27,9 +27,15 @@ overrides the group-var default and forces sequential commits across the cluster
 
 ## Prerequisites
 
-- `bench-infra/.env` with `HCLOUD_TOKEN` (Hetzner) or `AWS_ACCESS_KEY_ID` +
-  `AWS_SECRET_ACCESS_KEY` for the target cloud.
-- `bench-infra/terraform.tfvars` with `ssh_private_key_file` set.
+- `bench-infra/.env` with `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (or `AWS_PROFILE`).
+- `bench-infra/terraform.tfvars` configured for AWS — use `example.aws.tfvars` as the
+  template:
+  ```bash
+  cp bench-infra/example.aws.tfvars bench-infra/terraform.tfvars
+  # then fill in ssh_public_key, ssh_private_key_file, allow_ssh_cidr
+  ```
+  The template already sets `cloud = "aws"` and `instance_type = "c7i.4xlarge"` (3-node
+  default, placement-group, sustained bandwidth — correct for Phase B).
 - Terraform state is empty (no fleet running). Run `make -C bench-infra destroy` if needed.
 - The working tree is clean and the `uc_pipeline_depth` var is committed (this task).
 
@@ -41,14 +47,17 @@ overrides the group-var default and forces sequential commits across the cluster
 
 ```bash
 # From the repo root:
-make -C bench-infra up-uc FANOUT_INSTANCE_TYPE=ccx13
+make -C bench-infra up-uc
 cd bench-infra && ansible-playbook ansible/bench.yml \
-  -e aeron_enabled=false \
   -e uc_pipeline_depth=1
 ```
 
 `make up-uc` does:
-1. `terraform apply` — 3 hosts (node0/node1/node2)
+1. `terraform apply` — 3 hosts (node0/node1/node2), instance type and cloud taken from
+   `terraform.tfvars` (set to `cloud=aws` + `instance_type=c7i.4xlarge` per Prerequisites).
+   Note: `up-uc` does **not** accept `FANOUT_INSTANCE_TYPE` / `PING_INSTANCE_TYPE` make
+   variables — those only apply to `up-fanout` and `up-ping`. The instance type must be set
+   in `terraform.tfvars`.
 2. `make inventory` — writes `bench-infra/inventory/hosts.yml`
 3. `ansible-playbook provision.yml -e aeron_enabled=false` — OS tuning, toolchain, UC
    build (rsync from local tree), peer config (`uc-peers.env` per host)
@@ -79,7 +88,6 @@ The fleet is still up from Pass 1. Restart the cluster with the default depth:
 
 ```bash
 cd bench-infra && ansible-playbook ansible/bench.yml \
-  -e aeron_enabled=false \
   -e uc_pipeline_depth=8
 ```
 
@@ -216,5 +224,6 @@ make -C bench-infra destroy
   and depth=8 runs.
 - If the fleet is idle between passes, run `make -C bench-infra status` to check hosts are
   still reachable before starting Pass 2.
-- For AWS, set `FANOUT_INSTANCE_TYPE=c7i.xlarge` (or larger) and ensure `netem_iface` is
-  overridden to the correct NIC (e.g., `enp39s0` on c7i; check with `ip link` on the host).
+- For AWS, `instance_type = "c7i.4xlarge"` is already the correct default in
+  `example.aws.tfvars`. Ensure `netem_iface` is overridden to the correct NIC (e.g.,
+  `enp39s0` on c7i; check with `ip link` on the host).
