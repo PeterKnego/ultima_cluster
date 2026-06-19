@@ -44,6 +44,12 @@ enum EchoClientInner {
         /// Held so the client endpoint outlives in-flight RPCs.
         _endpoint: quinn::Endpoint,
     },
+    BareTokioUdp {
+        sock: std::sync::Arc<tokio::net::UdpSocket>,
+        /// Held for documentation; the socket is already `connect`ed to this address.
+        #[allow(dead_code)]
+        peer: std::net::SocketAddr,
+    },
 }
 
 impl EchoClient {
@@ -84,6 +90,12 @@ impl EchoClient {
                 }
                 Ok(resp.body)
             }
+            EchoClientInner::BareTokioUdp { sock, .. } => {
+                sock.send(&body).await.map_err(NetworkError::Io)?;
+                let mut buf = vec![0u8; 64 * 1024];
+                let n = sock.recv(&mut buf).await.map_err(NetworkError::Io)?;
+                Ok(bytes::Bytes::copy_from_slice(&buf[..n]))
+            }
         }
     }
 }
@@ -99,6 +111,10 @@ enum EchoServerInner {
         endpoint: quinn::Endpoint,
         accept_task: tokio::task::JoinHandle<()>,
     },
+    BareTokioUdp {
+        handle: tokio::task::JoinHandle<()>,
+        local: std::net::SocketAddr,
+    },
 }
 
 impl EchoServer {
@@ -111,6 +127,7 @@ impl EchoServer {
             EchoServerInner::Quic { endpoint, .. } => {
                 endpoint.local_addr().map_err(NetworkError::Io)
             }
+            EchoServerInner::BareTokioUdp { local, .. } => Ok(*local),
         }
     }
 
@@ -124,6 +141,10 @@ impl EchoServer {
             } => {
                 endpoint.close(0u32.into(), b"shutdown");
                 let _ = accept_task.await;
+            }
+            EchoServerInner::BareTokioUdp { handle, .. } => {
+                handle.abort();
+                let _ = handle.await;
             }
         }
     }
@@ -293,9 +314,47 @@ pub async fn quic_echo_pair() -> Result<(EchoClient, EchoServer), NetworkError> 
     Ok((client, server))
 }
 
+/// Bind a bare tokio UDP echo server + client on loopback.
+///
+/// No [`Frame`] framing, no protocol — the server simply echoes every received
+/// datagram back to the sender. This is the raw async-socket latency floor:
+/// the cheapest possible UDP round-trip, with zero protocol overhead.
+/// Use this as the bottom rung of the latency ladder.
+pub async fn bare_tokio_udp_echo_pair() -> Result<(EchoClient, EchoServer), NetworkError> {
+    let srv = tokio::net::UdpSocket::bind("127.0.0.1:0").await.map_err(NetworkError::Io)?;
+    let local = srv.local_addr().map_err(NetworkError::Io)?;
+    let handle = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok((n, from)) = srv.recv_from(&mut buf).await {
+            let _ = srv.send_to(&buf[..n], from).await;
+        }
+    });
+    let cli = tokio::net::UdpSocket::bind("127.0.0.1:0").await.map_err(NetworkError::Io)?;
+    cli.connect(local).await.map_err(NetworkError::Io)?;
+    let client = EchoClient {
+        inner: EchoClientInner::BareTokioUdp {
+            sock: std::sync::Arc::new(cli),
+            peer: local,
+        },
+        next_id: AtomicU64::new(1),
+    };
+    let server = EchoServer {
+        inner: EchoServerInner::BareTokioUdp { handle, local },
+    };
+    Ok((client, server))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bare_tokio_udp_echo_roundtrips() {
+        let (client, server) = bare_tokio_udp_echo_pair().await.unwrap();
+        let resp = client.rpc(bytes::Bytes::from_static(b"ping-payload")).await.unwrap();
+        assert_eq!(&resp[..], b"ping-payload");
+        server.shutdown().await;
+    }
 
     #[tokio::test]
     async fn udp_echo_round_trips() {
