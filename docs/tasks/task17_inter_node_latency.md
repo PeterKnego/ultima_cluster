@@ -424,6 +424,22 @@ node0 server, 64 B single-inflight ping; `net.core.busy_poll=50` via `os_tune`):
    98 µs in §6.6, which came through a different harness path; both put UC-UDP within a small
    factor of Aeron.) There is almost no single-inflight RTT gap left to close.
 
+**Second fabric — Hetzner ccx13 LAN (2026-06-19), confirms the verdict:**
+
+| transport | p50 | p99 |
+|---|--:|--:|
+| **UC-UDP** | **200.6 µs** | 332 µs |
+| busy-poll UDP | 349.2 µs | 435.7 µs |
+| UC-QUIC | 354.6 µs | 453.9 µs |
+
+UC-UDP is again the fastest userspace datapath (≈ task16 §6.4's Hetzner baseline of 305 µs, cleaner
+harness here), and **busy-poll is again slower — by far more (+149 µs vs AWS's +10 µs)**. On a
+2-vCPU ccx13 the rung's busy-spin thread starves the tokio runtime that feeds it via mpsc, so the
+handoff overhead explodes. **Busy-poll loses to plain UC-UDP on BOTH fabrics** (low-RTT AWS
+placement group AND high-RTT Hetzner LAN) — the cheap-drop-in busy-poll lever is a dead end, and
+the Gate-B1 / AF_XDP-cancel decision holds across clouds. Hetzner LAN RTT (~200 µs) is ~4× the AWS
+placement group (~50 µs) — and busy-poll did not close that gap, it widened it.
+
 ### 9.3 Harness bug found + fixed (the run blocker)
 
 First Pass-1 attempt failed: every node logged `setsid: failed to execute UC_PIPELINE_DEPTH=1:
