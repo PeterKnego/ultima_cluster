@@ -399,14 +399,30 @@ the 8-deep pipeline real RTT-wait to hide; loopback's µs RTT had none. **The Ph
 `stream_append` change is validated cross-host: a measurable throughput-and-latency win under
 load, at no cost when idle.**
 
-### 9.2 B1 — busy-poll datapath RTT: BLOCKED this run
+### 9.2 B1 — busy-poll datapath RTT (run 2026-06-19, after the split-role rung landed)
 
-The cross-host `SO_BUSY_POLL` RTT could **not** be measured: the `busypoll-udp` rung (like the
-Phase A `bare-udp`/`busyspin-udp` rungs) is a **loopback-only echo-pair** — `--role server`
-returns *"busypoll-udp does not support --role server; use --role both"*. Busy-poll's benefit is
-a real-NIC phenomenon that only appears cross-host (server on node0, client on node1), so a
-loopback-only rung cannot measure it. **A split-role (server/client) busy-poll implementation is
-required** — a code follow-up, not doable live on a billing fleet.
+The first attempt was blocked: the `busypoll-udp` rung was a loopback-only echo-pair (`--role
+server` bailed). That was fixed (a split-role `busypoll_udp_echo_server`/`_client`, commit
+`bf77537`), then measured on a fresh 2-of-3-node `c7i.4xlarge` fleet (per-link, node1 client →
+node0 server, 64 B single-inflight ping; `net.core.busy_poll=50` via `os_tune`):
+
+| transport | p50 | p99 | p99.9 |
+|---|--:|--:|--:|
+| **UC-UDP** | **49.4 µs** | 60.2 µs | 70.5 µs |
+| busy-poll UDP | 59.6 µs | 74.4 µs | 98.8 µs |
+| UC-QUIC | 68.8 µs | 115.5 µs | 134.3 µs |
+| Aeron (task16 §6.6, same HW) | 47 µs | 66 µs | ~76 µs |
+
+**Two findings:**
+1. **Busy-poll did NOT help — it was ~10 µs *slower* than plain UC-UDP** (59.6 vs 49.4 µs p50).
+   Caveat/confound: the busy-poll rung adds a dedicated thread + mpsc/oneshot handoff per RPC,
+   whereas UC-UDP drives the `UdpMux` directly — so the rung's architecture overhead (~10 µs)
+   masks any ENA busy-poll benefit. The clean read is not "busy-poll is bad" but "busy-poll, as a
+   cheap drop-in, does not beat UC's existing UDP path here."
+2. **UC-UDP is already essentially at the Aeron floor (49.4 vs 47 µs p50)** on this clean
+   placement-group link. (This per-link `--role server/client` number is lower/cleaner than the
+   98 µs in §6.6, which came through a different harness path; both put UC-UDP within a small
+   factor of Aeron.) There is almost no single-inflight RTT gap left to close.
 
 ### 9.3 Harness bug found + fixed (the run blocker)
 
@@ -423,9 +439,15 @@ accounting for `setsid` consuming the assignment as an argv.)
 
 - **Gate-A / V2 streaming: CLOSED, positive.** B-V2 confirms the pipelined `stream_append`
   helps under cross-host load. No further action — it's already merged + default.
-- **Gate-B1 (busy-poll vs AF_XDP): DEFERRED** — un-evaluable until the split-role busy-poll rung
-  exists. Follow-up: (1) add `--role server`/`client` support to the busy-poll rung (small code
-  task), (2) a short, cheaper B1-only fleet run (2-node suffices for per-link RTT) comparing
-  busy-poll vs UC-UDP/QUIC vs the known Aeron 47 µs floor (task16 §6.6, same hardware).
-- **AF_XDP (Stage 2):** still gated on Gate-B1; not started.
-- **QUIC stays the default transport.**
+- **Gate-B1 (busy-poll vs AF_XDP): CLOSED — do NOT pursue AF_XDP.** §9.2 shows plain UC-UDP is
+  already ~at the Aeron floor (49 vs 47 µs p50) on a clean placement-group link, and the cheap
+  busy-poll lever did not beat it. With essentially no single-inflight RTT gap remaining, the
+  weeks of AF_XDP work (raw L2 framing, UMEM, `CAP_NET_ADMIN`, ENA-zero-copy verification) cannot
+  pay off — kernel-bypass would chase a gap that is already closed. **AF_XDP (Stage 2) is
+  cancelled.**
+- **Net latency conclusion:** the durable win was **V2 streaming** (§9.1 — pipelined commit, +6 %
+  throughput / −28 % p50 under load, shipped + default). UC's transports are already in Aeron's
+  latency class for raw per-link RTT; the remaining headroom is throughput-under-load (which V2
+  streaming addressed), not single-shot latency.
+- **QUIC stays the default transport** (encrypted-by-default, mature; ~20 µs behind UC-UDP on
+  single-inflight RTT but that is not the bottleneck for replication throughput).

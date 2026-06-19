@@ -13,10 +13,23 @@ resource "aws_vpc" "bench" {
   tags                 = { Name = "${var.owner}-vpc", owner = var.owner }
 }
 
+# Pick an AZ that actually offers the requested instance type. AWS otherwise
+# auto-places the subnet in an arbitrary AZ (e.g. us-east-1e), where larger
+# types like c7i.4xlarge are not offered → RunInstances "Unsupported" 400.
+data "aws_ec2_instance_type_offerings" "supported_az" {
+  filter {
+    name   = "instance-type"
+    values = [local.instance_type]
+  }
+  location_type = "availability-zone"
+}
+
 resource "aws_subnet" "bench" {
   vpc_id                  = aws_vpc.bench.id
   cidr_block              = "10.10.1.0/24"
   map_public_ip_on_launch = true
+  # Cluster placement group pins all nodes to this one AZ; pick a supported one.
+  availability_zone = sort(data.aws_ec2_instance_type_offerings.supported_az.locations)[0]
 }
 
 resource "aws_internet_gateway" "bench" {
