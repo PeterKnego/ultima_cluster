@@ -384,4 +384,16 @@ done
 ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=accept-new -o BatchMode=yes \
   "${SSH_USER}@${NODE0_IP}" "${REMOTE_CMD}"
 
+# The orchestrator writes HDR results under node0:<benchmarks_path>/scripts/results.
+# Its own download step targets a control-box path that doesn't exist on node0,
+# so fetch the tarball back ourselves.
+echo "[fetch] pulling aeron results from node0 -> ${OUT_DIR}/" >&2
+mkdir -p "${OUT_DIR}"
+ssh -i "${SSH_KEY}" -o StrictHostKeyChecking=accept-new -o BatchMode=yes "${SSH_USER}@${NODE0_IP}" \
+  "cd ${AERON_DEPLOY_DIR}/scripts/results 2>/dev/null && tar -czf /tmp/aeron-results.tgz . 2>/dev/null && echo ok" \
+  && scp -i "${SSH_KEY}" -o StrictHostKeyChecking=accept-new "${SSH_USER}@${NODE0_IP}:/tmp/aeron-results.tgz" "${OUT_DIR}/aeron-results.tgz" \
+  && tar -xzf "${OUT_DIR}/aeron-results.tgz" -C "${OUT_DIR}" \
+  && echo "[fetch] aeron results in ${OUT_DIR}/" >&2 \
+  || echo "[fetch] WARN: no aeron results fetched (check node0 ${AERON_DEPLOY_DIR}/scripts/results)" >&2
+
 echo "[run] done. HDR results under ${OUT_DIR}/ — normalize with aeron_hdr_to_csv.py" >&2
