@@ -124,10 +124,10 @@ for pass in a1:0 b1:1 a2:0 b2:1; do
 done
 ```
 
-**Primary metric (`submitted→persisted`):** run with the `profile/raftcore-stats` build so node0
-emits `RAFT_RUNTIME_STATS` (the leader's submit→journal-persist segment). Scrape node0 stderr
-(`/opt/bench/uc-node.out`) per pass and record the `submitted_to_persisted` p50/p99. If that
-instrument branch is not yet merged, build the fleet from it for this run (note it in the result).
+**Primary metric (`submitted→persisted`):** the leader's journal append+fsync segment — where
+preallocation acts. It is NOT in `uc_sweep.csv`; it comes from the openraft `runtime-stats`
+instrument dumped to node0 stderr. **Apply the instrument, capture, and parse per the Appendix
+below**, recording `submitted→persisted` p50/p99 for each of the 4 passes.
 
 ---
 
@@ -159,6 +159,108 @@ a dev-ext4-only win not worth the default.
 ```bash
 make -C bench-infra destroy   # always, to stop charges
 ```
+
+## Appendix — the `submitted→persisted` instrument + scraping step
+
+The primary metric needs openraft 0.10's `runtime-stats` instrument, which dumps per-stage
+log-lifecycle latencies (µs) to node0 stderr. There is a stale `profile/raftcore-stats` branch
+(2026-06-17, ~12.7k lines behind main — do NOT build from it directly). Re-apply the 3-hunk
+instrument onto a fresh branch off current `main` instead, build the fleet from that branch, and
+keep it OUT of the merged default (measurement-only).
+
+### A. Apply the instrument (fresh branch off current main)
+
+```bash
+git checkout -b profile/raftcore-stats-v2 main
+```
+
+**Hunk 1 — `Cargo.toml` (workspace root, the `openraft = ` line):** add the `runtime-stats` feature.
+```diff
+-openraft = { version = "0.10.0-alpha.21", features = ["serde"] }
++openraft = { version = "0.10.0-alpha.21", features = ["serde", "runtime-stats"] }
+```
+
+**Hunk 2 — `uc_node/src/runtime/node.rs`:** add a `runtime_stats_display()` accessor to BOTH the
+inner runtime enum (the one with `Self::Embedded(r)` / `Self::Shmem(r)` arms) and the public `Node`
+impl:
+```rust
+    // inner runtime enum impl:
+    pub(crate) async fn runtime_stats_display(&self) -> Option<String> {
+        match self {
+            Self::Embedded(r) => r.runtime_stats().await.ok().map(|s| s.display().to_string()),
+            Self::Shmem(r) => r.runtime_stats().await.ok().map(|s| s.display().to_string()),
+        }
+    }
+```
+```rust
+    // public Node impl:
+    pub async fn runtime_stats_display(&self) -> Option<String> {
+        self.raft.runtime_stats_display().await
+    }
+```
+
+**Hunk 3 — `uc_autobench/src/bin/uc-node-launch.rs`:** replace the plain shutdown wait
+(`tokio::signal::ctrl_c().await?;`, ~line 257; `use std::time::Duration;` is already imported) with
+a 5s periodic dump loop that still exits on Ctrl-C:
+```rust
+    let mut stats_tick = tokio::time::interval(Duration::from_secs(5));
+    stats_tick.tick().await; // fires immediately; skip the t=0 tick
+    loop {
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => { r?; break; }
+            _ = stats_tick.tick() => {
+                if let Some(s) = node.runtime_stats_display().await {
+                    eprintln!("RAFT_RUNTIME_STATS node={} {}", args.node_id, s);
+                }
+            }
+        }
+    }
+```
+
+Build-check locally (`cargo build -p uc_autobench --bin uc-node-launch`), commit, and run the A/B
+passes (Passes section above) against this branch — the `run` role rsyncs the local tree, so a
+local branch is enough; no push required.
+
+### B. Capture (per pass)
+
+The `run` role launches each node with stderr → `{{ remote_home }}/uc-node.out`. On the leader
+(usually node0), the file accumulates one `RAFT_RUNTIME_STATS node=0 …` line every 5s. After each
+pass, grab the LAST line (the stats are cumulative histograms since node start, so the final dump
+has the most samples and the steady-state distribution):
+
+```bash
+SSH_KEY=$(awk -F'"' '/ssh_private_key_file/{print $2}' bench-infra/terraform.tfvars)
+SSH_USER=$(cd bench-infra && terraform -chdir=terraform output -raw ssh_user)
+NODE0_IP=$(cd bench-infra && terraform -chdir=terraform output -json nodes | jq -r '.[]|select(.role=="node0").public_ip')
+for tag in a1 b1 a2 b2; do
+  # (run the matching pass first, THEN capture before the next pass restarts node0)
+  ssh -i "$SSH_KEY" "$SSH_USER@$NODE0_IP" \
+    "grep 'RAFT_RUNTIME_STATS node=0' /opt/bench/uc-node.out | tail -1" \
+    > "bench-out/prealloc-rtstats-$tag.txt"
+done
+```
+
+Note: each `bench.yml` pass restarts node0 (truncating/replacing `uc-node.out`), so capture
+**immediately after** each pass and before the next one starts.
+
+### C. Parse `submitted→persisted` p50/p99
+
+openraft's `RuntimeStats::display()` prints the per-stage log-lifecycle block (the same stages
+profiled in `docs/tasks/task13` §15: `proposed→received`, `received→submitted`,
+**`submitted→persisted`**, `persisted→committed`, `committed→applied`). The exact field layout is
+whatever alpha.21 emits, so **calibrate the extractor on one captured line first**:
+
+```bash
+cat bench-out/prealloc-rtstats-a1.txt        # eyeball the submitted->persisted stage + p50/p99 fields
+# then extract that stage from each pass (adjust the pattern to the real label/format):
+for tag in a1 b1 a2 b2; do
+  echo -n "$tag: "; grep -oE 'submitted[^ ]*persisted[^|]*' "bench-out/prealloc-rtstats-$tag.txt"
+done
+```
+
+Average the two A (off) values and the two B (on) values. **Decision:** `submitted→persisted`
+p50/p99 should drop materially under B (toward the microbench −50..65%). That, with no end-to-end
+regression (Comparing section), is the merge criterion for the gated promotion PR.
 
 ## Notes
 
