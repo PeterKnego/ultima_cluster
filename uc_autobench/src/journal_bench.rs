@@ -24,6 +24,10 @@ pub const METRIC_KEYS: &[&str] = &[
     "append_consistent_p99_ns",
     "append_consistent_p99_ns_64b",
     "append_consistent_p99_ns_4k",
+    // Full Journal::append().wait() on a PREALLOCATED journal (the cluster's
+    // actual path): the real single-append floor incl. channel+notifier handoff.
+    "append_consistent_prealloc_p50_ns",
+    "append_consistent_prealloc_p99_ns",
     "append_eventual_ack_p99_ns",
     "append_eventual_throughput",
     "replay_throughput_entries_s",
@@ -180,6 +184,29 @@ pub fn run(cfg: &Config) -> BTreeMap<String, f64> {
             j.append(seq, 0, &p).unwrap().wait().unwrap();
         });
         m.insert(key.into(), percentile(&mut s, 99.0));
+    }
+
+    // -- append_consistent_prealloc: the SAME serial single-append latency as
+    // append_consistent above, but on a PREALLOCATED journal (the path the UC
+    // cluster actually runs, UC_JOURNAL_PREALLOC=on). Isolates the full
+    // Journal::append().wait() cost — write + fsync + channel + notifier — with
+    // no size-extension metadata commit. 1 KiB payload. p50 = the real floor.
+    {
+        let (_d, j) = fresh_prealloc(&root, Durability::Consistent);
+        let p = vec![0xABu8; 1024];
+        let mut seq = 0u64;
+        let mut s = batched_samples_ns(cfg.consistent_samples, 1, || {
+            seq += 1;
+            j.append(seq, 0, &p).unwrap().wait().unwrap();
+        });
+        m.insert(
+            "append_consistent_prealloc_p50_ns".into(),
+            percentile(&mut s, 50.0),
+        );
+        m.insert(
+            "append_consistent_prealloc_p99_ns".into(),
+            percentile(&mut s, 99.0),
+        );
     }
 
     // -- write_only / fsync_only: the two stages of a Consistent commit,
