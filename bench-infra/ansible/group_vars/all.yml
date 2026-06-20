@@ -15,6 +15,7 @@ aeron_enabled: true      # false = UC-only fleet (skip Aeron build + Aeron sweep
 idle_strategy: busyspin
 uc_pipeline_depth: 8            # pipeline depth threaded to UC nodes via UC_PIPELINE_DEPTH; override with -e uc_pipeline_depth=1
 uc_journal_prealloc: 1          # journal segment preallocation (task36) via UC_JOURNAL_PREALLOC; default ON post-promotion, override -e uc_journal_prealloc=0 to roll back / for the A arm
+uc_api_batch_linger_ms: 5       # openraft api_batch_linger_ms via UC_API_BATCH_LINGER_MS; override -e uc_api_batch_linger_ms=0 for low-latency (A/B)
 
 # --- Build sources ---
 aeron_benchmarks_repo: "https://github.com/aeron-io/benchmarks.git"

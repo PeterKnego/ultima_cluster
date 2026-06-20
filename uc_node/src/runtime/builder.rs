@@ -24,6 +24,29 @@ use crate::raft::state_machine::AdaptedStateMachine;
 use crate::raft::state_machine_shmem::ShmemAdaptedStateMachine;
 use crate::raft::{NodeAddr, NodeId, TypeConfig};
 
+/// Default openraft `api_batch_linger_ms` for UC (ms the leader waits to fill a
+/// ClientWrite batch before flushing — a throughput-for-latency trade; openraft's
+/// own default is 0). This is the dominant end-to-end commit-latency term
+/// (task13 §15 `proposed→received`), so it is exposed as a tunable.
+const API_BATCH_LINGER_MS_DEFAULT: u64 = 5;
+
+/// Parse the `UC_API_BATCH_LINGER_MS` value; falls back to the default on
+/// missing/non-numeric. Pure helper so it can be unit-tested without the env.
+/// Mirrors `network::parse_pipeline_depth`.
+fn parse_api_batch_linger_ms(s: Option<&str>) -> u64 {
+    match s {
+        Some(v) => v.parse::<u64>().unwrap_or(API_BATCH_LINGER_MS_DEFAULT),
+        None => API_BATCH_LINGER_MS_DEFAULT,
+    }
+}
+
+/// Runtime-configurable `api_batch_linger_ms`. Reads `UC_API_BATCH_LINGER_MS`;
+/// default 5ms (current behavior). Set `=0` for lowest latency (smaller batches,
+/// lower throughput). A/B'd via `uc_autobench/scripts/linger-commit-ab.md`.
+fn api_batch_linger_ms_from_env() -> u64 {
+    parse_api_batch_linger_ms(std::env::var("UC_API_BATCH_LINGER_MS").ok().as_deref())
+}
+
 /// Builds an embedded-mode ultima_cluster node.
 /// Generic over S; non-generic shmem-fronted variant arrives in M3.
 pub struct NodeBuilder<S: StateMachine> {
@@ -362,7 +385,7 @@ where
             config.raft.snapshot_policy_logs_since_last,
         ),
         max_payload_entries: config.raft.max_payload_entries,
-        api_batch_linger_ms: 5,
+        api_batch_linger_ms: api_batch_linger_ms_from_env(),
         ..Default::default()
     };
     let validated = raft_config_unvalidated
@@ -621,3 +644,24 @@ struct NodeSendPtr(*const uc_protocol::cnc::NodeStatus);
 // SAFETY: invariant upheld at every consumer call site — mmap lives in
 // `Instance` which is moved into `NodeHandle` and outlives all users.
 unsafe impl Send for NodeSendPtr {}
+
+#[cfg(test)]
+mod tests {
+    use super::{API_BATCH_LINGER_MS_DEFAULT, parse_api_batch_linger_ms};
+
+    #[test]
+    fn linger_unset_is_default() {
+        assert_eq!(parse_api_batch_linger_ms(None), API_BATCH_LINGER_MS_DEFAULT);
+    }
+
+    #[test]
+    fn linger_zero_is_zero() {
+        assert_eq!(parse_api_batch_linger_ms(Some("0")), 0);
+    }
+
+    #[test]
+    fn linger_parses_value_and_falls_back_on_garbage() {
+        assert_eq!(parse_api_batch_linger_ms(Some("12")), 12);
+        assert_eq!(parse_api_batch_linger_ms(Some("bad")), API_BATCH_LINGER_MS_DEFAULT);
+    }
+}
