@@ -15,4 +15,5 @@ pub mod task_spec;
 pub mod baseline;
 pub mod diskcheck;
 pub mod journal_bench;
+pub mod sample_dump;
 pub mod sampling;
