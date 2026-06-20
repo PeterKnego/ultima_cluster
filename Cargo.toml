@@ -24,7 +24,7 @@ futures = "0.3"
 # raft + storage
 openraft = { version = "0.10.0-alpha.21", features = ["serde"] }
 openraft-legacy = { version = "0.10.0-alpha.21" }
-ultima-journal = { path = "../ultima_db/ultima_journal" }
+ultima-journal = { path = "../ultima_cluster/ultima_journal" }
 # `persistence` is required for snapshot_stream / install_snapshot_stream.
 ultima-db = { path = "../ultima_db", features = ["persistence"] }
 
