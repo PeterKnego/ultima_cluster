@@ -199,6 +199,13 @@ pub fn run(cfg: &Config) -> BTreeMap<String, f64> {
             seq += 1;
             j.append(seq, 0, &p).unwrap().wait().unwrap();
         });
+        // Investigation-only (UC_JOURNAL_DUMP_PREALLOC=path): persist the raw
+        // per-sample latencies so the ~4 samples above p99 (4th-worst of 400)
+        // can be located in a `perf sched` trace by ordinal. No effect on the
+        // emitted percentiles; absent the env var this is a no-op.
+        if let Some(p) = crate::sample_dump::dump_path_from_env("UC_JOURNAL_DUMP_PREALLOC") {
+            crate::sample_dump::dump_samples(&p, &s).expect("dump prealloc samples");
+        }
         m.insert(
             "append_consistent_prealloc_p50_ns".into(),
             percentile(&mut s, 50.0),
