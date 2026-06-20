@@ -706,3 +706,31 @@ does to it internally.
   latency/throughput trade, the replication round-trip (openraft/network), and the
   submit→node IPC poll-sleep (already partly addressed by event-driven ring wakeups,
   task11). Journal fsync is not where the commit-path budget is spent.
+
+## 17. Follow-up (2026-06-20) — journal segment preallocation: real journal win, NULL end-to-end (again)
+
+Pursued the §16 "leader fsync tail" lever further: **segment preallocation** (etcd
+`filePipeline` — preallocate each journal segment so the per-commit `fdatasync` skips the
+ext4 jbd2 metadata commit a size-extending append forces). Shipped to `ultima_journal`
+(task36); cluster reads `UC_JOURNAL_PREALLOC`. Note §13/this doc earlier called §5
+preallocation "NOT pursued (YAGNI)" — that was reversed once a microbench showed the jbd2
+commit is a real fraction of a *local-NVMe* fsync.
+
+3-platform interleaved cloud A/B (Consistent, 200/s, inflight 8; `submitted→persisted` from
+the `runtime-stats` instrument, prealloc OFF→ON):
+
+| platform | storage | `submitted→persisted` P50 | P99 / end-to-end |
+|---|---|---|---|
+| Hetzner ccx13 | local NVMe | 1531→1095µs (**−28%**), body −~50% | flat / NULL |
+| AWS c6id | local NVMe | 261→194µs (**−26%**), floor 155→75µs | flat / NULL |
+| AWS c7i | EBS (network) | 2910→2866µs (−1.5%) | flat / NULL |
+
+**Same verdict as §16 (fdatasync).** A real, reproducible journal-stage win on local NVMe
+(the jbd2 commit is ~half a fast-NVMe fsync; on EBS the ~2.5ms network-flush floor swamps it)
+— but it **does not reach end-to-end**: commit latency is unchanged because `api_batch_linger`
+(~5ms) + replication dominate, exactly as §15/§16 found. The journal P99 tail is also flat
+(batching/scheduling-bound at this rate). **Enabled by default anyway** (real, free,
+correctness-proven, no regression on any storage; `UC_JOURNAL_PREALLOC=0` rollback). The
+pattern is now firmly established across two journal optimizations: **leader-fsync wins are
+real but masked by linger + replication on the 3-node Consistent path.** The end-to-end levers
+remain `api_batch_linger`, the replication round-trip, and IPC poll-sleep — not journal fsync.
