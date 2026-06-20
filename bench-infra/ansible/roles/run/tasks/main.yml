@@ -85,6 +85,7 @@
         export UC_DURABILITY={{ 'eventual' if durability == 'none' else 'consistent' }}
         export UC_TRANSPORT={{ transport }}
         export UC_PIPELINE_DEPTH={{ uc_pipeline_depth }}
+        export UC_JOURNAL_PREALLOC={{ uc_journal_prealloc }}
         setsid {{ uc_target_bin }}/uc-node-launch \
           --node-id $UC_NODE_ID --listen $UC_LISTEN $UC_PEERS \
           --app-id $UC_APP_ID --with-service \

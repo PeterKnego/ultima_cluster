@@ -20,6 +20,21 @@ use crate::ClusterError;
 
 const SEGMENT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Parse the `UC_JOURNAL_PREALLOC` value into the journal preallocation flag.
+/// `"1"`/`"true"` enable it; anything else (incl. unset/`"0"`/garbage) is off.
+/// Pure helper so it can be unit-tested without touching the process env.
+/// Mirrors `network::parse_pipeline_depth`.
+fn parse_journal_prealloc(s: Option<&str>) -> bool {
+    matches!(s, Some("1") | Some("true"))
+}
+
+/// Runtime toggle for `JournalConfig.preallocate_segments` (ultima_journal task36).
+/// Reads `UC_JOURNAL_PREALLOC`; default OFF. The A/B run-book
+/// (`uc_autobench/scripts/prealloc-commit-ab.md`) flips this on the same binary.
+fn journal_prealloc_from_env() -> bool {
+    parse_journal_prealloc(std::env::var("UC_JOURNAL_PREALLOC").ok().as_deref())
+}
+
 /// Persisted snapshot meta (the last installed snapshot's metadata + a
 /// pointer to its bytes file under data_dir).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -76,9 +91,9 @@ impl JournalLogStorage {
             dir: data_dir.join("journal"),
             segment_size_bytes: SEGMENT_SIZE_BYTES,
             durability: log_durability,
-            // Opt-out for now: segment preallocation (ultima_journal task36) stays
-            // off until the operator cloud A/B on prod NVMe justifies flipping it.
-            preallocate_segments: false,
+            // A/B toggle (task36): preallocation is OFF unless UC_JOURNAL_PREALLOC=1.
+            // Default stays off until the cloud A/B justifies flipping the default.
+            preallocate_segments: journal_prealloc_from_env(),
         })?);
 
         let vote = Arc::new(StableValue::open(StableValueConfig {
@@ -452,5 +467,28 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             .wait()
             .map_err(journal_io)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_journal_prealloc;
+
+    #[test]
+    fn prealloc_unset_is_off() {
+        assert!(!parse_journal_prealloc(None));
+    }
+
+    #[test]
+    fn prealloc_one_and_true_are_on() {
+        assert!(parse_journal_prealloc(Some("1")));
+        assert!(parse_journal_prealloc(Some("true")));
+    }
+
+    #[test]
+    fn prealloc_zero_and_garbage_are_off() {
+        assert!(!parse_journal_prealloc(Some("0")));
+        assert!(!parse_journal_prealloc(Some("false")));
+        assert!(!parse_journal_prealloc(Some("bad")));
     }
 }
