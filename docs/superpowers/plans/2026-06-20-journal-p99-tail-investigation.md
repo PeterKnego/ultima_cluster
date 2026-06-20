@@ -262,7 +262,7 @@ pub mod wal_depth1;
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run (from `../ultima_db`): `cargo test -p ultima-autobench wal_depth1 --features persistence`
+Run (from `../ultima_db`): `cargo test -p ultima-autobench wal_depth1`
 Expected: PASS — `test result: ok. 1 passed`. (The `persistence` feature gates `BenchWal`; `autobench/Cargo.toml:10` already enables it on the `ultima-db` dep, but pass it explicitly to be safe.)
 
 - [ ] **Step 5: Commit**
@@ -330,7 +330,7 @@ fn main() {
 
 - [ ] **Step 2: Build it**
 
-Run (from `../ultima_db`): `cargo build -p ultima-autobench --bin wal-depth1-microbench --features persistence`
+Run (from `../ultima_db`): `cargo build -p ultima-autobench --bin wal-depth1-microbench`
 Expected: clean build.
 
 - [ ] **Step 3: Manual shape check (quick config; tmpfs allowed for the shape check only)**
@@ -339,7 +339,7 @@ Run:
 ```bash
 cd ../ultima_db
 AUTOBENCH_QUICK=1 UC_WAL_DUMP_DEPTH1=/tmp/wdump.txt \
-  cargo run -p ultima-autobench --bin wal-depth1-microbench --features persistence --release 2>/dev/null
+  cargo run -p ultima-autobench --bin wal-depth1-microbench --release 2>/dev/null
 wc -l /tmp/wdump.txt
 cd -
 ```
@@ -472,7 +472,7 @@ ssh -i /home/claude/.ssh/id_ed25519 ubuntu@$NODE0 \
  'cd /opt/bench/src/ultima_db && \
   sudo env PATH=/opt/bench/.cargo/bin:/usr/bin:/bin CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup \
    CARGO_TARGET_DIR=/opt/bench/target ULTIMA_BENCH_DIR=/opt/bench UC_WAL_DUMP_DEPTH1=/opt/bench/wdump.txt \
-   cargo run -p ultima-autobench --bin wal-depth1-microbench --features persistence --release 2>/dev/null'
+   cargo run -p ultima-autobench --bin wal-depth1-microbench --release 2>/dev/null'
 ```
 Record `wal_depth1_prealloc_p50_ns` and `wal_depth1_prealloc_p99_ns` (400 samples).
 
