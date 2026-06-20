@@ -9,3 +9,10 @@
 //! and is executed directly by Claude Code.
 
 pub mod task_spec;
+
+// journal-commit task (moved in alongside the ultima_journal crate). Self-contained:
+// depends only on ultima_journal + these helpers — no uc_node/uc_protocol coupling.
+pub mod baseline;
+pub mod diskcheck;
+pub mod journal_bench;
+pub mod sampling;

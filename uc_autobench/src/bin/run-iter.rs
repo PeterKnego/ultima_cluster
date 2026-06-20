@@ -1,7 +1,8 @@
 //! run-iter — single-command per-iteration harness for uc_autobench.
 //!
-//! Spawns build → ring_torture → shmem-microbench → (conditional) shmem-e2e,
-//! emits one JSON object on stdout describing the outcome. The agent reads
+//! Spawns build → <task>-torture → <task>-microbench → (conditional) e2e gate
+//! (binaries/tests chosen per `task_spec`), emits one JSON object on stdout
+//! describing the outcome. The agent reads
 //! the JSON `status` field, not the exit code. Exit 0 even on stage failure;
 //! non-zero only on this binary's own internal bug.
 //!
@@ -258,14 +259,14 @@ fn main() {
         emit_and_exit(&out);
     }
 
-    // Stage 2: ring_torture conformance
+    // Stage 2: per-task conformance (frozen torture suite)
     let mut torture_cmd = Command::new("cargo");
     torture_cmd.args([
         "test",
         "-p",
         "uc_autobench",
         "--test",
-        "ring_torture",
+        spec.torture_test,
         "--release",
     ]);
     let torture = run_stage(torture_cmd, Duration::from_secs(300));
@@ -345,8 +346,10 @@ fn main() {
         // as a microbench failure rather than running the gate blind.
         out.status = "microbench_failed".into();
         out.stage = "microbench".into();
-        out.stderr_tail =
-            Some("microbench stdout JSON missing required key `spsc_p99_ns`".to_string());
+        out.stderr_tail = Some(format!(
+            "microbench stdout JSON missing required key `{}`",
+            spec.primary_metric
+        ));
         emit_and_exit(&out);
     };
 

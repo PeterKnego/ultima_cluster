@@ -26,6 +26,8 @@ uc_protocol = { path = "../uc_protocol" }
 uc_node = { path = "../uc_node", features = ["test-support"] }
 uc_service = { path = "../uc_service" }
 uc_client = { path = "../uc_client" }
+# journal-commit task (self-contained; no other uc_autobench bench uses it)
+ultima-journal = { workspace = true, features = ["bench-support"] }
 
 [dev-dependencies]
 crc32fast = { workspace = true }
@@ -61,3 +63,7 @@ path = "src/bin/uc-node-launch.rs"
 [[bin]]
 name = "internode-rpc-bench"
 path = "src/bin/internode-rpc-bench.rs"
+
+[[bin]]
+name = "journal-microbench"
+path = "src/bin/journal-microbench.rs"
