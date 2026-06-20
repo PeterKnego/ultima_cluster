@@ -99,7 +99,7 @@ Using superpowers (brainstorming, writing-plans, executing-plans) during feature
 
 ## Pointers to dependent crates
 
-- `../ultima_journal/` — segmented append journal + StableValue. See `../ultima_db/docs/tasks/task26_journal.md`.
+- `ultima_journal/` — segmented append journal + StableValue. In-tree workspace member (moved in from `ultima_db`; full history preserved). Design notes: `../ultima_db/docs/tasks/task26_journal.md`.
 - `../ultima_db/` — MVCC copy-on-write B-tree store with snapshot_stream wire format. See `../ultima_db/CLAUDE.md` and `../ultima_db/docs/tasks/task27_snapshot_stream.md`.
 - `openraft` — Raft consensus library; storage trait spec at https://deepwiki.com/databendlabs/openraft/2.3-implementing-storage-traits ; network trait spec at https://deepwiki.com/databendlabs/openraft/2.4-implementing-the-network-layer .
 - `quinn` — QUIC implementation in Rust.
