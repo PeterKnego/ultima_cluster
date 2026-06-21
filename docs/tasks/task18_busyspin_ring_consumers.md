@@ -3,7 +3,8 @@
 **Date:** 2026-06-21.
 **Status:** Two prototypes built, reviewed, env-gated default-off. NOT merged to main (kept on
 branch `prototype/o1-busyspin-apply-consumer`, 13 commits). Local microbenches confirm the
-mechanism + regime; the headline throughput-ceiling payoff is fleet-only and unmeasured.
+mechanism + regime; the headline throughput-ceiling payoff was measured on an AWS NVMe fleet
+(2026-06-21) and is **NULL end-to-end** (§4a) — keep default-off.
 **Branch:** `prototype/o1-busyspin-apply-consumer`.
 
 **Provenance / scaffolding.** Originates from opportunity **O1** in the Aeron-vs-UC threading/copying
@@ -134,6 +135,48 @@ saturated load. The ~10k/s throughput-ceiling payoff is **fleet-only and unmeasu
 
 ---
 
+## 4a. Fleet A/B result — NULL end-to-end (AWS, measured 2026-06-21)
+
+The "fleet-only and unmeasured" payoff above was **measured** on AWS and is **null at the e2e cluster
+level**. Setup: 3× `c6id.4xlarge` (16 vCPU, local **NVMe** instance store mounted at the journal
+`--data-dir`), single-AZ cluster placement group, us-east-1, QUIC, `durability=consistent`,
+`UC_API_BATCH_LINGER_MS=0` (linger=0 chosen deliberately — §1: at linger=5 the effect is <1%, so
+linger=0 is the only setting that could expose busy-spin). **A arm** = defaults (busy-spin off);
+**B arm** = `UC_APPLY_SPIN_BUDGET=busy` + `UC_NODE_BRIDGE_SPIN_BUDGET=busy`. Built from this branch via
+`bench-infra` rsync mode; env vars threaded through the `run` role (`bench-infra/ansible/roles/run/tasks/main.yml`
++ `group_vars/all.yml`). Driver: `commit-path-load`, payload 64 B, inflight 128.
+
+**Result.** Across the sustainable ladder both arms are **indistinguishable**, and run-to-run variance
+**dwarfs** any A/B delta:
+- **≤10 k/s** (cluster not saturated): both arms achieve target, p50 sub-ms to single-digit-ms; A≈B.
+- **~12 k/s** (onset of congestion collapse): both hit ~12 k achieved, but p50 for the *same* arm-A
+  config swung **1.31 ms ↔ 69.5 ms** between two reps — pure noise, no arm ordering.
+- **~14 k/s** (collapse): achieved bounces 10.4 k–14 k with **no consistent arm preference** (B faster
+  one rep, A faster the next); p50 in the 100 ms–1 s range.
+- A first coarse run's apparent "+5.8 % ceiling" for B (17.7 k vs 18.7 k achieved @ 20 k target) fell
+  **inside** the ±13 % same-config run-to-run band (a repeat of arm A alone gave 15.6 k vs 17.7 k @ 20 k)
+  — i.e. not a real effect. Pushing the ladder to 24 k–28 k drove congestion collapse that crashed the
+  load driver, confirming the real sustainable ceiling is ~12 k/s, set by the commit floor, not by
+  intra-host consumer wakeups.
+
+**Why null (expected).** The e2e per-commit floor is **~0.85–1.4 ms** (Raft replication RTT to a
+majority + NVMe journal fsync + openraft async scheduling). Busy-spin removes the intra-host ring
+wakeups — ~32 µs on the apply consumer (full win) + a *partial* win on the node bridges (the
+parker→async `Notify`→tokio reschedule residual remains, §4) — call it **~40 µs/commit**, which is
+**~3–5 % of a millisecond-scale commit** and invisible under the noise. This **reinforces the same
+pattern** as task17 Phase B (cross-host busy-poll → null: "network was never the bottleneck") and the
+journal prealloc/fdatasync A/Bs (null e2e): the cluster commit path masks µs-scale intra-host/transport
+micro-optimizations under linger + replication + fsync. **Bottom line: keep busy-spin env-gated and
+default-off; it is not worth enabling for cluster throughput/latency.** A real win would require
+attacking the millisecond floor itself (the residual-`Notify` removal / node+service co-location in §6,
+plus replication RTT) — not the intra-host wakeups in isolation.
+
+Reproduce: `cd bench-infra && make up-uc`, then per arm
+`cd ansible && ansible-playbook bench.yml -e aeron_enabled=false -e uc_api_batch_linger_ms=0 [-e uc_apply_spin_budget=busy -e uc_node_bridge_spin_budget=busy]`;
+results land in `bench-out/dist/<ts>/node0/uc_sweep.csv`. `make destroy` when done.
+
+---
+
 ## 5. Configuration & rollback
 
 | env var | component | unset (default) | `busy`/`max` | `<N>` |
@@ -153,8 +196,9 @@ Both default-off; rollback = unset the env var. snapshot_resp always uses `0` re
 - **O3 — adaptive spin→park** (`BackoffIdleStrategy`-style): the finite-`N` path already exists in both
   components as scaffolding; the remaining work is choosing N adaptively under load so cores aren't
   burned at idle.
-- **Fleet run** against the ~10k/s throughput ceiling — the actual O1 payoff, not measurable in the
-  sandbox; needs the NVMe/cross-host fleet (`c6id`).
+- **Fleet run** against the ~10k/s throughput ceiling — **DONE 2026-06-21, result NULL** (see §4a):
+  no measurable e2e throughput/latency win on a 3× `c6id` NVMe fleet at linger=0; the ~40 µs/commit
+  intra-host saving is dwarfed by the ~1 ms Raft-commit floor. Keep default-off.
 - **Architectural (residual-`Notify` removal)** on the node side — poll the ring in the async consumer
   or co-locate node+service so the node-side hop loses its second wakeup too. Rewrite-class; weigh only
   if a sub-ms latency floor becomes a product goal (and recall Raft replication RTT is the wall after
