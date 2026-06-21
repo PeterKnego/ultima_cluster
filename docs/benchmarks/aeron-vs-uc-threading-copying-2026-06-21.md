@@ -186,7 +186,70 @@ matches this `now − intended_send` model, so the §1 percentiles are apples-to
 
 ## 5 Microbenchmark results
 
-_TBD — Tasks 5–7._
+Run in **this sandbox** (4 vCPU, virtualized — absolute numbers are inflated vs a
+dedicated host; ratios and orders-of-magnitude are the signal). Both are dependency-free
+`std` examples in `uc_protocol/examples/` (criterion/`atomic-wait` are not vendored and the
+sandbox is offline). `release` build, 100k / 5M iterations.
+
+### 5.1 Threading — futex park/wake vs busy-spin  *(sandbox-validated)*
+
+`cargo run -p uc_protocol --release --example handoff_wakeup_bench` — ping-pong round trip,
+futex arm uses the same `FUTEX_WAIT`/`FUTEX_WAKE` syscall as `uc_protocol/src/ring/futex.rs`.
+
+| arm | ns / round-trip | ns / wakeup |
+|---|---|---|
+| busy-spin | **132** | **66** |
+| futex park/wake | **23,516** | **11,758** |
+
+**A futex wakeup costs ~11.7 µs here; a busy-spin handoff costs ~66 ns — a ~175× gap.**
+Implication for each removable hop that currently parks: removing the park (busy-spin or
+poll the ring) saves **≈ the futex cost per wakeup**. The inherent cross-process hops
+(#1/#5/#7/#10) each pay this when the consumer has parked; the spin-then-park (`SPIN_TRIES=64`,
+§2 hop #6) already dodges it *when the producer is hot*, but pays full price when the consumer
+has gone to sleep — exactly the shallow-pipeline / low-rate regime where UC's p50 is measured.
+Tradeoff: busy-spin burns a core (Aeron's low-latency profile burns 3) — only viable on a
+bounded number of dedicated hot hops, **intra-host** (distinct from the settled-negative
+cross-host busy-poll: this targets a local ring consumer, not the wire).
+
+### 5.2 Copying — memcpy vs refcount-clone  *(sandbox-validated)*
+
+`cargo run -p uc_protocol --release --example payload_copy_bench` — `copy_from_slice` vs
+`Arc<[u8]>::clone` (same mechanism as `Bytes::clone`) at the §2 census payload sizes.
+
+| size (B) | memcpy ns | Arc-clone ns |
+|---|---|---|
+| 64 | ~6 | ~5 |
+| 256 | ~4 | ~4 |
+| 4096 | **~40** | **~4** |
+
+**A copy at KV payload sizes is single-digit-to-~40 ns; a refcount clone is flat ~4 ns.**
+Both are **~300–2000× smaller than one futex wakeup (~11,700 ns).** So the removable copies
+**C-1** (journal double-copy) and **C-2** (client `copy_from_slice`) save only **nanoseconds**
+at typical payloads — **low priority.** Copying only becomes commit-relevant for **large frames**
+(the 4 MiB / 16 MiB ring max): a 4 MiB memcpy ≈ tens of µs, then comparable to a wakeup.
+
+### 5.3 Reconciliation with the documented storage handoff  *(sandbox-validated + cites prior)*
+
+The handoff-tax doc (`docs/wal-journal-handoff-tax-2026-06-21.md`) independently measured the
+*storage* cross-thread handoff at **~32 µs (store WAL, tmpfs)** and **~22 µs (journal, over the
+raw-write floor)** — each is **two scheduler wakeups per commit** (enqueue→writer, writer→signal).
+Dividing by two gives **~11–16 µs/wakeup**, which **matches this session's measured ~11.7 µs/wakeup**.
+The two-wakeup model is therefore confirmed from both directions (a generic futex ping-pong here,
+and the end-to-end WAL/journal handoff there). This *is* the journal `Notifier`/`SeqWatermark`
+hops J1/J2 (T-7/T-8) in §2.
+
+### 5.4 What still needs the fleet  *(needs-fleet-confirmation)*
+
+- **Absolute wakeup cost on the real c6id host** — sandbox numbers are inflated; the headline
+  attribution needs a dedicated-host re-run.
+- **Depth-1 p99 (5.2 ms tail)** and **end-to-end cluster-commit attribution** (how many of the
+  ~800 µs–8 ms a real commit spends parked vs replicating vs fsync).
+- **`perf sched` / off-CPU profile** to confirm wakeups are the scheduler cost (sandbox
+  `perf_event_paranoid=4`, no `perf`).
+- **Deferred (not skipped):** re-running ultima_db's `singlewriter_persistence_bench` to
+  re-confirm the ~32 µs / ~3 µs handoff live. Skipped this pass because (a) §5.3 already
+  triangulates it, and (b) `../ultima_db` is a shared checkout that may have a concurrent
+  session — avoided to not disturb it. Re-run on the fleet host alongside the items above.
 
 ---
 
