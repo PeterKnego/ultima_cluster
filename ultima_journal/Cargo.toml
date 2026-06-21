@@ -20,5 +20,8 @@ stable_value = ["dep:serde", "dep:bincode"]
 # barrier in isolation. Not part of the supported API.
 bench-support = []
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = "3"

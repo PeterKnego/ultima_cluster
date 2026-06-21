@@ -2621,6 +2621,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "crc32fast",
+ "rustix",
  "serde",
  "tempfile",
  "thiserror",

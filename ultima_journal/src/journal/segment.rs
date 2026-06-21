@@ -446,7 +446,7 @@ impl SegmentFile {
                 fill_zero_write_paced(&self.file, span, chunk_bytes)?
             }
             crate::PreallocFill::FallocateZeroRange => {
-                fill_fallocate_zero_range(&self.file, span, chunk_bytes)?
+                fallocate_zero_range_at(&self.file, self.size, total_len - self.size, chunk_bytes)?
             }
         }
         Ok(())
@@ -722,13 +722,43 @@ fn fill_zero_write_paced(
     Ok(())
 }
 
-/// Placeholder until Task 3: behaves as paced so the dispatcher compiles.
+/// `fallocate(ZERO_RANGE)` over `[0, total_len)` + one `sync_data`. Linux only;
+/// on non-Linux or `OPNOTSUPP`/`NOSYS` falls back to the paced zero-write.
 fn fill_fallocate_zero_range(
     file: &std::fs::File,
     total_len: u64,
     chunk_bytes: u64,
 ) -> Result<(), JournalError> {
-    fill_zero_write_paced(file, total_len, chunk_bytes)
+    fallocate_zero_range_at(file, 0, total_len, chunk_bytes)
+}
+
+/// Offset-aware ZERO_RANGE fill of `[offset, offset+len)`, used by both
+/// `create_prealloc_temp` (offset 0) and `preallocate_to` (offset = cursor).
+fn fallocate_zero_range_at(
+    file: &std::fs::File,
+    offset: u64,
+    len: u64,
+    chunk_bytes: u64,
+) -> Result<(), JournalError> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{fallocate, FallocateFlags};
+        use rustix::io::Errno;
+        match fallocate(file, FallocateFlags::ZERO_RANGE, offset, len) {
+            Ok(()) => {
+                file.sync_data()?;
+                return Ok(());
+            }
+            // Filesystem/kernel without ZERO_RANGE: fall back to paced.
+            Err(Errno::OPNOTSUPP) | Err(Errno::NOSYS) => {}
+            Err(e) => return Err(JournalError::Io(std::io::Error::from(e))),
+        }
+    }
+    // Fallback (non-Linux, or unsupported): paced zero-write of [offset, offset+len).
+    // The caller has already seeked to `offset` for the preallocate_to path; for
+    // create_prealloc_temp offset is 0 and the fresh file is already at 0.
+    let _ = offset;
+    fill_zero_write_paced(file, len, chunk_bytes)
 }
 
 fn now_nanos() -> u64 {
@@ -1167,6 +1197,22 @@ mod tests {
         assert_eq!(meta.len(), total, "file must be exactly total_len");
         let bytes = std::fs::read(&p).unwrap();
         assert!(bytes.iter().all(|&b| b == 0), "every byte must be zero");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fallocate_zero_range_produces_full_size_all_zero_file() {
+        use crate::PreallocFill;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("seg-prealloc.1.tmp");
+        let total: u64 = 2 * 1024 * 1024 + 13;
+        // On a filesystem without ZERO_RANGE support this falls back to paced;
+        // either way the postcondition (full-size, all zeros) must hold.
+        SegmentFile::create_prealloc_temp(&p, total, PreallocFill::FallocateZeroRange, 4 * 1024 * 1024).unwrap();
+        let meta = std::fs::metadata(&p).unwrap();
+        assert_eq!(meta.len(), total);
+        let bytes = std::fs::read(&p).unwrap();
+        assert!(bytes.iter().all(|&b| b == 0));
     }
 
     #[test]
