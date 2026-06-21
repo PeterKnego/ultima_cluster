@@ -1,0 +1,161 @@
+# Task 18 — Busy-spin intra-host ring consumers (O1 prototypes)
+
+**Date:** 2026-06-21.
+**Status:** Two prototypes built, reviewed, env-gated default-off. NOT merged to main (kept on
+branch `prototype/o1-busyspin-apply-consumer`, 13 commits). Local microbenches confirm the
+mechanism + regime; the headline throughput-ceiling payoff is fleet-only and unmeasured.
+**Branch:** `prototype/o1-busyspin-apply-consumer`.
+
+**Provenance / scaffolding.** Originates from opportunity **O1** in the Aeron-vs-UC threading/copying
+investigation (`docs/benchmarks/aeron-vs-uc-threading-copying-2026-06-21.md`). Design/plan artifacts
+are retained under `docs/superpowers/`:
+`specs/2026-06-21-o1-busyspin-apply-consumer-design.md` + `plans/2026-06-21-o1-busyspin-apply-consumer.md`
+(apply consumer), and `specs/2026-06-21-o1-node-bridge-busyspin-design.md` +
+`plans/2026-06-21-o1-node-bridge-busyspin.md` (node bridges). This doc is the canonical record and
+stands on its own.
+
+---
+
+## 1. Motivation
+
+The Aeron-vs-UC investigation (Task-adjacent, see the benchmark doc above) established that UC's gap
+to Aeron on the commit hot path is a **threading/wakeup** story, not a copying one: a futex park/wake
+costs **~8.8 µs** vs **~29 ns** for a busy-spin (~300×), while a payload copy is single-digit-to-~40 ns
+(~200–2000× smaller than one wakeup). Aeron Cluster runs consensus + service as **polling agents in one
+process** (0 intra-host parks); UC splits node/service into separate processes bridged by **futex rings**
+and routes consensus through openraft's async model, so each intra-host stage transition pays a futex
+park + reschedule.
+
+**O1** = busy-spin the **intra-host ring consumers UC owns**, the intra-host analog of Aeron's polling
+consumers. This is explicitly distinct from the settled-negative **cross-host** busy-poll (task17
+Phase B: "network was never the bottleneck — fsync/IPC dwarf RTT"). The honest target is the **~10k/s
+throughput ceiling** and the per-commit pipeline cost beneath the 5 ms `api_batch_linger` — NOT the
+linger-bound headline p50 (at linger=5ms, eliminating every intra-host wakeup moves p50 <1%).
+
+Two prototypes were built, covering the intra-host consumers on the commit path:
+1. the **service apply consumer** (the single hottest hop, #5/#6);
+2. the **node-side `submit` + `apply_resp` bridges** (T-1 ingress, T-4 response).
+
+---
+
+## 2. Shared mechanism — a configurable spin budget
+
+Both prototypes share one idea: **make the spin-before-park window configurable**, with a sentinel
+`u32::MAX` for pure busy-spin (never enter `FUTEX_WAIT`). Both are **env-gated, default-off, and
+byte-for-byte unchanged when the env var is unset.** Busy-spin trades a burned core for removed wakeup
+latency — viable only on a bounded number of hot hops (Aeron's low-latency profile burns 3 dedicated
+cores).
+
+### 2.1 Service apply consumer (`uc_protocol` + `uc_service`)
+
+The apply consumer is a **sync `std::thread`** calling `SpscConsumer::read_or_park` — already
+spin-then-park (`SPIN_TRIES = 64`, then `FUTEX_WAIT` up to `PARK_CEIL = 2 ms`).
+
+- `uc_protocol/src/ring/spsc.rs`: `SpscConsumer` gains a private `spin_budget: u32` (default
+  `SPIN_TRIES`) + `set_spin_budget(&mut self, u32)`. `read_or_park` uses it; on the `u32::MAX`
+  sentinel it polls in `BUSY_SPIN_CHUNK = 256`-sized bursts and returns `Ok(None)` between bursts
+  (never parks) so the caller re-checks its stop flag — keeping shutdown prompt with no `FUTEX_WAIT`.
+  `uc_protocol` stays env-free (wire layer); it only exposes the knob.
+- `uc_service/src/runtime/apply_loop.rs`: reads `UC_APPLY_SPIN_BUDGET` via a pure
+  `parse_spin_budget(Option<&str>) -> u32` (unset → `SPIN_TRIES`; `busy`/`max` case-insensitive →
+  `u32::MAX`; `<N>` → N; unparseable → `SPIN_TRIES`) and calls `set_spin_budget` once before the loop.
+
+### 2.2 Node-side bridges (`uc_node`)
+
+The node consumers are **async tasks** woken via a tokio `Notify`: a dedicated `NotifyBridge` parker
+OS-thread `FUTEX_WAIT`s on the ring and fires `Notify`; the async consumer does `try_read`; on `None`
+it `bridge.notified().await`.
+
+- `uc_node/src/ipc/ring_bridge.rs`: `NotifyBridge::spawn(handle, name, spin_budget: u32)`. Parker loop:
+  `0` → park immediately (today's behavior); `u32::MAX` → busy-spin on `current_seq`, fire `Notify`
+  **only on a real change** (a notify-per-spin would churn the async consumer), checking the stop flag
+  each spin; finite `N` → spin N then park. **Busy mode must NOT `arm()` the ring** (see §3).
+  `parse_bridge_spin_budget`/`bridge_spin_budget` read `UC_NODE_BRIDGE_SPIN_BUDGET` (unset → `0`;
+  `busy`/`max` → `u32::MAX`; `<N>` → N; unparseable → `0`).
+- Call sites: `client_dispatcher.rs` (submit) and `state_machine_shmem.rs` (apply_resp) pass the env
+  budget; **snapshot_resp** passes `0` (not on the steady-state hot path).
+
+**Why the two defaults differ** (`UC_APPLY_SPIN_BUDGET` defaults to 64, `UC_NODE_BRIDGE_SPIN_BUDGET`
+to 0): each value reproduces *today's* behavior for that component — the apply consumer already
+spin-then-parks (64), the bridge parker has no spin phase today (0). Approach B (eliminate the parker,
+poll in the async task) was rejected: on a `current_thread` runtime it starves all other tasks,
+including the commit tasks the submit loop spawns — flavor-dependent and architectural-tier.
+
+---
+
+## 3. Correctness
+
+- **Default path byte-for-byte unchanged.** Apply: field defaults to `SPIN_TRIES`, the finite/park
+  branch is the original arm→recheck→futex-park→disarm. Bridge: budget `0` → zero-iteration spin →
+  the original arm/park/disarm/notify. Env unset → defaults. All existing tests pass without the env.
+- **Busy-mode shutdown stays prompt.** Apply: `read_or_park` returns `Ok(None)` every `BUSY_SPIN_CHUNK`
+  so the loop re-checks `stop`. Bridge: the busy parker checks `stop` each spin. Neither waits on a
+  wakeup that never comes.
+- **No lost wakeup (bridge busy mode).** The parker tracks `last` vs `current_seq` (= the producer's
+  `publish_position`, which the consumer never mutates); the consumer drains to empty before each
+  `notified().await`, and tokio `Notify` stores one permit. Any publish the consumer misses before
+  awaiting still differs from `last` when the parker next reads it → a notify follows.
+- **The bug the final review caught (fixed `a7d76be`).** The first node-bridge implementation had the
+  busy parker call `handle.arm()` at startup and only `disarm()` at shutdown. `arm()` leaves the ring's
+  `waiters > 0`, and the SPSC producer's `signal()` only *skips* its `FUTEX_WAKE` syscall when
+  `waiters == 0` — so a busy bridge made the **producer fire a useless `FUTEX_WAKE` on every publish**,
+  relocating the futex cost to the producer hot path and partly defeating the optimization. Fix: gate
+  `arm()`/`disarm()` on `spin_budget != u32::MAX` (busy mode leaves the ring un-armed — it never parks,
+  so it needs no waiter registration). The apply half never had this (its busy branch returns before
+  `arm()`).
+
+---
+
+## 4. Measured results (sandbox, 4 vCPU — ratios are the signal, absolutes are inflated)
+
+All from dependency-free benches (criterion/`atomic-wait` are not vendored; the sandbox is offline).
+
+**Per-wakeup mechanism** (`uc_protocol/examples/handoff_wakeup_bench.rs`, min-of-5): futex park/wake
+**~8.8 µs/wakeup** vs busy-spin **~29 ns** (~300×). Reconciles with the storage handoff doc's ~22–32 µs
+two-wakeup-per-commit handoff.
+
+**Apply consumer** (`uc_protocol/examples/apply_spin_consume_bench.rs`, real `SpscRing`, two regimes):
+- **saturated** (hot producer): park ≈ busy, **delta near-zero and sign-varying** — busy-spin can
+  *regress* when hot, because `SPIN_TRIES=64` already dodges the futex and busy mode's 256-spin chunk
+  costs more than park's short spin.
+- **spaced** (~200 µs gap → consumer parks): **park ~33 µs/rt vs busy ~0.8 µs/rt (~32 µs win)** — busy
+  skips the futex wakeup + the reschedule of a fully-descheduled sync thread.
+
+**Node bridge** (`uc_node/src/ipc/ring_bridge.rs` `measure_publish_to_notified_park_vs_busy`, a
+print-based `#[tokio::test]`): publish→notified **park ~19.5 µs vs busy ~5.7 µs (~3.4×)**. The node-side
+win is **partial**: busy removes the ~14 µs ring futex park, but busy still pays ~5.7 µs because the
+parker→async **`Notify`→tokio-reschedule wakeup remains** (unlike the apply consumer's sync thread,
+~0.8 µs). Removing that residual needs the architectural follow-up (poll in the async task / co-locate
+node+service).
+
+**Takeaway:** busy-spin is a **low-rate-latency / throughput-ceiling** lever, NOT a free win — it helps
+only when consumers actually park (the shallow-pipeline / low-rate regime), and can regress under
+saturated load. The ~10k/s throughput-ceiling payoff is **fleet-only and unmeasured** here.
+
+---
+
+## 5. Configuration & rollback
+
+| env var | component | unset (default) | `busy`/`max` | `<N>` |
+|---|---|---|---|---|
+| `UC_APPLY_SPIN_BUDGET` | service apply consumer | `SPIN_TRIES` (64, spin-then-park) | `u32::MAX` (pure busy-spin) | spin N then park |
+| `UC_NODE_BRIDGE_SPIN_BUDGET` | submit + apply_resp bridges | `0` (park immediately) | `u32::MAX` (busy parker) | spin N then park |
+
+Both default-off; rollback = unset the env var. snapshot_resp always uses `0` regardless.
+
+---
+
+## 6. Status & follow-ups
+
+- **Done + reviewed (final review READY TO MERGE after the `a7d76be` fix):** both prototypes, env-gated,
+  default-off; `cargo clippy --workspace -- -D warnings` clean; `uc_protocol` 70 + `uc_service` 15 +
+  `uc_node` ring_bridge 4 tests green.
+- **O3 — adaptive spin→park** (`BackoffIdleStrategy`-style): the finite-`N` path already exists in both
+  components as scaffolding; the remaining work is choosing N adaptively under load so cores aren't
+  burned at idle.
+- **Fleet run** against the ~10k/s throughput ceiling — the actual O1 payoff, not measurable in the
+  sandbox; needs the NVMe/cross-host fleet (`c6id`).
+- **Architectural (residual-`Notify` removal)** on the node side — poll the ring in the async consumer
+  or co-locate node+service so the node-side hop loses its second wakeup too. Rewrite-class; weigh only
+  if a sub-ms latency floor becomes a product goal (and recall Raft replication RTT is the wall after
+  that).
