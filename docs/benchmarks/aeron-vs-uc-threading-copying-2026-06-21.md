@@ -58,19 +58,129 @@ latency + throughput-ceiling** story, to be confirmed by the census in §2.
 
 ## 2 UC commit-path census (hops + copies)
 
-_TBD — Task 2._
+One client write, leader steady-state. Citations spot-verified against the code (the journal
+double-copy, the client `copy_from_slice`, the ring memcpy in/out, the spin-then-park).
+
+### Hops (scheduler/wakeup boundaries)
+
+| # | from-thread → to-thread | process boundary? | wakeup mechanism | class | file:line |
+|---|---|---|---|---|---|
+| 1 | uc_client task → uc_node client_dispatcher | **yes** | inter-proc **futex** (waiters-guarded) | inherent | `uc_protocol/src/ring/mpsc.rs:205`, `ring/futex.rs:22-44` |
+| 2 | NotifyBridge parker thread → client_dispatcher task | no | futex-wait → tokio `Notify` | **removable T-1** | `uc_node/src/ipc/ring_bridge.rs:48-50`; `client_dispatcher.rs:144` |
+| 3 | client_dispatcher → openraft RaftCore | no | tokio channel | **removable T-2** (openraft-internal) | `client_dispatcher.rs:107` |
+| 4 | RaftCore → openraft SM worker | no | tokio channel | **removable T-3** (openraft-internal) | `raft/state_machine_shmem.rs:512-530` |
+| 5 | node apply() → uc_service apply thread | **yes** | inter-proc **futex** | inherent | `uc_protocol/src/ring/spsc.rs:196`, `ring/futex.rs:35-44` |
+| 6 | apply.ring publish → service consumer | (service side of #5) | **spin 64× then futex park** | inherent | `ring/spsc.rs:217-233`; `ring/common.rs:67` (`SPIN_TRIES`) |
+| 7 | uc_service apply thread → node await_apply_resp | **yes** | inter-proc futex + Notify bridge | inherent | `uc_service/src/runtime/apply_loop.rs:124-138`; `state_machine_shmem.rs:949` |
+| 8 | NotifyBridge parker → node SM worker | no | tokio `Notify` | **removable T-4** | `ring_bridge.rs:48-50`; `state_machine_shmem.rs:949` |
+| 9 | node SM worker → client_dispatcher (responder) | no | tokio channel | **removable T-5** (openraft-internal) | `state_machine_shmem.rs:650-653` |
+| 10 | client_dispatcher → uc_client broadcast_reader | **yes** | inter-proc futex (`all=true`) + Notify | inherent | `client_dispatcher.rs:321-335`; `ring/broadcast.rs:123` |
+| 11 | broadcast_reader → caller's `submit().await` | no | tokio oneshot | **removable T-6** | `uc_client/src/rings.rs:115-116`; `client.rs:252` |
+| J1 | openraft append → journal writer thread | no | `std::sync::mpsc` send | **removable T-7** | `ultima_journal/src/journal/mod.rs:334`; `writer.rs:330` |
+| J2 | journal writer → append caller | no | **Condvar** notify (or inline cb) | **removable T-8** | `writer.rs:423`; `notifier.rs:115-128`; `mod.rs:441-448` |
+
+**Total: 13 wakeup boundaries.** **4 are inherent** (cross-process IPC: #1, #5/#6, #7, #10);
+**8 are removable** intra-process hops (T-1…T-8). Of the removable ones, **T-2/T-3/T-5 are
+inside openraft** (would require forking it); **T-1/T-4/T-6** are UC's own bridge/oneshot hops;
+**T-7/T-8** are the journal handoff already covered by `docs/wal-journal-handoff-tax-2026-06-21.md`.
+
+### Copies (payload)
+
+17 copy events; 13 necessary, 2 already zero-copy refcount handoffs, **2 removable**.
+
+| key removable / handoff | what | file:line |
+|---|---|---|
+| **C-1** | journal serializes once, then **copies the bytes twice** — `payload.to_vec()` → `payload_vec.clone()` into `AppendRequest` **and** `pending.insert(…, payload_vec)`. An `Arc<[u8]>`/`Arc<Vec<u8>>` would drop one. | `ultima_journal/src/journal/mod.rs:324-351` |
+| **C-2** | client `Bytes::copy_from_slice(&buf)` on the response read — could `Bytes::from(std::mem::take(&mut buf))` to avoid the extra heap copy. | `uc_client/src/rings.rs:114` |
+| C4, C13 (already zero-copy) | `Bytes::from(Vec)` ownership transfer at the submit-read and apply-resp-read — no copy. | `client_dispatcher.rs:97`; `state_machine_shmem.rs:939` |
+
+**The 4 unavoidable ring memcpys** (C2/C3 submit, C8/C9 apply) plus the bincode
+encode/decode at each format boundary (C1/C5/C10/C11) are the bulk. Each ring hop is a copy
+*into* the fixed shmem slot and a copy *out* — inherent to a fixed-region SPSC/MPSC ring.
+
+**Verdict on the CLAUDE.md `AppCommand = bytes::Bytes` "no intermediate copy" claim:**
+**partially true, overstated.** `Bytes` does eliminate intra-process heap copies (C4/C13 are
+genuine refcount handoffs), but **every ring boundary is a forced memcpy** (the slot is a fixed
+shmem region) — so the payload is copied ≥4× through the rings regardless of `Bytes`, plus the
+serialize/deserialize passes.
+
+**Payload-size context (for the copy microbench):** hot-path `payload_buf` preallocates **4096 B**
+(`client_dispatcher.rs:64`); frame header is **20 B** (`ring/common.rs:276`); ring caps are
+16 MiB (client) / 64 MiB (apply) with 4/16 MiB max frame — i.e. typical KV payloads are tens–hundreds
+of bytes, large frames are outliers. Microbench sizes: **64 / 256 / 4096 B**.
 
 ---
 
 ## 3 Aeron core pattern catalog
 
-_TBD — Task 3._
+**Note:** the threading/buffer primitives (`Agent`, `AgentRunner`, `IdleStrategy`,
+`*RingBuffer`, `BroadcastTransmitter`, `UnsafeBuffer`) live in **agrona** (external jar, no
+source in-tree); citations below are aeron's *call sites* into that API.
+
+| pattern | what it does | wakeups/msg | copies/msg | file:line |
+|---|---|---|---|---|
+| **Agent duty-cycle** | each role (Conductor/Sender/Receiver) is a dedicated thread looping `doWork()`; never parks for work — polls | **0** | 0 | `aeron-driver/.../MediaDriver.java:279-283`; `DriverConductor.java:118`; `Sender.java:60`; `Receiver.java:41` |
+| **BackoffIdleStrategy** (default) | on no-work: spin 10× → yield 20× → park 1µs↑1ms | 0 hot; 1 park only when fully idle | 0 | `Configuration.java:482,487-504` |
+| **BusySpinIdleStrategy** (low-lat) | on no-work: `onSpinWait()` only, never parks (burns a core) | **0 always** | 0 | `aeron-samples/.../LowLatencyMediaDriver.java:46-47` |
+| **ManyToOneRingBuffer** (client→driver) | MPSC; consumer (Conductor) **polls** every duty cycle | **0** | 0 (read in place) | `Aeron.java:1237`; `DriverProxy.java:83`; `ClientCommandAdapter.java:101` |
+| **BroadcastTransmitter / CopyBroadcastReceiver** (driver→client) | one-to-many; client **polls** | **0** | 1 (CopyReceiver scratch copy vs fast transmitter) | `ClientProxy.java:218`; `Aeron.java:1243-1245`; `DriverEventsAdapter.java:70-71` |
+| **Publication.offer** | claim term-buffer space (atomic `getAndAddLong`), then `putBytes` payload in | 0 (non-blocking) | **1** | `ConcurrentPublication.java:359,372,380` |
+| **Publication.tryClaim + BufferClaim** | reserve a log range, hand the producer a **pointer into the log buffer**; write in place; `commit()`=`putIntRelease` | 0 | **0** | `Publication.java:557`; `ConcurrentPublication.java:311,713-736`; `logbuffer/BufferClaim.java:56-58,185-193` |
+| **Image.poll / FragmentHandler** | consumer reads its position counter, volatile-loads frame length, calls handler with a **raw pointer into the mmap term buffer** | **0** | **0** | `Image.java:340,358-374`; `logbuffer/FrameDescriptor.java:297-306` |
+| **Flyweight over DirectBuffer** | headers/messages read/written in place by byte-offset; no deserialize copy | 0 | **0** | `protocol/HeaderFlyweight.java:40`; `command/CorrelatedMessageFlyweight.java:37,65-71` |
+| **mmap'd log term buffers** | log file `mmap`'d + wrapped by `UnsafeBuffer`; producer & consumer share the same physical pages → true OS-level zero-copy IPC | 0 | **0** | `LogBuffers.java:48,74,84-103,165-171` |
+
+**Philosophy (single-process publish→poll, tryClaim path): 0 thread wakeups, 0 payload copies.**
+The *entire* producer↔consumer coordination is one `putIntRelease` (publish) + one `getIntVolatile`
+(poll) on the frame-length word. No queue, no condvar, no futex, no lock handoff between stages.
+With `offer` instead of `tryClaim` it's 1 copy; the read side is always 0. Default Agents back off
+to a park when fully idle; the low-latency profile busy-spins on dedicated cores (3 cores burned).
 
 ---
 
 ## 4 Aeron Cluster commit-path census
 
-_TBD — Task 4._
+One cluster commit, leader. Same schema as §2 so it sits side-by-side.
+
+| # | from → to | separate thread? | wait mechanism | file:line |
+|---|---|---|---|---|
+| 1 | client → ConsensusModuleAgent (ingress) | yes (proc) | UDP→driver→IPC term buffer; CM **polls** `controlledPoll()` | `IngressAdapter.java:223-231`; `ConsensusModuleAgent.java:2427` |
+| 2 | CM → log publication / Archive | yes (driver) | `offer`/`tryClaim` to log term buffer; Archive **polls** RecordingPos | `LogPublisher.java:132`; `ConsensusModuleAgent.java:1627` |
+| 3 | leader → followers (replicate) | yes (**network**) | MDC UDP | `LogPublisher.java:111`; `ConsensusModuleAgent.java:1633-1637` |
+| 4 | follower → leader (appendPosition ACK) | yes (**network**) | follower polls counter, sends via consensus channel; leader **polls** `ConsensusAdapter` | `ConsensusModuleAgent.java:2686-2704`; `ConsensusAdapter.java:69-77` |
+| 5 | CM `commitPosition` counter → ClusteredServiceAgent | yes (thread) | leader `setRelease()` atomic store; service **spins** on `commitPosition.get()` each duty cycle | `ConsensusModuleAgent.java:2863`; `ClusteredServiceAgent.java:262` |
+| 6 | ServiceAgent → user `onSessionMessage()` | **no** (same stack) | in-thread call | `BoundedLogAdapter.java:130-163`; `ClusteredServiceAgent.java:482-496` |
+| 7 | service response → client (egress) | yes (net/IPC) | `offer` to egress publication; client polls | `ClusteredServiceAgent.java:680`; `ContainerClientSession.java:86-89` |
+
+**Copies:** 4 real byte-copies (ingress→log term buffer, log→archive file, network replicate,
+egress→client). **All intra-process buffer reads are zero-copy flyweights** over mapped memory
+(ingress dispatch, the bounded-log→service handoff). The leader→service commit notification is a
+**single atomic counter write** read by the service via a shared `CountersReader` slab — **no
+queue, no futex, no condvar**.
+
+**Side-by-side (per commit):**
+
+| | thread hops | of which park/futex on hot path | payload copies |
+|---|---|---|---|
+| **Aeron Cluster** | 5 agent boundaries (3 poll-based no-wakeup; 2 are network send/recv) | **0** (Agents poll/spin, never park for work) | **4** (all in-process reads are flyweight zero-copy) |
+| **UC** | 13 (4 cross-process futex, 8 intra-proc; J1/J2 journal) | up to several **futex/condvar** wakeups + the spin-then-park | 17 events (4 forced ring memcpys + serialize/deserialize each boundary) |
+
+**Structural difference.** Aeron Cluster keeps the consensus module and the clustered service as
+two **polling Agents in one JVM** sharing `/dev/shm` term buffers and a counter slab — a commit
+crosses zero queues/locks/futexes; the only blocking is the two network hops (intrinsic to Raft).
+UC splits node and service into **separate OS processes** bridged by shmem rings, and routes
+consensus through a **general-purpose Raft library (openraft) built on async tasks** — so each
+intra-host stage transition that Aeron does as a counter-poll, UC does as a futex wake + park
+(≈1–10 µs/round-trip on Linux) or a tokio channel/`Notify` hop. And where Aeron reads log entries
+as flyweights in place, UC serializes to the journal, deserializes for apply, and copies through
+each ring slot. **The threading and copy gap is structural, not a tuning miss** — it follows
+directly from process-separation + a futex/async-channel handoff model vs. a single-process
+poll-everything model.
+
+**LoadTestRig measurement model** (`bench-parity/aeron-cluster-ipc/README.md:16-17`): open-loop
+fixed-rate send, latency = `now − intendedSendTime` (coordinated-omission-safe). UC's harness
+matches this `now − intended_send` model, so the §1 percentiles are apples-to-apples on the
+*measurement*, even though the *workload* (raw RTT vs full batched SMR commit) is not like-for-like.
 
 ---
 
