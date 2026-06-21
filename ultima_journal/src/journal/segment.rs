@@ -225,26 +225,34 @@ impl SegmentFile {
         })
     }
 
-    /// Create a NEW preallocated temp segment file: zero-fill `[0, total_len)`
-    /// with real writes, `sync_all`, and fsync the parent dir so the file
-    /// survives a crash. Writes NO header — `base_seq` is unknown until the
-    /// temp is activated at rotation. See `journal::segment_pipeline`.
-    pub(crate) fn create_prealloc_temp(path: &Path, total_len: u64) -> Result<(), JournalError> {
-        let mut file = OpenOptions::new()
+    /// Create a NEW preallocated temp segment file filled per `fill`. All
+    /// strategies leave the file `total_len` bytes long and readable as zeros.
+    /// Writes NO header — `base_seq` is unknown until activation.
+    pub(crate) fn create_prealloc_temp(
+        path: &Path,
+        total_len: u64,
+        fill: crate::PreallocFill,
+        chunk_bytes: u64,
+    ) -> Result<(), JournalError> {
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(path)?;
-        let zeros = vec![0u8; 1024 * 1024];
-        let mut remaining = total_len;
-        while remaining > 0 {
-            let n = remaining.min(zeros.len() as u64) as usize;
-            file.write_all(&zeros[..n])?;
-            remaining -= n as u64;
-        }
-        file.sync_all()?;
-        if let Some(parent) = path.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
+        match fill {
+            crate::PreallocFill::ZeroWriteFull => {
+                fill_zero_write_full(&file, total_len)?;
+                // Baseline parity: make the temp's dir entry crash-durable.
+                if let Some(parent) = path.parent() {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+            }
+            crate::PreallocFill::ZeroWritePaced => {
+                fill_zero_write_paced(&file, total_len, chunk_bytes)?
+            }
+            crate::PreallocFill::FallocateZeroRange => {
+                fill_fallocate_zero_range(&file, total_len, chunk_bytes)?
+            }
         }
         Ok(())
     }
@@ -418,26 +426,29 @@ impl SegmentFile {
         Ok(self.file.metadata()?.len())
     }
 
-    /// Physically zero-fill from the logical cursor `self.size` out to
-    /// `total_len` and `sync_all` once, WITHOUT advancing the cursor. Forces
-    /// the filesystem to allocate and mark the extents *written* up front (a
-    /// real write, not a sparse `set_len`/`fallocate`, which on ext4 leaves
-    /// unwritten extents that re-journal a metadata commit on first
-    /// overwrite). Appends then overwrite already-written blocks, so the
-    /// per-commit `sync_data` carries no `i_size`/extent-map change.
-    pub(crate) fn preallocate_to(&mut self, total_len: u64) -> Result<(), JournalError> {
+    /// Physically fill from the logical cursor `self.size` out to `total_len`
+    /// per `fill`, WITHOUT advancing the cursor. Leaves the tail readable as
+    /// zeros so appends overwrite already-written blocks (metadata-free commit).
+    pub(crate) fn preallocate_to(
+        &mut self,
+        total_len: u64,
+        fill: crate::PreallocFill,
+        chunk_bytes: u64,
+    ) -> Result<(), JournalError> {
         if total_len <= self.size {
             return Ok(());
         }
-        let zeros = vec![0u8; 1024 * 1024];
         self.file.seek(SeekFrom::Start(self.size))?;
-        let mut remaining = total_len - self.size;
-        while remaining > 0 {
-            let n = remaining.min(zeros.len() as u64) as usize;
-            self.file.write_all(&zeros[..n])?;
-            remaining -= n as u64;
+        let span = total_len - self.size;
+        match fill {
+            crate::PreallocFill::ZeroWriteFull => fill_zero_write_full(&self.file, span)?,
+            crate::PreallocFill::ZeroWritePaced => {
+                fill_zero_write_paced(&self.file, span, chunk_bytes)?
+            }
+            crate::PreallocFill::FallocateZeroRange => {
+                fill_fallocate_zero_range(&self.file, span, chunk_bytes)?
+            }
         }
-        self.file.sync_all()?;
         Ok(())
     }
 
@@ -480,7 +491,7 @@ impl SegmentFile {
         &mut self,
         total_len: u64,
     ) -> Result<(), JournalError> {
-        self.preallocate_to(total_len)
+        self.preallocate_to(total_len, crate::PreallocFill::ZeroWriteFull, 0)
     }
 
     /// Read the entire body (after header) and decode all records.
@@ -665,6 +676,59 @@ impl SegmentFile {
         self.index.retain(|(_, off)| *off < len);
         Ok(())
     }
+}
+
+/// Real zero-write of `[0, total_len)` + one `sync_all` (original strategy).
+fn fill_zero_write_full(file: &std::fs::File, total_len: u64) -> Result<(), JournalError> {
+    let zeros = vec![0u8; 1024 * 1024];
+    let mut f = file;
+    let mut remaining = total_len;
+    while remaining > 0 {
+        let n = remaining.min(zeros.len() as u64) as usize;
+        f.write_all(&zeros[..n])?;
+        remaining -= n as u64;
+    }
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Real zero-write in chunks: `sync_data` every ~`chunk_bytes` with a yield
+/// between, so the device flush never queues as one large barrier ahead of a
+/// foreground commit. No dir sync (temp is recreated on crash).
+fn fill_zero_write_paced(
+    file: &std::fs::File,
+    total_len: u64,
+    chunk_bytes: u64,
+) -> Result<(), JournalError> {
+    let zeros = vec![0u8; 1024 * 1024];
+    let sync_every = chunk_bytes.max(1);
+    let mut f = file;
+    let mut written: u64 = 0;
+    let mut since_sync: u64 = 0;
+    while written < total_len {
+        let n = (total_len - written).min(zeros.len() as u64) as usize;
+        f.write_all(&zeros[..n])?;
+        written += n as u64;
+        since_sync += n as u64;
+        if since_sync >= sync_every {
+            f.sync_data()?;
+            std::thread::yield_now();
+            since_sync = 0;
+        }
+    }
+    if since_sync > 0 {
+        f.sync_data()?;
+    }
+    Ok(())
+}
+
+/// Placeholder until Task 3: behaves as paced so the dispatcher compiles.
+fn fill_fallocate_zero_range(
+    file: &std::fs::File,
+    total_len: u64,
+    chunk_bytes: u64,
+) -> Result<(), JournalError> {
+    fill_zero_write_paced(file, total_len, chunk_bytes)
 }
 
 fn now_nanos() -> u64 {
@@ -1057,11 +1121,12 @@ mod tests {
 
     #[test]
     fn preallocate_to_extends_physical_without_moving_cursor() {
+        use crate::PreallocFill;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seg-test.log");
         let mut seg = SegmentFile::create(&path, 1).unwrap();
         let logical_before = seg.size().unwrap();
-        seg.preallocate_to(1 * 1024 * 1024).unwrap();
+        seg.preallocate_to(1 * 1024 * 1024, PreallocFill::ZeroWriteFull, 0).unwrap();
         assert_eq!(seg.size().unwrap(), logical_before, "logical cursor unchanged");
         assert_eq!(seg.physical_len().unwrap(), 1 * 1024 * 1024, "physical extended");
     }
@@ -1072,7 +1137,7 @@ mod tests {
         let temp = dir.path().join("seg-prealloc.0.tmp");
         let final_path = dir.path().join("seg-00000000000000000007.log");
 
-        SegmentFile::create_prealloc_temp(&temp, 1 * 1024 * 1024).unwrap();
+        SegmentFile::create_prealloc_temp(&temp, 1 * 1024 * 1024, crate::PreallocFill::ZeroWriteFull, 0).unwrap();
         assert!(temp.exists());
 
         let mut seg = SegmentFile::activate_prealloc_temp(&temp, &final_path, 7).unwrap();
@@ -1091,11 +1156,25 @@ mod tests {
     }
 
     #[test]
+    fn paced_fill_produces_full_size_all_zero_file() {
+        use crate::PreallocFill;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("seg-prealloc.0.tmp");
+        // A size that is NOT a multiple of the 4 MiB chunk to exercise the final partial sync.
+        let total: u64 = 4 * 1024 * 1024 + 7;
+        SegmentFile::create_prealloc_temp(&p, total, PreallocFill::ZeroWritePaced, 4 * 1024 * 1024).unwrap();
+        let meta = std::fs::metadata(&p).unwrap();
+        assert_eq!(meta.len(), total, "file must be exactly total_len");
+        let bytes = std::fs::read(&p).unwrap();
+        assert!(bytes.iter().all(|&b| b == 0), "every byte must be zero");
+    }
+
+    #[test]
     fn reset_cursor_sets_logical_size_without_truncating_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seg-test.log");
         let mut seg = SegmentFile::create(&path, 1).unwrap();
-        seg.preallocate_to(1 * 1024 * 1024).unwrap();
+        seg.preallocate_to(1 * 1024 * 1024, crate::PreallocFill::ZeroWriteFull, 0).unwrap();
         seg.append_records(&[(1, 0, b"hello")]).unwrap();
         let after_append = seg.size().unwrap();
         seg.reset_cursor(SEGMENT_HEADER_SIZE as u64);

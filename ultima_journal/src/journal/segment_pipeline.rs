@@ -21,6 +21,8 @@ pub(crate) struct SegmentPipeline {
 struct Shared {
     dir: PathBuf,
     segment_size: u64,
+    fill: crate::PreallocFill,
+    fill_chunk_bytes: u64,
     counter: AtomicU64,
     shutdown: AtomicBool,
     slot: Mutex<Slot>,
@@ -37,10 +39,14 @@ impl SegmentPipeline {
     pub(crate) fn spawn(
         dir: PathBuf,
         segment_size: u64,
+        fill: crate::PreallocFill,
+        fill_chunk_bytes: u64,
     ) -> Result<Arc<SegmentPipeline>, JournalError> {
         let shared = Arc::new(Shared {
             dir,
             segment_size,
+            fill,
+            fill_chunk_bytes,
             counter: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
             slot: Mutex::new(Slot::default()),
@@ -136,7 +142,12 @@ fn preallocator_loop(shared: Arc<Shared>) {
         };
         if need_one {
             let path = next_temp_path(&shared);
-            match SegmentFile::create_prealloc_temp(&path, shared.segment_size) {
+            match SegmentFile::create_prealloc_temp(
+                &path,
+                shared.segment_size,
+                shared.fill,
+                shared.fill_chunk_bytes,
+            ) {
                 Ok(()) => {
                     let mut slot = shared.slot.lock().unwrap();
                     slot.ready = Some(path);
@@ -169,7 +180,7 @@ mod tests {
     #[test]
     fn pipeline_hands_off_then_prepares_next() {
         let dir = tempfile::tempdir().unwrap();
-        let pipe = SegmentPipeline::spawn(dir.path().to_path_buf(), 256 * 1024).unwrap();
+        let pipe = SegmentPipeline::spawn(dir.path().to_path_buf(), 256 * 1024, crate::PreallocFill::ZeroWriteFull, 0).unwrap();
 
         let first = pipe.take_ready().unwrap();
         assert!(first.exists(), "first temp ready after spawn");
@@ -187,7 +198,7 @@ mod tests {
     #[test]
     fn shutdown_removes_unconsumed_temp() {
         let dir = tempfile::tempdir().unwrap();
-        let pipe = SegmentPipeline::spawn(dir.path().to_path_buf(), 256 * 1024).unwrap();
+        let pipe = SegmentPipeline::spawn(dir.path().to_path_buf(), 256 * 1024, crate::PreallocFill::ZeroWriteFull, 0).unwrap();
         pipe.shutdown();
         // After shutdown no ready temp should linger on disk.
         let leftover: Vec<_> = std::fs::read_dir(dir.path())

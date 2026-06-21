@@ -203,13 +203,19 @@ impl Journal {
             && let Some(active) = segments.last_mut()
             && active.physical_len()? < config.segment_size_bytes
         {
-            active.preallocate_to(config.segment_size_bytes)?;
+            active.preallocate_to(
+                config.segment_size_bytes,
+                config.prealloc_fill,
+                config.prealloc_fill_chunk_bytes,
+            )?;
         }
 
         let pipeline = if config.preallocate_segments {
             Some(crate::journal::segment_pipeline::SegmentPipeline::spawn(
                 config.dir.clone(),
                 config.segment_size_bytes,
+                config.prealloc_fill,
+                config.prealloc_fill_chunk_bytes,
             )?)
         } else {
             None
