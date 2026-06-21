@@ -79,7 +79,8 @@ double-copy, the client `copy_from_slice`, the ring memcpy in/out, the spin-then
 | J1 | openraft append → journal writer thread | no | `std::sync::mpsc` send | **removable T-7** | `ultima_journal/src/journal/mod.rs:334`; `writer.rs:330` |
 | J2 | journal writer → append caller | no | **Condvar** notify (or inline cb) | **removable T-8** | `writer.rs:423`; `notifier.rs:115-128`; `mod.rs:441-448` |
 
-**Total: 13 wakeup boundaries.** **4 are inherent** (cross-process IPC: #1, #5/#6, #7, #10);
+**Total: 13 rows; #6 is the consumer side of #5, so 12 distinct boundaries.** **4 are inherent**
+(cross-process IPC: #1, #5/#6, #7, #10);
 **8 are removable** intra-process hops (T-1…T-8). Of the removable ones, **T-2/T-3/T-5 are
 inside openraft** (would require forking it); **T-1/T-4/T-6** are UC's own bridge/oneshot hops;
 **T-7/T-8** are the journal handoff already covered by `docs/wal-journal-handoff-tax-2026-06-21.md`.
@@ -198,10 +199,12 @@ futex arm uses the same `FUTEX_WAIT`/`FUTEX_WAKE` syscall as `uc_protocol/src/ri
 
 | arm | ns / round-trip | ns / wakeup |
 |---|---|---|
-| busy-spin | **132** | **66** |
-| futex park/wake | **23,516** | **11,758** |
+| busy-spin | **58** | **29** |
+| futex park/wake | **17,529** | **8,765** |
 
-**A futex wakeup costs ~11.7 µs here; a busy-spin handoff costs ~66 ns — a ~175× gap.**
+(min of 5 timed passes per arm, to suppress scheduler noise.)
+
+**A futex wakeup costs ~8.8 µs here; a busy-spin handoff costs ~29 ns — a ~300× gap.**
 Implication for each removable hop that currently parks: removing the park (busy-spin or
 poll the ring) saves **≈ the futex cost per wakeup**. The inherent cross-process hops
 (#1/#5/#7/#10) each pay this when the consumer has parked; the spin-then-park (`SPIN_TRIES=64`,
@@ -223,7 +226,7 @@ cross-host busy-poll: this targets a local ring consumer, not the wire).
 | 4096 | **~40** | **~4** |
 
 **A copy at KV payload sizes is single-digit-to-~40 ns; a refcount clone is flat ~4 ns.**
-Both are **~300–2000× smaller than one futex wakeup (~11,700 ns).** So the removable copies
+Both are **~200–2000× smaller than one futex wakeup (~8,800 ns).** So the removable copies
 **C-1** (journal double-copy) and **C-2** (client `copy_from_slice`) save only **nanoseconds**
 at typical payloads — **low priority.** Copying only becomes commit-relevant for **large frames**
 (the 4 MiB / 16 MiB ring max): a 4 MiB memcpy ≈ tens of µs, then comparable to a wakeup.
@@ -233,7 +236,8 @@ at typical payloads — **low priority.** Copying only becomes commit-relevant f
 The handoff-tax doc (`docs/wal-journal-handoff-tax-2026-06-21.md`) independently measured the
 *storage* cross-thread handoff at **~32 µs (store WAL, tmpfs)** and **~22 µs (journal, over the
 raw-write floor)** — each is **two scheduler wakeups per commit** (enqueue→writer, writer→signal).
-Dividing by two gives **~11–16 µs/wakeup**, which **matches this session's measured ~11.7 µs/wakeup**.
+Dividing by two gives **~11–16 µs/wakeup**, the **same order as this session's measured ~8.8 µs/wakeup**
+(the min-of-5 sandbox value sits just below the doc's range; a dedicated host would tighten both).
 The two-wakeup model is therefore confirmed from both directions (a generic futex ping-pong here,
 and the end-to-end WAL/journal handoff there). This *is* the journal `Notifier`/`SeqWatermark`
 hops J1/J2 (T-7/T-8) in §2.
@@ -262,7 +266,7 @@ ceiling** and a **linger=0 latency floor** — *not* the linger-bound 8 ms p50 (
 
 | ID | opportunity | Aeron pattern | evidence | impact | confidence | horizon | regime |
 |---|---|---|---|---|---|---|---|
-| **O1** | **Busy-spin / poll the intra-host ring consumers UC owns** instead of futex-parking — the node→service & service→node bridge hops (T-1, T-4) and tuning the `SPIN_TRIES` window (hop #6). Eliminates the ~11.7 µs park per hop *when consumers idle*. | Agent duty-cycle + `BusySpinIdleStrategy`; consumers poll, never park | §5.1 (175× futex vs spin); §2 hops #5–8 | raises throughput ceiling; cuts ~tens-of-µs/commit at low rate | sandbox-validated (mechanism); **needs-fleet-confirmation** (ceiling delta) | **in-place tweak** (bounded cores) | **both** (esp. loaded) |
+| **O1** | **Busy-spin / poll the intra-host ring consumers UC owns** instead of futex-parking — the node→service & service→node bridge hops (T-1, T-4) and tuning the `SPIN_TRIES` window (hop #6). Eliminates the ~8.8 µs park per hop *when consumers idle*. | Agent duty-cycle + `BusySpinIdleStrategy`; consumers poll, never park | §5.1 (~300× futex vs spin); §2 hops #5–8 | raises throughput ceiling; cuts ~tens-of-µs/commit at low rate | sandbox-validated (mechanism); **needs-fleet-confirmation** (ceiling delta) | **in-place tweak** (bounded cores) | **both** (esp. loaded) |
 | **O2** | **Journal `SeqWatermark` route** for `append().wait()` (T-7/T-8) — drop the per-append `Notifier` alloc + condvar fan-out. | poll a watermark counter, not a per-op condvar | handoff-tax doc §B; §5.3 | collapses depth-1 p99 (hypothesis); ~1 wakeup/commit | hypothesis (needs `perf`) | refactor | serial/shallow |
 | **O3** | **Adaptive spin window** on the cross-process hops (#1/#5/#7/#10): widen `SPIN_TRIES` under sustained load so the consumer rarely parks at the knee, fall back to park when idle. | `BackoffIdleStrategy` ladder (spin→yield→park) | §5.1; §3 | raises ceiling without burning a core when idle | hypothesis | in-place tweak | loaded |
 | **C-1** | journal double-copy → `Arc<[u8]>` | flyweight / no redundant copy | §2; §5.2 | **~ns** (hygiene) | sandbox-validated | in-place tweak | both |
@@ -278,12 +282,12 @@ ceiling** and a **linger=0 latency floor** — *not* the linger-bound 8 ms p50 (
 
 - **O1 is the highest-leverage shippable change**: busy-spin (or a wider spin window) the
   intra-host ring consumers the node already owns, so a commit's stage transitions don't pay the
-  ~11.7 µs futex park. It is bounded (a handful of hot hops, not the whole system), it is the
+  ~8.8 µs futex park. It is bounded (a handful of hot hops, not the whole system), it is the
   intra-host analog of Aeron's polling consumers, and it is explicitly *not* the settled-negative
   cross-host busy-poll. **O3** makes it idle-safe (adaptive spin→park) so cores aren't burned at
   rest. **O2** is the journal half, already designed in the handoff-tax doc.
 - **The copying axis is a near-non-issue** (C-1/C-2): §5.2 shows copies are ~4–40 ns at KV sizes
-  vs ~11,700 ns per wakeup. Do them for hygiene, not throughput. They'd only matter for MB-scale
+  vs ~8,800 ns per wakeup. Do them for hygiene, not throughput. They'd only matter for MB-scale
   frames. **This refutes "data copying on the hot path" as a meaningful lever at typical payloads**
   — the CLAUDE.md `Bytes` zero-copy posture is already good enough; the forced ring memcpys are
   cheap.
@@ -295,7 +299,7 @@ Cluster runs consensus + service as **polling Agents in one process** — a comm
 parks** intra-host and reads log entries as **flyweights (0 copies)**. UC splits node and service
 into **separate OS processes** bridged by futex rings, and routes consensus through **openraft's
 async task/channel model** — so each intra-host transition Aeron does as a counter-poll, UC does as
-a futex wake+park (~11.7 µs here) or a tokio hop. **A1** (co-locate node+service, poll instead of
+a futex wake+park (~8.8 µs here) or a tokio hop. **A1** (co-locate node+service, poll instead of
 park) and **A2** (duty-cycle consensus vs openraft async) are what it would take to truly match
 Aeron — both rewrite-class, both giving up correctness-proven seams (the process isolation that
 makes service-crash reconstruction and the lincheck story work; the openraft consensus core). Not

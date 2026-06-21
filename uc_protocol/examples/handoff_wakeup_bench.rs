@@ -130,14 +130,20 @@ fn report(name: &str, d: Duration) {
     );
 }
 
+/// min-of-N to suppress scheduler noise (the absolute ns/wakeup is reconciled
+/// against the handoff-tax doc in §5.3, so harden it past a single sample).
+fn best_of(runs: u32, mut f: impl FnMut() -> Duration) -> Duration {
+    (0..runs).map(|_| f()).min().unwrap()
+}
+
 fn main() {
     // warm up scheduler / caches
     let _ = bench_busyspin();
     let _ = bench_futex();
 
-    let spin = bench_busyspin();
-    let futex = bench_futex();
-    println!("== handoff wakeup microbench (release) ==");
+    let spin = best_of(5, bench_busyspin);
+    let futex = best_of(5, bench_futex);
+    println!("== handoff wakeup microbench (release, min of 5) ==");
     report("busyspin_roundtrip", spin);
     report("futex_roundtrip", futex);
     let delta = (futex.as_nanos() as f64 - spin.as_nanos() as f64) / ROUND_TRIPS as f64 / 2.0;
