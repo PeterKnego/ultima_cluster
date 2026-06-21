@@ -106,7 +106,7 @@ fn main() {
     println!("park  {:>9.0} ns/rt", per_rt_ns(sat_park, SATURATED_RTS));
     println!("busy  {:>9.0} ns/rt", per_rt_ns(sat_busy, SATURATED_RTS));
     println!(
-        "delta {:>9.0} ns/rt (small: SPIN_TRIES already dodges the futex when hot)",
+        "delta {:>9.0} ns/rt (near-zero/noisy, sign varies: when hot the consumer rarely parks, so busy-spin saves no futex wakeup — and its 256-spin chunks can cost MORE than park's short spin)",
         per_rt_ns(sat_park, SATURATED_RTS) - per_rt_ns(sat_busy, SATURATED_RTS)
     );
 
