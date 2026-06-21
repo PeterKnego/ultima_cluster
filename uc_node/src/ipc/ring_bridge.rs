@@ -197,4 +197,40 @@ mod tests {
         drop(bridge);
         let _ = std::fs::remove_file(&path);
     }
+
+    // Measurement (not a strict perf assert — sandbox noise + the residual
+    // Notify->reschedule make a hard inequality flaky). Prints publish->notified
+    // latency for park vs busy so the direction is visible with --nocapture.
+    #[tokio::test]
+    async fn measure_publish_to_notified_park_vs_busy() {
+        async fn one(budget: u32, iters: u32) -> std::time::Duration {
+            let path = tmp_ring_path(if budget == u32::MAX { "m-busy" } else { "m-park" });
+            let ring = SpscRing::create(&path, 65536, 1024).expect("create");
+            let (mut producer, mut consumer) = ring.into_split();
+            let bridge = NotifyBridge::spawn(consumer.wait_handle(), "measure", budget);
+            let mut buf = Vec::new();
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                // small gap so a parking parker (budget 0) actually parks
+                tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+                let t0 = std::time::Instant::now();
+                producer.try_write(7, 0, [0; 8], b"x").expect("write");
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), bridge.notified()).await;
+                total += t0.elapsed();
+                while consumer.try_read(&mut buf).ok().flatten().is_some() {} // drain
+            }
+            drop(bridge);
+            let _ = std::fs::remove_file(&path);
+            total / iters
+        }
+        let iters = 200;
+        let park = one(0, iters).await;
+        let busy = one(u32::MAX, iters).await;
+        println!(
+            "publish->notified: park={park:?} busy={busy:?} (busy removes the ~us ring futex park; \
+             the Notify->reschedule remains in both)"
+        );
+        // correctness only: both modes deliver within the timeout (non-zero, finite)
+        assert!(park.as_nanos() > 0 && busy.as_nanos() > 0);
+    }
 }
