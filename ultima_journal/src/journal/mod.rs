@@ -42,7 +42,9 @@ pub struct JournalConfig {
     /// size-extending append otherwise forces. See task on segment preallocation.
     pub preallocate_segments: bool,
     /// Fill strategy for preallocated segments (only consulted when
-    /// `preallocate_segments`). Default `ZeroWriteFull` (no behavior change).
+    /// `preallocate_segments`). Default `FallocateZeroRange` (the A/B winner:
+    /// cures the background-fill fsync-contention p99 tail; falls back to
+    /// `ZeroWritePaced` on non-Linux / unsupported filesystems).
     pub prealloc_fill: PreallocFill,
     /// Chunk granularity for `ZeroWritePaced` (and the paced fallback): issue a
     /// `sync_data` after roughly this many bytes. Default 4 MiB.
@@ -56,7 +58,7 @@ impl JournalConfig {
             segment_size_bytes: 64 * 1024 * 1024,
             durability: crate::Durability::Consistent,
             preallocate_segments: false,
-            prealloc_fill: PreallocFill::ZeroWriteFull,
+            prealloc_fill: PreallocFill::FallocateZeroRange,
             prealloc_fill_chunk_bytes: 4 * 1024 * 1024,
         }
     }
@@ -714,7 +716,7 @@ mod tests {
     #[test]
     fn prealloc_fill_defaults() {
         let cfg = JournalConfig::new("/tmp/does-not-matter");
-        assert_eq!(cfg.prealloc_fill, PreallocFill::ZeroWriteFull);
+        assert_eq!(cfg.prealloc_fill, PreallocFill::FallocateZeroRange);
         assert_eq!(cfg.prealloc_fill_chunk_bytes, 4 * 1024 * 1024);
     }
 

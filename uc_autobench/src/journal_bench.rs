@@ -114,10 +114,12 @@ fn fresh_cfg(
     cfg.durability = durability;
     cfg.preallocate_segments = preallocate;
     if preallocate {
+        // Mapping mirrors parse_prealloc_fill() in uc_node/src/raft/log_storage.rs;
+        // default (unset/unknown) is the A/B winner FallocateZeroRange.
         cfg.prealloc_fill = match std::env::var("UC_JOURNAL_PREALLOC_FILL").ok().as_deref() {
+            Some("full") => ultima_journal::PreallocFill::ZeroWriteFull,
             Some("paced") => ultima_journal::PreallocFill::ZeroWritePaced,
-            Some("fallocate") => ultima_journal::PreallocFill::FallocateZeroRange,
-            _ => ultima_journal::PreallocFill::ZeroWriteFull,
+            _ => ultima_journal::PreallocFill::FallocateZeroRange,
         };
     }
     let j = Journal::open(cfg).unwrap();

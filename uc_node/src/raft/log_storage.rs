@@ -36,15 +36,17 @@ fn journal_prealloc_from_env() -> bool {
 }
 
 /// Parse `UC_JOURNAL_PREALLOC_FILL` into the segment fill strategy. Default
-/// `ZeroWriteFull` (unset/unknown); `"paced"`/`"fallocate"` select the
-/// contention-reducing strategies. Orthogonal to `UC_JOURNAL_PREALLOC` (on/off).
-/// Pure helper for unit testing without touching the process env.
+/// `FallocateZeroRange` (unset/unknown) — the A/B winner that cures the
+/// background-fill p99 tail and itself falls back to paced on unsupported
+/// filesystems; `"full"` restores the legacy zero-write baseline and `"paced"`
+/// selects the dependency-free contention fix. Orthogonal to
+/// `UC_JOURNAL_PREALLOC` (on/off). Pure helper for unit testing without env.
 fn parse_prealloc_fill(s: Option<&str>) -> ultima_journal::PreallocFill {
     use ultima_journal::PreallocFill;
     match s {
+        Some("full") => PreallocFill::ZeroWriteFull,
         Some("paced") => PreallocFill::ZeroWritePaced,
-        Some("fallocate") => PreallocFill::FallocateZeroRange,
-        _ => PreallocFill::ZeroWriteFull,
+        _ => PreallocFill::FallocateZeroRange,
     }
 }
 
@@ -521,7 +523,8 @@ mod tests {
         assert_eq!(parse_prealloc_fill(Some("paced")), PreallocFill::ZeroWritePaced);
         assert_eq!(parse_prealloc_fill(Some("fallocate")), PreallocFill::FallocateZeroRange);
         assert_eq!(parse_prealloc_fill(Some("full")), PreallocFill::ZeroWriteFull);
-        assert_eq!(parse_prealloc_fill(None), PreallocFill::ZeroWriteFull);
-        assert_eq!(parse_prealloc_fill(Some("garbage")), PreallocFill::ZeroWriteFull);
+        // Default (unset/unknown) is now the A/B winner FallocateZeroRange.
+        assert_eq!(parse_prealloc_fill(None), PreallocFill::FallocateZeroRange);
+        assert_eq!(parse_prealloc_fill(Some("garbage")), PreallocFill::FallocateZeroRange);
     }
 }
