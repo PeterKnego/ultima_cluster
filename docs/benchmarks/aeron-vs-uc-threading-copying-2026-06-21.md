@@ -255,10 +255,72 @@ hops J1/J2 (T-7/T-8) in §2.
 
 ## 6 Prioritized opportunities
 
-_TBD — Task 8._
+Sorted by (impact × confidence ÷ horizon). "Regime" = which operating point it helps:
+**serial/shallow** (parked consumers, low rate), **loaded** (hot producers, the ~10k/s ceiling),
+or **both**. Headline impact is judged against the two real targets from §1 — the **throughput
+ceiling** and a **linger=0 latency floor** — *not* the linger-bound 8 ms p50 (see §7).
+
+| ID | opportunity | Aeron pattern | evidence | impact | confidence | horizon | regime |
+|---|---|---|---|---|---|---|---|
+| **O1** | **Busy-spin / poll the intra-host ring consumers UC owns** instead of futex-parking — the node→service & service→node bridge hops (T-1, T-4) and tuning the `SPIN_TRIES` window (hop #6). Eliminates the ~11.7 µs park per hop *when consumers idle*. | Agent duty-cycle + `BusySpinIdleStrategy`; consumers poll, never park | §5.1 (175× futex vs spin); §2 hops #5–8 | raises throughput ceiling; cuts ~tens-of-µs/commit at low rate | sandbox-validated (mechanism); **needs-fleet-confirmation** (ceiling delta) | **in-place tweak** (bounded cores) | **both** (esp. loaded) |
+| **O2** | **Journal `SeqWatermark` route** for `append().wait()` (T-7/T-8) — drop the per-append `Notifier` alloc + condvar fan-out. | poll a watermark counter, not a per-op condvar | handoff-tax doc §B; §5.3 | collapses depth-1 p99 (hypothesis); ~1 wakeup/commit | hypothesis (needs `perf`) | refactor | serial/shallow |
+| **O3** | **Adaptive spin window** on the cross-process hops (#1/#5/#7/#10): widen `SPIN_TRIES` under sustained load so the consumer rarely parks at the knee, fall back to park when idle. | `BackoffIdleStrategy` ladder (spin→yield→park) | §5.1; §3 | raises ceiling without burning a core when idle | hypothesis | in-place tweak | loaded |
+| **C-1** | journal double-copy → `Arc<[u8]>` | flyweight / no redundant copy | §2; §5.2 | **~ns** (hygiene) | sandbox-validated | in-place tweak | both |
+| **C-2** | client `copy_from_slice` → `Bytes::from(mem::take)` | zero-copy receive | §2; §5.2 | **~ns** (hygiene) | sandbox-validated | in-place tweak | both |
+| **A1** | **Co-locate node+service in one process** with polling agents — removes 2 of the 4 IPC boundaries (#5/#6/#7) and their futex hops; service apply becomes an in-process poll like Aeron's ClusteredServiceAgent. | single-process polling Agents over shared term buffers | §4 side-by-side | removes ~2 inherent wakeups/commit + 2 ring copy-pairs | hypothesis | **long-horizon rewrite** | both |
+| **A2** | **Bypass openraft's internal async hops** (T-2/T-3/T-5) — a duty-cycle consensus loop instead of task+channel handoffs. | `ConsensusModuleAgent` poll loop | §2 hops #3/#4/#9; §4 | removes ~3 intra-proc wakeups/commit | hypothesis | **long-horizon rewrite** (fork/replace openraft) | both |
 
 ---
 
 ## 7 Synthesis
 
-_TBD — Task 8._
+### Actionable tier (inside the current architecture)
+
+- **O1 is the highest-leverage shippable change**: busy-spin (or a wider spin window) the
+  intra-host ring consumers the node already owns, so a commit's stage transitions don't pay the
+  ~11.7 µs futex park. It is bounded (a handful of hot hops, not the whole system), it is the
+  intra-host analog of Aeron's polling consumers, and it is explicitly *not* the settled-negative
+  cross-host busy-poll. **O3** makes it idle-safe (adaptive spin→park) so cores aren't burned at
+  rest. **O2** is the journal half, already designed in the handoff-tax doc.
+- **The copying axis is a near-non-issue** (C-1/C-2): §5.2 shows copies are ~4–40 ns at KV sizes
+  vs ~11,700 ns per wakeup. Do them for hygiene, not throughput. They'd only matter for MB-scale
+  frames. **This refutes "data copying on the hot path" as a meaningful lever at typical payloads**
+  — the CLAUDE.md `Bytes` zero-copy posture is already good enough; the forced ring memcpys are
+  cheap.
+
+### Architectural tier (structural gap — long-horizon)
+
+§4 is the core result: **the Aeron gap on these two axes is structural, not a tuning miss.** Aeron
+Cluster runs consensus + service as **polling Agents in one process** — a commit crosses **0
+parks** intra-host and reads log entries as **flyweights (0 copies)**. UC splits node and service
+into **separate OS processes** bridged by futex rings, and routes consensus through **openraft's
+async task/channel model** — so each intra-host transition Aeron does as a counter-poll, UC does as
+a futex wake+park (~11.7 µs here) or a tokio hop. **A1** (co-locate node+service, poll instead of
+park) and **A2** (duty-cycle consensus vs openraft async) are what it would take to truly match
+Aeron — both rewrite-class, both giving up correctness-proven seams (the process isolation that
+makes service-crash reconstruction and the lincheck story work; the openraft consensus core). Not
+recommended unless the low-latency floor becomes a primary product goal.
+
+### What would actually close the ~80 µs-vs-8 ms gap
+
+**Honest bottom line, in order:**
+
+1. **The 8 ms p50 is ~5 ms linger + ~2.7 ms replication + IPC.** At this operating point, *every*
+   threading/copying finding here is **<1% of p50** — the ~4 inherent intra-host wakeups total
+   ~tens of µs against an 8 ms commit. **Nothing in this investigation moves the headline p50** at
+   linger=5ms; the linger knob does (already known, §1).
+2. **In a `linger=0` world** (the honest low-latency floor, not yet measured), p50 collapses toward
+   **replication RTT (~2.7 ms) + IPC wakeups (~tens of µs) + fsync**. There, replication dominates;
+   the intra-host wakeups (O1/O3) are the *second* term and worth reclaiming — but UC stays ~ms
+   (replication-bound) vs Aeron's ~80 µs regardless. **Raft replication RTT, not threading, is the
+   next floor** — and Aeron Cluster pays that too (its ~80 µs is a tuned single-host/IPC config; its
+   cross-host cluster latency is also ms-range).
+3. **The ~2× throughput ceiling (~10k/s) is the most tractable real target**, and it *is* partly a
+   threading story: at ~100 µs/commit budget, several futex wakeups/commit + openraft's serialized
+   apply cap single-core throughput, where Aeron's poll-everything model does not. **O1 + O3 (raise
+   the ceiling by not parking under load) are the recommended next experiment**, fleet-confirmed.
+
+**Recommendation:** pursue **O1/O3** (intra-host busy-spin/adaptive-spin, fleet-measured against the
+throughput ceiling) and **O2** (journal watermark). Treat copying (C-1/C-2) as hygiene. Shelve the
+architectural tier (A1/A2) unless a linger=0, sub-ms latency floor becomes a product requirement —
+and even then, recognize replication RTT, not the handoff, is the wall after that.
