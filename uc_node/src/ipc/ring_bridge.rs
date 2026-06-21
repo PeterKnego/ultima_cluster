@@ -33,7 +33,10 @@ pub struct NotifyBridge {
 
 impl NotifyBridge {
     /// Spawn the parker thread for `handle`. `name` is for diagnostics.
-    pub fn spawn(handle: RingWaitHandle, name: &'static str) -> Self {
+    /// `spin_budget`: `0` = park immediately (default); `u32::MAX` = busy-spin
+    /// (never park, notify only on a real `current_seq` change); finite `N` =
+    /// spin `N` times looking for a change, then park.
+    pub fn spawn(handle: RingWaitHandle, name: &'static str, spin_budget: u32) -> Self {
         let notify = Arc::new(Notify::new());
         let stop = Arc::new(AtomicBool::new(false));
         let waker = handle.clone();
@@ -43,10 +46,45 @@ impl NotifyBridge {
             .name(format!("ring-park-{name}"))
             .spawn(move || {
                 handle.arm();
+                let mut last = handle.current_seq();
                 while !s.load(Ordering::Acquire) {
-                    let seq = handle.current_seq();
-                    handle.park(seq, PARK_CEIL);
-                    n.notify_one();
+                    if spin_budget == u32::MAX {
+                        // Busy: spin until the wakeup word changes or we stop;
+                        // notify ONLY on a real change (never park, no syscall).
+                        loop {
+                            let now = handle.current_seq();
+                            if now != last {
+                                last = now;
+                                n.notify_one();
+                                break;
+                            }
+                            if s.load(Ordering::Acquire) {
+                                break;
+                            }
+                            std::hint::spin_loop();
+                        }
+                    } else {
+                        // Spin up to `spin_budget` looking for a change (0 = none),
+                        // then park up to PARK_CEIL. Notify after either path —
+                        // a spurious notify on timeout is tolerated (the consumer
+                        // re-checks via try_read), matching the prior behavior.
+                        let mut changed = false;
+                        for _ in 0..spin_budget {
+                            let now = handle.current_seq();
+                            if now != last {
+                                last = now;
+                                changed = true;
+                                break;
+                            }
+                            std::hint::spin_loop();
+                        }
+                        if !changed {
+                            let seq = handle.current_seq();
+                            handle.park(seq, PARK_CEIL);
+                            last = handle.current_seq();
+                        }
+                        n.notify_one();
+                    }
                 }
                 handle.disarm();
             })
@@ -80,5 +118,83 @@ impl NotifyBridge {
 impl Drop for NotifyBridge {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Parse `UC_NODE_BRIDGE_SPIN_BUDGET` into a parker spin budget. Pure (testable):
+/// `None`/unparseable -> `0` (park immediately, today's behavior); `busy`/`max`
+/// (case-insensitive) -> `u32::MAX` (pure busy-spin); `<N>` -> N (spin then park).
+pub fn parse_bridge_spin_budget(v: Option<&str>) -> u32 {
+    match v {
+        Some(s) if s.trim().eq_ignore_ascii_case("busy") || s.trim().eq_ignore_ascii_case("max") => {
+            u32::MAX
+        }
+        Some(s) => s.trim().parse::<u32>().unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// Read the node bridge spin budget from the environment.
+pub fn bridge_spin_budget() -> u32 {
+    parse_bridge_spin_budget(std::env::var("UC_NODE_BRIDGE_SPIN_BUDGET").ok().as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uc_protocol::ring::SpscRing;
+
+    fn tmp_ring_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("uc-bridge-test-{}-{tag}.ring", std::process::id()))
+    }
+
+    #[test]
+    fn parse_bridge_spin_budget_cases() {
+        assert_eq!(parse_bridge_spin_budget(None), 0);
+        assert_eq!(parse_bridge_spin_budget(Some("busy")), u32::MAX);
+        assert_eq!(parse_bridge_spin_budget(Some("BUSY")), u32::MAX);
+        assert_eq!(parse_bridge_spin_budget(Some("max")), u32::MAX);
+        assert_eq!(parse_bridge_spin_budget(Some("MAX")), u32::MAX);
+        assert_eq!(parse_bridge_spin_budget(Some(" 256 ")), 256);
+        assert_eq!(parse_bridge_spin_budget(Some("garbage")), 0);
+    }
+
+    // Busy mode: the parker notifies on a publish and shuts down cleanly.
+    #[tokio::test]
+    async fn busy_bridge_notifies_on_publish_and_shuts_down() {
+        let path = tmp_ring_path("busy");
+        let ring = SpscRing::create(&path, 4096, 1024).expect("create");
+        let (mut producer, consumer) = ring.into_split();
+        let bridge = NotifyBridge::spawn(consumer.wait_handle(), "test-busy", u32::MAX);
+
+        // Mirror the real consumer: the parker snapshots `current_seq` at startup
+        // and notifies on a LATER change. Let it start watching, THEN publish, so
+        // the publish is a real change the parker observes (a publish before the
+        // snapshot would be one the consumer's own try_read handles, not notify).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        producer.try_write(7, 0, [0; 8], b"hi").expect("write");
+        let res = tokio::time::timeout(std::time::Duration::from_secs(1), bridge.notified()).await;
+        assert!(res.is_ok(), "busy bridge did not notify on publish");
+
+        drop(bridge); // shutdown joins the parker; test completing => no hang
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Default (budget 0 = park): still notifies on a publish (via the park path).
+    #[tokio::test]
+    async fn park_bridge_notifies_on_publish() {
+        let path = tmp_ring_path("park");
+        let ring = SpscRing::create(&path, 4096, 1024).expect("create");
+        let (mut producer, consumer) = ring.into_split();
+        let bridge = NotifyBridge::spawn(consumer.wait_handle(), "test-park", 0);
+
+        // Let the parker reach its park, then publish so the publish wakes it.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        producer.try_write(7, 0, [0; 8], b"hi").expect("write");
+        let res = tokio::time::timeout(std::time::Duration::from_secs(1), bridge.notified()).await;
+        assert!(res.is_ok(), "park bridge did not notify on publish");
+
+        drop(bridge);
+        let _ = std::fs::remove_file(&path);
     }
 }
