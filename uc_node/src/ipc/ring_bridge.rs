@@ -45,7 +45,12 @@ impl NotifyBridge {
         let join = std::thread::Builder::new()
             .name(format!("ring-park-{name}"))
             .spawn(move || {
-                handle.arm();
+                // Busy mode never parks, so it must NOT arm the ring: an armed
+                // ring makes the producer fire a useless FUTEX_WAKE on every
+                // publish (waiters stays > 0). Only the park path needs arming.
+                if spin_budget != u32::MAX {
+                    handle.arm();
+                }
                 let mut last = handle.current_seq();
                 while !s.load(Ordering::Acquire) {
                     if spin_budget == u32::MAX {
@@ -86,7 +91,9 @@ impl NotifyBridge {
                         n.notify_one();
                     }
                 }
-                handle.disarm();
+                if spin_budget != u32::MAX {
+                    handle.disarm();
+                }
             })
             .expect("spawn ring parker thread");
         Self {
