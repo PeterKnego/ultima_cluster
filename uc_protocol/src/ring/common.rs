@@ -66,6 +66,11 @@ pub const PARK_CEIL: std::time::Duration = std::time::Duration::from_millis(2);
 /// idle strategy); only after these fail do we arm + futex-wait.
 pub const SPIN_TRIES: u32 = 64;
 
+/// Busy-spin chunk: in busy mode (`spin_budget == u32::MAX`) the consumer polls
+/// this many times per `read_or_park` call before returning `Ok(None)`, bounding
+/// stop-flag/shutdown latency without ever parking.
+pub const BUSY_SPIN_CHUNK: u32 = 256;
+
 /// Padding-marker `msg_type` — consumer skips to the start of the slot
 /// region when it encounters this in a record header.
 pub const PADDING_MSG_TYPE: u16 = 0xffff;
