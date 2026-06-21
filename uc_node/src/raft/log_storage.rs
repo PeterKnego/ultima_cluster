@@ -35,6 +35,23 @@ fn journal_prealloc_from_env() -> bool {
     parse_journal_prealloc(std::env::var("UC_JOURNAL_PREALLOC").ok().as_deref())
 }
 
+/// Parse `UC_JOURNAL_PREALLOC_FILL` into the segment fill strategy. Default
+/// `ZeroWriteFull` (unset/unknown); `"paced"`/`"fallocate"` select the
+/// contention-reducing strategies. Orthogonal to `UC_JOURNAL_PREALLOC` (on/off).
+/// Pure helper for unit testing without touching the process env.
+fn parse_prealloc_fill(s: Option<&str>) -> ultima_journal::PreallocFill {
+    use ultima_journal::PreallocFill;
+    match s {
+        Some("paced") => PreallocFill::ZeroWritePaced,
+        Some("fallocate") => PreallocFill::FallocateZeroRange,
+        _ => PreallocFill::ZeroWriteFull,
+    }
+}
+
+fn journal_prealloc_fill_from_env() -> ultima_journal::PreallocFill {
+    parse_prealloc_fill(std::env::var("UC_JOURNAL_PREALLOC_FILL").ok().as_deref())
+}
+
 /// Persisted snapshot meta (the last installed snapshot's metadata + a
 /// pointer to its bytes file under data_dir).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -95,7 +112,7 @@ impl JournalLogStorage {
             // UC_JOURNAL_PREALLOC=0 to roll back. Gated on the cloud A/B (see
             // uc_autobench/scripts/prealloc-commit-ab.md) before this branch merges.
             preallocate_segments: journal_prealloc_from_env(),
-            prealloc_fill: ultima_journal::PreallocFill::ZeroWriteFull,
+            prealloc_fill: journal_prealloc_fill_from_env(),
             prealloc_fill_chunk_bytes: 4 * 1024 * 1024,
         })?);
 
@@ -475,7 +492,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_journal_prealloc;
+    use super::{parse_journal_prealloc, parse_prealloc_fill};
 
     #[test]
     fn prealloc_unset_is_on() {
@@ -496,5 +513,15 @@ mod tests {
         assert!(parse_journal_prealloc(Some("true")));
         // Fail-open to the new default for anything that isn't an explicit disable.
         assert!(parse_journal_prealloc(Some("bad")));
+    }
+
+    #[test]
+    fn parse_prealloc_fill_maps_values() {
+        use ultima_journal::PreallocFill;
+        assert_eq!(parse_prealloc_fill(Some("paced")), PreallocFill::ZeroWritePaced);
+        assert_eq!(parse_prealloc_fill(Some("fallocate")), PreallocFill::FallocateZeroRange);
+        assert_eq!(parse_prealloc_fill(Some("full")), PreallocFill::ZeroWriteFull);
+        assert_eq!(parse_prealloc_fill(None), PreallocFill::ZeroWriteFull);
+        assert_eq!(parse_prealloc_fill(Some("garbage")), PreallocFill::ZeroWriteFull);
     }
 }

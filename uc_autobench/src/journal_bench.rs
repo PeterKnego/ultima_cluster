@@ -113,6 +113,13 @@ fn fresh_cfg(
     let mut cfg = JournalConfig::new(dir.path());
     cfg.durability = durability;
     cfg.preallocate_segments = preallocate;
+    if preallocate {
+        cfg.prealloc_fill = match std::env::var("UC_JOURNAL_PREALLOC_FILL").ok().as_deref() {
+            Some("paced") => ultima_journal::PreallocFill::ZeroWritePaced,
+            Some("fallocate") => ultima_journal::PreallocFill::FallocateZeroRange,
+            _ => ultima_journal::PreallocFill::ZeroWriteFull,
+        };
+    }
     let j = Journal::open(cfg).unwrap();
     (dir, j)
 }
