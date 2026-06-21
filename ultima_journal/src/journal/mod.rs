@@ -11,6 +11,27 @@ use std::sync::{Arc, Mutex};
 use crate::{JournalError, Notifier};
 use writer::{AppendRequest, SeqWatermark, Writer, WriterState};
 
+/// How a preallocated segment's empty tail is laid down. All three produce a
+/// full-size file that reads back as zeros (so recovery's zero-tail = end-of-log
+/// logic is identical); they differ only in I/O shape, which governs whether the
+/// background fill contends with foreground per-commit `fdatasync`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreallocFill {
+    /// Real zero-write of the whole segment + one `sync_all` + parent-dir
+    /// `sync_all`. Original behavior; the A/B baseline and current default.
+    ZeroWriteFull,
+    /// Real zero-write in chunks, `sync_data` every `prealloc_fill_chunk_bytes`
+    /// with a `yield_now` between, no per-temp dir sync. Same written extents as
+    /// `ZeroWriteFull`, but the device flush is split into small spaced barriers
+    /// so a foreground commit `fdatasync` can interleave. Pure `std`.
+    ZeroWritePaced,
+    /// `fallocate(FALLOC_FL_ZERO_RANGE)` + one `sync_data`, no per-temp dir sync.
+    /// Linux-only; falls back to `ZeroWritePaced` on non-Linux or `OPNOTSUPP`.
+    /// Near-zero background I/O *iff* the kernel yields initialized extents
+    /// (validated by the fleet A/B, not assumed).
+    FallocateZeroRange,
+}
+
 #[derive(Debug, Clone)]
 pub struct JournalConfig {
     pub dir: std::path::PathBuf,
@@ -20,6 +41,12 @@ pub struct JournalConfig {
     /// up front so the per-commit `fdatasync` skips the ext4 metadata commit a
     /// size-extending append otherwise forces. See task on segment preallocation.
     pub preallocate_segments: bool,
+    /// Fill strategy for preallocated segments (only consulted when
+    /// `preallocate_segments`). Default `ZeroWriteFull` (no behavior change).
+    pub prealloc_fill: PreallocFill,
+    /// Chunk granularity for `ZeroWritePaced` (and the paced fallback): issue a
+    /// `sync_data` after roughly this many bytes. Default 4 MiB.
+    pub prealloc_fill_chunk_bytes: u64,
 }
 
 impl JournalConfig {
@@ -29,6 +56,8 @@ impl JournalConfig {
             segment_size_bytes: 64 * 1024 * 1024,
             durability: crate::Durability::Consistent,
             preallocate_segments: false,
+            prealloc_fill: PreallocFill::ZeroWriteFull,
+            prealloc_fill_chunk_bytes: 4 * 1024 * 1024,
         }
     }
 }
@@ -675,6 +704,13 @@ fn bounds_to_inclusive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prealloc_fill_defaults() {
+        let cfg = JournalConfig::new("/tmp/does-not-matter");
+        assert_eq!(cfg.prealloc_fill, PreallocFill::ZeroWriteFull);
+        assert_eq!(cfg.prealloc_fill_chunk_bytes, 4 * 1024 * 1024);
+    }
 
     #[test]
     fn config_preallocate_defaults_off() {

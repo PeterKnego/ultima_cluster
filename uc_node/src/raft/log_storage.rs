@@ -95,6 +95,8 @@ impl JournalLogStorage {
             // UC_JOURNAL_PREALLOC=0 to roll back. Gated on the cloud A/B (see
             // uc_autobench/scripts/prealloc-commit-ab.md) before this branch merges.
             preallocate_segments: journal_prealloc_from_env(),
+            prealloc_fill: ultima_journal::PreallocFill::ZeroWriteFull,
+            prealloc_fill_chunk_bytes: 4 * 1024 * 1024,
         })?);
 
         let vote = Arc::new(StableValue::open(StableValueConfig {
