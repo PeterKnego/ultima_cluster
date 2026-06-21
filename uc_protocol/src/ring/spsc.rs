@@ -27,10 +27,10 @@ use std::sync::atomic::Ordering;
 use memmap2::MmapMut;
 
 use crate::ring::common::{
-    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, PARK_CEIL, ParkMode, RING_HEADER_LEN,
-    RecordHeader, RingError, RingHeader, RingWaitHandle, SPIN_TRIES, BUSY_SPIN_CHUNK, align_record_size,
-    init_ring_header, try_read_record_at, validate_ring_header, write_padding_marker_at,
-    write_record_at,
+    BUSY_SPIN_CHUNK, FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, PARK_CEIL, ParkMode,
+    RING_HEADER_LEN, RecordHeader, RingError, RingHeader, RingWaitHandle, SPIN_TRIES,
+    align_record_size, init_ring_header, try_read_record_at, validate_ring_header,
+    write_padding_marker_at, write_record_at,
 };
 
 /// Shared inner state — owns the mmap and exposes the header + slot region.
@@ -648,7 +648,12 @@ mod tests {
         consumer.set_spin_budget(4); // small finite window, then park
         let mut buf = Vec::new();
         // empty -> parks up to PARK_CEIL, returns None
+        let start = std::time::Instant::now();
         assert!(consumer.read_or_park(&mut buf).expect("read").is_none());
+        assert!(
+            start.elapsed() >= PARK_CEIL,
+            "finite budget should have parked"
+        );
         // published -> read returns it
         producer.try_write(9, 0, [0; 8], b"x").expect("write");
         let rec = consumer.read_or_park(&mut buf).expect("read").expect("some");
