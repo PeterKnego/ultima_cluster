@@ -114,8 +114,27 @@ then commits return to ~57 µs once the fill completes. The tight ~2.85 ms clust
 fsync queuing behind a roughly fixed slab of background dirty data + barrier.
 
 Corroborating: the journal's **non**-preallocated append arms (no pipeline thread running) had
-`fdatasync` max ≤ 0.35 ms — i.e. the tail appears *with* background preallocation, not without it. The
-store WAL avoids it entirely by filling its prealloc chunk inline, once, before the commit loop.
+`fdatasync` max ≤ 0.35 ms in the same perf session — i.e. the tail appears *with* background
+preallocation, not without it. The store WAL avoids it entirely by filling its prealloc chunk inline,
+once, before the commit loop.
+
+**Strength of the attribution (stated plainly).** The transplant NO-GO is *proven* at Tier 1: the time
+is provably inside `fdatasync` (40 µs max runqueue; per-syscall trace), so swapping the wait primitive
+cannot help — this stands regardless of *why* the fdatasync is slow. The further attribution of the
+slowness to the `SegmentPipeline` specifically is **inferential**, resting on three consistent facts
+rather than a single direct observation: (a) `create_prealloc_temp` is the only heavy background I/O on
+the code path and it fires at open, when the burst occurs; (b) the slow fdatasyncs form one *contiguous*
+~21 ms burst that then stops (a fixed-bandwidth competition signature, not scattered jitter), with the
+last entry shorter (1.65 ms) as if the competitor finished mid-flush; (c) the non-prealloc arm (no
+pipeline) is clean and the store WAL (no concurrent filler) is clean. What is *not* in hand is a trace
+slice showing the pipeline thread's own `write`/`sync_all` overlapping the burst — and the fleet has
+been torn down, so this last confirmation is left to the follow-up task (re-run with the pipeline thread
+explicitly traced, e.g. `perf trace` filtered to both tids, or an `ext4:`/`block:` tracepoint capture).
+
+Bridging Tier 0 → Tier 1: the isolated `fsync_prealloc_p99` of 45.5 µs and the 2.85 ms append-path tail
+are not in tension — the device queue serialises the entire background 64 MiB fill (+ barriers) ahead of
+a single foreground `fdatasync`, so the foreground call inherits the whole competing flush's latency
+rather than a small fraction of it.
 
 ## Decision
 
