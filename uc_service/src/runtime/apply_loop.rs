@@ -26,10 +26,28 @@ use uc_protocol::frames::apply::{
 };
 use uc_protocol::ring::RingError;
 use uc_protocol::ring::spsc::{SpscConsumer, SpscProducer};
+use uc_protocol::ring::SPIN_TRIES;
 
 use crate::StateMachine;
 
 const ERROR_BACKOFF: Duration = Duration::from_millis(10);
+
+/// Parse the `UC_APPLY_SPIN_BUDGET` value into a spin budget for the apply
+/// consumer. Pure (testable): `None`/unparseable -> default `SPIN_TRIES`;
+/// `busy`/`max` (case-insensitive) -> `u32::MAX` (pure busy-spin); `<N>` -> N.
+fn parse_spin_budget(v: Option<&str>) -> u32 {
+    match v {
+        Some(s) if s.trim().eq_ignore_ascii_case("busy") || s.trim().eq_ignore_ascii_case("max") => {
+            u32::MAX
+        }
+        Some(s) => s.trim().parse::<u32>().unwrap_or(SPIN_TRIES),
+        None => SPIN_TRIES,
+    }
+}
+
+fn apply_spin_budget() -> u32 {
+    parse_spin_budget(std::env::var("UC_APPLY_SPIN_BUDGET").ok().as_deref())
+}
 
 pub struct ApplyLoopHandle {
     pub join: JoinHandle<()>,
@@ -46,6 +64,13 @@ where
 {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_for_thread = Arc::clone(&stop);
+    let budget = apply_spin_budget();
+    consumer.set_spin_budget(budget);
+    if budget == u32::MAX {
+        tracing::info!("apply consumer: busy-spin mode (UC_APPLY_SPIN_BUDGET=busy)");
+    } else if budget != SPIN_TRIES {
+        tracing::info!(spin_budget = budget, "apply consumer: custom spin budget");
+    }
     let join = std::thread::Builder::new()
         .name("uc-service-apply".into())
         .spawn(move || {
@@ -136,5 +161,21 @@ fn publish_response(
             }
             Err(e) => panic!("apply_resp write at log_index={log_index}: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spin_budget_parsing() {
+        assert_eq!(parse_spin_budget(None), SPIN_TRIES);
+        assert_eq!(parse_spin_budget(Some("busy")), u32::MAX);
+        assert_eq!(parse_spin_budget(Some("BUSY")), u32::MAX);
+        assert_eq!(parse_spin_budget(Some("max")), u32::MAX);
+        assert_eq!(parse_spin_budget(Some(" 128 ")), 128);
+        assert_eq!(parse_spin_budget(Some("garbage")), SPIN_TRIES);
+        assert_eq!(parse_spin_budget(Some("0")), 0);
     }
 }
