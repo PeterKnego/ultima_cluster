@@ -82,6 +82,48 @@ async task/channel machinery), not network. Re-bucketing the ~1.88 ms floor by *
 The base 0.86 ms is consistent with task11's finding that the post-wakeup single-node floor is dominated
 by `commit_to_apply_enq` (~672 µs) — openraft's internal commit→apply handoff.
 
+## 3b. Replication sub-decomposition — it's openraft choreography, not the RPC (probe, 2026-06-25)
+
+The §3 cut showed ~0.52 ms of the replication bucket is *software*. To find whether that software is
+**UC's network code** (fixable: per-RPC `open_bi` stream, bincode) or **openraft's async core** (not
+fixable without a rewrite), a leader-side probe (`uc-bench-probes`, commit f88eb03) brackets the whole
+`append_entries` RPC on one clock — encode + pool/connect + send + wire×2 + follower recv/append/respond
++ decode — recording only RPCs that carry entries (heartbeats excluded). Self-timed inline, so no
+cross-process clock join. Fresh fleet, same regime (3× c6id.2xlarge NVMe, linger=0, inflight=1, rate=200);
+raw data `bench-out/floor-decomp/repl/`.
+
+| arm | leader-observed RPC round-trip (p50) | samples | note |
+|---|---:|---:|---|
+| 1node_eventual / 1node_consistent | — | **n=0** | control: no replication, probe silent ✓ |
+| 3node_eventual | **184 µs** (p99 469, min 93) | 16805 | the RPC, no follower fsync |
+| 3node_consistent | **222 µs** (p99 533, min 137) | 16806 | +38 µs vs eventual = follower NVMe fsync ✓ |
+
+Raw LAN ping this fleet: **118 µs min / 221 µs avg** round-trip. So the entire `append_entries` RPC
+(184 µs) is **wire-dominated** — UC's added software (codec + per-RPC stream open + follower append) is
+only **~tens of µs**. The +38 µs eventual→consistent delta matching a follower fsync is an independent
+check that the probe brackets the real round-trip.
+
+**The cut.** Of the ~0.70 ms replication bucket: the RPC round-trip is **0.184 ms (~26%)**, of which only
+~0.03 ms is UC software; the remaining **~0.52 ms (~74%) is openraft choreography** — the async gap
+*outside* the RPC: leader appends → RaftCore hands to ReplicationCore → RPC → ack → match-index update →
+commit-index advance → apply trigger, each a tokio task wakeup (~8.8 µs each, and there are many).
+
+**Decision (pre-registered in the probe scope):**
+- RPC-software ~0.03 ms (≪ the 0.3 ms bar) → **the QUIC stream-pooling / scatter-gather-codec "cheap win"
+  does not exist.** Killing per-RPC `open_bi` would save microseconds against a millisecond floor.
+- choreography ~0.52 ms (≫ 0.3 ms) → it is **openraft-core async**, not UC code. **Confirms the structural
+  verdict**: the replication software is the openraft duty-cycle itself.
+
+So the only levers that move the floor remain (a) openraft-internal — fewer core↔replication async hops /
+apply-commit pipelining (needs openraft changes, not a UC-side config), or (b) the co-location / duty-cycle
+rewrite. There is no cheap UC-network-layer win. Micro-optimizing the RPC path (stream reuse, leaner codec)
+is **not worth it**.
+
+> Caveat: the inflight=1 e2e p50 per arm was noisy on this fleet (single rung; 3node_consistent<3node_eventual
+> and a 1node_eventual rung inverted — sampling noise), so the replication-bucket value is taken from §2's
+> cleaner run (0.70 ms). The probe's RPC measurement (n≈17k, tight) is robust, and the conclusion holds for
+> any plausible bucket: 0.18 ms RPC is unambiguously a small fraction of a 0.5–0.9 ms replication cost.
+
 ## 4. So what — where this points
 
 - **NOT fsync-bound** (18%): the inline-fsync / SeqWatermark work (handoff-tax doc) is low-value at the
@@ -91,17 +133,24 @@ by `commit_to_apply_enq` (~672 µs) — openraft's internal commit→apply hando
 - **~73% is openraft-async + 3-process-IPC structure.** This is *why* every µs-scale micro-opt has been
   null: they nibble the 27%. To move the floor you must attack the structure.
 
-**Two levers, cheap-first:**
-1. **openraft-internal tuning (cheaper, do first).** The ~0.52 ms replication-software and the ~0.86 ms
-   base are both openraft-internal, not I/O. Probe: replication pipelining (`UC_PIPELINE_DEPTH`, task17),
-   apply batching, and the commit→apply duty-cycle. A targeted win here needs no rewrite. The 0.52 ms
-   replication-software (≈2.7× the wire RTT) is the most suspicious single number — start there.
-2. **Structural rewrite (expensive, gate on #1).** Co-locate node+service (drop the IPC hops) and/or
-   replace the openraft async duty-cycle with a polling model (Aeron-style). Rewrite-class; only justified
-   if #1 stalls and sub-ms latency / 2× throughput becomes a product goal.
+**Levers — and what the §3b probe ruled out.** The §3b probe shows the replication software is **openraft
+choreography (~0.52 ms), not UC's RPC code (~0.03 ms)**, so:
+- ❌ **UC network-layer micro-opt (ruled out).** QUIC stream pooling / scatter-gather codec saves ~tens of
+  µs — not worth it. (This was the candidate "cheap win"; the probe killed it.)
+- ⚠️ **openraft-internal (not a UC knob).** The 0.52 ms choreography + the 0.86 ms base (≈ task11's
+  `commit_to_apply_enq`) live in openraft's RaftCore↔ReplicationCore↔apply async loop. Reducing it means
+  *changing openraft* (fewer task hops, tighter commit→apply, batching) — an upstream/fork effort, not a
+  config. `UC_PIPELINE_DEPTH` (task17) already exists but only hides RTT under load, not the single-shot
+  choreography. So this is medium-hard, not the "cheap first" it looked like before the probe.
+- 🔨 **Structural rewrite.** Co-locate node+service (drop IPC hops) and/or replace the openraft async
+  duty-cycle with a polling model (Aeron-style). Rewrite-class; justified only if sub-ms latency / 2×
+  throughput becomes a product goal.
 
-If neither is pursued: the honest canonical verdict is **UC commit floor ≈ 1–2 ms, ~73% structural, and
-that is the design point** — stop filing µs-scale edges.
+**Bottom line: there is no cheap win left.** The floor is ~74% openraft-async + 3-proc-IPC structure
+(§3) and the replication slice specifically is openraft choreography (§3b), not anything UC can tune at
+the network or config layer. The honest canonical verdict is **UC commit floor ≈ 1–2 ms, ~73%
+structural, and that is the design point** — stop filing µs-scale edges; any real improvement is an
+openraft-core change or the co-location rewrite.
 
 ## 5. Reproduce
 
