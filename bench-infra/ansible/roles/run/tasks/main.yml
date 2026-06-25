@@ -80,8 +80,15 @@
 
 - block:
     - name: Start UC node
+      # single_node mode (floor-decomposition): only node0 runs, as a 1-node raft
+      # (peer set = just itself) so the e2e latency isolates the no-replication
+      # base+fsync layers. Default false = today's full N-node cluster.
+      when: (not (single_node | default(false) | bool)) or node_role == "node0"
       ansible.builtin.shell: |
         . {{ remote_home }}/uc-peers.env
+        {% if single_node | default(false) | bool %}
+        export UC_PEERS="--peer $UC_NODE_ID@$UC_LISTEN"
+        {% endif %}
         export UC_DURABILITY={{ 'eventual' if durability == 'none' else 'consistent' }}
         export UC_TRANSPORT={{ transport }}
         export UC_PIPELINE_DEPTH={{ uc_pipeline_depth }}
@@ -119,6 +126,7 @@
         {{ payload_bytes }} {{ inflight }} {{ measure_seconds }}
         {{ warmup_seconds }}
         {{ remote_home }}/results/uc_sweep.csv
+        {{ uc_sweep_config | default((1 if (single_node | default(false) | bool) else 3) | string + 'node_' + ('eventual' if durability == 'none' else 'consistent')) }}
       when: node_role == "node0"
       changed_when: true
 
