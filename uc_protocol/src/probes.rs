@@ -34,6 +34,8 @@ mod imp {
     pub fn stamp_log(_log_index: u64, _cp: Checkpoint) {}
     #[inline(always)]
     pub fn bridge(_client_id: u32, _local_seq: u32, _log_index: u64) {}
+    #[inline(always)]
+    pub fn record_repl_rpc_ns(_ns: u64) {}
 }
 
 #[cfg(feature = "uc-bench-probes")]
@@ -54,6 +56,11 @@ mod imp {
         log_rows: Mutex<HashMap<u64, Row>>,
         /// client-key -> log_index, recorded at the dispatcher once both are known.
         bridge: Mutex<HashMap<u64, u64>>,
+        /// Leader-observed append_entries round-trip durations (ns). Recorded
+        /// inline by the network layer (each RPC self-times), so this needs no
+        /// cross-process clock join — unlike the keyed rows above. Only the
+        /// leader populates it; empty heartbeats are excluded by the caller.
+        repl_rpc: Mutex<Vec<u64>>,
     }
 
     static SINK: OnceLock<Sink> = OnceLock::new();
@@ -64,6 +71,7 @@ mod imp {
             client_rows: Mutex::new(HashMap::new()),
             log_rows: Mutex::new(HashMap::new()),
             bridge: Mutex::new(HashMap::new()),
+            repl_rpc: Mutex::new(Vec::new()),
         })
     }
 
@@ -100,12 +108,23 @@ mod imp {
             .insert(client_key(client_id, local_seq), log_index);
     }
 
+    /// Record one leader-observed append_entries round-trip (ns).
+    pub fn record_repl_rpc_ns(ns: u64) {
+        sink().repl_rpc.lock().push(ns);
+    }
+
+    /// Drain the recorded replication-RPC round-trip samples (ns).
+    pub fn drain_repl_rpc() -> Vec<u64> {
+        std::mem::take(&mut *sink().repl_rpc.lock())
+    }
+
     /// Clear all captured stamps. Call before a measured run.
     pub fn reset() {
         let s = sink();
         s.client_rows.lock().clear();
         s.log_rows.lock().clear();
         s.bridge.lock().clear();
+        s.repl_rpc.lock().clear();
     }
 
     /// Drain and join client-keyed + log-keyed rows into one row per request.
@@ -158,10 +177,10 @@ mod imp {
     }
 }
 
-pub use imp::{bridge, stamp_client, stamp_log};
+pub use imp::{bridge, record_repl_rpc_ns, stamp_client, stamp_log};
 
 #[cfg(feature = "uc-bench-probes")]
-pub use imp::{drain_joined, reset, stage_deltas};
+pub use imp::{drain_joined, drain_repl_rpc, reset, stage_deltas};
 
 #[cfg(all(test, feature = "uc-bench-probes"))]
 mod tests {
@@ -219,5 +238,21 @@ mod tests {
         stamp_client(9, 1, Checkpoint::ClientRecv);
         // No bridge, no log row.
         assert!(drain_joined().is_empty());
+    }
+
+    #[test]
+    fn repl_rpc_samples_record_and_drain() {
+        let _serial = SINK_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        // Leader-observed append_entries round-trips (ns), recorded inline by the
+        // network layer so each RPC self-times (no cross-process clock join).
+        record_repl_rpc_ns(190_000);
+        record_repl_rpc_ns(210_000);
+        record_repl_rpc_ns(200_000);
+        let mut got = drain_repl_rpc();
+        got.sort_unstable();
+        assert_eq!(got, vec![190_000, 200_000, 210_000]);
+        // drain is destructive: a second drain is empty.
+        assert!(drain_repl_rpc().is_empty());
     }
 }

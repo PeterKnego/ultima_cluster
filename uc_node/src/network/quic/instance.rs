@@ -180,6 +180,12 @@ impl RaftNetwork<TypeConfig> for QuicRaftNetwork {
         {
             return Err(rpc_err(NetworkError::Disconnected));
         }
+        // Leader-observed replication-RPC timing (floor-decomposition probe): bracket
+        // the whole RPC (encode + connect + send + wire×2 + follower processing +
+        // decode) on a single clock. Exclude empty heartbeats so only real
+        // replication round-trips are sampled. No-op without `uc-bench-probes`.
+        let has_entries = !rpc.entries.is_empty();
+        let rpc_start = std::time::Instant::now();
         let body = codec::encode_append_entries_req(&rpc).map_err(rpc_err)?;
         let timeout = option.hard_ttl();
         let conn = self.get_or_connect().await.map_err(rpc_err)?;
@@ -192,7 +198,13 @@ impl RaftNetwork<TypeConfig> for QuicRaftNetwork {
             )
             .await
         {
-            Ok(resp_body) => codec::decode_append_entries_resp(&resp_body).map_err(rpc_err),
+            Ok(resp_body) => {
+                let resp = codec::decode_append_entries_resp(&resp_body).map_err(rpc_err)?;
+                if has_entries {
+                    uc_protocol::probes::record_repl_rpc_ns(rpc_start.elapsed().as_nanos() as u64);
+                }
+                Ok(resp)
+            }
             Err(e) => {
                 self.evict(&conn).await;
                 Err(rpc_err(e))

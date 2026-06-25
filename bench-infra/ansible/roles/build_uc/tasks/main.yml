@@ -31,8 +31,11 @@
   when: uc_src_mode == "git"
 
 - name: Build uc_autobench release bins
+  # uc_bench_probes=true compiles in the latency probe sink (incl. the leader
+  # replication-RPC timing); default off so normal latency benches aren't perturbed.
   ansible.builtin.command: >
     {{ remote_home }}/.cargo/bin/cargo build --release
+    {{ '--features uc-bench-probes' if (uc_bench_probes | default(false) | bool) else '' }}
     -p uc_autobench --bin uc-node-launch --bin commit-path-load --bin internode-rpc-bench
   args:
     chdir: "{{ uc_src_dir }}"

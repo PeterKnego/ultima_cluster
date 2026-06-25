@@ -24,6 +24,11 @@ uc_node_bridge_spin_budget: "0"     # node submit+apply_resp NotifyBridge spin b
 # (no replication) so 1node vs 3node and eventual vs consistent deltas attribute the commit floor
 # into {base consensus+IPC, fsync, replication}. CSV config label auto-derives ('<n>node_<dura>').
 single_node: false
+# Compile the uc-bench-probes sink into the UC bins (incl. leader replication-RPC
+# timing). -e uc_bench_probes=true for the replication-overhead probe; off by default
+# so normal latency benches aren't perturbed. NOTE: changing it requires a rebuild
+# (re-run `make up-uc` / the build_uc role), not just a new bench.yml run.
+uc_bench_probes: false
 
 # --- Build sources ---
 aeron_benchmarks_repo: "https://github.com/aeron-io/benchmarks.git"

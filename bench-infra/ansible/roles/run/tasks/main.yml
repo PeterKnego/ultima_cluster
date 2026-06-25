@@ -130,6 +130,15 @@
       when: node_role == "node0"
       changed_when: true
 
+    - name: Capture leader replication-RPC probe stats (uc_bench_probes only)
+      # The leader emits cumulative REPL_RPC_STATS to uc-node.out every 3s; grab
+      # the last line into results/ so collect pulls it. node0 is the bootstrap leader.
+      ansible.builtin.shell: >
+        grep 'REPL_RPC_STATS' {{ remote_home }}/uc-node.out | tail -1
+        > {{ remote_home }}/results/repl_rpc.txt || true
+      changed_when: false
+      when: node_role == "node0" and (uc_bench_probes | default(false) | bool)
+
     - name: Stop UC JVMs/procs
       ansible.builtin.shell: "pkill -9 -f '[u]c-node-launch' || true; pkill -9 -f '[k]v_service' || true"
       changed_when: false
