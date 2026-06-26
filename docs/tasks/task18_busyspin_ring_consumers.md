@@ -1,9 +1,9 @@
 # Task 18 — Busy-spin intra-host ring consumers (O1 prototypes)
 
 **Date:** 2026-06-21.
-**Status:** Two prototypes built, reviewed, env-gated default-off. NOT merged to main (kept on
-branch `prototype/o1-busyspin-apply-consumer`, 13 commits). Local microbenches confirm the
-mechanism + regime; the headline throughput-ceiling payoff was measured on an AWS NVMe fleet
+**Status:** Two prototypes built, reviewed, env-gated default-off. **MERGED to main 2026-06-26**
+(no-ff merge `d641a6b`, from branch `prototype/o1-busyspin-apply-consumer`). Local microbenches confirm
+the mechanism + regime; the headline throughput-ceiling payoff was measured on an AWS NVMe fleet
 (2026-06-21) and is **NULL end-to-end** (§4a). A follow-on floor decomposition + replication probe
 (§7, 2026-06-25) explains why and closes the whole µs-optimization thread: the ~1–2 ms commit floor is
 **~73% structural** (openraft async + 3-proc IPC), so there is no cheap win — keep default-off.
