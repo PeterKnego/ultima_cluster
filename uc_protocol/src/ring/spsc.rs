@@ -27,10 +27,10 @@ use std::sync::atomic::Ordering;
 use memmap2::MmapMut;
 
 use crate::ring::common::{
-    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, PARK_CEIL, ParkMode, RING_HEADER_LEN,
-    RecordHeader, RingError, RingHeader, RingWaitHandle, SPIN_TRIES, align_record_size,
-    init_ring_header, try_read_record_at, validate_ring_header, write_padding_marker_at,
-    write_record_at,
+    BUSY_SPIN_CHUNK, FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, PARK_CEIL, ParkMode,
+    RING_HEADER_LEN, RecordHeader, RingError, RingHeader, RingWaitHandle, SPIN_TRIES,
+    align_record_size, init_ring_header, try_read_record_at, validate_ring_header,
+    write_padding_marker_at, write_record_at,
 };
 
 /// Shared inner state — owns the mmap and exposes the header + slot region.
@@ -101,6 +101,9 @@ pub struct SpscConsumer {
     inner: Arc<SpscInner>,
     /// Wakeup mechanism; must match the producer's `mode` (see `SpscProducer::mode`).
     pub mode: ParkMode,
+    /// Spin tries before parking on an empty ring. `SPIN_TRIES` by default;
+    /// `u32::MAX` = busy-spin sentinel (never park). Set via `set_spin_budget`.
+    spin_budget: u32,
 }
 
 impl SpscProducer {
@@ -204,18 +207,35 @@ impl SpscConsumer {
         RingWaitHandle::new(self.inner.clone(), self.inner.header(), self.mode)
     }
 
-    /// Blocking read: returns a record, or `Ok(None)` only after parking up to
-    /// `PARK_CEIL` with nothing available. Arm-then-recheck closes the
-    /// lost-wakeup race: we snapshot the wakeup word, register as a waiter,
-    /// re-check the ring, and only then park on the snapshot — if the producer
-    /// published in between, `publish_position != seq` and the futex returns
-    /// immediately. For SYNC (std::thread) consumers only.
+    /// Override the spin-before-park budget. `u32::MAX` selects pure busy-spin:
+    /// the consumer never parks; it polls in `BUSY_SPIN_CHUNK`-sized bursts and
+    /// returns `Ok(None)` between them so the caller can re-check its own stop
+    /// condition. Default is `SPIN_TRIES`.
+    pub fn set_spin_budget(&mut self, budget: u32) {
+        self.spin_budget = budget;
+    }
+
+    /// Blocking read: returns a record, or `Ok(None)` after exhausting the spin
+    /// budget (then parking up to `PARK_CEIL`, unless in busy mode). Arm-then-
+    /// recheck closes the lost-wakeup race on the parking path. SYNC consumers only.
     pub fn read_or_park(
         &mut self,
         payload_buf: &mut Vec<u8>,
     ) -> Result<Option<RecordHeader>, RingError> {
+        // Busy mode (sentinel): poll in a bounded chunk, never park. Returning
+        // Ok(None) between chunks lets the caller re-check its stop flag, so
+        // shutdown stays prompt without ever entering FUTEX_WAIT.
+        if self.spin_budget == u32::MAX {
+            for _ in 0..BUSY_SPIN_CHUNK {
+                if let Some(rec) = self.try_read(payload_buf)? {
+                    return Ok(Some(rec));
+                }
+                std::hint::spin_loop();
+            }
+            return Ok(None);
+        }
         // Spin-then-park: catch an in-flight publish without a syscall first.
-        for _ in 0..SPIN_TRIES {
+        for _ in 0..self.spin_budget {
             if let Some(rec) = self.try_read(payload_buf)? {
                 return Ok(Some(rec));
             }
@@ -361,6 +381,7 @@ impl SpscRing {
             SpscConsumer {
                 inner: self.inner,
                 mode: ParkMode::default(),
+                spin_budget: SPIN_TRIES,
             },
         )
     }
@@ -588,5 +609,54 @@ mod tests {
         let r = consumer.read_or_park(&mut buf).expect("read");
         assert!(r.is_none());
         assert!(start.elapsed() >= PARK_CEIL); // parked the full backstop with no producer
+    }
+
+    #[test]
+    fn busy_mode_empty_returns_without_parking() {
+        use std::time::Instant;
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = SpscRing::create(tmp.path(), 4096, 1024).expect("create");
+        let (_producer, mut consumer) = ring.into_split();
+        consumer.set_spin_budget(u32::MAX);
+        let mut buf = Vec::new();
+        let start = Instant::now();
+        let rec = consumer.read_or_park(&mut buf).expect("read");
+        let elapsed = start.elapsed();
+        assert!(rec.is_none());
+        // Busy mode must NOT have parked up to PARK_CEIL (2ms); a chunk is sub-ms.
+        assert!(elapsed < PARK_CEIL, "busy mode appears to have parked: {elapsed:?}");
+    }
+
+    #[test]
+    fn busy_mode_reads_published_record() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = SpscRing::create(tmp.path(), 4096, 1024).expect("create");
+        let (mut producer, mut consumer) = ring.into_split();
+        consumer.set_spin_budget(u32::MAX);
+        producer.try_write(7, 0, [0; 8], b"hi").expect("write");
+        let mut buf = Vec::new();
+        let rec = consumer.read_or_park(&mut buf).expect("read").expect("some");
+        assert_eq!(rec.msg_type, 7);
+        assert_eq!(&buf[..], b"hi");
+    }
+
+    #[test]
+    fn finite_budget_reads_and_returns_empty() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = SpscRing::create(tmp.path(), 4096, 1024).expect("create");
+        let (mut producer, mut consumer) = ring.into_split();
+        consumer.set_spin_budget(4); // small finite window, then park
+        let mut buf = Vec::new();
+        // empty -> parks up to PARK_CEIL, returns None
+        let start = std::time::Instant::now();
+        assert!(consumer.read_or_park(&mut buf).expect("read").is_none());
+        assert!(
+            start.elapsed() >= PARK_CEIL,
+            "finite budget should have parked"
+        );
+        // published -> read returns it
+        producer.try_write(9, 0, [0; 8], b"x").expect("write");
+        let rec = consumer.read_or_park(&mut buf).expect("read").expect("some");
+        assert_eq!(rec.msg_type, 9);
     }
 }

@@ -60,7 +60,11 @@ where
     let join = tokio::spawn(async move {
         let mut consumer = submit_consumer;
         let submit_bridge =
-            crate::ipc::ring_bridge::NotifyBridge::spawn(consumer.wait_handle(), "submit");
+            crate::ipc::ring_bridge::NotifyBridge::spawn(
+                consumer.wait_handle(),
+                "submit",
+                crate::ipc::ring_bridge::bridge_spin_budget(),
+            );
         let mut payload_buf: Vec<u8> = Vec::with_capacity(4096);
         while !stop_for_task.load(Ordering::Relaxed) {
             match consumer.try_read(&mut payload_buf) {

@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::ipc::ring_bridge::NotifyBridge;
+use crate::ipc::ring_bridge::{NotifyBridge, bridge_spin_budget};
 use uc_protocol::cnc::ServiceStatus;
 
 use bytes::Bytes;
@@ -441,10 +441,11 @@ impl<S: StateMachine> ShmemAdaptedStateMachine<S> {
 
         // Build the apply_resp bridge BEFORE moving the consumer into ShmemInner.
         let apply_resp_bridge =
-            NotifyBridge::spawn(apply_resp_consumer.wait_handle(), "apply_resp");
+            NotifyBridge::spawn(apply_resp_consumer.wait_handle(), "apply_resp", bridge_spin_budget());
         // Build the snapshot_resp bridge BEFORE moving the consumer into ShmemInner.
+        // snapshot_resp is NOT on the hot path — always park (budget 0).
         let snapshot_resp_bridge =
-            NotifyBridge::spawn(snapshot_resp_consumer.wait_handle(), "snapshot_resp");
+            NotifyBridge::spawn(snapshot_resp_consumer.wait_handle(), "snapshot_resp", 0);
 
         let last_seen_epoch = epoch_of(service_status_ptr);
         Ok(Self {

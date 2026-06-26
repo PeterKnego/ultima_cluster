@@ -251,6 +251,36 @@ async fn main() -> anyhow::Result<()> {
         instance_dir.display()
     );
 
+    // Floor-decomposition probe (uc-bench-probes only): the leader records every
+    // append_entries round-trip it observes (network/quic/instance.rs). Drain it
+    // periodically into a cumulative accumulator and emit p50/p99/count so the
+    // last line before `pkill -9` teardown carries the whole-run aggregate. Only
+    // the leader produces samples; 1-node arms emit n=0 (no replication).
+    #[cfg(feature = "uc-bench-probes")]
+    tokio::spawn(async move {
+        let mut acc: Vec<u64> = Vec::new();
+        let mut ticker = tokio::time::interval(Duration::from_secs(3));
+        loop {
+            ticker.tick().await;
+            acc.extend(uc_protocol::probes::drain_repl_rpc());
+            if acc.is_empty() {
+                eprintln!("REPL_RPC_STATS n=0");
+                continue;
+            }
+            let mut s = acc.clone();
+            s.sort_unstable();
+            let pct = |p: f64| s[((s.len() as f64 * p) as usize).min(s.len() - 1)];
+            eprintln!(
+                "REPL_RPC_STATS n={} p50_ns={} p99_ns={} min_ns={} max_ns={}",
+                s.len(),
+                pct(0.50),
+                pct(0.99),
+                s[0],
+                s[s.len() - 1],
+            );
+        }
+    });
+
     // Run until Ctrl-C, then shut down service first, then node (the node's
     // _instance still holds the cnc mmap; node.shutdown joins the heartbeat
     // ticker before dropping it).

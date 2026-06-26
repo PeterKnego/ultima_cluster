@@ -16,6 +16,19 @@ idle_strategy: busyspin
 uc_pipeline_depth: 8            # pipeline depth threaded to UC nodes via UC_PIPELINE_DEPTH; override with -e uc_pipeline_depth=1
 uc_journal_prealloc: 1          # journal segment preallocation (task36) via UC_JOURNAL_PREALLOC; default ON post-promotion, override -e uc_journal_prealloc=0 to roll back / for the A arm
 uc_api_batch_linger_ms: 5       # openraft api_batch_linger_ms via UC_API_BATCH_LINGER_MS; override -e uc_api_batch_linger_ms=0 for low-latency (A/B)
+# Task18 busy-spin intra-host ring consumers (O1, default-off — reproduces today's behavior when unset).
+# A/B: A arm = defaults below; B arm = -e uc_apply_spin_budget=busy uc_node_bridge_spin_budget=busy
+uc_apply_spin_budget: "64"          # service apply consumer SpscConsumer spin budget; 'busy'/'max' = pure busy-spin
+uc_node_bridge_spin_budget: "0"     # node submit+apply_resp NotifyBridge spin budget; 'busy'/'max' = busy parker
+# Floor-decomposition (layered e2e-delta): -e single_node=true runs only node0 as a 1-node raft
+# (no replication) so 1node vs 3node and eventual vs consistent deltas attribute the commit floor
+# into {base consensus+IPC, fsync, replication}. CSV config label auto-derives ('<n>node_<dura>').
+single_node: false
+# Compile the uc-bench-probes sink into the UC bins (incl. leader replication-RPC
+# timing). -e uc_bench_probes=true for the replication-overhead probe; off by default
+# so normal latency benches aren't perturbed. NOTE: changing it requires a rebuild
+# (re-run `make up-uc` / the build_uc role), not just a new bench.yml run.
+uc_bench_probes: false
 
 # --- Build sources ---
 aeron_benchmarks_repo: "https://github.com/aeron-io/benchmarks.git"

@@ -2611,6 +2611,7 @@ dependencies = [
  "bincode",
  "crc32fast",
  "dashmap",
+ "parking_lot",
  "serde",
  "thiserror",
 ]

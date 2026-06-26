@@ -80,13 +80,22 @@
 
 - block:
     - name: Start UC node
+      # single_node mode (floor-decomposition): only node0 runs, as a 1-node raft
+      # (peer set = just itself) so the e2e latency isolates the no-replication
+      # base+fsync layers. Default false = today's full N-node cluster.
+      when: (not (single_node | default(false) | bool)) or node_role == "node0"
       ansible.builtin.shell: |
         . {{ remote_home }}/uc-peers.env
+        {% if single_node | default(false) | bool %}
+        export UC_PEERS="--peer $UC_NODE_ID@$UC_LISTEN"
+        {% endif %}
         export UC_DURABILITY={{ 'eventual' if durability == 'none' else 'consistent' }}
         export UC_TRANSPORT={{ transport }}
         export UC_PIPELINE_DEPTH={{ uc_pipeline_depth }}
         export UC_JOURNAL_PREALLOC={{ uc_journal_prealloc }}
         export UC_API_BATCH_LINGER_MS={{ uc_api_batch_linger_ms }}
+        export UC_APPLY_SPIN_BUDGET={{ uc_apply_spin_budget }}
+        export UC_NODE_BRIDGE_SPIN_BUDGET={{ uc_node_bridge_spin_budget }}
         setsid {{ uc_target_bin }}/uc-node-launch \
           --node-id $UC_NODE_ID --listen $UC_LISTEN $UC_PEERS \
           --app-id $UC_APP_ID --with-service \
@@ -117,8 +126,18 @@
         {{ payload_bytes }} {{ inflight }} {{ measure_seconds }}
         {{ warmup_seconds }}
         {{ remote_home }}/results/uc_sweep.csv
+        {{ uc_sweep_config | default((1 if (single_node | default(false) | bool) else 3) | string + 'node_' + ('eventual' if durability == 'none' else 'consistent')) }}
       when: node_role == "node0"
       changed_when: true
+
+    - name: Capture leader replication-RPC probe stats (uc_bench_probes only)
+      # The leader emits cumulative REPL_RPC_STATS to uc-node.out every 3s; grab
+      # the last line into results/ so collect pulls it. node0 is the bootstrap leader.
+      ansible.builtin.shell: >
+        grep 'REPL_RPC_STATS' {{ remote_home }}/uc-node.out | tail -1
+        > {{ remote_home }}/results/repl_rpc.txt || true
+      changed_when: false
+      when: node_role == "node0" and (uc_bench_probes | default(false) | bool)
 
     - name: Stop UC JVMs/procs
       ansible.builtin.shell: "pkill -9 -f '[u]c-node-launch' || true; pkill -9 -f '[k]v_service' || true"

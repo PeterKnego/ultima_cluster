@@ -1,10 +1,61 @@
 ---
 - name: Install tuning tools
   ansible.builtin.apt:
-    name: [linux-tools-common, util-linux, tuned]
+    name: [linux-tools-common, util-linux, tuned, e2fsprogs]
     update_cache: true
     state: present
   failed_when: false   # linux-tools-common naming varies; non-fatal
+
+# --- Local NVMe instance store ---------------------------------------------
+# On NVMe-bearing instance types (e.g. AWS c6id) the ephemeral instance-store
+# device carries the model string "Instance Storage". Mount it at remote_home
+# BEFORE any role writes there, so the UC journal (--data-dir) and the Aeron
+# cluster.dir/archive.dir (both under remote_home) land on local NVMe — a fair
+# on-NVMe comparison with zero path/template changes. No-op (and harmless) on
+# EBS-only / Hetzner hosts where no instance-store device exists.
+- name: Detect local instance-store NVMe device
+  ansible.builtin.shell: |
+    set -e
+    for d in /sys/block/nvme*; do
+      [ -e "$d/device/model" ] || continue
+      if grep -qi 'Instance Storage' "$d/device/model"; then
+        dev="/dev/$(basename "$d")"
+        # whole-device, currently unmounted (skip if any partition is mounted)
+        if [ -z "$(lsblk -nro MOUNTPOINT "$dev" | tr -d '[:space:]')" ]; then
+          echo "$dev"; exit 0
+        fi
+      fi
+    done
+    exit 0   # none found → empty stdout
+  register: nvme_detect
+  changed_when: false
+
+- name: Mount the instance-store NVMe at remote_home
+  when: nvme_detect.stdout | trim | length > 0
+  block:
+    - name: Ensure mount point exists
+      ansible.builtin.file:
+        path: "{{ remote_home }}"
+        state: directory
+        mode: "0755"
+
+    - name: Format ext4 + mount (idempotent — skips if already mounted)
+      ansible.builtin.shell: |
+        set -e
+        DEV="{{ nvme_detect.stdout | trim }}"
+        if mountpoint -q "{{ remote_home }}"; then
+          echo "already-mounted"; exit 0
+        fi
+        mkfs.ext4 -F -q "$DEV"
+        mount -o noatime "$DEV" "{{ remote_home }}"
+        echo "mounted $DEV at {{ remote_home }}"
+      register: nvme_mount
+      changed_when: "'mounted ' in nvme_mount.stdout"
+
+    - name: Report NVMe mount status
+      ansible.builtin.debug:
+        msg: "instance-store NVMe: {{ nvme_mount.stdout | trim }}"
+# ---------------------------------------------------------------------------
 
 - name: Set CPU governor to performance
   ansible.builtin.shell: |
