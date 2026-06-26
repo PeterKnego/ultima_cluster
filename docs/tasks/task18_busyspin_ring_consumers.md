@@ -4,7 +4,9 @@
 **Status:** Two prototypes built, reviewed, env-gated default-off. NOT merged to main (kept on
 branch `prototype/o1-busyspin-apply-consumer`, 13 commits). Local microbenches confirm the
 mechanism + regime; the headline throughput-ceiling payoff was measured on an AWS NVMe fleet
-(2026-06-21) and is **NULL end-to-end** (§4a) — keep default-off.
+(2026-06-21) and is **NULL end-to-end** (§4a). A follow-on floor decomposition + replication probe
+(§7, 2026-06-25) explains why and closes the whole µs-optimization thread: the ~1–2 ms commit floor is
+**~73% structural** (openraft async + 3-proc IPC), so there is no cheap win — keep default-off.
 **Branch:** `prototype/o1-busyspin-apply-consumer`.
 
 **Provenance / scaffolding.** Originates from opportunity **O1** in the Aeron-vs-UC threading/copying
@@ -203,3 +205,46 @@ Both default-off; rollback = unset the env var. snapshot_resp always uses `0` re
   or co-locate node+service so the node-side hop loses its second wakeup too. Rewrite-class; weigh only
   if a sub-ms latency floor becomes a product goal (and recall Raft replication RTT is the wall after
   that).
+
+---
+
+## 7. Closing verdict — the floor is structural; the µs hunt is over (2026-06-25)
+
+O1's null fleet result (§4a) raised the obvious question: if removing intra-host wakeups does nothing,
+**what is the ~1–2 ms commit floor actually made of?** That was settled by a follow-on decomposition
+(full record: `docs/benchmarks/floor-decomposition-2026-06-25.md`), which closes not just O1 but the
+whole µs-scale optimization thread (O1 busy-spin, task17 Phase B busy-poll, journal prealloc, fdatasync —
+all NULL e2e for the same reason).
+
+**Floor decomposition** (AWS 3× `c6id` NVMe, linger=0, inflight=1, layered e2e-delta over
+{1,3}node × {eventual,consistent}; cross-check additive within 0.7%):
+
+| bucket | p50 | % of the ~1.88 ms floor | nature |
+|---|---:|---:|---|
+| base — IPC rings + openraft commit→apply + apply | 0.86 ms | 46% | software |
+| replication — leader→majority | 0.70 ms | 37% | mostly software |
+| fsync — local NVMe journal | 0.33 ms | 18% | physical I/O |
+
+Raw LAN RTT is only ~0.19 ms, so re-cut by *nature*: **~73% software/structural** (openraft async +
+3-proc IPC + replication pipeline), **~27% physical** (fsync 18% + wire 10%).
+
+**Replication sub-probe** (leader-side `append_entries` round-trip timing, this branch's
+`uc-bench-probes` addition): the RPC is **p50 184 µs**, wire-dominated — UC's own network software is
+~tens of µs. So of the 0.70 ms replication bucket, the RPC is ~0.18 ms (~26%) and **~0.52 ms (~74%) is
+openraft async choreography** (RaftCore↔ReplicationCore↔apply task hops *outside* the RPC). A QUIC
+stream-pooling / leaner-codec optimization would save microseconds — it is **not worth it**.
+
+**The verdict:**
+1. **Every µs-scale micro-opt was correctly null** — busy-spin (this task), busy-poll, journal prealloc,
+   fdatasync all nibble the ~27% physical slice while ~73% of the floor is openraft-async + IPC structure.
+2. **There is no cheap win left.** Not fsync (18%), not wire (10%), not UC's RPC code (~0.03 ms). The cost
+   is the openraft duty-cycle and the 3-process split themselves.
+3. **The only levers that move the floor** are (a) openraft-internal changes — fewer core↔replication↔apply
+   async hops (a fork/upstream effort, not a UC config; `UC_PIPELINE_DEPTH` only hides RTT under load), or
+   (b) the co-location / polling rewrite (§6, rewrite-class). Both are product-level decisions.
+4. **Canonical design point:** UC's commit floor is **≈ 1–2 ms, ~73% structural**, and that is by design
+   for a 3-process SMR server on openraft. The busy-spin prototypes stay **env-gated, default-off**; keep
+   them as scaffolding for the architectural path, not as a shipped optimization.
+
+This is the end of the latency-floor investigation that began with the Aeron-vs-UC parity work: the gap
+is structural, it is now quantified, and chasing it further requires changing the structure.
