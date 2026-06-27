@@ -20,6 +20,7 @@ openraft-legacy = { workspace = true }
 ultima-journal = { workspace = true }
 uc_protocol = { path = "../uc_protocol" }
 uc_service = { path = "../uc_service" }
+uc-rt-busyspin = { path = "../uc-rt-busyspin", optional = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
@@ -49,6 +50,11 @@ uc-lincheck = { path = "../uc-lincheck" }
 
 [features]
 test-helpers = []
+# Experimental: run openraft's internal tasks on the busy-spin AsyncRuntime
+# (crate `uc-rt-busyspin`) instead of tokio. Single-node only for now (multi-node
+# needs the quinn tokio-reactor boundary resolved). Default off.
+#   cargo test -p uc_node --features busyspin-runtime --test m1_single_node
+busyspin-runtime = ["dep:uc-rt-busyspin"]
 # Reusable in-process node+service+client fixtures (see src/test_support.rs).
 # Used by uc_node's own M4 integration tests and by the uc_autobench shmem-e2e binary.
 test-support = ["dep:uc_client", "dep:tempfile", "dep:anyhow"]

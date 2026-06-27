@@ -1,0 +1,20 @@
+[package]
+name = "uc-rt-busyspin"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Busy-spin (never-park) AsyncRuntime backend for openraft, for ultima_cluster"
+
+[lib]
+name = "uc_rt_busyspin"
+path = "src/lib.rs"
+
+[dependencies]
+# The openraft runtime-abstraction crate (Send / default mode — NOT single-threaded)
+# and its tokio backend, reused only for the runtime-agnostic channel/sync types.
+# Path-deps resolve to the SAME packages as uc_node's openraft pin, so the
+# `Mpsc`/`Watch`/`Oneshot`/`Mutex` trait impls unify across the workspace.
+openraft-rt = { path = "../../openraft/rt" }
+openraft-rt-tokio = { path = "../../openraft/rt-tokio" }
+rand = "0.10"

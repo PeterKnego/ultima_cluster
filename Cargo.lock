@@ -2494,6 +2494,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "uc-rt-busyspin"
+version = "0.1.0"
+dependencies = [
+ "openraft-rt",
+ "openraft-rt-tokio",
+ "rand 0.10.1",
+]
+
+[[package]]
 name = "uc_autobench"
 version = "0.1.0"
 dependencies = [
@@ -2562,6 +2571,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uc-lincheck",
+ "uc-rt-busyspin",
  "uc_client",
  "uc_node",
  "uc_protocol",
