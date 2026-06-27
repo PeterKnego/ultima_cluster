@@ -18,3 +18,7 @@ path = "src/lib.rs"
 openraft-rt = { path = "../../openraft/rt" }
 openraft-rt-tokio = { path = "../../openraft/rt-tokio" }
 rand = "0.10"
+# Only for `runtime::Handle` capture/enter: the busy-spin workers enter the
+# application's ambient tokio runtime so reactor-bound I/O (quinn, tokio timers)
+# triggered by openraft on a worker finds a driver. No runtime is built here.
+tokio = { version = "1", features = ["rt"] }

@@ -64,7 +64,7 @@ the win.
 | openraft `AsyncRuntime` conformance `Suite::<UcBusySpinRuntime>::test_all()` | ✅ green |
 | `uc_node` compiles with `AsyncRuntime = UcBusySpinRuntime` (1-line swap) | ✅ |
 | Single-node M1 boot + commit + restart (`m1_single_node`, both tests) | ✅ green on busy-spin |
-| Multi-node (`m2_multi_node`) | ❌ panics at the I/O boundary (below) |
+| Multi-node (`m2_multi_node`) | ✅ **with the hybrid reactor** (below) — election, replication, failover all green on busy-spin |
 
 ### The boundary (the only blocker, and it's expected)
 
@@ -86,12 +86,41 @@ both still open:
    polls a reactor-bound future. The physical 27% (wire RTT + fsync) lives there
    anyway, so a futex hop on that boundary is harmless.
 
+## Hybrid reactor — multi-node now works (2026-06-27, follow-up)
+
+The boundary above is resolved by **resolution 1**: the busy-spin workers enter
+the application's *own* ambient tokio runtime. `executor::capture_reactor()`
+grabs `Handle::try_current()` at openraft's first `spawn` (which runs inside
+`Raft::new`, i.e. within UC's runtime), and each worker lazily `Handle::enter()`s
+it for its lifetime. Entering UC's *own* runtime (not a separate reactor) keeps
+quinn's socket ownership consistent — the endpoint is created on that same
+runtime. quinn's I/O, its internal `tokio::spawn` connection drivers, and tokio
+timers then all find a driver; the busy-poll loop re-polls regardless of wakers.
+
+Result: real 3-node consensus runs on the busy-spin executor —
+`three_node_cluster_elects_leader`, `three_node_replication` (writes replicated
+over quinn), and `leader_failover` all pass (each in a fresh process).
+
+### Known skeleton limitation: process-global pool + no task cancellation
+
+The executor is a **process-global** singleton and does not cancel a node's tasks
+on shutdown. The in-process multi-node test suite boots many nodes (3 per test ×
+several tests) into the *one* shared pool, and shut-down nodes' tasks may keep
+spinning, accumulating until the single worker starves → the *full* `m2` suite
+hangs. Each test **passes in isolation / a fresh process**. Production is one node
+per process, so this never arises there. The clean fixes (next-step work) are a
+**per-node executor** (not a global singleton) and/or **task cancellation on
+`Raft` drop**. Also note: busy-spin workers peg cores; on the 4-core CI box even
+two workers starve tokio's I/O thread, so the default is **one** worker
+(`UC_BUSYSPIN_WORKERS` to override; wants dedicated/pinned cores).
+
 ## How to run
 
 ```bash
 cargo test -p uc-rt-busyspin                                              # conformance Suite
 cargo test -p uc_node --features busyspin-runtime --test m1_single_node   # single-node boot on busy-spin
-UC_BUSYSPIN_WORKERS=4 cargo test -p uc_node --features busyspin-runtime --test m1_single_node
+# multi-node: run one test per process (global-pool limitation, see above)
+cargo test -p uc_node --features busyspin-runtime --test m2_multi_node three_node_replication -- --exact
 ```
 
 The swap is **feature-gated** (`busyspin-runtime`, default off) so the default
@@ -100,8 +129,13 @@ build/test stays on tokio and green. Flipping it is the one `#[cfg]`'d line in
 
 ## Next steps (not yet done)
 
-1. Resolve the tokio-reactor boundary (hybrid `Handle::enter()` is the smaller
-   step) and get `m2_multi_node` green on busy-spin.
-2. CPU-affinity pinning in the executor (`core_affinity`), worker-per-core.
-3. Only then: replace the hot internal channels with `Send` busy-spin rings and
-   measure against the floor decomposition (the actual perf payoff).
+1. ~~Resolve the tokio-reactor boundary~~ — **done** (hybrid `Handle::enter()`;
+   multi-node consensus green on busy-spin).
+2. **Executor lifecycle:** per-node executor (drop the process-global singleton)
+   and/or task cancellation on `Raft` drop, so the full in-process multi-node
+   suite stops accumulating tasks. This unblocks running the suites unmodified.
+3. CPU-affinity pinning in the executor (`core_affinity`), worker-per-core, with
+   a clear core-reservation story so busy-spin workers don't starve tokio's I/O.
+4. Only then: replace the hot internal channels with `Send` busy-spin rings and
+   **measure against the floor decomposition** (the actual perf payoff — still
+   unmeasured).

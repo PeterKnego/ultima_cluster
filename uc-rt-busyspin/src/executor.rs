@@ -50,13 +50,38 @@ struct Executor {
 
 static EXEC: OnceLock<Executor> = OnceLock::new();
 
+// The application's ambient tokio runtime, captured the first time openraft
+// spawns from within it (e.g. inside `Raft::new`). Busy-spin workers enter it so
+// that reactor-bound I/O futures openraft awaits on a worker (quinn sockets,
+// quinn's internal `tokio::spawn`/timers) find a driver. Entering the app's own
+// runtime — rather than a separate reactor — keeps quinn's socket ownership
+// consistent (the endpoint is created on that same runtime). Absent any ambient
+// runtime (e.g. the conformance Suite), this stays empty and workers never enter
+// — single-node needs no reactor.
+static REACTOR_HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+
+/// Capture the ambient tokio runtime handle if we are called from within one.
+/// Idempotent; a no-op once captured or when there is no ambient runtime.
+fn capture_reactor() {
+    if REACTOR_HANDLE.get().is_none()
+        && let Ok(h) = tokio::runtime::Handle::try_current()
+    {
+        let _ = REACTOR_HANDLE.set(h);
+    }
+}
+
 fn default_workers() -> usize {
     std::env::var("UC_BUSYSPIN_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        // SKELETON default. The real build pins one worker per reserved core.
-        .unwrap_or(2)
+        // Default to a SINGLE never-park worker: it already collapses the futex
+        // for a node's openraft tasks, and one spinning core coexists with the
+        // app's tokio runtime. Going multi-worker pegs N cores at 100%, so it is
+        // opt-in (UC_BUSYSPIN_WORKERS) and wants dedicated/pinned cores — note
+        // the in-process multi-node tests share ONE process-global pool, so more
+        // workers there starve tokio's I/O thread rather than help.
+        .unwrap_or(1)
 }
 
 /// Ensure the global busy-spin executor is running (idempotent).
@@ -89,7 +114,16 @@ fn start(n: usize) -> Executor {
 fn worker_loop(rx: Receiver<BoxFuture>) {
     let waker = noop_waker();
     let mut tasks: Vec<BoxFuture> = Vec::new();
+    // Lazily enter the app's tokio runtime once it has been captured (handles
+    // the case where workers start before the first `spawn` captures it). The
+    // guard is held for the worker's lifetime.
+    let mut _rt_guard: Option<tokio::runtime::EnterGuard<'static>> = None;
     loop {
+        if _rt_guard.is_none()
+            && let Some(h) = REACTOR_HANDLE.get()
+        {
+            _rt_guard = Some(h.enter());
+        }
         // Absorb newly spawned tasks.
         loop {
             match rx.try_recv() {
@@ -168,6 +202,9 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    // First spawn from openraft happens inside the app's runtime (Raft::new);
+    // grab that runtime handle so workers can enter it for reactor-bound I/O.
+    capture_reactor();
     let slot = Arc::new(JoinSlot { inner: Mutex::new((None, None)) });
     let slot2 = slot.clone();
     let wrapped: BoxFuture = Box::pin(async move {
