@@ -22,8 +22,10 @@ async-trait = "0.1"
 futures = "0.3"
 
 # raft + storage
-openraft = { version = "0.10.0-alpha.21", features = ["serde"] }
-openraft-legacy = { version = "0.10.0-alpha.21" }
+# Bumped alpha.21 -> alpha.25 via local checkout (alpha.25 not yet on crates.io).
+# TODO: revert to crates.io version deps once alpha.25 is published.
+openraft = { path = "../openraft/openraft", features = ["serde"] }
+openraft-legacy = { path = "../openraft/legacy" }
 ultima-journal = { path = "ultima_journal" }
 # `persistence` is required for snapshot_stream / install_snapshot_stream.
 ultima-db = { path = "../ultima_db", features = ["persistence"] }

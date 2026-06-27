@@ -1056,6 +1056,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1251,9 +1260,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openraft"
-version = "0.10.0-alpha.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f40148cf75ead81993d5910bc72275e542e4e01a90241bf1905236843fe3009d"
+version = "0.10.0-alpha.25"
 dependencies = [
  "anyerror",
  "backoff-series",
@@ -1264,7 +1271,7 @@ dependencies = [
  "derive_more",
  "display-more",
  "futures-util",
- "itertools",
+ "itertools 0.15.0",
  "maplit",
  "openraft-macros",
  "openraft-rt",
@@ -1280,9 +1287,7 @@ dependencies = [
 
 [[package]]
 name = "openraft-legacy"
-version = "0.10.0-alpha.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc9b53ebd47aa95e84d184921e31220aaa7db91d874ec1f39d6851bf16db74ad"
+version = "0.10.0-alpha.25"
 dependencies = [
  "futures",
  "openraft",
@@ -1293,9 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.10.0-alpha.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ec23cd291c763fb17d8dabf7cc4eacaefd45d02e52a4df88ce50c702f030689"
+version = "0.10.0-alpha.25"
 dependencies = [
  "chrono",
  "proc-macro2",
@@ -1306,9 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt"
-version = "0.10.0-alpha.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a31c2d12e376df204612bb2016d652ea2d48b8edeaa04263facbe2fc7a11e3ef"
+version = "0.10.0-alpha.25"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -1319,9 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt-tokio"
-version = "0.10.0-alpha.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d8c01f2a456a864282bc4eaf76f1f78ab040d80416fd30fd15b8ab88faa337a"
+version = "0.10.0-alpha.25"
 dependencies = [
  "futures-util",
  "openraft-rt",
@@ -1527,7 +1526,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "once_cell",
@@ -1547,7 +1546,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
