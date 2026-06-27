@@ -2500,6 +2500,7 @@ dependencies = [
  "openraft-rt",
  "openraft-rt-tokio",
  "rand 0.10.1",
+ "tokio",
 ]
 
 [[package]]
