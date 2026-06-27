@@ -101,26 +101,45 @@ Result: real 3-node consensus runs on the busy-spin executor —
 `three_node_cluster_elects_leader`, `three_node_replication` (writes replicated
 over quinn), and `leader_failover` all pass (each in a fresh process).
 
-### Known skeleton limitation: process-global pool + no task cancellation
+### Multi-runtime handle refresh (the bug the suite found)
 
-The executor is a **process-global** singleton and does not cancel a node's tasks
-on shutdown. The in-process multi-node test suite boots many nodes (3 per test ×
-several tests) into the *one* shared pool, and shut-down nodes' tasks may keep
-spinning, accumulating until the single worker starves → the *full* `m2` suite
-hangs. Each test **passes in isolation / a fresh process**. Production is one node
-per process, so this never arises there. The clean fixes (next-step work) are a
-**per-node executor** (not a global singleton) and/or **task cancellation on
-`Raft` drop**. Also note: busy-spin workers peg cores; on the 4-core CI box even
-two workers starve tokio's I/O thread, so the default is **one** worker
-(`UC_BUSYSPIN_WORKERS` to override; wants dedicated/pinned cores).
+First cut captured the app runtime in a write-once `OnceLock`. But each
+`#[tokio::test]` builds and drops its **own** tokio runtime, so from the second
+test on the workers were entered into a **dropped** runtime and quinn I/O hung
+(live-task count climbing, never draining). Fix: the captured handle is
+**refreshable** — `REACTOR_HANDLE` is a `Mutex<Option<Handle>>` with a generation
+counter; it is **cleared when the pool drains to zero** (all nodes stopped) and
+re-captured on the next spawn, and workers re-enter when the generation changes.
+A `LIVE_TASKS` counter drives the drain detection (also handy via
+`UC_BUSYSPIN_DEBUG`). In production (one long-lived runtime; the pool never idles
+to zero while a node runs) it captures once and never changes.
+
+With that, the **full `m2_multi_node` suite passes serialized** (and
+`m4_client_three_node`, etc.): all five — elect, replication, failover, snapshot
+install, membership removal — green on busy-spin.
+
+### Remaining limitations (skeleton)
+
+- **Run in-process multi-node suites with `--test-threads=1`.** The handle is one
+  process-global slot; *parallel* tests run *concurrent* runtimes that can't all
+  be the captured one. Serialized is required — and matches UC's existing
+  convention for in-process multi-node suites (e.g. `fault-injection`).
+- **Busy-spin workers peg cores.** On the 4-core box even two workers starve
+  tokio's I/O thread, so the default is **one** worker; idle pacing uses
+  `yield_now()` (coexists with tokio) unless `UC_BUSYSPIN_PURE=1`. Multi-worker
+  wants dedicated/pinned cores (`UC_BUSYSPIN_WORKERS`).
+- **Process-global pool, no per-task cancellation.** Sufficient now (openraft
+  self-terminates its tasks on `Raft::shutdown`, and the drain-to-zero refresh
+  handles sequential runtimes). A genuine **per-node executor** would also unlock
+  parallel in-process tests — deferred.
 
 ## How to run
 
 ```bash
 cargo test -p uc-rt-busyspin                                              # conformance Suite
 cargo test -p uc_node --features busyspin-runtime --test m1_single_node   # single-node boot on busy-spin
-# multi-node: run one test per process (global-pool limitation, see above)
-cargo test -p uc_node --features busyspin-runtime --test m2_multi_node three_node_replication -- --exact
+# multi-node: serialized (one process-global runtime handle slot)
+cargo test -p uc_node --features busyspin-runtime --test m2_multi_node -- --test-threads=1
 ```
 
 The swap is **feature-gated** (`busyspin-runtime`, default off) so the default
@@ -131,9 +150,10 @@ build/test stays on tokio and green. Flipping it is the one `#[cfg]`'d line in
 
 1. ~~Resolve the tokio-reactor boundary~~ — **done** (hybrid `Handle::enter()`;
    multi-node consensus green on busy-spin).
-2. **Executor lifecycle:** per-node executor (drop the process-global singleton)
-   and/or task cancellation on `Raft` drop, so the full in-process multi-node
-   suite stops accumulating tasks. This unblocks running the suites unmodified.
+2. **Per-node executor** (drop the process-global singleton + per-node runtime
+   handle). The drain-to-zero handle refresh already makes the full in-process
+   multi-node suites pass *serialized*; a per-node executor would additionally
+   unblock running them *in parallel* (the default `cargo test`).
 3. CPU-affinity pinning in the executor (`core_affinity`), worker-per-core, with
    a clear core-reservation story so busy-spin workers don't starve tokio's I/O.
 4. Only then: replace the hot internal channels with `Send` busy-spin rings and

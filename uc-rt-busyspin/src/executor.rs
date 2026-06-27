@@ -22,7 +22,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -50,23 +50,40 @@ struct Executor {
 
 static EXEC: OnceLock<Executor> = OnceLock::new();
 
-// The application's ambient tokio runtime, captured the first time openraft
-// spawns from within it (e.g. inside `Raft::new`). Busy-spin workers enter it so
-// that reactor-bound I/O futures openraft awaits on a worker (quinn sockets,
-// quinn's internal `tokio::spawn`/timers) find a driver. Entering the app's own
-// runtime — rather than a separate reactor — keeps quinn's socket ownership
-// consistent (the endpoint is created on that same runtime). Absent any ambient
-// runtime (e.g. the conformance Suite), this stays empty and workers never enter
-// — single-node needs no reactor.
-static REACTOR_HANDLE: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+// The application's ambient tokio runtime, captured when openraft spawns from
+// within it (e.g. inside `Raft::new`). Busy-spin workers enter it so that
+// reactor-bound I/O futures openraft awaits on a worker (quinn sockets, quinn's
+// internal `tokio::spawn`/timers) find a driver. Entering the app's own runtime
+// — rather than a separate reactor — keeps quinn's socket ownership consistent
+// (the endpoint is created on that same runtime). Absent any ambient runtime
+// (e.g. the conformance Suite), this stays `None` and workers never enter.
+//
+// It is *refreshable*, not write-once: it is cleared when the pool drains to
+// zero (all nodes stopped) and re-captured on the next spawn, so a process that
+// builds more than one tokio runtime over its lifetime (notably each
+// `#[tokio::test]`) does not leave workers entered into a dropped runtime.
+// `REACTOR_GEN` bumps on every change; workers re-clone the handle when it does.
+static REACTOR_HANDLE: Mutex<Option<tokio::runtime::Handle>> = Mutex::new(None);
+static REACTOR_GEN: AtomicU64 = AtomicU64::new(0);
 
-/// Capture the ambient tokio runtime handle if we are called from within one.
-/// Idempotent; a no-op once captured or when there is no ambient runtime.
+/// Capture the ambient tokio runtime handle if we are inside one and none is
+/// currently held. No-op without an ambient runtime or once captured.
 fn capture_reactor() {
-    if REACTOR_HANDLE.get().is_none()
+    let mut g = REACTOR_HANDLE.lock().unwrap();
+    if g.is_none()
         && let Ok(h) = tokio::runtime::Handle::try_current()
     {
-        let _ = REACTOR_HANDLE.set(h);
+        *g = Some(h);
+        REACTOR_GEN.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// Clear the captured handle (called when the pool drains to zero) so the next
+/// spawn re-captures whatever runtime is then current.
+fn clear_reactor() {
+    let mut g = REACTOR_HANDLE.lock().unwrap();
+    if g.take().is_some() {
+        REACTOR_GEN.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -114,15 +131,17 @@ fn start(n: usize) -> Executor {
 fn worker_loop(rx: Receiver<BoxFuture>) {
     let waker = noop_waker();
     let mut tasks: Vec<BoxFuture> = Vec::new();
-    // Lazily enter the app's tokio runtime once it has been captured (handles
-    // the case where workers start before the first `spawn` captures it). The
-    // guard is held for the worker's lifetime.
-    let mut _rt_guard: Option<tokio::runtime::EnterGuard<'static>> = None;
+    // The app-runtime handle is owned locally and re-cloned whenever the global
+    // generation changes, so we always enter the *current* runtime (not a
+    // dropped one). It is entered per poll pass — cheap thread-local context
+    // set/restore — which also makes a mid-pass refresh take effect next pass.
+    let mut local_gen = u64::MAX;
+    let mut local_handle: Option<tokio::runtime::Handle> = None;
     loop {
-        if _rt_guard.is_none()
-            && let Some(h) = REACTOR_HANDLE.get()
-        {
-            _rt_guard = Some(h.enter());
+        let cur_gen = REACTOR_GEN.load(Ordering::Acquire);
+        if cur_gen != local_gen {
+            local_handle = REACTOR_HANDLE.lock().unwrap().clone();
+            local_gen = cur_gen;
         }
         // Absorb newly spawned tasks.
         loop {
@@ -132,24 +151,65 @@ fn worker_loop(rx: Receiver<BoxFuture>) {
                 Err(TryRecvError::Disconnected) => return, // never happens: senders are 'static
             }
         }
-        // Busy-poll every live task; drop the ones that finish.
-        let mut i = 0;
-        while i < tasks.len() {
-            let mut cx = Context::from_waker(&waker);
-            match tasks[i].as_mut().poll(&mut cx) {
-                Poll::Ready(()) => {
-                    // Task finished; drop the completed future.
-                    drop(tasks.swap_remove(i));
+        // Busy-poll every live task within the app-runtime context (if any) so
+        // reactor-bound I/O futures find a driver; drop the ones that finish.
+        {
+            let _enter = local_handle.as_ref().map(|h| h.enter());
+            let mut i = 0;
+            while i < tasks.len() {
+                let mut cx = Context::from_waker(&waker);
+                match tasks[i].as_mut().poll(&mut cx) {
+                    Poll::Ready(()) => {
+                        // Task finished; drop the completed future.
+                        drop(tasks.swap_remove(i));
+                        let n = LIVE_TASKS.fetch_sub(1, Ordering::Relaxed) - 1;
+                        if debug_on() {
+                            eprintln!("[busyspin] done  -> live={n}");
+                        }
+                        // Pool drained: release the captured runtime so the next
+                        // spawn re-captures whatever runtime is then current.
+                        if n == 0 {
+                            clear_reactor();
+                        }
+                    }
+                    Poll::Pending => i += 1,
                 }
-                Poll::Pending => i += 1,
             }
         }
-        std::hint::spin_loop();
+        // Idle pacing between passes. Default `yield_now()` so the worker
+        // coexists with the app's tokio I/O thread (and other nodes) under CPU
+        // oversubscription — on a dedicated core this is ~a no-op so latency is
+        // preserved. `UC_BUSYSPIN_PURE=1` forces a pure `spin_loop()` hint for
+        // dedicated/pinned-core deployments that want the absolute minimum
+        // wakeup latency and never want to cede the core.
+        if pure_spin() {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
     }
+}
+
+fn pure_spin() -> bool {
+    static PURE: OnceLock<bool> = OnceLock::new();
+    *PURE.get_or_init(|| {
+        std::env::var("UC_BUSYSPIN_PURE").map(|v| v == "1" || v == "true").unwrap_or(false)
+    })
+}
+
+static LIVE_TASKS: AtomicUsize = AtomicUsize::new(0);
+
+fn debug_on() -> bool {
+    static D: OnceLock<bool> = OnceLock::new();
+    *D.get_or_init(|| std::env::var("UC_BUSYSPIN_DEBUG").is_ok())
 }
 
 fn submit(task: BoxFuture) {
     let ex = global();
+    let n = LIVE_TASKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if debug_on() {
+        eprintln!("[busyspin] spawn -> live={n}");
+    }
     let idx = ex.next.fetch_add(1, Ordering::Relaxed) % ex.workers.len();
     let _ = ex.workers[idx].lock().unwrap().send(task);
 }
