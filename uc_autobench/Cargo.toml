@@ -9,6 +9,8 @@ authors.workspace = true
 # Turns on uc_protocol's probe sink across the whole dependency graph (feature
 # unification makes uc_node/uc_service/uc_client use the same instrumented build).
 uc-bench-probes = ["uc_protocol/uc-bench-probes"]
+# Build the busy-spin AsyncRuntime into uc_node (for busyspin-commit-bench A/B).
+busyspin = ["uc_node/busyspin-runtime"]
 
 [dependencies]
 serde = { workspace = true }
