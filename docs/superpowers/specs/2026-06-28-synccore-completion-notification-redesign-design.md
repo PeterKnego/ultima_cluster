@@ -72,7 +72,12 @@ not a hot path.)
 
 ## Change 2 — readability gate (gated reader + consumer watermark)
 
-Makes Change 1 safe multi-node. Fully contained to `sync_durability`:
+Makes Change 1 safe multi-node. Mostly in `sync_durability`, but it necessarily changes
+the *vended-reader type* (`raft_core.rs`'s `log_reader_request_tx` and `ReplicationCore`'s
+reader field/param via a `cfg` alias): replication's read range is bounded by the engine's
+in-memory `last_log_id` (set synchronously before storage), *not* an io_state marker the
+loop controls, so the gate must wrap the *read*, not defer a marker. The watermark is
+consumer-FIFO-ordered (not naively monotonic) so truncation lowers it correctly.
 
 - **Watermark.** The consumer owns a `watch` whose value is the highest `LogId` whose
   `append()` has returned (the contract's *readable* point). In `run_op`'s `Append` arm,
