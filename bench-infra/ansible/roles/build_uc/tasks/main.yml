@@ -23,6 +23,20 @@
       - "--exclude=.git"
   when: uc_src_mode == "rsync"
 
+# UC's Cargo.toml has a path dep `../openraft/openraft` (the openraft fork, incl. the
+# experimental sync-core feature). Ship the sibling openraft repo to {{ or_src_dir }}
+# (= /opt/bench/openraft) so that, with UC at /opt/bench/uc, `../openraft/openraft`
+# resolves to /opt/bench/openraft/openraft on the host. Without this, cargo build fails.
+- name: (rsync mode) Sync sibling openraft (path dep) to host
+  ansible.posix.synchronize:
+    src: "{{ or_local_path }}/"
+    dest: "{{ or_src_dir }}/"
+    rsync_opts:
+      - "--exclude=target"
+      - "--exclude=.git"
+      - "--exclude=_log"   # openraft/tests/_log can hold many GB of suite tracing logs
+  when: uc_src_mode == "rsync"
+
 - name: (git mode) Clone UC at pinned ref
   ansible.builtin.git:
     repo: "{{ uc_repo_url }}"
@@ -30,12 +44,19 @@
     version: "{{ uc_git_ref }}"
   when: uc_src_mode == "git"
 
-- name: Build uc_autobench release bins
+- name: Compose cargo feature list
   # uc_bench_probes=true compiles in the latency probe sink (incl. the leader
   # replication-RPC timing); default off so normal latency benches aren't perturbed.
+  # uc_sync_core=true builds openraft with the synchronous SyncCore instead of RaftCore.
+  ansible.builtin.set_fact:
+    uc_cargo_features: >-
+      {{ (['uc-bench-probes'] if (uc_bench_probes | default(false) | bool) else [])
+         + (['sync-core'] if (uc_sync_core | default(false) | bool) else []) }}
+
+- name: Build uc_autobench release bins
   ansible.builtin.command: >
     {{ remote_home }}/.cargo/bin/cargo build --release
-    {{ '--features uc-bench-probes' if (uc_bench_probes | default(false) | bool) else '' }}
+    {{ ('--features ' + (uc_cargo_features | join(','))) if (uc_cargo_features | length > 0) else '' }}
     -p uc_autobench --bin uc-node-launch --bin commit-path-load --bin internode-rpc-bench
   args:
     chdir: "{{ uc_src_dir }}"

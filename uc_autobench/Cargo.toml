@@ -11,6 +11,9 @@ authors.workspace = true
 uc-bench-probes = ["uc_protocol/uc-bench-probes"]
 # Build the busy-spin AsyncRuntime into uc_node (for busyspin-commit-bench A/B).
 busyspin = ["uc_node/busyspin-runtime"]
+# Build openraft with the synchronous SyncCore (instead of async RaftCore) into the
+# fleet bins, for the SyncCore-vs-RaftCore real-I/O A/B. See uc_node's sync-core feature.
+sync-core = ["uc_node/sync-core"]
 
 [dependencies]
 serde = { workspace = true }
