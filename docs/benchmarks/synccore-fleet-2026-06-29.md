@@ -85,3 +85,39 @@ instance coincidence can't be ruled out, but the pattern points at thread cleanu
 
 Cost guard: fleet fully destroyed (11 resources, terraform state empty). Raw single-run CSVs
 in the session scratchpad (`armA_raftcore.csv`, `armB_synccore.csv`).
+
+---
+
+## Diagnostic re-run (instrumented, same day) — hang RULED OUT as SyncCore
+
+Re-ran a small fleet with a 1 Hz on-node sampler (load, `uc-node-launch` proc + thread
+count, memory) across 4 back-to-back SyncCore iterates, to test the saturation / thread-leak
+/ OOM hypotheses.
+
+**Findings (3× c6id.2xlarge, 8 vCPU):**
+- **No saturation.** Peak load across the entire run was **~2.5–2.85 on 8 cores** — never
+  close to saturated. (A busy-spin death-spiral would show load ≥ 8.)
+- **No leak / no accumulation.** Peak **4 threads and 1 process** per `uc-node-launch`, ever.
+  Between iterates `ucprocs` returned to 0 (clean teardown); the one flaky iterate that left a
+  straggler was cleaned by the next iterate's start-`pkill`.
+- **No OOM.**
+- **The "hang" reproduced — at low load — as a transient ansible failure.** One of the four
+  iterates failed with the *exact* original signature: `Timeout (62s) waiting for privilege
+  escalation prompt` → all nodes `UNREACHABLE`, while load was only ~2.7. It **self-recovered**:
+  the very next iterate ran cleanly. An earlier diag attempt's `make up-uc` *provision* also
+  flaked once and then succeeded on retry.
+
+**Conclusion:** the fleet "hang" is **intermittent ansible sudo/SSH privilege-escalation
+flakiness** (strikes at low load, self-recovers), **not** a SyncCore resource problem.
+SyncCore runs on the fleet at the same low load as RaftCore, with a bounded ~4 threads/node.
+Both the teardown-leak hypothesis (test-harness cycle) and the saturation hypothesis are now
+ruled out.
+
+**Actionables (bench-infra, not SyncCore):**
+- Harden the flaky ansible tasks against the sudo-escalation timeout — e.g. enable SSH
+  pipelining / longer `ControlPersist`, raise the become timeout + add retries on the
+  election-wait / launch tasks, and check whether remote `sudo` is doing slow DNS/PAM lookups
+  (a classic cause of low-load 60s sudo stalls on cloud hosts).
+- With that fixed, a denoised multi-rep SyncCore-vs-RaftCore A/B becomes reliable. The
+  single-rep numbers above stand as a first (noisy) data point; SyncCore is **not** pathological
+  on the fleet.
