@@ -50,6 +50,13 @@ uc-lincheck = { path = "../uc-lincheck" }
 
 [features]
 test-helpers = []
+# Experimental: build openraft with the synchronous SyncCore (instead of async RaftCore).
+# Orthogonal to busyspin-runtime — uses the default tokio runtime; SyncCore's consensus
+# thread enters the app's tokio runtime as a hybrid reactor, and the durability consumer
+# drives UC's journal RaftLogStorage reactor-free under block_on. Public Raft API unchanged,
+# so no UC code changes. Default off.
+#   cargo test -p uc_node --features sync-core --test m1_single_node
+sync-core = ["openraft/sync-core"]
 # Experimental: run openraft's internal tasks on the busy-spin AsyncRuntime
 # (crate `uc-rt-busyspin`) instead of tokio. Single- and multi-node consensus
 # work (multi-node via the hybrid tokio-reactor; busy-spin workers enter the
