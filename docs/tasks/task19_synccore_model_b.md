@@ -154,14 +154,31 @@ Because SyncCore was throughput-null, the throughput ceiling was attributed dire
   Pareto win — **2× the throughput knee (5k→10k)** *and* lower latency at every load — because
   linger only buys fsync batching and fsync isn't the bottleneck.
   (`linger-pipeline-frontier-2026-06-30.md`.)
-- **Second 2× (10k→~20k) is structural** — cross-host replication latency; the ~20k figure is
-  the 1-node ceiling a replicated cluster can't reach. **Co-location does not address it**
-  (it's intra-host; the gap is cross-host quorum cost). Diminishing returns; gated behind a
-  replication-2× attribution if ever revisited.
+- **Second 2× (10k→~20k):** *initially* attributed to structural cross-host replication
+  latency — **but see the correction below; this was substantially a measurement artifact.**
 
-**Strategic note:** the aeron-investigation throughput target was ~10k/s. The linger change
-moved the 3-node knee to 10k — so the project's stated throughput target is plausibly **met**,
-by a one-line config change extracted from this spike.
+**Strategic note (as first written):** the aeron-investigation throughput target was ~10k/s;
+the linger change moved the 3-node knee to 10k, so the target looked **met**.
+
+### 6a. CORRECTION (2026-06-30, leader profiling + inflight sweep)
+
+The "structural 10k ceiling" was re-examined by profiling the leader at the knee and sweeping
+the load generator's `inflight`. Doc: `docs/benchmarks/leader-profile-inflight-2026-06-30.md`.
+
+- **The leader is ~90% idle at the 10k knee** — no thread pegged (busiest ~30% of a core),
+  box `%Cpu(s) ~93–96% idle` while sustaining ~9.8k commits/s. So 10k is **not** a saturated
+  resource and **not** CPU/Engine-bound (killing the "single-threaded Engine" hypothesis).
+- **The knee rises with `inflight`**: at the *same* 10k load, raising `inflight` 128→256
+  *lowered* p50 from 26.5 ms to 5.8 ms (so 128 was the binding limit, not the server), and the
+  sustainable knee moved from ~10k to ~14.6k (p50 187 ms). `throughput = inflight ÷ latency`,
+  and **we had held `inflight=128` (the bench default) through every measurement this session.**
+- **⇒ the 10k "ceiling" was concurrency-starvation**, not structural. The system was being
+  under-driven across a ms-latency commit path. The "throughput target met at 10k" and
+  "replication 2× is structural" claims above are therefore **softened**: more throughput
+  (≥15k shown) is available by driving more concurrency, at a tail-latency cost; the true
+  ceiling is **unknown** (inflight ≥512 destabilized the runs and is unmeasured).
+- Open (being chased): where the knee plateaus + what (if anything) saturates at the higher
+  knee (re-profile at inflight=256/15k), and why high inflight destabilizes.
 
 ---
 
