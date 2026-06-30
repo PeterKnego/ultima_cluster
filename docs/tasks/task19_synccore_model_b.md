@@ -177,8 +177,18 @@ the load generator's `inflight`. Doc: `docs/benchmarks/leader-profile-inflight-2
   "replication 2× is structural" claims above are therefore **softened**: more throughput
   (≥15k shown) is available by driving more concurrency, at a tail-latency cost; the true
   ceiling is **unknown** (inflight ≥512 destabilized the runs and is unmeasured).
-- Open (being chased): where the knee plateaus + what (if anything) saturates at the higher
-  knee (re-profile at inflight=256/15k), and why high inflight destabilizes.
+- **The real ceiling IS a named hot path (chase, re-profile at inflight=256/14k):** the knee
+  plateaus at **~15k** (inflight 256→384 no gain), where **one thread saturates** (86% and
+  climbing while the box stays ~90% idle). Its perf call-graph: **21.6% `read()` of the journal's
+  ext4 segment files** (+ page-copy + ~15% faults) and **22% crc32**. ⇒ the leader's
+  **single-threaded log-read path for replication/apply** — it re-reads just-appended entries
+  back from disk and recomputes CRC to build AppendEntries — saturates one core. This
+  **supersedes the "structural replication wall."** Concrete UC-side fixes (NOT structural, NOT
+  openraft-core): (1) in-memory recent-entry cache (serve replication reads from RAM, not ext4
+  — kills ~27%), (2) skip CRC re-validation on own entries (~22%), (3) zero-copy entry bytes.
+  Eliminating ~40–50% of that thread's CPU should push the ceiling well past 15k. Caveat:
+  inflight ≥512 destabilizes (separate, unmeasured). Doc:
+  `docs/benchmarks/leader-profile-inflight-2026-06-30.md` §5.
 
 ---
 

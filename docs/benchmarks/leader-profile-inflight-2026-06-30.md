@@ -70,6 +70,50 @@ questions are (a) where the knee plateaus and what saturates there (is the box s
 15k?), and (b) why inflight≥512 destabilizes. Both are being chased
 (`chase_run` → a follow-up addendum).
 
+## 5. Addendum (chase) — the real ceiling IS a named hot path: leader log-read + CRC
+
+Re-profiled the leader at **inflight=256, sustained ~14k** (the higher knee), and mapped the
+knee past 256.
+
+- **The busiest thread climbed to 86%** (from 72% at the lower load) while the box stayed
+  ~85–95% idle and all other threads ~0–4%. So as throughput rises, **one thread approaches
+  saturation** — the ceiling is a single-thread limit, only *unmasked* once inflight is high
+  enough (at inflight=128 concurrency-starvation capped throughput below this thread's limit).
+- **The knee plateaus at ~15k**: inflight 128→10k, 256→~15k, 384→~15k (rep-noisy 10/15 at the
+  SLA boundary). More concurrency past 256 buys nothing → ~15k is the hard ceiling.
+- **`inflight ≥ 512` destabilizes** the run regardless of rate ladder (a separate
+  high-concurrency instability — unmeasured, worth a look).
+
+**What that thread burns CPU on (perf call-graph at the ceiling):**
+```
+34.6% syscall → 21.6% __x64_sys_read → ext4_file_read_iter → filemap_read
+                                       → copy_page_to_iter (21.4%, page copy) + ~15% page-faults
+21.8% crc32fast::update_fast_16   (record CRC, growing with load: 17%→22%)
+ 5.9% anon page allocation
+```
+
+**⇒ The real throughput ceiling (~15k) is the leader's single-threaded log-read path for
+replication/apply.** It **re-reads just-appended log entries back from the journal's on-disk
+ext4 segment files** (read + page-copy + faults ≈ 27%) and **recomputes CRC32** (≈ 22%) to
+build AppendEntries (and to apply) — saturating one core while 7 sit idle. It is reading from
+disk what it just wrote to memory.
+
+This **supersedes the "structural replication wall"** framing and reconciles every prior null:
+SyncCore null (the cost is read+copy+CRC *compute*, not scheduling); fsync null (the bottleneck
+is the *read* path); pipeline-depth null/hurt (more in-flight = more of these reads); the
+replication 2× (1-node has no followers → no replication reads → ~2× throughput); and the
+repo's open `future-writerstate-lock-contention` note (replication reads).
+
+**Concrete, UC-side fixes (not structural, not openraft-core):**
+1. **In-memory cache of recent log entries** — serve replication/apply reads of just-written
+   entries from RAM, not `read()` off ext4. Removes the ~27% read+copy+fault. *Biggest lever.*
+2. **Skip CRC re-validation on the leader's own freshly-written entries** — removes much of the
+   ~22%.
+3. **Zero-copy the entry bytes** into the AppendEntries frame (avoid `copy_page_to_iter`).
+
+Eliminating ~40–50% of that thread's CPU should push the ceiling well past 15k — a real,
+attackable throughput win, in UC code.
+
 ## Method note
 
 The `profile` hook is now in `bench-infra/ansible/roles/run/tasks/main.yml` (gated
