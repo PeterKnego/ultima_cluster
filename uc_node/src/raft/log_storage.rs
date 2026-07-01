@@ -297,6 +297,24 @@ fn journal_io(e: ultima_journal::JournalError) -> io::Error {
     io::Error::other(e)
 }
 
+/// Cap for a single `limited_get_log_entries` replication read.
+///
+/// openraft's DEFAULT `limited_get_log_entries` returns the FULL, unbounded
+/// `[start, end)` range. When a follower lags under load, that materializes the
+/// entire gap in ONE call — a multi-MB journal read + CRC-verify + huge buffer
+/// alloc that saturates a single core (observed as ~20% `read()` + ~21% `crc32`
+/// on the leader's busiest thread at the ~15k ceiling), and it is
+/// self-reinforcing: a big read makes a big AppendEntries, which the follower is
+/// slow to append+fsync, which grows the gap, which makes the next read bigger.
+///
+/// openraft sends at most `max_payload_entries` (default 300, UC default 300)
+/// entries per AppendEntries regardless, so returning more is pure waste. We cap
+/// each read to this bound; openraft explicitly tolerates a short return
+/// (`replication/stream_state.rs` — "limited_get_log_entries will return logs
+/// smaller than the range"), so replication simply catches up in bounded chunks.
+/// Kept comfortably above the 300 default so a full batch is never starved.
+const LIMITED_GET_MAX_ENTRIES: u64 = 512;
+
 impl RaftLogReader<TypeConfig> for JournalLogStorage {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,
@@ -331,6 +349,21 @@ impl RaftLogReader<TypeConfig> for JournalLogStorage {
             entries.push(entry);
         }
         Ok(entries)
+    }
+
+    /// Bounded replication read. openraft's default returns the whole unbounded
+    /// `[start, end)`; we cap it to `LIMITED_GET_MAX_ENTRIES` so a lagging
+    /// follower cannot force an unbounded catch-up read (the ~15k-ceiling cause).
+    /// A short return is contractually fine — openraft advances in chunks. The
+    /// capped range is near-tail and small, so it is usually served straight from
+    /// the entry cache (`try_get_log_entries`), never touching the journal.
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<<TypeConfig as openraft::RaftTypeConfig>::Entry>, io::Error> {
+        let capped_end = end.min(start.saturating_add(LIMITED_GET_MAX_ENTRIES));
+        self.try_get_log_entries(start..capped_end).await
     }
 
     async fn read_vote(&mut self) -> Result<Option<RaftVote>, io::Error> {
