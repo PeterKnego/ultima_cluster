@@ -81,3 +81,33 @@ to be visible on the fleet.
 Fleet destroyed (0 resources, no leak — the driver teardown completed after a transient
 state-lock collision). 8 session fleets, all clean. Bench-infra now threads `UC_LOG_CACHE_BYTES`
 (default 256MB, `-e uc_log_cache_bytes=0` to disable) for future A/Bs.
+
+## Addendum — the NoopOutput bench fix is ALSO null (2026-07-01)
+
+Wired `NoopOutput` in the bench (`uc-node-launch.rs`, commit 6c6dec2) so the service drains
+`service/output.ring`, and re-measured (verified deployed: node0 source + binary rebuilt this
+run). **Complete null — every axis identical to pre-fix:**
+
+| | crc32 | read() | busiest thread | `output_chan full` warns | knee (i128 / i256) |
+|---|---|---|---|---|---|
+| pre-fix | 22% | 20% | 87% | 599k | 10k / 15k |
+| **+ NoopOutput** | 21% | 20% | 86% | **581k** | 10k / 15k |
+
+So the explorer's "missing output.ring consumer" model was wrong: draining `output.ring` did
+**not** clear the `output_chan` backup. The `output_chan` (1024) stays full because the
+`output_dispatcher`'s per-entry synchronous round-trip (publish to `output.ring` + await
+`output_resp`) cannot drain 1024 slots at 15k/s regardless of the consumer — and even that does
+not fully explain the persistent steady-state read/crc32 (output_replay is transition-only).
+**The read/crc32 source remains unpinned, and the ~15k ceiling is unmoved by every lever.**
+
+## Meta — stop the fleet-based throughput chase
+
+This is the 4th consecutive null in the throughput chase (SyncCore, the log cache, and now the
+output-handler fix). Across ~9 session fleets the ~15k knee (inflight 256) / ~10k (inflight 128)
+has moved for **exactly one** lever — the `linger 5→2` config (the shipped 2× win). Every
+structural/code hypothesis has failed, and the bottleneck resists diagnosis (read/crc32 +
+output_chan-full persist through the obvious fixes). Recommendation: **stop the fleet A/B chase.**
+Bank the linger win + the (correct, embedded-useful) cache + the diagnostic knowledge. If
+throughput is genuinely critical later, switch to a LOCAL deep-instrumented single-node
+flamegraph of the apply/output path (cheaper + more diagnostic than more cloud A/Bs) rather than
+another fleet.
