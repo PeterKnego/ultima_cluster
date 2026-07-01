@@ -110,12 +110,11 @@ impl EntryCache {
         }
     }
 
-    // Telemetry accessors. `hits` is asserted by the differential cache test;
-    // `misses` is retained for future observability (node telemetry / tracing).
-    // Both are gated so dead_code does not fire during library compilation.
-    #[cfg(any(test, feature = "test-helpers"))]
+    // Telemetry accessors. `hits` is used by the differential cache test and
+    // by the periodic node-level `log_entry_cache` tracing emit (Task 3).
+    // `misses` is used for the same tracing emit.  Both use relaxed loads —
+    // the counters are approximate and require no cross-thread ordering.
     pub(crate) fn hits(&self) -> u64 { self.hits.load(Ordering::Relaxed) }
-    #[allow(dead_code)]
     pub(crate) fn misses(&self) -> u64 { self.misses.load(Ordering::Relaxed) }
 }
 

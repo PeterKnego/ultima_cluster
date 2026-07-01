@@ -408,6 +408,31 @@ where
         fault_table,
     };
 
+    // Periodic cache hit/miss telemetry (Task 3). Clone the cache Arc before
+    // `log_storage` is consumed by `Raft::new` below. The background task is
+    // detached — it runs until the tokio runtime drops (node shutdown). We
+    // deliberately skip storing the JoinHandle to avoid plumbing a new field
+    // into NodeHandle for a debug-log-only task; the task loop exits naturally
+    // when the runtime shuts down. Relaxed loads — approximate counters only.
+    {
+        let cache = log_storage.cache.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(5));
+            interval.set_missed_tick_behavior(
+                tokio::time::MissedTickBehavior::Skip,
+            );
+            loop {
+                interval.tick().await;
+                tracing::debug!(
+                    hits = cache.hits(),
+                    misses = cache.misses(),
+                    "log_entry_cache"
+                );
+            }
+        });
+    }
+
     // Build the factory + raft + server for the selected transport. Both arms
     // produce the same `Raft<TypeConfig, A>` (network type is erased into
     // RaftCore) so bootstrap below is transport-agnostic.
