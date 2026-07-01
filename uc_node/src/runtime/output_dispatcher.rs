@@ -43,10 +43,25 @@ pub struct OutputDispatcherHandle {
 
 const PUBLISH_GRACE: Duration = Duration::from_secs(1);
 const PUBLISH_RETRY_BACKOFF: Duration = Duration::from_micros(100);
-const RESPONSE_POLL_IDLE: Duration = Duration::from_micros(100);
+const RESPONSE_POLL_IDLE: Duration = Duration::from_micros(10);
 const RETRY_BACKOFF_INITIAL: Duration = Duration::from_millis(10);
 const RETRY_BACKOFF_CAP: Duration = Duration::from_secs(1);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Max entries drained from `output_chan` before one coalesced `output_progress`
+/// fsync. Advancing the durable marker is a fsync (`StableValue::store().wait()`);
+/// doing it per entry caps the dispatcher far below the commit rate (15k/s ⇒ 15k
+/// fsync/s, impossible), so `output_chan` backs up and `output_progress` stalls
+/// near 0 — which makes leadership-transition output-replay scan the whole log.
+/// We instead process a drained batch and fsync ONCE to the batch's highest
+/// completed index. Under load the drain is large (naturally coalescing the
+/// fsync); at low load batches are size 1 (a fsync per entry, but the rate is
+/// low so it is free). At-least-once output is preserved: a crash mid-batch
+/// replays from the last durably-marked index and `on_committed` is idempotent
+/// by contract. Advancing to the last completed index in the batch is
+/// behavior-equivalent to the old per-entry advance (indices arrive in ascending
+/// log order, so the last completed IS the max).
+const OUTPUT_BATCH_MAX: usize = 1024;
 
 pub fn spawn_output_dispatcher(
     mut rx: Receiver<(u64, Bytes)>,
@@ -62,74 +77,105 @@ pub fn spawn_output_dispatcher(
 
     let join = tokio::spawn(async move {
         while !stop_for_task.load(Ordering::Relaxed) {
-            let Some((log_index, cmd_bytes)) = rx.recv().await else {
+            // Block for the first item, then drain everything else immediately
+            // available (up to OUTPUT_BATCH_MAX) so the durable output_progress
+            // fsync coalesces to ONE store per batch instead of one per entry.
+            let Some(first) = rx.recv().await else {
                 break;
             };
-
-            if !*leader_rx.borrow() {
-                tracing::debug!(log_index, "output_dispatcher: not leader; dropping");
-                continue;
+            let mut batch: Vec<(u64, Bytes)> = Vec::with_capacity(16);
+            batch.push(first);
+            while batch.len() < OUTPUT_BATCH_MAX {
+                match rx.try_recv() {
+                    Ok(item) => batch.push(item),
+                    Err(_) => break,
+                }
             }
 
-            let mut backoff = RETRY_BACKOFF_INITIAL;
-            'outer: loop {
-                if stop_for_task.load(Ordering::Relaxed) || !*leader_rx.borrow() {
-                    break 'outer;
+            // Process each entry (publish + await + decide) exactly as before,
+            // but DEFER the durable marker: track the highest completed index and
+            // fsync once after the batch. `highest_completed` ends at the last
+            // Ok/Permanent entry, which — because rx delivers in ascending log
+            // order — is the max, matching the old per-entry advance semantics
+            // (including jumping past a mid-batch skip's gap).
+            let mut highest_completed: Option<u64> = None;
+            'batch: for (log_index, cmd_bytes) in batch {
+                if stop_for_task.load(Ordering::Relaxed) {
+                    break 'batch;
+                }
+                if !*leader_rx.borrow() {
+                    tracing::debug!(log_index, "output_dispatcher: not leader; dropping");
+                    continue;
                 }
 
-                // 1) Publish OutputFrame with 1s grace.
-                match publish_output_frame(&producer, log_index, &cmd_bytes).await {
-                    PublishOutcome::Published => {}
-                    PublishOutcome::Skipped => {
-                        tracing::warn!(
-                            log_index,
-                            "output.ring full > 1s; skipping; replay will catch this"
-                        );
-                        break 'outer;
+                let mut backoff = RETRY_BACKOFF_INITIAL;
+                'entry: loop {
+                    if stop_for_task.load(Ordering::Relaxed) || !*leader_rx.borrow() {
+                        break 'batch;
                     }
-                    PublishOutcome::FatalError => break 'outer,
-                }
 
-                // 2) Await response. Honors `stop` so shutdown isn't gated
-                // on the 30s timeout when no service-side consumer is wired.
-                let resp =
-                    match await_output_resp(&mut output_resp_consumer, log_index, &stop_for_task)
-                        .await
+                    // 1) Publish OutputFrame with 1s grace.
+                    match publish_output_frame(&producer, log_index, &cmd_bytes).await {
+                        PublishOutcome::Published => {}
+                        PublishOutcome::Skipped => {
+                            tracing::warn!(
+                                log_index,
+                                "output.ring full > 1s; skipping; replay will catch this"
+                            );
+                            break 'entry;
+                        }
+                        PublishOutcome::FatalError => break 'entry,
+                    }
+
+                    // 2) Await response. Honors `stop` so shutdown isn't gated
+                    // on the 30s timeout when no service-side consumer is wired.
+                    let resp = match await_output_resp(
+                        &mut output_resp_consumer,
+                        log_index,
+                        &stop_for_task,
+                    )
+                    .await
                     {
                         Some(r) => r,
                         None => {
                             if stop_for_task.load(Ordering::Relaxed) {
-                                break 'outer;
+                                break 'batch;
                             }
                             tracing::warn!(
                                 log_index,
                                 "output_resp timeout; skipping; replay will catch"
                             );
-                            break 'outer;
+                            break 'entry;
                         }
                     };
 
-                // 3) Decide.
-                match resp {
-                    Ok(()) => {
-                        advance_output_progress(&output_progress, log_index);
-                        break 'outer;
-                    }
-                    Err(OutputError::Permanent(ref msg)) => {
-                        tracing::warn!(
-                            log_index,
-                            msg,
-                            "OutputError::Permanent — advancing marker anyway"
-                        );
-                        advance_output_progress(&output_progress, log_index);
-                        break 'outer;
-                    }
-                    Err(OutputError::Retryable(ref msg)) => {
-                        tracing::info!(log_index, msg, ?backoff, "Retryable — backoff");
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(RETRY_BACKOFF_CAP);
+                    // 3) Decide.
+                    match resp {
+                        Ok(()) => {
+                            highest_completed = Some(log_index);
+                            break 'entry;
+                        }
+                        Err(OutputError::Permanent(ref msg)) => {
+                            tracing::warn!(
+                                log_index,
+                                msg,
+                                "OutputError::Permanent — advancing marker anyway"
+                            );
+                            highest_completed = Some(log_index);
+                            break 'entry;
+                        }
+                        Err(OutputError::Retryable(ref msg)) => {
+                            tracing::info!(log_index, msg, ?backoff, "Retryable — backoff");
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(RETRY_BACKOFF_CAP);
+                        }
                     }
                 }
+            }
+
+            // ONE coalesced durable fsync for the whole batch.
+            if let Some(idx) = highest_completed {
+                advance_output_progress(&output_progress, idx);
             }
         }
     });
