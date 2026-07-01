@@ -227,8 +227,19 @@ async fn main() -> anyhow::Result<()> {
             data_dir: args.data_dir.join("service"),
             ..ServiceConfig::default()
         };
-        let svc_task =
-            tokio::spawn(async move { ServiceBuilder::new(svc_cfg, KvSm::default()).run().await });
+        // Wire NoopOutput so the service drains `service/output.ring`. Without an
+        // output handler, ServiceBuilder::run() DROPS the output.ring consumer, so
+        // nothing drains it: the ring fills, output_dispatcher spin-burns a core
+        // (~1 item/s), output_chan stays full (per-commit "output_chan full" warns),
+        // and output_progress stalls near 0 — making leadership-transition output
+        // replay scan the whole log (the read()+crc32 core saturation). NoopOutput
+        // drains-and-discards, keeping the output path a no-op instead of a thrash.
+        let svc_task = tokio::spawn(async move {
+            ServiceBuilder::new(svc_cfg, KvSm::default())
+                .output_handler(uc_service::NoopOutput)
+                .run()
+                .await
+        });
         let svc = svc_task
             .await
             .map_err(|e| anyhow::anyhow!("service task panic: {e}"))?
