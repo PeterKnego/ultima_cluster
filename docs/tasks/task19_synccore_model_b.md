@@ -251,3 +251,8 @@ throughput attribution) is already merged on `main`-track independent of this de
 - Evidence: `docs/benchmarks/synccore-*`, `throughput-knee-attribution-*`,
   `linger-pipeline-frontier-*`, `pipeline-depth-sweep-*`, `floor-decomposition-2026-06-25.md`.
 - SDD ledger: `openraft/.superpowers/sdd/progress.md`.
+
+
+### 6c. SyncCore A/B on top of the purge fix (2026-07-01) — THROUGHPUT NULL, confirms ceiling is pipeline-bound
+
+After root-causing + fixing the real ~15k throughput ceiling (`Journal::purge_before` full-segment scan; `ultima_cluster` commit aa031e8, ceiling -> ~24-27k), re-ran the SyncCore-vs-RaftCore A/B **on top of the purge fix** (both arms carry it; openraft branch sync-core@a6a590ec, built via `-e uc_sync_core=true`; sync-core+purge-fix lin_register 3/3 green). **Throughput NULL at the ceiling** (RaftCore 24.2k vs SyncCore 24.9k @25k offered / inflight-256), because the ceiling is now the **apply/output/journal pipeline** (congestion collapse past ~256 concurrency) — orthogonal to the consensus choreography SyncCore optimizes. SyncCore edges that showed: **p99 2288ms vs 3708ms** (its latency signature) and NO congestion-collapse at the 30k rung where RaftCore collapsed to 2.6k (single noisy point, needs 3-5 repeats). Net: **the purge fix, not SyncCore, was the throughput win** — reinforces the shelve/decide-later disposition (SyncCore = latency play, not throughput). Doc: `docs/benchmarks/throughput-ceiling-root-cause-2026-07-01.md`.
