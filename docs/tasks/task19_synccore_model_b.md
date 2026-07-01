@@ -190,6 +190,20 @@ the load generator's `inflight`. Doc: `docs/benchmarks/leader-profile-inflight-2
   inflight ≥512 destabilizes (separate, unmeasured). Doc:
   `docs/benchmarks/leader-profile-inflight-2026-06-30.md` §5.
 
+### 6b. CORRECTION #2 (2026-07-01, log-entry-cache fleet A/B is NULL)
+
+The log entry cache (built to serve those reads from RAM) was measured on the fleet: **NULL —
+knee 15k with cache ON and OFF, `read()`+`crc32` unchanged.** Root cause: the bench runs **shmem
+mode** and the hot journal reads are the **UC apply/output/replay path reading the journal
+DIRECTLY** (`state_machine_shmem.rs:1153 journal.iter_range`, `output_replay.rs:132`), which
+BYPASS the cache (it only intercepts openraft `try_get_log_entries`). Driver: **599k `output_chan
+full` warnings** — the service can't keep up at 15k, so the node constantly replays committed
+entries from the journal into the service. **So §6a's "leader re-reads log FOR REPLICATION" was
+wrong for shmem mode — it's the apply/output pipeline (service falling behind).** The cache is
+correct + merge-ready but ineffective for shmem; the real throughput bottleneck is the shmem
+apply/output pipeline (re-diagnose the service apply rate + the `output_chan`/output_dispatcher).
+Doc: `docs/benchmarks/log-cache-win-null-2026-07-01.md`.
+
 ---
 
 ## 7. Known limitations / deferred (all documented)

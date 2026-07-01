@@ -96,6 +96,7 @@
         export UC_API_BATCH_LINGER_MS={{ uc_api_batch_linger_ms }}
         export UC_APPLY_SPIN_BUDGET={{ uc_apply_spin_budget }}
         export UC_NODE_BRIDGE_SPIN_BUDGET={{ uc_node_bridge_spin_budget }}
+        export UC_LOG_CACHE_BYTES={{ uc_log_cache_bytes }}
         setsid {{ uc_target_bin }}/uc-node-launch \
           --node-id $UC_NODE_ID --listen $UC_LISTEN $UC_PEERS \
           --app-id $UC_APP_ID --with-service \

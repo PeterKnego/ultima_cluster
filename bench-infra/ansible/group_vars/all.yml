@@ -20,6 +20,7 @@ uc_api_batch_linger_ms: 5       # openraft api_batch_linger_ms via UC_API_BATCH_
 # A/B: A arm = defaults below; B arm = -e uc_apply_spin_budget=busy uc_node_bridge_spin_budget=busy
 uc_apply_spin_budget: "64"          # service apply consumer SpscConsumer spin budget; 'busy'/'max' = pure busy-spin
 uc_node_bridge_spin_budget: "0"     # node submit+apply_resp NotifyBridge spin budget; 'busy'/'max' = busy parker
+uc_log_cache_bytes: 268435456        # UC_LOG_CACHE_BYTES: leader log-entry cache budget (task: log entry cache); default 256MiB, override -e uc_log_cache_bytes=0 to DISABLE (A/B the cache)
 # Floor-decomposition (layered e2e-delta): -e single_node=true runs only node0 as a 1-node raft
 # (no replication) so 1node vs 3node and eventual vs consistent deltas attribute the commit floor
 # into {base consensus+IPC, fsync, replication}. CSV config label auto-derives ('<n>node_<dura>').
