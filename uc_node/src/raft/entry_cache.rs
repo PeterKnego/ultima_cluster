@@ -110,9 +110,10 @@ impl EntryCache {
         }
     }
 
-    // Telemetry accessors: not yet wired to a reporting path but retained for
-    // future observability (node telemetry / tracing integration).
-    #[allow(dead_code)]
+    // Telemetry accessors. `hits` is asserted by the differential cache test;
+    // `misses` is retained for future observability (node telemetry / tracing).
+    // Both are gated so dead_code does not fire during library compilation.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) fn hits(&self) -> u64 { self.hits.load(Ordering::Relaxed) }
     #[allow(dead_code)]
     pub(crate) fn misses(&self) -> u64 { self.misses.load(Ordering::Relaxed) }

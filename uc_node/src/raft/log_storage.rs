@@ -517,6 +517,12 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             .map_err(journal_io)?
             .wait()
             .map_err(journal_io)?;
+        // The journal and cache are updated under separate locks (the journal's
+        // internal writer lock, then the cache's RwLock), not as a single atomic
+        // operation — spec §4 wording notwithstanding. This is safe because Raft
+        // only ever truncates uncommitted tail entries, and those entries are never
+        // concurrently read for apply or replication. Confirmed by the lincheck +
+        // partition suite (Task 3, cache ON).
         self.cache.truncate_after(keep_seq);
         Ok(())
     }
@@ -544,6 +550,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use openraft::storage::RaftLogStorage as _;
     use openraft::storage::RaftLogStorageExt as _;
     use openraft::vote::RaftLeaderId as _;
@@ -553,6 +560,7 @@ mod tests {
 
     use super::{parse_journal_prealloc, parse_prealloc_fill, JournalLogStorage};
     use crate::raft::entry_cache::Entry;
+    use crate::raft::AppCommand;
     use crate::raft::LeaderId;
     use crate::raft::RaftLogId;
 
@@ -568,13 +576,18 @@ mod tests {
         (store, dir)
     }
 
-    /// Append `count` Blank entries starting at `start` (1-based index).
-    /// Returns the cloned Vec so callers can inspect the appended entries.
+    /// Build a distinct per-index payload for use in Normal entries.
+    fn cmd_for_index(i: u64) -> AppCommand {
+        AppCommand(Bytes::from(format!("cmd-{i}")))
+    }
+
+    /// Append `count` Normal entries (distinct payload per index) starting at `start`.
+    /// Returns the cloned Vec so callers can compare against returned entries.
     async fn append_n(store: &mut JournalLogStorage, start: u64, count: u64) -> Vec<Entry> {
         let entries: Vec<Entry> = (start..start + count)
             .map(|i| Entry {
                 log_id: LogId::new(LeaderId::new(1, 1), i),
-                payload: EntryPayload::Blank,
+                payload: EntryPayload::Normal(cmd_for_index(i)),
             })
             .collect();
         let result = entries.clone();
@@ -582,8 +595,15 @@ mod tests {
         result
     }
 
-    fn entry_indexes(entries: &[Entry]) -> Vec<u64> {
-        entries.iter().map(|e| e.log_id.index).collect()
+    /// Extract (log_index, payload_bytes) for full-entry comparison.
+    /// A divergent cached payload is a linearizability violation — this helper
+    /// catches it where comparing indexes alone would not.
+    fn entry_key(e: &Entry) -> (u64, Bytes) {
+        let payload_bytes = match &e.payload {
+            EntryPayload::Normal(cmd) => cmd.0.clone(),
+            _ => Bytes::new(),
+        };
+        (e.log_id.index, payload_bytes)
     }
 
     fn log_id_at(index: u64) -> RaftLogId {
@@ -595,27 +615,45 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// For every query range and both cache budgets (0=disabled, 64MB=enabled),
-    /// `try_get_log_entries` must return the same log indexes as the journal.
-    /// This is the correctness guard: a wrong entry from the cache is a
-    /// linearizability violation.
+    /// `try_get_log_entries` must return byte-identical entries (index AND payload).
+    /// In the enabled arm, also asserts the cache actually served the in-window
+    /// reads — so a silent population regression causes the test to fail rather
+    /// than fall through to the journal and pass spuriously.
     #[tokio::test]
     async fn cache_reads_match_journal() {
         for budget in [0usize, 64 * 1024 * 1024] {
             let (mut store, _dir) = new_test_storage(budget).await;
-            let _appended = append_n(&mut store, 1, 20).await; // indexes 1..=20
+            append_n(&mut store, 1, 20).await; // indexes 1..=20
+
             for (lo, hi) in [(1u64, 21u64), (5, 15), (18, 21), (1, 2)] {
                 let got = store.try_get_log_entries(lo..hi).await.unwrap();
+                let expected: Vec<_> = (lo..hi)
+                    .map(|i| (i, Bytes::from(format!("cmd-{i}"))))
+                    .collect();
                 assert_eq!(
-                    entry_indexes(&got),
-                    (lo..hi).collect::<Vec<_>>(),
+                    got.iter().map(entry_key).collect::<Vec<_>>(),
+                    expected,
                     "budget={budget} range={lo}..{hi}"
                 );
             }
+
+            // Entries 1..=20 are fully within the 64 MB budget; every in-window
+            // read above must have been served by the cache, not the journal.
+            if budget > 0 {
+                assert!(
+                    store.cache.hits() > 0,
+                    "cache never hit — population regressed (budget={budget})"
+                );
+            }
+
             store.purge(log_id_at(5)).await.unwrap(); // remove <=5
             let got = store.try_get_log_entries(6u64..21).await.unwrap();
+            let expected: Vec<_> = (6u64..21)
+                .map(|i| (i, Bytes::from(format!("cmd-{i}"))))
+                .collect();
             assert_eq!(
-                entry_indexes(&got),
-                (6u64..21).collect::<Vec<_>>(),
+                got.iter().map(entry_key).collect::<Vec<_>>(),
+                expected,
                 "budget={budget} after purge"
             );
         }
