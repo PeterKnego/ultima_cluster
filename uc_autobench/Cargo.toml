@@ -29,7 +29,7 @@ hdrhistogram = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 uc_protocol = { path = "../uc_protocol" }
-uc_node = { path = "../uc_node", features = ["test-support"] }
+uc_node = { path = "../uc_node", features = ["test-support"], default-features = false }
 uc_service = { path = "../uc_service" }
 uc_client = { path = "../uc_client" }
 # journal-commit task (self-contained; no other uc_autobench bench uses it)
