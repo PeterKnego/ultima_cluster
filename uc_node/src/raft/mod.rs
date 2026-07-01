@@ -4,6 +4,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
+pub mod entry_cache; // log-entry tail cache (Task 1)
 pub mod log_storage; // Task 7
 pub mod state_machine; // M1/M2: embedded apply
 pub mod state_machine_shmem; // M3: apply via shmem ring
