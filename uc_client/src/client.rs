@@ -27,6 +27,21 @@ use crate::watchers::{StallWatchers, spawn_stall_watchers};
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const BACKPRESSURE_GRACE: Duration = Duration::from_secs(1);
+
+/// Per-request response timeout. Defaults to [`DEFAULT_REQUEST_TIMEOUT`] (10s);
+/// override with `UC_CLIENT_REQUEST_TIMEOUT_MS` (read once). Saturation/overload
+/// benchmarks raise this so a multi-second tail request isn't reported as a
+/// failure — the p99 legitimately reaches seconds past the throughput knee.
+fn request_timeout() -> Duration {
+    static T: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("UC_CLIENT_REQUEST_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT)
+    })
+}
 const RING_FULL_RETRY: Duration = Duration::from_micros(100);
 
 pub struct Client {
@@ -243,7 +258,8 @@ impl Client {
         }
 
         // Await response with stall + timeout selectors.
-        let timeout = tokio::time::sleep(DEFAULT_REQUEST_TIMEOUT);
+        let req_timeout = request_timeout();
+        let timeout = tokio::time::sleep(req_timeout);
         tokio::pin!(timeout);
 
         loop {
@@ -257,7 +273,7 @@ impl Client {
                 }
                 _ = &mut timeout => {
                     self.in_flight.remove(&local_seq);
-                    return Err(ClientError::Timeout(DEFAULT_REQUEST_TIMEOUT));
+                    return Err(ClientError::Timeout(req_timeout));
                 }
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     // Check stall flags.

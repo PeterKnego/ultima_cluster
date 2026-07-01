@@ -214,6 +214,7 @@ async fn run_step(
     let mut next_send = start;
     let mut seq: u64 = 0;
     let mut completed: u64 = 0;
+    let mut dropped: u64 = 0;
     let val = vec![0u8; payload_bytes];
     let mut gauge = ConcurrencyGauge::default();
 
@@ -247,8 +248,20 @@ async fn run_step(
         // completion, whichever is first.
         tokio::select! {
             Some(res) = inflight_set.next(), if !inflight_set.is_empty() => {
-                hist.record(res?.min(600_000_000_000))?;
-                completed += 1;
+                // A per-request timeout/error in deep overload must NOT abort the
+                // whole ladder step — count it as dropped and keep measuring, so
+                // saturation rungs report their achieved (goodput) rate instead of
+                // failing. (Pair with UC_CLIENT_REQUEST_TIMEOUT_MS to let the tail
+                // complete rather than drop.)
+                match res {
+                    Ok(latency) => {
+                        hist.record(latency.min(600_000_000_000))?;
+                        completed += 1;
+                    }
+                    Err(_) => {
+                        dropped += 1;
+                    }
+                }
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_send)),
                 if now < deadline && inflight_set.len() < inflight => {}
@@ -257,6 +270,16 @@ async fn run_step(
     }
 
     let achieved = completed as f64 / start.elapsed().as_secs_f64();
+    if dropped > 0 {
+        eprintln!(
+            "  [overload] target={:.0} inflight={} completed={} DROPPED={} ({:.1}% — client req-timeout; raise UC_CLIENT_REQUEST_TIMEOUT_MS)",
+            target_rate,
+            inflight,
+            completed,
+            dropped,
+            100.0 * dropped as f64 / (completed + dropped).max(1) as f64,
+        );
+    }
     Ok((hist, achieved, gauge.finish()))
 }
 

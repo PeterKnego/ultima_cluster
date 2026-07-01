@@ -154,6 +154,10 @@
         {{ warmup_seconds }}
         {{ remote_home }}/results/uc_sweep.csv
         {{ uc_sweep_config | default((1 if (single_node | default(false) | bool) else 3) | string + 'node_' + ('eventual' if durability == 'none' else 'consistent')) }}
+      environment:
+        # Per-request client timeout (ms). Raise for saturation/overload sweeps so
+        # a multi-second tail request isn't reported as a failure (default 10000).
+        UC_CLIENT_REQUEST_TIMEOUT_MS: "{{ uc_client_request_timeout_ms | default(10000) }}"
       when: node_role == "node0"
       changed_when: true
 
