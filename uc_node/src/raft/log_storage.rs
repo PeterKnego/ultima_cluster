@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use ultima_journal::{Durability, Journal, JournalConfig, StableValue, StableValueConfig};
 
 use super::{RaftLogId, RaftStoredMembership, RaftVote};
+use crate::raft::entry_cache::EntryCache;
 use crate::ClusterError;
 
 const SEGMENT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
@@ -54,6 +55,15 @@ fn journal_prealloc_fill_from_env() -> ultima_journal::PreallocFill {
     parse_prealloc_fill(std::env::var("UC_JOURNAL_PREALLOC_FILL").ok().as_deref())
 }
 
+/// `UC_LOG_CACHE_BYTES` — recent-entry cache budget in bytes; 0 disables. Default 256 MiB.
+const LOG_CACHE_BYTES_DEFAULT: usize = 256 * 1024 * 1024;
+fn log_cache_bytes_from_env() -> usize {
+    std::env::var("UC_LOG_CACHE_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(LOG_CACHE_BYTES_DEFAULT)
+}
+
 /// Persisted snapshot meta (the last installed snapshot's metadata + a
 /// pointer to its bytes file under data_dir).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -88,6 +98,10 @@ pub struct JournalLogStorage {
     /// Serializes seq assignment per the journal's caller-coordination requirement.
     /// openraft already serializes appends, so this is a no-contention guarantee.
     pub(crate) append_lock: Arc<Mutex<()>>,
+    /// In-memory cache of recent log entries; shared with all log readers via `Arc`.
+    /// Populated on `append`, consulted on `try_get_log_entries`, evicted on
+    /// `truncate_after`/`purge`. `budget_bytes=0` disables; see `UC_LOG_CACHE_BYTES`.
+    pub(crate) cache: Arc<EntryCache>,
 }
 
 impl JournalLogStorage {
@@ -163,6 +177,7 @@ impl JournalLogStorage {
             snapshot_meta,
             output_progress,
             append_lock: Arc::new(Mutex::new(())),
+            cache: Arc::new(EntryCache::new(log_cache_bytes_from_env())),
         })
     }
 
@@ -202,6 +217,17 @@ impl JournalLogStorage {
             snapshot_meta: self.snapshot_meta.clone(),
             output_progress: self.output_progress.clone(),
             data_dir,
+        }
+    }
+
+    /// Replace the cache with a given budget (test/test-helpers only).
+    /// Allows tests to exercise both enabled (budget>0) and disabled (budget=0)
+    /// code paths without touching the process env (which is racy under parallel tests).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) fn _with_cache_budget(self, budget_bytes: usize) -> Self {
+        Self {
+            cache: Arc::new(EntryCache::new(budget_bytes)),
+            ..self
         }
     }
 
@@ -276,6 +302,23 @@ impl RaftLogReader<TypeConfig> for JournalLogStorage {
         &mut self,
         range: RB,
     ) -> Result<Vec<<TypeConfig as openraft::RaftTypeConfig>::Entry>, io::Error> {
+        use std::ops::Bound;
+        // Resolve to concrete [start, end). Unbounded ends can't be cache-checked
+        // (we don't know the tail) → fall through to the journal.
+        let start = match range.start_bound() {
+            Bound::Included(&s) => Some(s),
+            Bound::Excluded(&s) => Some(s + 1),
+            Bound::Unbounded => None,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(&e) => Some(e + 1),
+            Bound::Excluded(&e) => Some(e),
+            Bound::Unbounded => None,
+        };
+        if let (Some(start), Some(end)) = (start, end) && let Some(entries) = self.cache.get_range(start, end) {
+            return Ok(entries);
+        }
+        // Cache miss or unbounded range → read from the journal.
         let iter = self.journal.iter_range(range).map_err(journal_io)?;
         let mut entries = Vec::new();
         for record in iter {
@@ -364,6 +407,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             snapshot_meta: self.snapshot_meta.clone(),
             output_progress: self.output_progress.clone(),
             append_lock: self.append_lock.clone(),
+            cache: self.cache.clone(),
         }
     }
 
@@ -428,6 +472,9 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             last_notifier = Some(notifier);
             uc_protocol::probes::stamp_log(seq, uc_protocol::probes::Checkpoint::JournalAppended);
             probe_last_seq = Some(seq);
+            // Populate the cache after the journal write succeeds. `entry` is still
+            // owned here (encode_to_vec borrows; term/seq are field copies). Move it in.
+            self.cache.append_entry(seq, entry, payload.len());
         }
 
         if let (Some(notifier), Some(probe_seq)) = (last_notifier, probe_last_seq) {
@@ -470,6 +517,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             .map_err(journal_io)?
             .wait()
             .map_err(journal_io)?;
+        self.cache.truncate_after(keep_seq);
         Ok(())
     }
 
@@ -488,13 +536,90 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             .map_err(sv_io)?
             .wait()
             .map_err(journal_io)?;
+        // Evict entries with seq <= log_id.index (mirrors journal's purge_before semantics).
+        self.cache.purge_upto(log_id.index);
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_journal_prealloc, parse_prealloc_fill};
+    use openraft::storage::RaftLogStorage as _;
+    use openraft::storage::RaftLogStorageExt as _;
+    use openraft::vote::RaftLeaderId as _;
+    use openraft::RaftLogReader as _;
+    use openraft::{EntryPayload, LogId};
+    use tempfile::TempDir;
+
+    use super::{parse_journal_prealloc, parse_prealloc_fill, JournalLogStorage};
+    use crate::raft::entry_cache::Entry;
+    use crate::raft::LeaderId;
+    use crate::raft::RaftLogId;
+
+    // -----------------------------------------------------------------------
+    // Helpers for cache differential tests
+    // -----------------------------------------------------------------------
+
+    async fn new_test_storage(budget: usize) -> (JournalLogStorage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let store = JournalLogStorage::open(dir.path())
+            .expect("open")
+            ._with_cache_budget(budget);
+        (store, dir)
+    }
+
+    /// Append `count` Blank entries starting at `start` (1-based index).
+    /// Returns the cloned Vec so callers can inspect the appended entries.
+    async fn append_n(store: &mut JournalLogStorage, start: u64, count: u64) -> Vec<Entry> {
+        let entries: Vec<Entry> = (start..start + count)
+            .map(|i| Entry {
+                log_id: LogId::new(LeaderId::new(1, 1), i),
+                payload: EntryPayload::Blank,
+            })
+            .collect();
+        let result = entries.clone();
+        store.blocking_append(entries).await.expect("append_n");
+        result
+    }
+
+    fn entry_indexes(entries: &[Entry]) -> Vec<u64> {
+        entries.iter().map(|e| e.log_id.index).collect()
+    }
+
+    fn log_id_at(index: u64) -> RaftLogId {
+        LogId::new(LeaderId::new(1, 1), index)
+    }
+
+    // -----------------------------------------------------------------------
+    // Differential test: cache-served entries == journal-served entries
+    // -----------------------------------------------------------------------
+
+    /// For every query range and both cache budgets (0=disabled, 64MB=enabled),
+    /// `try_get_log_entries` must return the same log indexes as the journal.
+    /// This is the correctness guard: a wrong entry from the cache is a
+    /// linearizability violation.
+    #[tokio::test]
+    async fn cache_reads_match_journal() {
+        for budget in [0usize, 64 * 1024 * 1024] {
+            let (mut store, _dir) = new_test_storage(budget).await;
+            let _appended = append_n(&mut store, 1, 20).await; // indexes 1..=20
+            for (lo, hi) in [(1u64, 21u64), (5, 15), (18, 21), (1, 2)] {
+                let got = store.try_get_log_entries(lo..hi).await.unwrap();
+                assert_eq!(
+                    entry_indexes(&got),
+                    (lo..hi).collect::<Vec<_>>(),
+                    "budget={budget} range={lo}..{hi}"
+                );
+            }
+            store.purge(log_id_at(5)).await.unwrap(); // remove <=5
+            let got = store.try_get_log_entries(6u64..21).await.unwrap();
+            assert_eq!(
+                entry_indexes(&got),
+                (6u64..21).collect::<Vec<_>>(),
+                "budget={budget} after purge"
+            );
+        }
+    }
 
     #[test]
     fn prealloc_unset_is_on() {

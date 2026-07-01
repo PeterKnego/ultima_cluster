@@ -1,8 +1,6 @@
 //! In-memory cache of recent log entries (the log tail), serving replication/apply
 //! reads from RAM instead of re-reading the journal's ext4 segments. See
 //! docs/superpowers/specs/2026-07-01-log-entry-cache-design.md.
-// Items are pub(crate) but only wired in Task 2 (log_storage.rs integration).
-#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -95,7 +93,7 @@ impl EntryCache {
     pub(crate) fn truncate_after(&self, keep_seq: u64) {
         if !self.enabled() { return; }
         let mut g = self.inner.write();
-        while let Some((_, _)) = g.entries.back() {
+        while !g.entries.is_empty() {
             let last = g.base_seq + g.entries.len() as u64 - 1;
             if last > keep_seq {
                 if let Some((_, s)) = g.entries.pop_back() { g.bytes -= s; }
@@ -112,7 +110,11 @@ impl EntryCache {
         }
     }
 
+    // Telemetry accessors: not yet wired to a reporting path but retained for
+    // future observability (node telemetry / tracing integration).
+    #[allow(dead_code)]
     pub(crate) fn hits(&self) -> u64 { self.hits.load(Ordering::Relaxed) }
+    #[allow(dead_code)]
     pub(crate) fn misses(&self) -> u64 { self.misses.load(Ordering::Relaxed) }
 }
 
