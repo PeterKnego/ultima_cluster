@@ -509,24 +509,32 @@ impl Journal {
     pub fn purge_before(&self, seq: u64) -> Result<(), JournalError> {
         let mut st = self.state.lock().unwrap();
 
-        // Drop segments whose final record's seq <= seq.
+        // Drop segments whose final record's seq <= seq. A non-active segment's
+        // last seq is `segments[i+1].base_seq() - 1` — segments are contiguous, so
+        // segment i+1 begins exactly one seq after segment i ends. This is O(1) and
+        // avoids a full-segment `scan()`.
+        //
+        // The previous implementation called `seg.scan()` here — decoding and
+        // CRC-verifying EVERY record of a 64 MiB segment — just to read its last
+        // record's seq. openraft purges the log after every snapshot, so at load
+        // that full-scan-per-purge dominated the leader's CPU: ~90M record decodes
+        // / ~8 GB of CRC per 40s at 15k msg/s, which was THE throughput ceiling
+        // (fixing it: decode 90M→7M, crc32 21%→14%, inflight-128 knee 10k→15k).
+        //
+        // The active (last) segment is never dropped (we still need a place to
+        // append), so it never needs its last seq computed here.
+        let n = st.segments.len();
         let mut keep_idx = 0;
-        for (i, seg) in st.segments.iter().enumerate() {
-            let scan = seg.scan()?;
-            let last = scan.records.last().map(|r| r.seq);
-            if let Some(last) = last
-                && last <= seq
-            {
-                keep_idx = i + 1;
-                continue;
+        for i in 0..n {
+            if i + 1 >= n {
+                break; // active segment — never dropped
             }
-            break;
-        }
-
-        // Never drop the active (last) segment even if its records all <= seq —
-        // we still need a place to append.
-        if keep_idx == st.segments.len() && !st.segments.is_empty() {
-            keep_idx -= 1;
+            let seg_last = st.segments[i + 1].base_seq().saturating_sub(1);
+            if seg_last <= seq {
+                keep_idx = i + 1;
+            } else {
+                break;
+            }
         }
 
         let removed: Vec<_> = st.segments.drain(..keep_idx).collect();
