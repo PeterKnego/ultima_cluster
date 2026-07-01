@@ -76,3 +76,39 @@ change remains.
 `output_progress` marker with a per-entry fsync (now batch-coalesced in `ada14e1`, but the
 per-entry shmem round-trip remains). This is **off the client-response critical path** (apply
 `try_send`s and drops on full), so it does not gate throughput; it is an efficiency follow-up.
+
+## Post-fix ceiling curve (multi-threaded load client, 3-node consistent, linger=2)
+
+With the load client fixed (`commit-path-load` now multi-threaded + spawn-per-request, so it can
+drive inflight ≥ 512 — see below), the full concurrency sweep (max achieved per inflight, offered
+ladder 20/30/45/60k, two runs):
+
+| inflight | max achieved | note |
+|---|---|---|
+| 128 | 18.7–20.3k | |
+| **256** | **23.7–26.6k** | **peak (the ceiling)** |
+| 512 | 19.1k | declining; 60k rung collapsed to 1.5k |
+| 1024 | 11.9k | congestion collapse |
+| 2048 | 14.2k | congestion collapse |
+
+**The cluster ceiling is ~24–27k msg/s, at an optimal concurrency of ~256 in-flight.** Beyond
+that the system does **not** scale — it suffers **congestion collapse** (goodput *falls* as
+concurrency/offered-load rise: e.g. 60k-offered at inflight=512 collapsed to 1.5k). So the answer
+to "how high does it go" is a peak, not a plateau: push past ~256 concurrency and throughput
+degrades. p99 at the top rungs is multi-second (coordinated-omission latency under overload).
+
+Net vs the start of the investigation: the *measured* ceiling went from a **hidden ~15k** (the
+old client's 10s timeout aborted the overload rungs, and it couldn't drive past inflight=256) to
+a **real ~24–27k peak** after the `purge_before` fix — with the operating sweet spot at ~256
+in-flight.
+
+### The load-client stall at inflight ≥ 512 (fixed)
+
+`commit-path-load` ran on a single-threaded tokio runtime (`current_thread`) and polled all N
+in-flight futures in one `FuturesUnordered` on one task; the client's response-reader is a
+`tokio::spawn` task, so it shared that one core, and each in-flight future also woke a 100ms
+stall-check timer + grabbed a shared mutex. At inflight ≥ 512 the core saturated, the reader
+starved, and the rung never finished (900s cell timeout) — a *load-generator* limit, not the
+cluster. Fixed by switching to a multi-threaded runtime and spawning each request as its own task
+under a `Semaphore(inflight)` cap (commits `36c0a5a`, `1bb9108`). The cluster itself handled
+256-concurrency fine; it's the *excess* concurrency that triggers congestion collapse.
