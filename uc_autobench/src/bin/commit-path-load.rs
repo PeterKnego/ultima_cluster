@@ -7,9 +7,8 @@
 //! a multi_thread runtime intermittently times out the shmem handshake.
 
 use std::io::{Read, Write};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use futures::stream::{FuturesUnordered, StreamExt};
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use uc_service::{SnapshotError, StateMachine};
@@ -198,7 +197,7 @@ impl ConcurrencyGauge {
 }
 
 async fn run_step(
-    client: &uc_client::Client,
+    client: Arc<uc_client::Client>,
     target_rate: f64,
     inflight: usize,
     duration: Duration,
@@ -210,69 +209,84 @@ async fn run_step(
     let start = Instant::now();
     let deadline = start + duration;
 
-    let mut inflight_set = FuturesUnordered::new();
+    // Concurrency cap: `inflight` permits. Each request is a spawned task (so the
+    // multi-threaded runtime spreads them across cores); acquiring a permit blocks
+    // (backpressure) when the cluster can't keep up, turning the open loop into a
+    // closed loop at saturation. Results (Some(latency_ns) | None=dropped) return
+    // via the channel so a straggler can't abort the step.
+    let sem = Arc::new(tokio::sync::Semaphore::new(inflight));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Option<u64>>();
+    let val = Arc::new(vec![0u8; payload_bytes]);
     let mut next_send = start;
     let mut seq: u64 = 0;
     let mut completed: u64 = 0;
     let mut dropped: u64 = 0;
-    let val = vec![0u8; payload_bytes];
     let mut gauge = ConcurrencyGauge::default();
 
     loop {
         let now = Instant::now();
-        if now >= deadline && inflight_set.is_empty() {
+        if now >= deadline {
             break;
         }
-
-        // Launch all sends whose intended time has arrived, up to the cap.
-        while now >= next_send && inflight_set.len() < inflight && next_send < deadline {
-            let intended = next_send;
-            let cmd = KvCmd::Put {
-                key: seq % 4096,
-                val: val.clone(),
-            };
-            seq += 1;
-            next_send += period;
-            inflight_set.push(async move {
-                let _r: u64 = client.submit(&cmd).await?;
-                Ok::<_, anyhow::Error>(intended.elapsed().as_nanos() as u64)
-            });
+        // Pace to the open-loop schedule.
+        if now < next_send {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(next_send)).await;
         }
+        // Acquire a permit (caps concurrency at `inflight`; blocks under saturation).
+        let permit = Arc::clone(&sem)
+            .acquire_owned()
+            .await
+            .expect("semaphore not closed");
+        gauge.sample(inflight - sem.available_permits());
+        let intended = next_send;
+        next_send += period;
+        let sq = seq;
+        seq += 1;
+        let client = Arc::clone(&client);
+        let val = Arc::clone(&val);
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let cmd = KvCmd::Put {
+                key: sq % 4096,
+                val: (*val).clone(),
+            };
+            let outcome = match client.submit::<_, u64>(&cmd).await {
+                Ok(_) => Some(intended.elapsed().as_nanos() as u64),
+                Err(_) => None, // straggler timeout/error — counted as dropped
+            };
+            let _ = tx.send(outcome);
+            drop(permit);
+        });
 
-        // Sample concurrency AFTER launching, so it reflects the true working
-        // set we are about to await — not the post-drain count from the prior
-        // iteration (which systematically under-reports by one).
-        gauge.sample(inflight_set.len());
-
-        // Drain whatever completed, or wait until the next scheduled send / a
-        // completion, whichever is first.
-        tokio::select! {
-            Some(res) = inflight_set.next(), if !inflight_set.is_empty() => {
-                // A per-request timeout/error in deep overload must NOT abort the
-                // whole ladder step — count it as dropped and keep measuring, so
-                // saturation rungs report their achieved (goodput) rate instead of
-                // failing. (Pair with UC_CLIENT_REQUEST_TIMEOUT_MS to let the tail
-                // complete rather than drop.)
-                match res {
-                    Ok(latency) => {
-                        hist.record(latency.min(600_000_000_000))?;
-                        completed += 1;
-                    }
-                    Err(_) => {
-                        dropped += 1;
-                    }
+        // Non-blocking drain of any completed results to keep counters current.
+        while let Ok(outcome) = rx.try_recv() {
+            match outcome {
+                Some(l) => {
+                    hist.record(l.min(600_000_000_000))?;
+                    completed += 1;
                 }
+                None => dropped += 1,
             }
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_send)),
-                if now < deadline && inflight_set.len() < inflight => {}
-            else => { break; }
+        }
+    }
+
+    // Stop spawning; drop our sender so `rx` closes once all in-flight tasks finish,
+    // then drain the tail.
+    drop(tx);
+    while let Some(outcome) = rx.recv().await {
+        match outcome {
+            Some(l) => {
+                hist.record(l.min(600_000_000_000))?;
+                completed += 1;
+            }
+            None => dropped += 1,
         }
     }
 
     let achieved = completed as f64 / start.elapsed().as_secs_f64();
     if dropped > 0 {
         eprintln!(
-            "  [overload] target={:.0} inflight={} completed={} DROPPED={} ({:.1}% — client req-timeout; raise UC_CLIENT_REQUEST_TIMEOUT_MS)",
+            "  [overload] target={:.0} inflight={} completed={} DROPPED={} ({:.1}% — raise UC_CLIENT_REQUEST_TIMEOUT_MS)",
             target_rate,
             inflight,
             completed,
@@ -330,7 +344,12 @@ where
     s.split(',').map(|x| x.trim().parse().unwrap()).collect()
 }
 
-#[tokio::main(flavor = "current_thread")]
+// Multi-threaded runtime: at high inflight the driver must spread the in-flight
+// request futures + the client's response-reader task across cores. On the old
+// single-threaded (`current_thread`) runtime one core saturated at inflight >= 512
+// (each in-flight future also wakes a 100ms stall-check timer), starving the
+// response path and stalling the sweep. run_step now spawns each request as a task.
+#[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -361,29 +380,32 @@ async fn main() -> anyhow::Result<()> {
     // (--connect, Phase 2 multi-process) or spawn the in-process single-node
     // fixture (Phase 1). Both bindings must outlive the run, so declare them
     // before the branch.
+    // run_step spawns each request as a task, so it needs an owned, 'static
+    // `Arc<Client>` (not the fixture's borrowed `&Client`). Both paths connect a
+    // dedicated client and wrap it in an Arc.
     let fixture: Option<ClusterFixture<KvSm>>;
-    let owned_client;
-    let client: &uc_client::Client = if let Some(dir) = &args.connect {
+    let client: Arc<uc_client::Client> = if let Some(dir) = &args.connect {
         eprintln!(
             "commit-path-load: attaching to running cluster at {} (app_id={})",
             dir.display(),
             args.app_id
         );
-        owned_client = uc_client::Client::connect(dir, &args.app_id).await?;
         fixture = None;
-        &owned_client
+        Arc::new(uc_client::Client::connect(dir, &args.app_id).await?)
     } else {
-        fixture = Some(ClusterFixture::<KvSm>::single_node(1).await?);
-        fixture.as_ref().unwrap().client(0)
+        let f = ClusterFixture::<KvSm>::single_node(1).await?;
+        let c = Arc::new(uc_client::Client::connect(f.instance_path(), f.app_id()).await?);
+        fixture = Some(f);
+        c
     };
 
     for &inflight in &inflights {
         for &rate in &rates {
             // Warmup (discarded).
-            let _ = run_step(client, rate, inflight, warmup, args.payload_bytes).await?;
+            let _ = run_step(client.clone(), rate, inflight, warmup, args.payload_bytes).await?;
             // Measured.
             let (hist, achieved, conc) =
-                run_step(client, rate, inflight, window, args.payload_bytes).await?;
+                run_step(client.clone(), rate, inflight, window, args.payload_bytes).await?;
             eprintln!(
                 "  [gauge] inflight cap={inflight} actual mean={:.1} max={}",
                 conc.mean, conc.max
