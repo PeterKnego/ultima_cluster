@@ -20,6 +20,7 @@ openraft-legacy = { workspace = true }
 ultima-journal = { workspace = true }
 uc_protocol = { path = "../uc_protocol" }
 uc_service = { path = "../uc_service" }
+uc-rt-busyspin = { path = "../uc-rt-busyspin", optional = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 rcgen = { workspace = true }
@@ -48,7 +49,22 @@ ultima-db = { workspace = true }
 uc-lincheck = { path = "../uc-lincheck" }
 
 [features]
+default = ["sync-core"]  # SyncCore (synchronous consensus) is the default model; --no-default-features for RaftCore
 test-helpers = []
+# Experimental: build openraft with the synchronous SyncCore (instead of async RaftCore).
+# Orthogonal to busyspin-runtime — uses the default tokio runtime; SyncCore's consensus
+# thread enters the app's tokio runtime as a hybrid reactor, and the durability consumer
+# drives UC's journal RaftLogStorage reactor-free under block_on. Public Raft API unchanged,
+# so no UC code changes. Default off.
+#   cargo test -p uc_node --features sync-core --test m1_single_node
+sync-core = ["openraft/sync-core"]
+# Experimental: run openraft's internal tasks on the busy-spin AsyncRuntime
+# (crate `uc-rt-busyspin`) instead of tokio. Single- and multi-node consensus
+# work (multi-node via the hybrid tokio-reactor; busy-spin workers enter the
+# app's runtime for quinn I/O). Default off. See
+# docs/openraft-busyspin-runtime-feasibility.md.
+#   cargo test -p uc_node --features busyspin-runtime --test m1_single_node
+busyspin-runtime = ["dep:uc-rt-busyspin"]
 # Reusable in-process node+service+client fixtures (see src/test_support.rs).
 # Used by uc_node's own M4 integration tests and by the uc_autobench shmem-e2e binary.
 test-support = ["dep:uc_client", "dep:tempfile", "dep:anyhow"]

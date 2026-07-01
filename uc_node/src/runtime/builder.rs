@@ -25,10 +25,14 @@ use crate::raft::state_machine_shmem::ShmemAdaptedStateMachine;
 use crate::raft::{NodeAddr, NodeId, TypeConfig};
 
 /// Default openraft `api_batch_linger_ms` for UC (ms the leader waits to fill a
-/// ClientWrite batch before flushing — a throughput-for-latency trade; openraft's
-/// own default is 0). This is the dominant end-to-end commit-latency term
-/// (task13 §15 `proposed→received`), so it is exposed as a tunable.
-const API_BATCH_LINGER_MS_DEFAULT: u64 = 5;
+/// ClientWrite batch before flushing). Set to 2ms per the 2026-06-30 fleet linger
+/// frontier (docs/benchmarks/linger-pipeline-frontier-2026-06-30.md): 2ms strictly
+/// dominates the previous 5ms — 2× the throughput knee (5k→10k msg/s) AND lower
+/// latency at every load — because linger only buys fsync/proposal batching and
+/// fsync is NOT the throughput bottleneck (the attribution proved it), so the 5ms
+/// wait was pure cost. openraft's own default is 0; `UC_API_BATCH_LINGER_MS`
+/// overrides for rollback / tuning.
+const API_BATCH_LINGER_MS_DEFAULT: u64 = 2;
 
 /// Parse the `UC_API_BATCH_LINGER_MS` value; falls back to the default on
 /// missing/non-numeric. Pure helper so it can be unit-tested without the env.
@@ -41,8 +45,8 @@ fn parse_api_batch_linger_ms(s: Option<&str>) -> u64 {
 }
 
 /// Runtime-configurable `api_batch_linger_ms`. Reads `UC_API_BATCH_LINGER_MS`;
-/// default 5ms (current behavior). Set `=0` for lowest latency (smaller batches,
-/// lower throughput). A/B'd via `uc_autobench/scripts/linger-commit-ab.md`.
+/// default 2ms (see `API_BATCH_LINGER_MS_DEFAULT`). Override (e.g. `=5` to roll
+/// back, `=0` for absolute lowest p50) for tuning.
 fn api_batch_linger_ms_from_env() -> u64 {
     parse_api_batch_linger_ms(std::env::var("UC_API_BATCH_LINGER_MS").ok().as_deref())
 }
@@ -403,6 +407,31 @@ where
         #[cfg(feature = "fault-injection")]
         fault_table,
     };
+
+    // Periodic cache hit/miss telemetry (Task 3). Clone the cache Arc before
+    // `log_storage` is consumed by `Raft::new` below. The background task is
+    // detached — it runs until the tokio runtime drops (node shutdown). We
+    // deliberately skip storing the JoinHandle to avoid plumbing a new field
+    // into NodeHandle for a debug-log-only task; the task loop exits naturally
+    // when the runtime shuts down. Relaxed loads — approximate counters only.
+    {
+        let cache = log_storage.cache.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(5));
+            interval.set_missed_tick_behavior(
+                tokio::time::MissedTickBehavior::Skip,
+            );
+            loop {
+                interval.tick().await;
+                tracing::debug!(
+                    hits = cache.hits(),
+                    misses = cache.misses(),
+                    "log_entry_cache"
+                );
+            }
+        });
+    }
 
     // Build the factory + raft + server for the selected transport. Both arms
     // produce the same `Raft<TypeConfig, A>` (network type is erased into

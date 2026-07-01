@@ -1,4 +1,31 @@
 ---
+# --- Root-cause fix for the intermittent ~62s "Timeout waiting for privilege
+# escalation prompt" / all-hosts-UNREACHABLE flake (see
+# docs/benchmarks/synccore-fleet-2026-06-29.md). On cloud hosts whose own name
+# is not in /etc/hosts and whose reverse-DNS resolver is slow, every `sudo`
+# (and sshd at connect) stalls on getaddrinfo of the host's own hostname until
+# the lookup times out — exactly the low-load, self-recovering signature seen.
+# These two idempotent tasks remove the stall permanently and, because they
+# persist on disk, fix every later `iterate.yml` relaunch (the path that hung
+# the denoising batch), not just this provision run. Placed FIRST so the rest
+# of provisioning runs against an already-fast sudo. ------------------------
+- name: Map the host's own name to a local address (kills sudo getaddrinfo stall)
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    line: "127.0.1.1 {{ ansible_fqdn }} {{ ansible_hostname }}"
+    regexp: '^127\.0\.1\.1\s'
+    state: present
+    create: false
+
+- name: Disable sshd reverse-DNS lookups (UseDNS no — avoids connect-time stall)
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    line: "UseDNS no"
+    regexp: '^\s*#?\s*UseDNS\b'
+    state: present
+    validate: "/usr/sbin/sshd -t -f %s"
+  notify: Reload sshd
+
 - name: Install tuning tools
   ansible.builtin.apt:
     name: [linux-tools-common, util-linux, tuned, e2fsprogs]

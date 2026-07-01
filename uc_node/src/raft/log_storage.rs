@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use ultima_journal::{Durability, Journal, JournalConfig, StableValue, StableValueConfig};
 
 use super::{RaftLogId, RaftStoredMembership, RaftVote};
+use crate::raft::entry_cache::EntryCache;
 use crate::ClusterError;
 
 const SEGMENT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
@@ -54,6 +55,15 @@ fn journal_prealloc_fill_from_env() -> ultima_journal::PreallocFill {
     parse_prealloc_fill(std::env::var("UC_JOURNAL_PREALLOC_FILL").ok().as_deref())
 }
 
+/// `UC_LOG_CACHE_BYTES` — recent-entry cache budget in bytes; 0 disables. Default 256 MiB.
+const LOG_CACHE_BYTES_DEFAULT: usize = 256 * 1024 * 1024;
+fn log_cache_bytes_from_env() -> usize {
+    std::env::var("UC_LOG_CACHE_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(LOG_CACHE_BYTES_DEFAULT)
+}
+
 /// Persisted snapshot meta (the last installed snapshot's metadata + a
 /// pointer to its bytes file under data_dir).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -88,6 +98,10 @@ pub struct JournalLogStorage {
     /// Serializes seq assignment per the journal's caller-coordination requirement.
     /// openraft already serializes appends, so this is a no-contention guarantee.
     pub(crate) append_lock: Arc<Mutex<()>>,
+    /// In-memory cache of recent log entries; shared with all log readers via `Arc`.
+    /// Populated on `append`, consulted on `try_get_log_entries`, evicted on
+    /// `truncate_after`/`purge`. `budget_bytes=0` disables; see `UC_LOG_CACHE_BYTES`.
+    pub(crate) cache: Arc<EntryCache>,
 }
 
 impl JournalLogStorage {
@@ -163,6 +177,7 @@ impl JournalLogStorage {
             snapshot_meta,
             output_progress,
             append_lock: Arc::new(Mutex::new(())),
+            cache: Arc::new(EntryCache::new(log_cache_bytes_from_env())),
         })
     }
 
@@ -202,6 +217,17 @@ impl JournalLogStorage {
             snapshot_meta: self.snapshot_meta.clone(),
             output_progress: self.output_progress.clone(),
             data_dir,
+        }
+    }
+
+    /// Replace the cache with a given budget (test/test-helpers only).
+    /// Allows tests to exercise both enabled (budget>0) and disabled (budget=0)
+    /// code paths without touching the process env (which is racy under parallel tests).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) fn _with_cache_budget(self, budget_bytes: usize) -> Self {
+        Self {
+            cache: Arc::new(EntryCache::new(budget_bytes)),
+            ..self
         }
     }
 
@@ -271,11 +297,46 @@ fn journal_io(e: ultima_journal::JournalError) -> io::Error {
     io::Error::other(e)
 }
 
+/// Cap for a single `limited_get_log_entries` replication read.
+///
+/// openraft's DEFAULT `limited_get_log_entries` returns the FULL, unbounded
+/// `[start, end)` range. When a follower lags under load, that materializes the
+/// entire gap in ONE call — a multi-MB journal read + CRC-verify + huge buffer
+/// alloc that saturates a single core (observed as ~20% `read()` + ~21% `crc32`
+/// on the leader's busiest thread at the ~15k ceiling), and it is
+/// self-reinforcing: a big read makes a big AppendEntries, which the follower is
+/// slow to append+fsync, which grows the gap, which makes the next read bigger.
+///
+/// openraft sends at most `max_payload_entries` (default 300, UC default 300)
+/// entries per AppendEntries regardless, so returning more is pure waste. We cap
+/// each read to this bound; openraft explicitly tolerates a short return
+/// (`replication/stream_state.rs` — "limited_get_log_entries will return logs
+/// smaller than the range"), so replication simply catches up in bounded chunks.
+/// Kept comfortably above the 300 default so a full batch is never starved.
+const LIMITED_GET_MAX_ENTRIES: u64 = 512;
+
 impl RaftLogReader<TypeConfig> for JournalLogStorage {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,
         range: RB,
     ) -> Result<Vec<<TypeConfig as openraft::RaftTypeConfig>::Entry>, io::Error> {
+        use std::ops::Bound;
+        // Resolve to concrete [start, end). Unbounded ends can't be cache-checked
+        // (we don't know the tail) → fall through to the journal.
+        let start = match range.start_bound() {
+            Bound::Included(&s) => Some(s),
+            Bound::Excluded(&s) => Some(s + 1),
+            Bound::Unbounded => None,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(&e) => Some(e + 1),
+            Bound::Excluded(&e) => Some(e),
+            Bound::Unbounded => None,
+        };
+        if let (Some(start), Some(end)) = (start, end) && let Some(entries) = self.cache.get_range(start, end) {
+            return Ok(entries);
+        }
+        // Cache miss or unbounded range → read from the journal.
         let iter = self.journal.iter_range(range).map_err(journal_io)?;
         let mut entries = Vec::new();
         for record in iter {
@@ -288,6 +349,21 @@ impl RaftLogReader<TypeConfig> for JournalLogStorage {
             entries.push(entry);
         }
         Ok(entries)
+    }
+
+    /// Bounded replication read. openraft's default returns the whole unbounded
+    /// `[start, end)`; we cap it to `LIMITED_GET_MAX_ENTRIES` so a lagging
+    /// follower cannot force an unbounded catch-up read (the ~15k-ceiling cause).
+    /// A short return is contractually fine — openraft advances in chunks. The
+    /// capped range is near-tail and small, so it is usually served straight from
+    /// the entry cache (`try_get_log_entries`), never touching the journal.
+    async fn limited_get_log_entries(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<<TypeConfig as openraft::RaftTypeConfig>::Entry>, io::Error> {
+        let capped_end = end.min(start.saturating_add(LIMITED_GET_MAX_ENTRIES));
+        self.try_get_log_entries(start..capped_end).await
     }
 
     async fn read_vote(&mut self) -> Result<Option<RaftVote>, io::Error> {
@@ -364,6 +440,7 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             snapshot_meta: self.snapshot_meta.clone(),
             output_progress: self.output_progress.clone(),
             append_lock: self.append_lock.clone(),
+            cache: self.cache.clone(),
         }
     }
 
@@ -428,6 +505,9 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             last_notifier = Some(notifier);
             uc_protocol::probes::stamp_log(seq, uc_protocol::probes::Checkpoint::JournalAppended);
             probe_last_seq = Some(seq);
+            // Populate the cache after the journal write succeeds. `entry` is still
+            // owned here (encode_to_vec borrows; term/seq are field copies). Move it in.
+            self.cache.append_entry(seq, entry, payload.len());
         }
 
         if let (Some(notifier), Some(probe_seq)) = (last_notifier, probe_last_seq) {
@@ -470,6 +550,13 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             .map_err(journal_io)?
             .wait()
             .map_err(journal_io)?;
+        // The journal and cache are updated under separate locks (the journal's
+        // internal writer lock, then the cache's RwLock), not as a single atomic
+        // operation — spec §4 wording notwithstanding. This is safe because Raft
+        // only ever truncates uncommitted tail entries, and those entries are never
+        // concurrently read for apply or replication. Confirmed by the lincheck +
+        // partition suite (Task 3, cache ON).
+        self.cache.truncate_after(keep_seq);
         Ok(())
     }
 
@@ -488,13 +575,122 @@ impl RaftLogStorage<TypeConfig> for JournalLogStorage {
             .map_err(sv_io)?
             .wait()
             .map_err(journal_io)?;
+        // Evict entries with seq <= log_id.index (mirrors journal's purge_before semantics).
+        self.cache.purge_upto(log_id.index);
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_journal_prealloc, parse_prealloc_fill};
+    use bytes::Bytes;
+    use openraft::storage::RaftLogStorage as _;
+    use openraft::storage::RaftLogStorageExt as _;
+    use openraft::vote::RaftLeaderId as _;
+    use openraft::RaftLogReader as _;
+    use openraft::{EntryPayload, LogId};
+    use tempfile::TempDir;
+
+    use super::{parse_journal_prealloc, parse_prealloc_fill, JournalLogStorage};
+    use crate::raft::entry_cache::Entry;
+    use crate::raft::AppCommand;
+    use crate::raft::LeaderId;
+    use crate::raft::RaftLogId;
+
+    // -----------------------------------------------------------------------
+    // Helpers for cache differential tests
+    // -----------------------------------------------------------------------
+
+    async fn new_test_storage(budget: usize) -> (JournalLogStorage, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let store = JournalLogStorage::open(dir.path())
+            .expect("open")
+            ._with_cache_budget(budget);
+        (store, dir)
+    }
+
+    /// Build a distinct per-index payload for use in Normal entries.
+    fn cmd_for_index(i: u64) -> AppCommand {
+        AppCommand(Bytes::from(format!("cmd-{i}")))
+    }
+
+    /// Append `count` Normal entries (distinct payload per index) starting at `start`.
+    /// Returns the cloned Vec so callers can compare against returned entries.
+    async fn append_n(store: &mut JournalLogStorage, start: u64, count: u64) -> Vec<Entry> {
+        let entries: Vec<Entry> = (start..start + count)
+            .map(|i| Entry {
+                log_id: LogId::new(LeaderId::new(1, 1), i),
+                payload: EntryPayload::Normal(cmd_for_index(i)),
+            })
+            .collect();
+        let result = entries.clone();
+        store.blocking_append(entries).await.expect("append_n");
+        result
+    }
+
+    /// Extract (log_index, payload_bytes) for full-entry comparison.
+    /// A divergent cached payload is a linearizability violation — this helper
+    /// catches it where comparing indexes alone would not.
+    fn entry_key(e: &Entry) -> (u64, Bytes) {
+        let payload_bytes = match &e.payload {
+            EntryPayload::Normal(cmd) => cmd.0.clone(),
+            _ => Bytes::new(),
+        };
+        (e.log_id.index, payload_bytes)
+    }
+
+    fn log_id_at(index: u64) -> RaftLogId {
+        LogId::new(LeaderId::new(1, 1), index)
+    }
+
+    // -----------------------------------------------------------------------
+    // Differential test: cache-served entries == journal-served entries
+    // -----------------------------------------------------------------------
+
+    /// For every query range and both cache budgets (0=disabled, 64MB=enabled),
+    /// `try_get_log_entries` must return byte-identical entries (index AND payload).
+    /// In the enabled arm, also asserts the cache actually served the in-window
+    /// reads — so a silent population regression causes the test to fail rather
+    /// than fall through to the journal and pass spuriously.
+    #[tokio::test]
+    async fn cache_reads_match_journal() {
+        for budget in [0usize, 64 * 1024 * 1024] {
+            let (mut store, _dir) = new_test_storage(budget).await;
+            append_n(&mut store, 1, 20).await; // indexes 1..=20
+
+            for (lo, hi) in [(1u64, 21u64), (5, 15), (18, 21), (1, 2)] {
+                let got = store.try_get_log_entries(lo..hi).await.unwrap();
+                let expected: Vec<_> = (lo..hi)
+                    .map(|i| (i, Bytes::from(format!("cmd-{i}"))))
+                    .collect();
+                assert_eq!(
+                    got.iter().map(entry_key).collect::<Vec<_>>(),
+                    expected,
+                    "budget={budget} range={lo}..{hi}"
+                );
+            }
+
+            // Entries 1..=20 are fully within the 64 MB budget; every in-window
+            // read above must have been served by the cache, not the journal.
+            if budget > 0 {
+                assert!(
+                    store.cache.hits() > 0,
+                    "cache never hit — population regressed (budget={budget})"
+                );
+            }
+
+            store.purge(log_id_at(5)).await.unwrap(); // remove <=5
+            let got = store.try_get_log_entries(6u64..21).await.unwrap();
+            let expected: Vec<_> = (6u64..21)
+                .map(|i| (i, Bytes::from(format!("cmd-{i}"))))
+                .collect();
+            assert_eq!(
+                got.iter().map(entry_key).collect::<Vec<_>>(),
+                expected,
+                "budget={budget} after purge"
+            );
+        }
+    }
 
     #[test]
     fn prealloc_unset_is_on() {

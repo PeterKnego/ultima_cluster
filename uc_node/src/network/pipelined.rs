@@ -56,6 +56,7 @@ use openraft::raft::{
     VoteResponse,
 };
 use openraft::raft::TransferLeaderRequest;
+use openraft::raft::TransferLeaderResponse;
 use openraft::type_config::alias::{LogIdOf, SnapshotOf, VoteOf};
 use openraft_legacy::network_v1::Adapter;
 use openraft_legacy::network_v1::RaftNetwork as RaftNetworkV1;
@@ -157,7 +158,7 @@ where
         &mut self,
         req: TransferLeaderRequest<TypeConfig>,
         option: RPCOption,
-    ) -> Result<(), RPCError<TypeConfig>> {
+    ) -> Result<TransferLeaderResponse<TypeConfig>, RPCError<TypeConfig>> {
         self.inner.transfer_leader(req, option).await
     }
 

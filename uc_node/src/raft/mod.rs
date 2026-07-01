@@ -4,6 +4,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
+pub mod entry_cache; // log-entry tail cache (Task 1)
 pub mod log_storage; // Task 7
 pub mod state_machine; // M1/M2: embedded apply
 pub mod state_machine_shmem; // M3: apply via shmem ring
@@ -69,6 +70,11 @@ impl From<AppCommand> for Bytes {
 /// User-Response bytes, also refcounted.
 pub type AppResponse = Bytes;
 
+// The `AsyncRuntime` is the only line that varies between the default tokio
+// scheduler and the experimental busy-spin runtime (feature `busyspin-runtime`,
+// crate `uc-rt-busyspin`). The rest of `TypeConfig` is identical; the two
+// declarations are kept whole because `declare_raft_types!` is a macro.
+#[cfg(not(feature = "busyspin-runtime"))]
 openraft::declare_raft_types!(
     pub TypeConfig:
         D = AppCommand,
@@ -81,6 +87,24 @@ openraft::declare_raft_types!(
         Entry = openraft::Entry<<Self::LeaderId as openraft::vote::RaftLeaderId>::Committed, Self::D, Self::NodeId, Self::Node>,
         SnapshotData = std::io::Cursor<Vec<u8>>, // M1: in-memory; M5 swaps to snapshot.region reader
         AsyncRuntime = openraft::impls::TokioRuntime,
+);
+
+// Experimental: openraft's internal tasks run on a never-park busy-spin
+// executor instead of tokio (see `uc-rt-busyspin`). Single-node boots+commits;
+// multi-node needs the tokio-reactor boundary resolved for quinn I/O.
+#[cfg(feature = "busyspin-runtime")]
+openraft::declare_raft_types!(
+    pub TypeConfig:
+        D = AppCommand,
+        R = AppResponse,
+        NodeId = NodeId,
+        Node = NodeAddr,
+        Term = u64,
+        LeaderId = openraft::impls::leader_id_adv::LeaderId<Self::Term, Self::NodeId>,
+        Vote = openraft::impls::Vote<Self::LeaderId>,
+        Entry = openraft::Entry<<Self::LeaderId as openraft::vote::RaftLeaderId>::Committed, Self::D, Self::NodeId, Self::Node>,
+        SnapshotData = std::io::Cursor<Vec<u8>>, // M1: in-memory; M5 swaps to snapshot.region reader
+        AsyncRuntime = uc_rt_busyspin::UcBusySpinRuntime,
 );
 
 // ---------------------------------------------------------------------------

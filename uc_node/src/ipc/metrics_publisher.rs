@@ -107,8 +107,10 @@ fn publish_once(
     let last_applied = m.last_applied.as_ref().map(|l| l.index()).unwrap_or(0);
     status.last_applied.store(last_applied, Ordering::Relaxed);
 
-    // committed: Option<LogId<...>>; the highest locally-committed index.
-    let committed = m.committed.as_ref().map(|l| l.index()).unwrap_or(0);
+    // cluster_committed: Option<LogId<...>>; the quorum-acknowledged commit index
+    // (alpha.25 split the old `committed` into local_committed / cluster_committed;
+    // cluster_committed preserves the prior quorum-granted semantics).
+    let committed = m.cluster_committed.as_ref().map(|l| l.index()).unwrap_or(0);
     status.last_committed.store(committed, Ordering::Relaxed);
 
     // M5: notify output_dispatcher of leader state. `send` is a no-op when

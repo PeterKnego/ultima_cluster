@@ -497,7 +497,7 @@ dependencies = [
  "prost",
  "rand 0.9.4",
  "serde",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -598,6 +598,17 @@ checksum = "bf8aaad655bf39f0691f6f4025a8b58f1ff46fb12cb70f6d69e4f0dd2eb717a8"
 dependencies = [
  "chrono",
  "chrono-tz",
+]
+
+[[package]]
+name = "disruptor"
+version = "4.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d215fb4eb4f05a6ed7748403359b7aa65e9c239385837497f4b70ba5b2fe5d93"
+dependencies = [
+ "core_affinity",
+ "crossbeam-utils",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1056,6 +1067,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1251,9 +1271,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openraft"
-version = "0.10.0-alpha.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f40148cf75ead81993d5910bc72275e542e4e01a90241bf1905236843fe3009d"
+version = "0.10.0-alpha.25"
 dependencies = [
  "anyerror",
  "backoff-series",
@@ -1263,8 +1281,9 @@ dependencies = [
  "clap",
  "derive_more",
  "display-more",
+ "disruptor",
  "futures-util",
- "itertools",
+ "itertools 0.15.0",
  "maplit",
  "openraft-macros",
  "openraft-rt",
@@ -1273,16 +1292,15 @@ dependencies = [
  "rand 0.10.1",
  "serde",
  "smallvec",
- "thiserror",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "validit",
 ]
 
 [[package]]
 name = "openraft-legacy"
-version = "0.10.0-alpha.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc9b53ebd47aa95e84d184921e31220aaa7db91d874ec1f39d6851bf16db74ad"
+version = "0.10.0-alpha.25"
 dependencies = [
  "futures",
  "openraft",
@@ -1293,9 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.10.0-alpha.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ec23cd291c763fb17d8dabf7cc4eacaefd45d02e52a4df88ce50c702f030689"
+version = "0.10.0-alpha.25"
 dependencies = [
  "chrono",
  "proc-macro2",
@@ -1306,9 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt"
-version = "0.10.0-alpha.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a31c2d12e376df204612bb2016d652ea2d48b8edeaa04263facbe2fc7a11e3ef"
+version = "0.10.0-alpha.25"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -1319,9 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt-tokio"
-version = "0.10.0-alpha.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d8c01f2a456a864282bc4eaf76f1f78ab040d80416fd30fd15b8ab88faa337a"
+version = "0.10.0-alpha.25"
 dependencies = [
  "futures-util",
  "openraft-rt",
@@ -1527,7 +1539,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools",
+ "itertools 0.14.0",
  "log",
  "multimap",
  "once_cell",
@@ -1547,7 +1559,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -1596,7 +1608,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2 0.6.3",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "web-time",
@@ -1617,7 +1629,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror",
+ "thiserror 2.0.18",
  "tinyvec",
  "tracing",
  "web-time",
@@ -2167,11 +2179,31 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.18",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2495,6 +2527,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "uc-rt-busyspin"
+version = "0.1.0"
+dependencies = [
+ "openraft-rt",
+ "openraft-rt-tokio",
+ "rand 0.10.1",
+ "tokio",
+]
+
+[[package]]
 name = "uc_autobench"
 version = "0.1.0"
 dependencies = [
@@ -2528,7 +2570,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uc_protocol",
@@ -2558,11 +2600,12 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "uc-lincheck",
+ "uc-rt-busyspin",
  "uc_client",
  "uc_node",
  "uc_protocol",
@@ -2583,7 +2626,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2597,7 +2640,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "uc_protocol",
@@ -2613,7 +2656,7 @@ dependencies = [
  "dashmap",
  "parking_lot",
  "serde",
- "thiserror",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2625,7 +2668,7 @@ dependencies = [
  "rustix",
  "serde",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

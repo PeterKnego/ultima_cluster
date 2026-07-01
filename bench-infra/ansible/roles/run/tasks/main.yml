@@ -96,6 +96,7 @@
         export UC_API_BATCH_LINGER_MS={{ uc_api_batch_linger_ms }}
         export UC_APPLY_SPIN_BUDGET={{ uc_apply_spin_budget }}
         export UC_NODE_BRIDGE_SPIN_BUDGET={{ uc_node_bridge_spin_budget }}
+        export UC_LOG_CACHE_BYTES={{ uc_log_cache_bytes }}
         setsid {{ uc_target_bin }}/uc-node-launch \
           --node-id $UC_NODE_ID --listen $UC_LISTEN $UC_PEERS \
           --app-id $UC_APP_ID --with-service \
@@ -116,6 +117,32 @@
         mode: "0755"
       when: node_role == "node0"
 
+    # --- leader profiling (task19 throughput follow-up: what saturates at the knee?) ---
+    - name: Install perf (best-effort, AWS kernel)
+      ansible.builtin.apt:
+        name: ["linux-tools-{{ ansible_kernel }}", "linux-tools-aws", "linux-tools-common"]
+        state: present
+      become: true
+      failed_when: false
+      when: profile | default(false) | bool and node_role == "node0"
+
+    - name: Start leader profilers in background (node0), then the sweep provides load
+      # Backgrounded so they sample DURING the next task (the sustained rung). top -H +
+      # ps -T give per-thread %CPU + thread NAMES (maps a hot thread to its role:
+      # tokio worker / journal writer / durability consumer / etc.); perf gives the
+      # on-CPU function breakdown (best-effort — needs the versioned perf package).
+      ansible.builtin.shell: |
+        pid=$(pgrep -f '[u]c-node-launch' | head -1)
+        echo "leader_pid=$pid kernel=$(uname -r)" > {{ remote_home }}/results/profile_meta.txt
+        grep -m1 -iE 'leader|became leader|elected' {{ remote_home }}/uc-node.out >> {{ remote_home }}/results/profile_meta.txt 2>/dev/null || true
+        setsid bash -c "top -bH -d 1 -n 45 -p $pid > {{ remote_home }}/results/top_threads.txt 2>&1" </dev/null &
+        setsid bash -c "for i in \$(seq 1 45); do ps -T -p $pid -o tid,comm,pcpu --sort=-pcpu 2>/dev/null | head -18; echo ---s\$i---; sleep 1; done > {{ remote_home }}/results/threads.txt 2>&1" </dev/null &
+        setsid bash -c "perf record -g --call-graph dwarf -F 199 -p $pid -o {{ remote_home }}/perf.data -- sleep 35 > {{ remote_home }}/results/perf_record.log 2>&1" </dev/null &
+        echo "profilers started for pid=$pid"
+      become: true
+      changed_when: false
+      when: profile | default(false) | bool and node_role == "node0"
+
     - name: Drive UC rate ladder (node0)
       ansible.builtin.command: >
         {{ remote_home }}/run_uc_sweep.sh
@@ -127,8 +154,28 @@
         {{ warmup_seconds }}
         {{ remote_home }}/results/uc_sweep.csv
         {{ uc_sweep_config | default((1 if (single_node | default(false) | bool) else 3) | string + 'node_' + ('eventual' if durability == 'none' else 'consistent')) }}
+      environment:
+        # Per-request client timeout (ms). Raise for saturation/overload sweeps so
+        # a multi-second tail request isn't reported as a failure (default 10000).
+        UC_CLIENT_REQUEST_TIMEOUT_MS: "{{ uc_client_request_timeout_ms | default(10000) }}"
       when: node_role == "node0"
       changed_when: true
+
+    - name: Generate perf report + stage profile artifacts (node0)
+      ansible.builtin.shell: |
+        sleep 4   # let the backgrounded perf flush perf.data
+        if [ -s {{ remote_home }}/perf.data ]; then
+          perf report --stdio -i {{ remote_home }}/perf.data --sort overhead,symbol 2>/dev/null | grep -vE '^#' | sed '/^$/d' | head -45 > {{ remote_home }}/results/perf_symbols.txt
+          perf report --stdio -g graph,1,caller -i {{ remote_home }}/perf.data 2>/dev/null | head -150 > {{ remote_home }}/results/perf_callgraph.txt
+        else
+          echo "no perf.data — perf unavailable on this kernel (rely on top_threads.txt / threads.txt)" > {{ remote_home }}/results/perf_symbols.txt
+        fi
+        # per-thread peak %CPU summary from the top -H series (which thread, if any, pegged a core)
+        echo "== per-thread peak %CPU (top -H over the load window) ==" > {{ remote_home }}/results/thread_peak.txt
+        awk '/^[ ]*[0-9]/{c=$0; sub(/^[ ]*/,"",c); n=split(c,a," "); cpu=a[9]; name=a[12]; if(cpu+0>m[name]) m[name]=cpu+0} END{for(k in m) printf "%6.1f  %s\n", m[k], k}' {{ remote_home }}/results/top_threads.txt 2>/dev/null | sort -rn | head -20 >> {{ remote_home }}/results/thread_peak.txt || true
+      become: true
+      changed_when: false
+      when: profile | default(false) | bool and node_role == "node0"
 
     - name: Capture leader replication-RPC probe stats (uc_bench_probes only)
       # The leader emits cumulative REPL_RPC_STATS to uc-node.out every 3s; grab

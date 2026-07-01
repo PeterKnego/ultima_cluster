@@ -20,6 +20,7 @@ uc_api_batch_linger_ms: 5       # openraft api_batch_linger_ms via UC_API_BATCH_
 # A/B: A arm = defaults below; B arm = -e uc_apply_spin_budget=busy uc_node_bridge_spin_budget=busy
 uc_apply_spin_budget: "64"          # service apply consumer SpscConsumer spin budget; 'busy'/'max' = pure busy-spin
 uc_node_bridge_spin_budget: "0"     # node submit+apply_resp NotifyBridge spin budget; 'busy'/'max' = busy parker
+uc_log_cache_bytes: 268435456        # UC_LOG_CACHE_BYTES: leader log-entry cache budget (task: log entry cache); default 256MiB, override -e uc_log_cache_bytes=0 to DISABLE (A/B the cache)
 # Floor-decomposition (layered e2e-delta): -e single_node=true runs only node0 as a 1-node raft
 # (no replication) so 1node vs 3node and eventual vs consistent deltas attribute the commit floor
 # into {base consensus+IPC, fsync, replication}. CSV config label auto-derives ('<n>node_<dura>').
@@ -39,12 +40,18 @@ uc_git_ref: ""                           # used when uc_src_mode=git
 uc_repo_url: ""                          # used when uc_src_mode=git
 uc_local_path: "{{ playbook_dir }}/../.."  # repo root (ultima_cluster), for rsync mode
 ud_local_path: "{{ playbook_dir }}/../../../ultima_db"  # sibling repo (external path dep)
+or_local_path: "{{ playbook_dir }}/../../../openraft"   # sibling repo (openraft fork; UC's openraft path dep is ../openraft/openraft)
+# Build openraft with the synchronous SyncCore (instead of async RaftCore). Build-time
+# feature; toggling requires a rebuild (re-run iterate / build_uc), not just a new bench.
+# A/B: A arm = false (RaftCore), B arm = -e uc_sync_core=true (SyncCore).
+uc_sync_core: false
 
 # --- Layout on hosts ---
 remote_home: "/opt/bench"
 aeron_deploy_dir: "/opt/bench/aeron-deploy"
 uc_src_dir: "/opt/bench/uc"
 ud_src_dir: "/opt/bench/ultima_db"   # so /opt/bench/uc/../ultima_db resolves on the host
+or_src_dir: "/opt/bench/openraft"    # so /opt/bench/uc/../openraft/openraft resolves on the host
 uc_target_bin: "/opt/bench/uc/target/release"
 
 # --- Aeron port bases (matches canonical cluster_localhost ranges) ---
