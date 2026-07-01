@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [features]
+default = ["sync-core"]  # SyncCore (synchronous consensus) is the default model; --no-default-features for RaftCore
 # Turns on uc_protocol's probe sink across the whole dependency graph (feature
 # unification makes uc_node/uc_service/uc_client use the same instrumented build).
 uc-bench-probes = ["uc_protocol/uc-bench-probes"]

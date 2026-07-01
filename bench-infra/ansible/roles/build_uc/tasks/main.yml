@@ -47,15 +47,19 @@
 - name: Compose cargo feature list
   # uc_bench_probes=true compiles in the latency probe sink (incl. the leader
   # replication-RPC timing); default off so normal latency benches aren't perturbed.
-  # uc_sync_core=true builds openraft with the synchronous SyncCore instead of RaftCore.
+  # SyncCore (synchronous consensus) is now the DEFAULT cargo feature — built unless
+  # explicitly disabled. Pass `-e uc_sync_core=false` to build RaftCore instead
+  # (adds --no-default-features). uc_bench_probes=true adds the probe sink.
   ansible.builtin.set_fact:
     uc_cargo_features: >-
-      {{ (['uc-bench-probes'] if (uc_bench_probes | default(false) | bool) else [])
-         + (['sync-core'] if (uc_sync_core | default(false) | bool) else []) }}
+      {{ (['uc-bench-probes'] if (uc_bench_probes | default(false) | bool) else []) }}
+    uc_no_default_features: >-
+      {{ '--no-default-features' if ((uc_sync_core is defined) and (not (uc_sync_core | bool))) else '' }}
 
 - name: Build uc_autobench release bins
   ansible.builtin.command: >
     {{ remote_home }}/.cargo/bin/cargo build --release
+    {{ uc_no_default_features }}
     {{ ('--features ' + (uc_cargo_features | join(','))) if (uc_cargo_features | length > 0) else '' }}
     -p uc_autobench --bin uc-node-launch --bin commit-path-load --bin internode-rpc-bench
   args:
