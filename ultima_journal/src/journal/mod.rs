@@ -545,12 +545,19 @@ impl Journal {
             let _ = d.sync_all();
         }
 
-        // Recompute first_seq.
+        // Recompute first_seq WITHOUT a full-segment scan: the first remaining
+        // segment's first record seq IS its base_seq (segment header, contiguous
+        // records). The `last_seq >= base_seq` filter yields None when the journal
+        // is empty (fully purged). This was the RESIDUAL HALF of the purge
+        // full-scan bug: the last-seq drop loop above was fixed earlier, but this
+        // first_seq recompute still `scan()`ed a whole 64 MiB segment on every
+        // purge — and openraft purges after every snapshot (~5/s at load), so it
+        // was ~93% of the leader's journal decodes (the residual crc32 ceiling).
         st.first_seq = st
             .segments
             .first()
-            .and_then(|s| s.scan().ok())
-            .and_then(|scan| scan.records.first().map(|r| r.seq));
+            .map(|s| s.base_seq())
+            .filter(|&b| st.last_seq.is_some_and(|last| last >= b));
 
         Ok(())
     }
