@@ -112,3 +112,25 @@ starved, and the rung never finished (900s cell timeout) — a *load-generator* 
 cluster. Fixed by switching to a multi-threaded runtime and spawning each request as its own task
 under a `Semaphore(inflight)` cap (commits `36c0a5a`, `1bb9108`). The cluster itself handled
 256-concurrency fine; it's the *excess* concurrency that triggers congestion collapse.
+
+## SyncCore vs RaftCore — 5-repeat A/B at the 30k rung (2026-07-01)
+
+A first single-run A/B (both arms on the purge fix) suggested SyncCore resisted a 30k congestion
+collapse that flattened RaftCore, and had lower p99. **Five repeats per arm (30k offered,
+inflight=256, independent fresh-cluster iterate runs) show both signals were noise:**
+
+| arm | achieved (5 runs, k msg/s) | mean | collapsed <10k | p99 mean |
+|---|---|---|---|---|
+| SyncCore | 24.7 25.2 26.2 22.6 22.9 | 24.3k | 0/5 | 2294 ms |
+| RaftCore | 25.9 25.0 25.8 26.2 24.5 | **25.5k** | 0/5 | **1829 ms** |
+
+- **No collapse in either arm** — the earlier RaftCore 30k→2.6k was a one-off transient, not a
+  systematic weakness. SyncCore has **no collapse-resistance advantage**.
+- **p99 reversed** — RaftCore is marginally *lower* here; the single-run SyncCore p99 edge was noise.
+- **At the operating ceiling (inflight=256/30k), SyncCore and RaftCore are statistically equal,
+  RaftCore marginally ahead on both throughput and p99.**
+
+SyncCore's one measured real edge is **low-concurrency latency** (task19: ~+35-45% at inflight=1),
+a different regime than this ceiling. SyncCore was made the default consensus model (commit
+addb8ee, merged to main) on the cleaner-synchronous-foundation + maintainer-direction basis —
+**not** on a proven throughput or robustness advantage at load.
