@@ -73,9 +73,18 @@ struct CacheInner<C: RaftTypeConfig> {
 
 ## 4. Operations & correctness
 
-All three mutations run *inside* the adapter methods that already mutate the journal, holding
-the cache write lock, so the cache is updated in lockstep with the journal — a concurrent reader
-never sees them diverge.
+All three mutations run *inside* the adapter methods that already mutate the journal. The
+journal op and the cache op take **separate** locks (the journal's, then the cache's `RwLock`),
+not one shared lock — so there is a brief window where the journal is mutated and the cache is
+not yet. This is safe (byte-identity is never violated) because of two Raft guarantees: (a)
+only *uncommitted tail* entries are ever truncated, and a truncated-but-still-cached entry is
+never concurrently read for apply/replication (the leader never truncates its own log; a
+committed entry is never truncated); and (b) a purge-front entry that is briefly still cached is
+*byte-identical* to what the journal just held. Critically, a `truncate_after`'s cache-evict
+fully completes before any later re-`append` at those indexes runs (the core serializes these
+ops), so the cache can never serve OLD content for an index the journal has re-appended with NEW
+content. The per-op serialization by the Raft core is what makes the two-lock refinement
+correct.
 
 - **`append(entries)`** (already serialized by the adapter append lock): write-lock; assert
   each `seq == base_seq + len` (contiguous); `push_back`; add its byte estimate; then `pop_front`
