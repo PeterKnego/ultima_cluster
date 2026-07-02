@@ -51,6 +51,24 @@ messaging part, and that layering is the whole story. The pieces:
   and writes the raw term-buffer bytes to disk files, exposing a "recorded up to position
   X" counter. This is how anything in Aeron becomes durable — including the cluster log.
 
+One node, put together — four components, ~8 polling threads, every handoff through
+shared-memory term buffers and position counters (no queues, no wakeups):
+
+```
+┌─ MEDIA DRIVER ──┐ ┌─ ARCHIVE ───────┐ ┌─ CONSENSUS MODULE ─┐ ┌─ SERVICE ─────────┐
+│  conductor      │ │  conductor      │ │  1 thread:         │ │  1 thread:        │
+│  sender    ◀────┼─┼── recorder      │ │   poll ingress,    │ │   poll committed  │
+│  receiver       │ │  replayer       │ │   append to log,   │ │   log, apply user │
+│  (3 threads)    │ │  (3 threads)    │ │   position gossip, │ │   state machine,  │
+│                 │ │                 │ │   commit, election │ │   offer responses │
+└───────┬─────────┘ └────────┬────────┘ └─────────┬──────────┘ └─────────┬─────────┘
+        │                    │                    │                      │
+        ▼                    ▼                    ▼                      ▼
+╔═══════════════════════════════════════════════════════════════════════════════════╗
+║   shared-memory term buffers (ingress / log / egress) + position counters (mmap)   ║
+╚═══════════════════════════════════════════════════════════════════════════════════╝
+```
+
 **Rosetta table for the SMR reader:**
 
 | Raft/SMR concept | Aeron Cluster realization |
@@ -69,7 +87,36 @@ Keep one number in mind for scale: a 64 B message is framed with a 32 B header a
 
 ## 2. The life of one message (leader, steady state)
 
-Plain-language walkthrough; every step below has a deep-dive section later.
+Plain-language walkthrough; every step below has a deep-dive section later. First the
+**data path** — what happens *per message* (step numbers match the list below; `═▶` is a
+UDP hop by the media driver, `─▶` is shared memory on one host):
+
+```
+ client              leader                 leader                LEADER LOG
+ app     ①          ingress      ②        consensus    ②         term buffer
+ thread ────▶ terms ═════▶ terms ────▶ thread (one append) ────▶ ●●●●●●●●●●●
+                                                                  │  │  │  │
+              ┌───────────────── ③ driver sender fans out ────────┘  │  │  │
+              │                    (MDC; NAK retransmits             │  │  │
+              ▼                     re-read THIS buffer)             │  │  │
+        follower log terms ×N                             ④ archive ─┘  │  │
+              │ (each follower runs its own ④ and ⑦)        recorder:   │  │
+              ▼                                       block-write ≤1MiB │  │
+        follower archive: write+fsync → durable pos    + 1 fsync/block  │  │
+                                                       → RecordingPos   │  │
+                                          ⑦ service thread ─────────────┘  │
+                                            polls log in place,           ...
+                                            bounded by commit counter,
+                                            applies user state machine
+                                                 │ ⑧ response
+ client                                          ▼
+ app     ◀════ egress terms ◀─────────── response offer (leader only)
+ thread   (poll in place)
+```
+
+Steps ⑤ (position gossip) and ⑥ (commit) are deliberately absent from this picture —
+they are the **control plane**, run per *duty cycle* rather than per message, and are drawn
+in §5. Step by step:
 
 1. **Client → cluster.** The client library prepends a small session header and appends the
    message into its *ingress* term buffer (one atomic fetch-and-add to claim space, copy
@@ -114,7 +161,23 @@ Plain-language walkthrough; every step below has a deep-dive section later.
 Count what scaled with the 800k: term-buffer appends, datagram packing, block writes.
 Count what didn't: consensus control traffic (kHz), commit computation (per duty cycle),
 fsyncs (per block), flow-control updates (per window fraction). That asymmetry is the
-design.
+design — a funnel in which every stage coalesces the one above it, with no timer anywhere:
+
+```
+ 800,000 /s   messages: term-buffer appends (one XADD + release-store each)
+    │
+    ▼  ÷14        TermScanner packs complete frames MTU-full (1408 B)
+  ~57,000 /s  datagrams: one send + one recv syscall, one position store each
+    │
+    ▼  ÷10…100    archive recorder drains whatever accumulated (≤1 MiB blocks)
+  ~600–6,000 /s  file writes — and ONE fdatasync per block (sync.level=1)
+    │
+    ▼  coalesced per duty cycle / window fraction / 200 ms floor
+  ~1,000–3,000 /s  control messages: AppendPosition, CommitPosition, flow-control
+```
+
+The deeper the backlog, the *fewer* expensive operations per message. Load makes the
+funnel more efficient, which is why the latency curve stays flat to 800k.
 
 ## 3. Deep dive: the messaging data plane
 
@@ -172,6 +235,27 @@ identical on 8 and 16 vCPU) while Aeron's consensus thread shrugs at 800k.
 
 ## 5. Deep dive: replication and commit
 
+The two planes, on a 3-node cluster — the data plane carries every message but involves no
+consensus code; the control plane involves the consensus threads but carries no messages:
+
+```
+ DATA PLANE — per message, driver threads only          (at 800k msg/s: 800k msgs)
+ ═══════════════════════════════════════════════════════════════════════════════
+                            log stream (MDC fan-out; NAK/retransmit inside)
+   leader log terms ═══════════════════▶ follower A log terms ─▶ archive ─▶ fsync
+                    ╚══════════════════▶ follower B log terms ─▶ archive ─▶ fsync
+
+
+ CONTROL PLANE — per duty cycle, consensus threads      (at 800k msg/s: ~kHz total)
+ ─────────────────────────────────────────────────────────────────────────────────
+   follower A ── AppendPosition(durable pos = X) ──▶ ┌────────┐
+   follower B ── AppendPosition(durable pos = Y) ──▶ │ leader │
+                                                     └───┬────┘
+        commit = majority-th of rank(X, Y, own durable)  │
+   follower A ◀───────── CommitPosition(commit) ─────────┤
+   follower B ◀───────── CommitPosition(commit) ─────────┘
+```
+
 - The log is published once with **MDC — multi-destination-cast** — one publication whose
   frames the *driver's sender thread* transmits to every registered follower endpoint
   (ConsensusModuleAgent.java:1595-1636). Consensus code sends nothing per message.
@@ -217,6 +301,23 @@ the awaiting submit future. Two async hops plus a per-message waker where Aeron 
 (Shmem mode adds the service-process rings and the output/replay machinery on top.)
 
 ## 7. Where the measured 13× / 14× gap lives
+
+The single-picture version — what the one consensus thread does per message:
+
+```
+ Aeron:  poll ingress ─▶ append to log ─▶ done                            (1 touch;
+                                                                           everything else
+                                                                           happens on other
+                                                                           threads, keyed by
+                                                                           position counters)
+
+ UC:     api-batch channel ─▶ engine command ─▶ journal append ─▶ replication
+         read-back (per-peer streams re-read entries from storage) ─▶ ack
+         processing ─▶ commit bookkeeping ─▶ apply dispatch (sm-worker channel)
+         ─▶ per-message response oneshot                                  (~5–7 touches,
+                                                                           mostly on/through
+                                                                           the same thread)
+```
 
 | mechanism | Aeron | UC today | our measurement |
 |---|---|---|---|
