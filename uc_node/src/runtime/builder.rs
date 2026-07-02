@@ -318,6 +318,7 @@ impl<S: StateMachine> NodeBuilder<S> {
                     response_producer.clone(),
                     handle.raft.clone(),
                     node_id_for_watcher,
+                    handle.admission.clone(),
                 );
                 let client_query_dispatcher =
                     crate::ipc::client_dispatcher::spawn_client_query_dispatcher(
@@ -607,6 +608,14 @@ where
 
     let raft_handle = wrap_raft(raft);
 
+    // Admission control: one write-permit pool per node, shared between the
+    // shmem client dispatcher and NodeHandle::submit. 0 = uncapped.
+    let admission = (config.raft.max_inflight_writes > 0).then(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            config.raft.max_inflight_writes as usize,
+        ))
+    });
+
     Ok(NodeHandle {
         raft: raft_handle,
         config,
@@ -624,6 +633,7 @@ where
         output_dispatcher: None,
         output_replay_watcher: None,
         reconcile_driver: None,
+        admission,
     })
 }
 

@@ -103,6 +103,9 @@
         {% if uc_snapshot_logs_since_last | default('') | string | length > 0 %}
         export UC_SNAPSHOT_LOGS_SINCE_LAST={{ uc_snapshot_logs_since_last }}
         {% endif %}
+        {% if uc_max_inflight_writes | default('') | string | length > 0 %}
+        export UC_MAX_INFLIGHT_WRITES={{ uc_max_inflight_writes }}
+        {% endif %}
         # Embedded arm: the in-process load driver reads the same per-request
         # timeout knob uc_client does (harmless in shmem mode — the node ignores it).
         export UC_CLIENT_REQUEST_TIMEOUT_MS={{ uc_client_request_timeout_ms | default(10000) }}

@@ -190,6 +190,12 @@ fn build_node_cfg(args: &Args) -> anyhow::Result<NodeConfig> {
             {
                 t.snapshot_policy_logs_since_last = v;
             }
+            // Admission control: max in-pipeline client writes (0 = uncapped).
+            if let Some(v) =
+                std::env::var("UC_MAX_INFLIGHT_WRITES").ok().and_then(|v| v.parse().ok())
+            {
+                t.max_inflight_writes = v;
+            }
             t
         },
         tls: TlsConfig::default(),

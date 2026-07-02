@@ -159,6 +159,21 @@ pub struct RaftTuning {
     /// default is 300; raising it amortizes the quorum round-trip + per-batch
     /// follower fsync over more entries (the 3-node throughput lever).
     pub max_payload_entries: u64,
+    /// Admission control: max client WRITES admitted into the commit pipeline
+    /// concurrently (a per-node semaphore taken before `client_write`).
+    /// `0` disables the cap.
+    ///
+    /// Without it the in-cluster queue depth is whatever clients offer, and
+    /// deep overload buys only latency and instability: on the reference
+    /// fleet (3× c6id.2xlarge, 64 B KV, consistent) throughput peaks at ~256
+    /// concurrent writes (~58 k msg/s embedded / ~44 k shmem at ms-level p50)
+    /// and DEGRADES beyond it — 512 concurrent measured 2.6× lower goodput
+    /// embedded, with seconds-level p50 and followers pushed toward the purge
+    /// horizon. The cap pins the pipeline at its efficient depth; excess
+    /// submits wait at the door (shmem: the submit ring fills and clients see
+    /// ring backpressure; embedded: `submit()` awaits a permit). See
+    /// docs/benchmarks/purge-slack-2026-07-02.md + postfix-ceiling-rerun.
+    pub max_inflight_writes: u32,
 }
 
 impl Default for RaftTuning {
@@ -170,6 +185,7 @@ impl Default for RaftTuning {
             max_in_snapshot_log_to_keep: 200_000,
             snapshot_policy_logs_since_last: 5000,
             max_payload_entries: 300,
+            max_inflight_writes: 256,
         }
     }
 }

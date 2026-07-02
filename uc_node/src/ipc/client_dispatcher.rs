@@ -50,6 +50,7 @@ pub(crate) fn spawn_client_dispatcher<S>(
     response_producer: SharedResponseProducer,
     raft: RaftHandle<S>,
     node_id: NodeId,
+    admission: Option<Arc<tokio::sync::Semaphore>>,
 ) -> ClientDispatcherHandle
 where
     S: StateMachine + Send + 'static,
@@ -103,11 +104,27 @@ where
                     // keeps pulling submits instead of awaiting each full Raft
                     // round-trip inline. Serial await capped throughput at
                     // ~1/commit-latency; spawning lets many ClientWrites be in
-                    // flight so openraft batches them. The submit ring + client
-                    // in-flight window bound the number of concurrent tasks.
+                    // flight so openraft batches them.
+                    //
+                    // Admission control: take a permit BEFORE spawning, so the
+                    // number of in-pipeline writes is bounded cluster-side (not
+                    // by whatever concurrency clients offer). When saturated,
+                    // this loop parks here and stops draining submit.ring; the
+                    // ring fills and clients see ring backpressure — excess
+                    // load waits at the door instead of bloating cluster queues
+                    // (deep queues measured as the overload collapse driver;
+                    // see RaftTuning::max_inflight_writes).
+                    let permit = match &admission {
+                        Some(sem) => match Arc::clone(sem).acquire_owned().await {
+                            Ok(p) => Some(p),
+                            Err(_) => break, // semaphore closed = shutting down
+                        },
+                        None => None,
+                    };
                     let raft_c = raft.clone();
                     let resp_c = Arc::clone(&response_producer);
                     tokio::spawn(async move {
+                        let _permit = permit;
                         match raft_c.client_write(app_command).await {
                             Ok(resp) => {
                                 uc_protocol::probes::bridge(

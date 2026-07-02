@@ -214,6 +214,11 @@ pub struct NodeHandle<S: StateMachine> {
     /// adapter clone). Rebuilds a reattached service to the node frontier so reads
     /// don't observe stale state. Stopped + joined on shutdown.
     pub(crate) reconcile_driver: Option<crate::raft::state_machine_shmem::ReconcileDriverHandle>,
+    /// Admission control for client writes: at most
+    /// `RaftTuning::max_inflight_writes` commands in the commit pipeline
+    /// concurrently (`None` = uncapped). Shared with the shmem client
+    /// dispatcher; [`Self::submit`] takes a permit on the embedded path.
+    pub(crate) admission: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 
 impl<S: StateMachine> NodeHandle<S> {
@@ -235,6 +240,19 @@ impl<S: StateMachine> NodeHandle<S> {
         use crate::raft::AppCommand;
         let bytes = bincode::serde::encode_to_vec(&cmd, bincode::config::standard())?;
         let app_command: AppCommand = AppCommand::from(Bytes::from(bytes));
+
+        // Admission control: hold a permit for the full commit round-trip so at
+        // most `max_inflight_writes` commands are in the pipeline (backpressure:
+        // excess submitters wait here at the door, not in cluster queues).
+        let _permit = match &self.admission {
+            Some(sem) => Some(
+                sem.clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ClusterError::Raft("admission semaphore closed".into()))?,
+            ),
+            None => None,
+        };
 
         let result = self
             .raft
@@ -395,6 +413,9 @@ impl<S: StateMachine> NodeHandle<S> {
             output_dispatcher,
             output_replay_watcher,
             reconcile_driver,
+            // Dropping the semaphore closes it; permit holders finish normally
+            // and later acquirers get a closed error.
+            admission: _,
         } = self;
 
         // Shmem mode: signal the state-machine adapter to abort any apply()

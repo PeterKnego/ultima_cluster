@@ -27,6 +27,10 @@ uc_log_cache_bytes: 268435456        # UC_LOG_CACHE_BYTES: leader log-entry cach
 uc_max_in_snapshot_log_to_keep: ""
 # Snapshot cadence in applied entries (UC_SNAPSHOT_LOGS_SINCE_LAST). Empty = binary default (5000).
 uc_snapshot_logs_since_last: ""
+# Admission control: max in-pipeline client writes per node (UC_MAX_INFLIGHT_WRITES).
+# Empty = binary default (256 = the measured optimum). -e uc_max_inflight_writes=0 = UNCAPPED
+# (the control arm / pre-admission behavior).
+uc_max_inflight_writes: ""
 # Floor-decomposition (layered e2e-delta): -e single_node=true runs only node0 as a 1-node raft
 # (no replication) so 1node vs 3node and eventual vs consistent deltas attribute the commit floor
 # into {base consensus+IPC, fsync, replication}. CSV config label auto-derives ('<n>node_<dura>').
