@@ -1,208 +1,276 @@
 # Aeron Cluster hot-path anatomy — how 800k msg/s @ p50 0.4 ms (with fsync) happens
 
-Source-level map of Aeron's per-message hot path (Aeron checkout `be83d5d4de`, Java tree),
-produced 2026-07-02 after the parity scorecard measured Aeron Cluster at ≥800k msg/s,
-p50 0.38 ms / p99 0.44 ms *with* per-block fdatasync (`file.sync.level=1`), vs UC's ~56k.
-Each section ends with the UC contrast. §7 derives the optimization plan skeleton.
+A source-level map of Aeron Cluster's per-message hot path, written for a reader who knows
+SMR/Raft concepts (log, leader/follower, commit index, apply, quorum) but not Aeron.
+Produced 2026-07-02 (Aeron checkout `be83d5d4de`, Java tree) after the parity scorecard
+measured Aeron Cluster at ≥800k msg/s, p50 0.38 ms / p99 0.44 ms *with* per-block fdatasync
+(`file.sync.level=1`), vs UC's ~56k msg/s. Section 8 derives a UC optimization plan.
 
-TL;DR — three design moves produce the numbers, and none of them is "faster code":
+**TL;DR — the numbers come from three design moves, none of which is "faster code":**
 
-1. **Consensus is a control plane, not a data plane.** Log replication is a raw byte-stream
-   fan-out done by the media driver's sender thread (multi-destination-cast of the log term
-   buffer). The consensus module never sends entries and never acks batches: followers
-   gossip a monotonic *durable position* (coalesced, per duty-cycle, 200 ms heartbeat
-   floor), the leader computes commit = majority-ranked position, and gossips that back.
-   At 800k msg/s the consensus-control traffic is a few thousand tiny messages/sec.
-2. **Batching is structural, never timer-based.** No linger anywhere. Batches form from
-   backlog at every stage: the sender's TermScanner packs whatever complete frames exist
-   (≤MTU: 14×96 B messages/datagram), the archive recorder block-writes whatever
-   accumulated since its last poll (≤1 MiB) and fsyncs once per block, position counters
-   update with hysteresis (per-datagram, per-poll, per-window/4). Under load, batch size
-   grows automatically; at idle, latency is one poll cadence.
-3. **A pipeline of single-writer polling Agents over shared-mmap buffers.** ~8 duty-cycle
-   threads per node (driver 3, archive 3, consensus 1, service 1), each a single-writer
-   loop; every handoff is a term buffer with release/acquire frame-length framing (exactly
-   UC's ring discipline) read in place — zero locks, zero wakeups, zero syscalls on the
-   intra-host path, ~3 userland copies end-to-end.
-
-The consensus-module thread touches each message exactly **once** (one `offer` into the log
-term buffer). Everything else — replication, durability, apply, egress — happens on other
-Agents reading the same shared memory, coordinated only by monotonic position counters.
+1. **Consensus is a control plane, not a data plane.** Log entries are never sent by the
+   consensus code at all — replication is a raw byte-stream fan-out done by Aeron's
+   messaging layer, and followers acknowledge with a coalesced "my durable log position is
+   now X" message a few thousand times per second, regardless of message rate. There is no
+   AppendEntries, no per-batch ack, and the leader's consensus thread touches each message
+   exactly once.
+2. **Batching is structural, never timer-based.** There is no linger delay anywhere.
+   Batches form automatically from backlog at every stage; under load they grow, at idle
+   latency is just a polling loop's reaction time.
+3. **The node is a pipeline of single-writer polling threads over shared memory.** ~8
+   threads, each looping over its own stage, handing work to the next via shared-memory
+   buffers and monotonic position counters. No locks, no wakeups, no syscalls on the
+   intra-host path, ~3 copies end to end.
 
 ---
 
-## 1. The messaging data plane (what a 64 B message costs)
+## 1. Aeron in five concepts (the primer)
 
-Frame = 32 B header + payload, 32-aligned → **96 B** for a 64 B message.
+Aeron is a messaging library first; the cluster (SMR) part is built *on top of* the
+messaging part, and that layering is the whole story. The pieces:
+
+- **Media driver** — a separate always-running component (own process or embedded) that
+  owns all networking. Applications never touch sockets; they exchange data with the
+  driver through shared memory. In the default "dedicated" mode the driver runs **three
+  threads**: a *conductor* (admin/bookkeeping), a *sender* (drains outgoing buffers to
+  UDP), and a *receiver* (reassembles incoming datagrams into buffers).
+- **Term buffer** — the core data structure: a large memory-mapped ring of fixed-size
+  segments ("terms") that a *Publication* (sender handle) appends framed messages into and
+  a *Subscription/Image* (receiver handle) reads from **in place**. A frame becomes visible
+  to readers via a release-store of its length word — the same atomic-after-write framing
+  discipline UC's shmem rings use. Everything in Aeron — client↔driver, driver↔driver
+  recording, cluster log — is a term-buffer stream.
+- **Counters** — progress and flow control are communicated exclusively through
+  shared-memory position counters (how far the publisher may write, how far the sender has
+  sent, how far a subscriber has read...). Nothing signals anything; interested parties
+  poll counters.
+- **Agents** — every active component is an "Agent": a single-writer duty-cycle loop
+  (`doWork()`) run by one thread with a configurable idle strategy (busy-spin at the
+  latency-sensitive end). No thread pools, no async runtimes, no tasks.
+- **Archive** — a recording service: it *subscribes* to any stream like a normal consumer
+  and writes the raw term-buffer bytes to disk files, exposing a "recorded up to position
+  X" counter. This is how anything in Aeron becomes durable — including the cluster log.
+
+**Rosetta table for the SMR reader:**
+
+| Raft/SMR concept | Aeron Cluster realization |
+|---|---|
+| the replicated log | one term-buffer *stream* ("the log channel"), leader-published |
+| AppendEntries RPC | none — followers simply *subscribe* to the log stream; the media driver fans it out |
+| log persistence | each node's Archive records the log stream to segment files |
+| follower matchIndex | `AppendPosition`: a tiny control message carrying the follower's *recorded-durable* position, sent coalesced |
+| leader commitIndex | `CommitPosition`: leader ranks members' durable positions, takes the majority-th, gossips it back; also exposed as a local counter |
+| apply loop | the service is its own Agent that polls the log stream directly, bounded by the commit counter |
+| state machine responses | the service offers responses onto per-client egress streams (leader only) |
+| election/terms | a separate `Election` state machine on the consensus thread — idle at steady state |
+
+Keep one number in mind for scale: a 64 B message is framed with a 32 B header and
+32-byte-aligned → **96 B on the wire and in every buffer**.
+
+## 2. The life of one message (leader, steady state)
+
+Plain-language walkthrough; every step below has a deep-dive section later.
+
+1. **Client → cluster.** The client library prepends a small session header and appends the
+   message into its *ingress* term buffer (one atomic fetch-and-add to claim space, copy
+   the bytes, one release-store to publish — no syscall). The client's media driver packs
+   it, with its neighbors, into a UDP datagram to the leader (~14 such messages fit one
+   datagram).
+2. **Leader ingress.** The leader's driver receiver thread rebuilds the datagram into the
+   ingress term buffer. The **consensus module** — a single Agent thread — polls that
+   buffer, validates the session, and does its *entire* per-message consensus duty: **one
+   append of the message onto the log stream's term buffer.** No quorum math, no RPC, no
+   queueing. That's the whole per-message cost on the consensus thread.
+3. **Replication happens in the fabric.** The log stream has each follower registered as a
+   destination ("multi-destination-cast": one publication, N endpoints). The *driver's
+   sender thread* — not consensus code — packs log frames MTU-full and sends them to every
+   follower. If a datagram is lost, the follower's driver notices the gap and sends a NAK;
+   the sender re-reads the frames *from the same term buffer* and retransmits. The log
+   never gets re-read from disk or from the consensus module for replication.
+4. **Durability, everywhere, off-thread.** On the leader and on each follower, the local
+   Archive subscribes to the log stream and block-writes whatever has accumulated since its
+   last poll (up to 1 MiB per write) to a preallocated 128 MiB segment file, then — at
+   `file.sync.level=1` — issues **one fdatasync per block**. Only after write(+sync) does
+   it advance its "recorded position" counter. fsync frequency scales with *block* rate,
+   not message rate: the more load, the bigger the blocks.
+5. **Acknowledgement = position gossip.** Each follower's consensus thread watches its own
+   recorded-position counter and, once per duty cycle in which it advanced (with a 200 ms
+   heartbeat floor), sends the leader one small `AppendPosition` message — implicitly
+   acknowledging *every* message up to that durable position. At 800k msg/s this is a few
+   thousand control messages per second total.
+6. **Commit.** Once per duty cycle, the leader ranks all members' durable positions, takes
+   the majority-th highest (bounded by its own durable position) — that's the commit index
+   — and, when it advanced, gossips `CommitPosition` to members and bumps a local counter.
+   Note the semantics: **commit waits for a quorum of fsync'd positions** — full Raft
+   durability — at a cost amortized to the duty-cycle rate.
+7. **Apply.** The service (own Agent, own thread — the leader's service reads its own log
+   stream via a loopback "spy" subscription) polls the log **in place**, bounded by the
+   commit counter, and invokes the user's state-machine callback. No apply queue, no
+   handoff: the log *is* the apply queue and the commit counter is the only coordination.
+8. **Respond.** The service offers the response onto that client's egress stream (followers
+   run the same apply but their offers are no-ops); the driver sends it; the client's
+   poller picks it up in place.
+
+Count what scaled with the 800k: term-buffer appends, datagram packing, block writes.
+Count what didn't: consensus control traffic (kHz), commit computation (per duty cycle),
+fsyncs (per block), flow-control updates (per window fraction). That asymmetry is the
+design.
+
+## 3. Deep dive: the messaging data plane
+
+*(what one 64 B message costs the messaging layer; classes in `aeron-client`/`aeron-driver`)*
 
 **Publish** (`ConcurrentPublication.offer`, ConcurrentPublication.java:154): one volatile
-load of pub-lmt (flow-control gate), one **XADD** on the per-term tail counter (claims a
-disjoint range — no CAS loop, no lock), header written with a negative-length release
-store, payload `putBytes` (64 B copy), then a release store of the positive frame length —
-the commit point that makes the frame visible to every scanner. `tryClaim` is the zero-copy
-variant (caller writes directly into the term buffer). `ExclusivePublication` (used for the
-cluster log) drops even the XADD — plain store, single writer. **Zero syscalls, zero
-allocation per message.**
+read of the flow-control limit counter, one atomic fetch-and-add (XADD) on the term's tail
+counter to claim 96 B (no CAS loop — concurrent producers get disjoint ranges), header
+written with a negative-length release-store ("in progress"), 64 B payload copy, then a
+release-store of the positive frame length — the commit point that makes the frame visible
+to all readers. A `tryClaim` variant lets the caller write payload directly into the term
+buffer (zero copy). The cluster log uses `ExclusivePublication` (single writer) which
+replaces even the XADD with a plain store. **Zero syscalls, zero allocation per message.**
 
-**Send** (driver sender thread, NetworkPublication.java:826): `TermScanner` walks completed
-frames from snd-pos and packs **up to one MTU (1408 B = 14 messages)** into one
-`DatagramChannel.write` — one syscall per datagram, snd-pos release-stored once per
-datagram. Bound = flow-control window (snd-lmt from receiver Status Messages, sent every
-window/4 ≈ 32 KiB, ~2.4k SMs/s at 77 MB/s — not per message).
+**Send** (driver sender thread, NetworkPublication.java:826): a scanner walks completed
+frames and packs **up to one MTU (1408 B = 14 × 96 B messages) into one
+`DatagramChannel.write`** — one syscall per *datagram*, one position-counter store per
+datagram. The send window is bounded by flow control: the receiver reports its progress
+via a Status Message every quarter-window (~32 KiB), i.e. ~2.4k times/s at 77 MB/s — not
+per message.
 
-**Receive** (driver receiver thread): one `receive` syscall per datagram,
-`TermRebuilder.insert` copies the datagram into the image term buffer at its
-offset-addressed slot (out-of-order safe, duplicate-free), release-stores the frame length,
-bumps rcv-hwm once per datagram. Loss → NAK (event-driven) → sender re-scans the term
-buffer and retransmits. **Retransmit needs no storage read-back — the term buffer IS the
-retransmit buffer.**
+**Receive** (driver receiver thread): one `receive` syscall per datagram; frames are copied
+into the receiving term buffer at their *position-addressed offset* (so out-of-order and
+duplicate datagrams are handled trivially), and published with the same release-store
+framing. Loss triggers a NAK; retransmission re-reads the sender's term buffer.
 
-**Subscribe** (`Image.poll`, Image.java:340): reads frames **in place** in the shared-mmap
-term buffer (zero copy), up to fragmentLimit per poll, sub-pos release-stored **once per
-poll**.
+**Consume** (`Image.poll`, Image.java:340): the handler is called with pointers **into the
+shared term buffer** (zero copy), up to a fragment limit per poll, and the reader's
+position counter is stored **once per poll**, not per message.
 
-**IPC**: publisher and subscriber map the same term buffer; no driver data involvement at
-all; nobody wakes anybody — pure polling; the conductor refreshes pub-lmt with window/8
-hysteresis.
+**Same-host (IPC)**: publisher and subscriber map the *same* term buffer; the driver's data
+path is not involved at all; nobody wakes anybody — pure polling.
 
-At 800k×64 B cross-host: 800k XADDs, **~57k send + ~57k recv syscalls** (14:1 MTU packing),
-~57k position stores, ~2.4k status messages, 0 NAKs. That's the entire data plane.
+At 800k × 64 B cross-host this totals: 800k XADDs, **~57k send and ~57k receive syscalls**
+(the 14:1 MTU packing), ~57k position stores, ~2.4k status messages, 0 NAKs.
 
-**UC contrast:** UC's shmem rings have the same framing discipline (atomic-after-write
-length prefix) — this layer was never the gap (task18/aeron investigation: copying refuted,
-ring hop ~29 ns busy / ~9 µs futex). What UC lacks is everything below.
+**UC contrast:** UC's shmem rings use the same atomic-after-write framing — this layer was
+never our gap (the 2026-06-21 investigation measured ring hops at ~29 ns busy-spun; copying
+refuted). What UC lacks is the layering *above*, next sections.
 
-## 2. Ingress → log on the leader (the consensus thread's per-message work)
+## 4. Deep dive: ingress → log (the consensus thread)
 
 `IngressAdapter.poll` → `ConsensusModuleAgent.onIngressMessage`
-(ConsensusModuleAgent.java:783): role/term guard, session hash-lookup, then
-`LogPublisher.appendMessage` (LogPublisher.java:115) = **one gather `offer`**
-(session-header + payload, single copy) onto the log `ExclusivePublication`. That is the
-consensus module's **entire** per-message duty. No quorum math, no RPC, no counters, no
-queueing — per-message consensus cost ≈ one term-buffer append.
+(ConsensusModuleAgent.java:783): check "am I leader, is the term current", one hash-map
+session lookup, then `LogPublisher.appendMessage` (LogPublisher.java:115) = **one gather
+append** (session header + payload, the one copy on this thread) onto the log stream.
+That is the consensus module's entire per-message duty.
 
-**UC contrast:** on UC's consensus thread each entry is touched repeatedly: api-batch
-channel enqueue → engine command processing → journal append → **replication read-back**
-(per-peer streams re-read entries via `limited_get_log_entries` — from the journal or entry
-cache) → apply dispatch through `sm::Worker` → per-message oneshot completion. The single
-thread does O(5–7) touches per entry; Aeron's does 1.
+**UC contrast:** on UC's consensus thread each entry is touched ~5–7 times: api-batch
+channel enqueue → engine command processing → journal append → *replication read-back*
+(per-peer streams re-read entries from storage via `limited_get_log_entries`) → apply
+dispatch through openraft's state-machine worker → per-message response oneshot. This is
+the direct mechanical reason UC plateaus at ~54–56k on one consensus thread (measured
+identical on 8 and 16 vCPU) while Aeron's consensus thread shrugs at 800k.
 
-## 3. Replication = the fabric, acks = position gossip
+## 5. Deep dive: replication and commit
 
-- The leader's log channel is **MDC (multi-destination-cast)**: one `ExclusivePublication`,
-  one destination per follower (ConsensusModuleAgent.java:1595-1636). The **driver's sender
-  thread** does the fan-out from the same term buffer the append wrote. No AppendEntries,
-  no per-batch request/response, no storage read on the replication path.
-- Followers subscribe to the log stream like any subscription; their **archive records it**
-  (SourceLocation.REMOTE), and `RecordingPos` — advanced only **after** the block write
-  (+fsync at sync.level≥1) — is the follower's durable position.
-- **Follower → leader**: `AppendPosition` (tiny SBE message) sent only when the recorded
-  position advanced since the last send, floor 200 ms (ConsensusModuleAgent.java:2686,2701)
-  — i.e., once per follower duty-cycle batch covering thousands of messages.
-- **Leader**: per duty cycle, ranks member positions (majority-th highest,
-  ClusterMember.java:867), bounded by its own durable position → `CommitPosition` gossiped
-  to members only when it advanced (:2846). Commit therefore waits for a **quorum of
-  fsync'd positions** — real Raft durability semantics — at a cost amortized to
-  ~duty-cycle rate.
+- The log is published once with **MDC — multi-destination-cast** — one publication whose
+  frames the *driver's sender thread* transmits to every registered follower endpoint
+  (ConsensusModuleAgent.java:1595-1636). Consensus code sends nothing per message.
+- Followers are plain subscribers to the log stream; their Archives record it; the
+  **recorded position advances only after write(+fsync at sync.level≥1)**
+  (RecordingSession.java:236-239) — so it is a *durable* position.
+- **Follower → leader**: `AppendPosition` (a fixed ~30 B control message) sent only when
+  the recorded position advanced since the last send, floor one per 200 ms
+  (ConsensusModuleAgent.java:2686,2701). One message acknowledges everything up to that
+  position — the Raft matchIndex, coalesced.
+- **Leader**: once per duty cycle, rank member positions and take the majority-th highest
+  (ClusterMember.java:867) bounded by the leader's own durable position; if it advanced,
+  gossip `CommitPosition` and bump the local commit counter (:2818-2873).
 
-**UC contrast:** openraft replication is per-batch RPC choreography: engine decides a
-range → per-peer stream reads entries back from storage → AppendEntries over QUIC →
-follower engine ingests → journal append+fsync → ack response → leader engine
-update_matching → commit → notify. The measured cost: ~0.52 ms of the 0.70 ms replication
-bucket is this choreography, not the wire (floor-decomposition §3b). Aeron's equivalent
-control loop runs a handful of times per millisecond *total*, independent of message rate.
+**UC contrast:** openraft replication is per-batch RPC choreography — engine decides a
+range, per-peer stream reads the entries back from storage, AppendEntries over QUIC,
+follower engine ingests, fsyncs, responds, leader engine updates matching, commits,
+notifies. Our replication probe measured ~0.52 ms of the 0.70 ms replication bucket as this
+choreography (the wire RTT is only ~0.18 ms). Aeron's equivalent control loop runs a few
+thousand times per second *in total*, independent of message rate.
 
-## 4. Durability (why fsync is free at 800k)
+## 6. Deep dive: durability, apply, egress
 
-The archive recorder (dedicated agent) `blockPoll`s the log image: each poll delivers the
-contiguous run of complete frames since last time (≤1 MiB, ≤1 term), one positional
-`FileChannel.write` from the mapped term buffer (no intermediate copy), then — at
-sync.level 1 — **one `force(false)` per block** (RecordingWriter.java:131-140). Segments
-are 128 MiB, preallocated with `setLength` at open (one dir-force per ~1.7 s at 77 MB/s).
-fsync frequency = block rate, which *falls* as load rises (bigger blocks). Level 0 = same
-writes, zero forces.
+**Durability**: the Archive recorder (a dedicated Agent) polls the log image for whatever
+contiguous complete frames accumulated (≤1 MiB, never crossing a term), does one positional
+`FileChannel.write` **directly from the mapped term buffer** (no intermediate copy), then at
+sync.level 1 one `force(false)` — an fdatasync — per block (RecordingWriter.java:131-140).
+Segments are 128 MiB, preallocated at open. fsync *frequency falls as load rises* (bigger
+blocks). **This is the same design as UC's journal group commit + fdatasync + preallocation
+— our scorecard confirmed fsync is throughput-free for both systems.** The floors differ
+(+0.4 ms UC vs +36 µs Aeron eventual→durable) because UC serializes more *stages* around
+the sync, not because the sync strategy differs.
 
-**UC contrast:** UC's journal group commit + fdatasync is the **same design** (and the
-prealloc work matched the segment preallocation). This is why fsync is throughput-free in
-both systems (scorecard confirmed). The floors differ (+0.4 ms UC vs +36 µs Aeron) because
-UC's *commit path serializes more stages* around the sync, not because the sync strategy
-differs. No work needed here.
+**Apply**: the service Agent polls the committed log **in place**
+(`BoundedLogAdapter.poll(commitPosition.get())`, ClusteredServiceAgent.java:262) and calls
+the user callback inline. Leader and follower run identical apply; only the leader's
+response offers actually send (followers' are mocked). No apply channel, no per-entry
+handoff, no completion futures — the log is the queue, the counter is the coordination.
 
-## 5. Apply and egress
+**UC contrast:** UC embedded apply = openraft sm-worker task receives a command batch →
+adapter mutex → bincode decode → user apply → bincode encode → per-message oneshot wake of
+the awaiting submit future. Two async hops plus a per-message waker where Aeron has a poll.
+(Shmem mode adds the service-process rings and the output/replay machinery on top.)
 
-The service is its own Agent (own process/thread) that **polls the committed log
-directly**: `BoundedLogAdapter.poll(commitPosition.get())` — bounded by a shared-memory
-counter, reading the log in place (leader: a *spy* subscription on its own log publication;
-follower: the replicated stream). Apply = the user callback inline on the service thread.
-Egress = `session.offer` onto a per-session response publication (followers compute but
-don't send). No apply channel, no per-entry handoff, no response oneshot — the *log itself*
-is the apply queue and the *position counter* is the only coordination.
+## 7. Where the measured 13× / 14× gap lives
 
-**UC contrast:** UC's embedded apply path is: openraft `sm::Worker` task receives an apply
-command batch → `AdaptedStateMachine::apply` under a mutex → bincode decode → user apply →
-bincode encode → per-message oneshot wake of the submit future. Two async hops + per-message
-waker + codec, where Aeron has a poll of shared memory. (Shmem mode adds the service
-process rings + output/replay machinery on top.)
-
-## 6. Where the 13×/14× actually lives (measured + mapped)
-
-| mechanism | Aeron | UC today | measured cost |
+| mechanism | Aeron | UC today | our measurement |
 |---|---|---|---|
-| per-message consensus-thread touches | 1 (log offer) | ~5–7 (engine, journal, repl read-back, apply dispatch, oneshot) | UC plateau 54–56k on 1 thread, same on 8/16 vCPU |
-| replication transport | driver MDC from term buffer | per-batch RPC + storage read-back | 0.52 ms choreography vs 0.18 ms wire |
-| replication ack | coalesced durable-position gossip | per-RPC response through engine | part of the 0.52 ms |
-| batching | structural (backlog-formed) | timer linger (2 ms) + group commit | linger 5→2 ms was the single biggest shipped win |
+| per-message consensus-thread touches | 1 (log append) | ~5–7 (engine, journal, repl read-back, apply dispatch, oneshot) | UC plateau 54–56k on 1 thread, same on 8/16 vCPU |
+| replication transport | driver fan-out from the log buffer | per-batch RPC + storage read-back | 0.52 ms choreography vs 0.18 ms wire |
+| replication ack | coalesced durable-position gossip | per-RPC response through the engine | inside the 0.52 ms |
+| batching | structural (backlog-formed) | timer linger (2 ms) + group commit | linger 5→2 ms was our single biggest shipped throughput win |
 | apply | service polls committed log in place | channel hops + mutex + codecs + oneshot | base bucket 0.86 ms incl. commit→apply ~0.67 ms |
-| wakeups | none (polling agents) | futex/task wakes per hop | +0.68 ms floor just from multi_thread scheduling |
-| durability | block write+fsync, position after | group commit fdatasync | equivalent — free on both |
+| wakeups | none (polling Agents) | futex/task wakes per hop | +0.68 ms floor just from a multi_thread runtime |
+| durability | block write + fsync-per-block | journal group commit | equivalent — throughput-free on both |
 
-## 7. Derived UC optimization plan (skeleton)
+## 8. Derived UC optimization plan (skeleton)
 
 Ordered by leverage; each maps to an existing fork/UC asset.
 
-- **P1 — Replication as a data stream + position gossip** (attacks the 0.52 ms choreography
-  bucket and the per-entry consensus-thread work). Stream journal bytes to followers as a
-  continuous flow (the fork's per-peer stream consumers — SyncCore 3c — already sever
-  replication from the core and hold per-peer sessions); replace per-batch ack RPC with a
-  monotonic durable-position report; commit = ranked quorum position in the engine. This is
-  a semantic change to the openraft fork (position-based protocol between our own nodes),
-  not upstreamable — effectively completing the divorce that 3c started.
-- **P2 — No storage read-back on replication.** Replicate from the bytes at append time
-  (the journal write buffer / the already-built EntryCache as a term-buffer analog), with
-  journal read only for lagging followers. The EntryCache (built, merge-ready,
-  embedded-effective) is the asset; the change is feeding replication from the append path
-  instead of `limited_get_log_entries`.
+- **P1 — Replication as a data stream + position gossip.** Stream journal bytes to
+  followers as a continuous flow; replace per-batch ack RPCs with a monotonic
+  durable-position report; commit = ranked quorum position in the engine. The fork's
+  SyncCore 3c per-peer stream consumers already severed replication from the core — this
+  completes that divorce with a position-based protocol between our own nodes (fork-only,
+  not upstreamable). Attacks the 0.52 ms choreography bucket *and* the per-entry
+  consensus-thread work.
+- **P2 — No storage read-back on replication.** Feed replication from the bytes at append
+  time (the already-built EntryCache is our term-buffer analog), with journal reads only
+  for lagging followers.
 - **P3 — Kill the timer linger: backlog-formed batching.** Batch = drain-whatever-is-queued
-  at every stage (submit ring → engine input; engine → journal already is group commit;
-  journal → replication scanner). At low load, latency = poll cadence (µs), not 2 ms; at
-  high load, batches grow automatically. Expected: the floor's linger component vanishes
-  with no throughput cost — the Aeron mechanism proves the design.
-- **P4 — Apply = poll the committed log.** The service/apply stage becomes an independent
-  poller of the journal bounded by a commit watermark (embedded: same process; shmem: the
-  service already has the journal-replay machinery — make it the *primary* path, with the
-  response keyed by log position on the broadcast ring instead of per-message oneshots).
-  This is SyncCore 3e's "apply inline" taken to its logical end.
-- **P5 — Compose the agent pipeline.** SyncCore already built the shape: sync consensus
-  loop + reactor-free durability consumer + per-peer network consumers + disruptor input
-  ring, busy-spin executor available. P1–P4 turn those stages into a pure
-  counter-coordinated pipeline; then the consensus thread's per-message work approaches
-  Aeron's (one staging append), and throughput stops being bounded by one thread doing
-  everything.
-- **Non-goals** (already at parity): fsync strategy (§4), ring/framing discipline (§1),
-  overload robustness (admission control shipped).
+  at every stage (submit ring → engine input; engine → journal is already group commit;
+  journal → replication scanner). Low load: latency = poll cadence, not 2 ms. High load:
+  batches grow automatically. Aeron is the existence proof that this loses nothing.
+- **P4 — Apply = poll the committed log.** The apply stage becomes an independent poller of
+  the journal bounded by a commit watermark, with responses keyed by log position on the
+  broadcast ring instead of per-message oneshots — SyncCore 3e's "apply inline" taken to
+  its logical end.
+- **P5 — Compose the agent pipeline.** SyncCore already built the shape (sync consensus
+  loop, reactor-free durability consumer, per-peer network consumers, disruptor input ring,
+  busy-spin executor). P1–P4 turn those stages into a pure counter-coordinated pipeline; the
+  consensus thread's per-message work then approaches Aeron's single staging append.
+- **Non-goals** (already at parity): fsync strategy (§6), ring/framing discipline (§3),
+  overload robustness (admission control, purge slack, wedge fix — shipped this week).
 
-Realistic expectations: P3 alone is a floor play (‑2 ms at low load). P1+P2+P4 attack both
-the 13× latency (choreography + hops) and the 14× throughput (consensus-thread touches).
-None is a knob; all are fork/architecture work with the foundations already validated
-(task19, 3c consumers, EntryCache, busy-spin executor, this week's correctness gates).
+Realistic expectations: P3 alone is a latency-floor play (removes the linger term). P1+P2+P4
+attack both the ~13× latency gap (choreography + hops) and the ~14× throughput gap
+(consensus-thread touches). None is a knob; all are fork/architecture work with foundations
+already validated (task19 SyncCore, 3c consumers, EntryCache, busy-spin executor, this
+week's correctness gates).
 
 ---
 
 *Method: three parallel source surveys over `/home/claude/ultima/aeron` (data plane;
-consensus module; archive + client), key files: ConcurrentPublication/ExclusivePublication,
-NetworkPublication/TermScanner/TermRebuilder, ConsensusModuleAgent, LogPublisher/LogAdapter,
-ClusterMember.quorumPosition, RecordingWriter/RecordingSession, ClusteredServiceAgent/
-BoundedLogAdapter, AeronCluster. Line references as of Aeron `be83d5d4de`. The
-aeron-benchmarks LoadTestRig itself is not in that checkout; its echo-service semantics were
-confirmed via the in-tree EchoService analog. Numbers quoted from
-`aeron-parity-scorecard-2026-07-02.md` and the floor-decomposition/knee-attribution docs.*
+consensus module; archive + client). Key classes: ConcurrentPublication /
+ExclusivePublication, NetworkPublication / TermScanner / TermRebuilder,
+ConsensusModuleAgent, LogPublisher / LogAdapter, ClusterMember.quorumPosition,
+RecordingWriter / RecordingSession, ClusteredServiceAgent / BoundedLogAdapter, AeronCluster.
+Line references as of Aeron `be83d5d4de`. The aeron-benchmarks LoadTestRig is not in that
+checkout; its echo-service semantics were confirmed via the in-tree EchoService analog.
+Numbers quoted from `benchmarks/aeron-parity-scorecard-2026-07-02.md` and the
+floor-decomposition / knee-attribution docs.*
