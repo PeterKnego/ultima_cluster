@@ -29,10 +29,15 @@ UC: embedded, inflight 256, linger 2 (floor cells: inflight 1, linger 0).
 | latency floor (200 msg/s) | p50 **0.117 ms** / p99 0.299 | p50 **1.48 ms** / p99 2.07 | **~13×** |
 | throughput ceiling | **≥ 800 k/s** (p50 0.38 ms / p99 0.44 ms at 800k; knee NOT reached) | **~56 k/s** plateau | **≥ 14×** |
 
-(Aeron fsync ≥ no-fsync in these runs — archive fsync simply isn't its constraint at
-these payload sizes; the 800k rung moves ~50 MB/s to NVMe. Its real knee likely sits
-beyond the single-threaded LoadTestRig's pacing. UC's fsync tax on *throughput* is also
-≈nil — group commit — and ~0.4 ms on the floor.)
+(NB the two "≥" bounds are not comparable: both arms sustained the 300k ladder, and the
+extra 400–800k probe happened to run only in the fsync configuration — the no-fsync arm
+was never offered more than 300k. Fsync is NOT faster than no-fsync: on latency the
+expected ordering holds everywhere (floor 117 µs vs 81 µs; at 300k p50 325 µs vs 72 µs).
+The real finding is that archive fsync costs Aeron ~nothing on *throughput* — sequential
+writes amortize one fdatasync over thousands of 64 B messages; the 800k rung moves only
+~50 MB/s to NVMe. UC behaves identically: group commit makes fsync throughput-free and
+~0.4 ms on the floor. Aeron's true knee likely sits beyond the single-threaded
+LoadTestRig's pacing.)
 
 ### Robustness (from this week's UC work; Aeron not stress-probed here)
 
