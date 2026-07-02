@@ -139,6 +139,19 @@ pub struct RaftTuning {
     pub heartbeat_interval_ms: u64,
     pub election_timeout_min_ms: u64,
     pub election_timeout_max_ms: u64,
+    /// Log entries retained BEHIND the snapshot boundary at purge time — the "purge
+    /// slack" a lagging follower can catch up through via log replication instead of
+    /// snapshot install.
+    ///
+    /// This must cover a realistic lag burst at full load: with the openraft default
+    /// of 1000 and snapshots every `snapshot_policy_logs_since_last` applied entries,
+    /// a cluster at 45k msg/s purges to within 1000 entries (~22 ms) of the frontier
+    /// several times per second. Any follower that lags more than that can only
+    /// recover via snapshot install — which takes far longer than 22 ms, by the end of
+    /// which it is below the (advanced) purge horizon again: a snapshot-thrash
+    /// livelock with zero goodput (observed on the 2026-07-02 fleet; see
+    /// docs/benchmarks/postfix-ceiling-rerun-2026-07-02.md). The default gives ~4 s of
+    /// slack at 50k msg/s (~20 MB of journal at KV payloads — less than one segment).
     pub max_in_snapshot_log_to_keep: u64,
     /// Trigger snapshot every N applied log entries. openraft default is 5000.
     pub snapshot_policy_logs_since_last: u64,
@@ -154,7 +167,7 @@ impl Default for RaftTuning {
             heartbeat_interval_ms: 250,
             election_timeout_min_ms: 1000,
             election_timeout_max_ms: 2000,
-            max_in_snapshot_log_to_keep: 1000,
+            max_in_snapshot_log_to_keep: 200_000,
             snapshot_policy_logs_since_last: 5000,
             max_payload_entries: 300,
         }

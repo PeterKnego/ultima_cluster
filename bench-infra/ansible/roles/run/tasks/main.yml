@@ -97,6 +97,12 @@
         export UC_APPLY_SPIN_BUDGET={{ uc_apply_spin_budget }}
         export UC_NODE_BRIDGE_SPIN_BUDGET={{ uc_node_bridge_spin_budget }}
         export UC_LOG_CACHE_BYTES={{ uc_log_cache_bytes }}
+        {% if uc_max_in_snapshot_log_to_keep | default('') | string | length > 0 %}
+        export UC_MAX_IN_SNAPSHOT_LOG_TO_KEEP={{ uc_max_in_snapshot_log_to_keep }}
+        {% endif %}
+        {% if uc_snapshot_logs_since_last | default('') | string | length > 0 %}
+        export UC_SNAPSHOT_LOGS_SINCE_LAST={{ uc_snapshot_logs_since_last }}
+        {% endif %}
         # Embedded arm: the in-process load driver reads the same per-request
         # timeout knob uc_client does (harmless in shmem mode — the node ignores it).
         export UC_CLIENT_REQUEST_TIMEOUT_MS={{ uc_client_request_timeout_ms | default(10000) }}

@@ -171,13 +171,26 @@ fn build_node_cfg(args: &Args) -> anyhow::Result<NodeConfig> {
         raft_listen_addr: args.listen,
         app_id: args.app_id.clone(),
         bootstrap: BootstrapConfig::Peers { peers },
-        raft: RaftTuning {
-            // Sweep knob for the 3-node throughput experiment; default 300.
-            max_payload_entries: std::env::var("UC_MAX_PAYLOAD_ENTRIES")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
-            ..RaftTuning::default()
+        raft: {
+            let mut t = RaftTuning::default();
+            // Sweep knobs, threaded via env like UC_DURABILITY below.
+            if let Some(v) = std::env::var("UC_MAX_PAYLOAD_ENTRIES").ok().and_then(|v| v.parse().ok()) {
+                t.max_payload_entries = v;
+            }
+            // Purge slack: entries retained behind the snapshot boundary (the
+            // snapshot-thrash-livelock lever; see RaftTuning docs).
+            if let Some(v) =
+                std::env::var("UC_MAX_IN_SNAPSHOT_LOG_TO_KEEP").ok().and_then(|v| v.parse().ok())
+            {
+                t.max_in_snapshot_log_to_keep = v;
+            }
+            // Snapshot cadence (purge frequency), for slack/cadence sweeps.
+            if let Some(v) =
+                std::env::var("UC_SNAPSHOT_LOGS_SINCE_LAST").ok().and_then(|v| v.parse().ok())
+            {
+                t.snapshot_policy_logs_since_last = v;
+            }
+            t
         },
         tls: TlsConfig::default(),
         // Transport is selectable via UC_TRANSPORT env var; default QUIC.
