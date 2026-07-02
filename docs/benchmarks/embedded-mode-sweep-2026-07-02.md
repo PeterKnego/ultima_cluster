@@ -1,5 +1,12 @@
 # Embedded-mode (co-location) sweep — floor & ceiling A/B vs shmem (2026-07-02)
 
+> **⚠️ CEILING CONCLUSION SUPERSEDED same-day:** the "co-location ~null on the ceiling"
+> verdict below was measured with the replication wedge present in BOTH arms, capping both
+> at ~30k. After the wedge fix, the post-fix re-run
+> (`postfix-ceiling-rerun-2026-07-02.md`) shows **embedded ~57k graceful plateau vs shmem
+> ~31k + collapse** at inflight 256 — co-location IS a throughput lever once the cluster
+> stays healthy. The floor conclusions (co-location ~40 µs; multi_thread +45%) stand.
+
 **Question:** the 2026-07-02 ceiling correction says the ~25-30k msg/s ceiling is the
 *latency floor* (fsync + 3-process shmem IPC + openraft async choreography) and that to move
 past it you must "co-locate to remove IPC hops, cut async replication choreography, or batch
