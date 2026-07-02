@@ -136,3 +136,60 @@ addb8ee, merged to main) on the cleaner-synchronous-foundation + maintainer-dire
 **not** on a proven throughput or robustness advantage at load.
 
 > **⚠️ CORRECTION 2026-07-01: the 5-repeat A/B above is INVALIDATED.** It ran *after* SyncCore was made the default Cargo feature (addb8ee), and due to Cargo feature unification (`uc_autobench` depended on `uc_node` without `default-features = false`), `-e uc_sync_core=false --no-default-features` did NOT disable uc_node's sync-core default — so BOTH arms were actually **SyncCore**. That is why they looked equal and neither collapsed. It did NOT test RaftCore and did NOT debunk the collapse-resistance. The only valid RaftCore-vs-SyncCore comparison remains the *first* single-run A/B (RaftCore 24.2k, collapsed at 30k; SyncCore 24.9k, held) — a single point, still unsettled. Build fixed (uc_autobench uc_node dep `default-features = false`; verified RaftCore build = 0 sync_core symbols, SyncCore = 266); a corrected A/B + a clean RaftCore ceiling profile are pending.
+
+---
+
+## Correction (2026-07-02): the crc32 was NOT the throughput ceiling — the ceiling is the latency floor
+
+The framing above ("the ~15k ceiling was journal read+CRC", "crc32 is the ceiling") is **only
+half right, and misleading for throughput.** A second round of diagnosis + a proper sweep
+corrected it.
+
+**Residual crc32 found + fixed.** After the first purge fix, a fresh RaftCore profile still showed
+crc32 ~18% at the ceiling. Decode-partition counters (a per-primitive `scan`/`read_record`/
+`read_window` decode count, plus per-caller entry counts) pinned it definitively:
+`scan()` = **93-99% of all journal decodes** (~42M/40s on the leader), and the only steady-load
+`scan()` caller is **`purge_before`'s `first_seq` recompute** (`ultima_journal` mod.rs ~549) — the
+**residual half of the purge full-scan bug**: the first fix (`aa031e8`) removed the *last-seq*
+segment-drop scan but missed the *first_seq* recompute scan right below it, which still scanned a
+whole 64 MiB segment on every purge (~5/s, post-snapshot). Fixed in `28dcd6c`
+(`first_seq = first-segment.base_seq()`, filtered by `last_seq`; O(1), no scan; journal purge tests
++ lin_register 3/3 green). `log_id_at` (58k decodes) and `read_record` (0) were ruled out by
+direct measurement — two wrong hypotheses (log_id_at, and earlier a build variant) were caught by
+measuring instead of inferring.
+
+**But it's throughput-neutral — which is the real lesson.** The fix eliminated 93% of the journal
+decodes: crc32 vanished from the profile (top symbol became `finish_task_switch`), and the box went
+from ~50% to **~85-96% idle**. Yet a proper post-fix sweep (RaftCore, inflight 128/256/512, 2 reps)
+gave **20-30k, centered ~25k — statistically identical to pre-fix.**
+
+| inflight | rep 1 | rep 2 |
+|---|---|---|
+| 128 | 22,813 | 20,494 |
+| 256 | 19,991 | 29,988 |
+| 512 | 24,989 | 19,993 |
+
+So the crc32/scan was real **wasted CPU**, but on an otherwise-idle box (5-7 of 8 cores idle) it was
+**never the throughput-binding constraint.** The **~25k ceiling is the latency floor**: fsync
+durability + 3-process shmem IPC round-trips + openraft's async replication choreography (the
+~1-2 ms commit floor). Throughput = concurrency ÷ latency; that floor caps it regardless of spare
+CPU. This is the same structural floor the floor-decomposition found (~73% software/IPC/async,
+~27% fsync/wire), and it explains the whole investigation:
+
+- **SyncCore throughput-null** — it trims per-op latency but the floor is fsync+IPC, not consensus CPU.
+- **cache / output-handler / limited_get all null** — none touched the latency floor.
+- **The *first* purge fix (`aa031e8`) *did* move 15k→25k** — that scan (90M decodes) was heavy
+  enough to actually saturate the leader thread; once removed, the ceiling became latency-bound.
+  This second scan (42M) was already below the floor, so removing it is throughput-neutral.
+
+**Disposition of `28dcd6c`:** keep it — it's correct hygiene (a full-segment scan per purge
+eliminated: less CPU, less I/O, less read-amplification, tail-latency headroom) — but it is **not**
+a throughput win.
+
+**To actually move past ~25k you must attack the latency floor** — co-locate to remove IPC hops,
+cut async replication choreography, or batch fsync harder — **not** CPU/crc32/journal work.
+
+**Method lessons:** (1) the top CPU symbol is not the throughput bottleneck when cores are idle;
+(2) measure the ceiling with a sweep + repeats, not a single profile cell (one anomalous cell read
+11k; six reps showed 20-30k); (3) attribute by direct measurement (decode-delta / per-primitive
+counters), not by inference from a partial profile.
