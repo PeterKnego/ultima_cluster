@@ -137,6 +137,11 @@ on a 2/3 quorum with one core's worth of warn-logging overhead.
 - **File/fix the replication wedge** (fork `stream_state`): empty `limited_get_log_entries`
   below the purge horizon must trigger snapshot install, not a 10 ms-heartbeat retry loop.
   Add a bench-side alert on the warn (it burned ~110 log lines/s for 43 min, silently).
+  **→ FIXED 2026-07-02, fork commit `8d535489` (bounded retries → once-per-inflight `Err`
+  escalation → engine re-decides snapshot; stale-response hardening). Regression test
+  `t21_empty_reads_escalate_to_snapshot.rs`; openraft suites + UC lincheck/partition gates
+  green. See `docs/openraft-known-issues.md` §5. A ceiling re-run to measure the unwedged
+  256+ inflight region is the natural follow-up.**
 - Infra: `uc_ipc_mode` knob + `build.yml` (build-only playbook) + `loadcore` Submitter seam
   shipped (39e8c1b, 932029b). One ansible sudo-flake hit the embed-r2 collect (CSV fetched
   ad-hoc; data complete). 8 bench.yml runs + 1 provision on this fleet; destroyed clean

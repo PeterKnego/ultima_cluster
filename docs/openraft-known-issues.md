@@ -85,6 +85,32 @@ visibility bug surfacing during convergence). **Re-checked after the `1de711a` f
 journal fix. (A rare flake can't be proven absent by 35 runs, but the suspected cause
 — the apply-assert — did not fire once where it previously did.)
 
+## 5. Replication-stream wedge on unservable read ranges — FIXED IN FORK 2026-07-02
+
+A replication stream whose `limited_get_log_entries()` persistently returns empty for a
+non-empty range (typically: the log prefix was purged under a live `LogsSince` stream —
+the engine's purge gate operates on engine-side inflight state, which can diverge from a
+still-running stream after an `update_progress(Err)` reset) retried forever as a
+heartbeat (upstream's graceful handling for openraft#1601). The wedge is silent and
+total: healthy heartbeat ACKs keep the leader content, the target never advances (needs
+a snapshot, never gets one), and `try_purge_log()` postpones purging forever.
+
+Root-caused from the embedded-mode sweep fleet run (2026-07-02): a learner-catchup
+stream wedged at `limited_get_log_entries(0, 300)` one minute into a load run (283k
+warn-loops / 43 min), the cluster silently ran on a 2/3 quorum, and when the second
+follower fell behind at 256-inflight/30k the cluster wedged with zero goodput — this was
+the observed "congestion collapse". See
+`docs/benchmarks/embedded-mode-sweep-2026-07-02.md`.
+
+**Fixed in the fork (`sync-core` branch, commit `8d535489`):** bounded empty-read
+retries, then a once-per-inflight-id `Err` progress escalation so the engine resets the
+inflight (unblocking purge) and re-decides — choosing snapshot replication below the
+purge horizon; plus stale-response hardening in `Inflight::ack` /
+`Updater::update_matching`. Repro + regression test:
+`tests/tests/replication/t21_empty_reads_escalate_to_snapshot.rs`.
+**Status: worth reporting upstream (the graceful-empty handling from #1601 lacks an
+escape hatch; the stale-ack `unreachable!()` is independently reachable).**
+
 ---
 
 **Not openraft:** a teardown-time `SIGSEGV` occasionally seen after an in-process
