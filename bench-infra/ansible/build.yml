@@ -1,0 +1,20 @@
+---
+# Re-sync the local working tree + incremental UC rebuild on the live fleet,
+# WITHOUT running a sweep (contrast: iterate.yml = build + run + fetch).
+# Use after local bench-bin changes mid-session:
+#   ansible-playbook build.yml -e aeron_enabled=false
+- name: Rebuild UC binaries on the live fleet
+  hosts: cluster
+  become: true
+  gather_facts: false
+  vars:
+    aeron_enabled: false
+  pre_tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        delay: 2
+        timeout: 120
+    - name: Gather facts (after SSH is reachable)
+      ansible.builtin.setup:
+  roles:
+    - build_uc
