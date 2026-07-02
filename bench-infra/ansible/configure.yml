@@ -1,0 +1,19 @@
+---
+# Re-render host configs (uc-peers.env + aeron-cfg/*.properties) on the live fleet
+# WITHOUT re-provisioning or rebuilding. Needed when a CONFIG-time knob changes
+# between bench runs — notably `durability`, which the cluster.properties template
+# maps to aeron.archive.file.sync.level (consistent -> 1, none -> 0):
+#   ansible-playbook configure.yml -e durability=consistent
+- name: Re-render bench host configs
+  hosts: cluster
+  become: true
+  gather_facts: false
+  pre_tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+        delay: 2
+        timeout: 120
+    - name: Gather facts (after SSH is reachable)
+      ansible.builtin.setup:
+  roles:
+    - config
