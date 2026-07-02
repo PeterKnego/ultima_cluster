@@ -25,6 +25,16 @@ uc_log_cache_bytes: 268435456        # UC_LOG_CACHE_BYTES: leader log-entry cach
 # (no replication) so 1node vs 3node and eventual vs consistent deltas attribute the commit floor
 # into {base consensus+IPC, fsync, replication}. CSV config label auto-derives ('<n>node_<dura>').
 single_node: false
+# IPC mode of the UC nodes: 'shmem' (default, historical topology: node + separate
+# uc_service over rings, load driven by commit-path-load via uc_client) or 'embedded'
+# (co-location arm: KvSm in-process, NO service process, NO shmem surface — the load
+# driver runs INSIDE node0's process via uc-node-launch --load-* flags and writes the
+# same uc_sweep.csv; the run role then waits for the file instead of driving the
+# ladder). Runtime knob only (no rebuild needed).
+uc_ipc_mode: shmem
+# Max seconds to wait for the embedded in-process sweep to finish (covers the whole
+# inflight × rate ladder incl. warmups; size it to ladder_len × (warmup+measure) + slack).
+embedded_sweep_timeout_secs: 3600
 # Compile the uc-bench-probes sink into the UC bins (incl. leader replication-RPC
 # timing). -e uc_bench_probes=true for the replication-overhead probe; off by default
 # so normal latency benches aren't perturbed. NOTE: changing it requires a rebuild

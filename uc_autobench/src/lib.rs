@@ -10,6 +10,10 @@
 
 pub mod task_spec;
 
+// Shared open-loop KV load-driver core for the fleet bench bins
+// (commit-path-load + uc-node-launch's embedded in-process load mode).
+pub mod loadcore;
+
 // journal-commit task (moved in alongside the ultima_journal crate). Self-contained:
 // depends only on ultima_journal + these helpers — no uc_node/uc_protocol coupling.
 pub mod baseline;

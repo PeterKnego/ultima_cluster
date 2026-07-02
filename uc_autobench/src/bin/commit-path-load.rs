@@ -1,307 +1,21 @@
-//! commit-path-load — open-loop load driver for UC's full single-node commit
-//! path. Drives a rate ladder × in-flight-concurrency sweep against an
-//! in-process `ClusterFixture`, recording submit→response latency in an HDR
-//! histogram and writing one CSV row per ladder step.
+//! commit-path-load — open-loop load driver for UC's full commit path over
+//! the shmem client surface. Drives a rate ladder × in-flight-concurrency
+//! sweep (shared core: `uc_autobench::loadcore`) against either an in-process
+//! `ClusterFixture` (Phase 1, single-node) or a running cluster's instance
+//! dir (`--connect`, Phase 2 multi-process), recording submit→response
+//! latency in an HDR histogram and writing one CSV row per ladder step.
 //!
-//! Runtime MUST be current_thread (memory feedback_m3_test_runtime_flavor):
-//! a multi_thread runtime intermittently times out the shmem handshake.
+//! For the embedded (no-shmem) arm, the same sweep runs in-process inside
+//! `uc-node-launch --ipc-mode embedded` — see loadcore's `Submitter` seam.
 
-use std::io::{Read, Write};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use hdrhistogram::Histogram;
-use serde::{Deserialize, Serialize};
-use uc_service::{SnapshotError, StateMachine};
-
-/// KV command: write `val` at `key`. Serializable so it rides Client::submit.
-#[derive(Serialize, Deserialize)]
-enum KvCmd {
-    Put { key: u64, val: Vec<u8> },
-}
-
-/// In-memory KV state machine. Default-able so it works with ClusterFixture.
-#[derive(Default)]
-struct KvSm {
-    map: std::collections::HashMap<u64, Vec<u8>>,
-    last_applied: Option<u64>,
-}
-
-impl StateMachine for KvSm {
-    type Command = KvCmd;
-    type Response = u64; // returns current map.len()
-    type Query = u64; // key to read
-    type QueryResponse = Option<Vec<u8>>;
-    type SnapshotHandle = Vec<u8>;
-
-    fn apply(&mut self, log_index: u64, cmd: KvCmd) -> u64 {
-        match cmd {
-            KvCmd::Put { key, val } => {
-                self.map.insert(key, val);
-            }
-        }
-        self.last_applied = Some(log_index);
-        self.map.len() as u64
-    }
-
-    fn query(&self, key: u64) -> Option<Vec<u8>> {
-        self.map.get(&key).cloned()
-    }
-
-    fn last_applied(&self) -> Option<u64> {
-        self.last_applied
-    }
-
-    fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError> {
-        Ok((Vec::new(), self.last_applied.unwrap_or(0)))
-    }
-
-    fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn Write) -> Result<(), SnapshotError> {
-        dst.write_all(&handle)?;
-        Ok(())
-    }
-
-    fn install_snapshot(&mut self, _src: &mut dyn Read) -> Result<u64, SnapshotError> {
-        Ok(self.last_applied.unwrap_or(0))
-    }
-}
-
-struct StepRow {
-    config: String,
-    workload: String,
-    payload_bytes: usize,
-    inflight: usize,
-    target_rate: f64,
-    achieved_rate: f64,
-    hist: Histogram<u64>,
-}
-
-impl StepRow {
-    fn to_csv(&self) -> String {
-        format!(
-            "uc,{},{},{},{},{:.0},{:.1},{},{},{},{},{},{}",
-            self.config,
-            self.workload,
-            self.payload_bytes,
-            self.inflight,
-            self.target_rate,
-            self.achieved_rate,
-            self.hist.value_at_quantile(0.50),
-            self.hist.value_at_quantile(0.99),
-            self.hist.value_at_quantile(0.999),
-            self.hist.value_at_quantile(0.9999),
-            self.hist.max(),
-            self.hist.len(),
-        )
-    }
-}
-
-const CSV_HEADER: &str = "system,config,workload,payload_bytes,inflight,target_rate,achieved_rate,\
-p50_ns,p99_ns,p99_9_ns,p99_99_ns,max_ns,count";
-
-/// ns→µs: matches Aeron's default `outputTimeUnit=MICROSECONDS`, so both
-/// systems' .hgrm files share the same value axis on the HdrHistogram plotter.
-const HGRM_SCALE: f64 = 1000.0;
-/// HdrHistogram default `percentileTicksPerHalfDistance` (Aeron uses the default).
-const HGRM_TICKS: u32 = 5;
-
-/// Write `hist` as an HdrHistogram percentile-distribution text file (.hgrm),
-/// byte-compatible with Java HdrHistogram's
-/// `outputPercentileDistribution(out, ticksPerHalfDistance=5, scalingRatio, csv=false)`
-/// — the exact format Aeron's `LoadTestRig` prints. Values are divided by
-/// `scale` (1000.0 = ns→µs). Drop the resulting files (both systems') onto
-/// <https://hdrhistogram.github.io/HdrHistogram/plotFiles.html> to overlay them.
-///
-/// Note: the 3-decimal value precision below mirrors the 3 significant figures
-/// the histogram is created with (`new_with_bounds(.., 3)`); keep them in sync.
-fn write_hgrm(hist: &Histogram<u64>, path: &std::path::Path, scale: f64) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-
-    // Header (Java prints "...\n\n" — a header row then a blank line).
-    writeln!(
-        f,
-        "{:>12} {:>14} {:>10} {:>14}",
-        "Value", "Percentile", "TotalCount", "1/(1-Percentile)"
-    )?;
-    writeln!(f)?;
-
-    // One row per percentile tick. `count_since_last_iteration` summed in visit
-    // order == Java's getTotalCountToThisValue (the iterator walks values up).
-    let mut total: u64 = 0;
-    for v in hist.iter_quantiles(HGRM_TICKS) {
-        total += v.count_since_last_iteration();
-        let value = v.value_iterated_to() as f64 / scale;
-        let q = v.quantile_iterated_to();
-        if q < 1.0 {
-            // Java: "%12.3f %2.12f %10d %14.2f"
-            writeln!(f, "{:12.3} {:2.12} {:10} {:14.2}", value, q, total, 1.0 / (1.0 - q))?;
-        } else {
-            // 100th percentile: 1/(1-p) is infinite, so the column is dropped.
-            // Java: "%12.3f %2.12f %10d"
-            writeln!(f, "{:12.3} {:2.12} {:10}", value, q, total)?;
-        }
-    }
-
-    // Footer comment lines (parsed for Mean/Max by the plotter; '#'-prefixed).
-    writeln!(
-        f,
-        "#[Mean    = {:12.3}, StdDeviation   = {:12.3}]",
-        hist.mean() / scale,
-        hist.stdev() / scale
-    )?;
-    writeln!(
-        f,
-        "#[Max     = {:12.3}, Total count    = {:12}]",
-        hist.max() as f64 / scale,
-        hist.len()
-    )?;
-    f.flush()
-}
-
-/// Run one ladder step: open-loop at `target_rate` msgs/s, at most `inflight`
-/// concurrent submits, for `duration`. Records intended-send→response latency
-/// (coordinated-omission-free: latency is measured from the request's INTENDED
-/// send time, not its actual dispatch time). `payload_bytes` sets the KV value
-/// size. Returns the populated histogram and the achieved rate
-/// (completed / wall-seconds).
-/// Accumulates the actual in-flight concurrency observed during a step, so we
-/// can report achieved-vs-cap (the Phase-0 Little's-law check).
-#[derive(Default)]
-struct ConcurrencyGauge {
-    sum: u64,
-    samples: u64,
-    max: usize,
-}
-
-struct ConcurrencyStat {
-    mean: f64,
-    max: usize,
-}
-
-impl ConcurrencyGauge {
-    fn sample(&mut self, inflight: usize) {
-        self.sum += inflight as u64;
-        self.samples += 1;
-        self.max = self.max.max(inflight);
-    }
-    fn finish(&self) -> ConcurrencyStat {
-        ConcurrencyStat {
-            mean: if self.samples == 0 {
-                0.0
-            } else {
-                self.sum as f64 / self.samples as f64
-            },
-            max: self.max,
-        }
-    }
-}
-
-async fn run_step(
-    client: Arc<uc_client::Client>,
-    target_rate: f64,
-    inflight: usize,
-    duration: Duration,
-    payload_bytes: usize,
-) -> anyhow::Result<(Histogram<u64>, f64, ConcurrencyStat)> {
-    // 1ns..600s range, 3 sig figs (matches Aeron-side hdr_init precision).
-    let mut hist = Histogram::<u64>::new_with_bounds(1, 600_000_000_000, 3)?;
-    let period = Duration::from_secs_f64(1.0 / target_rate);
-    let start = Instant::now();
-    let deadline = start + duration;
-
-    // Concurrency cap: `inflight` permits. Each request is a spawned task (so the
-    // multi-threaded runtime spreads them across cores); acquiring a permit blocks
-    // (backpressure) when the cluster can't keep up, turning the open loop into a
-    // closed loop at saturation. Results (Some(latency_ns) | None=dropped) return
-    // via the channel so a straggler can't abort the step.
-    let sem = Arc::new(tokio::sync::Semaphore::new(inflight));
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Option<u64>>();
-    let val = Arc::new(vec![0u8; payload_bytes]);
-    let mut next_send = start;
-    let mut seq: u64 = 0;
-    let mut completed: u64 = 0;
-    let mut dropped: u64 = 0;
-    let mut gauge = ConcurrencyGauge::default();
-
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            break;
-        }
-        // Pace to the open-loop schedule.
-        if now < next_send {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(next_send)).await;
-        }
-        // Acquire a permit (caps concurrency at `inflight`; blocks under saturation).
-        let permit = Arc::clone(&sem)
-            .acquire_owned()
-            .await
-            .expect("semaphore not closed");
-        gauge.sample(inflight - sem.available_permits());
-        let intended = next_send;
-        next_send += period;
-        let sq = seq;
-        seq += 1;
-        let client = Arc::clone(&client);
-        let val = Arc::clone(&val);
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let cmd = KvCmd::Put {
-                key: sq % 4096,
-                val: (*val).clone(),
-            };
-            let outcome = match client.submit::<_, u64>(&cmd).await {
-                Ok(_) => Some(intended.elapsed().as_nanos() as u64),
-                Err(_) => None, // straggler timeout/error — counted as dropped
-            };
-            let _ = tx.send(outcome);
-            drop(permit);
-        });
-
-        // Non-blocking drain of any completed results to keep counters current.
-        while let Ok(outcome) = rx.try_recv() {
-            match outcome {
-                Some(l) => {
-                    hist.record(l.min(600_000_000_000))?;
-                    completed += 1;
-                }
-                None => dropped += 1,
-            }
-        }
-    }
-
-    // Stop spawning; drop our sender so `rx` closes once all in-flight tasks finish,
-    // then drain the tail.
-    drop(tx);
-    while let Some(outcome) = rx.recv().await {
-        match outcome {
-            Some(l) => {
-                hist.record(l.min(600_000_000_000))?;
-                completed += 1;
-            }
-            None => dropped += 1,
-        }
-    }
-
-    let achieved = completed as f64 / start.elapsed().as_secs_f64();
-    if dropped > 0 {
-        eprintln!(
-            "  [overload] target={:.0} inflight={} completed={} DROPPED={} ({:.1}% — raise UC_CLIENT_REQUEST_TIMEOUT_MS)",
-            target_rate,
-            inflight,
-            completed,
-            dropped,
-            100.0 * dropped as f64 / (completed + dropped).max(1) as f64,
-        );
-    }
-    Ok((hist, achieved, gauge.finish()))
-}
 
 use clap::Parser;
+use uc_autobench::loadcore::{parse_list, run_sweep, ClientSubmitter, KvSm, SweepOpts};
 use uc_node::test_support::ClusterFixture;
 
 #[derive(Parser)]
-#[command(about = "Open-loop commit-path load driver for UC (single-node)")]
+#[command(about = "Open-loop commit-path load driver for UC (shmem client path)")]
 struct Args {
     /// config label written into the CSV (e.g. single_tmpfs, single_disk)
     #[arg(long, default_value = "single_disk")]
@@ -337,42 +51,21 @@ struct Args {
     app_id: String,
 }
 
-fn parse_list<T: std::str::FromStr>(s: &str) -> Vec<T>
-where
-    T::Err: std::fmt::Debug,
-{
-    s.split(',').map(|x| x.trim().parse().unwrap()).collect()
-}
-
 // Multi-threaded runtime: at high inflight the driver must spread the in-flight
 // request futures + the client's response-reader task across cores. On the old
 // single-threaded (`current_thread`) runtime one core saturated at inflight >= 512
 // (each in-flight future also wakes a 100ms stall-check timer), starving the
-// response path and stalling the sweep. run_step now spawns each request as a task.
+// response path and stalling the sweep. run_step spawns each request as a task.
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .try_init();
     let args = Args::parse();
-    let rates: Vec<f64> = parse_list(&args.rates);
-    let inflights: Vec<usize> = parse_list(&args.inflight);
-    let window = Duration::from_secs_f64(args.window_secs);
-    let warmup = Duration::from_secs_f64(args.warmup_secs);
-
-    if let Some(parent) = std::path::Path::new(&args.out).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut csv = std::fs::File::create(&args.out)?;
-    writeln!(csv, "{CSV_HEADER}")?;
-
-    if let Some(dir) = &args.hgrm_dir {
-        std::fs::create_dir_all(dir)?;
-    }
 
     eprintln!(
-        "commit-path-load: config={} rates={:?} inflight={:?} payload={}B",
-        args.config, rates, inflights, args.payload_bytes
+        "commit-path-load: config={} rates={} inflight={} payload={}B",
+        args.config, args.rates, args.inflight, args.payload_bytes
     );
 
     // One client is enough for the open-loop driver (submit takes &self and we
@@ -380,9 +73,6 @@ async fn main() -> anyhow::Result<()> {
     // (--connect, Phase 2 multi-process) or spawn the in-process single-node
     // fixture (Phase 1). Both bindings must outlive the run, so declare them
     // before the branch.
-    // run_step spawns each request as a task, so it needs an owned, 'static
-    // `Arc<Client>` (not the fixture's borrowed `&Client`). Both paths connect a
-    // dedicated client and wrap it in an Arc.
     let fixture: Option<ClusterFixture<KvSm>>;
     let client: Arc<uc_client::Client> = if let Some(dir) = &args.connect {
         eprintln!(
@@ -399,41 +89,17 @@ async fn main() -> anyhow::Result<()> {
         c
     };
 
-    for &inflight in &inflights {
-        for &rate in &rates {
-            // Warmup (discarded).
-            let _ = run_step(client.clone(), rate, inflight, warmup, args.payload_bytes).await?;
-            // Measured.
-            let (hist, achieved, conc) =
-                run_step(client.clone(), rate, inflight, window, args.payload_bytes).await?;
-            eprintln!(
-                "  [gauge] inflight cap={inflight} actual mean={:.1} max={}",
-                conc.mean, conc.max
-            );
-            let row = StepRow {
-                config: args.config.clone(),
-                workload: "kv".into(),
-                payload_bytes: args.payload_bytes,
-                inflight,
-                target_rate: rate,
-                achieved_rate: achieved,
-                hist,
-            };
-            let line = row.to_csv();
-            writeln!(csv, "{line}")?;
-            csv.flush()?;
-            eprintln!("  {line}");
-
-            if let Some(dir) = &args.hgrm_dir {
-                let path = dir.join(format!(
-                    "{}_{}_r{}_if{}.hgrm",
-                    args.config, row.workload, rate as u64, inflight
-                ));
-                write_hgrm(&row.hist, &path, HGRM_SCALE)?;
-                eprintln!("  wrote {}", path.display());
-            }
-        }
-    }
+    let opts = SweepOpts {
+        config: args.config,
+        rates: parse_list(&args.rates),
+        inflights: parse_list(&args.inflight),
+        payload_bytes: args.payload_bytes,
+        window_secs: args.window_secs,
+        warmup_secs: args.warmup_secs,
+        out: args.out.clone().into(),
+        hgrm_dir: args.hgrm_dir,
+    };
+    run_sweep(ClientSubmitter(client), &opts).await?;
 
     // Ordered teardown only for the in-process fixture; a --connect client is
     // dropped (the external cluster keeps running).
@@ -443,92 +109,4 @@ async fn main() -> anyhow::Result<()> {
 
     eprintln!("commit-path-load: wrote {}", args.out);
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn concurrency_gauge_tracks_mean_and_max() {
-        let mut g = ConcurrencyGauge::default();
-        g.sample(0);
-        g.sample(4);
-        g.sample(8);
-        g.sample(4);
-        let s = g.finish();
-        assert_eq!(s.max, 8);
-        assert!((s.mean - 4.0).abs() < 1e-9); // (0+4+8+4)/4
-    }
-
-    #[test]
-    fn empty_gauge_is_zero() {
-        let s = ConcurrencyGauge::default().finish();
-        assert_eq!(s.max, 0);
-        assert_eq!(s.mean, 0.0);
-    }
-
-    #[test]
-    fn hgrm_matches_hdrhistogram_text_format() {
-        let mut h = Histogram::<u64>::new_with_bounds(1, 600_000_000_000, 3).unwrap();
-        // Record in ns; exporter scales ÷1000 to µs.
-        for &v in &[1_000u64, 2_000, 3_000, 50_000, 1_000_000] {
-            h.record(v).unwrap();
-        }
-        let path = std::env::temp_dir().join(format!("uc_hgrm_{}.hgrm", std::process::id()));
-        write_hgrm(&h, &path, HGRM_SCALE).unwrap();
-        let s = std::fs::read_to_string(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
-
-        // Header columns (HdrHistogram / Aeron text format).
-        assert!(s.contains("Value"));
-        assert!(s.contains("Percentile"));
-        assert!(s.contains("TotalCount"));
-        assert!(s.contains("1/(1-Percentile)"));
-        // Footer comment lines.
-        assert!(s.contains("#[Mean"));
-        assert!(s.contains("#[Max"));
-        // 1000 ns scaled to µs -> "1.000" appears as the smallest value.
-        assert!(s.contains("1.000"));
-        // Final row reaches the 100th percentile (quantile 1.0).
-        assert!(s.contains("1.000000000000"));
-        // Total count reaches the number of recorded samples.
-        assert!(s.lines().any(|l| l.split_whitespace().nth(2) == Some("5")));
-    }
-
-    #[test]
-    fn kv_apply_inserts_and_counts() {
-        let mut sm = KvSm::default();
-        let n = sm.apply(
-            1,
-            KvCmd::Put {
-                key: 7,
-                val: vec![1, 2, 3],
-            },
-        );
-        assert_eq!(n, 1);
-        assert_eq!(sm.query(7), Some(vec![1, 2, 3]));
-        assert_eq!(sm.last_applied(), Some(1));
-    }
-
-    #[test]
-    fn csv_row_has_13_columns() {
-        let mut hist = Histogram::<u64>::new(3).unwrap();
-        for v in [100u64, 200, 300, 400, 500] {
-            hist.record(v).unwrap();
-        }
-        let row = StepRow {
-            config: "single_disk".into(),
-            workload: "kv".into(),
-            payload_bytes: 64,
-            inflight: 8,
-            target_rate: 1000.0,
-            achieved_rate: 987.6,
-            hist,
-        };
-        let csv = row.to_csv();
-        assert_eq!(csv.split(',').count(), 13);
-        assert!(csv.starts_with("uc,single_disk,kv,64,8,1000,987.6,"));
-        assert_eq!(CSV_HEADER.split(',').count(), 13);
-    }
 }
