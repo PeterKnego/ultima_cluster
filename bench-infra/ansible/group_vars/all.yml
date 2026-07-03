@@ -53,7 +53,12 @@ uc_bench_probes: false
 
 # --- Build sources ---
 aeron_benchmarks_repo: "https://github.com/aeron-io/benchmarks.git"
-aeron_benchmarks_ref: "master"          # pin to a SHA for canonical runs
+aeron_benchmarks_ref: "6afb215"   # pinned 2026-07-03 for reproducibility + external-service patch
+# ---- aeron-go arm (Go ClusteredServiceContainer A/B) ----
+aerongo_enabled: false            # true = run the Go-service arm after the Java arm
+aerongo_repo: "https://github.com/lirm/aeron-go.git"
+aerongo_ref: "8b05ad1"            # upstream HEAD 2024-06-06; proven against Aeron 1.43 AND 1.51
+aerongo_dir: "/opt/bench/aerongo"
 jdk_version: "21"
 uc_src_mode: "rsync"                     # 'rsync' local working tree | 'git'
 uc_git_ref: ""                           # used when uc_src_mode=git

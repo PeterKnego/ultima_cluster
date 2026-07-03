@@ -13,6 +13,23 @@
     depth: 1
   register: aeron_clone
 
+- name: Copy ClusterNode external-service patch
+  ansible.builtin.copy:
+    src: clusternode-external-service.patch
+    dest: "{{ remote_home }}/clusternode-external-service.patch"
+    mode: "0644"
+
+- name: Apply ClusterNode external-service patch
+  ansible.builtin.shell: |
+    cd {{ remote_home }}/aeron-benchmarks
+    if git apply --reverse --check {{ remote_home }}/clusternode-external-service.patch 2>/dev/null; then
+      echo already-applied
+    else
+      git apply {{ remote_home }}/clusternode-external-service.patch
+    fi
+  register: patch_apply
+  changed_when: "'already-applied' not in patch_apply.stdout"
+
 - name: Build deployTar
   ansible.builtin.shell: ./gradlew clean deployTar -x test --no-daemon --console=plain
   args:

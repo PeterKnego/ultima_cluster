@@ -1,0 +1,54 @@
+diff --git a/benchmarks-aeron/src/main/java/io/aeron/benchmarks/aeron/ClusterNode.java b/benchmarks-aeron/src/main/java/io/aeron/benchmarks/aeron/ClusterNode.java
+index cb5e497..4f8a9c5 100644
+--- a/benchmarks-aeron/src/main/java/io/aeron/benchmarks/aeron/ClusterNode.java
++++ b/benchmarks-aeron/src/main/java/io/aeron/benchmarks/aeron/ClusterNode.java
+@@ -123,7 +123,8 @@ public final class ClusterNode
+ 
+             try (Archive archive = Archive.launch(archiveContext);
+                 Component<ConsensusModule> cm = consensusModule.start();
+-                Component<ClusteredServiceContainer> csc = clusteredServiceContainer.start();
++                Component<ClusteredServiceContainer> csc =
++                    Type.EXTERNAL == type ? null : clusteredServiceContainer.start();
+                 FailoverControlServer failoverControlServer = createFailoverControlServer(
+                     type,
+                     memberId,
+@@ -134,11 +135,14 @@ public final class ClusterNode
+                 signalBarrier.await();
+ 
+                 final String prefix = "cluster-node-" + memberId + "-";
+-                AeronUtil.dumpClusterErrors(
+-                    logsDir.resolve(prefix + "clustered-service-errors.txt"),
+-                    clusterDir,
+-                    ClusterMarkFile.markFilenameForService(serviceId),
+-                    ClusterMarkFile.linkFilenameForService(serviceId));
++                if (Type.EXTERNAL != type)
++                {
++                    AeronUtil.dumpClusterErrors(
++                        logsDir.resolve(prefix + "clustered-service-errors.txt"),
++                        clusterDir,
++                        ClusterMarkFile.markFilenameForService(serviceId),
++                        ClusterMarkFile.linkFilenameForService(serviceId));
++                }
+                 AeronUtil.dumpClusterErrors(
+                     logsDir.resolve(prefix + "consensus-module-errors.txt"),
+                     clusterDir,
+@@ -217,12 +221,17 @@ public final class ClusterNode
+     private enum Type
+     {
+         ECHO,
+-        FAILOVER;
++        FAILOVER,
++        EXTERNAL;
+ 
+         public static Type fromSystemProperty()
+         {
+             final String clusteredServiceName = System.getProperty(CLUSTER_SERVICE_PROP_NAME);
+-            return "failover".equals(clusteredServiceName) ? FAILOVER : ECHO;
++            if ("failover".equals(clusteredServiceName))
++            {
++                return FAILOVER;
++            }
++            return "external".equals(clusteredServiceName) ? EXTERNAL : ECHO;
+         }
+     }
+ }
