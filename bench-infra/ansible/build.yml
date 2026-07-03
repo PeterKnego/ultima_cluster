@@ -18,3 +18,5 @@
       ansible.builtin.setup:
   roles:
     - build_uc
+    - role: build_aerongo
+      when: aerongo_enabled | default(false) | bool

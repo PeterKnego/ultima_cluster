@@ -1,0 +1,35 @@
+---
+- name: Install Go toolchain
+  ansible.builtin.apt:
+    name: golang-go
+    state: present
+    update_cache: true
+  become: true
+
+- name: Clone aeron-go
+  ansible.builtin.git:
+    repo: "{{ aerongo_repo }}"
+    dest: "{{ remote_home }}/aeron-go"
+    version: "{{ aerongo_ref }}"
+    force: true
+
+- name: Ensure aerongo dir exists
+  ansible.builtin.file:
+    path: "{{ aerongo_dir }}"
+    state: directory
+    mode: "0755"
+  become: true
+
+- name: Build echo_service
+  ansible.builtin.shell: |
+    cd {{ remote_home }}/aeron-go
+    go build -o /tmp/echo_service ./examples/cluster
+  changed_when: true
+
+- name: Install echo_service
+  ansible.builtin.copy:
+    src: /tmp/echo_service
+    dest: "{{ aerongo_dir }}/echo_service"
+    remote_src: true
+    mode: "0755"
+  become: true
