@@ -1,0 +1,223 @@
++++ dirname /opt/bench/aeron-deploy/scripts/aeron/cluster-node
+++ cd /opt/bench/aeron-deploy/scripts/aeron
+++ pwd
++ DIR=/opt/bench/aeron-deploy/scripts/aeron
+++ basename /opt/bench/aeron-deploy/scripts/aeron/cluster-node .sh
++ PROCESS_FILE_NAME=cluster-node
++ export PROCESS_FILE_NAME
++ exec /opt/bench/aeron-deploy/scripts/aeron/../run-java io.aeron.benchmarks.aeron.ClusterNode /opt/bench/aeron-deploy/scripts/aeron/low-latency-driver.properties /opt/bench/aeron-deploy/scripts/aeron/low-latency-archive.properties /opt/bench/aeron-deploy/scripts/aeron/benchmark.properties /opt/bench/aeron-cfg/cluster.properties /opt/bench/aeron-cfg/node.properties
++++ dirname /opt/bench/aeron-deploy/scripts/aeron/../run-java
+++ cd /opt/bench/aeron-deploy/scripts/aeron/..
+++ pwd
++ DIR=/opt/bench/aeron-deploy/scripts
++ class_name=ClusterNode
++ log_file_name=cluster-node
++ '[' -d /dev/shm ']'
++ gc_log_file=/dev/shm/cluster-node-gc.log
++ error_log_file=/dev/shm/cluster-node-crash.log
++ java_options=(-Djava.net.preferIPv4Stack=true -Djava.net.preferIPv6Addresses=false -XX:+UnlockExperimentalVMOptions -XX:+TrustFinalNonStaticFields -XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints -XX:+UseParallelGC -XX:ErrorFile="${error_log_file}" -Xms4G -Xmx4G -XX:+AlwaysPreTouch -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=1G -XX:+EnableDynamicAgentLoading "-Xlog:gc*,safepoint=info,arguments=info:file=${gc_log_file}:time")
++ add_opens=(--add-opens java.base/java.util.zip=ALL-UNNAMED --add-opens java.base/jdk.internal.misc=ALL-UNNAMED)
++ jvm_opts=()
++ [[ -v JVM_OPTS ]]
++ [[ -n -Xms16M -Dio.aeron.benchmarks.output.directory=/opt/bench/results -Dio.aeron.benchmarks.aeron.cluster.service=external ]]
++ IFS=' '
++ read -ra jvm_opts
++ unset IFS
++ classpath=
++ for jar in "$DIR/../benchmarks-all/build/libs"/*.jar
++ classpath=/opt/bench/aeron-deploy/scripts/../benchmarks-all/build/libs/benchmarks.jar
++ exec /usr/lib/jvm/java-21-openjdk-amd64/bin/java -cp /opt/bench/aeron-deploy/scripts/../benchmarks-all/build/libs/benchmarks.jar -Djava.net.preferIPv4Stack=true -Djava.net.preferIPv6Addresses=false -XX:+UnlockExperimentalVMOptions -XX:+TrustFinalNonStaticFields -XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints -XX:+UseParallelGC -XX:ErrorFile=/dev/shm/cluster-node-crash.log -Xms4G -Xmx4G -XX:+AlwaysPreTouch -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=1G -XX:+EnableDynamicAgentLoading '-Xlog:gc*,safepoint=info,arguments=info:file=/dev/shm/cluster-node-gc.log:time' --add-opens java.base/java.util.zip=ALL-UNNAMED --add-opens java.base/jdk.internal.misc=ALL-UNNAMED -Xms16M -Dio.aeron.benchmarks.output.directory=/opt/bench/results -Dio.aeron.benchmarks.aeron.cluster.service=external io.aeron.benchmarks.aeron.ClusterNode /opt/bench/aeron-deploy/scripts/aeron/low-latency-driver.properties /opt/bench/aeron-deploy/scripts/aeron/low-latency-archive.properties /opt/bench/aeron-deploy/scripts/aeron/benchmark.properties /opt/bench/aeron-cfg/cluster.properties /opt/bench/aeron-cfg/node.properties
+Archive.Context
+{
+    isConcluded=true
+    deleteArchiveOnStart=true
+    ownsAeronClient=true
+    aeronDirectoryName='/dev/shm/node0-driver'
+    aeron=Aeron{isClosed=false, clientId=2}
+    archiveDir=/opt/bench/cluster/node0/archive
+    archiveDirectoryName='/opt/bench/cluster/node0/archive'
+    archiveDirChannel=sun.nio.ch.FileChannelImpl@7a5d012c
+    archiveFileStore=/opt/bench (/dev/nvme1n1)
+    archiveId=1
+    catalog=Catalog{forceWrites=true, forceMetadata=false, isClosed=false, catalogFile=/opt/bench/cluster/node0/archive/archive.catalog, archiveDir=/opt/bench/cluster/node0/archive, epochClock=org.agrona.concurrent.SystemEpochClock@3fb6a447, checksum=null, alignment=64, firstRecordingDescriptorOffset=32, catalogChannel=sun.nio.ch.FileChannelImpl@79b4d0f, capacity=1048576, nextRecordingId=0, nextRecordingDescriptorOffset=32}
+    markFile=ArchiveMarkFile{markFile=org.agrona.MarkFile@2096442d}
+    archiveClientContext=AeronArchive.Context
+{
+    isConcluded=false
+    ownsAeronClient=false
+    aeronDirectoryName='/dev/shm/node0-driver'
+    aeron=Aeron{isClosed=false, clientId=2}
+    messageTimeoutNs=10000000000
+    recordingEventsChannel='null'
+    recordingEventsStreamId=30
+    controlRequestChannel='aeron:udp?endpoint=10.10.1.10:20004'
+    controlRequestStreamId=10
+    controlResponseChannel='aeron:udp?endpoint=10.10.1.10:0'
+    controlResponseStreamId=20
+    controlTermBufferSparse=true
+    controlTermBufferLength=65536
+    controlMtuLength=1408
+    idleStrategy=null
+    lock=org.agrona.concurrent.NoOpLock@13c78c0b
+    errorHandler=org.agrona.concurrent.errors.LoggingErrorHandler@12843fce
+    credentialsSupplier=null
+}
+    mediaDriverAgentInvoker=null
+    controlChannel='aeron:udp?endpoint=10.10.1.10:20004'
+    controlStreamId=10
+    localControlChannel='aeron:ipc?term-length=64k'
+    localControlStreamId=10
+    controlTermBufferSparse=true
+    controlTermBufferLength=65536
+    controlMtuLength=1408
+    recordingEventsChannel='null'
+    recordingEventsStreamId=30
+    recordingEventsEnabled=false
+    replicationChannel='aeron:udp?endpoint=10.10.1.10:0'
+    connectTimeoutNs=5000000000
+    sessionLivenessCheckIntervalNs=1000000000
+    replayLingerTimeoutNs=5000000000
+    maxCatalogEntries=-1
+    catalogCapacity=1048576
+    lowStorageSpaceThreshold=134217728
+    segmentFileLength=134217728
+    fileSyncLevel=1
+    catalogFileSyncLevel=1
+    maxConcurrentRecordings=20
+    maxConcurrentReplays=20
+    fileIoMaxLength=1048576
+    threadingMode=DEDICATED
+    threadFactory=io.aeron.archive.Archive$Context$$Lambda/0x00007f490002b448@32d992b2
+    abortLatch=java.util.concurrent.CountDownLatch@215be6bb[Count = 2]
+    idleStrategySupplier=io.aeron.archive.Archive$Configuration$$Lambda/0x00007f490002b668@4439f31e
+    replayerIdleStrategySupplier=io.aeron.archive.Archive$Configuration$$Lambda/0x00007f490002bab8@5dfcfece
+    recorderIdleStrategySupplier=io.aeron.archive.Archive$Configuration$$Lambda/0x00007f490002b890@23ceabc1
+    epochClock=org.agrona.concurrent.SystemEpochClock@3fb6a447
+    authenticatorSupplier=io.aeron.security.DefaultAuthenticatorSupplier@5d5eef3d
+    controlSessionsCounter=AtomicCounter{isClosed=false, id=54, value=0, countersManager=null}
+    recordingSessionCounter=AtomicCounter{isClosed=false, id=55, value=0, countersManager=null}
+    replaySessionCounter=AtomicCounter{isClosed=false, id=56, value=0, countersManager=null}
+    errorBufferLength=1048576
+    errorHandler=org.agrona.concurrent.errors.LoggingErrorHandler@12843fce
+    errorCounter=AtomicCounter{isClosed=false, id=47, value=0, countersManager=null}
+    countedErrorHandler=org.agrona.concurrent.CountedErrorHandler@4520ebad
+    recordChecksum=null
+    replayChecksum=null
+    dataBuffer=UnsafeBuffer{addressOffset=139951456899136, capacity=1048576, byteArray=null, byteBuffer=java.nio.DirectByteBuffer[pos=0 lim=1048576 cap=1048576]}
+    replayBuffer=null
+    recordChecksumBuffer=null
+    conductorCycleThresholdNs=1000000
+    recorderCycleThresholdNs=1000000
+    replayerCycleThresholdNs=1000000
+    conductorDutyCycleTracker=DutyCycleStallTracker{maxCycleTime=AtomicCounter{isClosed=false, id=48, value=0, countersManager=null}, cycleTimeThresholdExceededCount=AtomicCounter{isClosed=false, id=49, value=0, countersManager=null}, cycleTimeThresholdNs=1000000}
+    recorderDutyCycleTracker=DutyCycleStallTracker{maxCycleTime=AtomicCounter{isClosed=false, id=50, value=0, countersManager=null}, cycleTimeThresholdExceededCount=AtomicCounter{isClosed=false, id=51, value=0, countersManager=null}, cycleTimeThresholdNs=1000000}
+    replayerDutyCycleTracker=DutyCycleStallTracker{maxCycleTime=AtomicCounter{isClosed=false, id=52, value=0, countersManager=null}, cycleTimeThresholdExceededCount=AtomicCounter{isClosed=false, id=53, value=0, countersManager=null}, cycleTimeThresholdNs=1000000}
+    totalWriteBytesCounter=AtomicCounter{isClosed=false, id=58, value=0, countersManager=null}
+    totalWriteTimeCounter=AtomicCounter{isClosed=false, id=59, value=0, countersManager=null}
+    maxWriteTimeCounter=AtomicCounter{isClosed=false, id=57, value=0, countersManager=null}
+    totalReadBytesCounter=AtomicCounter{isClosed=false, id=61, value=0, countersManager=null}
+    totalReadTimeCounter=AtomicCounter{isClosed=false, id=62, value=0, countersManager=null}
+    maxReadTimeCounter=AtomicCounter{isClosed=false, id=60, value=0, countersManager=null}
+}
+ConsensusModule.Context
+{
+    isConcluded=true
+    ownsAeronClient=true
+    aeronDirectoryName='/dev/shm/node0-driver'
+    aeron=Aeron{isClosed=false, clientId=23}
+    deleteDirOnStart=false
+    clusterDirectoryName='/opt/bench/cluster/node0/cluster'
+    clusterDir=/opt/bench/cluster/node0/cluster
+    recordingLog=RecordingLog{entries=[], cacheIndex={}}
+    markFile=ClusterMarkFile{semanticVersion=0.3.0, markFile=/dev/shm/node0-driver/cluster-mark.dat}
+    fileSyncLevel=1
+    appVersion=1
+    clusterId=0
+    clusterMemberId=0
+    appointedLeaderId=0
+    clusterMembers='0,10.10.1.10:20000,10.10.1.10:20001,10.10.1.10:20002,10.10.1.10:20003,10.10.1.10:20004|1,10.10.1.11:21000,10.10.1.11:21001,10.10.1.11:21002,10.10.1.11:21003,10.10.1.11:21004|2,10.10.1.12:22000,10.10.1.12:22001,10.10.1.12:22002,10.10.1.12:22003,10.10.1.12:22004'
+    ingressChannel='aeron:udp'
+    ingressStreamId=101
+    ingressFragmentLimit=50
+    logChannel='aeron:udp?term-length=64m'
+    logStreamId=100
+    memberEndpoints=''
+    replayChannel='aeron:ipc'
+    replayStreamId=103
+    controlChannel='aeron:ipc?term-length=128k'
+    consensusModuleStreamId=105
+    serviceStreamId=104
+    snapshotChannel='aeron:ipc?alias=snapshot'
+    snapshotStreamId=107
+    consensusChannel='aeron:udp'
+    consensusStreamId=108
+    replicationChannel='aeron:udp?endpoint=10.10.1.10:0'
+    logFragmentLimit=50
+    serviceCount=1
+    errorBufferLength=1048576
+    maxConcurrentSessions=10
+    ticksPerWheel=128
+    wheelTickResolutionNs=8000000
+    timerServiceSupplier=io.aeron.cluster.WheelTimerServiceSupplier@4148db48
+    sessionTimeoutNs=10000000000
+    leaderHeartbeatTimeoutNs=10000000000
+    leaderHeartbeatIntervalNs=200000000
+    startupCanvassTimeoutNs=60000000000
+    electionTimeoutNs=1000000000
+    electionStatusIntervalNs=100000000
+    terminationTimeoutNs=10000000000
+    threadFactory=io.aeron.cluster.ConsensusModule$Context$$Lambda/0x00007f49000c9010@282003e1
+    idleStrategySupplier=io.aeron.benchmarks.aeron.ClusterNode$$Lambda/0x00007f490000e1e0@7fad8c79
+    clusterClock=io.aeron.cluster.MillisecondClusterClock@71a794e5
+    epochClock=org.agrona.concurrent.SystemEpochClock@3fb6a447
+    random=java.util.Random@76329302
+    errorLog=org.agrona.concurrent.errors.DistinctErrorLog@5e25a92e
+    errorHandler=io.aeron.CommonContext$ErrorHandlerWrapper@4df828d7
+    errorCounter=AtomicCounter{isClosed=false, id=66, value=0, countersManager=null}
+    countedErrorHandler=org.agrona.concurrent.CountedErrorHandler@b59d31
+    moduleStateCounter=AtomicCounter{isClosed=false, id=67, value=0, countersManager=null}
+    electionStateCounter=AtomicCounter{isClosed=false, id=68, value=0, countersManager=null}
+    clusterNodeRoleCounter=AtomicCounter{isClosed=false, id=71, value=0, countersManager=null}
+    commitPosition=AtomicCounter{isClosed=false, id=72, value=0, countersManager=null}
+    controlToggle=AtomicCounter{isClosed=false, id=73, value=0, countersManager=null}
+    nodeControlToggle=AtomicCounter{isClosed=false, id=74, value=0, countersManager=null}
+    snapshotCounter=AtomicCounter{isClosed=false, id=75, value=0, countersManager=null}
+    timedOutClientCounter=AtomicCounter{isClosed=false, id=76, value=0, countersManager=null}
+    standbySnapshotCounter=null
+    electionCounter=AtomicCounter{isClosed=false, id=69, value=0, countersManager=null}
+    leadershipTermId=AtomicCounter{isClosed=false, id=70, value=0, countersManager=null}
+    terminationHook=io.aeron.benchmarks.aeron.ClusterNode$$Lambda/0x00007f49000c6458@62fdb4a6
+    archiveContext=AeronArchive.Context
+{
+    isConcluded=false
+    ownsAeronClient=false
+    aeronDirectoryName='/dev/shm/node0-driver'
+    aeron=Aeron{isClosed=false, clientId=23}
+    messageTimeoutNs=10000000000
+    recordingEventsChannel='null'
+    recordingEventsStreamId=30
+    controlRequestChannel='aeron:ipc?alias=cm-archive-ctrl-req-cluster-0-member-0|term-length=64k'
+    controlRequestStreamId=10
+    controlResponseChannel='aeron:ipc?alias=cm-archive-ctrl-resp-cluster-0-member-0|term-length=64k'
+    controlResponseStreamId=120
+    controlTermBufferSparse=true
+    controlTermBufferLength=65536
+    controlMtuLength=1408
+    idleStrategy=null
+    lock=org.agrona.concurrent.NoOpLock@13c78c0b
+    errorHandler=org.agrona.concurrent.CountedErrorHandler@b59d31
+    credentialsSupplier=null
+}
+    authenticatorSupplier=io.aeron.security.DefaultAuthenticatorSupplier@11e21d0e
+    authorisationServiceSupplier=io.aeron.cluster.ConsensusModule$Configuration$$Lambda/0x00007f490000dfb0@1dd02175
+    logPublisher=LogPublisher{destinationChannel='aeron:udp?term-length=64m'}
+    egressPublisher=EgressPublisher{}
+    isLogMdc=true
+    useAgentInvoker=false
+    cycleThresholdNs=1000000
+    dutyCycleTracker=DutyCycleStallTracker{maxCycleTime=AtomicCounter{isClosed=false, id=77, value=0, countersManager=null}, cycleTimeThresholdExceededCount=AtomicCounter{isClosed=false, id=78, value=0, countersManager=null}, cycleTimeThresholdNs=1000000}
+    totalSnapshotDurationThresholdNs=1000000000
+    totalSnapshotDurationTracker=SnapshotDurationTracker{maxSnapshotDuration=AtomicCounter{isClosed=false, id=79, value=0, countersManager=null}, snapshotDurationThresholdExceededCount=AtomicCounter{isClosed=false, id=80, value=0, countersManager=null}, durationThresholdNs=1000000000}
+    acceptStandbySnapshots=false
+    bootstrapState=null
+}

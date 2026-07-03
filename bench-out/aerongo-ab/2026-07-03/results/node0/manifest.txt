@@ -1,0 +1,15 @@
+timestamp=20260703T193105Z
+cloud_role=node0
+instance=16vcpu 31551MB
+kernel=6.17.0-1019-aws
+durability=consistent
+transport=quic
+netem_loss_pct=0
+netem_delay_ms=0
+netem_iface=eth0
+aeron_ingress=udp
+rate_ladder=100,500,1000,2000,5000,10000,20000
+payload_bytes=64
+inflight=128
+uc_provenance=n/a
+aeron_benchmarks_ref=6afb215

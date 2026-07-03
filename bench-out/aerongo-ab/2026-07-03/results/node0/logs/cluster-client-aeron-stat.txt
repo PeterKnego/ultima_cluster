@@ -1,0 +1,223 @@
+CnC version: 0.2.0
+PID: 12552
+Start time: 2026-07-03 19:27:27.831+0000
+================================================================
+  0:          235,364,448 - Bytes sent
+  1:          175,992,552 - Bytes received
+  2:                    0 - Failed offers to ReceiverProxy
+  3:                    0 - Failed offers to SenderProxy
+  4:                    0 - Failed offers to DriverConductorProxy
+  5:                    0 - NAKs sent
+  6:                    0 - NAKs received
+  7:               12,625 - Status Messages sent
+  8:               15,818 - Status Messages received
+  9:                3,388 - Heartbeats sent
+ 10:                2,285 - Heartbeats received
+ 11:                    0 - Retransmits sent
+ 12:                    0 - Flow control under runs
+ 13:                    0 - Flow control over runs
+ 14:                    0 - Invalid packets
+ 15:                    0 - Errors: version=1.51.0 commit=9773cba37e
+ 16:                    0 - Short sends
+ 17:                    0 - Failed attempts to free log buffers
+ 18:                    0 - Sender flow control limits, i.e. back-pressure events
+ 19:                    0 - Unblocked Publications
+ 20:                    0 - Unblocked Control Commands
+ 21:                    0 - Possible TTL Asymmetry
+ 22:                    0 - ControllableIdleStrategy status
+ 23:                    0 - Loss gap fills
+ 24:                    0 - Client liveness timeouts
+ 25:                    0 - Resolution changes: driverName=null
+ 26:            6,935,133 - Conductor max cycle time doing its work in ns: DEDICATED
+ 27:                   13 - Conductor work cycle exceeded threshold count: threshold=1ms DEDICATED
+ 28:            4,158,077 - Sender max cycle time doing its work in ns: DEDICATED
+ 29:                    6 - Sender work cycle exceeded threshold count: threshold=1ms DEDICATED
+ 30:            4,202,346 - Receiver max cycle time doing its work in ns: DEDICATED
+ 31:                    8 - Receiver work cycle exceeded threshold count: threshold=1ms DEDICATED
+ 32:               73,320 - NameResolver max time in ns
+ 33:                    0 - NameResolver exceeded threshold count: threshold=5s
+ 34:               78,592 - Aeron software: version=1.51.0 commit=9773cba37e
+ 35:          258,170,880 - Bytes currently mapped
+ 36:                    0 - Retransmitted bytes
+ 37:                    0 - Retransmit Pool Overflow count
+ 38:                    0 - Error Frames received
+ 39:                    0 - Error Frames sent
+ 40:                    1 - Publications Revoked
+ 41:                    0 - Publication Images Revoked
+ 42:                    0 - Images rejected
+ 43:               65,536 - Control protocol version
+ 44:                    0 - Status Messages rejected
+ 45:                    0 - Failed offers to AsyncExecutorProxy
+ 46:    1,783,106,958,962 - client-heartbeat: id=2 name=archive archiveId=1 version=1.51.0 commit=9773cba37e
+ 47:                    0 - Archive Errors - archiveId=1 version=1.51.0 commit=9773cba37e
+ 48:            3,741,363 - archive-conductor max cycle time in ns: DEDICATED - archiveId=1
+ 49:                    6 - archive-conductor work cycle time exceeded count: threshold=1ms DEDICATED - archiveId=1
+ 50:            3,408,457 - archive-recorder max cycle time in ns: DEDICATED - archiveId=1
+ 51:                    7 - archive-recorder work cycle time exceeded count: threshold=1ms DEDICATED - archiveId=1
+ 52:            4,497,051 - archive-replayer max cycle time in ns: DEDICATED - archiveId=1
+ 53:                    2 - archive-replayer work cycle time exceeded count: threshold=1ms DEDICATED - archiveId=1
+ 54:                    1 - Archive Control Sessions - archiveId=1
+ 55:                    1 - Archive Recording Sessions - archiveId=1
+ 56:                    0 - Archive Replay Sessions - archiveId=1
+ 57:            2,142,271 - archive-recorder max write time in ns - archiveId=1
+ 58:           59,291,392 - archive-recorder total write bytes - archiveId=1
+ 59:       18,351,971,394 - archive-recorder total write time in ns - archiveId=1
+ 60:                    0 - archive-replayer max read time in ns - archiveId=1
+ 61:                    0 - archive-replayer total read bytes - archiveId=1
+ 62:                    0 - archive-replayer total read time in ns - archiveId=1
+ 63:                    1 - rcv-channel: aeron:udp?sparse=true|endpoint=10.10.1.10:20004 10.10.1.10:20004
+ 64:                    1 - rcv-local-sockaddr: 63 10.10.1.10:20004
+ 65:    1,783,106,959,076 - client-heartbeat: id=23 name=consensus-module-0-0 version=1.51.0 commit=9773cba37e
+ 66:                    0 - Cluster Errors - clusterId=0 version=1.51.0 commit=9773cba37e
+ 67:                    1 - Consensus Module state - clusterId=0
+ 68:                   17 - Cluster election state - clusterId=0
+ 69:                    1 - Cluster election count - clusterId=0
+ 70:                    0 - Cluster leadership term id - clusterId=0
+ 71:                    2 - Cluster node role - clusterId=0
+ 72:           59,291,392 - Cluster commit-pos: - clusterId=0
+ 73:                    1 - Cluster control toggle - clusterId=0
+ 74:                    1 - Node control toggle - clusterId=0
+ 75:                    0 - Cluster snapshot count - clusterId=0
+ 76:                    0 - Cluster timed out client count - clusterId=0
+ 77:           16,000,000 - Cluster max cycle time in ns - clusterId=0
+ 78:                    4 - Cluster work cycle time exceeded count: threshold=1ms - clusterId=0
+ 79:                    0 - Total max snapshot duration in ns - clusterId=0
+ 80:                    0 - Total max snapshot duration exceeded count: threshold=1s - clusterId=0
+ 81:                    1 - rcv-channel: aeron:udp?endpoint=10.10.1.10:20001 10.10.1.10:20001
+ 82:                    1 - rcv-local-sockaddr: 81 10.10.1.10:20001
+ 83:                  160 - pub-pos (concurrent): 41 24934390 104 aeron:ipc?term-length=128k
+ 84:               65,536 - pub-lmt: 41 24934390 104 aeron:ipc?term-length=128k
+ 85:                  576 - pub-pos (exclusive): 44 24934391 10 aeron:ipc?session-id=24934391|term-length=64k|sparse=true|mtu=1408|alias=cm-archive-ctrl-req-cluster-0-member-0
+ 86:               32,768 - pub-lmt: 44 24934391 10 aeron:ipc?session-id=24934391|term-length=64k|sparse=true|mtu=1408|alias=cm-archive-ctrl-req-cluster-0-member-0
+ 87:                  576 - sub-pos: 22 24934391 10 aeron:ipc?term-length=64k @0
+ 88:                7,712 - pub-pos (exclusive): 46 24934391 120 aeron:ipc?mtu=1408|term-length=64k|session-id=24934391|alias=cm-archive-ctrl-resp-cluster-0-member-0|sparse=true
+ 89:               36,896 - pub-lmt: 46 24934391 120 aeron:ipc?mtu=1408|term-length=64k|session-id=24934391|alias=cm-archive-ctrl-resp-cluster-0-member-0|sparse=true
+ 90:                7,712 - sub-pos: 43 24934391 120 aeron:ipc?session-id=24934391|term-length=64k|sparse=true|mtu=1408|alias=cm-archive-ctrl-resp-cluster-0-member-0 @0
+ 91:        1,699,992,322 - control-session: name=consensus-module-0-0 version=1.51.0 commit=9773cba37e sourceIdentity=aeron:ipc sessionId=24934391 - archiveId=1
+ 92:                  160 - sub-pos: 63 24934390 104 aeron:ipc?term-length=128k|alias=service-control @0
+ 93:                    1 - snd-channel: aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.11:21001 10.10.1.10:39853
+ 94:                    1 - snd-local-sockaddr: 93 10.10.1.10:39853
+ 95:    1,783,106,958,915 - client-heartbeat: id=61
+ 96:                  192 - sub-pos: 40 24934393 105 aeron:ipc?term-length=128k @0
+ 97:                  192 - pub-pos (concurrent): 62 24934393 105 aeron:ipc?term-length=128k|alias=service-control
+ 98:               65,536 - pub-lmt: 62 24934393 105 aeron:ipc?term-length=128k|alias=service-control
+ 99:                    0 - snd-bpe: 188 24934425 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:36078
+100:           28,690,624 - pub-pos (exclusive): 65 24934394 108 aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.11:21001
+101:           28,756,160 - pub-lmt: 65 24934394 108 aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.11:21001
+102:           28,690,624 - snd-pos: 65 24934394 108 aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.11:21001
+103:           28,750,784 - snd-lmt: 65 24934394 108 aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.11:21001
+104:                    0 - snd-bpe: 65 24934394 108 aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.11:21001
+105:                    0 - snd-naks-received: 65 24934394 108 aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.11:21001
+106:                    1 - snd-channel: aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.12:22001 10.10.1.10:37668
+107:                    1 - snd-local-sockaddr: 106 10.10.1.10:37668
+108:           28,690,624 - pub-pos (exclusive): 66 24934395 108 aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.12:22001
+109:           28,756,160 - pub-lmt: 66 24934395 108 aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.12:22001
+110:           28,690,624 - snd-pos: 66 24934395 108 aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.12:22001
+111:           28,750,784 - snd-lmt: 66 24934395 108 aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.12:22001
+112:                    0 - snd-bpe: 66 24934395 108 aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.12:22001
+113:                    0 - snd-naks-received: 66 24934395 108 aeron:udp?control=10.10.1.10:0|endpoint=10.10.1.12:22001
+114:           28,661,504 - sub-pos: 39 -1010530928 108 aeron:udp?endpoint=10.10.1.10:20001 @0
+115:           28,661,504 - rcv-hwm: 68 -1010530928 108 aeron:udp?endpoint=10.10.1.10:20001
+116:           28,661,504 - rcv-pos: 68 -1010530928 108 aeron:udp?endpoint=10.10.1.10:20001
+117:                    0 - rcv-naks-sent: 68 -1010530928 108 aeron:udp?endpoint=10.10.1.10:20001
+118:           28,661,888 - sub-pos: 39 1488466250 108 aeron:udp?endpoint=10.10.1.10:20001 @0
+119:           28,661,888 - rcv-hwm: 69 1488466250 108 aeron:udp?endpoint=10.10.1.10:20001
+120:           28,661,888 - rcv-pos: 69 1488466250 108 aeron:udp?endpoint=10.10.1.10:20001
+121:                    0 - rcv-naks-sent: 69 1488466250 108 aeron:udp?endpoint=10.10.1.10:20001
+122:                    1 - snd-channel: aeron:udp?alias=log|term-id=0|tags=71,70|term-length=64m|control=10.10.1.10:0|term-offset=0|control-mode=manual|ssc=false|init-term-id=0 10.10.1.10:52889
+123:                    1 - snd-local-sockaddr: 122 10.10.1.10:52889
+124:                    2 - mdc-num-dest: aeron:udp?alias=log|term-id=0|tags=71,70|term-length=64m|control=10.10.1.10:0|term-offset=0|control-mode=manual|ssc=false|init-term-id=0 
+125:           59,291,392 - pub-pos (exclusive): 72 24934396 100 aeron:udp?alias=log|term-id=0|tags=71,70|term-length=64m|control=10.10.1.10:0|term-offset=0|control-mode=manual|ssc=false|init-term-id=0
+126:           92,845,824 - pub-lmt: 72 24934396 100 aeron:udp?alias=log|term-id=0|tags=71,70|term-length=64m|control=10.10.1.10:0|term-offset=0|control-mode=manual|ssc=false|init-term-id=0
+127:           59,291,392 - snd-pos: 72 24934396 100 aeron:udp?alias=log|term-id=0|tags=71,70|term-length=64m|control=10.10.1.10:0|term-offset=0|control-mode=manual|ssc=false|init-term-id=0
+128:           59,418,496 - snd-lmt: 72 24934396 100 aeron:udp?alias=log|term-id=0|tags=71,70|term-length=64m|control=10.10.1.10:0|term-offset=0|control-mode=manual|ssc=false|init-term-id=0
+129:                    0 - snd-bpe: 72 24934396 100 aeron:udp?alias=log|term-id=0|tags=71,70|term-length=64m|control=10.10.1.10:0|term-offset=0|control-mode=manual|ssc=false|init-term-id=0
+130:                    0 - snd-naks-received: 72 24934396 100 aeron:udp?alias=log|term-id=0|tags=71,70|term-length=64m|control=10.10.1.10:0|term-offset=0|control-mode=manual|ssc=false|init-term-id=0
+131:           59,291,392 - sub-pos: 76 24934396 100 aeron-spy:aeron:udp?tags=71|session-id=24934396|alias=log @0
+132:           59,291,392 - rec-pos: 0 24934396 100 aeron:udp?tags=71|session-id=24934396|alias=log - archiveId=1
+133:           59,291,392 - sub-pos: 78 24934396 100 aeron-spy:aeron:udp?tags=71|session-id=24934396|alias=log @0
+134:                    1 - rcv-channel: aeron:udp?rejoin=false|reliable=true|endpoint=10.10.1.10:20000 10.10.1.10:20000
+135:                    1 - rcv-local-sockaddr: 134 10.10.1.10:20000
+136:                    0 - snd-naks-received: 188 24934425 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:36078
+139:           30,720,256 - snd-pos: 199 24934429 101 aeron:udp?endpoint=10.10.1.10:20000
+140:           30,777,728 - snd-lmt: 199 24934429 101 aeron:udp?endpoint=10.10.1.10:20000
+145:                    0 - rcv-naks-sent: 210 1488466265 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:0
+148:                    1 - snd-local-sockaddr: 199 10.10.1.10:48652
+149:            3,072,128 - pub-pos (concurrent): 150 24934415 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:49539
+154:                    1 - snd-channel: aeron:udp?endpoint=10.10.1.10:20000 10.10.1.10:54832
+155:                    1 - snd-local-sockaddr: 154 10.10.1.10:54832
+156:           30,720,256 - sub-pos: 80 24934429 101 aeron:udp?rejoin=false|reliable=true|endpoint=10.10.1.10:20000 @0
+158:                    0 - snd-bpe: 199 24934429 101 aeron:udp?endpoint=10.10.1.10:20000
+159:                    0 - snd-naks-received: 199 24934429 101 aeron:udp?endpoint=10.10.1.10:20000
+163:                    1 - rcv-local-sockaddr: 221 10.10.1.10:35273
+164:    1,783,106,958,831 - client-heartbeat: id=195 name=cluster-client version=1.51.0 commit=9773cba37e
+166:                    7 - cluster-session: name= version=1.51.0 commit=9773cba37e sourceIdentity=10.10.1.10:54832 sessionId=24934429 - clusterId=0
+169:           30,720,128 - pub-pos (concurrent): 207 24934430 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:35273
+170:                    1 - snd-channel: aeron:udp?rejoin=false|endpoint=10.10.1.10:35273 10.10.1.10:33802
+171:                    1 - snd-channel: aeron:udp?rejoin=false|endpoint=10.10.1.10:55799 10.10.1.10:50223
+172:                    1 - snd-local-sockaddr: 171 10.10.1.10:50223
+173:              153,728 - pub-pos (concurrent): 93 24934400 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:55799
+174:              153,728 - pub-lmt: 93 24934400 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:55799
+175:              153,728 - snd-pos: 93 24934400 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:55799
+176:              214,016 - snd-lmt: 93 24934400 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:55799
+177:                    0 - snd-bpe: 93 24934400 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:55799
+178:                    0 - snd-naks-received: 93 24934400 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:55799
+179:                    1 - snd-channel: aeron:udp?rejoin=false|endpoint=10.10.1.10:36078 10.10.1.10:46818
+180:            1,536,128 - pub-pos (concurrent): 131 24934410 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:53554
+181:            1,536,128 - pub-lmt: 131 24934410 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:53554
+182:            1,536,128 - snd-pos: 131 24934410 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:53554
+184:                    1 - snd-local-sockaddr: 170 10.10.1.10:33802
+185:                    1 - snd-channel: aeron:udp?rejoin=false|endpoint=10.10.1.10:53554 10.10.1.10:38329
+186:                    1 - snd-local-sockaddr: 185 10.10.1.10:38329
+188:            1,601,024 - snd-lmt: 131 24934410 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:53554
+189:                    0 - snd-bpe: 131 24934410 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:53554
+190:                    0 - snd-naks-received: 131 24934410 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:53554
+191:                    0 - sub-pos: 196 1488466265 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:0 @0
+192:                    0 - rcv-hwm: 210 1488466265 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:0
+193:                    0 - rcv-pos: 210 1488466265 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:0
+198:           30,720,256 - rcv-hwm: 200 24934429 101 aeron:udp?rejoin=false|reliable=true|endpoint=10.10.1.10:20000
+199:                    1 - snd-channel: aeron:udp?rejoin=false|endpoint=10.10.1.10:49539 10.10.1.10:48652
+205:                    1 - snd-local-sockaddr: 179 10.10.1.10:46818
+206:           15,360,128 - pub-pos (concurrent): 188 24934425 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:36078
+207:           30,720,256 - rcv-pos: 200 24934429 101 aeron:udp?rejoin=false|reliable=true|endpoint=10.10.1.10:20000
+209:                    1 - snd-channel: aeron:udp?rejoin=false|endpoint=10.10.1.10:50978 10.10.1.10:55946
+210:                    1 - snd-local-sockaddr: 209 10.10.1.10:55946
+211:              768,128 - pub-pos (concurrent): 112 24934405 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:50978
+212:              768,128 - pub-lmt: 112 24934405 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:50978
+213:              768,128 - snd-pos: 112 24934405 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:50978
+214:              824,960 - snd-lmt: 112 24934405 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:50978
+215:                    0 - snd-bpe: 112 24934405 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:50978
+216:                    0 - snd-naks-received: 112 24934405 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:50978
+221:                    1 - rcv-channel: aeron:udp?rejoin=false|endpoint=10.10.1.10:0 10.10.1.10:35273
+222:                    0 - snd-bpe: 150 24934415 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:49539
+223:                    0 - snd-naks-received: 150 24934415 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:49539
+226:            3,072,128 - pub-lmt: 150 24934415 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:49539
+227:            3,072,128 - snd-pos: 150 24934415 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:49539
+228:            3,136,640 - snd-lmt: 150 24934415 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:49539
+230:            7,680,128 - pub-pos (concurrent): 169 24934420 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:60354
+231:            7,680,128 - pub-lmt: 169 24934420 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:60354
+232:            7,680,128 - snd-pos: 169 24934420 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:60354
+233:           30,785,792 - pub-lmt: 199 24934429 101 aeron:udp?endpoint=10.10.1.10:20000
+235:                    1 - snd-channel: aeron:udp?rejoin=false|endpoint=10.10.1.10:60354 10.10.1.10:52630
+236:                    1 - snd-local-sockaddr: 235 10.10.1.10:52630
+237:           30,720,256 - pub-pos (exclusive): 199 24934429 101 aeron:udp?endpoint=10.10.1.10:20000
+238:            7,743,488 - snd-lmt: 169 24934420 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:60354
+239:                    0 - snd-bpe: 169 24934420 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:60354
+240:                    0 - snd-naks-received: 169 24934420 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:60354
+241:                    0 - rcv-naks-sent: 200 24934429 101 aeron:udp?rejoin=false|reliable=true|endpoint=10.10.1.10:20000
+242:           15,360,128 - pub-lmt: 188 24934425 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:36078
+243:           15,360,128 - snd-pos: 188 24934425 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:36078
+244:           15,422,592 - snd-lmt: 188 24934425 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:36078
+246:           30,720,128 - rcv-hwm: 208 24934430 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:0
+247:           30,720,128 - rcv-pos: 208 24934430 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:0
+248:                    0 - rcv-naks-sent: 208 24934430 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:0
+250:                    0 - snd-bpe: 207 24934430 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:35273
+251:                    0 - snd-naks-received: 207 24934430 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:35273
+252:           30,720,128 - sub-pos: 196 24934430 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:0 @0
+254:           30,785,664 - pub-lmt: 207 24934430 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:35273
+255:           30,720,128 - snd-pos: 207 24934430 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:35273
+256:           30,777,856 - snd-lmt: 207 24934430 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:35273
+265:                    0 - sub-pos: 196 -1010530920 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:0 @0
+266:                    0 - rcv-hwm: 211 -1010530920 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:0
+267:                    0 - rcv-pos: 211 -1010530920 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:0
+268:                    0 - rcv-naks-sent: 211 -1010530920 102 aeron:udp?rejoin=false|endpoint=10.10.1.10:0

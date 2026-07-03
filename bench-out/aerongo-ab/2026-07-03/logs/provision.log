@@ -1,0 +1,219 @@
+
+PLAY [Provision bench hosts (tune, build, configure)] **************************
+
+TASK [Wait for SSH to come up] *************************************************
+[WARNING]: Host 'uc-bench-node0' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered. See https://docs.ansible.com/ansible-core/2.21/reference_appendices/interpreter_discovery.html for more information.
+[WARNING]: Host 'uc-bench-node1' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered. See https://docs.ansible.com/ansible-core/2.21/reference_appendices/interpreter_discovery.html for more information.
+[WARNING]: Host 'uc-bench-node2' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered. See https://docs.ansible.com/ansible-core/2.21/reference_appendices/interpreter_discovery.html for more information.
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [Gather facts (after SSH is reachable)] ***********************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [os_tune : Map the host's own name to a local address (kills sudo getaddrinfo stall)] ***
+[WARNING]: Module remote_tmp /root/.ansible/tmp did not exist and was created with a mode of 0700, this may cause issues when running as another user. To avoid this, create the remote_tmp dir with the correct permissions manually
+[WARNING]: Deprecation warnings can be disabled by setting `deprecation_warnings=False` in ansible.cfg.
+[DEPRECATION WARNING]: INJECT_FACTS_AS_VARS default to `True` is deprecated, top-level facts will not be auto injected after the change. This feature will be removed from ansible-core version 2.24.
+Origin: /home/claude/ultima/ultima_cluster/bench-infra/ansible/roles/os_tune/tasks/main.yml:15:11
+
+13   ansible.builtin.lineinfile:
+14     path: /etc/hosts
+15     line: "127.0.1.1 {{ ansible_fqdn }} {{ ansible_hostname }}"
+             ^ column 11
+
+Use `ansible_facts["fact_name"]` (no `ansible_` prefix) instead.
+
+changed: [uc-bench-node0]
+changed: [uc-bench-node1]
+changed: [uc-bench-node2]
+
+TASK [os_tune : Disable sshd reverse-DNS lookups (UseDNS no — avoids connect-time stall)] ***
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+TASK [os_tune : Install tuning tools] ******************************************
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+TASK [os_tune : Detect local instance-store NVMe device] ***********************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [os_tune : Ensure mount point exists] *************************************
+changed: [uc-bench-node0]
+changed: [uc-bench-node1]
+changed: [uc-bench-node2]
+
+TASK [os_tune : Format ext4 + mount (idempotent — skips if already mounted)] ***
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+TASK [os_tune : Report NVMe mount status] **************************************
+ok: [uc-bench-node0] => {
+    "msg": "instance-store NVMe: mounted /dev/nvme1n1 at /opt/bench"
+}
+ok: [uc-bench-node1] => {
+    "msg": "instance-store NVMe: mounted /dev/nvme0n1 at /opt/bench"
+}
+ok: [uc-bench-node2] => {
+    "msg": "instance-store NVMe: mounted /dev/nvme1n1 at /opt/bench"
+}
+
+TASK [os_tune : Set CPU governor to performance] *******************************
+ok: [uc-bench-node1]
+ok: [uc-bench-node0]
+ok: [uc-bench-node2]
+
+TASK [os_tune : Disable transparent hugepages] *********************************
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+ok: [uc-bench-node0]
+
+TASK [os_tune : Apply low-latency sysctls] *************************************
+changed: [uc-bench-node0] => (item={'k': 'vm.swappiness', 'v': '0'})
+changed: [uc-bench-node1] => (item={'k': 'vm.swappiness', 'v': '0'})
+changed: [uc-bench-node2] => (item={'k': 'vm.swappiness', 'v': '0'})
+changed: [uc-bench-node0] => (item={'k': 'net.core.rmem_max', 'v': '16777216'})
+changed: [uc-bench-node2] => (item={'k': 'net.core.rmem_max', 'v': '16777216'})
+changed: [uc-bench-node0] => (item={'k': 'net.core.wmem_max', 'v': '16777216'})
+changed: [uc-bench-node2] => (item={'k': 'net.core.wmem_max', 'v': '16777216'})
+changed: [uc-bench-node1] => (item={'k': 'net.core.rmem_max', 'v': '16777216'})
+changed: [uc-bench-node0] => (item={'k': 'net.core.rmem_default', 'v': '1048576'})
+changed: [uc-bench-node2] => (item={'k': 'net.core.rmem_default', 'v': '1048576'})
+changed: [uc-bench-node1] => (item={'k': 'net.core.wmem_max', 'v': '16777216'})
+changed: [uc-bench-node1] => (item={'k': 'net.core.rmem_default', 'v': '1048576'})
+changed: [uc-bench-node0] => (item={'k': 'net.core.wmem_default', 'v': '1048576'})
+changed: [uc-bench-node2] => (item={'k': 'net.core.wmem_default', 'v': '1048576'})
+changed: [uc-bench-node2] => (item={'k': 'net.core.busy_poll', 'v': '50'})
+changed: [uc-bench-node1] => (item={'k': 'net.core.wmem_default', 'v': '1048576'})
+changed: [uc-bench-node2] => (item={'k': 'net.core.busy_read', 'v': '50'})
+changed: [uc-bench-node0] => (item={'k': 'net.core.busy_poll', 'v': '50'})
+changed: [uc-bench-node0] => (item={'k': 'net.core.busy_read', 'v': '50'})
+changed: [uc-bench-node1] => (item={'k': 'net.core.busy_poll', 'v': '50'})
+changed: [uc-bench-node1] => (item={'k': 'net.core.busy_read', 'v': '50'})
+
+TASK [os_tune : Raise open-file limits] ****************************************
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+TASK [os_tune : Apply tuned latency profile (best effort)] *********************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [toolchains : Install base build dependencies] ****************************
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+TASK [toolchains : Detect JAVA_HOME] *******************************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [toolchains : Export JAVA_HOME for all shells] ****************************
+changed: [uc-bench-node1]
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+
+TASK [toolchains : Install rustup + stable toolchain (idempotent)] *************
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+TASK [toolchains : Export cargo on PATH] ***************************************
+changed: [uc-bench-node0]
+changed: [uc-bench-node1]
+changed: [uc-bench-node2]
+
+TASK [toolchains : Record toolchain versions (provenance)] *********************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [toolchains : Show toolchain versions] ************************************
+ok: [uc-bench-node0] => {
+    "tool_versions.stdout_lines": [
+        "javac 21.0.11",
+        "rustc 1.96.1 (31fca3adb 2026-06-26)"
+    ]
+}
+ok: [uc-bench-node2] => {
+    "tool_versions.stdout_lines": [
+        "javac 21.0.11",
+        "rustc 1.96.1 (31fca3adb 2026-06-26)"
+    ]
+}
+ok: [uc-bench-node1] => {
+    "tool_versions.stdout_lines": [
+        "javac 21.0.11",
+        "rustc 1.96.1 (31fca3adb 2026-06-26)"
+    ]
+}
+
+TASK [build_aeron : Ensure bench home exists] **********************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [build_aeron : Clone aeron-benchmarks] ************************************
+[WARNING]: Ignoring depth argument. Shallow clones are only available for HEAD, branches, tags or in combination with refspec.
+changed: [uc-bench-node1]
+changed: [uc-bench-node2]
+changed: [uc-bench-node0]
+
+TASK [build_aeron : Copy ClusterNode external-service patch] *******************
+changed: [uc-bench-node0]
+changed: [uc-bench-node1]
+changed: [uc-bench-node2]
+
+TASK [build_aeron : Apply ClusterNode external-service patch] ******************
+changed: [uc-bench-node0]
+changed: [uc-bench-node1]
+changed: [uc-bench-node2]
+
+TASK [build_aeron : Build deployTar] *******************************************
+changed: [uc-bench-node2]
+changed: [uc-bench-node0]
+changed: [uc-bench-node1]
+
+TASK [build_aeron : Ensure deploy dir exists (pre-extract)] ********************
+changed: [uc-bench-node0]
+changed: [uc-bench-node1]
+changed: [uc-bench-node2]
+
+TASK [build_aeron : Extract deployTar] *****************************************
+changed: [uc-bench-node1]
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+
+TASK [build_aeron : Make aeron-deploy writable by the run user (non-root JVM writes results here)] ***
+[DEPRECATION WARNING]: INJECT_FACTS_AS_VARS default to `True` is deprecated, top-level facts will not be auto injected after the change. This feature will be removed from ansible-core version 2.24.
+Origin: /home/claude/ultima/ultima_cluster/bench-infra/ansible/roles/build_aeron/tasks/main.yml:63:9
+
+61     group: "{{ ansible_user_gid }}"
+62     recurse: true
+63   when: ansible_user_id != 'root'
+           ^ column 9
+
+Use `ansible_facts["fact_name"]` (no `ansible_` prefix) instead.
+
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node0]
+skipping: [uc-bench-node2]
+
+TASK [build_aeron : Verify launchers + LoadTestRig present] ********************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [build_uc : (rsync mode) Sync local UC working tree to host] **************

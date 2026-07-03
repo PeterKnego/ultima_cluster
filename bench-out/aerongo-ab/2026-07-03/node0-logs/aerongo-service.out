@@ -1,0 +1,19 @@
+aeron dir:  /dev/shm/node0-driver
+2026-07-03T19:27:31.840Z	info	driver	driver/proxy.go:37	aeron clientID:61
+OnStart with no image
+OnRoleChange - role=2
+OnNewLeadershipTermEvent - leaderTermId=0 logPos=96 time=1783106852231 termBase=0 leaderId=0 logSessionId=24934396 timeUnit=0 appVer=1
+OnSessionOpen - sessionId=1 timestamp=1783106873154
+OnSessionClose - sessionId=1 timestamp=1783106885206 reason=0
+OnSessionOpen - sessionId=2 timestamp=1783106885468
+OnSessionClose - sessionId=2 timestamp=1783106897524 reason=0
+OnSessionOpen - sessionId=3 timestamp=1783106897817
+OnSessionClose - sessionId=3 timestamp=1783106909873 reason=0
+OnSessionOpen - sessionId=4 timestamp=1783106910125
+OnSessionClose - sessionId=4 timestamp=1783106922174 reason=0
+OnSessionOpen - sessionId=5 timestamp=1783106922420
+OnSessionClose - sessionId=5 timestamp=1783106934485 reason=0
+OnSessionOpen - sessionId=6 timestamp=1783106934734
+OnSessionClose - sessionId=6 timestamp=1783106946792 reason=0
+OnSessionOpen - sessionId=7 timestamp=1783106947042
+OnSessionClose - sessionId=7 timestamp=1783106959111 reason=0

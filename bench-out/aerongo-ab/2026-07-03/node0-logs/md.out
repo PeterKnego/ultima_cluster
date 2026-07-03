@@ -1,0 +1,168 @@
++++ dirname /opt/bench/aeron-deploy/scripts/aeron/media-driver
+++ cd /opt/bench/aeron-deploy/scripts/aeron
+++ pwd
++ DIR=/opt/bench/aeron-deploy/scripts/aeron
+++ basename /opt/bench/aeron-deploy/scripts/aeron/media-driver .sh
++ PROCESS_FILE_NAME=media-driver-%p
++ export PROCESS_FILE_NAME
++ exec /opt/bench/aeron-deploy/scripts/aeron/../run-java io.aeron.driver.MediaDriver /opt/bench/aeron-deploy/scripts/aeron/low-latency-driver.properties /opt/bench/aeron-deploy/scripts/aeron/benchmark.properties /opt/bench/aeron-cfg/cluster.properties /opt/bench/aeron-cfg/node.properties
++++ dirname /opt/bench/aeron-deploy/scripts/aeron/../run-java
+++ cd /opt/bench/aeron-deploy/scripts/aeron/..
+++ pwd
++ DIR=/opt/bench/aeron-deploy/scripts
++ class_name=MediaDriver
++ log_file_name=media-driver-%p
++ '[' -d /dev/shm ']'
++ gc_log_file=/dev/shm/media-driver-%p-gc.log
++ error_log_file=/dev/shm/media-driver-%p-crash.log
++ java_options=(-Djava.net.preferIPv4Stack=true -Djava.net.preferIPv6Addresses=false -XX:+UnlockExperimentalVMOptions -XX:+TrustFinalNonStaticFields -XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints -XX:+UseParallelGC -XX:ErrorFile="${error_log_file}" -Xms4G -Xmx4G -XX:+AlwaysPreTouch -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=1G -XX:+EnableDynamicAgentLoading "-Xlog:gc*,safepoint=info,arguments=info:file=${gc_log_file}:time")
++ add_opens=(--add-opens java.base/java.util.zip=ALL-UNNAMED --add-opens java.base/jdk.internal.misc=ALL-UNNAMED)
++ jvm_opts=()
++ [[ -v JVM_OPTS ]]
++ [[ -n -Xms16M ]]
++ IFS=' '
++ read -ra jvm_opts
++ unset IFS
++ classpath=
++ for jar in "$DIR/../benchmarks-all/build/libs"/*.jar
++ classpath=/opt/bench/aeron-deploy/scripts/../benchmarks-all/build/libs/benchmarks.jar
++ exec /usr/lib/jvm/java-21-openjdk-amd64/bin/java -cp /opt/bench/aeron-deploy/scripts/../benchmarks-all/build/libs/benchmarks.jar -Djava.net.preferIPv4Stack=true -Djava.net.preferIPv6Addresses=false -XX:+UnlockExperimentalVMOptions -XX:+TrustFinalNonStaticFields -XX:+UnlockDiagnosticVMOptions -XX:+DebugNonSafepoints -XX:+UseParallelGC -XX:ErrorFile=/dev/shm/media-driver-%p-crash.log -Xms4G -Xmx4G -XX:+AlwaysPreTouch -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=1G -XX:+EnableDynamicAgentLoading '-Xlog:gc*,safepoint=info,arguments=info:file=/dev/shm/media-driver-%p-gc.log:time' --add-opens java.base/java.util.zip=ALL-UNNAMED --add-opens java.base/jdk.internal.misc=ALL-UNNAMED -Xms16M io.aeron.driver.MediaDriver /opt/bench/aeron-deploy/scripts/aeron/low-latency-driver.properties /opt/bench/aeron-deploy/scripts/aeron/benchmark.properties /opt/bench/aeron-cfg/cluster.properties /opt/bench/aeron-cfg/node.properties
+MediaDriver.Context
+{
+    isConcluded=true
+    isClosed=false
+    cncVersion=0.2.0
+    aeronDirectory=/dev/shm/node0-driver
+    enabledExperimentalFeatures=false
+    aeronDirectoryName='/dev/shm/node0-driver'
+    cncFile=/dev/shm/node0-driver/cnc.dat
+    countersMetaDataBuffer=UnsafeBuffer{addressOffset=139434037081088, capacity=33554432, byteArray=null, byteBuffer=java.nio.DirectByteBuffer[pos=0 lim=48238592 cap=48238592]}
+    countersValuesBuffer=UnsafeBuffer{addressOffset=139434070635520, capacity=8388608, byteArray=null, byteBuffer=java.nio.DirectByteBuffer[pos=0 lim=48238592 cap=48238592]}
+    driverTimeoutMs=30000
+    printConfigurationOnStart=true
+    useWindowsHighResTimer=true
+    warnIfDirectoryExists=false
+    dirDeleteOnStart=true
+    dirDeleteOnShutdown=true
+    termBufferSparseFile=true
+    performStorageChecks=false
+    spiesSimulateConnection=true
+    reliableStream=true
+    tetherSubscriptions=true
+    rejoinStream=true
+    receiverGroupConsideration=INFER
+    conductorBufferLength=1049344
+    toClientsBufferLength=1048704
+    counterValuesBufferLength=8388608
+    errorBufferLength=4194304
+    lowStorageWarningThreshold=167772160
+    timerIntervalNs=1000000000
+    clientLivenessTimeoutNs=10000000000
+    imageLivenessTimeoutNs=10000000000
+    publicationUnblockTimeoutNs=15000000000
+    publicationConnectionTimeoutNs=5000000000
+    publicationLingerTimeoutNs=5000000000
+    untetheredWindowLimitTimeoutNs=5000000000
+    untetheredRestingTimeoutNs=10000000000
+    retransmitUnicastDelayNs=0
+    retransmitUnicastLingerNs=10000000
+    nakUnicastDelayNs=1000
+    nakMulticastMaxBackoffNs=10000000
+    nakMulticastGroupSize=10
+    statusMessageTimeoutNs=200000000
+    counterFreeToReuseTimeoutNs=1000000000
+    conductorCycleThresholdNs=1000000
+    senderCycleThresholdNs=1000000
+    receiverCycleThresholdNs=1000000
+    nameResolverThresholdNs=5000000000
+    publicationTermBufferLength=131072
+    ipcTermBufferLength=131072
+    publicationTermWindowLength=0
+    ipcPublicationTermWindowLength=0
+    initialWindowLength=131072
+    socketSndbufLength=131072
+    socketRcvbufLength=131072
+    socketMulticastTtl=0
+    mtuLength=1408
+    ipcMtuLength=1408
+    filePageSize=4096
+    publicationReservedSessionIdLow=-1
+    publicationReservedSessionIdHigh=1000
+    lossReportBufferLength=1048576
+    epochClock=org.agrona.concurrent.SystemEpochClock@c038203
+    nanoClock=org.agrona.concurrent.SystemNanoClock@cc285f4
+    cachedEpochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1
+    cachedNanoClock=org.agrona.concurrent.CachedNanoClock@8bd1b6a
+    threadingMode=DEDICATED
+    conductorThreadFactory=io.aeron.driver.MediaDriver$Context$$Lambda/0x00007ed08802c5b8@18be83e4
+    senderThreadFactory=io.aeron.driver.MediaDriver$Context$$Lambda/0x00007ed08802c7d8@cb5822
+    receiverThreadFactory=io.aeron.driver.MediaDriver$Context$$Lambda/0x00007ed08802c9f8@4b9e13df
+    sharedThreadFactory=null
+    sharedNetworkThreadFactory=null
+    conductorIdleStrategy=BusySpinIdleStrategy{alias=spin}
+    senderIdleStrategy=NoOpIdleStrategy{alias=noop}
+    receiverIdleStrategy=NoOpIdleStrategy{alias=noop}
+    sharedNetworkIdleStrategy=null
+    sharedIdleStrategy=null
+    asyncExecutorIdleStrategy=SleepingIdleStrategy{alias=sleep-ns, sleepPeriodNs=1000000}
+    sendChannelEndpointSupplier=io.aeron.driver.DefaultSendChannelEndpointSupplier@2b98378d
+    receiveChannelEndpointSupplier=io.aeron.driver.DefaultReceiveChannelEndpointSupplier@475530b9
+    receiveChannelEndpointThreadLocals=ReceiveChannelEndpointThreadLocals{nextReceiverId=8264976374669873335}
+    tempBuffer=UnsafeBuffer{addressOffset=16, capacity=512, byteArray=byte[512], byteBuffer=null}
+    unicastFlowControlSupplier=DefaultUnicastFlowControlSupplier{flowControlClass=io.aeron.driver.UnicastFlowControl}
+    multicastFlowControlSupplier=DefaultMulticastFlowControlSupplier{flowControlClass=io.aeron.driver.MaxMulticastFlowControl}
+    applicationSpecificFeedback=[]
+    receiverGroupTag=null
+    flowControlGroupTag=-1
+    flowControlGroupMinSize=0
+    flowControlReceiverTimeoutNs=5000000000
+    unicastFlowControlRetransmitReceiverWindowMultiple=16
+    multicastFControlRetransmitReceiverWindowMultiple=4
+    reResolutionCheckIntervalNs=1000000000
+    receiverGroupConsideration=INFER
+    congestionControlSupplier=io.aeron.driver.DefaultCongestionControlSupplier@18eed359
+    terminationValidator=io.aeron.driver.DefaultDenyTerminationValidator@3e9b1010
+    terminationHook=io.aeron.driver.MediaDriver$$Lambda/0x00007ed08800f4e0@6c3708b3
+    nameResolver=io.aeron.driver.DefaultNameResolver@6f1fba17
+    resolverName='null'
+    resolverInterface='null'
+    resolverBootstrapNeighbor='null'
+    sendToStatusMessagePollRatio=6
+    unicastFeedbackDelayGenerator=StaticDelayGenerator{delayInNs=1000, retryDelayNs=100000}
+    multicastFeedbackDelayGenerator=OptimalMulticastDelayGenerator{randMax=3.302585092994046E-7, baseX=1.2613558468370601E-8, constantT=3027931.0656411387, factorT=7.927976886994827E7}
+    retransmitUnicastDelayGenerator=StaticDelayGenerator{delayInNs=0, retryDelayNs=0}
+    retransmitUnicastLingerGenerator=StaticDelayGenerator{delayInNs=10000000, retryDelayNs=10000000}
+    errorLog=org.agrona.concurrent.errors.DistinctErrorLog@1f28c152
+    errorHandler=org.agrona.concurrent.errors.LoggingErrorHandler@7d907bac
+    useConcurrentCountersManager=false
+    countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}
+    systemCounters=SystemCounters{counterByDescriptorMap={BYTES_SENT=AtomicCounter{isClosed=false, id=0, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, BYTES_RECEIVED=AtomicCounter{isClosed=false, id=1, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, RECEIVER_PROXY_FAILS=AtomicCounter{isClosed=false, id=2, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, SENDER_PROXY_FAILS=AtomicCounter{isClosed=false, id=3, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, CONDUCTOR_PROXY_FAILS=AtomicCounter{isClosed=false, id=4, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, NAK_MESSAGES_SENT=AtomicCounter{isClosed=false, id=5, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, NAK_MESSAGES_RECEIVED=AtomicCounter{isClosed=false, id=6, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, STATUS_MESSAGES_SENT=AtomicCounter{isClosed=false, id=7, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, STATUS_MESSAGES_RECEIVED=AtomicCounter{isClosed=false, id=8, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, HEARTBEATS_SENT=AtomicCounter{isClosed=false, id=9, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, HEARTBEATS_RECEIVED=AtomicCounter{isClosed=false, id=10, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, RETRANSMITS_SENT=AtomicCounter{isClosed=false, id=11, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, FLOW_CONTROL_UNDER_RUNS=AtomicCounter{isClosed=false, id=12, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, FLOW_CONTROL_OVER_RUNS=AtomicCounter{isClosed=false, id=13, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, INVALID_PACKETS=AtomicCounter{isClosed=false, id=14, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, ERRORS=AtomicCounter{isClosed=false, id=15, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, SHORT_SENDS=AtomicCounter{isClosed=false, id=16, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, FREE_FAILS=AtomicCounter{isClosed=false, id=17, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, SENDER_FLOW_CONTROL_LIMITS=AtomicCounter{isClosed=false, id=18, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, UNBLOCKED_PUBLICATIONS=AtomicCounter{isClosed=false, id=19, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, UNBLOCKED_COMMANDS=AtomicCounter{isClosed=false, id=20, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, POSSIBLE_TTL_ASYMMETRY=AtomicCounter{isClosed=false, id=21, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, CONTROLLABLE_IDLE_STRATEGY=AtomicCounter{isClosed=false, id=22, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, LOSS_GAP_FILLS=AtomicCounter{isClosed=false, id=23, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, CLIENT_TIMEOUTS=AtomicCounter{isClosed=false, id=24, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, RESOLUTION_CHANGES=AtomicCounter{isClosed=false, id=25, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, CONDUCTOR_MAX_CYCLE_TIME=AtomicCounter{isClosed=false, id=26, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, CONDUCTOR_CYCLE_TIME_THRESHOLD_EXCEEDED=AtomicCounter{isClosed=false, id=27, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, SENDER_MAX_CYCLE_TIME=AtomicCounter{isClosed=false, id=28, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, SENDER_CYCLE_TIME_THRESHOLD_EXCEEDED=AtomicCounter{isClosed=false, id=29, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, RECEIVER_MAX_CYCLE_TIME=AtomicCounter{isClosed=false, id=30, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, RECEIVER_CYCLE_TIME_THRESHOLD_EXCEEDED=AtomicCounter{isClosed=false, id=31, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, NAME_RESOLVER_MAX_TIME=AtomicCounter{isClosed=false, id=32, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, NAME_RESOLVER_TIME_THRESHOLD_EXCEEDED=AtomicCounter{isClosed=false, id=33, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, AERON_VERSION=AtomicCounter{isClosed=false, id=34, value=78592, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, BYTES_CURRENTLY_MAPPED=AtomicCounter{isClosed=false, id=35, value=49287168, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, RETRANSMITTED_BYTES=AtomicCounter{isClosed=false, id=36, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, RETRANSMIT_OVERFLOW=AtomicCounter{isClosed=false, id=37, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, ERROR_FRAMES_RECEIVED=AtomicCounter{isClosed=false, id=38, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, ERROR_FRAMES_SENT=AtomicCounter{isClosed=false, id=39, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, PUBLICATIONS_REVOKED=AtomicCounter{isClosed=false, id=40, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, PUBLICATION_IMAGES_REVOKED=AtomicCounter{isClosed=false, id=41, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, IMAGES_REJECTED=AtomicCounter{isClosed=false, id=42, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, CONTROL_PROTOCOL_VERSION=AtomicCounter{isClosed=false, id=43, value=65536, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, STATUS_MESSAGES_REJECTED=AtomicCounter{isClosed=false, id=44, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, ASYNC_EXECUTOR_PROXY_FAILS=AtomicCounter{isClosed=false, id=45, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}}}
+    lossReport=LossReport{nextRecordOffset=0, buffer=UnsafeBuffer{addressOffset=139434033934336, capacity=1048576, byteArray=null, byteBuffer=java.nio.DirectByteBuffer[pos=0 lim=1048576 cap=1048576]}}
+    logFactory=io.aeron.driver.buffer.FileStoreLogFactory@1efed156
+    dataTransportPoller=DataTransportPoller{}
+    controlTransportPoller=ControlTransportPoller{}
+    driverCommandQueue={}
+    receiverCommandQueue=org.agrona.concurrent.OneToOneConcurrentArrayQueue@6737fd8f
+    senderCommandQueue=org.agrona.concurrent.OneToOneConcurrentArrayQueue@72b6cbcc
+    receiverProxy=ReceiverProxy{, failCount=AtomicCounter{isClosed=false, id=2, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}}
+    senderProxy=SenderProxy{, failCount=AtomicCounter{isClosed=false, id=3, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}}
+    driverConductorProxy=DriverConductorProxy{threadingMode=DEDICATED, failCount=AtomicCounter{isClosed=false, id=4, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}}
+    clientProxy=ClientProxy{}
+    asyncExecutorProxy=AsyncExecutorProxy{, failCount=AtomicCounter{isClosed=false, id=45, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}}
+    asyncExecutorEnabled=true
+    toDriverCommands=org.agrona.concurrent.ringbuffer.ManyToOneRingBuffer@7d0587f1
+    lossReportBuffer=java.nio.DirectByteBuffer[pos=0 lim=1048576 cap=1048576]
+    cncByteBuffer=java.nio.DirectByteBuffer[pos=0 lim=48238592 cap=48238592]
+    cncMetaDataBuffer=UnsafeBuffer{addressOffset=139434034982912, capacity=128, byteArray=null, byteBuffer=java.nio.DirectByteBuffer[pos=0 lim=48238592 cap=48238592]}
+    channelSendTimestampClock=org.agrona.concurrent.SystemEpochNanoClock@5d76b067
+    channelReceiveTimestampClock=org.agrona.concurrent.SystemEpochNanoClock@2a17b7b6
+    conductorDutyCycleTracker=DutyCycleStallTracker{maxCycleTime=AtomicCounter{isClosed=false, id=26, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, cycleTimeThresholdExceededCount=AtomicCounter{isClosed=false, id=27, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, cycleTimeThresholdNs=1000000}
+    senderDutyCycleTracker=DutyCycleStallTracker{maxCycleTime=AtomicCounter{isClosed=false, id=28, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, cycleTimeThresholdExceededCount=AtomicCounter{isClosed=false, id=29, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, cycleTimeThresholdNs=1000000}
+    receiverDutyCycleTracker=DutyCycleStallTracker{maxCycleTime=AtomicCounter{isClosed=false, id=30, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, cycleTimeThresholdExceededCount=AtomicCounter{isClosed=false, id=31, value=0, countersManager=CountersManager{freeToReuseTimeoutMs=1000, highWaterMarkId=45, freeList=[], epochClock=org.agrona.concurrent.CachedEpochClock@55f3ddb1}}, cycleTimeThresholdNs=1000000}
+    senderWildcardPortRange=null
+    receiverWildcardPortRange=null
+    senderPortManager=io.aeron.driver.media.WildcardPortManager@23faf8f2
+    receiverPortManager=io.aeron.driver.media.WildcardPortManager@2d6eabae
+    resourceFreeLimit=10
+    maxResend=16
+}

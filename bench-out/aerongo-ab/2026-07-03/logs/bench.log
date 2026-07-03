@@ -1,0 +1,193 @@
+
+PLAY [Run the parity sweep and collect results] ********************************
+
+TASK [Gathering Facts] *********************************************************
+[WARNING]: Host 'uc-bench-node0' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered. See https://docs.ansible.com/ansible-core/2.21/reference_appendices/interpreter_discovery.html for more information.
+[WARNING]: Host 'uc-bench-node2' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered. See https://docs.ansible.com/ansible-core/2.21/reference_appendices/interpreter_discovery.html for more information.
+[WARNING]: Host 'uc-bench-node1' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered. See https://docs.ansible.com/ansible-core/2.21/reference_appendices/interpreter_discovery.html for more information.
+ok: [uc-bench-node0]
+ok: [uc-bench-node2]
+ok: [uc-bench-node1]
+
+TASK [run : Clean stale cluster state] *****************************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node2]
+ok: [uc-bench-node1]
+
+TASK [run : Ensure results dir is owned by the run user] ***********************
+[WARNING]: Deprecation warnings can be disabled by setting `deprecation_warnings=False` in ansible.cfg.
+[DEPRECATION WARNING]: INJECT_FACTS_AS_VARS default to `True` is deprecated, top-level facts will not be auto injected after the change. This feature will be removed from ansible-core version 2.24.
+Origin: /home/claude/ultima/ultima_cluster/bench-infra/ansible/roles/run/tasks/main.yml:18:12
+
+16     path: "{{ remote_home }}/results"
+17     state: directory
+18     owner: "{{ ansible_user_id }}"
+              ^ column 12
+
+Use `ansible_facts["fact_name"]` (no `ansible_` prefix) instead.
+
+ok: [uc-bench-node0]
+ok: [uc-bench-node2]
+ok: [uc-bench-node1]
+
+TASK [run : Start Aeron media driver] ******************************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [run : Start Aeron cluster node] ******************************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node2]
+ok: [uc-bench-node1]
+
+TASK [run : Wait for cluster election to settle] *******************************
+Pausing for 20 seconds
+ok: [uc-bench-node0]
+
+TASK [run : Copy Aeron sweep script to node0] **********************************
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node2]
+changed: [uc-bench-node0]
+
+TASK [run : Drive Aeron rate ladder (node0)] ***********************************
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node2]
+changed: [uc-bench-node0]
+
+TASK [run : Stop Aeron JVMs] ***************************************************
+ok: [uc-bench-node1]
+ok: [uc-bench-node0]
+ok: [uc-bench-node2]
+
+TASK [run : Clean cluster state between arms (go arm)] *************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [run : Start Aeron media driver (go arm)] *********************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [run : Start Aeron cluster node with external service (go arm)] ***********
+ok: [uc-bench-node0]
+ok: [uc-bench-node2]
+ok: [uc-bench-node1]
+
+TASK [run : Copy aeron-go service supervisor] **********************************
+changed: [uc-bench-node1]
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+
+TASK [run : Start aeron-go echo service] ***************************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [run : Wait for go-arm cluster election to settle] ************************
+Pausing for 20 seconds
+ok: [uc-bench-node0]
+
+TASK [run : Drive Aeron-Go rate ladder (node0)] ********************************
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node2]
+changed: [uc-bench-node0]
+
+TASK [run : Stop go-arm processes] *********************************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [run : Apply netem shaping (when loss or delay > 0)] **********************
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node0]
+skipping: [uc-bench-node2]
+
+TASK [run : Start UC node] *****************************************************
+ok: [uc-bench-node1]
+ok: [uc-bench-node0]
+ok: [uc-bench-node2]
+
+TASK [run : Wait for UC leader election] ***************************************
+Pausing for 15 seconds
+ok: [uc-bench-node0]
+
+TASK [run : Copy UC sweep script to node0] *************************************
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node2]
+changed: [uc-bench-node0]
+
+TASK [run : Install perf (best-effort, AWS kernel)] ****************************
+skipping: [uc-bench-node0]
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node2]
+
+TASK [run : Start leader profilers in background (node0), then the sweep provides load] ***
+skipping: [uc-bench-node0]
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node2]
+
+TASK [run : Drive UC rate ladder (node0)] **************************************
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node2]
+changed: [uc-bench-node0]
+
+TASK [run : Wait for embedded in-process sweep (node0)] ************************
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node0]
+skipping: [uc-bench-node2]
+
+TASK [run : Generate perf report + stage profile artifacts (node0)] ************
+skipping: [uc-bench-node0]
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node2]
+
+TASK [run : Capture leader replication-RPC probe stats (uc_bench_probes only)] ***
+skipping: [uc-bench-node0]
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node2]
+
+TASK [run : Stop UC JVMs/procs] ************************************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [run : Remove netem shaping (always, idempotent)] *************************
+skipping: [uc-bench-node0]
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node2]
+
+TASK [collect : Compute run timestamp (once)] **********************************
+ok: [uc-bench-node0]
+
+TASK [collect : Write provenance manifest on node0] ****************************
+[DEPRECATION WARNING]: INJECT_FACTS_AS_VARS default to `True` is deprecated, top-level facts will not be auto injected after the change. This feature will be removed from ansible-core version 2.24.
+Origin: /home/claude/ultima/ultima_cluster/bench-infra/ansible/roles/collect/tasks/main.yml:12:14
+
+10     dest: "{{ remote_home }}/results/manifest.txt"
+11     mode: "0644"
+12     content: |
+                ^ column 14
+
+Use `ansible_facts["fact_name"]` (no `ansible_` prefix) instead.
+
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node2]
+changed: [uc-bench-node0]
+
+TASK [collect : Fetch results to local bench-out/dist/<ts>] ********************
+changed: [uc-bench-node1]
+changed: [uc-bench-node2]
+changed: [uc-bench-node0]
+
+TASK [collect : Report collected location] *************************************
+ok: [uc-bench-node0] => {
+    "msg": "Results pulled to /home/claude/ultima/ultima_cluster/bench-infra/ansible/../../bench-out/dist/20260703T193105Z/"
+}
+
+PLAY RECAP *********************************************************************
+uc-bench-node0             : ok=26   changed=8    unreachable=0    failed=0    skipped=7    rescued=0    ignored=0   
+uc-bench-node1             : ok=15   changed=2    unreachable=0    failed=0    skipped=13   rescued=0    ignored=0   
+uc-bench-node2             : ok=15   changed=2    unreachable=0    failed=0    skipped=13   rescued=0    ignored=0   
+
+BENCH EXIT=0

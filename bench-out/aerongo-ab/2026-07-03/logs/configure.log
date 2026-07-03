@@ -1,0 +1,52 @@
+
+PLAY [Re-render bench host configs] ********************************************
+
+TASK [Wait for SSH] ************************************************************
+[WARNING]: Host 'uc-bench-node2' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered. See https://docs.ansible.com/ansible-core/2.21/reference_appendices/interpreter_discovery.html for more information.
+[WARNING]: Host 'uc-bench-node0' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered. See https://docs.ansible.com/ansible-core/2.21/reference_appendices/interpreter_discovery.html for more information.
+[WARNING]: Host 'uc-bench-node1' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered. See https://docs.ansible.com/ansible-core/2.21/reference_appendices/interpreter_discovery.html for more information.
+ok: [uc-bench-node2]
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+
+TASK [Gather facts (after SSH is reachable)] ***********************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [config : Create cluster + results dirs] **********************************
+changed: [uc-bench-node0] => (item=/opt/bench/aeron-cfg)
+changed: [uc-bench-node1] => (item=/opt/bench/aeron-cfg)
+changed: [uc-bench-node2] => (item=/opt/bench/aeron-cfg)
+changed: [uc-bench-node2] => (item=/opt/bench/results)
+changed: [uc-bench-node0] => (item=/opt/bench/results)
+changed: [uc-bench-node1] => (item=/opt/bench/results)
+changed: [uc-bench-node2] => (item=/opt/bench/cluster/node2)
+changed: [uc-bench-node1] => (item=/opt/bench/cluster/node1)
+changed: [uc-bench-node0] => (item=/opt/bench/cluster/node0)
+
+TASK [config : Render Aeron cluster.properties (all nodes)] ********************
+changed: [uc-bench-node0]
+changed: [uc-bench-node1]
+changed: [uc-bench-node2]
+
+TASK [config : Render Aeron node.properties (all nodes)] ***********************
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+changed: [uc-bench-node0]
+
+TASK [config : Render Aeron client.properties (node0 only)] ********************
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node2]
+changed: [uc-bench-node0]
+
+TASK [config : Write UC peer args fragment (consumed by run role)] *************
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+PLAY RECAP *********************************************************************
+uc-bench-node0             : ok=7    changed=5    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0   
+uc-bench-node1             : ok=6    changed=4    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+uc-bench-node2             : ok=6    changed=4    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+

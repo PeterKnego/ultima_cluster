@@ -1,0 +1,85 @@
+
+PLAY [Rebuild UC binaries on the live fleet] ***********************************
+
+TASK [Wait for SSH] ************************************************************
+[WARNING]: Host 'uc-bench-node0' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered. See https://docs.ansible.com/ansible-core/2.21/reference_appendices/interpreter_discovery.html for more information.
+[WARNING]: Host 'uc-bench-node2' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered. See https://docs.ansible.com/ansible-core/2.21/reference_appendices/interpreter_discovery.html for more information.
+[WARNING]: Host 'uc-bench-node1' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered. See https://docs.ansible.com/ansible-core/2.21/reference_appendices/interpreter_discovery.html for more information.
+ok: [uc-bench-node0]
+ok: [uc-bench-node2]
+ok: [uc-bench-node1]
+
+TASK [Gather facts (after SSH is reachable)] ***********************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node2]
+ok: [uc-bench-node1]
+
+TASK [build_uc : (rsync mode) Sync local UC working tree to host] **************
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+TASK [build_uc : (rsync mode) Sync sibling ultima_db (external path dep) to host] ***
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+TASK [build_uc : (rsync mode) Sync sibling openraft (path dep) to host] ********
+changed: [uc-bench-node1]
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+
+TASK [build_uc : (git mode) Clone UC at pinned ref] ****************************
+skipping: [uc-bench-node0]
+skipping: [uc-bench-node1]
+skipping: [uc-bench-node2]
+
+TASK [build_uc : Compose cargo feature list] ***********************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node1]
+ok: [uc-bench-node2]
+
+TASK [build_uc : Build uc_autobench release bins] ******************************
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+TASK [build_uc : Verify UC bins exist] *****************************************
+ok: [uc-bench-node0]
+ok: [uc-bench-node2]
+ok: [uc-bench-node1]
+
+TASK [build_uc : Record UC source provenance] **********************************
+ok: [uc-bench-node0]
+
+TASK [build_aerongo : Install Go toolchain] ************************************
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+TASK [build_aerongo : Clone aeron-go] ******************************************
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+TASK [build_aerongo : Ensure aerongo dir exists] *******************************
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+TASK [build_aerongo : Build echo_service] **************************************
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+TASK [build_aerongo : Install echo_service] ************************************
+changed: [uc-bench-node0]
+changed: [uc-bench-node2]
+changed: [uc-bench-node1]
+
+PLAY RECAP *********************************************************************
+uc-bench-node0             : ok=14   changed=9    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+uc-bench-node1             : ok=13   changed=9    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+uc-bench-node2             : ok=13   changed=9    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+
+BUILD EXIT=0
