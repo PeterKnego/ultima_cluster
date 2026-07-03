@@ -11,6 +11,7 @@
     dest: "{{ remote_home }}/aeron-benchmarks"
     version: "{{ aeron_benchmarks_ref }}"
     depth: 1
+    force: true
   register: aeron_clone
 
 - name: Copy ClusterNode external-service patch
