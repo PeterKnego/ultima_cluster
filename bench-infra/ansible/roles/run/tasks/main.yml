@@ -6,6 +6,7 @@
   ansible.builtin.shell: |
     pkill -9 -f '[i]o.aeron' || true
     pkill -9 -f '[u]c-node-launch' || true
+    pkill -9 -f '[e]cho_service' || true
     rm -rf /dev/shm/*-driver /dev/shm/uc-* {{ remote_home }}/cluster {{ remote_home }}/uc-data {{ remote_home }}/results
     mkdir -p {{ remote_home }}/results
   changed_when: false
@@ -58,6 +59,7 @@
     {{ rate_ladder | join(',') }}
     {{ payload_bytes }} {{ warmup_seconds }} {{ measure_seconds }}
     {{ batch_size }}
+    aeron
   when: aeron_enabled | default(true) | bool and node_role == "node0"
   changed_when: true
 
@@ -66,6 +68,78 @@
   changed_when: false
   failed_when: false
   when: aeron_enabled | default(true) | bool
+
+# ---- Aeron-Go arm: same consensus core, service container in Go ----
+- name: Clean cluster state between arms (go arm)
+  ansible.builtin.shell: |
+    pkill -9 -f '[i]o.aeron' || true
+    sleep 1
+    rm -rf /dev/shm/*-driver {{ remote_home }}/cluster
+  changed_when: false
+  when: aerongo_enabled | default(false) | bool
+
+- name: Start Aeron media driver (go arm)
+  ansible.builtin.shell: |
+    export JAVA_HOME="$(dirname $(dirname $(readlink -f $(which javac))))"
+    export JVM_OPTS="-Xms16M"
+    setsid {{ aeron_deploy_dir }}/scripts/aeron/media-driver \
+      {{ remote_home }}/aeron-cfg/cluster.properties \
+      {{ remote_home }}/aeron-cfg/node.properties > {{ remote_home }}/md-go.out 2>&1 < /dev/null &
+  changed_when: false
+  when: aerongo_enabled | default(false) | bool
+
+- name: Start Aeron cluster node with external service (go arm)
+  ansible.builtin.shell: |
+    export JAVA_HOME="$(dirname $(dirname $(readlink -f $(which javac))))"
+    export JVM_OPTS="-Xms16M -Dio.aeron.benchmarks.output.directory={{ remote_home }}/results -Dio.aeron.benchmarks.aeron.cluster.service=external"
+    setsid {{ aeron_deploy_dir }}/scripts/aeron/cluster-node \
+      {{ remote_home }}/aeron-cfg/cluster.properties \
+      {{ remote_home }}/aeron-cfg/node.properties > {{ remote_home }}/node-go.out 2>&1 < /dev/null &
+  changed_when: false
+  when: aerongo_enabled | default(false) | bool
+
+- name: Copy aeron-go service supervisor
+  ansible.builtin.copy:
+    src: aerongo_service_loop.sh
+    dest: "{{ remote_home }}/aerongo_service_loop.sh"
+    mode: "0755"
+  when: aerongo_enabled | default(false) | bool
+
+- name: Start aeron-go echo service
+  ansible.builtin.shell: |
+    setsid {{ remote_home }}/aerongo_service_loop.sh \
+      {{ aerongo_dir }}/echo_service \
+      /dev/shm/{{ node_role }}-driver \
+      {{ remote_home }}/cluster/{{ node_role }}/cluster \
+      > {{ remote_home }}/aerongo-service.out 2>&1 < /dev/null &
+  changed_when: false
+  when: aerongo_enabled | default(false) | bool
+
+- name: Wait for go-arm cluster election to settle
+  ansible.builtin.pause:
+    seconds: 20
+  run_once: true
+  when: aerongo_enabled | default(false) | bool
+
+- name: Drive Aeron-Go rate ladder (node0)
+  ansible.builtin.command: >
+    {{ remote_home }}/run_aeron_sweep.sh
+    {{ remote_home }}
+    {{ rate_ladder | join(',') }}
+    {{ payload_bytes }} {{ warmup_seconds }} {{ measure_seconds }}
+    {{ batch_size }}
+    aerongo
+  when: aerongo_enabled | default(false) | bool and node_role == "node0"
+  changed_when: true
+
+- name: Stop go-arm processes
+  ansible.builtin.shell: |
+    pkill -9 -f '[i]o.aeron' || true
+    pkill -9 -f '[a]erongo_service_loop' || true
+    pkill -9 -f '[e]cho_service' || true
+  changed_when: false
+  failed_when: false
+  when: aerongo_enabled | default(false) | bool
 
 # ---- UC: start one uc-node per host, sweep on node0, then tear down ----
 # Wrap in a block so netem is always removed even if the sweep fails.

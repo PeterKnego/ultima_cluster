@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs on node0. Assumes media drivers + cluster nodes already started cluster-wide
 # (the run role starts them per-host). Drives the rate ladder via LoadTestRig.
-# Args: HOME_DIR RATES PAYLOAD WARMUP MEASURE BATCH
+# Args: HOME_DIR RATES PAYLOAD WARMUP MEASURE BATCH [PREFIX]
 set -uxo pipefail
 HOME_DIR="$1"; shift
 RATES="$1"; shift          # comma-separated
@@ -9,6 +9,7 @@ PAYLOAD="$1"; shift
 WARMUP="$1"; shift
 MEASURE="$1"; shift
 BATCH="$1"; shift
+PREFIX="${1:-aeron}"
 export JAVA_HOME; JAVA_HOME="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
 export AERON_SCRIPT_HOME="${HOME_DIR}/aeron-deploy/scripts/aeron"
 CFG="${HOME_DIR}/aeron-cfg"
@@ -23,7 +24,7 @@ for r in "${RUNGS[@]}"; do
 -Dio.aeron.benchmarks.warmup.iterations=${WARMUP} \
 -Dio.aeron.benchmarks.warmup.message.rate=${r} \
 -Dio.aeron.benchmarks.iterations=${MEASURE} \
--Dio.aeron.benchmarks.output.file=aeron_rung_${r}"
+-Dio.aeron.benchmarks.output.file=${PREFIX}_rung_${r}"
   echo "=== aeron rung ${r} ==="
   timeout 180 "${AERON_SCRIPT_HOME}/cluster-client" "${CFG}/cluster.properties" "${CFG}/client.properties" || true
 done
