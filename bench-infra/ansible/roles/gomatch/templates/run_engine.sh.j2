@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# gomatch service container. Retries at startup (the consensus module may not
+# have finished its election yet); once up it runs until killed.
+export AERON_DIR={{ gomatch_aeron_dir }}
+export CLUSTER_DIR={{ gomatch_dir }}/cluster
+for i in $(seq 1 30); do
+  {{ gomatch_dir }}/bin/engine
+  echo "engine exited (attempt $i), retrying in 2s" >&2
+  sleep 2
+done
