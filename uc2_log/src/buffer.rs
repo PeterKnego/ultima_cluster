@@ -150,6 +150,11 @@ impl LogBuffer {
     /// `Overrun` (caller falls back to journal replay). The margin is
     /// `max_claim()` because an in-flight append's writes (padding header +
     /// frame) are not yet reflected in the counter.
+    ///
+    /// CONTRACT: `pos` must be a frame start (positions come from append
+    /// results / frame walks / archive block bases); a mid-frame `pos`
+    /// misreads a payload byte as the length word (bounded by the safety
+    /// analysis above, but garbage).
     pub fn read_frame_validated(&self, pos: u64, out: &mut Vec<u8>) -> FrameRead {
         let append = self.counters.append.load_acquire();
         if pos >= append {
@@ -164,6 +169,12 @@ impl LogBuffer {
         out.clear();
         // SAFETY: [off, off+len) within capacity (frames never span the wrap).
         out.extend_from_slice(unsafe { std::slice::from_raw_parts(self.region.ptr_at(off), len) });
+        // Seqlock discipline: an acquire fence orders the preceding
+        // non-atomic copy before the re-check below. Without it the check is
+        // only sound on TSO archs (e.g. x86) that happen not to reorder
+        // loads past later loads; on weaker memory models the re-load of
+        // `append` could be hoisted above (or racing) the copy above.
+        std::sync::atomic::fence(Ordering::Acquire);
         // Re-validate: did the appender advance into our margin during the copy?
         let append_after = self.counters.append.load_acquire();
         if append_after + self.max_claim() > pos + self.capacity {
@@ -174,7 +185,9 @@ impl LogBuffer {
 }
 
 /// The single writer. On the leader this is driven by the consensus agent;
-/// M1 drives it directly. NOT Sync — exactly one appender per buffer.
+/// M1 drives it directly. `append` takes `&mut self` and the type is not
+/// Clone; constructing more than one Appender per buffer is a
+/// caller-contract violation (single-writer principle).
 pub struct Appender {
     buffer: Arc<LogBuffer>,
     pos: u64,
