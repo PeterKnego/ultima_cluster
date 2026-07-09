@@ -14,6 +14,7 @@
 //! Overrun rule: the appender never claims past `durable + capacity` — the
 //! single hard gate (the archive is the only reader the ring can never drop).
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -79,6 +80,38 @@ impl LogBuffer {
     #[inline]
     pub fn max_payload(&self) -> usize {
         self.max_payload
+    }
+
+    /// Create (or truncate) the buffer file at `capacity` bytes and map it.
+    pub fn create_file(
+        path: &Path,
+        capacity: u64,
+        counters: Arc<LogCounters>,
+        max_payload: usize,
+    ) -> Result<Self, std::io::Error> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        file.set_len(capacity)?;
+        // SAFETY: exclusive logical ownership per the instance-dir contract
+        // (one node per instance dir; instance.lock arrives with uc2_node).
+        let m = unsafe { memmap2::MmapMut::map_mut(&file)? };
+        Ok(Self::new(Region::from_mmap(m), counters, max_payload))
+    }
+
+    /// Map an existing buffer file; capacity = file length.
+    pub fn open_file(
+        path: &Path,
+        counters: Arc<LogCounters>,
+        max_payload: usize,
+    ) -> Result<Self, std::io::Error> {
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        // SAFETY: see create_file.
+        let m = unsafe { memmap2::MmapMut::map_mut(&file)? };
+        Ok(Self::new(Region::from_mmap(m), counters, max_payload))
     }
 
     /// Worst-case single-append write footprint span: padding (< one aligned

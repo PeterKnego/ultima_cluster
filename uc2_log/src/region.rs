@@ -16,6 +16,8 @@ use std::ptr::NonNull;
 
 enum Backing {
     Heap(Layout),
+    // Held only for its `Drop` impl (munmap on drop); never read otherwise.
+    Mmap(#[allow(dead_code)] memmap2::MmapMut),
 }
 
 pub struct Region {
@@ -37,6 +39,16 @@ impl Region {
         let raw = unsafe { alloc_zeroed(layout) };
         let Some(ptr) = NonNull::new(raw) else { handle_alloc_error(layout) };
         Self { ptr, len, backing: Backing::Heap(layout) }
+    }
+
+    /// mmap-backed region (real instances; the file lives in the instance
+    /// dir, e.g. /dev/shm for same-host IPC). The mapping's address is stable
+    /// for the Region's lifetime (the MmapMut is owned and never remapped).
+    pub fn from_mmap(m: memmap2::MmapMut) -> Self {
+        let len = m.len();
+        assert!(len > 0);
+        let ptr = NonNull::new(m.as_ptr() as *mut u8).expect("mmap ptr");
+        Self { ptr, len, backing: Backing::Mmap(m) }
     }
 
     #[inline]
@@ -65,6 +77,7 @@ impl Drop for Region {
         match &self.backing {
             // SAFETY: allocated with this exact layout in heap_zeroed.
             Backing::Heap(layout) => unsafe { dealloc(self.ptr.as_ptr(), *layout) },
+            Backing::Mmap(_) => {} // munmap on MmapMut drop
         }
     }
 }
