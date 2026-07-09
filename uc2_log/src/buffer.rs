@@ -34,6 +34,17 @@ pub enum AppendError {
     PayloadTooLarge,
 }
 
+#[derive(Debug)]
+pub enum FrameRead {
+    /// Frame copied into `out` (header + payload, unaligned length).
+    Frame(FrameHeader),
+    /// `pos` is at or beyond the append counter.
+    NotCommitted,
+    /// The frame's bytes may have been overwritten (reader lagged more than
+    /// capacity − max_claim behind). Fall back to journal replay.
+    Overrun,
+}
+
 pub struct LogBuffer {
     region: Region,
     capacity: u64,
@@ -74,7 +85,6 @@ impl LogBuffer {
     /// max frame, since padding is only emitted when the frame doesn't fit
     /// the space before the wrap) + the frame itself. Used by validated
     /// readers (Task 4) as their safety margin.
-    #[allow(dead_code)] // consumed by the validated reader in Task 4
     #[inline]
     pub(crate) fn max_claim(&self) -> u64 {
         2 * align_frame_len(HEADER_LEN + self.max_payload) as u64
@@ -131,6 +141,35 @@ impl LogBuffer {
         // SAFETY: [from, from+end) is committed, contiguous in the region,
         // and gate-protected from overwrite while the archive holds it.
         unsafe { std::slice::from_raw_parts(self.region.ptr_at(off), end as usize) }
+    }
+
+    /// Read one frame at `pos` with overwrite validation, for lagging /
+    /// position-addressed readers (M2 NAK retransmit, M5 service). Copies the
+    /// frame into `out` then re-checks the append counter: if the appender
+    /// could have advanced into (or near) this frame's bytes, returns
+    /// `Overrun` (caller falls back to journal replay). The margin is
+    /// `max_claim()` because an in-flight append's writes (padding header +
+    /// frame) are not yet reflected in the counter.
+    pub fn read_frame_validated(&self, pos: u64, out: &mut Vec<u8>) -> FrameRead {
+        let append = self.counters.append.load_acquire();
+        if pos >= append {
+            return FrameRead::NotCommitted;
+        }
+        if append + self.max_claim() > pos + self.capacity {
+            return FrameRead::Overrun;
+        }
+        let off = self.offset(pos);
+        let len = self.commit_word(off).load(Ordering::Acquire) as usize;
+        debug_assert!(len >= 4 && align_frame_len(len) as u64 <= self.capacity - off as u64);
+        out.clear();
+        // SAFETY: [off, off+len) within capacity (frames never span the wrap).
+        out.extend_from_slice(unsafe { std::slice::from_raw_parts(self.region.ptr_at(off), len) });
+        // Re-validate: did the appender advance into our margin during the copy?
+        let append_after = self.counters.append.load_acquire();
+        if append_after + self.max_claim() > pos + self.capacity {
+            return FrameRead::Overrun;
+        }
+        FrameRead::Frame(frame::read_header(out))
     }
 }
 
@@ -352,5 +391,43 @@ mod tests {
         let (b, _c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 1);
         assert_eq!(a.append(1, 1, &[0u8; 257]).unwrap_err(), AppendError::PayloadTooLarge);
+    }
+
+    #[test]
+    fn validated_read_roundtrip_and_not_committed() {
+        let (b, _c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 2);
+        a.append(9, 77, b"abc").unwrap();
+        let mut out = Vec::new();
+        match b.read_frame_validated(0, &mut out) {
+            FrameRead::Frame(h) => {
+                assert_eq!(h.correlation_id, 77);
+                assert_eq!(h.length as usize, HEADER_LEN + 3);
+                assert_eq!(&out[HEADER_LEN..], b"abc");
+            }
+            other => panic!("expected Frame, got {other:?}"),
+        }
+        // beyond append -> NotCommitted
+        assert!(matches!(b.read_frame_validated(64, &mut out), FrameRead::NotCommitted));
+    }
+
+    #[test]
+    fn validated_read_detects_overrun_after_wrap() {
+        let (b, c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        // write ~3 capacities worth, letting the gate breathe by keeping
+        // durable glued to append (as a healthy archive would)
+        let mut n = 0u64;
+        while a.position() < 3 * CAP {
+            a.append(1, n, &[0u8; 64]).unwrap();
+            c.durable.store_release(a.position());
+            n += 1;
+        }
+        // position 0 was overwritten laps ago
+        let mut out = Vec::new();
+        assert!(matches!(b.read_frame_validated(0, &mut out), FrameRead::Overrun));
+        // a recent frame still reads fine (within capacity minus margin)
+        let recent = a.position() - 96;
+        assert!(matches!(b.read_frame_validated(recent, &mut out), FrameRead::Frame(_)));
     }
 }
