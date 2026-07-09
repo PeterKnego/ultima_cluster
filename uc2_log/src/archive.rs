@@ -100,6 +100,10 @@ impl Archive {
         }
         let notifier = self.journal.append(self.next_block_seq, self.durable_pos, slice)?;
         let len = slice.len() as u64;
+        // If wait() errors here, next_block_seq is left unadvanced, so a
+        // retry would hit NonMonotonicSeq — acceptable because a Consistent-
+        // mode fsync failure poisons the journal fail-stop; the archive is
+        // not retryable across it.
         notifier.wait()?;
         self.durable_pos += len;
         self.next_block_seq += 1;
@@ -128,11 +132,26 @@ mod tests {
         (b, counters, dir)
     }
 
+    /// Small segments so parallel test journals don't exhaust quota'd tmpfs;
+    /// preallocation stays on (the production default path is covered by
+    /// archive_config_defaults).
+    fn test_cfg(dir: &std::path::Path) -> ArchiveConfig {
+        ArchiveConfig { segment_size_bytes: 4 * 1024 * 1024, ..ArchiveConfig::new(dir) }
+    }
+
+    #[test]
+    fn archive_config_defaults() {
+        let cfg = ArchiveConfig::new("/nonexistent");
+        assert_eq!(cfg.segment_size_bytes, 64 * 1024 * 1024);
+        assert_eq!(cfg.max_block_bytes, 1024 * 1024);
+        assert!(cfg.preallocate_segments);
+    }
+
     #[test]
     #[cfg_attr(miri, ignore)] // real journal files + fsync
     fn records_blocks_and_advances_durable() {
         let (b, c, dir) = setup(1 << 16);
-        let mut arch = Archive::open(ArchiveConfig::new(dir.path())).unwrap();
+        let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
         assert_eq!(arch.recovered_position(), 0);
 
         let mut a = Appender::new(Arc::clone(&b), 1);
@@ -149,7 +168,7 @@ mod tests {
     #[cfg_attr(miri, ignore)] // real journal files + fsync
     fn blocks_split_at_max_and_meta_is_base_position() {
         let (b, _c, dir) = setup(1 << 16);
-        let cfg = ArchiveConfig { max_block_bytes: 200, ..ArchiveConfig::new(dir.path()) };
+        let cfg = ArchiveConfig { max_block_bytes: 200, ..test_cfg(dir.path()) };
         let mut arch = Archive::open(cfg).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 1);
         for i in 0..4 {
@@ -176,7 +195,7 @@ mod tests {
         // observable contract here: durable equals exactly what was recorded,
         // and journal.durable_seq() covers every block we advanced over.
         let (b, c, dir) = setup(1 << 16);
-        let mut arch = Archive::open(ArchiveConfig::new(dir.path())).unwrap();
+        let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 1);
         a.append(1, 0, &[1u8; 64]).unwrap();
         arch.do_work(&b).unwrap();
