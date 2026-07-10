@@ -192,8 +192,9 @@ mod tests {
         assert!(!r.insert(100, 110));
         assert!(!r.insert(120, 130));
         assert!(!r.insert(140, 150));
-        // one run overlapping all three: predecessor-merges with [100,110)
-        // and drives the successor loop over [120,130) and [140,150)
+        // one run overlapping all three: 95 is below every key, so the
+        // predecessor branch never fires — the successor loop alone absorbs
+        // [100,110), [120,130) and [140,150) (3 iterations)
         assert!(!r.insert(95, 145));
         assert_eq!(r.first_gap(), Some((0, 95)));
         assert_eq!(r.highest(), 150);
@@ -214,6 +215,22 @@ mod tests {
         assert_eq!(r.highest(), 300);
         assert!(r.insert(0, 100));
         assert_eq!(r.contiguous(), 300);
+    }
+
+    #[test]
+    fn insert_merges_backward_then_forward_combined() {
+        // predecessor merge widens `s` back to `ps`, THEN the successor loop
+        // iterates over the widened range — the one branch combination the
+        // other coalescing tests don't reach
+        let mut r = Rebuilt::new(0);
+        assert!(!r.insert(100, 110));
+        assert!(!r.insert(200, 210));
+        assert!(!r.insert(105, 205)); // overlaps [100,110) backward, [200,210) forward
+        assert_eq!(r.first_gap(), Some((0, 100)));
+        assert_eq!(r.highest(), 210);
+        assert!(r.insert(0, 100));
+        assert_eq!(r.contiguous(), 210);
+        assert_eq!(r.first_gap(), None);
     }
 
     #[test]
