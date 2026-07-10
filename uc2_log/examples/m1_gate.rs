@@ -19,6 +19,7 @@ use uc2_log::agent::{AgentRunner, IdleStrategy};
 use uc2_log::archive::{Archive, ArchiveConfig};
 use uc2_log::buffer::{AppendError, Appender, LogBuffer};
 use uc2_log::counters::LogCounters;
+use uc_protocol::v2::frame::{align_frame_len, HEADER_LEN};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -81,6 +82,10 @@ fn main() {
     let mut appended = 0u64;
     let mut overruns = 0u64;
     let mut next_report = start + Duration::from_secs(1);
+    // Per-second samples of (elapsed_secs, durable_bytes) taken at each progress
+    // report — used to derive a mid-run steady-state rate that excludes both the
+    // initial unthrottled buffer-fill burst and the final drain.
+    let mut samples: Vec<(f64, u64)> = Vec::new();
     while Instant::now() < deadline {
         for _ in 0..1024 {
             match appender.append(1, appended, &payload) {
@@ -95,6 +100,7 @@ fn main() {
         let now = Instant::now();
         if now >= next_report {
             next_report = now + Duration::from_secs(1);
+            samples.push((start.elapsed().as_secs_f64(), counters.durable.load_acquire()));
             eprintln!(
                 "t={:>3}s appended={} durable_lag={}B",
                 start.elapsed().as_secs(),
@@ -106,34 +112,62 @@ fn main() {
             break;
         }
     }
-    let elapsed = start.elapsed();
+    // Append window: from start until the append loop stopped issuing new frames.
+    let elapsed_append = start.elapsed();
     // drain: wait for the archive to catch up, then stop it
     while counters.durable.load_acquire() < counters.append.load_acquire() {
         std::thread::yield_now();
     }
+    // Durable window: from start until every appended byte is recorded+fsynced.
+    // The headline rate uses THIS so the fsync time of the drained backlog is in
+    // the denominator, not just the numerator (honest append+record+fsync).
+    let elapsed_durable = start.elapsed();
     agent.stop();
 
     let nblocks = blocks.load(Ordering::Relaxed);
     let bytes = counters.durable.load_acquire();
-    let rate = appended as f64 / elapsed.as_secs_f64();
+    let framed = align_frame_len(HEADER_LEN + payload_len);
+    let durable_rate = appended as f64 / elapsed_durable.as_secs_f64();
+    let append_rate = appended as f64 / elapsed_append.as_secs_f64();
+    // Steady-state: durable-counter delta between the first and last full-second
+    // samples, converted to msgs/s via the framed size. Excludes the fill burst
+    // and the drain. Needs >= 2 samples to form a delta.
+    let steady_rate = if samples.len() >= 2 {
+        let (t0, d0) = samples[0];
+        let (t1, d1) = *samples.last().unwrap();
+        let dt = t1 - t0;
+        if dt > 0.0 && d1 > d0 {
+            Some((d1 - d0) as f64 / framed as f64 / dt)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     println!("== uc2 M1 gate ==");
-    println!("payload            {payload_len} B  (96 B framed at 64 B)");
-    println!("duration           {:.2} s", elapsed.as_secs_f64());
+    println!(
+        "payload            {payload_len} B  ({framed} B framed at {HEADER_LEN} B header)"
+    );
+    println!("duration (durable) {:.2} s", elapsed_durable.as_secs_f64());
     println!("appended           {appended} msgs");
-    println!("rate               {:.0} msgs/s", rate);
+    println!("rate (durable)     {durable_rate:.0} msgs/s");
+    println!("append rate (excl. final drain)  {append_rate:.0} msgs/s");
+    if let Some(ss) = steady_rate {
+        println!("steady-state (mid-run durable delta)  {ss:.0} msgs/s");
+    }
     println!(
         "recorded+fsynced   {bytes} B ({:.1} MB/s)",
-        bytes as f64 / elapsed.as_secs_f64() / 1e6
+        bytes as f64 / elapsed_durable.as_secs_f64() / 1e6
     );
     println!(
         "blocks (=fsyncs)   {nblocks} ({:.0}/s, avg {:.0} KiB)",
-        nblocks as f64 / elapsed.as_secs_f64(),
+        nblocks as f64 / elapsed_durable.as_secs_f64(),
         bytes as f64 / nblocks.max(1) as f64 / 1024.0
     );
     println!("overrun stalls     {overruns}");
     println!(
         "GATE (>=1M msgs/s @64B): {}",
-        if payload_len == 64 && rate >= 1_000_000.0 {
+        if payload_len == 64 && durable_rate >= 1_000_000.0 {
             "PASS"
         } else {
             "CHECK"
