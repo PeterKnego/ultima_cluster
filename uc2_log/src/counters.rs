@@ -29,16 +29,23 @@ impl PaddedAtomicU64 {
     }
 }
 
-/// The M1+M2 counter set. append: written only by the appender (leader) /
+/// The M1+M2+M3 counter set. append: written only by the appender (leader) /
 /// receiver (follower), after the frame commit word (so any position below
 /// `append` is a committed frame). durable: written only by the archive,
 /// after write+fdatasync of the block. sent: written only by the sender
 /// agent, after the datagram send (leader only; follower leaves it 0).
+/// commit: the cluster's quorum-fsync'd position (spec §6) — written only by
+/// the sender-agent thread on the leader (quorum ranking) and only by the
+/// receiver-agent thread on a follower (CommitPosition gossip, monotonic).
+/// NOT primed on restart: locally-durable bytes are not necessarily
+/// quorum-durable, so priming commit would manufacture a phantom commit; it
+/// is re-derived live. (Commit persistence is revisited in M4/M5.)
 #[repr(C)]
 pub struct LogCounters {
     pub append: PaddedAtomicU64,
     pub durable: PaddedAtomicU64,
     pub sent: PaddedAtomicU64,
+    pub commit: PaddedAtomicU64,
 }
 
 impl LogCounters {
@@ -48,6 +55,7 @@ impl LogCounters {
             append: PaddedAtomicU64::new(0),
             durable: PaddedAtomicU64::new(0),
             sent: PaddedAtomicU64::new(0),
+            commit: PaddedAtomicU64::new(0),
         }
     }
     /// Prime the counters after archive recovery (append resumes at durable —
@@ -57,6 +65,7 @@ impl LogCounters {
     /// positions below `pos` have no bytes in the buffer — validated reads
     /// return `Overrun` and the journal is the only source, until a prefill
     /// mechanism exists (spec §4 "node restart", sized in M4/M6).
+    /// `commit` is deliberately not primed (see the struct doc).
     pub fn prime(&self, pos: u64) {
         self.durable.store_release(pos);
         self.append.store_release(pos);
@@ -75,10 +84,15 @@ mod tests {
         assert_eq!(c.append.load_acquire(), 0);
         assert_eq!(c.durable.load_acquire(), 0);
         assert_eq!(c.sent.load_acquire(), 0);
+        assert_eq!(c.commit.load_acquire(), 0);
         c.prime(4096);
         assert_eq!(c.append.load_acquire(), 4096);
         assert_eq!(c.durable.load_acquire(), 4096);
         assert_eq!(c.sent.load_acquire(), 4096);
+        // commit is NOT primed: locally-durable bytes are not necessarily
+        // quorum-durable — priming commit would be a phantom commit. It is
+        // re-derived from quorum reports (leader) or gossip (follower).
+        assert_eq!(c.commit.load_acquire(), 0);
     }
 
     #[test]
