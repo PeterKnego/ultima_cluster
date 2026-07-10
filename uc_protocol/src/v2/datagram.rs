@@ -126,6 +126,16 @@ mod tests {
         let mut buf = [0u8; DATAGRAM_HEADER_LEN];
         write_datagram_header(&mut buf, &h);
         assert_eq!(read_datagram_header(&buf), h);
+        // Pin the ABSOLUTE wire layout with a literal LE byte array — this
+        // module is frozen once M3 peers speak it, so a write/read round
+        // trip alone isn't enough (both sides could agree on a wrong
+        // layout). position=0xDEAD_BEEF_0000_0040 -> LE
+        // [0x40,0,0,0,0xEF,0xBE,0xAD,0xDE]; term=9 -> [9,0,0,0]; kind=1;
+        // flags=0x5a; reserved=[0,0].
+        assert_eq!(
+            buf,
+            [0x40, 0x00, 0x00, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 9, 0, 0, 0, 1, 0x5a, 0, 0]
+        );
         // reserved slot stays zero (future per-datagram PSK-MAC home, spec §5)
         assert_eq!(&buf[OFF_DGRAM_RESERVED..OFF_DGRAM_RESERVED + 2], &[0, 0]);
         // layout: position(8) term(4) kind(1) flags(1) reserved(2) = 16
@@ -143,11 +153,19 @@ mod tests {
         let mut buf = [0u8; NAK_BODY_LEN];
         write_nak_body(&mut buf, &n);
         assert_eq!(read_nak_body(&buf), n);
+        // Absolute wire pin, not just internal write/read consistency:
+        // position=4096=0x1000 -> LE [0,16,0,0,0,0,0,0];
+        // length=65536=0x10000 -> LE [0,0,1,0]; reserved=[0,0,0,0].
+        assert_eq!(buf, [0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
 
         let s = StatusBody { contiguous_position: 1 << 33, receive_window: 1 << 28 };
         let mut buf = [0u8; STATUS_BODY_LEN];
         write_status_body(&mut buf, &s);
         assert_eq!(read_status_body(&buf), s);
+        // Absolute wire pin: contiguous_position=1<<33=0x2_0000_0000 -> LE
+        // [0,0,0,0,2,0,0,0]; receive_window=1<<28=0x1000_0000 -> LE
+        // [0,0,0,16]; reserved=[0,0,0,0].
+        assert_eq!(buf, [0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 16, 0, 0, 0, 0]);
     }
 
     #[test]
