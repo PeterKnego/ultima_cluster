@@ -5,3 +5,5 @@
 //! Spec: docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md §5.
 
 pub mod fault;
+pub mod flow;
+pub mod rebuild;
