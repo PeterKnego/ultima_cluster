@@ -145,7 +145,12 @@ impl LogBuffer {
     }
 
     #[inline]
-    fn offset(&self, pos: u64) -> usize {
+    pub(crate) fn region(&self) -> &Region {
+        &self.region
+    }
+
+    #[inline]
+    pub(crate) fn offset(&self, pos: u64) -> usize {
         (pos & self.mask) as usize
     }
 

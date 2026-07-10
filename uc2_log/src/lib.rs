@@ -9,3 +9,4 @@ pub mod archive;
 pub mod buffer;
 pub mod counters;
 pub mod region;
+pub mod writer;
