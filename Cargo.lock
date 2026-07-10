@@ -2571,6 +2571,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "uc2_consensus"
+version = "0.1.0"
+
+[[package]]
 name = "uc2_log"
 version = "0.1.0"
 dependencies = [
