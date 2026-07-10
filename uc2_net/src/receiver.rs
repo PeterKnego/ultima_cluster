@@ -903,14 +903,19 @@ mod tests {
                 break;
             }
         }
-        assert!(r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed) >= 1);
-        // no further advance -> no immediate re-send (floor is u64::MAX-ish in
-        // the `follower` helper via status_floor_ns; append_pos floor is set
-        // long in Step 3's helper tweak)
+        // capture the baseline IMMEDIATELY after the first send, then assert
+        // it holds across 50 quiescent cycles: durable unchanged + floor
+        // disabled (u64::MAX in the helper) must mean NO re-send — a bug that
+        // forgets to update ap_reported re-sends every cycle and fails here
+        let sent = r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed);
         for _ in 0..50 {
             r.do_work();
         }
-        let sent = r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed),
+            sent,
+            "re-sent AppendPosition without a durable advance"
+        );
         b.counters().durable.store_release(1920); // next block
         let deadline = Instant::now() + Duration::from_secs(5);
         while r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed) == sent {
