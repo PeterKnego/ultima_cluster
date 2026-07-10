@@ -19,6 +19,7 @@ pub mod magic;
 pub mod probes;
 pub mod ring;
 pub mod snapshot_region;
+pub mod v2;
 pub mod version;
 
 pub use error_codes::ErrorCode;
