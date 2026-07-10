@@ -29,19 +29,26 @@ impl PaddedAtomicU64 {
     }
 }
 
-/// The M1 counter set. append: written only by the appender, after the frame
-/// commit word (so any position below `append` is a committed frame).
-/// durable: written only by the archive, after write+fdatasync of the block.
+/// The M1+M2 counter set. append: written only by the appender (leader) /
+/// receiver (follower), after the frame commit word (so any position below
+/// `append` is a committed frame). durable: written only by the archive,
+/// after write+fdatasync of the block. sent: written only by the sender
+/// agent, after the datagram send (leader only; follower leaves it 0).
 #[repr(C)]
 pub struct LogCounters {
     pub append: PaddedAtomicU64,
     pub durable: PaddedAtomicU64,
+    pub sent: PaddedAtomicU64,
 }
 
 impl LogCounters {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self { append: PaddedAtomicU64::new(0), durable: PaddedAtomicU64::new(0) }
+        Self {
+            append: PaddedAtomicU64::new(0),
+            durable: PaddedAtomicU64::new(0),
+            sent: PaddedAtomicU64::new(0),
+        }
     }
     /// Prime the counters after archive recovery (append resumes at durable —
     /// bytes beyond durable are discarded on restart, spec §6).
@@ -53,6 +60,8 @@ impl LogCounters {
     pub fn prime(&self, pos: u64) {
         self.durable.store_release(pos);
         self.append.store_release(pos);
+        // A restart resends from durable; followers drop the duplicates.
+        self.sent.store_release(pos);
     }
 }
 
@@ -65,9 +74,11 @@ mod tests {
         let c = LogCounters::new();
         assert_eq!(c.append.load_acquire(), 0);
         assert_eq!(c.durable.load_acquire(), 0);
+        assert_eq!(c.sent.load_acquire(), 0);
         c.prime(4096);
         assert_eq!(c.append.load_acquire(), 4096);
         assert_eq!(c.durable.load_acquire(), 4096);
+        assert_eq!(c.sent.load_acquire(), 4096);
     }
 
     #[test]
