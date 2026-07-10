@@ -186,6 +186,37 @@ mod tests {
     }
 
     #[test]
+    fn insert_absorbs_multiple_ooo_runs() {
+        let mut r = Rebuilt::new(0);
+        // three disjoint ooo runs
+        assert!(!r.insert(100, 110));
+        assert!(!r.insert(120, 130));
+        assert!(!r.insert(140, 150));
+        // one run overlapping all three: predecessor-merges with [100,110)
+        // and drives the successor loop over [120,130) and [140,150)
+        assert!(!r.insert(95, 145));
+        assert_eq!(r.first_gap(), Some((0, 95)));
+        assert_eq!(r.highest(), 150);
+        // filling [0,95) must absorb the single coalesced run in one step
+        assert!(r.insert(0, 95));
+        assert_eq!(r.contiguous(), 150);
+        assert_eq!(r.first_gap(), None);
+    }
+
+    #[test]
+    fn insert_merges_forward_with_no_predecessor() {
+        let mut r = Rebuilt::new(0);
+        assert!(!r.insert(200, 300));
+        // new run strictly before the existing one, nothing precedes it:
+        // successor loop alone must absorb [200,300)
+        assert!(!r.insert(100, 250));
+        assert_eq!(r.first_gap(), Some((0, 100)));
+        assert_eq!(r.highest(), 300);
+        assert!(r.insert(0, 100));
+        assert_eq!(r.contiguous(), 300);
+    }
+
+    #[test]
     fn nak_timer_arms_randomized_fires_and_backs_off() {
         let cfg = NakConfig { delay_min_ns: 200_000, delay_max_ns: 1_000_000, backoff_ns: 5_000_000 };
         let mut t = NakTimer::new(cfg, 42);
