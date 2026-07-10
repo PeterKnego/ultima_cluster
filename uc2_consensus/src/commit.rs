@@ -117,6 +117,22 @@ mod tests {
     }
 
     #[test]
+    fn four_node_even_cluster_commit_is_third_highest() {
+        // even cluster: 4/2 + 1 = 3 = a real majority of 4, not 2 —
+        // regression guard on the quorum formula for the even case
+        let mut t = CommitTracker::new(3, 4);
+        t.on_durable(0, 90);
+        t.on_durable(1, 80);
+        // {own=100, 90, 80, 0} -> quorum 3 -> 3rd highest = 80
+        assert_eq!(t.advance(100), Some(80));
+        // the silent fourth member alone must never complete the quorum:
+        // with only one report, {100, 90, 0, 0} -> 3rd = 0
+        let mut t2 = CommitTracker::new(3, 4);
+        t2.on_durable(0, 90);
+        assert_eq!(t2.advance(100), None);
+    }
+
+    #[test]
     fn five_node_commit_is_third_highest() {
         let mut t = CommitTracker::new(4, 5);
         // {own=100, 90, 80, 70, 0} -> quorum 3 -> 3rd highest = 80
