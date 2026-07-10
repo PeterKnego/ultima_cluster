@@ -87,6 +87,9 @@ pub struct SenderStats {
     pub naks_dropped: AtomicU64,
     /// CommitPosition datagrams fanned out (on-advance + floor re-gossip).
     pub commit_gossips: AtomicU64,
+    /// AppendPosition reports from an address not in the follower set — dropped
+    /// at the membership guard, never ranked (forged/unknown source).
+    pub append_pos_unknown_source: AtomicU64,
 }
 
 pub struct Sender {
@@ -176,6 +179,8 @@ impl Sender {
                 CtrlMsg::AppendPos { from, durable } => {
                     if let Some(&i) = self.follower_idx.get(&from) {
                         self.tracker.on_durable(i, durable);
+                    } else {
+                        self.stats.append_pos_unknown_source.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -508,6 +513,11 @@ mod tests {
         tx.send(ctrl_ap(ghost.addr(), 960)).unwrap();
         s.do_work();
         assert_eq!(b.counters().commit.load_acquire(), 0, "unknown source advanced commit");
+        assert_eq!(
+            s.stats().append_pos_unknown_source.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "unknown-source report must be counted at the membership guard"
+        );
     }
 
     #[test]

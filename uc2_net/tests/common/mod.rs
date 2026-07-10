@@ -87,6 +87,7 @@ pub fn spawn_follower(name: &str, leader: SocketAddr, faults: FaultConfig) -> Fo
 pub struct Leader {
     pub node: Node,
     pub stats: Arc<uc2_net::sender::SenderStats>,
+    pub lr_stats: Arc<uc2_net::receiver::LeaderStats>,
 }
 
 /// The leader socket binds FIRST (followers need its address) — pass it in.
@@ -104,10 +105,11 @@ pub fn spawn_leader(raw: UdpSocket, followers: Vec<SocketAddr>, faults: FaultCon
     let txa =
         AgentRunner::spawn("leader-tx", IdleStrategy::Yield, move || sender.do_work()).unwrap();
     let mut lr = LeaderReceiver::new(recv, tx, TERM).unwrap();
+    let lr_stats = lr.stats(); // capture before the receiver moves into its agent
     let lra =
         AgentRunner::spawn("leader-ctrl", IdleStrategy::Yield, move || lr.do_work()).unwrap();
     let ara = spawn_archive("leader-ar", &buffer, dir.path());
-    Leader { node: Node { buffer, dir, agents: vec![txa, lra, ara] }, stats }
+    Leader { node: Node { buffer, dir, agents: vec![txa, lra, ara] }, stats, lr_stats }
 }
 
 /// Append `n_msgs` 64 B messages, pacing admission against the LIVE followers

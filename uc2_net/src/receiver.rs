@@ -379,6 +379,17 @@ impl FollowerReceiver {
     }
 }
 
+/// Leader-side inbound-demux counters. Shared via `Arc` so a supervising
+/// thread can read them after the receiver has moved into its agent closure
+/// (the same pattern as `FollowerStats` / `SenderStats`).
+#[derive(Default)]
+pub struct LeaderStats {
+    /// Control dropped because the sender channel was full (recoverable).
+    pub dropped_full: AtomicU64,
+    /// Inbound control with a mismatched leadership term (M3 static term).
+    pub dropped_stale_term: AtomicU64,
+}
+
 /// The leader-side inbound demux: NAK/status/AppendPosition → the sender's
 /// channel. All control is term-checked (static term in M3; stale terms are
 /// dropped and counted). Vote kinds (7-8) arrive in M4 with their own route.
@@ -387,8 +398,7 @@ pub struct LeaderReceiver {
     to_sender: mpsc::SyncSender<CtrlMsg>,
     term_id: u32,
     recv_buf: Vec<u8>,
-    pub dropped_full: u64,
-    pub dropped_stale_term: u64,
+    stats: Arc<LeaderStats>,
 }
 
 impl LeaderReceiver {
@@ -403,12 +413,16 @@ impl LeaderReceiver {
             to_sender,
             term_id,
             recv_buf: vec![0u8; 2048],
-            dropped_full: 0,
-            dropped_stale_term: 0,
+            stats: Arc::new(LeaderStats::default()),
         })
     }
 
+    pub fn stats(&self) -> Arc<LeaderStats> {
+        Arc::clone(&self.stats)
+    }
+
     pub fn do_work(&mut self) -> bool {
+        use Ordering::Relaxed;
         let mut did = false;
         for _ in 0..64 {
             let (n, from) = match self.sock.recv_from(&mut self.recv_buf) {
@@ -428,7 +442,7 @@ impl LeaderReceiver {
             }
             let h = read_datagram_header(&self.recv_buf);
             if h.leadership_term_id != self.term_id {
-                self.dropped_stale_term += 1;
+                self.stats.dropped_stale_term.fetch_add(1, Relaxed);
                 continue;
             }
             let body = &self.recv_buf[DATAGRAM_HEADER_LEN..n];
@@ -453,7 +467,8 @@ impl LeaderReceiver {
             if let Some(m) = msg
                 && self.to_sender.try_send(m).is_err()
             {
-                self.dropped_full += 1; // safe: NAK backoff / status floor recover
+                // safe: NAK backoff / status floor recover
+                self.stats.dropped_full.fetch_add(1, Relaxed);
             }
         }
         did
@@ -985,6 +1000,7 @@ mod tests {
         let addr = sock.local_addr().unwrap();
         let (tx, rx) = mpsc::sync_channel(16);
         let mut lr = LeaderReceiver::new(sock, tx, TERM).unwrap();
+        let lr_stats = lr.stats(); // capture the handle before any move
         let mut f = FakeLeader::new(); // reuse as a fake follower endpoint
         f.send(addr, DGRAM_KIND_APPEND_POSITION, 4096, TERM, &[]);
         f.send(addr, DGRAM_KIND_APPEND_POSITION, 9999, TERM - 1, &[]); // stale term
@@ -999,8 +1015,9 @@ mod tests {
         }
         assert!(matches!(got, Some(CtrlMsg::AppendPos { durable: 4096, .. })));
         // the stale one must be counted dropped, never demuxed
+        use std::sync::atomic::Ordering::Relaxed;
         let deadline = Instant::now() + Duration::from_secs(5);
-        while lr.dropped_stale_term < 1 {
+        while lr_stats.dropped_stale_term.load(Relaxed) < 1 {
             assert!(Instant::now() < deadline, "stale-term control never observed");
             lr.do_work();
         }

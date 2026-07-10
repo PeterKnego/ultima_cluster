@@ -11,7 +11,8 @@ mod common;
 
 use std::net::UdpSocket;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::Ordering::Relaxed;
+use std::time::{Duration, Instant};
 
 use common::*;
 use uc2_net::fault::{FaultConfig, FaultSocket};
@@ -120,7 +121,35 @@ fn forged_and_stale_reports_cannot_move_commit() {
         );
         ghost.send_to(&d, leader_addr).unwrap();
     }
-    std::thread::sleep(Duration::from_millis(300));
+
+    // The `assert_eq!(commit, end)` below is only INSURANCE, not the proof: in
+    // this topology a single forged report can never reach the quorum rank (2nd
+    // of {own, f1, ghost} still needs f1) and the tracker's bounded-by-own cap
+    // holds commit at the leader's own durable regardless — so that assertion
+    // would pass even if both guards were deleted AND even if the datagrams
+    // never arrived. The actual PROOF that the guards work is the two counters
+    // below: each proves its datagram LANDED at the node and was REJECTED at its
+    // specific guard.
+
+    // (1) the stale-term ghost datagram reached the leader's demux and was
+    // rejected there (never forwarded to the sender's tracker).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while leader.lr_stats.dropped_stale_term.load(Relaxed) < 1 {
+        assert!(Instant::now() < deadline, "stale-term ghost never reached / rejected at the demux");
+        std::thread::yield_now();
+    }
+    // (2) the correct-term ghost traversed the demux (term matched) and was
+    // rejected at the sender's follower-set membership guard.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while leader.stats.append_pos_unknown_source.load(Relaxed) < 1 {
+        assert!(Instant::now() < deadline, "unknown-source ghost never reached / rejected at the sender");
+        std::thread::yield_now();
+    }
+
+    // With both guards proven to have fired, a short settle then confirms the
+    // insurance: commit is still pinned at quorum durable, not the ghost's
+    // 1 GiB overshoot.
+    std::thread::sleep(Duration::from_millis(100));
     let commit = leader.node.buffer.counters().commit.load_acquire();
     assert_eq!(commit, end, "forged/stale report moved commit ({commit} != {end})");
     converge_and_compare(leader, vec![f1], end);
