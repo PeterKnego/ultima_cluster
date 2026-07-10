@@ -25,10 +25,10 @@ use std::time::Instant;
 use uc2_log::buffer::LogBuffer;
 use uc2_log::writer::PositionedWriter;
 use uc_protocol::v2::datagram::{
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
-    DGRAM_KIND_NAK, DGRAM_KIND_STATUS, DatagramHeader, NAK_BODY_LEN, NakBody, STATUS_BODY_LEN,
-    StatusBody, read_datagram_header, read_nak_body, read_status_body, write_datagram_header,
-    write_nak_body, write_status_body,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA,
+    DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_STATUS, DatagramHeader, NAK_BODY_LEN, NakBody,
+    STATUS_BODY_LEN, StatusBody, read_datagram_header, read_nak_body, read_status_body,
+    write_datagram_header, write_nak_body, write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
 
@@ -75,6 +75,9 @@ pub struct FollowerConfig {
     /// Status every this many rebuilt bytes (0 = capacity/4, spec §5's
     /// quarter-window).
     pub status_bytes: u64,
+    /// AppendPosition is sent on durable advance; the floor bounds the gap
+    /// between reports when durable is quiescent (spec §6).
+    pub append_pos_floor_ns: u64,
 }
 
 impl FollowerConfig {
@@ -87,6 +90,7 @@ impl FollowerConfig {
             nak_max_bytes: 65_536,
             status_floor_ns: 100_000_000,
             status_bytes: 0,
+            append_pos_floor_ns: 100_000_000,
         }
     }
 }
@@ -101,6 +105,8 @@ pub struct FollowerStats {
     pub dropped_malformed: AtomicU64,
     pub naks_sent: AtomicU64,
     pub statuses_sent: AtomicU64,
+    pub append_positions_sent: AtomicU64,
+    pub commits_received: AtomicU64,
 }
 
 pub struct FollowerReceiver {
@@ -115,6 +121,12 @@ pub struct FollowerReceiver {
     base: Instant,
     last_status_ns: u64,
     status_at: u64,
+    /// Durable value last reported via AppendPosition.
+    ap_reported: u64,
+    last_ap_ns: u64,
+    /// Highest commit gossip accepted (shadow of the counter — this thread is
+    /// the counter's single writer, so a plain field avoids the re-load).
+    commit_seen: u64,
     recv_buf: Vec<u8>,
     stats: Arc<FollowerStats>,
 }
@@ -137,6 +149,9 @@ impl FollowerReceiver {
             base: Instant::now(),
             last_status_ns: 0,
             status_at: start,
+            ap_reported: start,
+            last_ap_ns: 0,
+            commit_seen: 0,
             recv_buf: vec![0u8; 65_536],
             stats: Arc::new(FollowerStats::default()),
         }
@@ -251,6 +266,17 @@ impl FollowerReceiver {
             DGRAM_KIND_HEARTBEAT => {
                 self.leader_append = self.leader_append.max(h.position);
             }
+            DGRAM_KIND_COMMIT_POSITION => {
+                // Monotonic max: UDP-reordered gossip never regresses. The
+                // stored value is the CLUSTER commit; M5's apply agent clamps
+                // to min(commit, local contiguous durable) at consumption
+                // (spec §6) — the counter itself stays raw.
+                self.stats.commits_received.fetch_add(1, Relaxed);
+                if h.position > self.commit_seen {
+                    self.commit_seen = h.position;
+                    self.buffer.counters().commit.store_release(self.commit_seen);
+                }
+            }
             _ => {} // control kinds for the consensus agent: M3
         }
     }
@@ -297,11 +323,34 @@ impl FollowerReceiver {
             did = true;
         }
 
+        // Single durable load reused by AppendPosition + status below.
+        let durable = self.buffer.counters().durable.load_acquire();
+
+        // AppendPosition (spec §6): report our durable on advance (block/
+        // fsync granularity, ~kHz) or on the floor. Feeds the leader's
+        // quorum commit ranking.
+        if durable > self.ap_reported || now - self.last_ap_ns >= self.cfg.append_pos_floor_ns {
+            let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+            write_datagram_header(
+                &mut d,
+                &DatagramHeader {
+                    position: durable,
+                    leadership_term_id: self.cfg.term_id,
+                    kind: DGRAM_KIND_APPEND_POSITION,
+                    flags: 0,
+                },
+            );
+            let _ = self.sock.send_to(&d, self.cfg.leader);
+            self.ap_reported = durable;
+            self.last_ap_ns = now;
+            self.stats.append_positions_sent.fetch_add(1, Relaxed);
+            did = true;
+        }
+
         // Status: every quarter-window of progress, or on the time floor.
         if contiguous - self.status_at >= self.status_bytes
             || now - self.last_status_ns >= self.cfg.status_floor_ns
         {
-            let durable = self.buffer.counters().durable.load_acquire();
             // The advance-guard in on_datagram makes underflow unreachable;
             // saturate anyway so a future guard regression degrades to a
             // window=0 backpressure signal rather than a bogus ~4 GiB window.
@@ -422,8 +471,8 @@ mod tests {
     use uc_protocol::v2::datagram::{
         read_nak_body, read_status_body, write_datagram_header, write_nak_body,
         write_status_body, DatagramHeader, DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION,
-        DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_STATUS, NAK_BODY_LEN,
-        STATUS_BODY_LEN,
+        DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK,
+        DGRAM_KIND_STATUS, NAK_BODY_LEN, STATUS_BODY_LEN,
     };
 
     const TERM: u32 = 9;
@@ -492,6 +541,7 @@ mod tests {
         let mut cfg = FollowerConfig::new(TERM, leader);
         cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
         cfg.status_floor_ns = u64::MAX; // no time-driven status in unit tests
+        cfg.append_pos_floor_ns = u64::MAX; // advance-driven AppendPosition only
         FollowerReceiver::new(Arc::clone(b), FaultSocket::bind("127.0.0.1:0").unwrap(), cfg)
     }
 
@@ -831,6 +881,68 @@ mod tests {
             r.do_work();
         }
         assert_eq!(b.counters().append.load_acquire(), 0);
+    }
+
+    #[test]
+    fn durable_advance_emits_append_position() {
+        let b = buffer();
+        let leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        // simulate the archive: durable advances by one block
+        b.counters().durable.store_release(960);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "no AppendPosition");
+            r.do_work();
+            if let Some((h, body)) = leader.recv()
+                && h.kind == DGRAM_KIND_APPEND_POSITION
+            {
+                assert_eq!(h.position, 960);
+                assert_eq!(h.leadership_term_id, TERM);
+                assert!(body.is_empty(), "AppendPosition is header-only");
+                break;
+            }
+        }
+        assert!(r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        // no further advance -> no immediate re-send (floor is u64::MAX-ish in
+        // the `follower` helper via status_floor_ns; append_pos floor is set
+        // long in Step 3's helper tweak)
+        for _ in 0..50 {
+            r.do_work();
+        }
+        let sent = r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed);
+        b.counters().durable.store_release(1920); // next block
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed) == sent {
+            assert!(Instant::now() < deadline, "advance did not re-report");
+            r.do_work();
+        }
+    }
+
+    #[test]
+    fn commit_position_gossip_is_stored_monotonically() {
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+        leader.send(to, DGRAM_KIND_COMMIT_POSITION, 4096, TERM, &[]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while b.counters().commit.load_acquire() < 4096 {
+            assert!(Instant::now() < deadline, "commit gossip never landed");
+            r.do_work();
+        }
+        // stale/reordered gossip must not regress; stale TERM must be dropped
+        leader.send(to, DGRAM_KIND_COMMIT_POSITION, 1024, TERM, &[]);
+        leader.send(to, DGRAM_KIND_COMMIT_POSITION, 9999, TERM - 1, &[]);
+        let st = r.stats();
+        let before_stale = st.dropped_stale_term.load(std::sync::atomic::Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_stale_term.load(std::sync::atomic::Ordering::Relaxed) == before_stale {
+            assert!(Instant::now() < deadline, "stale-term gossip never observed");
+            r.do_work();
+        }
+        assert_eq!(b.counters().commit.load_acquire(), 4096);
+        assert!(st.commits_received.load(std::sync::atomic::Ordering::Relaxed) >= 2);
     }
 
     #[test]
