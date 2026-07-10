@@ -204,6 +204,25 @@ impl FollowerReceiver {
                     self.stats.dropped_malformed.fetch_add(1, Relaxed);
                     return;
                 };
+                // Empty-body DATA: walk_advance(&[]) == Some(0). It is
+                // malformed, not an overrun; catching it here also guarantees
+                // rebuilt.insert never sees a zero-length (pos, pos) range.
+                if advance == 0 {
+                    self.stats.dropped_malformed.fetch_add(1, Relaxed);
+                    return;
+                }
+                // Overrun gate on the STREAM ADVANCE, not the wire bytes: a
+                // wrap-padding run is header-only on the wire (32 B) yet
+                // advances its full padding span, so write_run's bytes-based
+                // guard under-checks it — a padding datagram could push the
+                // frontier past durable + capacity and underflow the status
+                // window. Enforce the spec guard on `advance` here; write_run's
+                // own bytes guard stays as belt-and-suspenders.
+                let durable = self.buffer.counters().durable.load_acquire();
+                if h.position + advance > durable + self.buffer.capacity() {
+                    self.stats.dropped_overrun.fetch_add(1, Relaxed);
+                    return;
+                }
                 if !self.writer.write_run(h.position, body) {
                     // beyond durable + capacity (archive lagging) or wrap-
                     // crossing garbage: flow control should prevent the
@@ -270,7 +289,10 @@ impl FollowerReceiver {
             || now - self.last_status_ns >= self.cfg.status_floor_ns
         {
             let durable = self.buffer.counters().durable.load_acquire();
-            let window = (durable + self.buffer.capacity() - contiguous) as u32;
+            // The advance-guard in on_datagram makes underflow unreachable;
+            // saturate anyway so a future guard regression degrades to a
+            // window=0 backpressure signal rather than a bogus ~4 GiB window.
+            let window = (durable + self.buffer.capacity()).saturating_sub(contiguous) as u32;
             let mut d = vec![0u8; DATAGRAM_HEADER_LEN + STATUS_BODY_LEN];
             write_datagram_header(
                 &mut d,
@@ -603,6 +625,138 @@ mod tests {
         } else {
             panic!("expected padding run");
         }
+    }
+
+    /// F1 regression: a wrap-padding datagram whose ADVANCE (not wire bytes)
+    /// violates `durable + capacity` is dropped as overrun, the frontier does
+    /// not move, and the advertised receive window does not underflow.
+    ///
+    /// Pre-fix, the DATA path delegated the overrun check to
+    /// `write_run`, which gates on `position + bytes.len()`. For the lap-2
+    /// padding `bytes.len() == 32` but `advance == 64`: write_run's guard
+    /// (`8128 + 32 == 8160`, not `> 8160`) PASSED, so the frontier advanced to
+    /// 8192 and the status window computed `4064 + 4096 - 8192` which underflows
+    /// `u32` to ~4.29e9 — a bogus huge window that defeats flow control. The
+    /// advance-based guard added here rejects it (`8128 + 64 == 8192 > 8160`).
+    #[test]
+    fn padding_advance_overrun_dropped_window_no_underflow() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Dedicated small buffer: 4096 is a power of two and >= 4*max_claim
+        // (max_payload 256 -> max_claim 576 -> 2304). 96-byte frames lap it in
+        // 42 frames + a 64-byte wrap padding.
+        fn small() -> Arc<LogBuffer> {
+            let counters = Arc::new(LogCounters::new());
+            Arc::new(LogBuffer::new(Region::heap_zeroed(4096), counters, 256))
+        }
+
+        // Two honest laps of leader wire runs. The buffer is only 4096 B, so
+        // lap 2 overwrites lap 1's offsets — capture each run right after its
+        // append, before it is clobbered. Glue durable to append so it laps.
+        let leader = small();
+        let mut a = Appender::new(Arc::clone(&leader), TERM);
+        let mut runs: Vec<(u64, Vec<u8>, u64)> = Vec::new();
+        let mut read_pos = 0u64;
+        let mut out = Vec::new();
+        for i in 0..85u64 {
+            a.append(4, i, &[0u8; 64]).unwrap();
+            leader.counters().durable.store_release(a.position());
+            while let SliceRead::Run(r) = leader.read_run_validated(read_pos, 96, &mut out) {
+                runs.push((read_pos, out[..r.bytes].to_vec(), r.advance));
+                read_pos += r.advance;
+            }
+        }
+        // Partition: lap1 (42 frames + padding) < 4096; lap2 frames
+        // [4096,8128); lap2 padding at 8128; ignore the frame at 8192 that
+        // forced the padding.
+        let lap1: Vec<_> = runs.iter().filter(|(p, ..)| *p < 4096).cloned().collect();
+        let lap2_frames: Vec<_> =
+            runs.iter().filter(|(p, ..)| (4096..8128).contains(p)).cloned().collect();
+        let pad2 = runs.iter().find(|(p, ..)| *p == 8128).cloned().expect("lap2 padding");
+        // Honest-generation sanity.
+        assert_eq!(lap1.len(), 43);
+        assert_eq!(lap1.last().unwrap().0, 4032); // padding at 4032
+        assert_eq!(lap1.last().unwrap().1.len(), 32); // header-only on the wire
+        assert_eq!(lap1.last().unwrap().2, 64); // advances the full pad span
+        assert_eq!(lap2_frames.len(), 42);
+        assert_eq!((pad2.0, pad2.1.len(), pad2.2), (8128, 32, 64));
+
+        // Follower on its own dedicated small buffer.
+        let fb = small();
+        let mut leader_ep = FakeLeader::new();
+        let mut cfg = FollowerConfig::new(TERM, leader_ep.addr());
+        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.status_floor_ns = u64::MAX;
+        cfg.status_bytes = 96; // a status per frame's worth of progress
+        let mut r = FollowerReceiver::new(
+            Arc::clone(&fb),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            cfg,
+        );
+        let to = r.local_addr();
+
+        // (3) lap 1: [0,4096) rebuilt; ends exactly at durable(0)+capacity —
+        // allowed, the boundary check is strict `>`.
+        for (pos, bytes, _) in &lap1 {
+            leader_ep.send(to, DGRAM_KIND_DATA, *pos, TERM, bytes);
+        }
+        drive_until(&mut r, || fb.counters().append.load_acquire() == 4096);
+
+        // (4) the archive advances durable (simulating the local recorder).
+        fb.counters().durable.store_release(4064);
+
+        // (5) lap 2 frames [4096,8128): each ends <= 8160 = durable+capacity.
+        for (pos, bytes, _) in &lap2_frames {
+            leader_ep.send(to, DGRAM_KIND_DATA, *pos, TERM, bytes);
+        }
+        drive_until(&mut r, || fb.counters().append.load_acquire() == 8128);
+
+        // (6) lap 2 padding: advance 64 pushes 8128 -> 8192 > 8160 -> dropped.
+        leader_ep.send(to, DGRAM_KIND_DATA, pad2.0, TERM, &pad2.1);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while r.stats().dropped_overrun.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "padding overrun never counted");
+            r.do_work();
+            std::thread::yield_now();
+        }
+        // frontier did NOT move past the honest lap-2 tail
+        assert_eq!(fb.counters().append.load_acquire(), 8128);
+
+        // (7) a status reflecting the final state advertises a SANE window
+        // (4064 + 4096 - 8128 = 32), not a ~4 GiB underflow.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "no final status");
+            r.do_work();
+            if let Some((h, body)) = leader_ep.recv() {
+                if h.kind == DGRAM_KIND_STATUS {
+                    let s = read_status_body(&body);
+                    if s.contiguous_position == 8128 {
+                        assert_eq!(s.receive_window, 32);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// F2 regression: an empty-body DATA datagram is malformed, not overrun.
+    #[test]
+    fn empty_body_data_is_malformed_not_overrun() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+        leader.send(to, DGRAM_KIND_DATA, 0, TERM, &[]); // empty body
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_malformed.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "empty body never counted malformed");
+            r.do_work();
+            std::thread::yield_now();
+        }
+        assert_eq!(st.dropped_overrun.load(Relaxed), 0);
+        assert_eq!(b.counters().append.load_acquire(), 0); // frontier unmoved
     }
 
     #[test]
