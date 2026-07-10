@@ -31,7 +31,14 @@ pub const DGRAM_KIND_HEARTBEAT: u8 = 2;
 pub const DGRAM_KIND_NAK: u8 = 3;
 /// Payload = `StatusBody`.
 pub const DGRAM_KIND_STATUS: u8 = 4;
-// 5..=8 reserved: APPEND_POSITION, COMMIT_POSITION, REQUEST_VOTE, VOTE (M3/M4).
+/// Header-only (spec §6): `position` = the sender's DURABLE position.
+/// Follower → leader, on durable advance (block/fsync granularity) plus a
+/// 100 ms floor. Feeds the leader's quorum commit ranking.
+pub const DGRAM_KIND_APPEND_POSITION: u8 = 5;
+/// Header-only (spec §6): `position` = the cluster COMMIT position (quorum-
+/// fsync'd). Leader → followers, on commit advance plus the same floor.
+pub const DGRAM_KIND_COMMIT_POSITION: u8 = 6;
+// 7..=8 reserved: REQUEST_VOTE, VOTE (M4).
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatagramHeader {
@@ -174,5 +181,7 @@ mod tests {
         assert_eq!(DGRAM_KIND_HEARTBEAT, 2);
         assert_eq!(DGRAM_KIND_NAK, 3);
         assert_eq!(DGRAM_KIND_STATUS, 4);
+        assert_eq!(DGRAM_KIND_APPEND_POSITION, 5);
+        assert_eq!(DGRAM_KIND_COMMIT_POSITION, 6);
     }
 }
