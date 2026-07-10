@@ -200,6 +200,15 @@ impl FollowerReceiver {
                     self.stats.dropped_dup.fetch_add(1, Relaxed);
                     return;
                 }
+                // Corrupt-header hardening (M2 final review): the wire has no
+                // CRC, so a flipped position bit must fail closed. Misaligned
+                // positions would corrupt reader framing; a position whose
+                // sum with `advance` wraps u64 would sneak past the overrun
+                // gate below as a tiny wrapped value.
+                if !h.position.is_multiple_of(frame::FRAME_ALIGNMENT as u64) {
+                    self.stats.dropped_malformed.fetch_add(1, Relaxed);
+                    return;
+                }
                 let Some(advance) = walk_advance(body) else {
                     self.stats.dropped_malformed.fetch_add(1, Relaxed);
                     return;
@@ -219,7 +228,11 @@ impl FollowerReceiver {
                 // window. Enforce the spec guard on `advance` here; write_run's
                 // own bytes guard stays as belt-and-suspenders.
                 let durable = self.buffer.counters().durable.load_acquire();
-                if h.position + advance > durable + self.buffer.capacity() {
+                let Some(end) = h.position.checked_add(advance) else {
+                    self.stats.dropped_malformed.fetch_add(1, Relaxed);
+                    return;
+                };
+                if end > durable + self.buffer.capacity() {
                     self.stats.dropped_overrun.fetch_add(1, Relaxed);
                     return;
                 }
@@ -500,10 +513,10 @@ mod tests {
         while got_nak.is_none() {
             assert!(Instant::now() < deadline);
             r.do_work();
-            if let Some((h, body)) = leader.recv() {
-                if h.kind == DGRAM_KIND_NAK {
-                    got_nak = Some(read_nak_body(&body));
-                }
+            if let Some((h, body)) = leader.recv()
+                && h.kind == DGRAM_KIND_NAK
+            {
+                got_nak = Some(read_nak_body(&body));
             }
         }
         let nak = got_nak.unwrap();
@@ -528,12 +541,12 @@ mod tests {
         loop {
             assert!(Instant::now() < deadline, "no tail NAK");
             r.do_work();
-            if let Some((h, body)) = leader.recv() {
-                if h.kind == DGRAM_KIND_NAK {
-                    let nak = read_nak_body(&body);
-                    assert_eq!((nak.position, nak.length), (0, 192));
-                    break;
-                }
+            if let Some((h, body)) = leader.recv()
+                && h.kind == DGRAM_KIND_NAK
+            {
+                let nak = read_nak_body(&body);
+                assert_eq!((nak.position, nak.length), (0, 192));
+                break;
             }
         }
     }
@@ -585,14 +598,14 @@ mod tests {
         loop {
             assert!(Instant::now() < deadline, "no status");
             r.do_work();
-            if let Some((h, body)) = leader.recv() {
-                if h.kind == DGRAM_KIND_STATUS {
-                    let s = read_status_body(&body);
-                    assert_eq!(s.contiguous_position, 96);
-                    // durable 0 + capacity 65536 - contiguous 96
-                    assert_eq!(s.receive_window, 65536 - 96);
-                    break;
-                }
+            if let Some((h, body)) = leader.recv()
+                && h.kind == DGRAM_KIND_STATUS
+            {
+                let s = read_status_body(&body);
+                assert_eq!(s.contiguous_position, 96);
+                // durable 0 + capacity 65536 - contiguous 96
+                assert_eq!(s.receive_window, 65536 - 96);
+                break;
             }
         }
     }
@@ -727,13 +740,13 @@ mod tests {
         loop {
             assert!(Instant::now() < deadline, "no final status");
             r.do_work();
-            if let Some((h, body)) = leader_ep.recv() {
-                if h.kind == DGRAM_KIND_STATUS {
-                    let s = read_status_body(&body);
-                    if s.contiguous_position == 8128 {
-                        assert_eq!(s.receive_window, 32);
-                        break;
-                    }
+            if let Some((h, body)) = leader_ep.recv()
+                && h.kind == DGRAM_KIND_STATUS
+            {
+                let s = read_status_body(&body);
+                if s.contiguous_position == 8128 {
+                    assert_eq!(s.receive_window, 32);
+                    break;
                 }
             }
         }
@@ -757,6 +770,45 @@ mod tests {
         }
         assert_eq!(st.dropped_overrun.load(Relaxed), 0);
         assert_eq!(b.counters().append.load_acquire(), 0); // frontier unmoved
+    }
+
+    #[test]
+    fn misaligned_wire_position_is_malformed() {
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+        let runs = frame_runs(&[&[1u8; 64]], 4096);
+        // legit frame bytes, but position not on a 32-byte frame boundary
+        leader.send(to, DGRAM_KIND_DATA, 16, TERM, &runs[0].1);
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_malformed.load(std::sync::atomic::Ordering::Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "misaligned datagram never observed");
+            r.do_work();
+        }
+        assert_eq!(b.counters().append.load_acquire(), 0, "misaligned position advanced the log");
+    }
+
+    #[test]
+    fn position_overflow_is_malformed_not_accepted() {
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+        let runs = frame_runs(&[&[1u8; 64]], 4096);
+        // u64 wrap: position + advance overflows; the wrapped sum must not
+        // sneak past the overrun gate (accept-rule arithmetic escape)
+        let pos = u64::MAX - 63; // 32-aligned (u64::MAX - 63 = ...FFC0), advance 96 wraps
+        assert_eq!(pos % 32, 0);
+        leader.send(to, DGRAM_KIND_DATA, pos, TERM, &runs[0].1);
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_malformed.load(std::sync::atomic::Ordering::Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "overflowing datagram never observed");
+            r.do_work();
+        }
+        assert_eq!(b.counters().append.load_acquire(), 0);
     }
 
     #[test]

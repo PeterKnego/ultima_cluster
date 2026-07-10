@@ -27,6 +27,13 @@ use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 use crate::fault::FaultSocket;
 use crate::flow::FlowControl;
 
+/// Bound on queued NAK requests (M2 final review: a flooding/hostile
+/// follower must not grow the deque unboundedly). Oldest entries drop first —
+/// a re-NAK after backoff re-requests anything still missing, so dropping is
+/// always recoverable. 1024 entries ≈ 24 KB; the worst storm observed in the
+/// M2 gate was ~10k NAKs over a whole run.
+const NAK_QUEUE_MAX: usize = 1024;
+
 /// Control messages routed from the leader's receiver agent (Task 8).
 /// Bounded channel; a dropped message is safe (NAK re-fires after backoff,
 /// status re-sends on its floor).
@@ -71,6 +78,9 @@ pub struct SenderStats {
     /// Validated read lost the race with the appender: that follower needs a
     /// journal replay session (M4) — in M2 this only counts.
     pub overruns: AtomicU64,
+    /// NAK requests dropped because the queue hit `NAK_QUEUE_MAX` (oldest
+    /// dropped first); observability only — a re-NAK after backoff recovers.
+    pub naks_dropped: AtomicU64,
 }
 
 pub struct Sender {
@@ -142,6 +152,10 @@ impl Sender {
                     self.flow.on_status(from, contiguous, window)
                 }
                 CtrlMsg::Nak { from, position, length } => {
+                    if self.naks.len() >= NAK_QUEUE_MAX {
+                        self.naks.pop_front();
+                        self.stats.naks_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                     self.naks.push_back((from, position, length))
                 }
             }
@@ -375,6 +389,33 @@ mod tests {
         assert!(body.len() >= 192);
         assert!(f1.recv().is_none(), "NAK service must not fan out");
         assert_eq!(s.stats().naks_served.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn nak_queue_is_capped_dropping_oldest() {
+        let b = buffer();
+        let f1 = Fake::new();
+        let (tx, rx) = mpsc::sync_channel(4096);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f1.addr()],
+            3,
+            rx,
+            cfg,
+        );
+        // flood 1100 NAKs in one control drain; the queue must trim to the cap
+        for i in 0..1100u64 {
+            tx.send(CtrlMsg::Nak { from: f1.addr(), position: i * 96, length: 96 }).unwrap();
+        }
+        s.do_work(); // drains all 1100, serves 1
+        assert_eq!(
+            s.stats().naks_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            1100 - NAK_QUEUE_MAX as u64,
+            "overflow beyond the cap must be counted as dropped"
+        );
     }
 
     #[test]

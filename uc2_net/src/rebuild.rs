@@ -109,6 +109,10 @@ struct Armed {
 
 impl NakTimer {
     pub fn new(cfg: NakConfig, seed: u64) -> Self {
+        assert!(
+            cfg.delay_min_ns <= cfg.delay_max_ns,
+            "delay_min_ns must be <= delay_max_ns"
+        );
         Self { cfg, rng: XorShift64::new(seed), armed: None }
     }
 
@@ -231,6 +235,13 @@ mod tests {
         assert!(r.insert(0, 100));
         assert_eq!(r.contiguous(), 210);
         assert_eq!(r.first_gap(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "delay_min_ns must be <= delay_max_ns")]
+    fn nak_config_min_above_max_is_rejected() {
+        let cfg = NakConfig { delay_min_ns: 2, delay_max_ns: 1, backoff_ns: 5 };
+        let _ = NakTimer::new(cfg, 1);
     }
 
     #[test]
