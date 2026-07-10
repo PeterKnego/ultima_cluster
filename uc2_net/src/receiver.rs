@@ -25,9 +25,9 @@ use std::time::Instant;
 use uc2_log::buffer::LogBuffer;
 use uc2_log::writer::PositionedWriter;
 use uc_protocol::v2::datagram::{
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK,
-    DGRAM_KIND_STATUS, DatagramHeader, NAK_BODY_LEN, NakBody, STATUS_BODY_LEN, StatusBody,
-    read_datagram_header, read_nak_body, read_status_body, write_datagram_header,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
+    DGRAM_KIND_NAK, DGRAM_KIND_STATUS, DatagramHeader, NAK_BODY_LEN, NakBody, STATUS_BODY_LEN,
+    StatusBody, read_datagram_header, read_nak_body, read_status_body, write_datagram_header,
     write_nak_body, write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
@@ -330,19 +330,33 @@ impl FollowerReceiver {
     }
 }
 
-/// The leader-side inbound demux: NAK/status → the sender's channel.
-/// (Vote/append-position kinds get a consensus channel in M3.)
+/// The leader-side inbound demux: NAK/status/AppendPosition → the sender's
+/// channel. All control is term-checked (static term in M3; stale terms are
+/// dropped and counted). Vote kinds (7-8) arrive in M4 with their own route.
 pub struct LeaderReceiver {
     sock: UdpSocket,
     to_sender: mpsc::SyncSender<CtrlMsg>,
+    term_id: u32,
     recv_buf: Vec<u8>,
     pub dropped_full: u64,
+    pub dropped_stale_term: u64,
 }
 
 impl LeaderReceiver {
-    pub fn new(sock: UdpSocket, to_sender: mpsc::SyncSender<CtrlMsg>) -> io::Result<Self> {
+    pub fn new(
+        sock: UdpSocket,
+        to_sender: mpsc::SyncSender<CtrlMsg>,
+        term_id: u32,
+    ) -> io::Result<Self> {
         sock.set_nonblocking(true)?;
-        Ok(Self { sock, to_sender, recv_buf: vec![0u8; 2048], dropped_full: 0 })
+        Ok(Self {
+            sock,
+            to_sender,
+            term_id,
+            recv_buf: vec![0u8; 2048],
+            dropped_full: 0,
+            dropped_stale_term: 0,
+        })
     }
 
     pub fn do_work(&mut self) -> bool {
@@ -364,6 +378,10 @@ impl LeaderReceiver {
                 continue;
             }
             let h = read_datagram_header(&self.recv_buf);
+            if h.leadership_term_id != self.term_id {
+                self.dropped_stale_term += 1;
+                continue;
+            }
             let body = &self.recv_buf[DATAGRAM_HEADER_LEN..n];
             let msg = match h.kind {
                 DGRAM_KIND_NAK if body.len() >= NAK_BODY_LEN => {
@@ -377,6 +395,9 @@ impl LeaderReceiver {
                         contiguous: b.contiguous_position,
                         window: b.receive_window,
                     })
+                }
+                DGRAM_KIND_APPEND_POSITION => {
+                    Some(CtrlMsg::AppendPos { from, durable: h.position })
                 }
                 _ => None,
             };
@@ -400,8 +421,9 @@ mod tests {
     use uc2_log::region::Region;
     use uc_protocol::v2::datagram::{
         read_nak_body, read_status_body, write_datagram_header, write_nak_body,
-        write_status_body, DatagramHeader, DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA,
-        DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_STATUS, NAK_BODY_LEN, STATUS_BODY_LEN,
+        write_status_body, DatagramHeader, DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION,
+        DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_STATUS, NAK_BODY_LEN,
+        STATUS_BODY_LEN,
     };
 
     const TERM: u32 = 9;
@@ -816,7 +838,7 @@ mod tests {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
         let (tx, rx) = mpsc::sync_channel(16);
-        let mut lr = LeaderReceiver::new(sock, tx).unwrap();
+        let mut lr = LeaderReceiver::new(sock, tx, TERM).unwrap();
         let mut f = FakeLeader::new(); // reuse as a fake follower endpoint
         let mut nb = [0u8; NAK_BODY_LEN];
         write_nak_body(&mut nb, &uc_protocol::v2::datagram::NakBody { position: 96, length: 192 });
@@ -838,5 +860,33 @@ mod tests {
         }
         assert!(matches!(got[0], CtrlMsg::Nak { position: 96, length: 192, .. }));
         assert!(matches!(got[1], CtrlMsg::Status { contiguous: 4096, .. }));
+    }
+
+    #[test]
+    fn leader_receiver_demuxes_append_position_and_drops_stale_term() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        let (tx, rx) = mpsc::sync_channel(16);
+        let mut lr = LeaderReceiver::new(sock, tx, TERM).unwrap();
+        let mut f = FakeLeader::new(); // reuse as a fake follower endpoint
+        f.send(addr, DGRAM_KIND_APPEND_POSITION, 4096, TERM, &[]);
+        f.send(addr, DGRAM_KIND_APPEND_POSITION, 9999, TERM - 1, &[]); // stale term
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = None;
+        while got.is_none() {
+            assert!(Instant::now() < deadline);
+            lr.do_work();
+            if let Ok(m) = rx.try_recv() {
+                got = Some(m);
+            }
+        }
+        assert!(matches!(got, Some(CtrlMsg::AppendPos { durable: 4096, .. })));
+        // the stale one must be counted dropped, never demuxed
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lr.dropped_stale_term < 1 {
+            assert!(Instant::now() < deadline, "stale-term control never observed");
+            lr.do_work();
+        }
+        assert!(rx.try_recv().is_err(), "stale-term control reached the sender");
     }
 }

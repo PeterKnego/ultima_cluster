@@ -91,7 +91,7 @@ fn leader_node(
     let stats = sender.stats();
     let txa = AgentRunner::spawn("leader-tx", IdleStrategy::BusySpin, move || sender.do_work())
         .unwrap();
-    let mut lr = LeaderReceiver::new(recv, tx).unwrap();
+    let mut lr = LeaderReceiver::new(recv, tx, TERM).unwrap();
     let lra =
         AgentRunner::spawn("leader-ctrl", IdleStrategy::BusySpin, move || lr.do_work()).unwrap();
     let ara = archive_agent("leader-ar", &b, journal_dir);

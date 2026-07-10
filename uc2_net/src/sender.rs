@@ -10,6 +10,7 @@
 //! COPIED out via a validated read before the syscall: with no CRC on the
 //! wire, sending live ring memory could transmit silently corrupt bytes.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,10 +18,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
+use uc2_consensus::commit::CommitTracker;
 use uc2_log::buffer::{LogBuffer, SliceRead};
 use uc_protocol::v2::datagram::{
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DatagramHeader, MTU_DEFAULT,
-    write_datagram_header,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
+    DatagramHeader, MTU_DEFAULT, write_datagram_header,
 };
 use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 
@@ -41,6 +43,8 @@ const NAK_QUEUE_MAX: usize = 1024;
 pub enum CtrlMsg {
     Nak { from: SocketAddr, position: u64, length: u32 },
     Status { from: SocketAddr, contiguous: u64, window: u32 },
+    /// A follower's AppendPosition report (spec §6): its durable position.
+    AppendPos { from: SocketAddr, durable: u64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,6 +85,8 @@ pub struct SenderStats {
     /// NAK requests dropped because the queue hit `NAK_QUEUE_MAX` (oldest
     /// dropped first); observability only — a re-NAK after backoff recovers.
     pub naks_dropped: AtomicU64,
+    /// CommitPosition datagrams fanned out (on-advance + floor re-gossip).
+    pub commit_gossips: AtomicU64,
 }
 
 pub struct Sender {
@@ -98,6 +104,10 @@ pub struct Sender {
     naks: VecDeque<(SocketAddr, u64, u32)>,
     base: Instant,
     last_heartbeat_ns: u64,
+    /// Quorum commit ranking (spec §6) — this thread is the single writer of
+    /// the leader's commit counter.
+    tracker: CommitTracker,
+    follower_idx: HashMap<SocketAddr, usize>,
     stats: Arc<SenderStats>,
 }
 
@@ -116,6 +126,9 @@ impl Sender {
         );
         let flow = FlowControl::new(&followers, cluster_size, cfg.initial_window);
         let sent = buffer.counters().sent.load_acquire();
+        let tracker = CommitTracker::new(followers.len(), cluster_size);
+        let follower_idx: HashMap<SocketAddr, usize> =
+            followers.iter().enumerate().map(|(i, a)| (*a, i)).collect();
         Sender {
             buffer,
             sock,
@@ -129,6 +142,8 @@ impl Sender {
             naks: VecDeque::new(),
             base: Instant::now(),
             last_heartbeat_ns: 0,
+            tracker,
+            follower_idx,
             stats: Arc::new(SenderStats::default()),
         }
     }
@@ -158,7 +173,24 @@ impl Sender {
                     }
                     self.naks.push_back((from, position, length))
                 }
+                CtrlMsg::AppendPos { from, durable } => {
+                    if let Some(&i) = self.follower_idx.get(&from) {
+                        self.tracker.on_durable(i, durable);
+                    }
+                }
             }
+            did = true;
+        }
+
+        // Commit ranking (spec §6): once per duty cycle, quorum-th highest of
+        // {own durable} ∪ reports, bounded by own durable, monotonic. Advances
+        // at block/fsync granularity (reports and own durable both move per
+        // archive block), so the on-advance gossip stays ~kHz — never
+        // per-message.
+        let own_durable = self.buffer.counters().durable.load_acquire();
+        if let Some(c) = self.tracker.advance(own_durable) {
+            self.buffer.counters().commit.store_release(c);
+            self.gossip_commit(c);
             did = true;
         }
 
@@ -209,6 +241,8 @@ impl Sender {
             for &to in &self.followers {
                 let _ = self.sock.send_to(&self.scratch, to);
             }
+            // CommitPosition floor (spec §6: same 100 ms floor as heartbeats)
+            self.gossip_commit(self.tracker.commit());
             self.stats.heartbeats.fetch_add(1, Ordering::Relaxed);
             did = true;
         }
@@ -234,6 +268,15 @@ impl Sender {
             self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
             self.stats.bytes.fetch_add(body_bytes as u64, Ordering::Relaxed);
         }
+    }
+
+    /// Header-only CommitPosition to every follower.
+    fn gossip_commit(&mut self, commit: u64) {
+        self.assemble(commit, DGRAM_KIND_COMMIT_POSITION, 0);
+        for &to in &self.followers {
+            let _ = self.sock.send_to(&self.scratch, to);
+        }
+        self.stats.commit_gossips.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Retransmit [pos, pos+len) to ONE follower, MTU chunk by MTU chunk.
@@ -416,6 +459,97 @@ mod tests {
             1100 - NAK_QUEUE_MAX as u64,
             "overflow beyond the cap must be counted as dropped"
         );
+    }
+
+    fn ctrl_ap(from: SocketAddr, durable: u64) -> CtrlMsg {
+        CtrlMsg::AppendPos { from, durable }
+    }
+
+    #[test]
+    fn commit_advances_on_quorum_reports_and_gossips() {
+        let b = buffer();
+        let (f1, f2) = (Fake::new(), Fake::new());
+        let (mut s, tx) = sender_to(&[&f1, &f2], &b);
+        // leader's own durable: 10 frames' worth
+        b.counters().durable.store_release(960);
+        // no reports -> {960, 0, 0} -> 2nd highest = 0 -> no commit
+        s.do_work();
+        assert_eq!(b.counters().commit.load_acquire(), 0);
+        // one follower reports 480 -> {960, 480, 0} -> commit 480 + gossip
+        tx.send(ctrl_ap(f1.addr(), 480)).unwrap();
+        s.do_work();
+        assert_eq!(b.counters().commit.load_acquire(), 480);
+        for f in [&f1, &f2] {
+            let (h, body) = f.recv().expect("commit gossip");
+            assert_eq!(h.kind, DGRAM_KIND_COMMIT_POSITION);
+            assert_eq!(h.position, 480);
+            assert_eq!(h.leadership_term_id, 9);
+            assert!(body.is_empty(), "CommitPosition is header-only");
+        }
+        // second follower overtakes: {960, 480, 700} -> commit 700
+        tx.send(ctrl_ap(f2.addr(), 700)).unwrap();
+        s.do_work();
+        assert_eq!(b.counters().commit.load_acquire(), 700);
+        // bounded by own durable: reports at 5000 -> commit = 960
+        tx.send(ctrl_ap(f1.addr(), 5000)).unwrap();
+        tx.send(ctrl_ap(f2.addr(), 5000)).unwrap();
+        s.do_work();
+        assert_eq!(b.counters().commit.load_acquire(), 960);
+        assert!(s.stats().commit_gossips.load(std::sync::atomic::Ordering::Relaxed) >= 3);
+    }
+
+    #[test]
+    fn unknown_source_report_is_ignored() {
+        let b = buffer();
+        let f1 = Fake::new();
+        let ghost = Fake::new(); // not in the follower set
+        let (mut s, tx) = sender_to(&[&f1], &b);
+        b.counters().durable.store_release(960);
+        tx.send(ctrl_ap(ghost.addr(), 960)).unwrap();
+        s.do_work();
+        assert_eq!(b.counters().commit.load_acquire(), 0, "unknown source advanced commit");
+    }
+
+    #[test]
+    fn heartbeat_block_regossips_commit_on_the_floor() {
+        let b = buffer();
+        let f1 = Fake::new();
+        let (tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = 1; // fire every cycle
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f1.addr()],
+            3,
+            rx,
+            cfg,
+        );
+        b.counters().durable.store_release(960);
+        tx.send(ctrl_ap(f1.addr(), 480)).unwrap();
+        s.do_work(); // advances commit to 480, gossips + heartbeats
+        // drain until we have seen BOTH a heartbeat and >= 2 CommitPosition
+        // datagrams (the on-advance gossip plus the floor re-gossip)
+        let mut commits = 0;
+        let mut heartbeats = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while commits < 2 || heartbeats < 1 {
+            assert!(Instant::now() < deadline, "floor re-gossip never arrived");
+            s.do_work();
+            while let Some((h, _)) = f1.recv() {
+                match h.kind {
+                    DGRAM_KIND_COMMIT_POSITION => {
+                        assert_eq!(h.position, 480);
+                        commits += 1;
+                    }
+                    DGRAM_KIND_HEARTBEAT => heartbeats += 1,
+                    _ => {}
+                }
+                if commits >= 2 && heartbeats >= 1 {
+                    break;
+                }
+            }
+        }
     }
 
     #[test]

@@ -110,7 +110,7 @@ fn spawn_leader(raw: UdpSocket, followers: Vec<SocketAddr>, faults: FaultConfig)
     let stats = sender.stats();
     let txa =
         AgentRunner::spawn("leader-tx", IdleStrategy::Yield, move || sender.do_work()).unwrap();
-    let mut lr = LeaderReceiver::new(recv, tx).unwrap();
+    let mut lr = LeaderReceiver::new(recv, tx, TERM).unwrap();
     let lra =
         AgentRunner::spawn("leader-ctrl", IdleStrategy::Yield, move || lr.do_work()).unwrap();
     let ara = spawn_archive("leader-ar", &buffer, dir.path());
