@@ -46,6 +46,27 @@ pub enum FrameRead {
     Overrun,
 }
 
+/// Result payload of a successful `read_run_validated`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunRead {
+    /// Bytes copied into `out`.
+    pub bytes: usize,
+    /// Stream positions consumed (> `bytes` iff the run ends in a padding
+    /// frame, which is copied header-only).
+    pub advance: u64,
+}
+
+#[derive(Debug)]
+pub enum SliceRead {
+    Run(RunRead),
+    /// `from` is at or beyond the append counter.
+    NotCommitted,
+    /// The run's bytes may have been overwritten (reader lagged more than
+    /// capacity − max_claim behind), or `from` predates a restart prime.
+    /// Fall back to journal replay.
+    Overrun,
+}
+
 pub struct LogBuffer {
     region: Region,
     capacity: u64,
@@ -124,7 +145,12 @@ impl LogBuffer {
     }
 
     #[inline]
-    fn offset(&self, pos: u64) -> usize {
+    pub(crate) fn region(&self) -> &Region {
+        &self.region
+    }
+
+    #[inline]
+    pub(crate) fn offset(&self, pos: u64) -> usize {
         (pos & self.mask) as usize
     }
 
@@ -198,6 +224,13 @@ impl LogBuffer {
         }
         let off = self.offset(pos);
         let len = self.commit_word(off).load(Ordering::Acquire) as usize;
+        if len == 0 {
+            // A zero commit word below `append` means these bytes were never
+            // written to THIS buffer file: the counters were primed past them
+            // after a restart and the frames live only in the journal
+            // (LogCounters::prime contract). Same remedy as a lap overrun.
+            return FrameRead::Overrun;
+        }
         debug_assert!(len >= 4 && align_frame_len(len) as u64 <= self.capacity - off as u64);
         out.clear();
         // SAFETY: [off, off+len) within capacity (frames never span the wrap).
@@ -214,6 +247,67 @@ impl LogBuffer {
             return FrameRead::Overrun;
         }
         FrameRead::Frame(frame::read_header(out))
+    }
+
+    /// Batch validated read for the sender (M2): copy a run of contiguous
+    /// committed whole frames starting at `from` (a frame start) into `out`.
+    /// The run never crosses the wrap; a padding frame is copied header-only
+    /// (32 B) but advances its full aligned span and ends the run. Always
+    /// returns at least one frame if one is available (a frame larger than
+    /// `max_bytes` is returned alone — the sender's MTU config assert makes
+    /// that impossible in practice). Seqlock discipline as in
+    /// `read_frame_validated`: pre/post overwrite-margin checks around the
+    /// copy with an acquire fence between.
+    pub fn read_run_validated(&self, from: u64, max_bytes: usize, out: &mut Vec<u8>) -> SliceRead {
+        let append = self.counters.append.load_acquire();
+        if from >= append {
+            return SliceRead::NotCommitted;
+        }
+        if append + self.max_claim() > from + self.capacity {
+            return SliceRead::Overrun;
+        }
+        let off = self.offset(from);
+        let hard = (append - from).min(self.capacity - off as u64);
+        out.clear();
+        let mut walked = 0u64; // stream advance
+        let mut copied = 0usize; // bytes in out
+        while walked < hard {
+            let o = off + walked as usize;
+            let len = self.commit_word(o).load(Ordering::Acquire) as usize;
+            if len == 0 {
+                break; // restart-primed tail: no bytes in this buffer
+            }
+            let aligned = align_frame_len(len) as u64;
+            if aligned == 0 || walked + aligned > hard {
+                break; // torn/overwritten length — post-check will decide
+            }
+            // SAFETY: o + 5 within capacity (aligned span checked above).
+            let ftype = unsafe { *self.region.ptr_at(o + frame::OFF_TYPE) };
+            let copy_len = if ftype == FRAME_TYPE_PADDING { HEADER_LEN } else { aligned as usize };
+            if copied > 0 && copied + copy_len > max_bytes {
+                break;
+            }
+            // SAFETY: [o, o+copy_len) within capacity; validated below.
+            out.extend_from_slice(unsafe {
+                std::slice::from_raw_parts(self.region.ptr_at(o), copy_len)
+            });
+            copied += copy_len;
+            walked += aligned;
+            if ftype == FRAME_TYPE_PADDING || copied >= max_bytes {
+                break; // padding ends at the wrap
+            }
+        }
+        // Seqlock re-check (see read_frame_validated for the fence rationale).
+        std::sync::atomic::fence(Ordering::Acquire);
+        let append_after = self.counters.append.load_acquire();
+        if append_after + self.max_claim() > from + self.capacity {
+            return SliceRead::Overrun;
+        }
+        if walked == 0 {
+            // len == 0 at a committed position: primed-over-fresh-buffer.
+            return SliceRead::Overrun;
+        }
+        SliceRead::Run(RunRead { bytes: copied, advance: walked })
     }
 }
 
@@ -458,6 +552,26 @@ mod tests {
     }
 
     #[test]
+    fn primed_fresh_buffer_reads_overrun_not_garbage() {
+        // Node restart: journal recovered to 2*CAP, buffer file recreated
+        // (all zeros). Positions below the primed point exist only in the
+        // journal — validated reads must degrade to Overrun (replay is the
+        // fallback), not parse zeroed/stale bytes.
+        let (b, c) = buf();
+        c.prime(2 * CAP);
+        let mut out = Vec::new();
+        // Both positions pass the lap-overrun margin check (>= append +
+        // max_claim - capacity = 8192 + 576 - 4096 = 4672) and previously
+        // fell through to the zero commit word.
+        assert!(matches!(b.read_frame_validated(2 * CAP - 64, &mut out), FrameRead::Overrun));
+        assert!(matches!(b.read_frame_validated(4672, &mut out), FrameRead::Overrun));
+        // Post-restart appends still read fine.
+        let mut a = Appender::new(Arc::clone(&b), 5);
+        a.append(1, 7, b"post-restart").unwrap();
+        assert!(matches!(b.read_frame_validated(2 * CAP, &mut out), FrameRead::Frame(_)));
+    }
+
+    #[test]
     fn validated_read_detects_overrun_after_wrap() {
         let (b, c) = buf();
         let mut a = Appender::new(Arc::clone(&b), 1);
@@ -475,5 +589,88 @@ mod tests {
         // a recent frame still reads fine (within capacity minus margin)
         let recent = a.position() - 96;
         assert!(matches!(b.read_frame_validated(recent, &mut out), FrameRead::Frame(_)));
+    }
+
+    #[test]
+    fn run_read_packs_whole_frames_up_to_max_bytes() {
+        let (b, _c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        for i in 0..4 {
+            a.append(1, i, &[i as u8; 64]).unwrap(); // 4 x 96 B frames
+        }
+        let mut out = Vec::new();
+        // 200-byte budget -> 2 whole frames (192)
+        match b.read_run_validated(0, 200, &mut out) {
+            SliceRead::Run(r) => {
+                assert_eq!((r.bytes, r.advance), (192, 192));
+                assert_eq!(out.len(), 192);
+                assert_eq!(read_header(&out).correlation_id, 0);
+                assert_eq!(read_header(&out[96..]).correlation_id, 1);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // continuing from the advance point picks up frame 2
+        match b.read_run_validated(192, 4096, &mut out) {
+            SliceRead::Run(r) => {
+                assert_eq!((r.bytes, r.advance), (192, 192)); // frames 2,3
+                assert_eq!(read_header(&out).correlation_id, 2);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // at least one frame even under a tiny budget
+        match b.read_run_validated(0, 8, &mut out) {
+            SliceRead::Run(r) => assert_eq!((r.bytes, r.advance), (96, 96)),
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // caught up
+        assert!(matches!(b.read_run_validated(4 * 96, 4096, &mut out), SliceRead::NotCommitted));
+    }
+
+    #[test]
+    fn run_read_padding_is_header_only_with_full_advance() {
+        let (b, c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        for i in 0..42 {
+            a.append(1, i, &[0u8; 64]).unwrap(); // fill to 4032
+        }
+        c.durable.store_release(4032);
+        a.append(1, 99, &[0u8; 64]).unwrap(); // 64 B padding at 4032, frame at 4096
+        let mut out = Vec::new();
+        // run starting at the padding: 32 bytes copied, 64 positions advanced,
+        // run ends (padding ends at the wrap)
+        match b.read_run_validated(4032, 1392, &mut out) {
+            SliceRead::Run(r) => {
+                assert_eq!((r.bytes, r.advance), (HEADER_LEN, 64));
+                assert_eq!(read_header(&out).frame_type, FRAME_TYPE_PADDING);
+                assert_eq!(read_header(&out).length, 64);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+        // and the post-wrap frame comes as its own run
+        match b.read_run_validated(4096, 1392, &mut out) {
+            SliceRead::Run(r) => {
+                assert_eq!((r.bytes, r.advance), (96, 96));
+                assert_eq!(read_header(&out).correlation_id, 99);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_read_detects_overrun_and_primed_fresh_buffer() {
+        let (b, c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut n = 0u64;
+        while a.position() < 3 * CAP {
+            a.append(1, n, &[0u8; 64]).unwrap();
+            c.durable.store_release(a.position());
+            n += 1;
+        }
+        let mut out = Vec::new();
+        assert!(matches!(b.read_run_validated(0, 1392, &mut out), SliceRead::Overrun));
+        // primed-over-fresh-buffer (Task 1 semantics, run variant)
+        let (b2, c2) = buf();
+        c2.prime(2 * CAP);
+        assert!(matches!(b2.read_run_validated(2 * CAP - 64, 1392, &mut out), SliceRead::Overrun));
     }
 }

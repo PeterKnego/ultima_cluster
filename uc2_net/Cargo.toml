@@ -1,0 +1,14 @@
+[package]
+name = "uc2_net"
+description = "UC v2 UDP replication data plane: sender/receiver agents, NAK, flow control (spec 2026-07-09, M2)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+uc_protocol = { path = "../uc_protocol" }
+uc2_log = { path = "../uc2_log" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
