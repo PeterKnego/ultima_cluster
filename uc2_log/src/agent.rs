@@ -33,12 +33,17 @@ impl IdleStrategy {
 
 pub struct AgentRunner {
     stop: Arc<AtomicBool>,
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
 }
 
 impl AgentRunner {
     /// Spawn a named agent thread looping `work()`; when `work` returns
     /// false (no work done), the idle strategy runs.
+    ///
+    /// CONTRACT: `work` is a DUTY CYCLE — it must do a bounded amount of work
+    /// per call and return `true` iff it made progress. It must never block
+    /// or loop internally waiting for input; that starves the stop flag and
+    /// turns the idle strategy into a lie.
     pub fn spawn<F>(name: &str, idle: IdleStrategy, mut work: F) -> io::Result<AgentRunner>
     where
         F: FnMut() -> bool + Send + 'static,
@@ -52,13 +57,26 @@ impl AgentRunner {
                 }
             }
         })?;
-        Ok(AgentRunner { stop, handle })
+        Ok(AgentRunner { stop, handle: Some(handle) })
     }
 
     /// Signal stop and join; propagates a panic from the work closure.
-    pub fn stop(self) {
+    /// Prefer this over `drop` in teardown paths that must observe failures.
+    pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.handle.join().expect("agent thread panicked");
+        self.handle.take().unwrap().join().expect("agent thread panicked");
+    }
+}
+
+/// Dropping without `stop()` still signals and joins (no leaked busy-spinning
+/// thread — the v1 SyncCore teardown lesson), but swallows a work-closure
+/// panic to avoid a double panic during unwind.
+impl Drop for AgentRunner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -83,5 +101,26 @@ mod tests {
         runner.stop();
         let n = count.load(Ordering::Relaxed);
         assert!(n >= 1000);
+    }
+
+    #[test]
+    fn drop_without_stop_signals_and_joins() {
+        use std::time::{Duration, Instant};
+        let count = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&count);
+        let runner = AgentRunner::spawn("drop-agent", IdleStrategy::Yield, move || {
+            c.fetch_add(1, Ordering::Relaxed);
+            true
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while count.load(Ordering::Relaxed) < 100 {
+            assert!(Instant::now() < deadline, "agent never ran");
+            std::thread::yield_now();
+        }
+        drop(runner); // must signal stop AND join — the thread is gone after this
+        let n = count.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(count.load(Ordering::Relaxed), n, "agent thread still running after drop");
     }
 }

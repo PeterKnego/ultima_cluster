@@ -43,8 +43,13 @@ impl LogCounters {
     pub fn new() -> Self {
         Self { append: PaddedAtomicU64::new(0), durable: PaddedAtomicU64::new(0) }
     }
-    /// Prime both counters after archive recovery (append resumes at durable —
+    /// Prime the counters after archive recovery (append resumes at durable —
     /// bytes beyond durable are discarded on restart, spec §6).
+    ///
+    /// CONTRACT: after priming over a FRESH (zeroed/recreated) buffer file,
+    /// positions below `pos` have no bytes in the buffer — validated reads
+    /// return `Overrun` and the journal is the only source, until a prefill
+    /// mechanism exists (spec §4 "node restart", sized in M4/M6).
     pub fn prime(&self, pos: u64) {
         self.durable.store_release(pos);
         self.append.store_release(pos);

@@ -198,6 +198,13 @@ impl LogBuffer {
         }
         let off = self.offset(pos);
         let len = self.commit_word(off).load(Ordering::Acquire) as usize;
+        if len == 0 {
+            // A zero commit word below `append` means these bytes were never
+            // written to THIS buffer file: the counters were primed past them
+            // after a restart and the frames live only in the journal
+            // (LogCounters::prime contract). Same remedy as a lap overrun.
+            return FrameRead::Overrun;
+        }
         debug_assert!(len >= 4 && align_frame_len(len) as u64 <= self.capacity - off as u64);
         out.clear();
         // SAFETY: [off, off+len) within capacity (frames never span the wrap).
@@ -455,6 +462,26 @@ mod tests {
         }
         // beyond append -> NotCommitted
         assert!(matches!(b.read_frame_validated(64, &mut out), FrameRead::NotCommitted));
+    }
+
+    #[test]
+    fn primed_fresh_buffer_reads_overrun_not_garbage() {
+        // Node restart: journal recovered to 2*CAP, buffer file recreated
+        // (all zeros). Positions below the primed point exist only in the
+        // journal — validated reads must degrade to Overrun (replay is the
+        // fallback), not parse zeroed/stale bytes.
+        let (b, c) = buf();
+        c.prime(2 * CAP);
+        let mut out = Vec::new();
+        // Both positions pass the lap-overrun margin check (>= append +
+        // max_claim - capacity = 8192 + 576 - 4096 = 4672) and previously
+        // fell through to the zero commit word.
+        assert!(matches!(b.read_frame_validated(2 * CAP - 64, &mut out), FrameRead::Overrun));
+        assert!(matches!(b.read_frame_validated(4672, &mut out), FrameRead::Overrun));
+        // Post-restart appends still read fine.
+        let mut a = Appender::new(Arc::clone(&b), 5);
+        a.append(1, 7, b"post-restart").unwrap();
+        assert!(matches!(b.read_frame_validated(2 * CAP, &mut out), FrameRead::Frame(_)));
     }
 
     #[test]
