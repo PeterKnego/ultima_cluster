@@ -2578,6 +2578,7 @@ version = "0.1.0"
 name = "uc2_log"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "loom",
  "memmap2",
  "serde",
