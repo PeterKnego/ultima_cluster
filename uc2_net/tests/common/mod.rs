@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -95,11 +96,12 @@ pub fn spawn_follower_on(
     sock.set_faults(faults);
     let buffer = buffer();
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = FollowerConfig::new(TERM, leader);
+    let mut cfg = FollowerConfig::new(leader);
     cfg.seed = faults.seed.wrapping_add(addr.port() as u64);
     cfg.status_floor_ns = 5_000_000; // 5 ms: keep flow adverts fresh under test loads
     cfg.nak = NakConfig { delay_min_ns: 100_000, delay_max_ns: 500_000, backoff_ns: 2_000_000 };
-    let mut rx = FollowerReceiver::new(Arc::clone(&buffer), sock, cfg);
+    let term = Arc::new(AtomicU32::new(TERM));
+    let mut rx = FollowerReceiver::new(Arc::clone(&buffer), sock, cfg, term);
     let stats = rx.stats();
     let rxa = AgentRunner::spawn(&format!("{name}-rx"), IdleStrategy::Yield, move || rx.do_work())
         .unwrap();
@@ -126,12 +128,14 @@ pub fn spawn_leader(raw: UdpSocket, followers: Vec<SocketAddr>, faults: FaultCon
     // Open the archive first so the sender can take its journal as the deep-NAK
     // replay source (M4) before the sender agent spawns.
     let (ara, journal) = spawn_archive("leader-ar", &buffer, dir.path());
-    let mut sender = Sender::new(Arc::clone(&buffer), send, followers, 3, rx, cfg);
+    let term = Arc::new(AtomicU32::new(TERM));
+    let mut sender =
+        Sender::new(Arc::clone(&buffer), send, followers, 3, rx, cfg, Arc::clone(&term));
     sender.set_replay_source(journal);
     let stats = sender.stats();
     let txa =
         AgentRunner::spawn("leader-tx", IdleStrategy::Yield, move || sender.do_work()).unwrap();
-    let mut lr = LeaderReceiver::new(recv, tx, TERM).unwrap();
+    let mut lr = LeaderReceiver::new(recv, tx, term).unwrap();
     let lr_stats = lr.stats(); // capture before the receiver moves into its agent
     let lra =
         AgentRunner::spawn("leader-ctrl", IdleStrategy::Yield, move || lr.do_work()).unwrap();

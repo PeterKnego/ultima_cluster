@@ -18,7 +18,7 @@
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -26,15 +26,84 @@ use uc2_log::buffer::LogBuffer;
 use uc2_log::writer::PositionedWriter;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA,
-    DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_STATUS, DatagramHeader, NAK_BODY_LEN, NakBody,
-    STATUS_BODY_LEN, StatusBody, read_datagram_header, read_nak_body, read_status_body,
-    write_datagram_header, write_nak_body, write_status_body,
+    DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_STATUS,
+    DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN,
+    NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody, STATUS_BODY_LEN, StatusBody, TermMapEntryWire,
+    VOTE_BODY_LEN, VoteBody, read_datagram_header, read_nak_body, read_request_vote_body,
+    read_status_body, read_term_map_body, read_vote_body, write_datagram_header, write_nak_body,
+    write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
 
+use crate::TermHandle;
 use crate::fault::FaultSocket;
 use crate::rebuild::{NakConfig, NakTimer, Rebuilt};
 use crate::sender::CtrlMsg;
+
+/// Consensus-plane events demuxed off the shared UDP socket and routed to the
+/// consensus agent (Task 8) when a receiver is in NODE MODE
+/// (`set_consensus_route`). Kinds 5–9 forward RAW — carrying their own term so
+/// the state machine, not the data plane, does term filtering and adoption
+/// (a higher-term `RequestVote` MUST reach the SM). `LeaderActivity` is the
+/// data plane's rate-limited liveness signal: current-term DATA/HEARTBEAT was
+/// seen this duty cycle, so the SM should not time out the leader.
+#[derive(Debug, Clone)]
+pub enum NetEvent {
+    Report { from: SocketAddr, term: u32, durable: u64 },
+    CommitGossip { term: u32, commit: u64 },
+    RequestVote { from: SocketAddr, body: RequestVoteBody },
+    Vote { from: SocketAddr, body: VoteBody },
+    TermMap { term: u32, entries: Vec<TermMapEntryWire> },
+    /// Any current-term leader traffic (data/heartbeat) seen — liveness.
+    LeaderActivity { term: u32 },
+}
+
+/// Parse a consensus-plane datagram (kinds 5–9) into a [`NetEvent`], RAW — no
+/// term filter (the SM adopts higher terms). `from` is the datagram's source
+/// address (Report/RequestVote/Vote address their reply by it). Returns `None`
+/// for a malformed body (too short, or a term-map that fails its own checks);
+/// the caller drops it. Non-consensus kinds return `None` (never reached — the
+/// callers pre-match the kind).
+fn consensus_event(h: &DatagramHeader, d: &[u8], from: SocketAddr) -> Option<NetEvent> {
+    let body = &d[DATAGRAM_HEADER_LEN..];
+    match h.kind {
+        DGRAM_KIND_APPEND_POSITION => {
+            Some(NetEvent::Report { from, term: h.leadership_term_id, durable: h.position })
+        }
+        DGRAM_KIND_COMMIT_POSITION => {
+            Some(NetEvent::CommitGossip { term: h.leadership_term_id, commit: h.position })
+        }
+        DGRAM_KIND_REQUEST_VOTE if body.len() >= REQUEST_VOTE_BODY_LEN => {
+            Some(NetEvent::RequestVote { from, body: read_request_vote_body(body) })
+        }
+        DGRAM_KIND_VOTE if body.len() >= VOTE_BODY_LEN => {
+            Some(NetEvent::Vote { from, body: read_vote_body(body) })
+        }
+        DGRAM_KIND_TERM_MAP => {
+            let mut out = [TermMapEntryWire { term: 0, base: 0 }; MAX_TERM_MAP_WIRE_ENTRIES];
+            let count = read_term_map_body(body, &mut out)?;
+            Some(NetEvent::TermMap {
+                term: h.leadership_term_id,
+                entries: out[..count].to_vec(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// True iff `kind` is a consensus-plane datagram (kinds 5–9) — routed RAW to
+/// the consensus agent in node mode, bypassing the data-plane term filter.
+#[inline]
+fn is_consensus_kind(kind: u8) -> bool {
+    matches!(
+        kind,
+        DGRAM_KIND_APPEND_POSITION
+            | DGRAM_KIND_COMMIT_POSITION
+            | DGRAM_KIND_REQUEST_VOTE
+            | DGRAM_KIND_VOTE
+            | DGRAM_KIND_TERM_MAP
+    )
+}
 
 /// Walk the frames of a DATA payload: total stream advance, or None if
 /// malformed (torn frame, zero length, padding not last / not header-only).
@@ -65,7 +134,6 @@ pub(crate) fn walk_advance(body: &[u8]) -> Option<u64> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct FollowerConfig {
-    pub term_id: u32,
     pub leader: SocketAddr,
     pub seed: u64,
     pub nak: NakConfig,
@@ -81,9 +149,10 @@ pub struct FollowerConfig {
 }
 
 impl FollowerConfig {
-    pub fn new(term_id: u32, leader: SocketAddr) -> Self {
+    /// The term is no longer part of the config — it is a live [`TermHandle`]
+    /// passed to [`FollowerReceiver::new`] (the consensus agent bumps it).
+    pub fn new(leader: SocketAddr) -> Self {
         Self {
-            term_id,
             leader,
             seed: 1,
             nak: NakConfig::default(),
@@ -103,6 +172,9 @@ pub struct FollowerStats {
     pub dropped_dup: AtomicU64,
     pub dropped_overrun: AtomicU64,
     pub dropped_malformed: AtomicU64,
+    /// DATA dropped because the intake gate was CLOSED (M4 reconciliation
+    /// window — the consensus agent holds it shut; see `set_intake_gate`).
+    pub dropped_gated: AtomicU64,
     pub naks_sent: AtomicU64,
     pub statuses_sent: AtomicU64,
     pub append_positions_sent: AtomicU64,
@@ -129,10 +201,29 @@ pub struct FollowerReceiver {
     commit_seen: u64,
     recv_buf: Vec<u8>,
     stats: Arc<FollowerStats>,
+    /// Live leadership term (M4). The consensus agent (Task 8) is the sole
+    /// writer; the data path only loads it (`Relaxed`) to term-filter DATA/
+    /// HEARTBEAT and to stamp its own NAK/STATUS/AppendPosition datagrams.
+    term: TermHandle,
+    /// Node mode (M4): when set, kinds 5–9 are forwarded RAW to the consensus
+    /// agent (bypassing the term filter) and the local COMMIT_POSITION store is
+    /// disabled — the consensus agent owns the commit counter (single writer).
+    /// `None` = legacy M3 behavior byte-for-byte.
+    route: Option<mpsc::SyncSender<NetEvent>>,
+    /// Intake gate (M4). `false` closes the DATA arm and suppresses
+    /// AppendPosition entirely; see [`set_intake_gate`](Self::set_intake_gate).
+    gate: Option<Arc<AtomicBool>>,
+    /// Per-duty-cycle latch: emit at most one `LeaderActivity` per `do_work`.
+    activity_emitted: bool,
 }
 
 impl FollowerReceiver {
-    pub fn new(buffer: Arc<LogBuffer>, sock: FaultSocket, cfg: FollowerConfig) -> Self {
+    pub fn new(
+        buffer: Arc<LogBuffer>,
+        sock: FaultSocket,
+        cfg: FollowerConfig,
+        term: TermHandle,
+    ) -> Self {
         let start = buffer.counters().append.load_acquire();
         let status_bytes =
             if cfg.status_bytes == 0 { buffer.capacity() / 4 } else { cfg.status_bytes };
@@ -154,11 +245,63 @@ impl FollowerReceiver {
             commit_seen: 0,
             recv_buf: vec![0u8; 65_536],
             stats: Arc::new(FollowerStats::default()),
+            term,
+            route: None,
+            gate: None,
+            activity_emitted: false,
         }
     }
 
     pub fn stats(&self) -> Arc<FollowerStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Put the receiver in NODE MODE (M4): consensus datagrams (kinds 5–9) are
+    /// forwarded RAW to `tx` (no term filter — the SM adopts higher terms), and
+    /// the local COMMIT_POSITION counter store is DISABLED (the consensus agent
+    /// becomes the commit counter's single writer). DATA/HEARTBEAT still drive
+    /// the data plane and additionally emit a rate-limited [`NetEvent::
+    /// LeaderActivity`]. Without this call the receiver is byte-for-byte M3.
+    /// `tx` should be sized by Task 8; a full channel drops (votes re-fire on
+    /// the election timeout, gossip/reports re-send on their floors).
+    pub fn set_consensus_route(&mut self, tx: mpsc::SyncSender<NetEvent>) {
+        self.route = Some(tx);
+    }
+
+    /// Install the intake gate (M4). When the gate reads `false` the DATA arm
+    /// drops (counted `dropped_gated`) and AppendPosition emission is suppressed
+    /// ENTIRELY — the single mechanism that implements the sim's
+    /// [`uc2_sim::world::DataPlane::Gated`] contract's ambiguous-window half:
+    /// the consensus agent closes the gate on adopting a new term and reopens it
+    /// only after reconciliation (`TermMapReceived` + any truncation), so no
+    /// divergent-prefix extension is accepted and no raw durable escapes toward
+    /// commit ranking while the follower's tail is unconfirmed. Default (no gate
+    /// / gate `true`) = current behavior.
+    pub fn set_intake_gate(&mut self, gate: Arc<AtomicBool>) {
+        self.gate = Some(gate);
+    }
+
+    #[inline]
+    fn gate_open(&self) -> bool {
+        self.gate.as_ref().is_none_or(|g| g.load(Ordering::Relaxed))
+    }
+
+    /// Emit one `LeaderActivity` per duty cycle (node mode only). A closed or
+    /// full route is fine — the latch still trips so we never spam the channel.
+    fn note_leader_activity(&mut self, term: u32) {
+        if self.activity_emitted {
+            return;
+        }
+        let emitted = match &self.route {
+            Some(route) => {
+                let _ = route.try_send(NetEvent::LeaderActivity { term });
+                true
+            }
+            None => false,
+        };
+        if emitted {
+            self.activity_emitted = true;
+        }
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -172,6 +315,7 @@ impl FollowerReceiver {
     /// One duty cycle: drain up to 64 datagrams, then NAK/status upkeep.
     pub fn do_work(&mut self) -> bool {
         let mut did = false;
+        self.activity_emitted = false; // one LeaderActivity per cycle (node mode)
         for _ in 0..64 {
             let mut buf = std::mem::take(&mut self.recv_buf);
             let r = self.sock.recv_from(&mut buf);
@@ -179,8 +323,8 @@ impl FollowerReceiver {
                 Ok(Some((n, from))) => Some((n, from)),
                 _ => None,
             };
-            if let Some((n, _from)) = got {
-                self.on_datagram(&buf[..n]);
+            if let Some((n, from)) = got {
+                self.on_datagram(&buf[..n], from);
                 did = true;
             }
             self.recv_buf = buf;
@@ -192,20 +336,42 @@ impl FollowerReceiver {
         did
     }
 
-    fn on_datagram(&mut self, d: &[u8]) {
+    fn on_datagram(&mut self, d: &[u8], from: SocketAddr) {
         use Ordering::Relaxed;
         if d.len() < DATAGRAM_HEADER_LEN {
             self.stats.dropped_malformed.fetch_add(1, Relaxed);
             return;
         }
         let h = read_datagram_header(d);
-        if h.leadership_term_id != self.cfg.term_id {
+        // Node mode: consensus kinds (5–9) are forwarded RAW to the consensus
+        // agent — no data-plane term filter, since a higher-term RequestVote
+        // MUST reach the SM. This also disables the local COMMIT_POSITION store
+        // (kind 6 routes as CommitGossip; the consensus agent owns the counter).
+        if self.route.is_some() && is_consensus_kind(h.kind) {
+            if let Some(ev) = consensus_event(&h, d, from)
+                && let Some(route) = &self.route
+            {
+                let _ = route.try_send(ev);
+            }
+            return;
+        }
+        let term = self.term.load(Relaxed);
+        if h.leadership_term_id != term {
             self.stats.dropped_stale_term.fetch_add(1, Relaxed);
             return;
         }
         self.stats.datagrams.fetch_add(1, Relaxed);
         match h.kind {
             DGRAM_KIND_DATA => {
+                // Intake gate (M4): during the ambiguous term-adoption window
+                // the consensus agent holds the gate CLOSED so no
+                // divergent-prefix extension is accepted. Still count the
+                // leader's liveness (this is current-term traffic).
+                if !self.gate_open() {
+                    self.stats.dropped_gated.fetch_add(1, Relaxed);
+                    self.note_leader_activity(h.leadership_term_id);
+                    return;
+                }
                 let body = &d[DATAGRAM_HEADER_LEN..];
                 let contiguous = self.rebuilt.contiguous();
                 // Accept rule: never rewrite at-or-below the frontier —
@@ -262,11 +428,16 @@ impl FollowerReceiver {
                 if self.rebuilt.insert(h.position, h.position + advance) {
                     self.buffer.counters().append.store_release(self.rebuilt.contiguous());
                 }
+                self.note_leader_activity(h.leadership_term_id);
             }
             DGRAM_KIND_HEARTBEAT => {
                 self.leader_append = self.leader_append.max(h.position);
+                self.note_leader_activity(h.leadership_term_id);
             }
             DGRAM_KIND_COMMIT_POSITION => {
+                // Legacy mode ONLY: in node mode kind 6 is routed above as
+                // CommitGossip and never reaches here (the consensus agent owns
+                // the commit counter). Keep the local monotonic store for M3.
                 // Monotonic max: UDP-reordered gossip never regresses. The
                 // stored value is the CLUSTER commit; M5's apply agent clamps
                 // to min(commit, local contiguous durable) at consumption
@@ -285,6 +456,7 @@ impl FollowerReceiver {
         use Ordering::Relaxed;
         let mut did = false;
         let now = self.now_ns();
+        let term = self.term.load(Relaxed); // stamps our NAK/STATUS/AppendPosition
         let contiguous = self.rebuilt.contiguous();
 
         // Gap = missing bytes before out-of-order data, else missing tail
@@ -312,7 +484,7 @@ impl FollowerReceiver {
                 &mut d,
                 &DatagramHeader {
                     position: 0,
-                    leadership_term_id: self.cfg.term_id,
+                    leadership_term_id: term,
                     kind: DGRAM_KIND_NAK,
                     flags: 0,
                 },
@@ -328,14 +500,21 @@ impl FollowerReceiver {
 
         // AppendPosition (spec §6): report our durable on advance (block/
         // fsync granularity, ~kHz) or on the floor. Feeds the leader's
-        // quorum commit ranking.
-        if durable > self.ap_reported || now - self.last_ap_ns >= self.cfg.append_pos_floor_ns {
+        // quorum commit ranking. SUPPRESSED ENTIRELY while the intake gate is
+        // closed (M4): during term adoption our raw durable may cover a
+        // divergent, unconfirmed tail — letting it escape toward commit ranking
+        // is exactly the phantom-commit source the Gated contract forbids. The
+        // ap_reported/last_ap_ns cursors are left untouched, so the first
+        // AppendPosition after the gate reopens fires immediately.
+        if self.gate_open()
+            && (durable > self.ap_reported || now - self.last_ap_ns >= self.cfg.append_pos_floor_ns)
+        {
             let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
             write_datagram_header(
                 &mut d,
                 &DatagramHeader {
                     position: durable,
-                    leadership_term_id: self.cfg.term_id,
+                    leadership_term_id: term,
                     kind: DGRAM_KIND_APPEND_POSITION,
                     flags: 0,
                 },
@@ -360,7 +539,7 @@ impl FollowerReceiver {
                 &mut d,
                 &DatagramHeader {
                     position: 0,
-                    leadership_term_id: self.cfg.term_id,
+                    leadership_term_id: term,
                     kind: DGRAM_KIND_STATUS,
                     flags: 0,
                 },
@@ -391,34 +570,50 @@ pub struct LeaderStats {
 }
 
 /// The leader-side inbound demux: NAK/status/AppendPosition → the sender's
-/// channel. All control is term-checked (static term in M3; stale terms are
-/// dropped and counted). Vote kinds (7-8) arrive in M4 with their own route.
+/// channel. NAK/status are term-checked data-plane control (stale terms are
+/// dropped and counted). In NODE MODE (`set_consensus_route`) the consensus
+/// kinds 5–9 are forwarded RAW to the consensus agent instead — including
+/// AppendPosition, which becomes a [`NetEvent::Report`] (the consensus agent,
+/// not the sender's tracker, does commit ranking in M4).
 pub struct LeaderReceiver {
     sock: UdpSocket,
     to_sender: mpsc::SyncSender<CtrlMsg>,
-    term_id: u32,
+    term: TermHandle,
     recv_buf: Vec<u8>,
     stats: Arc<LeaderStats>,
+    /// Node mode (M4): kinds 5–9 forwarded RAW to the consensus agent (no term
+    /// filter). `None` = legacy M3 (AppendPosition → sender tracker).
+    route: Option<mpsc::SyncSender<NetEvent>>,
 }
 
 impl LeaderReceiver {
     pub fn new(
         sock: UdpSocket,
         to_sender: mpsc::SyncSender<CtrlMsg>,
-        term_id: u32,
+        term: TermHandle,
     ) -> io::Result<Self> {
         sock.set_nonblocking(true)?;
         Ok(Self {
             sock,
             to_sender,
-            term_id,
+            term,
             recv_buf: vec![0u8; 2048],
             stats: Arc::new(LeaderStats::default()),
+            route: None,
         })
     }
 
     pub fn stats(&self) -> Arc<LeaderStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Put the receiver in NODE MODE (M4): kinds 5–9 (AppendPosition,
+    /// CommitGossip, RequestVote, Vote, TermMap) are forwarded RAW to `tx` —
+    /// no term filter, since the SM adopts higher terms. NAK/STATUS still go to
+    /// the sender's channel (flow control is data-plane). Without this call the
+    /// receiver is byte-for-byte M3.
+    pub fn set_consensus_route(&mut self, tx: mpsc::SyncSender<NetEvent>) {
+        self.route = Some(tx);
     }
 
     pub fn do_work(&mut self) -> bool {
@@ -441,7 +636,16 @@ impl LeaderReceiver {
                 continue;
             }
             let h = read_datagram_header(&self.recv_buf);
-            if h.leadership_term_id != self.term_id {
+            // Node mode: consensus kinds (5–9) forwarded RAW (no term filter).
+            if self.route.is_some() && is_consensus_kind(h.kind) {
+                if let Some(ev) = consensus_event(&h, &self.recv_buf[..n], from)
+                    && let Some(route) = &self.route
+                {
+                    let _ = route.try_send(ev);
+                }
+                continue;
+            }
+            if h.leadership_term_id != self.term.load(Relaxed) {
                 self.stats.dropped_stale_term.fetch_add(1, Relaxed);
                 continue;
             }
@@ -495,6 +699,10 @@ mod tests {
     fn buffer() -> Arc<LogBuffer> {
         let counters = Arc::new(LogCounters::new());
         Arc::new(LogBuffer::new(Region::heap_zeroed(1 << 16), counters, 256))
+    }
+
+    fn term_handle(t: u32) -> TermHandle {
+        Arc::new(std::sync::atomic::AtomicU32::new(t))
     }
 
     /// A fake leader endpoint: a raw socket we send DATA from and receive
@@ -553,11 +761,16 @@ mod tests {
     }
 
     fn follower(b: &Arc<LogBuffer>, leader: SocketAddr) -> FollowerReceiver {
-        let mut cfg = FollowerConfig::new(TERM, leader);
+        let mut cfg = FollowerConfig::new(leader);
         cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
         cfg.status_floor_ns = u64::MAX; // no time-driven status in unit tests
         cfg.append_pos_floor_ns = u64::MAX; // advance-driven AppendPosition only
-        FollowerReceiver::new(Arc::clone(b), FaultSocket::bind("127.0.0.1:0").unwrap(), cfg)
+        FollowerReceiver::new(
+            Arc::clone(b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            cfg,
+            term_handle(TERM),
+        )
     }
 
     fn drive_until<F: Fn() -> bool>(r: &mut FollowerReceiver, pred: F) {
@@ -670,13 +883,14 @@ mod tests {
     fn status_advertises_contiguous_and_window() {
         let b = buffer();
         let mut leader = FakeLeader::new();
-        let mut cfg = FollowerConfig::new(TERM, leader.addr());
+        let mut cfg = FollowerConfig::new(leader.addr());
         cfg.status_bytes = 96; // status on every frame's worth of progress
         cfg.status_floor_ns = u64::MAX;
         let mut r = FollowerReceiver::new(
             Arc::clone(&b),
             FaultSocket::bind("127.0.0.1:0").unwrap(),
             cfg,
+            term_handle(TERM),
         );
         let to = r.local_addr();
         let runs = frame_runs(&[&[7u8; 64]], 4096);
@@ -783,7 +997,7 @@ mod tests {
         // Follower on its own dedicated small buffer.
         let fb = small();
         let mut leader_ep = FakeLeader::new();
-        let mut cfg = FollowerConfig::new(TERM, leader_ep.addr());
+        let mut cfg = FollowerConfig::new(leader_ep.addr());
         cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
         cfg.status_floor_ns = u64::MAX;
         cfg.status_bytes = 96; // a status per frame's worth of progress
@@ -791,6 +1005,7 @@ mod tests {
             Arc::clone(&fb),
             FaultSocket::bind("127.0.0.1:0").unwrap(),
             cfg,
+            term_handle(TERM),
         );
         let to = r.local_addr();
 
@@ -970,7 +1185,7 @@ mod tests {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
         let (tx, rx) = mpsc::sync_channel(16);
-        let mut lr = LeaderReceiver::new(sock, tx, TERM).unwrap();
+        let mut lr = LeaderReceiver::new(sock, tx, term_handle(TERM)).unwrap();
         let mut f = FakeLeader::new(); // reuse as a fake follower endpoint
         let mut nb = [0u8; NAK_BODY_LEN];
         write_nak_body(&mut nb, &uc_protocol::v2::datagram::NakBody { position: 96, length: 192 });
@@ -999,7 +1214,7 @@ mod tests {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
         let (tx, rx) = mpsc::sync_channel(16);
-        let mut lr = LeaderReceiver::new(sock, tx, TERM).unwrap();
+        let mut lr = LeaderReceiver::new(sock, tx, term_handle(TERM)).unwrap();
         let lr_stats = lr.stats(); // capture the handle before any move
         let mut f = FakeLeader::new(); // reuse as a fake follower endpoint
         f.send(addr, DGRAM_KIND_APPEND_POSITION, 4096, TERM, &[]);
@@ -1022,5 +1237,182 @@ mod tests {
             lr.do_work();
         }
         assert!(rx.try_recv().is_err(), "stale-term control reached the sender");
+    }
+
+    // ----------------------------------------------------------- M4 (Task 7)
+
+    use std::sync::atomic::AtomicBool;
+    use uc_protocol::v2::datagram::{
+        write_request_vote_body, DGRAM_KIND_REQUEST_VOTE, NakBody, REQUEST_VOTE_BODY_LEN,
+        RequestVoteBody,
+    };
+
+    /// A live term bump takes effect on the next datagram: DATA at the OLD term
+    /// is dropped `dropped_stale_term` once the handle has moved forward.
+    #[test]
+    fn term_bump_drops_old_term_data() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let handle = term_handle(TERM);
+        let mut cfg = FollowerConfig::new(leader.addr());
+        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.status_floor_ns = u64::MAX;
+        cfg.append_pos_floor_ns = u64::MAX;
+        let mut r = FollowerReceiver::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            cfg,
+            Arc::clone(&handle),
+        );
+        let to = r.local_addr();
+        let runs = frame_runs(&[&[1u8; 64], &[2u8; 64]], 96); // one frame per run
+        // term TERM accepted while the handle reads TERM
+        leader.send(to, DGRAM_KIND_DATA, runs[0].0, TERM, &runs[0].1);
+        drive_until(&mut r, || b.counters().append.load_acquire() == runs[0].2);
+        // consensus agent bumps the term; the same-term stream is now stale
+        handle.store(TERM + 1, Relaxed);
+        leader.send(to, DGRAM_KIND_DATA, runs[1].0, TERM, &runs[1].1);
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_stale_term.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "old-term DATA never dropped after bump");
+            r.do_work();
+        }
+        assert_eq!(b.counters().append.load_acquire(), runs[0].2, "stale DATA advanced the log");
+    }
+
+    /// Node mode: a HIGHER-term RequestVote (kind 7) reaches the consensus route
+    /// RAW (not dropped by the data-plane term filter), and COMMIT_POSITION is
+    /// routed as `CommitGossip` instead of being stored in the local counter.
+    #[test]
+    fn node_mode_routes_consensus_raw_and_disables_commit_store() {
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let (tx, rx) = mpsc::sync_channel::<NetEvent>(16);
+        r.set_consensus_route(tx);
+        let to = r.local_addr();
+
+        // higher-term RequestVote must NOT be term-filtered
+        let mut rvb = vec![0u8; REQUEST_VOTE_BODY_LEN];
+        write_request_vote_body(
+            &mut rvb,
+            &RequestVoteBody { new_term: TERM + 5, last_term: TERM, last_durable: 320 },
+        );
+        leader.send(to, DGRAM_KIND_REQUEST_VOTE, 0, TERM + 5, &rvb);
+        // commit gossip at the current term
+        leader.send(to, DGRAM_KIND_COMMIT_POSITION, 4096, TERM, &[]);
+
+        let mut saw_vote = false;
+        let mut saw_gossip = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(saw_vote && saw_gossip) {
+            assert!(Instant::now() < deadline, "consensus events never routed");
+            r.do_work();
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    NetEvent::RequestVote { body, .. } => {
+                        assert_eq!(body.new_term, TERM + 5);
+                        saw_vote = true;
+                    }
+                    NetEvent::CommitGossip { term, commit } => {
+                        assert_eq!((term, commit), (TERM, 4096));
+                        saw_gossip = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // the local commit counter is NOT written in node mode
+        assert_eq!(b.counters().commit.load_acquire(), 0, "node mode still stored commit locally");
+    }
+
+    /// The intake gate CLOSED drops DATA (`dropped_gated`) and suppresses
+    /// AppendPosition ENTIRELY; reopening it resumes both.
+    #[test]
+    fn intake_gate_closed_drops_data_and_suppresses_append_position() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let handle = term_handle(TERM);
+        let mut cfg = FollowerConfig::new(leader.addr());
+        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.status_floor_ns = u64::MAX;
+        cfg.append_pos_floor_ns = u64::MAX; // advance-driven AppendPosition only
+        let mut r = FollowerReceiver::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            cfg,
+            handle,
+        );
+        let gate = Arc::new(AtomicBool::new(false)); // CLOSED
+        r.set_intake_gate(Arc::clone(&gate));
+        let to = r.local_addr();
+        let runs = frame_runs(&[&[1u8; 64]], 4096);
+
+        // gate closed: DATA dropped, frontier unmoved
+        b.counters().durable.store_release(960); // a durable advance to report
+        leader.send(to, DGRAM_KIND_DATA, runs[0].0, TERM, &runs[0].1);
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_gated.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "gated DATA never counted");
+            r.do_work();
+        }
+        for _ in 0..50 {
+            r.do_work();
+        }
+        assert_eq!(b.counters().append.load_acquire(), 0, "gated DATA advanced the log");
+        assert_eq!(
+            st.append_positions_sent.load(Relaxed),
+            0,
+            "AppendPosition escaped while the gate was closed"
+        );
+
+        // reopen: DATA accepted AND AppendPosition now flows
+        gate.store(true, Relaxed);
+        leader.send(to, DGRAM_KIND_DATA, runs[0].0, TERM, &runs[0].1);
+        drive_until(&mut r, || b.counters().append.load_acquire() == runs[0].2);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.append_positions_sent.load(Relaxed) == 0 {
+            assert!(Instant::now() < deadline, "AppendPosition never resumed after reopen");
+            r.do_work();
+        }
+    }
+
+    /// Leader-side node mode: AppendPosition (kind 5) routes to consensus as a
+    /// `Report` (raw), while NAK still reaches the sender's channel.
+    #[test]
+    fn leader_receiver_node_mode_routes_append_position_as_report() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        let (tx_sender, rx_sender) = mpsc::sync_channel::<CtrlMsg>(16);
+        let (tx_cons, rx_cons) = mpsc::sync_channel::<NetEvent>(16);
+        let mut lr = LeaderReceiver::new(sock, tx_sender, term_handle(TERM)).unwrap();
+        lr.set_consensus_route(tx_cons);
+        let mut f = FakeLeader::new(); // fake follower endpoint
+        // AppendPosition -> consensus Report (even at a higher term: raw)
+        f.send(addr, DGRAM_KIND_APPEND_POSITION, 2048, TERM + 3, &[]);
+        // NAK -> sender channel (data-plane control)
+        let mut nb = [0u8; NAK_BODY_LEN];
+        write_nak_body(&mut nb, &NakBody { position: 96, length: 192 });
+        f.send(addr, DGRAM_KIND_NAK, 0, TERM, &nb);
+
+        let mut report = None;
+        let mut nak = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while report.is_none() || nak.is_none() {
+            assert!(Instant::now() < deadline, "leader node-mode demux stuck");
+            lr.do_work();
+            if let Ok(ev) = rx_cons.try_recv() {
+                report = Some(ev);
+            }
+            if let Ok(m) = rx_sender.try_recv() {
+                nak = Some(m);
+            }
+        }
+        assert!(matches!(report, Some(NetEvent::Report { term, durable: 2048, .. }) if term == TERM + 3));
+        assert!(matches!(nak, Some(CtrlMsg::Nak { position: 96, length: 192, .. })));
     }
 }

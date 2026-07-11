@@ -62,6 +62,17 @@ pub struct Archive {
     cfg: ArchiveConfig,
     durable_pos: u64,
     next_block_seq: u64,
+    /// The leadership term of the last non-padding frame observed by `do_work`'s
+    /// header walk (M4, spec §6). A frame whose term differs from this is a
+    /// term transition — recorded into `term_observations` as
+    /// `(term, that frame's base position)`. Reset to 0 by `truncate_to` (see
+    /// there): re-observing an already-known term downstream is harmless (the
+    /// SM's `DataTermObserved` handler is idempotent for `term <= last`).
+    last_observed_term: u32,
+    /// Term transitions detected post-fsync, position-ordered by construction
+    /// (blocks record the contiguous prefix in order). Drained by
+    /// `take_term_observations`.
+    term_observations: Vec<(u32, u64)>,
 }
 
 impl Archive {
@@ -84,7 +95,14 @@ impl Archive {
                 (meta + payload.len() as u64, last + 1)
             }
         };
-        Ok(Self { journal, cfg, durable_pos, next_block_seq })
+        Ok(Self {
+            journal,
+            cfg,
+            durable_pos,
+            next_block_seq,
+            last_observed_term: 0,
+            term_observations: Vec::new(),
+        })
     }
 
     /// Where the log resumes after recovery (counters.prime(this)).
@@ -118,6 +136,7 @@ impl Archive {
         if slice.is_empty() {
             return Ok(false);
         }
+        let base = self.durable_pos;
         let notifier = self.journal.append(self.next_block_seq, self.durable_pos, slice)?;
         let len = slice.len() as u64;
         // If wait() errors here, next_block_seq is left unadvanced, so a
@@ -125,10 +144,51 @@ impl Archive {
         // mode fsync failure poisons the journal fail-stop; the archive is
         // not retryable across it.
         notifier.wait()?;
+        // Post-fsync term observation (M4): walk the (now durable) block's frame
+        // headers for leadership-term transitions. Cheap — headers only, no
+        // payload touch. `slice` is the contiguous prefix in stream order, so
+        // the pushed observations are position-ordered by construction.
+        self.observe_terms(slice, base);
         self.durable_pos += len;
         self.next_block_seq += 1;
         buffer.counters().durable.store_release(self.durable_pos);
         Ok(true)
+    }
+
+    /// Walk `block`'s frame headers (payload of the record whose base stream
+    /// position is `base`), recording each leadership-term transition into
+    /// `term_observations` as `(term, base position of the transition's first
+    /// frame)`. PADDING frames are skipped (a wrap padding carries a stale term
+    /// stamp and is not a real term boundary). Header-only, so it never reads
+    /// payload bytes.
+    fn observe_terms(&mut self, block: &[u8], base: u64) {
+        let mut off = 0usize;
+        while off + HEADER_LEN <= block.len() {
+            let h = frame::read_header(&block[off..]);
+            let aligned = frame::align_frame_len(h.length as usize);
+            // Defense in depth: a sub-header or zero length would stall the walk
+            // (archived blocks are frame-aligned + CRC-validated, so unreachable
+            // on real input). Stop rather than spin/over-index.
+            if (h.length as usize) < HEADER_LEN || off + aligned > block.len() {
+                break;
+            }
+            if h.frame_type != FRAME_TYPE_PADDING
+                && h.leadership_term_id != self.last_observed_term
+            {
+                self.term_observations.push((h.leadership_term_id, base + off as u64));
+                self.last_observed_term = h.leadership_term_id;
+            }
+            off += aligned;
+        }
+    }
+
+    /// Drain the term transitions detected since the last call (M4). Each entry
+    /// is `(term, base position of that term's first frame in the recorded
+    /// stream)` — the NewTerm frame's position for an election-opened term.
+    /// Position-ordered. The consensus agent (Task 8) feeds these to the SM as
+    /// `DataTermObserved`, which is idempotent for already-known terms.
+    pub fn take_term_observations(&mut self) -> Vec<(u32, u64)> {
+        std::mem::take(&mut self.term_observations)
     }
 
     /// Truncate the archived stream to end exactly at `pos` (spec §4, election
@@ -206,6 +266,14 @@ impl Archive {
             self.next_block_seq = lo + 1;
         }
         self.durable_pos = pos;
+        // The recorded stream changed under us: reset the term-observation
+        // cursor (M4). Simplest correct choice — drop any pending observations
+        // and re-stamp terms as the truncated tail is re-recorded. Re-observing
+        // an already-known term is harmless (the SM's `DataTermObserved` handler
+        // is idempotent for `term <= last`); walking the map back to the exact
+        // covering term is the caller's job if it ever needs it.
+        self.last_observed_term = 0;
+        self.term_observations.clear();
         Ok(())
     }
 }
@@ -598,5 +666,101 @@ mod tests {
             Err(ArchiveError::UnsupportedTruncation { pos: 0 })
         ));
         assert_eq!(arch.recovered_position(), 192);
+    }
+
+    // ----------------------------------------------- M4 term observation (T7)
+
+    use uc_protocol::v2::frame::{write_header_except_length, FrameHeader, FRAME_TYPE_MESSAGE};
+
+    /// A recorded block spanning a term change yields the transition at the
+    /// EXACT base of the new term's first frame; draining empties the buffer.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn term_observations_capture_transitions_with_exact_base() {
+        let (b, _c, dir) = setup(1 << 16);
+        let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
+        // term 1 frames at 0, 96; term 2 frames at 192, 288 (one block, 384 B)
+        let mut a1 = Appender::new(Arc::clone(&b), 1);
+        a1.append(1, 0, &[0u8; 64]).unwrap();
+        a1.append(1, 1, &[0u8; 64]).unwrap();
+        let mut a2 = Appender::new(Arc::clone(&b), 2);
+        a2.append(1, 2, &[0u8; 64]).unwrap();
+        a2.append(1, 3, &[0u8; 64]).unwrap();
+        assert!(arch.do_work(&b).unwrap());
+        assert_eq!(arch.take_term_observations(), vec![(1, 0), (2, 192)]);
+        // draining consumed them
+        assert!(arch.take_term_observations().is_empty());
+    }
+
+    /// Truncation resets the observation cursor; re-recording the still-in-ring
+    /// tail re-yields its term (idempotent downstream).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn truncate_resets_and_reobserves_terms() {
+        let (b, _c, dir) = setup(1 << 16);
+        let cfg = ArchiveConfig { max_block_bytes: 200, ..test_cfg(dir.path()) };
+        let mut arch = Archive::open(cfg).unwrap();
+        // block 0 = term 1 (frames 0, 96); block 1 = term 2 (frames 192, 288)
+        let mut a1 = Appender::new(Arc::clone(&b), 1);
+        for i in 0..2 {
+            a1.append(1, i, &[0u8; 64]).unwrap();
+        }
+        let mut a2 = Appender::new(Arc::clone(&b), 2);
+        for i in 2..4 {
+            a2.append(1, i, &[0u8; 64]).unwrap();
+        }
+        while arch.do_work(&b).unwrap() {}
+        assert_eq!(arch.take_term_observations(), vec![(1, 0), (2, 192)]);
+        // drop block 1 (term 2); the reset clears the cursor + pending buffer
+        arch.truncate_to(192).unwrap();
+        assert!(arch.take_term_observations().is_empty());
+        // term 2's frames are still in the ring [192, 384): re-recording them
+        // re-yields (2, 192) because last_observed_term was reset to 0
+        assert!(arch.do_work(&b).unwrap());
+        assert_eq!(arch.take_term_observations(), vec![(2, 192)]);
+    }
+
+    /// A padding-only span yields no observation (padding carries a stale term
+    /// stamp and is not a real term boundary); a following message frame at the
+    /// same term still transitions from the initial 0.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn observe_terms_skips_padding_only_spans() {
+        let (_b, _c, dir) = setup(1 << 16);
+        let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
+
+        // header-only padding frame (32 B), term-stamped 5
+        let mut pad = vec![0u8; HEADER_LEN];
+        write_header_except_length(
+            &mut pad,
+            &FrameHeader {
+                length: 0,
+                frame_type: FRAME_TYPE_PADDING,
+                flags: 0,
+                leadership_term_id: 5,
+                session_id: 0,
+                correlation_id: 0,
+            },
+        );
+        pad[..4].copy_from_slice(&(HEADER_LEN as u32).to_le_bytes());
+        arch.observe_terms(&pad, 4096);
+        assert!(arch.take_term_observations().is_empty(), "padding produced a spurious term");
+
+        // a real message frame at term 5 now transitions from 0 -> 5 at base 0
+        let mut msg = vec![0u8; frame::align_frame_len(HEADER_LEN + 64)];
+        write_header_except_length(
+            &mut msg,
+            &FrameHeader {
+                length: 0,
+                frame_type: FRAME_TYPE_MESSAGE,
+                flags: 0,
+                leadership_term_id: 5,
+                session_id: 0,
+                correlation_id: 0,
+            },
+        );
+        msg[..4].copy_from_slice(&((HEADER_LEN + 64) as u32).to_le_bytes());
+        arch.observe_terms(&msg, 0);
+        assert_eq!(arch.take_term_observations(), vec![(5, 0)]);
     }
 }

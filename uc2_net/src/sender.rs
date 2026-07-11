@@ -30,6 +30,7 @@ use uc_protocol::v2::frame::{
 };
 use ultima_journal::Journal;
 
+use crate::TermHandle;
 use crate::fault::FaultSocket;
 use crate::flow::FlowControl;
 
@@ -145,9 +146,19 @@ pub struct Sender {
     /// (M4 replay sessions). `None` until `set_replay_source` wires the
     /// archive's journal in — M2/M3 call sites leave it unset (Overrun counts).
     replay: Option<Arc<Journal>>,
+    /// Live leadership term (M4): stamps every DATA/HEARTBEAT/CommitPosition
+    /// datagram. The consensus agent (Task 8) is the sole writer; this thread
+    /// only loads it (`Relaxed`). Distinct from `cfg.term_id`, which is retained
+    /// for the legacy `SenderConfig` API but no longer used for stamping.
+    term: TermHandle,
+    /// Node mode (M4): when set, the sender's OWN commit ranking is disabled —
+    /// the tracker, the commit gossip, and the AppendPos ctrl arm all go inert
+    /// (the consensus agent owns commit ranking + gossip). `false` = legacy M3.
+    node_mode: bool,
 }
 
 impl Sender {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         buffer: Arc<LogBuffer>,
         sock: FaultSocket,
@@ -155,6 +166,7 @@ impl Sender {
         cluster_size: usize,
         ctrl: mpsc::Receiver<CtrlMsg>,
         cfg: SenderConfig,
+        term: TermHandle,
     ) -> Sender {
         assert!(
             align_frame_len(HEADER_LEN + buffer.max_payload()) + DATAGRAM_HEADER_LEN <= cfg.mtu,
@@ -182,11 +194,24 @@ impl Sender {
             follower_idx,
             stats: Arc::new(SenderStats::default()),
             replay: None,
+            term,
+            node_mode: false,
         }
     }
 
     pub fn stats(&self) -> Arc<SenderStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Put the sender in NODE MODE (M4): disable its OWN commit ranking and
+    /// gossip. The tracker stops advancing, the floor re-gossip is skipped, and
+    /// any `AppendPos` ctrl (which the node-mode leader receiver no longer
+    /// routes here) is ignored — the consensus agent (Task 8) does commit
+    /// ranking + CommitPosition gossip. The sender still streams DATA, serves
+    /// NAKs, heartbeats, and honors flow control. Legacy M3 callers leave this
+    /// unset and keep the old self-ranking behavior (the M2/M3 gates rely on it).
+    pub fn set_node_mode(&mut self) {
+        self.node_mode = true;
     }
 
     /// Wire the archive's journal in as the retransmit source for deep NAKs
@@ -256,6 +281,12 @@ impl Sender {
                     }
                 }
                 CtrlMsg::AppendPos { from, durable } => {
+                    // Node mode: commit ranking belongs to the consensus agent;
+                    // the node-mode leader receiver routes AppendPosition there,
+                    // not here, so this arm is defensively inert.
+                    if self.node_mode {
+                        continue;
+                    }
                     if let Some(&i) = self.follower_idx.get(&from) {
                         // A follower cannot hold bytes the leader never
                         // appended. The wire has no CRC, so a bit-flip that
@@ -295,11 +326,15 @@ impl Sender {
         // at block/fsync granularity (reports and own durable both move per
         // archive block), so the on-advance gossip stays ~kHz — never
         // per-message.
-        let own_durable = self.buffer.counters().durable.load_acquire();
-        if let Some(c) = self.tracker.advance(own_durable) {
-            self.buffer.counters().commit.store_release(c);
-            self.gossip_commit(c);
-            did = true;
+        // Node mode disables self-ranking entirely (the consensus agent owns
+        // the commit counter + gossip); legacy M3 keeps ranking here.
+        if !self.node_mode {
+            let own_durable = self.buffer.counters().durable.load_acquire();
+            if let Some(c) = self.tracker.advance(own_durable) {
+                self.buffer.counters().commit.store_release(c);
+                self.gossip_commit(c);
+                did = true;
+            }
         }
 
         if let Some((to, pos, len)) = self.naks.pop_front() {
@@ -361,8 +396,11 @@ impl Sender {
             for &to in &self.followers {
                 let _ = self.sock.send_to(&self.scratch, to);
             }
-            // CommitPosition floor (spec §6: same 100 ms floor as heartbeats)
-            self.gossip_commit(self.tracker.commit());
+            // CommitPosition floor (spec §6: same 100 ms floor as heartbeats).
+            // Node mode: the consensus agent gossips commit, not us.
+            if !self.node_mode {
+                self.gossip_commit(self.tracker.commit());
+            }
             self.stats.heartbeats.fetch_add(1, Ordering::Relaxed);
             did = true;
         }
@@ -375,7 +413,12 @@ impl Sender {
         self.scratch.resize(DATAGRAM_HEADER_LEN, 0);
         write_datagram_header(
             &mut self.scratch,
-            &DatagramHeader { position, leadership_term_id: self.cfg.term_id, kind, flags: 0 },
+            &DatagramHeader {
+                position,
+                leadership_term_id: self.term.load(Ordering::Relaxed),
+                kind,
+                flags: 0,
+            },
         );
         self.scratch.extend_from_slice(&self.run[..body_bytes]);
     }
@@ -494,7 +537,7 @@ impl Sender {
             &mut self.scratch,
             &DatagramHeader {
                 position,
-                leadership_term_id: self.cfg.term_id,
+                leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind: DGRAM_KIND_DATA,
                 flags: 0,
             },
@@ -608,6 +651,10 @@ mod tests {
         Arc::new(LogBuffer::new(Region::heap_zeroed(1 << 16), counters, 256))
     }
 
+    fn term_handle(t: u32) -> TermHandle {
+        Arc::new(std::sync::atomic::AtomicU32::new(t))
+    }
+
     struct Fake {
         sock: FaultSocket,
     }
@@ -647,6 +694,7 @@ mod tests {
             3,
             rx,
             cfg,
+            term_handle(9),
         );
         (s, tx)
     }
@@ -739,6 +787,7 @@ mod tests {
             3,
             rx,
             cfg,
+            term_handle(9),
         );
         let mut a = Appender::new(Arc::clone(&b), 9);
         for i in 0..2 {
@@ -922,6 +971,7 @@ mod tests {
             3,
             rx,
             cfg,
+            term_handle(9),
         );
         for i in 0..(NAK_QUEUE_MAX + K) as u16 {
             // distinct sources; position 0 is frame-aligned (never rejected)
@@ -1072,6 +1122,7 @@ mod tests {
             3,
             rx,
             cfg,
+            term_handle(9),
         );
         // append 10 frames (append = 960) so the report 480 is plausible
         let mut a = Appender::new(Arc::clone(&b), 9);
@@ -1120,6 +1171,7 @@ mod tests {
             3,
             rx,
             cfg,
+            term_handle(9),
         );
         let mut a = Appender::new(Arc::clone(&b), 9);
         a.append(4, 0, &[0u8; 64]).unwrap();
@@ -1185,6 +1237,7 @@ mod tests {
             3,
             rx,
             cfg,
+            term_handle(9),
         );
         s.set_replay_source(arch.journal_arc());
         // NAK for position 0 (lapped long ago)
@@ -1202,6 +1255,85 @@ mod tests {
             s.stats().overruns.load(std::sync::atomic::Ordering::Relaxed),
             0,
             "the seam is now served, not counted"
+        );
+    }
+
+    // ----------------------------------------------------------- M4 (Task 7)
+
+    /// Item-6 verify: a DATA datagram's header term comes from the SENDER's
+    /// TermHandle, while the FRAME header term comes from the APPENDER — two
+    /// different actors, so they CAN legitimately differ transiently after a
+    /// term bump. Safety (the archive term-observation scan, Task 7 item 5)
+    /// reads FRAME terms; the datagram term is only the liveness/filter check.
+    #[test]
+    fn datagram_term_from_handle_frame_term_from_appender() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = buffer();
+        let f1 = Fake::new();
+        let (tx, rx) = mpsc::sync_channel(16);
+        let _ = tx;
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let handle = term_handle(9);
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f1.addr()],
+            3,
+            rx,
+            cfg,
+            Arc::clone(&handle),
+        );
+        // the appender stamps its frames with term 7 (its own leadership term)
+        let mut a = Appender::new(Arc::clone(&b), 7);
+        a.append(4, 0, &[0u8; 64]).unwrap();
+        // the consensus agent bumps the sender's handle to 8 before the send:
+        // the DATA datagram must carry 8 while the frame inside still carries 7
+        handle.store(8, Relaxed);
+        s.do_work();
+        let (h, body) = f1.recv().expect("data datagram");
+        assert_eq!(h.kind, DGRAM_KIND_DATA);
+        assert_eq!(h.leadership_term_id, 8, "datagram term must come from the sender handle");
+        assert_eq!(
+            read_header(&body).leadership_term_id,
+            7,
+            "frame term must come from the appender (may differ from the datagram term)"
+        );
+    }
+
+    /// Node mode disables the sender's OWN commit ranking + gossip: a report
+    /// that would advance commit in legacy mode leaves it untouched.
+    #[test]
+    fn node_mode_disables_commit_ranking_and_gossip() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = buffer();
+        let (f1, f2) = (Fake::new(), Fake::new());
+        let (tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f1.addr(), f2.addr()],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+        );
+        s.set_node_mode();
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        for i in 0..10 {
+            a.append(4, i, &[0u8; 64]).unwrap();
+        }
+        b.counters().durable.store_release(960);
+        // in legacy mode {960, 960, 0} would commit 960; node mode ignores it
+        tx.send(CtrlMsg::AppendPos { from: f1.addr(), durable: 960 }).unwrap();
+        s.do_work();
+        assert_eq!(b.counters().commit.load_acquire(), 0, "node mode still self-ranked commit");
+        assert_eq!(
+            s.stats().commit_gossips.load(Relaxed),
+            0,
+            "node mode still gossiped commit"
         );
     }
 }
