@@ -56,23 +56,28 @@ fn next_boundary(map: &[(u32, u64)], pos: u64) -> Option<u64> {
 
 /// Data-plane strength — an EXPLICIT, switchable contract (F1).
 ///
-/// The two modes differ in exactly two places (the follower's report clamp and
-/// the DATA accept gate); both switch sites carry a pointer back here.
+/// The modes differ in exactly two places (the follower's report clamp and the
+/// DATA accept gate); both switch sites carry a pointer back here.
 ///
-/// **`RawM3` reproduces the shipped M3 receiver; `Gated` is the contract Task 7
-/// MUST implement** — see the phantom-commit trace in the task-5 review for why
-/// the shipped receiver is unsafe. The `RawM3` regression tests
-/// (`raw_m3_*_is_caught`) prove the oracle catches that unsafe behavior; the
-/// fuzz tiers run `Gated` and stay green.
+/// **`RawM3` reproduces the shipped M3 receiver; `Gated` is a structural
+/// clamp that is STRICTLY STRONGER than what `uc2_node` implements; `Mechanism`
+/// models the REAL boolean intake-gate discipline `uc2_node` actually runs** —
+/// see the phantom-commit trace in the task-5 review for why the shipped
+/// receiver is unsafe, and the M4 C-1 review for why `Gated`'s structural clamp
+/// was too strong to catch the gate-reopen TOCTOU. The `RawM3` regression tests
+/// (`raw_m3_*_is_caught`) and the `mechanism_*` pins keep the oracle honest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DataPlane {
-    /// THE TASK-7 BINDING CONTRACT. (a) A follower reports its AppendPosition
-    /// clamped to its `matched` current-term frontier — never its raw durable
-    /// after a term adoption until reconciliation re-confirms the bytes.
-    /// (b) DATA acceptance rejects extensions of a divergent prefix (the
-    /// `prevLogTerm`-equivalent check), so a follower never records a term at a
-    /// base whose prefix it disagrees on. Together these make a phantom commit
-    /// unreachable.
+    /// A STRUCTURAL clamp — stronger than the shipped node. (a) A follower
+    /// reports its AppendPosition clamped to its `matched` current-term frontier
+    /// — never its raw durable after a term adoption until reconciliation
+    /// re-confirms the bytes. (b) DATA acceptance rejects extensions of a
+    /// divergent prefix (the `prevLogTerm`-equivalent check), so a follower never
+    /// records a term at a base whose prefix it disagrees on. Together these make
+    /// a phantom commit unreachable — but they are stronger than the boolean gate
+    /// `uc2_node` runs, so a bug in the gate's OPEN/CLOSE discipline (M4 C-1) is
+    /// invisible under `Gated`. That is exactly why [`DataPlane::Mechanism`]
+    /// exists.
     Gated,
     /// The REAL M3 receiver's behavior (the shipped `uc2_net` FollowerReceiver).
     /// Reports are the raw durable immediately after a term adoption; DATA is
@@ -81,6 +86,23 @@ pub enum DataPlane {
     /// the follower's prefix diverges. Reproduces the phantom-commit /
     /// wrong-base-stamp bugs the sim must catch.
     RawM3,
+    /// The REAL mechanism `uc2_node` implements: a per-node boolean `intake_gate`
+    /// (not a structural clamp). The gate CLOSES on adopting a strictly new term
+    /// and re-arms reconciliation; while CLOSED, DATA is dropped and the
+    /// AppendPosition report is suppressed ENTIRELY (not clamped). The gate
+    /// REOPENS on a clean reconcile (a term-map that needs no truncation) or when
+    /// an in-flight truncation's archive ack lands — and, iff `reopen_guard`, the
+    /// clean-reconcile reopen is additionally guarded by "no truncation in
+    /// flight". When open, the node behaves like [`DataPlane::RawM3`] (raw report,
+    /// contiguity-only accept) — the gate is the ONLY protection, exactly as the
+    /// binary ships it.
+    ///
+    /// `reopen_guard: true` mirrors `uc2_node` post-M4 (commit a8d98f4, the C-1
+    /// fix). `reopen_guard: false` is the M4-C-1 COUNTERFACTUAL: a duplicate term
+    /// map delivered mid-truncation reopens the gate early, the raw divergent
+    /// durable (still un-truncated) escapes into the leader's commit ranking, and
+    /// the oracle must catch the resulting phantom commit.
+    Mechanism { reopen_guard: bool },
 }
 
 /// Deterministic xorshift64 — the crate-local RNG (matches the SM's / fault
@@ -130,6 +152,16 @@ pub struct SimConfig {
     /// Data-plane strength (F1). Defaults to [`DataPlane::Gated`] — the Task-7
     /// contract; the `raw_m3_*` regression tests flip it to [`DataPlane::RawM3`].
     pub data_plane: DataPlane,
+    /// Archive-truncation latency: the virtual-time gap between an
+    /// `Action::Truncate` firing and its `TruncatedFeedback` (the archive slot
+    /// ack). Default 0 = instantaneous (the historical behavior; the physical
+    /// truncate completes as the very next event). A NON-ZERO window is what lets
+    /// the [`DataPlane::Mechanism`] C-1 counterfactual reproduce: a real async
+    /// archive truncation takes time, and while it is in flight a newer term can
+    /// adopt (re-arming reconcile) and re-ship its map — the exact TOCTOU the
+    /// intake-gate reopen guard closes. Only `Mechanism` holds the divergent
+    /// durable across this window; the other modes truncate instantly regardless.
+    pub truncate_latency_ns: u64,
 }
 
 impl Default for SimConfig {
@@ -150,6 +182,7 @@ impl Default for SimConfig {
             election_timeout_max_ns: 300_000_000, // 300ms
             gossip_floor_ns: 100_000_000,         // 100ms — spec §6 idle re-gossip
             data_plane: DataPlane::Gated,
+            truncate_latency_ns: 0, // instantaneous archive ack (historical default)
         }
     }
 }
@@ -245,11 +278,28 @@ struct Node {
     /// Leader: position of this term's NewTerm no-op frame, once appended.
     new_term_pos: Option<u64>,
     /// A truncation is in flight (data plane paused until `TruncatedFeedback`).
+    /// Doubles as the C-1 guard's `pending_truncation.is_some()` marker under
+    /// [`DataPlane::Mechanism`].
     truncating: bool,
     /// Snapshot captured when a `TermMap` is delivered, so a resulting
     /// `Truncate` can be checked against the pre-reconcile map + leader map.
     map_before_reconcile: Vec<(u32, u64)>,
     last_leader_map: Vec<(u32, u64)>,
+    // ---- intake-gate model ([`DataPlane::Mechanism`] only; ignored otherwise) ----
+    /// The real receiver's boolean intake gate: `true` = OPEN (DATA accepted,
+    /// AppendPosition reported), `false` = CLOSED. Mirrors `uc2_node`'s
+    /// `intake_gate: Arc<AtomicBool>` — the ONLY divergence protection the binary
+    /// ships (weaker than `Gated`'s structural clamp).
+    intake_gate: bool,
+    /// Shadow of the SM's adopted term (`uc2_node::adopted_term`): the gate closes
+    /// only on a STRICTLY new term, so we must know the last term we adopted.
+    adopted_term: u32,
+    /// Under `Mechanism`, the physical truncation is DEFERRED across the archive
+    /// latency window: the divergent durable tail stays on disk (the closed gate
+    /// suppresses reporting it) until `TruncatedFeedback` applies this target.
+    /// This is what lets the C-1 counterfactual expose the still-present divergent
+    /// durable when the gate reopens early.
+    pending_trunc_to: Option<u64>,
 }
 
 /// The simulator. Construct with [`World::new`], drive with [`World::run`] (or
@@ -321,6 +371,9 @@ impl World {
                 truncating: false,
                 map_before_reconcile: Vec::new(),
                 last_leader_map: Vec::new(),
+                intake_gate: true, // open until a term is adopted
+                adopted_term: 0,
+                pending_trunc_to: None,
             });
         }
         let checker = InvariantChecker::new(cfg.seed, n);
@@ -609,18 +662,50 @@ impl World {
                 {
                     let (id, term) = (self.nodes[node].id, self.nodes[node].sm.current_term());
                     // F1a data-plane contract switch — see `DataPlane`.
-                    //   Gated  (Task-7 contract): clamp to `matched`, so a
-                    //          divergent-but-un-truncated durable is never counted
-                    //          toward commit.
-                    //   RawM3  (shipped M3 receiver): report the raw durable — the
-                    //          phantom-commit source the oracle must catch.
+                    //   Gated     (structural clamp): clamp to `matched`, so a
+                    //             divergent-but-un-truncated durable is never
+                    //             counted toward commit.
+                    //   RawM3     (shipped M3 receiver): report the raw durable —
+                    //             the phantom-commit source the oracle must catch.
+                    //   Mechanism (real intake gate): raw durable, but the report
+                    //             is SUPPRESSED ENTIRELY while the gate is closed
+                    //             (handled below) — never clamped.
                     let reportable = match self.cfg.data_plane {
                         DataPlane::Gated => new_durable.min(self.nodes[node].matched),
-                        DataPlane::RawM3 => new_durable,
+                        DataPlane::RawM3 | DataPlane::Mechanism { .. } => new_durable,
                     };
-                    self.send(node, leader, Msg::Report { from: id, term, durable: reportable }, now);
+                    let suppressed = matches!(self.cfg.data_plane, DataPlane::Mechanism { .. })
+                        && !self.nodes[node].intake_gate;
+                    if !suppressed {
+                        self.send(
+                            node,
+                            leader,
+                            Msg::Report { from: id, term, durable: reportable },
+                            now,
+                        );
+                    }
                 }
             }
+        }
+        // Mechanism C-1 CONTINUOUS LEAK: an erroneously-OPEN intake gate during a
+        // truncation ships the stale (un-re-primed) AppendPosition = the raw
+        // divergent durable, on the archive cadence, until the ack finally
+        // re-primes the counters. The guarded mechanism keeps the gate CLOSED
+        // throughout a truncation, so this can only fire in the `reopen_guard:
+        // false` counterfactual (after a duplicate term map reopened the gate
+        // mid-truncation). The single reopen-time report is one datagram; a real
+        // receiver keeps shipping it — which is what lets the leader actually rank
+        // the divergent durable into a phantom commit.
+        if self.nodes[node].up
+            && matches!(self.cfg.data_plane, DataPlane::Mechanism { .. })
+            && self.nodes[node].truncating
+            && self.nodes[node].intake_gate
+            && let Some(leader) = self.nodes[node].leader_hint
+            && leader != node
+        {
+            let (id, term, durable) =
+                (self.nodes[node].id, self.nodes[node].sm.current_term(), self.nodes[node].durable);
+            self.send(node, leader, Msg::Report { from: id, term, durable }, now);
         }
         self.push(SimEvent::ArchiveStep { node }, now + self.cfg.archive_step_ns);
         Ok(())
@@ -647,6 +732,11 @@ impl World {
         for c in &mut nd.cursors {
             *c = 0;
         }
+        // Rebuilt receiver: gate open, no reconcile armed, adopted term = the
+        // term the persisted vote restored (mirrors uc2_node boot).
+        nd.intake_gate = true;
+        nd.adopted_term = nd.sm.current_term();
+        nd.pending_trunc_to = None;
         self.checker.on_restart(node);
         self.stat_restarts += 1;
         Ok(())
@@ -669,7 +759,43 @@ impl World {
         let nd = &mut self.nodes[node];
         nd.term_map = m;
         nd.truncating = false;
+        // Intake gate (Mechanism): the archive ack completes reconciliation. Apply
+        // the deferred physical truncation (durable was held at the divergent value
+        // across the window), then reopen the gate — UNLESS a newer term adopted
+        // mid-truncation re-armed the reconcile latch, in which case that term's
+        // fresh reconcile must complete first (mirrors uc2_node::on_truncated).
+        if matches!(self.cfg.data_plane, DataPlane::Mechanism { .. }) {
+            if let Some(t) = nd.pending_trunc_to.take() {
+                nd.durable = t;
+                nd.append = t;
+            }
+            self.record_committed(node);
+            // Reconciliation for this term is complete (durable clamped to the
+            // consistent truncation point, pruned map adopted): reopen the gate.
+            self.reopen_gate(node, now);
+        }
         Ok(())
+    }
+
+    /// Reopen a node's intake gate ([`DataPlane::Mechanism`]) and resume
+    /// reporting: ship the node's CURRENT durable to its leader. In the guarded
+    /// flow the gate only reopens once reconciliation is clean (durable already
+    /// truncated/consistent), so this reports a SAFE position. Under the unguarded
+    /// C-1 flow the gate reopens with a truncation still in flight, so the RAW
+    /// divergent durable — not yet truncated — escapes into the leader's commit
+    /// ranking, and the genuine-quorum oracle (inv5) catches the phantom.
+    fn reopen_gate(&mut self, node: usize, now: u64) {
+        self.nodes[node].intake_gate = true;
+        if let Some(leader) = self.nodes[node].leader_hint
+            && leader != node
+        {
+            let (id, term, durable) = (
+                self.nodes[node].id,
+                self.nodes[node].sm.current_term(),
+                self.nodes[node].durable,
+            );
+            self.send(node, leader, Msg::Report { from: id, term, durable }, now);
+        }
     }
 
     // ------------------------------------------------------------- delivery
@@ -697,20 +823,28 @@ impl World {
                     // removed by term-map reconciliation (Truncate), never by
                     // silently overwriting it — so we simply drop until then.
                     // F1b data-plane contract switch — see `DataPlane`.
-                    //   Gated  (Task-7 contract): require prev-term agreement, so a
-                    //          divergent prefix can never be extended (a follower
-                    //          never stamps a term at a base whose prefix it
-                    //          disagrees on).
-                    //   RawM3  (shipped M3 receiver): accept on position-contiguity
-                    //          + current-term ALONE — the wrong-base-stamp source.
+                    //   Gated     (structural clamp): require prev-term agreement,
+                    //             so a divergent prefix can never be extended (a
+                    //             follower never stamps a term at a base whose
+                    //             prefix it disagrees on).
+                    //   RawM3     (shipped M3 receiver): accept on position-
+                    //             contiguity + current-term ALONE — the wrong-base-
+                    //             stamp source.
+                    //   Mechanism (real intake gate): same contiguity-only accept
+                    //             as RawM3, but ONLY while the gate is open; a
+                    //             closed gate drops the DATA outright (below).
                     let ok_prev = match self.cfg.data_plane {
                         DataPlane::Gated => {
                             from_pos == 0
                                 || term_at(&self.nodes[to].term_map, from_pos - 1) == prev_term
                         }
-                        DataPlane::RawM3 => true,
+                        DataPlane::RawM3 | DataPlane::Mechanism { .. } => true,
                     };
-                    if from_pos == self.nodes[to].append && ok_prev {
+                    let gate_open = match self.cfg.data_plane {
+                        DataPlane::Mechanism { .. } => self.nodes[to].intake_gate,
+                        _ => true,
+                    };
+                    if gate_open && from_pos == self.nodes[to].append && ok_prev {
                         if to_pos > from_pos {
                             self.nodes[to].append = to_pos;
                             // Data-stamped recording at the term's true base
@@ -765,7 +899,46 @@ impl World {
                 // be validated (invariant 4 + T2 carry).
                 self.nodes[to].map_before_reconcile = self.nodes[to].term_map.clone();
                 self.nodes[to].last_leader_map = entries.clone();
-                self.feed(to, Event::TermMapReceived { term, entries }, now, step)
+                let term_before = self.nodes[to].sm.current_term();
+                let truncs_before = self.stat_truncations;
+                self.feed(to, Event::TermMapReceived { term, entries }, now, step)?;
+                // Intake-gate CLEAN-RECONCILE reopen (mirrors uc2_node::feed): a
+                // term-map that was actually processed (`term >= ours`) and needed
+                // NO truncation completes reconciliation for the adopted term, so
+                // the gate reopens and the reconcile latch clears.
+                //
+                // C-1 GUARD (iff `reopen_guard`): additionally require no
+                // truncation in flight. A leader re-ships its map continuously, so
+                // a DUPLICATE term-map routinely lands after we emitted a
+                // `Truncate` but before the archive ack; the SM's truncating latch
+                // drops it with zero actions (`produced_truncate` false, term
+                // unchanged), and the UNGUARDED heuristic would reopen the gate
+                // mid-truncation — letting the raw divergent durable escape into
+                // the leader's commit ranking (the M4 C-1 phantom-commit path).
+                if let DataPlane::Mechanism { reopen_guard } = self.cfg.data_plane {
+                    // CLEAN-RECONCILE reopen: a term map that was processed
+                    // (`term >= ours`) and needed NO truncation completes
+                    // reconciliation for the adopted term, so a CLOSED gate
+                    // reopens. C-1 GUARD (iff `reopen_guard`): additionally require
+                    // no truncation in flight. A leader re-ships its map
+                    // continuously, so a duplicate term map routinely lands after a
+                    // `Truncate` but before the archive ack; the SM's truncating
+                    // latch drops it with zero actions (`produced_truncate` false,
+                    // term unchanged), and the UNGUARDED heuristic reopens the gate
+                    // mid-truncation — letting the raw divergent durable escape into
+                    // the leader's commit ranking (the M4 C-1 phantom-commit path,
+                    // commit a8d98f4).
+                    let produced_truncate = self.stat_truncations > truncs_before;
+                    let guard_ok = !reopen_guard || !self.nodes[to].truncating;
+                    if !self.nodes[to].intake_gate
+                        && !produced_truncate
+                        && guard_ok
+                        && term >= term_before
+                    {
+                        self.reopen_gate(to, now);
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -872,13 +1045,28 @@ impl World {
                     let msg = self.make_data(node, base, pos, term);
                     self.send(node, p, msg, now);
                 }
+                // Intake gate (Mechanism): a leader is the source of truth — gate
+                // open, no reconcile pending (mirrors uc2_node::exec BecomeLeader).
+                let nd = &mut self.nodes[node];
+                nd.adopted_term = term;
+                        nd.intake_gate = true;
+                nd.pending_trunc_to = None;
             }
-            Action::BecomeFollower { term: _, leader } => {
+            Action::BecomeFollower { term, leader } => {
                 self.nodes[node].leader_hint = leader.map(|l| l as usize);
                 self.nodes[node].new_term_pos = None;
                 // A new term means a possibly-new leader: the replication match
                 // must be re-confirmed from scratch (Raft resets matchIndex).
                 self.nodes[node].matched = 0;
+                // Intake gate (Mechanism): adopting a STRICTLY new term closes the
+                // gate; it reopens only once reconciliation for this term completes
+                // (a clean term map, or a truncation ack). The shadow
+                // `adopted_term` is tracked in all modes; the gate field is only
+                // read under `Mechanism`.
+                if term > self.nodes[node].adopted_term {
+                    self.nodes[node].intake_gate = false;
+                }
+                self.nodes[node].adopted_term = term;
             }
             Action::AdvanceCommit { commit } => {
                 // Genuine-quorum oracle (F3): the checker judges the commit
@@ -933,15 +1121,38 @@ impl World {
                 self.checker.on_truncate(node as NodeId, to, &own_before, &leader, step)?;
                 self.stat_truncations += 1;
 
+                let mechanism = matches!(self.cfg.data_plane, DataPlane::Mechanism { .. });
                 let nd = &mut self.nodes[node];
-                nd.durable = to;
-                nd.append = to;
+                if mechanism {
+                    // Real intake gate: emitting the truncate closes the gate and
+                    // clears the reconcile latch — the truncate IS the reconcile
+                    // decision for this term (mirrors uc2_node::exec Truncate).
+                    //
+                    // PERSIST-BEFORE-TRUNCATE (uc2_node): the PRUNED map (`new_map`,
+                    // a clean prefix of the leader's lineage) is adopted durably
+                    // NOW, so a crash in the window recovers a valid prefix and the
+                    // map never claims terms above the still-present bytes. inv2
+                    // stays clean even if the global commit advances during the
+                    // window. What is DEFERRED is the physical byte truncation:
+                    // `durable`/`append` stay at the divergent value (bytes still on
+                    // disk) until the `TruncatedFeedback` ack applies `to`. Because
+                    // the adopted map only covers up to `to`, the checker's content
+                    // oracle already caps this node's genuine frontier at `to` — so
+                    // an escaped report of the higher raw durable (the C-1
+                    // counterfactual) is caught as a phantom commit (inv5).
+                    nd.term_map = new_map;
+                    nd.intake_gate = false;
+                    nd.pending_trunc_to = Some(to);
+                } else {
+                    nd.durable = to;
+                    nd.append = to;
+                    // The persisted term map is NOT adopted until `Truncated`
+                    // feedback — a crash in this window recovers the pre-truncate
+                    // map (which reconcile handles again). `new_map` is only what
+                    // the SM will adopt on feedback (it re-derives it too).
+                    let _ = new_map;
+                }
                 nd.truncating = true;
-                // The persisted term map is NOT adopted until `Truncated`
-                // feedback — a crash in this window recovers the pre-truncate
-                // map (which reconcile handles again). Keep new_map only to know
-                // what the SM will adopt on feedback (it re-derives it too).
-                let _ = new_map;
 
                 if self.crash_on_truncate {
                     self.crash_on_truncate = false;
@@ -949,9 +1160,14 @@ impl World {
                     // durable stayed at `to` (archive-durable), map stayed old.
                     self.do_crash(node, now);
                 } else {
-                    // Feed `Truncated` back as the very next event (latch window),
-                    // carrying the SM-allocated epoch so it matches (M5).
-                    self.push(SimEvent::TruncatedFeedback { node, epoch, to }, now);
+                    // Feed `Truncated` back after the archive-latency window
+                    // (`truncate_latency_ns`; 0 = the very next event), carrying
+                    // the SM-allocated epoch so it matches (M5). The non-zero
+                    // window is the C-1 reproduction surface — see the field docs.
+                    self.push(
+                        SimEvent::TruncatedFeedback { node, epoch, to },
+                        now + self.cfg.truncate_latency_ns,
+                    );
                 }
             }
             Action::Fatal { reason } => {
@@ -1082,6 +1298,31 @@ impl World {
         // Mirror `step_once`'s post-event invariant 2 sweep.
         let maps: Vec<Vec<(u32, u64)>> = self.nodes.iter().map(|n| n.term_map.clone()).collect();
         self.checker.check_prefix_consistency(&maps, step)
+    }
+
+    /// Enqueue a raw follower `Report{from, term, durable}` addressed to the
+    /// current leader, regardless of data-plane mode (the T5-deferred forged-report
+    /// pin). `durable` is taken at face value: a value ABOVE the sender's real
+    /// durable models a forged/corrupt report that a real leader's CommitTracker
+    /// would rank verbatim. The genuine byte-content-quorum oracle must catch any
+    /// commit that rides it. No-op if there is no leader to report to.
+    pub fn inject_report(&mut self, from: usize, term: u32, durable: u64) {
+        let Some(to) = self
+            .nodes
+            .iter()
+            .position(|n| n.up && matches!(n.sm.role(), Role::Leader))
+        else {
+            return;
+        };
+        let id = self.nodes[from].id;
+        let now = self.now;
+        // Deliver promptly (minimal link latency) so the injected report is ranked
+        // before followers legitimately catch up to the leader — this keeps the
+        // pin deterministic. Bypasses the drop/dup fault dice (a scripted inject).
+        self.push(
+            SimEvent::Deliver { to, from, msg: Msg::Report { from: id, term, durable } },
+            now + self.cfg.latency_min_ns,
+        );
     }
 
     /// A node's current append (write) position.

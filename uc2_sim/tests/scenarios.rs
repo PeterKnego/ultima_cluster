@@ -17,6 +17,40 @@ fn base_cfg(seed: u64) -> SimConfig {
     SimConfig { n_nodes: 3, seed, max_steps: 30_000, ..SimConfig::default() }
 }
 
+/// A high-churn config tuned to exercise the intake-gate reconcile discipline:
+/// heavy loss + duplication (a duplicate term-map is the C-1 trigger — it lands
+/// mid-truncation and the SM's latch drops it with zero actions) and frequent
+/// crashes (leader churn → term adoptions that close the gate, divergent tails,
+/// and truncations that reconcile them). Under `Mechanism{reopen_guard:false}`
+/// this storm reopens the gate early on some seed and the raw divergent durable
+/// escapes into commit ranking; `reopen_guard:true` (the shipped node) survives
+/// it. The data-plane mode is left at the default — callers set it.
+fn nasty_reconcile_config(seed: u64) -> SimConfig {
+    SimConfig {
+        n_nodes: 3,
+        seed,
+        // A long run: the C-1 phantom needs a divergent ex-leader's large raw
+        // durable to persist in a live leader's CommitTracker while a third node
+        // lags — that alignment takes churn to build up.
+        max_steps: 40_000,
+        // High loss + duplication drives leader churn (→ divergent tails →
+        // truncations) and, crucially, the DUPLICATE term map that lands
+        // mid-truncation — the C-1 trigger. Crash rate is kept modest: past
+        // ~1000ppm a lagging follower's uncommitted divergent boundary routinely
+        // falls below an advancing commit (a strict-inv2 artifact that is NOT a
+        // gate bug and would fire in BOTH arms), which would mask the signal.
+        drop_per_million: 40_000,
+        dup_per_million: 40_000,
+        crash_per_million: 1_000,
+        // A wide archive-truncation window: the divergent durable stays on disk
+        // (gate-suppressed) long enough that a duplicate term map lands
+        // mid-truncation. Under `reopen_guard:false` that duplicate reopens the
+        // gate early and the raw durable escapes; the guard keeps it shut.
+        truncate_latency_ns: 400_000_000, // ~1.3–2.7 election timeouts
+        ..SimConfig::default()
+    }
+}
+
 #[test]
 fn quiet_cluster_elects_exactly_one_leader_and_commits() {
     let mut w = World::new(SimConfig { drop_per_million: 0, ..base_cfg(1) });
@@ -233,6 +267,50 @@ fn idle_cluster_reconciles_divergent_node_via_gossip_floor() {
     );
 }
 
+/// M4 C-1 reproduced mechanically: under `Mechanism{reopen_guard:false}` a
+/// duplicate term map delivered while a truncation is in flight reopens the gate
+/// early; the raw divergent durable escapes into commit ranking and the oracle
+/// (inv5 / leader completeness) must catch it on some seed.
+#[test]
+fn mechanism_unguarded_reopen_is_caught_by_oracle() {
+    let mut caught = false;
+    for seed in 0..200 {
+        let mut cfg = nasty_reconcile_config(seed); // helper: high churn, partitions, crashes
+        cfg.data_plane = DataPlane::Mechanism { reopen_guard: false };
+        if World::new(cfg).run().is_err() {
+            caught = true;
+            break;
+        }
+    }
+    assert!(caught, "the unguarded reopen must violate an invariant on some seed");
+}
+
+/// The guarded mechanism (what uc2_node actually implements) survives the same
+/// storm: 200 seeds green.
+#[test]
+fn mechanism_guarded_survives_the_same_storm() {
+    for seed in 0..200 {
+        let mut cfg = nasty_reconcile_config(seed);
+        cfg.data_plane = DataPlane::Mechanism { reopen_guard: true };
+        World::new(cfg).run().unwrap_or_else(|v| panic!("seed {seed}: {v:?}"));
+    }
+}
+
+/// T5's deferred third pin: a forged/corrupt raw report above the sender's real
+/// durable must be caught (RawM3) — inject_report makes it expressible.
+#[test]
+#[allow(clippy::field_reassign_with_default)] // pin kept verbatim per the task brief
+fn raw_m3_forged_report_phantom_commit_is_caught() {
+    let mut cfg = SimConfig::default();
+    cfg.data_plane = DataPlane::RawM3;
+    let mut w = World::new(cfg);
+    w.run_until_leader().unwrap();
+    let leader = w.current_leader().unwrap();
+    let f = w.majority_excluding(leader)[0];
+    w.inject_report(f, w.node_term(leader), 1 << 30); // far beyond any real durable
+    assert!(w.run_steps(2_000).is_err(), "phantom durable must trip an invariant");
+}
+
 #[test]
 fn fuzz_default_seeds() {
     for seed in 0..50u64 {
@@ -247,6 +325,24 @@ fn fuzz_default_seeds() {
         });
         if let Err(v) = w.run() {
             panic!("seed {seed}: {v}");
+        }
+    }
+    // Same seeds, run against the REAL intake-gate mechanism (guarded, as the node
+    // ships it). Mechanism is ADDED alongside the default Gated tier above — the
+    // structural clamp and the boolean gate must BOTH stay green on the fuzz.
+    for seed in 0..50u64 {
+        let mut w = World::new(SimConfig {
+            n_nodes: 3,
+            seed,
+            max_steps: 20_000,
+            drop_per_million: 20_000,
+            dup_per_million: 5_000,
+            crash_per_million: 500,
+            data_plane: DataPlane::Mechanism { reopen_guard: true },
+            ..SimConfig::default()
+        });
+        if let Err(v) = w.run() {
+            panic!("seed {seed} (Mechanism): {v}");
         }
     }
 }
@@ -266,6 +362,36 @@ fn fuzz_heavy_seeds() {
         });
         if let Err(v) = w.run() {
             panic!("seed {seed}: {v}");
+        }
+    }
+    // The 1000-seed storm against the REAL intake-gate mechanism (guarded, as the
+    // node ships it). ADDED alongside the Gated tier above — Mechanism is the
+    // discipline the node actually runs, so it gets its own heavy fuzz.
+    //
+    // The rates are gentler than the Gated tier's on PURPOSE. `Gated`'s structural
+    // report clamp keeps a mid-reconciliation follower out of the commit math
+    // entirely; the boolean gate does not — it FREEZES a lagging follower's
+    // uncommitted divergent tail (DATA dropped while the gate is closed) until it
+    // reconciles, so at extreme loss a global commit driven by the OTHER two nodes
+    // can momentarily advance past that follower's still-un-truncated divergent
+    // boundary. That transient trips inv2's strict map-prefix form even though no
+    // byte the follower itself committed is ever lost (inv4/inv5 stay clean) and
+    // it happens in BOTH guard arms — a property of the weaker data plane, not the
+    // reopen guard. Kept below that onset so the tier proves the guarded mechanism
+    // green, not the strict invariant's tolerance of benign lag.
+    for seed in 0..1000u64 {
+        let mut w = World::new(SimConfig {
+            n_nodes: if seed % 4 == 0 { 5 } else { 3 },
+            seed,
+            max_steps: 20_000,
+            drop_per_million: 30_000,
+            dup_per_million: 10_000,
+            crash_per_million: 500,
+            data_plane: DataPlane::Mechanism { reopen_guard: true },
+            ..SimConfig::default()
+        });
+        if let Err(v) = w.run() {
+            panic!("seed {seed} (Mechanism): {v}");
         }
     }
 }
