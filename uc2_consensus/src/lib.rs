@@ -9,3 +9,4 @@
 //! module, gated by the deterministic simulation (uc2_sim).
 
 pub mod commit;
+pub mod election;

@@ -61,6 +61,14 @@ impl CommitTracker {
         self.commit
     }
 
+    /// Clear per-follower reports (term transition: stale-term reports must
+    /// not certify bytes in the new term). Commit itself stays monotonic.
+    pub fn reset_reports(&mut self) {
+        for r in &mut self.reported {
+            *r = 0;
+        }
+    }
+
     /// Rank the quorum. Returns `Some(new_commit)` iff commit advanced.
     pub fn advance(&mut self, own_durable: u64) -> Option<u64> {
         self.scratch.clear();
@@ -160,6 +168,23 @@ mod tests {
         assert_eq!(t.advance(1000), Some(700));
         t.on_durable(0, 2000);
         assert_eq!(t.advance(1000), Some(1000)); // still bounded by own
+    }
+
+    #[test]
+    fn reset_reports_clears_slots_but_keeps_commit() {
+        let mut t = CommitTracker::new(2, 3);
+        // both followers ahead of own; commit bounded by own = 1000
+        t.on_durable(0, 5000);
+        t.on_durable(1, 5000);
+        assert_eq!(t.advance(1000), Some(1000));
+        assert_eq!(t.commit(), 1000);
+        // term transition: stale-term reports must not certify the new term
+        t.reset_reports();
+        // own advances to 6000 but followers are silent (cleared to 0):
+        // {6000, 0, 0} -> quorum-2 = 0 -> no advance. (Without the clear, the
+        // stale 5000/5000 would wrongly certify 5000.)
+        assert_eq!(t.advance(6000), None);
+        assert_eq!(t.commit(), 1000);
     }
 
     #[test]
