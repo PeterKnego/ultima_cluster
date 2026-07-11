@@ -415,13 +415,19 @@ impl ElectionSm {
             }
 
             Event::Truncated { to } => {
-                // Only meaningful while we asked for a truncation. A higher term
-                // adopted mid-flight clears the latch and abandons the pending
-                // map; ignore its stale feedback (the new leader re-ships).
+                // I-1: physical truncation is always the truth about durability.
+                // Clamp durable down BEFORE the latch check so that even a stale
+                // or unexpected ack (we are not `truncating`) can never leave the
+                // SM overclaiming durable bytes that were physically truncated
+                // away. `min` only ever shrinks — a `to` above our durable (a
+                // truncation point beyond what we hold) reduces nothing.
+                self.durable = self.durable.min(to);
+                // Only the map-adoption / latch-release is truncation-scoped. A
+                // higher term adopted mid-flight clears the latch and abandons the
+                // pending map; ignore its stale feedback (the new leader re-ships).
                 if !self.truncating {
                     return;
                 }
-                self.durable = to;
                 if let Some(m) = self.pending_new_map.take() {
                     self.term_map = m;
                 }
@@ -568,7 +574,11 @@ impl ElectionSm {
                     self.pending_new_map = Some(new_map.clone());
                     out.push(Action::Truncate { to: valid_up_to, new_map });
                 } else if new_map != self.term_map {
-                    // Nothing to truncate, but we adopted covering entries.
+                    // Nothing to truncate. Post-redesign (data-stamped recording)
+                    // this branch only ever SHRINKS our map — dropping a phantom
+                    // frontier entry we opened but never got covered — never adopts
+                    // leader entries (our map grows solely via `DataTermObserved`).
+                    // Persist the shrunk map so our vote credentials stay honest.
                     self.term_map = new_map.clone();
                     out.push(Action::PersistTermMap { new_map });
                 }
@@ -1227,6 +1237,31 @@ mod tests {
         // Stale truncation feedback for the abandoned request is ignored.
         step(&mut s, Event::Truncated { to: 4096 });
         assert_eq!(s.term_map(), &[(1, 0), (2, 4096)]);
+    }
+
+    /// I-1: physical truncation is the truth about durability. A stale/unexpected
+    /// `Truncated` ack — one that arrives while we are NOT truncating — still
+    /// clamps `durable` DOWN (never overclaim bytes physically truncated away) but
+    /// changes nothing else and emits no actions. Here `to (500) < durable (1000)`.
+    #[test]
+    fn stale_truncated_ack_clamps_durable_only() {
+        let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 1000, 0);
+        let before_term = s.current_term();
+        let before_map = s.term_map().to_vec();
+        // Not truncating: the ack clamps durable and returns no actions.
+        let acts = step(&mut s, Event::Truncated { to: 500 });
+        assert!(acts.is_empty(), "a stale Truncated ack emits no actions");
+        assert_eq!(s.current_term(), before_term, "term unchanged");
+        assert_eq!(s.term_map(), before_map.as_slice(), "term map unchanged");
+        assert!(!s.truncating, "latch stays clear (we never asked to truncate)");
+        // durable is now 500: the next election solicits with last_durable == 500,
+        // proving the clamp took (it was 1000 before the ack).
+        let acts = step(&mut s, Event::Tick { now_ns: 301 });
+        let last_durable = acts.iter().find_map(|a| match a {
+            Action::StartElection { last_durable, .. } => Some(*last_durable),
+            _ => None,
+        });
+        assert_eq!(last_durable, Some(500), "durable was clamped to the truncated point");
     }
 
     /// Reconciliation with no common prefix surfaces `Fatal` (never truncates).

@@ -547,9 +547,23 @@ impl Consensus {
             // Gate reopen (T7 discipline): a term-map that was actually processed
             // (term >= ours) and needed NO truncation completes reconciliation
             // for the adopted term.
+            //
+            // C-1 guard: also require that NO truncation is in flight
+            // (`pending_new_map.is_none()`). A leader re-ships its map at kHz, so
+            // a duplicate TermMap routinely lands AFTER we emitted `Action::Truncate`
+            // but BEFORE the archive's `Truncated` ack. On that duplicate the SM's
+            // `truncating` latch drops the event with ZERO actions, so
+            // `produced_truncate` is false and the term hasn't moved — the old
+            // heuristic would reopen the gate MID-TRUNCATION, letting the receiver
+            // ship an AppendPosition stamped with the current term over the raw
+            // divergent durable (counters not yet re-primed) → monotonic-max
+            // poisons the leader's CommitTracker → phantom commit. The node's own
+            // emit→ack marker (`pending_new_map`: set in `Action::Truncate`,
+            // cleared in `on_truncated`) brackets that window exactly.
             if let Some(t) = tm_term
                 && self.awaiting_reconcile
                 && !produced_truncate
+                && self.pending_new_map.is_none()
                 && t >= term_before
             {
                 self.open_gate();
@@ -751,4 +765,168 @@ fn rederive_term_map(
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Live-channel ends the test must keep alive so the `Consensus`'s owned
+    /// senders/receivers don't disconnect while we drive `feed` directly.
+    struct Harness {
+        cons: Consensus,
+        // Kept alive: dropping these would disconnect the consensus's endpoints.
+        _net_tx: mpsc::SyncSender<NetEvent>,
+        _obs_tx: mpsc::SyncSender<(u32, u64)>,
+        _ingress_tx: mpsc::SyncSender<Vec<u8>>,
+        _trunc_rx: mpsc::Receiver<u64>,
+        _ack_tx: mpsc::SyncSender<u64>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Harness {
+        fn gate_open(&self) -> bool {
+            self.cons.intake_gate.load(Ordering::Acquire)
+        }
+    }
+
+    /// Build a bare `Consensus` (no spawned agents) wired to real state + sockets
+    /// so `feed`/`exec` run their true side effects (vote persist, gate flips,
+    /// `trunc_tx` send). The SM is seeded as a healed ex-leader whose durable tail
+    /// diverges from the current leader's map, so a term-map delivery truncates.
+    fn harness() -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Arc::new(LogCounters::new());
+        let buffer = Arc::new(LogBuffer::new(
+            Region::heap_zeroed(1 << 16),
+            Arc::clone(&counters),
+            4096,
+        ));
+        counters.prime(6000);
+        let state = NodeState::open(dir.path()).unwrap();
+
+        // id=1 in [0,1,2]; own map (1,0),(2,4096) at durable 6000 → boot_term 2.
+        let members = vec![0u32, 1, 2];
+        let sm = ElectionSm::new(
+            ElectionConfig {
+                id: 1,
+                members: members.clone(),
+                election_timeout_min_ns: 150,
+                election_timeout_max_ns: 300,
+                gossip_floor_ns: u64::MAX,
+                seed: 7,
+            },
+            None,
+            &[(1, 0), (2, 4096)],
+            6000,
+            0,
+        );
+        let boot_term = sm.current_term();
+        assert_eq!(boot_term, 2);
+
+        let mut id_to_addr = HashMap::new();
+        let mut addr_to_id = HashMap::new();
+        for (i, id) in members.iter().enumerate() {
+            let addr: SocketAddr = format!("127.0.0.1:{}", 9100 + i).parse().unwrap();
+            id_to_addr.insert(*id, addr);
+            addr_to_id.insert(addr, *id);
+        }
+        let peers = vec![0u32, 2];
+
+        let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(64);
+        let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(64);
+        let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Vec<u8>>(64);
+        let (trunc_tx, trunc_rx) = mpsc::sync_channel::<u64>(64);
+        let (ack_tx, ack_rx) = mpsc::sync_channel::<u64>(64);
+
+        let sock = FaultSocket::from_socket(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
+        let intake_gate = Arc::new(AtomicBool::new(true));
+
+        let cons = Consensus {
+            id: 1,
+            sm,
+            state,
+            counters: Arc::clone(&counters),
+            buffer,
+            appender: None,
+            next_corr: 0,
+            pending_ingress: None,
+            sock,
+            id_to_addr,
+            addr_to_id,
+            peers,
+            net_rx,
+            obs_rx,
+            ingress_rx,
+            trunc_tx,
+            ack_rx,
+            term_handle: Arc::new(AtomicU32::new(boot_term)),
+            leader_flag: Arc::new(AtomicBool::new(false)),
+            can_serve_flag: Arc::new(AtomicBool::new(false)),
+            intake_gate,
+            truncations: Arc::new(AtomicU64::new(0)),
+            base: Instant::now(),
+            durable_seen: 6000,
+            adopted_term: boot_term,
+            awaiting_reconcile: false,
+            pending_new_map: None,
+        };
+
+        Harness {
+            cons,
+            _net_tx: net_tx,
+            _obs_tx: obs_tx,
+            _ingress_tx: ingress_tx,
+            _trunc_rx: trunc_rx,
+            _ack_tx: ack_tx,
+            _dir: dir,
+        }
+    }
+
+    /// C-1 regression: a DUPLICATE term map delivered AFTER `Action::Truncate`
+    /// executed but BEFORE the archive's `Truncated` ack must leave the intake
+    /// gate CLOSED. A leader re-ships its map at kHz, so this duplicate is the
+    /// common case, not a rare one. On the duplicate the SM's `truncating` latch
+    /// drops the event with zero actions; without the `pending_new_map.is_none()`
+    /// guard the reopen heuristic (no truncate produced + term unchanged) would
+    /// reopen the gate mid-truncation, letting the receiver ship an AppendPosition
+    /// over the raw divergent durable → phantom commit.
+    #[test]
+    fn duplicate_term_map_mid_truncation_keeps_gate_closed() {
+        let mut h = harness();
+        assert!(h.gate_open(), "gate starts open");
+
+        // Adopt term 3 (a higher term): closes the gate, arms reconciliation.
+        h.cons.feed(Event::RequestVote {
+            from: 0,
+            new_term: 3,
+            last_term: 1,
+            last_durable: 7000,
+        });
+        assert!(!h.gate_open(), "adopting a new term closes the gate");
+        assert!(h.cons.awaiting_reconcile);
+
+        // Term-map #1: reconciles to a divergent tail → Action::Truncate. The node
+        // stashes `pending_new_map`, closes the gate, and commands the archive.
+        h.cons.feed(Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        assert!(!h.gate_open(), "gate stays closed while the truncate is emitted");
+        assert!(h.cons.pending_new_map.is_some(), "a truncation is now in flight");
+        // The truncate command reached the archive channel.
+        assert_eq!(h._trunc_rx.try_recv().ok(), Some(4096));
+
+        // Term-map #2: the leader re-ships the SAME map while the archive
+        // truncation is still in flight. The SM's `truncating` latch drops it with
+        // zero actions. The gate MUST remain closed (C-1 guard).
+        h.cons.feed(Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        assert!(
+            !h.gate_open(),
+            "a duplicate term map mid-truncation must NOT reopen the intake gate"
+        );
+        assert!(h.cons.pending_new_map.is_some(), "still truncating");
+
+        // Only the archive's Truncated ack reopens the gate (reconciliation done).
+        h.cons.on_truncated(4096);
+        assert!(h.gate_open(), "the Truncated ack completes reconciliation and reopens");
+        assert!(h.cons.pending_new_map.is_none());
+    }
 }

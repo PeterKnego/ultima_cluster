@@ -207,11 +207,16 @@ impl Archive {
     /// A truncation that would drop or shrink the FIRST archived block returns
     /// `UnsupportedTruncation`: `Journal::truncate_after(keep_seq)` keeps every
     /// record with `seq <= keep_seq` and so can never remove the earliest block.
-    /// This is unreachable in M4 — reconciliation truncation points are term-map
-    /// bases, and term 1's base is position 0 = block 0's start, which takes the
-    /// whole-block or no-op path; a partial cut strictly inside the first block
-    /// of the whole cluster history requires a divergence within a committed
-    /// prefix, which the sim confirms never occurs.
+    ///
+    /// This case IS reachable in early-life contested elections — it is NOT
+    /// verified-impossible (the sim does not model archive blocks and cannot
+    /// check it). Concretely: a node fsyncs its term-1 `NewTerm` frame, is
+    /// partitioned before any datagram lands, and a peer wins term 2 at base 0;
+    /// on heal, reconciliation yields `Truncate{to: 0}` → `pos == first_base` →
+    /// `lo == first` → `UnsupportedTruncation`. This is currently a FAIL-STOP
+    /// error requiring manual intervention (and it recurs on every restart, since
+    /// the divergent block is still durable). First-block truncation support
+    /// (journal full-clear / snapshot re-seed) is a REQUIRED M5 follow-up.
     pub fn truncate_to(&mut self, pos: u64) -> Result<(), ArchiveError> {
         if pos == self.durable_pos {
             return Ok(());
