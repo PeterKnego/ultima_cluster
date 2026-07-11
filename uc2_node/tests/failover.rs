@@ -572,34 +572,30 @@ fn heal_truncates_divergent_tail_and_reconverges() {
     });
     assert!(c.nodes[old].term() >= c.nodes[new].term(), "old leader did not adopt the new term");
 
-    // DATA-PLANE catch-up. The ex-leader can only carry term-(N+1) data durably
-    // PAST its phantom ceiling after the truncation above cut the divergence at
-    // `base`. A fully idle catch-up is blocked by a SEPARATE, pre-existing
-    // `uc2_net` race (outside this fix's scope): the archive truncation's
-    // `LogCounters::prime(to)` can regress the shared `append` counter AFTER the
-    // follower-receiver has already rebuilt past `to`, and the receiver never
-    // re-asserts `append == rebuilt.contiguous` (its `insert()` stores only on a
-    // forward advance) — so an idle ex-leader truncates but its `durable` wedges
-    // at the truncation point. Resuming the majority's write load advances the
-    // receiver's rebuild past the regression and re-syncs the counter, keeping
-    // the replay-equality below deterministic. Follow-up: reset the receiver's
-    // `rebuilt`/`leader_append` to `to` on the truncation feedback.
-    let deadline = deadline_secs(60);
-    while c.nodes[old].durable() <= phantom_ceiling {
-        assert!(Instant::now() < deadline, "old leader never caught up past its phantom ceiling");
-        for _ in 0..16 {
-            let _ = c.nodes[new].n().submit(vec![0x11; PAYLOAD]);
-        }
-        std::thread::yield_now();
-    }
-
-    // Full reconvergence to a single, stable frontier: stop submitting, let the
-    // leader quiesce (ingress drained + last frame quorum-committed), then wait
-    // for every node (including the reconciled ex-leader) to reach that exact
-    // position — the precondition for a byte-equal replay.
+    // DATA-PLANE catch-up — with ZERO new submissions (the review's core ask;
+    // previously blocked on a pre-existing `uc2_net` wedge, now fixed). After the
+    // truncation above cut the divergence at `base`, the ex-leader catches up to
+    // the majority's frontier PURELY via the new leader's gossip floor + the
+    // follower NAK/replay path. This exercises the receiver's post-truncation
+    // resync: the archive's `LogCounters::prime(to)` regresses the shared
+    // `append` counter below the receiver's rebuilt frontier, and the receiver
+    // re-syncs its tracker at the top of its duty cycle so the re-shipped DATA
+    // below the (stale) frontier is ACCEPTED rather than dropped as a dup —
+    // without which `durable` wedged at the truncation point forever.
     let _ = (base, fresh);
+
+    // Full reconvergence to a single, stable frontier: the idle leader is already
+    // quiesced (no submissions since heal); capture its committed frontier and
+    // wait for every node — including the reconciled ex-leader — to reach that
+    // exact position, the precondition for a byte-equal replay.
     let final_target = await_quiesced(&c.nodes[new], 60);
     await_all(&c.nodes, final_target, 60, "reconverge durable", NodeH::durable);
+    // The ex-leader carries the majority's term-(N+1) tail, not its truncated
+    // phantom tail: its durable climbed strictly PAST the phantom ceiling.
+    assert!(
+        c.nodes[old].durable() > phantom_ceiling,
+        "ex-leader did not carry the majority tail past its phantom ceiling"
+    );
 
     c.stop_all();
     let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].dirs.journal).collect();

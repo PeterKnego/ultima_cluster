@@ -184,6 +184,11 @@ pub struct FollowerStats {
     pub statuses_sent: AtomicU64,
     pub append_positions_sent: AtomicU64,
     pub commits_received: AtomicU64,
+    /// Truncation resyncs (M4): times the receiver rebuilt its `rebuilt` gap
+    /// tracker after the archive's `LogCounters::prime(to)` regressed the shared
+    /// `append` counter below the tracker's frontier — the data-plane half of a
+    /// reconciliation truncation. See [`FollowerReceiver::resync_after_truncation`].
+    pub truncation_resyncs: AtomicU64,
 }
 
 pub struct FollowerReceiver {
@@ -337,8 +342,53 @@ impl FollowerReceiver {
         self.base.elapsed().as_nanos() as u64
     }
 
+    /// Truncation resync (M4): after a reconciliation truncation the ARCHIVE's
+    /// `LogCounters::prime(to)` REGRESSES the shared `append` counter to `to`,
+    /// but our private `rebuilt` tracker is already PAST `to` (we rebuilt to the
+    /// divergent frontier before the consensus agent cut it). We store
+    /// `append = rebuilt.contiguous()` only on a FORWARD `insert`, so the
+    /// regressed counter is never re-asserted — every subsequent DATA landing
+    /// below the stale `contiguous` is dropped as a dup (`h.position <
+    /// contiguous`) and `append`/`durable` would wedge at the truncation point
+    /// forever.
+    ///
+    /// Only a truncation can drive the shared counter BELOW our tracker: in the
+    /// follower role we are the counter's sole FORWARD writer and the archive's
+    /// `prime` is its only backward writer, so `append < contiguous` is an
+    /// unambiguous truncation signature. On detection, rebuild the tracker from
+    /// the re-primed counter — reset `rebuilt` and `leader_append` to `append`
+    /// (stale tail-gap state would otherwise NAK for pre-truncation positions)
+    /// and disarm the NAK timer (fresh gap tracking; `poll(None, …)` clears the
+    /// armed gap).
+    ///
+    /// The intake gate is held CLOSED for the entire truncation round-trip
+    /// (`node.rs`: gate closed → `Truncate` → archive `truncate_to` + `prime` →
+    /// ack → gate reopened), so no DATA lands mid-regress. Running this at the
+    /// TOP of `do_work` guarantees the resync happens on the first post-reopen
+    /// duty cycle BEFORE any datagram of the new tail is processed.
+    fn resync_after_truncation(&mut self) {
+        let append = self.buffer.counters().append.load_acquire();
+        if append < self.rebuilt.contiguous() {
+            self.rebuilt = Rebuilt::new(append);
+            self.leader_append = append;
+            self.nak.poll(None, self.now_ns()); // disarm: the gap predates the cut
+            // The report cursors shadow the frontier and must regress with it:
+            // `status_at` gates on `contiguous - status_at` (would underflow if
+            // left above the re-primed frontier), and `ap_reported` gates the
+            // AppendPosition send so the first re-established durable reports
+            // promptly toward the new leader's commit ranking.
+            self.status_at = append;
+            self.ap_reported = append;
+            self.stats.truncation_resyncs.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// One duty cycle: drain up to 64 datagrams, then NAK/status upkeep.
     pub fn do_work(&mut self) -> bool {
+        // FIRST, before any datagram: if the archive truncated and re-primed the
+        // shared `append` counter below our rebuilt frontier, rebuild the tracker
+        // so the re-shipped post-truncation tail is accepted, not dropped as dup.
+        self.resync_after_truncation();
         let mut did = false;
         self.activity_emitted = false; // one LeaderActivity per cycle (node mode)
         for _ in 0..64 {
@@ -1445,6 +1495,61 @@ mod tests {
             assert!(Instant::now() < deadline, "AppendPosition never resumed after reopen");
             r.do_work();
         }
+    }
+
+    /// M4 truncation resync: after a reconciliation truncation the archive's
+    /// `prime(to)` REGRESSES the shared `append` counter below the receiver's
+    /// private `rebuilt.contiguous` frontier. The receiver must detect the
+    /// regression at the TOP of its duty cycle, rebuild its tracker from the
+    /// re-primed counter, and then ACCEPT DATA at the truncation point — pre-fix
+    /// it dropped every such datagram as a dup (`position < contiguous`) and
+    /// wedged `append`/`durable` at the truncation point forever.
+    #[test]
+    fn truncation_regression_resyncs_rebuilt_tracker() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+
+        // 1. drive the follower's contiguous frontier to 288 (three 96 B frames).
+        let runs = frame_runs(&[&[1u8; 64], &[2u8; 64], &[3u8; 64]], 96);
+        assert_eq!(runs.len(), 3);
+        for (pos, bytes, _) in &runs {
+            leader.send(to, DGRAM_KIND_DATA, *pos, TERM, bytes);
+        }
+        drive_until(&mut r, || b.counters().append.load_acquire() == 288);
+
+        // 2. simulate the archive truncation round-trip: the consensus agent has
+        //    closed the intake gate and the archive re-primed the counters back
+        //    to 96 (a divergent tail past 96 was cut). No DATA lands mid-regress
+        //    because the gate is closed; here we drive the counter directly. The
+        //    receiver's private tracker is still at 288.
+        b.counters().prime(96);
+        assert_eq!(b.counters().append.load_acquire(), 96);
+
+        // 3. one duty cycle detects the regression and resyncs. The check is at
+        //    the top of do_work and synchronous on the counter, so exactly one
+        //    call trips it (no DATA is pending).
+        r.do_work();
+        assert_eq!(r.stats().truncation_resyncs.load(Relaxed), 1);
+
+        // 4. DATA at the truncation point (position 96) is now ACCEPTED and
+        //    advances the frontier FROM 96 — pre-fix `96 < contiguous(288)` so it
+        //    was dropped as a dup and the log never moved.
+        let dup_before = r.stats().dropped_dup.load(Relaxed);
+        leader.send(to, DGRAM_KIND_DATA, runs[1].0, TERM, &runs[1].1);
+        drive_until(&mut r, || b.counters().append.load_acquire() == 192);
+        assert_eq!(
+            r.stats().dropped_dup.load(Relaxed),
+            dup_before,
+            "post-resync DATA at the truncation point was dropped as a dup"
+        );
+
+        // 5. idempotent: once the tracker matches the counter again, no further
+        //    resync fires.
+        r.do_work();
+        assert_eq!(r.stats().truncation_resyncs.load(Relaxed), 1);
     }
 
     /// Leader-role node composition (M4): the unified `FollowerReceiver` with a
