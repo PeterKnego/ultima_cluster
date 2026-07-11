@@ -90,11 +90,12 @@ pub struct SenderStats {
     pub naks_served: AtomicU64,
     pub heartbeats: AtomicU64,
     pub flow_stalls: AtomicU64,
-    /// A NAK whose bytes had left the ring could NOT be served from the
-    /// journal — either no replay source is wired, or the position is below
-    /// the first archived block (purged; M6). With a replay source set for a
-    /// still-archived position, the seam is served (see `replay_datagrams`),
-    /// not counted here.
+    /// A NAK unservable from EITHER source — the requested bytes had scrolled out
+    /// of the ring AND could not be replayed from the journal (no replay source
+    /// wired, or the position is below the first archived block: purged; M6). With
+    /// a replay source set for a still-archived position the seam IS served (see
+    /// `replay_datagrams`) and is not counted here — this counter is strictly the
+    /// "bytes gone from ring and journal" case.
     pub overruns: AtomicU64,
     /// DATA datagrams retransmitted from the JOURNAL to serve a deep NAK whose
     /// bytes had already scrolled out of the ring (M4 replay sessions). This is

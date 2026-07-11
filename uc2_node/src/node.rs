@@ -8,7 +8,7 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Instant;
 
 use uc2_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId};
@@ -28,6 +28,23 @@ use uc_protocol::v2::datagram::{
     RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire, VOTE_BODY_LEN,
     VoteBody, write_datagram_header, write_request_vote_body, write_term_map_body, write_vote_body,
 };
+
+/// Single-slot truncation ack. One truncation is in flight at a time (the SM
+/// latch serializes them), so a slot suffices and, unlike a bounded channel,
+/// cannot drop an ack (M4 final-review carry: infallible ack send). Holds the
+/// `(epoch, to)` of the most recently completed truncation until the consensus
+/// agent takes it.
+#[derive(Clone, Default)]
+pub(crate) struct TruncationSlot(Arc<Mutex<Option<(u64, u64)>>>);
+
+impl TruncationSlot {
+    pub fn post(&self, epoch: u64, to: u64) {
+        *self.0.lock().unwrap() = Some((epoch, to));
+    }
+    pub fn take(&self) -> Option<(u64, u64)> {
+        self.0.lock().unwrap().take()
+    }
+}
 
 /// Journal + node-state directories for one node.
 #[derive(Debug, Clone)]
@@ -190,8 +207,10 @@ impl Node {
         let (ctrl_tx, ctrl_rx) = mpsc::sync_channel::<CtrlMsg>(1024);
         let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Vec<u8>>(INGRESS_CAPACITY);
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(1024);
-        let (trunc_tx, trunc_rx) = mpsc::sync_channel::<u64>(64);
-        let (ack_tx, ack_rx) = mpsc::sync_channel::<u64>(64);
+        // Truncation command channel carries `(epoch, to)`; the ack rides an
+        // infallible single slot (one truncation in flight — the SM latch).
+        let (trunc_tx, trunc_rx) = mpsc::sync_channel::<(u64, u64)>(64);
+        let trunc_slot = TruncationSlot::default();
 
         // Sender (streams when leader; node-mode disables its own ranking).
         let mut sender_cfg = SenderConfig::new(boot_term);
@@ -226,12 +245,14 @@ impl Node {
         // dropped), then record, then ship data-stamped term observations.
         let arc_buffer = Arc::clone(&buffer);
         let arc_counters = Arc::clone(&counters);
+        let arc_slot = trunc_slot.clone();
         let archive_agent = AgentRunner::spawn("uc2-archive", IdleStrategy::Yield, move || {
             let mut did = false;
-            while let Ok(to) = trunc_rx.try_recv() {
+            while let Ok((epoch, to)) = trunc_rx.try_recv() {
                 archive.truncate_to(to).expect("archive truncate fail-stop");
                 arc_counters.prime(to);
-                let _ = ack_tx.try_send(to);
+                // Infallible ack: a single slot cannot drop (one in flight).
+                arc_slot.post(epoch, to);
                 did = true;
             }
             if archive.do_work(&arc_buffer).expect("archive fail-stop") {
@@ -267,7 +288,7 @@ impl Node {
             obs_rx,
             ingress_rx,
             trunc_tx,
-            ack_rx,
+            trunc_slot,
             term_handle: Arc::clone(&term_handle),
             leader_flag: Arc::clone(&leader_flag),
             can_serve_flag: Arc::clone(&can_serve_flag),
@@ -277,7 +298,7 @@ impl Node {
             durable_seen: durable,
             adopted_term: boot_term,
             awaiting_reconcile: false,
-            pending_new_map: None,
+            pending_truncation: None,
         };
         let consensus_agent =
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
@@ -340,10 +361,23 @@ impl Node {
     }
 
     /// Consensus events dropped because the NetEvent channel was full (T7
-    /// observability). Safe drops — votes/reports/gossip re-fire on their
-    /// cadence — but a rising count signals a wedged consensus agent.
+    /// observability), summed across kinds. Safe drops — votes/reports/gossip
+    /// re-fire on their cadence — but a rising count signals a wedged consensus
+    /// agent. Use [`net_event_drops_by_kind`](Self::net_event_drops_by_kind) to
+    /// attribute the drops to a specific traffic class.
     pub fn net_event_drops(&self) -> u64 {
-        self.route_drops.route_drops.load(Ordering::Relaxed)
+        self.route_drops.net_drops.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+    }
+
+    /// Per-kind consensus-event drop counts, indexed by
+    /// [`uc2_net::receiver::NetEvent::kind_idx`]
+    /// (Report, CommitGossip, RequestVote, Vote, TermMap, LeaderActivity).
+    pub fn net_event_drops_by_kind(&self) -> [u64; uc2_net::receiver::NET_EVENT_KINDS] {
+        let mut out = [0u64; uc2_net::receiver::NET_EVENT_KINDS];
+        for (o, c) in out.iter_mut().zip(self.route_drops.net_drops.iter()) {
+            *o = c.load(Ordering::Relaxed);
+        }
+        out
     }
 
     /// Graceful stop: signal every agent and join.
@@ -381,8 +415,8 @@ struct Consensus {
     net_rx: mpsc::Receiver<NetEvent>,
     obs_rx: mpsc::Receiver<(u32, u64)>,
     ingress_rx: mpsc::Receiver<Vec<u8>>,
-    trunc_tx: mpsc::SyncSender<u64>,
-    ack_rx: mpsc::Receiver<u64>,
+    trunc_tx: mpsc::SyncSender<(u64, u64)>,
+    trunc_slot: TruncationSlot,
     term_handle: TermHandle,
     leader_flag: Arc<AtomicBool>,
     can_serve_flag: Arc<AtomicBool>,
@@ -392,7 +426,10 @@ struct Consensus {
     durable_seen: u64,
     adopted_term: u32,
     awaiting_reconcile: bool,
-    pending_new_map: Option<Vec<(u32, u64)>>,
+    /// The epoch of the truncation currently in flight (emit→ack bracket). `Some`
+    /// from `Action::Truncate` exec until the matching slot ack; the intake-gate
+    /// reopen discipline uses it to know a truncation is pending.
+    pending_truncation: Option<u64>,
 }
 
 impl Consensus {
@@ -418,9 +455,10 @@ impl Consensus {
             did = true;
         }
 
-        // 1c. Drain truncation acks (a later cycle after emitting `Truncate`).
-        while let Ok(to) = self.ack_rx.try_recv() {
-            self.on_truncated(to);
+        // 1c. Drain the truncation ack slot (a later cycle after emitting
+        // `Truncate`). The infallible single slot holds at most one ack.
+        if let Some((epoch, to)) = self.trunc_slot.take() {
+            self.on_truncated(epoch, to);
             did = true;
         }
 
@@ -549,23 +587,26 @@ impl Consensus {
             // for the adopted term.
             //
             // C-1 guard: also require that NO truncation is in flight
-            // (`pending_new_map.is_none()`). A leader re-ships its map at kHz, so
+            // (`pending_truncation.is_none()`). A leader re-ships its map at kHz, so
             // a duplicate TermMap routinely lands AFTER we emitted `Action::Truncate`
-            // but BEFORE the archive's `Truncated` ack. On that duplicate the SM's
-            // `truncating` latch drops the event with ZERO actions, so
+            // but BEFORE the archive's slot ack. On that duplicate the SM's
+            // truncating latch drops the event with ZERO actions, so
             // `produced_truncate` is false and the term hasn't moved — the old
             // heuristic would reopen the gate MID-TRUNCATION, letting the receiver
             // ship an AppendPosition stamped with the current term over the raw
             // divergent durable (counters not yet re-primed) → monotonic-max
             // poisons the leader's CommitTracker → phantom commit. The node's own
-            // emit→ack marker (`pending_new_map`: set in `Action::Truncate`,
+            // emit→ack marker (`pending_truncation`: set in `Action::Truncate`,
             // cleared in `on_truncated`) brackets that window exactly.
             if let Some(t) = tm_term
                 && self.awaiting_reconcile
                 && !produced_truncate
-                && self.pending_new_map.is_none()
+                && self.pending_truncation.is_none()
                 && t >= term_before
             {
+                // Clean reconcile for the adopted term: reopen and clear the
+                // awaiting-reconcile latch (M-3).
+                self.awaiting_reconcile = false;
                 self.open_gate();
             }
         }
@@ -629,7 +670,9 @@ impl Consensus {
                 self.appender = Some(appender);
                 work.push(Event::NewTermAppended { position: end });
                 self.adopted_term = term;
-                self.open_gate(); // a leader is the source of truth; no reconcile pending
+                // A leader is the source of truth; no reconcile pending (M-3).
+                self.awaiting_reconcile = false;
+                self.open_gate();
                 self.leader_flag.store(true, Ordering::Release);
             }
             Action::BecomeFollower { term, .. } => {
@@ -663,12 +706,28 @@ impl Consensus {
                     self.send(addr, DGRAM_KIND_TERM_MAP, 0, term, &body);
                 }
             }
-            Action::Truncate { to, new_map } => {
-                // Pause intake, stash the map to persist on ack, command the
-                // archive. The SM has already latched out the data plane.
+            Action::Truncate { epoch, to, new_map } => {
+                // Persist-before-truncate ordering (M5): store the pruned map
+                // DURABLY *before* commanding the physical truncate, so a crash in
+                // the window recovers a map that is a valid prefix of the
+                // truncated log — never a map that claims terms above the
+                // still-present bytes. With `rederive_term_map` this is
+                // self-healing: a persisted-but-not-truncated journal is corrected
+                // by the reconcile that reissues the truncate on the next boot.
+                self.state
+                    .store_term_map(&to_entries(&new_map))
+                    .expect("term-map persist fail-stop");
+                // Pause intake and record the emit→ack bracket (the SM allocated
+                // `epoch`; we transport it). The SM has already latched the data
+                // plane. Emitting the truncate IS the reconcile decision for the
+                // currently-adopted term, so clear `awaiting_reconcile` — a
+                // higher term adopted while the truncate is in flight re-arms it
+                // (BecomeFollower), keeping the gate closed until THAT term
+                // reconciles.
                 self.close_gate();
-                self.pending_new_map = Some(new_map);
-                self.trunc_tx.send(to).expect("archive channel closed");
+                self.pending_truncation = Some(epoch);
+                self.awaiting_reconcile = false;
+                self.trunc_tx.send((epoch, to)).expect("archive channel closed");
             }
             Action::PersistTermMap { new_map } => {
                 self.state
@@ -681,21 +740,28 @@ impl Consensus {
         }
     }
 
-    /// Archive-truncation feedback: adopt + persist the reconciled map, reopen
-    /// intake, release the SM latch, count the truncation.
-    fn on_truncated(&mut self, to: u64) {
-        if let Some(new_map) = self.pending_new_map.take() {
-            self.state
-                .store_term_map(&to_entries(&new_map))
-                .expect("term-map persist fail-stop");
-        }
+    /// Archive-truncation feedback (slot ack). The map was already persisted
+    /// durably in `Action::Truncate` (persist-before-truncate), so nothing is
+    /// stored here. The `Event::Truncated{epoch, to}` is fed UNCONDITIONALLY —
+    /// physical truncation is the truth about durability and the SM's durable
+    /// clamp must run even for a stale-epoch ack. Only the MATCHING epoch clears
+    /// the emit→ack bracket, counts the truncation, and reopens the gate — and the
+    /// reopen fires only if no newer term is itself awaiting reconcile (a term
+    /// adopted mid-truncation re-armed `awaiting_reconcile`, and its fresh
+    /// reconcile in the new term must complete first).
+    fn on_truncated(&mut self, epoch: u64, to: u64) {
         // The archive re-primed the counters to `to`; keep our shadow in step so
         // we don't refeed a spurious DurableAdvanced.
         self.durable_seen = to;
-        self.open_gate();
-        self.awaiting_reconcile = false;
-        self.truncations.fetch_add(1, Ordering::Relaxed);
-        self.feed(Event::Truncated { to });
+        let matching = self.pending_truncation == Some(epoch);
+        self.feed(Event::Truncated { epoch, to });
+        if matching {
+            self.pending_truncation = None;
+            self.truncations.fetch_add(1, Ordering::Relaxed);
+            if !self.awaiting_reconcile {
+                self.open_gate();
+            }
+        }
     }
 
     fn open_gate(&self) {
@@ -779,14 +845,37 @@ mod tests {
         _net_tx: mpsc::SyncSender<NetEvent>,
         _obs_tx: mpsc::SyncSender<(u32, u64)>,
         _ingress_tx: mpsc::SyncSender<Vec<u8>>,
-        _trunc_rx: mpsc::Receiver<u64>,
-        _ack_tx: mpsc::SyncSender<u64>,
+        _trunc_rx: mpsc::Receiver<(u64, u64)>,
         _dir: tempfile::TempDir,
     }
 
     impl Harness {
         fn gate_open(&self) -> bool {
             self.cons.intake_gate.load(Ordering::Acquire)
+        }
+
+        /// Adopt `term` (higher-term RequestVote), then deliver a divergent term
+        /// map that reconciles to a `Truncate` in flight. Drains the archive
+        /// command so the channel stays clear.
+        fn adopt_and_truncate(&mut self, term: u32, entries: Vec<(u32, u64)>) {
+            self.cons.feed(Event::RequestVote {
+                from: 0,
+                new_term: term,
+                last_term: 1,
+                last_durable: 7000,
+            });
+            self.cons.feed(Event::TermMapReceived { term, entries });
+            // Consume the archive command (the real archive agent would).
+            let _ = self._trunc_rx.try_recv();
+        }
+
+        /// Simulate the archive completing the truncation and the consensus
+        /// duty-cycle draining the infallible slot.
+        fn post_ack_and_drain(&mut self, epoch: u64, to: u64) {
+            self.cons.trunc_slot.post(epoch, to);
+            if let Some((e, t)) = self.cons.trunc_slot.take() {
+                self.cons.on_truncated(e, t);
+            }
         }
     }
 
@@ -836,8 +925,8 @@ mod tests {
         let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(64);
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(64);
         let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Vec<u8>>(64);
-        let (trunc_tx, trunc_rx) = mpsc::sync_channel::<u64>(64);
-        let (ack_tx, ack_rx) = mpsc::sync_channel::<u64>(64);
+        let (trunc_tx, trunc_rx) = mpsc::sync_channel::<(u64, u64)>(64);
+        let trunc_slot = TruncationSlot::default();
 
         let sock = FaultSocket::from_socket(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
         let intake_gate = Arc::new(AtomicBool::new(true));
@@ -859,7 +948,7 @@ mod tests {
             obs_rx,
             ingress_rx,
             trunc_tx,
-            ack_rx,
+            trunc_slot,
             term_handle: Arc::new(AtomicU32::new(boot_term)),
             leader_flag: Arc::new(AtomicBool::new(false)),
             can_serve_flag: Arc::new(AtomicBool::new(false)),
@@ -869,7 +958,7 @@ mod tests {
             durable_seen: 6000,
             adopted_term: boot_term,
             awaiting_reconcile: false,
-            pending_new_map: None,
+            pending_truncation: None,
         };
 
         Harness {
@@ -878,19 +967,18 @@ mod tests {
             _obs_tx: obs_tx,
             _ingress_tx: ingress_tx,
             _trunc_rx: trunc_rx,
-            _ack_tx: ack_tx,
             _dir: dir,
         }
     }
 
     /// C-1 regression: a DUPLICATE term map delivered AFTER `Action::Truncate`
-    /// executed but BEFORE the archive's `Truncated` ack must leave the intake
-    /// gate CLOSED. A leader re-ships its map at kHz, so this duplicate is the
-    /// common case, not a rare one. On the duplicate the SM's `truncating` latch
-    /// drops the event with zero actions; without the `pending_new_map.is_none()`
-    /// guard the reopen heuristic (no truncate produced + term unchanged) would
-    /// reopen the gate mid-truncation, letting the receiver ship an AppendPosition
-    /// over the raw divergent durable → phantom commit.
+    /// executed but BEFORE the archive's slot ack must leave the intake gate
+    /// CLOSED. A leader re-ships its map at kHz, so this duplicate is the common
+    /// case, not a rare one. On the duplicate the SM's truncating latch drops the
+    /// event with zero actions; without the `pending_truncation.is_none()` guard
+    /// the reopen heuristic (no truncate produced + term unchanged) would reopen
+    /// the gate mid-truncation, letting the receiver ship an AppendPosition over
+    /// the raw divergent durable → phantom commit.
     #[test]
     fn duplicate_term_map_mid_truncation_keeps_gate_closed() {
         let mut h = harness();
@@ -907,26 +995,48 @@ mod tests {
         assert!(h.cons.awaiting_reconcile);
 
         // Term-map #1: reconciles to a divergent tail → Action::Truncate. The node
-        // stashes `pending_new_map`, closes the gate, and commands the archive.
+        // persists the pruned map, records `pending_truncation`, closes the gate,
+        // and commands the archive with `(epoch, to)`.
         h.cons.feed(Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
         assert!(!h.gate_open(), "gate stays closed while the truncate is emitted");
-        assert!(h.cons.pending_new_map.is_some(), "a truncation is now in flight");
-        // The truncate command reached the archive channel.
-        assert_eq!(h._trunc_rx.try_recv().ok(), Some(4096));
+        let epoch = h.cons.pending_truncation.expect("a truncation is now in flight");
+        // The truncate command reached the archive channel with its epoch.
+        assert_eq!(h._trunc_rx.try_recv().ok(), Some((epoch, 4096)));
 
         // Term-map #2: the leader re-ships the SAME map while the archive
-        // truncation is still in flight. The SM's `truncating` latch drops it with
+        // truncation is still in flight. The SM's truncating latch drops it with
         // zero actions. The gate MUST remain closed (C-1 guard).
         h.cons.feed(Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
         assert!(
             !h.gate_open(),
             "a duplicate term map mid-truncation must NOT reopen the intake gate"
         );
-        assert!(h.cons.pending_new_map.is_some(), "still truncating");
+        assert!(h.cons.pending_truncation.is_some(), "still truncating");
 
-        // Only the archive's Truncated ack reopens the gate (reconciliation done).
-        h.cons.on_truncated(4096);
+        // Only the archive's slot ack reopens the gate (reconciliation done).
+        h.post_ack_and_drain(epoch, 4096);
         assert!(h.gate_open(), "the Truncated ack completes reconciliation and reopens");
-        assert!(h.cons.pending_new_map.is_none());
+        assert!(h.cons.pending_truncation.is_none());
+    }
+
+    /// M5 residual carry: a matching-epoch ack for a truncation whose adopted term
+    /// was SUPERSEDED mid-flight must NOT reopen the gate (nor persist a stale
+    /// map). The pruned map was already persisted at `Action::Truncate` time
+    /// (persist-before-truncate), and the newer term's own reconcile must complete
+    /// before intake reopens.
+    #[test]
+    fn stale_ack_after_adoption_does_not_reopen_gate_or_persist_stale_map() {
+        let mut h = harness();
+        // adopt term 3, receive divergent map → Truncate (epoch e1) in flight
+        h.adopt_and_truncate(3, vec![(1, 0), (3, 4096)]);
+        // higher term 4 adopted mid-truncation
+        h.cons.feed(Event::RequestVote { from: 0, new_term: 4, last_term: 3, last_durable: 9000 });
+        assert!(!h.gate_open());
+        // the e1 ack arrives (archive finished the OLD truncation)
+        h.post_ack_and_drain(/*epoch*/ 1, /*to*/ 4096);
+        assert!(!h.gate_open(), "gate must stay closed: term 4 not yet reconciled");
+        // clean reconcile in term 4 reopens
+        h.cons.feed(Event::TermMapReceived { term: 4, entries: vec![(1, 0), (4, 4096)] });
+        assert!(h.gate_open());
     }
 }

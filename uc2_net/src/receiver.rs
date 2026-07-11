@@ -58,6 +58,25 @@ pub enum NetEvent {
     LeaderActivity { term: u32 },
 }
 
+impl NetEvent {
+    /// Dense index for the per-kind drop counters (`FollowerStats::net_drops`).
+    /// Stable ordering — the array is read out positionally by observability.
+    #[inline]
+    pub fn kind_idx(&self) -> usize {
+        match self {
+            NetEvent::Report { .. } => 0,
+            NetEvent::CommitGossip { .. } => 1,
+            NetEvent::RequestVote { .. } => 2,
+            NetEvent::Vote { .. } => 3,
+            NetEvent::TermMap { .. } => 4,
+            NetEvent::LeaderActivity { .. } => 5,
+        }
+    }
+}
+
+/// Number of [`NetEvent`] kinds (the width of the per-kind drop counters).
+pub const NET_EVENT_KINDS: usize = 6;
+
 /// Parse a consensus-plane datagram (kinds 5–9) into a [`NetEvent`], RAW — no
 /// term filter (the SM adopts higher terms). `from` is the datagram's source
 /// address (Report/RequestVote/Vote address their reply by it). Returns `None`
@@ -176,18 +195,22 @@ pub struct FollowerStats {
     /// window — the consensus agent holds it shut; see `set_intake_gate`).
     pub dropped_gated: AtomicU64,
     /// Consensus events (kinds 5–9) dropped because the consensus route channel
-    /// was FULL (M4 node composition — the T7 observability concern). Safe:
-    /// votes re-fire on the election timeout, reports/gossip on their floors.
-    /// Surfaced so a wedged consensus agent is diagnosable rather than silent.
-    pub route_drops: AtomicU64,
+    /// was FULL (M4 node composition — the T7 observability concern), counted
+    /// PER KIND (indexed by [`NetEvent::kind_idx`]) so a wedge is attributable to
+    /// the specific traffic class starving. Safe: votes re-fire on the election
+    /// timeout, reports/gossip on their floors. Surfaced so a wedged consensus
+    /// agent is diagnosable rather than silent.
+    pub net_drops: [AtomicU64; NET_EVENT_KINDS],
     pub naks_sent: AtomicU64,
     pub statuses_sent: AtomicU64,
     pub append_positions_sent: AtomicU64,
     pub commits_received: AtomicU64,
-    /// Truncation resyncs (M4): times the receiver rebuilt its `rebuilt` gap
+    /// Counter-regress resyncs (M4): times the receiver rebuilt its `rebuilt` gap
     /// tracker after the archive's `LogCounters::prime(to)` regressed the shared
-    /// `append` counter below the tracker's frontier — the data-plane half of a
-    /// reconciliation truncation. See [`FollowerReceiver::resync_after_truncation`].
+    /// `append` counter below the tracker's frontier. Fires on a reconciliation
+    /// truncation AND on a `BecomeLeader` collapse-to-base prime (both drive the
+    /// counter backward); the resync is the correct recovery for either. See
+    /// [`FollowerReceiver::resync_after_truncation`].
     pub truncation_resyncs: AtomicU64,
 }
 
@@ -352,11 +375,15 @@ impl FollowerReceiver {
     /// contiguous`) and `append`/`durable` would wedge at the truncation point
     /// forever.
     ///
-    /// Only a truncation can drive the shared counter BELOW our tracker: in the
-    /// follower role we are the counter's sole FORWARD writer and the archive's
-    /// `prime` is its only backward writer, so `append < contiguous` is an
-    /// unambiguous truncation signature. On detection, rebuild the tracker from
-    /// the re-primed counter — reset `rebuilt` and `leader_append` to `append`
+    /// A backward move of the shared counter below our tracker is the archive's
+    /// `prime` signature: in the follower role we are the counter's sole FORWARD
+    /// writer and `prime` is its only backward writer, so `append < contiguous` is
+    /// unambiguous. It fires on a reconciliation truncation AND on a leader-open
+    /// collapse (`BecomeLeader` primes to `base`) — this resync handles BOTH,
+    /// harmless-to-beneficial: whatever regressed the counter, rebuilding the gap
+    /// tracker from the re-primed frontier is exactly the right recovery. On
+    /// detection, rebuild the tracker from the re-primed counter — reset `rebuilt`
+    /// and `leader_append` to `append`
     /// (stale tail-gap state would otherwise NAK for pre-truncation positions)
     /// and disarm the NAK timer (fresh gap tracking; `poll(None, …)` clears the
     /// armed gap).
@@ -425,11 +452,14 @@ impl FollowerReceiver {
         if self.route.is_some() && is_consensus_kind(h.kind) {
             if let Some(ev) = consensus_event(&h, d, from)
                 && let Some(route) = &self.route
-                && route.try_send(ev).is_err()
             {
-                // A full consensus channel drops term-critical traffic; count it
-                // (the consensus agent's cadence recovers — votes/reports re-fire).
-                self.stats.route_drops.fetch_add(1, Ordering::Relaxed);
+                let idx = ev.kind_idx();
+                if route.try_send(ev).is_err() {
+                    // A full consensus channel drops term-critical traffic; count
+                    // it per kind (the consensus agent's cadence recovers —
+                    // votes/reports re-fire).
+                    self.stats.net_drops[idx].fetch_add(1, Ordering::Relaxed);
+                }
             }
             return;
         }

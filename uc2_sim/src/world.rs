@@ -189,8 +189,9 @@ enum SimEvent {
     ArchiveStep { node: usize },
     Restart { node: usize },
     /// Agent feedback for a completed truncation (`Event::Truncated`), scheduled
-    /// as the next event to model the latch window.
-    TruncatedFeedback { node: usize, to: u64 },
+    /// as the next event to model the latch window. Carries the SM-allocated
+    /// `epoch` so the feedback matches the in-flight truncation (M5).
+    TruncatedFeedback { node: usize, epoch: u64, to: u64 },
 }
 
 /// Heap entry ordered strictly by `(time, seq)` — `seq` is globally unique so
@@ -537,7 +538,9 @@ impl World {
             SimEvent::Tick { node } => self.on_tick(node, now, step),
             SimEvent::ArchiveStep { node } => self.on_archive(node, now, step),
             SimEvent::Restart { node } => self.on_restart(node, now),
-            SimEvent::TruncatedFeedback { node, to } => self.on_truncated_feedback(node, to, now, step),
+            SimEvent::TruncatedFeedback { node, epoch, to } => {
+                self.on_truncated_feedback(node, epoch, to, now, step)
+            }
             SimEvent::Deliver { to, from, msg } => {
                 if !self.nodes[to].up || self.blocked(from, to) || self.vote_blocked(&msg) {
                     return Ok(());
@@ -652,6 +655,7 @@ impl World {
     fn on_truncated_feedback(
         &mut self,
         node: usize,
+        epoch: u64,
         to: u64,
         now: u64,
         step: u64,
@@ -659,7 +663,7 @@ impl World {
         if !self.nodes[node].up {
             return Ok(());
         }
-        self.feed(node, Event::Truncated { to }, now, step)?;
+        self.feed(node, Event::Truncated { epoch, to }, now, step)?;
         // The SM has adopted its pending map; mirror it into our persisted store.
         let m = self.nodes[node].sm.term_map().to_vec();
         let nd = &mut self.nodes[node];
@@ -923,7 +927,7 @@ impl World {
             Action::PersistTermMap { new_map } => {
                 self.nodes[node].term_map = new_map;
             }
-            Action::Truncate { to, new_map } => {
+            Action::Truncate { epoch, to, new_map } => {
                 let own_before = self.nodes[node].map_before_reconcile.clone();
                 let leader = self.nodes[node].last_leader_map.clone();
                 self.checker.on_truncate(node as NodeId, to, &own_before, &leader, step)?;
@@ -945,8 +949,9 @@ impl World {
                     // durable stayed at `to` (archive-durable), map stayed old.
                     self.do_crash(node, now);
                 } else {
-                    // Feed `Truncated` back as the very next event (latch window).
-                    self.push(SimEvent::TruncatedFeedback { node, to }, now);
+                    // Feed `Truncated` back as the very next event (latch window),
+                    // carrying the SM-allocated epoch so it matches (M5).
+                    self.push(SimEvent::TruncatedFeedback { node, epoch, to }, now);
                 }
             }
             Action::Fatal { reason } => {

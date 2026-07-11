@@ -89,10 +89,13 @@ pub enum Event {
     /// truncation (a data-plane event; the term is re-observed once the data
     /// plane resumes).
     DataTermObserved { term: u32, base: u64 },
-    /// Agent feedback: the archive was truncated to `to` and the write counter
-    /// re-primed. Lands durable at `to`, adopts the pending map, clears the
-    /// truncating latch.
-    Truncated { to: u64 },
+    /// Agent feedback: the archive was truncated to `to` under truncation `epoch`
+    /// and the write counter re-primed. The durable clamp (`durable = min(durable,
+    /// to)`) is UNCONDITIONAL — physical truncation is the truth about durability,
+    /// even for a stale-epoch ack. The truncating latch is released and the
+    /// pending map adopted IFF `epoch` matches the in-flight truncation the SM
+    /// allocated in the corresponding `Action::Truncate`.
+    Truncated { epoch: u64, to: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,11 +119,14 @@ pub enum Action {
     AdvanceCommit { commit: u64 },
     /// Gossip CommitPosition{commit} to followers (leader only).
     GossipCommit { commit: u64 },
-    /// Truncate our log to `to`, THEN (via `Truncated` feedback) replace our
-    /// term map with `new_map`. The agent must call `Archive::truncate_to(to)`,
-    /// re-prime the write counter, then feed `Truncated{to}` back. The SM latches
-    /// out data-plane events until that feedback arrives.
-    Truncate { to: u64, new_map: Vec<(u32, u64)> },
+    /// Truncate our log to `to`, THEN (via matching-`epoch` `Truncated` feedback)
+    /// replace our term map with `new_map`. `epoch` is SM-allocated and monotonic:
+    /// the SM owns the ack identity, the driving agent merely transports it back
+    /// on `Truncated`. The agent must persist `new_map`, call
+    /// `Archive::truncate_to(to)`, re-prime the write counter, then feed
+    /// `Truncated{epoch, to}` back. The SM latches out data-plane events until the
+    /// matching-epoch feedback arrives — even across a mid-flight term adoption.
+    Truncate { epoch: u64, to: u64, new_map: Vec<(u32, u64)> },
     /// Ship our term map to followers (leader only): the last
     /// `MAX_TERM_MAP_WIRE_ENTRIES` entries. Emitted on `BecomeLeader`,
     /// piggybacked on the commit-gossip cadence, AND re-emitted on the idle
@@ -194,13 +200,18 @@ pub struct ElectionSm {
     /// Leader: true once the NewTerm frame committed (Raft §5.4.2 read gate).
     serving: bool,
 
-    /// Follower: truncation in flight. While set, data-plane events are latched
-    /// out (no commit/durable advance); only the vote path (RequestVote/Vote)
-    /// and the `Truncated` feedback are processed. A higher term via the vote
-    /// path stays adoptable; the latch is bounded by the agent's `Truncated`
-    /// feedback (it cannot wedge indefinitely).
-    truncating: bool,
-    /// The reconciled map to adopt once `Truncated` feedback arrives.
+    /// Follower: truncation in flight, identified by its SM-allocated epoch. While
+    /// `Some`, data-plane events are latched out (no commit/durable advance); only
+    /// the vote path (RequestVote/Vote) and the `Truncated` feedback are
+    /// processed. A higher term via the vote path stays adoptable AND does NOT
+    /// clear the latch — the physical truncation must still complete and ack. The
+    /// latch is released ONLY by a matching-epoch `Truncated`, so it is bounded by
+    /// the agent's feedback (it cannot wedge indefinitely).
+    truncating_epoch: Option<u64>,
+    /// Monotonic truncation-epoch allocator. Bumped on every issued
+    /// `Action::Truncate`; the SM owns this identity and the node transports it.
+    truncation_epoch: u64,
+    /// The reconciled map to adopt once the matching `Truncated` feedback arrives.
     pending_new_map: Option<Vec<(u32, u64)>>,
 }
 
@@ -223,9 +234,15 @@ impl ElectionSm {
             cfg.id,
             cfg.members
         );
-        debug_assert!(
-            cfg.election_timeout_min_ns <= cfg.election_timeout_max_ns,
-            "election_timeout_min_ns must be <= election_timeout_max_ns (span==0 is allowed)"
+        // Hard-assert (M-2): a strictly positive timer span. An empty span
+        // (`min == max`) collapses randomized election timeouts to a single
+        // value across the cluster — a split-vote hazard — and a `min > max`
+        // wraps the span in release mode. Fail loudly at construction.
+        assert!(
+            cfg.election_timeout_min_ns < cfg.election_timeout_max_ns,
+            "election timeout span empty (min={} !< max={})",
+            cfg.election_timeout_min_ns,
+            cfg.election_timeout_max_ns
         );
 
         let map_term = recovered_term_map.last().map(|(t, _)| *t).unwrap_or(0);
@@ -256,7 +273,8 @@ impl ElectionSm {
             tracker,
             new_term_pos: None,
             serving: false,
-            truncating: false,
+            truncating_epoch: None,
+            truncation_epoch: 0,
             pending_new_map: None,
         };
         sm.arm_timeout(now_ns);
@@ -273,7 +291,8 @@ impl ElectionSm {
         // CommitGossip, TermMapReceived) are deliberately latched out here; the
         // data plane is paused during truncation and they are re-delivered once
         // it resumes, so no adoption is lost.
-        if self.truncating && !matches!(ev, Event::RequestVote { .. } | Event::Vote { .. } | Event::Truncated { .. })
+        if self.truncating_epoch.is_some()
+            && !matches!(ev, Event::RequestVote { .. } | Event::Vote { .. } | Event::Truncated { .. })
         {
             return;
         }
@@ -351,6 +370,14 @@ impl ElectionSm {
             }
 
             Event::RequestVote { from, new_term, last_term, last_durable } => {
+                // Symmetry with the Vote-grant membership check (M4 Info): a
+                // non-member RequestVote is ignored ENTIRELY — no rejection AND no
+                // term adoption. Only configured members participate in elections,
+                // and the safety core enforces that here rather than trusting the
+                // transport (which a forged-source datagram could evade).
+                if !self.members.contains(&from) {
+                    return;
+                }
                 if new_term < self.current_term {
                     // Stale candidate: reject carrying our term so it learns.
                     out.push(Action::SendVoteRejection { to: from, term: self.current_term });
@@ -414,24 +441,28 @@ impl ElectionSm {
                 }
             }
 
-            Event::Truncated { to } => {
+            Event::Truncated { epoch, to } => {
                 // I-1: physical truncation is always the truth about durability.
-                // Clamp durable down BEFORE the latch check so that even a stale
-                // or unexpected ack (we are not `truncating`) can never leave the
-                // SM overclaiming durable bytes that were physically truncated
-                // away. `min` only ever shrinks — a `to` above our durable (a
-                // truncation point beyond what we hold) reduces nothing.
+                // Clamp durable down BEFORE the epoch check so that even a stale-
+                // or wrong-epoch ack (or one arriving when we are not truncating)
+                // can never leave the SM overclaiming durable bytes that were
+                // physically truncated away. `min` only ever shrinks — a `to`
+                // above our durable reduces nothing.
                 self.durable = self.durable.min(to);
-                // Only the map-adoption / latch-release is truncation-scoped. A
-                // higher term adopted mid-flight clears the latch and abandons the
-                // pending map; ignore its stale feedback (the new leader re-ships).
-                if !self.truncating {
+                // Latch release / map adoption is scoped to the MATCHING epoch the
+                // SM allocated for this truncation. A wrong-epoch ack (a late or
+                // superseded truncation's feedback) clamps durable above but
+                // changes nothing else — the in-flight truncation is still awaited.
+                // Note the latch survives a mid-flight term adoption: the physical
+                // truncation was issued and must complete; only its own epoch's ack
+                // releases it and adopts its pruned map.
+                if self.truncating_epoch != Some(epoch) {
                     return;
                 }
                 if let Some(m) = self.pending_new_map.take() {
                     self.term_map = m;
                 }
-                self.truncating = false;
+                self.truncating_epoch = None;
             }
         }
     }
@@ -452,6 +483,16 @@ impl ElectionSm {
     /// The term map including any entry opened this run.
     pub fn term_map(&self) -> &[(u32, u64)] {
         &self.term_map
+    }
+
+    /// True while a truncation is in flight (the data-plane latch is held).
+    pub fn is_truncating(&self) -> bool {
+        self.truncating_epoch.is_some()
+    }
+
+    /// The durable byte position the SM currently believes it holds.
+    pub fn durable(&self) -> u64 {
+        self.durable
     }
 
     // ---- internals ----
@@ -535,6 +576,12 @@ impl ElectionSm {
         self.role = Role::Leader;
         self.serving = false;
         self.new_term_pos = None;
+        // Anchor the idle re-gossip floor to when leadership began (M-4). Without
+        // this the floor stays anchored at construction, so the first leader tick
+        // of a node that becomes leader long after boot immediately fires the idle
+        // re-emission (harmless, but a spurious extra datagram) instead of the
+        // first clean `gossip_floor_ns` after opening the term.
+        self.last_gossip_ns = self.last_tick_ns;
         // Open the term in the term map (base = our durable = the collapse point).
         self.term_map.push((self.current_term, self.durable));
         // Fresh follower slots: stale-term reports must not certify the new term.
@@ -551,10 +598,12 @@ impl ElectionSm {
         self.new_term_pos = None;
         self.votes_received.clear();
         self.voted_for = None; // new term: no vote cast yet
-        // A term change invalidates any pending truncation (computed against the
-        // old leader's map); the new leader will re-ship and we re-reconcile.
-        self.truncating = false;
-        self.pending_new_map = None;
+        // A term change does NOT clear an in-flight truncation (M4 I-1 / M5): the
+        // physical truncation was already issued to the archive and must complete
+        // and ack. The `truncating_epoch` latch therefore persists ACROSS adoption
+        // and is released only by its own matching-epoch `Truncated`. The pruned
+        // map it adopts is a valid prefix regardless of the new term; the new
+        // leader re-ships and we re-reconcile from there.
         out.push(Action::BecomeFollower { term: new_term, leader });
     }
 
@@ -569,10 +618,14 @@ impl ElectionSm {
             Reconcile::Ok(Outcome { valid_up_to, new_map }) => {
                 if valid_up_to < self.durable {
                     // A byte is invalid: latch out the data plane and truncate.
-                    // The map is adopted only once the archive confirms.
-                    self.truncating = true;
+                    // The map is adopted only once the archive confirms with the
+                    // matching epoch. The SM allocates that epoch here (it owns the
+                    // ack identity); the node mirrors it from the action.
+                    self.truncation_epoch += 1;
+                    let epoch = self.truncation_epoch;
+                    self.truncating_epoch = Some(epoch);
                     self.pending_new_map = Some(new_map.clone());
-                    out.push(Action::Truncate { to: valid_up_to, new_map });
+                    out.push(Action::Truncate { epoch, to: valid_up_to, new_map });
                 } else if new_map != self.term_map {
                     // Nothing to truncate. Post-redesign (data-stamped recording)
                     // this branch only ever SHRINKS our map — dropping a phantom
@@ -734,6 +787,29 @@ mod tests {
         let mut out = Vec::new();
         sm.step(ev, &mut out);
         out
+    }
+
+    /// A follower that has adopted term 3 with an own map (`[(1,0),(2,4096)]` at
+    /// durable 6000) that diverges from the incoming term-3 leader map — so the
+    /// next `TermMapReceived{term:3}` reconciles to a `Truncate`.
+    fn sm_with_divergent_map() -> ElectionSm {
+        let mut s = ElectionSm::new(cfg(1), None, &[(1, 0), (2, 4096)], 6000, 0);
+        step(&mut s, Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
+        s
+    }
+
+    /// A fresh follower at term 1 in the `[0,1,2]` cluster (id 0).
+    fn fresh_follower() -> ElectionSm {
+        ElectionSm::new(cfg(0), None, &[(1, 0)], 0, 0)
+    }
+
+    fn extract_truncate_epoch(out: &[Action]) -> u64 {
+        out.iter()
+            .find_map(|a| match a {
+                Action::Truncate { epoch, .. } => Some(*epoch),
+                _ => None,
+            })
+            .expect("truncate issued")
     }
 
     #[test]
@@ -1054,16 +1130,16 @@ mod tests {
             Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] },
         );
         let trunc = acts.iter().find_map(|a| match a {
-            Action::Truncate { to, new_map } => Some((*to, new_map.clone())),
+            Action::Truncate { epoch, to, new_map } => Some((*epoch, *to, new_map.clone())),
             _ => None,
         });
-        let (to, new_map) = trunc.expect("must truncate the divergent tail");
+        let (epoch, to, new_map) = trunc.expect("must truncate the divergent tail");
         assert_eq!(to, 4096);
         assert_eq!(new_map, vec![(1, 0)]);
         // while truncating: data-plane events latched (no commit advance)
         assert!(step(&mut s, Event::CommitGossip { term: 3, commit: 5000 }).is_empty());
-        // agent feedback: truncation done
-        step(&mut s, Event::Truncated { to: 4096 });
+        // agent feedback: truncation done (matching epoch releases the latch)
+        step(&mut s, Event::Truncated { epoch, to: 4096 });
         assert_eq!(s.term_map(), &[(1, 0)]);
         // commit gossip clamps nothing here — it flows again (bounded by
         // durable at apply time, M5; the counter itself is raw)
@@ -1109,7 +1185,9 @@ mod tests {
             seed: 42,
         };
         let mut s = ElectionSm::new(cfg, None, &[], 0, 0);
-        // Drive to leader of term 1 (last_gossip_ns anchored at construction = 0).
+        // Drive to leader of term 1. `become_leader` re-anchors the idle floor to
+        // when leadership began (M-4) — here the last observed tick, 301 — so the
+        // first idle re-emission is a clean `gossip_floor_ns` (1000) after that.
         step(&mut s, Event::Tick { now_ns: 301 });
         step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
         assert!(matches!(s.role(), Role::Leader));
@@ -1123,17 +1201,21 @@ mod tests {
             )
         };
 
-        // First crossing: 1000 - 0 >= 1000.
-        let a = step(&mut s, Event::Tick { now_ns: 1000 });
+        // Before the first crossing (1000 - 301 = 699 < 1000): nothing.
+        let pre = step(&mut s, Event::Tick { now_ns: 1000 });
+        assert!(pre.is_empty(), "no re-emission before the first floor elapses");
+
+        // First crossing: 1301 - 301 >= 1000.
+        let a = step(&mut s, Event::Tick { now_ns: 1301 });
         assert_eq!(gossips(&a), (1, 1), "first floor crossing emits one commit + one map");
         assert!(!a.iter().any(|x| matches!(x, Action::AdvanceCommit { .. })), "idle: no commit advance");
 
-        // Between crossings (1500 - 1000 = 500 < 1000): nothing at all.
-        let b = step(&mut s, Event::Tick { now_ns: 1500 });
+        // Between crossings (1800 - 1301 = 499 < 1000): nothing at all.
+        let b = step(&mut s, Event::Tick { now_ns: 1800 });
         assert!(b.is_empty(), "no re-emission before the floor elapses again");
 
-        // Second crossing: 2000 - 1000 >= 1000.
-        let c = step(&mut s, Event::Tick { now_ns: 2000 });
+        // Second crossing: 2301 - 1301 >= 1000.
+        let c = step(&mut s, Event::Tick { now_ns: 2301 });
         assert_eq!(gossips(&c), (1, 1), "second floor crossing emits one commit + one map");
 
         // Immediately after: still nothing until the floor elapses once more.
@@ -1199,7 +1281,7 @@ mod tests {
             Event::TermMapReceived { term: 2, entries: vec![(1, 0), (2, 2000)] },
         );
         let trunc = acts.iter().find_map(|a| match a {
-            Action::Truncate { to, new_map } => Some((*to, new_map.clone())),
+            Action::Truncate { to, new_map, .. } => Some((*to, new_map.clone())),
             _ => None,
         });
         let (to, new_map) = trunc.expect("uncovered divergent tail must truncate");
@@ -1220,23 +1302,29 @@ mod tests {
         assert_eq!(s.term_map(), &[(1, 0), (2, 4096)]);
     }
 
-    /// A higher term adopted mid-truncation clears the latch and abandons the
-    /// pending map; stale `Truncated` feedback is then ignored.
+    /// M5: a higher term adopted mid-truncation is ADOPTABLE (the latch never
+    /// blocks an election) but does NOT clear the truncating latch — the physical
+    /// truncation was already issued and must complete. The in-flight
+    /// truncation's own matching-epoch ack then releases the latch and adopts its
+    /// (valid-prefix) pruned map.
     #[test]
-    fn higher_term_mid_truncation_clears_latch() {
+    fn higher_term_mid_truncation_is_adoptable_but_holds_latch() {
         let mut s = ElectionSm::new(cfg(1), None, &[(1, 0), (2, 4096)], 6000, 0);
         step(&mut s, Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
         let acts =
             step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
-        assert!(acts.iter().any(|a| matches!(a, Action::Truncate { .. })));
-        // A newer election reaches us while truncating: the latch must not block it.
+        let epoch = extract_truncate_epoch(&acts);
+        // A newer election reaches us while truncating: adoptable, latch held.
         let acts =
             step(&mut s, Event::RequestVote { from: 2, new_term: 4, last_term: 3, last_durable: 8000 });
         assert!(acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 4, .. })));
         assert_eq!(s.current_term(), 4);
-        // Stale truncation feedback for the abandoned request is ignored.
-        step(&mut s, Event::Truncated { to: 4096 });
-        assert_eq!(s.term_map(), &[(1, 0), (2, 4096)]);
+        assert!(s.is_truncating(), "adoption must NOT clear the latch (M5)");
+        // The in-flight truncation acks with its own epoch → latch releases and
+        // adopts the pruned map.
+        step(&mut s, Event::Truncated { epoch, to: 4096 });
+        assert!(!s.is_truncating());
+        assert_eq!(s.term_map(), &[(1, 0)]);
     }
 
     /// I-1: physical truncation is the truth about durability. A stale/unexpected
@@ -1249,11 +1337,11 @@ mod tests {
         let before_term = s.current_term();
         let before_map = s.term_map().to_vec();
         // Not truncating: the ack clamps durable and returns no actions.
-        let acts = step(&mut s, Event::Truncated { to: 500 });
+        let acts = step(&mut s, Event::Truncated { epoch: 1, to: 500 });
         assert!(acts.is_empty(), "a stale Truncated ack emits no actions");
         assert_eq!(s.current_term(), before_term, "term unchanged");
         assert_eq!(s.term_map(), before_map.as_slice(), "term map unchanged");
-        assert!(!s.truncating, "latch stays clear (we never asked to truncate)");
+        assert!(!s.is_truncating(), "latch stays clear (we never asked to truncate)");
         // durable is now 500: the next election solicits with last_durable == 500,
         // proving the clamp took (it was 1000 before the ack).
         let acts = step(&mut s, Event::Tick { now_ns: 301 });
@@ -1275,5 +1363,67 @@ mod tests {
         );
         assert!(acts.iter().any(|a| matches!(a, Action::Fatal { .. })));
         assert!(!acts.iter().any(|a| matches!(a, Action::Truncate { .. })));
+    }
+
+    // ---- M5 truncation-epoch protocol (SM-owned ack identity) ----
+
+    /// A `Truncated` ack carrying a NON-matching epoch clamps durable (physical
+    /// truncation is truth) but must NOT release the latch; only the matching
+    /// epoch does.
+    #[test]
+    fn truncated_ack_with_wrong_epoch_keeps_latch() {
+        let mut sm = sm_with_divergent_map();
+        let mut out = Vec::new();
+        sm.step(Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] }, &mut out);
+        let epoch = out
+            .iter()
+            .find_map(|a| match a {
+                Action::Truncate { epoch, .. } => Some(*epoch),
+                _ => None,
+            })
+            .expect("truncate issued");
+        // stale ack (epoch-1): durable clamps, latch stays
+        out.clear();
+        sm.step(Event::Truncated { epoch: epoch - 1, to: 4096 }, &mut out);
+        assert!(sm.is_truncating(), "stale-epoch ack must not release the latch");
+        // matching ack: latch released
+        out.clear();
+        sm.step(Event::Truncated { epoch, to: 4096 }, &mut out);
+        assert!(!sm.is_truncating());
+    }
+
+    /// A higher term adopted mid-truncation must NOT clear the latch; the
+    /// in-flight truncation's own matching-epoch ack releases it (and the durable
+    /// clamps to the physical truth).
+    #[test]
+    fn adoption_mid_truncation_holds_latch_until_matching_ack() {
+        let mut sm = sm_with_divergent_map();
+        let mut out = Vec::new();
+        sm.step(Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] }, &mut out);
+        let epoch = extract_truncate_epoch(&out);
+        // higher-term RequestVote adopts term 4 mid-truncation
+        out.clear();
+        sm.step(Event::RequestVote { from: 1, new_term: 4, last_term: 3, last_durable: 9000 }, &mut out);
+        assert!(sm.is_truncating(), "adoption must NOT clear the truncating latch (M4 I-1)");
+        // duplicate term maps in the window are dropped by the latch (no actions)
+        out.clear();
+        sm.step(Event::TermMapReceived { term: 4, entries: vec![(4, 0)] }, &mut out);
+        assert!(out.is_empty());
+        // the in-flight truncation acks with its own epoch → latch releases
+        out.clear();
+        sm.step(Event::Truncated { epoch, to: 4096 }, &mut out);
+        assert!(!sm.is_truncating());
+        assert!(sm.durable() <= 4096, "durable clamped to physical truth");
+    }
+
+    /// A RequestVote from a NON-member is ignored entirely — no answer AND no term
+    /// adoption (symmetry with the Vote-grant membership check, M4 Info finding).
+    #[test]
+    fn request_vote_from_non_member_is_ignored() {
+        let mut sm = fresh_follower(); // members [0,1,2], id 0
+        let mut out = Vec::new();
+        sm.step(Event::RequestVote { from: 9, new_term: 5, last_term: 4, last_durable: 1 << 20 }, &mut out);
+        assert!(out.is_empty(), "non-member RequestVote must produce nothing");
+        assert_eq!(sm.current_term(), 1, "and must not adopt the term");
     }
 }
