@@ -19,15 +19,23 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use uc2_consensus::commit::CommitTracker;
+use uc2_log::archive::find_block;
 use uc2_log::buffer::{LogBuffer, SliceRead};
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
     DatagramHeader, MTU_DEFAULT, write_datagram_header,
 };
-use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
+use uc_protocol::v2::frame::{FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len, read_header};
+use ultima_journal::Journal;
 
 use crate::fault::FaultSocket;
 use crate::flow::FlowControl;
+
+/// Datagrams a single served NAK may replay from the journal before yielding
+/// (spec §5 "bounded, separately paced"). The follower's NAK backoff
+/// re-requests whatever is still missing — that re-NAK IS the pacing, so one
+/// serve stays a bounded duty cycle even when the gap spans a whole block.
+const REPLAY_DGRAMS_PER_NAK: usize = 8;
 
 /// Bound on queued NAK requests (M2 final review: a flooding/hostile
 /// follower must not grow the deque unboundedly). Oldest entries drop first —
@@ -79,9 +87,17 @@ pub struct SenderStats {
     pub naks_served: AtomicU64,
     pub heartbeats: AtomicU64,
     pub flow_stalls: AtomicU64,
-    /// Validated read lost the race with the appender: that follower needs a
-    /// journal replay session (M4) — in M2 this only counts.
+    /// A NAK whose bytes had left the ring could NOT be served from the
+    /// journal — either no replay source is wired, or the position is below
+    /// the first archived block (purged; M6). With a replay source set for a
+    /// still-archived position, the seam is served (see `replay_datagrams`),
+    /// not counted here.
     pub overruns: AtomicU64,
+    /// DATA datagrams retransmitted from the JOURNAL to serve a deep NAK whose
+    /// bytes had already scrolled out of the ring (M4 replay sessions). This is
+    /// the proof the replay path ran; the M2 ring-served NAK path counts under
+    /// `datagrams` / `naks_served` as before.
+    pub replay_datagrams: AtomicU64,
     /// NAK requests dropped because the queue hit `NAK_QUEUE_MAX` (oldest
     /// dropped first); observability only — a re-NAK after backoff recovers.
     pub naks_dropped: AtomicU64,
@@ -117,6 +133,10 @@ pub struct Sender {
     tracker: CommitTracker,
     follower_idx: HashMap<SocketAddr, usize>,
     stats: Arc<SenderStats>,
+    /// Journal handle for serving deep NAKs whose bytes have left the ring
+    /// (M4 replay sessions). `None` until `set_replay_source` wires the
+    /// archive's journal in — M2/M3 call sites leave it unset (Overrun counts).
+    replay: Option<Arc<Journal>>,
 }
 
 impl Sender {
@@ -153,11 +173,21 @@ impl Sender {
             tracker,
             follower_idx,
             stats: Arc::new(SenderStats::default()),
+            replay: None,
         }
     }
 
     pub fn stats(&self) -> Arc<SenderStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// Wire the archive's journal in as the retransmit source for deep NAKs
+    /// (positions that have already scrolled out of the ring). Without it a
+    /// deep NAK counts an `overrun` and wedges the follower — WITH it the seam
+    /// is served from durable storage (M4 replay sessions, closing M2's
+    /// >1-ring-behind gap). One handle, shared `&self` with internal locking.
+    pub fn set_replay_source(&mut self, journal: Arc<Journal>) {
+        self.replay = Some(journal);
     }
 
     fn now_ns(&self) -> u64 {
@@ -175,11 +205,33 @@ impl Sender {
                     self.flow.on_status(from, contiguous, window)
                 }
                 CtrlMsg::Nak { from, position, length } => {
-                    if self.naks.len() >= NAK_QUEUE_MAX {
-                        self.naks.pop_front();
-                        self.stats.naks_dropped.fetch_add(1, Ordering::Relaxed);
+                    // Coalesce per follower. A follower's NAK position is its
+                    // current contiguous frontier — monotonic non-decreasing —
+                    // so its latest NAK supersedes any earlier one still queued.
+                    // Keeping ONE slot per follower is what makes deep-replay
+                    // catch-up (M4) viable: without it a follower re-NAKing its
+                    // stuck frontier every backoff piles hundreds of redundant
+                    // retransmit requests behind its real progress, and the
+                    // FIFO serve spends the whole duty budget re-sending bytes
+                    // the follower already has (a self-inflicted NAK storm —
+                    // measured ~0.8% goodput before this). The cap stays as a
+                    // belt-and-suspenders guard against an unknown/spoofed flood
+                    // (many distinct source addresses).
+                    if let Some(slot) = self.naks.iter_mut().find(|(a, _, _)| *a == from) {
+                        // Guard against a reordered ctrl delivery regressing the
+                        // frontier: only a non-stale position (>= the queued
+                        // one) replaces the slot.
+                        if position >= slot.1 {
+                            slot.1 = position;
+                            slot.2 = length;
+                        }
+                    } else {
+                        if self.naks.len() >= NAK_QUEUE_MAX {
+                            self.naks.pop_front();
+                            self.stats.naks_dropped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        self.naks.push_back((from, position, length));
                     }
-                    self.naks.push_back((from, position, length))
                 }
                 CtrlMsg::AppendPos { from, durable } => {
                     if let Some(&i) = self.follower_idx.get(&from) {
@@ -257,9 +309,21 @@ impl Sender {
                 }
                 SliceRead::NotCommitted => break,
                 SliceRead::Overrun => {
-                    // can't happen while sent tracks append closely; counted
-                    // for the M4 replay-session seam
-                    self.stats.overruns.fetch_add(1, Ordering::Relaxed);
+                    // The fan-out cursor lapped the ring — it cannot happen
+                    // while `sent` tracks `append` closely (the steady state),
+                    // and never fires in the paced integration flow. If it does
+                    // (e.g. a sender constructed against an already-lapped ring)
+                    // AND a replay source is wired, the gap is durable in the
+                    // journal: resync the fan-out to `append` and let each
+                    // follower NAK the skipped span (served from the journal,
+                    // `serve_nak_from_journal`). Only WITHOUT a replay source is
+                    // this an unrecoverable overrun worth counting.
+                    if self.replay.is_some() {
+                        self.sent = append;
+                        self.buffer.counters().sent.store_release(self.sent);
+                    } else {
+                        self.stats.overruns.fetch_add(1, Ordering::Relaxed);
+                    }
                     break;
                 }
             }
@@ -330,14 +394,146 @@ impl Sender {
                 }
                 SliceRead::NotCommitted => break,
                 SliceRead::Overrun => {
-                    // requested bytes have left the buffer: this follower
-                    // needs a journal replay session (M4)
-                    self.stats.overruns.fetch_add(1, Ordering::Relaxed);
+                    // Requested bytes have scrolled out of the ring. Serve the
+                    // gap from the durable journal (M4 replay sessions); only
+                    // when that is impossible (no source wired, or the position
+                    // is below the first archived block — purged, M6) is it an
+                    // unrecoverable overrun. Bounded to `REPLAY_DGRAMS_PER_NAK`
+                    // datagrams — the follower re-NAKs the remainder.
+                    if !self.serve_nak_from_journal(to, p, end) {
+                        self.stats.overruns.fetch_add(1, Ordering::Relaxed);
+                    }
                     break;
                 }
             }
         }
         self.stats.naks_served.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Serve a deep NAK for `[pos, end)` from the journal: walk the archived
+    /// blocks that cover it, starting at `pos`'s frame boundary, replaying up to
+    /// `REPLAY_DGRAMS_PER_NAK` DATA datagrams — byte-identical to the ring path
+    /// (`chunk_frames` mirrors `read_run_validated`'s wire discipline). The
+    /// budget spans block boundaries: under heavy streaming the archive records
+    /// many small blocks, so a one-block cap would starve a deep catch-up.
+    /// Returns `false` (caller counts an overrun) only when nothing at all was
+    /// servable — no replay source, or `pos` is below the first archived block
+    /// (purged — M6). The re-NAK paces whatever the budget left behind.
+    fn serve_nak_from_journal(&mut self, to: SocketAddr, pos: u64, end: u64) -> bool {
+        let Some(journal) = self.replay.clone() else {
+            return false; // no replay source wired (M2/M3 posture)
+        };
+        let budget = self.cfg.mtu - DATAGRAM_HEADER_LEN;
+        let mut p = pos;
+        let mut emitted = 0usize;
+        let mut served_any = false;
+        while emitted < REPLAY_DGRAMS_PER_NAK && p < end {
+            // Below the first archived block (purged) or a journal I/O error:
+            // not servable. A read error is fail-stop territory elsewhere;
+            // treating it as unserved here is safe (the follower re-NAKs) and
+            // keeps this hot path infallible.
+            let Some((seq, base)) = find_block(&journal, p).ok().flatten() else {
+                break;
+            };
+            let Ok(Some((rbase, block))) = journal.read(seq) else {
+                break;
+            };
+            debug_assert_eq!(rbase, base, "find_block seq/base must agree with the read");
+            let block_end = base + block.len() as u64;
+            if p >= block_end {
+                // `p` sits at/beyond the durable frontier (last block fully
+                // consumed): nothing archived here to serve.
+                break;
+            }
+            served_any = true;
+            chunk_frames(&block, base, p, budget, |dp, body| {
+                if emitted >= REPLAY_DGRAMS_PER_NAK {
+                    return; // budget spent; the re-NAK fetches the remainder
+                }
+                self.send_replay_dgram(to, dp, body);
+                emitted += 1;
+            });
+            // If the budget wasn't spent, this whole block was replayed —
+            // advance to the next block. If it was, `p` is irrelevant (the loop
+            // exits) and the follower re-NAKs from where it actually got to.
+            p = block_end;
+        }
+        served_any
+    }
+
+    /// Assemble a DATA datagram from an arbitrary body slice (a journal-replay
+    /// run) and send it to one follower. Same framing as `fan_out`/`assemble`,
+    /// but the body is copied from the caller's slice (the ring path stages it
+    /// in `self.run`; here it lives in the journal block).
+    fn send_replay_dgram(&mut self, to: SocketAddr, position: u64, body: &[u8]) {
+        self.scratch.clear();
+        self.scratch.resize(DATAGRAM_HEADER_LEN, 0);
+        write_datagram_header(
+            &mut self.scratch,
+            &DatagramHeader {
+                position,
+                leadership_term_id: self.cfg.term_id,
+                kind: DGRAM_KIND_DATA,
+                flags: 0,
+            },
+        );
+        self.scratch.extend_from_slice(body);
+        let _ = self.sock.send_to(&self.scratch, to);
+        self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+        self.stats.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+        self.stats.replay_datagrams.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Walk the frames of an archived `block` (payload of the journal record whose
+/// base stream position is `base`) starting at position `from` — a frame
+/// boundary at/after `base` — grouping whole frames into MTU-`budget` runs and
+/// emitting each as `(run_position, body)`. This reproduces EXACTLY the wire
+/// discipline `LogBuffer::read_run_validated` produces off the live ring so the
+/// journal-replay path and the ring path yield interchangeable datagrams:
+///
+/// - a run always carries at least one whole frame (a lone oversized frame is
+///   emitted alone, as the sender's MTU assert makes impossible in practice);
+/// - a run never crosses a padding frame; padding is emitted HEADER-ONLY
+///   (`HEADER_LEN` bytes) and ends its run, though the walk advances the full
+///   aligned span (padding fills to the ring wrap);
+/// - a run is cut once the copied bytes would exceed `budget`.
+///
+/// Blocks are frame-aligned and CRC-validated on read, so — unlike the ring
+/// path — there is no torn-frame / overwrite guard: every length read is sound.
+pub(crate) fn chunk_frames(
+    block: &[u8],
+    base: u64,
+    from: u64,
+    budget: usize,
+    mut emit: impl FnMut(u64, &[u8]),
+) {
+    debug_assert!(from >= base, "replay start must be within the block");
+    let mut off = (from - base) as usize;
+    while off < block.len() {
+        let run_start = off;
+        let run_pos = base + off as u64;
+        let mut copied = 0usize;
+        let mut run_end = off; // end of the bytes this run copies (may trail `off`)
+        while off < block.len() {
+            let hdr = read_header(&block[off..]);
+            let aligned = align_frame_len(hdr.length as usize);
+            let is_padding = hdr.frame_type == FRAME_TYPE_PADDING;
+            // Padding contributes only its 32-byte header to the wire (the rest
+            // of its span is stale ring bytes); a message contributes its whole
+            // aligned slot.
+            let copy_len = if is_padding { HEADER_LEN } else { aligned };
+            if copied > 0 && copied + copy_len > budget {
+                break; // budget cut (the first frame of a run always fits)
+            }
+            off += aligned;
+            run_end = run_start + copied + copy_len;
+            copied += copy_len;
+            if is_padding || copied >= budget {
+                break; // padding ends the run at the wrap; budget ends it too
+            }
+        }
+        emit(run_pos, &block[run_start..run_end]);
     }
 }
 
@@ -469,7 +665,13 @@ mod tests {
     }
 
     #[test]
-    fn nak_queue_is_capped_dropping_oldest() {
+    fn nak_from_one_follower_coalesces_to_its_latest_frontier() {
+        // A follower's NAK position is its monotonic contiguous frontier, so a
+        // flood of re-NAKs (the deep-replay backoff, M4) MUST collapse to one
+        // queued request at the latest position — never pile 1100 redundant
+        // retransmits (that self-inflicted storm throttled deep catch-up to
+        // ~0.8% goodput before coalescing). Two frames are appended so the
+        // coalesced NAK actually serves; its position proves it kept the latest.
         let b = buffer();
         let f1 = Fake::new();
         let (tx, rx) = mpsc::sync_channel(4096);
@@ -483,16 +685,61 @@ mod tests {
             rx,
             cfg,
         );
-        // flood 1100 NAKs in one control drain; the queue must trim to the cap
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        for i in 0..2 {
+            a.append(4, i, &[i as u8; 64]).unwrap(); // frames at 0 and 96
+        }
+        s.do_work(); // steady-stream both frames out
+        f1.drain();
+        // flood 1100 NAKs at ASCENDING positions; only the newest is live
         for i in 0..1100u64 {
             tx.send(CtrlMsg::Nak { from: f1.addr(), position: i * 96, length: 96 }).unwrap();
         }
-        s.do_work(); // drains all 1100, serves 1
+        s.do_work(); // drains all 1100 into ONE coalesced slot, serves that slot
         assert_eq!(
             s.stats().naks_dropped.load(std::sync::atomic::Ordering::Relaxed),
-            1100 - NAK_QUEUE_MAX as u64,
-            "overflow beyond the cap must be counted as dropped"
+            0,
+            "same-follower NAKs coalesce to one slot — the cap never trips"
         );
+        assert_eq!(
+            s.stats().naks_served.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the 1100 re-NAKs collapse to a single served request"
+        );
+        // The one served request was the LATEST frontier (1099*96), which is
+        // beyond `append` (96*2): NotCommitted, so nothing is sent — proving the
+        // slot held the newest position, not the oldest (which would have sent
+        // frame 0).
+        assert!(f1.recv().is_none(), "coalesced NAK kept the latest position, not the oldest");
+    }
+
+    #[test]
+    fn naks_from_distinct_followers_keep_separate_slots() {
+        // Coalescing is PER follower — two followers each get their own queued
+        // request (one serve apiece), so one node's re-NAKs never crowd out
+        // another's recovery.
+        let b = buffer();
+        let (f1, f2) = (Fake::new(), Fake::new());
+        let (mut s, tx) = sender_to(&[&f1, &f2], &b);
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        for i in 0..4 {
+            a.append(4, i, &[0u8; 64]).unwrap();
+        }
+        s.do_work();
+        f1.drain();
+        f2.drain();
+        tx.send(CtrlMsg::Nak { from: f1.addr(), position: 0, length: 96 }).unwrap();
+        tx.send(CtrlMsg::Nak { from: f2.addr(), position: 96, length: 96 }).unwrap();
+        // two distinct slots -> two do_work cycles serve one NAK each
+        s.do_work();
+        s.do_work();
+        assert_eq!(
+            s.stats().naks_served.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "each follower's NAK is served on its own"
+        );
+        assert!(f1.recv().is_some(), "f1's NAK served");
+        assert!(f2.recv().is_some(), "f2's NAK served");
     }
 
     fn ctrl_ap(from: SocketAddr, durable: u64) -> CtrlMsg {
@@ -690,5 +937,65 @@ mod tests {
             }
         }
         assert!(saw_heartbeat);
+    }
+
+    #[test]
+    fn journal_replay_serves_deep_nak_with_identical_wire_format() {
+        // leader with a TINY buffer (4096) laps it 3x while archiving; a NAK
+        // for lap-0 positions must be served from the journal
+        let counters = Arc::new(uc2_log::counters::LogCounters::new());
+        let b = Arc::new(LogBuffer::new(
+            uc2_log::region::Region::heap_zeroed(4096),
+            counters,
+            256,
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = uc2_log::archive::ArchiveConfig {
+            segment_size_bytes: 4 * 1024 * 1024,
+            ..uc2_log::archive::ArchiveConfig::new(dir.path())
+        };
+        let mut arch = uc2_log::archive::Archive::open(cfg).unwrap();
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        let mut n = 0u64;
+        while a.position() < 3 * 4096 {
+            match a.append(1, n, &[n as u8; 64]) {
+                Ok(_) => n += 1,
+                Err(uc2_log::buffer::AppendError::WouldOverrun) => {
+                    arch.do_work(&b).unwrap();
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        while arch.do_work(&b).unwrap() {}
+
+        let f1 = Fake::new();
+        let (tx, rx) = mpsc::sync_channel(64);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f1.addr()],
+            3,
+            rx,
+            cfg,
+        );
+        s.set_replay_source(arch.journal_arc());
+        // NAK for position 0 (lapped long ago)
+        tx.send(CtrlMsg::Nak { from: f1.addr(), position: 0, length: 4096 }).unwrap();
+        s.do_work();
+        // served from the journal: DATA datagrams, self-locating from 0,
+        // frames byte-identical to the original appends
+        let (h, body) = f1.recv().expect("replayed datagram");
+        assert_eq!(h.kind, DGRAM_KIND_DATA);
+        assert_eq!(h.position, 0);
+        assert_eq!(read_header(&body).correlation_id, 0);
+        assert_eq!(&body[HEADER_LEN..HEADER_LEN + 64], &[0u8; 64]);
+        assert!(s.stats().replay_datagrams.load(std::sync::atomic::Ordering::Relaxed) >= 1);
+        assert_eq!(
+            s.stats().overruns.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the seam is now served, not counted"
+        );
     }
 }

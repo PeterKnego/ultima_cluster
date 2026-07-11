@@ -10,11 +10,21 @@
 //! not message rate, and there is no linger anywhere.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use uc_protocol::v2::frame::{self, FrameHeader, FRAME_TYPE_PADDING, HEADER_LEN};
 use ultima_journal::{Durability, Journal, JournalConfig, JournalError};
 
 use crate::buffer::LogBuffer;
+
+// The replay-session path (uc2_net, M4) shares the archive's journal handle
+// across the sender thread, so it must be `Send + Sync`. It is: `Journal` is
+// `&self` throughout with internal locking (`Arc<Mutex<..>>`). Assert it at
+// compile time so a regression here is loud rather than a distant trait error.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Journal>();
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArchiveError {
@@ -48,7 +58,7 @@ impl ArchiveConfig {
 }
 
 pub struct Archive {
-    journal: Journal,
+    journal: Arc<Journal>,
     cfg: ArchiveConfig,
     durable_pos: u64,
     next_block_seq: u64,
@@ -64,7 +74,7 @@ impl Archive {
             preallocate_segments: cfg.preallocate_segments,
             ..JournalConfig::new(&cfg.dir)
         };
-        let journal = Journal::open(jcfg)?;
+        let journal = Arc::new(Journal::open(jcfg)?);
         let (durable_pos, next_block_seq) = match journal.last_seq() {
             None => (0, 0),
             Some(last) => {
@@ -91,6 +101,13 @@ impl Archive {
     /// Test/replay access to the underlying journal.
     pub fn journal(&self) -> &Journal {
         &self.journal
+    }
+
+    /// A shared handle to the underlying journal, for a replay source that
+    /// outlives this borrow (the sender's NAK replay path, M4). Cheap clone —
+    /// the journal itself is `&self` with internal locking.
+    pub fn journal_arc(&self) -> Arc<Journal> {
+        Arc::clone(&self.journal)
     }
 
     /// One duty cycle: record at most one block. Returns Ok(true) if work was
@@ -254,13 +271,38 @@ impl Replay<'_> {
     }
 }
 
+/// Binary-search the archived blocks for the one whose payload contains `pos`:
+/// the block with the greatest base `<= pos`. Returns its `(seq, base)`, or
+/// `None` when there are no blocks or `pos` is below the first archived base
+/// (purged). Extracted verbatim from `replay_from`'s search; shared with the
+/// sender's NAK replay path (M4). Every record it reads is in `[first, last]`,
+/// so the reads are infallible except for a genuine journal I/O error.
+pub fn find_block(journal: &Journal, pos: u64) -> Result<Option<(u64, u64)>, ArchiveError> {
+    let (Some(first), Some(last)) = (journal.first_seq(), journal.last_seq()) else {
+        return Ok(None);
+    };
+    let (first_meta, _) = journal.read(first)?.expect("first block readable");
+    if pos < first_meta {
+        return Ok(None);
+    }
+    // greatest block with base <= pos
+    let (mut lo, mut hi) = (first, last);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        let (meta, _) = journal.read(mid)?.expect("block readable");
+        if meta <= pos { lo = mid } else { hi = mid - 1 }
+    }
+    let (base, _) = journal.read(lo)?.expect("block readable");
+    Ok(Some((lo, base)))
+}
+
 impl Archive {
     /// Replay archived frames starting at `pos` (a frame start). Positions at
     /// or beyond the durable frontier yield an empty replay. Positions below
     /// the first archived block are gone (purged) -> error.
     pub fn replay_from(&self, pos: u64) -> Result<Replay<'_>, ArchiveError> {
         let exhausted = Replay {
-            journal: &self.journal,
+            journal: self.journal.as_ref(),
             seq: 1,
             last_seq: None,
             block: Vec::new(),
@@ -271,23 +313,17 @@ impl Archive {
         if pos >= self.durable_pos {
             return Ok(exhausted);
         }
-        let (Some(first), Some(last)) = (self.journal.first_seq(), self.journal.last_seq())
-        else {
+        let Some(last) = self.journal.last_seq() else {
             return Ok(exhausted);
         };
-        let (first_meta, _) = self.journal.read(first)?.expect("first block readable");
-        if pos < first_meta {
-            return Err(ArchiveError::PositionPurged { pos, first_base: first_meta });
-        }
-        // binary search: greatest block with base <= pos
-        let (mut lo, mut hi) = (first, last);
-        while lo < hi {
-            let mid = lo + (hi - lo).div_ceil(2);
-            let (meta, _) = self.journal.read(mid)?.expect("block readable");
-            if meta <= pos { lo = mid } else { hi = mid - 1 }
-        }
+        let Some((lo, _base)) = find_block(&self.journal, pos)? else {
+            // pos < durable frontier but below the first archived block: purged.
+            let first = self.journal.first_seq().expect("last_seq implies first_seq");
+            let (first_base, _) = self.journal.read(first)?.expect("first block readable");
+            return Err(ArchiveError::PositionPurged { pos, first_base });
+        };
         Ok(Replay {
-            journal: &self.journal,
+            journal: self.journal.as_ref(),
             seq: lo,
             last_seq: Some(last),
             block: Vec::new(),
