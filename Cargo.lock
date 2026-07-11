@@ -2580,6 +2580,7 @@ version = "0.1.0"
 dependencies = [
  "loom",
  "memmap2",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
  "uc_protocol",

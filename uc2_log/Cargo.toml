@@ -13,6 +13,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 uc_protocol = { path = "../uc_protocol" }
 ultima-journal = { workspace = true }
 memmap2 = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]
