@@ -6,12 +6,16 @@
 //!
 //! Local (single host, loopback, all three nodes in-process):
 //!   cargo run -p uc2_net --release --example m3_gate -- local <journal_root> \
-//!       [secs=10] [payload=64] [admission_mib=4] [buffer_mib=256]
+//!       [secs=10] [payload=64] [admission_kib=4096] [buffer_mib=256]
 //!
 //! Fleet (one process per host; start followers first):
 //!   m3_gate follower <bind_addr> <journal_dir> <leader_addr> [buffer_mib]
 //!   m3_gate leader <bind_addr> <journal_dir> <f1_addr> <f2_addr> \
-//!       [secs=10] [payload=64] [admission_mib=4] [buffer_mib=256]
+//!       [secs=10] [payload=64] [admission_kib=4096] [buffer_mib=256]
+//!
+//! The admission window is in KiB so the fleet run can SWEEP it (e.g.
+//! 64/256/1024 KiB): p50 commit latency is dominated by window / drain-rate
+//! queueing, so the 400k+p50 bar must be read at the best point of the sweep.
 //!
 //! Journal dirs MUST be on a real filesystem (dev sandbox: /home/claude/...,
 //! NEVER /tmp — RAM-backed tmpfs). UC2_M3_MAX_BYTES caps the appended stream.
@@ -189,7 +193,7 @@ fn local(args: &[String]) {
     let root = args.first().expect("usage: m3_gate local <journal_root> ...").clone();
     let secs: u64 = args.get(1).map(|s| s.parse().unwrap()).unwrap_or(10);
     let payload: usize = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(64);
-    let admission_mib: u64 = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(4);
+    let admission_kib: u64 = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(4096);
     let buffer_mib: usize = args.get(4).map(|s| s.parse().unwrap()).unwrap_or(256);
 
     let raw = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -205,7 +209,7 @@ fn local(args: &[String]) {
 
     println!("== uc2 M3 gate (local loopback) ==");
     println!(
-        "payload {payload} B, admission {admission_mib} MiB, buffers {buffer_mib} MiB x3, {secs} s"
+        "payload {payload} B, admission {admission_kib} KiB, buffers {buffer_mib} MiB x3, {secs} s"
     );
 
     let (p, pl) = (Arc::clone(&lb), Arc::clone(&f1b));
@@ -228,7 +232,7 @@ fn local(args: &[String]) {
     .unwrap();
 
     let clock = Instant::now();
-    let mut res = drive_load(&lb, secs, payload, admission_mib << 20, clock);
+    let mut res = drive_load(&lb, secs, payload, admission_kib << 10, clock);
     let full = clock.elapsed().as_secs_f64();
     printer.stop();
 
@@ -308,12 +312,12 @@ fn leader_role(args: &[String]) {
     let f2: SocketAddr = args.get(3).expect("f2 addr").parse().unwrap();
     let secs: u64 = args.get(4).map(|s| s.parse().unwrap()).unwrap_or(10);
     let payload: usize = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(64);
-    let admission_mib: u64 = args.get(6).map(|s| s.parse().unwrap()).unwrap_or(4);
+    let admission_kib: u64 = args.get(6).map(|s| s.parse().unwrap()).unwrap_or(4096);
     let buffer_mib: usize = args.get(7).map(|s| s.parse().unwrap()).unwrap_or(256);
     let raw = UdpSocket::bind(bind.as_str()).unwrap();
     let (lb, lst, agents) = leader_node(raw, vec![f1, f2], journal, buffer_mib);
     let clock = Instant::now();
-    let mut res = drive_load(&lb, secs, payload, admission_mib << 20, clock);
+    let mut res = drive_load(&lb, secs, payload, admission_kib << 10, clock);
     let full = clock.elapsed().as_secs_f64();
     res.latencies_ns.sort_unstable();
     let (p50, p99) =
@@ -328,9 +332,10 @@ fn leader_role(args: &[String]) {
         lst.commit_gossips.load(R),
         lst.overruns.load(R),
     );
+    let pass = committed_per_s >= 400_000.0 && p50 as f64 / 1e6 <= 1.0 && lst.overruns.load(R) == 0;
     println!(
-        "GATE (>=400k committed/s, p50 <= 1 ms): {}",
-        if committed_per_s >= 400_000.0 && p50 as f64 / 1e6 <= 1.0 { "PASS" } else { "FAIL" }
+        "GATE (>=400k committed/s, p50 <= 1 ms, fsync on): {}",
+        if pass { "PASS" } else { "FAIL" }
     );
     for a in agents {
         a.stop();
