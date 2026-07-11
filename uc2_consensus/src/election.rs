@@ -23,6 +23,7 @@
 //! election) from `[min, max)` via a crate-local xorshift — no dependency.
 
 use crate::commit::CommitTracker;
+use crate::reconcile::{MAX_TERM_MAP_WIRE_ENTRIES, Outcome, Reconcile, reconcile};
 
 pub type NodeId = u32;
 
@@ -71,6 +72,13 @@ pub enum Event {
     Vote { from: NodeId, term: u32, granted: bool },
     /// The NewTerm frame this node appended (leader) reached position P.
     NewTermAppended { position: u64 },
+    /// The leader shipped its term map (follower role input; term-filtered like
+    /// `CommitGossip`). Runs reconciliation against our own map + durable.
+    TermMapReceived { term: u32, entries: Vec<(u32, u64)> },
+    /// Agent feedback: the archive was truncated to `to` and the write counter
+    /// re-primed. Lands durable at `to`, adopts the pending map, clears the
+    /// truncating latch.
+    Truncated { to: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +102,23 @@ pub enum Action {
     AdvanceCommit { commit: u64 },
     /// Gossip CommitPosition{commit} to followers (leader only).
     GossipCommit { commit: u64 },
+    /// Truncate our log to `to`, THEN (via `Truncated` feedback) replace our
+    /// term map with `new_map`. The agent must call `Archive::truncate_to(to)`,
+    /// re-prime the write counter, then feed `Truncated{to}` back. The SM latches
+    /// out data-plane events until that feedback arrives.
+    Truncate { to: u64, new_map: Vec<(u32, u64)> },
+    /// Ship our term map to followers (leader only): the last
+    /// `MAX_TERM_MAP_WIRE_ENTRIES` entries. Emitted on `BecomeLeader` and
+    /// piggybacked on the commit-gossip cadence.
+    ShipTermMap { entries: Vec<(u32, u64)> },
+    /// Persist the reconciled term map durably (follower adopted leader entries
+    /// with no truncation needed — keeps vote credentials honest).
+    PersistTermMap { new_map: Vec<(u32, u64)> },
+    /// Reconciliation found no common prefix — the divergence predates the
+    /// shipped window. Incremental repair is impossible; the agent logs and
+    /// panics (M6 snapshot install is the real fix). The sim asserts this never
+    /// fires at `<= MAX_TERM_MAP_WIRE_ENTRIES` terms.
+    Fatal { reason: &'static str },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +168,13 @@ pub struct ElectionSm {
     new_term_pos: Option<u64>,
     /// Leader: true once the NewTerm frame committed (Raft §5.4.2 read gate).
     serving: bool,
+
+    /// Follower: truncation in flight. While set, data-plane events are latched
+    /// out (no commit/durable advance); only term/vote events (and the
+    /// `Truncated` feedback) are processed — a higher term stays adoptable.
+    truncating: bool,
+    /// The reconciled map to adopt once `Truncated` feedback arrives.
+    pending_new_map: Option<Vec<(u32, u64)>>,
 }
 
 impl ElectionSm {
@@ -194,12 +226,22 @@ impl ElectionSm {
             tracker,
             new_term_pos: None,
             serving: false,
+            truncating: false,
+            pending_new_map: None,
         };
         sm.arm_timeout(now_ns);
         sm
     }
 
     pub fn step(&mut self, ev: Event, out: &mut Vec<Action>) {
+        // Truncating latch: drop data-plane events while a truncation is in
+        // flight. Only term/vote events (which may adopt a strictly higher
+        // term — that must always be possible) and the `Truncated` feedback
+        // are processed.
+        if self.truncating && !matches!(ev, Event::RequestVote { .. } | Event::Vote { .. } | Event::Truncated { .. })
+        {
+            return;
+        }
         match ev {
             Event::Tick { now_ns } => self.on_tick(now_ns, out),
 
@@ -309,6 +351,30 @@ impl ElectionSm {
                     }
                 }
             }
+
+            Event::TermMapReceived { term, entries } => {
+                if term < self.current_term {
+                    return; // stale-term map: dropped
+                }
+                if term > self.current_term {
+                    self.adopt_term(term, None, out);
+                }
+                self.reconcile_term_map(&entries, out);
+            }
+
+            Event::Truncated { to } => {
+                // Only meaningful while we asked for a truncation. A higher term
+                // adopted mid-flight clears the latch and abandons the pending
+                // map; ignore its stale feedback (the new leader re-ships).
+                if !self.truncating {
+                    return;
+                }
+                self.durable = to;
+                if let Some(m) = self.pending_new_map.take() {
+                    self.term_map = m;
+                }
+                self.truncating = false;
+            }
         }
     }
 
@@ -397,6 +463,8 @@ impl ElectionSm {
         // Fresh follower slots: stale-term reports must not certify the new term.
         self.tracker.reset_reports();
         out.push(Action::BecomeLeader { term: self.current_term, base: self.durable });
+        // Ship the freshly-opened term map so followers can reconcile (spec §M4).
+        out.push(Action::ShipTermMap { entries: self.term_map_wire_tail() });
     }
 
     fn adopt_term(&mut self, new_term: u32, leader: Option<NodeId>, out: &mut Vec<Action>) {
@@ -406,7 +474,41 @@ impl ElectionSm {
         self.new_term_pos = None;
         self.votes_received.clear();
         self.voted_for = None; // new term: no vote cast yet
+        // A term change invalidates any pending truncation (computed against the
+        // old leader's map); the new leader will re-ship and we re-reconcile.
+        self.truncating = false;
+        self.pending_new_map = None;
         out.push(Action::BecomeFollower { term: new_term, leader });
+    }
+
+    /// Run reconciliation against a leader-shipped map and emit the derived
+    /// action: `Truncate` (+ latch) when a byte is invalid, `PersistTermMap`
+    /// when the map merely grows, `Fatal` when there is no common prefix.
+    fn reconcile_term_map(&mut self, entries: &[(u32, u64)], out: &mut Vec<Action>) {
+        match reconcile(&self.term_map, self.durable, entries) {
+            Reconcile::NoCommonPrefix => out.push(Action::Fatal {
+                reason: "term-map reconciliation found no common prefix (snapshot install required)",
+            }),
+            Reconcile::Ok(Outcome { valid_up_to, new_map }) => {
+                if valid_up_to < self.durable {
+                    // A byte is invalid: latch out the data plane and truncate.
+                    // The map is adopted only once the archive confirms.
+                    self.truncating = true;
+                    self.pending_new_map = Some(new_map.clone());
+                    out.push(Action::Truncate { to: valid_up_to, new_map });
+                } else if new_map != self.term_map {
+                    // Nothing to truncate, but we adopted covering entries.
+                    self.term_map = new_map.clone();
+                    out.push(Action::PersistTermMap { new_map });
+                }
+            }
+        }
+    }
+
+    /// The last `MAX_TERM_MAP_WIRE_ENTRIES` term-map entries (the wire tail).
+    fn term_map_wire_tail(&self) -> Vec<(u32, u64)> {
+        let start = self.term_map.len().saturating_sub(MAX_TERM_MAP_WIRE_ENTRIES);
+        self.term_map[start..].to_vec()
     }
 
     fn step_down_to_follower(&mut self, out: &mut Vec<Action>) {
@@ -482,6 +584,9 @@ impl ElectionSm {
             self.commit_seen = c;
             out.push(Action::AdvanceCommit { commit: c });
             out.push(Action::GossipCommit { commit: c });
+            // Piggyback the term map on the commit-gossip cadence so a lagging
+            // or reconnecting follower can reconcile (spec §M4).
+            out.push(Action::ShipTermMap { entries: self.term_map_wire_tail() });
             // Serving gate. Note we intentionally do NOT reset the embedded
             // `tracker.commit` across terms, yet this can only flip `serving`
             // true on a genuinely-new-term commit: byte positions are globally
@@ -844,5 +949,108 @@ mod tests {
             "same-term commit gossip must depose a candidate"
         );
         assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 4096 })));
+    }
+
+    // ---- M4 reconciliation wiring ----
+
+    #[test]
+    fn follower_truncates_on_divergent_term_map_and_resumes_after_feedback() {
+        // node 1 was a failed leader: own map (1,0),(2,4096), durable 6000
+        let mut s = ElectionSm::new(cfg(1), None, &[(1, 0), (2, 4096)], 6000, 0);
+        // adopt term 3 via a grant, then the term-3 leader ships its map
+        step(&mut s, Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] },
+        );
+        let trunc = acts.iter().find_map(|a| match a {
+            Action::Truncate { to, new_map } => Some((*to, new_map.clone())),
+            _ => None,
+        });
+        let (to, new_map) = trunc.expect("must truncate the divergent tail");
+        assert_eq!(to, 4096);
+        assert_eq!(new_map, vec![(1, 0)]);
+        // while truncating: data-plane events latched (no commit advance)
+        assert!(step(&mut s, Event::CommitGossip { term: 3, commit: 5000 }).is_empty());
+        // agent feedback: truncation done
+        step(&mut s, Event::Truncated { to: 4096 });
+        assert_eq!(s.term_map(), &[(1, 0)]);
+        // commit gossip clamps nothing here — it flows again (bounded by
+        // durable at apply time, M5; the counter itself is raw)
+        let acts = step(&mut s, Event::CommitGossip { term: 3, commit: 5000 });
+        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 5000 })));
+    }
+
+    #[test]
+    fn leader_ships_term_map_on_open() {
+        let mut s = sm(0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        let acts = step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        assert!(acts.iter().any(|a| matches!(a, Action::BecomeLeader { .. })));
+        assert!(acts.iter().any(
+            |a| matches!(a, Action::ShipTermMap { entries } if entries == &vec![(1, 0)])
+        ));
+    }
+
+    /// A follower behind the leader (streamed bytes, stale map) adopts the
+    /// covering entries with no truncation and persists the grown map.
+    #[test]
+    fn follower_adopts_covering_entries_without_truncation() {
+        let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 3000, 0);
+        step(&mut s, Event::RequestVote { from: 0, new_term: 2, last_term: 1, last_durable: 4000 });
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived { term: 2, entries: vec![(1, 0), (2, 2000)] },
+        );
+        assert!(!acts.iter().any(|a| matches!(a, Action::Truncate { .. })));
+        assert!(acts.iter().any(
+            |a| matches!(a, Action::PersistTermMap { new_map } if new_map == &vec![(1, 0), (2, 2000)])
+        ));
+        assert_eq!(s.term_map(), &[(1, 0), (2, 2000)]);
+    }
+
+    /// A stale-term map (term below ours) is dropped; no reconciliation runs.
+    #[test]
+    fn stale_term_map_is_dropped() {
+        let mut s = ElectionSm::new(cfg(1), None, &[(1, 0), (2, 4096)], 6000, 0);
+        step(&mut s, Event::RequestVote { from: 0, new_term: 3, last_term: 2, last_durable: 7000 });
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived { term: 1, entries: vec![(1, 0), (9, 0)] },
+        );
+        assert!(acts.is_empty());
+        assert_eq!(s.term_map(), &[(1, 0), (2, 4096)]);
+    }
+
+    /// A higher term adopted mid-truncation clears the latch and abandons the
+    /// pending map; stale `Truncated` feedback is then ignored.
+    #[test]
+    fn higher_term_mid_truncation_clears_latch() {
+        let mut s = ElectionSm::new(cfg(1), None, &[(1, 0), (2, 4096)], 6000, 0);
+        step(&mut s, Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
+        let acts =
+            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        assert!(acts.iter().any(|a| matches!(a, Action::Truncate { .. })));
+        // A newer election reaches us while truncating: the latch must not block it.
+        let acts =
+            step(&mut s, Event::RequestVote { from: 2, new_term: 4, last_term: 3, last_durable: 8000 });
+        assert!(acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 4, .. })));
+        assert_eq!(s.current_term(), 4);
+        // Stale truncation feedback for the abandoned request is ignored.
+        step(&mut s, Event::Truncated { to: 4096 });
+        assert_eq!(s.term_map(), &[(1, 0), (2, 4096)]);
+    }
+
+    /// Reconciliation with no common prefix surfaces `Fatal` (never truncates).
+    #[test]
+    fn no_common_prefix_surfaces_fatal() {
+        let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 5000, 0);
+        step(&mut s, Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived { term: 41, entries: vec![(40, 1 << 20), (41, 2 << 20)] },
+        );
+        assert!(acts.iter().any(|a| matches!(a, Action::Fatal { .. })));
+        assert!(!acts.iter().any(|a| matches!(a, Action::Truncate { .. })));
     }
 }
