@@ -2598,6 +2598,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "uc2_sim"
+version = "0.1.0"
+dependencies = [
+ "uc2_consensus",
+]
+
+[[package]]
 name = "uc_autobench"
 version = "0.1.0"
 dependencies = [
