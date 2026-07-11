@@ -552,6 +552,14 @@ pub(crate) fn chunk_frames(
                 break;
             }
             let hdr = read_header(&block[off..]);
+            // A length below HEADER_LEN is provably corrupt. Zero is the
+            // dangerous case: align_frame_len(0) == 0 advances nothing and
+            // would livelock this loop forever (a silent cluster-wide wedge,
+            // worse than a panic). Mirror walk_advance's guard.
+            if (hdr.length as usize) < HEADER_LEN {
+                bail = true;
+                break;
+            }
             let aligned = align_frame_len(hdr.length as usize);
             if off + aligned > block.len() {
                 bail = true;
@@ -865,6 +873,32 @@ mod tests {
             count += 1;
         });
         assert_eq!(count, 0, "starting on a corrupt frame emits nothing and does not panic");
+
+        // A ZERO length word (the re-review's livelock case): align_frame_len(0)
+        // == 0 advances nothing, so without the below-HEADER_LEN bail the gather
+        // loop would spin at the same offset forever — a silent sender-agent
+        // wedge, worse than a panic. This test TERMINATING is the assertion;
+        // the intact frame before the zero word is still served.
+        let mut block = msg_frame(96, 0);
+        let mut zeroed = vec![0u8; HEADER_LEN];
+        zeroed[OFF_TYPE] = FRAME_TYPE_MESSAGE; // length word stays 0
+        block.extend_from_slice(&zeroed);
+        block.extend_from_slice(&msg_frame(96, 1)); // a frame BEYOND the corruption
+        let blen = block.len();
+        let mut emissions: Vec<(u64, usize)> = Vec::new();
+        chunk_frames(&block, 0, 0, 65_536, |pos, body| {
+            assert!(body.len() <= blen);
+            emissions.push((pos, body.len()));
+        });
+        assert_eq!(
+            emissions,
+            vec![(0, 96)],
+            "zero-length word: prior frames served, walk terminates, nothing beyond"
+        );
+        // and starting exactly ON the zero word: terminate with no emission
+        let mut count = 0usize;
+        chunk_frames(&block, 0, 96, 65_536, |_pos, _body| count += 1);
+        assert_eq!(count, 0);
     }
 
     #[test]
