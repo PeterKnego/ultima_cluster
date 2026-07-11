@@ -175,6 +175,11 @@ pub struct FollowerStats {
     /// DATA dropped because the intake gate was CLOSED (M4 reconciliation
     /// window — the consensus agent holds it shut; see `set_intake_gate`).
     pub dropped_gated: AtomicU64,
+    /// Consensus events (kinds 5–9) dropped because the consensus route channel
+    /// was FULL (M4 node composition — the T7 observability concern). Safe:
+    /// votes re-fire on the election timeout, reports/gossip on their floors.
+    /// Surfaced so a wedged consensus agent is diagnosable rather than silent.
+    pub route_drops: AtomicU64,
     pub naks_sent: AtomicU64,
     pub statuses_sent: AtomicU64,
     pub append_positions_sent: AtomicU64,
@@ -370,8 +375,11 @@ impl FollowerReceiver {
         if self.route.is_some() && is_consensus_kind(h.kind) {
             if let Some(ev) = consensus_event(&h, d, from)
                 && let Some(route) = &self.route
+                && route.try_send(ev).is_err()
             {
-                let _ = route.try_send(ev);
+                // A full consensus channel drops term-critical traffic; count it
+                // (the consensus agent's cadence recovers — votes/reports re-fire).
+                self.stats.route_drops.fetch_add(1, Ordering::Relaxed);
             }
             return;
         }
@@ -381,6 +389,18 @@ impl FollowerReceiver {
             return;
         }
         self.stats.datagrams.fetch_add(1, Relaxed);
+        // Node mode (M4): learn the current leader's address from its own
+        // current-term traffic (DATA/HEARTBEAT flow leader→follower). Our
+        // follower-role control (NAK/STATUS/AppendPosition) is then addressed to
+        // whoever is actually leading THIS term — so a failover retargets our
+        // reports automatically, without any external leader-hint plumbing. Only
+        // leader-origin kinds retarget; follower→leader kinds (NAK/STATUS/
+        // AppendPosition) never do. Gated on node mode so M3 stays byte-for-byte.
+        if self.route.is_some()
+            && matches!(h.kind, DGRAM_KIND_DATA | DGRAM_KIND_HEARTBEAT)
+        {
+            self.cfg.leader = from;
+        }
         match h.kind {
             DGRAM_KIND_DATA => {
                 // Intake gate (M4): during the ambiguous term-adoption window

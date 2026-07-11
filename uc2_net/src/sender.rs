@@ -161,6 +161,12 @@ pub struct Sender {
     /// cycle. The consensus agent (Task 8) is the sole writer. `None` = always
     /// on (legacy M2/M3, where the role is static for the process lifetime).
     role: Option<Arc<AtomicBool>>,
+    /// Last observed leader-role state. A `false → true` edge means this node
+    /// was just promoted, so the send cursor resyncs to the (re-primed) `sent`
+    /// counter before streaming — `BecomeLeader` collapsed volatile to the
+    /// durable base, and a stale cached cursor would re-stream and regress the
+    /// counter.
+    was_leader: bool,
 }
 
 impl Sender {
@@ -203,6 +209,7 @@ impl Sender {
             term,
             node_mode: false,
             role: None,
+            was_leader: false,
         }
     }
 
@@ -359,6 +366,13 @@ impl Sender {
         // Leader-role gate (M4): a follower drains control (above) but produces
         // NO leader output — no NAK service, no DATA stream, no heartbeats.
         let leader_role = self.role.as_ref().is_none_or(|r| r.load(Ordering::Relaxed));
+        if leader_role && !self.was_leader {
+            // Promotion edge: BecomeLeader re-primed `sent` to the durable base;
+            // adopt it so we stream only the fresh term's tail, never re-stream
+            // (which would regress the counter under a slower cached cursor).
+            self.sent = self.buffer.counters().sent.load_acquire();
+        }
+        self.was_leader = leader_role;
         if !leader_role {
             return did;
         }
