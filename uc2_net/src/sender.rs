@@ -25,7 +25,9 @@ use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
     DatagramHeader, MTU_DEFAULT, write_datagram_header,
 };
-use uc_protocol::v2::frame::{FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len, read_header};
+use uc_protocol::v2::frame::{
+    FRAME_ALIGNMENT, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len, read_header,
+};
 use ultima_journal::Journal;
 
 use crate::fault::FaultSocket;
@@ -101,6 +103,12 @@ pub struct SenderStats {
     /// NAK requests dropped because the queue hit `NAK_QUEUE_MAX` (oldest
     /// dropped first); observability only — a re-NAK after backoff recovers.
     pub naks_dropped: AtomicU64,
+    /// NAK positions that are provably corrupt: not a frame boundary — same
+    /// fail-closed posture as the receiver's DATA guards. Rejected at ingestion
+    /// before the position can reach the journal path (where a garbage length
+    /// at an arbitrary offset would panic the sender agent); the wire has no
+    /// CRC, so a bit-flip escaping the UDP checksum could misalign a position.
+    pub naks_rejected: AtomicU64,
     /// CommitPosition datagrams fanned out (on-advance + floor re-gossip).
     pub commit_gossips: AtomicU64,
     /// AppendPosition reports from an address not in the follower set — dropped
@@ -205,6 +213,20 @@ impl Sender {
                     self.flow.on_status(from, contiguous, window)
                 }
                 CtrlMsg::Nak { from, position, length } => {
+                    // Fail closed against a corrupt/hostile position. A NAK
+                    // position is a stream byte offset, and every frame boundary
+                    // is 32-byte aligned; a position that is NOT frame-aligned
+                    // can never name a real frame. Trusting it would drive
+                    // `chunk_frames`/`read_header` to an arbitrary offset in an
+                    // archived block, read a garbage length, and panic the
+                    // sender agent (there is no wire CRC to catch the flip).
+                    // Reject + count — the receiver's DATA path is equally
+                    // fail-closed; a re-NAK from an honest follower is aligned.
+                    if !position.is_multiple_of(FRAME_ALIGNMENT as u64) {
+                        self.stats.naks_rejected.fetch_add(1, Ordering::Relaxed);
+                        did = true;
+                        continue;
+                    }
                     // Coalesce per follower. A follower's NAK position is its
                     // current contiguous frontier — monotonic non-decreasing —
                     // so its latest NAK supersedes any earlier one still queued.
@@ -515,9 +537,26 @@ pub(crate) fn chunk_frames(
         let run_pos = base + off as u64;
         let mut copied = 0usize;
         let mut run_end = off; // end of the bytes this run copies (may trail `off`)
+        let mut bail = false;
         while off < block.len() {
+            // Defense in depth (fail closed). Honest blocks are frame-aligned
+            // and journal-CRC-validated, so these guards never trip on real
+            // input — but a corrupt length word (or a misaligned start that
+            // slipped an earlier check) must NOT drive an index past the block
+            // and panic the sender agent. Bail on: not enough bytes left for a
+            // header, or a frame whose aligned end overruns the block. Whatever
+            // whole frames we already gathered are still emitted; the follower
+            // re-NAKs and is served from the correct boundary or dropped again.
+            if off + HEADER_LEN > block.len() {
+                bail = true;
+                break;
+            }
             let hdr = read_header(&block[off..]);
             let aligned = align_frame_len(hdr.length as usize);
+            if off + aligned > block.len() {
+                bail = true;
+                break;
+            }
             let is_padding = hdr.frame_type == FRAME_TYPE_PADDING;
             // Padding contributes only its 32-byte header to the wire (the rest
             // of its span is stale ring bytes); a message contributes its whole
@@ -533,7 +572,12 @@ pub(crate) fn chunk_frames(
                 break; // padding ends the run at the wrap; budget ends it too
             }
         }
-        emit(run_pos, &block[run_start..run_end]);
+        if run_end > run_start {
+            emit(run_pos, &block[run_start..run_end]);
+        }
+        if bail {
+            return; // corrupt frame: stop walking (never index past the block)
+        }
     }
 }
 
@@ -546,7 +590,10 @@ mod tests {
     use uc2_log::counters::LogCounters;
     use uc2_log::region::Region;
     use uc_protocol::v2::datagram::read_datagram_header;
-    use uc_protocol::v2::frame::{read_header, HEADER_LEN};
+    use uc_protocol::v2::frame::{
+        read_header, write_header_except_length, FrameHeader, FRAME_TYPE_MESSAGE, HEADER_LEN,
+        OFF_TYPE,
+    };
 
     fn buffer() -> Arc<LogBuffer> {
         let counters = Arc::new(LogCounters::new());
@@ -740,6 +787,131 @@ mod tests {
         );
         assert!(f1.recv().is_some(), "f1's NAK served");
         assert!(f2.recv().is_some(), "f2's NAK served");
+    }
+
+    #[test]
+    fn nak_with_misaligned_position_is_rejected() {
+        // A NAK whose position is not a 32-byte frame boundary can never name a
+        // real frame; trusting it would drive the journal replay path to a
+        // garbage length and panic the sender agent. Reject at ingestion (fail
+        // closed) — count it, never queue it, send nothing to the requester.
+        let b = buffer();
+        let f1 = Fake::new();
+        let (mut s, tx) = sender_to(&[&f1], &b);
+        tx.send(CtrlMsg::Nak { from: f1.addr(), position: 100, length: 96 }).unwrap();
+        s.do_work();
+        assert_eq!(
+            s.stats().naks_rejected.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "misaligned NAK position must be rejected at ingestion"
+        );
+        assert_eq!(
+            s.stats().naks_served.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a rejected NAK is never queued or served"
+        );
+        assert!(f1.recv().is_none(), "nothing is sent to the requester for a corrupt NAK");
+    }
+
+    /// Hand-build a valid message frame of `total` bytes (header + payload,
+    /// zero-filled) with correlation id `corr`.
+    fn msg_frame(total: u32, corr: u64) -> Vec<u8> {
+        let mut f = vec![0u8; align_frame_len(total as usize)];
+        write_header_except_length(
+            &mut f,
+            &FrameHeader {
+                length: total,
+                frame_type: FRAME_TYPE_MESSAGE,
+                flags: 0,
+                leadership_term_id: 9,
+                session_id: 0,
+                correlation_id: corr,
+            },
+        );
+        f[..4].copy_from_slice(&total.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn chunk_frames_clamps_on_corrupt_length_word() {
+        // A valid 96-byte frame at offset 0, then a GARBAGE length word at the
+        // next frame boundary (offset 96) whose aligned span (~4 GiB) runs off
+        // the end of a 128-byte block. chunk_frames must serve the intact frame,
+        // refuse to index past the block on the corrupt one, and stop — no
+        // panic, no emission whose end exceeds block.len().
+        let mut block = msg_frame(96, 0);
+        let mut garbage = vec![0u8; HEADER_LEN];
+        garbage[..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        garbage[OFF_TYPE] = FRAME_TYPE_MESSAGE;
+        block.extend_from_slice(&garbage); // 128 bytes; frame at 96 claims ~4 GiB
+        let blen = block.len();
+
+        // Walk from the start: the good frame is served, the corrupt one clamps.
+        let mut emissions: Vec<(u64, usize)> = Vec::new();
+        chunk_frames(&block, 0, 0, 65_536, |pos, body| {
+            assert!(body.len() <= blen, "emission ran past the block");
+            emissions.push((pos, body.len()));
+        });
+        assert_eq!(
+            emissions,
+            vec![(0, 96)],
+            "only the intact frame is emitted; the corrupt length is clamped"
+        );
+
+        // Walk FROM the corrupt boundary directly: bail immediately, emit nothing.
+        let mut count = 0usize;
+        chunk_frames(&block, 0, 96, 65_536, |_pos, body| {
+            assert!(body.len() <= blen);
+            count += 1;
+        });
+        assert_eq!(count, 0, "starting on a corrupt frame emits nothing and does not panic");
+    }
+
+    #[test]
+    fn nak_queue_caps_across_distinct_sources() {
+        // Coalescing keys per source, so distinct source addresses each claim
+        // their own slot — the live flood-guard the M2 FIFO test covered (a
+        // single follower can no longer overflow the cap, but a many-source
+        // spoofed flood still must). NAK_QUEUE_MAX+K requests from that many
+        // distinct addrs in ONE drain fill the cap and drop exactly the K
+        // oldest; the queue keeps serving afterwards.
+        const K: usize = 8;
+        let b = buffer();
+        let f1 = Fake::new();
+        let (tx, rx) = mpsc::sync_channel(NAK_QUEUE_MAX + 64);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f1.addr()],
+            3,
+            rx,
+            cfg,
+        );
+        for i in 0..(NAK_QUEUE_MAX + K) as u16 {
+            // distinct sources; position 0 is frame-aligned (never rejected)
+            let from = SocketAddr::from(([127, 0, 0, 1], 20_000 + i));
+            tx.send(CtrlMsg::Nak { from, position: 0, length: 96 }).unwrap();
+        }
+        s.do_work(); // drains all NAK_QUEUE_MAX+K into the queue, serves one
+        assert_eq!(
+            s.stats().naks_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            K as u64,
+            "exactly the K over-cap distinct-source NAKs drop"
+        );
+        assert_eq!(
+            s.stats().naks_rejected.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "aligned positions are not rejected"
+        );
+        let served = s.stats().naks_served.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(served, 1, "the drain cycle served one queued NAK");
+        s.do_work();
+        assert!(
+            s.stats().naks_served.load(std::sync::atomic::Ordering::Relaxed) > served,
+            "the capped queue keeps serving on later cycles"
+        );
     }
 
     fn ctrl_ap(from: SocketAddr, durable: u64) -> CtrlMsg {

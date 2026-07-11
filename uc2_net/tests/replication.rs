@@ -165,5 +165,10 @@ fn paused_follower_recovers_via_replay_sessions() {
         sstats.replay_datagrams.load(Ordering::Relaxed) > 0,
         "recovery must have used the journal replay path"
     );
+    assert_eq!(
+        sstats.overruns.load(Ordering::Relaxed),
+        0,
+        "the deep-NAK seam is SERVED from the journal, never counted as an overrun"
+    );
     converge_and_compare(leader, vec![f1, f2], end);
 }
