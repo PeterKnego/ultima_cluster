@@ -54,6 +54,35 @@ fn next_boundary(map: &[(u32, u64)], pos: u64) -> Option<u64> {
     map.iter().map(|&(_, b)| b).find(|&b| b > pos)
 }
 
+/// Data-plane strength — an EXPLICIT, switchable contract (F1).
+///
+/// The two modes differ in exactly two places (the follower's report clamp and
+/// the DATA accept gate); both switch sites carry a pointer back here.
+///
+/// **`RawM3` reproduces the shipped M3 receiver; `Gated` is the contract Task 7
+/// MUST implement** — see the phantom-commit trace in the task-5 review for why
+/// the shipped receiver is unsafe. The `RawM3` regression tests
+/// (`raw_m3_*_is_caught`) prove the oracle catches that unsafe behavior; the
+/// fuzz tiers run `Gated` and stay green.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DataPlane {
+    /// THE TASK-7 BINDING CONTRACT. (a) A follower reports its AppendPosition
+    /// clamped to its `matched` current-term frontier — never its raw durable
+    /// after a term adoption until reconciliation re-confirms the bytes.
+    /// (b) DATA acceptance rejects extensions of a divergent prefix (the
+    /// `prevLogTerm`-equivalent check), so a follower never records a term at a
+    /// base whose prefix it disagrees on. Together these make a phantom commit
+    /// unreachable.
+    Gated,
+    /// The REAL M3 receiver's behavior (the shipped `uc2_net` FollowerReceiver).
+    /// Reports are the raw durable immediately after a term adoption; DATA is
+    /// accepted on position-contiguity + current-term ALONE (no prev-term gate),
+    /// so the data-stamp base is wherever the first accepted frame lands even if
+    /// the follower's prefix diverges. Reproduces the phantom-commit /
+    /// wrong-base-stamp bugs the sim must catch.
+    RawM3,
+}
+
 /// Deterministic xorshift64 — the crate-local RNG (matches the SM's / fault
 /// layer's copy so the whole sim is dependency-free and reproducible).
 struct XorShift64(u64);
@@ -94,6 +123,9 @@ pub struct SimConfig {
     pub archive_bytes_max: u64,
     pub election_timeout_min_ns: u64,
     pub election_timeout_max_ns: u64,
+    /// Data-plane strength (F1). Defaults to [`DataPlane::Gated`] — the Task-7
+    /// contract; the `raw_m3_*` regression tests flip it to [`DataPlane::RawM3`].
+    pub data_plane: DataPlane,
 }
 
 impl Default for SimConfig {
@@ -112,6 +144,7 @@ impl Default for SimConfig {
             archive_bytes_max: 4 * FRAME,
             election_timeout_min_ns: 150_000_000, // 150ms — the SM's own default
             election_timeout_max_ns: 300_000_000, // 300ms
+            data_plane: DataPlane::Gated,
         }
     }
 }
@@ -225,7 +258,12 @@ pub struct World {
     steps: u64,
     checker: InvariantChecker,
 
-    // faults / scripting
+    // faults / scripting.
+    // DETERMINISM GUARD: these HashSets are ONLY ever probed with `.contains()`
+    // (see `blocked`) — never iterated. A future `.iter()`/`.drain()` over them
+    // would leak the platform's hash-random iteration order into event ordering
+    // and break reproducibility; if you need to enumerate them, switch to a
+    // BTreeSet or collect+sort first.
     isolated: HashSet<usize>,
     blocked_pairs: HashSet<(usize, usize)>,
     vote_drop_until: u64,
@@ -374,7 +412,18 @@ impl World {
         let step = self.steps;
         self.handle(q.ev, q.time, step)?;
         // Invariant 2 (prefix consistency) after EVERY event. Invariants 1/3/4/5
-        // are point-in-time and checked inline as their triggering action fires.
+        // are point-in-time and checked inline at the exact triggering action
+        // (`BecomeLeader` / `AdvanceCommit` / `Truncate`) rather than in a
+        // post-event sweep.
+        //
+        // DOCUMENTED DEVIATION from the brief's "after every event" wording, and
+        // equivalent-or-stricter: these invariants are properties OF the action
+        // (an election, a commit, a truncation), so checking them at the instant
+        // the action fires catches the exact same violations a post-event sweep
+        // would — and catches them mid-event, before any follow-up action in the
+        // same feed can paper over the offending state. Nothing mutates the
+        // checked quantities between the action and the sweep, so no violation
+        // can slip through the gap.
         let maps: Vec<Vec<(u32, u64)>> = self.nodes.iter().map(|n| n.term_map.clone()).collect();
         self.checker.check_prefix_consistency(&maps, step)?;
         Ok(true)
@@ -404,19 +453,17 @@ impl World {
         self.rng.next_u64()
     }
 
-    /// Raise a node's committed high-water by its currently-held frontier —
-    /// `min(commit, matched, durable)` for a follower, `min(commit, durable)`
-    /// for a leader (its own log is the reference). Called wherever any of the
-    /// three advances (commit gossip / accept / fsync). This is the sound bound
-    /// for the never-truncate-committed invariant (see `InvariantChecker`).
+    /// Raise a node's committed high-water from GENUINE byte-content ground truth
+    /// (F3): the frontier up to which it durably holds bytes identical to the
+    /// committed lineage, capped at the genuine global commit. Derived by the
+    /// checker from real `(durable, term_map)` state — NOT the model's `matched`
+    /// — so the bound is identical whether the data plane is `Gated` or `RawM3`.
+    /// Called wherever a node's durable/content advances (commit / accept / fsync)
+    /// and for every node whenever the lineage advances.
     fn record_committed(&mut self, node: usize) {
-        let nd = &self.nodes[node];
-        let held = if matches!(nd.sm.role(), Role::Leader) {
-            nd.commit.min(nd.durable)
-        } else {
-            nd.commit.min(nd.matched).min(nd.durable)
-        };
-        self.checker.record_held(node, held);
+        let durable = self.nodes[node].durable;
+        let map = self.nodes[node].term_map.clone();
+        self.checker.record_held_content(node, durable, &map);
     }
 
     fn push(&mut self, ev: SimEvent, time: u64) {
@@ -547,7 +594,16 @@ impl World {
                     && leader != node
                 {
                     let (id, term) = (self.nodes[node].id, self.nodes[node].sm.current_term());
-                    let reportable = new_durable.min(self.nodes[node].matched);
+                    // F1a data-plane contract switch — see `DataPlane`.
+                    //   Gated  (Task-7 contract): clamp to `matched`, so a
+                    //          divergent-but-un-truncated durable is never counted
+                    //          toward commit.
+                    //   RawM3  (shipped M3 receiver): report the raw durable — the
+                    //          phantom-commit source the oracle must catch.
+                    let reportable = match self.cfg.data_plane {
+                        DataPlane::Gated => new_durable.min(self.nodes[node].matched),
+                        DataPlane::RawM3 => new_durable,
+                    };
                     self.send(node, leader, Msg::Report { from: id, term, durable: reportable }, now);
                 }
             }
@@ -625,8 +681,20 @@ impl World {
                     // would extend a divergent prefix. A divergent tail is only
                     // removed by term-map reconciliation (Truncate), never by
                     // silently overwriting it — so we simply drop until then.
-                    let ok_prev = from_pos == 0
-                        || term_at(&self.nodes[to].term_map, from_pos - 1) == prev_term;
+                    // F1b data-plane contract switch — see `DataPlane`.
+                    //   Gated  (Task-7 contract): require prev-term agreement, so a
+                    //          divergent prefix can never be extended (a follower
+                    //          never stamps a term at a base whose prefix it
+                    //          disagrees on).
+                    //   RawM3  (shipped M3 receiver): accept on position-contiguity
+                    //          + current-term ALONE — the wrong-base-stamp source.
+                    let ok_prev = match self.cfg.data_plane {
+                        DataPlane::Gated => {
+                            from_pos == 0
+                                || term_at(&self.nodes[to].term_map, from_pos - 1) == prev_term
+                        }
+                        DataPlane::RawM3 => true,
+                    };
                     if from_pos == self.nodes[to].append && ok_prev {
                         if to_pos > from_pos {
                             self.nodes[to].append = to_pos;
@@ -757,11 +825,11 @@ impl World {
             }
             Action::BecomeLeader { term, base } => {
                 // Invariants 1 + 5 at the instant a term opens. The leader's own
-                // SM map already holds the freshly-opened (term, base).
-                let mut maps: Vec<Vec<(u32, u64)>> =
-                    self.nodes.iter().map(|nd| nd.term_map.clone()).collect();
-                maps[node] = self.nodes[node].sm.term_map().to_vec();
-                self.checker.on_become_leader(node as NodeId, term, base, &maps, step)?;
+                // SM map already holds the freshly-opened (term, base); inv5
+                // checks it against the committed lineage (ground truth), so a
+                // divergent peer can't excuse an incomplete leader.
+                let leader_map = self.nodes[node].sm.term_map().to_vec();
+                self.checker.on_become_leader(node as NodeId, term, base, &leader_map, step)?;
                 self.stat_leaders += 1;
 
                 // Collapse the volatile tail to the durable base, then append the
@@ -798,9 +866,30 @@ impl World {
                 self.nodes[node].matched = 0;
             }
             Action::AdvanceCommit { commit } => {
-                self.checker.on_advance_commit(node as NodeId, commit, step)?;
+                // Genuine-quorum oracle (F3): the checker judges the commit
+                // against every member's REAL (durable, term_map), independent of
+                // the data-plane mode. A phantom commit is caught here and aborts
+                // the run before the global commit high-water can advance.
+                let durables: Vec<u64> = self.nodes.iter().map(|nd| nd.durable).collect();
+                let maps: Vec<Vec<(u32, u64)>> =
+                    self.nodes.iter().map(|nd| nd.term_map.clone()).collect();
+                let term = self.nodes[node].sm.current_term();
+                let is_leader = matches!(self.nodes[node].sm.role(), Role::Leader);
+                self.checker.on_advance_commit(
+                    node as NodeId,
+                    commit,
+                    term,
+                    is_leader,
+                    &durables,
+                    &maps,
+                    step,
+                )?;
                 self.nodes[node].commit = commit;
-                self.record_committed(node);
+                // The genuine commit / lineage may have advanced: refresh every
+                // node's committed high-water against the new ground truth.
+                for m in 0..n {
+                    self.record_committed(m);
+                }
             }
             Action::GossipCommit { commit } => {
                 let term = self.nodes[node].sm.current_term();
@@ -907,6 +996,16 @@ impl World {
         self.blocked_pairs.clear();
     }
 
+    /// Selectively reconnect a single directed-agnostic pair `(a, b)` (the inverse
+    /// of [`World::partition`]) without touching other blocked pairs — needed to
+    /// script a partial heal, e.g. reconnect an ex-leader to the new leader while
+    /// keeping a third node lagging. (Total isolation via [`World::partition_node`]
+    /// is all-or-nothing; a precise partial heal uses pairwise `partition` +
+    /// `unpartition`.)
+    pub fn unpartition(&mut self, a: usize, b: usize) {
+        self.blocked_pairs.remove(&(a.min(b), a.max(b)));
+    }
+
     /// Crash a node immediately (at the current virtual time).
     pub fn crash(&mut self, node: usize) {
         if self.nodes[node].up {
@@ -924,6 +1023,46 @@ impl World {
     /// Arm a one-shot: crash a node the moment its next `Truncate` action fires.
     pub fn crash_on_next_truncate(&mut self) {
         self.crash_on_truncate = true;
+    }
+
+    /// Deliver a single crafted `Data` wire frame straight into node `to`'s
+    /// receiver (bypassing the partition table — this is exactly the byte-for-byte
+    /// input the real M3 `FollowerReceiver` processes), then run the post-event
+    /// invariant sweep. Used to script the reviewer's exact receiver trace where a
+    /// leader's current-term frame lands on a follower whose prefix diverges — the
+    /// timing a natural run can't force because the reconcile term-map (shipped on
+    /// the commit-gossip cadence) otherwise repairs the follower first. Under
+    /// [`DataPlane::RawM3`] the follower accepts on contiguity alone and stamps the
+    /// segment's term at a wrong base; the returned violation is that catch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn inject_data(
+        &mut self,
+        from: usize,
+        to: usize,
+        term: u32,
+        seg_term: u32,
+        from_pos: u64,
+        to_pos: u64,
+        prev_term: u32,
+    ) -> Result<(), InvariantViolation> {
+        self.steps += 1;
+        let step = self.steps;
+        let now = self.now;
+        let msg = Msg::Data { term, seg_term, from_pos, to_pos, prev_term };
+        self.deliver(to, from, msg, now, step)?;
+        // Mirror `step_once`'s post-event invariant 2 sweep.
+        let maps: Vec<Vec<(u32, u64)>> = self.nodes.iter().map(|n| n.term_map.clone()).collect();
+        self.checker.check_prefix_consistency(&maps, step)
+    }
+
+    /// A node's current append (write) position.
+    pub fn node_append(&self, node: usize) -> u64 {
+        self.nodes[node].append
+    }
+
+    /// A node's current SM term.
+    pub fn node_term(&self, node: usize) -> u32 {
+        self.nodes[node].sm.current_term()
     }
 
     // ----------------------------------------------------------- accessors
