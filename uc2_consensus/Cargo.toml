@@ -1,0 +1,9 @@
+[package]
+name = "uc2_consensus"
+description = "UC v2 pure-sync consensus state machine: quorum commit ranking (spec 2026-07-09 §6, M3); elections/truncation land in M4"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]

@@ -10,6 +10,7 @@
 //! COPIED out via a validated read before the syscall: with no CRC on the
 //! wire, sending live ring memory could transmit silently corrupt bytes.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,15 +18,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
+use uc2_consensus::commit::CommitTracker;
 use uc2_log::buffer::{LogBuffer, SliceRead};
 use uc_protocol::v2::datagram::{
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DatagramHeader, MTU_DEFAULT,
-    write_datagram_header,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
+    DatagramHeader, MTU_DEFAULT, write_datagram_header,
 };
 use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 
 use crate::fault::FaultSocket;
 use crate::flow::FlowControl;
+
+/// Bound on queued NAK requests (M2 final review: a flooding/hostile
+/// follower must not grow the deque unboundedly). Oldest entries drop first —
+/// a re-NAK after backoff re-requests anything still missing, so dropping is
+/// always recoverable. 1024 entries ≈ 24 KB; the worst storm observed in the
+/// M2 gate was ~10k NAKs over a whole run.
+const NAK_QUEUE_MAX: usize = 1024;
 
 /// Control messages routed from the leader's receiver agent (Task 8).
 /// Bounded channel; a dropped message is safe (NAK re-fires after backoff,
@@ -34,6 +43,8 @@ use crate::flow::FlowControl;
 pub enum CtrlMsg {
     Nak { from: SocketAddr, position: u64, length: u32 },
     Status { from: SocketAddr, contiguous: u64, window: u32 },
+    /// A follower's AppendPosition report (spec §6): its durable position.
+    AppendPos { from: SocketAddr, durable: u64 },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -71,6 +82,19 @@ pub struct SenderStats {
     /// Validated read lost the race with the appender: that follower needs a
     /// journal replay session (M4) — in M2 this only counts.
     pub overruns: AtomicU64,
+    /// NAK requests dropped because the queue hit `NAK_QUEUE_MAX` (oldest
+    /// dropped first); observability only — a re-NAK after backoff recovers.
+    pub naks_dropped: AtomicU64,
+    /// CommitPosition datagrams fanned out (on-advance + floor re-gossip).
+    pub commit_gossips: AtomicU64,
+    /// AppendPosition reports from an address not in the follower set — dropped
+    /// at the membership guard, never ranked (forged/unknown source).
+    pub append_pos_unknown_source: AtomicU64,
+    /// AppendPosition reports (from a KNOWN follower) claiming positions beyond
+    /// our own append are provably corrupt in a static term (a follower cannot
+    /// hold bytes the leader never appended) — dropped whole, counted; M4's
+    /// term/incarnation machinery revisits.
+    pub append_pos_implausible: AtomicU64,
 }
 
 pub struct Sender {
@@ -88,6 +112,10 @@ pub struct Sender {
     naks: VecDeque<(SocketAddr, u64, u32)>,
     base: Instant,
     last_heartbeat_ns: u64,
+    /// Quorum commit ranking (spec §6) — this thread is the single writer of
+    /// the leader's commit counter.
+    tracker: CommitTracker,
+    follower_idx: HashMap<SocketAddr, usize>,
     stats: Arc<SenderStats>,
 }
 
@@ -106,6 +134,9 @@ impl Sender {
         );
         let flow = FlowControl::new(&followers, cluster_size, cfg.initial_window);
         let sent = buffer.counters().sent.load_acquire();
+        let tracker = CommitTracker::new(followers.len(), cluster_size);
+        let follower_idx: HashMap<SocketAddr, usize> =
+            followers.iter().enumerate().map(|(i, a)| (*a, i)).collect();
         Sender {
             buffer,
             sock,
@@ -119,6 +150,8 @@ impl Sender {
             naks: VecDeque::new(),
             base: Instant::now(),
             last_heartbeat_ns: 0,
+            tracker,
+            follower_idx,
             stats: Arc::new(SenderStats::default()),
         }
     }
@@ -142,9 +175,56 @@ impl Sender {
                     self.flow.on_status(from, contiguous, window)
                 }
                 CtrlMsg::Nak { from, position, length } => {
+                    if self.naks.len() >= NAK_QUEUE_MAX {
+                        self.naks.pop_front();
+                        self.stats.naks_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
                     self.naks.push_back((from, position, length))
                 }
+                CtrlMsg::AppendPos { from, durable } => {
+                    if let Some(&i) = self.follower_idx.get(&from) {
+                        // A follower cannot hold bytes the leader never
+                        // appended. The wire has no CRC, so a bit-flip that
+                        // escapes the UDP checksum could inflate this report;
+                        // a report claiming more than our own append is
+                        // provably corrupt in a static term. DROP it whole
+                        // (count it) rather than clamp-to-append: clamping
+                        // would still let one corrupt datagram certify that the
+                        // follower holds every appended byte — {own, own, 0}
+                        // ranks own at the quorum slot — manufacturing a
+                        // phantom commit on leader-only durability and
+                        // defeating the quorum-loss-stall theorem. Dropping
+                        // poisons nothing: the tracker slot is monotonic-max,
+                        // so a later legitimate report still advances it. The
+                        // one legitimate way a follower leads our append — a
+                        // restarted leader whose append was re-primed below a
+                        // still-ahead follower — is a future-incarnation case
+                        // that M4's term/incarnation machinery handles; in a
+                        // static term it cannot arise. Load append once per
+                        // report is fine (control is kHz).
+                        let own_append = self.buffer.counters().append.load_acquire();
+                        if durable > own_append {
+                            self.stats.append_pos_implausible.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            self.tracker.on_durable(i, durable);
+                        }
+                    } else {
+                        self.stats.append_pos_unknown_source.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
+            did = true;
+        }
+
+        // Commit ranking (spec §6): once per duty cycle, quorum-th highest of
+        // {own durable} ∪ reports, bounded by own durable, monotonic. Advances
+        // at block/fsync granularity (reports and own durable both move per
+        // archive block), so the on-advance gossip stays ~kHz — never
+        // per-message.
+        let own_durable = self.buffer.counters().durable.load_acquire();
+        if let Some(c) = self.tracker.advance(own_durable) {
+            self.buffer.counters().commit.store_release(c);
+            self.gossip_commit(c);
             did = true;
         }
 
@@ -195,6 +275,8 @@ impl Sender {
             for &to in &self.followers {
                 let _ = self.sock.send_to(&self.scratch, to);
             }
+            // CommitPosition floor (spec §6: same 100 ms floor as heartbeats)
+            self.gossip_commit(self.tracker.commit());
             self.stats.heartbeats.fetch_add(1, Ordering::Relaxed);
             did = true;
         }
@@ -220,6 +302,15 @@ impl Sender {
             self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
             self.stats.bytes.fetch_add(body_bytes as u64, Ordering::Relaxed);
         }
+    }
+
+    /// Header-only CommitPosition to every follower.
+    fn gossip_commit(&mut self, commit: u64) {
+        self.assemble(commit, DGRAM_KIND_COMMIT_POSITION, 0);
+        for &to in &self.followers {
+            let _ = self.sock.send_to(&self.scratch, to);
+        }
+        self.stats.commit_gossips.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Retransmit [pos, pos+len) to ONE follower, MTU chunk by MTU chunk.
@@ -375,6 +466,190 @@ mod tests {
         assert!(body.len() >= 192);
         assert!(f1.recv().is_none(), "NAK service must not fan out");
         assert_eq!(s.stats().naks_served.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn nak_queue_is_capped_dropping_oldest() {
+        let b = buffer();
+        let f1 = Fake::new();
+        let (tx, rx) = mpsc::sync_channel(4096);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f1.addr()],
+            3,
+            rx,
+            cfg,
+        );
+        // flood 1100 NAKs in one control drain; the queue must trim to the cap
+        for i in 0..1100u64 {
+            tx.send(CtrlMsg::Nak { from: f1.addr(), position: i * 96, length: 96 }).unwrap();
+        }
+        s.do_work(); // drains all 1100, serves 1
+        assert_eq!(
+            s.stats().naks_dropped.load(std::sync::atomic::Ordering::Relaxed),
+            1100 - NAK_QUEUE_MAX as u64,
+            "overflow beyond the cap must be counted as dropped"
+        );
+    }
+
+    fn ctrl_ap(from: SocketAddr, durable: u64) -> CtrlMsg {
+        CtrlMsg::AppendPos { from, durable }
+    }
+
+    #[test]
+    fn commit_advances_on_quorum_reports_and_gossips() {
+        let b = buffer();
+        let (f1, f2) = (Fake::new(), Fake::new());
+        let (mut s, tx) = sender_to(&[&f1, &f2], &b);
+        // Append 20 frames (append = 1920) so follower reports are plausible
+        // (durable ≤ append, the real invariant); the leader's own archive lags
+        // at durable = 960 (its own fsync trails its append).
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        for i in 0..20 {
+            a.append(4, i, &[0u8; 64]).unwrap();
+        }
+        b.counters().durable.store_release(960);
+        // no reports -> {960, 0, 0} -> 2nd highest = 0 -> no commit
+        s.do_work();
+        assert_eq!(b.counters().commit.load_acquire(), 0);
+        f1.drain();
+        f2.drain();
+        // one follower reports 480 -> {960, 480, 0} -> commit 480 + gossip
+        tx.send(ctrl_ap(f1.addr(), 480)).unwrap();
+        s.do_work();
+        assert_eq!(b.counters().commit.load_acquire(), 480);
+        let mut saw_gossip = 0;
+        for f in [&f1, &f2] {
+            while let Some((h, body)) = f.recv() {
+                if h.kind == DGRAM_KIND_COMMIT_POSITION {
+                    assert_eq!(h.position, 480);
+                    assert_eq!(h.leadership_term_id, 9);
+                    assert!(body.is_empty(), "CommitPosition is header-only");
+                    saw_gossip += 1;
+                    break;
+                }
+            }
+        }
+        assert_eq!(saw_gossip, 2, "commit gossip must fan out to both followers");
+        // second follower overtakes: {960, 480, 700} -> commit 700
+        tx.send(ctrl_ap(f2.addr(), 700)).unwrap();
+        s.do_work();
+        assert_eq!(b.counters().commit.load_acquire(), 700);
+        // bounded by own durable: followers fully durable at append (1920, a
+        // plausible report ≤ append) -> {1920, 1920, 960} -> 2nd = 1920 ->
+        // min(own durable 960) -> commit = 960
+        tx.send(ctrl_ap(f1.addr(), 1920)).unwrap();
+        tx.send(ctrl_ap(f2.addr(), 1920)).unwrap();
+        s.do_work();
+        assert_eq!(b.counters().commit.load_acquire(), 960);
+        assert!(s.stats().commit_gossips.load(std::sync::atomic::Ordering::Relaxed) >= 3);
+    }
+
+    #[test]
+    fn unknown_source_report_is_ignored() {
+        let b = buffer();
+        let f1 = Fake::new();
+        let ghost = Fake::new(); // not in the follower set
+        let (mut s, tx) = sender_to(&[&f1], &b);
+        b.counters().durable.store_release(960);
+        tx.send(ctrl_ap(ghost.addr(), 960)).unwrap();
+        s.do_work();
+        assert_eq!(b.counters().commit.load_acquire(), 0, "unknown source advanced commit");
+        assert_eq!(
+            s.stats().append_pos_unknown_source.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "unknown-source report must be counted at the membership guard"
+        );
+    }
+
+    #[test]
+    fn implausible_append_position_is_dropped_not_ranked() {
+        let b = buffer();
+        let (f1, f2) = (Fake::new(), Fake::new());
+        let (mut s, tx) = sender_to(&[&f1, &f2], &b);
+        // own append = 960 (10 frames of 96 B); own durable = 960
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        for i in 0..10 {
+            a.append(4, i, &[0u8; 64]).unwrap();
+        }
+        b.counters().durable.store_release(960);
+        // A corrupt/forged report from KNOWN f1 claims a durable far beyond our
+        // append. If it were ranked — even clamped to append=960 — it would
+        // certify f1 holds every appended byte: rank {960, 960, 0} -> 2nd = 960
+        // -> a PHANTOM commit of 960 on leader-only durability (WITHOUT this
+        // datagram the rank is {960, 0, 0} -> 2nd = 0 -> no commit). Dropped,
+        // commit MUST stay 0.
+        tx.send(ctrl_ap(f1.addr(), 1 << 40)).unwrap();
+        s.do_work();
+        assert_eq!(
+            b.counters().commit.load_acquire(),
+            0,
+            "implausible report manufactured a phantom commit on leader-only durability"
+        );
+        assert_eq!(
+            s.stats().append_pos_implausible.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "implausible report must be counted"
+        );
+        // The dropped report did NOT poison the slot: a later LEGITIMATE report
+        // (480, within append) advances it normally -> {960, 480, 0} -> 480.
+        tx.send(ctrl_ap(f1.addr(), 480)).unwrap();
+        s.do_work();
+        assert_eq!(
+            b.counters().commit.load_acquire(),
+            480,
+            "the dropped report poisoned f1's tracker slot"
+        );
+    }
+
+    #[test]
+    fn heartbeat_block_regossips_commit_on_the_floor() {
+        let b = buffer();
+        let f1 = Fake::new();
+        let (tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = 1; // fire every cycle
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f1.addr()],
+            3,
+            rx,
+            cfg,
+        );
+        // append 10 frames (append = 960) so the report 480 is plausible
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        for i in 0..10 {
+            a.append(4, i, &[0u8; 64]).unwrap();
+        }
+        b.counters().durable.store_release(960);
+        tx.send(ctrl_ap(f1.addr(), 480)).unwrap();
+        s.do_work(); // advances commit to 480, gossips + heartbeats
+        // drain until we have seen BOTH a heartbeat and >= 2 CommitPosition
+        // datagrams (the on-advance gossip plus the floor re-gossip)
+        let mut commits = 0;
+        let mut heartbeats = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while commits < 2 || heartbeats < 1 {
+            assert!(Instant::now() < deadline, "floor re-gossip never arrived");
+            s.do_work();
+            while let Some((h, _)) = f1.recv() {
+                match h.kind {
+                    DGRAM_KIND_COMMIT_POSITION => {
+                        assert_eq!(h.position, 480);
+                        commits += 1;
+                    }
+                    DGRAM_KIND_HEARTBEAT => heartbeats += 1,
+                    _ => {}
+                }
+                if commits >= 2 && heartbeats >= 1 {
+                    break;
+                }
+            }
+        }
     }
 
     #[test]

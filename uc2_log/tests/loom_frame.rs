@@ -19,6 +19,17 @@
 //!      that bounds itself by the commit word directly instead of `append`.
 //!
 //! Run: RUSTFLAGS="--cfg loom" cargo test -p uc2_log --test loom_frame --release
+//!
+//! DELIBERATELY NOT MODELED — the seqlock overwrite-race: `read_frame_validated`
+//! and `read_run_validated` copy with plain loads, then acquire-fence and
+//! re-check the `append` margin. That discipline is sound on TSO (x86: stores
+//! become visible in program order, so a stale post-check bound implies
+//! unoverwritten bytes) but is formally racy under the C++ memory model —
+//! like every mmap-ring design including Aeron's (M1 review adjudication,
+//! 2026-07-09). A faithful loom model of it CORRECTLY FAILS under loom's full
+//! C++ semantics (later plain stores may be observed before an earlier
+//! release-store of `append`), so do not add one and conclude the code is
+//! broken: the two visibility pairs above are the loom-modelable properties.
 #![cfg(loom)]
 
 use loom::sync::Arc;

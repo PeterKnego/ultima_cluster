@@ -51,8 +51,9 @@ pub enum FrameRead {
 pub struct RunRead {
     /// Bytes copied into `out`.
     pub bytes: usize,
-    /// Stream positions consumed (> `bytes` iff the run ends in a padding
-    /// frame, which is copied header-only).
+    /// Stream positions consumed (≥ `bytes`; strictly greater when the run
+    /// ends in a padding frame whose span exceeds its 32-byte header — a
+    /// 32-byte padding span gives advance == bytes).
     pub advance: u64,
 }
 

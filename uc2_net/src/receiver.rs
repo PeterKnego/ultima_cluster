@@ -25,10 +25,10 @@ use std::time::Instant;
 use uc2_log::buffer::LogBuffer;
 use uc2_log::writer::PositionedWriter;
 use uc_protocol::v2::datagram::{
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK,
-    DGRAM_KIND_STATUS, DatagramHeader, NAK_BODY_LEN, NakBody, STATUS_BODY_LEN, StatusBody,
-    read_datagram_header, read_nak_body, read_status_body, write_datagram_header,
-    write_nak_body, write_status_body,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA,
+    DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_STATUS, DatagramHeader, NAK_BODY_LEN, NakBody,
+    STATUS_BODY_LEN, StatusBody, read_datagram_header, read_nak_body, read_status_body,
+    write_datagram_header, write_nak_body, write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
 
@@ -75,6 +75,9 @@ pub struct FollowerConfig {
     /// Status every this many rebuilt bytes (0 = capacity/4, spec §5's
     /// quarter-window).
     pub status_bytes: u64,
+    /// AppendPosition is sent on durable advance; the floor bounds the gap
+    /// between reports when durable is quiescent (spec §6).
+    pub append_pos_floor_ns: u64,
 }
 
 impl FollowerConfig {
@@ -87,6 +90,7 @@ impl FollowerConfig {
             nak_max_bytes: 65_536,
             status_floor_ns: 100_000_000,
             status_bytes: 0,
+            append_pos_floor_ns: 100_000_000,
         }
     }
 }
@@ -101,6 +105,8 @@ pub struct FollowerStats {
     pub dropped_malformed: AtomicU64,
     pub naks_sent: AtomicU64,
     pub statuses_sent: AtomicU64,
+    pub append_positions_sent: AtomicU64,
+    pub commits_received: AtomicU64,
 }
 
 pub struct FollowerReceiver {
@@ -115,6 +121,12 @@ pub struct FollowerReceiver {
     base: Instant,
     last_status_ns: u64,
     status_at: u64,
+    /// Durable value last reported via AppendPosition.
+    ap_reported: u64,
+    last_ap_ns: u64,
+    /// Highest commit gossip accepted (shadow of the counter — this thread is
+    /// the counter's single writer, so a plain field avoids the re-load).
+    commit_seen: u64,
     recv_buf: Vec<u8>,
     stats: Arc<FollowerStats>,
 }
@@ -137,6 +149,9 @@ impl FollowerReceiver {
             base: Instant::now(),
             last_status_ns: 0,
             status_at: start,
+            ap_reported: start,
+            last_ap_ns: 0,
+            commit_seen: 0,
             recv_buf: vec![0u8; 65_536],
             stats: Arc::new(FollowerStats::default()),
         }
@@ -200,6 +215,15 @@ impl FollowerReceiver {
                     self.stats.dropped_dup.fetch_add(1, Relaxed);
                     return;
                 }
+                // Corrupt-header hardening (M2 final review): the wire has no
+                // CRC, so a flipped position bit must fail closed. Misaligned
+                // positions would corrupt reader framing; a position whose
+                // sum with `advance` wraps u64 would sneak past the overrun
+                // gate below as a tiny wrapped value.
+                if !h.position.is_multiple_of(frame::FRAME_ALIGNMENT as u64) {
+                    self.stats.dropped_malformed.fetch_add(1, Relaxed);
+                    return;
+                }
                 let Some(advance) = walk_advance(body) else {
                     self.stats.dropped_malformed.fetch_add(1, Relaxed);
                     return;
@@ -219,7 +243,11 @@ impl FollowerReceiver {
                 // window. Enforce the spec guard on `advance` here; write_run's
                 // own bytes guard stays as belt-and-suspenders.
                 let durable = self.buffer.counters().durable.load_acquire();
-                if h.position + advance > durable + self.buffer.capacity() {
+                let Some(end) = h.position.checked_add(advance) else {
+                    self.stats.dropped_malformed.fetch_add(1, Relaxed);
+                    return;
+                };
+                if end > durable + self.buffer.capacity() {
                     self.stats.dropped_overrun.fetch_add(1, Relaxed);
                     return;
                 }
@@ -237,6 +265,17 @@ impl FollowerReceiver {
             }
             DGRAM_KIND_HEARTBEAT => {
                 self.leader_append = self.leader_append.max(h.position);
+            }
+            DGRAM_KIND_COMMIT_POSITION => {
+                // Monotonic max: UDP-reordered gossip never regresses. The
+                // stored value is the CLUSTER commit; M5's apply agent clamps
+                // to min(commit, local contiguous durable) at consumption
+                // (spec §6) — the counter itself stays raw.
+                self.stats.commits_received.fetch_add(1, Relaxed);
+                if h.position > self.commit_seen {
+                    self.commit_seen = h.position;
+                    self.buffer.counters().commit.store_release(self.commit_seen);
+                }
             }
             _ => {} // control kinds for the consensus agent: M3
         }
@@ -284,11 +323,34 @@ impl FollowerReceiver {
             did = true;
         }
 
+        // Single durable load reused by AppendPosition + status below.
+        let durable = self.buffer.counters().durable.load_acquire();
+
+        // AppendPosition (spec §6): report our durable on advance (block/
+        // fsync granularity, ~kHz) or on the floor. Feeds the leader's
+        // quorum commit ranking.
+        if durable > self.ap_reported || now - self.last_ap_ns >= self.cfg.append_pos_floor_ns {
+            let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+            write_datagram_header(
+                &mut d,
+                &DatagramHeader {
+                    position: durable,
+                    leadership_term_id: self.cfg.term_id,
+                    kind: DGRAM_KIND_APPEND_POSITION,
+                    flags: 0,
+                },
+            );
+            let _ = self.sock.send_to(&d, self.cfg.leader);
+            self.ap_reported = durable;
+            self.last_ap_ns = now;
+            self.stats.append_positions_sent.fetch_add(1, Relaxed);
+            did = true;
+        }
+
         // Status: every quarter-window of progress, or on the time floor.
         if contiguous - self.status_at >= self.status_bytes
             || now - self.last_status_ns >= self.cfg.status_floor_ns
         {
-            let durable = self.buffer.counters().durable.load_acquire();
             // The advance-guard in on_datagram makes underflow unreachable;
             // saturate anyway so a future guard regression degrades to a
             // window=0 backpressure signal rather than a bogus ~4 GiB window.
@@ -317,22 +379,50 @@ impl FollowerReceiver {
     }
 }
 
-/// The leader-side inbound demux: NAK/status → the sender's channel.
-/// (Vote/append-position kinds get a consensus channel in M3.)
+/// Leader-side inbound-demux counters. Shared via `Arc` so a supervising
+/// thread can read them after the receiver has moved into its agent closure
+/// (the same pattern as `FollowerStats` / `SenderStats`).
+#[derive(Default)]
+pub struct LeaderStats {
+    /// Control dropped because the sender channel was full (recoverable).
+    pub dropped_full: AtomicU64,
+    /// Inbound control with a mismatched leadership term (M3 static term).
+    pub dropped_stale_term: AtomicU64,
+}
+
+/// The leader-side inbound demux: NAK/status/AppendPosition → the sender's
+/// channel. All control is term-checked (static term in M3; stale terms are
+/// dropped and counted). Vote kinds (7-8) arrive in M4 with their own route.
 pub struct LeaderReceiver {
     sock: UdpSocket,
     to_sender: mpsc::SyncSender<CtrlMsg>,
+    term_id: u32,
     recv_buf: Vec<u8>,
-    pub dropped_full: u64,
+    stats: Arc<LeaderStats>,
 }
 
 impl LeaderReceiver {
-    pub fn new(sock: UdpSocket, to_sender: mpsc::SyncSender<CtrlMsg>) -> io::Result<Self> {
+    pub fn new(
+        sock: UdpSocket,
+        to_sender: mpsc::SyncSender<CtrlMsg>,
+        term_id: u32,
+    ) -> io::Result<Self> {
         sock.set_nonblocking(true)?;
-        Ok(Self { sock, to_sender, recv_buf: vec![0u8; 2048], dropped_full: 0 })
+        Ok(Self {
+            sock,
+            to_sender,
+            term_id,
+            recv_buf: vec![0u8; 2048],
+            stats: Arc::new(LeaderStats::default()),
+        })
+    }
+
+    pub fn stats(&self) -> Arc<LeaderStats> {
+        Arc::clone(&self.stats)
     }
 
     pub fn do_work(&mut self) -> bool {
+        use Ordering::Relaxed;
         let mut did = false;
         for _ in 0..64 {
             let (n, from) = match self.sock.recv_from(&mut self.recv_buf) {
@@ -351,6 +441,10 @@ impl LeaderReceiver {
                 continue;
             }
             let h = read_datagram_header(&self.recv_buf);
+            if h.leadership_term_id != self.term_id {
+                self.stats.dropped_stale_term.fetch_add(1, Relaxed);
+                continue;
+            }
             let body = &self.recv_buf[DATAGRAM_HEADER_LEN..n];
             let msg = match h.kind {
                 DGRAM_KIND_NAK if body.len() >= NAK_BODY_LEN => {
@@ -365,12 +459,16 @@ impl LeaderReceiver {
                         window: b.receive_window,
                     })
                 }
+                DGRAM_KIND_APPEND_POSITION => {
+                    Some(CtrlMsg::AppendPos { from, durable: h.position })
+                }
                 _ => None,
             };
             if let Some(m) = msg
                 && self.to_sender.try_send(m).is_err()
             {
-                self.dropped_full += 1; // safe: NAK backoff / status floor recover
+                // safe: NAK backoff / status floor recover
+                self.stats.dropped_full.fetch_add(1, Relaxed);
             }
         }
         did
@@ -387,8 +485,9 @@ mod tests {
     use uc2_log::region::Region;
     use uc_protocol::v2::datagram::{
         read_nak_body, read_status_body, write_datagram_header, write_nak_body,
-        write_status_body, DatagramHeader, DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA,
-        DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_STATUS, NAK_BODY_LEN, STATUS_BODY_LEN,
+        write_status_body, DatagramHeader, DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION,
+        DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK,
+        DGRAM_KIND_STATUS, NAK_BODY_LEN, STATUS_BODY_LEN,
     };
 
     const TERM: u32 = 9;
@@ -457,6 +556,7 @@ mod tests {
         let mut cfg = FollowerConfig::new(TERM, leader);
         cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
         cfg.status_floor_ns = u64::MAX; // no time-driven status in unit tests
+        cfg.append_pos_floor_ns = u64::MAX; // advance-driven AppendPosition only
         FollowerReceiver::new(Arc::clone(b), FaultSocket::bind("127.0.0.1:0").unwrap(), cfg)
     }
 
@@ -500,10 +600,10 @@ mod tests {
         while got_nak.is_none() {
             assert!(Instant::now() < deadline);
             r.do_work();
-            if let Some((h, body)) = leader.recv() {
-                if h.kind == DGRAM_KIND_NAK {
-                    got_nak = Some(read_nak_body(&body));
-                }
+            if let Some((h, body)) = leader.recv()
+                && h.kind == DGRAM_KIND_NAK
+            {
+                got_nak = Some(read_nak_body(&body));
             }
         }
         let nak = got_nak.unwrap();
@@ -528,12 +628,12 @@ mod tests {
         loop {
             assert!(Instant::now() < deadline, "no tail NAK");
             r.do_work();
-            if let Some((h, body)) = leader.recv() {
-                if h.kind == DGRAM_KIND_NAK {
-                    let nak = read_nak_body(&body);
-                    assert_eq!((nak.position, nak.length), (0, 192));
-                    break;
-                }
+            if let Some((h, body)) = leader.recv()
+                && h.kind == DGRAM_KIND_NAK
+            {
+                let nak = read_nak_body(&body);
+                assert_eq!((nak.position, nak.length), (0, 192));
+                break;
             }
         }
     }
@@ -585,14 +685,14 @@ mod tests {
         loop {
             assert!(Instant::now() < deadline, "no status");
             r.do_work();
-            if let Some((h, body)) = leader.recv() {
-                if h.kind == DGRAM_KIND_STATUS {
-                    let s = read_status_body(&body);
-                    assert_eq!(s.contiguous_position, 96);
-                    // durable 0 + capacity 65536 - contiguous 96
-                    assert_eq!(s.receive_window, 65536 - 96);
-                    break;
-                }
+            if let Some((h, body)) = leader.recv()
+                && h.kind == DGRAM_KIND_STATUS
+            {
+                let s = read_status_body(&body);
+                assert_eq!(s.contiguous_position, 96);
+                // durable 0 + capacity 65536 - contiguous 96
+                assert_eq!(s.receive_window, 65536 - 96);
+                break;
             }
         }
     }
@@ -727,13 +827,13 @@ mod tests {
         loop {
             assert!(Instant::now() < deadline, "no final status");
             r.do_work();
-            if let Some((h, body)) = leader_ep.recv() {
-                if h.kind == DGRAM_KIND_STATUS {
-                    let s = read_status_body(&body);
-                    if s.contiguous_position == 8128 {
-                        assert_eq!(s.receive_window, 32);
-                        break;
-                    }
+            if let Some((h, body)) = leader_ep.recv()
+                && h.kind == DGRAM_KIND_STATUS
+            {
+                let s = read_status_body(&body);
+                if s.contiguous_position == 8128 {
+                    assert_eq!(s.receive_window, 32);
+                    break;
                 }
             }
         }
@@ -760,11 +860,117 @@ mod tests {
     }
 
     #[test]
+    fn misaligned_wire_position_is_malformed() {
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+        let runs = frame_runs(&[&[1u8; 64]], 4096);
+        // legit frame bytes, but position not on a 32-byte frame boundary
+        leader.send(to, DGRAM_KIND_DATA, 16, TERM, &runs[0].1);
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_malformed.load(std::sync::atomic::Ordering::Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "misaligned datagram never observed");
+            r.do_work();
+        }
+        assert_eq!(b.counters().append.load_acquire(), 0, "misaligned position advanced the log");
+    }
+
+    #[test]
+    fn position_overflow_is_malformed_not_accepted() {
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+        let runs = frame_runs(&[&[1u8; 64]], 4096);
+        // u64 wrap: position + advance overflows; the wrapped sum must not
+        // sneak past the overrun gate (accept-rule arithmetic escape)
+        let pos = u64::MAX - 63; // 32-aligned (u64::MAX - 63 = ...FFC0), advance 96 wraps
+        assert_eq!(pos % 32, 0);
+        leader.send(to, DGRAM_KIND_DATA, pos, TERM, &runs[0].1);
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_malformed.load(std::sync::atomic::Ordering::Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "overflowing datagram never observed");
+            r.do_work();
+        }
+        assert_eq!(b.counters().append.load_acquire(), 0);
+    }
+
+    #[test]
+    fn durable_advance_emits_append_position() {
+        let b = buffer();
+        let leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        // simulate the archive: durable advances by one block
+        b.counters().durable.store_release(960);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline, "no AppendPosition");
+            r.do_work();
+            if let Some((h, body)) = leader.recv()
+                && h.kind == DGRAM_KIND_APPEND_POSITION
+            {
+                assert_eq!(h.position, 960);
+                assert_eq!(h.leadership_term_id, TERM);
+                assert!(body.is_empty(), "AppendPosition is header-only");
+                break;
+            }
+        }
+        // capture the baseline IMMEDIATELY after the first send, then assert
+        // it holds across 50 quiescent cycles: durable unchanged + floor
+        // disabled (u64::MAX in the helper) must mean NO re-send — a bug that
+        // forgets to update ap_reported re-sends every cycle and fails here
+        let sent = r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..50 {
+            r.do_work();
+        }
+        assert_eq!(
+            r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed),
+            sent,
+            "re-sent AppendPosition without a durable advance"
+        );
+        b.counters().durable.store_release(1920); // next block
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while r.stats().append_positions_sent.load(std::sync::atomic::Ordering::Relaxed) == sent {
+            assert!(Instant::now() < deadline, "advance did not re-report");
+            r.do_work();
+        }
+    }
+
+    #[test]
+    fn commit_position_gossip_is_stored_monotonically() {
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+        leader.send(to, DGRAM_KIND_COMMIT_POSITION, 4096, TERM, &[]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while b.counters().commit.load_acquire() < 4096 {
+            assert!(Instant::now() < deadline, "commit gossip never landed");
+            r.do_work();
+        }
+        // stale/reordered gossip must not regress; stale TERM must be dropped
+        leader.send(to, DGRAM_KIND_COMMIT_POSITION, 1024, TERM, &[]);
+        leader.send(to, DGRAM_KIND_COMMIT_POSITION, 9999, TERM - 1, &[]);
+        let st = r.stats();
+        let before_stale = st.dropped_stale_term.load(std::sync::atomic::Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_stale_term.load(std::sync::atomic::Ordering::Relaxed) == before_stale {
+            assert!(Instant::now() < deadline, "stale-term gossip never observed");
+            r.do_work();
+        }
+        assert_eq!(b.counters().commit.load_acquire(), 4096);
+        assert!(st.commits_received.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+    }
+
+    #[test]
     fn leader_receiver_demuxes_control_to_sender_channel() {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let addr = sock.local_addr().unwrap();
         let (tx, rx) = mpsc::sync_channel(16);
-        let mut lr = LeaderReceiver::new(sock, tx).unwrap();
+        let mut lr = LeaderReceiver::new(sock, tx, TERM).unwrap();
         let mut f = FakeLeader::new(); // reuse as a fake follower endpoint
         let mut nb = [0u8; NAK_BODY_LEN];
         write_nak_body(&mut nb, &uc_protocol::v2::datagram::NakBody { position: 96, length: 192 });
@@ -786,5 +992,35 @@ mod tests {
         }
         assert!(matches!(got[0], CtrlMsg::Nak { position: 96, length: 192, .. }));
         assert!(matches!(got[1], CtrlMsg::Status { contiguous: 4096, .. }));
+    }
+
+    #[test]
+    fn leader_receiver_demuxes_append_position_and_drops_stale_term() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        let (tx, rx) = mpsc::sync_channel(16);
+        let mut lr = LeaderReceiver::new(sock, tx, TERM).unwrap();
+        let lr_stats = lr.stats(); // capture the handle before any move
+        let mut f = FakeLeader::new(); // reuse as a fake follower endpoint
+        f.send(addr, DGRAM_KIND_APPEND_POSITION, 4096, TERM, &[]);
+        f.send(addr, DGRAM_KIND_APPEND_POSITION, 9999, TERM - 1, &[]); // stale term
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut got = None;
+        while got.is_none() {
+            assert!(Instant::now() < deadline);
+            lr.do_work();
+            if let Ok(m) = rx.try_recv() {
+                got = Some(m);
+            }
+        }
+        assert!(matches!(got, Some(CtrlMsg::AppendPos { durable: 4096, .. })));
+        // the stale one must be counted dropped, never demuxed
+        use std::sync::atomic::Ordering::Relaxed;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while lr_stats.dropped_stale_term.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "stale-term control never observed");
+            lr.do_work();
+        }
+        assert!(rx.try_recv().is_err(), "stale-term control reached the sender");
     }
 }

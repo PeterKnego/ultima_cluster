@@ -30,7 +30,11 @@ impl PositionedWriter {
     /// what the local archive hasn't recorded).
     pub fn write_run(&self, position: u64, bytes: &[u8]) -> bool {
         let b = &self.buffer;
-        debug_assert_eq!(position % 32, 0, "runs start at frame boundaries");
+        debug_assert_eq!(
+            position % uc_protocol::v2::frame::FRAME_ALIGNMENT as u64,
+            0,
+            "runs start at frame boundaries"
+        );
         let off = b.offset(position);
         if bytes.is_empty() || bytes.len() as u64 > b.capacity() - off as u64 {
             return false;
