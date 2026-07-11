@@ -38,7 +38,113 @@ pub const DGRAM_KIND_APPEND_POSITION: u8 = 5;
 /// Header-only (spec §6): `position` = the cluster COMMIT position (quorum-
 /// fsync'd). Leader → followers, on commit advance plus the same floor.
 pub const DGRAM_KIND_COMMIT_POSITION: u8 = 6;
-// 7..=8 reserved: REQUEST_VOTE, VOTE (M4).
+/// Body = `RequestVoteBody` (spec §6): candidate solicits a vote for
+/// `new_term` carrying its log position credentials. The header's
+/// `leadership_term_id` also carries `new_term` (body is authoritative).
+pub const DGRAM_KIND_REQUEST_VOTE: u8 = 7;
+/// Body = `VoteBody`: the response. Granted votes are PERSISTED by the
+/// granter before this datagram is sent (spec §6).
+pub const DGRAM_KIND_VOTE: u8 = 8;
+/// Body = term-map suffix (count + entries): the leader's term history for
+/// follower reconciliation (spec §6). Ships at most
+/// `MAX_TERM_MAP_WIRE_ENTRIES` most-recent entries; a follower whose common
+/// prefix is older than the suffix falls back to full replay from 0.
+pub const DGRAM_KIND_TERM_MAP: u8 = 9;
+
+pub const REQUEST_VOTE_BODY_LEN: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestVoteBody {
+    pub new_term: u32,
+    pub last_term: u32,
+    pub last_durable: u64,
+}
+
+pub fn write_request_vote_body(buf: &mut [u8], b: &RequestVoteBody) {
+    buf[0..4].copy_from_slice(&b.new_term.to_le_bytes());
+    buf[4..8].copy_from_slice(&b.last_term.to_le_bytes());
+    buf[8..16].copy_from_slice(&b.last_durable.to_le_bytes());
+}
+
+pub fn read_request_vote_body(buf: &[u8]) -> RequestVoteBody {
+    RequestVoteBody {
+        new_term: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        last_term: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        last_durable: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+    }
+}
+
+pub const VOTE_BODY_LEN: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoteBody {
+    pub term: u32,
+    pub granted: bool,
+}
+
+pub fn write_vote_body(buf: &mut [u8], b: &VoteBody) {
+    buf[0..4].copy_from_slice(&b.term.to_le_bytes());
+    buf[4] = b.granted as u8;
+    buf[5..16].fill(0);
+}
+
+pub fn read_vote_body(buf: &[u8]) -> VoteBody {
+    VoteBody {
+        term: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        granted: buf[4] != 0,
+    }
+}
+
+pub const TERM_MAP_HEADER_LEN: usize = 8;
+pub const TERM_MAP_ENTRY_LEN: usize = 16;
+/// 64 × 16 + 8 = 1032 B — fits the 1392 B MTU body budget with room.
+pub const MAX_TERM_MAP_WIRE_ENTRIES: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TermMapEntryWire {
+    pub term: u32,
+    pub base: u64,
+}
+
+/// Writes header + entries; returns bytes written. `entries.len()` must be
+/// ≤ `MAX_TERM_MAP_WIRE_ENTRIES` (caller ships a suffix).
+pub fn write_term_map_body(buf: &mut [u8], entries: &[TermMapEntryWire]) -> usize {
+    debug_assert!(entries.len() <= MAX_TERM_MAP_WIRE_ENTRIES);
+    buf[0..4].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    buf[4..8].copy_from_slice(&0u32.to_le_bytes());
+    let mut o = TERM_MAP_HEADER_LEN;
+    for e in entries {
+        buf[o..o + 4].copy_from_slice(&e.term.to_le_bytes());
+        buf[o + 4..o + 8].copy_from_slice(&0u32.to_le_bytes());
+        buf[o + 8..o + 16].copy_from_slice(&e.base.to_le_bytes());
+        o += TERM_MAP_ENTRY_LEN;
+    }
+    o
+}
+
+/// Returns the entry count read into `out`, or None if malformed (short
+/// buffer, count over the cap, or trailing garbage length).
+pub fn read_term_map_body(buf: &[u8], out: &mut [TermMapEntryWire]) -> Option<usize> {
+    if buf.len() < TERM_MAP_HEADER_LEN {
+        return None;
+    }
+    let count = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+    if count > MAX_TERM_MAP_WIRE_ENTRIES || count > out.len() {
+        return None;
+    }
+    if buf.len() != TERM_MAP_HEADER_LEN + count * TERM_MAP_ENTRY_LEN {
+        return None;
+    }
+    let mut o = TERM_MAP_HEADER_LEN;
+    for slot in out.iter_mut().take(count) {
+        *slot = TermMapEntryWire {
+            term: u32::from_le_bytes(buf[o..o + 4].try_into().unwrap()),
+            base: u64::from_le_bytes(buf[o + 8..o + 16].try_into().unwrap()),
+        };
+        o += TERM_MAP_ENTRY_LEN;
+    }
+    Some(count)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DatagramHeader {
@@ -183,5 +289,54 @@ mod tests {
         assert_eq!(DGRAM_KIND_STATUS, 4);
         assert_eq!(DGRAM_KIND_APPEND_POSITION, 5);
         assert_eq!(DGRAM_KIND_COMMIT_POSITION, 6);
+        assert_eq!(DGRAM_KIND_REQUEST_VOTE, 7);
+        assert_eq!(DGRAM_KIND_VOTE, 8);
+        assert_eq!(DGRAM_KIND_TERM_MAP, 9);
+    }
+
+    #[test]
+    fn vote_bodies_roundtrip_and_pin_layout() {
+        let rv = RequestVoteBody { new_term: 7, last_term: 6, last_durable: 0x0000_0001_0000_0040 };
+        let mut buf = [0u8; REQUEST_VOTE_BODY_LEN];
+        write_request_vote_body(&mut buf, &rv);
+        assert_eq!(read_request_vote_body(&buf), rv);
+        // literal LE pin: new_term 7, last_term 6, last_durable 2^32+64
+        assert_eq!(buf, [7, 0, 0, 0, 6, 0, 0, 0, 0x40, 0, 0, 0, 1, 0, 0, 0]);
+
+        let v = VoteBody { term: 7, granted: true };
+        let mut buf = [0u8; VOTE_BODY_LEN];
+        write_vote_body(&mut buf, &v);
+        assert_eq!(read_vote_body(&buf), v);
+        assert_eq!(buf, [7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let v = VoteBody { term: 7, granted: false };
+        write_vote_body(&mut buf, &v);
+        assert_eq!(buf[4], 0);
+    }
+
+    #[test]
+    fn term_map_body_roundtrips_and_pins_layout() {
+        let entries =
+            [TermMapEntryWire { term: 1, base: 0 }, TermMapEntryWire { term: 3, base: 4096 }];
+        let mut buf = [0u8; TERM_MAP_HEADER_LEN + 2 * TERM_MAP_ENTRY_LEN];
+        let n = write_term_map_body(&mut buf, &entries);
+        assert_eq!(n, 8 + 32);
+        let mut out = [TermMapEntryWire { term: 0, base: 0 }; MAX_TERM_MAP_WIRE_ENTRIES];
+        let m = read_term_map_body(&buf[..n], &mut out).expect("well-formed");
+        assert_eq!(&out[..m], &entries);
+        // literal pin: count 2, reserved 0, entry0 {1, rsvd, base 0}, entry1 {3, rsvd, base 4096}
+        assert_eq!(
+            &buf[..n],
+            &[
+                2, 0, 0, 0, 0, 0, 0, 0, // count + reserved
+                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // term 1, base 0
+                3, 0, 0, 0, 0, 0, 0, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, // term 3, base 4096
+            ][..]
+        );
+        // malformed: truncated entry -> None
+        assert!(read_term_map_body(&buf[..n - 1], &mut out).is_none());
+        // malformed: count beyond the cap -> None
+        let mut big = [0u8; TERM_MAP_HEADER_LEN];
+        big[0..4].copy_from_slice(&(MAX_TERM_MAP_WIRE_ENTRIES as u32 + 1).to_le_bytes());
+        assert!(read_term_map_body(&big, &mut out).is_none());
     }
 }
