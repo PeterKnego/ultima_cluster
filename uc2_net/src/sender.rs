@@ -90,6 +90,11 @@ pub struct SenderStats {
     /// AppendPosition reports from an address not in the follower set — dropped
     /// at the membership guard, never ranked (forged/unknown source).
     pub append_pos_unknown_source: AtomicU64,
+    /// AppendPosition reports (from a KNOWN follower) claiming positions beyond
+    /// our own append are provably corrupt in a static term (a follower cannot
+    /// hold bytes the leader never appended) — dropped whole, counted; M4's
+    /// term/incarnation machinery revisits.
+    pub append_pos_implausible: AtomicU64,
 }
 
 pub struct Sender {
@@ -178,7 +183,31 @@ impl Sender {
                 }
                 CtrlMsg::AppendPos { from, durable } => {
                     if let Some(&i) = self.follower_idx.get(&from) {
-                        self.tracker.on_durable(i, durable);
+                        // A follower cannot hold bytes the leader never
+                        // appended. The wire has no CRC, so a bit-flip that
+                        // escapes the UDP checksum could inflate this report;
+                        // a report claiming more than our own append is
+                        // provably corrupt in a static term. DROP it whole
+                        // (count it) rather than clamp-to-append: clamping
+                        // would still let one corrupt datagram certify that the
+                        // follower holds every appended byte — {own, own, 0}
+                        // ranks own at the quorum slot — manufacturing a
+                        // phantom commit on leader-only durability and
+                        // defeating the quorum-loss-stall theorem. Dropping
+                        // poisons nothing: the tracker slot is monotonic-max,
+                        // so a later legitimate report still advances it. The
+                        // one legitimate way a follower leads our append — a
+                        // restarted leader whose append was re-primed below a
+                        // still-ahead follower — is a future-incarnation case
+                        // that M4's term/incarnation machinery handles; in a
+                        // static term it cannot arise. Load append once per
+                        // report is fine (control is kHz).
+                        let own_append = self.buffer.counters().append.load_acquire();
+                        if durable > own_append {
+                            self.stats.append_pos_implausible.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            self.tracker.on_durable(i, durable);
+                        }
                     } else {
                         self.stats.append_pos_unknown_source.fetch_add(1, Ordering::Relaxed);
                     }
@@ -475,29 +504,45 @@ mod tests {
         let b = buffer();
         let (f1, f2) = (Fake::new(), Fake::new());
         let (mut s, tx) = sender_to(&[&f1, &f2], &b);
-        // leader's own durable: 10 frames' worth
+        // Append 20 frames (append = 1920) so follower reports are plausible
+        // (durable ≤ append, the real invariant); the leader's own archive lags
+        // at durable = 960 (its own fsync trails its append).
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        for i in 0..20 {
+            a.append(4, i, &[0u8; 64]).unwrap();
+        }
         b.counters().durable.store_release(960);
         // no reports -> {960, 0, 0} -> 2nd highest = 0 -> no commit
         s.do_work();
         assert_eq!(b.counters().commit.load_acquire(), 0);
+        f1.drain();
+        f2.drain();
         // one follower reports 480 -> {960, 480, 0} -> commit 480 + gossip
         tx.send(ctrl_ap(f1.addr(), 480)).unwrap();
         s.do_work();
         assert_eq!(b.counters().commit.load_acquire(), 480);
+        let mut saw_gossip = 0;
         for f in [&f1, &f2] {
-            let (h, body) = f.recv().expect("commit gossip");
-            assert_eq!(h.kind, DGRAM_KIND_COMMIT_POSITION);
-            assert_eq!(h.position, 480);
-            assert_eq!(h.leadership_term_id, 9);
-            assert!(body.is_empty(), "CommitPosition is header-only");
+            while let Some((h, body)) = f.recv() {
+                if h.kind == DGRAM_KIND_COMMIT_POSITION {
+                    assert_eq!(h.position, 480);
+                    assert_eq!(h.leadership_term_id, 9);
+                    assert!(body.is_empty(), "CommitPosition is header-only");
+                    saw_gossip += 1;
+                    break;
+                }
+            }
         }
+        assert_eq!(saw_gossip, 2, "commit gossip must fan out to both followers");
         // second follower overtakes: {960, 480, 700} -> commit 700
         tx.send(ctrl_ap(f2.addr(), 700)).unwrap();
         s.do_work();
         assert_eq!(b.counters().commit.load_acquire(), 700);
-        // bounded by own durable: reports at 5000 -> commit = 960
-        tx.send(ctrl_ap(f1.addr(), 5000)).unwrap();
-        tx.send(ctrl_ap(f2.addr(), 5000)).unwrap();
+        // bounded by own durable: followers fully durable at append (1920, a
+        // plausible report ≤ append) -> {1920, 1920, 960} -> 2nd = 1920 ->
+        // min(own durable 960) -> commit = 960
+        tx.send(ctrl_ap(f1.addr(), 1920)).unwrap();
+        tx.send(ctrl_ap(f2.addr(), 1920)).unwrap();
         s.do_work();
         assert_eq!(b.counters().commit.load_acquire(), 960);
         assert!(s.stats().commit_gossips.load(std::sync::atomic::Ordering::Relaxed) >= 3);
@@ -521,6 +566,46 @@ mod tests {
     }
 
     #[test]
+    fn implausible_append_position_is_dropped_not_ranked() {
+        let b = buffer();
+        let (f1, f2) = (Fake::new(), Fake::new());
+        let (mut s, tx) = sender_to(&[&f1, &f2], &b);
+        // own append = 960 (10 frames of 96 B); own durable = 960
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        for i in 0..10 {
+            a.append(4, i, &[0u8; 64]).unwrap();
+        }
+        b.counters().durable.store_release(960);
+        // A corrupt/forged report from KNOWN f1 claims a durable far beyond our
+        // append. If it were ranked — even clamped to append=960 — it would
+        // certify f1 holds every appended byte: rank {960, 960, 0} -> 2nd = 960
+        // -> a PHANTOM commit of 960 on leader-only durability (WITHOUT this
+        // datagram the rank is {960, 0, 0} -> 2nd = 0 -> no commit). Dropped,
+        // commit MUST stay 0.
+        tx.send(ctrl_ap(f1.addr(), 1 << 40)).unwrap();
+        s.do_work();
+        assert_eq!(
+            b.counters().commit.load_acquire(),
+            0,
+            "implausible report manufactured a phantom commit on leader-only durability"
+        );
+        assert_eq!(
+            s.stats().append_pos_implausible.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "implausible report must be counted"
+        );
+        // The dropped report did NOT poison the slot: a later LEGITIMATE report
+        // (480, within append) advances it normally -> {960, 480, 0} -> 480.
+        tx.send(ctrl_ap(f1.addr(), 480)).unwrap();
+        s.do_work();
+        assert_eq!(
+            b.counters().commit.load_acquire(),
+            480,
+            "the dropped report poisoned f1's tracker slot"
+        );
+    }
+
+    #[test]
     fn heartbeat_block_regossips_commit_on_the_floor() {
         let b = buffer();
         let f1 = Fake::new();
@@ -535,6 +620,11 @@ mod tests {
             rx,
             cfg,
         );
+        // append 10 frames (append = 960) so the report 480 is plausible
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        for i in 0..10 {
+            a.append(4, i, &[0u8; 64]).unwrap();
+        }
         b.counters().durable.store_release(960);
         tx.send(ctrl_ap(f1.addr(), 480)).unwrap();
         s.do_work(); // advances commit to 480, gossips + heartbeats
