@@ -40,6 +40,14 @@ fn single_node_cluster_elects_itself_and_serves() {
     }
     assert!(node.is_leader());
     assert_eq!(node.current_term(), 1);
+    // Raft §5.4.2 pin (one-sided): can_serve implies the NewTerm frame is
+    // COMMITTED — commit must already cover the 32-byte frame's END. Pre-fix
+    // (NewTermAppended fed the frame START) can_serve flipped at commit >= 0,
+    // i.e. instantly, typically observed here before the archive's fsync.
+    assert!(
+        node.counters().commit.load_acquire() >= 32,
+        "serving before the NewTerm frame committed (§5.4.2 gate defeated)"
+    );
 
     for i in 0..100u64 {
         node.submit(vec![i as u8; 64]).unwrap();

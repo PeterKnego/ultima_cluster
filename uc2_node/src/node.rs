@@ -595,11 +595,20 @@ impl Consensus {
                 let map = to_entries(self.sm.term_map());
                 self.state.store_term_map(&map).expect("term-map persist fail-stop");
                 self.term_handle.store(term, Ordering::Release);
+                // Explicit single-writer handoff (review hardening): the gate
+                // is closed across the prime so a UDP-reordered straggler that
+                // cleared the old term filter cannot race the counter reset.
+                self.close_gate();
                 self.counters.prime(base);
                 let mut appender = Appender::new(Arc::clone(&self.buffer), term);
-                let pos = appender.append_new_term().expect("NewTerm append fail-stop");
+                appender.append_new_term().expect("NewTerm append fail-stop");
+                // The serving gate compares COMMIT (an end/frontier position)
+                // against this value, so it must be the frame's END — feeding
+                // the start would flip can_serve before the NewTerm frame is
+                // quorum-committed (at base 0: instantly). Raft §5.4.2.
+                let end = appender.position();
                 self.appender = Some(appender);
-                work.push(Event::NewTermAppended { position: pos });
+                work.push(Event::NewTermAppended { position: end });
                 self.adopted_term = term;
                 self.open_gate(); // a leader is the source of truth; no reconcile pending
                 self.leader_flag.store(true, Ordering::Release);
