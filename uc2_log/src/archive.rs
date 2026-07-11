@@ -487,6 +487,16 @@ mod tests {
             assert_eq!(f.header.correlation_id, i);
         }
         assert!(r.next().unwrap().is_none());
+        // reopen-pin the PARTIAL-block path (the whole-block path is pinned
+        // in the boundary test): the re-appended prefix's meta+len must
+        // recover to exactly the truncation point across a restart
+        drop(arch);
+        let mut arch = Archive::open(ArchiveConfig {
+            max_block_bytes: 200,
+            ..test_cfg(dir.path())
+        })
+        .unwrap();
+        assert_eq!(arch.recovered_position(), 480);
         // the archive keeps working after truncation: append + record resumes
         let (b2, c2, _) = setup(1 << 16);
         c2.prime(480);
@@ -544,6 +554,13 @@ mod tests {
             Err(ArchiveError::UnsupportedTruncation { pos: 96 })
         ));
         // frontier unchanged; the archive is still usable
+        assert_eq!(arch.recovered_position(), 192);
+        // pos == first archived base (drop EVERY block) hits the same
+        // first-block guard: also inexpressible, also fails cleanly
+        assert!(matches!(
+            arch.truncate_to(0),
+            Err(ArchiveError::UnsupportedTruncation { pos: 0 })
+        ));
         assert_eq!(arch.recovered_position(), 192);
     }
 }
