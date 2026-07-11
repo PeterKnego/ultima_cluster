@@ -167,25 +167,34 @@ impl InvariantChecker {
     /// A node advanced its commit counter to `commit` (`Action::AdvanceCommit`).
     ///
     /// Checks invariant 3 (per-node monotonicity) always, and the genuine-quorum
-    /// commit oracle (F3) at the ONE place it is meaningful: a **current max-term
-    /// leader's** rank-based commit — the actual "I certify these bytes are
-    /// quorum-fsync'd" assertion.
+    /// commit oracle (F3) for **every leader's** rank-based commit — the actual "I
+    /// certify these bytes are quorum-fsync'd" assertion. (T1) This includes a
+    /// STALE leader (still `Role::Leader` of a superseded term while a higher term
+    /// has opened elsewhere): a delayed report can reach it and its rank-commit can
+    /// cover divergent bytes no genuine quorum holds — unchecked, and
+    /// applied-then-truncated in M5, that is SMR divergence — so a leader commit is
+    /// phantom-checked regardless of whether its term is the current max.
     ///
     /// `AdvanceCommit` is otherwise a RAW counter (spec §6 / inv3 note): a
-    /// follower echoes a leader's gossiped commit without holding the bytes, and a
-    /// stale (superseded-term) leader can re-rank stale reports. Those raw
-    /// advances are benign — a higher-term leader is (or will be) elected complete
+    /// follower echoes a leader's gossiped commit without holding the bytes. That
+    /// raw echo is benign — a higher-term leader is (or will be) elected complete
     /// over the genuine committed history (invariant 5), and M5 clamps apply to
-    /// held-durable — so they must NOT be judged against a current-state quorum
-    /// (that would false-positive on every legitimate gossip echo / deposed
-    /// leader). Only when the committer is the leader of the highest term ever
-    /// elected is its commit a fresh certification: then a quorum must genuinely
-    /// hold bytes identical to its lineage (`durables[m]`/`maps[m]` are every
-    /// member's real state; `maps[node]` is the committing leader's map). Because
-    /// this reads only real `(durable, term_map)` state, its strength is identical
-    /// under `Gated` and `RawM3` — the phantom-commit guard the `RawM3` tests
-    /// exercise. This is also the ONE place the global commit high-water and the
-    /// committed lineage advance.
+    /// held-durable — so it must NOT be judged against a current-state quorum (that
+    /// would false-positive on every legitimate gossip echo), and returns early.
+    /// For a leader commit, a quorum must genuinely hold bytes identical to its
+    /// lineage (`durables[m]`/`maps[m]` are every member's real state; `maps[node]`
+    /// is the committing leader's map). Because this reads only real
+    /// `(durable, term_map)` state, its strength is identical under `Gated` and
+    /// `RawM3` — the phantom-commit guard the `RawM3` tests exercise. The reviewer
+    /// worked the safety argument that the stale-leader check does not
+    /// false-positive under `Gated`: a follower there clamps its report to
+    /// `matched`, so a stale leader can only rank commits a genuine quorum truly
+    /// holds (report/vote quorum intersection forces the newer leader's lineage to
+    /// cover any stale-quorum-committed position).
+    ///
+    /// The global commit high-water and committed lineage advance ONLY for a leader
+    /// of the highest term ever elected: a stale leader's lineage must never become
+    /// ground truth (it may certify over history a newer term already superseded).
     #[allow(clippy::too_many_arguments)]
     pub fn on_advance_commit(
         &mut self,
@@ -207,10 +216,14 @@ impl InvariantChecker {
         }
         self.last_commit[i] = commit;
 
-        // Only a leader of the highest term ever elected certifies fresh commits.
-        let max_term = self.leaders_by_term.keys().next_back().copied().unwrap_or(0);
-        if !(is_leader && term == max_term && max_term > 0) {
-            return Ok(()); // raw echo / stale-leader re-commit: benign, gmc untouched
+        // A raw FOLLOWER echo of gossiped commit is benign — it holds no bytes and
+        // asserts no certification, so it must NOT be judged against a current-state
+        // quorum. Only a LEADER's rank-commit is a genuine certification, and (T1)
+        // it is phantom-checked even when the leader is STALE (its term is below the
+        // current max), because a delayed report can make a stale leader rank a
+        // commit over divergent bytes no genuine quorum holds.
+        if !is_leader {
+            return Ok(()); // raw gossip echo: benign, gmc untouched
         }
 
         // Genuine byte-content quorum: for each member, the frontier up to which
@@ -234,7 +247,11 @@ impl InvariantChecker {
             ));
         }
 
-        if commit >= self.global_max_commit {
+        // Ground truth advances ONLY for a leader of the highest term ever elected:
+        // a stale leader's lineage must never become the committed history (a
+        // higher-term leader is elected complete over genuine history — inv5).
+        let max_term = self.leaders_by_term.keys().next_back().copied().unwrap_or(0);
+        if term == max_term && max_term > 0 && commit >= self.global_max_commit {
             self.global_max_commit = commit;
             // Refresh the committed lineage to the committing leader's map (it is
             // authoritative and, by invariant 5, complete over the committed
@@ -360,24 +377,33 @@ impl InvariantChecker {
         Ok(())
     }
 
-    /// Invariant 2 — term-map prefix consistency over committed positions. Every
-    /// term boundary a node records BELOW the global commit high-water must be an
-    /// EXACT committed boundary (same term AND base) in the ground-truth lineage.
+    /// Invariant 2 — term-map prefix consistency over committed positions. The
+    /// list of term boundaries a node records BELOW the global commit high-water
+    /// must equal a LEADING SLICE (prefix) of the ground-truth lineage's committed
+    /// boundaries — same terms AND bases, in order, with no gap.
     ///
-    /// This tolerates a lagging node (it simply records FEWER boundaries) and a
-    /// clean divergent durable tail (a follower's uncommitted-from-its-view stale
-    /// bytes add no term boundary to its map — its map stays a valid committed
-    /// prefix and is truncated later). But it catches map CORRUPTION: a boundary
-    /// at the wrong base (a term stamped onto a divergent prefix — the F1b `RawM3`
-    /// wrong-base-stamp bug, where two nodes end up recording the same term at
-    /// different bases) or at the wrong term. Checking exact `(term, base)`
-    /// membership — rather than the old zip which stopped at the shorter map's
-    /// length and only compared terms position-by-position — is the fix for the
-    /// zip-truncation that let a misplaced/missing committed boundary slip through.
-    /// Judging each node against the single lineage is equivalent-or-stronger than
-    /// the spec's pairwise form (two nodes that each match ground truth match each
-    /// other, and a node diverging from ground truth is caught even if some peer
-    /// diverged identically). Run after every event.
+    /// (T2) A pure membership test — "every below-gmc boundary is *some* committed
+    /// lineage boundary" — is too weak: a node map `[(1,0),(3,2000)]` against a
+    /// lineage `[(1,0),(2,960),(3,2000)]` (gmc 3000) passes membership (both node
+    /// boundaries are lineage members) yet is MISSING the middle `(2,960)` — a
+    /// divergent committed prefix. The leading-slice comparison rejects it, because
+    /// the node's list is not a prefix of the lineage's.
+    ///
+    /// This still tolerates a lagging node (it records FEWER boundaries → a shorter
+    /// prefix) and a clean divergent durable tail (a follower's
+    /// uncommitted-from-its-view stale bytes add no boundary below gmc — its
+    /// below-gmc list stays a valid prefix and is truncated later). But it catches
+    /// map CORRUPTION: a boundary at the wrong base (the F1b `RawM3`
+    /// wrong-base-stamp bug), at the wrong term, or a missing-middle boundary. This
+    /// prefix form is the fix for the earlier membership check (which itself
+    /// replaced the pre-review zip that stopped at the shorter map's length and
+    /// compared terms position-by-position).
+    ///
+    /// Judging each node against the single lineage as a prefix is
+    /// equivalent-or-stronger than the spec's pairwise form: two nodes that are
+    /// each a prefix of ground truth are prefixes of each other, and a node that
+    /// deviates from the ground-truth prefix is caught even if some peer deviated
+    /// identically. Run after every event.
     pub fn check_prefix_consistency(
         &self,
         maps: &[Vec<(u32, u64)>],
@@ -385,22 +411,27 @@ impl InvariantChecker {
     ) -> Result<(), InvariantViolation> {
         debug_assert_eq!(maps.len(), self.n);
         let gmc = self.global_max_commit;
+        // The ground-truth committed prefix: lineage boundaries below gmc (the
+        // lineage is sorted by base, so `take_while` yields the committed prefix).
+        let lineage_prefix: Vec<(u32, u64)> =
+            self.committed_lineage.iter().copied().take_while(|&(_, b)| b < gmc).collect();
         for (node, m) in maps.iter().enumerate() {
-            for &(t, b) in m.iter() {
-                if b >= gmc {
-                    break; // map sorted by base; beyond the committed prefix
-                }
-                if !self.committed_lineage.contains(&(t, b)) {
-                    return Err(self.viol(
-                        "term-map prefix consistency (inv2)",
-                        step,
-                        format!(
-                            "node {node} records committed-position boundary ({t},{b}) that is not \
-                             an exact committed lineage boundary (lineage={:?}, gmc={gmc})",
-                            self.committed_lineage
-                        ),
-                    ));
-                }
+            // This node's recorded boundaries below the committed high-water.
+            let node_prefix: Vec<(u32, u64)> =
+                m.iter().copied().take_while(|&(_, b)| b < gmc).collect();
+            // Must be a LEADING SLICE of the lineage's committed boundaries.
+            let is_prefix = node_prefix.len() <= lineage_prefix.len()
+                && node_prefix.iter().zip(lineage_prefix.iter()).all(|(a, b)| a == b);
+            if !is_prefix {
+                return Err(self.viol(
+                    "term-map prefix consistency (inv2)",
+                    step,
+                    format!(
+                        "node {node} committed-position boundaries {node_prefix:?} are not a \
+                         leading slice of the committed lineage prefix {lineage_prefix:?} \
+                         (gmc={gmc})"
+                    ),
+                ));
             }
         }
         Ok(())
@@ -445,6 +476,23 @@ mod tests {
     }
 
     #[test]
+    fn inv2_catches_missing_middle_boundary() {
+        // (T2) The reviewer's counterexample: node map [(1,0),(3,2000)] against
+        // lineage [(1,0),(2,960),(3,2000)] with gmc 3000. BOTH node boundaries are
+        // members of the lineage, so a membership test passes it — but the node is
+        // missing the middle (2,960) committed boundary, so its below-gmc list is
+        // NOT a leading slice of the lineage's. The prefix comparison catches it.
+        let c = checker(vec![(1, 0), (2, 960), (3, 2000)], 3000);
+        let maps = vec![
+            vec![(1, 0), (2, 960), (3, 2000)],
+            vec![(1, 0), (3, 2000)], // missing-middle: passes membership, fails prefix
+            vec![(1, 0), (2, 960), (3, 2000)],
+        ];
+        let err = c.check_prefix_consistency(&maps, 1).unwrap_err();
+        assert!(err.invariant.contains("inv2"), "{err}");
+    }
+
+    #[test]
     fn inv2_tolerates_lagging_prefix() {
         // A node that recorded FEWER committed boundaries (it is behind) is a valid
         // prefix — not a violation.
@@ -483,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn phantom_commit_flagged_only_for_current_max_term_leader() {
+    fn phantom_commit_flagged_for_current_max_term_leader() {
         let mut c = InvariantChecker::new(42, 3);
         // Establish term 2 as the highest elected term (its leader = node 0).
         c.on_become_leader(0, 2, 0, &[(2, 0)], 1).unwrap();
@@ -493,6 +541,37 @@ mod tests {
         let maps = vec![vec![(2, 0)], vec![(9, 0)], vec![(9, 0)]];
         let err = c.on_advance_commit(0, 3000, 2, true, &durables, &maps, 2).unwrap_err();
         assert!(err.invariant.contains("phantom"), "{err}");
+    }
+
+    #[test]
+    fn stale_leader_phantom_commit_is_caught() {
+        // (T1) The blind spot: a delayed report reaches a STALE leader (node 0,
+        // still Role::Leader of the superseded term 2) after term 3 opened
+        // elsewhere. Its rank-commit covers bytes only it holds. Pre-T1 this was
+        // skipped (term 2 != max_term 3); now every leader commit is phantom-checked.
+        let mut c = InvariantChecker::new(42, 3);
+        c.leaders_by_term.insert(2, 0);
+        c.leaders_by_term.insert(3, 2); // term 3 (node 2) is the current max term
+        let durables = vec![3000, 3000, 3000];
+        let maps = vec![vec![(2, 0)], vec![(9, 0)], vec![(9, 0)]];
+        let err = c.on_advance_commit(0, 3000, 2, true, &durables, &maps, 5).unwrap_err();
+        assert!(err.invariant.contains("phantom"), "{err}");
+        assert_eq!(c.global_max_commit, 0, "a stale leader's phantom must not advance gmc");
+    }
+
+    #[test]
+    fn stale_leader_genuine_commit_passes_but_does_not_advance_ground_truth() {
+        // (T1, the gating half) A stale term-2 leader whose commit a genuine quorum
+        // DOES hold is not a false positive — the check passes — but ground truth
+        // must NOT move: a stale leader's lineage never becomes committed history.
+        let mut c = InvariantChecker::new(42, 3);
+        c.leaders_by_term.insert(2, 0);
+        c.leaders_by_term.insert(3, 2);
+        let durables = vec![3000, 3000, 0];
+        let maps = vec![vec![(2, 0)], vec![(2, 0)], vec![]];
+        assert!(c.on_advance_commit(0, 3000, 2, true, &durables, &maps, 5).is_ok());
+        assert_eq!(c.global_max_commit, 0, "stale leader must not advance gmc");
+        assert!(c.committed_lineage.is_empty(), "stale leader must not set the lineage");
     }
 
     #[test]
