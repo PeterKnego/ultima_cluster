@@ -213,6 +213,44 @@ mod tests {
     }
 
     #[test]
+    fn instance_id_high_bits_pin_the_lo_hi_split() {
+        // An instance_id with DIFFERENT non-zero halves, pinned as literal
+        // bytes at both offsets. A write/read roundtrip alone cannot catch
+        // a consistently-swapped lo/hi (it would roundtrip fine); only the
+        // absolute byte pin does.
+        let h = CncHeader {
+            instance_id: (0xFEED_FACE_CAFE_BEEF_u128 << 64) | 0x0123_4567_89AB_CDEF_u128,
+            ..header(1)
+        };
+        let mut page = vec![0u8; CNC_PAGE_LEN];
+        write_cnc_header(&mut page, &h, "kv");
+        // low half 0x0123_4567_89AB_CDEF -> LE at CNC_OFF_INSTANCE_LO (16)
+        assert_eq!(
+            &page[CNC_OFF_INSTANCE_LO..CNC_OFF_INSTANCE_LO + 8],
+            &[0xEF, 0xCD, 0xAB, 0x89, 0x67, 0x45, 0x23, 0x01]
+        );
+        // high half 0xFEED_FACE_CAFE_BEEF -> LE at CNC_OFF_INSTANCE_HI (24)
+        assert_eq!(
+            &page[CNC_OFF_INSTANCE_HI..CNC_OFF_INSTANCE_HI + 8],
+            &[0xEF, 0xBE, 0xFE, 0xCA, 0xCE, 0xFA, 0xED, 0xFE]
+        );
+        assert_eq!(read_cnc_header(&page).map(|o| o.instance_id), Some(h.instance_id));
+    }
+
+    #[test]
+    fn app_id_63_bytes_is_the_longest_legal_value() {
+        // Boundary success case: 63 bytes fills the field up to the
+        // mandatory NUL terminator (64 bytes panics — covered separately).
+        let h = header(1);
+        let mut page = vec![0u8; CNC_PAGE_LEN];
+        let app_id = "x".repeat(63);
+        write_cnc_header(&mut page, &h, &app_id);
+        assert_eq!(read_cnc_app_id(&page), app_id);
+        // the final byte of the 64-byte field is the NUL terminator
+        assert_eq!(page[CNC_OFF_APP_ID + 63], 0);
+    }
+
+    #[test]
     fn read_rejects_bad_magic_or_short_page() {
         // all-zero page: magic mismatch
         let page = vec![0u8; CNC_PAGE_LEN];

@@ -205,6 +205,15 @@ impl CncPage {
     /// clients, a reconnecting node).
     pub fn open_file(path: &Path, expected_app_id: &str) -> Result<Arc<CncPage>, CncError> {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        // Attach-validation contract: bad magic/len/crc → BadHeader (a typed
+        // error, never a panic). The file length here is EXTERNAL input (a
+        // torn create_file crash, wrong path, corruption), so it must be
+        // rejected before reaching `Self::new`, whose length assert guards
+        // only the internally-controlled construction paths (create_file
+        // just set_len'd the file; heap allocated exactly one page).
+        if file.metadata()?.len() != CNC_PAGE_LEN as u64 {
+            return Err(CncError::BadHeader);
+        }
         // SAFETY: attaching to a page created by `create_file` (possibly in
         // another process) via a shared mmap of the same file.
         let mmap = unsafe { memmap2::MmapMut::map_mut(&file)? };
@@ -336,6 +345,45 @@ mod tests {
         }
         let r = CncPage::open_file(&p, "test-app").map(|_| ());
         assert!(matches!(r, Err(CncError::BadHeader)), "flipped crc-protected byte must be rejected: {r:?}");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real cnc file, mmap'd
+    fn open_file_rejects_wrong_length_file_without_panicking() {
+        // A cnc file of any non-4096 length (torn create_file crash, wrong
+        // path, corruption) is EXTERNAL input: the attach contract is
+        // "bad magic/len/crc → BadHeader", never a panic in the attaching
+        // process. (CncPage::new's length assert is only for the
+        // internally-controlled create_file/heap paths.)
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("cnc2.dat");
+        std::fs::write(&p, vec![0u8; 1000]).unwrap();
+        let r = CncPage::open_file(&p, "test-app").map(|_| ());
+        assert!(matches!(r, Err(CncError::BadHeader)), "{r:?}");
+        // Also the too-long side, same class of corruption.
+        std::fs::write(&p, vec![0u8; CNC_PAGE_LEN + 1]).unwrap();
+        let r = CncPage::open_file(&p, "test-app").map(|_| ());
+        assert!(matches!(r, Err(CncError::BadHeader)), "{r:?}");
+    }
+
+    #[test]
+    fn meta_roundtrips_high_instance_bits_and_63_byte_app_id() {
+        // instance_id with non-zero HIGH 64 bits pins the INSTANCE_LO/HI
+        // split (a swapped-half bug is invisible to ids that fit in u64),
+        // and a 63-byte app_id is the longest legal one (64-byte field,
+        // NUL-terminated).
+        let app_id: String = "a".repeat(63);
+        let meta = CncMeta {
+            node_id: 9,
+            instance_id: (0xFEED_FACE_CAFE_BEEF_u128 << 64) | 0x0123_4567_89AB_CDEF_u128,
+            app_id: app_id.clone(),
+            buffer_bytes: 1 << 22,
+            max_payload: 512,
+        };
+        let page = CncPage::heap(&meta);
+        let out = page.meta();
+        assert_eq!(out, meta);
+        assert_eq!(out.app_id.len(), 63);
     }
 
     #[test]
