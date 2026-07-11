@@ -8,8 +8,10 @@
 //! held datagram is therefore delayed by at most one send — heartbeats keep
 //! sends coming, so nothing is held forever).
 
+use std::collections::HashSet;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::{Arc, RwLock};
 
 /// Deterministic xorshift64 — no external RNG dependency.
 pub(crate) struct XorShift64(u64);
@@ -46,11 +48,38 @@ impl Default for FaultConfig {
     }
 }
 
+/// A shared, injectable partition table (M4, spec §8): the set of peer
+/// addresses this socket is currently partitioned away from. Cloned into a
+/// [`FaultSocket`] and driven from a test/consensus thread while the socket's
+/// own agent keeps sending — every `send_to` consults it BEFORE the seeded
+/// fault rolls (a partition is not a random fault; it is a hard, scriptable
+/// link cut). Empty-set is the steady state, so `send_to` pays exactly one
+/// uncontended read-lock (~20 ns) when nothing is blocked.
+#[derive(Clone, Default)]
+pub struct PartitionHandle(Arc<RwLock<HashSet<SocketAddr>>>);
+
+impl PartitionHandle {
+    /// Partition this socket away from `addr`: subsequent `send_to(addr)` drop
+    /// silently until [`unblock`](Self::unblock)/[`clear`](Self::clear).
+    pub fn block(&self, addr: SocketAddr) {
+        self.0.write().unwrap().insert(addr);
+    }
+    /// Reconnect a single peer (inverse of [`block`](Self::block)).
+    pub fn unblock(&self, addr: SocketAddr) {
+        self.0.write().unwrap().remove(&addr);
+    }
+    /// Heal every partition on this socket.
+    pub fn clear(&self) {
+        self.0.write().unwrap().clear();
+    }
+}
+
 pub struct FaultSocket {
     sock: UdpSocket,
     cfg: FaultConfig,
     rng: XorShift64,
     held: Option<(Vec<u8>, SocketAddr)>,
+    blocked: PartitionHandle,
 }
 
 impl FaultSocket {
@@ -61,7 +90,19 @@ impl FaultSocket {
     pub fn from_socket(sock: UdpSocket) -> io::Result<Self> {
         sock.set_nonblocking(true)?;
         let cfg = FaultConfig::default();
-        Ok(Self { sock, rng: XorShift64::new(cfg.seed), cfg, held: None })
+        Ok(Self {
+            sock,
+            rng: XorShift64::new(cfg.seed),
+            cfg,
+            held: None,
+            blocked: PartitionHandle::default(),
+        })
+    }
+
+    /// A shared handle to this socket's partition table (M4). Multiple handles
+    /// alias the same set; driving any one of them affects this socket's sends.
+    pub fn partition_handle(&self) -> PartitionHandle {
+        self.blocked.clone()
     }
 
     pub fn set_faults(&mut self, cfg: FaultConfig) {
@@ -80,6 +121,16 @@ impl FaultSocket {
     }
 
     pub fn send_to(&mut self, buf: &[u8], to: SocketAddr) -> io::Result<()> {
+        // Partition check BEFORE the seeded fault rolls: a scripted link cut is
+        // deterministic and must not consume RNG draws (that would desync a
+        // seeded drop/dup/reorder run). Empty-set steady state = one
+        // uncontended read-lock; a partitioned peer's datagram is dropped whole.
+        {
+            let blocked = self.blocked.0.read().unwrap();
+            if !blocked.is_empty() && blocked.contains(&to) {
+                return Ok(());
+            }
+        }
         if self.cfg.drop_per_million > 0 && self.rng.chance(self.cfg.drop_per_million) {
             return Ok(()); // dropped on the wire
         }
@@ -201,5 +252,58 @@ mod tests {
         tx.send_to(b"first", to).unwrap(); // held back
         tx.send_to(b"second", to).unwrap(); // goes out, then flushes "first"
         assert_eq!(recv_all(&rx, 2), vec![b"second".to_vec(), b"first".to_vec()]);
+    }
+
+    #[test]
+    fn partition_blocks_then_unblocks_one_peer() {
+        let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        let to = rx.local_addr().unwrap();
+        let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        let part = tx.partition_handle();
+
+        // clean baseline: delivery works
+        tx.send_to(b"a", to).unwrap();
+        assert_eq!(recv_all(&rx, 1), vec![b"a".to_vec()]);
+
+        // block the peer: sends are dropped whole (no RNG consumed, no fault)
+        part.block(to);
+        for _ in 0..10 {
+            tx.send_to(b"blocked", to).unwrap();
+        }
+        // nothing arrives within a short settle
+        let mut buf = [0u8; 16];
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(rx.recv_from(&mut buf).unwrap().is_none(), "partitioned peer still received");
+
+        // unblock: delivery resumes
+        part.unblock(to);
+        tx.send_to(b"b", to).unwrap();
+        assert_eq!(recv_all(&rx, 1), vec![b"b".to_vec()]);
+
+        // clear() heals everything too
+        part.block(to);
+        part.clear();
+        tx.send_to(b"c", to).unwrap();
+        assert_eq!(recv_all(&rx, 1), vec![b"c".to_vec()]);
+    }
+
+    #[test]
+    fn empty_partition_set_does_not_consume_rng() {
+        // A partition check on an empty set must not touch the RNG, or a seeded
+        // drop run would desync. Two sockets, identical drop seed: one with an
+        // (empty) partition handle queried, one untouched — identical output.
+        let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        let to = rx.local_addr().unwrap();
+        let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        tx.set_faults(FaultConfig { seed: 99, drop_per_million: 500_000, ..Default::default() });
+        let _part = tx.partition_handle(); // exists but empty — must be inert
+        for i in 0..100u8 {
+            tx.send_to(&[i], to).unwrap();
+        }
+        let mut rng = XorShift64::new(99);
+        let expected: Vec<Vec<u8>> =
+            (0..100u8).filter(|_| !rng.chance(500_000)).map(|i| vec![i]).collect();
+        let got = recv_all(&rx, expected.len());
+        assert_eq!(got, expected, "empty partition set perturbed the seeded drop sequence");
     }
 }

@@ -22,7 +22,7 @@
 //! gate's accounting lesson (docs/benchmarks/uc2-m1-gate-2026-07-09.md).
 
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -61,8 +61,9 @@ fn follower_node(
     buffer_mib: usize,
 ) -> (Arc<LogBuffer>, Arc<FollowerStats>, Vec<AgentRunner>) {
     let b = buffer(buffer_mib);
-    let cfg = FollowerConfig::new(TERM, leader);
-    let mut rx = FollowerReceiver::new(Arc::clone(&b), sock, cfg);
+    let cfg = FollowerConfig::new(leader);
+    let mut rx =
+        FollowerReceiver::new(Arc::clone(&b), sock, cfg, Arc::new(AtomicU32::new(TERM)));
     let stats = rx.stats();
     let rxa =
         AgentRunner::spawn(&format!("{name}-rx"), IdleStrategy::BusySpin, move || rx.do_work())
@@ -87,11 +88,20 @@ fn leader_node(
         ..Default::default()
     });
     let (tx, rx) = mpsc::sync_channel(4096);
-    let mut sender = Sender::new(Arc::clone(&b), send, followers, 3, rx, SenderConfig::new(TERM));
+    let term = Arc::new(AtomicU32::new(TERM));
+    let mut sender = Sender::new(
+        Arc::clone(&b),
+        send,
+        followers,
+        3,
+        rx,
+        SenderConfig::new(TERM),
+        Arc::clone(&term),
+    );
     let stats = sender.stats();
     let txa = AgentRunner::spawn("leader-tx", IdleStrategy::BusySpin, move || sender.do_work())
         .unwrap();
-    let mut lr = LeaderReceiver::new(recv, tx, TERM).unwrap();
+    let mut lr = LeaderReceiver::new(recv, tx, term).unwrap();
     let lra =
         AgentRunner::spawn("leader-ctrl", IdleStrategy::BusySpin, move || lr.do_work()).unwrap();
     let ara = archive_agent("leader-ar", &b, journal_dir);

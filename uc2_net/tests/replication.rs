@@ -135,3 +135,40 @@ fn dead_follower_does_not_stall_the_quorum() {
     converge_and_compare(leader, vec![f1], end);
     drop(dead);
 }
+
+#[test]
+fn paused_follower_recovers_via_replay_sessions() {
+    // THE M2-envelope test: a live follower falls >1 ring behind, which was
+    // NAK-unrecoverable in M2/M3 (permanent wedge, overruns>0). With replay
+    // sessions the sender serves deep NAKs from the journal. overruns>0 was
+    // EXPECTED in M2's framing; with the seam SERVED the counter stays 0 and
+    // replay_datagrams>0 is the proof the path ran.
+    let raw = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let leader_addr = raw.local_addr().unwrap();
+    let f1 = spawn_follower("rp-f1", leader_addr, FaultConfig::default());
+    let b1 = Arc::clone(&f1.node.buffer);
+    // follower 2 starts PAUSED: socket bound (no ICMP noise) but agents not
+    // yet spawned — it will join >1 ring behind
+    let f2_sock = FaultSocket::bind("127.0.0.1:0").unwrap();
+    let f2_addr = f2_sock.local_addr().unwrap();
+    let leader = spawn_leader(raw, vec![f1.addr, f2_addr], FaultConfig::default());
+    let sstats = Arc::clone(&leader.stats);
+    // stream ~3 rings (CAP = 1 MiB) paced by the live follower only
+    let end = load(&leader.node.buffer, &[&b1], 32_768);
+    assert!(end >= 3 * CAP);
+    // now start follower 2 from zero: its first NAKs are >1 ring deep
+    let f2 = spawn_follower_on("rp-f2", f2_sock, leader_addr, FaultConfig::default());
+    let b2 = Arc::clone(&f2.node.buffer);
+    await_pos(&b2.counters().append, end, "paused follower rebuilt");
+    await_pos(&b2.counters().durable, end, "paused follower durable");
+    assert!(
+        sstats.replay_datagrams.load(Ordering::Relaxed) > 0,
+        "recovery must have used the journal replay path"
+    );
+    assert_eq!(
+        sstats.overruns.load(Ordering::Relaxed),
+        0,
+        "the deep-NAK seam is SERVED from the journal, never counted as an overrun"
+    );
+    converge_and_compare(leader, vec![f1, f2], end);
+}

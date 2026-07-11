@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use uc_protocol::v2::frame::{
-    self, FRAME_TYPE_MESSAGE, FRAME_TYPE_PADDING, FrameHeader, HEADER_LEN, align_frame_len,
+    self, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING, FrameHeader, HEADER_LEN,
+    align_frame_len,
 };
 
 use crate::counters::LogCounters;
@@ -400,6 +401,60 @@ impl Appender {
         Ok(frame_pos)
     }
 
+    /// Append the header-only `FRAME_TYPE_NEW_TERM` no-op frame that opens a
+    /// leadership term (spec §6, M4): 32 bytes, stamped with this appender's
+    /// leadership term, zero payload. The data plane streams it like any frame,
+    /// the archive's term-observation walk records `(term, base)` at its
+    /// position, and its quorum commit is what gates the new leader's serving
+    /// (Raft §5.4.2). Returns its position. Same wrap/overrun discipline as
+    /// `append`.
+    pub fn append_new_term(&mut self) -> Result<u64, AppendError> {
+        let total = HEADER_LEN; // header-only no-op frame
+        let aligned = align_frame_len(total) as u64;
+        let b = &self.buffer;
+
+        let off = b.offset(self.pos);
+        let to_end = b.capacity - off as u64;
+        let pad = if aligned > to_end { to_end } else { 0 };
+        let end = self.pos + pad + aligned;
+
+        if end > self.cached_durable + b.capacity {
+            self.cached_durable = b.counters.durable.load_acquire();
+            if end > self.cached_durable + b.capacity {
+                return Err(AppendError::WouldOverrun);
+            }
+        }
+
+        let frame_pos = if pad > 0 {
+            self.write_padding(off, pad as u32);
+            self.pos + pad
+        } else {
+            self.pos
+        };
+        let foff = b.offset(frame_pos);
+
+        // SAFETY: as in `append` — within capacity, writer-owned by the gate.
+        unsafe {
+            let hdr = std::slice::from_raw_parts_mut(b.region.ptr_at(foff), HEADER_LEN);
+            frame::write_header_except_length(
+                hdr,
+                &FrameHeader {
+                    length: 0,
+                    frame_type: FRAME_TYPE_NEW_TERM,
+                    flags: 0,
+                    leadership_term_id: self.leadership_term_id,
+                    session_id: 0,
+                    correlation_id: 0,
+                },
+            );
+        }
+        b.commit_word(foff).store(total as u32, Ordering::Release);
+
+        self.pos = end;
+        b.counters.append.store_release(self.pos);
+        Ok(frame_pos)
+    }
+
     /// Padding frame: header only; `length` spans to the buffer end.
     fn write_padding(&self, off: usize, pad_len: u32) {
         let b = &self.buffer;
@@ -429,7 +484,7 @@ mod tests {
     use crate::region::Region;
     use std::sync::Arc;
     use uc_protocol::v2::frame::{
-        FRAME_TYPE_MESSAGE, FRAME_TYPE_PADDING, HEADER_LEN, read_header,
+        FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING, HEADER_LEN, read_header,
     };
 
     const CAP: u64 = 4096;
@@ -463,6 +518,25 @@ mod tests {
         assert_eq!(h.session_id, 11);
         assert_eq!(h.correlation_id, 42);
         assert_eq!(&s[HEADER_LEN..HEADER_LEN + 12], b"hello world!");
+    }
+
+    #[test]
+    fn append_new_term_is_header_only_32_bytes() {
+        let (b, c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 7);
+        let pos = a.append_new_term().unwrap();
+        assert_eq!(pos, 0);
+        assert_eq!(a.position(), 32, "the NewTerm frame is header-only (32 B)");
+        assert_eq!(c.append.load_acquire(), 32);
+        let s = b.recordable_slice(0, 1 << 20);
+        assert_eq!(s.len(), 32);
+        let h = read_header(s);
+        assert_eq!(h.length, HEADER_LEN as u32);
+        assert_eq!(h.frame_type, FRAME_TYPE_NEW_TERM);
+        assert_eq!(h.leadership_term_id, 7);
+        // a data frame after it opens exactly at base + 32
+        let dpos = a.append(1, 0, &[0u8; 64]).unwrap();
+        assert_eq!(dpos, 32);
     }
 
     #[test]

@@ -1,6 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Peter Knego
 [package]
-name = "uc2_net"
-description = "UC v2 UDP replication data plane: sender/receiver agents, NAK, flow control (spec 2026-07-09, M2)"
+name = "uc2_node"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -9,8 +10,10 @@ authors.workspace = true
 [dependencies]
 uc_protocol = { path = "../uc_protocol" }
 uc2_log = { path = "../uc2_log" }
+uc2_net = { path = "../uc2_net" }
 uc2_consensus = { path = "../uc2_consensus" }
 ultima-journal = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

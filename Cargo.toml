@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["uc_protocol", "uc2_log", "uc2_net", "uc2_consensus", "uc_service", "uc_node", "uc_client", "uc_autobench", "uc-lincheck", "uc-rt-busyspin", "ultima_journal", "examples/counter_loop", "examples/uc-crashtest"]
+members = ["uc_protocol", "uc2_log", "uc2_net", "uc2_consensus", "uc2_sim", "uc2_node", "uc_service", "uc_node", "uc_client", "uc_autobench", "uc-lincheck", "uc-rt-busyspin", "ultima_journal", "examples/counter_loop", "examples/uc-crashtest"]
 
 [workspace.package]
 edition = "2024"

@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ use uc2_net::fault::{FaultConfig, FaultSocket};
 use uc2_net::rebuild::NakConfig;
 use uc2_net::receiver::{FollowerConfig, FollowerReceiver, LeaderReceiver};
 use uc2_net::sender::{Sender, SenderConfig};
+use ultima_journal::Journal;
 
 pub const TERM: u32 = 3;
 pub const CAP: u64 = 1 << 20; // 1 MiB buffers, identical on every node
@@ -51,13 +53,23 @@ impl Node {
     }
 }
 
-pub fn spawn_archive(name: &str, buffer: &Arc<LogBuffer>, dir: &std::path::Path) -> AgentRunner {
+/// Spawn the archive agent AND hand back a shared handle to its journal (the
+/// sender's NAK replay source, M4). The journal is extracted BEFORE the archive
+/// moves into the agent closure — a follower ignores the handle; the leader
+/// wires it into its sender via `set_replay_source`.
+pub fn spawn_archive(
+    name: &str,
+    buffer: &Arc<LogBuffer>,
+    dir: &std::path::Path,
+) -> (AgentRunner, Arc<Journal>) {
     let mut archive = Archive::open(test_cfg(dir)).unwrap();
+    let journal = archive.journal_arc();
     let b = Arc::clone(buffer);
-    AgentRunner::spawn(name, IdleStrategy::Yield, move || {
+    let runner = AgentRunner::spawn(name, IdleStrategy::Yield, move || {
         archive.do_work(&b).expect("archive fail-stop")
     })
-    .unwrap()
+    .unwrap();
+    (runner, journal)
 }
 
 pub struct Follower {
@@ -67,20 +79,33 @@ pub struct Follower {
 }
 
 pub fn spawn_follower(name: &str, leader: SocketAddr, faults: FaultConfig) -> Follower {
-    let mut sock = FaultSocket::bind("127.0.0.1:0").unwrap();
+    let sock = FaultSocket::bind("127.0.0.1:0").unwrap();
+    spawn_follower_on(name, sock, leader, faults)
+}
+
+/// Build a follower on a PRE-BOUND socket (the M4 paused-follower test binds
+/// the socket first — quiet, no ICMP — then joins the cluster far behind).
+/// `spawn_follower` is the two-line wrapper that binds a fresh socket.
+pub fn spawn_follower_on(
+    name: &str,
+    mut sock: FaultSocket,
+    leader: SocketAddr,
+    faults: FaultConfig,
+) -> Follower {
     let addr = sock.local_addr().unwrap();
     sock.set_faults(faults);
     let buffer = buffer();
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = FollowerConfig::new(TERM, leader);
+    let mut cfg = FollowerConfig::new(leader);
     cfg.seed = faults.seed.wrapping_add(addr.port() as u64);
     cfg.status_floor_ns = 5_000_000; // 5 ms: keep flow adverts fresh under test loads
     cfg.nak = NakConfig { delay_min_ns: 100_000, delay_max_ns: 500_000, backoff_ns: 2_000_000 };
-    let mut rx = FollowerReceiver::new(Arc::clone(&buffer), sock, cfg);
+    let term = Arc::new(AtomicU32::new(TERM));
+    let mut rx = FollowerReceiver::new(Arc::clone(&buffer), sock, cfg, term);
     let stats = rx.stats();
     let rxa = AgentRunner::spawn(&format!("{name}-rx"), IdleStrategy::Yield, move || rx.do_work())
         .unwrap();
-    let ara = spawn_archive(&format!("{name}-ar"), &buffer, dir.path());
+    let (ara, _journal) = spawn_archive(&format!("{name}-ar"), &buffer, dir.path());
     Follower { node: Node { buffer, dir, agents: vec![rxa, ara] }, stats, addr }
 }
 
@@ -100,15 +125,20 @@ pub fn spawn_leader(raw: UdpSocket, followers: Vec<SocketAddr>, faults: FaultCon
     let (tx, rx) = mpsc::sync_channel(1024);
     let mut cfg = SenderConfig::new(TERM);
     cfg.heartbeat_ns = 2_000_000; // 2 ms: quick tail-loss detection in tests
-    let mut sender = Sender::new(Arc::clone(&buffer), send, followers, 3, rx, cfg);
+    // Open the archive first so the sender can take its journal as the deep-NAK
+    // replay source (M4) before the sender agent spawns.
+    let (ara, journal) = spawn_archive("leader-ar", &buffer, dir.path());
+    let term = Arc::new(AtomicU32::new(TERM));
+    let mut sender =
+        Sender::new(Arc::clone(&buffer), send, followers, 3, rx, cfg, Arc::clone(&term));
+    sender.set_replay_source(journal);
     let stats = sender.stats();
     let txa =
         AgentRunner::spawn("leader-tx", IdleStrategy::Yield, move || sender.do_work()).unwrap();
-    let mut lr = LeaderReceiver::new(recv, tx, TERM).unwrap();
+    let mut lr = LeaderReceiver::new(recv, tx, term).unwrap();
     let lr_stats = lr.stats(); // capture before the receiver moves into its agent
     let lra =
         AgentRunner::spawn("leader-ctrl", IdleStrategy::Yield, move || lr.do_work()).unwrap();
-    let ara = spawn_archive("leader-ar", &buffer, dir.path());
     Leader { node: Node { buffer, dir, agents: vec![txa, lra, ara] }, stats, lr_stats }
 }
 

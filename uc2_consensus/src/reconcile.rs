@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
+//! Term-map reconciliation (spec §M4): the pure, exhaustively-testable core of
+//! log truncation. A follower that receives the leader's term map compares it
+//! against its own history and decides, byte-for-byte, how far its local log is
+//! still valid.
+//!
+//! A **term map** is an ascending `Vec<(term, base)>`: term `t`'s bytes begin at
+//! byte position `base`. Positions are globally monotone across the cluster, so
+//! two maps that share an entry share every byte below that entry's successor.
+//!
+//! ## Data-stamped term recording (the safety contract)
+//!
+//! Our own map records a term **only when we actually accepted that term's
+//! data** — never by adopting an entry the leader gossiped. Concretely, an entry
+//! `(t, b)` appears in our own map iff either we opened term `t` ourselves as
+//! leader (base = our durable at the time), or we streamed and durably wrote
+//! bytes stamped term `t` starting at `b` (the `DataTermObserved` path in the
+//! election SM). Gossip never grows our map.
+//!
+//! This is what makes truncation sound. Consider a healed ex-leader whose own
+//! map is `[(1,0)]` at durable 3000 (it wrote bytes `[2000,3000)` under its own
+//! failed term but only ever stamped them as term 1). The real cluster opened
+//! term 2 at position 2000. The leader ships `[(1,0),(2,2000)]`. Because our own
+//! map *lacks* a term-2 stamp below our durable, those `[2000,3000)` bytes are
+//! provably ours-and-divergent, not the term-2 leader's — so we truncate to
+//! 2000. Had we adopted the gossiped `(2,2000)` (the old, unsafe rule), we would
+//! have recorded our stale divergent bytes as the term-2 leader's data — a
+//! split-history that could then be served or used as vote credentials. A leader
+//! entry we lack below our durable therefore **proves** divergence.
+//!
+//! ## [`reconcile`] rule (pure over `(own, own_durable, leader)`)
+//!
+//! - Find `k`, the length of the longest common prefix of the two maps.
+//! - `valid_up_to = own_durable`, clamped down to:
+//!   - `own[k].base` when `k < own.len()` — our first entry beyond the common
+//!     prefix is a history the leader never certified (a conflicting term or an
+//!     overhang past a shorter leader map);
+//!   - `leader[k].base` when `k < leader.len()` **and** `leader[k].base <
+//!     own_durable` — a term the leader certified below our durable that our own
+//!     data-stamped map lacks, i.e. proven divergence.
+//! - `new_map` = **our own surviving entries only** (own entries with
+//!   `base < valid_up_to`). The leader's entries are never adopted here; our map
+//!   grows solely through our own leadership or `DataTermObserved`.
+//!
+//! The caller (the election SM) derives the action from the [`Outcome`]:
+//! `valid_up_to < own_durable` ⇒ truncate; else if `new_map` shrank/changed ⇒
+//! persist. [`Reconcile::NoCommonPrefix`] means the leader's shipped suffix
+//! begins strictly beyond our entire history — incremental reconciliation is
+//! impossible and M6's snapshot install is the real answer; M4 surfaces it
+//! loudly (the sim asserts it is unreachable at `<= MAX_TERM_MAP_WIRE_ENTRIES`
+//! terms).
+
+/// Cap on the number of term-map entries shipped on the wire (the leader
+/// piggybacks the last `MAX_TERM_MAP_WIRE_ENTRIES` on its commit-gossip
+/// cadence). A follower whose divergence predates this window falls off the
+/// incremental path and needs a snapshot (M6) — surfaced as
+/// [`Reconcile::NoCommonPrefix`].
+pub const MAX_TERM_MAP_WIRE_ENTRIES: usize = 64;
+
+/// The result of comparing our term map against the leader's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    /// The byte position up to which our local log is still valid. Truncation
+    /// is required iff `valid_up_to < own_durable`.
+    pub valid_up_to: u64,
+    /// The reconciled term map: our own surviving entries (base strictly below
+    /// `valid_up_to`). Never contains an adopted leader entry.
+    pub new_map: Vec<(u32, u64)>,
+}
+
+/// Outcome of [`reconcile`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reconcile {
+    /// Histories share a prefix. See [`Outcome`] for the surviving bound and the
+    /// reconciled map.
+    Ok(Outcome),
+    /// No common entry — the leader's shipped suffix begins beyond our history.
+    /// Incremental reconciliation is impossible; a snapshot install (M6) is the
+    /// answer. The sim/harness prove this is unreachable at `<=
+    /// MAX_TERM_MAP_WIRE_ENTRIES` terms.
+    NoCommonPrefix,
+}
+
+/// Compare our `own` term map (bounded by `own_durable`) against the `leader`'s.
+///
+/// Both maps are ascending `(term, base)` slices. See the module docs for the
+/// rules; the unit tests are the binding contract.
+pub fn reconcile(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) -> Reconcile {
+    // A leader with no map tells us nothing — our history is clean as-is.
+    if leader.is_empty() {
+        return Reconcile::Ok(Outcome { valid_up_to: own_durable, new_map: own.to_vec() });
+    }
+
+    // Longest common prefix (entries equal in both term and base).
+    let mut k = 0;
+    while k < own.len() && k < leader.len() && own[k] == leader[k] {
+        k += 1;
+    }
+
+    // No shared entry AND our first entry begins at or below the leader's first:
+    // if the leader's earliest shipped entry begins strictly beyond our first
+    // byte, its window has slid past our history — incremental repair is out.
+    // (Empty own has no first entry, so it can never be NoCommonPrefix — a fresh
+    // node reconciles cleanly against whatever the leader shows.)
+    if k == 0 && !own.is_empty() && leader[0].1 > own[0].1 {
+        return Reconcile::NoCommonPrefix;
+    }
+
+    // Our bytes are valid up to our durable, clamped down at the first point of
+    // divergence beyond the common prefix:
+    //   - our own first uncertified entry (conflict or overhang), and/or
+    //   - a leader term below our durable that our data-stamped map LACKS
+    //     (proven divergence — the bytes there are ours, not that term's).
+    let mut valid_up_to = own_durable;
+    if k < own.len() {
+        valid_up_to = valid_up_to.min(own[k].1);
+    }
+    if k < leader.len() && leader[k].1 < own_durable {
+        valid_up_to = valid_up_to.min(leader[k].1);
+    }
+
+    // The reconciled map is our own surviving entries only — never an adopted
+    // leader entry (reconcile never grows the map — that is `DataTermObserved`'s
+    // job). The COMMON PREFIX is kept unconditionally: a legitimate zero-byte
+    // frontier entry (base == durable) that the leader shares must survive.
+    // Beyond the prefix, entries survive only below `valid_up_to`. In a CLEAN
+    // outcome every beyond-prefix own entry has base >= durable (else the
+    // own-side clamp above would have fired), i.e. it is a zero-byte PHANTOM
+    // from a term the leader's history contradicts (e.g. we won a term,
+    // persisted the map entry, and crashed before the NewTerm frame fsynced).
+    // Keeping such a phantom is unsafe: once genuine data streams past its
+    // base, the next reconcile's own-side clamp would spuriously truncate
+    // genuine (possibly committed) bytes at the phantom's base.
+    let new_map: Vec<(u32, u64)> = own[..k]
+        .iter()
+        .chain(own[k..].iter().filter(|(_, base)| *base < valid_up_to))
+        .copied()
+        .collect();
+
+    Reconcile::Ok(Outcome { valid_up_to, new_map })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_outcome_drops_beyond_prefix_phantom_frontier_entry() {
+        // Deposed ex-leader that crashed AFTER persisting its term-2 map
+        // entry but BEFORE the NewTerm frame fsynced: map [(1,0),(2,5000)],
+        // durable exactly 5000 (zero term-2 bytes). Term 3 opened at 5000.
+        // Reconcile is CLEAN (nothing to truncate: valid_up_to == durable)
+        // but the phantom (2,5000) MUST be dropped — keeping it would make a
+        // LATER reconcile (after genuine term-3 data streams past 5000)
+        // spuriously truncate committed bytes at the phantom's base.
+        match reconcile(&[(1, 0), (2, 5000)], 5000, &[(1, 0), (3, 5000)]) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 5000); // clean — no truncation
+                assert_eq!(o.new_map, vec![(1, 0)]); // phantom dropped
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        // and the SHARED frontier entry (in the common prefix) survives:
+        let m = [(1, 0), (2, 5000)];
+        match reconcile(&m, 5000, &m) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 5000);
+                assert_eq!(o.new_map, m.to_vec()); // k == 2: kept unconditionally
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn identical_histories_are_clean() {
+        // Same map on both sides: valid to our durable, map unchanged.
+        let m = [(1, 0), (3, 4096)];
+        match reconcile(&m, 8000, &m) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 8000); // == own_durable ⇒ clean
+                assert_eq!(o.new_map, vec![(1, 0), (3, 4096)]);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn divergent_own_tail_truncates_at_own_divergent_base() {
+        // common: (1,0). We opened term 2 at 4096 (a leader that never won
+        // quorum); real history went term 3 at 4096. Our term-2 tail diverges.
+        let own = [(1, 0), (2, 4096)];
+        let leader = [(1, 0), (3, 4096)];
+        match reconcile(&own, 6000, &leader) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 4096); // < durable ⇒ truncate
+                assert_eq!(o.new_map, vec![(1, 0)]);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn own_overhang_beyond_leader_truncates_at_own_next_base() {
+        // We opened term 2 at 5000 as a leader that never won quorum; the real
+        // cluster never had term 2 (leader map stops at term 1). Our [5000,
+        // 6000) term-2 bytes are uncertified — truncate to 5000, keep (1,0).
+        let own = [(1, 0), (2, 5000)];
+        let leader = [(1, 0)];
+        match reconcile(&own, 6000, &leader) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 5000);
+                assert_eq!(o.new_map, vec![(1, 0)]);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// F4 behind-follower-clean: the follower's OWN map already carries the
+    /// term-2 stamp (it streamed and durably wrote term-2 bytes, recording the
+    /// term via `DataTermObserved`). Reconciling against the identical leader
+    /// map is clean — no truncation, map unchanged. This is the case that the
+    /// old (unsafe) code conflated with the ex-leader-divergent case below;
+    /// data-stamping is exactly what tells them apart.
+    #[test]
+    fn behind_follower_with_stamped_term_is_clean() {
+        let own = [(1, 0), (2, 2000)];
+        let leader = [(1, 0), (2, 2000)];
+        match reconcile(&own, 3000, &leader) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 3000); // == durable ⇒ clean
+                assert_eq!(o.new_map, vec![(1, 0), (2, 2000)]);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// F4 SCENARIO A — the safety pin. A healed ex-leader whose own map is
+    /// `[(1,0)]` at durable 3000 (it wrote `[2000,3000)` under its own failed
+    /// term, only ever stamping them as term 1). The real cluster opened term 2
+    /// at 2000. Because our data-stamped map LACKS a term-2 entry below our
+    /// durable, those bytes are provably ours-and-divergent: truncate to 2000,
+    /// keep only `[(1,0)]`. The old code adopted the gossiped `(2,2000)` and
+    /// returned `valid_up_to == 3000` — recording stale divergent bytes as the
+    /// term-2 leader's data (split-history). RED against the pre-fix code.
+    #[test]
+    fn ex_leader_divergent_truncates_at_leaders_uncovered_base() {
+        let own = [(1, 0)];
+        let leader = [(1, 0), (2, 2000)];
+        match reconcile(&own, 3000, &leader) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 2000); // < durable ⇒ truncate
+                assert_eq!(o.new_map, vec![(1, 0)]);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn entry_at_the_bound_is_not_a_divergence() {
+        // Leader opened term 2 exactly at our durable: our own map lacks it, but
+        // the term-2 base (3000) is NOT below our durable (3000), so no byte of
+        // ours is attributed to it — clean, no truncation. Our map does not grow
+        // here (that happens when we actually stream term-2 data).
+        let own = [(1, 0)];
+        let leader = [(1, 0), (2, 3000)];
+        match reconcile(&own, 3000, &leader) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 3000); // clean, no truncation
+                assert_eq!(o.new_map, vec![(1, 0)]); // (2,3000) not adopted
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    /// F4 Minor: same base, different term. `own=[(5,0)]`, `leader=[(6,0)]` —
+    /// the whole history diverges at position 0, but position 0 is shared ground
+    /// (both begin there), so this is NOT `NoCommonPrefix`; it is a truncate to
+    /// 0. The leader's term-6 base (0) sits below our durable and our map lacks
+    /// it ⇒ everything above 0 is ours-and-divergent.
+    #[test]
+    fn same_base_different_term_truncates_to_zero() {
+        match reconcile(&[(5, 0)], 4096, &[(6, 0)]) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 0);
+                assert_eq!(o.new_map, vec![]);
+            }
+            other => panic!("expected Ok (truncate to 0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_common_prefix_is_surfaced() {
+        // Leader shipped only a suffix (window slid past our history): its first
+        // entry begins far beyond our first byte, no overlap.
+        let own = [(1, 0)];
+        let leader = [(40, 1 << 20), (41, 2 << 20)];
+        assert!(matches!(reconcile(&own, 5000, &leader), Reconcile::NoCommonPrefix));
+    }
+
+    #[test]
+    fn empty_own_map_reconciles_clean_at_durable_zero() {
+        // Fresh follower, no history, no bytes: nothing of ours to invalidate,
+        // nothing to record (our map grows only when we actually stream data).
+        match reconcile(&[], 0, &[(1, 0), (2, 5000)]) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 0);
+                assert_eq!(o.new_map, vec![]);
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+}

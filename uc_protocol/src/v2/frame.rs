@@ -27,6 +27,11 @@ pub const FRAME_TYPE_MESSAGE: u8 = 1;
 /// header is actually written — the rest of the padded region is stale bytes.
 /// Readers and the archive skip it by `length`; replay drops it.
 pub const FRAME_TYPE_PADDING: u8 = 2;
+/// New-term no-op (spec §6, Raft §5.4.2): a zero-payload frame the new
+/// leader appends immediately on opening a term and must see COMMIT before
+/// serving. Replicated/archived/replayed like any message frame; the apply
+/// layer (M5) skips every non-MESSAGE type.
+pub const FRAME_TYPE_NEW_TERM: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -109,6 +114,13 @@ mod tests {
         assert_eq!(out.leadership_term_id, 7);
         assert_eq!(out.session_id, 0x1122_3344_5566_7788);
         assert_eq!(out.correlation_id, 42);
+    }
+
+    #[test]
+    fn frame_type_codes_are_stable() {
+        assert_eq!(FRAME_TYPE_MESSAGE, 1);
+        assert_eq!(FRAME_TYPE_PADDING, 2);
+        assert_eq!(FRAME_TYPE_NEW_TERM, 3);
     }
 
     #[test]
