@@ -122,16 +122,22 @@ pub fn reconcile(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) ->
     }
 
     // The reconciled map is our own surviving entries only — never an adopted
-    // leader entry. `valid_up_to` only ever clamps *down* from `own_durable`, so
-    // `valid_up_to == own_durable` is the clean case: nothing was truncated and
-    // the map is unchanged (reconcile never grows the map — that is
-    // `DataTermObserved`'s job). Only under a real truncation do we drop the
-    // entries whose bytes are gone (base >= the surviving bound).
-    let new_map: Vec<(u32, u64)> = if valid_up_to >= own_durable {
-        own.to_vec()
-    } else {
-        own.iter().copied().filter(|(_, base)| *base < valid_up_to).collect()
-    };
+    // leader entry (reconcile never grows the map — that is `DataTermObserved`'s
+    // job). The COMMON PREFIX is kept unconditionally: a legitimate zero-byte
+    // frontier entry (base == durable) that the leader shares must survive.
+    // Beyond the prefix, entries survive only below `valid_up_to`. In a CLEAN
+    // outcome every beyond-prefix own entry has base >= durable (else the
+    // own-side clamp above would have fired), i.e. it is a zero-byte PHANTOM
+    // from a term the leader's history contradicts (e.g. we won a term,
+    // persisted the map entry, and crashed before the NewTerm frame fsynced).
+    // Keeping such a phantom is unsafe: once genuine data streams past its
+    // base, the next reconcile's own-side clamp would spuriously truncate
+    // genuine (possibly committed) bytes at the phantom's base.
+    let new_map: Vec<(u32, u64)> = own[..k]
+        .iter()
+        .chain(own[k..].iter().filter(|(_, base)| *base < valid_up_to))
+        .copied()
+        .collect();
 
     Reconcile::Ok(Outcome { valid_up_to, new_map })
 }
@@ -139,6 +145,33 @@ pub fn reconcile(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clean_outcome_drops_beyond_prefix_phantom_frontier_entry() {
+        // Deposed ex-leader that crashed AFTER persisting its term-2 map
+        // entry but BEFORE the NewTerm frame fsynced: map [(1,0),(2,5000)],
+        // durable exactly 5000 (zero term-2 bytes). Term 3 opened at 5000.
+        // Reconcile is CLEAN (nothing to truncate: valid_up_to == durable)
+        // but the phantom (2,5000) MUST be dropped — keeping it would make a
+        // LATER reconcile (after genuine term-3 data streams past 5000)
+        // spuriously truncate committed bytes at the phantom's base.
+        match reconcile(&[(1, 0), (2, 5000)], 5000, &[(1, 0), (3, 5000)]) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 5000); // clean — no truncation
+                assert_eq!(o.new_map, vec![(1, 0)]); // phantom dropped
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        // and the SHARED frontier entry (in the common prefix) survives:
+        let m = [(1, 0), (2, 5000)];
+        match reconcile(&m, 5000, &m) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 5000);
+                assert_eq!(o.new_map, m.to_vec()); // k == 2: kept unconditionally
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
 
     #[test]
     fn identical_histories_are_clean() {
