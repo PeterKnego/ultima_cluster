@@ -338,5 +338,9 @@ mod tests {
         let mut big = [0u8; TERM_MAP_HEADER_LEN];
         big[0..4].copy_from_slice(&(MAX_TERM_MAP_WIRE_ENTRIES as u32 + 1).to_le_bytes());
         assert!(read_term_map_body(&big, &mut out).is_none());
+        // malformed: buffer shorter than the 8-byte header -> None (the
+        // third documented failure mode; must not panic on slicing)
+        assert!(read_term_map_body(&buf[..TERM_MAP_HEADER_LEN - 1], &mut out).is_none());
+        assert!(read_term_map_body(&[], &mut out).is_none());
     }
 }
