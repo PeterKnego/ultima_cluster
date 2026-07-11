@@ -210,6 +210,13 @@ pub struct FollowerReceiver {
     /// disabled — the consensus agent owns the commit counter (single writer).
     /// `None` = legacy M3 behavior byte-for-byte.
     route: Option<mpsc::SyncSender<NetEvent>>,
+    /// Leader-control demux (M4 node composition): when set, inbound NAK/STATUS
+    /// (data-plane control a follower addresses to its leader) are forwarded to
+    /// the sender's control channel — so the SAME receiver that accepts DATA as
+    /// a follower also feeds the sender's retransmit + flow-pacing when this
+    /// node is the leader. Term-filtered like the data plane (control is
+    /// term-scoped). `None` = follower-only (a follower never receives these).
+    sender_route: Option<mpsc::SyncSender<CtrlMsg>>,
     /// Intake gate (M4). `false` closes the DATA arm and suppresses
     /// AppendPosition entirely; see [`set_intake_gate`](Self::set_intake_gate).
     gate: Option<Arc<AtomicBool>>,
@@ -247,6 +254,7 @@ impl FollowerReceiver {
             stats: Arc::new(FollowerStats::default()),
             term,
             route: None,
+            sender_route: None,
             gate: None,
             activity_emitted: false,
         }
@@ -266,6 +274,18 @@ impl FollowerReceiver {
     /// the election timeout, gossip/reports re-send on their floors).
     pub fn set_consensus_route(&mut self, tx: mpsc::SyncSender<NetEvent>) {
         self.route = Some(tx);
+    }
+
+    /// Install the leader-control demux (M4 node composition). When set, inbound
+    /// NAK/STATUS datagrams (kinds 3/4 — data-plane control a follower sends TO
+    /// its leader) are forwarded to the sender's `CtrlMsg` channel `tx`, so a
+    /// single unified receiver drives the sender's retransmit + flow-pacing
+    /// while this node is the leader. A follower never receives these, so the
+    /// route sits idle in the follower role. Term-filtered like DATA (a full
+    /// channel drops — NAK backoff / status floor recover). Without this call
+    /// NAK/STATUS are ignored (the M3 follower posture).
+    pub fn set_sender_route(&mut self, tx: mpsc::SyncSender<CtrlMsg>) {
+        self.sender_route = Some(tx);
     }
 
     /// Install the intake gate (M4). When the gate reads `false` the DATA arm
@@ -446,6 +466,32 @@ impl FollowerReceiver {
                 if h.position > self.commit_seen {
                     self.commit_seen = h.position;
                     self.buffer.counters().commit.store_release(self.commit_seen);
+                }
+            }
+            DGRAM_KIND_NAK if self.sender_route.is_some() => {
+                // Leader role (M4): a follower's NAK, demuxed to our sender so it
+                // retransmits the missing span. Term-checked above.
+                let body = &d[DATAGRAM_HEADER_LEN..];
+                if body.len() >= NAK_BODY_LEN
+                    && let Some(route) = &self.sender_route
+                {
+                    let b = read_nak_body(body);
+                    let _ = route.try_send(CtrlMsg::Nak { from, position: b.position, length: b.length });
+                }
+            }
+            DGRAM_KIND_STATUS if self.sender_route.is_some() => {
+                // Leader role (M4): a follower's flow-window advert, demuxed to
+                // our sender's quorum pacing.
+                let body = &d[DATAGRAM_HEADER_LEN..];
+                if body.len() >= STATUS_BODY_LEN
+                    && let Some(route) = &self.sender_route
+                {
+                    let b = read_status_body(body);
+                    let _ = route.try_send(CtrlMsg::Status {
+                        from,
+                        contiguous: b.contiguous_position,
+                        window: b.receive_window,
+                    });
                 }
             }
             _ => {} // control kinds for the consensus agent: M3
@@ -1379,6 +1425,57 @@ mod tests {
             assert!(Instant::now() < deadline, "AppendPosition never resumed after reopen");
             r.do_work();
         }
+    }
+
+    /// Leader-role node composition (M4): the unified `FollowerReceiver` with a
+    /// sender route installed demuxes inbound NAK/STATUS to the sender's control
+    /// channel (leader retransmit + flow pacing), while consensus kinds still
+    /// route to the consensus channel. A follower never receives NAK/STATUS, so
+    /// the route is dormant in that role.
+    #[test]
+    fn sender_route_demuxes_nak_and_status() {
+        let b = buffer();
+        let mut peer = FakeLeader::new(); // stands in for a follower endpoint
+        let mut r = follower(&b, peer.addr());
+        let (tx, rx) = mpsc::sync_channel::<CtrlMsg>(16);
+        r.set_sender_route(tx);
+        let to = r.local_addr();
+
+        let mut nb = [0u8; NAK_BODY_LEN];
+        write_nak_body(&mut nb, &NakBody { position: 96, length: 192 });
+        peer.send(to, DGRAM_KIND_NAK, 0, TERM, &nb);
+        let mut sb = [0u8; STATUS_BODY_LEN];
+        write_status_body(
+            &mut sb,
+            &StatusBody { contiguous_position: 4096, receive_window: 1 << 20 },
+        );
+        peer.send(to, DGRAM_KIND_STATUS, 0, TERM, &sb);
+        // a stale-term NAK must be dropped, never demuxed
+        peer.send(to, DGRAM_KIND_NAK, 0, TERM - 1, &nb);
+
+        let mut nak = None;
+        let mut status = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while nak.is_none() || status.is_none() {
+            assert!(Instant::now() < deadline, "control never demuxed to the sender");
+            r.do_work();
+            while let Ok(m) = rx.try_recv() {
+                match m {
+                    CtrlMsg::Nak { .. } => nak = Some(m),
+                    CtrlMsg::Status { .. } => status = Some(m),
+                    _ => {}
+                }
+            }
+        }
+        assert!(matches!(nak, Some(CtrlMsg::Nak { position: 96, length: 192, .. })));
+        assert!(matches!(status, Some(CtrlMsg::Status { contiguous: 4096, .. })));
+        use std::sync::atomic::Ordering::Relaxed;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while r.stats().dropped_stale_term.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "stale-term NAK never observed");
+            r.do_work();
+        }
+        assert!(rx.try_recv().is_err(), "stale-term control leaked to the sender");
     }
 
     /// Leader-side node mode: AppendPosition (kind 5) routes to consensus as a

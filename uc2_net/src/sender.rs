@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -155,6 +155,12 @@ pub struct Sender {
     /// the tracker, the commit gossip, and the AppendPos ctrl arm all go inert
     /// (the consensus agent owns commit ranking + gossip). `false` = legacy M3.
     node_mode: bool,
+    /// Leader-role gate (M4 node composition): when set and reading `false` the
+    /// node is NOT the leader, so the sender streams no DATA, serves no NAKs,
+    /// and emits no heartbeats — a demoted leader goes silent on the next duty
+    /// cycle. The consensus agent (Task 8) is the sole writer. `None` = always
+    /// on (legacy M2/M3, where the role is static for the process lifetime).
+    role: Option<Arc<AtomicBool>>,
 }
 
 impl Sender {
@@ -196,6 +202,7 @@ impl Sender {
             replay: None,
             term,
             node_mode: false,
+            role: None,
         }
     }
 
@@ -212,6 +219,18 @@ impl Sender {
     /// unset and keep the old self-ranking behavior (the M2/M3 gates rely on it).
     pub fn set_node_mode(&mut self) {
         self.node_mode = true;
+    }
+
+    /// Gate all leader-role output on `flag` (M4 node composition). While the
+    /// flag reads `false` the node is a follower: the sender still drains its
+    /// control channel each cycle (harmless — a follower is not addressed by
+    /// NAK/STATUS), but streams no DATA, serves no NAKs, and beats no
+    /// heartbeats, so a stepped-down leader falls silent immediately without
+    /// tearing down the agent. The consensus agent flips it `true` on
+    /// `BecomeLeader` and `false` on `BecomeFollower`. Default (unset) = the
+    /// legacy always-on behavior the M2/M3 gates rely on.
+    pub fn set_role_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.role = Some(flag);
     }
 
     /// Wire the archive's journal in as the retransmit source for deep NAKs
@@ -335,6 +354,13 @@ impl Sender {
                 self.gossip_commit(c);
                 did = true;
             }
+        }
+
+        // Leader-role gate (M4): a follower drains control (above) but produces
+        // NO leader output — no NAK service, no DATA stream, no heartbeats.
+        let leader_role = self.role.as_ref().is_none_or(|r| r.load(Ordering::Relaxed));
+        if !leader_role {
+            return did;
         }
 
         if let Some((to, pos, len)) = self.naks.pop_front() {
@@ -1299,6 +1325,50 @@ mod tests {
             7,
             "frame term must come from the appender (may differ from the datagram term)"
         );
+    }
+
+    /// Role-flag gating (M4 node composition): a sender whose role flag reads
+    /// `false` produces NO leader output — even with appended data and an
+    /// elapsed heartbeat interval it streams nothing, beats nothing, and does
+    /// not advance `sent`. Flipping the flag `true` resumes streaming at once.
+    #[test]
+    fn role_flag_gates_streaming_and_heartbeats() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        let b = buffer();
+        let f1 = Fake::new();
+        let (tx, rx) = mpsc::sync_channel(16);
+        let _ = tx; // no control traffic
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = 1; // would fire every cycle if this node were leader
+        let flag = Arc::new(AtomicBool::new(false)); // FOLLOWER
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f1.addr()],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+        );
+        s.set_role_flag(Arc::clone(&flag));
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        for i in 0..3 {
+            a.append(4, i, &[0u8; 64]).unwrap();
+        }
+        for _ in 0..8 {
+            s.do_work();
+        }
+        assert!(f1.recv().is_none(), "a follower-role sender must emit nothing");
+        assert_eq!(s.stats().datagrams.load(Relaxed), 0);
+        assert_eq!(s.stats().heartbeats.load(Relaxed), 0);
+        assert_eq!(b.counters().sent.load_acquire(), 0, "follower role advanced sent");
+        // promote to leader: the pending frames now stream out
+        flag.store(true, Relaxed);
+        s.do_work();
+        let (h, body) = f1.recv().expect("leader role must stream the pending data");
+        assert_eq!(h.kind, DGRAM_KIND_DATA);
+        assert_eq!(body.len(), 3 * 96);
+        assert_eq!(b.counters().sent.load_acquire(), 3 * 96);
     }
 
     /// Node mode disables the sender's OWN commit ranking + gossip: a report
