@@ -32,8 +32,6 @@ pub enum ArchiveError {
     Journal(#[from] JournalError),
     #[error("position {pos} is below the first archived block (first base {first_base})")]
     PositionPurged { pos: u64, first_base: u64 },
-    #[error("cannot truncate to {pos}: would drop or shrink the first archived block")]
-    UnsupportedTruncation { pos: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -204,19 +202,20 @@ impl Archive {
     /// Task 8) is responsible for resetting the buffer counters afterward
     /// (`counters.prime(pos)`) and re-deriving everything volatile.
     ///
-    /// A truncation that would drop or shrink the FIRST archived block returns
-    /// `UnsupportedTruncation`: `Journal::truncate_after(keep_seq)` keeps every
-    /// record with `seq <= keep_seq` and so can never remove the earliest block.
+    /// # First-block truncation (M4 carry #3)
     ///
-    /// This case IS reachable in early-life contested elections — it is NOT
-    /// verified-impossible (the sim does not model archive blocks and cannot
-    /// check it). Concretely: a node fsyncs its term-1 `NewTerm` frame, is
-    /// partitioned before any datagram lands, and a peer wins term 2 at base 0;
-    /// on heal, reconciliation yields `Truncate{to: 0}` → `pos == first_base` →
-    /// `lo == first` → `UnsupportedTruncation`. This is currently a FAIL-STOP
-    /// error requiring manual intervention (and it recurs on every restart, since
-    /// the divergent block is still durable). First-block truncation support
-    /// (journal full-clear / snapshot re-seed) is a REQUIRED M5 follow-up.
+    /// A cut at or inside the FIRST archived block cannot be expressed via
+    /// `Journal::truncate_after` (it keeps every record with `seq <= keep_seq`
+    /// and so can never remove the earliest block). This IS reachable in an
+    /// early-life contested election: a node fsyncs its term-1 `NewTerm` frame,
+    /// is partitioned before any datagram lands, and a peer wins term 2 at
+    /// base 0; on heal, reconciliation yields `Truncate{to: 0}` → `pos ==
+    /// first_base` → `lo == first`. Pre-fix this returned an `UnsupportedTruncation`
+    /// fail-stop that recurred on every restart (a permanent single-node loss).
+    ///
+    /// It is now supported by clearing the whole journal (`Journal::truncate_all`)
+    /// and re-seeding the surviving prefix `[first_base, pos)` as a fresh block
+    /// seq 0. `pos == first_base` (drop everything) leaves the journal empty.
     pub fn truncate_to(&mut self, pos: u64) -> Result<(), ArchiveError> {
         if pos == self.durable_pos {
             return Ok(());
@@ -249,12 +248,28 @@ impl Archive {
             }
         }
         let (base, bytes) = self.journal.read(lo)?.expect("block readable");
-        // Any cut that touches the first archived block (drop it whole when
+        // A cut at or inside the FIRST archived block (drop it whole when
         // pos == first_base, or shrink it when pos is inside it) is inexpressible
-        // via `truncate_after`, which can never remove the earliest block. Guard
-        // here so the `lo - 1` arithmetic below is always in range.
+        // via `truncate_after`, which can never remove the earliest block. Clear
+        // the whole journal instead and re-seed the surviving prefix as a fresh
+        // block seq 0. `base == first_base` here (lo == first).
         if lo == first {
-            return Err(ArchiveError::UnsupportedTruncation { pos });
+            let keep = (pos - base) as usize;
+            debug_assert!(keep < bytes.len(), "first-block cut must be strictly inside the block");
+            let prefix = bytes[..keep].to_vec();
+            self.journal.truncate_all()?.wait()?;
+            if pos > base {
+                // Re-append the surviving prefix [base, pos) as block seq 0.
+                self.journal.append(0, base, &prefix)?.wait()?;
+                self.next_block_seq = 1;
+            } else {
+                // pos == base == first_base: keep nothing.
+                self.next_block_seq = 0;
+            }
+            self.durable_pos = pos;
+            self.last_observed_term = 0;
+            self.term_observations.clear();
+            return Ok(());
         }
         if base == pos {
             // pos is exactly this block's start: drop it and everything after,
@@ -642,35 +657,78 @@ mod tests {
         assert_eq!(arch.recovered_position(), 192);
     }
 
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn truncate_to_partial_cut_in_first_block_is_unsupported() {
-        // A cut that would shrink the FIRST archived block is inexpressible via
-        // Journal::truncate_after (it can never remove the earliest block).
-        // Unreachable in M4, but must fail cleanly rather than corrupt/underflow.
+    /// Helper: an archive holding exactly ONE block of 4 frames (positions
+    /// 0, 96, 192, 288; block [0, 384)), recorded + fsynced. Returns the frame
+    /// start positions. The `TempDir` is intentionally leaked so the journal
+    /// dir outlives the returned `Archive` (which keeps the journal open).
+    fn archive_with_one_block() -> (Archive, Arc<LogBuffer>, Vec<u64>) {
         let (b, _c, dir) = setup(1 << 16);
-        let cfg = ArchiveConfig { max_block_bytes: 200, ..test_cfg(dir.path()) };
-        let mut arch = Archive::open(cfg).unwrap();
+        // Default 1 MiB block cap: all 4 frames (384 B) land in ONE block.
+        let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
         let mut a = Appender::new(Arc::clone(&b), 1);
-        for i in 0..2 {
-            a.append(1, i, &[0u8; 64]).unwrap(); // 2 frames = one 192 B block
+        let mut frames = Vec::new();
+        for i in 0..4 {
+            frames.push(a.append(1, i, &[i as u8; 64]).unwrap());
         }
         while arch.do_work(&b).unwrap() {}
+        assert_eq!(arch.recovered_position(), 384, "4 frames = one 384 B block");
+        assert_eq!(arch.blocks_recorded(), 1, "helper must record exactly one block");
+        assert_eq!(frames, vec![0, 96, 192, 288]);
+        std::mem::forget(dir); // keep the journal dir alive for `arch`'s lifetime
+        (arch, b, frames)
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn truncate_inside_first_block_clears_and_reappends_prefix() {
+        // one block [0, N) with several frames; cut at a frame boundary inside it
+        let (mut archive, buffer, appender_frames) = archive_with_one_block(); // helper: appends 4 frames, records+fsyncs 1 block
+        let cut = appender_frames[2]; // position of the 3rd frame = keep frames 0,1
+        archive.truncate_to(cut).unwrap();
+        assert_eq!(archive.recovered_position(), cut);
+        let mut replay = archive.replay_from(0).unwrap();
+        let mut n = 0; while replay.next().unwrap().is_some() { n += 1; }
+        assert_eq!(n, 2, "only the surviving prefix frames replay");
+        let _ = buffer;
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn truncate_to_zero_clears_everything() {
+        let (mut archive, _b, _f) = archive_with_one_block();
+        archive.truncate_to(0).unwrap(); // the contested-first-election case (M4 final review I-2)
+        assert_eq!(archive.recovered_position(), 0);
+        assert!(archive.replay_from(0).unwrap().next().unwrap().is_none());
+    }
+
+    /// First-block truncation must survive a reopen: after clearing everything
+    /// (`truncate_to(0)`) the recovered frontier is 0 and the archive keeps
+    /// working; after a partial first-block cut the re-seeded prefix recovers.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn first_block_truncation_survives_reopen() {
+        let (b, _c, dir) = setup(1 << 16);
+        {
+            let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
+            let mut a = Appender::new(Arc::clone(&b), 1);
+            for i in 0..4 {
+                a.append(1, i, &[i as u8; 64]).unwrap();
+            }
+            while arch.do_work(&b).unwrap() {}
+            assert_eq!(arch.recovered_position(), 384);
+            // partial cut inside the first (only) block: keep [0, 192)
+            arch.truncate_to(192).unwrap();
+            assert_eq!(arch.recovered_position(), 192);
+        }
+        // reopen: the re-seeded prefix recovers to exactly the truncation point
+        let arch = Archive::open(test_cfg(dir.path())).unwrap();
         assert_eq!(arch.recovered_position(), 192);
-        // pos 96 is a frame boundary strictly inside block 0 (base 0)
-        assert!(matches!(
-            arch.truncate_to(96),
-            Err(ArchiveError::UnsupportedTruncation { pos: 96 })
-        ));
-        // frontier unchanged; the archive is still usable
-        assert_eq!(arch.recovered_position(), 192);
-        // pos == first archived base (drop EVERY block) hits the same
-        // first-block guard: also inexpressible, also fails cleanly
-        assert!(matches!(
-            arch.truncate_to(0),
-            Err(ArchiveError::UnsupportedTruncation { pos: 0 })
-        ));
-        assert_eq!(arch.recovered_position(), 192);
+        let mut r = arch.replay_from(0).unwrap();
+        let mut n = 0;
+        while r.next().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 2, "surviving prefix frames recover across reopen");
     }
 
     // ----------------------------------------------- M4 term observation (T7)

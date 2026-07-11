@@ -502,6 +502,57 @@ impl Journal {
         Ok(Notifier::done())
     }
 
+    /// Remove every record from the journal — the keep-nothing counterpart of
+    /// [`Journal::truncate_after`]. After it returns, [`Journal::first_seq`] and
+    /// [`Journal::last_seq`] are `None` and a subsequent `append` restarts the
+    /// sequence (typically at 0).
+    ///
+    /// Crash-safe via the SAME durable intent-file discipline as
+    /// `truncate_after`, using the reserved keep_seq sentinel `u64::MAX`
+    /// ("keep none"): the intent is fsync-durable before any segment is
+    /// unlinked, then all segments are dropped and a fresh empty segment is
+    /// created at base_seq 0, then the intent is consumed. `Journal::open`
+    /// completes a torn `truncate_all` idempotently by re-running the same
+    /// destructive step from the surviving intent. (Consequently `u64::MAX` is
+    /// not a valid `keep_seq` for `truncate_after`; a real Raft log index never
+    /// reaches it.)
+    ///
+    /// Queued-but-unwritten appends are fenced exactly as in `truncate_after`
+    /// (truncation-generation bump + durable-seq pullback to none), so a stale
+    /// request still sitting in the writer channel cannot resurrect a removed
+    /// record.
+    ///
+    /// Returns a `Notifier::done()` — the operation is fully synchronous.
+    pub fn truncate_all(&self) -> Result<Notifier, JournalError> {
+        let mut st = self.state.lock().unwrap();
+        if st.poisoned {
+            return Err(JournalError::Closed);
+        }
+
+        // Fence every queued-but-unwritten append: none survive a keep-none
+        // truncate. Drop the whole in-memory overlay and bump the truncation
+        // generation so the writer skips any request whose seq we just cleared.
+        st.pending.clear();
+        st.truncate_gen += 1;
+
+        // Pull the durability watermark back to none: no durable seq survives,
+        // and an in-flight publish for pre-truncate bytes must not re-advance it
+        // (stale generation).
+        st.persisted_hwm = 0;
+        self.durability.reset_to(0, st.truncate_gen);
+
+        // Intent → destructive phase → consume intent.
+        let dir = st.dir.clone();
+        write_truncate_intent(&dir, KEEP_NONE_SENTINEL)?;
+        apply_truncate_to_segments(&dir, &mut st.segments, KEEP_NONE_SENTINEL)?;
+        remove_truncate_intent(&dir)?;
+
+        st.first_seq = None;
+        st.last_seq = None;
+
+        Ok(Notifier::done())
+    }
+
     /// Drop full segments whose final record's seq <= `seq`.
     /// Never drops the active (last) segment even if eligible, to ensure
     /// future appends still have a place to go.
@@ -613,6 +664,12 @@ impl Drop for Journal {
 const TRUNCATE_INTENT_FILENAME: &str = "truncate.intent";
 const TRUNCATE_INTENT_MAGIC: &[u8; 8] = b"ULTJINT1";
 
+/// Reserved `keep_seq` value carried through the truncate-intent machinery to
+/// mean "keep NOTHING" — the [`Journal::truncate_all`] sentinel. A real Raft log
+/// index never reaches `u64::MAX`, so overloading it is safe; `truncate_after`
+/// must never be called with it (it would be reinterpreted as keep-none).
+const KEEP_NONE_SENTINEL: u64 = u64::MAX;
+
 fn sync_dir(dir: &std::path::Path) -> Result<(), JournalError> {
     std::fs::File::open(dir)?.sync_all()?;
     Ok(())
@@ -667,6 +724,24 @@ fn apply_truncate_to_segments(
     segments: &mut Vec<segment::SegmentFile>,
     keep_seq: u64,
 ) -> Result<Option<u64>, JournalError> {
+    // Keep-none sentinel (truncate_all): unlink EVERY segment and re-seed a
+    // fresh empty segment at base_seq 0 so the writer always has an append
+    // target. Idempotent under the durable intent — a torn replay runs this
+    // again, dropping the (possibly already-fresh) seg-0 and recreating it.
+    if keep_seq == KEEP_NONE_SENTINEL {
+        let removed = std::mem::take(segments);
+        for seg in removed {
+            let _ = std::fs::remove_file(seg.path());
+        }
+        let path = dir.join(format!("seg-{:020}.log", 0u64));
+        // Defensive: a prior torn attempt may have left the fresh seg-0 on disk
+        // outside `segments`; `create_new` would then hit EEXIST, so clear it.
+        let _ = std::fs::remove_file(&path);
+        let fresh = segment::SegmentFile::create(&path, 0)?;
+        segments.push(fresh);
+        sync_dir(dir)?;
+        return Ok(None);
+    }
     match segments.iter().rposition(|s| s.base_seq() <= keep_seq) {
         None => {
             // keep_seq is below every segment — drop everything.
@@ -995,6 +1070,51 @@ mod tests {
         // Re-append from new tail.
         j.append(6, 0, b"new").unwrap().wait().unwrap();
         assert_eq!(j.read(6).unwrap().unwrap().1, b"new".to_vec());
+    }
+
+    #[test]
+    fn truncate_all_empties_and_reopens_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        for s in 0..5 { j.append(s, s * 100, &[s as u8; 64]).unwrap().wait().unwrap(); }
+        j.truncate_all().unwrap().wait().unwrap();
+        assert_eq!(j.first_seq(), None);
+        assert_eq!(j.last_seq(), None);
+        // append restarts at seq 0
+        j.append(0, 7, b"fresh").unwrap().wait().unwrap();
+        assert_eq!(j.read(0).unwrap().unwrap(), (7, b"fresh".to_vec()));
+        drop(j);
+        let j2 = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        assert_eq!(j2.last_seq(), Some(0));
+    }
+
+    /// A durable keep-none intent left behind by a crash (after the intent was
+    /// fsynced but before/while the destructive phase ran) must be completed on
+    /// open: every record dropped, the intent consumed, the journal usable.
+    /// This pins the torn `truncate_all` idempotent-replay path.
+    #[test]
+    fn open_completes_truncate_all_from_intent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let j = Journal::open(JournalConfig::new(dir.path())).unwrap();
+            for i in 0..5u64 {
+                j.append(i, 0, b"x").unwrap().wait().unwrap();
+            }
+        }
+        // Simulate a crash right after the keep-none intent became durable but
+        // before any segment was unlinked.
+        write_intent_bytes(dir.path(), u64::MAX);
+
+        let j2 = Journal::open(JournalConfig::new(dir.path())).unwrap();
+        assert_eq!(j2.first_seq(), None, "keep-none intent must empty the journal");
+        assert_eq!(j2.last_seq(), None);
+        assert!(
+            !dir.path().join("truncate.intent").exists(),
+            "intent file must be consumed after completion"
+        );
+        // Journal is usable — re-append from seq 0.
+        j2.append(0, 9, b"fresh").unwrap().wait().unwrap();
+        assert_eq!(j2.read(0).unwrap().unwrap(), (9, b"fresh".to_vec()));
     }
 
     #[test]

@@ -249,7 +249,11 @@ impl Node {
         let archive_agent = AgentRunner::spawn("uc2-archive", IdleStrategy::Yield, move || {
             let mut did = false;
             while let Ok((epoch, to)) = trunc_rx.try_recv() {
-                archive.truncate_to(to).expect("archive truncate fail-stop");
+                // First-block cuts (a contested first election, `to` at/inside
+                // block 0) are handled by the archive via `Journal::truncate_all`
+                // + prefix re-seed (M4 carry #3) and no longer fail-stop. Any
+                // remaining error is a genuine journal I/O fault — still fatal.
+                archive.truncate_to(to).expect("archive truncate fail-stop (journal I/O)");
                 arc_counters.prime(to);
                 // Infallible ack: a single slot cannot drop (one in flight).
                 arc_slot.post(epoch, to);
