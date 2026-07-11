@@ -551,23 +551,39 @@ fn heal_truncates_divergent_tail_and_reconverges() {
     let phantom_ceiling = pre + phantom * FRAME;
     assert!(c.nodes[old].truncations() == 0, "premature truncation before heal");
 
-    // Heal every link.
+    // Heal every link — into a FULLY IDLE cluster (no submissions).
     for node in &c.nodes {
         node.heal();
     }
 
-    // Review addition 7 — reconciliation precedes rejoining the data plane.
-    // The old leader can only carry term-(N+1) data durably PAST its phantom
-    // ceiling after truncating the divergent tail (its receiver refuses the new
-    // term's overlapping frames until the divergence at `base` is cut). So the
-    // first time its durable exceeds `phantom_ceiling`, a truncation must have
-    // already happened. This is race-free: it does not depend on catching the
-    // transient truncation dip.
-    //
-    // The new leader re-ships its term map only on the commit cadence
-    // (`rank_leader`), i.e. only while commit is advancing — a reconnecting
-    // divergent node reconciles off a shipped map. So keep the majority
-    // committing (as a live cluster would) until the old leader has caught up.
+    // Task-9 — idle-cluster RECONCILIATION proof (the review's core ask). With
+    // ZERO new submissions, the ex-leader must adopt the new term and TRUNCATE
+    // its divergent tail (review addition 7: reconciliation precedes rejoining
+    // the data plane), driven purely by the new leader's gossip FLOOR re-shipping
+    // the term map on its bounded (100ms) cadence. Before this fix `ShipTermMap`
+    // rode only the commit-advance cadence, so an idle leader never handed the
+    // reconnecting node a map and the divergent tail stayed un-truncated forever
+    // — the hole the old submit-per-iteration loop masked. This asserts, in the
+    // real node, the SAME property `uc2_sim`'s
+    // `idle_cluster_reconciles_divergent_node_via_gossip_floor` pins at the model
+    // layer.
+    await_until(30, "ex-leader did not reconcile on the idle gossip floor alone", || {
+        c.nodes[old].truncations() >= 1
+    });
+    assert!(c.nodes[old].term() >= c.nodes[new].term(), "old leader did not adopt the new term");
+
+    // DATA-PLANE catch-up. The ex-leader can only carry term-(N+1) data durably
+    // PAST its phantom ceiling after the truncation above cut the divergence at
+    // `base`. A fully idle catch-up is blocked by a SEPARATE, pre-existing
+    // `uc2_net` race (outside this fix's scope): the archive truncation's
+    // `LogCounters::prime(to)` can regress the shared `append` counter AFTER the
+    // follower-receiver has already rebuilt past `to`, and the receiver never
+    // re-asserts `append == rebuilt.contiguous` (its `insert()` stores only on a
+    // forward advance) — so an idle ex-leader truncates but its `durable` wedges
+    // at the truncation point. Resuming the majority's write load advances the
+    // receiver's rebuild past the regression and re-syncs the counter, keeping
+    // the replay-equality below deterministic. Follow-up: reset the receiver's
+    // `rebuilt`/`leader_append` to `to` on the truncation feedback.
     let deadline = deadline_secs(60);
     while c.nodes[old].durable() <= phantom_ceiling {
         assert!(Instant::now() < deadline, "old leader never caught up past its phantom ceiling");
@@ -576,11 +592,6 @@ fn heal_truncates_divergent_tail_and_reconverges() {
         }
         std::thread::yield_now();
     }
-    assert!(
-        c.nodes[old].truncations() >= 1,
-        "old leader rejoined the data plane without truncating its divergent tail"
-    );
-    assert!(c.nodes[old].term() >= c.nodes[new].term(), "old leader did not adopt the new term");
 
     // Full reconvergence to a single, stable frontier: stop submitting, let the
     // leader quiesce (ingress drained + last frame quorum-committed), then wait

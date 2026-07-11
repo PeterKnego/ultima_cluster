@@ -16,7 +16,7 @@
 //! | `BecomeLeader`        | IN ORDER: (1) append the new `TermMapEntry{term, base}` + persist the term map durably; (2) collapse volatile append to `base` (durable), discarding the unreplicated tail; (3) append the `NewTerm` no-op frame and feed `NewTermAppended` back; (4) switch data-plane roles to leader. |
 //! | `BecomeFollower`      | Switch data-plane roles to follower of `term`.                                                                                |
 //! | `AdvanceCommit`       | Store the commit counter (agent owns the store; single writer).                                                               |
-//! | `GossipCommit`        | Gossip `CommitPosition{commit}` to followers (leader only).                                                                    |
+//! | `GossipCommit`        | Gossip `CommitPosition{commit}` to followers (leader only). Rides commit advances AND the idle re-gossip floor (`gossip_floor_ns`). |
 //!
 //! Determinism note: election timeouts are re-randomized on every arming (a
 //! follower reset on leader activity, or a candidate starting a fresh
@@ -52,6 +52,12 @@ pub struct ElectionConfig {
     pub members: Vec<NodeId>,
     pub election_timeout_min_ns: u64, // default 150_000_000
     pub election_timeout_max_ns: u64, // default 300_000_000
+    /// Idle re-gossip floor (spec §6): the maximum interval a leader will go
+    /// without re-emitting `GossipCommit` + `ShipTermMap`, even when commit is
+    /// not advancing. Bounds how long a follower that missed the last
+    /// advance-gossip datagram — or a divergent node rejoining an *idle*
+    /// cluster — waits to learn commit / reconcile. Default 100_000_000 (100ms).
+    pub gossip_floor_ns: u64,
     pub seed: u64,
 }
 
@@ -116,8 +122,10 @@ pub enum Action {
     /// out data-plane events until that feedback arrives.
     Truncate { to: u64, new_map: Vec<(u32, u64)> },
     /// Ship our term map to followers (leader only): the last
-    /// `MAX_TERM_MAP_WIRE_ENTRIES` entries. Emitted on `BecomeLeader` and
-    /// piggybacked on the commit-gossip cadence.
+    /// `MAX_TERM_MAP_WIRE_ENTRIES` entries. Emitted on `BecomeLeader`,
+    /// piggybacked on the commit-gossip cadence, AND re-emitted on the idle
+    /// gossip floor (`gossip_floor_ns`) so a divergent node rejoining an idle
+    /// cluster still receives a map to reconcile against.
     ShipTermMap { entries: Vec<(u32, u64)> },
     /// Persist the reconciled term map durably (follower adopted leader entries
     /// with no truncation needed — keeps vote credentials honest).
@@ -148,6 +156,8 @@ pub struct ElectionSm {
     members: Vec<NodeId>,
     timeout_min_ns: u64,
     timeout_max_ns: u64,
+    /// Idle re-gossip floor (see [`ElectionConfig::gossip_floor_ns`]).
+    gossip_floor_ns: u64,
     rng: XorShift64,
 
     role: Role,
@@ -166,6 +176,13 @@ pub struct ElectionSm {
     pending_leader_activity: bool,
     /// Absolute ns at which the current election timer fires.
     timeout_deadline_ns: u64,
+    /// Absolute ns of the most recent `Tick` (the only time source). Used as the
+    /// gossip-floor anchor for an advance driven off a `Report` (which carries no
+    /// time of its own), so a report-driven gossip resets the floor too.
+    last_tick_ns: u64,
+    /// Absolute ns of the last leader gossip (advance-driven or floor-driven).
+    /// The floor re-emits once `now - last_gossip_ns >= gossip_floor_ns`.
+    last_gossip_ns: u64,
 
     /// Candidate: grants counted for `current_term` (self included).
     votes_received: Vec<NodeId>,
@@ -223,6 +240,7 @@ impl ElectionSm {
             members: cfg.members,
             timeout_min_ns: cfg.election_timeout_min_ns,
             timeout_max_ns: cfg.election_timeout_max_ns,
+            gossip_floor_ns: cfg.gossip_floor_ns,
             rng: XorShift64::new(cfg.seed),
             role: Role::Follower,
             current_term,
@@ -232,6 +250,8 @@ impl ElectionSm {
             commit_seen: 0,
             pending_leader_activity: false,
             timeout_deadline_ns: 0,
+            last_tick_ns: now_ns,
+            last_gossip_ns: now_ns,
             votes_received: Vec::new(),
             tracker,
             new_term_pos: None,
@@ -300,7 +320,9 @@ impl ElectionSm {
                     && let Some(slot) = self.follower_slot(from)
                 {
                     self.tracker.on_durable(slot, durable);
-                    self.rank_leader(out);
+                    // A Report carries no time; anchor a resulting advance-gossip
+                    // to the last observed Tick so it resets the floor too.
+                    self.rank_leader(self.last_tick_ns, out);
                 }
             }
 
@@ -441,8 +463,27 @@ impl ElectionSm {
     }
 
     fn on_tick(&mut self, now_ns: u64, out: &mut Vec<Action>) {
+        self.last_tick_ns = now_ns;
         match self.role {
-            Role::Leader => self.rank_leader(out),
+            Role::Leader => {
+                // Advance-driven gossip first (resets the floor when it fires).
+                self.rank_leader(now_ns, out);
+                // Idle re-emission floor (spec §6): even with commit plateaued,
+                // re-ship commit + term map on a bounded cadence. Two liveness
+                // holes this closes on an OTHERWISE-idle cluster: (1) a divergent
+                // node rejoining never gets a term map (ShipTermMap rides only the
+                // advance cadence) → never reconciles → gated forever; (2) a
+                // follower that missed the last advance-gossip datagram never
+                // learns the plateaued commit. Idempotent — monotonic intake
+                // everywhere makes a re-emission a no-op for anyone already caught
+                // up. `rank_leader` set `last_gossip_ns = now_ns` if it just
+                // gossiped, so this cannot double-fire in the same tick.
+                if now_ns.saturating_sub(self.last_gossip_ns) >= self.gossip_floor_ns {
+                    self.last_gossip_ns = now_ns;
+                    out.push(Action::GossipCommit { commit: self.commit_seen });
+                    out.push(Action::ShipTermMap { entries: self.term_map_wire_tail() });
+                }
+            }
             Role::Follower | Role::Candidate => {
                 if self.pending_leader_activity {
                     // Saw the leader since last tick: re-arm, do not time out.
@@ -607,11 +648,14 @@ impl ElectionSm {
         None
     }
 
-    fn rank_leader(&mut self, out: &mut Vec<Action>) {
+    fn rank_leader(&mut self, now_ns: u64, out: &mut Vec<Action>) {
         if let Some(c) = self.tracker.advance(self.durable)
             && c > self.commit_seen
         {
             self.commit_seen = c;
+            // This advance carries the gossip; reset the idle floor so it does
+            // not double-fire right after (spec §6 re-gossip cadence).
+            self.last_gossip_ns = now_ns;
             out.push(Action::AdvanceCommit { commit: c });
             out.push(Action::GossipCommit { commit: c });
             // Piggyback the term map on the commit-gossip cadence so a lagging
@@ -643,6 +687,11 @@ mod tests {
             members: vec![0, 1, 2],
             election_timeout_min_ns: 150,
             election_timeout_max_ns: 300,
+            // Huge floor: these tests drive ranking via `Tick` at tiny `now_ns`
+            // values, so the idle re-gossip floor must never fire and perturb the
+            // exact action-list assertions. The floor's own behavior is covered by
+            // `idle_leader_reemits_on_gossip_floor` with a small floor.
+            gossip_floor_ns: u64::MAX,
             seed: 42 + id as u64,
         }
     }
@@ -653,6 +702,7 @@ mod tests {
             members,
             election_timeout_min_ns: 150,
             election_timeout_max_ns: 300,
+            gossip_floor_ns: u64::MAX,
             seed: 42 + id as u64,
         }
     }
@@ -1030,6 +1080,55 @@ mod tests {
             acts.iter().any(|a| matches!(a, Action::ShipTermMap { entries } if entries == &vec![(1, 0)])),
             "commit advance must re-ship the term map on the gossip cadence"
         );
+    }
+
+    /// Task-9 fix: an IDLE leader (no commit movement) re-emits exactly one
+    /// `GossipCommit` + one `ShipTermMap` each time the gossip floor elapses, and
+    /// NOTHING between crossings. This is the mechanism that lets a divergent node
+    /// rejoining an idle cluster still receive a term map to reconcile against.
+    #[test]
+    fn idle_leader_reemits_on_gossip_floor() {
+        // Small floor (1000 ns) so a couple of ticks straddle it; distinct from
+        // the election timeout so a leader tick is unambiguous.
+        let cfg = ElectionConfig {
+            id: 0,
+            members: vec![0, 1, 2],
+            election_timeout_min_ns: 150,
+            election_timeout_max_ns: 300,
+            gossip_floor_ns: 1000,
+            seed: 42,
+        };
+        let mut s = ElectionSm::new(cfg, None, &[], 0, 0);
+        // Drive to leader of term 1 (last_gossip_ns anchored at construction = 0).
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+
+        // No reports arrive → commit never advances; commit_seen stays 0. Each
+        // floor crossing must emit exactly one commit-gossip + one term-map ship.
+        let gossips = |acts: &[Action]| {
+            (
+                acts.iter().filter(|a| matches!(a, Action::GossipCommit { commit: 0 })).count(),
+                acts.iter().filter(|a| matches!(a, Action::ShipTermMap { .. })).count(),
+            )
+        };
+
+        // First crossing: 1000 - 0 >= 1000.
+        let a = step(&mut s, Event::Tick { now_ns: 1000 });
+        assert_eq!(gossips(&a), (1, 1), "first floor crossing emits one commit + one map");
+        assert!(!a.iter().any(|x| matches!(x, Action::AdvanceCommit { .. })), "idle: no commit advance");
+
+        // Between crossings (1500 - 1000 = 500 < 1000): nothing at all.
+        let b = step(&mut s, Event::Tick { now_ns: 1500 });
+        assert!(b.is_empty(), "no re-emission before the floor elapses again");
+
+        // Second crossing: 2000 - 1000 >= 1000.
+        let c = step(&mut s, Event::Tick { now_ns: 2000 });
+        assert_eq!(gossips(&c), (1, 1), "second floor crossing emits one commit + one map");
+
+        // Immediately after: still nothing until the floor elapses once more.
+        let d = step(&mut s, Event::Tick { now_ns: 2500 });
+        assert!(d.is_empty(), "no re-emission immediately after a crossing");
     }
 
     #[test]

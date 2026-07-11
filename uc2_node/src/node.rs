@@ -153,6 +153,11 @@ impl Node {
                 members: members_ids.clone(),
                 election_timeout_min_ns: cfg.election_timeout_min_ns,
                 election_timeout_max_ns: cfg.election_timeout_max_ns,
+                // Idle re-gossip floor (spec §6): re-ship commit + term map every
+                // 100ms even when commit is plateaued, so a divergent node
+                // rejoining an idle cluster still reconciles. Not a NodeConfig
+                // knob — the value is a protocol constant, not deployment-tuned.
+                gossip_floor_ns: 100_000_000,
                 seed: cfg.seed,
             },
             recovered_vote,

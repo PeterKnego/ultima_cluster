@@ -123,6 +123,10 @@ pub struct SimConfig {
     pub archive_bytes_max: u64,
     pub election_timeout_min_ns: u64,
     pub election_timeout_max_ns: u64,
+    /// Idle re-gossip floor (spec §6): the leader re-ships commit + term map on
+    /// this cadence even with commit plateaued. Small relative to the fault
+    /// timescales so idle reconciliation happens within a run.
+    pub gossip_floor_ns: u64,
     /// Data-plane strength (F1). Defaults to [`DataPlane::Gated`] — the Task-7
     /// contract; the `raw_m3_*` regression tests flip it to [`DataPlane::RawM3`].
     pub data_plane: DataPlane,
@@ -144,6 +148,7 @@ impl Default for SimConfig {
             archive_bytes_max: 4 * FRAME,
             election_timeout_min_ns: 150_000_000, // 150ms — the SM's own default
             election_timeout_max_ns: 300_000_000, // 300ms
+            gossip_floor_ns: 100_000_000,         // 100ms — spec §6 idle re-gossip
             data_plane: DataPlane::Gated,
         }
     }
@@ -268,6 +273,10 @@ pub struct World {
     blocked_pairs: HashSet<(usize, usize)>,
     vote_drop_until: u64,
     crash_on_truncate: bool,
+    /// When set, a serving leader stops appending NEW frames — modeling a client
+    /// that has stopped submitting. The leader still heartbeats its existing tail
+    /// and re-gossips commit + term map on the idle floor, so commit PLATEAUS.
+    quiet: bool,
 
     // stats
     stat_leaders: u32,
@@ -325,6 +334,7 @@ impl World {
             blocked_pairs: HashSet::new(),
             vote_drop_until: 0,
             crash_on_truncate: false,
+            quiet: false,
             stat_leaders: 0,
             stat_truncations: 0,
             stat_restarts: 0,
@@ -346,6 +356,7 @@ impl World {
             members: (0..cfg.n_nodes as NodeId).collect(),
             election_timeout_min_ns: cfg.election_timeout_min_ns,
             election_timeout_max_ns: cfg.election_timeout_max_ns,
+            gossip_floor_ns: cfg.gossip_floor_ns,
             // Distinct per-node seeds so timeouts spread (avoids lockstep splits).
             seed: cfg.seed ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(node as u64 + 1),
         }
@@ -557,7 +568,7 @@ impl World {
         // Agent duty: a serving leader appends a frame; any leader (re)ships the
         // outstanding tail to each follower (also the liveness heartbeat).
         if matches!(self.nodes[node].sm.role(), Role::Leader) && !self.nodes[node].truncating {
-            if self.nodes[node].sm.can_serve() {
+            if self.nodes[node].sm.can_serve() && !self.quiet {
                 self.nodes[node].append += FRAME;
             }
             let ap = self.nodes[node].append;
@@ -1004,6 +1015,19 @@ impl World {
     /// `unpartition`.)
     pub fn unpartition(&mut self, a: usize, b: usize) {
         self.blocked_pairs.remove(&(a.min(b), a.max(b)));
+    }
+
+    /// Quiesce (or resume) the cluster's write load: while set, a serving leader
+    /// stops appending NEW frames, so commit plateaus. Models "no new client
+    /// submissions" — the state in which only the idle gossip floor keeps a
+    /// reconnecting divergent node reconciling.
+    pub fn set_quiet(&mut self, quiet: bool) {
+        self.quiet = quiet;
+    }
+
+    /// Number of truncations any node has performed so far (for mid-run assertions).
+    pub fn truncations(&self) -> u32 {
+        self.stat_truncations
     }
 
     /// Crash a node immediately (at the current virtual time).

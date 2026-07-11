@@ -86,7 +86,19 @@ fn crash_during_truncate_recovers() {
 /// removed.
 #[test]
 fn raw_m3_data_plane_phantom_commit_is_caught() {
-    let mut w = World::new(SimConfig { drop_per_million: 0, data_plane: DataPlane::RawM3, ..base_cfg(3) });
+    // Disable the idle gossip floor for this deterministic negative pin: the
+    // script's window depends on X raw-reporting its divergent durable to L
+    // BEFORE reconciliation repairs it (L's commit is stalled, so pre-floor no
+    // term map shipped during the window). The floor — whose job IS to re-ship
+    // the map on an idle/stalled leader — would repair X first and prevent the
+    // phantom, which is correct behavior but defeats this ORACLE pin. The floor's
+    // real effect is covered by `idle_cluster_reconciles_divergent_node_via_gossip_floor`.
+    let mut w = World::new(SimConfig {
+        drop_per_million: 0,
+        data_plane: DataPlane::RawM3,
+        gossip_floor_ns: u64::MAX,
+        ..base_cfg(3)
+    });
     w.run_until_leader().expect("setup: elect first leader");
     let x = w.current_leader().unwrap(); // term-1 leader = future divergent ex-leader X
     w.run_steps(300).expect("setup: commit a genuine prefix on all three");
@@ -140,6 +152,11 @@ fn raw_m3_wrong_base_term_stamp_is_caught() {
         drop_per_million: 0,
         data_plane: DataPlane::RawM3,
         max_steps: 80_000,
+        // Same rationale as the phantom-commit pin: this script relies on the
+        // reconcile term map NOT repairing the follower before the injected
+        // divergent frame lands (see the doc comment). The idle floor is disabled
+        // so it cannot race the scripted repair.
+        gossip_floor_ns: u64::MAX,
         ..base_cfg(5)
     });
     w.run_until_leader().expect("setup: elect first leader");
@@ -168,6 +185,51 @@ fn raw_m3_wrong_base_term_stamp_is_caught() {
     assert!(
         v.invariant.contains("inv2"),
         "expected a term-map prefix-consistency (inv2) violation, got: {v}"
+    );
+}
+
+/// Task-9 idle-reconciliation pin: a divergent node healing into a FULLY IDLE
+/// cluster (commit plateaued, zero new submissions) MUST still reconcile —
+/// `truncations >= 1` — driven by the leader's gossip FLOOR alone. This is the
+/// exact hole the failover test's submit-per-iteration workaround was masking:
+/// without the floor, `ShipTermMap` rides only the commit-advance cadence, so an
+/// idle leader never hands the reconnecting node a map and its divergent tail
+/// stays un-truncated forever.
+#[test]
+fn idle_cluster_reconciles_divergent_node_via_gossip_floor() {
+    let mut w = World::new(SimConfig { drop_per_million: 0, max_steps: 60_000, ..base_cfg(3) });
+    w.run_until_leader().expect("setup: elect first leader");
+    let old = w.current_leader().unwrap();
+    w.run_steps(300).expect("setup: genuine committed prefix on all three");
+
+    // Isolate the term-1 leader: it keeps appending an uncommitted divergent
+    // tail while the majority elects a higher-term leader and commits past it.
+    w.partition_node(old);
+    w.run_until(|w| w.current_leader().is_some_and(|l| l != old))
+        .expect("setup: new higher-term leader elects");
+    w.run_steps(500).expect("setup: majority commits past the old prefix");
+    let divergent_append = w.node_append(old);
+    assert!(divergent_append > 0, "setup: old leader must hold a divergent tail");
+
+    // Quiesce: the new leader stops taking writes — commit PLATEAUS. From here
+    // only the idle gossip floor re-ships commit + term map.
+    w.set_quiet(true);
+    w.run_steps(2_000).expect("plateau settles under the idle floor");
+    let commit_plateau = w.max_commit();
+    assert_eq!(w.truncations(), 0, "no reconciliation while the divergent node is still isolated");
+
+    // Heal the divergent node into the now-idle cluster. With NO new submissions,
+    // it must STILL reconcile — the floor-shipped term map is the only trigger.
+    w.heal();
+    w.run_until(|w| w.truncations() >= 1).expect("idle reconciliation must run to completion");
+    assert!(
+        w.truncations() >= 1,
+        "divergent node failed to reconcile into an idle cluster (gossip floor did not re-ship the map)"
+    );
+    assert_eq!(
+        w.max_commit(),
+        commit_plateau,
+        "commit must NOT have advanced — the reconciliation was driven by the idle floor, not new writes"
     );
 }
 
