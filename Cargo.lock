@@ -2599,6 +2599,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "uc2_node"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+ "uc2_consensus",
+ "uc2_log",
+ "uc2_net",
+ "uc_protocol",
+ "ultima-journal",
+]
+
+[[package]]
 name = "uc2_sim"
 version = "0.1.0"
 dependencies = [
