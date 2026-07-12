@@ -16,10 +16,16 @@
 
 mod apply;
 mod attach;
+mod builder_agent;
 mod config;
 mod egress;
 mod output;
 mod replay;
+/// Position-tagged on-disk snapshot files (M6 Task 3) — `SnapshotStore`'s
+/// atomic-publish + keep-newest-2 retention. Public: tests and operational
+/// tooling read the snapshot directory directly (e.g. the M6 Task 3 e2e test
+/// cross-checks the cnc marker against `SnapshotStore::newest`).
+pub mod snapshots;
 mod traits;
 
 /// Reference [`StateMachine`] + [`SnapshotStateMachine`] adapter backed by an
@@ -29,16 +35,20 @@ pub mod ultima_db;
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use uc2_log::agent::{AgentRunner, IdleStrategy};
 use uc2_log::cnc::CncPage;
 use uc2_log::reader::LogFollower;
 
-use crate::apply::apply_cycle;
+use crate::apply::{FreezeFn, SnapshotTrigger, apply_cycle};
+use crate::builder_agent::{BuildJob, BuilderState, builder_cycle};
 use crate::output::{OutputState, output_cycle};
+use crate::snapshots::SnapshotStore;
 
-pub use crate::config::{ServiceConfig, ServiceError, SnapshotError};
+pub use crate::config::{ServiceConfig, ServiceError, SnapshotError, SnapshotPolicy};
 pub use crate::traits::{
     NoopOutput, OutputError, OutputHandler, SnapshotStateMachine, StateMachine,
 };
@@ -124,6 +134,100 @@ impl<S: StateMachine, O: OutputHandler<S>> ServiceBuilder<S, O> {
         }
         let apply_agent = AgentRunner::spawn("uc2-apply", APPLY_IDLE, move || apply_cycle(&mut state))?;
         agents.push(apply_agent);
+
+        Ok(Service { agents, sm, _cnc: cnc, instance_id, epoch })
+    }
+
+    /// Like [`start`](Self::start), but ALSO spawns the M6 Task 3 snapshot
+    /// builder thread — explicit opt-in for `S: SnapshotStateMachine`.
+    ///
+    /// **Controller-resolved deviation from the M6 Task 3 brief.** The brief's
+    /// implicit shape was "spawn the builder whenever the SM is capable", but
+    /// Rust cannot specialize a generic function's behavior on an *optional*
+    /// trait bound at runtime — `start`'s `S: StateMachine` bound alone gives
+    /// the compiler no way to conditionally call `S::freeze` only "if `S`
+    /// happens to also implement `SnapshotStateMachine`". The resolution
+    /// mirrors the existing `.output_handler(..)` opt-in pattern: a caller
+    /// whose SM implements [`SnapshotStateMachine`] but does NOT want the
+    /// builder thread (e.g. it never intends to configure a non-default
+    /// [`SnapshotPolicy`](crate::SnapshotPolicy), or wants to defer opting in)
+    /// simply calls [`start`](Self::start) instead — the builder thread only
+    /// ever exists because THIS method was called, never as a side effect of
+    /// the SM's capability alone.
+    pub fn start_with_snapshots(self) -> Result<Service<S>, ServiceError>
+    where
+        S: SnapshotStateMachine,
+    {
+        let ServiceBuilder { cfg, sm, output } = self;
+
+        let attached = attach::attach(&cfg, sm)?;
+        let buffer = attached.buffer;
+        let cnc = attached.cnc;
+        let instance_id = attached.instance_id;
+        let epoch = attached.epoch;
+
+        let mut state = attached.apply_state;
+        let sm = Arc::clone(&state.sm);
+        let journal_dir = state.journal_dir.clone();
+
+        let mut agents = Vec::with_capacity(3);
+        if std::any::TypeId::of::<O>() != std::any::TypeId::of::<NoopOutput>() {
+            let start_pos = cnc.status().output_progress.load_acquire();
+            let output_follower = LogFollower::new(Arc::clone(&buffer), start_pos);
+            let mut output_state = OutputState::new(
+                output_follower,
+                Arc::clone(&sm),
+                Arc::clone(&cnc),
+                output,
+                journal_dir,
+                instance_id,
+            )?;
+            let output_agent =
+                AgentRunner::spawn("uc2-output", OUTPUT_IDLE, move || output_cycle(&mut output_state))?;
+            agents.push(output_agent);
+        }
+
+        // Snapshot builder wiring: a 1-slot channel handing a (position,
+        // type-erased streaming job) job from the apply thread (freeze, SM
+        // lock held briefly — `crate::apply::maybe_build_snapshot`) to the
+        // builder thread (stream + publish, off-lock —
+        // `crate::builder_agent::builder_cycle`). `busy` gates BOTH
+        // directions of "one in-flight build max": the apply thread checks it
+        // before even calling `freeze()`, and the builder thread holds it for
+        // the full stream+publish duration, not just while a job sits in the
+        // channel.
+        let store = SnapshotStore::open(&cfg.instance_dir)?;
+        let busy = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel::<(u64, BuildJob)>(1);
+        // Seed the interval basis from whatever the cnc marker already holds
+        // (0 on a fresh page) — a service reattaching after a prior
+        // incarnation already built snapshots doesn't immediately re-trigger.
+        let last_snapshot_pos = cnc.snapshots().service_snapshot_pos.load_acquire();
+        let freeze: FreezeFn<S> = Box::new(|sm: &S| {
+            let (handle, pos) = sm.freeze()?;
+            let job: BuildJob = Box::new(move |w: &mut dyn std::io::Write| S::stream_snapshot(handle, w));
+            Ok((job, pos))
+        });
+        state.snapshot_trigger = Some(SnapshotTrigger {
+            policy: cfg.snapshot_policy,
+            last_snapshot_pos,
+            busy: Arc::clone(&busy),
+            tx,
+            freeze,
+        });
+        let mut builder_state = BuilderState { rx, store, cnc: Arc::clone(&cnc), busy };
+        let builder_agent =
+            AgentRunner::spawn("uc2-snapshot-builder", APPLY_IDLE, move || builder_cycle(&mut builder_state))?;
+
+        let apply_agent = AgentRunner::spawn("uc2-apply", APPLY_IDLE, move || apply_cycle(&mut state))?;
+        agents.push(apply_agent);
+        // Builder pushed LAST: `Service::stop`'s loop stops agents in
+        // insertion order, so the builder is joined last — any build already
+        // in flight when teardown starts gets to finish cleanly (the atomic
+        // publish is never aborted mid-write; `AgentRunner::stop`/`Drop` only
+        // signal BETWEEN duty cycles) after apply has already stopped feeding
+        // it new work.
+        agents.push(builder_agent);
 
         Ok(Service { agents, sm, _cnc: cnc, instance_id, epoch })
     }

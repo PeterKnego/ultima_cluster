@@ -20,8 +20,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use uc_protocol::v2::cnc::{
-    self, CNC_OFF_APPEND, CNC_OFF_HEADER_CRC, CNC_OFF_SERVICE_APPLIED, CNC_OFF_TERM, CNC_PAGE_LEN,
-    CNC_V2_VERSION, CncHeader,
+    self, CNC_OFF_APPEND, CNC_OFF_HEADER_CRC, CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SNAPSHOT_POS,
+    CNC_OFF_TERM, CNC_PAGE_LEN, CNC_V2_VERSION, CncHeader,
 };
 
 use crate::counters::{LogCounters, PaddedAtomicU64};
@@ -89,6 +89,23 @@ const _: () = assert!(std::mem::offset_of!(NodeStatusV2, node_heartbeat_ns) == 1
 const _: () = assert!(std::mem::offset_of!(NodeStatusV2, service_heartbeat_ns) == 256);
 const _: () = assert!(std::mem::offset_of!(NodeStatusV2, output_progress) == 320);
 const _: () = assert!(std::mem::offset_of!(NodeStatusV2, next_client_id) == 384);
+
+/// M6 Task 3: the snapshot marker slots, cast at `CNC_OFF_SERVICE_SNAPSHOT_POS`
+/// (1152). `service_snapshot_pos`: writer = the service snapshot builder
+/// thread; position of the newest COMPLETE on-disk snapshot, `0` = none — set
+/// ONLY after `SnapshotStore::publish`'s atomic rename completes (a torn build
+/// is never visible here). `node_snapshot_floor`: writer = consensus (Task 4
+/// mirrors the same value onto the node side so the purge driver never has to
+/// cross into the service's write); init `0`.
+#[repr(C)]
+pub struct SnapshotSlots {
+    pub service_snapshot_pos: PaddedAtomicU64,
+    pub node_snapshot_floor: PaddedAtomicU64,
+}
+
+const _: () = assert!(std::mem::size_of::<SnapshotSlots>() == 128);
+const _: () = assert!(std::mem::offset_of!(SnapshotSlots, service_snapshot_pos) == 0);
+const _: () = assert!(std::mem::offset_of!(SnapshotSlots, node_snapshot_floor) == 64);
 
 /// The mmap'd (or heap) cnc v2 page. `Region` is `Send + Sync`, so this is
 /// too — every accessor casts a `&self`-borrowed reference at a pinned
@@ -307,6 +324,12 @@ impl CncPage {
         unsafe { &*(self.region.ptr_at(CNC_OFF_TERM) as *const NodeStatusV2) }
     }
 
+    /// `SnapshotSlots` cast at `CNC_OFF_SERVICE_SNAPSHOT_POS` (M6 Task 3).
+    pub fn snapshots(&self) -> &SnapshotSlots {
+        // SAFETY: as `counters()` — offset 1152, size 128, 1152+128=1280<=4096.
+        unsafe { &*(self.region.ptr_at(CNC_OFF_SERVICE_SNAPSHOT_POS) as *const SnapshotSlots) }
+    }
+
     /// Decode the header + app_id back into an owned `CncMeta`.
     pub fn meta(&self) -> CncMeta {
         let page = self.page();
@@ -380,11 +403,24 @@ mod tests {
         assert_eq!(size_of::<ServiceProgress>(), 192);
         assert_eq!(size_of::<NodeStatusV2>(), 448);
         assert_eq!(CNC_OFF_NEXT_CLIENT_ID - CNC_OFF_TERM, 384);
+        assert_eq!(size_of::<SnapshotSlots>(), 128);
+        assert_eq!(CNC_OFF_NODE_SNAPSHOT_FLOOR - CNC_OFF_SERVICE_SNAPSHOT_POS, 64);
         let page = CncPage::heap(&test_meta());
         let base = page.page_base_for_tests();
         assert_eq!(page.counters() as *const _ as usize - base, CNC_OFF_APPEND);
         assert_eq!(page.service() as *const _ as usize - base, CNC_OFF_SERVICE_APPLIED);
         assert_eq!(page.status() as *const _ as usize - base, CNC_OFF_TERM);
+        assert_eq!(page.snapshots() as *const _ as usize - base, CNC_OFF_SERVICE_SNAPSHOT_POS);
+    }
+
+    #[test]
+    fn snapshot_slots_init_zero_and_are_independently_writable() {
+        let page = CncPage::heap(&test_meta());
+        assert_eq!(page.snapshots().service_snapshot_pos.load_acquire(), 0, "0 = no snapshot yet");
+        assert_eq!(page.snapshots().node_snapshot_floor.load_acquire(), 0);
+        page.snapshots().service_snapshot_pos.store_release(4096);
+        assert_eq!(page.snapshots().service_snapshot_pos.load_acquire(), 4096);
+        assert_eq!(page.snapshots().node_snapshot_floor.load_acquire(), 0, "independent slots");
     }
 
     #[test]

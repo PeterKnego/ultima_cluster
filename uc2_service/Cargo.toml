@@ -33,4 +33,9 @@ tokio = { version = "1", default-features = false, features = ["rt", "time"] }
 uc2_node = { path = "../uc2_node" }
 uc2_net = { path = "../uc2_net" }
 uc2_client = { path = "../uc2_client" }
+# Dev-only cycle (permitted: the cyclic edge is a dev-dependency, same pattern
+# as uc2_node's own `uc-lincheck` dev-dep) — the M6 Task 3 e2e test drives the
+# real RegisterSm (SnapshotStateMachine capability, feature `v2`) through a
+# full node + service + client stack rather than a local one-off test SM.
+uc-lincheck = { path = "../uc-lincheck", default-features = false, features = ["v2"] }
 tempfile = { workspace = true }

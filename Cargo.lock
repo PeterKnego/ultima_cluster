@@ -2663,6 +2663,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "uc-lincheck",
  "uc2_client",
  "uc2_log",
  "uc2_net",

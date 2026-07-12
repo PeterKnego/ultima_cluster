@@ -109,6 +109,11 @@ pub(crate) fn attach<S: StateMachine>(
         instance_id,
         instance_mismatch_streak: 0,
         my_epoch: epoch,
+        // M6 Task 3: only `start_with_snapshots` installs a real trigger
+        // (it needs `S: SnapshotStateMachine`, a bound `attach` doesn't
+        // carry) — it overwrites this field on the `Attached` this function
+        // returns, before spawning the apply thread.
+        snapshot_trigger: None,
     };
 
     Ok(Attached { apply_state, buffer, cnc, instance_id, epoch })

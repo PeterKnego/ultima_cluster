@@ -18,7 +18,8 @@
 //! 704   NodeStatusV2  (term, flags, leader_hint,
 //!                      node_heartbeat_ns, service_heartbeat_ns,
 //!                      output_progress, next_client_id)     7 × 64 B lines
-//! 1152..4096  reserved (zero) — M6 per-follower observability slots
+//! 1152  SnapshotSlots (service_snapshot_pos, node_snapshot_floor) 2 × 64 B lines
+//! 1280..4096  reserved (zero) — M6 remaining per-follower observability slots
 //! ```
 //!
 //! **crc split (deliberate):** this module is `core`-only (no_std-friendly —
@@ -66,7 +67,11 @@ pub const CNC_OFF_NODE_HEARTBEAT_NS: usize = 896; // writer: consensus agent
 pub const CNC_OFF_SERVICE_HEARTBEAT_NS: usize = 960; // writer: service apply agent
 pub const CNC_OFF_OUTPUT_PROGRESS: usize = 1024; // writer: consensus (persisted marker mirror)
 pub const CNC_OFF_NEXT_CLIENT_ID: usize = 1088; // fetch_add by clients; init 1
-// 1152..4096 reserved (zero) — M6 per-follower observability slots land here
+// M6 Task 3: SnapshotSlots (service_snapshot_pos, node_snapshot_floor). ONE new
+// slot landing now; the rest of the 1152.. band is Task 9 (peer/observability).
+pub const CNC_OFF_SERVICE_SNAPSHOT_POS: usize = 1152; // writer: service snapshot builder thread; position S of the newest COMPLETE on-disk snapshot; 0 = none
+pub const CNC_OFF_NODE_SNAPSHOT_FLOOR: usize = 1216; // writer: consensus (Task 4 mirror); init 0
+// 1280..4096 reserved (zero) — M6 remaining per-follower observability slots
 
 pub const NODE_FLAG_LEADER: u64 = 1;
 pub const NODE_FLAG_CAN_SERVE: u64 = 2;
@@ -335,5 +340,8 @@ mod tests {
         assert_eq!(CNC_OFF_NEXT_CLIENT_ID - CNC_OFF_TERM, 384);
         assert_eq!(NODE_FLAG_LEADER, 1);
         assert_eq!(NODE_FLAG_CAN_SERVE, 2);
+        // M6 Task 3: SnapshotSlots.
+        assert_eq!(CNC_OFF_SERVICE_SNAPSHOT_POS, 1152);
+        assert_eq!(CNC_OFF_NODE_SNAPSHOT_FLOOR - CNC_OFF_SERVICE_SNAPSHOT_POS, 64);
     }
 }
