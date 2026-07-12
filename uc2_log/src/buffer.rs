@@ -23,6 +23,7 @@ use uc_protocol::v2::frame::{
     align_frame_len,
 };
 
+use crate::cnc::CncPage;
 use crate::counters::LogCounters;
 use crate::region::Region;
 
@@ -74,11 +75,14 @@ pub struct LogBuffer {
     capacity: u64,
     mask: u64,
     max_payload: usize,
-    counters: Arc<LogCounters>,
+    /// The shared cnc v2 page: the buffer's position counters
+    /// ([`LogCounters`]) live cast onto it (`cnc.counters()`), so every
+    /// process mapping the page coordinates over the same atomics (M5).
+    cnc: Arc<CncPage>,
 }
 
 impl LogBuffer {
-    pub fn new(region: Region, counters: Arc<LogCounters>, max_payload: usize) -> Self {
+    pub fn new(region: Region, cnc: Arc<CncPage>, max_payload: usize) -> Self {
         let capacity = region.len() as u64;
         assert!(capacity.is_power_of_two(), "capacity must be a power of two");
         assert!(capacity <= 1 << 31, "length commit word is u32");
@@ -87,7 +91,7 @@ impl LogBuffer {
             capacity >= 4 * max_claim,
             "capacity too small for max_payload (need >= 4x max claim)"
         );
-        Self { region, capacity, mask: capacity - 1, max_payload, counters }
+        Self { region, capacity, mask: capacity - 1, max_payload, cnc }
     }
 
     #[inline]
@@ -95,9 +99,18 @@ impl LogBuffer {
         self.capacity
     }
 
+    /// The position counters (cast onto the shared cnc page). Returns a
+    /// borrowed reference — call-sites read/write the atomics through it.
     #[inline]
-    pub fn counters(&self) -> &Arc<LogCounters> {
-        &self.counters
+    pub fn counters(&self) -> &LogCounters {
+        self.cnc.counters()
+    }
+
+    /// The shared cnc v2 page this buffer's counters live on. Cloned by agents
+    /// that publish other page fields (consensus status, service progress).
+    #[inline]
+    pub fn cnc(&self) -> &Arc<CncPage> {
+        &self.cnc
     }
 
     #[inline]
@@ -109,7 +122,7 @@ impl LogBuffer {
     pub fn create_file(
         path: &Path,
         capacity: u64,
-        counters: Arc<LogCounters>,
+        cnc: Arc<CncPage>,
         max_payload: usize,
     ) -> Result<Self, std::io::Error> {
         let file = std::fs::OpenOptions::new()
@@ -122,19 +135,22 @@ impl LogBuffer {
         // SAFETY: exclusive logical ownership per the instance-dir contract
         // (one node per instance dir; instance.lock arrives with uc2_node).
         let m = unsafe { memmap2::MmapMut::map_mut(&file)? };
-        Ok(Self::new(Region::from_mmap(m), counters, max_payload))
+        Ok(Self::new(Region::from_mmap(m), cnc, max_payload))
     }
 
-    /// Map an existing buffer file; capacity = file length.
+    /// Map an existing buffer file; capacity = file length. Reuse preserves the
+    /// ring bytes below `durable` across a node restart (free NAK-serving
+    /// prefill) — the node only opens (vs. creates) when the file already
+    /// matches the configured capacity.
     pub fn open_file(
         path: &Path,
-        counters: Arc<LogCounters>,
+        cnc: Arc<CncPage>,
         max_payload: usize,
     ) -> Result<Self, std::io::Error> {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
         // SAFETY: see create_file.
         let m = unsafe { memmap2::MmapMut::map_mut(&file)? };
-        Ok(Self::new(Region::from_mmap(m), counters, max_payload))
+        Ok(Self::new(Region::from_mmap(m), cnc, max_payload))
     }
 
     /// Worst-case single-append write footprint span: padding (< one aligned
@@ -173,7 +189,7 @@ impl LogBuffer {
     /// holder) may call this; the returned slice is protected from overwrite
     /// by the appender's gate against `durable`.
     pub fn recordable_slice(&self, from: u64, max_bytes: usize) -> &[u8] {
-        let append = self.counters.append.load_acquire();
+        let append = self.cnc.counters().append.load_acquire();
         if append <= from {
             return &[];
         }
@@ -217,7 +233,7 @@ impl LogBuffer {
     /// misreads a payload byte as the length word (bounded by the safety
     /// analysis above, but garbage).
     pub fn read_frame_validated(&self, pos: u64, out: &mut Vec<u8>) -> FrameRead {
-        let append = self.counters.append.load_acquire();
+        let append = self.cnc.counters().append.load_acquire();
         if pos >= append {
             return FrameRead::NotCommitted;
         }
@@ -244,7 +260,7 @@ impl LogBuffer {
         // `append` could be hoisted above (or racing) the copy above.
         std::sync::atomic::fence(Ordering::Acquire);
         // Re-validate: did the appender advance into our margin during the copy?
-        let append_after = self.counters.append.load_acquire();
+        let append_after = self.cnc.counters().append.load_acquire();
         if append_after + self.max_claim() > pos + self.capacity {
             return FrameRead::Overrun;
         }
@@ -261,7 +277,7 @@ impl LogBuffer {
     /// `read_frame_validated`: pre/post overwrite-margin checks around the
     /// copy with an acquire fence between.
     pub fn read_run_validated(&self, from: u64, max_bytes: usize, out: &mut Vec<u8>) -> SliceRead {
-        let append = self.counters.append.load_acquire();
+        let append = self.cnc.counters().append.load_acquire();
         if from >= append {
             return SliceRead::NotCommitted;
         }
@@ -301,7 +317,7 @@ impl LogBuffer {
         }
         // Seqlock re-check (see read_frame_validated for the fence rationale).
         std::sync::atomic::fence(Ordering::Acquire);
-        let append_after = self.counters.append.load_acquire();
+        let append_after = self.cnc.counters().append.load_acquire();
         if append_after + self.max_claim() > from + self.capacity {
             return SliceRead::Overrun;
         }
@@ -326,8 +342,8 @@ pub struct Appender {
 
 impl Appender {
     pub fn new(buffer: Arc<LogBuffer>, leadership_term_id: u32) -> Self {
-        let pos = buffer.counters.append.load_acquire();
-        let cached_durable = buffer.counters.durable.load_acquire();
+        let pos = buffer.cnc.counters().append.load_acquire();
+        let cached_durable = buffer.cnc.counters().durable.load_acquire();
         Self { buffer, pos, cached_durable, leadership_term_id }
     }
 
@@ -358,7 +374,7 @@ impl Appender {
 
         // The one hard gate: never claim past durable + capacity.
         if end > self.cached_durable + b.capacity {
-            self.cached_durable = b.counters.durable.load_acquire();
+            self.cached_durable = b.cnc.counters().durable.load_acquire();
             if end > self.cached_durable + b.capacity {
                 return Err(AppendError::WouldOverrun);
             }
@@ -397,7 +413,7 @@ impl Appender {
         b.commit_word(foff).store(total as u32, Ordering::Release);
 
         self.pos = end;
-        b.counters.append.store_release(self.pos);
+        b.cnc.counters().append.store_release(self.pos);
         Ok(frame_pos)
     }
 
@@ -419,7 +435,7 @@ impl Appender {
         let end = self.pos + pad + aligned;
 
         if end > self.cached_durable + b.capacity {
-            self.cached_durable = b.counters.durable.load_acquire();
+            self.cached_durable = b.cnc.counters().durable.load_acquire();
             if end > self.cached_durable + b.capacity {
                 return Err(AppendError::WouldOverrun);
             }
@@ -451,7 +467,7 @@ impl Appender {
         b.commit_word(foff).store(total as u32, Ordering::Release);
 
         self.pos = end;
-        b.counters.append.store_release(self.pos);
+        b.cnc.counters().append.store_release(self.pos);
         Ok(frame_pos)
     }
 
@@ -480,7 +496,7 @@ impl Appender {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::counters::LogCounters;
+    use crate::cnc::{CncMeta, CncPage};
     use crate::region::Region;
     use std::sync::Arc;
     use uc_protocol::v2::frame::{
@@ -489,14 +505,24 @@ mod tests {
 
     const CAP: u64 = 4096;
 
-    fn buf() -> (Arc<LogBuffer>, Arc<LogCounters>) {
-        let counters = Arc::new(LogCounters::new());
+    fn test_cnc() -> Arc<CncPage> {
+        CncPage::heap(&CncMeta {
+            node_id: 0,
+            instance_id: 0,
+            app_id: "test".into(),
+            buffer_bytes: CAP,
+            max_payload: 256,
+        })
+    }
+
+    fn buf() -> (Arc<LogBuffer>, Arc<CncPage>) {
+        let cnc = test_cnc();
         let b = Arc::new(LogBuffer::new(
             Region::heap_zeroed(CAP as usize),
-            Arc::clone(&counters),
+            Arc::clone(&cnc),
             256, // max_payload for tests
         ));
-        (b, counters)
+        (b, cnc)
     }
 
     #[test]
@@ -507,7 +533,7 @@ mod tests {
         assert_eq!(pos, 0);
         // 32 header + 12 payload = 44 -> aligned 64
         assert_eq!(a.position(), 64);
-        assert_eq!(c.append.load_acquire(), 64);
+        assert_eq!(c.counters().append.load_acquire(), 64);
 
         let s = b.recordable_slice(0, 1 << 20);
         assert_eq!(s.len(), 64);
@@ -527,7 +553,7 @@ mod tests {
         let pos = a.append_new_term().unwrap();
         assert_eq!(pos, 0);
         assert_eq!(a.position(), 32, "the NewTerm frame is header-only (32 B)");
-        assert_eq!(c.append.load_acquire(), 32);
+        assert_eq!(c.counters().append.load_acquire(), 32);
         let s = b.recordable_slice(0, 1 << 20);
         assert_eq!(s.len(), 32);
         let h = read_header(s);
@@ -566,13 +592,13 @@ mod tests {
         }
         assert_eq!(a.position(), 4032);
         // next 96 B frame doesn't fit in the remaining 64 -> 64 B padding + frame at 4096
-        c.durable.store_release(4032); // let the gate breathe
+        c.counters().durable.store_release(4032); // let the gate breathe
         let pos = a.append(1, 99, &[0u8; 64]).unwrap();
         assert_eq!(pos, 4096);
         assert_eq!(a.position(), 4192);
 
         // slice from 4032 stops at the wrap: just the 64 B padding frame
-        c.durable.store_release(4032);
+        c.counters().durable.store_release(4032);
         let s = b.recordable_slice(4032, 1 << 20);
         assert_eq!(s.len(), 64);
         let h = read_header(s);
@@ -595,7 +621,7 @@ mod tests {
         // 4032 used; next append needs padding(64) + frame(96) -> end 4192 > 0 + 4096
         assert_eq!(a.append(1, 500, &[0u8; 64]).unwrap_err(), AppendError::WouldOverrun);
         // archive "records" one frame -> gate opens exactly enough
-        c.durable.store_release(96);
+        c.counters().durable.store_release(96);
         assert_eq!(a.append(1, 500, &[0u8; 64]).unwrap(), 4096);
         // and closes again
         assert_eq!(a.append(1, 501, &[0u8; 64]).unwrap_err(), AppendError::WouldOverrun);
@@ -633,7 +659,7 @@ mod tests {
         // journal — validated reads must degrade to Overrun (replay is the
         // fallback), not parse zeroed/stale bytes.
         let (b, c) = buf();
-        c.prime(2 * CAP);
+        c.counters().prime(2 * CAP);
         let mut out = Vec::new();
         // Both positions pass the lap-overrun margin check (>= append +
         // max_claim - capacity = 8192 + 576 - 4096 = 4672) and previously
@@ -655,7 +681,7 @@ mod tests {
         let mut n = 0u64;
         while a.position() < 3 * CAP {
             a.append(1, n, &[0u8; 64]).unwrap();
-            c.durable.store_release(a.position());
+            c.counters().durable.store_release(a.position());
             n += 1;
         }
         // position 0 was overwritten laps ago
@@ -708,7 +734,7 @@ mod tests {
         for i in 0..42 {
             a.append(1, i, &[0u8; 64]).unwrap(); // fill to 4032
         }
-        c.durable.store_release(4032);
+        c.counters().durable.store_release(4032);
         a.append(1, 99, &[0u8; 64]).unwrap(); // 64 B padding at 4032, frame at 4096
         let mut out = Vec::new();
         // run starting at the padding: 32 bytes copied, 64 positions advanced,
@@ -738,14 +764,14 @@ mod tests {
         let mut n = 0u64;
         while a.position() < 3 * CAP {
             a.append(1, n, &[0u8; 64]).unwrap();
-            c.durable.store_release(a.position());
+            c.counters().durable.store_release(a.position());
             n += 1;
         }
         let mut out = Vec::new();
         assert!(matches!(b.read_run_validated(0, 1392, &mut out), SliceRead::Overrun));
         // primed-over-fresh-buffer (Task 1 semantics, run variant)
         let (b2, c2) = buf();
-        c2.prime(2 * CAP);
+        c2.counters().prime(2 * CAP);
         assert!(matches!(b2.read_run_validated(2 * CAP - 64, 1392, &mut out), SliceRead::Overrun));
     }
 }

@@ -24,6 +24,8 @@
 //! §3.2 / §6; plan `docs/superpowers/plans/2026-07-11-uc2-m4-elections.md`
 //! Task 8.
 
+pub mod ipc;
 mod node;
 
-pub use node::{Node, NodeConfig, NodeDirs, SubmitError};
+pub use ipc::{InstanceDir, IpcError};
+pub use node::{Node, NodeConfig, SubmitError};

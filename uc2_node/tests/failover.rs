@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use uc2_consensus::election::NodeId;
 use uc2_log::archive::{Archive, ArchiveConfig, ReplayFrame};
 use uc2_net::fault::FaultConfig;
-use uc2_node::{Node, NodeConfig, NodeDirs};
+use uc2_node::{Node, NodeConfig};
 
 /// On-wire size of a 96 B-payload message frame (32 B header + 96 B, already
 /// 32 B-aligned). The harness submits exactly 96 B payloads so each commit step
@@ -70,7 +70,9 @@ fn serialize() -> MutexGuard<'static, ()> {
 struct NodeH {
     id: NodeId,
     addr: SocketAddr,
-    dirs: NodeDirs,
+    instance_dir: PathBuf,
+    /// Derived (`instance_dir/journal`) — kept for the replay-equality checks.
+    journal_dir: PathBuf,
     seed: u64,
     node: Option<Node>,
 }
@@ -149,7 +151,8 @@ impl NodeH {
     fn restart(&mut self, members: &[(NodeId, SocketAddr)]) {
         assert!(self.node.is_none(), "restart of a live node");
         let sock = rebind(self.addr);
-        let cfg = make_config(self.id, members.to_vec(), self.dirs.clone(), self.seed, self.addr);
+        let cfg =
+            make_config(self.id, members.to_vec(), self.instance_dir.clone(), self.seed, self.addr);
         self.node = Some(Node::start_with_socket(cfg, sock).expect("restart"));
     }
 }
@@ -171,7 +174,7 @@ fn rebind(addr: SocketAddr) -> UdpSocket {
 fn make_config(
     id: NodeId,
     members: Vec<(NodeId, SocketAddr)>,
-    dirs: NodeDirs,
+    instance_dir: PathBuf,
     seed: u64,
     addr: SocketAddr,
 ) -> NodeConfig {
@@ -179,9 +182,11 @@ fn make_config(
         id,
         members,
         bind: addr,
-        dirs,
+        instance_dir,
+        app_id: "failover".into(),
         buffer_bytes: 1 << 22, // 4 MiB: no wrap within a test (see module docs)
         max_payload: 256,
+        admission_bytes: 256 * 1024,
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed,
@@ -227,14 +232,19 @@ fn spawn_cluster(n: usize) -> Cluster {
     let mut nodes = Vec::with_capacity(n);
     for (i, sock) in socks.into_iter().enumerate() {
         let addr = members[i].1;
-        let dirs = NodeDirs {
-            journal: dir.path().join(format!("n{i}/j")),
-            state: dir.path().join(format!("n{i}/s")),
-        };
+        let instance_dir = dir.path().join(format!("n{i}"));
+        let journal_dir = instance_dir.join("journal");
         let seed = seed_for(i);
-        let cfg = make_config(i as NodeId, members.clone(), dirs.clone(), seed, addr);
+        let cfg = make_config(i as NodeId, members.clone(), instance_dir.clone(), seed, addr);
         let node = Node::start_with_socket(cfg, sock).expect("start");
-        nodes.push(NodeH { id: i as NodeId, addr, dirs, seed, node: Some(node) });
+        nodes.push(NodeH {
+            id: i as NodeId,
+            addr,
+            instance_dir,
+            journal_dir,
+            seed,
+            node: Some(node),
+        });
     }
     Cluster { _dir: dir, members, nodes }
 }
@@ -390,7 +400,7 @@ fn boot_elects_exactly_one_leader_and_commits() {
     await_all(&c.nodes, target, 60, "durable", NodeH::durable);
 
     c.stop_all();
-    let dirs: Vec<&PathBuf> = c.nodes.iter().map(|n| &n.dirs.journal).collect();
+    let dirs: Vec<&PathBuf> = c.nodes.iter().map(|n| &n.journal_dir).collect();
     assert_replay_equal(&dirs);
 }
 
@@ -446,7 +456,7 @@ fn leader_kill_fails_over_subsecond_without_losing_committed_data() {
     for &i in &survivors {
         c.nodes[i].stop();
     }
-    let dirs: Vec<&PathBuf> = survivors.iter().map(|&i| &c.nodes[i].dirs.journal).collect();
+    let dirs: Vec<&PathBuf> = survivors.iter().map(|&i| &c.nodes[i].journal_dir).collect();
     assert_replay_equal(&dirs);
 }
 
@@ -598,7 +608,7 @@ fn heal_truncates_divergent_tail_and_reconverges() {
     );
 
     c.stop_all();
-    let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].dirs.journal).collect();
+    let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].journal_dir).collect();
     // Byte-equal, including BOTH NewTerm frames and none of the phantom appends.
     assert_replay_equal(&dirs);
 }
@@ -694,7 +704,7 @@ fn contested_first_election_first_block_truncation_recovers() {
         await_all(&c.nodes, final_target, 15, "reconverge durable", NodeH::durable);
 
         c.stop_all();
-        let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].dirs.journal).collect();
+        let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].journal_dir).collect();
         assert_replay_equal(&dirs);
 
         // The converged stream STARTS at position 0 with the base-0 term's
@@ -760,6 +770,6 @@ fn restarted_follower_recovers_state_and_rejoins() {
     assert!(!c.nodes[follower].is_leader(), "restarted follower unexpectedly became leader");
 
     c.stop_all();
-    let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].dirs.journal).collect();
+    let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].journal_dir).collect();
     assert_replay_equal(&dirs);
 }

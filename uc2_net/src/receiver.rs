@@ -50,10 +50,10 @@ use crate::sender::CtrlMsg;
 #[derive(Debug, Clone)]
 pub enum NetEvent {
     Report { from: SocketAddr, term: u32, durable: u64 },
-    CommitGossip { term: u32, commit: u64 },
+    CommitGossip { from: SocketAddr, term: u32, commit: u64 },
     RequestVote { from: SocketAddr, body: RequestVoteBody },
     Vote { from: SocketAddr, body: VoteBody },
-    TermMap { term: u32, entries: Vec<TermMapEntryWire> },
+    TermMap { from: SocketAddr, term: u32, entries: Vec<TermMapEntryWire> },
     /// Any current-term leader traffic (data/heartbeat) seen — liveness.
     LeaderActivity { term: u32 },
 }
@@ -90,7 +90,7 @@ fn consensus_event(h: &DatagramHeader, d: &[u8], from: SocketAddr) -> Option<Net
             Some(NetEvent::Report { from, term: h.leadership_term_id, durable: h.position })
         }
         DGRAM_KIND_COMMIT_POSITION => {
-            Some(NetEvent::CommitGossip { term: h.leadership_term_id, commit: h.position })
+            Some(NetEvent::CommitGossip { from, term: h.leadership_term_id, commit: h.position })
         }
         DGRAM_KIND_REQUEST_VOTE if body.len() >= REQUEST_VOTE_BODY_LEN => {
             Some(NetEvent::RequestVote { from, body: read_request_vote_body(body) })
@@ -102,6 +102,7 @@ fn consensus_event(h: &DatagramHeader, d: &[u8], from: SocketAddr) -> Option<Net
             let mut out = [TermMapEntryWire { term: 0, base: 0 }; MAX_TERM_MAP_WIRE_ENTRIES];
             let count = read_term_map_body(body, &mut out)?;
             Some(NetEvent::TermMap {
+                from,
                 term: h.leadership_term_id,
                 entries: out[..count].to_vec(),
             })
@@ -831,7 +832,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
     use uc2_log::buffer::{Appender, LogBuffer, SliceRead};
-    use uc2_log::counters::LogCounters;
+    use uc2_log::cnc::{CncMeta, CncPage};
     use uc2_log::region::Region;
     use uc_protocol::v2::datagram::{
         read_nak_body, read_status_body, write_datagram_header, write_nak_body,
@@ -842,9 +843,18 @@ mod tests {
 
     const TERM: u32 = 9;
 
+    fn test_cnc(cap: u64) -> Arc<CncPage> {
+        CncPage::heap(&CncMeta {
+            node_id: 0,
+            instance_id: 0,
+            app_id: "test".into(),
+            buffer_bytes: cap,
+            max_payload: 256,
+        })
+    }
+
     fn buffer() -> Arc<LogBuffer> {
-        let counters = Arc::new(LogCounters::new());
-        Arc::new(LogBuffer::new(Region::heap_zeroed(1 << 16), counters, 256))
+        Arc::new(LogBuffer::new(Region::heap_zeroed(1 << 16), test_cnc(1 << 16), 256))
     }
 
     fn term_handle(t: u32) -> TermHandle {
@@ -1067,14 +1077,14 @@ mod tests {
         assert_eq!(walk_advance(&[0u8; 32]), None); // zero length
         // padding-only run from a wrapping buffer
         let b = buffer();
-        let c = Arc::clone(b.counters());
+        let c = Arc::clone(b.cnc());
         let mut a = Appender::new(Arc::clone(&b), TERM);
         let per = 96u64;
         let cap = b.capacity();
         let fill = (cap / per) as usize; // 682 frames -> 65472, 64 short of the wrap
         for i in 0..fill {
             a.append(4, i as u64, &[0u8; 64]).unwrap();
-            c.durable.store_release(a.position());
+            c.counters().durable.store_release(a.position());
         }
         let pad_pos = a.position();
         a.append(4, 999, &[0u8; 64]).unwrap(); // forces padding
@@ -1105,8 +1115,7 @@ mod tests {
         // (max_payload 256 -> max_claim 576 -> 2304). 96-byte frames lap it in
         // 42 frames + a 64-byte wrap padding.
         fn small() -> Arc<LogBuffer> {
-            let counters = Arc::new(LogCounters::new());
-            Arc::new(LogBuffer::new(Region::heap_zeroed(4096), counters, 256))
+            Arc::new(LogBuffer::new(Region::heap_zeroed(4096), test_cnc(4096), 256))
         }
 
         // Two honest laps of leader wire runs. The buffer is only 4096 B, so
@@ -1462,7 +1471,7 @@ mod tests {
                         assert_eq!(body.new_term, TERM + 5);
                         saw_vote = true;
                     }
-                    NetEvent::CommitGossip { term, commit } => {
+                    NetEvent::CommitGossip { term, commit, .. } => {
                         assert_eq!((term, commit), (TERM, 4096));
                         saw_gossip = true;
                     }

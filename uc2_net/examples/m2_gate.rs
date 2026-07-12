@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use uc2_log::agent::{AgentRunner, IdleStrategy};
 use uc2_log::archive::{Archive, ArchiveConfig};
 use uc2_log::buffer::{AppendError, Appender, LogBuffer};
-use uc2_log::counters::LogCounters;
+use uc2_log::cnc::{CncMeta, CncPage};
 use uc2_log::region::Region;
 use uc2_net::fault::{FaultConfig, FaultSocket};
 use uc2_net::receiver::{FollowerConfig, FollowerReceiver, FollowerStats, LeaderReceiver};
@@ -39,8 +39,14 @@ const TERM: u32 = 1;
 const MAX_PAYLOAD: usize = 1024;
 
 fn buffer(mib: usize) -> Arc<LogBuffer> {
-    let counters = Arc::new(LogCounters::new());
-    Arc::new(LogBuffer::new(Region::heap_zeroed(mib << 20), counters, MAX_PAYLOAD))
+    let cnc = CncPage::heap(&CncMeta {
+        node_id: 0,
+        instance_id: 0,
+        app_id: "test".into(),
+        buffer_bytes: (mib as u64) << 20,
+        max_payload: MAX_PAYLOAD as u32,
+    });
+    Arc::new(LogBuffer::new(Region::heap_zeroed(mib << 20), cnc, MAX_PAYLOAD))
 }
 
 fn archive_agent(name: &str, b: &Arc<LogBuffer>, dir: &str) -> AgentRunner {

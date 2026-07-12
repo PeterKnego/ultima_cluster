@@ -2603,6 +2603,8 @@ dependencies = [
 name = "uc2_node"
 version = "0.1.0"
 dependencies = [
+ "fs2",
+ "rand 0.9.4",
  "tempfile",
  "thiserror 2.0.18",
  "uc2_consensus",

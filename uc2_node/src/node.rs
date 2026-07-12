@@ -9,19 +9,23 @@ use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use uc2_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId};
 use uc2_log::agent::{AgentRunner, IdleStrategy};
 use uc2_log::archive::{Archive, ArchiveConfig};
 use uc2_log::buffer::{AppendError, Appender, LogBuffer};
+use uc2_log::cnc::{CncMeta, CncPage};
 use uc2_log::counters::LogCounters;
-use uc2_log::region::Region;
 use uc2_log::state::{NodeState, TermMap, TermMapEntry, VoteRecord};
 use uc2_net::TermHandle;
 use uc2_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc2_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent};
 use uc2_net::sender::{CtrlMsg, Sender, SenderConfig};
+use uc_protocol::ring::{BroadcastRing, MpscRing, SpscRing};
+use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
+
+use crate::ipc::InstanceDir;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_TERM_MAP,
     DGRAM_KIND_VOTE, DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, REQUEST_VOTE_BODY_LEN,
@@ -46,23 +50,24 @@ impl TruncationSlot {
     }
 }
 
-/// Journal + node-state directories for one node.
-#[derive(Debug, Clone)]
-pub struct NodeDirs {
-    pub journal: PathBuf,
-    pub state: PathBuf,
-}
-
 /// Static-membership node configuration (M4: no discovery, no reconfiguration).
 pub struct NodeConfig {
     pub id: NodeId,
     /// Every member INCLUDING self, as `(id, addr)`.
     pub members: Vec<(NodeId, SocketAddr)>,
     pub bind: SocketAddr,
-    pub dirs: NodeDirs,
+    /// The node's on-disk instance directory (flock'd; holds cnc page, log
+    /// buffer, journal, state, and the IPC ring files). Reused across restarts.
+    pub instance_dir: PathBuf,
+    /// Application identity stamped into the cnc page; attaching parties
+    /// (service, clients) must present the same `app_id` (else "wrong cluster").
+    pub app_id: String,
     /// Ring capacity in bytes; power of two.
     pub buffer_bytes: usize,
     pub max_payload: usize,
+    /// Ingress admission budget in bytes (`append - commit` backpressure gate,
+    /// wired in Task 7). Default `256 * 1024`.
+    pub admission_bytes: u64,
     pub election_timeout_min_ns: u64,
     pub election_timeout_max_ns: u64,
     pub seed: u64,
@@ -88,8 +93,21 @@ const INGRESS_PER_CYCLE: usize = 256;
 /// NetEvent channel depth (T7 observability: a full channel counts a drop).
 const NET_EVENT_CAPACITY: usize = 4096;
 
+/// The node's shared-memory IPC rings (spec §7), created fresh at every boot.
+/// Held for the node's life so the mmap'd files stay live for attaching
+/// clients/service. Wired to dispatch agents in later M5 tasks — currently the
+/// node is only the creator, so the handles are held but not yet polled.
+#[allow(dead_code)]
+struct Rings {
+    ingress: MpscRing,
+    query: MpscRing,
+    svc_query: SpscRing,
+    egress_service: BroadcastRing,
+    egress_node: BroadcastRing,
+}
+
 pub struct Node {
-    counters: Arc<LogCounters>,
+    cnc: Arc<CncPage>,
     term_handle: TermHandle,
     leader_flag: Arc<AtomicBool>,
     can_serve_flag: Arc<AtomicBool>,
@@ -97,6 +115,9 @@ pub struct Node {
     truncations: Arc<AtomicU64>,
     route_drops: Arc<uc2_net::receiver::FollowerStats>,
     partition_handles: Vec<PartitionHandle>,
+    // Held for the node's life: the instance flock and the IPC ring mmaps.
+    _instance: InstanceDir,
+    _rings: Rings,
     agents: Vec<AgentRunner>,
 }
 
@@ -116,6 +137,11 @@ impl Node {
     pub fn start_with_socket(cfg: NodeConfig, sock: UdpSocket) -> io::Result<Node> {
         let self_addr = sock.local_addr()?;
 
+        // 1. flock FIRST — one node per instance dir. A contended lock (a live
+        // node already owns this dir) surfaces as an io error whose Display
+        // carries "AlreadyRunning" (the harness matches on it).
+        let instance = InstanceDir::acquire(&cfg.instance_dir).map_err(to_io)?;
+
         // Three clones of the one node socket: the receiver recvs (and sends
         // follower-role control), the sender streams, the consensus agent sends
         // votes/gossip/term-maps/elections. Each wraps in a `FaultSocket` so its
@@ -132,13 +158,11 @@ impl Node {
             cons_sock.partition_handle(),
         ];
 
-        // Recover durable state.
-        std::fs::create_dir_all(&cfg.dirs.journal)?;
-        std::fs::create_dir_all(&cfg.dirs.state)?;
-        let state = NodeState::open(&cfg.dirs.state).map_err(to_io)?;
+        // 2. Recover durable state from the journal.
         let mut archive =
-            Archive::open(ArchiveConfig::new(&cfg.dirs.journal)).map_err(to_io)?;
+            Archive::open(ArchiveConfig::new(instance.journal_dir())).map_err(to_io)?;
         let durable = archive.recovered_position();
+        let state = NodeState::open(&instance.state_dir()).map_err(to_io)?;
 
         // Recovery re-derivation (T4 carry 4): if the persisted term map does not
         // cover the durable journal frontier — a crash after the bytes fsynced
@@ -152,14 +176,40 @@ impl Node {
             state.store_term_map(&to_entries(&rederived)).map_err(to_io)?;
         }
 
-        // The shared ring + counters, primed to the recovery point.
-        let counters = Arc::new(LogCounters::new());
-        let buffer = Arc::new(LogBuffer::new(
-            Region::heap_zeroed(cfg.buffer_bytes),
-            Arc::clone(&counters),
+        // 3. Re-create the cnc v2 page EVERY boot with a fresh random
+        // `instance_id` (invalidates any stale attachment), then prime the
+        // counters (which live cast onto the page) to the recovery point.
+        let instance_id = rand::random::<u128>();
+        let meta = CncMeta {
+            node_id: cfg.id,
+            instance_id,
+            app_id: cfg.app_id.clone(),
+            buffer_bytes: cfg.buffer_bytes as u64,
+            max_payload: cfg.max_payload as u32,
+        };
+        let cnc = CncPage::create_file(&instance.cnc_path(), &meta).map_err(to_io)?;
+        cnc.counters().prime(durable);
+
+        // 4. Log buffer file: reuse the existing file when it already matches the
+        // configured capacity (preserves ring bytes below `durable` across a
+        // restart — free NAK-serving prefill), else create it fresh.
+        let buffer = Arc::new(open_or_create_buffer(
+            &instance.log_path(),
+            cfg.buffer_bytes as u64,
+            Arc::clone(&cnc),
             cfg.max_payload,
-        ));
-        counters.prime(durable);
+        )?);
+
+        // 5. Durable output-progress marker → mirror onto the page for attaching
+        // parties. There is no persisted marker until the output loop lands (a
+        // later M5 task); the page's zeroed default (0) is the correct boot
+        // value, published explicitly here as the mirror point.
+        let output_progress = 0u64;
+        cnc.status().output_progress.store_release(output_progress);
+
+        // 6. Rings created fresh each boot (stale files unlinked first — any
+        // prior attachment is invalidated by the new instance_id anyway).
+        let rings = create_rings(&instance)?;
 
         // Election SM over the recovered credentials.
         let members_ids: Vec<NodeId> = cfg.members.iter().map(|(id, _)| *id).collect();
@@ -244,7 +294,7 @@ impl Node {
         // Archive agent: truncate commands first (don't record blocks about to be
         // dropped), then record, then ship data-stamped term observations.
         let arc_buffer = Arc::clone(&buffer);
-        let arc_counters = Arc::clone(&counters);
+        let arc_cnc = Arc::clone(&cnc);
         let arc_slot = trunc_slot.clone();
         let archive_agent = AgentRunner::spawn("uc2-archive", IdleStrategy::Yield, move || {
             let mut did = false;
@@ -254,7 +304,7 @@ impl Node {
                 // + prefix re-seed (M4 carry #3) and no longer fail-stop. Any
                 // remaining error is a genuine journal I/O fault — still fatal.
                 archive.truncate_to(to).expect("archive truncate fail-stop (journal I/O)");
-                arc_counters.prime(to);
+                arc_cnc.counters().prime(to);
                 // Infallible ack: a single slot cannot drop (one in flight).
                 arc_slot.post(epoch, to);
                 did = true;
@@ -279,7 +329,7 @@ impl Node {
             id: cfg.id,
             sm,
             state,
-            counters: Arc::clone(&counters),
+            cnc: Arc::clone(&cnc),
             buffer: Arc::clone(&buffer),
             appender: None,
             next_corr: 0,
@@ -308,7 +358,7 @@ impl Node {
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
 
         Ok(Node {
-            counters,
+            cnc,
             term_handle,
             leader_flag,
             can_serve_flag,
@@ -316,6 +366,8 @@ impl Node {
             truncations,
             route_drops,
             partition_handles,
+            _instance: instance,
+            _rings: rings,
             // Stop order: consensus first (stops writing the term handle), then
             // the data plane, then the archive last (so a final block can flush).
             agents: vec![consensus_agent, sender_agent, receiver_agent, archive_agent],
@@ -334,8 +386,8 @@ impl Node {
         self.term_handle.load(Ordering::Acquire)
     }
 
-    pub fn counters(&self) -> &Arc<LogCounters> {
-        &self.counters
+    pub fn counters(&self) -> &LogCounters {
+        self.cnc.counters()
     }
 
     /// Leader-only ingress: enqueue a payload for the consensus agent to append
@@ -407,7 +459,9 @@ struct Consensus {
     id: NodeId,
     sm: ElectionSm,
     state: NodeState,
-    counters: Arc<LogCounters>,
+    /// The shared cnc v2 page — this agent is the single writer of `commit`,
+    /// `term`, `flags`, `leader_hint`, and `node_heartbeat_ns`.
+    cnc: Arc<CncPage>,
     buffer: Arc<LogBuffer>,
     appender: Option<Appender>,
     next_corr: u64,
@@ -467,7 +521,7 @@ impl Consensus {
         }
 
         // 2. Poll the durable counter; feed DurableAdvanced on change.
-        let d = self.counters.durable.load_acquire();
+        let d = self.cnc.counters().durable.load_acquire();
         if d != self.durable_seen {
             self.durable_seen = d;
             self.feed(Event::DurableAdvanced { durable: d });
@@ -486,7 +540,34 @@ impl Consensus {
         // 5. Publish role/serving snapshots for the API (term is written on
         // transitions; keep can_serve fresh every cycle).
         self.can_serve_flag.store(self.sm.can_serve(), Ordering::Release);
+
+        // 6. Publish the node's status onto the shared cnc page for cross-process
+        // attachers (service, clients). `term` + `flags` reflect the SM every
+        // cycle; `node_heartbeat_ns` is wall-clock ns (SystemTime) so a service
+        // in another process can compare it against its own clock for liveness.
+        self.publish_status();
         did
+    }
+
+    /// Publish `term`, `flags` (leader/can_serve), and a fresh wall-clock
+    /// heartbeat onto the cnc page. `leader_hint` is published event-driven
+    /// (see `feed_net` / `exec`), not here.
+    fn publish_status(&self) {
+        let status = self.cnc.status();
+        status.term.store_release(self.sm.current_term() as u64);
+        let mut flags = 0u64;
+        if self.leader_flag.load(Ordering::Relaxed) {
+            flags |= NODE_FLAG_LEADER;
+        }
+        if self.sm.can_serve() {
+            flags |= NODE_FLAG_CAN_SERVE;
+        }
+        status.flags.store_release(flags);
+        let now_ns = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        status.node_heartbeat_ns.store_release(now_ns);
     }
 
     fn now_ns(&self) -> u64 {
@@ -544,7 +625,10 @@ impl Consensus {
                 let Some(id) = self.addr_to_id.get(&from).copied() else { return };
                 Event::Report { from: id, term, durable }
             }
-            NetEvent::CommitGossip { term, commit } => Event::CommitGossip { term, commit },
+            NetEvent::CommitGossip { from, term, commit } => {
+                self.learn_leader_hint(from, term);
+                Event::CommitGossip { term, commit }
+            }
             NetEvent::RequestVote { from, body } => {
                 let Some(id) = self.addr_to_id.get(&from).copied() else { return };
                 Event::RequestVote {
@@ -558,13 +642,32 @@ impl Consensus {
                 let Some(id) = self.addr_to_id.get(&from).copied() else { return };
                 Event::Vote { from: id, term: body.term, granted: body.granted }
             }
-            NetEvent::TermMap { term, entries } => Event::TermMapReceived {
-                term,
-                entries: entries.iter().map(|e| (e.term, e.base)).collect(),
-            },
+            NetEvent::TermMap { from, term, entries } => {
+                self.learn_leader_hint(from, term);
+                Event::TermMapReceived {
+                    term,
+                    entries: entries.iter().map(|e| (e.term, e.base)).collect(),
+                }
+            }
             NetEvent::LeaderActivity { term } => Event::LeaderSeen { term },
         };
         self.feed(event);
+    }
+
+    /// Learn (publish) the current leader's id from current-term leader traffic
+    /// (commit gossip / term map). Only a datagram whose term MATCHES our
+    /// already-adopted term identifies a confirmed leader: its source resolves
+    /// to a member id via `addr_to_id`. A higher-term datagram is a *new* leader
+    /// we have not adopted yet — the SM adopts it and `exec`'s `BecomeFollower`
+    /// resets the hint to `u64::MAX` (unknown), and the next same-term datagram
+    /// re-learns the id here.
+    fn learn_leader_hint(&self, from: SocketAddr, term: u32) {
+        if term != self.sm.current_term() {
+            return;
+        }
+        if let Some(id) = self.addr_to_id.get(&from).copied() {
+            self.cnc.status().leader_hint.store_release(id as u64);
+        }
     }
 
     /// Feed one event into the SM and execute every resulting action IN ORDER;
@@ -663,7 +766,7 @@ impl Consensus {
                 // is closed across the prime so a UDP-reordered straggler that
                 // cleared the old term filter cannot race the counter reset.
                 self.close_gate();
-                self.counters.prime(base);
+                self.cnc.counters().prime(base);
                 let mut appender = Appender::new(Arc::clone(&self.buffer), term);
                 appender.append_new_term().expect("NewTerm append fail-stop");
                 // The serving gate compares COMMIT (an end/frontier position)
@@ -678,6 +781,8 @@ impl Consensus {
                 self.awaiting_reconcile = false;
                 self.open_gate();
                 self.leader_flag.store(true, Ordering::Release);
+                // We ARE the leader of this term (leader_hint published on the page).
+                self.cnc.status().leader_hint.store_release(self.id as u64);
             }
             Action::BecomeFollower { term, .. } => {
                 self.term_handle.store(term, Ordering::Release);
@@ -688,12 +793,16 @@ impl Consensus {
                 if term > self.adopted_term {
                     self.close_gate();
                     self.awaiting_reconcile = true;
+                    // A newly adopted term has no known leader yet — reset the
+                    // hint to `unknown` until current-term leader traffic
+                    // re-learns it (`learn_leader_hint`).
+                    self.cnc.status().leader_hint.store_release(u64::MAX);
                 }
                 self.adopted_term = term;
             }
             Action::AdvanceCommit { commit } => {
                 // The ONLY commit store in the binary (both roles).
-                self.counters.commit.store_release(commit);
+                self.cnc.counters().commit.store_release(commit);
             }
             Action::GossipCommit { commit } => {
                 let term = self.sm.current_term();
@@ -789,6 +898,49 @@ impl Consensus {
 
 // ------------------------------------------------------------------- helpers
 
+/// Reuse the log-buffer file when it already matches the configured capacity
+/// (preserves the ring bytes below `durable` across a restart — free
+/// NAK-serving prefill), otherwise create it fresh at `capacity`.
+fn open_or_create_buffer(
+    path: &std::path::Path,
+    capacity: u64,
+    cnc: Arc<CncPage>,
+    max_payload: usize,
+) -> io::Result<LogBuffer> {
+    let reuse = std::fs::metadata(path).map(|m| m.len() == capacity).unwrap_or(false);
+    if reuse {
+        LogBuffer::open_file(path, cnc, max_payload)
+    } else {
+        LogBuffer::create_file(path, capacity, cnc, max_payload)
+    }
+}
+
+/// Create the node's shared-memory IPC ring files fresh (unlinking any stale
+/// file first — a prior instance's attachment is invalidated by the new
+/// instance_id anyway). Sizes are fixed by the spec: ingress 4 MiB, query
+/// 1 MiB, svc_query 1 MiB, both broadcasts 4 MiB; 64 KiB max message each.
+fn create_rings(dir: &InstanceDir) -> io::Result<Rings> {
+    const MIB: u64 = 1 << 20;
+    const MAX_MSG: u32 = 64 << 10;
+    for p in [
+        dir.ingress_ring(),
+        dir.query_ring(),
+        dir.svc_query_ring(),
+        dir.egress_service(),
+        dir.egress_node(),
+    ] {
+        let _ = std::fs::remove_file(&p);
+    }
+    Ok(Rings {
+        ingress: MpscRing::create(&dir.ingress_ring(), 4 * MIB, MAX_MSG).map_err(to_io)?,
+        query: MpscRing::create(&dir.query_ring(), MIB, MAX_MSG).map_err(to_io)?,
+        svc_query: SpscRing::create(&dir.svc_query_ring(), MIB, MAX_MSG).map_err(to_io)?,
+        egress_service: BroadcastRing::create(&dir.egress_service(), 4 * MIB, MAX_MSG)
+            .map_err(to_io)?,
+        egress_node: BroadcastRing::create(&dir.egress_node(), 4 * MIB, MAX_MSG).map_err(to_io)?,
+    })
+}
+
 fn to_pairs(m: &TermMap) -> Vec<(u32, u64)> {
     m.iter().map(|e| (e.term, e.base)).collect()
 }
@@ -840,6 +992,19 @@ fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uc2_log::region::Region;
+
+    /// Build a heap-backed cnc page for the bare-`Consensus` harness (no file,
+    /// no flock — these tests drive `feed`/`exec` directly).
+    fn test_cnc() -> Arc<CncPage> {
+        CncPage::heap(&CncMeta {
+            node_id: 1,
+            instance_id: 0,
+            app_id: "test".into(),
+            buffer_bytes: 1 << 16,
+            max_payload: 4096,
+        })
+    }
 
     /// Live-channel ends the test must keep alive so the `Consensus`'s owned
     /// senders/receivers don't disconnect while we drive `feed` directly.
@@ -889,13 +1054,13 @@ mod tests {
     /// diverges from the current leader's map, so a term-map delivery truncates.
     fn harness() -> Harness {
         let dir = tempfile::tempdir().unwrap();
-        let counters = Arc::new(LogCounters::new());
+        let cnc = test_cnc();
         let buffer = Arc::new(LogBuffer::new(
             Region::heap_zeroed(1 << 16),
-            Arc::clone(&counters),
+            Arc::clone(&cnc),
             4096,
         ));
-        counters.prime(6000);
+        cnc.counters().prime(6000);
         let state = NodeState::open(dir.path()).unwrap();
 
         // id=1 in [0,1,2]; own map (1,0),(2,4096) at durable 6000 → boot_term 2.
@@ -939,7 +1104,7 @@ mod tests {
             id: 1,
             sm,
             state,
-            counters: Arc::clone(&counters),
+            cnc: Arc::clone(&cnc),
             buffer,
             appender: None,
             next_corr: 0,

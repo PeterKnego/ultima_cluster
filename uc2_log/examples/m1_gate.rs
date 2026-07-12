@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use uc2_log::agent::{AgentRunner, IdleStrategy};
 use uc2_log::archive::{Archive, ArchiveConfig};
 use uc2_log::buffer::{AppendError, Appender, LogBuffer};
-use uc2_log::counters::LogCounters;
+use uc2_log::cnc::{CncMeta, CncPage};
 use uc_protocol::v2::frame::{align_frame_len, HEADER_LEN};
 
 fn main() {
@@ -42,14 +42,20 @@ fn main() {
         .unwrap_or(0);
 
     std::fs::create_dir_all(&journal_dir).unwrap();
-    let counters = Arc::new(LogCounters::new());
+    let cnc = CncPage::heap(&CncMeta {
+        node_id: 0,
+        instance_id: 0,
+        app_id: "test".into(),
+        buffer_bytes: buffer_mib * 1024 * 1024,
+        max_payload: 1024 * 1024,
+    });
     let mut archive = Archive::open(ArchiveConfig::new(&journal_dir)).unwrap();
-    counters.prime(archive.recovered_position());
+    cnc.counters().prime(archive.recovered_position());
     let buffer = Arc::new(
         LogBuffer::create_file(
             buffer_path.as_ref(),
             buffer_mib * 1024 * 1024,
-            Arc::clone(&counters),
+            Arc::clone(&cnc),
             1024 * 1024,
         )
         .unwrap(),
@@ -100,12 +106,12 @@ fn main() {
         let now = Instant::now();
         if now >= next_report {
             next_report = now + Duration::from_secs(1);
-            samples.push((start.elapsed().as_secs_f64(), counters.durable.load_acquire()));
+            samples.push((start.elapsed().as_secs_f64(), cnc.counters().durable.load_acquire()));
             eprintln!(
                 "t={:>3}s appended={} durable_lag={}B",
                 start.elapsed().as_secs(),
                 appended,
-                counters.append.load_acquire() - counters.durable.load_acquire(),
+                cnc.counters().append.load_acquire() - cnc.counters().durable.load_acquire(),
             );
         }
         if max_msgs != 0 && appended >= max_msgs {
@@ -115,7 +121,7 @@ fn main() {
     // Append window: from start until the append loop stopped issuing new frames.
     let elapsed_append = start.elapsed();
     // drain: wait for the archive to catch up, then stop it
-    while counters.durable.load_acquire() < counters.append.load_acquire() {
+    while cnc.counters().durable.load_acquire() < cnc.counters().append.load_acquire() {
         std::thread::yield_now();
     }
     // Durable window: from start until every appended byte is recorded+fsynced.
@@ -125,7 +131,7 @@ fn main() {
     agent.stop();
 
     let nblocks = blocks.load(Ordering::Relaxed);
-    let bytes = counters.durable.load_acquire();
+    let bytes = cnc.counters().durable.load_acquire();
     let framed = align_frame_len(HEADER_LEN + payload_len);
     let durable_rate = appended as f64 / elapsed_durable.as_secs_f64();
     let append_rate = appended as f64 / elapsed_append.as_secs_f64();

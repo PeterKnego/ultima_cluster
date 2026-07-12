@@ -426,20 +426,22 @@ impl Archive {
 mod tests {
     use super::*;
     use crate::buffer::{Appender, LogBuffer};
-    use crate::counters::LogCounters;
+    use crate::cnc::{CncMeta, CncPage};
     use crate::region::Region;
     use std::sync::Arc;
     use uc_protocol::v2::frame::read_header;
 
-    fn setup(cap: usize) -> (Arc<LogBuffer>, Arc<LogCounters>, tempfile::TempDir) {
+    fn setup(cap: usize) -> (Arc<LogBuffer>, Arc<CncPage>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let counters = Arc::new(LogCounters::new());
-        let b = Arc::new(LogBuffer::new(
-            Region::heap_zeroed(cap),
-            Arc::clone(&counters),
-            256,
-        ));
-        (b, counters, dir)
+        let cnc = CncPage::heap(&CncMeta {
+            node_id: 0,
+            instance_id: 0,
+            app_id: "test".into(),
+            buffer_bytes: cap as u64,
+            max_payload: 256,
+        });
+        let b = Arc::new(LogBuffer::new(Region::heap_zeroed(cap), Arc::clone(&cnc), 256));
+        (b, cnc, dir)
     }
 
     /// Small segments so parallel test journals don't exhaust quota'd tmpfs;
@@ -470,7 +472,7 @@ mod tests {
         }
         assert!(arch.do_work(&b).unwrap()); // one block: all 10 frames (960 B < 1 MiB)
         assert!(!arch.do_work(&b).unwrap()); // caught up
-        assert_eq!(c.durable.load_acquire(), 960);
+        assert_eq!(c.counters().durable.load_acquire(), 960);
         assert_eq!(arch.blocks_recorded(), 1);
     }
 
@@ -509,7 +511,7 @@ mod tests {
         let mut a = Appender::new(Arc::clone(&b), 1);
         a.append(1, 0, &[1u8; 64]).unwrap();
         arch.do_work(&b).unwrap();
-        assert_eq!(c.durable.load_acquire(), 96);
+        assert_eq!(c.counters().durable.load_acquire(), 96);
         // block 0 must already be durable (wait returns immediately)
         arch.journal().wait_durable(0).unwrap();
     }
@@ -530,7 +532,7 @@ mod tests {
         let arch = Archive::open(test_cfg(dir.path())).unwrap();
         assert_eq!(arch.recovered_position(), 480);
         let (b2, c2, _) = setup(1 << 16);
-        c2.prime(arch.recovered_position());
+        c2.counters().prime(arch.recovered_position());
         let mut arch = arch;
         let mut a2 = Appender::new(Arc::clone(&b2), 2);
         // Appender::new picks up position from the primed counters
@@ -538,7 +540,7 @@ mod tests {
         let pos = a2.append(1, 100, &[0u8; 64]).unwrap();
         assert_eq!(pos, 480);
         assert!(arch.do_work(&b2).unwrap());
-        assert_eq!(c2.durable.load_acquire(), 576);
+        assert_eq!(c2.counters().durable.load_acquire(), 576);
         let _ = (c, b);
     }
 
@@ -623,7 +625,7 @@ mod tests {
         assert_eq!(arch.recovered_position(), 480);
         // the archive keeps working after truncation: append + record resumes
         let (b2, c2, _) = setup(1 << 16);
-        c2.prime(480);
+        c2.counters().prime(480);
         let mut a2 = Appender::new(Arc::clone(&b2), 2);
         assert_eq!(a2.append(1, 100, &[9u8; 64]).unwrap(), 480);
         assert!(arch.do_work(&b2).unwrap());

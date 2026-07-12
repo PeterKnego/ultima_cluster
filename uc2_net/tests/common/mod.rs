@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 use uc2_log::agent::{AgentRunner, IdleStrategy};
 use uc2_log::archive::{Archive, ArchiveConfig, ReplayFrame};
 use uc2_log::buffer::{AppendError, Appender, LogBuffer};
-use uc2_log::counters::{LogCounters, PaddedAtomicU64};
+use uc2_log::cnc::{CncMeta, CncPage};
+use uc2_log::counters::PaddedAtomicU64;
 use uc2_log::region::Region;
 use uc2_net::fault::{FaultConfig, FaultSocket};
 use uc2_net::rebuild::NakConfig;
@@ -32,8 +33,14 @@ pub fn test_cfg(dir: &std::path::Path) -> ArchiveConfig {
 }
 
 pub fn buffer() -> Arc<LogBuffer> {
-    let counters = Arc::new(LogCounters::new());
-    Arc::new(LogBuffer::new(Region::heap_zeroed(CAP as usize), counters, MAX_PAYLOAD))
+    let cnc = CncPage::heap(&CncMeta {
+        node_id: 0,
+        instance_id: 0,
+        app_id: "test".into(),
+        buffer_bytes: CAP,
+        max_payload: MAX_PAYLOAD as u32,
+    });
+    Arc::new(LogBuffer::new(Region::heap_zeroed(CAP as usize), cnc, MAX_PAYLOAD))
 }
 
 pub struct Node {

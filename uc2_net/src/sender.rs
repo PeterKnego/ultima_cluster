@@ -679,7 +679,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
     use uc2_log::buffer::Appender;
-    use uc2_log::counters::LogCounters;
+    use uc2_log::cnc::{CncMeta, CncPage};
     use uc2_log::region::Region;
     use uc_protocol::v2::datagram::read_datagram_header;
     use uc_protocol::v2::frame::{
@@ -687,9 +687,18 @@ mod tests {
         OFF_TYPE,
     };
 
+    fn test_cnc(cap: u64) -> Arc<CncPage> {
+        CncPage::heap(&CncMeta {
+            node_id: 0,
+            instance_id: 0,
+            app_id: "test".into(),
+            buffer_bytes: cap,
+            max_payload: 256,
+        })
+    }
+
     fn buffer() -> Arc<LogBuffer> {
-        let counters = Arc::new(LogCounters::new());
-        Arc::new(LogBuffer::new(Region::heap_zeroed(1 << 16), counters, 256))
+        Arc::new(LogBuffer::new(Region::heap_zeroed(1 << 16), test_cnc(1 << 16), 256))
     }
 
     fn term_handle(t: u32) -> TermHandle {
@@ -1242,10 +1251,9 @@ mod tests {
     fn journal_replay_serves_deep_nak_with_identical_wire_format() {
         // leader with a TINY buffer (4096) laps it 3x while archiving; a NAK
         // for lap-0 positions must be served from the journal
-        let counters = Arc::new(uc2_log::counters::LogCounters::new());
         let b = Arc::new(LogBuffer::new(
             uc2_log::region::Region::heap_zeroed(4096),
-            counters,
+            test_cnc(4096),
             256,
         ));
         let dir = tempfile::tempdir().unwrap();
