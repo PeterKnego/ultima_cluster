@@ -301,7 +301,7 @@ mod tests {
         let local = (2u32 << 24) | (3 << 16);
         let newer_minor = (2u32 << 24) | (5 << 16);
         assert!(!version_compatible(local, newer_minor));
-        let other_major = (3u32 << 24) | (0 << 16);
+        let other_major = 3u32 << 24; // major 3, minor 0
         assert!(!version_compatible(local, other_major));
     }
 

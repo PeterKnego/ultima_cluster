@@ -45,7 +45,6 @@ pub(crate) struct ApplyState<S: StateMachine> {
     pub(crate) journal_dir: PathBuf,
     /// The node→service query ring consumer half. Drained by Task 11's
     /// `drain_queries`; held here so the apply thread owns it (single reader).
-    #[allow(dead_code)]
     pub(crate) svc_query: SpscConsumer,
     /// Observability: set while a batch has surfaced `Overrun` and the replay
     /// reconstruction is degrading the follower back onto the live buffer.
@@ -142,10 +141,63 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
     progressed
 }
 
-/// Task 11 fills this in (drain `svc_query`, answer linearizable reads onto the
-/// egress broadcast). No query producer is wired to `svc_query.ring` yet, so
-/// this is a no-op stub.
-fn drain_queries<S: StateMachine>(_st: &mut ApplyState<S>) {}
+/// Query bounded drain per apply cycle — the read-side analog of the apply
+/// batch cap, so a burst of queries can never starve the apply loop.
+const QUERY_DRAIN_PER_CYCLE: usize = 64;
+
+/// Drain `svc_query.ring` (bounded): decode each read's `expected_epoch` prefix,
+/// REFUSE any stamped for a superseded incarnation with `MSG_V2_RETRY`, and
+/// answer the rest by querying the SM and publishing `MSG_V2_RESPONSE`
+/// (`FLAG_V2_IS_QUERY`) onto the egress broadcast. Runs on the apply thread
+/// right after the batch loop, taking the SM lock the same way `apply` does
+/// (single-threaded — the read/write distinction a `RwLock` would give buys
+/// nothing here).
+///
+/// Payload contract (`ipc.rs`): `expected_epoch: u64 LE ++ query bytes`.
+/// `expected_epoch == 0` means "skip the check" — a snapshot read the node
+/// forwarded unconditionally. Both this RETRY site and the barrier's are
+/// PRE-query / side-effect-free: a query never mutates the SM (the
+/// cross-task RETRY-is-side-effect-free invariant, Task 10 review).
+fn drain_queries<S: StateMachine>(st: &mut ApplyState<S>) {
+    // This incarnation's epoch (fixed at attach; a newer incarnation would have
+    // bumped it — and would have joined this thread first, so a live mismatch
+    // means the read was routed for a different incarnation than the one now
+    // reading it: refuse it).
+    let my_epoch = st.cnc.service().service_epoch.load_acquire();
+    let mut buf = Vec::new();
+    for _ in 0..QUERY_DRAIN_PER_CYCLE {
+        match st.svc_query.try_read(&mut buf) {
+            Ok(Some(rec)) => {
+                // Payload = expected_epoch u64 LE ++ query bytes. A record too
+                // short to hold the prefix is a protocol violation — drop it (a
+                // query has no recovery contract; the client times out/retries).
+                if buf.len() < 8 {
+                    continue;
+                }
+                let expected_epoch = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                if expected_epoch != 0 && expected_epoch != my_epoch {
+                    // Stale incarnation (task14 TOCTOU close): the read was routed
+                    // for a superseded service epoch. Refuse with RETRY rather
+                    // than answer with THIS incarnation's (different) state. The
+                    // SM is NOT touched — side-effect-free.
+                    st.egress.publish_retry(rec.header_extra);
+                    continue;
+                }
+                let (q, _) = bincode::serde::decode_from_slice::<S::Query, _>(
+                    &buf[8..],
+                    bincode::config::standard(),
+                )
+                .expect("corrupt query frame (fail-stop)");
+                let qr = st.sm.lock().unwrap().query(q);
+                st.egress.publish_query_answer(rec.header_extra, &qr);
+            }
+            Ok(None) => break,
+            // Corrupt record (bad crc/magic): stop this cycle; the next retries
+            // at the same unread position.
+            Err(_) => break,
+        }
+    }
+}
 
 fn unix_ns() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)

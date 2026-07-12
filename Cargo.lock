@@ -2617,13 +2617,17 @@ dependencies = [
 name = "uc2_node"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "fs2",
  "rand 0.9.4",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
+ "uc2_client",
  "uc2_consensus",
  "uc2_log",
  "uc2_net",
+ "uc2_service",
  "uc_protocol",
  "ultima-journal",
 ]
@@ -2636,6 +2640,7 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.18",
+ "uc2_client",
  "uc2_log",
  "uc2_net",
  "uc2_node",

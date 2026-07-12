@@ -25,12 +25,12 @@ use uc2_log::buffer::LogBuffer;
 use uc2_log::writer::PositionedWriter;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA,
-    DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_STATUS,
-    DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN,
-    NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody, STATUS_BODY_LEN, StatusBody, TermMapEntryWire,
-    VOTE_BODY_LEN, VoteBody, read_datagram_header, read_nak_body, read_request_vote_body,
-    read_status_body, read_term_map_body, read_vote_body, write_datagram_header, write_nak_body,
-    write_status_body,
+    DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK,
+    DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
+    MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody,
+    STATUS_BODY_LEN, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_datagram_header,
+    read_nak_body, read_read_probe_body, read_request_vote_body, read_status_body,
+    read_term_map_body, read_vote_body, write_datagram_header, write_nak_body, write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
 
@@ -41,7 +41,7 @@ use crate::sender::CtrlMsg;
 
 /// Consensus-plane events demuxed off the shared UDP socket and routed to the
 /// consensus agent (Task 8) over the [`FollowerReceiver::new`] constructor's
-/// mandatory route. Kinds 5–9 forward RAW — carrying their own term so the
+/// mandatory route. Kinds 5–11 forward RAW — carrying their own term so the
 /// state machine, not the data plane, does term filtering and adoption (a
 /// higher-term `RequestVote` MUST reach the SM). `LeaderActivity` is the data
 /// plane's rate-limited liveness signal: current-term DATA/HEARTBEAT was seen
@@ -53,6 +53,16 @@ pub enum NetEvent {
     RequestVote { from: SocketAddr, body: RequestVoteBody },
     Vote { from: SocketAddr, body: VoteBody },
     TermMap { from: SocketAddr, term: u32, entries: Vec<TermMapEntryWire> },
+    /// Read-barrier probe (M5 §7), leader → follower. `from` is the leader's
+    /// node id (from the body — the reply is addressed by it), `term` is the
+    /// datagram HEADER term the follower must match to ACK (the stale-leader
+    /// filter). Routed RAW like the other consensus kinds.
+    ReadProbe { nonce: u64, from: u32, term: u32 },
+    /// Read-barrier ack, follower → leader. `from` is the acking follower's node
+    /// id (from the body); the leader counts distinct ackers per nonce. No term
+    /// field: the nonce is unique to one leader's read round, so a matching
+    /// pending nonce already scopes the ack to this leader.
+    ReadProbeAck { nonce: u64, from: u32 },
     /// Any current-term leader traffic (data/heartbeat) seen — liveness.
     LeaderActivity { term: u32 },
 }
@@ -69,14 +79,16 @@ impl NetEvent {
             NetEvent::Vote { .. } => 3,
             NetEvent::TermMap { .. } => 4,
             NetEvent::LeaderActivity { .. } => 5,
+            NetEvent::ReadProbe { .. } => 6,
+            NetEvent::ReadProbeAck { .. } => 7,
         }
     }
 }
 
 /// Number of [`NetEvent`] kinds (the width of the per-kind drop counters).
-pub const NET_EVENT_KINDS: usize = 6;
+pub const NET_EVENT_KINDS: usize = 8;
 
-/// Parse a consensus-plane datagram (kinds 5–9) into a [`NetEvent`], RAW — no
+/// Parse a consensus-plane datagram (kinds 5–11) into a [`NetEvent`], RAW — no
 /// term filter (the SM adopts higher terms). `from` is the datagram's source
 /// address (Report/RequestVote/Vote address their reply by it). Returns `None`
 /// for a malformed body (too short, or a term-map that fails its own checks);
@@ -106,11 +118,21 @@ fn consensus_event(h: &DatagramHeader, d: &[u8], from: SocketAddr) -> Option<Net
                 entries: out[..count].to_vec(),
             })
         }
+        DGRAM_KIND_READ_PROBE => {
+            // Carry the datagram HEADER term: the follower ACKs only if it still
+            // equals its own current term (the node-side stale-leader filter).
+            let b = read_read_probe_body(body)?;
+            Some(NetEvent::ReadProbe { nonce: b.nonce, from: b.from, term: h.leadership_term_id })
+        }
+        DGRAM_KIND_READ_PROBE_ACK => {
+            let b = read_read_probe_body(body)?;
+            Some(NetEvent::ReadProbeAck { nonce: b.nonce, from: b.from })
+        }
         _ => None,
     }
 }
 
-/// True iff `kind` is a consensus-plane datagram (kinds 5–9) — routed RAW to
+/// True iff `kind` is a consensus-plane datagram (kinds 5–11) — routed RAW to
 /// the consensus agent in node mode, bypassing the data-plane term filter.
 #[inline]
 fn is_consensus_kind(kind: u8) -> bool {
@@ -121,6 +143,8 @@ fn is_consensus_kind(kind: u8) -> bool {
             | DGRAM_KIND_REQUEST_VOTE
             | DGRAM_KIND_VOTE
             | DGRAM_KIND_TERM_MAP
+            | DGRAM_KIND_READ_PROBE
+            | DGRAM_KIND_READ_PROBE_ACK
     )
 }
 
@@ -194,7 +218,7 @@ pub struct FollowerStats {
     /// DATA dropped because the intake gate was CLOSED (M4 reconciliation
     /// window — the consensus agent holds it shut; see `set_intake_gate`).
     pub dropped_gated: AtomicU64,
-    /// Consensus events (kinds 5–9) dropped because the consensus route channel
+    /// Consensus events (kinds 5–11) dropped because the consensus route channel
     /// was FULL (M4 node composition — the T7 observability concern), counted
     /// PER KIND (indexed by [`NetEvent::kind_idx`]) so a wedge is attributable to
     /// the specific traffic class starving. Safe: votes re-fire on the election
@@ -234,7 +258,7 @@ pub struct FollowerReceiver {
     /// writer; the data path only loads it (`Relaxed`) to term-filter DATA/
     /// HEARTBEAT and to stamp its own NAK/STATUS/AppendPosition datagrams.
     term: TermHandle,
-    /// Consensus route (M4): kinds 5–9 are forwarded RAW to the consensus
+    /// Consensus route (M4): kinds 5–11 are forwarded RAW to the consensus
     /// agent (bypassing the term filter — the SM adopts higher terms). The
     /// consensus agent is the sole writer of the commit counter; this receiver
     /// never stores commit locally (M4 carry #5 removed the M3 local
@@ -255,7 +279,7 @@ pub struct FollowerReceiver {
 }
 
 impl FollowerReceiver {
-    /// `route` carries consensus datagrams (kinds 5–9, spec §3.1) RAW to the
+    /// `route` carries consensus datagrams (kinds 5–11, spec §3.1) RAW to the
     /// consensus agent (no term filter — the SM adopts higher terms; a
     /// full/disconnected channel drops harmlessly — votes re-fire on the
     /// election timeout, gossip/reports re-send on their floors). DATA/
@@ -428,7 +452,7 @@ impl FollowerReceiver {
             return;
         }
         let h = read_datagram_header(d);
-        // Consensus kinds (5–9) are forwarded RAW to the consensus agent — no
+        // Consensus kinds (5–11) are forwarded RAW to the consensus agent — no
         // data-plane term filter, since a higher-term RequestVote MUST reach
         // the SM. `DGRAM_KIND_COMMIT_POSITION` routes as `CommitGossip`; the
         // consensus agent is the sole commit-counter writer (M4 carry #5
@@ -1304,6 +1328,50 @@ mod tests {
         }
         // the local commit counter is never written — the consensus agent owns it
         assert_eq!(b.counters().commit.load_acquire(), 0, "receiver stored commit locally");
+    }
+
+    /// Read-barrier kinds 10/11 route RAW to the consensus agent, carrying the
+    /// probe's HEADER term (the node-side stale-leader filter reads it) and the
+    /// body's `from` node id. Delivered even when the datagram term differs from
+    /// the receiver's own — term adjudication is the SM's job, not the data
+    /// plane's (a probe/ack must always reach the barrier).
+    #[test]
+    fn read_probe_kinds_route_raw_with_header_term() {
+        use uc_protocol::v2::datagram::{
+            write_read_probe_body, ReadProbeBody, READ_PROBE_BODY_LEN,
+        };
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let (tx, rx) = mpsc::sync_channel::<NetEvent>(16);
+        let mut r = follower_routed(&b, leader.addr(), tx);
+        let to = r.local_addr();
+
+        let mut body = vec![0u8; READ_PROBE_BODY_LEN];
+        write_read_probe_body(&mut body, &ReadProbeBody { nonce: 0xABCD, from: 2 });
+        // Probe at a term ABOVE the receiver's — must NOT be term-filtered.
+        leader.send(to, DGRAM_KIND_READ_PROBE, 0, TERM + 4, &body);
+        write_read_probe_body(&mut body, &ReadProbeBody { nonce: 0xABCD, from: 1 });
+        leader.send(to, DGRAM_KIND_READ_PROBE_ACK, 0, TERM, &body);
+
+        let (mut saw_probe, mut saw_ack) = (false, false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(saw_probe && saw_ack) {
+            assert!(Instant::now() < deadline, "read-barrier events never routed");
+            r.do_work();
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    NetEvent::ReadProbe { nonce, from, term } => {
+                        assert_eq!((nonce, from, term), (0xABCD, 2, TERM + 4));
+                        saw_probe = true;
+                    }
+                    NetEvent::ReadProbeAck { nonce, from } => {
+                        assert_eq!((nonce, from), (0xABCD, 1));
+                        saw_ack = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// The intake gate CLOSED drops DATA (`dropped_gated`) and suppresses

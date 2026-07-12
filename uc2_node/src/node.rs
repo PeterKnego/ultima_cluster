@@ -22,17 +22,24 @@ use uc2_net::TermHandle;
 use uc2_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc2_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent};
 use uc2_net::sender::{CtrlMsg, Sender, SenderConfig};
-use uc_protocol::ring::{BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, SpscRing};
+use uc_protocol::ring::{
+    BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, SpscProducer, SpscRing,
+};
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
-use uc_protocol::v2::ipc::{MSG_V2_NOT_LEADER, client_from_extra, extra_client};
+use uc_protocol::v2::ipc::{
+    FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SVC_QUERY, client_from_extra,
+    extra_client,
+};
 
 use crate::ipc::InstanceDir;
 use uc2_log::buffer::FrameRead;
 use uc_protocol::v2::datagram::{
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_TERM_MAP,
-    DGRAM_KIND_VOTE, DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, REQUEST_VOTE_BODY_LEN,
-    RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire, VOTE_BODY_LEN,
-    VoteBody, write_datagram_header, write_request_vote_body, write_term_map_body, write_vote_body,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_READ_PROBE,
+    DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE,
+    DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN,
+    ReadProbeBody, RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire,
+    VOTE_BODY_LEN, VoteBody, write_datagram_header, write_read_probe_body, write_request_vote_body,
+    write_term_map_body, write_vote_body,
 };
 
 /// Single-slot truncation ack. One truncation is in flight at a time (the SM
@@ -96,6 +103,46 @@ const NET_DRAIN_PER_CYCLE: usize = 4096;
 const INGRESS_PER_CYCLE: usize = 256;
 /// NetEvent channel depth (T7 observability: a full channel counts a drop).
 const NET_EVENT_CAPACITY: usize = 4096;
+/// Query records drained per duty cycle (bounded work, like the ingress ring).
+const QUERY_DRAIN_PER_CYCLE: usize = 64;
+/// A linearizable read's confirmation deadline (spec §7): if the read-index
+/// quorum + service catch-up do not complete within this, the read is answered
+/// `MSG_V2_RETRY` (side-effect-free) and dropped. Same order as the election
+/// timeout — a partitioned-away leader fails its reads within ~1s.
+const READ_BARRIER_TIMEOUT_NS: u64 = 1_000_000_000;
+
+/// Phase of an in-flight linearizable read (the ReadIndex barrier state
+/// machine, spec §7 / v1 task14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadPhase {
+    /// Collecting distinct READ_PROBE_ACKs toward a quorum (the read-index
+    /// confirmation that this leader still leads — the no-stale-read guarantee).
+    AwaitQuorum,
+    /// Quorum confirmed; waiting for the service to apply through `commit_at`.
+    AwaitApplied,
+}
+
+/// One in-flight linearizable read, parked on the consensus agent between the
+/// client's `query.ring` submission and the moment it is forwarded to the
+/// service (or retried). The read index is `commit_at`, captured at admission.
+struct PendingRead {
+    client_id: u32,
+    local_seq: u32,
+    /// The raw query bytes (forwarded verbatim after `expected_epoch`).
+    query: Vec<u8>,
+    /// Unique per read; scopes the READ_PROBE round so acks attribute correctly.
+    nonce: u64,
+    /// Read index: the commit position at admission. The read may only be
+    /// answered once the service has applied at least this far.
+    commit_at: u64,
+    /// Distinct nodes that have confirmed this read's index (self seeded).
+    ackers: Vec<NodeId>,
+    /// Majority of the membership — the ack count that confirms the read index.
+    quorum: usize,
+    /// Absolute `now_ns` deadline; past it the read is retried.
+    deadline_ns: u64,
+    phase: ReadPhase,
+}
 
 /// The ingress admission door (Task 7, spec §7): open while the unconfirmed
 /// backlog `append - commit` is within `budget`. A closed door leaves records
@@ -109,17 +156,17 @@ fn admission_open(append: u64, commit: u64, budget: u64) -> bool {
     append.saturating_sub(commit) <= budget
 }
 
-/// The node's shared-memory IPC rings not yet wired to an agent (spec §7),
-/// created fresh at every boot. Held for the node's life so the mmap'd files
-/// stay live for attaching clients/service. `ingress` (MPSC) and `egress_node`
-/// (broadcast) are split at boot instead: their consumer/producer halves are
-/// handed to the consensus agent (Task 7); the other halves (not needed on
-/// the node side — attaching clients open the files themselves) are dropped
-/// in `create_rings`. Wired to dispatch agents in later M5 tasks.
+/// The node's shared-memory IPC rings whose live halves are not otherwise
+/// held, created fresh at every boot and kept for the node's life so the mmap'd
+/// file stays live for the attaching service. `ingress`/`egress_node` (Task 7)
+/// and now `query`/`svc_query` (Task 11) are split at boot: their node-side
+/// halves (the ingress + query CONSUMERs, the egress_node + svc_query
+/// PRODUCERs) are handed to the consensus agent, and the counterpart halves —
+/// which attaching clients/service open the files for themselves — are dropped
+/// in `create_rings`. `egress_service` is the service's producer ring; the node
+/// only creates + retains the file so the service can open it.
 #[allow(dead_code)]
 struct Rings {
-    query: MpscRing,
-    svc_query: SpscRing,
     egress_service: BroadcastRing,
 }
 
@@ -234,7 +281,7 @@ impl Node {
         // prior attachment is invalidated by the new instance_id anyway).
         // `ingress`/`egress_node` are pre-split: the consensus agent is the
         // sole owner of the consumer/producer half it drives (Task 7).
-        let (rings, ingress_ring, egress_node) = create_rings(&instance)?;
+        let (rings, ingress_ring, egress_node, query_ring, svc_query) = create_rings(&instance)?;
 
         // Election SM over the recovered credentials.
         let members_ids: Vec<NodeId> = cfg.members.iter().map(|(id, _)| *id).collect();
@@ -366,6 +413,10 @@ impl Node {
             pending_ingress: None,
             ingress_ring,
             egress_node,
+            query_ring,
+            svc_query,
+            pending_reads: Vec::new(),
+            next_nonce: 0,
             admission_bytes: cfg.admission_bytes,
             pending_ring_ingress: None,
             sock: cons_sock,
@@ -489,8 +540,8 @@ impl Node {
     }
 
     /// Per-kind consensus-event drop counts, indexed by
-    /// [`uc2_net::receiver::NetEvent::kind_idx`]
-    /// (Report, CommitGossip, RequestVote, Vote, TermMap, LeaderActivity).
+    /// [`uc2_net::receiver::NetEvent::kind_idx`] (Report, CommitGossip,
+    /// RequestVote, Vote, TermMap, LeaderActivity, ReadProbe, ReadProbeAck).
     pub fn net_event_drops_by_kind(&self) -> [u64; uc2_net::receiver::NET_EVENT_KINDS] {
         let mut out = [0u64; uc2_net::receiver::NET_EVENT_KINDS];
         for (o, c) in out.iter_mut().zip(self.route_drops.net_drops.iter()) {
@@ -533,9 +584,24 @@ struct Consensus {
     /// thread is its sole reader.
     ingress_ring: MpscConsumer,
     /// The node egress broadcast ring's producer half (Task 7) — the
-    /// consensus agent is this ring's single writer (currently only
-    /// `MSG_V2_NOT_LEADER`; later tasks add `MSG_V2_RETRY`).
+    /// consensus agent is this ring's single writer (`MSG_V2_NOT_LEADER` for a
+    /// non-leader submit/read, and `MSG_V2_RETRY` when a linearizable read's
+    /// barrier deadline lapses or leadership is lost — Task 11).
     egress_node: BroadcastProducer,
+    /// The client query ring's consumer half (Task 11, MPSC) — the consensus
+    /// thread is its sole reader (`MSG_V2_QUERY`; `flags` bit 0 = linearizable).
+    query_ring: MpscConsumer,
+    /// The node→service query ring's producer half (Task 11, SPSC) — the
+    /// consensus agent is its single writer (`MSG_V2_SVC_QUERY`; payload =
+    /// `expected_epoch: u64 LE ++ query bytes`).
+    svc_query: SpscProducer,
+    /// In-flight linearizable reads parked between admission and forward/retry
+    /// (the ReadIndex barrier state machine). Small — one entry per outstanding
+    /// client read; walked every duty cycle (bounded by outstanding reads).
+    pending_reads: Vec<PendingRead>,
+    /// Monotonic per-node read nonce (never reset — uniquely scopes each read's
+    /// READ_PROBE round so acks attribute to the right pending read).
+    next_nonce: u64,
     /// Mirror of `NodeConfig::admission_bytes` (the `append - commit` door
     /// budget for the ring drain).
     admission_bytes: u64,
@@ -620,6 +686,17 @@ impl Consensus {
         // role — bounded by `INGRESS_PER_CYCLE` either way so a saturated
         // ring cannot starve the rest of the duty cycle.
         did |= self.drain_ingress_ring(serving);
+
+        // 3c. Drain the client query ring (Task 11): snapshot reads forward to
+        // the service immediately (epoch check skipped); linearizable reads open
+        // a ReadIndex barrier (nonce'd READ_PROBE to every follower) or are
+        // redirected `MSG_V2_NOT_LEADER` while not serving. Bounded per cycle.
+        did |= self.drain_query_ring();
+
+        // 3d. Advance in-flight linearizable reads: quorum acks arrive via
+        // `feed_net`; once quorum + service catch-up hold, forward the read to
+        // the service; on deadline or lost leadership, answer `MSG_V2_RETRY`.
+        did |= self.advance_pending_reads();
 
         // 4. Feed the tick — the ONLY place real time enters the SM.
         let now = self.now_ns();
@@ -790,6 +867,202 @@ impl Consensus {
         let _ = self.egress_node.write(MSG_V2_NOT_LEADER, 0, extra, &leader_hint.to_le_bytes());
     }
 
+    /// Answer a linearizable read with `MSG_V2_RETRY` on the node egress. Emitted
+    /// ONLY on a barrier deadline or a leadership loss — BOTH pre-answer and
+    /// side-effect-free: a query never mutates the SM, and this read is dropped
+    /// before it is ever forwarded, so the client may safely re-issue (the
+    /// cross-task RETRY-is-side-effect-free invariant, Task 10 review).
+    fn send_retry(&mut self, client_id: u32, local_seq: u32) {
+        let extra = extra_client(client_id, local_seq);
+        let _ = self.egress_node.write(MSG_V2_RETRY, 0, extra, &[]);
+    }
+
+    /// Forward a barrier-passed (or snapshot) read to the service on
+    /// `svc_query.ring`: payload = `expected_epoch: u64 LE ++ query bytes`,
+    /// `header_extra` echoing the client identity so the service's answer routes
+    /// back. `expected_epoch == 0` means "skip the epoch check" (snapshot reads).
+    /// Returns `false` if the ring is momentarily full (the caller retries).
+    fn forward_svc_query(
+        &mut self,
+        client_id: u32,
+        local_seq: u32,
+        expected_epoch: u64,
+        query: &[u8],
+    ) -> bool {
+        let mut payload = Vec::with_capacity(8 + query.len());
+        payload.extend_from_slice(&expected_epoch.to_le_bytes());
+        payload.extend_from_slice(query);
+        let extra = extra_client(client_id, local_seq);
+        self.svc_query.try_write(MSG_V2_SVC_QUERY, 0, extra, &payload).is_ok()
+    }
+
+    /// Send a nonce'd READ_PROBE to every follower over the consensus socket,
+    /// stamped with our current term (a follower acks only a probe whose term
+    /// still equals its own — the no-stale-read filter lives on the follower).
+    fn send_read_probe(&mut self, nonce: u64) {
+        let term = self.sm.current_term();
+        let mut body = [0u8; READ_PROBE_BODY_LEN];
+        write_read_probe_body(&mut body, &ReadProbeBody { nonce, from: self.id });
+        for id in self.peers.clone() {
+            let addr = self.id_to_addr[&id];
+            self.send(addr, DGRAM_KIND_READ_PROBE, 0, term, &body);
+        }
+    }
+
+    /// Follower side of a READ_PROBE: membership-check the probing leader, then
+    /// reply a READ_PROBE_ACK **iff** the datagram's term still equals our
+    /// current term. A stale leader's probe (a lower/older term) dies here — this
+    /// is the teeth of the no-stale-read theorem: a deposed leader can never
+    /// collect the read quorum, so it can never certify a linearizable read.
+    fn on_read_probe(&mut self, nonce: u64, from: NodeId, term: u32) {
+        let Some(&addr) = self.id_to_addr.get(&from) else { return };
+        if term != self.sm.current_term() {
+            return;
+        }
+        let mut body = [0u8; READ_PROBE_BODY_LEN];
+        write_read_probe_body(&mut body, &ReadProbeBody { nonce, from: self.id });
+        self.send(addr, DGRAM_KIND_READ_PROBE_ACK, 0, self.sm.current_term(), &body);
+    }
+
+    /// Leader side of a READ_PROBE_ACK: membership-check the acker, match the
+    /// pending read by nonce, and count DISTINCT ackers (a duplicate ack from the
+    /// same node does not advance the count). On reaching quorum the read moves
+    /// to `AwaitApplied`.
+    fn on_read_probe_ack(&mut self, nonce: u64, from: NodeId) {
+        if !self.id_to_addr.contains_key(&from) {
+            return;
+        }
+        for r in self.pending_reads.iter_mut() {
+            if r.nonce == nonce && r.phase == ReadPhase::AwaitQuorum {
+                if !r.ackers.contains(&from) {
+                    r.ackers.push(from);
+                }
+                if r.ackers.len() >= r.quorum {
+                    r.phase = ReadPhase::AwaitApplied;
+                }
+                return;
+            }
+        }
+    }
+
+    /// Drain the client query ring (bounded). Snapshot reads forward straight to
+    /// the service; linearizable reads open a ReadIndex barrier (or redirect
+    /// `MSG_V2_NOT_LEADER` while not serving).
+    fn drain_query_ring(&mut self) -> bool {
+        let mut did = false;
+        for _ in 0..QUERY_DRAIN_PER_CYCLE {
+            let mut buf = Vec::new();
+            match self.query_ring.try_read(&mut buf) {
+                Ok(Some(rec)) => {
+                    did = true;
+                    let (client_id, local_seq) = client_from_extra(rec.header_extra);
+                    if rec.flags & FLAG_V2_LINEARIZABLE == 0 {
+                        // Snapshot: forward immediately, epoch check skipped (0).
+                        self.forward_svc_query(client_id, local_seq, 0, &buf);
+                        continue;
+                    }
+                    // Linearizable: only a serving leader can confirm a read.
+                    if !self.sm.can_serve() {
+                        self.send_not_leader(client_id, local_seq);
+                        continue;
+                    }
+                    let n = self.peers.len() + 1;
+                    let quorum = n / 2 + 1;
+                    let nonce = self.next_nonce;
+                    self.next_nonce += 1;
+                    let commit_at = self.cnc.counters().commit.load_acquire();
+                    let deadline_ns = self.now_ns() + READ_BARRIER_TIMEOUT_NS;
+                    let mut ackers = Vec::with_capacity(n);
+                    ackers.push(self.id); // self-ack (acks: 1)
+                    // Single-node (quorum 1): skip straight to AwaitApplied.
+                    let phase = if ackers.len() >= quorum {
+                        ReadPhase::AwaitApplied
+                    } else {
+                        ReadPhase::AwaitQuorum
+                    };
+                    let need_probe = phase == ReadPhase::AwaitQuorum;
+                    self.pending_reads.push(PendingRead {
+                        client_id,
+                        local_seq,
+                        query: buf,
+                        nonce,
+                        commit_at,
+                        ackers,
+                        quorum,
+                        deadline_ns,
+                        phase,
+                    });
+                    if need_probe {
+                        self.send_read_probe(nonce);
+                    }
+                }
+                Ok(None) => break,
+                // Corrupt record: stop this cycle (retried at the same unread
+                // position next cycle) — same posture as the ingress drain.
+                Err(_) => break,
+            }
+        }
+        did
+    }
+
+    /// Advance every in-flight linearizable read one step. A read past its
+    /// deadline, or held while leadership was lost, is answered `MSG_V2_RETRY`
+    /// and dropped. An `AwaitApplied` read whose service has caught up to
+    /// `commit_at` — verified with the capture-recheck epoch bracket (task14
+    /// TOCTOU close) — is forwarded to the service and dropped.
+    fn advance_pending_reads(&mut self) -> bool {
+        if self.pending_reads.is_empty() {
+            return false;
+        }
+        let now = self.now_ns();
+        let can_serve = self.sm.can_serve();
+        let mut did = false;
+        let mut i = 0;
+        while i < self.pending_reads.len() {
+            // Deadline passed OR leadership lost → RETRY (side-effect-free),
+            // drop. `swap_remove` reorders harmlessly (read order is irrelevant).
+            if now >= self.pending_reads[i].deadline_ns || !can_serve {
+                let r = self.pending_reads.swap_remove(i);
+                self.send_retry(r.client_id, r.local_seq);
+                did = true;
+                continue;
+            }
+            if self.pending_reads[i].phase == ReadPhase::AwaitApplied {
+                let commit_at = self.pending_reads[i].commit_at;
+                // Capture-recheck bracket (verbatim per the brief): capture the
+                // epoch `e`, require the service applied through `commit_at`, then
+                // require the epoch is STILL `e`. A service restart mid-check
+                // moves the epoch and fails the recheck — so a read is never
+                // forwarded across a service incarnation boundary.
+                let ready = {
+                    let svc = self.cnc.service();
+                    let e = svc.service_epoch.load_acquire();
+                    let applied = svc.service_applied.load_acquire();
+                    if applied >= commit_at && svc.service_epoch.load_acquire() == e {
+                        Some(e)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(e) = ready {
+                    let client_id = self.pending_reads[i].client_id;
+                    let local_seq = self.pending_reads[i].local_seq;
+                    let query = std::mem::take(&mut self.pending_reads[i].query);
+                    if self.forward_svc_query(client_id, local_seq, e, &query) {
+                        self.pending_reads.swap_remove(i);
+                        did = true;
+                        continue;
+                    }
+                    // svc_query ring momentarily full: restore the query bytes and
+                    // retry next cycle (re-capturing the epoch bracket then).
+                    self.pending_reads[i].query = query;
+                }
+            }
+            i += 1;
+        }
+        did
+    }
+
     /// Translate a wire NetEvent into an SM event and feed it. Unknown source
     /// addresses (not a configured member) are dropped.
     fn feed_net(&mut self, ev: NetEvent) {
@@ -847,6 +1120,18 @@ impl Consensus {
                     term,
                     entries: entries.iter().map(|e| (e.term, e.base)).collect(),
                 }
+            }
+            NetEvent::ReadProbe { nonce, from, term } => {
+                // Follower side: reply an ack iff still our term (handled inline,
+                // never an SM event — the barrier is node-side only).
+                self.on_read_probe(nonce, from, term);
+                return;
+            }
+            NetEvent::ReadProbeAck { nonce, from } => {
+                // Leader side: count a distinct acker toward a pending read's
+                // quorum (node-side only, never an SM event).
+                self.on_read_probe_ack(nonce, from);
+                return;
             }
             NetEvent::LeaderActivity { term } => Event::LeaderSeen { term },
         };
@@ -1122,13 +1407,17 @@ fn open_or_create_buffer(
 /// file first — a prior instance's attachment is invalidated by the new
 /// instance_id anyway). Sizes are fixed by the spec: ingress 4 MiB, query
 /// 1 MiB, svc_query 1 MiB, both broadcasts 4 MiB; 64 KiB max message each.
-/// Returns the not-yet-wired `Rings`, plus the ingress ring's consumer half
-/// and the node egress ring's producer half — the two halves the consensus
-/// agent drives (Task 7). Their counterpart halves (an ingress producer, an
-/// egress_node consumer) are dropped here: the node itself never produces
-/// into ingress or consumes from egress_node, and attaching clients open the
-/// files themselves to get their own halves.
-fn create_rings(dir: &InstanceDir) -> io::Result<(Rings, MpscConsumer, BroadcastProducer)> {
+/// Returns the retained `Rings`, plus the four node-side ring halves the
+/// consensus agent drives: the ingress ring's CONSUMER + the node egress ring's
+/// PRODUCER (Task 7), and the query ring's CONSUMER + the svc_query ring's
+/// PRODUCER (Task 11 — the node reads client queries and forwards barrier-passed
+/// reads to the service). Every counterpart half (the ingress + query
+/// producers, the egress_node consumer, the svc_query consumer) is dropped
+/// here: the node never uses them, and attaching clients/service open the files
+/// themselves to get their own halves.
+fn create_rings(
+    dir: &InstanceDir,
+) -> io::Result<(Rings, MpscConsumer, BroadcastProducer, MpscConsumer, SpscProducer)> {
     const MIB: u64 = 1 << 20;
     const MAX_MSG: u32 = 64 << 10;
     for p in [
@@ -1144,15 +1433,21 @@ fn create_rings(dir: &InstanceDir) -> io::Result<(Rings, MpscConsumer, Broadcast
     let (_ingress_producer, ingress_consumer) = ingress.into_split();
     let egress_node = BroadcastRing::create(&dir.egress_node(), 4 * MIB, MAX_MSG).map_err(to_io)?;
     let egress_node_producer = egress_node.producer();
+    // Query ring (clients → node, MPSC): keep the node's CONSUMER half.
+    let query = MpscRing::create(&dir.query_ring(), MIB, MAX_MSG).map_err(to_io)?;
+    let (_query_producer, query_consumer) = query.into_split();
+    // svc_query ring (node → service, SPSC): keep the node's PRODUCER half.
+    let svc_query = SpscRing::create(&dir.svc_query_ring(), MIB, MAX_MSG).map_err(to_io)?;
+    let (svc_query_producer, _svc_query_consumer) = svc_query.into_split();
     Ok((
         Rings {
-            query: MpscRing::create(&dir.query_ring(), MIB, MAX_MSG).map_err(to_io)?,
-            svc_query: SpscRing::create(&dir.svc_query_ring(), MIB, MAX_MSG).map_err(to_io)?,
             egress_service: BroadcastRing::create(&dir.egress_service(), 4 * MIB, MAX_MSG)
                 .map_err(to_io)?,
         },
         ingress_consumer,
         egress_node_producer,
+        query_consumer,
+        svc_query_producer,
     ))
 }
 
@@ -1327,6 +1622,10 @@ mod tests {
             BroadcastRing::create(&dir.path().join("egress_node.broadcast"), 4096, 1024)
                 .unwrap()
                 .producer();
+        let (_query_producer, query_ring) =
+            MpscRing::create(&dir.path().join("query.ring"), 4096, 1024).unwrap().into_split();
+        let (svc_query, _svc_query_consumer) =
+            SpscRing::create(&dir.path().join("svc_query.ring"), 4096, 1024).unwrap().into_split();
 
         let cons = Consensus {
             id: 1,
@@ -1339,6 +1638,10 @@ mod tests {
             pending_ingress: None,
             ingress_ring,
             egress_node,
+            query_ring,
+            svc_query,
+            pending_reads: Vec::new(),
+            next_nonce: 0,
             admission_bytes: 256 * 1024,
             pending_ring_ingress: None,
             sock,
@@ -1527,5 +1830,106 @@ mod tests {
         // Zero budget: only a perfectly caught-up door is open.
         assert!(admission_open(50, 50, 0));
         assert!(!admission_open(51, 50, 0));
+    }
+
+    /// Drive the harness node (id 1, boot term 2) to a SERVING leader of term 3:
+    /// election timeout → candidate; one peer grant → BecomeLeader (NewTerm frame
+    /// at [6016, 6048)); then advance commit past the frame via a follower's
+    /// durable Report, which opens `can_serve`. Returns the append frontier 6048.
+    fn drive_to_serving_leader(h: &mut Harness) -> u64 {
+        h.cons.feed(Event::Tick { now_ns: 301 });
+        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+        assert!(h.cons.leader_flag.load(Ordering::Acquire), "election did not complete");
+        let append = h.cons.cnc.counters().append.load_acquire();
+        assert_eq!(append, 6048);
+        h.cons.feed(Event::DurableAdvanced { durable: append });
+        let addr0: SocketAddr = "127.0.0.1:9100".parse().unwrap(); // member 0
+        h.cons.feed_net(NetEvent::Report { from: addr0, term: 3, durable: append });
+        assert!(h.cons.sm.can_serve(), "commit did not open the serving gate");
+        append
+    }
+
+    /// Push a linearizable read into the barrier for the harness node.
+    fn mk_read(cons: &Consensus, commit_at: u64, quorum: usize, deadline_ns: u64) -> PendingRead {
+        PendingRead {
+            client_id: 7,
+            local_seq: 1,
+            query: Vec::new(),
+            nonce: 42,
+            commit_at,
+            ackers: vec![cons.id], // self-ack (acks: 1)
+            quorum,
+            deadline_ns,
+            phase: ReadPhase::AwaitQuorum,
+        }
+    }
+
+    /// Task 11 barrier: READ_PROBE_ACKs count DISTINCT ackers (a duplicate from
+    /// the same node does not advance), a non-member ack is ignored, quorum flips
+    /// the read to `AwaitApplied`, and the capture-recheck bracket forwards to the
+    /// service ONLY once `service_applied >= commit_at` (with the epoch stable).
+    #[test]
+    fn barrier_counts_distinct_ackers_then_forwards_on_service_catchup() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+
+        // A read requiring a 3-way quorum, with a read index above the (zero)
+        // service_applied so the forward waits for catch-up.
+        let far = h.cons.now_ns() + 10_000_000_000;
+        let read = mk_read(&h.cons, /*commit_at*/ 6048, /*quorum*/ 3, far);
+        h.cons.pending_reads.push(read);
+
+        // A non-member ack (id 99 is not in [0,1,2]) is dropped by the
+        // membership check.
+        h.cons.on_read_probe_ack(42, 99);
+        assert_eq!(h.cons.pending_reads[0].ackers, vec![1]);
+
+        // Distinct acker 0, then a DUPLICATE 0 that must not advance the count.
+        h.cons.on_read_probe_ack(42, 0);
+        h.cons.on_read_probe_ack(42, 0);
+        assert_eq!(h.cons.pending_reads[0].ackers, vec![1, 0]);
+        assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitQuorum);
+
+        // The second distinct acker reaches quorum 3 → AwaitApplied.
+        h.cons.on_read_probe_ack(42, 2);
+        assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitApplied);
+
+        // Service not yet caught up (applied 0 < commit_at 6048): the read stays
+        // parked, never forwarded.
+        assert!(!h.cons.advance_pending_reads());
+        assert_eq!(h.cons.pending_reads.len(), 1);
+
+        // Service catches up AND the epoch is stable across the capture-recheck
+        // → forwarded to svc_query and dropped from the barrier.
+        h.cons.cnc.service().service_applied.store_release(6048);
+        assert!(h.cons.advance_pending_reads());
+        assert!(h.cons.pending_reads.is_empty(), "caught-up read must forward and drop");
+    }
+
+    /// Task 11 barrier: a read past its deadline is answered `MSG_V2_RETRY`
+    /// (side-effect-free) and dropped, even while still serving.
+    #[test]
+    fn barrier_retries_a_read_past_its_deadline() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        // deadline_ns = 0 is already in the past.
+        let read = mk_read(&h.cons, 0, 2, 0);
+        h.cons.pending_reads.push(read);
+        assert!(h.cons.advance_pending_reads());
+        assert!(h.cons.pending_reads.is_empty(), "past-deadline read must retry + drop");
+    }
+
+    /// Task 11 barrier: leadership lost (a follower / non-serving node) retries
+    /// every in-flight read immediately — a deposed leader can never certify a
+    /// linearizable read.
+    #[test]
+    fn barrier_retries_all_reads_when_not_serving() {
+        let mut h = harness(); // boots a FOLLOWER: can_serve == false
+        assert!(!h.cons.sm.can_serve());
+        let far = h.cons.now_ns() + 10_000_000_000;
+        let read = mk_read(&h.cons, 0, 2, far); // deadline far off; only depose fires
+        h.cons.pending_reads.push(read);
+        assert!(h.cons.advance_pending_reads());
+        assert!(h.cons.pending_reads.is_empty(), "a non-serving node retries in-flight reads");
     }
 }

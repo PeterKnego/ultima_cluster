@@ -18,4 +18,5 @@ thiserror = { workspace = true }
 [dev-dependencies]
 uc2_node = { path = "../uc2_node" }
 uc2_net = { path = "../uc2_net" }
+uc2_client = { path = "../uc2_client" }
 tempfile = { workspace = true }
