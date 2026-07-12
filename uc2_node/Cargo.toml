@@ -22,6 +22,10 @@ rand = { workspace = true }
 # barrier test drives the full read path with a real service + client.
 uc2_service = { path = "../uc2_service" }
 uc2_client = { path = "../uc2_client" }
+# L3 lincheck port (Task 13): the WGL checker/history/model + CAS-register SM,
+# built for the v2 SDK trait only (v1 `uc_service` is not pulled in here).
+uc-lincheck = { path = "../uc-lincheck", default-features = false, features = ["v2"] }
 serde = { workspace = true }
 bincode = { workspace = true }
 tempfile = { workspace = true }
+rand = { workspace = true }
