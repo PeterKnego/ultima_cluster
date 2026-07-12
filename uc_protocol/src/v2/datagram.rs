@@ -51,6 +51,48 @@ pub const DGRAM_KIND_VOTE: u8 = 8;
 /// prefix is older than the suffix falls back to full replay from 0.
 pub const DGRAM_KIND_TERM_MAP: u8 = 9;
 
+/// Body = `ReadProbeBody` (M5 §7 linearizable-read barrier): the leader's
+/// nonce'd read-index confirmation solicitation. Leader → every follower. The
+/// header's `leadership_term_id` carries the leader's current term — a follower
+/// ACKs ONLY if that term still equals its own (a stale leader's probe dies
+/// there; the no-stale-read theorem's teeth). `position` is unused (zero).
+pub const DGRAM_KIND_READ_PROBE: u8 = 10;
+/// Body = `ReadProbeBody`: the follower's confirmation. Follower → the probing
+/// leader (addressed by the leader id carried in the probe body's `from`).
+/// The leader counts DISTINCT ackers per nonce toward its read quorum.
+pub const DGRAM_KIND_READ_PROBE_ACK: u8 = 11;
+
+pub const READ_PROBE_BODY_LEN: usize = 16;
+
+/// Read-barrier probe/ack body: a `nonce` scoping the round to one read, plus
+/// the sender's own node id in `from` (so the receiver addresses its reply, and
+/// the leader attributes each distinct acker). LE: nonce 0..8, from 8..12,
+/// 12..16 zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadProbeBody {
+    pub nonce: u64,
+    pub from: u32,
+}
+
+pub fn write_read_probe_body(buf: &mut [u8], b: &ReadProbeBody) {
+    buf[0..8].copy_from_slice(&b.nonce.to_le_bytes());
+    buf[8..12].copy_from_slice(&b.from.to_le_bytes());
+    buf[12..16].fill(0);
+}
+
+/// Decode a read-probe body, or `None` if the buffer is shorter than
+/// [`READ_PROBE_BODY_LEN`] (the caller drops a malformed datagram). A longer
+/// buffer decodes its 16-byte prefix (trailing bytes ignored).
+pub fn read_read_probe_body(buf: &[u8]) -> Option<ReadProbeBody> {
+    if buf.len() < READ_PROBE_BODY_LEN {
+        return None;
+    }
+    Some(ReadProbeBody {
+        nonce: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
+        from: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+    })
+}
+
 pub const REQUEST_VOTE_BODY_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +334,8 @@ mod tests {
         assert_eq!(DGRAM_KIND_REQUEST_VOTE, 7);
         assert_eq!(DGRAM_KIND_VOTE, 8);
         assert_eq!(DGRAM_KIND_TERM_MAP, 9);
+        assert_eq!(DGRAM_KIND_READ_PROBE, 10);
+        assert_eq!(DGRAM_KIND_READ_PROBE_ACK, 11);
     }
 
     #[test]
@@ -311,6 +355,34 @@ mod tests {
         let v = VoteBody { term: 7, granted: false };
         write_vote_body(&mut buf, &v);
         assert_eq!(buf[4], 0);
+    }
+
+    #[test]
+    fn read_probe_body_roundtrips_and_pins_layout() {
+        let b = ReadProbeBody { nonce: 0x0102_0304_0506_0708, from: 0x0A0B_0C0D };
+        let mut buf = [0u8; READ_PROBE_BODY_LEN];
+        write_read_probe_body(&mut buf, &b);
+        assert_eq!(read_read_probe_body(&buf), Some(b));
+        // Absolute LE wire pin (not just a round trip — both sides could agree
+        // on a swapped field order): nonce 0x0102030405060708 -> LE bytes
+        // 0..8; from 0x0A0B0C0D -> LE bytes 8..12; bytes 12..16 zero.
+        assert_eq!(
+            buf,
+            [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x0D, 0x0C, 0x0B, 0x0A, 0, 0, 0, 0]
+        );
+        // A longer buffer decodes the same 16-byte prefix (trailing bytes ignored).
+        let mut long = [0xFFu8; READ_PROBE_BODY_LEN + 8];
+        write_read_probe_body(&mut long[..READ_PROBE_BODY_LEN], &b);
+        assert_eq!(read_read_probe_body(&long), Some(b));
+        // Malformed: any buffer shorter than the 16-byte body -> None (must not
+        // panic on slicing). Pin every boundary below the length.
+        for short in 0..READ_PROBE_BODY_LEN {
+            assert!(read_read_probe_body(&buf[..short]).is_none(), "len {short} must reject");
+        }
+        assert!(read_read_probe_body(&[]).is_none());
+        // The two new kind codes are stable.
+        assert_eq!(DGRAM_KIND_READ_PROBE, 10);
+        assert_eq!(DGRAM_KIND_READ_PROBE_ACK, 11);
     }
 
     #[test]

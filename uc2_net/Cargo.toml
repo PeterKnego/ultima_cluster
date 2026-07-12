@@ -9,7 +9,6 @@ authors.workspace = true
 [dependencies]
 uc_protocol = { path = "../uc_protocol" }
 uc2_log = { path = "../uc2_log" }
-uc2_consensus = { path = "../uc2_consensus" }
 ultima-journal = { workspace = true }
 
 [dev-dependencies]

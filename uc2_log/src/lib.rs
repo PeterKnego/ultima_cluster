@@ -7,7 +7,9 @@
 pub mod agent;
 pub mod archive;
 pub mod buffer;
+pub mod cnc;
 pub mod counters;
+pub mod reader;
 pub mod region;
 pub mod state;
 pub mod writer;

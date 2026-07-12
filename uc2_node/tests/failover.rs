@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use uc2_consensus::election::NodeId;
 use uc2_log::archive::{Archive, ArchiveConfig, ReplayFrame};
 use uc2_net::fault::FaultConfig;
-use uc2_node::{Node, NodeConfig, NodeDirs};
+use uc2_node::{Node, NodeConfig};
 
 /// On-wire size of a 96 B-payload message frame (32 B header + 96 B, already
 /// 32 B-aligned). The harness submits exactly 96 B payloads so each commit step
@@ -70,7 +70,9 @@ fn serialize() -> MutexGuard<'static, ()> {
 struct NodeH {
     id: NodeId,
     addr: SocketAddr,
-    dirs: NodeDirs,
+    instance_dir: PathBuf,
+    /// Derived (`instance_dir/journal`) — kept for the replay-equality checks.
+    journal_dir: PathBuf,
     seed: u64,
     node: Option<Node>,
 }
@@ -149,7 +151,8 @@ impl NodeH {
     fn restart(&mut self, members: &[(NodeId, SocketAddr)]) {
         assert!(self.node.is_none(), "restart of a live node");
         let sock = rebind(self.addr);
-        let cfg = make_config(self.id, members.to_vec(), self.dirs.clone(), self.seed, self.addr);
+        let cfg =
+            make_config(self.id, members.to_vec(), self.instance_dir.clone(), self.seed, self.addr);
         self.node = Some(Node::start_with_socket(cfg, sock).expect("restart"));
     }
 }
@@ -171,7 +174,7 @@ fn rebind(addr: SocketAddr) -> UdpSocket {
 fn make_config(
     id: NodeId,
     members: Vec<(NodeId, SocketAddr)>,
-    dirs: NodeDirs,
+    instance_dir: PathBuf,
     seed: u64,
     addr: SocketAddr,
 ) -> NodeConfig {
@@ -179,9 +182,11 @@ fn make_config(
         id,
         members,
         bind: addr,
-        dirs,
+        instance_dir,
+        app_id: "failover".into(),
         buffer_bytes: 1 << 22, // 4 MiB: no wrap within a test (see module docs)
         max_payload: 256,
+        admission_bytes: 256 * 1024,
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed,
@@ -227,14 +232,19 @@ fn spawn_cluster(n: usize) -> Cluster {
     let mut nodes = Vec::with_capacity(n);
     for (i, sock) in socks.into_iter().enumerate() {
         let addr = members[i].1;
-        let dirs = NodeDirs {
-            journal: dir.path().join(format!("n{i}/j")),
-            state: dir.path().join(format!("n{i}/s")),
-        };
+        let instance_dir = dir.path().join(format!("n{i}"));
+        let journal_dir = instance_dir.join("journal");
         let seed = seed_for(i);
-        let cfg = make_config(i as NodeId, members.clone(), dirs.clone(), seed, addr);
+        let cfg = make_config(i as NodeId, members.clone(), instance_dir.clone(), seed, addr);
         let node = Node::start_with_socket(cfg, sock).expect("start");
-        nodes.push(NodeH { id: i as NodeId, addr, dirs, seed, node: Some(node) });
+        nodes.push(NodeH {
+            id: i as NodeId,
+            addr,
+            instance_dir,
+            journal_dir,
+            seed,
+            node: Some(node),
+        });
     }
     Cluster { _dir: dir, members, nodes }
 }
@@ -390,7 +400,7 @@ fn boot_elects_exactly_one_leader_and_commits() {
     await_all(&c.nodes, target, 60, "durable", NodeH::durable);
 
     c.stop_all();
-    let dirs: Vec<&PathBuf> = c.nodes.iter().map(|n| &n.dirs.journal).collect();
+    let dirs: Vec<&PathBuf> = c.nodes.iter().map(|n| &n.journal_dir).collect();
     assert_replay_equal(&dirs);
 }
 
@@ -446,7 +456,7 @@ fn leader_kill_fails_over_subsecond_without_losing_committed_data() {
     for &i in &survivors {
         c.nodes[i].stop();
     }
-    let dirs: Vec<&PathBuf> = survivors.iter().map(|&i| &c.nodes[i].dirs.journal).collect();
+    let dirs: Vec<&PathBuf> = survivors.iter().map(|&i| &c.nodes[i].journal_dir).collect();
     assert_replay_equal(&dirs);
 }
 
@@ -598,9 +608,118 @@ fn heal_truncates_divergent_tail_and_reconverges() {
     );
 
     c.stop_all();
-    let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].dirs.journal).collect();
+    let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].journal_dir).collect();
     // Byte-equal, including BOTH NewTerm frames and none of the phantom appends.
     assert_replay_equal(&dirs);
+}
+
+/// Contested first election (M4 final-review I-2): a node wins term 1 and fsyncs
+/// its NewTerm frame but is partitioned before any datagram lands; a peer wins
+/// term 2 at base 0. On heal, the isolated node must truncate to 0 (a first-block
+/// cut) WITHOUT panicking and rejoin; pre-fix this was a fail-stop panic loop on
+/// every restart.
+///
+/// Constructing it means winning a race: `is_leader` flips at the end of
+/// `BecomeLeader`, ahead of the sender agent shipping the NewTerm DATA, so we
+/// spin on `is_leader` and cut the fresh leader off from both peers the instant
+/// it appears — its term-1 NewTerm (recorded to its OWN journal at base 0) then
+/// never reaches a follower, the other two time out, and one wins term 2 ALSO at
+/// base 0. That race is ~50/50 (the sender can ship first), so we retry the
+/// construction: a new leader that opens ABOVE base 0 (its serving commit exceeds
+/// the lone NewTerm frame) means the isolated node's frame slipped through and
+/// committed — not a first-block cut — so we tear down and rebuild. Once a clean
+/// base-0 construction is in hand the outcome is deterministic.
+#[test]
+fn contested_first_election_first_block_truncation_recovers() {
+    let _g = serialize();
+
+    // Bounded retries: the isolate-before-ship race is ~50/50, so P(no clean
+    // construction in 24 tries) is < 1e-7.
+    const MAX_ATTEMPTS: usize = 24;
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut c = spawn_cluster(3);
+
+        // Catch the FIRST node to claim leadership and isolate it immediately,
+        // before its NewTerm datagram can land on either peer.
+        let deadline = deadline_secs(30);
+        let leader = loop {
+            if let Some(i) = (0..3).find(|&i| c.nodes[i].node.is_some() && c.nodes[i].is_leader()) {
+                break i;
+            }
+            assert!(Instant::now() < deadline, "no node claimed leadership");
+            std::thread::yield_now();
+        };
+        let others: Vec<usize> = (0..3).filter(|&i| i != leader).collect();
+        for &o in &others {
+            partition(&c.nodes[leader], &c.nodes[o]);
+        }
+        let old_term = c.nodes[leader].term();
+
+        // The other two elect a new leader. If it opens its term at base 0 its
+        // serving commit is exactly the NewTerm frame (`NEW_TERM`); anything
+        // larger means the isolated node's term-1 NewTerm replicated + committed
+        // before we cut the link — not a first-block cut. Rebuild.
+        let new = await_serving_among(&c.nodes, &others, 30);
+        assert!(c.nodes[new].term() > old_term, "new leader did not advance the term");
+        if c.nodes[new].commit() != NEW_TERM {
+            // Lost the race this time — the new term opened above base 0.
+            c.stop_all();
+            assert!(attempt + 1 < MAX_ATTEMPTS, "no clean base-0 construction in {MAX_ATTEMPTS} tries");
+            continue;
+        }
+        // The term whose NewTerm now sits COMMITTED at base 0. It survives every
+        // later election (its data below is committed), so the converged stream's
+        // first frame carries exactly this term — strictly above the isolated
+        // node's `old_term`, proving that divergent first block was truncated.
+        let base0_term = c.nodes[new].term();
+
+        // Clean construction: the new term opened at base 0. Commit a few
+        // payloads so it holds a real frontier strictly beyond the NewTerm.
+        let fresh = 8u64;
+        submit_n(&c.nodes[new], fresh);
+        let majority_target = NEW_TERM + fresh * FRAME;
+        for &o in &others {
+            await_until(30, &format!("majority node {o} commit"), || {
+                c.nodes[o].commit() >= majority_target
+            });
+        }
+        assert_eq!(c.nodes[leader].truncations(), 0, "premature truncation before heal");
+
+        // Heal. The isolated ex-leader adopts the new term and truncates its
+        // divergent first block (base 0) to 0 — the first-block path — driven by
+        // the new leader's idle gossip-floor term-map re-ship. This is the exact
+        // cut that pre-fix panicked the archive/consensus agent in a restart loop.
+        for node in &c.nodes {
+            node.heal();
+        }
+        await_until(30, "ex-leader did not truncate its divergent first block", || {
+            c.nodes[leader].truncations() >= 1
+        });
+        assert!(c.nodes[leader].term() >= c.nodes[new].term(), "ex-leader did not adopt the new term");
+
+        // Converge (the test completing without a panic IS the core assertion —
+        // pre-fix the consensus agent panicked on the first-block cut).
+        let final_target = await_quiesced(&c.nodes[new], 30);
+        await_all(&c.nodes, final_target, 15, "reconverge commit", NodeH::commit);
+        await_all(&c.nodes, final_target, 15, "reconverge durable", NodeH::durable);
+
+        c.stop_all();
+        let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].journal_dir).collect();
+        assert_replay_equal(&dirs);
+
+        // The converged stream STARTS at position 0 with the base-0 term's
+        // NewTerm frame — strictly above the isolated node's `old_term`, proof
+        // its term-1 first block was cut to 0 (the first-block path), not shrunk
+        // to a non-zero boundary.
+        let golden = replayed(dirs[0]);
+        assert_eq!(golden[0].position, 0, "converged stream must start at base 0");
+        assert_eq!(
+            golden[0].header.leadership_term_id, base0_term,
+            "first frame must be the base-0 term's NewTerm — the divergent term-1 first block was fully truncated"
+        );
+        assert!(base0_term > old_term, "base-0 term must exceed the isolated node's term");
+        return; // success
+    }
 }
 
 /// Test 5: gracefully stop a follower, commit more traffic on the quorum, then
@@ -651,6 +770,6 @@ fn restarted_follower_recovers_state_and_rejoins() {
     assert!(!c.nodes[follower].is_leader(), "restarted follower unexpectedly became leader");
 
     c.stop_all();
-    let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].dirs.journal).collect();
+    let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].journal_dir).collect();
     assert_replay_equal(&dirs);
 }

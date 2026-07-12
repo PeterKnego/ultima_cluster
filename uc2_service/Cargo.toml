@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Peter Knego
+[package]
+name = "uc2_service"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+uc_protocol = { path = "../uc_protocol" }
+uc2_log = { path = "../uc2_log" }
+ultima-journal = { path = "../ultima_journal" }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+# Task 12 (OutputHandler): the output agent's own `current_thread` runtime.
+# `rt` (thread scheduling / block_on) + `time` (a handler's own `tokio::time`
+# use inside `on_committed`) ONLY — no multi-thread runtime, no macros, no I/O
+# drivers; the retry backoff itself sleeps via plain `std::thread::sleep`.
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+
+[dev-dependencies]
+uc2_node = { path = "../uc2_node" }
+uc2_net = { path = "../uc2_net" }
+uc2_client = { path = "../uc2_client" }
+tempfile = { workspace = true }

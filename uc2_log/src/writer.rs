@@ -58,21 +58,23 @@ impl PositionedWriter {
 mod tests {
     use super::*;
     use crate::buffer::{Appender, LogBuffer, SliceRead};
-    use crate::counters::LogCounters;
+    use crate::cnc::{CncMeta, CncPage};
     use crate::region::Region;
     use std::sync::Arc;
     use uc_protocol::v2::frame::read_header;
 
     const CAP: u64 = 4096;
 
-    fn buf() -> (Arc<LogBuffer>, Arc<LogCounters>) {
-        let counters = Arc::new(LogCounters::new());
-        let b = Arc::new(LogBuffer::new(
-            Region::heap_zeroed(CAP as usize),
-            Arc::clone(&counters),
-            256,
-        ));
-        (b, counters)
+    fn buf() -> (Arc<LogBuffer>, Arc<CncPage>) {
+        let cnc = CncPage::heap(&CncMeta {
+            node_id: 0,
+            instance_id: 0,
+            app_id: "test".into(),
+            buffer_bytes: CAP,
+            max_payload: 256,
+        });
+        let b = Arc::new(LogBuffer::new(Region::heap_zeroed(CAP as usize), Arc::clone(&cnc), 256));
+        (b, cnc)
     }
 
     /// End-to-end symmetry: leader appends, sender-style run read, follower
@@ -94,7 +96,7 @@ mod tests {
         }
         assert_eq!(pos, 4 * 96);
         // receiver-role: advance append after (simulated) gap tracking
-        fc.append.store_release(pos);
+        fc.counters().append.store_release(pos);
         let s = follower.recordable_slice(0, 1 << 20);
         assert_eq!(s.len(), 384);
         assert_eq!(read_header(&s[96..]).correlation_id, 1);
@@ -118,7 +120,7 @@ mod tests {
         assert!(w.write_run(CAP - 32, &[0u8; 32]));
         // overrun guard: durable = 0 -> nothing beyond position capacity
         assert!(!w.write_run(CAP, &[0u8; 32])); // 4096+32 > 0+4096
-        fc.durable.store_release(96);
+        fc.counters().durable.store_release(96);
         assert!(w.write_run(CAP, &[0u8; 32])); // 4128 <= 96+4096
     }
 }

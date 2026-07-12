@@ -532,6 +532,49 @@ impl SegmentFile {
         }
     }
 
+    /// Read + decode all records like [`scan`], but treat a record-level CRC
+    /// failure the SAME as a torn tail (stop, keep the records decoded so far)
+    /// instead of returning `Err`. This is the read primitive for
+    /// [`crate::journal::TailReader`]: a concurrent writer flushing a record can
+    /// momentarily expose a valid length prefix over a not-yet-visible (zeroed)
+    /// body/CRC, which fails CRC; a strictly read-only tail reader must
+    /// conservatively END the scan there — the writer will finish the record and
+    /// a later re-scan will pick it up. Genuine mid-segment corruption is
+    /// likewise bounded to "stop early", which is safe for a tail reader whose
+    /// caller re-bounds every APPLIED byte by the cluster commit counter (a
+    /// slightly-stale durable frontier is never wrong, only conservative). The
+    /// sparse index is not built here (tail readers scan whole segments).
+    pub(crate) fn scan_tolerant(&self) -> Result<ScanResult, JournalError> {
+        let mut f = self.file.try_clone()?;
+        f.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        let segname = self.segname();
+        let mut records = Vec::new();
+        let mut cursor = 0usize;
+        loop {
+            let abs_offset = SEGMENT_HEADER_SIZE as u64 + cursor as u64;
+            match decode_record(&buf[cursor..], &segname, abs_offset) {
+                Ok(Some((rec, n))) => {
+                    records.push(rec);
+                    cursor += n;
+                }
+                // Ok(None) = torn/zero tail; Err(_) = a record that fails CRC
+                // under a concurrent writer's half-flushed bytes. Both END the
+                // scan conservatively — never propagate as corruption.
+                Ok(None) | Err(_) => {
+                    let had_torn_tail = cursor < buf.len();
+                    return Ok(ScanResult {
+                        records,
+                        last_durable_offset: SEGMENT_HEADER_SIZE as u64 + cursor as u64,
+                        had_torn_tail,
+                        index: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+
     /// The segment's file name as a `String`, for error/corruption context.
     fn segname(&self) -> String {
         self.path.file_name().unwrap().to_string_lossy().to_string()

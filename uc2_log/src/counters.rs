@@ -27,7 +27,19 @@ impl PaddedAtomicU64 {
     pub fn store_release(&self, v: u64) {
         self.v.store(v, Ordering::Release)
     }
+    /// Atomic fetch-add, `AcqRel` (used by the M5 cnc page: `service_epoch`
+    /// bump at service attach and `next_client_id` allocation — both need
+    /// the read-modify-write result, and everything the caller wrote before
+    /// it, visible to any concurrent reader immediately, not just
+    /// eventually). Returns the value *before* the add, matching
+    /// `AtomicU64::fetch_add`.
+    #[inline]
+    pub fn fetch_add(&self, v: u64) -> u64 {
+        self.v.fetch_add(v, Ordering::AcqRel)
+    }
 }
+
+const _: () = assert!(std::mem::size_of::<PaddedAtomicU64>() == 64);
 
 /// The M1+M2+M3 counter set. append: written only by the appender (leader) /
 /// receiver (follower), after the frame commit word (so any position below
@@ -47,6 +59,17 @@ pub struct LogCounters {
     pub sent: PaddedAtomicU64,
     pub commit: PaddedAtomicU64,
 }
+
+// Layout pinned to the M5 cnc v2 page (uc_protocol::v2::cnc): `CncPage`
+// casts `LogCounters` directly at `CNC_OFF_APPEND`, so its field order and
+// per-field 64-byte stride must never drift from the protocol constants.
+// `uc2_log::cnc::tests::cnc_offsets_match_protocol_constants` cross-checks
+// this against `uc_protocol` directly; these asserts pin the struct side.
+const _: () = assert!(std::mem::size_of::<LogCounters>() == 256);
+const _: () = assert!(std::mem::offset_of!(LogCounters, append) == 0);
+const _: () = assert!(std::mem::offset_of!(LogCounters, durable) == 64);
+const _: () = assert!(std::mem::offset_of!(LogCounters, sent) == 128);
+const _: () = assert!(std::mem::offset_of!(LogCounters, commit) == 192);
 
 impl LogCounters {
     #[allow(clippy::new_without_default)]
@@ -99,5 +122,14 @@ mod tests {
     fn padded_is_a_full_cache_line() {
         assert_eq!(std::mem::size_of::<PaddedAtomicU64>(), 64);
         assert_eq!(std::mem::align_of::<PaddedAtomicU64>(), 64);
+    }
+
+    #[test]
+    fn fetch_add_returns_prior_value_and_advances() {
+        let a = PaddedAtomicU64::new(1);
+        assert_eq!(a.fetch_add(1), 1, "next_client_id-style allocation: old id returned");
+        assert_eq!(a.load_acquire(), 2);
+        assert_eq!(a.fetch_add(5), 2);
+        assert_eq!(a.load_acquire(), 7);
     }
 }

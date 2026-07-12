@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use uc2_consensus::election::NodeId;
 use uc2_net::fault::FaultConfig;
-use uc2_node::{Node, NodeConfig, NodeDirs, SubmitError};
+use uc2_node::{Node, NodeConfig, SubmitError};
 
 /// Payload every submit carries (64 B → a 96 B on-wire frame after the 32 B
 /// header, already 32 B-aligned).
@@ -64,7 +64,7 @@ const SERVE_BUDGET: Duration = Duration::from_secs(1);
 struct NodeH {
     id: NodeId,
     addr: SocketAddr,
-    dirs: NodeDirs,
+    instance_dir: PathBuf,
     seed: u64,
     node: Option<Node>,
 }
@@ -112,7 +112,7 @@ impl NodeH {
     fn restart(&mut self, members: &[(NodeId, SocketAddr)]) {
         assert!(self.node.is_none(), "restart of a live node");
         let sock = rebind(self.addr);
-        let cfg = make_config(self.id, members.to_vec(), self.dirs.clone(), self.seed, self.addr);
+        let cfg = make_config(self.id, members.to_vec(), self.instance_dir.clone(), self.seed, self.addr);
         self.node = Some(Node::start_with_socket(cfg, sock).expect("restart"));
     }
 }
@@ -133,7 +133,7 @@ fn rebind(addr: SocketAddr) -> UdpSocket {
 fn make_config(
     id: NodeId,
     members: Vec<(NodeId, SocketAddr)>,
-    dirs: NodeDirs,
+    instance_dir: PathBuf,
     seed: u64,
     addr: SocketAddr,
 ) -> NodeConfig {
@@ -141,9 +141,11 @@ fn make_config(
         id,
         members,
         bind: addr,
-        dirs,
+        instance_dir,
+        app_id: "m4_gate".into(),
         buffer_bytes: BUFFER_BYTES,
         max_payload: 256,
+        admission_bytes: 256 * 1024,
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed,
@@ -175,14 +177,11 @@ fn spawn_cluster(root: &Path, n: usize) -> Cluster {
     let mut nodes = Vec::with_capacity(n);
     for (i, sock) in socks.into_iter().enumerate() {
         let addr = members[i].1;
-        let dirs = NodeDirs {
-            journal: root.join(format!("n{i}/j")),
-            state: root.join(format!("n{i}/s")),
-        };
+        let instance_dir = root.join(format!("n{i}"));
         let seed = seed_for(i);
-        let cfg = make_config(i as NodeId, members.clone(), dirs.clone(), seed, addr);
+        let cfg = make_config(i as NodeId, members.clone(), instance_dir.clone(), seed, addr);
         let node = Node::start_with_socket(cfg, sock).expect("start");
-        nodes.push(NodeH { id: i as NodeId, addr, dirs, seed, node: Some(node) });
+        nodes.push(NodeH { id: i as NodeId, addr, instance_dir, seed, node: Some(node) });
     }
     Cluster { members, nodes }
 }
