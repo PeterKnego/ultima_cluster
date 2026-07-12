@@ -33,12 +33,14 @@
 //! serving leader) — see the send-loop comment for the redirect-flood failure
 //! mode this prevents.
 //!
-//! Reported: responses/s (drain-inclusive clock — from the first send to the
-//! LAST resolved response, i.e. it includes the tail drain, not just the
-//! send-loop's wall time), p50/p90/p99/max (an hdrhistogram of `now -
-//! send_ns[slot]` per genuine first-arrival response), sends, responses,
-//! in-flight-at-end. **PASS iff `responses/s >= 400_000 && p50 <= 1.0 ms`**;
-//! otherwise `RESULT: FAIL (honest)` + `exit(1)`.
+//! Reported: responses/s (drain-inclusive clock — from the first send to
+//! `max(last resolved response, send-window end)`, i.e. it includes the tail
+//! drain AND cannot excise a dead tail where responses stopped arriving
+//! mid-window), p50/p90/p99/max (an hdrhistogram of `now - send_ns[slot]` per
+//! genuine first-arrival response), sends, responses, in-flight-at-end.
+//! **PASS iff `responses/s >= 400_000 && p50 <= 1.0 ms && in-flight-at-end ==
+//! 0`** (the run must have COMPLETED its work — see the pass computation for
+//! why zero, strictly); otherwise `RESULT: FAIL (honest)` + `exit(1)`.
 //!
 //! **`all`** boots 3 nodes + 3 services in-process (real file-backed shmem,
 //! just not real separate OS processes) under a tempdir guarded OFF `/tmp`
@@ -416,9 +418,10 @@ fn await_serving(cnc: &CncPage, timeout: Duration) {
 /// any later delivery for the same `local_seq` finds a mismatched (already-
 /// cleared, or reused-by-a-newer-send) owner and is dropped, counted in
 /// `duplicates`, never double-timed or double-counted toward throughput.
-fn poll_egress(ring: &mut BroadcastConsumer, ctx: &MatcherCtx) -> bool {
-    let mut buf = Vec::new();
-    match ring.try_read(&mut buf) {
+fn poll_egress(ring: &mut BroadcastConsumer, ctx: &MatcherCtx, buf: &mut Vec<u8>) -> bool {
+    // `buf` is owned by the matcher loop and reused across records (try_read
+    // clears/overwrites it) — no per-record allocation on the drain path.
+    match ring.try_read(buf) {
         Ok(Some(rec)) => {
             let (cid, local_seq) = client_from_extra(rec.header_extra);
             if cid != ctx.client_id {
@@ -565,10 +568,13 @@ fn run_client_measurement(
             .name("m5-gate-matcher".into())
             .spawn(move || {
                 let ctx = ctx;
+                // One reusable payload buffer for the whole drain (try_read
+                // clears it per record) — no per-record allocation.
+                let mut buf = Vec::new();
                 loop {
                     let mut did = false;
-                    did |= poll_egress(&mut egress_service, &ctx);
-                    did |= poll_egress(&mut egress_node, &ctx);
+                    did |= poll_egress(&mut egress_service, &ctx, &mut buf);
+                    did |= poll_egress(&mut egress_node, &ctx, &mut buf);
                     if !did {
                         if stop.load(Ordering::Relaxed) {
                             break;
@@ -625,8 +631,16 @@ fn run_client_measurement(
             }
         }
         sent.fetch_add(1, Ordering::Relaxed);
+        // u32 wrap is unreachable in practice: even at 1 M sends/s a u32 lasts
+        // ~71 minutes and gate runs are tens of seconds; `wrapping_add` is
+        // belt-and-suspenders, not a supported regime (a wrap would reuse
+        // low SLOT_MASK indices, which the owner CAS would surface as
+        // duplicates/unresolved slots — loudly, not silently).
         local_seq = local_seq.wrapping_add(1);
     }
+    // When the send loop exited, relative to t0 — the measurement window's
+    // floor for the drain-inclusive denominator below.
+    let send_window_end_ns = t0.elapsed().as_nanos() as u64;
 
     // Drain grace: give outstanding requests a bounded window to resolve
     // before reporting whatever remains as in-flight.
@@ -643,8 +657,17 @@ fn run_client_measurement(
     let sends = sent.load(Ordering::Relaxed);
     let resp = responses.load(Ordering::Relaxed);
     let resolved_n = resolved.load(Ordering::Relaxed);
-    // Drain-inclusive clock: first send (t0) -> last resolved response.
-    let elapsed = Duration::from_nanos(last_response_ns.load(Ordering::Relaxed));
+    let inflight_at_end = sends.saturating_sub(resolved_n);
+    // Drain-inclusive clock, floored at the send window's end:
+    // `max(last_response, send_window_end)`. Taking last_response alone would
+    // let a run whose responses STOP arriving mid-window (service permanently
+    // behind while the node keeps CAN_SERVE — no redirects, serving gate open,
+    // last_response frozen early) silently excise its dead tail from the
+    // denominator and report the early burst's rate as the run's rate. With
+    // the floor, a dead tail depresses responses/s instead of vanishing.
+    let elapsed = Duration::from_nanos(
+        last_response_ns.load(Ordering::Relaxed).max(send_window_end_ns),
+    );
     let responses_per_sec =
         if elapsed.as_secs_f64() > 0.0 { resp as f64 / elapsed.as_secs_f64() } else { 0.0 };
 
@@ -654,7 +677,16 @@ fn run_client_measurement(
         (ms(h.value_at_quantile(0.50)), ms(h.value_at_quantile(0.90)), ms(h.value_at_quantile(0.99)), ms(h.max()))
     };
 
-    let pass = responses_per_sec >= RESPONSES_PER_SEC_BAR && p50_ms <= P50_MS_BAR;
+    // PASS requires the run to have actually completed its work: zero
+    // in-flight at end (strict, no epsilon). A healthy run has DRAIN_GRACE
+    // (5 s) to resolve a tail of at most `inflight_cap` outstanding requests —
+    // at even 1% of the 400k/s bar that drains in ~milliseconds — so anything
+    // left means responses stopped arriving (service stalled) or were lost
+    // (broadcast overwrite): either way the throughput/latency numbers above
+    // describe a run that did not finish, and must not print PASS.
+    let pass = responses_per_sec >= RESPONSES_PER_SEC_BAR
+        && p50_ms <= P50_MS_BAR
+        && inflight_at_end == 0;
 
     ClientStats {
         sends,
@@ -663,7 +695,7 @@ fn run_client_measurement(
         retried: retried.load(Ordering::Relaxed),
         duplicates: duplicates.load(Ordering::Relaxed),
         overwritten: overwritten.load(Ordering::Relaxed),
-        inflight_at_end: sends.saturating_sub(resolved_n),
+        inflight_at_end,
         elapsed,
         p50_ms,
         p90_ms,
@@ -691,7 +723,8 @@ fn print_report(s: &ClientStats) {
     println!("p99                   : {:.3} ms", s.p99_ms);
     println!("max                   : {:.3} ms", s.max_ms);
     println!(
-        "bar                   : responses/s >= {RESPONSES_PER_SEC_BAR:.0} && p50 <= {P50_MS_BAR:.1} ms"
+        "bar                   : responses/s >= {RESPONSES_PER_SEC_BAR:.0} && p50 <= {P50_MS_BAR:.1} ms \
+         && in-flight at end == 0"
     );
     println!("============================================================================");
     if s.pass {
