@@ -15,7 +15,9 @@
 //! agent over a bounded channel (control is kHz; a full channel drops, and
 //! NAK backoff / status refresh recover).
 
+use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -26,11 +28,14 @@ use uc2_log::writer::PositionedWriter;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA,
     DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK,
-    DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
+    DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE,
+    DGRAM_KIND_SNAP_NAK, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
     MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody,
-    STATUS_BODY_LEN, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_datagram_header,
-    read_nak_body, read_read_probe_body, read_request_vote_body, read_status_body,
-    read_term_map_body, read_vote_body, write_datagram_header, write_nak_body, write_status_body,
+    SNAP_BEGIN_BODY_LEN, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody, SnapNakBody, StatusBody,
+    TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_datagram_header, read_nak_body,
+    read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
+    read_status_body, read_term_map_body, read_vote_body, write_datagram_header, write_nak_body,
+    write_snap_begin_body, write_snap_nak_body, write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
 
@@ -237,6 +242,24 @@ pub struct FollowerStats {
     pub truncation_resyncs: AtomicU64,
 }
 
+/// M6 Task 6: one in-flight INBOUND snapshot transfer (this node is receiving a
+/// snapshot from the leader because its NAK fell below the purge floor). Chunks
+/// land at their file offset in a pre-sized `.part`; a `Rebuilt` over the file's
+/// byte space tracks contiguity + gaps (NAK'd like the main stream). On
+/// completion the `.part` is fsync'd + atomically renamed to the final artifact.
+struct SnapIntake {
+    peer: SocketAddr,
+    session: u32,
+    snapshot_pos: u64,
+    total_len: u64,
+    file: std::fs::File,
+    part_path: PathBuf,
+    final_path: PathBuf,
+    /// Contiguity over `[0, total_len)` file offsets.
+    got: Rebuilt,
+    nak: NakTimer,
+}
+
 pub struct FollowerReceiver {
     buffer: Arc<LogBuffer>,
     writer: PositionedWriter,
@@ -276,6 +299,18 @@ pub struct FollowerReceiver {
     gate: Option<Arc<AtomicBool>>,
     /// Per-duty-cycle latch: emit at most one `LeaderActivity` per `do_work`.
     activity_emitted: bool,
+    /// M6 Task 6: snapshot directory (`instance_dir/snapshots`) for inbound
+    /// transfers. `None` = this node never receives snapshots (no intake).
+    snap_dir: Option<PathBuf>,
+    /// M6 Task 6: the in-flight inbound snapshot transfer, if any.
+    snap_intake: Option<SnapIntake>,
+    /// M6 Task 6: node-internal signal — the position of the newest COMPLETE
+    /// inbound snapshot (written on rename). The consensus agent samples it to
+    /// issue `ArchiveCmd::AdoptFloor` and mirror it to cnc. `None` in unit tests.
+    incoming_snapshot_pos: Option<Arc<AtomicU64>>,
+    /// M6 Task 6: config for the inbound-transfer NAK timer (RTT delay + seed).
+    snap_nak_cfg: NakConfig,
+    snap_seed: u64,
 }
 
 impl FollowerReceiver {
@@ -317,6 +352,11 @@ impl FollowerReceiver {
             sender_route: None,
             gate: None,
             activity_emitted: false,
+            snap_dir: None,
+            snap_intake: None,
+            incoming_snapshot_pos: None,
+            snap_nak_cfg: cfg.nak,
+            snap_seed: cfg.seed,
         }
     }
 
@@ -347,6 +387,16 @@ impl FollowerReceiver {
     /// / gate `true`) = current behavior.
     pub fn set_intake_gate(&mut self, gate: Arc<AtomicBool>) {
         self.gate = Some(gate);
+    }
+
+    /// M6 Task 6: enable INBOUND snapshot transfers. `snap_dir` is where the
+    /// `.part`/final artifacts land (`instance_dir/snapshots`); `incoming` (if
+    /// set) receives the position of each COMPLETED transfer for the consensus
+    /// agent to adopt as an archive floor. Without this call kinds 12/13 are
+    /// ignored (a node that never joins below a floor never receives snapshots).
+    pub fn set_snapshot_intake(&mut self, snap_dir: PathBuf, incoming: Option<Arc<AtomicU64>>) {
+        self.snap_dir = Some(snap_dir);
+        self.incoming_snapshot_pos = incoming;
     }
 
     #[inline]
@@ -589,8 +639,193 @@ impl FollowerReceiver {
                     });
                 }
             }
+            // M6 Task 6 — INBOUND snapshot transfer (this node is the receiver:
+            // its NAK fell below the leader's purge floor). Term-filtered above.
+            DGRAM_KIND_SNAP_BEGIN => {
+                if let Some(b) = read_snap_begin_body(&d[DATAGRAM_HEADER_LEN..]) {
+                    self.snap_begin(from, b);
+                }
+            }
+            DGRAM_KIND_SNAP_CHUNK => {
+                self.snap_chunk(from, h.position, &d[DATAGRAM_HEADER_LEN..]);
+            }
+            // OUTBOUND session control (this node is the leader shipping a
+            // snapshot): demux the peer's repair NAK / completion to our sender.
+            DGRAM_KIND_SNAP_NAK if self.sender_route.is_some() => {
+                let body = &d[DATAGRAM_HEADER_LEN..];
+                if let Some(b) = read_snap_nak_body(body)
+                    && let Some(route) = &self.sender_route
+                {
+                    let _ = route.try_send(CtrlMsg::SnapNak {
+                        from,
+                        session: b.session,
+                        offset: b.offset,
+                        length: b.length,
+                    });
+                }
+            }
+            DGRAM_KIND_SNAP_DONE if self.sender_route.is_some() => {
+                let body = &d[DATAGRAM_HEADER_LEN..];
+                if let Some(b) = read_snap_begin_body(body)
+                    && let Some(route) = &self.sender_route
+                {
+                    let _ = route.try_send(CtrlMsg::SnapDone { from, session: b.session });
+                }
+            }
             _ => {} // NAK/STATUS with no sender_route installed (follower role)
         }
+    }
+
+    /// Begin an inbound snapshot transfer: pre-size a `.part` and start tracking
+    /// contiguity. A duplicate BEGIN for the in-flight session is a no-op; a BEGIN
+    /// for a different session replaces a stale one.
+    fn snap_begin(&mut self, from: SocketAddr, b: SnapBeginBody) {
+        let Some(dir) = self.snap_dir.clone() else {
+            return; // this node does not receive snapshots
+        };
+        if let Some(cur) = &self.snap_intake
+            && cur.peer == from
+            && cur.session == b.session
+        {
+            return; // duplicate BEGIN — already in progress
+        }
+        if b.total_len == 0 {
+            return;
+        }
+        let part_path = dir.join(format!("incoming-{}.part", b.snapshot_pos));
+        let final_path = dir.join(format!("snap-{}.ultsnap", b.snapshot_pos));
+        let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&part_path)
+        else {
+            return;
+        };
+        if file.set_len(b.total_len).is_err() {
+            return;
+        }
+        self.snap_intake = Some(SnapIntake {
+            peer: from,
+            session: b.session,
+            snapshot_pos: b.snapshot_pos,
+            total_len: b.total_len,
+            file,
+            part_path,
+            final_path,
+            got: Rebuilt::new(0),
+            nak: NakTimer::new(self.snap_nak_cfg, self.snap_seed ^ b.session as u64),
+        });
+        self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Land one snapshot chunk at its file offset; on completion fsync + rename.
+    fn snap_chunk(&mut self, from: SocketAddr, offset: u64, payload: &[u8]) {
+        let Some(intake) = self.snap_intake.as_mut() else {
+            return;
+        };
+        if intake.peer != from || payload.is_empty() {
+            return;
+        }
+        let Some(end) = offset.checked_add(payload.len() as u64) else {
+            return;
+        };
+        if end > intake.total_len {
+            return; // past EOF — corrupt/duplicate; drop
+        }
+        if intake.file.seek(SeekFrom::Start(offset)).is_err()
+            || intake.file.write_all(payload).is_err()
+        {
+            return;
+        }
+        intake.got.insert(offset, end);
+        if intake.got.contiguous() >= intake.total_len {
+            self.snap_complete();
+        }
+    }
+
+    /// The `.part` is contiguous: fsync, atomically rename to the final artifact,
+    /// signal completion, and ack with SNAP_DONE.
+    fn snap_complete(&mut self) {
+        let Some(intake) = self.snap_intake.take() else {
+            return;
+        };
+        // Durability + atomic publish: a torn `.part` is never renamed, so a
+        // reader (the service gap guard, or AdoptFloor) only ever sees a complete
+        // artifact.
+        if intake.file.sync_all().is_err() {
+            return;
+        }
+        drop(intake.file);
+        if std::fs::rename(&intake.part_path, &intake.final_path).is_err() {
+            return;
+        }
+        // Ack: echo the SnapBeginBody as SNAP_DONE so the leader closes its session.
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_BEGIN_BODY_LEN];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader {
+                position: 0,
+                leadership_term_id: self.term.load(Ordering::Relaxed),
+                kind: DGRAM_KIND_SNAP_DONE,
+                flags: 0,
+            },
+        );
+        write_snap_begin_body(
+            &mut d[DATAGRAM_HEADER_LEN..],
+            &SnapBeginBody {
+                session: intake.session,
+                snapshot_pos: intake.snapshot_pos,
+                total_len: intake.total_len,
+            },
+        );
+        let _ = self.sock.send_to(&d, intake.peer);
+        // Signal the consensus agent to adopt the floor + mirror observability.
+        if let Some(slot) = &self.incoming_snapshot_pos {
+            slot.store(intake.snapshot_pos, Ordering::Release);
+        }
+        self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Emit a SNAP_NAK for the first gap in the inbound transfer (RTT-delayed,
+    /// like the main stream). Called once per duty cycle from `upkeep`.
+    fn snap_upkeep(&mut self, now: u64) -> bool {
+        let Some(intake) = self.snap_intake.as_mut() else {
+            return false;
+        };
+        let contiguous = intake.got.contiguous();
+        let gap = intake.got.first_gap().or({
+            if contiguous < intake.total_len {
+                Some((contiguous, intake.total_len))
+            } else {
+                None
+            }
+        });
+        let fired = intake.nak.poll(gap, now);
+        if let Some((start, end)) = fired {
+            let length = (end - start).min(self.cfg.nak_max_bytes as u64) as u32;
+            let session = intake.session;
+            let peer = intake.peer;
+            let term = self.term.load(Ordering::Relaxed);
+            let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_NAK_BODY_LEN];
+            write_datagram_header(
+                &mut d,
+                &DatagramHeader {
+                    position: 0,
+                    leadership_term_id: term,
+                    kind: DGRAM_KIND_SNAP_NAK,
+                    flags: 0,
+                },
+            );
+            write_snap_nak_body(
+                &mut d[DATAGRAM_HEADER_LEN..],
+                &SnapNakBody { session, offset: start, length },
+            );
+            let _ = self.sock.send_to(&d, peer);
+            return true;
+        }
+        false
     }
 
     fn upkeep(&mut self) -> bool {
@@ -693,6 +928,12 @@ impl FollowerReceiver {
             self.status_at = contiguous;
             self.last_status_ns = now;
             self.stats.statuses_sent.fetch_add(1, Relaxed);
+            did = true;
+        }
+
+        // M6 Task 6: drive an inbound snapshot transfer's NAK repair. Poll twice
+        // (arm then fire) like the main-stream NAK above.
+        if self.snap_upkeep(now) || self.snap_upkeep(self.now_ns()) {
             did = true;
         }
         did
@@ -1519,6 +1760,7 @@ mod tests {
                 match m {
                     CtrlMsg::Nak { .. } => nak = Some(m),
                     CtrlMsg::Status { .. } => status = Some(m),
+                    _ => {} // snapshot-session control not exercised by this test
                 }
             }
         }

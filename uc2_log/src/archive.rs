@@ -32,6 +32,12 @@ pub enum ArchiveError {
     Journal(#[from] JournalError),
     #[error("position {pos} is below the first archived block (first base {first_base})")]
     PositionPurged { pos: u64, first_base: u64 },
+    /// M6 Task 6: `adopt_floor(pos)` on a non-empty archive whose durable
+    /// frontier is below `pos` — adopting would orphan the real prefix in
+    /// `[durable, pos)`. Legal only for an empty archive (the learner-join case)
+    /// or as a no-op when the frontier already covers `pos`.
+    #[error("cannot adopt snapshot floor {pos}: archive already holds data up to {durable}")]
+    AdoptFloorConflict { durable: u64, pos: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +183,31 @@ impl Archive {
             };
         }
         Ok(self.first_base)
+    }
+
+    /// M6 Task 6: adopt `pos` as this archive's floor WITHOUT any bytes — the
+    /// receiving side of a snapshot session (a fresh learner) has just installed
+    /// the state below `pos` from the shipped snapshot, so the archive advances
+    /// its durable frontier to `pos` and the next block records at base `pos`.
+    ///
+    /// Legal only for an EMPTY archive whose frontier is at/below `pos` (the
+    /// learner-join case). A non-empty archive already covering `pos` treats it
+    /// as a no-op (a mid-life follower ignores an AdoptFloor for state it has);
+    /// a non-empty archive BELOW `pos` errors — adopting would orphan the real
+    /// prefix in `[durable, pos)`. Returns the new `durable`/`first_base`.
+    pub fn adopt_floor(&mut self, pos: u64) -> Result<u64, ArchiveError> {
+        if self.journal.last_seq().is_some() {
+            if self.durable_pos >= pos {
+                return Ok(self.durable_pos); // already covered — no-op
+            }
+            return Err(ArchiveError::AdoptFloorConflict { durable: self.durable_pos, pos });
+        }
+        if pos < self.durable_pos {
+            return Err(ArchiveError::AdoptFloorConflict { durable: self.durable_pos, pos });
+        }
+        self.durable_pos = pos;
+        self.first_base = pos;
+        Ok(pos)
     }
 
     /// Test/replay access to the underlying journal.
@@ -546,6 +577,40 @@ mod tests {
         assert_eq!(cfg.segment_size_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.max_block_bytes, 1024 * 1024);
         assert!(cfg.preallocate_segments);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real journal files + fsync
+    fn adopt_floor_on_empty_advances_frontier_without_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
+            assert_eq!(arch.recovered_position(), 0);
+            assert_eq!(arch.adopt_floor(64 * 1024).unwrap(), 64 * 1024);
+            assert_eq!(arch.recovered_position(), 64 * 1024, "durable advanced with no data");
+            assert_eq!(arch.first_base(), 64 * 1024);
+            // Idempotent no-op when already at/below the floor.
+            assert_eq!(arch.adopt_floor(64 * 1024).unwrap(), 64 * 1024);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real journal files + fsync
+    fn adopt_floor_on_nonempty_below_pos_is_rejected() {
+        let (b, _c, dir) = setup(1 << 16);
+        let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        for i in 0..5 {
+            a.append(1, i, &[7u8; 64]).unwrap();
+        }
+        arch.do_work(&b).unwrap(); // durable = 480, journal non-empty
+        // Adopting a floor ABOVE the real frontier would orphan the prefix.
+        assert!(matches!(
+            arch.adopt_floor(64 * 1024),
+            Err(ArchiveError::AdoptFloorConflict { .. })
+        ));
+        // But adopting one we already cover is a harmless no-op.
+        assert_eq!(arch.adopt_floor(0).unwrap(), arch.recovered_position());
     }
 
     #[test]

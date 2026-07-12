@@ -74,6 +74,11 @@ pub(crate) enum ArchiveCmd {
     /// Drop whole journal blocks strictly below the block covering `below`
     /// (`Archive::purge_below`). No ack. Errors log-warn and drop.
     Purge { below: u64 },
+    /// M6 Task 6: adopt `pos` as the archive floor WITHOUT bytes — the receiving
+    /// side of a snapshot session (a learner) installed the state below `pos`
+    /// from the shipped file, so the archive advances its frontier to `pos` and
+    /// the counters prime there. No ack; a conflict logs + drops.
+    AdoptFloor { pos: u64 },
 }
 
 /// Journal purge policy (M6 Task 4). **Default `Disabled` — purge is OFF by
@@ -432,6 +437,25 @@ impl Node {
             Arc::clone(&leader_flag),
         );
         sender.set_replay_source(journal);
+        // M6 Task 6: snapshot session wiring. `snap_dir` holds the position-tagged
+        // artifacts (shared with the service's builder); `incoming_snapshot` is the
+        // node-internal signal the receiver raises on a completed inbound transfer.
+        let snap_dir = cfg.instance_dir.join("snapshots");
+        let _ = std::fs::create_dir_all(&snap_dir);
+        let incoming_snapshot = Arc::new(AtomicU64::new(0));
+        // Offer ONLY the file at the node's durable floor: a session ships a
+        // fully-published artifact (rename-atomic + validated as the floor marker).
+        let src_cnc = Arc::clone(&cnc);
+        let src_dir = snap_dir.clone();
+        sender.set_snapshot_source(Arc::new(move || {
+            let floor = src_cnc.snapshots().node_snapshot_floor.load_acquire();
+            if floor == 0 {
+                return None;
+            }
+            let path = src_dir.join(format!("snap-{floor}.ultsnap"));
+            let len = std::fs::metadata(&path).ok()?.len();
+            Some((floor, path, len))
+        }));
 
         // Receiver (unified follower-receiver + leader-control demux).
         let mut rcfg = FollowerConfig::new(self_addr); // auto-learns the real leader from DATA
@@ -447,6 +471,7 @@ impl Node {
         );
         receiver.set_sender_route(ctrl_tx);
         receiver.set_intake_gate(Arc::clone(&intake_gate));
+        receiver.set_snapshot_intake(snap_dir.clone(), Some(Arc::clone(&incoming_snapshot)));
         let route_drops = receiver.stats();
 
         // Archive agent: archive commands first (don't record blocks about to be
@@ -489,6 +514,21 @@ impl Node {
                                     "uc2_node: archive purge_below({below}) failed: {e} \
                                      (dropped; retries next interval)"
                                 );
+                            }
+                        }
+                    }
+                    ArchiveCmd::AdoptFloor { pos } => {
+                        // M6 Task 6: a learner installed the snapshot at `pos`.
+                        // Advance the archive floor with no bytes and prime the
+                        // counters there so the live stream (positions >= pos) is
+                        // accepted. A conflict (real data below pos) logs + drops.
+                        match archive.adopt_floor(pos) {
+                            Ok(new_floor) => {
+                                arc_cnc.counters().prime(new_floor);
+                                arc_first_base.store(new_floor, Ordering::Release);
+                            }
+                            Err(e) => {
+                                eprintln!("uc2_node: archive adopt_floor({pos}) failed: {e}");
                             }
                         }
                     }
@@ -554,6 +594,8 @@ impl Node {
             archive_first_base: Arc::clone(&archive_first_base),
             snapshot_persisted_floor: state_snapshot_floor,
             snapshot_floor_last_persist_ns: None,
+            incoming_snapshot: Arc::clone(&incoming_snapshot),
+            adopted_incoming: 0,
         };
         let consensus_agent =
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
@@ -782,6 +824,13 @@ struct Consensus {
     /// M6 Task 4: monotonic ns of the last snapshot-floor persist; `None` until
     /// the first. Same 100 ms fsync floor as output-progress.
     snapshot_floor_last_persist_ns: Option<u64>,
+    /// M6 Task 6: node-internal signal from the receiver — the position of the
+    /// newest COMPLETE inbound snapshot transfer (0 = none). Sampled each cycle;
+    /// on a new value we adopt it as the archive floor + mirror to cnc.
+    incoming_snapshot: Arc<AtomicU64>,
+    /// M6 Task 6: last inbound-snapshot position already adopted (shadow, so the
+    /// AdoptFloor command + cnc mirror fire once per completed transfer).
+    adopted_incoming: u64,
 }
 
 impl Consensus {
@@ -869,7 +918,32 @@ impl Consensus {
         // validated increase, durably persist the snapshot floor + mirror it,
         // then (if the purge policy is on) command the archive to purge below it.
         did |= self.maybe_persist_snapshot_floor();
+
+        // 9. Sample the receiver's completed-inbound-snapshot signal (M6 Task 6);
+        // on a new value, adopt it as the archive floor and mirror it to cnc.
+        did |= self.maybe_adopt_incoming_snapshot();
         did
+    }
+
+    /// M6 Task 6. When the receiver completes an inbound snapshot transfer it
+    /// raises `incoming_snapshot`; sample it and, on a new position, mirror it to
+    /// the cnc observability slot and — when our own durable frontier is below it
+    /// (the learner-join case) — command the archive to adopt it as the floor.
+    fn maybe_adopt_incoming_snapshot(&mut self) -> bool {
+        let pos = self.incoming_snapshot.load(Ordering::Acquire);
+        if pos <= self.adopted_incoming {
+            return false;
+        }
+        self.adopted_incoming = pos;
+        self.cnc.snapshots().incoming_snapshot_pos.store_release(pos);
+        // Only adopt when we don't already cover `pos` — a mid-life follower that
+        // already holds the state ignores it (the archive agent no-ops it too, but
+        // skipping the command keeps the channel quiet).
+        let durable = self.cnc.counters().durable.load_acquire();
+        if durable < pos {
+            let _ = self.trunc_tx.try_send(ArchiveCmd::AdoptFloor { pos });
+        }
+        true
     }
 
     /// Sample `service().output_completed` (a cheap compare every cycle); on an
@@ -1961,6 +2035,8 @@ mod tests {
             archive_first_base: Arc::new(AtomicU64::new(0)),
             snapshot_persisted_floor: 0,
             snapshot_floor_last_persist_ns: None,
+            incoming_snapshot: Arc::new(AtomicU64::new(0)),
+            adopted_incoming: 0,
         };
 
         Harness {

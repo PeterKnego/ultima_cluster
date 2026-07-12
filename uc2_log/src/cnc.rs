@@ -101,11 +101,16 @@ const _: () = assert!(std::mem::offset_of!(NodeStatusV2, next_client_id) == 384)
 pub struct SnapshotSlots {
     pub service_snapshot_pos: PaddedAtomicU64,
     pub node_snapshot_floor: PaddedAtomicU64,
+    /// M6 Task 6: position of the newest COMPLETE inbound snapshot the receiver
+    /// landed (writer: consensus, mirrored from the receiver's node-internal
+    /// signal). Observability; the AdoptFloor decision reads the same signal.
+    pub incoming_snapshot_pos: PaddedAtomicU64,
 }
 
-const _: () = assert!(std::mem::size_of::<SnapshotSlots>() == 128);
+const _: () = assert!(std::mem::size_of::<SnapshotSlots>() == 192);
 const _: () = assert!(std::mem::offset_of!(SnapshotSlots, service_snapshot_pos) == 0);
 const _: () = assert!(std::mem::offset_of!(SnapshotSlots, node_snapshot_floor) == 64);
+const _: () = assert!(std::mem::offset_of!(SnapshotSlots, incoming_snapshot_pos) == 128);
 
 /// The mmap'd (or heap) cnc v2 page. `Region` is `Send + Sync`, so this is
 /// too — every accessor casts a `&self`-borrowed reference at a pinned
@@ -326,7 +331,7 @@ impl CncPage {
 
     /// `SnapshotSlots` cast at `CNC_OFF_SERVICE_SNAPSHOT_POS` (M6 Task 3).
     pub fn snapshots(&self) -> &SnapshotSlots {
-        // SAFETY: as `counters()` — offset 1152, size 128, 1152+128=1280<=4096.
+        // SAFETY: as `counters()` — offset 1152, size 192, 1152+192=1344<=4096.
         unsafe { &*(self.region.ptr_at(CNC_OFF_SERVICE_SNAPSHOT_POS) as *const SnapshotSlots) }
     }
 
@@ -403,7 +408,7 @@ mod tests {
         assert_eq!(size_of::<ServiceProgress>(), 192);
         assert_eq!(size_of::<NodeStatusV2>(), 448);
         assert_eq!(CNC_OFF_NEXT_CLIENT_ID - CNC_OFF_TERM, 384);
-        assert_eq!(size_of::<SnapshotSlots>(), 128);
+        assert_eq!(size_of::<SnapshotSlots>(), 192);
         assert_eq!(CNC_OFF_NODE_SNAPSHOT_FLOOR - CNC_OFF_SERVICE_SNAPSHOT_POS, 64);
         let page = CncPage::heap(&test_meta());
         let base = page.page_base_for_tests();
