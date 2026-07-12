@@ -1,0 +1,36 @@
+[package]
+name = "uc2-crashtest"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "uc2-crashtest-node"
+path = "src/bin/uc2-crashtest-node.rs"
+
+[[bin]]
+name = "uc2-crashtest-service"
+path = "src/bin/uc2-crashtest-service.rs"
+
+[features]
+hard-crash-tests = []
+
+[dependencies]
+uc2_node      = { path = "../../uc2_node" }
+uc2_service   = { path = "../../uc2_service" }
+uc2_net       = { path = "../../uc2_net" }
+uc2_consensus = { path = "../../uc2_consensus" }
+# v2-only feature: pulls in the `RegisterSm: uc2_service::StateMachine` impl
+# without the heavy default `v1` (`uc_service`) dependency.
+uc-lincheck   = { path = "../../uc-lincheck", default-features = false, features = ["v2"] }
+clap          = { version = "4", features = ["derive"] }
+anyhow        = { workspace = true }
+
+# uc-lincheck is already a [dependency] (used by the bins) and is therefore
+# available to the integration tests too — no dev-dep needed.
+[dev-dependencies]
+uc2_client = { path = "../../uc2_client" }
+tempfile   = { workspace = true }
+rand       = { workspace = true } # seeded op selection in hard_crash.rs
