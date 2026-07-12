@@ -212,11 +212,25 @@ impl Client {
             Ok(raw) => decode_response(raw),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.registrations.lock().unwrap().remove(&local_seq);
-                let current = self.cnc.meta().instance_id;
-                if current != self.instance_id {
-                    Err(ClientError::InstanceRestart { attached: self.instance_id, current })
-                } else {
-                    Err(ClientError::Timeout(self.request_timeout))
+                // Non-panicking header re-read (M5 final review #2b): the node
+                // may be recreating the cnc file IN PLACE right now (truncate →
+                // set_len → rewrite header), so our mmap can observe a zeroed or
+                // torn header. `meta()` would `expect`-panic on that — a panic
+                // reachable from a plain client API call by a concurrent node
+                // restart. `try_instance_id` returns `None` for that torn
+                // window; we classify it as `InstanceRestart` (the node IS being
+                // recreated — the more accurate signal than a bare timeout), with
+                // `current: 0` as the documented "header unreadable / node
+                // mid-recreate" sentinel. A clean read that differs is a genuine
+                // restart; a clean matching read is an honest `Timeout`.
+                match self.cnc.try_instance_id() {
+                    Some(current) if current != self.instance_id => {
+                        Err(ClientError::InstanceRestart { attached: self.instance_id, current })
+                    }
+                    None => {
+                        Err(ClientError::InstanceRestart { attached: self.instance_id, current: 0 })
+                    }
+                    Some(_) => Err(ClientError::Timeout(self.request_timeout)),
                 }
             }
             // Unreachable in normal operation: the one `SyncSender` lives in

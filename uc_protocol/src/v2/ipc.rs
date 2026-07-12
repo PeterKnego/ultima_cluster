@@ -14,10 +14,13 @@
 //!     linearizable vs. snapshot routing.
 //!   * `svc_query.ring` (SPSC, node → service): [`MSG_V2_SVC_QUERY`] —
 //!     payload is `expected_epoch: u64 LE` followed by the query bytes.
-//!   * `egress_service.broadcast` (node → service + clients):
-//!     [`MSG_V2_RESPONSE`] — payload is `position: u64 LE` followed by the
-//!     response bytes; `flags` bit 0 ([`FLAG_V2_IS_QUERY`]) distinguishes a
-//!     query answer from a submit response.
+//!   * `egress_service.broadcast` (SERVICE → clients): [`MSG_V2_RESPONSE`] —
+//!     written by the service apply agent (`uc2_service::egress`), NOT the node
+//!     (the node only creates the ring file; the attaching service owns the
+//!     producer). Payload is `position: u64 LE` followed by the response bytes;
+//!     `flags` bit 0 ([`FLAG_V2_IS_QUERY`]) distinguishes a query answer from a
+//!     submit response. The service also emits [`MSG_V2_RETRY`] here for a
+//!     stale-epoch query refusal.
 //!   * `egress_node.broadcast` (node → clients): [`MSG_V2_NOT_LEADER`] —
 //!     payload is `leader_hint: u64 LE` (`u64::MAX` = unknown).
 //!   * Either broadcast ring may also carry [`MSG_V2_RETRY`] — a transient

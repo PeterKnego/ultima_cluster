@@ -222,6 +222,20 @@ impl CncPage {
 
     /// Create (or truncate) the cnc file at exactly one page, map it, and
     /// write a fresh header + initial atomic values.
+    ///
+    /// **Accepted SIGBUS window (M5 final review #2a):** this recreates the file
+    /// IN PLACE (same inode) — `truncate: true` drops it to length 0, then
+    /// `set_len(CNC_PAGE_LEN)` grows it back. A stale process from a previous
+    /// node generation that still holds a live mmap of this same inode can, in
+    /// the truncate→`set_len` gap, touch a page that is momentarily beyond
+    /// end-of-file and take a SIGBUS. This is ACCEPTED: it is behaviorally
+    /// equivalent to the SIGKILL that the crashtest (`node_sigkill_recovery`)
+    /// already proves safe — a stale attachment dying is the intended outcome of
+    /// a node restart (v2.0 contract). Recreating in place (rather than
+    /// unlink+create a new inode) is LOAD-BEARING: it is what lets an attached
+    /// client's own mmap observe the fresh `instance_id` and self-classify
+    /// [`crate::cnc::CncPage::try_instance_id`]-driven `InstanceRestart`, instead
+    /// of reading a stale detached page forever.
     pub fn create_file(path: &Path, meta: &CncMeta) -> Result<Arc<CncPage>, CncError> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -305,6 +319,34 @@ impl CncPage {
             buffer_bytes: header.buffer_bytes,
             max_payload: header.max_payload,
         }
+    }
+
+    /// Non-panicking `instance_id` read straight off the header bytes — a cheap
+    /// two-`u64` hot-path probe for liveness / node-restart detection against a
+    /// page another process may be recreating IN PLACE (M5 final review #2b/#2c).
+    ///
+    /// Returns `None` when the magic doesn't match — i.e. the header is being
+    /// rewritten (a node restart truncates the file to zero, `set_len`s it back,
+    /// then rewrites the header in place; a concurrent reader can catch that torn
+    /// window as a zeroed / partial page) or the page is otherwise not a valid v2
+    /// cnc page. Unlike [`Self::meta`] it NEVER panics and does NOT check the
+    /// crc32 (this is a per-cycle probe, not an attach-time validation): callers
+    /// treat `None` as "instance changing / unavailable" and re-probe next cycle
+    /// rather than trusting a torn value. A `Some(id)` may still be a mid-write
+    /// value during that window; the callers that fail-stop on a change require
+    /// two CONSECUTIVE mismatching cycles so a single torn read cannot false-trip.
+    pub fn try_instance_id(&self) -> Option<u128> {
+        let page = self.page();
+        if &page[cnc::CNC_OFF_MAGIC..cnc::CNC_OFF_MAGIC + 8] != cnc::CNC_MAGIC {
+            return None;
+        }
+        let lo = u64::from_le_bytes(
+            page[cnc::CNC_OFF_INSTANCE_LO..cnc::CNC_OFF_INSTANCE_LO + 8].try_into().ok()?,
+        );
+        let hi = u64::from_le_bytes(
+            page[cnc::CNC_OFF_INSTANCE_HI..cnc::CNC_OFF_INSTANCE_HI + 8].try_into().ok()?,
+        );
+        Some(((hi as u128) << 64) | (lo as u128))
     }
 
     /// Test-only: the page's base address, for pointer-offset assertions

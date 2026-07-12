@@ -106,6 +106,9 @@ pub(crate) fn attach<S: StateMachine>(
         journal_dir: dir.join("journal"),
         svc_query,
         needs_replay: false,
+        instance_id,
+        instance_mismatch_streak: 0,
+        my_epoch: epoch,
     };
 
     Ok(Attached { apply_state, buffer, cnc, instance_id, epoch })

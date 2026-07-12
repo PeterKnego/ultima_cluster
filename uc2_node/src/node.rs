@@ -1100,7 +1100,26 @@ impl Consensus {
                     let svc = self.cnc.service();
                     let e = svc.service_epoch.load_acquire();
                     let applied = svc.service_applied.load_acquire();
-                    if applied >= commit_at && svc.service_epoch.load_acquire() == e {
+                    // Sentinel-collision guard (M5 final review IMPORTANT #1): a
+                    // captured epoch of 0 is NOT ready — never forward on it.
+                    // `expected_epoch == 0` is the wire sentinel for "skip the
+                    // epoch check" (a snapshot read the service answers
+                    // unconditionally — see `uc_protocol::v2::ipc` and
+                    // `uc2_service::apply::drain_queries`). A fresh cnc page
+                    // zeroes `service_epoch` on EVERY node boot, so the bracket
+                    // could otherwise pass while NO live service has attached
+                    // this generation — and a stale service incarnation still
+                    // writing `service_applied` onto the recreated page (the
+                    // crashtest's node_sigkill_recovery window) could push
+                    // `applied >= commit_at` with `e == 0`. Forwarding then would
+                    // (a) stamp the skip-the-check sentinel and (b) certify a
+                    // read against an unattached / stale-incarnation SM. Require
+                    // `e >= 1`: an unattached generation's read simply waits
+                    // (deadline → RETRY as usual), and only a real attached
+                    // incarnation (epoch bumped at attach) is ever forwarded —
+                    // with its true epoch, so the service's own stale-epoch
+                    // refusal still applies end-to-end.
+                    if e >= 1 && applied >= commit_at && svc.service_epoch.load_acquire() == e {
                         Some(e)
                     } else {
                         None
@@ -1963,11 +1982,52 @@ mod tests {
         assert!(!h.cons.advance_pending_reads());
         assert_eq!(h.cons.pending_reads.len(), 1);
 
-        // Service catches up AND the epoch is stable across the capture-recheck
-        // → forwarded to svc_query and dropped from the barrier.
+        // Service catches up (applied >= commit_at) BUT no service has attached
+        // this generation yet (service_epoch still 0) — the sentinel-collision
+        // guard (IMPORTANT #1) treats a captured epoch of 0 as NOT ready, so the
+        // read stays parked, never forwarded on the skip-the-check sentinel.
         h.cons.cnc.service().service_applied.store_release(6048);
+        assert!(!h.cons.advance_pending_reads());
+        assert_eq!(h.cons.pending_reads.len(), 1, "epoch-0 must not forward");
+
+        // A real incarnation attaches (epoch 1). NOW the capture-recheck bracket
+        // passes with a live epoch → forwarded to svc_query and dropped.
+        h.cons.cnc.service().service_epoch.store_release(1);
         assert!(h.cons.advance_pending_reads());
         assert!(h.cons.pending_reads.is_empty(), "caught-up read must forward and drop");
+    }
+
+    /// Task 11 barrier, sentinel-collision guard (M5 final review IMPORTANT #1):
+    /// a linearizable read whose service has caught up (`service_applied >=
+    /// commit_at`) must NOT be forwarded while `service_epoch == 0` (a fresh cnc
+    /// page has no attached service this generation; epoch 0 is the wire
+    /// "skip-the-check" sentinel). It forwards only once a real incarnation bumps
+    /// the epoch to >= 1 — with that true epoch, so the service's own stale-epoch
+    /// refusal still applies. (Red without the `e >= 1` guard: the read forwards
+    /// on epoch 0, disabling the check.)
+    #[test]
+    fn barrier_does_not_forward_on_epoch_zero_sentinel() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+
+        let far = h.cons.now_ns() + 10_000_000_000;
+        // Single-node quorum (1) so the read is AwaitApplied immediately.
+        let mut read = mk_read(&h.cons, /*commit_at*/ 6048, /*quorum*/ 1, far);
+        read.phase = ReadPhase::AwaitApplied;
+        h.cons.pending_reads.push(read);
+
+        // Service applied past the read index, but service_epoch is still 0
+        // (no service attached this generation): the guard parks the read.
+        h.cons.cnc.service().service_applied.store_release(6048);
+        assert_eq!(h.cons.cnc.service().service_epoch.load_acquire(), 0);
+        assert!(!h.cons.advance_pending_reads(), "must not forward on the epoch-0 sentinel");
+        assert_eq!(h.cons.pending_reads.len(), 1);
+
+        // Epoch bumps to 1 (a real incarnation attached) → forwarded with
+        // expected_epoch 1 and dropped from the barrier.
+        h.cons.cnc.service().service_epoch.store_release(1);
+        assert!(h.cons.advance_pending_reads(), "must forward once epoch >= 1");
+        assert!(h.cons.pending_reads.is_empty());
     }
 
     /// Task 11 barrier: a read past its deadline is answered `MSG_V2_RETRY`

@@ -106,6 +106,7 @@ impl<S: StateMachine, O: OutputHandler<S>> ServiceBuilder<S, O> {
                 Arc::clone(&cnc),
                 output,
                 journal_dir,
+                instance_id,
             )?;
             let output_agent =
                 AgentRunner::spawn("uc2-output", OUTPUT_IDLE, move || output_cycle(&mut output_state))?;

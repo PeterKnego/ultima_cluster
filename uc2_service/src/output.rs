@@ -87,6 +87,13 @@ pub(crate) struct OutputState<S: StateMachine, O: OutputHandler<S>> {
     /// first cycle), so the NEXT leader cycle resets the cursor from the
     /// node's durable marker before doing any work.
     pub(crate) was_leader: bool,
+    /// The node `instance_id` this incarnation attached to (M5 final review
+    /// #2c) — a change means the node restarted; this thread must fail-stop
+    /// rather than keep writing `output_completed` onto the new generation's
+    /// page. Checked with the same two-consecutive-cycle derace as the apply
+    /// loop, via [`crate::apply::check_node_instance`].
+    pub(crate) instance_id: u128,
+    pub(crate) instance_mismatch_streak: u8,
 }
 
 impl<S: StateMachine, O: OutputHandler<S>> OutputState<S, O> {
@@ -96,13 +103,24 @@ impl<S: StateMachine, O: OutputHandler<S>> OutputState<S, O> {
         cnc: Arc<CncPage>,
         handler: O,
         journal_dir: std::path::PathBuf,
+        instance_id: u128,
     ) -> std::io::Result<Self> {
         // `rt` (thread scheduling) + `time` (enabled for a future handler that
         // wants `tokio::time` inside `on_committed`; the backoff sleeps here go
         // through plain `std::thread::sleep`) — "rt + time features only" per
         // the plan.
         let rt = tokio::runtime::Builder::new_current_thread().enable_time().build()?;
-        Ok(Self { follower, sm, cnc, handler, rt, journal_dir, was_leader: false })
+        Ok(Self {
+            follower,
+            sm,
+            cnc,
+            handler,
+            rt,
+            journal_dir,
+            was_leader: false,
+            instance_id,
+            instance_mismatch_streak: 0,
+        })
     }
 }
 
@@ -116,6 +134,11 @@ fn is_leader(cnc: &CncPage) -> bool {
 pub(crate) fn output_cycle<S: StateMachine, O: OutputHandler<S>>(
     st: &mut OutputState<S, O>,
 ) -> bool {
+    // Node-restart fail-stop (M5 final review #2c), checked BEFORE the leader
+    // gate so a deposed output thread on a restarted node still fail-stops rather
+    // than lingering as a zombie writer of `output_completed`.
+    crate::apply::check_node_instance(&st.cnc, st.instance_id, &mut st.instance_mismatch_streak);
+
     if !is_leader(&st.cnc) {
         // Deposed (or never yet leader): idle. Leave the cursor exactly where
         // it is — it is NOT the source of truth (`output_progress` is); the
