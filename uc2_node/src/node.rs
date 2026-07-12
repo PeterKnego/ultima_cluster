@@ -643,6 +643,7 @@ impl Node {
             snapshot_floor_last_persist_ns: None,
             incoming_snapshot: Arc::clone(&incoming_snapshot),
             adopted_incoming: 0,
+            last_leader_map: Vec::new(),
         };
         let consensus_agent =
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
@@ -894,6 +895,12 @@ struct Consensus {
     /// M6 Task 6: last inbound-snapshot position already adopted (shadow, so the
     /// AdoptFloor command + cnc mirror fire once per completed transfer).
     adopted_incoming: u64,
+    /// M6 Task 8: the leader's most-recently-shipped term-map (the wire tail),
+    /// captured verbatim on every `TermMap` datagram. On a snapshot install
+    /// (`AdoptFloor`) this authoritative lineage is seeded into the SM so a
+    /// below-floor joiner's next reconcile finds the common prefix that otherwise
+    /// lives hidden inside the snapshot. Empty until the first term-map arrives.
+    last_leader_map: Vec<(u32, u64)>,
 }
 
 impl Consensus {
@@ -1004,6 +1011,19 @@ impl Consensus {
         // skipping the command keeps the channel quiet).
         let durable = self.cnc.counters().durable.load_acquire();
         if durable < pos {
+            // M6 Task 8: seed the SM with the leader's authoritative lineage BEFORE
+            // the archive adopts the floor. The snapshot IS the leader's committed
+            // history up to `pos`, so its lineage — not our absent local bytes — is
+            // the truth the next reconcile must match. Without this the shared
+            // prefix lives inside the snapshot, invisible to reconcile, which would
+            // clamp a truncate below the adopted floor (a PositionPurged fail-stop).
+            // Persist-before-adopt: the seeded map is durable before the floor moves,
+            // so a crash in the window recovers a map consistent with the floor.
+            if !self.last_leader_map.is_empty() {
+                self.sm.adopt_snapshot_lineage(&self.last_leader_map);
+                let map = to_entries(self.sm.term_map());
+                self.state.store_term_map(&map).expect("term-map persist fail-stop");
+            }
             let _ = self.trunc_tx.try_send(ArchiveCmd::AdoptFloor { pos });
         }
         true
@@ -1548,10 +1568,11 @@ impl Consensus {
             }
             NetEvent::TermMap { from, term, entries } => {
                 self.learn_leader_hint(from, term);
-                Event::TermMapReceived {
-                    term,
-                    entries: entries.iter().map(|e| (e.term, e.base)).collect(),
-                }
+                let pairs: Vec<(u32, u64)> = entries.iter().map(|e| (e.term, e.base)).collect();
+                // M6 Task 8: remember the leader's authoritative lineage for the
+                // snapshot-install seed (below-floor join). Capture the newest.
+                self.last_leader_map = pairs.clone();
+                Event::TermMapReceived { term, entries: pairs }
             }
             NetEvent::ReadProbe { nonce, from, term } => {
                 // Follower side: reply an ack iff still our term (handled inline,
@@ -2126,6 +2147,7 @@ mod tests {
             snapshot_floor_last_persist_ns: None,
             incoming_snapshot: Arc::new(AtomicU64::new(0)),
             adopted_incoming: 0,
+            last_leader_map: Vec::new(),
         };
 
         Harness {

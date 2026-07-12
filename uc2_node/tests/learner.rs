@@ -25,8 +25,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use uc2_consensus::election::NodeId;
+use uc2_log::cnc::CncPage;
 use uc2_net::fault::FaultConfig;
-use uc2_node::{Node, NodeConfig};
+use uc2_node::{Node, NodeConfig, PurgePolicy};
 
 const PAYLOAD: usize = 96;
 
@@ -307,6 +308,115 @@ fn learner_replicates_live_and_never_disturbs_quorum() {
     for node in &mut c.nodes {
         node.stop();
     }
+}
+
+/// M6 Task 8 Step 4 — a FRESH learner joins a cluster whose leader has PURGED its
+/// log prefix, and catches up by installing the shipped snapshot then tail-replaying.
+///
+/// A single voter (deterministic leader) drives megabytes through a small ring,
+/// publishes a snapshot floor (the service builder is stood in for by writing the
+/// cnc position + a snapshot file, as `purge_safety.rs` does — `uc2_node` never
+/// parses the file), and purges `[0, floor)`. A learner then starts with a FRESH
+/// instance dir: it NAKs from 0 BELOW the leader's ring floor, the leader cannot
+/// serve the purged prefix from ring or journal so it upgrades to a snapshot
+/// SESSION (Task 6); the learner adopts the shipped floor (AdoptFloor) — seeding
+/// the leader's term-map lineage so reconcile finds the below-floor common prefix
+/// (Task 8 fix) instead of trying to truncate below the floor — and tail-replays
+/// the retained `[floor, append)`, reaching a frontier it could NEVER have reached
+/// by replay alone (those bytes are gone). The leader's commit never gates on it.
+#[test]
+fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
+    let _g = serialize();
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-learner-join-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    const SEG: u64 = 64 * 1024;
+    let app = "learner-join";
+
+    let v_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let l_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let v_addr = v_sock.local_addr().unwrap();
+    let l_addr = l_sock.local_addr().unwrap();
+    let members = vec![(0u32, v_addr)];
+    let learners = vec![(1u32, l_addr)];
+
+    let cfg = |id: NodeId, sock_addr: SocketAddr, d: PathBuf| NodeConfig {
+        id,
+        members: members.clone(),
+        learners: learners.clone(),
+        bind: sock_addr,
+        instance_dir: d,
+        app_id: app.into(),
+        // A SMALL ring so a fresh learner's NAK from 0 falls BELOW the ring floor
+        // (durable - capacity) into the PURGED journal region → snapshot session.
+        buffer_bytes: 1 << 18,
+        max_payload: 256,
+        admission_bytes: 256 * 1024,
+        election_timeout_min_ns: 50_000_000,
+        election_timeout_max_ns: 100_000_000,
+        seed: 0xC0FFEE ^ id as u64,
+        faults: FaultConfig::default(),
+        purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        journal_segment_bytes: SEG,
+    };
+
+    let v_dir = dir.path().join("v0");
+    let voter = Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
+    await_until(30, "voter serves", || voter.can_serve());
+
+    for i in 0u64..24000 {
+        let mut p = vec![0u8; PAYLOAD];
+        p[..8].copy_from_slice(&i.to_le_bytes());
+        loop {
+            match voter.submit(p.clone()) {
+                Ok(()) => break,
+                Err(_) => std::thread::yield_now(),
+            }
+        }
+    }
+    await_until(30, "voter quiesced", || {
+        let c = voter.counters();
+        let a = c.append.load_acquire();
+        a > 0 && c.commit.load_acquire() == a && c.durable.load_acquire() == a
+    });
+
+    // Publish a snapshot floor + a real snapshot file for the sender to ship.
+    let cnc = CncPage::open_file(&v_dir.join("cnc2.dat"), app).expect("open voter cnc");
+    let durable = voter.counters().durable.load_acquire();
+    // Frame-aligned (a real service publishes a snapshot at an apply boundary —
+    // a 128 B frame end for these 96 B payloads); a mid-frame floor would land the
+    // journal-replay datagram below the adopted position and be dropped as a dup.
+    let floor = (durable / 2) / 128 * 128;
+    assert!(floor > SEG, "need >1 segment below the floor (durable={durable})");
+    let snap_dir = v_dir.join("snapshots");
+    std::fs::create_dir_all(&snap_dir).unwrap();
+    std::fs::write(snap_dir.join(format!("snap-{floor}.ultsnap")), vec![0x5Au8; 4096]).unwrap();
+    cnc.snapshots().service_snapshot_pos.store_release(floor);
+
+    await_until(30, "voter purged its prefix", || voter.archive_first_base() > 0);
+    let first_base = voter.archive_first_base();
+    assert!(first_base > 0, "the prefix must be gone so replay-from-0 is impossible");
+    let frontier = voter.counters().append.load_acquire();
+
+    // A FRESH learner joins with no prior state.
+    let l_dir = dir.path().join("l1");
+    let learner = Node::start_with_socket(cfg(1, l_addr, l_dir), l_sock).expect("start learner");
+
+    // It cannot replay `[0, first_base)` (purged) — the ONLY way it reaches the
+    // frontier is the snapshot session + AdoptFloor (+ lineage seed) + tail replay.
+    await_until(40, "learner caught up across the purged prefix", || {
+        learner.counters().durable.load_acquire() >= frontier
+            && learner.counters().commit.load_acquire() >= frontier
+    });
+    assert!(
+        learner.archive_first_base() >= first_base,
+        "the learner must have adopted the shipped snapshot floor, not replayed from 0"
+    );
+    assert!(!learner.is_leader(), "a learner never leads");
+
+    learner.stop();
+    voter.stop();
 }
 
 #[test]

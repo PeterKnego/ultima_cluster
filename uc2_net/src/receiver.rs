@@ -311,6 +311,14 @@ pub struct FollowerReceiver {
     /// M6 Task 6: config for the inbound-transfer NAK timer (RTT delay + seed).
     snap_nak_cfg: NakConfig,
     snap_seed: u64,
+    /// M6 Task 8: a completed snapshot install awaiting the consensus agent's
+    /// `AdoptFloor` FORWARD re-prime. Set to the snapshot position on
+    /// `snap_complete`; once the buffer's `append` reaches it (the archive adopted
+    /// the floor), the receiver rebuilds its gap tracker FORWARD to the new floor so
+    /// it NAKs the retained `[floor, frontier)` tail instead of re-requesting the
+    /// purged prefix. Cleared once applied. Distinct from the backward truncation
+    /// re-prime, which is unambiguous from the counter alone.
+    snap_adopt_pending: Option<u64>,
 }
 
 impl FollowerReceiver {
@@ -357,6 +365,7 @@ impl FollowerReceiver {
             incoming_snapshot_pos: None,
             snap_nak_cfg: cfg.nak,
             snap_seed: cfg.seed,
+            snap_adopt_pending: None,
         }
     }
 
@@ -452,15 +461,23 @@ impl FollowerReceiver {
     /// duty cycle BEFORE any datagram of the new tail is processed.
     fn resync_after_truncation(&mut self) {
         let append = self.buffer.counters().append.load_acquire();
+        // A BACKWARD move of the shared counter below our tracker is the archive's
+        // `prime` signature: in the follower role we are the counter's sole FORWARD
+        // writer, and `prime` is its only backward writer, so `append < contiguous`
+        // is unambiguous (a leader's own append legitimately runs AHEAD of its
+        // receiver's tracker, so a `!=` test would misfire on every leader cycle).
+        // It fires on a reconciliation truncation AND on a `BecomeLeader` collapse.
+        // The FORWARD `AdoptFloor` re-prime (M6 Task 8) is NOT distinguishable here
+        // and is handled separately by `resync_after_snapshot_install`.
         if append < self.rebuilt.contiguous() {
             self.rebuilt = Rebuilt::new(append);
             self.leader_append = append;
-            self.nak.poll(None, self.now_ns()); // disarm: the gap predates the cut
-            // The report cursors shadow the frontier and must regress with it:
+            self.nak.poll(None, self.now_ns()); // disarm: the old gap predates the re-prime
+            // The report cursors shadow the frontier and must move with it:
             // `status_at` gates on `contiguous - status_at` (would underflow if
-            // left above the re-primed frontier), and `ap_reported` gates the
+            // left above a regressed frontier), and `ap_reported` gates the
             // AppendPosition send so the first re-established durable reports
-            // promptly toward the new leader's commit ranking.
+            // promptly toward the leader's commit ranking.
             self.status_at = append;
             self.ap_reported = append;
             self.stats.truncation_resyncs.fetch_add(1, Ordering::Relaxed);
@@ -473,6 +490,8 @@ impl FollowerReceiver {
         // shared `append` counter below our rebuilt frontier, rebuild the tracker
         // so the re-shipped post-truncation tail is accepted, not dropped as dup.
         self.resync_after_truncation();
+        // And, after a snapshot install, forward to the adopted floor (M6 Task 8).
+        self.resync_after_snapshot_install();
         let mut did = false;
         self.activity_emitted = false; // one LeaderActivity per cycle (node mode)
         for _ in 0..64 {
@@ -785,7 +804,38 @@ impl FollowerReceiver {
         if let Some(slot) = &self.incoming_snapshot_pos {
             slot.store(intake.snapshot_pos, Ordering::Release);
         }
+        // Arm the forward gap-tracker resync: once the consensus agent's AdoptFloor
+        // re-primes the shared `append` up to this position, rebuild our tracker
+        // forward so we NAK the retained `[floor, frontier)` tail (M6 Task 8).
+        self.snap_adopt_pending = Some(intake.snapshot_pos);
         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M6 Task 8: after a snapshot install, the consensus agent's `AdoptFloor`
+    /// re-primes the shared `append` counter FORWARD to the snapshot floor. Unlike
+    /// the backward truncation re-prime, a forward move is indistinguishable from a
+    /// leader's own append by the counter alone — so this resync is gated on an
+    /// actual completed install (`snap_adopt_pending`). Once `append` has reached
+    /// the adopted floor, rebuild the gap tracker there so the next NAK requests the
+    /// retained tail (not the purged prefix, which would loop the session forever),
+    /// then disarm.
+    fn resync_after_snapshot_install(&mut self) {
+        let Some(floor) = self.snap_adopt_pending else {
+            return;
+        };
+        let append = self.buffer.counters().append.load_acquire();
+        if append < floor {
+            return; // AdoptFloor not applied yet
+        }
+        if append > self.rebuilt.contiguous() {
+            self.rebuilt = Rebuilt::new(append);
+            self.leader_append = self.leader_append.max(append);
+            self.nak.poll(None, self.now_ns()); // disarm the stale below-floor gap
+            self.status_at = append;
+            self.ap_reported = append;
+            self.stats.truncation_resyncs.fetch_add(1, Ordering::Relaxed);
+        }
+        self.snap_adopt_pending = None;
     }
 
     /// Emit a SNAP_NAK for the first gap in the inbound transfer (RTT-delayed,

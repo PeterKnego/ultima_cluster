@@ -537,6 +537,31 @@ impl ElectionSm {
         &self.term_map
     }
 
+    /// M6 Task 8: adopt the leader's authoritative term-map lineage as our
+    /// baseline on installing a snapshot at a purge floor.
+    ///
+    /// A below-floor joiner (`durable < floor`) discards its local bytes and
+    /// installs the leader's snapshot, whose lineage IS the leader's committed
+    /// history up to the floor. Its term-map must become that lineage — otherwise
+    /// the shared prefix lives *inside* the snapshot, invisible to `reconcile`,
+    /// which would then see the leader's below-floor entries as un-stamped
+    /// divergence and clamp a truncate BELOW the adopted floor (a `PositionPurged`
+    /// fail-stop). Seeding here makes the very next `reconcile` a clean prefix
+    /// match. Entries at/above the floor are idempotently re-confirmed as the
+    /// tail replays (`DataTermObserved` is monotone below its last).
+    ///
+    /// Safe because it runs ONLY on a snapshot install (the node gates it on
+    /// `durable < floor`, i.e. we genuinely lack this history) with the leader's
+    /// own shipped map — never against local, possibly-divergent bytes.
+    pub fn adopt_snapshot_lineage(&mut self, lineage: &[(u32, u64)]) {
+        if lineage.is_empty() {
+            return;
+        }
+        self.term_map = lineage.to_vec();
+        let last_term = lineage.last().map(|(t, _)| *t).unwrap_or(0);
+        self.current_term = self.current_term.max(last_term);
+    }
+
     /// True while a truncation is in flight (the data-plane latch is held).
     pub fn is_truncating(&self) -> bool {
         self.truncating_epoch.is_some()
