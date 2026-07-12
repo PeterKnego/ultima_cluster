@@ -738,16 +738,26 @@ impl Consensus {
         did
     }
 
-    /// Sample `service().output_completed` (a cheap compare every cycle); on a
-    /// change, once at least [`OUTPUT_PROGRESS_FLOOR_NS`] has elapsed since the
+    /// Sample `service().output_completed` (a cheap compare every cycle); on an
+    /// INCREASE, once at least [`OUTPUT_PROGRESS_FLOOR_NS`] has elapsed since the
     /// last persist, durably store it via `NodeState::store_output_progress`
     /// THEN mirror it onto `status().output_progress` — durable-then-mirror,
     /// never the other order, so an attaching service can never observe a
     /// mirror value ahead of what actually survives a node crash. Returns
     /// `true` iff it persisted (drives the idle strategy).
+    ///
+    /// **Increase-only — the marker is a durable HIGH-WATER MARK.** The cnc
+    /// page is re-created fresh every node boot, so `output_completed` restarts
+    /// at 0 while `output_persisted_completed` is seeded from the recovered
+    /// durable marker M. A plain not-equal check would treat that boot-time
+    /// `0 != M` as a change and persist 0 on the very first cycle —
+    /// deterministically regressing the on-disk marker after ANY node restart
+    /// (at-least-once SAFE, but it defeats the marker's purpose: the next
+    /// leader would replay outputs from 0/the purge floor). A fresh page's 0
+    /// (or any other lower value) must never regress it.
     fn maybe_persist_output_progress(&mut self) -> bool {
         let completed = self.cnc.service().output_completed.load_acquire();
-        if completed == self.output_persisted_completed {
+        if completed <= self.output_persisted_completed {
             return false;
         }
         let now = self.now_ns();

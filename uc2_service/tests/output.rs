@@ -202,8 +202,14 @@ fn output_runs_leader_only_at_least_once_across_service_restart() {
     // and check that `sorted` — the deduped positions the `Recorder` ever saw
     // across BOTH incarnations — covers every one of them from its own first
     // entry onward. At-least-once permits duplicates (already folded out by
-    // `dedup`) but never a SKIP. A closure (not a free fn) so it can capture
-    // `dir` without threading it through the call site.
+    // `dedup`) but never a SKIP. Note the anchor: the walk starts at
+    // `sorted[0]`, so this proves "no gap after the FIRST seen position" —
+    // in general it would not catch a skip BEFORE the first delivery. That
+    // earliest-skip case is covered in THIS test anyway: incarnation 1
+    // starts from marker 0 and delivers from the true first committed
+    // position, so `sorted[0]` IS the journal's first MESSAGE position. A
+    // closure (not a free fn) so it can capture `dir` without threading it
+    // through the call site.
     let is_contiguous_positions = |sorted: &[u64]| -> bool {
         if sorted.is_empty() {
             return true;

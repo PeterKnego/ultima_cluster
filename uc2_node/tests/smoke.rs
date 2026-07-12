@@ -145,6 +145,68 @@ fn single_node_cluster_elects_itself_and_serves() {
     assert_eq!(vote, Some(uc2_log::state::VoteRecord { term: 1, voted_for: 0 }));
 }
 
+/// Task 12 review pin: the durable output-progress marker is a HIGH-WATER
+/// MARK — a node restart must never regress it. The cnc page is re-created
+/// fresh every boot, so `service().output_completed` restarts at 0 while the
+/// recovered on-disk marker is M > 0; a change-detecting (rather than
+/// increase-only) persister would deterministically persist 0 on the first
+/// consensus cycle after the restart, clobbering M (at-least-once safe, but
+/// the next leader would replay ALL outputs from 0/the purge floor).
+///
+/// Drives `output_completed` directly on the page (unit-style — the service
+/// is out of scope here; the node's persister only ever reads the counter),
+/// waits for the durable persist + mirror, restarts the node on the SAME
+/// instance dir, and asserts both the mirror and the on-disk StableValue
+/// still report M.
+#[test]
+fn output_progress_marker_survives_node_restart() {
+    const M: u64 = 4096;
+    let dir = tempfile::tempdir().unwrap();
+
+    let node = start_single_node(dir.path());
+    wait_until(|| node.can_serve());
+
+    // Simulate a service having completed outputs up to M. The first-ever
+    // increase persists without waiting out the 100 ms floor, so the mirror
+    // update is prompt.
+    let cnc = uc2_log::cnc::CncPage::open_file(&dir.path().join("cnc2.dat"), "smoke").unwrap();
+    cnc.service().output_completed.store_release(M);
+    wait_until(|| cnc.status().output_progress.load_acquire() == M);
+    drop(cnc);
+    node.stop();
+
+    // The marker is durable on disk.
+    let state = uc2_log::state::NodeState::open(&dir.path().join("state")).unwrap();
+    assert_eq!(state.output_progress(), M, "marker durably persisted before the restart");
+    drop(state);
+
+    // Restart on the same instance dir: the fresh cnc page's output_completed
+    // is 0. The increase-only persister must leave both the mirror and the
+    // on-disk marker at M.
+    let node = Node::start(config_for(dir.path())).unwrap();
+    wait_until(|| node.can_serve());
+    let cnc = uc2_log::cnc::CncPage::open_file(&dir.path().join("cnc2.dat"), "smoke").unwrap();
+    assert_eq!(
+        cnc.status().output_progress.load_acquire(),
+        M,
+        "boot mirrors the recovered marker"
+    );
+    // Let the consensus loop run a comfortable number of duty cycles — the
+    // pre-fix regression fired on the very FIRST cycle, so this settle window
+    // is more than enough to catch it.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        cnc.status().output_progress.load_acquire(),
+        M,
+        "a node restart must not clobber the marker with the fresh page's 0"
+    );
+    drop(cnc);
+    node.stop();
+
+    let state = uc2_log::state::NodeState::open(&dir.path().join("state")).unwrap();
+    assert_eq!(state.output_progress(), M, "on-disk marker still M after the restart");
+}
+
 /// Read the frame at `pos` via the buffer's validated read, panicking if it
 /// is not (yet) a committed message frame — the harness already waited for
 /// commit to pass `pos` before calling this.

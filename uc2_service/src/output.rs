@@ -217,8 +217,12 @@ pub(crate) fn output_cycle<S: StateMachine, O: OutputHandler<S>>(
 /// `Mutex` guard is held for the duration of `rt.block_on(..)` — v1-verbatim
 /// semantics (the pre-M5 design held an `RwLock` read the same way). This
 /// blocks the APPLY thread's next `sm.lock()` for as long as the handler
-/// takes — a real degradation for a slow/blocking handler, flagged in the
-/// task report as a concern for the controller rather than silently accepted.
+/// takes — and with it QUERIES too: the query-ring drain (`apply.rs`'s
+/// `drain_queries`, running on the apply thread to answer client reads) and
+/// the embedded `Service::query` path (`lib.rs`) take this SAME `Mutex`, so a
+/// slow handler stalls reads as well as applies. A real degradation for a
+/// slow/blocking handler, flagged in the task report as a concern for the
+/// controller rather than silently accepted.
 fn deliver<S: StateMachine, O: OutputHandler<S>>(
     sm: &Arc<Mutex<S>>,
     cnc: &CncPage,
