@@ -21,6 +21,7 @@ use uc2_log::cnc::CncPage;
 use uc_protocol::v2::frame::{self, FRAME_TYPE_MESSAGE, HEADER_LEN, align_frame_len};
 use ultima_journal::TailReader;
 
+use crate::apply::SnapshotRestore;
 use crate::config::ServiceError;
 use crate::traits::StateMachine;
 
@@ -49,6 +50,7 @@ pub(crate) fn replay_into<S: StateMachine>(
     sm: &Mutex<S>,
     cnc: &CncPage,
     journal_dir: &std::path::Path,
+    restore: Option<&SnapshotRestore<S>>,
 ) -> Result<u64, ServiceError> {
     let reader = TailReader::open(journal_dir).map_err(|e| ServiceError::Replay(e.to_string()))?;
     let mut guard = sm.lock().unwrap();
@@ -57,6 +59,60 @@ pub(crate) fn replay_into<S: StateMachine>(
     let mut cursor = 0u64;
     let mut decode_error = false;
 
+    // M6 Task 5 — the GAP GUARD. `needed` is the position tail replay would
+    // start dispatching from; `first` is the journal's lowest replayable
+    // position (base of its first retained block, 0 if unpurged). If the journal
+    // has been purged ABOVE what the SM needs (`first > needed`), the tail alone
+    // cannot rebuild a contiguous state — the frames in `(needed, first)` are
+    // gone. Without this guard, `scan_from` would silently start at `first` and
+    // "succeed" with a hole in the middle of the state (the silent-gap bug
+    // class). Instead: install a covering snapshot (if the SM can), else
+    // fail-stop with the contract named.
+    let mut start_pos = guard.last_applied().unwrap_or(0);
+    let first = reader
+        .first_meta()
+        .map_err(|e| ServiceError::Replay(e.to_string()))?
+        .unwrap_or(0);
+    if first > start_pos {
+        // A covering snapshot must reach at least `first` (so the snapshot's
+        // prefix `[0, S]` and the journal's tail `[first, target]` overlap and
+        // leave no hole). Pick the newest snapshot no higher than the live apply
+        // target; require `S >= first`.
+        let target = {
+            let c = cnc.counters();
+            c.commit.load_acquire().min(c.durable.load_acquire())
+        };
+        let covering = match restore {
+            Some(r) => r
+                .store
+                .newest(target)
+                .map_err(|e| ServiceError::Replay(e.to_string()))?,
+            None => None,
+        };
+        match (restore, covering) {
+            (Some(r), Some((s_pos, path))) if s_pos >= first => {
+                let mut file =
+                    std::fs::File::open(&path).map_err(|e| ServiceError::Replay(e.to_string()))?;
+                let installed = (r.install)(&mut guard, s_pos, &mut file)
+                    .map_err(|e| ServiceError::Replay(format!("snapshot install: {e}")))?;
+                debug_assert_eq!(installed, s_pos, "install must land at the artifact's tag");
+                // The SM is now at `installed`; tail replay continues from there.
+                // (`installed >= first`, so the journal's retained tail is a
+                // contiguous continuation — no hole.)
+                start_pos = installed;
+                cursor = installed;
+            }
+            // No install capability, or no snapshot covers the floor: the gap is
+            // unbridgeable. Fail-stop, contract named (kills the silent-gap class).
+            _ => {
+                return Err(ServiceError::SnapshotRequired {
+                    needed: start_pos,
+                    first_available: first,
+                });
+            }
+        }
+    }
+
     // Skip whole segment FILES entirely below what the SM has already applied:
     // replay only dispatches frames with `pos > last_applied`, so a segment
     // whose records all end at/below `last_applied` contributes nothing. This is
@@ -64,9 +120,7 @@ pub(crate) fn replay_into<S: StateMachine>(
     // one holding `last_applied`) and the per-frame `> last_applied` skip below
     // is unchanged, so the applied set and the returned `cursor` are identical
     // to the old full `scan`; only the wasted re-read of purged/applied leading
-    // segments is removed (the O(journal)-per-overrun M5 carry). The gap GUARD
-    // (below-floor detection) lands in Task 5.
-    let start_pos = guard.last_applied().unwrap_or(0);
+    // segments is removed (the O(journal)-per-overrun M5 carry).
 
     reader
         .scan_from(start_pos, |_seq, base, payload| {

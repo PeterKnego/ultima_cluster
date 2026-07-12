@@ -75,6 +75,19 @@ pub enum ServiceError {
     /// fail-stop: the service cannot rebuild its state.
     #[error("journal replay error: {0}")]
     Replay(String),
+    /// M6 Task 5: the journal has been purged below the position the service
+    /// needs (`first_available > needed`) AND the state machine cannot install a
+    /// snapshot to fill the gap — either it does not implement
+    /// [`SnapshotStateMachine`](crate::SnapshotStateMachine), or no on-disk
+    /// snapshot covers the floor. Fail-stop: reconstruction is impossible, so the
+    /// apply agent dies with the contract named rather than replaying a partial
+    /// prefix onto a phantom cursor (the silent-gap bug class).
+    #[error(
+        "SnapshotRequired: journal purged below the service frontier \
+         (needs {needed}, first available {first_available}) and the state \
+         machine cannot install a covering snapshot"
+    )]
+    SnapshotRequired { needed: u64, first_available: u64 },
 }
 
 /// Why a [`SnapshotStateMachine`](crate::SnapshotStateMachine) freeze/stream/

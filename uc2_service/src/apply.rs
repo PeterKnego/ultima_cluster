@@ -33,6 +33,23 @@ use crate::traits::StateMachine;
 /// `S: StateMachine`-bounded type so [`ApplyState`] itself needs no such bound.
 pub(crate) type FreezeFn<S> = Box<dyn Fn(&S) -> Result<(BuildJob, u64), SnapshotError> + Send>;
 
+/// Boxed "install this snapshot stream into the SM" closure (M6 Task 5). Same
+/// type-erasure trick as [`FreezeFn`]: built in `start_with_snapshots` where
+/// `S: SnapshotStateMachine`, called by the reconstruction path on the apply
+/// thread with the SM lock held (install IS state mutation). Returns the
+/// post-install position `S` (== the artifact's tag).
+pub(crate) type InstallFn<S> =
+    Box<dyn Fn(&mut S, u64, &mut dyn std::io::Read) -> Result<u64, SnapshotError> + Send>;
+
+/// The apply thread's below-the-floor reconstruction capability (M6 Task 5).
+/// Present only for a snapshot-capable service (`start_with_snapshots`); its
+/// absence is what turns a below-floor gap into [`ServiceError::SnapshotRequired`]
+/// fail-stop instead of a covering install.
+pub(crate) struct SnapshotRestore<S: StateMachine> {
+    pub(crate) store: crate::snapshots::SnapshotStore,
+    pub(crate) install: InstallFn<S>,
+}
+
 /// M6 Task 3: the apply thread's half of the snapshot-builder handoff. Present
 /// only when the service was started via `start_with_snapshots`; `None` for a
 /// plain `start()` (or an SM that never opted in) means [`maybe_build_snapshot`]
@@ -101,6 +118,10 @@ pub(crate) struct ApplyState<S: StateMachine> {
     pub(crate) my_epoch: u64,
     /// M6 Task 3: `Some` only for a service started via `start_with_snapshots`.
     pub(crate) snapshot_trigger: Option<SnapshotTrigger<S>>,
+    /// M6 Task 5: below-floor reconstruction (snapshot install + tail replay).
+    /// `Some` only for a snapshot-capable service; `None` makes a below-floor
+    /// gap fail-stop with [`ServiceError::SnapshotRequired`].
+    pub(crate) snapshot_restore: Option<SnapshotRestore<S>>,
 }
 
 /// One apply duty cycle. Returns `true` iff it made progress (drove the idle
@@ -183,8 +204,18 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
             // cursor while replay ran, degrades once more from a strictly higher
             // cursor. Forward progress every time.
             st.needs_replay = true;
-            let cursor = replay_into(&st.sm, &st.cnc, &st.journal_dir)
-                .expect("service journal replay fail-stop");
+            let cursor = match replay_into(
+                &st.sm,
+                &st.cnc,
+                &st.journal_dir,
+                st.snapshot_restore.as_ref(),
+            ) {
+                Ok(cursor) => cursor,
+                // Fail-stop with the contract named (Display carries it). The
+                // SnapshotRequired case is the deliberate below-floor-without-
+                // -snapshot outcome; any other Err is genuine journal I/O.
+                Err(e) => panic!("service journal replay fail-stop: {e}"),
+            };
             st.follower.cursor = cursor;
             st.cnc.service().service_applied.store_release(cursor);
             st.needs_replay = false;

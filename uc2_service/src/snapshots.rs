@@ -36,6 +36,10 @@ const SUFFIX: &str = ".ultsnap";
 /// Owns the `instance_dir/snapshots` directory: position-tagged file naming,
 /// atomic publish, and keep-newest-2 retention. Cheap to construct — no open
 /// file handles are held between calls.
+///
+/// `Clone` is cheap (a `PathBuf`) and lets the builder thread and the apply
+/// thread's reconstruction path (M6 Task 5) each hold one over the same dir.
+#[derive(Clone)]
 pub struct SnapshotStore {
     dir: PathBuf,
 }

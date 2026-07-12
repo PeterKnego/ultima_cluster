@@ -215,6 +215,18 @@ impl<S: StateMachine, O: OutputHandler<S>> ServiceBuilder<S, O> {
             tx,
             freeze,
         });
+        // M6 Task 5: the mirror capability — install a covering snapshot when
+        // journal replay would otherwise fall below the purge floor. Built here
+        // for the same reason as `freeze`: `S: SnapshotStateMachine` is only in
+        // scope in this method. The reconstruction path (apply thread, SM lock
+        // held) uses its own `SnapshotStore` clone to locate the newest covering
+        // artifact.
+        let install: crate::apply::InstallFn<S> =
+            Box::new(|sm: &mut S, pos: u64, src: &mut dyn std::io::Read| sm.install_snapshot(pos, src));
+        state.snapshot_restore = Some(crate::apply::SnapshotRestore {
+            store: store.clone(),
+            install,
+        });
         let mut builder_state = BuilderState { rx, store, cnc: Arc::clone(&cnc), busy };
         let builder_agent =
             AgentRunner::spawn("uc2-snapshot-builder", APPLY_IDLE, move || builder_cycle(&mut builder_state))?;

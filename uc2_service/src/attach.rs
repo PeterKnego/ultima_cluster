@@ -77,6 +77,11 @@ pub(crate) fn attach<S: StateMachine>(
     //    newer) instance dir. Refuse rather than replay off a phantom cursor the
     //    journal can never satisfy. `unwrap_or(0)` folds the fresh-SM case in:
     //    `0 > durable` is never true, so a fresh SM never drifts.
+    //
+    //    M6 Task 5 note: this bound is UNCHANGED by purge. `durable` remains the
+    //    right upper bound — a purge only raises the journal's LOWER floor
+    //    (`first_base`); the below-floor case is handled downstream by the apply
+    //    thread's gap guard (snapshot install or `SnapshotRequired`), not here.
     let last_applied = sm.last_applied();
     let frontier = cnc.counters().durable.load_acquire();
     if last_applied.unwrap_or(0) > frontier {
@@ -114,6 +119,10 @@ pub(crate) fn attach<S: StateMachine>(
         // carry) — it overwrites this field on the `Attached` this function
         // returns, before spawning the apply thread.
         snapshot_trigger: None,
+        // M6 Task 5: likewise, only `start_with_snapshots` installs the
+        // below-floor reconstruction capability; a plain `start()` leaves it
+        // `None`, so a purged-below gap fail-stops with `SnapshotRequired`.
+        snapshot_restore: None,
     };
 
     Ok(Attached { apply_state, buffer, cnc, instance_id, epoch })
