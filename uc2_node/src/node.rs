@@ -248,6 +248,10 @@ pub struct Node {
     admission_bytes: u64,
     buffer: Arc<LogBuffer>,
     truncations: Arc<AtomicU64>,
+    /// M6 Task 8: count of wipe-and-rejoins (NoCommonPrefix → truncate-to-0). A
+    /// subset of `truncations` (a wipe is also a truncate), tracked separately for
+    /// observability and the wipe-safety tests.
+    wipes: Arc<AtomicU64>,
     reports_implausible: Arc<AtomicU64>,
     /// M6 Task 4: node-internal mirror of the archive's lowest replayable
     /// position (written by the archive agent). Exposed via
@@ -414,6 +418,7 @@ impl Node {
         let can_serve_flag = Arc::new(AtomicBool::new(false));
         let intake_gate = Arc::new(AtomicBool::new(true)); // open until a term is adopted
         let truncations = Arc::new(AtomicU64::new(0));
+        let wipes = Arc::new(AtomicU64::new(0));
         let reports_implausible = Arc::new(AtomicU64::new(0));
 
         // Peer maps and the follower set. Both voters AND learners go into the
@@ -623,6 +628,7 @@ impl Node {
             can_serve_flag: Arc::clone(&can_serve_flag),
             intake_gate: Arc::clone(&intake_gate),
             truncations: Arc::clone(&truncations),
+            wipes: Arc::clone(&wipes),
             reports_implausible: Arc::clone(&reports_implausible),
             base: Instant::now(),
             durable_seen: durable,
@@ -650,6 +656,7 @@ impl Node {
             admission_bytes: cfg.admission_bytes,
             buffer,
             truncations,
+            wipes,
             reports_implausible,
             archive_first_base,
             route_drops,
@@ -726,6 +733,12 @@ impl Node {
     /// Truncations this node has performed (reconciliation after a divergence).
     pub fn truncations(&self) -> u64 {
         self.truncations.load(Ordering::Relaxed)
+    }
+
+    /// M6 Task 8: how many wipe-and-rejoins (NoCommonPrefix → truncate-to-0) this
+    /// node has performed. A subset of [`Node::truncations`].
+    pub fn wipes(&self) -> u64 {
+        self.wipes.load(Ordering::Relaxed)
     }
 
     /// Current-term follower Reports dropped at the implausibility guard
@@ -837,6 +850,9 @@ struct Consensus {
     can_serve_flag: Arc<AtomicBool>,
     intake_gate: Arc<AtomicBool>,
     truncations: Arc<AtomicU64>,
+    /// M6 Task 8: wipe-and-rejoin count (NoCommonPrefix → truncate-to-0), bumped
+    /// on `Action::CountWipe`. Shared with the `Node` handle for observability.
+    wipes: Arc<AtomicU64>,
     reports_implausible: Arc<AtomicU64>,
     base: Instant,
     durable_seen: u64,
@@ -1761,6 +1777,12 @@ impl Consensus {
             Action::Fatal { reason } => {
                 panic!("consensus fatal (fail-stop): {reason}");
             }
+            Action::CountWipe => {
+                // M6 Task 8: a wipe-and-rejoin was decided; the substantive
+                // `Truncate { to: 0 }` follows in the same action batch. Count it
+                // (distinct from an ordinary truncate) for observability + tests.
+                self.wipes.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -2089,6 +2111,7 @@ mod tests {
             can_serve_flag: Arc::new(AtomicBool::new(false)),
             intake_gate,
             truncations: Arc::new(AtomicU64::new(0)),
+            wipes: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             base: Instant::now(),
             durable_seen: 6016,
@@ -2161,6 +2184,47 @@ mod tests {
         h.post_ack_and_drain(epoch, 4096);
         assert!(h.gate_open(), "the Truncated ack completes reconciliation and reopens");
         assert!(h.cons.pending_truncation.is_none());
+    }
+
+    /// M6 Task 8: a `NoCommonPrefix` reconcile drives a WIPE-AND-REJOIN end to end
+    /// through a real `Consensus`. The divergence predates the leader's shipped
+    /// window (its earliest entry begins above our first byte — the purged-prefix
+    /// case), so the SM emits a truncate-to-0 with an empty map plus a `CountWipe`
+    /// tag. The node runs the true side effects: persists the empty map, closes the
+    /// intake gate, commands the archive `Truncate { to: 0 }`, and counts the wipe
+    /// distinctly from an ordinary truncate. The archive ack then reopens the gate.
+    #[test]
+    fn no_common_prefix_wipes_the_node_and_rejoins_empty() {
+        let mut h = harness();
+        assert_eq!(h.cons.wipes.load(Ordering::Relaxed), 0);
+
+        // Adopt a far-higher term (closes the gate, arms reconciliation).
+        h.cons.feed(Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
+        assert!(!h.gate_open());
+
+        // A leader map whose earliest shipped entry begins at 1<<20 — its window
+        // slid past our first byte (base 0). own=[(1,0),(2,4096)] shares no prefix
+        // ⇒ NoCommonPrefix ⇒ wipe.
+        h.cons.feed(Event::TermMapReceived { term: 41, entries: vec![(40, 1 << 20), (41, 2 << 20)] });
+
+        // The wipe was counted (distinct from a truncate) and the archive was
+        // commanded to truncate to 0 (a full wipe), under an in-flight epoch.
+        assert_eq!(h.cons.wipes.load(Ordering::Relaxed), 1, "wipe counted");
+        let epoch = h.cons.pending_truncation.expect("wipe truncation in flight");
+        assert_eq!(
+            h._trunc_rx.try_recv().ok(),
+            Some(ArchiveCmd::Truncate { epoch, to: 0 }),
+            "a wipe is a truncate-to-0"
+        );
+        assert!(!h.gate_open(), "gate closed across the wipe");
+
+        // The archive ack completes the wipe: the gate reopens (empty follower,
+        // ready to refill from the live stream / snapshot session) and the
+        // truncation is counted.
+        h.post_ack_and_drain(epoch, 0);
+        assert!(h.gate_open(), "the Truncated ack reopens intake after the wipe");
+        assert_eq!(h.cons.pending_truncation, None);
+        assert_eq!(h.cons.truncations.load(Ordering::Relaxed), 1, "a wipe is also a truncate");
     }
 
     /// M5 residual carry: a matching-epoch ack for a truncation whose adopted term

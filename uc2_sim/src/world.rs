@@ -332,6 +332,7 @@ pub struct World {
     // stats
     stat_leaders: u32,
     stat_truncations: u32,
+    stat_wipes: u32,
     stat_restarts: u32,
 }
 
@@ -341,6 +342,9 @@ pub struct Stats {
     pub leaders_elected: u32,
     pub max_commit: u64,
     pub truncations: u32,
+    /// M6 Task 8: wipe-and-rejoins (NoCommonPrefix → truncate-to-0). A subset of
+    /// `truncations`.
+    pub wipes: u32,
     pub restarts: u32,
     pub steps: u64,
 }
@@ -391,6 +395,7 @@ impl World {
             quiet: false,
             stat_leaders: 0,
             stat_truncations: 0,
+            stat_wipes: 0,
             stat_restarts: 0,
             nodes,
             cfg,
@@ -510,6 +515,7 @@ impl World {
             leaders_elected: self.stat_leaders,
             max_commit: self.checker.global_max_commit,
             truncations: self.stat_truncations,
+            wipes: self.stat_wipes,
             restarts: self.stat_restarts,
             steps: self.steps,
         }
@@ -1173,9 +1179,16 @@ impl World {
                     );
                 }
             }
+            Action::CountWipe => {
+                // M6 Task 8: a wipe-and-rejoin was decided; the substantive
+                // `Truncate { to: 0 }` follows in the same batch (handled above).
+                self.stat_wipes += 1;
+            }
             Action::Fatal { reason } => {
-                // NoCommonPrefix must be unreachable within the wire cap; if it
-                // fires, that is an invariant breach (report it, don't paper).
+                // With wipe-and-rejoin ON (default), NoCommonPrefix never reaches
+                // here. It only fires in the wipe-disabled COUNTERFACTUAL, which
+                // deliberately reproduces the old fail-stop to document what the
+                // wipe path changed — so surface it as the invariant breach.
                 return Err(InvariantViolation {
                     invariant: "Fatal unreachable — NoCommonPrefix (spec §8)",
                     step,
@@ -1326,6 +1339,40 @@ impl World {
             SimEvent::Deliver { to, from, msg: Msg::Report { from: id, term, durable } },
             now + self.cfg.latency_min_ns,
         );
+    }
+
+    /// M6 Task 8: deliver a crafted `TermMap` wire message straight into node
+    /// `to`'s reconcile (bypassing the partition table), then run the post-event
+    /// invariant sweep. This models the purged-leader case a natural sim run can't
+    /// cheaply reach: a leader whose shipped term-map tail has slid PAST the
+    /// target's first byte (its low-end entries dropped by log purge), so the
+    /// target finds no common prefix and must WIPE-and-rejoin. `entries` is exactly
+    /// the byte-for-byte wire tail such a leader would ship.
+    pub fn inject_term_map(
+        &mut self,
+        from: usize,
+        to: usize,
+        term: u32,
+        entries: Vec<(u32, u64)>,
+    ) -> Result<(), InvariantViolation> {
+        self.steps += 1;
+        let step = self.steps;
+        let now = self.now;
+        self.deliver(to, from, Msg::TermMap { term, entries }, now, step)?;
+        let maps: Vec<Vec<(u32, u64)>> = self.nodes.iter().map(|n| n.term_map.clone()).collect();
+        self.checker.check_prefix_consistency(&maps, step)
+    }
+
+    /// M6 Task 8: flip a node's SM to the wipe-DISABLED counterfactual — a
+    /// `NoCommonPrefix` reconcile then fail-stops (`Action::Fatal`) instead of
+    /// wiping, documenting exactly what the wipe path changed.
+    pub fn disable_wipe(&mut self, node: usize) {
+        self.nodes[node].sm.set_wipe_on_no_common_prefix(false);
+    }
+
+    /// M6 Task 8: wipe-and-rejoin count observed so far.
+    pub fn wipes(&self) -> u32 {
+        self.stat_wipes
     }
 
     /// A node's current append (write) position.

@@ -150,6 +150,11 @@ pub enum Action {
     /// panics (M6 snapshot install is the real fix). The sim asserts this never
     /// fires at `<= MAX_TERM_MAP_WIRE_ENTRIES` terms.
     Fatal { reason: &'static str },
+    /// M6 Task 8: a wipe-and-rejoin was decided (NoCommonPrefix). This is a pure
+    /// counter tag — the substantive work is the accompanying
+    /// `Truncate { to: 0, new_map: [] }` this is emitted alongside. The agent bumps
+    /// a `wipes` counter and takes no other action.
+    CountWipe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,6 +229,11 @@ pub struct ElectionSm {
     truncation_epoch: u64,
     /// The reconciled map to adopt once the matching `Truncated` feedback arrives.
     pending_new_map: Option<Vec<(u32, u64)>>,
+    /// M6 Task 8: on `Reconcile::NoCommonPrefix`, wipe-and-rejoin (truncate to 0 +
+    /// empty map) instead of fail-stopping. Default `true`. The sim counterfactual
+    /// flips it to `false` to reproduce the OLD `Action::Fatal` behavior and prove
+    /// the same divergent world fail-stops without the wipe.
+    wipe_on_no_common_prefix: bool,
 }
 
 impl ElectionSm {
@@ -301,9 +311,17 @@ impl ElectionSm {
             truncating_epoch: None,
             truncation_epoch: 0,
             pending_new_map: None,
+            wipe_on_no_common_prefix: true,
         };
         sm.arm_timeout(now_ns);
         sm
+    }
+
+    /// M6 Task 8: toggle wipe-and-rejoin on `Reconcile::NoCommonPrefix`. Default
+    /// on (`true`). The sim counterfactual sets it `false` to reproduce the old
+    /// `Action::Fatal` fail-stop on the identical divergent world.
+    pub fn set_wipe_on_no_common_prefix(&mut self, v: bool) {
+        self.wipe_on_no_common_prefix = v;
     }
 
     pub fn step(&mut self, ev: Event, out: &mut Vec<Action>) {
@@ -652,6 +670,33 @@ impl ElectionSm {
     /// when the map merely grows, `Fatal` when there is no common prefix.
     fn reconcile_term_map(&mut self, entries: &[(u32, u64)], out: &mut Vec<Action>) {
         match reconcile(&self.term_map, self.durable, entries) {
+            Reconcile::NoCommonPrefix if self.wipe_on_no_common_prefix => {
+                // WIPE-AND-REJOIN (M6 Task 8). The divergence predates the leader's
+                // shipped term-map window — in M6 this is the real case where the
+                // leader PURGED its log prefix, so its earliest retained entry
+                // begins above our first byte and no incremental cut exists. Rather
+                // than fail-stop, discard our ENTIRE local log and rejoin as an
+                // empty follower: truncate to 0 with an empty map, then let the live
+                // stream refill us (NAK-replay, or a snapshot session when the
+                // leader has purged the prefix — Task 6). We reuse the ordinary
+                // truncate machinery verbatim (persist-empty-map → truncate_to(0)
+                // first-block arm → truncate_all → prime(0) → epoch'd ack → gate
+                // reopen), so a wipe is exactly `Truncate { to: 0, new_map: [] }`.
+                //
+                // SAFETY: this is only ever reached as a FOLLOWER adopting a
+                // higher-or-equal-term leader's map (a leader never reconciles
+                // against another map). The data-plane latch — allow-list
+                // {RequestVote, Vote, Truncated} — holds from this emit until the
+                // wipe's matching-epoch `Truncated` ack lands, so no post-wipe byte
+                // can be accepted (or reported) out of order, and the empty map we
+                // adopt is a trivial (zero-length) prefix of the leader's authority.
+                self.truncation_epoch += 1;
+                let epoch = self.truncation_epoch;
+                self.truncating_epoch = Some(epoch);
+                self.pending_new_map = Some(Vec::new());
+                out.push(Action::CountWipe);
+                out.push(Action::Truncate { epoch, to: 0, new_map: Vec::new() });
+            }
             Reconcile::NoCommonPrefix => out.push(Action::Fatal {
                 reason: "term-map reconciliation found no common prefix (snapshot install required)",
             }),
@@ -1470,10 +1515,32 @@ mod tests {
         assert_eq!(last_durable, Some(500), "durable was clamped to the truncated point");
     }
 
-    /// Reconciliation with no common prefix surfaces `Fatal` (never truncates).
+    /// M6 Task 8: reconciliation with no common prefix WIPES-and-rejoins by
+    /// default — a `CountWipe` tag plus a truncate-to-0 with an empty map (never a
+    /// `Fatal`). own=[(1,0)] @5000 vs a leader whose shipped tail begins at 1<<20:
+    /// the leader's window slid past our first byte (its prefix was purged).
     #[test]
-    fn no_common_prefix_surfaces_fatal() {
+    fn no_common_prefix_wipes_and_rejoins() {
         let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 5000, 0);
+        step(&mut s, Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived { term: 41, entries: vec![(40, 1 << 20), (41, 2 << 20)] },
+        );
+        assert!(acts.iter().any(|a| matches!(a, Action::CountWipe)), "wipe was counted");
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::Truncate { to: 0, new_map, .. } if new_map.is_empty())),
+            "wipe is a truncate-to-0 with an empty map"
+        );
+        assert!(!acts.iter().any(|a| matches!(a, Action::Fatal { .. })), "no fail-stop");
+    }
+
+    /// The counterfactual: with wipe DISABLED, the identical world fail-stops with
+    /// `Fatal` (the old behavior) — documenting exactly what the wipe path changed.
+    #[test]
+    fn no_common_prefix_fatal_when_wipe_disabled() {
+        let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 5000, 0);
+        s.set_wipe_on_no_common_prefix(false);
         step(&mut s, Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
         let acts = step(
             &mut s,
@@ -1481,6 +1548,7 @@ mod tests {
         );
         assert!(acts.iter().any(|a| matches!(a, Action::Fatal { .. })));
         assert!(!acts.iter().any(|a| matches!(a, Action::Truncate { .. })));
+        assert!(!acts.iter().any(|a| matches!(a, Action::CountWipe)));
     }
 
     // ---- M5 truncation-epoch protocol (SM-owned ack identity) ----
