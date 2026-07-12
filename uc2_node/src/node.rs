@@ -22,10 +22,12 @@ use uc2_net::TermHandle;
 use uc2_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc2_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent};
 use uc2_net::sender::{CtrlMsg, Sender, SenderConfig};
-use uc_protocol::ring::{BroadcastRing, MpscRing, SpscRing};
+use uc_protocol::ring::{BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, SpscRing};
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
+use uc_protocol::v2::ipc::{MSG_V2_NOT_LEADER, client_from_extra, extra_client};
 
 use crate::ipc::InstanceDir;
+use uc2_log::buffer::FrameRead;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_TERM_MAP,
     DGRAM_KIND_VOTE, DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, REQUEST_VOTE_BODY_LEN,
@@ -74,8 +76,10 @@ pub struct NodeConfig {
     pub faults: FaultConfig,
 }
 
-/// Why a `submit` was refused. Leader-only ingress (M5 replaces this with the
-/// client ring); a non-serving node or a saturated ingress queue rejects.
+/// Why a `submit` was refused: leader-only ingress. `Full` covers both a
+/// saturated in-process queue and the admission window being closed
+/// (`append - commit > admission_bytes`, Task 7) — either way the caller's
+/// remedy is the same: back off and retry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SubmitError {
     #[error("node is not a serving leader")]
@@ -93,17 +97,30 @@ const INGRESS_PER_CYCLE: usize = 256;
 /// NetEvent channel depth (T7 observability: a full channel counts a drop).
 const NET_EVENT_CAPACITY: usize = 4096;
 
-/// The node's shared-memory IPC rings (spec §7), created fresh at every boot.
-/// Held for the node's life so the mmap'd files stay live for attaching
-/// clients/service. Wired to dispatch agents in later M5 tasks — currently the
-/// node is only the creator, so the handles are held but not yet polled.
+/// The ingress admission door (Task 7, spec §7): open while the unconfirmed
+/// backlog `append - commit` is within `budget`. A closed door leaves records
+/// in the client ring for a later cycle (backpressuring the client's
+/// `try_write` into `RingError::Full` once the ring itself fills) rather than
+/// appending unboundedly ahead of quorum commit. `saturating_sub` makes the
+/// transient `commit > append` snapshot (a stale/racy read across the two
+/// independent atomics) open rather than panic.
+#[inline]
+fn admission_open(append: u64, commit: u64, budget: u64) -> bool {
+    append.saturating_sub(commit) <= budget
+}
+
+/// The node's shared-memory IPC rings not yet wired to an agent (spec §7),
+/// created fresh at every boot. Held for the node's life so the mmap'd files
+/// stay live for attaching clients/service. `ingress` (MPSC) and `egress_node`
+/// (broadcast) are split at boot instead: their consumer/producer halves are
+/// handed to the consensus agent (Task 7); the other halves (not needed on
+/// the node side — attaching clients open the files themselves) are dropped
+/// in `create_rings`. Wired to dispatch agents in later M5 tasks.
 #[allow(dead_code)]
 struct Rings {
-    ingress: MpscRing,
     query: MpscRing,
     svc_query: SpscRing,
     egress_service: BroadcastRing,
-    egress_node: BroadcastRing,
 }
 
 pub struct Node {
@@ -112,6 +129,11 @@ pub struct Node {
     leader_flag: Arc<AtomicBool>,
     can_serve_flag: Arc<AtomicBool>,
     ingress_tx: mpsc::SyncSender<Vec<u8>>,
+    /// Ingress admission budget (`append - commit`), mirrored from
+    /// `NodeConfig` so `submit` (the in-process path) enforces the same
+    /// door as the client ring drain.
+    admission_bytes: u64,
+    buffer: Arc<LogBuffer>,
     truncations: Arc<AtomicU64>,
     reports_implausible: Arc<AtomicU64>,
     route_drops: Arc<uc2_net::receiver::FollowerStats>,
@@ -210,7 +232,9 @@ impl Node {
 
         // 6. Rings created fresh each boot (stale files unlinked first — any
         // prior attachment is invalidated by the new instance_id anyway).
-        let rings = create_rings(&instance)?;
+        // `ingress`/`egress_node` are pre-split: the consensus agent is the
+        // sole owner of the consumer/producer half it drives (Task 7).
+        let (rings, ingress_ring, egress_node) = create_rings(&instance)?;
 
         // Election SM over the recovered credentials.
         let members_ids: Vec<NodeId> = cfg.members.iter().map(|(id, _)| *id).collect();
@@ -340,6 +364,10 @@ impl Node {
             appender: None,
             next_corr: 0,
             pending_ingress: None,
+            ingress_ring,
+            egress_node,
+            admission_bytes: cfg.admission_bytes,
+            pending_ring_ingress: None,
             sock: cons_sock,
             id_to_addr,
             addr_to_id,
@@ -370,6 +398,8 @@ impl Node {
             leader_flag,
             can_serve_flag,
             ingress_tx,
+            admission_bytes: cfg.admission_bytes,
+            buffer,
             truncations,
             reports_implausible,
             route_drops,
@@ -398,12 +428,28 @@ impl Node {
         self.cnc.counters()
     }
 
+    /// Read the committed message frame at `pos` (which must be a frame
+    /// start) via the log buffer's validated read. Exposed for
+    /// harness/embedded callers (e.g. the smoke test) that want to inspect a
+    /// frame's stamped `session_id`/`correlation_id` end to end; the real
+    /// service/client SDKs read frames off the shared-memory rings instead.
+    pub fn read_frame_validated(&self, pos: u64, out: &mut Vec<u8>) -> FrameRead {
+        self.buffer.read_frame_validated(pos, out)
+    }
+
     /// Leader-only ingress: enqueue a payload for the consensus agent to append
-    /// (M5 replaces this with the client submit ring). Refused unless the node
-    /// is a serving leader; `Full` when the bounded queue is saturated.
+    /// (harness/embedded use; the real path is the client ingress MPSC ring,
+    /// Task 7). Refused unless the node is a serving leader, the admission
+    /// window is open (same `append - commit <= admission_bytes` door the
+    /// ring drain enforces), or the bounded in-process queue is saturated.
     pub fn submit(&self, payload: Vec<u8>) -> Result<(), SubmitError> {
         if !self.can_serve() {
             return Err(SubmitError::NotServing);
+        }
+        let append = self.cnc.counters().append.load_acquire();
+        let commit = self.cnc.counters().commit.load_acquire();
+        if !admission_open(append, commit, self.admission_bytes) {
+            return Err(SubmitError::Full);
         }
         match self.ingress_tx.try_send(payload) {
             Ok(()) => Ok(()),
@@ -483,6 +529,21 @@ struct Consensus {
     appender: Option<Appender>,
     next_corr: u64,
     pending_ingress: Option<Vec<u8>>,
+    /// The client ingress ring's consumer half (Task 7) — the consensus
+    /// thread is its sole reader.
+    ingress_ring: MpscConsumer,
+    /// The node egress broadcast ring's producer half (Task 7) — the
+    /// consensus agent is this ring's single writer (currently only
+    /// `MSG_V2_NOT_LEADER`; later tasks add `MSG_V2_RETRY`).
+    egress_node: BroadcastProducer,
+    /// Mirror of `NodeConfig::admission_bytes` (the `append - commit` door
+    /// budget for the ring drain).
+    admission_bytes: u64,
+    /// A ring record held back by a prior `AppendError::WouldOverrun` before
+    /// taking more from `ingress_ring` — the record was already consumed off
+    /// the ring (its consumer position advanced), so it MUST be retried here
+    /// rather than dropped. `(client_id, local_seq, payload)`.
+    pending_ring_ingress: Option<(u32, u32, Vec<u8>)>,
     sock: FaultSocket,
     id_to_addr: HashMap<NodeId, SocketAddr>,
     addr_to_id: HashMap<SocketAddr, NodeId>,
@@ -546,10 +607,19 @@ impl Consensus {
             did = true;
         }
 
-        // 3. Drain the ingress queue (leader && serving only), bounded.
-        if self.leader_flag.load(Ordering::Relaxed) && self.sm.can_serve() {
+        // 3. Drain the in-process ingress queue (leader && serving only, the
+        // harness/embedded path), bounded.
+        let serving = self.leader_flag.load(Ordering::Relaxed) && self.sm.can_serve();
+        if serving {
             did |= self.drain_ingress();
         }
+
+        // 3b. Drain the client ingress MPSC ring (Task 7): appends while
+        // serving, subject to the admission window, or redirects each record
+        // with `MSG_V2_NOT_LEADER` while not. Runs every cycle regardless of
+        // role — bounded by `INGRESS_PER_CYCLE` either way so a saturated
+        // ring cannot starve the rest of the duty cycle.
+        did |= self.drain_ingress_ring(serving);
 
         // 4. Feed the tick — the ONLY place real time enters the SM.
         let now = self.now_ns();
@@ -633,6 +703,91 @@ impl Consensus {
                 true // consumed (dropped) — do not wedge the queue on it
             }
         }
+    }
+
+    /// Drain the client ingress MPSC ring, bounded by `INGRESS_PER_CYCLE`
+    /// whether `serving` or not (a saturated ring must never starve the rest
+    /// of the duty cycle). While serving, each record is appended via the
+    /// leader appender — gated by the admission window (`append - commit <=
+    /// admission_bytes`); once the window closes, drainage stops for this
+    /// cycle and the remaining records stay in the ring (backpressuring the
+    /// client's `try_write` into `RingError::Full` once it also fills).
+    /// While NOT serving, every drained record is answered with
+    /// `MSG_V2_NOT_LEADER` on the node egress broadcast instead of being
+    /// appended.
+    fn drain_ingress_ring(&mut self, serving: bool) -> bool {
+        let mut did = false;
+
+        // Retry a record held back by a prior WouldOverrun before taking
+        // more — it was already consumed off the ring, so it must not be
+        // dropped. Only meaningful while serving (only path that appends);
+        // a role flip while one is pending just carries it to the next
+        // serving window (the ring itself has no memory of it any more).
+        if serving && let Some((client_id, local_seq, payload)) = self.pending_ring_ingress.take() {
+            if !self.try_append_client(client_id, local_seq, &payload) {
+                self.pending_ring_ingress = Some((client_id, local_seq, payload));
+                return did;
+            }
+            did = true;
+        }
+
+        for _ in 0..INGRESS_PER_CYCLE {
+            if serving {
+                let append = self.cnc.counters().append.load_acquire();
+                let commit = self.cnc.counters().commit.load_acquire();
+                if !admission_open(append, commit, self.admission_bytes) {
+                    break; // door closed; leave the rest in the ring this cycle
+                }
+            }
+            let mut buf = Vec::new();
+            match self.ingress_ring.try_read(&mut buf) {
+                Ok(Some(rec)) => {
+                    let (client_id, local_seq) = client_from_extra(rec.header_extra);
+                    if serving {
+                        if !self.try_append_client(client_id, local_seq, &buf) {
+                            self.pending_ring_ingress = Some((client_id, local_seq, buf));
+                            break;
+                        }
+                    } else {
+                        self.send_not_leader(client_id, local_seq);
+                    }
+                    did = true;
+                }
+                Ok(None) => break,
+                // Corrupt record (bad crc/magic — the wire has no per-record
+                // recovery once framing is suspect): stop this cycle rather
+                // than risk misreading a subsequent slot; the next cycle
+                // re-tries at the same (unread) consumer position.
+                Err(_) => break,
+            }
+        }
+        did
+    }
+
+    /// Append one client-stamped ring record; `false` = would overrun
+    /// (caller holds it back for retry). A too-large payload is dropped (a
+    /// client contract violation, not backpressure) — same policy as
+    /// `try_append`.
+    fn try_append_client(&mut self, client_id: u32, local_seq: u32, payload: &[u8]) -> bool {
+        let Some(app) = self.appender.as_mut() else { return false };
+        match app.append(client_id as u64, local_seq as u64, payload) {
+            Ok(_) => true,
+            Err(AppendError::WouldOverrun) => false,
+            Err(AppendError::PayloadTooLarge) => true, // consumed (dropped)
+        }
+    }
+
+    /// Answer a drained ingress record with `MSG_V2_NOT_LEADER` on the node
+    /// egress broadcast, echoing the client's identity in `header_extra` so
+    /// it can pick its own answer out of the shared broadcast (every client
+    /// sees every record). Payload is the current `leader_hint`
+    /// (`u64::MAX` = unknown) as 8 LE bytes. Best-effort: `BroadcastProducer`
+    /// never blocks and a write failure here (e.g. an oversized frame, which
+    /// this fixed 8-byte payload can never be) is not actionable.
+    fn send_not_leader(&mut self, client_id: u32, local_seq: u32) {
+        let leader_hint = self.cnc.status().leader_hint.load_acquire();
+        let extra = extra_client(client_id, local_seq);
+        let _ = self.egress_node.write(MSG_V2_NOT_LEADER, 0, extra, &leader_hint.to_le_bytes());
     }
 
     /// Translate a wire NetEvent into an SM event and feed it. Unknown source
@@ -967,7 +1122,13 @@ fn open_or_create_buffer(
 /// file first — a prior instance's attachment is invalidated by the new
 /// instance_id anyway). Sizes are fixed by the spec: ingress 4 MiB, query
 /// 1 MiB, svc_query 1 MiB, both broadcasts 4 MiB; 64 KiB max message each.
-fn create_rings(dir: &InstanceDir) -> io::Result<Rings> {
+/// Returns the not-yet-wired `Rings`, plus the ingress ring's consumer half
+/// and the node egress ring's producer half — the two halves the consensus
+/// agent drives (Task 7). Their counterpart halves (an ingress producer, an
+/// egress_node consumer) are dropped here: the node itself never produces
+/// into ingress or consumes from egress_node, and attaching clients open the
+/// files themselves to get their own halves.
+fn create_rings(dir: &InstanceDir) -> io::Result<(Rings, MpscConsumer, BroadcastProducer)> {
     const MIB: u64 = 1 << 20;
     const MAX_MSG: u32 = 64 << 10;
     for p in [
@@ -979,14 +1140,20 @@ fn create_rings(dir: &InstanceDir) -> io::Result<Rings> {
     ] {
         let _ = std::fs::remove_file(&p);
     }
-    Ok(Rings {
-        ingress: MpscRing::create(&dir.ingress_ring(), 4 * MIB, MAX_MSG).map_err(to_io)?,
-        query: MpscRing::create(&dir.query_ring(), MIB, MAX_MSG).map_err(to_io)?,
-        svc_query: SpscRing::create(&dir.svc_query_ring(), MIB, MAX_MSG).map_err(to_io)?,
-        egress_service: BroadcastRing::create(&dir.egress_service(), 4 * MIB, MAX_MSG)
-            .map_err(to_io)?,
-        egress_node: BroadcastRing::create(&dir.egress_node(), 4 * MIB, MAX_MSG).map_err(to_io)?,
-    })
+    let ingress = MpscRing::create(&dir.ingress_ring(), 4 * MIB, MAX_MSG).map_err(to_io)?;
+    let (_ingress_producer, ingress_consumer) = ingress.into_split();
+    let egress_node = BroadcastRing::create(&dir.egress_node(), 4 * MIB, MAX_MSG).map_err(to_io)?;
+    let egress_node_producer = egress_node.producer();
+    Ok((
+        Rings {
+            query: MpscRing::create(&dir.query_ring(), MIB, MAX_MSG).map_err(to_io)?,
+            svc_query: SpscRing::create(&dir.svc_query_ring(), MIB, MAX_MSG).map_err(to_io)?,
+            egress_service: BroadcastRing::create(&dir.egress_service(), 4 * MIB, MAX_MSG)
+                .map_err(to_io)?,
+        },
+        ingress_consumer,
+        egress_node_producer,
+    ))
 }
 
 fn to_pairs(m: &TermMap) -> Vec<(u32, u64)> {
@@ -1151,6 +1318,16 @@ mod tests {
         let sock = FaultSocket::from_socket(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
         let intake_gate = Arc::new(AtomicBool::new(true));
 
+        // Real ring files under the harness tempdir (small — nothing in this
+        // module's tests writes real ring traffic through them; that's
+        // covered by uc2_node/tests/smoke.rs).
+        let (_ingress_producer, ingress_ring) =
+            MpscRing::create(&dir.path().join("ingress.ring"), 4096, 1024).unwrap().into_split();
+        let egress_node =
+            BroadcastRing::create(&dir.path().join("egress_node.broadcast"), 4096, 1024)
+                .unwrap()
+                .producer();
+
         let cons = Consensus {
             id: 1,
             sm,
@@ -1160,6 +1337,10 @@ mod tests {
             appender: None,
             next_corr: 0,
             pending_ingress: None,
+            ingress_ring,
+            egress_node,
+            admission_bytes: 256 * 1024,
+            pending_ring_ingress: None,
             sock,
             id_to_addr,
             addr_to_id,
@@ -1325,5 +1506,26 @@ mod tests {
             "higher-term report must reach the SM and adopt the term"
         );
         assert_eq!(h.cons.reports_implausible.load(Ordering::Relaxed), 1, "adoption not counted");
+    }
+
+    /// Task 7: the ingress admission door's pure decision function. Exercised
+    /// directly (rather than via a live single-node commit race, which can't
+    /// hold `commit` still to force the window shut) per the brief's Step 4.
+    #[test]
+    fn admission_guard_math() {
+        // No backlog: wide open.
+        assert!(admission_open(100, 100, 4096));
+        // Exactly at budget: still open (the check is `<=`).
+        assert!(admission_open(4096, 0, 4096));
+        // One byte over budget: closed.
+        assert!(!admission_open(4097, 0, 4096));
+        // A much larger backlog: closed.
+        assert!(!admission_open(1 << 20, 0, 4096));
+        // Commit observed (transiently) ahead of append: `saturating_sub`
+        // must not underflow/panic, and the door stays open.
+        assert!(admission_open(0, 100, 4096));
+        // Zero budget: only a perfectly caught-up door is open.
+        assert!(admission_open(50, 50, 0));
+        assert!(!admission_open(51, 50, 0));
     }
 }

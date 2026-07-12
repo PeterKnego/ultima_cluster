@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig};
+use uc_protocol::v2::ipc::{MSG_V2_SUBMIT, extra_client};
 
 /// A single-member config over an ephemeral loopback port. The member addr is a
 /// placeholder — a one-node cluster elects itself with no peer sends, so the
@@ -142,4 +143,41 @@ fn single_node_cluster_elects_itself_and_serves() {
     // committed NewTerm frame (both observed above) could exist.
     let vote = uc2_log::state::NodeState::open(&dir.path().join("state")).unwrap().vote();
     assert_eq!(vote, Some(uc2_log::state::VoteRecord { term: 1, voted_for: 0 }));
+}
+
+/// Read the frame at `pos` via the buffer's validated read, panicking if it
+/// is not (yet) a committed message frame — the harness already waited for
+/// commit to pass `pos` before calling this.
+fn read_frame_at(node: &Node, pos: u64, buf: &mut Vec<u8>) -> uc_protocol::v2::frame::FrameHeader {
+    match node.read_frame_validated(pos, buf) {
+        uc2_log::buffer::FrameRead::Frame(hdr) => hdr,
+        other => panic!("expected a committed frame at {pos}, got {other:?}"),
+    }
+}
+
+/// Task 7: a client attaches to `ingress.ring` directly (the real cross-
+/// process path — no `Node::submit`), writes a `MSG_V2_SUBMIT` record
+/// carrying its `(client_id, local_seq)` in `header_extra`, and the consensus
+/// agent's ring drain appends it — stamping the log frame's
+/// `session_id`/`correlation_id` from that same identity end to end.
+#[test]
+fn ingress_ring_submission_reaches_commit_and_non_leader_redirects() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = start_single_node(dir.path());
+    wait_until(|| node.can_serve());
+
+    let ring = uc_protocol::ring::mpsc::MpscRing::open(&dir.path().join("ingress.ring")).unwrap();
+    let (prod, _) = ring.into_split();
+
+    let commit0 = node.counters().commit.load_acquire();
+    prod.try_write(MSG_V2_SUBMIT, 0, extra_client(7, 1), b"hello-ring").unwrap();
+    wait_until(|| node.counters().commit.load_acquire() > commit0);
+
+    // The frame carries the client identity end to end.
+    let mut buf = Vec::new();
+    let hdr = read_frame_at(&node, commit0, &mut buf);
+    assert_eq!(hdr.session_id, 7);
+    assert_eq!(hdr.correlation_id, 1);
+
+    node.stop();
 }

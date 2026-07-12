@@ -7,3 +7,4 @@
 pub mod cnc;
 pub mod datagram;
 pub mod frame;
+pub mod ipc;
