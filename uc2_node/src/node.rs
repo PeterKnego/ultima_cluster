@@ -113,6 +113,7 @@ pub struct Node {
     can_serve_flag: Arc<AtomicBool>,
     ingress_tx: mpsc::SyncSender<Vec<u8>>,
     truncations: Arc<AtomicU64>,
+    reports_implausible: Arc<AtomicU64>,
     route_drops: Arc<uc2_net::receiver::FollowerStats>,
     partition_handles: Vec<PartitionHandle>,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
@@ -240,6 +241,7 @@ impl Node {
         let can_serve_flag = Arc::new(AtomicBool::new(false));
         let intake_gate = Arc::new(AtomicBool::new(true)); // open until a term is adopted
         let truncations = Arc::new(AtomicU64::new(0));
+        let reports_implausible = Arc::new(AtomicU64::new(0));
 
         // Peer maps and the follower set.
         let mut id_to_addr = HashMap::new();
@@ -352,6 +354,7 @@ impl Node {
             can_serve_flag: Arc::clone(&can_serve_flag),
             intake_gate: Arc::clone(&intake_gate),
             truncations: Arc::clone(&truncations),
+            reports_implausible: Arc::clone(&reports_implausible),
             base: Instant::now(),
             durable_seen: durable,
             adopted_term: boot_term,
@@ -368,6 +371,7 @@ impl Node {
             can_serve_flag,
             ingress_tx,
             truncations,
+            reports_implausible,
             route_drops,
             partition_handles,
             _instance: instance,
@@ -418,6 +422,15 @@ impl Node {
     /// Truncations this node has performed (reconciliation after a divergence).
     pub fn truncations(&self) -> u64 {
         self.truncations.load(Ordering::Relaxed)
+    }
+
+    /// Current-term follower Reports dropped at the implausibility guard
+    /// (claimed durable beyond our own append — provably corrupt in a static
+    /// term; the wire has no CRC). M4 I-1 carry: one bit-flipped datagram must
+    /// never manufacture a commit. Observability only — the drop poisons
+    /// nothing (a later legitimate report still ranks).
+    pub fn reports_implausible(&self) -> u64 {
+        self.reports_implausible.load(Ordering::Relaxed)
     }
 
     /// Consensus events dropped because the NetEvent channel was full (T7
@@ -484,6 +497,7 @@ struct Consensus {
     can_serve_flag: Arc<AtomicBool>,
     intake_gate: Arc<AtomicBool>,
     truncations: Arc<AtomicU64>,
+    reports_implausible: Arc<AtomicU64>,
     base: Instant,
     durable_seen: u64,
     adopted_term: u32,
@@ -627,6 +641,32 @@ impl Consensus {
         let event = match ev {
             NetEvent::Report { from, term, durable } => {
                 let Some(id) = self.addr_to_id.get(&from).copied() else { return };
+                // Implausibility guard (M4 I-1 carry, ported from the deleted
+                // legacy sender arm): a follower cannot hold bytes the leader
+                // never appended. The wire has no CRC, so a bit-flip that
+                // escapes the UDP checksum could inflate this report; a
+                // CURRENT-term report claiming more than our own append is
+                // provably corrupt. DROP it whole (count it) rather than
+                // clamp-to-append: clamping would still let one corrupt
+                // datagram certify that the follower holds every appended
+                // byte — {own, own, 0} ranks own at the quorum slot —
+                // manufacturing a phantom commit on leader-only durability
+                // and defeating the quorum-loss-stall theorem. Dropping
+                // poisons nothing: the tracker slot is monotonic-max, so a
+                // later legitimate report still advances it. The guard is
+                // scoped to term == current on purpose: a HIGHER-term report
+                // must always reach the SM (it triggers adopt_term — the one
+                // legitimate way a follower leads our append, e.g. a restarted
+                // leader re-primed below a still-ahead follower, arrives via
+                // term machinery, never inside a static term). Stale terms
+                // pass through too — the SM drops them itself. This guard is
+                // node-side by design: the SM never sees the append counter.
+                if term == self.sm.current_term()
+                    && durable > self.cnc.counters().append.load_acquire()
+                {
+                    self.reports_implausible.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
                 Event::Report { from: id, term, durable }
             }
             NetEvent::CommitGossip { from, term, commit } => {
@@ -1068,10 +1108,13 @@ mod tests {
             Arc::clone(&cnc),
             4096,
         ));
-        cnc.counters().prime(6000);
+        // 6016 = 188 * 32: stream positions are always FRAME-aligned in the
+        // real system, and a leader-election test appends the NewTerm frame at
+        // this base (a misaligned base trips the buffer's alignment asserts).
+        cnc.counters().prime(6016);
         let state = NodeState::open(dir.path()).unwrap();
 
-        // id=1 in [0,1,2]; own map (1,0),(2,4096) at durable 6000 → boot_term 2.
+        // id=1 in [0,1,2]; own map (1,0),(2,4096) at durable 6016 → boot_term 2.
         let members = vec![0u32, 1, 2];
         let sm = ElectionSm::new(
             ElectionConfig {
@@ -1084,7 +1127,7 @@ mod tests {
             },
             None,
             &[(1, 0), (2, 4096)],
-            6000,
+            6016,
             0,
         );
         let boot_term = sm.current_term();
@@ -1131,8 +1174,9 @@ mod tests {
             can_serve_flag: Arc::new(AtomicBool::new(false)),
             intake_gate,
             truncations: Arc::new(AtomicU64::new(0)),
+            reports_implausible: Arc::new(AtomicU64::new(0)),
             base: Instant::now(),
-            durable_seen: 6000,
+            durable_seen: 6016,
             adopted_term: boot_term,
             awaiting_reconcile: false,
             pending_truncation: None,
@@ -1215,5 +1259,71 @@ mod tests {
         // clean reconcile in term 4 reopens
         h.cons.feed(Event::TermMapReceived { term: 4, entries: vec![(1, 0), (4, 4096)] });
         assert!(h.gate_open());
+    }
+
+    /// M4 I-1 carry, ported guard: a CURRENT-term follower Report claiming a
+    /// durable beyond our own append is provably corrupt (no wire CRC — one
+    /// bit-flip can inflate it) and must be DROPPED WHOLE at the node's
+    /// `feed_net`, never ranked and never clamped — clamping would rank
+    /// {own, own, 0} at the quorum slot and manufacture a phantom commit on
+    /// leader-only durability. The drop poisons nothing (the tracker slot is
+    /// monotonic-max: a later legitimate report still ranks), and the guard is
+    /// term-scoped: a HIGHER-term report must still reach the SM to trigger
+    /// adoption. This guard lived in the legacy M3 sender arm deleted by M4
+    /// carry #5; this test pins its node-mode port (the SM cannot host it —
+    /// it never sees the append counter).
+    #[test]
+    fn implausible_current_term_report_is_dropped_not_ranked() {
+        let mut h = harness();
+        let addr0: SocketAddr = "127.0.0.1:9100".parse().unwrap(); // member 0
+
+        // Drive the harness node (id 1, boot term 2, durable/append primed at
+        // 6016) to LEADER: election timeout fires -> candidate term 3; one
+        // peer grant (2 of 3 with the self-vote) -> BecomeLeader, which appends
+        // the 32 B NewTerm frame at base 6016 (append -> 6048).
+        h.cons.feed(Event::Tick { now_ns: 301 });
+        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+        assert_eq!(h.cons.sm.current_term(), 3);
+        assert!(h.cons.leader_flag.load(Ordering::Acquire), "election did not complete");
+        let append = h.cons.cnc.counters().append.load_acquire();
+        assert_eq!(append, 6048, "NewTerm frame must sit at [6016, 6048)");
+        assert_eq!(h.cons.cnc.counters().commit.load_acquire(), 0);
+        // Own archive covers the full append (feeds the tracker's own-durable).
+        h.cons.feed(Event::DurableAdvanced { durable: append });
+
+        // A forged/corrupt CURRENT-term report far beyond our append. Unguarded
+        // it would rank {own=6048, 2^40, 0} -> 2nd highest = 2^40 -> bounded by
+        // own = 6048 -> a PHANTOM commit of the whole log on leader-only
+        // durability. Guarded: dropped whole + counted, commit stays 0.
+        h.cons.feed_net(NetEvent::Report { from: addr0, term: 3, durable: 1 << 40 });
+        assert_eq!(
+            h.cons.cnc.counters().commit.load_acquire(),
+            0,
+            "implausible report manufactured a phantom commit on leader-only durability"
+        );
+        assert_eq!(h.cons.reports_implausible.load(Ordering::Relaxed), 1, "drop must be counted");
+
+        // The drop poisoned nothing: a legitimate report (durable == append)
+        // from the same follower ranks normally -> quorum {6048, 6048, 0} ->
+        // commit advances to 6048.
+        h.cons.feed_net(NetEvent::Report { from: addr0, term: 3, durable: append });
+        assert_eq!(
+            h.cons.cnc.counters().commit.load_acquire(),
+            append,
+            "legitimate report after a dropped one must still rank (slot not poisoned)"
+        );
+        assert_eq!(h.cons.reports_implausible.load(Ordering::Relaxed), 1);
+
+        // Term-scoping is load-bearing: a HIGHER-term report — even one with an
+        // absurd durable — must NOT be eaten by the guard; it reaches the SM
+        // and triggers term adoption (the legitimate follower-leads-our-append
+        // case arrives via term machinery, never inside a static term).
+        h.cons.feed_net(NetEvent::Report { from: addr0, term: 7, durable: 1 << 40 });
+        assert_eq!(
+            h.cons.sm.current_term(),
+            7,
+            "higher-term report must reach the SM and adopt the term"
+        );
+        assert_eq!(h.cons.reports_implausible.load(Ordering::Relaxed), 1, "adoption not counted");
     }
 }
