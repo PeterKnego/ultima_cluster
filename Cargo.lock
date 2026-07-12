@@ -2635,8 +2635,11 @@ dependencies = [
 name = "uc2_node"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bincode",
+ "clap",
  "fs2",
+ "hdrhistogram",
  "rand 0.9.4",
  "serde",
  "tempfile",
