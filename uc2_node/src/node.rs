@@ -110,6 +110,13 @@ const QUERY_DRAIN_PER_CYCLE: usize = 64;
 /// `MSG_V2_RETRY` (side-effect-free) and dropped. Same order as the election
 /// timeout — a partitioned-away leader fails its reads within ~1s.
 const READ_BARRIER_TIMEOUT_NS: u64 = 1_000_000_000;
+/// Output-progress persist floor (Task 12 / spec §7): rate-limits the durable
+/// `StableValue::store` (an fsync) to at most once per 100 ms even under a
+/// change every cycle. The cheap in-page `output_completed` compare still runs
+/// every cycle; only the durable persist (and its cnc mirror update) is
+/// floored. A persist lag only WIDENS the next incarnation's at-least-once
+/// replay window — never a correctness issue (see `NodeState`'s module doc).
+const OUTPUT_PROGRESS_FLOOR_NS: u64 = 100_000_000;
 
 /// Phase of an in-flight linearizable read (the ReadIndex barrier state
 /// machine, spec §7 / v1 task14).
@@ -270,11 +277,12 @@ impl Node {
             cfg.max_payload,
         )?);
 
-        // 5. Durable output-progress marker → mirror onto the page for attaching
-        // parties. There is no persisted marker until the output loop lands (a
-        // later M5 task); the page's zeroed default (0) is the correct boot
-        // value, published explicitly here as the mirror point.
-        let output_progress = 0u64;
+        // 5. Durable output-progress marker (Task 12) → mirror onto the page for
+        // attaching parties. `state.output_progress()` is whatever the output
+        // loop last durably persisted (0 for a fresh instance dir, or if the
+        // output loop has never run); the service's output agent reads this
+        // SAME mirror at attach to seed its cursor (spec §7).
+        let output_progress = state.output_progress();
         cnc.status().output_progress.store_release(output_progress);
 
         // 6. Rings created fresh each boot (stale files unlinked first — any
@@ -439,6 +447,8 @@ impl Node {
             adopted_term: boot_term,
             awaiting_reconcile: false,
             pending_truncation: None,
+            output_persisted_completed: output_progress,
+            output_progress_last_persist_ns: None,
         };
         let consensus_agent =
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
@@ -633,6 +643,16 @@ struct Consensus {
     /// from `Action::Truncate` exec until the matching slot ack; the intake-gate
     /// reopen discipline uses it to know a truncation is pending.
     pending_truncation: Option<u64>,
+    /// Last `output_completed` value durably persisted to
+    /// `state/output_progress.state` (Task 12) — lets `maybe_persist_output_progress`
+    /// tell "changed since last persist" apart from "unchanged, nothing to do"
+    /// with one cheap compare per cycle.
+    output_persisted_completed: u64,
+    /// Monotonic ns (via `now_ns`) of the last output-progress persist; `None`
+    /// until the first one (so the very first observed change persists without
+    /// waiting out the floor). The 100 ms floor rate-limits the fsync'd
+    /// `StableValue::store`, not the cheap in-page compare that runs every cycle.
+    output_progress_last_persist_ns: Option<u64>,
 }
 
 impl Consensus {
@@ -711,7 +731,39 @@ impl Consensus {
         // cycle; `node_heartbeat_ns` is wall-clock ns (SystemTime) so a service
         // in another process can compare it against its own clock for liveness.
         self.publish_status();
+
+        // 7. Sample the service-written `output_completed` counter (Task 12);
+        // on change, durably persist + mirror it, subject to the 100 ms floor.
+        did |= self.maybe_persist_output_progress();
         did
+    }
+
+    /// Sample `service().output_completed` (a cheap compare every cycle); on a
+    /// change, once at least [`OUTPUT_PROGRESS_FLOOR_NS`] has elapsed since the
+    /// last persist, durably store it via `NodeState::store_output_progress`
+    /// THEN mirror it onto `status().output_progress` — durable-then-mirror,
+    /// never the other order, so an attaching service can never observe a
+    /// mirror value ahead of what actually survives a node crash. Returns
+    /// `true` iff it persisted (drives the idle strategy).
+    fn maybe_persist_output_progress(&mut self) -> bool {
+        let completed = self.cnc.service().output_completed.load_acquire();
+        if completed == self.output_persisted_completed {
+            return false;
+        }
+        let now = self.now_ns();
+        let floor_elapsed = self
+            .output_progress_last_persist_ns
+            .is_none_or(|last| now.saturating_sub(last) >= OUTPUT_PROGRESS_FLOOR_NS);
+        if !floor_elapsed {
+            return false;
+        }
+        self.state
+            .store_output_progress(completed)
+            .expect("output_progress persist fail-stop (journal I/O)");
+        self.cnc.status().output_progress.store_release(completed);
+        self.output_persisted_completed = completed;
+        self.output_progress_last_persist_ns = Some(now);
+        true
     }
 
     /// Publish `term`, `flags` (leader/can_serve), and a fresh wall-clock
@@ -1664,6 +1716,8 @@ mod tests {
             adopted_term: boot_term,
             awaiting_reconcile: false,
             pending_truncation: None,
+            output_persisted_completed: 0,
+            output_progress_last_persist_ns: None,
         };
 
         Harness {

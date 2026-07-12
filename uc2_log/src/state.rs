@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! Persisted per-node consensus state (spec §6): the vote record and the
-//! term map (the RecordingLog analog), each a rotating two-slot
-//! `StableValue`. Both stores are DURABLE ON RETURN (`Notifier::wait`) —
-//! the vote's persist-before-answer contract and the term map's
-//! open-term-before-serving contract both depend on that, so this module
-//! never exposes a fire-and-forget store.
+//! Persisted per-node consensus state (spec §6): the vote record, the
+//! term map (the RecordingLog analog), and the output-progress marker
+//! (Task 12), each a rotating two-slot `StableValue`. All three stores are
+//! DURABLE ON RETURN (`Notifier::wait`) — the vote's persist-before-answer
+//! contract and the term map's open-term-before-serving contract both depend
+//! on that, so this module never exposes a fire-and-forget store. The
+//! output-progress marker does not strictly need durable-on-return (a
+//! persistence lag only widens at-least-once replay — see
+//! `uc2_node::node::Consensus::maybe_persist_output_progress`), but reuses the
+//! same durable `StableValue` primitive for consistency.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -33,21 +37,27 @@ pub type TermMap = Vec<TermMapEntry>;
 pub struct NodeState {
     vote: StableValue<VoteRecord>,
     term_map: StableValue<TermMap>,
+    output_progress: StableValue<u64>,
     /// Cached copies (`StableValue::load` clones the cached value, but reads on
-    /// the consensus hot path go through this single lock; the term map and the
-    /// vote share it so a recovery read is one lock, not two).
-    cache: Mutex<(Option<VoteRecord>, TermMap)>,
+    /// the consensus hot path go through this single lock; the term map, the
+    /// vote, and the output-progress marker share it so a recovery read is one
+    /// lock, not three).
+    cache: Mutex<(Option<VoteRecord>, TermMap, u64)>,
 }
 
 impl NodeState {
-    /// Open (create if absent) `vote.state` + `term_map.state` in `dir`, seeding
-    /// the read cache from whatever survived the last run.
+    /// Open (create if absent) `vote.state` + `term_map.state` +
+    /// `output_progress.state` in `dir`, seeding the read cache from whatever
+    /// survived the last run.
     pub fn open(dir: &Path) -> Result<Self, StableValueError> {
         let vote = StableValue::open(StableValueConfig::new(dir.join("vote.state")))?;
         let term_map = StableValue::open(StableValueConfig::new(dir.join("term_map.state")))?;
+        let output_progress =
+            StableValue::open(StableValueConfig::new(dir.join("output_progress.state")))?;
         let v = vote.load()?;
         let m = term_map.load()?.unwrap_or_default();
-        Ok(Self { vote, term_map, cache: Mutex::new((v, m)) })
+        let op = output_progress.load()?.unwrap_or(0);
+        Ok(Self { vote, term_map, output_progress, cache: Mutex::new((v, m, op)) })
     }
 
     pub fn vote(&self) -> Option<VoteRecord> {
@@ -56,6 +66,12 @@ impl NodeState {
 
     pub fn term_map(&self) -> TermMap {
         self.cache.lock().unwrap().1.clone()
+    }
+
+    /// The last durably-persisted output-progress marker (Task 12); `0` if the
+    /// output loop has never advanced it (or this is a fresh instance dir).
+    pub fn output_progress(&self) -> u64 {
+        self.cache.lock().unwrap().2
     }
 
     /// Durable on return — the caller may answer the vote request only after
@@ -70,6 +86,16 @@ impl NodeState {
     pub fn store_term_map(&self, m: &TermMap) -> Result<(), StableValueError> {
         self.term_map.store(m)?.wait().map_err(durability_error)?;
         self.cache.lock().unwrap().1 = m.clone();
+        Ok(())
+    }
+
+    /// Durable on return — persist the output-progress marker (Task 12). A
+    /// stale (lagging) reader between this write and a crash only widens the
+    /// next incarnation's at-least-once replay window; never a correctness
+    /// issue (see the module doc).
+    pub fn store_output_progress(&self, v: u64) -> Result<(), StableValueError> {
+        self.output_progress.store(&v)?.wait().map_err(durability_error)?;
+        self.cache.lock().unwrap().2 = v;
         Ok(())
     }
 }
@@ -121,5 +147,19 @@ mod tests {
         s.store_vote(VoteRecord { term: 1, voted_for: 0 }).unwrap();
         s.store_vote(VoteRecord { term: 2, voted_for: 1 }).unwrap();
         assert_eq!(s.vote(), Some(VoteRecord { term: 2, voted_for: 1 }));
+    }
+
+    #[test]
+    fn output_progress_defaults_to_zero_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = NodeState::open(dir.path()).unwrap();
+            assert_eq!(s.output_progress(), 0, "fresh instance dir marker defaults to 0");
+            s.store_output_progress(4096).unwrap();
+            assert_eq!(s.output_progress(), 4096);
+        }
+        // "restart": reopen from the same dir.
+        let s = NodeState::open(dir.path()).unwrap();
+        assert_eq!(s.output_progress(), 4096, "durable marker survives reopen");
     }
 }

@@ -14,6 +14,11 @@ ultima-journal = { path = "../ultima_journal" }
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }
+# Task 12 (OutputHandler): the output agent's own `current_thread` runtime.
+# `rt` (thread scheduling / block_on) + `time` (a handler's own `tokio::time`
+# use inside `on_committed`) ONLY — no multi-thread runtime, no macros, no I/O
+# drivers; the retry backoff itself sleeps via plain `std::thread::sleep`.
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
 
 [dev-dependencies]
 uc2_node = { path = "../uc2_node" }

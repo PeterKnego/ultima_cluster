@@ -21,6 +21,11 @@ use crate::traits::StateMachine;
 /// state (moved into its thread) plus the handles the `Service` keeps.
 pub(crate) struct Attached<S: StateMachine> {
     pub(crate) apply_state: ApplyState<S>,
+    /// The log buffer, held separately (not just inside `apply_state.follower`)
+    /// so the builder can hand the output agent (Task 12) its OWN independent
+    /// [`LogFollower`] over the same buffer — apply and output are two distinct
+    /// readers with two distinct cursors.
+    pub(crate) buffer: Arc<LogBuffer>,
     pub(crate) cnc: Arc<CncPage>,
     pub(crate) instance_id: u128,
     /// This incarnation's service epoch (the post-bump value).
@@ -92,7 +97,7 @@ pub(crate) fn attach<S: StateMachine>(
     //    bump-once-at-attach point; it happens before the thread is READY.
     let epoch = cnc.service().service_epoch.fetch_add(1) + 1;
 
-    let follower = LogFollower::new(buffer, start_pos);
+    let follower = LogFollower::new(Arc::clone(&buffer), start_pos);
     let apply_state = ApplyState {
         follower,
         sm: Arc::new(Mutex::new(sm)),
@@ -103,5 +108,5 @@ pub(crate) fn attach<S: StateMachine>(
         needs_replay: false,
     };
 
-    Ok(Attached { apply_state, cnc, instance_id, epoch })
+    Ok(Attached { apply_state, buffer, cnc, instance_id, epoch })
 }
