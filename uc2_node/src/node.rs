@@ -25,7 +25,10 @@ use uc2_net::sender::{CtrlMsg, Sender, SenderConfig};
 use uc_protocol::ring::{
     BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, SpscProducer, SpscRing,
 };
-use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
+use uc_protocol::v2::cnc::{
+    CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE,
+    NODE_FLAG_LEADER,
+};
 use uc_protocol::v2::ipc::{
     FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SVC_QUERY, client_from_extra,
     extra_client,
@@ -258,6 +261,10 @@ pub struct Node {
     /// [`Node::archive_first_base`] for purge-safety tests.
     archive_first_base: Arc<AtomicU64>,
     route_drops: Arc<uc2_net::receiver::FollowerStats>,
+    /// M6 Task 9: the sender's stats (for the prefill-decision pin — a restarted
+    /// leader serves a below-ring NAK from the journal, `replay_datagrams > 0`,
+    /// rather than prefilling its ring).
+    sender_stats: Arc<uc2_net::sender::SenderStats>,
     partition_handles: Vec<PartitionHandle>,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
     _instance: InstanceDir,
@@ -488,6 +495,11 @@ impl Node {
         let snap_dir = cfg.instance_dir.join("snapshots");
         let _ = std::fs::create_dir_all(&snap_dir);
         let incoming_snapshot = Arc::new(AtomicU64::new(0));
+        // M6 Task 9 (straddle hardening): bumped by the archive agent AFTER each
+        // `LogCounters::prime(to)` (truncate / AdoptFloor). The receiver samples it
+        // around a DATA datagram to detect a prime that straddled its processing and
+        // drop the stale frontier rather than clobber the freshly primed floor.
+        let prime_generation = Arc::new(AtomicU64::new(0));
         // Offer ONLY the file at the node's durable floor: a session ships a
         // fully-published artifact (rename-atomic + validated as the floor marker).
         let src_cnc = Arc::clone(&cnc);
@@ -501,6 +513,20 @@ impl Node {
             let len = std::fs::metadata(&path).ok()?.len();
             Some((floor, path, len))
         }));
+
+        // M6 Task 9: the per-peer observability band, cnc-slot order (voters
+        // first, then learners), capped at the fixed slot count. The consensus
+        // agent owns `id_and_role` + `reported_durable`; the sender fills
+        // `advertised_limit` from its flow-control view (bounded, once per cycle).
+        let peer_band: Vec<(NodeId, u8)> = peers
+            .iter()
+            .map(|id| (*id, CNC_PEER_ROLE_VOTER))
+            .chain(learner_ids.iter().map(|id| (*id, CNC_PEER_ROLE_LEARNER)))
+            .take(CNC_MAX_PEER_SLOTS)
+            .collect();
+        let sender_peer_slots: Vec<(SocketAddr, usize)> =
+            peer_band.iter().enumerate().map(|(i, (id, _))| (id_to_addr[id], i)).collect();
+        sender.set_peer_slots(Arc::clone(&cnc), sender_peer_slots);
 
         // Receiver (unified follower-receiver + leader-control demux).
         let mut rcfg = FollowerConfig::new(self_addr); // auto-learns the real leader from DATA
@@ -517,6 +543,7 @@ impl Node {
         receiver.set_sender_route(ctrl_tx);
         receiver.set_intake_gate(Arc::clone(&intake_gate));
         receiver.set_snapshot_intake(snap_dir.clone(), Some(Arc::clone(&incoming_snapshot)));
+        receiver.set_prime_generation(Arc::clone(&prime_generation));
         let route_drops = receiver.stats();
 
         // Archive agent: archive commands first (don't record blocks about to be
@@ -525,6 +552,7 @@ impl Node {
         let arc_cnc = Arc::clone(&cnc);
         let arc_slot = trunc_slot.clone();
         let arc_first_base = Arc::clone(&archive_first_base);
+        let arc_prime_gen = Arc::clone(&prime_generation);
         let archive_agent = AgentRunner::spawn("uc2-archive", IdleStrategy::Yield, move || {
             let mut did = false;
             while let Ok(cmd) = trunc_rx.try_recv() {
@@ -539,6 +567,9 @@ impl Node {
                             .truncate_to(to)
                             .expect("archive truncate fail-stop (journal I/O)");
                         arc_cnc.counters().prime(to);
+                        // Publish the prime so a straddling receiver drops the stale
+                        // frontier instead of clobbering `to` (M6 Task 9).
+                        arc_prime_gen.fetch_add(1, Ordering::Release);
                         // A truncation can drop the first block (first-block cut);
                         // republish the floor so the consensus guard stays honest.
                         arc_first_base.store(archive.first_base(), Ordering::Release);
@@ -570,6 +601,7 @@ impl Node {
                         match archive.adopt_floor(pos) {
                             Ok(new_floor) => {
                                 arc_cnc.counters().prime(new_floor);
+                                arc_prime_gen.fetch_add(1, Ordering::Release);
                                 arc_first_base.store(new_floor, Ordering::Release);
                             }
                             Err(e) => {
@@ -590,6 +622,7 @@ impl Node {
             did
         })?;
 
+        let sender_stats = sender.stats();
         let sender_agent =
             AgentRunner::spawn("uc2-sender", IdleStrategy::Yield, move || sender.do_work())?;
         let receiver_agent =
@@ -618,6 +651,9 @@ impl Node {
             addr_to_id,
             peers,
             learner_ids,
+            peer_band,
+            peer_reported: HashMap::new(),
+            peer_band_published: false,
             net_rx,
             obs_rx,
             ingress_rx,
@@ -661,6 +697,7 @@ impl Node {
             reports_implausible,
             archive_first_base,
             route_drops,
+            sender_stats,
             partition_handles,
             _instance: instance,
             _rings: rings,
@@ -740,6 +777,15 @@ impl Node {
     /// node has performed. A subset of [`Node::truncations`].
     pub fn wipes(&self) -> u64 {
         self.wipes.load(Ordering::Relaxed)
+    }
+
+    /// M6 Task 9: datagrams this node's leader has served from the JOURNAL (deep
+    /// NAK / replay sessions) rather than the live ring. `> 0` after a follower
+    /// catches up across a below-ring gap is the prefill-decision evidence: the
+    /// stream is repaired on demand from durable storage, so a restarted node
+    /// never prefills its ring.
+    pub fn replay_datagrams(&self) -> u64 {
+        self.sender_stats.replay_datagrams.load(Ordering::Relaxed)
     }
 
     /// Current-term follower Reports dropped at the implausibility guard
@@ -841,6 +887,17 @@ struct Consensus {
     /// self). Learners receive DATA (via the sender), commit gossip, and term maps
     /// so they replicate + reconcile, but are NEVER counted for any quorum.
     learner_ids: Vec<NodeId>,
+    /// M6 Task 9: the per-peer observability band as `(peer_id, role_bits)` in
+    /// cnc-slot order (voters first, then learners, capped at `CNC_MAX_PEER_SLOTS`).
+    /// The consensus agent publishes `id_and_role` (boot-once) + `reported_durable`
+    /// (per cycle) into `cnc.peer_slot(i)`; the sender fills `advertised_limit`.
+    peer_band: Vec<(NodeId, u8)>,
+    /// M6 Task 9: newest durable position each peer has reported (in-memory,
+    /// updated per Report; flushed to the cnc band once per duty cycle — the cnc
+    /// store is bounded, not per-datagram).
+    peer_reported: HashMap<NodeId, u64>,
+    /// Latch: publish the static `id_and_role` cells once (first duty cycle).
+    peer_band_published: bool,
     net_rx: mpsc::Receiver<NetEvent>,
     obs_rx: mpsc::Receiver<(u32, u64)>,
     ingress_rx: mpsc::Receiver<Vec<u8>>,
@@ -992,7 +1049,36 @@ impl Consensus {
         // 9. Sample the receiver's completed-inbound-snapshot signal (M6 Task 6);
         // on a new value, adopt it as the archive floor and mirror it to cnc.
         did |= self.maybe_adopt_incoming_snapshot();
+
+        // 10. Publish the per-peer observability band + archive floor (M6 Task 9).
+        // Bounded: one pass over ≤8 slots per cycle, no per-datagram cnc writes.
+        self.publish_peer_band();
         did
+    }
+
+    /// M6 Task 9: refresh the cnc observability band. Writes the static
+    /// `id_and_role` cells once (first cycle), then each peer's `reported_durable`
+    /// from the in-memory tracker, and mirrors the archive's first-retained base.
+    /// Diagnostics only — never gates correctness.
+    fn publish_peer_band(&mut self) {
+        if !self.peer_band_published {
+            for (i, (id, role)) in self.peer_band.iter().enumerate() {
+                self.cnc
+                    .peer_slot(i)
+                    .id_and_role
+                    .store_release(uc2_log::cnc::pack_id_and_role(*id, *role));
+            }
+            self.peer_band_published = true;
+        }
+        for (i, (id, _)) in self.peer_band.iter().enumerate() {
+            if let Some(d) = self.peer_reported.get(id) {
+                self.cnc.peer_slot(i).reported_durable.store_release(*d);
+            }
+        }
+        // Mirror the archive's first-retained base (the purge floor). Comparing it
+        // against `node_snapshot_floor` is the "purge caught up to snapshot" check.
+        let first_base = self.archive_first_base.load(Ordering::Acquire);
+        self.cnc.archive_first_base().store_release(first_base);
     }
 
     /// M6 Task 6. When the receiver completes an inbound snapshot transfer it
@@ -1547,6 +1633,12 @@ impl Consensus {
                     self.reports_implausible.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
+                // M6 Task 9: track the peer's newest durable for the cnc band
+                // (in-memory, monotonic-max; flushed once per duty cycle).
+                self.peer_reported
+                    .entry(id)
+                    .and_modify(|d| *d = (*d).max(durable))
+                    .or_insert(durable);
                 Event::Report { from: id, term, durable }
             }
             NetEvent::CommitGossip { from, term, commit } => {
@@ -2122,6 +2214,9 @@ mod tests {
             addr_to_id,
             peers,
             learner_ids: Vec::new(),
+            peer_band: Vec::new(),
+            peer_reported: HashMap::new(),
+            peer_band_published: false,
             net_rx,
             obs_rx,
             ingress_rx,

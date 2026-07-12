@@ -61,6 +61,17 @@ impl FlowControl {
         self.learners.iter().find(|(a, _)| *a == addr).map(|(_, p)| *p)
     }
 
+    /// M6 Task 9: the per-peer flow value for the cnc observability band — a
+    /// voter's advertised ceiling (`contiguous + window`) or a learner's latest
+    /// contiguous position. `None` if `addr` is neither a follower nor a learner.
+    pub fn advertised_limit(&self, addr: SocketAddr) -> Option<u64> {
+        self.followers
+            .iter()
+            .chain(self.learners.iter())
+            .find(|(a, _)| *a == addr)
+            .map(|(_, l)| *l)
+    }
+
     /// The sender may not send at or beyond this position.
     pub fn limit(&self) -> u64 {
         if self.needed == 0 {

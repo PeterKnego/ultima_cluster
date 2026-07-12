@@ -20,8 +20,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use uc_protocol::v2::cnc::{
-    self, CNC_OFF_APPEND, CNC_OFF_HEADER_CRC, CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SNAPSHOT_POS,
-    CNC_OFF_TERM, CNC_PAGE_LEN, CNC_V2_VERSION, CncHeader,
+    self, CNC_MAX_PEER_SLOTS, CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE, CNC_OFF_HEADER_CRC,
+    CNC_OFF_PEER_SLOTS, CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_TERM,
+    CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_V2_VERSION, CncHeader,
 };
 
 use crate::counters::{LogCounters, PaddedAtomicU64};
@@ -111,6 +112,50 @@ const _: () = assert!(std::mem::size_of::<SnapshotSlots>() == 192);
 const _: () = assert!(std::mem::offset_of!(SnapshotSlots, service_snapshot_pos) == 0);
 const _: () = assert!(std::mem::offset_of!(SnapshotSlots, node_snapshot_floor) == 64);
 const _: () = assert!(std::mem::offset_of!(SnapshotSlots, incoming_snapshot_pos) == 128);
+
+/// M6 Task 9: one per-peer observability record (leader-published), cast at
+/// `CNC_OFF_PEER_SLOTS + i * CNC_PEER_SLOT_STRIDE`. Each field is its own
+/// 64-byte cache line so the two distinct writers (consensus, sender) never
+/// false-share. A dormant slot (unused index, or any slot on a follower) reads
+/// all-zero. Bounded update: the leader refreshes a slot at most once per duty
+/// cycle, never per datagram — this band is diagnostics, off the hot path.
+#[repr(C)]
+pub struct PeerSlot {
+    /// `(peer_id as u64) << 8 | role_bits`; role_bits ∈ {VOTER, LEARNER}.
+    /// Writer: consensus (boot-once). Zero = unused slot.
+    pub id_and_role: PaddedAtomicU64,
+    /// Newest durable position this peer reported (writer: consensus, Report
+    /// intake — includes a learner's cell, which never counts toward commit).
+    pub reported_durable: PaddedAtomicU64,
+    /// The receive window this peer last advertised via STATUS (writer: sender).
+    pub advertised_limit: PaddedAtomicU64,
+    /// `(naks_served as u64) << 32 | (replay_datagrams as u32 as u64)` — the
+    /// leader's retransmit effort toward this peer (writer: sender). RESERVED /
+    /// dormant in M6: the sender's `naks_served`/`replay_datagrams` counters are
+    /// aggregate (in `SenderStats`), not per-peer; a per-peer split would add a
+    /// hot-path (per-datagram) counter to the retransmit loop, so it is deferred.
+    /// The cache line is pinned so a later fill needs no layout change.
+    pub naks_plus_replay: PaddedAtomicU64,
+}
+
+const _: () = assert!(std::mem::size_of::<PeerSlot>() == 256);
+const _: () = assert!(std::mem::size_of::<PeerSlot>() == CNC_PEER_SLOT_STRIDE);
+const _: () = assert!(std::mem::offset_of!(PeerSlot, id_and_role) == 0);
+const _: () = assert!(std::mem::offset_of!(PeerSlot, reported_durable) == 64);
+const _: () = assert!(std::mem::offset_of!(PeerSlot, advertised_limit) == 128);
+const _: () = assert!(std::mem::offset_of!(PeerSlot, naks_plus_replay) == 192);
+
+/// Pack a peer id + role byte into the `id_and_role` cell.
+#[inline]
+pub fn pack_id_and_role(peer_id: u32, role_bits: u8) -> u64 {
+    ((peer_id as u64) << 8) | role_bits as u64
+}
+
+/// Pack the sender's per-peer retransmit counters into `naks_plus_replay`.
+#[inline]
+pub fn pack_naks_plus_replay(naks_served: u32, replay_datagrams: u32) -> u64 {
+    ((naks_served as u64) << 32) | replay_datagrams as u64
+}
 
 /// The mmap'd (or heap) cnc v2 page. `Region` is `Send + Sync`, so this is
 /// too — every accessor casts a `&self`-borrowed reference at a pinned
@@ -335,6 +380,24 @@ impl CncPage {
         unsafe { &*(self.region.ptr_at(CNC_OFF_SERVICE_SNAPSHOT_POS) as *const SnapshotSlots) }
     }
 
+    /// The archive's first-retained log position (purge floor), mirrored by the
+    /// consensus agent (M6 Task 9). Compare against `snapshots().node_snapshot_floor`
+    /// for the "purge caught up to snapshot" health check.
+    pub fn archive_first_base(&self) -> &PaddedAtomicU64 {
+        // SAFETY: offset 1344, size 64, 1344+64=1408<=4096.
+        unsafe { &*(self.region.ptr_at(CNC_OFF_ARCHIVE_FIRST_BASE) as *const PaddedAtomicU64) }
+    }
+
+    /// The `i`-th per-peer observability slot (M6 Task 9). Panics if `i` is out
+    /// of range. A dormant slot reads all-zero.
+    pub fn peer_slot(&self, i: usize) -> &PeerSlot {
+        assert!(i < CNC_MAX_PEER_SLOTS, "peer slot index {i} out of range");
+        let off = CNC_OFF_PEER_SLOTS + i * CNC_PEER_SLOT_STRIDE;
+        // SAFETY: last slot ends at 1408 + 8*256 = 3456 <= 4096 (const-asserted
+        // in `uc_protocol`); each is a `PeerSlot` (256 B, 4 padded atomics).
+        unsafe { &*(self.region.ptr_at(off) as *const PeerSlot) }
+    }
+
     /// Decode the header + app_id back into an owned `CncMeta`.
     pub fn meta(&self) -> CncMeta {
         let page = self.page();
@@ -416,6 +479,54 @@ mod tests {
         assert_eq!(page.service() as *const _ as usize - base, CNC_OFF_SERVICE_APPLIED);
         assert_eq!(page.status() as *const _ as usize - base, CNC_OFF_TERM);
         assert_eq!(page.snapshots() as *const _ as usize - base, CNC_OFF_SERVICE_SNAPSHOT_POS);
+        // M6 Task 9 observability band: archive_first_base + the 8 peer slots.
+        assert_eq!(size_of::<PeerSlot>(), CNC_PEER_SLOT_STRIDE);
+        assert_eq!(
+            page.archive_first_base() as *const _ as usize - base,
+            CNC_OFF_ARCHIVE_FIRST_BASE
+        );
+        for i in 0..CNC_MAX_PEER_SLOTS {
+            assert_eq!(
+                page.peer_slot(i) as *const _ as usize - base,
+                CNC_OFF_PEER_SLOTS + i * CNC_PEER_SLOT_STRIDE,
+                "peer slot {i} offset drift"
+            );
+        }
+        // Sub-field offsets within a slot pin the packing the decoder relies on.
+        let s0 = page.peer_slot(0) as *const _ as usize;
+        assert_eq!(&page.peer_slot(0).id_and_role as *const _ as usize - s0, CNC_PEER_OFF_ID_AND_ROLE);
+        assert_eq!(
+            &page.peer_slot(0).reported_durable as *const _ as usize - s0,
+            CNC_PEER_OFF_REPORTED_DURABLE
+        );
+        assert_eq!(
+            &page.peer_slot(0).advertised_limit as *const _ as usize - s0,
+            CNC_PEER_OFF_ADVERTISED_LIMIT
+        );
+        assert_eq!(
+            &page.peer_slot(0).naks_plus_replay as *const _ as usize - s0,
+            CNC_PEER_OFF_NAKS_PLUS_REPLAY
+        );
+    }
+
+    #[test]
+    fn peer_slots_pack_decode_and_are_independent() {
+        use uc_protocol::v2::cnc::CNC_PEER_ROLE_LEARNER;
+        let page = CncPage::heap(&test_meta());
+        // Dormant by default.
+        assert_eq!(page.peer_slot(3).id_and_role.load_acquire(), 0);
+        // Pack round-trips.
+        page.peer_slot(3).id_and_role.store_release(pack_id_and_role(7, CNC_PEER_ROLE_LEARNER));
+        let raw = page.peer_slot(3).id_and_role.load_acquire();
+        assert_eq!(raw >> 8, 7);
+        assert_eq!((raw & 0xff) as u8, CNC_PEER_ROLE_LEARNER);
+        page.peer_slot(3).naks_plus_replay.store_release(pack_naks_plus_replay(11, 42));
+        let np = page.peer_slot(3).naks_plus_replay.load_acquire();
+        assert_eq!((np >> 32) as u32, 11);
+        assert_eq!(np as u32, 42);
+        // Other slots untouched.
+        assert_eq!(page.peer_slot(2).id_and_role.load_acquire(), 0);
+        assert_eq!(page.peer_slot(4).id_and_role.load_acquire(), 0);
     }
 
     #[test]

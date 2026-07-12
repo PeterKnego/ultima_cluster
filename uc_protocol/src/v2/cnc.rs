@@ -19,7 +19,10 @@
 //!                      node_heartbeat_ns, service_heartbeat_ns,
 //!                      output_progress, next_client_id)     7 × 64 B lines
 //! 1152  SnapshotSlots (service_snapshot_pos, node_snapshot_floor, incoming_snapshot_pos) 3 × 64 B lines
-//! 1344..4096  reserved (zero) — M6 remaining per-follower observability slots
+//! 1344  archive_first_base                                  1 × 64 B line
+//! 1408  PeerSlots[8]   (per peer: id_and_role, reported_durable,
+//!                       advertised_limit, naks_served_plus_replay) 8 × 256 B
+//! 3456..4096  reserved (zero)
 //! ```
 //!
 //! **crc split (deliberate):** this module is `core`-only (no_std-friendly —
@@ -72,7 +75,36 @@ pub const CNC_OFF_NEXT_CLIENT_ID: usize = 1088; // fetch_add by clients; init 1
 pub const CNC_OFF_SERVICE_SNAPSHOT_POS: usize = 1152; // writer: service snapshot builder thread; position S of the newest COMPLETE on-disk snapshot; 0 = none
 pub const CNC_OFF_NODE_SNAPSHOT_FLOOR: usize = 1216; // writer: consensus (Task 4 mirror); init 0
 pub const CNC_OFF_INCOMING_SNAPSHOT_POS: usize = 1280; // writer: consensus (Task 6 mirror of the receiver's completed inbound snapshot); observability; 0 = none
-// 1344..4096 reserved (zero) — M6 remaining per-follower observability slots (Task 9)
+// M6 Task 9: ops observability band. `archive_first_base` mirrors the archive
+// agent's first-retained log position (the purge floor); comparing it against
+// `node_snapshot_floor` is the "purge caught up to snapshot" health check.
+pub const CNC_OFF_ARCHIVE_FIRST_BASE: usize = 1344; // writer: consensus (mirrors the archive agent's first-base atomic); init = boot first_base
+
+// M6 Task 9: per-peer observability slots. `CNC_MAX_PEER_SLOTS` fixed-stride
+// records; the leader's consensus + sender agents publish one slot per peer
+// (bounded write: once per duty cycle, never per datagram). A slot is dormant
+// (all-zero) on a follower and for unused peer indices. Layout per slot (each
+// field its own 64-byte cache line to keep single-writer stores contention-free):
+//   +0   peer_id_and_role  u64 = (peer_id << 8) | role_bits   writer: consensus (boot-once)
+//   +64  reported_durable  u64                                writer: consensus (Report intake)
+//   +128 advertised_limit  u64                                writer: sender    (STATUS intake)
+//   +192 naks_plus_replay  u64 = (naks_served << 32) | replay writer: sender
+pub const CNC_OFF_PEER_SLOTS: usize = 1408;
+pub const CNC_PEER_SLOT_STRIDE: usize = 256;
+pub const CNC_MAX_PEER_SLOTS: usize = 8;
+// Per-slot field offsets (relative to the slot base).
+pub const CNC_PEER_OFF_ID_AND_ROLE: usize = 0;
+pub const CNC_PEER_OFF_REPORTED_DURABLE: usize = 64;
+pub const CNC_PEER_OFF_ADVERTISED_LIMIT: usize = 128;
+pub const CNC_PEER_OFF_NAKS_PLUS_REPLAY: usize = 192;
+// Role bits packed into the low byte of `peer_id_and_role`.
+pub const CNC_PEER_ROLE_VOTER: u8 = 1;
+pub const CNC_PEER_ROLE_LEARNER: u8 = 2;
+// The whole band must fit within the page.
+const _: () = assert!(
+    CNC_OFF_PEER_SLOTS + CNC_MAX_PEER_SLOTS * CNC_PEER_SLOT_STRIDE <= CNC_PAGE_LEN,
+    "peer-slot band overruns the cnc page"
+);
 
 pub const NODE_FLAG_LEADER: u64 = 1;
 pub const NODE_FLAG_CAN_SERVE: u64 = 2;
@@ -346,5 +378,20 @@ mod tests {
         assert_eq!(CNC_OFF_NODE_SNAPSHOT_FLOOR - CNC_OFF_SERVICE_SNAPSHOT_POS, 64);
         assert_eq!(CNC_OFF_INCOMING_SNAPSHOT_POS - CNC_OFF_NODE_SNAPSHOT_FLOOR, 64);
         assert_eq!(CNC_OFF_INCOMING_SNAPSHOT_POS, 1280);
+        // M6 Task 9: observability band — archive_first_base + per-peer slots.
+        assert_eq!(CNC_OFF_ARCHIVE_FIRST_BASE, 1344);
+        assert_eq!(CNC_OFF_ARCHIVE_FIRST_BASE - CNC_OFF_INCOMING_SNAPSHOT_POS, 64);
+        assert_eq!(CNC_OFF_PEER_SLOTS, 1408);
+        assert_eq!(CNC_PEER_SLOT_STRIDE, 256);
+        assert_eq!(CNC_MAX_PEER_SLOTS, 8);
+        assert_eq!(CNC_PEER_OFF_ID_AND_ROLE, 0);
+        assert_eq!(CNC_PEER_OFF_REPORTED_DURABLE, 64);
+        assert_eq!(CNC_PEER_OFF_ADVERTISED_LIMIT, 128);
+        assert_eq!(CNC_PEER_OFF_NAKS_PLUS_REPLAY, 192);
+        assert_eq!(CNC_PEER_ROLE_VOTER, 1);
+        assert_eq!(CNC_PEER_ROLE_LEARNER, 2);
+        // The band ends at 3456, inside the 4096-byte page (the `<= CNC_PAGE_LEN`
+        // bound is const-asserted at module scope).
+        assert_eq!(CNC_OFF_PEER_SLOTS + CNC_MAX_PEER_SLOTS * CNC_PEER_SLOT_STRIDE, 3456);
     }
 }

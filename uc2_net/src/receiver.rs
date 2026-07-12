@@ -240,6 +240,14 @@ pub struct FollowerStats {
     /// counter backward); the resync is the correct recovery for either. See
     /// [`FollowerReceiver::resync_after_truncation`].
     pub truncation_resyncs: AtomicU64,
+    /// Straddle drops (M6 Task 9): times a DATA datagram was discarded because a
+    /// `LogCounters::prime(to)` re-primed the shared `append` counter DURING this
+    /// datagram's processing (between the frontier read and the `store_release`).
+    /// Storing the stale `rebuilt.contiguous()` would clobber the freshly primed
+    /// floor with a value from the prior stream life. The drop is safe — the next
+    /// `do_work` top resyncs the tracker to the primed floor and NAKs forward. See
+    /// the generation recheck in the DATA arm.
+    pub dropped_straddle: AtomicU64,
 }
 
 /// M6 Task 6: one in-flight INBOUND snapshot transfer (this node is receiving a
@@ -319,6 +327,18 @@ pub struct FollowerReceiver {
     /// purged prefix. Cleared once applied. Distinct from the backward truncation
     /// re-prime, which is unambiguous from the counter alone.
     snap_adopt_pending: Option<u64>,
+    /// M6 Task 9 (straddle hardening): a node-internal generation counter bumped
+    /// by the archive/consensus agent on every `LogCounters::prime(to)` (truncate,
+    /// AdoptFloor, BecomeLeader collapse). The DATA arm samples it before reading
+    /// the frontier and rechecks it just before `append.store_release`; a change
+    /// means a prime straddled this datagram, so the (now stale) contiguous value
+    /// is dropped rather than published. `None` = no primes race this receiver
+    /// (single-life unit tests). See [`set_prime_generation`](Self::set_prime_generation).
+    prime_gen: Option<Arc<AtomicU64>>,
+    /// Test-only hook fired between the frontier read and the generation recheck
+    /// in the DATA arm, so a test can deterministically inject a straddling prime.
+    #[cfg(test)]
+    straddle_hook: Option<Box<dyn Fn() + Send>>,
 }
 
 impl FollowerReceiver {
@@ -366,6 +386,9 @@ impl FollowerReceiver {
             snap_nak_cfg: cfg.nak,
             snap_seed: cfg.seed,
             snap_adopt_pending: None,
+            prime_gen: None,
+            #[cfg(test)]
+            straddle_hook: None,
         }
     }
 
@@ -396,6 +419,31 @@ impl FollowerReceiver {
     /// / gate `true`) = current behavior.
     pub fn set_intake_gate(&mut self, gate: Arc<AtomicBool>) {
         self.gate = Some(gate);
+    }
+
+    /// M6 Task 9: install the prime-generation counter shared with the archive/
+    /// consensus agent. The agent bumps it AFTER each `LogCounters::prime(to)`;
+    /// the receiver uses it to detect a prime that straddles a DATA datagram's
+    /// processing and drop the resulting stale frontier rather than clobber the
+    /// freshly primed floor. Without this call the recheck is inert (single-life
+    /// receivers never see a competing prime).
+    pub fn set_prime_generation(&mut self, generation: Arc<AtomicU64>) {
+        self.prime_gen = Some(generation);
+    }
+
+    /// Current prime generation (0 when no counter is installed — the recheck
+    /// then always matches, so single-life receivers are unaffected).
+    #[inline]
+    fn prime_gen_val(&self) -> u64 {
+        self.prime_gen.as_ref().map_or(0, |g| g.load(Ordering::Relaxed))
+    }
+
+    /// Test-only: install a hook fired in the DATA arm between the `rebuilt`
+    /// insert and the generation recheck, so a test can deterministically inject
+    /// a straddling `prime` + generation bump.
+    #[cfg(test)]
+    fn set_straddle_hook(&mut self, hook: Box<dyn Fn() + Send>) {
+        self.straddle_hook = Some(hook);
     }
 
     /// M6 Task 6: enable INBOUND snapshot transfers. `snap_dir` is where the
@@ -556,6 +604,12 @@ impl FollowerReceiver {
         }
         match h.kind {
             DGRAM_KIND_DATA => {
+                // Straddle guard (M6 Task 9): sample the prime generation BEFORE
+                // reading the frontier. If the archive re-primes `append` to a new
+                // floor anywhere during this datagram's processing, the recheck
+                // just before `store_release` (below) drops the now-stale frontier
+                // rather than clobbering the freshly primed value.
+                let gen0 = self.prime_gen_val();
                 // Intake gate (M4): during the ambiguous term-adoption window
                 // the consensus agent holds the gate CLOSED so no
                 // divergent-prefix extension is accepted. Still count the
@@ -619,6 +673,21 @@ impl FollowerReceiver {
                 }
                 self.stats.bytes.fetch_add(body.len() as u64, Relaxed);
                 if self.rebuilt.insert(h.position, h.position + advance) {
+                    #[cfg(test)]
+                    if let Some(hook) = self.straddle_hook.take() {
+                        hook();
+                        self.straddle_hook = Some(hook);
+                    }
+                    // Recheck the prime generation. A prime that straddled this
+                    // datagram re-based `append` to a new floor; publishing the
+                    // stale `rebuilt.contiguous()` would drag it backward. Drop
+                    // instead — the next `do_work` resync realigns the tracker to
+                    // the primed floor and NAKs forward. `rebuilt` is left as-is;
+                    // that resync discards it (rebuilds from `append`).
+                    if self.prime_gen_val() != gen0 {
+                        self.stats.dropped_straddle.fetch_add(1, Relaxed);
+                        return;
+                    }
                     self.buffer.counters().append.store_release(self.rebuilt.contiguous());
                 }
                 self.note_leader_activity(h.leadership_term_id);
@@ -1772,6 +1841,56 @@ mod tests {
         //    resync fires.
         r.do_work();
         assert_eq!(r.stats().truncation_resyncs.load(Relaxed), 1);
+    }
+
+    /// M6 Task 9 (straddle hardening): a `LogCounters::prime(to)` that lands
+    /// BETWEEN the DATA arm's frontier read and its `append.store_release` must
+    /// not be clobbered by the stale `rebuilt.contiguous()`. The archive agent
+    /// re-primes `append` to a new floor (AdoptFloor after a snapshot install) and
+    /// bumps a shared prime-generation counter; the receiver rechecks that counter
+    /// just before storing and DROPS the straddled datagram (`dropped_straddle`)
+    /// so the freshly primed floor survives. Pre-fix, the store would drag `append`
+    /// back down to the old life's frontier — a below-floor re-request storm.
+    #[test]
+    fn straddling_prime_is_not_clobbered_by_stale_frontier() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+
+        // Install the shared prime-generation counter (as the node does).
+        let prime_gen = Arc::new(AtomicU64::new(0));
+        r.set_prime_generation(Arc::clone(&prime_gen));
+
+        // The hook simulates the archive agent priming `append` FORWARD to a new
+        // floor (960) and publishing the prime — exactly while this datagram sits
+        // between its `rebuilt.insert` and `store_release`. One-shot: it primes
+        // only on the first fire (generation still 0).
+        let bh = Arc::clone(&b);
+        let pgh = Arc::clone(&prime_gen);
+        r.set_straddle_hook(Box::new(move || {
+            if pgh.load(Relaxed) == 0 {
+                bh.counters().prime(960);
+                pgh.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+        }));
+
+        // Deliver one in-order DATA frame at position 0. It passes the gate and
+        // frontier check, writes, and inserts (0, 96) — then the hook straddles.
+        let runs = frame_runs(&[&[7u8; 64]], 96);
+        let (pos, bytes, _) = &runs[0];
+        leader.send(to, DGRAM_KIND_DATA, *pos, TERM, bytes);
+        let st = r.stats();
+        drive_until(&mut r, || st.dropped_straddle.load(Relaxed) == 1);
+
+        // The primed floor (960) survives — the stale contiguous (96) was dropped.
+        assert_eq!(
+            b.counters().append.load_acquire(),
+            960,
+            "straddling prime clobbered by the stale frontier"
+        );
+        assert_eq!(prime_gen.load(Relaxed), 1);
     }
 
     /// Leader-role node composition (M4): the unified `FollowerReceiver` with a

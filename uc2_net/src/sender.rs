@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use uc2_log::archive::find_block;
 use uc2_log::buffer::{LogBuffer, SliceRead};
+use uc2_log::cnc::CncPage;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_SNAP_BEGIN,
     DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_BODY_LEN, SnapBeginBody,
@@ -210,7 +211,16 @@ pub struct Sender {
     /// M6 Task 6: monotonic session-id generator — distinguishes a fresh session
     /// from a just-closed one so a stale SNAP_NAK/SNAP_DONE can't cross-talk.
     snap_session_seq: u32,
+    /// M6 Task 9: cnc observability band + addr→slot map. `None` on nodes that
+    /// never lead and in unit tests. Once per duty cycle the sender fills each
+    /// peer's `advertised_limit` from its flow-control view (bounded — a pass over
+    /// ≤8 slots, no per-datagram cnc writes). Diagnostics only.
+    peer_obs: Option<PeerObs>,
 }
+
+/// M6 Task 9: the sender's observability handle — the cnc page plus the
+/// `(peer addr, slot index)` map it fills with `advertised_limit`.
+type PeerObs = (Arc<CncPage>, Vec<(SocketAddr, usize)>);
 
 impl Sender {
     #[allow(clippy::too_many_arguments)]
@@ -274,11 +284,19 @@ impl Sender {
             snapshot_source: None,
             snap: None,
             snap_session_seq: 0,
+            peer_obs: None,
         }
     }
 
     pub fn stats(&self) -> Arc<SenderStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// M6 Task 9: wire the cnc observability band + addr→slot map. The sender
+    /// fills each peer's `advertised_limit` once per duty cycle. Without this call
+    /// the band's sender-owned cells stay dormant (unit tests, non-leaders).
+    pub fn set_peer_slots(&mut self, cnc: Arc<CncPage>, slots: Vec<(SocketAddr, usize)>) {
+        self.peer_obs = Some((cnc, slots));
     }
 
     /// Wire the newest-shippable-snapshot resolver (M6 Task 6). Without it a
@@ -466,6 +484,18 @@ impl Sender {
             // sender no longer ranks or gossips commit at all (M4 carry #5).
             self.stats.heartbeats.fetch_add(1, Ordering::Relaxed);
             did = true;
+        }
+
+        // M6 Task 9: refresh each peer's `advertised_limit` in the cnc band from
+        // the flow-control view. Bounded (≤8 slots, once per cycle); leader-only
+        // (this point is past the `!leader_role` return) so a demoted node stops
+        // updating. Diagnostics — never gates the stream.
+        if let Some((cnc, slots)) = &self.peer_obs {
+            for (addr, idx) in slots {
+                if let Some(limit) = self.flow.advertised_limit(*addr) {
+                    cnc.peer_slot(*idx).advertised_limit.store_release(limit);
+                }
+            }
         }
         did
     }
