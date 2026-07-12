@@ -2614,6 +2614,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "uc2_service"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uc2_log",
+ "uc2_net",
+ "uc2_node",
+ "uc_protocol",
+]
+
+[[package]]
 name = "uc2_sim"
 version = "0.1.0"
 dependencies = [
