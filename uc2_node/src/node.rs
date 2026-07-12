@@ -262,7 +262,8 @@ impl Node {
         let (trunc_tx, trunc_rx) = mpsc::sync_channel::<(u64, u64)>(64);
         let trunc_slot = TruncationSlot::default();
 
-        // Sender (streams when leader; node-mode disables its own ranking).
+        // Sender (streams when leader; commit ranking is entirely the
+        // consensus agent's job — the sender never ranks or gossips commit).
         let mut sender_cfg = SenderConfig::new(boot_term);
         sender_cfg.heartbeat_ns = 20_000_000; // 20 ms: brisk tail-loss detection
         let journal = archive.journal_arc();
@@ -274,19 +275,22 @@ impl Node {
             ctrl_rx,
             sender_cfg,
             Arc::clone(&term_handle),
+            Arc::clone(&leader_flag),
         );
-        sender.set_node_mode();
-        sender.set_role_flag(Arc::clone(&leader_flag));
         sender.set_replay_source(journal);
 
-        // Receiver (unified follower-receiver in node mode).
+        // Receiver (unified follower-receiver + leader-control demux).
         let mut rcfg = FollowerConfig::new(self_addr); // auto-learns the real leader from DATA
         rcfg.seed = cfg.seed ^ 0x5DEE_CE66_1D0C_2A11;
         rcfg.status_floor_ns = 20_000_000;
         rcfg.append_pos_floor_ns = 20_000_000;
-        let mut receiver =
-            FollowerReceiver::new(Arc::clone(&buffer), recv_sock, rcfg, Arc::clone(&term_handle));
-        receiver.set_consensus_route(net_tx);
+        let mut receiver = FollowerReceiver::new(
+            Arc::clone(&buffer),
+            recv_sock,
+            rcfg,
+            Arc::clone(&term_handle),
+            net_tx,
+        );
         receiver.set_sender_route(ctrl_tx);
         receiver.set_intake_gate(Arc::clone(&intake_gate));
         let route_drops = receiver.stats();
@@ -801,7 +805,11 @@ impl Consensus {
                 self.adopted_term = term;
             }
             Action::AdvanceCommit { commit } => {
-                // The ONLY commit store in the binary (both roles).
+                // The ONLY commit store in the binary (both roles). M4 carry #5
+                // deleted uc2_net's two legacy sites (the sender's self-ranking
+                // tracker and the receiver's local COMMIT_POSITION store) —
+                // grep-provable: `grep -rn "commit.store_release" uc2_net/ |
+                // wc -l` == 0.
                 self.cnc.counters().commit.store_release(commit);
             }
             Action::GossipCommit { commit } => {

@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -19,9 +19,19 @@ use uc2_log::counters::PaddedAtomicU64;
 use uc2_log::region::Region;
 use uc2_net::fault::{FaultConfig, FaultSocket};
 use uc2_net::rebuild::NakConfig;
-use uc2_net::receiver::{FollowerConfig, FollowerReceiver, LeaderReceiver};
+use uc2_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent};
 use uc2_net::sender::{Sender, SenderConfig};
 use ultima_journal::Journal;
+
+/// A channel end for the consensus route that nothing drains (this harness has
+/// no `ElectionSm` — the wire-level tests here don't exercise commit ranking,
+/// which is entirely the consensus agent's job now, M4 carry #5). A dropped
+/// receiver just makes `try_send` fail `Disconnected`, which the receiver
+/// treats identically to a full channel (counted, never a hang or panic).
+fn unrouted_consensus() -> mpsc::SyncSender<NetEvent> {
+    let (tx, _rx) = mpsc::sync_channel(64);
+    tx
+}
 
 pub const TERM: u32 = 3;
 pub const CAP: u64 = 1 << 20; // 1 MiB buffers, identical on every node
@@ -108,7 +118,8 @@ pub fn spawn_follower_on(
     cfg.status_floor_ns = 5_000_000; // 5 ms: keep flow adverts fresh under test loads
     cfg.nak = NakConfig { delay_min_ns: 100_000, delay_max_ns: 500_000, backoff_ns: 2_000_000 };
     let term = Arc::new(AtomicU32::new(TERM));
-    let mut rx = FollowerReceiver::new(Arc::clone(&buffer), sock, cfg, term);
+    let mut rx =
+        FollowerReceiver::new(Arc::clone(&buffer), sock, cfg, term, unrouted_consensus());
     let stats = rx.stats();
     let rxa = AgentRunner::spawn(&format!("{name}-rx"), IdleStrategy::Yield, move || rx.do_work())
         .unwrap();
@@ -119,34 +130,61 @@ pub fn spawn_follower_on(
 pub struct Leader {
     pub node: Node,
     pub stats: Arc<uc2_net::sender::SenderStats>,
-    pub lr_stats: Arc<uc2_net::receiver::LeaderStats>,
 }
 
 /// The leader socket binds FIRST (followers need its address) — pass it in.
+///
+/// Wired the way the real `uc2_node::Node` composes leader duty (M4 carry #5
+/// deleted the separate M2/M3 `LeaderReceiver` actor): ONE socket, cloned
+/// twice, backs both the `Sender`'s outbound side and a unified
+/// `FollowerReceiver` whose `sender_route` demuxes inbound NAK/STATUS to the
+/// sender's control channel. This harness has no `ElectionSm`, so the
+/// consensus route goes to a sink nobody drains (`unrouted_consensus`) —
+/// harmless, since none of these wire-level tests assert on commit ranking
+/// (that property now lives entirely in `uc2_consensus`/`uc2_node`).
 pub fn spawn_leader(raw: UdpSocket, followers: Vec<SocketAddr>, faults: FaultConfig) -> Leader {
     let buffer = buffer();
     let dir = tempfile::tempdir().unwrap();
-    let recv = raw.try_clone().unwrap();
-    let mut send = FaultSocket::from_socket(raw).unwrap();
-    send.set_faults(faults);
-    let (tx, rx) = mpsc::sync_channel(1024);
+    let self_addr = raw.local_addr().unwrap();
+    let mut send_sock = FaultSocket::from_socket(raw.try_clone().unwrap()).unwrap();
+    let mut recv_sock = FaultSocket::from_socket(raw).unwrap();
+    send_sock.set_faults(faults);
+    recv_sock.set_faults(faults);
+    let (ctrl_tx, ctrl_rx) = mpsc::sync_channel(1024);
     let mut cfg = SenderConfig::new(TERM);
     cfg.heartbeat_ns = 2_000_000; // 2 ms: quick tail-loss detection in tests
     // Open the archive first so the sender can take its journal as the deep-NAK
     // replay source (M4) before the sender agent spawns.
     let (ara, journal) = spawn_archive("leader-ar", &buffer, dir.path());
     let term = Arc::new(AtomicU32::new(TERM));
-    let mut sender =
-        Sender::new(Arc::clone(&buffer), send, followers, 3, rx, cfg, Arc::clone(&term));
+    let role = Arc::new(AtomicBool::new(true)); // this harness is always-leader
+    let mut sender = Sender::new(
+        Arc::clone(&buffer),
+        send_sock,
+        followers,
+        3,
+        ctrl_rx,
+        cfg,
+        Arc::clone(&term),
+        role,
+    );
     sender.set_replay_source(journal);
     let stats = sender.stats();
     let txa =
         AgentRunner::spawn("leader-tx", IdleStrategy::Yield, move || sender.do_work()).unwrap();
-    let mut lr = LeaderReceiver::new(recv, tx, term).unwrap();
-    let lr_stats = lr.stats(); // capture before the receiver moves into its agent
-    let lra =
-        AgentRunner::spawn("leader-ctrl", IdleStrategy::Yield, move || lr.do_work()).unwrap();
-    Leader { node: Node { buffer, dir, agents: vec![txa, lra, ara] }, stats, lr_stats }
+
+    let rcfg = FollowerConfig::new(self_addr); // never actually followed from
+    let mut receiver = FollowerReceiver::new(
+        Arc::clone(&buffer),
+        recv_sock,
+        rcfg,
+        term,
+        unrouted_consensus(),
+    );
+    receiver.set_sender_route(ctrl_tx);
+    let rxa =
+        AgentRunner::spawn("leader-ctrl", IdleStrategy::Yield, move || receiver.do_work()).unwrap();
+    Leader { node: Node { buffer, dir, agents: vec![txa, rxa, ara] }, stats }
 }
 
 /// Append `n_msgs` 64 B messages, pacing admission against the LIVE followers
