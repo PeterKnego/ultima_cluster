@@ -102,8 +102,15 @@ pub enum PurgePolicy {
 /// Static-membership node configuration (M4: no discovery, no reconfiguration).
 pub struct NodeConfig {
     pub id: NodeId,
-    /// Every member INCLUDING self, as `(id, addr)`.
+    /// Every VOTING member INCLUDING self (if this node is a voter), as
+    /// `(id, addr)`. Learners are NOT listed here.
     pub members: Vec<(NodeId, SocketAddr)>,
+    /// M6 Task 7: learner peers, as `(id, addr)`. Default empty. A learner is
+    /// replicated-to (fan-out) but never counted (no vote, no quorum slot, no
+    /// flow-control window, no read-quorum ack). If this node's OWN id is in
+    /// `learners` it boots in learner mode (candidacy disabled). Learner ids must
+    /// be disjoint from `members`.
+    pub learners: Vec<(NodeId, SocketAddr)>,
     pub bind: SocketAddr,
     /// The node's on-disk instance directory (flock'd; holds cnc page, log
     /// buffer, journal, state, and the IPC ring files). Reused across restarts.
@@ -371,6 +378,14 @@ impl Node {
 
         // Election SM over the recovered credentials.
         let members_ids: Vec<NodeId> = cfg.members.iter().map(|(id, _)| *id).collect();
+        // M6 Task 7: a node whose own id is in `learners` boots in learner mode —
+        // replicated-to, never counted. By construction its id is NOT in `members`.
+        let is_learner = cfg.learners.iter().any(|(id, _)| *id == cfg.id);
+        assert!(
+            !is_learner || !members_ids.contains(&cfg.id),
+            "a learner's id must not also be a voting member (id={})",
+            cfg.id
+        );
         let recovered_vote = state.vote().map(|v| (v.term, v.voted_for));
         let sm = ElectionSm::new(
             ElectionConfig {
@@ -384,6 +399,7 @@ impl Node {
                 // knob — the value is a protocol constant, not deployment-tuned.
                 gossip_floor_ns: 100_000_000,
                 seed: cfg.seed,
+                can_vote: !is_learner,
             },
             recovered_vote,
             &rederived,
@@ -400,16 +416,29 @@ impl Node {
         let truncations = Arc::new(AtomicU64::new(0));
         let reports_implausible = Arc::new(AtomicU64::new(0));
 
-        // Peer maps and the follower set.
+        // Peer maps and the follower set. Both voters AND learners go into the
+        // address maps (a leader routes gossip/term-map to learners too, and every
+        // node maps inbound learner datagrams for demux), but only VOTERS are in
+        // `peers` — the set that paces quorum, is solicited for votes, and is
+        // targeted by READ_PROBE.
         let mut id_to_addr = HashMap::new();
         let mut addr_to_id = HashMap::new();
-        for (id, addr) in &cfg.members {
+        for (id, addr) in cfg.members.iter().chain(cfg.learners.iter()) {
             id_to_addr.insert(*id, *addr);
             addr_to_id.insert(*addr, *id);
         }
         let peers: Vec<NodeId> = members_ids.iter().copied().filter(|id| *id != cfg.id).collect();
+        // M6 Task 7: learners this node fans out to (all learners except self, so a
+        // learner never streams to itself).
+        let learner_ids: Vec<NodeId> =
+            cfg.learners.iter().map(|(id, _)| *id).filter(|id| *id != cfg.id).collect();
+        let learner_addrs: Vec<SocketAddr> =
+            learner_ids.iter().map(|id| id_to_addr[id]).collect();
+        // Leader fan-out = voters-minus-self ++ learners-minus-self (streamed
+        // identically); the learner subset is excluded from flow control.
+        let voting_followers: Vec<SocketAddr> = peers.iter().map(|id| id_to_addr[id]).collect();
         let followers: Vec<SocketAddr> =
-            peers.iter().map(|id| id_to_addr[id]).collect();
+            voting_followers.iter().chain(learner_addrs.iter()).copied().collect();
 
         // Channels.
         let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(NET_EVENT_CAPACITY);
@@ -426,11 +455,22 @@ impl Node {
         let mut sender_cfg = SenderConfig::new(boot_term);
         sender_cfg.heartbeat_ns = 20_000_000; // 20 ms: brisk tail-loss detection
         let journal = archive.journal_arc();
-        let mut sender = Sender::new(
+        // A learner never leads, so its sender streams to no one: give it a solo
+        // (empty) fan-out with a cluster size of 1, which also sidesteps flow
+        // control's leader-in-cluster invariant (from a learner's view every voter
+        // is a follower, so `voters == cluster_size` would trip the assert). A
+        // voter's sender gets the real fan-out = voters-minus-self ++ learners.
+        let (sender_followers, sender_learners, sender_cluster) = if is_learner {
+            (Vec::new(), Vec::new(), 1)
+        } else {
+            (followers, learner_addrs.clone(), cfg.members.len())
+        };
+        let mut sender = Sender::with_learners(
             Arc::clone(&buffer),
             send_sock,
-            followers,
-            cfg.members.len(),
+            sender_followers,
+            &sender_learners,
+            sender_cluster,
             ctrl_rx,
             sender_cfg,
             Arc::clone(&term_handle),
@@ -572,6 +612,7 @@ impl Node {
             id_to_addr,
             addr_to_id,
             peers,
+            learner_ids,
             net_rx,
             obs_rx,
             ingress_rx,
@@ -779,7 +820,13 @@ struct Consensus {
     sock: FaultSocket,
     id_to_addr: HashMap<NodeId, SocketAddr>,
     addr_to_id: HashMap<SocketAddr, NodeId>,
+    /// Voting peers (voting members minus self): solicited for votes, paced for
+    /// quorum, targeted by READ_PROBE, and used for the read-quorum size.
     peers: Vec<NodeId>,
+    /// M6 Task 7: learner peers this node fans gossip out to (all learners minus
+    /// self). Learners receive DATA (via the sender), commit gossip, and term maps
+    /// so they replicate + reconcile, but are NEVER counted for any quorum.
+    learner_ids: Vec<NodeId>,
     net_rx: mpsc::Receiver<NetEvent>,
     obs_rx: mpsc::Receiver<(u32, u64)>,
     ingress_rx: mpsc::Receiver<Vec<u8>>,
@@ -1237,6 +1284,14 @@ impl Consensus {
     /// Send a nonce'd READ_PROBE to every follower over the consensus socket,
     /// stamped with our current term (a follower acks only a probe whose term
     /// still equals its own — the no-stale-read filter lives on the follower).
+    /// Gossip fan-out targets: voting peers ++ learners. Commit gossip and term
+    /// maps go to both (learners replicate + reconcile); votes and READ_PROBEs go
+    /// to voters only. Collected into an owned Vec so the caller can `self.send`
+    /// inside the loop (which needs `&mut self`).
+    fn gossip_targets(&self) -> Vec<NodeId> {
+        self.peers.iter().chain(self.learner_ids.iter()).copied().collect()
+    }
+
     fn send_read_probe(&mut self, nonce: u64) {
         let term = self.sm.current_term();
         let mut body = [0u8; READ_PROBE_BODY_LEN];
@@ -1267,7 +1322,11 @@ impl Consensus {
     /// same node does not advance the count). On reaching quorum the read moves
     /// to `AwaitApplied`.
     fn on_read_probe_ack(&mut self, nonce: u64, from: NodeId) {
-        if !self.id_to_addr.contains_key(&from) {
+        // M6 Task 7 (the constraint block): the read quorum is over VOTERS only.
+        // The probe loop already targets voting peers, but re-check membership here
+        // so a learner's (or any non-voter's) ack can never complete a read quorum
+        // — even a forged/misrouted one. `peers` is the voting set minus self.
+        if !self.peers.contains(&from) {
             return;
         }
         for r in self.pending_reads.iter_mut() {
@@ -1651,7 +1710,10 @@ impl Consensus {
             }
             Action::GossipCommit { commit } => {
                 let term = self.sm.current_term();
-                for id in self.peers.clone() {
+                // Voters AND learners: a learner advances its commit off this
+                // gossip exactly like a follower (it just never gossips back a
+                // Report that counts).
+                for id in self.gossip_targets() {
                     let addr = self.id_to_addr[&id];
                     self.send(addr, DGRAM_KIND_COMMIT_POSITION, commit, term, &[]);
                 }
@@ -1659,7 +1721,9 @@ impl Consensus {
             Action::ShipTermMap { entries } => {
                 let term = self.sm.current_term();
                 let body = encode_term_map(&entries);
-                for id in self.peers.clone() {
+                // Voters AND learners: a learner reconciles against the shipped map
+                // (the NoCommonPrefix → wipe path in Task 8 rides this too).
+                for id in self.gossip_targets() {
                     let addr = self.id_to_addr[&id];
                     self.send(addr, DGRAM_KIND_TERM_MAP, 0, term, &body);
                 }
@@ -1951,6 +2015,7 @@ mod tests {
                 election_timeout_max_ns: 300,
                 gossip_floor_ns: u64::MAX,
                 seed: 7,
+                can_vote: true,
             },
             None,
             &[(1, 0), (2, 4096)],
@@ -2013,6 +2078,7 @@ mod tests {
             id_to_addr,
             addr_to_id,
             peers,
+            learner_ids: Vec::new(),
             net_rx,
             obs_rx,
             ingress_rx,

@@ -120,6 +120,7 @@ fn start_single_node_with_buffer(dir: &Path, app_id: &str, buffer_bytes: usize) 
         seed: 1,
         faults: FaultConfig::default(),
         purge: uc2_node::PurgePolicy::Disabled,
+        learners: Vec::new(),
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
     })
     .unwrap()
@@ -308,6 +309,7 @@ fn start_purge_node(dir: &Path, app_id: &str) -> Node {
         seed: 1,
         faults: FaultConfig::default(),
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        learners: Vec::new(),
         journal_segment_bytes: PURGE_SEG,
     })
     .unwrap()

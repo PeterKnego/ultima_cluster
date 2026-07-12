@@ -44,6 +44,7 @@ fn config(dir: &Path, app: &str, purge: PurgePolicy) -> NodeConfig {
         seed: 1,
         faults: FaultConfig::default(),
         purge,
+        learners: Vec::new(),
         journal_segment_bytes: SEG_BYTES,
     }
 }

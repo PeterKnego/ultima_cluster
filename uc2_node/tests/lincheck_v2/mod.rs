@@ -106,6 +106,7 @@ fn make_config(
         seed: seed_for(id as usize),
         faults,
         purge: uc2_node::PurgePolicy::Disabled,
+        learners: Vec::new(),
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
     }
 }

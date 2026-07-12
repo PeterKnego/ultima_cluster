@@ -413,6 +413,9 @@ impl World {
             gossip_floor_ns: cfg.gossip_floor_ns,
             // Distinct per-node seeds so timeouts spread (avoids lockstep splits).
             seed: cfg.seed ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(node as u64 + 1),
+            // The sim models a homogeneous voting cluster (no learners yet — that
+            // path is exercised at the node integration tier in Task 7/8).
+            can_vote: true,
         }
     }
 

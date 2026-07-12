@@ -276,6 +276,7 @@ fn node_config(
         seed: seed_for(id),
         faults: FaultConfig::default(),
         purge: uc2_node::PurgePolicy::Disabled,
+        learners: Vec::new(),
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
     }
 }

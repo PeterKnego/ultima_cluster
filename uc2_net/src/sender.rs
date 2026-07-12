@@ -224,11 +224,34 @@ impl Sender {
         term: TermHandle,
         role: Arc<AtomicBool>,
     ) -> Sender {
+        Self::with_learners(buffer, sock, followers, &[], cluster_size, ctrl, cfg, term, role)
+    }
+
+    /// M6 Task 7: leader-side voter/learner split. `followers` is the full fan-out
+    /// (voters-minus-self ++ learners, streamed identically); `learners` is the
+    /// subset excluded from flow-control's quorum statistic. `cluster_size` is the
+    /// VOTING cluster size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_learners(
+        buffer: Arc<LogBuffer>,
+        sock: FaultSocket,
+        followers: Vec<SocketAddr>,
+        learners: &[SocketAddr],
+        cluster_size: usize,
+        ctrl: mpsc::Receiver<CtrlMsg>,
+        cfg: SenderConfig,
+        term: TermHandle,
+        role: Arc<AtomicBool>,
+    ) -> Sender {
         assert!(
             align_frame_len(HEADER_LEN + buffer.max_payload()) + DATAGRAM_HEADER_LEN <= cfg.mtu,
             "a max-size frame must fit one datagram (raise mtu — the jumbo-frame knob)"
         );
-        let flow = FlowControl::new(&followers, cluster_size, cfg.initial_window);
+        // Voting followers pace commit; learners are fanned-out to but never enter
+        // `limit()`.
+        let voting: Vec<SocketAddr> =
+            followers.iter().copied().filter(|a| !learners.contains(a)).collect();
+        let flow = FlowControl::new(&voting, cluster_size, cfg.initial_window, learners);
         let sent = buffer.counters().sent.load_acquire();
         Sender {
             buffer,

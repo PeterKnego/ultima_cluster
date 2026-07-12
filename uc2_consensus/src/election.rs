@@ -59,6 +59,15 @@ pub struct ElectionConfig {
     /// cluster — waits to learn commit / reconcile. Default 100_000_000 (100ms).
     pub gossip_floor_ns: u64,
     pub seed: u64,
+    /// M6 Task 7: candidacy switch. A voter (`true`) runs the ordinary election
+    /// path — times out, solicits votes, grants votes. A learner (`false`) is
+    /// replicated-to but never counted: its election timer never fires a
+    /// candidacy, and it never grants a `RequestVote` (it still ADOPTS a higher
+    /// term for liveness/reconcile — just never votes). By construction a
+    /// learner's own id is NOT in `members` (the voting set), so it also never
+    /// occupies a `CommitTracker` slot and its `Report` is dropped by
+    /// `follower_slot` — the two halves of "never affects quorum".
+    pub can_vote: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +169,8 @@ pub enum Role {
 pub struct ElectionSm {
     id: NodeId,
     members: Vec<NodeId>,
+    /// M6 Task 7: candidacy switch (see [`ElectionConfig::can_vote`]).
+    can_vote: bool,
     timeout_min_ns: u64,
     timeout_max_ns: u64,
     /// Idle re-gossip floor (see [`ElectionConfig::gossip_floor_ns`]).
@@ -227,13 +238,26 @@ impl ElectionSm {
         now_ns: u64,
     ) -> Self {
         // Fail loudly at construction, not via a usize underflow later
-        // (n_members - 1) or a nonsensical timer span.
-        assert!(
-            !cfg.members.is_empty() && cfg.members.contains(&cfg.id),
-            "election membership must be non-empty and contain self (id={}, members={:?})",
-            cfg.id,
-            cfg.members
-        );
+        // (n_members - 1) or a nonsensical timer span. A voter's own id must be
+        // in `members` (it occupies a CommitTracker slot and votes for itself);
+        // a learner's own id must NOT be — `members` is the voting set only, and
+        // a learner is replicated-to without ever being counted (M6 Task 7).
+        assert!(!cfg.members.is_empty(), "election membership must be non-empty");
+        if cfg.can_vote {
+            assert!(
+                cfg.members.contains(&cfg.id),
+                "a voter's id must be in the voting membership (id={}, members={:?})",
+                cfg.id,
+                cfg.members
+            );
+        } else {
+            assert!(
+                !cfg.members.contains(&cfg.id),
+                "a learner's id must NOT be in the voting membership (id={}, members={:?})",
+                cfg.id,
+                cfg.members
+            );
+        }
         // Hard-assert (M-2): a strictly positive timer span. An empty span
         // (`min == max`) collapses randomized election timeouts to a single
         // value across the cluster — a split-vote hazard — and a `min > max`
@@ -255,6 +279,7 @@ impl ElectionSm {
         let mut sm = Self {
             id: cfg.id,
             members: cfg.members,
+            can_vote: cfg.can_vote,
             timeout_min_ns: cfg.election_timeout_min_ns,
             timeout_max_ns: cfg.election_timeout_max_ns,
             gossip_floor_ns: cfg.gossip_floor_ns,
@@ -376,6 +401,15 @@ impl ElectionSm {
                 // and the safety core enforces that here rather than trusting the
                 // transport (which a forged-source datagram could evade).
                 if !self.members.contains(&from) {
+                    return;
+                }
+                if !self.can_vote {
+                    // Learner: adopt a higher term (liveness/reconcile) but never
+                    // vote — it is not in the voting set and must not influence any
+                    // election. No rejection either: a learner emits no vote traffic.
+                    if new_term > self.current_term {
+                        self.adopt_term(new_term, None, out);
+                    }
                     return;
                 }
                 if new_term < self.current_term {
@@ -537,7 +571,13 @@ impl ElectionSm {
                     self.pending_leader_activity = false;
                     self.arm_timeout(now_ns);
                 } else if now_ns >= self.timeout_deadline_ns {
-                    self.start_election(now_ns, out);
+                    if self.can_vote {
+                        self.start_election(now_ns, out);
+                    } else {
+                        // Learner: the timer fires but never becomes a candidacy —
+                        // just re-arm so we keep tracking liveness without electing.
+                        self.arm_timeout(now_ns);
+                    }
                 }
             }
         }
@@ -756,6 +796,7 @@ mod tests {
             // `idle_leader_reemits_on_gossip_floor` with a small floor.
             gossip_floor_ns: u64::MAX,
             seed: 42 + id as u64,
+            can_vote: true,
         }
     }
 
@@ -767,6 +808,7 @@ mod tests {
             election_timeout_max_ns: 300,
             gossip_floor_ns: u64::MAX,
             seed: 42 + id as u64,
+            can_vote: true,
         }
     }
 
@@ -803,6 +845,21 @@ mod tests {
         ElectionSm::new(cfg(0), None, &[(1, 0)], 0, 0)
     }
 
+    /// A learner (id 9, deliberately NOT in the voting set `[0,1,2]`): it is
+    /// replicated-to but never counted (M6 Task 7).
+    fn learner() -> ElectionSm {
+        let cfg = ElectionConfig {
+            id: 9,
+            members: vec![0, 1, 2],
+            election_timeout_min_ns: 150,
+            election_timeout_max_ns: 300,
+            gossip_floor_ns: u64::MAX,
+            seed: 7,
+            can_vote: false,
+        };
+        ElectionSm::new(cfg, None, &[(1, 0)], 0, 0)
+    }
+
     fn extract_truncate_epoch(out: &[Action]) -> u64 {
         out.iter()
             .find_map(|a| match a {
@@ -810,6 +867,66 @@ mod tests {
                 _ => None,
             })
             .expect("truncate issued")
+    }
+
+    #[test]
+    fn learner_never_becomes_a_candidate() {
+        let mut s = learner();
+        assert!(matches!(s.role(), Role::Follower));
+        let term0 = s.current_term(); // seeded from the recovered map, not candidacy
+        // Drive the election timer well past its max many times: a learner's timer
+        // fires but re-arms — it never solicits votes, never casts one, never
+        // leaves follower, and never bumps the term via candidacy.
+        for t in 1..=50u64 {
+            let acts = step(&mut s, Event::Tick { now_ns: t * 400 });
+            assert!(
+                !acts.iter().any(|a| matches!(a, Action::StartElection { .. })),
+                "a learner must never solicit votes"
+            );
+            assert!(
+                !acts.iter().any(|a| matches!(a, Action::PersistAndSendVote { .. })),
+                "a learner must never cast a vote (self or otherwise)"
+            );
+        }
+        assert!(matches!(s.role(), Role::Follower));
+        assert_eq!(s.current_term(), term0, "candidacy never bumped the term");
+    }
+
+    #[test]
+    fn learner_adopts_term_but_never_grants_a_vote() {
+        let mut s = learner();
+        // A voter solicits at term 5: the learner adopts the term (liveness /
+        // reconcile) but emits ZERO vote traffic — no grant, no rejection.
+        let acts = step(
+            &mut s,
+            Event::RequestVote { from: 0, new_term: 5, last_term: 1, last_durable: 10_000 },
+        );
+        assert_eq!(s.current_term(), 5, "learner adopted the higher term");
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::PersistAndSendVote { .. })),
+            "learner never grants a vote"
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::SendVoteRejection { .. })),
+            "learner emits no vote rejection either"
+        );
+        assert!(matches!(s.role(), Role::Follower));
+    }
+
+    #[test]
+    fn learner_report_never_advances_a_leaders_commit() {
+        // The phantom-commit-via-learner hole, pinned shut: a leader whose voting
+        // peers are silent must NOT commit on a learner's (sky-high) durable Report.
+        let mut s = sm(0);
+        step(&mut s, Event::Tick { now_ns: 301 }); // candidate, term 1
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true }); // majority → leader
+        assert!(matches!(s.role(), Role::Leader));
+        // A learner (id 9, NOT a voting member) reports a huge durable at our term.
+        let acts = step(&mut s, Event::Report { from: 9, term: 1, durable: 1 << 40 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            "a learner's Report must never advance commit (follower_slot drops it)"
+        );
     }
 
     #[test]
@@ -1183,6 +1300,7 @@ mod tests {
             election_timeout_max_ns: 300,
             gossip_floor_ns: 1000,
             seed: 42,
+            can_vote: true,
         };
         let mut s = ElectionSm::new(cfg, None, &[], 0, 0);
         // Drive to leader of term 1. `become_leader` re-anchors the idle floor to
