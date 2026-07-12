@@ -723,6 +723,13 @@ impl Node {
         self.cnc.counters()
     }
 
+    /// The service's applied position (cnc `service_applied`, offset 512). A
+    /// reconstructing service catches up when this reaches `commit`; the M6 gate
+    /// reads it to time below-floor reconstruction convergence.
+    pub fn service_applied(&self) -> u64 {
+        self.cnc.service().service_applied.load_acquire()
+    }
+
     /// M6 Task 4: the archive's lowest still-replayable position (the purge
     /// floor's realized value). `0` when nothing has been purged. Exposed for
     /// purge-safety tests: after the service publishes a snapshot and the purge
