@@ -59,6 +59,41 @@ impl TruncationSlot {
     }
 }
 
+/// A command from the consensus agent to the archive agent (M6 Task 4). Was a
+/// bare `(epoch, to)` truncation tuple through M5; the snapshot floor adds a
+/// second verb, so the channel carries a typed enum. `Truncate` keeps the exact
+/// M4/M5 semantics (persist-map-before-truncate is done on the consensus side;
+/// the archive just executes + acks via the [`TruncationSlot`]). `Purge` is
+/// best-effort and needs no ack — a failed purge simply retries next interval,
+/// and correctness never depends on any particular block still being present
+/// (a reader below the floor recovers via the snapshot path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchiveCmd {
+    /// Drop the divergent tail at/above `to`; ack `(epoch, to)` when done.
+    Truncate { epoch: u64, to: u64 },
+    /// Drop whole journal blocks strictly below the block covering `below`
+    /// (`Archive::purge_below`). No ack. Errors log-warn and drop.
+    Purge { below: u64 },
+}
+
+/// Journal purge policy (M6 Task 4). **Default `Disabled` — purge is OFF by
+/// default.** Every M6 bug class is "purged something someone still needed", so
+/// a deployment opts in explicitly. `BelowSnapshot` purges journal blocks below
+/// `snapshot_floor - slack_bytes`, never at/above the durable snapshot floor and
+/// never into the block that covers it (the archive's `purge_below` keeps the
+/// covering block; `Journal::purge_before` never drops the active segment — two
+/// layers of slack). `slack_bytes` keeps a margin of still-replayable journal
+/// below the floor so a follower whose NAK lands just under it can still be
+/// served from the log instead of forcing a snapshot session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PurgePolicy {
+    #[default]
+    Disabled,
+    BelowSnapshot {
+        slack_bytes: u64,
+    },
+}
+
 /// Static-membership node configuration (M4: no discovery, no reconfiguration).
 pub struct NodeConfig {
     pub id: NodeId,
@@ -81,7 +116,19 @@ pub struct NodeConfig {
     pub election_timeout_max_ns: u64,
     pub seed: u64,
     pub faults: FaultConfig,
+    /// M6 Task 4: journal purge policy. Default [`PurgePolicy::Disabled`] — a
+    /// node never purges unless explicitly configured AND the service publishes
+    /// a snapshot floor (a snapshot-incapable SM never registers one).
+    pub purge: PurgePolicy,
+    /// M6 Task 4: journal segment size in bytes (the archive rolls a new
+    /// segment file at this granularity; purge drops whole non-active
+    /// segments). Production default `64 MiB` ([`DEFAULT_JOURNAL_SEGMENT_BYTES`]);
+    /// tests shrink it so a purge is observable without writing gigabytes.
+    pub journal_segment_bytes: u64,
 }
+
+/// Production default journal segment size (matches `ArchiveConfig::new`).
+pub const DEFAULT_JOURNAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Why a `submit` was refused: leader-only ingress. `Full` covers both a
 /// saturated in-process queue and the admission window being closed
@@ -190,6 +237,10 @@ pub struct Node {
     buffer: Arc<LogBuffer>,
     truncations: Arc<AtomicU64>,
     reports_implausible: Arc<AtomicU64>,
+    /// M6 Task 4: node-internal mirror of the archive's lowest replayable
+    /// position (written by the archive agent). Exposed via
+    /// [`Node::archive_first_base`] for purge-safety tests.
+    archive_first_base: Arc<AtomicU64>,
     route_drops: Arc<uc2_net::receiver::FollowerStats>,
     partition_handles: Vec<PartitionHandle>,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
@@ -236,9 +287,25 @@ impl Node {
         ];
 
         // 2. Recover durable state from the journal.
-        let mut archive =
-            Archive::open(ArchiveConfig::new(instance.journal_dir())).map_err(to_io)?;
+        let mut archive_cfg = ArchiveConfig {
+            segment_size_bytes: cfg.journal_segment_bytes,
+            ..ArchiveConfig::new(instance.journal_dir())
+        };
+        // Invariant: a block records as ONE journal record and must fit within a
+        // segment. Keep the block cap comfortably below the segment size (never
+        // above the production 1 MiB default). This lets tests shrink segments
+        // to a few KiB to observe purge without the block cap overflowing them.
+        archive_cfg.max_block_bytes = archive_cfg
+            .max_block_bytes
+            .min((cfg.journal_segment_bytes / 2) as usize)
+            .max(4096);
+        let mut archive = Archive::open(archive_cfg).map_err(to_io)?;
         let durable = archive.recovered_position();
+        // M6 Task 4: node-internal mirror of the archive's lowest replayable
+        // position. Written by the archive agent (after a purge), read by the
+        // consensus agent (the purge guard: never issue a purge that wouldn't
+        // advance the floor) and exposed via `Node::archive_first_base` for tests.
+        let archive_first_base = Arc::new(AtomicU64::new(archive.first_base()));
         let state = NodeState::open(&instance.state_dir()).map_err(to_io)?;
 
         // Recovery re-derivation (T4 carry 4): if the persisted term map does not
@@ -284,6 +351,12 @@ impl Node {
         // SAME mirror at attach to seed its cursor (spec §7).
         let output_progress = state.output_progress();
         cnc.status().output_progress.store_release(output_progress);
+        // M6 Task 4: same durable-then-mirror seeding for the snapshot floor —
+        // the recovered value onto the fresh cnc page so an attaching reader
+        // sees the real floor immediately (not 0), and the persister's
+        // increase-only shadow starts from it.
+        let state_snapshot_floor = state.snapshot_floor();
+        cnc.snapshots().node_snapshot_floor.store_release(state_snapshot_floor);
 
         // 6. Rings created fresh each boot (stale files unlinked first — any
         // prior attachment is invalidated by the new instance_id anyway).
@@ -340,7 +413,7 @@ impl Node {
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(1024);
         // Truncation command channel carries `(epoch, to)`; the ack rides an
         // infallible single slot (one truncation in flight — the SM latch).
-        let (trunc_tx, trunc_rx) = mpsc::sync_channel::<(u64, u64)>(64);
+        let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
         let trunc_slot = TruncationSlot::default();
 
         // Sender (streams when leader; commit ranking is entirely the
@@ -376,22 +449,50 @@ impl Node {
         receiver.set_intake_gate(Arc::clone(&intake_gate));
         let route_drops = receiver.stats();
 
-        // Archive agent: truncate commands first (don't record blocks about to be
-        // dropped), then record, then ship data-stamped term observations.
+        // Archive agent: archive commands first (don't record blocks about to be
+        // dropped/purged), then record, then ship data-stamped term observations.
         let arc_buffer = Arc::clone(&buffer);
         let arc_cnc = Arc::clone(&cnc);
         let arc_slot = trunc_slot.clone();
+        let arc_first_base = Arc::clone(&archive_first_base);
         let archive_agent = AgentRunner::spawn("uc2-archive", IdleStrategy::Yield, move || {
             let mut did = false;
-            while let Ok((epoch, to)) = trunc_rx.try_recv() {
-                // First-block cuts (a contested first election, `to` at/inside
-                // block 0) are handled by the archive via `Journal::truncate_all`
-                // + prefix re-seed (M4 carry #3) and no longer fail-stop. Any
-                // remaining error is a genuine journal I/O fault — still fatal.
-                archive.truncate_to(to).expect("archive truncate fail-stop (journal I/O)");
-                arc_cnc.counters().prime(to);
-                // Infallible ack: a single slot cannot drop (one in flight).
-                arc_slot.post(epoch, to);
+            while let Ok(cmd) = trunc_rx.try_recv() {
+                match cmd {
+                    ArchiveCmd::Truncate { epoch, to } => {
+                        // First-block cuts (a contested first election, `to`
+                        // at/inside block 0) are handled by the archive via
+                        // `Journal::truncate_all` + prefix re-seed (M4 carry #3)
+                        // and no longer fail-stop. Any remaining error is a
+                        // genuine journal I/O fault — still fatal.
+                        archive
+                            .truncate_to(to)
+                            .expect("archive truncate fail-stop (journal I/O)");
+                        arc_cnc.counters().prime(to);
+                        // A truncation can drop the first block (first-block cut);
+                        // republish the floor so the consensus guard stays honest.
+                        arc_first_base.store(archive.first_base(), Ordering::Release);
+                        // Infallible ack: a single slot cannot drop (one in flight).
+                        arc_slot.post(epoch, to);
+                    }
+                    ArchiveCmd::Purge { below } => {
+                        // Best-effort: a failed purge logs + drops (retries next
+                        // interval). Correctness never depends on a block still
+                        // being present — a reader below the floor recovers via
+                        // the snapshot path (Task 5 same-host, Task 6 remote).
+                        match archive.purge_below(below) {
+                            Ok(new_first) => {
+                                arc_first_base.store(new_first, Ordering::Release);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "uc2_node: archive purge_below({below}) failed: {e} \
+                                     (dropped; retries next interval)"
+                                );
+                            }
+                        }
+                    }
+                }
                 did = true;
             }
             if archive.do_work(&arc_buffer).expect("archive fail-stop") {
@@ -449,6 +550,10 @@ impl Node {
             pending_truncation: None,
             output_persisted_completed: output_progress,
             output_progress_last_persist_ns: None,
+            purge_policy: cfg.purge,
+            archive_first_base: Arc::clone(&archive_first_base),
+            snapshot_persisted_floor: state_snapshot_floor,
+            snapshot_floor_last_persist_ns: None,
         };
         let consensus_agent =
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
@@ -463,6 +568,7 @@ impl Node {
             buffer,
             truncations,
             reports_implausible,
+            archive_first_base,
             route_drops,
             partition_handles,
             _instance: instance,
@@ -487,6 +593,14 @@ impl Node {
 
     pub fn counters(&self) -> &LogCounters {
         self.cnc.counters()
+    }
+
+    /// M6 Task 4: the archive's lowest still-replayable position (the purge
+    /// floor's realized value). `0` when nothing has been purged. Exposed for
+    /// purge-safety tests: after the service publishes a snapshot and the purge
+    /// driver runs, this advances to at most the snapshot floor.
+    pub fn archive_first_base(&self) -> u64 {
+        self.archive_first_base.load(Ordering::Acquire)
     }
 
     /// Read the committed message frame at `pos` (which must be a frame
@@ -627,7 +741,7 @@ struct Consensus {
     net_rx: mpsc::Receiver<NetEvent>,
     obs_rx: mpsc::Receiver<(u32, u64)>,
     ingress_rx: mpsc::Receiver<Vec<u8>>,
-    trunc_tx: mpsc::SyncSender<(u64, u64)>,
+    trunc_tx: mpsc::SyncSender<ArchiveCmd>,
     trunc_slot: TruncationSlot,
     term_handle: TermHandle,
     leader_flag: Arc<AtomicBool>,
@@ -653,6 +767,21 @@ struct Consensus {
     /// waiting out the floor). The 100 ms floor rate-limits the fsync'd
     /// `StableValue::store`, not the cheap in-page compare that runs every cycle.
     output_progress_last_persist_ns: Option<u64>,
+    /// M6 Task 4: journal purge policy (default `Disabled`). Gates the purge
+    /// half of `maybe_persist_snapshot_floor`.
+    purge_policy: PurgePolicy,
+    /// M6 Task 4: node-internal mirror of the archive's lowest replayable
+    /// position, written by the archive agent. Read here to gate purge (only
+    /// issue a `Purge` that would actually advance the floor).
+    archive_first_base: Arc<AtomicU64>,
+    /// M6 Task 4: last snapshot floor durably persisted to `state/snapshot.state`.
+    /// The increase-only high-water mark — seeded from the recovered durable
+    /// floor at boot so a fresh cnc page's `service_snapshot_pos == 0` can never
+    /// regress it (the marker-clobber lesson, exactly as `output_persisted_completed`).
+    snapshot_persisted_floor: u64,
+    /// M6 Task 4: monotonic ns of the last snapshot-floor persist; `None` until
+    /// the first. Same 100 ms fsync floor as output-progress.
+    snapshot_floor_last_persist_ns: Option<u64>,
 }
 
 impl Consensus {
@@ -735,6 +864,11 @@ impl Consensus {
         // 7. Sample the service-written `output_completed` counter (Task 12);
         // on change, durably persist + mirror it, subject to the 100 ms floor.
         did |= self.maybe_persist_output_progress();
+
+        // 8. Sample the service-written `service_snapshot_pos` (M6 Task 4); on a
+        // validated increase, durably persist the snapshot floor + mirror it,
+        // then (if the purge policy is on) command the archive to purge below it.
+        did |= self.maybe_persist_snapshot_floor();
         did
     }
 
@@ -774,6 +908,74 @@ impl Consensus {
         self.output_persisted_completed = completed;
         self.output_progress_last_persist_ns = Some(now);
         true
+    }
+
+    /// M6 Task 4. Sample the service-written `snapshots().service_snapshot_pos`
+    /// (a cheap compare every cycle); on a VALIDATED increase durably persist
+    /// the snapshot floor via `NodeState::store_snapshot_floor` THEN mirror it
+    /// onto `snapshots().node_snapshot_floor` (durable-then-mirror, same order
+    /// as output-progress), and — when a purge policy is configured — command
+    /// the archive to drop journal below `floor - slack`. Returns `true` iff it
+    /// did fsync or purge work (drives the idle strategy).
+    ///
+    /// **Increase-only, and validated `<= durable`.** Increase-only is the same
+    /// high-water-mark discipline as `maybe_persist_output_progress` (the cnc
+    /// page is fresh every boot; `snapshot_persisted_floor` is seeded from the
+    /// recovered durable floor so a boot-time `service_snapshot_pos == 0` cannot
+    /// regress it) — but here regressing the floor would be a SAFETY bug, not
+    /// mere at-least-once slack: a purge floor must never move backwards. The
+    /// `<= durable` gate rejects a service value ahead of this node's fsync
+    /// frontier (a torn/racy read, or a snapshot at a not-yet-durable position)
+    /// — a purge floor is only ever a position whose covering journal block is
+    /// itself durable here.
+    ///
+    /// The fsync + the archive command are throttled to [`OUTPUT_PROGRESS_FLOOR_NS`]
+    /// (the cheap in-page compares still run every cycle); a purge that couldn't
+    /// advance the floor (archive not yet caught up, or a prior best-effort
+    /// purge that failed) simply retries on the next tick.
+    fn maybe_persist_snapshot_floor(&mut self) -> bool {
+        let service_pos = self.cnc.snapshots().service_snapshot_pos.load_acquire();
+        let durable = self.cnc.counters().durable.load_acquire();
+        let have_new_floor =
+            service_pos > self.snapshot_persisted_floor && service_pos <= durable;
+        let purge_on = matches!(self.purge_policy, PurgePolicy::BelowSnapshot { .. });
+        // Cheap exit every cycle when there is neither a newer floor to persist
+        // nor a purge policy that might have outstanding work.
+        if !have_new_floor && !purge_on {
+            return false;
+        }
+        let now = self.now_ns();
+        let floor_elapsed = self
+            .snapshot_floor_last_persist_ns
+            .is_none_or(|last| now.saturating_sub(last) >= OUTPUT_PROGRESS_FLOOR_NS);
+        if !floor_elapsed {
+            return false;
+        }
+
+        let mut did = false;
+        if have_new_floor {
+            self.state
+                .store_snapshot_floor(service_pos)
+                .expect("snapshot floor persist fail-stop (journal I/O)");
+            self.cnc.snapshots().node_snapshot_floor.store_release(service_pos);
+            self.snapshot_persisted_floor = service_pos;
+            did = true;
+        }
+        if let PurgePolicy::BelowSnapshot { slack_bytes } = self.purge_policy {
+            let target = self.snapshot_persisted_floor.saturating_sub(slack_bytes);
+            // Only command a purge that would actually advance the floor. The
+            // archive acks by advancing `archive_first_base`; `try_send` (not
+            // `send`) keeps a full channel from blocking the consensus loop — a
+            // dropped purge is harmless (best-effort, retried next tick).
+            if target > self.archive_first_base.load(Ordering::Acquire) {
+                let _ = self.trunc_tx.try_send(ArchiveCmd::Purge { below: target });
+                did = true;
+            }
+        }
+        if did {
+            self.snapshot_floor_last_persist_ns = Some(now);
+        }
+        did
     }
 
     /// Publish `term`, `flags` (leader/can_serve), and a fresh wall-clock
@@ -1409,7 +1611,9 @@ impl Consensus {
                 self.close_gate();
                 self.pending_truncation = Some(epoch);
                 self.awaiting_reconcile = false;
-                self.trunc_tx.send((epoch, to)).expect("archive channel closed");
+                self.trunc_tx
+                    .send(ArchiveCmd::Truncate { epoch, to })
+                    .expect("archive channel closed");
             }
             Action::PersistTermMap { new_map } => {
                 self.state
@@ -1564,6 +1768,12 @@ fn rederive_term_map(
         Some((t, b)) => (*b, *t),
         None => (0, 0),
     };
+    // M6 Task 4: after a purge, the persisted map's last base may sit below the
+    // archive's first retained block — replaying from it would be `PositionPurged`.
+    // Everything below `first_base` is already in the persisted map (and covered
+    // by the snapshot the purge floor represents); only the retained tail can
+    // contain terms not yet stamped, so clamp the scan start to `first_base`.
+    let start = start.max(archive.first_base());
     let mut replay = archive.replay_from(start)?;
     while let Some(frame) = replay.next()? {
         let t = frame.header.leadership_term_id;
@@ -1605,7 +1815,7 @@ mod tests {
         _net_tx: mpsc::SyncSender<NetEvent>,
         _obs_tx: mpsc::SyncSender<(u32, u64)>,
         _ingress_tx: mpsc::SyncSender<Vec<u8>>,
-        _trunc_rx: mpsc::Receiver<(u64, u64)>,
+        _trunc_rx: mpsc::Receiver<ArchiveCmd>,
         _dir: tempfile::TempDir,
     }
 
@@ -1688,7 +1898,7 @@ mod tests {
         let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(64);
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(64);
         let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Vec<u8>>(64);
-        let (trunc_tx, trunc_rx) = mpsc::sync_channel::<(u64, u64)>(64);
+        let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
         let trunc_slot = TruncationSlot::default();
 
         let sock = FaultSocket::from_socket(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
@@ -1747,6 +1957,10 @@ mod tests {
             pending_truncation: None,
             output_persisted_completed: 0,
             output_progress_last_persist_ns: None,
+            purge_policy: PurgePolicy::Disabled,
+            archive_first_base: Arc::new(AtomicU64::new(0)),
+            snapshot_persisted_floor: 0,
+            snapshot_floor_last_persist_ns: None,
         };
 
         Harness {
@@ -1789,7 +2003,7 @@ mod tests {
         assert!(!h.gate_open(), "gate stays closed while the truncate is emitted");
         let epoch = h.cons.pending_truncation.expect("a truncation is now in flight");
         // The truncate command reached the archive channel with its epoch.
-        assert_eq!(h._trunc_rx.try_recv().ok(), Some((epoch, 4096)));
+        assert_eq!(h._trunc_rx.try_recv().ok(), Some(ArchiveCmd::Truncate { epoch, to: 4096 }));
 
         // Term-map #2: the leader re-ships the SAME map while the archive
         // truncation is still in flight. The SM's truncating latch drops it with

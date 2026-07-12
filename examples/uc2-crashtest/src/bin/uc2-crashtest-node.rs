@@ -69,6 +69,8 @@ fn main() -> anyhow::Result<()> {
         election_timeout_max_ns: 300_000_000,
         seed: 1,
         faults: FaultConfig::default(),
+        purge: uc2_node::PurgePolicy::Disabled,
+        journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
     };
 
     let _node = Node::start(cfg)?;
