@@ -32,7 +32,10 @@
 //! `freeze` / `stream_snapshot` / `install_snapshot` delegate to ultima_db's
 //! `snapshot_stream` / `install_snapshot_stream` (wire format documented in
 //! `ultima_db/docs/tasks/task27_snapshot_stream.md`), both requiring the
-//! `persistence` feature on `ultima-db` (carried by the workspace dep).
+//! `persistence` feature on `ultima-db` (carried by the workspace dep). The
+//! adapter assumes a **persisted** store (e.g. `Persistence::smr(dir)`):
+//! `install_snapshot` runs `checkpoint()` after the install, which errors
+//! under `Persistence::None`.
 //!
 //! # Errors in `apply`
 //!
@@ -44,7 +47,7 @@
 use std::io::{Read, Write};
 
 use serde::{Serialize, de::DeserializeOwned};
-use ultima_db::{InstallOptions, ReadTx, SnapshotReader, Store, WriteTx};
+use ultima_db::{InstallOptions, OnExtra, ReadTx, SnapshotReader, Store, WriteTx};
 
 use crate::config::SnapshotError;
 use crate::traits::{SnapshotStateMachine, StateMachine};
@@ -140,10 +143,17 @@ where
     ) -> Result<u64, SnapshotError> {
         // Pin the installed snapshot to the artifact's tagged position `S`, so
         // the version space stays in lockstep with the log position space.
+        //
+        // `OnExtra::Drop` = strict replace semantics: the trait contract is
+        // "replace the state wholesale", so a destination table absent from
+        // the incoming snapshot (a divergent prior life) must NOT survive the
+        // install — exactly the Raft `InstallSnapshot` mode ultima_db
+        // documents `Drop` for.
         self.store
             .install_snapshot_stream(
                 src,
                 InstallOptions {
+                    on_extra_tables: OnExtra::Drop,
                     commit_version: Some(position),
                     ..InstallOptions::default()
                 },
