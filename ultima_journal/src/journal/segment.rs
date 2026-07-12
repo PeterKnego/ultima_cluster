@@ -575,6 +575,35 @@ impl SegmentFile {
         }
     }
 
+    /// Read ONLY the first record's `meta` (its block base position) with a
+    /// bounded 20-byte read — the length prefix plus the record's seq/meta head
+    /// — never scanning the whole segment. Returns `Ok(None)` when the segment
+    /// has no readable first record yet: an empty/zeroed first slot (length
+    /// prefix 0, written last per the atomic-after-write discipline) or a body
+    /// too short to hold seq+meta. Does NOT CRC-verify: the only caller
+    /// ([`crate::journal::TailReader::scan_from`]) uses this for a CONSERVATIVE
+    /// segment-skip decision, and an unreadable head is treated as "don't skip".
+    pub(crate) fn first_record_meta(&self) -> Result<Option<u64>, JournalError> {
+        let mut f = self.file.try_clone()?;
+        f.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))?;
+        let mut head = [0u8; 4 + 16];
+        match f.read_exact(&mut head) {
+            Ok(()) => {}
+            // Segment shorter than one record head (empty active segment / torn):
+            // no readable first record.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(JournalError::Io(e)),
+        }
+        let body_len = u32::from_le_bytes(head[0..4].try_into().unwrap()) as usize;
+        // body_len 0 = unwritten (prefix not yet stamped); < 16 = torn/garbage
+        // head. Either way, no readable meta yet.
+        if body_len < 16 {
+            return Ok(None);
+        }
+        // body layout: seq[0..8], meta[8..16]; head = 4-byte prefix + body head.
+        Ok(Some(u64::from_le_bytes(head[12..20].try_into().unwrap())))
+    }
+
     /// The segment's file name as a `String`, for error/corruption context.
     fn segname(&self) -> String {
         self.path.file_name().unwrap().to_string_lossy().to_string()

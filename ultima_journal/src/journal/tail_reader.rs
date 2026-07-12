@@ -28,7 +28,14 @@
 //!   NEXT `scan` simply won't include it. A partially-applied truncate leaves a
 //!   `truncate.intent` file, which the reader deliberately IGNORES (it is a
 //!   `.intent`, not a `seg-*.log`) — completing it is the writer's job, and a
-//!   pre-truncation stale read is bounded below.
+//!   pre-truncation stale read is bounded below. `Journal::purge_before` (M6)
+//!   makes this unlink-under-scan case REAL rather than theoretical: a segment
+//!   listed by [`scan_from`](TailReader::scan_from)'s directory read can vanish
+//!   before its `open_for_read` (or its first-record probe). Both the main scan
+//!   loop and the skip-probe treat that `NotFound` as "not there" — the scan
+//!   continues past a vanished file and the probe declines to skip — so a
+//!   concurrent purge can never break a scan, only make it observe a slightly
+//!   higher floor.
 //! * Truncation sentinel records (a `truncate_after` in progress) are skipped
 //!   (`segment::is_sentinel`).
 //!
@@ -74,31 +81,56 @@ impl TailReader {
     /// scan (see the module safety argument).
     pub fn scan(
         &self,
+        visit: impl FnMut(u64, u64, &[u8]) -> bool,
+    ) -> Result<(), JournalError> {
+        // scan(v) is exactly scan_from(0, v): with start_meta 0 no segment can
+        // be skipped (only the first block has meta 0, and a skip needs the NEXT
+        // segment's first meta <= 0), so every record is visited in seq order.
+        self.scan_from(0, visit)
+    }
+
+    /// Like [`scan`](TailReader::scan), but skips whole segment FILES whose
+    /// records all end at or below `start_meta`, decided by each segment's
+    /// first-record meta vs the NEXT segment's first-record meta — O(#segments)
+    /// bounded probes, never O(bytes). `visit` still receives EVERY record of
+    /// the first relevant segment onward (the covering segment is always
+    /// yielded), so callers keep their own per-record skip. `scan(v) ==
+    /// scan_from(0, v)`.
+    ///
+    /// Concurrent-safe exactly like `scan`: a segment (or its probe target)
+    /// unlinked by a concurrent purge is treated as absent — the scan continues
+    /// past it and the skip-probe declines to skip — so a live purge can never
+    /// break the scan (see the module safety argument).
+    pub fn scan_from(
+        &self,
+        start_meta: u64,
         mut visit: impl FnMut(u64, u64, &[u8]) -> bool,
     ) -> Result<(), JournalError> {
-        // Re-list on every call: filenames `seg-{seq:020}.log` sort in seq
-        // order (the same ordering `Journal::open` relies on). Orphan
-        // preallocation temps (`seg-prealloc.*.tmp`) and the `truncate.intent`
-        // file are excluded by the extension filter — the reader never touches
-        // them.
-        let mut paths: Vec<PathBuf> = std::fs::read_dir(&self.dir)?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .map(|n| {
-                        let s = n.to_string_lossy();
-                        s.starts_with("seg-") && s.ends_with(".log")
-                    })
-                    .unwrap_or(false)
-            })
-            .collect();
-        paths.sort();
+        let paths = self.segment_paths()?;
 
-        for path in paths {
+        // Find the first segment to scan: the COVERING segment (the last one
+        // whose first record meta <= start_meta). Skip segment file `i` only
+        // when file `i+1`'s first record meta <= start_meta — then every record
+        // of file `i` is strictly below that, hence below start_meta, and file
+        // `i` is entirely skippable. Stop at the first `i+1` whose first meta
+        // exceeds start_meta OR cannot be probed (vanished / torn head): the
+        // conservative choice is to NOT skip further, so the covering segment is
+        // always retained.
+        let mut start_idx = 0usize;
+        for i in 0..paths.len() {
+            if i + 1 >= paths.len() {
+                break; // never skip the last (active) segment
+            }
+            match Self::probe_first_meta(&paths[i + 1])? {
+                Some(next_first) if next_first <= start_meta => start_idx = i + 1,
+                _ => break,
+            }
+        }
+
+        for path in &paths[start_idx..] {
             // A segment can be unlinked between the listing and the open (a
             // concurrent purge); skip a vanished file rather than error.
-            let seg = match SegmentFile::open_for_read(&path) {
+            let seg = match SegmentFile::open_for_read(path) {
                 Ok(seg) => seg,
                 Err(JournalError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => return Err(e),
@@ -114,6 +146,54 @@ impl TailReader {
             }
         }
         Ok(())
+    }
+
+    /// The `meta` of the first readable record across all segments (the
+    /// archive's first block base) — `None` if the journal is empty or fully
+    /// purged. Concurrent-safe like [`scan`](TailReader::scan): probes segments
+    /// in seq order and returns the first readable first-record meta, skipping a
+    /// segment whose head is vanished/torn.
+    pub fn first_meta(&self) -> Result<Option<u64>, JournalError> {
+        for path in self.segment_paths()? {
+            if let Some(meta) = Self::probe_first_meta(&path)? {
+                return Ok(Some(meta));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The sorted `seg-*.log` paths in `dir`, re-listed per call so segments
+    /// rotated (or purged) since the last call are reflected. Orphan
+    /// preallocation temps (`seg-prealloc.*.tmp`) and the `truncate.intent`
+    /// file are excluded by the extension filter — the reader never touches
+    /// them. Filenames `seg-{seq:020}.log` sort in seq order.
+    fn segment_paths(&self) -> Result<Vec<PathBuf>, JournalError> {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&self.dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .map(|n| {
+                        let s = n.to_string_lossy();
+                        s.starts_with("seg-") && s.ends_with(".log")
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        paths.sort();
+        Ok(paths)
+    }
+
+    /// Probe a segment file's first-record meta without scanning it. A file
+    /// unlinked by a concurrent purge between listing and open reads as
+    /// `Ok(None)` (absent → not skippable / skipped over), matching the scan's
+    /// `NotFound`-continue discipline.
+    fn probe_first_meta(path: &Path) -> Result<Option<u64>, JournalError> {
+        match SegmentFile::open_for_read(path) {
+            Ok(seg) => seg.first_record_meta(),
+            Err(JournalError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -152,6 +232,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
         assert!(TailReader::open(&missing).is_err());
+    }
+
+    /// Tiny segments (~8 records/segment) so a scan spans several files.
+    fn small_segment_config(dir: &std::path::Path) -> JournalConfig {
+        JournalConfig { segment_size_bytes: 736, ..JournalConfig::new(dir) }
+    }
+
+    #[test]
+    fn scan_from_skips_leading_segments_but_yields_the_covering_one() {
+        let dir = tempfile::tempdir().unwrap();
+        // tiny segments so multiple files exist: ~8 records/segment
+        let j = Journal::open(small_segment_config(dir.path())).unwrap();
+        for s in 0..40 { j.append(s, s * 100, &[7u8; 64]).unwrap().wait().unwrap(); }
+        let r = TailReader::open(dir.path()).unwrap();
+        let mut first_seen = None;
+        r.scan_from(2_500, |seq, meta, _| { first_seen.get_or_insert((seq, meta)); true }).unwrap();
+        let (seq, meta) = first_seen.unwrap();
+        assert!(meta <= 2_500, "covering record yielded, not skipped");
+        assert!(seq >= 8, "at least one leading segment file was skipped entirely");
+        assert_eq!(r.first_meta().unwrap(), Some(0));
+    }
+
+    #[test]
+    fn scan_from_zero_equals_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(small_segment_config(dir.path())).unwrap();
+        for s in 0..40 { j.append(s, s * 100, &[7u8; 64]).unwrap().wait().unwrap(); }
+        let r = TailReader::open(dir.path()).unwrap();
+        let mut via_scan = Vec::new();
+        r.scan(|seq, meta, _| { via_scan.push((seq, meta)); true }).unwrap();
+        let mut via_from = Vec::new();
+        r.scan_from(0, |seq, meta, _| { via_from.push((seq, meta)); true }).unwrap();
+        assert_eq!(via_scan, via_from);
+        assert_eq!(via_scan.len(), 40);
+    }
+
+    #[test]
+    fn first_meta_is_none_on_empty_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let _j = Journal::open(small_segment_config(dir.path())).unwrap();
+        let r = TailReader::open(dir.path()).unwrap();
+        assert_eq!(r.first_meta().unwrap(), None);
     }
 
     #[test]

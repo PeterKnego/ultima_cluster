@@ -57,8 +57,19 @@ pub(crate) fn replay_into<S: StateMachine>(
     let mut cursor = 0u64;
     let mut decode_error = false;
 
+    // Skip whole segment FILES entirely below what the SM has already applied:
+    // replay only dispatches frames with `pos > last_applied`, so a segment
+    // whose records all end at/below `last_applied` contributes nothing. This is
+    // pure perf plumbing — `scan_from` still yields the COVERING segment (the
+    // one holding `last_applied`) and the per-frame `> last_applied` skip below
+    // is unchanged, so the applied set and the returned `cursor` are identical
+    // to the old full `scan`; only the wasted re-read of purged/applied leading
+    // segments is removed (the O(journal)-per-overrun M5 carry). The gap GUARD
+    // (below-floor detection) lands in Task 5.
+    let start_pos = guard.last_applied().unwrap_or(0);
+
     reader
-        .scan(|_seq, base, payload| {
+        .scan_from(start_pos, |_seq, base, payload| {
             // Re-read the live apply frontier PER BLOCK: both commit and durable
             // can advance while we replay, so a later block may legitimately be
             // (partly) applicable that an earlier snapshot would have gated.

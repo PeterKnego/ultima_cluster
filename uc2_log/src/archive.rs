@@ -60,6 +60,14 @@ pub struct Archive {
     cfg: ArchiveConfig,
     durable_pos: u64,
     next_block_seq: u64,
+    /// Lowest stream position still replayable from this archive: the base of
+    /// the FIRST retained journal block, `== durable_pos` when the journal is
+    /// empty. Tracked across `open` (recovered from `journal.first_seq()`'s
+    /// block meta), `do_work` (first block seeds it), `truncate_to` (the
+    /// first-block arm re-seeds it), and `purge_below` (recomputed after the
+    /// journal drops leading segments). This is the real "floor" reported in
+    /// every `PositionPurged`.
+    first_base: u64,
     /// The leadership term of the last non-padding frame observed by `do_work`'s
     /// header walk (M4, spec §6). A frame whose term differs from this is a
     /// term transition — recorded into `term_observations` as
@@ -93,11 +101,19 @@ impl Archive {
                 (meta + payload.len() as u64, last + 1)
             }
         };
+        // Recover the floor from the FIRST retained block's meta (a
+        // purged-then-reopened journal keeps correct bounds); `durable_pos`
+        // (== 0 here) when the journal is empty.
+        let first_base = match journal.first_seq() {
+            None => durable_pos,
+            Some(first) => journal.read(first)?.expect("first block readable").0,
+        };
         Ok(Self {
             journal,
             cfg,
             durable_pos,
             next_block_seq,
+            first_base,
             last_observed_term: 0,
             term_observations: Vec::new(),
         })
@@ -112,6 +128,55 @@ impl Archive {
     #[inline]
     pub fn blocks_recorded(&self) -> u64 {
         self.next_block_seq
+    }
+
+    /// Lowest position still replayable from this archive: base of the first
+    /// retained block; `== recovered_position()` when the journal is empty.
+    /// Task 4's purge driver and Task 5's gap guard both read this.
+    #[inline]
+    pub fn first_base(&self) -> u64 {
+        self.first_base
+    }
+
+    /// Purge journal blocks strictly below the block COVERING `pos` (the
+    /// covering block is retained — a replay at `pos` must succeed after).
+    /// No-op if `pos <= first_base`, if no block covers `pos`, or if the
+    /// covering block is already the first retained one. Returns the new
+    /// `first_base`.
+    ///
+    /// Purge is SEGMENT-granular (`Journal::purge_before` drops whole
+    /// non-active segment files), so the new floor is the first record meta of
+    /// the first surviving segment — always `<= pos`. The active-segment guard
+    /// in `purge_before` is extra slack: we never ask it to touch the covering
+    /// block's segment because we purge strictly below `covering_seq`.
+    pub fn purge_below(&mut self, pos: u64) -> Result<u64, ArchiveError> {
+        if pos <= self.first_base {
+            return Ok(self.first_base);
+        }
+        let Some((covering_seq, _base)) = find_block(&self.journal, pos)? else {
+            // `pos` below the first block (can't happen given the guard above)
+            // or the journal is empty: nothing to purge.
+            return Ok(self.first_base);
+        };
+        let first_seq = self
+            .journal
+            .first_seq()
+            .expect("find_block returned Some => non-empty journal");
+        // Only purge when the covering block is strictly above the first
+        // retained one. `covering_seq - 1 >= first_seq`, so `purge_before` drops
+        // exactly the segments below the covering block's segment and never the
+        // covering block itself (whose segment's last seq >= covering_seq).
+        // (Guarding on `covering_seq > first_seq` rather than a bare
+        // `saturating_sub(1)` avoids purge_before(0) dropping a lone first
+        // segment whose last seq is 0.)
+        if covering_seq > first_seq {
+            self.journal.purge_before(covering_seq - 1)?;
+            self.first_base = match self.journal.first_seq() {
+                None => self.durable_pos,
+                Some(first) => self.journal.read(first)?.expect("first block readable").0,
+            };
+        }
+        Ok(self.first_base)
     }
 
     /// Test/replay access to the underlying journal.
@@ -147,6 +212,11 @@ impl Archive {
         // payload touch. `slice` is the contiguous prefix in stream order, so
         // the pushed observations are position-ordered by construction.
         self.observe_terms(slice, base);
+        // The first block ever recorded (fresh journal, or one just cleared by a
+        // first-block `truncate_to`) seeds the floor at its base.
+        if self.next_block_seq == 0 {
+            self.first_base = base;
+        }
         self.durable_pos += len;
         self.next_block_seq += 1;
         buffer.counters().durable.store_release(self.durable_pos);
@@ -221,7 +291,7 @@ impl Archive {
             return Ok(());
         }
         if pos > self.durable_pos {
-            return Err(ArchiveError::PositionPurged { pos, first_base: self.durable_pos });
+            return Err(ArchiveError::PositionPurged { pos, first_base: self.first_base });
         }
         // Alignment is only meaningful for a position we will actually cut at;
         // out-of-range values are rejected above and never reach here.
@@ -230,11 +300,11 @@ impl Archive {
             "truncation positions are frame boundaries"
         );
         let (Some(first), Some(last)) = (self.journal.first_seq(), self.journal.last_seq()) else {
-            return Err(ArchiveError::PositionPurged { pos, first_base: 0 });
+            return Err(ArchiveError::PositionPurged { pos, first_base: self.first_base });
         };
         let (first_base, _) = self.journal.read(first)?.expect("first block readable");
         if pos < first_base {
-            return Err(ArchiveError::PositionPurged { pos, first_base });
+            return Err(ArchiveError::PositionPurged { pos, first_base: self.first_base });
         }
         // Binary search: greatest block with base <= pos (replay_from's shape).
         let (mut lo, mut hi) = (first, last);
@@ -267,6 +337,11 @@ impl Archive {
                 self.next_block_seq = 0;
             }
             self.durable_pos = pos;
+            // The first block was rewritten (or dropped): the floor is now the
+            // re-seeded prefix's base, which equals `base` (== old first_base);
+            // when `pos == base` the journal is empty and the floor is `pos`
+            // (== base). Either way the surviving floor is `base`.
+            self.first_base = base;
             self.last_observed_term = 0;
             self.term_observations.clear();
             return Ok(());
@@ -317,6 +392,21 @@ pub struct Replay<'a> {
     off: usize,
     /// skip frames below this position (mid-block replay starts)
     skip_below: u64,
+}
+
+impl std::fmt::Debug for Replay<'_> {
+    // `Journal` is not `Debug`; surface the replay's cursor state instead (a
+    // `Result<Replay, _>` is `{:?}`-printed by tests when an unexpected `Ok`
+    // arrives where `PositionPurged` was asserted).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Replay")
+            .field("seq", &self.seq)
+            .field("last_seq", &self.last_seq)
+            .field("block_base", &self.block_base)
+            .field("off", &self.off)
+            .field("skip_below", &self.skip_below)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Replay<'_> {
@@ -406,9 +496,8 @@ impl Archive {
         };
         let Some((lo, _base)) = find_block(&self.journal, pos)? else {
             // pos < durable frontier but below the first archived block: purged.
-            let first = self.journal.first_seq().expect("last_seq implies first_seq");
-            let (first_base, _) = self.journal.read(first)?.expect("first block readable");
-            return Err(ArchiveError::PositionPurged { pos, first_base });
+            // Report the tracked floor (the first retained block's base).
+            return Err(ArchiveError::PositionPurged { pos, first_base: self.first_base });
         };
         Ok(Replay {
             journal: self.journal.as_ref(),
@@ -657,6 +746,78 @@ mod tests {
         let arch = Archive::open(ArchiveConfig { max_block_bytes: 200, ..test_cfg(dir.path()) })
             .unwrap();
         assert_eq!(arch.recovered_position(), 192);
+    }
+
+    /// Helper: an archive holding `n_blocks` blocks of 4 frames each (96 B per
+    /// frame → 384 B per block), one block PER SEGMENT (so a purge can actually
+    /// drop whole segment files), recorded + fsynced. Returns the frame start
+    /// positions across every block. The `TempDir` is intentionally leaked so
+    /// the journal dir outlives the returned `Archive`.
+    fn archive_with_blocks(n_blocks: usize) -> (Archive, Arc<LogBuffer>, Vec<u64>) {
+        let (b, _c, dir) = setup(1 << 16);
+        // 384 B block cap = exactly 4 frames/block; a 408 B journal record fills
+        // a 440 B segment, so the next block rolls a new segment (1 block/seg).
+        let cfg = ArchiveConfig {
+            max_block_bytes: 384,
+            segment_size_bytes: 440,
+            preallocate_segments: false,
+            ..ArchiveConfig::new(dir.path())
+        };
+        let mut arch = Archive::open(cfg).unwrap();
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        let mut frames = Vec::new();
+        for i in 0..(n_blocks as u64 * 4) {
+            frames.push(a.append(1, i, &[i as u8; 64]).unwrap());
+        }
+        while arch.do_work(&b).unwrap() {}
+        assert_eq!(arch.blocks_recorded(), n_blocks as u64, "one block per 4 frames");
+        std::mem::forget(dir); // keep the journal dir alive for `arch`'s lifetime
+        (arch, b, frames)
+    }
+
+    /// The journal directory backing `a` (test accessor; `cfg` is same-module).
+    fn archive_dir(a: &Archive) -> std::path::PathBuf {
+        a.cfg.dir.clone()
+    }
+
+    /// The durable frontier implied by `frames`: end of the last frame (96 B).
+    fn frames_end(frames: &[u64]) -> u64 {
+        frames.last().unwrap() + 96
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn purge_below_keeps_covering_block_and_replay_at_pos_succeeds() {
+        let (mut archive, _buffer, frames) = archive_with_blocks(4); // 4 blocks, 4 frames each
+        let cut = frames[9]; // a frame inside block 2
+        let new_first = archive.purge_below(cut).unwrap();
+        assert!(new_first <= cut, "covering block retained");
+        assert_eq!(archive.first_base(), new_first);
+        // replay at the cut still works…
+        let mut r = archive.replay_from(cut).unwrap();
+        assert!(r.next().unwrap().is_some());
+        // …and replay BELOW the new floor is PositionPurged with correct bounds
+        match archive.replay_from(new_first.saturating_sub(1)) {
+            Err(ArchiveError::PositionPurged { pos, first_base }) => {
+                assert_eq!(first_base, new_first);
+                assert!(pos < first_base);
+            }
+            other => panic!("expected PositionPurged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn purge_below_is_noop_at_or_below_floor_and_survives_reopen() {
+        let (mut archive, _b, frames) = archive_with_blocks(4);
+        let cut = frames[9];
+        let first = archive.purge_below(cut).unwrap();
+        assert_eq!(archive.purge_below(first).unwrap(), first, "no-op at floor");
+        let dir = archive_dir(&archive);
+        drop(archive);
+        let re = Archive::open(ArchiveConfig::new(&dir)).unwrap();
+        assert_eq!(re.first_base(), first, "floor recovered from journal.first_seq");
+        assert_eq!(re.recovered_position(), frames_end(&frames), "frontier untouched by purge");
     }
 
     /// Helper: an archive holding exactly ONE block of 4 frames (positions
