@@ -3,10 +3,14 @@
 
 //! The apply agent duty cycle (spec §7). A single polling thread that follows
 //! the committed log, applies each `MESSAGE` frame to the user's state machine,
-//! and (while leader) publishes the response onto the egress broadcast.
+//! and (while leader) publishes the response onto the egress broadcast. On an
+//! `Overrun` (the live buffer scrolled past the cursor) it degrades to journal
+//! replay (Task 9) and rejoins the live buffer at the byte position replay
+//! reached.
 
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uc2_log::cnc::CncPage;
@@ -16,6 +20,7 @@ use uc_protocol::v2::cnc::NODE_FLAG_LEADER;
 use uc_protocol::v2::frame::FRAME_TYPE_MESSAGE;
 
 use crate::egress::Egress;
+use crate::replay::replay_into;
 use crate::traits::StateMachine;
 
 /// Everything the apply thread owns. Fields are accessed directly (not through
@@ -24,21 +29,27 @@ use crate::traits::StateMachine;
 /// are touched).
 pub(crate) struct ApplyState<S: StateMachine> {
     pub(crate) follower: LogFollower,
-    /// The user state machine. `RwLock` (not a bare `S`) so Task 11's
-    /// `drain_queries` — which runs on THIS same apply thread, right after the
-    /// applies — can take a read lock while the apply path takes the write
-    /// lock; a bare `&mut`/`&` split would fight the borrow checker across the
-    /// two phases. Owned (not `Arc`), because the SM never leaves this thread,
-    /// so the `StateMachine: Send + 'static` bound (no `Sync`) is enough.
-    pub(crate) sm: RwLock<S>,
+    /// The user state machine, behind `Arc<Mutex<S>>`. `Arc` (shared, not owned)
+    /// so the `Service` handle can reach it for direct queries (the test/embedded
+    /// query path until the client query ring lands in Task 10/11); `Mutex`
+    /// (not `RwLock`) so sharing needs only `S: Send` — the `StateMachine` bound
+    /// is `Send + 'static`, with no `Sync`. Task 11's `drain_queries` runs on
+    /// THIS same apply thread right after the applies, taking the lock the same
+    /// way the apply path does (single-threaded, so the read/write distinction a
+    /// `RwLock` would give buys nothing here).
+    pub(crate) sm: Arc<Mutex<S>>,
     pub(crate) cnc: Arc<CncPage>,
     pub(crate) egress: Egress,
+    /// The node's journal directory — the archived-log source the replay path
+    /// reconstructs from on `Overrun`.
+    pub(crate) journal_dir: PathBuf,
     /// The node→service query ring consumer half. Drained by Task 11's
     /// `drain_queries`; held here so the apply thread owns it (single reader).
     #[allow(dead_code)]
     pub(crate) svc_query: SpscConsumer,
-    /// Set when a batch surfaced `Overrun` — Task 9 wires the journal-replay
-    /// reconstruction that clears it. Here it only records the condition.
+    /// Observability: set while a batch has surfaced `Overrun` and the replay
+    /// reconstruction is degrading the follower back onto the live buffer.
+    /// Cleared once replay rejoins.
     pub(crate) needs_replay: bool,
 }
 
@@ -46,7 +57,8 @@ pub(crate) struct ApplyState<S: StateMachine> {
 /// strategy). Follows the plan skeleton exactly:
 /// target = `min(commit, durable)`; apply every committed `MESSAGE` up to it;
 /// skip already-applied positions (idempotent re-entry) and non-`MESSAGE`
-/// frames; publish responses only while leader.
+/// frames; publish responses only while leader. On `Overrun`, reconstruct via
+/// journal replay and rejoin the live buffer.
 pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
     let c = st.cnc.counters();
     // Apply frontier = the lesser of quorum-commit and local durability. Both
@@ -59,15 +71,16 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
         let is_leader =
             st.cnc.status().flags.load_acquire() & NODE_FLAG_LEADER != 0;
         let cursor_before = st.follower.cursor;
-        match st.follower.next_batch(target) {
+        // Resolve the batch to a plain enum before touching other fields, so the
+        // mutable borrow of `st.follower` the batch holds ends before the
+        // replay/publish arms mutate `st.follower.cursor`.
+        let overrun = match st.follower.next_batch(target) {
             Batch::CaughtUp => break,
-            // Task 9 wires the replay reconstruction; here we record and stop.
-            Batch::Overrun => {
-                st.needs_replay = true;
-                break;
-            }
+            // The live buffer scrolled past the cursor (or these bytes live only
+            // in the journal after a restart prime) — degrade to replay below.
+            Batch::Overrun => true,
             Batch::Frames(frames) => {
-                let mut sm = st.sm.write().unwrap();
+                let mut sm = st.sm.lock().unwrap();
                 for (pos, hdr, payload) in frames {
                     // NEW_TERM (and any future non-MESSAGE type) is not user data.
                     if hdr.frame_type != FRAME_TYPE_MESSAGE {
@@ -100,7 +113,27 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
                     break;
                 }
                 progressed = true;
+                false
             }
+        };
+        if overrun {
+            // Task 9: reconstruct from the journal, then rejoin the live buffer
+            // at the byte position replay reached. Livelock-free: each replay
+            // pass strictly ADVANCES the cursor toward the archived frontier
+            // captured at that pass's start (a monotonic byte position), so the
+            // inner loop cannot spin in place — it either catches up (next
+            // `next_batch` is `CaughtUp`/`Frames`) or, if the ring lapped the new
+            // cursor while replay ran, degrades once more from a strictly higher
+            // cursor. Forward progress every time.
+            st.needs_replay = true;
+            let cursor = replay_into(&st.sm, &st.cnc, &st.journal_dir)
+                .expect("service journal replay fail-stop");
+            st.follower.cursor = cursor;
+            st.cnc.service().service_applied.store_release(cursor);
+            st.needs_replay = false;
+            progressed = true;
+            // Re-loop: read live from the rejoin point (may CaughtUp, apply
+            // more, or Overrun again if the ring lapped us during replay).
         }
     }
     // Liveness: a wall-clock heartbeat the node compares against its own clock.

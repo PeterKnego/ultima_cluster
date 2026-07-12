@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 uc_protocol = { path = "../uc_protocol" }
 uc2_log = { path = "../uc2_log" }
+ultima-journal = { path = "../ultima_journal" }
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }

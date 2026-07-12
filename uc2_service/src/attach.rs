@@ -5,7 +5,7 @@
 //! LOAD-BEARING — see the numbered steps.
 
 use std::sync::Arc;
-use std::sync::RwLock;
+use std::sync::Mutex;
 
 use uc2_log::buffer::LogBuffer;
 use uc2_log::cnc::CncPage;
@@ -62,13 +62,27 @@ pub(crate) fn attach<S: StateMachine>(
     //    seen). For M5 we publish `last_applied` (the position, not the frame
     //    end); the idempotent-skip makes the distinction harmless and Task 9's
     //    replay recomputes the true byte cursor.
+    //
+    //    Drift bound = the archive DURABLE frontier (`counters().durable`), not
+    //    `commit` (Task 8 review). In any correct run the apply loop only ever
+    //    advances `last_applied` up to `min(commit, durable) <= durable`, and
+    //    the journal (archive) only guarantees replay availability up to
+    //    `durable`. So `last_applied > durable` cannot arise from this cluster's
+    //    history — it can only be a PERSISTENT SM carried in from a different (or
+    //    newer) instance dir. Refuse rather than replay off a phantom cursor the
+    //    journal can never satisfy. `unwrap_or(0)` folds the fresh-SM case in:
+    //    `0 > durable` is never true, so a fresh SM never drifts.
     let last_applied = sm.last_applied();
-    if let Some(la) = last_applied {
-        let frontier = cnc.counters().durable.load_acquire();
-        if la > frontier {
-            return Err(ServiceError::Drift { service: la, journal: frontier });
-        }
+    let frontier = cnc.counters().durable.load_acquire();
+    if last_applied.unwrap_or(0) > frontier {
+        return Err(ServiceError::Drift { service: last_applied.unwrap_or(0), journal: frontier });
     }
+    // The follower resumes from `last_applied` (a frame START); the apply loop's
+    // idempotent-skip re-walks that one frame harmlessly, and if the live ring
+    // has already scrolled past it the first `next_batch` returns `Overrun` and
+    // the SAME journal-replay mechanism (Task 9) reconstructs + rejoins. Exactly
+    // one rejoin mechanism — try-live-then-replay — covers both a caught-up
+    // reattach and a fresh SM (`None -> 0`) on a long-scrolled ring.
     let start_pos = last_applied.unwrap_or(0);
     cnc.service().service_applied.store_release(start_pos);
 
@@ -81,9 +95,10 @@ pub(crate) fn attach<S: StateMachine>(
     let follower = LogFollower::new(buffer, start_pos);
     let apply_state = ApplyState {
         follower,
-        sm: RwLock::new(sm),
+        sm: Arc::new(Mutex::new(sm)),
         cnc: Arc::clone(&cnc),
         egress,
+        journal_dir: dir.join("journal"),
         svc_query,
         needs_replay: false,
     };

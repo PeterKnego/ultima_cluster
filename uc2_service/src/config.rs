@@ -34,4 +34,10 @@ pub enum ServiceError {
     /// wrong-app on-disk SM). Refuse rather than replay off a phantom cursor.
     #[error("state-machine/journal drift: service last_applied={service}, journal frontier={journal}")]
     Drift { service: u64, journal: u64 },
+    /// A journal-replay reconstruction (Task 9) could not read the archived
+    /// log — a genuine journal I/O error (a torn/half-flushed record is handled
+    /// conservatively by the read-only `TailReader`, not surfaced here). This is
+    /// fail-stop: the service cannot rebuild its state.
+    #[error("journal replay error: {0}")]
+    Replay(String),
 }

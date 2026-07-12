@@ -3,7 +3,10 @@
 
 pub(crate) mod segment;
 mod segment_pipeline;
+mod tail_reader;
 mod writer;
+
+pub use tail_reader::TailReader;
 
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, Mutex};

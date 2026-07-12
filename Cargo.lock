@@ -2625,6 +2625,7 @@ dependencies = [
  "uc2_net",
  "uc2_node",
  "uc_protocol",
+ "ultima-journal",
 ]
 
 [[package]]
