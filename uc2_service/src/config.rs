@@ -41,3 +41,14 @@ pub enum ServiceError {
     #[error("journal replay error: {0}")]
     Replay(String),
 }
+
+/// Why a [`SnapshotStateMachine`](crate::SnapshotStateMachine) freeze/stream/
+/// install failed. Mirrors the v1 `uc_service::SnapshotError` shape (an I/O
+/// failure or a codec/serialization failure), re-exported at the crate root.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("codec: {0}")]
+    Codec(String),
+}

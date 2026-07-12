@@ -22,6 +22,11 @@ mod output;
 mod replay;
 mod traits;
 
+/// Reference [`StateMachine`] + [`SnapshotStateMachine`] adapter backed by an
+/// [`ultima_db::Store`] (Cargo feature `ultima_db`, off by default).
+#[cfg(feature = "ultima_db")]
+pub mod ultima_db;
+
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -33,8 +38,10 @@ use uc2_log::reader::LogFollower;
 use crate::apply::apply_cycle;
 use crate::output::{OutputState, output_cycle};
 
-pub use crate::config::{ServiceConfig, ServiceError};
-pub use crate::traits::{NoopOutput, OutputError, OutputHandler, StateMachine};
+pub use crate::config::{ServiceConfig, ServiceError, SnapshotError};
+pub use crate::traits::{
+    NoopOutput, OutputError, OutputHandler, SnapshotStateMachine, StateMachine,
+};
 
 /// Default idle strategy for the apply thread: a short sleep between empty
 /// cycles (a busy-spin knob comes later). Background-grade politeness that

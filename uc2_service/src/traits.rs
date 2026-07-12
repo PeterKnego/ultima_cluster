@@ -9,6 +9,12 @@
 //! absolute byte **`position`** (the v2 log_index analog and the idempotency
 //! key), not a log index; there are no snapshot methods (M5 reconstruction
 //! replays the log instead — Task 9).
+//!
+//! M6 adds one OPTIONAL capability trait, [`SnapshotStateMachine`], for SMs that
+//! can serialize/restore their full state (what gates log purge). Existing SMs
+//! that don't implement it are untouched.
+
+use crate::config::SnapshotError;
 
 /// The user's deterministic business logic.
 ///
@@ -36,6 +42,60 @@ pub trait StateMachine: Send + 'static {
     /// nothing already seen); over-reporting above the journal frontier is
     /// refused at attach ([`ServiceError::Drift`](crate::ServiceError::Drift)).
     fn last_applied(&self) -> Option<u64>;
+}
+
+/// Optional capability: state machines that can serialize their full state and
+/// restore it wholesale. This is what lets the framework **purge** the log — a
+/// deployment whose SM does not implement it never purges (M6; documented), and
+/// below-floor reconstruction (Task 5) installs a snapshot instead of replaying
+/// from the archive.
+///
+/// It is a *separate* trait from [`StateMachine`] on purpose: v2's base trait
+/// carries no snapshot methods (M5 reconstruction replayed the log), so existing
+/// SMs are untouched — a snapshot-capable SM opts in by also implementing this.
+///
+/// ## Position-as-version
+///
+/// The `u64`s here are absolute byte **positions** in the log (the v2 log-index
+/// analog), NOT dense 1,2,3 indexes: they are sparse, strictly-increasing
+/// artifact tags. `freeze` pins the current position; `install_snapshot` is told
+/// the position `S` the artifact was tagged with and must land the restored
+/// state exactly there.
+pub trait SnapshotStateMachine: StateMachine {
+    /// An opaque, consistent handle to the frozen state. `Send + 'static` so it
+    /// can cross to the off-thread streaming step.
+    type SnapshotHandle: Send + 'static;
+
+    /// O(1) consistent pin of the current state; returns `(handle, position)`
+    /// where `position == self.last_applied().unwrap_or(0)` at pin time. Called
+    /// on the APPLY thread with the SM lock held, so the position cannot move
+    /// underneath the pin.
+    fn freeze(&self) -> Result<(Self::SnapshotHandle, u64), SnapshotError>;
+
+    /// Stream the pinned state to `dst`. Runs OFF the apply thread with NO SM
+    /// lock held (the v1 rule) — the handle carries a consistent, immutable view
+    /// so concurrent applies cannot corrupt the stream.
+    fn stream_snapshot(
+        handle: Self::SnapshotHandle,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), SnapshotError>;
+
+    /// Replace the state wholesale from a stream produced by
+    /// [`stream_snapshot`](Self::stream_snapshot), landing it at `position`
+    /// (the artifact tag `S` — the caller supplies it; the bare byte stream does
+    /// not carry it). Returns the post-install position, which MUST equal
+    /// `position`. Runs on the apply thread with the SM lock held.
+    ///
+    /// Deviation from the M6 brief's literal trait block: the brief sketched a
+    /// no-argument `install_snapshot(&mut self, src)` that recovered `S` from a
+    /// "stream trailer". No such trailer exists in the ULTSNAP wire format, so
+    /// the honest shape passes `position` explicitly — the caller already knows
+    /// `S` (it is the snapshot artifact's tag).
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, SnapshotError>;
 }
 
 /// Optional leader-only, at-least-once side-effect handler (Task 12 wires the

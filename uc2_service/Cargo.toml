@@ -7,10 +7,19 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# `ultima_db` pulls in the reference `StoreStateMachine` adapter (the
+# `SnapshotStateMachine` capability backed by `ultima_db::Store`). Off by
+# default so a service that supplies its own SM never builds the store.
+ultima_db = ["dep:ultima-db"]
+
 [dependencies]
 uc_protocol = { path = "../uc_protocol" }
 uc2_log = { path = "../uc2_log" }
 ultima-journal = { path = "../ultima_journal" }
+# Optional: the `ultima_db` adapter. The workspace dep already carries
+# features = ["persistence"] (required for snapshot_stream / install).
+ultima-db = { workspace = true, optional = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }
