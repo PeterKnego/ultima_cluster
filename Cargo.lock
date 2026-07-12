@@ -2613,6 +2613,7 @@ dependencies = [
  "crc32fast",
  "loom",
  "memmap2",
+ "rand 0.9.4",
  "serde",
  "tempfile",
  "thiserror 2.0.18",

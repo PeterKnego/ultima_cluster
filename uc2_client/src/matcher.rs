@@ -19,20 +19,51 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use uc2_log::agent::{AgentRunner, IdleStrategy};
 use uc_protocol::ring::{BroadcastConsumer, RingError};
-use uc_protocol::v2::ipc::{MSG_V2_NOT_LEADER, MSG_V2_RESPONSE, MSG_V2_RETRY, client_from_extra};
+use uc_protocol::v2::ipc::{
+    FLAG_V2_IS_QUERY, MSG_V2_NOT_LEADER, MSG_V2_RESPONSE, MSG_V2_RETRY, client_from_extra,
+};
 
 /// Idle sleep between empty poll cycles (brief mechanics: "50 µs sleep idle").
 const MATCHER_IDLE: Duration = Duration::from_micros(50);
 
+/// Which response kind a pending request expects — the discriminator the
+/// matcher checks against a delivered `MSG_V2_RESPONSE`'s `FLAG_V2_IS_QUERY`
+/// bit (T14 defense-in-depth). A submit registration must only be satisfied by
+/// a submit response, a query registration only by a query answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RegKind {
+    /// Registered by `submit` — expects a `MSG_V2_RESPONSE` with the query bit
+    /// CLEAR.
+    Submit,
+    /// Registered by `query_*` — expects a `MSG_V2_RESPONSE` with
+    /// `FLAG_V2_IS_QUERY` SET.
+    Query,
+}
+
+/// One in-flight request's slot in the registration table: the kind it expects
+/// (for the matcher's kind check) plus the channel to hand the answer back on.
+pub(crate) struct Pending {
+    pub(crate) kind: RegKind,
+    pub(crate) tx: mpsc::SyncSender<RawResp>,
+}
+
 /// The per-`local_seq` registration table, shared between `Client` (insert on
 /// submit/query, remove on write-failure/timeout) and the matcher thread
 /// (remove-and-answer on a matching record, or drain-all on shutdown/overwrite).
-pub(crate) type Registrations = Arc<Mutex<HashMap<u32, mpsc::SyncSender<RawResp>>>>;
+pub(crate) type Registrations = Arc<Mutex<HashMap<u32, Pending>>>;
+
+/// Count of `MSG_V2_RESPONSE` records dropped by the matcher because the
+/// delivered kind (submit vs query, per `FLAG_V2_IS_QUERY`) did not match the
+/// waiting registration's expected kind — a stale cross-generation catch-up
+/// response that collided on `(client_id, local_seq)`. Exposed via
+/// [`crate::Client::kind_mismatch_drops`] (a stat, never silent).
+pub(crate) type KindMismatchDrops = Arc<AtomicU64>;
 
 /// What the matcher hands back to a blocked `submit`/`query_*` call. Carries
 /// just enough to build the typed `Result<R, ClientError>` the public API
@@ -90,11 +121,12 @@ pub(crate) fn spawn_matcher(
     mut egress_service: BroadcastConsumer,
     mut egress_node: BroadcastConsumer,
     registrations: Registrations,
+    kind_mismatch_drops: KindMismatchDrops,
 ) -> io::Result<AgentRunner> {
     AgentRunner::spawn("uc2-client-matcher", IdleStrategy::Sleep(MATCHER_IDLE), move || {
         let mut did = false;
-        did |= poll_ring(&mut egress_service, client_id, &registrations);
-        did |= poll_ring(&mut egress_node, client_id, &registrations);
+        did |= poll_ring(&mut egress_service, client_id, &registrations, &kind_mismatch_drops);
+        did |= poll_ring(&mut egress_node, client_id, &registrations, &kind_mismatch_drops);
         did
     })
 }
@@ -107,6 +139,7 @@ pub(crate) fn poll_ring(
     ring: &mut BroadcastConsumer,
     client_id: u32,
     registrations: &Registrations,
+    kind_mismatch_drops: &AtomicU64,
 ) -> bool {
     let mut buf = Vec::new();
     match ring.try_read(&mut buf) {
@@ -115,21 +148,58 @@ pub(crate) fn poll_ring(
             if cid != client_id {
                 return true; // addressed to another client; every client sees every record
             }
-            let raw = match rec.msg_type {
-                MSG_V2_RESPONSE => RawResp::Response(buf),
+            match rec.msg_type {
+                MSG_V2_RESPONSE => {
+                    // Kind check (T14 MAJOR, defense in depth). A submit response
+                    // (query bit clear) may only satisfy a Submit registration; a
+                    // query answer (FLAG_V2_IS_QUERY set) only a Query one. A
+                    // kind-MISMATCHED delivery is a stale cross-generation
+                    // catch-up response that collided on (client_id, local_seq):
+                    // DROP it and count it, leaving the registration in place to
+                    // receive its correct answer. This kills the observed
+                    // submit→query type-confusion class (bincode: WriteAck=None,
+                    // CasResult decodes as Some(_)) even under a residual id
+                    // collision. NOT_LEADER/RETRY are kind-agnostic (pre-side-
+                    // effect signals) and route below regardless.
+                    let delivered = if rec.flags & FLAG_V2_IS_QUERY != 0 {
+                        RegKind::Query
+                    } else {
+                        RegKind::Submit
+                    };
+                    let mut map = registrations.lock().unwrap();
+                    match map.get(&local_seq) {
+                        Some(p) if p.kind == delivered => {
+                            let tx = map.remove(&local_seq).unwrap().tx;
+                            drop(map);
+                            let _ = tx.send(RawResp::Response(buf));
+                        }
+                        Some(_) => {
+                            // Kind mismatch: leave the registration, drop+count.
+                            drop(map);
+                            kind_mismatch_drops.fetch_add(1, Ordering::Relaxed);
+                        }
+                        None => {} // nobody waiting on this local_seq (already timed out)
+                    }
+                }
                 MSG_V2_NOT_LEADER => {
                     let hint = u64::from_le_bytes(
                         buf.get(..8)
                             .and_then(|s| s.try_into().ok())
                             .unwrap_or([0xff; 8]), // malformed: treat as unknown, never panic
                     );
-                    RawResp::NotLeader(if hint == u64::MAX { None } else { Some(hint as u32) })
+                    let raw =
+                        RawResp::NotLeader(if hint == u64::MAX { None } else { Some(hint as u32) });
+                    // best-effort: the caller may have already timed out
+                    if let Some(p) = registrations.lock().unwrap().remove(&local_seq) {
+                        let _ = p.tx.send(raw);
+                    }
                 }
-                MSG_V2_RETRY => RawResp::Retry,
+                MSG_V2_RETRY => {
+                    if let Some(p) = registrations.lock().unwrap().remove(&local_seq) {
+                        let _ = p.tx.send(RawResp::Retry);
+                    }
+                }
                 _ => return true, // not a client-facing msg_type; ignore
-            };
-            if let Some(tx) = registrations.lock().unwrap().remove(&local_seq) {
-                let _ = tx.send(raw); // best-effort: the caller may have already timed out
             }
             true
         }
@@ -155,8 +225,8 @@ fn fail_all(registrations: &Registrations, mk: impl Fn() -> RawResp) {
     let mut map = registrations.lock().unwrap();
     let entries: Vec<_> = map.drain().collect();
     drop(map);
-    for (_, tx) in entries {
-        let _ = tx.send(mk());
+    for (_, p) in entries {
+        let _ = p.tx.send(mk());
     }
 }
 
@@ -177,6 +247,17 @@ mod tests {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
+    fn drops() -> KindMismatchDrops {
+        Arc::new(AtomicU64::new(0))
+    }
+
+    /// Insert a pending registration of the given kind, returning the rx half.
+    fn register(regs: &Registrations, local_seq: u32, kind: RegKind) -> mpsc::Receiver<RawResp> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        regs.lock().unwrap().insert(local_seq, Pending { kind, tx });
+        rx
+    }
+
     #[test]
     fn response_addressed_to_this_client_is_routed_and_removed() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -185,14 +266,13 @@ mod tests {
         let mut consumer = ring.subscribe();
 
         let registrations = reg();
-        let (tx, rx) = mpsc::sync_channel(1);
-        registrations.lock().unwrap().insert(7, tx);
+        let rx = register(&registrations, 7, RegKind::Submit);
 
         let mut payload = 100u64.to_le_bytes().to_vec(); // position
         payload.extend(bincode::serde::encode_to_vec(42u64, bincode::config::standard()).unwrap());
         producer.write(MSG_V2_RESPONSE, 0, extra_client(1, 7), &payload).unwrap();
 
-        assert!(poll_ring(&mut consumer, 1, &registrations));
+        assert!(poll_ring(&mut consumer, 1, &registrations, &drops()));
         let raw = rx.try_recv().expect("routed");
         let decoded: u64 = decode_response(raw).unwrap();
         assert_eq!(decoded, 42);
@@ -207,17 +287,76 @@ mod tests {
         let mut consumer = ring.subscribe();
 
         let registrations = reg();
-        let (tx, rx) = mpsc::sync_channel::<RawResp>(1);
-        registrations.lock().unwrap().insert(0, tx);
+        let rx = register(&registrations, 0, RegKind::Submit);
 
         // Same local_seq (0) but a DIFFERENT client_id (99, not 1).
         let mut payload = 8u64.to_le_bytes().to_vec();
         payload.extend(bincode::serde::encode_to_vec(1u64, bincode::config::standard()).unwrap());
         producer.write(MSG_V2_RESPONSE, 0, extra_client(99, 0), &payload).unwrap();
 
-        assert!(poll_ring(&mut consumer, 1, &registrations), "still counts as progress");
+        assert!(poll_ring(&mut consumer, 1, &registrations, &drops()), "still counts as progress");
         assert!(rx.try_recv().is_err(), "must not be delivered to the wrong client");
         assert!(registrations.lock().unwrap().contains_key(&0), "registration untouched");
+    }
+
+    #[test]
+    fn query_answer_to_a_submit_registration_is_dropped_counted_and_correct_still_delivered() {
+        // T14 MAJOR: a stale cross-generation catch-up that collided on
+        // (client_id, local_seq) arrives as a query-flagged RESPONSE while a
+        // SUBMIT is registered on that local_seq. It must be DROPPED + counted,
+        // the registration left intact, and the client's real submit response
+        // (query bit clear) delivered when it arrives.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let ring = BroadcastRing::create(tmp.path(), 4096, 256).unwrap();
+        let mut producer = ring.producer();
+        let mut consumer = ring.subscribe();
+
+        let registrations = reg();
+        let counter = drops();
+        let rx = register(&registrations, 5, RegKind::Submit);
+
+        // Wrong kind: FLAG_V2_IS_QUERY set, addressed to (1, 5). Payload decodes
+        // (position ++ bincode) but the kind guard rejects it before any deliver.
+        let mut wrong = 0u64.to_le_bytes().to_vec();
+        wrong.extend(bincode::serde::encode_to_vec(1u64, bincode::config::standard()).unwrap());
+        producer.write(MSG_V2_RESPONSE, FLAG_V2_IS_QUERY, extra_client(1, 5), &wrong).unwrap();
+        assert!(poll_ring(&mut consumer, 1, &registrations, &counter));
+        assert!(rx.try_recv().is_err(), "kind-mismatched delivery must be dropped");
+        assert_eq!(counter.load(Ordering::Relaxed), 1, "the drop is counted, not silent");
+        assert!(registrations.lock().unwrap().contains_key(&5), "registration stays for the real answer");
+
+        // The correct submit response (query bit clear) now arrives and routes.
+        let mut right = 200u64.to_le_bytes().to_vec();
+        right.extend(bincode::serde::encode_to_vec(9u64, bincode::config::standard()).unwrap());
+        producer.write(MSG_V2_RESPONSE, 0, extra_client(1, 5), &right).unwrap();
+        assert!(poll_ring(&mut consumer, 1, &registrations, &counter));
+        let decoded: u64 = decode_response(rx.try_recv().expect("real answer routed")).unwrap();
+        assert_eq!(decoded, 9);
+        assert_eq!(counter.load(Ordering::Relaxed), 1, "no further drops");
+        assert!(registrations.lock().unwrap().is_empty(), "registration consumed by the real answer");
+    }
+
+    #[test]
+    fn submit_response_to_a_query_registration_is_dropped_and_counted() {
+        // The mirror case: a submit-flagged RESPONSE against a QUERY
+        // registration (this is the exact captured T14 violation shape — a
+        // stale WriteAck/CasResult decoded as a query's Option<u64>).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let ring = BroadcastRing::create(tmp.path(), 4096, 256).unwrap();
+        let mut producer = ring.producer();
+        let mut consumer = ring.subscribe();
+
+        let registrations = reg();
+        let counter = drops();
+        let rx = register(&registrations, 3, RegKind::Query);
+
+        let mut submit_resp = 0u64.to_le_bytes().to_vec();
+        submit_resp.extend(bincode::serde::encode_to_vec(1u64, bincode::config::standard()).unwrap());
+        producer.write(MSG_V2_RESPONSE, 0, extra_client(1, 3), &submit_resp).unwrap();
+        assert!(poll_ring(&mut consumer, 1, &registrations, &counter));
+        assert!(rx.try_recv().is_err(), "submit response must not satisfy a query registration");
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert!(registrations.lock().unwrap().contains_key(&3));
     }
 
     #[test]
@@ -228,20 +367,20 @@ mod tests {
         let mut consumer = ring.subscribe();
 
         let registrations = reg();
-        let (tx, rx) = mpsc::sync_channel(1);
-        registrations.lock().unwrap().insert(3, tx);
+        // NOT_LEADER is kind-agnostic (a pre-side-effect signal): route it even
+        // to a Query registration.
+        let rx = register(&registrations, 3, RegKind::Query);
         producer
             .write(MSG_V2_NOT_LEADER, 0, extra_client(5, 3), &u64::MAX.to_le_bytes())
             .unwrap();
-        assert!(poll_ring(&mut consumer, 5, &registrations));
+        assert!(poll_ring(&mut consumer, 5, &registrations, &drops()));
         let err = decode_response::<()>(rx.try_recv().unwrap()).unwrap_err();
         assert!(matches!(err, crate::error::ClientError::NotLeader { hint: None }));
 
         // A concrete hint (leader 2).
-        let (tx2, rx2) = mpsc::sync_channel(1);
-        registrations.lock().unwrap().insert(4, tx2);
+        let rx2 = register(&registrations, 4, RegKind::Submit);
         producer.write(MSG_V2_NOT_LEADER, 0, extra_client(5, 4), &2u64.to_le_bytes()).unwrap();
-        assert!(poll_ring(&mut consumer, 5, &registrations));
+        assert!(poll_ring(&mut consumer, 5, &registrations, &drops()));
         let err = decode_response::<()>(rx2.try_recv().unwrap()).unwrap_err();
         assert!(matches!(err, crate::error::ClientError::NotLeader { hint: Some(2) }));
     }
@@ -254,10 +393,9 @@ mod tests {
         let mut consumer = ring.subscribe();
 
         let registrations = reg();
-        let (tx, rx) = mpsc::sync_channel(1);
-        registrations.lock().unwrap().insert(9, tx);
+        let rx = register(&registrations, 9, RegKind::Submit);
         producer.write(MSG_V2_RETRY, 0, extra_client(1, 9), &[]).unwrap();
-        assert!(poll_ring(&mut consumer, 1, &registrations));
+        assert!(poll_ring(&mut consumer, 1, &registrations, &drops()));
         let err = decode_response::<()>(rx.try_recv().unwrap()).unwrap_err();
         assert!(matches!(err, crate::error::ClientError::Retry));
     }
@@ -271,16 +409,14 @@ mod tests {
         let mut consumer = ring.subscribe();
 
         let registrations = reg();
-        let (tx_a, rx_a) = mpsc::sync_channel(1);
-        let (tx_b, rx_b) = mpsc::sync_channel(1);
-        registrations.lock().unwrap().insert(1, tx_a);
-        registrations.lock().unwrap().insert(2, tx_b);
+        let rx_a = register(&registrations, 1, RegKind::Submit);
+        let rx_b = register(&registrations, 2, RegKind::Query);
 
         for _ in 0..20 {
             producer.write(MSG_V2_RESPONSE, 0, [0; 8], &[0u8; 32]).unwrap();
         }
 
-        assert!(poll_ring(&mut consumer, 1, &registrations));
+        assert!(poll_ring(&mut consumer, 1, &registrations, &drops()));
         assert!(matches!(rx_a.try_recv(), Ok(RawResp::Overwritten)));
         assert!(matches!(rx_b.try_recv(), Ok(RawResp::Overwritten)));
         assert!(registrations.lock().unwrap().is_empty());
@@ -289,10 +425,8 @@ mod tests {
     #[test]
     fn drain_with_shutdown_sends_shutdown_to_every_pending() {
         let registrations = reg();
-        let (tx1, rx1) = mpsc::sync_channel(1);
-        let (tx2, rx2) = mpsc::sync_channel(1);
-        registrations.lock().unwrap().insert(1, tx1);
-        registrations.lock().unwrap().insert(2, tx2);
+        let rx1 = register(&registrations, 1, RegKind::Submit);
+        let rx2 = register(&registrations, 2, RegKind::Query);
 
         drain_with_shutdown(&registrations);
 

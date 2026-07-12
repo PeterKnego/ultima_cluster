@@ -97,6 +97,44 @@ pub struct CncPage {
     region: Region,
 }
 
+/// Pick the initial value of a freshly-created page's `next_client_id`
+/// allocation counter. A random `u32` in `[1, 2^31)` (nonzero — `0` is the
+/// reserved "no id" sentinel; top bit forced clear).
+///
+/// **Why random, not `1` (load-bearing — T14 MAJOR; the next reader MUST
+/// understand this):** `client_id` is allocated per cnc-page *generation*
+/// (`fetch_add` off this counter), and a page is recreated from scratch on
+/// every node (re)boot. A client's request/response identity on the shared
+/// broadcast rings is the pair `(client_id, local_seq)` and NOTHING else — the
+/// matcher correlates purely on it. Meanwhile the service's live-ring catch-up
+/// path (`uc2_service::apply`) legitimately RE-PUBLISHES historical responses
+/// stamped with their ORIGINAL `(client_id, local_seq)` when a fresh service
+/// incarnation walks the committed log from cursor 0 (this is the at-least-once
+/// delivery a client waits on across a service-only crash — it must NOT be
+/// suppressed). If `next_client_id` restarted at `1` every generation, an old
+/// generation's re-published response `(id, seq)` would collide with a live
+/// client of the SAME low `(id, seq)` in a later generation and be misdelivered
+/// to it — the pinned T14 linearizability defect (a stale submit response
+/// answering a live query). Seeding each generation at an independent random
+/// base makes such a collision require two generations' random bases to land
+/// within `local_seq`-range (a few thousand) of each other: with bases spread
+/// over `2^31` that is ~`2^-31·k` per generation pair — negligible.
+///
+/// The top bit is forced clear so a generation's allocations (base + a few
+/// thousand ids) have ~`2^31` of headroom before they could wrap `u32` into
+/// another generation's likely-occupied range; a `local_seq`-range wrap into a
+/// neighbouring random base is the same negligible event as above.
+///
+/// **Accepted residual (v2.0):** a *same-kind* cross-generation collision (a
+/// stale submit → a live submit of the identically-random `(id, seq)`) remains
+/// theoretically possible at that ~`2^-31` scale and is accepted; the
+/// [`uc2_client`] matcher's kind check (submit-vs-query, `FLAG_V2_IS_QUERY`) is
+/// the second belt that kills the observed *cross*-kind (submit→query) confusion
+/// class even under such a residual collision.
+fn gen_unique_client_id_base() -> u32 {
+    (rand::random::<u32>() >> 1) | 1
+}
+
 impl CncPage {
     /// Common constructor: asserts the region is exactly one page and that
     /// its base pointer is aligned for the `#[repr(C)]` atomic-struct casts
@@ -131,8 +169,9 @@ impl CncPage {
     /// Write the header for a freshly-created page: fixed fields via
     /// `uc_protocol::v2::cnc::write_cnc_header`, then this crate's crc32
     /// over `[0..CNC_OFF_HEADER_CRC)`, then the fixed initial values
-    /// (`leader_hint = u64::MAX`, `next_client_id = 1`; every other atomic
-    /// stays at its zeroed default).
+    /// (`leader_hint = u64::MAX`, `next_client_id` = a per-generation random
+    /// base — see [`gen_unique_client_id_base`]; every other atomic stays at
+    /// its zeroed default).
     fn init(&mut self, meta: &CncMeta) {
         let created_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -152,7 +191,7 @@ impl CncPage {
         page[CNC_OFF_HEADER_CRC..CNC_OFF_HEADER_CRC + 4].copy_from_slice(&crc.to_le_bytes());
 
         self.status().leader_hint.store_release(u64::MAX);
-        self.status().next_client_id.store_release(1);
+        self.status().next_client_id.store_release(gen_unique_client_id_base() as u64);
     }
 
     /// Validate an attached (not just-created) page: magic/length (via
@@ -325,7 +364,11 @@ mod tests {
         assert_eq!(re.counters().append.load_acquire(), 4096, "same mapped page, not a copy");
         assert!(matches!(CncPage::open_file(&p, "other"), Err(CncError::AppIdMismatch { .. })));
         assert_eq!(re.status().leader_hint.load_acquire(), u64::MAX);
-        assert_eq!(re.status().next_client_id.load_acquire(), 1);
+        // Per-generation random base (T14): nonzero, top bit clear. Same value
+        // through the shared mmap (not a fresh draw on open).
+        let base = re.status().next_client_id.load_acquire();
+        assert_ne!(base, 0, "0 is the reserved no-id sentinel");
+        assert!(base < (1 << 31), "top bit must be clear (generation headroom)");
     }
 
     #[test]
@@ -421,9 +464,30 @@ mod tests {
     #[test]
     fn heap_page_next_client_id_allocates_with_fetch_add() {
         let page = CncPage::heap(&test_meta());
+        // Base is a per-generation random value (T14), not a fixed 1; allocation
+        // is still a monotone fetch_add from wherever the base landed.
+        let base = page.status().next_client_id.load_acquire();
+        assert_ne!(base, 0, "0 is the reserved no-id sentinel");
+        assert!(base < (1 << 31), "top bit clear");
         let first = page.status().next_client_id.fetch_add(1);
-        assert_eq!(first, 1, "starts at 1 per the M4 next_client_id contract");
-        assert_eq!(page.status().next_client_id.load_acquire(), 2);
+        assert_eq!(first, base, "fetch_add returns the current base");
+        assert_eq!(page.status().next_client_id.load_acquire(), base + 1);
+    }
+
+    #[test]
+    fn client_id_base_is_generation_unique_nonzero_and_top_bit_clear() {
+        // Two independently-created page generations must get different, nonzero
+        // bases with the top bit clear (T14 MAJOR: generation-unique client ids
+        // so an old generation's re-published (client_id, local_seq) can't
+        // collide with a live client's). Statistically certain over 2^31.
+        let a = CncPage::heap(&test_meta()).status().next_client_id.load_acquire();
+        let b = CncPage::heap(&test_meta()).status().next_client_id.load_acquire();
+        for base in [a, b] {
+            assert_ne!(base, 0, "0 is the reserved no-id sentinel");
+            assert_ne!(base, 1, "must NOT be the old fixed base of 1");
+            assert!(base < (1 << 31), "top bit must be clear");
+        }
+        assert_ne!(a, b, "two generations must get different random bases");
     }
 
     #[test]

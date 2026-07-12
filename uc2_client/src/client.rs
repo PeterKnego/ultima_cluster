@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -22,7 +22,9 @@ use uc_protocol::ring::{BroadcastRing, MpscProducer, MpscRing, RingError};
 use uc_protocol::v2::ipc::{FLAG_V2_LINEARIZABLE, MSG_V2_QUERY, MSG_V2_SUBMIT, extra_client};
 
 use crate::error::ClientError;
-use crate::matcher::{RawResp, Registrations, decode_response, drain_with_shutdown, spawn_matcher};
+use crate::matcher::{
+    Pending, RawResp, RegKind, Registrations, decode_response, drain_with_shutdown, spawn_matcher,
+};
 
 /// Default per-request timeout; override with `UC2_CLIENT_TIMEOUT_MS`.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,6 +53,10 @@ pub struct Client {
     query_ring: Mutex<MpscProducer>,
     next_local_seq: AtomicU32,
     registrations: Registrations,
+    /// Count of stale kind-mismatched `MSG_V2_RESPONSE` records the matcher
+    /// dropped (T14 defense in depth). Shared with the matcher thread; exposed
+    /// via [`Client::kind_mismatch_drops`].
+    kind_mismatch_drops: Arc<AtomicU64>,
     /// `None` only after `shutdown` has taken it (never observable from
     /// outside this module: `shutdown` consumes `self`).
     matcher: Option<AgentRunner>,
@@ -77,12 +83,19 @@ impl Client {
         let egress_node = BroadcastRing::open(&instance_dir.join(EGRESS_NODE))?.subscribe();
 
         let registrations: Registrations = Arc::new(Mutex::new(HashMap::new()));
+        let kind_mismatch_drops = Arc::new(AtomicU64::new(0));
         // `AgentRunner::spawn` only fails on OS thread-spawn exhaustion; there
         // is no dedicated `ClientError` variant for that (near-impossible in
         // practice), so it rides along on `Ring` via `RingError::Io` — the
         // closest existing "attach-time io problem" bucket.
-        let matcher = spawn_matcher(client_id, egress_service, egress_node, Arc::clone(&registrations))
-            .map_err(RingError::Io)?;
+        let matcher = spawn_matcher(
+            client_id,
+            egress_service,
+            egress_node,
+            Arc::clone(&registrations),
+            Arc::clone(&kind_mismatch_drops),
+        )
+        .map_err(RingError::Io)?;
 
         Ok(Client {
             cnc,
@@ -92,6 +105,7 @@ impl Client {
             query_ring: Mutex::new(query_producer),
             next_local_seq: AtomicU32::new(0),
             registrations,
+            kind_mismatch_drops,
             matcher: Some(matcher),
             request_timeout: read_request_timeout(),
         })
@@ -105,6 +119,15 @@ impl Client {
         self.instance_id
     }
 
+    /// Number of stale, kind-mismatched `MSG_V2_RESPONSE` records the matcher
+    /// has dropped (a submit response delivered to a pending query, or vice
+    /// versa — a T14 cross-generation `(client_id, local_seq)` collision). A
+    /// diagnostic stat: nonzero means the defense-in-depth kind check fired, so
+    /// a stale response was correctly discarded rather than misrouted.
+    pub fn kind_mismatch_drops(&self) -> u64 {
+        self.kind_mismatch_drops.load(Ordering::Relaxed)
+    }
+
     /// The cnc page's current `leader_hint` (`u64::MAX` sentinel → `None`).
     pub fn leader_hint(&self) -> Option<u32> {
         let hint = self.cnc.status().leader_hint.load_acquire();
@@ -116,7 +139,7 @@ impl Client {
     pub fn submit<C: Serialize, R: DeserializeOwned>(&self, cmd: &C) -> Result<R, ClientError> {
         let payload = bincode::serde::encode_to_vec(cmd, bincode::config::standard())
             .map_err(|e| ClientError::Decode(e.to_string()))?;
-        self.send_and_await(&self.ingress, MSG_V2_SUBMIT, 0, &payload)
+        self.send_and_await(&self.ingress, MSG_V2_SUBMIT, 0, RegKind::Submit, &payload)
     }
 
     /// Snapshot (non-linearizable) read.
@@ -142,7 +165,7 @@ impl Client {
     ) -> Result<QR, ClientError> {
         let payload = bincode::serde::encode_to_vec(q, bincode::config::standard())
             .map_err(|e| ClientError::Decode(e.to_string()))?;
-        self.send_and_await(&self.query_ring, MSG_V2_QUERY, flags, &payload)
+        self.send_and_await(&self.query_ring, MSG_V2_QUERY, flags, RegKind::Query, &payload)
     }
 
     /// The shared send/register/await core for both `submit` and `query_*`:
@@ -157,13 +180,14 @@ impl Client {
         ring: &Mutex<MpscProducer>,
         msg_type: u16,
         flags: u16,
+        kind: RegKind,
         payload: &[u8],
     ) -> Result<R, ClientError> {
         let local_seq = self.next_local_seq.fetch_add(1, Ordering::Relaxed);
         let extra = extra_client(self.client_id, local_seq);
 
         let (tx, rx) = mpsc::sync_channel::<RawResp>(1);
-        self.registrations.lock().unwrap().insert(local_seq, tx);
+        self.registrations.lock().unwrap().insert(local_seq, Pending { kind, tx });
 
         let write_deadline = Instant::now() + BACKPRESSURE_GRACE;
         loop {
