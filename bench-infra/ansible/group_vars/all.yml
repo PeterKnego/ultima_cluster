@@ -12,44 +12,10 @@ netem_delay_ms: 0        # one-way delay ms applied via tc qdisc; 0 = no shaping
 netem_iface: eth0        # interface to shape (override per cloud env)
 aeron_ingress: udp       # 'udp' (proven) | 'ipc' (gated behind task13 §11 fix, do not use yet)
 aeron_enabled: true      # false = UC-only fleet (skip Aeron build + Aeron sweep), used by the throughput loop
-idle_strategy: busyspin
-uc_pipeline_depth: 8            # pipeline depth threaded to UC nodes via UC_PIPELINE_DEPTH; override with -e uc_pipeline_depth=1
-uc_journal_prealloc: 1          # journal segment preallocation (task36) via UC_JOURNAL_PREALLOC; default ON post-promotion, override -e uc_journal_prealloc=0 to roll back / for the A arm
-uc_api_batch_linger_ms: 5       # openraft api_batch_linger_ms via UC_API_BATCH_LINGER_MS; override -e uc_api_batch_linger_ms=0 for low-latency (A/B)
-# Task18 busy-spin intra-host ring consumers (O1, default-off — reproduces today's behavior when unset).
-# A/B: A arm = defaults below; B arm = -e uc_apply_spin_budget=busy uc_node_bridge_spin_budget=busy
-uc_apply_spin_budget: "64"          # service apply consumer SpscConsumer spin budget; 'busy'/'max' = pure busy-spin
-uc_node_bridge_spin_budget: "0"     # node submit+apply_resp NotifyBridge spin budget; 'busy'/'max' = busy parker
-uc_log_cache_bytes: 268435456        # UC_LOG_CACHE_BYTES: leader log-entry cache budget (task: log entry cache); default 256MiB, override -e uc_log_cache_bytes=0 to DISABLE (A/B the cache)
-# Purge slack: log entries retained BEHIND the snapshot boundary (UC_MAX_IN_SNAPSHOT_LOG_TO_KEEP).
-# Empty = binary default (RaftTuning: 200000 since the purge-slack fix; was 1000 = the
-# snapshot-thrash livelock). A/B: -e uc_max_in_snapshot_log_to_keep=1000 for the pre-fix arm.
-uc_max_in_snapshot_log_to_keep: ""
-# Snapshot cadence in applied entries (UC_SNAPSHOT_LOGS_SINCE_LAST). Empty = binary default (5000).
-uc_snapshot_logs_since_last: ""
-# Admission control: max in-pipeline client writes per node (UC_MAX_INFLIGHT_WRITES).
-# Empty = binary default (256 = the measured optimum). -e uc_max_inflight_writes=0 = UNCAPPED
-# (the control arm / pre-admission behavior).
-uc_max_inflight_writes: ""
-# Floor-decomposition (layered e2e-delta): -e single_node=true runs only node0 as a 1-node raft
-# (no replication) so 1node vs 3node and eventual vs consistent deltas attribute the commit floor
-# into {base consensus+IPC, fsync, replication}. CSV config label auto-derives ('<n>node_<dura>').
-single_node: false
-# IPC mode of the UC nodes: 'shmem' (default, historical topology: node + separate
-# uc_service over rings, load driven by commit-path-load via uc_client) or 'embedded'
-# (co-location arm: KvSm in-process, NO service process, NO shmem surface — the load
-# driver runs INSIDE node0's process via uc-node-launch --load-* flags and writes the
-# same uc_sweep.csv; the run role then waits for the file instead of driving the
-# ladder). Runtime knob only (no rebuild needed).
-uc_ipc_mode: shmem
-# Max seconds to wait for the embedded in-process sweep to finish (covers the whole
-# inflight × rate ladder incl. warmups; size it to ladder_len × (warmup+measure) + slack).
-embedded_sweep_timeout_secs: 3600
-# Compile the uc-bench-probes sink into the UC bins (incl. leader replication-RPC
-# timing). -e uc_bench_probes=true for the replication-overhead probe; off by default
-# so normal latency benches aren't perturbed. NOTE: changing it requires a rebuild
-# (re-run `make up-uc` / the build_uc role), not just a new bench.yml run.
-uc_bench_probes: false
+# NOTE (v1 retired): UC benchmarking is now driven by the v2 gate orchestrators
+# (scripts/m6_fleet_gate.py + the m5_gate/m6_gate examples), not the ansible run
+# role. The old UC commit-path sweep knobs (uc_pipeline_depth, uc_ipc_mode,
+# uc_sync_core, admission/spin budgets, ...) were removed with the v1 stack.
 
 # --- Build sources ---
 aeron_benchmarks_repo: "https://github.com/aeron-io/benchmarks.git"
@@ -65,18 +31,12 @@ uc_git_ref: ""                           # used when uc_src_mode=git
 uc_repo_url: ""                          # used when uc_src_mode=git
 uc_local_path: "{{ playbook_dir }}/../.."  # repo root (ultima_cluster), for rsync mode
 ud_local_path: "{{ playbook_dir }}/../../../ultima_db"  # sibling repo (external path dep)
-or_local_path: "{{ playbook_dir }}/../../../openraft"   # sibling repo (openraft fork; UC's openraft path dep is ../openraft/openraft)
-# Build openraft with the synchronous SyncCore (instead of async RaftCore). Build-time
-# feature; toggling requires a rebuild (re-run iterate / build_uc), not just a new bench.
-# A/B: A arm = false (RaftCore), B arm = -e uc_sync_core=true (SyncCore).
-uc_sync_core: false
 
 # --- Layout on hosts ---
 remote_home: "/opt/bench"
 aeron_deploy_dir: "/opt/bench/aeron-deploy"
 uc_src_dir: "/opt/bench/uc"
 ud_src_dir: "/opt/bench/ultima_db"   # so /opt/bench/uc/../ultima_db resolves on the host
-or_src_dir: "/opt/bench/openraft"    # so /opt/bench/uc/../openraft/openraft resolves on the host
 uc_target_bin: "/opt/bench/uc/target/release"
 
 # --- Aeron port bases (matches canonical cluster_localhost ranges) ---
@@ -87,19 +47,5 @@ aeron_port_base: { node0: 20000, node1: 21000, node2: 22000 }
 uc_raft_port: { node0: 7001, node1: 7002, node2: 7003 }
 uc_app_id: "uc-bench-dist"
 
-# --- Net-ping harness (cross-host transport RTT) ---
-# A 2-host fleet (see `make up-ping`) stands up PERSISTENT echo responders on
-# node0 via the netping_serve role; a separate uc_autobench driver points its
-# clients at node0's IP:port and runs many ping experiments without re-provision.
-netping_udp_port: 9100   # internode-rpc-bench --transport udp  --listen 0.0.0.0:9100
-netping_quic_port: 9101  # internode-rpc-bench --transport quic --listen 0.0.0.0:9101
-# Aeron-benchmarks "echo" responder launcher under the built dist's
-# {{ aeron_deploy_dir }}/scripts/aeron/. VERIFY against the built dist on first
-# provision — the aeron-io/benchmarks repo names the remote echo responder
-# launcher 'echo' (older trees may call it 'remote'); netping_serve checks the
-# script is present and fails fast with a hint if this name is wrong.
-aeron_echo_launcher: "echo-server"   # verified on live aeron-io/benchmarks dist 2026-06-18 (was "echo"; RTT client = "echo-client"). NOTE: a FAIR Aeron baseline needs >=4 isolated busy-spin cores/host (remote-echo-benchmarks pins driver conductor/sender/receiver + load-rig) — ccx13 (2 vCPU) is too small; use ccx33 for the Aeron run.
-
 # --- Results ---
 results_local_dir: "{{ playbook_dir }}/../../bench-out/dist"
-iterate_local_csv: "{{ playbook_dir }}/../../bench-out/iterate/uc_sweep.csv"  # fixed path the loop reads

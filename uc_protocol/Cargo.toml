@@ -22,7 +22,7 @@ bincode = { workspace = true }
 [features]
 # Commit-path latency probes. OFF by default: when off, every `stamp_*` is a
 # zero-cost inline no-op and frame layout is unchanged. Enabled only for bench
-# builds (e.g. uc_autobench's attribution-bench).
+# builds that opt into the attribution probe sink.
 uc-bench-probes = []
 
 [dev-dependencies]

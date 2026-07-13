@@ -13,17 +13,10 @@ export
 
 TF      := terraform -chdir=terraform
 TFVARS  ?= terraform.tfvars
-# Instance type for the ping / fan-out fleets. Default ccx13 = the Hetzner
-# default; override per cloud, e.g. on AWS:
-#   make up-ping   PING_INSTANCE_TYPE=c7i.4xlarge
-#   make up-fanout FANOUT_INSTANCE_TYPE=c7i.4xlarge
-# For the fan-out Aeron baseline use a >=4-dedicated-core type (ccx33 on Hetzner).
-PING_INSTANCE_TYPE   ?= ccx13
-FANOUT_INSTANCE_TYPE ?= ccx13
 ANSIBLE := ansible-playbook
 SSH_KEY := $(shell awk -F'"' '/ssh_private_key_file/{print $$2}' $(TFVARS))
 
-.PHONY: init up up-uc up-ping up-fanout provision bench bench-oneshot status destroy ssh-node0 inventory iterate
+.PHONY: init up up-uc provision bench bench-oneshot status destroy ssh-node0 inventory
 
 init:
 	$(TF) init
@@ -37,20 +30,6 @@ up-uc: ## provision a UC-only fleet (no Aeron) for the throughput loop
 	$(TF) apply -auto-approve -var-file=../$(TFVARS)
 	$(MAKE) inventory
 	cd ansible && SSH_PRIVATE_KEY_FILE=$(SSH_KEY) $(ANSIBLE) provision.yml -e aeron_enabled=false
-
-up-ping: ## provision a 2-host ccx13 fleet + persistent UC/Aeron echo responders (cross-host ping harness)
-	TF_VAR_node_count=2 TF_VAR_instance_type=$(PING_INSTANCE_TYPE) $(TF) apply -auto-approve -var-file=../$(TFVARS)
-	$(MAKE) inventory
-	cd ansible && SSH_PRIVATE_KEY_FILE=$(SSH_KEY) $(ANSIBLE) netping.yml
-
-up-fanout: ## provision a 3-host fan-out fleet (FANOUT_INSTANCE_TYPE, default ccx13; use ccx33 for the Aeron baseline) + UC echo responders on all nodes
-	TF_VAR_node_count=3 TF_VAR_instance_type=$(FANOUT_INSTANCE_TYPE) $(TF) apply -auto-approve -var-file=../$(TFVARS)
-	$(MAKE) inventory
-	cd ansible && SSH_PRIVATE_KEY_FILE=$(SSH_KEY) $(ANSIBLE) netping.yml
-
-iterate: ## one loop iteration on the live fleet: rebuild UC + UC sweep, print fitness JSON
-	cd ansible && $(ANSIBLE) iterate.yml -e aeron_enabled=false
-	@python3 scripts/uc_fitness.py ../bench-out/iterate/uc_sweep.csv
 
 inventory:
 	SSH_PRIVATE_KEY_FILE=$(SSH_KEY) ./inventory/terraform_to_inventory.sh

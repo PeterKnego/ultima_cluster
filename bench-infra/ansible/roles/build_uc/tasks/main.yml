@@ -23,20 +23,6 @@
       - "--exclude=.git"
   when: uc_src_mode == "rsync"
 
-# UC's Cargo.toml has a path dep `../openraft/openraft` (the openraft fork, incl. the
-# experimental sync-core feature). Ship the sibling openraft repo to {{ or_src_dir }}
-# (= /opt/bench/openraft) so that, with UC at /opt/bench/uc, `../openraft/openraft`
-# resolves to /opt/bench/openraft/openraft on the host. Without this, cargo build fails.
-- name: (rsync mode) Sync sibling openraft (path dep) to host
-  ansible.posix.synchronize:
-    src: "{{ or_local_path }}/"
-    dest: "{{ or_src_dir }}/"
-    rsync_opts:
-      - "--exclude=target"
-      - "--exclude=.git"
-      - "--exclude=_log"   # openraft/tests/_log can hold many GB of suite tracing logs
-  when: uc_src_mode == "rsync"
-
 - name: (git mode) Clone UC at pinned ref
   ansible.builtin.git:
     repo: "{{ uc_repo_url }}"
@@ -44,24 +30,15 @@
     version: "{{ uc_git_ref }}"
   when: uc_src_mode == "git"
 
-- name: Compose cargo feature list
-  # uc_bench_probes=true compiles in the latency probe sink (incl. the leader
-  # replication-RPC timing); default off so normal latency benches aren't perturbed.
-  # SyncCore (synchronous consensus) is now the DEFAULT cargo feature — built unless
-  # explicitly disabled. Pass `-e uc_sync_core=false` to build RaftCore instead
-  # (adds --no-default-features). uc_bench_probes=true adds the probe sink.
-  ansible.builtin.set_fact:
-    uc_cargo_features: >-
-      {{ (['uc-bench-probes'] if (uc_bench_probes | default(false) | bool) else []) }}
-    uc_no_default_features: >-
-      {{ '--no-default-features' if ((uc_sync_core is defined) and (not (uc_sync_core | bool))) else '' }}
-
-- name: Build uc_autobench release bins
+# UC v2 gate binaries are cargo examples under uc2_node (release builds no examples
+# by default, so name them explicitly). m6_gate carries node/service/learner/probe/
+# loadclient roles; m5_gate is the throughput gate. The python gate orchestrators
+# (scripts/m6_fleet_gate.py) also self-build the example on each host, so this both
+# validates the build and warms the target dir for a fast orchestrator rebuild.
+- name: Build UC v2 gate example binaries
   ansible.builtin.command: >
     {{ remote_home }}/.cargo/bin/cargo build --release
-    {{ uc_no_default_features }}
-    {{ ('--features ' + (uc_cargo_features | join(','))) if (uc_cargo_features | length > 0) else '' }}
-    -p uc_autobench --bin uc-node-launch --bin commit-path-load --bin internode-rpc-bench
+    -p uc2_node --example m5_gate --example m6_gate
   args:
     chdir: "{{ uc_src_dir }}"
   environment:
@@ -70,11 +47,10 @@
   register: uc_build
   changed_when: "'Compiling' in uc_build.stderr or 'Finished' in uc_build.stderr"
 
-- name: Verify UC bins exist
+- name: Verify UC v2 gate bins exist
   ansible.builtin.shell: |
-    test -x {{ uc_target_bin }}/uc-node-launch
-    test -x {{ uc_target_bin }}/commit-path-load
-    test -x {{ uc_target_bin }}/internode-rpc-bench
+    test -x {{ uc_target_bin }}/examples/m5_gate
+    test -x {{ uc_target_bin }}/examples/m6_gate
   changed_when: false
 
 - name: Record UC source provenance

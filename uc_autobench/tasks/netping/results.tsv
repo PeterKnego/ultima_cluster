@@ -1,1 +1,0 @@
-netem_delay_ms	netem_loss_pct	system	config	workload	payload_bytes	inflight	target_rate	achieved_rate	p50_ns	p99_ns	p99_9_ns	p99_99_ns	max_ns	count
