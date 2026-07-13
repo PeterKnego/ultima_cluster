@@ -723,6 +723,64 @@ mod tests {
         assert_eq!(a.append(1, 501, &[0u8; 64]).unwrap_err(), AppendError::WouldOverrun);
     }
 
+    /// M7 Task 7 (uc2_node's admin path, mandatory review carry): a
+    /// `WouldOverrun` from `append_config` must leave EXACTLY the pre-call
+    /// state behind — no partial write, no frontier advance, no stray padding
+    /// frame — so `uc2_node::Consensus::propose_and_append`'s retry-whole
+    /// contract (reply `status=2` and let `uc2ctl`/the follower's forward try
+    /// again) is sound: the SAME config bytes re-appended on retry must land
+    /// as the FIRST thing after the gate reopens, not after some already-
+    /// written-but-unlinked debris. Pins the exact code path this task's
+    /// review relies on: `append_config`'s overrun check (buffer.rs) runs
+    /// strictly before it touches `self.pos`/writes any header/commit word.
+    #[test]
+    fn append_config_would_overrun_leaves_no_partial_state() {
+        let (b, c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        // Fill to exactly capacity (durable stays 0): 42 frames of 96 B = 4032,
+        // 64 B of headroom left — too little for a config frame (32 header +
+        // 12 payload = 44 -> aligned 64, but the overrun gate compares against
+        // durable + capacity = 4096, and 4032 + 64 == 4096 is NOT an overrun,
+        // so pad by one more small append to land exactly on the boundary).
+        for i in 0..42 {
+            a.append(1, i, &[0u8; 64]).unwrap();
+        }
+        assert_eq!(a.position(), 4032);
+        let pos_before = a.position();
+        let append_before = c.counters().append.load_acquire();
+        let slice_before = b.recordable_slice(0, 1 << 20).to_vec();
+
+        // A config payload needing padding + frame > the 64 B headroom: pad(64)
+        // would land the frame at 4096, well past durable(0) + capacity(4096).
+        let big_payload = vec![0u8; 200];
+        assert_eq!(
+            a.append_config(9, &big_payload).unwrap_err(),
+            AppendError::WouldOverrun,
+            "expected the config append to be gated by the overrun check"
+        );
+
+        // No partial state: position, the shared append counter, and every
+        // recorded byte are BIT-FOR-BIT what they were before the failed call.
+        assert_eq!(a.position(), pos_before, "WouldOverrun must not advance the appender's position");
+        assert_eq!(
+            c.counters().append.load_acquire(),
+            append_before,
+            "WouldOverrun must not advance the shared append counter"
+        );
+        assert_eq!(
+            b.recordable_slice(0, 1 << 20).to_vec(),
+            slice_before,
+            "WouldOverrun must not have written any bytes (no stray padding/header)"
+        );
+
+        // The retry, once durable advances enough to open the gate, appends
+        // cleanly at exactly the pre-failure position — proving the failed
+        // attempt left nothing behind for the retry to trip over.
+        c.counters().durable.store_release(4032);
+        let end = a.append_config(9, &big_payload).unwrap();
+        assert_eq!(end, pos_before + 64 /* pad */ + align_frame_len(HEADER_LEN + big_payload.len()) as u64);
+    }
+
     #[test]
     fn payload_too_large_is_rejected() {
         let (b, _c) = buf();

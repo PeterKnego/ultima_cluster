@@ -11,12 +11,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Instant, SystemTime};
 
-use uc2_consensus::config::{Addr, ClusterConfig};
-use uc2_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId};
+use uc2_consensus::config::{Addr, ClusterConfig, ConfigOp};
+use uc2_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId, Role};
 use uc2_log::agent::{AgentRunner, IdleStrategy};
 use uc2_log::archive::{Archive, ArchiveConfig};
 use uc2_log::buffer::{AppendError, Appender, LogBuffer};
-use uc2_log::cnc::{CncMeta, CncPage};
+use uc2_log::cnc::{AdminReq, AdminResp, CncMeta, CncPage};
 use uc2_log::counters::LogCounters;
 use uc2_log::state::{ConfigRecord, NodeState, StoredConfig, StoredMember, TermMap, TermMapEntry, VoteRecord};
 use uc2_net::TermHandle;
@@ -40,12 +40,14 @@ use uc_protocol::v2::ipc::{
 use crate::ipc::InstanceDir;
 use uc2_log::buffer::FrameRead;
 use uc_protocol::v2::datagram::{
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_READ_PROBE,
-    DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE,
-    DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN,
-    ReadProbeBody, RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire,
-    VOTE_BODY_LEN, VoteBody, write_datagram_header, write_read_probe_body, write_request_vote_body,
-    write_term_map_body, write_vote_body,
+    CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL,
+    DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK,
+    DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
+    MAX_TERM_MAP_WIRE_ENTRIES, READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN, ReadProbeBody,
+    RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire, VOTE_BODY_LEN,
+    VoteBody, write_config_proposal_body, write_config_reply_body, write_datagram_header,
+    write_read_probe_body, write_request_vote_body, write_term_map_body, write_vote_body,
 };
 
 /// Single-slot truncation ack. One truncation is in flight at a time (the SM
@@ -747,6 +749,9 @@ impl Node {
             last_leader_map: Vec::new(),
             halt_removed: false,
             config_bytes: Arc::clone(&config_bytes),
+            last_admin_seq: 0,
+            pending_admin_fwd: None,
+            last_config_reply: None,
         };
         let consensus_agent =
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
@@ -890,7 +895,8 @@ impl Node {
 
     /// Per-kind consensus-event drop counts, indexed by
     /// [`uc2_net::receiver::NetEvent::kind_idx`] (Report, CommitGossip,
-    /// RequestVote, Vote, TermMap, LeaderActivity, ReadProbe, ReadProbeAck).
+    /// RequestVote, Vote, TermMap, LeaderActivity, ReadProbe, ReadProbeAck,
+    /// ConfigProposal, ConfigReply).
     pub fn net_event_drops_by_kind(&self) -> [u64; uc2_net::receiver::NET_EVENT_KINDS] {
         let mut out = [0u64; uc2_net::receiver::NET_EVENT_KINDS];
         for (o, c) in out.iter_mut().zip(self.route_drops.net_drops.iter()) {
@@ -1066,6 +1072,26 @@ struct Consensus {
     /// read by the sender's `SnapshotSource` closure (a separate `Arc` clone) so
     /// every SNAP_BEGIN ships whatever config is CURRENT at ship time.
     config_bytes: Arc<Mutex<Vec<u8>>>,
+    /// M7 Task 7: the last admin-request seq consumed off the cnc admin-req
+    /// slot (`do_work` step 11's seqlock cursor into `read_admin_req`). `0` at
+    /// boot — matches the freshly-zeroed cnc page (recreated every node boot),
+    /// so an admin request from a prior life is never replayed.
+    last_admin_seq: u64,
+    /// M7 Task 7: this (follower) node's own in-flight forwarded proposal —
+    /// `(seq, nonce)` of the admin request we forwarded to the leader as a
+    /// kind-16 `ConfigProposal`. A 1-slot pending map (one admin request in
+    /// flight at a time, per the cnc admin band's own single-slot discipline):
+    /// cleared once the matching-nonce `NetEvent::ConfigReply` (kind 17)
+    /// arrives and its status/reason/version is written back to the response
+    /// line. `None` = no forward outstanding.
+    pending_admin_fwd: Option<(u64, u64)>,
+    /// M7 Task 7: leader-side nonce dedup — the last forwarded proposal's
+    /// `(nonce, reply)` this node (as leader) answered. A repeat nonce (the
+    /// follower's forward retried, or a genuine wire retry) gets the STORED
+    /// reply re-sent rather than re-running `propose_config` a second time —
+    /// idempotent under retry without relying on `ChangePending` to happen to
+    /// refuse the repeat. `None` until the first forwarded proposal is handled.
+    last_config_reply: Option<(u64, ConfigReplyBody)>,
 }
 
 impl Consensus {
@@ -1186,7 +1212,19 @@ impl Consensus {
         // Bounded: one pass over ≤8 slots per cycle, no per-datagram cnc writes.
         self.publish_peer_band();
 
-        // 11. M7: clear the cnc `config_pending` mirror once commit has crossed
+        // 11. Admin slot (M7 Task 7): at most one request per cycle. Leader:
+        // propose + append + reply on the response line. Follower: forward to
+        // the leader hint as kind 16 (remembering seq/nonce for the eventual
+        // kind-17 reply); no hint -> reply status=2 (retry). `read_admin_req`'s
+        // seqlock cursor (`last_admin_seq`) makes this idempotent against a
+        // duty cycle that runs before `uc2ctl`'s poll catches the response.
+        if let Some(req) = self.cnc.read_admin_req(self.last_admin_seq) {
+            self.last_admin_seq = req.seq;
+            self.handle_admin(req);
+            did = true;
+        }
+
+        // 12. M7: clear the cnc `config_pending` mirror once commit has crossed
         // the adopted config's position — the entry is no longer at risk of a
         // truncation revert. `sm.config_pending()` is the single source of truth
         // (`config_position > commit_seen`, updated on every commit advance/gossip);
@@ -1496,10 +1534,14 @@ impl Consensus {
     /// by version). Returns the frame-END position (the new
     /// `ConfigRecord.position`).
     ///
-    /// Nothing calls this yet — Task 7's admin propose path
-    /// (`ElectionSm::propose_config` → this) wires it in.
-    #[allow(dead_code)] // wired by Task 7's admin propose path
-    fn append_config_frame(&mut self, new_cfg: &ClusterConfig) -> u64 {
+    /// Task 7's admin propose path (`ElectionSm::propose_config` ->
+    /// `propose_and_append` -> this) is the caller. On `Err` (the ring is
+    /// momentarily full, `AppendError::WouldOverrun`, or the vanishingly
+    /// unlikely `PayloadTooLarge`) nothing has been appended and nothing has
+    /// been fed to the SM — `propose_config` never mutated state either, so
+    /// the caller's retry sees a byte-for-byte unchanged SM (see
+    /// `propose_and_append`'s doc for the full argument).
+    fn append_config_frame(&mut self, new_cfg: &ClusterConfig) -> Result<u64, AppendError> {
         let term = self.sm.current_term();
         let wire = cluster_to_wire(new_cfg, self.sm.config_position());
         let mut bytes = Vec::new();
@@ -1508,10 +1550,9 @@ impl Consensus {
             .appender
             .as_mut()
             .expect("append_config_frame is leader-only")
-            .append_config(term, &bytes)
-            .expect("config append fail-stop (admission/backpressure is Task 7's concern)");
+            .append_config(term, &bytes)?;
         self.feed(Event::ConfigObserved { position, config: new_cfg.clone() });
-        position
+        Ok(position)
     }
 
     /// Drain the client ingress MPSC ring, bounded by `INGRESS_PER_CYCLE`
@@ -1904,6 +1945,21 @@ impl Consensus {
                 return;
             }
             NetEvent::LeaderActivity { term } => Event::LeaderSeen { term },
+            NetEvent::ConfigProposal { from, body } => {
+                // Leader side (M7 Task 7): a follower forwarded its admin
+                // request. Handled inline — never an SM event (the propose/
+                // append pipeline is node-side, like `append_config_frame`
+                // itself).
+                self.on_config_proposal(from, body);
+                return;
+            }
+            NetEvent::ConfigReply { body } => {
+                // Follower side (M7 Task 7): the leader's reply to OUR
+                // forwarded proposal. Handled inline — matched against the
+                // 1-slot pending map by nonce.
+                self.on_config_reply(body);
+                return;
+            }
         };
         self.feed(event);
     }
@@ -1922,6 +1978,119 @@ impl Consensus {
         if let Some(id) = self.addr_to_id.get(&from).copied() {
             self.cnc.status().leader_hint.store_release(id as u64);
         }
+    }
+
+    /// M7 Task 7: `do_work` step 11's admin-slot dispatcher. Leader: propose +
+    /// append locally and answer the response line directly. Follower: forward
+    /// to whoever the leader hint names (kind 16), remembering `(seq, nonce)`
+    /// so the eventual `NetEvent::ConfigReply` (kind 17) can be matched back to
+    /// this response line; no hint (or the hint resolves to no known address,
+    /// e.g. mid-election) -> reply `status=2` (retry) immediately — side-effect-
+    /// free, `uc2ctl` just polls again.
+    fn handle_admin(&mut self, req: AdminReq) {
+        if matches!(self.sm.role(), Role::Leader) {
+            let (status, reason, version) = self.propose_and_append(req.op, req.id, req.ip, req.port);
+            self.write_admin_reply(req.seq, status, reason, version);
+            return;
+        }
+        let hint = self.cnc.status().leader_hint.load_acquire();
+        let leader_addr = (hint != u64::MAX)
+            .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
+            .flatten();
+        let Some(leader_addr) = leader_addr else {
+            self.write_admin_reply(req.seq, 2, 0, self.cnc.config_version());
+            return;
+        };
+        self.pending_admin_fwd = Some((req.seq, req.nonce));
+        let body = ConfigProposalBody { nonce: req.nonce, op: req.op, id: req.id, ip: req.ip, port: req.port };
+        let mut buf = [0u8; CONFIG_PROPOSAL_BODY_LEN];
+        write_config_proposal_body(&mut buf, &body);
+        let term = self.sm.current_term();
+        self.send(leader_addr, DGRAM_KIND_CONFIG_PROPOSAL, 0, term, &buf);
+    }
+
+    /// M7 Task 7: leader-only — decode the wire op fields, `propose_config`,
+    /// and on `Ok` append + adopt-at-append (`append_config_frame`). Shared by
+    /// the local admin-slot path and the network `ConfigProposal` forward path
+    /// (one propose/append pipeline either way). Returns the wire reply triple
+    /// `(status, reason, version)`:
+    /// * `0, 0, new_version` — accepted.
+    /// * `1, reason_code, current_version` — refused (`ProposeError`, or `6`/
+    ///   `NotFound`'s code reused for a malformed/unknown op field — `uc2ctl`
+    ///   never emits one, so this is a defensive catch-all, not a real path).
+    /// * `2, 0, current_version` — retry: the ring was momentarily full
+    ///   (`AppendError::WouldOverrun`). Safe to retry WHOLE: `propose_config`
+    ///   itself never mutates SM state (it only reads `role`/`serving`/
+    ///   `config_pending`/`commit_seen`/`last_reports` and returns a fresh
+    ///   `ClusterConfig` clone) and adoption happens ONLY via the `ConfigObserved`
+    ///   `append_config_frame` feeds back on a SUCCESSFUL append — so a failed
+    ///   append leaves the SM bit-for-bit as it was before this call; nothing
+    ///   here can leave a half-adopted config behind for the retry to trip over.
+    fn propose_and_append(&mut self, op: u32, id: u32, ip: u32, port: u16) -> (u32, u32, u64) {
+        let Some(config_op) = wire_to_config_op(op, id, ip, port) else {
+            return (1, 6, self.cnc.config_version());
+        };
+        match self.sm.propose_config(config_op, self.admission_bytes) {
+            Ok(new_cfg) => {
+                let version = new_cfg.version;
+                match self.append_config_frame(&new_cfg) {
+                    Ok(_position) => (0, 0, version),
+                    Err(AppendError::WouldOverrun) | Err(AppendError::PayloadTooLarge) => {
+                        (2, 0, self.cnc.config_version())
+                    }
+                }
+            }
+            Err(e) => (1, ClusterConfig::reason_code(&e), self.cnc.config_version()),
+        }
+    }
+
+    /// M7 Task 7: leader-side handling of a follower-forwarded proposal (kind
+    /// 16). A stale/not-yet-leader recipient just drops it — the forwarding
+    /// follower's request times out and `uc2ctl` (or the follower's next admin
+    /// cycle) re-learns the current leader hint and can re-forward. Nonce
+    /// dedup: a repeat nonce gets the STORED reply re-sent rather than a fresh
+    /// `propose_config` call (retry-idempotent while the change is pending).
+    fn on_config_proposal(&mut self, from: SocketAddr, body: ConfigProposalBody) {
+        if !matches!(self.sm.role(), Role::Leader) {
+            return;
+        }
+        if let Some((nonce, reply)) = &self.last_config_reply
+            && *nonce == body.nonce
+        {
+            let reply = *reply;
+            self.send_config_reply(from, &reply);
+            return;
+        }
+        let (status, reason, version) = self.propose_and_append(body.op, body.id, body.ip, body.port);
+        let reply = ConfigReplyBody { nonce: body.nonce, status, reason, version };
+        self.last_config_reply = Some((body.nonce, reply));
+        self.send_config_reply(from, &reply);
+    }
+
+    fn send_config_reply(&mut self, to: SocketAddr, reply: &ConfigReplyBody) {
+        let mut buf = [0u8; CONFIG_REPLY_BODY_LEN];
+        write_config_reply_body(&mut buf, reply);
+        let term = self.sm.current_term();
+        self.send(to, DGRAM_KIND_CONFIG_REPLY, 0, term, &buf);
+    }
+
+    /// M7 Task 7: follower-side handling of the leader's reply (kind 17) to our
+    /// forwarded proposal. Matched against the 1-slot pending map by nonce; a
+    /// reply for any other nonce (stale, or a race with a since-superseded
+    /// forward) is dropped rather than misattributed to the wrong response line.
+    fn on_config_reply(&mut self, body: ConfigReplyBody) {
+        let Some((seq, nonce)) = self.pending_admin_fwd else { return };
+        if nonce != body.nonce {
+            return;
+        }
+        self.pending_admin_fwd = None;
+        self.write_admin_reply(seq, body.status, body.reason, body.version);
+    }
+
+    /// Write the admin response line (fields-then-seq/release; the T1 accessor
+    /// enforces the discipline) for `seq`.
+    fn write_admin_reply(&mut self, seq: u64, status: u32, reason: u32, version: u64) {
+        self.cnc.write_admin_resp(&AdminResp { seq, status, reason, version });
     }
 
     /// Feed one event into the SM and execute every resulting action IN ORDER;
@@ -2358,6 +2527,21 @@ fn addr_to_pair(a: SocketAddr) -> Addr {
 fn stored_member(id: NodeId, addr: SocketAddr) -> StoredMember {
     let (ip, port) = addr_to_pair(addr);
     StoredMember { id, ip, port }
+}
+
+/// M7 Task 7: decode the cnc admin-req / `ConfigProposalBody` wire fields
+/// (`op` 1..=5, `id`, `ip`, `port`) into a `ConfigOp` — the inverse of
+/// `ClusterConfig::op_code`. `None` for an out-of-range `op` (never emitted by
+/// `uc2ctl`; a defensive catch-all for a malformed/future-version request).
+fn wire_to_config_op(op: u32, id: NodeId, ip: u32, port: u16) -> Option<ConfigOp> {
+    match op {
+        1 => Some(ConfigOp::AddLearner { id, addr: (ip, port) }),
+        2 => Some(ConfigOp::PromoteLearner { id }),
+        3 => Some(ConfigOp::DemoteVoter { id }),
+        4 => Some(ConfigOp::RemoveLearner { id }),
+        5 => Some(ConfigOp::RemoveVoter { id }),
+        _ => None,
+    }
 }
 
 /// `WireConfig` (the decoded `FRAME_TYPE_CONFIG` payload) -> `ClusterConfig`
@@ -2831,6 +3015,9 @@ mod tests {
             last_leader_map: Vec::new(),
             halt_removed: false,
             config_bytes: Arc::new(Mutex::new(Vec::new())),
+            last_admin_seq: 0,
+            pending_admin_fwd: None,
+            last_config_reply: None,
         };
 
         Harness {
