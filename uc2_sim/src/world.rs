@@ -23,6 +23,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 
+use uc2_consensus::config::{Addr, ClusterConfig};
 use uc2_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId, Role};
 use uc2_consensus::reconcile::MAX_TERM_MAP_WIRE_ENTRIES;
 
@@ -410,17 +411,20 @@ impl World {
     }
 
     fn election_cfg(cfg: &SimConfig, node: usize) -> ElectionConfig {
+        // Genesis config: every node a voter, synthetic addr `(node_idx, 1)` — the
+        // sim never opens sockets, so the addr is a dep-free placeholder (M7).
+        let voters: Vec<(NodeId, Addr)> = (0..cfg.n_nodes as NodeId)
+            .map(|id| (id, (id, 1)))
+            .collect();
         ElectionConfig {
             id: node as NodeId,
-            members: (0..cfg.n_nodes as NodeId).collect(),
+            config: ClusterConfig::genesis(voters, Vec::new()),
+            config_position: 0,
             election_timeout_min_ns: cfg.election_timeout_min_ns,
             election_timeout_max_ns: cfg.election_timeout_max_ns,
             gossip_floor_ns: cfg.gossip_floor_ns,
             // Distinct per-node seeds so timeouts spread (avoids lockstep splits).
             seed: cfg.seed ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(node as u64 + 1),
-            // The sim models a homogeneous voting cluster (no learners yet — that
-            // path is exercised at the node integration tier in Task 7/8).
-            can_vote: true,
         }
     }
 
@@ -1183,6 +1187,13 @@ impl World {
                 // M6 Task 8: a wipe-and-rejoin was decided; the substantive
                 // `Truncate { to: 0 }` follows in the same batch (handled above).
                 self.stat_wipes += 1;
+            }
+            Action::ConfigAdopted { .. } => {
+                // M7 migration stub: config-frame modeling (mirror + revert-on-
+                // truncate + inv6-9) lands in Task 4 Step 2, not this pure migration.
+            }
+            Action::HaltRemoved => {
+                // M7 migration stub: see `Action::ConfigAdopted` above.
             }
             Action::Fatal { reason } => {
                 // With wipe-and-rejoin ON (default), NoCommonPrefix never reaches
