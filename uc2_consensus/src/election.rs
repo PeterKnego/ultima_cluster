@@ -23,6 +23,7 @@
 //! election) from `[min, max)` via a crate-local xorshift — no dependency.
 
 use crate::commit::CommitTracker;
+use crate::config::{ClusterConfig, ConfigOp, ProposeError};
 use crate::reconcile::{MAX_TERM_MAP_WIRE_ENTRIES, Outcome, Reconcile, reconcile};
 
 pub type NodeId = u32;
@@ -47,9 +48,17 @@ impl XorShift64 {
 
 pub struct ElectionConfig {
     pub id: NodeId,
-    /// Static voting membership, self included. Position in this Vec is the
-    /// follower index used by CommitTracker when leader.
-    pub members: Vec<NodeId>,
+    /// The adopted cluster membership (M7): voters + learners + tombstones,
+    /// versioned. `members` (the voting set, self included iff a voter) and
+    /// `can_vote` are DERIVED from this at construction and again on every
+    /// `Event::ConfigObserved` adoption — see `ElectionSm::adopt_config`.
+    /// M6 Task 7's learner-candidacy switch (a learner's own id is NOT in the
+    /// voting set, so it never occupies a `CommitTracker` slot and its
+    /// `Report` is dropped by `follower_slot` — the two halves of "never
+    /// affects quorum") now falls out of `config.is_voter(id)`.
+    pub config: ClusterConfig,
+    /// Recovered frame-end position of `config` (0 at genesis / fresh boot).
+    pub config_position: u64,
     pub election_timeout_min_ns: u64, // default 150_000_000
     pub election_timeout_max_ns: u64, // default 300_000_000
     /// Idle re-gossip floor (spec §6): the maximum interval a leader will go
@@ -59,15 +68,6 @@ pub struct ElectionConfig {
     /// cluster — waits to learn commit / reconcile. Default 100_000_000 (100ms).
     pub gossip_floor_ns: u64,
     pub seed: u64,
-    /// M6 Task 7: candidacy switch. A voter (`true`) runs the ordinary election
-    /// path — times out, solicits votes, grants votes. A learner (`false`) is
-    /// replicated-to but never counted: its election timer never fires a
-    /// candidacy, and it never grants a `RequestVote` (it still ADOPTS a higher
-    /// term for liveness/reconcile — just never votes). By construction a
-    /// learner's own id is NOT in `members` (the voting set), so it also never
-    /// occupies a `CommitTracker` slot and its `Report` is dropped by
-    /// `follower_slot` — the two halves of "never affects quorum".
-    pub can_vote: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +105,14 @@ pub enum Event {
     /// pending map adopted IFF `epoch` matches the in-flight truncation the SM
     /// allocated in the corresponding `Action::Truncate`.
     Truncated { epoch: u64, to: u64 },
+    /// M7: a `ClusterConfig` frame was observed (durably appended) ending at
+    /// `position` — fed by the leader append path, the follower archive scan,
+    /// AND boot recovery. Adopts iff `config.version` strictly exceeds the
+    /// currently adopted version (idempotent / monotone). This is a DATA-PLANE
+    /// event: it is deliberately NOT in the truncating latch's allow-list, so
+    /// it is dropped while a truncation is in flight and re-observed once the
+    /// data plane resumes — including the post-revert re-adoption case.
+    ConfigObserved { position: u64, config: ClusterConfig },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +163,18 @@ pub enum Action {
     /// `Truncate { to: 0, new_map: [] }` this is emitted alongside. The agent bumps
     /// a `wipes` counter and takes no other action.
     CountWipe,
+    /// M7: a higher-version `ClusterConfig` was adopted at `position` (`prev`/
+    /// `prev_position` are the superseded config and its position). The agent
+    /// must, in any order that preserves durability-before-effect: (1) persist
+    /// the `ConfigRecord`; (2) rebuild the net layer (`SetPeers`) from the new
+    /// config; (3) update `cnc.dat`. If this adoption also emitted
+    /// `HaltRemoved`, the halt still applies.
+    ConfigAdopted { position: u64, config: ClusterConfig, prev_position: u64, prev: ClusterConfig },
+    /// M7: this node is not a member of the just-adopted config (and is not a
+    /// leader mid-self-removal — a leader keeps serving until its own removal
+    /// commits; Task 8 adds that commit-triggered step-down). The agent must
+    /// fail-stop.
+    HaltRemoved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,9 +193,25 @@ pub enum Role {
 
 pub struct ElectionSm {
     id: NodeId,
+    /// The adopted `ClusterConfig` (M7). `members`/`can_vote` below are
+    /// derived from it at construction and on every adoption boundary.
+    config: ClusterConfig,
+    /// Frame-end position of `config` (the append offset it was observed at).
+    config_position: u64,
+    /// Derived voting set: `config.voter_ids()`. Kept as private derived
+    /// state (rather than recomputed on every access) so the rest of the SM
+    /// body — `majority()`, `follower_slot()`, the vote/report membership
+    /// checks — stays unchanged.
     members: Vec<NodeId>,
-    /// M6 Task 7: candidacy switch (see [`ElectionConfig::can_vote`]).
+    /// Derived: `config.is_voter(id)`. M6 Task 7: candidacy switch — see the
+    /// doc on [`ElectionConfig::config`].
     can_vote: bool,
+    /// Carried per-member durable reports (M7): upserted (max) on every
+    /// current-term `Report` from a config member, cleared on `become_leader`
+    /// (stale-term reports must not certify anything in the new term), and
+    /// pruned to surviving config members at every `adopt_config` rebuild.
+    /// Backs the `PromoteLearner` catch-up precondition and `last_report`.
+    last_reports: Vec<(NodeId, u64)>,
     timeout_min_ns: u64,
     timeout_max_ns: u64,
     /// Idle re-gossip floor (see [`ElectionConfig::gossip_floor_ns`]).
@@ -247,25 +283,31 @@ impl ElectionSm {
         durable: u64,
         now_ns: u64,
     ) -> Self {
+        // Derive the voting set + candidacy switch from the adopted config
+        // (M7). `members` is voters-only; a learner's own id must NOT be in
+        // it (M6 Task 7 — replicated-to without ever being counted).
+        let members_ids = cfg.config.voter_ids();
+        let can_vote = cfg.config.is_voter(cfg.id);
+
         // Fail loudly at construction, not via a usize underflow later
         // (n_members - 1) or a nonsensical timer span. A voter's own id must be
         // in `members` (it occupies a CommitTracker slot and votes for itself);
         // a learner's own id must NOT be — `members` is the voting set only, and
         // a learner is replicated-to without ever being counted (M6 Task 7).
-        assert!(!cfg.members.is_empty(), "election membership must be non-empty");
-        if cfg.can_vote {
+        assert!(!members_ids.is_empty(), "election membership must be non-empty");
+        if can_vote {
             assert!(
-                cfg.members.contains(&cfg.id),
+                members_ids.contains(&cfg.id),
                 "a voter's id must be in the voting membership (id={}, members={:?})",
                 cfg.id,
-                cfg.members
+                members_ids
             );
         } else {
             assert!(
-                !cfg.members.contains(&cfg.id),
+                !members_ids.contains(&cfg.id),
                 "a learner's id must NOT be in the voting membership (id={}, members={:?})",
                 cfg.id,
-                cfg.members
+                members_ids
             );
         }
         // Hard-assert (M-2): a strictly positive timer span. An empty span
@@ -283,13 +325,16 @@ impl ElectionSm {
         let vote_term = recovered_vote.map(|(t, _)| t).unwrap_or(0);
         let current_term = vote_term.max(map_term);
 
-        let n_members = cfg.members.len();
+        let n_members = members_ids.len();
         let tracker = CommitTracker::new(n_members - 1, n_members);
 
         let mut sm = Self {
             id: cfg.id,
-            members: cfg.members,
-            can_vote: cfg.can_vote,
+            config: cfg.config,
+            config_position: cfg.config_position,
+            members: members_ids,
+            can_vote,
+            last_reports: Vec::new(),
             timeout_min_ns: cfg.election_timeout_min_ns,
             timeout_max_ns: cfg.election_timeout_max_ns,
             gossip_floor_ns: cfg.gossip_floor_ns,
@@ -377,6 +422,19 @@ impl ElectionSm {
                 if term > self.current_term {
                     self.adopt_term(term, None, out);
                     return;
+                }
+                // Carried reports (M7): upsert (max) for ANY current-term
+                // report from a config MEMBER (voter or learner), regardless
+                // of our own role — a follower may later become leader and
+                // needs the last-known durable for the promote-learner
+                // catch-up precondition without waiting for a fresh report.
+                // A non-member's report (forged source, or a removed voter)
+                // is dropped here just like `follower_slot` drops it below.
+                if self.config.contains(from) && from != self.id {
+                    match self.last_reports.iter_mut().find(|(id, _)| *id == from) {
+                        Some((_, d)) => *d = (*d).max(durable),
+                        None => self.last_reports.push((from, durable)),
+                    }
                 }
                 if matches!(self.role, Role::Leader)
                     && let Some(slot) = self.follower_slot(from)
@@ -516,6 +574,13 @@ impl ElectionSm {
                 }
                 self.truncating_epoch = None;
             }
+
+            Event::ConfigObserved { position, config } => {
+                if config.version <= self.config.version {
+                    return; // idempotent / stale re-observation
+                }
+                self.adopt_config(position, config, out);
+            }
         }
     }
 
@@ -570,6 +635,54 @@ impl ElectionSm {
     /// The durable byte position the SM currently believes it holds.
     pub fn durable(&self) -> u64 {
         self.durable
+    }
+
+    /// The currently adopted cluster membership.
+    pub fn config(&self) -> &ClusterConfig {
+        &self.config
+    }
+
+    /// Frame-end position of the currently adopted config.
+    pub fn config_position(&self) -> u64 {
+        self.config_position
+    }
+
+    /// One membership change in flight at a time: true while the adopted
+    /// config's position has not yet committed.
+    pub fn config_pending(&self) -> bool {
+        self.config_position > self.commit_seen
+    }
+
+    /// The last carried durable report for `id` (used by the promote-learner
+    /// catch-up precondition and by `uc2ctl status`).
+    pub fn last_report(&self, id: NodeId) -> Option<u64> {
+        self.last_reports.iter().find(|(rid, _)| *rid == id).map(|(_, d)| *d)
+    }
+
+    /// Leader-only membership proposal (M7). `slack` = max catch-up gap a
+    /// learner may have and still be promoted (the node passes its admission
+    /// window). Returns the NEW config for the node to append as a
+    /// FRAME_TYPE_CONFIG frame; adoption happens via the `ConfigObserved` the
+    /// append path feeds back — one adoption path for leader and follower.
+    /// The SM does NOT self-adopt here.
+    pub fn propose_config(&mut self, op: ConfigOp, slack: u64) -> Result<ClusterConfig, ProposeError> {
+        if !matches!(self.role, Role::Leader) {
+            return Err(ProposeError::NotLeader);
+        }
+        if !self.serving {
+            return Err(ProposeError::NotServing); // the single-server-change precondition
+        }
+        if self.config_pending() {
+            return Err(ProposeError::ChangePending); // one in flight
+        }
+        if let ConfigOp::PromoteLearner { id } = op {
+            let reported = self.last_report(id).unwrap_or(0);
+            let target = self.commit_seen.saturating_sub(slack);
+            if reported < target {
+                return Err(ProposeError::NotCaughtUp { gap: target - reported });
+            }
+        }
+        self.config.apply(op)
     }
 
     // ---- internals ----
@@ -669,6 +782,9 @@ impl ElectionSm {
         self.term_map.push((self.current_term, self.durable));
         // Fresh follower slots: stale-term reports must not certify the new term.
         self.tracker.reset_reports();
+        // M7: stale-term carried reports must not certify a promote-learner
+        // precondition either (mirrors the tracker reset above).
+        self.last_reports.clear();
         out.push(Action::BecomeLeader { term: self.current_term, base: self.durable });
         // Ship the freshly-opened term map so followers can reconcile (spec §M4).
         out.push(Action::ShipTermMap { entries: self.term_map_wire_tail() });
@@ -821,6 +937,62 @@ impl ElectionSm {
         None
     }
 
+    /// Rebuild-at-boundary (M7): adopt `cfg` (observed ending at `position`),
+    /// refresh the derived voting set, rebuild the `CommitTracker` sized to
+    /// the new voting set, and re-feed the last durable report per surviving
+    /// member so commit ranking does not restart from zero. Commit itself is
+    /// monotonic in the cnc counter — a rebuild can only pause, never regress
+    /// it.
+    fn adopt_config(&mut self, position: u64, cfg: ClusterConfig, out: &mut Vec<Action>) {
+        let prev = std::mem::replace(&mut self.config, cfg);
+        let prev_position = self.config_position;
+        self.config_position = position;
+        self.members = self.config.voter_ids();
+        self.can_vote = self.config.is_voter(self.id);
+
+        // Sizing subtlety: `follower_slot` skips only `m == self.id`. If self
+        // is (still) a voter, it occupies no slot and the tracker is sized as
+        // before: n-1 tracked followers over a cluster of n. If self is NOT a
+        // voter (a learner, or — Leader case — mid-self-removal, kept
+        // serving until commit per the self-exclusion rule below), it
+        // occupies NO slot to exclude, so ALL n voters get a dense slot
+        // 0..n — using the old `n - 1` here would both under-track one
+        // member (permanently reads zero) AND panic in `follower_slot` /
+        // `CommitTracker::on_durable` once a real report maps to slot `n-1`,
+        // one past the tracker's `n-1`-sized `reported` vec. `CommitTracker`
+        // still requires `cluster_size > n_followers` ("the leader is a
+        // member") — own_durable always occupies that "+1" ranking slot in
+        // `advance`, self-as-voter or not — so cluster_size is always
+        // `n_followers + 1`.
+        let n = self.members.len();
+        let n_followers = if self.can_vote { n - 1 } else { n };
+        self.tracker = CommitTracker::new(n_followers, n_followers + 1);
+        // Prune to SURVIVING config members (voter OR learner — not just
+        // voters): a learner's carried report must survive an unrelated
+        // rebuild (e.g. another AddLearner) so a later PromoteLearner still
+        // sees it; a truly removed id (voter or learner) is correctly
+        // dropped because `self.config.contains` is false for it.
+        self.last_reports.retain(|(id, _)| self.config.contains(*id) && *id != self.id);
+        for &(id, durable) in &self.last_reports {
+            if let Some(slot) = self.follower_slot(id) {
+                self.tracker.on_durable(slot, durable);
+            }
+        }
+        out.push(Action::ConfigAdopted {
+            position,
+            config: self.config.clone(),
+            prev_position,
+            prev,
+        });
+        // Self-exclusion: a follower halts now; a leader removing itself keeps
+        // serving until this entry COMMITS (the node executes the step-down —
+        // Task 8), because C_new must be replicated by a leader that still
+        // exists.
+        if !self.config.contains(self.id) && !matches!(self.role, Role::Leader) {
+            out.push(Action::HaltRemoved);
+        }
+    }
+
     fn rank_leader(&mut self, now_ns: u64, out: &mut Vec<Action>) {
         if let Some(c) = self.tracker.advance(self.durable)
             && c > self.commit_seen
@@ -854,10 +1026,25 @@ impl ElectionSm {
 mod tests {
     use super::*;
 
+    /// Synthetic per-test addr: `(id, 1)` — never a real `SocketAddr`.
+    fn addr_of(id: NodeId) -> (u32, u16) {
+        (id, 1)
+    }
+
+    /// A genesis `ClusterConfig` with `members` all as voters, no learners.
+    fn genesis_voters(members: &[NodeId]) -> ClusterConfig {
+        ClusterConfig::genesis(members.iter().map(|&id| (id, addr_of(id))).collect(), Vec::new())
+    }
+
     fn cfg(id: NodeId) -> ElectionConfig {
+        cfg_members(id, vec![0, 1, 2])
+    }
+
+    fn cfg_members(id: NodeId, members: Vec<NodeId>) -> ElectionConfig {
         ElectionConfig {
             id,
-            members: vec![0, 1, 2],
+            config: genesis_voters(&members),
+            config_position: 0,
             election_timeout_min_ns: 150,
             election_timeout_max_ns: 300,
             // Huge floor: these tests drive ranking via `Tick` at tiny `now_ns`
@@ -866,19 +1053,22 @@ mod tests {
             // `idle_leader_reemits_on_gossip_floor` with a small floor.
             gossip_floor_ns: u64::MAX,
             seed: 42 + id as u64,
-            can_vote: true,
         }
     }
 
-    fn cfg_members(id: NodeId, members: Vec<NodeId>) -> ElectionConfig {
+    /// Like `cfg_members`, but with an explicit learner set (M7 promote tests).
+    fn cfg_with_learners(id: NodeId, voters: Vec<NodeId>, learners: Vec<NodeId>) -> ElectionConfig {
         ElectionConfig {
             id,
-            members,
+            config: ClusterConfig::genesis(
+                voters.iter().map(|&v| (v, addr_of(v))).collect(),
+                learners.iter().map(|&l| (l, addr_of(l))).collect(),
+            ),
+            config_position: 0,
             election_timeout_min_ns: 150,
             election_timeout_max_ns: 300,
             gossip_floor_ns: u64::MAX,
             seed: 42 + id as u64,
-            can_vote: true,
         }
     }
 
@@ -920,12 +1110,15 @@ mod tests {
     fn learner() -> ElectionSm {
         let cfg = ElectionConfig {
             id: 9,
-            members: vec![0, 1, 2],
+            config: ClusterConfig::genesis(
+                vec![(0, addr_of(0)), (1, addr_of(1)), (2, addr_of(2))],
+                vec![(9, addr_of(9))],
+            ),
+            config_position: 0,
             election_timeout_min_ns: 150,
             election_timeout_max_ns: 300,
             gossip_floor_ns: u64::MAX,
             seed: 7,
-            can_vote: false,
         };
         ElectionSm::new(cfg, None, &[(1, 0)], 0, 0)
     }
@@ -1365,12 +1558,12 @@ mod tests {
         // the election timeout so a leader tick is unambiguous.
         let cfg = ElectionConfig {
             id: 0,
-            members: vec![0, 1, 2],
+            config: genesis_voters(&[0, 1, 2]),
+            config_position: 0,
             election_timeout_min_ns: 150,
             election_timeout_max_ns: 300,
             gossip_floor_ns: 1000,
             seed: 42,
-            can_vote: true,
         };
         let mut s = ElectionSm::new(cfg, None, &[], 0, 0);
         // Drive to leader of term 1. `become_leader` re-anchors the idle floor to
@@ -1636,5 +1829,196 @@ mod tests {
         sm.step(Event::RequestVote { from: 9, new_term: 5, last_term: 4, last_durable: 1 << 20 }, &mut out);
         assert!(out.is_empty(), "non-member RequestVote must produce nothing");
         assert_eq!(sm.current_term(), 1, "and must not adopt the term");
+    }
+
+    // ---- M7 dynamic membership ----
+
+    /// The tracker rebuild carries existing per-follower reports across an
+    /// adoption boundary (commit ranking never restarts from zero), and the
+    /// newly-added voter gets a dense `CommitTracker` slot from the rebuild.
+    #[test]
+    fn adopt_config_rebuilds_tracker_and_carries_reports() {
+        // 3 voters {1,2,3}; self=1 becomes leader of term 1.
+        let mut s = ElectionSm::new(cfg_members(1, vec![1, 2, 3]), None, &[], 0, 0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 2, term: 1, granted: true }); // majority of 3
+        assert!(matches!(s.role(), Role::Leader));
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        // Majority of 3 is 2: own + node 2's report alone already commits 32.
+        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 32 });
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 32 })),
+            "pre-adoption: quorum on the carried reports commits 32"
+        );
+        step(&mut s, Event::Report { from: 3, term: 1, durable: 32 });
+
+        // Adopt v1: a higher-version config adding voter 5, fed directly as
+        // the append path would (ConfigObserved does not care how the config
+        // was derived, only that its version is higher).
+        let mut new_cfg = s.config().clone();
+        new_cfg.voters.push((5, (5, 5)));
+        new_cfg.version = 1;
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg.clone() });
+        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { position: 40, .. })));
+        assert_eq!(s.config(), &new_cfg);
+        assert_eq!(s.config_position(), 40);
+        assert!(s.follower_slot(5).is_some(), "the new voter must get a tracked slot");
+
+        // Post-adoption: fresh durable + reports from the carried members (2,3)
+        // alone (no report from 5 yet) still reach quorum-of-4.
+        step(&mut s, Event::DurableAdvanced { durable: 64 });
+        step(&mut s, Event::Report { from: 2, term: 1, durable: 64 });
+        let acts = step(&mut s, Event::Report { from: 3, term: 1, durable: 64 });
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 64 })),
+            "commit advances post-adoption via the carried reports for 2 and 3"
+        );
+    }
+
+    /// `propose_config` is refused: by a non-leader (`NotLeader`), by a leader
+    /// that has not yet committed its own `NewTerm` frame (`NotServing` — the
+    /// single-server-change precondition), and while a prior proposal is
+    /// still uncommitted (`ChangePending` — one in flight).
+    #[test]
+    fn propose_refused_unless_serving_and_no_pending() {
+        let mut s = sm(0); // voters [0,1,2], id 0
+        step(&mut s, Event::Tick { now_ns: 301 });
+        assert!(matches!(s.role(), Role::Candidate));
+        assert_eq!(
+            s.propose_config(ConfigOp::AddLearner { id: 5, addr: (5, 5) }, 0),
+            Err(ProposeError::NotLeader)
+        );
+
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+        assert!(!s.can_serve());
+        assert_eq!(
+            s.propose_config(ConfigOp::AddLearner { id: 5, addr: (5, 5) }, 0),
+            Err(ProposeError::NotServing)
+        );
+
+        // Commit the NewTerm frame -> serving.
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        step(&mut s, Event::Tick { now_ns: 310 });
+        assert!(s.can_serve());
+
+        let new_cfg = s.propose_config(ConfigOp::AddLearner { id: 5, addr: (5, 5) }, 0).unwrap();
+        assert_eq!(new_cfg.version, 1);
+
+        // The append path feeds the observed config back; it has not
+        // committed yet (commit_seen stays 32 < config_position 40).
+        step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
+        assert!(s.config_pending());
+        assert_eq!(
+            s.propose_config(ConfigOp::AddLearner { id: 6, addr: (6, 6) }, 0),
+            Err(ProposeError::ChangePending)
+        );
+    }
+
+    /// `PromoteLearner` additionally requires the learner's last carried
+    /// report to be within `slack` of `commit_seen`.
+    #[test]
+    fn promote_requires_caught_up_learner() {
+        let mut s = ElectionSm::new(cfg_with_learners(0, vec![0, 1, 2], vec![5]), None, &[], 0, 0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 100_000 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100_000 });
+        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 100_000 })));
+        assert!(s.can_serve());
+
+        step(&mut s, Event::Report { from: 5, term: 1, durable: 10_000 });
+        assert_eq!(s.last_report(5), Some(10_000));
+        assert!(!s.config_pending());
+
+        assert_eq!(
+            s.propose_config(ConfigOp::PromoteLearner { id: 5 }, 32_768),
+            Err(ProposeError::NotCaughtUp { gap: 57_232 })
+        );
+
+        step(&mut s, Event::Report { from: 5, term: 1, durable: 90_000 });
+        assert!(s.propose_config(ConfigOp::PromoteLearner { id: 5 }, 32_768).is_ok());
+    }
+
+    /// `ConfigObserved` adopts iff `config.version` strictly exceeds the
+    /// current version: re-feeding the same version is a no-op, and a lower
+    /// version arriving after a higher one is ignored (never regresses).
+    #[test]
+    fn config_observed_is_idempotent_and_monotone_by_version() {
+        let mut s = sm(0); // voters [0,1,2], id 0
+        let mut cfg_v1 = s.config().clone();
+        cfg_v1.voters.push((5, (5, 5)));
+        cfg_v1.version = 1;
+
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: cfg_v1.clone() });
+        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        assert_eq!(s.config().version, 1);
+
+        // Re-observation of the SAME version: one adoption total, this is a no-op.
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: cfg_v1.clone() });
+        assert!(acts.is_empty(), "same-version re-observation must be a no-op");
+        assert_eq!(s.config().version, 1);
+
+        // A LOWER version arriving after a higher one is ignored.
+        let mut cfg_v0 = cfg_v1;
+        cfg_v0.version = 0;
+        let acts = step(&mut s, Event::ConfigObserved { position: 999, config: cfg_v0 });
+        assert!(acts.is_empty());
+        assert_eq!(s.config().version, 1, "a stale lower version must not regress adoption");
+    }
+
+    /// A follower not present in a just-adopted config fail-stops.
+    #[test]
+    fn removed_follower_emits_halt() {
+        // 3 voters [1,2,3]; self = 3 (a plain follower, never elected).
+        let mut s = ElectionSm::new(cfg_members(3, vec![1, 2, 3]), None, &[], 0, 0);
+        assert!(matches!(s.role(), Role::Follower));
+        let mut new_cfg = s.config().clone();
+        new_cfg.voters.retain(|(id, _)| *id != 3);
+        new_cfg.tombstones.push(3);
+        new_cfg.version = 1;
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
+        assert!(acts.iter().any(|a| matches!(a, Action::HaltRemoved)));
+    }
+
+    /// After a voter is removed from the adopted config, its `Report` no
+    /// longer moves commit (`follower_slot` drops it) and its `RequestVote`
+    /// is ignored entirely — extending the existing forged-report /
+    /// non-member tests to the dynamic (post-adoption) case.
+    #[test]
+    fn nonmember_vote_and_report_stay_dropped_after_adoption() {
+        let mut s = ElectionSm::new(cfg_members(0, vec![0, 1, 2, 3]), None, &[], 0, 0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(&mut s, Event::Vote { from: 2, term: 1, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+
+        let mut new_cfg = s.config().clone();
+        new_cfg.voters.retain(|(id, _)| *id != 3);
+        new_cfg.tombstones.push(3);
+        new_cfg.version = 1;
+        step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
+        assert!(!s.config().contains(3));
+        assert!(s.follower_slot(3).is_none());
+
+        // The removed voter's Report must not move commit.
+        let acts = step(&mut s, Event::Report { from: 3, term: 1, durable: 1 << 30 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            "a removed voter's Report must not move commit"
+        );
+
+        // The removed voter's RequestVote is ignored entirely: no answer, no
+        // term adoption (mirrors `request_vote_from_non_member_is_ignored`).
+        let before_term = s.current_term();
+        let acts =
+            step(&mut s, Event::RequestVote { from: 3, new_term: before_term + 5, last_term: 1, last_durable: 0 });
+        assert!(acts.is_empty(), "a removed voter's RequestVote must produce nothing");
+        assert_eq!(s.current_term(), before_term, "and must not adopt the term");
     }
 }
