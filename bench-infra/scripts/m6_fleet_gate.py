@@ -99,19 +99,22 @@ class SshHost:
     invocation runs under `sudo`. `systemd-run` already runs the unit as root.
     """
 
-    SSH = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes"]
     CARGO = "/opt/bench/.cargo/bin/cargo"
     UC_SRC = "/opt/bench/uc"
 
-    def __init__(self, gate_bin, node_dir, public_ip, private_ip, ssh_user):
+    def __init__(self, gate_bin, node_dir, public_ip, private_ip, ssh_user, ssh_key):
         self.gate = gate_bin           # path to m6_gate ON the remote host
         self.dir = str(node_dir)       # instance dir ON the remote host
         self.public_ip = public_ip
         self.private_ip = private_ip
         self.target = f"{ssh_user}@{public_ip}"
+        self.ssh = ["ssh", "-o", "StrictHostKeyChecking=accept-new",
+                    "-o", "BatchMode=yes", "-i", ssh_key]
 
     def _ssh(self, cmd, **kw):
-        return subprocess.run(self.SSH + [self.target, cmd], text=True, **kw)
+        # SSH_AUTH_SOCK is left to the caller's env (unset it before running the
+        # orchestrator — a forwarded agent hangs ssh here, bench-infra gotcha).
+        return subprocess.run(self.ssh + [self.target, cmd], text=True, **kw)
 
     def prepare(self):
         """Build the m6_gate example (release builds no examples by default) and
@@ -359,10 +362,10 @@ def build_local_hosts(gate_bin, root):
     return hosts
 
 
-def build_fleet_hosts(gate_bin, ssh_user, hosts_arg):
+def build_fleet_hosts(gate_bin, ssh_user, ssh_key, hosts_arg):
     if hosts_arg:
         # "pub1/priv1,pub2/priv2,..." — 4 entries, voters 0-2 + learner 3.
-        entries = [h.split("/") for h in hosts_arg.split(",")]
+        entries = [tuple(h.split("/")) for h in hosts_arg.split(",")]
     else:
         out = subprocess.check_output(
             ["terraform", "output", "-json", "nodes"],
@@ -374,7 +377,7 @@ def build_fleet_hosts(gate_bin, ssh_user, hosts_arg):
         raise SystemExit(f"need 4 hosts (3 voters + 1 learner), got {len(entries)}")
     hosts = []
     for i, (pub, priv) in enumerate(entries[:4]):
-        hosts.append(SshHost(gate_bin, f"/opt/bench/m6/n{i}", pub, priv, ssh_user))
+        hosts.append(SshHost(gate_bin, f"/opt/bench/m6/n{i}", pub, priv, ssh_user, ssh_key))
     return hosts
 
 
@@ -386,6 +389,7 @@ def main():
     ap.add_argument("--root", default="/home/claude/.cache/m6_fleet", help="local root dir")
     ap.add_argument("--hosts", default="", help="fleet: pub/priv,... (else terraform output)")
     ap.add_argument("--ssh-user", default="ubuntu", help="fleet ssh user")
+    ap.add_argument("--ssh-key", default="/home/claude/.ssh/id_ed25519", help="fleet ssh key")
     ap.add_argument("--cycles", type=int, default=5, help="purge-cycle count")
     args = ap.parse_args()
 
@@ -398,7 +402,7 @@ def main():
         stop_file = str(Path(args.root) / "STOP")
     else:
         gate = args.bin or "/opt/bench/uc/target/release/examples/m6_gate"
-        hosts = build_fleet_hosts(gate, args.ssh_user, args.hosts)
+        hosts = build_fleet_hosts(gate, args.ssh_user, args.ssh_key, args.hosts)
         # Fleet: build the example on each host (release builds no examples) +
         # mkdir the instance-dir parent. The loadclient stop-file lives on the
         # remote leader host and is never created; teardown kills the unit.
