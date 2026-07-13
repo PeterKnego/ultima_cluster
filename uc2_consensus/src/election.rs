@@ -198,6 +198,24 @@ pub struct ElectionSm {
     config: ClusterConfig,
     /// Frame-end position of `config` (the append offset it was observed at).
     config_position: u64,
+    /// The superseded config (M7): exactly ONE level of history, mirroring the
+    /// durable `ConfigRecord { cur, prev }`. One-in-flight (a proposal is
+    /// refused while the previous config frame is uncommitted) plus
+    /// committed-never-truncated make one level sufficient — at most one
+    /// config entry is ever truncation-exposed. Maintained by `adopt_config`;
+    /// consumed by the truncation revert in the `Truncated` arm. At
+    /// construction `prev == config` (genesis / fresh boot has nothing to
+    /// revert to); boot recovery of a real record's prev level goes through
+    /// [`ElectionSm::restore_prev_config`].
+    prev_config: ClusterConfig,
+    /// Frame-end position of `prev_config` (0 at genesis / fiat).
+    prev_position: u64,
+    /// M7 counterfactual hook: revert-on-truncate ON by default. The sim flips
+    /// it to `false` (mirroring `set_wipe_on_no_common_prefix`) to prove the
+    /// revert is load-bearing — with it deleted, a truncation below the config
+    /// frame leaves the SM operating under a config its own log no longer
+    /// carries, and the sim's inv8 goes red.
+    revert_on_truncate: bool,
     /// Derived voting set: `config.voter_ids()`. Kept as private derived
     /// state (rather than recomputed on every access) so the rest of the SM
     /// body — `majority()`, `follower_slot()`, the vote/report membership
@@ -330,6 +348,9 @@ impl ElectionSm {
 
         let mut sm = Self {
             id: cfg.id,
+            prev_config: cfg.config.clone(),
+            prev_position: cfg.config_position,
+            revert_on_truncate: true,
             config: cfg.config,
             config_position: cfg.config_position,
             members: members_ids,
@@ -367,6 +388,24 @@ impl ElectionSm {
     /// `Action::Fatal` fail-stop on the identical divergent world.
     pub fn set_wipe_on_no_common_prefix(&mut self, v: bool) {
         self.wipe_on_no_common_prefix = v;
+    }
+
+    /// M7: toggle the truncation config-revert. Default on (`true`). The sim
+    /// counterfactual (`revert_on_truncate_disabled`) sets it `false` — deleting
+    /// the real guard so inv8 (revert correctness) goes red mechanically — the
+    /// same pattern as [`ElectionSm::set_wipe_on_no_common_prefix`].
+    pub fn set_revert_on_truncate(&mut self, v: bool) {
+        self.revert_on_truncate = v;
+    }
+
+    /// M7 boot-recovery hook: restore the durable `ConfigRecord`'s PREV level.
+    /// `ElectionSm::new` seeds `prev = config` (a fresh boot has nothing to
+    /// revert to); a node recovering a real two-level record calls this right
+    /// after construction so a post-restart truncation below `config_position`
+    /// still reverts to the genuine predecessor instead of no-op'ing.
+    pub fn restore_prev_config(&mut self, prev: ClusterConfig, prev_position: u64) {
+        self.prev_config = prev;
+        self.prev_position = prev_position;
     }
 
     pub fn step(&mut self, ev: Event, out: &mut Vec<Action>) {
@@ -573,6 +612,52 @@ impl ElectionSm {
                     self.term_map = m;
                 }
                 self.truncating_epoch = None;
+                // M7 truncation revert (spec §5): `config_position` is the config
+                // frame's END (the effect point) and truncation is frame-aligned,
+                // so `to < config_position` means the frame itself was removed —
+                // the adopted config no longer has a log entry backing it.
+                // `to == config_position` preserves the frame exactly: no revert.
+                // Scoped to the MATCHING-epoch ack (same latch discipline as the
+                // pending-map adoption above): a stale-epoch ack clamps durable
+                // but never touches config state.
+                if to < self.config_position && self.revert_on_truncate {
+                    if to == 0 {
+                        // WIPE-AND-REJOIN: keep the current config as operational
+                        // truth (config-by-fiat — the same authority argument as
+                        // `adopt_snapshot_lineage`): a wiped node refills from the
+                        // leader's live stream, which re-stamps real positions;
+                        // dropping to a genesis-era config here would shrink the
+                        // voting set the node answers elections under, for no
+                        // safety gain. The record resets to position 0 with
+                        // prev == cur (nothing below a wipe to revert to).
+                        self.config_position = 0;
+                        self.prev_config = self.config.clone();
+                        self.prev_position = 0;
+                    } else {
+                        // Ordinary truncation: revert one level. One-in-flight
+                        // guarantees at most one truncation-exposed config, so
+                        // after the revert the single history level is exhausted:
+                        // prev_* already equal the reverted values (config was
+                        // just set FROM prev_config; positions likewise).
+                        self.config = self.prev_config.clone();
+                        self.config_position = self.prev_position;
+                    }
+                    // Rebuild-at-boundary under the (possibly reverted) config —
+                    // fresh EMPTY tracker: unlike `adopt_config`, carried reports
+                    // are NOT re-fed. They were collected under the just-removed
+                    // config's world-view mid-divergence; post-truncation reports
+                    // re-arrive from live traffic and re-prime the ranking.
+                    self.rebuild_membership(false);
+                    // One adoption/persist path for the node: the agent persists
+                    // the (reverted / position-reset) record and rebuilds exactly
+                    // as it would for a forward adoption.
+                    out.push(Action::ConfigAdopted {
+                        position: self.config_position,
+                        config: self.config.clone(),
+                        prev_position: self.prev_position,
+                        prev: self.prev_config.clone(),
+                    });
+                }
             }
 
             Event::ConfigObserved { position, config } => {
@@ -944,26 +1029,50 @@ impl ElectionSm {
     /// monotonic in the cnc counter — a rebuild can only pause, never regress
     /// it.
     fn adopt_config(&mut self, position: u64, cfg: ClusterConfig, out: &mut Vec<Action>) {
-        let prev = std::mem::replace(&mut self.config, cfg);
-        let prev_position = self.config_position;
+        self.prev_config = std::mem::replace(&mut self.config, cfg);
+        self.prev_position = self.config_position;
         self.config_position = position;
+        self.rebuild_membership(true);
+        out.push(Action::ConfigAdopted {
+            position,
+            config: self.config.clone(),
+            prev_position: self.prev_position,
+            prev: self.prev_config.clone(),
+        });
+        // Self-exclusion: a follower halts now; a leader removing itself keeps
+        // serving until this entry COMMITS (the node executes the step-down —
+        // Task 8), because C_new must be replicated by a leader that still
+        // exists.
+        if !self.config.contains(self.id) && !matches!(self.role, Role::Leader) {
+            out.push(Action::HaltRemoved);
+        }
+    }
+
+    /// Refresh every structure DERIVED from `self.config` (rebuild-at-boundary,
+    /// M7): the voting set, the candidacy switch, a fresh dense-slot
+    /// `CommitTracker`, and the carried-reports prune. Shared by forward
+    /// adoption (`adopt_config`, `carry_reports = true` — commit ranking must
+    /// not restart from zero across the boundary) and the truncation revert
+    /// (`carry_reports = false` — reports collected under the just-removed
+    /// config are stale; live traffic re-primes them).
+    ///
+    /// Sizing subtlety: `follower_slot` skips only `m == self.id`. If self
+    /// is (still) a voter, it occupies no slot and the tracker is sized as
+    /// before: n-1 tracked followers over a cluster of n. If self is NOT a
+    /// voter (a learner, or — Leader case — mid-self-removal, kept
+    /// serving until commit per the self-exclusion rule in `adopt_config`), it
+    /// occupies NO slot to exclude, so ALL n voters get a dense slot
+    /// 0..n — using the old `n - 1` here would both under-track one
+    /// member (permanently reads zero) AND panic in `follower_slot` /
+    /// `CommitTracker::on_durable` once a real report maps to slot `n-1`,
+    /// one past the tracker's `n-1`-sized `reported` vec. `CommitTracker`
+    /// still requires `cluster_size > n_followers` ("the leader is a
+    /// member") — own_durable always occupies that "+1" ranking slot in
+    /// `advance`, self-as-voter or not — so cluster_size is always
+    /// `n_followers + 1`.
+    fn rebuild_membership(&mut self, carry_reports: bool) {
         self.members = self.config.voter_ids();
         self.can_vote = self.config.is_voter(self.id);
-
-        // Sizing subtlety: `follower_slot` skips only `m == self.id`. If self
-        // is (still) a voter, it occupies no slot and the tracker is sized as
-        // before: n-1 tracked followers over a cluster of n. If self is NOT a
-        // voter (a learner, or — Leader case — mid-self-removal, kept
-        // serving until commit per the self-exclusion rule below), it
-        // occupies NO slot to exclude, so ALL n voters get a dense slot
-        // 0..n — using the old `n - 1` here would both under-track one
-        // member (permanently reads zero) AND panic in `follower_slot` /
-        // `CommitTracker::on_durable` once a real report maps to slot `n-1`,
-        // one past the tracker's `n-1`-sized `reported` vec. `CommitTracker`
-        // still requires `cluster_size > n_followers` ("the leader is a
-        // member") — own_durable always occupies that "+1" ranking slot in
-        // `advance`, self-as-voter or not — so cluster_size is always
-        // `n_followers + 1`.
         let n = self.members.len();
         let n_followers = if self.can_vote { n - 1 } else { n };
         self.tracker = CommitTracker::new(n_followers, n_followers + 1);
@@ -973,23 +1082,12 @@ impl ElectionSm {
         // sees it; a truly removed id (voter or learner) is correctly
         // dropped because `self.config.contains` is false for it.
         self.last_reports.retain(|(id, _)| self.config.contains(*id) && *id != self.id);
-        for &(id, durable) in &self.last_reports {
-            if let Some(slot) = self.follower_slot(id) {
-                self.tracker.on_durable(slot, durable);
+        if carry_reports {
+            for &(id, durable) in &self.last_reports {
+                if let Some(slot) = self.follower_slot(id) {
+                    self.tracker.on_durable(slot, durable);
+                }
             }
-        }
-        out.push(Action::ConfigAdopted {
-            position,
-            config: self.config.clone(),
-            prev_position,
-            prev,
-        });
-        // Self-exclusion: a follower halts now; a leader removing itself keeps
-        // serving until this entry COMMITS (the node executes the step-down —
-        // Task 8), because C_new must be replicated by a leader that still
-        // exists.
-        if !self.config.contains(self.id) && !matches!(self.role, Role::Leader) {
-            out.push(Action::HaltRemoved);
         }
     }
 
@@ -2020,5 +2118,158 @@ mod tests {
             step(&mut s, Event::RequestVote { from: 3, new_term: before_term + 5, last_term: 1, last_durable: 0 });
         assert!(acts.is_empty(), "a removed voter's RequestVote must produce nothing");
         assert_eq!(s.current_term(), before_term, "and must not adopt the term");
+    }
+
+    // ---- M7 truncation config-revert (spec §5, pulled forward from Task 6) ----
+
+    /// A learner-adding v1 config adopted at `position`, for the revert tests.
+    fn v1_of(s: &ElectionSm) -> ClusterConfig {
+        let mut v1 = s.config().clone();
+        v1.learners.push((9, addr_of(9)));
+        v1.version = 1;
+        v1
+    }
+
+    /// (a) Ordinary truncation strictly below the config frame's END reverts one
+    /// level — and re-emits `ConfigAdopted` so the node persists + rebuilds
+    /// through the one existing path. The revert waits for the MATCHING-epoch
+    /// ack (same latch discipline as the pending-map adoption).
+    #[test]
+    fn truncation_below_config_frame_reverts_to_prev() {
+        let mut s = sm_with_divergent_map(); // map [(1,0),(2,4096)], durable 6000, term 3
+        let genesis = s.config().clone();
+        let v1 = v1_of(&s);
+        step(&mut s, Event::ConfigObserved { position: 5000, config: v1.clone() });
+        assert_eq!((s.config().version, s.config_position()), (1, 5000));
+        // Divergent-map reconcile → Truncate{to: 4096} — strictly below 5000,
+        // so the config frame is removed by the cut.
+        let acts =
+            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let epoch = extract_truncate_epoch(&acts);
+        assert_eq!(s.config().version, 1, "config untouched until the matching-epoch ack");
+        let acts = step(&mut s, Event::Truncated { epoch, to: 4096 });
+        assert_eq!(s.config(), &genesis, "reverted one level to prev");
+        assert_eq!(s.config_position(), 0);
+        assert!(
+            acts.iter().any(|a| matches!(
+                a,
+                Action::ConfigAdopted { position: 0, config, .. } if config.version == 0
+            )),
+            "the revert re-emits ConfigAdopted (node persists the reverted record)"
+        );
+    }
+
+    /// (b) `to == config_position` exactly preserves the frame (frame-END effect
+    /// point; truncation keeps `[0, to)`) — no revert, no ConfigAdopted.
+    #[test]
+    fn truncation_at_config_frame_end_preserves_the_config() {
+        let mut s = sm_with_divergent_map();
+        let v1 = v1_of(&s);
+        step(&mut s, Event::ConfigObserved { position: 4096, config: v1.clone() });
+        let acts =
+            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let epoch = extract_truncate_epoch(&acts);
+        let acts = step(&mut s, Event::Truncated { epoch, to: 4096 });
+        assert_eq!(s.config(), &v1, "to == config_position: frame preserved, no revert");
+        assert_eq!(s.config_position(), 4096);
+        assert!(!acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+    }
+
+    /// (c) A wipe (`Truncate{to: 0}` from NoCommonPrefix) keeps the OPERATIONAL
+    /// config (config-by-fiat, the `adopt_snapshot_lineage` authority argument)
+    /// and resets the record to position 0 with prev == cur.
+    #[test]
+    fn wipe_keeps_operational_config_and_resets_record_position() {
+        let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 5000, 0);
+        let v1 = v1_of(&s);
+        step(&mut s, Event::ConfigObserved { position: 3000, config: v1.clone() });
+        step(&mut s, Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived { term: 41, entries: vec![(40, 1 << 20), (41, 2 << 20)] },
+        );
+        assert!(acts.iter().any(|a| matches!(a, Action::CountWipe)), "wipe path reached");
+        let epoch = extract_truncate_epoch(&acts);
+        let acts = step(&mut s, Event::Truncated { epoch, to: 0 });
+        assert_eq!(s.config(), &v1, "wipe keeps the operational config (fiat)");
+        assert_eq!(s.config_position(), 0, "record position resets to 0");
+        assert!(
+            acts.iter().any(|a| matches!(
+                a,
+                Action::ConfigAdopted { position: 0, config, prev_position: 0, prev }
+                    if *config == v1 && *prev == v1
+            )),
+            "the fiat reset is persisted through ConfigAdopted"
+        );
+    }
+
+    /// (d) A NON-matching-epoch ack clamps durable (physical truth) but must
+    /// not revert config state — the latch discipline scopes the revert to the
+    /// in-flight truncation's own ack, exactly like the pending-map adoption.
+    #[test]
+    fn wrong_epoch_ack_clamps_durable_but_never_reverts_config() {
+        let mut s = sm_with_divergent_map();
+        let v1 = v1_of(&s);
+        step(&mut s, Event::ConfigObserved { position: 5000, config: v1.clone() });
+        let acts =
+            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let epoch = extract_truncate_epoch(&acts);
+        let acts = step(&mut s, Event::Truncated { epoch: epoch + 7, to: 4096 });
+        assert!(s.is_truncating(), "wrong epoch: latch held");
+        assert!(s.durable() <= 4096, "durable clamps to physical truth");
+        assert_eq!(s.config(), &v1, "config untouched by a wrong-epoch ack");
+        assert_eq!(s.config_position(), 5000);
+        assert!(!acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        // The matching ack then reverts.
+        let acts = step(&mut s, Event::Truncated { epoch, to: 4096 });
+        assert_eq!(s.config().version, 0);
+        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+    }
+
+    /// The counterfactual hook: with `set_revert_on_truncate(false)` the guard is
+    /// deleted — the stale config survives a truncation that removed its frame
+    /// (the exact bug class the sim's inv8 must catch red).
+    #[test]
+    fn revert_disabled_counterfactual_keeps_stale_config() {
+        let mut s = sm_with_divergent_map();
+        s.set_revert_on_truncate(false);
+        let v1 = v1_of(&s);
+        step(&mut s, Event::ConfigObserved { position: 5000, config: v1.clone() });
+        let acts =
+            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let epoch = extract_truncate_epoch(&acts);
+        let acts = step(&mut s, Event::Truncated { epoch, to: 4096 });
+        assert_eq!(s.config(), &v1, "guard deleted: the stale config survives");
+        assert_eq!(s.config_position(), 5000);
+        assert!(!acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+    }
+
+    /// Boot recovery: `restore_prev_config` injects the durable record's PREV
+    /// level (construction seeds prev == cur), so a post-restart truncation
+    /// below `config_position` reverts to the genuine predecessor.
+    #[test]
+    fn restored_prev_level_backs_a_post_restart_revert() {
+        let genesis = genesis_voters(&[0, 1, 2]);
+        let mut v1 = genesis.clone();
+        v1.learners.push((9, addr_of(9)));
+        v1.version = 1;
+        let ecfg = ElectionConfig {
+            id: 1,
+            config: v1.clone(),
+            config_position: 5000,
+            election_timeout_min_ns: 150,
+            election_timeout_max_ns: 300,
+            gossip_floor_ns: u64::MAX,
+            seed: 43,
+        };
+        let mut s = ElectionSm::new(ecfg, None, &[(1, 0), (2, 4096)], 6000, 0);
+        s.restore_prev_config(genesis.clone(), 0);
+        step(&mut s, Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
+        let acts =
+            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let epoch = extract_truncate_epoch(&acts);
+        step(&mut s, Event::Truncated { epoch, to: 4096 });
+        assert_eq!(s.config(), &genesis, "reverted to the RESTORED prev, not the seeded cur");
+        assert_eq!(s.config_position(), 0);
     }
 }
