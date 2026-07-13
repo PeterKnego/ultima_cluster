@@ -19,7 +19,9 @@ elimination proved the residual gap is architecture, not tuning:
 - SyncCore (openraft fork, Model B): well-executed, suite-green, latency-positive in its
   regime — and fleet-throughput NULL. The shape, not the scheduler, is the limit.
 
-`docs/aeron-hot-path-anatomy.md` (3f675f4) is the source-level map of why Aeron wins and
+`docs/aeron-hot-path-anatomy.md` (3f675f4; removed from the tree with the v1 doc
+cleanup — read it via `git show 3f675f4:docs/aeron-hot-path-anatomy.md`) is the
+source-level map of why Aeron wins and
 **the reference document for every v2 design decision** ("port the design, not the code";
 the Aeron Java tree is the tiebreaker). The three moves v2 adopts wholesale:
 
