@@ -1,0 +1,70 @@
+name: nightly
+
+# The full proof suite — everything ci.yml deliberately skips. One job per
+# proof family so a slow capstone doesn't hide a loom/crashtest failure and
+# each gets its own timeout:
+#   * capstones  — the whole workspace test suite INCLUDING uc2_node's WGL
+#                  lincheck capstones (lin_v2: failover + purge/snapshot-churn
+#                  linearizability; lin_partition_v2: partition / quorum-loss)
+#                  plus the uc2_service ultima_db-adapter pass.
+#   * sim-heavy  — uc2_sim's 1000-seed election/truncation fuzz tier.
+#   * loom       — the uc2_log frame-visibility memory model (exhaustive
+#                  interleaving exploration; needs `--cfg loom` + release).
+#   * crashtest  — multi-process SIGKILL-mid-load linearizability
+#                  (uc2-crashtest bins spawned via CARGO_BIN_EXE_*).
+# Runners are small (4 vCPU) vs the dev fleet; the capstones spin multi-node
+# clusters of busy-polling agents, hence the generous timeouts. A red run here
+# with a green ci.yml usually means a timing-sensitive capstone, not a logic
+# regression — reproduce locally before reverting anything.
+
+on:
+  schedule:
+    - cron: '17 3 * * *' # daily 03:17 UTC (offset from ultima_db's weekly jobs)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  capstones:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Full workspace tests (incl. lin_v2 + lin_partition_v2)
+        run: cargo test --workspace
+      - name: Tests (uc2_service + ultima_db adapter)
+        run: cargo test -p uc2_service --features ultima_db
+
+  sim-heavy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Seeded heavy fuzz (1000-seed election/truncation)
+        run: cargo test -p uc2_sim --features sim-heavy
+
+  loom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Frame-visibility loom model
+        run: cargo test -p uc2_log --test loom_frame --release
+        env:
+          RUSTFLAGS: --cfg loom
+
+  crashtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Multi-process SIGKILL linearizability
+        run: cargo test -p uc2-crashtest --features hard-crash-tests

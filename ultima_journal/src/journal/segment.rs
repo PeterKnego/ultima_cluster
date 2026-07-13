@@ -1228,9 +1228,9 @@ mod tests {
         let path = dir.path().join("seg-test.log");
         let mut seg = SegmentFile::create(&path, 1).unwrap();
         let logical_before = seg.size().unwrap();
-        seg.preallocate_to(1 * 1024 * 1024, PreallocFill::ZeroWriteFull, 0).unwrap();
+        seg.preallocate_to(1024 * 1024, PreallocFill::ZeroWriteFull, 0).unwrap();
         assert_eq!(seg.size().unwrap(), logical_before, "logical cursor unchanged");
-        assert_eq!(seg.physical_len().unwrap(), 1 * 1024 * 1024, "physical extended");
+        assert_eq!(seg.physical_len().unwrap(), 1024 * 1024, "physical extended");
     }
 
     #[test]
@@ -1239,7 +1239,7 @@ mod tests {
         let temp = dir.path().join("seg-prealloc.0.tmp");
         let final_path = dir.path().join("seg-00000000000000000007.log");
 
-        SegmentFile::create_prealloc_temp(&temp, 1 * 1024 * 1024, crate::PreallocFill::ZeroWriteFull, 0).unwrap();
+        SegmentFile::create_prealloc_temp(&temp, 1024 * 1024, crate::PreallocFill::ZeroWriteFull, 0).unwrap();
         assert!(temp.exists());
 
         let mut seg = SegmentFile::activate_prealloc_temp(&temp, &final_path, 7).unwrap();
@@ -1247,7 +1247,7 @@ mod tests {
         assert!(final_path.exists());
         assert_eq!(seg.base_seq(), 7);
         assert_eq!(seg.size().unwrap(), SEGMENT_HEADER_SIZE as u64, "logical cursor at header");
-        assert_eq!(seg.physical_len().unwrap(), 1 * 1024 * 1024, "preallocated tail preserved");
+        assert_eq!(seg.physical_len().unwrap(), 1024 * 1024, "preallocated tail preserved");
 
         // The activated segment is a normal append target.
         seg.append_records(&[(7, 0, b"first")]).unwrap();
@@ -1292,12 +1292,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("seg-test.log");
         let mut seg = SegmentFile::create(&path, 1).unwrap();
-        seg.preallocate_to(1 * 1024 * 1024, crate::PreallocFill::ZeroWriteFull, 0).unwrap();
+        seg.preallocate_to(1024 * 1024, crate::PreallocFill::ZeroWriteFull, 0).unwrap();
         seg.append_records(&[(1, 0, b"hello")]).unwrap();
         let after_append = seg.size().unwrap();
         seg.reset_cursor(SEGMENT_HEADER_SIZE as u64);
         assert_eq!(seg.size().unwrap(), SEGMENT_HEADER_SIZE as u64, "cursor reset");
         assert!(after_append > SEGMENT_HEADER_SIZE as u64);
-        assert_eq!(seg.physical_len().unwrap(), 1 * 1024 * 1024, "physical preserved");
+        assert_eq!(seg.physical_len().unwrap(), 1024 * 1024, "physical preserved");
     }
 }
