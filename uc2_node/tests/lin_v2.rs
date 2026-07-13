@@ -320,10 +320,12 @@ fn linearizable_under_purge_and_snapshot_churn() {
 /// interleaved with live reconfiguration, not just reconfiguration in
 /// isolation.
 ///
-/// Same bars as the other capstones: ≥ 80 % `Ok`, `Linearizable`, ≤ 120 s,
-/// across seeds 0x1107 / 7 / 99 (the default + `LIN_SEED`). NON-VACUITY:
-/// `config_ops_committed >= 3` — proof that the reconfig arm didn't just
-/// spin on `NotCaughtUp`/pending no-ops the whole run.
+/// Same bars as the other capstones: ≥ 80 % `Ok`, `Linearizable`, ≤ 120 s
+/// (this capstone's budget is env-tunable via `UC2_LIN_BUDGET_SECS`, default
+/// 120 — see the `budget_secs` local below), across seeds 0x1107 / 7 / 99
+/// (the default + `LIN_SEED`). NON-VACUITY: `config_ops_committed >= 3` —
+/// proof that the reconfig arm didn't just spin on `NotCaughtUp`/pending
+/// no-ops the whole run.
 #[test]
 fn linearizable_under_reconfig_churn() {
     const DEFAULT_SEED: u64 = 0x1107;
@@ -358,7 +360,21 @@ fn linearizable_under_reconfig_churn() {
     // timeout + the spare-voting fault gates below already make safe to
     // sustain.
     const FAULT_PERIOD: Duration = Duration::from_millis(1200);
-    const BUDGET: Duration = Duration::from_secs(115);
+    // Wall-clock budget for this capstone only (the other three capstones
+    // keep their hard-coded 120 s bar). This capstone runs a 4th busy-spin
+    // node (`spare_node: true`) plus widened election timeouts, which can
+    // run tight on a shrunk-vCPU hosted CI runner even though it comfortably
+    // clears 120 s on the dev fleet — env-tunable so CI can widen it
+    // (`UC2_LIN_BUDGET_SECS`, default 120, matching the other capstones'
+    // fixed bar) without touching the correctness bars below.
+    let budget_secs: u64 = std::env::var("UC2_LIN_BUDGET_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120);
+    // Soft cutoff for the scheduler loop, 5 s inside the hard budget below —
+    // preserved from the original fixed 115-vs-120 split so teardown (worker
+    // join + cluster stop) has room before the hard assert fires.
+    let budget = Duration::from_secs(budget_secs.saturating_sub(5));
 
     let ccfg = ClusterCfg { spare_node: true, ..ClusterCfg::default() };
 
@@ -443,7 +459,7 @@ fn linearizable_under_reconfig_churn() {
             }
         }
         faults += 1;
-        if start.elapsed() > BUDGET {
+        if start.elapsed() > budget {
             break;
         }
     }
@@ -476,8 +492,9 @@ fn linearizable_under_reconfig_churn() {
         entries.len()
     );
     assert!(
-        elapsed < Duration::from_secs(120),
-        "reconfig-churn capstone took {elapsed:?} — exceeded the 120 s/seed budget"
+        elapsed < Duration::from_secs(budget_secs),
+        "reconfig-churn capstone took {elapsed:?} — exceeded the {budget_secs} s/seed budget \
+         (override via UC2_LIN_BUDGET_SECS)"
     );
 
     match check_register(&entries) {

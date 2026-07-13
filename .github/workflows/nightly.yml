@@ -32,6 +32,12 @@ jobs:
   capstones:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      # lin_v2's reconfig-churn capstone runs a 4th busy-spin node + widened
+      # election timeouts on top of the other capstones' load; its
+      # env-tunable wall-clock budget (default 120s, see lin_v2.rs) is
+      # widened here so it doesn't blow the wall on this runner's 4 vCPUs.
+      UC2_LIN_BUDGET_SECS: 240
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2

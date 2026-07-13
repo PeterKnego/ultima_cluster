@@ -140,6 +140,10 @@ impl MpscProducer {
             // too little room do we pay the `Acquire` load of the real
             // `consumer_position` and re-check.
             //
+            // Invariant: consumer <= publish <= claim (in real time, on the
+            // shared header). But the LOCAL `claim_pos`/`consumer_pos`
+            // snapshots below can violate that ordering — see next paragraph.
+            //
             // `claim_pos - consumer_pos` uses `saturating_sub`, not plain `-`:
             // under concurrent producers, `claim_pos` (loaded once at the top
             // of this loop iteration) can go stale relative to a freshly
@@ -449,5 +453,74 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(received.len(), total);
+    }
+
+    /// Regression test for the free-space underflow fix (commit 8c1ae01).
+    ///
+    /// `try_write`'s free-space check computes
+    /// `claim_pos.saturating_sub(consumer_pos)`. The real header obeys
+    /// `consumer <= publish <= claim` at all times, but a PRODUCER'S LOCAL
+    /// SNAPSHOT of `claim_pos` (read once at the top of the loop) can go
+    /// stale relative to a freshly (`Acquire`) reloaded `consumer_position`:
+    /// under multi-producer contention another producer can race
+    /// `claim_position`/`publish_position` forward and the consumer can
+    /// drain past THIS producer's now-stale view of it, so for the LOCAL
+    /// variables `claim_pos < consumer_pos` even though the shared header
+    /// never actually violates the invariant. If that subtraction were
+    /// plain `-` instead of `saturating_sub`, it would underflow a `u64`
+    /// and panic in a debug build (`attempt to subtract with overflow`).
+    ///
+    /// Reproducing the exact multi-thread interleaving is timing-dependent
+    /// (see `wrap_under_many_producers_no_torn_read`'s doc-note on that
+    /// class of race). Instead this test drives the SAME production code
+    /// path (`MpscProducer::try_write`) deterministically by writing the
+    /// ring's header atomics directly — `#[cfg(test)]` code in this module
+    /// has field access to `MpscInner`/`MpscProducer` internals via the
+    /// crate-private fields, no accessor needed — to force exactly the
+    /// `claim_pos < consumer_pos` shape the fix guards against, then
+    /// asserts `try_write` does not panic and completes successfully
+    /// (reading the stale-claim state as "fully free", per the fix's
+    /// documented safety argument: the subsequent CAS re-checks against the
+    /// real `claim_position` and simply retries if a snapshot was stale, so
+    /// clamping to 0 here is never itself the overrun-safety mechanism).
+    ///
+    /// Verified to actually discriminate the fix: temporarily reverting
+    /// both `saturating_sub` calls in this free-space computation back to
+    /// plain `-` reproduces `panicked at ... attempt to subtract with
+    /// overflow` on this exact test in a debug build; restoring
+    /// `saturating_sub` makes it pass again. (Manually confirmed while
+    /// authoring this test; not re-verified on every CI run.)
+    #[test]
+    fn free_space_computation_does_not_underflow_on_stale_claim_snapshot() {
+        let tmp = NamedTempFile::new().unwrap();
+        // Small power-of-two ring: a handful of "claimed" bytes forces the
+        // tail-straddle + cache-miss-reload branches deterministically.
+        let ring = MpscRing::create(tmp.path(), 128, 128).expect("create");
+        let (producer, _consumer) = ring.into_split();
+
+        let header = producer.inner.header();
+        // "Claimed up to 120, all of it already published" — an
+        // invariant-respecting state on its own (publish == claim == 120).
+        header.claim_position.store(120, Ordering::Release);
+        header.publish_position.store(120, Ordering::Release);
+        // Force the shape the fix guards against: the (about to be
+        // reloaded) real `consumer_position` sits AHEAD of the claim
+        // snapshot this call will read. This is the deterministic proxy
+        // for "another producer's claim + a fast consumer overtook this
+        // producer's stale view" described above.
+        header.consumer_position.store(200, Ordering::Release);
+        // Force the cache-miss reload path: with the cache at 0, the first
+        // (cache-based) free-space read looks like "ring nearly full"
+        // against `claim_pos = 120`, so `try_write` pays the `Acquire`
+        // reload of the real `consumer_position` (200) above — that
+        // reload's subsequent computation is the one under test.
+        producer.cached_consumer_pos.set(0);
+
+        // Old code (`claim_pos - consumer_pos` with `claim_pos(120) <
+        // consumer_pos(200)`) panics here in debug; the `saturating_sub`
+        // fix must not, and the write must succeed.
+        producer
+            .try_write(1, 0, [0; 8], b"x")
+            .expect("stale-claim snapshot must read as fully-free, not underflow/panic");
     }
 }
