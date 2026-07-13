@@ -23,7 +23,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 
-use uc2_consensus::config::{Addr, ClusterConfig};
+use uc2_consensus::config::{Addr, ClusterConfig, ConfigOp, ProposeError};
 use uc2_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId, Role};
 use uc2_consensus::reconcile::MAX_TERM_MAP_WIRE_ENTRIES;
 
@@ -163,6 +163,22 @@ pub struct SimConfig {
     /// intake-gate reopen guard closes. Only `Mechanism` holds the divergent
     /// durable across this window; the other modes truncate instantly regardless.
     pub truncate_latency_ns: u64,
+    /// M7: node indices that start as LEARNERS in the genesis config (every
+    /// other index is a genesis voter). A learner is replicated-to but never
+    /// counted toward quorum and never a candidate — until promoted.
+    pub initial_learners: Vec<usize>,
+    /// M7 COUNTERFACTUAL (default false): `propose_config` overrides a
+    /// `NotServing` refusal — deleting the single-server-change precondition
+    /// (Ongaro 2015; structurally the M4 serving gate). The crafted
+    /// disjoint-quorum scenario must then trip inv7 — the red pin proving the
+    /// gate is load-bearing.
+    pub serving_gate_disabled: bool,
+    /// M7 COUNTERFACTUAL (default false): delete revert-on-truncate — both the
+    /// SM's revert (`ElectionSm::set_revert_on_truncate(false)`) and the sim's
+    /// node-obligation mirror revert at `Truncate` exec. A truncation that
+    /// removes a config frame then leaves the stale config adopted, and inv8
+    /// must go red.
+    pub revert_on_truncate_disabled: bool,
 }
 
 impl Default for SimConfig {
@@ -184,9 +200,29 @@ impl Default for SimConfig {
             gossip_floor_ns: 100_000_000,         // 100ms — spec §6 idle re-gossip
             data_plane: DataPlane::Gated,
             truncate_latency_ns: 0, // instantaneous archive ack (historical default)
+            initial_learners: Vec::new(),
+            serving_gate_disabled: false,
+            revert_on_truncate_disabled: false,
         }
     }
 }
+
+/// M7: a config frame appended into a leader's modeled stream — the World's
+/// frame LEDGER entry. `end` is the frame-END byte position (the effect point);
+/// `term` is the appending leader's term, which doubles as the frame's content
+/// identity (spec §6): a node holds this frame iff `term_at(map, end - 1) ==
+/// term`, i.e. its lineage at that byte is the appending term's.
+#[derive(Clone, Debug)]
+struct CfgFrame {
+    term: u32,
+    end: u64,
+    config: ClusterConfig,
+}
+
+/// M7: promote-learner catch-up slack (max report gap) used by the sim's
+/// `propose_config`. Generous relative to the archive cadence so a broadcast-fed
+/// learner qualifies within a few retries; small enough to stay a real check.
+const PROMOTE_SLACK: u64 = 64 * FRAME;
 
 /// Wire messages. `from`/`to` node ids equal node indices (members are `0..n`).
 #[derive(Clone, Debug)]
@@ -301,6 +337,21 @@ struct Node {
     /// This is what lets the C-1 counterfactual expose the still-present divergent
     /// durable when the gate reopens early.
     pending_trunc_to: Option<u64>,
+    // ---- M7 config state ----
+    /// Durable-across-crash mirror of the node's `ConfigRecord { cur, prev }`
+    /// (the sim IS the StableValue, like `vote`/`term_map`). Written on every
+    /// `Action::ConfigAdopted`; the node-obligation revert happens at
+    /// `Action::Truncate` EXEC (persist-revert-before-truncate, spec §5) so a
+    /// crash anywhere in the truncation window recovers a record consistent
+    /// with the truncated log. Recovered into the SM at restart.
+    cfg_cur: ClusterConfig,
+    cfg_cur_pos: u64,
+    cfg_prev: ClusterConfig,
+    cfg_prev_pos: u64,
+    /// `Action::HaltRemoved` fired: the node fail-stopped permanently (removed
+    /// from the cluster). Like a crash, but no restart is ever scheduled and
+    /// `restart()` refuses.
+    halted: bool,
 }
 
 /// The simulator. Construct with [`World::new`], drive with [`World::run`] (or
@@ -325,6 +376,18 @@ pub struct World {
     blocked_pairs: HashSet<(usize, usize)>,
     vote_drop_until: u64,
     crash_on_truncate: bool,
+    // ---- M7 config modeling ----
+    /// The config-frame LEDGER: every config frame ever appended by any leader
+    /// (any lineage). Follower observation (adopt-at-durable) and the inv6/inv8
+    /// frontier implication are both recomputed from it.
+    config_frames: Vec<CfgFrame>,
+    /// The genesis config (identical on every node) — the version-0 baseline of
+    /// the frontier implication.
+    genesis_config: ClusterConfig,
+    /// A violation raised inside a scripted call that cannot return it
+    /// (`propose_config` returns `Result<_, ProposeError>`); surfaced by the
+    /// next `step_once`.
+    pending_violation: Option<InvariantViolation>,
     /// When set, a serving leader stops appending NEW frames — modeling a client
     /// that has stopped submitting. The leader still heartbeats its existing tail
     /// and re-gossips commit + term map on the idle floor, so commit PLATEAUS.
@@ -356,10 +419,14 @@ impl World {
         assert!(cfg.election_timeout_min_ns <= cfg.election_timeout_max_ns);
         assert!(cfg.latency_min_ns <= cfg.latency_max_ns);
         let n = cfg.n_nodes;
+        let genesis = Self::genesis_config(&cfg);
         let mut nodes = Vec::with_capacity(n);
         for id in 0..n {
-            let ecfg = Self::election_cfg(&cfg, id);
-            let sm = ElectionSm::new(ecfg, None, &[], 0, 0);
+            let ecfg = Self::election_cfg(&cfg, id, genesis.clone(), 0);
+            let mut sm = ElectionSm::new(ecfg, None, &[], 0, 0);
+            if cfg.revert_on_truncate_disabled {
+                sm.set_revert_on_truncate(false); // counterfactual: guard deleted
+            }
             nodes.push(Node {
                 id: id as NodeId,
                 sm,
@@ -379,6 +446,11 @@ impl World {
                 intake_gate: true, // open until a term is adopted
                 adopted_term: 0,
                 pending_trunc_to: None,
+                cfg_cur: genesis.clone(),
+                cfg_cur_pos: 0,
+                cfg_prev: genesis.clone(),
+                cfg_prev_pos: 0,
+                halted: false,
             });
         }
         let checker = InvariantChecker::new(cfg.seed, n);
@@ -393,6 +465,9 @@ impl World {
             blocked_pairs: HashSet::new(),
             vote_drop_until: 0,
             crash_on_truncate: false,
+            config_frames: Vec::new(),
+            genesis_config: genesis,
+            pending_violation: None,
             quiet: false,
             stat_leaders: 0,
             stat_truncations: 0,
@@ -410,16 +485,35 @@ impl World {
         w
     }
 
-    fn election_cfg(cfg: &SimConfig, node: usize) -> ElectionConfig {
-        // Genesis config: every node a voter, synthetic addr `(node_idx, 1)` — the
-        // sim never opens sockets, so the addr is a dep-free placeholder (M7).
-        let voters: Vec<(NodeId, Addr)> = (0..cfg.n_nodes as NodeId)
-            .map(|id| (id, (id, 1)))
-            .collect();
+    /// The genesis `ClusterConfig` (identical on every node): all indices are
+    /// voters except `initial_learners`; synthetic addrs `(node_idx, 1)` — the
+    /// sim never opens sockets, so the addr is a dep-free placeholder (M7).
+    fn genesis_config(cfg: &SimConfig) -> ClusterConfig {
+        let mut voters: Vec<(NodeId, Addr)> = Vec::new();
+        let mut learners: Vec<(NodeId, Addr)> = Vec::new();
+        for id in 0..cfg.n_nodes {
+            let m = (id as NodeId, (id as u32, 1u16));
+            if cfg.initial_learners.contains(&id) {
+                learners.push(m);
+            } else {
+                voters.push(m);
+            }
+        }
+        ClusterConfig::genesis(voters, learners)
+    }
+
+    /// Build a node's `ElectionConfig` around the given adopted config — the
+    /// genesis config at world construction, the durable mirror at restart.
+    fn election_cfg(
+        cfg: &SimConfig,
+        node: usize,
+        config: ClusterConfig,
+        config_position: u64,
+    ) -> ElectionConfig {
         ElectionConfig {
             id: node as NodeId,
-            config: ClusterConfig::genesis(voters, Vec::new()),
-            config_position: 0,
+            config,
+            config_position,
             election_timeout_min_ns: cfg.election_timeout_min_ns,
             election_timeout_max_ns: cfg.election_timeout_max_ns,
             gossip_floor_ns: cfg.gossip_floor_ns,
@@ -481,6 +575,11 @@ impl World {
     /// Pop and process one event, then run the post-event invariant sweep.
     /// Returns `false` when the queue is empty.
     fn step_once(&mut self) -> Result<bool, InvariantViolation> {
+        // A violation raised inside a scripted call that could not return it
+        // (M7 `propose_config` self-feed) surfaces before anything else runs.
+        if let Some(v) = self.pending_violation.take() {
+            return Err(v);
+        }
         let Some(Reverse(q)) = self.queue.pop() else {
             return Ok(false);
         };
@@ -503,6 +602,28 @@ impl World {
         // can slip through the gap.
         let maps: Vec<Vec<(u32, u64)>> = self.nodes.iter().map(|n| n.term_map.clone()).collect();
         self.checker.check_prefix_consistency(&maps, step)?;
+        // inv6 — config determinism, swept like inv2: every settled node's
+        // adopted config must be backed by its own log (durable frontier, or
+        // the append frontier for the adopt-at-append window). Nodes with a
+        // truncation in flight are exempt — the mid-window state (pruned map
+        // adopted, physical cut pending) is a legitimate transient, and inv8
+        // re-checks the settled state at the ack. Down/halted nodes are frozen.
+        for i in 0..self.cfg.n_nodes {
+            let nd = &self.nodes[i];
+            if !nd.up || nd.truncating {
+                continue;
+            }
+            let adopted = nd.sm.config().clone();
+            let implied_d = self.implied_config_at(i, self.nodes[i].durable).clone();
+            let implied_a = self.implied_config_at(i, self.nodes[i].append).clone();
+            self.checker.check_config_determinism(
+                i as NodeId,
+                &adopted,
+                &implied_d,
+                &implied_a,
+                step,
+            )?;
+        }
         Ok(true)
     }
 
@@ -665,6 +786,10 @@ impl World {
                 self.nodes[node].durable = new_durable;
                 self.record_committed(node);
                 self.feed(node, Event::DurableAdvanced { durable: new_durable }, now, step)?;
+                // M7 adopt-at-durable: the archive frame-scan surfaces config
+                // frames whose END the fresh durable just crossed (and whose
+                // bytes this node genuinely holds).
+                self.observe_config_frames(node, now, step)?;
                 // A follower reports its fresh durable to the current leader —
                 // but only up to `matched` (the frontier confirmed consistent
                 // with this leader). Never report divergent bytes it has fsync'd
@@ -725,14 +850,39 @@ impl World {
     }
 
     fn on_restart(&mut self, node: usize, now: u64) -> Result<(), InvariantViolation> {
-        if self.nodes[node].up {
-            return Ok(()); // already recovered
+        if self.nodes[node].up || self.nodes[node].halted {
+            return Ok(()); // already recovered — or removed for good (M7)
         }
-        let cfg = Self::election_cfg(&self.cfg, node);
+        // M7 boot-revert (the recovery half of the node's revert obligation):
+        // the durable record must never claim a config position ABOVE the
+        // recovered log — a leader that adopted at APPEND and crashed before its
+        // archive covered the frame recovers a log that ends below the record's
+        // position, and boots on the record's prev level instead. Skipped in the
+        // revert-disabled counterfactual (the same deleted guard).
+        if !self.cfg.revert_on_truncate_disabled
+            && self.nodes[node].cfg_cur_pos > self.nodes[node].durable
+        {
+            let nd = &mut self.nodes[node];
+            nd.cfg_cur = nd.cfg_prev.clone();
+            nd.cfg_cur_pos = nd.cfg_prev_pos;
+        }
+        let cfg = Self::election_cfg(
+            &self.cfg,
+            node,
+            self.nodes[node].cfg_cur.clone(),
+            self.nodes[node].cfg_cur_pos,
+        );
         let vote = self.nodes[node].vote;
         let term_map = self.nodes[node].term_map.clone();
         let durable = self.nodes[node].durable;
-        let sm = ElectionSm::new(cfg, vote, &term_map, durable, now);
+        let mut sm = ElectionSm::new(cfg, vote, &term_map, durable, now);
+        // Restore the record's PREV level (construction seeds prev == cur), so a
+        // post-restart truncation below the config frame still reverts to the
+        // genuine predecessor.
+        sm.restore_prev_config(self.nodes[node].cfg_prev.clone(), self.nodes[node].cfg_prev_pos);
+        if self.cfg.revert_on_truncate_disabled {
+            sm.set_revert_on_truncate(false); // counterfactual persists across restarts
+        }
         let nd = &mut self.nodes[node];
         nd.sm = sm;
         nd.up = true;
@@ -787,7 +937,71 @@ impl World {
             // consistent truncation point, pruned map adopted): reopen the gate.
             self.reopen_gate(node, now);
         }
+        // inv8 — revert correctness, pinned at the exact point the truncation
+        // SETTLES (durable clamped, map adopted, config reverted/kept per spec
+        // §5): the adopted config must re-equal the frontier-implied config.
+        // This is the check the `revert_on_truncate_disabled` counterfactual
+        // turns red.
+        let implied = self.implied_config_at(node, self.nodes[node].durable).clone();
+        let adopted = self.nodes[node].sm.config().clone();
+        self.checker.check_revert_correctness(node as NodeId, &adopted, &implied, step)?;
         Ok(())
+    }
+
+    /// M7: feed `Event::ConfigObserved` for every ledger frame whose END is at
+    /// or below the node's durable AND whose bytes the node genuinely holds
+    /// (content identity: the node's lineage at the frame's last byte is the
+    /// appending term — spec §6). This is the sim's archive frame-scan: the
+    /// ONLY follower adoption path (adopt-at-durable), and also what RE-adopts
+    /// a config after a truncation + refill re-crosses a surviving frame. The
+    /// SM's version monotonicity makes re-feeding idempotent; the version
+    /// filter here just avoids feed spam.
+    fn observe_config_frames(
+        &mut self,
+        node: usize,
+        now: u64,
+        step: u64,
+    ) -> Result<(), InvariantViolation> {
+        let durable = self.nodes[node].durable;
+        let cur_version = self.nodes[node].sm.config().version;
+        let mut due: Vec<(u64, ClusterConfig)> = self
+            .config_frames
+            .iter()
+            .filter(|f| {
+                f.end <= durable
+                    && f.end > 0
+                    && term_at(&self.nodes[node].term_map, f.end - 1) == f.term
+                    && f.config.version > cur_version
+            })
+            .map(|f| (f.end, f.config.clone()))
+            .collect();
+        due.sort_by_key(|(end, _)| *end); // ascending: adopt in stream order
+        for (end, config) in due {
+            self.feed(node, Event::ConfigObserved { position: end, config }, now, step)?;
+        }
+        Ok(())
+    }
+
+    /// M7 (inv6/inv8 oracle): the config implied by node `node`'s content at
+    /// byte frontier `upto` — the highest-version ledger frame with `end <=
+    /// upto` whose bytes the node genuinely holds (content identity), else the
+    /// node's position-0 baseline: its own fiat config when the durable record
+    /// sits at position 0 (genesis, a wipe's config-by-fiat, or a revert to
+    /// genesis), the world genesis otherwise.
+    fn implied_config_at(&self, node: usize, upto: u64) -> &ClusterConfig {
+        let nd = &self.nodes[node];
+        let mut best: &ClusterConfig =
+            if nd.cfg_cur_pos == 0 { &nd.cfg_cur } else { &self.genesis_config };
+        for f in &self.config_frames {
+            if f.end <= upto
+                && f.end > 0
+                && term_at(&nd.term_map, f.end - 1) == f.term
+                && f.config.version > best.version
+            {
+                best = &f.config;
+            }
+        }
+        best
     }
 
     /// Reopen a node's intake gate ([`DataPlane::Mechanism`]) and resume
@@ -1025,12 +1239,25 @@ impl World {
                 }
             }
             Action::BecomeLeader { term, base } => {
-                // Invariants 1 + 5 at the instant a term opens. The leader's own
-                // SM map already holds the freshly-opened (term, base); inv5
-                // checks it against the committed lineage (ground truth), so a
-                // divergent peer can't excuse an incomplete leader.
+                // Invariants 1 + 7(chain) + 5 at the instant a term opens. The
+                // leader's own SM map already holds the freshly-opened (term,
+                // base); inv5 checks it against the committed lineage (ground
+                // truth), so a divergent peer can't excuse an incomplete leader.
+                // inv7's chain half checks the winner's (adopted, prev) config
+                // pair against the committed config — the disjoint-quorum
+                // election guard (M7).
                 let leader_map = self.nodes[node].sm.term_map().to_vec();
-                self.checker.on_become_leader(node as NodeId, term, base, &leader_map, step)?;
+                let adopted = self.nodes[node].sm.config().clone();
+                let prev = self.nodes[node].cfg_prev.clone();
+                self.checker.on_become_leader(
+                    node as NodeId,
+                    term,
+                    base,
+                    &leader_map,
+                    &adopted,
+                    &prev,
+                    step,
+                )?;
                 self.stat_leaders += 1;
 
                 // Collapse the volatile tail to the durable base, then append the
@@ -1086,11 +1313,18 @@ impl World {
                 // against every member's REAL (durable, term_map), independent of
                 // the data-plane mode. A phantom commit is caught here and aborts
                 // the run before the global commit high-water can advance.
+                // M7 (inv7): the quorum is ranked over the ADOPTING node's config
+                // VOTERS, and the commit's config must chain off the committed
+                // config — see `InvariantChecker::on_advance_commit`.
                 let durables: Vec<u64> = self.nodes.iter().map(|nd| nd.durable).collect();
                 let maps: Vec<Vec<(u32, u64)>> =
                     self.nodes.iter().map(|nd| nd.term_map.clone()).collect();
                 let term = self.nodes[node].sm.current_term();
                 let is_leader = matches!(self.nodes[node].sm.role(), Role::Leader);
+                let voters = self.nodes[node].sm.config().voter_ids();
+                let adopted = self.nodes[node].sm.config().clone();
+                let prev = self.nodes[node].cfg_prev.clone();
+                let config_position = self.nodes[node].sm.config_position();
                 self.checker.on_advance_commit(
                     node as NodeId,
                     commit,
@@ -1098,6 +1332,10 @@ impl World {
                     is_leader,
                     &durables,
                     &maps,
+                    &voters,
+                    &adopted,
+                    &prev,
+                    config_position,
                     step,
                 )?;
                 self.nodes[node].commit = commit;
@@ -1133,6 +1371,29 @@ impl World {
                 let leader = self.nodes[node].last_leader_map.clone();
                 self.checker.on_truncate(node as NodeId, to, &own_before, &leader, step)?;
                 self.stat_truncations += 1;
+
+                // M7 persist-revert-BEFORE-truncate (spec §5): the NODE's
+                // obligation — the durable ConfigRecord (our mirror) is
+                // reverted at EXEC time, before the physical truncation, so a
+                // crash anywhere in the window recovers a record consistent
+                // with the truncated log. The SM's own state reverts at the
+                // matching-epoch ack, which re-emits `ConfigAdopted` with these
+                // same values (an idempotent mirror re-write). `to == cfg_cur_pos`
+                // preserves the frame — frame-END effect point, no revert.
+                // The counterfactual deletes this half of the guard too.
+                if !self.cfg.revert_on_truncate_disabled && to < self.nodes[node].cfg_cur_pos {
+                    let nd = &mut self.nodes[node];
+                    if to == 0 {
+                        // Wipe: config-by-fiat — keep cur, reset the record to
+                        // position 0 with prev == cur.
+                        nd.cfg_cur_pos = 0;
+                        nd.cfg_prev = nd.cfg_cur.clone();
+                        nd.cfg_prev_pos = 0;
+                    } else {
+                        nd.cfg_cur = nd.cfg_prev.clone();
+                        nd.cfg_cur_pos = nd.cfg_prev_pos;
+                    }
+                }
 
                 let mechanism = matches!(self.cfg.data_plane, DataPlane::Mechanism { .. });
                 let nd = &mut self.nodes[node];
@@ -1188,12 +1449,33 @@ impl World {
                 // `Truncate { to: 0 }` follows in the same batch (handled above).
                 self.stat_wipes += 1;
             }
-            Action::ConfigAdopted { .. } => {
-                // M7 migration stub: config-frame modeling (mirror + revert-on-
-                // truncate + inv6-9) lands in Task 4 Step 2, not this pure migration.
+            Action::ConfigAdopted { position, config, prev_position, prev } => {
+                // inv9 — tombstone permanence, judged on EVERY adoption
+                // (forward, revert, wipe-fiat).
+                self.checker.on_config_adopted(node as NodeId, &config, &prev, step)?;
+                // The sim's durable ConfigRecord mirror (cur + prev): the
+                // node-obligation persist. Survives crash; recovered into the
+                // SM at restart.
+                let nd = &mut self.nodes[node];
+                nd.cfg_cur = config;
+                nd.cfg_cur_pos = position;
+                nd.cfg_prev = prev;
+                nd.cfg_prev_pos = prev_position;
             }
             Action::HaltRemoved => {
-                // M7 migration stub: see `Action::ConfigAdopted` above.
+                // Removed from the cluster: fail-stop, PERMANENTLY — like a
+                // crash, but no restart is ever scheduled and `restart()`
+                // refuses (the `halted` flag). Volatile state is torn down the
+                // same way `do_crash` does it.
+                let nd = &mut self.nodes[node];
+                nd.halted = true;
+                nd.up = false;
+                nd.append = nd.durable;
+                nd.commit = 0;
+                nd.truncating = false;
+                nd.new_term_pos = None;
+                nd.leader_hint = None;
+                nd.matched = 0;
             }
             Action::Fatal { reason } => {
                 // With wipe-and-rejoin ON (default), NoCommonPrefix never reaches
@@ -1384,6 +1666,90 @@ impl World {
     /// M6 Task 8: wipe-and-rejoin count observed so far.
     pub fn wipes(&self) -> u32 {
         self.stat_wipes
+    }
+
+    /// M7: propose a membership change on `node`. The SM enforces every
+    /// precondition (`NotLeader` / `NotServing` / `ChangePending` / the
+    /// structural refusals / promote catch-up with [`PROMOTE_SLACK`]). On
+    /// success the leader appends the config frame — [`FRAME`] bytes occupying
+    /// real positions in its modeled stream, exactly like data — records it in
+    /// the World's frame ledger, and adopts at APPEND (feeding itself
+    /// `ConfigObserved{position: frame_end}`); followers observe when their
+    /// durable crosses the frame end (`observe_config_frames`). Returns the new
+    /// config version.
+    ///
+    /// `serving_gate_disabled` (counterfactual): a `NotServing` refusal is
+    /// OVERRIDDEN — the one-in-flight check and the structural preconditions
+    /// are re-applied by hand (only the gate is deleted; the promote catch-up
+    /// check is skipped too, unused by the pin) and the op goes through,
+    /// modeling a node that ignores the single-server-change precondition.
+    pub fn propose_config(&mut self, node: usize, op: ConfigOp) -> Result<u64, ProposeError> {
+        if !self.nodes[node].up {
+            // A down (or halted-removed) process has no admin path; its SM's
+            // frozen Role::Leader must not accept proposals into a dead stream.
+            return Err(ProposeError::NotLeader);
+        }
+        let new_cfg = match self.nodes[node].sm.propose_config(op, PROMOTE_SLACK) {
+            Ok(c) => c,
+            Err(ProposeError::NotServing) if self.cfg.serving_gate_disabled => {
+                if self.nodes[node].sm.config_pending() {
+                    return Err(ProposeError::ChangePending);
+                }
+                self.nodes[node].sm.config().apply(op)?
+            }
+            Err(e) => return Err(e),
+        };
+        let version = new_cfg.version;
+        let term = self.nodes[node].sm.current_term();
+        let nd = &mut self.nodes[node];
+        nd.append += FRAME;
+        let end = nd.append;
+        self.config_frames.push(CfgFrame { term, end, config: new_cfg.clone() });
+        // Leader adopt-at-append. The self-feed can raise a violation
+        // (inv9 at adoption) that this signature cannot return — park it for
+        // the next step.
+        self.steps += 1;
+        let (now, step) = (self.now, self.steps);
+        if let Err(v) =
+            self.feed(node, Event::ConfigObserved { position: end, config: new_cfg }, now, step)
+        {
+            self.pending_violation = Some(v);
+        }
+        Ok(version)
+    }
+
+    /// M7: a node's adopted config version.
+    pub fn node_config_version(&self, node: usize) -> u64 {
+        self.nodes[node].sm.config().version
+    }
+
+    /// M7: true once `node` fail-stopped on adopting a config that removed it.
+    pub fn halted_removed(&self, node: usize) -> bool {
+        self.nodes[node].halted
+    }
+
+    /// M7: true iff `node` is up, `Role::Leader`, REGARDLESS of the serving
+    /// gate — the gate-off counterfactual must act in the window before the
+    /// NewTerm frame commits, which [`World::current_leader`] deliberately
+    /// hides. Per-node (not a global scan): a stale deposed leader keeps its
+    /// role while isolated, so scripts must be able to exclude a known-stale
+    /// index instead of trusting a lowest-index scan.
+    pub fn node_is_raw_leader(&self, node: usize) -> bool {
+        self.nodes[node].up && matches!(self.nodes[node].sm.role(), Role::Leader)
+    }
+
+    /// M7: true iff `node` is up, `Role::Leader`, AND past the serving gate —
+    /// the per-node form of [`World::current_leader`], for scripts that must
+    /// exclude a known-stale ex-leader (which keeps role + serving while
+    /// isolated and would win a lowest-index scan).
+    pub fn node_is_serving_leader(&self, node: usize) -> bool {
+        let nd = &self.nodes[node];
+        nd.up && matches!(nd.sm.role(), Role::Leader) && nd.sm.can_serve()
+    }
+
+    /// A node's current durable (fsync'd) position.
+    pub fn node_durable(&self, node: usize) -> u64 {
+        self.nodes[node].durable
     }
 
     /// A node's current append (write) position.
