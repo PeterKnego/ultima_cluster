@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use uc_protocol::v2::frame::{self, FrameHeader, FRAME_TYPE_PADDING, HEADER_LEN};
+use uc_protocol::v2::frame::{self, FrameHeader, FRAME_TYPE_CONFIG, FRAME_TYPE_PADDING, HEADER_LEN};
 use ultima_journal::{Durability, Journal, JournalConfig, JournalError};
 
 use crate::buffer::LogBuffer;
@@ -85,6 +85,15 @@ pub struct Archive {
     /// (blocks record the contiguous prefix in order). Drained by
     /// `take_term_observations`.
     term_observations: Vec<(u32, u64)>,
+    /// M7 (spec 2026-07-13): `(frame-END position, payload bytes)` for every
+    /// `FRAME_TYPE_CONFIG` frame durably recorded since the last
+    /// `take_config_observations` call — detected in the SAME header walk as
+    /// `term_observations` (one scan, two outputs). Position-ordered by
+    /// construction. `frame_end = base + off + align_frame_len(h.length)` is
+    /// the effect point matching `ConfigRecord.position` semantics. Reset by
+    /// `truncate_to` exactly like `term_observations`: any observation from a
+    /// dropped tail is stale and must not be re-fed as if still durable.
+    config_observations: Vec<(u64, Vec<u8>)>,
 }
 
 impl Archive {
@@ -122,6 +131,7 @@ impl Archive {
             first_base,
             last_observed_term: 0,
             term_observations: Vec::new(),
+            config_observations: Vec::new(),
         })
     }
 
@@ -277,8 +287,30 @@ impl Archive {
                 self.term_observations.push((h.leadership_term_id, base + off as u64));
                 self.last_observed_term = h.leadership_term_id;
             }
+            // M7: CONFIG frames in the same header walk. `aligned` is already
+            // the frame's end offset within `block` — `base + off + aligned`
+            // is the frame-END stream position (the adoption effect point,
+            // matching `ConfigRecord.position`).
+            if h.frame_type == FRAME_TYPE_CONFIG {
+                let payload_start = off + HEADER_LEN;
+                let payload_end = off + h.length as usize;
+                self.config_observations.push((
+                    base + off as u64 + aligned as u64,
+                    block[payload_start..payload_end].to_vec(),
+                ));
+            }
             off += aligned;
         }
+    }
+
+    /// Drain the CONFIG-frame observations detected since the last call (M7):
+    /// `(frame-END position, payload bytes)`, position-ordered. Fed by the
+    /// consensus agent as `Event::ConfigObserved` — the follower / boot-recovery
+    /// half of config adoption (the leader's own append path feeds itself
+    /// directly at append time; this is how everyone ELSE learns of it once it
+    /// is durable).
+    pub fn take_config_observations(&mut self) -> Vec<(u64, Vec<u8>)> {
+        std::mem::take(&mut self.config_observations)
     }
 
     /// Drain the term transitions detected since the last call (M4). Each entry
@@ -375,6 +407,7 @@ impl Archive {
             self.first_base = base;
             self.last_observed_term = 0;
             self.term_observations.clear();
+            self.config_observations.clear();
             return Ok(());
         }
         if base == pos {
@@ -400,6 +433,7 @@ impl Archive {
         // covering term is the caller's job if it ever needs it.
         self.last_observed_term = 0;
         self.term_observations.clear();
+        self.config_observations.clear();
         Ok(())
     }
 }
@@ -1053,5 +1087,58 @@ mod tests {
         msg[..4].copy_from_slice(&((HEADER_LEN + 64) as u32).to_le_bytes());
         arch.observe_terms(&msg, 0);
         assert_eq!(arch.take_term_observations(), vec![(5, 0)]);
+    }
+
+    // --------------------------------------------------------- M7 config scan
+
+    /// A recorded block containing a CONFIG frame between two MESSAGE frames
+    /// yields exactly `(frame-END position, payload)`; draining empties it.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn config_observations_capture_frame_at_exact_frame_end() {
+        let (b, _c, dir) = setup(1 << 16);
+        let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        a.append(1, 0, &[0u8; 64]).unwrap(); // ordinary MESSAGE frame first (96 B)
+        let end = a.append_config(1, b"cfg-v1").unwrap(); // CONFIG frame next
+        a.append(1, 1, &[0u8; 64]).unwrap(); // MESSAGE frame after it
+        assert!(arch.do_work(&b).unwrap());
+        assert_eq!(arch.take_config_observations(), vec![(end, b"cfg-v1".to_vec())]);
+        // draining consumed them
+        assert!(arch.take_config_observations().is_empty());
+    }
+
+    /// A block with only MESSAGE/PADDING frames (no CONFIG) yields nothing.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn config_observations_empty_for_message_and_padding_only_block() {
+        let (b, _c, dir) = setup(1 << 16);
+        let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        for i in 0..4 {
+            a.append(1, i, &[0u8; 64]).unwrap();
+        }
+        assert!(arch.do_work(&b).unwrap());
+        assert!(arch.take_config_observations().is_empty());
+    }
+
+    /// Truncation resets the config-observation buffer exactly like the term
+    /// cursor: an observation from a dropped tail must never be re-fed as if
+    /// still durable (it would be a stale-but-higher-version `ConfigObserved`
+    /// racing the SM's own truncation-revert adoption).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn truncate_resets_config_observations() {
+        let (b, _c, dir) = setup(1 << 16);
+        let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        a.append(1, 0, &[0u8; 64]).unwrap(); // [0, 96)
+        a.append_config(1, b"cfg-v1").unwrap(); // [96, 160), same (only) block
+        assert!(arch.do_work(&b).unwrap());
+        // Deliberately NOT drained here — the observation is still pending when
+        // the truncation lands, so the reset below is the thing under test
+        // rather than an already-empty buffer.
+        arch.truncate_to(96).unwrap(); // drops the CONFIG frame's bytes (first-block cut)
+        assert!(arch.take_config_observations().is_empty(), "stale observation must not survive truncation");
     }
 }

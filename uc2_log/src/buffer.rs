@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use uc_protocol::v2::frame::{
-    self, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING, FrameHeader, HEADER_LEN,
-    align_frame_len,
+    self, FRAME_TYPE_CONFIG, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING,
+    FrameHeader, HEADER_LEN, align_frame_len,
 };
 
 use crate::cnc::CncPage;
@@ -471,6 +471,75 @@ impl Appender {
         Ok(frame_pos)
     }
 
+    /// Append a `FRAME_TYPE_CONFIG` entry (M7, spec 2026-07-13): payload =
+    /// `v2::config::encode_config` bytes, stamped with `term` — the caller's
+    /// current leadership term, passed explicitly (rather than read off
+    /// `self.leadership_term_id`) so the signature matches the config-append
+    /// contract shared with the sim's model (`uc2_sim::world`), which has no
+    /// live `Appender` to carry it. In practice the caller always passes its
+    /// own current term, so this is not observably different from the
+    /// internal field. Returns the frame-END position — the adoption effect
+    /// point (`ConfigRecord.position` semantics), UNLIKE `append`/
+    /// `append_new_term` which return the frame START. Same wrap/overrun
+    /// discipline as `append`.
+    pub fn append_config(&mut self, term: u32, payload: &[u8]) -> Result<u64, AppendError> {
+        if payload.len() > self.buffer.max_payload {
+            return Err(AppendError::PayloadTooLarge);
+        }
+        let total = HEADER_LEN + payload.len();
+        let aligned = align_frame_len(total) as u64;
+        let b = &self.buffer;
+
+        let off = b.offset(self.pos);
+        let to_end = b.capacity - off as u64;
+        let pad = if aligned > to_end { to_end } else { 0 };
+        let end = self.pos + pad + aligned;
+
+        // The one hard gate: never claim past durable + capacity.
+        if end > self.cached_durable + b.capacity {
+            self.cached_durable = b.cnc.counters().durable.load_acquire();
+            if end > self.cached_durable + b.capacity {
+                return Err(AppendError::WouldOverrun);
+            }
+        }
+
+        let frame_pos = if pad > 0 {
+            self.write_padding(off, pad as u32);
+            self.pos + pad
+        } else {
+            self.pos
+        };
+        let foff = b.offset(frame_pos);
+
+        // SAFETY (all raw writes): within capacity; bytes in [append,
+        // durable+capacity) are writer-owned per the gate; ordering via the
+        // commit word + append counter release stores below.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                b.region.ptr_at(foff + HEADER_LEN),
+                payload.len(),
+            );
+            let hdr = std::slice::from_raw_parts_mut(b.region.ptr_at(foff), HEADER_LEN);
+            frame::write_header_except_length(
+                hdr,
+                &FrameHeader {
+                    length: 0,
+                    frame_type: FRAME_TYPE_CONFIG,
+                    flags: 0,
+                    leadership_term_id: term,
+                    session_id: 0,
+                    correlation_id: 0,
+                },
+            );
+        }
+        b.commit_word(foff).store(total as u32, Ordering::Release);
+
+        self.pos = end;
+        b.cnc.counters().append.store_release(self.pos);
+        Ok(end)
+    }
+
     /// Padding frame: header only; `length` spans to the buffer end.
     fn write_padding(&self, off: usize, pad_len: u32) {
         let b = &self.buffer;
@@ -500,7 +569,8 @@ mod tests {
     use crate::region::Region;
     use std::sync::Arc;
     use uc_protocol::v2::frame::{
-        FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING, HEADER_LEN, read_header,
+        FRAME_TYPE_CONFIG, FRAME_TYPE_MESSAGE, FRAME_TYPE_NEW_TERM, FRAME_TYPE_PADDING, HEADER_LEN,
+        read_header,
     };
 
     const CAP: u64 = 4096;
@@ -563,6 +633,32 @@ mod tests {
         // a data frame after it opens exactly at base + 32
         let dpos = a.append(1, 0, &[0u8; 64]).unwrap();
         assert_eq!(dpos, 32);
+    }
+
+    #[test]
+    fn append_config_records_type_term_and_payload_returns_frame_end() {
+        let (b, c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 7);
+        let payload = b"cfg-bytes-v1";
+        // Stamped with the PASSED term (9), not the appender's own (7) —
+        // pins the explicit-term signature.
+        let end = a.append_config(9, payload).unwrap();
+        // 32 header + 12 payload = 44 -> aligned 64
+        assert_eq!(end, 64, "returns the frame-END position, unlike append/append_new_term");
+        assert_eq!(a.position(), 64);
+        assert_eq!(c.counters().append.load_acquire(), 64);
+
+        let s = b.recordable_slice(0, 1 << 20);
+        assert_eq!(s.len(), 64);
+        let h = read_header(s);
+        assert_eq!(h.length, (HEADER_LEN + payload.len()) as u32);
+        assert_eq!(h.frame_type, FRAME_TYPE_CONFIG);
+        assert_eq!(h.leadership_term_id, 9);
+        assert_eq!(&s[HEADER_LEN..HEADER_LEN + payload.len()], payload);
+
+        // a data frame after it opens exactly at the returned frame-end
+        let dpos = a.append(1, 0, &[0u8; 64]).unwrap();
+        assert_eq!(dpos, 64);
     }
 
     #[test]

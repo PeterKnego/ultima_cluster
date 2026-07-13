@@ -5,19 +5,20 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Instant, SystemTime};
 
+use uc2_consensus::config::{Addr, ClusterConfig};
 use uc2_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId};
 use uc2_log::agent::{AgentRunner, IdleStrategy};
 use uc2_log::archive::{Archive, ArchiveConfig};
 use uc2_log::buffer::{AppendError, Appender, LogBuffer};
 use uc2_log::cnc::{CncMeta, CncPage};
 use uc2_log::counters::LogCounters;
-use uc2_log::state::{NodeState, TermMap, TermMapEntry, VoteRecord};
+use uc2_log::state::{ConfigRecord, NodeState, StoredConfig, StoredMember, TermMap, TermMapEntry, VoteRecord};
 use uc2_net::TermHandle;
 use uc2_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc2_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent};
@@ -29,6 +30,7 @@ use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE,
     NODE_FLAG_LEADER,
 };
+use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
 use uc_protocol::v2::ipc::{
     FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SVC_QUERY, client_from_extra,
     extra_client,
@@ -102,17 +104,29 @@ pub enum PurgePolicy {
     },
 }
 
-/// Static-membership node configuration (M4: no discovery, no reconfiguration).
+/// Static-membership node configuration (M4: no discovery; M7 adds live
+/// reconfiguration on top — see `members`/`learners` below).
 pub struct NodeConfig {
     pub id: NodeId,
     /// Every VOTING member INCLUDING self (if this node is a voter), as
     /// `(id, addr)`. Learners are NOT listed here.
+    ///
+    /// M7: this is the SEED config — authoritative only for a FRESH instance
+    /// directory (no durable `ConfigRecord` yet). Once a node has booted once,
+    /// the durable `ConfigRecord` (`uc2_log::state::NodeState::config_record`)
+    /// plus the `FRAME_TYPE_CONFIG` stream own the cluster's actual membership;
+    /// this field is then ignored (a restart with a stale/edited `members` list
+    /// has no effect). A cluster that never appends a config frame behaves
+    /// exactly as before M7 — the genesis record IS this seed, verbatim.
     pub members: Vec<(NodeId, SocketAddr)>,
     /// M6 Task 7: learner peers, as `(id, addr)`. Default empty. A learner is
     /// replicated-to (fan-out) but never counted (no vote, no quorum slot, no
     /// flow-control window, no read-quorum ack). If this node's OWN id is in
     /// `learners` it boots in learner mode (candidacy disabled). Learner ids must
     /// be disjoint from `members`.
+    ///
+    /// M7: the SEED, exactly like `members` above (same fresh-instance-dir-only
+    /// caveat).
     pub learners: Vec<(NodeId, SocketAddr)>,
     pub bind: SocketAddr,
     /// The node's on-disk instance directory (flock'd; holds cnc page, log
@@ -387,21 +401,46 @@ impl Node {
         // sole owner of the consumer/producer half it drives (Task 7).
         let (rings, ingress_ring, egress_node, query_ring, svc_query) = create_rings(&instance)?;
 
-        // Election SM over the recovered credentials.
-        let members_ids: Vec<NodeId> = cfg.members.iter().map(|(id, _)| *id).collect();
-        // M6 Task 7: a node whose own id is in `learners` boots in learner mode —
-        // replicated-to, never counted. By construction its id is NOT in `members`.
-        let is_learner = cfg.learners.iter().any(|(id, _)| *id == cfg.id);
+        // M7 (spec 2026-07-13): genesis-seed the durable `ConfigRecord` on a
+        // fresh instance dir. `cfg.members`/`cfg.learners` are the SEED —
+        // authoritative only here (see `NodeConfig`'s doc); every subsequent
+        // boot, and every live reconfiguration, is owned by the durable record
+        // + the `FRAME_TYPE_CONFIG` stream from here on. Behavior-preservation:
+        // for a cluster that never appends a config frame, this genesis record
+        // (version 0, `prev == config`) IS the old static wiring — nothing
+        // observably changes.
+        if state.config_record().is_none() {
+            let genesis = StoredConfig {
+                version: 0,
+                voters: cfg.members.iter().map(|(id, a)| stored_member(*id, *a)).collect(),
+                learners: cfg.learners.iter().map(|(id, a)| stored_member(*id, *a)).collect(),
+                tombstones: Vec::new(),
+            };
+            let rec =
+                ConfigRecord { position: 0, config: genesis.clone(), prev_position: 0, prev: genesis };
+            state.store_config_record(&rec).map_err(to_io)?;
+        }
+        let config_rec = state.config_record().expect("seeded immediately above if absent");
+        let config = stored_to_cluster(&config_rec.config);
+        let prev_config = stored_to_cluster(&config_rec.prev);
+
+        // Election SM over the recovered credentials + the recovered config.
+        // M6 Task 7 / M7: a node whose own id is a learner in the ADOPTED
+        // config boots in learner mode — replicated-to, never counted.
+        // `ElectionSm` derives `can_vote` from `config.is_voter(id)` itself now
+        // (M7 migration off the old `members`/`can_vote` `ElectionConfig` fields).
+        let is_learner = config.is_learner(cfg.id);
         assert!(
-            !is_learner || !members_ids.contains(&cfg.id),
+            !is_learner || !config.is_voter(cfg.id),
             "a learner's id must not also be a voting member (id={})",
             cfg.id
         );
         let recovered_vote = state.vote().map(|v| (v.term, v.voted_for));
-        let sm = ElectionSm::new(
+        let mut sm = ElectionSm::new(
             ElectionConfig {
                 id: cfg.id,
-                members: members_ids.clone(),
+                config: config.clone(),
+                config_position: config_rec.position,
                 election_timeout_min_ns: cfg.election_timeout_min_ns,
                 election_timeout_max_ns: cfg.election_timeout_max_ns,
                 // Idle re-gossip floor (spec §6): re-ship commit + term map every
@@ -410,13 +449,16 @@ impl Node {
                 // knob — the value is a protocol constant, not deployment-tuned.
                 gossip_floor_ns: 100_000_000,
                 seed: cfg.seed,
-                can_vote: !is_learner,
             },
             recovered_vote,
             &rederived,
             durable,
             0,
         );
+        // Seed the recovered PREV level (T4/T5): a no-op identity restore at
+        // genesis (`prev == config`, both at position 0) — real content only
+        // when a prior life actually adopted a config.
+        sm.restore_prev_config(prev_config, config_rec.prev_position);
         let boot_term = sm.current_term();
 
         // Shared, consensus-thread-written role snapshots + the term handle.
@@ -428,22 +470,12 @@ impl Node {
         let wipes = Arc::new(AtomicU64::new(0));
         let reports_implausible = Arc::new(AtomicU64::new(0));
 
-        // Peer maps and the follower set. Both voters AND learners go into the
-        // address maps (a leader routes gossip/term-map to learners too, and every
-        // node maps inbound learner datagrams for demux), but only VOTERS are in
-        // `peers` — the set that paces quorum, is solicited for votes, and is
-        // targeted by READ_PROBE.
-        let mut id_to_addr = HashMap::new();
-        let mut addr_to_id = HashMap::new();
-        for (id, addr) in cfg.members.iter().chain(cfg.learners.iter()) {
-            id_to_addr.insert(*id, *addr);
-            addr_to_id.insert(*addr, *id);
-        }
-        let peers: Vec<NodeId> = members_ids.iter().copied().filter(|id| *id != cfg.id).collect();
-        // M6 Task 7: learners this node fans out to (all learners except self, so a
-        // learner never streams to itself).
-        let learner_ids: Vec<NodeId> =
-            cfg.learners.iter().map(|(id, _)| *id).filter(|id| *id != cfg.id).collect();
+        // Peer maps and the follower set, derived from the adopted config —
+        // shared with `Consensus::rebuild_peer_maps` (M7's live-reconfiguration
+        // rebuild) via the free `derive_peer_maps` helper (this call happens
+        // before any `Consensus` exists, so it cannot be a method call yet).
+        let (id_to_addr, addr_to_id, peers, learner_ids, peer_band) =
+            derive_peer_maps(&config, cfg.id);
         let learner_addrs: Vec<SocketAddr> =
             learner_ids.iter().map(|id| id_to_addr[id]).collect();
         // Leader fan-out = voters-minus-self ++ learners-minus-self (streamed
@@ -457,6 +489,11 @@ impl Node {
         let (ctrl_tx, ctrl_rx) = mpsc::sync_channel::<CtrlMsg>(1024);
         let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Vec<u8>>(INGRESS_CAPACITY);
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(1024);
+        // M7: durably-recorded CONFIG-frame observations, `(frame-END position,
+        // payload bytes)` — the archive agent's config scan (`take_config_observations`)
+        // forwards here; the consensus agent decodes + feeds `Event::ConfigObserved`
+        // (do_work step 1c). Same shape/rationale as `obs_tx`/`obs_rx` above.
+        let (cfg_obs_tx, cfg_obs_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(1024);
         // Truncation command channel carries `(epoch, to)`; the ack rides an
         // infallible single slot (one truncation in flight — the SM latch).
         let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
@@ -515,15 +552,10 @@ impl Node {
         }));
 
         // M6 Task 9: the per-peer observability band, cnc-slot order (voters
-        // first, then learners), capped at the fixed slot count. The consensus
-        // agent owns `id_and_role` + `reported_durable`; the sender fills
+        // first, then learners), capped at the fixed slot count — already
+        // derived above (`derive_peer_maps`). The consensus agent owns
+        // `id_and_role` + `reported_durable`; the sender fills
         // `advertised_limit` from its flow-control view (bounded, once per cycle).
-        let peer_band: Vec<(NodeId, u8)> = peers
-            .iter()
-            .map(|id| (*id, CNC_PEER_ROLE_VOTER))
-            .chain(learner_ids.iter().map(|id| (*id, CNC_PEER_ROLE_LEARNER)))
-            .take(CNC_MAX_PEER_SLOTS)
-            .collect();
         let sender_peer_slots: Vec<(SocketAddr, usize)> =
             peer_band.iter().enumerate().map(|(i, (id, _))| (id_to_addr[id], i)).collect();
         sender.set_peer_slots(Arc::clone(&cnc), sender_peer_slots);
@@ -540,7 +572,9 @@ impl Node {
             Arc::clone(&term_handle),
             net_tx,
         );
-        receiver.set_sender_route(ctrl_tx);
+        // Cloned: the consensus agent keeps its own producer half to drive
+        // `CtrlMsg::SetPeers` (M7 config adoption, `Consensus::exec`).
+        receiver.set_sender_route(ctrl_tx.clone());
         receiver.set_intake_gate(Arc::clone(&intake_gate));
         receiver.set_snapshot_intake(snap_dir.clone(), Some(Arc::clone(&incoming_snapshot)));
         receiver.set_prime_generation(Arc::clone(&prime_generation));
@@ -619,6 +653,13 @@ impl Node {
                 let _ = obs_tx.try_send(obs);
                 did = true;
             }
+            // M7: forward durably-recorded CONFIG-frame observations the same
+            // way (position-ordered, one scan already did both in `do_work`
+            // above via `Archive::observe_terms`).
+            for obs in archive.take_config_observations() {
+                let _ = cfg_obs_tx.try_send(obs);
+                did = true;
+            }
             did
         })?;
 
@@ -656,9 +697,11 @@ impl Node {
             peer_band_published: false,
             net_rx,
             obs_rx,
+            cfg_obs_rx,
             ingress_rx,
             trunc_tx,
             trunc_slot,
+            sender_ctrl: ctrl_tx,
             term_handle: Arc::clone(&term_handle),
             leader_flag: Arc::clone(&leader_flag),
             can_serve_flag: Arc::clone(&can_serve_flag),
@@ -680,6 +723,7 @@ impl Node {
             incoming_snapshot: Arc::clone(&incoming_snapshot),
             adopted_incoming: 0,
             last_leader_map: Vec::new(),
+            halt_removed: false,
         };
         let consensus_agent =
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
@@ -907,9 +951,19 @@ struct Consensus {
     peer_band_published: bool,
     net_rx: mpsc::Receiver<NetEvent>,
     obs_rx: mpsc::Receiver<(u32, u64)>,
+    /// M7: durably-recorded CONFIG-frame observations from the archive agent's
+    /// scan, `(frame-END position, payload bytes)` — decoded + fed as
+    /// `Event::ConfigObserved` in `do_work` step 1c.
+    cfg_obs_rx: mpsc::Receiver<(u64, Vec<u8>)>,
     ingress_rx: mpsc::Receiver<Vec<u8>>,
     trunc_tx: mpsc::SyncSender<ArchiveCmd>,
     trunc_slot: TruncationSlot,
+    /// M7: this agent's own producer half of the sender's `CtrlMsg` channel —
+    /// used to send `CtrlMsg::SetPeers` on config adoption (`Action::ConfigAdopted`).
+    /// A clone of the same sender the receiver uses to route NAK/Status/SnapNak/
+    /// SnapDone (`receiver.set_sender_route`); a dropped/full-channel send is
+    /// silently ignored (nothing productive to do about a dead sender thread here).
+    sender_ctrl: mpsc::SyncSender<CtrlMsg>,
     term_handle: TermHandle,
     leader_flag: Arc<AtomicBool>,
     can_serve_flag: Arc<AtomicBool>,
@@ -965,11 +1019,25 @@ struct Consensus {
     /// below-floor joiner's next reconcile finds the common prefix that otherwise
     /// lives hidden inside the snapshot. Empty until the first term-map arrives.
     last_leader_map: Vec<(u32, u64)>,
+    /// M7: latched once this node observes itself removed from the adopted
+    /// config while NOT a leader mid-self-removal (`Action::HaltRemoved`).
+    /// `do_work` checks this FIRST and returns immediately once set — a
+    /// permanent park, never cleared (fail-stop; a removed node's only path
+    /// back in is a fresh join under a new id/config, not un-halting).
+    halt_removed: bool,
 }
 
 impl Consensus {
     /// One consensus duty cycle (binding order, plan §Task 8).
     fn do_work(&mut self) -> bool {
+        // M7: a removed node fail-stops permanently (`Action::HaltRemoved`) —
+        // checked FIRST, before anything else runs. The halting cycle itself
+        // (the one that set the flag) already ran to completion — including
+        // one last `publish_status` that zeroed LEADER/CAN_SERVE — so this
+        // only ever short-circuits a SUBSEQUENT cycle.
+        if self.halt_removed {
+            return false;
+        }
         let mut did = false;
 
         // 1. Drain the NetEvent channel → SM events.
@@ -990,7 +1058,23 @@ impl Consensus {
             did = true;
         }
 
-        // 1c. Drain the truncation ack slot (a later cycle after emitting
+        // 1c. Drain durably-recorded CONFIG-frame observations (M7): decode +
+        // feed `Event::ConfigObserved`. This is the follower / boot-recovery
+        // half of config adoption — the leader's own append path
+        // (`append_config_frame`) feeds itself directly at append time
+        // (adopt-at-append); this is how everyone else learns once the frame
+        // is durable (and how the leader itself re-confirms, harmlessly —
+        // adoption is idempotent by version). A decode failure is fail-stop:
+        // the archive's block is journal-CRC-covered, so a malformed payload
+        // here is a BUG, never something to shrug off.
+        while let Ok((position, payload)) = self.cfg_obs_rx.try_recv() {
+            let wire = decode_config(&payload)
+                .unwrap_or_else(|| panic!("corrupt CONFIG frame at {position}"));
+            self.feed(Event::ConfigObserved { position, config: wire_to_cluster_config(&wire) });
+            did = true;
+        }
+
+        // 1d. Drain the truncation ack slot (a later cycle after emitting
         // `Truncate`). The infallible single slot holds at most one ack.
         if let Some((epoch, to)) = self.trunc_slot.take() {
             self.on_truncated(epoch, to);
@@ -1060,6 +1144,16 @@ impl Consensus {
         // 10. Publish the per-peer observability band + archive floor (M6 Task 9).
         // Bounded: one pass over ≤8 slots per cycle, no per-datagram cnc writes.
         self.publish_peer_band();
+
+        // 11. M7: clear the cnc `config_pending` mirror once commit has crossed
+        // the adopted config's position — the entry is no longer at risk of a
+        // truncation revert. `sm.config_pending()` is the single source of truth
+        // (`config_position > commit_seen`, updated on every commit advance/gossip);
+        // mirrored here rather than re-deriving it from the raw cnc counters.
+        if !self.sm.config_pending() && self.cnc.config_pending() != 0 {
+            self.cnc.store_config_pending(false);
+            did = true;
+        }
         did
     }
 
@@ -1086,6 +1180,27 @@ impl Consensus {
         // against `node_snapshot_floor` is the "purge caught up to snapshot" check.
         let first_base = self.archive_first_base.load(Ordering::Acquire);
         self.cnc.archive_first_base().store_release(first_base);
+    }
+
+    /// M7: rebuild the node's own peer-address maps + observability band from
+    /// a newly-adopted `ClusterConfig` (`Action::ConfigAdopted` — both a
+    /// forward adoption and the SM's own truncation-revert re-adoption).
+    /// Shares `derive_peer_maps` with `Node::start`'s construction-time
+    /// seeding (the identical derivation, genesis or live) — a cluster that
+    /// never reconfigures gets byte-identical maps either way.
+    fn rebuild_peer_maps(&mut self, config: &ClusterConfig) {
+        let (id_to_addr, addr_to_id, peers, learner_ids, peer_band) =
+            derive_peer_maps(config, self.id);
+        self.id_to_addr = id_to_addr;
+        self.addr_to_id = addr_to_id;
+        self.peers = peers;
+        self.learner_ids = learner_ids;
+        self.peer_band = peer_band;
+        // Re-publish `id_and_role` for the (possibly changed) membership next
+        // cycle; prune reported-durable entries for ids no longer in the band.
+        self.peer_band_published = false;
+        let live: Vec<NodeId> = self.peer_band.iter().map(|(id, _)| *id).collect();
+        self.peer_reported.retain(|id, _| live.contains(id));
     }
 
     /// M6 Task 6. When the receiver completes an inbound snapshot transfer it
@@ -1231,15 +1346,21 @@ impl Consensus {
     /// Publish `term`, `flags` (leader/can_serve), and a fresh wall-clock
     /// heartbeat onto the cnc page. `leader_hint` is published event-driven
     /// (see `feed_net` / `exec`), not here.
+    ///
+    /// M7: once `halt_removed`, LEADER/CAN_SERVE are forced OFF regardless of
+    /// `leader_flag`/`sm.can_serve()` — an attaching service/client must never
+    /// mistake a removed, permanently-parked node for a live leader/server.
     fn publish_status(&self) {
         let status = self.cnc.status();
         status.term.store_release(self.sm.current_term() as u64);
         let mut flags = 0u64;
-        if self.leader_flag.load(Ordering::Relaxed) {
-            flags |= NODE_FLAG_LEADER;
-        }
-        if self.sm.can_serve() {
-            flags |= NODE_FLAG_CAN_SERVE;
+        if !self.halt_removed {
+            if self.leader_flag.load(Ordering::Relaxed) {
+                flags |= NODE_FLAG_LEADER;
+            }
+            if self.sm.can_serve() {
+                flags |= NODE_FLAG_CAN_SERVE;
+            }
         }
         status.flags.store_release(flags);
         let now_ns = SystemTime::now()
@@ -1294,6 +1415,33 @@ impl Consensus {
                 true // consumed (dropped) — do not wedge the queue on it
             }
         }
+    }
+
+    /// M7 leader append path: encode `new_cfg` as a `FRAME_TYPE_CONFIG` payload
+    /// superseding the currently-adopted config (`self.sm.config_position()`
+    /// is the wire `prev_position` audit field), append it via the leader
+    /// appender, and adopt-at-append by feeding the event back to ourselves
+    /// immediately — the archive re-observes the same durable frame later
+    /// (`do_work` step 1c), which is a harmless no-op re-adoption (idempotent
+    /// by version). Returns the frame-END position (the new
+    /// `ConfigRecord.position`).
+    ///
+    /// Nothing calls this yet — Task 7's admin propose path
+    /// (`ElectionSm::propose_config` → this) wires it in.
+    #[allow(dead_code)] // wired by Task 7's admin propose path
+    fn append_config_frame(&mut self, new_cfg: &ClusterConfig) -> u64 {
+        let term = self.sm.current_term();
+        let wire = cluster_to_wire(new_cfg, self.sm.config_position());
+        let mut bytes = Vec::new();
+        encode_config(&wire, &mut bytes);
+        let position = self
+            .appender
+            .as_mut()
+            .expect("append_config_frame is leader-only")
+            .append_config(term, &bytes)
+            .expect("config append fail-stop (admission/backpressure is Task 7's concern)");
+        self.feed(Event::ConfigObserved { position, config: new_cfg.clone() });
+        position
     }
 
     /// Drain the client ingress MPSC ring, bounded by `INGRESS_PER_CYCLE`
@@ -1903,6 +2051,59 @@ impl Consensus {
                 // (distinct from an ordinary truncate) for observability + tests.
                 self.wipes.fetch_add(1, Ordering::Relaxed);
             }
+            Action::ConfigAdopted { position, config, prev_position, prev } => {
+                // M7: the SM adopted a higher-version `ClusterConfig` — via the
+                // leader's own append (`append_config_frame`), a follower's
+                // archive-scan observation, boot recovery, OR the SM's own
+                // truncation-revert re-adoption. One exec arm for all of them.
+                //
+                // Persist BEFORE any behavioral change (crash between persist
+                // and rebuild = recovery re-adopts from the record via
+                // `ElectionSm::new` + `restore_prev_config`: safe).
+                let rec = ConfigRecord {
+                    position,
+                    config: cluster_to_stored(&config),
+                    prev_position,
+                    prev: cluster_to_stored(&prev),
+                };
+                self.state.store_config_record(&rec).expect("config persist fail-stop");
+                // Rebuild the net layer: voters-minus-self / learners-minus-self,
+                // DISJOINT sets (`CtrlMsg::SetPeers`'s documented convention —
+                // the sender recombines them for its own fan-out).
+                let followers: Vec<SocketAddr> = config
+                    .voters
+                    .iter()
+                    .filter(|(id, _)| *id != self.id)
+                    .map(|(_, a)| addr_of(*a))
+                    .collect();
+                let learners: Vec<SocketAddr> = config
+                    .learners
+                    .iter()
+                    .filter(|(id, _)| *id != self.id)
+                    .map(|(_, a)| addr_of(*a))
+                    .collect();
+                let _ = self.sender_ctrl.send(CtrlMsg::SetPeers {
+                    followers,
+                    learners,
+                    cluster_size: config.voters.len(),
+                });
+                // Refresh the node's own routing + observability.
+                self.rebuild_peer_maps(&config);
+                self.publish_peer_band();
+                self.cnc.store_config_version(config.version);
+                // Cleared once commit crosses `position` (do_work step 11).
+                self.cnc.store_config_pending(true);
+            }
+            Action::HaltRemoved => {
+                // M7: this node is not a member of the just-adopted config (and
+                // is not a leader mid-self-removal — that case keeps serving
+                // until its own removal commits). Fail-stop: park permanently.
+                // `publish_status` (still to run this SAME cycle, below `exec`
+                // in `do_work`) forces LEADER/CAN_SERVE off once `halt_removed`
+                // is set, so the very next status publish already reflects it.
+                eprintln!("node {}: removed from cluster config — halting", self.id);
+                self.halt_removed = true;
+            }
         }
     }
 
@@ -2016,6 +2217,133 @@ fn create_rings(
     ))
 }
 
+// --------------------------------------------------------- M7 config helpers
+
+/// The wire `Addr` tuple (`uc2_consensus::config::Addr = (ip: u32, port:
+/// u16)`) as a real `SocketAddr` (IPv4-only — `uc2_consensus` stays dep-free,
+/// so this conversion lives here). Inverse of `stored_member`'s ip/port
+/// extraction below.
+fn addr_of((ip, port): Addr) -> SocketAddr {
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip.to_be_bytes()), port))
+}
+
+/// A real `SocketAddr` (IPv4-only) as the wire `Addr` tuple. Used only at
+/// genesis-seed construction (`Node::start`), where `NodeConfig::members`/
+/// `learners` are still plain `(NodeId, SocketAddr)`. Inverse of `addr_of`.
+fn addr_to_pair(a: SocketAddr) -> Addr {
+    match a {
+        SocketAddr::V4(v4) => (u32::from_be_bytes(v4.ip().octets()), v4.port()),
+        SocketAddr::V6(_) => panic!("uc2 is IPv4-only (addr={a})"),
+    }
+}
+
+/// Genesis-seed helper: `(NodeId, SocketAddr)` -> `StoredMember`.
+fn stored_member(id: NodeId, addr: SocketAddr) -> StoredMember {
+    let (ip, port) = addr_to_pair(addr);
+    StoredMember { id, ip, port }
+}
+
+/// `WireConfig` (the decoded `FRAME_TYPE_CONFIG` payload) -> `ClusterConfig`
+/// (the SM's in-memory form). Purely numeric — `WireMember`'s `(ip, port)` IS
+/// the `Addr` shape already, no `SocketAddr` involved.
+fn wire_to_cluster_config(w: &WireConfig) -> ClusterConfig {
+    ClusterConfig {
+        version: w.version,
+        voters: w.voters.iter().map(|m| (m.id, (m.ip, m.port))).collect(),
+        learners: w.learners.iter().map(|m| (m.id, (m.ip, m.port))).collect(),
+        tombstones: w.tombstones.clone(),
+    }
+}
+
+/// `ClusterConfig` -> the `WireConfig` to append as a `FRAME_TYPE_CONFIG`
+/// payload. `prev_position` is an audit-trail field only (the durable
+/// `ConfigRecord` keeps the authoritative prev) — the caller passes the
+/// CURRENTLY-adopted config's position, the entry `c` supersedes.
+fn cluster_to_wire(c: &ClusterConfig, prev_position: u64) -> WireConfig {
+    WireConfig {
+        version: c.version,
+        prev_position,
+        voters: c
+            .voters
+            .iter()
+            .map(|(id, (ip, port))| WireMember { id: *id, ip: *ip, port: *port })
+            .collect(),
+        learners: c
+            .learners
+            .iter()
+            .map(|(id, (ip, port))| WireMember { id: *id, ip: *ip, port: *port })
+            .collect(),
+        tombstones: c.tombstones.clone(),
+    }
+}
+
+/// `StoredConfig` (the durable `ConfigRecord`'s `config`/`prev`) -> `ClusterConfig`.
+fn stored_to_cluster(s: &StoredConfig) -> ClusterConfig {
+    ClusterConfig {
+        version: s.version,
+        voters: s.voters.iter().map(|m| (m.id, (m.ip, m.port))).collect(),
+        learners: s.learners.iter().map(|m| (m.id, (m.ip, m.port))).collect(),
+        tombstones: s.tombstones.clone(),
+    }
+}
+
+/// `ClusterConfig` -> `StoredConfig`, for persisting a `ConfigRecord`.
+fn cluster_to_stored(c: &ClusterConfig) -> StoredConfig {
+    StoredConfig {
+        version: c.version,
+        voters: c
+            .voters
+            .iter()
+            .map(|(id, (ip, port))| StoredMember { id: *id, ip: *ip, port: *port })
+            .collect(),
+        learners: c
+            .learners
+            .iter()
+            .map(|(id, (ip, port))| StoredMember { id: *id, ip: *ip, port: *port })
+            .collect(),
+        tombstones: c.tombstones.clone(),
+    }
+}
+
+/// Derive the peer-address maps + observability band from a `ClusterConfig`
+/// for `id` (voters first, then learners, cnc-slot order, capped at
+/// `CNC_MAX_PEER_SLOTS`). A free function (not a `Consensus` method) because
+/// `Node::start` needs it BEFORE any `Consensus` exists — the `Sender`'s
+/// fan-out is derived from the same maps and must be constructed (and moved
+/// into its own thread) first. `Consensus::rebuild_peer_maps` is a thin
+/// wrapper that calls this and assigns the result to its own fields, so
+/// construction-time seeding and live-reconfiguration rebuild share ONE
+/// derivation (behavior-preservation for a cluster that never reconfigures).
+#[allow(clippy::type_complexity)]
+fn derive_peer_maps(
+    config: &ClusterConfig,
+    id: NodeId,
+) -> (
+    HashMap<NodeId, SocketAddr>,
+    HashMap<SocketAddr, NodeId>,
+    Vec<NodeId>,
+    Vec<NodeId>,
+    Vec<(NodeId, u8)>,
+) {
+    let mut id_to_addr = HashMap::new();
+    let mut addr_to_id = HashMap::new();
+    for (mid, addr) in config.voters.iter().chain(config.learners.iter()) {
+        let sock = addr_of(*addr);
+        id_to_addr.insert(*mid, sock);
+        addr_to_id.insert(sock, *mid);
+    }
+    let peers: Vec<NodeId> = config.voter_ids().into_iter().filter(|i| *i != id).collect();
+    let learner_ids: Vec<NodeId> =
+        config.learners.iter().map(|(lid, _)| *lid).filter(|i| *i != id).collect();
+    let peer_band: Vec<(NodeId, u8)> = peers
+        .iter()
+        .map(|i| (*i, CNC_PEER_ROLE_VOTER))
+        .chain(learner_ids.iter().map(|i| (*i, CNC_PEER_ROLE_LEARNER)))
+        .take(CNC_MAX_PEER_SLOTS)
+        .collect();
+    (id_to_addr, addr_to_id, peers, learner_ids, peer_band)
+}
+
 fn to_pairs(m: &TermMap) -> Vec<(u32, u64)> {
     m.iter().map(|e| (e.term, e.base)).collect()
 }
@@ -2094,6 +2422,7 @@ mod tests {
         // Kept alive: dropping these would disconnect the consensus's endpoints.
         _net_tx: mpsc::SyncSender<NetEvent>,
         _obs_tx: mpsc::SyncSender<(u32, u64)>,
+        _cfg_obs_tx: mpsc::SyncSender<(u64, Vec<u8>)>,
         _ingress_tx: mpsc::SyncSender<Vec<u8>>,
         _trunc_rx: mpsc::Receiver<ArchiveCmd>,
         _dir: tempfile::TempDir,
@@ -2148,25 +2477,7 @@ mod tests {
         let state = NodeState::open(dir.path()).unwrap();
 
         // id=1 in [0,1,2]; own map (1,0),(2,4096) at durable 6016 → boot_term 2.
-        let members = vec![0u32, 1, 2];
-        let sm = ElectionSm::new(
-            ElectionConfig {
-                id: 1,
-                members: members.clone(),
-                election_timeout_min_ns: 150,
-                election_timeout_max_ns: 300,
-                gossip_floor_ns: u64::MAX,
-                seed: 7,
-                can_vote: true,
-            },
-            None,
-            &[(1, 0), (2, 4096)],
-            6016,
-            0,
-        );
-        let boot_term = sm.current_term();
-        assert_eq!(boot_term, 2);
-
+        let members = [0u32, 1, 2];
         let mut id_to_addr = HashMap::new();
         let mut addr_to_id = HashMap::new();
         for (i, id) in members.iter().enumerate() {
@@ -2176,11 +2487,40 @@ mod tests {
         }
         let peers = vec![0u32, 2];
 
+        // M7: genesis config over the same static membership (no reconfiguration
+        // in this harness's tests — pure migration off the old `members`/
+        // `can_vote` `ElectionConfig` fields).
+        let config = ClusterConfig::genesis(
+            members.iter().map(|id| (*id, addr_to_pair(id_to_addr[id]))).collect(),
+            Vec::new(),
+        );
+        let sm = ElectionSm::new(
+            ElectionConfig {
+                id: 1,
+                config,
+                config_position: 0,
+                election_timeout_min_ns: 150,
+                election_timeout_max_ns: 300,
+                gossip_floor_ns: u64::MAX,
+                seed: 7,
+            },
+            None,
+            &[(1, 0), (2, 4096)],
+            6016,
+            0,
+        );
+        let boot_term = sm.current_term();
+        assert_eq!(boot_term, 2);
+
         let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(64);
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(64);
+        let (cfg_obs_tx, cfg_obs_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(64);
         let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Vec<u8>>(64);
         let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
         let trunc_slot = TruncationSlot::default();
+        // Not asserted on by any test in this module — a dropped receiver just
+        // makes `sender_ctrl.send` return an ignored `Err` (`exec`'s `let _ =`).
+        let (sender_ctrl, _sender_ctrl_rx) = mpsc::sync_channel::<CtrlMsg>(64);
 
         let sock = FaultSocket::from_socket(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
         let intake_gate = Arc::new(AtomicBool::new(true));
@@ -2226,9 +2566,11 @@ mod tests {
             peer_band_published: false,
             net_rx,
             obs_rx,
+            cfg_obs_rx,
             ingress_rx,
             trunc_tx,
             trunc_slot,
+            sender_ctrl,
             term_handle: Arc::new(AtomicU32::new(boot_term)),
             leader_flag: Arc::new(AtomicBool::new(false)),
             can_serve_flag: Arc::new(AtomicBool::new(false)),
@@ -2250,12 +2592,14 @@ mod tests {
             incoming_snapshot: Arc::new(AtomicU64::new(0)),
             adopted_incoming: 0,
             last_leader_map: Vec::new(),
+            halt_removed: false,
         };
 
         Harness {
             cons,
             _net_tx: net_tx,
             _obs_tx: obs_tx,
+            _cfg_obs_tx: cfg_obs_tx,
             _ingress_tx: ingress_tx,
             _trunc_rx: trunc_rx,
             _dir: dir,

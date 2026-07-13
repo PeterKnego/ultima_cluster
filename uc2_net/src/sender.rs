@@ -10,7 +10,7 @@
 //! COPIED out via a validated read before the syscall: with no CRC on the
 //! wire, sending live ring memory could transmit silently corrupt bytes.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -71,7 +71,7 @@ const SNAP_SESSION_TIMEOUT_NS: u64 = 30_000_000_000;
 /// routed RAW to it as [`crate::receiver::NetEvent::Report`] and never reaches
 /// the sender's control channel (M4 carry #5 — the sender no longer ranks
 /// commit at all).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum CtrlMsg {
     Nak { from: SocketAddr, position: u64, length: u32 },
     Status { from: SocketAddr, contiguous: u64, window: u32 },
@@ -79,6 +79,14 @@ pub enum CtrlMsg {
     SnapNak { from: SocketAddr, session: u32, offset: u64, length: u32 },
     /// M6 Task 6: the snapshot-session peer signals the file is complete.
     SnapDone { from: SocketAddr, session: u32 },
+    /// M7 (spec 2026-07-13): the consensus agent adopted a new `ClusterConfig`
+    /// (`Action::ConfigAdopted`) — rebuild the fan-out + flow control from it.
+    /// `followers` and `learners` are DISJOINT sets (voters-minus-self,
+    /// learners-minus-self — the same convention `NodeConfig`/`Consensus` use
+    /// elsewhere), not the combined fan-out `Sender::with_learners` takes at
+    /// construction; the handler recombines them for streaming. `cluster_size`
+    /// is the VOTING cluster size (`ClusterConfig::voters.len()`).
+    SetPeers { followers: Vec<SocketAddr>, learners: Vec<SocketAddr>, cluster_size: usize },
 }
 
 /// M6 Task 6: newest durable snapshot artifact the node is willing to ship —
@@ -180,6 +188,15 @@ pub struct Sender {
     /// Datagram assembly (header + run).
     scratch: Vec<u8>,
     naks: VecDeque<(SocketAddr, u64, u32)>,
+    /// M7: the raw `(contiguous, window)` of the most recent `Status` from
+    /// each source address, kept RAW (not the derived `contiguous + window`
+    /// combined limit) so a `SetPeers` rebuild can re-feed `FlowControl::on_status`
+    /// and have it re-classify each address as voter/learner under the NEW
+    /// membership (a promoted learner's last advert becomes a voter limit, and
+    /// vice versa) rather than replaying a stale derived value. An address no
+    /// longer present after rebuild is silently ignored by `on_status` — no
+    /// pruning needed.
+    last_status: HashMap<SocketAddr, (u64, u32)>,
     base: Instant,
     last_heartbeat_ns: u64,
     stats: Arc<SenderStats>,
@@ -274,6 +291,7 @@ impl Sender {
             run: Vec::with_capacity(cfg.mtu),
             scratch: Vec::with_capacity(cfg.mtu),
             naks: VecDeque::new(),
+            last_status: HashMap::new(),
             base: Instant::now(),
             last_heartbeat_ns: 0,
             stats: Arc::new(SenderStats::default()),
@@ -328,6 +346,7 @@ impl Sender {
         while let Ok(m) = self.ctrl.try_recv() {
             match m {
                 CtrlMsg::Status { from, contiguous, window } => {
+                    self.last_status.insert(from, (contiguous, window));
                     self.flow.on_status(from, contiguous, window)
                 }
                 CtrlMsg::Nak { from, position, length } => {
@@ -394,6 +413,26 @@ impl Sender {
                     {
                         self.snap = None;
                     }
+                }
+                CtrlMsg::SetPeers { followers, learners, cluster_size } => {
+                    // Rebuild flow control from the new voting/learner split,
+                    // re-feeding every surviving address's last raw advert so
+                    // ranking does not restart from the bootstrap window (mirrors
+                    // `ElectionSm::rebuild_membership`'s carried-reports rationale).
+                    self.flow =
+                        FlowControl::new(&followers, cluster_size, self.cfg.initial_window, &learners);
+                    for (&addr, &(contiguous, window)) in self.last_status.iter() {
+                        self.flow.on_status(addr, contiguous, window);
+                    }
+                    // Full fan-out = the new voters-minus-self ++ learners-minus-self,
+                    // streamed identically (same shape `with_learners` builds at
+                    // construction).
+                    self.followers = followers.into_iter().chain(learners).collect();
+                    // The peer-observability slot mapping doesn't change here (M6
+                    // Task 9's cnc band is keyed by NodeId, which SetPeers doesn't
+                    // carry) — refresh whatever it already tracks against the new
+                    // flow view immediately rather than waiting out a stale cycle.
+                    self.refresh_peer_obs();
                 }
             }
             did = true;
@@ -490,6 +529,16 @@ impl Sender {
         // the flow-control view. Bounded (≤8 slots, once per cycle); leader-only
         // (this point is past the `!leader_role` return) so a demoted node stops
         // updating. Diagnostics — never gates the stream.
+        self.refresh_peer_obs();
+        did
+    }
+
+    /// M6 Task 9 (extracted M7): fill each tracked peer's `advertised_limit`
+    /// cnc slot from the current `FlowControl` view. Called once per duty cycle
+    /// AND immediately after a `SetPeers` rebuild (M7) so a reconfigured peer's
+    /// slot doesn't wait out a stale cycle. Bounded (≤8 slots); a no-op when
+    /// `set_peer_slots` was never called (non-leader / unit tests).
+    fn refresh_peer_obs(&mut self) {
         if let Some((cnc, slots)) = &self.peer_obs {
             for (addr, idx) in slots {
                 if let Some(limit) = self.flow.advertised_limit(*addr) {
@@ -497,7 +546,6 @@ impl Sender {
                 }
             }
         }
-        did
     }
 
     /// Header + the first `body_bytes` of `self.run` into `self.scratch`.
@@ -971,6 +1019,41 @@ mod tests {
         }
         assert_eq!(b.counters().sent.load_acquire(), 3 * 96);
         assert_eq!(s.stats().datagrams.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    /// M7: `SetPeers` swaps the fan-out + rebuilds `FlowControl` from the new
+    /// membership, re-feeding each surviving address's last raw `Status` so
+    /// the quorum ranking does not restart from the bootstrap window.
+    #[test]
+    fn set_peers_rebuilds_fanout_and_refeeds_last_status() {
+        let b = buffer();
+        let (f1, f2, f3) = (Fake::new(), Fake::new(), Fake::new());
+        let (mut s, tx) = sender_to(&[&f1, &f2], &b); // cluster_size 3: leader + f1 + f2
+
+        // Seed both followers' adverts before the reconfig.
+        tx.send(CtrlMsg::Status { from: f1.addr(), contiguous: 1_000_000, window: 100_000 })
+            .unwrap();
+        tx.send(CtrlMsg::Status { from: f2.addr(), contiguous: 2_000_000, window: 50_000 })
+            .unwrap();
+        s.do_work();
+        // cluster_size 3 -> needed = 1: the higher of the two followers.
+        assert_eq!(s.flow.limit(), 2_050_000);
+
+        // Grow the cluster: add f3 as a third voter (learners stay empty).
+        tx.send(CtrlMsg::SetPeers {
+            followers: vec![f1.addr(), f2.addr(), f3.addr()],
+            learners: vec![],
+            cluster_size: 4,
+        })
+        .unwrap();
+        s.do_work();
+
+        assert_eq!(s.followers.len(), 3, "fan-out grew to the new voter set");
+        assert!(s.followers.contains(&f3.addr()));
+        // needed = 2 now: f1's and f2's re-fed adverts must have survived the
+        // rebuild (f3 has no status yet, so it sits at the bootstrap window
+        // and cannot be the 2nd-highest).
+        assert_eq!(s.flow.limit(), 1_100_000, "f1's re-fed advert, not the bootstrap window");
     }
 
     #[test]
