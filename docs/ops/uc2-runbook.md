@@ -31,10 +31,22 @@ directory (same host, shared memory). Default files:
 | `egress_node.broadcast`           | node→clients | Submit responses broadcast to clients. |
 
 Note: unlike v1, UC v2 does **not** use a `/dev/shm/ultima-{user}-{instance}`
-discovery directory — every IPC file lives directly under the instance dir. Put
-the instance dir on `tmpfs` (e.g. under `/dev/shm`) if you want the rings + cnc
-in RAM; keep `journal/` on a durable disk (it is the only thing that must
-survive a crash).
+discovery directory — every IPC file lives directly under the instance dir.
+
+**Durability requirement — what must sit on a real disk.** `journal/` (the
+replay/purge source of truth), `state/` (the vote + term-map `StableValue`s —
+losing these across a machine restart lets a node re-vote in a term it already
+voted in, i.e. a split-brain hazard, not just data loss), and `snapshots/` must
+all survive a power loss. Only the rings, `cnc2.dat`, and `log.buf` are
+volatile-safe (rebuilt/re-primed on boot). Since `journal/`, `state/`, and
+`snapshots/` all live *under* the instance dir, the simplest safe posture is:
+**put the whole instance dir on a real filesystem, never on tmpfs** — an
+instance dir on RAM makes every fsync a silent no-op and voids all durability
+guarantees while everything appears to work. (Splitting rings-on-tmpfs from
+durables-on-disk requires bind-mounting the durable subdirs; only do this
+deliberately.) The fleet-gate orchestrator (`bench-infra/scripts/m6_fleet_gate.py`)
+enforces this: it `stat -f`s the instance-dir parent on every host — local and
+remote — and refuses to run on `tmpfs`/`ramfs`.
 
 ---
 
