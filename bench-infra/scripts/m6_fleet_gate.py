@@ -91,9 +91,17 @@ class LocalHost:
 
 
 class SshHost:
-    """A node that runs on a remote host; every action goes over ssh + systemd-run."""
+    """A node that runs on a remote host; every action goes over ssh + systemd-run.
+
+    Fleet layout (bench-infra ansible, memory): the UC tree is rsync'd to
+    /opt/bench/uc and built AS ROOT (CARGO_HOME=/opt/bench/.cargo), so the gate
+    binary, instance dirs, and cnc files are all root-owned — every gate
+    invocation runs under `sudo`. `systemd-run` already runs the unit as root.
+    """
 
     SSH = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes"]
+    CARGO = "/opt/bench/.cargo/bin/cargo"
+    UC_SRC = "/opt/bench/uc"
 
     def __init__(self, gate_bin, node_dir, public_ip, private_ip, ssh_user):
         self.gate = gate_bin           # path to m6_gate ON the remote host
@@ -105,17 +113,31 @@ class SshHost:
     def _ssh(self, cmd, **kw):
         return subprocess.run(self.SSH + [self.target, cmd], text=True, **kw)
 
+    def prepare(self):
+        """Build the m6_gate example (release builds no examples by default) and
+        create the instance-dir parent. Idempotent; ~9 s on a warm target."""
+        r = self._ssh(
+            f"sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup "
+            f"{self.CARGO} build --release --example m6_gate "
+            f"--manifest-path {self.UC_SRC}/Cargo.toml -p uc2_node "
+            f"&& sudo mkdir -p /opt/bench/m6 && echo PREPARED",
+            capture_output=True,
+        )
+        if "PREPARED" not in (r.stdout or ""):
+            raise RuntimeError(f"prepare {self.public_ip} failed: {r.stderr or r.stdout}")
+
     def bind_addr(self):
         # Fleet nodes bind their PRIVATE NIC IP (the cross-host route) on a fixed
         # port — one node per host, so no port contention.
         return f"{self.private_ip}:19100"
 
     def start_unit(self, unit, args):
-        # systemd-run --collect so the transient unit is cleaned up on stop; the
-        # gate role parks, so it stays until we stop it. Quote args safely.
+        # systemd-run --collect (transient unit, cleaned up on stop); the gate role
+        # parks, so it stays until we stop it. TimeoutStopSec=1 — parked gate bins
+        # ignore SIGTERM (M5 finding). Args are single-quoted.
         quoted = " ".join(f"'{a}'" for a in args)
         cmd = (
-            f"sudo systemd-run --unit=m6-{unit} --collect "
+            f"sudo systemd-run --unit=m6-{unit} --collect -p TimeoutStopSec=1 "
             f"-p StandardOutput=append:/opt/bench/m6-{unit}.log "
             f"-p StandardError=append:/opt/bench/m6-{unit}.log "
             f"{self.gate} {quoted}"
@@ -125,7 +147,6 @@ class SshHost:
             raise RuntimeError(f"start m6-{unit} on {self.public_ip} failed: {r.stderr}")
 
     def kill_unit(self, unit):
-        # TimeoutStopSec kept short: parked gate bins ignore SIGTERM (M5 finding).
         self._ssh(
             f"sudo systemctl kill --signal=SIGKILL m6-{unit} 2>/dev/null; "
             f"sudo systemctl stop m6-{unit} 2>/dev/null; true",
@@ -138,7 +159,7 @@ class SshHost:
 
     def probe(self):
         r = self._ssh(
-            f"{self.gate} probe --instance-dir {self.dir} --app-id {APP}",
+            f"sudo {self.gate} probe --instance-dir {self.dir} --app-id {APP}",
             capture_output=True,
         )
         if r.returncode != 0:
@@ -376,9 +397,15 @@ def main():
         hosts = build_local_hosts(gate, args.root)
         stop_file = str(Path(args.root) / "STOP")
     else:
-        gate = args.bin or "/opt/bench/m6_gate"
+        gate = args.bin or "/opt/bench/uc/target/release/examples/m6_gate"
         hosts = build_fleet_hosts(gate, args.ssh_user, args.hosts)
+        # Fleet: build the example on each host (release builds no examples) +
+        # mkdir the instance-dir parent. The loadclient stop-file lives on the
+        # remote leader host and is never created; teardown kills the unit.
         stop_file = "/opt/bench/m6_STOP"
+        log("preparing fleet hosts (build m6_gate example + mkdir)...")
+        for h in hosts:
+            h.prepare()
 
     voters, learner = [0, 1, 2], 3
     addr = {i: hosts[i].bind_addr() for i in range(4)}
@@ -402,8 +429,12 @@ def main():
     try:
         ok, verdicts = run_gate(hosts, voters, learner, members, learners, args.cycles, stop_file)
     finally:
-        Path(stop_file).write_text("stop")  # tell loadclient to finish
-        time.sleep(1.0)
+        # Local: signal the loadclient to finish cleanly via its stop-file. Fleet:
+        # the stop-file is on the remote leader (not reachable from here) — the
+        # per-host teardown kills the loadclient unit instead.
+        if args.local:
+            Path(stop_file).write_text("stop")
+            time.sleep(1.0)
         for h in hosts:
             try:
                 h.teardown()
