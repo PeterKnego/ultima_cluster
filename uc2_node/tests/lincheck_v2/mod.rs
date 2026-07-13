@@ -54,6 +54,7 @@ use rand::{Rng, SeedableRng};
 
 use uc2_client::{Client, ClientError};
 use uc2_consensus::election::NodeId;
+use uc2_log::cnc::{AdminReq, AdminResp, CncPage};
 use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig};
 use uc2_service::{ServiceBuilder, ServiceConfig, SnapshotPolicy};
@@ -96,6 +97,12 @@ pub struct ClusterCfg {
     /// `> 0` → services start via `start_with_snapshots` with this cadence; `0` →
     /// plain `start` (no snapshot builder), the M5 default.
     pub snapshot_interval_bytes: u64,
+    /// M7 Task 10: reserve an extra (not-yet-a-member) address for
+    /// [`LinClusterV2::random_config_op`] to cycle a "spare" node through
+    /// add-learner -> promote -> demote -> remove-learner. `false` (the M5/M6
+    /// default) reserves nothing — [`random_config_op`](LinClusterV2::random_config_op)
+    /// panics if called on a cluster that didn't ask for one.
+    pub spare_node: bool,
 }
 
 impl Default for ClusterCfg {
@@ -104,6 +111,7 @@ impl Default for ClusterCfg {
             purge: uc2_node::PurgePolicy::Disabled,
             journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
             snapshot_interval_bytes: 0,
+            spare_node: false,
         }
     }
 }
@@ -116,6 +124,17 @@ fn make_config(
     faults: FaultConfig,
     ccfg: ClusterCfg,
 ) -> NodeConfig {
+    // M7 Task 10: a `spare_node` cluster runs a REAL 4th node (its own full
+    // set of polling agent threads + a service) on top of the base 3 — on a
+    // 4-core box that is real oversubscription (the module doc already
+    // notes the base 3-node case is "well past the core count"), and the
+    // 150-300 ms timeout tuned for 3 nodes was observed to livelock (no
+    // node ever re-elected after the first kill under heavy scheduling
+    // contention with 4 real nodes live). Widen it here — spare-enabled
+    // clusters only, so the other three (already-tuned, already-green)
+    // capstones' timing is byte-for-byte unchanged.
+    let (timeout_min_ns, timeout_max_ns) =
+        if ccfg.spare_node { (900_000_000, 1_600_000_000) } else { (150_000_000, 300_000_000) };
     NodeConfig {
         id,
         members,
@@ -125,8 +144,8 @@ fn make_config(
         buffer_bytes: 1 << 22, // 4 MiB
         max_payload: 256,
         admission_bytes: 256 * 1024,
-        election_timeout_min_ns: 150_000_000,
-        election_timeout_max_ns: 300_000_000,
+        election_timeout_min_ns: timeout_min_ns,
+        election_timeout_max_ns: timeout_max_ns,
         seed: seed_for(id as usize),
         faults,
         purge: ccfg.purge,
@@ -194,12 +213,47 @@ impl NodeSlot {
 
 // --------------------------------------------------------------- the cluster
 
+/// M7 Task 10: the "spare" node's cycle position — a single fresh id at a
+/// time, walking add-learner -> promote -> demote -> remove-learner. Every
+/// step is only attempted once the PREVIOUS admin op has actually committed
+/// (see [`LinClusterV2::random_config_op`]'s `config_pending` gate at the top
+/// of every call) — `status == 0` on the leader's own admin response is only
+/// a LOCAL, optimistic accept (confirmed against `uc2_node/tests/reconfig.rs`'s
+/// `truncation_revert_e2e`: an isolated leader gets `status: 0` from a change
+/// that is later reverted wholesale), so phase never advances off a bare
+/// `status == 0` alone — it advances on the NEXT call finding `config_pending`
+/// cleared, i.e. genuinely committed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SparePhase {
+    /// No cycle in flight; the next call starts a fresh id at `AddLearner`.
+    Idle,
+    Added,
+    Promoted,
+    Demoted,
+}
+
 pub struct LinClusterV2 {
     nodes: Vec<NodeSlot>,
     members: Vec<(NodeId, SocketAddr)>,
     faults: FaultConfig,
     ccfg: ClusterCfg,
     root: PathBuf,
+    /// M7 Task 10 (`ClusterCfg::spare_node`): the reserved address the spare
+    /// cycles through; `None` when the cluster didn't ask for one.
+    spare_addr: Option<SocketAddr>,
+    spare_root: Option<PathBuf>,
+    /// The spare's CURRENTLY live node+service, if a cycle is in flight
+    /// (`spare_phase != Idle`). `NodeSlot::id` here is whatever fresh id the
+    /// current cycle allocated — never the same id twice (tombstone rule).
+    spare: Option<NodeSlot>,
+    spare_phase: SparePhase,
+    /// Monotonic fresh-id allocator for the spare (starts at 100, per the
+    /// brief's tombstone rule — an id, once removed, can NEVER be re-added).
+    next_spare_id: NodeId,
+    /// M7 Task 10 non-vacuity counter: incremented once per admin op that
+    /// actually committed (add/promote/demote/remove each count separately).
+    /// `pub` — the capstone reads it directly (`cluster.config_ops_committed`).
+    pub config_ops_committed: u32,
 }
 
 impl LinClusterV2 {
@@ -233,7 +287,33 @@ impl LinClusterV2 {
             let service = spawn_service(&instance_dir, ccfg.snapshot_interval_bytes);
             nodes.push(NodeSlot { id: i as NodeId, addr, instance_dir, node: Some(node), service: Some(service) });
         }
-        LinClusterV2 { nodes, members, faults, ccfg, root: root.to_owned() }
+        // M7 Task 10: reserve (bind-then-drop, same tolerance as `rebind`
+        // elsewhere in this file) an extra address for the spare, outside the
+        // initial member list — voters learn its address dynamically from the
+        // replicated CONFIG frame when it's later added (see
+        // `uc2_node/tests/reconfig.rs`'s `joining_node_boots_from_stale_seed`),
+        // not from their own boot-time `members`.
+        let (spare_addr, spare_root) = if ccfg.spare_node {
+            let sock = UdpSocket::bind("127.0.0.1:0").expect("bind spare addr");
+            let addr = sock.local_addr().unwrap();
+            drop(sock);
+            (Some(addr), Some(root.join("spare")))
+        } else {
+            (None, None)
+        };
+        LinClusterV2 {
+            nodes,
+            members,
+            faults,
+            ccfg,
+            root: root.to_owned(),
+            spare_addr,
+            spare_root,
+            spare: None,
+            spare_phase: SparePhase::Idle,
+            next_spare_id: 100,
+            config_ops_committed: 0,
+        }
     }
 
     /// The fixed `(node-id → instance-dir)` map workers route over (index i = id
@@ -254,9 +334,34 @@ impl LinClusterV2 {
             .unwrap_or(0)
     }
 
-    /// Index of the current serving leader, or `None` in a transient window.
+    /// Index of the current serving leader, or `None` in a transient window
+    /// (including while the M7 Task 10 spare — a real voting member once
+    /// promoted — is the one serving; it has no `self.nodes` index, so
+    /// callers using the `let Some(li) = self.leader() else { return }`
+    /// idiom already treat that as a harmless no-op).
     pub fn leader(&self) -> Option<usize> {
         (0..self.nodes.len()).find(|&i| self.nodes[i].is_serving_leader())
+    }
+
+    /// M7 Task 10: true iff the spare is live and reports itself the sole
+    /// serving leader. Always `false` when `ClusterCfg::spare_node` was unset
+    /// (`self.spare` stays `None` for every other capstone) — dormant there,
+    /// so the `await_*` waiters below behave IDENTICALLY to before this task
+    /// for every existing capstone.
+    fn spare_is_serving(&self) -> bool {
+        self.spare.as_ref().is_some_and(|s| s.is_serving_leader())
+    }
+
+    /// M7 Task 10: true while the spare is a full VOTER (`SparePhase::Promoted`,
+    /// i.e. after `PromoteLearner` committed and before `DemoteVoter` does) —
+    /// a real quorum member `partition_minority`'s `cut()` plumbing (scoped to
+    /// `self.nodes`, the original `n`) does not know how to isolate. The
+    /// reconfig-churn capstone's fault scheduler skips the partition arm
+    /// during this (usually short) window rather than teaching every
+    /// partition helper to reason about a DYNAMICALLY-joining/leaving 4th
+    /// quorum member — always `false` when `ClusterCfg::spare_node` is unset.
+    pub fn spare_is_voting(&self) -> bool {
+        self.spare_phase == SparePhase::Promoted
     }
 
     /// A fresh client attached to node `node`'s shmem directory (the real
@@ -278,6 +383,17 @@ impl LinClusterV2 {
             assert!(serving.len() <= 1, "split-brain: nodes {serving:?} all serve");
             if serving.len() == 1 {
                 return serving[0];
+            }
+            // M7 Task 10: a live, PROMOTED spare is a real voting member and
+            // can legitimately win an election when none of the original `n`
+            // nodes currently serves. `spare_is_serving()` is always `false`
+            // for every other capstone (dormant `self.spare`), so this branch
+            // never fires there. `self.nodes.len()` is an out-of-range
+            // sentinel index — every call site that uses the return value
+            // downstream (e.g. `partition_minority`'s `i != li` follower
+            // pick) only compares it, never indexes `self.nodes` with it.
+            if serving.is_empty() && self.spare_is_serving() {
+                return self.nodes.len();
             }
             assert!(Instant::now() < deadline, "no single serving leader within {secs}s");
             std::thread::yield_now();
@@ -301,6 +417,11 @@ impl LinClusterV2 {
             if serving.len() == 1 {
                 return serving[0];
             }
+            // M7 Task 10: see `await_single_serving`'s doc — a live promoted
+            // spare can be the sole server; dormant for every other capstone.
+            if serving.is_empty() && self.spare_is_serving() {
+                return self.nodes.len();
+            }
             assert!(Instant::now() < deadline, "cluster did not reconverge to one leader within {secs}s");
             std::thread::yield_now();
         }
@@ -317,6 +438,11 @@ impl LinClusterV2 {
             assert!(serving.len() <= 1, "split-brain among survivors: {serving:?}");
             if serving.len() == 1 {
                 return serving[0];
+            }
+            // M7 Task 10: see `await_single_serving`'s doc — a live promoted
+            // spare can be the sole server; dormant for every other capstone.
+            if serving.is_empty() && self.spare_is_serving() {
+                return self.nodes.len();
             }
             assert!(Instant::now() < deadline, "no survivor leader within {secs}s");
             std::thread::yield_now();
@@ -479,8 +605,17 @@ impl LinClusterV2 {
         out
     }
 
-    /// Node-first-then-service teardown for every slot (module docs).
+    /// Node-first-then-service teardown for every slot (module docs), plus
+    /// the spare (M7 Task 10) if a cycle was left in flight.
     pub fn stop(mut self) {
+        if let Some(mut spare) = self.spare.take() {
+            if let Some(node) = spare.node.take() {
+                node.stop();
+            }
+            if let Some(service) = spare.service.take() {
+                service.stop();
+            }
+        }
         for s in &mut self.nodes {
             if let Some(node) = s.node.take() {
                 node.stop();
@@ -489,6 +624,210 @@ impl LinClusterV2 {
                 service.stop();
             }
         }
+    }
+
+    // -------------------------------------------------- M7 Task 10: reconfig
+
+    /// Open `dir`'s cnc page directly — the `uc2ctl` attach path minus the
+    /// bin (mirrors `uc2_node/tests/reconfig.rs`'s `open_cnc`).
+    fn open_cnc(dir: &Path) -> Arc<CncPage> {
+        CncPage::open_file(&dir.join("cnc2.dat"), APP).expect("open cnc")
+    }
+
+    /// Write an admin request into `cnc`'s admin slot and poll for its
+    /// response (mirrors `reconfig.rs`'s `admin_request`). A timeout here
+    /// means the targeted node never answered at all (e.g. it's mid-restart
+    /// with no forwarding partner) — a real harness/timing bug worth failing
+    /// loudly on, unlike the per-status handling in `random_config_op` below.
+    fn admin_request(cnc: &CncPage, op: u32, id: u32, ip: u32, port: u16, secs: u64) -> AdminResp {
+        let old_seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0);
+        let seq = old_seq + 1;
+        let nonce = rand::random::<u64>();
+        cnc.write_admin_req(&AdminReq { seq, nonce, op, id, ip, port });
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(resp) = cnc.read_admin_resp(seq) {
+                return resp;
+            }
+            assert!(Instant::now() < deadline, "admin response timed out for seq {seq}");
+            std::thread::yield_now();
+        }
+    }
+
+    fn addr_to_wire(addr: SocketAddr) -> (u32, u16) {
+        match addr {
+            SocketAddr::V4(a) => (u32::from(*a.ip()), a.port()),
+            SocketAddr::V6(_) => panic!("this harness only binds IPv4 loopback"),
+        }
+    }
+
+    /// M7 Task 10: drive the spare's cycle one step at a time —
+    /// add-learner -> promote -> demote -> remove-learner — allocating a
+    /// FRESH id (monotonic from 100) at the start of every cycle (the
+    /// tombstone rule: a removed id can never rejoin, see `uc2_consensus`'s
+    /// `ClusterConfig::apply`). Returns whether THIS call committed an admin
+    /// op; `false` is a legitimate no-op (a change is already pending, a
+    /// learner isn't caught up yet, a transient `Retry`/`ChangePending`, or
+    /// the jitter skip below) — the natural pacing that keeps this arm from
+    /// swamping the fault scheduler. Never blocks longer than one admin
+    /// round-trip (bounded, see `admin_request`).
+    ///
+    /// Panics if `ClusterCfg::spare_node` wasn't set — calling this on a
+    /// cluster with nowhere to put the spare is a harness bug, not a runtime
+    /// condition to tolerate.
+    pub fn random_config_op(&mut self, rng: &mut StdRng) -> bool {
+        let spare_addr = self.spare_addr.expect("random_config_op requires ClusterCfg::spare_node");
+        let spare_root = self.spare_root.clone().unwrap();
+
+        // Light jitter: don't fire on every eligible tick, spreading this
+        // arm's admin round-trips out a bit even when nothing else gates it.
+        if rng.random_bool(0.2) {
+            return false;
+        }
+
+        // The current leader is USUALLY one of the original `n` nodes, but
+        // once the spare is promoted (`SparePhase::Promoted`) it is a real
+        // voter and can legitimately WIN an election itself — `self.leader()`
+        // only scans `self.nodes`, so fall back to the spare's own cnc when
+        // IT is the one reporting itself the sole server (mirrors
+        // `spare_is_serving`'s doc: this is a live cluster doing its job, not
+        // a stall).
+        let leader_dir = match self.leader() {
+            Some(li) => self.nodes[li].instance_dir.clone(),
+            None if self.spare_is_serving() => {
+                self.spare.as_ref().expect("spare_is_serving implies a live spare").instance_dir.clone()
+            }
+            None => return false,
+        };
+        let leader_cnc = Self::open_cnc(&leader_dir);
+
+        // The brief's core discipline: never start a new step while the
+        // previous one hasn't genuinely committed yet (a bare `status == 0`
+        // is only a local/optimistic accept — see `SparePhase`'s doc).
+        if leader_cnc.config_pending() != 0 {
+            return false;
+        }
+
+        match self.spare_phase {
+            SparePhase::Idle => {
+                let id = self.next_spare_id;
+                self.next_spare_id += 1;
+                let dir = spare_root.join(format!("id{id}"));
+                std::fs::create_dir_all(&dir).expect("spare instance dir");
+                let cfg =
+                    make_config(id, self.members.clone(), dir.clone(), spare_addr, self.faults, self.ccfg);
+                let sock = rebind(spare_addr);
+                let node = Node::start_with_socket(cfg, sock).expect("spare node start");
+                let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
+                self.spare =
+                    Some(NodeSlot { id, addr: spare_addr, instance_dir: dir, node: Some(node), service: Some(service) });
+                let (ip, port) = Self::addr_to_wire(spare_addr);
+                let resp = Self::admin_request(&leader_cnc, 1 /* AddLearner */, id, ip, port, 10);
+                if resp.status == 0 {
+                    self.spare_phase = SparePhase::Added;
+                    self.config_ops_committed += 1;
+                    true
+                } else {
+                    // Transient (Retry/ChangePending) or a genuine structural
+                    // refusal racing a concurrent fault — abandon this id
+                    // (fresh-forever anyway) and let the next call try again.
+                    eprintln!("[random_config_op] add-learner {id} not accepted: {resp:?} — retrying later");
+                    if let Some(mut slot) = self.spare.take() {
+                        if let Some(n) = slot.node.take() {
+                            n.stop();
+                        }
+                        if let Some(s) = slot.service.take() {
+                            s.stop();
+                        }
+                    }
+                    false
+                }
+            }
+            SparePhase::Added => {
+                let id = self.spare.as_ref().expect("spare live while Added").id;
+                let resp = Self::admin_request(&leader_cnc, 2 /* PromoteLearner */, id, 0, 0, 10);
+                match resp.status {
+                    0 => {
+                        self.spare_phase = SparePhase::Promoted;
+                        self.config_ops_committed += 1;
+                        true
+                    }
+                    // NotCaughtUp (10) / ChangePending (3) / Retry (status 2):
+                    // natural, retry on a later call once caught up / settled.
+                    1 if matches!(resp.reason, 3 | 10) => false,
+                    2 => false,
+                    _ => {
+                        eprintln!("[random_config_op] promote {id} unexpected refusal: {resp:?} — abandoning cycle");
+                        self.abandon_spare();
+                        false
+                    }
+                }
+            }
+            SparePhase::Promoted => {
+                let id = self.spare.as_ref().expect("spare live while Promoted").id;
+                let resp = Self::admin_request(&leader_cnc, 3 /* DemoteVoter */, id, 0, 0, 10);
+                match resp.status {
+                    0 => {
+                        self.spare_phase = SparePhase::Demoted;
+                        self.config_ops_committed += 1;
+                        true
+                    }
+                    1 if resp.reason == 3 => false,
+                    2 => false,
+                    _ => {
+                        eprintln!("[random_config_op] demote {id} unexpected refusal: {resp:?} — abandoning cycle");
+                        self.abandon_spare();
+                        false
+                    }
+                }
+            }
+            SparePhase::Demoted => {
+                let id = self.spare.as_ref().expect("spare live while Demoted").id;
+                let resp = Self::admin_request(&leader_cnc, 4 /* RemoveLearner */, id, 0, 0, 10);
+                match resp.status {
+                    0 => {
+                        // Tombstoned now (forever) — no reason to keep the
+                        // process up; tear it down and free the address/dir
+                        // for the NEXT cycle's fresh id.
+                        self.teardown_spare();
+                        self.spare_phase = SparePhase::Idle;
+                        self.config_ops_committed += 1;
+                        true
+                    }
+                    1 if resp.reason == 3 => false,
+                    2 => false,
+                    _ => {
+                        eprintln!("[random_config_op] remove-learner {id} unexpected refusal: {resp:?} — abandoning cycle");
+                        self.abandon_spare();
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stop the spare's node+service (if any) without touching `spare_phase`
+    /// — used by the RemoveLearner success path, where the phase is reset by
+    /// the caller right after.
+    fn teardown_spare(&mut self) {
+        if let Some(mut slot) = self.spare.take() {
+            if let Some(n) = slot.node.take() {
+                n.stop();
+            }
+            if let Some(s) = slot.service.take() {
+                s.stop();
+            }
+        }
+    }
+
+    /// An unexpected mid-cycle refusal (racing some OTHER concurrent fault,
+    /// e.g. a leader failover reverting the not-yet-committed change this
+    /// cycle depended on) — tear the spare down and reset to `Idle` so the
+    /// NEXT call starts a brand-fresh cycle rather than retrying a step whose
+    /// precondition may no longer hold.
+    fn abandon_spare(&mut self) {
+        self.teardown_spare();
+        self.spare_phase = SparePhase::Idle;
     }
 }
 
