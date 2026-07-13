@@ -1294,6 +1294,49 @@ impl Consensus {
         self.peer_reported.retain(|id, _| live.contains(id));
     }
 
+    /// M7 Task 9: rebuild the sender's net layer (`CtrlMsg::SetPeers`) AND this
+    /// node's own routing/observability (`rebuild_peer_maps` +
+    /// `publish_peer_band`) for a newly-adopted `ClusterConfig`. Factored out of
+    /// `Action::ConfigAdopted`'s exec arm so the snapshot-fiat install path in
+    /// `maybe_adopt_incoming_snapshot` shares the IDENTICAL derivation — a
+    /// below-floor joiner's installed config can differ from its boot seed
+    /// (T7 shipped live reconfiguration), so it needs exactly this rebuild too,
+    /// not a second hand-rolled copy that could drift from this one.
+    fn rebuild_net_for_config(&mut self, config: &ClusterConfig) {
+        // Rebuild the net layer: voters-minus-self / learners-minus-self,
+        // DISJOINT sets (`CtrlMsg::SetPeers`'s documented convention —
+        // the sender recombines them for its own fan-out).
+        let followers: Vec<SocketAddr> = config
+            .voters
+            .iter()
+            .filter(|(id, _)| *id != self.id)
+            .map(|(_, a)| addr_of(*a))
+            .collect();
+        let learners: Vec<SocketAddr> = config
+            .learners
+            .iter()
+            .filter(|(id, _)| *id != self.id)
+            .map(|(_, a)| addr_of(*a))
+            .collect();
+        // M7 Task 8: `sender_cluster_size` (not the plain voter count) —
+        // a LEADER mid-self-removal keeps rebuilding its OWN real sender
+        // here while `config` no longer contains it, and a removed
+        // FOLLOWER's now-moot sender is rebuilt one last time before it
+        // halts; both need the "self occupies an uncounted +1 slot"
+        // adjustment or `FlowControl::new`'s invariant assert panics the
+        // sender thread on the spot (see the helper's doc). The fiat-install
+        // caller's joiner is typically a learner (not yet a voter in its own
+        // seed), exercising this same +1 branch.
+        let _ = self.sender_ctrl.send(CtrlMsg::SetPeers {
+            followers,
+            learners,
+            cluster_size: sender_cluster_size(config, self.id),
+        });
+        // Refresh the node's own routing + observability.
+        self.rebuild_peer_maps(config);
+        self.publish_peer_band();
+    }
+
     /// M6 Task 6. When the receiver completes an inbound snapshot transfer it
     /// raises `incoming_snapshot`; sample it and, on a new position, mirror it to
     /// the cnc observability slot and — when our own durable frontier is below it
@@ -1328,15 +1371,17 @@ impl Consensus {
             // identical reason the lineage is: our own absent local bytes carry
             // nothing genuine to fall back to below the floor. Persist-before-
             // adopt-floor, same ordering discipline as the lineage seed above.
-            // TODO(Task 7): this fiat path updates the SM + record + cnc but does
-            // NOT rebuild peer routing (rebuild_peer_maps + CtrlMsg::SetPeers).
-            // Unreachable divergence today (no admin propose path, so a joiner's
-            // seed membership always equals the shipped membership — only the
-            // version differs), but once membership can change live, a below-floor
-            // joiner installing a snapshot whose config differs from its boot seed
-            // MUST also rebuild routing here, and the one-in-flight rule
-            // (ElectionSm::propose_config's ChangePending refusal) is what keeps
-            // the one-level ConfigRecord history sufficient — do not weaken it.
+            // M7 Task 9: the installed config can DIFFER from this joiner's boot
+            // seed — T7 shipped the admin propose path, so membership can have
+            // changed live since the seed was drawn. Left as-is, this node would
+            // keep routing off its stale seed (deaf to any member the seed
+            // doesn't know about) until the next live config change reached it.
+            // So after adopting the config we rebuild the net layer + our own
+            // routing exactly as `Action::ConfigAdopted`'s exec arm does (shared
+            // via `rebuild_net_for_config` — one derivation, not two that could
+            // drift). The one-in-flight rule (`ElectionSm::propose_config`'s
+            // ChangePending refusal) is what keeps the one-level ConfigRecord
+            // history sufficient here — do not weaken it.
             let cfg_bytes = self.incoming_snapshot_config.lock().unwrap().clone();
             if !cfg_bytes.is_empty() {
                 let wire = decode_config(&cfg_bytes)
@@ -1351,6 +1396,7 @@ impl Consensus {
                 };
                 self.state.store_config_record(&rec).expect("config persist fail-stop");
                 self.cnc.store_config_version(cfg.version);
+                self.rebuild_net_for_config(&cfg);
             }
             let _ = self.trunc_tx.try_send(ArchiveCmd::AdoptFloor { pos });
         }
@@ -2401,36 +2447,11 @@ impl Consensus {
                 let mut wire_bytes = Vec::new();
                 encode_config(&cluster_to_wire(&config, prev_position), &mut wire_bytes);
                 *self.config_bytes.lock().unwrap() = wire_bytes;
-                // Rebuild the net layer: voters-minus-self / learners-minus-self,
-                // DISJOINT sets (`CtrlMsg::SetPeers`'s documented convention —
-                // the sender recombines them for its own fan-out).
-                let followers: Vec<SocketAddr> = config
-                    .voters
-                    .iter()
-                    .filter(|(id, _)| *id != self.id)
-                    .map(|(_, a)| addr_of(*a))
-                    .collect();
-                let learners: Vec<SocketAddr> = config
-                    .learners
-                    .iter()
-                    .filter(|(id, _)| *id != self.id)
-                    .map(|(_, a)| addr_of(*a))
-                    .collect();
-                // M7 Task 8: `sender_cluster_size` (not the plain voter count) —
-                // a LEADER mid-self-removal keeps rebuilding its OWN real sender
-                // here while `config` no longer contains it, and a removed
-                // FOLLOWER's now-moot sender is rebuilt one last time before it
-                // halts; both need the "self occupies an uncounted +1 slot"
-                // adjustment or `FlowControl::new`'s invariant assert panics the
-                // sender thread on the spot (see the helper's doc).
-                let _ = self.sender_ctrl.send(CtrlMsg::SetPeers {
-                    followers,
-                    learners,
-                    cluster_size: sender_cluster_size(&config, self.id),
-                });
-                // Refresh the node's own routing + observability.
-                self.rebuild_peer_maps(&config);
-                self.publish_peer_band();
+                // Rebuild the net layer + this node's own routing/observability.
+                // Shared with the snapshot-fiat install path in
+                // `maybe_adopt_incoming_snapshot` (M7 Task 9) — one derivation for
+                // "what changes when membership changes" everywhere it changes.
+                self.rebuild_net_for_config(&config);
                 self.cnc.store_config_version(config.version);
                 // Cleared once commit crosses `position` (do_work step 11).
                 self.cnc.store_config_pending(true);
