@@ -1003,34 +1003,27 @@ fn full_replace_a_box_recipe() {
 /// around every step and asserting commit strictly advances throughout. The
 /// final voter set must be exactly the original 3.
 ///
-/// IGNORED — pins a real production bug found by this test (see
-/// `docs/tasks` / task-9 report for the full writeup; not fixed here per the
-/// M7 Task 9 brief, which scopes this suite to test authorship only).
+/// Was IGNORED; un-ignored by the M7 Task 9 fix (see `docs/tasks` / the
+/// task-9 report for the full writeup).
 ///
-/// Root cause: `ElectionSm::adopt_config` (`uc2_consensus/src/election.rs`,
-/// ~line 1160) sets the permanent one-way latch `self_removed = true`
-/// whenever the config it JUST adopted excludes `self.id` — with no way to
-/// tell "a real removal" apart from "this is a HISTORICAL config, from
-/// before I joined, that I am replaying during catch-up, and a LATER config
-/// in the very same catch-up run legitimately re-includes me". The second
-/// learner added here (id 61) sequentially and correctly adopts v1 (voters
+/// Root cause (FIXED): `ElectionSm::adopt_config` (`uc2_consensus/src/election.rs`)
+/// used to set the permanent one-way latch `self_removed = true` whenever
+/// the config it JUST adopted excluded `self.id` — with no way to tell "a
+/// real removal" apart from "this is a HISTORICAL config, from before I
+/// joined, that I am replaying during catch-up, and a LATER config in the
+/// very same catch-up run legitimately re-includes me". The second learner
+/// added here (id 61) sequentially and correctly adopts v1 (voters
 /// [0,1,2], learner [60] — 61 legitimately absent, it hasn't joined yet),
 /// v2 (60 promoted — still legitimately absent), then v3 (61 finally
-/// present as learner) — but v1 and v2 already latched `self_removed`
-/// forever. `halt_if_removed_follower` (called from unrelated tick/event
-/// paths) later re-observes that stale latch and fires `Action::HaltRemoved`
-/// — permanently parking node 61 — even though its CURRENT config (v3, and
-/// the v4 promotion the test proposes next) includes it. Observed directly:
-/// node 61 halts ("removed from cluster config") and its counters freeze at
-/// config_version=3 forever, so `await_config_converged(.., 4, ..)` times
-/// out. This is not an artificial construction — it is the unavoidable
-/// shape of "add a SECOND voter after the first is already promoted", which
-/// the pre-existing suite never exercised (every prior joiner's own v1 IS
-/// its first relevant config, so the latch was never set on a false
-/// positive before).
-#[ignore = "pins a real production bug: ElectionSm::adopt_config's self_removed latch \
-            fires on a joiner's own pre-admission history and never clears — see the \
-            doc comment on this test and the task-9 report"]
+/// present as learner) — the old absence-based predicate would have latched
+/// `self_removed` on v1/v2 already, and `halt_if_removed_follower` (called
+/// from unrelated tick/event paths) would then fire `Action::HaltRemoved`
+/// and permanently park node 61. Fixed by switching the predicate to
+/// tombstone-based (`config.tombstones.contains(&self.id)`): absent-and-not-
+/// tombstoned now correctly means "not yet admitted", never "removed" —
+/// ids are fresh-forever (`ClusterConfig::apply`: an id enters only via
+/// `AddLearner`, blocked by the tombstone check for a tombstoned id; an id
+/// leaves only via `Remove*`, which ALWAYS pushes a tombstone).
 #[test]
 fn resize_3_to_5_to_3() {
     let _g = serialize();
@@ -1090,13 +1083,59 @@ fn resize_3_to_5_to_3() {
     submit_batch(&c.nodes[leader].node, 200);
     await_commit_advanced(&c.nodes, before, "commit must advance across remove-learner 61");
 
-    // ---- final: voter set == the original 3 ----
+    // ---- final: the original 3 converge on v8; the two added-then-removed
+    // nodes (60, 61) have permanently fail-stopped on adopting their own
+    // removal (60 at v6, 61 at v8) and must be excluded from an "every
+    // c.nodes entry" convergence/voter-set loop — folding them in would
+    // either spin forever (60 is frozen below v8) or read a stale,
+    // no-longer-current peer band (both).
+    let removed_60 = c.nodes.iter().find(|h| h.id == 60).unwrap();
+    let removed_61 = c.nodes.iter().find(|h| h.id == 61).unwrap();
+    {
+        let deadline = deadline_secs(20);
+        while removed_60.node.config_version() < 6 {
+            assert!(Instant::now() < deadline, "node 60 never adopted its own removal (v6)");
+            std::thread::yield_now();
+        }
+    }
+    {
+        let deadline = deadline_secs(20);
+        while removed_61.node.config_version() < 8 {
+            assert!(Instant::now() < deadline, "node 61 never adopted its own removal (v8)");
+            std::thread::yield_now();
+        }
+    }
+
+    let survivors: Vec<&NodeH> = c.nodes.iter().filter(|h| h.id < 3).collect();
     let deadline = deadline_secs(30);
-    while c.nodes.iter().any(|h| h.node.config_version() < 8) {
-        assert!(Instant::now() < deadline, "config version 8 never converged cluster-wide");
+    while survivors.iter().any(|h| h.node.config_version() < 8) {
+        assert!(Instant::now() < deadline, "config version 8 never converged among the original 3");
         std::thread::yield_now();
     }
-    for h in &c.nodes {
+
+    // The VOTER-role band publish can lag a beat behind the config-version
+    // bump, so poll for the settled shape before asserting on it with clear
+    // messages. Note: this only checks VOTER-role membership (the property
+    // that actually matters for quorum) — a removed LEARNER's peer slot may
+    // legitimately linger with a stale non-voter entry rather than being
+    // wiped to zero, which is orthogonal to this test's scope.
+    let deadline = deadline_secs(10);
+    loop {
+        let settled = survivors.iter().all(|h| {
+            let cnc = open_cnc(&h.instance_dir);
+            let mut got = voter_ids_via_cnc(&cnc);
+            got.sort();
+            let mut want: Vec<NodeId> = [0u32, 1, 2].into_iter().filter(|&id| id != h.id).collect();
+            want.sort();
+            got == want
+        });
+        if settled {
+            break;
+        }
+        assert!(Instant::now() < deadline, "final voter set never settled");
+        std::thread::yield_now();
+    }
+    for h in &survivors {
         let cnc = open_cnc(&h.instance_dir);
         let mut got = voter_ids_via_cnc(&cnc);
         got.sort();
@@ -1104,6 +1143,14 @@ fn resize_3_to_5_to_3() {
         want.sort();
         assert_eq!(got, want, "node {}: final voter set must be exactly the original 3", h.id);
     }
+
+    // Both removed nodes genuinely fail-stopped: over a settle window during
+    // which the survivors keep committing, neither advances any further
+    // (frozen, not merely lagging).
+    let (v60, v61) = (removed_60.node.config_version(), removed_61.node.config_version());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(removed_60.node.config_version(), v60, "node 60 must stay frozen (fail-stopped)");
+    assert_eq!(removed_61.node.config_version(), v61, "node 61 must stay frozen (fail-stopped)");
 
     for h in c.nodes {
         h.node.stop();

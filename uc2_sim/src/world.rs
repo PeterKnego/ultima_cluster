@@ -167,6 +167,16 @@ pub struct SimConfig {
     /// other index is a genesis voter). A learner is replicated-to but never
     /// counted toward quorum and never a candidate — until promoted.
     pub initial_learners: Vec<usize>,
+    /// M7 Task 9 (T9 integration-catch coverage): node indices that are a
+    /// real, ticking sim process but start ENTIRELY ABSENT from the genesis
+    /// `ClusterConfig` — neither voter nor learner — mirroring a real cluster
+    /// process that exists but hasn't been admitted yet (a `resize_3_to_5_to_3`
+    /// -shaped SECOND joiner). Must be disjoint from `initial_learners`. Such a
+    /// node receives ZERO replication/gossip/vote traffic (see `config_peers`)
+    /// until `AddLearner` admits it, then genuinely replays every prior
+    /// `ConfigObserved` version — including ones that exclude its own id —
+    /// exactly like a fresh real process catching up from empty.
+    pub genesis_absent: Vec<usize>,
     /// M7 COUNTERFACTUAL (default false): `propose_config` overrides a
     /// `NotServing` refusal — deleting the single-server-change precondition
     /// (Ongaro 2015; structurally the M4 serving gate). The crafted
@@ -201,6 +211,7 @@ impl Default for SimConfig {
             data_plane: DataPlane::Gated,
             truncate_latency_ns: 0, // instantaneous archive ack (historical default)
             initial_learners: Vec::new(),
+            genesis_absent: Vec::new(),
             serving_gate_disabled: false,
             revert_on_truncate_disabled: false,
         }
@@ -377,6 +388,21 @@ pub struct World {
     vote_drop_until: u64,
     crash_on_truncate: bool,
     // ---- M7 config modeling ----
+    /// T9 integration-catch coverage (M7 Task 9): the set of real node
+    /// indices EVER admitted into SOME adopted config, at any point — starts
+    /// as every id except `SimConfig::genesis_absent`, and gains an id the
+    /// instant a leader's `propose_config` computes a new config that
+    /// contains it (so the very frame that admits it is itself
+    /// deliverable). Deliberately ONE-WAY (never removed): a later
+    /// demotion/removal must still be able to reach the target at least
+    /// once so it can adopt its own removal and fail-stop cleanly — gating
+    /// replication fan-out on the SENDER's live/current adopted config
+    /// instead would stop shipping the removal frame to the very node that
+    /// needs to receive it. Used by `config_peers` to gate the five
+    /// replication/gossip/vote broadcast sites; probed only via
+    /// `.contains()` per the determinism guard above.
+    admitted_ever: HashSet<usize>,
+
     /// The config-frame LEDGER: every config frame ever appended by any leader
     /// (any lineage). Follower observation (adopt-at-durable) and the inv6/inv8
     /// frontier implication are both recomputed from it.
@@ -418,6 +444,10 @@ impl World {
         assert!(cfg.n_nodes >= 1, "n_nodes must be >= 1");
         assert!(cfg.election_timeout_min_ns <= cfg.election_timeout_max_ns);
         assert!(cfg.latency_min_ns <= cfg.latency_max_ns);
+        assert!(
+            cfg.genesis_absent.iter().all(|id| !cfg.initial_learners.contains(id)),
+            "genesis_absent and initial_learners must be disjoint"
+        );
         let n = cfg.n_nodes;
         let genesis = Self::genesis_config(&cfg);
         let mut nodes = Vec::with_capacity(n);
@@ -454,6 +484,8 @@ impl World {
             });
         }
         let checker = InvariantChecker::new(cfg.seed, n);
+        let admitted_ever: HashSet<usize> =
+            (0..n).filter(|id| !cfg.genesis_absent.contains(id)).collect();
         let mut w = World {
             rng: XorShift64::new(cfg.seed ^ 0xD1B5_4A32_D192_ED03),
             queue: BinaryHeap::new(),
@@ -467,6 +499,7 @@ impl World {
             crash_on_truncate: false,
             config_frames: Vec::new(),
             genesis_config: genesis,
+            admitted_ever,
             pending_violation: None,
             quiet: false,
             stat_leaders: 0,
@@ -486,12 +519,18 @@ impl World {
     }
 
     /// The genesis `ClusterConfig` (identical on every node): all indices are
-    /// voters except `initial_learners`; synthetic addrs `(node_idx, 1)` — the
-    /// sim never opens sockets, so the addr is a dep-free placeholder (M7).
+    /// voters except `initial_learners`, and `genesis_absent` indices are
+    /// omitted entirely (present as a running sim process, absent from the
+    /// config — see `SimConfig::genesis_absent`); synthetic addrs
+    /// `(node_idx, 1)` — the sim never opens sockets, so the addr is a
+    /// dep-free placeholder (M7).
     fn genesis_config(cfg: &SimConfig) -> ClusterConfig {
         let mut voters: Vec<(NodeId, Addr)> = Vec::new();
         let mut learners: Vec<(NodeId, Addr)> = Vec::new();
         for id in 0..cfg.n_nodes {
+            if cfg.genesis_absent.contains(&id) {
+                continue;
+            }
             let m = (id as NodeId, (id as u32, 1u16));
             if cfg.initial_learners.contains(&id) {
                 learners.push(m);
@@ -500,6 +539,34 @@ impl World {
             }
         }
         ClusterConfig::genesis(voters, learners)
+    }
+
+    /// The sender's replication/gossip/vote fan-out set: every OTHER real
+    /// node index EVER admitted into some adopted config (`admitted_ever`)
+    /// — deliberately NOT `0..n_nodes` unconditionally. A `genesis_absent`
+    /// id must receive zero traffic until formally admitted via
+    /// `AddLearner` (T9 integration-catch coverage: this is what lets a
+    /// genesis-absent id genuinely replay pre-admission `ConfigObserved`
+    /// history rather than passively tracking the stream from before it
+    /// ever joined).
+    ///
+    /// Deliberately gated on `admitted_ever` (one-way, cluster-global), NOT
+    /// on the SENDER's own CURRENT/live adopted config: a leader removing
+    /// some OTHER member must keep shipping to it at least once past the
+    /// point where the leader itself has already adopted the config that
+    /// excludes it, or the removed node would never receive the very frame
+    /// it needs to adopt its own removal and fail-stop (this was a real
+    /// regression caught while adding `genesis_absent` support —
+    /// `add_promote_demote_remove_cycle_under_faults` deadlocked on it).
+    ///
+    /// Also implicitly bounded to real processes: `admitted_ever` is seeded
+    /// from `0..n_nodes` and only ever grows from a real config's own
+    /// voter/learner ids (see `propose_config`), so a VIRTUAL id with no
+    /// backing sim process (e.g. `AddLearner { id: 9, .. }` — "the config
+    /// pipeline neither knows nor cares") is never a member of it and is
+    /// never indexed into `self.nodes`/`cursors`.
+    fn config_peers(&self, node: usize) -> Vec<usize> {
+        (0..self.nodes.len()).filter(|&p| p != node && self.admitted_ever.contains(&p)).collect()
     }
 
     /// Build a node's `ElectionConfig` around the given adopted config — the
@@ -763,10 +830,7 @@ impl World {
             }
             let ap = self.nodes[node].append;
             let term = self.nodes[node].sm.current_term();
-            for p in 0..self.cfg.n_nodes {
-                if p == node {
-                    continue;
-                }
+            for p in self.config_peers(node) {
                 let from = self.nodes[node].cursors[p].min(ap);
                 let msg = self.make_data(node, from, ap, term);
                 self.send(node, p, msg, now);
@@ -1226,10 +1290,7 @@ impl World {
             }
             Action::StartElection { new_term, last_term, last_durable } => {
                 let from = node as NodeId;
-                for p in 0..n {
-                    if p == node {
-                        continue;
-                    }
+                for p in self.config_peers(node) {
                     self.send(
                         node,
                         p,
@@ -1278,10 +1339,7 @@ impl World {
                 // Immediate heartbeat so followers re-arm (avoids a spurious
                 // competing election right after we win). The NewTerm frame
                 // [base, pos) is the new term; prev_term is whatever preceded it.
-                for p in 0..n {
-                    if p == node {
-                        continue;
-                    }
+                for p in self.config_peers(node) {
                     let msg = self.make_data(node, base, pos, term);
                     self.send(node, p, msg, now);
                 }
@@ -1347,19 +1405,13 @@ impl World {
             }
             Action::GossipCommit { commit } => {
                 let term = self.nodes[node].sm.current_term();
-                for p in 0..n {
-                    if p == node {
-                        continue;
-                    }
+                for p in self.config_peers(node) {
                     self.send(node, p, Msg::CommitGossip { term, commit }, now);
                 }
             }
             Action::ShipTermMap { entries } => {
                 let term = self.nodes[node].sm.current_term();
-                for p in 0..n {
-                    if p == node {
-                        continue;
-                    }
+                for p in self.config_peers(node) {
                     self.send(node, p, Msg::TermMap { term, entries: entries.clone() }, now);
                 }
             }
@@ -1707,6 +1759,18 @@ impl World {
             }
             Err(e) => return Err(e),
         };
+        // T9 integration-catch coverage: admit the new config's FULL
+        // membership into `admitted_ever` right away — at proposal time, not
+        // at commit or even at adoption — so the very frame that ADMITS a
+        // `genesis_absent` id is itself deliverable to it on the next tick
+        // (chicken-and-egg otherwise: it can't receive the frame that tells
+        // it to start receiving frames). One-way: never removed here even
+        // for a `DemoteVoter`/`RemoveLearner`/`RemoveVoter` op, so a target
+        // being removed keeps receiving traffic until it adopts its own
+        // removal and fail-stops.
+        for &(id, _) in new_cfg.voters.iter().chain(new_cfg.learners.iter()) {
+            self.admitted_ever.insert(id as usize);
+        }
         let version = new_cfg.version;
         let term = self.nodes[node].sm.current_term();
         let nd = &mut self.nodes[node];

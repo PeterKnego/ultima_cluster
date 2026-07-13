@@ -551,6 +551,87 @@ fn add_promote_demote_remove_cycle_under_faults() {
     );
 }
 
+/// T9 integration-catch coverage (M7 Task 9 fix): a SECOND process admitted
+/// entirely after prior config history already exists — the exact
+/// `resize_3_to_5_to_3` shape (`uc2_node/tests/reconfig.rs`) that caught the
+/// production `adopt_config` self-removal-latch bug, reproduced at the sim
+/// level. Nodes 3 and 4 are REAL, ticking sim processes that start entirely
+/// OUTSIDE the genesis `ClusterConfig` (`SimConfig::genesis_absent`) — not
+/// even learners — mirroring a real process that hasn't joined yet. Node 3
+/// is added and promoted first (v1, v2); node 4 is added ONLY afterward
+/// (v3), so its catch-up must genuinely replay v1 and v2 — both of which
+/// exclude ITS OWN id — before it ever reaches v3, the version that finally
+/// admits it. The old absence-based predicate would have wrongly latched
+/// `self_removed` on v1/v2 and permanently fail-stopped node 4 before it
+/// ever got a chance to adopt its own admission or promotion; asserted
+/// directly via `halted_removed`, not just convergence timing — a
+/// convergence-only check would falsely "pass" (`all_live_at_version`
+/// exempts halted nodes from the version check).
+#[test]
+fn second_learner_admitted_after_prior_config_history_converges() {
+    let mut w = World::new(SimConfig {
+        n_nodes: 5,
+        seed: 61,
+        max_steps: 400_000,
+        drop_per_million: 0,
+        genesis_absent: vec![3, 4],
+        ..SimConfig::default()
+    });
+    w.run_until_leader().expect("elect among the 3 genesis voters");
+    w.run_steps(300).expect("a genuine committed prefix");
+
+    // v1: admit node 3 as a learner. It must not halt (it is being ADDED,
+    // not removed) — and node 4 (still entirely genesis-absent) must be
+    // untouched by a version that doesn't concern it. Convergence is checked
+    // over nodes {0,1,2,3} only (`all_live_at_version(w, 4, ..)`): node 4
+    // legitimately stays at config_version 0 until v3 ever reaches it, so
+    // including it in the "all nodes at v1" predicate would make it
+    // unsatisfiable and silently exhaust `run_until`'s step budget
+    // (`run_until` returns `Ok(())` on timeout too, not just on success —
+    // hence the explicit follow-up assert rather than trusting the
+    // `.expect` message alone).
+    assert_eq!(propose_ok(&mut w, ConfigOp::AddLearner { id: 3, addr: (3, 1) }), 1);
+    w.run_until(|w| all_live_at_version(w, 4, 1)).expect("invariants while converging on v1");
+    assert!(all_live_at_version(&w, 4, 1), "v1 must actually converge on nodes 0-3");
+    assert!(!w.halted_removed(3), "node 3's own admission must not halt it");
+    assert!(!w.halted_removed(4), "node 4 (still genesis-absent) must not be affected by v1");
+
+    // v2: promote node 3 to voter.
+    assert_eq!(propose_ok(&mut w, ConfigOp::PromoteLearner { id: 3 }), 2);
+    w.run_until(|w| all_live_at_version(w, 4, 2)).expect("invariants while converging on v2");
+    assert!(all_live_at_version(&w, 4, 2), "v2 must actually converge on nodes 0-3");
+    assert!(!w.halted_removed(3));
+    assert!(!w.halted_removed(4), "node 4 must still be unaffected before its own admission");
+
+    // v3: admit node 4 — the SECOND joiner, AFTER v1/v2 already exist. Its
+    // catch-up must replay v1 (voters {0,1,2}, learner [3] — 4 legitimately
+    // absent) and v2 (3 promoted — 4 still legitimately absent) before it
+    // ever reaches v3. This is the exact bug shape: the old code would
+    // wrongly halt node 4 while it replays v1/v2, and it would never reach
+    // v3 at all. Node 4 is now part of the relevant set.
+    assert_eq!(propose_ok(&mut w, ConfigOp::AddLearner { id: 4, addr: (4, 1) }), 3);
+    w.run_until(|w| all_live_at_version(w, 5, 3)).expect("invariants while converging on v3");
+    assert!(
+        !w.halted_removed(4),
+        "node 4 must not halt while replaying pre-admission config history (v1/v2)"
+    );
+    assert!(all_live_at_version(&w, 5, 3), "v3 must actually converge on all 5 nodes");
+    assert_eq!(w.node_config_version(4), 3, "node 4 must genuinely reach v3, not stall on replay");
+
+    // v4: promote node 4 too — proves it kept participating normally after
+    // admission (not just limping along at v3 with a dead latch waiting to
+    // fire on the next higher-term event).
+    assert_eq!(propose_ok(&mut w, ConfigOp::PromoteLearner { id: 4 }), 4);
+    w.run_until(|w| all_live_at_version(w, 5, 4)).expect("invariants while converging on v4");
+    assert!(all_live_at_version(&w, 5, 4), "v4 must actually converge on all 5 nodes");
+    assert!(!w.halted_removed(4), "node 4 must not halt on its own promotion either");
+
+    // The 5-voter cluster (now {0,1,2,3,4}) keeps committing.
+    let c = w.max_commit();
+    w.run_steps(2_000).expect("the grown cluster keeps serving");
+    assert!(w.max_commit() > c, "commit must keep advancing under the grown 5-voter config");
+}
+
 /// One-in-flight: a second proposal before the first frame commits is refused
 /// with `ChangePending`; once it commits, the next change is accepted.
 #[test]

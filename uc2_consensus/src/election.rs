@@ -305,20 +305,23 @@ pub struct ElectionSm {
     /// until the agent actually parks the process. Never reset — this is a
     /// one-way trip, same posture as `HaltRemoved`.
     stepped_down: bool,
-    /// T8 review fix: latched `true` the moment `adopt_config` FORMALLY
-    /// observes (via a real `Event::ConfigObserved` adoption, at ANY role —
-    /// the leader carve-out only defers the resulting `HaltRemoved`, it
-    /// doesn't erase the fact) that `config` no longer contains `self.id`.
-    /// Deliberately starts `false` at construction and is set ONLY by
-    /// `adopt_config`, never by inspecting the boot-recovered `config`
-    /// directly: a freshly-joining node's local seed legitimately excludes
-    /// itself too (it hasn't learned its own learner-hood from the
-    /// replicated stream yet — see `ElectionConfig::config`'s doc), and that
-    /// is NOT a removal. Gates `halt_if_removed_follower`'s halt-on-demotion
-    /// check so that check fires only for a genuine, formally-adopted
-    /// self-removal — never for "not a member yet". Never reset once set:
-    /// tombstones are permanent (inv9), so a real self-exclusion can never
-    /// be un-adopted.
+    /// T8 review fix (T9 integration fix, M7 Task 9: corrected predicate):
+    /// latched `true` the moment `adopt_config` FORMALLY observes (via a real
+    /// `Event::ConfigObserved` adoption, at ANY role — the leader carve-out
+    /// only defers the resulting `HaltRemoved`, it doesn't erase the fact)
+    /// that `config.tombstones` contains `self.id`. Deliberately starts
+    /// `false` at construction and is set ONLY by `adopt_config`, never by
+    /// inspecting the boot-recovered `config` directly: a freshly-joining
+    /// node's local seed legitimately excludes itself too (it hasn't learned
+    /// its own learner-hood from the replicated stream yet — see
+    /// `ElectionConfig::config`'s doc), and that is NOT a removal — same
+    /// reasoning covers a joiner's own replay of any PRIOR historical
+    /// `ConfigObserved` version that predates its admission (T9's
+    /// `resize_3_to_5_to_3` catch). Gates `halt_if_removed_follower`'s
+    /// halt-on-demotion check so that check fires only for a genuine,
+    /// formally-adopted self-removal (tombstoned) — never for "not a member
+    /// yet" (absent but not tombstoned). Never reset once set: tombstones are
+    /// permanent (inv9), so a real self-exclusion can never be un-adopted.
     self_removed: bool,
 }
 
@@ -1157,7 +1160,19 @@ impl ElectionSm {
         // serving until this entry COMMITS (the node executes the step-down —
         // Task 8), because C_new must be replicated by a leader that still
         // exists.
-        if !self.config.contains(self.id) {
+        //
+        // TOMBSTONE-based, not absence-based (T9 integration catch, M7 Task 9
+        // fix): ids are fresh-forever (`ClusterConfig::apply` — an id enters
+        // only via `AddLearner`, which the tombstone check blocks for a
+        // tombstoned id; an id leaves only via `Remove*`, which ALWAYS pushes
+        // a tombstone), so `absent ∧ not-tombstoned` means "not yet admitted",
+        // never "removed". A newly-admitted node replaying `ConfigObserved`
+        // history from before its own admission (e.g. a second learner whose
+        // catch-up replays configs that only include the FIRST learner)
+        // legitimately adopts one or more historical versions that exclude
+        // its own id — `!config.contains(self.id)` cannot tell that apart
+        // from a real removal and would wrongly halt/latch on it.
+        if self.config.tombstones.contains(&self.id) {
             // T8 review fix: latch this REGARDLESS of role. The leader carve-
             // out below only defers the resulting `HaltRemoved` action — it
             // does not mean the removal wasn't formally adopted. The latch is
@@ -1300,8 +1315,21 @@ impl ElectionSm {
             // C_new voters can elect among themselves. Emit exactly once
             // (`stepped_down` latches it) even though this branch re-runs on
             // every subsequent advance until the agent actually parks us.
+            //
+            // TOMBSTONE-based (T9 fix, uniform with `adopt_config`'s halt
+            // predicate) rather than absence-based: for a LEADER specifically
+            // the two are equivalent — reaching `Role::Leader` requires
+            // having been a voter in some already-adopted config, and ids are
+            // fresh-forever (see `adopt_config`'s comment), so a leader can
+            // only become absent from `config` via a `Remove*` that also
+            // tombstoned it. The debug_assert below pins that equivalence.
+            debug_assert!(
+                self.config.contains(self.id) || self.config.tombstones.contains(&self.id),
+                "leader id {} absent from config but not tombstoned — fresh-forever-ids invariant violated",
+                self.id
+            );
             if !self.stepped_down
-                && !self.config.contains(self.id)
+                && self.config.tombstones.contains(&self.id)
                 && self.commit_seen >= self.config_position
             {
                 self.stepped_down = true;
@@ -2273,6 +2301,119 @@ mod tests {
         new_cfg.version = 1;
         let acts = step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
         assert!(acts.iter().any(|a| matches!(a, Action::HaltRemoved)));
+    }
+
+    /// T9 integration catch (M7 Task 9 fix): a node whose own id is NOT in
+    /// genesis at all replays historical `ConfigObserved` versions that
+    /// pre-date its own admission — each one legitimately excludes it —
+    /// and must NEITHER halt NOR latch `self_removed` on any of them; only
+    /// a real tombstone may do that. This is the exact `resize_3_to_5_to_3`
+    /// failure shape: a SECOND joiner (61) whose catch-up replays v1
+    /// (voters [0,1,2], learner [60] — 61 absent, hasn't joined yet) then
+    /// v2 (60 promoted — 61 still absent) before it ever reaches v3 (61
+    /// finally admitted as a learner). A higher-term event landing
+    /// mid-replay (which unconditionally routes through `adopt_term` ->
+    /// `halt_if_removed_follower`, per `Event::RequestVote`'s handler) must
+    /// also not halt — this is the precise trigger the old absence-based
+    /// predicate got wrong (it would have latched `self_removed` on v1/v2
+    /// already, and this event is what surfaces the latch as a halt).
+    #[test]
+    fn joiner_replaying_pre_admission_configs_neither_halts_nor_latches() {
+        // Genesis: voters [0,1,2]; self = 61, entirely absent (not even a
+        // learner) — "hasn't joined the cluster at all" yet.
+        let mut s = ElectionSm::new(cfg_members(61, vec![0, 1, 2]), None, &[], 0, 0);
+        assert!(matches!(s.role(), Role::Follower));
+        assert!(!s.config().contains(61));
+
+        // v1: AddLearner{60} — 61 legitimately still absent.
+        let mut v1 = ClusterConfig::genesis(
+            [0, 1, 2].iter().map(|&id| (id, addr_of(id))).collect(),
+            vec![(60, addr_of(60))],
+        );
+        v1.version = 1;
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: v1 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "v1 (pre-admission history) must not halt a not-yet-admitted joiner"
+        );
+        assert!(!s.config().is_voter(61), "not yet a voter");
+        assert!(!s.config().contains(61), "not yet present at all in v1");
+
+        // v2: PromoteLearner{60} — 61 still legitimately absent.
+        let mut v2 = ClusterConfig::genesis(
+            [0, 1, 2, 60].iter().map(|&id| (id, addr_of(id))).collect(),
+            Vec::new(),
+        );
+        v2.version = 2;
+        let acts = step(&mut s, Event::ConfigObserved { position: 80, config: v2 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "v2 (still pre-admission history) must not halt"
+        );
+        assert!(!s.config().is_voter(61));
+        assert!(!s.config().contains(61));
+
+        // Mid-replay, a higher-term event (from a current voter, 0) drives
+        // `adopt_term` — which unconditionally calls `halt_if_removed_follower`
+        // regardless of role — BEFORE v3 is ever adopted. This is the T9 bug's
+        // exact trigger: the old absence-based predicate had already latched
+        // `self_removed = true` on v1/v2, so this event would incorrectly halt.
+        let acts = step(
+            &mut s,
+            Event::RequestVote { from: 0, new_term: 5, last_term: 1, last_durable: 0 },
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "a higher-term event mid-replay (before admission) must not surface a stale halt latch"
+        );
+
+        // v3: AddLearner{61} — 61 is finally present (as a learner).
+        let mut v3 = ClusterConfig::genesis(
+            [0, 1, 2, 60].iter().map(|&id| (id, addr_of(id))).collect(),
+            vec![(61, addr_of(61))],
+        );
+        v3.version = 3;
+        let acts = step(&mut s, Event::ConfigObserved { position: 120, config: v3 });
+        assert!(!acts.iter().any(|a| matches!(a, Action::HaltRemoved)), "own admission must never halt");
+        assert!(s.config().contains(61), "61 must now participate");
+        assert!(!s.config().is_voter(61), "still only a learner at v3");
+    }
+
+    /// The demote-then-remove path: demoting self from voter to learner is
+    /// NOT a removal (still present, no tombstone — must not halt); the
+    /// SUBSEQUENT removal-as-learner tombstones it and DOES halt. Pins that
+    /// the tombstone-based predicate still correctly fires on the real
+    /// removal path, not just the direct-voter-removal path already covered
+    /// by `removed_follower_emits_halt`.
+    #[test]
+    fn demote_then_remove_still_halts() {
+        // 3 voters [1,2,3]; self = 3 (a plain follower, never elected).
+        let mut s = ElectionSm::new(cfg_members(3, vec![1, 2, 3]), None, &[], 0, 0);
+        assert!(matches!(s.role(), Role::Follower));
+
+        // DemoteVoter{3}: voter -> learner. Still `contains` (learner), no
+        // tombstone — must NOT halt.
+        let mut demoted = s.config().clone();
+        demoted.voters.retain(|(id, _)| *id != 3);
+        demoted.learners.push((3, addr_of(3)));
+        demoted.version = 1;
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: demoted });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "demote alone (still present as a learner) must not halt"
+        );
+        assert!(s.config().contains(3));
+
+        // RemoveLearner{3}: tombstoned — now it halts.
+        let mut removed = s.config().clone();
+        removed.learners.retain(|(id, _)| *id != 3);
+        removed.tombstones.push(3);
+        removed.version = 2;
+        let acts = step(&mut s, Event::ConfigObserved { position: 80, config: removed });
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "removal-as-learner (tombstoned) must halt"
+        );
     }
 
     // ---- M7 Task 8: leader self-removal ----
