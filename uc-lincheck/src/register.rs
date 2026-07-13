@@ -124,6 +124,58 @@ impl uc2_service::StateMachine for RegisterSm {
     }
 }
 
+// The optional snapshot capability (M6): what lets the L3 harness drive the
+// REAL purge path. `SnapshotHandle = Vec<u8>` (bincode of `(value,
+// last_applied)`). `install_snapshot` takes the target `position` (the artifact
+// tag) and asserts the payload's recorded position matches (belt-and-suspenders
+// against a mis-tagged artifact).
+#[cfg(feature = "v2")]
+impl uc2_service::SnapshotStateMachine for RegisterSm {
+    type SnapshotHandle = Vec<u8>;
+
+    fn freeze(&self) -> Result<(Vec<u8>, u64), uc2_service::SnapshotError> {
+        let buf = bincode::serde::encode_to_vec(
+            (self.value, self.last_applied),
+            bincode::config::standard(),
+        )
+        .map_err(|e| uc2_service::SnapshotError::Codec(e.to_string()))?;
+        Ok((buf, self.last_applied.unwrap_or(0)))
+    }
+
+    fn stream_snapshot(
+        handle: Vec<u8>,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc2_service::SnapshotError> {
+        std::io::Write::write_all(dst, &handle)?;
+        Ok(())
+    }
+
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc2_service::SnapshotError> {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(src, &mut buf)?;
+        let ((v, la), _) = bincode::serde::decode_from_slice::<(Option<u64>, Option<u64>), _>(
+            &buf,
+            bincode::config::standard(),
+        )
+        .map_err(|e| uc2_service::SnapshotError::Codec(e.to_string()))?;
+        // The payload's recorded position must match the artifact tag we were
+        // asked to land at.
+        if la.unwrap_or(0) != position {
+            return Err(uc2_service::SnapshotError::Codec(format!(
+                "snapshot payload position {} != requested {position}",
+                la.unwrap_or(0)
+            )));
+        }
+        self.value = v;
+        self.last_applied = Some(position);
+        Ok(position)
+    }
+}
+
 /// The pure CAS-register transition shared by both SDK `apply` impls (the only
 /// difference between v1/v2 is the index name and the trait surface, never the
 /// business logic — keeping it in one place is what makes the model a single
@@ -197,5 +249,30 @@ mod v2_tests {
         assert_eq!(sm.apply(384, Cmd::Cas { old: 7, new: 1 }), CmdResp::CasResult(false));
         assert_eq!(sm.query(()), Some(9));
         assert_eq!(sm.last_applied(), Some(384));
+    }
+
+    /// The M6 snapshot capability roundtrips through the v2 trait, keyed on the
+    /// artifact position `S`.
+    #[test]
+    fn snapshot_roundtrip_via_v2_capability() {
+        use uc2_service::SnapshotStateMachine;
+
+        let mut sm = RegisterSm::default();
+        sm.apply(4096, Cmd::Write(42));
+        let (handle, s) = sm.freeze().unwrap();
+        assert_eq!(s, 4096);
+        let mut bytes = Vec::new();
+        RegisterSm::stream_snapshot(handle, &mut bytes).unwrap();
+
+        let mut restored = RegisterSm::default();
+        assert_eq!(
+            restored.install_snapshot(4096, &mut bytes.as_slice()).unwrap(),
+            4096
+        );
+        assert_eq!(restored.query(()), Some(42));
+        assert_eq!(restored.last_applied(), Some(4096));
+
+        // A mis-tagged install (wrong artifact position) is refused.
+        assert!(restored.install_snapshot(99, &mut bytes.as_slice()).is_err());
     }
 }

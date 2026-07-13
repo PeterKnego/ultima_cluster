@@ -93,6 +93,85 @@ pub fn read_read_probe_body(buf: &[u8]) -> Option<ReadProbeBody> {
     })
 }
 
+// -- M6 Task 6: snapshot session (kinds 12–15) --------------------------------
+// A bounded, strictly-lower-priority unicast file transfer: the leader ships a
+// snapshot artifact to ONE peer whose NAK fell below the journal purge floor.
+// MDC-free (single peer), NAK-repaired like the main stream, budget-bounded.
+
+/// leader → peer: opens a session. Body = [`SnapBeginBody`]; header `position` = 0.
+pub const DGRAM_KIND_SNAP_BEGIN: u8 = 12;
+/// leader → peer: one file chunk. Header `position` = the snapshot-FILE offset;
+/// payload = the raw bytes at that offset.
+pub const DGRAM_KIND_SNAP_CHUNK: u8 = 13;
+/// peer → leader: request a missing byte range. Body = [`SnapNakBody`].
+pub const DGRAM_KIND_SNAP_NAK: u8 = 14;
+/// peer → leader: the file is complete (echoes the [`SnapBeginBody`] as the ack).
+pub const DGRAM_KIND_SNAP_DONE: u8 = 15;
+
+pub const SNAP_BEGIN_BODY_LEN: usize = 24;
+
+/// Opens (and, echoed back, acks) a snapshot session. `session` scopes chunk/NAK
+/// traffic to one transfer; `snapshot_pos` is the artifact's tag `S`; `total_len`
+/// is the file size the receiver pre-sizes its `.part` to. LE: session 0..4,
+/// 4..8 zero (u64 alignment for `snapshot_pos`), snapshot_pos 8..16,
+/// total_len 16..24.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapBeginBody {
+    pub session: u32,
+    pub snapshot_pos: u64,
+    pub total_len: u64,
+}
+
+pub fn write_snap_begin_body(buf: &mut [u8], b: &SnapBeginBody) {
+    buf[0..4].copy_from_slice(&b.session.to_le_bytes());
+    buf[4..8].fill(0);
+    buf[8..16].copy_from_slice(&b.snapshot_pos.to_le_bytes());
+    buf[16..24].copy_from_slice(&b.total_len.to_le_bytes());
+}
+
+/// Decode a snap-begin body, or `None` if the buffer is shorter than
+/// [`SNAP_BEGIN_BODY_LEN`] (the caller drops a malformed datagram).
+pub fn read_snap_begin_body(buf: &[u8]) -> Option<SnapBeginBody> {
+    if buf.len() < SNAP_BEGIN_BODY_LEN {
+        return None;
+    }
+    Some(SnapBeginBody {
+        session: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        snapshot_pos: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+        total_len: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+    })
+}
+
+pub const SNAP_NAK_BODY_LEN: usize = 16;
+
+/// Requests a missing chunk of the snapshot file: `[offset, offset+length)`.
+/// `session` scopes it to the active transfer. LE: session 0..4, offset 4..12,
+/// length 12..16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapNakBody {
+    pub session: u32,
+    pub offset: u64,
+    pub length: u32,
+}
+
+pub fn write_snap_nak_body(buf: &mut [u8], b: &SnapNakBody) {
+    buf[0..4].copy_from_slice(&b.session.to_le_bytes());
+    buf[4..12].copy_from_slice(&b.offset.to_le_bytes());
+    buf[12..16].copy_from_slice(&b.length.to_le_bytes());
+}
+
+/// Decode a snap-NAK body, or `None` if shorter than [`SNAP_NAK_BODY_LEN`].
+pub fn read_snap_nak_body(buf: &[u8]) -> Option<SnapNakBody> {
+    if buf.len() < SNAP_NAK_BODY_LEN {
+        return None;
+    }
+    Some(SnapNakBody {
+        session: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        offset: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
+        length: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+    })
+}
+
 pub const REQUEST_VOTE_BODY_LEN: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +415,45 @@ mod tests {
         assert_eq!(DGRAM_KIND_TERM_MAP, 9);
         assert_eq!(DGRAM_KIND_READ_PROBE, 10);
         assert_eq!(DGRAM_KIND_READ_PROBE_ACK, 11);
+        assert_eq!(DGRAM_KIND_SNAP_BEGIN, 12);
+        assert_eq!(DGRAM_KIND_SNAP_CHUNK, 13);
+        assert_eq!(DGRAM_KIND_SNAP_NAK, 14);
+        assert_eq!(DGRAM_KIND_SNAP_DONE, 15);
+    }
+
+    #[test]
+    fn snap_begin_body_roundtrips_and_pins_layout() {
+        let b = SnapBeginBody { session: 0x0A0B_0C0D, snapshot_pos: 0x1000, total_len: 300 * 1024 };
+        let mut buf = [0u8; SNAP_BEGIN_BODY_LEN];
+        write_snap_begin_body(&mut buf, &b);
+        assert_eq!(read_snap_begin_body(&buf), Some(b));
+        // session=0x0A0B0C0D -> LE [0x0D,0x0C,0x0B,0x0A]; pad [0,0,0,0];
+        // snapshot_pos=0x1000 -> LE [0,0x10,0,0,0,0,0,0];
+        // total_len=307200=0x0004_B000 -> LE [0x00,0xB0,0x04,0,0,0,0,0].
+        assert_eq!(
+            buf,
+            [
+                0x0D, 0x0C, 0x0B, 0x0A, 0, 0, 0, 0, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0xB0,
+                0x04, 0, 0, 0, 0, 0
+            ]
+        );
+        // Short buffer is rejected (caller drops the datagram).
+        assert_eq!(read_snap_begin_body(&buf[..SNAP_BEGIN_BODY_LEN - 1]), None);
+    }
+
+    #[test]
+    fn snap_nak_body_roundtrips_and_pins_layout() {
+        let b = SnapNakBody { session: 0x0102_0304, offset: 0x1_0000, length: 1408 };
+        let mut buf = [0u8; SNAP_NAK_BODY_LEN];
+        write_snap_nak_body(&mut buf, &b);
+        assert_eq!(read_snap_nak_body(&buf), Some(b));
+        // session=0x01020304 -> LE [0x04,0x03,0x02,0x01];
+        // offset=0x10000 -> LE [0,0,1,0,0,0,0,0]; length=1408=0x0580 -> LE [0x80,0x05,0,0].
+        assert_eq!(
+            buf,
+            [0x04, 0x03, 0x02, 0x01, 0, 0, 1, 0, 0, 0, 0, 0, 0x80, 0x05, 0, 0]
+        );
+        assert_eq!(read_snap_nak_body(&buf[..SNAP_NAK_BODY_LEN - 1]), None);
     }
 
     #[test]

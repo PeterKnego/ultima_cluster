@@ -7,10 +7,19 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# `ultima_db` pulls in the reference `StoreStateMachine` adapter (the
+# `SnapshotStateMachine` capability backed by `ultima_db::Store`). Off by
+# default so a service that supplies its own SM never builds the store.
+ultima_db = ["dep:ultima-db"]
+
 [dependencies]
 uc_protocol = { path = "../uc_protocol" }
 uc2_log = { path = "../uc2_log" }
 ultima-journal = { path = "../ultima_journal" }
+# Optional: the `ultima_db` adapter. The workspace dep already carries
+# features = ["persistence"] (required for snapshot_stream / install).
+ultima-db = { workspace = true, optional = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }
@@ -24,4 +33,9 @@ tokio = { version = "1", default-features = false, features = ["rt", "time"] }
 uc2_node = { path = "../uc2_node" }
 uc2_net = { path = "../uc2_net" }
 uc2_client = { path = "../uc2_client" }
+# Dev-only cycle (permitted: the cyclic edge is a dev-dependency, same pattern
+# as uc2_node's own `uc-lincheck` dev-dep) — the M6 Task 3 e2e test drives the
+# real RegisterSm (SnapshotStateMachine capability, feature `v2`) through a
+# full node + service + client stack rather than a local one-off test SM.
+uc-lincheck = { path = "../uc-lincheck", default-features = false, features = ["v2"] }
 tempfile = { workspace = true }

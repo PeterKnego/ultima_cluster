@@ -15,11 +15,13 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use uc2_net::fault::FaultConfig;
-use uc2_node::{Node, NodeConfig};
-use uc2_service::{Service, ServiceBuilder, ServiceConfig, StateMachine};
+use uc2_node::{Node, NodeConfig, PurgePolicy};
+use uc2_service::{Service, ServiceBuilder, ServiceConfig, SnapshotPolicy, StateMachine};
 use uc2_log::cnc::CncPage;
 use uc_protocol::ring::{MpscProducer, MpscRing, RingError};
 use uc_protocol::v2::ipc::{MSG_V2_SUBMIT, extra_client};
+
+use uc_lincheck::register::{Cmd as RegCmd, RegisterSm};
 
 // A tiny ring so the committed history scrolls out of the live buffer fast,
 // forcing the attaching service down the journal-replay reconstruction path.
@@ -63,6 +65,43 @@ impl StateMachine for CountSm {
     }
 }
 
+/// M6 Task 5: `CountSm` is ACCUMULATING (`Add`), so — unlike a last-write-wins
+/// register — dropping a purged prefix yields a wrong total. That makes a
+/// snapshot-capable `CountSm` the load-bearing silent-gap regression: correct
+/// reconstruction below the floor is only possible if the install actually runs.
+impl uc2_service::SnapshotStateMachine for CountSm {
+    type SnapshotHandle = (u64, Option<u64>);
+
+    fn freeze(&self) -> Result<((u64, Option<u64>), u64), uc2_service::SnapshotError> {
+        Ok(((self.total, self.last_applied), self.last_applied.unwrap_or(0)))
+    }
+
+    fn stream_snapshot(
+        handle: (u64, Option<u64>),
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc2_service::SnapshotError> {
+        let bytes = bincode::serde::encode_to_vec(handle, bincode::config::standard())
+            .map_err(|e| uc2_service::SnapshotError::Codec(e.to_string()))?;
+        std::io::Write::write_all(dst, &bytes)?;
+        Ok(())
+    }
+
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc2_service::SnapshotError> {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(src, &mut buf)?;
+        let ((total, _last), _): ((u64, Option<u64>), usize) =
+            bincode::serde::decode_from_slice(&buf, bincode::config::standard())
+                .map_err(|e| uc2_service::SnapshotError::Codec(e.to_string()))?;
+        self.total = total;
+        self.last_applied = Some(position);
+        Ok(position)
+    }
+}
+
 // --------------------------------------------------------------------- harness
 
 fn start_single_node_with_buffer(dir: &Path, app_id: &str, buffer_bytes: usize) -> Node {
@@ -80,6 +119,9 @@ fn start_single_node_with_buffer(dir: &Path, app_id: &str, buffer_bytes: usize) 
         election_timeout_max_ns: 100_000_000,
         seed: 1,
         faults: FaultConfig::default(),
+        purge: uc2_node::PurgePolicy::Disabled,
+        learners: Vec::new(),
+        journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
     })
     .unwrap()
 }
@@ -234,6 +276,231 @@ fn restarted_service_epoch_bumps_and_state_rebuilds() {
     // The fresh in-memory SM rebuilds the SAME total purely from the journal.
     wait_until(|| query_total(&svc2) == 2_000);
     assert_eq!(query_total(&svc2), 2_000, "in-memory state fully reconstructed from the journal");
+
+    svc2.stop();
+    node.stop();
+}
+
+// ================================ M6 Task 5 ================================
+// Below-the-floor reconstruction: when the journal has been PURGED below what a
+// fresh/restarted service needs, replay alone leaves a hole. A snapshot-capable
+// SM installs a covering snapshot then tail-replays; an incapable one fail-stops
+// with the contract named (the silent-gap bug class, shut).
+
+/// Tiny journal segments + tiny log ring so a few hundred KiB of writes rolls
+/// many segments (purge is observable) AND the live buffer scrolls (a fresh
+/// service is forced onto the reconstruction path).
+const PURGE_SEG: u64 = 64 * 1024;
+const PURGE_BUF: usize = 64 * 1024;
+
+fn start_purge_node(dir: &Path, app_id: &str) -> Node {
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    Node::start(NodeConfig {
+        id: 0,
+        members: vec![(0, bind)],
+        bind,
+        instance_dir: dir.to_path_buf(),
+        app_id: app_id.into(),
+        buffer_bytes: PURGE_BUF,
+        max_payload: 256,
+        admission_bytes: 256 * 1024,
+        election_timeout_min_ns: 50_000_000,
+        election_timeout_max_ns: 100_000_000,
+        seed: 1,
+        faults: FaultConfig::default(),
+        purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        learners: Vec::new(),
+        journal_segment_bytes: PURGE_SEG,
+    })
+    .unwrap()
+}
+
+/// Submit one `RegisterSm` `Write(val)` through the raw ingress ring (no service
+/// response awaited — works whether or not a service is attached).
+fn write_reg(prod: &MpscProducer, local_seq: u32, val: u64) {
+    let payload = bincode::serde::encode_to_vec(RegCmd::Write(val), bincode::config::standard())
+        .unwrap();
+    let extra = extra_client(CLIENT_ID, local_seq);
+    for attempt in 0.. {
+        match prod.try_write(MSG_V2_SUBMIT, 0, extra, &payload) {
+            Ok(()) => return,
+            Err(RingError::Full) => {
+                assert!(attempt < 200_000, "ingress ring never drained");
+                std::thread::sleep(Duration::from_micros(50));
+            }
+            Err(e) => panic!("submit failed: {e}"),
+        }
+    }
+}
+
+/// Bring up a purge-enabled node, run a snapshotting `RegisterSm` that writes
+/// `1..=n`, wait until the journal is ACTUALLY purged below a built snapshot,
+/// then crash the service. Leaves the node up with: journal purged
+/// (`archive_first_base > 0`), a covering snapshot on disk, all `n` writes
+/// committed + durable. Returns the ingress producer so the caller can drive
+/// further node-only commits.
+fn purged_node_after_snapshotting_service(dir: &Path, app: &str, n: u32) -> (Node, MpscProducer) {
+    let node = start_purge_node(dir, app);
+    wait_until(|| node.can_serve());
+
+    let svc1 = ServiceBuilder::new(
+        ServiceConfig::new(dir, app).snapshot_policy(SnapshotPolicy { interval_bytes: 4 * 1024 }),
+        RegisterSm::default(),
+    )
+    .start_with_snapshots()
+    .unwrap();
+
+    let prod = open_ingress(dir);
+    for i in 1..=n {
+        write_reg(&prod, i, i as u64);
+    }
+    wait_commit_covers_all(&node);
+    // A snapshot was published AND the node purged below it.
+    let cnc = open_cnc(dir, app);
+    wait_until(|| cnc.snapshots().service_snapshot_pos.load_acquire() > 0);
+    wait_until(|| node.archive_first_base() > 0);
+
+    svc1.crash();
+    (node, prod)
+}
+
+fn query_reg(svc: &Service<RegisterSm>) -> Option<u64> {
+    svc.query(())
+}
+
+#[test]
+fn fresh_service_below_purge_floor_installs_snapshot_then_tail_replays() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let app = "rec_snap";
+    let n = 4_000u32;
+    let (node, prod) = purged_node_after_snapshotting_service(dir.path(), app, n);
+
+    // Node-only commits AFTER the service died: these land above the last
+    // snapshot, so reconstruction must be snapshot-install + a real tail replay.
+    let final_val = n + 200;
+    for i in (n + 1)..=final_val {
+        write_reg(&prod, i, i as u64);
+    }
+    wait_commit_covers_all(&node);
+
+    // Service #2: a FRESH snapshot-capable RegisterSm. Its cursor 0 is below the
+    // purge floor → the gap guard installs the covering snapshot, then tail
+    // replay carries it to the live frontier — state == snapshot prefix + tail,
+    // exactly once.
+    let svc2 = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), app).snapshot_policy(SnapshotPolicy { interval_bytes: 0 }),
+        RegisterSm::default(),
+    )
+    .start_with_snapshots()
+    .unwrap();
+    let cnc = open_cnc(dir.path(), app);
+    wait_service_caught_up(&cnc);
+    assert_eq!(
+        query_reg(&svc2),
+        Some(final_val as u64),
+        "state == snapshot prefix + journal tail (install + tail replay)"
+    );
+
+    svc2.stop();
+    node.stop();
+}
+
+/// A snapshot capture buffer for the fail-stop test: the apply thread's
+/// `SnapshotRequired` panic is recorded by a scoped panic hook (the panic
+/// unwinds a background thread, so it never fails the test thread directly).
+static PANIC_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[test]
+fn gap_without_snapshot_capability_fails_stop_with_named_contract() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let app = "rec_nosnap";
+    let (node, _prod) = purged_node_after_snapshotting_service(dir.path(), app, 4_000);
+
+    // Record any panic message globally for the duration of this test. Success
+    // paths never panic, so cross-talk from sibling tests is a non-issue; we only
+    // assert on the SnapshotRequired substring.
+    PANIC_LOG.lock().unwrap().clear();
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|info| {
+        PANIC_LOG.lock().unwrap().push(info.to_string());
+    }));
+
+    // Service #2 is a CountSm — NO SnapshotStateMachine capability, so `.start()`
+    // leaves `snapshot_restore = None`. Attaching below the purge floor cannot
+    // install a snapshot: the apply agent must fail-stop with the contract named,
+    // never silently replay a partial prefix from `first_base` onto a phantom
+    // cursor.
+    let svc2 = ServiceBuilder::new(cfg(dir.path(), app), CountSm::default()).start().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let fired = loop {
+        if PANIC_LOG.lock().unwrap().iter().any(|m| m.contains("SnapshotRequired")) {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    std::panic::set_hook(prev);
+    assert!(fired, "the apply agent must fail-stop with SnapshotRequired within the deadline");
+
+    // The apply thread is dead; `crash()` joins via Drop (swallowing the panic),
+    // so teardown does not re-raise it.
+    svc2.crash();
+    node.stop();
+}
+
+/// The load-bearing silent-gap pin: an ACCUMULATING snapshot-capable SM below
+/// the purge floor must reconstruct the EXACT total. Without the gap guard +
+/// install, replay would silently start at `first_base`, drop the purged
+/// prefix's contributions, and converge to a total short by exactly that
+/// prefix's sum — "succeeding" with wrong state. The install closes it.
+#[test]
+fn snapshotting_count_sm_below_floor_recovers_exact_total() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let app = "rec_count_snap";
+    let n = 4_000u32;
+
+    let node = start_purge_node(dir.path(), app);
+    wait_until(|| node.can_serve());
+    let svc1 = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), app).snapshot_policy(SnapshotPolicy { interval_bytes: 4 * 1024 }),
+        CountSm::default(),
+    )
+    .start_with_snapshots()
+    .unwrap();
+    let prod = open_ingress(dir.path());
+    for i in 1..=n {
+        write_submit_retrying(&prod, 5, i, &Cmd::Add(1));
+    }
+    wait_commit_covers_all(&node);
+    let cnc = open_cnc(dir.path(), app);
+    wait_until(|| cnc.snapshots().service_snapshot_pos.load_acquire() > 0);
+    wait_until(|| node.archive_first_base() > 0);
+    svc1.crash();
+
+    // Node-only commits above the last snapshot.
+    let m = 200u32;
+    for i in (n + 1)..=(n + m) {
+        write_submit_retrying(&prod, 5, i, &Cmd::Add(1));
+    }
+    wait_commit_covers_all(&node);
+
+    // Fresh snapshot-capable CountSm: install the covering snapshot (its prefix
+    // total), then tail-replay the rest → the exact grand total, no prefix lost.
+    let svc2 = ServiceBuilder::new(
+        ServiceConfig::new(dir.path(), app).snapshot_policy(SnapshotPolicy { interval_bytes: 0 }),
+        CountSm::default(),
+    )
+    .start_with_snapshots()
+    .unwrap();
+    wait_service_caught_up(&cnc);
+    assert_eq!(
+        query_total(&svc2),
+        (n + m) as u64,
+        "accumulated total reconstructed EXACTLY — no purged-prefix contributions lost"
+    );
 
     svc2.stop();
     node.stop();

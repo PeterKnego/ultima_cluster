@@ -37,6 +37,9 @@ fn config_for(dir: &Path) -> NodeConfig {
         election_timeout_max_ns: 100_000_000,
         seed: 1,
         faults: FaultConfig::default(),
+        purge: uc2_node::PurgePolicy::Disabled,
+        learners: Vec::new(),
+        journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
     }
 }
 

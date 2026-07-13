@@ -28,4 +28,4 @@ pub mod ipc;
 mod node;
 
 pub use ipc::{InstanceDir, IpcError};
-pub use node::{Node, NodeConfig, SubmitError};
+pub use node::{DEFAULT_JOURNAL_SEGMENT_BYTES, Node, NodeConfig, PurgePolicy, SubmitError};

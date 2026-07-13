@@ -59,6 +59,15 @@ pub struct ElectionConfig {
     /// cluster — waits to learn commit / reconcile. Default 100_000_000 (100ms).
     pub gossip_floor_ns: u64,
     pub seed: u64,
+    /// M6 Task 7: candidacy switch. A voter (`true`) runs the ordinary election
+    /// path — times out, solicits votes, grants votes. A learner (`false`) is
+    /// replicated-to but never counted: its election timer never fires a
+    /// candidacy, and it never grants a `RequestVote` (it still ADOPTS a higher
+    /// term for liveness/reconcile — just never votes). By construction a
+    /// learner's own id is NOT in `members` (the voting set), so it also never
+    /// occupies a `CommitTracker` slot and its `Report` is dropped by
+    /// `follower_slot` — the two halves of "never affects quorum".
+    pub can_vote: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +150,11 @@ pub enum Action {
     /// panics (M6 snapshot install is the real fix). The sim asserts this never
     /// fires at `<= MAX_TERM_MAP_WIRE_ENTRIES` terms.
     Fatal { reason: &'static str },
+    /// M6 Task 8: a wipe-and-rejoin was decided (NoCommonPrefix). This is a pure
+    /// counter tag — the substantive work is the accompanying
+    /// `Truncate { to: 0, new_map: [] }` this is emitted alongside. The agent bumps
+    /// a `wipes` counter and takes no other action.
+    CountWipe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +174,8 @@ pub enum Role {
 pub struct ElectionSm {
     id: NodeId,
     members: Vec<NodeId>,
+    /// M6 Task 7: candidacy switch (see [`ElectionConfig::can_vote`]).
+    can_vote: bool,
     timeout_min_ns: u64,
     timeout_max_ns: u64,
     /// Idle re-gossip floor (see [`ElectionConfig::gossip_floor_ns`]).
@@ -213,6 +229,11 @@ pub struct ElectionSm {
     truncation_epoch: u64,
     /// The reconciled map to adopt once the matching `Truncated` feedback arrives.
     pending_new_map: Option<Vec<(u32, u64)>>,
+    /// M6 Task 8: on `Reconcile::NoCommonPrefix`, wipe-and-rejoin (truncate to 0 +
+    /// empty map) instead of fail-stopping. Default `true`. The sim counterfactual
+    /// flips it to `false` to reproduce the OLD `Action::Fatal` behavior and prove
+    /// the same divergent world fail-stops without the wipe.
+    wipe_on_no_common_prefix: bool,
 }
 
 impl ElectionSm {
@@ -227,13 +248,26 @@ impl ElectionSm {
         now_ns: u64,
     ) -> Self {
         // Fail loudly at construction, not via a usize underflow later
-        // (n_members - 1) or a nonsensical timer span.
-        assert!(
-            !cfg.members.is_empty() && cfg.members.contains(&cfg.id),
-            "election membership must be non-empty and contain self (id={}, members={:?})",
-            cfg.id,
-            cfg.members
-        );
+        // (n_members - 1) or a nonsensical timer span. A voter's own id must be
+        // in `members` (it occupies a CommitTracker slot and votes for itself);
+        // a learner's own id must NOT be — `members` is the voting set only, and
+        // a learner is replicated-to without ever being counted (M6 Task 7).
+        assert!(!cfg.members.is_empty(), "election membership must be non-empty");
+        if cfg.can_vote {
+            assert!(
+                cfg.members.contains(&cfg.id),
+                "a voter's id must be in the voting membership (id={}, members={:?})",
+                cfg.id,
+                cfg.members
+            );
+        } else {
+            assert!(
+                !cfg.members.contains(&cfg.id),
+                "a learner's id must NOT be in the voting membership (id={}, members={:?})",
+                cfg.id,
+                cfg.members
+            );
+        }
         // Hard-assert (M-2): a strictly positive timer span. An empty span
         // (`min == max`) collapses randomized election timeouts to a single
         // value across the cluster — a split-vote hazard — and a `min > max`
@@ -255,6 +289,7 @@ impl ElectionSm {
         let mut sm = Self {
             id: cfg.id,
             members: cfg.members,
+            can_vote: cfg.can_vote,
             timeout_min_ns: cfg.election_timeout_min_ns,
             timeout_max_ns: cfg.election_timeout_max_ns,
             gossip_floor_ns: cfg.gossip_floor_ns,
@@ -276,9 +311,17 @@ impl ElectionSm {
             truncating_epoch: None,
             truncation_epoch: 0,
             pending_new_map: None,
+            wipe_on_no_common_prefix: true,
         };
         sm.arm_timeout(now_ns);
         sm
+    }
+
+    /// M6 Task 8: toggle wipe-and-rejoin on `Reconcile::NoCommonPrefix`. Default
+    /// on (`true`). The sim counterfactual sets it `false` to reproduce the old
+    /// `Action::Fatal` fail-stop on the identical divergent world.
+    pub fn set_wipe_on_no_common_prefix(&mut self, v: bool) {
+        self.wipe_on_no_common_prefix = v;
     }
 
     pub fn step(&mut self, ev: Event, out: &mut Vec<Action>) {
@@ -376,6 +419,15 @@ impl ElectionSm {
                 // and the safety core enforces that here rather than trusting the
                 // transport (which a forged-source datagram could evade).
                 if !self.members.contains(&from) {
+                    return;
+                }
+                if !self.can_vote {
+                    // Learner: adopt a higher term (liveness/reconcile) but never
+                    // vote — it is not in the voting set and must not influence any
+                    // election. No rejection either: a learner emits no vote traffic.
+                    if new_term > self.current_term {
+                        self.adopt_term(new_term, None, out);
+                    }
                     return;
                 }
                 if new_term < self.current_term {
@@ -485,6 +537,31 @@ impl ElectionSm {
         &self.term_map
     }
 
+    /// M6 Task 8: adopt the leader's authoritative term-map lineage as our
+    /// baseline on installing a snapshot at a purge floor.
+    ///
+    /// A below-floor joiner (`durable < floor`) discards its local bytes and
+    /// installs the leader's snapshot, whose lineage IS the leader's committed
+    /// history up to the floor. Its term-map must become that lineage — otherwise
+    /// the shared prefix lives *inside* the snapshot, invisible to `reconcile`,
+    /// which would then see the leader's below-floor entries as un-stamped
+    /// divergence and clamp a truncate BELOW the adopted floor (a `PositionPurged`
+    /// fail-stop). Seeding here makes the very next `reconcile` a clean prefix
+    /// match. Entries at/above the floor are idempotently re-confirmed as the
+    /// tail replays (`DataTermObserved` is monotone below its last).
+    ///
+    /// Safe because it runs ONLY on a snapshot install (the node gates it on
+    /// `durable < floor`, i.e. we genuinely lack this history) with the leader's
+    /// own shipped map — never against local, possibly-divergent bytes.
+    pub fn adopt_snapshot_lineage(&mut self, lineage: &[(u32, u64)]) {
+        if lineage.is_empty() {
+            return;
+        }
+        self.term_map = lineage.to_vec();
+        let last_term = lineage.last().map(|(t, _)| *t).unwrap_or(0);
+        self.current_term = self.current_term.max(last_term);
+    }
+
     /// True while a truncation is in flight (the data-plane latch is held).
     pub fn is_truncating(&self) -> bool {
         self.truncating_epoch.is_some()
@@ -537,7 +614,13 @@ impl ElectionSm {
                     self.pending_leader_activity = false;
                     self.arm_timeout(now_ns);
                 } else if now_ns >= self.timeout_deadline_ns {
-                    self.start_election(now_ns, out);
+                    if self.can_vote {
+                        self.start_election(now_ns, out);
+                    } else {
+                        // Learner: the timer fires but never becomes a candidacy —
+                        // just re-arm so we keep tracking liveness without electing.
+                        self.arm_timeout(now_ns);
+                    }
                 }
             }
         }
@@ -612,6 +695,33 @@ impl ElectionSm {
     /// when the map merely grows, `Fatal` when there is no common prefix.
     fn reconcile_term_map(&mut self, entries: &[(u32, u64)], out: &mut Vec<Action>) {
         match reconcile(&self.term_map, self.durable, entries) {
+            Reconcile::NoCommonPrefix if self.wipe_on_no_common_prefix => {
+                // WIPE-AND-REJOIN (M6 Task 8). The divergence predates the leader's
+                // shipped term-map window — in M6 this is the real case where the
+                // leader PURGED its log prefix, so its earliest retained entry
+                // begins above our first byte and no incremental cut exists. Rather
+                // than fail-stop, discard our ENTIRE local log and rejoin as an
+                // empty follower: truncate to 0 with an empty map, then let the live
+                // stream refill us (NAK-replay, or a snapshot session when the
+                // leader has purged the prefix — Task 6). We reuse the ordinary
+                // truncate machinery verbatim (persist-empty-map → truncate_to(0)
+                // first-block arm → truncate_all → prime(0) → epoch'd ack → gate
+                // reopen), so a wipe is exactly `Truncate { to: 0, new_map: [] }`.
+                //
+                // SAFETY: this is only ever reached as a FOLLOWER adopting a
+                // higher-or-equal-term leader's map (a leader never reconciles
+                // against another map). The data-plane latch — allow-list
+                // {RequestVote, Vote, Truncated} — holds from this emit until the
+                // wipe's matching-epoch `Truncated` ack lands, so no post-wipe byte
+                // can be accepted (or reported) out of order, and the empty map we
+                // adopt is a trivial (zero-length) prefix of the leader's authority.
+                self.truncation_epoch += 1;
+                let epoch = self.truncation_epoch;
+                self.truncating_epoch = Some(epoch);
+                self.pending_new_map = Some(Vec::new());
+                out.push(Action::CountWipe);
+                out.push(Action::Truncate { epoch, to: 0, new_map: Vec::new() });
+            }
             Reconcile::NoCommonPrefix => out.push(Action::Fatal {
                 reason: "term-map reconciliation found no common prefix (snapshot install required)",
             }),
@@ -756,6 +866,7 @@ mod tests {
             // `idle_leader_reemits_on_gossip_floor` with a small floor.
             gossip_floor_ns: u64::MAX,
             seed: 42 + id as u64,
+            can_vote: true,
         }
     }
 
@@ -767,6 +878,7 @@ mod tests {
             election_timeout_max_ns: 300,
             gossip_floor_ns: u64::MAX,
             seed: 42 + id as u64,
+            can_vote: true,
         }
     }
 
@@ -803,6 +915,21 @@ mod tests {
         ElectionSm::new(cfg(0), None, &[(1, 0)], 0, 0)
     }
 
+    /// A learner (id 9, deliberately NOT in the voting set `[0,1,2]`): it is
+    /// replicated-to but never counted (M6 Task 7).
+    fn learner() -> ElectionSm {
+        let cfg = ElectionConfig {
+            id: 9,
+            members: vec![0, 1, 2],
+            election_timeout_min_ns: 150,
+            election_timeout_max_ns: 300,
+            gossip_floor_ns: u64::MAX,
+            seed: 7,
+            can_vote: false,
+        };
+        ElectionSm::new(cfg, None, &[(1, 0)], 0, 0)
+    }
+
     fn extract_truncate_epoch(out: &[Action]) -> u64 {
         out.iter()
             .find_map(|a| match a {
@@ -810,6 +937,66 @@ mod tests {
                 _ => None,
             })
             .expect("truncate issued")
+    }
+
+    #[test]
+    fn learner_never_becomes_a_candidate() {
+        let mut s = learner();
+        assert!(matches!(s.role(), Role::Follower));
+        let term0 = s.current_term(); // seeded from the recovered map, not candidacy
+        // Drive the election timer well past its max many times: a learner's timer
+        // fires but re-arms — it never solicits votes, never casts one, never
+        // leaves follower, and never bumps the term via candidacy.
+        for t in 1..=50u64 {
+            let acts = step(&mut s, Event::Tick { now_ns: t * 400 });
+            assert!(
+                !acts.iter().any(|a| matches!(a, Action::StartElection { .. })),
+                "a learner must never solicit votes"
+            );
+            assert!(
+                !acts.iter().any(|a| matches!(a, Action::PersistAndSendVote { .. })),
+                "a learner must never cast a vote (self or otherwise)"
+            );
+        }
+        assert!(matches!(s.role(), Role::Follower));
+        assert_eq!(s.current_term(), term0, "candidacy never bumped the term");
+    }
+
+    #[test]
+    fn learner_adopts_term_but_never_grants_a_vote() {
+        let mut s = learner();
+        // A voter solicits at term 5: the learner adopts the term (liveness /
+        // reconcile) but emits ZERO vote traffic — no grant, no rejection.
+        let acts = step(
+            &mut s,
+            Event::RequestVote { from: 0, new_term: 5, last_term: 1, last_durable: 10_000 },
+        );
+        assert_eq!(s.current_term(), 5, "learner adopted the higher term");
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::PersistAndSendVote { .. })),
+            "learner never grants a vote"
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::SendVoteRejection { .. })),
+            "learner emits no vote rejection either"
+        );
+        assert!(matches!(s.role(), Role::Follower));
+    }
+
+    #[test]
+    fn learner_report_never_advances_a_leaders_commit() {
+        // The phantom-commit-via-learner hole, pinned shut: a leader whose voting
+        // peers are silent must NOT commit on a learner's (sky-high) durable Report.
+        let mut s = sm(0);
+        step(&mut s, Event::Tick { now_ns: 301 }); // candidate, term 1
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true }); // majority → leader
+        assert!(matches!(s.role(), Role::Leader));
+        // A learner (id 9, NOT a voting member) reports a huge durable at our term.
+        let acts = step(&mut s, Event::Report { from: 9, term: 1, durable: 1 << 40 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            "a learner's Report must never advance commit (follower_slot drops it)"
+        );
     }
 
     #[test]
@@ -1183,6 +1370,7 @@ mod tests {
             election_timeout_max_ns: 300,
             gossip_floor_ns: 1000,
             seed: 42,
+            can_vote: true,
         };
         let mut s = ElectionSm::new(cfg, None, &[], 0, 0);
         // Drive to leader of term 1. `become_leader` re-anchors the idle floor to
@@ -1352,10 +1540,32 @@ mod tests {
         assert_eq!(last_durable, Some(500), "durable was clamped to the truncated point");
     }
 
-    /// Reconciliation with no common prefix surfaces `Fatal` (never truncates).
+    /// M6 Task 8: reconciliation with no common prefix WIPES-and-rejoins by
+    /// default — a `CountWipe` tag plus a truncate-to-0 with an empty map (never a
+    /// `Fatal`). own=[(1,0)] @5000 vs a leader whose shipped tail begins at 1<<20:
+    /// the leader's window slid past our first byte (its prefix was purged).
     #[test]
-    fn no_common_prefix_surfaces_fatal() {
+    fn no_common_prefix_wipes_and_rejoins() {
         let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 5000, 0);
+        step(&mut s, Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived { term: 41, entries: vec![(40, 1 << 20), (41, 2 << 20)] },
+        );
+        assert!(acts.iter().any(|a| matches!(a, Action::CountWipe)), "wipe was counted");
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::Truncate { to: 0, new_map, .. } if new_map.is_empty())),
+            "wipe is a truncate-to-0 with an empty map"
+        );
+        assert!(!acts.iter().any(|a| matches!(a, Action::Fatal { .. })), "no fail-stop");
+    }
+
+    /// The counterfactual: with wipe DISABLED, the identical world fail-stops with
+    /// `Fatal` (the old behavior) — documenting exactly what the wipe path changed.
+    #[test]
+    fn no_common_prefix_fatal_when_wipe_disabled() {
+        let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 5000, 0);
+        s.set_wipe_on_no_common_prefix(false);
         step(&mut s, Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
         let acts = step(
             &mut s,
@@ -1363,6 +1573,7 @@ mod tests {
         );
         assert!(acts.iter().any(|a| matches!(a, Action::Fatal { .. })));
         assert!(!acts.iter().any(|a| matches!(a, Action::Truncate { .. })));
+        assert!(!acts.iter().any(|a| matches!(a, Action::CountWipe)));
     }
 
     // ---- M5 truncation-epoch protocol (SM-owned ack identity) ----

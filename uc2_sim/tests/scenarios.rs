@@ -311,6 +311,54 @@ fn raw_m3_forged_report_phantom_commit_is_caught() {
     assert!(w.run_steps(2_000).is_err(), "phantom durable must trip an invariant");
 }
 
+/// M6 Task 8 — a NoCommonPrefix reconcile REACHES the wipe decision, and the
+/// wipe-DISABLED counterfactual fail-stops.
+///
+/// A leader whose shipped term-map tail has slid PAST a follower's first byte —
+/// its low-end entries dropped by log purge (the real M6 case, unreachable in a
+/// natural sim run capped at `MAX_TERM_MAP_WIRE_ENTRIES` terms) — leaves that
+/// follower NO common prefix. We craft the exact byte-for-byte "slid-past" wire
+/// tail and inject it into a follower holding a genuine `[(1,0)]` prefix, driving
+/// `reconcile` to `NoCommonPrefix` through the full sim data plane.
+///
+/// This runs the wipe-DISABLED counterfactual: the reconcile fail-stops
+/// (`Action::Fatal` -> `InvariantViolation`), which both proves the injection
+/// genuinely reaches `NoCommonPrefix` AND documents exactly what the default wipe
+/// path replaces (that `Fatal` becomes a truncate-to-0).
+///
+/// The POSITIVE wipe response (truncate-to-0 then refill) is proven exhaustively
+/// at the SM level (`election.rs` `no_common_prefix_wipes_and_rejoins`) and end to
+/// end through a real `Consensus` (`node.rs`
+/// `no_common_prefix_wipes_the_node_and_rejoins_empty`, which runs the true
+/// persist-empty-map -> truncate -> ack -> gate-reopen). It is NOT re-asserted in
+/// the sim because the sim deliberately cannot: a genuine NoCommonPrefix means the
+/// leader's window slid past the follower's COMMITTED prefix, so a faithful wipe
+/// discards locally-committed bytes whose safety derives from the SNAPSHOT backing
+/// the purge floor — and the sim models no snapshots, so its
+/// committed-never-truncated oracle (inv4) correctly refuses to bless a
+/// truncate-to-0 below a node's committed high-water. Modelling that is out of
+/// scope for M6's sim; the node-level test covers the real execution.
+#[test]
+fn no_common_prefix_reaches_wipe_and_fatal_when_disabled() {
+    let mut cfg = base_cfg(1);
+    cfg.data_plane = DataPlane::Mechanism { reopen_guard: true };
+    let mut w = World::new(cfg);
+    w.run_until_leader().expect("elect leader");
+    let leader = w.current_leader().unwrap();
+    // A follower with a genuine [(1,0)] prefix; isolate it so gossip does not
+    // repair it before the crafted slid-past tail lands.
+    let x = (0..3).find(|&i| i != leader).unwrap();
+    w.partition_node(x);
+    w.disable_wipe(x); // counterfactual: NoCommonPrefix must surface Fatal
+    let hi = w.node_term(x).max(w.node_term(leader)) + 40;
+    let tail = vec![(hi - 1, 1 << 20), (hi, 2 << 20)];
+    assert!(
+        w.inject_term_map(leader, x, hi, tail).is_err(),
+        "wipe-disabled: a below-window map must reach NoCommonPrefix -> fail-stop"
+    );
+    assert_eq!(w.wipes(), 0, "no wipe counted in the counterfactual");
+}
+
 #[test]
 fn fuzz_default_seeds() {
     for seed in 0..50u64 {

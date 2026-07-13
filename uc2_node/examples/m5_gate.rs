@@ -275,6 +275,9 @@ fn node_config(
         election_timeout_max_ns: ELECTION_TIMEOUT_MAX_NS,
         seed: seed_for(id),
         faults: FaultConfig::default(),
+        purge: uc2_node::PurgePolicy::Disabled,
+        learners: Vec::new(),
+        journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
     }
 }
 

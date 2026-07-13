@@ -29,8 +29,8 @@ serde = { workspace = true }
 bincode = { workspace = true }
 tempfile = { workspace = true }
 rand = { workspace = true }
-# m5_gate (Task 15): CLI parsing, latency histogram, error plumbing for the
-# node/service reference-binary roles.
+# m5_gate (Task 15) / m6_gate (M6 Task 10): CLI parsing, latency histogram,
+# error plumbing for the node/service/learner reference-binary + gate roles.
 clap = { workspace = true }
 hdrhistogram = { workspace = true }
 anyhow = { workspace = true }

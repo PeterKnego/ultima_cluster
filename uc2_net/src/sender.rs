@@ -11,7 +11,9 @@
 //! wire, sending live ring memory could transmit silently corrupt bytes.
 
 use std::collections::VecDeque;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -19,9 +21,11 @@ use std::time::Instant;
 
 use uc2_log::archive::find_block;
 use uc2_log::buffer::{LogBuffer, SliceRead};
+use uc2_log::cnc::CncPage;
 use uc_protocol::v2::datagram::{
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DatagramHeader, MTU_DEFAULT,
-    write_datagram_header,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_SNAP_BEGIN,
+    DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_BODY_LEN, SnapBeginBody,
+    write_datagram_header, write_snap_begin_body,
 };
 use uc_protocol::v2::frame::{
     FRAME_ALIGNMENT, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len, read_header,
@@ -45,6 +49,19 @@ const REPLAY_DGRAMS_PER_NAK: usize = 8;
 /// M2 gate was ~10k NAKs over a whole run.
 const NAK_QUEUE_MAX: usize = 1024;
 
+/// Snapshot-session chunk datagrams a single duty cycle may emit (M6 Task 6,
+/// spec §5 "separately paced"). Strictly below live DATA + NAK-replay: the
+/// session is driven LAST in `do_work`, after the fan-out and NAK budgets, and
+/// capped here so a transfer can never starve the live stream — a session under
+/// contention just takes more cycles (bounded catch-up is the gate's measure,
+/// not a deadline).
+const SNAP_DGRAMS_PER_CYCLE: usize = 4;
+
+/// A snapshot session with no NAK and no DONE for this long is abandoned (the
+/// peer died mid-transfer, or its DONE was lost). The peer re-NAKs below the
+/// floor if it still needs the snapshot, reopening a fresh session.
+const SNAP_SESSION_TIMEOUT_NS: u64 = 30_000_000_000;
+
 /// Control messages routed from the leader's receiver agent (Task 8).
 /// Bounded channel; a dropped message is safe (NAK re-fires after backoff,
 /// status re-sends on its floor).
@@ -58,6 +75,34 @@ const NAK_QUEUE_MAX: usize = 1024;
 pub enum CtrlMsg {
     Nak { from: SocketAddr, position: u64, length: u32 },
     Status { from: SocketAddr, contiguous: u64, window: u32 },
+    /// M6 Task 6: the snapshot-session peer requests a missing file range.
+    SnapNak { from: SocketAddr, session: u32, offset: u64, length: u32 },
+    /// M6 Task 6: the snapshot-session peer signals the file is complete.
+    SnapDone { from: SocketAddr, session: u32 },
+}
+
+/// M6 Task 6: newest durable snapshot artifact the node is willing to ship —
+/// `(snapshot_pos, path, total_len)`. The node wires this to `SnapshotStore`
+/// filtered by its PERSISTED floor marker (never a half-written file). `None`
+/// = no shippable snapshot (the NAK stays an overrun).
+pub type SnapshotSource = Arc<dyn Fn() -> Option<(u64, PathBuf, u64)> + Send + Sync>;
+
+/// One in-flight outbound snapshot transfer (M6 Task 6). At most one at a time
+/// — a second requester waits; sessions are rare by construction (only a peer
+/// whose NAK fell below the purge floor triggers one).
+struct SnapSession {
+    peer: SocketAddr,
+    session: u32,
+    snapshot_pos: u64,
+    file: std::fs::File,
+    total_len: u64,
+    /// Next sequential byte offset to ship (the contiguous fill cursor).
+    cursor: u64,
+    /// Peer-requested missing ranges (repair), served before the cursor.
+    naks: VecDeque<(u64, u32)>,
+    /// SNAP_BEGIN has been sent (first cycle sends it before any chunk).
+    begun: bool,
+    last_activity_ns: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -113,6 +158,13 @@ pub struct SenderStats {
     /// at an arbitrary offset would panic the sender agent); the wire has no
     /// CRC, so a bit-flip escaping the UDP checksum could misalign a position.
     pub naks_rejected: AtomicU64,
+    /// M6 Task 6: snapshot sessions opened (a below-floor NAK upgraded to a file
+    /// ship instead of counting an overrun).
+    pub snap_sessions: AtomicU64,
+    /// M6 Task 6: SNAP_CHUNK datagrams sent (cursor fill + repair).
+    pub snap_chunks: AtomicU64,
+    /// M6 Task 6: SNAP_CHUNK datagrams sent specifically to repair a peer NAK.
+    pub snap_chunk_naks: AtomicU64,
 }
 
 pub struct Sender {
@@ -151,7 +203,24 @@ pub struct Sender {
     /// durable base, and a stale cached cursor would re-stream and regress the
     /// counter.
     was_leader: bool,
+    /// M6 Task 6: newest shippable snapshot resolver (node-wired). `None` = this
+    /// node never ships snapshots (a below-floor NAK stays an overrun).
+    snapshot_source: Option<SnapshotSource>,
+    /// M6 Task 6: the single in-flight outbound snapshot session, if any.
+    snap: Option<SnapSession>,
+    /// M6 Task 6: monotonic session-id generator — distinguishes a fresh session
+    /// from a just-closed one so a stale SNAP_NAK/SNAP_DONE can't cross-talk.
+    snap_session_seq: u32,
+    /// M6 Task 9: cnc observability band + addr→slot map. `None` on nodes that
+    /// never lead and in unit tests. Once per duty cycle the sender fills each
+    /// peer's `advertised_limit` from its flow-control view (bounded — a pass over
+    /// ≤8 slots, no per-datagram cnc writes). Diagnostics only.
+    peer_obs: Option<PeerObs>,
 }
+
+/// M6 Task 9: the sender's observability handle — the cnc page plus the
+/// `(peer addr, slot index)` map it fills with `advertised_limit`.
+type PeerObs = (Arc<CncPage>, Vec<(SocketAddr, usize)>);
 
 impl Sender {
     #[allow(clippy::too_many_arguments)]
@@ -165,11 +234,34 @@ impl Sender {
         term: TermHandle,
         role: Arc<AtomicBool>,
     ) -> Sender {
+        Self::with_learners(buffer, sock, followers, &[], cluster_size, ctrl, cfg, term, role)
+    }
+
+    /// M6 Task 7: leader-side voter/learner split. `followers` is the full fan-out
+    /// (voters-minus-self ++ learners, streamed identically); `learners` is the
+    /// subset excluded from flow-control's quorum statistic. `cluster_size` is the
+    /// VOTING cluster size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_learners(
+        buffer: Arc<LogBuffer>,
+        sock: FaultSocket,
+        followers: Vec<SocketAddr>,
+        learners: &[SocketAddr],
+        cluster_size: usize,
+        ctrl: mpsc::Receiver<CtrlMsg>,
+        cfg: SenderConfig,
+        term: TermHandle,
+        role: Arc<AtomicBool>,
+    ) -> Sender {
         assert!(
             align_frame_len(HEADER_LEN + buffer.max_payload()) + DATAGRAM_HEADER_LEN <= cfg.mtu,
             "a max-size frame must fit one datagram (raise mtu — the jumbo-frame knob)"
         );
-        let flow = FlowControl::new(&followers, cluster_size, cfg.initial_window);
+        // Voting followers pace commit; learners are fanned-out to but never enter
+        // `limit()`.
+        let voting: Vec<SocketAddr> =
+            followers.iter().copied().filter(|a| !learners.contains(a)).collect();
+        let flow = FlowControl::new(&voting, cluster_size, cfg.initial_window, learners);
         let sent = buffer.counters().sent.load_acquire();
         Sender {
             buffer,
@@ -189,11 +281,30 @@ impl Sender {
             term,
             role,
             was_leader: false,
+            snapshot_source: None,
+            snap: None,
+            snap_session_seq: 0,
+            peer_obs: None,
         }
     }
 
     pub fn stats(&self) -> Arc<SenderStats> {
         Arc::clone(&self.stats)
+    }
+
+    /// M6 Task 9: wire the cnc observability band + addr→slot map. The sender
+    /// fills each peer's `advertised_limit` once per duty cycle. Without this call
+    /// the band's sender-owned cells stay dormant (unit tests, non-leaders).
+    pub fn set_peer_slots(&mut self, cnc: Arc<CncPage>, slots: Vec<(SocketAddr, usize)>) {
+        self.peer_obs = Some((cnc, slots));
+    }
+
+    /// Wire the newest-shippable-snapshot resolver (M6 Task 6). Without it a
+    /// below-floor NAK stays an overrun; with it that NAK upgrades to a snapshot
+    /// session. The node supplies a closure over `SnapshotStore` filtered by its
+    /// durable floor marker, so a session only ever ships a fully-published file.
+    pub fn set_snapshot_source(&mut self, src: SnapshotSource) {
+        self.snapshot_source = Some(src);
     }
 
     /// Wire the archive's journal in as the retransmit source for deep NAKs
@@ -260,6 +371,28 @@ impl Sender {
                             self.stats.naks_dropped.fetch_add(1, Ordering::Relaxed);
                         }
                         self.naks.push_back((from, position, length));
+                    }
+                }
+                CtrlMsg::SnapNak { from, session, offset, length } => {
+                    // A repair request for the active session only (a stale
+                    // session id — the peer NAKing a transfer we already closed —
+                    // is dropped). Bounded implicitly by the file size / peer.
+                    if let Some(s) = self.snap.as_mut()
+                        && s.peer == from
+                        && s.session == session
+                    {
+                        s.naks.push_back((offset, length));
+                        s.last_activity_ns = self.base.elapsed().as_nanos() as u64;
+                    }
+                }
+                CtrlMsg::SnapDone { from, session } => {
+                    // The peer has the whole file — close the session (frees the
+                    // slot for the next requester).
+                    if let Some(s) = self.snap.as_ref()
+                        && s.peer == from
+                        && s.session == session
+                    {
+                        self.snap = None;
                     }
                 }
             }
@@ -332,6 +465,13 @@ impl Sender {
             self.stats.flow_stalls.fetch_add(1, Ordering::Relaxed);
         }
 
+        // M6 Task 6: drive the snapshot session LAST — strictly below live DATA
+        // and NAK-replay (both already served above), capped per cycle, so a
+        // transfer can never starve the live stream.
+        if self.drive_snap_session() {
+            did = true;
+        }
+
         let now = self.now_ns();
         if now - self.last_heartbeat_ns >= self.cfg.heartbeat_ns {
             self.last_heartbeat_ns = now;
@@ -344,6 +484,18 @@ impl Sender {
             // sender no longer ranks or gossips commit at all (M4 carry #5).
             self.stats.heartbeats.fetch_add(1, Ordering::Relaxed);
             did = true;
+        }
+
+        // M6 Task 9: refresh each peer's `advertised_limit` in the cnc band from
+        // the flow-control view. Bounded (≤8 slots, once per cycle); leader-only
+        // (this point is past the `!leader_role` return) so a demoted node stops
+        // updating. Diagnostics — never gates the stream.
+        if let Some((cnc, slots)) = &self.peer_obs {
+            for (addr, idx) in slots {
+                if let Some(limit) = self.flow.advertised_limit(*addr) {
+                    cnc.peer_slot(*idx).advertised_limit.store_release(limit);
+                }
+            }
         }
         did
     }
@@ -398,7 +550,15 @@ impl Sender {
                     // unrecoverable overrun. Bounded to `REPLAY_DGRAMS_PER_NAK`
                     // datagrams — the follower re-NAKs the remainder.
                     if !self.serve_nak_from_journal(to, p, end) {
-                        self.stats.overruns.fetch_add(1, Ordering::Relaxed);
+                        // Below the purge floor: gone from ring AND journal. M6
+                        // Task 6 — upgrade to a snapshot session (ship the newest
+                        // durable snapshot file to this peer) instead of counting
+                        // an unrecoverable overrun. If none can be opened (no
+                        // source, no file, or a session is already in flight) it
+                        // stays an overrun and the peer re-NAKs.
+                        if !self.try_open_snap_session(to) {
+                            self.stats.overruns.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     break;
                 }
@@ -456,6 +616,148 @@ impl Sender {
             p = block_end;
         }
         served_any
+    }
+
+    // -- M6 Task 6: snapshot session -----------------------------------------
+
+    /// Try to open a snapshot session to `to` in response to a below-floor NAK.
+    /// Returns `false` (caller counts an overrun) when: a session is already in
+    /// flight (one at a time — the peer re-NAKs and waits), no source is wired,
+    /// no shippable snapshot exists, or the file cannot be opened.
+    fn try_open_snap_session(&mut self, to: SocketAddr) -> bool {
+        if self.snap.is_some() {
+            return false;
+        }
+        let Some(src) = self.snapshot_source.clone() else {
+            return false;
+        };
+        let Some((pos, path, len)) = src() else {
+            return false;
+        };
+        let Ok(file) = std::fs::File::open(&path) else {
+            return false;
+        };
+        let sid = self.snap_session_seq.wrapping_add(1);
+        self.snap_session_seq = sid;
+        self.snap = Some(SnapSession {
+            peer: to,
+            session: sid,
+            snapshot_pos: pos,
+            file,
+            total_len: len,
+            cursor: 0,
+            naks: VecDeque::new(),
+            begun: false,
+            last_activity_ns: self.base.elapsed().as_nanos() as u64,
+        });
+        self.stats.snap_sessions.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Advance the in-flight snapshot session by at most [`SNAP_DGRAMS_PER_CYCLE`]
+    /// chunk datagrams: send SNAP_BEGIN once, then serve peer repair NAKs, then
+    /// fill the cursor sequentially. Abandons the session after
+    /// [`SNAP_SESSION_TIMEOUT_NS`] with no progress. Returns `true` iff it did work.
+    fn drive_snap_session(&mut self) -> bool {
+        let Some(mut sess) = self.snap.take() else {
+            return false;
+        };
+        let now = self.base.elapsed().as_nanos() as u64;
+        if now.saturating_sub(sess.last_activity_ns) >= SNAP_SESSION_TIMEOUT_NS {
+            // Abandoned (peer died, or its DONE was lost): drop the session; the
+            // slot frees for the next requester. `self.snap` stays `None`.
+            return true;
+        }
+
+        let mut did = false;
+        if !sess.begun {
+            self.send_snap_begin(sess.peer, sess.session, sess.snapshot_pos, sess.total_len);
+            sess.begun = true;
+            did = true;
+        }
+
+        let mut emitted = 0usize;
+        // Repair NAKs first (the peer is blocked on these).
+        while emitted < SNAP_DGRAMS_PER_CYCLE {
+            let Some((offset, length)) = sess.naks.pop_front() else {
+                break;
+            };
+            let n = self.send_snap_chunk(&mut sess, offset, true);
+            if n == 0 {
+                break; // offset past EOF / read error — drop the request
+            }
+            if (n as u32) < length {
+                // Range spans multiple datagrams: re-queue the remainder.
+                sess.naks.push_front((offset + n as u64, length - n as u32));
+            }
+            emitted += 1;
+            did = true;
+        }
+        // Then sequential cursor fill.
+        while emitted < SNAP_DGRAMS_PER_CYCLE && sess.cursor < sess.total_len {
+            let at = sess.cursor;
+            let n = self.send_snap_chunk(&mut sess, at, false);
+            if n == 0 {
+                break;
+            }
+            sess.cursor += n as u64;
+            emitted += 1;
+            did = true;
+        }
+
+        if did {
+            sess.last_activity_ns = now;
+        }
+        self.snap = Some(sess);
+        did
+    }
+
+    /// Read one MTU-sized chunk from the snapshot file at `offset` and ship it as
+    /// a SNAP_CHUNK (header `position` = file offset). Returns bytes sent (0 on
+    /// EOF / read error).
+    fn send_snap_chunk(&mut self, sess: &mut SnapSession, offset: u64, is_nak: bool) -> usize {
+        if offset >= sess.total_len {
+            return 0;
+        }
+        let want = ((sess.total_len - offset) as usize).min(self.cfg.mtu - DATAGRAM_HEADER_LEN);
+        let mut buf = vec![0u8; want];
+        if sess.file.seek(SeekFrom::Start(offset)).is_err() {
+            return 0;
+        }
+        if sess.file.read_exact(&mut buf).is_err() {
+            return 0;
+        }
+        self.assemble_snap(offset, DGRAM_KIND_SNAP_CHUNK, &buf);
+        let _ = self.sock.send_to(&self.scratch, sess.peer);
+        self.stats.snap_chunks.fetch_add(1, Ordering::Relaxed);
+        if is_nak {
+            self.stats.snap_chunk_naks.fetch_add(1, Ordering::Relaxed);
+        }
+        want
+    }
+
+    /// Ship SNAP_BEGIN (header `position` = 0; body carries session/pos/len).
+    fn send_snap_begin(&mut self, peer: SocketAddr, session: u32, snapshot_pos: u64, total_len: u64) {
+        let mut body = [0u8; SNAP_BEGIN_BODY_LEN];
+        write_snap_begin_body(&mut body, &SnapBeginBody { session, snapshot_pos, total_len });
+        self.assemble_snap(0, DGRAM_KIND_SNAP_BEGIN, &body);
+        let _ = self.sock.send_to(&self.scratch, peer);
+    }
+
+    /// Assemble a snapshot-session datagram (header + explicit body) into scratch.
+    fn assemble_snap(&mut self, position: u64, kind: u8, payload: &[u8]) {
+        self.scratch.clear();
+        self.scratch.resize(DATAGRAM_HEADER_LEN, 0);
+        write_datagram_header(
+            &mut self.scratch,
+            &DatagramHeader {
+                position,
+                leadership_term_id: self.term.load(Ordering::Relaxed),
+                kind,
+                flags: 0,
+            },
+        );
+        self.scratch.extend_from_slice(payload);
     }
 
     /// Assemble a DATA datagram from an arbitrary body slice (a journal-replay

@@ -74,6 +74,9 @@ struct NodeH {
     /// Derived (`instance_dir/journal`) — kept for the replay-equality checks.
     journal_dir: PathBuf,
     seed: u64,
+    /// The ring size this node booted with — a restart MUST reuse it (the cnc
+    /// geometry is fixed at create time).
+    buffer_bytes: usize,
     node: Option<Node>,
 }
 
@@ -101,6 +104,9 @@ impl NodeH {
     }
     fn truncations(&self) -> u64 {
         self.n().truncations()
+    }
+    fn replay_datagrams(&self) -> u64 {
+        self.n().replay_datagrams()
     }
 
     /// Best-effort submit: retry the bounded ingress while `Full`, fail fast on
@@ -151,8 +157,14 @@ impl NodeH {
     fn restart(&mut self, members: &[(NodeId, SocketAddr)]) {
         assert!(self.node.is_none(), "restart of a live node");
         let sock = rebind(self.addr);
-        let cfg =
-            make_config(self.id, members.to_vec(), self.instance_dir.clone(), self.seed, self.addr);
+        let cfg = make_config_ring(
+            self.id,
+            members.to_vec(),
+            self.instance_dir.clone(),
+            self.seed,
+            self.addr,
+            self.buffer_bytes,
+        );
         self.node = Some(Node::start_with_socket(cfg, sock).expect("restart"));
     }
 }
@@ -171,12 +183,19 @@ fn rebind(addr: SocketAddr) -> UdpSocket {
 
 /// Per-node config with the shared harness knobs (see module docs). `bind` is
 /// ignored by `start_with_socket` but the field is required.
-fn make_config(
+/// Default ring: 4 MiB, no wrap within a test (see module docs).
+const DEFAULT_RING: usize = 1 << 22;
+
+/// Per-node config with an explicit ring size — the prefill-decision pin
+/// uses a small ring so a catch-up gap scrolls OUT of the ring and must be
+/// served from the journal (replay) rather than the live buffer.
+fn make_config_ring(
     id: NodeId,
     members: Vec<(NodeId, SocketAddr)>,
     instance_dir: PathBuf,
     seed: u64,
     addr: SocketAddr,
+    buffer_bytes: usize,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -184,13 +203,16 @@ fn make_config(
         bind: addr,
         instance_dir,
         app_id: "failover".into(),
-        buffer_bytes: 1 << 22, // 4 MiB: no wrap within a test (see module docs)
+        buffer_bytes,
         max_payload: 256,
         admission_bytes: 256 * 1024,
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
         seed,
         faults: FaultConfig::default(),
+        purge: uc2_node::PurgePolicy::Disabled,
+        learners: Vec::new(),
+        journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
     }
 }
 
@@ -213,6 +235,12 @@ struct Cluster {
 /// Bind every node's socket FIRST (so the full member map is known before any
 /// agent runs), then start each node on its pre-bound socket.
 fn spawn_cluster(n: usize) -> Cluster {
+    spawn_cluster_ring(n, DEFAULT_RING)
+}
+
+/// As [`spawn_cluster`] but with an explicit ring size (the prefill-decision pin
+/// uses a small ring). Every node — and its restarts — boots with `buffer_bytes`.
+fn spawn_cluster_ring(n: usize, buffer_bytes: usize) -> Cluster {
     let dir = tempfile::Builder::new()
         .prefix("uc2-failover-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -235,7 +263,14 @@ fn spawn_cluster(n: usize) -> Cluster {
         let instance_dir = dir.path().join(format!("n{i}"));
         let journal_dir = instance_dir.join("journal");
         let seed = seed_for(i);
-        let cfg = make_config(i as NodeId, members.clone(), instance_dir.clone(), seed, addr);
+        let cfg = make_config_ring(
+            i as NodeId,
+            members.clone(),
+            instance_dir.clone(),
+            seed,
+            addr,
+            buffer_bytes,
+        );
         let node = Node::start_with_socket(cfg, sock).expect("start");
         nodes.push(NodeH {
             id: i as NodeId,
@@ -243,6 +278,7 @@ fn spawn_cluster(n: usize) -> Cluster {
             instance_dir,
             journal_dir,
             seed,
+            buffer_bytes,
             node: Some(node),
         });
     }
@@ -401,6 +437,74 @@ fn boot_elects_exactly_one_leader_and_commits() {
 
     c.stop_all();
     let dirs: Vec<&PathBuf> = c.nodes.iter().map(|n| &n.journal_dir).collect();
+    assert_replay_equal(&dirs);
+}
+
+/// Test 6 (M6 Task 9 — prefill decision, Decision #6): a restarted node does NOT
+/// prefill its send ring from the journal. Instead a below-ring catch-up gap is
+/// served **on demand from the journal** (deep-NAK replay). Proven with a small
+/// ring so the gap that opens while a follower is down scrolls OUT of the leader's
+/// ring: on restart the follower NAKs below the ring, the leader serves those
+/// datagrams from the journal (`replay_datagrams > 0`), and the follower converges
+/// — all with no ring prefill anywhere.
+#[test]
+fn restarted_follower_below_ring_gap_is_served_from_journal_not_prefilled() {
+    let _g = serialize();
+    // 256 KiB ring = 2048 × 128 B frames. A gap wider than this cannot be served
+    // from the ring — only the journal.
+    const RING: usize = 1 << 18;
+    const RING_FRAMES: u64 = (RING as u64) / FRAME; // 2048
+    let mut c = spawn_cluster_ring(3, RING);
+    let members = c.members.clone();
+
+    let leader = await_single_leader(&c.nodes, 30);
+    let term_before = c.nodes[leader].term();
+    // A modest baseline everyone holds.
+    let target1 = NEW_TERM + 200 * FRAME;
+    submit_n(&c.nodes[leader], 200);
+    await_all(&c.nodes, target1, 60, "baseline commit", NodeH::commit);
+    await_all(&c.nodes, target1, 60, "baseline durable", NodeH::durable);
+
+    // Stop a follower; the leader + the other follower keep quorum (2 of 3).
+    let follower = (0..3).find(|&i| i != leader).expect("a follower exists");
+    let other = (0..3).find(|&i| i != leader && i != follower).unwrap();
+    c.nodes[follower].stop();
+
+    // Commit far MORE than one ring while it is down, so its frontier (`target1`)
+    // ends up well below the leader's ring tail — 5× the ring.
+    let gap_frames = 5 * RING_FRAMES;
+    submit_n(&c.nodes[leader], gap_frames);
+    let target2 = target1 + gap_frames * FRAME;
+    await_until(90, "leader commit past the gap", || c.nodes[leader].commit() >= target2);
+    await_until(90, "quorum follower commit past the gap", || {
+        c.nodes[other].commit() >= target2
+    });
+    assert_eq!(c.nodes[leader].term(), term_before, "term bumped while a follower was down");
+
+    let replay_before = c.nodes[leader].replay_datagrams();
+
+    // Restart the follower: it recovers durable state, adopts the current term,
+    // and must catch up across the below-ring gap.
+    c.nodes[follower].restart(&members);
+    await_until(60, "restarted follower did not adopt the current term", || {
+        c.nodes[follower].term() == term_before
+    });
+    await_until(90, "restarted follower did not catch up across the below-ring gap", || {
+        c.nodes[follower].durable() >= target2
+    });
+
+    // The evidence: the leader served the gap from the JOURNAL, not the ring — so
+    // no node ever prefilled its ring on restart.
+    let replay_after = c.nodes[leader].replay_datagrams();
+    assert!(
+        replay_after > replay_before,
+        "below-ring catch-up served no journal-replay datagrams \
+         (replay_datagrams {replay_before} -> {replay_after}); the gap was not below the ring"
+    );
+    assert!(!c.nodes[follower].is_leader(), "restarted follower unexpectedly became leader");
+
+    c.stop_all();
+    let dirs: Vec<&PathBuf> = (0..3).map(|i| &c.nodes[i].journal_dir).collect();
     assert_replay_equal(&dirs);
 }
 

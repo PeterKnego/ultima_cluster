@@ -11,6 +11,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use uc2_log::cnc::CncPage;
@@ -19,9 +21,53 @@ use uc_protocol::ring::SpscConsumer;
 use uc_protocol::v2::cnc::NODE_FLAG_LEADER;
 use uc_protocol::v2::frame::FRAME_TYPE_MESSAGE;
 
+use crate::builder_agent::BuildJob;
+use crate::config::SnapshotError;
 use crate::egress::Egress;
 use crate::replay::replay_into;
 use crate::traits::StateMachine;
+
+/// Boxed "freeze the current state and produce a streaming job" closure. Built
+/// once, in [`crate::ServiceBuilder::start_with_snapshots`], where the
+/// `S: SnapshotStateMachine` bound is available; stored here behind a plain
+/// `S: StateMachine`-bounded type so [`ApplyState`] itself needs no such bound.
+pub(crate) type FreezeFn<S> = Box<dyn Fn(&S) -> Result<(BuildJob, u64), SnapshotError> + Send>;
+
+/// Boxed "install this snapshot stream into the SM" closure (M6 Task 5). Same
+/// type-erasure trick as [`FreezeFn`]: built in `start_with_snapshots` where
+/// `S: SnapshotStateMachine`, called by the reconstruction path on the apply
+/// thread with the SM lock held (install IS state mutation). Returns the
+/// post-install position `S` (== the artifact's tag).
+pub(crate) type InstallFn<S> =
+    Box<dyn Fn(&mut S, u64, &mut dyn std::io::Read) -> Result<u64, SnapshotError> + Send>;
+
+/// The apply thread's below-the-floor reconstruction capability (M6 Task 5).
+/// Present only for a snapshot-capable service (`start_with_snapshots`); its
+/// absence is what turns a below-floor gap into [`ServiceError::SnapshotRequired`]
+/// fail-stop instead of a covering install.
+pub(crate) struct SnapshotRestore<S: StateMachine> {
+    pub(crate) store: crate::snapshots::SnapshotStore,
+    pub(crate) install: InstallFn<S>,
+}
+
+/// M6 Task 3: the apply thread's half of the snapshot-builder handoff. Present
+/// only when the service was started via `start_with_snapshots`; `None` for a
+/// plain `start()` (or an SM that never opted in) means [`maybe_build_snapshot`]
+/// is a no-op every cycle.
+pub(crate) struct SnapshotTrigger<S: StateMachine> {
+    pub(crate) policy: crate::config::SnapshotPolicy,
+    /// The position basis for the next interval check: updated to the
+    /// attempted position whenever a freeze is attempted (success OR failure)
+    /// — see [`maybe_build_snapshot`]'s doc for why a failure still advances
+    /// this rather than hot-looping a retry every cycle.
+    pub(crate) last_snapshot_pos: u64,
+    /// Shared with the builder thread's `BuilderState`. Gates BOTH directions
+    /// of "one in-flight build max": checked here before even calling
+    /// `freeze()`, held by the builder for the full stream+publish duration.
+    pub(crate) busy: Arc<AtomicBool>,
+    pub(crate) tx: mpsc::SyncSender<(u64, BuildJob)>,
+    pub(crate) freeze: FreezeFn<S>,
+}
 
 /// Everything the apply thread owns. Fields are accessed directly (not through
 /// `&self` methods) inside the frames loop so the borrow checker sees the
@@ -70,6 +116,12 @@ pub(crate) struct ApplyState<S: StateMachine> {
     /// for a newer one). #2c fail-stops on the node-restart case; this closes the
     /// same-node service-restart case.
     pub(crate) my_epoch: u64,
+    /// M6 Task 3: `Some` only for a service started via `start_with_snapshots`.
+    pub(crate) snapshot_trigger: Option<SnapshotTrigger<S>>,
+    /// M6 Task 5: below-floor reconstruction (snapshot install + tail replay).
+    /// `Some` only for a snapshot-capable service; `None` makes a below-floor
+    /// gap fail-stop with [`ServiceError::SnapshotRequired`].
+    pub(crate) snapshot_restore: Option<SnapshotRestore<S>>,
 }
 
 /// One apply duty cycle. Returns `true` iff it made progress (drove the idle
@@ -152,8 +204,18 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
             // cursor while replay ran, degrades once more from a strictly higher
             // cursor. Forward progress every time.
             st.needs_replay = true;
-            let cursor = replay_into(&st.sm, &st.cnc, &st.journal_dir)
-                .expect("service journal replay fail-stop");
+            let cursor = match replay_into(
+                &st.sm,
+                &st.cnc,
+                &st.journal_dir,
+                st.snapshot_restore.as_ref(),
+            ) {
+                Ok(cursor) => cursor,
+                // Fail-stop with the contract named (Display carries it). The
+                // SnapshotRequired case is the deliberate below-floor-without-
+                // -snapshot outcome; any other Err is genuine journal I/O.
+                Err(e) => panic!("service journal replay fail-stop: {e}"),
+            };
             st.follower.cursor = cursor;
             st.cnc.service().service_applied.store_release(cursor);
             st.needs_replay = false;
@@ -165,7 +227,73 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
     // Liveness: a wall-clock heartbeat the node compares against its own clock.
     st.cnc.status().service_heartbeat_ns.store_release(unix_ns());
     drain_queries(st);
+    // M6 Task 3: the freeze hook, last in the cycle (module doc / brief) —
+    // strictly after the batch loop above has published this cycle's
+    // `service_applied`, so a freeze taken here always sees the freshest
+    // position this cycle produced.
+    maybe_build_snapshot(st);
     progressed
+}
+
+/// Check the snapshot policy's interval and, if tripped, `freeze()` the SM
+/// (taking its lock briefly — NOT the whole cycle's lock span) and hand the
+/// resulting streaming job to the builder thread over the 1-slot channel.
+///
+/// No-op whenever: there is no trigger (plain `start()`, or an SM that never
+/// opted into `start_with_snapshots`); the policy is `interval_bytes: 0`
+/// ("never" — the default); a build is already in flight (`busy`); or the
+/// threshold hasn't tripped yet.
+///
+/// **Both freeze failure and a full/disconnected handoff still advance
+/// `last_snapshot_pos`** to this cycle's `service_applied` — deliberately: the
+/// alternative (leaving the basis unchanged) would re-attempt `freeze()` every
+/// single apply cycle for as long as the failure persists, turning "next
+/// interval retries" into a hot loop of freeze calls + log lines. Advancing the
+/// basis means a genuinely broken `freeze()` is retried once per
+/// `interval_bytes` worth of progress, same cadence as the happy path — a
+/// failed build looks, from the trigger's point of view, just like a
+/// successful one that produced nothing durable.
+fn maybe_build_snapshot<S: StateMachine>(st: &mut ApplyState<S>) {
+    let Some(trigger) = st.snapshot_trigger.as_mut() else { return };
+    if trigger.policy.interval_bytes == 0 {
+        return; // "never" (default policy)
+    }
+    if trigger.busy.load(Ordering::Acquire) {
+        return; // one in-flight build max
+    }
+    let applied = st.cnc.service().service_applied.load_acquire();
+    if applied.saturating_sub(trigger.last_snapshot_pos) < trigger.policy.interval_bytes {
+        return;
+    }
+
+    let frozen = {
+        // The SM lock, taken briefly for `freeze()` ONLY — never held across
+        // the (off-thread) stream/publish work, per the brief's lock-rule
+        // split.
+        let sm = st.sm.lock().unwrap();
+        (trigger.freeze)(&sm)
+    };
+    match frozen {
+        Ok((job, pos)) => {
+            trigger.last_snapshot_pos = pos;
+            trigger.busy.store(true, Ordering::Release);
+            if trigger.tx.try_send((pos, job)).is_err() {
+                // Defensive only: under normal operation `busy` already
+                // prevents this (the builder can't be mid-cycle AND have an
+                // empty channel slot occupied by us at the same time). Revert
+                // `busy` so a torn/disconnected builder can't wedge future
+                // attempts forever.
+                trigger.busy.store(false, Ordering::Release);
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "uc2_service: snapshot freeze failed at applied={applied}: {e} \
+                 (dropped; the next policy interval retries)"
+            );
+            trigger.last_snapshot_pos = applied;
+        }
+    }
 }
 
 /// Query bounded drain per apply cycle — the read-side analog of the apply

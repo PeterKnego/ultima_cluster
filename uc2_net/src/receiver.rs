@@ -15,7 +15,9 @@
 //! agent over a bounded channel (control is kHz; a full channel drops, and
 //! NAK backoff / status refresh recover).
 
+use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -26,11 +28,14 @@ use uc2_log::writer::PositionedWriter;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA,
     DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK,
-    DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
+    DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE,
+    DGRAM_KIND_SNAP_NAK, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
     MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody,
-    STATUS_BODY_LEN, StatusBody, TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_datagram_header,
-    read_nak_body, read_read_probe_body, read_request_vote_body, read_status_body,
-    read_term_map_body, read_vote_body, write_datagram_header, write_nak_body, write_status_body,
+    SNAP_BEGIN_BODY_LEN, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody, SnapNakBody, StatusBody,
+    TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_datagram_header, read_nak_body,
+    read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
+    read_status_body, read_term_map_body, read_vote_body, write_datagram_header, write_nak_body,
+    write_snap_begin_body, write_snap_nak_body, write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
 
@@ -235,6 +240,32 @@ pub struct FollowerStats {
     /// counter backward); the resync is the correct recovery for either. See
     /// [`FollowerReceiver::resync_after_truncation`].
     pub truncation_resyncs: AtomicU64,
+    /// Straddle drops (M6 Task 9): times a DATA datagram was discarded because a
+    /// `LogCounters::prime(to)` re-primed the shared `append` counter DURING this
+    /// datagram's processing (between the frontier read and the `store_release`).
+    /// Storing the stale `rebuilt.contiguous()` would clobber the freshly primed
+    /// floor with a value from the prior stream life. The drop is safe — the next
+    /// `do_work` top resyncs the tracker to the primed floor and NAKs forward. See
+    /// the generation recheck in the DATA arm.
+    pub dropped_straddle: AtomicU64,
+}
+
+/// M6 Task 6: one in-flight INBOUND snapshot transfer (this node is receiving a
+/// snapshot from the leader because its NAK fell below the purge floor). Chunks
+/// land at their file offset in a pre-sized `.part`; a `Rebuilt` over the file's
+/// byte space tracks contiguity + gaps (NAK'd like the main stream). On
+/// completion the `.part` is fsync'd + atomically renamed to the final artifact.
+struct SnapIntake {
+    peer: SocketAddr,
+    session: u32,
+    snapshot_pos: u64,
+    total_len: u64,
+    file: std::fs::File,
+    part_path: PathBuf,
+    final_path: PathBuf,
+    /// Contiguity over `[0, total_len)` file offsets.
+    got: Rebuilt,
+    nak: NakTimer,
 }
 
 pub struct FollowerReceiver {
@@ -276,6 +307,38 @@ pub struct FollowerReceiver {
     gate: Option<Arc<AtomicBool>>,
     /// Per-duty-cycle latch: emit at most one `LeaderActivity` per `do_work`.
     activity_emitted: bool,
+    /// M6 Task 6: snapshot directory (`instance_dir/snapshots`) for inbound
+    /// transfers. `None` = this node never receives snapshots (no intake).
+    snap_dir: Option<PathBuf>,
+    /// M6 Task 6: the in-flight inbound snapshot transfer, if any.
+    snap_intake: Option<SnapIntake>,
+    /// M6 Task 6: node-internal signal — the position of the newest COMPLETE
+    /// inbound snapshot (written on rename). The consensus agent samples it to
+    /// issue `ArchiveCmd::AdoptFloor` and mirror it to cnc. `None` in unit tests.
+    incoming_snapshot_pos: Option<Arc<AtomicU64>>,
+    /// M6 Task 6: config for the inbound-transfer NAK timer (RTT delay + seed).
+    snap_nak_cfg: NakConfig,
+    snap_seed: u64,
+    /// M6 Task 8: a completed snapshot install awaiting the consensus agent's
+    /// `AdoptFloor` FORWARD re-prime. Set to the snapshot position on
+    /// `snap_complete`; once the buffer's `append` reaches it (the archive adopted
+    /// the floor), the receiver rebuilds its gap tracker FORWARD to the new floor so
+    /// it NAKs the retained `[floor, frontier)` tail instead of re-requesting the
+    /// purged prefix. Cleared once applied. Distinct from the backward truncation
+    /// re-prime, which is unambiguous from the counter alone.
+    snap_adopt_pending: Option<u64>,
+    /// M6 Task 9 (straddle hardening): a node-internal generation counter bumped
+    /// by the archive/consensus agent on every `LogCounters::prime(to)` (truncate,
+    /// AdoptFloor, BecomeLeader collapse). The DATA arm samples it before reading
+    /// the frontier and rechecks it just before `append.store_release`; a change
+    /// means a prime straddled this datagram, so the (now stale) contiguous value
+    /// is dropped rather than published. `None` = no primes race this receiver
+    /// (single-life unit tests). See [`set_prime_generation`](Self::set_prime_generation).
+    prime_gen: Option<Arc<AtomicU64>>,
+    /// Test-only hook fired between the frontier read and the generation recheck
+    /// in the DATA arm, so a test can deterministically inject a straddling prime.
+    #[cfg(test)]
+    straddle_hook: Option<Box<dyn Fn() + Send>>,
 }
 
 impl FollowerReceiver {
@@ -317,6 +380,15 @@ impl FollowerReceiver {
             sender_route: None,
             gate: None,
             activity_emitted: false,
+            snap_dir: None,
+            snap_intake: None,
+            incoming_snapshot_pos: None,
+            snap_nak_cfg: cfg.nak,
+            snap_seed: cfg.seed,
+            snap_adopt_pending: None,
+            prime_gen: None,
+            #[cfg(test)]
+            straddle_hook: None,
         }
     }
 
@@ -347,6 +419,41 @@ impl FollowerReceiver {
     /// / gate `true`) = current behavior.
     pub fn set_intake_gate(&mut self, gate: Arc<AtomicBool>) {
         self.gate = Some(gate);
+    }
+
+    /// M6 Task 9: install the prime-generation counter shared with the archive/
+    /// consensus agent. The agent bumps it AFTER each `LogCounters::prime(to)`;
+    /// the receiver uses it to detect a prime that straddles a DATA datagram's
+    /// processing and drop the resulting stale frontier rather than clobber the
+    /// freshly primed floor. Without this call the recheck is inert (single-life
+    /// receivers never see a competing prime).
+    pub fn set_prime_generation(&mut self, generation: Arc<AtomicU64>) {
+        self.prime_gen = Some(generation);
+    }
+
+    /// Current prime generation (0 when no counter is installed — the recheck
+    /// then always matches, so single-life receivers are unaffected).
+    #[inline]
+    fn prime_gen_val(&self) -> u64 {
+        self.prime_gen.as_ref().map_or(0, |g| g.load(Ordering::Relaxed))
+    }
+
+    /// Test-only: install a hook fired in the DATA arm between the `rebuilt`
+    /// insert and the generation recheck, so a test can deterministically inject
+    /// a straddling `prime` + generation bump.
+    #[cfg(test)]
+    fn set_straddle_hook(&mut self, hook: Box<dyn Fn() + Send>) {
+        self.straddle_hook = Some(hook);
+    }
+
+    /// M6 Task 6: enable INBOUND snapshot transfers. `snap_dir` is where the
+    /// `.part`/final artifacts land (`instance_dir/snapshots`); `incoming` (if
+    /// set) receives the position of each COMPLETED transfer for the consensus
+    /// agent to adopt as an archive floor. Without this call kinds 12/13 are
+    /// ignored (a node that never joins below a floor never receives snapshots).
+    pub fn set_snapshot_intake(&mut self, snap_dir: PathBuf, incoming: Option<Arc<AtomicU64>>) {
+        self.snap_dir = Some(snap_dir);
+        self.incoming_snapshot_pos = incoming;
     }
 
     #[inline]
@@ -402,15 +509,23 @@ impl FollowerReceiver {
     /// duty cycle BEFORE any datagram of the new tail is processed.
     fn resync_after_truncation(&mut self) {
         let append = self.buffer.counters().append.load_acquire();
+        // A BACKWARD move of the shared counter below our tracker is the archive's
+        // `prime` signature: in the follower role we are the counter's sole FORWARD
+        // writer, and `prime` is its only backward writer, so `append < contiguous`
+        // is unambiguous (a leader's own append legitimately runs AHEAD of its
+        // receiver's tracker, so a `!=` test would misfire on every leader cycle).
+        // It fires on a reconciliation truncation AND on a `BecomeLeader` collapse.
+        // The FORWARD `AdoptFloor` re-prime (M6 Task 8) is NOT distinguishable here
+        // and is handled separately by `resync_after_snapshot_install`.
         if append < self.rebuilt.contiguous() {
             self.rebuilt = Rebuilt::new(append);
             self.leader_append = append;
-            self.nak.poll(None, self.now_ns()); // disarm: the gap predates the cut
-            // The report cursors shadow the frontier and must regress with it:
+            self.nak.poll(None, self.now_ns()); // disarm: the old gap predates the re-prime
+            // The report cursors shadow the frontier and must move with it:
             // `status_at` gates on `contiguous - status_at` (would underflow if
-            // left above the re-primed frontier), and `ap_reported` gates the
+            // left above a regressed frontier), and `ap_reported` gates the
             // AppendPosition send so the first re-established durable reports
-            // promptly toward the new leader's commit ranking.
+            // promptly toward the leader's commit ranking.
             self.status_at = append;
             self.ap_reported = append;
             self.stats.truncation_resyncs.fetch_add(1, Ordering::Relaxed);
@@ -423,6 +538,8 @@ impl FollowerReceiver {
         // shared `append` counter below our rebuilt frontier, rebuild the tracker
         // so the re-shipped post-truncation tail is accepted, not dropped as dup.
         self.resync_after_truncation();
+        // And, after a snapshot install, forward to the adopted floor (M6 Task 8).
+        self.resync_after_snapshot_install();
         let mut did = false;
         self.activity_emitted = false; // one LeaderActivity per cycle (node mode)
         for _ in 0..64 {
@@ -487,6 +604,12 @@ impl FollowerReceiver {
         }
         match h.kind {
             DGRAM_KIND_DATA => {
+                // Straddle guard (M6 Task 9): sample the prime generation BEFORE
+                // reading the frontier. If the archive re-primes `append` to a new
+                // floor anywhere during this datagram's processing, the recheck
+                // just before `store_release` (below) drops the now-stale frontier
+                // rather than clobbering the freshly primed value.
+                let gen0 = self.prime_gen_val();
                 // Intake gate (M4): during the ambiguous term-adoption window
                 // the consensus agent holds the gate CLOSED so no
                 // divergent-prefix extension is accepted. Still count the
@@ -550,6 +673,21 @@ impl FollowerReceiver {
                 }
                 self.stats.bytes.fetch_add(body.len() as u64, Relaxed);
                 if self.rebuilt.insert(h.position, h.position + advance) {
+                    #[cfg(test)]
+                    if let Some(hook) = self.straddle_hook.take() {
+                        hook();
+                        self.straddle_hook = Some(hook);
+                    }
+                    // Recheck the prime generation. A prime that straddled this
+                    // datagram re-based `append` to a new floor; publishing the
+                    // stale `rebuilt.contiguous()` would drag it backward. Drop
+                    // instead — the next `do_work` resync realigns the tracker to
+                    // the primed floor and NAKs forward. `rebuilt` is left as-is;
+                    // that resync discards it (rebuilds from `append`).
+                    if self.prime_gen_val() != gen0 {
+                        self.stats.dropped_straddle.fetch_add(1, Relaxed);
+                        return;
+                    }
                     self.buffer.counters().append.store_release(self.rebuilt.contiguous());
                 }
                 self.note_leader_activity(h.leadership_term_id);
@@ -589,8 +727,224 @@ impl FollowerReceiver {
                     });
                 }
             }
+            // M6 Task 6 — INBOUND snapshot transfer (this node is the receiver:
+            // its NAK fell below the leader's purge floor). Term-filtered above.
+            DGRAM_KIND_SNAP_BEGIN => {
+                if let Some(b) = read_snap_begin_body(&d[DATAGRAM_HEADER_LEN..]) {
+                    self.snap_begin(from, b);
+                }
+            }
+            DGRAM_KIND_SNAP_CHUNK => {
+                self.snap_chunk(from, h.position, &d[DATAGRAM_HEADER_LEN..]);
+            }
+            // OUTBOUND session control (this node is the leader shipping a
+            // snapshot): demux the peer's repair NAK / completion to our sender.
+            DGRAM_KIND_SNAP_NAK if self.sender_route.is_some() => {
+                let body = &d[DATAGRAM_HEADER_LEN..];
+                if let Some(b) = read_snap_nak_body(body)
+                    && let Some(route) = &self.sender_route
+                {
+                    let _ = route.try_send(CtrlMsg::SnapNak {
+                        from,
+                        session: b.session,
+                        offset: b.offset,
+                        length: b.length,
+                    });
+                }
+            }
+            DGRAM_KIND_SNAP_DONE if self.sender_route.is_some() => {
+                let body = &d[DATAGRAM_HEADER_LEN..];
+                if let Some(b) = read_snap_begin_body(body)
+                    && let Some(route) = &self.sender_route
+                {
+                    let _ = route.try_send(CtrlMsg::SnapDone { from, session: b.session });
+                }
+            }
             _ => {} // NAK/STATUS with no sender_route installed (follower role)
         }
+    }
+
+    /// Begin an inbound snapshot transfer: pre-size a `.part` and start tracking
+    /// contiguity. A duplicate BEGIN for the in-flight session is a no-op; a BEGIN
+    /// for a different session replaces a stale one.
+    fn snap_begin(&mut self, from: SocketAddr, b: SnapBeginBody) {
+        let Some(dir) = self.snap_dir.clone() else {
+            return; // this node does not receive snapshots
+        };
+        if let Some(cur) = &self.snap_intake
+            && cur.peer == from
+            && cur.session == b.session
+        {
+            return; // duplicate BEGIN — already in progress
+        }
+        if b.total_len == 0 {
+            return;
+        }
+        let part_path = dir.join(format!("incoming-{}.part", b.snapshot_pos));
+        let final_path = dir.join(format!("snap-{}.ultsnap", b.snapshot_pos));
+        let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .read(true)
+            .open(&part_path)
+        else {
+            return;
+        };
+        if file.set_len(b.total_len).is_err() {
+            return;
+        }
+        self.snap_intake = Some(SnapIntake {
+            peer: from,
+            session: b.session,
+            snapshot_pos: b.snapshot_pos,
+            total_len: b.total_len,
+            file,
+            part_path,
+            final_path,
+            got: Rebuilt::new(0),
+            nak: NakTimer::new(self.snap_nak_cfg, self.snap_seed ^ b.session as u64),
+        });
+        self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Land one snapshot chunk at its file offset; on completion fsync + rename.
+    fn snap_chunk(&mut self, from: SocketAddr, offset: u64, payload: &[u8]) {
+        let Some(intake) = self.snap_intake.as_mut() else {
+            return;
+        };
+        if intake.peer != from || payload.is_empty() {
+            return;
+        }
+        let Some(end) = offset.checked_add(payload.len() as u64) else {
+            return;
+        };
+        if end > intake.total_len {
+            return; // past EOF — corrupt/duplicate; drop
+        }
+        if intake.file.seek(SeekFrom::Start(offset)).is_err()
+            || intake.file.write_all(payload).is_err()
+        {
+            return;
+        }
+        intake.got.insert(offset, end);
+        if intake.got.contiguous() >= intake.total_len {
+            self.snap_complete();
+        }
+    }
+
+    /// The `.part` is contiguous: fsync, atomically rename to the final artifact,
+    /// signal completion, and ack with SNAP_DONE.
+    fn snap_complete(&mut self) {
+        let Some(intake) = self.snap_intake.take() else {
+            return;
+        };
+        // Durability + atomic publish: a torn `.part` is never renamed, so a
+        // reader (the service gap guard, or AdoptFloor) only ever sees a complete
+        // artifact.
+        if intake.file.sync_all().is_err() {
+            return;
+        }
+        drop(intake.file);
+        if std::fs::rename(&intake.part_path, &intake.final_path).is_err() {
+            return;
+        }
+        // Ack: echo the SnapBeginBody as SNAP_DONE so the leader closes its session.
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_BEGIN_BODY_LEN];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader {
+                position: 0,
+                leadership_term_id: self.term.load(Ordering::Relaxed),
+                kind: DGRAM_KIND_SNAP_DONE,
+                flags: 0,
+            },
+        );
+        write_snap_begin_body(
+            &mut d[DATAGRAM_HEADER_LEN..],
+            &SnapBeginBody {
+                session: intake.session,
+                snapshot_pos: intake.snapshot_pos,
+                total_len: intake.total_len,
+            },
+        );
+        let _ = self.sock.send_to(&d, intake.peer);
+        // Signal the consensus agent to adopt the floor + mirror observability.
+        if let Some(slot) = &self.incoming_snapshot_pos {
+            slot.store(intake.snapshot_pos, Ordering::Release);
+        }
+        // Arm the forward gap-tracker resync: once the consensus agent's AdoptFloor
+        // re-primes the shared `append` up to this position, rebuild our tracker
+        // forward so we NAK the retained `[floor, frontier)` tail (M6 Task 8).
+        self.snap_adopt_pending = Some(intake.snapshot_pos);
+        self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// M6 Task 8: after a snapshot install, the consensus agent's `AdoptFloor`
+    /// re-primes the shared `append` counter FORWARD to the snapshot floor. Unlike
+    /// the backward truncation re-prime, a forward move is indistinguishable from a
+    /// leader's own append by the counter alone — so this resync is gated on an
+    /// actual completed install (`snap_adopt_pending`). Once `append` has reached
+    /// the adopted floor, rebuild the gap tracker there so the next NAK requests the
+    /// retained tail (not the purged prefix, which would loop the session forever),
+    /// then disarm.
+    fn resync_after_snapshot_install(&mut self) {
+        let Some(floor) = self.snap_adopt_pending else {
+            return;
+        };
+        let append = self.buffer.counters().append.load_acquire();
+        if append < floor {
+            return; // AdoptFloor not applied yet
+        }
+        if append > self.rebuilt.contiguous() {
+            self.rebuilt = Rebuilt::new(append);
+            self.leader_append = self.leader_append.max(append);
+            self.nak.poll(None, self.now_ns()); // disarm the stale below-floor gap
+            self.status_at = append;
+            self.ap_reported = append;
+            self.stats.truncation_resyncs.fetch_add(1, Ordering::Relaxed);
+        }
+        self.snap_adopt_pending = None;
+    }
+
+    /// Emit a SNAP_NAK for the first gap in the inbound transfer (RTT-delayed,
+    /// like the main stream). Called once per duty cycle from `upkeep`.
+    fn snap_upkeep(&mut self, now: u64) -> bool {
+        let Some(intake) = self.snap_intake.as_mut() else {
+            return false;
+        };
+        let contiguous = intake.got.contiguous();
+        let gap = intake.got.first_gap().or({
+            if contiguous < intake.total_len {
+                Some((contiguous, intake.total_len))
+            } else {
+                None
+            }
+        });
+        let fired = intake.nak.poll(gap, now);
+        if let Some((start, end)) = fired {
+            let length = (end - start).min(self.cfg.nak_max_bytes as u64) as u32;
+            let session = intake.session;
+            let peer = intake.peer;
+            let term = self.term.load(Ordering::Relaxed);
+            let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_NAK_BODY_LEN];
+            write_datagram_header(
+                &mut d,
+                &DatagramHeader {
+                    position: 0,
+                    leadership_term_id: term,
+                    kind: DGRAM_KIND_SNAP_NAK,
+                    flags: 0,
+                },
+            );
+            write_snap_nak_body(
+                &mut d[DATAGRAM_HEADER_LEN..],
+                &SnapNakBody { session, offset: start, length },
+            );
+            let _ = self.sock.send_to(&d, peer);
+            return true;
+        }
+        false
     }
 
     fn upkeep(&mut self) -> bool {
@@ -693,6 +1047,12 @@ impl FollowerReceiver {
             self.status_at = contiguous;
             self.last_status_ns = now;
             self.stats.statuses_sent.fetch_add(1, Relaxed);
+            did = true;
+        }
+
+        // M6 Task 6: drive an inbound snapshot transfer's NAK repair. Poll twice
+        // (arm then fire) like the main-stream NAK above.
+        if self.snap_upkeep(now) || self.snap_upkeep(self.now_ns()) {
             did = true;
         }
         did
@@ -1483,6 +1843,56 @@ mod tests {
         assert_eq!(r.stats().truncation_resyncs.load(Relaxed), 1);
     }
 
+    /// M6 Task 9 (straddle hardening): a `LogCounters::prime(to)` that lands
+    /// BETWEEN the DATA arm's frontier read and its `append.store_release` must
+    /// not be clobbered by the stale `rebuilt.contiguous()`. The archive agent
+    /// re-primes `append` to a new floor (AdoptFloor after a snapshot install) and
+    /// bumps a shared prime-generation counter; the receiver rechecks that counter
+    /// just before storing and DROPS the straddled datagram (`dropped_straddle`)
+    /// so the freshly primed floor survives. Pre-fix, the store would drag `append`
+    /// back down to the old life's frontier — a below-floor re-request storm.
+    #[test]
+    fn straddling_prime_is_not_clobbered_by_stale_frontier() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+
+        // Install the shared prime-generation counter (as the node does).
+        let prime_gen = Arc::new(AtomicU64::new(0));
+        r.set_prime_generation(Arc::clone(&prime_gen));
+
+        // The hook simulates the archive agent priming `append` FORWARD to a new
+        // floor (960) and publishing the prime — exactly while this datagram sits
+        // between its `rebuilt.insert` and `store_release`. One-shot: it primes
+        // only on the first fire (generation still 0).
+        let bh = Arc::clone(&b);
+        let pgh = Arc::clone(&prime_gen);
+        r.set_straddle_hook(Box::new(move || {
+            if pgh.load(Relaxed) == 0 {
+                bh.counters().prime(960);
+                pgh.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+        }));
+
+        // Deliver one in-order DATA frame at position 0. It passes the gate and
+        // frontier check, writes, and inserts (0, 96) — then the hook straddles.
+        let runs = frame_runs(&[&[7u8; 64]], 96);
+        let (pos, bytes, _) = &runs[0];
+        leader.send(to, DGRAM_KIND_DATA, *pos, TERM, bytes);
+        let st = r.stats();
+        drive_until(&mut r, || st.dropped_straddle.load(Relaxed) == 1);
+
+        // The primed floor (960) survives — the stale contiguous (96) was dropped.
+        assert_eq!(
+            b.counters().append.load_acquire(),
+            960,
+            "straddling prime clobbered by the stale frontier"
+        );
+        assert_eq!(prime_gen.load(Relaxed), 1);
+    }
+
     /// Leader-role node composition (M4): the unified `FollowerReceiver` with a
     /// sender route installed demuxes inbound NAK/STATUS to the sender's control
     /// channel (leader retransmit + flow pacing), while consensus kinds still
@@ -1519,6 +1929,7 @@ mod tests {
                 match m {
                     CtrlMsg::Nak { .. } => nak = Some(m),
                     CtrlMsg::Status { .. } => status = Some(m),
+                    _ => {} // snapshot-session control not exercised by this test
                 }
             }
         }

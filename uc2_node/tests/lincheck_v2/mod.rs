@@ -56,7 +56,7 @@ use uc2_client::{Client, ClientError};
 use uc2_consensus::election::NodeId;
 use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig};
-use uc2_service::{ServiceBuilder, ServiceConfig};
+use uc2_service::{ServiceBuilder, ServiceConfig, SnapshotPolicy};
 
 use uc_lincheck::history::{History, Outcome};
 use uc_lincheck::model::{Op, RegResp};
@@ -85,12 +85,36 @@ fn seed_for(i: usize) -> u64 {
 /// sub-second failover, 4 MiB ring, small payloads). `faults` is applied to
 /// every one of the node's sockets (drop/dup/reorder), used by the lossy-links
 /// scenario; partitions are scripted separately through `partition_handles`.
+/// M6 Task 10: the purge/snapshot knobs a cluster boots (and re-boots) with.
+/// `Default` = the M5 posture (no purge, no snapshots, 64 MiB segments) so the
+/// failover capstone is byte-for-byte unchanged; the purge-churn capstone sets
+/// all three to exercise snapshot-backed purge + below-floor reconstruction.
+#[derive(Clone, Copy)]
+pub struct ClusterCfg {
+    pub purge: uc2_node::PurgePolicy,
+    pub journal_segment_bytes: u64,
+    /// `> 0` → services start via `start_with_snapshots` with this cadence; `0` →
+    /// plain `start` (no snapshot builder), the M5 default.
+    pub snapshot_interval_bytes: u64,
+}
+
+impl Default for ClusterCfg {
+    fn default() -> Self {
+        Self {
+            purge: uc2_node::PurgePolicy::Disabled,
+            journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+            snapshot_interval_bytes: 0,
+        }
+    }
+}
+
 fn make_config(
     id: NodeId,
     members: Vec<(NodeId, SocketAddr)>,
     instance_dir: PathBuf,
     addr: SocketAddr,
     faults: FaultConfig,
+    ccfg: ClusterCfg,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -105,6 +129,9 @@ fn make_config(
         election_timeout_max_ns: 300_000_000,
         seed: seed_for(id as usize),
         faults,
+        purge: ccfg.purge,
+        learners: Vec::new(),
+        journal_segment_bytes: ccfg.journal_segment_bytes,
     }
 }
 
@@ -126,10 +153,21 @@ fn rebind(addr: SocketAddr) -> UdpSocket {
 /// nothing, so this is always a clean in-memory state; the node reconstructs it
 /// from the replicated log (journal replay, Task 9) — that reconstruction is
 /// exactly what the capstone's service-crash fault proves.
-fn spawn_service(dir: &Path) -> uc2_service::Service<RegisterSm> {
-    ServiceBuilder::new(ServiceConfig::new(dir, APP), RegisterSm::default())
-        .start()
-        .expect("service start")
+fn spawn_service(dir: &Path, snapshot_interval_bytes: u64) -> uc2_service::Service<RegisterSm> {
+    if snapshot_interval_bytes == 0 {
+        ServiceBuilder::new(ServiceConfig::new(dir, APP), RegisterSm::default())
+            .start()
+            .expect("service start")
+    } else {
+        // M6 Task 10: snapshot-capable service — builds on-disk snapshots on the
+        // policy cadence so the node can advance its purge floor. Below-floor
+        // reconstruction after a service crash then goes via snapshot install.
+        let cfg = ServiceConfig::new(dir, APP)
+            .snapshot_policy(SnapshotPolicy { interval_bytes: snapshot_interval_bytes });
+        ServiceBuilder::new(cfg, RegisterSm::default())
+            .start_with_snapshots()
+            .expect("snapshot service start")
+    }
 }
 
 // ------------------------------------------------------------------ one slot
@@ -160,6 +198,7 @@ pub struct LinClusterV2 {
     nodes: Vec<NodeSlot>,
     members: Vec<(NodeId, SocketAddr)>,
     faults: FaultConfig,
+    ccfg: ClusterCfg,
     root: PathBuf,
 }
 
@@ -169,6 +208,13 @@ impl LinClusterV2 {
     /// runs), start each node on its pre-bound socket, then attach one service
     /// per node. Every node gets `faults` on its sockets (default = none).
     pub fn start(root: &Path, n: usize, faults: FaultConfig) -> LinClusterV2 {
+        Self::start_cfg(root, n, faults, ClusterCfg::default())
+    }
+
+    /// As [`start`](Self::start) but with an explicit purge/snapshot posture
+    /// (M6 Task 10 purge-churn capstone). The posture is retained so every
+    /// restart reuses it.
+    pub fn start_cfg(root: &Path, n: usize, faults: FaultConfig, ccfg: ClusterCfg) -> LinClusterV2 {
         let socks: Vec<UdpSocket> =
             (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
         let members: Vec<(NodeId, SocketAddr)> =
@@ -178,21 +224,34 @@ impl LinClusterV2 {
         for (i, sock) in socks.into_iter().enumerate() {
             let addr = members[i].1;
             let instance_dir = root.join(format!("n{i}"));
-            let cfg = make_config(i as NodeId, members.clone(), instance_dir.clone(), addr, faults);
+            let cfg =
+                make_config(i as NodeId, members.clone(), instance_dir.clone(), addr, faults, ccfg);
             let node = Node::start_with_socket(cfg, sock).expect("node start");
             // A follower's service follows the committed log too, so every node
             // carries a service from boot — the new leader after a failover
             // already has one attached.
-            let service = spawn_service(&instance_dir);
+            let service = spawn_service(&instance_dir, ccfg.snapshot_interval_bytes);
             nodes.push(NodeSlot { id: i as NodeId, addr, instance_dir, node: Some(node), service: Some(service) });
         }
-        LinClusterV2 { nodes, members, faults, root: root.to_owned() }
+        LinClusterV2 { nodes, members, faults, ccfg, root: root.to_owned() }
     }
 
     /// The fixed `(node-id → instance-dir)` map workers route over (index i = id
     /// i). Stable for the whole run: restarts reuse the same dir.
     pub fn dirs(&self) -> Vec<PathBuf> {
         self.nodes.iter().map(|s| s.instance_dir.clone()).collect()
+    }
+
+    /// M6 Task 10: the highest archive first-retained position across live nodes —
+    /// `> 0` proves purge actually dropped a journal prefix during the run (so the
+    /// purge-churn capstone's below-floor reconstruction path was real, not
+    /// vacuous). Call before [`stop`](Self::stop).
+    pub fn max_archive_first_base(&self) -> u64 {
+        self.nodes
+            .iter()
+            .filter_map(|s| s.node.as_ref().map(|n| n.archive_first_base()))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Index of the current serving leader, or `None` in a transient window.
@@ -289,9 +348,9 @@ impl LinClusterV2 {
         // Restart on the persisted dir + same port (static membership): recovers
         // durable state, rejoins in the current term.
         let sock = rebind(addr);
-        let cfg = make_config(id, self.members.clone(), dir.clone(), addr, self.faults);
+        let cfg = make_config(id, self.members.clone(), dir.clone(), addr, self.faults, self.ccfg);
         let node = Node::start_with_socket(cfg, sock).expect("leader node restart");
-        let service = spawn_service(&dir);
+        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
         self.nodes[li].node = Some(node);
         self.nodes[li].service = Some(service);
         // Full cluster settles back to a single serving leader.
@@ -308,9 +367,35 @@ impl LinClusterV2 {
         if let Some(service) = self.nodes[li].service.take() {
             service.crash();
         }
-        let service = spawn_service(&dir);
+        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
         self.nodes[li].service = Some(service);
         // The node never lost quorum, so a serving leader still exists.
+        self.await_single_serving(20);
+    }
+
+    /// M6 Task 10: crash a random live FOLLOWER's service (the node stays up).
+    /// Under the purge-churn posture the leader has purged the log below where the
+    /// fresh empty service needs to start, so the node reconstructs it via a
+    /// SNAPSHOT INSTALL + tail-replay (Task 5), not plain journal replay — the
+    /// below-floor reconstruction path this capstone exists to stress. A no-op if
+    /// there is no live follower. Quorum is untouched (a follower's service is not
+    /// in any quorum), so the cluster keeps serving throughout.
+    pub fn crash_and_restart_random_follower_service(&mut self, rng: &mut StdRng) {
+        let Some(li) = self.leader() else { return };
+        let followers: Vec<usize> = (0..self.nodes.len())
+            .filter(|&i| i != li && self.nodes[i].is_live() && self.nodes[i].service.is_some())
+            .collect();
+        if followers.is_empty() {
+            return;
+        }
+        let fi = followers[rng.random_range(0..followers.len())];
+        let dir = self.nodes[fi].instance_dir.clone();
+        if let Some(service) = self.nodes[fi].service.take() {
+            service.crash();
+        }
+        let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
+        self.nodes[fi].service = Some(service);
+        // The leader never lost quorum; a serving leader still exists.
         self.await_single_serving(20);
     }
 

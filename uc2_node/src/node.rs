@@ -25,7 +25,10 @@ use uc2_net::sender::{CtrlMsg, Sender, SenderConfig};
 use uc_protocol::ring::{
     BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, SpscProducer, SpscRing,
 };
-use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
+use uc_protocol::v2::cnc::{
+    CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE,
+    NODE_FLAG_LEADER,
+};
 use uc_protocol::v2::ipc::{
     FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SVC_QUERY, client_from_extra,
     extra_client,
@@ -59,11 +62,58 @@ impl TruncationSlot {
     }
 }
 
+/// A command from the consensus agent to the archive agent (M6 Task 4). Was a
+/// bare `(epoch, to)` truncation tuple through M5; the snapshot floor adds a
+/// second verb, so the channel carries a typed enum. `Truncate` keeps the exact
+/// M4/M5 semantics (persist-map-before-truncate is done on the consensus side;
+/// the archive just executes + acks via the [`TruncationSlot`]). `Purge` is
+/// best-effort and needs no ack — a failed purge simply retries next interval,
+/// and correctness never depends on any particular block still being present
+/// (a reader below the floor recovers via the snapshot path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArchiveCmd {
+    /// Drop the divergent tail at/above `to`; ack `(epoch, to)` when done.
+    Truncate { epoch: u64, to: u64 },
+    /// Drop whole journal blocks strictly below the block covering `below`
+    /// (`Archive::purge_below`). No ack. Errors log-warn and drop.
+    Purge { below: u64 },
+    /// M6 Task 6: adopt `pos` as the archive floor WITHOUT bytes — the receiving
+    /// side of a snapshot session (a learner) installed the state below `pos`
+    /// from the shipped file, so the archive advances its frontier to `pos` and
+    /// the counters prime there. No ack; a conflict logs + drops.
+    AdoptFloor { pos: u64 },
+}
+
+/// Journal purge policy (M6 Task 4). **Default `Disabled` — purge is OFF by
+/// default.** Every M6 bug class is "purged something someone still needed", so
+/// a deployment opts in explicitly. `BelowSnapshot` purges journal blocks below
+/// `snapshot_floor - slack_bytes`, never at/above the durable snapshot floor and
+/// never into the block that covers it (the archive's `purge_below` keeps the
+/// covering block; `Journal::purge_before` never drops the active segment — two
+/// layers of slack). `slack_bytes` keeps a margin of still-replayable journal
+/// below the floor so a follower whose NAK lands just under it can still be
+/// served from the log instead of forcing a snapshot session.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PurgePolicy {
+    #[default]
+    Disabled,
+    BelowSnapshot {
+        slack_bytes: u64,
+    },
+}
+
 /// Static-membership node configuration (M4: no discovery, no reconfiguration).
 pub struct NodeConfig {
     pub id: NodeId,
-    /// Every member INCLUDING self, as `(id, addr)`.
+    /// Every VOTING member INCLUDING self (if this node is a voter), as
+    /// `(id, addr)`. Learners are NOT listed here.
     pub members: Vec<(NodeId, SocketAddr)>,
+    /// M6 Task 7: learner peers, as `(id, addr)`. Default empty. A learner is
+    /// replicated-to (fan-out) but never counted (no vote, no quorum slot, no
+    /// flow-control window, no read-quorum ack). If this node's OWN id is in
+    /// `learners` it boots in learner mode (candidacy disabled). Learner ids must
+    /// be disjoint from `members`.
+    pub learners: Vec<(NodeId, SocketAddr)>,
     pub bind: SocketAddr,
     /// The node's on-disk instance directory (flock'd; holds cnc page, log
     /// buffer, journal, state, and the IPC ring files). Reused across restarts.
@@ -81,7 +131,19 @@ pub struct NodeConfig {
     pub election_timeout_max_ns: u64,
     pub seed: u64,
     pub faults: FaultConfig,
+    /// M6 Task 4: journal purge policy. Default [`PurgePolicy::Disabled`] — a
+    /// node never purges unless explicitly configured AND the service publishes
+    /// a snapshot floor (a snapshot-incapable SM never registers one).
+    pub purge: PurgePolicy,
+    /// M6 Task 4: journal segment size in bytes (the archive rolls a new
+    /// segment file at this granularity; purge drops whole non-active
+    /// segments). Production default `64 MiB` ([`DEFAULT_JOURNAL_SEGMENT_BYTES`]);
+    /// tests shrink it so a purge is observable without writing gigabytes.
+    pub journal_segment_bytes: u64,
 }
+
+/// Production default journal segment size (matches `ArchiveConfig::new`).
+pub const DEFAULT_JOURNAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Why a `submit` was refused: leader-only ingress. `Full` covers both a
 /// saturated in-process queue and the admission window being closed
@@ -189,8 +251,20 @@ pub struct Node {
     admission_bytes: u64,
     buffer: Arc<LogBuffer>,
     truncations: Arc<AtomicU64>,
+    /// M6 Task 8: count of wipe-and-rejoins (NoCommonPrefix → truncate-to-0). A
+    /// subset of `truncations` (a wipe is also a truncate), tracked separately for
+    /// observability and the wipe-safety tests.
+    wipes: Arc<AtomicU64>,
     reports_implausible: Arc<AtomicU64>,
+    /// M6 Task 4: node-internal mirror of the archive's lowest replayable
+    /// position (written by the archive agent). Exposed via
+    /// [`Node::archive_first_base`] for purge-safety tests.
+    archive_first_base: Arc<AtomicU64>,
     route_drops: Arc<uc2_net::receiver::FollowerStats>,
+    /// M6 Task 9: the sender's stats (for the prefill-decision pin — a restarted
+    /// leader serves a below-ring NAK from the journal, `replay_datagrams > 0`,
+    /// rather than prefilling its ring).
+    sender_stats: Arc<uc2_net::sender::SenderStats>,
     partition_handles: Vec<PartitionHandle>,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
     _instance: InstanceDir,
@@ -236,9 +310,25 @@ impl Node {
         ];
 
         // 2. Recover durable state from the journal.
-        let mut archive =
-            Archive::open(ArchiveConfig::new(instance.journal_dir())).map_err(to_io)?;
+        let mut archive_cfg = ArchiveConfig {
+            segment_size_bytes: cfg.journal_segment_bytes,
+            ..ArchiveConfig::new(instance.journal_dir())
+        };
+        // Invariant: a block records as ONE journal record and must fit within a
+        // segment. Keep the block cap comfortably below the segment size (never
+        // above the production 1 MiB default). This lets tests shrink segments
+        // to a few KiB to observe purge without the block cap overflowing them.
+        archive_cfg.max_block_bytes = archive_cfg
+            .max_block_bytes
+            .min((cfg.journal_segment_bytes / 2) as usize)
+            .max(4096);
+        let mut archive = Archive::open(archive_cfg).map_err(to_io)?;
         let durable = archive.recovered_position();
+        // M6 Task 4: node-internal mirror of the archive's lowest replayable
+        // position. Written by the archive agent (after a purge), read by the
+        // consensus agent (the purge guard: never issue a purge that wouldn't
+        // advance the floor) and exposed via `Node::archive_first_base` for tests.
+        let archive_first_base = Arc::new(AtomicU64::new(archive.first_base()));
         let state = NodeState::open(&instance.state_dir()).map_err(to_io)?;
 
         // Recovery re-derivation (T4 carry 4): if the persisted term map does not
@@ -284,6 +374,12 @@ impl Node {
         // SAME mirror at attach to seed its cursor (spec §7).
         let output_progress = state.output_progress();
         cnc.status().output_progress.store_release(output_progress);
+        // M6 Task 4: same durable-then-mirror seeding for the snapshot floor —
+        // the recovered value onto the fresh cnc page so an attaching reader
+        // sees the real floor immediately (not 0), and the persister's
+        // increase-only shadow starts from it.
+        let state_snapshot_floor = state.snapshot_floor();
+        cnc.snapshots().node_snapshot_floor.store_release(state_snapshot_floor);
 
         // 6. Rings created fresh each boot (stale files unlinked first — any
         // prior attachment is invalidated by the new instance_id anyway).
@@ -293,6 +389,14 @@ impl Node {
 
         // Election SM over the recovered credentials.
         let members_ids: Vec<NodeId> = cfg.members.iter().map(|(id, _)| *id).collect();
+        // M6 Task 7: a node whose own id is in `learners` boots in learner mode —
+        // replicated-to, never counted. By construction its id is NOT in `members`.
+        let is_learner = cfg.learners.iter().any(|(id, _)| *id == cfg.id);
+        assert!(
+            !is_learner || !members_ids.contains(&cfg.id),
+            "a learner's id must not also be a voting member (id={})",
+            cfg.id
+        );
         let recovered_vote = state.vote().map(|v| (v.term, v.voted_for));
         let sm = ElectionSm::new(
             ElectionConfig {
@@ -306,6 +410,7 @@ impl Node {
                 // knob — the value is a protocol constant, not deployment-tuned.
                 gossip_floor_ns: 100_000_000,
                 seed: cfg.seed,
+                can_vote: !is_learner,
             },
             recovered_vote,
             &rederived,
@@ -320,18 +425,32 @@ impl Node {
         let can_serve_flag = Arc::new(AtomicBool::new(false));
         let intake_gate = Arc::new(AtomicBool::new(true)); // open until a term is adopted
         let truncations = Arc::new(AtomicU64::new(0));
+        let wipes = Arc::new(AtomicU64::new(0));
         let reports_implausible = Arc::new(AtomicU64::new(0));
 
-        // Peer maps and the follower set.
+        // Peer maps and the follower set. Both voters AND learners go into the
+        // address maps (a leader routes gossip/term-map to learners too, and every
+        // node maps inbound learner datagrams for demux), but only VOTERS are in
+        // `peers` — the set that paces quorum, is solicited for votes, and is
+        // targeted by READ_PROBE.
         let mut id_to_addr = HashMap::new();
         let mut addr_to_id = HashMap::new();
-        for (id, addr) in &cfg.members {
+        for (id, addr) in cfg.members.iter().chain(cfg.learners.iter()) {
             id_to_addr.insert(*id, *addr);
             addr_to_id.insert(*addr, *id);
         }
         let peers: Vec<NodeId> = members_ids.iter().copied().filter(|id| *id != cfg.id).collect();
+        // M6 Task 7: learners this node fans out to (all learners except self, so a
+        // learner never streams to itself).
+        let learner_ids: Vec<NodeId> =
+            cfg.learners.iter().map(|(id, _)| *id).filter(|id| *id != cfg.id).collect();
+        let learner_addrs: Vec<SocketAddr> =
+            learner_ids.iter().map(|id| id_to_addr[id]).collect();
+        // Leader fan-out = voters-minus-self ++ learners-minus-self (streamed
+        // identically); the learner subset is excluded from flow control.
+        let voting_followers: Vec<SocketAddr> = peers.iter().map(|id| id_to_addr[id]).collect();
         let followers: Vec<SocketAddr> =
-            peers.iter().map(|id| id_to_addr[id]).collect();
+            voting_followers.iter().chain(learner_addrs.iter()).copied().collect();
 
         // Channels.
         let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(NET_EVENT_CAPACITY);
@@ -340,7 +459,7 @@ impl Node {
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(1024);
         // Truncation command channel carries `(epoch, to)`; the ack rides an
         // infallible single slot (one truncation in flight — the SM latch).
-        let (trunc_tx, trunc_rx) = mpsc::sync_channel::<(u64, u64)>(64);
+        let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
         let trunc_slot = TruncationSlot::default();
 
         // Sender (streams when leader; commit ranking is entirely the
@@ -348,17 +467,66 @@ impl Node {
         let mut sender_cfg = SenderConfig::new(boot_term);
         sender_cfg.heartbeat_ns = 20_000_000; // 20 ms: brisk tail-loss detection
         let journal = archive.journal_arc();
-        let mut sender = Sender::new(
+        // A learner never leads, so its sender streams to no one: give it a solo
+        // (empty) fan-out with a cluster size of 1, which also sidesteps flow
+        // control's leader-in-cluster invariant (from a learner's view every voter
+        // is a follower, so `voters == cluster_size` would trip the assert). A
+        // voter's sender gets the real fan-out = voters-minus-self ++ learners.
+        let (sender_followers, sender_learners, sender_cluster) = if is_learner {
+            (Vec::new(), Vec::new(), 1)
+        } else {
+            (followers, learner_addrs.clone(), cfg.members.len())
+        };
+        let mut sender = Sender::with_learners(
             Arc::clone(&buffer),
             send_sock,
-            followers,
-            cfg.members.len(),
+            sender_followers,
+            &sender_learners,
+            sender_cluster,
             ctrl_rx,
             sender_cfg,
             Arc::clone(&term_handle),
             Arc::clone(&leader_flag),
         );
         sender.set_replay_source(journal);
+        // M6 Task 6: snapshot session wiring. `snap_dir` holds the position-tagged
+        // artifacts (shared with the service's builder); `incoming_snapshot` is the
+        // node-internal signal the receiver raises on a completed inbound transfer.
+        let snap_dir = cfg.instance_dir.join("snapshots");
+        let _ = std::fs::create_dir_all(&snap_dir);
+        let incoming_snapshot = Arc::new(AtomicU64::new(0));
+        // M6 Task 9 (straddle hardening): bumped by the archive agent AFTER each
+        // `LogCounters::prime(to)` (truncate / AdoptFloor). The receiver samples it
+        // around a DATA datagram to detect a prime that straddled its processing and
+        // drop the stale frontier rather than clobber the freshly primed floor.
+        let prime_generation = Arc::new(AtomicU64::new(0));
+        // Offer ONLY the file at the node's durable floor: a session ships a
+        // fully-published artifact (rename-atomic + validated as the floor marker).
+        let src_cnc = Arc::clone(&cnc);
+        let src_dir = snap_dir.clone();
+        sender.set_snapshot_source(Arc::new(move || {
+            let floor = src_cnc.snapshots().node_snapshot_floor.load_acquire();
+            if floor == 0 {
+                return None;
+            }
+            let path = src_dir.join(format!("snap-{floor}.ultsnap"));
+            let len = std::fs::metadata(&path).ok()?.len();
+            Some((floor, path, len))
+        }));
+
+        // M6 Task 9: the per-peer observability band, cnc-slot order (voters
+        // first, then learners), capped at the fixed slot count. The consensus
+        // agent owns `id_and_role` + `reported_durable`; the sender fills
+        // `advertised_limit` from its flow-control view (bounded, once per cycle).
+        let peer_band: Vec<(NodeId, u8)> = peers
+            .iter()
+            .map(|id| (*id, CNC_PEER_ROLE_VOTER))
+            .chain(learner_ids.iter().map(|id| (*id, CNC_PEER_ROLE_LEARNER)))
+            .take(CNC_MAX_PEER_SLOTS)
+            .collect();
+        let sender_peer_slots: Vec<(SocketAddr, usize)> =
+            peer_band.iter().enumerate().map(|(i, (id, _))| (id_to_addr[id], i)).collect();
+        sender.set_peer_slots(Arc::clone(&cnc), sender_peer_slots);
 
         // Receiver (unified follower-receiver + leader-control demux).
         let mut rcfg = FollowerConfig::new(self_addr); // auto-learns the real leader from DATA
@@ -374,24 +542,74 @@ impl Node {
         );
         receiver.set_sender_route(ctrl_tx);
         receiver.set_intake_gate(Arc::clone(&intake_gate));
+        receiver.set_snapshot_intake(snap_dir.clone(), Some(Arc::clone(&incoming_snapshot)));
+        receiver.set_prime_generation(Arc::clone(&prime_generation));
         let route_drops = receiver.stats();
 
-        // Archive agent: truncate commands first (don't record blocks about to be
-        // dropped), then record, then ship data-stamped term observations.
+        // Archive agent: archive commands first (don't record blocks about to be
+        // dropped/purged), then record, then ship data-stamped term observations.
         let arc_buffer = Arc::clone(&buffer);
         let arc_cnc = Arc::clone(&cnc);
         let arc_slot = trunc_slot.clone();
+        let arc_first_base = Arc::clone(&archive_first_base);
+        let arc_prime_gen = Arc::clone(&prime_generation);
         let archive_agent = AgentRunner::spawn("uc2-archive", IdleStrategy::Yield, move || {
             let mut did = false;
-            while let Ok((epoch, to)) = trunc_rx.try_recv() {
-                // First-block cuts (a contested first election, `to` at/inside
-                // block 0) are handled by the archive via `Journal::truncate_all`
-                // + prefix re-seed (M4 carry #3) and no longer fail-stop. Any
-                // remaining error is a genuine journal I/O fault — still fatal.
-                archive.truncate_to(to).expect("archive truncate fail-stop (journal I/O)");
-                arc_cnc.counters().prime(to);
-                // Infallible ack: a single slot cannot drop (one in flight).
-                arc_slot.post(epoch, to);
+            while let Ok(cmd) = trunc_rx.try_recv() {
+                match cmd {
+                    ArchiveCmd::Truncate { epoch, to } => {
+                        // First-block cuts (a contested first election, `to`
+                        // at/inside block 0) are handled by the archive via
+                        // `Journal::truncate_all` + prefix re-seed (M4 carry #3)
+                        // and no longer fail-stop. Any remaining error is a
+                        // genuine journal I/O fault — still fatal.
+                        archive
+                            .truncate_to(to)
+                            .expect("archive truncate fail-stop (journal I/O)");
+                        arc_cnc.counters().prime(to);
+                        // Publish the prime so a straddling receiver drops the stale
+                        // frontier instead of clobbering `to` (M6 Task 9).
+                        arc_prime_gen.fetch_add(1, Ordering::Release);
+                        // A truncation can drop the first block (first-block cut);
+                        // republish the floor so the consensus guard stays honest.
+                        arc_first_base.store(archive.first_base(), Ordering::Release);
+                        // Infallible ack: a single slot cannot drop (one in flight).
+                        arc_slot.post(epoch, to);
+                    }
+                    ArchiveCmd::Purge { below } => {
+                        // Best-effort: a failed purge logs + drops (retries next
+                        // interval). Correctness never depends on a block still
+                        // being present — a reader below the floor recovers via
+                        // the snapshot path (Task 5 same-host, Task 6 remote).
+                        match archive.purge_below(below) {
+                            Ok(new_first) => {
+                                arc_first_base.store(new_first, Ordering::Release);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "uc2_node: archive purge_below({below}) failed: {e} \
+                                     (dropped; retries next interval)"
+                                );
+                            }
+                        }
+                    }
+                    ArchiveCmd::AdoptFloor { pos } => {
+                        // M6 Task 6: a learner installed the snapshot at `pos`.
+                        // Advance the archive floor with no bytes and prime the
+                        // counters there so the live stream (positions >= pos) is
+                        // accepted. A conflict (real data below pos) logs + drops.
+                        match archive.adopt_floor(pos) {
+                            Ok(new_floor) => {
+                                arc_cnc.counters().prime(new_floor);
+                                arc_prime_gen.fetch_add(1, Ordering::Release);
+                                arc_first_base.store(new_floor, Ordering::Release);
+                            }
+                            Err(e) => {
+                                eprintln!("uc2_node: archive adopt_floor({pos}) failed: {e}");
+                            }
+                        }
+                    }
+                }
                 did = true;
             }
             if archive.do_work(&arc_buffer).expect("archive fail-stop") {
@@ -404,6 +622,7 @@ impl Node {
             did
         })?;
 
+        let sender_stats = sender.stats();
         let sender_agent =
             AgentRunner::spawn("uc2-sender", IdleStrategy::Yield, move || sender.do_work())?;
         let receiver_agent =
@@ -431,6 +650,10 @@ impl Node {
             id_to_addr,
             addr_to_id,
             peers,
+            learner_ids,
+            peer_band,
+            peer_reported: HashMap::new(),
+            peer_band_published: false,
             net_rx,
             obs_rx,
             ingress_rx,
@@ -441,6 +664,7 @@ impl Node {
             can_serve_flag: Arc::clone(&can_serve_flag),
             intake_gate: Arc::clone(&intake_gate),
             truncations: Arc::clone(&truncations),
+            wipes: Arc::clone(&wipes),
             reports_implausible: Arc::clone(&reports_implausible),
             base: Instant::now(),
             durable_seen: durable,
@@ -449,6 +673,13 @@ impl Node {
             pending_truncation: None,
             output_persisted_completed: output_progress,
             output_progress_last_persist_ns: None,
+            purge_policy: cfg.purge,
+            archive_first_base: Arc::clone(&archive_first_base),
+            snapshot_persisted_floor: state_snapshot_floor,
+            snapshot_floor_last_persist_ns: None,
+            incoming_snapshot: Arc::clone(&incoming_snapshot),
+            adopted_incoming: 0,
+            last_leader_map: Vec::new(),
         };
         let consensus_agent =
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
@@ -462,8 +693,11 @@ impl Node {
             admission_bytes: cfg.admission_bytes,
             buffer,
             truncations,
+            wipes,
             reports_implausible,
+            archive_first_base,
             route_drops,
+            sender_stats,
             partition_handles,
             _instance: instance,
             _rings: rings,
@@ -487,6 +721,21 @@ impl Node {
 
     pub fn counters(&self) -> &LogCounters {
         self.cnc.counters()
+    }
+
+    /// The service's applied position (cnc `service_applied`, offset 512). A
+    /// reconstructing service catches up when this reaches `commit`; the M6 gate
+    /// reads it to time below-floor reconstruction convergence.
+    pub fn service_applied(&self) -> u64 {
+        self.cnc.service().service_applied.load_acquire()
+    }
+
+    /// M6 Task 4: the archive's lowest still-replayable position (the purge
+    /// floor's realized value). `0` when nothing has been purged. Exposed for
+    /// purge-safety tests: after the service publishes a snapshot and the purge
+    /// driver runs, this advances to at most the snapshot floor.
+    pub fn archive_first_base(&self) -> u64 {
+        self.archive_first_base.load(Ordering::Acquire)
     }
 
     /// Read the committed message frame at `pos` (which must be a frame
@@ -529,6 +778,21 @@ impl Node {
     /// Truncations this node has performed (reconciliation after a divergence).
     pub fn truncations(&self) -> u64 {
         self.truncations.load(Ordering::Relaxed)
+    }
+
+    /// M6 Task 8: how many wipe-and-rejoins (NoCommonPrefix → truncate-to-0) this
+    /// node has performed. A subset of [`Node::truncations`].
+    pub fn wipes(&self) -> u64 {
+        self.wipes.load(Ordering::Relaxed)
+    }
+
+    /// M6 Task 9: datagrams this node's leader has served from the JOURNAL (deep
+    /// NAK / replay sessions) rather than the live ring. `> 0` after a follower
+    /// catches up across a below-ring gap is the prefill-decision evidence: the
+    /// stream is repaired on demand from durable storage, so a restarted node
+    /// never prefills its ring.
+    pub fn replay_datagrams(&self) -> u64 {
+        self.sender_stats.replay_datagrams.load(Ordering::Relaxed)
     }
 
     /// Current-term follower Reports dropped at the implausibility guard
@@ -623,17 +887,37 @@ struct Consensus {
     sock: FaultSocket,
     id_to_addr: HashMap<NodeId, SocketAddr>,
     addr_to_id: HashMap<SocketAddr, NodeId>,
+    /// Voting peers (voting members minus self): solicited for votes, paced for
+    /// quorum, targeted by READ_PROBE, and used for the read-quorum size.
     peers: Vec<NodeId>,
+    /// M6 Task 7: learner peers this node fans gossip out to (all learners minus
+    /// self). Learners receive DATA (via the sender), commit gossip, and term maps
+    /// so they replicate + reconcile, but are NEVER counted for any quorum.
+    learner_ids: Vec<NodeId>,
+    /// M6 Task 9: the per-peer observability band as `(peer_id, role_bits)` in
+    /// cnc-slot order (voters first, then learners, capped at `CNC_MAX_PEER_SLOTS`).
+    /// The consensus agent publishes `id_and_role` (boot-once) + `reported_durable`
+    /// (per cycle) into `cnc.peer_slot(i)`; the sender fills `advertised_limit`.
+    peer_band: Vec<(NodeId, u8)>,
+    /// M6 Task 9: newest durable position each peer has reported (in-memory,
+    /// updated per Report; flushed to the cnc band once per duty cycle — the cnc
+    /// store is bounded, not per-datagram).
+    peer_reported: HashMap<NodeId, u64>,
+    /// Latch: publish the static `id_and_role` cells once (first duty cycle).
+    peer_band_published: bool,
     net_rx: mpsc::Receiver<NetEvent>,
     obs_rx: mpsc::Receiver<(u32, u64)>,
     ingress_rx: mpsc::Receiver<Vec<u8>>,
-    trunc_tx: mpsc::SyncSender<(u64, u64)>,
+    trunc_tx: mpsc::SyncSender<ArchiveCmd>,
     trunc_slot: TruncationSlot,
     term_handle: TermHandle,
     leader_flag: Arc<AtomicBool>,
     can_serve_flag: Arc<AtomicBool>,
     intake_gate: Arc<AtomicBool>,
     truncations: Arc<AtomicU64>,
+    /// M6 Task 8: wipe-and-rejoin count (NoCommonPrefix → truncate-to-0), bumped
+    /// on `Action::CountWipe`. Shared with the `Node` handle for observability.
+    wipes: Arc<AtomicU64>,
     reports_implausible: Arc<AtomicU64>,
     base: Instant,
     durable_seen: u64,
@@ -653,6 +937,34 @@ struct Consensus {
     /// waiting out the floor). The 100 ms floor rate-limits the fsync'd
     /// `StableValue::store`, not the cheap in-page compare that runs every cycle.
     output_progress_last_persist_ns: Option<u64>,
+    /// M6 Task 4: journal purge policy (default `Disabled`). Gates the purge
+    /// half of `maybe_persist_snapshot_floor`.
+    purge_policy: PurgePolicy,
+    /// M6 Task 4: node-internal mirror of the archive's lowest replayable
+    /// position, written by the archive agent. Read here to gate purge (only
+    /// issue a `Purge` that would actually advance the floor).
+    archive_first_base: Arc<AtomicU64>,
+    /// M6 Task 4: last snapshot floor durably persisted to `state/snapshot.state`.
+    /// The increase-only high-water mark — seeded from the recovered durable
+    /// floor at boot so a fresh cnc page's `service_snapshot_pos == 0` can never
+    /// regress it (the marker-clobber lesson, exactly as `output_persisted_completed`).
+    snapshot_persisted_floor: u64,
+    /// M6 Task 4: monotonic ns of the last snapshot-floor persist; `None` until
+    /// the first. Same 100 ms fsync floor as output-progress.
+    snapshot_floor_last_persist_ns: Option<u64>,
+    /// M6 Task 6: node-internal signal from the receiver — the position of the
+    /// newest COMPLETE inbound snapshot transfer (0 = none). Sampled each cycle;
+    /// on a new value we adopt it as the archive floor + mirror to cnc.
+    incoming_snapshot: Arc<AtomicU64>,
+    /// M6 Task 6: last inbound-snapshot position already adopted (shadow, so the
+    /// AdoptFloor command + cnc mirror fire once per completed transfer).
+    adopted_incoming: u64,
+    /// M6 Task 8: the leader's most-recently-shipped term-map (the wire tail),
+    /// captured verbatim on every `TermMap` datagram. On a snapshot install
+    /// (`AdoptFloor`) this authoritative lineage is seeded into the SM so a
+    /// below-floor joiner's next reconcile finds the common prefix that otherwise
+    /// lives hidden inside the snapshot. Empty until the first term-map arrives.
+    last_leader_map: Vec<(u32, u64)>,
 }
 
 impl Consensus {
@@ -735,7 +1047,79 @@ impl Consensus {
         // 7. Sample the service-written `output_completed` counter (Task 12);
         // on change, durably persist + mirror it, subject to the 100 ms floor.
         did |= self.maybe_persist_output_progress();
+
+        // 8. Sample the service-written `service_snapshot_pos` (M6 Task 4); on a
+        // validated increase, durably persist the snapshot floor + mirror it,
+        // then (if the purge policy is on) command the archive to purge below it.
+        did |= self.maybe_persist_snapshot_floor();
+
+        // 9. Sample the receiver's completed-inbound-snapshot signal (M6 Task 6);
+        // on a new value, adopt it as the archive floor and mirror it to cnc.
+        did |= self.maybe_adopt_incoming_snapshot();
+
+        // 10. Publish the per-peer observability band + archive floor (M6 Task 9).
+        // Bounded: one pass over ≤8 slots per cycle, no per-datagram cnc writes.
+        self.publish_peer_band();
         did
+    }
+
+    /// M6 Task 9: refresh the cnc observability band. Writes the static
+    /// `id_and_role` cells once (first cycle), then each peer's `reported_durable`
+    /// from the in-memory tracker, and mirrors the archive's first-retained base.
+    /// Diagnostics only — never gates correctness.
+    fn publish_peer_band(&mut self) {
+        if !self.peer_band_published {
+            for (i, (id, role)) in self.peer_band.iter().enumerate() {
+                self.cnc
+                    .peer_slot(i)
+                    .id_and_role
+                    .store_release(uc2_log::cnc::pack_id_and_role(*id, *role));
+            }
+            self.peer_band_published = true;
+        }
+        for (i, (id, _)) in self.peer_band.iter().enumerate() {
+            if let Some(d) = self.peer_reported.get(id) {
+                self.cnc.peer_slot(i).reported_durable.store_release(*d);
+            }
+        }
+        // Mirror the archive's first-retained base (the purge floor). Comparing it
+        // against `node_snapshot_floor` is the "purge caught up to snapshot" check.
+        let first_base = self.archive_first_base.load(Ordering::Acquire);
+        self.cnc.archive_first_base().store_release(first_base);
+    }
+
+    /// M6 Task 6. When the receiver completes an inbound snapshot transfer it
+    /// raises `incoming_snapshot`; sample it and, on a new position, mirror it to
+    /// the cnc observability slot and — when our own durable frontier is below it
+    /// (the learner-join case) — command the archive to adopt it as the floor.
+    fn maybe_adopt_incoming_snapshot(&mut self) -> bool {
+        let pos = self.incoming_snapshot.load(Ordering::Acquire);
+        if pos <= self.adopted_incoming {
+            return false;
+        }
+        self.adopted_incoming = pos;
+        self.cnc.snapshots().incoming_snapshot_pos.store_release(pos);
+        // Only adopt when we don't already cover `pos` — a mid-life follower that
+        // already holds the state ignores it (the archive agent no-ops it too, but
+        // skipping the command keeps the channel quiet).
+        let durable = self.cnc.counters().durable.load_acquire();
+        if durable < pos {
+            // M6 Task 8: seed the SM with the leader's authoritative lineage BEFORE
+            // the archive adopts the floor. The snapshot IS the leader's committed
+            // history up to `pos`, so its lineage — not our absent local bytes — is
+            // the truth the next reconcile must match. Without this the shared
+            // prefix lives inside the snapshot, invisible to reconcile, which would
+            // clamp a truncate below the adopted floor (a PositionPurged fail-stop).
+            // Persist-before-adopt: the seeded map is durable before the floor moves,
+            // so a crash in the window recovers a map consistent with the floor.
+            if !self.last_leader_map.is_empty() {
+                self.sm.adopt_snapshot_lineage(&self.last_leader_map);
+                let map = to_entries(self.sm.term_map());
+                self.state.store_term_map(&map).expect("term-map persist fail-stop");
+            }
+            let _ = self.trunc_tx.try_send(ArchiveCmd::AdoptFloor { pos });
+        }
+        true
     }
 
     /// Sample `service().output_completed` (a cheap compare every cycle); on an
@@ -774,6 +1158,74 @@ impl Consensus {
         self.output_persisted_completed = completed;
         self.output_progress_last_persist_ns = Some(now);
         true
+    }
+
+    /// M6 Task 4. Sample the service-written `snapshots().service_snapshot_pos`
+    /// (a cheap compare every cycle); on a VALIDATED increase durably persist
+    /// the snapshot floor via `NodeState::store_snapshot_floor` THEN mirror it
+    /// onto `snapshots().node_snapshot_floor` (durable-then-mirror, same order
+    /// as output-progress), and — when a purge policy is configured — command
+    /// the archive to drop journal below `floor - slack`. Returns `true` iff it
+    /// did fsync or purge work (drives the idle strategy).
+    ///
+    /// **Increase-only, and validated `<= durable`.** Increase-only is the same
+    /// high-water-mark discipline as `maybe_persist_output_progress` (the cnc
+    /// page is fresh every boot; `snapshot_persisted_floor` is seeded from the
+    /// recovered durable floor so a boot-time `service_snapshot_pos == 0` cannot
+    /// regress it) — but here regressing the floor would be a SAFETY bug, not
+    /// mere at-least-once slack: a purge floor must never move backwards. The
+    /// `<= durable` gate rejects a service value ahead of this node's fsync
+    /// frontier (a torn/racy read, or a snapshot at a not-yet-durable position)
+    /// — a purge floor is only ever a position whose covering journal block is
+    /// itself durable here.
+    ///
+    /// The fsync + the archive command are throttled to [`OUTPUT_PROGRESS_FLOOR_NS`]
+    /// (the cheap in-page compares still run every cycle); a purge that couldn't
+    /// advance the floor (archive not yet caught up, or a prior best-effort
+    /// purge that failed) simply retries on the next tick.
+    fn maybe_persist_snapshot_floor(&mut self) -> bool {
+        let service_pos = self.cnc.snapshots().service_snapshot_pos.load_acquire();
+        let durable = self.cnc.counters().durable.load_acquire();
+        let have_new_floor =
+            service_pos > self.snapshot_persisted_floor && service_pos <= durable;
+        let purge_on = matches!(self.purge_policy, PurgePolicy::BelowSnapshot { .. });
+        // Cheap exit every cycle when there is neither a newer floor to persist
+        // nor a purge policy that might have outstanding work.
+        if !have_new_floor && !purge_on {
+            return false;
+        }
+        let now = self.now_ns();
+        let floor_elapsed = self
+            .snapshot_floor_last_persist_ns
+            .is_none_or(|last| now.saturating_sub(last) >= OUTPUT_PROGRESS_FLOOR_NS);
+        if !floor_elapsed {
+            return false;
+        }
+
+        let mut did = false;
+        if have_new_floor {
+            self.state
+                .store_snapshot_floor(service_pos)
+                .expect("snapshot floor persist fail-stop (journal I/O)");
+            self.cnc.snapshots().node_snapshot_floor.store_release(service_pos);
+            self.snapshot_persisted_floor = service_pos;
+            did = true;
+        }
+        if let PurgePolicy::BelowSnapshot { slack_bytes } = self.purge_policy {
+            let target = self.snapshot_persisted_floor.saturating_sub(slack_bytes);
+            // Only command a purge that would actually advance the floor. The
+            // archive acks by advancing `archive_first_base`; `try_send` (not
+            // `send`) keeps a full channel from blocking the consensus loop — a
+            // dropped purge is harmless (best-effort, retried next tick).
+            if target > self.archive_first_base.load(Ordering::Acquire) {
+                let _ = self.trunc_tx.try_send(ArchiveCmd::Purge { below: target });
+                did = true;
+            }
+        }
+        if did {
+            self.snapshot_floor_last_persist_ns = Some(now);
+        }
+        did
     }
 
     /// Publish `term`, `flags` (leader/can_serve), and a fresh wall-clock
@@ -961,6 +1413,14 @@ impl Consensus {
     /// Send a nonce'd READ_PROBE to every follower over the consensus socket,
     /// stamped with our current term (a follower acks only a probe whose term
     /// still equals its own — the no-stale-read filter lives on the follower).
+    /// Gossip fan-out targets: voting peers ++ learners. Commit gossip and term
+    /// maps go to both (learners replicate + reconcile); votes and READ_PROBEs go
+    /// to voters only. Collected into an owned Vec so the caller can `self.send`
+    /// inside the loop (which needs `&mut self`).
+    fn gossip_targets(&self) -> Vec<NodeId> {
+        self.peers.iter().chain(self.learner_ids.iter()).copied().collect()
+    }
+
     fn send_read_probe(&mut self, nonce: u64) {
         let term = self.sm.current_term();
         let mut body = [0u8; READ_PROBE_BODY_LEN];
@@ -991,7 +1451,11 @@ impl Consensus {
     /// same node does not advance the count). On reaching quorum the read moves
     /// to `AwaitApplied`.
     fn on_read_probe_ack(&mut self, nonce: u64, from: NodeId) {
-        if !self.id_to_addr.contains_key(&from) {
+        // M6 Task 7 (the constraint block): the read quorum is over VOTERS only.
+        // The probe loop already targets voting peers, but re-check membership here
+        // so a learner's (or any non-voter's) ack can never complete a read quorum
+        // — even a forged/misrouted one. `peers` is the voting set minus self.
+        if !self.peers.contains(&from) {
             return;
         }
         for r in self.pending_reads.iter_mut() {
@@ -1176,6 +1640,12 @@ impl Consensus {
                     self.reports_implausible.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
+                // M6 Task 9: track the peer's newest durable for the cnc band
+                // (in-memory, monotonic-max; flushed once per duty cycle).
+                self.peer_reported
+                    .entry(id)
+                    .and_modify(|d| *d = (*d).max(durable))
+                    .or_insert(durable);
                 Event::Report { from: id, term, durable }
             }
             NetEvent::CommitGossip { from, term, commit } => {
@@ -1197,10 +1667,11 @@ impl Consensus {
             }
             NetEvent::TermMap { from, term, entries } => {
                 self.learn_leader_hint(from, term);
-                Event::TermMapReceived {
-                    term,
-                    entries: entries.iter().map(|e| (e.term, e.base)).collect(),
-                }
+                let pairs: Vec<(u32, u64)> = entries.iter().map(|e| (e.term, e.base)).collect();
+                // M6 Task 8: remember the leader's authoritative lineage for the
+                // snapshot-install seed (below-floor join). Capture the newest.
+                self.last_leader_map = pairs.clone();
+                Event::TermMapReceived { term, entries: pairs }
             }
             NetEvent::ReadProbe { nonce, from, term } => {
                 // Follower side: reply an ack iff still our term (handled inline,
@@ -1375,7 +1846,10 @@ impl Consensus {
             }
             Action::GossipCommit { commit } => {
                 let term = self.sm.current_term();
-                for id in self.peers.clone() {
+                // Voters AND learners: a learner advances its commit off this
+                // gossip exactly like a follower (it just never gossips back a
+                // Report that counts).
+                for id in self.gossip_targets() {
                     let addr = self.id_to_addr[&id];
                     self.send(addr, DGRAM_KIND_COMMIT_POSITION, commit, term, &[]);
                 }
@@ -1383,7 +1857,9 @@ impl Consensus {
             Action::ShipTermMap { entries } => {
                 let term = self.sm.current_term();
                 let body = encode_term_map(&entries);
-                for id in self.peers.clone() {
+                // Voters AND learners: a learner reconciles against the shipped map
+                // (the NoCommonPrefix → wipe path in Task 8 rides this too).
+                for id in self.gossip_targets() {
                     let addr = self.id_to_addr[&id];
                     self.send(addr, DGRAM_KIND_TERM_MAP, 0, term, &body);
                 }
@@ -1409,7 +1885,9 @@ impl Consensus {
                 self.close_gate();
                 self.pending_truncation = Some(epoch);
                 self.awaiting_reconcile = false;
-                self.trunc_tx.send((epoch, to)).expect("archive channel closed");
+                self.trunc_tx
+                    .send(ArchiveCmd::Truncate { epoch, to })
+                    .expect("archive channel closed");
             }
             Action::PersistTermMap { new_map } => {
                 self.state
@@ -1418,6 +1896,12 @@ impl Consensus {
             }
             Action::Fatal { reason } => {
                 panic!("consensus fatal (fail-stop): {reason}");
+            }
+            Action::CountWipe => {
+                // M6 Task 8: a wipe-and-rejoin was decided; the substantive
+                // `Truncate { to: 0 }` follows in the same action batch. Count it
+                // (distinct from an ordinary truncate) for observability + tests.
+                self.wipes.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -1564,6 +2048,12 @@ fn rederive_term_map(
         Some((t, b)) => (*b, *t),
         None => (0, 0),
     };
+    // M6 Task 4: after a purge, the persisted map's last base may sit below the
+    // archive's first retained block — replaying from it would be `PositionPurged`.
+    // Everything below `first_base` is already in the persisted map (and covered
+    // by the snapshot the purge floor represents); only the retained tail can
+    // contain terms not yet stamped, so clamp the scan start to `first_base`.
+    let start = start.max(archive.first_base());
     let mut replay = archive.replay_from(start)?;
     while let Some(frame) = replay.next()? {
         let t = frame.header.leadership_term_id;
@@ -1605,7 +2095,7 @@ mod tests {
         _net_tx: mpsc::SyncSender<NetEvent>,
         _obs_tx: mpsc::SyncSender<(u32, u64)>,
         _ingress_tx: mpsc::SyncSender<Vec<u8>>,
-        _trunc_rx: mpsc::Receiver<(u64, u64)>,
+        _trunc_rx: mpsc::Receiver<ArchiveCmd>,
         _dir: tempfile::TempDir,
     }
 
@@ -1667,6 +2157,7 @@ mod tests {
                 election_timeout_max_ns: 300,
                 gossip_floor_ns: u64::MAX,
                 seed: 7,
+                can_vote: true,
             },
             None,
             &[(1, 0), (2, 4096)],
@@ -1688,7 +2179,7 @@ mod tests {
         let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(64);
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(64);
         let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Vec<u8>>(64);
-        let (trunc_tx, trunc_rx) = mpsc::sync_channel::<(u64, u64)>(64);
+        let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
         let trunc_slot = TruncationSlot::default();
 
         let sock = FaultSocket::from_socket(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
@@ -1729,6 +2220,10 @@ mod tests {
             id_to_addr,
             addr_to_id,
             peers,
+            learner_ids: Vec::new(),
+            peer_band: Vec::new(),
+            peer_reported: HashMap::new(),
+            peer_band_published: false,
             net_rx,
             obs_rx,
             ingress_rx,
@@ -1739,6 +2234,7 @@ mod tests {
             can_serve_flag: Arc::new(AtomicBool::new(false)),
             intake_gate,
             truncations: Arc::new(AtomicU64::new(0)),
+            wipes: Arc::new(AtomicU64::new(0)),
             reports_implausible: Arc::new(AtomicU64::new(0)),
             base: Instant::now(),
             durable_seen: 6016,
@@ -1747,6 +2243,13 @@ mod tests {
             pending_truncation: None,
             output_persisted_completed: 0,
             output_progress_last_persist_ns: None,
+            purge_policy: PurgePolicy::Disabled,
+            archive_first_base: Arc::new(AtomicU64::new(0)),
+            snapshot_persisted_floor: 0,
+            snapshot_floor_last_persist_ns: None,
+            incoming_snapshot: Arc::new(AtomicU64::new(0)),
+            adopted_incoming: 0,
+            last_leader_map: Vec::new(),
         };
 
         Harness {
@@ -1789,7 +2292,7 @@ mod tests {
         assert!(!h.gate_open(), "gate stays closed while the truncate is emitted");
         let epoch = h.cons.pending_truncation.expect("a truncation is now in flight");
         // The truncate command reached the archive channel with its epoch.
-        assert_eq!(h._trunc_rx.try_recv().ok(), Some((epoch, 4096)));
+        assert_eq!(h._trunc_rx.try_recv().ok(), Some(ArchiveCmd::Truncate { epoch, to: 4096 }));
 
         // Term-map #2: the leader re-ships the SAME map while the archive
         // truncation is still in flight. The SM's truncating latch drops it with
@@ -1805,6 +2308,47 @@ mod tests {
         h.post_ack_and_drain(epoch, 4096);
         assert!(h.gate_open(), "the Truncated ack completes reconciliation and reopens");
         assert!(h.cons.pending_truncation.is_none());
+    }
+
+    /// M6 Task 8: a `NoCommonPrefix` reconcile drives a WIPE-AND-REJOIN end to end
+    /// through a real `Consensus`. The divergence predates the leader's shipped
+    /// window (its earliest entry begins above our first byte — the purged-prefix
+    /// case), so the SM emits a truncate-to-0 with an empty map plus a `CountWipe`
+    /// tag. The node runs the true side effects: persists the empty map, closes the
+    /// intake gate, commands the archive `Truncate { to: 0 }`, and counts the wipe
+    /// distinctly from an ordinary truncate. The archive ack then reopens the gate.
+    #[test]
+    fn no_common_prefix_wipes_the_node_and_rejoins_empty() {
+        let mut h = harness();
+        assert_eq!(h.cons.wipes.load(Ordering::Relaxed), 0);
+
+        // Adopt a far-higher term (closes the gate, arms reconciliation).
+        h.cons.feed(Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
+        assert!(!h.gate_open());
+
+        // A leader map whose earliest shipped entry begins at 1<<20 — its window
+        // slid past our first byte (base 0). own=[(1,0),(2,4096)] shares no prefix
+        // ⇒ NoCommonPrefix ⇒ wipe.
+        h.cons.feed(Event::TermMapReceived { term: 41, entries: vec![(40, 1 << 20), (41, 2 << 20)] });
+
+        // The wipe was counted (distinct from a truncate) and the archive was
+        // commanded to truncate to 0 (a full wipe), under an in-flight epoch.
+        assert_eq!(h.cons.wipes.load(Ordering::Relaxed), 1, "wipe counted");
+        let epoch = h.cons.pending_truncation.expect("wipe truncation in flight");
+        assert_eq!(
+            h._trunc_rx.try_recv().ok(),
+            Some(ArchiveCmd::Truncate { epoch, to: 0 }),
+            "a wipe is a truncate-to-0"
+        );
+        assert!(!h.gate_open(), "gate closed across the wipe");
+
+        // The archive ack completes the wipe: the gate reopens (empty follower,
+        // ready to refill from the live stream / snapshot session) and the
+        // truncation is counted.
+        h.post_ack_and_drain(epoch, 0);
+        assert!(h.gate_open(), "the Truncated ack reopens intake after the wipe");
+        assert_eq!(h.cons.pending_truncation, None);
+        assert_eq!(h.cons.truncations.load(Ordering::Relaxed), 1, "a wipe is also a truncate");
     }
 
     /// M5 residual carry: a matching-epoch ack for a truncation whose adopted term

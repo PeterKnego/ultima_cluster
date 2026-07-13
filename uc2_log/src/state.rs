@@ -38,11 +38,18 @@ pub struct NodeState {
     vote: StableValue<VoteRecord>,
     term_map: StableValue<TermMap>,
     output_progress: StableValue<u64>,
+    /// M6 Task 4: the durable snapshot floor — the position of the newest
+    /// service-built snapshot the node has validated (`<= durable`) and
+    /// committed to. Purge never drops journal below it. Same `StableValue`
+    /// primitive + increase-only-high-water-mark discipline as
+    /// `output_progress` (see `store_snapshot_floor` / the node's
+    /// `maybe_persist_snapshot_floor`).
+    snapshot: StableValue<u64>,
     /// Cached copies (`StableValue::load` clones the cached value, but reads on
     /// the consensus hot path go through this single lock; the term map, the
-    /// vote, and the output-progress marker share it so a recovery read is one
-    /// lock, not three).
-    cache: Mutex<(Option<VoteRecord>, TermMap, u64)>,
+    /// vote, the output-progress marker, and the snapshot floor share it so a
+    /// recovery read is one lock, not four).
+    cache: Mutex<(Option<VoteRecord>, TermMap, u64, u64)>,
 }
 
 impl NodeState {
@@ -54,10 +61,18 @@ impl NodeState {
         let term_map = StableValue::open(StableValueConfig::new(dir.join("term_map.state")))?;
         let output_progress =
             StableValue::open(StableValueConfig::new(dir.join("output_progress.state")))?;
+        let snapshot = StableValue::open(StableValueConfig::new(dir.join("snapshot.state")))?;
         let v = vote.load()?;
         let m = term_map.load()?.unwrap_or_default();
         let op = output_progress.load()?.unwrap_or(0);
-        Ok(Self { vote, term_map, output_progress, cache: Mutex::new((v, m, op)) })
+        let snap = snapshot.load()?.unwrap_or(0);
+        Ok(Self {
+            vote,
+            term_map,
+            output_progress,
+            snapshot,
+            cache: Mutex::new((v, m, op, snap)),
+        })
     }
 
     pub fn vote(&self) -> Option<VoteRecord> {
@@ -96,6 +111,27 @@ impl NodeState {
     pub fn store_output_progress(&self, v: u64) -> Result<(), StableValueError> {
         self.output_progress.store(&v)?.wait().map_err(durability_error)?;
         self.cache.lock().unwrap().2 = v;
+        Ok(())
+    }
+
+    /// The last durably-persisted snapshot floor (M6 Task 4); `0` if no snapshot
+    /// has ever been validated (or this is a fresh instance dir).
+    pub fn snapshot_floor(&self) -> u64 {
+        self.cache.lock().unwrap().3
+    }
+
+    /// Durable on return — persist the snapshot floor (M6 Task 4). Caller
+    /// (`Consensus::maybe_persist_snapshot_floor`) enforces the increase-only
+    /// high-water-mark and the `<= durable` validation BEFORE calling this, for
+    /// the exact reason the output-progress marker does: the cnc page is
+    /// recreated fresh every boot, so a naive "value changed" persist would
+    /// regress the durable floor to a lower live value on the first cycle and
+    /// (unlike output-progress, which is only at-least-once slack) that would be
+    /// a SAFETY bug — a purge floor must never move backwards. This method is
+    /// the plain durable store; the guard lives at the one call site.
+    pub fn store_snapshot_floor(&self, v: u64) -> Result<(), StableValueError> {
+        self.snapshot.store(&v)?.wait().map_err(durability_error)?;
+        self.cache.lock().unwrap().3 = v;
         Ok(())
     }
 }
@@ -161,5 +197,29 @@ mod tests {
         // "restart": reopen from the same dir.
         let s = NodeState::open(dir.path()).unwrap();
         assert_eq!(s.output_progress(), 4096, "durable marker survives reopen");
+    }
+
+    #[test]
+    fn snapshot_floor_defaults_to_zero_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = NodeState::open(dir.path()).unwrap();
+            assert_eq!(s.snapshot_floor(), 0, "fresh instance dir floor defaults to 0");
+            s.store_snapshot_floor(8192).unwrap();
+            assert_eq!(s.snapshot_floor(), 8192);
+        }
+        // "restart": reopen from the same dir — the floor is a durable value.
+        let s = NodeState::open(dir.path()).unwrap();
+        assert_eq!(s.snapshot_floor(), 8192, "durable snapshot floor survives reopen");
+    }
+
+    #[test]
+    fn snapshot_floor_is_independent_of_output_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = NodeState::open(dir.path()).unwrap();
+        s.store_output_progress(4096).unwrap();
+        s.store_snapshot_floor(8192).unwrap();
+        assert_eq!(s.output_progress(), 4096);
+        assert_eq!(s.snapshot_floor(), 8192, "separate StableValues, separate cache slots");
     }
 }
