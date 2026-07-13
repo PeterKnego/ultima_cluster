@@ -1,0 +1,51 @@
+name: ci
+
+# Fast correctness gate for PRs and pushes to main (~minutes, not the full
+# proof suite — that's nightly.yml):
+#   * clippy — the workspace lint gate (--all-targets, -D warnings), plus a
+#     second pass with uc2_service's non-default `ultima_db` feature so the
+#     StoreStateMachine adapter (crates.io ultima-db) stays green — the
+#     default workspace build never compiles it.
+#   * tests — the whole workspace EXCEPT uc2_node's slow WGL capstones
+#     (lin_v2 / lin_partition_v2 spin multi-node clusters of busy-polling
+#     agents for minutes; nightly runs them). uc2_node's fast integration
+#     suites (smoke, failover, learner, purge_safety, query_barrier) DO run
+#     here — they're the election/truncation/reconstruction regression net.
+# Deliberately NOT run here:
+#   * cargo fmt --check — the codebase predates a fmt pass (~800 hunks of
+#     drift); clippy is the enforced style gate, per CLAUDE.md.
+#   * lin_v2 / lin_partition_v2 / sim-heavy / loom / hard-crash — nightly.yml.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (workspace, all targets)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (uc2_service + ultima_db adapter)
+        run: cargo clippy -p uc2_service --features ultima_db --all-targets -- -D warnings
+      - name: Tests (workspace, minus slow capstones)
+        run: cargo test --workspace --exclude uc2_node
+      - name: Tests (uc2_service + ultima_db adapter)
+        run: cargo test -p uc2_service --features ultima_db
+      - name: Tests (uc2_node fast integration)
+        run: >
+          cargo test -p uc2_node --lib
+          --test smoke --test failover --test learner
+          --test purge_safety --test query_barrier

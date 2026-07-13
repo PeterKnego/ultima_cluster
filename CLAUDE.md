@@ -26,7 +26,10 @@ Canonical documents, in order:
    decode, purge enablement, learner add/remove).
 4. Storage primitives: `../ultima_db/docs/tasks/task26_journal.md`
    (`ultima_journal` log primitives) and `task27_snapshot_stream.md` (the
-   `ultima_db` snapshot wire format).
+   `ultima_db` snapshot wire format). The `ultima-db` *code* dependency comes
+   from crates.io (the workspace builds standalone); the sibling checkout is
+   only needed for its docs or lockstep local development
+   (`[patch.crates-io]`).
 
 ## Build & Test Commands
 
@@ -36,7 +39,8 @@ cargo test                                       # in-process integration + sim 
 cargo test -p uc2_node --test lin_v2             # WGL linearizability capstone (failover + purge/snapshot churn)
 cargo test -p uc2_node --test lin_partition_v2   # network-partition / quorum-loss linearizability
 cargo test -p uc2-crashtest --features hard-crash-tests   # spawn real node+service procs; SIGKILL mid-load, assert linearizable
-cargo clippy --workspace -- -D warnings          # lint (must pass with zero warnings)
+cargo test -p uc2_service --features ultima_db   # the (non-default) ultima-db store adapter — the default build never compiles it
+cargo clippy --workspace --all-targets -- -D warnings     # lint (must pass with zero warnings)
 cargo run -p uc2_node --release --example m5_gate # throughput gate harness (see the gate doc)
 cargo run -p uc2_node --release --example m6_gate -- all --secs 6 --cycles 5   # snapshots/learners/purge gate
 ```
@@ -209,6 +213,8 @@ them manually if ever.
 - `ultima_journal/` — segmented append journal + `StableValue`. In-tree workspace
   member (moved in from `ultima_db`; full history preserved). Design notes:
   `../ultima_db/docs/tasks/task26_journal.md`.
-- `../ultima_db/` — MVCC copy-on-write B-tree store with `snapshot_stream` wire
-  format (the default app-state store + snapshot format). See `../ultima_db/CLAUDE.md`
-  and `../ultima_db/docs/tasks/task27_snapshot_stream.md`.
+- `ultima-db` — MVCC copy-on-write B-tree store with `snapshot_stream` wire
+  format (the default app-state store + snapshot format, behind `uc2_service`'s
+  non-default `ultima_db` feature). **Dependency comes from crates.io** — no
+  sibling checkout required to build. Docs live in the `../ultima_db/` repo
+  (`CLAUDE.md`, `docs/tasks/task27_snapshot_stream.md`) when checked out.

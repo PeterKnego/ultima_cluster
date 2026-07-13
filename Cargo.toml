@@ -22,8 +22,11 @@ futures = "0.3"
 
 # storage
 ultima-journal = { path = "ultima_journal" }
-# `persistence` is required for snapshot_stream / install_snapshot_stream.
-ultima-db = { path = "../ultima_db", features = ["persistence"] }
+# crates.io dep (published 0.1.1) — the workspace builds standalone, no sibling
+# checkout needed. `persistence` is required for snapshot_stream /
+# install_snapshot_stream. For lockstep local development against a checkout,
+# temporarily add: [patch.crates-io] ultima-db = { path = "../ultima_db" }
+ultima-db = { version = "0.1.1", features = ["persistence"] }
 
 # QUIC + TLS (M2)
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }

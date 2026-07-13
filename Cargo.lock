@@ -1016,7 +1016,9 @@ dependencies = [
 
 [[package]]
 name = "ultima-db"
-version = "0.1.0"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f46899501446a25fc5373265431728d28d833a4af15551769ca0ac7215893f8"
 dependencies = [
  "bincode",
  "crc32fast",
