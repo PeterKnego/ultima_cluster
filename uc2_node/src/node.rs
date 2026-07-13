@@ -1278,6 +1278,15 @@ impl Consensus {
             // identical reason the lineage is: our own absent local bytes carry
             // nothing genuine to fall back to below the floor. Persist-before-
             // adopt-floor, same ordering discipline as the lineage seed above.
+            // TODO(Task 7): this fiat path updates the SM + record + cnc but does
+            // NOT rebuild peer routing (rebuild_peer_maps + CtrlMsg::SetPeers).
+            // Unreachable divergence today (no admin propose path, so a joiner's
+            // seed membership always equals the shipped membership — only the
+            // version differs), but once membership can change live, a below-floor
+            // joiner installing a snapshot whose config differs from its boot seed
+            // MUST also rebuild routing here, and the one-in-flight rule
+            // (ElectionSm::propose_config's ChangePending refusal) is what keeps
+            // the one-level ConfigRecord history sufficient — do not weaken it.
             let cfg_bytes = self.incoming_snapshot_config.lock().unwrap().clone();
             if !cfg_bytes.is_empty() {
                 let wire = decode_config(&cfg_bytes)

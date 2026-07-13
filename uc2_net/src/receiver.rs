@@ -892,7 +892,7 @@ impl FollowerReceiver {
                 session: intake.session,
                 snapshot_pos: intake.snapshot_pos,
                 total_len: intake.total_len,
-                config: vec![], // M7: empty for M6
+                config: vec![], // the DONE ack carries no config — only SNAP_BEGIN ships it
             },
         );
         let _ = self.sock.send_to(&d, intake.peer);
