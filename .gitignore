@@ -38,3 +38,7 @@ auto-bench-runs/
 /bench-out/*
 !/bench-out/reference/
 .claude/
+
+# python bytecode (bench-infra scripts)
+__pycache__/
+*.pyc
