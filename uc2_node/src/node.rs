@@ -518,11 +518,17 @@ impl Node {
         // (empty) fan-out with a cluster size of 1, which also sidesteps flow
         // control's leader-in-cluster invariant (from a learner's view every voter
         // is a follower, so `voters == cluster_size` would trip the assert). A
-        // voter's sender gets the real fan-out = voters-minus-self ++ learners.
+        // voter's sender gets the real fan-out = voters-minus-self ++ learners,
+        // sized via `sender_cluster_size` (M7 Task 8) rather than the possibly-
+        // stale seed's `cfg.members.len()` — the RECOVERED `config` is the
+        // authoritative source (a restart after live reconfiguration may have a
+        // materially different voter count than the seed), and using the seed
+        // count would panic `FlowControl::new` for a node that recovers as a
+        // genuine non-voter (a stale-seed joiner not yet in ANY list).
         let (sender_followers, sender_learners, sender_cluster) = if is_learner {
             (Vec::new(), Vec::new(), 1)
         } else {
-            (followers, learner_addrs.clone(), cfg.members.len())
+            (followers, learner_addrs.clone(), sender_cluster_size(&config, cfg.id))
         };
         let mut sender = Sender::with_learners(
             Arc::clone(&buffer),
@@ -1186,8 +1192,14 @@ impl Consensus {
         self.feed(Event::Tick { now_ns: now });
 
         // 5. Publish role/serving snapshots for the API (term is written on
-        // transitions; keep can_serve fresh every cycle).
-        self.can_serve_flag.store(self.sm.can_serve(), Ordering::Release);
+        // transitions; keep can_serve fresh every cycle). M7 Task 8: masked
+        // off `halt_removed` exactly like `publish_status`'s cnc mirror below —
+        // otherwise a self-removing LEADER's `StepDownRemoved` halt (`exec`,
+        // above these steps in this SAME cycle) would be silently undone right
+        // here: the SM's own `serving` field is never cleared by step-down (it
+        // has no reason to be), so an unconditional store would re-publish
+        // `true` for `Node::can_serve()` the very cycle it just halted.
+        self.can_serve_flag.store(!self.halt_removed && self.sm.can_serve(), Ordering::Release);
 
         // 6. Publish the node's status onto the shared cnc page for cross-process
         // attachers (service, clients). `term` + `flags` reflect the SM every
@@ -2404,10 +2416,17 @@ impl Consensus {
                     .filter(|(id, _)| *id != self.id)
                     .map(|(_, a)| addr_of(*a))
                     .collect();
+                // M7 Task 8: `sender_cluster_size` (not the plain voter count) —
+                // a LEADER mid-self-removal keeps rebuilding its OWN real sender
+                // here while `config` no longer contains it, and a removed
+                // FOLLOWER's now-moot sender is rebuilt one last time before it
+                // halts; both need the "self occupies an uncounted +1 slot"
+                // adjustment or `FlowControl::new`'s invariant assert panics the
+                // sender thread on the spot (see the helper's doc).
                 let _ = self.sender_ctrl.send(CtrlMsg::SetPeers {
                     followers,
                     learners,
-                    cluster_size: config.voters.len(),
+                    cluster_size: sender_cluster_size(&config, self.id),
                 });
                 // Refresh the node's own routing + observability.
                 self.rebuild_peer_maps(&config);
@@ -2420,13 +2439,42 @@ impl Consensus {
                 // M7: this node is not a member of the just-adopted config (and
                 // is not a leader mid-self-removal — that case keeps serving
                 // until its own removal commits). Fail-stop: park permanently.
-                // `publish_status` (still to run this SAME cycle, below `exec`
-                // in `do_work`) forces LEADER/CAN_SERVE off once `halt_removed`
-                // is set, so the very next status publish already reflects it.
                 eprintln!("node {}: removed from cluster config — halting", self.id);
-                self.halt_removed = true;
+                self.halt();
+            }
+            Action::StepDownRemoved => {
+                // M7 Task 8: a LEADER's own removal has just COMMITTED (the SM
+                // kept it serving through the adoption window; commit crossing
+                // `config_position` means C_new itself now certifies the
+                // removal). Nothing left to do but fail-stop exactly like
+                // `HaltRemoved`. The remaining C_new voters elect among
+                // themselves; this leader never depended on beyond the commit
+                // that just landed.
+                eprintln!("node {}: removed from cluster (self-removal committed) — halting", self.id);
+                self.halt();
             }
         }
+    }
+
+    /// Shared fail-stop park for `HaltRemoved`/`StepDownRemoved` (M7 Task 8):
+    /// set the permanent `halt_removed` latch (`do_work`'s entry check short-
+    /// circuits every SUBSEQUENT cycle), AND clear the in-process
+    /// `leader_flag`/`can_serve_flag` immediately rather than leaving them at
+    /// whatever they last read. `publish_status` (still to run this SAME
+    /// cycle, below `exec` in `do_work`) already masks the CNC-PAGE mirror
+    /// off `halt_removed` regardless — but `Node::is_leader()`/`can_serve()`
+    /// read these two atomics DIRECTLY, bypassing that mask entirely. Without
+    /// this, `StepDownRemoved`'s leader case (the SM's `serving` field is
+    /// never cleared by step-down — it has no reason to be, nothing else
+    /// reads it once halted) would leave an embedded caller's `is_leader()`/
+    /// `can_serve()` reporting stale `true` forever after a real halt. A
+    /// removed FOLLOWER's flags were already `false` here (only a LEADER
+    /// reaches `StepDownRemoved`), so this is a no-op there — the fix is
+    /// entirely about the self-removal leader case Task 8 introduces.
+    fn halt(&mut self) {
+        self.halt_removed = true;
+        self.leader_flag.store(false, Ordering::Release);
+        self.can_serve_flag.store(false, Ordering::Release);
     }
 
     /// Archive-truncation feedback (slot ack). The map was already persisted
@@ -2640,6 +2688,27 @@ fn cluster_to_stored(c: &ClusterConfig) -> StoredConfig {
             .collect(),
         tombstones: c.tombstones.clone(),
     }
+}
+
+/// M7 Task 8: the VOTING cluster size to pass as `FlowControl::new`'s
+/// `cluster_size` for `id`'s OWN sender, over `config`. Mirrors
+/// `ElectionSm::rebuild_membership`'s `CommitTracker` sizing convention
+/// exactly (own_durable / self always occupies a ranking slot, member or
+/// not): if `id` IS a voter in `config`, it already occupies one of
+/// `config.voters.len()` slots and that count is the cluster size outright.
+/// If `id` is NOT a voter — a learner (though callers special-case learners
+/// with a dummy solo sender before ever reaching here), a genuinely unknown
+/// orphan booting from a stale seed, or — Task 8's real case — a LEADER
+/// mid-self-removal that must keep serving/replicating until its own removal
+/// commits — it occupies an UNCOUNTED "+1" slot that
+/// `FlowControl::new`'s `cluster_size > voting_followers.len()` assert
+/// requires to exist (`followers`/`voting` in that case is the FULL voter
+/// list, unfiltered, since `id` isn't in it to filter out — using the plain
+/// voter count here would make `cluster_size == followers.len()` and panic
+/// the instant a non-member's own sender is (re)built).
+fn sender_cluster_size(config: &ClusterConfig, id: NodeId) -> usize {
+    let n = config.voters.len();
+    if config.is_voter(id) { n } else { n + 1 }
 }
 
 /// Derive the peer-address maps + observability band from a `ClusterConfig`

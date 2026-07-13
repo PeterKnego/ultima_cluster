@@ -572,6 +572,45 @@ fn propose_during_pending_is_refused() {
     );
 }
 
+/// M7 Task 8 (controller amendment carry #4): a LEADER proposes its own
+/// removal — it keeps serving through the adoption window (`halted_removed`
+/// stays false, it is still the raw/serving leader), then steps down
+/// (`Action::StepDownRemoved` -> `halted_removed`) the instant the removal
+/// entry itself commits — never before. The surviving C_new voters (the
+/// other 2 of the original 3) elect a new leader and keep committing. All
+/// safety invariants (inv1-9) stay green throughout (the oracle sweep runs
+/// after every scripted step and every natural step via `step_once`).
+#[test]
+fn leader_self_removal_steps_down_after_commit_and_c_new_elects() {
+    let mut w = World::new(SimConfig { drop_per_million: 0, ..base_cfg(21) });
+    w.run_until_leader().expect("elect L1");
+    let l1 = w.current_leader().unwrap();
+    w.run_steps(300).expect("a genuine committed prefix");
+
+    assert_eq!(propose_ok(&mut w, ConfigOp::RemoveVoter { id: l1 as u32 }), 1);
+    // Removing itself: the leader keeps serving through the adoption window —
+    // it must NOT halt yet (Task 8's whole point: C_new must be replicated by
+    // a leader that still exists).
+    assert!(!w.halted_removed(l1), "self-removing leader must not halt at adoption");
+    assert!(w.node_is_serving_leader(l1), "leader keeps serving pre-commit");
+
+    // Once the removal entry itself commits, the leader steps down.
+    w.run_until(|w| w.halted_removed(l1))
+        .expect("leader steps down once its own removal commits");
+    assert!(
+        !w.node_is_raw_leader(l1),
+        "the stepped-down leader must no longer be a live raw leader"
+    );
+
+    // C_new (the surviving 2 voters) elects a new leader and keeps committing.
+    w.run_until_leader().expect("C_new elects a new leader");
+    let l2 = w.current_leader().unwrap();
+    assert_ne!(l2, l1, "the new leader must be one of the survivors");
+    let c = w.max_commit();
+    w.run_steps(2_000).expect("the shrunken cluster keeps serving");
+    assert!(w.max_commit() > c, "commit must keep advancing under the new (2-voter) config");
+}
+
 /// Truncation revert (spec §5): a config frame appended by a leader that gets
 /// isolated before replicating it is truncated away when the node reconciles
 /// into the new term — the node reverts to the previous config (inv8 checks at

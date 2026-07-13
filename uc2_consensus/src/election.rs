@@ -175,6 +175,17 @@ pub enum Action {
     /// commits; Task 8 adds that commit-triggered step-down). The agent must
     /// fail-stop.
     HaltRemoved,
+    /// M7 Task 8: a LEADER's own removal has just COMMITTED (`commit_seen`
+    /// crossed `config_position` while `!config.contains(self.id)`). Emitted
+    /// exactly once (guarded by `stepped_down`) from `rank_leader`, the same
+    /// site that advances commit. The agent must stop leading the same way
+    /// `HaltRemoved` fail-stops — log, park permanently, feed nothing further.
+    /// The remaining voters (C_new) elect normally; they never depended on
+    /// this leader beyond the commit that just landed. Never fires for a
+    /// follower (a follower's self-exclusion is `HaltRemoved`, emitted at
+    /// ADOPTION, not commit — it has no NewTerm-style obligation to keep
+    /// serving the entry that removed it).
+    StepDownRemoved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +299,12 @@ pub struct ElectionSm {
     /// flips it to `false` to reproduce the OLD `Action::Fatal` behavior and prove
     /// the same divergent world fail-stops without the wipe.
     wipe_on_no_common_prefix: bool,
+    /// M7 Task 8: latched once `Action::StepDownRemoved` has fired, so a
+    /// leader mid-self-removal emits it exactly once even though `rank_leader`
+    /// keeps running (re-shipping gossip, ranking further reports) every tick
+    /// until the agent actually parks the process. Never reset — this is a
+    /// one-way trip, same posture as `HaltRemoved`.
+    stepped_down: bool,
 }
 
 impl ElectionSm {
@@ -378,6 +395,7 @@ impl ElectionSm {
             truncation_epoch: 0,
             pending_new_map: None,
             wipe_on_no_common_prefix: true,
+            stepped_down: false,
         };
         sm.arm_timeout(now_ns);
         sm
@@ -1096,6 +1114,52 @@ impl ElectionSm {
     /// member") — own_durable always occupies that "+1" ranking slot in
     /// `advance`, self-as-voter or not — so cluster_size is always
     /// `n_followers + 1`.
+    ///
+    /// **CONSCIOUS DECISION (M7 Task 8 controller amendment carry #1, T3/T4
+    /// review): the mid-self-removal leader's ranking is MORE PERMISSIVE than
+    /// a pure C_new quorum, and this is INTENTIONAL — kept, not tightened.**
+    /// When self is a departing leader, `n_followers = n` (every C_new voter
+    /// gets a slot, none excluded for self) and `cluster_size = n + 1`, so
+    /// `advance`'s quorum is `(n+1)/2 + 1` ranked over `{own_durable} ∪
+    /// {n real C_new reports}`. Own_durable is the leader's OWN append —
+    /// which is not itself a C_new member's durable — so this quorum can be
+    /// satisfied by the leader's own count plus FEWER than a true majority of
+    /// the n real C_new voters (pinned by
+    /// `self_removal_window_tracker_permits_leader_plus_one_of_two_new_followers`:
+    /// with 2 C_new voters, `own + 1-of-2` already ranks 2nd-highest, whereas a
+    /// pure C_new majority needs both). Ongaro's 2014 dissertation §4.2.2
+    /// explicitly forbids the removed leader counting itself toward C_new's
+    /// majority for exactly this reason. Two options were on the table:
+    ///
+    /// (a) exclude the departing leader from the ranking entirely (a real
+    ///     "pure C_new quorum" tracker), or
+    /// (b) keep this sizing and rely on a DIFFERENT safety argument.
+    ///
+    /// We chose **(b)**. The safety argument: `handle_request_vote`'s
+    /// `log_ok` freshness check (`(last_term, last_durable) >= (our_term,
+    /// our_durable)`) means NO candidate can ever win an election without a
+    /// log at least as up-to-date as a majority of voters who granted it —
+    /// in particular, at least as up-to-date as one of the honest C_new
+    /// voters whose report the leader ranked to reach this commit (by the
+    /// classic Raft pigeonhole: any two majority-ish sets of C_new voters
+    /// across two elections share at least one voter, and that voter will
+    /// never grant a vote to a candidate whose log is behind what it durably
+    /// holds — which already includes this commit's bytes, since ITS OWN
+    /// report is what the leader ranked). So even though the ranking itself
+    /// admits a smaller real-C_new-agreement than Ongaro's rule requires, no
+    /// future election winner can ever NOT hold what was committed here — the
+    /// externally-observable safety property (no committed entry is ever
+    /// lost) holds regardless. `uc2_sim`'s config-churn fuzz (`fuzz_heavy_config_churn`,
+    /// which routinely proposes `RemoveVoter{leader}`) oracle-checks this
+    /// exact window on every seed and stays green under (b); a REAL
+    /// discrepancy (a future leader missing a report-certified commit) would
+    /// trip inv5/inv7 there. (a) would need a tracker mode that ranks
+    /// `own_durable` OUT of the "+1" slot entirely — undertaking a second
+    /// `CommitTracker` shape and re-deriving the sim's oracle in lockstep —
+    /// for a property already proven sound and already the sim's live
+    /// coverage; strictly more churn for no safety gain. If a future reader
+    /// ever needs (a), the sim's oracle for this window must move in lockstep
+    /// (re-run `cargo test -p uc2_sim --features sim-heavy --release`).
     fn rebuild_membership(&mut self, carry_reports: bool) {
         self.members = self.config.voter_ids();
         self.can_vote = self.config.is_voter(self.id);
@@ -1141,6 +1205,25 @@ impl ElectionSm {
                 && c >= pos
             {
                 self.serving = true;
+            }
+            // M7 Task 8: leader self-removal completion. `adopt_config` kept
+            // this leader serving through the adoption window (a leader
+            // removing itself must keep appending until C_new itself
+            // certifies the removal — Ongaro's single-server-change
+            // rationale: C_new must be replicated by a leader that still
+            // exists). Once THIS commit crosses `config_position` — the
+            // removal entry itself is now committed — there is nothing left
+            // for this leader to do: it is not in `config`, so it can never
+            // again be counted toward a future quorum, and the surviving
+            // C_new voters can elect among themselves. Emit exactly once
+            // (`stepped_down` latches it) even though this branch re-runs on
+            // every subsequent advance until the agent actually parks us.
+            if !self.stepped_down
+                && !self.config.contains(self.id)
+                && self.commit_seen >= self.config_position
+            {
+                self.stepped_down = true;
+                out.push(Action::StepDownRemoved);
             }
         }
     }
@@ -2108,6 +2191,145 @@ mod tests {
         new_cfg.version = 1;
         let acts = step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
         assert!(acts.iter().any(|a| matches!(a, Action::HaltRemoved)));
+    }
+
+    // ---- M7 Task 8: leader self-removal ----
+
+    /// Controller amendment carry #2: a LEADER adopting a config that
+    /// excludes ITSELF does not panic, keeps leading (`can_serve()` stays
+    /// true, no `HaltRemoved`), and commit keeps advancing via C_new reports
+    /// while it still appends — the single-server-change rationale (C_new
+    /// must be replicated by a leader that still exists) requires exactly
+    /// this. `HaltRemoved` (the follower path) is exercised by
+    /// `removed_follower_emits_halt` above; this pins the leader path stays
+    /// disjoint from it.
+    #[test]
+    fn leader_self_removal_adoption_keeps_leading_and_ranks_via_c_new() {
+        // 3 voters [0,1,2]; self = 0 becomes leader of term 1.
+        let mut s = sm(0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        assert!(s.can_serve(), "NewTerm committed: serving");
+
+        // Propose + adopt RemoveVoter{self} (fed as the append path would;
+        // config_position is set WELL above where we drive commit below, so
+        // this test stays strictly in the pre-crossing window).
+        let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
+        assert!(!new_cfg.contains(0));
+        let acts = step(&mut s, Event::ConfigObserved { position: 200, config: new_cfg });
+        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "a leader mid-self-removal must NOT halt at adoption"
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::StepDownRemoved)),
+            "no step-down before the removal entry itself commits"
+        );
+        assert!(matches!(s.role(), Role::Leader), "no panic, still leader");
+        assert!(s.can_serve(), "still serving through the adoption window");
+        assert!(!s.config().contains(0));
+
+        // Commit still advances via C_new reports (from 1, then 2) while the
+        // leader keeps appending — the whole point of not halting at
+        // adoption. Stays below config_position (200): still not stepped
+        // down. The FIRST report (own=128 + follower 1's 128, follower 2
+        // still stale at 0) already ranks the quorum-of-3 and crosses;
+        // follower 2's report is a same-value no-op advance (`None`).
+        step(&mut s, Event::DurableAdvanced { durable: 128 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 128 });
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 128 })),
+            "commit must keep advancing post-self-removal-adoption"
+        );
+        assert!(!acts.iter().any(|a| matches!(a, Action::StepDownRemoved)));
+        assert!(matches!(s.role(), Role::Leader));
+        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 128 });
+        assert!(!acts.iter().any(|a| matches!(a, Action::StepDownRemoved)));
+        assert!(matches!(s.role(), Role::Leader));
+    }
+
+    /// Step 1 / M7 Task 8: once commit CROSSES the self-removing leader's own
+    /// `config_position`, it emits `Action::StepDownRemoved` — exactly once,
+    /// even as further reports keep landing after the crossing.
+    #[test]
+    fn leader_self_removal_steps_down_once_commit_crosses_config_position() {
+        let mut s = sm(0); // voters [0,1,2], id 0
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        assert!(s.can_serve());
+
+        let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
+        step(&mut s, Event::ConfigObserved { position: 64, config: new_cfg });
+        assert!(matches!(s.role(), Role::Leader));
+
+        // Below config_position (64): no step-down yet.
+        step(&mut s, Event::DurableAdvanced { durable: 50 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 50 });
+        assert!(!acts.iter().any(|a| matches!(a, Action::StepDownRemoved)));
+        assert!(matches!(s.role(), Role::Leader), "still leading pre-crossing");
+
+        // Crosses config_position (64): StepDownRemoved fires alongside the
+        // AdvanceCommit that crosses it.
+        step(&mut s, Event::DurableAdvanced { durable: 100 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100 });
+        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 100 })));
+        assert_eq!(
+            acts.iter().filter(|a| matches!(a, Action::StepDownRemoved)).count(),
+            1,
+            "must emit StepDownRemoved exactly once on crossing"
+        );
+
+        // Further driving never re-emits it.
+        step(&mut s, Event::DurableAdvanced { durable: 200 });
+        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 200 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::StepDownRemoved)),
+            "must not re-emit after the first crossing"
+        );
+    }
+
+    /// Controller amendment carry #1 pin: the mid-self-removal leader's
+    /// ranking is MORE PERMISSIVE than a pure C_new quorum — it commits on
+    /// `{leader's own durable} ∪ {a single C_new follower's report}` even
+    /// though a genuine majority of the 2 remaining C_new voters would
+    /// require BOTH. This is the exact tradeoff documented at the
+    /// `rebuild_membership` sizing site (kept — decision (b), backed by the
+    /// `log_ok` + pigeonhole argument, not tightened to a pure-C_new tracker).
+    #[test]
+    fn self_removal_window_tracker_permits_leader_plus_one_of_two_new_followers() {
+        let mut s = sm(0); // voters [0,1,2], id 0
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        assert!(s.can_serve());
+
+        let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
+        assert_eq!(new_cfg.voter_ids(), vec![1, 2]);
+        step(&mut s, Event::ConfigObserved { position: 64, config: new_cfg });
+        assert!(!s.config().contains(0));
+
+        // The leader's own durable advances far past config_position; follower
+        // 2 NEVER reports again (permanently silent — a lagging/partitioned
+        // C_new voter). Only follower 1 reports.
+        step(&mut s, Event::DurableAdvanced { durable: 1000 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 1000 });
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 1000 })),
+            "own + ONE of the two C_new followers already ranks a quorum-of-3 \
+             (leader's own slot + follower 1's slot) even though follower 2 \
+             never reported — MORE permissive than a pure majority-of-2 over \
+             {{1,2}} alone, which is the conscious tradeoff carry #1 documents"
+        );
     }
 
     /// After a voter is removed from the adopted config, its `Report` no

@@ -1462,7 +1462,15 @@ impl World {
                 nd.cfg_prev = prev;
                 nd.cfg_prev_pos = prev_position;
             }
-            Action::HaltRemoved => {
+            // M7 Task 8: `StepDownRemoved` is the leader-mid-self-removal twin
+            // of `HaltRemoved` — it fires AFTER the commit crossing (the SM
+            // kept the leader serving through the adoption window; the node
+            // model here doesn't need to distinguish "removed follower halts
+            // at adoption" from "removed leader halts at commit", both reduce
+            // to the identical fail-stop model below). Same permanent-park
+            // semantics either way: like a crash, but no restart is ever
+            // scheduled (`restart()` refuses via the `halted` flag).
+            Action::HaltRemoved | Action::StepDownRemoved => {
                 // Removed from the cluster: fail-stop, PERMANENTLY — like a
                 // crash, but no restart is ever scheduled and `restart()`
                 // refuses (the `halted` flag). Volatile state is torn down the
