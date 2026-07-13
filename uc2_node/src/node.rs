@@ -1260,6 +1260,22 @@ impl Consensus {
                     .id_and_role
                     .store_release(uc2_log::cnc::pack_id_and_role(*id, *role));
             }
+            // M7 review finding (Task 11 gate authoring): a rebuild that
+            // SHRINKS the peer band (a demote/remove-voter/remove-learner
+            // that drops the total member count) must also zero every
+            // trailing slot beyond the new length — otherwise a stale
+            // `id_and_role` from the PREVIOUS, longer band lingers forever
+          // (this loop previously only ever wrote `0..peer_band.len()`, never
+            // clearing anything beyond it), producing a ghost duplicate entry
+            // for a still-live id at its old index alongside its real, newly
+            // rewritten slot. Diagnostics-only band (never gates correctness —
+            // the real membership/quorum state lives in the SM's own
+            // rebuilt tracker), but `uc2ctl status` and the runbook's
+            // staleness warning read exactly this band, so a stale ghost
+            // slot is a real, user-visible bug.
+            for i in self.peer_band.len()..CNC_MAX_PEER_SLOTS {
+                self.cnc.peer_slot(i).id_and_role.store_release(0);
+            }
             self.peer_band_published = true;
         }
         for (i, (id, _)) in self.peer_band.iter().enumerate() {

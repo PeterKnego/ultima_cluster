@@ -10,6 +10,15 @@ application server**. This is **UC v2**: milestones M1–M6 are complete and on
 end-to-end SDK, and snapshots/learners/purge). The M5 throughput gate and M6
 fleet gate both passed on real AWS fleets.
 
+**M7 (live single-server reconfiguration)** ships promote/demote/add/remove
+membership changes, one at a time, under load, via the `uc2ctl` admin CLI — no
+restarts, no joint consensus (branch `uc2/m7-reconfig`; design spec
+`docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md`). Green on the full
+local proof stack; the 5-host fleet run is a separate, user-approved step
+(`v2.1.0` tags only once it lands — see
+`docs/benchmarks/uc2-m7-gate-2026-07-13.md`). This bumps the wire protocol
+version once (`FRAME_TYPE_CONFIG=4`, admin datagram kinds 16/17).
+
 **The v1 stack (an `openraft`-based design) has been retired** and its crates
 deleted — v2 owns consensus, elections, and transport directly. Do not
 reintroduce `openraft`, `quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client`
@@ -19,11 +28,13 @@ Canonical documents, in order:
 
 1. `docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md` — the
    canonical v2 design spec. Read it end-to-end before substantial work.
-2. `docs/benchmarks/uc2-m{1..6}-gate-*.md` — the per-milestone gate docs (the
+2. `docs/benchmarks/uc2-m{1..7}-gate-*.md` — the per-milestone gate docs (the
    permanent record for v2; there is no `docs/tasks/` consolidation for v2 — the
-   `taskNN` docs under `docs/tasks/` are v1-era history).
+   `taskNN` docs under `docs/tasks/` are v1-era history). M7's design spec is
+   `docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md` (a second,
+   later spec than the M1-M6 one above).
 3. `docs/ops/uc2-runbook.md` — operational runbook (instance-dir layout, cnc
-   decode, purge enablement, learner add/remove).
+   decode, purge enablement, live reconfiguration ops).
 4. Storage primitives: `../ultima_db/docs/tasks/task26_journal.md`
    (`ultima_journal` log primitives) and `task27_snapshot_stream.md` (the
    `ultima_db` snapshot wire format). The `ultima-db` *code* dependency comes
@@ -43,10 +54,14 @@ cargo test -p uc2_service --features ultima_db   # the (non-default) ultima-db s
 cargo clippy --workspace --all-targets -- -D warnings     # lint (must pass with zero warnings)
 cargo run -p uc2_node --release --example m5_gate # throughput gate harness (see the gate doc)
 cargo run -p uc2_node --release --example m6_gate -- all --secs 6 --cycles 5   # snapshots/learners/purge gate
+cargo run -p uc2_node --release --example m7_gate -- all --secs 6             # live reconfig gate (replace/resize/self-removal)
+cargo run -p uc2_node --example uc2ctl -- status --instance-dir D --app-id A  # M7 admin CLI: add/promote/demote/remove/status
 ```
 
 Cross-host fleet gates run via `bench-infra/` (terraform + ansible provisioning,
-`bench-infra/scripts/m6_fleet_gate.py` as the orchestrator).
+`bench-infra/scripts/m6_fleet_gate.py` as the orchestrator — pass `--m7` for
+the M7 scenarios, which drive `uc2ctl` for admin ops and run over a 5-host
+topology instead of M6's 4).
 
 Workspace crates:
 
