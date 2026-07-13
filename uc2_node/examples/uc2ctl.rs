@@ -192,7 +192,11 @@ fn run_mutate(common: &CommonArgs, op: u32, id: u32, (ip, port): (u32, u16)) -> 
             }
         }
         if Instant::now() >= deadline {
-            anyhow::bail!("timeout waiting {POLL_TIMEOUT:?} for a response to seq {seq}");
+            anyhow::bail!(
+                "timeout waiting {POLL_TIMEOUT:?} for a response to seq {seq} — a newer admin \
+                 request may have superseded this one (only one forward is in flight at a time); \
+                 `uc2ctl status` shows the authoritative config version"
+            );
         }
         std::thread::sleep(POLL_INTERVAL);
     }

@@ -2001,6 +2001,14 @@ impl Consensus {
             self.write_admin_reply(req.seq, 2, 0, self.cnc.config_version());
             return;
         };
+        // T7 review finding 2: a still-outstanding forward would otherwise be
+        // silently overwritten, leaving its caller with a bare timeout and no
+        // answer at all. Answer the superseded request with status=2 (retry)
+        // before replacing the pending slot.
+        if let Some((old_seq, _old_nonce)) = self.pending_admin_fwd.take() {
+            eprintln!("uc2_node: admin forward superseded by newer request");
+            self.write_admin_reply(old_seq, 2, 0, self.cnc.config_version());
+        }
         self.pending_admin_fwd = Some((req.seq, req.nonce));
         let body = ConfigProposalBody { nonce: req.nonce, op: req.op, id: req.id, ip: req.ip, port: req.port };
         let mut buf = [0u8; CONFIG_PROPOSAL_BODY_LEN];
@@ -2093,6 +2101,21 @@ impl Consensus {
         self.cnc.write_admin_resp(&AdminResp { seq, status, reason, version });
     }
 
+    /// T7 review finding 1: invalidate the admin nonce-dedup cache and any
+    /// still-outstanding forwarded admin request across a role/truncation
+    /// transition. Both are scoped to a single leader "life" — surviving one
+    /// would let a duplicate kind-16 datagram (same nonce) replay a reply that
+    /// belongs to a since-reverted or since-superseded world (e.g. an
+    /// uncommitted config that a later truncate reverted). A pending forward
+    /// gets an explicit status=2 (retry) admin reply written now, rather than
+    /// leaving the caller to hang for the full timeout with no answer at all.
+    fn invalidate_admin_caches(&mut self) {
+        self.last_config_reply = None;
+        if let Some((seq, _nonce)) = self.pending_admin_fwd.take() {
+            self.write_admin_reply(seq, 2, 0, self.cnc.config_version());
+        }
+    }
+
     /// Feed one event into the SM and execute every resulting action IN ORDER;
     /// SM-local follow-ups (`NewTermAppended`) are processed after the batch
     /// (mirroring the uc2_sim driver's work queue). Also drives the intake-gate
@@ -2177,6 +2200,9 @@ impl Consensus {
                 }
             }
             Action::BecomeLeader { term, base } => {
+                // T7 review finding 1: a stale nonce-dedup / forward cache must
+                // not survive into this new leader life.
+                self.invalidate_admin_caches();
                 // Contract order (T3/T7, load-bearing): (a) term-map append +
                 // persist durable; (b) collapse volatile via prime(base) — old
                 // bytes above base must never be streamable; (c) fresh appender
@@ -2208,6 +2234,10 @@ impl Consensus {
                 self.cnc.status().leader_hint.store_release(self.id as u64);
             }
             Action::BecomeFollower { term, .. } => {
+                // T7 review finding 1: stepping down from leader (or adopting a
+                // new term as follower) must not leave a stale nonce-dedup /
+                // forward cache answerable by a later duplicate datagram.
+                self.invalidate_admin_caches();
                 self.term_handle.store(term, Ordering::Release);
                 self.leader_flag.store(false, Ordering::Release);
                 self.appender = None;
@@ -2252,6 +2282,12 @@ impl Consensus {
                 }
             }
             Action::Truncate { epoch, to, new_map } => {
+                // T7 review finding 1: a truncate can revert an uncommitted
+                // config (see the persist-revert-before-truncate block below)
+                // without necessarily passing through a BecomeLeader/Follower
+                // transition first — invalidate the admin caches here too so
+                // no stale reply outlives the config it was answering for.
+                self.invalidate_admin_caches();
                 // Persist-before-truncate ordering (M5): store the pruned map
                 // DURABLY *before* commanding the physical truncate, so a crash in
                 // the window recovers a map that is a valid prefix of the
@@ -3077,6 +3113,29 @@ mod tests {
         h.post_ack_and_drain(epoch, 4096);
         assert!(h.gate_open(), "the Truncated ack completes reconciliation and reopens");
         assert!(h.cons.pending_truncation.is_none());
+    }
+
+    /// T7 review finding 1: `last_config_reply` (leader-side nonce dedup) and
+    /// `pending_admin_fwd` (follower-side in-flight forward) must not survive a
+    /// role transition — a stale entry would let a duplicated kind-16 datagram
+    /// replay an answer that belongs to a since-reverted world. Adopting a
+    /// higher term as a follower (`Action::BecomeFollower`) must clear both,
+    /// and the cleared forward must get an explicit status=2 (retry) admin
+    /// reply rather than leaving its caller to a bare timeout.
+    #[test]
+    fn become_follower_invalidates_stale_admin_caches() {
+        let mut h = harness();
+        h.cons.last_config_reply =
+            Some((42, ConfigReplyBody { nonce: 42, status: 0, reason: 0, version: 5 }));
+        h.cons.pending_admin_fwd = Some((99, 42));
+
+        // Adopt a higher term as a follower -> Action::BecomeFollower.
+        h.cons.feed(Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
+
+        assert!(h.cons.last_config_reply.is_none(), "nonce-dedup cache must be cleared");
+        assert!(h.cons.pending_admin_fwd.is_none(), "in-flight forward must be cleared");
+        let resp = h.cons.cnc.read_admin_resp(99).expect("superseded forward gets an answer");
+        assert_eq!(resp.status, 2, "cleared forward is answered with retry, not silence");
     }
 
     /// M6 Task 8: a `NoCommonPrefix` reconcile drives a WIPE-AND-REJOIN end to end
