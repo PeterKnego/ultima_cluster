@@ -50,8 +50,10 @@ use clap::{Parser, Subcommand};
 
 use uc2_client::{Client, ClientError};
 use uc2_consensus::election::NodeId;
+use uc2_log::cnc::CncPage;
 use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig, PurgePolicy};
+use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 use uc2_service::{
     ServiceBuilder, ServiceConfig, SnapshotError, SnapshotPolicy, SnapshotStateMachine, StateMachine,
 };
@@ -75,6 +77,14 @@ enum Role {
     Learner(NodeArgs),
     /// State-machine service, attached to a running node.
     Service(ServiceArgs),
+    /// Read a node's counters from its local cnc page and print one JSON line
+    /// (the fleet orchestrator's observability channel — cnc is same-host only).
+    Probe(ProbeArgs),
+    /// Sustained write load + a monotonic linearizable-read consistency guard,
+    /// attached to the LOCAL node (run on the leader host). Exits 1 on a read
+    /// regression (committed-value divergence) — the fleet divergence check.
+    #[command(name = "loadclient")]
+    LoadClient(LoadClientArgs),
 }
 
 #[derive(clap::Args)]
@@ -117,6 +127,28 @@ struct ServiceArgs {
     app_id: String,
 }
 
+#[derive(clap::Args)]
+struct ProbeArgs {
+    #[arg(long)]
+    instance_dir: PathBuf,
+    #[arg(long, default_value = "m6-gate")]
+    app_id: String,
+}
+
+#[derive(clap::Args)]
+struct LoadClientArgs {
+    #[arg(long)]
+    instance_dir: PathBuf,
+    #[arg(long, default_value = "m6-gate")]
+    app_id: String,
+    /// Run for this many seconds (0 = until --stop-file appears).
+    #[arg(long, default_value_t = 0)]
+    secs: u64,
+    /// Stop when this file exists (the orchestrator's kill switch).
+    #[arg(long, default_value = "")]
+    stop_file: String,
+}
+
 fn main() {
     let cli = Cli::parse();
     let r = match cli.role {
@@ -124,6 +156,8 @@ fn main() {
         Role::Node(a) => run_node(a, false),
         Role::Learner(a) => run_node(a, true),
         Role::Service(a) => run_service(a),
+        Role::Probe(a) => run_probe(a),
+        Role::LoadClient(a) => run_loadclient(a),
     };
     if let Err(e) = r {
         eprintln!("m6_gate error: {e:#}");
@@ -300,6 +334,126 @@ fn run_service(a: ServiceArgs) -> anyhow::Result<()> {
     loop {
         thread::park();
     }
+}
+
+/// Read the local node's counters from its cnc page and print ONE JSON line.
+/// The fleet orchestrator's observability channel: cnc is shared memory, so this
+/// must run ON the host whose node it probes. Never touches the node — read-only.
+fn run_probe(a: ProbeArgs) -> anyhow::Result<()> {
+    let cnc = CncPage::open_file(&a.instance_dir.join("cnc2.dat"), &a.app_id)
+        .map_err(|e| anyhow::anyhow!("open cnc: {e:?}"))?;
+    let flags = cnc.status().flags.load_acquire();
+    let c = cnc.counters();
+    println!(
+        "{{\"leader\":{},\"can_serve\":{},\"term\":{},\"commit\":{},\"durable\":{},\
+         \"append\":{},\"service_applied\":{},\"archive_first_base\":{},\"leader_hint\":{}}}",
+        (flags & NODE_FLAG_LEADER) != 0,
+        (flags & NODE_FLAG_CAN_SERVE) != 0,
+        cnc.status().term.load_acquire(),
+        c.commit.load_acquire(),
+        c.durable.load_acquire(),
+        c.append.load_acquire(),
+        cnc.service().service_applied.load_acquire(),
+        cnc.archive_first_base().load_acquire(),
+        cnc.status().leader_hint.load_acquire(),
+    );
+    Ok(())
+}
+
+/// Sustained write load against the LOCAL node (run on the leader host), with a
+/// monotonic linearizable-read guard: every so often it reads the register and
+/// asserts the value never regresses and never exceeds what has been written —
+/// the fleet's committed-value-divergence check. Exits 1 on a violation. Runs
+/// until `--secs` elapse or `--stop-file` appears (0 secs + no stop-file = until
+/// killed). Prints a periodic heartbeat and a final summary line.
+fn run_loadclient(a: LoadClientArgs) -> anyhow::Result<()> {
+    let stop_file = (!a.stop_file.is_empty()).then(|| PathBuf::from(&a.stop_file));
+    let deadline = (a.secs > 0).then(|| Instant::now() + Duration::from_secs(a.secs));
+
+    // Attach; retry briefly (the node may still be electing).
+    let attach_deadline = Instant::now() + Duration::from_secs(30);
+    let client = loop {
+        match Client::connect(&a.instance_dir, &a.app_id) {
+            Ok(c) => break c,
+            Err(e) => {
+                anyhow::ensure!(Instant::now() < attach_deadline, "attach failed: {e:?}");
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+
+    let mut next_val = 1u64;
+    let mut committed_max = 0u64;
+    let mut last_read = 0u64;
+    let mut writes = 0u64;
+    let mut reads = 0u64;
+    let mut last_beat = Instant::now();
+    let start = Instant::now();
+
+    loop {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
+        if stop_file.as_ref().is_some_and(|sf| sf.exists()) {
+            break;
+        }
+
+        // Write.
+        let payload = next_val.to_le_bytes().to_vec();
+        match client.submit::<Vec<u8>, u64>(&payload) {
+            Ok(_) => {
+                committed_max = committed_max.max(next_val);
+                next_val += 1;
+                writes += 1;
+            }
+            Err(ClientError::NotLeader { .. }) | Err(ClientError::Retry) => {
+                // Not the leader host (or a transient election) — wait; the
+                // orchestrator runs this on the leader, so this is brief.
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(ClientError::BackpressureFull) => thread::sleep(Duration::from_millis(2)),
+            Err(_) => thread::sleep(Duration::from_millis(20)),
+        }
+
+        // Periodic monotonic linearizable read (the divergence guard). A transient
+        // error carries no info, so it is simply skipped.
+        if writes.is_multiple_of(64)
+            && let Ok(v) = client.query_linearizable::<(), u64>(&())
+        {
+            reads += 1;
+            if v < last_read {
+                eprintln!(
+                    "DIVERGENCE: linearizable read REGRESSED {last_read} -> {v} \
+                     (committed_max={committed_max})"
+                );
+                std::process::exit(1);
+            }
+            if v > committed_max {
+                eprintln!(
+                    "DIVERGENCE: read {v} exceeds anything written (committed_max={committed_max})"
+                );
+                std::process::exit(1);
+            }
+            last_read = v;
+        }
+
+        if last_beat.elapsed() >= Duration::from_secs(2) {
+            let rate = writes as f64 / start.elapsed().as_secs_f64();
+            println!(
+                "loadclient: writes={writes} reads={reads} committed_max={committed_max} \
+                 last_read={last_read} rate={rate:.0}/s"
+            );
+            last_beat = Instant::now();
+        }
+    }
+
+    let rate = writes as f64 / start.elapsed().as_secs_f64().max(1e-6);
+    println!(
+        "loadclient DONE: writes={writes} reads={reads} committed_max={committed_max} \
+         last_read={last_read} rate={rate:.0}/s elapsed={:.1}s",
+        start.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 // ------------------------------------------------------------ load driver
