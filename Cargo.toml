@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["uc_protocol", "uc2_log", "uc2_net", "uc2_consensus", "uc2_sim", "uc2_node", "uc2_service", "uc2_client", "uc_service", "uc_node", "uc_client", "uc_autobench", "uc-lincheck", "uc-rt-busyspin", "ultima_journal", "examples/counter_loop", "examples/uc-crashtest", "examples/uc2-crashtest"]
+members = ["uc_protocol", "uc2_log", "uc2_net", "uc2_consensus", "uc2_sim", "uc2_node", "uc2_service", "uc2_client", "uc-lincheck", "ultima_journal", "examples/uc2-crashtest"]
 
 [workspace.package]
 edition = "2024"
@@ -18,14 +18,9 @@ tracing = "0.1"
 
 # async
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "fs", "io-util"] }
-async-trait = "0.1"
 futures = "0.3"
 
-# raft + storage
-# Bumped alpha.21 -> alpha.25 via local checkout (alpha.25 not yet on crates.io).
-# TODO: revert to crates.io version deps once alpha.25 is published.
-openraft = { path = "../openraft/openraft", features = ["serde"] }
-openraft-legacy = { path = "../openraft/legacy" }
+# storage
 ultima-journal = { path = "ultima_journal" }
 # `persistence` is required for snapshot_stream / install_snapshot_stream.
 ultima-db = { path = "../ultima_db", features = ["persistence"] }
@@ -43,7 +38,6 @@ page_size = "0.6"
 crc32fast = "1"
 fs2 = "0.4"
 rand = "0.9"
-dashmap = "6"
 
 # dev
 tempfile = "3"
@@ -51,13 +45,8 @@ anyhow = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wait-timeout = "0.2"
 
-# uc_autobench
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-sha2 = "0.10"
+# cli + bench harness (uc2 gate examples)
 clap = { version = "4", features = ["derive"] }
-jiff = { version = "0.1", features = ["serde"] }
-toml = "0.8"
-serde_json = "1"
 hdrhistogram = "7"
 
 [profile.release]

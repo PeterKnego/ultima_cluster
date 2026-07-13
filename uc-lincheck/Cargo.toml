@@ -10,17 +10,12 @@ publish = false
 path = "src/lib.rs"
 
 [features]
-# `v1` is default so existing consumers (uc_node tests, examples/uc-crashtest)
-# keep building `RegisterSm: uc_service::StateMachine` unchanged. `v2` adds the
-# parallel `RegisterSm: uc2_service::StateMachine` impl for the M5 L3 port; a
-# consumer that only wants v2 (uc2_node tests) sets `default-features = false,
-# features = ["v2"]` so the heavy v1 `uc_service` crate is not pulled in.
-default = ["v1"]
-v1 = ["dep:uc_service"]
+# `v2` binds `RegisterSm: uc2_service::StateMachine` for the L3 lincheck port.
+# (The v1 feature was retired with the v1 stack; v2 is now the only impl.)
+default = ["v2"]
 v2 = ["dep:uc2_service"]
 
 [dependencies]
-uc_service  = { path = "../uc_service", optional = true }
 uc2_service = { path = "../uc2_service", optional = true }
 serde       = { workspace = true }
 bincode     = { workspace = true }
