@@ -9,7 +9,9 @@
 v1 (`uc_node` on openraft) is correct — lincheck/hard-crash/partition gates green — but
 structurally capped ~13×/14× behind Aeron Cluster on matched hardware and durability:
 Aeron ≥800 k msg/s @ p50 0.38 ms *with fsync* vs UC ~56 k @ floor 1.48 ms
-(`docs/benchmarks/aeron-parity-scorecard-2026-07-02.md`). Three weeks of systematic
+(`docs/benchmarks/aeron-parity-scorecard-2026-07-02.md`; removed from the tree with the
+v1 doc cleanup — read it via
+`git show 2a1156c:docs/benchmarks/aeron-parity-scorecard-2026-07-02.md`). Three weeks of systematic
 elimination proved the residual gap is architecture, not tuning:
 
 - Floor decomposition: ~73 % of the commit floor is openraft async choreography +
