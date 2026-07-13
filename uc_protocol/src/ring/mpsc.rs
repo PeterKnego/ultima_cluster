@@ -139,12 +139,27 @@ impl MpscProducer {
             // `free` is under-estimated — safe). Only when the cache reports
             // too little room do we pay the `Acquire` load of the real
             // `consumer_position` and re-check.
+            //
+            // `claim_pos - consumer_pos` uses `saturating_sub`, not plain `-`:
+            // under concurrent producers, `claim_pos` (loaded once at the top
+            // of this loop iteration) can go stale relative to a freshly
+            // reloaded `consumer_pos` if another producer's CAS advances the
+            // real `claim_position` past our snapshot in between — unlike
+            // SPSC (single producer, so its own `producer_pos` can never be
+            // overtaken), MPSC has no such single-writer guarantee on
+            // `claim_pos`. A stale-negative `claim_pos - consumer_pos` just
+            // means our free-space ESTIMATE was pessimistic-then-corrected;
+            // it is never the actual safety mechanism against an overrun —
+            // the `compare_exchange_weak` on `claim_position` below re-checks
+            // against the CURRENT value and simply fails+retries if our
+            // snapshot was stale, so clamping to 0 here (reading as "fully
+            // free" this iteration) cannot cause a claim past the real tail.
             let mut consumer_pos = self.cached_consumer_pos.get();
-            let mut free = capacity.saturating_sub((claim_pos - consumer_pos) as usize);
+            let mut free = capacity.saturating_sub(claim_pos.saturating_sub(consumer_pos) as usize);
             if free < needed {
                 consumer_pos = header.consumer_position.load(Ordering::Acquire);
                 self.cached_consumer_pos.set(consumer_pos);
-                free = capacity.saturating_sub((claim_pos - consumer_pos) as usize);
+                free = capacity.saturating_sub(claim_pos.saturating_sub(consumer_pos) as usize);
                 if free < needed {
                     return Err(RingError::Full);
                 }
