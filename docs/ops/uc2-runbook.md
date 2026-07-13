@@ -270,6 +270,19 @@ unknown yet, or the append ring was momentarily full") means: just try again.
    do this **after** promoting, not before (removing first would run one
    member short during the promotion window for no reason).
 
+> **Snapshot-pairing caveat:** under sustained write load, a fresh learner
+> catching up purely via NAK/journal replay is a throughput-bounded race it
+> can lose indefinitely — a sufficiently fast, unthrottled writer can outrun
+> replay forever, not just slowly (this is not a hang: stopping the writer
+> lets the same learner catch up completely, just slowly). **Pair
+> reconfiguration with M6 snapshots/purge in any deployment with meaningful
+> sustained write load**: a `SnapshotStateMachine` + purge policy lets a
+> below-floor learner converge via snapshot install + tail replay instead of
+> pure replay, removing the ceiling entirely. The `promote` precondition's
+> `NotCaughtUp` refusal (reason 10) is the guard that surfaces this — it
+> withholds promotion until the gap closes, so the failure mode is "promote
+> never accepted", not a silent quorum hazard.
+
 **Resize the cluster (e.g. 3 → 5)**: repeat `add-learner` + (catch-up) +
 `promote` once per new voter — two independent single-server changes, not one
 bulk operation. Shrinking back (5 → 3) is `demote` + `remove-learner` per
@@ -277,6 +290,16 @@ member being dropped, in either order relative to each other (they are
 independent single-server changes too) but demote-then-remove per member (you
 cannot remove a current voter directly — demote it to a learner first, then
 remove the learner).
+
+> **Snapshot-pairing caveat:** the same NAK/journal-replay ceiling applies to
+> every `add-learner` in a resize — under sustained write load, a fresh
+> learner catching up purely via replay can be outrun indefinitely by a
+> sufficiently fast, unthrottled writer (not a hang: stopping the writer lets
+> it catch up completely, just slowly). **Pair reconfiguration with M6
+> snapshots/purge in any deployment with meaningful sustained write load** so
+> each new learner converges via snapshot install + tail replay rather than
+> racing pure replay. The `promote` precondition's `NotCaughtUp` refusal
+> (reason 10) is the guard that surfaces this.
 
 **Leader self-removal**: `remove-voter <the-leader's-own-id>`, run against
 that same leader's own instance dir (or any node — it forwards). The leader

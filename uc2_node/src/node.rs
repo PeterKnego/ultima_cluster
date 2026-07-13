@@ -1265,7 +1265,7 @@ impl Consensus {
             // that drops the total member count) must also zero every
             // trailing slot beyond the new length — otherwise a stale
             // `id_and_role` from the PREVIOUS, longer band lingers forever
-          // (this loop previously only ever wrote `0..peer_band.len()`, never
+            // (this loop previously only ever wrote `0..peer_band.len()`, never
             // clearing anything beyond it), producing a ghost duplicate entry
             // for a still-live id at its old index alongside its real, newly
             // rewritten slot. Diagnostics-only band (never gates correctness —

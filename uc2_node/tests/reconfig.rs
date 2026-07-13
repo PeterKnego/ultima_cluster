@@ -893,6 +893,62 @@ fn voter_ids_via_cnc(cnc: &CncPage) -> Vec<NodeId> {
     ids
 }
 
+/// Non-panicking predicate mirroring [`assert_peer_band_clean`] below, for
+/// use in a settle-poll loop ahead of the hard assertion (`publish_peer_band`
+/// runs inline with config adoption, but a reader can still catch a beat
+/// where a peer's cnc page reflects an in-flight transition).
+fn peer_band_is_clean(cnc: &CncPage, expected_ids: &[NodeId]) -> bool {
+    let mut seen: Vec<NodeId> = Vec::new();
+    for i in 0..CNC_MAX_PEER_SLOTS {
+        let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+        if raw == 0 {
+            continue;
+        }
+        let id = (raw >> 8) as u32;
+        if !expected_ids.contains(&id) || seen.contains(&id) {
+            return false;
+        }
+        seen.push(id);
+    }
+    true
+}
+
+/// T11 review (peer-band ghost-slot regression): scan EVERY
+/// `CNC_MAX_PEER_SLOTS` slot of `cnc`'s observability band — not just the
+/// slots the current membership happens to occupy — and assert the whole
+/// band is clean: no id appears twice, and no id outside `expected_ids`
+/// appears at all. This is the discriminating check for the
+/// `publish_peer_band` fix (`uc2_node/src/node.rs`): a rebuild that SHRINKS
+/// the band used to only ever rewrite `0..peer_band.len()`, leaving a stale
+/// `id_and_role` from the previous, longer band lingering in a trailing slot
+/// forever — producing a ghost duplicate entry for a still-live id at its
+/// old index, alongside its real, freshly-rewritten slot at its new index.
+/// `pack_id_and_role(peer_id, role)` is `(peer_id << 8) | role`, and no
+/// populated slot is ever written with role byte 0 (`CNC_PEER_ROLE_VOTER` =
+/// 1, `CNC_PEER_ROLE_LEARNER` = 2), so `raw == 0` unambiguously means
+/// "empty" — even for id 0, which IS a real member id in this suite (a
+/// populated slot for id 0 packs to `(0 << 8) | role` = 1 or 2, never 0).
+fn assert_peer_band_clean(cnc: &CncPage, expected_ids: &[NodeId]) {
+    let mut seen: Vec<NodeId> = Vec::new();
+    for i in 0..CNC_MAX_PEER_SLOTS {
+        let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+        if raw == 0 {
+            continue;
+        }
+        let id = (raw >> 8) as u32;
+        let role = (raw & 0xff) as u8;
+        assert!(
+            expected_ids.contains(&id),
+            "slot {i}: ghost id {id} (role byte {role}) present, outside expected set {expected_ids:?}"
+        );
+        assert!(
+            !seen.contains(&id),
+            "slot {i}: id {id} duplicated in the peer band (a stale ghost slot from a prior, wider band) — role byte {role}, already seen at an earlier slot"
+        );
+        seen.push(id);
+    }
+}
+
 /// Rebind a fresh UDP socket on a specific loopback address, retrying
 /// briefly (mirrors `failover.rs`'s `rebind`).
 fn rebind(addr: SocketAddr) -> UdpSocket {
@@ -992,6 +1048,19 @@ fn full_replace_a_box_recipe() {
     }
     // The new node is now a fully-fledged voter cluster-wide, at v3.
     await_config_converged(&c.nodes, 3, new_id, CNC_PEER_ROLE_VOTER, 20);
+
+    // T11 review: the shrink from 4 members back to 3 (the `RemoveVoter`
+    // above) must not leave a ghost/duplicate slot anywhere in the band —
+    // scan ALL 8 slots, not just the ones `voter_ids_via_cnc`-style checks
+    // look at. Final voter set: the original 3 minus the crashed one, plus
+    // the new node; every survivor's own band excludes itself.
+    let final_voters: Vec<NodeId> =
+        [0u32, 1, 2].into_iter().filter(|&id| id != crash_id).chain(std::iter::once(new_id)).collect();
+    for h in &c.nodes {
+        let cnc = open_cnc(&h.instance_dir);
+        let expected: Vec<NodeId> = final_voters.iter().copied().filter(|&id| id != h.id).collect();
+        assert_peer_band_clean(&cnc, &expected);
+    }
 
     for h in c.nodes {
         h.node.stop();
@@ -1115,10 +1184,11 @@ fn resize_3_to_5_to_3() {
 
     // The VOTER-role band publish can lag a beat behind the config-version
     // bump, so poll for the settled shape before asserting on it with clear
-    // messages. Note: this only checks VOTER-role membership (the property
-    // that actually matters for quorum) — a removed LEARNER's peer slot may
-    // legitimately linger with a stale non-voter entry rather than being
-    // wiped to zero, which is orthogonal to this test's scope.
+    // messages. This only checks VOTER-role membership (the property that
+    // actually matters for quorum); the T11 ghost-slot regression check right
+    // below additionally covers the full 8-slot band, including the two
+    // demoted-then-removed learners (60, 61) — with the `publish_peer_band`
+    // fix, neither may linger anywhere once the shrink to v8 settles.
     let deadline = deadline_secs(10);
     loop {
         let settled = survivors.iter().all(|h| {
@@ -1142,6 +1212,29 @@ fn resize_3_to_5_to_3() {
         let mut want: Vec<NodeId> = [0u32, 1, 2].into_iter().filter(|&id| id != h.id).collect();
         want.sort();
         assert_eq!(got, want, "node {}: final voter set must be exactly the original 3", h.id);
+    }
+
+    // T11 review (peer-band ghost-slot regression): the shrink 5 -> 3 above
+    // must not leave a ghost/duplicate slot ANYWHERE in the band — all 8
+    // slots, not just the voter-role ones checked above. Poll for settled
+    // first (same rationale as the voter-set poll above), then hard-assert.
+    let deadline = deadline_secs(10);
+    loop {
+        let clean = survivors.iter().all(|h| {
+            let cnc = open_cnc(&h.instance_dir);
+            let want: Vec<NodeId> = [0u32, 1, 2].into_iter().filter(|&id| id != h.id).collect();
+            peer_band_is_clean(&cnc, &want)
+        });
+        if clean {
+            break;
+        }
+        assert!(Instant::now() < deadline, "final peer band never settled clean (ghost/duplicate slot)");
+        std::thread::yield_now();
+    }
+    for h in &survivors {
+        let cnc = open_cnc(&h.instance_dir);
+        let want: Vec<NodeId> = [0u32, 1, 2].into_iter().filter(|&id| id != h.id).collect();
+        assert_peer_band_clean(&cnc, &want);
     }
 
     // Both removed nodes genuinely fail-stopped: over a settle window during
