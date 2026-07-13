@@ -24,7 +24,7 @@ use uc2_log::buffer::{LogBuffer, SliceRead};
 use uc2_log::cnc::CncPage;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_SNAP_BEGIN,
-    DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_BODY_LEN, SnapBeginBody,
+    DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_FIXED_LEN, SnapBeginBody,
     write_datagram_header, write_snap_begin_body,
 };
 use uc_protocol::v2::frame::{
@@ -736,10 +736,10 @@ impl Sender {
         want
     }
 
-    /// Ship SNAP_BEGIN (header `position` = 0; body carries session/pos/len).
+    /// Ship SNAP_BEGIN (header `position` = 0; body carries session/pos/len/config).
     fn send_snap_begin(&mut self, peer: SocketAddr, session: u32, snapshot_pos: u64, total_len: u64) {
-        let mut body = [0u8; SNAP_BEGIN_BODY_LEN];
-        write_snap_begin_body(&mut body, &SnapBeginBody { session, snapshot_pos, total_len });
+        let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN]; // M7: may grow with config; M6 uses empty config
+        write_snap_begin_body(&mut body, &SnapBeginBody { session, snapshot_pos, total_len, config: vec![] });
         self.assemble_snap(0, DGRAM_KIND_SNAP_BEGIN, &body);
         let _ = self.sock.send_to(&self.scratch, peer);
     }

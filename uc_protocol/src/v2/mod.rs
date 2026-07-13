@@ -5,6 +5,7 @@
 //! Core-only modules — the multi-language gate for protocol v2.
 
 pub mod cnc;
+pub mod config;
 pub mod datagram;
 pub mod frame;
 pub mod ipc;

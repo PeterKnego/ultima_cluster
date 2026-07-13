@@ -31,7 +31,7 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE,
     DGRAM_KIND_SNAP_NAK, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
     MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody,
-    SNAP_BEGIN_BODY_LEN, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody, SnapNakBody, StatusBody,
+    SNAP_BEGIN_FIXED_LEN, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody, SnapNakBody, StatusBody,
     TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_datagram_header, read_nak_body,
     read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
     read_status_body, read_term_map_body, read_vote_body, write_datagram_header, write_nak_body,
@@ -850,7 +850,7 @@ impl FollowerReceiver {
             return;
         }
         // Ack: echo the SnapBeginBody as SNAP_DONE so the leader closes its session.
-        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_BEGIN_BODY_LEN];
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_BEGIN_FIXED_LEN]; // M7: may grow with config
         write_datagram_header(
             &mut d,
             &DatagramHeader {
@@ -866,6 +866,7 @@ impl FollowerReceiver {
                 session: intake.session,
                 snapshot_pos: intake.snapshot_pos,
                 total_len: intake.total_len,
+                config: vec![], // M7: empty for M6
             },
         );
         let _ = self.sock.send_to(&d, intake.peer);
