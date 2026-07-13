@@ -305,6 +305,21 @@ pub struct ElectionSm {
     /// until the agent actually parks the process. Never reset — this is a
     /// one-way trip, same posture as `HaltRemoved`.
     stepped_down: bool,
+    /// T8 review fix: latched `true` the moment `adopt_config` FORMALLY
+    /// observes (via a real `Event::ConfigObserved` adoption, at ANY role —
+    /// the leader carve-out only defers the resulting `HaltRemoved`, it
+    /// doesn't erase the fact) that `config` no longer contains `self.id`.
+    /// Deliberately starts `false` at construction and is set ONLY by
+    /// `adopt_config`, never by inspecting the boot-recovered `config`
+    /// directly: a freshly-joining node's local seed legitimately excludes
+    /// itself too (it hasn't learned its own learner-hood from the
+    /// replicated stream yet — see `ElectionConfig::config`'s doc), and that
+    /// is NOT a removal. Gates `halt_if_removed_follower`'s halt-on-demotion
+    /// check so that check fires only for a genuine, formally-adopted
+    /// self-removal — never for "not a member yet". Never reset once set:
+    /// tombstones are permanent (inv9), so a real self-exclusion can never
+    /// be un-adopted.
+    self_removed: bool,
 }
 
 impl ElectionSm {
@@ -396,6 +411,7 @@ impl ElectionSm {
             pending_new_map: None,
             wipe_on_no_common_prefix: true,
             stepped_down: false,
+            self_removed: false,
         };
         sm.arm_timeout(now_ns);
         sm
@@ -933,6 +949,7 @@ impl ElectionSm {
         // map it adopts is a valid prefix regardless of the new term; the new
         // leader re-ships and we re-reconcile from there.
         out.push(Action::BecomeFollower { term: new_term, leader });
+        self.halt_if_removed_follower(out);
     }
 
     /// Run reconciliation against a leader-shipped map and emit the derived
@@ -1006,6 +1023,59 @@ impl ElectionSm {
         self.new_term_pos = None;
         self.votes_received.clear();
         out.push(Action::BecomeFollower { term: self.current_term, leader: None });
+        self.halt_if_removed_follower(out);
+    }
+
+    /// M7 Task 8 (T8 review finding): after ANY transition to `Role::Follower`,
+    /// fail-stop if a self-removal was FORMALLY adopted (`self.self_removed`,
+    /// latched by `adopt_config`) at any point during this run. Closes a
+    /// fail-stop completeness gap in the self-removal machinery:
+    /// `adopt_config`'s leader carve-out deliberately suppresses
+    /// `HaltRemoved` while `Role::Leader` (a leader mid-self-removal must
+    /// keep serving until its own removal commits), and the commit-triggered
+    /// `StepDownRemoved` fires only from `rank_leader` once that commit
+    /// actually lands. If a higher-term event (RequestVote / Vote / Report /
+    /// LeaderSeen / CommitGossip / TermMapReceived — all routed through
+    /// `adopt_term` — or a Candidate hearing the term's real leader, routed
+    /// through `step_down_to_follower`) demotes this node to follower BEFORE
+    /// the removal commits, NEITHER site can ever fire again:
+    /// `StepDownRemoved` can't (no longer leader), and `adopt_config`'s site
+    /// isn't re-entered (`ConfigObserved` is version-gated, and no new config
+    /// is being adopted anyway). Without this call the node becomes a
+    /// permanently inert non-voting follower that never fail-stops — a
+    /// liveness/completeness bug (not a safety one: it is fully inert, never
+    /// wrongly participates).
+    ///
+    /// Gated on the LATCH (`self_removed`), NOT on a raw `!config.contains
+    /// (self.id)` check: a freshly-joining node's boot-recovered `config`
+    /// legitimately excludes itself too (its local seed predates learning its
+    /// own learner-hood from the replicated stream — see
+    /// `ElectionConfig::config`'s doc / `joining_node_boots_from_stale_seed`
+    /// in `uc2_node`'s reconfig tests), and such a node fields plenty of
+    /// higher-term events (`adopt_term`) from the already-leaderful cluster
+    /// while it waits to adopt its real config. The raw check would halt it
+    /// on the spot, before it ever gets a chance to join. The latch only ever
+    /// becomes `true` via a REAL `adopt_config` adoption that observed
+    /// self-exclusion — never merely by inspecting recovered/boot state — so
+    /// "never yet a member" and "formally removed" stay distinguishable.
+    ///
+    /// Deliberately NOT separately double-emission-latched (contrast
+    /// `stepped_down`, which exists to keep `rank_leader`'s per-tick action
+    /// stream to exactly one `StepDownRemoved` across many subsequent ticks of
+    /// a leader that keeps re-ranking after its own commit crossing).
+    /// `Action::HaltRemoved` is idempotent at the node: `Node::halt()` just
+    /// sets a one-way flag, and `do_work` short-circuits once it is set, so
+    /// at most one further `feed` — and thus at most one redundant emission —
+    /// can ever occur before the process actually parks. There is also no
+    /// in-SM double-emission hazard: within a single `step`, at most one of
+    /// `adopt_term`/`step_down_to_follower` ever runs (every call site that
+    /// reaches `step_down_to_follower` does so only when `adopt_term` was NOT
+    /// just taken in the same event, since `adopt_term` already flips `role`
+    /// away from `Candidate` first).
+    fn halt_if_removed_follower(&mut self, out: &mut Vec<Action>) {
+        if self.self_removed {
+            out.push(Action::HaltRemoved);
+        }
     }
 
     fn handle_request_vote(
@@ -1087,8 +1157,20 @@ impl ElectionSm {
         // serving until this entry COMMITS (the node executes the step-down —
         // Task 8), because C_new must be replicated by a leader that still
         // exists.
-        if !self.config.contains(self.id) && !matches!(self.role, Role::Leader) {
-            out.push(Action::HaltRemoved);
+        if !self.config.contains(self.id) {
+            // T8 review fix: latch this REGARDLESS of role. The leader carve-
+            // out below only defers the resulting `HaltRemoved` action — it
+            // does not mean the removal wasn't formally adopted. The latch is
+            // what lets `halt_if_removed_follower` correctly fail-stop a
+            // self-removing leader that gets preempted by a higher term
+            // BEFORE its own removal commits (a demotion that reaches neither
+            // this site again — `ConfigObserved` is version-gated — nor
+            // `rank_leader`'s commit-triggered `StepDownRemoved`, since it is
+            // no longer leader).
+            self.self_removed = true;
+            if !matches!(self.role, Role::Leader) {
+                out.push(Action::HaltRemoved);
+            }
         }
     }
 
@@ -2294,6 +2376,77 @@ mod tests {
             !acts.iter().any(|a| matches!(a, Action::StepDownRemoved)),
             "must not re-emit after the first crossing"
         );
+    }
+
+    /// T8 review finding: a self-removing LEADER preempted by a HIGHER TERM
+    /// before its own removal commits must still fail-stop. `adopt_config`'s
+    /// leader carve-out suppresses `HaltRemoved` at adoption (correctly — the
+    /// leader must keep serving until C_new certifies the removal), and it
+    /// never reaches the commit crossing that would fire `StepDownRemoved`
+    /// (a higher-term RequestVote from a surviving C_new member demotes it
+    /// first). Without `halt_if_removed_follower` this node would become a
+    /// permanently inert non-voting follower that never fail-stops — a
+    /// completeness gap, not a safety one.
+    #[test]
+    fn leader_self_removal_preempted_by_higher_term_halts() {
+        let mut s = sm(0); // voters [0,1,2], id 0
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        assert!(matches!(s.role(), Role::Leader));
+
+        // Adopt our own removal; config_position (200) is well above anything
+        // driven below, so we stay in the pre-crossing window throughout —
+        // the carve-out keeps this leader serving with no HaltRemoved here.
+        let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
+        let acts = step(&mut s, Event::ConfigObserved { position: 200, config: new_cfg });
+        assert!(!acts.iter().any(|a| matches!(a, Action::HaltRemoved)));
+        assert!(matches!(s.role(), Role::Leader), "carve-out: still leading through adoption");
+        assert!(!s.config().contains(0));
+
+        // Preempted by a higher term via a RequestVote from a surviving
+        // C_new member (1) BEFORE the removal entry commits: no
+        // StepDownRemoved has fired (commit never crossed config_position),
+        // and HaltRemoved was already suppressed at adoption. This demotion
+        // is the ONLY remaining chance to halt.
+        let acts = step(
+            &mut s,
+            Event::RequestVote { from: 1, new_term: 2, last_term: 1, last_durable: 32 },
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 2, leader: None })),
+            "must demote to follower of the new term"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "a removed node preempted before self-removal commits must still fail-stop"
+        );
+        assert!(matches!(s.role(), Role::Follower));
+    }
+
+    /// Negative companion: a leader stepping down the exact same way (a
+    /// higher-term preemption) but that was NEVER removed from the config
+    /// must NOT halt — only the removed case fail-stops.
+    #[test]
+    fn leader_preempted_by_higher_term_without_removal_does_not_halt() {
+        let mut s = leader_term1(); // voters [0,1,2], id 0, still fully a member
+        assert!(s.config().contains(0));
+
+        let acts = step(
+            &mut s,
+            Event::RequestVote { from: 1, new_term: 2, last_term: 1, last_durable: 0 },
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 2, .. })),
+            "must demote to follower of the new term"
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "a leader that was never removed must not halt on ordinary preemption"
+        );
+        assert!(matches!(s.role(), Role::Follower));
     }
 
     /// Controller amendment carry #1 pin: the mid-self-removal leader's
