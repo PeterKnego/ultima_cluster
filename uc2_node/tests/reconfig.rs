@@ -22,7 +22,8 @@ use uc2_log::cnc::{AdminReq, AdminResp, CncPage};
 use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig};
 use uc_protocol::v2::cnc::{
-    CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
+    CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE,
+    NODE_FLAG_LEADER,
 };
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_REQUEST_VOTE, DatagramHeader,
@@ -168,7 +169,25 @@ fn await_config_converged(nodes: &[NodeH], version: u64, member_id: NodeId, want
         if nodes.iter().all(|h| h.node.config_version() >= version) {
             break;
         }
-        assert!(Instant::now() < deadline, "config version {version} never converged cluster-wide");
+        assert!(
+            Instant::now() < deadline,
+            "config version {version} never converged cluster-wide: {:?}",
+            nodes
+                .iter()
+                .map(|h| {
+                    let c = h.node.counters();
+                    (
+                        h.id,
+                        h.node.config_version(),
+                        c.append.load_acquire(),
+                        c.durable.load_acquire(),
+                        c.commit.load_acquire(),
+                        h.node.is_leader(),
+                        h.node.can_serve(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
         std::thread::yield_now();
     }
     for h in nodes.iter().filter(|h| h.id != member_id) {
@@ -669,6 +688,757 @@ fn joining_node_boots_from_stale_seed() {
     }
 
     node5_h.node.stop();
+    for h in c.nodes {
+        h.node.stop();
+    }
+}
+
+// ------------------------------------------------------------ M7 Task 9
+//
+// The remaining spec §9.3 integration scenarios: a full box-replacement
+// recipe, a 3->5->3 resize under continuous traffic, an exhaustive refusal
+// matrix (exact reason codes), a truncation/revert proof combining a
+// pending config with a real network partition, and a crash-mid-pending
+// recovery. These reuse T7/T8's admin-slot harness (`admin_request`,
+// `admin_request_ok`, `await_config_converged`, `open_cnc`, ...) verbatim
+// and add a handful of small, purely-additive test-support helpers below
+// (partition control mirroring `failover.rs`'s `NodeH::block/heal`, a
+// small-admission cluster variant to make `NotCaughtUp` reachable without
+// thousands of baseline writes, and a "config settled" poll to avoid
+// racing `ChangePending` against later, unrelated refusal probes).
+
+/// Cut node `a`'s outbound sends to `peer` (one side of a link cut — the
+/// caller cuts the other direction too via [`partition`]). Mirrors
+/// `failover.rs`'s `NodeH::block`.
+fn block_link(a: &NodeH, peer: SocketAddr) {
+    for h in a.node.partition_handles() {
+        h.block(peer);
+    }
+}
+
+/// Heal every partition on `a`'s sockets. Mirrors `failover.rs`'s `NodeH::heal`.
+fn heal_link(a: &NodeH) {
+    for h in a.node.partition_handles() {
+        h.clear();
+    }
+}
+
+/// Cut every link between `a` and `b` (both send directions) — mirrors
+/// `failover.rs`'s free `partition` fn.
+fn partition(a: &NodeH, b: &NodeH) {
+    block_link(a, b.addr);
+    block_link(b, a.addr);
+}
+
+/// Wait until exactly one of `idxs` is serving and return its index (used
+/// when some members are excluded from the check — e.g. an isolated
+/// minority leader that still privately believes it serves). Mirrors
+/// `failover.rs`'s `await_serving_among`.
+fn await_serving_among(nodes: &[NodeH], idxs: &[usize], secs: u64) -> usize {
+    let deadline = deadline_secs(secs);
+    loop {
+        let serving: Vec<usize> = idxs.iter().copied().filter(|&i| nodes[i].node.can_serve()).collect();
+        assert!(serving.len() <= 1, "split-brain among {idxs:?}: {serving:?} serve");
+        if serving.len() == 1 {
+            return serving[0];
+        }
+        assert!(Instant::now() < deadline, "no leader among {idxs:?}");
+        std::thread::yield_now();
+    }
+}
+
+/// Wait for a STABLE single serving leader across the WHOLE cluster,
+/// tolerating (rather than asserting away) a transient overlap right after
+/// healing a partition that isolated a believing leader: at the instant
+/// `heal()` merely stops dropping datagrams, the old leader's own state is
+/// unchanged (it has not yet received or sent anything revealing the
+/// higher term), so it and the freshly-elected majority leader can BOTH
+/// legitimately read `can_serve() == true` for the first few poll
+/// iterations. `await_single_leader`'s strict split-brain assert is the
+/// right tool everywhere else in this suite (proving no overlap ever
+/// happens under normal operation); here we deliberately relax it because
+/// the overlap is the expected, momentary shape of "a heal in flight", not
+/// a bug — we just need a settled leader to keep driving the test.
+fn find_stable_leader(nodes: &[NodeH], secs: u64) -> usize {
+    let deadline = deadline_secs(secs);
+    loop {
+        let serving: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].node.can_serve()).collect();
+        if serving.len() == 1 {
+            let i = serving[0];
+            std::thread::sleep(Duration::from_millis(20));
+            let still: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].node.can_serve()).collect();
+            if still == vec![i] {
+                return i;
+            }
+        }
+        assert!(Instant::now() < deadline, "no stable single leader emerged");
+        std::thread::yield_now();
+    }
+}
+
+/// As [`spawn_cluster`] but with an explicit `admission_bytes` (the M7
+/// `NotCaughtUp` catch-up-slack window) — lets a test reach a real
+/// `NotCaughtUp` refusal with a modest amount of traffic rather than
+/// needing to exceed the default 256 KiB slack.
+fn spawn_cluster_admission(n: usize, admission_bytes: u64) -> Cluster {
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-reconfig-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    let dir_path = dir.path().to_path_buf();
+
+    let socks: Vec<UdpSocket> =
+        (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
+    let members: Vec<(NodeId, SocketAddr)> =
+        socks.iter().enumerate().map(|(i, s)| (i as NodeId, s.local_addr().unwrap())).collect();
+
+    let mut nodes = Vec::with_capacity(n);
+    for (i, sock) in socks.into_iter().enumerate() {
+        let addr = members[i].1;
+        let instance_dir = dir.path().join(format!("n{i}"));
+        let mut cfg =
+            make_config(i as NodeId, members.clone(), addr, instance_dir.clone(), seed_for(i));
+        cfg.admission_bytes = admission_bytes;
+        let node = Node::start_with_socket(cfg, sock).expect("start");
+        nodes.push(NodeH { id: i as NodeId, addr, instance_dir, node });
+    }
+    Cluster { _dir: dir, dir_path, members, nodes }
+}
+
+/// Wait until `cnc`'s mirrored `config_pending` reads stable (0). Used
+/// between successive "real" (expected-to-succeed) admin ops so a later,
+/// unrelated refusal probe cannot spuriously observe `ChangePending`
+/// instead of the structural reason it is actually testing for — the
+/// pending gate is checked BEFORE every structural precondition in
+/// `ElectionSm::propose_config`, so an unsettled prior change would
+/// silently swap in reason 3 for whatever exact reason a probe expects.
+fn await_config_settled(cnc: &CncPage, secs: u64) {
+    let deadline = deadline_secs(secs);
+    while cnc.config_pending() != 0 {
+        assert!(Instant::now() < deadline, "config change never settled (stayed pending)");
+        std::thread::yield_now();
+    }
+}
+
+/// Submit `n` distinct 64 B payloads through `node`, retrying while the
+/// bounded ingress reports `Full`.
+fn submit_batch(node: &Node, n: u64) {
+    for i in 0..n {
+        let mut p = vec![0u8; 64];
+        p[..8].copy_from_slice(&i.to_le_bytes());
+        let deadline = deadline_secs(20);
+        loop {
+            match node.submit(p.clone()) {
+                Ok(()) => break,
+                Err(_) => {
+                    assert!(Instant::now() < deadline, "submit stayed refused");
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+}
+
+/// Max over every live node's own commit counter (each individually
+/// monotonic) — a cluster-wide high-water mark for "commit advanced".
+fn commit_high_water(nodes: &[NodeH]) -> u64 {
+    nodes.iter().map(|h| h.node.counters().commit.load_acquire()).max().unwrap_or(0)
+}
+
+/// Wait (bounded) for the cluster-wide commit high-water to advance past
+/// `before` — `submit_batch` only enqueues (it returns as soon as the ring
+/// accepts the payload), so the actual quorum-commit of those bytes lags
+/// behind it and must be awaited, not read back immediately.
+fn await_commit_advanced(nodes: &[NodeH], before: u64, msg: &str) {
+    let deadline = deadline_secs(20);
+    while commit_high_water(nodes) <= before {
+        assert!(Instant::now() < deadline, "{msg}");
+        std::thread::yield_now();
+    }
+}
+
+/// Add `id` as a learner via `leader_cnc` (asserting the resulting version),
+/// then boot a REAL node for it on a freshly bound socket and push its
+/// handle into `c.nodes` — the "replace/resize a box" pattern shared by
+/// `full_replace_a_box_recipe` and `resize_3_to_5_to_3`: a real process that
+/// can genuinely receive replicated data and report its own catch-up
+/// progress, not a bare structural entry.
+fn add_learner_and_boot(c: &mut Cluster, leader_cnc: &CncPage, id: NodeId, expect_version: u64) {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().unwrap();
+    let (ip, port) = addr_to_wire(addr);
+    let resp = admin_request_ok(leader_cnc, 1 /* AddLearner */, id, ip, port, 20);
+    assert_eq!(resp.version, expect_version, "add-learner {id} landed at an unexpected version");
+    let instance_dir = c.dir_path.join(format!("n{id}"));
+    let cfg = make_config(id, c.members.clone(), addr, instance_dir.clone(), seed_for(id as usize));
+    let node = Node::start_with_socket(cfg, sock).expect("start extra node");
+    c.nodes.push(NodeH { id, addr, instance_dir, node });
+}
+
+/// The set of ids `cnc`'s own peer band currently publishes with VOTER role
+/// (i.e. every OTHER member this node currently considers a voter).
+fn voter_ids_via_cnc(cnc: &CncPage) -> Vec<NodeId> {
+    let mut ids = Vec::new();
+    for i in 0..CNC_MAX_PEER_SLOTS {
+        let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+        if raw == 0 {
+            continue;
+        }
+        let id = (raw >> 8) as u32;
+        let role = (raw & 0xff) as u8;
+        if role == CNC_PEER_ROLE_VOTER {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// Rebind a fresh UDP socket on a specific loopback address, retrying
+/// briefly (mirrors `failover.rs`'s `rebind`).
+fn rebind(addr: SocketAddr) -> UdpSocket {
+    let deadline = deadline_secs(5);
+    loop {
+        match UdpSocket::bind(addr) {
+            Ok(s) => return s,
+            Err(_) if Instant::now() < deadline => std::thread::yield_now(),
+            Err(e) => panic!("rebind {addr} failed: {e}"),
+        }
+    }
+}
+
+/// "Replace a box" recipe end to end: add a fresh node as a learner, prove
+/// its catch-up via an EXPLICIT `PeerSlot::reported_durable` poll (not a
+/// blind promote-retry), promote it to voter, crash one of the ORIGINAL
+/// voters, remove that crashed voter — landing on a 3-voter set that is the
+/// original set minus the crashed one plus the new node. Every intermediate
+/// `config_version` (1, 2, 3) is directly observed along the way.
+#[test]
+fn full_replace_a_box_recipe() {
+    let _g = serialize();
+    let mut c = spawn_cluster(3);
+    let leader = await_single_leader(&c.nodes, 20);
+    let leader_id = c.nodes[leader].id;
+    let leader_cnc = open_cnc(&c.nodes[leader].instance_dir);
+
+    let new_id: NodeId = 50;
+    add_learner_and_boot(&mut c, &leader_cnc, new_id, 1);
+    await_config_converged(&c.nodes, 1, new_id, CNC_PEER_ROLE_LEARNER, 20);
+
+    // Drive real writes so the new learner has a real gap to close.
+    submit_batch(&c.nodes[leader].node, 800);
+
+    // EXPLICIT PeerSlot poll: wait for the new learner's reported_durable
+    // (as the LEADER sees it) to reach the leader's own commit — this is
+    // the discriminating "poll catch-up" step the recipe calls for, as
+    // opposed to just retrying PromoteLearner blindly until NotCaughtUp
+    // clears.
+    let target_commit = c.nodes[leader].node.counters().commit.load_acquire();
+    let deadline = deadline_secs(30);
+    loop {
+        let mut caught_up = false;
+        for i in 0..CNC_MAX_PEER_SLOTS {
+            let raw = leader_cnc.peer_slot(i).id_and_role.load_acquire();
+            if raw == 0 {
+                continue;
+            }
+            let id = (raw >> 8) as u32;
+            if id == new_id
+                && leader_cnc.peer_slot(i).reported_durable.load_acquire() >= target_commit
+            {
+                caught_up = true;
+            }
+        }
+        if caught_up {
+            break;
+        }
+        assert!(Instant::now() < deadline, "new node's PeerSlot never reported catch-up");
+        std::thread::yield_now();
+    }
+
+    // Promote — the poll above already proved it is caught up, so this must
+    // succeed on the first try (no NotCaughtUp-tolerant retry needed).
+    let resp = admin_request_ok(&leader_cnc, 2 /* PromoteLearner */, new_id, 0, 0, 20);
+    assert_eq!(resp.version, 2);
+    await_config_converged(&c.nodes, 2, new_id, CNC_PEER_ROLE_VOTER, 20);
+
+    // Now 4 voters: the original 3 plus the new one. Crash one of the
+    // ORIGINAL voters (never the current leader, to keep this a plain
+    // dead-follower removal rather than self-removal — already covered by
+    // `leader_self_removal_hands_off`).
+    let crash_id = (0..3u32).find(|&id| id != leader_id).unwrap();
+    let crash_idx = c.nodes.iter().position(|h| h.id == crash_id).unwrap();
+    c.nodes.remove(crash_idx).node.crash();
+
+    let resp = admin_request_ok(&leader_cnc, 5 /* RemoveVoter */, crash_id, 0, 0, 20);
+    assert_eq!(resp.version, 3);
+
+    let deadline = deadline_secs(20);
+    while c.nodes.iter().any(|h| h.node.config_version() < 3) {
+        assert!(Instant::now() < deadline, "config version 3 never converged after the replace");
+        std::thread::yield_now();
+    }
+    // The crashed/removed original voter must never surface in a survivor's
+    // peer band again.
+    for h in &c.nodes {
+        let cnc = open_cnc(&h.instance_dir);
+        for i in 0..CNC_MAX_PEER_SLOTS {
+            let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+            if raw == 0 {
+                continue;
+            }
+            let id = (raw >> 8) as u32;
+            assert_ne!(id, crash_id, "node {}: removed voter {crash_id} still published", h.id);
+        }
+    }
+    // The new node is now a fully-fledged voter cluster-wide, at v3.
+    await_config_converged(&c.nodes, 3, new_id, CNC_PEER_ROLE_VOTER, 20);
+
+    for h in c.nodes {
+        h.node.stop();
+    }
+}
+
+/// Grow 3 -> 5 (two add+promote pairs, versions 1-4) then shrink 5 -> 3 (two
+/// demote+remove-learner pairs, versions 5-8), submitting real traffic
+/// around every step and asserting commit strictly advances throughout. The
+/// final voter set must be exactly the original 3.
+///
+/// IGNORED — pins a real production bug found by this test (see
+/// `docs/tasks` / task-9 report for the full writeup; not fixed here per the
+/// M7 Task 9 brief, which scopes this suite to test authorship only).
+///
+/// Root cause: `ElectionSm::adopt_config` (`uc2_consensus/src/election.rs`,
+/// ~line 1160) sets the permanent one-way latch `self_removed = true`
+/// whenever the config it JUST adopted excludes `self.id` — with no way to
+/// tell "a real removal" apart from "this is a HISTORICAL config, from
+/// before I joined, that I am replaying during catch-up, and a LATER config
+/// in the very same catch-up run legitimately re-includes me". The second
+/// learner added here (id 61) sequentially and correctly adopts v1 (voters
+/// [0,1,2], learner [60] — 61 legitimately absent, it hasn't joined yet),
+/// v2 (60 promoted — still legitimately absent), then v3 (61 finally
+/// present as learner) — but v1 and v2 already latched `self_removed`
+/// forever. `halt_if_removed_follower` (called from unrelated tick/event
+/// paths) later re-observes that stale latch and fires `Action::HaltRemoved`
+/// — permanently parking node 61 — even though its CURRENT config (v3, and
+/// the v4 promotion the test proposes next) includes it. Observed directly:
+/// node 61 halts ("removed from cluster config") and its counters freeze at
+/// config_version=3 forever, so `await_config_converged(.., 4, ..)` times
+/// out. This is not an artificial construction — it is the unavoidable
+/// shape of "add a SECOND voter after the first is already promoted", which
+/// the pre-existing suite never exercised (every prior joiner's own v1 IS
+/// its first relevant config, so the latch was never set on a false
+/// positive before).
+#[ignore = "pins a real production bug: ElectionSm::adopt_config's self_removed latch \
+            fires on a joiner's own pre-admission history and never clears — see the \
+            doc comment on this test and the task-9 report"]
+#[test]
+fn resize_3_to_5_to_3() {
+    let _g = serialize();
+    let mut c = spawn_cluster(3);
+    let leader = await_single_leader(&c.nodes, 20);
+    let leader_cnc = open_cnc(&c.nodes[leader].instance_dir);
+
+    // ---- grow 3 -> 5: two add+promote pairs (v1-v4) ----
+    add_learner_and_boot(&mut c, &leader_cnc, 60, 1);
+    let before = commit_high_water(&c.nodes);
+    submit_batch(&c.nodes[leader].node, 300);
+    await_commit_advanced(&c.nodes, before, "commit must advance across add-learner 60");
+    await_config_converged(&c.nodes, 1, 60, CNC_PEER_ROLE_LEARNER, 20);
+
+    let resp = admin_request_ok(&leader_cnc, 2 /* PromoteLearner */, 60, 0, 0, 30);
+    assert_eq!(resp.version, 2);
+    let before = commit_high_water(&c.nodes);
+    submit_batch(&c.nodes[leader].node, 300);
+    await_commit_advanced(&c.nodes, before, "commit must advance across promote 60");
+    await_config_converged(&c.nodes, 2, 60, CNC_PEER_ROLE_VOTER, 20);
+
+    add_learner_and_boot(&mut c, &leader_cnc, 61, 3);
+    let before = commit_high_water(&c.nodes);
+    submit_batch(&c.nodes[leader].node, 300);
+    await_commit_advanced(&c.nodes, before, "commit must advance across add-learner 61");
+    await_config_converged(&c.nodes, 3, 61, CNC_PEER_ROLE_LEARNER, 90);
+
+    let resp = admin_request_ok(&leader_cnc, 2, 61, 0, 0, 30);
+    assert_eq!(resp.version, 4);
+    let before = commit_high_water(&c.nodes);
+    submit_batch(&c.nodes[leader].node, 300);
+    await_commit_advanced(&c.nodes, before, "commit must advance across promote 61");
+    await_config_converged(&c.nodes, 4, 61, CNC_PEER_ROLE_VOTER, 90);
+
+    // ---- shrink 5 -> 3: two demote+remove-learner pairs (v5-v8) ----
+    let resp = admin_request_ok(&leader_cnc, 3 /* DemoteVoter */, 60, 0, 0, 20);
+    assert_eq!(resp.version, 5);
+    let before = commit_high_water(&c.nodes);
+    submit_batch(&c.nodes[leader].node, 200);
+    await_commit_advanced(&c.nodes, before, "commit must advance across demote 60");
+
+    let resp = admin_request_ok(&leader_cnc, 4 /* RemoveLearner */, 60, 0, 0, 20);
+    assert_eq!(resp.version, 6);
+    let before = commit_high_water(&c.nodes);
+    submit_batch(&c.nodes[leader].node, 200);
+    await_commit_advanced(&c.nodes, before, "commit must advance across remove-learner 60");
+
+    let resp = admin_request_ok(&leader_cnc, 3 /* DemoteVoter */, 61, 0, 0, 20);
+    assert_eq!(resp.version, 7);
+    let before = commit_high_water(&c.nodes);
+    submit_batch(&c.nodes[leader].node, 200);
+    await_commit_advanced(&c.nodes, before, "commit must advance across demote 61");
+
+    let resp = admin_request_ok(&leader_cnc, 4 /* RemoveLearner */, 61, 0, 0, 20);
+    assert_eq!(resp.version, 8);
+    let before = commit_high_water(&c.nodes);
+    submit_batch(&c.nodes[leader].node, 200);
+    await_commit_advanced(&c.nodes, before, "commit must advance across remove-learner 61");
+
+    // ---- final: voter set == the original 3 ----
+    let deadline = deadline_secs(30);
+    while c.nodes.iter().any(|h| h.node.config_version() < 8) {
+        assert!(Instant::now() < deadline, "config version 8 never converged cluster-wide");
+        std::thread::yield_now();
+    }
+    for h in &c.nodes {
+        let cnc = open_cnc(&h.instance_dir);
+        let mut got = voter_ids_via_cnc(&cnc);
+        got.sort();
+        let mut want: Vec<NodeId> = [0u32, 1, 2].into_iter().filter(|&id| id != h.id).collect();
+        want.sort();
+        assert_eq!(got, want, "node {}: final voter set must be exactly the original 3", h.id);
+    }
+
+    for h in c.nodes {
+        h.node.stop();
+    }
+}
+
+/// Every refusal reason surfaces with its EXACT wire code: `AlreadyPresent`
+/// (5, add-learner an existing voter id), `NotFound` (6, demote an unknown
+/// id), `WrongRole` (7, promote an existing voter), `ChangePending` (3, a
+/// second proposal while the first is durably un-committable — see below),
+/// `NotCaughtUp` (10, promote a learner with no real backing process),
+/// `Tombstoned` (4, re-add a removed id), `TooManyMembers` (9, the 8-member
+/// cap), `ZeroVoters` (8, removing the last voter).
+///
+/// `ChangePending` construction: rather than racing two proposals against
+/// an uncontrollable local commit latency (flaky either way it lands), the
+/// leader is partitioned from BOTH followers first. `propose_config`'s
+/// local append succeeds regardless (no network needed to append to one's
+/// own journal — the isolated-leader-keeps-writing behavior `failover.rs`
+/// already proves), but `config_pending()` cannot ever clear without a
+/// quorum ack, which is categorically impossible while every link is cut.
+/// So a second, distinct proposal on the SAME (still-isolated) leader is a
+/// deterministic `ChangePending`, not a timing bet.
+#[test]
+fn every_refusal_surfaces() {
+    let _g = serialize();
+    let c = spawn_cluster(3);
+    let leader = await_single_leader(&c.nodes, 20);
+    let mut leader_cnc = open_cnc(&c.nodes[leader].instance_dir);
+    await_config_settled(&leader_cnc, 20);
+
+    // ---- AlreadyPresent: add-learner on an existing VOTER id ----
+    let resp = admin_request(&leader_cnc, 1 /* AddLearner */, 0, 0, 0);
+    assert_eq!(resp.status, 1);
+    assert_eq!(resp.reason, 5, "AlreadyPresent expected, got {resp:?}");
+
+    // ---- NotFound: demote an unknown id ----
+    let resp = admin_request(&leader_cnc, 3 /* DemoteVoter */, 999, 0, 0);
+    assert_eq!(resp.status, 1);
+    assert_eq!(resp.reason, 6, "NotFound expected, got {resp:?}");
+
+    // ---- WrongRole: promote an existing VOTER id ----
+    let resp = admin_request(&leader_cnc, 2 /* PromoteLearner */, 0, 0, 0);
+    assert_eq!(resp.status, 1);
+    assert_eq!(resp.reason, 7, "WrongRole expected, got {resp:?}");
+
+    // ---- ChangePending (see doc comment above) ----
+    let followers: Vec<usize> = (0..c.nodes.len()).filter(|&i| i != leader).collect();
+    for &f in &followers {
+        partition(&c.nodes[leader], &c.nodes[f]);
+    }
+    let resp1 = admin_request(&leader_cnc, 1 /* AddLearner */, 300, 0, 0);
+    assert_eq!(resp1.status, 0, "op1's local append must be accepted even while isolated");
+    let resp2 = admin_request(&leader_cnc, 1 /* AddLearner */, 301, 0, 0);
+    assert_eq!(resp2.status, 1);
+    assert_eq!(resp2.reason, 3, "ChangePending expected, got {resp2:?}");
+    for h in &c.nodes {
+        heal_link(h);
+    }
+    // Reconverge to a single, STABLE leader (either the same one or a fresh
+    // one elected during the isolation — either is fine; the ChangePending
+    // observation above is already captured) before continuing.
+    let leader = find_stable_leader(&c.nodes, 20);
+    leader_cnc = open_cnc(&c.nodes[leader].instance_dir);
+    await_config_settled(&leader_cnc, 20);
+
+    // ---- NotCaughtUp: promote a learner with no real backing process, on
+    // a cluster with a tiny admission slack so ordinary traffic already
+    // exceeds it (avoids needing thousands of baseline writes). ----
+    {
+        let c2 = spawn_cluster_admission(3, 4096);
+        let leader2 = await_single_leader(&c2.nodes, 20);
+        let leader2_cnc = open_cnc(&c2.nodes[leader2].instance_dir);
+        submit_batch(&c2.nodes[leader2].node, 100);
+        let deadline = deadline_secs(20);
+        while c2.nodes[leader2].node.counters().commit.load_acquire() <= 4096 {
+            assert!(Instant::now() < deadline, "commit never exceeded the tiny admission slack");
+            std::thread::yield_now();
+        }
+        let never_addr: SocketAddr = "127.0.0.1:59500".parse().unwrap(); // never bound/started
+        let (ip, port) = addr_to_wire(never_addr);
+        let resp = admin_request_ok(&leader2_cnc, 1 /* AddLearner */, 500, ip, port, 20);
+        assert_eq!(resp.version, 1);
+        await_config_settled(&leader2_cnc, 20);
+        let resp = admin_request(&leader2_cnc, 2 /* PromoteLearner */, 500, 0, 0);
+        assert_eq!(resp.status, 1);
+        assert_eq!(resp.reason, 10, "NotCaughtUp expected, got {resp:?}");
+        for h in c2.nodes {
+            h.node.stop();
+        }
+    }
+
+    // ---- Tombstoned: remove a learner, then try to re-add the same id ----
+    let learner_addr: SocketAddr = "127.0.0.1:59600".parse().unwrap();
+    let (ip, port) = addr_to_wire(learner_addr);
+    let resp = admin_request_ok(&leader_cnc, 1 /* AddLearner */, 600, ip, port, 20);
+    assert!(resp.version >= 1);
+    await_config_settled(&leader_cnc, 20);
+    let resp = admin_request_ok(&leader_cnc, 4 /* RemoveLearner */, 600, 0, 0, 20);
+    assert!(resp.version >= 2);
+    await_config_settled(&leader_cnc, 20);
+    let resp = admin_request(&leader_cnc, 1 /* AddLearner */, 600, ip, port);
+    assert_eq!(resp.status, 1);
+    assert_eq!(resp.reason, 4, "Tombstoned expected, got {resp:?}");
+
+    // ---- TooManyMembers: add learners until the 8-member cap refuses ----
+    fn add_learner_until_capped(cnc: &CncPage, id: u32, ip: u32, port: u16, secs: u64) -> AdminResp {
+        let deadline = deadline_secs(secs);
+        loop {
+            let resp = admin_request(cnc, 1 /* AddLearner */, id, ip, port);
+            match resp.status {
+                0 => return resp,
+                1 if resp.reason == 9 => return resp, // the cap: a terminal, expected outcome
+                1 if matches!(resp.reason, 2 | 3 | 10) => {}
+                2 => {}
+                _ => panic!("add-learner {id} refused unexpectedly: {resp:?}"),
+            }
+            assert!(Instant::now() < deadline, "add-learner {id} never resolved (last {resp:?})");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let mut hit_cap = false;
+    for k in 0u32..10 {
+        let id = 700 + k;
+        let addr: SocketAddr = format!("127.0.0.1:{}", 20000 + k).parse().unwrap();
+        let (ip, port) = addr_to_wire(addr);
+        let resp = add_learner_until_capped(&leader_cnc, id, ip, port, 20);
+        if resp.status == 1 && resp.reason == 9 {
+            hit_cap = true;
+            break;
+        }
+    }
+    assert!(hit_cap, "never observed TooManyMembers filling to the 8-member cap");
+
+    // ---- ZeroVoters: remove voters down to 1; the third refuses ----
+    let leader_id = c.nodes[leader].id;
+    let followers_ids: Vec<NodeId> = (0..3u32).filter(|&id| id != leader_id).collect();
+    assert_eq!(followers_ids.len(), 2);
+    let resp = admin_request_ok(&leader_cnc, 5 /* RemoveVoter */, followers_ids[0], 0, 0, 20);
+    assert_eq!(resp.status, 0);
+    await_config_settled(&leader_cnc, 20);
+    let resp = admin_request_ok(&leader_cnc, 5 /* RemoveVoter */, followers_ids[1], 0, 0, 20);
+    assert_eq!(resp.status, 0);
+    await_config_settled(&leader_cnc, 20);
+    let resp = admin_request(&leader_cnc, 5 /* RemoveVoter */, leader_id, 0, 0);
+    assert_eq!(resp.status, 1);
+    assert_eq!(resp.reason, 8, "ZeroVoters expected, got {resp:?}");
+
+    for h in c.nodes {
+        h.node.stop();
+    }
+}
+
+/// Craft a divergent-leader shape whose divergent tail CONTAINS a config
+/// frame: partition the leader from both followers, propose a config change
+/// while it still believes it serves (accepted, appended, adopted LOCALLY —
+/// `config_version` bumps to 1 on that node alone), let the majority elect
+/// a fresh leader (whose config stays at genesis, v0 — it never saw the
+/// phantom change), heal, and prove the ex-leader TRUNCATES its divergent
+/// tail and REVERTS `config_version` back to 0 — deterministically staying
+/// there (there is nothing else to converge to yet, so this is not a
+/// transient blip to race against). Then prove the cluster still works
+/// post-revert: a FRESH config change lands at v1 (the phantom v1 never
+/// counted) and converges everywhere, with the phantom id never surfacing.
+#[test]
+fn truncation_revert_e2e() {
+    let _g = serialize();
+    let c = spawn_cluster(3);
+    let leader = await_single_leader(&c.nodes, 20);
+
+    let followers: Vec<usize> = (0..c.nodes.len()).filter(|&i| i != leader).collect();
+    for &f in &followers {
+        partition(&c.nodes[leader], &c.nodes[f]);
+    }
+
+    // Still isolated, the old leader still believes it serves (exactly like
+    // failover.rs's phantom-write proof) — propose while it does.
+    let leader_cnc = open_cnc(&c.nodes[leader].instance_dir);
+    let phantom_id: NodeId = 900;
+    let phantom_addr: SocketAddr = "127.0.0.1:59900".parse().unwrap();
+    let (ip, port) = addr_to_wire(phantom_addr);
+    let resp = admin_request(&leader_cnc, 1 /* AddLearner */, phantom_id, ip, port);
+    assert_eq!(resp.status, 0, "isolated leader refused its own local append: {resp:?}");
+    assert_eq!(resp.version, 1);
+    assert_eq!(
+        c.nodes[leader].node.config_version(),
+        1,
+        "the phantom config is adopted LOCALLY (optimistically), before any replication"
+    );
+
+    // The majority elects a NEW leader; its config stays at genesis (v0) —
+    // it never saw the phantom change.
+    let new = await_serving_among(&c.nodes, &followers, 20);
+    assert!(c.nodes[new].node.current_term() > 0);
+    for &f in &followers {
+        assert_eq!(
+            c.nodes[f].node.config_version(),
+            0,
+            "the majority must not see the isolated leader's phantom config"
+        );
+    }
+
+    // Heal. The ex-leader must adopt the higher term, TRUNCATE its
+    // divergent config-bearing tail, and REVERT.
+    for h in &c.nodes {
+        heal_link(h);
+    }
+    let deadline = deadline_secs(30);
+    while c.nodes[leader].node.truncations() == 0 {
+        assert!(Instant::now() < deadline, "ex-leader never truncated its divergent config tail");
+        std::thread::yield_now();
+    }
+    let deadline = deadline_secs(20);
+    while c.nodes[leader].node.config_version() != 0 {
+        assert!(Instant::now() < deadline, "ex-leader's config never reverted to genesis (v0)");
+        std::thread::yield_now();
+    }
+    // Deterministic settle window: with no competing majority config change
+    // to converge to yet, the reverted version must STAY at 0.
+    let settle = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < settle {
+        assert_eq!(c.nodes[leader].node.config_version(), 0, "reverted config regressed off v0");
+        std::thread::yield_now();
+    }
+    // Journal-record consistency: the reverted record is no longer pending
+    // — it is backed by committed (and thus durable) bytes, not a dangling
+    // local-only append.
+    assert_eq!(leader_cnc.config_pending(), 0, "reverted config must not read back as pending");
+
+    // Full data-plane reconvergence to a single, stable frontier (the new
+    // leader is idle — no submissions since heal).
+    let final_target = {
+        let deadline = deadline_secs(30);
+        loop {
+            let a = c.nodes[new].node.counters().append.load_acquire();
+            let d = c.nodes[new].node.counters().durable.load_acquire();
+            let cm = c.nodes[new].node.counters().commit.load_acquire();
+            if d == a && cm == a {
+                break a;
+            }
+            assert!(Instant::now() < deadline, "new leader never quiesced");
+            std::thread::yield_now();
+        }
+    };
+    for h in &c.nodes {
+        let deadline = deadline_secs(30);
+        while h.node.counters().durable.load_acquire() < final_target {
+            assert!(Instant::now() < deadline, "node {} never reconverged durable", h.id);
+            std::thread::yield_now();
+        }
+    }
+
+    // The cluster still works post-revert: a FRESH config change lands at
+    // v1 (the phantom v1 never counted) and converges everywhere.
+    let new_leader_cnc = open_cnc(&c.nodes[new].instance_dir);
+    let real_id: NodeId = 901;
+    let real_addr: SocketAddr = "127.0.0.1:59901".parse().unwrap();
+    let (ip2, port2) = addr_to_wire(real_addr);
+    let resp = admin_request_ok(&new_leader_cnc, 1 /* AddLearner */, real_id, ip2, port2, 20);
+    assert_eq!(resp.version, 1, "the fresh post-revert config is v1 — the phantom v1 never counted");
+    await_config_converged(&c.nodes, 1, real_id, CNC_PEER_ROLE_LEARNER, 20);
+
+    // Final: every node agrees on the SAME version; the phantom id never
+    // surfaces anywhere.
+    for h in &c.nodes {
+        assert_eq!(h.node.config_version(), 1, "node {} did not converge to the final version", h.id);
+        let cnc = open_cnc(&h.instance_dir);
+        for i in 0..CNC_MAX_PEER_SLOTS {
+            let raw = cnc.peer_slot(i).id_and_role.load_acquire();
+            if raw == 0 {
+                continue;
+            }
+            let id = (raw >> 8) as u32;
+            assert_ne!(id, phantom_id, "node {}: the truncated phantom learner must never surface", h.id);
+        }
+    }
+
+    for h in c.nodes {
+        h.node.stop();
+    }
+}
+
+/// SIGKILL-free crash-mid-pending recovery: crash a follower FIRST (so the
+/// leader still holds quorum without it), propose a config change that
+/// commits via the remaining 2-of-3, restart the crashed follower from the
+/// SAME dirs/port, and confirm it re-adopts the config it missed straight
+/// from the journal/replicated stream — rejoining as an ordinary follower,
+/// with no spurious election.
+#[test]
+fn crash_mid_pending_recovers() {
+    let _g = serialize();
+    let mut c = spawn_cluster(3);
+    let members = c.members.clone();
+    let leader = await_single_leader(&c.nodes, 20);
+    let leader_id = c.nodes[leader].id;
+    let follower = (0..c.nodes.len()).find(|&i| i != leader).expect("a follower exists");
+    let follower_id = c.nodes[follower].id;
+    let follower_addr = c.nodes[follower].addr;
+    let follower_dir = c.nodes[follower].instance_dir.clone();
+
+    // Crash the follower FIRST — while it is down, the leader still has
+    // quorum (2 of 3) to commit a config change without it.
+    c.nodes.remove(follower).node.crash();
+
+    let leader_idx = c.nodes.iter().position(|h| h.id == leader_id).unwrap();
+    let leader_cnc = open_cnc(&c.nodes[leader_idx].instance_dir);
+
+    let new_id: NodeId = 70;
+    let learner_addr: SocketAddr = "127.0.0.1:59070".parse().unwrap(); // structural only
+    let (ip, port) = addr_to_wire(learner_addr);
+    let resp = admin_request_ok(&leader_cnc, 1 /* AddLearner */, new_id, ip, port, 20);
+    assert_eq!(resp.version, 1);
+
+    // It commits via the remaining quorum (leader + the other live follower).
+    await_config_converged(&c.nodes, 1, new_id, CNC_PEER_ROLE_LEARNER, 20);
+
+    // Restart the crashed follower from the SAME dirs on the SAME port.
+    let sock = rebind(follower_addr);
+    let cfg =
+        make_config(follower_id, members, follower_addr, follower_dir.clone(), seed_for(follower_id as usize));
+    let node = Node::start_with_socket(cfg, sock).expect("restart follower");
+    c.nodes.push(NodeH { id: follower_id, addr: follower_addr, instance_dir: follower_dir, node });
+
+    // It re-adopts the config it missed from the journal/replicated stream,
+    // rejoining as an ordinary follower — no spurious election / leader claim.
+    let restarted_idx = c.nodes.iter().position(|h| h.id == follower_id).unwrap();
+    let deadline = deadline_secs(30);
+    while c.nodes[restarted_idx].node.config_version() < 1 {
+        assert!(Instant::now() < deadline, "restarted follower never re-adopted the missed config");
+        std::thread::yield_now();
+    }
+    assert!(!c.nodes[restarted_idx].node.is_leader(), "restarted follower unexpectedly became leader");
+
+    await_config_converged(&c.nodes, 1, new_id, CNC_PEER_ROLE_LEARNER, 20);
+
     for h in c.nodes {
         h.node.stop();
     }
