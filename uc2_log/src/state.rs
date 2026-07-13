@@ -32,7 +32,33 @@ pub struct TermMapEntry {
     pub base: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredMember {
+    pub id: u32,
+    pub ip: u32,
+    pub port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredConfig {
+    pub version: u64,
+    pub voters: Vec<StoredMember>,
+    pub learners: Vec<StoredMember>,
+    pub tombstones: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigRecord {
+    pub position: u64,      // frame-END effect point; 0 = genesis
+    pub config: StoredConfig,
+    pub prev_position: u64,
+    pub prev: StoredConfig,
+}
+
 pub type TermMap = Vec<TermMapEntry>;
+
+/// Cached consensus state: vote, term map, output progress, snapshot floor, config record.
+type CacheState = (Option<VoteRecord>, TermMap, u64, u64, Option<ConfigRecord>);
 
 pub struct NodeState {
     vote: StableValue<VoteRecord>,
@@ -45,33 +71,42 @@ pub struct NodeState {
     /// `output_progress` (see `store_snapshot_floor` / the node's
     /// `maybe_persist_snapshot_floor`).
     snapshot: StableValue<u64>,
+    /// M7 Task 2: the durable cluster membership configuration record —
+    /// contains both the current and previous config, forming a one-level
+    /// history. One-in-flight suffices because a new config is only proposable
+    /// after the previous one commits, and committed entries cannot be
+    /// truncated, so at most one config entry is ever truncation-exposed.
+    config: StableValue<ConfigRecord>,
     /// Cached copies (`StableValue::load` clones the cached value, but reads on
     /// the consensus hot path go through this single lock; the term map, the
-    /// vote, the output-progress marker, and the snapshot floor share it so a
-    /// recovery read is one lock, not four).
-    cache: Mutex<(Option<VoteRecord>, TermMap, u64, u64)>,
+    /// vote, the output-progress marker, the snapshot floor, and the config
+    /// record share it so a recovery read is one lock, not five).
+    cache: Mutex<CacheState>,
 }
 
 impl NodeState {
     /// Open (create if absent) `vote.state` + `term_map.state` +
-    /// `output_progress.state` in `dir`, seeding the read cache from whatever
-    /// survived the last run.
+    /// `output_progress.state` + `snapshot.state` + `config.state` in `dir`,
+    /// seeding the read cache from whatever survived the last run.
     pub fn open(dir: &Path) -> Result<Self, StableValueError> {
         let vote = StableValue::open(StableValueConfig::new(dir.join("vote.state")))?;
         let term_map = StableValue::open(StableValueConfig::new(dir.join("term_map.state")))?;
         let output_progress =
             StableValue::open(StableValueConfig::new(dir.join("output_progress.state")))?;
         let snapshot = StableValue::open(StableValueConfig::new(dir.join("snapshot.state")))?;
+        let config = StableValue::open(StableValueConfig::new(dir.join("config.state")))?;
         let v = vote.load()?;
         let m = term_map.load()?.unwrap_or_default();
         let op = output_progress.load()?.unwrap_or(0);
         let snap = snapshot.load()?.unwrap_or(0);
+        let c = config.load()?;
         Ok(Self {
             vote,
             term_map,
             output_progress,
             snapshot,
-            cache: Mutex::new((v, m, op, snap)),
+            config,
+            cache: Mutex::new((v, m, op, snap, c)),
         })
     }
 
@@ -132,6 +167,24 @@ impl NodeState {
     pub fn store_snapshot_floor(&self, v: u64) -> Result<(), StableValueError> {
         self.snapshot.store(&v)?.wait().map_err(durability_error)?;
         self.cache.lock().unwrap().3 = v;
+        Ok(())
+    }
+
+    /// The last durably-persisted cluster membership configuration record
+    /// (M7 Task 2); `None` if no config has been recorded (a fresh instance
+    /// must seed genesis before any configuration state is durable).
+    pub fn config_record(&self) -> Option<ConfigRecord> {
+        self.cache.lock().unwrap().4.clone()
+    }
+
+    /// Durable on return — persist the cluster membership configuration record
+    /// (M7 Task 2). A one-level history (current and previous) suffices because
+    /// a new config is only proposable after the previous one commits, and
+    /// committed entries cannot be truncated — so at most one config entry is
+    /// ever truncation-exposed and thus at risk of reverting.
+    pub fn store_config_record(&self, r: &ConfigRecord) -> Result<(), StableValueError> {
+        self.config.store(r)?.wait().map_err(durability_error)?;
+        self.cache.lock().unwrap().4 = Some(r.clone());
         Ok(())
     }
 }
@@ -221,5 +274,32 @@ mod tests {
         s.store_snapshot_floor(8192).unwrap();
         assert_eq!(s.output_progress(), 4096);
         assert_eq!(s.snapshot_floor(), 8192, "separate StableValues, separate cache slots");
+    }
+
+    #[test]
+    fn config_record_defaults_none_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let genesis = StoredConfig {
+            version: 0,
+            voters: vec![StoredMember { id: 1, ip: 0x0a000001, port: 19100 }],
+            learners: vec![],
+            tombstones: vec![],
+        };
+        {
+            let s = NodeState::open(dir.path()).unwrap();
+            assert_eq!(s.config_record(), None, "fresh dir: no record until the node seeds genesis");
+            let r = ConfigRecord {
+                position: 0,
+                config: genesis.clone(),
+                prev_position: 0,
+                prev: genesis.clone(),
+            };
+            s.store_config_record(&r).unwrap();
+            assert_eq!(s.config_record(), Some(r));
+        }
+        let s = NodeState::open(dir.path()).unwrap();
+        let r = s.config_record().expect("survives reopen");
+        assert_eq!(r.config, genesis);
+        assert_eq!(r.position, 0);
     }
 }
