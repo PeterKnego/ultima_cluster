@@ -90,10 +90,16 @@ pub enum CtrlMsg {
 }
 
 /// M6 Task 6: newest durable snapshot artifact the node is willing to ship —
-/// `(snapshot_pos, path, total_len)`. The node wires this to `SnapshotStore`
-/// filtered by its PERSISTED floor marker (never a half-written file). `None`
-/// = no shippable snapshot (the NAK stays an overrun).
-pub type SnapshotSource = Arc<dyn Fn() -> Option<(u64, PathBuf, u64)> + Send + Sync>;
+/// `(snapshot_pos, path, total_len, config)`. The node wires this to
+/// `SnapshotStore` filtered by its PERSISTED floor marker (never a
+/// half-written file). `None` = no shippable snapshot (the NAK stays an
+/// overrun). M7 Task 6: `config` is the `v2::config::encode_config` bytes of
+/// the CURRENT `ConfigRecord.config` at ship time — carried in every
+/// `SNAP_BEGIN` so a below-floor joiner adopts the leader's membership
+/// alongside its lineage. Over-delivery (shipping it to a peer whose config is
+/// already current) is safe: the receiver adopts by fiat only on a genuine
+/// install, and adoption itself is idempotent by version.
+pub type SnapshotSource = Arc<dyn Fn() -> Option<(u64, PathBuf, u64, Vec<u8>)> + Send + Sync>;
 
 /// One in-flight outbound snapshot transfer (M6 Task 6). At most one at a time
 /// — a second requester waits; sessions are rare by construction (only a peer
@@ -111,6 +117,9 @@ struct SnapSession {
     /// SNAP_BEGIN has been sent (first cycle sends it before any chunk).
     begun: bool,
     last_activity_ns: u64,
+    /// M7 Task 6: the encoded `ConfigRecord.config` at the moment this session
+    /// opened (from the `SnapshotSource` closure) — carried in `SNAP_BEGIN`.
+    config: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -679,7 +688,7 @@ impl Sender {
         let Some(src) = self.snapshot_source.clone() else {
             return false;
         };
-        let Some((pos, path, len)) = src() else {
+        let Some((pos, path, len, config)) = src() else {
             return false;
         };
         let Ok(file) = std::fs::File::open(&path) else {
@@ -697,6 +706,7 @@ impl Sender {
             naks: VecDeque::new(),
             begun: false,
             last_activity_ns: self.base.elapsed().as_nanos() as u64,
+            config,
         });
         self.stats.snap_sessions.fetch_add(1, Ordering::Relaxed);
         true
@@ -719,7 +729,7 @@ impl Sender {
 
         let mut did = false;
         if !sess.begun {
-            self.send_snap_begin(sess.peer, sess.session, sess.snapshot_pos, sess.total_len);
+            self.send_snap_begin(sess.peer, sess.session, sess.snapshot_pos, sess.total_len, &sess.config);
             sess.begun = true;
             did = true;
         }
@@ -785,9 +795,21 @@ impl Sender {
     }
 
     /// Ship SNAP_BEGIN (header `position` = 0; body carries session/pos/len/config).
-    fn send_snap_begin(&mut self, peer: SocketAddr, session: u32, snapshot_pos: u64, total_len: u64) {
-        let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN]; // M7: may grow with config; M6 uses empty config
-        write_snap_begin_body(&mut body, &SnapBeginBody { session, snapshot_pos, total_len, config: vec![] });
+    /// M7 Task 6: `config` is the encoded `ConfigRecord.config` this session's
+    /// `SnapshotSource` closure captured at open time — the body grows to fit it.
+    fn send_snap_begin(
+        &mut self,
+        peer: SocketAddr,
+        session: u32,
+        snapshot_pos: u64,
+        total_len: u64,
+        config: &[u8],
+    ) {
+        let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN + config.len()];
+        write_snap_begin_body(
+            &mut body,
+            &SnapBeginBody { session, snapshot_pos, total_len, config: config.to_vec() },
+        );
         self.assemble_snap(0, DGRAM_KIND_SNAP_BEGIN, &body);
         let _ = self.sock.send_to(&self.scratch, peer);
     }

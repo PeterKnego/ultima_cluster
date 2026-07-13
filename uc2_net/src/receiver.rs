@@ -18,7 +18,7 @@
 use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -250,6 +250,12 @@ pub struct FollowerStats {
     pub dropped_straddle: AtomicU64,
 }
 
+/// M7 Task 6: the `(position, config)` companion cells `set_snapshot_intake`
+/// wires in — the position cell for `ArchiveCmd::AdoptFloor`, the config cell
+/// for `adopt_snapshot_config`. Named to keep `set_snapshot_intake`'s signature
+/// under clippy's type-complexity threshold.
+pub type IncomingSnapshotSignal = (Arc<AtomicU64>, Arc<Mutex<Vec<u8>>>);
+
 /// M6 Task 6: one in-flight INBOUND snapshot transfer (this node is receiving a
 /// snapshot from the leader because its NAK fell below the purge floor). Chunks
 /// land at their file offset in a pre-sized `.part`; a `Rebuilt` over the file's
@@ -266,6 +272,11 @@ struct SnapIntake {
     /// Contiguity over `[0, total_len)` file offsets.
     got: Rebuilt,
     nak: NakTimer,
+    /// M7 Task 6: the encoded `ConfigRecord.config` carried in `SNAP_BEGIN`
+    /// (`v2::config::encode_config` bytes; empty if the leader shipped none).
+    /// Forwarded to `incoming_snapshot_config` on completion, alongside
+    /// `incoming_snapshot_pos`, for the consensus agent's install handler.
+    config: Vec<u8>,
 }
 
 pub struct FollowerReceiver {
@@ -316,6 +327,13 @@ pub struct FollowerReceiver {
     /// inbound snapshot (written on rename). The consensus agent samples it to
     /// issue `ArchiveCmd::AdoptFloor` and mirror it to cnc. `None` in unit tests.
     incoming_snapshot_pos: Option<Arc<AtomicU64>>,
+    /// M7 Task 6: companion cell for `incoming_snapshot_pos` — the encoded
+    /// config carried by the SAME completed transfer. Written in `snap_complete`
+    /// BEFORE `incoming_snapshot_pos` is stored (so the consensus agent's
+    /// `Acquire` load of the position, once it observes the new value, is
+    /// guaranteed to see this cell's matching content — the mutex lock/unlock
+    /// pair is itself a release/acquire fence). `None` in unit tests.
+    incoming_snapshot_config: Option<Arc<Mutex<Vec<u8>>>>,
     /// M6 Task 6: config for the inbound-transfer NAK timer (RTT delay + seed).
     snap_nak_cfg: NakConfig,
     snap_seed: u64,
@@ -383,6 +401,7 @@ impl FollowerReceiver {
             snap_dir: None,
             snap_intake: None,
             incoming_snapshot_pos: None,
+            incoming_snapshot_config: None,
             snap_nak_cfg: cfg.nak,
             snap_seed: cfg.seed,
             snap_adopt_pending: None,
@@ -448,12 +467,18 @@ impl FollowerReceiver {
 
     /// M6 Task 6: enable INBOUND snapshot transfers. `snap_dir` is where the
     /// `.part`/final artifacts land (`instance_dir/snapshots`); `incoming` (if
-    /// set) receives the position of each COMPLETED transfer for the consensus
-    /// agent to adopt as an archive floor. Without this call kinds 12/13 are
-    /// ignored (a node that never joins below a floor never receives snapshots).
-    pub fn set_snapshot_intake(&mut self, snap_dir: PathBuf, incoming: Option<Arc<AtomicU64>>) {
+    /// set) is `(position, config)`: the position cell receives each COMPLETED
+    /// transfer's floor for the consensus agent to adopt as an archive floor,
+    /// and (M7 Task 6) the config cell receives that SAME transfer's carried
+    /// `SNAP_BEGIN.config` bytes for the agent's `adopt_snapshot_config` install
+    /// handler. Without this call kinds 12/13 are ignored (a node that never
+    /// joins below a floor never receives snapshots).
+    pub fn set_snapshot_intake(&mut self, snap_dir: PathBuf, incoming: Option<IncomingSnapshotSignal>) {
         self.snap_dir = Some(snap_dir);
-        self.incoming_snapshot_pos = incoming;
+        if let Some((pos, config)) = incoming {
+            self.incoming_snapshot_pos = Some(pos);
+            self.incoming_snapshot_config = Some(config);
+        }
     }
 
     #[inline]
@@ -804,6 +829,7 @@ impl FollowerReceiver {
             final_path,
             got: Rebuilt::new(0),
             nak: NakTimer::new(self.snap_nak_cfg, self.snap_seed ^ b.session as u64),
+            config: b.config,
         });
         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
     }
@@ -870,6 +896,14 @@ impl FollowerReceiver {
             },
         );
         let _ = self.sock.send_to(&d, intake.peer);
+        // M7 Task 6: publish the carried config BEFORE the position signal — the
+        // consensus agent's install handler samples the position (Acquire) and
+        // only then reads this cell, so publishing it first (the mutex itself is
+        // a release fence) guarantees it sees THIS transfer's bytes, never a
+        // stale or absent value from a prior/no session.
+        if let Some(cell) = &self.incoming_snapshot_config {
+            *cell.lock().unwrap() = intake.config.clone();
+        }
         // Signal the consensus agent to adopt the floor + mirror observability.
         if let Some(slot) = &self.incoming_snapshot_pos {
             slot.store(intake.snapshot_pos, Ordering::Release);

@@ -98,7 +98,7 @@ fn build(faults: FaultConfig) -> Harness {
     let snap_path = write_snapshot_file(leader_dir.path());
     let src_len = std::fs::metadata(&snap_path).unwrap().len();
     let snapshot_source: uc2_net::sender::SnapshotSource =
-        Arc::new(move || Some((SNAP_POS, snap_path.clone(), src_len)));
+        Arc::new(move || Some((SNAP_POS, snap_path.clone(), src_len, Vec::new())));
 
     let leader_buf = heap_buffer();
     // Prime the ring far ahead so a NAK at position 0 is below the ring floor

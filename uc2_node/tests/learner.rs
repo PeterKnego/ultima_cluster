@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 
 use uc2_consensus::election::NodeId;
 use uc2_log::cnc::CncPage;
+use uc2_log::state::{ConfigRecord, NodeState, StoredConfig, StoredMember};
 use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig, PurgePolicy};
 
@@ -362,8 +363,35 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     };
 
     let v_dir = dir.path().join("v0");
+    // M7 Task 6: pre-seed the voter's `ConfigRecord` at version 1 — same
+    // membership as the seed config, just a version bump — BEFORE it boots, so
+    // the config the snapshot session carries is genuinely non-genesis. No
+    // live-reconfig admin path is wired yet (that's Task 7's job) to bump it in
+    // flight, so this is the only way to prove the wire carry end to end rather
+    // than asserting a trivial 0 == 0 coincidence.
+    let stored_member = |id: NodeId, a: SocketAddr| StoredMember {
+        id,
+        ip: match a.ip() {
+            std::net::IpAddr::V4(v4) => u32::from(v4),
+            std::net::IpAddr::V6(_) => panic!("ipv4 only"),
+        },
+        port: a.port(),
+    };
+    std::fs::create_dir_all(v_dir.join("state")).unwrap();
+    {
+        let cfg_v1 = StoredConfig {
+            version: 1,
+            voters: members.iter().map(|(id, a)| stored_member(*id, *a)).collect(),
+            learners: learners.iter().map(|(id, a)| stored_member(*id, *a)).collect(),
+            tombstones: Vec::new(),
+        };
+        let rec = ConfigRecord { position: 0, config: cfg_v1.clone(), prev_position: 0, prev: cfg_v1 };
+        NodeState::open(&v_dir.join("state")).unwrap().store_config_record(&rec).unwrap();
+    }
+
     let voter = Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
     await_until(30, "voter serves", || voter.can_serve());
+    assert_eq!(voter.config_version(), 1, "voter booted from the pre-seeded v1 record");
 
     for i in 0u64..24000 {
         let mut p = vec![0u8; PAYLOAD];
@@ -414,6 +442,18 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
         "the learner must have adopted the shipped snapshot floor, not replayed from 0"
     );
     assert!(!learner.is_leader(), "a learner never leads");
+
+    // M7 Task 6: the snapshot session carries the leader's config alongside its
+    // lineage (`SnapBeginBody.config`) — the joiner decodes + adopts it by fiat
+    // (`adopt_snapshot_config`) on install completion, so its `config_version`
+    // converges with the leader's PRE-SEEDED v1 (not the learner's own genesis
+    // v0) — a real cross-node version bump, not a trivial 0 == 0 coincidence.
+    assert_eq!(voter.config_version(), 1, "sanity: voter still reports the pre-seeded version");
+    assert_eq!(
+        learner.config_version(),
+        voter.config_version(),
+        "the joiner's config_version must converge with the leader's after install"
+    );
 
     learner.stop();
     voter.stop();

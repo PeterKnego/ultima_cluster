@@ -712,6 +712,32 @@ impl ElectionSm {
         self.current_term = self.current_term.max(last_term);
     }
 
+    /// M7 Task 6: config-by-fiat on a snapshot install (mirrors
+    /// [`ElectionSm::adopt_snapshot_lineage`] just above — same authority
+    /// argument: a below-floor joiner discards its local bytes and installs the
+    /// leader's snapshot, so there is no genuine local history to prefer over
+    /// what the snapshot carries; the leader's config AT the floor becomes
+    /// truth by fiat). Unlike ordinary adoption (`adopt_config` /
+    /// `ConfigObserved`) this sets `cur == prev == config` at `position ==
+    /// prev_position == floor` — a cold joiner has nothing below the floor to
+    /// revert to, so collapsing the one-level history to a single point is
+    /// correct (there is no genuine predecessor to lose). Rebuilds every
+    /// structure derived from `self.config` — voting set, candidacy, a FRESH
+    /// EMPTY `CommitTracker`, and the carried-reports prune — exactly like the
+    /// truncation revert (`carry_reports = false`: this is a cold join, there
+    /// is nothing to carry forward). Emits NO `Action::ConfigAdopted`: unlike
+    /// every other adoption path, this one is driven from the node's
+    /// snapshot-install-completion handler, which persists the fiat
+    /// `ConfigRecord` inline rather than through the shared exec arm — the
+    /// node (not the SM) owns the timing of a snapshot install.
+    pub fn adopt_snapshot_config(&mut self, position: u64, config: ClusterConfig) {
+        self.config = config.clone();
+        self.prev_config = config;
+        self.config_position = position;
+        self.prev_position = position;
+        self.rebuild_membership(false);
+    }
+
     /// True while a truncation is in flight (the data-plane latch is held).
     pub fn is_truncating(&self) -> bool {
         self.truncating_epoch.is_some()
@@ -2271,5 +2297,44 @@ mod tests {
         step(&mut s, Event::Truncated { epoch, to: 4096 });
         assert_eq!(s.config(), &genesis, "reverted to the RESTORED prev, not the seeded cur");
         assert_eq!(s.config_position(), 0);
+    }
+
+    /// M7 Task 6: `adopt_snapshot_config` is config-by-fiat — mirrors
+    /// `adopt_snapshot_lineage`'s authority argument for the term map. A
+    /// below-floor joiner installs the leader's config AT the floor as both
+    /// `cur` and `prev` (nothing genuine below the floor to revert to), rebuilds
+    /// the derived voting set / candidacy / tracker fresh (no carried reports —
+    /// a cold join), and emits no `Action::ConfigAdopted` (the node persists the
+    /// fiat record inline on the install path, not through the shared exec arm).
+    #[test]
+    fn adopt_snapshot_config_is_fiat_with_no_action() {
+        // Reuse the established divergent-map fixture (own map [(1,0),(2,4096)],
+        // durable 6000, term 3 adopted) so the follow-up `TermMapReceived`
+        // reconciles to a real `Truncate{to: 4096}` — the floor this test installs
+        // the fiat config AT.
+        let mut s = sm_with_divergent_map();
+        let mut floor_cfg = s.config().clone();
+        floor_cfg.learners.push((9, addr_of(9)));
+        floor_cfg.version = 7;
+        const FLOOR: u64 = 4096;
+
+        s.adopt_snapshot_config(FLOOR, floor_cfg.clone());
+        assert_eq!(s.config(), &floor_cfg, "cur == the shipped floor config");
+        assert_eq!(s.config_position(), FLOOR, "position == the floor");
+
+        // Truncate EXACTLY at the floor's position: with cur == prev == floor_cfg
+        // (the fiat collapse to one point), there is nothing lower to revert to,
+        // so this is a no-op preserve — exactly ordinary adoption's
+        // `to == config_position` case (proves the fiat collapse, not a stale
+        // pre-install `prev`, backs any subsequent revert decision) — and, unlike
+        // a real forward adoption, installing the fiat config itself emitted no
+        // `Action::ConfigAdopted` (asserted implicitly: only the truncate/ack
+        // below can produce one, and it must not here either).
+        let acts =
+            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let epoch = extract_truncate_epoch(&acts);
+        let acts = step(&mut s, Event::Truncated { epoch, to: FLOOR });
+        assert_eq!(s.config(), &floor_cfg, "to == config_position: no revert");
+        assert!(!acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
     }
 }
