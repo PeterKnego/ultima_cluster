@@ -44,6 +44,25 @@ CONVERGE_BUDGET = 10.0    # s — follower reconstruction must converge within t
 PURGE_WAIT = 20.0         # s — wait for the purge floor to advance before a cycle
 BASELINE_SECS = 8.0       # s — commit-rate baseline window before the join
 
+# Journal durability guard. Each node's instance dir CONTAINS its journal
+# (uc2_node InstanceDir::journal_dir() lives under it), so an instance dir on a
+# RAM-backed filesystem makes fsync a no-op and every durability number this
+# gate produces fiction. Deny-list volatile fs types rather than allow-listing
+# ext4 (xfs & friends must still pass). `stat -f -c %T` reports e.g.
+# 'ext2/ext3' for ext4 and 'tmpfs' for tmpfs.
+VOLATILE_FS = {"tmpfs", "ramfs", "devtmpfs", "shm"}
+
+
+def assert_durable_fs(fstype, where, host):
+    fstype = (fstype or "").strip()
+    if not fstype or fstype in VOLATILE_FS:
+        raise SystemExit(
+            f"[m6-gate] FATAL: {where} on {host} is on '{fstype or 'unknown'}' — a "
+            f"RAM-backed filesystem defeats journal fsync durability; refusing to "
+            f"run the gate. Put the instance dirs on a real disk (fleet: os_tune "
+            f"mounts the instance-store NVMe at /opt/bench — check it ran)."
+        )
+
 
 # ----------------------------------------------------------------- host models
 
@@ -117,17 +136,26 @@ class SshHost:
         return subprocess.run(self.ssh + [self.target, cmd], text=True, **kw)
 
     def prepare(self):
-        """Build the m6_gate example (release builds no examples by default) and
-        create the instance-dir parent. Idempotent; ~9 s on a warm target."""
+        """Build the m6_gate example (release builds no examples by default),
+        create the instance-dir parent, and report its filesystem type (the
+        journal lives under the instance dir — a tmpfs here would silently void
+        every durability claim, so the caller hard-fails on volatile fs types).
+        Idempotent; ~9 s on a warm target."""
         r = self._ssh(
             f"sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup "
             f"{self.CARGO} build --release --example m6_gate "
             f"--manifest-path {self.UC_SRC}/Cargo.toml -p uc2_node "
-            f"&& sudo mkdir -p /opt/bench/m6 && echo PREPARED",
+            f"&& sudo mkdir -p /opt/bench/m6 "
+            f"&& echo FSTYPE=$(stat -f -c %T /opt/bench/m6) && echo PREPARED",
             capture_output=True,
         )
-        if "PREPARED" not in (r.stdout or ""):
-            raise RuntimeError(f"prepare {self.public_ip} failed: {r.stderr or r.stdout}")
+        out = r.stdout or ""
+        if "PREPARED" not in out:
+            raise RuntimeError(f"prepare {self.public_ip} failed: {r.stderr or out}")
+        fstype = next(
+            (l.split("=", 1)[1] for l in out.splitlines() if l.startswith("FSTYPE=")), ""
+        )
+        assert_durable_fs(fstype, "/opt/bench/m6 (instance-dir parent)", self.public_ip)
 
     def bind_addr(self):
         # Fleet nodes bind their PRIVATE NIC IP (the cross-host route) on a fixed
@@ -350,6 +378,13 @@ def build_local_hosts(gate_bin, root):
     if root.exists():
         subprocess.run(["rm", "-rf", str(root)], check=True)
     root.mkdir(parents=True)
+    # Same durability guard as the fleet path: the node instance dirs (and thus
+    # the journals) live under this root. Catches --root on /tmp (RAM tmpfs on
+    # dev boxes) or any TMPDIR-style redirection onto a volatile fs.
+    fstype = subprocess.check_output(
+        ["stat", "-f", "-c", "%T", str(root)], text=True
+    )
+    assert_durable_fs(fstype, f"{root} (local gate root)", "localhost")
     hosts = []
     for i in range(4):
         node_dir = root / f"n{i}"
