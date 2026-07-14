@@ -1595,3 +1595,78 @@ fn crash_mid_pending_recovers() {
         h.node.stop();
     }
 }
+
+/// Post-M7 follow-up: a node restarted on an instance dir whose recovered
+/// config tombstones its OWN id must refuse to start (previously: booted as
+/// a permanently-idle zombie — the runtime HaltRemoved latch is version-
+/// gated and never re-fires on boot).
+#[test]
+fn restart_of_removed_node_refuses_to_start() {
+    let _g = serialize();
+    let mut c = spawn_cluster(3);
+    let leader = await_single_leader(&c.nodes, 20);
+    let leader_cnc = open_cnc(&c.nodes[leader].instance_dir);
+
+    let removed_id: NodeId = 100;
+    add_learner_and_boot(&mut c, &leader_cnc, removed_id, 1);
+    await_config_converged(&c.nodes, 1, removed_id, CNC_PEER_ROLE_LEARNER, 20);
+
+    // A real gap of committed traffic before the removal, same as this
+    // file's other add/promote/demote/remove sequences.
+    let before = commit_high_water(&c.nodes);
+    submit_batch(&c.nodes[leader].node, 100);
+    await_commit_advanced(&c.nodes, before, "commit must advance after adding learner 100");
+
+    let resp = admin_request_ok(&leader_cnc, 4 /* RemoveLearner */, removed_id, 0, 0, 20);
+    assert_eq!(resp.version, 2);
+
+    // Wait for the REMOVED node itself to adopt its own removal
+    // (config_version reaches v2). For a non-leader, `ConfigObserved` is
+    // fed only from a durably-ARCHIVED CONFIG frame ("this is how everyone
+    // else learns once the frame is durable" — node.rs `Consensus::do_work`
+    // step 1c), so by the time this loop exits the removal frame's position
+    // is already <= this node's own recovered `durable`: no window left for
+    // `recover_config_record`'s T5-carry revert to undo the tombstone on
+    // restart (that revert only ever fires for a record ahead of durable).
+    let removed_idx = c.nodes.iter().position(|h| h.id == removed_id).unwrap();
+    let deadline = deadline_secs(20);
+    while c.nodes[removed_idx].node.config_version() < 2 {
+        assert!(Instant::now() < deadline, "removed learner never adopted its own removal");
+        std::thread::yield_now();
+    }
+
+    // Drop the removed node's OWN handle — a clean stop, which releases the
+    // instance-dir flock and fully joins every agent — before restarting on
+    // the SAME instance dir. The old process's runtime HaltRemoved latch is
+    // irrelevant here; this proves the NEW process's construction-time
+    // refusal instead.
+    let removed_dir = c.nodes[removed_idx].instance_dir.clone();
+    let removed_addr = c.nodes[removed_idx].addr;
+    let removed = c.nodes.remove(removed_idx);
+    removed.node.stop();
+
+    // Restart with the same NodeConfig shape the harness uses for every
+    // spawned node (`make_config`/`add_learner_and_boot`): same instance
+    // dir, id, and bind address.
+    let sock = rebind(removed_addr);
+    let cfg = make_config(
+        removed_id,
+        c.members.clone(),
+        removed_addr,
+        removed_dir,
+        seed_for(removed_id as usize),
+    );
+    // `Node` doesn't implement `Debug`, so `expect_err` isn't available —
+    // match directly instead.
+    let err = match Node::start_with_socket(cfg, sock) {
+        Ok(_) => panic!("a tombstoned id must not boot"),
+        Err(e) => e,
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("tombstoned"), "error must name the cause: {msg}");
+    assert!(msg.contains("fresh id"), "error must name the recourse: {msg}");
+
+    for h in c.nodes {
+        h.node.stop();
+    }
+}

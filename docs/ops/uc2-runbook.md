@@ -349,6 +349,18 @@ config version, sorted out only by wiping the directory before every reused
 host slot's new generation (`bench-infra/scripts/m6_fleet_gate.py`'s
 `reset_dir`).
 
+**A removed node's binary refuses to restart on its old instance dir**
+(`tombstoned in the recovered cluster config`) — this is the intended
+decommission backstop, not an error to work around. Previously a restarted
+removed node would boot as a permanently-idle zombie (the runtime
+`HaltRemoved` latch is version-gated and never re-fires on boot, so a fresh
+process never re-halted itself); `Node::start` now checks the just-recovered
+config against its own id at construction and fails loudly instead, so an
+orchestrator sees a failed unit rather than a healthy-looking idle one. If a
+node was removed while its removal was still uncommitted and the cluster
+later truncated it (rare; requires losing the removal's own quorum), the
+wrongly-halted node's recourse is the same wipe-and-rejoin as below.
+
 **Wipe-and-rejoin (NoCommonPrefix):** unrelated to reconfiguration — if a
 rejoining node's log has no common prefix with the leader (the leader purged
 past the divergence), the node truncates to 0 and rejoins from the snapshot

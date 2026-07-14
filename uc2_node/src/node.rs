@@ -425,6 +425,24 @@ impl Node {
                 .map_err(to_io)?;
 
         let config = stored_to_cluster(&config_rec.config);
+        // Post-M7 follow-up: a node whose OWN id is tombstoned in the
+        // recovered config can never rejoin under this id (fresh-forever
+        // ids) and would otherwise boot as a permanently-idle zombie — the
+        // runtime HaltRemoved latch cannot re-fire (adoption is version-
+        // gated; no higher-version ConfigObserved ever arrives for an
+        // already-adopted removal). Fail loudly at construction: an
+        // orchestrator sees a failed unit, not a healthy idle one. (The T8
+        // truncation-revert edge — a durable-but-uncommitted self-removal
+        // later truncated cluster-wide — previously recovered via restart;
+        // its recourse is now wipe-and-rejoin, documented in the runbook.)
+        if config.tombstones.contains(&cfg.id) {
+            return Err(io::Error::other(format!(
+                "node id {} is tombstoned in the recovered cluster config (v{}): \
+                 this id was permanently removed and can never rejoin; \
+                 decommission this instance dir, or wipe it and rejoin with a fresh id",
+                cfg.id, config.version
+            )));
+        }
         let prev_config = stored_to_cluster(&config_rec.prev);
         // M7 Task 6: mirror the recovered version onto the FRESH cnc page
         // immediately — same durable-then-mirror discipline as the snapshot
