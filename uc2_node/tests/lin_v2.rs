@@ -349,7 +349,7 @@ fn linearizable_under_reconfig_churn() {
     // workspace (the crashtest's `hard_crash` test) — an UNDISTURBED run of
     // this capstone (few faults land, e.g. the config-op cycle completes in
     // its first few picks) can otherwise let the workers run wild for the
-    // rest of `BUDGET` while only the `config_ops_committed` condition below
+    // rest of `BUDGET` while only the `config_ops_accepted` condition below
     // is still pending, and was observed to reach 4000+ entries and blow the
     // checker's stack. The scheduler loop bails out once ops cross this line
     // even if `MIN_CONFIG_OPS` isn't met yet (the assert below still catches
