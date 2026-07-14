@@ -492,6 +492,11 @@ def start_service(host):
 def run_gate(hosts, voters, learner, members, learners, cycles, stop_file):
     verdicts = []
 
+    # Clean room (same rationale as run_gate_m7): never inherit durable state
+    # from a prior run on these hosts.
+    for h in hosts:
+        h.reset_dir()
+
     # 1. Bring up the three voters (node, then service once the cnc exists).
     for i in voters:
         start_node(hosts[i], "node", i, members, learners)
@@ -1055,6 +1060,14 @@ def run_gate_m7(hosts, members_seed, stop_file):
     the prior scenario freed up), and checks the loadclient divergence guard
     at the end — same composition contract as M6's `run_gate`."""
     verdicts = []
+
+    # Clean room: a gate run must never inherit durable state from a prior run
+    # (or any other experiment) on these hosts — stale `config.state` carries
+    # old tombstones/versions, and the orchestrator's fresh-id counter would
+    # collide with them ("add-learner refused: Tombstoned", hit on a real
+    # rerun). Wipe every instance dir up front, exactly like a fresh provision.
+    for h in hosts:
+        h.reset_dir()
 
     for i in range(3):
         # `bind_addr()` is safe to call directly here — `main()` already
