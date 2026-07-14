@@ -1182,6 +1182,22 @@ impl Consensus {
         while let Ok((position, payload)) = self.cfg_obs_rx.try_recv() {
             let wire = decode_config(&payload)
                 .unwrap_or_else(|| panic!("corrupt CONFIG frame at {position}"));
+            // Belt (post-M7 follow-up): observations are drained AFTER the
+            // archive agent's do_work returned, and do_work store_release's
+            // durable as its LAST step — so a durably-recorded CONFIG
+            // frame's end position can never exceed the durable counter
+            // here. A violation is a mis-based observation (recorder bug):
+            // adopting it would park config_position above durable, where
+            // config_pending could never clear. Skip + log, don't adopt.
+            let durable = self.cnc.counters().durable.load_acquire();
+            if position > durable {
+                eprintln!(
+                    "node {}: ignoring implausible ConfigObserved at {position} (durable {durable})",
+                    self.id
+                );
+                did = true;
+                continue;
+            }
             self.feed(Event::ConfigObserved { position, config: wire_to_cluster_config(&wire) });
             did = true;
         }
@@ -3702,6 +3718,37 @@ mod tests {
         h.adopt_and_truncate(3, vec![(1, 0), (3, 4096)]);
         let after = h.cons.state.config_record().unwrap();
         assert_eq!(after, before, "to == position: no revert, record byte-identical");
+    }
+
+    // ---- post-M7 follow-up (Task 6): ConfigObserved position<=durable belt ----
+
+    /// The do_work step-1c drain must SKIP (not adopt) a `ConfigObserved`
+    /// observation whose position exceeds the durable counter — the archive
+    /// agent's ordering guarantee (`do_work` store_release's `durable` as its
+    /// LAST step, strictly before draining `take_config_observations`; see
+    /// node.rs:705/715 and archive.rs's `do_work`) means this can never
+    /// legitimately happen for a real, durably-recorded CONFIG frame. This
+    /// drives the real drain path through the harness's `cfg_obs` sender
+    /// (rather than `feed` directly) so the belt itself is exercised. The
+    /// SAME payload at a plausible position (<= durable) must still adopt —
+    /// the belt discriminates on position, not payload.
+    #[test]
+    fn implausible_config_observation_is_ignored() {
+        let mut h = harness();
+        let durable = h.cons.cnc.counters().durable.load_acquire();
+        let v1 = v1_of(&h);
+        let mut bytes = Vec::new();
+        encode_config(&cluster_to_wire(&v1, 0), &mut bytes);
+
+        // Implausible: far above durable — must be skipped, not adopted.
+        h._cfg_obs_tx.send((durable + 1_000_000, bytes.clone())).unwrap();
+        h.cons.do_work();
+        assert_eq!(h.cons.sm.config().version, 0, "implausible obs must not adopt");
+
+        // Plausible: the SAME config, at position <= durable — must still adopt.
+        h._cfg_obs_tx.send((durable, bytes)).unwrap();
+        h.cons.do_work();
+        assert_eq!(h.cons.sm.config().version, 1, "plausible obs must still adopt");
     }
 
     // ---- M7 Task 6: boot recovery of the ConfigRecord ----
