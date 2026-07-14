@@ -1198,7 +1198,14 @@ impl Consensus {
                 did = true;
                 continue;
             }
-            self.feed(Event::ConfigObserved { position, config: wire_to_cluster_config(&wire) });
+            let config = wire_to_cluster_config(&wire);
+            if config_content_diverges(self.sm.config(), &config) {
+                eprintln!(
+                    "node {}: DIVERGENT config observed at {position}: version {} content differs from adopted",
+                    self.id, config.version
+                );
+            }
+            self.feed(Event::ConfigObserved { position, config });
             did = true;
         }
 
@@ -2748,6 +2755,15 @@ fn wire_to_cluster_config(w: &WireConfig) -> ClusterConfig {
     }
 }
 
+/// Post-M7 follow-up: same version + different content = divergence (two
+/// configs minted at one version — possible only via the wipe-fiat position
+/// reset or a bug), never a benign re-observation. The version gate in
+/// `Event::ConfigObserved` SILENTLY drops equal versions, so without this
+/// check divergence is invisible.
+pub(crate) fn config_content_diverges(current: &ClusterConfig, incoming: &ClusterConfig) -> bool {
+    incoming.version == current.version && incoming != current
+}
+
 /// `ClusterConfig` -> the `WireConfig` to append as a `FRAME_TYPE_CONFIG`
 /// payload. `prev_position` is an audit-trail field only (the durable
 /// `ConfigRecord` keeps the authoritative prev) — the caller passes the
@@ -3749,6 +3765,58 @@ mod tests {
         h._cfg_obs_tx.send((durable, bytes)).unwrap();
         h.cons.do_work();
         assert_eq!(h.cons.sm.config().version, 1, "plausible obs must still adopt");
+    }
+
+    // ---- post-M7 follow-up (Task 7): equal-version content-divergence check ----
+
+    /// Pure-function unit test: same version + different content diverges;
+    /// identical configs (even at the same version) and different versions
+    /// are NOT this check's job (that's `ConfigObserved`'s version gate).
+    #[test]
+    fn config_content_divergence_detector() {
+        let a = ClusterConfig {
+            version: 3,
+            voters: vec![(1, (0, 0)), (2, (0, 0)), (3, (0, 0))],
+            learners: Vec::new(),
+            tombstones: Vec::new(),
+        };
+        let mut b = a.clone();
+        assert!(!config_content_diverges(&a, &b), "identical: benign");
+        b.voters.pop();
+        assert!(config_content_diverges(&a, &b), "same version, different content");
+        let mut c = a.clone();
+        c.version += 1;
+        assert!(!config_content_diverges(&a, &c), "different version: not this check's job");
+    }
+
+    /// A same-version-different-content `ConfigObserved` through the real
+    /// drain path (`_cfg_obs_tx` + `do_work`) is dropped by the version gate
+    /// exactly like a benign re-observation — this task only adds the loud
+    /// eprintln signal (`config_content_diverges`), it does not change
+    /// adoption behavior: the adopted config must be unchanged either way.
+    #[test]
+    fn equal_version_content_divergence_is_not_adopted() {
+        let mut h = harness();
+        let durable = h.cons.cnc.counters().durable.load_acquire();
+        let v1 = v1_of(&h);
+        h.cons.feed(Event::ConfigObserved { position: 0, config: v1.clone() });
+        assert_eq!(h.cons.sm.config(), &v1, "v1 adopted directly via feed");
+
+        // Same version (1) as the adopted config, different content: drop
+        // the learner v1_of added.
+        let mut divergent = v1.clone();
+        divergent.learners.clear();
+        let mut bytes = Vec::new();
+        encode_config(&cluster_to_wire(&divergent, 0), &mut bytes);
+
+        h._cfg_obs_tx.send((durable, bytes)).unwrap();
+        h.cons.do_work();
+
+        assert_eq!(
+            h.cons.sm.config(),
+            &v1,
+            "version gate drops the equal-version divergent observation"
+        );
     }
 
     // ---- M7 Task 6: boot recovery of the ConfigRecord ----
