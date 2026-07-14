@@ -228,7 +228,12 @@ impl LogBuffer {
             // `end + aligned > hard` — whether `hard` is the wrap clamp or the
             // append clamp — is genuinely impossible for intact committed
             // frames; a hit here means the length word itself is torn/corrupt.
-            if aligned == 0 || end + aligned > hard {
+            // A NONZERO length below `HEADER_LEN` (e.g. a torn `1`) aligns up to
+            // 32 and would otherwise slip past BOTH disjuncts as a "valid"
+            // sub-header frame — every legitimately committed word is a message/
+            // config/new-term/padding frame of length >= HEADER_LEN, so guard it
+            // exactly as `Replay::next`/`observe_terms` do (Task 3 H1 audit).
+            if (len as usize) < HEADER_LEN || end + aligned > hard {
                 return Err(RecordableCorrupt { from, append, end, claimed_len: len });
             }
             if end > 0 && end + aligned > max_bytes as u64 {
@@ -718,6 +723,33 @@ mod tests {
         assert_eq!(err.from, 0);
         assert_eq!(err.append, 192);
         assert!(err.end > 0, "the first, intact frame was walked before the tear");
+    }
+
+    /// Post-M7 follow-up (Task 3 H1 audit): a torn length word whose value is
+    /// NONZERO but below `HEADER_LEN` (e.g. 1) must ALSO surface as
+    /// `Err(RecordableCorrupt)`. `align_frame_len(1) == 32 != 0`, so it passes
+    /// the `aligned == 0` disjunct, and `end + 32 <= hard` when it is the last
+    /// word in the committed region, so it passes the overrun disjunct too — it
+    /// would otherwise be walked as a "valid" sub-header frame and recorded into
+    /// a malformed block (the downstream `Replay::next` OOB the whole task is
+    /// about). Mirrors `Replay::next`/`observe_terms`'s `total < HEADER_LEN`
+    /// guard, closing the one walk that lacked it.
+    #[test]
+    fn recordable_slice_surfaces_subheader_length_word() {
+        let (b, _c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        a.append(1, 0, &[0u8; 64]).unwrap(); // frame 1: 96 B at offset 0
+        a.append_new_term().unwrap(); // frame 2: 32 B header-only at offset 96
+        assert_eq!(a.position(), 128, "committed region is exactly [0, 128)");
+        // Poison frame 2's length word to a nonzero sub-HEADER_LEN value. It is
+        // the LAST word in [0, append), so end(96) + align(1)=32 == hard(128)
+        // does NOT trip the overrun disjunct.
+        b.commit_word(96).store(1, Ordering::Release);
+        let err = b.recordable_slice(0, 1 << 20).unwrap_err();
+        assert_eq!(err.claimed_len, 1);
+        assert_eq!(err.end, 96, "the first, intact frame was walked before the tear");
+        assert_eq!(err.from, 0);
+        assert_eq!(err.append, 128);
     }
 
     #[test]
