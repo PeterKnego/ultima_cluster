@@ -1263,7 +1263,7 @@ mod tests {
         let (pos, bytes, advance) = &runs[0];
         leader.send(to, DGRAM_KIND_DATA, *pos, TERM, bytes);
         drive_until(&mut r, || b.counters().append.load_acquire() == *advance);
-        let s = b.recordable_slice(0, 1 << 20);
+        let s = b.recordable_slice(0, 1 << 20).unwrap();
         assert_eq!(s.len(), *advance as usize);
         assert_eq!(&s[32..36], b"aaaa");
     }

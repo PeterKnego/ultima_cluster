@@ -97,7 +97,7 @@ mod tests {
         assert_eq!(pos, 4 * 96);
         // receiver-role: advance append after (simulated) gap tracking
         fc.counters().append.store_release(pos);
-        let s = follower.recordable_slice(0, 1 << 20);
+        let s = follower.recordable_slice(0, 1 << 20).unwrap();
         assert_eq!(s.len(), 384);
         assert_eq!(read_header(&s[96..]).correlation_id, 1);
         assert_eq!(&s[3 * 96 + 32..3 * 96 + 96], &[3u8; 64]);
@@ -106,7 +106,7 @@ mod tests {
         if let SliceRead::Run(r) = leader.read_run_validated(0, 200, &mut run2) {
             assert!(w.write_run(0, &run2[..r.bytes]));
         }
-        assert_eq!(follower.recordable_slice(0, 1 << 20).len(), 384);
+        assert_eq!(follower.recordable_slice(0, 1 << 20).unwrap().len(), 384);
     }
 
     #[test]

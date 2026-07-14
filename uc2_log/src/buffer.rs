@@ -81,6 +81,21 @@ pub struct LogBuffer {
     cnc: Arc<CncPage>,
 }
 
+/// Post-M7 follow-up: an impossible length word inside the committed region
+/// `[from, append)` during `recordable_slice`'s frame walk. The committed
+/// region is immutable until recorded, so this is a recorder-side invariant
+/// break (torn write, mis-primed `from`, or memory-ordering bug) — the
+/// archive must fail-stop loudly rather than record a malformed block
+/// (previously a `debug_assert!`, i.e. silent garbage in release builds —
+/// the leading upstream suspect for the once-seen `Replay::next` panic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordableCorrupt {
+    pub from: u64,
+    pub append: u64,
+    pub end: u64,
+    pub claimed_len: u32,
+}
+
 impl LogBuffer {
     pub fn new(region: Region, cnc: Arc<CncPage>, max_payload: usize) -> Self {
         let capacity = region.len() as u64;
@@ -188,10 +203,10 @@ impl LogBuffer {
     /// a frame in half. CONTRACT: only the archive (the durability gate
     /// holder) may call this; the returned slice is protected from overwrite
     /// by the appender's gate against `durable`.
-    pub fn recordable_slice(&self, from: u64, max_bytes: usize) -> &[u8] {
+    pub fn recordable_slice(&self, from: u64, max_bytes: usize) -> Result<&[u8], RecordableCorrupt> {
         let append = self.cnc.counters().append.load_acquire();
         if append <= from {
-            return &[];
+            return Ok(&[]);
         }
         let off = self.offset(from);
         let hard = (append - from).min(self.capacity - off as u64);
@@ -209,7 +224,13 @@ impl LogBuffer {
                 .unwrap(),
             );
             let aligned = align_frame_len(len as usize) as u64;
-            debug_assert!(aligned > 0 && end + aligned <= hard);
+            // Frames never span the wrap and padding fills exactly to it, so
+            // `end + aligned > hard` — whether `hard` is the wrap clamp or the
+            // append clamp — is genuinely impossible for intact committed
+            // frames; a hit here means the length word itself is torn/corrupt.
+            if aligned == 0 || end + aligned > hard {
+                return Err(RecordableCorrupt { from, append, end, claimed_len: len });
+            }
             if end > 0 && end + aligned > max_bytes as u64 {
                 break;
             }
@@ -217,7 +238,7 @@ impl LogBuffer {
         }
         // SAFETY: [from, from+end) is committed, contiguous in the region,
         // and gate-protected from overwrite while the archive holds it.
-        unsafe { std::slice::from_raw_parts(self.region.ptr_at(off), end as usize) }
+        Ok(unsafe { std::slice::from_raw_parts(self.region.ptr_at(off), end as usize) })
     }
 
     /// Read one frame at `pos` with overwrite validation, for lagging /
@@ -605,7 +626,7 @@ mod tests {
         assert_eq!(a.position(), 64);
         assert_eq!(c.counters().append.load_acquire(), 64);
 
-        let s = b.recordable_slice(0, 1 << 20);
+        let s = b.recordable_slice(0, 1 << 20).unwrap();
         assert_eq!(s.len(), 64);
         let h = read_header(s);
         assert_eq!(h.length, (HEADER_LEN + 12) as u32);
@@ -624,7 +645,7 @@ mod tests {
         assert_eq!(pos, 0);
         assert_eq!(a.position(), 32, "the NewTerm frame is header-only (32 B)");
         assert_eq!(c.counters().append.load_acquire(), 32);
-        let s = b.recordable_slice(0, 1 << 20);
+        let s = b.recordable_slice(0, 1 << 20).unwrap();
         assert_eq!(s.len(), 32);
         let h = read_header(s);
         assert_eq!(h.length, HEADER_LEN as u32);
@@ -648,7 +669,7 @@ mod tests {
         assert_eq!(a.position(), 64);
         assert_eq!(c.counters().append.load_acquire(), 64);
 
-        let s = b.recordable_slice(0, 1 << 20);
+        let s = b.recordable_slice(0, 1 << 20).unwrap();
         assert_eq!(s.len(), 64);
         let h = read_header(s);
         assert_eq!(h.length, (HEADER_LEN + payload.len()) as u32);
@@ -669,13 +690,34 @@ mod tests {
             a.append(1, i, &[0u8; 64]).unwrap(); // 96 B frames
         }
         // max_bytes cuts mid-frame at 200 -> trimmed to 2 whole frames (192)
-        let s = b.recordable_slice(0, 200);
+        let s = b.recordable_slice(0, 200).unwrap();
         assert_eq!(s.len(), 192);
         // always returns at least one whole frame even if max_bytes is tiny
-        let s = b.recordable_slice(0, 8);
+        let s = b.recordable_slice(0, 8).unwrap();
         assert_eq!(s.len(), 96);
         // empty when caught up
-        assert_eq!(b.recordable_slice(4 * 96, 1 << 20).len(), 0);
+        assert_eq!(b.recordable_slice(4 * 96, 1 << 20).unwrap().len(), 0);
+    }
+
+    /// Post-M7 follow-up: a torn/corrupt length word inside the committed
+    /// region must surface as `Err(RecordableCorrupt)`, not a debug-only
+    /// assert (silent garbage in release builds) or an OOB slice. Poisons the
+    /// second frame's length word through the same `commit_word` atomic the
+    /// appender itself uses (an absurd claimed length far past the committed
+    /// span), mirroring a torn write / mis-primed `from` / ordering bug.
+    #[test]
+    fn recordable_slice_surfaces_torn_length_word() {
+        let (b, _c) = buf();
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        a.append(1, 0, &[0u8; 64]).unwrap(); // frame 1: 96 B, at offset 0
+        a.append(1, 1, &[0u8; 64]).unwrap(); // frame 2: 96 B, at offset 96
+        let second_frame_off = 96usize;
+        b.commit_word(second_frame_off).store(1 << 20, Ordering::Release); // absurd len
+        let err = b.recordable_slice(0, 1 << 20).unwrap_err();
+        assert_eq!(err.claimed_len, 1 << 20);
+        assert_eq!(err.from, 0);
+        assert_eq!(err.append, 192);
+        assert!(err.end > 0, "the first, intact frame was walked before the tear");
     }
 
     #[test]
@@ -695,13 +737,13 @@ mod tests {
 
         // slice from 4032 stops at the wrap: just the 64 B padding frame
         c.counters().durable.store_release(4032);
-        let s = b.recordable_slice(4032, 1 << 20);
+        let s = b.recordable_slice(4032, 1 << 20).unwrap();
         assert_eq!(s.len(), 64);
         let h = read_header(s);
         assert_eq!(h.frame_type, FRAME_TYPE_PADDING);
         assert_eq!(h.length, 64);
         // and the next slice (post-wrap) starts with the message frame
-        let s = b.recordable_slice(4096, 1 << 20);
+        let s = b.recordable_slice(4096, 1 << 20).unwrap();
         assert_eq!(s.len(), 96);
         assert_eq!(read_header(s).correlation_id, 99);
     }
@@ -748,7 +790,7 @@ mod tests {
         assert_eq!(a.position(), 4032);
         let pos_before = a.position();
         let append_before = c.counters().append.load_acquire();
-        let slice_before = b.recordable_slice(0, 1 << 20).to_vec();
+        let slice_before = b.recordable_slice(0, 1 << 20).unwrap().to_vec();
 
         // A config payload needing padding + frame > the 64 B headroom: pad(64)
         // would land the frame at 4096, well past durable(0) + capacity(4096).
@@ -768,7 +810,7 @@ mod tests {
             "WouldOverrun must not advance the shared append counter"
         );
         assert_eq!(
-            b.recordable_slice(0, 1 << 20).to_vec(),
+            b.recordable_slice(0, 1 << 20).unwrap().to_vec(),
             slice_before,
             "WouldOverrun must not have written any bytes (no stray padding/header)"
         );

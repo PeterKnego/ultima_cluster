@@ -45,6 +45,12 @@ pub enum ArchiveError {
     /// error (previously an unlabeled OOB slice panic in `Replay::next`).
     #[error("corrupt archived block seq {seq} (base {base}): frame at off {off} claims len {claimed_len}, block len {block_len}")]
     CorruptBlock { seq: u64, base: u64, off: usize, claimed_len: u32, block_len: usize },
+    /// Post-M7 follow-up: `LogBuffer::recordable_slice`'s frame walk hit a
+    /// length word inconsistent with the committed region — a recorder-side
+    /// invariant break (see `RecordableCorrupt`'s doc comment). Fail-stop
+    /// rather than record a malformed block.
+    #[error("recorder-side corrupt frame walk: {0:?}")]
+    RecorderCorrupt(crate::buffer::RecordableCorrupt),
 }
 
 #[derive(Debug, Clone)]
@@ -243,7 +249,9 @@ impl Archive {
     /// done. The durable counter is advanced ONLY after Notifier::wait()
     /// returns (Consistent durability => post-fdatasync).
     pub fn do_work(&mut self, buffer: &LogBuffer) -> Result<bool, ArchiveError> {
-        let slice = buffer.recordable_slice(self.durable_pos, self.cfg.max_block_bytes);
+        let slice = buffer
+            .recordable_slice(self.durable_pos, self.cfg.max_block_bytes)
+            .map_err(ArchiveError::RecorderCorrupt)?;
         if slice.is_empty() {
             return Ok(false);
         }
