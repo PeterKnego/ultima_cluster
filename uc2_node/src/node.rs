@@ -2555,6 +2555,40 @@ impl Consensus {
                 self.cnc.store_config_version(config.version);
                 // Cleared once commit crosses `position` (do_work step 11).
                 self.cnc.store_config_pending(true);
+                // Final-review carry (post-M7 follow-up wave): the crash-handoff
+                // wedge `propose_config`'s `SelfDemote` guard can't close. That
+                // guard only blocks a SERVING leader from PROPOSING its own
+                // demote; it can't stop a DIFFERENT leader from proposing
+                // `DemoteVoter{B}` (legal — B isn't self), replicating the CONFIG
+                // frame to B, and crashing before it commits. If B then wins the
+                // election, B's own archive scan re-observes that frame and
+                // adopts it here from the log — while B is `Role::Leader`. A
+                // demote leaves no tombstone (only `Remove*` does), so the
+                // `tombstones.contains(self.id)` latch above never fires and
+                // neither `HaltRemoved` nor `StepDownRemoved` follows — B keeps
+                // serving as leader but can never vote again, with zero signal.
+                // Safety holds (a learner casts no vote, occupies no quorum
+                // slot); the wedge is silent. This is exactly that shape: warn
+                // loudly so an operator notices and runs `remove-learner` on
+                // this id (then rejoins fresh) rather than the fleet quietly
+                // running a leader that can't be re-elected. This arm runs once
+                // per adoption, so the check fires exactly once per such event.
+                // A mechanical fix (a commit-triggered self-step-down for this
+                // shape, mirroring `StepDownRemoved`) is a deferred, post-merge
+                // ticket — out of scope here.
+                if matches!(self.sm.role(), Role::Leader)
+                    && !config.is_voter(self.id)
+                    && !config.tombstones.contains(&self.id)
+                {
+                    eprintln!(
+                        "node {}: WARNING leader adopted a config demoting itself from the \
+                         log (crash-handoff of a demote a prior leader proposed against this \
+                         id) — continuing to serve as leader but can never vote again; \
+                         operator recourse: remove-learner {} on this node, then rejoin with \
+                         a fresh id",
+                        self.id, self.id
+                    );
+                }
             }
             Action::HaltRemoved => {
                 // M7: this node is not a member of the just-adopted config (and
@@ -3823,6 +3857,66 @@ mod tests {
             &v1,
             "version gate drops the equal-version divergent observation"
         );
+    }
+
+    // ---- final-review carry: crash-handoff self-demote wedge (silent, by design) ----
+
+    /// Pins the exact wedge shape the final-review finding describes:
+    /// `propose_config`'s `SelfDemote` guard only blocks a leader from
+    /// PROPOSING its own demote — it can't stop a DIFFERENT (now-crashed)
+    /// leader's `DemoteVoter{self}` proposal from reaching this node from the
+    /// log after IT wins an election. Drive the harness's id-1 SM to leader
+    /// (mirrors `election::tests::leader_term1`'s Tick-then-majority-Vote
+    /// recipe: boot_term 2 -> election term 3, self-vote + one peer grant out
+    /// of the 3-voter [0,1,2] cluster is a majority), then feed a
+    /// `ConfigObserved` demoting id 1 (self) to a learner — a real archive-
+    /// scan observation would look identical. `adopt_config` has no
+    /// tombstone to key off (a demote never tombstones), so the SM adopts it
+    /// silently: role stays Leader, self is no longer a voter, and neither
+    /// `HaltRemoved` nor `StepDownRemoved` fires — the node keeps serving as
+    /// an unelectable leader with zero signal from the SM itself. The
+    /// `Action::ConfigAdopted` exec arm's eprintln (this task's node-side
+    /// fix) is not asserted here — it's the OBSERVABLE wedge shape underneath
+    /// it that's load-bearing and worth pinning.
+    #[test]
+    fn leader_adopting_own_demote_from_log_stays_leader_unelectable_no_halt() {
+        let mut h = harness();
+        assert!(matches!(h.cons.sm.role(), Role::Follower), "harness boots a follower");
+
+        // Drive to leader of term 3: election timeout, then a majority vote
+        // (self + peer 0, out of voters [0,1,2]).
+        h.cons.feed(Event::Tick { now_ns: 301 });
+        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+        assert!(matches!(h.cons.sm.role(), Role::Leader), "majority vote elects");
+        assert!(!h.cons.halt_removed);
+
+        // Crash-handoff shape: a `DemoteVoter{1}` a prior (now-dead) leader
+        // proposed and replicated, durably recorded, now observed from the
+        // log by this node — which is ITSELF the target, and is now leader.
+        let mut demoted = h.cons.sm.config().clone();
+        let self_addr = demoted
+            .voters
+            .iter()
+            .find(|(id, _)| *id == 1)
+            .map(|(_, addr)| *addr)
+            .expect("self is a genesis voter");
+        demoted.voters.retain(|(id, _)| *id != 1);
+        demoted.learners.push((1, self_addr));
+        demoted.version += 1;
+        h.cons.feed(Event::ConfigObserved { position: 40, config: demoted });
+
+        // The wedge, exactly as the finding describes: still Leader, self
+        // demoted out of the voting set, not tombstoned, and no fail-stop.
+        assert!(
+            matches!(h.cons.sm.role(), Role::Leader),
+            "adopting a config from the log does not itself change role"
+        );
+        assert!(!h.cons.sm.config().is_voter(1), "self was demoted to a learner");
+        assert!(
+            !h.cons.sm.config().tombstones.contains(&1),
+            "a demote (unlike a remove) never tombstones"
+        );
+        assert!(!h.cons.halt_removed, "the wedge is silent: no halt/step-down fires");
     }
 
     // ---- post-M7 follow-up (Task 10 fix): fiat install clears the pending mirror ----

@@ -836,11 +836,26 @@ impl ElectionSm {
         if matches!(op, ConfigOp::DemoteVoter { id } if id == self.id) {
             // A leader demoting ITSELF would lead-as-learner forever:
             // `StepDownRemoved` covers only self-REMOVAL (rank_leader's
-            // commit-crossing check), and nothing else ever demotes a
-            // serving leader. Refuse; the operator recourse is
+            // commit-crossing check). Refuse; the operator recourse is
             // RemoveVoter{self} (the proven step-down path) plus a
             // fresh-id learner rejoin. `ClusterConfig::apply` stays
             // id-blind — this is the only validation site that knows self.
+            //
+            // This closes the PROPOSE-time door only — it is not the full
+            // story. A DIFFERENT leader may legally propose `DemoteVoter{B}`
+            // (id != that leader's self), replicate the CONFIG frame to B,
+            // and crash before it commits; if B then wins the election, B's
+            // own archive scan re-observes and adopts that frame from the
+            // log while `Role::Leader` — the exact shape this guard exists
+            // to prevent, reached by a path this guard cannot see (B never
+            // called `propose_config` for it). `adopt_config` has no
+            // tombstone to key off (a demote never tombstones) so no
+            // halt/step-down follows; the node keeps serving as leader but
+            // can never vote again. Safety holds, the wedge is silent.
+            // `uc2_node`'s `Action::ConfigAdopted` exec arm carries a loud
+            // node-side warning for this case; a mechanical fix (a commit-
+            // triggered self-step-down mirroring `StepDownRemoved`) is a
+            // deferred, post-merge ticket.
             return Err(ProposeError::SelfDemote);
         }
         if let ConfigOp::PromoteLearner { id } = op {
