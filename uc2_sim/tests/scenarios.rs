@@ -12,6 +12,7 @@
 //! contract) is built out. See `DataPlane` for the two-mode contract.
 
 use uc2_consensus::config::{ConfigOp, ProposeError};
+use uc2_sim::invariants::InvariantViolation;
 use uc2_sim::world::{DataPlane, SimConfig, World};
 
 fn base_cfg(seed: u64) -> SimConfig {
@@ -143,7 +144,10 @@ fn raw_m3_data_plane_phantom_commit_is_caught() {
     // uncommitted term-1 divergent tail while the other two carry on.
     w.partition(x, a);
     w.partition(x, b);
-    w.run_until(|w| w.current_leader().is_some_and(|l| l != x)).expect("setup: new leader elects");
+    assert!(
+        w.run_until(|w| w.current_leader().is_some_and(|l| l != x)).unwrap(),
+        "setup: new leader elects timed out"
+    );
     let l = w.current_leader().unwrap(); // the new higher-term leader L
     let g = if l == a { b } else { a }; // the third node = lagging follower G
     w.run_steps(300).expect("setup: L commits with G past the old prefix");
@@ -201,14 +205,20 @@ fn raw_m3_wrong_base_term_stamp_is_caught() {
     let (a, b) = (others[0], others[1]);
     w.partition(x, a);
     w.partition(x, b);
-    w.run_until(|w| w.current_leader().is_some_and(|l| l != x)).expect("setup: new leader");
+    assert!(
+        w.run_until(|w| w.current_leader().is_some_and(|l| l != x)).unwrap(),
+        "setup: new leader timed out"
+    );
     let l = w.current_leader().unwrap();
     w.run_steps(150).expect("setup: X grows a modest divergent tail");
     // Freeze X's divergent append (crash), so the genuine majority can commit PAST
     // it (an isolated live leader would keep pace and outrun the commit).
     w.crash(x);
     let d = w.node_append(x); // frozen divergence point (append == durable)
-    w.run_until(|w| w.max_commit() > d + 500).expect("setup: genuine commit runs past X");
+    assert!(
+        w.run_until(|w| w.max_commit() > d + 500).unwrap(),
+        "setup: genuine commit runs past X timed out"
+    );
     assert!(w.max_commit() > d, "setup: majority must commit past X's divergence point");
     w.restart(x).expect("setup: X returns as a follower at its frozen durable");
     // Inject the current-term(2) segment at X's own append. RawM3 accepts on
@@ -240,8 +250,10 @@ fn idle_cluster_reconciles_divergent_node_via_gossip_floor() {
     // Isolate the term-1 leader: it keeps appending an uncommitted divergent
     // tail while the majority elects a higher-term leader and commits past it.
     w.partition_node(old);
-    w.run_until(|w| w.current_leader().is_some_and(|l| l != old))
-        .expect("setup: new higher-term leader elects");
+    assert!(
+        w.run_until(|w| w.current_leader().is_some_and(|l| l != old)).unwrap(),
+        "setup: new higher-term leader elects timed out"
+    );
     w.run_steps(500).expect("setup: majority commits past the old prefix");
     let divergent_append = w.node_append(old);
     assert!(divergent_append > 0, "setup: old leader must hold a divergent tail");
@@ -256,7 +268,10 @@ fn idle_cluster_reconciles_divergent_node_via_gossip_floor() {
     // Heal the divergent node into the now-idle cluster. With NO new submissions,
     // it must STILL reconcile — the floor-shipped term map is the only trigger.
     w.heal();
-    w.run_until(|w| w.truncations() >= 1).expect("idle reconciliation must run to completion");
+    assert!(
+        w.run_until(|w| w.truncations() >= 1).unwrap(),
+        "idle reconciliation must run to completion (timed out)"
+    );
     assert!(
         w.truncations() >= 1,
         "divergent node failed to reconcile into an idle cluster (gossip floor did not re-ship the map)"
@@ -499,7 +514,7 @@ fn add_promote_demote_remove_cycle_under_faults() {
     // add-learner (a fresh id joins as learner; id 7 has no process behind it —
     // the config pipeline neither knows nor cares).
     assert_eq!(propose_ok(&mut w, ConfigOp::AddLearner { id: 7, addr: (7, 1) }), 1);
-    w.run_until(|w| all_live_at_version(w, 5, 1)).expect("v1 adopted everywhere");
+    assert!(w.run_until(|w| all_live_at_version(w, 5, 1)).unwrap(), "v1 adopted everywhere timed out");
 
     // Fault between steps: crash a follower (auto-restarts).
     let l = w.current_leader().unwrap();
@@ -509,7 +524,7 @@ fn add_promote_demote_remove_cycle_under_faults() {
 
     // promote the caught-up learner 4 -> voter (quorum grows to 5).
     assert_eq!(propose_ok(&mut w, ConfigOp::PromoteLearner { id: 4 }), 2);
-    w.run_until(|w| all_live_at_version(w, 5, 2)).expect("v2 adopted everywhere");
+    assert!(w.run_until(|w| all_live_at_version(w, 5, 2)).unwrap(), "v2 adopted everywhere timed out");
 
     // Fault between steps: partition a follower pair, then heal.
     let l = w.current_leader().unwrap();
@@ -523,22 +538,25 @@ fn add_promote_demote_remove_cycle_under_faults() {
 
     // demote 4 back to learner.
     assert_eq!(propose_ok(&mut w, ConfigOp::DemoteVoter { id: 4 }), 3);
-    w.run_until(|w| all_live_at_version(w, 5, 3)).expect("v3 adopted everywhere");
+    assert!(w.run_until(|w| all_live_at_version(w, 5, 3)).unwrap(), "v3 adopted everywhere timed out");
 
     // remove-learner 4: on adopting the config that drops it, 4 fail-stops.
     assert_eq!(propose_ok(&mut w, ConfigOp::RemoveLearner { id: 4 }), 4);
-    w.run_until(|w| w.halted_removed(4)).expect("4 adopts its own removal");
+    assert!(w.run_until(|w| w.halted_removed(4)).unwrap(), "4 adopts its own removal (timed out)");
     assert!(w.halted_removed(4), "the removed learner must halt");
 
     // remove-voter: a NON-leader voter; it halts on adoption too.
     let l = w.current_leader().unwrap();
     let t = (0..4).find(|&i| i != l && !w.halted_removed(i)).unwrap();
     assert_eq!(propose_ok(&mut w, ConfigOp::RemoveVoter { id: t as u32 }), 5);
-    w.run_until(|w| w.halted_removed(t)).expect("t adopts its own removal");
+    assert!(w.run_until(|w| w.halted_removed(t)).unwrap(), "t adopts its own removal (timed out)");
     assert!(w.halted_removed(t), "the removed voter must halt");
 
     // The survivors converge on v5 and keep committing.
-    w.run_until(|w| all_live_at_version(w, 5, 5)).expect("v5 adopted on survivors");
+    assert!(
+        w.run_until(|w| all_live_at_version(w, 5, 5)).unwrap(),
+        "v5 adopted on survivors timed out"
+    );
     let c = w.max_commit();
     w.run_steps(2_000).expect("the shrunken cluster keeps serving");
     assert!(w.max_commit() > c, "commit must still advance under the final config");
@@ -586,19 +604,24 @@ fn second_learner_admitted_after_prior_config_history_converges() {
     // over nodes {0,1,2,3} only (`all_live_at_version(w, 4, ..)`): node 4
     // legitimately stays at config_version 0 until v3 ever reaches it, so
     // including it in the "all nodes at v1" predicate would make it
-    // unsatisfiable and silently exhaust `run_until`'s step budget
-    // (`run_until` returns `Ok(())` on timeout too, not just on success —
-    // hence the explicit follow-up assert rather than trusting the
-    // `.expect` message alone).
+    // unsatisfiable. The `assert!` on `run_until`'s `Ok(bool)` (task-12
+    // ledger x) is now what catches that; the follow-up `all_live_at_version`
+    // assert stays as a stronger, more specific message on failure.
     assert_eq!(propose_ok(&mut w, ConfigOp::AddLearner { id: 3, addr: (3, 1) }), 1);
-    w.run_until(|w| all_live_at_version(w, 4, 1)).expect("invariants while converging on v1");
+    assert!(
+        w.run_until(|w| all_live_at_version(w, 4, 1)).unwrap(),
+        "invariants while converging on v1 timed out"
+    );
     assert!(all_live_at_version(&w, 4, 1), "v1 must actually converge on nodes 0-3");
     assert!(!w.halted_removed(3), "node 3's own admission must not halt it");
     assert!(!w.halted_removed(4), "node 4 (still genesis-absent) must not be affected by v1");
 
     // v2: promote node 3 to voter.
     assert_eq!(propose_ok(&mut w, ConfigOp::PromoteLearner { id: 3 }), 2);
-    w.run_until(|w| all_live_at_version(w, 4, 2)).expect("invariants while converging on v2");
+    assert!(
+        w.run_until(|w| all_live_at_version(w, 4, 2)).unwrap(),
+        "invariants while converging on v2 timed out"
+    );
     assert!(all_live_at_version(&w, 4, 2), "v2 must actually converge on nodes 0-3");
     assert!(!w.halted_removed(3));
     assert!(!w.halted_removed(4), "node 4 must still be unaffected before its own admission");
@@ -610,7 +633,10 @@ fn second_learner_admitted_after_prior_config_history_converges() {
     // wrongly halt node 4 while it replays v1/v2, and it would never reach
     // v3 at all. Node 4 is now part of the relevant set.
     assert_eq!(propose_ok(&mut w, ConfigOp::AddLearner { id: 4, addr: (4, 1) }), 3);
-    w.run_until(|w| all_live_at_version(w, 5, 3)).expect("invariants while converging on v3");
+    assert!(
+        w.run_until(|w| all_live_at_version(w, 5, 3)).unwrap(),
+        "invariants while converging on v3 timed out"
+    );
     assert!(
         !w.halted_removed(4),
         "node 4 must not halt while replaying pre-admission config history (v1/v2)"
@@ -622,7 +648,10 @@ fn second_learner_admitted_after_prior_config_history_converges() {
     // admission (not just limping along at v3 with a dead latch waiting to
     // fire on the next higher-term event).
     assert_eq!(propose_ok(&mut w, ConfigOp::PromoteLearner { id: 4 }), 4);
-    w.run_until(|w| all_live_at_version(w, 5, 4)).expect("invariants while converging on v4");
+    assert!(
+        w.run_until(|w| all_live_at_version(w, 5, 4)).unwrap(),
+        "invariants while converging on v4 timed out"
+    );
     assert!(all_live_at_version(&w, 5, 4), "v4 must actually converge on all 5 nodes");
     assert!(!w.halted_removed(4), "node 4 must not halt on its own promotion either");
 
@@ -676,8 +705,10 @@ fn leader_self_removal_steps_down_after_commit_and_c_new_elects() {
     assert!(w.node_is_serving_leader(l1), "leader keeps serving pre-commit");
 
     // Once the removal entry itself commits, the leader steps down.
-    w.run_until(|w| w.halted_removed(l1))
-        .expect("leader steps down once its own removal commits");
+    assert!(
+        w.run_until(|w| w.halted_removed(l1)).unwrap(),
+        "leader steps down once its own removal commits (timed out)"
+    );
     assert!(
         !w.node_is_raw_leader(l1),
         "the stepped-down leader must no longer be a live raw leader"
@@ -711,10 +742,13 @@ fn truncation_below_config_frame_reverts() {
     let p1 = w.node_append(l1); // the frame's END position
     // Its own archive makes the frame durable (adopt-at-append settles into
     // adopt-at-durable) while the majority elects a higher term without it.
-    w.run_until(|w| {
-        w.node_durable(l1) >= p1 && (0..3).any(|i| i != l1 && w.node_is_serving_leader(i))
-    })
-    .expect("frame durable on L1; new leader elected without it");
+    assert!(
+        w.run_until(|w| {
+            w.node_durable(l1) >= p1 && (0..3).any(|i| i != l1 && w.node_is_serving_leader(i))
+        })
+        .unwrap(),
+        "frame durable on L1; new leader elected without it (timed out)"
+    );
     assert_eq!(w.node_config_version(l1), 1, "isolated ex-leader adopted its own frame");
     let l2 = (0..3).find(|&i| i != l1 && w.node_is_serving_leader(i)).unwrap();
     w.run_steps(400).expect("majority commits past the old prefix under v0");
@@ -723,7 +757,10 @@ fn truncation_below_config_frame_reverts() {
     // Heal: reconciliation truncates L1's divergent tail (strictly below the
     // frame end) -> the SM reverts to v0 and the durable record follows.
     w.heal();
-    w.run_until(|w| w.truncations() >= 1).expect("the divergent tail truncates");
+    assert!(
+        w.run_until(|w| w.truncations() >= 1).unwrap(),
+        "the divergent tail truncates (timed out)"
+    );
     w.run_steps(200).expect("the ack lands and the revert settles");
     assert_eq!(
         w.node_config_version(l1),
@@ -736,7 +773,10 @@ fn truncation_below_config_frame_reverts() {
     // content — the ledger's content-identity check keeps them apart).
     let l2 = (0..3).find(|&i| w.node_is_serving_leader(i)).unwrap();
     assert_eq!(w.propose_config(l2, ConfigOp::AddLearner { id: 8, addr: (8, 1) }), Ok(1));
-    w.run_until(|w| w.node_config_version(l1) == 1).expect("L1 re-adopts from the new stream");
+    assert!(
+        w.run_until(|w| w.node_config_version(l1) == 1).unwrap(),
+        "L1 re-adopts from the new stream (timed out)"
+    );
     w.run_steps(500).expect("green steady state");
 }
 
@@ -757,10 +797,13 @@ fn counterfactual_no_revert_breaks_inv8() {
     w.partition_node(l1);
     assert_eq!(w.propose_config(l1, ConfigOp::AddLearner { id: 9, addr: (9, 1) }), Ok(1));
     let p1 = w.node_append(l1);
-    w.run_until(|w| {
-        w.node_durable(l1) >= p1 && (0..3).any(|i| i != l1 && w.node_is_serving_leader(i))
-    })
-    .expect("frame durable on L1; new leader elected without it");
+    assert!(
+        w.run_until(|w| {
+            w.node_durable(l1) >= p1 && (0..3).any(|i| i != l1 && w.node_is_serving_leader(i))
+        })
+        .unwrap(),
+        "frame durable on L1; new leader elected without it (timed out)"
+    );
     w.run_steps(400).expect("majority commits past the old prefix");
     w.heal();
     let v = w
@@ -819,8 +862,10 @@ fn counterfactual_no_serving_gate_produces_disjoint_quorum_commit() {
     }
     assert!(accepted, "L1 must accept the promote");
     let p1 = w.node_append(l1);
-    w.run_until(|w| w.node_durable(l1) >= p1 && w.node_config_version(4) == 1)
-        .expect("C1 durable on L1 and adopted by 4");
+    assert!(
+        w.run_until(|w| w.node_durable(l1) >= p1 && w.node_config_version(4) == 1).unwrap(),
+        "C1 durable on L1 and adopted by 4 (timed out)"
+    );
     // Phase 2: L1 crashes right after proposing; 4 goes dark holding C1.
     w.crash(l1);
     w.partition_node(4);
@@ -828,8 +873,10 @@ fn counterfactual_no_serving_gate_produces_disjoint_quorum_commit() {
     // proposes RemoveVoter{L1} immediately — its NewTerm can NEVER commit
     // under C_old (L1 down + c dark = at most 2 of quorum 3), so with the
     // gate this proposal would be refused forever.
-    w.run_until(|w| (0..4).any(|i| i != l1 && w.node_is_raw_leader(i)))
-        .expect("a new raw leader");
+    assert!(
+        w.run_until(|w| (0..4).any(|i| i != l1 && w.node_is_raw_leader(i))).unwrap(),
+        "a new raw leader (timed out)"
+    );
     let l2 = (0..4).find(|&i| i != l1 && w.node_is_raw_leader(i)).unwrap();
     let c = other_voters.iter().copied().find(|&v| v != l2).unwrap();
     let b = other_voters.iter().copied().find(|&v| v != l2 && v != c).unwrap();
@@ -841,8 +888,10 @@ fn counterfactual_no_serving_gate_produces_disjoint_quorum_commit() {
     );
     let p2 = w.node_append(l2);
     // C1' commits on {L2, b} — a quorum of C1'(3) but NOT of C_old(4).
-    w.run_until(|w| w.node_config_version(b) == 1 && w.max_commit() >= p2)
-        .expect("C1' commits under its own shrunken quorum");
+    assert!(
+        w.run_until(|w| w.node_config_version(b) == 1 && w.max_commit() >= p2).unwrap(),
+        "C1' commits under its own shrunken quorum (timed out)"
+    );
     // Phase 4: silence the only C1' holders; the C1 side ({L1, 4, c}) heals
     // and elects — a quorum of a config lineage ground truth never committed.
     w.heal();
@@ -973,8 +1022,10 @@ fn serving_gate_refuses_the_premature_proposal() {
     }
     w.crash(l1);
     w.partition_node(4);
-    w.run_until(|w| (0..4).any(|i| i != l1 && w.node_is_raw_leader(i)))
-        .expect("a new raw leader");
+    assert!(
+        w.run_until(|w| (0..4).any(|i| i != l1 && w.node_is_raw_leader(i))).unwrap(),
+        "a new raw leader (timed out)"
+    );
     let l2 = (0..4).find(|&i| i != l1 && w.node_is_raw_leader(i)).unwrap();
     let c = other_voters.iter().copied().find(|&v| v != l2).unwrap();
     w.partition(l2, c);
@@ -987,4 +1038,44 @@ fn serving_gate_refuses_the_premature_proposal() {
     // And the run stays green: the gated world never reaches a disjoint-quorum
     // commit (only a genuinely-serving later leader may accept a change).
     w.run_steps(30_000).expect("gated world stays green");
+}
+
+// ================= Task 12 ledger: run_until timeout signal + parked violation =================
+
+/// Ledger minor (x): `run_until` must distinguish "predicate held" from
+/// "budget exhausted first" — the old `Ok(())` collapsed both into a single
+/// success value, so a scenario whose phase silently timed out could still
+/// read as green.
+#[test]
+fn run_until_reports_timeout_distinctly() {
+    let mut w = World::new(SimConfig { n_nodes: 3, seed: 99, max_steps: 50, ..SimConfig::default() });
+    let held = w.run_until(|_| false).unwrap();
+    assert!(!held, "an unsatisfiable predicate must report Ok(false), not silent success");
+    let held = w.run_until(|_| true).unwrap();
+    assert!(held, "an already-true predicate must report Ok(true)");
+}
+
+/// Ledger minor (g): a violation parked by a scripted self-feed whose
+/// signature cannot return it (`propose_config` at world.rs:1803, taken by
+/// `step_once` at world.rs:662) must not be dropped if the caller's very next
+/// `run`/`run_until*` call never steps because its predicate/budget is
+/// already satisfied on entry. Reached via `test_only_park_violation`
+/// (world.rs) rather than a real inv9 trace: on the shipped SM, no legal
+/// `ConfigOp` sequence produces a self-inconsistent adopted config, so the
+/// only way to exercise the parked-violation state deterministically and
+/// cheaply is to park one directly — the real self-feed call site
+/// (`propose_config`) is otherwise unreachable-by-design in a healthy run.
+#[test]
+fn parked_violation_surfaces_without_a_step() {
+    let mut w = World::new(SimConfig { n_nodes: 3, seed: 7, max_steps: 50, ..SimConfig::default() });
+    w.test_only_park_violation(InvariantViolation {
+        invariant: "test-parked (task-12 ledger g)",
+        step: 0,
+        seed: 7,
+        detail: "synthetic parked violation".to_string(),
+    });
+    assert!(
+        w.run_until(|_| true).is_err(),
+        "ledger (g): a parked violation must not be dropped when pred is already true"
+    );
 }

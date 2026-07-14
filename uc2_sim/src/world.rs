@@ -594,6 +594,9 @@ impl World {
     /// Run to the step budget (or an empty queue, or the term-map wire cap).
     /// Returns the run [`Stats`], or the first [`InvariantViolation`].
     pub fn run(&mut self) -> Result<Stats, InvariantViolation> {
+        if let Some(v) = self.pending_violation.take() {
+            return Err(v); // ledger minor g: don't drop a parked violation
+        }
         while self.steps < self.cfg.max_steps {
             if self.term_map_cap_reached() {
                 break;
@@ -607,6 +610,9 @@ impl World {
 
     /// Step until a serving leader exists (or the budget runs out).
     pub fn run_until_leader(&mut self) -> Result<(), InvariantViolation> {
+        if let Some(v) = self.pending_violation.take() {
+            return Err(v); // ledger minor g: don't drop a parked violation
+        }
         while self.current_leader().is_none() && self.steps < self.cfg.max_steps {
             if self.term_map_cap_reached() || !self.step_once()? {
                 break;
@@ -615,21 +621,30 @@ impl World {
         Ok(())
     }
 
-    /// Step until `pred` holds (or the budget runs out).
+    /// Step until `pred` holds (or the budget runs out). `Ok(true)` iff the
+    /// predicate held; `Ok(false)` = budget/queue/cap exhausted first
+    /// (ledger minor x: the old `Ok(())` let scenarios silently "pass"
+    /// phases that had timed out).
     pub fn run_until(
         &mut self,
         mut pred: impl FnMut(&World) -> bool,
-    ) -> Result<(), InvariantViolation> {
+    ) -> Result<bool, InvariantViolation> {
+        if let Some(v) = self.pending_violation.take() {
+            return Err(v); // ledger minor g: don't drop a parked violation
+        }
         while !pred(self) && self.steps < self.cfg.max_steps {
             if self.term_map_cap_reached() || !self.step_once()? {
                 break;
             }
         }
-        Ok(())
+        Ok(pred(self))
     }
 
     /// Step at most `k` events (bounded also by the global budget).
     pub fn run_steps(&mut self, k: u64) -> Result<(), InvariantViolation> {
+        if let Some(v) = self.pending_violation.take() {
+            return Err(v); // ledger minor g: don't drop a parked violation
+        }
         let target = self.steps.saturating_add(k);
         while self.steps < target && self.steps < self.cfg.max_steps {
             if self.term_map_cap_reached() || !self.step_once()? {
@@ -637,6 +652,19 @@ impl World {
             }
         }
         Ok(())
+    }
+
+    /// TEST-ONLY: park a violation exactly as the `propose_config` self-feed
+    /// does at world.rs:1803 (a violation raised inside a scripted call whose
+    /// signature cannot return it), without needing to stage a real
+    /// inv9-triggering config trace. Used to prove ledger minor (g) — a
+    /// parked violation must not be silently dropped by a `run`/`run_until*`
+    /// call whose predicate/budget is already satisfied on entry — against
+    /// the exact code path the entry checks guard, without depending on a
+    /// scenario that only an actual SM bug would ever produce.
+    #[doc(hidden)]
+    pub fn test_only_park_violation(&mut self, v: InvariantViolation) {
+        self.pending_violation = Some(v);
     }
 
     /// Pop and process one event, then run the post-event invariant sweep.
