@@ -106,6 +106,23 @@ const _: () = assert!(
     "peer-slot band overruns the cnc page"
 );
 
+/// M7 — adopted cluster-config version. Writer: consensus agent.
+pub const CNC_OFF_CONFIG_VERSION: usize = 3456;
+/// M7 — 1 while a config change is uncommitted (pending), else 0.
+/// Writer: consensus agent.
+pub const CNC_OFF_CONFIG_PENDING: usize = 3520;
+/// M7 — admin REQUEST line (writer: uc2ctl, same-host). seq u64 @+0 is the
+/// commit word — the admin writes the fields, then seq, with release; the
+/// consensus agent acts on seq > last-seen. Fields: nonce u64 @+8, op u32
+/// @+16, id u32 @+20, ip u32 @+24, port u32 @+28.
+pub const CNC_OFF_ADMIN_REQ: usize = 3584;
+/// M7 — admin RESPONSE line (writer: consensus agent). seq u64 @+0 echoes the
+/// request seq (written LAST, release); status u32 @+8, reason u32 @+12,
+/// version u64 @+16.
+pub const CNC_OFF_ADMIN_RESP: usize = 3648;
+
+const _: () = assert!(CNC_OFF_ADMIN_RESP + 64 <= CNC_PAGE_LEN);
+
 pub const NODE_FLAG_LEADER: u64 = 1;
 pub const NODE_FLAG_CAN_SERVE: u64 = 2;
 
@@ -393,5 +410,10 @@ mod tests {
         // The band ends at 3456, inside the 4096-byte page (the `<= CNC_PAGE_LEN`
         // bound is const-asserted at module scope).
         assert_eq!(CNC_OFF_PEER_SLOTS + CNC_MAX_PEER_SLOTS * CNC_PEER_SLOT_STRIDE, 3456);
+        // M7: config band.
+        assert_eq!(CNC_OFF_CONFIG_VERSION, 3456);
+        assert_eq!(CNC_OFF_CONFIG_PENDING, 3520);
+        assert_eq!(CNC_OFF_ADMIN_REQ, 3584);
+        assert_eq!(CNC_OFF_ADMIN_RESP, 3648);
     }
 }

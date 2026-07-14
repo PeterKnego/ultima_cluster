@@ -5,19 +5,20 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Instant, SystemTime};
 
-use uc2_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId};
+use uc2_consensus::config::{Addr, ClusterConfig, ConfigOp};
+use uc2_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId, Role};
 use uc2_log::agent::{AgentRunner, IdleStrategy};
 use uc2_log::archive::{Archive, ArchiveConfig};
 use uc2_log::buffer::{AppendError, Appender, LogBuffer};
-use uc2_log::cnc::{CncMeta, CncPage};
+use uc2_log::cnc::{AdminReq, AdminResp, CncMeta, CncPage};
 use uc2_log::counters::LogCounters;
-use uc2_log::state::{NodeState, TermMap, TermMapEntry, VoteRecord};
+use uc2_log::state::{ConfigRecord, NodeState, StoredConfig, StoredMember, TermMap, TermMapEntry, VoteRecord};
 use uc2_net::TermHandle;
 use uc2_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc2_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent};
@@ -29,6 +30,8 @@ use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE,
     NODE_FLAG_LEADER,
 };
+use uc_protocol::v2::config::{WireConfig, WireMember, decode_config, encode_config};
+use uc_protocol::v2::frame::{FRAME_TYPE_CONFIG, align_frame_len};
 use uc_protocol::v2::ipc::{
     FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_RETRY, MSG_V2_SVC_QUERY, client_from_extra,
     extra_client,
@@ -37,12 +40,14 @@ use uc_protocol::v2::ipc::{
 use crate::ipc::InstanceDir;
 use uc2_log::buffer::FrameRead;
 use uc_protocol::v2::datagram::{
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_READ_PROBE,
-    DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE,
-    DatagramHeader, MAX_TERM_MAP_WIRE_ENTRIES, READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN,
-    ReadProbeBody, RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire,
-    VOTE_BODY_LEN, VoteBody, write_datagram_header, write_read_probe_body, write_request_vote_body,
-    write_term_map_body, write_vote_body,
+    CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_CONFIG_PROPOSAL,
+    DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK,
+    DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
+    MAX_TERM_MAP_WIRE_ENTRIES, READ_PROBE_BODY_LEN, REQUEST_VOTE_BODY_LEN, ReadProbeBody,
+    RequestVoteBody, TERM_MAP_ENTRY_LEN, TERM_MAP_HEADER_LEN, TermMapEntryWire, VOTE_BODY_LEN,
+    VoteBody, write_config_proposal_body, write_config_reply_body, write_datagram_header,
+    write_read_probe_body, write_request_vote_body, write_term_map_body, write_vote_body,
 };
 
 /// Single-slot truncation ack. One truncation is in flight at a time (the SM
@@ -102,17 +107,29 @@ pub enum PurgePolicy {
     },
 }
 
-/// Static-membership node configuration (M4: no discovery, no reconfiguration).
+/// Static-membership node configuration (M4: no discovery; M7 adds live
+/// reconfiguration on top — see `members`/`learners` below).
 pub struct NodeConfig {
     pub id: NodeId,
     /// Every VOTING member INCLUDING self (if this node is a voter), as
     /// `(id, addr)`. Learners are NOT listed here.
+    ///
+    /// M7: this is the SEED config — authoritative only for a FRESH instance
+    /// directory (no durable `ConfigRecord` yet). Once a node has booted once,
+    /// the durable `ConfigRecord` (`uc2_log::state::NodeState::config_record`)
+    /// plus the `FRAME_TYPE_CONFIG` stream own the cluster's actual membership;
+    /// this field is then ignored (a restart with a stale/edited `members` list
+    /// has no effect). A cluster that never appends a config frame behaves
+    /// exactly as before M7 — the genesis record IS this seed, verbatim.
     pub members: Vec<(NodeId, SocketAddr)>,
     /// M6 Task 7: learner peers, as `(id, addr)`. Default empty. A learner is
     /// replicated-to (fan-out) but never counted (no vote, no quorum slot, no
     /// flow-control window, no read-quorum ack). If this node's OWN id is in
     /// `learners` it boots in learner mode (candidacy disabled). Learner ids must
     /// be disjoint from `members`.
+    ///
+    /// M7: the SEED, exactly like `members` above (same fresh-instance-dir-only
+    /// caveat).
     pub learners: Vec<(NodeId, SocketAddr)>,
     pub bind: SocketAddr,
     /// The node's on-disk instance directory (flock'd; holds cnc page, log
@@ -266,6 +283,12 @@ pub struct Node {
     /// rather than prefilling its ring).
     sender_stats: Arc<uc2_net::sender::SenderStats>,
     partition_handles: Vec<PartitionHandle>,
+    /// Final-review fix (Item 1 test): a clone of the SAME `Arc<Mutex<Vec<u8>>>`
+    /// the consensus agent's `config_bytes` field and the sender's
+    /// `SnapshotSource` closure read — i.e. observing this from a test is
+    /// observing exactly what a SNAP_BEGIN this node ships would carry, not a
+    /// proxy for it. Exposed via [`Node::snapshot_config_bytes`].
+    config_bytes: Arc<Mutex<Vec<u8>>>,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
     _instance: InstanceDir,
     _rings: Rings,
@@ -387,21 +410,52 @@ impl Node {
         // sole owner of the consumer/producer half it drives (Task 7).
         let (rings, ingress_ring, egress_node, query_ring, svc_query) = create_rings(&instance)?;
 
-        // Election SM over the recovered credentials.
-        let members_ids: Vec<NodeId> = cfg.members.iter().map(|(id, _)| *id).collect();
-        // M6 Task 7: a node whose own id is in `learners` boots in learner mode —
-        // replicated-to, never counted. By construction its id is NOT in `members`.
-        let is_learner = cfg.learners.iter().any(|(id, _)| *id == cfg.id);
+        // M7 (spec 2026-07-13): recover the durable `ConfigRecord` — genesis-seed
+        // on a fresh instance dir, T5-carry revert of a record ahead of durable,
+        // and Step 3a forward re-derivation from the archive's own retained
+        // CONFIG frames. See `recover_config_record`'s doc for the full rationale;
+        // extracted to a free function so it's unit-testable without a full
+        // two-thread `Node`.
+        let config_rec =
+            recover_config_record(&state, &archive, durable, &cfg.members, &cfg.learners)
+                .map_err(to_io)?;
+
+        let config = stored_to_cluster(&config_rec.config);
+        let prev_config = stored_to_cluster(&config_rec.prev);
+        // M7 Task 6: mirror the recovered version onto the FRESH cnc page
+        // immediately — same durable-then-mirror discipline as the snapshot
+        // floor / output-progress markers just above (`cnc` is re-created on
+        // every boot, so without this an attaching reader sees a stale `0` for
+        // an entire duty cycle even when the recovered record is not genesis).
+        cnc.store_config_version(config.version);
+
+        // M7 Task 6: the snapshot-session config-carry cache — the encoded
+        // CURRENT `ConfigRecord.config` (`v2::config::encode_config` bytes), read
+        // by the sender's `SnapshotSource` closure at ship time and refreshed by
+        // `Action::ConfigAdopted`'s exec arm on every adoption (forward, revert,
+        // or boot re-derivation alike). Seeded here from the just-recovered
+        // record so a snapshot shipped before the first live adoption still
+        // carries real bytes rather than an empty placeholder.
+        let config_bytes =
+            Arc::new(Mutex::new(config_wire_bytes(&config, config_rec.prev_position)));
+
+        // Election SM over the recovered credentials + the recovered config.
+        // M6 Task 7 / M7: a node whose own id is a learner in the ADOPTED
+        // config boots in learner mode — replicated-to, never counted.
+        // `ElectionSm` derives `can_vote` from `config.is_voter(id)` itself now
+        // (M7 migration off the old `members`/`can_vote` `ElectionConfig` fields).
+        let is_learner = config.is_learner(cfg.id);
         assert!(
-            !is_learner || !members_ids.contains(&cfg.id),
+            !is_learner || !config.is_voter(cfg.id),
             "a learner's id must not also be a voting member (id={})",
             cfg.id
         );
         let recovered_vote = state.vote().map(|v| (v.term, v.voted_for));
-        let sm = ElectionSm::new(
+        let mut sm = ElectionSm::new(
             ElectionConfig {
                 id: cfg.id,
-                members: members_ids.clone(),
+                config: config.clone(),
+                config_position: config_rec.position,
                 election_timeout_min_ns: cfg.election_timeout_min_ns,
                 election_timeout_max_ns: cfg.election_timeout_max_ns,
                 // Idle re-gossip floor (spec §6): re-ship commit + term map every
@@ -410,13 +464,16 @@ impl Node {
                 // knob — the value is a protocol constant, not deployment-tuned.
                 gossip_floor_ns: 100_000_000,
                 seed: cfg.seed,
-                can_vote: !is_learner,
             },
             recovered_vote,
             &rederived,
             durable,
             0,
         );
+        // Seed the recovered PREV level (T4/T5): a no-op identity restore at
+        // genesis (`prev == config`, both at position 0) — real content only
+        // when a prior life actually adopted a config.
+        sm.restore_prev_config(prev_config, config_rec.prev_position);
         let boot_term = sm.current_term();
 
         // Shared, consensus-thread-written role snapshots + the term handle.
@@ -428,22 +485,12 @@ impl Node {
         let wipes = Arc::new(AtomicU64::new(0));
         let reports_implausible = Arc::new(AtomicU64::new(0));
 
-        // Peer maps and the follower set. Both voters AND learners go into the
-        // address maps (a leader routes gossip/term-map to learners too, and every
-        // node maps inbound learner datagrams for demux), but only VOTERS are in
-        // `peers` — the set that paces quorum, is solicited for votes, and is
-        // targeted by READ_PROBE.
-        let mut id_to_addr = HashMap::new();
-        let mut addr_to_id = HashMap::new();
-        for (id, addr) in cfg.members.iter().chain(cfg.learners.iter()) {
-            id_to_addr.insert(*id, *addr);
-            addr_to_id.insert(*addr, *id);
-        }
-        let peers: Vec<NodeId> = members_ids.iter().copied().filter(|id| *id != cfg.id).collect();
-        // M6 Task 7: learners this node fans out to (all learners except self, so a
-        // learner never streams to itself).
-        let learner_ids: Vec<NodeId> =
-            cfg.learners.iter().map(|(id, _)| *id).filter(|id| *id != cfg.id).collect();
+        // Peer maps and the follower set, derived from the adopted config —
+        // shared with `Consensus::rebuild_peer_maps` (M7's live-reconfiguration
+        // rebuild) via the free `derive_peer_maps` helper (this call happens
+        // before any `Consensus` exists, so it cannot be a method call yet).
+        let (id_to_addr, addr_to_id, peers, learner_ids, peer_band) =
+            derive_peer_maps(&config, cfg.id);
         let learner_addrs: Vec<SocketAddr> =
             learner_ids.iter().map(|id| id_to_addr[id]).collect();
         // Leader fan-out = voters-minus-self ++ learners-minus-self (streamed
@@ -457,6 +504,11 @@ impl Node {
         let (ctrl_tx, ctrl_rx) = mpsc::sync_channel::<CtrlMsg>(1024);
         let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Vec<u8>>(INGRESS_CAPACITY);
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(1024);
+        // M7: durably-recorded CONFIG-frame observations, `(frame-END position,
+        // payload bytes)` — the archive agent's config scan (`take_config_observations`)
+        // forwards here; the consensus agent decodes + feeds `Event::ConfigObserved`
+        // (do_work step 1c). Same shape/rationale as `obs_tx`/`obs_rx` above.
+        let (cfg_obs_tx, cfg_obs_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(1024);
         // Truncation command channel carries `(epoch, to)`; the ack rides an
         // infallible single slot (one truncation in flight — the SM latch).
         let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
@@ -471,11 +523,17 @@ impl Node {
         // (empty) fan-out with a cluster size of 1, which also sidesteps flow
         // control's leader-in-cluster invariant (from a learner's view every voter
         // is a follower, so `voters == cluster_size` would trip the assert). A
-        // voter's sender gets the real fan-out = voters-minus-self ++ learners.
+        // voter's sender gets the real fan-out = voters-minus-self ++ learners,
+        // sized via `sender_cluster_size` (M7 Task 8) rather than the possibly-
+        // stale seed's `cfg.members.len()` — the RECOVERED `config` is the
+        // authoritative source (a restart after live reconfiguration may have a
+        // materially different voter count than the seed), and using the seed
+        // count would panic `FlowControl::new` for a node that recovers as a
+        // genuine non-voter (a stale-seed joiner not yet in ANY list).
         let (sender_followers, sender_learners, sender_cluster) = if is_learner {
             (Vec::new(), Vec::new(), 1)
         } else {
-            (followers, learner_addrs.clone(), cfg.members.len())
+            (followers, learner_addrs.clone(), sender_cluster_size(&config, cfg.id))
         };
         let mut sender = Sender::with_learners(
             Arc::clone(&buffer),
@@ -495,6 +553,11 @@ impl Node {
         let snap_dir = cfg.instance_dir.join("snapshots");
         let _ = std::fs::create_dir_all(&snap_dir);
         let incoming_snapshot = Arc::new(AtomicU64::new(0));
+        // M7 Task 6: companion cell for `incoming_snapshot` — the encoded config
+        // carried by the SAME completed inbound transfer (`SnapBeginBody.config`),
+        // stashed by the receiver in `snap_complete` and consumed by the
+        // consensus agent's `maybe_adopt_incoming_snapshot`.
+        let incoming_snapshot_config = Arc::new(Mutex::new(Vec::new()));
         // M6 Task 9 (straddle hardening): bumped by the archive agent AFTER each
         // `LogCounters::prime(to)` (truncate / AdoptFloor). The receiver samples it
         // around a DATA datagram to detect a prime that straddled its processing and
@@ -504,6 +567,10 @@ impl Node {
         // fully-published artifact (rename-atomic + validated as the floor marker).
         let src_cnc = Arc::clone(&cnc);
         let src_dir = snap_dir.clone();
+        // M7 Task 6: the same cell `Action::ConfigAdopted`'s exec arm refreshes —
+        // ships whatever config is CURRENT at the moment a peer's NAK opens a
+        // session, never a boot-time snapshot of it.
+        let src_config_bytes = Arc::clone(&config_bytes);
         sender.set_snapshot_source(Arc::new(move || {
             let floor = src_cnc.snapshots().node_snapshot_floor.load_acquire();
             if floor == 0 {
@@ -511,19 +578,15 @@ impl Node {
             }
             let path = src_dir.join(format!("snap-{floor}.ultsnap"));
             let len = std::fs::metadata(&path).ok()?.len();
-            Some((floor, path, len))
+            let config = src_config_bytes.lock().unwrap().clone();
+            Some((floor, path, len, config))
         }));
 
         // M6 Task 9: the per-peer observability band, cnc-slot order (voters
-        // first, then learners), capped at the fixed slot count. The consensus
-        // agent owns `id_and_role` + `reported_durable`; the sender fills
+        // first, then learners), capped at the fixed slot count — already
+        // derived above (`derive_peer_maps`). The consensus agent owns
+        // `id_and_role` + `reported_durable`; the sender fills
         // `advertised_limit` from its flow-control view (bounded, once per cycle).
-        let peer_band: Vec<(NodeId, u8)> = peers
-            .iter()
-            .map(|id| (*id, CNC_PEER_ROLE_VOTER))
-            .chain(learner_ids.iter().map(|id| (*id, CNC_PEER_ROLE_LEARNER)))
-            .take(CNC_MAX_PEER_SLOTS)
-            .collect();
         let sender_peer_slots: Vec<(SocketAddr, usize)> =
             peer_band.iter().enumerate().map(|(i, (id, _))| (id_to_addr[id], i)).collect();
         sender.set_peer_slots(Arc::clone(&cnc), sender_peer_slots);
@@ -540,9 +603,14 @@ impl Node {
             Arc::clone(&term_handle),
             net_tx,
         );
-        receiver.set_sender_route(ctrl_tx);
+        // Cloned: the consensus agent keeps its own producer half to drive
+        // `CtrlMsg::SetPeers` (M7 config adoption, `Consensus::exec`).
+        receiver.set_sender_route(ctrl_tx.clone());
         receiver.set_intake_gate(Arc::clone(&intake_gate));
-        receiver.set_snapshot_intake(snap_dir.clone(), Some(Arc::clone(&incoming_snapshot)));
+        receiver.set_snapshot_intake(
+            snap_dir.clone(),
+            Some((Arc::clone(&incoming_snapshot), Arc::clone(&incoming_snapshot_config))),
+        );
         receiver.set_prime_generation(Arc::clone(&prime_generation));
         let route_drops = receiver.stats();
 
@@ -619,6 +687,13 @@ impl Node {
                 let _ = obs_tx.try_send(obs);
                 did = true;
             }
+            // M7: forward durably-recorded CONFIG-frame observations the same
+            // way (position-ordered, one scan already did both in `do_work`
+            // above via `Archive::observe_terms`).
+            for obs in archive.take_config_observations() {
+                let _ = cfg_obs_tx.try_send(obs);
+                did = true;
+            }
             did
         })?;
 
@@ -656,9 +731,11 @@ impl Node {
             peer_band_published: false,
             net_rx,
             obs_rx,
+            cfg_obs_rx,
             ingress_rx,
             trunc_tx,
             trunc_slot,
+            sender_ctrl: ctrl_tx,
             term_handle: Arc::clone(&term_handle),
             leader_flag: Arc::clone(&leader_flag),
             can_serve_flag: Arc::clone(&can_serve_flag),
@@ -678,8 +755,14 @@ impl Node {
             snapshot_persisted_floor: state_snapshot_floor,
             snapshot_floor_last_persist_ns: None,
             incoming_snapshot: Arc::clone(&incoming_snapshot),
+            incoming_snapshot_config: Arc::clone(&incoming_snapshot_config),
             adopted_incoming: 0,
             last_leader_map: Vec::new(),
+            halt_removed: false,
+            config_bytes: Arc::clone(&config_bytes),
+            last_admin_seq: 0,
+            pending_admin_fwd: None,
+            last_config_reply: None,
         };
         let consensus_agent =
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
@@ -699,6 +782,7 @@ impl Node {
             route_drops,
             sender_stats,
             partition_handles,
+            config_bytes: Arc::clone(&config_bytes),
             _instance: instance,
             _rings: rings,
             // Stop order: consensus first (stops writing the term handle), then
@@ -736,6 +820,25 @@ impl Node {
     /// driver runs, this advances to at most the snapshot floor.
     pub fn archive_first_base(&self) -> u64 {
         self.archive_first_base.load(Ordering::Acquire)
+    }
+
+    /// M7 Task 6: the cnc-mirrored `ConfigRecord.config.version` — bumped by
+    /// `Action::ConfigAdopted` (ordinary adoption) AND by the snapshot-install
+    /// fiat path (`maybe_adopt_incoming_snapshot`). Exposed for tests asserting
+    /// a joiner's config converges with the leader's after a snapshot install.
+    pub fn config_version(&self) -> u64 {
+        self.cnc.config_version()
+    }
+
+    /// Final-review fix (Item 1 test): the raw encoded-`ClusterConfig` bytes
+    /// currently cached for the sender's `SnapshotSource` closure — i.e.
+    /// exactly what a SNAP_BEGIN this node ships right now would carry in
+    /// `SnapBeginBody.config`. Exposed for tests asserting the snapshot-fiat
+    /// install path (`maybe_adopt_incoming_snapshot`) refreshed this cache,
+    /// not just the SM/record/cnc-version (which `rebuild_net_for_config`
+    /// alone used to leave stale on that path — see the doc comment there).
+    pub fn snapshot_config_bytes(&self) -> Vec<u8> {
+        self.config_bytes.lock().unwrap().clone()
     }
 
     /// Read the committed message frame at `pos` (which must be a frame
@@ -815,7 +918,8 @@ impl Node {
 
     /// Per-kind consensus-event drop counts, indexed by
     /// [`uc2_net::receiver::NetEvent::kind_idx`] (Report, CommitGossip,
-    /// RequestVote, Vote, TermMap, LeaderActivity, ReadProbe, ReadProbeAck).
+    /// RequestVote, Vote, TermMap, LeaderActivity, ReadProbe, ReadProbeAck,
+    /// ConfigProposal, ConfigReply).
     pub fn net_event_drops_by_kind(&self) -> [u64; uc2_net::receiver::NET_EVENT_KINDS] {
         let mut out = [0u64; uc2_net::receiver::NET_EVENT_KINDS];
         for (o, c) in out.iter_mut().zip(self.route_drops.net_drops.iter()) {
@@ -907,9 +1011,19 @@ struct Consensus {
     peer_band_published: bool,
     net_rx: mpsc::Receiver<NetEvent>,
     obs_rx: mpsc::Receiver<(u32, u64)>,
+    /// M7: durably-recorded CONFIG-frame observations from the archive agent's
+    /// scan, `(frame-END position, payload bytes)` — decoded + fed as
+    /// `Event::ConfigObserved` in `do_work` step 1c.
+    cfg_obs_rx: mpsc::Receiver<(u64, Vec<u8>)>,
     ingress_rx: mpsc::Receiver<Vec<u8>>,
     trunc_tx: mpsc::SyncSender<ArchiveCmd>,
     trunc_slot: TruncationSlot,
+    /// M7: this agent's own producer half of the sender's `CtrlMsg` channel —
+    /// used to send `CtrlMsg::SetPeers` on config adoption (`Action::ConfigAdopted`).
+    /// A clone of the same sender the receiver uses to route NAK/Status/SnapNak/
+    /// SnapDone (`receiver.set_sender_route`); a dropped/full-channel send is
+    /// silently ignored (nothing productive to do about a dead sender thread here).
+    sender_ctrl: mpsc::SyncSender<CtrlMsg>,
     term_handle: TermHandle,
     leader_flag: Arc<AtomicBool>,
     can_serve_flag: Arc<AtomicBool>,
@@ -956,6 +1070,11 @@ struct Consensus {
     /// newest COMPLETE inbound snapshot transfer (0 = none). Sampled each cycle;
     /// on a new value we adopt it as the archive floor + mirror to cnc.
     incoming_snapshot: Arc<AtomicU64>,
+    /// M7 Task 6: companion cell for `incoming_snapshot` — the encoded config
+    /// carried by the SAME completed transfer (`SnapBeginBody.config`), decoded
+    /// and adopted by fiat (`ElectionSm::adopt_snapshot_config`) alongside the
+    /// archive-floor adoption in `maybe_adopt_incoming_snapshot`.
+    incoming_snapshot_config: Arc<Mutex<Vec<u8>>>,
     /// M6 Task 6: last inbound-snapshot position already adopted (shadow, so the
     /// AdoptFloor command + cnc mirror fire once per completed transfer).
     adopted_incoming: u64,
@@ -965,11 +1084,50 @@ struct Consensus {
     /// below-floor joiner's next reconcile finds the common prefix that otherwise
     /// lives hidden inside the snapshot. Empty until the first term-map arrives.
     last_leader_map: Vec<(u32, u64)>,
+    /// M7: latched once this node observes itself removed from the adopted
+    /// config while NOT a leader mid-self-removal (`Action::HaltRemoved`).
+    /// `do_work` checks this FIRST and returns immediately once set — a
+    /// permanent park, never cleared (fail-stop; a removed node's only path
+    /// back in is a fresh join under a new id/config, not un-halting).
+    halt_removed: bool,
+    /// M7 Task 6: the snapshot-session config-carry cache — refreshed with the
+    /// newly-adopted config's encoded bytes on every `Action::ConfigAdopted`;
+    /// read by the sender's `SnapshotSource` closure (a separate `Arc` clone) so
+    /// every SNAP_BEGIN ships whatever config is CURRENT at ship time.
+    config_bytes: Arc<Mutex<Vec<u8>>>,
+    /// M7 Task 7: the last admin-request seq consumed off the cnc admin-req
+    /// slot (`do_work` step 11's seqlock cursor into `read_admin_req`). `0` at
+    /// boot — matches the freshly-zeroed cnc page (recreated every node boot),
+    /// so an admin request from a prior life is never replayed.
+    last_admin_seq: u64,
+    /// M7 Task 7: this (follower) node's own in-flight forwarded proposal —
+    /// `(seq, nonce)` of the admin request we forwarded to the leader as a
+    /// kind-16 `ConfigProposal`. A 1-slot pending map (one admin request in
+    /// flight at a time, per the cnc admin band's own single-slot discipline):
+    /// cleared once the matching-nonce `NetEvent::ConfigReply` (kind 17)
+    /// arrives and its status/reason/version is written back to the response
+    /// line. `None` = no forward outstanding.
+    pending_admin_fwd: Option<(u64, u64)>,
+    /// M7 Task 7: leader-side nonce dedup — the last forwarded proposal's
+    /// `(nonce, reply)` this node (as leader) answered. A repeat nonce (the
+    /// follower's forward retried, or a genuine wire retry) gets the STORED
+    /// reply re-sent rather than re-running `propose_config` a second time —
+    /// idempotent under retry without relying on `ChangePending` to happen to
+    /// refuse the repeat. `None` until the first forwarded proposal is handled.
+    last_config_reply: Option<(u64, ConfigReplyBody)>,
 }
 
 impl Consensus {
     /// One consensus duty cycle (binding order, plan §Task 8).
     fn do_work(&mut self) -> bool {
+        // M7: a removed node fail-stops permanently (`Action::HaltRemoved`) —
+        // checked FIRST, before anything else runs. The halting cycle itself
+        // (the one that set the flag) already ran to completion — including
+        // one last `publish_status` that zeroed LEADER/CAN_SERVE — so this
+        // only ever short-circuits a SUBSEQUENT cycle.
+        if self.halt_removed {
+            return false;
+        }
         let mut did = false;
 
         // 1. Drain the NetEvent channel → SM events.
@@ -990,7 +1148,23 @@ impl Consensus {
             did = true;
         }
 
-        // 1c. Drain the truncation ack slot (a later cycle after emitting
+        // 1c. Drain durably-recorded CONFIG-frame observations (M7): decode +
+        // feed `Event::ConfigObserved`. This is the follower / boot-recovery
+        // half of config adoption — the leader's own append path
+        // (`append_config_frame`) feeds itself directly at append time
+        // (adopt-at-append); this is how everyone else learns once the frame
+        // is durable (and how the leader itself re-confirms, harmlessly —
+        // adoption is idempotent by version). A decode failure is fail-stop:
+        // the archive's block is journal-CRC-covered, so a malformed payload
+        // here is a BUG, never something to shrug off.
+        while let Ok((position, payload)) = self.cfg_obs_rx.try_recv() {
+            let wire = decode_config(&payload)
+                .unwrap_or_else(|| panic!("corrupt CONFIG frame at {position}"));
+            self.feed(Event::ConfigObserved { position, config: wire_to_cluster_config(&wire) });
+            did = true;
+        }
+
+        // 1d. Drain the truncation ack slot (a later cycle after emitting
         // `Truncate`). The infallible single slot holds at most one ack.
         if let Some((epoch, to)) = self.trunc_slot.take() {
             self.on_truncated(epoch, to);
@@ -1035,8 +1209,14 @@ impl Consensus {
         self.feed(Event::Tick { now_ns: now });
 
         // 5. Publish role/serving snapshots for the API (term is written on
-        // transitions; keep can_serve fresh every cycle).
-        self.can_serve_flag.store(self.sm.can_serve(), Ordering::Release);
+        // transitions; keep can_serve fresh every cycle). M7 Task 8: masked
+        // off `halt_removed` exactly like `publish_status`'s cnc mirror below —
+        // otherwise a self-removing LEADER's `StepDownRemoved` halt (`exec`,
+        // above these steps in this SAME cycle) would be silently undone right
+        // here: the SM's own `serving` field is never cleared by step-down (it
+        // has no reason to be), so an unconditional store would re-publish
+        // `true` for `Node::can_serve()` the very cycle it just halted.
+        self.can_serve_flag.store(!self.halt_removed && self.sm.can_serve(), Ordering::Release);
 
         // 6. Publish the node's status onto the shared cnc page for cross-process
         // attachers (service, clients). `term` + `flags` reflect the SM every
@@ -1060,6 +1240,28 @@ impl Consensus {
         // 10. Publish the per-peer observability band + archive floor (M6 Task 9).
         // Bounded: one pass over ≤8 slots per cycle, no per-datagram cnc writes.
         self.publish_peer_band();
+
+        // 11. Admin slot (M7 Task 7): at most one request per cycle. Leader:
+        // propose + append + reply on the response line. Follower: forward to
+        // the leader hint as kind 16 (remembering seq/nonce for the eventual
+        // kind-17 reply); no hint -> reply status=2 (retry). `read_admin_req`'s
+        // seqlock cursor (`last_admin_seq`) makes this idempotent against a
+        // duty cycle that runs before `uc2ctl`'s poll catches the response.
+        if let Some(req) = self.cnc.read_admin_req(self.last_admin_seq) {
+            self.last_admin_seq = req.seq;
+            self.handle_admin(req);
+            did = true;
+        }
+
+        // 12. M7: clear the cnc `config_pending` mirror once commit has crossed
+        // the adopted config's position — the entry is no longer at risk of a
+        // truncation revert. `sm.config_pending()` is the single source of truth
+        // (`config_position > commit_seen`, updated on every commit advance/gossip);
+        // mirrored here rather than re-deriving it from the raw cnc counters.
+        if !self.sm.config_pending() && self.cnc.config_pending() != 0 {
+            self.cnc.store_config_pending(false);
+            did = true;
+        }
         did
     }
 
@@ -1075,6 +1277,22 @@ impl Consensus {
                     .id_and_role
                     .store_release(uc2_log::cnc::pack_id_and_role(*id, *role));
             }
+            // M7 review finding (Task 11 gate authoring): a rebuild that
+            // SHRINKS the peer band (a demote/remove-voter/remove-learner
+            // that drops the total member count) must also zero every
+            // trailing slot beyond the new length — otherwise a stale
+            // `id_and_role` from the PREVIOUS, longer band lingers forever
+            // (this loop previously only ever wrote `0..peer_band.len()`, never
+            // clearing anything beyond it), producing a ghost duplicate entry
+            // for a still-live id at its old index alongside its real, newly
+            // rewritten slot. Diagnostics-only band (never gates correctness —
+            // the real membership/quorum state lives in the SM's own
+            // rebuilt tracker), but `uc2ctl status` and the runbook's
+            // staleness warning read exactly this band, so a stale ghost
+            // slot is a real, user-visible bug.
+            for i in self.peer_band.len()..CNC_MAX_PEER_SLOTS {
+                self.cnc.peer_slot(i).id_and_role.store_release(0);
+            }
             self.peer_band_published = true;
         }
         for (i, (id, _)) in self.peer_band.iter().enumerate() {
@@ -1086,6 +1304,83 @@ impl Consensus {
         // against `node_snapshot_floor` is the "purge caught up to snapshot" check.
         let first_base = self.archive_first_base.load(Ordering::Acquire);
         self.cnc.archive_first_base().store_release(first_base);
+    }
+
+    /// M7: rebuild the node's own peer-address maps + observability band from
+    /// a newly-adopted `ClusterConfig` (`Action::ConfigAdopted` — both a
+    /// forward adoption and the SM's own truncation-revert re-adoption).
+    /// Shares `derive_peer_maps` with `Node::start`'s construction-time
+    /// seeding (the identical derivation, genesis or live) — a cluster that
+    /// never reconfigures gets byte-identical maps either way.
+    fn rebuild_peer_maps(&mut self, config: &ClusterConfig) {
+        let (id_to_addr, addr_to_id, peers, learner_ids, peer_band) =
+            derive_peer_maps(config, self.id);
+        self.id_to_addr = id_to_addr;
+        self.addr_to_id = addr_to_id;
+        self.peers = peers;
+        self.learner_ids = learner_ids;
+        self.peer_band = peer_band;
+        // Re-publish `id_and_role` for the (possibly changed) membership next
+        // cycle; prune reported-durable entries for ids no longer in the band.
+        self.peer_band_published = false;
+        let live: Vec<NodeId> = self.peer_band.iter().map(|(id, _)| *id).collect();
+        self.peer_reported.retain(|id, _| live.contains(id));
+    }
+
+    /// M7 Task 9: rebuild the sender's net layer (`CtrlMsg::SetPeers`) AND this
+    /// node's own routing/observability (`rebuild_peer_maps` +
+    /// `publish_peer_band`) for a newly-adopted `ClusterConfig`. Factored out of
+    /// `Action::ConfigAdopted`'s exec arm so the snapshot-fiat install path in
+    /// `maybe_adopt_incoming_snapshot` shares the IDENTICAL derivation — a
+    /// below-floor joiner's installed config can differ from its boot seed
+    /// (T7 shipped live reconfiguration), so it needs exactly this rebuild too,
+    /// not a second hand-rolled copy that could drift from this one.
+    ///
+    /// Final-review fix: ALSO refreshes the `config_bytes` snapshot-session
+    /// config-carry cache here (`config_wire_bytes(config, prev_position)`) —
+    /// this is now the single site both live callers share, so the
+    /// snapshot-fiat install path (which calls this but never used to touch
+    /// the cache) can no longer leave it stale. `prev_position` is the
+    /// audit-trail field the caller would otherwise pass to `cluster_to_wire`
+    /// itself (the exec arm's adopted `prev_position`; the fiat path's own
+    /// floor position, since a wholesale-replace install sets `prev == config`
+    /// at that same position).
+    fn rebuild_net_for_config(&mut self, config: &ClusterConfig, prev_position: u64) {
+        // Rebuild the net layer: voters-minus-self / learners-minus-self,
+        // DISJOINT sets (`CtrlMsg::SetPeers`'s documented convention —
+        // the sender recombines them for its own fan-out).
+        let followers: Vec<SocketAddr> = config
+            .voters
+            .iter()
+            .filter(|(id, _)| *id != self.id)
+            .map(|(_, a)| addr_of(*a))
+            .collect();
+        let learners: Vec<SocketAddr> = config
+            .learners
+            .iter()
+            .filter(|(id, _)| *id != self.id)
+            .map(|(_, a)| addr_of(*a))
+            .collect();
+        // M7 Task 8: `sender_cluster_size` (not the plain voter count) —
+        // a LEADER mid-self-removal keeps rebuilding its OWN real sender
+        // here while `config` no longer contains it, and a removed
+        // FOLLOWER's now-moot sender is rebuilt one last time before it
+        // halts; both need the "self occupies an uncounted +1 slot"
+        // adjustment or `FlowControl::new`'s invariant assert panics the
+        // sender thread on the spot (see the helper's doc). The fiat-install
+        // caller's joiner is typically a learner (not yet a voter in its own
+        // seed), exercising this same +1 branch.
+        let _ = self.sender_ctrl.send(CtrlMsg::SetPeers {
+            followers,
+            learners,
+            cluster_size: sender_cluster_size(config, self.id),
+        });
+        // Final-review fix: refresh the snapshot-session config-carry cache —
+        // see the doc comment above for why this lives here now.
+        *self.config_bytes.lock().unwrap() = config_wire_bytes(config, prev_position);
+        // Refresh the node's own routing + observability.
+        self.rebuild_peer_maps(config);
+        self.publish_peer_band();
     }
 
     /// M6 Task 6. When the receiver completes an inbound snapshot transfer it
@@ -1116,6 +1411,44 @@ impl Consensus {
                 self.sm.adopt_snapshot_lineage(&self.last_leader_map);
                 let map = to_entries(self.sm.term_map());
                 self.state.store_term_map(&map).expect("term-map persist fail-stop");
+            }
+            // M7 Task 6: the snapshot session carried the leader's config alongside
+            // the lineage (`SnapBeginBody.config`) — adopt it by fiat for the
+            // identical reason the lineage is: our own absent local bytes carry
+            // nothing genuine to fall back to below the floor. Persist-before-
+            // adopt-floor, same ordering discipline as the lineage seed above.
+            // M7 Task 9: the installed config can DIFFER from this joiner's boot
+            // seed — T7 shipped the admin propose path, so membership can have
+            // changed live since the seed was drawn. Left as-is, this node would
+            // keep routing off its stale seed (deaf to any member the seed
+            // doesn't know about) until the next live config change reached it.
+            // So after adopting the config we rebuild the net layer + our own
+            // routing exactly as `Action::ConfigAdopted`'s exec arm does (shared
+            // via `rebuild_net_for_config` — one derivation, not two that could
+            // drift). The one-in-flight rule (`ElectionSm::propose_config`'s
+            // ChangePending refusal) is what keeps the one-level ConfigRecord
+            // history sufficient here — do not weaken it.
+            let cfg_bytes = self.incoming_snapshot_config.lock().unwrap().clone();
+            if !cfg_bytes.is_empty() {
+                let wire = decode_config(&cfg_bytes)
+                    .unwrap_or_else(|| panic!("corrupt snapshot-carried CONFIG at floor {pos}"));
+                let cfg = wire_to_cluster_config(&wire);
+                self.sm.adopt_snapshot_config(pos, cfg.clone());
+                let rec = ConfigRecord {
+                    position: pos,
+                    config: cluster_to_stored(&cfg),
+                    prev_position: pos,
+                    prev: cluster_to_stored(&cfg),
+                };
+                self.state.store_config_record(&rec).expect("config persist fail-stop");
+                self.cnc.store_config_version(cfg.version);
+                // Final-review fix: this call now ALSO refreshes `config_bytes`
+                // (previously only `Action::ConfigAdopted`'s exec arm did, so a
+                // below-floor rejoiner that later became leader would ship its
+                // STALE pre-fall config in SNAP_BEGIN to the next joiner). `pos`
+                // doubles as the prev_position audit field since this is a
+                // wholesale-replace install: `rec.prev == rec.config` at `pos`.
+                self.rebuild_net_for_config(&cfg, pos);
             }
             let _ = self.trunc_tx.try_send(ArchiveCmd::AdoptFloor { pos });
         }
@@ -1231,15 +1564,21 @@ impl Consensus {
     /// Publish `term`, `flags` (leader/can_serve), and a fresh wall-clock
     /// heartbeat onto the cnc page. `leader_hint` is published event-driven
     /// (see `feed_net` / `exec`), not here.
+    ///
+    /// M7: once `halt_removed`, LEADER/CAN_SERVE are forced OFF regardless of
+    /// `leader_flag`/`sm.can_serve()` — an attaching service/client must never
+    /// mistake a removed, permanently-parked node for a live leader/server.
     fn publish_status(&self) {
         let status = self.cnc.status();
         status.term.store_release(self.sm.current_term() as u64);
         let mut flags = 0u64;
-        if self.leader_flag.load(Ordering::Relaxed) {
-            flags |= NODE_FLAG_LEADER;
-        }
-        if self.sm.can_serve() {
-            flags |= NODE_FLAG_CAN_SERVE;
+        if !self.halt_removed {
+            if self.leader_flag.load(Ordering::Relaxed) {
+                flags |= NODE_FLAG_LEADER;
+            }
+            if self.sm.can_serve() {
+                flags |= NODE_FLAG_CAN_SERVE;
+            }
         }
         status.flags.store_release(flags);
         let now_ns = SystemTime::now()
@@ -1294,6 +1633,36 @@ impl Consensus {
                 true // consumed (dropped) — do not wedge the queue on it
             }
         }
+    }
+
+    /// M7 leader append path: encode `new_cfg` as a `FRAME_TYPE_CONFIG` payload
+    /// superseding the currently-adopted config (`self.sm.config_position()`
+    /// is the wire `prev_position` audit field), append it via the leader
+    /// appender, and adopt-at-append by feeding the event back to ourselves
+    /// immediately — the archive re-observes the same durable frame later
+    /// (`do_work` step 1c), which is a harmless no-op re-adoption (idempotent
+    /// by version). Returns the frame-END position (the new
+    /// `ConfigRecord.position`).
+    ///
+    /// Task 7's admin propose path (`ElectionSm::propose_config` ->
+    /// `propose_and_append` -> this) is the caller. On `Err` (the ring is
+    /// momentarily full, `AppendError::WouldOverrun`, or the vanishingly
+    /// unlikely `PayloadTooLarge`) nothing has been appended and nothing has
+    /// been fed to the SM — `propose_config` never mutated state either, so
+    /// the caller's retry sees a byte-for-byte unchanged SM (see
+    /// `propose_and_append`'s doc for the full argument).
+    fn append_config_frame(&mut self, new_cfg: &ClusterConfig) -> Result<u64, AppendError> {
+        let term = self.sm.current_term();
+        let wire = cluster_to_wire(new_cfg, self.sm.config_position());
+        let mut bytes = Vec::new();
+        encode_config(&wire, &mut bytes);
+        let position = self
+            .appender
+            .as_mut()
+            .expect("append_config_frame is leader-only")
+            .append_config(term, &bytes)?;
+        self.feed(Event::ConfigObserved { position, config: new_cfg.clone() });
+        Ok(position)
     }
 
     /// Drain the client ingress MPSC ring, bounded by `INGRESS_PER_CYCLE`
@@ -1686,6 +2055,21 @@ impl Consensus {
                 return;
             }
             NetEvent::LeaderActivity { term } => Event::LeaderSeen { term },
+            NetEvent::ConfigProposal { from, body } => {
+                // Leader side (M7 Task 7): a follower forwarded its admin
+                // request. Handled inline — never an SM event (the propose/
+                // append pipeline is node-side, like `append_config_frame`
+                // itself).
+                self.on_config_proposal(from, body);
+                return;
+            }
+            NetEvent::ConfigReply { body } => {
+                // Follower side (M7 Task 7): the leader's reply to OUR
+                // forwarded proposal. Handled inline — matched against the
+                // 1-slot pending map by nonce.
+                self.on_config_reply(body);
+                return;
+            }
         };
         self.feed(event);
     }
@@ -1703,6 +2087,142 @@ impl Consensus {
         }
         if let Some(id) = self.addr_to_id.get(&from).copied() {
             self.cnc.status().leader_hint.store_release(id as u64);
+        }
+    }
+
+    /// M7 Task 7: `do_work` step 11's admin-slot dispatcher. Leader: propose +
+    /// append locally and answer the response line directly. Follower: forward
+    /// to whoever the leader hint names (kind 16), remembering `(seq, nonce)`
+    /// so the eventual `NetEvent::ConfigReply` (kind 17) can be matched back to
+    /// this response line; no hint (or the hint resolves to no known address,
+    /// e.g. mid-election) -> reply `status=2` (retry) immediately — side-effect-
+    /// free, `uc2ctl` just polls again.
+    fn handle_admin(&mut self, req: AdminReq) {
+        if matches!(self.sm.role(), Role::Leader) {
+            let (status, reason, version) = self.propose_and_append(req.op, req.id, req.ip, req.port);
+            self.write_admin_reply(req.seq, status, reason, version);
+            return;
+        }
+        let hint = self.cnc.status().leader_hint.load_acquire();
+        let leader_addr = (hint != u64::MAX)
+            .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
+            .flatten();
+        let Some(leader_addr) = leader_addr else {
+            self.write_admin_reply(req.seq, 2, 0, self.cnc.config_version());
+            return;
+        };
+        // T7 review finding 2: a still-outstanding forward would otherwise be
+        // silently overwritten, leaving its caller with a bare timeout and no
+        // answer at all. Answer the superseded request with status=2 (retry)
+        // before replacing the pending slot.
+        if let Some((old_seq, _old_nonce)) = self.pending_admin_fwd.take() {
+            eprintln!("uc2_node: admin forward superseded by newer request");
+            self.write_admin_reply(old_seq, 2, 0, self.cnc.config_version());
+        }
+        self.pending_admin_fwd = Some((req.seq, req.nonce));
+        let body = ConfigProposalBody { nonce: req.nonce, op: req.op, id: req.id, ip: req.ip, port: req.port };
+        let mut buf = [0u8; CONFIG_PROPOSAL_BODY_LEN];
+        write_config_proposal_body(&mut buf, &body);
+        let term = self.sm.current_term();
+        self.send(leader_addr, DGRAM_KIND_CONFIG_PROPOSAL, 0, term, &buf);
+    }
+
+    /// M7 Task 7: leader-only — decode the wire op fields, `propose_config`,
+    /// and on `Ok` append + adopt-at-append (`append_config_frame`). Shared by
+    /// the local admin-slot path and the network `ConfigProposal` forward path
+    /// (one propose/append pipeline either way). Returns the wire reply triple
+    /// `(status, reason, version)`:
+    /// * `0, 0, new_version` — accepted.
+    /// * `1, reason_code, current_version` — refused (`ProposeError`, or `6`/
+    ///   `NotFound`'s code reused for a malformed/unknown op field — `uc2ctl`
+    ///   never emits one, so this is a defensive catch-all, not a real path).
+    /// * `2, 0, current_version` — retry: the ring was momentarily full
+    ///   (`AppendError::WouldOverrun`). Safe to retry WHOLE: `propose_config`
+    ///   itself never mutates SM state (it only reads `role`/`serving`/
+    ///   `config_pending`/`commit_seen`/`last_reports` and returns a fresh
+    ///   `ClusterConfig` clone) and adoption happens ONLY via the `ConfigObserved`
+    ///   `append_config_frame` feeds back on a SUCCESSFUL append — so a failed
+    ///   append leaves the SM bit-for-bit as it was before this call; nothing
+    ///   here can leave a half-adopted config behind for the retry to trip over.
+    fn propose_and_append(&mut self, op: u32, id: u32, ip: u32, port: u16) -> (u32, u32, u64) {
+        let Some(config_op) = wire_to_config_op(op, id, ip, port) else {
+            return (1, 6, self.cnc.config_version());
+        };
+        match self.sm.propose_config(config_op, self.admission_bytes) {
+            Ok(new_cfg) => {
+                let version = new_cfg.version;
+                match self.append_config_frame(&new_cfg) {
+                    Ok(_position) => (0, 0, version),
+                    Err(AppendError::WouldOverrun) | Err(AppendError::PayloadTooLarge) => {
+                        (2, 0, self.cnc.config_version())
+                    }
+                }
+            }
+            Err(e) => (1, ClusterConfig::reason_code(&e), self.cnc.config_version()),
+        }
+    }
+
+    /// M7 Task 7: leader-side handling of a follower-forwarded proposal (kind
+    /// 16). A stale/not-yet-leader recipient just drops it — the forwarding
+    /// follower's request times out and `uc2ctl` (or the follower's next admin
+    /// cycle) re-learns the current leader hint and can re-forward. Nonce
+    /// dedup: a repeat nonce gets the STORED reply re-sent rather than a fresh
+    /// `propose_config` call (retry-idempotent while the change is pending).
+    fn on_config_proposal(&mut self, from: SocketAddr, body: ConfigProposalBody) {
+        if !matches!(self.sm.role(), Role::Leader) {
+            return;
+        }
+        if let Some((nonce, reply)) = &self.last_config_reply
+            && *nonce == body.nonce
+        {
+            let reply = *reply;
+            self.send_config_reply(from, &reply);
+            return;
+        }
+        let (status, reason, version) = self.propose_and_append(body.op, body.id, body.ip, body.port);
+        let reply = ConfigReplyBody { nonce: body.nonce, status, reason, version };
+        self.last_config_reply = Some((body.nonce, reply));
+        self.send_config_reply(from, &reply);
+    }
+
+    fn send_config_reply(&mut self, to: SocketAddr, reply: &ConfigReplyBody) {
+        let mut buf = [0u8; CONFIG_REPLY_BODY_LEN];
+        write_config_reply_body(&mut buf, reply);
+        let term = self.sm.current_term();
+        self.send(to, DGRAM_KIND_CONFIG_REPLY, 0, term, &buf);
+    }
+
+    /// M7 Task 7: follower-side handling of the leader's reply (kind 17) to our
+    /// forwarded proposal. Matched against the 1-slot pending map by nonce; a
+    /// reply for any other nonce (stale, or a race with a since-superseded
+    /// forward) is dropped rather than misattributed to the wrong response line.
+    fn on_config_reply(&mut self, body: ConfigReplyBody) {
+        let Some((seq, nonce)) = self.pending_admin_fwd else { return };
+        if nonce != body.nonce {
+            return;
+        }
+        self.pending_admin_fwd = None;
+        self.write_admin_reply(seq, body.status, body.reason, body.version);
+    }
+
+    /// Write the admin response line (fields-then-seq/release; the T1 accessor
+    /// enforces the discipline) for `seq`.
+    fn write_admin_reply(&mut self, seq: u64, status: u32, reason: u32, version: u64) {
+        self.cnc.write_admin_resp(&AdminResp { seq, status, reason, version });
+    }
+
+    /// T7 review finding 1: invalidate the admin nonce-dedup cache and any
+    /// still-outstanding forwarded admin request across a role/truncation
+    /// transition. Both are scoped to a single leader "life" — surviving one
+    /// would let a duplicate kind-16 datagram (same nonce) replay a reply that
+    /// belongs to a since-reverted or since-superseded world (e.g. an
+    /// uncommitted config that a later truncate reverted). A pending forward
+    /// gets an explicit status=2 (retry) admin reply written now, rather than
+    /// leaving the caller to hang for the full timeout with no answer at all.
+    fn invalidate_admin_caches(&mut self) {
+        self.last_config_reply = None;
+        if let Some((seq, _nonce)) = self.pending_admin_fwd.take() {
+            self.write_admin_reply(seq, 2, 0, self.cnc.config_version());
         }
     }
 
@@ -1790,6 +2310,9 @@ impl Consensus {
                 }
             }
             Action::BecomeLeader { term, base } => {
+                // T7 review finding 1: a stale nonce-dedup / forward cache must
+                // not survive into this new leader life.
+                self.invalidate_admin_caches();
                 // Contract order (T3/T7, load-bearing): (a) term-map append +
                 // persist durable; (b) collapse volatile via prime(base) — old
                 // bytes above base must never be streamable; (c) fresh appender
@@ -1821,6 +2344,10 @@ impl Consensus {
                 self.cnc.status().leader_hint.store_release(self.id as u64);
             }
             Action::BecomeFollower { term, .. } => {
+                // T7 review finding 1: stepping down from leader (or adopting a
+                // new term as follower) must not leave a stale nonce-dedup /
+                // forward cache answerable by a later duplicate datagram.
+                self.invalidate_admin_caches();
                 self.term_handle.store(term, Ordering::Release);
                 self.leader_flag.store(false, Ordering::Release);
                 self.appender = None;
@@ -1865,6 +2392,12 @@ impl Consensus {
                 }
             }
             Action::Truncate { epoch, to, new_map } => {
+                // T7 review finding 1: a truncate can revert an uncommitted
+                // config (see the persist-revert-before-truncate block below)
+                // without necessarily passing through a BecomeLeader/Follower
+                // transition first — invalidate the admin caches here too so
+                // no stale reply outlives the config it was answering for.
+                self.invalidate_admin_caches();
                 // Persist-before-truncate ordering (M5): store the pruned map
                 // DURABLY *before* commanding the physical truncate, so a crash in
                 // the window recovers a map that is a valid prefix of the
@@ -1875,6 +2408,46 @@ impl Consensus {
                 self.state
                     .store_term_map(&to_entries(&new_map))
                     .expect("term-map persist fail-stop");
+                // M7 Task 6: persist-revert-BEFORE-truncate — the SAME discipline as
+                // the term-map persist immediately above. If this truncation drops
+                // the currently-adopted config FRAME (`to` lands strictly below its
+                // recorded position), the durable `ConfigRecord` must not survive
+                // claiming a position the truncated log no longer backs. Revert it
+                // NOW, synchronously, before the archive's physical truncate runs, so
+                // a crash in the window between this persist and the truncate
+                // recovers a record that is a valid predecessor of whatever the
+                // truncated log ends up holding — never one ahead of it. The SM's OWN
+                // `Truncated`-arm revert (T4) then re-emits `Action::ConfigAdopted` on
+                // the matching-epoch ack, whose persist is an idempotent overwrite of
+                // this exact same record — one adoption/persist path either way.
+                if let Some(rec) = self.state.config_record()
+                    && to < rec.position
+                {
+                    let reverted = if to == 0 {
+                        // Wipe-and-rejoin (mirrors the SM's own wipe branch):
+                        // config-by-fiat — keep the CURRENT operational config
+                        // rather than dropping to a predecessor a wiped node has no
+                        // further use for (same authority argument as
+                        // `adopt_snapshot_lineage`/`adopt_snapshot_config`).
+                        ConfigRecord {
+                            position: 0,
+                            config: rec.config.clone(),
+                            prev_position: 0,
+                            prev: rec.config,
+                        }
+                    } else {
+                        // Ordinary truncation: revert one level — prev promoted to
+                        // cur, prev duplicated (the one-level history is now
+                        // exhausted: nothing below the reverted config to recover).
+                        ConfigRecord {
+                            position: rec.prev_position,
+                            config: rec.prev.clone(),
+                            prev_position: rec.prev_position,
+                            prev: rec.prev,
+                        }
+                    };
+                    self.state.store_config_record(&reverted).expect("config persist fail-stop");
+                }
                 // Pause intake and record the emit→ack bracket (the SM allocated
                 // `epoch`; we transport it). The SM has already latched the data
                 // plane. Emitting the truncate IS the reconcile decision for the
@@ -1903,7 +2476,75 @@ impl Consensus {
                 // (distinct from an ordinary truncate) for observability + tests.
                 self.wipes.fetch_add(1, Ordering::Relaxed);
             }
+            Action::ConfigAdopted { position, config, prev_position, prev } => {
+                // M7: the SM adopted a higher-version `ClusterConfig` — via the
+                // leader's own append (`append_config_frame`), a follower's
+                // archive-scan observation, boot recovery, OR the SM's own
+                // truncation-revert re-adoption. One exec arm for all of them.
+                //
+                // Persist BEFORE any behavioral change (crash between persist
+                // and rebuild = recovery re-adopts from the record via
+                // `ElectionSm::new` + `restore_prev_config`: safe).
+                let rec = ConfigRecord {
+                    position,
+                    config: cluster_to_stored(&config),
+                    prev_position,
+                    prev: cluster_to_stored(&prev),
+                };
+                self.state.store_config_record(&rec).expect("config persist fail-stop");
+                // Rebuild the net layer + this node's own routing/observability
+                // (and, since the final-review fix, the snapshot-session
+                // config-carry cache too — so every SNAP_BEGIN a session opens
+                // from here on ships THIS config; over-delivery to a peer that
+                // doesn't need it is safe, adopt-by-version idempotence on the
+                // receiving end). Shared with the snapshot-fiat install path in
+                // `maybe_adopt_incoming_snapshot` (M7 Task 9) — one derivation for
+                // "what changes when membership changes" everywhere it changes.
+                self.rebuild_net_for_config(&config, prev_position);
+                self.cnc.store_config_version(config.version);
+                // Cleared once commit crosses `position` (do_work step 11).
+                self.cnc.store_config_pending(true);
+            }
+            Action::HaltRemoved => {
+                // M7: this node is not a member of the just-adopted config (and
+                // is not a leader mid-self-removal — that case keeps serving
+                // until its own removal commits). Fail-stop: park permanently.
+                eprintln!("node {}: removed from cluster config — halting", self.id);
+                self.halt();
+            }
+            Action::StepDownRemoved => {
+                // M7 Task 8: a LEADER's own removal has just COMMITTED (the SM
+                // kept it serving through the adoption window; commit crossing
+                // `config_position` means C_new itself now certifies the
+                // removal). Nothing left to do but fail-stop exactly like
+                // `HaltRemoved`. The remaining C_new voters elect among
+                // themselves; this leader never depended on beyond the commit
+                // that just landed.
+                eprintln!("node {}: removed from cluster (self-removal committed) — halting", self.id);
+                self.halt();
+            }
         }
+    }
+
+    /// Shared fail-stop park for `HaltRemoved`/`StepDownRemoved` (M7 Task 8):
+    /// set the permanent `halt_removed` latch (`do_work`'s entry check short-
+    /// circuits every SUBSEQUENT cycle), AND clear the in-process
+    /// `leader_flag`/`can_serve_flag` immediately rather than leaving them at
+    /// whatever they last read. `publish_status` (still to run this SAME
+    /// cycle, below `exec` in `do_work`) already masks the CNC-PAGE mirror
+    /// off `halt_removed` regardless — but `Node::is_leader()`/`can_serve()`
+    /// read these two atomics DIRECTLY, bypassing that mask entirely. Without
+    /// this, `StepDownRemoved`'s leader case (the SM's `serving` field is
+    /// never cleared by step-down — it has no reason to be, nothing else
+    /// reads it once halted) would leave an embedded caller's `is_leader()`/
+    /// `can_serve()` reporting stale `true` forever after a real halt. A
+    /// removed FOLLOWER's flags were already `false` here (only a LEADER
+    /// reaches `StepDownRemoved`), so this is a no-op there — the fix is
+    /// entirely about the self-removal leader case Task 8 introduces.
+    fn halt(&mut self) {
+        self.halt_removed = true;
+        self.leader_flag.store(false, Ordering::Release);
+        self.can_serve_flag.store(false, Ordering::Release);
     }
 
     /// Archive-truncation feedback (slot ack). The map was already persisted
@@ -2016,6 +2657,184 @@ fn create_rings(
     ))
 }
 
+// --------------------------------------------------------- M7 config helpers
+
+/// The wire `Addr` tuple (`uc2_consensus::config::Addr = (ip: u32, port:
+/// u16)`) as a real `SocketAddr` (IPv4-only — `uc2_consensus` stays dep-free,
+/// so this conversion lives here). Inverse of `stored_member`'s ip/port
+/// extraction below.
+fn addr_of((ip, port): Addr) -> SocketAddr {
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip.to_be_bytes()), port))
+}
+
+/// A real `SocketAddr` (IPv4-only) as the wire `Addr` tuple. Used only at
+/// genesis-seed construction (`Node::start`), where `NodeConfig::members`/
+/// `learners` are still plain `(NodeId, SocketAddr)`. Inverse of `addr_of`.
+fn addr_to_pair(a: SocketAddr) -> Addr {
+    match a {
+        SocketAddr::V4(v4) => (u32::from_be_bytes(v4.ip().octets()), v4.port()),
+        SocketAddr::V6(_) => panic!("uc2 is IPv4-only (addr={a})"),
+    }
+}
+
+/// Genesis-seed helper: `(NodeId, SocketAddr)` -> `StoredMember`.
+fn stored_member(id: NodeId, addr: SocketAddr) -> StoredMember {
+    let (ip, port) = addr_to_pair(addr);
+    StoredMember { id, ip, port }
+}
+
+/// M7 Task 7: decode the cnc admin-req / `ConfigProposalBody` wire fields
+/// (`op` 1..=5, `id`, `ip`, `port`) into a `ConfigOp` — the inverse of
+/// `ClusterConfig::op_code`. `None` for an out-of-range `op` (never emitted by
+/// `uc2ctl`; a defensive catch-all for a malformed/future-version request).
+fn wire_to_config_op(op: u32, id: NodeId, ip: u32, port: u16) -> Option<ConfigOp> {
+    match op {
+        1 => Some(ConfigOp::AddLearner { id, addr: (ip, port) }),
+        2 => Some(ConfigOp::PromoteLearner { id }),
+        3 => Some(ConfigOp::DemoteVoter { id }),
+        4 => Some(ConfigOp::RemoveLearner { id }),
+        5 => Some(ConfigOp::RemoveVoter { id }),
+        _ => None,
+    }
+}
+
+/// `WireConfig` (the decoded `FRAME_TYPE_CONFIG` payload) -> `ClusterConfig`
+/// (the SM's in-memory form). Purely numeric — `WireMember`'s `(ip, port)` IS
+/// the `Addr` shape already, no `SocketAddr` involved.
+fn wire_to_cluster_config(w: &WireConfig) -> ClusterConfig {
+    ClusterConfig {
+        version: w.version,
+        voters: w.voters.iter().map(|m| (m.id, (m.ip, m.port))).collect(),
+        learners: w.learners.iter().map(|m| (m.id, (m.ip, m.port))).collect(),
+        tombstones: w.tombstones.clone(),
+    }
+}
+
+/// `ClusterConfig` -> the `WireConfig` to append as a `FRAME_TYPE_CONFIG`
+/// payload. `prev_position` is an audit-trail field only (the durable
+/// `ConfigRecord` keeps the authoritative prev) — the caller passes the
+/// CURRENTLY-adopted config's position, the entry `c` supersedes.
+fn cluster_to_wire(c: &ClusterConfig, prev_position: u64) -> WireConfig {
+    WireConfig {
+        version: c.version,
+        prev_position,
+        voters: c
+            .voters
+            .iter()
+            .map(|(id, (ip, port))| WireMember { id: *id, ip: *ip, port: *port })
+            .collect(),
+        learners: c
+            .learners
+            .iter()
+            .map(|(id, (ip, port))| WireMember { id: *id, ip: *ip, port: *port })
+            .collect(),
+        tombstones: c.tombstones.clone(),
+    }
+}
+
+/// The single derivation of the snapshot-session config-carry cache's bytes
+/// (final-review fix): `encode_config(&cluster_to_wire(..))`, called from
+/// every site that refreshes `config_bytes` — boot-time construction AND
+/// `rebuild_net_for_config` (shared in turn by the live-adoption exec arm and
+/// the snapshot-fiat install path). One derivation means the three sites
+/// cannot drift apart the way construction/exec-arm vs. fiat-install did
+/// before this fix (fiat install rebuilt peers/routing but never refreshed
+/// this cache, so a below-floor rejoiner that later became leader would ship
+/// its STALE pre-fall config to the next joiner).
+fn config_wire_bytes(config: &ClusterConfig, prev_position: u64) -> Vec<u8> {
+    let mut wire_bytes = Vec::new();
+    encode_config(&cluster_to_wire(config, prev_position), &mut wire_bytes);
+    wire_bytes
+}
+
+/// `StoredConfig` (the durable `ConfigRecord`'s `config`/`prev`) -> `ClusterConfig`.
+fn stored_to_cluster(s: &StoredConfig) -> ClusterConfig {
+    ClusterConfig {
+        version: s.version,
+        voters: s.voters.iter().map(|m| (m.id, (m.ip, m.port))).collect(),
+        learners: s.learners.iter().map(|m| (m.id, (m.ip, m.port))).collect(),
+        tombstones: s.tombstones.clone(),
+    }
+}
+
+/// `ClusterConfig` -> `StoredConfig`, for persisting a `ConfigRecord`.
+fn cluster_to_stored(c: &ClusterConfig) -> StoredConfig {
+    StoredConfig {
+        version: c.version,
+        voters: c
+            .voters
+            .iter()
+            .map(|(id, (ip, port))| StoredMember { id: *id, ip: *ip, port: *port })
+            .collect(),
+        learners: c
+            .learners
+            .iter()
+            .map(|(id, (ip, port))| StoredMember { id: *id, ip: *ip, port: *port })
+            .collect(),
+        tombstones: c.tombstones.clone(),
+    }
+}
+
+/// M7 Task 8: the VOTING cluster size to pass as `FlowControl::new`'s
+/// `cluster_size` for `id`'s OWN sender, over `config`. Mirrors
+/// `ElectionSm::rebuild_membership`'s `CommitTracker` sizing convention
+/// exactly (own_durable / self always occupies a ranking slot, member or
+/// not): if `id` IS a voter in `config`, it already occupies one of
+/// `config.voters.len()` slots and that count is the cluster size outright.
+/// If `id` is NOT a voter — a learner (though callers special-case learners
+/// with a dummy solo sender before ever reaching here), a genuinely unknown
+/// orphan booting from a stale seed, or — Task 8's real case — a LEADER
+/// mid-self-removal that must keep serving/replicating until its own removal
+/// commits — it occupies an UNCOUNTED "+1" slot that
+/// `FlowControl::new`'s `cluster_size > voting_followers.len()` assert
+/// requires to exist (`followers`/`voting` in that case is the FULL voter
+/// list, unfiltered, since `id` isn't in it to filter out — using the plain
+/// voter count here would make `cluster_size == followers.len()` and panic
+/// the instant a non-member's own sender is (re)built).
+fn sender_cluster_size(config: &ClusterConfig, id: NodeId) -> usize {
+    let n = config.voters.len();
+    if config.is_voter(id) { n } else { n + 1 }
+}
+
+/// Derive the peer-address maps + observability band from a `ClusterConfig`
+/// for `id` (voters first, then learners, cnc-slot order, capped at
+/// `CNC_MAX_PEER_SLOTS`). A free function (not a `Consensus` method) because
+/// `Node::start` needs it BEFORE any `Consensus` exists — the `Sender`'s
+/// fan-out is derived from the same maps and must be constructed (and moved
+/// into its own thread) first. `Consensus::rebuild_peer_maps` is a thin
+/// wrapper that calls this and assigns the result to its own fields, so
+/// construction-time seeding and live-reconfiguration rebuild share ONE
+/// derivation (behavior-preservation for a cluster that never reconfigures).
+#[allow(clippy::type_complexity)]
+fn derive_peer_maps(
+    config: &ClusterConfig,
+    id: NodeId,
+) -> (
+    HashMap<NodeId, SocketAddr>,
+    HashMap<SocketAddr, NodeId>,
+    Vec<NodeId>,
+    Vec<NodeId>,
+    Vec<(NodeId, u8)>,
+) {
+    let mut id_to_addr = HashMap::new();
+    let mut addr_to_id = HashMap::new();
+    for (mid, addr) in config.voters.iter().chain(config.learners.iter()) {
+        let sock = addr_of(*addr);
+        id_to_addr.insert(*mid, sock);
+        addr_to_id.insert(sock, *mid);
+    }
+    let peers: Vec<NodeId> = config.voter_ids().into_iter().filter(|i| *i != id).collect();
+    let learner_ids: Vec<NodeId> =
+        config.learners.iter().map(|(lid, _)| *lid).filter(|i| *i != id).collect();
+    let peer_band: Vec<(NodeId, u8)> = peers
+        .iter()
+        .map(|i| (*i, CNC_PEER_ROLE_VOTER))
+        .chain(learner_ids.iter().map(|i| (*i, CNC_PEER_ROLE_LEARNER)))
+        .take(CNC_MAX_PEER_SLOTS)
+        .collect();
+    (id_to_addr, addr_to_id, peers, learner_ids, peer_band)
+}
+
 fn to_pairs(m: &TermMap) -> Vec<(u32, u64)> {
     m.iter().map(|e| (e.term, e.base)).collect()
 }
@@ -2066,6 +2885,125 @@ fn rederive_term_map(
     Ok(map)
 }
 
+/// M7 (spec 2026-07-13) boot recovery of the durable `ConfigRecord`, in order:
+///
+/// 1. **Genesis-seed** a fresh instance dir (no record yet) from `members`/
+///    `learners` — authoritative only here (see `NodeConfig::members`'s doc);
+///    every subsequent boot, and every live reconfiguration, is owned by the
+///    durable record + the `FRAME_TYPE_CONFIG` stream from here on.
+///    Behavior-preservation: a cluster that never appends a config frame gets
+///    this genesis record (version 0, `prev == config`) verbatim forever —
+///    nothing observably changes from the pre-M7 static wiring.
+/// 2. **T5-carry revert** (M7 Task 6): the leader persists the `ConfigRecord`
+///    SYNCHRONOUSLY at append (`append_config_frame` -> `Action::ConfigAdopted`'s
+///    persist), strictly AHEAD of the archive's own (async) fsync of that same
+///    frame's bytes. A crash in that window recovers a durable record whose
+///    `position` the recovered archive frontier (`durable`) does NOT actually
+///    back — the record is claiming survival for bytes that never made it.
+///    Revert it to its own prev level (mirrors `uc2_sim::World::on_restart`'s
+///    boot-revert); if THAT level is ALSO ahead of durable (a compounding
+///    same-run crash window: two adoptions before any archive catch-up), there
+///    is nothing genuine left in the record to trust, so fall back to a fresh
+///    config-by-fiat genesis record — the same seed as step 1, just re-run
+///    because the "existing" record turned out unusable.
+/// 3. **Step 3a forward re-derivation**: the reverse gap. A FOLLOWER's archive
+///    scan durably records a CONFIG frame and only afterward (a later duty
+///    cycle) drains it into `Event::ConfigObserved` -> the persist. A crash in
+///    THAT window durably archives the frame but never persists the record, so
+///    recovery must scan the SAME retained window `rederive_term_map` scans
+///    (`archive.first_base()`-clamped) for CONFIG frames above the (possibly
+///    just-reverted) record's position and re-adopt them, exactly like a live
+///    `ConfigObserved` would (`rederive_config`, idempotent by version).
+///
+/// Persists the record back to `state` whenever any step changes it, so the
+/// returned value and `state.config_record()` always agree. Extracted to a
+/// free function (rather than inlined in `Node::start_with_socket`) so it is
+/// unit-testable against a real file-backed `Archive`/`NodeState` without
+/// standing up a full two-thread `Node`.
+fn recover_config_record(
+    state: &NodeState,
+    archive: &Archive,
+    durable: u64,
+    members: &[(NodeId, SocketAddr)],
+    learners: &[(NodeId, SocketAddr)],
+) -> io::Result<ConfigRecord> {
+    let seed = || {
+        let genesis = StoredConfig {
+            version: 0,
+            voters: members.iter().map(|(id, a)| stored_member(*id, *a)).collect(),
+            learners: learners.iter().map(|(id, a)| stored_member(*id, *a)).collect(),
+            tombstones: Vec::new(),
+        };
+        ConfigRecord { position: 0, config: genesis.clone(), prev_position: 0, prev: genesis }
+    };
+    if state.config_record().is_none() {
+        state.store_config_record(&seed()).map_err(to_io)?;
+    }
+    let mut rec = state.config_record().expect("seeded immediately above if absent");
+
+    if rec.position > durable {
+        rec = if rec.prev_position > durable {
+            seed()
+        } else {
+            ConfigRecord {
+                position: rec.prev_position,
+                config: rec.prev.clone(),
+                prev_position: rec.prev_position,
+                prev: rec.prev,
+            }
+        };
+        state.store_config_record(&rec).map_err(to_io)?;
+    }
+
+    let rederived = rederive_config(archive, rec.clone()).map_err(to_io)?;
+    if rederived != rec {
+        state.store_config_record(&rederived).map_err(to_io)?;
+    }
+    Ok(rederived)
+}
+
+/// M7 Task 6 (Step 3a): recovery counterpart of `rederive_term_map` above for
+/// the `ConfigRecord` — see the boot call site's doc for the crash window this
+/// closes (a follower durably archives a `FRAME_TYPE_CONFIG` frame and only a
+/// LATER duty cycle drains it into the persisted record; a crash in between
+/// loses the persist but not the archived bytes). Scans archived frames from
+/// `rec.position` (clamped to `archive.first_base()`, exactly like
+/// `rederive_term_map`'s clamp — everything below it is either already folded
+/// into `rec` or covered by a snapshot floor) forward, folding in every
+/// `FRAME_TYPE_CONFIG` frame whose decoded version strictly exceeds the
+/// currently-folded config's version (idempotent / monotone, exactly
+/// `Event::ConfigObserved`'s own adoption guard). Produces the same one-level
+/// prev/cur shape `Action::ConfigAdopted`'s exec arm persists, so even a
+/// multi-hop scan (more than one adoption crash-exposed in the same window)
+/// folds down to a valid one-level record.
+fn rederive_config(
+    archive: &Archive,
+    rec: ConfigRecord,
+) -> Result<ConfigRecord, uc2_log::archive::ArchiveError> {
+    let start = rec.position.max(archive.first_base());
+    let mut cur = rec;
+    let mut replay = archive.replay_from(start)?;
+    while let Some(frame) = replay.next()? {
+        if frame.header.frame_type != FRAME_TYPE_CONFIG {
+            continue;
+        }
+        let wire = decode_config(&frame.payload)
+            .unwrap_or_else(|| panic!("corrupt CONFIG frame at {}", frame.position));
+        if wire.version <= cur.config.version {
+            continue; // idempotent / stale re-observation
+        }
+        let frame_end = frame.position + align_frame_len(frame.header.length as usize) as u64;
+        let new_config = cluster_to_stored(&wire_to_cluster_config(&wire));
+        cur = ConfigRecord {
+            position: frame_end,
+            prev_position: cur.position,
+            prev: cur.config,
+            config: new_config,
+        };
+    }
+    Ok(cur)
+}
+
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
@@ -2094,6 +3032,7 @@ mod tests {
         // Kept alive: dropping these would disconnect the consensus's endpoints.
         _net_tx: mpsc::SyncSender<NetEvent>,
         _obs_tx: mpsc::SyncSender<(u32, u64)>,
+        _cfg_obs_tx: mpsc::SyncSender<(u64, Vec<u8>)>,
         _ingress_tx: mpsc::SyncSender<Vec<u8>>,
         _trunc_rx: mpsc::Receiver<ArchiveCmd>,
         _dir: tempfile::TempDir,
@@ -2148,25 +3087,7 @@ mod tests {
         let state = NodeState::open(dir.path()).unwrap();
 
         // id=1 in [0,1,2]; own map (1,0),(2,4096) at durable 6016 → boot_term 2.
-        let members = vec![0u32, 1, 2];
-        let sm = ElectionSm::new(
-            ElectionConfig {
-                id: 1,
-                members: members.clone(),
-                election_timeout_min_ns: 150,
-                election_timeout_max_ns: 300,
-                gossip_floor_ns: u64::MAX,
-                seed: 7,
-                can_vote: true,
-            },
-            None,
-            &[(1, 0), (2, 4096)],
-            6016,
-            0,
-        );
-        let boot_term = sm.current_term();
-        assert_eq!(boot_term, 2);
-
+        let members = [0u32, 1, 2];
         let mut id_to_addr = HashMap::new();
         let mut addr_to_id = HashMap::new();
         for (i, id) in members.iter().enumerate() {
@@ -2176,11 +3097,40 @@ mod tests {
         }
         let peers = vec![0u32, 2];
 
+        // M7: genesis config over the same static membership (no reconfiguration
+        // in this harness's tests — pure migration off the old `members`/
+        // `can_vote` `ElectionConfig` fields).
+        let config = ClusterConfig::genesis(
+            members.iter().map(|id| (*id, addr_to_pair(id_to_addr[id]))).collect(),
+            Vec::new(),
+        );
+        let sm = ElectionSm::new(
+            ElectionConfig {
+                id: 1,
+                config,
+                config_position: 0,
+                election_timeout_min_ns: 150,
+                election_timeout_max_ns: 300,
+                gossip_floor_ns: u64::MAX,
+                seed: 7,
+            },
+            None,
+            &[(1, 0), (2, 4096)],
+            6016,
+            0,
+        );
+        let boot_term = sm.current_term();
+        assert_eq!(boot_term, 2);
+
         let (net_tx, net_rx) = mpsc::sync_channel::<NetEvent>(64);
         let (obs_tx, obs_rx) = mpsc::sync_channel::<(u32, u64)>(64);
+        let (cfg_obs_tx, cfg_obs_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(64);
         let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Vec<u8>>(64);
         let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
         let trunc_slot = TruncationSlot::default();
+        // Not asserted on by any test in this module — a dropped receiver just
+        // makes `sender_ctrl.send` return an ignored `Err` (`exec`'s `let _ =`).
+        let (sender_ctrl, _sender_ctrl_rx) = mpsc::sync_channel::<CtrlMsg>(64);
 
         let sock = FaultSocket::from_socket(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
         let intake_gate = Arc::new(AtomicBool::new(true));
@@ -2226,9 +3176,11 @@ mod tests {
             peer_band_published: false,
             net_rx,
             obs_rx,
+            cfg_obs_rx,
             ingress_rx,
             trunc_tx,
             trunc_slot,
+            sender_ctrl,
             term_handle: Arc::new(AtomicU32::new(boot_term)),
             leader_flag: Arc::new(AtomicBool::new(false)),
             can_serve_flag: Arc::new(AtomicBool::new(false)),
@@ -2248,14 +3200,21 @@ mod tests {
             snapshot_persisted_floor: 0,
             snapshot_floor_last_persist_ns: None,
             incoming_snapshot: Arc::new(AtomicU64::new(0)),
+            incoming_snapshot_config: Arc::new(Mutex::new(Vec::new())),
             adopted_incoming: 0,
             last_leader_map: Vec::new(),
+            halt_removed: false,
+            config_bytes: Arc::new(Mutex::new(Vec::new())),
+            last_admin_seq: 0,
+            pending_admin_fwd: None,
+            last_config_reply: None,
         };
 
         Harness {
             cons,
             _net_tx: net_tx,
             _obs_tx: obs_tx,
+            _cfg_obs_tx: cfg_obs_tx,
             _ingress_tx: ingress_tx,
             _trunc_rx: trunc_rx,
             _dir: dir,
@@ -2308,6 +3267,29 @@ mod tests {
         h.post_ack_and_drain(epoch, 4096);
         assert!(h.gate_open(), "the Truncated ack completes reconciliation and reopens");
         assert!(h.cons.pending_truncation.is_none());
+    }
+
+    /// T7 review finding 1: `last_config_reply` (leader-side nonce dedup) and
+    /// `pending_admin_fwd` (follower-side in-flight forward) must not survive a
+    /// role transition — a stale entry would let a duplicated kind-16 datagram
+    /// replay an answer that belongs to a since-reverted world. Adopting a
+    /// higher term as a follower (`Action::BecomeFollower`) must clear both,
+    /// and the cleared forward must get an explicit status=2 (retry) admin
+    /// reply rather than leaving its caller to a bare timeout.
+    #[test]
+    fn become_follower_invalidates_stale_admin_caches() {
+        let mut h = harness();
+        h.cons.last_config_reply =
+            Some((42, ConfigReplyBody { nonce: 42, status: 0, reason: 0, version: 5 }));
+        h.cons.pending_admin_fwd = Some((99, 42));
+
+        // Adopt a higher term as a follower -> Action::BecomeFollower.
+        h.cons.feed(Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
+
+        assert!(h.cons.last_config_reply.is_none(), "nonce-dedup cache must be cleared");
+        assert!(h.cons.pending_admin_fwd.is_none(), "in-flight forward must be cleared");
+        let resp = h.cons.cnc.read_admin_resp(99).expect("superseded forward gets an answer");
+        assert_eq!(resp.status, 2, "cleared forward is answered with retry, not silence");
     }
 
     /// M6 Task 8: a `NoCommonPrefix` reconcile drives a WIPE-AND-REJOIN end to end
@@ -2599,5 +3581,267 @@ mod tests {
         h.cons.pending_reads.push(read);
         assert!(h.cons.advance_pending_reads());
         assert!(h.cons.pending_reads.is_empty(), "a non-serving node retries in-flight reads");
+    }
+
+    // ---- M7 Task 6: persist-revert-BEFORE-truncate (`Action::Truncate` exec) ----
+
+    /// A learner-adding v1 config bump over the harness's genesis, for the
+    /// revert-before-truncate tests (mirrors `election::tests::v1_of`).
+    fn v1_of(h: &Harness) -> ClusterConfig {
+        let mut v1 = h.cons.sm.config().clone();
+        v1.learners.push((9, (9, 1)));
+        v1.version = 1;
+        v1
+    }
+
+    /// M7 Task 6, ordinary case: a config adopted ABOVE the truncation target
+    /// must have its durable `ConfigRecord` reverted to prev SYNCHRONOUSLY inside
+    /// `exec`'s `Action::Truncate` arm — BEFORE the archive even receives the
+    /// truncate command (`_trunc_rx` still holds it, unconsumed by any ack). The
+    /// SM's own later revert (on the matching-epoch ack) then re-persists the
+    /// identical record — an idempotent overwrite, not a second decision.
+    #[test]
+    fn truncate_exec_reverts_config_record_before_truncate() {
+        let mut h = harness();
+        let genesis = h.cons.sm.config().clone();
+        let v1 = v1_of(&h);
+        // Adopt v1 at position 5000 — ABOVE the divergent-map truncation target
+        // (4096) the harness's own map/leader-map mismatch always produces.
+        h.cons.feed(Event::ConfigObserved { position: 5000, config: v1.clone() });
+        let rec = h.cons.state.config_record().expect("v1 persisted");
+        assert_eq!(rec.position, 5000);
+        assert_eq!(rec.config.version, 1);
+
+        // Divergent term map -> Action::Truncate{to: 4096, ..} — strictly below
+        // 5000, so the config frame backing v1 is removed by the cut.
+        h.adopt_and_truncate(3, vec![(1, 0), (3, 4096)]);
+        let epoch = h.cons.pending_truncation.expect("a truncation is in flight");
+
+        // The record is ALREADY reverted — before any archive ack.
+        let rec = h.cons.state.config_record().expect("record still present");
+        assert_eq!(rec.position, 0, "reverted to prev's position");
+        assert_eq!(rec.config.version, 0, "reverted to the genesis config");
+        assert_eq!(rec.prev_position, 0);
+        assert_eq!(rec.prev.version, 0, "prev duplicated (history exhausted)");
+        assert_eq!(stored_to_cluster(&rec.config), genesis);
+
+        // The SM's own matching-epoch revert then re-emits ConfigAdopted, whose
+        // persist is an idempotent overwrite of the same reverted record.
+        h.post_ack_and_drain(epoch, 4096);
+        let rec = h.cons.state.config_record().expect("record still present");
+        assert_eq!(rec.position, 0);
+        assert_eq!(rec.config.version, 0);
+    }
+
+    /// M7 Task 6, wipe case (`to == 0`): the durable record resets to position 0
+    /// but keeps the CURRENT operational config (config-by-fiat) rather than
+    /// dropping to a genuine predecessor — a wiped node has no further use for
+    /// history below a config it refills live from the leader's stream.
+    #[test]
+    fn truncate_exec_wipe_persists_fiat_record_before_truncate() {
+        let mut h = harness();
+        let v1 = v1_of(&h);
+        h.cons.feed(Event::ConfigObserved { position: 3000, config: v1.clone() });
+        assert_eq!(h.cons.state.config_record().unwrap().position, 3000);
+
+        // NoCommonPrefix: the leader's shipped window begins at 1<<20, far past
+        // our own map — wipe-and-rejoin, Truncate{to: 0}.
+        h.cons.feed(Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
+        h.cons.feed(Event::TermMapReceived {
+            term: 41,
+            entries: vec![(40, 1 << 20), (41, 2 << 20)],
+        });
+        let epoch = h.cons.pending_truncation.expect("wipe truncation in flight");
+
+        // Fiat record already persisted before any archive ack: position 0,
+        // config == prev == the CURRENT (v1) config, not genesis.
+        let rec = h.cons.state.config_record().expect("record still present");
+        assert_eq!(rec.position, 0);
+        assert_eq!(rec.prev_position, 0);
+        assert_eq!(stored_to_cluster(&rec.config), v1, "fiat keeps the CURRENT config");
+        assert_eq!(rec.config, rec.prev, "prev duplicated (fiat, not a genuine predecessor)");
+
+        h.post_ack_and_drain(epoch, 0);
+        let rec = h.cons.state.config_record().unwrap();
+        assert_eq!(stored_to_cluster(&rec.config), v1, "SM's own wipe-revert re-confirms the fiat");
+    }
+
+    /// M7 Task 6: `to == config_record().position` exactly preserves the frame
+    /// (frame-END effect point; truncation keeps `[0, to)`) — the guard is a
+    /// strict `<`, so no revert fires and the record is untouched by `exec`.
+    #[test]
+    fn truncate_exec_at_config_position_leaves_record_untouched() {
+        let mut h = harness();
+        let v1 = v1_of(&h);
+        // Adopt v1 EXACTLY at the divergent-map scenario's truncation target.
+        h.cons.feed(Event::ConfigObserved { position: 4096, config: v1.clone() });
+        let before = h.cons.state.config_record().unwrap();
+
+        h.adopt_and_truncate(3, vec![(1, 0), (3, 4096)]);
+        let after = h.cons.state.config_record().unwrap();
+        assert_eq!(after, before, "to == position: no revert, record byte-identical");
+    }
+
+    // ---- M7 Task 6: boot recovery of the ConfigRecord ----
+
+    /// A genesis `ClusterConfig` over a one-voter seed `[(0, addr)]`.
+    fn seed_members() -> Vec<(NodeId, SocketAddr)> {
+        vec![(0, "127.0.0.1:9200".parse().unwrap())]
+    }
+
+    /// Append a real `FRAME_TYPE_CONFIG` frame carrying `cfg` into `archive` (via
+    /// a throwaway heap-backed buffer + `Appender`, exactly the bytes
+    /// `Consensus::append_config_frame` would produce) and durably record it
+    /// (`do_work` to exhaustion). Returns the frame-END position.
+    fn append_and_archive_config(archive: &mut Archive, term: u32, cfg: &ClusterConfig) -> u64 {
+        let cnc = test_cnc();
+        let buffer = Arc::new(LogBuffer::new(Region::heap_zeroed(1 << 16), cnc, 4096));
+        let mut appender = Appender::new(Arc::clone(&buffer), term);
+        let mut bytes = Vec::new();
+        encode_config(&cluster_to_wire(cfg, 0), &mut bytes);
+        let end = appender.append_config(term, &bytes).expect("config frame append");
+        while archive.do_work(&buffer).expect("archive do_work") {}
+        end
+    }
+
+    /// Step 3a: a follower durably archives a `FRAME_TYPE_CONFIG` frame (the data
+    /// plane), but a crash before the NEXT duty cycle drains it means the
+    /// `ConfigRecord` file itself never reflects the adoption — modeled here by
+    /// deleting `config.state` outright from a stopped instance dir. On reboot,
+    /// `recover_config_record` must NOT silently reseed genesis (losing the real
+    /// adoption): the archive scan re-discovers the durably-archived frame and
+    /// rebuilds the record to the SAME version it held before the file was lost.
+    #[test]
+    fn boot_rebuilds_config_record_from_archive_scan_after_config_state_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        let members = seed_members();
+
+        let mut archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
+        let genesis = ClusterConfig::genesis(
+            members.iter().map(|(id, a)| (*id, addr_to_pair(*a))).collect(),
+            Vec::new(),
+        );
+        let mut v1 = genesis.clone();
+        v1.learners.push((9, (9, 1)));
+        v1.version = 1;
+        let end = append_and_archive_config(&mut archive, 1, &v1);
+        let durable = archive.recovered_position();
+        assert_eq!(durable, end, "the config frame is the only bytes recorded");
+
+        // First life: the record legitimately reflects v1 (as `Action::ConfigAdopted`
+        // would have persisted it), then config.state is lost.
+        {
+            let state = NodeState::open(&dir.path().join("state")).unwrap();
+            let rec = ConfigRecord {
+                position: end,
+                config: cluster_to_stored(&v1),
+                prev_position: 0,
+                prev: cluster_to_stored(&genesis),
+            };
+            state.store_config_record(&rec).unwrap();
+        }
+        std::fs::remove_file(dir.path().join("state").join("config.state")).unwrap();
+        // A stale `.bak`/rotation slot could also carry the old value back — a
+        // real `StableValue` may keep more than one file; remove whatever exists.
+        for entry in std::fs::read_dir(dir.path().join("state")).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().starts_with("config.state") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+
+        // Reboot: fresh `Archive::open` (recovers the durably-archived frame) +
+        // fresh `NodeState::open` (config.state gone -> `config_record() == None`).
+        let archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
+        let state = NodeState::open(&dir.path().join("state")).unwrap();
+        assert!(state.config_record().is_none(), "the file is genuinely gone");
+
+        let rec = recover_config_record(&state, &archive, durable, &members, &[]).unwrap();
+        assert_eq!(rec.config.version, 1, "rebuilt to the SAME version the lost file held");
+        assert_eq!(stored_to_cluster(&rec.config), v1);
+        assert_eq!(rec.position, end);
+        assert_eq!(stored_to_cluster(&rec.prev), genesis, "prev recovered as the genesis seed");
+        // The rebuilt record is durable — a subsequent read agrees.
+        assert_eq!(state.config_record().unwrap(), rec);
+    }
+
+    /// T5-carry: a record whose `position` is ABOVE the recovered archive
+    /// frontier (the leader persists at append, strictly ahead of the archive's
+    /// own fsync) must revert to its own prev level on boot — the position it
+    /// claims is not actually backed by durable bytes.
+    #[test]
+    fn boot_reverts_a_config_record_persisted_ahead_of_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        let members = seed_members();
+        let archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
+        let durable = archive.recovered_position();
+        assert_eq!(durable, 0, "empty journal: nothing durable");
+
+        let genesis = ClusterConfig::genesis(
+            members.iter().map(|(id, a)| (*id, addr_to_pair(*a))).collect(),
+            Vec::new(),
+        );
+        let mut v1 = genesis.clone();
+        v1.learners.push((9, (9, 1)));
+        v1.version = 1;
+
+        let state = NodeState::open(&dir.path().join("state")).unwrap();
+        // Simulate the leader's append-time persist: position 9000, ABOVE durable
+        // (0) — the archive never actually recorded that frame before the crash.
+        // `prev` (genesis, position 0) is genuinely below durable, so this is the
+        // ordinary (non-compounding) revert case.
+        let ahead = ConfigRecord {
+            position: 9000,
+            config: cluster_to_stored(&v1),
+            prev_position: 0,
+            prev: cluster_to_stored(&genesis),
+        };
+        state.store_config_record(&ahead).unwrap();
+
+        let rec = recover_config_record(&state, &archive, durable, &members, &[]).unwrap();
+        assert_eq!(rec.position, 0, "reverted to prev's position");
+        assert_eq!(stored_to_cluster(&rec.config), genesis, "reverted to the genuine predecessor");
+        assert_eq!(state.config_record().unwrap(), rec, "the revert is itself persisted");
+    }
+
+    /// T5-carry, compounding case: BOTH the record's position AND its prev's
+    /// position are ahead of durable (two adoptions in the same crash-exposed
+    /// window) — there is nothing genuine left to revert to, so recovery falls
+    /// back to a fresh config-by-fiat genesis seed.
+    #[test]
+    fn boot_falls_back_to_seed_when_both_levels_are_ahead_of_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        let members = seed_members();
+        let archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
+        let durable = archive.recovered_position();
+        assert_eq!(durable, 0);
+
+        let genesis = ClusterConfig::genesis(
+            members.iter().map(|(id, a)| (*id, addr_to_pair(*a))).collect(),
+            Vec::new(),
+        );
+        let mut v1 = genesis.clone();
+        v1.learners.push((9, (9, 1)));
+        v1.version = 1;
+        let mut v2 = v1.clone();
+        v2.version = 2;
+
+        let state = NodeState::open(&dir.path().join("state")).unwrap();
+        let ahead = ConfigRecord {
+            position: 9000,
+            config: cluster_to_stored(&v2),
+            prev_position: 5000, // ALSO above durable (0)
+            prev: cluster_to_stored(&v1),
+        };
+        state.store_config_record(&ahead).unwrap();
+
+        let rec = recover_config_record(&state, &archive, durable, &members, &[]).unwrap();
+        assert_eq!(rec.position, 0);
+        assert_eq!(rec.config.version, 0, "fresh genesis-by-fiat, not either compromised level");
+        assert_eq!(stored_to_cluster(&rec.config), genesis);
+        assert_eq!(rec.config, rec.prev, "seed record: prev duplicated");
     }
 }

@@ -46,7 +46,9 @@
 //! sends real SIGKILLs.
 #![cfg(feature = "hard-crash-tests")]
 
+use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -55,6 +57,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use uc2_client::{Client, ClientError};
+use uc2_log::cnc::{AdminReq, CncPage};
 use uc_lincheck::checker::{Verdict, check_register};
 use uc_lincheck::history::{History, Outcome};
 use uc_lincheck::model::{Op, RegResp};
@@ -551,4 +554,540 @@ fn node_sigkill_recovery_once(run: u32) {
 
     assert_linearizable(&entries, "node_sigkill_recovery", &format!("run{run}"));
     // node / svc Reaps dropped here → killed + reaped.
+}
+
+// ============================================================== test 3 (M7)
+//
+// `sigkill_mid_config_window` — a REAL 3-node, multi-PROCESS cluster (unlike
+// every other test in this file, which is single-node): 3 separate
+// `uc2-crashtest-node`/`uc2-crashtest-service` process pairs sharing nothing
+// but the wire protocol, driven by a concurrent CAS-register workload routed
+// leader-hint-style across all 3 (mirrors `uc2_node/tests/lincheck_v2/mod.rs`'s
+// `WorkerConn`). Against that live cluster: write an `AddLearner` admin
+// request directly into the LEADER's cnc admin slot (the `uc2ctl`/
+// `reconfig.rs` pattern, reached here without a client or the bin), then race
+// a real SIGKILL of the leader's NODE PROCESS against its own append-to-
+// commit window — tight timing, no synchronization with the node's internal
+// state beyond polling `config_pending`/`config_version` on the SAME cnc
+// mmap. Whichever side of the race the kill lands on is a legitimate outcome
+// (`uc2_node/tests/reconfig.rs::truncation_revert_e2e` already proves a
+// leader's own admin accept is a LOCAL, optimistic append — genuinely
+// revertible until quorum commit) — the invariant under test is that the
+// cluster NEVER converges on a MIX: every live node must land on the exact
+// same config version (either the pre-race one or pre-race+1), and the WGL
+// history recorded by the concurrent workload throughout must stay
+// linearizable.
+
+/// Bind a fresh loopback UDP socket purely to learn a free port, then drop it
+/// — the child node process binds the real socket itself (mirrors
+/// `uc2_node/tests/reconfig.rs`'s pre-bind-then-hand-the-address-to-a-peer
+/// pattern, adapted for a separate OS process instead of a `UdpSocket` we
+/// could hand over directly).
+fn free_addr() -> SocketAddr {
+    let s = UdpSocket::bind("127.0.0.1:0").expect("bind probe");
+    let addr = s.local_addr().unwrap();
+    drop(s);
+    addr
+}
+
+fn members_arg(members: &[(u32, SocketAddr)]) -> String {
+    members.iter().map(|(id, a)| format!("{id}@{a}")).collect::<Vec<_>>().join(",")
+}
+
+fn addr_to_wire(addr: SocketAddr) -> (u32, u16) {
+    match addr {
+        SocketAddr::V4(a) => (u32::from(*a.ip()), a.port()),
+        SocketAddr::V6(_) => panic!("this harness only binds IPv4 loopback"),
+    }
+}
+
+/// Spawn a node process as one voter of an `n`-member cluster (unlike
+/// `common::spawn_node`, which always boots a single-node default).
+fn spawn_node_multi(instance_dir: &Path, id: u32, bind: SocketAddr, members: &str) -> Reap {
+    let child = Command::new(NODE_BIN)
+        .arg("--instance-dir")
+        .arg(instance_dir)
+        .arg("--app-id")
+        .arg(APP_ID)
+        .arg("--id")
+        .arg(id.to_string())
+        .arg("--bind")
+        .arg(bind.to_string())
+        .arg("--members")
+        .arg(members)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn node {id}: {e}"));
+    Reap(child)
+}
+
+/// Open `dir`'s cnc page directly (the `uc2ctl` attach path minus the bin,
+/// mirrors `uc2_node/tests/reconfig.rs`'s `open_cnc`) — `None` on any
+/// transient failure (mid-restart truncation window, not yet created), which
+/// every caller below treats as "try again", never a hard error.
+fn open_cnc(dir: &Path) -> Option<Arc<CncPage>> {
+    CncPage::open_file(&dir.join("cnc2.dat"), APP_ID).ok()
+}
+
+/// Wait for exactly one of `dirs` to report itself the sole serving leader
+/// (both `NODE_FLAG_LEADER` and `NODE_FLAG_CAN_SERVE` set), reading every
+/// node's cnc directly. Returns its index.
+fn await_single_leader_multi(dirs: &[PathBuf], secs: u64) -> usize {
+    use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
+    let want = NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let serving: Vec<usize> = (0..dirs.len())
+            .filter(|&i| {
+                open_cnc(&dirs[i]).is_some_and(|c| c.status().flags.load_acquire() & want == want)
+            })
+            .collect();
+        assert!(serving.len() <= 1, "split-brain: dirs {serving:?} all serve");
+        if serving.len() == 1 {
+            return serving[0];
+        }
+        assert!(Instant::now() < deadline, "no single leader among {} dirs within {secs}s", dirs.len());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Wait until a node respawned on the SAME instance dir presents a FRESH cnc
+/// `instance_id` (differing from `old_id`) — mirrors `common::
+/// wait_for_fresh_instance`, but reads the raw cnc page directly instead of
+/// requiring a full client attach (this test's own `open_cnc`/`CncPage`
+/// handles are already in scope). Returns the fresh id.
+fn wait_for_fresh_cnc_instance(dir: &Path, old_id: Option<u128>, timeout: Duration) -> u128 {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(id) = open_cnc(dir).and_then(|cnc| cnc.try_instance_id())
+            && Some(id) != old_id
+        {
+            return id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "node restart on {} never presented a fresh cnc instance within {timeout:?}",
+            dir.display()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Wait until EVERY dir's `config_version` reads the SAME value, that value
+/// being either `v_lo` or `v_hi` (the only two legal outcomes of one
+/// in-flight admin op), then re-confirm after a short settle window — a
+/// still-propagating majority could transiently look converged one poll
+/// before a lagging node catches up. Returns the settled common version.
+fn await_config_converged_one_of(dirs: &[PathBuf], v_lo: u64, v_hi: u64, secs: u64) -> u64 {
+    let read_all = |dirs: &[PathBuf]| -> Option<Vec<u64>> {
+        dirs.iter().map(|d| open_cnc(d).map(|c| c.config_version())).collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(versions) = read_all(dirs) {
+            let v0 = versions[0];
+            if versions.iter().all(|&v| v == v0) && (v0 == v_lo || v0 == v_hi) {
+                std::thread::sleep(Duration::from_millis(300));
+                if read_all(dirs) == Some(versions) {
+                    return v0;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "config never converged to a single value in {{{v_lo}, {v_hi}}} within {secs}s (last: {:?})",
+            read_all(dirs)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+// ---------------------------------------------- multi-node worker routing
+//
+// Mirrors `uc2_node/tests/lincheck_v2/mod.rs`'s `WorkerConn`/`submit_cmd`/
+// `read_leader` (leader-hint routing across several dirs instead of this
+// file's single-`dir` `Conn`/`submit_cmd`/`read_leader` above), reusing the
+// SAME `SubmitOutcome`/`ReadOutcome` classification types.
+
+struct MultiConn {
+    dirs: Arc<Vec<PathBuf>>,
+    target: usize,
+    client: Option<Client>,
+}
+
+impl MultiConn {
+    /// `start` is taken mod `dirs.len()` — callers pass a worker id as the
+    /// initial routing target (spreading workers across nodes at boot), and
+    /// this crate's worker ids are 1-based (id 0 is reserved for the
+    /// warm-up write in the WGL history), so an id `>= dirs.len()` must wrap
+    /// rather than index out of range.
+    fn new(dirs: Arc<Vec<PathBuf>>, start: usize) -> Self {
+        let target = start % dirs.len();
+        Self { dirs, target, client: None }
+    }
+    fn client(&mut self) -> Option<&Client> {
+        if self.client.is_none() {
+            match Client::connect(&self.dirs[self.target], APP_ID) {
+                Ok(c) => self.client = Some(c),
+                Err(_) => return None,
+            }
+        }
+        self.client.as_ref()
+    }
+    fn reconnect_to(&mut self, idx: usize) {
+        if let Some(c) = self.client.take() {
+            c.shutdown();
+        }
+        self.target = idx % self.dirs.len();
+    }
+    fn rotate(&mut self) {
+        let next = (self.target + 1) % self.dirs.len();
+        self.reconnect_to(next);
+    }
+    fn drop_client(&mut self) {
+        if let Some(c) = self.client.take() {
+            c.shutdown();
+        }
+    }
+}
+
+fn submit_cmd_multi(conn: &mut MultiConn, cmd: &Cmd, deadline: Instant) -> SubmitOutcome {
+    loop {
+        if Instant::now() > deadline {
+            return SubmitOutcome::Indeterminate;
+        }
+        let Some(client) = conn.client() else {
+            std::thread::sleep(Duration::from_millis(20));
+            conn.rotate();
+            continue;
+        };
+        match client.submit::<Cmd, CmdResp>(cmd) {
+            Ok(r) => return SubmitOutcome::Ok(r),
+            Err(ClientError::NotLeader { hint }) => match hint {
+                Some(h) => conn.reconnect_to(h as usize),
+                None => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    conn.rotate();
+                }
+            },
+            Err(ClientError::BackpressureFull) | Err(ClientError::Retry) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(ClientError::InstanceRestart { .. })
+            | Err(ClientError::Cnc(_))
+            | Err(ClientError::Ring(_)) => {
+                conn.drop_client();
+                return SubmitOutcome::Indeterminate;
+            }
+            Err(ClientError::Timeout(_)) | Err(ClientError::ResponseOverwritten) => {
+                return SubmitOutcome::Indeterminate;
+            }
+            Err(e @ ClientError::Decode(_))
+            | Err(e @ ClientError::AppIdMismatch { .. })
+            | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
+        }
+    }
+}
+
+fn read_leader_multi(conn: &mut MultiConn, deadline: Instant) -> ReadOutcome {
+    loop {
+        if Instant::now() > deadline {
+            return ReadOutcome::Indeterminate;
+        }
+        let Some(client) = conn.client() else {
+            std::thread::sleep(Duration::from_millis(20));
+            conn.rotate();
+            continue;
+        };
+        match client.query_linearizable::<(), Option<u64>>(&()) {
+            Ok(v) => return ReadOutcome::Ok(v),
+            Err(ClientError::NotLeader { hint }) => match hint {
+                Some(h) => conn.reconnect_to(h as usize),
+                None => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    conn.rotate();
+                }
+            },
+            Err(ClientError::Retry) => std::thread::sleep(Duration::from_millis(15)),
+            Err(ClientError::InstanceRestart { .. })
+            | Err(ClientError::Cnc(_))
+            | Err(ClientError::Ring(_)) => {
+                conn.drop_client();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(ClientError::BackpressureFull) => std::thread::sleep(Duration::from_millis(10)),
+            Err(ClientError::Timeout(_)) | Err(ClientError::ResponseOverwritten) => {
+                return ReadOutcome::Indeterminate;
+            }
+            Err(e @ ClientError::Decode(_))
+            | Err(e @ ClientError::AppIdMismatch { .. })
+            | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::ShutDown) => return ReadOutcome::Fatal(format!("{e:?}")),
+        }
+    }
+}
+
+fn worker_multi(
+    id: u32,
+    dirs: Arc<Vec<PathBuf>>,
+    history: Arc<History>,
+    stop: Arc<AtomicBool>,
+    mut rng: StdRng,
+    last_seen: Arc<AtomicU64>,
+    throttle: Duration,
+) {
+    let mut conn = MultiConn::new(dirs, id as usize);
+    while !stop.load(Ordering::Relaxed) {
+        if !throttle.is_zero() {
+            std::thread::sleep(throttle);
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        match rng.random_range(0..3u8) {
+            0 => {
+                let v = rng.random_range(1..1000u64);
+                let inv = history.invoke();
+                let outcome = match submit_cmd_multi(&mut conn, &Cmd::Write(v), deadline) {
+                    SubmitOutcome::Ok(_) => Outcome::Ok(RegResp::Ack),
+                    SubmitOutcome::Indeterminate => Outcome::Indeterminate,
+                    SubmitOutcome::Fatal(e) => panic!("fatal submit: {e}"),
+                };
+                history.record(id, Op::Write(v), inv, outcome);
+            }
+            1 => {
+                let inv = history.invoke();
+                let outcome = match read_leader_multi(&mut conn, deadline) {
+                    ReadOutcome::Ok(v) => {
+                        if let Some(x) = v {
+                            last_seen.store(x, Ordering::Relaxed);
+                        }
+                        Outcome::Ok(RegResp::Value(v))
+                    }
+                    ReadOutcome::Indeterminate => Outcome::Indeterminate,
+                    ReadOutcome::Fatal(e) => panic!("fatal read: {e}"),
+                };
+                history.record(id, Op::Read, inv, outcome);
+            }
+            _ => {
+                let old = if rng.random_bool(0.7) {
+                    last_seen.load(Ordering::Relaxed)
+                } else {
+                    rng.random_range(1..1000u64)
+                };
+                let new = rng.random_range(1..1000u64);
+                let inv = history.invoke();
+                let outcome = match submit_cmd_multi(&mut conn, &Cmd::Cas { old, new }, deadline) {
+                    SubmitOutcome::Ok(CmdResp::CasResult(b)) => {
+                        if b {
+                            last_seen.store(new, Ordering::Relaxed);
+                        }
+                        Outcome::Ok(RegResp::CasOk(b))
+                    }
+                    SubmitOutcome::Ok(other) => panic!("cas returned non-cas response: {other:?}"),
+                    SubmitOutcome::Indeterminate => Outcome::Indeterminate,
+                    SubmitOutcome::Fatal(e) => panic!("fatal cas: {e}"),
+                };
+                history.record(id, Op::Cas { old, new }, inv, outcome);
+            }
+        }
+    }
+    conn.drop_client();
+}
+
+fn spawn_workers_multi(
+    dirs: &Arc<Vec<PathBuf>>,
+    history: &Arc<History>,
+    stop: &Arc<AtomicBool>,
+    last_seen: &Arc<AtomicU64>,
+    seed: u64,
+    throttle: Duration,
+    n_workers: u32,
+) -> Vec<std::thread::JoinHandle<()>> {
+    (1..=n_workers)
+        .map(|w| {
+            let rng = StdRng::seed_from_u64(seed ^ (w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let (dirs, history, stop, last_seen) =
+                (Arc::clone(dirs), Arc::clone(history), Arc::clone(stop), Arc::clone(last_seen));
+            std::thread::spawn(move || worker_multi(w, dirs, history, stop, rng, last_seen, throttle))
+        })
+        .collect()
+}
+
+/// Record the warm-up write against whichever node is currently leader
+/// (routing via `MultiConn`) — see the single-node `warmup_write`'s doc for
+/// why this must be recorded rather than discarded.
+fn warmup_write_multi(dirs: &Arc<Vec<PathBuf>>, history: &History, last_seen: &AtomicU64) {
+    let mut conn = MultiConn::new(Arc::clone(dirs), 0);
+    let inv = history.invoke();
+    match submit_cmd_multi(&mut conn, &Cmd::Write(1), Instant::now() + Duration::from_secs(20)) {
+        SubmitOutcome::Ok(_) => {}
+        other => panic!("warm-up write did not commit: {other:?}"),
+    }
+    history.record(0, Op::Write(1), inv, Outcome::Ok(RegResp::Ack));
+    last_seen.store(1, Ordering::Relaxed);
+    conn.drop_client();
+}
+
+/// M7 Task 10 — the scenario itself. A real 3-node cluster; `RUNS` times,
+/// race an `AddLearner` admin write against a SIGKILL of the leader's node
+/// process, restart it, and prove cluster-wide config-version convergence
+/// never straddles two values. Concurrent workers keep driving the WGL
+/// workload across the whole test; the final history must stay
+/// linearizable.
+#[test]
+fn sigkill_mid_config_window() {
+    shorten_client_timeout();
+    let tmp = tempfile::tempdir().unwrap();
+
+    const N: usize = 3;
+    let addrs: Vec<SocketAddr> = (0..N).map(|_| free_addr()).collect();
+    let members: Vec<(u32, SocketAddr)> = (0..N as u32).map(|i| (i, addrs[i as usize])).collect();
+    let members_str = members_arg(&members);
+
+    let mut dirs: Vec<PathBuf> = Vec::with_capacity(N);
+    let mut node_procs: Vec<Option<Reap>> = Vec::with_capacity(N);
+    for i in 0..N as u32 {
+        let d = tmp.path().join(format!("n{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        node_procs.push(Some(spawn_node_multi(&d, i, addrs[i as usize], &members_str)));
+        wait_for_path(&d.join("cnc2.dat"), Duration::from_secs(10));
+        dirs.push(d);
+    }
+    let mut svc_procs: Vec<Option<Reap>> = dirs.iter().map(|d| Some(spawn_service(d))).collect();
+
+    await_single_leader_multi(&dirs, 30);
+
+    let dirs = Arc::new(dirs);
+    let history = Arc::new(History::default());
+    let last_seen = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    warmup_write_multi(&dirs, &history, &last_seen);
+
+    const N_WORKERS: u32 = 3;
+    let handles =
+        spawn_workers_multi(&dirs, &history, &stop, &last_seen, 0xC0FFEE, Duration::from_millis(15), N_WORKERS);
+
+    const RUNS: u32 = 3;
+    let mut committed_version = 0u64;
+    let mut observed_pending_count = 0u32;
+    let mut committed_count = 0u32;
+
+    for run in 0..RUNS {
+        let li = await_single_leader_multi(&dirs, 20);
+
+        let spare_id = 100 + run; // fresh-forever: never reused across runs
+        let spare_addr = free_addr();
+        let (ip, port) = addr_to_wire(spare_addr);
+        let target_version = committed_version + 1;
+
+        let leader_cnc = open_cnc(&dirs[li]).expect("leader cnc must open");
+        let old_seq = leader_cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0);
+        let seq = old_seq + 1;
+        let nonce = rand::random::<u64>();
+        leader_cnc.write_admin_req(&AdminReq {
+            seq,
+            nonce,
+            op: 1, // AddLearner
+            id: spare_id,
+            ip,
+            port,
+        });
+
+        // The race: poll for the append-to-commit window and SIGKILL the
+        // instant we see it — or, if we never catch it (the change committed
+        // faster than we could observe, or never got appended at all before
+        // the poll budget expires), kill anyway. Both sides of the race are
+        // valid histories (see the module doc above); `observed_pending`
+        // just tells us which side THIS run actually landed on.
+        let race_deadline = Instant::now() + Duration::from_millis(1500);
+        let mut observed_pending = false;
+        while Instant::now() < race_deadline {
+            if leader_cnc.config_pending() != 0 {
+                observed_pending = true;
+                break;
+            }
+            if leader_cnc.config_version() >= target_version {
+                break; // already committed — kill now anyway (the other side)
+            }
+        }
+        // Capture the pre-kill instance id, then DROP our handle to this
+        // generation's cnc BEFORE the restart truncates the SAME inode in
+        // place — holding a live mmap across that window is the documented
+        // "accepted SIGBUS window" in `uc2_log::cnc::CncPage::create_file`'s
+        // doc, which explicitly calls out a "stale process" doing exactly
+        // this as the at-risk party; dropping first makes every subsequent
+        // read go through a FRESH `open_file` (safe: it just gets `None` or
+        // a `BadHeader` during the transient window, never a SIGBUS).
+        let old_instance_id = leader_cnc.try_instance_id();
+        drop(leader_cnc);
+
+        if observed_pending {
+            observed_pending_count += 1;
+        }
+
+        // SIGKILL the leader NODE now (Reap reassignment), whichever side of
+        // the race we landed on. Also drop its SERVICE — the v2.0 external-
+        // supervisor contract restated in `node_sigkill_recovery`'s doc above
+        // (a service never self-heals across a node restart).
+        node_procs[li] = None;
+        svc_procs[li] = None;
+
+        // Restart on the SAME id/bind/members; wait for a genuinely FRESH
+        // cnc instance (not the stale pre-truncate leftover) before the
+        // service reattaches.
+        node_procs[li] = Some(spawn_node_multi(&dirs[li], li as u32, addrs[li], &members_str));
+        wait_for_fresh_cnc_instance(&dirs[li], old_instance_id, Duration::from_secs(10));
+        svc_procs[li] = Some(spawn_service(&dirs[li]));
+
+        // Cluster-wide convergence: EITHER the pre-race version (the add
+        // never committed) OR pre-race+1 (it did) — but the identical value
+        // on every node, never a straddle.
+        let final_version =
+            await_config_converged_one_of(&dirs, committed_version, target_version, 30);
+        assert!(
+            final_version == committed_version || final_version == target_version,
+            "run {run}: converged to an unexpected version {final_version} \
+             (expected {committed_version} or {target_version})"
+        );
+        if final_version == target_version {
+            committed_count += 1;
+        }
+        eprintln!(
+            "[sigkill_mid_config_window] run={run} observed_pending={observed_pending} \
+             final_version={final_version} (pre-race was {committed_version}, target {target_version})"
+        );
+        committed_version = final_version;
+
+        // Let the workers get some clean traffic through before the NEXT
+        // race — otherwise 3 back-to-back kill/restart cycles (each only a
+        // few hundred ms) never give the concurrent workload a settled
+        // window to actually rack up `Ok`s, and the liveness gate below is
+        // starved for reasons that have nothing to do with linearizability.
+        std::thread::sleep(Duration::from_millis(800));
+    }
+
+    // Same reasoning as above: let the tail of the history reflect a
+    // healthy, fully-recovered cluster after the last race.
+    std::thread::sleep(Duration::from_secs(1));
+
+    stop.store(true, Ordering::Relaxed);
+    join_workers(handles);
+
+    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let ok = History::ok_count(&entries);
+    eprintln!(
+        "[sigkill_mid_config_window] ops={} ok={ok} runs={RUNS} \
+         observed_pending={observed_pending_count}/{RUNS} committed={committed_count}/{RUNS} \
+         final_config_version={committed_version}",
+        entries.len()
+    );
+    assert!(
+        ok >= 20,
+        "liveness: only {ok} ops completed Ok (<20) across the {RUNS} config-window races"
+    );
+
+    assert_linearizable(&entries, "sigkill_mid_config_window", "all");
+    // node_procs / svc_procs dropped here → killed + reaped.
 }

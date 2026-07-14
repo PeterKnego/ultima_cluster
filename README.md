@@ -8,6 +8,13 @@ memory-channel speed.
 **Status: v2.0** — milestones M1–M6 complete, every gate passed on real
 hardware. Measured on a 3×`c6id.2xlarge` AWS fleet (fsync on, linearizable):
 
+**M7 (live single-server reconfiguration)** is implemented and green on the
+full local proof stack (sim invariants, WGL capstones incl. a reconfig-churn
+arm, crashtest, multi-process `--local` orchestrator run) — see
+[`docs/benchmarks/uc2-m7-gate-2026-07-13.md`](docs/benchmarks/uc2-m7-gate-2026-07-13.md).
+The 5-host fleet run (the gate's headline number) is a separate,
+user-approved step; `v2.1.0` is tagged only once it lands.
+
 | Gate | Result |
 |---|---|
 | End-to-end SDK round trip (M5) | **1.64 M responses/s @ p50 0.600 ms** (4.1× the ≥400 k bar) |
@@ -99,21 +106,24 @@ suite (capstones, sim-heavy, loom, crashtest).
 
 ## Documentation
 
-- **Design spec (canonical):** [`docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md`](docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md)
-- **Milestone gate records:** [`docs/benchmarks/`](docs/benchmarks/) (`uc2-m1` … `uc2-m6`)
-- **Operations runbook:** [`docs/ops/uc2-runbook.md`](docs/ops/uc2-runbook.md) — instance-dir layout, durability requirements, cnc decoding, purge enablement, learner add/remove
+- **Design specs (canonical):** [`docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md`](docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md) (M1–M6) + [`docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md`](docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md) (M7)
+- **Milestone gate records:** [`docs/benchmarks/`](docs/benchmarks/) (`uc2-m1` … `uc2-m7`)
+- **Operations runbook:** [`docs/ops/uc2-runbook.md`](docs/ops/uc2-runbook.md) — instance-dir layout, durability requirements, cnc decoding, purge enablement, live reconfiguration ops (`uc2ctl`)
 - **v1 history:** [`docs/tasks/`](docs/tasks/) — the retired openraft-based v1 stack's consolidated record (kept as the negative-results archive that shaped v2)
 
 Bench/fleet tooling lives under [`bench-infra/`](bench-infra/) (terraform +
 ansible + the fleet-gate orchestrator; refuses to run journal-bearing gates on
 RAM-backed filesystems).
 
-## Scope (v2.0)
+## Scope (v2.0 + M7)
 
-Static voting set (learners supported; joint-consensus reconfiguration is
-v2.x). Trusted-network posture — no wire encryption (a PSK-MAC slot is
-reserved in the datagram header). One node per instance directory, up to 8
-peers in the cnc observability band.
+**Dynamic membership (M7)**: single-server reconfiguration is shipped —
+promote / demote / add / remove one member at a time, live, under load, via
+the `uc2ctl` admin CLI. Joint consensus is not needed for the supported ops
+(adjacent configs differ by one member, so majorities always intersect). Hard
+cap: **8 total members** (voters + learners) in the cnc observability band —
+unchanged from v2.0. Trusted-network posture — no wire encryption (a PSK-MAC
+slot is reserved in the datagram header). One node per instance directory.
 
 ## License
 

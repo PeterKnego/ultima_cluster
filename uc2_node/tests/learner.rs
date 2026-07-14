@@ -26,8 +26,11 @@ use std::time::{Duration, Instant};
 
 use uc2_consensus::election::NodeId;
 use uc2_log::cnc::CncPage;
+use uc2_log::state::{ConfigRecord, NodeState, StoredConfig, StoredMember};
 use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig, PurgePolicy};
+use uc_protocol::v2::cnc::{CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER};
+use uc_protocol::v2::config::decode_config;
 
 const PAYLOAD: usize = 96;
 
@@ -324,6 +327,11 @@ fn learner_replicates_live_and_never_disturbs_quorum() {
 /// (Task 8 fix) instead of trying to truncate below the floor — and tail-replays
 /// the retained `[floor, append)`, reaching a frontier it could NEVER have reached
 /// by replay alone (those bytes are gone). The leader's commit never gates on it.
+///
+/// M7 Task 9: the pre-seeded config also adds a learner absent from the
+/// joiner's own boot seed, so the fiat-installed config genuinely diverges
+/// from the seed the joiner started with — proving the install rebuilds peer
+/// routing (`rebuild_net_for_config`), not just the SM/record/cnc version.
 #[test]
 fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     let _g = serialize();
@@ -362,8 +370,50 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     };
 
     let v_dir = dir.path().join("v0");
+    // M7 Task 9: the pre-seeded v1 config now ADDS a member absent from both
+    // nodes' boot seed (`members`/`learners` above) — a distinct learner id 9
+    // at an addr neither node ever binds (fire-and-forget UDP fan-out to an
+    // unbound port is harmless, same convention `reconfig.rs` uses for
+    // members that don't need a real running node). This is what turns the
+    // T7-review gap real: the joiner's snapshot-installed config genuinely
+    // DIFFERS from its own boot seed (not just a version bump on identical
+    // membership), so converging `config_version` alone can't distinguish
+    // "adopted the config" from "adopted the config AND rebuilt routing" —
+    // the peer-band assertion below is what actually pins the rebuild.
+    let extra_learner_id: NodeId = 9;
+    let extra_learner_addr: SocketAddr = "127.0.0.1:59909".parse().unwrap();
+    // M7 Task 6: pre-seed the voter's `ConfigRecord` at version 1 BEFORE it
+    // boots, so the config the snapshot session carries is genuinely
+    // non-genesis (and, as of Task 9, genuinely different membership) — the
+    // only way to prove the wire carry (and now the routing rebuild) end to
+    // end rather than asserting a trivial 0 == 0 / seed == seed coincidence.
+    let stored_member = |id: NodeId, a: SocketAddr| StoredMember {
+        id,
+        ip: match a.ip() {
+            std::net::IpAddr::V4(v4) => u32::from(v4),
+            std::net::IpAddr::V6(_) => panic!("ipv4 only"),
+        },
+        port: a.port(),
+    };
+    std::fs::create_dir_all(v_dir.join("state")).unwrap();
+    {
+        let cfg_v1 = StoredConfig {
+            version: 1,
+            voters: members.iter().map(|(id, a)| stored_member(*id, *a)).collect(),
+            learners: learners
+                .iter()
+                .map(|(id, a)| stored_member(*id, *a))
+                .chain(std::iter::once(stored_member(extra_learner_id, extra_learner_addr)))
+                .collect(),
+            tombstones: Vec::new(),
+        };
+        let rec = ConfigRecord { position: 0, config: cfg_v1.clone(), prev_position: 0, prev: cfg_v1 };
+        NodeState::open(&v_dir.join("state")).unwrap().store_config_record(&rec).unwrap();
+    }
+
     let voter = Node::start_with_socket(cfg(0, v_addr, v_dir.clone()), v_sock).expect("start voter");
     await_until(30, "voter serves", || voter.can_serve());
+    assert_eq!(voter.config_version(), 1, "voter booted from the pre-seeded v1 record");
 
     for i in 0u64..24000 {
         let mut p = vec![0u8; PAYLOAD];
@@ -401,7 +451,8 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
 
     // A FRESH learner joins with no prior state.
     let l_dir = dir.path().join("l1");
-    let learner = Node::start_with_socket(cfg(1, l_addr, l_dir), l_sock).expect("start learner");
+    let learner =
+        Node::start_with_socket(cfg(1, l_addr, l_dir.clone()), l_sock).expect("start learner");
 
     // It cannot replay `[0, first_base)` (purged) — the ONLY way it reaches the
     // frontier is the snapshot session + AdoptFloor (+ lineage seed) + tail replay.
@@ -414,6 +465,80 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
         "the learner must have adopted the shipped snapshot floor, not replayed from 0"
     );
     assert!(!learner.is_leader(), "a learner never leads");
+
+    // M7 Task 6: the snapshot session carries the leader's config alongside its
+    // lineage (`SnapBeginBody.config`) — the joiner decodes + adopts it by fiat
+    // (`adopt_snapshot_config`) on install completion, so its `config_version`
+    // converges with the leader's PRE-SEEDED v1 (not the learner's own genesis
+    // v0) — a real cross-node version bump, not a trivial 0 == 0 coincidence.
+    assert_eq!(voter.config_version(), 1, "sanity: voter still reports the pre-seeded version");
+    assert_eq!(
+        learner.config_version(),
+        voter.config_version(),
+        "the joiner's config_version must converge with the leader's after install"
+    );
+
+    // M7 Task 9: the fiat install must also rebuild peer routing — the
+    // joiner's own boot seed never contained `extra_learner_id`, so the ONLY
+    // way its cnc peer band knows about it is `rebuild_net_for_config` having
+    // run off the snapshot-installed config (`rebuild_peer_maps` +
+    // `publish_peer_band`), not the stale seed it started from. This is the
+    // observable, stable proof the TODO's routing gap asked for — cheaper and
+    // more direct than trying to observe it via the sender's fan-out.
+    let learner_cnc = CncPage::open_file(&l_dir.join("cnc2.dat"), app).expect("open learner cnc");
+    let mut found_extra_learner = false;
+    for i in 0..CNC_MAX_PEER_SLOTS {
+        let raw = learner_cnc.peer_slot(i).id_and_role.load_acquire();
+        if raw == 0 {
+            continue;
+        }
+        let id = (raw >> 8) as u32;
+        let role = (raw & 0xff) as u8;
+        if id == extra_learner_id {
+            assert_eq!(
+                role, CNC_PEER_ROLE_LEARNER,
+                "joiner's peer slot for id {extra_learner_id} has role {role}, want learner"
+            );
+            found_extra_learner = true;
+        }
+    }
+    assert!(
+        found_extra_learner,
+        "joiner's peer band never picked up id {extra_learner_id} from the installed \
+         config — the snapshot-fiat install did not rebuild peer routing"
+    );
+
+    // Final-review fix (Item 1): assert the SNAP_BEGIN config-carry cache
+    // itself converged — not just `config_version`/peer-routing, which are
+    // proxies. Before this fix, `maybe_adopt_incoming_snapshot`'s fiat-install
+    // block persisted the record and rebuilt peer routing but never refreshed
+    // `config_bytes`, so the joiner's cache would still hold ITS OWN stale
+    // boot-seed derivation (version 0, no `extra_learner_id`) rather than the
+    // leader's installed v1 config — meaning a below-floor rejoiner that later
+    // became leader would ship the WRONG config to the next joiner. Compare
+    // the decoded MEMBERSHIP content, not the raw bytes: `prev_position` is a
+    // deliberately audit-trail-only field (per `cluster_to_wire`'s doc) and
+    // legitimately differs here — the voter's cache carries its genuinely
+    // historical prev_position (0, from the pre-seeded record), while the
+    // joiner's fiat wholesale-replace install collapses prev_position to the
+    // installed floor itself (`rebuild_net_for_config(&cfg, pos)` — see the
+    // fiat-install call site's comment); the two are not supposed to match.
+    let voter_decoded =
+        decode_config(&voter.snapshot_config_bytes()).expect("voter's cached config must decode");
+    let learner_decoded =
+        decode_config(&learner.snapshot_config_bytes()).expect("joiner's cached config must decode");
+    assert_eq!(learner_decoded.version, voter_decoded.version, "cache version must converge");
+    assert_eq!(learner_decoded.voters, voter_decoded.voters, "cache voters must converge");
+    assert_eq!(learner_decoded.learners, voter_decoded.learners, "cache learners must converge");
+    assert_eq!(
+        learner_decoded.tombstones, voter_decoded.tombstones,
+        "cache tombstones must converge"
+    );
+    assert_eq!(learner_decoded.version, 1, "decoded cache must carry the installed v1 config");
+    assert!(
+        learner_decoded.learners.iter().any(|m| m.id == extra_learner_id),
+        "decoded cache must contain the extra learner from the installed config"
+    );
 
     learner.stop();
     voter.stop();

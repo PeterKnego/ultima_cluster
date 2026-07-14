@@ -32,6 +32,12 @@ pub const FRAME_TYPE_PADDING: u8 = 2;
 /// serving. Replicated/archived/replayed like any message frame; the apply
 /// layer (M5) skips every non-MESSAGE type.
 pub const FRAME_TYPE_NEW_TERM: u8 = 3;
+/// Cluster-config entry (M7, spec 2026-07-13): payload =
+/// `v2::config::encode_config` bytes. Appended by a serving leader; adopted
+/// at append (leader) / at durable recording (follower, archive scan).
+/// Replicated/archived/replayed like any frame; the apply layer skips every
+/// non-MESSAGE type, so services never see it.
+pub const FRAME_TYPE_CONFIG: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -121,6 +127,7 @@ mod tests {
         assert_eq!(FRAME_TYPE_MESSAGE, 1);
         assert_eq!(FRAME_TYPE_PADDING, 2);
         assert_eq!(FRAME_TYPE_NEW_TERM, 3);
+        assert_eq!(FRAME_TYPE_CONFIG, 4);
     }
 
     #[test]

@@ -20,7 +20,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use uc_protocol::v2::cnc::{
-    self, CNC_MAX_PEER_SLOTS, CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE, CNC_OFF_HEADER_CRC,
+    self, CNC_MAX_PEER_SLOTS, CNC_OFF_ADMIN_REQ, CNC_OFF_ADMIN_RESP, CNC_OFF_APPEND,
+    CNC_OFF_ARCHIVE_FIRST_BASE, CNC_OFF_CONFIG_PENDING, CNC_OFF_CONFIG_VERSION, CNC_OFF_HEADER_CRC,
     CNC_OFF_PEER_SLOTS, CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_TERM,
     CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_V2_VERSION, CncHeader,
 };
@@ -155,6 +156,26 @@ pub fn pack_id_and_role(peer_id: u32, role_bits: u8) -> u64 {
 #[inline]
 pub fn pack_naks_plus_replay(naks_served: u32, replay_datagrams: u32) -> u64 {
     ((naks_served as u64) << 32) | replay_datagrams as u64
+}
+
+/// M7 admin request record (seqlock discipline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminReq {
+    pub seq: u64,
+    pub nonce: u64,
+    pub op: u32,
+    pub id: u32,
+    pub ip: u32,
+    pub port: u16,
+}
+
+/// M7 admin response record (seqlock discipline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminResp {
+    pub seq: u64,
+    pub status: u32,
+    pub reason: u32,
+    pub version: u64,
 }
 
 /// The mmap'd (or heap) cnc v2 page. `Region` is `Send + Sync`, so this is
@@ -398,6 +419,112 @@ impl CncPage {
         unsafe { &*(self.region.ptr_at(off) as *const PeerSlot) }
     }
 
+    /// M7: config version (adopted cluster-config).
+    pub fn config_version(&self) -> u64 {
+        // SAFETY: offset 3456, size 8 (first field of the 64-byte line).
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_CONFIG_VERSION) as *const PaddedAtomicU64 };
+        // SAFETY: cast is valid; the atomic is within bounds and properly aligned.
+        unsafe { (*ptr).load_acquire() }
+    }
+
+    /// M7: store config version.
+    pub fn store_config_version(&self, v: u64) {
+        // SAFETY: offset 3456, size 8.
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_CONFIG_VERSION) as *const PaddedAtomicU64 };
+        unsafe { (*ptr).store_release(v) }
+    }
+
+    /// M7: config pending (1 = uncommitted, 0 = stable).
+    pub fn config_pending(&self) -> u64 {
+        // SAFETY: offset 3520, size 8.
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_CONFIG_PENDING) as *const PaddedAtomicU64 };
+        unsafe { (*ptr).load_acquire() }
+    }
+
+    /// M7: store config pending.
+    pub fn store_config_pending(&self, pending: bool) {
+        // SAFETY: offset 3520, size 8.
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_CONFIG_PENDING) as *const PaddedAtomicU64 };
+        unsafe { (*ptr).store_release(pending as u64) }
+    }
+
+    /// M7: read admin request if seq > last_seen_seq (seqlock semantics).
+    /// Returns `None` if the seq hasn't advanced since last call with that seq.
+    pub fn read_admin_req(&self, last_seen_seq: u64) -> Option<AdminReq> {
+        let off = CNC_OFF_ADMIN_REQ;
+        // SAFETY: off is CNC_OFF_ADMIN_REQ, a 64-byte-aligned offset within
+        // the page; seq is the seqlock commit word (writer: write_admin_req,
+        // store_release'd last), so it must be acquire-loaded — a plain byte
+        // read here would let the compiler/CPU reorder the field reads below
+        // ahead of it, observing a torn write.
+        let ptr_seq = unsafe { self.region.ptr_at(off) as *const PaddedAtomicU64 };
+        let seq = unsafe { (*ptr_seq).load_acquire() };
+        if seq <= last_seen_seq {
+            return None;
+        }
+        // The acquire above orders these plain field reads (seqlock discipline).
+        let page = self.page();
+        let nonce = u64::from_le_bytes(page[off + 8..off + 16].try_into().unwrap());
+        let op = u32::from_le_bytes(page[off + 16..off + 20].try_into().unwrap());
+        let id = u32::from_le_bytes(page[off + 20..off + 24].try_into().unwrap());
+        let ip = u32::from_le_bytes(page[off + 24..off + 28].try_into().unwrap());
+        let port = u32::from_le_bytes(page[off + 28..off + 32].try_into().unwrap()) as u16;
+        Some(AdminReq { seq, nonce, op, id, ip, port })
+    }
+
+    /// M7: write admin request (fields then seq with release for seqlock semantics).
+    pub fn write_admin_req(&self, req: &AdminReq) {
+        let off = CNC_OFF_ADMIN_REQ;
+        let ptr_seq = unsafe { self.region.ptr_at(off) as *const PaddedAtomicU64 };
+        // Write fields first (not seq)
+        // SAFETY: off is CNC_OFF_ADMIN_REQ; we write a 64-byte line at that offset.
+        let page_mut = unsafe { std::slice::from_raw_parts_mut(self.region.ptr_at(off), 64) };
+        page_mut[8..16].copy_from_slice(&req.nonce.to_le_bytes());
+        page_mut[16..20].copy_from_slice(&req.op.to_le_bytes());
+        page_mut[20..24].copy_from_slice(&req.id.to_le_bytes());
+        page_mut[24..28].copy_from_slice(&req.ip.to_le_bytes());
+        page_mut[28..32].copy_from_slice(&u32::from(req.port).to_le_bytes());
+        // Write seq last with release
+        // SAFETY: ptr_seq is valid (cast from self.region.ptr_at); it's a PaddedAtomicU64.
+        unsafe { (*ptr_seq).store_release(req.seq) };
+    }
+
+    /// M7: read admin response if seq matches (seqlock semantics).
+    pub fn read_admin_resp(&self, expect_seq: u64) -> Option<AdminResp> {
+        // SAFETY: offset 3648, seq at +0, status at +8, reason at +12, version at +16.
+        let off = CNC_OFF_ADMIN_RESP;
+        // SAFETY: off is CNC_OFF_ADMIN_RESP, a 64-byte-aligned offset; seq is
+        // the seqlock commit word (writer: write_admin_resp, store_release'd
+        // last), so it must be acquire-loaded — see read_admin_req for why a
+        // plain byte read here would be unsound.
+        let ptr_seq = unsafe { self.region.ptr_at(off) as *const PaddedAtomicU64 };
+        let seq = unsafe { (*ptr_seq).load_acquire() };
+        if seq != expect_seq {
+            return None;
+        }
+        // The acquire above orders these plain field reads (seqlock discipline).
+        let page = self.page();
+        let status = u32::from_le_bytes(page[off + 8..off + 12].try_into().unwrap());
+        let reason = u32::from_le_bytes(page[off + 12..off + 16].try_into().unwrap());
+        let version = u64::from_le_bytes(page[off + 16..off + 24].try_into().unwrap());
+        Some(AdminResp { seq, status, reason, version })
+    }
+
+    /// M7: write admin response (fields then seq with release).
+    pub fn write_admin_resp(&self, resp: &AdminResp) {
+        let off = CNC_OFF_ADMIN_RESP;
+        let ptr_seq = unsafe { self.region.ptr_at(off) as *const PaddedAtomicU64 };
+        // Write fields first
+        // SAFETY: off is CNC_OFF_ADMIN_RESP; we write a 64-byte line at that offset.
+        let page_mut = unsafe { std::slice::from_raw_parts_mut(self.region.ptr_at(off), 64) };
+        page_mut[8..12].copy_from_slice(&resp.status.to_le_bytes());
+        page_mut[12..16].copy_from_slice(&resp.reason.to_le_bytes());
+        page_mut[16..24].copy_from_slice(&resp.version.to_le_bytes());
+        // Write seq last with release
+        // SAFETY: ptr_seq is valid (cast from self.region.ptr_at); it's a PaddedAtomicU64.
+        unsafe { (*ptr_seq).store_release(resp.seq) };
+    }
+
     /// Decode the header + app_id back into an owned `CncMeta`.
     pub fn meta(&self) -> CncMeta {
         let page = self.page();
@@ -507,6 +634,11 @@ mod tests {
             &page.peer_slot(0).naks_plus_replay as *const _ as usize - s0,
             CNC_PEER_OFF_NAKS_PLUS_REPLAY
         );
+        // M7: config band offsets.
+        assert_eq!(CNC_OFF_CONFIG_VERSION, 3456);
+        assert_eq!(CNC_OFF_CONFIG_PENDING, 3520);
+        assert_eq!(CNC_OFF_ADMIN_REQ, 3584);
+        assert_eq!(CNC_OFF_ADMIN_RESP, 3648);
     }
 
     #[test]
@@ -691,5 +823,53 @@ mod tests {
         let prev = page.service().service_epoch.fetch_add(1);
         assert_eq!(prev, 0);
         assert_eq!(page.service().service_epoch.load_acquire(), 1);
+    }
+
+    #[test]
+    fn admin_req_roundtrip_and_seq_discipline() {
+        let page = CncPage::heap(&test_meta());
+        // port=19100 exercises a normal value; a second req with port > 255
+        // (65535) catches a width bug that a truncated/2-byte port write
+        // would hide for small port numbers.
+        let req = AdminReq { seq: 1, nonce: 0xDEAD_BEEF_CAFE_F00D, op: 3, id: 42, ip: 0x0A00_0001, port: 19100 };
+        page.write_admin_req(&req);
+        let out = page.read_admin_req(0).expect("seq 1 > last_seen 0");
+        assert_eq!(out, req);
+
+        let req2 = AdminReq { seq: 2, nonce: 1, op: 5, id: 7, ip: 0x7F00_0001, port: 65535 };
+        page.write_admin_req(&req2);
+        let out2 = page.read_admin_req(1).expect("seq 2 > last_seen 1");
+        assert_eq!(out2, req2, "high port (>255) must round-trip through the u32-width field");
+
+        // seq <= last_seen_seq must observe no new request.
+        assert!(page.read_admin_req(2).is_none(), "seq == last_seen must yield None");
+        assert!(page.read_admin_req(3).is_none(), "seq < last_seen must yield None");
+    }
+
+    #[test]
+    fn admin_resp_roundtrip_and_seq_match() {
+        let page = CncPage::heap(&test_meta());
+        let resp = AdminResp { seq: 7, status: 1, reason: 0, version: 99 };
+        page.write_admin_resp(&resp);
+        let out = page.read_admin_resp(7).expect("seq matches");
+        assert_eq!(out, resp);
+
+        assert!(page.read_admin_resp(8).is_none(), "seq mismatch (too high) must yield None");
+        assert!(page.read_admin_resp(6).is_none(), "seq mismatch (too low) must yield None");
+    }
+
+    #[test]
+    fn config_version_and_pending_roundtrip() {
+        let page = CncPage::heap(&test_meta());
+        assert_eq!(page.config_version(), 0);
+        assert_eq!(page.config_pending(), 0);
+
+        page.store_config_version(42);
+        assert_eq!(page.config_version(), 42);
+
+        page.store_config_pending(true);
+        assert_eq!(page.config_pending(), 1);
+        page.store_config_pending(false);
+        assert_eq!(page.config_pending(), 0);
     }
 }

@@ -49,6 +49,16 @@ fn parse_members(s: &str) -> Vec<(NodeId, SocketAddr)> {
         .collect()
 }
 
+/// A distinct, id-derived election seed (M7 Task 10: the multi-node
+/// crashtest cluster needs every node's randomized election timeout to
+/// differ, or all processes racing the identical xorshift stream livelock
+/// on simultaneous elections). `id == 0` reproduces the historical fixed
+/// `seed: 1` byte-for-byte (`1 ^ (0).wrapping_mul(..) == 1`), so the
+/// existing single-node tests (default `--id 0`) are unaffected.
+fn seed_for(id: uc2_consensus::election::NodeId) -> u64 {
+    1 ^ (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let members = match &args.members {
@@ -67,7 +77,7 @@ fn main() -> anyhow::Result<()> {
         admission_bytes: 256 * 1024,
         election_timeout_min_ns: 150_000_000,
         election_timeout_max_ns: 300_000_000,
-        seed: 1,
+        seed: seed_for(args.id),
         faults: FaultConfig::default(),
         purge: uc2_node::PurgePolicy::Disabled,
         learners: Vec::new(),

@@ -18,7 +18,7 @@
 use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -26,16 +26,19 @@ use std::time::Instant;
 use uc2_log::buffer::LogBuffer;
 use uc2_log::writer::PositionedWriter;
 use uc_protocol::v2::datagram::{
-    DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION, DGRAM_KIND_DATA,
-    DGRAM_KIND_HEARTBEAT, DGRAM_KIND_NAK, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK,
-    DGRAM_KIND_REQUEST_VOTE, DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE,
-    DGRAM_KIND_SNAP_NAK, DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
+    ConfigProposalBody, ConfigReplyBody, DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION,
+    DGRAM_KIND_COMMIT_POSITION,
+    DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
+    DGRAM_KIND_NAK, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE,
+    DGRAM_KIND_SNAP_BEGIN, DGRAM_KIND_SNAP_CHUNK, DGRAM_KIND_SNAP_DONE, DGRAM_KIND_SNAP_NAK,
+    DGRAM_KIND_STATUS, DGRAM_KIND_TERM_MAP, DGRAM_KIND_VOTE, DatagramHeader,
     MAX_TERM_MAP_WIRE_ENTRIES, NAK_BODY_LEN, NakBody, REQUEST_VOTE_BODY_LEN, RequestVoteBody,
-    SNAP_BEGIN_BODY_LEN, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody, SnapNakBody, StatusBody,
-    TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_datagram_header, read_nak_body,
-    read_read_probe_body, read_request_vote_body, read_snap_begin_body, read_snap_nak_body,
-    read_status_body, read_term_map_body, read_vote_body, write_datagram_header, write_nak_body,
-    write_snap_begin_body, write_snap_nak_body, write_status_body,
+    SNAP_BEGIN_FIXED_LEN, SNAP_NAK_BODY_LEN, STATUS_BODY_LEN, SnapBeginBody, SnapNakBody, StatusBody,
+    TermMapEntryWire, VOTE_BODY_LEN, VoteBody, read_config_proposal_body, read_config_reply_body,
+    read_datagram_header, read_nak_body, read_read_probe_body, read_request_vote_body,
+    read_snap_begin_body, read_snap_nak_body, read_status_body, read_term_map_body, read_vote_body,
+    write_datagram_header, write_nak_body, write_snap_begin_body, write_snap_nak_body,
+    write_status_body,
 };
 use uc_protocol::v2::frame::{self, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len};
 
@@ -70,6 +73,15 @@ pub enum NetEvent {
     ReadProbeAck { nonce: u64, from: u32 },
     /// Any current-term leader traffic (data/heartbeat) seen — liveness.
     LeaderActivity { term: u32 },
+    /// M7 Task 7: a follower's forwarded membership proposal (kind 16, `uc2ctl`'s
+    /// admin request forwarded by a non-leader that has a leader hint). `from` is
+    /// the forwarding follower's address — the leader's reply (kind 17) is
+    /// addressed back to it. Routed RAW like the other consensus kinds: a stale/
+    /// not-yet-leader node just drops it (the follower's forward times out).
+    ConfigProposal { from: SocketAddr, body: ConfigProposalBody },
+    /// M7 Task 7: the leader's reply to a forwarded proposal (kind 17),
+    /// follower-bound. Matched by the follower's 1-slot pending map on `nonce`.
+    ConfigReply { body: ConfigReplyBody },
 }
 
 impl NetEvent {
@@ -86,12 +98,14 @@ impl NetEvent {
             NetEvent::LeaderActivity { .. } => 5,
             NetEvent::ReadProbe { .. } => 6,
             NetEvent::ReadProbeAck { .. } => 7,
+            NetEvent::ConfigProposal { .. } => 8,
+            NetEvent::ConfigReply { .. } => 9,
         }
     }
 }
 
 /// Number of [`NetEvent`] kinds (the width of the per-kind drop counters).
-pub const NET_EVENT_KINDS: usize = 8;
+pub const NET_EVENT_KINDS: usize = 10;
 
 /// Parse a consensus-plane datagram (kinds 5–11) into a [`NetEvent`], RAW — no
 /// term filter (the SM adopts higher terms). `from` is the datagram's source
@@ -133,12 +147,17 @@ fn consensus_event(h: &DatagramHeader, d: &[u8], from: SocketAddr) -> Option<Net
             let b = read_read_probe_body(body)?;
             Some(NetEvent::ReadProbeAck { nonce: b.nonce, from: b.from })
         }
+        DGRAM_KIND_CONFIG_PROPOSAL => {
+            Some(NetEvent::ConfigProposal { from, body: read_config_proposal_body(body)? })
+        }
+        DGRAM_KIND_CONFIG_REPLY => Some(NetEvent::ConfigReply { body: read_config_reply_body(body)? }),
         _ => None,
     }
 }
 
-/// True iff `kind` is a consensus-plane datagram (kinds 5–11) — routed RAW to
-/// the consensus agent in node mode, bypassing the data-plane term filter.
+/// True iff `kind` is a consensus-plane datagram (kinds 5–11, plus the M7
+/// admin-forward kinds 16/17) — routed RAW to the consensus agent in node
+/// mode, bypassing the data-plane term filter.
 #[inline]
 fn is_consensus_kind(kind: u8) -> bool {
     matches!(
@@ -150,6 +169,8 @@ fn is_consensus_kind(kind: u8) -> bool {
             | DGRAM_KIND_TERM_MAP
             | DGRAM_KIND_READ_PROBE
             | DGRAM_KIND_READ_PROBE_ACK
+            | DGRAM_KIND_CONFIG_PROPOSAL
+            | DGRAM_KIND_CONFIG_REPLY
     )
 }
 
@@ -250,6 +271,12 @@ pub struct FollowerStats {
     pub dropped_straddle: AtomicU64,
 }
 
+/// M7 Task 6: the `(position, config)` companion cells `set_snapshot_intake`
+/// wires in — the position cell for `ArchiveCmd::AdoptFloor`, the config cell
+/// for `adopt_snapshot_config`. Named to keep `set_snapshot_intake`'s signature
+/// under clippy's type-complexity threshold.
+pub type IncomingSnapshotSignal = (Arc<AtomicU64>, Arc<Mutex<Vec<u8>>>);
+
 /// M6 Task 6: one in-flight INBOUND snapshot transfer (this node is receiving a
 /// snapshot from the leader because its NAK fell below the purge floor). Chunks
 /// land at their file offset in a pre-sized `.part`; a `Rebuilt` over the file's
@@ -266,6 +293,11 @@ struct SnapIntake {
     /// Contiguity over `[0, total_len)` file offsets.
     got: Rebuilt,
     nak: NakTimer,
+    /// M7 Task 6: the encoded `ConfigRecord.config` carried in `SNAP_BEGIN`
+    /// (`v2::config::encode_config` bytes; empty if the leader shipped none).
+    /// Forwarded to `incoming_snapshot_config` on completion, alongside
+    /// `incoming_snapshot_pos`, for the consensus agent's install handler.
+    config: Vec<u8>,
 }
 
 pub struct FollowerReceiver {
@@ -316,6 +348,13 @@ pub struct FollowerReceiver {
     /// inbound snapshot (written on rename). The consensus agent samples it to
     /// issue `ArchiveCmd::AdoptFloor` and mirror it to cnc. `None` in unit tests.
     incoming_snapshot_pos: Option<Arc<AtomicU64>>,
+    /// M7 Task 6: companion cell for `incoming_snapshot_pos` — the encoded
+    /// config carried by the SAME completed transfer. Written in `snap_complete`
+    /// BEFORE `incoming_snapshot_pos` is stored (so the consensus agent's
+    /// `Acquire` load of the position, once it observes the new value, is
+    /// guaranteed to see this cell's matching content — the mutex lock/unlock
+    /// pair is itself a release/acquire fence). `None` in unit tests.
+    incoming_snapshot_config: Option<Arc<Mutex<Vec<u8>>>>,
     /// M6 Task 6: config for the inbound-transfer NAK timer (RTT delay + seed).
     snap_nak_cfg: NakConfig,
     snap_seed: u64,
@@ -383,6 +422,7 @@ impl FollowerReceiver {
             snap_dir: None,
             snap_intake: None,
             incoming_snapshot_pos: None,
+            incoming_snapshot_config: None,
             snap_nak_cfg: cfg.nak,
             snap_seed: cfg.seed,
             snap_adopt_pending: None,
@@ -448,12 +488,18 @@ impl FollowerReceiver {
 
     /// M6 Task 6: enable INBOUND snapshot transfers. `snap_dir` is where the
     /// `.part`/final artifacts land (`instance_dir/snapshots`); `incoming` (if
-    /// set) receives the position of each COMPLETED transfer for the consensus
-    /// agent to adopt as an archive floor. Without this call kinds 12/13 are
-    /// ignored (a node that never joins below a floor never receives snapshots).
-    pub fn set_snapshot_intake(&mut self, snap_dir: PathBuf, incoming: Option<Arc<AtomicU64>>) {
+    /// set) is `(position, config)`: the position cell receives each COMPLETED
+    /// transfer's floor for the consensus agent to adopt as an archive floor,
+    /// and (M7 Task 6) the config cell receives that SAME transfer's carried
+    /// `SNAP_BEGIN.config` bytes for the agent's `adopt_snapshot_config` install
+    /// handler. Without this call kinds 12/13 are ignored (a node that never
+    /// joins below a floor never receives snapshots).
+    pub fn set_snapshot_intake(&mut self, snap_dir: PathBuf, incoming: Option<IncomingSnapshotSignal>) {
         self.snap_dir = Some(snap_dir);
-        self.incoming_snapshot_pos = incoming;
+        if let Some((pos, config)) = incoming {
+            self.incoming_snapshot_pos = Some(pos);
+            self.incoming_snapshot_config = Some(config);
+        }
     }
 
     #[inline]
@@ -804,6 +850,7 @@ impl FollowerReceiver {
             final_path,
             got: Rebuilt::new(0),
             nak: NakTimer::new(self.snap_nak_cfg, self.snap_seed ^ b.session as u64),
+            config: b.config,
         });
         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
     }
@@ -850,7 +897,7 @@ impl FollowerReceiver {
             return;
         }
         // Ack: echo the SnapBeginBody as SNAP_DONE so the leader closes its session.
-        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_BEGIN_BODY_LEN];
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + SNAP_BEGIN_FIXED_LEN]; // M7: may grow with config
         write_datagram_header(
             &mut d,
             &DatagramHeader {
@@ -866,9 +913,18 @@ impl FollowerReceiver {
                 session: intake.session,
                 snapshot_pos: intake.snapshot_pos,
                 total_len: intake.total_len,
+                config: vec![], // the DONE ack carries no config — only SNAP_BEGIN ships it
             },
         );
         let _ = self.sock.send_to(&d, intake.peer);
+        // M7 Task 6: publish the carried config BEFORE the position signal — the
+        // consensus agent's install handler samples the position (Acquire) and
+        // only then reads this cell, so publishing it first (the mutex itself is
+        // a release fence) guarantees it sees THIS transfer's bytes, never a
+        // stale or absent value from a prior/no session.
+        if let Some(cell) = &self.incoming_snapshot_config {
+            *cell.lock().unwrap() = intake.config.clone();
+        }
         // Signal the consensus agent to adopt the floor + mirror observability.
         if let Some(slot) = &self.incoming_snapshot_pos {
             slot.store(intake.snapshot_pos, Ordering::Release);
@@ -1727,6 +1783,68 @@ mod tests {
                     NetEvent::ReadProbeAck { nonce, from } => {
                         assert_eq!((nonce, from), (0xABCD, 1));
                         saw_ack = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// M7 Task 7: kinds 16/17 (the admin-forward proposal/reply) route RAW to
+    /// the consensus agent exactly like the other consensus kinds — no term
+    /// filter, since a follower forwards to whatever leader it currently has a
+    /// hint for, and the leader replies to whichever follower forwarded, both
+    /// independent of the receiver's own tracked term.
+    #[test]
+    fn config_kinds_route_raw_to_the_consensus_agent() {
+        use uc_protocol::v2::datagram::{
+            CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, write_config_proposal_body,
+            write_config_reply_body,
+        };
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let (tx, rx) = mpsc::sync_channel::<NetEvent>(16);
+        let mut r = follower_routed(&b, leader.addr(), tx);
+        let to = r.local_addr();
+
+        let mut pbuf = vec![0u8; CONFIG_PROPOSAL_BODY_LEN];
+        write_config_proposal_body(
+            &mut pbuf,
+            &ConfigProposalBody { nonce: 0x1122_3344, op: 1, id: 9, ip: 0x7F00_0001, port: 4000 },
+        );
+        // Term deliberately mismatched from the receiver's own — must still route.
+        leader.send(to, DGRAM_KIND_CONFIG_PROPOSAL, 0, TERM + 9, &pbuf);
+
+        let mut rbuf = vec![0u8; CONFIG_REPLY_BODY_LEN];
+        write_config_reply_body(
+            &mut rbuf,
+            &ConfigReplyBody { nonce: 0x1122_3344, status: 0, reason: 0, version: 1 },
+        );
+        leader.send(to, DGRAM_KIND_CONFIG_REPLY, 0, TERM, &rbuf);
+
+        let (mut saw_proposal, mut saw_reply) = (false, false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !(saw_proposal && saw_reply) {
+            assert!(Instant::now() < deadline, "config-forward events never routed");
+            r.do_work();
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    NetEvent::ConfigProposal { body, .. } => {
+                        assert_eq!(body, ConfigProposalBody {
+                            nonce: 0x1122_3344,
+                            op: 1,
+                            id: 9,
+                            ip: 0x7F00_0001,
+                            port: 4000,
+                        });
+                        saw_proposal = true;
+                    }
+                    NetEvent::ConfigReply { body } => {
+                        assert_eq!(
+                            body,
+                            ConfigReplyBody { nonce: 0x1122_3344, status: 0, reason: 0, version: 1 }
+                        );
+                        saw_reply = true;
                     }
                     _ => {}
                 }

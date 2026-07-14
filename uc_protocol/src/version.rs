@@ -22,7 +22,7 @@ impl ProtocolVersion {
     }
 }
 
-pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
+pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 2, 0);
 pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
 
 #[cfg(test)]

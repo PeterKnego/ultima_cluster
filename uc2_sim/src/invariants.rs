@@ -2,7 +2,25 @@
 // Copyright 2026 Peter Knego
 
 //! The five safety invariants (spec §8) plus the two carry-over obligations
-//! from earlier Task-4 reviews (T2 truncate-bound, `Fatal`-is-unreachable).
+//! from earlier Task-4 reviews (T2 truncate-bound, `Fatal`-is-unreachable),
+//! plus the M7 config invariants inv6–9 (reconfig spec §8):
+//!
+//! - **inv6 — config determinism:** a node's adopted config equals the config
+//!   its durable frontier implies (the world recomputes the implication from
+//!   its config-frame ledger; the append frontier is also accepted, covering
+//!   the leader's adopt-at-append window).
+//! - **inv7 — quorum legality:** a leader's commit must be certified by a
+//!   genuine content-quorum of the ADOPTING node's config voters (the M4/M5
+//!   "inv5 phantom" oracle, made config-aware), AND ride a config that chains
+//!   off the committed config (the chain half also guards elections — a winner
+//!   operating under a config that neither matches nor directly succeeds the
+//!   committed one is the disjoint-quorum smoking gun the serving gate
+//!   prevents).
+//! - **inv8 — revert correctness:** after a truncation settles, the adopted
+//!   config re-equals the frontier-implied config.
+//! - **inv9 — tombstone permanence:** no adopted config re-lists a tombstoned
+//!   id (self-consistency and across the adoption edge), and tombstones never
+//!   shrink.
 //!
 //! The checker owns the sim's *ground truth* — the values a real cluster would
 //! only know from an oracle: which node opened which term, the **genuine**
@@ -43,6 +61,7 @@
 
 use std::fmt;
 
+use uc2_consensus::config::ClusterConfig;
 use uc2_consensus::election::NodeId;
 
 /// The term covering byte `pos` in an ascending `(term, base)` map — the term of
@@ -132,6 +151,14 @@ pub struct InvariantChecker {
     committed_lineage: Vec<(u32, u64)>,
     /// term -> the node that opened it as leader (invariant 1: at most one).
     leaders_by_term: std::collections::BTreeMap<u32, NodeId>,
+    /// M7 (inv7 chain half): the config governing the committed lineage — set
+    /// from the committing leader's own view (its adopted config if the commit
+    /// covers the config frame's end, else its prev) whenever `global_max_commit`
+    /// advances. `None` until the first genuine commit. A later leader commit or
+    /// election whose (adopted, prev) pair contains neither this config nor a
+    /// direct successor of it is operating on a divergent config history —
+    /// exactly the disjoint-quorum world the serving gate forbids.
+    committed_config: Option<ClusterConfig>,
     /// Per-node max commit EVER certified (durable across restart) — the bound
     /// for invariant 4 (a node never truncates below its own committed bytes).
     pub committed_hw: Vec<u64>,
@@ -148,6 +175,7 @@ impl InvariantChecker {
             global_max_commit: 0,
             committed_lineage: Vec::new(),
             leaders_by_term: std::collections::BTreeMap::new(),
+            committed_config: None,
             committed_hw: vec![0; n],
             last_commit: vec![0; n],
         }
@@ -195,6 +223,17 @@ impl InvariantChecker {
     /// The global commit high-water and committed lineage advance ONLY for a leader
     /// of the highest term ever elected: a stale leader's lineage must never become
     /// ground truth (it may certify over history a newer term already superseded).
+    /// M7 addendum: the check is CONFIG-AWARE (inv7 — quorum legality). The
+    /// genuine content-quorum is ranked over the ADOPTING leader's config
+    /// VOTERS (`voters`, quorum = |voters|/2 + 1) instead of a static world
+    /// majority — a static count would be too strong for a legally shrunk
+    /// config (a 3-voter config commits with 2, not with a majority of every
+    /// process that ever existed) and too weak for a grown one. With the
+    /// genesis all-voter config this is bit-identical to the historical inv5
+    /// phantom oracle, which is why the `RawM3`/`Mechanism` pins keep working
+    /// unchanged. Additionally the CHAIN half of inv7 rejects a commit riding
+    /// a config that neither matches nor directly succeeds the committed
+    /// config (see [`InvariantChecker::committed_config`]).
     #[allow(clippy::too_many_arguments)]
     pub fn on_advance_commit(
         &mut self,
@@ -204,6 +243,10 @@ impl InvariantChecker {
         is_leader: bool,
         durables: &[u64],
         maps: &[Vec<(u32, u64)>],
+        voters: &[NodeId],
+        adopted: &ClusterConfig,
+        prev: &ClusterConfig,
+        config_position: u64,
         step: u64,
     ) -> Result<(), InvariantViolation> {
         let i = node as usize;
@@ -226,23 +269,80 @@ impl InvariantChecker {
             return Ok(()); // raw gossip echo: benign, gmc untouched
         }
 
-        // Genuine byte-content quorum: for each member, the frontier up to which
-        // it durably holds bytes identical to the committing leader's lineage.
+        // inv7 (chain half) — a commit that ADVANCES ground truth must ride a
+        // config chained off the committed config: equal to it, or a direct
+        // successor (prev == it — the leader's own still-pending proposal).
+        // Anything else means the new committed history is being certified
+        // under a config lineage ground truth never committed. Scoped to
+        // gmc-ADVANCING commits only: a STALE leader's benign rank-commit (the
+        // T1 legal case — content-genuine, never becomes ground truth) may
+        // carry a superseded uncommitted config after a newer config committed
+        // elsewhere, and must not false-positive; its content is still fully
+        // phantom-checked below. Elections check the chain UNCONDITIONALLY
+        // (`on_become_leader`): a legal winner always holds the committed
+        // config (term-lexicographic vote freshness + inv5 completeness).
+        let max_term = self.leaders_by_term.keys().next_back().copied().unwrap_or(0);
+        let advancing = term == max_term && max_term > 0 && commit >= self.global_max_commit;
+        if advancing
+            && let Some(cc) = &self.committed_config
+            && adopted != cc
+            && prev != cc
+        {
+            return Err(self.viol(
+                "quorum legality (inv7): config chain divergence",
+                step,
+                format!(
+                    "node {node} (leader, term {term}) certified commit {commit} under config \
+                     v{} (prev v{}) but the committed config is v{} — neither matches nor \
+                     directly succeeds it (disjoint-quorum hazard)",
+                    adopted.version, prev.version, cc.version
+                ),
+            ));
+        }
+
+        // inv7 (quorum half) — genuine byte-content quorum over the ADOPTING
+        // node's config voters: for each voter, the frontier up to which it
+        // durably holds bytes identical to the committing leader's lineage. A
+        // voter id with no world process behind it (possible in fuzz-injected
+        // configs) holds nothing.
+        //
+        // MID-SELF-REMOVAL leader (spec §4): a leader that proposed its own
+        // removal keeps serving until the entry commits, and its own durable
+        // legitimately occupies the "+1" ranking slot even though it is no
+        // longer a voter (`CommitTracker::new(n_followers, n_followers + 1)` —
+        // the appender always holds everything it appended). This is SAFE: the
+        // certified position is genuinely held by ceil(v/2) counted VOTERS,
+        // and any C_new election quorum (v/2 + 1 of v) must intersect that
+        // subset (pigeonhole: ceil(v/2) + v/2 + 1 > v). The oracle therefore
+        // ranks voters ∪ {committing leader}, exactly the tracker's rule; when
+        // the leader IS a voter this changes nothing.
         let lineage = &maps[i];
-        let mut frontiers: Vec<u64> = (0..self.n)
-            .map(|m| durables[m].min(first_content_divergence(&maps[m], lineage, u64::MAX)))
+        let mut certifiers: Vec<NodeId> = voters.to_vec();
+        if !certifiers.contains(&node) {
+            certifiers.push(node);
+        }
+        let mut frontiers: Vec<u64> = certifiers
+            .iter()
+            .map(|&v| {
+                let m = v as usize;
+                if m >= self.n {
+                    return 0;
+                }
+                durables[m].min(first_content_divergence(&maps[m], lineage, u64::MAX))
+            })
             .collect();
         frontiers.sort_unstable_by(|a, b| b.cmp(a)); // descending
-        let quorum = self.n / 2 + 1;
-        let genuine = frontiers[quorum - 1];
+        let quorum = certifiers.len() / 2 + 1;
+        let genuine = frontiers.get(quorum - 1).copied().unwrap_or(0);
         if commit > genuine {
             return Err(self.viol(
-                "leader completeness (inv5): phantom commit — no genuine quorum",
+                "quorum legality (inv7): phantom commit — no genuine quorum of the adopting config",
                 step,
                 format!(
                     "node {node} (leader, term {term}) certified commit {commit} but only a \
-                     genuine quorum-frontier of {genuine} holds that content (per-member \
-                     frontiers {frontiers:?})"
+                     genuine quorum-frontier of {genuine} among config-v{} voters {voters:?} \
+                     holds that content (per-voter frontiers {frontiers:?})",
+                    adopted.version
                 ),
             ));
         }
@@ -250,13 +350,18 @@ impl InvariantChecker {
         // Ground truth advances ONLY for a leader of the highest term ever elected:
         // a stale leader's lineage must never become the committed history (a
         // higher-term leader is elected complete over genuine history — inv5).
-        let max_term = self.leaders_by_term.keys().next_back().copied().unwrap_or(0);
-        if term == max_term && max_term > 0 && commit >= self.global_max_commit {
+        if advancing {
             self.global_max_commit = commit;
             // Refresh the committed lineage to the committing leader's map (it is
             // authoritative and, by invariant 5, complete over the committed
             // prefix). Cloned so later node-map mutations can't alias ground truth.
             self.committed_lineage = lineage.clone();
+            // The governing config of the committed lineage (inv7 chain ground
+            // truth): the leader's adopted config if this commit covers its
+            // config frame's END, else the frame is still uncommitted and prev
+            // governs. Cloned for the same aliasing reason as the lineage.
+            let gov = if commit >= config_position { adopted } else { prev };
+            self.committed_config = Some(gov.clone());
         }
         Ok(())
     }
@@ -274,13 +379,26 @@ impl InvariantChecker {
 
     /// A node opened `term` as leader (translated `Action::BecomeLeader`).
     /// `leader_map` is the new leader's term map (already including the freshly
-    /// opened `(term, base)`). Checks invariants 1 and 5.
+    /// opened `(term, base)`). Checks invariants 1, 7 (chain half) and 5.
+    ///
+    /// The inv7 chain check runs BEFORE inv5's completeness checks and mirrors
+    /// the commit-side rule: a legally elected leader holds every committed
+    /// byte durable (inv5), hence has adopted every committed config frame, so
+    /// its (adopted, prev) pair always contains the committed config. A winner
+    /// for which neither matches was elected by a quorum of a config lineage
+    /// ground truth never committed — the serving-gate counterfactual's
+    /// disjoint-quorum election (Ongaro 2015), caught here at the election
+    /// itself rather than at the committed-history destruction it goes on to
+    /// cause.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_become_leader(
         &mut self,
         node: NodeId,
         term: u32,
         base: u64,
         leader_map: &[(u32, u64)],
+        adopted: &ClusterConfig,
+        prev: &ClusterConfig,
         step: u64,
     ) -> Result<(), InvariantViolation> {
         // Invariant 1 — election safety: at most one leader per term.
@@ -295,6 +413,23 @@ impl InvariantChecker {
             _ => {
                 self.leaders_by_term.insert(term, node);
             }
+        }
+
+        // Invariant 7 (chain half) — election config legality (see above).
+        if let Some(cc) = &self.committed_config
+            && adopted != cc
+            && prev != cc
+        {
+            return Err(self.viol(
+                "quorum legality (inv7): config chain divergence",
+                step,
+                format!(
+                    "node {node} won term {term} under config v{} (prev v{}) but the committed \
+                     config is v{} — neither matches nor directly succeeds it (the election's \
+                     quorum came from a config lineage that was never committed)",
+                    adopted.version, prev.version, cc.version
+                ),
+            ));
         }
 
         // Invariant 5 — leader completeness (global commit-safety at election):
@@ -377,6 +512,110 @@ impl InvariantChecker {
         Ok(())
     }
 
+    /// Invariant 6 — config determinism: a node's adopted config must equal the
+    /// config its DURABLE frontier implies (the world derives `implied_durable`
+    /// from its config-frame ledger: the highest-version frame whose end is
+    /// durably held with matching content identity, else the node's position-0
+    /// baseline). The APPEND-frontier implication is also accepted — the
+    /// adopt-at-append window: a leader adopts its own frame the moment it
+    /// appends it (and keeps that adoption if deposed before the frame turns
+    /// durable; its own archive closes the window). An adoption backed by
+    /// NEITHER frontier — a config whose frame the node's log does not carry —
+    /// is the determinism breach.
+    pub fn check_config_determinism(
+        &self,
+        node: NodeId,
+        adopted: &ClusterConfig,
+        implied_durable: &ClusterConfig,
+        implied_append: &ClusterConfig,
+        step: u64,
+    ) -> Result<(), InvariantViolation> {
+        if adopted != implied_durable && adopted != implied_append {
+            return Err(self.viol(
+                "config determinism (inv6)",
+                step,
+                format!(
+                    "node {node} has adopted config v{} but its durable frontier implies v{} \
+                     (append frontier v{}) — the adopted config is not backed by its log",
+                    adopted.version, implied_durable.version, implied_append.version
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Invariant 8 — revert correctness: once a truncation SETTLES (the
+    /// matching-epoch ack landed: durable clamped, map adopted, config
+    /// reverted/kept per spec §5), the adopted config must re-equal the
+    /// frontier-implied config exactly (durable == append here, so there is no
+    /// adopt-at-append window to allow). The same property inv6 sweeps
+    /// continuously, pinned at the exact point the revert obligation falls due
+    /// — this is the check the `revert_on_truncate_disabled` counterfactual
+    /// turns red.
+    pub fn check_revert_correctness(
+        &self,
+        node: NodeId,
+        adopted: &ClusterConfig,
+        implied: &ClusterConfig,
+        step: u64,
+    ) -> Result<(), InvariantViolation> {
+        if adopted != implied {
+            return Err(self.viol(
+                "revert correctness (inv8)",
+                step,
+                format!(
+                    "node {node} finished a truncation still adopting config v{} while its \
+                     durable frontier implies v{} — the truncated-away config frame survived \
+                     (revert-on-truncate failed)",
+                    adopted.version, implied.version
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Invariant 9 — tombstone permanence, judged on EVERY adoption (forward,
+    /// revert, or wipe-fiat): (a) the adopted config must not list a member it
+    /// itself tombstones; (b) it must not re-list an id its predecessor
+    /// tombstoned; (c) tombstones never shrink across the adoption edge.
+    pub fn on_config_adopted(
+        &self,
+        node: NodeId,
+        config: &ClusterConfig,
+        prev: &ClusterConfig,
+        step: u64,
+    ) -> Result<(), InvariantViolation> {
+        let relisted = config
+            .voters
+            .iter()
+            .chain(config.learners.iter())
+            .map(|(id, _)| *id)
+            .find(|id| config.tombstones.contains(id) || prev.tombstones.contains(id));
+        if let Some(id) = relisted {
+            return Err(self.viol(
+                "tombstone permanence (inv9)",
+                step,
+                format!(
+                    "node {node} adopted config v{} re-listing tombstoned id {id} \
+                     (config tombstones {:?}, prev tombstones {:?})",
+                    config.version, config.tombstones, prev.tombstones
+                ),
+            ));
+        }
+        if let Some(id) = prev.tombstones.iter().find(|id| !config.tombstones.contains(id)) {
+            return Err(self.viol(
+                "tombstone permanence (inv9)",
+                step,
+                format!(
+                    "node {node} adopted config v{} DROPPING tombstone {id} carried by its \
+                     predecessor v{} — tombstones are forever",
+                    config.version, prev.version
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Invariant 2 — term-map prefix consistency over committed positions. The
     /// list of term boundaries a node records BELOW the global commit high-water
     /// must equal a LEADING SLICE (prefix) of the ground-truth lineage's committed
@@ -449,6 +688,11 @@ mod tests {
         c
     }
 
+    /// A genesis config with the given node ids as voters (synthetic addrs).
+    fn gcfg(voters: &[NodeId]) -> ClusterConfig {
+        ClusterConfig::genesis(voters.iter().map(|&v| (v, (v, 1))).collect(), Vec::new())
+    }
+
     #[test]
     fn inv2_catches_misplaced_boundary_same_term() {
         // Lineage: term 2 starts at 960. A node records term 2 at 3456 — the right
@@ -512,7 +756,8 @@ mod tests {
         // the leader's shorter committed prefix, tolerated this.
         let mut c = checker(vec![(1, 0), (2, 960)], 2000);
         let leader_map = vec![(1, 0), (5, 2000)];
-        let err = c.on_become_leader(0, 5, 2000, &leader_map, 1).unwrap_err();
+        let g = gcfg(&[0, 1, 2]);
+        let err = c.on_become_leader(0, 5, 2000, &leader_map, &g, &g, 1).unwrap_err();
         assert!(err.invariant.contains("inv5"), "{err}");
     }
 
@@ -520,26 +765,31 @@ mod tests {
     fn inv5_accepts_complete_leader() {
         let mut c = checker(vec![(1, 0), (2, 960)], 2000);
         let leader_map = vec![(1, 0), (2, 960), (5, 2000)];
-        assert!(c.on_become_leader(0, 5, 2000, &leader_map, 1).is_ok());
+        let g = gcfg(&[0, 1, 2]);
+        assert!(c.on_become_leader(0, 5, 2000, &leader_map, &g, &g, 1).is_ok());
     }
 
     #[test]
     fn inv5_catches_election_below_global_commit() {
         let mut c = checker(vec![(1, 0)], 2000);
         // Opening a term at base 1500 < gmc 2000 is a completeness breach.
-        assert!(c.on_become_leader(0, 3, 1500, &[(1, 0), (3, 1500)], 1).is_err());
+        let g = gcfg(&[0, 1, 2]);
+        assert!(c.on_become_leader(0, 3, 1500, &[(1, 0), (3, 1500)], &g, &g, 1).is_err());
     }
 
     #[test]
     fn phantom_commit_flagged_for_current_max_term_leader() {
         let mut c = InvariantChecker::new(42, 3);
         // Establish term 2 as the highest elected term (its leader = node 0).
-        c.on_become_leader(0, 2, 0, &[(2, 0)], 1).unwrap();
+        let g = gcfg(&[0, 1, 2]);
+        c.on_become_leader(0, 2, 0, &[(2, 0)], &g, &g, 1).unwrap();
         // Node 0 (leader, term 2) certifies commit 3000, but only itself holds that
         // content (divergent peers) -> genuine quorum = 0 -> phantom caught.
         let durables = vec![3000, 3000, 3000];
         let maps = vec![vec![(2, 0)], vec![(9, 0)], vec![(9, 0)]];
-        let err = c.on_advance_commit(0, 3000, 2, true, &durables, &maps, 2).unwrap_err();
+        let err = c
+            .on_advance_commit(0, 3000, 2, true, &durables, &maps, &[0, 1, 2], &g, &g, 0, 2)
+            .unwrap_err();
         assert!(err.invariant.contains("phantom"), "{err}");
     }
 
@@ -554,7 +804,10 @@ mod tests {
         c.leaders_by_term.insert(3, 2); // term 3 (node 2) is the current max term
         let durables = vec![3000, 3000, 3000];
         let maps = vec![vec![(2, 0)], vec![(9, 0)], vec![(9, 0)]];
-        let err = c.on_advance_commit(0, 3000, 2, true, &durables, &maps, 5).unwrap_err();
+        let g = gcfg(&[0, 1, 2]);
+        let err = c
+            .on_advance_commit(0, 3000, 2, true, &durables, &maps, &[0, 1, 2], &g, &g, 0, 5)
+            .unwrap_err();
         assert!(err.invariant.contains("phantom"), "{err}");
         assert_eq!(c.global_max_commit, 0, "a stale leader's phantom must not advance gmc");
     }
@@ -569,7 +822,11 @@ mod tests {
         c.leaders_by_term.insert(3, 2);
         let durables = vec![3000, 3000, 0];
         let maps = vec![vec![(2, 0)], vec![(2, 0)], vec![]];
-        assert!(c.on_advance_commit(0, 3000, 2, true, &durables, &maps, 5).is_ok());
+        let g = gcfg(&[0, 1, 2]);
+        assert!(
+            c.on_advance_commit(0, 3000, 2, true, &durables, &maps, &[0, 1, 2], &g, &g, 0, 5)
+                .is_ok()
+        );
         assert_eq!(c.global_max_commit, 0, "stale leader must not advance gmc");
         assert!(c.committed_lineage.is_empty(), "stale leader must not set the lineage");
     }
@@ -577,12 +834,170 @@ mod tests {
     #[test]
     fn raw_gossip_echo_from_follower_is_not_a_phantom() {
         let mut c = InvariantChecker::new(42, 3);
-        c.on_become_leader(0, 2, 0, &[(2, 0)], 1).unwrap();
+        let g = gcfg(&[0, 1, 2]);
+        c.on_become_leader(0, 2, 0, &[(2, 0)], &g, &g, 1).unwrap();
         // A follower (is_leader = false) echoing a gossiped commit it does not hold
         // is the raw counter — benign, never flagged, and does not move gmc.
         let durables = vec![3000, 0, 0];
         let maps = vec![vec![(2, 0)], vec![], vec![]];
-        assert!(c.on_advance_commit(1, 3000, 2, false, &durables, &maps, 2).is_ok());
+        assert!(
+            c.on_advance_commit(1, 3000, 2, false, &durables, &maps, &[0, 1, 2], &g, &g, 0, 2)
+                .is_ok()
+        );
         assert_eq!(c.global_max_commit, 0, "a raw echo must not advance the genuine commit");
+    }
+
+    // ---- M7 config invariants (inv6-9), the `inv2_catches_*` pattern ----
+
+    /// A config with `version` and one extra learner per version bump, so
+    /// distinct versions are also distinct content.
+    fn vcfg(version: u64) -> ClusterConfig {
+        let mut c = gcfg(&[0, 1, 2]);
+        for v in 0..version {
+            c.learners.push((10 + v as NodeId, (10 + v as u32, 1)));
+        }
+        c.version = version;
+        c
+    }
+
+    #[test]
+    fn inv6_catches_config_not_backed_by_log() {
+        // The node adopted v1 but NEITHER its durable nor its append frontier
+        // implies it (the frame is gone / never was on its lineage).
+        let c = checker(vec![(1, 0)], 0);
+        let err = c
+            .check_config_determinism(1, &vcfg(1), &vcfg(0), &vcfg(0), 1)
+            .unwrap_err();
+        assert!(err.invariant.contains("inv6"), "{err}");
+    }
+
+    #[test]
+    fn inv6_tolerates_the_adopt_at_append_window() {
+        // A leader adopts its own config frame at APPEND, before its durable
+        // crosses it: implied-by-durable is still v0, implied-by-append is v1.
+        let c = checker(vec![(1, 0)], 0);
+        assert!(c.check_config_determinism(0, &vcfg(1), &vcfg(0), &vcfg(1), 1).is_ok());
+        // And plain agreement at the durable frontier is of course fine.
+        assert!(c.check_config_determinism(0, &vcfg(1), &vcfg(1), &vcfg(1), 2).is_ok());
+    }
+
+    #[test]
+    fn inv7_catches_commit_without_quorum_of_adopting_config() {
+        // The voter RESTRICTION is load-bearing: a 5-process world where the
+        // adopting config's voters are [0,1,2]. The leader (0) commits content
+        // that nodes 3 and 4 genuinely hold — a STATIC world-majority (3 of 5:
+        // {0,3,4}) would bless it — but of the config's actual voters only the
+        // leader itself holds it, so no config quorum (2 of [0,1,2]) exists.
+        let mut c = InvariantChecker::new(42, 5);
+        c.leaders_by_term.insert(2, 0);
+        let durables = vec![3000, 3000, 3000, 3000, 3000];
+        let maps = vec![
+            vec![(2, 0)], // leader lineage
+            vec![(9, 0)], // voter 1: divergent
+            vec![(9, 0)], // voter 2: divergent
+            vec![(2, 0)], // NON-voter 3 holds it — must not count
+            vec![(2, 0)], // NON-voter 4 holds it — must not count
+        ];
+        let g = gcfg(&[0, 1, 2]);
+        let err = c
+            .on_advance_commit(0, 3000, 2, true, &durables, &maps, &[0, 1, 2], &g, &g, 0, 5)
+            .unwrap_err();
+        assert!(err.invariant.contains("inv7"), "{err}");
+        assert!(err.invariant.contains("phantom"), "{err}");
+    }
+
+    #[test]
+    fn inv7_catches_commit_off_the_committed_config_chain() {
+        // The committed config is v2; a leader commits under v1 whose prev is
+        // v0 — neither matches nor directly succeeds the committed config: its
+        // certifying quorum comes from a config lineage ground truth never
+        // committed (the serving-gate counterfactual's smoking gun).
+        let mut c = InvariantChecker::new(42, 3);
+        c.leaders_by_term.insert(3, 1);
+        c.committed_config = Some(vcfg(2));
+        let durables = vec![3000, 3000, 3000];
+        let maps = vec![vec![(3, 0)], vec![(3, 0)], vec![(3, 0)]];
+        let err = c
+            .on_advance_commit(1, 3000, 3, true, &durables, &maps, &[0, 1, 2], &vcfg(1), &vcfg(0), 0, 5)
+            .unwrap_err();
+        assert!(err.invariant.contains("inv7"), "{err}");
+        assert!(err.detail.contains("chain") || err.invariant.contains("chain"), "{err}");
+    }
+
+    #[test]
+    fn inv7_accepts_a_direct_successor_of_the_committed_config() {
+        // A leader committing its own still-pending proposal: adopted v3 with
+        // prev == the committed v2 — the legal one-in-flight shape.
+        let mut c = InvariantChecker::new(42, 3);
+        c.leaders_by_term.insert(3, 1);
+        c.committed_config = Some(vcfg(2));
+        let durables = vec![3000, 3000, 3000];
+        let maps = vec![vec![(3, 0)], vec![(3, 0)], vec![(3, 0)]];
+        assert!(
+            c.on_advance_commit(1, 3000, 3, true, &durables, &maps, &[0, 1, 2], &vcfg(3), &vcfg(2), 100, 5)
+                .is_ok()
+        );
+        // The commit covered the frame end (100 <= 3000): v3 is now committed.
+        assert_eq!(c.committed_config.as_ref().map(|g| g.version), Some(3));
+    }
+
+    #[test]
+    fn inv7_catches_election_off_the_committed_config_chain() {
+        // Same chain rule at the ELECTION: a winner whose (adopted, prev) pair
+        // contains neither the committed config nor its predecessor was elected
+        // by a quorum of a divergent config lineage — red BEFORE it can destroy
+        // committed history (which inv5 would only catch afterwards).
+        let mut c = InvariantChecker::new(42, 3);
+        c.committed_config = Some(vcfg(2));
+        let err = c
+            .on_become_leader(0, 7, 5000, &[(7, 5000)], &vcfg(1), &vcfg(0), 5)
+            .unwrap_err();
+        assert!(err.invariant.contains("inv7"), "{err}");
+    }
+
+    #[test]
+    fn inv8_catches_unreverted_config_after_truncation() {
+        // The truncation settled with the node still adopting v1 while its
+        // durable frontier implies v0 — revert-on-truncate failed (the
+        // counterfactual's bug class).
+        let c = checker(vec![(1, 0)], 0);
+        let err = c.check_revert_correctness(1, &vcfg(1), &vcfg(0), 1).unwrap_err();
+        assert!(err.invariant.contains("inv8"), "{err}");
+        // The settled, reverted state passes.
+        assert!(c.check_revert_correctness(1, &vcfg(0), &vcfg(0), 2).is_ok());
+    }
+
+    #[test]
+    fn inv9_catches_tombstoned_id_relisted() {
+        let c = checker(vec![(1, 0)], 0);
+        // (a) self-inconsistent: the config lists voter 2 AND tombstones it.
+        let mut bad = gcfg(&[0, 1, 2]);
+        bad.version = 1;
+        bad.tombstones.push(2);
+        let err = c.on_config_adopted(0, &bad, &gcfg(&[0, 1, 2]), 1).unwrap_err();
+        assert!(err.invariant.contains("inv9"), "{err}");
+        // (b) across the edge: prev tombstoned 2, the new config re-lists it.
+        let mut prev = gcfg(&[0, 1]);
+        prev.tombstones.push(2);
+        let mut relist = gcfg(&[0, 1, 2]); // 2 is back
+        relist.version = 2;
+        relist.tombstones.push(2); // even carrying the tombstone forward
+        assert!(c.on_config_adopted(0, &relist, &prev, 2).is_err());
+    }
+
+    #[test]
+    fn inv9_catches_dropped_tombstone() {
+        let c = checker(vec![(1, 0)], 0);
+        let mut prev = gcfg(&[0, 1]);
+        prev.tombstones.push(2);
+        let mut next = gcfg(&[0, 1]); // tombstone list silently emptied
+        next.version = 2;
+        let err = c.on_config_adopted(0, &next, &prev, 1).unwrap_err();
+        assert!(err.invariant.contains("inv9"), "{err}");
+        // Carrying it forward is fine.
+        let mut ok = gcfg(&[0, 1]);
+        ok.version = 2;
+        ok.tombstones.push(2);
+        assert!(c.on_config_adopted(0, &ok, &prev, 2).is_ok());
     }
 }

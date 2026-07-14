@@ -108,18 +108,91 @@ pub const DGRAM_KIND_SNAP_NAK: u8 = 14;
 /// peer → leader: the file is complete (echoes the [`SnapBeginBody`] as the ack).
 pub const DGRAM_KIND_SNAP_DONE: u8 = 15;
 
-pub const SNAP_BEGIN_BODY_LEN: usize = 24;
+/// M7: follower→leader forwarded membership proposal (`uc2ctl` wrote the
+/// local admin slot on a non-leader). Body = `ConfigProposalBody`.
+pub const DGRAM_KIND_CONFIG_PROPOSAL: u8 = 16;
+/// M7: leader→follower reply for a forwarded proposal. Body = `ConfigReplyBody`.
+pub const DGRAM_KIND_CONFIG_REPLY: u8 = 17;
+
+pub const SNAP_BEGIN_FIXED_LEN: usize = 26;
+
+pub const CONFIG_PROPOSAL_BODY_LEN: usize = 22;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigProposalBody {
+    pub nonce: u64,
+    /// `uc2_consensus::config::ConfigOp` discriminant (1..=5).
+    pub op: u32,
+    pub id: u32,
+    pub ip: u32,
+    pub port: u16,
+}
+
+pub fn write_config_proposal_body(buf: &mut [u8], b: &ConfigProposalBody) {
+    buf[0..8].copy_from_slice(&b.nonce.to_le_bytes());
+    buf[8..12].copy_from_slice(&b.op.to_le_bytes());
+    buf[12..16].copy_from_slice(&b.id.to_le_bytes());
+    buf[16..20].copy_from_slice(&b.ip.to_le_bytes());
+    buf[20..22].copy_from_slice(&b.port.to_le_bytes());
+}
+
+pub fn read_config_proposal_body(buf: &[u8]) -> Option<ConfigProposalBody> {
+    if buf.len() < CONFIG_PROPOSAL_BODY_LEN {
+        return None;
+    }
+    Some(ConfigProposalBody {
+        nonce: u64::from_le_bytes(buf[0..8].try_into().ok()?),
+        op: u32::from_le_bytes(buf[8..12].try_into().ok()?),
+        id: u32::from_le_bytes(buf[12..16].try_into().ok()?),
+        ip: u32::from_le_bytes(buf[16..20].try_into().ok()?),
+        port: u16::from_le_bytes(buf[20..22].try_into().ok()?),
+    })
+}
+
+pub const CONFIG_REPLY_BODY_LEN: usize = 24;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigReplyBody {
+    pub nonce: u64,
+    /// 0 = accepted; 1 = refused (see `reason`); 2 = retry (leader unknown/changed).
+    pub status: u32,
+    /// `uc2_consensus::config::ProposeError` discriminant when refused.
+    pub reason: u32,
+    /// New config version when accepted; current version otherwise.
+    pub version: u64,
+}
+
+pub fn write_config_reply_body(buf: &mut [u8], b: &ConfigReplyBody) {
+    buf[0..8].copy_from_slice(&b.nonce.to_le_bytes());
+    buf[8..12].copy_from_slice(&b.status.to_le_bytes());
+    buf[12..16].copy_from_slice(&b.reason.to_le_bytes());
+    buf[16..24].copy_from_slice(&b.version.to_le_bytes());
+}
+
+pub fn read_config_reply_body(buf: &[u8]) -> Option<ConfigReplyBody> {
+    if buf.len() < CONFIG_REPLY_BODY_LEN {
+        return None;
+    }
+    Some(ConfigReplyBody {
+        nonce: u64::from_le_bytes(buf[0..8].try_into().ok()?),
+        status: u32::from_le_bytes(buf[8..12].try_into().ok()?),
+        reason: u32::from_le_bytes(buf[12..16].try_into().ok()?),
+        version: u64::from_le_bytes(buf[16..24].try_into().ok()?),
+    })
+}
 
 /// Opens (and, echoed back, acks) a snapshot session. `session` scopes chunk/NAK
 /// traffic to one transfer; `snapshot_pos` is the artifact's tag `S`; `total_len`
-/// is the file size the receiver pre-sizes its `.part` to. LE: session 0..4,
+/// is the file size the receiver pre-sizes its `.part` to; `config` is the
+/// length-prefixed encoded config (M7, empty for M6). LE: session 0..4,
 /// 4..8 zero (u64 alignment for `snapshot_pos`), snapshot_pos 8..16,
-/// total_len 16..24.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// total_len 16..24, config_len u16 24..26, config bytes 26...
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapBeginBody {
     pub session: u32,
     pub snapshot_pos: u64,
     pub total_len: u64,
+    pub config: Vec<u8>,
 }
 
 pub fn write_snap_begin_body(buf: &mut [u8], b: &SnapBeginBody) {
@@ -127,18 +200,27 @@ pub fn write_snap_begin_body(buf: &mut [u8], b: &SnapBeginBody) {
     buf[4..8].fill(0);
     buf[8..16].copy_from_slice(&b.snapshot_pos.to_le_bytes());
     buf[16..24].copy_from_slice(&b.total_len.to_le_bytes());
+    buf[24..26].copy_from_slice(&(b.config.len() as u16).to_le_bytes());
+    if !b.config.is_empty() {
+        buf[26..26 + b.config.len()].copy_from_slice(&b.config);
+    }
 }
 
 /// Decode a snap-begin body, or `None` if the buffer is shorter than
-/// [`SNAP_BEGIN_BODY_LEN`] (the caller drops a malformed datagram).
+/// [`SNAP_BEGIN_FIXED_LEN`] (the caller drops a malformed datagram).
 pub fn read_snap_begin_body(buf: &[u8]) -> Option<SnapBeginBody> {
-    if buf.len() < SNAP_BEGIN_BODY_LEN {
+    if buf.len() < SNAP_BEGIN_FIXED_LEN {
+        return None;
+    }
+    let config_len = u16::from_le_bytes(buf[24..26].try_into().ok()?) as usize;
+    if buf.len() < SNAP_BEGIN_FIXED_LEN + config_len {
         return None;
     }
     Some(SnapBeginBody {
         session: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
         snapshot_pos: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
         total_len: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+        config: buf[26..26 + config_len].to_vec(),
     })
 }
 
@@ -403,6 +485,26 @@ mod tests {
     }
 
     #[test]
+    fn config_proposal_and_reply_bodies_roundtrip_and_pin_layout() {
+        let p = ConfigProposalBody { nonce: 7, op: 2, id: 5, ip: 0x0a000005, port: 19100 };
+        let mut buf = [0u8; CONFIG_PROPOSAL_BODY_LEN];
+        write_config_proposal_body(&mut buf, &p);
+        assert_eq!(&buf[0..8], &7u64.to_le_bytes());
+        assert_eq!(&buf[8..12], &2u32.to_le_bytes());
+        assert_eq!(&buf[12..16], &5u32.to_le_bytes());
+        assert_eq!(&buf[16..20], &0x0a000005u32.to_le_bytes());
+        assert_eq!(&buf[20..22], &19100u16.to_le_bytes());
+        assert_eq!(read_config_proposal_body(&buf), Some(p));
+
+        let r = ConfigReplyBody { nonce: 7, status: 0, reason: 0, version: 4 };
+        let mut buf = [0u8; CONFIG_REPLY_BODY_LEN];
+        write_config_reply_body(&mut buf, &r);
+        assert_eq!(&buf[0..8], &7u64.to_le_bytes());
+        assert_eq!(&buf[16..24], &4u64.to_le_bytes());
+        assert_eq!(read_config_reply_body(&buf), Some(r));
+    }
+
+    #[test]
     fn kind_codes_are_stable() {
         assert_eq!(DGRAM_KIND_DATA, 1);
         assert_eq!(DGRAM_KIND_HEARTBEAT, 2);
@@ -419,26 +521,29 @@ mod tests {
         assert_eq!(DGRAM_KIND_SNAP_CHUNK, 13);
         assert_eq!(DGRAM_KIND_SNAP_NAK, 14);
         assert_eq!(DGRAM_KIND_SNAP_DONE, 15);
+        assert_eq!(DGRAM_KIND_CONFIG_PROPOSAL, 16);
+        assert_eq!(DGRAM_KIND_CONFIG_REPLY, 17);
     }
 
     #[test]
     fn snap_begin_body_roundtrips_and_pins_layout() {
-        let b = SnapBeginBody { session: 0x0A0B_0C0D, snapshot_pos: 0x1000, total_len: 300 * 1024 };
-        let mut buf = [0u8; SNAP_BEGIN_BODY_LEN];
+        let b = SnapBeginBody { session: 0x0A0B_0C0D, snapshot_pos: 0x1000, total_len: 300 * 1024, config: vec![] };
+        let mut buf = vec![0u8; SNAP_BEGIN_FIXED_LEN];
         write_snap_begin_body(&mut buf, &b);
         assert_eq!(read_snap_begin_body(&buf), Some(b));
         // session=0x0A0B0C0D -> LE [0x0D,0x0C,0x0B,0x0A]; pad [0,0,0,0];
         // snapshot_pos=0x1000 -> LE [0,0x10,0,0,0,0,0,0];
-        // total_len=307200=0x0004_B000 -> LE [0x00,0xB0,0x04,0,0,0,0,0].
+        // total_len=307200=0x0004_B000 -> LE [0x00,0xB0,0x04,0,0,0,0,0];
+        // config_len=0 -> LE [0,0].
         assert_eq!(
-            buf,
-            [
+            &buf[..],
+            &[
                 0x0D, 0x0C, 0x0B, 0x0A, 0, 0, 0, 0, 0x00, 0x10, 0, 0, 0, 0, 0, 0, 0x00, 0xB0,
-                0x04, 0, 0, 0, 0, 0
+                0x04, 0, 0, 0, 0, 0, 0, 0
             ]
         );
         // Short buffer is rejected (caller drops the datagram).
-        assert_eq!(read_snap_begin_body(&buf[..SNAP_BEGIN_BODY_LEN - 1]), None);
+        assert_eq!(read_snap_begin_body(&buf[..SNAP_BEGIN_FIXED_LEN - 1]), None);
     }
 
     #[test]

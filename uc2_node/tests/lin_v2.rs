@@ -212,6 +212,7 @@ fn linearizable_under_purge_and_snapshot_churn() {
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: 16 * 1024,
         snapshot_interval_bytes: 32 * 1024,
+        spare_node: false,
     };
 
     let seed: u64 =
@@ -298,6 +299,212 @@ fn linearizable_under_purge_and_snapshot_churn() {
         }
         Verdict::Inconclusive => {
             panic!("checker Inconclusive under purge (seed={seed}); raise THROTTLE / lower TARGET_OPS")
+        }
+    }
+}
+
+// ------------------------------------------------- capstone under reconfig (M7)
+
+/// M7 Task 10 — the milestone's strongest correctness proof: the SAME
+/// failover-capstone workload + WGL oracle, but the fault mix now ALSO
+/// churns live membership. A `ClusterCfg::spare_node` reserves an extra
+/// address the scheduler cycles through `LinClusterV2::random_config_op`
+/// (add-learner -> promote -> demote -> remove-learner, one step per pick,
+/// each gated on the previous step's `config_pending` actually clearing —
+/// see that method's doc for why a bare admin `status == 0` is NOT by itself
+/// a durable-commit guarantee). The other three arms are: kill-leader
+/// (node kill+restart), a follower-service crash (mirroring the purge
+/// capstone's third arm), and a short isolate-a-follower-then-heal
+/// partition (mirroring `lin_partition_v2.rs`'s minority scenario) — so this
+/// capstone proves linearizability holds with ALL FOUR fault classes
+/// interleaved with live reconfiguration, not just reconfiguration in
+/// isolation.
+///
+/// Same bars as the other capstones: ≥ 80 % `Ok`, `Linearizable`, ≤ 120 s
+/// (this capstone's budget is env-tunable via `UC2_LIN_BUDGET_SECS`, default
+/// 120 — see the `budget_secs` local below), across seeds 0x1107 / 7 / 99
+/// (the default + `LIN_SEED`). NON-VACUITY: `config_ops_committed >= 3` —
+/// proof that the reconfig arm didn't just spin on `NotCaughtUp`/pending
+/// no-ops the whole run.
+#[test]
+fn linearizable_under_reconfig_churn() {
+    const DEFAULT_SEED: u64 = 0x1107;
+    const TARGET_OPS: usize = 600;
+    // A hard ceiling on top of `TARGET_OPS`: the WGL checker (`uc-lincheck`,
+    // untouched) has only ever been exercised up to ~1.7k entries in this
+    // workspace (the crashtest's `hard_crash` test) — an UNDISTURBED run of
+    // this capstone (few faults land, e.g. the config-op cycle completes in
+    // its first few picks) can otherwise let the workers run wild for the
+    // rest of `BUDGET` while only the `config_ops_committed` condition below
+    // is still pending, and was observed to reach 4000+ entries and blow the
+    // checker's stack. The scheduler loop bails out once ops cross this line
+    // even if `MIN_CONFIG_OPS` isn't met yet (the assert below still catches
+    // genuine vacuity; this only guards against an accidental OVER-run).
+    const MAX_OPS: usize = 1500;
+    const N_WORKERS: u32 = 3;
+    // Heavier than the other capstones' 15-20 ms: this capstone's fault
+    // schedule (see `FAULT_PERIOD` below) gives the cluster long undisturbed
+    // stretches, and light throttling let raw worker throughput alone push
+    // the history size into `MAX_OPS` territory well before the fault
+    // schedule had a chance to matter.
+    const THROTTLE: Duration = Duration::from_millis(150);
+    // More spacing than the plain failover capstone's 1 s (a config-op
+    // round-trip — propose + replicate + commit, sometimes a catch-up wait —
+    // is slower than a bare kill+restart), but NOT so much that the total
+    // tick count over `BUDGET` gets small enough for the arm picker's
+    // per-seed variance to matter: at 2.5 s this capstone was observed
+    // (seed 99) to draw the config arm only twice in the entire budget by
+    // sheer bad luck in that seed's RNG stream, reaching `config_ops_committed
+    // == 2` and failing non-vacuity even though nothing was actually stuck.
+    // 1.2 s roughly doubles the tick budget, which the widened election
+    // timeout + the spare-voting fault gates below already make safe to
+    // sustain.
+    const FAULT_PERIOD: Duration = Duration::from_millis(1200);
+    // Wall-clock budget for this capstone only (the other three capstones
+    // keep their hard-coded 120 s bar). This capstone runs a 4th busy-spin
+    // node (`spare_node: true`) plus widened election timeouts, which can
+    // run tight on a shrunk-vCPU hosted CI runner even though it comfortably
+    // clears 120 s on the dev fleet — env-tunable so CI can widen it
+    // (`UC2_LIN_BUDGET_SECS`, default 120, matching the other capstones'
+    // fixed bar) without touching the correctness bars below.
+    let budget_secs: u64 = std::env::var("UC2_LIN_BUDGET_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120);
+    // Soft cutoff for the scheduler loop, 5 s inside the hard budget below —
+    // preserved from the original fixed 115-vs-120 split so teardown (worker
+    // join + cluster stop) has room before the hard assert fires.
+    let budget = Duration::from_secs(budget_secs.saturating_sub(5));
+
+    let ccfg = ClusterCfg { spare_node: true, ..ClusterCfg::default() };
+
+    let seed: u64 =
+        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SEED);
+
+    let _g = serialize();
+    let dir = tempdir();
+    let mut cluster = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    cluster.await_single_serving(30);
+
+    let dirs = Arc::new(cluster.dirs());
+    let history = Arc::new(History::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let last_seen = Arc::new(AtomicU64::new(0));
+
+    let handles = spawn_workers(&dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS);
+
+    // Fault scheduler: one quorum-preserving fault at a time, 1-in-4 —
+    //   0: leader node kill+restart,
+    //   1: random follower service crash+restart,
+    //   2: isolate a random follower, hold briefly, then heal
+    //      (`lin_partition_v2.rs`'s minority scenario, condensed),
+    //   3: random_config_op — one step of the spare's add/promote/demote/
+    //      remove cycle (a legitimate no-op when a change is already
+    //      pending / the learner isn't caught up yet).
+    // Non-vacuity floor (the capstone asserts `>= 3` at the end; target one
+    // higher here so scheduling jitter doesn't shave the margin to zero).
+    // At full worker throughput (no purge slowing anything down, unlike the
+    // purge-churn capstone) `TARGET_OPS` alone is reached in a few seconds —
+    // WAY before enough fault-scheduler ticks have fired to cycle the spare a
+    // handful of times, so the loop must keep running on the config-ops
+    // condition too, not stop the instant the op-count bar is cleared.
+    const MIN_CONFIG_OPS: u32 = 4;
+    let mut frng = StdRng::seed_from_u64(seed ^ 0xFA17);
+    let mut faults = 0u32;
+    let mut config_arm_picks = 0u32;
+    let start = Instant::now();
+    loop {
+        let snap = history.snapshot();
+        if snap.len() >= MAX_OPS {
+            break;
+        }
+        if History::ok_count(&snap) >= TARGET_OPS && cluster.config_ops_committed >= MIN_CONFIG_OPS {
+            break;
+        }
+        std::thread::sleep(FAULT_PERIOD);
+        match frng.random_range(0..4u8) {
+            // While the spare is a full VOTER (`Promoted`, between
+            // PromoteLearner and DemoteVoter committing) the cluster's
+            // quorum is a razor-thin 3-of-4 with zero slack: killing one of
+            // the original 3 leaves EXACTLY 3 live members, so the pending
+            // DemoteVoter proposal needs every one of them healthy and
+            // caught up to commit. Observed empirically (seed 99): repeated
+            // kills during this window can keep the SAME pending change
+            // perpetually unsettled (`ChangePending` on every subsequent
+            // admin attempt) for the rest of the budget. Skip this arm
+            // during that (short) window, same rationale as the partition
+            // arm below.
+            0 if !cluster.spare_is_voting() => cluster.kill_and_restart_leader(),
+            0 => {}
+            1 => cluster.crash_and_restart_random_follower_service(&mut frng),
+            2 => {
+                // `partition_minority`'s `cut()` plumbing only knows about
+                // the original `n` nodes; while the spare is a full VOTER
+                // (`Promoted`, between PromoteLearner and DemoteVoter
+                // committing) it is a real 4th quorum member that isolating
+                // "the other two" would not actually cut off from — skip
+                // this arm during that (short) window rather than teaching
+                // the shared partition helpers about a member that joins and
+                // leaves quorum mid-run.
+                if !cluster.spare_is_voting() {
+                    cluster.partition_minority();
+                    std::thread::sleep(Duration::from_millis(800));
+                    cluster.heal();
+                    cluster.await_reconverged(20);
+                }
+            }
+            _ => {
+                config_arm_picks += 1;
+                cluster.random_config_op(&mut frng);
+            }
+        }
+        faults += 1;
+        if start.elapsed() > budget {
+            break;
+        }
+    }
+    let elapsed = start.elapsed();
+
+    // Non-vacuity: captured before `stop()` consumes the cluster.
+    let config_ops_committed = cluster.config_ops_committed;
+
+    stop.store(true, Ordering::Relaxed);
+    join_workers(handles);
+    cluster.stop();
+
+    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let ok = History::ok_count(&entries);
+    eprintln!(
+        "[lin_v2 reconfig] seed={seed} faults={faults} (config-arm picks={config_arm_picks}) \
+         ops={} ok={ok} config_ops_committed={config_ops_committed} elapsed={:.1}s — checking",
+        entries.len(),
+        elapsed.as_secs_f64()
+    );
+
+    assert!(
+        config_ops_committed >= 3,
+        "vacuous: reconfig churn never actually reconfigured (config_ops_committed={config_ops_committed})"
+    );
+
+    assert!(
+        ok * 100 >= entries.len() * 80,
+        "liveness: only {ok}/{} ops Ok (<80%) — cluster failed to progress under reconfig churn",
+        entries.len()
+    );
+    assert!(
+        elapsed < Duration::from_secs(budget_secs),
+        "reconfig-churn capstone took {elapsed:?} — exceeded the {budget_secs} s/seed budget \
+         (override via UC2_LIN_BUDGET_SECS)"
+    );
+
+    match check_register(&entries) {
+        Verdict::Linearizable => {}
+        Verdict::Violation => {
+            dump_history(&entries, seed);
+            panic!("LINEARIZABILITY VIOLATION under reconfig churn (seed={seed}); history dumped");
+        }
+        Verdict::Inconclusive => {
+            panic!("checker Inconclusive under reconfig churn (seed={seed}); raise THROTTLE / lower TARGET_OPS")
         }
     }
 }

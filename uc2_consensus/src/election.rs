@@ -23,6 +23,7 @@
 //! election) from `[min, max)` via a crate-local xorshift — no dependency.
 
 use crate::commit::CommitTracker;
+use crate::config::{ClusterConfig, ConfigOp, ProposeError};
 use crate::reconcile::{MAX_TERM_MAP_WIRE_ENTRIES, Outcome, Reconcile, reconcile};
 
 pub type NodeId = u32;
@@ -47,9 +48,17 @@ impl XorShift64 {
 
 pub struct ElectionConfig {
     pub id: NodeId,
-    /// Static voting membership, self included. Position in this Vec is the
-    /// follower index used by CommitTracker when leader.
-    pub members: Vec<NodeId>,
+    /// The adopted cluster membership (M7): voters + learners + tombstones,
+    /// versioned. `members` (the voting set, self included iff a voter) and
+    /// `can_vote` are DERIVED from this at construction and again on every
+    /// `Event::ConfigObserved` adoption — see `ElectionSm::adopt_config`.
+    /// M6 Task 7's learner-candidacy switch (a learner's own id is NOT in the
+    /// voting set, so it never occupies a `CommitTracker` slot and its
+    /// `Report` is dropped by `follower_slot` — the two halves of "never
+    /// affects quorum") now falls out of `config.is_voter(id)`.
+    pub config: ClusterConfig,
+    /// Recovered frame-end position of `config` (0 at genesis / fresh boot).
+    pub config_position: u64,
     pub election_timeout_min_ns: u64, // default 150_000_000
     pub election_timeout_max_ns: u64, // default 300_000_000
     /// Idle re-gossip floor (spec §6): the maximum interval a leader will go
@@ -59,15 +68,6 @@ pub struct ElectionConfig {
     /// cluster — waits to learn commit / reconcile. Default 100_000_000 (100ms).
     pub gossip_floor_ns: u64,
     pub seed: u64,
-    /// M6 Task 7: candidacy switch. A voter (`true`) runs the ordinary election
-    /// path — times out, solicits votes, grants votes. A learner (`false`) is
-    /// replicated-to but never counted: its election timer never fires a
-    /// candidacy, and it never grants a `RequestVote` (it still ADOPTS a higher
-    /// term for liveness/reconcile — just never votes). By construction a
-    /// learner's own id is NOT in `members` (the voting set), so it also never
-    /// occupies a `CommitTracker` slot and its `Report` is dropped by
-    /// `follower_slot` — the two halves of "never affects quorum".
-    pub can_vote: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +105,14 @@ pub enum Event {
     /// pending map adopted IFF `epoch` matches the in-flight truncation the SM
     /// allocated in the corresponding `Action::Truncate`.
     Truncated { epoch: u64, to: u64 },
+    /// M7: a `ClusterConfig` frame was observed (durably appended) ending at
+    /// `position` — fed by the leader append path, the follower archive scan,
+    /// AND boot recovery. Adopts iff `config.version` strictly exceeds the
+    /// currently adopted version (idempotent / monotone). This is a DATA-PLANE
+    /// event: it is deliberately NOT in the truncating latch's allow-list, so
+    /// it is dropped while a truncation is in flight and re-observed once the
+    /// data plane resumes — including the post-revert re-adoption case.
+    ConfigObserved { position: u64, config: ClusterConfig },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +163,29 @@ pub enum Action {
     /// `Truncate { to: 0, new_map: [] }` this is emitted alongside. The agent bumps
     /// a `wipes` counter and takes no other action.
     CountWipe,
+    /// M7: a higher-version `ClusterConfig` was adopted at `position` (`prev`/
+    /// `prev_position` are the superseded config and its position). The agent
+    /// must, in any order that preserves durability-before-effect: (1) persist
+    /// the `ConfigRecord`; (2) rebuild the net layer (`SetPeers`) from the new
+    /// config; (3) update `cnc.dat`. If this adoption also emitted
+    /// `HaltRemoved`, the halt still applies.
+    ConfigAdopted { position: u64, config: ClusterConfig, prev_position: u64, prev: ClusterConfig },
+    /// M7: this node is not a member of the just-adopted config (and is not a
+    /// leader mid-self-removal — a leader keeps serving until its own removal
+    /// commits; Task 8 adds that commit-triggered step-down). The agent must
+    /// fail-stop.
+    HaltRemoved,
+    /// M7 Task 8: a LEADER's own removal has just COMMITTED (`commit_seen`
+    /// crossed `config_position` while `!config.contains(self.id)`). Emitted
+    /// exactly once (guarded by `stepped_down`) from `rank_leader`, the same
+    /// site that advances commit. The agent must stop leading the same way
+    /// `HaltRemoved` fail-stops — log, park permanently, feed nothing further.
+    /// The remaining voters (C_new) elect normally; they never depended on
+    /// this leader beyond the commit that just landed. Never fires for a
+    /// follower (a follower's self-exclusion is `HaltRemoved`, emitted at
+    /// ADOPTION, not commit — it has no NewTerm-style obligation to keep
+    /// serving the entry that removed it).
+    StepDownRemoved,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,9 +204,43 @@ pub enum Role {
 
 pub struct ElectionSm {
     id: NodeId,
+    /// The adopted `ClusterConfig` (M7). `members`/`can_vote` below are
+    /// derived from it at construction and on every adoption boundary.
+    config: ClusterConfig,
+    /// Frame-end position of `config` (the append offset it was observed at).
+    config_position: u64,
+    /// The superseded config (M7): exactly ONE level of history, mirroring the
+    /// durable `ConfigRecord { cur, prev }`. One-in-flight (a proposal is
+    /// refused while the previous config frame is uncommitted) plus
+    /// committed-never-truncated make one level sufficient — at most one
+    /// config entry is ever truncation-exposed. Maintained by `adopt_config`;
+    /// consumed by the truncation revert in the `Truncated` arm. At
+    /// construction `prev == config` (genesis / fresh boot has nothing to
+    /// revert to); boot recovery of a real record's prev level goes through
+    /// [`ElectionSm::restore_prev_config`].
+    prev_config: ClusterConfig,
+    /// Frame-end position of `prev_config` (0 at genesis / fiat).
+    prev_position: u64,
+    /// M7 counterfactual hook: revert-on-truncate ON by default. The sim flips
+    /// it to `false` (mirroring `set_wipe_on_no_common_prefix`) to prove the
+    /// revert is load-bearing — with it deleted, a truncation below the config
+    /// frame leaves the SM operating under a config its own log no longer
+    /// carries, and the sim's inv8 goes red.
+    revert_on_truncate: bool,
+    /// Derived voting set: `config.voter_ids()`. Kept as private derived
+    /// state (rather than recomputed on every access) so the rest of the SM
+    /// body — `majority()`, `follower_slot()`, the vote/report membership
+    /// checks — stays unchanged.
     members: Vec<NodeId>,
-    /// M6 Task 7: candidacy switch (see [`ElectionConfig::can_vote`]).
+    /// Derived: `config.is_voter(id)`. M6 Task 7: candidacy switch — see the
+    /// doc on [`ElectionConfig::config`].
     can_vote: bool,
+    /// Carried per-member durable reports (M7): upserted (max) on every
+    /// current-term `Report` from a config member, cleared on `become_leader`
+    /// (stale-term reports must not certify anything in the new term), and
+    /// pruned to surviving config members at every `adopt_config` rebuild.
+    /// Backs the `PromoteLearner` catch-up precondition and `last_report`.
+    last_reports: Vec<(NodeId, u64)>,
     timeout_min_ns: u64,
     timeout_max_ns: u64,
     /// Idle re-gossip floor (see [`ElectionConfig::gossip_floor_ns`]).
@@ -234,6 +299,30 @@ pub struct ElectionSm {
     /// flips it to `false` to reproduce the OLD `Action::Fatal` behavior and prove
     /// the same divergent world fail-stops without the wipe.
     wipe_on_no_common_prefix: bool,
+    /// M7 Task 8: latched once `Action::StepDownRemoved` has fired, so a
+    /// leader mid-self-removal emits it exactly once even though `rank_leader`
+    /// keeps running (re-shipping gossip, ranking further reports) every tick
+    /// until the agent actually parks the process. Never reset — this is a
+    /// one-way trip, same posture as `HaltRemoved`.
+    stepped_down: bool,
+    /// T8 review fix (T9 integration fix, M7 Task 9: corrected predicate):
+    /// latched `true` the moment `adopt_config` FORMALLY observes (via a real
+    /// `Event::ConfigObserved` adoption, at ANY role — the leader carve-out
+    /// only defers the resulting `HaltRemoved`, it doesn't erase the fact)
+    /// that `config.tombstones` contains `self.id`. Deliberately starts
+    /// `false` at construction and is set ONLY by `adopt_config`, never by
+    /// inspecting the boot-recovered `config` directly: a freshly-joining
+    /// node's local seed legitimately excludes itself too (it hasn't learned
+    /// its own learner-hood from the replicated stream yet — see
+    /// `ElectionConfig::config`'s doc), and that is NOT a removal — same
+    /// reasoning covers a joiner's own replay of any PRIOR historical
+    /// `ConfigObserved` version that predates its admission (T9's
+    /// `resize_3_to_5_to_3` catch). Gates `halt_if_removed_follower`'s
+    /// halt-on-demotion check so that check fires only for a genuine,
+    /// formally-adopted self-removal (tombstoned) — never for "not a member
+    /// yet" (absent but not tombstoned). Never reset once set: tombstones are
+    /// permanent (inv9), so a real self-exclusion can never be un-adopted.
+    self_removed: bool,
 }
 
 impl ElectionSm {
@@ -247,25 +336,31 @@ impl ElectionSm {
         durable: u64,
         now_ns: u64,
     ) -> Self {
+        // Derive the voting set + candidacy switch from the adopted config
+        // (M7). `members` is voters-only; a learner's own id must NOT be in
+        // it (M6 Task 7 — replicated-to without ever being counted).
+        let members_ids = cfg.config.voter_ids();
+        let can_vote = cfg.config.is_voter(cfg.id);
+
         // Fail loudly at construction, not via a usize underflow later
         // (n_members - 1) or a nonsensical timer span. A voter's own id must be
         // in `members` (it occupies a CommitTracker slot and votes for itself);
         // a learner's own id must NOT be — `members` is the voting set only, and
         // a learner is replicated-to without ever being counted (M6 Task 7).
-        assert!(!cfg.members.is_empty(), "election membership must be non-empty");
-        if cfg.can_vote {
+        assert!(!members_ids.is_empty(), "election membership must be non-empty");
+        if can_vote {
             assert!(
-                cfg.members.contains(&cfg.id),
+                members_ids.contains(&cfg.id),
                 "a voter's id must be in the voting membership (id={}, members={:?})",
                 cfg.id,
-                cfg.members
+                members_ids
             );
         } else {
             assert!(
-                !cfg.members.contains(&cfg.id),
+                !members_ids.contains(&cfg.id),
                 "a learner's id must NOT be in the voting membership (id={}, members={:?})",
                 cfg.id,
-                cfg.members
+                members_ids
             );
         }
         // Hard-assert (M-2): a strictly positive timer span. An empty span
@@ -283,13 +378,19 @@ impl ElectionSm {
         let vote_term = recovered_vote.map(|(t, _)| t).unwrap_or(0);
         let current_term = vote_term.max(map_term);
 
-        let n_members = cfg.members.len();
+        let n_members = members_ids.len();
         let tracker = CommitTracker::new(n_members - 1, n_members);
 
         let mut sm = Self {
             id: cfg.id,
-            members: cfg.members,
-            can_vote: cfg.can_vote,
+            prev_config: cfg.config.clone(),
+            prev_position: cfg.config_position,
+            revert_on_truncate: true,
+            config: cfg.config,
+            config_position: cfg.config_position,
+            members: members_ids,
+            can_vote,
+            last_reports: Vec::new(),
             timeout_min_ns: cfg.election_timeout_min_ns,
             timeout_max_ns: cfg.election_timeout_max_ns,
             gossip_floor_ns: cfg.gossip_floor_ns,
@@ -312,6 +413,8 @@ impl ElectionSm {
             truncation_epoch: 0,
             pending_new_map: None,
             wipe_on_no_common_prefix: true,
+            stepped_down: false,
+            self_removed: false,
         };
         sm.arm_timeout(now_ns);
         sm
@@ -322,6 +425,24 @@ impl ElectionSm {
     /// `Action::Fatal` fail-stop on the identical divergent world.
     pub fn set_wipe_on_no_common_prefix(&mut self, v: bool) {
         self.wipe_on_no_common_prefix = v;
+    }
+
+    /// M7: toggle the truncation config-revert. Default on (`true`). The sim
+    /// counterfactual (`revert_on_truncate_disabled`) sets it `false` — deleting
+    /// the real guard so inv8 (revert correctness) goes red mechanically — the
+    /// same pattern as [`ElectionSm::set_wipe_on_no_common_prefix`].
+    pub fn set_revert_on_truncate(&mut self, v: bool) {
+        self.revert_on_truncate = v;
+    }
+
+    /// M7 boot-recovery hook: restore the durable `ConfigRecord`'s PREV level.
+    /// `ElectionSm::new` seeds `prev = config` (a fresh boot has nothing to
+    /// revert to); a node recovering a real two-level record calls this right
+    /// after construction so a post-restart truncation below `config_position`
+    /// still reverts to the genuine predecessor instead of no-op'ing.
+    pub fn restore_prev_config(&mut self, prev: ClusterConfig, prev_position: u64) {
+        self.prev_config = prev;
+        self.prev_position = prev_position;
     }
 
     pub fn step(&mut self, ev: Event, out: &mut Vec<Action>) {
@@ -377,6 +498,19 @@ impl ElectionSm {
                 if term > self.current_term {
                     self.adopt_term(term, None, out);
                     return;
+                }
+                // Carried reports (M7): upsert (max) for ANY current-term
+                // report from a config MEMBER (voter or learner), regardless
+                // of our own role — a follower may later become leader and
+                // needs the last-known durable for the promote-learner
+                // catch-up precondition without waiting for a fresh report.
+                // A non-member's report (forged source, or a removed voter)
+                // is dropped here just like `follower_slot` drops it below.
+                if self.config.contains(from) && from != self.id {
+                    match self.last_reports.iter_mut().find(|(id, _)| *id == from) {
+                        Some((_, d)) => *d = (*d).max(durable),
+                        None => self.last_reports.push((from, durable)),
+                    }
                 }
                 if matches!(self.role, Role::Leader)
                     && let Some(slot) = self.follower_slot(from)
@@ -515,6 +649,59 @@ impl ElectionSm {
                     self.term_map = m;
                 }
                 self.truncating_epoch = None;
+                // M7 truncation revert (spec §5): `config_position` is the config
+                // frame's END (the effect point) and truncation is frame-aligned,
+                // so `to < config_position` means the frame itself was removed —
+                // the adopted config no longer has a log entry backing it.
+                // `to == config_position` preserves the frame exactly: no revert.
+                // Scoped to the MATCHING-epoch ack (same latch discipline as the
+                // pending-map adoption above): a stale-epoch ack clamps durable
+                // but never touches config state.
+                if to < self.config_position && self.revert_on_truncate {
+                    if to == 0 {
+                        // WIPE-AND-REJOIN: keep the current config as operational
+                        // truth (config-by-fiat — the same authority argument as
+                        // `adopt_snapshot_lineage`): a wiped node refills from the
+                        // leader's live stream, which re-stamps real positions;
+                        // dropping to a genesis-era config here would shrink the
+                        // voting set the node answers elections under, for no
+                        // safety gain. The record resets to position 0 with
+                        // prev == cur (nothing below a wipe to revert to).
+                        self.config_position = 0;
+                        self.prev_config = self.config.clone();
+                        self.prev_position = 0;
+                    } else {
+                        // Ordinary truncation: revert one level. One-in-flight
+                        // guarantees at most one truncation-exposed config, so
+                        // after the revert the single history level is exhausted:
+                        // prev_* already equal the reverted values (config was
+                        // just set FROM prev_config; positions likewise).
+                        self.config = self.prev_config.clone();
+                        self.config_position = self.prev_position;
+                    }
+                    // Rebuild-at-boundary under the (possibly reverted) config —
+                    // fresh EMPTY tracker: unlike `adopt_config`, carried reports
+                    // are NOT re-fed. They were collected under the just-removed
+                    // config's world-view mid-divergence; post-truncation reports
+                    // re-arrive from live traffic and re-prime the ranking.
+                    self.rebuild_membership(false);
+                    // One adoption/persist path for the node: the agent persists
+                    // the (reverted / position-reset) record and rebuilds exactly
+                    // as it would for a forward adoption.
+                    out.push(Action::ConfigAdopted {
+                        position: self.config_position,
+                        config: self.config.clone(),
+                        prev_position: self.prev_position,
+                        prev: self.prev_config.clone(),
+                    });
+                }
+            }
+
+            Event::ConfigObserved { position, config } => {
+                if config.version <= self.config.version {
+                    return; // idempotent / stale re-observation
+                }
+                self.adopt_config(position, config, out);
             }
         }
     }
@@ -562,6 +749,37 @@ impl ElectionSm {
         self.current_term = self.current_term.max(last_term);
     }
 
+    /// M7 Task 6: config-by-fiat on a snapshot install (mirrors
+    /// [`ElectionSm::adopt_snapshot_lineage`] just above — same authority
+    /// argument: a below-floor joiner discards its local bytes and installs the
+    /// leader's snapshot, so there is no genuine local history to prefer over
+    /// what the snapshot carries; the leader's config AT the floor becomes
+    /// truth by fiat). Unlike ordinary adoption (`adopt_config` /
+    /// `ConfigObserved`) this sets `cur == prev == config` at `position ==
+    /// prev_position == floor` — a cold joiner has nothing below the floor to
+    /// revert to, so collapsing the one-level history to a single point is
+    /// correct (there is no genuine predecessor to lose). Rebuilds every
+    /// structure derived from `self.config` — voting set, candidacy, a FRESH
+    /// EMPTY `CommitTracker`, and the carried-reports prune — exactly like the
+    /// truncation revert (`carry_reports = false`: this is a cold join, there
+    /// is nothing to carry forward). Emits NO `Action::ConfigAdopted`: unlike
+    /// every other adoption path, this one is driven from the node's
+    /// snapshot-install-completion handler, which persists the fiat
+    /// `ConfigRecord` inline rather than through the shared exec arm — the
+    /// node (not the SM) owns the timing of a snapshot install.
+    pub fn adopt_snapshot_config(&mut self, position: u64, config: ClusterConfig) {
+        // Final-review fix (trivial): the sender's fan-out (`rebuild_net_for_config`
+        // -> `followers`/`learners`, both filtered to `config.voters`/`learners`)
+        // never addresses a tombstoned id, so a session shipping the installer its
+        // OWN tombstone is unreachable by construction. Pins that invariant.
+        debug_assert!(!config.tombstones.contains(&self.id), "fiat install of our own tombstone");
+        self.config = config.clone();
+        self.prev_config = config;
+        self.config_position = position;
+        self.prev_position = position;
+        self.rebuild_membership(false);
+    }
+
     /// True while a truncation is in flight (the data-plane latch is held).
     pub fn is_truncating(&self) -> bool {
         self.truncating_epoch.is_some()
@@ -570,6 +788,54 @@ impl ElectionSm {
     /// The durable byte position the SM currently believes it holds.
     pub fn durable(&self) -> u64 {
         self.durable
+    }
+
+    /// The currently adopted cluster membership.
+    pub fn config(&self) -> &ClusterConfig {
+        &self.config
+    }
+
+    /// Frame-end position of the currently adopted config.
+    pub fn config_position(&self) -> u64 {
+        self.config_position
+    }
+
+    /// One membership change in flight at a time: true while the adopted
+    /// config's position has not yet committed.
+    pub fn config_pending(&self) -> bool {
+        self.config_position > self.commit_seen
+    }
+
+    /// The last carried durable report for `id` (used by the promote-learner
+    /// catch-up precondition and by `uc2ctl status`).
+    pub fn last_report(&self, id: NodeId) -> Option<u64> {
+        self.last_reports.iter().find(|(rid, _)| *rid == id).map(|(_, d)| *d)
+    }
+
+    /// Leader-only membership proposal (M7). `slack` = max catch-up gap a
+    /// learner may have and still be promoted (the node passes its admission
+    /// window). Returns the NEW config for the node to append as a
+    /// FRAME_TYPE_CONFIG frame; adoption happens via the `ConfigObserved` the
+    /// append path feeds back — one adoption path for leader and follower.
+    /// The SM does NOT self-adopt here.
+    pub fn propose_config(&mut self, op: ConfigOp, slack: u64) -> Result<ClusterConfig, ProposeError> {
+        if !matches!(self.role, Role::Leader) {
+            return Err(ProposeError::NotLeader);
+        }
+        if !self.serving {
+            return Err(ProposeError::NotServing); // the single-server-change precondition
+        }
+        if self.config_pending() {
+            return Err(ProposeError::ChangePending); // one in flight
+        }
+        if let ConfigOp::PromoteLearner { id } = op {
+            let reported = self.last_report(id).unwrap_or(0);
+            let target = self.commit_seen.saturating_sub(slack);
+            if reported < target {
+                return Err(ProposeError::NotCaughtUp { gap: target - reported });
+            }
+        }
+        self.config.apply(op)
     }
 
     // ---- internals ----
@@ -669,6 +935,9 @@ impl ElectionSm {
         self.term_map.push((self.current_term, self.durable));
         // Fresh follower slots: stale-term reports must not certify the new term.
         self.tracker.reset_reports();
+        // M7: stale-term carried reports must not certify a promote-learner
+        // precondition either (mirrors the tracker reset above).
+        self.last_reports.clear();
         out.push(Action::BecomeLeader { term: self.current_term, base: self.durable });
         // Ship the freshly-opened term map so followers can reconcile (spec §M4).
         out.push(Action::ShipTermMap { entries: self.term_map_wire_tail() });
@@ -688,6 +957,7 @@ impl ElectionSm {
         // map it adopts is a valid prefix regardless of the new term; the new
         // leader re-ships and we re-reconcile from there.
         out.push(Action::BecomeFollower { term: new_term, leader });
+        self.halt_if_removed_follower(out);
     }
 
     /// Run reconciliation against a leader-shipped map and emit the derived
@@ -761,6 +1031,59 @@ impl ElectionSm {
         self.new_term_pos = None;
         self.votes_received.clear();
         out.push(Action::BecomeFollower { term: self.current_term, leader: None });
+        self.halt_if_removed_follower(out);
+    }
+
+    /// M7 Task 8 (T8 review finding): after ANY transition to `Role::Follower`,
+    /// fail-stop if a self-removal was FORMALLY adopted (`self.self_removed`,
+    /// latched by `adopt_config`) at any point during this run. Closes a
+    /// fail-stop completeness gap in the self-removal machinery:
+    /// `adopt_config`'s leader carve-out deliberately suppresses
+    /// `HaltRemoved` while `Role::Leader` (a leader mid-self-removal must
+    /// keep serving until its own removal commits), and the commit-triggered
+    /// `StepDownRemoved` fires only from `rank_leader` once that commit
+    /// actually lands. If a higher-term event (RequestVote / Vote / Report /
+    /// LeaderSeen / CommitGossip / TermMapReceived — all routed through
+    /// `adopt_term` — or a Candidate hearing the term's real leader, routed
+    /// through `step_down_to_follower`) demotes this node to follower BEFORE
+    /// the removal commits, NEITHER site can ever fire again:
+    /// `StepDownRemoved` can't (no longer leader), and `adopt_config`'s site
+    /// isn't re-entered (`ConfigObserved` is version-gated, and no new config
+    /// is being adopted anyway). Without this call the node becomes a
+    /// permanently inert non-voting follower that never fail-stops — a
+    /// liveness/completeness bug (not a safety one: it is fully inert, never
+    /// wrongly participates).
+    ///
+    /// Gated on the LATCH (`self_removed`), NOT on a raw `!config.contains
+    /// (self.id)` check: a freshly-joining node's boot-recovered `config`
+    /// legitimately excludes itself too (its local seed predates learning its
+    /// own learner-hood from the replicated stream — see
+    /// `ElectionConfig::config`'s doc / `joining_node_boots_from_stale_seed`
+    /// in `uc2_node`'s reconfig tests), and such a node fields plenty of
+    /// higher-term events (`adopt_term`) from the already-leaderful cluster
+    /// while it waits to adopt its real config. The raw check would halt it
+    /// on the spot, before it ever gets a chance to join. The latch only ever
+    /// becomes `true` via a REAL `adopt_config` adoption that observed
+    /// self-exclusion — never merely by inspecting recovered/boot state — so
+    /// "never yet a member" and "formally removed" stay distinguishable.
+    ///
+    /// Deliberately NOT separately double-emission-latched (contrast
+    /// `stepped_down`, which exists to keep `rank_leader`'s per-tick action
+    /// stream to exactly one `StepDownRemoved` across many subsequent ticks of
+    /// a leader that keeps re-ranking after its own commit crossing).
+    /// `Action::HaltRemoved` is idempotent at the node: `Node::halt()` just
+    /// sets a one-way flag, and `do_work` short-circuits once it is set, so
+    /// at most one further `feed` — and thus at most one redundant emission —
+    /// can ever occur before the process actually parks. There is also no
+    /// in-SM double-emission hazard: within a single `step`, at most one of
+    /// `adopt_term`/`step_down_to_follower` ever runs (every call site that
+    /// reaches `step_down_to_follower` does so only when `adopt_term` was NOT
+    /// just taken in the same event, since `adopt_term` already flips `role`
+    /// away from `Candidate` first).
+    fn halt_if_removed_follower(&mut self, out: &mut Vec<Action>) {
+        if self.self_removed {
+            out.push(Action::HaltRemoved);
+        }
     }
 
     fn handle_request_vote(
@@ -821,6 +1144,159 @@ impl ElectionSm {
         None
     }
 
+    /// Rebuild-at-boundary (M7): adopt `cfg` (observed ending at `position`),
+    /// refresh the derived voting set, rebuild the `CommitTracker` sized to
+    /// the new voting set, and re-feed the last durable report per surviving
+    /// member so commit ranking does not restart from zero. Commit itself is
+    /// monotonic in the cnc counter — a rebuild can only pause, never regress
+    /// it.
+    fn adopt_config(&mut self, position: u64, cfg: ClusterConfig, out: &mut Vec<Action>) {
+        self.prev_config = std::mem::replace(&mut self.config, cfg);
+        self.prev_position = self.config_position;
+        self.config_position = position;
+        self.rebuild_membership(true);
+        out.push(Action::ConfigAdopted {
+            position,
+            config: self.config.clone(),
+            prev_position: self.prev_position,
+            prev: self.prev_config.clone(),
+        });
+        // Self-exclusion: a follower halts now; a leader removing itself keeps
+        // serving until this entry COMMITS (the node executes the step-down —
+        // Task 8), because C_new must be replicated by a leader that still
+        // exists.
+        //
+        // TOMBSTONE-based, not absence-based (T9 integration catch, M7 Task 9
+        // fix): ids are fresh-forever (`ClusterConfig::apply` — an id enters
+        // only via `AddLearner`, which the tombstone check blocks for a
+        // tombstoned id; an id leaves only via `Remove*`, which ALWAYS pushes
+        // a tombstone), so `absent ∧ not-tombstoned` means "not yet admitted",
+        // never "removed". A newly-admitted node replaying `ConfigObserved`
+        // history from before its own admission (e.g. a second learner whose
+        // catch-up replays configs that only include the FIRST learner)
+        // legitimately adopts one or more historical versions that exclude
+        // its own id — `!config.contains(self.id)` cannot tell that apart
+        // from a real removal and would wrongly halt/latch on it.
+        if self.config.tombstones.contains(&self.id) {
+            // T8 review fix: latch this REGARDLESS of role. The leader carve-
+            // out below only defers the resulting `HaltRemoved` action — it
+            // does not mean the removal wasn't formally adopted. The latch is
+            // what lets `halt_if_removed_follower` correctly fail-stop a
+            // self-removing leader that gets preempted by a higher term
+            // BEFORE its own removal commits (a demotion that reaches neither
+            // this site again — `ConfigObserved` is version-gated — nor
+            // `rank_leader`'s commit-triggered `StepDownRemoved`, since it is
+            // no longer leader).
+            self.self_removed = true;
+            if !matches!(self.role, Role::Leader) {
+                out.push(Action::HaltRemoved);
+            }
+        }
+    }
+
+    /// Refresh every structure DERIVED from `self.config` (rebuild-at-boundary,
+    /// M7): the voting set, the candidacy switch, a fresh dense-slot
+    /// `CommitTracker`, and the carried-reports prune. Shared by forward
+    /// adoption (`adopt_config`, `carry_reports = true` — commit ranking must
+    /// not restart from zero across the boundary) and the truncation revert
+    /// (`carry_reports = false` — reports collected under the just-removed
+    /// config are stale; live traffic re-primes them).
+    ///
+    /// Sizing subtlety: `follower_slot` skips only `m == self.id`. If self
+    /// is (still) a voter, it occupies no slot and the tracker is sized as
+    /// before: n-1 tracked followers over a cluster of n. If self is NOT a
+    /// voter (a learner, or — Leader case — mid-self-removal, kept
+    /// serving until commit per the self-exclusion rule in `adopt_config`), it
+    /// occupies NO slot to exclude, so ALL n voters get a dense slot
+    /// 0..n — using the old `n - 1` here would both under-track one
+    /// member (permanently reads zero) AND panic in `follower_slot` /
+    /// `CommitTracker::on_durable` once a real report maps to slot `n-1`,
+    /// one past the tracker's `n-1`-sized `reported` vec. `CommitTracker`
+    /// still requires `cluster_size > n_followers` ("the leader is a
+    /// member") — own_durable always occupies that "+1" ranking slot in
+    /// `advance`, self-as-voter or not — so cluster_size is always
+    /// `n_followers + 1`.
+    ///
+    /// **CONSCIOUS DECISION (M7 Task 8 controller amendment carry #1, T3/T4
+    /// review): the mid-self-removal leader's ranking is MORE PERMISSIVE than
+    /// a pure C_new quorum, and this is INTENTIONAL — kept, not tightened.**
+    /// When self is a departing leader, `n_followers = n` (every C_new voter
+    /// gets a slot, none excluded for self) and `cluster_size = n + 1`, so
+    /// `advance`'s quorum is `(n+1)/2 + 1` ranked over `{own_durable} ∪
+    /// {n real C_new reports}`. Own_durable is the leader's OWN append —
+    /// which is not itself a C_new member's durable — so this quorum can be
+    /// satisfied by the leader's own count plus FEWER than a true majority of
+    /// the n real C_new voters (pinned by
+    /// `self_removal_window_tracker_permits_leader_plus_one_of_two_new_followers`:
+    /// with 2 C_new voters, `own + 1-of-2` already ranks 2nd-highest, whereas a
+    /// pure C_new majority needs both). Ongaro's 2014 dissertation §4.2.2
+    /// explicitly forbids the removed leader counting itself toward C_new's
+    /// majority for exactly this reason. Two options were on the table:
+    ///
+    /// (a) exclude the departing leader from the ranking entirely (a real
+    ///     "pure C_new quorum" tracker), or
+    /// (b) keep this sizing and rely on a DIFFERENT safety argument.
+    ///
+    /// We chose **(b)**. The safety argument: `handle_request_vote`'s
+    /// `log_ok` freshness check (`(last_term, last_durable) >= (our_term,
+    /// our_durable)`) means NO candidate can ever win an election without a
+    /// log at least as up-to-date as a majority of voters who granted it —
+    /// in particular, at least as up-to-date as one of the honest C_new
+    /// voters whose report the leader ranked to reach this commit (by the
+    /// classic Raft pigeonhole: any two majority-ish sets of C_new voters
+    /// across two elections share at least one voter, and that voter will
+    /// never grant a vote to a candidate whose log is behind what it durably
+    /// holds — which already includes this commit's bytes, since ITS OWN
+    /// report is what the leader ranked). So even though the ranking itself
+    /// admits a smaller real-C_new-agreement than Ongaro's rule requires, no
+    /// future election winner can ever NOT hold what was committed here — the
+    /// externally-observable safety property (no committed entry is ever
+    /// lost) holds regardless. `uc2_sim`'s config-churn fuzz (`fuzz_heavy_config_churn`,
+    /// which routinely proposes `RemoveVoter{leader}`) oracle-checks this
+    /// exact window on every seed and stays green under (b); a REAL
+    /// discrepancy (a future leader missing a report-certified commit) would
+    /// trip inv5/inv7 there. (a) would need a tracker mode that ranks
+    /// `own_durable` OUT of the "+1" slot entirely — undertaking a second
+    /// `CommitTracker` shape and re-deriving the sim's oracle in lockstep —
+    /// for a property already proven sound and already the sim's live
+    /// coverage; strictly more churn for no safety gain. If a future reader
+    /// ever needs (a), the sim's oracle for this window must move in lockstep
+    /// (re-run `cargo test -p uc2_sim --features sim-heavy --release`).
+    fn rebuild_membership(&mut self, carry_reports: bool) {
+        self.members = self.config.voter_ids();
+        self.can_vote = self.config.is_voter(self.id);
+        // Final-review fix: prune `votes_received` to the surviving voter set
+        // (plus always keep our own self-grant). Without this a candidate's
+        // stale tally from a since-removed voter keeps counting toward
+        // `majority()` forever — same-term two-leader hazard: candidate holds
+        // grants {self, X}; a config removing X becomes durable mid-candidacy
+        // (majority over the NEW, smaller membership drops to 1); the stale
+        // X-grant still in `votes_received` now satisfies that majority and
+        // this node fiat-"wins" while a disjoint real majority of the new
+        // membership elects someone else in the same term. Deliberately do
+        // NOT re-check majority/become_leader here (a later grant re-triggers
+        // the check via `Event::Vote` naturally) — staying conservative
+        // (falling below majority never elects) is the safe direction; only
+        // ratcheting the tally down needs no accompanying action.
+        self.votes_received.retain(|v| self.members.contains(v) || *v == self.id);
+        let n = self.members.len();
+        let n_followers = if self.can_vote { n - 1 } else { n };
+        self.tracker = CommitTracker::new(n_followers, n_followers + 1);
+        // Prune to SURVIVING config members (voter OR learner — not just
+        // voters): a learner's carried report must survive an unrelated
+        // rebuild (e.g. another AddLearner) so a later PromoteLearner still
+        // sees it; a truly removed id (voter or learner) is correctly
+        // dropped because `self.config.contains` is false for it.
+        self.last_reports.retain(|(id, _)| self.config.contains(*id) && *id != self.id);
+        if carry_reports {
+            for &(id, durable) in &self.last_reports {
+                if let Some(slot) = self.follower_slot(id) {
+                    self.tracker.on_durable(slot, durable);
+                }
+            }
+        }
+    }
+
     fn rank_leader(&mut self, now_ns: u64, out: &mut Vec<Action>) {
         if let Some(c) = self.tracker.advance(self.durable)
             && c > self.commit_seen
@@ -846,6 +1322,38 @@ impl ElectionSm {
             {
                 self.serving = true;
             }
+            // M7 Task 8: leader self-removal completion. `adopt_config` kept
+            // this leader serving through the adoption window (a leader
+            // removing itself must keep appending until C_new itself
+            // certifies the removal — Ongaro's single-server-change
+            // rationale: C_new must be replicated by a leader that still
+            // exists). Once THIS commit crosses `config_position` — the
+            // removal entry itself is now committed — there is nothing left
+            // for this leader to do: it is not in `config`, so it can never
+            // again be counted toward a future quorum, and the surviving
+            // C_new voters can elect among themselves. Emit exactly once
+            // (`stepped_down` latches it) even though this branch re-runs on
+            // every subsequent advance until the agent actually parks us.
+            //
+            // TOMBSTONE-based (T9 fix, uniform with `adopt_config`'s halt
+            // predicate) rather than absence-based: for a LEADER specifically
+            // the two are equivalent — reaching `Role::Leader` requires
+            // having been a voter in some already-adopted config, and ids are
+            // fresh-forever (see `adopt_config`'s comment), so a leader can
+            // only become absent from `config` via a `Remove*` that also
+            // tombstoned it. The debug_assert below pins that equivalence.
+            debug_assert!(
+                self.config.contains(self.id) || self.config.tombstones.contains(&self.id),
+                "leader id {} absent from config but not tombstoned — fresh-forever-ids invariant violated",
+                self.id
+            );
+            if !self.stepped_down
+                && self.config.tombstones.contains(&self.id)
+                && self.commit_seen >= self.config_position
+            {
+                self.stepped_down = true;
+                out.push(Action::StepDownRemoved);
+            }
         }
     }
 }
@@ -854,10 +1362,25 @@ impl ElectionSm {
 mod tests {
     use super::*;
 
+    /// Synthetic per-test addr: `(id, 1)` — never a real `SocketAddr`.
+    fn addr_of(id: NodeId) -> (u32, u16) {
+        (id, 1)
+    }
+
+    /// A genesis `ClusterConfig` with `members` all as voters, no learners.
+    fn genesis_voters(members: &[NodeId]) -> ClusterConfig {
+        ClusterConfig::genesis(members.iter().map(|&id| (id, addr_of(id))).collect(), Vec::new())
+    }
+
     fn cfg(id: NodeId) -> ElectionConfig {
+        cfg_members(id, vec![0, 1, 2])
+    }
+
+    fn cfg_members(id: NodeId, members: Vec<NodeId>) -> ElectionConfig {
         ElectionConfig {
             id,
-            members: vec![0, 1, 2],
+            config: genesis_voters(&members),
+            config_position: 0,
             election_timeout_min_ns: 150,
             election_timeout_max_ns: 300,
             // Huge floor: these tests drive ranking via `Tick` at tiny `now_ns`
@@ -866,19 +1389,22 @@ mod tests {
             // `idle_leader_reemits_on_gossip_floor` with a small floor.
             gossip_floor_ns: u64::MAX,
             seed: 42 + id as u64,
-            can_vote: true,
         }
     }
 
-    fn cfg_members(id: NodeId, members: Vec<NodeId>) -> ElectionConfig {
+    /// Like `cfg_members`, but with an explicit learner set (M7 promote tests).
+    fn cfg_with_learners(id: NodeId, voters: Vec<NodeId>, learners: Vec<NodeId>) -> ElectionConfig {
         ElectionConfig {
             id,
-            members,
+            config: ClusterConfig::genesis(
+                voters.iter().map(|&v| (v, addr_of(v))).collect(),
+                learners.iter().map(|&l| (l, addr_of(l))).collect(),
+            ),
+            config_position: 0,
             election_timeout_min_ns: 150,
             election_timeout_max_ns: 300,
             gossip_floor_ns: u64::MAX,
             seed: 42 + id as u64,
-            can_vote: true,
         }
     }
 
@@ -920,12 +1446,15 @@ mod tests {
     fn learner() -> ElectionSm {
         let cfg = ElectionConfig {
             id: 9,
-            members: vec![0, 1, 2],
+            config: ClusterConfig::genesis(
+                vec![(0, addr_of(0)), (1, addr_of(1)), (2, addr_of(2))],
+                vec![(9, addr_of(9))],
+            ),
+            config_position: 0,
             election_timeout_min_ns: 150,
             election_timeout_max_ns: 300,
             gossip_floor_ns: u64::MAX,
             seed: 7,
-            can_vote: false,
         };
         ElectionSm::new(cfg, None, &[(1, 0)], 0, 0)
     }
@@ -1157,6 +1686,63 @@ mod tests {
         assert!(matches!(s.role(), Role::Leader));
     }
 
+    /// Final-review fix: `rebuild_membership` must prune `votes_received` when
+    /// a config adoption removes a voter the candidate already counted —
+    /// otherwise the stale grant keeps counting toward the (now smaller)
+    /// majority forever, letting a same-term candidate "win" off a disjoint
+    /// quorum from whatever a real majority of the new membership converges
+    /// on. 5 voters [0,1,2,3,4], self=0: a grant from 1 leaves the candidate
+    /// at 2/5, below majority(3). Voter 1 — the only non-self granter — is
+    /// then removed (durably observed mid-candidacy, exactly the interleaving
+    /// the review found: some other leader's config change reaches this
+    /// candidate via the ordinary `ConfigObserved` path, which does not
+    /// require self to be Leader). The new majority of 4 is still 3. Without
+    /// pruning, the stale grant from 1 would still be in the tally, so a
+    /// single FRESH grant would wrongly cross majority (stale-1 + self +
+    /// fresh-2 = 3) even though only 2 of the tally are real votes from
+    /// current members. With pruning, it correctly takes two fresh grants.
+    #[test]
+    fn config_adoption_prunes_stale_grant_from_removed_voter() {
+        let mut s = ElectionSm::new(cfg_members(0, vec![0, 1, 2, 3, 4]), None, &[], 0, 0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        assert!(matches!(s.role(), Role::Candidate));
+        assert_eq!(s.current_term(), 1);
+
+        // Self + voter 1's grant: 2 of 5, below majority(3) — still Candidate.
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        assert!(matches!(s.role(), Role::Candidate));
+
+        // Voter 1 is removed from the config, durably adopted mid-candidacy.
+        let mut new_cfg = s.config().clone();
+        new_cfg.voters.retain(|(id, _)| *id != 1);
+        new_cfg.tombstones.push(1);
+        new_cfg.version = 1;
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
+        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::BecomeLeader { .. })),
+            "adoption itself must never auto-check majority/become_leader — a later \
+             grant re-triggers the check naturally"
+        );
+        assert!(matches!(s.role(), Role::Candidate));
+
+        // ONE fresh grant from a surviving member (2): the pruned tally is
+        // {0,2} = 2, still below the new majority(3) of 4 — must stay
+        // Candidate. (Pre-fix, the stale grant from 1 would still be
+        // counted — {0,1,2} = 3 — wrongly crossing majority right here.)
+        let acts = step(&mut s, Event::Vote { from: 2, term: 1, granted: true });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::BecomeLeader { .. })),
+            "the stale grant from the removed voter must not count toward the new majority"
+        );
+        assert!(matches!(s.role(), Role::Candidate));
+
+        // A second fresh grant (3): {0,2,3} = 3 real grants of 4 — a genuine majority.
+        let acts = step(&mut s, Event::Vote { from: 3, term: 1, granted: true });
+        assert!(acts.iter().any(|a| matches!(a, Action::BecomeLeader { .. })));
+        assert!(matches!(s.role(), Role::Leader));
+    }
+
     /// F1: a grant from a non-member id must be ignored. `votes_received` is
     /// seeded with self, so without the membership check one forged grant would
     /// be a majority of 3 and elect the candidate (RED pre-F1).
@@ -1365,12 +1951,12 @@ mod tests {
         // the election timeout so a leader tick is unambiguous.
         let cfg = ElectionConfig {
             id: 0,
-            members: vec![0, 1, 2],
+            config: genesis_voters(&[0, 1, 2]),
+            config_position: 0,
             election_timeout_min_ns: 150,
             election_timeout_max_ns: 300,
             gossip_floor_ns: 1000,
             seed: 42,
-            can_vote: true,
         };
         let mut s = ElectionSm::new(cfg, None, &[], 0, 0);
         // Drive to leader of term 1. `become_leader` re-anchors the idle floor to
@@ -1636,5 +2222,711 @@ mod tests {
         sm.step(Event::RequestVote { from: 9, new_term: 5, last_term: 4, last_durable: 1 << 20 }, &mut out);
         assert!(out.is_empty(), "non-member RequestVote must produce nothing");
         assert_eq!(sm.current_term(), 1, "and must not adopt the term");
+    }
+
+    // ---- M7 dynamic membership ----
+
+    /// The tracker rebuild carries existing per-follower reports across an
+    /// adoption boundary (commit ranking never restarts from zero), and the
+    /// newly-added voter gets a dense `CommitTracker` slot from the rebuild.
+    #[test]
+    fn adopt_config_rebuilds_tracker_and_carries_reports() {
+        // 3 voters {1,2,3}; self=1 becomes leader of term 1.
+        let mut s = ElectionSm::new(cfg_members(1, vec![1, 2, 3]), None, &[], 0, 0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 2, term: 1, granted: true }); // majority of 3
+        assert!(matches!(s.role(), Role::Leader));
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        // Majority of 3 is 2: own + node 2's report alone already commits 32.
+        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 32 });
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 32 })),
+            "pre-adoption: quorum on the carried reports commits 32"
+        );
+        step(&mut s, Event::Report { from: 3, term: 1, durable: 32 });
+
+        // Adopt v1: a higher-version config adding voter 5, fed directly as
+        // the append path would (ConfigObserved does not care how the config
+        // was derived, only that its version is higher).
+        let mut new_cfg = s.config().clone();
+        new_cfg.voters.push((5, (5, 5)));
+        new_cfg.version = 1;
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg.clone() });
+        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { position: 40, .. })));
+        assert_eq!(s.config(), &new_cfg);
+        assert_eq!(s.config_position(), 40);
+        assert!(s.follower_slot(5).is_some(), "the new voter must get a tracked slot");
+
+        // Post-adoption: fresh durable + reports from the carried members (2,3)
+        // alone (no report from 5 yet) still reach quorum-of-4.
+        step(&mut s, Event::DurableAdvanced { durable: 64 });
+        step(&mut s, Event::Report { from: 2, term: 1, durable: 64 });
+        let acts = step(&mut s, Event::Report { from: 3, term: 1, durable: 64 });
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 64 })),
+            "commit advances post-adoption via the carried reports for 2 and 3"
+        );
+    }
+
+    /// `propose_config` is refused: by a non-leader (`NotLeader`), by a leader
+    /// that has not yet committed its own `NewTerm` frame (`NotServing` — the
+    /// single-server-change precondition), and while a prior proposal is
+    /// still uncommitted (`ChangePending` — one in flight).
+    #[test]
+    fn propose_refused_unless_serving_and_no_pending() {
+        let mut s = sm(0); // voters [0,1,2], id 0
+        step(&mut s, Event::Tick { now_ns: 301 });
+        assert!(matches!(s.role(), Role::Candidate));
+        assert_eq!(
+            s.propose_config(ConfigOp::AddLearner { id: 5, addr: (5, 5) }, 0),
+            Err(ProposeError::NotLeader)
+        );
+
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+        assert!(!s.can_serve());
+        assert_eq!(
+            s.propose_config(ConfigOp::AddLearner { id: 5, addr: (5, 5) }, 0),
+            Err(ProposeError::NotServing)
+        );
+
+        // Commit the NewTerm frame -> serving.
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        step(&mut s, Event::Tick { now_ns: 310 });
+        assert!(s.can_serve());
+
+        let new_cfg = s.propose_config(ConfigOp::AddLearner { id: 5, addr: (5, 5) }, 0).unwrap();
+        assert_eq!(new_cfg.version, 1);
+
+        // The append path feeds the observed config back; it has not
+        // committed yet (commit_seen stays 32 < config_position 40).
+        step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
+        assert!(s.config_pending());
+        assert_eq!(
+            s.propose_config(ConfigOp::AddLearner { id: 6, addr: (6, 6) }, 0),
+            Err(ProposeError::ChangePending)
+        );
+    }
+
+    /// `PromoteLearner` additionally requires the learner's last carried
+    /// report to be within `slack` of `commit_seen`.
+    #[test]
+    fn promote_requires_caught_up_learner() {
+        let mut s = ElectionSm::new(cfg_with_learners(0, vec![0, 1, 2], vec![5]), None, &[], 0, 0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 100_000 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100_000 });
+        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 100_000 })));
+        assert!(s.can_serve());
+
+        step(&mut s, Event::Report { from: 5, term: 1, durable: 10_000 });
+        assert_eq!(s.last_report(5), Some(10_000));
+        assert!(!s.config_pending());
+
+        assert_eq!(
+            s.propose_config(ConfigOp::PromoteLearner { id: 5 }, 32_768),
+            Err(ProposeError::NotCaughtUp { gap: 57_232 })
+        );
+
+        step(&mut s, Event::Report { from: 5, term: 1, durable: 90_000 });
+        assert!(s.propose_config(ConfigOp::PromoteLearner { id: 5 }, 32_768).is_ok());
+    }
+
+    /// `ConfigObserved` adopts iff `config.version` strictly exceeds the
+    /// current version: re-feeding the same version is a no-op, and a lower
+    /// version arriving after a higher one is ignored (never regresses).
+    #[test]
+    fn config_observed_is_idempotent_and_monotone_by_version() {
+        let mut s = sm(0); // voters [0,1,2], id 0
+        let mut cfg_v1 = s.config().clone();
+        cfg_v1.voters.push((5, (5, 5)));
+        cfg_v1.version = 1;
+
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: cfg_v1.clone() });
+        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        assert_eq!(s.config().version, 1);
+
+        // Re-observation of the SAME version: one adoption total, this is a no-op.
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: cfg_v1.clone() });
+        assert!(acts.is_empty(), "same-version re-observation must be a no-op");
+        assert_eq!(s.config().version, 1);
+
+        // A LOWER version arriving after a higher one is ignored.
+        let mut cfg_v0 = cfg_v1;
+        cfg_v0.version = 0;
+        let acts = step(&mut s, Event::ConfigObserved { position: 999, config: cfg_v0 });
+        assert!(acts.is_empty());
+        assert_eq!(s.config().version, 1, "a stale lower version must not regress adoption");
+    }
+
+    /// A follower not present in a just-adopted config fail-stops.
+    #[test]
+    fn removed_follower_emits_halt() {
+        // 3 voters [1,2,3]; self = 3 (a plain follower, never elected).
+        let mut s = ElectionSm::new(cfg_members(3, vec![1, 2, 3]), None, &[], 0, 0);
+        assert!(matches!(s.role(), Role::Follower));
+        let mut new_cfg = s.config().clone();
+        new_cfg.voters.retain(|(id, _)| *id != 3);
+        new_cfg.tombstones.push(3);
+        new_cfg.version = 1;
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
+        assert!(acts.iter().any(|a| matches!(a, Action::HaltRemoved)));
+    }
+
+    /// T9 integration catch (M7 Task 9 fix): a node whose own id is NOT in
+    /// genesis at all replays historical `ConfigObserved` versions that
+    /// pre-date its own admission — each one legitimately excludes it —
+    /// and must NEITHER halt NOR latch `self_removed` on any of them; only
+    /// a real tombstone may do that. This is the exact `resize_3_to_5_to_3`
+    /// failure shape: a SECOND joiner (61) whose catch-up replays v1
+    /// (voters [0,1,2], learner [60] — 61 absent, hasn't joined yet) then
+    /// v2 (60 promoted — 61 still absent) before it ever reaches v3 (61
+    /// finally admitted as a learner). A higher-term event landing
+    /// mid-replay (which unconditionally routes through `adopt_term` ->
+    /// `halt_if_removed_follower`, per `Event::RequestVote`'s handler) must
+    /// also not halt — this is the precise trigger the old absence-based
+    /// predicate got wrong (it would have latched `self_removed` on v1/v2
+    /// already, and this event is what surfaces the latch as a halt).
+    #[test]
+    fn joiner_replaying_pre_admission_configs_neither_halts_nor_latches() {
+        // Genesis: voters [0,1,2]; self = 61, entirely absent (not even a
+        // learner) — "hasn't joined the cluster at all" yet.
+        let mut s = ElectionSm::new(cfg_members(61, vec![0, 1, 2]), None, &[], 0, 0);
+        assert!(matches!(s.role(), Role::Follower));
+        assert!(!s.config().contains(61));
+
+        // v1: AddLearner{60} — 61 legitimately still absent.
+        let mut v1 = ClusterConfig::genesis(
+            [0, 1, 2].iter().map(|&id| (id, addr_of(id))).collect(),
+            vec![(60, addr_of(60))],
+        );
+        v1.version = 1;
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: v1 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "v1 (pre-admission history) must not halt a not-yet-admitted joiner"
+        );
+        assert!(!s.config().is_voter(61), "not yet a voter");
+        assert!(!s.config().contains(61), "not yet present at all in v1");
+
+        // v2: PromoteLearner{60} — 61 still legitimately absent.
+        let mut v2 = ClusterConfig::genesis(
+            [0, 1, 2, 60].iter().map(|&id| (id, addr_of(id))).collect(),
+            Vec::new(),
+        );
+        v2.version = 2;
+        let acts = step(&mut s, Event::ConfigObserved { position: 80, config: v2 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "v2 (still pre-admission history) must not halt"
+        );
+        assert!(!s.config().is_voter(61));
+        assert!(!s.config().contains(61));
+
+        // Mid-replay, a higher-term event (from a current voter, 0) drives
+        // `adopt_term` — which unconditionally calls `halt_if_removed_follower`
+        // regardless of role — BEFORE v3 is ever adopted. This is the T9 bug's
+        // exact trigger: the old absence-based predicate had already latched
+        // `self_removed = true` on v1/v2, so this event would incorrectly halt.
+        let acts = step(
+            &mut s,
+            Event::RequestVote { from: 0, new_term: 5, last_term: 1, last_durable: 0 },
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "a higher-term event mid-replay (before admission) must not surface a stale halt latch"
+        );
+
+        // v3: AddLearner{61} — 61 is finally present (as a learner).
+        let mut v3 = ClusterConfig::genesis(
+            [0, 1, 2, 60].iter().map(|&id| (id, addr_of(id))).collect(),
+            vec![(61, addr_of(61))],
+        );
+        v3.version = 3;
+        let acts = step(&mut s, Event::ConfigObserved { position: 120, config: v3 });
+        assert!(!acts.iter().any(|a| matches!(a, Action::HaltRemoved)), "own admission must never halt");
+        assert!(s.config().contains(61), "61 must now participate");
+        assert!(!s.config().is_voter(61), "still only a learner at v3");
+    }
+
+    /// The demote-then-remove path: demoting self from voter to learner is
+    /// NOT a removal (still present, no tombstone — must not halt); the
+    /// SUBSEQUENT removal-as-learner tombstones it and DOES halt. Pins that
+    /// the tombstone-based predicate still correctly fires on the real
+    /// removal path, not just the direct-voter-removal path already covered
+    /// by `removed_follower_emits_halt`.
+    #[test]
+    fn demote_then_remove_still_halts() {
+        // 3 voters [1,2,3]; self = 3 (a plain follower, never elected).
+        let mut s = ElectionSm::new(cfg_members(3, vec![1, 2, 3]), None, &[], 0, 0);
+        assert!(matches!(s.role(), Role::Follower));
+
+        // DemoteVoter{3}: voter -> learner. Still `contains` (learner), no
+        // tombstone — must NOT halt.
+        let mut demoted = s.config().clone();
+        demoted.voters.retain(|(id, _)| *id != 3);
+        demoted.learners.push((3, addr_of(3)));
+        demoted.version = 1;
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: demoted });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "demote alone (still present as a learner) must not halt"
+        );
+        assert!(s.config().contains(3));
+
+        // RemoveLearner{3}: tombstoned — now it halts.
+        let mut removed = s.config().clone();
+        removed.learners.retain(|(id, _)| *id != 3);
+        removed.tombstones.push(3);
+        removed.version = 2;
+        let acts = step(&mut s, Event::ConfigObserved { position: 80, config: removed });
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "removal-as-learner (tombstoned) must halt"
+        );
+    }
+
+    // ---- M7 Task 8: leader self-removal ----
+
+    /// Controller amendment carry #2: a LEADER adopting a config that
+    /// excludes ITSELF does not panic, keeps leading (`can_serve()` stays
+    /// true, no `HaltRemoved`), and commit keeps advancing via C_new reports
+    /// while it still appends — the single-server-change rationale (C_new
+    /// must be replicated by a leader that still exists) requires exactly
+    /// this. `HaltRemoved` (the follower path) is exercised by
+    /// `removed_follower_emits_halt` above; this pins the leader path stays
+    /// disjoint from it.
+    #[test]
+    fn leader_self_removal_adoption_keeps_leading_and_ranks_via_c_new() {
+        // 3 voters [0,1,2]; self = 0 becomes leader of term 1.
+        let mut s = sm(0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        assert!(s.can_serve(), "NewTerm committed: serving");
+
+        // Propose + adopt RemoveVoter{self} (fed as the append path would;
+        // config_position is set WELL above where we drive commit below, so
+        // this test stays strictly in the pre-crossing window).
+        let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
+        assert!(!new_cfg.contains(0));
+        let acts = step(&mut s, Event::ConfigObserved { position: 200, config: new_cfg });
+        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "a leader mid-self-removal must NOT halt at adoption"
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::StepDownRemoved)),
+            "no step-down before the removal entry itself commits"
+        );
+        assert!(matches!(s.role(), Role::Leader), "no panic, still leader");
+        assert!(s.can_serve(), "still serving through the adoption window");
+        assert!(!s.config().contains(0));
+
+        // Commit still advances via C_new reports (from 1, then 2) while the
+        // leader keeps appending — the whole point of not halting at
+        // adoption. Stays below config_position (200): still not stepped
+        // down. The FIRST report (own=128 + follower 1's 128, follower 2
+        // still stale at 0) already ranks the quorum-of-3 and crosses;
+        // follower 2's report is a same-value no-op advance (`None`).
+        step(&mut s, Event::DurableAdvanced { durable: 128 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 128 });
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 128 })),
+            "commit must keep advancing post-self-removal-adoption"
+        );
+        assert!(!acts.iter().any(|a| matches!(a, Action::StepDownRemoved)));
+        assert!(matches!(s.role(), Role::Leader));
+        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 128 });
+        assert!(!acts.iter().any(|a| matches!(a, Action::StepDownRemoved)));
+        assert!(matches!(s.role(), Role::Leader));
+    }
+
+    /// Step 1 / M7 Task 8: once commit CROSSES the self-removing leader's own
+    /// `config_position`, it emits `Action::StepDownRemoved` — exactly once,
+    /// even as further reports keep landing after the crossing.
+    #[test]
+    fn leader_self_removal_steps_down_once_commit_crosses_config_position() {
+        let mut s = sm(0); // voters [0,1,2], id 0
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        assert!(s.can_serve());
+
+        let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
+        step(&mut s, Event::ConfigObserved { position: 64, config: new_cfg });
+        assert!(matches!(s.role(), Role::Leader));
+
+        // Below config_position (64): no step-down yet.
+        step(&mut s, Event::DurableAdvanced { durable: 50 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 50 });
+        assert!(!acts.iter().any(|a| matches!(a, Action::StepDownRemoved)));
+        assert!(matches!(s.role(), Role::Leader), "still leading pre-crossing");
+
+        // Crosses config_position (64): StepDownRemoved fires alongside the
+        // AdvanceCommit that crosses it.
+        step(&mut s, Event::DurableAdvanced { durable: 100 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100 });
+        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 100 })));
+        assert_eq!(
+            acts.iter().filter(|a| matches!(a, Action::StepDownRemoved)).count(),
+            1,
+            "must emit StepDownRemoved exactly once on crossing"
+        );
+
+        // Further driving never re-emits it.
+        step(&mut s, Event::DurableAdvanced { durable: 200 });
+        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 200 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::StepDownRemoved)),
+            "must not re-emit after the first crossing"
+        );
+    }
+
+    /// T8 review finding: a self-removing LEADER preempted by a HIGHER TERM
+    /// before its own removal commits must still fail-stop. `adopt_config`'s
+    /// leader carve-out suppresses `HaltRemoved` at adoption (correctly — the
+    /// leader must keep serving until C_new certifies the removal), and it
+    /// never reaches the commit crossing that would fire `StepDownRemoved`
+    /// (a higher-term RequestVote from a surviving C_new member demotes it
+    /// first). Without `halt_if_removed_follower` this node would become a
+    /// permanently inert non-voting follower that never fail-stops — a
+    /// completeness gap, not a safety one.
+    #[test]
+    fn leader_self_removal_preempted_by_higher_term_halts() {
+        let mut s = sm(0); // voters [0,1,2], id 0
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        assert!(matches!(s.role(), Role::Leader));
+
+        // Adopt our own removal; config_position (200) is well above anything
+        // driven below, so we stay in the pre-crossing window throughout —
+        // the carve-out keeps this leader serving with no HaltRemoved here.
+        let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
+        let acts = step(&mut s, Event::ConfigObserved { position: 200, config: new_cfg });
+        assert!(!acts.iter().any(|a| matches!(a, Action::HaltRemoved)));
+        assert!(matches!(s.role(), Role::Leader), "carve-out: still leading through adoption");
+        assert!(!s.config().contains(0));
+
+        // Preempted by a higher term via a RequestVote from a surviving
+        // C_new member (1) BEFORE the removal entry commits: no
+        // StepDownRemoved has fired (commit never crossed config_position),
+        // and HaltRemoved was already suppressed at adoption. This demotion
+        // is the ONLY remaining chance to halt.
+        let acts = step(
+            &mut s,
+            Event::RequestVote { from: 1, new_term: 2, last_term: 1, last_durable: 32 },
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 2, leader: None })),
+            "must demote to follower of the new term"
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "a removed node preempted before self-removal commits must still fail-stop"
+        );
+        assert!(matches!(s.role(), Role::Follower));
+    }
+
+    /// Negative companion: a leader stepping down the exact same way (a
+    /// higher-term preemption) but that was NEVER removed from the config
+    /// must NOT halt — only the removed case fail-stops.
+    #[test]
+    fn leader_preempted_by_higher_term_without_removal_does_not_halt() {
+        let mut s = leader_term1(); // voters [0,1,2], id 0, still fully a member
+        assert!(s.config().contains(0));
+
+        let acts = step(
+            &mut s,
+            Event::RequestVote { from: 1, new_term: 2, last_term: 1, last_durable: 0 },
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 2, .. })),
+            "must demote to follower of the new term"
+        );
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "a leader that was never removed must not halt on ordinary preemption"
+        );
+        assert!(matches!(s.role(), Role::Follower));
+    }
+
+    /// Controller amendment carry #1 pin: the mid-self-removal leader's
+    /// ranking is MORE PERMISSIVE than a pure C_new quorum — it commits on
+    /// `{leader's own durable} ∪ {a single C_new follower's report}` even
+    /// though a genuine majority of the 2 remaining C_new voters would
+    /// require BOTH. This is the exact tradeoff documented at the
+    /// `rebuild_membership` sizing site (kept — decision (b), backed by the
+    /// `log_ok` + pigeonhole argument, not tightened to a pure-C_new tracker).
+    #[test]
+    fn self_removal_window_tracker_permits_leader_plus_one_of_two_new_followers() {
+        let mut s = sm(0); // voters [0,1,2], id 0
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        assert!(s.can_serve());
+
+        let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
+        assert_eq!(new_cfg.voter_ids(), vec![1, 2]);
+        step(&mut s, Event::ConfigObserved { position: 64, config: new_cfg });
+        assert!(!s.config().contains(0));
+
+        // The leader's own durable advances far past config_position; follower
+        // 2 NEVER reports again (permanently silent — a lagging/partitioned
+        // C_new voter). Only follower 1 reports.
+        step(&mut s, Event::DurableAdvanced { durable: 1000 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 1000 });
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 1000 })),
+            "own + ONE of the two C_new followers already ranks a quorum-of-3 \
+             (leader's own slot + follower 1's slot) even though follower 2 \
+             never reported — MORE permissive than a pure majority-of-2 over \
+             {{1,2}} alone, which is the conscious tradeoff carry #1 documents"
+        );
+    }
+
+    /// After a voter is removed from the adopted config, its `Report` no
+    /// longer moves commit (`follower_slot` drops it) and its `RequestVote`
+    /// is ignored entirely — extending the existing forged-report /
+    /// non-member tests to the dynamic (post-adoption) case.
+    #[test]
+    fn nonmember_vote_and_report_stay_dropped_after_adoption() {
+        let mut s = ElectionSm::new(cfg_members(0, vec![0, 1, 2, 3]), None, &[], 0, 0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(&mut s, Event::Vote { from: 2, term: 1, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+
+        let mut new_cfg = s.config().clone();
+        new_cfg.voters.retain(|(id, _)| *id != 3);
+        new_cfg.tombstones.push(3);
+        new_cfg.version = 1;
+        step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
+        assert!(!s.config().contains(3));
+        assert!(s.follower_slot(3).is_none());
+
+        // The removed voter's Report must not move commit.
+        let acts = step(&mut s, Event::Report { from: 3, term: 1, durable: 1 << 30 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            "a removed voter's Report must not move commit"
+        );
+
+        // The removed voter's RequestVote is ignored entirely: no answer, no
+        // term adoption (mirrors `request_vote_from_non_member_is_ignored`).
+        let before_term = s.current_term();
+        let acts =
+            step(&mut s, Event::RequestVote { from: 3, new_term: before_term + 5, last_term: 1, last_durable: 0 });
+        assert!(acts.is_empty(), "a removed voter's RequestVote must produce nothing");
+        assert_eq!(s.current_term(), before_term, "and must not adopt the term");
+    }
+
+    // ---- M7 truncation config-revert (spec §5, pulled forward from Task 6) ----
+
+    /// A learner-adding v1 config adopted at `position`, for the revert tests.
+    fn v1_of(s: &ElectionSm) -> ClusterConfig {
+        let mut v1 = s.config().clone();
+        v1.learners.push((9, addr_of(9)));
+        v1.version = 1;
+        v1
+    }
+
+    /// (a) Ordinary truncation strictly below the config frame's END reverts one
+    /// level — and re-emits `ConfigAdopted` so the node persists + rebuilds
+    /// through the one existing path. The revert waits for the MATCHING-epoch
+    /// ack (same latch discipline as the pending-map adoption).
+    #[test]
+    fn truncation_below_config_frame_reverts_to_prev() {
+        let mut s = sm_with_divergent_map(); // map [(1,0),(2,4096)], durable 6000, term 3
+        let genesis = s.config().clone();
+        let v1 = v1_of(&s);
+        step(&mut s, Event::ConfigObserved { position: 5000, config: v1.clone() });
+        assert_eq!((s.config().version, s.config_position()), (1, 5000));
+        // Divergent-map reconcile → Truncate{to: 4096} — strictly below 5000,
+        // so the config frame is removed by the cut.
+        let acts =
+            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let epoch = extract_truncate_epoch(&acts);
+        assert_eq!(s.config().version, 1, "config untouched until the matching-epoch ack");
+        let acts = step(&mut s, Event::Truncated { epoch, to: 4096 });
+        assert_eq!(s.config(), &genesis, "reverted one level to prev");
+        assert_eq!(s.config_position(), 0);
+        assert!(
+            acts.iter().any(|a| matches!(
+                a,
+                Action::ConfigAdopted { position: 0, config, .. } if config.version == 0
+            )),
+            "the revert re-emits ConfigAdopted (node persists the reverted record)"
+        );
+    }
+
+    /// (b) `to == config_position` exactly preserves the frame (frame-END effect
+    /// point; truncation keeps `[0, to)`) — no revert, no ConfigAdopted.
+    #[test]
+    fn truncation_at_config_frame_end_preserves_the_config() {
+        let mut s = sm_with_divergent_map();
+        let v1 = v1_of(&s);
+        step(&mut s, Event::ConfigObserved { position: 4096, config: v1.clone() });
+        let acts =
+            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let epoch = extract_truncate_epoch(&acts);
+        let acts = step(&mut s, Event::Truncated { epoch, to: 4096 });
+        assert_eq!(s.config(), &v1, "to == config_position: frame preserved, no revert");
+        assert_eq!(s.config_position(), 4096);
+        assert!(!acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+    }
+
+    /// (c) A wipe (`Truncate{to: 0}` from NoCommonPrefix) keeps the OPERATIONAL
+    /// config (config-by-fiat, the `adopt_snapshot_lineage` authority argument)
+    /// and resets the record to position 0 with prev == cur.
+    #[test]
+    fn wipe_keeps_operational_config_and_resets_record_position() {
+        let mut s = ElectionSm::new(cfg(1), None, &[(1, 0)], 5000, 0);
+        let v1 = v1_of(&s);
+        step(&mut s, Event::ConfigObserved { position: 3000, config: v1.clone() });
+        step(&mut s, Event::RequestVote { from: 0, new_term: 41, last_term: 40, last_durable: 9000 });
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived { term: 41, entries: vec![(40, 1 << 20), (41, 2 << 20)] },
+        );
+        assert!(acts.iter().any(|a| matches!(a, Action::CountWipe)), "wipe path reached");
+        let epoch = extract_truncate_epoch(&acts);
+        let acts = step(&mut s, Event::Truncated { epoch, to: 0 });
+        assert_eq!(s.config(), &v1, "wipe keeps the operational config (fiat)");
+        assert_eq!(s.config_position(), 0, "record position resets to 0");
+        assert!(
+            acts.iter().any(|a| matches!(
+                a,
+                Action::ConfigAdopted { position: 0, config, prev_position: 0, prev }
+                    if *config == v1 && *prev == v1
+            )),
+            "the fiat reset is persisted through ConfigAdopted"
+        );
+    }
+
+    /// (d) A NON-matching-epoch ack clamps durable (physical truth) but must
+    /// not revert config state — the latch discipline scopes the revert to the
+    /// in-flight truncation's own ack, exactly like the pending-map adoption.
+    #[test]
+    fn wrong_epoch_ack_clamps_durable_but_never_reverts_config() {
+        let mut s = sm_with_divergent_map();
+        let v1 = v1_of(&s);
+        step(&mut s, Event::ConfigObserved { position: 5000, config: v1.clone() });
+        let acts =
+            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let epoch = extract_truncate_epoch(&acts);
+        let acts = step(&mut s, Event::Truncated { epoch: epoch + 7, to: 4096 });
+        assert!(s.is_truncating(), "wrong epoch: latch held");
+        assert!(s.durable() <= 4096, "durable clamps to physical truth");
+        assert_eq!(s.config(), &v1, "config untouched by a wrong-epoch ack");
+        assert_eq!(s.config_position(), 5000);
+        assert!(!acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        // The matching ack then reverts.
+        let acts = step(&mut s, Event::Truncated { epoch, to: 4096 });
+        assert_eq!(s.config().version, 0);
+        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+    }
+
+    /// The counterfactual hook: with `set_revert_on_truncate(false)` the guard is
+    /// deleted — the stale config survives a truncation that removed its frame
+    /// (the exact bug class the sim's inv8 must catch red).
+    #[test]
+    fn revert_disabled_counterfactual_keeps_stale_config() {
+        let mut s = sm_with_divergent_map();
+        s.set_revert_on_truncate(false);
+        let v1 = v1_of(&s);
+        step(&mut s, Event::ConfigObserved { position: 5000, config: v1.clone() });
+        let acts =
+            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let epoch = extract_truncate_epoch(&acts);
+        let acts = step(&mut s, Event::Truncated { epoch, to: 4096 });
+        assert_eq!(s.config(), &v1, "guard deleted: the stale config survives");
+        assert_eq!(s.config_position(), 5000);
+        assert!(!acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+    }
+
+    /// Boot recovery: `restore_prev_config` injects the durable record's PREV
+    /// level (construction seeds prev == cur), so a post-restart truncation
+    /// below `config_position` reverts to the genuine predecessor.
+    #[test]
+    fn restored_prev_level_backs_a_post_restart_revert() {
+        let genesis = genesis_voters(&[0, 1, 2]);
+        let mut v1 = genesis.clone();
+        v1.learners.push((9, addr_of(9)));
+        v1.version = 1;
+        let ecfg = ElectionConfig {
+            id: 1,
+            config: v1.clone(),
+            config_position: 5000,
+            election_timeout_min_ns: 150,
+            election_timeout_max_ns: 300,
+            gossip_floor_ns: u64::MAX,
+            seed: 43,
+        };
+        let mut s = ElectionSm::new(ecfg, None, &[(1, 0), (2, 4096)], 6000, 0);
+        s.restore_prev_config(genesis.clone(), 0);
+        step(&mut s, Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
+        let acts =
+            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let epoch = extract_truncate_epoch(&acts);
+        step(&mut s, Event::Truncated { epoch, to: 4096 });
+        assert_eq!(s.config(), &genesis, "reverted to the RESTORED prev, not the seeded cur");
+        assert_eq!(s.config_position(), 0);
+    }
+
+    /// M7 Task 6: `adopt_snapshot_config` is config-by-fiat — mirrors
+    /// `adopt_snapshot_lineage`'s authority argument for the term map. A
+    /// below-floor joiner installs the leader's config AT the floor as both
+    /// `cur` and `prev` (nothing genuine below the floor to revert to), rebuilds
+    /// the derived voting set / candidacy / tracker fresh (no carried reports —
+    /// a cold join), and emits no `Action::ConfigAdopted` (the node persists the
+    /// fiat record inline on the install path, not through the shared exec arm).
+    #[test]
+    fn adopt_snapshot_config_is_fiat_with_no_action() {
+        // Reuse the established divergent-map fixture (own map [(1,0),(2,4096)],
+        // durable 6000, term 3 adopted) so the follow-up `TermMapReceived`
+        // reconciles to a real `Truncate{to: 4096}` — the floor this test installs
+        // the fiat config AT.
+        let mut s = sm_with_divergent_map();
+        let mut floor_cfg = s.config().clone();
+        floor_cfg.learners.push((9, addr_of(9)));
+        floor_cfg.version = 7;
+        const FLOOR: u64 = 4096;
+
+        s.adopt_snapshot_config(FLOOR, floor_cfg.clone());
+        assert_eq!(s.config(), &floor_cfg, "cur == the shipped floor config");
+        assert_eq!(s.config_position(), FLOOR, "position == the floor");
+
+        // Truncate EXACTLY at the floor's position: with cur == prev == floor_cfg
+        // (the fiat collapse to one point), there is nothing lower to revert to,
+        // so this is a no-op preserve — exactly ordinary adoption's
+        // `to == config_position` case (proves the fiat collapse, not a stale
+        // pre-install `prev`, backs any subsequent revert decision) — and, unlike
+        // a real forward adoption, installing the fiat config itself emitted no
+        // `Action::ConfigAdopted` (asserted implicitly: only the truncate/ack
+        // below can produce one, and it must not here either).
+        let acts =
+            step(&mut s, Event::TermMapReceived { term: 3, entries: vec![(1, 0), (3, 4096)] });
+        let epoch = extract_truncate_epoch(&acts);
+        let acts = step(&mut s, Event::Truncated { epoch, to: FLOOR });
+        assert_eq!(s.config(), &floor_cfg, "to == config_position: no revert");
+        assert!(!acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
     }
 }

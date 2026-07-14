@@ -32,5 +32,10 @@ anyhow        = { workspace = true }
 # available to the integration tests too — no dev-dep needed.
 [dev-dependencies]
 uc2_client = { path = "../../uc2_client" }
+# M7 Task 10: `sigkill_mid_config_window` drives the leader's cnc admin slot
+# directly (the `uc2ctl`/`reconfig.rs` harness pattern), reading the cnc file
+# without going through a client.
+uc2_log      = { path = "../../uc2_log" }
+uc_protocol  = { path = "../../uc_protocol" } # NODE_FLAG_LEADER/CAN_SERVE constants
 tempfile   = { workspace = true }
 rand       = { workspace = true } # seeded op selection in hard_crash.rs
