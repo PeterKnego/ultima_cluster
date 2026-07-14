@@ -201,7 +201,14 @@ fn linearizable_under_purge_and_snapshot_churn() {
     // reconstruction installs a snapshot + tail-replays, which is slower than a
     // plain restart, so give recovery room while staying inside the budget.
     const FAULT_PERIOD: Duration = Duration::from_millis(1200);
-    const BUDGET: Duration = Duration::from_secs(115);
+    // Env-tunable like the reconfig capstone (nightly CI sets UC2_LIN_BUDGET_SECS
+    // = 240 for the whole capstones job): a slow 4-vCPU hosted runner pushes
+    // bytes slowly enough that 115 s can elapse before a 16 KiB segment ever
+    // falls below the snapshot floor — the non-vacuity assert then fires as
+    // "vacuous" even though nothing is wrong. Same correctness bar, more room.
+    let budget = Duration::from_secs(
+        std::env::var("UC2_LIN_BUDGET_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(115),
+    );
 
     // Purge posture: 16 KiB journal segments (smaller than the snapshot interval,
     // so whole segments fall below the snapshot floor and get dropped even in the
@@ -239,7 +246,14 @@ fn linearizable_under_purge_and_snapshot_churn() {
     let mut faults = 0u32;
     let mut follower_svc_faults = 0u32;
     let start = Instant::now();
-    while History::ok_count(&history.snapshot()) < TARGET_OPS {
+    // Churn until BOTH bars are met: enough ok ops AND the purge floor actually
+    // advanced (the non-vacuity condition). On a fast box the floor advances
+    // long before TARGET_OPS; on a slow CI runner the op bar can be met while
+    // the byte volume still hasn't filled a segment — keep the fault mix live
+    // until it does, bounded by the (env-tunable) budget.
+    while History::ok_count(&history.snapshot()) < TARGET_OPS
+        || cluster.max_archive_first_base() == 0
+    {
         std::thread::sleep(FAULT_PERIOD);
         match frng.random_range(0..3u8) {
             0 => cluster.kill_and_restart_leader(),
@@ -250,7 +264,7 @@ fn linearizable_under_purge_and_snapshot_churn() {
             }
         }
         faults += 1;
-        if start.elapsed() > BUDGET {
+        if start.elapsed() > budget {
             break;
         }
     }

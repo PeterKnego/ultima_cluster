@@ -799,7 +799,13 @@ fn contested_first_election_first_block_truncation_recovers() {
         await_until(30, "ex-leader did not truncate its divergent first block", || {
             c.nodes[leader].truncations() >= 1
         });
-        assert!(c.nodes[leader].term() >= c.nodes[new].term(), "ex-leader did not adopt the new term");
+        // Await, don't assert: the truncation completing and the SM adopting the
+        // new term are ordered by the truncating latch + the next gossip delivery
+        // (up to the 100 ms idle floor) — a loaded CI runner can observe the
+        // truncation before the adoption lands. The property is eventual.
+        await_until(15, "ex-leader did not adopt the new term", || {
+            c.nodes[leader].term() >= c.nodes[new].term()
+        });
 
         // Converge (the test completing without a panic IS the core assertion —
         // pre-fix the consensus agent panicked on the first-block cut).
