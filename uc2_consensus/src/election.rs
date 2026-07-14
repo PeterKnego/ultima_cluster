@@ -828,6 +828,16 @@ impl ElectionSm {
         if self.config_pending() {
             return Err(ProposeError::ChangePending); // one in flight
         }
+        if matches!(op, ConfigOp::DemoteVoter { id } if id == self.id) {
+            // A leader demoting ITSELF would lead-as-learner forever:
+            // `StepDownRemoved` covers only self-REMOVAL (rank_leader's
+            // commit-crossing check), and nothing else ever demotes a
+            // serving leader. Refuse; the operator recourse is
+            // RemoveVoter{self} (the proven step-down path) plus a
+            // fresh-id learner rejoin. `ClusterConfig::apply` stays
+            // id-blind — this is the only validation site that knows self.
+            return Err(ProposeError::SelfDemote);
+        }
         if let ConfigOp::PromoteLearner { id } = op {
             let reported = self.last_report(id).unwrap_or(0);
             let target = self.commit_seen.saturating_sub(slack);
@@ -2309,6 +2319,28 @@ mod tests {
             s.propose_config(ConfigOp::AddLearner { id: 6, addr: (6, 6) }, 0),
             Err(ProposeError::ChangePending)
         );
+    }
+
+    /// A leader may not demote itself (`DemoteVoter{self}`): it would lead
+    /// as a learner forever, since nothing else ever demotes a serving
+    /// leader (`StepDownRemoved` covers only self-*removal*). Demoting
+    /// another voter is unaffected.
+    #[test]
+    fn self_demote_is_refused_other_demote_still_works() {
+        let mut s = sm(0); // voters [0,1,2], id 0
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        assert!(s.can_serve());
+
+        assert_eq!(
+            s.propose_config(ConfigOp::DemoteVoter { id: 0 }, 0),
+            Err(ProposeError::SelfDemote)
+        );
+        assert!(s.propose_config(ConfigOp::DemoteVoter { id: 1 }, 0).is_ok());
     }
 
     /// `PromoteLearner` additionally requires the learner's last carried

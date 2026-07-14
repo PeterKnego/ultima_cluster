@@ -1256,7 +1256,9 @@ fn resize_3_to_5_to_3() {
 /// second proposal while the first is durably un-committable — see below),
 /// `NotCaughtUp` (10, promote a learner with no real backing process),
 /// `Tombstoned` (4, re-add a removed id), `TooManyMembers` (9, the 8-member
-/// cap), `ZeroVoters` (8, removing the last voter).
+/// cap), `ZeroVoters` (8, removing the last voter), `SelfDemote` (12, the
+/// leader demoting its own id), and the node-level malformed/unknown-op
+/// catch-all (11, an op code the node doesn't recognize).
 ///
 /// `ChangePending` construction: rather than racing two proposals against
 /// an uncontrollable local commit latency (flaky either way it lands), the
@@ -1289,6 +1291,16 @@ fn every_refusal_surfaces() {
     let resp = admin_request(&leader_cnc, 2 /* PromoteLearner */, 0, 0, 0);
     assert_eq!(resp.status, 1);
     assert_eq!(resp.reason, 7, "WrongRole expected, got {resp:?}");
+
+    // ---- SelfDemote (12): demote the LEADER's own id ----
+    let resp = admin_request(&leader_cnc, 3 /* DemoteVoter */, leader as u32, 0, 0);
+    assert_eq!(resp.status, 1);
+    assert_eq!(resp.reason, 12, "SelfDemote expected, got {resp:?}");
+
+    // ---- Malformed op (11): an op code the node doesn't know ----
+    let resp = admin_request(&leader_cnc, 99, 5, 0, 0);
+    assert_eq!(resp.status, 1);
+    assert_eq!(resp.reason, 11, "malformed-op reason expected, got {resp:?}");
 
     // ---- ChangePending (see doc comment above) ----
     let followers: Vec<usize> = (0..c.nodes.len()).filter(|&i| i != leader).collect();

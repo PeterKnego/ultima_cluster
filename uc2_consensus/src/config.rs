@@ -44,6 +44,8 @@ pub enum ConfigOp {
     RemoveVoter { id: NodeId },            // 5
 }
 
+// 11 is NOT a ProposeError: it is the node-level malformed/unknown-op reply
+// (uc2_node::REASON_MALFORMED_OP).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProposeError {
     NotLeader,                // wire reason = 1
@@ -56,6 +58,7 @@ pub enum ProposeError {
     ZeroVoters,               // 8
     TooManyMembers,           // 9  (MAX_MEMBERS = 8)
     NotCaughtUp { gap: u64 }, // 10
+    SelfDemote,               // 12 (a leader may not demote itself — see propose_config)
 }
 
 /// The id a `ConfigOp` targets, regardless of variant.
@@ -172,6 +175,7 @@ impl ClusterConfig {
             ProposeError::ZeroVoters => 8,
             ProposeError::TooManyMembers => 9,
             ProposeError::NotCaughtUp { .. } => 10,
+            ProposeError::SelfDemote => 12,
         }
     }
 }
@@ -238,5 +242,6 @@ mod tests {
         assert_eq!(ClusterConfig::reason_code(&ProposeError::ZeroVoters), 8);
         assert_eq!(ClusterConfig::reason_code(&ProposeError::TooManyMembers), 9);
         assert_eq!(ClusterConfig::reason_code(&ProposeError::NotCaughtUp { gap: 1 }), 10);
+        assert_eq!(ClusterConfig::reason_code(&ProposeError::SelfDemote), 12);
     }
 }

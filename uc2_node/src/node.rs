@@ -196,6 +196,10 @@ const READ_BARRIER_TIMEOUT_NS: u64 = 1_000_000_000;
 /// floored. A persist lag only WIDENS the next incarnation's at-least-once
 /// replay window — never a correctness issue (see `NodeState`'s module doc).
 const OUTPUT_PROGRESS_FLOOR_NS: u64 = 100_000_000;
+/// Wire reason for a malformed/unknown admin op field (NOT a `ProposeError`:
+/// codes 1-10 and 12 are the SM's; 11 is the node's own defensive catch-all,
+/// previously a deliberate reuse of 6/NotFound).
+const REASON_MALFORMED_OP: u32 = 11;
 
 /// Phase of an in-flight linearizable read (the ReadIndex barrier state
 /// machine, spec §7 / v1 task14).
@@ -2133,8 +2137,8 @@ impl Consensus {
     /// (one propose/append pipeline either way). Returns the wire reply triple
     /// `(status, reason, version)`:
     /// * `0, 0, new_version` — accepted.
-    /// * `1, reason_code, current_version` — refused (`ProposeError`, or `6`/
-    ///   `NotFound`'s code reused for a malformed/unknown op field — `uc2ctl`
+    /// * `1, reason_code, current_version` — refused (`ProposeError`, or
+    ///   `REASON_MALFORMED_OP` for a malformed/unknown op field — `uc2ctl`
     ///   never emits one, so this is a defensive catch-all, not a real path).
     /// * `2, 0, current_version` — retry: the ring was momentarily full
     ///   (`AppendError::WouldOverrun`). Safe to retry WHOLE: `propose_config`
@@ -2146,7 +2150,7 @@ impl Consensus {
     ///   here can leave a half-adopted config behind for the retry to trip over.
     fn propose_and_append(&mut self, op: u32, id: u32, ip: u32, port: u16) -> (u32, u32, u64) {
         let Some(config_op) = wire_to_config_op(op, id, ip, port) else {
-            return (1, 6, self.cnc.config_version());
+            return (1, REASON_MALFORMED_OP, self.cnc.config_version());
         };
         match self.sm.propose_config(config_op, self.admission_bytes) {
             Ok(new_cfg) => {

@@ -148,6 +148,8 @@ fn reason_str(reason: u32) -> &'static str {
         8 => "ZeroVoters (would leave the cluster with no voters)",
         9 => "TooManyMembers (8-member cap)",
         10 => "NotCaughtUp (learner is too far behind commit to promote safely)",
+        11 => "malformed/unknown op (node didn't recognize the request — CLI/node version mismatch?)",
+        12 => "SelfDemote (a leader cannot demote itself; RemoveVoter it and rejoin a fresh id as learner)",
         _ => "unknown/malformed",
     }
 }

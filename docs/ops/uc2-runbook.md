@@ -236,7 +236,7 @@ scenarios write directly); no new IPC ring, no new port.
 |---|---|---|---|
 | `add-learner id@addr` | 1 | id not tombstoned, not already present; ≤ 8 total members after | learner added; stream + (below-floor, if purged past it) snapshot session begins |
 | `promote id` | 2 | id is a learner; its reported durable ≥ commit − slack (default: one admission window) | learner → voter |
-| `demote id` | 3 | id is a voter; would not leave 0 voters | voter → learner |
+| `demote id` | 3 | id is a voter; would not leave 0 voters; id is not the leader's own | voter → learner |
 | `remove-learner id` | 4 | id is a learner | removed **and tombstoned** |
 | `remove-voter id` | 5 | id is a voter; would not leave 0 voters | removed **and tombstoned**; if `id` is the current leader, it keeps serving until its own removal **commits**, then steps down (→ §8's failover class) |
 
@@ -254,6 +254,8 @@ scenarios write directly); no new IPC ring, no new port.
 | 8 | `ZeroVoters` | would leave the cluster with no voters |
 | 9 | `TooManyMembers` | would exceed the 8-member cap |
 | 10 | `NotCaughtUp` | learner too far behind commit to promote safely — refusal reports the measured gap |
+| 11 | malformed/unknown op | node-level catch-all (not a `ProposeError`) — an op code the node doesn't recognize |
+| 12 | `SelfDemote` | `demote` refused the leader's own id — see the recourse below |
 
 A `status: 2` (`retry`) response (not a `ProposeError` — a CLI-level "leader
 unknown yet, or the append ring was momentarily full") means: just try again.
@@ -300,6 +302,11 @@ remove the learner).
 > each new learner converges via snapshot install + tail replay rather than
 > racing pure replay. The `promote` precondition's `NotCaughtUp` refusal
 > (reason 10) is the guard that surfaces this.
+
+**Demoting the leader itself is refused (reason 12).** To turn a leader into
+a learner: `remove-voter` its id (self-removal is supported — the leader
+replicates its own removal, steps down when it commits), then `add-learner` a
+FRESH id on that host (tombstoned ids never rejoin).
 
 **Leader self-removal**: `remove-voter <the-leader's-own-id>`, run against
 that same leader's own instance dir (or any node — it forwards). The leader
