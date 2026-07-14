@@ -575,6 +575,49 @@ pub fn find_block(journal: &Journal, pos: u64) -> Result<Option<(u64, u64)>, Arc
     Ok(Some((lo, base)))
 }
 
+/// Replay archived frames starting at `pos` over a bare `&Journal` — the
+/// shared-handle counterpart of [`Archive::replay_from`] for callers holding a
+/// [`journal_arc`](Archive::journal_arc) clone WITHOUT the `Archive` (the
+/// sender-thread shape, M4: journal reads racing the archive agent's
+/// appends/fsyncs, which `Journal`'s internal locking makes safe — blocks
+/// appended concurrently land strictly above the `last_seq` snapshot taken
+/// here and are never read). Returns `Ok(None)` when `pos` is below the first
+/// archived block (purged): this caller has no floor bookkeeping to report,
+/// unlike `Archive::replay_from`'s `PositionPurged`. A `pos` at/beyond the
+/// durable frontier yields an exhausted replay (every frame of the covering
+/// block sits below `skip_below`).
+///
+/// CONTRACT (as `Archive::replay_from`): `pos` is a frame start, and the
+/// blocks in the returned replay's `[seq, last_seq]` snapshot must not be
+/// purged/truncated/rewritten while it is drained — `Replay::next` expects
+/// every block in its range readable. Concurrent APPENDS are fine.
+pub fn replay_journal_from(journal: &Journal, pos: u64) -> Result<Option<Replay<'_>>, ArchiveError> {
+    let Some(last) = journal.last_seq() else {
+        // Empty journal: an exhausted replay (mirrors replay_from's shape).
+        return Ok(Some(Replay {
+            journal,
+            seq: 1,
+            last_seq: None,
+            block: Vec::new(),
+            block_base: 0,
+            off: 0,
+            skip_below: 0,
+        }));
+    };
+    let Some((lo, _base)) = find_block(journal, pos)? else {
+        return Ok(None); // below the first archived block (purged)
+    };
+    Ok(Some(Replay {
+        journal,
+        seq: lo,
+        last_seq: Some(last),
+        block: Vec::new(),
+        block_base: 0,
+        off: 0,
+        skip_below: pos,
+    }))
+}
+
 impl Archive {
     /// Replay archived frames starting at `pos` (a frame start). Positions at
     /// or beyond the durable frontier yield an empty replay. Positions below
@@ -1176,6 +1219,51 @@ mod tests {
         // rather than an already-empty buffer.
         arch.truncate_to(96).unwrap(); // drops the CONFIG frame's bytes (first-block cut)
         assert!(arch.take_config_observations().is_empty(), "stale observation must not survive truncation");
+    }
+
+    /// Post-M7 Task 3 (review carry): `replay_journal_from` — the shared-
+    /// handle `Replay` constructor — matches `Archive::replay_from` frame-for-
+    /// frame, returns `Ok(None)` below the purge floor (where `replay_from`
+    /// errors `PositionPurged`), and drains empty at/beyond the durable
+    /// frontier and on an empty journal.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn replay_journal_from_matches_replay_from_and_handles_bounds() {
+        let (mut archive, _b, frames) = archive_with_blocks(4); // 16 frames, 4 blocks
+        let journal = archive.journal_arc();
+
+        // Mid-stream frame start: identical stream to replay_from.
+        let mid = frames[frames.len() / 2];
+        let mut a = archive.replay_from(mid).unwrap();
+        let mut b = replay_journal_from(&journal, mid).unwrap().expect("covered position");
+        loop {
+            match (a.next().unwrap(), b.next().unwrap()) {
+                (Some(x), Some(y)) => assert_eq!(x, y),
+                (None, None) => break,
+                (x, y) => panic!("streams diverged: {x:?} vs {y:?}"),
+            }
+        }
+
+        // At/beyond the durable frontier: exhausted, not an error.
+        let frontier = frames_end(&frames);
+        let mut r = replay_journal_from(&journal, frontier).unwrap().expect("constructible");
+        assert!(r.next().unwrap().is_none());
+
+        // Below the purge floor: Ok(None) (no floor bookkeeping to report).
+        let cut = frames[9];
+        let new_first = archive.purge_below(cut).unwrap();
+        let journal = archive.journal_arc();
+        assert!(
+            replay_journal_from(&journal, new_first.saturating_sub(1)).unwrap().is_none(),
+            "below-floor position must yield Ok(None)"
+        );
+
+        // Empty journal: exhausted replay.
+        let dir = tempfile::tempdir().unwrap();
+        let empty = Archive::open(test_cfg(dir.path())).unwrap();
+        let ej = empty.journal_arc();
+        let mut r = replay_journal_from(&ej, 0).unwrap().expect("constructible");
+        assert!(r.next().unwrap().is_none());
     }
 
     // --- Post-M7 follow-up: Replay::next corrupt-block guard ---------------

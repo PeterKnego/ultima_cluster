@@ -16,8 +16,13 @@
 //!   * archiver thread  — `Archive::do_work` (recordable_slice -> journal
 //!     block -> fdatasync -> advance durable). The `RecorderCorrupt` (H1) and,
 //!     downstream, `CorruptBlock` (recorded garbage) surface here.
-//!   * replayer thread  — `replay_from(random pos in [first_base, durable))`
-//!     draining `next()` to the end. The `CorruptBlock` (H1/H2/H3) OOB site.
+//!   * replayer thread  — LOCK-FREE `Replay` drain over a `journal_arc()`
+//!     clone (`replay_journal_from(random pos in [first_base, durable))`),
+//!     WITHOUT the archive mutex: journal READS genuinely race the archiver's
+//!     journal APPENDS + fsyncs (the sender-thread NAK shape, and the original
+//!     panic's described "scan against a block still being concurrently
+//!     written" — H3 by exercise, not only by audit). The `CorruptBlock`
+//!     (H1/H2/H3) OOB site.
 //!   * reconfig thread  — (arms B/C only) quiesces the appender via an
 //!     exclusive `append_gate`, then either `truncate_to(frame boundary)` +
 //!     `prime` (election reconciliation, H2) or drop+reopen the Archive +
@@ -26,16 +31,27 @@
 //!     `BecomeLeader`/archive-truncate paths do (`close_gate` -> `prime` ->
 //!     fresh `Appender`).
 //!
+//! Lock discipline: `append_gate` -> `topo` (RwLock) -> `archive` (Mutex),
+//! strictly in that order for any thread taking more than one. `topo`
+//! excludes ONLY topology mutations from in-flight replay drains: purge /
+//! truncate / reopen take `topo.write()`, the replayer holds `topo.read()`
+//! across a drain — `Replay::next` contract-requires its `[seq, last_seq]`
+//! snapshot to stay readable (production `Replay` users are boot-time
+//! single-threaded; the production lock-free journal reader, the sender's NAK
+//! path, tolerates vanished blocks itself, `sender.rs::serve_nak_from_journal`).
+//! Crucially `do_work`'s append+fsync NEVER takes `topo`, so replay reads race
+//! block appends for real.
+//!
 //! The single production caller of `recordable_slice` is `Archive::do_work`,
-//! and the single caller of `Replay::next` is a `replay_from` drain, so these
+//! and `Replay::next` is only ever driven by a replay drain, so these
 //! three+one agents cover every path to the two structured errors.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uc2_log::archive::{Archive, ArchiveConfig, ArchiveError};
+use uc2_log::archive::{Archive, ArchiveConfig, ArchiveError, replay_journal_from};
 use uc2_log::buffer::{AppendError, Appender, LogBuffer};
 use uc2_log::cnc::{CncMeta, CncPage};
 use uc2_log::region::Region;
@@ -107,10 +123,13 @@ fn archive_cfg(dir: &std::path::Path) -> ArchiveConfig {
 
 /// The two structured corruption errors are the repro. Any other error is
 /// unexpected in this harness (we never pick a purged replay position) and is
-/// also a failure. Panics with the run seed so a hit is reproducible-ish
-/// (thread timing is inherently nondeterministic, but the seed pins the
-/// payload-size stream).
-fn fail_repro(seed: u64, ctx: &str, err: &ArchiveError) -> ! {
+/// also a failure. Sets the shared stop flag FIRST so the main loop and every
+/// sibling thread wind down promptly (instead of sleeping out the full
+/// budget before the join re-raises), then panics with the run seed so a hit
+/// is reproducible-ish (thread timing is inherently nondeterministic, but the
+/// seed pins the payload-size stream).
+fn fail_repro(stop: &AtomicBool, seed: u64, ctx: &str, err: &ArchiveError) -> ! {
+    stop.store(true, Ordering::Relaxed);
     panic!("ARCHIVE STRESS REPRO (seed={seed}) at {ctx}: {err:?} -- {err}");
 }
 
@@ -124,11 +143,12 @@ fn pick_frame_boundary(
     durable: u64,
     rng: &mut u64,
     seed: u64,
+    stop: &AtomicBool,
 ) -> Option<u64> {
     let mut r = match arch.replay_from(first) {
         Ok(r) => r,
         Err(ArchiveError::PositionPurged { .. }) => return None,
-        Err(e) => fail_repro(seed, "pick_frame_boundary/replay_from", &e),
+        Err(e) => fail_repro(stop, seed, "pick_frame_boundary/replay_from", &e),
     };
     let mut positions = Vec::new();
     loop {
@@ -143,7 +163,7 @@ fn pick_frame_boundary(
                 }
             }
             Ok(None) => break,
-            Err(e) => fail_repro(seed, "pick_frame_boundary/next", &e),
+            Err(e) => fail_repro(stop, seed, "pick_frame_boundary/next", &e),
         }
     }
     if positions.len() < 4 {
@@ -176,6 +196,9 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
     // Archive is always `Some` outside a reopen's held critical section.
     let archive = Arc::new(Mutex::new(Some(Archive::open(cfg.clone()).unwrap())));
     let append_gate = Arc::new(Mutex::new(())); // held by appender; taken exclusively to reconfig
+    // Journal-topology lock (see module doc): write = purge/truncate/reopen,
+    // read = an in-flight lock-free replay drain. do_work NEVER takes it.
+    let topo = Arc::new(RwLock::new(()));
     let generation = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -227,12 +250,30 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
     let archiver_thread = {
         let buffer = Arc::clone(&buffer);
         let archive = Arc::clone(&archive);
+        let topo = Arc::clone(&topo);
         let stop = Arc::clone(&stop);
         thread::Builder::new()
             .name("stress-archiver".into())
             .spawn(move || {
                 let mut since_purge = 0u32;
                 while !stop.load(Ordering::Relaxed) {
+                    // Purge drops whole segments, so it is a topology mutation:
+                    // take `topo.write()` BEFORE the archive mutex (the one lock
+                    // order) so no lock-free replay drain is in flight. do_work
+                    // below deliberately does NOT take `topo` — its journal
+                    // appends + fsyncs must race the replayer's reads.
+                    if since_purge >= 32 {
+                        since_purge = 0;
+                        let durable = buffer.counters().durable.load_acquire();
+                        if durable > PURGE_SLACK {
+                            let _t = topo.write().unwrap();
+                            let mut guard = archive.lock().unwrap();
+                            let arch = guard.as_mut().expect("archive present outside reopen");
+                            if let Err(e) = arch.purge_below(durable - PURGE_SLACK) {
+                                fail_repro(&stop, seed, "archiver/purge_below", &e);
+                            }
+                        }
+                    }
                     let mut guard = archive.lock().unwrap();
                     let arch = guard.as_mut().expect("archive present outside reopen");
                     match arch.do_work(&buffer) {
@@ -244,21 +285,12 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
                         }
                         Ok(false) => {}
                         Err(e @ ArchiveError::RecorderCorrupt(_)) => {
-                            fail_repro(seed, "archiver/do_work", &e)
+                            fail_repro(&stop, seed, "archiver/do_work", &e)
                         }
                         Err(e @ ArchiveError::CorruptBlock { .. }) => {
-                            fail_repro(seed, "archiver/do_work", &e)
+                            fail_repro(&stop, seed, "archiver/do_work", &e)
                         }
-                        Err(e) => fail_repro(seed, "archiver/do_work(unexpected)", &e),
-                    }
-                    if since_purge >= 32 {
-                        since_purge = 0;
-                        let durable = buffer.counters().durable.load_acquire();
-                        if durable > PURGE_SLACK
-                            && let Err(e) = arch.purge_below(durable - PURGE_SLACK)
-                        {
-                            fail_repro(seed, "archiver/purge_below", &e);
-                        }
+                        Err(e) => fail_repro(&stop, seed, "archiver/do_work(unexpected)", &e),
                     }
                     drop(guard);
                     thread::yield_now();
@@ -267,41 +299,66 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
             .unwrap()
     };
 
-    // ---- replayer ---------------------------------------------------------
+    // ---- replayer (LOCK-FREE vs the archiver's appends) --------------------
     let replayer_thread = {
         let buffer = Arc::clone(&buffer);
         let archive = Arc::clone(&archive);
+        let topo = Arc::clone(&topo);
         let stop = Arc::clone(&stop);
         thread::Builder::new()
             .name("stress-replayer".into())
             .spawn(move || {
                 let mut rng = seed ^ 0x5555_1234;
                 while !stop.load(Ordering::Relaxed) {
-                    let guard = archive.lock().unwrap();
-                    let arch = guard.as_ref().expect("archive present outside reopen");
-                    // Holding the archive lock pins durable + first_base + the
-                    // journal against the archiver, so [first, durable) is a
-                    // consistent, non-purged, contiguous span.
-                    let first = arch.first_base();
+                    // `topo.read()` for the whole drain: purge/truncate/reopen
+                    // are excluded (Replay::next's snapshot-readable contract),
+                    // but do_work is NOT — every journal.read below races the
+                    // archiver's journal.append + fdatasync for real. The
+                    // archive mutex is held only long enough to snapshot the
+                    // journal handle + floor, never across a read.
+                    let _t = topo.read().unwrap();
+                    let (journal, first) = {
+                        let guard = archive.lock().unwrap();
+                        let arch = guard.as_ref().expect("archive present outside reopen");
+                        (arch.journal_arc(), arch.first_base())
+                    };
+                    // Read durable AFTER the snapshot: it only grows (do_work
+                    // advances it post-append+fsync on this same journal), so
+                    // every pos < durable is block-covered; and under
+                    // topo.read, first can't grow (no purge) and the handle
+                    // can't be swapped (no reopen).
                     let durable = buffer.counters().durable.load_acquire();
                     if durable > first {
                         let pos = first + xorshift(&mut rng) % (durable - first);
-                        let mut r = match arch.replay_from(pos) {
-                            Ok(r) => r,
-                            Err(e) => fail_repro(seed, "replayer/replay_from", &e),
-                        };
-                        loop {
-                            match r.next() {
-                                Ok(Some(_)) => {}
-                                Ok(None) => break,
-                                Err(e @ ArchiveError::CorruptBlock { .. }) => {
-                                    fail_repro(seed, "replayer/next", &e)
+                        match replay_journal_from(&journal, pos) {
+                            Ok(Some(mut r)) => loop {
+                                match r.next() {
+                                    Ok(Some(_)) => {}
+                                    Ok(None) => break,
+                                    Err(e @ ArchiveError::CorruptBlock { .. }) => {
+                                        fail_repro(&stop, seed, "replayer/next", &e)
+                                    }
+                                    Err(e) => {
+                                        fail_repro(&stop, seed, "replayer/next(unexpected)", &e)
+                                    }
                                 }
-                                Err(e) => fail_repro(seed, "replayer/next(unexpected)", &e),
+                            },
+                            Ok(None) => {
+                                // pos ∈ [first, durable) with purge excluded by
+                                // topo.read: a covering block MUST exist.
+                                stop.store(true, Ordering::Relaxed);
+                                panic!(
+                                    "ARCHIVE STRESS REPRO (seed={seed}) at replayer/\
+                                     replay_journal_from: pos {pos} in [{first}, {durable}) \
+                                     reported below-floor (Ok(None)) with purge excluded"
+                                );
+                            }
+                            Err(e) => {
+                                fail_repro(&stop, seed, "replayer/replay_journal_from", &e)
                             }
                         }
                     }
-                    drop(guard);
+                    drop(_t);
                     thread::yield_now();
                 }
             })
@@ -313,6 +370,7 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
         let buffer = Arc::clone(&buffer);
         let archive = Arc::clone(&archive);
         let append_gate = Arc::clone(&append_gate);
+        let topo = Arc::clone(&topo);
         let generation = Arc::clone(&generation);
         let stop = Arc::clone(&stop);
         let cfg = cfg.clone();
@@ -326,14 +384,18 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
                         if stop.load(Ordering::Relaxed) {
                             break;
                         }
-                        // Quiesce the appender, then take the archive, and HOLD
-                        // BOTH across the whole reconfig: no append can race the
+                        // Quiesce the appender, exclude in-flight replay drains
+                        // (topology mutation -> topo.write), then take the
+                        // archive — the one lock order — and HOLD ALL THREE
+                        // across the whole reconfig: no append can race the
                         // prime and no archiver/replayer can touch the journal
                         // (uc2_node closes the gate across the counter reset, and
-                        // a crash-restart has no concurrent journal writer at
-                        // all). Releasing either mid-reconfig is the unfaithful
-                        // interleaving that manufactures a false repro.
+                        // a crash-restart has no concurrent journal user at
+                        // all). Releasing any of them mid-reconfig is the
+                        // unfaithful interleaving that manufactures a false
+                        // repro.
                         let _ag = append_gate.lock().unwrap();
+                        let _t = topo.write().unwrap();
                         let mut guard = archive.lock().unwrap();
 
                         let do_reopen =
@@ -358,18 +420,19 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
                             let first = arch.first_base();
                             if durable > first + PURGE_SLACK / 2
                                 && let Some(target) =
-                                    pick_frame_boundary(arch, first, durable, &mut rng, seed)
+                                    pick_frame_boundary(arch, first, durable, &mut rng, seed, &stop)
                             {
                                 match arch.truncate_to(target) {
                                     Ok(()) => {
                                         buffer.counters().prime(target);
                                         generation.fetch_add(1, Ordering::Release);
                                     }
-                                    Err(e) => fail_repro(seed, "reconfig/truncate_to", &e),
+                                    Err(e) => fail_repro(&stop, seed, "reconfig/truncate_to", &e),
                                 }
                             }
                         }
                         drop(guard);
+                        drop(_t);
                         drop(_ag);
                     }
                 })
@@ -416,8 +479,9 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
 }
 
 /// Arm A: concurrent append + archive + replay, wrap-heavy. Exercises H1 (the
-/// `recordable_slice` frame walk racing the appender) and the `Replay::next`
-/// drain over live-recorded blocks.
+/// `recordable_slice` frame walk racing the appender) and the lock-free
+/// `Replay::next` drain racing the archiver's journal appends + fsyncs (H3 by
+/// exercise).
 #[test]
 #[cfg_attr(miri, ignore)] // real journal files + fsync + threads
 fn stress_append_archive_replay() {
