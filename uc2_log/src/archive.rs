@@ -38,6 +38,13 @@ pub enum ArchiveError {
     /// or as a no-op when the frontier already covers `pos`.
     #[error("cannot adopt snapshot floor {pos}: archive already holds data up to {durable}")]
     AdoptFloorConflict { durable: u64, pos: u64 },
+    /// Post-M7 follow-up: a recorded block whose frame headers are inconsistent
+    /// with the block length (sub-header claimed length, or a frame overrunning
+    /// the block). Archived blocks are journal-CRC-covered, so this is a
+    /// recorder-side bug or on-disk corruption — surfaced as a diagnosable
+    /// error (previously an unlabeled OOB slice panic in `Replay::next`).
+    #[error("corrupt archived block seq {seq} (base {base}): frame at off {off} claims len {claimed_len}, block len {block_len}")]
+    CorruptBlock { seq: u64, base: u64, off: usize, claimed_len: u32, block_len: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -496,9 +503,30 @@ impl Replay<'_> {
                 self.off = 0;
                 self.seq += 1;
             }
+            // Defense in depth (mirrors `observe_terms`'s walk guard): a
+            // sub-header remainder or a frame overrunning the block would
+            // previously OOB-panic at the header read / payload slice below.
+            if self.block.len() - self.off < HEADER_LEN {
+                return Err(ArchiveError::CorruptBlock {
+                    seq: self.seq.saturating_sub(1),
+                    base: self.block_base,
+                    off: self.off,
+                    claimed_len: 0,
+                    block_len: self.block.len(),
+                });
+            }
             let hdr = frame::read_header(&self.block[self.off..]);
             let total = hdr.length as usize;
             let aligned = frame::align_frame_len(total);
+            if total < HEADER_LEN || self.off + aligned > self.block.len() {
+                return Err(ArchiveError::CorruptBlock {
+                    seq: self.seq.saturating_sub(1),
+                    base: self.block_base,
+                    off: self.off,
+                    claimed_len: hdr.length,
+                    block_len: self.block.len(),
+                });
+            }
             let position = self.block_base + self.off as u64;
             let payload_range = self.off + HEADER_LEN..self.off + total;
             self.off += aligned;
@@ -1140,5 +1168,131 @@ mod tests {
         // rather than an already-empty buffer.
         arch.truncate_to(96).unwrap(); // drops the CONFIG frame's bytes (first-block cut)
         assert!(arch.take_config_observations().is_empty(), "stale observation must not survive truncation");
+    }
+
+    // --- Post-M7 follow-up: Replay::next corrupt-block guard ---------------
+
+    /// Encode one frame (header + payload, 32-byte aligned) appended to `buf`,
+    /// matching `Appender::append`'s wire layout: payload, then header-sans-
+    /// length via `write_header_except_length`, then the unaligned
+    /// header+payload byte count written into the leading commit word.
+    fn push_frame(buf: &mut Vec<u8>, payload: &[u8], correlation_id: u64) {
+        let total = HEADER_LEN + payload.len();
+        let start = buf.len();
+        buf.resize(start + frame::align_frame_len(total), 0u8);
+        buf[start + HEADER_LEN..start + total].copy_from_slice(payload);
+        frame::write_header_except_length(
+            &mut buf[start..start + HEADER_LEN],
+            &FrameHeader {
+                length: 0,
+                frame_type: FRAME_TYPE_MESSAGE,
+                flags: 0,
+                leadership_term_id: 0,
+                session_id: 0,
+                correlation_id,
+            },
+        );
+        buf[start..start + 4].copy_from_slice(&(total as u32).to_le_bytes());
+    }
+
+    /// Append a bare frame header (no payload bytes behind it) whose `length`
+    /// field claims `claimed_len` bytes — simulates a corrupted/truncated
+    /// block tail.
+    fn push_corrupt_header(buf: &mut Vec<u8>, claimed_len: u32) {
+        let start = buf.len();
+        buf.resize(start + HEADER_LEN, 0u8);
+        frame::write_header_except_length(
+            &mut buf[start..start + HEADER_LEN],
+            &FrameHeader {
+                length: 0,
+                frame_type: FRAME_TYPE_MESSAGE,
+                flags: 0,
+                leadership_term_id: 0,
+                session_id: 0,
+                correlation_id: 0,
+            },
+        );
+        buf[start..start + 4].copy_from_slice(&claimed_len.to_le_bytes());
+    }
+
+    /// A `Replay` reading block seq 0 of `journal` from the start — same
+    /// construction `Archive::replay_from` uses for its "start of a found
+    /// block" case, but independent of any `Archive`'s own durable-frontier
+    /// bookkeeping since these tests append directly to the journal (bypassing
+    /// `Archive::do_work`) to hand-corrupt a block's tail.
+    fn replay_block_zero(journal: &Journal) -> Replay<'_> {
+        Replay {
+            journal,
+            seq: 0,
+            last_seq: journal.last_seq(),
+            block: Vec::new(),
+            block_base: 0,
+            off: 0,
+            skip_below: 0,
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real journal files + fsync
+    fn replay_surfaces_corrupt_block_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = Archive::open(test_cfg(dir.path())).unwrap();
+        let journal = arch.journal();
+
+        let mut block = Vec::new();
+        push_frame(&mut block, b"hello", 7); // one valid frame
+        let valid_len = block.len();
+        push_corrupt_header(&mut block, 4096); // claims far more than the block holds
+
+        let notifier = journal.append(0, 0, &block).unwrap();
+        notifier.wait().unwrap();
+
+        let mut replay = replay_block_zero(journal);
+        let first = replay.next().unwrap().expect("the valid frame replays fine");
+        assert_eq!(first.payload, b"hello");
+        assert_eq!(first.header.correlation_id, 7);
+
+        let err = replay.next().unwrap_err();
+        match err {
+            ArchiveError::CorruptBlock { off, claimed_len, block_len, .. } => {
+                assert_eq!(off, valid_len);
+                assert_eq!(claimed_len, 4096);
+                assert_eq!(block_len, block.len());
+                assert!(off + claimed_len as usize > block_len);
+            }
+            other => panic!("expected CorruptBlock, got {other:?}"),
+        }
+    }
+
+    /// Second hazard: a block whose tail has fewer than `HEADER_LEN` bytes
+    /// left after the last valid frame (a sub-header remainder, e.g. a torn
+    /// final block) — distinct from the overrunning-length case above.
+    #[test]
+    #[cfg_attr(miri, ignore)] // real journal files + fsync
+    fn replay_surfaces_corrupt_block_for_subheader_remainder() {
+        let dir = tempfile::tempdir().unwrap();
+        let arch = Archive::open(test_cfg(dir.path())).unwrap();
+        let journal = arch.journal();
+
+        let mut block = Vec::new();
+        push_frame(&mut block, b"hi", 3); // one valid frame
+        let valid_len = block.len();
+        block.extend_from_slice(&[0u8; 10]); // < HEADER_LEN bytes left in the block
+
+        let notifier = journal.append(0, 0, &block).unwrap();
+        notifier.wait().unwrap();
+
+        let mut replay = replay_block_zero(journal);
+        assert!(replay.next().unwrap().is_some(), "the valid frame replays fine");
+
+        let err = replay.next().unwrap_err();
+        match err {
+            ArchiveError::CorruptBlock { off, claimed_len, block_len, .. } => {
+                assert_eq!(off, valid_len);
+                assert_eq!(claimed_len, 0);
+                assert_eq!(block_len, block.len());
+            }
+            other => panic!("expected CorruptBlock, got {other:?}"),
+        }
     }
 }
