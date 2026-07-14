@@ -477,10 +477,12 @@ impl CncPage {
     /// CONTRACT (post-M7 audit): at most ONE admin client writes this band
     /// at a time. The seqlock (seq store_release'd last) protects the
     /// node's reader from torn fields, NOT two concurrent writers from
-    /// interleaving — two uc2ctl processes racing this slot can compose a
+    /// interleaving — two admin clients racing this slot (e.g. uc2ctl, or
+    /// the m7_gate harness which writes this band directly) can compose a
     /// request neither sent (worst case: a refused/nonsense op, never data
-    /// corruption — the node validates every field). Operators: one uc2ctl
-    /// at a time per instance dir.
+    /// corruption — the node validates every field). Operators: one admin
+    /// client (uc2ctl, m7_gate, or any direct write_admin_req caller) at a
+    /// time per instance dir.
     pub fn write_admin_req(&self, req: &AdminReq) {
         let off = CNC_OFF_ADMIN_REQ;
         let ptr_seq = unsafe { self.region.ptr_at(off) as *const PaddedAtomicU64 };

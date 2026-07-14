@@ -214,13 +214,15 @@ flags are only a *bootstrap-trust seed* for a genuinely fresh instance dir —
 once any config frame exists, the stream is authoritative and a stale/edited
 seed has no effect).
 
-**Admin client single-writer rule:** at most ONE `uc2ctl` process may write the
-admin band (`instance_dir/cnc2.dat` offset 3584) at a time. The admin slot uses
-seqlock semantics for reader-writer safety (the consensus agent reads responses),
-but a seqlock does NOT protect writer-vs-writer racing: two concurrent `uc2ctl`
-processes can interleave field writes and compose a request neither sent
-(worst case: a refused/nonsense operation, never data corruption — the node
-validates every field). Operators: serialize `uc2ctl` invocations per instance dir.
+**Admin client single-writer rule:** at most ONE admin client may write the
+admin band (`instance_dir/cnc2.dat` offset 3584) at a time — this covers
+`uc2ctl` AND the `m7_gate` harness (which writes the band directly), or any
+other direct `write_admin_req` caller. The admin slot uses seqlock semantics
+for reader-writer safety (the consensus agent reads responses), but a seqlock
+does NOT protect writer-vs-writer racing: two concurrent admin clients can
+interleave field writes and compose a request neither sent (worst case: a
+refused/nonsense operation, never data corruption — the node validates every
+field). Operators: serialize admin clients (`uc2ctl`, `m7_gate`) per instance dir.
 
 ### `uc2ctl` — the five ops
 
