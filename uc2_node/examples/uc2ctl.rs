@@ -156,6 +156,7 @@ fn reason_str(reason: u32) -> &'static str {
 
 /// Shared mutating-command flow: attach, write a fresh admin request (`seq =
 /// old_seq + 1`, a random nonce), poll the response line, print + exit.
+/// CONTRACT: one uc2ctl process per instance dir at a time; concurrent invocations may produce a nonsense request.
 fn run_mutate(common: &CommonArgs, op: u32, id: u32, (ip, port): (u32, u16)) -> anyhow::Result<()> {
     let cnc = open(common)?;
 

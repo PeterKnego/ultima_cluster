@@ -473,6 +473,14 @@ impl CncPage {
     }
 
     /// M7: write admin request (fields then seq with release for seqlock semantics).
+    ///
+    /// CONTRACT (post-M7 audit): at most ONE admin client writes this band
+    /// at a time. The seqlock (seq store_release'd last) protects the
+    /// node's reader from torn fields, NOT two concurrent writers from
+    /// interleaving — two uc2ctl processes racing this slot can compose a
+    /// request neither sent (worst case: a refused/nonsense op, never data
+    /// corruption — the node validates every field). Operators: one uc2ctl
+    /// at a time per instance dir.
     pub fn write_admin_req(&self, req: &AdminReq) {
         let off = CNC_OFF_ADMIN_REQ;
         let ptr_seq = unsafe { self.region.ptr_at(off) as *const PaddedAtomicU64 };
@@ -511,6 +519,7 @@ impl CncPage {
     }
 
     /// M7: write admin response (fields then seq with release).
+    /// CONTRACT: single writer = the consensus agent (enforced by the four-agent single-writer design).
     pub fn write_admin_resp(&self, resp: &AdminResp) {
         let off = CNC_OFF_ADMIN_RESP;
         let ptr_seq = unsafe { self.region.ptr_at(off) as *const PaddedAtomicU64 };
