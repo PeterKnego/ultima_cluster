@@ -50,6 +50,26 @@
 //! < 10 % commit-rate-dip bar is fleet-only** — printed here as informational,
 //! exactly as M6 treated its dip number in the loopback-scale smoke.
 //!
+//! **M7 is deliberately paired with M6 (snapshots + purge), not scoped away
+//! from it.** A joining voter/learner catches up over TWO possible paths: (a)
+//! pure journal replay/NAK from wherever its replication cursor sits, or (b) a
+//! snapshot install (below the leader's purge floor) + a short tail replay.
+//! With purge off, EVERY join is path (a) — fine for `replace-a-box` (one
+//! join, early) but a real liveness bug for `resize-3-5-3`, whose learner
+//! joins after several prior scenarios' worth of unthrottled write history: an
+//! unthrottled writer can outrun a distant learner's pure replay (see the
+//! runbook caveat this gate used to carry, and the repro that motivated this
+//! fix — a `resize-3-5-3` learner stuck at config v1 while the cluster had
+//! already moved to v4). So this gate now ALSO wires `RegSm` with
+//! `SnapshotStateMachine`, runs the service with a snapshot policy, and runs
+//! the node with `PurgePolicy::BelowSnapshot` — exactly the M6 gate's
+//! machinery, reused here rather than reinvented — so a late joiner converges
+//! via snapshot install + tail replay instead of racing the writer. Disabled
+//! by default (`--snapshot-interval-bytes 0` / no `--purge-below-snapshot`) so
+//! existing fleet invocations are unchanged unless the orchestrator opts in;
+//! the `all` in-process smoke opts in unconditionally (m6-gate-sized
+//! constants) since the smoke should exercise what the fleet actually runs.
+//!
 //! **Loud disclaimer:** completing this binary is NOT passing the M7 gate.
 //! The gate is claimed only after `bench-infra/scripts/m6_fleet_gate.py --m7`
 //! passes locally AND (a separate, user-approved step) on the real fleet — see
@@ -73,7 +93,10 @@ use uc2_node::{Node, NodeConfig, PurgePolicy};
 use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER,
 };
-use uc2_service::{Service, ServiceBuilder, ServiceConfig, StateMachine};
+use uc2_service::{
+    Service, ServiceBuilder, ServiceConfig, SnapshotError, SnapshotPolicy, SnapshotStateMachine,
+    StateMachine,
+};
 
 // ------------------------------------------------------------------ CLI
 
@@ -127,6 +150,22 @@ struct NodeArgs {
     members: String,
     #[arg(long, default_value = "m7-gate")]
     app_id: String,
+    /// M6 pairing: enable `PurgePolicy::BelowSnapshot { slack_bytes: 0 }` so a
+    /// late-joining voter/learner under fleet load converges via snapshot
+    /// install + tail replay instead of racing pure journal replay against an
+    /// unthrottled writer (see the module doc). Default false (`Disabled`) —
+    /// unchanged behavior unless set. Only useful paired with the `service`
+    /// role's `--snapshot-interval-bytes > 0` (purge needs a real snapshot
+    /// floor to purge below).
+    #[arg(long)]
+    purge_below_snapshot: bool,
+    /// Journal segment size in bytes; only material with
+    /// `--purge-below-snapshot` (purge drops whole non-active segments).
+    /// Default = the production `DEFAULT_JOURNAL_SEGMENT_BYTES` (64 MiB) —
+    /// unchanged unless set smaller (the m6-gate fleet uses a small segment
+    /// so purge actually fires under the gate's modest write volume).
+    #[arg(long, default_value_t = uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES)]
+    journal_segment_bytes: u64,
 }
 
 #[derive(clap::Args)]
@@ -135,6 +174,15 @@ struct ServiceArgs {
     instance_dir: PathBuf,
     #[arg(long, default_value = "m7-gate")]
     app_id: String,
+    /// M6 pairing: snapshot cadence in bytes of applied command payload
+    /// (mirrors `m6_gate`'s `SnapshotPolicy::interval_bytes`). 0 (default) =
+    /// off — the service starts plain (`ServiceBuilder::start`), current
+    /// behavior unchanged. > 0 starts with `start_with_snapshots`, giving the
+    /// node a real snapshot floor to purge below and a snapshot session for
+    /// distant joiners/reconstructions to install instead of replaying the
+    /// full journal from genesis.
+    #[arg(long, default_value_t = 0)]
+    snapshot_interval_bytes: u64,
 }
 
 #[derive(clap::Args)]
@@ -209,9 +257,14 @@ fn main() {
 
 // ------------------------------------------------------------- the SM
 
-/// A plain register: `apply` stores the 8-byte LE payload as the current
-/// value; `query` returns it. No snapshot capability — M7's scope is
-/// membership, not purge (`NodeConfig.purge` stays `Disabled` throughout).
+/// A register: `apply` stores the 8-byte LE payload as the current value;
+/// `query` returns it. Snapshot-capable (see the `SnapshotStateMachine` impl
+/// below) — paired with M6 so a late-joining voter/learner under fleet load
+/// converges via snapshot install + tail replay rather than racing an
+/// unthrottled writer's pure journal replay (see the module doc). Snapshots +
+/// purge are OFF unless the fleet role's `--snapshot-interval-bytes` /
+/// `--purge-below-snapshot` flags are set; the in-process `all` smoke always
+/// enables them (m6-gate-sized constants).
 #[derive(Default)]
 struct RegSm {
     value: u64,
@@ -239,11 +292,60 @@ impl StateMachine for RegSm {
     }
 }
 
+impl SnapshotStateMachine for RegSm {
+    type SnapshotHandle = Vec<u8>;
+
+    fn freeze(&self) -> Result<(Vec<u8>, u64), SnapshotError> {
+        let pos = self.last_applied.unwrap_or(0);
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&self.value.to_le_bytes());
+        buf.extend_from_slice(&pos.to_le_bytes());
+        Ok((buf, pos))
+    }
+
+    fn stream_snapshot(handle: Vec<u8>, dst: &mut dyn std::io::Write) -> Result<(), SnapshotError> {
+        dst.write_all(&handle)?;
+        Ok(())
+    }
+
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, SnapshotError> {
+        let mut buf = Vec::new();
+        src.read_to_end(&mut buf)?;
+        if buf.len() < 16 {
+            return Err(SnapshotError::Codec(format!("short snapshot: {} bytes", buf.len())));
+        }
+        let v = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let pos = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        if pos != position {
+            return Err(SnapshotError::Codec(format!(
+                "snapshot payload position {pos} != requested {position}"
+            )));
+        }
+        self.value = v;
+        self.last_applied = Some(position);
+        Ok(position)
+    }
+}
+
 // --------------------------------------------------------- shared config
 
 const APP: &str = "m7-gate";
 /// 4 MiB ring (matches the lincheck/failover/reconfig harnesses).
 const BUFFER_BYTES: usize = 1 << 22;
+/// M6-gate-sized constants for the in-process `all` smoke's snapshot/purge
+/// pairing (identical to `m6_gate.rs`'s `SEGMENT_BYTES`/
+/// `SNAPSHOT_INTERVAL_BYTES`): small enough that purge actually fires under
+/// this gate's modest smoke write volume. `SMOKE_PURGE` is what every node
+/// (including scenario-spawned spares) uses in the `all` smoke — it is always
+/// on there (see the module doc); the fleet role wrappers gate on their own
+/// `--purge-below-snapshot`/`--snapshot-interval-bytes` flags instead.
+const SEGMENT_BYTES: u64 = 16 * 1024;
+const SNAPSHOT_INTERVAL_BYTES: u64 = 32 * 1024;
+const SMOKE_PURGE: PurgePolicy = PurgePolicy::BelowSnapshot { slack_bytes: 0 };
 
 fn seed_for(id: NodeId) -> u64 {
     0xA1B2_C3D4_5566_7788 ^ (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -265,12 +367,15 @@ fn parse_members(s: &str) -> Vec<(NodeId, SocketAddr)> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_config(
     id: NodeId,
     members: Vec<(NodeId, SocketAddr)>,
     bind: SocketAddr,
     instance_dir: PathBuf,
     app_id: String,
+    purge: PurgePolicy,
+    journal_segment_bytes: u64,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -286,14 +391,25 @@ fn make_config(
         election_timeout_max_ns: 300_000_000,
         seed: seed_for(id),
         faults: FaultConfig::default(),
-        purge: PurgePolicy::Disabled,
-        journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+        purge,
+        journal_segment_bytes,
     }
 }
 
-fn spawn_service(dir: &Path) -> Service<RegSm> {
-    let cfg = ServiceConfig::new(dir, APP);
-    ServiceBuilder::new(cfg, RegSm::default()).start().expect("service start")
+/// `snapshot_interval_bytes == 0` starts the service plain (current
+/// behavior); `> 0` starts it with a snapshot policy (M6 pairing — see the
+/// module doc).
+fn spawn_service(dir: &Path, snapshot_interval_bytes: u64) -> Service<RegSm> {
+    if snapshot_interval_bytes == 0 {
+        let cfg = ServiceConfig::new(dir, APP);
+        ServiceBuilder::new(cfg, RegSm::default()).start().expect("service start")
+    } else {
+        let cfg = ServiceConfig::new(dir, APP)
+            .snapshot_policy(SnapshotPolicy { interval_bytes: snapshot_interval_bytes });
+        ServiceBuilder::new(cfg, RegSm::default())
+            .start_with_snapshots()
+            .expect("snapshot service start")
+    }
 }
 
 fn addr_to_wire(addr: SocketAddr) -> (u32, u16) {
@@ -311,7 +427,20 @@ fn run_node(a: NodeArgs) -> anyhow::Result<()> {
         "instance_dir must be on a real filesystem (never /tmp — RAM tmpfs)"
     );
     let members = parse_members(&a.members);
-    let cfg = make_config(a.id, members, a.bind, a.instance_dir, a.app_id);
+    let purge = if a.purge_below_snapshot {
+        PurgePolicy::BelowSnapshot { slack_bytes: 0 }
+    } else {
+        PurgePolicy::Disabled
+    };
+    let cfg = make_config(
+        a.id,
+        members,
+        a.bind,
+        a.instance_dir,
+        a.app_id,
+        purge,
+        a.journal_segment_bytes,
+    );
     let _node = Node::start(cfg)?;
     println!("m7_gate node {} up; parking (harness owns lifecycle)", a.id);
     loop {
@@ -326,7 +455,7 @@ fn run_service(a: ServiceArgs) -> anyhow::Result<()> {
         anyhow::ensure!(Instant::now() < deadline, "timed out waiting for {cnc:?}");
         thread::sleep(Duration::from_millis(20));
     }
-    let _svc = spawn_service(&a.instance_dir);
+    let _svc = spawn_service(&a.instance_dir, a.snapshot_interval_bytes);
     println!("m7_gate service up; parking (harness owns lifecycle)");
     loop {
         thread::park();
@@ -799,12 +928,23 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     let addrs: Vec<SocketAddr> = socks.iter().map(|s| s.local_addr().unwrap()).collect();
     let members: Vec<(NodeId, SocketAddr)> = (0..NV).map(|i| (i as NodeId, addrs[i])).collect();
 
+    // M6 pairing: the in-process smoke always enables snapshots + purge
+    // (m6-gate-sized constants) — the smoke should exercise what the fleet
+    // actually runs (see the module doc).
     let mut nodes: Vec<NodeH> = Vec::with_capacity(NV);
     for (i, sock) in socks.into_iter().enumerate() {
         let dir = root.join(format!("n{i}"));
-        let cfg = make_config(i as NodeId, members.clone(), addrs[i], dir.clone(), APP.into());
+        let cfg = make_config(
+            i as NodeId,
+            members.clone(),
+            addrs[i],
+            dir.clone(),
+            APP.into(),
+            SMOKE_PURGE,
+            SEGMENT_BYTES,
+        );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
-        let svc = spawn_service(&dir);
+        let svc = spawn_service(&dir, SNAPSHOT_INTERVAL_BYTES);
         nodes.push(NodeH { id: i as NodeId, dir, node, svc: Some(svc) });
     }
 
@@ -895,9 +1035,17 @@ fn scenario_replace_a_box(
         return Verdict::fail(SC, format!("add-learner refused: reason {}", resp.reason));
     }
     let dir = root.join(format!("n{new_id}"));
-    let cfg = make_config(new_id, seed_members.to_vec(), addr, dir.clone(), APP.into());
+    let cfg = make_config(
+        new_id,
+        seed_members.to_vec(),
+        addr,
+        dir.clone(),
+        APP.into(),
+        SMOKE_PURGE,
+        SEGMENT_BYTES,
+    );
     let node = Node::start_with_socket(cfg, sock).expect("start spare");
-    let svc = spawn_service(&dir);
+    let svc = spawn_service(&dir, SNAPSHOT_INTERVAL_BYTES);
     nodes.push(NodeH { id: new_id, dir, node, svc: Some(svc) });
     sync_registry(registry, nodes);
 
@@ -980,9 +1128,17 @@ fn scenario_resize_3_5_3(
         let (ip, port) = addr_to_wire(addr);
         let resp = admin_request_ok(&leader_cnc, 1 /* AddLearner */, spare_id, ip, port, 20);
         let dir = root.join(format!("n{spare_id}"));
-        let cfg = make_config(spare_id, seed_members.to_vec(), addr, dir.clone(), APP.into());
+        let cfg = make_config(
+            spare_id,
+            seed_members.to_vec(),
+            addr,
+            dir.clone(),
+            APP.into(),
+            SMOKE_PURGE,
+            SEGMENT_BYTES,
+        );
         let node = Node::start_with_socket(cfg, sock).expect("start spare");
-        let svc = spawn_service(&dir);
+        let svc = spawn_service(&dir, SNAPSHOT_INTERVAL_BYTES);
         nodes.push(NodeH { id: spare_id, dir, node, svc: Some(svc) });
         sync_registry(registry, nodes);
         if !wait_config_converged(nodes, &halted, resp.version, 30) {

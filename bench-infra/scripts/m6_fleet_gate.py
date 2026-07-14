@@ -60,13 +60,14 @@ APP = "m6-gate"           # M7 mode reassigns this to "m7-gate" in main()
 # whole point of Fix 4 is that the M7 fleet gate drives M6-level UNTHROTTLED
 # load (m7_gate's `--rate` defaults to 0 = no pacing, matching m6_gate's
 # loadclient exactly), so the fleet orchestrator passes nothing. main() sets
-# a modest pace for `--m7 --local` ONLY: a fresh M7 spare's catch-up is pure
-# journal replay (its SM has no snapshot capability), and on one core-starved
-# dev box 5 busy-spinning node processes leave the replayer SLOWER than an
-# unthrottled local writer (measured on the first unthrottled local run:
-# replay ~700 records/s vs live ~1000/s — the spare fell monotonically
-# further behind), so a later add-learner is a race the joiner can never win
-# locally. That is a genuine local capacity limit, the same class as the
+# a modest pace for `--m7 --local` ONLY: even with the M6 pairing (snapshots +
+# purge, `start_node_m7`/`start_service(m7=True)` below) giving a late spare a
+# snapshot-install + tail-replay path instead of pure journal replay, on one
+# core-starved dev box 5 busy-spinning node processes still leave the
+# catch-up path measurably slower than an unthrottled local writer (the
+# original finding here, before the M6 pairing landed, was pure replay at
+# ~700 records/s vs live ~1000/s — the spare fell monotonically further
+# behind). That is a genuine local capacity limit, the same class as the
 # fleet-only dip bar — not something a longer budget or promote-retry fixes —
 # while the fleet's replay (dedicated 16-core hosts, M5-class pipeline)
 # outruns a single synchronous submit client by orders of magnitude.
@@ -79,6 +80,19 @@ BASELINE_SECS = 8.0       # s — commit-rate baseline window before a transitio
 MEASURE_WINDOW = 5.0      # s — M7: fixed window a transition's dip is measured over
 CONFIG_CONVERGE_BUDGET = 30.0  # s — M7: cluster-wide config-version convergence
 SELF_REMOVAL_BUDGET = 10.0     # s — M7: new-leader-serving gap after self-removal
+
+# M6 pairing (fleet-load joiner convergence fix): M7's `resize-3-5-3` learner
+# joins after several prior scenarios' worth of unthrottled write history and
+# can be outrun by pure journal replay (the documented runbook caveat — a real
+# repro during gate authoring left a learner stuck at config v1 while the
+# cluster was at v4). `m7_gate`'s node/service roles now carry the SAME
+# snapshot/purge machinery `m6_gate` has always run unconditionally, gated
+# behind explicit flags so the M7 gate opts in deliberately. Sizes mirror
+# `m6_gate.rs`'s own hardcoded `SEGMENT_BYTES`/`SNAPSHOT_INTERVAL_BYTES`
+# constants exactly (the M6 fleet gate has never exposed these as CLI flags —
+# they are baked into every m6_gate node/service unconditionally).
+M7_JOURNAL_SEGMENT_BYTES = 16 * 1024
+M7_SNAPSHOT_INTERVAL_BYTES = 32 * 1024
 
 # Journal durability guard. Each node's instance dir CONTAINS its journal
 # (uc2_node InstanceDir::journal_dir() lives under it), so an instance dir on a
@@ -478,15 +492,30 @@ def start_node_m7(host, node_id, members, bind_addr):
     # started and ran fine, but sat at config_version=0 forever because the
     # cluster was sending its replication data to a port nothing was
     # listening on).
+    #
+    # M6 pairing: always pass `--purge-below-snapshot` +
+    # `--journal-segment-bytes` for the M7 gate (this function is M7-only —
+    # M6 uses `start_node`) — see the M7_JOURNAL_SEGMENT_BYTES module comment.
+    # Every M7 node runs with purge on, original 3 voters included, since the
+    # journal a LATE joiner needs purged-below is the ORIGINAL voters', not
+    # just a spare's.
     args = [
         "node", "--id", str(node_id), "--bind", bind_addr,
         "--instance-dir", host.dir, "--members", members, "--app-id", APP,
+        "--purge-below-snapshot",
+        "--journal-segment-bytes", str(M7_JOURNAL_SEGMENT_BYTES),
     ]
     host.start_unit("node", args)
 
 
-def start_service(host):
-    host.start_unit("service", ["service", "--instance-dir", host.dir, "--app-id", APP])
+def start_service(host, m7=False):
+    args = ["service", "--instance-dir", host.dir, "--app-id", APP]
+    if m7:
+        # M6 pairing (M7 only — m6_gate's `service` role has no such flag; it
+        # runs with snapshots unconditionally instead). See the
+        # M7_SNAPSHOT_INTERVAL_BYTES module comment.
+        args += ["--snapshot-interval-bytes", str(M7_SNAPSHOT_INTERVAL_BYTES)]
+    host.start_unit("service", args)
 
 
 def run_gate(hosts, voters, learner, members, learners, cycles, stop_file):
@@ -805,7 +834,7 @@ def scenario_replace_a_box(hosts, cluster):
         spare_host.reset_dir()  # this host slot may be a REUSED, previously-removed id's dir
         start_node_m7(spare_host, new_id, cluster.members_str(), addr)
         time.sleep(2.0)
-        start_service(spare_host)
+        start_service(spare_host, m7=True)
         if not bump_and_await_config(cluster, hosts, voter_idxs + [spare_hidx], JOIN_BUDGET):
             raise RuntimeError("add-learner never converged cluster-wide")
         target = leader_host.probe()["commit"]
@@ -892,7 +921,7 @@ def scenario_resize_3_5_3(hosts, cluster):
             spare_host.reset_dir()  # this host slot may be a REUSED, previously-removed id's dir
             start_node_m7(spare_host, new_id, cluster.members_str(), addr)
             time.sleep(2.0)
-            start_service(spare_host)
+            start_service(spare_host, m7=True)
             if not bump_and_await_config(cluster, hosts, list(cluster.voters.values()) + [spare_hidx], JOIN_BUDGET):
                 raise RuntimeError(f"add-learner {new_id} never converged cluster-wide")
             target = leader_host.probe()["commit"]
@@ -1076,7 +1105,7 @@ def run_gate_m7(hosts, members_seed, stop_file):
         start_node_m7(hosts[i], i, members_seed, hosts[i].bind_addr())
     time.sleep(2.0)
     for i in range(3):
-        start_service(hosts[i])
+        start_service(hosts[i], m7=True)
 
     leader_hidx = wait_leader(hosts, [0, 1, 2], 40)
     if leader_hidx is None:
