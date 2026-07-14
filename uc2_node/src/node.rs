@@ -3825,6 +3825,48 @@ mod tests {
         );
     }
 
+    // ---- post-M7 follow-up (Task 10 fix): fiat install clears the pending mirror ----
+
+    /// Discriminating proof for the fiat `store_config_pending(false)` in
+    /// `maybe_adopt_incoming_snapshot` (Task 10): the learner-join e2e test's
+    /// canary cannot tell the fiat clear from do_work's periodic mirror-clear
+    /// (step 12) — a fresh joiner's SM has nothing pending, so the periodic
+    /// clear wipes any pre-seeded mirror within one duty cycle on its own.
+    /// Here the fiat install itself makes `sm.config_pending()` TRUE (the
+    /// adopted floor sits above `commit_seen`), which BLOCKS step 12's
+    /// `!self.sm.config_pending()` guard in the very cycle the install runs —
+    /// so the mirror can only read 0 afterwards if the fiat store line ran.
+    /// The assert on `sm.config_pending()` pins that blocking condition.
+    #[test]
+    fn fiat_snapshot_install_clears_config_pending_mirror() {
+        let mut h = harness();
+        let v1 = v1_of(&h);
+        // A completed inbound snapshot at a floor ABOVE our durable frontier
+        // (the learner-join shape: `durable < pos` is what routes
+        // `maybe_adopt_incoming_snapshot` into the adopt/fiat branch), with
+        // the leader's config carried alongside — exactly the two slots the
+        // receiver's `snap_complete` publishes (config cell BEFORE position).
+        let floor = 1u64 << 20;
+        assert!(floor > h.cons.cnc.counters().durable.load_acquire());
+        *h.cons.incoming_snapshot_config.lock().unwrap() = config_wire_bytes(&v1, 0);
+        h.cons.incoming_snapshot.store(floor, Ordering::Release);
+        // A stale pre-crash `true` in the pending mirror.
+        h.cons.cnc.store_config_pending(true);
+
+        h.cons.do_work();
+
+        assert_eq!(h.cons.sm.config().version, 1, "fiat install adopted the carried config");
+        assert!(
+            h.cons.sm.config_pending(),
+            "floor > commit_seen: the periodic mirror-clear must be blocked this cycle"
+        );
+        assert_eq!(
+            h.cons.cnc.config_pending(),
+            0,
+            "the fiat install itself must clear the pending mirror"
+        );
+    }
+
     // ---- M7 Task 6: boot recovery of the ConfigRecord ----
 
     /// A genesis `ClusterConfig` over a one-voter seed `[(0, addr)]`.
