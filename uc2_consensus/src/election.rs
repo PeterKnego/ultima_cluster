@@ -379,6 +379,11 @@ impl ElectionSm {
         let current_term = vote_term.max(map_term);
 
         let n_members = members_ids.len();
+        // FOOTGUN (ledger minor f): this initial sizing is NOT can_vote-
+        // aware — it is correct only because every adoption immediately
+        // re-derives via rebuild_membership (which IS can_vote-aware, see
+        // its sizing subtlety doc). If `new` ever adopts a non-genesis
+        // config directly, size with rebuild_membership's rule instead.
         let tracker = CommitTracker::new(n_members - 1, n_members);
 
         let mut sm = Self {

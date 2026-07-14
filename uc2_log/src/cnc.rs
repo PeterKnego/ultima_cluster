@@ -915,4 +915,18 @@ mod tests {
             "offset pin: the value must live at 3712 exactly"
         );
     }
+
+    #[test]
+    fn admin_req_port_is_u32_wide_at_plus_28_raw_bytes() {
+        // Ledger minor (c): the roundtrip test is width-blind — pin the
+        // wire fact directly: port occupies the u32 at +28 (T1 review fix).
+        let page = CncPage::heap(&test_meta());
+        page.write_admin_req(&AdminReq { seq: 1, nonce: 0, op: 1, id: 1, ip: 0, port: 0x4A9C });
+        let raw = page.page();
+        assert_eq!(
+            &raw[CNC_OFF_ADMIN_REQ + 28..CNC_OFF_ADMIN_REQ + 32],
+            &[0x9C, 0x4A, 0x00, 0x00],
+            "port must be LE u32 at +28"
+        );
+    }
 }

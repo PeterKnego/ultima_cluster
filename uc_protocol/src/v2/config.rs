@@ -143,4 +143,22 @@ mod tests {
         encode_config(&big, &mut b2);
         assert_eq!(decode_config(&b2), None, "over MAX_MEMBERS refused at decode too");
     }
+
+    #[test]
+    fn decode_config_minimal_boundary() {
+        // Ledger minor (b): the exact-CONFIG_FIXED_LEN success case (an
+        // empty config) was untested — only failures and populated configs.
+        let empty = WireConfig {
+            version: 1,
+            prev_position: 0,
+            voters: vec![],
+            learners: vec![],
+            tombstones: vec![],
+        };
+        let mut buf = Vec::new();
+        encode_config(&empty, &mut buf);
+        assert_eq!(buf.len(), CONFIG_FIXED_LEN);
+        assert_eq!(decode_config(&buf), Some(empty));
+        assert_eq!(decode_config(&buf[..CONFIG_FIXED_LEN - 1]), None);
+    }
 }
