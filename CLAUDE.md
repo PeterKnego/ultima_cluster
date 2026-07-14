@@ -141,7 +141,7 @@ Storage primitives:
 - Archive / recovery: `ultima_journal::Journal` (segmented append, group commit,
   CRC per block; block seq = block index, meta = base position).
 - Durable state: `ultima_journal::StableValue<T>` (rotating two-slot atomic value)
-  for vote, term map, snapshot floor, output progress.
+  for vote, term map, snapshot floor, output progress, cluster-config record (config.state).
 - App state + snapshots: the user's `StateMachine`; M6 snapshots use the
   `SnapshotStateMachine` capability and (for the default store) `ultima_db`'s
   `snapshot_stream` wire format.

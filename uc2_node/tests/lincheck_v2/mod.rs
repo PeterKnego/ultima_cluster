@@ -252,8 +252,9 @@ pub struct LinClusterV2 {
     next_spare_id: NodeId,
     /// M7 Task 10 non-vacuity counter: incremented once per admin op that
     /// actually committed (add/promote/demote/remove each count separately).
-    /// `pub` — the capstone reads it directly (`cluster.config_ops_committed`).
-    pub config_ops_committed: u32,
+    /// `pub` — the capstone reads it directly (`cluster.config_ops_accepted`).
+    // counts LOCAL leader accepts (status=0 replies), not durable commits — a late-crash accept may be reverted; the capstone's non-vacuity floor only needs "the arm exercised reconfig", so accepts are the right denominator.
+    pub config_ops_accepted: u32,
 }
 
 impl LinClusterV2 {
@@ -312,7 +313,7 @@ impl LinClusterV2 {
             spare: None,
             spare_phase: SparePhase::Idle,
             next_spare_id: 100,
-            config_ops_committed: 0,
+            config_ops_accepted: 0,
         }
     }
 
@@ -725,7 +726,7 @@ impl LinClusterV2 {
                 let resp = Self::admin_request(&leader_cnc, 1 /* AddLearner */, id, ip, port, 10);
                 if resp.status == 0 {
                     self.spare_phase = SparePhase::Added;
-                    self.config_ops_committed += 1;
+                    self.config_ops_accepted += 1;
                     true
                 } else {
                     // Transient (Retry/ChangePending) or a genuine structural
@@ -749,7 +750,7 @@ impl LinClusterV2 {
                 match resp.status {
                     0 => {
                         self.spare_phase = SparePhase::Promoted;
-                        self.config_ops_committed += 1;
+                        self.config_ops_accepted += 1;
                         true
                     }
                     // NotCaughtUp (10) / ChangePending (3) / Retry (status 2):
@@ -769,7 +770,7 @@ impl LinClusterV2 {
                 match resp.status {
                     0 => {
                         self.spare_phase = SparePhase::Demoted;
-                        self.config_ops_committed += 1;
+                        self.config_ops_accepted += 1;
                         true
                     }
                     1 if resp.reason == 3 => false,
@@ -791,7 +792,7 @@ impl LinClusterV2 {
                         // for the NEXT cycle's fresh id.
                         self.teardown_spare();
                         self.spare_phase = SparePhase::Idle;
-                        self.config_ops_committed += 1;
+                        self.config_ops_accepted += 1;
                         true
                     }
                     1 if resp.reason == 3 => false,

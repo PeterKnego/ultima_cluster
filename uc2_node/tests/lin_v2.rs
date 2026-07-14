@@ -337,7 +337,7 @@ fn linearizable_under_purge_and_snapshot_churn() {
 /// Same bars as the other capstones: ≥ 80 % `Ok`, `Linearizable`, ≤ 120 s
 /// (this capstone's budget is env-tunable via `UC2_LIN_BUDGET_SECS`, default
 /// 120 — see the `budget_secs` local below), across seeds 0x1107 / 7 / 99
-/// (the default + `LIN_SEED`). NON-VACUITY: `config_ops_committed >= 3` —
+/// (the default + `LIN_SEED`). NON-VACUITY: `config_ops_accepted >= 3` —
 /// proof that the reconfig arm didn't just spin on `NotCaughtUp`/pending
 /// no-ops the whole run.
 #[test]
@@ -368,7 +368,7 @@ fn linearizable_under_reconfig_churn() {
     // tick count over `BUDGET` gets small enough for the arm picker's
     // per-seed variance to matter: at 2.5 s this capstone was observed
     // (seed 99) to draw the config arm only twice in the entire budget by
-    // sheer bad luck in that seed's RNG stream, reaching `config_ops_committed
+    // sheer bad luck in that seed's RNG stream, reaching `config_ops_accepted
     // == 2` and failing non-vacuity even though nothing was actually stuck.
     // 1.2 s roughly doubles the tick budget, which the widened election
     // timeout + the spare-voting fault gates below already make safe to
@@ -420,7 +420,7 @@ fn linearizable_under_reconfig_churn() {
     // At full worker throughput (no purge slowing anything down, unlike the
     // purge-churn capstone) `TARGET_OPS` alone is reached in a few seconds —
     // WAY before enough fault-scheduler ticks have fired to cycle the spare a
-    // handful of times, so the loop must keep running on the config-ops
+    // handful of times, so the loop must keep running on the config-accepted
     // condition too, not stop the instant the op-count bar is cleared.
     const MIN_CONFIG_OPS: u32 = 4;
     let mut frng = StdRng::seed_from_u64(seed ^ 0xFA17);
@@ -432,7 +432,7 @@ fn linearizable_under_reconfig_churn() {
         if snap.len() >= MAX_OPS {
             break;
         }
-        if History::ok_count(&snap) >= TARGET_OPS && cluster.config_ops_committed >= MIN_CONFIG_OPS {
+        if History::ok_count(&snap) >= TARGET_OPS && cluster.config_ops_accepted >= MIN_CONFIG_OPS {
             break;
         }
         std::thread::sleep(FAULT_PERIOD);
@@ -480,7 +480,7 @@ fn linearizable_under_reconfig_churn() {
     let elapsed = start.elapsed();
 
     // Non-vacuity: captured before `stop()` consumes the cluster.
-    let config_ops_committed = cluster.config_ops_committed;
+    let config_ops_accepted = cluster.config_ops_accepted;
 
     stop.store(true, Ordering::Relaxed);
     join_workers(handles);
@@ -490,14 +490,14 @@ fn linearizable_under_reconfig_churn() {
     let ok = History::ok_count(&entries);
     eprintln!(
         "[lin_v2 reconfig] seed={seed} faults={faults} (config-arm picks={config_arm_picks}) \
-         ops={} ok={ok} config_ops_committed={config_ops_committed} elapsed={:.1}s — checking",
+         ops={} ok={ok} config_ops_accepted={config_ops_accepted} elapsed={:.1}s — checking",
         entries.len(),
         elapsed.as_secs_f64()
     );
 
     assert!(
-        config_ops_committed >= 3,
-        "vacuous: reconfig churn never actually reconfigured (config_ops_committed={config_ops_committed})"
+        config_ops_accepted >= 3,
+        "vacuous: reconfig churn never actually reconfigured (config_ops_accepted={config_ops_accepted})"
     );
 
     assert!(

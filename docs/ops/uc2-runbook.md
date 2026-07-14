@@ -272,6 +272,8 @@ unknown yet, or the append ring was momentarily full") means: just try again.
 
 ### Recipes
 
+**If the leader crashes between accepting an admin op and writing the reply**, `uc2ctl` times out with no response line — the op may still have landed. Recourse: `uc2ctl status` on the new leader; if `config version` advanced, the op committed (do NOT blind-retry an add/remove — the refusal matrix (AlreadyPresent/Tombstoned) makes a duplicate harmless but noisy).
+
 **Replace a dead/dying box** (3 committed config changes):
 1. `add-learner <new-id>@<new-addr>` — bring the new host up first.
 2. Wait for it to catch up (`uc2ctl status` on any node shows the new id's
