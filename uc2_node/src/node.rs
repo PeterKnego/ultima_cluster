@@ -283,6 +283,12 @@ pub struct Node {
     /// rather than prefilling its ring).
     sender_stats: Arc<uc2_net::sender::SenderStats>,
     partition_handles: Vec<PartitionHandle>,
+    /// Final-review fix (Item 1 test): a clone of the SAME `Arc<Mutex<Vec<u8>>>`
+    /// the consensus agent's `config_bytes` field and the sender's
+    /// `SnapshotSource` closure read — i.e. observing this from a test is
+    /// observing exactly what a SNAP_BEGIN this node ships would carry, not a
+    /// proxy for it. Exposed via [`Node::snapshot_config_bytes`].
+    config_bytes: Arc<Mutex<Vec<u8>>>,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
     _instance: InstanceDir,
     _rings: Rings,
@@ -430,9 +436,8 @@ impl Node {
         // or boot re-derivation alike). Seeded here from the just-recovered
         // record so a snapshot shipped before the first live adoption still
         // carries real bytes rather than an empty placeholder.
-        let mut config_wire_bytes = Vec::new();
-        encode_config(&cluster_to_wire(&config, config_rec.prev_position), &mut config_wire_bytes);
-        let config_bytes = Arc::new(Mutex::new(config_wire_bytes));
+        let config_bytes =
+            Arc::new(Mutex::new(config_wire_bytes(&config, config_rec.prev_position)));
 
         // Election SM over the recovered credentials + the recovered config.
         // M6 Task 7 / M7: a node whose own id is a learner in the ADOPTED
@@ -777,6 +782,7 @@ impl Node {
             route_drops,
             sender_stats,
             partition_handles,
+            config_bytes: Arc::clone(&config_bytes),
             _instance: instance,
             _rings: rings,
             // Stop order: consensus first (stops writing the term handle), then
@@ -822,6 +828,17 @@ impl Node {
     /// a joiner's config converges with the leader's after a snapshot install.
     pub fn config_version(&self) -> u64 {
         self.cnc.config_version()
+    }
+
+    /// Final-review fix (Item 1 test): the raw encoded-`ClusterConfig` bytes
+    /// currently cached for the sender's `SnapshotSource` closure — i.e.
+    /// exactly what a SNAP_BEGIN this node ships right now would carry in
+    /// `SnapBeginBody.config`. Exposed for tests asserting the snapshot-fiat
+    /// install path (`maybe_adopt_incoming_snapshot`) refreshed this cache,
+    /// not just the SM/record/cnc-version (which `rebuild_net_for_config`
+    /// alone used to leave stale on that path — see the doc comment there).
+    pub fn snapshot_config_bytes(&self) -> Vec<u8> {
+        self.config_bytes.lock().unwrap().clone()
     }
 
     /// Read the committed message frame at `pos` (which must be a frame
@@ -1318,7 +1335,17 @@ impl Consensus {
     /// below-floor joiner's installed config can differ from its boot seed
     /// (T7 shipped live reconfiguration), so it needs exactly this rebuild too,
     /// not a second hand-rolled copy that could drift from this one.
-    fn rebuild_net_for_config(&mut self, config: &ClusterConfig) {
+    ///
+    /// Final-review fix: ALSO refreshes the `config_bytes` snapshot-session
+    /// config-carry cache here (`config_wire_bytes(config, prev_position)`) —
+    /// this is now the single site both live callers share, so the
+    /// snapshot-fiat install path (which calls this but never used to touch
+    /// the cache) can no longer leave it stale. `prev_position` is the
+    /// audit-trail field the caller would otherwise pass to `cluster_to_wire`
+    /// itself (the exec arm's adopted `prev_position`; the fiat path's own
+    /// floor position, since a wholesale-replace install sets `prev == config`
+    /// at that same position).
+    fn rebuild_net_for_config(&mut self, config: &ClusterConfig, prev_position: u64) {
         // Rebuild the net layer: voters-minus-self / learners-minus-self,
         // DISJOINT sets (`CtrlMsg::SetPeers`'s documented convention —
         // the sender recombines them for its own fan-out).
@@ -1348,6 +1375,9 @@ impl Consensus {
             learners,
             cluster_size: sender_cluster_size(config, self.id),
         });
+        // Final-review fix: refresh the snapshot-session config-carry cache —
+        // see the doc comment above for why this lives here now.
+        *self.config_bytes.lock().unwrap() = config_wire_bytes(config, prev_position);
         // Refresh the node's own routing + observability.
         self.rebuild_peer_maps(config);
         self.publish_peer_band();
@@ -1412,7 +1442,13 @@ impl Consensus {
                 };
                 self.state.store_config_record(&rec).expect("config persist fail-stop");
                 self.cnc.store_config_version(cfg.version);
-                self.rebuild_net_for_config(&cfg);
+                // Final-review fix: this call now ALSO refreshes `config_bytes`
+                // (previously only `Action::ConfigAdopted`'s exec arm did, so a
+                // below-floor rejoiner that later became leader would ship its
+                // STALE pre-fall config in SNAP_BEGIN to the next joiner). `pos`
+                // doubles as the prev_position audit field since this is a
+                // wholesale-replace install: `rec.prev == rec.config` at `pos`.
+                self.rebuild_net_for_config(&cfg, pos);
             }
             let _ = self.trunc_tx.try_send(ArchiveCmd::AdoptFloor { pos });
         }
@@ -2456,18 +2492,15 @@ impl Consensus {
                     prev: cluster_to_stored(&prev),
                 };
                 self.state.store_config_record(&rec).expect("config persist fail-stop");
-                // M7 Task 6: refresh the snapshot-session config-carry cache so
-                // every SNAP_BEGIN a session opens from here on ships THIS config
-                // (over-delivery to a peer that doesn't need it is safe —
-                // adopt-by-version idempotence on the receiving end).
-                let mut wire_bytes = Vec::new();
-                encode_config(&cluster_to_wire(&config, prev_position), &mut wire_bytes);
-                *self.config_bytes.lock().unwrap() = wire_bytes;
-                // Rebuild the net layer + this node's own routing/observability.
-                // Shared with the snapshot-fiat install path in
+                // Rebuild the net layer + this node's own routing/observability
+                // (and, since the final-review fix, the snapshot-session
+                // config-carry cache too — so every SNAP_BEGIN a session opens
+                // from here on ships THIS config; over-delivery to a peer that
+                // doesn't need it is safe, adopt-by-version idempotence on the
+                // receiving end). Shared with the snapshot-fiat install path in
                 // `maybe_adopt_incoming_snapshot` (M7 Task 9) — one derivation for
                 // "what changes when membership changes" everywhere it changes.
-                self.rebuild_net_for_config(&config);
+                self.rebuild_net_for_config(&config, prev_position);
                 self.cnc.store_config_version(config.version);
                 // Cleared once commit crosses `position` (do_work step 11).
                 self.cnc.store_config_pending(true);
@@ -2697,6 +2730,21 @@ fn cluster_to_wire(c: &ClusterConfig, prev_position: u64) -> WireConfig {
             .collect(),
         tombstones: c.tombstones.clone(),
     }
+}
+
+/// The single derivation of the snapshot-session config-carry cache's bytes
+/// (final-review fix): `encode_config(&cluster_to_wire(..))`, called from
+/// every site that refreshes `config_bytes` — boot-time construction AND
+/// `rebuild_net_for_config` (shared in turn by the live-adoption exec arm and
+/// the snapshot-fiat install path). One derivation means the three sites
+/// cannot drift apart the way construction/exec-arm vs. fiat-install did
+/// before this fix (fiat install rebuilt peers/routing but never refreshed
+/// this cache, so a below-floor rejoiner that later became leader would ship
+/// its STALE pre-fall config to the next joiner).
+fn config_wire_bytes(config: &ClusterConfig, prev_position: u64) -> Vec<u8> {
+    let mut wire_bytes = Vec::new();
+    encode_config(&cluster_to_wire(config, prev_position), &mut wire_bytes);
+    wire_bytes
 }
 
 /// `StoredConfig` (the durable `ConfigRecord`'s `config`/`prev`) -> `ClusterConfig`.

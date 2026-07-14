@@ -30,6 +30,7 @@ use uc2_log::state::{ConfigRecord, NodeState, StoredConfig, StoredMember};
 use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig, PurgePolicy};
 use uc_protocol::v2::cnc::{CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER};
+use uc_protocol::v2::config::decode_config;
 
 const PAYLOAD: usize = 96;
 
@@ -505,6 +506,38 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
         found_extra_learner,
         "joiner's peer band never picked up id {extra_learner_id} from the installed \
          config — the snapshot-fiat install did not rebuild peer routing"
+    );
+
+    // Final-review fix (Item 1): assert the SNAP_BEGIN config-carry cache
+    // itself converged — not just `config_version`/peer-routing, which are
+    // proxies. Before this fix, `maybe_adopt_incoming_snapshot`'s fiat-install
+    // block persisted the record and rebuilt peer routing but never refreshed
+    // `config_bytes`, so the joiner's cache would still hold ITS OWN stale
+    // boot-seed derivation (version 0, no `extra_learner_id`) rather than the
+    // leader's installed v1 config — meaning a below-floor rejoiner that later
+    // became leader would ship the WRONG config to the next joiner. Compare
+    // the decoded MEMBERSHIP content, not the raw bytes: `prev_position` is a
+    // deliberately audit-trail-only field (per `cluster_to_wire`'s doc) and
+    // legitimately differs here — the voter's cache carries its genuinely
+    // historical prev_position (0, from the pre-seeded record), while the
+    // joiner's fiat wholesale-replace install collapses prev_position to the
+    // installed floor itself (`rebuild_net_for_config(&cfg, pos)` — see the
+    // fiat-install call site's comment); the two are not supposed to match.
+    let voter_decoded =
+        decode_config(&voter.snapshot_config_bytes()).expect("voter's cached config must decode");
+    let learner_decoded =
+        decode_config(&learner.snapshot_config_bytes()).expect("joiner's cached config must decode");
+    assert_eq!(learner_decoded.version, voter_decoded.version, "cache version must converge");
+    assert_eq!(learner_decoded.voters, voter_decoded.voters, "cache voters must converge");
+    assert_eq!(learner_decoded.learners, voter_decoded.learners, "cache learners must converge");
+    assert_eq!(
+        learner_decoded.tombstones, voter_decoded.tombstones,
+        "cache tombstones must converge"
+    );
+    assert_eq!(learner_decoded.version, 1, "decoded cache must carry the installed v1 config");
+    assert!(
+        learner_decoded.learners.iter().any(|m| m.id == extra_learner_id),
+        "decoded cache must contain the extra learner from the installed config"
     );
 
     learner.stop();

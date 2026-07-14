@@ -768,6 +768,11 @@ impl ElectionSm {
     /// `ConfigRecord` inline rather than through the shared exec arm — the
     /// node (not the SM) owns the timing of a snapshot install.
     pub fn adopt_snapshot_config(&mut self, position: u64, config: ClusterConfig) {
+        // Final-review fix (trivial): the sender's fan-out (`rebuild_net_for_config`
+        // -> `followers`/`learners`, both filtered to `config.voters`/`learners`)
+        // never addresses a tombstoned id, so a session shipping the installer its
+        // OWN tombstone is unreachable by construction. Pins that invariant.
+        debug_assert!(!config.tombstones.contains(&self.id), "fiat install of our own tombstone");
         self.config = config.clone();
         self.prev_config = config;
         self.config_position = position;
@@ -1260,6 +1265,20 @@ impl ElectionSm {
     fn rebuild_membership(&mut self, carry_reports: bool) {
         self.members = self.config.voter_ids();
         self.can_vote = self.config.is_voter(self.id);
+        // Final-review fix: prune `votes_received` to the surviving voter set
+        // (plus always keep our own self-grant). Without this a candidate's
+        // stale tally from a since-removed voter keeps counting toward
+        // `majority()` forever — same-term two-leader hazard: candidate holds
+        // grants {self, X}; a config removing X becomes durable mid-candidacy
+        // (majority over the NEW, smaller membership drops to 1); the stale
+        // X-grant still in `votes_received` now satisfies that majority and
+        // this node fiat-"wins" while a disjoint real majority of the new
+        // membership elects someone else in the same term. Deliberately do
+        // NOT re-check majority/become_leader here (a later grant re-triggers
+        // the check via `Event::Vote` naturally) — staying conservative
+        // (falling below majority never elects) is the safe direction; only
+        // ratcheting the tally down needs no accompanying action.
+        self.votes_received.retain(|v| self.members.contains(v) || *v == self.id);
         let n = self.members.len();
         let n_followers = if self.can_vote { n - 1 } else { n };
         self.tracker = CommitTracker::new(n_followers, n_followers + 1);
@@ -1664,6 +1683,63 @@ mod tests {
         assert!(matches!(s.role(), Role::Candidate));
         let elect = step(&mut s, Event::Vote { from: 2, term: 1, granted: true });
         assert!(elect.iter().any(|a| matches!(a, Action::BecomeLeader { term: 1, .. })));
+        assert!(matches!(s.role(), Role::Leader));
+    }
+
+    /// Final-review fix: `rebuild_membership` must prune `votes_received` when
+    /// a config adoption removes a voter the candidate already counted —
+    /// otherwise the stale grant keeps counting toward the (now smaller)
+    /// majority forever, letting a same-term candidate "win" off a disjoint
+    /// quorum from whatever a real majority of the new membership converges
+    /// on. 5 voters [0,1,2,3,4], self=0: a grant from 1 leaves the candidate
+    /// at 2/5, below majority(3). Voter 1 — the only non-self granter — is
+    /// then removed (durably observed mid-candidacy, exactly the interleaving
+    /// the review found: some other leader's config change reaches this
+    /// candidate via the ordinary `ConfigObserved` path, which does not
+    /// require self to be Leader). The new majority of 4 is still 3. Without
+    /// pruning, the stale grant from 1 would still be in the tally, so a
+    /// single FRESH grant would wrongly cross majority (stale-1 + self +
+    /// fresh-2 = 3) even though only 2 of the tally are real votes from
+    /// current members. With pruning, it correctly takes two fresh grants.
+    #[test]
+    fn config_adoption_prunes_stale_grant_from_removed_voter() {
+        let mut s = ElectionSm::new(cfg_members(0, vec![0, 1, 2, 3, 4]), None, &[], 0, 0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        assert!(matches!(s.role(), Role::Candidate));
+        assert_eq!(s.current_term(), 1);
+
+        // Self + voter 1's grant: 2 of 5, below majority(3) — still Candidate.
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        assert!(matches!(s.role(), Role::Candidate));
+
+        // Voter 1 is removed from the config, durably adopted mid-candidacy.
+        let mut new_cfg = s.config().clone();
+        new_cfg.voters.retain(|(id, _)| *id != 1);
+        new_cfg.tombstones.push(1);
+        new_cfg.version = 1;
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: new_cfg });
+        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::BecomeLeader { .. })),
+            "adoption itself must never auto-check majority/become_leader — a later \
+             grant re-triggers the check naturally"
+        );
+        assert!(matches!(s.role(), Role::Candidate));
+
+        // ONE fresh grant from a surviving member (2): the pruned tally is
+        // {0,2} = 2, still below the new majority(3) of 4 — must stay
+        // Candidate. (Pre-fix, the stale grant from 1 would still be
+        // counted — {0,1,2} = 3 — wrongly crossing majority right here.)
+        let acts = step(&mut s, Event::Vote { from: 2, term: 1, granted: true });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::BecomeLeader { .. })),
+            "the stale grant from the removed voter must not count toward the new majority"
+        );
+        assert!(matches!(s.role(), Role::Candidate));
+
+        // A second fresh grant (3): {0,2,3} = 3 real grants of 4 — a genuine majority.
+        let acts = step(&mut s, Event::Vote { from: 3, term: 1, granted: true });
+        assert!(acts.iter().any(|a| matches!(a, Action::BecomeLeader { .. })));
         assert!(matches!(s.role(), Role::Leader));
     }
 

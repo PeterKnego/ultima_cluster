@@ -22,7 +22,7 @@ directory (same host, shared memory). Default files:
 | `cnc2.dat`                        | node     | The 4 KiB control page (magic `UC2CNC\0\0`). All cross-process observability lives here — see §3. |
 | `log.buf`                         | node     | The log ring buffer (`buffer_bytes`). Recreated fresh each boot. |
 | `journal/`                        | node     | Segmented durable log (`ultima_journal`). Survives restarts; the source of truth for replay + purge. |
-| `state/`                          | node     | Raft durables (`StableValue`s): vote, term-map, committed, output-progress, snapshot floor. |
+| `state/`                          | node     | Raft durables (`StableValue`s): vote, term-map, output-progress, snapshot floor. |
 | `snapshots/`                      | service + node | `snap-<pos>.ultsnap` artifacts. The service **builds** them; the node **ships/installs** them (M6). `<pos>` is the absolute log byte position the snapshot represents. |
 | `ingress.ring`                    | clients→node | MPSC submit ring. |
 | `query.ring`                      | clients→node | Query submissions (linearizable + snapshot reads). |
