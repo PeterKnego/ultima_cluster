@@ -2529,6 +2529,61 @@ mod tests {
         );
     }
 
+    /// Ledger minor (r): discriminates the tombstone-based `self_removed`
+    /// latch (T9 fix) from a raw `!config.contains(self.id)` predicate, in
+    /// ONE continuous SM lineage. The first half — absence without a
+    /// tombstone must not halt or latch, and a later inclusion adopts
+    /// normally — is already exercised end-to-end (multi-version, with a
+    /// mid-replay higher-term event too) by
+    /// `joiner_replaying_pre_admission_configs_neither_halts_nor_latches`
+    /// above; this test adds what that one does NOT cover: continuing the
+    /// SAME lineage into a REAL tombstoned removal and asserting the latch
+    /// DOES then fire (`HaltRemoved`, the follower path). A raw `!contains()`
+    /// predicate fails the first half (it would have latched — and so
+    /// eventually halted — on the plain absence step below, before 3 was
+    /// ever a member to be removed from); the tombstone predicate passes
+    /// both halves.
+    #[test]
+    fn self_removed_latch_is_tombstone_based_not_absence_based() {
+        // Genesis: voters [1, 2]; self = 3, entirely absent — the same
+        // not-yet-admitted-joiner replay shape as the T9 test above.
+        let mut s = ElectionSm::new(cfg_members(3, vec![1, 2]), None, &[], 0, 0);
+        assert!(matches!(s.role(), Role::Follower));
+        assert!(!s.config().contains(3));
+
+        // v1: still absent, still NOT tombstoned. A raw `!contains()`
+        // predicate would (wrongly) latch `self_removed = true` right here.
+        let mut v1 = s.config().clone();
+        v1.version = 1;
+        let acts = step(&mut s, Event::ConfigObserved { position: 40, config: v1 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "absence without a tombstone must not halt a not-yet-admitted node"
+        );
+
+        // v2: self is admitted as a voter — adopts normally, no halt.
+        let mut v2 = s.config().clone();
+        v2.voters.push((3, addr_of(3)));
+        v2.version = 2;
+        let acts = step(&mut s, Event::ConfigObserved { position: 80, config: v2 });
+        assert!(!acts.iter().any(|a| matches!(a, Action::HaltRemoved)), "own admission must never halt");
+        assert!(s.config().contains(3) && s.config().is_voter(3), "3 is now a voting member");
+
+        // v3: a REAL removal — tombstoned. Only this may latch
+        // `self_removed` / emit `HaltRemoved` (the follower path); a raw
+        // absence predicate could not distinguish it from v1 above (both are
+        // "3 not present as a voter"), yet only v3 is a genuine removal.
+        let mut v3 = s.config().clone();
+        v3.voters.retain(|(id, _)| *id != 3);
+        v3.tombstones.push(3);
+        v3.version = 3;
+        let acts = step(&mut s, Event::ConfigObserved { position: 120, config: v3 });
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::HaltRemoved)),
+            "a REAL tombstoned removal must latch self_removed and halt"
+        );
+    }
+
     // ---- M7 Task 8: leader self-removal ----
 
     /// Controller amendment carry #2: a LEADER adopting a config that

@@ -359,6 +359,14 @@ fn leader_self_removal_hands_off() {
 
         let start = Instant::now();
 
+        // The removed leader's own last published commit BEFORE the handoff —
+        // captured right before the removal is even requested, so it is
+        // genuinely a pre-handoff value. The strengthened assertion below
+        // proves the new leader's post-handoff commit strictly exceeds this,
+        // i.e. it actually COMMITS NEW entries rather than merely inheriting
+        // (or freezing at) whatever counter value the old leader left behind.
+        let old_commit = c.nodes[leader].node.counters().commit.load_acquire();
+
         // Remove the leader via ITS OWN admin cnc slot.
         let cnc = open_cnc(&c.nodes[leader].instance_dir);
         let resp = admin_request(&cnc, 5 /* RemoveVoter */, leader_id, 0, 0);
@@ -412,6 +420,21 @@ fn leader_self_removal_hands_off() {
             assert!(Instant::now() < deadline, "the new leader never advanced commit");
             std::thread::yield_now();
         }
+
+        // Strict commit-monotonicity across the handoff: the new leader's
+        // commit must be STRICTLY greater than the removed leader's own last
+        // published commit from before the handoff even started. This is the
+        // discriminating strengthening over the (still-kept) high-water
+        // non-regression check below — it fails a new leader that merely
+        // inherits `old_commit` and then freezes, since the wait loop above
+        // only proves forward motion from an arbitrary POST-handoff baseline.
+        let new_commit = c.nodes[new_leader].node.counters().commit.load_acquire();
+        assert!(
+            new_commit > old_commit,
+            "new leader's commit ({new_commit}) did not strictly exceed the removed \
+             leader's pre-handoff commit ({old_commit}) — it must commit NEW entries, \
+             not merely inherit the counter"
+        );
 
         stop.store(true, Ordering::Relaxed);
     });

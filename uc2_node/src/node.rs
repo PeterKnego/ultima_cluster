@@ -3889,6 +3889,31 @@ mod tests {
         end
     }
 
+    /// Like `append_and_archive_config`, but appends TWO real `FRAME_TYPE_CONFIG`
+    /// frames (`cfg1` then `cfg2`) onto the SAME buffer before draining —
+    /// modeling two adoptions durably archived in the same run (unlike two
+    /// separate calls to `append_and_archive_config`, which would each start a
+    /// fresh buffer at position 0 and so could never land sequentially in one
+    /// archive). Returns `(cfg1`'s frame-END, `cfg2`'s frame-END)`.
+    fn append_and_archive_two_configs(
+        archive: &mut Archive,
+        term: u32,
+        cfg1: &ClusterConfig,
+        cfg2: &ClusterConfig,
+    ) -> (u64, u64) {
+        let cnc = test_cnc();
+        let buffer = Arc::new(LogBuffer::new(Region::heap_zeroed(1 << 16), cnc, 4096));
+        let mut appender = Appender::new(Arc::clone(&buffer), term);
+        let mut bytes1 = Vec::new();
+        encode_config(&cluster_to_wire(cfg1, 0), &mut bytes1);
+        let end1 = appender.append_config(term, &bytes1).expect("v1 config frame append");
+        let mut bytes2 = Vec::new();
+        encode_config(&cluster_to_wire(cfg2, 0), &mut bytes2);
+        let end2 = appender.append_config(term, &bytes2).expect("v2 config frame append");
+        while archive.do_work(&buffer).expect("archive do_work") {}
+        (end1, end2)
+    }
+
     /// Step 3a: a follower durably archives a `FRAME_TYPE_CONFIG` frame (the data
     /// plane), but a crash before the NEXT duty cycle drains it means the
     /// `ConfigRecord` file itself never reflects the adoption — modeled here by
@@ -4028,5 +4053,70 @@ mod tests {
         assert_eq!(rec.config.version, 0, "fresh genesis-by-fiat, not either compromised level");
         assert_eq!(stored_to_cluster(&rec.config), genesis);
         assert_eq!(rec.config, rec.prev, "seed record: prev duplicated");
+    }
+
+    /// Ledger minor (k): composes the T5 revert shape
+    /// (`boot_reverts_a_config_record_persisted_ahead_of_durable`) with the
+    /// Step 3a rederive shape
+    /// (`boot_rebuilds_config_record_from_archive_scan_after_config_state_loss`)
+    /// in a single boot — the pair was previously only tested separately. The
+    /// archive durably records TWO real config frames, v1 then v2 (both
+    /// fsynced, so `durable` covers both) — but the persisted `ConfigRecord`
+    /// claims a stale v3 whose `prev` level is v1, itself genuinely below
+    /// `durable`. Revert-only recovery (skip the rederive step) would land on
+    /// the reverted v1 and silently lose the already-durable v2; the
+    /// discriminating assert is that recovery instead re-scans forward from
+    /// the reverted v1 and picks v2 back up — landing on v2's version AND its
+    /// frame-END position, not the reverted-to v1.
+    #[test]
+    fn boot_revert_then_journal_rederive_compose() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        let members = seed_members();
+
+        let mut archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
+        let genesis = ClusterConfig::genesis(
+            members.iter().map(|(id, a)| (*id, addr_to_pair(*a))).collect(),
+            Vec::new(),
+        );
+        let mut v1 = genesis.clone();
+        v1.learners.push((9, (9, 1)));
+        v1.version = 1;
+        let mut v2 = v1.clone();
+        v2.learners.push((10, (10, 1)));
+        v2.version = 2;
+
+        let (end1, end2) = append_and_archive_two_configs(&mut archive, 1, &v1, &v2);
+        let durable = archive.recovered_position();
+        assert_eq!(durable, end2, "both v1 and v2 frames are durably archived");
+
+        // Persisted record: a stale v3 claimed AHEAD of durable (the T5 crash
+        // window — the leader's append-time persist raced the archive fsync),
+        // whose `prev` level is v1 — itself genuinely below durable, so a
+        // plain revert (no rederivation) lands exactly on v1, NOT v2.
+        let mut v3 = v2.clone();
+        v3.learners.push((11, (11, 1)));
+        v3.version = 3;
+        let state = NodeState::open(&dir.path().join("state")).unwrap();
+        let ahead = ConfigRecord {
+            position: durable + 9000,
+            config: cluster_to_stored(&v3),
+            prev_position: end1,
+            prev: cluster_to_stored(&v1),
+        };
+        state.store_config_record(&ahead).unwrap();
+
+        // Reboot: fresh `Archive::open` (recovers the durably-archived frames).
+        let archive = Archive::open(ArchiveConfig::new(dir.path().join("journal"))).unwrap();
+        let rec = recover_config_record(&state, &archive, durable, &members, &[]).unwrap();
+
+        // The discriminating assert: recovery lands on the journal-rederived
+        // v2 (version AND frame-END position), not the reverted-to v1 — this
+        // fails if rederivation is skipped after the revert.
+        assert_eq!(rec.config.version, 2, "must rederive forward past the revert, landing on v2");
+        assert_eq!(rec.position, end2, "position must be v2's frame-END, not v1's (the reverted level)");
+        assert_eq!(stored_to_cluster(&rec.config), v2);
+        assert_eq!(stored_to_cluster(&rec.prev), v1, "prev is the level rederivation folded from");
+        assert_eq!(state.config_record().unwrap(), rec, "the rederived record is itself persisted");
     }
 }
