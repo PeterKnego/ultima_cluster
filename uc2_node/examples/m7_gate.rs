@@ -143,6 +143,18 @@ struct ProbeArgs {
     instance_dir: PathBuf,
     #[arg(long, default_value = "m7-gate")]
     app_id: String,
+    /// Fix 2 (bench-infra fleet-gate measurement hardening): if > 0, measure
+    /// an ON-HOST commit rate over this many seconds (read the commit
+    /// counter, sleep, read again, `rate = delta/secs`) and add a `"rate"`
+    /// field to the printed JSON. The whole measurement — sleep included —
+    /// happens inside this process, so the rate carries zero ssh/subprocess
+    /// round-trip skew; the fleet orchestrator's `dip_for_transition` uses
+    /// this instead of bracketing two separate remote probes with local
+    /// wall-clock (that bracketing technique systematically undercounted the
+    /// rate by the ssh+sudo RTT, ~8-16% of a 5-8s window on the fleet). 0
+    /// (default) = unchanged instant single-sample read, no `"rate"` field.
+    #[arg(long, default_value_t = 0.0)]
+    rate_secs: f64,
 }
 
 #[derive(clap::Args)]
@@ -157,6 +169,27 @@ struct LoadClientArgs {
     /// Stop when this file exists (the orchestrator's kill switch).
     #[arg(long, default_value = "")]
     stop_file: String,
+    /// Fix 4 (bench-infra fleet-gate measurement hardening): target
+    /// sustained write rate in writes/s, paced by a sleep after each
+    /// successful submit. 0 (default) = UNTHROTTLED — `m6_gate`'s loadclient
+    /// has no artificial pacing at all (it only backs off on
+    /// NotLeader/Retry/BackpressureFull), and that IS the load level the M7
+    /// fleet gate must match: the old unconditional 3ms-per-write throttle
+    /// here made this gate's load ~14x lighter than M6's, which is not
+    /// "under load" by M6's own bar. Kept as a flag rather than deleted
+    /// outright because a fresh, un-snapshotted M7 spare's catch-up is pure
+    /// journal replay (this gate's SM has no snapshot capability) — an
+    /// unthrottled writer CAN outrun a distant learner's replay (a real
+    /// repro hit during gate authoring). On the FLEET the guard against that
+    /// race is the `promote` precondition itself (`NotCaughtUp` refusal +
+    /// the orchestrator's bounded retry, `ctl_retry_transient` in
+    /// `bench-infra/scripts/m6_fleet_gate.py`) — replay on dedicated hosts
+    /// vastly outruns one synchronous submit client. On one core-starved
+    /// LOCAL dev box (5 busy-spinning nodes) the replayer is measurably
+    /// slower than an unthrottled writer, so the orchestrator's `--m7
+    /// --local` mode passes `--rate 300` (its fleet mode passes nothing).
+    #[arg(long, default_value_t = 0)]
+    rate: u64,
 }
 
 fn main() {
@@ -307,12 +340,22 @@ fn run_service(a: ServiceArgs) -> anyhow::Result<()> {
 fn run_probe(a: ProbeArgs) -> anyhow::Result<()> {
     let cnc = CncPage::open_file(&a.instance_dir.join("cnc2.dat"), &a.app_id)
         .map_err(|e| anyhow::anyhow!("open cnc: {e:?}"))?;
+
+    // On-host rate window (Fix 2): entirely inside this process, so the
+    // fleet orchestrator's dip measurement carries zero ssh RTT skew.
+    let rate = (a.rate_secs > 0.0).then(|| {
+        let c0 = cnc.counters().commit.load_acquire();
+        thread::sleep(Duration::from_secs_f64(a.rate_secs));
+        let c1 = cnc.counters().commit.load_acquire();
+        c1.saturating_sub(c0) as f64 / a.rate_secs
+    });
+
     let flags = cnc.status().flags.load_acquire();
     let c = cnc.counters();
-    println!(
+    let mut line = format!(
         "{{\"leader\":{},\"can_serve\":{},\"term\":{},\"commit\":{},\"durable\":{},\
          \"append\":{},\"service_applied\":{},\"config_version\":{},\"config_pending\":{},\
-         \"leader_hint\":{}}}",
+         \"leader_hint\":{}",
         (flags & NODE_FLAG_LEADER) != 0,
         (flags & NODE_FLAG_CAN_SERVE) != 0,
         cnc.status().term.load_acquire(),
@@ -324,6 +367,11 @@ fn run_probe(a: ProbeArgs) -> anyhow::Result<()> {
         cnc.config_pending() != 0,
         cnc.status().leader_hint.load_acquire(),
     );
+    if let Some(r) = rate {
+        line.push_str(&format!(",\"rate\":{r:.3}"));
+    }
+    line.push('}');
+    println!("{line}");
     Ok(())
 }
 
@@ -371,25 +419,16 @@ fn run_loadclient(a: LoadClientArgs) -> anyhow::Result<()> {
                 committed_max = committed_max.max(next_val);
                 next_val += 1;
                 writes += 1;
-                // Pace the writer: this gate's SM has NO snapshot capability
-                // (unlike M6's), so a fresh, far-behind learner/spare's
-                // catch-up is pure NAK/journal replay — a throughput-bounded
-                // path, not the near-instant snapshot install M6 relies on.
-                // An UNTHROTTLED loadclient on a shared/contended box can
-                // (and, in gate-authoring, DID) sustain a higher steady-state
-                // commit rate than deep-replay can catch up to, making a
-                // distant join a race the joiner can never win — not a hang,
-                // a genuine "writer outruns the replayer" scenario caught by
-                // this gate's own orchestrator run (`bench-infra/scripts/
-                // m6_fleet_gate.py --m7 --local`'s `resize-3-5-3` second add
-                // never converged; root-caused via a standalone repro showing
-                // durable climbing steadily but slower than the accumulation
-                // rate). A modest pace keeps this scenario a genuine
-                // "does a learner catch up under REAL concurrent load" proof
-                // — the thing M7 is actually testing — rather than an
-                // unrelated replay-throughput benchmark (M5's job, not this
-                // gate's).
-                thread::sleep(Duration::from_millis(3));
+                // Fix 4: pacing is now opt-in via `--rate` (see the flag's
+                // doc comment) — default 0 = unthrottled, matching M6's
+                // loadclient exactly. The race this throttle used to guard
+                // against (an unthrottled writer outrunning a distant
+                // spare's pure-replay catch-up) is now guarded at its actual
+                // source: the orchestrator's bounded `NotCaughtUp` retry
+                // around `promote` (`ctl_retry_transient`), not here.
+                if a.rate > 0 {
+                    thread::sleep(Duration::from_secs_f64(1.0 / a.rate as f64));
+                }
             }
             Err(ClientError::NotLeader { .. }) | Err(ClientError::Retry) => {
                 thread::sleep(Duration::from_millis(20));

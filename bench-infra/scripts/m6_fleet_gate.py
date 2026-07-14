@@ -52,9 +52,25 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 APP = "m6-gate"           # M7 mode reassigns this to "m7-gate" in main()
+# Extra args appended to every M7 loadclient unit. EMPTY on the fleet — the
+# whole point of Fix 4 is that the M7 fleet gate drives M6-level UNTHROTTLED
+# load (m7_gate's `--rate` defaults to 0 = no pacing, matching m6_gate's
+# loadclient exactly), so the fleet orchestrator passes nothing. main() sets
+# a modest pace for `--m7 --local` ONLY: a fresh M7 spare's catch-up is pure
+# journal replay (its SM has no snapshot capability), and on one core-starved
+# dev box 5 busy-spinning node processes leave the replayer SLOWER than an
+# unthrottled local writer (measured on the first unthrottled local run:
+# replay ~700 records/s vs live ~1000/s — the spare fell monotonically
+# further behind), so a later add-learner is a race the joiner can never win
+# locally. That is a genuine local capacity limit, the same class as the
+# fleet-only dip bar — not something a longer budget or promote-retry fixes —
+# while the fleet's replay (dedicated 16-core hosts, M5-class pipeline)
+# outruns a single synchronous submit client by orders of magnitude.
+M7_LOAD_ARGS = []
 JOIN_BUDGET = 60.0        # s — learner/spare must catch up within this
 DIP_MAX = 10.0            # % — fleet gate: commit-rate dip during a transition
 CONVERGE_BUDGET = 10.0    # s — follower reconstruction must converge within this
@@ -133,12 +149,70 @@ class LocalHost:
         p = self.procs.get(unit)
         return None if p is None else p.poll()
 
-    def probe(self):
-        out = subprocess.check_output(
-            [self.gate, "probe", "--instance-dir", self.dir, "--app-id", APP],
-            text=True, timeout=15,
-        )
+    def divergence_detected(self, unit):
+        """Fix 1: the loadclient divergence signal comes from its LOG, not its
+        exit code — both m6_gate/m7_gate's loadclient print an unambiguous
+        "DIVERGENCE:" line to stderr before exiting 1 on a committed-value
+        regression, and grepping that is unaffected by whether the process is
+        still alive, was reaped normally (secs elapsed / stop-file), or (fleet)
+        already garbage-collected by systemd `--collect` — see the identical
+        SshHost method and `SshHost.unit_exit`'s docstring for why exit-code/
+        `is-active` checking is the wrong tool here."""
+        path = self.logs / f"{unit}.log"
+        try:
+            return "DIVERGENCE:" in path.read_text(errors="replace")
+        except FileNotFoundError:
+            return False
+
+    def probe(self, rate_secs=0.0):
+        """`rate_secs > 0`: block for that many seconds while the probe itself
+        measures an on-host commit rate (see `m7_gate probe --rate-secs`) —
+        the returned dict then carries a `"rate"` field. `rate_secs == 0`
+        (default): unchanged, instant single-sample read."""
+        args = [self.gate, "probe", "--instance-dir", self.dir, "--app-id", APP]
+        if rate_secs > 0:
+            args += ["--rate-secs", str(rate_secs)]
+        out = subprocess.check_output(args, text=True, timeout=15 + rate_secs)
         return json.loads(out.strip().splitlines()[-1])
+
+    def rate_probe_start(self, secs):
+        """Fix 2: start an on-host `probe --rate-secs` window in the
+        BACKGROUND, writing its one JSON line to a file. The caller runs the
+        transition action while this window is open, so the rate this
+        measures SPANS the action with zero extra ssh/subprocess round-trip
+        skew in the measurement itself (see `dip_for_transition`). Returns an
+        opaque handle for `rate_probe_result`."""
+        path = self.logs / f"rateprobe-{time.time_ns()}.json"
+        f = open(path, "w")
+        p = subprocess.Popen(
+            [self.gate, "probe", "--instance-dir", self.dir, "--app-id", APP,
+             "--rate-secs", str(secs)],
+            stdout=f, stderr=subprocess.DEVNULL,
+        )
+        return (p, f, path)
+
+    def rate_probe_result(self, handle, timeout=60.0):
+        """Wait for the background rate-probe window to finish and return its
+        measured rate (`None` if it never produced a reading)."""
+        p, f, path = handle
+        try:
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait(timeout=5)
+        finally:
+            f.close()
+        try:
+            text = path.read_text().strip()
+            data = json.loads(text.splitlines()[-1]) if text else {}
+            return data.get("rate")
+        except (FileNotFoundError, json.JSONDecodeError, IndexError):
+            return None
+        finally:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
 
     def ctl(self, op, node_id=None, addr=None):
         """M7: drive one admin op against THIS host's node via the `uc2ctl`
@@ -256,17 +330,84 @@ class SshHost:
         )
 
     def unit_exit(self, unit):
-        r = self._ssh(f"systemctl is-active {self.unit_prefix}-{unit}", capture_output=True)
-        return None if r.stdout.strip() == "active" else 1
-
-    def probe(self):
+        """Best-effort ACTUAL exit status, distinct from `systemctl is-active`
+        (which reports "not active" — i.e. this used to return `1` — for ANY
+        stopped unit, including one this harness itself stopped cleanly via
+        `stop-file`/teardown; that false-positive was 4 of the fleet's FAILs).
+        `None` = still running, OR the transient `--collect` unit was already
+        garbage-collected and its exit status is simply unknowable — callers
+        that need a real signal after a unit may have exited should NOT rely
+        on this; the loadclient divergence guard uses `divergence_detected`
+        (log-based) instead precisely because of this ambiguity."""
         r = self._ssh(
-            f"sudo {self.gate} probe --instance-dir {self.dir} --app-id {APP}",
+            f"systemctl show -p ActiveState,ExecMainStatus,Result --value "
+            f"{self.unit_prefix}-{unit} 2>/dev/null",
             capture_output=True,
         )
+        lines = (r.stdout or "").splitlines()
+        if len(lines) < 3:
+            return None
+        active_state, exec_main_status, result = lines[0], lines[1], lines[2]
+        if active_state == "active":
+            return None
+        if result == "success":
+            return 0
+        try:
+            code = int(exec_main_status)
+        except ValueError:
+            return None
+        return code
+
+    def divergence_detected(self, unit):
+        """See `LocalHost.divergence_detected` — same log-grep signal, over
+        ssh, against the unit's append-log file (the same path `start_unit`
+        wires as this unit's `StandardOutput`/`StandardError`)."""
+        path = f"/opt/bench/{self.unit_prefix}-{unit}.log"
+        r = self._ssh(f"grep -q 'DIVERGENCE:' {path} 2>/dev/null", capture_output=True)
+        return r.returncode == 0
+
+    def probe(self, rate_secs=0.0):
+        cmd = f"sudo {self.gate} probe --instance-dir {self.dir} --app-id {APP}"
+        if rate_secs > 0:
+            cmd += f" --rate-secs {rate_secs}"
+        r = self._ssh(cmd, capture_output=True)
         if r.returncode != 0:
             raise RuntimeError(f"probe {self.public_ip} failed: {r.stderr}")
         return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def rate_probe_start(self, secs):
+        """See `LocalHost.rate_probe_start`. Fleet equivalent: a transient
+        `systemd-run` unit whose stdout is redirected straight to a file on
+        the remote host (`StandardOutput=file:...`) — started, then left
+        running in the background while the caller drives the transition."""
+        unit = f"{self.unit_prefix}-rateprobe"
+        path = f"/opt/bench/{unit}.json"
+        cmd = (
+            f"sudo rm -f {path}; "
+            f"sudo systemd-run --unit={unit} --collect -p StandardOutput=file:{path} "
+            f"{self.gate} probe --instance-dir {self.dir} --app-id {APP} --rate-secs {secs}"
+        )
+        r = self._ssh(cmd, capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"rate-probe start on {self.public_ip} failed: {r.stderr}")
+        return (unit, path)
+
+    def rate_probe_result(self, handle, timeout=60.0):
+        unit, path = handle
+        dl = time.time() + timeout
+        while time.time() < dl:
+            r = self._ssh(f"systemctl is-active {unit}", capture_output=True)
+            if r.stdout.strip() != "active":
+                break
+            time.sleep(0.3)
+        r = self._ssh(f"sudo cat {path} 2>/dev/null", capture_output=True)
+        lines = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
+        if not lines:
+            return None
+        try:
+            return json.loads(lines[-1]).get("rate")
+        except json.JSONDecodeError:
+            return None
 
     def ctl(self, op, node_id=None, addr=None):
         """M7: drive one admin op against THIS host's node via the remote
@@ -374,11 +515,15 @@ def run_gate(hosts, voters, learner, members, learners, cycles, stop_file):
     verdicts.append(scenario_learner_join(hosts, voters, learner, leader, members, learners))
     verdicts.append(scenario_purge_cycle(hosts, voters, leader, cycles))
 
-    # Loadclient divergence guard: it exits nonzero on a read regression.
-    ec = hosts[leader].unit_exit("loadclient")
-    if ec not in (None, 0):
-        log(f"FAIL: loadclient exited {ec} — committed-value DIVERGENCE detected")
-        verdicts.append(("divergence-guard", False, f"loadclient exit {ec}"))
+    # Loadclient divergence guard (Fix 1): it prints an unambiguous
+    # "DIVERGENCE:" line to its log before exiting 1 on a committed-value
+    # regression — checking the LOG rather than the exit code, because
+    # `is-active`-based exit-status checking false-positives on ANY normally-
+    # stopped unit (including this one, once teardown's stop-file signal
+    # lands and it exits 0).
+    if hosts[leader].divergence_detected("loadclient"):
+        log("FAIL: loadclient log shows DIVERGENCE — committed-value regression detected")
+        verdicts.append(("divergence-guard", False, "loadclient log contains DIVERGENCE:"))
 
     ok = all(v[1] for v in verdicts)
     return ok, verdicts
@@ -527,37 +672,50 @@ def _safe_probe(host):
 
 def dip_for_transition(leader_host, action_fn, baseline_secs=BASELINE_SECS, window=MEASURE_WINDOW):
     """The M6 learner-join dip technique, generalized to an arbitrary
-    `action_fn`: baseline the leader's commit rate over a fixed pre-window,
-    then run the action and measure the leader's commit rate over a window
-    that spans it (padded to `window` if the action itself is faster — this is
-    what keeps a near-instant transition's rate meaningful rather than a
-    divide-by-a-near-zero window). Returns `(dip_pct, during_rate, baseline_rate,
-    error_or_None)` — `action_fn` raising is caught and reported as the error,
-    not propagated (a scenario needs to still print a dip/rate reading even
-    when the transition itself failed)."""
-    c0 = leader_host.probe()["commit"]
-    t0 = time.time()
-    time.sleep(baseline_secs)
-    c1 = leader_host.probe()["commit"]
-    baseline_rate = (c1 - c0) / max(time.time() - t0, 1e-6)
+    `action_fn`.
 
-    tt0 = time.time()
-    ct0 = leader_host.probe()["commit"]
+    Fix 2 (measurement-skew fix): both the baseline and the during-transition
+    rate are now measured ENTIRELY ON THE HOST, via `m7_gate probe
+    --rate-secs` — the probe process itself reads the cnc commit counter,
+    sleeps locally, reads it again, and computes `delta/secs` before ever
+    touching the network. The OLD technique bracketed two REMOTE commit reads
+    with LOCAL wall-clock around each `probe()` ssh+sudo round trip
+    (~0.4-0.8s on the fleet): the numerator (commit delta) was correct but the
+    denominator (elapsed wall-clock) included that RTT twice, systematically
+    UNDERcounting the rate by ~8-16% — worse for voter-set transitions, whose
+    convergence-polling loop (`bump_and_await_config`) issues many more ssh
+    calls per window. On-host 390Hz sampling proved the cluster itself never
+    stalled >=200ms during any transition; the "dip" was this skew, not a
+    real quorum stall.
+
+    baseline: one blocking `probe(rate_secs=baseline_secs)` ssh exec — a
+    single round trip regardless of `baseline_secs`, so its relative skew is
+    negligible.
+    during: a rate-probe window STARTED on-host in the BACKGROUND
+    (`rate_probe_start`, `window` secs) ~0.5s before `action_fn` runs, so it
+    is already sampling when the transition begins, then read after
+    `action_fn` returns (`rate_probe_result` blocks until that background
+    window finishes). Zero ssh RTT inside the measured interval itself.
+
+    Returns `(dip_pct, during_rate, baseline_rate, error_or_None)` —
+    `action_fn` raising is caught and reported as the error, not propagated
+    (a scenario needs to still print a dip/rate reading even when the
+    transition itself failed)."""
+    p = leader_host.probe(rate_secs=baseline_secs)
+    baseline_rate = p.get("rate") or 0.0
+
+    handle = leader_host.rate_probe_start(window)
+    time.sleep(0.5)
     err = None
     try:
         action_fn()
     except Exception as e:  # noqa: BLE001 - reported to the caller, not swallowed
         err = str(e)
-    el = time.time() - tt0
-    if el < window:
-        time.sleep(window - el)
-    try:
-        ct1 = leader_host.probe()["commit"]
-    except Exception as e:
-        ct1 = ct0
-        err = err or f"leader unreachable after transition: {e}"
-    win = time.time() - tt0
-    rate = (ct1 - ct0) / max(win, 1e-6)
+    rate = leader_host.rate_probe_result(handle, timeout=window + 30.0)
+    if rate is None:
+        rate = 0.0
+        err = err or "on-host rate-probe window produced no reading"
+
     dip = max(0.0, (baseline_rate - rate) / baseline_rate * 100.0) if baseline_rate > 0 else 100.0
     return dip, rate, baseline_rate, err
 
@@ -587,6 +745,36 @@ def bump_and_await_config(cluster, hosts, host_idxs, budget=CONFIG_CONVERGE_BUDG
         time.sleep(0.5)
     log(f"config v{v} never converged on host_idxs={host_idxs}; last observed: {last}")
     return False
+
+
+PROMOTE_RETRY_BUDGET = 30.0  # s — bounded retry for a promote hitting NotCaughtUp
+
+
+def ctl_retry_transient(host, op, node_id=None, addr=None, budget=PROMOTE_RETRY_BUDGET,
+                         retry_substr="NotCaughtUp"):
+    """Fix 4: retry `host.ctl(op, ...)` while it is refused specifically for
+    `retry_substr` (default `NotCaughtUp`) — a live cluster's legitimate,
+    transient precondition refusal, not a bug. Any OTHER refusal propagates
+    immediately (same as a single-shot `ctl()` call), so a genuine bug still
+    fails fast.
+
+    Needed now that the loadclient runs unthrottled at M6's pace (Fix 4): the
+    orchestrator's own "spare caught up" check reads the SPARE's own reported
+    `durable` counter, which can be a beat ahead of what the LEADER itself has
+    heard from that peer (the actual signal `NotCaughtUp` gates on) — under a
+    fast writer, enough commits can land in that gap to make the very next
+    `promote` call observe the peer as still-behind. The old 3ms-per-write
+    throttle papered over this race by keeping the gap small; the real fix is
+    this bounded retry (mirrors `m7_gate.rs`'s own in-process
+    `admin_request_ok`, which already tolerates reasons 2/3/10)."""
+    dl = time.time() + budget
+    while True:
+        rc, out = host.ctl(op, node_id=node_id, addr=addr)
+        if rc == 0 or retry_substr not in out:
+            return rc, out
+        if time.time() >= dl:
+            return rc, out
+        time.sleep(0.5)
 
 
 def scenario_replace_a_box(hosts, cluster):
@@ -629,7 +817,7 @@ def scenario_replace_a_box(hosts, cluster):
         return ("replace-a-box", False, f"add-learner/catch-up failed: {err}")
 
     def promote():
-        rc, out = leader_host.ctl("promote", new_id)
+        rc, out = ctl_retry_transient(leader_host, "promote", new_id)
         if rc != 0:
             raise RuntimeError(f"promote refused: {out.strip()}")
         cluster.voters[new_id] = spare_hidx
@@ -716,7 +904,7 @@ def scenario_resize_3_5_3(hosts, cluster):
             return ("resize-3-5-3", False, f"add-learner {new_id}/catch-up failed: {err}")
 
         def promote(new_id=new_id, spare_hidx=spare_hidx):
-            rc, out = leader_host.ctl("promote", new_id)
+            rc, out = ctl_retry_transient(leader_host, "promote", new_id)
             if rc != 0:
                 raise RuntimeError(f"promote {new_id} refused: {out.strip()}")
             cluster.voters[new_id] = spare_hidx
@@ -790,23 +978,35 @@ def scenario_leader_self_removal(hosts, cluster, stop_file):
         return ("leader-self-removal", False, f"self-removal refused: {out.strip()}")
 
     survivor_hidxs = [h for nid, h in cluster.voters.items() if nid != leader_id]
+    # Fix 3: probe ONLY the old leader + survivors (== voter_idxs; never the
+    # unrelated free/spare host slots), and probe them CONCURRENTLY — the
+    # previous version made 2-3 SEQUENTIAL ssh probes per "0.1s-intended"
+    # iteration (~1-2s real per iteration on the fleet), so the measured
+    # `gap` was mostly ssh-RTT observation granularity, not real failover
+    # time. With a thread pool, one iteration costs ~1 ssh RTT (the slowest
+    # probe), not the sum — the measurement ceiling is now ~1 ssh RTT
+    # (~0.4-0.8s on the fleet), not several.
+    probe_targets = [leader_hidx] + survivor_hidxs
     regressed = False
     new_leader_hidx = None
     dl = time.time() + SELF_REMOVAL_BUDGET + 5.0  # small slack past the bar itself
-    while time.time() < dl:
-        cur = max((_safe_probe(hosts[h]).get("commit", 0) for h in voter_idxs), default=0)
-        if cur < high_water:
-            regressed = True
-        high_water = max(high_water, cur)
+    with ThreadPoolExecutor(max_workers=max(1, len(probe_targets))) as pool:
+        while time.time() < dl:
+            probed = dict(zip(probe_targets, pool.map(lambda h: _safe_probe(hosts[h]), probe_targets)))
 
-        serving = [h for h in survivor_hidxs if _safe_probe(hosts[h]).get("can_serve")]
-        if len(serving) > 1:
-            return ("leader-self-removal", False, f"split-brain among survivors: {serving}")
-        old_stepped_down = not _safe_probe(leader_host).get("can_serve", True)
-        if old_stepped_down and len(serving) == 1:
-            new_leader_hidx = serving[0]
-            break
-        time.sleep(0.1)
+            cur = max((probed[h].get("commit", 0) for h in probe_targets), default=0)
+            if cur < high_water:
+                regressed = True
+            high_water = max(high_water, cur)
+
+            serving = [h for h in survivor_hidxs if probed[h].get("can_serve")]
+            if len(serving) > 1:
+                return ("leader-self-removal", False, f"split-brain among survivors: {serving}")
+            old_stepped_down = not probed[leader_hidx].get("can_serve", True)
+            if old_stepped_down and len(serving) == 1:
+                new_leader_hidx = serving[0]
+                break
+            time.sleep(0.25)
     gap = time.time() - t0
 
     if regressed:
@@ -828,7 +1028,7 @@ def scenario_leader_self_removal(hosts, cluster, stop_file):
     hosts[new_leader_hidx].start_unit(
         "loadclient",
         ["loadclient", "--instance-dir", hosts[new_leader_hidx].dir, "--app-id", APP,
-         "--stop-file", stop_file],
+         "--stop-file", stop_file] + M7_LOAD_ARGS,
     )
     time.sleep(2.0)
     before = _safe_probe(hosts[new_leader_hidx]).get("commit", 0)
@@ -876,22 +1076,22 @@ def run_gate_m7(hosts, members_seed, stop_file):
     hosts[leader_hidx].start_unit(
         "loadclient",
         ["loadclient", "--instance-dir", hosts[leader_hidx].dir, "--app-id", APP,
-         "--stop-file", stop_file],
+         "--stop-file", stop_file] + M7_LOAD_ARGS,
     )
 
     verdicts.append(scenario_replace_a_box(hosts, cluster))
     verdicts.append(scenario_resize_3_5_3(hosts, cluster))
     verdicts.append(scenario_leader_self_removal(hosts, cluster, stop_file))
 
-    # Divergence guard: the loadclient unit (it may have moved host in
-    # `scenario_leader_self_removal`, since a fleet loadclient only ever talks
-    # to its own host's node) exits nonzero on a read regression — check every
-    # host, since exactly one of them still has a live/exited unit by this name.
+    # Divergence guard (Fix 1, log-based — see run_gate's identical comment):
+    # the loadclient unit may have moved host in `scenario_leader_self_removal`
+    # (a fleet loadclient only ever talks to its own host's node), so check
+    # every host's log — exactly one of them ever ran a loadclient by this
+    # name, and a missing log file is simply "no divergence", not a FAIL.
     for h in hosts:
-        ec = h.unit_exit("loadclient")
-        if ec not in (None, 0):
-            log(f"FAIL: loadclient on a host exited {ec} — committed-value DIVERGENCE detected")
-            verdicts.append(("divergence-guard", False, f"loadclient exit {ec}"))
+        if h.divergence_detected("loadclient"):
+            log("FAIL: loadclient log on a host shows DIVERGENCE — committed-value regression detected")
+            verdicts.append(("divergence-guard", False, "loadclient log contains DIVERGENCE:"))
 
     ok = all(v[1] for v in verdicts)
     return ok, verdicts
@@ -947,7 +1147,7 @@ def build_fleet_hosts(gate_bin, ssh_user, ssh_key, hosts_arg, count=4,
 
 
 def main():
-    global APP
+    global APP, M7_LOAD_ARGS
 
     ap = argparse.ArgumentParser(description="M6/M7 fleet-gate orchestrator")
     ap.add_argument("--local", action="store_true", help="run local processes (loopback UDP)")
@@ -969,6 +1169,12 @@ def main():
     gate_name = "m7_gate" if args.m7 else "m6_gate"
     if args.m7:
         APP = "m7-gate"
+        if args.local:
+            # Local-ONLY loadclient pace (~ the previously-proven local level;
+            # the fleet passes nothing = unthrottled M6-level load). See the
+            # M7_LOAD_ARGS module comment for the measured local
+            # replayer-slower-than-writer capacity limit this guards.
+            M7_LOAD_ARGS = ["--rate", "300"]
 
     if args.local:
         gate = args.bin or f"/home/claude/.cache/cargo-target/release/examples/{gate_name}"
