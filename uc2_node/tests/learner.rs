@@ -454,6 +454,12 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
     let learner =
         Node::start_with_socket(cfg(1, l_addr, l_dir.clone()), l_sock).expect("start learner");
 
+    // Pre-seed the learner's config_pending mirror to true to simulate a stale
+    // pending flag from a pre-crash config change. This is the real-world shape
+    // Task 10 must clear on fiat install — it should never stick around.
+    let joiner_cnc = CncPage::open_file(&l_dir.join("cnc2.dat"), app).expect("open learner cnc");
+    joiner_cnc.store_config_pending(true);
+
     // It cannot replay `[0, first_base)` (purged) — the ONLY way it reaches the
     // frontier is the snapshot session + AdoptFloor (+ lineage seed) + tail replay.
     await_until(40, "learner caught up across the purged prefix", || {
@@ -465,6 +471,13 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
         "the learner must have adopted the shipped snapshot floor, not replayed from 0"
     );
     assert!(!learner.is_leader(), "a learner never leads");
+
+    // Task 10: a fiat install is never pending — the cnc mirror must read stable
+    // (even if a pre-crash `true` had stalled there).
+    assert_eq!(
+        joiner_cnc.config_pending(), 0,
+        "a fiat install is never pending — the cnc mirror must read stable"
+    );
 
     // M7 Task 6: the snapshot session carries the leader's config alongside its
     // lineage (`SnapBeginBody.config`) — the joiner decodes + adopts it by fiat

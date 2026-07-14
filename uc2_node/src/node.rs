@@ -1488,6 +1488,11 @@ impl Consensus {
                 };
                 self.state.store_config_record(&rec).expect("config persist fail-stop");
                 self.cnc.store_config_version(cfg.version);
+                // Post-M7 follow-up: a fiat install has no in-flight change
+                // by construction (cur == prev at the floor) — clear the
+                // pending mirror too, or a stale pre-crash `true` sticks
+                // until the NEXT live change commits.
+                self.cnc.store_config_pending(false);
                 // Final-review fix: this call now ALSO refreshes `config_bytes`
                 // (previously only `Action::ConfigAdopted`'s exec arm did, so a
                 // below-floor rejoiner that later became leader would ship its
