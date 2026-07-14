@@ -123,6 +123,13 @@ pub const CNC_OFF_ADMIN_RESP: usize = 3648;
 
 const _: () = assert!(CNC_OFF_ADMIN_RESP + 64 <= CNC_PAGE_LEN);
 
+/// Post-M7 (0.3.0): the node's configured admission window
+/// (`NodeConfig::admission_bytes`), published once at boot. 0 = written by a
+/// pre-0.3.0 node (readers fall back to their own default). Next free
+/// reserved-band offset after this line: 3776.
+pub const CNC_OFF_ADMISSION_BYTES: usize = 3712;
+const _: () = assert!(CNC_OFF_ADMISSION_BYTES + 64 <= CNC_PAGE_LEN);
+
 pub const NODE_FLAG_LEADER: u64 = 1;
 pub const NODE_FLAG_CAN_SERVE: u64 = 2;
 
@@ -415,5 +422,7 @@ mod tests {
         assert_eq!(CNC_OFF_CONFIG_PENDING, 3520);
         assert_eq!(CNC_OFF_ADMIN_REQ, 3584);
         assert_eq!(CNC_OFF_ADMIN_RESP, 3648);
+        // Post-M7 (0.3.0): admission_bytes.
+        assert_eq!(CNC_OFF_ADMISSION_BYTES, 3712);
     }
 }

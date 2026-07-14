@@ -22,7 +22,8 @@ impl ProtocolVersion {
     }
 }
 
-pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 2, 0);
+// 0.3.0: post-M7 follow-ups — cnc admission_bytes @3712, admin reason codes 11/12 (additive).
+pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 3, 0);
 pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
 
 #[cfg(test)]

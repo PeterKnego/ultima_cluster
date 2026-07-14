@@ -450,6 +450,7 @@ impl Node {
         // every boot, so without this an attaching reader sees a stale `0` for
         // an entire duty cycle even when the recovered record is not genesis).
         cnc.store_config_version(config.version);
+        cnc.store_admission_bytes(cfg.admission_bytes);
 
         // M7 Task 6: the snapshot-session config-carry cache — the encoded
         // CURRENT `ConfigRecord.config` (`v2::config::encode_config` bytes), read

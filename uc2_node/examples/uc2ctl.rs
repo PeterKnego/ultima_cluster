@@ -82,12 +82,12 @@ struct IdArgs {
 struct StatusArgs {
     #[command(flatten)]
     common: CommonArgs,
-    /// The cluster's configured admission window in bytes (`NodeConfig::admission_bytes`)
-    /// — used only for the staleness warning below (`uc2ctl` cannot read a live
-    /// node's in-process config; pass the same value the cluster was started
-    /// with). Default matches every reference gate's `256 * 1024`.
-    #[arg(long, default_value_t = 256 * 1024)]
-    admission_bytes: u64,
+    /// Override for the staleness warning's admission window. Since 0.3.0
+    /// the node publishes its configured value on the cnc page and this
+    /// flag is only needed against pre-0.3.0 nodes (whose page reads 0 —
+    /// then this default applies).
+    #[arg(long)]
+    admission_bytes: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -220,6 +220,12 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
     let commit = cnc.counters().commit.load_acquire();
     let durable = cnc.counters().durable.load_acquire();
     let append = cnc.counters().append.load_acquire();
+    let admission_bytes = a.admission_bytes.unwrap_or_else(|| {
+        match cnc.admission_bytes() {
+            0 => 256 * 1024, // pre-0.3.0 node: fall back to the old default
+            v => v,
+        }
+    });
 
     println!(
         "config: version={} pending={}",
@@ -253,12 +259,12 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
         // commit). A dormant/never-reported peer reads 0 here, which is
         // caught by the same comparison whenever commit > admission_bytes.
         let behind = commit.saturating_sub(reported_durable);
-        let stale = behind > a.admission_bytes;
+        let stale = behind > admission_bytes;
         let warn = if stale {
             format!(
                 " -- STALE: {behind} bytes behind commit (> admission window {}); \
                  removing a live voter while node {id} is dark leaves you stalled",
-                a.admission_bytes
+                admission_bytes
             )
         } else {
             String::new()

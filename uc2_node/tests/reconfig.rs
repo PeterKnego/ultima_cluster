@@ -1276,6 +1276,9 @@ fn every_refusal_surfaces() {
     let leader = await_single_leader(&c.nodes, 20);
     let mut leader_cnc = open_cnc(&c.nodes[leader].instance_dir);
     await_config_settled(&leader_cnc, 20);
+    // Post-M7 (0.3.0): the node mirrors its configured admission window onto
+    // the cnc page once at boot (`make_config`'s `admission_bytes: 256 * 1024`).
+    assert_eq!(leader_cnc.admission_bytes(), 256 * 1024);
 
     // ---- AlreadyPresent: add-learner on an existing VOTER id ----
     let resp = admin_request(&leader_cnc, 1 /* AddLearner */, 0, 0, 0);

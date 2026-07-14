@@ -20,10 +20,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use uc_protocol::v2::cnc::{
-    self, CNC_MAX_PEER_SLOTS, CNC_OFF_ADMIN_REQ, CNC_OFF_ADMIN_RESP, CNC_OFF_APPEND,
-    CNC_OFF_ARCHIVE_FIRST_BASE, CNC_OFF_CONFIG_PENDING, CNC_OFF_CONFIG_VERSION, CNC_OFF_HEADER_CRC,
-    CNC_OFF_PEER_SLOTS, CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_TERM,
-    CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_V2_VERSION, CncHeader,
+    self, CNC_MAX_PEER_SLOTS, CNC_OFF_ADMIN_REQ, CNC_OFF_ADMIN_RESP, CNC_OFF_ADMISSION_BYTES,
+    CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE, CNC_OFF_CONFIG_PENDING, CNC_OFF_CONFIG_VERSION,
+    CNC_OFF_HEADER_CRC, CNC_OFF_PEER_SLOTS, CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SNAPSHOT_POS,
+    CNC_OFF_TERM, CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_V2_VERSION, CncHeader,
 };
 
 use crate::counters::{LogCounters, PaddedAtomicU64};
@@ -434,6 +434,22 @@ impl CncPage {
         unsafe { (*ptr).store_release(v) }
     }
 
+    /// Post-M7 (0.3.0): the node's configured admission window
+    /// (`NodeConfig::admission_bytes`), published once at boot. 0 = written
+    /// by a pre-0.3.0 node (readers fall back to their own default).
+    pub fn admission_bytes(&self) -> u64 {
+        // SAFETY: offset 3712, size 8.
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_ADMISSION_BYTES) as *const PaddedAtomicU64 };
+        unsafe { (*ptr).load_acquire() }
+    }
+
+    /// Post-M7 (0.3.0): store the node's configured admission window.
+    pub fn store_admission_bytes(&self, v: u64) {
+        // SAFETY: offset 3712, size 8.
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_ADMISSION_BYTES) as *const PaddedAtomicU64 };
+        unsafe { (*ptr).store_release(v) }
+    }
+
     /// M7: config pending (1 = uncommitted, 0 = stable).
     pub fn config_pending(&self) -> u64 {
         // SAFETY: offset 3520, size 8.
@@ -650,6 +666,8 @@ mod tests {
         assert_eq!(CNC_OFF_CONFIG_PENDING, 3520);
         assert_eq!(CNC_OFF_ADMIN_REQ, 3584);
         assert_eq!(CNC_OFF_ADMIN_RESP, 3648);
+        // Post-M7 (0.3.0): admission_bytes.
+        assert_eq!(CNC_OFF_ADMISSION_BYTES, 3712);
     }
 
     #[test]
@@ -882,5 +900,19 @@ mod tests {
         assert_eq!(page.config_pending(), 1);
         page.store_config_pending(false);
         assert_eq!(page.config_pending(), 0);
+    }
+
+    #[test]
+    fn admission_bytes_roundtrip_and_offset_pin() {
+        let page = CncPage::heap(&test_meta());
+        assert_eq!(page.admission_bytes(), 0, "fresh page reads 0 (pre-0.3.0 sentinel)");
+        page.store_admission_bytes(256 * 1024);
+        assert_eq!(page.admission_bytes(), 256 * 1024);
+        let raw = page.page();
+        assert_eq!(
+            u64::from_le_bytes(raw[3712..3720].try_into().unwrap()),
+            256 * 1024,
+            "offset pin: the value must live at 3712 exactly"
+        );
     }
 }
