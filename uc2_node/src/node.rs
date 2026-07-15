@@ -2555,38 +2555,37 @@ impl Consensus {
                 self.cnc.store_config_version(config.version);
                 // Cleared once commit crosses `position` (do_work step 11).
                 self.cnc.store_config_pending(true);
-                // Final-review carry (post-M7 follow-up wave): the crash-handoff
-                // wedge `propose_config`'s `SelfDemote` guard can't close. That
-                // guard only blocks a SERVING leader from PROPOSING its own
-                // demote; it can't stop a DIFFERENT leader from proposing
-                // `DemoteVoter{B}` (legal — B isn't self), replicating the CONFIG
-                // frame to B, and crashing before it commits. If B then wins the
-                // election, B's own archive scan re-observes that frame and
-                // adopts it here from the log — while B is `Role::Leader`. A
+                // The crash-handoff wedge `propose_config`'s `SelfDemote` guard
+                // can't close. That guard only blocks a SERVING leader from
+                // PROPOSING its own demote; it can't stop a DIFFERENT leader from
+                // proposing `DemoteVoter{B}` (legal — B isn't self), replicating
+                // the CONFIG frame to B, and crashing before it commits. If B then
+                // wins the election, B's own archive scan re-observes that frame
+                // and adopts it here from the log — while B is `Role::Leader`. A
                 // demote leaves no tombstone (only `Remove*` does), so the
-                // `tombstones.contains(self.id)` latch above never fires and
-                // neither `HaltRemoved` nor `StepDownRemoved` follows — B keeps
-                // serving as leader but can never vote again, with zero signal.
-                // Safety holds (a learner casts no vote, occupies no quorum
-                // slot); the wedge is silent. This is exactly that shape: warn
-                // loudly so an operator notices and runs `remove-learner` on
-                // this id (then rejoins fresh) rather than the fleet quietly
-                // running a leader that can't be re-elected. This arm runs once
-                // per adoption, so the check fires exactly once per such event.
-                // A mechanical fix (a commit-triggered self-step-down for this
-                // shape, mirroring `StepDownRemoved`) is a deferred, post-merge
-                // ticket — out of scope here.
+                // `tombstones.contains(self.id)` latch never fires and
+                // `StepDownRemoved` does not follow.
+                //
+                // Post-M7 loose-end T1 closed this wedge in the SM: `rank_leader`
+                // now relinquishes leadership (a same-term `BecomeFollower`, the
+                // generic arm above) once the demote COMMITS — B keeps appending
+                // through the adoption window (C_new must be replicated by a
+                // leader that still exists), then steps down to a live non-voting
+                // learner-follower and the surviving C_new voters elect among
+                // themselves. So this is now a TRANSIENT state, not a permanent
+                // wedge. Still log it (once per adoption): a leader adopting its
+                // own demote from the log is an operationally notable
+                // crash-handoff event even though it now self-heals.
                 if matches!(self.sm.role(), Role::Leader)
                     && !config.is_voter(self.id)
                     && !config.tombstones.contains(&self.id)
                 {
                     eprintln!(
-                        "node {}: WARNING leader adopted a config demoting itself from the \
-                         log (crash-handoff of a demote a prior leader proposed against this \
-                         id) — continuing to serve as leader but can never vote again; \
-                         operator recourse: remove-learner {} on this node, then rejoin with \
-                         a fresh id",
-                        self.id, self.id
+                        "node {}: leader adopted a config demoting itself from the log \
+                         (crash-handoff of a demote a prior leader proposed against this id) \
+                         — will relinquish leadership to a non-voting learner-follower once \
+                         the demote commits (T1 self-heal); no operator action required",
+                        self.id
                     );
                 }
             }
