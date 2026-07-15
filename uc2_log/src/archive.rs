@@ -581,16 +581,38 @@ pub fn find_block(journal: &Journal, pos: u64) -> Result<Option<(u64, u64)>, Arc
 /// sender-thread shape, M4: journal reads racing the archive agent's
 /// appends/fsyncs, which `Journal`'s internal locking makes safe — blocks
 /// appended concurrently land strictly above the `last_seq` snapshot taken
-/// here and are never read). Returns `Ok(None)` when `pos` is below the first
-/// archived block (purged): this caller has no floor bookkeeping to report,
-/// unlike `Archive::replay_from`'s `PositionPurged`. A `pos` at/beyond the
-/// durable frontier yields an exhausted replay (every frame of the covering
-/// block sits below `skip_below`).
+/// here and are never read).
 ///
-/// CONTRACT (as `Archive::replay_from`): `pos` is a frame start, and the
-/// blocks in the returned replay's `[seq, last_seq]` snapshot must not be
-/// purged/truncated/rewritten while it is drained — `Replay::next` expects
+/// # Return contract — the `Some(exhausted)` / `None` split (T2)
+///
+/// The two return shapes are the shared-handle mirror of `Archive::replay_from`'s
+/// exhausted-vs-`PositionPurged` split, NOT an accidental asymmetry:
+///
+/// - `Ok(Some(replay))` — a drainable replay. This covers both a `pos` inside
+///   the retained range (yields its frames) AND a `pos` at/beyond the durable
+///   frontier or on an EMPTY journal (a constructible replay that drains to
+///   nothing — the caller is CAUGHT UP, not missing data). `replay_from`
+///   returns `Ok(exhausted)` for these same two cases.
+/// - `Ok(None)` — `pos` is below the first archived block: the covering bytes
+///   are PURGED and gone (the caller must upgrade to a snapshot session). This
+///   is where `replay_from` returns `Err(PositionPurged)`; the free function has
+///   no `Archive` floor bookkeeping to report, so it collapses that to `None`.
+///
+/// So empty-journal → `Some(exhausted)` (caught up to nothing) and below-floor →
+/// `None` (purged) are deliberately different: "caught up" and "data gone" are
+/// distinct outcomes a caller must handle differently, exactly as `replay_from`
+/// distinguishes them.
+///
+/// LIFETIME/RACE CONTRACT (as `Archive::replay_from`): `pos` is a frame start,
+/// and the blocks in the returned replay's `[seq, last_seq]` snapshot must not
+/// be purged/truncated/rewritten while it is drained — `Replay::next` expects
 /// every block in its range readable. Concurrent APPENDS are fine.
+///
+/// `#[doc(hidden)]`: this is test-support / a future-adoption seam (the
+/// sender's deep-NAK path currently has its own `serve_nak_from_journal`
+/// replay); it is exercised by `tests/archive_stress.rs` and the unit test
+/// below, but is not part of the crate's stable surface.
+#[doc(hidden)]
 pub fn replay_journal_from(journal: &Journal, pos: u64) -> Result<Option<Replay<'_>>, ArchiveError> {
     let Some(last) = journal.last_seq() else {
         // Empty journal: an exhausted replay (mirrors replay_from's shape).
