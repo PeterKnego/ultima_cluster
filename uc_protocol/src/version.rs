@@ -23,6 +23,19 @@ impl ProtocolVersion {
 }
 
 // 0.3.0: post-M7 follow-ups — cnc admission_bytes @3712, admin reason codes 11/12 (additive).
+//
+// NB (post-M7 loose-end): these two constants and `ProtocolVersion::
+// compatible_with` are NOT on any live enforcement path — grep the workspace
+// and `CURRENT` has no caller outside this file, `MIN_COMPATIBLE` is only
+// re-exported (never read), and `compatible_with` is referenced only by this
+// module's own tests and a doc-comment. The version actually gated at every
+// IPC / peer handshake is the cnc-page field, checked by
+// `uc_protocol::v2::cnc::version_compatible(local, peer)` over the packed
+// `CNC_V2_VERSION` u32 (that module is `core`-only, so it re-spells the
+// same-major / peer-minor-not-newer rule directly rather than depend on this
+// type). Keep `CURRENT` in step with `CNC_V2_VERSION` by convention when you
+// bump the wire version; it documents the semver of the protocol but does not
+// itself enforce anything.
 pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 3, 0);
 pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
 

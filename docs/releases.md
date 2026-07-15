@@ -1,5 +1,26 @@
 # ultima_cluster releases
 
+## Unreleased (wire protocol 0.3.0)
+Post-M7 follow-up hardening (no new externally-visible features). Wire protocol
+bumped **0.2.0 → 0.3.0**, additive only:
+- cnc-page `admission_bytes` field pinned at offset 3712.
+- admin reply reason codes **11** (malformed/unknown op) and **12**
+  (self-demote refused).
+
+A 0.3.0 node accepts a 0.2.0 peer (same major, peer minor not newer — see
+`cnc::version_compatible`, the live gate; `version::CURRENT`/`MIN_COMPATIBLE`
+are documentation-only and enforce nothing).
+
+Loose-end hardening in this line:
+- **Leader-as-learner wedge closed** (T1): a leader that adopts its own demote
+  from the log now relinquishes leadership to a non-voting learner-follower once
+  the demote commits (a commit-triggered step-down mirroring self-removal),
+  instead of leading-as-a-learner until an operator intervened. Safety was never
+  affected; this removes the silent liveness wedge.
+- **Config observations delivered losslessly** (T5): a dropped config-frame
+  observation could silently run stale membership until a restart; delivery is
+  now lossless.
+
 ## v2.1.0 — 2026-07-14
 M7 live single-server reconfiguration (promote/demote/add/remove under load,
 no restarts, `uc2ctl` admin path, tombstone-based fresh-forever ids, leader
