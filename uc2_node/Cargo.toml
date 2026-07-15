@@ -34,3 +34,8 @@ rand = { workspace = true }
 clap = { workspace = true }
 hdrhistogram = { workspace = true }
 anyhow = { workspace = true }
+
+[features]
+# Fault injection for the elle mutation-testing tier. Off in every normal
+# build; even when compiled in, inert unless UC2_MUTATION is set.
+mutation-testing = ["uc2_consensus/mutation-testing"]

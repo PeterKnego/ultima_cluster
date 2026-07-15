@@ -493,6 +493,16 @@ impl Node {
             durable,
             0,
         );
+        #[cfg(feature = "mutation-testing")]
+        match crate::mutation::active() {
+            Some(crate::mutation::Mutation::CommitQuorumMinusOne) => {
+                sm.set_mutate_quorum_minus_one(true)
+            }
+            Some(crate::mutation::Mutation::SkipVoteOrderCheck) => {
+                sm.set_mutate_skip_vote_order(true)
+            }
+            _ => {}
+        }
         // Seed the recovered PREV level (T4/T5): a no-op identity restore at
         // genesis (`prev == config`, both at position 0) — real content only
         // when a prior life actually adopted a config.
@@ -1946,7 +1956,8 @@ impl Consensus {
                         ReadPhase::AwaitQuorum
                     };
                     let need_probe = phase == ReadPhase::AwaitQuorum;
-                    self.pending_reads.push(PendingRead {
+                    #[cfg_attr(not(feature = "mutation-testing"), allow(unused_mut))]
+                    let mut read = PendingRead {
                         client_id,
                         local_seq,
                         query: buf,
@@ -1956,7 +1967,19 @@ impl Consensus {
                         quorum,
                         deadline_ns,
                         phase,
-                    });
+                    };
+                    // Mutation tooth: skip the READ_PROBE quorum barrier entirely — the
+                    // read is served from local applied state without confirming
+                    // leadership. A deposed leader then answers stale reads (the elle
+                    // partition pass catches this under the strict model).
+                    #[cfg(feature = "mutation-testing")]
+                    if matches!(
+                        crate::mutation::active(),
+                        Some(crate::mutation::Mutation::SkipReadBarrier)
+                    ) {
+                        read.phase = ReadPhase::AwaitApplied;
+                    }
+                    self.pending_reads.push(read);
                     if need_probe {
                         self.send_read_probe(nonce);
                     }
@@ -3216,7 +3239,8 @@ mod tests {
             members.iter().map(|id| (*id, addr_to_pair(id_to_addr[id]))).collect(),
             Vec::new(),
         );
-        let sm = ElectionSm::new(
+        #[cfg_attr(not(feature = "mutation-testing"), allow(unused_mut))]
+        let mut sm = ElectionSm::new(
             ElectionConfig {
                 id: 1,
                 config,
@@ -3231,6 +3255,16 @@ mod tests {
             6016,
             0,
         );
+        #[cfg(feature = "mutation-testing")]
+        match crate::mutation::active() {
+            Some(crate::mutation::Mutation::CommitQuorumMinusOne) => {
+                sm.set_mutate_quorum_minus_one(true)
+            }
+            Some(crate::mutation::Mutation::SkipVoteOrderCheck) => {
+                sm.set_mutate_skip_vote_order(true)
+            }
+            _ => {}
+        }
         let boot_term = sm.current_term();
         assert_eq!(boot_term, 2);
 

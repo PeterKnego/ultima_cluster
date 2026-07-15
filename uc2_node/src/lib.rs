@@ -25,6 +25,8 @@
 //! Task 8.
 
 pub mod ipc;
+#[cfg(feature = "mutation-testing")]
+pub(crate) mod mutation;
 mod node;
 
 pub use ipc::{InstanceDir, IpcError};
