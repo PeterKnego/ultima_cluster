@@ -261,3 +261,67 @@ fn elle_partition() {
         "fewer than 3 partition cycles landed",
     );
 }
+
+/// Purge pass: the M6 purge-churn capstone's posture — aggressive
+/// snapshot-backed purge (16 KiB segments, 32 KiB snapshot cadence, zero
+/// slack) with the follower-service-crash arm forcing below-floor
+/// snapshot-install reconstruction. Non-vacuity: the archive floor advanced.
+#[test]
+#[ignore]
+fn elle_purge() {
+    let ccfg = ClusterCfg {
+        purge: uc2_node::PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        journal_segment_bytes: 16 * 1024,
+        snapshot_interval_bytes: 32 * 1024,
+        spare_node: false,
+    };
+    run_pass(
+        "purge",
+        ccfg,
+        20_000,
+        70,
+        Duration::from_millis(1200),
+        |cluster, rng, _faults| match rng.random_range(0..3u8) {
+            0 => cluster.kill_and_restart_leader(),
+            1 => cluster.crash_and_restart_leader_service(),
+            _ => cluster.crash_and_restart_random_follower_service(rng),
+        },
+        |cluster, _faults| cluster.max_archive_first_base() > 0,
+        "purge never advanced the archive floor",
+    );
+}
+
+/// Reconfig pass: the M7 reconfig-churn capstone's four arms — leader kill
+/// (gated off while the spare is a voter), follower service crash, a short
+/// minority partition (same gate), and one step of the spare's
+/// add/promote/demote/remove cycle. Non-vacuity: >= 3 accepted config ops.
+#[test]
+#[ignore]
+fn elle_reconfig() {
+    let ccfg = ClusterCfg { spare_node: true, ..ClusterCfg::default() };
+    run_pass(
+        "reconfig",
+        ccfg,
+        20_000,
+        70,
+        Duration::from_millis(1200),
+        |cluster, rng, _faults| match rng.random_range(0..4u8) {
+            0 if !cluster.spare_is_voting() => cluster.kill_and_restart_leader(),
+            0 => {}
+            1 => cluster.crash_and_restart_random_follower_service(rng),
+            2 => {
+                if !cluster.spare_is_voting() {
+                    cluster.partition_minority();
+                    std::thread::sleep(Duration::from_millis(800));
+                    cluster.heal();
+                    cluster.await_reconverged(20);
+                }
+            }
+            _ => {
+                cluster.random_config_op(rng);
+            }
+        },
+        |cluster, _faults| cluster.config_ops_accepted >= 3,
+        "reconfig churn never actually reconfigured (config_ops_accepted < 3)",
+    );
+}
