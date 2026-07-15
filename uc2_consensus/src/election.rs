@@ -323,6 +323,17 @@ pub struct ElectionSm {
     /// yet" (absent but not tombstoned). Never reset once set: tombstones are
     /// permanent (inv9), so a real self-exclusion can never be un-adopted.
     self_removed: bool,
+
+    /// Mutation tooth (elle harness): commit at quorum-1 instead of quorum.
+    /// Plain bool set by the caller (uc2_node's wiring) — this crate stays
+    /// env-free. See [`ElectionSm::set_mutate_quorum_minus_one`].
+    #[cfg(feature = "mutation-testing")]
+    mutate_quorum_minus_one: bool,
+    /// Mutation tooth (elle harness): grant votes ignoring the
+    /// `(last_term, last_durable)` freshness order. See
+    /// [`ElectionSm::set_mutate_skip_vote_order`].
+    #[cfg(feature = "mutation-testing")]
+    mutate_skip_vote_order: bool,
 }
 
 impl ElectionSm {
@@ -420,6 +431,10 @@ impl ElectionSm {
             wipe_on_no_common_prefix: true,
             stepped_down: false,
             self_removed: false,
+            #[cfg(feature = "mutation-testing")]
+            mutate_quorum_minus_one: false,
+            #[cfg(feature = "mutation-testing")]
+            mutate_skip_vote_order: false,
         };
         sm.arm_timeout(now_ns);
         sm
@@ -438,6 +453,22 @@ impl ElectionSm {
     /// same pattern as [`ElectionSm::set_wipe_on_no_common_prefix`].
     pub fn set_revert_on_truncate(&mut self, v: bool) {
         self.revert_on_truncate = v;
+    }
+
+    /// Mutation tooth: commit at quorum-1. Also degrades the CURRENT tracker so
+    /// wiring order (construct -> set) works.
+    #[cfg(feature = "mutation-testing")]
+    pub fn set_mutate_quorum_minus_one(&mut self, on: bool) {
+        self.mutate_quorum_minus_one = on;
+        if on {
+            self.tracker.force_quorum_minus_one();
+        }
+    }
+
+    /// Mutation tooth: grant votes ignoring the (last_term, last_durable) order.
+    #[cfg(feature = "mutation-testing")]
+    pub fn set_mutate_skip_vote_order(&mut self, on: bool) {
+        self.mutate_skip_vote_order = on;
     }
 
     /// M7 boot-recovery hook: restore the durable `ConfigRecord`'s PREV level.
@@ -1158,6 +1189,10 @@ impl ElectionSm {
 
     /// Lexicographic freshness: `(last_term, last_durable) >= (ours, durable)`.
     fn log_ok(&self, last_term: u32, last_durable: u64) -> bool {
+        #[cfg(feature = "mutation-testing")]
+        if self.mutate_skip_vote_order {
+            return true;
+        }
         let our_term = self.term_map.last().map(|(t, _)| *t).unwrap_or(0);
         (last_term, last_durable) >= (our_term, self.durable)
     }
@@ -1315,6 +1350,10 @@ impl ElectionSm {
         let n = self.members.len();
         let n_followers = if self.can_vote { n - 1 } else { n };
         self.tracker = CommitTracker::new(n_followers, n_followers + 1);
+        #[cfg(feature = "mutation-testing")]
+        if self.mutate_quorum_minus_one {
+            self.tracker.force_quorum_minus_one();
+        }
         // Prune to SURVIVING config members (voter OR learner — not just
         // voters): a learner's carried report must survive an unrelated
         // rebuild (e.g. another AddLearner) so a later PromoteLearner still
@@ -1642,6 +1681,31 @@ mod tests {
             Action::PersistAndSendVote { to: 0, vote } if vote.term == 4 && vote.voted_for == 0
         )));
         assert_eq!(s.current_term(), 4);
+    }
+
+    /// Mutation tooth (elle harness): with the vote-order check skipped, a
+    /// candidate with a SHORTER log is granted — the injected bug the
+    /// failover elle pass must catch as divergence/lost updates after an
+    /// election. Mirrors `vote_rule_lexicographic_on_durable_credentials`'s
+    /// arrange exactly (that test is the knob-off control: the identical
+    /// construction + RequestVote there is REFUSED via `SendVoteRejection`);
+    /// with the knob on the same event must be GRANTED instead.
+    #[cfg(feature = "mutation-testing")]
+    #[test]
+    fn skip_vote_order_grants_stale_candidate() {
+        // our node has durable 1000 in term 2
+        let mut s = ElectionSm::new(cfg(1), None, &[(1, 0), (2, 500)], 1000, 0);
+        s.set_mutate_skip_vote_order(true);
+        // candidate behind on durable: refused in the control test above,
+        // granted here with the vote-order check skipped.
+        let acts = step(
+            &mut s,
+            Event::RequestVote { from: 2, new_term: 3, last_term: 2, last_durable: 900 },
+        );
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::PersistAndSendVote { to: 2, .. })),
+            "stale candidate must be granted with the vote-order check skipped, got: {acts:?}"
+        );
     }
 
     #[test]

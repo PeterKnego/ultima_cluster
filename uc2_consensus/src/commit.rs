@@ -83,6 +83,14 @@ impl CommitTracker {
             None
         }
     }
+
+    /// Mutation tooth (elle harness): degrade the rank to quorum-1. Applied at
+    /// construction time by ElectionSm's knob so it survives config-boundary
+    /// tracker rebuilds.
+    #[cfg(feature = "mutation-testing")]
+    pub fn force_quorum_minus_one(&mut self) {
+        self.quorum = (self.quorum - 1).max(1);
+    }
 }
 
 #[cfg(test)]
@@ -197,5 +205,17 @@ mod tests {
     #[should_panic(expected = "quorum")]
     fn too_few_tracked_followers_is_rejected() {
         let _ = CommitTracker::new(1, 5); // quorum 3 > 2 tracked members
+    }
+
+    /// Mutation tooth (elle harness): forcing quorum-1 makes a 3-node tracker
+    /// commit on the leader's own durable alone — the injected bug the failover
+    /// elle pass must catch as a lost update.
+    #[cfg(feature = "mutation-testing")]
+    #[test]
+    fn forced_quorum_minus_one_commits_without_any_report() {
+        let mut t = CommitTracker::new(2, 3);
+        t.force_quorum_minus_one();
+        // No follower reports: {own=1000, 0, 0} -> rank 1 -> own -> commits.
+        assert_eq!(t.advance(1000), Some(1000));
     }
 }

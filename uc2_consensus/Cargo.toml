@@ -7,3 +7,9 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+
+[features]
+# Fault injection for the elle mutation-testing tier (scripts/elle_mutation.sh).
+# NEVER on by default; knob fields are plain bools set by uc2_node's wiring —
+# this crate stays env-free (pure-sync, no I/O).
+mutation-testing = []
