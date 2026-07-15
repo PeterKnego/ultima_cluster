@@ -663,6 +663,7 @@ impl World {
     /// the exact code path the entry checks guard, without depending on a
     /// scenario that only an actual SM bug would ever produce.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn test_only_park_violation(&mut self, v: InvariantViolation) {
         self.pending_violation = Some(v);
     }

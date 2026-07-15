@@ -12,6 +12,18 @@ authors.workspace = true
 [features]
 # Heavy fuzz tier (1000 seeds, 5-node mix): a CI knob, run in --release.
 sim-heavy = []
+# Test-only helpers (e.g. `World::test_only_park_violation`) that must not be
+# part of the shipped public surface. Enabled for this crate's own tests via the
+# self dev-dependency below (so default `cargo test` keeps working); never on for
+# `cargo build`. Post-M7 loose-end (4).
+test-support = []
 
 [dependencies]
 uc2_consensus = { path = "../uc2_consensus" }
+
+[dev-dependencies]
+# Self dev-dependency turns on `test-support` for the integration tests
+# (tests/scenarios.rs) without requiring `--features test-support` on every
+# `cargo test`. Standard idiom for a test-only pub API used by an integration
+# test (rust-lang/cargo#2911). Dev-only: does not affect `cargo build`.
+uc2_sim = { path = ".", features = ["test-support"] }
