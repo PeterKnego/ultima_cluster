@@ -710,11 +710,30 @@ impl Node {
                 let _ = obs_tx.try_send(obs);
                 did = true;
             }
-            // M7: forward durably-recorded CONFIG-frame observations the same
-            // way (position-ordered, one scan already did both in `do_work`
-            // above via `Archive::observe_terms`).
+            // M7: forward durably-recorded CONFIG-frame observations (position-
+            // ordered, detected in the same scan as the term observations above
+            // via `Archive::observe_terms`).
+            //
+            // Post-M7 loose-end T5: deliver these LOSSLESSLY, unlike the term
+            // observations above. Config observations are RARE (one per
+            // single-server membership change, gated by `config_pending`) and
+            // emitted EXACTLY ONCE — `observe_terms` detects each CONFIG frame on
+            // the recording pass only and never re-derives it, so a dropped
+            // observation is lost until the next full journal re-scan (a restart),
+            // silently running stale membership with no steady-state repair path.
+            // Term observations, by contrast, are idempotent and re-derivable from
+            // commit gossip, so their `try_send` drop above is intentionally
+            // tolerated. Here we block until the node's drain (`cfg_obs_rx`, a
+            // DIFFERENT thread's `do_work`, non-blocking `try_recv`) makes space;
+            // the 1024-deep channel only fills if that drain has wedged — itself a
+            // bug — and stalling the archive agent is strictly safer than a silent
+            // membership divergence (a stalled node is detectable; a diverged one
+            // is not). A send error means the receiver is gone (node shutting
+            // down): stop feeding.
             for obs in archive.take_config_observations() {
-                let _ = cfg_obs_tx.try_send(obs);
+                if cfg_obs_tx.send(obs).is_err() {
+                    break;
+                }
                 did = true;
             }
             did
