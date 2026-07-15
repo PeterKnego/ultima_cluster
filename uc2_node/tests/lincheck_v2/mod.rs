@@ -57,7 +57,7 @@ use uc2_consensus::election::NodeId;
 use uc2_log::cnc::{AdminReq, AdminResp, CncPage};
 use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig};
-use uc2_service::{ServiceBuilder, ServiceConfig, SnapshotPolicy};
+use uc2_service::{ServiceBuilder, ServiceConfig, SnapshotPolicy, SnapshotStateMachine};
 
 use uc_lincheck::history::{History, Outcome};
 use uc_lincheck::model::{Op, RegResp};
@@ -172,9 +172,12 @@ fn rebind(addr: SocketAddr) -> UdpSocket {
 /// nothing, so this is always a clean in-memory state; the node reconstructs it
 /// from the replicated log (journal replay, Task 9) — that reconstruction is
 /// exactly what the capstone's service-crash fault proves.
-fn spawn_service(dir: &Path, snapshot_interval_bytes: u64) -> uc2_service::Service<RegisterSm> {
+fn spawn_service<SM: SnapshotStateMachine + Default>(
+    dir: &Path,
+    snapshot_interval_bytes: u64,
+) -> uc2_service::Service<SM> {
     if snapshot_interval_bytes == 0 {
-        ServiceBuilder::new(ServiceConfig::new(dir, APP), RegisterSm::default())
+        ServiceBuilder::new(ServiceConfig::new(dir, APP), SM::default())
             .start()
             .expect("service start")
     } else {
@@ -183,7 +186,7 @@ fn spawn_service(dir: &Path, snapshot_interval_bytes: u64) -> uc2_service::Servi
         // reconstruction after a service crash then goes via snapshot install.
         let cfg = ServiceConfig::new(dir, APP)
             .snapshot_policy(SnapshotPolicy { interval_bytes: snapshot_interval_bytes });
-        ServiceBuilder::new(cfg, RegisterSm::default())
+        ServiceBuilder::new(cfg, SM::default())
             .start_with_snapshots()
             .expect("snapshot service start")
     }
@@ -193,15 +196,15 @@ fn spawn_service(dir: &Path, snapshot_interval_bytes: u64) -> uc2_service::Servi
 
 /// One cluster member: its fixed identity/address/dir plus the live node +
 /// service (taken out of their `Option`s across a crash/restart).
-pub struct NodeSlot {
+pub struct NodeSlot<SM: SnapshotStateMachine + Default> {
     id: NodeId,
     addr: SocketAddr,
     instance_dir: PathBuf,
     node: Option<Node>,
-    service: Option<uc2_service::Service<RegisterSm>>,
+    service: Option<uc2_service::Service<SM>>,
 }
 
-impl NodeSlot {
+impl<SM: SnapshotStateMachine + Default> NodeSlot<SM> {
     fn is_live(&self) -> bool {
         self.node.is_some()
     }
@@ -232,8 +235,8 @@ enum SparePhase {
     Demoted,
 }
 
-pub struct LinClusterV2 {
-    nodes: Vec<NodeSlot>,
+pub struct LinClusterV2<SM: SnapshotStateMachine + Default = RegisterSm> {
+    nodes: Vec<NodeSlot<SM>>,
     members: Vec<(NodeId, SocketAddr)>,
     faults: FaultConfig,
     ccfg: ClusterCfg,
@@ -245,7 +248,7 @@ pub struct LinClusterV2 {
     /// The spare's CURRENTLY live node+service, if a cycle is in flight
     /// (`spare_phase != Idle`). `NodeSlot::id` here is whatever fresh id the
     /// current cycle allocated — never the same id twice (tombstone rule).
-    spare: Option<NodeSlot>,
+    spare: Option<NodeSlot<SM>>,
     spare_phase: SparePhase,
     /// Monotonic fresh-id allocator for the spare (starts at 100, per the
     /// brief's tombstone rule — an id, once removed, can NEVER be re-added).
@@ -257,19 +260,19 @@ pub struct LinClusterV2 {
     pub config_ops_accepted: u32,
 }
 
-impl LinClusterV2 {
+impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
     /// Bring up an `n`-node cluster under `root` (a caller-owned tempdir): bind
     /// every socket first (so the full member map is known before any agent
     /// runs), start each node on its pre-bound socket, then attach one service
     /// per node. Every node gets `faults` on its sockets (default = none).
-    pub fn start(root: &Path, n: usize, faults: FaultConfig) -> LinClusterV2 {
+    pub fn start(root: &Path, n: usize, faults: FaultConfig) -> Self {
         Self::start_cfg(root, n, faults, ClusterCfg::default())
     }
 
     /// As [`start`](Self::start) but with an explicit purge/snapshot posture
     /// (M6 Task 10 purge-churn capstone). The posture is retained so every
     /// restart reuses it.
-    pub fn start_cfg(root: &Path, n: usize, faults: FaultConfig, ccfg: ClusterCfg) -> LinClusterV2 {
+    pub fn start_cfg(root: &Path, n: usize, faults: FaultConfig, ccfg: ClusterCfg) -> Self {
         let socks: Vec<UdpSocket> =
             (0..n).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
         let members: Vec<(NodeId, SocketAddr)> =
@@ -302,7 +305,7 @@ impl LinClusterV2 {
         } else {
             (None, None)
         };
-        LinClusterV2 {
+        Self {
             nodes,
             members,
             faults,
@@ -584,28 +587,6 @@ impl LinClusterV2 {
         }
     }
 
-    /// Linearizable read addressed to a SPECIFIC node via a fresh client on its
-    /// dir (not leader-routed) — used to probe a partitioned-away node, which
-    /// must NEVER answer with a stale `Ok`. `Ok(v)` → `Outcome::Ok`; any client
-    /// error → `Outcome::Indeterminate` (dropped by the checker), except a
-    /// (de)serialization / wrong-cluster error, which is a harness bug and
-    /// panics.
-    pub fn read_from(&self, node: usize) -> Outcome {
-        let dir = self.nodes[node].instance_dir.clone();
-        let client = match Client::connect(&dir, APP) {
-            Ok(c) => c,
-            // A failed attach against a partitioned/idle node is not a stale
-            // read — record it as indeterminate (the checker drops it).
-            Err(_) => return Outcome::Indeterminate,
-        };
-        let out = match client.query_linearizable::<(), Option<u64>>(&()) {
-            Ok(v) => Outcome::Ok(RegResp::Value(v)),
-            Err(e) => classify_read_err(&e),
-        };
-        client.shutdown();
-        out
-    }
-
     /// Node-first-then-service teardown for every slot (module docs), plus
     /// the spare (M7 Task 10) if a cycle was left in flight.
     pub fn stop(mut self) {
@@ -832,11 +813,36 @@ impl LinClusterV2 {
     }
 }
 
+// Register-typed probe used by the WGL partition scenarios only.
+impl LinClusterV2<RegisterSm> {
+    /// Linearizable read addressed to a SPECIFIC node via a fresh client on its
+    /// dir (not leader-routed) — used to probe a partitioned-away node, which
+    /// must NEVER answer with a stale `Ok`. `Ok(v)` → `Outcome::Ok`; any client
+    /// error → `Outcome::Indeterminate` (dropped by the checker), except a
+    /// (de)serialization / wrong-cluster error, which is a harness bug and
+    /// panics.
+    pub fn read_from(&self, node: usize) -> Outcome {
+        let dir = self.nodes[node].instance_dir.clone();
+        let client = match Client::connect(&dir, APP) {
+            Ok(c) => c,
+            // A failed attach against a partitioned/idle node is not a stale
+            // read — record it as indeterminate (the checker drops it).
+            Err(_) => return Outcome::Indeterminate,
+        };
+        let out = match client.query_linearizable::<(), Option<u64>>(&()) {
+            Ok(v) => Outcome::Ok(RegResp::Value(v)),
+            Err(e) => classify_read_err(&e),
+        };
+        client.shutdown();
+        out
+    }
+}
+
 // ------------------------------------------------------ client op outcomes
 
 #[derive(Debug)]
-pub enum SubmitOutcome {
-    Ok(CmdResp),
+pub enum SubmitOutcome<R> {
+    Ok(R),
     /// May or may not have committed (timed out / answer lapped / gave up
     /// routing) — the WGL "indeterminate mutation".
     Indeterminate,
@@ -846,8 +852,8 @@ pub enum SubmitOutcome {
 }
 
 #[derive(Debug)]
-pub enum ReadOutcome {
-    Ok(Option<u64>),
+pub enum ReadOutcome<QR> {
+    Ok(QR),
     Indeterminate,
     Fatal(String),
 }
@@ -869,14 +875,14 @@ fn classify_read_err(e: &ClientError) -> Outcome {
 
 /// A worker's client connection state: the current target dir index plus the
 /// live client (dropped + reconnected on `NOT_LEADER`/`InstanceRestart`).
-struct WorkerConn {
+pub struct WorkerConn {
     dirs: Arc<Vec<PathBuf>>,
     target: usize,
     client: Option<Client>,
 }
 
 impl WorkerConn {
-    fn new(dirs: Arc<Vec<PathBuf>>, start: usize) -> Self {
+    pub fn new(dirs: Arc<Vec<PathBuf>>, start: usize) -> Self {
         Self { dirs, target: start, client: None }
     }
     /// Ensure a client attached to `self.target`; `None` if the attach failed
@@ -900,7 +906,7 @@ impl WorkerConn {
         let next = (self.target + 1) % self.dirs.len();
         self.reconnect_to(next);
     }
-    fn drop_client(&mut self) {
+    pub fn drop_client(&mut self) {
         if let Some(c) = self.client.take() {
             c.shutdown();
         }
@@ -924,7 +930,11 @@ impl WorkerConn {
 /// "indeterminate mutation": present-or-absent, response unconstrained). A stale
 /// client (node restarted / attach raced a re-created page) is dropped so the
 /// next op reconnects to the fresh page.
-fn submit_cmd(conn: &mut WorkerConn, cmd: &Cmd, deadline: Instant) -> SubmitOutcome {
+pub fn submit_cmd<C: serde::Serialize, R: serde::de::DeserializeOwned>(
+    conn: &mut WorkerConn,
+    cmd: &C,
+    deadline: Instant,
+) -> SubmitOutcome<R> {
     loop {
         if Instant::now() > deadline {
             return SubmitOutcome::Indeterminate; // gave up routing → in-limbo
@@ -934,7 +944,7 @@ fn submit_cmd(conn: &mut WorkerConn, cmd: &Cmd, deadline: Instant) -> SubmitOutc
             conn.rotate();
             continue;
         };
-        match client.submit::<Cmd, CmdResp>(cmd) {
+        match client.submit::<C, R>(cmd) {
             Ok(r) => return SubmitOutcome::Ok(r),
             // Guaranteed-not-committed → safe to route + retry.
             Err(ClientError::NotLeader { hint }) => match hint {
@@ -972,7 +982,11 @@ fn submit_cmd(conn: &mut WorkerConn, cmd: &Cmd, deadline: Instant) -> SubmitOutc
 /// retried while routing; on the overall deadline it is `Indeterminate` (dropped
 /// by the checker). An errored read never yields `Ok`, so a lost read simply
 /// carries no information.
-fn read_leader(conn: &mut WorkerConn, deadline: Instant) -> ReadOutcome {
+pub fn read_leader<Q: serde::Serialize, QR: serde::de::DeserializeOwned>(
+    conn: &mut WorkerConn,
+    q: &Q,
+    deadline: Instant,
+) -> ReadOutcome<QR> {
     loop {
         if Instant::now() > deadline {
             return ReadOutcome::Indeterminate;
@@ -982,7 +996,7 @@ fn read_leader(conn: &mut WorkerConn, deadline: Instant) -> ReadOutcome {
             conn.rotate();
             continue;
         };
-        match client.query_linearizable::<(), Option<u64>>(&()) {
+        match client.query_linearizable::<Q, QR>(q) {
             Ok(v) => return ReadOutcome::Ok(v),
             Err(ClientError::NotLeader { hint }) => match hint {
                 Some(h) => conn.reconnect_to(h as usize),
@@ -1033,7 +1047,7 @@ fn worker(
             0 => {
                 let v = rng.random_range(1..1000u64);
                 let inv = history.invoke();
-                let outcome = match submit_cmd(&mut conn, &Cmd::Write(v), deadline) {
+                let outcome = match submit_cmd::<_, CmdResp>(&mut conn, &Cmd::Write(v), deadline) {
                     SubmitOutcome::Ok(_) => Outcome::Ok(RegResp::Ack),
                     SubmitOutcome::Indeterminate => Outcome::Indeterminate,
                     SubmitOutcome::Fatal(e) => panic!("fatal submit: {e}"),
@@ -1042,7 +1056,7 @@ fn worker(
             }
             1 => {
                 let inv = history.invoke();
-                let outcome = match read_leader(&mut conn, deadline) {
+                let outcome = match read_leader::<(), Option<u64>>(&mut conn, &(), deadline) {
                     ReadOutcome::Ok(v) => {
                         if let Some(x) = v {
                             last_seen.store(x, Ordering::Relaxed);
@@ -1062,7 +1076,7 @@ fn worker(
                 };
                 let new = rng.random_range(1..1000u64);
                 let inv = history.invoke();
-                let outcome = match submit_cmd(&mut conn, &Cmd::Cas { old, new }, deadline) {
+                let outcome = match submit_cmd::<_, CmdResp>(&mut conn, &Cmd::Cas { old, new }, deadline) {
                     SubmitOutcome::Ok(CmdResp::CasResult(b)) => {
                         if b {
                             last_seen.store(new, Ordering::Relaxed);

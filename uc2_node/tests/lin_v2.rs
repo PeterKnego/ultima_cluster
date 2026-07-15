@@ -65,7 +65,7 @@ fn dump_history(entries: &[Entry], seed: u64) {
 fn smoke_3node_write_then_read() {
     let _g = serialize();
     let dir = tempdir();
-    let cluster = LinClusterV2::start(dir.path(), 3, FaultConfig::default());
+    let cluster: LinClusterV2 = LinClusterV2::start(dir.path(), 3, FaultConfig::default());
     let leader = cluster.await_single_serving(30);
 
     let client = cluster.client(leader);
@@ -111,7 +111,7 @@ fn linearizable_under_failover_v2() {
 
     let _g = serialize();
     let dir = tempdir();
-    let mut cluster = LinClusterV2::start(dir.path(), 3, FaultConfig::default());
+    let mut cluster: LinClusterV2 = LinClusterV2::start(dir.path(), 3, FaultConfig::default());
     cluster.await_single_serving(30);
 
     let dirs = Arc::new(cluster.dirs());
@@ -227,7 +227,7 @@ fn linearizable_under_purge_and_snapshot_churn() {
 
     let _g = serialize();
     let dir = tempdir();
-    let mut cluster = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let mut cluster: LinClusterV2 = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
     cluster.await_single_serving(30);
 
     let dirs = Arc::new(cluster.dirs());
@@ -397,7 +397,7 @@ fn linearizable_under_reconfig_churn() {
 
     let _g = serialize();
     let dir = tempdir();
-    let mut cluster = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let mut cluster: LinClusterV2 = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
     cluster.await_single_serving(30);
 
     let dirs = Arc::new(cluster.dirs());
