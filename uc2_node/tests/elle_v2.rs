@@ -207,3 +207,57 @@ fn elle_quiet() {
         "unreachable",
     );
 }
+
+/// Failover pass: the lin_v2 failover capstone's fault mix — leader node
+/// kill+restart vs leader service crash+restart, 50/50, one quorum-preserving
+/// fault at a time. Also the catch vehicle for the `commit-quorum-minus-one`
+/// and `skip-vote-order-check` mutations (elle_mutation.sh).
+#[test]
+#[ignore]
+fn elle_failover() {
+    run_pass(
+        "failover",
+        ClusterCfg::default(),
+        20_000,
+        70,
+        Duration::from_secs(1),
+        |cluster, rng, _faults| {
+            if rng.random_bool(0.5) {
+                cluster.kill_and_restart_leader();
+            } else {
+                cluster.crash_and_restart_leader_service();
+            }
+        },
+        |_cluster, faults| faults >= 3,
+        "fewer than 3 faults landed",
+    );
+}
+
+/// Partition pass (spec deviation, approved): isolate-then-heal cycles — 2/3
+/// leader isolation (a deposed-but-alive leader is the stale-read window the
+/// `skip-read-barrier` mutation needs), 1/3 minority isolation. Clean runs
+/// must stay anomaly-free under the strict model: the barrier is exactly what
+/// makes a partitioned leader refuse stale answers.
+#[test]
+#[ignore]
+fn elle_partition() {
+    run_pass(
+        "partition",
+        ClusterCfg::default(),
+        20_000,
+        60,
+        Duration::from_millis(1200),
+        |cluster, rng, _faults| {
+            if rng.random_bool(2.0 / 3.0) {
+                let _ = cluster.partition_leader();
+            } else {
+                let _ = cluster.partition_minority();
+            }
+            std::thread::sleep(Duration::from_millis(800));
+            cluster.heal();
+            cluster.await_reconverged(20);
+        },
+        |_cluster, faults| faults >= 3,
+        "fewer than 3 partition cycles landed",
+    );
+}
