@@ -108,12 +108,14 @@ fn elle_worker(
 /// Drive one pass: boot, spawn workers, tick the nemesis every `fault_period`
 /// until the op target AND the pass's non-vacuity hold (or the budget runs
 /// out), then write `$ELLE_DIR/<name>/history.edn` (+ a `seed` sidecar) and
-/// assert the liveness/non-vacuity gates.
+/// assert the liveness/non-vacuity gates. The `default_workers` may be overridden
+/// by `$ELLE_WORKERS`.
 #[allow(clippy::too_many_arguments)]
 fn run_pass<F, V>(
     name: &str,
     ccfg: ClusterCfg,
     default_target_ops: u64,
+    default_workers: u64,
     min_ok_pct: u64,
     fault_period: Duration,
     mut nemesis_tick: F,
@@ -124,7 +126,7 @@ fn run_pass<F, V>(
     V: Fn(&LinClusterV2<ListAppendSm>, u32) -> bool,
 {
     let seed = env_u64("ELLE_SEED", 0x1107);
-    let n_workers = env_u64("ELLE_WORKERS", 4) as u32;
+    let n_workers = env_u64("ELLE_WORKERS", default_workers) as u32;
     let keys = env_u64("ELLE_KEYS", 8) as u32;
     let target = env_u64("ELLE_TARGET_OPS", default_target_ops);
     let budget = Duration::from_secs(env_u64("ELLE_BUDGET_SECS", 120));
@@ -200,6 +202,7 @@ fn elle_quiet() {
         "quiet",
         ClusterCfg::default(),
         50_000,
+        4,
         90,
         Duration::from_millis(100),
         |_cluster, _rng, _faults| {},
@@ -219,6 +222,7 @@ fn elle_failover() {
         "failover",
         ClusterCfg::default(),
         20_000,
+        4,
         70,
         Duration::from_secs(1),
         |cluster, rng, _faults| {
@@ -245,6 +249,7 @@ fn elle_partition() {
         "partition",
         ClusterCfg::default(),
         20_000,
+        4,
         60,
         Duration::from_millis(1200),
         |cluster, rng, _faults| {
@@ -279,6 +284,7 @@ fn elle_purge() {
         "purge",
         ccfg,
         20_000,
+        4,
         70,
         Duration::from_millis(1200),
         |cluster, rng, _faults| match rng.random_range(0..3u8) {
@@ -299,10 +305,15 @@ fn elle_purge() {
 #[ignore]
 fn elle_reconfig() {
     let ccfg = ClusterCfg { spare_node: true, ..ClusterCfg::default() };
+    // Reconfig's history size is driven by time-to-config-non-vacuity × worker
+    // throughput (not the op target); at 4 workers the ~195k-event history stalls
+    // elle-cli's strong-serializable cycle search — 1 worker keeps it within
+    // checker capacity (~44k events after earlier passes, clean verdicts).
     run_pass(
         "reconfig",
         ccfg,
         20_000,
+        1,
         70,
         Duration::from_millis(1200),
         |cluster, rng, _faults| match rng.random_range(0..4u8) {
