@@ -85,6 +85,9 @@ impl EdnRecorder {
 
     /// Stamp index + time and append the formatted line.
     pub fn record(&self, typ: EdnType, process: u64, op: &EdnOp) {
+        let time_ns = self.start.elapsed().as_nanos() as u64;
+        let mut lines = self.lines.lock().unwrap();
+        // Counter increments INSIDE the lock: an observed count guarantees the line is already pushed.
         match typ {
             EdnType::Invoke => {}
             EdnType::Ok => {
@@ -95,8 +98,6 @@ impl EdnRecorder {
                 self.completed.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let time_ns = self.start.elapsed().as_nanos() as u64;
-        let mut lines = self.lines.lock().unwrap();
         // Index is taken under the lock so line order == index order in the file.
         let index = self.index.fetch_add(1, Ordering::Relaxed);
         lines.push(edn_line(index, typ, process, time_ns, op));
@@ -172,6 +173,84 @@ mod tests {
         // Global :index stamps are the emission order.
         assert!(lines[0].starts_with("{:index 0, :type :invoke"));
         assert!(lines[3].starts_with("{:index 3, :type :info"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_stress_counter_ordering() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let r = Arc::new(EdnRecorder::new(0));
+        let num_threads = 8;
+        let records_per_thread = 200;
+        let op = EdnOp::Append { key: 1, val: 1 };
+
+        // Spawn threads, each recording a mix of Invoke and Ok.
+        let mut handles = vec![];
+        for _ in 0..num_threads {
+            let r = Arc::clone(&r);
+            let op = op.clone();
+            let handle = thread::spawn(move || {
+                for i in 0..records_per_thread {
+                    let typ = if i % 2 == 0 {
+                        EdnType::Invoke
+                    } else {
+                        EdnType::Ok
+                    };
+                    r.record(typ, 0, &op);
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Join all threads.
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // Verify counters match: total records issued and non-Invoke subset.
+        let total_records = num_threads * records_per_thread;
+        let ok_records = (records_per_thread / 2) * num_threads; // Half are Ok (i % 2 == 1).
+        assert_eq!(r.ok_count(), ok_records as u64);
+        assert_eq!(r.completed_count(), ok_records as u64);
+
+        // Write to temp file and verify line count and index ordering.
+        let dir = std::env::temp_dir().join(format!("edn-stress-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history_stress.edn");
+        r.write_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+
+        // Assert line count equals total records.
+        assert_eq!(
+            lines.len(),
+            total_records,
+            "Expected {} lines, got {}",
+            total_records,
+            lines.len()
+        );
+
+        // Parse :index from each line and verify they are exactly 0..n in order.
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(rest) = line.strip_prefix("{:index ") {
+                if let Some(idx_str) = rest.split(',').next() {
+                    let idx: u64 = idx_str.parse().expect("Failed to parse index");
+                    assert_eq!(
+                        idx, i as u64,
+                        "Line {} has index {}, expected {}",
+                        i, idx, i
+                    );
+                } else {
+                    panic!("Failed to split index from line {}: {}", i, line);
+                }
+            } else {
+                panic!("Line {} does not start with {{:index : {}", i, line);
+            }
+        }
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
