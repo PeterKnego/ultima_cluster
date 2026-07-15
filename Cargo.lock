@@ -999,6 +999,7 @@ name = "uc2_sim"
 version = "0.1.0"
 dependencies = [
  "uc2_consensus",
+ "uc2_sim",
 ]
 
 [[package]]
