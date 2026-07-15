@@ -3239,8 +3239,12 @@ mod tests {
             members.iter().map(|id| (*id, addr_to_pair(id_to_addr[id]))).collect(),
             Vec::new(),
         );
-        #[cfg_attr(not(feature = "mutation-testing"), allow(unused_mut))]
-        let mut sm = ElectionSm::new(
+        // NOTE: the test harness deliberately does NOT wire mutation knobs onto
+        // this ElectionSm. Mutations are exercised only via the production
+        // construction path (elle_v2.rs drives real nodes). Wiring them here
+        // would let a stray UC2_MUTATION silently corrupt the 16 harness-based
+        // unit tests. Production wiring lives at the `ElectionSm::new` above.
+        let sm = ElectionSm::new(
             ElectionConfig {
                 id: 1,
                 config,
@@ -3255,16 +3259,6 @@ mod tests {
             6016,
             0,
         );
-        #[cfg(feature = "mutation-testing")]
-        match crate::mutation::active() {
-            Some(crate::mutation::Mutation::CommitQuorumMinusOne) => {
-                sm.set_mutate_quorum_minus_one(true)
-            }
-            Some(crate::mutation::Mutation::SkipVoteOrderCheck) => {
-                sm.set_mutate_skip_vote_order(true)
-            }
-            _ => {}
-        }
         let boot_term = sm.current_term();
         assert_eq!(boot_term, 2);
 
