@@ -67,13 +67,7 @@ fn elle_worker(
     keys: u32,
     values: Arc<AtomicU64>,
 ) {
-    // `WorkerConn::new` stores `start` verbatim (unlike `rotate`/`reconnect_to`,
-    // which wrap `% dirs.len()`), so a worker count above the cluster size
-    // (the default ELLE_WORKERS=4 vs. this harness's fixed 3-node cluster)
-    // indexes out of bounds on first connect. Wrap here to match the harness's
-    // own rotation invariant.
-    let start = id as usize % dirs.len();
-    let mut conn = WorkerConn::new(dirs, start);
+    let mut conn = WorkerConn::new(dirs, id as usize);
     // Initial process ids 0..n_workers are pre-allocated by EdnRecorder::new.
     let mut process = id as u64;
     while !stop.load(Ordering::Relaxed) {

@@ -883,7 +883,11 @@ pub struct WorkerConn {
 
 impl WorkerConn {
     pub fn new(dirs: Arc<Vec<PathBuf>>, start: usize) -> Self {
-        Self { dirs, target: start, client: None }
+        // Wrap the start index to handle callers with more workers than cluster nodes
+        // (e.g., 4 workers on a 3-node cluster). This mirrors the invariant enforced
+        // by `reconnect_to` and `rotate`.
+        let target = start % dirs.len();
+        Self { dirs, target, client: None }
     }
     /// Ensure a client attached to `self.target`; `None` if the attach failed
     /// (node mid-restart / partitioned) — the caller rotates and retries.
