@@ -5,5 +5,6 @@
 //! (`examples/uc2-crashtest`).
 pub mod checker;
 pub mod history;
+pub mod list_append;
 pub mod model;
 pub mod register;
