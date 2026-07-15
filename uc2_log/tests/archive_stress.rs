@@ -51,7 +51,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use uc2_log::archive::{Archive, ArchiveConfig, ArchiveError, replay_journal_from};
+use uc2_log::archive::{Archive, ArchiveConfig, ArchiveError, find_block, replay_journal_from};
 use uc2_log::buffer::{AppendError, Appender, LogBuffer};
 use uc2_log::cnc::{CncMeta, CncPage};
 use uc2_log::region::Region;
@@ -67,6 +67,15 @@ const PURGE_SLACK: u64 = 4 * CAP;
 struct ArmConfig {
     truncation: bool,
     reopen: bool,
+    /// Arm D: run a "nak-server" thread that models
+    /// `sender.rs::serve_nak_from_journal` — a LOCK-FREE journal reader that
+    /// does NOT take `topo`, so the archiver's `purge_below` drops blocks out
+    /// from under its `find_block`/`journal.read(seq)` walk. Unlike the
+    /// `replay_journal_from` replayer (which holds `topo.read` to honor
+    /// `Replay::next`'s snapshot-readable contract), the production sender path
+    /// re-locates each block with `find_block` and TOLERATES a vanished one, so
+    /// this thread must never panic under the purge race. Closes t3b.
+    nak_server: bool,
 }
 
 fn budget_ms() -> u64 {
@@ -365,6 +374,78 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
             .unwrap()
     };
 
+    // ---- nak-server (arm D): LOCK-FREE, no topo, races purge --------------
+    // Faithful model of sender.rs::serve_nak_from_journal: walk blocks with
+    // find_block + journal.read(seq), tolerating a block that a concurrent
+    // purge_below drops between locate and read (break, never panic). It holds
+    // NO topology lock, so the archiver's purge genuinely races this walk —
+    // the exact production interleaving the topo.read replayer above excludes.
+    let nak_thread = if arm.nak_server {
+        let buffer = Arc::clone(&buffer);
+        let archive = Arc::clone(&archive);
+        let stop = Arc::clone(&stop);
+        Some(
+            thread::Builder::new()
+                .name("stress-nak".into())
+                .spawn(move || {
+                    let mut rng = seed ^ 0x0FF1_CE05;
+                    while !stop.load(Ordering::Relaxed) {
+                        // Snapshot the journal handle + floor WITHOUT topo (the
+                        // sender holds no topology lock). first/durable may both
+                        // move under us; that is the point.
+                        let (journal, first) = {
+                            let guard = archive.lock().unwrap();
+                            let arch = guard.as_ref().expect("archive present outside reopen");
+                            (arch.journal_arc(), arch.first_base())
+                        };
+                        let durable = buffer.counters().durable.load_acquire();
+                        if durable > first {
+                            // Bias half the picks to the FLOOR itself: `find_block`
+                            // then reads `first` right where the purger is dropping
+                            // it, maximally exposing the read-after-first_seq TOCTOU
+                            // window a purge-race panic lived in (t3b).
+                            let pos = if xorshift(&mut rng).is_multiple_of(2) {
+                                first
+                            } else {
+                                first + xorshift(&mut rng) % (durable - first)
+                            };
+                            let end = durable;
+                            // The serve_nak_from_journal loop, verbatim in shape:
+                            // re-locate each block; a vanished (purged) block just
+                            // ends the walk. NO expect/unwrap that a purge could
+                            // trip — a panic here is the repro.
+                            let mut p = pos;
+                            let mut guard_iters = 0u32;
+                            while p < end && guard_iters < 8192 {
+                                guard_iters += 1;
+                                let Some((seq, base)) =
+                                    find_block(&journal, p).ok().flatten()
+                                else {
+                                    break; // purged/below-floor: tolerated
+                                };
+                                let Ok(Some((rbase, block))) = journal.read(seq) else {
+                                    break; // block dropped between locate and read
+                                };
+                                // Append-only + front-purge never renumbers a seq,
+                                // so an existing seq's base is stable even under
+                                // the race (mirrors the production debug_assert).
+                                assert_eq!(rbase, base, "seq {seq}: read base disagrees with find_block");
+                                let block_end = base + block.len() as u64;
+                                if p >= block_end {
+                                    break; // at/beyond the durable frontier
+                                }
+                                p = block_end;
+                            }
+                        }
+                        thread::yield_now();
+                    }
+                })
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+
     // ---- reconfig (arms B/C) ---------------------------------------------
     let reconfig_thread = if arm.truncation || arm.reopen {
         let buffer = Arc::clone(&buffer);
@@ -464,6 +545,11 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
     {
         panics.push(("reconfig", p));
     }
+    if let Some(h) = nak_thread
+        && let Err(p) = h.join()
+    {
+        panics.push(("nak-server", p));
+    }
     if let Some((name, payload)) = panics.into_iter().next() {
         eprintln!("archive_stress[{arm_name}]: thread '{name}' failed (seed={seed})");
         std::panic::resume_unwind(payload);
@@ -485,7 +571,10 @@ fn run_stress(arm: ArmConfig, arm_name: &str) {
 #[test]
 #[cfg_attr(miri, ignore)] // real journal files + fsync + threads
 fn stress_append_archive_replay() {
-    run_stress(ArmConfig { truncation: false, reopen: false }, "A/append-archive-replay");
+    run_stress(
+        ArmConfig { truncation: false, reopen: false, nak_server: false },
+        "A/append-archive-replay",
+    );
 }
 
 /// Arm B: adds periodic `truncate_to(frame boundary)` + `prime` under an
@@ -494,7 +583,7 @@ fn stress_append_archive_replay() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn stress_with_truncation() {
-    run_stress(ArmConfig { truncation: true, reopen: false }, "B/truncation");
+    run_stress(ArmConfig { truncation: true, reopen: false, nak_server: false }, "B/truncation");
 }
 
 /// Arm C: periodic drop+reopen of the Archive mid-load with counter priming —
@@ -504,5 +593,160 @@ fn stress_with_truncation() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn stress_reopen() {
-    run_stress(ArmConfig { truncation: true, reopen: true }, "C/reopen");
+    run_stress(ArmConfig { truncation: true, reopen: true, nak_server: false }, "C/reopen");
+}
+
+/// Focused t3b repro (find_block purge-race): a TIGHT purge loop (floor chases
+/// durable at one-buffer slack, purging every iteration — no `since_purge`
+/// gate) while a finder hammers `find_block(&journal, floor)` LOCK-FREE. This
+/// hits the read-after-`first_seq()` TOCTOU window far more often than arm D's
+/// gated purge. On the pre-fix `find_block` (which `.expect()`s a raced read),
+/// a `first block readable` / `block readable` panic is the repro; the tolerant
+/// version returns `Ok(None)` and this runs clean. Discriminating guard for the
+/// find_block purge-tolerance fix.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn find_block_tolerates_tight_purge_race() {
+    let seed = run_seed();
+    let budget = Duration::from_millis(budget_ms());
+    println!("find_block_tolerates_tight_purge_race seed={seed} budget_ms={}", budget.as_millis());
+    // One-buffer slack: the floor stays ~CAP below durable and moves whenever
+    // durable advances (i.e. constantly under the appender's load).
+    const SMALL_SLACK: u64 = CAP;
+
+    let (buffer, _cnc) = make_buffer();
+    let dir = journal_dir();
+    let archive = Arc::new(Mutex::new(Archive::open(archive_cfg(dir.path())).unwrap()));
+    let append_gate = Arc::new(Mutex::new(()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let deadline = Instant::now() + budget;
+
+    // appender: continuous load so the journal keeps growing (purge has supply).
+    let appender_thread = {
+        let (buffer, append_gate, stop) =
+            (Arc::clone(&buffer), Arc::clone(&append_gate), Arc::clone(&stop));
+        thread::Builder::new()
+            .name("tight-appender".into())
+            .spawn(move || {
+                let mut rng = seed ^ 0xA5A5_A5A5;
+                let mut appender = Appender::new(Arc::clone(&buffer), 1);
+                let scratch = vec![0xABu8; MAX_PAYLOAD];
+                while !stop.load(Ordering::Relaxed) {
+                    let _g = append_gate.lock().unwrap();
+                    for _ in 0..16 {
+                        let payload_len = 68 + (xorshift(&mut rng) as usize % (3968 - 68));
+                        match appender.append(xorshift(&mut rng), xorshift(&mut rng), &scratch[..payload_len]) {
+                            Ok(_) => {}
+                            Err(AppendError::WouldOverrun) => break,
+                            Err(AppendError::PayloadTooLarge) => unreachable!("bounded above"),
+                        }
+                    }
+                    drop(_g);
+                    thread::yield_now();
+                }
+            })
+            .unwrap()
+    };
+
+    // archiver: record blocks (no purge here — the purger owns that).
+    let archiver_thread = {
+        let (buffer, archive, stop) = (Arc::clone(&buffer), Arc::clone(&archive), Arc::clone(&stop));
+        thread::Builder::new()
+            .name("tight-archiver".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Err(e) = archive.lock().unwrap().do_work(&buffer) {
+                        fail_repro(&stop, seed, "tight/archiver", &e);
+                    }
+                    thread::yield_now();
+                }
+            })
+            .unwrap()
+    };
+
+    // purger: TIGHT loop — purge the floor to durable-SMALL_SLACK every
+    // iteration. Holds the archive mutex only for the purge call itself.
+    let purger_thread = {
+        let (buffer, archive, stop) = (Arc::clone(&buffer), Arc::clone(&archive), Arc::clone(&stop));
+        thread::Builder::new()
+            .name("tight-purger".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let durable = buffer.counters().durable.load_acquire();
+                    if durable > SMALL_SLACK
+                        && let Err(e) = archive.lock().unwrap().purge_below(durable - SMALL_SLACK)
+                    {
+                        fail_repro(&stop, seed, "tight/purger", &e);
+                    }
+                    thread::yield_now();
+                }
+            })
+            .unwrap()
+    };
+
+    // finder: LOCK-FREE `find_block` hammering the floor, racing the purger.
+    let finder_thread = {
+        let (archive, stop) = (Arc::clone(&archive), Arc::clone(&stop));
+        thread::Builder::new()
+            .name("tight-finder".into())
+            .spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // Snapshot the (stable) journal handle + current floor under a
+                    // brief lock, then release BEFORE the lock-free find_block so
+                    // the purger genuinely races it.
+                    let (journal, first) = {
+                        let g = archive.lock().unwrap();
+                        (g.journal_arc(), g.first_base())
+                    };
+                    for _ in 0..256 {
+                        match find_block(&journal, first) {
+                            Ok(_) => {} // Some or Ok(None) (purged) both fine
+                            Err(e) => fail_repro(&stop, seed, "tight/finder", &e),
+                        }
+                    }
+                    thread::yield_now();
+                }
+            })
+            .unwrap()
+    };
+
+    while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+        thread::sleep(Duration::from_millis(20));
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    let mut panics = Vec::new();
+    for (name, h) in [
+        ("appender", appender_thread),
+        ("archiver", archiver_thread),
+        ("purger", purger_thread),
+        ("finder", finder_thread),
+    ] {
+        if let Err(p) = h.join() {
+            panics.push((name, p));
+        }
+    }
+    if let Some((name, payload)) = panics.into_iter().next() {
+        eprintln!("find_block_tolerates_tight_purge_race: thread '{name}' failed (seed={seed})");
+        std::panic::resume_unwind(payload);
+    }
+    let durable = buffer.counters().durable.load_acquire();
+    println!("find_block_tolerates_tight_purge_race seed={seed} OK — durable {durable} B");
+    assert!(durable > 0, "harness did no work");
+}
+
+/// Arm D (t3b): adds a lock-free "nak-server" thread modeling
+/// `sender.rs::serve_nak_from_journal` — `find_block` + `journal.read(seq)` per
+/// block, holding NO `topo` lock, so the archiver's `purge_below` drops blocks
+/// out from under its walk. The production sender path must TOLERATE a vanished
+/// block (break, never panic); a panic in this arm (e.g. an internal `.expect`
+/// on a read a purge just invalidated) is the repro. Closes the ledger's
+/// sender-NAK-vs-purge coverage gap.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn stress_nak_vs_purge() {
+    run_stress(
+        ArmConfig { truncation: false, reopen: false, nak_server: true },
+        "D/nak-vs-purge",
+    );
 }

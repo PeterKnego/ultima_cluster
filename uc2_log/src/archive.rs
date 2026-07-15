@@ -554,13 +554,28 @@ impl Replay<'_> {
 /// the block with the greatest base `<= pos`. Returns its `(seq, base)`, or
 /// `None` when there are no blocks or `pos` is below the first archived base
 /// (purged). Extracted verbatim from `replay_from`'s search; shared with the
-/// sender's NAK replay path (M4). Every record it reads is in `[first, last]`,
-/// so the reads are infallible except for a genuine journal I/O error.
+/// sender's NAK replay path (M4).
+///
+/// PURGE-RACE TOLERANCE (post-M7 t3b): this is called LOCK-FREE by the sender's
+/// `serve_nak_from_journal` (it holds no purge lock), so a concurrent
+/// `purge_below` can drop the segment backing `first`/`mid`/`lo` in the window
+/// between the `first_seq()`/`last_seq()` snapshot and any read below — a read
+/// of a since-purged seq then returns `Ok(None)`. Treat that as "the search
+/// target is now below the floor" (`Ok(None)`) rather than panicking on an
+/// `expect`: every lock-free caller already handles below-floor as "purged, not
+/// servable" (`serve_nak_from_journal` via `.ok().flatten()` -> break;
+/// `replay_from`/`replay_journal_from` -> `PositionPurged`/`Ok(None)`). A
+/// genuine journal I/O error still propagates via `?`. Absent a race (the
+/// boot-time single-threaded callers) no read here ever returns `None`, so the
+/// behavior is identical; only the raced case now degrades gracefully instead
+/// of crashing the sender agent. Exercised by `tests/archive_stress.rs` arm D.
 pub fn find_block(journal: &Journal, pos: u64) -> Result<Option<(u64, u64)>, ArchiveError> {
     let (Some(first), Some(last)) = (journal.first_seq(), journal.last_seq()) else {
         return Ok(None);
     };
-    let (first_meta, _) = journal.read(first)?.expect("first block readable");
+    let Some((first_meta, _)) = journal.read(first)? else {
+        return Ok(None); // `first` purged out from under us: below the floor now
+    };
     if pos < first_meta {
         return Ok(None);
     }
@@ -568,10 +583,14 @@ pub fn find_block(journal: &Journal, pos: u64) -> Result<Option<(u64, u64)>, Arc
     let (mut lo, mut hi) = (first, last);
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
-        let (meta, _) = journal.read(mid)?.expect("block readable");
+        let Some((meta, _)) = journal.read(mid)? else {
+            return Ok(None); // purged mid-search
+        };
         if meta <= pos { lo = mid } else { hi = mid - 1 }
     }
-    let (base, _) = journal.read(lo)?.expect("block readable");
+    let Some((base, _)) = journal.read(lo)? else {
+        return Ok(None); // purged mid-search
+    };
     Ok(Some((lo, base)))
 }
 
