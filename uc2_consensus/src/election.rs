@@ -849,13 +849,16 @@ impl ElectionSm {
             // log while `Role::Leader` — the exact shape this guard exists
             // to prevent, reached by a path this guard cannot see (B never
             // called `propose_config` for it). `adopt_config` has no
-            // tombstone to key off (a demote never tombstones) so no
-            // halt/step-down follows; the node keeps serving as leader but
-            // can never vote again. Safety holds, the wedge is silent.
-            // `uc2_node`'s `Action::ConfigAdopted` exec arm carries a loud
-            // node-side warning for this case; a mechanical fix (a commit-
-            // triggered self-step-down mirroring `StepDownRemoved`) is a
-            // deferred, post-merge ticket.
+            // tombstone to key off (a demote never tombstones), so the halt
+            // there does not fire. Post-M7 loose-end T1 closes that residual
+            // wedge at the COMMIT crossing instead: `rank_leader`'s demoted-
+            // but-present branch (parallel to `StepDownRemoved`) relinquishes
+            // leadership via a same-term `BecomeFollower` once the demote
+            // commits, dropping B to a live non-voting learner-follower. Safety
+            // always held (a learner casts no vote, holds no quorum slot); T1
+            // removed the silent liveness wedge that used to require operator
+            // intervention. `uc2_node`'s `Action::ConfigAdopted` exec arm logs
+            // the adoption as a notable (now transient) crash-handoff event.
             return Err(ProposeError::SelfDemote);
         }
         if let ConfigOp::PromoteLearner { id } = op {
@@ -1383,6 +1386,42 @@ impl ElectionSm {
             {
                 self.stepped_down = true;
                 out.push(Action::StepDownRemoved);
+            } else if !self.stepped_down
+                && self.config.contains(self.id)
+                && !self.config.is_voter(self.id)
+                && self.commit_seen >= self.config_position
+            {
+                // Post-M7 loose-end T1: the leader-as-learner wedge. This leader
+                // is PRESENT in its committed config but NOT a voter — it adopted
+                // its OWN demote from the log. A DIFFERENT leader legally proposed
+                // `DemoteVoter{self}` (id != that leader's self, so
+                // `propose_config`'s `SelfDemote` guard never saw it), replicated
+                // the CONFIG frame here, and crashed before it committed; we then
+                // won the election and re-observed the frame from our own archive
+                // scan while `Role::Leader`. A demote leaves no tombstone, so the
+                // `StepDownRemoved` branch above never fires. Before this branch
+                // existed we led-as-a-learner forever (safe — a learner casts no
+                // vote and holds no quorum slot — but a silent liveness wedge that
+                // an operator had to notice and manually `remove-learner`).
+                //
+                // Same commit-triggered timing and Ongaro rationale as
+                // self-removal (defer the relinquish until C_new certifies the
+                // change — C_new must be replicated by a leader that still
+                // exists). Unlike removal we do NOT fail-stop: the node stays a
+                // live, data-holding, non-voting learner-follower. Relinquish via
+                // `BecomeFollower` at the SAME term (`leader: None`) — the node's
+                // handler tears down leadership (drops the appender, clears the
+                // leader flag) WITHOUT closing the reconcile gate (that only fires
+                // on a strictly-newer term). `rebuild_membership` already set
+                // `can_vote = false` at adoption, so as a follower this node
+                // re-arms its election timer but never becomes a candidate; the
+                // surviving C_new voters elect among themselves. Latched by the
+                // shared `stepped_down` (mutually exclusive with the removal
+                // branch: removed => !contains, demoted => contains && !voter).
+                self.stepped_down = true;
+                self.role = Role::Follower;
+                self.serving = false;
+                out.push(Action::BecomeFollower { term: self.current_term, leader: None });
             }
         }
     }
@@ -2700,6 +2739,76 @@ mod tests {
             !acts.iter().any(|a| matches!(a, Action::StepDownRemoved)),
             "must not re-emit after the first crossing"
         );
+    }
+
+    /// Post-M7 loose-end T1: the leader-as-learner wedge. A leader that adopts
+    /// its OWN demote from the log — a DIFFERENT leader proposed
+    /// `DemoteVoter{B}` (legal, id != that leader's self), replicated the CONFIG
+    /// frame to B, and crashed before it committed; B then won the election and
+    /// re-observed the frame from its own archive scan while `Role::Leader`
+    /// (`propose_config`'s `SelfDemote` guard cannot see this path) — must
+    /// RELINQUISH leadership once that demote COMMITS, mirroring the self-removal
+    /// `StepDownRemoved` crossing. Unlike removal it steps down to a live,
+    /// non-voting learner-follower (a demote leaves no tombstone, so the node
+    /// stays in the cluster and keeps its data), via `BecomeFollower{leader:
+    /// None}`. Before this fix the tombstone-keyed step-down never fired and B
+    /// led-as-a-learner forever (safe — a learner casts no vote — but a silent
+    /// liveness wedge). Discriminating: reverting the `rank_leader` demote branch
+    /// leaves the node `Role::Leader` after the crossing and emits no
+    /// `BecomeFollower`, failing both the count and the role assertion.
+    #[test]
+    fn leader_self_demote_steps_down_to_follower_once_commit_crosses() {
+        let mut s = sm(0); // voters [0,1,2], id 0
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
+        step(&mut s, Event::NewTermAppended { position: 32 });
+        step(&mut s, Event::DurableAdvanced { durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        assert!(s.can_serve());
+
+        // Adopt our OWN demote from the log. NOT via `propose_config` (it
+        // refuses `SelfDemote`) — this is the archive-rescan adoption path the
+        // guard can't see. `apply` is id-blind, so it produces the demoted
+        // config directly. In [0,1,2], demoting 0 leaves voters [1,2], learner 0.
+        let demoted = s.config().apply(ConfigOp::DemoteVoter { id: 0 }).unwrap();
+        assert!(demoted.is_learner(0) && !demoted.is_voter(0));
+        assert!(!demoted.tombstones.contains(&0), "a demote leaves no tombstone");
+        let acts = step(&mut s, Event::ConfigObserved { position: 64, config: demoted });
+        assert!(acts.iter().any(|a| matches!(a, Action::ConfigAdopted { .. })));
+        // Leader carve-out: no halt, no step-down at adoption — the leader must
+        // keep appending until C_new certifies the demote. Role stays Leader,
+        // but it can no longer vote (rebuild_membership set can_vote = false).
+        assert!(!acts.iter().any(|a| matches!(a, Action::HaltRemoved | Action::StepDownRemoved)));
+        assert!(!acts.iter().any(|a| matches!(a, Action::BecomeFollower { .. })));
+        assert!(matches!(s.role(), Role::Leader), "still leading through the adoption window");
+
+        // Below config_position (64): still leading.
+        step(&mut s, Event::DurableAdvanced { durable: 50 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 50 });
+        assert!(!acts.iter().any(|a| matches!(a, Action::BecomeFollower { .. })));
+        assert!(matches!(s.role(), Role::Leader), "still leading pre-crossing");
+
+        // Commit crosses config_position (64): the demote is now certified by
+        // C_new ({1,2}); relinquish leadership to a non-voting follower.
+        step(&mut s, Event::DurableAdvanced { durable: 100 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100 });
+        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 100 })));
+        assert_eq!(
+            acts.iter()
+                .filter(|a| matches!(a, Action::BecomeFollower { term: 1, leader: None }))
+                .count(),
+            1,
+            "must relinquish leadership exactly once when the self-demote commits"
+        );
+        // NOT removed: a demote keeps the node in the cluster (no fail-stop).
+        assert!(!acts.iter().any(|a| matches!(a, Action::HaltRemoved | Action::StepDownRemoved)));
+        assert!(matches!(s.role(), Role::Follower), "now a non-voting learner-follower");
+
+        // Idempotent: further reports never re-emit the step-down (also, a
+        // follower's Report path never re-enters rank_leader).
+        step(&mut s, Event::DurableAdvanced { durable: 200 });
+        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 200 });
+        assert!(!acts.iter().any(|a| matches!(a, Action::BecomeFollower { .. })));
     }
 
     /// T8 review finding: a self-removing LEADER preempted by a HIGHER TERM
