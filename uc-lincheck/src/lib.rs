@@ -4,6 +4,7 @@
 //! capstone (`uc2_node` tests) and the multi-process hard-crash test
 //! (`examples/uc2-crashtest`).
 pub mod checker;
+pub mod edn;
 pub mod history;
 pub mod list_append;
 pub mod model;
