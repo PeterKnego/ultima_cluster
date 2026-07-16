@@ -133,11 +133,15 @@ pub fn reconcile(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) ->
     // Keeping such a phantom is unsafe: once genuine data streams past its
     // base, the next reconcile's own-side clamp would spuriously truncate
     // genuine (possibly committed) bytes at the phantom's base.
-    let new_map: Vec<(u32, u64)> = own[..k]
-        .iter()
-        .chain(own[k..].iter().filter(|(_, base)| *base < valid_up_to))
-        .copied()
-        .collect();
+    // (Loop form rather than an iterator chain: verifiability-friendly for the
+    // Lean/Aeneas pipeline — see docs/superpowers/specs/2026-07-16-uc2-lean-proofs-design.md §6.)
+    let mut new_map: Vec<(u32, u64)> = Vec::with_capacity(own.len());
+    new_map.extend_from_slice(&own[..k]);
+    for &(term, base) in &own[k..] {
+        if base < valid_up_to {
+            new_map.push((term, base));
+        }
+    }
 
     Reconcile::Ok(Outcome { valid_up_to, new_map })
 }
