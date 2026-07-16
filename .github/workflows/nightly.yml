@@ -95,3 +95,33 @@ jobs:
           java-version: '21'
       - name: Elle clean tier (5 passes, both consistency models)
         run: scripts/elle_check.sh
+
+  # Lean proofs gate (Phase 1): builds the sorry-free Uc2Model/Uc2Proofs
+  # kernels (commit tracker, reconcile, vote-freshness), then cross-checks
+  # the model against real Rust output via a 100k-vector conformance replay
+  # (uc2_consensus's conform_gen -> `lake exe conform`). See
+  # docs/benchmarks/uc2-lean-gate-2026-07-16.md and docs/ops/uc2-runbook.md
+  # §9 for the "changing a proved kernel" procedure.
+  lean-proofs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install elan
+        run: |
+          curl https://elan.lean-lang.org/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Fetch mathlib cache
+        working-directory: proofs
+        run: lake exe cache get
+      - name: Build proofs (sorry-free)
+        working-directory: proofs
+        run: |
+          lake build
+          ! grep -rn --include='*.lean' -w 'sorry' Uc2Model Uc2Proofs Conform
+      - uses: Swatinem/rust-cache@v2
+      - name: Conformance replay (100k vectors)
+        run: |
+          cargo run -p uc2_consensus --release --example conform_gen -- \
+            --out /tmp/vectors.jsonl --count 100000 --seed "$(date +%Y%m%d)"
+          cd proofs && lake exe conform /tmp/vectors.jsonl

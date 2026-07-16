@@ -446,3 +446,23 @@ NOT caught means the harness lost its teeth. Fix that by raising the dose
 (`ELLE_MIN_FAULTS`, `ELLE_HOLD_MS`, worker count) — never by weakening the
 catch. The clean-tier passes are never run mutated, so a clean-build
 `elle_check.sh` cannot carry the feature.
+
+---
+
+## §9 Changing a proved kernel (commit.rs / reconcile.rs / log_ok)
+
+The Lean model (`proofs/Uc2Model/`) mirrors these 1:1 and the nightly
+`lean-proofs` job replays 100k conformance vectors. When you change kernel
+behavior:
+
+1. Update the matching `Uc2Model` definition (doc comments name the Rust
+   source of each).
+2. Rebuild proofs: `cd proofs && lake build` — repair any broken theorems.
+   A theorem that can no longer be proved is a SIGNAL: the change may have
+   broken a safety property. Do not delete/weaken a theorem to make the
+   build green without review.
+3. Re-run the conformance rig locally (disk, never /tmp):
+   `cargo run -p uc2_consensus --release --example conform_gen -- --out $HOME/.cache/uc2-conform/vectors.jsonl --count 100000 --seed 1`
+   then `cd proofs && lake exe conform $HOME/.cache/uc2-conform/vectors.jsonl`.
+4. (If Phase 1.5 landed) regenerate the Aeneas translation and repair
+   `proofs/Aeneas/Equiv.lean`; refresh `proofs/Aeneas/SOURCES.sha256`.
