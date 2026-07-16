@@ -156,22 +156,41 @@ impl BroadcastConsumer {
                 return Ok(None);
             }
 
-            // Check for fall-behind: producer has lapped us by >= capacity.
-            if (producer_pos - self.head) as usize > capacity {
-                // Reset to current publish position so subsequent reads
-                // resume from "now."
+            // Fast-path fall-behind: the producer is already a full capacity (or
+            // more) ahead, so the slot at `head` is being — or has been —
+            // overwritten. Reset to "now" and signal the slow consumer.
+            if (producer_pos - self.head) as usize >= capacity {
                 self.head = producer_pos;
                 return Err(RingError::Overwritten);
             }
 
             let slot_offset = (self.head as usize) & (capacity - 1);
+            let head_before = self.head;
             // SAFETY: head < producer_pos and head is within `capacity` of
             // producer_pos, so the slot is within the active region.
-            // `publish_position` advances only after record bytes are
-            // committed, so no torn-read on wrap.
+            //
+            // Broadcast has NO backpressure (unlike SPSC/MPSC, whose
+            // `consumer_position` stops the producer): the single producer can
+            // LAP us during the copy below, overwriting the very slot we are
+            // reading. The pre-read check above is only a snapshot, so the result
+            // of this read is NOT trustworthy until we re-check the producer
+            // position. A torn read otherwise escapes as a hard `BadCrc`.
             let read =
-                unsafe { try_read_record_at(self.inner.slot_region(), slot_offset, payload_buf) }?;
-            let Some((rec, total_size)) = read else {
+                unsafe { try_read_record_at(self.inner.slot_region(), slot_offset, payload_buf) };
+            // Re-validate AFTER the copy (seqlock-style read barrier): the Acquire
+            // fence keeps the payload copy from being reordered past this load on
+            // weak memory models. If the producer advanced a full capacity beyond
+            // the record we read, that record was (or was being) overwritten
+            // mid-read — discard whatever we read/errored and surface the defined
+            // slow-consumer signal. Only a genuine (non-overwrite) decode error
+            // reaches the caller.
+            std::sync::atomic::fence(Ordering::Acquire);
+            let producer_pos2 = header.publish_position.load(Ordering::Acquire);
+            if (producer_pos2 - head_before) as usize >= capacity {
+                self.head = producer_pos2;
+                return Err(RingError::Overwritten);
+            }
+            let Some((rec, total_size)) = read? else {
                 return Ok(None);
             };
 
@@ -444,5 +463,52 @@ mod tests {
         // At least *some* records observed; we don't pin the exact count
         // because Overwritten resets are timing-dependent.
         assert!(a_seen > 0 && b_seen > 0, "a={a_seen} b={b_seen}");
+    }
+
+    /// Aggressive torn-read reproduction: a TINY ring, an unthrottled producer,
+    /// and a deliberately slow reader guarantee the producer laps the consumer
+    /// mid-read on nearly every wrap. A torn read must surface as `Overwritten`
+    /// (the defined slow-consumer signal) — NEVER as a hard `BadCrc`/`Corrupt`.
+    /// Without the post-read overwrite re-check this panics with "crc mismatch".
+    #[test]
+    fn overwrite_during_read_never_tears() {
+        let tmp = NamedTempFile::new().unwrap();
+        // 256 B ring, ~24 B records => a lap every ~10 records: constant races.
+        let ring = BroadcastRing::create(tmp.path(), 256, 64).expect("create");
+        let mut producer = ring.producer();
+        let mut sub = ring.subscribe();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_w = stop.clone();
+        let writer = std::thread::spawn(move || {
+            let mut i = 0u32;
+            while !stop_w.load(std::sync::atomic::Ordering::Relaxed) {
+                producer.write(1, 0, [0; 8], &i.to_le_bytes()).expect("write");
+                i = i.wrapping_add(1);
+            }
+        });
+
+        let mut buf = Vec::new();
+        let mut reads = 0usize;
+        let mut overwrites = 0usize;
+        // Slow reader: many iterations, each doing a little work between reads so
+        // the unthrottled producer laps it constantly.
+        for _ in 0..200_000 {
+            match sub.try_read(&mut buf) {
+                Ok(Some(_)) => {
+                    assert_eq!(buf.len(), 4, "torn payload leaked as a valid record");
+                    reads += 1;
+                }
+                Ok(None) => std::thread::yield_now(),
+                Err(RingError::Overwritten) => overwrites += 1,
+                Err(e) => panic!("torn read leaked as a hard error: {e}"),
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        // The point of the test is the overwrite path actually fired (races
+        // happened) and NO hard error escaped.
+        assert!(overwrites > 0, "test did not exercise the overwrite race");
+        let _ = reads;
     }
 }
