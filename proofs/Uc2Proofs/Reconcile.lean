@@ -341,6 +341,22 @@ theorem reconcile_preserves_shared_prefix (own : TermMap) (d : Nat)
       simp only [Nat.min_def]
       split_ifs <;> omega
 
+/-- **R3a.** Our first beyond-prefix entry (conflict or overhang) is always
+cut: `validUpTo` never exceeds its base. The `leader ≠ []` hypothesis
+excludes the empty-leader early return (Rust: "a leader with no map tells us
+nothing — clean as-is"), where no clamp applies by design; discovered via
+countermodel during proving (see gate doc). -/
+theorem reconcile_cuts_own_conflict (own : TermMap) (d : Nat)
+    (leader : TermMap) (o : Outcome)
+    (hne : leader ≠ [])
+    (h : reconcile own d leader = .ok o) :
+    ∀ e ∈ own[commonPrefixLen own leader]?, o.validUpTo ≤ e.2 := by
+  cases leader with
+  | nil => exact absurd rfl hne
+  | cons l0 ls =>
+    intro e he
+    exact (reconcileClamped_ok (reconcile_ok_clamped h)).2.1 e he
+
 /-- **R3b.** A leader term certified below our durable that our data-stamped
 map lacks is proven divergence — always cut. -/
 theorem reconcile_cuts_leader_uncovered (own : TermMap) (d : Nat)
