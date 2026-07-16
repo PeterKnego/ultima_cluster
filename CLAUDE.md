@@ -58,6 +58,8 @@ cargo run -p uc2_node --release --example m7_gate -- all --secs 6             # 
 cargo run -p uc2_node --example uc2ctl -- status --instance-dir D --app-id A  # M7 admin CLI: add/promote/demote/remove/status
 scripts/elle_check.sh                            # elle consistency tier: 5 list-append passes, both models (needs java+jq)
 scripts/elle_mutation.sh                         # elle mutation testing: control clean + 3 injected consensus bugs caught
+(cd proofs && lake exe cache get && lake build)   # Lean proofs: model + theorems + conform checker (needs elan)
+cargo run -p uc2_consensus --release --example conform_gen -- --out $HOME/.cache/uc2-conform/vectors.jsonl --count 100000 --seed 1 && (cd proofs && lake exe conform $HOME/.cache/uc2-conform/vectors.jsonl)  # model<->Rust conformance
 ```
 
 The elle scripts write histories to `$HOME/.cache/uc2-elle*` (disk) — never

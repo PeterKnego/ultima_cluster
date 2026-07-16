@@ -1,0 +1,18 @@
+name = "uc2-proofs"
+version = "0.1.0"
+defaultTargets = ["Uc2Model", "Uc2Proofs", "conform"]
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4"
+rev = "v4.32.0"
+
+[[lean_lib]]
+name = "Uc2Model"
+
+[[lean_lib]]
+name = "Uc2Proofs"
+
+[[lean_exe]]
+name = "conform"
+root = "Conform.Main"

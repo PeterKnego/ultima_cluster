@@ -336,6 +336,18 @@ pub struct ElectionSm {
     mutate_skip_vote_order: bool,
 }
 
+/// Lexicographic vote-freshness order (free-function form for the Lean
+/// conformance rig and Aeneas translation — spec 2026-07-16 lean-proofs §6):
+/// grant iff `(cand_last_term, cand_last_durable) >= (our_term, our_durable)`.
+pub fn log_ok_order(
+    our_term: u32,
+    our_durable: u64,
+    cand_last_term: u32,
+    cand_last_durable: u64,
+) -> bool {
+    (cand_last_term, cand_last_durable) >= (our_term, our_durable)
+}
+
 impl ElectionSm {
     /// `recovered_vote`/`recovered_term_map` come from NodeState;
     /// `durable` from archive recovery. current_term starts at
@@ -1197,7 +1209,7 @@ impl ElectionSm {
             return true;
         }
         let our_term = self.term_map.last().map(|(t, _)| *t).unwrap_or(0);
-        (last_term, last_durable) >= (our_term, self.durable)
+        log_ok_order(our_term, self.durable, last_term, last_durable)
     }
 
     /// Dense CommitTracker slot for a member id (members minus self, in order).
