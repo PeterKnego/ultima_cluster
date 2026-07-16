@@ -49,7 +49,13 @@ fn env_f64(name: &str, default: f64) -> f64 {
 }
 
 fn elle_dir() -> PathBuf {
-    PathBuf::from(std::env::var("ELLE_DIR").unwrap_or_else(|_| "/tmp/uc2-elle".into()))
+    // Default to DISK, never /tmp: /tmp is RAM-backed tmpfs with no swap on this
+    // box and a 50k-event history OOM-kills the run (see CLAUDE.md). The
+    // elle_check.sh / elle_mutation.sh wrappers set ELLE_DIR to $HOME/.cache too.
+    std::env::var("ELLE_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(".cache/uc2-elle")
+    })
 }
 
 /// Instance dirs on ext4 (journal segments blow the tmpfs /tmp quota).

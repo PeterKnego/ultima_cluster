@@ -15,7 +15,12 @@ FIX_RT="$ROOT/tools/elle-cli/fixtures/realtime_violation.edn"
 ELLE_DIR="${ELLE_DIR:-$HOME/.cache/uc2-elle}"
 # Pinned by the Task-3 probe (see tools/elle-cli/README.md).
 STRICT_MODEL="${ELLE_STRICT_MODEL:-strong-serializable}"
-# Set by elle_mutation.sh so mutated driver runs build with the fault feature.
+# Bound elle-cli's JVM heap so a pathological history fails loudly, not via the
+# OOM killer (see CLAUDE.md — this box has no swap).
+JAVA_XMX="${ELLE_JAVA_XMX:-2g}"
+# Escape hatch for manually generating a MUTATED clean-tier history (e.g.
+# ELLE_CARGO_FEATURES=--features\ mutation-testing). The mutation PROOF lives in
+# scripts/elle_mutation.sh; this stays empty for the normal clean tier.
 CARGO_FEATURES="${ELLE_CARGO_FEATURES:-}"
 
 PASSES=("$@")
@@ -32,7 +37,7 @@ fi
 # verdict <model> <history>: echoes true|false|unknown (exit code untrusted).
 verdict() {
     local out v
-    out="$("$JAVA" -jar "$JAR" --model list-append --consistency-models "$1" "$2")" || true
+    out="$("$JAVA" "-Xmx$JAVA_XMX" -jar "$JAR" --model list-append --consistency-models "$1" "$2")" || true
     v="$(printf '%s\n' "$out" | awk 'END { print $NF }')"
     case "$v" in
         true|false|unknown) printf '%s\n' "$v" ;;
@@ -43,7 +48,7 @@ verdict() {
 # classify <model> <history>: echoes "<valid?>|<sorted,joined anomaly-types>".
 classify() {
     local out
-    out="$("$JAVA" -jar "$JAR" --model list-append --consistency-models "$1" --verbose "$2")" || true
+    out="$("$JAVA" "-Xmx$JAVA_XMX" -jar "$JAR" --model list-append --consistency-models "$1" --verbose "$2")" || true
     printf '%s' "$out" \
         | jq -r '((.["valid?"])|tostring) + "|" + (((.["anomaly-types"]) // []) | sort | join(","))' 2>/dev/null \
         || { echo "error: elle-cli produced no JSON report for $2" >&2; exit 1; }

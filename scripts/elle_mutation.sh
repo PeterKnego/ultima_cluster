@@ -68,6 +68,9 @@ valid_under() {
     local out
     out="$("$JAVA" "-Xmx$JAVA_XMX" -jar "$JAR" --model list-append \
         --consistency-models "$1" --verbose "$2" 2>/dev/null)" || true
+    # jq on EMPTY stdin exits 0 with no output, so guard it — else an elle-cli
+    # crash would silently yield "" instead of the intended "missing".
+    [ -n "$out" ] || { echo missing; return; }
     printf '%s' "$out" | jq -r '(.["valid?"])|tostring' 2>/dev/null || echo missing
 }
 
@@ -94,14 +97,14 @@ echo "== TOOTH 1/3: commit-quorum-minus-one — elle verdict must flip to INVALI
 ec="$(gen cq elle_mut_commit_quorum commit-quorum-minus-one ELLE_TARGET_OPS=4000 ELLE_MIN_FAULTS=4 ELLE_WORKERS=4)"
 h="$(hist cq elle_mut_commit_quorum)"
 vs="$(valid_under serializable "$h")"; vst="$(valid_under "$STRICT_MODEL" "$h")"
-[ "$vst" = false ] || fail "commit-quorum NOT caught (strict valid?=$vst) — raise dose, never weaken"
+[ "$vst" = false ] || fail "commit-quorum NOT caught (strict valid?=$vst; if 'missing' the driver crashed — see $MUT_DIR/cq.log) — raise dose, never weaken"
 echo "OK: commit-quorum CAUGHT (serializable valid?=$vs, strict valid?=$vst)"
 
 echo "== TOOTH 2/3: skip-read-barrier — STRICT-ONLY real-time anomaly =="
 ec="$(gen rb elle_mut_read_barrier skip-read-barrier ELLE_MIN_FAULTS=6)"
 h="$(hist rb elle_mut_read_barrier)"
 vs="$(valid_under serializable "$h")"; vst="$(valid_under "$STRICT_MODEL" "$h")"
-[ "$vst" = false ] || fail "read-barrier NOT caught under strict model (valid?=$vst) — raise dose"
+[ "$vst" = false ] || fail "read-barrier NOT caught under strict model (valid?=$vst; if 'missing' the driver crashed — see $MUT_DIR/rb.log) — raise dose"
 # The whole point of this tooth: invisible to plain serializability.
 [ "$vs" = true ] || echo "  note: expected serializable-clean (valid?=true) but got '$vs' — a stale read is a pure real-time anomaly; strict caught it regardless"
 echo "OK: read-barrier CAUGHT under strict model only (serializable valid?=$vs, strict valid?=$vst)"

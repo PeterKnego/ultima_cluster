@@ -1968,7 +1968,6 @@ impl Consensus {
                     } else {
                         ReadPhase::AwaitQuorum
                     };
-                    let need_probe = phase == ReadPhase::AwaitQuorum;
                     #[cfg_attr(not(feature = "mutation-testing"), allow(unused_mut))]
                     let mut read = PendingRead {
                         client_id,
@@ -1992,6 +1991,9 @@ impl Consensus {
                     ) {
                         read.phase = ReadPhase::AwaitApplied;
                     }
+                    // Computed AFTER the mutation override so a barrier-skipped read
+                    // does not also emit a probe whose ACKs match no awaiting read.
+                    let need_probe = read.phase == ReadPhase::AwaitQuorum;
                     self.pending_reads.push(read);
                     if need_probe {
                         self.send_read_probe(nonce);

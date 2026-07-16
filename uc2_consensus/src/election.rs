@@ -459,10 +459,13 @@ impl ElectionSm {
     /// wiring order (construct -> set) works.
     #[cfg(feature = "mutation-testing")]
     pub fn set_mutate_quorum_minus_one(&mut self, on: bool) {
-        self.mutate_quorum_minus_one = on;
-        if on {
+        // Idempotent: only degrade the tracker on the 0->1 edge, else a repeated
+        // call would shrink the quorum again (force_quorum_minus_one is not a
+        // fixpoint). Called once from the node ctor today; this makes it foolproof.
+        if on && !self.mutate_quorum_minus_one {
             self.tracker.force_quorum_minus_one();
         }
+        self.mutate_quorum_minus_one = on;
     }
 
     /// Mutation tooth: grant votes ignoring the (last_term, last_durable) order.
