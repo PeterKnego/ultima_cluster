@@ -558,10 +558,12 @@ fn elle_mut_read_barrier() {
     let mut faults = 0u32;
     let start = Instant::now();
     while faults < min_faults {
-        let l = cluster.await_single_serving(20); // healed: exactly one leader
-        let stale = cluster.client(l); // pin DIRECTLY to the soon-isolated leader
+        // `partition_leader` re-derives the current leader itself and returns the
+        // index it isolated — use that directly (no redundant lookup, no TOCTOU
+        // against a separate `await_single_serving`).
+        let l = cluster.partition_leader(); // isolate the leader; its state is now frozen
+        let stale = cluster.client(l); // pin DIRECTLY to the isolated leader (local shmem)
         let mut maj = WorkerConn::new(Arc::clone(&dirs), (l + 1) % 3); // a majority node
-        let _ = cluster.partition_leader(); // isolate l (its state is now frozen)
         std::thread::sleep(settle); // majority elects a new leader
         for key in 0..keys {
             // 1. advance `key` on the MAJORITY (submit reroutes to the new leader).
