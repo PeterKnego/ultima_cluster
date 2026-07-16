@@ -1011,6 +1011,40 @@ impl ElectionSm {
         // first clean `gossip_floor_ns` after opening the term.
         self.last_gossip_ns = self.last_tick_ns;
         // Open the term in the term map (base = our durable = the collapse point).
+        //
+        // Same-base phantom prune (Lean gate Finding #3): first pop trailing
+        // entries whose base == our durable — zero-byte phantoms from a prior
+        // life that opened a term here, persisted the map, then crashed before
+        // any byte of that term fsynced. Left in place, we would gossip
+        // `[.., (t, D), (t+1, D)]` while a caught-up follower's data-stamped map
+        // can only ever hold `[.., (t+1, D)]` (no t-bytes exist anywhere; gossip
+        // never grows maps) — its reconcile then clamps at D and truncates,
+        // refills the identical bytes, and repeats on every gossip. Safety:
+        // - termAt-invariance: a pruned `(t', D)` is immediately shadowed by the
+        //   pushed `(t, D)` — `term_at` (uc2_sim invariants, the content-identity
+        //   oracle) returns the LAST entry with base <= pos, so removal changes
+        //   term_at at NO position; content identity is untouched.
+        // - No committed data affected: base == our durable means we hold ZERO
+        //   durable t'-bytes, and commit is bounded by the leader's own durable
+        //   (CommitTracker `advance` clamps with `.min(own_durable)`; Lean C2),
+        //   so nothing at/above D was ever committed under t'. A follower holding
+        //   UNcommitted t'-bytes above D is correctly truncated by its own-side
+        //   clamp with or without the prune.
+        // - Vote credentials: last_term momentarily drops, but the push below is
+        //   in the same synchronous step (no yield; single-writer consensus
+        //   agent) and pushes a strictly higher term — no observable window.
+        // The node persists `sm.term_map()` wholesale on `BecomeLeader` (before
+        // the NewTerm append), so the prune lands in the same persisted map as
+        // the push.
+        // NOTE: this is the ONLY site that creates a `base == durable` entry, so
+        // pruning here suffices — but that uniqueness silently leans on the
+        // node's `awaiting_reconcile` intake gate (reconcile-before-data on
+        // new-term adoption), which keeps a follower-side `DataTermObserved`
+        // from ever pushing onto a still-phantom-bearing map. Weakening that
+        // gate would re-open a second creation path this prune does not cover.
+        while self.term_map.last().is_some_and(|&(_, base)| base == self.durable) {
+            self.term_map.pop();
+        }
         self.term_map.push((self.current_term, self.durable));
         // Fresh follower slots: stale-term reports must not certify the new term.
         self.tracker.reset_reports();
@@ -2154,6 +2188,114 @@ mod tests {
         assert!(acts.iter().any(
             |a| matches!(a, Action::ShipTermMap { entries } if entries == &vec![(1, 0)])
         ));
+    }
+
+    /// Lean gate Finding #3 (shadowed term-map phantom): a leader that opened
+    /// term t at durable D, crashed AFTER the term-map persist but BEFORE any
+    /// term-t byte landed (its NewTerm frame never fsynced), recovers with the
+    /// zero-byte phantom `(t, D)` still in its map. When it re-wins as t+1 at
+    /// the same durable D, `become_leader` must PRUNE the same-base phantom
+    /// before pushing `(t+1, D)` — otherwise it gossips `[.., (t, D), (t+1, D)]`
+    /// and every caught-up follower (data-stamped `[.., (t+1, D)]`, durable > D)
+    /// hits a truncate/refill loop on each subsequent gossip.
+    #[test]
+    fn crash_rewin_prunes_same_base_phantom_at_become_leader() {
+        // Life 1: node 0 at durable 4096 (term-1 data) wins term 2.
+        let mut s = ElectionSm::new(cfg(0), None, &[(1, 0)], 4096, 0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 2, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+        assert_eq!(s.term_map(), &[(1, 0), (2, 4096)]);
+        // CRASH: the map `[(1,0),(2,4096)]` was persisted (BecomeLeader step (1))
+        // but the NewTerm frame never fsynced — durable is still 4096, so
+        // `(2, 4096)` is a zero-byte phantom. Recovery rebuilds the SM from the
+        // persisted map + vote, durable unchanged.
+        let mut s = ElectionSm::new(cfg(0), Some((2, 0)), &[(1, 0), (2, 4096)], 4096, 0);
+        // Life 2: re-win as term 3 at the same durable.
+        step(&mut s, Event::Tick { now_ns: 301 });
+        let acts = step(&mut s, Event::Vote { from: 1, term: 3, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+        // The phantom (2, 4096) is shadowed by (3, 4096) at every position
+        // (term_at returns the LAST entry with base <= pos) — it must be gone.
+        assert_eq!(
+            s.term_map(),
+            &[(1, 0), (3, 4096)],
+            "become_leader must prune the same-base zero-byte phantom (2, 4096)"
+        );
+        // And the pruned map is what ships to followers.
+        assert!(acts.iter().any(
+            |a| matches!(a, Action::ShipTermMap { entries } if entries == &vec![(1, 0), (3, 4096)])
+        ));
+    }
+
+    /// Two crash-rewins at the same durable D stack TWO phantoms; the next
+    /// become_leader at D must collapse the whole same-base chain to the single
+    /// new entry.
+    #[test]
+    fn crash_rewin_collapses_multi_phantom_chain() {
+        // Recovered from two successive crashed leaderships at durable 4096.
+        let mut s =
+            ElectionSm::new(cfg(0), Some((3, 0)), &[(1, 0), (2, 4096), (3, 4096)], 4096, 0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 4, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+        assert_eq!(
+            s.term_map(),
+            &[(1, 0), (4, 4096)],
+            "the whole same-base phantom chain must collapse to the new entry"
+        );
+    }
+
+    /// Normal-path regression: when durable ADVANCED past the last entry's base
+    /// (real bytes landed under that term), become_leader must NOT prune — the
+    /// predecessor entry genuinely stamps data and stays.
+    #[test]
+    fn become_leader_keeps_predecessor_when_durable_advanced() {
+        // Term-2 bytes landed: durable 8000 > base 4096. Re-win as term 3.
+        let mut s = ElectionSm::new(cfg(0), Some((2, 0)), &[(1, 0), (2, 4096)], 8000, 0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 3, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+        assert_eq!(
+            s.term_map(),
+            &[(1, 0), (2, 4096), (3, 8000)],
+            "an entry with real bytes (base < durable) must survive become_leader"
+        );
+    }
+
+    /// The actual Finding #3 bug shape at the reconcile kernel: a caught-up
+    /// follower (data-stamped `[(1,0),(3,4096)]`, durable 6000 — it streamed
+    /// term-3 bytes past 4096; it can NEVER hold `(2,4096)`, since zero term-2
+    /// bytes exist anywhere and gossip never grows maps) against the re-won
+    /// leader's map.
+    ///
+    /// PRE-FIX the leader shipped `[(1,0),(2,4096),(3,4096)]`: the common
+    /// prefix stops at k=1, the follower's own `(3,4096)` clamps valid_up_to to
+    /// 4096 < durable 6000 → TRUNCATE at 4096, refill of the identical term-3
+    /// bytes, then the next gossip truncated again — the loop. (Asserted below
+    /// as documentation of the hazard the prune removes.)
+    ///
+    /// POST-FIX the leader ships the pruned `[(1,0),(3,4096)]` and the same
+    /// follower reconciles CLEAN: valid_up_to == durable, no truncation, map
+    /// unchanged.
+    #[test]
+    fn pruned_leader_map_reconciles_clean_on_caught_up_follower() {
+        let follower = [(1, 0), (3, 4096)];
+        // Pre-fix leader map (phantom retained): spurious truncate at 4096.
+        match reconcile(&follower, 6000, &[(1, 0), (2, 4096), (3, 4096)]) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 4096, "the phantom forces a truncate — the bug");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        // Post-fix leader map (phantom pruned at become_leader): clean.
+        match reconcile(&follower, 6000, &[(1, 0), (3, 4096)]) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 6000, "caught-up follower must reconcile clean");
+                assert_eq!(o.new_map, follower.to_vec(), "no truncation, map unchanged");
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
     }
 
     /// Data-stamped recording (F3): a follower's own term map grows ONLY when it
