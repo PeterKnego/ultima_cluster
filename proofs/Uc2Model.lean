@@ -3,3 +3,4 @@ import Uc2Model.TermMap
 import Uc2Model.ByteHistory
 import Uc2Model.Commit
 import Uc2Model.Reconcile
+import Uc2Model.Vote
