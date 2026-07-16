@@ -1937,7 +1937,20 @@ impl Consensus {
                         continue;
                     }
                     // Linearizable: only a serving leader can confirm a read.
-                    if !self.sm.can_serve() {
+                    // Mutation tooth (`skip-read-barrier`): as an intentional bug,
+                    // answer linearizable reads from LOCAL applied state with NO
+                    // leadership check — an isolated/deposed leader then serves
+                    // STALE reads (a real-time-only anomaly the strict model
+                    // catches; see scripts/elle_mutation.sh). Reads only: writes
+                    // stay gated by the real `can_serve` at the ingress drain.
+                    let can_serve = self.sm.can_serve();
+                    #[cfg(feature = "mutation-testing")]
+                    let can_serve = can_serve
+                        || matches!(
+                            crate::mutation::active(),
+                            Some(crate::mutation::Mutation::SkipReadBarrier)
+                        );
+                    if !can_serve {
                         self.send_not_leader(client_id, local_seq);
                         continue;
                     }
@@ -2004,6 +2017,15 @@ impl Consensus {
         }
         let now = self.now_ns();
         let can_serve = self.sm.can_serve();
+        // `skip-read-barrier` tooth: keep resolving reads from local applied
+        // state even after leadership is lost, so an isolated leader answers
+        // stale reads instead of RETRY-ing (matches the admission bypass above).
+        #[cfg(feature = "mutation-testing")]
+        let can_serve = can_serve
+            || matches!(
+                crate::mutation::active(),
+                Some(crate::mutation::Mutation::SkipReadBarrier)
+            );
         let mut did = false;
         let mut i = 0;
         while i < self.pending_reads.len() {

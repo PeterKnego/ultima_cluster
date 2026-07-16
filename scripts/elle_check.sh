@@ -10,7 +10,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 JAR="$ROOT/tools/elle-cli/elle-cli-0.1.9-standalone.jar"
 FIX_CYCLE="$ROOT/tools/elle-cli/fixtures/known_bad.edn"
 FIX_RT="$ROOT/tools/elle-cli/fixtures/realtime_violation.edn"
-ELLE_DIR="${ELLE_DIR:-/tmp/uc2-elle}"
+# Histories go to DISK, never /tmp: /tmp is RAM-backed tmpfs with no swap on this
+# box, and the clean-tier histories (quiet ~50k events) OOM-kill the run there.
+ELLE_DIR="${ELLE_DIR:-$HOME/.cache/uc2-elle}"
 # Pinned by the Task-3 probe (see tools/elle-cli/README.md).
 STRICT_MODEL="${ELLE_STRICT_MODEL:-strong-serializable}"
 # Set by elle_mutation.sh so mutated driver runs build with the fault feature.
