@@ -297,4 +297,63 @@ theorem noCommonPrefix_iff (own : TermMap) (d : Nat) (leader : TermMap) :
     simp only [reconcile]
     exact if_pos ⟨hk, hlt o0 os rfl⟩
 
+/-! ### R2 / R3 -/
+
+/-- **R2.** Positions under the common certified prefix always survive: any
+`p < d` below BOTH maps' first beyond-prefix boundary is below
+`validUpTo`. "Committed bytes at a healed follower survive reconcile",
+local form. -/
+theorem reconcile_preserves_shared_prefix (own : TermMap) (d : Nat)
+    (leader : TermMap) (o : Outcome) (p : Nat)
+    (h : reconcile own d leader = .ok o)
+    (hp : p < d)
+    (hown : ∀ e ∈ own[commonPrefixLen own leader]?, p < e.2)
+    (hldr : ∀ e ∈ leader[commonPrefixLen own leader]?, p < e.2) :
+    p < o.validUpTo := by
+  cases leader with
+  | nil =>
+    simp only [reconcile] at h
+    cases h
+    exact hp
+  | cons l0 ls =>
+    have hc := reconcile_ok_clamped h
+    obtain ⟨v, m⟩ := o
+    dsimp only [Outcome.validUpTo]
+    rcases ho : own[commonPrefixLen own (l0 :: ls)]? with _ | e <;>
+      rcases hl : (l0 :: ls)[commonPrefixLen own (l0 :: ls)]? with _ | f <;>
+      simp only [reconcile.reconcileClamped, ho, hl, ReconcileResult.ok.injEq,
+        Outcome.mk.injEq] at hc <;>
+      obtain ⟨hv, hm⟩ := hc <;>
+      subst hv
+    -- own[k]? = none, leader[k]? = none
+    · exact hp
+    -- own[k]? = none, leader[k]? = some f
+    · have hf := hldr f hl
+      simp only [Nat.min_def]
+      split_ifs <;> omega
+    -- own[k]? = some e, leader[k]? = none
+    · have he := hown e ho
+      simp only [Nat.min_def]
+      split_ifs <;> omega
+    -- own[k]? = some e, leader[k]? = some f
+    · have he := hown e ho
+      have hf := hldr f hl
+      simp only [Nat.min_def]
+      split_ifs <;> omega
+
+/-- **R3b.** A leader term certified below our durable that our data-stamped
+map lacks is proven divergence — always cut. -/
+theorem reconcile_cuts_leader_uncovered (own : TermMap) (d : Nat)
+    (leader : TermMap) (o : Outcome)
+    (h : reconcile own d leader = .ok o) :
+    ∀ e ∈ leader[commonPrefixLen own leader]?, e.2 < d → o.validUpTo ≤ e.2 := by
+  cases leader with
+  | nil =>
+    simp only [reconcile] at h
+    cases h
+    simp
+  | cons l0 ls =>
+    intro e he _
+    exact (reconcileClamped_ok (reconcile_ok_clamped h)).2.2.1 e he
+
 end Uc2
