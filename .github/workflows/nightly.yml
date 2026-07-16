@@ -124,5 +124,5 @@ jobs:
       - name: Conformance replay (100k vectors)
         run: |
           cargo run -p uc2_consensus --release --example conform_gen -- \
-            --out /tmp/vectors.jsonl --count 100000 --seed "$(date +%Y%m%d)"
-          cd proofs && lake exe conform /tmp/vectors.jsonl
+            --out "$HOME/.cache/uc2-conform/vectors.jsonl" --count 100000 --seed "$(date +%Y%m%d)"
+          cd proofs && lake exe conform "$HOME/.cache/uc2-conform/vectors.jsonl"

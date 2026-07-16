@@ -74,6 +74,12 @@ section
 #guard (let t := (((new 2 3).onDurable 0 400).onDurable 1 700).advance 1000 |>.1
         let t := (t.onDurable 0 5000).onDurable 1 5000
         (t.advance 1000).2) == some 1000
+#guard (let t := (((new 2 3).onDurable 0 400).onDurable 1 700).advance 1000 |>.1
+        let t := ((t.onDurable 0 5000).onDurable 1 5000).advance 1000 |>.1
+        (t.advance 1000).2) == none -- no re-advance without movement
+#guard (let t := (((new 2 3).onDurable 0 400).onDurable 1 700).advance 1000 |>.1
+        let t := ((t.onDurable 0 5000).onDurable 1 5000).advance 1000 |>.1
+        ((t.advance 1000).1.advance 4000).2) == some 4000 -- own durable catches up
 -- reports_are_monotonic_per_follower_and_commit_never_regresses
 #guard (let t := ((new 2 3).onDurable 0 800).onDurable 1 900
         let (t, r1) := t.advance 1000

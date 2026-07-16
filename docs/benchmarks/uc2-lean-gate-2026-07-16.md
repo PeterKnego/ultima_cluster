@@ -79,6 +79,25 @@ with `--seed "$(date +%Y%m%d)"`, rotating coverage while staying reproducible
 from the run log; local reruns use `$HOME/.cache/uc2-conform/` (never `/tmp` —
 see the box rule in `CLAUDE.md`).
 
+**Honest note on spec §5's "plus every hand-written edge vector from the Rust
+unit tests" clause.** That coverage is not carried by the JSONL replay above —
+the replay only carries the seeded-random distribution, and a hand-written
+edge case has no guarantee of being sampled. It is instead discharged
+separately, at build time, as `#guard` pins inside `Uc2Model`: every
+`reconcile.rs` unit test (all 10) and every `commit.rs` unit test are each
+ported to an executable `#guard` assertion next to the corresponding model
+definition, checked on every `lake build` rather than via replay. As of this
+fix, `commit.rs` is fully pinned — the two trailing assertions of
+`three_node_commit_is_second_highest_bounded_by_own` (repeat `advance` at an
+already-reached commit returns `none`; own durable catching up past it still
+returns `some`) were previously unpinned and are now covered
+(`proofs/Uc2Model/Commit.lean`). The only exclusions are the 2
+`#[should_panic]` constructor tests (`leader_must_be_a_member`,
+`too_few_tracked_followers_is_rejected`) — the model takes those constructor
+preconditions as hypotheses rather than encoding a panic — and the
+`mutation-testing`-feature test (`forced_quorum_minus_one_commits_without_any_report`),
+which exercises an injected-bug knob outside the default build.
+
 ## Findings
 
 The value ledger. Two forced strengthenings of the informal contract, one
@@ -161,7 +180,7 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
 
 **Gated, not started.** Requires explicit user go-ahead per the plan and per
 Finding #3 above. Scope (per spec `docs/superpowers/specs/2026-07-16-uc2-lean-proofs-design.md`
-§7 when it lands): Aeneas translation of the Rust kernels into Lean and an
+§6 when it lands): Aeneas translation of the Rust kernels into Lean and an
 equivalence proof (`proofs/Aeneas/Equiv.lean` + `proofs/Aeneas/SOURCES.sha256`)
 against `Uc2Model`, closing the gap between "the model is proved safe" and
 "the model matches the Rust" beyond conformance testing's sampling guarantee.
