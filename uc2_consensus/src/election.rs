@@ -1036,6 +1036,12 @@ impl ElectionSm {
         // The node persists `sm.term_map()` wholesale on `BecomeLeader` (before
         // the NewTerm append), so the prune lands in the same persisted map as
         // the push.
+        // NOTE: this is the ONLY site that creates a `base == durable` entry, so
+        // pruning here suffices — but that uniqueness silently leans on the
+        // node's `awaiting_reconcile` intake gate (reconcile-before-data on
+        // new-term adoption), which keeps a follower-side `DataTermObserved`
+        // from ever pushing onto a still-phantom-bearing map. Weakening that
+        // gate would re-open a second creation path this prune does not cover.
         while self.term_map.last().is_some_and(|&(_, base)| base == self.durable) {
             self.term_map.pop();
         }

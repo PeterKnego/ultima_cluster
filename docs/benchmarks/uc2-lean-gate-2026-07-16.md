@@ -184,11 +184,22 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    `rederive_term_map` was deliberately **not** added: a frontier entry with
    base == durable is legitimate follower state (reconcile's own docs call
    out the shared zero-byte frontier entry), and only the `become_leader`
-   shadowing site ever *creates* the hazardous `(t, D), (t+1, D)` pair. Note
-   for Finding #2's `DataStamped` contract: the prune now actively maintains
-   the `own_stamped`/`leader_stamped` no-shadowed-phantom property at its one
+   shadowing site ever *creates* the hazardous `(t, D), (t+1, D)` pair — a
+   uniqueness that leans on the node's `awaiting_reconcile` intake gate
+   (reconcile-before-data on new-term adoption), which blocks the would-be
+   second creation path (a follower-side `DataTermObserved` pushing onto a
+   still-phantom-bearing map); weakening that gate would re-open it (noted
+   at the prune site in `election.rs`). Note for Finding #2's `DataStamped`
+   contract: the prune now actively maintains the
+   `own_stamped`/`leader_stamped` no-shadowed-phantom property at its one
    creation site, so the R4 hypothesis is enforced by construction rather
-   than merely assumed.
+   than merely assumed. Known residual (adversarial review, Minor):
+   `start_election`'s vote credentials still read the phantom-bearing map
+   pre-prune, so a phantom can inflate `last_term` in `RequestVote` — safe
+   by quorum intersection (the phantom term was legitimately won, so commit
+   cannot have advanced past its base under any older term), and the prune
+   only ever makes credentials *more* conservative; left for Tier B to
+   formalize.
 
 ### Restatements (recorded for completeness, not spec gaps)
 
