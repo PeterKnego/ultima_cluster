@@ -56,7 +56,14 @@ cargo run -p uc2_node --release --example m5_gate # throughput gate harness (see
 cargo run -p uc2_node --release --example m6_gate -- all --secs 6 --cycles 5   # snapshots/learners/purge gate
 cargo run -p uc2_node --release --example m7_gate -- all --secs 6             # live reconfig gate (replace/resize/self-removal)
 cargo run -p uc2_node --example uc2ctl -- status --instance-dir D --app-id A  # M7 admin CLI: add/promote/demote/remove/status
+scripts/elle_check.sh                            # elle consistency tier: 5 list-append passes, both models (needs java+jq)
+scripts/elle_mutation.sh                         # elle mutation testing: control clean + 3 injected consensus bugs caught
 ```
+
+The elle scripts write histories to `$HOME/.cache/uc2-elle*` (disk) — never
+override `ELLE_DIR`/`ELLE_MUT_DIR` to `/tmp` (RAM tmpfs, no swap → OOM; see
+"Local box" below). Nightly CI runs the clean tier (`elle` job); the weekly
+`elle-weekly.yml` runs the mutation tier.
 
 Cross-host fleet gates run via `bench-infra/` (terraform + ansible provisioning,
 `bench-infra/scripts/m6_fleet_gate.py` as the orchestrator — pass `--m7` for

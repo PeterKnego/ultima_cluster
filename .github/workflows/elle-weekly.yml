@@ -1,0 +1,45 @@
+name: elle-weekly
+
+# The elle MUTATION tier — the teeth. Separate from the nightly clean tier
+# because it is slow (dedicated adversary passes + a retried timing-race tooth)
+# and only needs to prove, occasionally, that the harness + UC's safety layers
+# still catch injected consensus bugs. `scripts/elle_mutation.sh` runs a control
+# (feature-on, UC2_MUTATION unset -> every pass clean) then three teeth, each
+# with the oracle matching how UC catches it:
+#   * commit-quorum-minus-one -> elle verdict INVALID (serializable + strict)
+#   * skip-read-barrier       -> elle verdict INVALID under the STRICT model ONLY
+#   * skip-vote-order-check   -> the driver run HARD-FAILS (a timing race, retried)
+# A red run means a tooth stopped biting (the harness lost coverage) OR a real
+# regression let a mutation through — reproduce locally before touching anything.
+
+on:
+  schedule:
+    - cron: '17 4 * * 0' # Sundays 04:17 UTC (offset from nightly's 03:17)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  elle-mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ELLE_MUTATION_BUDGET_SECS: 300
+      # More retries on CI than the local default (3): the vote-order tooth is a
+      # timing race, and a hosted 4-vCPU runner should not flake a real catch.
+      ELLE_VOTE_ORDER_TRIES: 5
+      # Bound elle-cli's heap so a pathological history fails loudly, not via OOM.
+      ELLE_JAVA_XMX: 3g
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Elle mutation suite (control clean + 3 teeth caught)
+        run: scripts/elle_mutation.sh

@@ -398,3 +398,51 @@ all --secs N`) run the milestone scenarios and **exit 1 on an honest FAIL** — 
 zero exit is the pass signal, so they compose in CI. They guard `/tmp` (RAM
 tmpfs with a quota) and want journals on a real disk; pass an explicit
 `journal_root` on the ext4 volume for a fleet run.
+
+---
+
+## 8. Reading an elle failure
+
+Two scripts adjudicate transactional safety with the vendored elle-cli 0.1.9
+(list-append workload). Both write histories to **disk** (`$HOME/.cache/uc2-elle*`),
+never `/tmp` — `/tmp` is RAM-backed tmpfs with no swap on the dev box and large
+histories OOM-kill the run. They need `java` + `jq`.
+
+### `scripts/elle_check.sh` — the clean tier (nightly `elle` job)
+
+Five passes (quiet, failover, partition, purge, reconfig). A FAIL means elle
+found a dependency cycle or an aborted/stale read that linearizability forbids —
+a real consistency bug, not flake. The history is the reproducible artifact
+(`$ELLE_DIR/<pass>/history.edn`, seed in the `seed` sidecar). Re-run elle-cli by
+hand for per-anomaly explanations + SVG cycle plots:
+
+    java -Xmx3g -jar tools/elle-cli/elle-cli-0.1.9-standalone.jar \
+        --model list-append --consistency-models strong-serializable \
+        --verbose --directory out/ "$HOME/.cache/uc2-elle/failover/history.edn"
+
+- An `unknown` verdict is a cycle-search timeout, never a pass — shrink
+  `ELLE_TARGET_OPS` (or raise the checker heap) and re-run.
+- A `serializable`-clean but `strong-serializable`-dirty history is a real-time
+  (stale-read) violation — suspect the READ_PROBE barrier / leader-change path.
+
+### `scripts/elle_mutation.sh` — the mutation tier / teeth (weekly)
+
+Proves the harness + UC's safety layers catch three injected consensus bugs
+(feature `mutation-testing`, off in every default build). It first runs a
+CONTROL (feature compiled in, `UC2_MUTATION` unset) that must be fully clean —
+the feature is inert — then three teeth, each with a **different oracle** because
+UC catches each a different way (defense in depth, not a shortcut):
+
+| Mutation | Oracle | What broke |
+| --- | --- | --- |
+| `commit-quorum-minus-one` | elle verdict INVALID (serializable **and** strict) | degraded commit quorum → isolated-leader split-brain → divergent committed histories |
+| `skip-read-barrier` | elle verdict INVALID under the **strict model only** (valid under plain serializable) | a deposed leader answers a stale read → a pure real-time anomaly |
+| `skip-vote-order-check` | the driver run **hard-fails** (exit ≠ 0) | a stale leader wins and truncates committed entries → UC's truncation-below-commit defense panics / reconvergence breaks |
+
+The vote-order tooth is a timing race, so the script retries it up to
+`ELLE_VOTE_ORDER_TRIES` (default 3) — caught iff *any* attempt hard-fails; a
+clean control passes every attempt. **The assertions invert:** a mutation that is
+NOT caught means the harness lost its teeth. Fix that by raising the dose
+(`ELLE_MIN_FAULTS`, `ELLE_HOLD_MS`, worker count) — never by weakening the
+catch. The clean-tier passes are never run mutated, so a clean-build
+`elle_check.sh` cannot carry the feature.
