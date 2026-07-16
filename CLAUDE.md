@@ -102,6 +102,26 @@ Workspace crates:
 - `ultima_journal` — segmented append journal + `StableValue`. In-tree workspace
   member (moved in from `ultima_db`; full history preserved).
 
+## Local box: do NOT write heavy artifacts to `/tmp`
+
+**`/tmp` on this box is `tmpfs` — RAM-backed — and there is NO swap.** Anything
+written under `/tmp` (including the agent scratchpad at `/tmp/claude-*/`) consumes
+resident RAM. Large test outputs there (multi-tens-of-thousands-of-event elle
+histories, journal segments, load-test dumps) race the busy-spin node clusters
+and `cargo` release builds for a ~15 GiB pool, and the kernel then `SIGKILL`s the
+biggest process (exit 137/143) — which manifests as tests dying mid-run or the
+Claude Code harness itself getting torn down ("previous process exited"). This
+recurs; avoid it structurally:
+
+- **Write test/scratch artifacts to real disk** (`/dev/sda1`, mounted at `/`, ~66
+  GiB free), NOT `/tmp`. For the elle harness, set `ELLE_DIR` under `/home/claude`
+  (e.g. `/home/claude/elle-out`), never the default `/tmp/uc2-elle`.
+- Test **instance dirs / journals already go to ext4** via
+  `env!("CARGO_TARGET_TMPDIR")` (the `tempdir()` helper in the test suites) — keep
+  it that way; do not `tempdir()` under `/tmp`.
+- Keep generated histories small (cap op targets), bound `elle-cli`'s JVM heap
+  (`-Xmx`), and `rm -rf` scratch between runs to reclaim RAM.
+
 ## Architecture overview
 
 UC is a State Machine Replication application server. Three process roles;
