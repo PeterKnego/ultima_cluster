@@ -220,12 +220,34 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
 
 ## Phase 1.5 status
 
-**Gated, not started.** Requires explicit user go-ahead per the plan and per
-Finding #3 above. Scope (per spec `docs/superpowers/specs/2026-07-16-uc2-lean-proofs-design.md`
-§6 when it lands): Aeneas translation of the Rust kernels into Lean and an
-equivalence proof (`proofs/Aeneas/Equiv.lean` + `proofs/Aeneas/SOURCES.sha256`)
-against `Uc2Model`, closing the gap between "the model is proved safe" and
-"the model matches the Rust" beyond conformance testing's sampling guarantee.
+**Attempted 2026-07-16 (user go-ahead), EXITED at a toolchain-version wall —
+fallback to conformance-only linkage per the spec §6 exit clause.** Outcome
+of the time-boxed attempt (full record: the T15 task report):
+
+- **The hard half is proven feasible.** Charon processed `uc2_consensus`
+  cleanly (`--start-from crate::reconcile::reconcile`; the 3.2k-line
+  `election.rs` was no obstacle) and produced LLBC for `reconcile` — the
+  translation path the spec worried about (iterator chains, crate size)
+  works, validating the T2 verifiability refactors.
+- **The block is version timing, not capability.** Aeneas HEAD's Lean
+  support library (`AeneasMeta`, a hard dependency of `import Aeneas`) pins
+  Lean v4.31.0 and fails to build under this repo's pinned v4.32.0 with two
+  independent Lean-core API breaks (a missing
+  `BVDecide.Frontend.Normalize.Enums` module and a `Simp` tactic-framework
+  type mismatch) — confirmed by an actual `lake build`, not just
+  toolchain-file diffing. No v4.32.x-compatible aeneas tag existed at
+  attempt time. Downgrading the repo's Lean pin to chase a research tool was
+  rejected (it would put the 14 proved theorems at risk to serve their
+  linkage upgrade).
+- **Retry condition:** aeneas bumps `backends/lean/lean-toolchain` to
+  ≥ v4.32.0 (watch https://github.com/AeneasVerif/aeneas). The full
+  toolchain (opam switch, charon binary, aeneas checkout) is left installed
+  under `/home/claude/{aeneas,charon,local-deps}` for a cheap resume; the
+  T15 report records exact tool commits, commands, and a solved
+  `require`-ordering fix for the mathlib version diamond the retry will hit.
+- **Standing linkage** until then: the conformance rig (170k vectors, three
+  seeds, zero divergence) + the build-time `#guard` pins. No
+  `proofs/Aeneas/` artifacts were vendored (tree kept clean on exit).
 
 ## Phase 2 spike
 
@@ -234,5 +256,9 @@ Not started. Pointer: spec `docs/superpowers/specs/2026-07-16-uc2-lean-proofs-de
 
 ---
 
-Phase 1 is complete as of this doc. **Per the Task 14 brief: STOP for user
-review before Phase 1.5** — it is gated on the disposition of Finding #3.
+Phase 1 is complete as of this doc. Post-gate dispositions (2026-07-16, all
+user-directed): branch merged to main; Finding #3 fixed via the same-base
+prune (see its Disposition paragraph); Phase 1.5 attempted and exited at the
+aeneas/Lean-4.32 version wall (see Phase 1.5 status above). Next formal-methods
+step when desired: the Phase 2 election-safety spike (spec §7), or a Phase 1.5
+retry once aeneas supports Lean ≥ 4.32.
