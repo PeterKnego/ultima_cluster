@@ -123,7 +123,7 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    FINDING"): a crashed ex-leader that re-wins an election ships its own
    shadowed phantom pair `(t, D), (t+1, D)` in its term map. Nothing prunes it:
    `become_leader` pushes the new term entry unconditionally
-   (`uc2_node/src/election.rs:1014`), leaders never reconcile their own map
+   (`uc2_consensus/src/election.rs:1014`), leaders never reconcile their own map
    (reconciliation is a follower-side operation), and recovery's
    **`rederive_term_map`** (`uc2_node/src/node.rs:3020-3045`) is append-only —
    it does not detect or drop an equal-base shadowed entry either (the

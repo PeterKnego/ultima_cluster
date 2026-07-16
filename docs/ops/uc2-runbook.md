@@ -449,7 +449,7 @@ catch. The clean-tier passes are never run mutated, so a clean-build
 
 ---
 
-## §9 Changing a proved kernel (commit.rs / reconcile.rs / log_ok)
+## 9. Changing a proved kernel (commit.rs / reconcile.rs / log_ok)
 
 The Lean model (`proofs/Uc2Model/`) mirrors these 1:1 and the nightly
 `lean-proofs` job replays 100k conformance vectors. When you change kernel

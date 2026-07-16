@@ -118,6 +118,7 @@ jobs:
         working-directory: proofs
         run: |
           lake build
+          test -d Uc2Model && test -d Uc2Proofs && test -d Conform
           ! grep -rn --include='*.lean' -w 'sorry' Uc2Model Uc2Proofs Conform
       - uses: Swatinem/rust-cache@v2
       - name: Conformance replay (100k vectors)
