@@ -125,6 +125,19 @@ a general property of Tier B proofs — the remainder is explicitly the set of
 theorems where that luck is least likely to repeat, because they're the ones
 that need real log content.
 
+**Estimate reliability, stated plainly.** Spec §9's own effort table priced
+*this spike* — "N-node model + election safety" — at "~1–2 weeks of
+sessions." Measured actual: ~45 minutes. That is a **~100×+ overestimate**
+against the single most directly comparable prior available (a same-author,
+same-domain estimate for this exact pair of theorems, made before either
+line of Lean existed). Read plainly, this cuts both ways and neither should
+be discounted: estimates in this domain are demonstrably unreliable, and on
+the one data point measured so far the unreliability ran entirely in the
+cheap direction — but only because the model was purpose-built for the
+theorem being priced (the same caveat as above). §3's estimates for (a)–(c)
+should be read with that ~100× miss in mind as a live possibility in *either*
+direction, not just as a floor.
+
 ## 3. Pricing the remainder (spec §7)
 
 Spec §7 lists three remaining Tier B theorems, each strictly building on the
@@ -226,9 +239,9 @@ open under Finding #3's disposition:
 
 **Basis for the estimate.** This is a genuine composition of two large
 invariants (per-node non-truncation + election-above-commit) across N nodes
-under a real network — the brief's own framing that invariant count grows
-"quadratically-ish with state coupling" applies most directly here: each new
-piece of correlated state (term map × commit × votedFor × the gate ordering)
+under a real network. Invariant count tends to grow quadratically-ish with
+state coupling, and that pattern applies most directly here: each new piece
+of correlated state (term map × commit × votedFor × the gate ordering)
 multiplies the case analysis in every preservation lemma, the opposite of
 S2's "7 of 8 cases are frame checks" luck.
 
@@ -256,16 +269,21 @@ itemize (a) as an explicit prerequisite**. If anything this memo's estimate,
 now that (a) is priced separately, suggests that placeholder was optimistic
 rather than pessimistic.
 
-**Be honest about the ratio the brief asked for**: (a)–(c) combined is
-plausibly **10–30× the spike's *task count and invariant-discovery
-exposure***, not 10–30× its 45 minutes of wall-clock. S1/S2's near-zero cost
-came from a model purpose-built to make the smallest Tier B theorem's
-preservation lemmas mostly frame checks (§2's caveat). None of (a)/(b)/(c)
-gets that luck — each is the same *kind* of proof as Phase 1's actual long
-pole (`Reconcile`/R4), not the spike's. Read this as **days-to-weeks of
-session time, not "another 30 minutes,"** with real variance driven by
-whether any component's informal contract turns out insufficient the way
-`DataStamped` did in Phase 1.
+As a sanity band: the controller's dispatch prompt for this memo suggested
+treating the remainder as plausibly **10–30× the spike**, as a way of
+flagging "days-to-weeks, not another 30 minutes." Our independently-derived
+12–28 S2-equivalents lands inside that band — but read it as a multiple of
+*task count and invariant-discovery exposure*, not of the spike's 45 minutes
+of wall-clock (a literal 10–30× of 45 minutes is only 7.5–22.5 hours, which
+this memo's own session-cadence math above already exceeds). S1/S2's
+near-zero cost came from a model purpose-built to make the smallest Tier B
+theorem's preservation lemmas mostly frame checks (§2's caveat). None of
+(a)/(b)/(c) gets that luck — each is the same *kind* of proof as Phase 1's
+actual long pole (`Reconcile`/R4), not the spike's. Read this as
+**days-to-weeks of session time, not "another 30 minutes,"** with real
+variance driven by whether any component's informal contract turns out
+insufficient the way `DataStamped` did in Phase 1 — and by the ~100×
+estimate miss noted in §2, which could run in either direction here too.
 
 ## 4. Recommendation: GO (phased), re-gate before (b) and (c)
 
@@ -276,12 +294,12 @@ the expensive back half of Tier B, structured the same way Phase 1.5's
 Aeneas attempt was time-boxed with a defined exit clause rather than open-
 ended.
 
-**Phased theorem order if GO: (a) → (b) → (c)**, per the brief's own
-recommendation and the dependency chain in §3 — (a) is the vocabulary
-(`term_map`/byte content/gossip messages) that (b) and (c) both consume; the
-gate doc's C5/`quorum_intersect` precedent (Phase 1's own note: "Tier B
-foundation... needed as its base lemma") is the same shape of investment,
-already amortized. There is no version of (b) or (c) that skips (a).
+**Phased theorem order if GO: (a) → (b) → (c)**, forced by the dependency
+chain in §3, not a preference — (a) is the vocabulary (`term_map`/byte
+content/gossip messages) that (b) and (c) both consume; the gate doc's
+C5/`quorum_intersect` precedent (Phase 1's own note: "Tier B foundation...
+needed as its base lemma") is the same shape of investment, already
+amortized. There is no version of (b) or (c) that skips (a).
 
 **Why phased rather than a single GO or NO-GO on the whole tail:**
 
