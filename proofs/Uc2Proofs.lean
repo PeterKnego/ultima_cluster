@@ -4,3 +4,4 @@ import Uc2Proofs.Commit
 import Uc2Proofs.Reconcile
 import Uc2Proofs.Vote
 import Uc2Proofs.Protocol
+import Uc2Proofs.ElectionSafety
