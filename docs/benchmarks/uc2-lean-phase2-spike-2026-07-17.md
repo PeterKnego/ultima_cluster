@@ -60,7 +60,15 @@ trade at the center of the spike:
   carry to the rest of Tier B (§3 below).
 - **Crash-restart** preserves `currentTerm`/`votedFor` (the `StableValue`-
   persisted vote record) and resets `role`/`votesReceived` — the model's
-  encoding of the V3 persist-before-send assumption.
+  encoding of the V3 persist-before-send assumption. Conformance caveat
+  (S1 review): "preserves `currentTerm` exactly" is not literal Rust —
+  `ElectionSm::new` recovers `max(vote.term, term-map last)`, which can
+  *regress* below a term the node had merely gossip-adopted pre-crash.
+  Harmless for this theorem: the recovered term never drops below the
+  node's last *vote* term, so the `(term, id)`-tagged `votedFor` still
+  forbids a conflicting re-grant at any granted term, and every
+  regressed-node global state is bisimulated by a model trace in which the
+  node simply never processed the higher-term traffic (message loss).
 
 **Non-vacuity** (a hard deliverable per the brief, not a nicety): named
 theorem `Uc2.nonvacuity_leader_trace : ∃ w : World 3, Reachable w ∧
