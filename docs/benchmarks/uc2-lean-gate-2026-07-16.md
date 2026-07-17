@@ -251,14 +251,25 @@ of the time-boxed attempt (full record: the T15 task report):
 
 ## Phase 2 spike
 
-Not started. Pointer: spec `docs/superpowers/specs/2026-07-16-uc2-lean-proofs-design.md`
-§7.
+**Complete 2026-07-17** (branch `uc2/lean-phase2-spike`): N-node election
+protocol model (`Uc2Proofs/Protocol.lean`, 8-constructor `Step`, sent-set
+network + havoc data plane + crash-restart, named non-vacuity leader trace)
+and **election safety proved** sorry-free over it
+(`Uc2Proofs/ElectionSafety.lean`, 5-clause invariant, axioms
+`[propext, Classical.choice, Quot.sound]`). Full result, measured proof-cost
+data, and the go/no-go pricing of the Tier B remainder (log-matching analog,
+leader completeness, state-machine safety) are in the dedicated memo:
+**`docs/benchmarks/uc2-lean-phase2-spike-2026-07-17.md`**. Recommendation:
+**GO (phased)** — log-matching analog first as a time-boxed sub-spike,
+re-gate before leader completeness / state-machine safety.
 
 ---
 
 Phase 1 is complete as of this doc. Post-gate dispositions (2026-07-16, all
 user-directed): branch merged to main; Finding #3 fixed via the same-base
 prune (see its Disposition paragraph); Phase 1.5 attempted and exited at the
-aeneas/Lean-4.32 version wall (see Phase 1.5 status above). Next formal-methods
-step when desired: the Phase 2 election-safety spike (spec §7), or a Phase 1.5
-retry once aeneas supports Lean ≥ 4.32.
+aeneas/Lean-4.32 version wall (see Phase 1.5 status above). The Phase 2
+election-safety spike (spec §7) is complete — see the Phase 2 spike section
+above and its memo. Next formal-methods step when desired: the log-matching
+sub-spike per that memo's recommendation, or a Phase 1.5 retry once aeneas
+supports Lean ≥ 4.32.
