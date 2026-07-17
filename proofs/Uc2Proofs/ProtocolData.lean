@@ -283,7 +283,10 @@ inductive Step {n : Nat} : World n → World n → Prop
   /-- Replication delivery (decision 4): accept a stamped record only at
   exactly the receiver's frontier (`uc2_log` writer rule — reordered and
   duplicated deliveries become no-ops, never corruption) and only when
-  `stamp ≤ currentTerm` (module doc, item 6 — the header-term-adopt +
+  `stamp ≤ currentTerm` (module doc, item 6 — the model's `≤` consequence of
+  two Rust guards: `uc2_net`'s receiver DROPS a DATA datagram whose header
+  term doesn't match the adopted term (adoption itself comes only from
+  consensus datagrams, never from DATA) plus the `awaiting_reconcile`
   reconcile-before-data intake gate, `node.rs` / `election.rs` ~1039 NOTE).
   Folds the `DataTermObserved` map growth (`Node.recvReplicate`). -/
   | deliverReplicate (w : World n) (j : Fin n) (pos t v : Nat)
