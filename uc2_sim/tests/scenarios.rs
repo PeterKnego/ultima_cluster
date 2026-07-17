@@ -1345,6 +1345,10 @@ fn old_term_range_must_not_commit_before_new_term_quorum() {
     // Liveness of the clamp: heal the rival inside the clamp window — the
     // T-leader's idle-floor map reconciles it (one truncation of the
     // divergent t2 frame, at exactly r_base >= its committed high-water).
+    // ORDER MATTERS: the rival must reconcile (heal) BEFORE the clamp
+    // releases and commit resumes below — inv2 is deliberately strict and
+    // would fire benignly on a commit that advances while the rival's
+    // divergent boundary is still live. Do not reorder heal after release.
     let truncs_before = w.truncations();
     w.unpartition(l, r);
     w.unpartition(a, r);
