@@ -31,7 +31,13 @@ path, built for the Tier-B election-safety proof (S2). Modeling decisions
 Fixed membership `Fin n`, all voters: `election.rs`'s non-member guards
 (lines 606, 643) and the learner `can_vote` gate (609) are vacuous here.
 Timers, commit gossip, term-map reconciliation, and truncation are not
-modeled — steps fire nondeterministically whenever enabled. -/
+modeled — steps fire nondeterministically whenever enabled.
+
+LA1 extension: one constructor, `adoptHigherTerm` (a message-free higher-term
+adoption — the `TermMapReceived` trigger of `adopt_term` the spike had no use
+for), added so the data-plane layer (`Uc2Proofs/ProtocolData.lean`) projects
+onto this model; `election_safety` is re-proved under it in
+`ElectionSafety.lean` (one near-copy of the `deliverVoteHigherTerm` case). -/
 
 namespace Uc2
 
@@ -230,6 +236,21 @@ inductive Step {n : Nat} : World n → World n → Prop
       Step w
         { nodes := Function.update w.nodes i
             { w.nodes i with lastTerm := newLastTerm, durable := newDurable }
+          sent := w.sent }
+  /-- `election.rs::adopt_term` fired by a data-plane trigger the spike left
+  unmodeled: `Event::TermMapReceived { term }` with `term > current_term`
+  adopts the higher term before reconciling (`election.rs` lines 656–663).
+  Message-free (the term-map gossip lives on the data wire, which this
+  election-slice model does not carry), so it over-approximates every
+  higher-term adoption UC performs off the vote path — term-map gossip,
+  higher-term data headers, snapshot lineage adoption. Added in LA1 as the
+  projection target for the data layer's `deliverTermMap`
+  (`Uc2Proofs/ProtocolData.lean`); safety-wise it is `deliverVoteHigherTerm`
+  without the message witness, which the invariant proof never used. -/
+  | adoptHigherTerm (w : World n) (i : Fin n) (t : Nat)
+      (hterm : (w.nodes i).currentTerm < t) :
+      Step w
+        { nodes := Function.update w.nodes i ((w.nodes i).adoptTerm t)
           sent := w.sent }
 
 /-- Reachability from boot: the reflexive-transitive closure of `Step`. -/
