@@ -11,7 +11,35 @@ A 0.3.0 node accepts a 0.2.0 peer (same major, peer minor not newer — see
 `cnc::version_compatible`, the live gate; `version::CURRENT`/`MIN_COMPATIBLE`
 are documentation-only and enforce nothing).
 
-Safety fix in this line:
+Safety fixes in this line:
+- **Commit advance was not clamped to the current term's NewTerm base — a
+  Raft §5.4.2 / Figure-8 acked-write-loss window** (Finding #6b, lean
+  leader-completeness effort; affects all prior v2 releases): the leader's
+  commit ranking (`rank_leader`) advanced/stored/gossiped off the
+  positions-only `CommitTracker` unconditionally — `new_term_pos` (the NewTerm
+  no-op frame appended at every election) gated only linearizable reads,
+  ingress admission, and M7 proposals (`serving`), never the commit store. At
+  any failover inheriting an uncommitted tail, followers reconcile clean and
+  their 20 ms AppendPosition floor reports the election base BEFORE the
+  NewTerm frame is quorum-durable, so the leader could commit (and ack, apply,
+  fire outputs for) an OLD-TERM-ONLY range; a divergent higher-lastTerm rival
+  could then still win the next term with a commit-quorum member's grant
+  (their data-stamped `last_term` had not yet reached the new term) and
+  truncate the committed bytes cluster-wide. The loss continuation needs a
+  rival's vote datagrams to beat the in-flight NewTerm byte to a voter — a
+  real race under loss/NAK repair — but the unsafe commit itself fires in the
+  normal post-reconcile path; never observed outside the directed
+  reproductions (no production deployment exists — pre-release fix). Fixed:
+  `rank_leader` now advances/stores/gossips ONLY once the ranked position
+  covers `new_term_pos` (Raft §5.4.2: never commit a prior-term range by
+  counting replicas; cost: commit stalls at most one NewTerm replication round
+  per election, which the read path already paid via `serving`). Found by the
+  Lean commit-certification model (46-step kernel-checked Figure-8
+  countermodel), reproduced RED-first and pinned by the sim
+  (`old_term_range_must_not_commit_before_new_term_quorum`, inv2 at the
+  violating advance) plus a `uc2_consensus` unit pin
+  (`commit_clamped_to_new_term_base_never_certifies_old_term_only_range`).
+  Remedy: upgrade; no back-port is planned.
 - **Boot-open intake gate could certify a phantom commit** (Finding #5, lean
   leader-completeness effort; affects all prior v2 releases): a voter that
   granted a term-T vote (persisted), held a divergent tail, and crashed before

@@ -16,13 +16,27 @@ ghost ledger on the world.
 Modeling decisions (settled at plan time, brief decisions 1–4, plus the
 designer calls documented inline):
 
-1. **Commit is an event in a world-level ghost** (decision 1):
-   `committed : List (Nat × Nat × Nat)` — (position, term-stamp, payload)
-   triples appended by `leaderAdvanceCommit` from the leader's own `hist`.
-   The ghost is a PROOF DEVICE mirrored by no Rust state (the closest analog
-   is the sequence of `Action::AdvanceCommit` values crossing positions);
-   append-only makes committed-stability trivial, and the content claims
-   (quorum held it, never truncated, later leaders have it) are theorems.
+1. **Commit is an event in a world-level ghost** (decision 1, RE-KEYED by
+   Finding #6a): `committed : List (Nat × Nat × Nat × Nat)` —
+   (position, term-stamp, COMMIT TERM, payload) tuples appended by
+   `leaderAdvanceCommit` from the leader's own `hist`, with the commit term
+   `T` = the committing leader's `currentTerm` at the advance. The original
+   stamp-only triple conflated the stamp with the commit term, and the
+   stamp-keyed LC-core was FALSE (a stamp-`t` entry can be committed at
+   `T > t` — a re-elected leader certifying its inherited prefix, Raft
+   Fig. 8's very subject — and an intermediate-term `u ∈ (t, T)` leader,
+   elected honestly on voters that had not yet received the entry, owes
+   nothing about it; the deleted `finding_stamp_keyed_lc_stale_leader` /
+   `lc_core_stamp_keyed_is_false`, 23-step kernel trace, drove exactly
+   that). Raft's Leader Completeness (§5.4.3) quantifies over leaders of
+   terms above the COMMIT term, so LC-core is re-keyed:
+   `(p, t, T, v) ∈ committed → leader i → T ≤ currentTerm i →
+   hist i p = some (t, v)` (LB2's target; see
+   `Uc2Proofs/LeaderCompleteness.lean`). The ghost is a PROOF DEVICE
+   mirrored by no Rust state (the closest analog is the sequence of
+   `Action::AdvanceCommit` values crossing positions); append-only makes
+   committed-stability trivial, and the content claims (quorum held it,
+   never truncated, later leaders have it) are theorems.
 2. **Reports are messages on their own wire** (decision 2): `CMsg.report
    (src) (term) (durable)` mirrors the AppendPosition datagram
    (`uc2_net/src/receiver.rs` 1052–1078; header carries
@@ -95,7 +109,29 @@ designer calls documented inline):
    entries; every append is still individually quorum-certified by the
    kernel `advance` that fired it. (Re-certification duplicates would be
    equally honest, just noisier for LB2.)
-9. **Omissions, documented**: (a) commit gossip / follower `commit_seen`
+9. **Finding #6b (FIXED): the §5.4.2 commit clamp.** Rust's `rank_leader`
+   used to push `Action::AdvanceCommit` UNCONDITIONALLY off the
+   positions-only `CommitTracker`: `new_term_pos` (the NewTerm no-op
+   frame's end, `election.rs` `Event::NewTermAppended`) gated only
+   reads/ingress/M7 via `serving`, never the commit store — so a leader
+   could commit an OLD-TERM-ONLY range at the election base off honest
+   post-reconcile AppendPosition floor reports that precede the NewTerm
+   frame becoming quorum-durable, and a divergent higher-lastTerm rival
+   could then win the next term with a commit-quorum member's grant and
+   truncate the committed byte cluster-wide (the deleted 46-step
+   countermodel `finding_fig8_old_term_commit_data_loss`, n = 5). The fix
+   (same commit as this amendment): `rank_leader` advances/stores/gossips
+   ONLY once `ranked ≥ new_term_pos` (`None` ⇒ no advance; a suppressed
+   advance does not update `commit_seen`). Modeled here as
+   `leaderAdvanceCommit`'s enabling `hbase`: the advance must cross the
+   leader's current-term base — the term map's last entry is
+   `(currentTerm, base)` (pushed by `becomeLeader`'s `prunePush`; the
+   model's analog of `new_term_pos = base + |NewTerm frame|`), and
+   `ranked ≥ new_term_pos > base ⟺ k > base`. Sim regression pins:
+   `uc2_sim` `old_term_range_must_not_commit_before_new_term_quorum`
+   (inv2, RED pre-fix → GREEN post-fix) and the `uc2_consensus` unit pin
+   `commit_clamped_to_new_term_base_never_certifies_old_term_only_range`.
+10. **Omissions, documented**: (a) commit gossip / follower `commit_seen`
    (decision 4 — YAGNI: leader completeness is about the leader's hist);
    (b) the Report higher-term-adoption arm (`election.rs` 549–551) — the
    data model has no bare-adoption step to project onto, and the same
@@ -180,7 +216,7 @@ structure World (n : Nat) where
   sent      : List (Uc2.Msg n)
   dsent     : List Uc2.Data.Frame
   csent     : List (CMsg n)
-  committed : List (Nat × Nat × Nat)
+  committed : List (Nat × Nat × Nat × Nat)
 
 /-- Boot: the data model's boot per node + a fresh tracker
 (`CommitTracker::new(n_members - 1, n_members)`, `election.rs` 410), zero
@@ -196,12 +232,16 @@ def World.init (n : Nat) : World n :=
     sent := [], dsent := [], csent := [], committed := [] }
 
 /-- The ghost entries a commit advance appends: every position in
-`[lo, hi)` the leader's hist defines, as `(position, term-stamp, payload)`.
-(`filterMap`: positions the leader does not hold are skipped — under the
-LA2 contiguity invariant and C2's own-durable clamp there are none.) -/
-def ghostEntries (h : Nat → Option (Nat × Nat)) (lo hi : Nat) :
-    List (Nat × Nat × Nat) :=
-  (List.range' lo (hi - lo)).filterMap fun p => (h p).map fun tv => (p, tv.1, tv.2)
+`[lo, hi)` the leader's hist defines, as
+`(position, term-stamp, commit term, payload)` — `T` is the committing
+leader's `currentTerm` at the advance (Finding #6a re-key; module doc,
+item 1). (`filterMap`: positions the leader does not hold are skipped —
+under the LA2 contiguity invariant and C2's own-durable clamp there are
+none.) -/
+def ghostEntries (h : Nat → Option (Nat × Nat)) (T lo hi : Nat) :
+    List (Nat × Nat × Nat × Nat) :=
+  (List.range' lo (hi - lo)).filterMap fun p =>
+    (h p).map fun tv => (p, tv.1, T, tv.2)
 
 /-- One cluster transition. Constructors 1–11 mirror the data model's steps
 verbatim on the `dn` slice, adding only the gate/tracker bookkeeping each
@@ -409,7 +449,7 @@ inductive Step {n : Nat} : World n → World n → Prop
   fields are the sender's actual state at emission; staleness happens in
   flight. Follower-only: a leader's report is self-dropped
   (`follower_slot(self) = None`), and a candidate's is stamped with its
-  PRE-bump term in Rust (module doc, item 9c). -/
+  PRE-bump term in Rust (module doc, item 10c). -/
   | sendReport (w : World n) (j : Fin n)
       (hrole : (w.nodes j).pn.role = .follower)
       (hgate : (w.nodes j).reconciled = true) :
@@ -425,7 +465,7 @@ inductive Step {n : Nat} : World n → World n → Prop
   `onDurable` (per-slot monotone — stale reordered deliveries never
   regress), slot-mapped by `follower_slot`. The `term < current_term` stale
   drop is a no-op (no constructor); the `term > current_term` adoption arm
-  is out of scope (module doc, item 9b). Data-plane stutter. -/
+  is out of scope (module doc, item 10b). Data-plane stutter. -/
   | deliverReport (w : World n) (i src : Fin n) (t d : Nat)
       (hmsg : CMsg.report src t d ∈ w.csent)
       (hrole : (w.nodes i).pn.role = .leader)
@@ -442,12 +482,20 @@ inductive Step {n : Nat} : World n → World n → Prop
   /-- The commit event (`election.rs::rank_leader` → `tracker.advance(own)`
   → `Action::AdvanceCommit`, stored by `node.rs`'s single commit-store
   site): the REAL kernel `advance`, fed by the folded reports and clamped
-  by the leader's own durable (C2's `min`), fires `some k`. The step stores
-  the advanced tracker, raises the watermark, and appends every
-  newly-crossed `(p, term-stamp, payload)` from the leader's OWN hist to
-  the ghost ledger (decision 1). Data-plane stutter. -/
+  by the leader's own durable (C2's `min`), fires `some k` — AND, the
+  Finding #6b §5.4.2 clamp (module doc, item 9), `k` crosses the leader's
+  current-term base: `hbase` requires the term map's last entry — pushed
+  as `(currentTerm, base)` by `becomeLeader`'s `prunePush`, the model's
+  `new_term_pos` analog — to sit strictly below `k`
+  (`ranked ≥ new_term_pos > base ⟺ k > base`; an empty map, unreachable
+  for a leader, forbids the advance exactly like Rust's
+  `new_term_pos == None`). The step stores the advanced tracker, raises
+  the watermark, and appends every newly-crossed
+  `(p, term-stamp, currentTerm, payload)` from the leader's OWN hist to
+  the ghost ledger (decision 1 / #6a re-key). Data-plane stutter. -/
   | leaderAdvanceCommit (w : World n) (i : Fin n) (k : Nat)
       (hrole : (w.nodes i).pn.role = .leader)
+      (hbase : ∃ e, (w.nodes i).dn.termMap.getLast? = some e ∧ e.2 < k)
       (hadv : ((w.nodes i).tracker.advance (w.nodes i).pn.durable).2 = some k) :
       Step w
         { nodes := Function.update w.nodes i
@@ -458,7 +506,8 @@ inductive Step {n : Nat} : World n → World n → Prop
           dsent := w.dsent
           csent := w.csent
           committed := w.committed ++
-            ghostEntries (w.nodes i).dn.hist (w.nodes i).commitIdx k }
+            ghostEntries (w.nodes i).dn.hist (w.nodes i).pn.currentTerm
+              (w.nodes i).commitIdx k }
 
 /-- Reachability from boot. -/
 def Reachable {n : Nat} (w : World n) : Prop :=
@@ -491,7 +540,7 @@ private theorem project_update {n : Nat} (nodes : Fin n → Node n) (i : Fin n)
 `Function.update` on the `dn` slice. -/
 private theorem project_mk {n : Nat} (w : World n) (i : Fin n) (c : Node n)
     (s : List (Uc2.Msg n)) (ds : List Uc2.Data.Frame) (cs : List (CMsg n))
-    (gm : List (Nat × Nat × Nat)) :
+    (gm : List (Nat × Nat × Nat × Nat)) :
     World.project
         { nodes := Function.update w.nodes i c, sent := s, dsent := ds,
           csent := cs, committed := gm }
@@ -503,7 +552,7 @@ private theorem project_mk {n : Nat} (w : World n) (i : Fin n) (c : Node n)
 identity — the commit steps' stutter witness. -/
 private theorem project_mk_self {n : Nat} (w : World n) (i : Fin n)
     (c : Node n) (hc : c.dn = (w.nodes i).dn) (cs : List (CMsg n))
-    (gm : List (Nat × Nat × Nat)) :
+    (gm : List (Nat × Nat × Nat × Nat)) :
     World.project
         { nodes := Function.update w.nodes i c, sent := w.sent,
           dsent := w.dsent, csent := cs, committed := gm }
@@ -562,13 +611,14 @@ theorem step_project {n : Nat} {w w' : World n} (h : Step w w') :
       { w.nodes i with
         tracker := (w.nodes i).tracker.onDurable (slotOf i src) d }
       rfl w.csent w.committed]
-  | leaderAdvanceCommit i k hrole hadv =>
+  | leaderAdvanceCommit i k hrole hbase hadv =>
     rw [project_mk_self w i
       { w.nodes i with
         tracker := ((w.nodes i).tracker.advance (w.nodes i).pn.durable).1
         commitIdx := max (w.nodes i).commitIdx k }
       rfl w.csent
-      (w.committed ++ ghostEntries (w.nodes i).dn.hist (w.nodes i).commitIdx k)]
+      (w.committed ++ ghostEntries (w.nodes i).dn.hist
+        (w.nodes i).pn.currentTerm (w.nodes i).commitIdx k)]
 
 /-- Boot projects to boot. -/
 theorem project_init (n : Nat) :
@@ -624,14 +674,16 @@ private theorem advance_fires {t : CommitTracker} {own : Nat}
 appends payload `42` at position 0, gossips its map so node 1 reconciles
 (gate reopens), replicates the record to node 1, node 1 REPORTS its durable
 (AppendPosition), the leader folds the report and the kernel `advance`
-fires — committing `(0, 1, 42)` into the ghost ledger — and then node 1
-(which durably holds the entry) wins the term-2 election. The final world
-satisfies every LC-core hypothesis (`(p,t,v) ∈ committed`, a leader, a
-strictly later term) AND its conclusion (`hist p = some (t, v)`).
-Exercises all three commit-plane constructors. -/
+fires — the §5.4.2 clamp (`hbase`) is satisfied (`k = 1` crosses the
+term-1 base 0) and the ghost commits `(0, 1, 1, 42)` (stamp 1, commit
+term 1) — and then node 1 (which durably holds the entry) wins the term-2
+election. The final world satisfies every re-keyed LC-core hypothesis
+(`(p, t, T, v) ∈ committed`, a leader, `T ≤ currentTerm`) AND its
+conclusion (`hist p = some (t, v)`). Exercises all three commit-plane
+constructors, including the clamped advance. -/
 theorem nonvacuity_commit_completeness_trace :
     ∃ w : World 3, Reachable w ∧
-      (0, 1, 42) ∈ w.committed ∧
+      (0, 1, 1, 42) ∈ w.committed ∧
       (w.nodes 1).pn.role = .leader ∧
       1 < (w.nodes 1).pn.currentTerm ∧
       (w.nodes 1).hist 0 = some (1, 42) := by
@@ -650,7 +702,7 @@ theorem nonvacuity_commit_completeness_trace :
       (.sendReport _ 1 (by decide) (by decide)))
       (.deliverReport _ 0 1 1 1 (by decide) (by decide) (by decide)
         (by decide)))
-      (.leaderAdvanceCommit _ 0 1 (by decide)
+      (.leaderAdvanceCommit _ 0 1 (by decide) ⟨(1, 0), by decide⟩
         (advance_fires ⟨[1, 0], 2, 0⟩ 1 1 (by decide) (by decide)
           (by simp [CommitTracker.advance, CommitTracker.ranking,
                 List.mergeSort]))))
@@ -687,9 +739,10 @@ section
 #guard slotOf (i := (1 : Fin 3)) (j := 2) == 1
 #guard slotOf (i := (2 : Fin 3)) (j := 0) == 0
 #guard slotOf (i := (2 : Fin 3)) (j := 1) == 1
--- ghost append: every held position in [lo, hi) as (pos, stamp, payload).
+-- ghost append: every held position in [lo, hi) as (pos, stamp, T, payload)
+-- — T is the committing leader's currentTerm at the advance (#6a re-key).
 #guard ghostEntries
     (fun p => if p == 0 then some (1, 7) else if p == 1 then some (3, 9) else none)
-    0 2 == [(0, 1, 7), (1, 3, 9)]
-#guard ghostEntries (fun _ => some (1, 7)) 2 2 == []
+    3 0 2 == [(0, 1, 3, 7), (1, 3, 3, 9)]
+#guard ghostEntries (fun _ => some (1, 7)) 3 2 2 == []
 end

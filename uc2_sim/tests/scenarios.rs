@@ -46,8 +46,14 @@ fn nasty_reconcile_config(seed: u64) -> SimConfig {
         // Finding #5 pin) started closing report-loss gaps — commits certify
         // sooner under loss, overtaking a laggard's un-truncated boundary
         // earlier. Probed at 500..=1000ppm over 200 seeds: guarded arm clean
-        // through 700, first benign inv2 transient (seed 22) at 800; the
-        // unguarded arm still catches its C-1 phantom at 700.
+        // through 700, first benign inv2 transient (seed 22) at 800.
+        // Finding #6b re-probe (2026-07-17, post §5.4.2 commit clamp): the
+        // clamp masks sub-NewTerm-quorum phantoms, so at 700ppm the UNGUARDED
+        // arm no longer catches (200 seeds; nor 200..800, truncate-latency
+        // 500-1000ms, drop/dup 60-80k, max_steps 80k); its genuine inv7
+        // phantom first appears at crash 1000ppm (seed 21). The red arm
+        // therefore overrides crash to 1000ppm with a phantom-class-only
+        // catch predicate; this shared config keeps the green arm's 700.
         drop_per_million: 40_000,
         dup_per_million: 40_000,
         crash_per_million: 700,
@@ -292,24 +298,48 @@ fn idle_cluster_reconciles_divergent_node_via_gossip_floor() {
 
 /// M4 C-1 reproduced mechanically: under `Mechanism{reopen_guard:false}` a
 /// duplicate term map delivered while a truncation is in flight reopens the gate
-/// early; the raw divergent durable escapes into commit ranking and the oracle
-/// (inv5 / leader completeness) must catch it on some seed.
+/// early; the raw divergent durable escapes into commit ranking and the
+/// genuine-quorum oracle (inv7 phantom) must catch it on some seed.
+///
+/// Finding #6b re-tune (2026-07-17): the §5.4.2 commit clamp
+/// (`rank_leader` advances only once `ranked >= new_term_pos`) is genuine
+/// defense-in-depth for THIS class too — an escaped divergent report can no
+/// longer certify anything below the new leader's NewTerm frame — so the
+/// C-1 phantom needs heavier churn than before: at the guarded arm's
+/// 700 ppm nothing catches in 200 seeds (nor in a 200..800 sweep, nor with
+/// truncate-latency 500-1000 ms, nor drop/dup 60-80k, nor max_steps 80k);
+/// the genuine inv7 phantom first appears at 1000 ppm (seed 21: "term-4
+/// leader certified 17472, genuine quorum-frontier 17376"). The guarded
+/// arm cannot follow to 1000 ppm because the DOCUMENTED benign strict-inv2
+/// laggard transient (fires in BOTH arms, seed 22, onset 800 ppm — see
+/// `nasty_reconcile_config`) caps its rate, so the twin runs asymmetric
+/// rates post-clamp: red arm 1000 ppm, green arm 700 ppm. To keep the red
+/// pin honest under the heavier rate, the catch predicate is SHARPENED to
+/// the inv7 phantom class — the benign both-arms inv2 transient can never
+/// satisfy it (a strictly stronger assertion; oracles untouched).
 #[test]
 fn mechanism_unguarded_reopen_is_caught_by_oracle() {
     let mut caught = false;
     for seed in 0..200 {
         let mut cfg = nasty_reconcile_config(seed); // helper: high churn, partitions, crashes
+        cfg.crash_per_million = 1_000; // red-arm rate, see the doc comment above
         cfg.data_plane = DataPlane::Mechanism { reopen_guard: false };
-        if World::new(cfg).run().is_err() {
+        if let Err(v) = World::new(cfg).run()
+            && v.invariant.contains("phantom")
+        {
             caught = true;
             break;
         }
     }
-    assert!(caught, "the unguarded reopen must violate an invariant on some seed");
+    assert!(caught, "the unguarded reopen must produce an inv7 phantom commit on some seed");
 }
 
-/// The guarded mechanism (what uc2_node actually implements) survives the same
-/// storm: 200 seeds green.
+/// The guarded mechanism (what uc2_node actually implements) survives the
+/// storm: 200 seeds green at the config's 700 ppm — the heaviest rate below
+/// the documented benign strict-inv2 laggard onset (800 ppm, fires in BOTH
+/// arms). Post-Finding-#6b the red twin above runs at 1000 ppm (the §5.4.2
+/// clamp pushed the genuine C-1 phantom past this arm's ceiling — see its
+/// doc comment); this arm deliberately stays at the shared-config rate.
 #[test]
 fn mechanism_guarded_survives_the_same_storm() {
     for seed in 0..200 {
@@ -1153,6 +1183,181 @@ fn rebooted_unreconciled_voter_must_not_certify_phantom_commit() {
     assert!(
         w.run_until(|w| w.max_commit() > commit_before).unwrap(),
         "commit must resume genuinely after reconciliation (timed out)"
+    );
+}
+
+/// Finding #6b (lean leader-completeness effort, gate doc 2026-07-16): Raft
+/// §5.4.2 / Figure 8 — a leader must NEVER commit a prior-term range by
+/// counting replicas; the commit may only advance once the current term's
+/// NewTerm frame (`new_term_pos`) is quorum-durable. Pre-fix,
+/// `election.rs::rank_leader` pushed `Action::AdvanceCommit` UNCONDITIONALLY
+/// off the positions-only `CommitTracker`: `new_term_pos` gated only
+/// reads/ingress/M7 (`serving`), never the commit store. At every failover
+/// inheriting an uncommitted tail, followers reconcile clean and their
+/// gate-open AppendPosition floor reports the election base BEFORE the
+/// NewTerm frame is quorum-durable — so the OLD-TERM-ONLY range commits
+/// (acks/apply/outputs fire below the §5.4.2 barrier), and a divergent
+/// higher-lastTerm rival can then win the next term with a commit-quorum
+/// member's grant and truncate the committed bytes cluster-wide (the loss
+/// continuation, machine-checked as the 46-step Lean countermodel
+/// `finding_fig8_old_term_commit_data_loss`, deleted with the fix).
+///
+/// DETERMINISTIC SCRIPT (5 nodes, Mechanism = the shipped gate discipline):
+/// - t1: leader L commits a genuine prefix on all five; then {L, A} are
+///   partitioned from {B, C, R'} and L keeps serving — an uncommitted
+///   term-1 tail W grows on {L, A} only.
+/// - t2: the majority-side trio elects a rival R (equal-credential grants);
+///   R is isolated the instant it wins, so its term-t2 NewTerm frame stays
+///   local: R holds the divergent higher-stamped map entry `(t2, r_base)`
+///   with `last_term = t2` while everyone else is still at `last_term 1`.
+/// - t3: W is grown far past R's frame, the cluster quiesced, C isolated,
+///   and B reconnected to {L, A}; the ensuing churn re-elects L (or A —
+///   both hold the full W tail) at a term T > t2, base = the tail end P_W.
+/// - The window: B reconciles CLEAN against the T-leader's map (its log is
+///   a pristine prefix), its intake gate reopens, and its 20 ms-analog
+///   report floor ships its rising durable at term T while it re-replicates
+///   the term-1 tail — long before the T NewTerm frame at [P_W, P_W+96) is
+///   quorum-durable. Pre-fix `rank_leader` certifies the OLD-TERM range as
+///   those reports land; the moment the commit crosses R's divergence base,
+///   the inv2 sweep flags the live rival's higher-stamped boundary sitting
+///   below the committed high-water — the §5.4.2 violation, caught by an
+///   existing oracle at the exact violating `AdvanceCommit`.
+///
+/// ORACLE NOTE (why inv2, not inv5/inv4): the loss continuation — R winning
+/// t4 off a commit-quorum member's grant (inv5: `base < global_max_commit`)
+/// and truncating the committed byte (inv4) — is structurally UNREACHABLE
+/// behind inv2 in this sim: `check_prefix_consistency` sweeps every node's
+/// persisted map after EVERY event, so the very `AdvanceCommit` that first
+/// carries gmc past the rival's divergent `(t2, r_base)` boundary reds the
+/// run before any later election or truncation event can occur. inv2 is
+/// the earliest existing oracle for this class; the t4 continuation is
+/// pinned by the Lean countermodel instead (kernel-`decide`d, n = 5).
+///
+/// This is the permanent regression pin for the rank_leader clamp: the run
+/// must stay GREEN, the commit must stay FROZEN until the NewTerm frame is
+/// quorum-durable (asserted directly), the rival must reconcile, and the
+/// commit must then advance past the whole tail + NewTerm frame.
+#[test]
+fn old_term_range_must_not_commit_before_new_term_quorum() {
+    let mut w = World::new(SimConfig {
+        n_nodes: 5,
+        seed: 3,
+        max_steps: 400_000,
+        drop_per_million: 0,
+        data_plane: DataPlane::Mechanism { reopen_guard: true },
+        ..SimConfig::default()
+    });
+    // Phase 1: elect the term-1 leader; a genuine committed prefix lands on
+    // all five voters.
+    w.run_until_leader().expect("setup: elect the term-1 leader");
+    let l = w.current_leader().unwrap();
+    w.run_steps(400).expect("setup: genuine committed prefix on all five");
+    assert!(w.max_commit() > 0, "setup: the prefix must genuinely commit");
+    let followers: Vec<usize> = (0..5).filter(|&i| i != l).collect();
+    let a = followers[0];
+    let trio = [followers[1], followers[2], followers[3]];
+
+    // Phase 2: partition {L, A} | {trio}. L keeps serving into A alone —
+    // the uncommitted term-1 tail W. The trio times out and elects the
+    // rival on equal credentials.
+    for &g in &trio {
+        w.partition(l, g);
+        w.partition(a, g);
+    }
+    assert!(
+        w.run_until(|w| trio.iter().any(|&g| w.node_is_raw_leader(g))).unwrap(),
+        "setup: the trio must elect the rival (timed out)"
+    );
+    let r = trio.iter().copied().find(|&g| w.node_is_raw_leader(g)).unwrap();
+    let t2 = w.node_term(r);
+    // The rival's divergent map entry base: its durable at the win (its
+    // NewTerm frame is appended above it and archives only later).
+    let r_base = w.node_durable(r);
+    // Isolate R the instant it wins: its term-t2 frame/map never reach the
+    // other two (partitions are consulted at delivery).
+    let (b, c) = {
+        let rest: Vec<usize> = trio.iter().copied().filter(|&g| g != r).collect();
+        (rest[0], rest[1])
+    };
+    w.partition(r, b);
+    w.partition(r, c);
+    // Grant-order guarantee: the granters' durables (and hence their last
+    // reports, and hence the stale leader's rank) never exceed the rival's
+    // election base — nothing above r_base is committed while W grows.
+    assert!(w.max_commit() <= r_base, "setup: stale commit must not pass the rival's base");
+
+    // Phase 3 prep: grow W far past the rival's frame (the drain of this
+    // tail at t3 is the deterministic §5.4.2 window), then quiesce and let
+    // {L, A} drain fully so the t3 election base is the frozen tail end.
+    assert!(
+        w.run_until(|w| w.node_append(l) >= r_base + 96 * 600).unwrap(),
+        "setup: the term-1 tail must grow past the rival's frame (timed out)"
+    );
+    w.set_quiet(true);
+    assert!(
+        w.run_until(|w| {
+            let pw = w.node_append(l);
+            w.node_durable(l) == pw && w.node_durable(a) == pw
+        })
+        .unwrap(),
+        "setup: L and A must drain the tail fully (timed out)"
+    );
+    let pw = w.node_append(l);
+    assert!(pw > r_base + 96, "setup: W must extend past the rival's divergent frame");
+
+    // Phase 3: silence C entirely (its lonely candidacies must not perturb
+    // the t3 term), reconnect B to {L, A}. B's floor reports depose the
+    // stale term-1 leader; the churn settles on L or A (the only logs that
+    // out-rank everyone) winning a term T > t2 at base P_W.
+    w.partition(b, c);
+    w.unpartition(l, b);
+    w.unpartition(a, b);
+    assert!(
+        w.run_until(|w| {
+            (w.node_is_raw_leader(l) && w.node_term(l) > t2)
+                || (w.node_is_raw_leader(a) && w.node_term(a) > t2)
+        })
+        .unwrap(),
+        "setup: L or A must re-win above the rival's term (timed out)"
+    );
+    let t3l = if w.node_is_raw_leader(l) { l } else { a };
+    assert_eq!(w.node_durable(t3l), pw, "the t3 election base is the frozen tail end");
+    let commit_frozen = w.max_commit();
+    assert!(commit_frozen <= r_base, "nothing above the rival's base is committed yet");
+
+    // THE PIN. B reconciles clean, reopens its gate, re-replicates the
+    // term-1 tail, and floor-reports its rising durable at term T. Pre-fix
+    // rank_leader commits the old-term range as those reports land — RED
+    // (inv2, at the exact AdvanceCommit that crosses r_base). Post-fix the
+    // clamp suppresses every advance until ranked >= new_term_pos, so the
+    // commit stays FROZEN through this whole window.
+    w.run_steps(1_500).expect(
+        "Finding #6b: an old-term-only range must not commit before the \
+         NewTerm frame is quorum-durable",
+    );
+    assert_eq!(
+        w.max_commit(),
+        commit_frozen,
+        "Raft 5.4.2 clamp: no commit may advance before the current term's \
+         NewTerm frame is quorum-durable"
+    );
+
+    // Liveness of the clamp: heal the rival inside the clamp window — the
+    // T-leader's idle-floor map reconciles it (one truncation of the
+    // divergent t2 frame, at exactly r_base >= its committed high-water).
+    let truncs_before = w.truncations();
+    w.unpartition(l, r);
+    w.unpartition(a, r);
+    assert!(
+        w.run_until(|w| w.truncations() > truncs_before).unwrap(),
+        "the healed rival must reconcile (truncate its divergent frame)"
+    );
+    // Once the NewTerm frame is quorum-durable the clamp releases: the
+    // commit advances past the WHOLE term-1 tail + the NewTerm frame in one
+    // certification — W is committed under the 5.4.2 barrier and survives.
+    assert!(
+        w.run_until(|w| w.max_commit() >= pw + 96).unwrap(),
+        "commit must resume past the tail + NewTerm frame once quorum-durable (timed out)"
     );
 }
 
