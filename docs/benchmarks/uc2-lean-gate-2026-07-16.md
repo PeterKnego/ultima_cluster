@@ -263,6 +263,23 @@ leader completeness, state-machine safety) are in the dedicated memo:
 **GO (phased)** — log-matching analog first as a time-boxed sub-spike,
 re-gate before leader completeness / state-machine safety.
 
+**Tier B(a) log-matching sub-spike complete 2026-07-17** (branch
+`uc2/lean-log-matching`, merged): the real data plane (payload history +
+data-stamped term map) is layered over the election model
+(`Uc2Proofs/ProtocolData.lean`, 11-constructor `Step`, `election_safety`
+carried forward by projection lift + one sanctioned `Protocol.lean`
+extension, `adoptHigherTerm`, re-proved green) and **`Uc2.Data.log_matching`
+is proved** sorry-free over it (`Uc2Proofs/LogMatching.lean`, 5-clause
+`DInv` + a cross-time writer `Cert`, axioms
+`[propext, Classical.choice, Quot.sound]`). **Election safety and
+log-matching are both proved, at every model level now in the tree.** The
+stretch prefix-form is dropped with a countermodel (false in the model,
+in the lineage/map reading only — see the memo). Measured cost (~6.2
+S2-equivalents) and the re-priced (b)/(c) estimates, plus a GO recommendation
+for (b) leader completeness, are in the memo's **"Tier B(a) actuals +
+re-gate"** section (same file as above). Next formal-methods decision: (b)
+leader completeness, per that section's recommendation.
+
 ---
 
 Phase 1 is complete as of this doc. Post-gate dispositions (2026-07-16, all
@@ -270,6 +287,8 @@ user-directed): branch merged to main; Finding #3 fixed via the same-base
 prune (see its Disposition paragraph); Phase 1.5 attempted and exited at the
 aeneas/Lean-4.32 version wall (see Phase 1.5 status above). The Phase 2
 election-safety spike (spec §7) is complete — see the Phase 2 spike section
-above and its memo. Next formal-methods step when desired: the log-matching
-sub-spike per that memo's recommendation, or a Phase 1.5 retry once aeneas
-supports Lean ≥ 4.32.
+above and its memo. Its Tier B(a) log-matching sub-spike is also complete
+(see the Phase 2 spike section) — `log_matching` is proved, and the memo's
+re-gate section prices and recommends GO on (b) leader completeness next.
+Other options when desired: a Phase 1.5 retry once aeneas supports
+Lean ≥ 4.32.

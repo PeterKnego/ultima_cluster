@@ -420,6 +420,39 @@ theorem inv_step {n : Nat} {w w' : World n} (h : Inv w) (hs : Step w w') :
         simp at hL'
       · simp only [Function.update_of_ne ha] at hL ⊢
         exact h.leader_quorum a hL
+  | adoptHigherTerm i t hterm =>
+    -- LA1: message-free higher-term adoption — the `deliverVoteHigherTerm`
+    -- argument verbatim (that case never consumed its message witness).
+    refine ⟨?_, ?_, ?_, ?_, ?_⟩
+    · -- grant_state: adoption jumps strictly past every old grant.
+      intro a c' t' hmem
+      rcases eq_or_ne a i with rfl | ha
+      · simp only [Function.update_self]
+        left
+        show t' < t
+        rcases h.grant_state a c' t' hmem with hlt | ⟨heq, _⟩ <;> omega
+      · simp only [Function.update_of_ne ha]
+        exact h.grant_state a c' t' hmem
+    · exact h.grant_uniq
+    · intro a hrole'
+      rcases eq_or_ne a i with rfl | ha
+      · simp only [Function.update_self] at hrole'
+        exact absurd rfl hrole'
+      · simp only [Function.update_of_ne ha] at hrole' ⊢
+        exact h.self_vote a hrole'
+    · intro a hrole' u hu
+      rcases eq_or_ne a i with rfl | ha
+      · simp only [Function.update_self] at hrole'
+        exact absurd rfl hrole'
+      · simp only [Function.update_of_ne ha] at hrole' hu ⊢
+        exact h.votes_sound a hrole' u hu
+    · intro a hL
+      rcases eq_or_ne a i with rfl | ha
+      · simp only [Function.update_self] at hL
+        have hL' : Role.follower = Role.leader := hL
+        simp at hL'
+      · simp only [Function.update_of_ne ha] at hL ⊢
+        exact h.leader_quorum a hL
   | havocData i nlt nd =>
     -- the havoc data plane touches nothing the invariant mentions
     refine ⟨?_, ?_, ?_, ?_, ?_⟩

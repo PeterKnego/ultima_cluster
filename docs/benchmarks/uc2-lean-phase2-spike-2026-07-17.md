@@ -357,3 +357,383 @@ amortized. There is no version of (b) or (c) that skips (a).
   benefit, but one that has to be weighed against several weeks of session
   time against a codebase where the properties in question are already
   under active empirical test.
+
+## Tier B(a) actuals + re-gate
+
+**Date:** 2026-07-17. **Branch:** `uc2/lean-log-matching` (base `main` @
+`a551dfc`, this spike merged). Plan:
+`docs/superpowers/plans/2026-07-17-uc2-lean-log-matching.md` (LA1 data-plane
+model / LA2 invariant + `log_matching` / LA3, this section). Task detail:
+`.superpowers/sdd/task-{LA1,LA2,LA3}-report.md`, ledger:
+`.superpowers/sdd/progress.md`. The original memo's §4 ("Recommendation: GO
+(phased)," above) authorized this sub-spike as a single time-boxed unit
+(capped at 5 sessions); it landed **within the box**, and this section
+reports the actuals and re-prices the remainder per that recommendation's
+mandatory re-gate. (This section has its own §1–§6 below — references to the
+memo's original numbered sections above are spelled out as "the original
+memo's §N" to avoid collision.)
+
+### 1. Result: log-matching analog proved
+
+**`Uc2.Data.log_matching` is proved**, sorry-free, over the real data plane
+(payload history + data-stamped term map), verbatim to the statement §7/the
+LA-series brief fixed at plan time:
+
+```lean
+theorem log_matching {n : Nat} (w : World n) (hw : Reachable w)
+    (i j : Fin n) (p : Nat) (t vi vj : Nat)
+    (hi : (w.nodes i).hist p = some (t, vi))
+    (hj : (w.nodes j).hist p = some (t, vj)) : vi = vj
+```
+
+— `Uc2Proofs/LogMatching.lean`, 1046 lines. Axiom check:
+`[propext, Classical.choice, Quot.sound]` — the standard trio, unchanged from
+Phase 1/Phase 2. Both LA1 (the data-plane model) and LA2 (the invariant +
+theorem) were **Approved on first review pass** (fable impl + fable review,
+same reviewer discipline as S1/S2).
+
+**Model growth over the Phase-2 election model** (`Uc2Proofs/ProtocolData.lean`,
+511 lines as of this task's gate run — 508 as LA1 left it, +3 from this
+task's `deliverReplicate` docstring fix, §3 below; `wc -l`-verified),
+layered — `Uc2Model/`, `Protocol.lean`, and `ElectionSafety.lean` all
+untouched except one sanctioned election-model extension, below): the
+spike's `havocData` stand-in is replaced by a real per-node payload history
+(`hist : Nat → Option (Nat × Nat)`, position ↦ `(term-stamp, payload)`) and
+data-stamped term map, driven by an **11-constructor** `Step` relation — the
+spike's 7 non-`havocData` election mirrors plus `leaderAppend`,
+`deliverReplicate`, `shipTermMap`, `deliverTermMap`. The election-safety
+guarantee is carried forward by **projection lift**, not re-proof: every data
+step simulates as 0–2 election steps (`step_project`), so
+`Uc2.Data.election_safety` is a one-line application of the lifted theorem —
+Route 1 of the two the LA-series plan sanctioned for keeping `election_safety`
+green under model extension. The one election-model extension needed,
+`adoptHigherTerm` (message-free higher-term adoption on `Protocol.lean`), was
+required because gossip-triggered adoption (`TermMapReceived{term >
+current_term}` → `adopt_term`, `election.rs` 656–663) has no election-wire
+message to witness once the gossip payload moves to the data wire the
+projection erases; `election_safety` was **re-proved green** in the same task
+against the extended model (the new `inv_step` case is the
+`deliverVoteHigherTerm` argument verbatim), satisfying the plan's
+never-weaken-under-extension constraint by the re-prove route as a belt on
+top of the projection-lift route.
+
+**The truncation trace** (opening deliverable of LA2, closing an LA1-carried
+review item that truncation had never been exercised at `Step` level):
+`nonvacuity_truncation_trace`, a 15-step, fully `decide`-discharged 3-node
+trace — a leader wins term 1 and appends two positions but only replicates
+one; a challenger wins term 2 on honestly-compared credentials and appends a
+divergent tail at the same position under a different term; the challenger's
+gossip reconciles the first leader down to `validUpTo = 1`, erasing its stale
+tail (`hist 1 = none`, durable 2→1); a follow-on replication re-converges it
+onto the challenger's byte. Every side condition and every pre/post `hist`
+fact is pinned by kernel `decide`; it built on the first attempt.
+
+**`election_safety` is green at both levels** after this sub-spike: the
+original `Uc2.election_safety` (over the pure election model, now carrying
+the `adoptHigherTerm` extension) and the lifted `Uc2.Data.election_safety`
+(over the full data-plane model) both re-verified by the gate run above.
+
+### 2. Findings this sub-spike
+
+The value ledger continues — two more entries, both about the precise shape
+of the `stamp ≤ currentTerm` guard LA1 introduced to keep `log_matching`
+true, and both sharpen (not weaken) the spike's own scope-collapse notes
+rather than undermining the theorem.
+
+**(i) Finding #4 — the settled design alone made LM-core false.** Before LA1
+added any guard, the data plane as sketched in the plan's "settled design"
+section admits a genuine countermodel: a deposed-but-uninformed leader
+accepts a higher-term byte at its own frontier while its `role` is still
+`.leader` at its stale term, gets truncated by its *own* stale gossip, and
+re-appends a different payload under a `(position, term)` pair already
+shipped — `log_matching`'s conclusion (`vi = vj`) would be false at that
+position/term. The fix — `stamp ≤ currentTerm` on `deliverReplicate` — is a
+faithful, conservative model of two jointly-operating Rust mechanisms:
+`uc2_net/src/receiver.rs`'s intake drops a DATA datagram whose header term
+doesn't match the node's currently-adopted term (adoption itself happens only
+via consensus datagrams — vote grants, term-map gossip — never via DATA), and
+the `awaiting_reconcile` intake gate additionally forces reconcile-before-data
+on new-term adoption. The model keeps only the weaker `≤` **consequence** of
+those two guards (accept if not-behind, rather than exact-match-or-drop),
+which is why the model is strictly *more* permissive than Rust here — a
+conservative over-approximation, never a shortcut that could hide a real
+divergence LM-core would otherwise catch.
+
+**(ii) The prefix-form is FALSE in the over-approximated model — and this
+sub-spike measured exactly where that over-approximation stops being free.**
+The brief's stretch goal ("same `(p, t)` on both nodes ⇒ histories agree at
+every `q ≤ p` within term `t`'s span") is refuted by a paper countermodel
+with four **named roles**, verified by LA2's review at **`n = 5`** (the
+LA2 review asserts reachability at `n ≥ 4` in general; the exact minimum
+node count has not been computed — no `n = 4` trace was exhibited, so it
+should be read as "at least 4," not "exactly 4"):
+
+- **node 0** — the term-1 leader: appends `(0,1,a)` at position 0 and
+  `(1,1,b)` at position 1, and replicates both to node 1.
+- **node 1** — the term-2 leader: having received `(0,1,a),(1,1,b)` from
+  node 0, node 1 wins term 2 and, as term-2 leader, **authors and ships**
+  the floating replicate frame `(2,2,c)` (a `leaderAppend` at node 1's own
+  frontier — the frame that later goes stale once node 1 is itself
+  deposed).
+- **node 2** — the node that later wins term 5 and accepts the stale
+  frame: holds only `(0,1,a)` (never received node 0's second byte), wins
+  term 5 on its lagging-but-sufficient credentials (durable 1), appends its
+  own `(1,5,y)` at position 1, then — now at `currentTerm = 5`, frontier
+  2 — accepts node 1's still-floating `(2,2,c)` frame via the `≤` guard
+  (stamp 2 ≤ 5, position = frontier).
+- **nodes 3 and 4** — voters: both sit at the boot credential `(lastTerm
+  0, durable 0)`, which loses to every other node's credentials in this
+  trace, so they can only ever grant (never plausibly win); they supply
+  the quorum node 2 needs to win term 5 without a grant from node 0 or
+  node 1 (both of whose credentials by then exceed node 2's, so neither
+  would grant it).
+
+Node 1 and node 2 now **agree at the shared pivot position 2** — both hold
+`(2,c)` there, the `(p, t)` pair the prefix-form's hypothesis is about —
+but **disagree at position 1**, strictly *below* that pivot: node 1's entry
+there is `(1,b)` (relayed from node 0's term-1 tenure), node 2's is `(5,y)`
+(node 2's own term-5 append), two different, non-`t`-matching stamps.
+
+This forces a precise disambiguation of "within term `t`'s span" that the
+brief's stretch statement left informal, which this memo states explicitly
+because the countermodel actually distinguishes the two readings:
+
+- **Entry-stamp reading** ("both histories are stamped `t` at every
+  `q ≤ p`, and those entries agree"): this is **not a new claim** — it is a
+  pointwise corollary of `log_matching` itself (apply the proved theorem at
+  each such `q`), and it is **true**, trivially. Position 1 in the
+  countermodel is *not* a counterexample to this reading at all: neither
+  node's entry at position 1 is stamped term 2, so the reading never asserts
+  anything about it.
+- **Lineage/map reading** ("every `q ≤ p` that the term map's *span* for `t`
+  covers, regardless of that position's own literal stamp"): this is the
+  reading the countermodel refutes — position 1 falls inside what a
+  map-derived "span of term 2, below position 2" would cover under either
+  node's map, yet the two nodes hold genuinely different, differently-stamped
+  content there. This is the reading that would require exact-match-or-drop
+  replication (Rust's real behavior) to hold, and it is **false** under the
+  model's conservative `≤` guard.
+
+The false reading is the boundary of the "accept-before-reconcile
+over-approximation" scope collapse (item 4 below) made precise and
+measured: tightening `deliverReplicate` toward Rust's exact-match-or-drop
+semantics (a real model change, out of this sub-spike's scope) is exactly
+what the lineage/map reading would need. `log_matching` itself is unaffected
+— indeed the same over-approximation that defeats the lineage reading is
+what makes LM-core's proof *easier* (a strictly more permissive replication
+rule can only produce more occurrences to reason about, never fewer, and the
+`DInv.cert` machinery closes over all of them regardless).
+
+### 3. Scope-collapse enumeration (routed from LA1's review)
+
+All four documented model/reality gaps from the LA-series, restated together
+per LA3's charter — none of them weakens what `log_matching` proves; each is
+either provably harmless or is the explicit, now-measured boundary of the
+theorem's reach:
+
+1. **Fsync-lag collapse** (`ProtocolData.lean` module doc, item 4). A leader
+   append is modeled immediately durable and `crashRestart` preserves the
+   whole data plane; the real lost-unfsynced-suffix crash (the journal/
+   `StableValue` recovery boundary) is not modeled. Safety argument: crash
+   demotes (`currentTerm` is strictly monotone across restart-then-reelect —
+   Phase 2's single-tenure fact), so any re-append after a lost suffix
+   happens under a strictly higher term than what was lost, and can never
+   manufacture two payloads under one already-used `(position, term)` pair —
+   the one fact `log_matching` is about. Crash-plane fidelity is out of
+   scope, not swept under the theorem.
+2. **Atomic truncation** (module doc, item 5). `node.rs`'s real pipeline —
+   persist-map → `Action::Truncate` → archive truncate → epoch'd `Truncated`
+   ack → pending-map adoption, with a data-plane latch holding the window
+   shut throughout — collapses into one atomic `deliverTermMap` step.
+   Reorder-equivalence argument: the real latch admits no data event into
+   the window, and a crash inside the window self-heals to the same
+   post-state (persist-before-truncate + `rederive_term_map`), so the
+   atomic model transition already *is* the committed real-world outcome;
+   nothing the latch would have serialized differently is reachable.
+3. **Full-map gossip** (module doc, item 7). `shipTermMap` ships the entire
+   term map every time, rather than Rust's bounded `term_map_wire_tail()`
+   window. The window is precisely what makes `NoCommonPrefix` reachable in
+   production (a follower whose shared prefix has been purged past the
+   window); under full-map gossip the wipe arm (`Node.applyGossip`'s
+   `.noCommonPrefix` case, `wipe_on_no_common_prefix`) stays **modeled but
+   unreachable in this model's worlds** — an honest simplification carried
+   unchanged from LA1's review, not newly discovered here.
+4. **Accept-before-reconcile over-approximation** (module doc, item 6 —
+   the `stamp ≤ currentTerm` guard vs. the real `awaiting_reconcile` gate).
+   This is Finding #4's fix (§2i) and its now-measured boundary (§2ii): the
+   model keeps only the `≤` consequence of Rust's exact-match-or-drop +
+   reconcile-before-data pair, which is conservative for `log_matching`
+   (strengthens it, if anything) but is exactly what blocks the
+   lineage/map reading of the prefix-form stretch goal from holding.
+
+**Docstring fix (in scope per the LA3 brief, applied this task):**
+`ProtocolData.lean`'s `deliverReplicate` docstring previously glossed the
+guard as "the header-term-adopt + reconcile-before-data intake gate," which
+reads as if a DATA datagram's header term itself triggers adoption. It does
+not — `uc2_net`'s receiver *drops* a DATA datagram whose header term doesn't
+match the adopted term; adoption comes only from consensus datagrams
+(vote grants, term-map gossip). The docstring now states the guard as the
+model's `≤` consequence of that drop-not-adopt behavior plus the
+`awaiting_reconcile` gate, matching item 6 above and Finding #4's write-up
+precisely.
+
+### 4. Measured costs vs. estimate
+
+| Task | Wall-clock | Output | Debug iterations | Review |
+|---|---|---|---|---|
+| LA1 (data-plane model + Finding #4 guard) | **~50 min** (~15 read, ~10 design, ~20 write, ~5 build/gate) | `ProtocolData.lean`, 508 lines as committed by LA1, 11-constructor `Step`, projection lift + `adoptHigherTerm` | 2, both **Lean-mechanics-only** (a structure-literal field-alignment parse quirk; a `simpa`-vs-`simp;exact` transparency mismatch) | Approved, first pass |
+| LA2 (`DInv` + `log_matching` + truncation trace) | **~2h15m** (~25 read, ~35 design, ~10 trace, ~40 write, ~15 build/gate, ~10 evidence/commit) | `LogMatching.lean`, 1046 lines, 5-clause `DInv` + `Cert` | 2, both **mechanics-only** (the same structure-literal quirk recurring; one `simp`/`.symm`/unification fix each) | Approved, first pass |
+| **LA1+LA2 combined** | **~3h05m (185 min)** | 1554 lines as LA2 left them (508 + 1046; now 1557 — `ProtocolData.lean` gained +3 from this task's own docstring fix, §3 above) | — | — |
+
+In S2-equivalents (S2 = the Phase-2 spike's `ElectionSafety.lean` task,
+~30 min — this memo's own reference unit): **185 min ÷ 30 min ≈ 6.2
+S2-equivalents.**
+
+Memo §3(a) priced this component at **3–7 S2-equivalents, 3–5 wall-clock
+sessions**. The actual, ~6.2 S2-equivalents, lands **inside the band, near
+its top** — a real contrast with the Phase 2 spike's own ~100×
+overestimate (the original memo's §2): this time the effort estimate was, if anything,
+close to accurate rather than wildly high. The pattern that *did* recur is
+narrower than "estimates run high" — it's specifically **session-count**
+that overshot: 3–5 sessions were priced (at Phase 1's task cadence of
+discrete ~30–45 min sittings), but the actual work landed in **2** genuinely
+continuous sittings (one per task), with LA2 alone running long enough
+(~2h15m, ~4.5 S2-equivalents) to internally cover what the cadence model
+would have called 3–4 separate sessions. So: the *total-effort* estimate was
+good this time; the *session-count* framing (assuming Phase-1-sized discrete
+sittings) was not — a different-shaped miss than S1/S2's, worth carrying
+forward as its own known-cost note rather than folding into the same bucket.
+Zero invariant-content churn in either task (both sets of debug iterations
+were pure Lean-mechanics, the same class of cost LA1 first hit and flagged
+forward to LA2, where it recurred exactly as predicted) — the R4-class
+stuck-proof risk did not materialize a third time running (after S1/S2 and
+now LA1/LA2), which is itself informative for §5's re-pricing below.
+
+### 5. Re-pricing (b) leader completeness and (c) state-machine safety
+
+**What (b) gets for free from (a), beyond just "the data plane now exists."**
+The original §3(b) pricing assumed leader completeness would have to build
+its own cross-time reasoning from scratch once `logOk` became load-bearing.
+Two concrete pieces of that work are now already sitting in
+`LogMatching.lean`, proved and exported:
+
+- **`DInv.cert`** — the cross-time writer certificate (`quorum`: a
+  grants-or-self quorum for `(term, leader)` in the append-only `sent` set;
+  `pinned`: the StableValue-persisted vote record, riding
+  `currentTerm`/`votedFor`/`role`; `noForeign`: that leader never granted the
+  term to anyone else) is *exactly* the shape of statement a
+  leader-completeness proof needs to say "the node that is the elected
+  leader for term `t` really did win `t`, historically, not just in the
+  current instant" — `election_safety` alone is simultaneous-only and can't
+  express this (LA2's report notes this explicitly: `Cert` was the
+  discovered inductive form of the temporal claim `election_safety` doesn't
+  cover). `Cert` and `reachable_dinv` are public, non-`private` — directly
+  reusable as (b)'s leader-election certificate rather than a rediscovery.
+- **`DInv.frontier`** — a leader's `durable` strictly bounds every
+  occurrence stamped with its own term — is half of what "elected leader's
+  durable ≥ global commit" needs: the other half is C3
+  (`advance_certified`/`Uc2Proofs/Commit.lean`, already proved in Phase 1 as
+  a pure fold over reported positions) wired into the *step relation* as a
+  real quorum-driven global counter, which is genuinely new — `Protocol.lean`
+  /`ProtocolData.lean` have no commit-counter transition at all yet.
+
+**What's still net-new for (b).** `logOk` becoming load-bearing (§3(b)'s
+original framing, unchanged) is real: `V2`/`logOk_iff` (Phase 1,
+`Uc2Proofs/Vote.lean`) gives the exact `(term, durable)` lexicographic
+characterization already proved, but it has never been correlated against a
+*live* commit counter inside a step relation before — that correlation, and
+wiring C3 into `Step` as an actual constructor rather than a property of one
+pure-fold call, is the part of §3(b)'s original estimate that survives
+untouched.
+
+**Re-estimate for (b): 3–6 S2-equivalents / 2–4 sessions** (down from the
+original 4–9 / 4–7), on top of (a). Reasoning: the hardest single piece
+of the original estimate — cross-time writer uniqueness under a real
+network — is discharged and reusable (`Cert`); the `frontier` clause covers
+half of the commit-bound argument; what remains (wiring C3 as a step-level
+transition, correlating it against `logOk_iff`) is real but bounded work,
+not a fresh invariant-discovery exercise. The range stays wide rather than
+collapsing to a point because the *pattern* observed twice now (S1/S2 then
+LA1/LA2: zero invariant-content churn, all debug cost mechanical) is
+encouraging but is not yet three-for-three at this specific proof's shape —
+commit-tracking-as-a-step-relation-transition is genuinely unprecedented in
+this codebase's Lean work.
+
+**What (c) gets for free from (a).** The original §3(c) pricing assumed the
+reconcile-on-gossip transitions (`R2`/`R3a`/`R3b`/`R4`) would need to be
+newly wired in as step-level constructors — that wiring is **done**:
+`deliverTermMap`/`Node.applyGossip` already consume the PROVED
+`Uc2Model.reconcile` kernel as an atomic step transition (scope collapse #2
+above), and `LogMatching.lean`'s `applyGossip_hist` lemma (truncation/wipe
+only erases, never invents content) is exactly the non-truncation-adjacent
+fact (c) needs as a building block for sim's inv4 analog. The 15-step
+truncation trace (this section's §1 above) is also a ready-made non-vacuity witness for whatever
+(c)'s truncation-composition theorem needs to exhibit.
+
+**What's still net-new for (c).** The two Finding-#3 residuals the Phase 1
+gate doc left as informal arguments rather than theorems: `start_election`
+reading the pre-prune term map (currently justified only by an informal
+"safe by quorum intersection" note in
+`docs/benchmarks/uc2-lean-gate-2026-07-16.md`'s Finding #3 disposition), and
+the `awaiting_reconcile` gate's role blocking the second phantom-creation
+path — neither is representable in `ProtocolData.lean` today, since intake
+ordering / gating state isn't modeled at all (this sub-spike's `≤` guard,
+§2i/§4-item-4, is the closest thing, and it is explicitly a weaker
+stand-in). Formalizing either requires new step-relation machinery, not
+reuse of (a)'s artifacts. Composing inv4 (non-truncation of committed bytes)
+with inv5 (election above commit) also strictly needs (b)'s commit counter
+first.
+
+**Re-estimate for (c): 4–9 S2-equivalents / 3–6 sessions** (down from the
+original 5–12 / 4–8), strictly on top of (a)+(b). Reasoning: the
+reconcile-step machinery and its erasure-only lemma are reused wholesale,
+which was the single biggest line item in the original estimate's "R2/R3/R4
+slot in as step semantics" framing; the Finding-#3 residuals are real,
+un-reused new work (intake-gate modeling has no precedent in this codebase's
+Lean model at all) and keep the range from collapsing further.
+
+### 6. Recommendation for (b): GO, phased, same cap discipline
+
+**GO for (b) leader completeness, as a single time-boxed sub-spike capped at
+6 sessions (the top of the re-priced range), with a mandatory re-gate before
+(c)** — the same phased structure the original memo's §4 recommended, now
+re-run one link down the chain. The evidence for continuing rather than
+stopping is stronger than it was at the original gate, not weaker:
+
+- **The R4-class stuck-proof risk has now stayed dormant twice in a row**
+  (S1/S2, then LA1/LA2) — both sub-spikes reported zero invariant-content
+  churn, with every debug iteration being pure Lean mechanics identified and
+  named in advance. That is genuine, if still limited, evidence the model
+  layering discipline (havoc → real data plane → the next real component)
+  generalizes rather than being a one-off.
+- **(a)'s artifacts are directly reusable for (b)**, not just conceptually
+  adjacent (§5) — `Cert`, `frontier`, and the truncation-trace pattern are
+  concrete exported Lean objects (b) consumes, which is the mechanism, not
+  just the hope, behind the downward re-price.
+- **The effort estimate itself was accurate this time** (this section's §4
+  above) — a second data point (after S1/S2's ~100× miss) suggesting the
+  estimation is converging as more of this specific proof's shape gets
+  measured, which should make the re-priced (b)/(c) ranges more trustworthy
+  than the original memo's §3 ranges were.
+
+**Trigger conditions**, unchanged in kind from the original memo's §4
+framing:
+
+- **Continue to (c)** if (b) lands within its 6-session cap with clauses
+  designed on paper and little-to-no post-first-build churn (the pattern
+  both prior sub-spikes showed).
+- **Stop and re-price before (c)** if (b) blows through its cap or surfaces
+  an R4-class stuck proof / insufficient informal contract — a real finding
+  either way, not a discipline failure, per the spec's own risk register.
+- **NO-GO on (b) is still not recommended** given the by-now 2-for-2 clean
+  run and the reusable artifacts sitting ready, but remains a legitimate
+  opportunity-cost call for the user (leader leases / wire-crypto stand as
+  the recorded alternatives) — a resourcing decision, not a technical one.
+- What the user should weigh, unchanged from the original memo's §4: the
+  sim/elle/lincheck stack
+  already covers leader completeness and state-machine safety empirically
+  under fault injection; Tier B's marginal value stays "mechanized exhaustive
+  guarantee + proof-pressure findings," now with a second and third real
+  finding (#4 and the prefix-form boundary) added to Phase 1's three since
+  the original gate — the finding-yield trend, if anything, continues to
+  favor continuing.
