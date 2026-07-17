@@ -38,12 +38,19 @@ fn nasty_reconcile_config(seed: u64) -> SimConfig {
         // High loss + duplication drives leader churn (→ divergent tails →
         // truncations) and, crucially, the DUPLICATE term map that lands
         // mid-truncation — the C-1 trigger. Crash rate is kept modest: past
-        // ~1000ppm a lagging follower's uncommitted divergent boundary routinely
+        // ~800ppm a lagging follower's uncommitted divergent boundary routinely
         // falls below an advancing commit (a strict-inv2 artifact that is NOT a
         // gate bug and would fire in BOTH arms), which would mask the signal.
+        // The onset moved down from ~1000ppm when the Mechanism report FLOOR
+        // (the receiver.rs 20 ms AppendPosition re-send, added with the
+        // Finding #5 pin) started closing report-loss gaps — commits certify
+        // sooner under loss, overtaking a laggard's un-truncated boundary
+        // earlier. Probed at 500..=1000ppm over 200 seeds: guarded arm clean
+        // through 700, first benign inv2 transient (seed 22) at 800; the
+        // unguarded arm still catches its C-1 phantom at 700.
         drop_per_million: 40_000,
         dup_per_million: 40_000,
-        crash_per_million: 1_000,
+        crash_per_million: 700,
         // A wide archive-truncation window: the divergent durable stays on disk
         // (gate-suppressed) long enough that a duplicate term map lands
         // mid-truncation. Under `reopen_guard:false` that duplicate reopens the
@@ -1040,6 +1047,115 @@ fn serving_gate_refuses_the_premature_proposal() {
     w.run_steps(30_000).expect("gated world stays green");
 }
 
+/// Finding #5 (lean leader-completeness effort, gate doc 2026-07-16): a voter
+/// that GRANTED a term-T vote (persisted), holds a divergent tail, and crashes
+/// BEFORE reconciling into term T must NOT certify a phantom commit after it
+/// reboots. Pre-fix, `uc2_node` booted the intake gate OPEN (`node.rs` 516,
+/// `awaiting_reconcile: false` at 801) while term recovery is
+/// `max(vote_term, map_term)` (`election.rs` 400-402) — so the rebooted voter
+/// reports `(term T, raw divergent durable)` on the receiver's 20 ms
+/// AppendPosition floor (`receiver.rs` 1052-1078) before the leader's 100 ms
+/// idle map re-ship can reconcile it, and the T-leader's tracker certifies a
+/// commit over content the reporter does not hold.
+///
+/// DETERMINISTIC SCRIPT (Mechanism = the shipped node's gate discipline):
+/// - V leads term 1, all three commit a genuine prefix; V is then isolated
+///   pairwise and keeps appending an uncommitted term-1 divergent tail.
+/// - The majority elects a term-2 leader L2 and commits past the old prefix.
+/// - L2 is cut from the third voter F; V<->F is opened. F (last_term 2)
+///   out-ranks V (last_term 1) lexicographically, so the ensuing election
+///   churn settles on F winning a term T > 2 **with V's persisted grant**.
+/// - V crashes at the grant — before any term-T map reaches it — and reboots:
+///   recovered term T (the vote), term map still ending at term 1.
+/// - The race: V's report floor (archive cadence) vs F's 100 ms map floor.
+///   Pre-fix the boot-open gate ships `(T, divergent durable)` and F rank-
+///   commits its term-T NewTerm frame with quorum {F, V} — but V's content
+///   diverges from F's lineage right above the term-2 base, and the third
+///   voter (L2) holds F's lineage only up to F's election base: the inv7
+///   phantom oracle flags the commit. Post-fix (gate boots CLOSED iff
+///   vote_term > map_term) the report is suppressed, F's map reconciles V
+///   (one truncation), and the cluster resumes committing genuinely.
+///
+/// This is the permanent regression pin for the fix: the run must stay GREEN,
+/// V must reconcile, and commit must advance genuinely afterwards.
+#[test]
+fn rebooted_unreconciled_voter_must_not_certify_phantom_commit() {
+    let mut w = World::new(SimConfig {
+        drop_per_million: 0,
+        data_plane: DataPlane::Mechanism { reopen_guard: true },
+        max_steps: 200_000,
+        ..base_cfg(3)
+    });
+    // Phase 1: V leads term 1; a genuine committed prefix lands on all three.
+    w.run_until_leader().expect("setup: elect the term-1 leader");
+    let v = w.current_leader().unwrap();
+    w.run_steps(300).expect("setup: genuine committed prefix on all three");
+    let others: Vec<usize> = (0..3).filter(|&i| i != v).collect();
+    let (a, b) = (others[0], others[1]);
+
+    // Phase 2: isolate V pairwise (so a precise partial heal is possible).
+    // V keeps appending + archiving an uncommitted term-1 divergent tail while
+    // the majority elects term 2 and commits past the old prefix.
+    w.partition(v, a);
+    w.partition(v, b);
+    assert!(
+        w.run_until(|w| w.current_leader().is_some_and(|l| l != v)).unwrap(),
+        "setup: term-2 leader election timed out"
+    );
+    let l2 = w.current_leader().unwrap();
+    let f = if l2 == a { b } else { a };
+    w.run_steps(300).expect("setup: term-2 commits past the old prefix; V's tail grows");
+
+    // Phase 3: cut L2 from F and open V<->F. F times out and campaigns; V
+    // grants (F's last_term 2 > V's 1, lexicographic vote order) and persists
+    // the vote. The churn may take an extra round (V's own doomed candidacy
+    // bumps terms), but only F can assemble a quorum ({F, V}), so the run
+    // settles on F as a raw leader of some term T > 2.
+    w.partition(l2, f);
+    w.unpartition(v, f);
+    assert!(
+        w.run_until(|w| w.node_is_raw_leader(f) && w.node_term(f) > 2).unwrap(),
+        "setup: F wins a term with V's grant (timed out)"
+    );
+    let t = w.node_term(f);
+    assert_eq!(w.node_term(v), t, "V granted (and adopted) F's winning term");
+    // 96 = one sim frame: V's frontier must sit beyond F's whole post-win
+    // append (base + NewTerm frame), so F has nothing to ship at V's frontier
+    // and the ONLY datagram V can contribute is its AppendPosition report.
+    assert!(w.node_durable(v) > w.node_durable(f) + 96, "V's divergent durable outruns F's base");
+
+    // Phase 4: crash V at the grant — its vote at term T is persisted, its
+    // term map still ends at term 1, and NO term-T map has reached it. Let
+    // F's first idle-floor map ship fire into the void (V is down), so the
+    // post-reboot race window is maximal and deterministic.
+    w.crash(v);
+    w.run_steps(60).expect("setup: F's initial gossip is dropped at the dark V");
+
+    // Phase 5: reboot V. Recovery: term = max(vote T, map last 1) = T.
+    // Pre-fix the intake gate boots OPEN and V's report floor ships
+    // (T, divergent durable) to F before F's next 100 ms map re-ship — the
+    // phantom-commit trace this pin exists for. Post-fix the gate boots
+    // CLOSED (vote_term > map_term), the report is suppressed, and the map
+    // reconciles V first.
+    let truncations_before = w.truncations();
+    let commit_before = w.max_commit();
+    w.restart(v).expect("reboot the unreconciled voter");
+    w.run_steps(4_000)
+        .expect("Finding #5: rebooted unreconciled voter's report must not certify a phantom commit");
+
+    // Liveness of the closed-gate boot: the leader's idle-floor map reconciles
+    // V (one extra reconcile round — the divergent tail truncates), and the
+    // cluster then commits GENUINELY past the pre-reboot high-water.
+    assert!(
+        w.truncations() > truncations_before,
+        "the rebooted voter must reconcile (truncate its divergent tail)"
+    );
+    assert!(
+        w.run_until(|w| w.max_commit() > commit_before).unwrap(),
+        "commit must resume genuinely after reconciliation (timed out)"
+    );
+}
+
 // ================= Task 12 ledger: run_until timeout signal + parked violation =================
 
 /// Ledger minor (x): `run_until` must distinguish "predicate held" from
@@ -1079,3 +1195,4 @@ fn parked_violation_surfaces_without_a_step() {
         "ledger (g): a parked violation must not be dropped when pred is already true"
     );
 }
+

@@ -201,6 +201,63 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    only ever makes credentials *more* conservative; left for Tier B to
    formalize.
 
+4. **Finding #5 — CONFIRMED REAL RUST BUG, SAFETY-CLASS (commit path),
+   FIXED (2026-07-17).** Surfaced by Tier B(b)'s LB1 commit-certification
+   layer (Finding #4, the data-plane one, lives in the Phase-2 spike memo):
+   the reconciliation intake gate — THE load-bearing guard tying a term-T
+   AppendPosition report to a tail reconciled against the T-leader — did
+   not survive a reboot. `uc2_node` booted the gate OPEN (`node.rs`
+   intake-gate init: `AtomicBool::new(true)`) with `awaiting_reconcile:
+   false`, while `ElectionSm::new` recovers `current_term =
+   vote_term.max(map_term)` — so a voter that GRANTED term T (vote
+   persisted before send), held a divergent tail, and crashed before
+   reconciling rebooted AT term T with the gate open; the receiver's 20 ms
+   AppendPosition floor re-send (`receiver.rs` 1052–1078) beat the
+   leader's 100 ms idle map re-ship, the same-term report fed the
+   T-leader's `CommitTracker`, and the tracker certified a **phantom
+   commit** over content the reporter did not hold (blast radius:
+   committed-acked write loss after a leader crash; SMR apply divergence
+   in a sub-interleaving). Machine-checked first as LB1's 27-step
+   kernel-decided countermodel `finding_boot_gate_stale_report_lc_violation`
+   (the FIXED LC-core statement was provably FALSE against
+   Rust-as-shipped), then adversarially line-verified against every cited
+   Rust site.
+
+   **Disposition: FIXED (TDD, RED-first).** (a) A directed `uc2_sim`
+   scenario, `rebooted_unreconciled_voter_must_not_certify_phantom_commit`
+   (`uc2_sim/tests/scenarios.rs`), stages the exact trace — divergent
+   term-1 ex-leader grants term T, crashes at the grant, reboots, its
+   report floor races the map — and the **inv7 phantom oracle flagged it
+   RED pre-fix** (`quorum legality (inv7): phantom commit — no genuine
+   quorum`, seed 3: term-4 leader certified 2880 against a genuine
+   quorum-frontier of 2784) and **GREEN post-fix**, validating both the
+   oracle and the fix; the scenario stays as the permanent regression pin
+   (it also asserts the closed-gate boot's liveness: one extra reconcile
+   round, then genuine commits resume). Expressing the trace required
+   mirroring the receiver's 20 ms report FLOOR into the sim's `Mechanism`
+   data plane (`world.rs` archive step — reports were previously
+   advance-triggered only, so a rebooted node could never report at all);
+   the nasty-storm crash rate was re-tuned 1000→700 ppm to stay below the
+   documented strict-inv2 benign-transient onset the more-realistic floor
+   lowered (probed over 200 seeds at 500..=1000 ppm; the unguarded C-1
+   arm still catches its phantom). (b) The Rust fix, both halves: the
+   intake gate boots CLOSED iff `vote_term > map_term` (`node.rs` gate
+   init) AND `awaiting_reconcile` boots to the same predicate (`node.rs`
+   Consensus init) — reopen rides only the EXISTING clean-reconcile /
+   truncate-ack / `BecomeLeader` arms. Completeness of the predicate:
+   `map_term >= vote_term` implies the tail's last mapped term was
+   validated under that term's leader (the map grows only via
+   `DataTermObserved` / `become_leader`; a gossip-only adoption reboots at
+   the old term and its stale reports are dropped). The sim's
+   `on_restart` mirrors the same predicate so the sim keeps modeling
+   `uc2_node` boot. (c) Model amendment (`Uc2Proofs/ProtocolCommit.lean`):
+   `crashRestart` now sets `reconciled := decide (currentTerm ≤ lastTermOf
+   termMap)`; the finding theorem became unprovable and was deleted in the
+   same commit (`lake build` green, 3026 jobs, sorry gate clean, axioms
+   unchanged). Gates re-run green: uc2_sim (23 scenarios incl. the pin +
+   both storm arms), uc2_consensus both configs, uc2_node lib, workspace
+   clippy, `lin_v2` release capstone.
+
 ### Restatements (recorded for completeness, not spec gaps)
 
 - `commit_certified_run` (C3, run form) was **strengthened**, not weakened: an

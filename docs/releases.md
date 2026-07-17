@@ -11,6 +11,25 @@ A 0.3.0 node accepts a 0.2.0 peer (same major, peer minor not newer — see
 `cnc::version_compatible`, the live gate; `version::CURRENT`/`MIN_COMPATIBLE`
 are documentation-only and enforce nothing).
 
+Safety fix in this line:
+- **Boot-open intake gate could certify a phantom commit** (Finding #5, lean
+  leader-completeness effort; affects all prior v2 releases): a voter that
+  granted a term-T vote (persisted), held a divergent tail, and crashed before
+  reconciling rebooted with the receiver intake gate OPEN — its 20 ms
+  AppendPosition floor report (raw divergent durable, stamped term T) could
+  reach the T-leader before the 100 ms idle term-map re-ship and be counted
+  toward quorum commit over content the reporter does not hold (worst case:
+  committed-acked write loss after a leader crash). Requires the 4-way
+  conjunction divergent-tail voter + persisted vote above the data-stamped map
+  + crash before reconcile + report-beats-gossip; never observed outside the
+  directed reproduction. Fixed: the gate (and the reconcile latch) now boots
+  CLOSED iff the recovered vote term exceeds the data-stamped term map's last
+  term, reopening via the existing reconcile paths (cost: one extra reconcile
+  round after such a reboot). Found by the Lean commit-certification model
+  (machine-checked countermodel), reproduced and pinned by the sim's inv7
+  phantom oracle (`rebooted_unreconciled_voter_must_not_certify_phantom_commit`,
+  RED pre-fix → GREEN post-fix). Remedy: upgrade; no back-port is planned.
+
 Loose-end hardening in this line:
 - **Leader-as-learner wedge closed** (T1): a leader that adopts its own demote
   from the log now relinquishes leadership to a non-voting learner-follower once

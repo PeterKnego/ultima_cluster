@@ -52,21 +52,26 @@ designer calls documented inline):
    holds. Truthful-at-send is NOT enough — the durable is honest, the
    CONTENT under it is not; the gate is what ties a term-T report to a
    hist that reconciled against the T-leader's map.
-5. **FINDING (candidate real gap): the gate does not survive reboot.**
-   Rust boots the intake gate OPEN (`node.rs` 516,
-   `AtomicBool::new(true)` "open until a term is adopted") with
+5. **Finding #5 (FIXED): the gate must survive reboot.** Rust used to boot
+   the intake gate OPEN (`node.rs` 516, `AtomicBool::new(true)`) with
    `awaiting_reconcile: false` (`node.rs` 801), while term recovery is
    `current_term = vote_term.max(map_term)` (`election.rs` 400–402) — so a
    voter that persisted a vote at term T (persist-before-send), crashed
-   before reconciling, and rebooted, reports `(T, durable)` over its raw
+   before reconciling, and rebooted, reported `(T, durable)` over its raw
    divergent tail; the receiver's AppendPosition floor re-send
-   (`receiver.rs` 1061) races the leader's kHz term-map gossip. Modeled
-   faithfully: `crashRestart` sets `reconciled := true`. Consequence,
-   machine-checked below (`finding_boot_gate_stale_report_lc_violation`):
-   the FIXED LC-core statement is FALSE for Rust-as-of-today semantics.
-   The candidate fix (boot the gate closed when `vote_term > map_term`,
-   i.e. model `reconciled := currentTerm ≤ lastTermOf termMap` at restart)
-   is escalated with the trace; see the task report.
+   (`receiver.rs` 1061) raced the leader's idle term-map re-ship and the
+   T-leader certified a phantom commit (LB1's machine-checked 27-step
+   countermodel, deleted with the fix — the FIXED LC-core statement was
+   FALSE for those semantics). The fix (lean gate doc 2026-07-16): boot
+   the gate CLOSED iff `vote_term > map_term` (`node.rs` gate init +
+   `awaiting_reconcile`), reopening only via the existing
+   clean-reconcile / truncate-ack / BecomeLeader arms. Modeled here:
+   `crashRestart` sets `reconciled := decide (currentTerm ≤ lastTermOf
+   termMap)` — the recovered term is `max(vote, map)`, so the gate boots
+   open exactly when the map's last term reaches the vote term (a tail
+   the T-leader validated). Sim regression pin:
+   `uc2_sim` `rebooted_unreconciled_voter_must_not_certify_phantom_commit`
+   (inv7 phantom oracle, RED pre-fix → GREEN post-fix).
 6. **Tracker state lives on every node, meaningful while leader** (mirrors
    Rust: `ElectionSm.tracker` exists in every role; only the leader feeds
    and ranks it, `election.rs` 566–571). `becomeLeader` resets the report
@@ -314,11 +319,15 @@ inductive Step {n : Nat} : World n → World n → Prop
           committed := w.committed }
   /-- `Data.Step.crashRestart`. Commit delta: the tracker is rebuilt fresh
   (`election.rs` 410 — in-memory, reconstructed at boot) and the intake gate
-  boots OPEN (`node.rs` 516 + 801) even though the recovered term is
-  `vote_term.max(map_term)` (`election.rs` 400–402) — THE FINDING (module
-  doc, item 5): a pre-crash strictly-higher-term adoption's gate closure
-  does not survive the reboot. `commitIdx` preserved (ghost cursor —
-  designer call, module doc item 8). -/
+  boots CLOSED iff the recovered vote term exceeds the data-stamped map's
+  last term — Finding #5's fix (module doc, item 5): recovery is
+  `vote_term.max(map_term)` (`election.rs` 400–402) and the model's
+  `currentTerm` IS that recovered term, so `reconciled := currentTerm ≤
+  lastTermOf termMap` boots the gate open exactly when the tail's last
+  mapped term reaches the recovered term (`node.rs` boot init:
+  `!(vote_term > map_term)`), and closed over an unreconciled
+  persisted-vote term. `commitIdx` preserved (ghost cursor — designer
+  call, module doc item 8). -/
   | crashRestart (w : World n) (i : Fin n) :
       Step w
         { nodes := Function.update w.nodes i
@@ -326,7 +335,8 @@ inductive Step {n : Nat} : World n → World n → Prop
                 { (w.nodes i).pn with role := .follower, votesReceived := ∅ } }
               tracker := CommitTracker.new (n - 1) n
               commitIdx := (w.nodes i).commitIdx
-              reconciled := true }
+              reconciled := decide ((w.nodes i).pn.currentTerm ≤
+                Uc2.Data.lastTermOf (w.nodes i).dn.termMap) }
           sent := w.sent
           dsent := w.dsent
           csent := w.csent
@@ -650,85 +660,17 @@ theorem nonvacuity_commit_completeness_trace :
       (.becomeLeader _ 1 (by decide) (by decide)),
     by decide, by decide, by decide, by decide⟩
 
-/-! ## FINDING — boot reopens the intake gate (candidate real gap)
-
-Machine-checked witness for module-doc item 5: with Rust-as-of-today boot
-semantics (`node.rs` 516/801 gate open + `election.rs` 400–402 recovering
-`current_term = vote_term.max(map_term)`), the FIXED LC-core statement is
-FALSE. Every step below maps to a real Rust behavior — in particular the
-crashed node's higher term survives the reboot because it PERSISTED A VOTE
-at that term (persist-before-send), not merely adopted it.
-
-The trace: node 1 leads term 1 and appends two entries (durable 2, only
-position 0 replicated to node 0). Node 0 wins term 2 (node 2's grant),
-opening its map at base 1 with zero appends — a same-base phantom — then
-crashes, restarts, and wins term 3 with NODE 1's OWN GRANT (`logOk`:
-candidate `lastTerm` 2 > 1 — node 1 persists its vote at term 3 and its
-gate closes). Node 0 appends `(1, term 3, 9)`. Node 1 crashes and reboots:
-its persisted term 3 survives, but the gate reopens — it reports
-`(term 3, durable 2)` over its stale term-1 tail. The kernel tracker
-certifies position 1 with quorum {leader, node 1} and the ghost commits
-`(1, 3, 9)` — held durably ONLY by the leader. Node 1 then wins term 4
-(node 2's grant), leaving a leader at term 4 > 3 whose hist at the
-committed position holds `(1, 8)`, not `(3, 9)`. -/
-theorem finding_boot_gate_stale_report_lc_violation :
-    ∃ w : World 3, Reachable w ∧
-      (1, 3, 9) ∈ w.committed ∧
-      (w.nodes 1).pn.role = .leader ∧
-      3 < (w.nodes 1).pn.currentTerm ∧
-      (w.nodes 1).hist 1 = some (1, 8) ∧
-      (w.nodes 1).hist 1 ≠ some (3, 9) := by
-  refine ⟨_,
-    .tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
-      (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
-      (.tail (.tail (.tail (.tail (.tail (.tail
-      -- term 1: node 1 leads, appends (0,(1,7)) and (1,(1,8));
-      -- node 0 reconciles + replicates position 0 only.
-      (.single (.startElection _ 1 (by decide)))
-      (.deliverRequestVote _ 0 1 1 0 0 (by decide) (by decide)))
-      (.deliverVote _ 1 0 1 (by decide) (by decide) (by decide)))
-      (.becomeLeader _ 1 (by decide) (by decide)))
-      (.leaderAppend _ 1 7 (by decide)))
-      (.leaderAppend _ 1 8 (by decide)))
-      (.shipTermMap _ 1 (by decide)))
-      (.deliverTermMap _ 0 1 [(1, 0)] (by decide) (by decide)))
-      (.deliverReplicate _ 0 0 1 7 (by decide) (by decide) (by decide)
-        (by decide)))
-      -- term 2: node 0 wins with node 2's grant, base 1, zero appends
-      -- (a same-base phantom (2,1) it will prune at term 3).
-      (.startElection _ 0 (by decide)))
-      (.deliverRequestVote _ 2 0 2 1 1 (by decide) (by decide)))
-      (.deliverVote _ 0 2 2 (by decide) (by decide) (by decide)))
-      (.becomeLeader _ 0 (by decide) (by decide)))
-      -- term 3: node 0 crash-restarts (leaders don't campaign) and wins
-      -- with NODE 1's grant (logOk: lastTerm 2 > 1) — node 1 persists its
-      -- vote at term 3 and its intake gate closes.
-      (.crashRestart _ 0))
-      (.startElection _ 0 (by decide)))
-      (.deliverRequestVote _ 1 0 3 2 1 (by decide) (by decide)))
-      (.deliverVote _ 0 1 3 (by decide) (by decide) (by decide)))
-      (.becomeLeader _ 0 (by decide) (by decide)))
-      (.leaderAppend _ 0 9 (by decide)))
-      -- THE FINDING: node 1 reboots — persisted term 3 survives, the gate
-      -- reopens — and reports (term 3, durable 2) over its term-1 tail.
-      (.crashRestart _ 1))
-      (.sendReport _ 1 (by decide) (by decide)))
-      (.deliverReport _ 0 1 3 2 (by decide) (by decide) (by decide)
-        (by decide)))
-      (.leaderAdvanceCommit _ 0 2 (by decide)
-        (advance_fires ⟨[2, 0], 2, 0⟩ 2 2 (by decide) (by decide)
-          (by simp [CommitTracker.advance, CommitTracker.ranking,
-                List.mergeSort]))))
-      -- term 4: node 1 wins with node 2's grant — a later-term leader
-      -- missing the committed entry.
-      (.startElection _ 1 (by decide)))
-      (.deliverRequestVote _ 2 1 4 1 2 (by decide) (by decide)))
-      (.deliverVote _ 1 2 4 (by decide) (by decide) (by decide)))
-      (.becomeLeader _ 1 (by decide) (by decide)),
-    by decide, by decide, by decide, by decide, by decide⟩
+/-! Finding #5's machine-checked countermodel
+(`finding_boot_gate_stale_report_lc_violation`, a 27-step kernel-decided
+trace) lived here while the boot-open gate was Rust-as-shipped; with the
+fix mirrored into `crashRestart` (module doc, item 5) the trace's
+`sendReport` step is no longer enabled for the rebooted voter (its
+recovered term 3 exceeds its map's last term 1 ⇒ `reconciled = false`),
+the theorem became unprovable, and it was DELETED in the same commit as
+the Rust fix — see the LB1 task report and the lean gate doc for the
+full trace. -/
 
 #print axioms nonvacuity_commit_completeness_trace
-#print axioms finding_boot_gate_stale_report_lc_violation
 #print axioms election_safety
 #print axioms log_matching
 

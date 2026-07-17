@@ -898,25 +898,43 @@ impl World {
                     //             counted toward commit.
                     //   RawM3     (shipped M3 receiver): report the raw durable —
                     //             the phantom-commit source the oracle must catch.
-                    //   Mechanism (real intake gate): raw durable, but the report
-                    //             is SUPPRESSED ENTIRELY while the gate is closed
-                    //             (handled below) — never clamped.
+                    //   Mechanism (real intake gate): reports ride the report
+                    //             FLOOR below (every archive step while the gate
+                    //             is open, advance or not — the receiver.rs
+                    //             20 ms floor mirror), not this advance-
+                    //             triggered send; a closed gate suppresses the
+                    //             report ENTIRELY — never clamped.
                     let reportable = match self.cfg.data_plane {
-                        DataPlane::Gated => new_durable.min(self.nodes[node].matched),
-                        DataPlane::RawM3 | DataPlane::Mechanism { .. } => new_durable,
+                        DataPlane::Gated => Some(new_durable.min(self.nodes[node].matched)),
+                        DataPlane::RawM3 => Some(new_durable),
+                        DataPlane::Mechanism { .. } => None,
                     };
-                    let suppressed = matches!(self.cfg.data_plane, DataPlane::Mechanism { .. })
-                        && !self.nodes[node].intake_gate;
-                    if !suppressed {
-                        self.send(
-                            node,
-                            leader,
-                            Msg::Report { from: id, term, durable: reportable },
-                            now,
-                        );
+                    if let Some(durable) = reportable {
+                        self.send(node, leader, Msg::Report { from: id, term, durable }, now);
                     }
                 }
             }
+        }
+        // Mechanism report FLOOR (mirrors `uc2_net/src/receiver.rs` 1052-1078):
+        // the real receiver re-sends its AppendPosition on a 20 ms floor while
+        // the intake gate is OPEN — WITHOUT requiring a durable advance.
+        // Modeled on the archive cadence. This is the datagram that races the
+        // leader's 100 ms idle map re-ship, and the delivery vehicle for
+        // Finding #5 (lean gate doc 2026-07-16): a REBOOTED node's durable
+        // never advances until it re-accepts data, so an advance-triggered-only
+        // report model could not express the boot-open-gate phantom report at
+        // all. Gate closed ⇒ suppressed ENTIRELY (never clamped), exactly like
+        // the advance path.
+        if self.nodes[node].up
+            && !self.nodes[node].truncating
+            && matches!(self.cfg.data_plane, DataPlane::Mechanism { .. })
+            && self.nodes[node].intake_gate
+            && let Some(leader) = self.nodes[node].leader_hint
+            && leader != node
+        {
+            let (id, term, durable) =
+                (self.nodes[node].id, self.nodes[node].sm.current_term(), self.nodes[node].durable);
+            self.send(node, leader, Msg::Report { from: id, term, durable }, now);
         }
         // Mechanism C-1 CONTINUOUS LEAK: an erroneously-OPEN intake gate during a
         // truncation ships the stale (un-re-primed) AppendPosition = the raw
@@ -988,9 +1006,21 @@ impl World {
         for c in &mut nd.cursors {
             *c = 0;
         }
-        // Rebuilt receiver: gate open, no reconcile armed, adopted term = the
-        // term the persisted vote restored (mirrors uc2_node boot).
-        nd.intake_gate = true;
+        // Rebuilt receiver (mirrors uc2_node boot). Finding #5 (lean gate doc
+        // 2026-07-16, leader-completeness effort): boot-open gate + persisted
+        // vote over an unreconciled divergent tail = phantom commit; boot
+        // closed iff vote_term > map_term — reconcile must complete before
+        // this node's reports may certify. Recovery is `max(vote, map)`
+        // (`ElectionSm::new`), so a voter that granted term T and crashed
+        // before reconciling reboots AT term T over a tail no T-leader
+        // validated; the report floor would certify it into a phantom commit
+        // (the `rebooted_unreconciled_voter_must_not_certify_phantom_commit`
+        // pin turns RED if this boots unconditionally open). Reopen rides the
+        // existing arms (clean-reconcile / truncate-ack / BecomeLeader).
+        // Adopted term = the recovered term.
+        let vote_term = vote.map(|(t, _)| t).unwrap_or(0);
+        let map_term = nd.term_map.last().map(|&(t, _)| t).unwrap_or(0);
+        nd.intake_gate = vote_term <= map_term;
         nd.adopted_term = nd.sm.current_term();
         nd.pending_trunc_to = None;
         self.checker.on_restart(node);
