@@ -393,8 +393,10 @@ theorem) were **Approved on first review pass** (fable impl + fable review,
 same reviewer discipline as S1/S2).
 
 **Model growth over the Phase-2 election model** (`Uc2Proofs/ProtocolData.lean`,
-508 lines, layered — `Uc2Model/`, `Protocol.lean`, and `ElectionSafety.lean`
-all untouched except one sanctioned election-model extension, below): the
+511 lines as of this task's gate run — 508 as LA1 left it, +3 from this
+task's `deliverReplicate` docstring fix, §3 below; `wc -l`-verified),
+layered — `Uc2Model/`, `Protocol.lean`, and `ElectionSafety.lean` all
+untouched except one sanctioned election-model extension, below): the
 spike's `havocData` stand-in is replaced by a real per-node payload history
 (`hist : Nat → Option (Nat × Nat)`, position ↦ `(term-stamp, payload)`) and
 data-stamped term map, driven by an **11-constructor** `Step` relation — the
@@ -461,19 +463,36 @@ divergence LM-core would otherwise catch.
 sub-spike measured exactly where that over-approximation stops being free.**
 The brief's stretch goal ("same `(p, t)` on both nodes ⇒ histories agree at
 every `q ≤ p` within term `t`'s span") is refuted by a paper countermodel
-(4 nodes — `n ≥ 4` is load-bearing, per the countermodel's need for a
-term-1 leader, a node that only partially replicates and independently wins
-term 5, and a third node that later accepts a stale floating frame): a
-term-1 leader ships `(0,1,a),(1,1,b)`; node A holds both and later accepts a
-floating term-2 frame `(2,2,c)` at its frontier (permitted by the `≤` guard);
-node B holds only `(0,1,a)`, wins term 5 on durable 1, appends `(1,5,y)`, then
-— at `currentTerm = 5` — *also* accepts the still-floating term-2 frame
-`(2,2,c)` (stamp 2 ≤ 5, and it lands at B's frontier, position 2). A and B
-now agree at the shared pivot position 2 — both hold `(2,c)` there, the `(p,
-t)` pair the prefix-form's hypothesis is about — but disagree at position 1,
-strictly *below* that pivot: node A's entry there is `(1,b)` (from the
-original term-1 leader), node B's is `(5,y)` (B's own term-5 append), two
-different, non-`t`-matching stamps.
+with four **named roles**, verified by LA2's review at **`n = 5`** (the
+LA2 review asserts reachability at `n ≥ 4` in general; the exact minimum
+node count has not been computed — no `n = 4` trace was exhibited, so it
+should be read as "at least 4," not "exactly 4"):
+
+- **node 0** — the term-1 leader: appends `(0,1,a)` at position 0 and
+  `(1,1,b)` at position 1, and replicates both to node 1.
+- **node 1** — the term-2 leader: having received `(0,1,a),(1,1,b)` from
+  node 0, node 1 wins term 2 and, as term-2 leader, **authors and ships**
+  the floating replicate frame `(2,2,c)` (a `leaderAppend` at node 1's own
+  frontier — the frame that later goes stale once node 1 is itself
+  deposed).
+- **node 2** — the node that later wins term 5 and accepts the stale
+  frame: holds only `(0,1,a)` (never received node 0's second byte), wins
+  term 5 on its lagging-but-sufficient credentials (durable 1), appends its
+  own `(1,5,y)` at position 1, then — now at `currentTerm = 5`, frontier
+  2 — accepts node 1's still-floating `(2,2,c)` frame via the `≤` guard
+  (stamp 2 ≤ 5, position = frontier).
+- **nodes 3 and 4** — voters: both sit at the boot credential `(lastTerm
+  0, durable 0)`, which loses to every other node's credentials in this
+  trace, so they can only ever grant (never plausibly win); they supply
+  the quorum node 2 needs to win term 5 without a grant from node 0 or
+  node 1 (both of whose credentials by then exceed node 2's, so neither
+  would grant it).
+
+Node 1 and node 2 now **agree at the shared pivot position 2** — both hold
+`(2,c)` there, the `(p, t)` pair the prefix-form's hypothesis is about —
+but **disagree at position 1**, strictly *below* that pivot: node 1's entry
+there is `(1,b)` (relayed from node 0's term-1 tenure), node 2's is `(5,y)`
+(node 2's own term-5 append), two different, non-`t`-matching stamps.
 
 This forces a precise disambiguation of "within term `t`'s span" that the
 brief's stretch statement left informal, which this memo states explicitly
@@ -562,9 +581,9 @@ precisely.
 
 | Task | Wall-clock | Output | Debug iterations | Review |
 |---|---|---|---|---|
-| LA1 (data-plane model + Finding #4 guard) | **~50 min** (~15 read, ~10 design, ~20 write, ~5 build/gate) | `ProtocolData.lean`, 508 lines, 11-constructor `Step`, projection lift + `adoptHigherTerm` | 2, both **Lean-mechanics-only** (a structure-literal field-alignment parse quirk; a `simpa`-vs-`simp;exact` transparency mismatch) | Approved, first pass |
+| LA1 (data-plane model + Finding #4 guard) | **~50 min** (~15 read, ~10 design, ~20 write, ~5 build/gate) | `ProtocolData.lean`, 508 lines as committed by LA1, 11-constructor `Step`, projection lift + `adoptHigherTerm` | 2, both **Lean-mechanics-only** (a structure-literal field-alignment parse quirk; a `simpa`-vs-`simp;exact` transparency mismatch) | Approved, first pass |
 | LA2 (`DInv` + `log_matching` + truncation trace) | **~2h15m** (~25 read, ~35 design, ~10 trace, ~40 write, ~15 build/gate, ~10 evidence/commit) | `LogMatching.lean`, 1046 lines, 5-clause `DInv` + `Cert` | 2, both **mechanics-only** (the same structure-literal quirk recurring; one `simp`/`.symm`/unification fix each) | Approved, first pass |
-| **LA1+LA2 combined** | **~3h05m (185 min)** | 1554 lines total (`ProtocolData.lean` + `LogMatching.lean`) | — | — |
+| **LA1+LA2 combined** | **~3h05m (185 min)** | 1554 lines as LA2 left them (508 + 1046; now 1557 — `ProtocolData.lean` gained +3 from this task's own docstring fix, §3 above) | — | — |
 
 In S2-equivalents (S2 = the Phase-2 spike's `ElectionSafety.lean` task,
 ~30 min — this memo's own reference unit): **185 min ÷ 30 min ≈ 6.2
