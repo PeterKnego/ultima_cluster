@@ -201,6 +201,216 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    only ever makes credentials *more* conservative; left for Tier B to
    formalize.
 
+4. **Finding #5 — CONFIRMED REAL RUST BUG, SAFETY-CLASS (commit path),
+   FIXED (2026-07-17).** Surfaced by Tier B(b)'s LB1 commit-certification
+   layer (Finding #4, the data-plane one, lives in the Phase-2 spike memo):
+   the reconciliation intake gate — THE load-bearing guard tying a term-T
+   AppendPosition report to a tail reconciled against the T-leader — did
+   not survive a reboot. `uc2_node` booted the gate OPEN (`node.rs`
+   intake-gate init: `AtomicBool::new(true)`) with `awaiting_reconcile:
+   false`, while `ElectionSm::new` recovers `current_term =
+   vote_term.max(map_term)` — so a voter that GRANTED term T (vote
+   persisted before send), held a divergent tail, and crashed before
+   reconciling rebooted AT term T with the gate open; the receiver's 20 ms
+   AppendPosition floor re-send (`receiver.rs` 1052–1078) beat the
+   leader's 100 ms idle map re-ship, the same-term report fed the
+   T-leader's `CommitTracker`, and the tracker certified a **phantom
+   commit** over content the reporter did not hold (blast radius:
+   committed-acked write loss after a leader crash; SMR apply divergence
+   in a sub-interleaving). Machine-checked first as LB1's 27-step
+   kernel-decided countermodel `finding_boot_gate_stale_report_lc_violation`
+   (the FIXED LC-core statement was provably FALSE against
+   Rust-as-shipped), then adversarially line-verified against every cited
+   Rust site.
+
+   **Disposition: FIXED (TDD, RED-first).** (a) A directed `uc2_sim`
+   scenario, `rebooted_unreconciled_voter_must_not_certify_phantom_commit`
+   (`uc2_sim/tests/scenarios.rs`), stages the exact trace — divergent
+   term-1 ex-leader grants term T, crashes at the grant, reboots, its
+   report floor races the map — and the **inv7 phantom oracle flagged it
+   RED pre-fix** (`quorum legality (inv7): phantom commit — no genuine
+   quorum`, seed 3: term-4 leader certified 2880 against a genuine
+   quorum-frontier of 2784) and **GREEN post-fix**, validating both the
+   oracle and the fix; the scenario stays as the permanent regression pin
+   (it also asserts the closed-gate boot's liveness: one extra reconcile
+   round, then genuine commits resume). Expressing the trace required
+   mirroring the receiver's 20 ms report FLOOR into the sim's `Mechanism`
+   data plane (`world.rs` archive step — reports were previously
+   advance-triggered only, so a rebooted node could never report at all);
+   the nasty-storm crash rate was re-tuned 1000→700 ppm to stay below the
+   documented strict-inv2 benign-transient onset the more-realistic floor
+   lowered (probed over 200 seeds at 500..=1000 ppm; the unguarded C-1
+   arm still catches its phantom). (b) The Rust fix, both halves: the
+   intake gate boots CLOSED iff `vote_term > map_term` (`node.rs` gate
+   init) AND `awaiting_reconcile` boots to the same predicate (`node.rs`
+   Consensus init) — reopen rides only the EXISTING clean-reconcile /
+   truncate-ack / `BecomeLeader` arms. Completeness of the predicate:
+   `map_term >= vote_term` implies the tail's last mapped term was
+   validated under that term's leader (the map grows only via
+   `DataTermObserved` / `become_leader`; a gossip-only adoption reboots at
+   the old term and its stale reports are dropped). The sim's
+   `on_restart` mirrors the same predicate so the sim keeps modeling
+   `uc2_node` boot. (c) Model amendment (`Uc2Proofs/ProtocolCommit.lean`):
+   `crashRestart` now sets `reconciled := decide (currentTerm ≤ lastTermOf
+   termMap)`; the finding theorem became unprovable and was deleted in the
+   same commit (`lake build` green, 3026 jobs, sorry gate clean, axioms
+   unchanged). Gates re-run green: uc2_sim (23 scenarios incl. the pin +
+   both storm arms), uc2_consensus both configs, uc2_node lib, workspace
+   clippy, `lin_v2` release capstone.
+
+5. **Finding #6b — CONFIRMED REAL v2.x DATA-LOSS BUG (Raft §5.4.2 /
+   Figure 8 class, acked-write loss), FIXED (2026-07-17)** — and **Finding
+   #6a — statement gap (stamp vs commit term), model re-keyed** in the same
+   commit. Both surfaced by Tier B(b)'s LB2 adversarial invariant design
+   (two kernel-`decide`d countermodels, independently review-confirmed with
+   Rust line evidence; full record: `.superpowers/sdd/task-LB2-report.md`).
+
+   **#6b, the bug.** UC records `new_term_pos` (the NewTerm no-op frame's
+   end, `election.rs` `Event::NewTermAppended`) but applied the Raft §5.4.2
+   barrier only to linearizable reads, ingress admission, and M7
+   `propose_config` (via `serving`/`can_serve`) — NEVER to the commit
+   advance: `rank_leader` pushed `Action::AdvanceCommit` unconditionally
+   off the positions-only `CommitTracker`. At every failover inheriting an
+   uncommitted tail, followers reconcile clean (their data-stamped maps not
+   yet bumped — `DataTermObserved` rides the archive scan, i.e. durable
+   bytes) and their gate-open 20 ms AppendPosition floor reports the
+   election base BEFORE the NewTerm frame is quorum-durable, so the leader
+   routinely committed an OLD-TERM-ONLY range — acks, apply, and
+   leader-only outputs firing below the §5.4.2 barrier. Loss continuation
+   (the race): a divergent higher-`lastTerm` rival wins the next term with
+   a commit-quorum member's grant (lexicographic `logOk`; the granter's
+   stamped `last_term` still old) and truncates the committed byte
+   cluster-wide — the 46-step, n = 5 Lean countermodel
+   `finding_fig8_old_term_commit_data_loss` drove it end to end (deleted
+   with the fix).
+
+   **Disposition: FIXED (TDD, RED-first), no new state.** (a) Directed
+   `uc2_sim` scenario `old_term_range_must_not_commit_before_new_term_quorum`
+   (5 nodes, `Mechanism` data plane, seed 3): term-1 leader + one caught-up
+   follower grow an uncommitted tail; a rival wins term t2 on the other
+   trio and is isolated holding only its divergent `(t2, base)` NewTerm
+   frame; the original leader re-wins at T > t2 and the third voter's
+   post-reconcile floor reports re-replicate + certify the old-term tail.
+   **RED pre-fix** at the exact violating `AdvanceCommit` — captured
+   verbatim: `term-map prefix consistency (inv2)… node 1 committed-position
+   boundaries [(1, 0), (3, 864)] are not a leading slice of the committed
+   lineage prefix [(1, 0)] (gmc=1007)` (the commit crossed the live rival's
+   divergence base with the T-term NewTerm frame not quorum-durable).
+   ORACLE NOTE (honest deviation from the review's inv4/inv5 prediction):
+   inv4/inv5 are structurally unreachable behind inv2 in this sim — the
+   post-event inv2 sweep runs after EVERY event, so the first commit past
+   the rival's divergent boundary reds the run before any rival election
+   (inv5) or truncation (inv4) event can occur; inv2 is the EARLIEST
+   existing oracle for the class (no oracle was added or weakened), and the
+   t4 loss continuation is pinned by the Lean countermodel instead.
+   (b) The Rust fix (`uc2_consensus/src/election.rs::rank_leader`): the
+   advance/store/gossip block is clamped to `ranked ≥ new_term_pos`;
+   `new_term_pos == None` (between `become_leader` and `NewTermAppended`)
+   means NO advance; a suppressed advance does not update `commit_seen`
+   (the tracker's internal watermark advancing is harmless — the next
+   covering rank re-fires). No new state — `new_term_pos` already existed;
+   `serving` now latches unconditionally on any emitted advance (every
+   emitted advance covers the NewTerm frame by construction). M7
+   self-removal/demote step-downs are unaffected (a removal entry is a
+   current-term serving-leader append, so its commit crossing always
+   passes the clamp; both configs' suites green unchanged). (c) Scenario
+   GREEN post-fix, with the clamp asserted DIRECTLY: the commit stays
+   frozen through the entire re-replication window, the healed rival
+   reconciles inside it (one truncation at exactly its divergence base),
+   and the commit then advances past the whole inherited tail + NewTerm
+   frame in one certification — W survives. A crate-level unit pin
+   (`commit_clamped_to_new_term_base_never_certifies_old_term_only_range`)
+   pins all three clamp behaviors (None-window, below-base suppression
+   without eating the later emission, covering-advance + serving latch)
+   and was RED-verified against a temporary revert of the clamp.
+   (d) Liveness: one NewTerm replication round per election before
+   inherited-tail commit — the same round the read path already paid via
+   `serving`; verified by the scenario's resumed-commit assert and the
+   full suites (incl. both release lincheck capstones).
+   (e) Sim mirror: none needed — `uc2_sim` drives the REAL
+   `ElectionSm::rank_leader` (`world.rs` wires `uc2_consensus` directly),
+   so the clamp is automatically reflected; the only sim-side artifact is
+   the scenario itself.
+
+   **#6a, the statement gap (independent; survives the #6b fix).** The
+   ghost ledger recorded `(position, stamp, payload)` while Raft's Leader
+   Completeness (§5.4.3) keys on the COMMIT term: a stamp-`t` entry can be
+   committed at `T > t` (a re-elected leader certifying its inherited
+   prefix), and an honest intermediate-term leader `u ∈ (t, T)` owes
+   nothing about it (`finding_stamp_keyed_lc_stale_leader` +
+   `lc_core_stamp_keyed_is_false`, 23-step trace — deleted with the
+   re-key). No Rust change: UC never exposes a stamp-keyed commitment.
+   **Model re-key**: `committed` now carries `(p, stamp, T, v)` with `T` =
+   the committing leader's `currentTerm` at the advance;
+   `leaderAdvanceCommit` records it and gains the #6b enabling (`hbase`:
+   the advance must cross the term map's last entry's base — the
+   `prunePush`-maintained `(currentTerm, base)` IS the model's
+   `new_term_pos` analog, `ranked ≥ new_term_pos > base ⟺ k > base`).
+   The LC-core statement is now commit-term-keyed —
+   `(p, t, T, v) ∈ committed → leader i → T ≤ currentTerm i → hist i p =
+   some (t, v)` — recorded in `Uc2Proofs/LeaderCompleteness.lean` as LB2's
+   target; the non-vacuity trace was adapted (clamped commit
+   `(0, 1, 1, 42)` + later-term winner) and the proofs gate is green
+   (`lake build` 3027 jobs, sorry gate clean, axioms unchanged:
+   non-vacuity `[propext, Quot.sound]`, lifted safety theorems
+   `[propext, Classical.choice, Quot.sound]`).
+
+   **Storm-pin re-tune rider**: the §5.4.2 clamp is genuine
+   defense-in-depth for the M4 C-1 class too (an unguarded-reopen escaped
+   divergent report can no longer certify anything below the new leader's
+   NewTerm frame), which pushed the `mechanism_unguarded_reopen` storm
+   catch out of its documented tuning window (700 ppm: no catch over
+   200+ seeds and every probed knob; the genuine inv7 phantom first
+   reappears at crash 1000 ppm, seed 21 — proving the reopen guard is
+   still load-bearing for post-NewTerm-commit escapes). Disposition per
+   the config's "rates, not oracles" rule: the twins now run asymmetric
+   crash rates (red arm 1000 ppm, green arm at the shared 700 ppm — its
+   ceiling is the documented benign both-arms strict-inv2 transient at
+   800 ppm), and the red arm's catch predicate is SHARPENED to the inv7
+   phantom class only, so the benign transient can never satisfy the pin.
+   Full probe data in the scenario-file config comment.
+
+6. **Finding #7 — MODEL-FIDELITY gap, NOT a Rust bug (open, discharge
+   scheduled).** Surfaced by Tier B(b)'s LB2 re-run, after both #6a/#6b were
+   fixed (`.superpowers/sdd/task-LB2-rerun-report.md`): the LA1 `≤`-guard
+   over-approximation on `deliverReplicate` (`hstamp : t ≤ currentTerm`,
+   already flagged in its own docstring as the model's conservative
+   consequence of two Rust guards — see the Phase 2 spike memo's Tier B(a)
+   §3 item 4) is sound for `Uc2.Data.log_matching` but unsound for leader
+   completeness: it lets a follower accept a dead leader's in-flight stale
+   frame interleaved with the live leader's stream — a "Frankenstein log"
+   real UC structurally forbids — and then honestly report a durable
+   frontier covering the leader's commit range with divergent content
+   underneath. Machine-checked as a 33-step kernel-decided countermodel
+   (`finding_stale_replicate_replay_lc_violation` /
+   `lc_core_commit_term_keyed_is_false`, kept in
+   `Uc2Proofs/LeaderCompleteness.lean` — they refute the unconditional
+   `leader_completeness` statement, which stays refuted regardless of any
+   conditional route). Rust evidence: `uc2_net/src/receiver.rs:636-639`
+   (`if h.leadership_term_id != term { dropped_stale_term; return; }`) —
+   exact header-match, not `≤`; real replication re-serves old-stamped
+   bytes during catch-up/NAK-repair strictly inside the CURRENT leader's
+   stream, a distinction the model's record-stamp-only `Frame.replicate`
+   cannot express. **No Rust change indicated; no sim change indicated** —
+   this is a model-fidelity gap, not a protocol defect.
+
+   **Disposition: OPEN, discharge scheduled as "Option 1."** User directive
+   was a hybrid: land a conditional `leader_completeness` now (carrying a
+   new hypothesis, `FramesCurrentAuthored`, that assumes away exactly this
+   gap — designed, hand-verified sufficient/faithful/non-circular, and
+   machine-checked non-vacuous in `task-LB2b-report.md`, though the
+   `leader_completeness` theorem itself remains open for unrelated reasons)
+   while scheduling the real fix as a follow-up: split `Frame.replicate`'s
+   record stamp from a header provenance term (mirroring
+   `receiver.rs:636-639` exactly) plus a new `serveTail` leader-re-serve
+   step, which discharges `FramesCurrentAuthored` by construction rather
+   than by hypothesis — at the cost of `Uc2.Data.log_matching`
+   (`LogMatching.lean`, 1046 lines) needing to re-green under the extended
+   model per the LA1 layering rules. Not started as of this gate. Full
+   record, cost accounting, and the options for what to do next:
+   `docs/benchmarks/uc2-lean-phase2-spike-2026-07-17.md`'s **"Tier B(b)
+   actuals + re-gate"** section.
+
 ### Restatements (recorded for completeness, not spec gaps)
 
 - `commit_certified_run` (C3, run form) was **strengthened**, not weakened: an
@@ -277,8 +487,35 @@ stretch prefix-form is dropped with a countermodel (false in the model,
 in the lineage/map reading only — see the memo). Measured cost (~6.2
 S2-equivalents) and the re-priced (b)/(c) estimates, plus a GO recommendation
 for (b) leader completeness, are in the memo's **"Tier B(a) actuals +
-re-gate"** section (same file as above). Next formal-methods decision: (b)
-leader completeness, per that section's recommendation.
+re-gate"** section (same file as above).
+
+**Tier B(b) leader-completeness sub-spike complete 2026-07-18** (branch
+`uc2/lean-leader-completeness`): **election safety + log-matching proved;
+leader completeness conditional-partial (`FramesCurrentAuthored`), 2 shipped
+bugs found+fixed en route.** Spelled out: `Uc2.Data.log_matching` and both
+levels of `election_safety` stay green, lifted into a new commit-plane layer
+(`Uc2Proofs/ProtocolCommit.lean`, kernel `CommitTracker` consumed, ghost
+committed ledger); `leader_completeness` itself is NOT proved — a
+conditional hypothesis (`FramesCurrentAuthored`) plus two supporting
+unconditional lemmas plus a required non-vacuity trace are landed and
+machine-checked in `Uc2Proofs/LeaderCompleteness.lean`, but the theorem
+closing the induction is open (Finding #7 above names exactly the gap the
+hypothesis carries away; discharging it is the scheduled "Option 1"
+follow-up). Along the way, the sub-spike's adversarial invariant design
+found and FIXED two real, shipped safety bugs — Finding #5 (a boot-time
+phantom-commit hazard on the commit path) and Finding #6b (a Raft
+§5.4.2/Figure-8-class acked-write-loss bug) — plus re-keyed one statement
+gap (Finding #6a). All four findings and their dispositions are in this
+doc's Findings section (items 4-6 above); the full actuals (measured
+cost — this sub-spike ran ~6-12× over its own 3–6 S2-equivalent estimate,
+the opposite of Tier B(a)'s in-range result), the hybrid-plan follow-ups, and
+the honest re-price of (c) state-machine safety (now gated on finishing
+(b)) are in the memo's **"Tier B(b) actuals + re-gate"** section (same file
+as above). Next formal-methods decision: presented, not resolved, in that
+section's recommendation — finish `leader_completeness` (Option 2 more
+sessions, on sonnet or fable), do the Option 1 model refinement first, or
+pause further proving on leader completeness given the two shipped-bug fixes
+already banked.
 
 ---
 
@@ -288,7 +525,14 @@ prune (see its Disposition paragraph); Phase 1.5 attempted and exited at the
 aeneas/Lean-4.32 version wall (see Phase 1.5 status above). The Phase 2
 election-safety spike (spec §7) is complete — see the Phase 2 spike section
 above and its memo. Its Tier B(a) log-matching sub-spike is also complete
-(see the Phase 2 spike section) — `log_matching` is proved, and the memo's
-re-gate section prices and recommends GO on (b) leader completeness next.
-Other options when desired: a Phase 1.5 retry once aeneas supports
-Lean ≥ 4.32.
+(see the Phase 2 spike section) — `log_matching` is proved. Its Tier B(b)
+leader-completeness sub-spike is also complete, but did not finish: election
+safety and log-matching stay proved, `leader_completeness` itself lands only
+conditionally (open theorem, `FramesCurrentAuthored` hypothesis), and the
+sub-spike found and fixed two real, shipped safety bugs (Findings #5, #6b)
+plus one statement re-key (#6a) along the way (Finding #7, model-fidelity,
+is the reason the conditional route exists at all) — see the Phase 2 spike
+section above and the memo's "Tier B(b) actuals + re-gate" section for the
+full record, cost accounting, and the presented (not resolved) options for
+what to do next. Other options when desired: a Phase 1.5 retry once aeneas
+supports Lean ≥ 4.32.

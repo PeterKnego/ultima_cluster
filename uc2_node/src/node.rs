@@ -513,7 +513,25 @@ impl Node {
         let term_handle: TermHandle = Arc::new(AtomicU32::new(boot_term));
         let leader_flag = Arc::new(AtomicBool::new(false));
         let can_serve_flag = Arc::new(AtomicBool::new(false));
-        let intake_gate = Arc::new(AtomicBool::new(true)); // open until a term is adopted
+        // Finding #5 (lean gate doc 2026-07-16, leader-completeness effort):
+        // boot-open gate + persisted vote over an unreconciled divergent tail =
+        // phantom commit; boot closed iff vote_term > map_term — reconcile must
+        // complete before this node's reports may certify. Term recovery is
+        // `max(vote_term, map_term)` (`ElectionSm::new`), so a voter that
+        // granted term T (vote persisted) and crashed BEFORE reconciling
+        // reboots AT term T holding a tail the T-leader never validated; with
+        // the gate open its 20 ms AppendPosition floor report
+        // (`receiver.rs`) races the leader's 100 ms idle map re-ship and can
+        // certify a commit over content it does not hold. `map_term >=
+        // vote_term` is the safe complement: the map grows only via
+        // DataTermObserved / become_leader, so a tail whose last mapped term
+        // reaches the vote term was validated under that term's leader.
+        // Reopen rides the EXISTING arms only (clean-reconcile, truncate-ack,
+        // BecomeLeader): liveness cost is one extra reconcile round.
+        let vote_term = recovered_vote.map(|(t, _)| t).unwrap_or(0);
+        let map_term = rederived.last().map(|&(t, _)| t).unwrap_or(0);
+        let boot_awaiting_reconcile = vote_term > map_term;
+        let intake_gate = Arc::new(AtomicBool::new(!boot_awaiting_reconcile));
         let truncations = Arc::new(AtomicU64::new(0));
         let wipes = Arc::new(AtomicU64::new(0));
         let reports_implausible = Arc::new(AtomicU64::new(0));
@@ -798,7 +816,11 @@ impl Node {
             base: Instant::now(),
             durable_seen: durable,
             adopted_term: boot_term,
-            awaiting_reconcile: false,
+            // Finding #5 (see the intake-gate boot init above): a recovered
+            // vote term beyond the data-stamped map arms the reconcile latch
+            // at boot, so the first clean reconcile / truncate-ack for the
+            // recovered term is what reopens the gate.
+            awaiting_reconcile: boot_awaiting_reconcile,
             pending_truncation: None,
             output_persisted_completed: output_progress,
             output_progress_last_persist_ns: None,

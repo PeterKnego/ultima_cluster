@@ -737,3 +737,391 @@ framing:
   finding (#4 and the prefix-form boundary) added to Phase 1's three since
   the original gate — the finding-yield trend, if anything, continues to
   favor continuing.
+
+## Tier B(b) actuals + re-gate
+
+**Date:** 2026-07-18. **Branch:** `uc2/lean-leader-completeness` (base
+`main` @ `9ee8e00`, the Tier B(a) merge). Plan:
+`docs/superpowers/plans/2026-07-17-uc2-lean-leader-completeness.md` (LB1
+commit machinery / LB2 `leader_completeness` / LB3, this section). Task
+detail: `.superpowers/sdd/task-LB1-report.md`,
+`.superpowers/sdd/finding5-fix-report.md`,
+`.superpowers/sdd/task-LB2-report.md`,
+`.superpowers/sdd/finding6-fix-report.md`,
+`.superpowers/sdd/task-LB2-rerun-report.md`,
+`.superpowers/sdd/task-LB2b-report.md`; ledger: `.superpowers/sdd/progress.md`
+("TIER B(b) LEADER COMPLETENESS" onward). Gate re-run for this doc:
+`cd proofs && lake build && ! grep -rn --include='*.lean' -w 'sorry'
+Uc2Model Uc2Proofs Conform` — `3027 jobs`, zero `sorry`, `GATE_PASS`.
+`proofs/Uc2Proofs/ProtocolCommit.lean` is 748 lines,
+`proofs/Uc2Proofs/LeaderCompleteness.lean` is 638 lines, as of the head
+commit (`1936141`) at gate time.
+
+The original memo's §6 (above) authorized (b) leader completeness as a
+single time-boxed sub-spike capped at 6 sessions, on the strength of two
+prior sub-spikes (S1/S2, LA1/LA2) that both landed with zero
+invariant-content churn. This section is that sub-spike's actuals. Unlike
+Tier B(a) — which landed inside its estimated band (the original memo's own
+§4 above) — this sub-spike **did not land the theorem and blew its cost
+estimate by roughly an order of magnitude**, for reasons that are, on
+inspection, the opposite of a discipline failure: the sub-spike found two
+real, shipped safety bugs and one genuine model-fidelity gap, each of which
+forced a stop-the-line adjudication before proof work could continue.
+
+### 1. Result: leader completeness lands CONDITIONALLY, not unconditionally
+
+**`leader_completeness` is NOT proved.** Stated plainly, because the
+headline could easily read as a green checkmark and it is not one: the
+theorem itself does not exist anywhere in `proofs/Uc2Proofs/`. What exists,
+machine-checked and gate-green, is a **partial, conditional** landing —
+`task-LB2b-report.md`'s Option-2 deliverable:
+
+- `FramesCurrentAuthored` — a hypothesis, designed and hand-verified
+  (sufficient / faithful to `receiver.rs:636-639` / non-circular) to carry
+  away exactly the model over-approximation Finding #7 (§2 below) exploits,
+  no stronger.
+- `hist_frame_provenance` and `committed_frame_provenance` — two
+  UNCONDITIONAL supporting lemmas (no `FramesCurrentAuthored` hypothesis)
+  that every stamped history entry, and every committed ghost entry, traces
+  back to an actual frame on the wire.
+- `nonvacuity_leader_completeness_trace` — the required non-vacuity
+  witness: a reachable world satisfying `FramesCurrentAuthored` and
+  non-trivial `leader_completeness` premises.
+- **NOT landed: the `leader_completeness` theorem itself.** The
+  `becomeLeader` induction case needs supporting invariant machinery this
+  codebase does not yet have (§4 below); `task-LB2b-report.md` estimated
+  building it at "at least 3–5 more S2/LA2-scale inductions" and stopped
+  per the sub-spike's own stuck-protocol rather than sorry it, weaken it, or
+  force it through with an over-strengthened hypothesis.
+
+So: election safety and log-matching are unconditionally proved (Phase 2,
+Tier B(a)). Leader completeness is conditionally landed — sufficient
+machinery exists to state and non-vacuously instantiate a
+`FramesCurrentAuthored`-conditioned version, but the theorem closing the
+induction is open. State-machine safety (c) was never started. This is a
+materially different place than the original memo's phased plan (§4/§6
+above) assumed (b) would land.
+
+### 2. THE FINDINGS — the value ledger, this sub-spike's headline
+
+Four findings surfaced during this sub-spike's adversarial invariant-design
+passes, each escalated and adjudicated before any further proof attempt, per
+the plan's stuck-protocol. Two are real, shipped, now-fixed bugs; one is a
+statement-design gap; one is a model-fidelity gap. This is the actual
+deliverable of the sub-spike, independent of whether the theorem itself
+lands.
+
+**Finding #5 (FIXED — real shipped bug, safety-class, commit path).**
+`task-LB1-report.md`'s commit-certification layer surfaced this before any
+preservation proof was attempted: `uc2_node` booted the receiver intake gate
+OPEN (`node.rs`, `AtomicBool::new(true)`, was line 516) with
+`awaiting_reconcile: false` (`node.rs`, was line 801), while
+`ElectionSm::new` recovers `current_term = vote_term.max(map_term)`
+(`election.rs:400-402`) and votes persist before send. A voter that GRANTED
+term T, held a divergent tail, and crashed before reconciling rebooted AT
+term T with the gate open; the receiver's 20ms `AppendPosition` floor
+re-send (`receiver.rs:1052-1078`) could beat the leader's 100ms idle
+term-map re-ship, and the same-term report fed the T-leader's
+`CommitTracker` — a phantom commit backed by content the reporter did not
+actually hold. Machine-checked first as a 27-step kernel-decided
+countermodel (`finding_boot_gate_stale_report_lc_violation`, now deleted
+post-fix); `finding5-fix-report.md` records the RED-first directed
+`uc2_sim` scenario
+(`rebooted_unreconciled_voter_must_not_certify_phantom_commit`) that
+reproduced the same shape and turned GREEN post-fix. **Fix:** the boot gate
+now closes iff `vote_term > map_term` (`node.rs`, both the gate-init and
+`awaiting_reconcile`-init sites); reopening rides the existing
+clean-reconcile / truncate-ack / `BecomeLeader` arms — no new machinery.
+
+**Finding #6b (FIXED — real shipped data-loss bug, Raft §5.4.2 / Figure-8
+class).** `task-LB2-report.md`'s first `leader_completeness` attempt
+surfaced this: `uc2_consensus/src/election.rs::rank_leader` pushed
+`Action::AdvanceCommit` off the positions-only `CommitTracker`
+UNCONDITIONALLY; `new_term_pos` gated reads/ingress/M7-propose via
+`serving`/`can_serve` but never the commit store itself. At any failover
+inheriting an uncommitted tail, followers reconcile clean and their
+gate-open 20ms `AppendPosition` floor reports the election base BEFORE the
+NewTerm frame is quorum-durable, so the leader could commit an
+**old-term-only range** — acks/apply/leader-only outputs firing below the
+§5.4.2 barrier. The loss continuation (machine-checked as the 46-step, n=5
+countermodel `finding_fig8_old_term_commit_data_loss`, now deleted
+post-fix): a divergent higher-`lastTerm` rival wins the next term with a
+commit-quorum member's honest grant and truncates the committed byte
+cluster-wide — the committed entry ends with zero copies anywhere in the
+cluster. `finding6-fix-report.md`'s RED-first `uc2_sim` scenario
+(`old_term_range_must_not_commit_before_new_term_quorum`, 5 nodes) caught
+the same shape via the existing inv2 oracle (term-map prefix consistency —
+the review's inv4/inv5 prediction was structurally preempted by inv2 firing
+first, an honest deviation the fix report documents rather than papers
+over) and turned GREEN post-fix. **Fix:** `rank_leader`'s advance/store/
+gossip block is clamped to `ranked ≥ new_term_pos`
+(`election.rs:1451-1465`) — `None` means no advance, a suppressed advance
+does not touch `commit_seen`, no new state.
+
+**Finding #6a (statement re-key, not a Rust bug).** Independent of #6b and
+surviving its fix: the ghost ledger (LB1 decision 1) recorded
+`(position, stamp, payload)` while Raft's Leader Completeness (§5.4.3)
+quantifies over the COMMIT term, not the stamp — a stamp-`t` entry can be
+committed at `T > t` (a re-elected leader certifying its own inherited
+prefix), and an honest intermediate-term leader owes it nothing. Machine-
+checked as a 23-step countermodel
+(`finding_stamp_keyed_lc_stale_leader`/`lc_core_stamp_keyed_is_false`, both
+now deleted). No Rust change: UC never exposes a stamp-keyed commitment.
+**Fix:** the ghost now carries the commit term —
+`committed : List (Nat × Nat × Nat × Nat)` as `(p, stamp, T, v)` — and
+`leader_completeness`'s hypothesis re-keyed to `T ≤ currentTerm i` (the
+form still open, §1 above).
+
+**Finding #7 (MODEL-FIDELITY gap, NOT a Rust bug).** `task-LB2-rerun-report.md`,
+surfacing after both #6-class fixes landed: the LA1 `≤`-guard
+over-approximation on `deliverReplicate` (`hstamp : t ≤ currentTerm`,
+already flagged in its own docstring as "the model's ≤ CONSEQUENCE of two
+Rust guards," per the original memo's §3(a)/Tier B(a) §3 above) is sound for
+log-matching but unsound for leader completeness: it lets a follower accept
+a dead leader's in-flight stale frame interleaved with the live leader's
+stream — a "Frankenstein log" real UC structurally forbids — and then
+honestly report a durable frontier covering the leader's commit range with
+divergent content underneath. Machine-checked as a 33-step countermodel
+(`finding_stale_replicate_replay_lc_violation`/
+`lc_core_commit_term_keyed_is_false`, both KEPT — they refute the
+unconditional statement, which stays refuted regardless of the conditional
+route). Rust evidence: `receiver.rs:636-639`
+(`if h.leadership_term_id != term { dropped_stale_term; return; }`) —
+exact header-match, not `≤`; real replication re-serves old-stamped bytes
+during catch-up/NAK-repair strictly inside the CURRENT leader's stream, a
+distinction the model's record-stamp-only `Frame.replicate` cannot express.
+This is what `FramesCurrentAuthored` (§1 above) assumes away, and what the
+scheduled Option 1 model refinement (§4 below) is meant to discharge by
+construction rather than by hypothesis.
+
+**The meta-point, stated as this memo's own reading of the four reports
+together:** Findings #5 and #6b were invisible to the entire empirical
+stack (`uc2_sim`'s seeded fuzz, the elle consistency harness, the WGL
+lincheck capstones) not because those oracles were poorly designed, but
+because of an **interleaving coverage gap** — both fix reports say this
+explicitly (`finding5-fix-report.md`'s "why nothing caught it before,"
+`finding6-fix-report.md`'s oracle-determination section): the existing sim
+oracles (inv7 for #5, inv2 for #6b) fire correctly and immediately the
+moment a directed scenario reaches the violating interleaving — `uc2_sim`
+just never reached it. `task-LB2-report.md` names the precise reason for
+#6b: same-disk kill-restart crashtests and 3-node elle scenarios cannot
+produce the divergent-rival, two-term-choreography shape the bug needs;
+`finding5-fix-report.md` names the analogous reason for #5 (rebooted voter
++ persisted grant + report-beats-gossip race). The prover did not invent a
+new class of defect the empirical stack was blind to in principle — it
+walked a path through the state space the empirical stack's own
+fuzz/scenario generators had structurally never walked.
+
+### 3. Measured costs
+
+**Wall-clock, by task, from the reports' own proof-cost accounting**
+(`task-LB1-report.md`, `task-LB2-report.md`, `task-LB2-rerun-report.md`,
+`task-LB2b-report.md`; the two fix reports do not carry an equivalent
+wall-clock section — see the note below):
+
+| Task | Wall-clock | Outcome |
+|---|---|---|
+| LB1 (commit machinery + non-vacuity) | ~95 min | complete, Finding #5 escalated |
+| LB2, first attempt | ~210 min (3.5h) | BLOCKED — Finding #6a + #6b |
+| LB2, re-run | ~150 min (2.5h) | BLOCKED — Finding #7 |
+| LB2b (Option 2, hypothesis + lemmas + non-vacuity) | ~630 min (10.5h, summed from the report's own stage breakdown: ~2.5h reading + ~1.5h hypothesis design + ~2.5h mechanizing the two lemmas + ~1.5h the non-vacuity trace + ~2h proof-strategy analysis + ~0.5h docstrings/gate) | PARTIAL — theorem itself BLOCKED |
+| **Measured Lean-task total** | **~1085 min ≈ 18h05m** | |
+
+In S2-equivalents (S2 = the Phase-2 spike's `ElectionSafety.lean` task,
+~30 min — the original memo's own reference unit, §2 above): **1085 min ÷
+30 min ≈ 36.2 S2-equivalents**, against the original memo's §6 estimate of
+**3–6 S2-equivalents for (b)**. That is a **~6–12× overrun on the Lean-task
+time alone** — before folding in the two Rust fix cycles at all.
+
+**Honest gap in the record:** `finding5-fix-report.md` and
+`finding6-fix-report.md` do not report a wall-clock total the way the four
+Lean-task reports do (grepped for "wall-clock"/"hour"/"minutes" — none
+present). Both cycles were real, substantial engineering effort by their
+own deliverable lists — RED-first directed `uc2_sim` scenario construction
+(one new sim fidelity mechanism for #5's 20ms report-floor mirror; a 5-node
+scripted-partition scenario for #6b), a Rust source fix, a `Uc2Proofs/
+ProtocolCommit.lean` model amendment plus finding-theorem deletion, a storm
+crash-rate re-tune with a multi-point ppm probe sweep for each, and a full
+cross-crate gate re-run (`uc2_sim`, `uc2_consensus` both feature configs,
+`uc2_node --lib`, workspace clippy, `lin_v2`, and for #6b also
+`lin_partition_v2`) — but this memo will not fabricate a number where the
+source record has none. The true total is **the measured ~18h05m of
+Lean-task time PLUS an unrecorded, additive amount for the two fix
+cycles** — meaning 36.2 S2-equivalents is a floor on the sub-spike's actual
+cost, not the whole of it.
+
+**This is the opposite pattern from Tier B(a).** The original memo's own
+Tier B(a) section (above) measured LA1+LA2 at ~6.2 S2-equivalents against a
+3–7 estimate — inside the band, near its top, and explicitly called out
+there as "a real contrast with the Phase 2 spike's own ~100× overestimate:
+this time the effort estimate was, if anything, close to accurate." Tier
+B(b) breaks that emerging pattern in the other direction: not because the
+proof mechanics were hard (LB1, LB2, and the LB2 re-run each report **zero
+failed build iterations** — every countermodel type-checked on the first
+`lake build`), but because the adversarial invariant-design phase kept
+surfacing genuine defects — two real bugs and one model-fidelity gap —
+each of which stopped the clock for an out-of-band Rust-fix-and-regate
+cycle before Lean work could resume. The R4-class "informal contract turns
+out insufficient" risk that stayed dormant through S1/S2 and LA1/LA2 (the
+original memo flagged this dormancy explicitly at each prior gate) did not
+recur here in that exact form — instead, the sub-spike's proof pressure hit
+something arguably more valuable and more expensive: real protocol bugs,
+not just proof-statement gaps.
+
+### 4. The hybrid plan + follow-ups
+
+The user's directive after Finding #7 (`progress.md`: "USER DECISION:
+HYBRID (Option 2 first — conditional LC now; Option 1 model-refinement to
+discharge later, scheduled follow-up. Fable out of credits → sonnet.")
+structures what remains:
+
+- **Option 2 (this sub-spike, `task-LB2b-report.md`): PARTIAL.**
+  `FramesCurrentAuthored` + `hist_frame_provenance` +
+  `committed_frame_provenance` + `nonvacuity_leader_completeness_trace` are
+  landed and machine-checked (§1 above). The `leader_completeness` theorem
+  itself is OPEN. `task-LB2b-report.md`'s own "Recommendation for the next
+  attempt" lists the remaining work in dependency order:
+  1. Prove `Uc2.TermMap.Ascending` is a maintained world invariant — it
+     exists as a pure predicate in `Uc2Model/TermMap.lean` but, per the
+     report's own `grep -rn Ascending Uc2Proofs/*.lean` check, nothing
+     outside `Reconcile.lean` establishes it holds across reachable worlds.
+  2. Prove a message-indexed report-provenance clause over `CMsg.report`,
+     mirroring `ElectionSafety.lean`'s `Inv.grant_state` pattern (an S2-era
+     artifact) applied to the commit-plane report messages instead of vote
+     messages.
+  3. Prove `committed_term_at_leaders` (the report's working name for the
+     invariant clause the `becomeLeader` induction needs), consuming (1)
+     and (2) plus the already-public `quorum_intersect` (C5) and
+     `logOk_iff` (V2).
+  4. Assemble `leader_completeness` from (3) plus the already-landed
+     `hist_frame_provenance`/`committed_frame_provenance` and the
+     unconditionally-proved `Uc2.Data.log_matching`.
+  `task-LB2b-report.md` estimates this at "at least 3–5 more S2/LA2-scale
+  inductions."
+- **Option 1 (scheduled, NOT started): frame header/stamp split +
+  `serveTail`.** `task-LB2-rerun-report.md`'s recommended fix: give
+  `Frame.replicate` both a header term (provenance — must equal the
+  receiver's currently-adopted term, mirroring `receiver.rs:636-639`
+  exactly rather than approximating it) and a record stamp, plus a new
+  `serveTail` leader step modeling the real NAK-repair/journal-replay path
+  by which old-stamped bytes legitimately reach a reconciled follower under
+  the CURRENT leader's header. This discharges `FramesCurrentAuthored`
+  entirely — it becomes a provable fact rather than a standing hypothesis —
+  at the cost of touching `Uc2Proofs/ProtocolData.lean`'s `Frame` shape,
+  which per the LA1 layering rules requires `Uc2.Data.log_matching`
+  (`LogMatching.lean`, 1046 lines) to re-green in the same task.
+  `progress.md`'s own gloss on this fix's scope: "~2–3 S2-eq model work
+  before the LC proof itself" — i.e. before whatever remains of Option 2's
+  four-step list above, since the `becomeLeader` invariant machinery is
+  needed either way.
+- **Tooling.** `progress.md` records that fable (the model used for LB1
+  and both LB2 BLOCKED-with-countermodel attempts) hit its credit limit
+  mid-task during the LB2 re-run's adjudication, forcing implementers and
+  reviewers onto sonnet from LB2b onward. Sonnet landed a genuinely useful
+  partial result (§1 above) but self-assessed the remaining
+  `becomeLeader`-endgame work as exceeding its own stuck-protocol ceiling.
+  Read against the arc's track record — fable closed S2's invariant
+  discovery, LA1/LA2's data-plane layering and log-matching proof, and both
+  LB2 countermodel discoveries, each within a single measured session — the
+  remaining LC-closing work (an `Ascending` world invariant plus a
+  message-indexed provenance clause plus a `becomeLeader` quorum-intersect
+  endgame) looks, on this memo's own reading of the pattern, like the kind
+  of invariant-discovery task this arc has consistently routed to fable
+  rather than sonnet. Whether that observation should gate the next attempt
+  on fable-credit availability is a scheduling call, not a technical one
+  this memo settles (§6 below).
+
+### 5. Re-pricing (c) state-machine safety
+
+The original memo's §5/§6 above (the Tier B(a) re-gate) priced (c) at
+**4–9 S2-equivalents / 3–6 sessions, strictly on top of (a)+(b)** — a
+pricing that implicitly assumed (b) would be a COMPLETE, unconditional
+`leader_completeness` by the time (c)'s design work started, the same way
+(a) was complete and unconditional when (b) was priced.
+
+That assumption no longer holds. (c) composes an inv4-analog
+(non-truncation of committed bytes) with an inv5-analog (election above
+commit) — both explicitly named as needing (b)'s commit-counter machinery
+as a dependency in the original memo's own §5 above ("Composing inv4 …
+with inv5 … also strictly needs (b)'s commit counter first"). A conditional
+`leader_completeness` is not the same dependency as a complete one: (c)
+would either have to (i) wait for `leader_completeness` to close
+unconditionally, or (ii) inherit `FramesCurrentAuthored` as its own standing
+hypothesis, compounding rather than resolving the conditionality one layer
+further into the arc's most safety-critical theorem. This memo does not
+pick between those two options — that is a design call for whoever starts
+(c), informed by whichever of §6's recommendations the user picks first.
+
+**Re-estimate: (c) is now gated on finishing (b), and "finishing (b)"
+itself costs more than the original 3–6 S2-equivalents already spent.**
+Stacking the two scheduled pieces of remaining (b) work: Option 1's
+"~2–3 S2-eq model work" (`progress.md`'s own gloss, §4 above) plus Option
+2's remaining "at least 3–5 more S2/LA2-scale inductions"
+(`task-LB2b-report.md`, §4 above) — noting these are not strictly additive
+if Option 1 lands first and simplifies what Option 2's remaining steps need
+to prove, but no report has re-derived that simplification, so treating
+them as additive is the honest default — puts finishing (b) at roughly
+**5–8 more S2-equivalents** on top of the ~36.2 already measured, before
+(c) can even begin its own estimated 4–9 S2-equivalents. Total to reach a
+complete (c): **roughly 9–17 S2-equivalents of NEW work from here**, on top
+of the ~36.2 (plus the two fix cycles' unrecorded time) already spent on
+(b).
+
+**The explicit honest caveat this memo owes, given §3 above:** (b)'s own
+3–6 S2-equivalent estimate missed the actual by 6–12×, and the miss was not
+a calibration error in the usual sense — it came from real bugs the
+adversarial proof process found, which by nature cannot be foreseen by an
+estimate made before the invariant-design pass happens. There is no
+principled reason to expect the 9–17 S2-equivalent number above is any
+better calibrated than the number it revises. Read it as a floor, stated
+with the same honesty the original memo applied to its own ~100×
+Phase-2-spike miss (§2 above): informative for ordering-of-magnitude
+planning, not a number to schedule against precisely.
+
+### 6. Recommendation
+
+Given three real findings (two shipped bugs fixed, one model-fidelity gap
+scheduled but not yet discharged) and a partial-but-genuinely-useful
+mechanized landing, this memo presents the options rather than picking one
+— consistent with how the arc has handled every prior stop-the-line
+decision (Finding #3's disposition options in the Phase 1 gate doc,
+Findings #5/#6/#7's escalations in this sub-spike, and the original
+hybrid-vs-full-refinement decision after Finding #7 itself):
+
+1. **Continue Option 2 now, more sonnet sessions.** Directly consumes
+   `task-LB2b-report.md`'s landed machinery
+   (`FramesCurrentAuthored`/`hist_frame_provenance`/
+   `committed_frame_provenance`/the non-vacuity trace) via its own
+   dependency-ordered four-step list (§4 above). Risk: sonnet already hit
+   its stuck-protocol ceiling once on exactly this remaining work; even a
+   clean landing leaves `leader_completeness` **permanently conditional**
+   on `FramesCurrentAuthored` unless Option 1 is done afterward anyway.
+2. **Wait for fable credits, then continue Option 2 with fable.** This
+   arc's track record (§4 above) suggests fable is the better-matched tool
+   for the remaining invariant-discovery work specifically. Risk: unknown
+   timeline for credit availability; still leaves the theorem conditional
+   even on success, same as option 1 above.
+3. **Do Option 1 first** (frame header/stamp split + `serveTail`,
+   `LogMatching.lean` re-green), converting the eventual
+   `leader_completeness` into a strictly stronger, UNCONDITIONAL theorem
+   rather than one permanently carrying `FramesCurrentAuthored`. This is
+   the follow-up the user already scheduled at the Finding #7 adjudication.
+   Likely the most expensive of the three paths in isolated cost (touches
+   the data-plane model + a 1046-line re-green), but the only one that
+   retires the model-fidelity debt Finding #7 identified rather than
+   working around it.
+4. **Treat the arc's bug-finding as the deliverable and pause further
+   proving on leader completeness.** Two real, shipped safety bugs
+   (Findings #5 and #6b) were found and fixed as a direct, measurable
+   result of this sub-spike's proof pressure — permanent value, already
+   banked, independent of whether the theorem itself is ever finished. Per
+   §2 above, neither bug was an oracle-design gap the empirical stack
+   (`uc2_sim`/elle/lincheck) could have been tuned to catch without the
+   adversarial invariant-design process that found them; pausing does not
+   retroactively lose that value. Cost: (c) stays permanently blocked and
+   the arc's own `(a) → (b) → (c)` phased plan (original memo's §4 above)
+   stops one theorem short of state-machine safety.
+
+This memo does not recommend among these four — §5's honest re-price and
+§3's honest cost accounting are offered as the inputs to that call, not a
+conclusion in place of it.

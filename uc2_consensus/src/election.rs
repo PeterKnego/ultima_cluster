@@ -1422,6 +1422,38 @@ impl ElectionSm {
         if let Some(c) = self.tracker.advance(self.durable)
             && c > self.commit_seen
         {
+            // Finding #6b (lean leader-completeness effort, gate doc
+            // 2026-07-16): Raft §5.4.2 — never commit a prior-term range by
+            // counting replicas; clamp to the current term's NewTerm base.
+            // The positions-only `CommitTracker` ranks bare durable reports,
+            // so right after an election it certifies the election base off
+            // honest post-reconcile AppendPosition floor reports BEFORE this
+            // term's NewTerm frame is quorum-durable — an OLD-TERM-ONLY
+            // range. Committed there, acks/apply/outputs fire below the
+            // §5.4.2 barrier, and a divergent higher-lastTerm rival can
+            // still win the next term with a commit-quorum member's grant
+            // (the granters' data-stamped `last_term` has not reached this
+            // term yet) and truncate the committed bytes cluster-wide —
+            // the classical Figure-8 acked-write loss. The barrier: advance
+            // / store / gossip ONLY once the ranked position covers
+            // `new_term_pos` (the same latch `serving` uses for reads and
+            // M7 proposals — the commit store was the one consumer missing
+            // it). `None` — the window between `become_leader` and
+            // `Event::NewTermAppended` — means NO advance. A suppressed
+            // advance must NOT update `commit_seen` (only a real emitted
+            // advance does); `tracker.commit` advancing internally is
+            // harmless — the next covering rank re-fires. Liveness cost is
+            // one NewTerm replication round per election, which the read
+            // path already pays via `serving`. Sim pin:
+            // `old_term_range_must_not_commit_before_new_term_quorum`;
+            // Lean countermodel (deleted with this fix):
+            // `finding_fig8_old_term_commit_data_loss`.
+            let Some(pos) = self.new_term_pos else {
+                return;
+            };
+            if c < pos {
+                return;
+            }
             self.commit_seen = c;
             // This advance carries the gossip; reset the idle floor so it does
             // not double-fire right after (spec §6 re-gossip cadence).
@@ -1431,18 +1463,16 @@ impl ElectionSm {
             // Piggyback the term map on the commit-gossip cadence so a lagging
             // or reconnecting follower can reconcile (spec §M4).
             out.push(Action::ShipTermMap { entries: self.term_map_wire_tail() });
-            // Serving gate. Note we intentionally do NOT reset the embedded
-            // `tracker.commit` across terms, yet this can only flip `serving`
-            // true on a genuinely-new-term commit: byte positions are globally
-            // monotone, so this term's `new_term_pos > base = durable >=
-            // commit_seen`. A quorum on `new_term_pos` therefore requires a
-            // commit strictly beyond anything a prior term produced, so a stale
-            // carry-over commit can never satisfy `c >= pos` for this term.
-            if let Some(pos) = self.new_term_pos
-                && c >= pos
-            {
-                self.serving = true;
-            }
+            // Serving gate: every emitted advance now has `c >= new_term_pos`
+            // (the §5.4.2 clamp above), so this term's NewTerm frame is
+            // quorum-committed the moment ANY advance fires — latch serving
+            // unconditionally. (Pre-clamp this was `c >= new_term_pos` as a
+            // separate check; note we still intentionally do NOT reset the
+            // embedded `tracker.commit` across terms — byte positions are
+            // globally monotone, so this term's `new_term_pos > base =
+            // durable >= commit_seen` and a stale carry-over commit can never
+            // have satisfied the clamp for this term.)
+            self.serving = true;
             // M7 Task 8: leader self-removal completion. `adopt_config` kept
             // this leader serving through the adoption window (a leader
             // removing itself must keep appending until C_new itself
@@ -1803,6 +1833,59 @@ mod tests {
             .chain(acts2.iter())
             .any(|a| matches!(a, Action::AdvanceCommit { commit: 32 }));
         assert!(advanced, "quorum on the NewTerm frame must commit it");
+        assert!(s.can_serve());
+    }
+
+    /// Finding #6b (Raft §5.4.2 / Figure 8, lean gate doc 2026-07-16): a
+    /// leader must never commit a PRIOR-term range by counting replicas —
+    /// the commit advance is clamped to this term's NewTerm base. Pre-fix,
+    /// `rank_leader` pushed `AdvanceCommit` unconditionally: quorum reports
+    /// at the election base (inherited old-term bytes) committed an
+    /// old-term-only range before the NewTerm frame was quorum-durable, and
+    /// a divergent higher-lastTerm rival could then truncate the committed
+    /// bytes cluster-wide. Three pins: (a) `new_term_pos == None` (the
+    /// window between `become_leader` and `NewTermAppended`) means NO
+    /// advance; (b) a ranked position below `new_term_pos` is suppressed
+    /// (and must NOT bump `commit_seen` — the later covering advance still
+    /// emits); (c) the first emitted advance covers `new_term_pos` and
+    /// latches `serving`.
+    #[test]
+    fn commit_clamped_to_new_term_base_never_certifies_old_term_only_range() {
+        // Node 0 recovers an uncommitted term-1 tail [0, 100) and wins term 2.
+        let mut s = ElectionSm::new(cfg(0), None, &[(1, 0)], 100, 0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        let acts = step(&mut s, Event::Vote { from: 1, term: 2, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+        assert!(acts.iter().any(|a| matches!(a, Action::BecomeLeader { term: 2, base: 100 })));
+
+        // (a) Quorum at the election base BEFORE NewTermAppended: the ranked
+        // position (100) is a prior-term-only range — no advance at all.
+        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 100 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            "5.4.2: an old-term-only range must not commit while new_term_pos is None"
+        );
+        assert!(!s.can_serve());
+
+        // (b) NewTerm frame appended at [100, 132); a report short of it is
+        // still suppressed.
+        step(&mut s, Event::NewTermAppended { position: 132 });
+        step(&mut s, Event::DurableAdvanced { durable: 132 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 110 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            "5.4.2: a ranked position below new_term_pos must not commit"
+        );
+        assert!(!s.can_serve());
+
+        // (c) The quorum crosses the NewTerm frame: the first emitted advance
+        // covers it (the suppressed ranks above did not eat the emission) and
+        // serving latches.
+        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 132 });
+        assert!(
+            acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 132 })),
+            "quorum on the NewTerm frame must commit it (and the whole inherited prefix)"
+        );
         assert!(s.can_serve());
     }
 
