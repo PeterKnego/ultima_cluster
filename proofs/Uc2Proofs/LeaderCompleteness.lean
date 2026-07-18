@@ -1,67 +1,41 @@
 import Mathlib.Tactic.FinCases
 import Uc2Proofs.ProtocolCommit
 
-/-! LC1 (Option-1 frame-provenance refinement) — the header/stamp split
-landed; `FramesCurrentAuthored`'s unconditional discharge REFUTED
-(Finding #8).
+/-! LC1/LC1b (Option-1 frame-provenance refinement) — the header/stamp
+split + the `dataTerm` lagging-handle repair; Findings #7 AND #8 keyed out.
 
-## What LC1 landed
+## What LC1 + LC1b landed
 
-The LB2-rerun report's "recommended fix (faithful)", adjudicated as the
-LC-closure arc's decisions 1–2 and applied in `ProtocolData.lean` /
+The LB2-rerun report's "recommended fix (faithful)" (arc decisions 1–2)
+plus the adjudicated Finding-#8 repair, applied in `ProtocolData.lean` /
 `ProtocolCommit.lean`:
 
 - `Frame.replicate (pos hdr stamp payload)` — the wire header
-  (`leadership_term_id`) and the record stamp are now separate fields;
-- delivery requires an EXACT header match
-  (`hhdr : hdr = currentTerm j`, `receiver.rs:636-639`
-  `dropped_stale_term`) plus the existing intake gate; the old
-  `hstamp : stamp ≤ currentTerm` delivery guard is gone — its content
-  moved to emission-side truthfulness (`LogMatching.lean`'s `StampInv`);
-- `leaderAppend` emits `hdr = stamp = currentTerm`; the new leader-only
+  (`leadership_term_id`) and the record stamp are separate fields;
+- delivery requires an EXACT header match against the node's DATA-PLANE
+  TERM HANDLE (`hhdr : hdr = dataTerm j`, `receiver.rs:636-639`
+  `dropped_stale_term` comparing `self.term` — the handle) plus the
+  existing intake gate; the old `hstamp : stamp ≤ currentTerm` delivery
+  guard is gone — its content moved to emission-side truthfulness
+  (`LogMatching.lean`'s `StampInv`, whose `data_le` clause carries the
+  handle lag `dataTerm ≤ currentTerm`);
+- `dataTerm` (LC1b) advances exactly where Rust stores `term_handle`:
+  `becomeLeader` (`node.rs:2462`), every strict adoption
+  (`Action::BecomeFollower`, `node.rs:2490` — the vote-request arm, the
+  higher-term-vote arm, and `deliverTermMap`'s gossip-adoption arm), and
+  boot/`crashRestart` (recovered term, `node.rs:513`); `startElection`
+  does NOT touch it (`node.rs` 2440–2450) — a candidate's data plane
+  keeps running at its pre-bump term;
+- `leaderAppend` emits `hdr = stamp = currentTerm`; the leader-only
   `serveTail` step re-ships a held byte under the CURRENT header with its
   ORIGINAL stamp (the NAK-repair/journal-replay catch-up path);
 - `observeTerm` stays keyed on the record STAMP (unchanged semantics).
 
-Under the amended shape, **Finding #7's pivotal step no longer
-type-checks**: the dead term-2 leader's in-flight frame carries header 2,
-and a follower reconciled to term 3 requires header 3 — so the
-cross-stream stale-replicate replay (the 33-step countermodel
-`finding_stale_replicate_replay_lc_violation` + its corollary
-`lc_core_commit_term_keyed_is_false`, which lived here) is unreachable and
-both finding-theorems are DELETED per the arc's decision 3 (the #5/#6b
-precedent; their full traces live in the LB2-rerun report and the lean
-gate doc). `nonvacuity_serve_tail_catchup_trace` (below) proves the
-amendment did NOT gut the legitimate inherited-prefix catch-up that the
-rejected equality-on-one-term alternative would have killed.
+`nonvacuity_serve_tail_catchup_trace` (below) proves the amendment did NOT
+gut the legitimate inherited-prefix catch-up that the rejected
+equality-on-one-term alternative would have killed.
 
-## Finding #8 — the discharge target is FALSE over the amended model
-(`finding_candidate_stale_gate_fca_violation` + `fca_unconditional_is_false`)
-
-The arc's decision 3 called for `frames_current_authored : Reachable w →
-FramesCurrentAuthored w`. That statement is REFUTED by a 24-step
-kernel-checked trace (see the finding theorem's docstring): the model's
-exact-match guard compares the header against `currentTerm`, but Rust's
-DATA path compares it against the node-level `term_handle`, which
-`Action::StartElection` does NOT advance (`node.rs` 2418–2428 — the same
-handle-lag `ProtocolCommit.lean`'s module doc item 10c records for
-reports). A CANDIDATE that bumped `currentTerm` past its last
-gate-opening regime therefore accepts, in the model, current-header bytes
-its map never reconciled against — in Rust the identical datagram is
-`dropped_stale_term`. Model-fidelity gap in the ADJUDICATED enabling
-(`hhdr` keyed to `currentTerm`), not a Rust bug; escalated per the
-stuck-protocol rather than weakened (candidate repairs are in the LC1 task
-report: model the lagging data-plane term handle, or close the model gate
-at `startElection`).
-
-`FramesCurrentAuthored` itself (definition below) is KEPT: it remains the
-Option-2 provenance predicate whose per-world truth the endgame consumes,
-with its faithfulness/non-circularity arguments unchanged (LB2b report).
-The unconditional provenance lemmas (`hist_frame_provenance`,
-`committed_frame_provenance`) are re-proven under the split frame shape
-(the wire header is existential — consumers care about the record stamp).
-
-## History
+## History (the finding-theorem deletions, decision-3 precedent)
 
 - **Finding #6a (statement gap)**: ghost re-keyed to
   `(position, stamp, commitTerm, payload)` (`ProtocolCommit.lean`, item 1).
@@ -70,11 +44,35 @@ The unconditional provenance lemmas (`hist_frame_provenance`,
   mirrored as `leaderAdvanceCommit`'s `hbase`.
 - **Finding #7 (model-fidelity)**: single-term frames + the `≤` stamp
   guard admitted a cross-stream stale-replicate replay — sound for log
-  matching, unsound for leader completeness. Fixed by THIS amendment;
-  finding-theorems deleted (traces in the LB2-rerun report + gate doc).
-- **Finding #8 (model-fidelity, THIS task)**: the amended guard's
-  `currentTerm` keying leaves a candidate hole vs Rust's lagging
-  `term_handle`; `Reachable → FramesCurrentAuthored` refuted below. -/
+  matching, unsound for leader completeness. Fixed by the LC1 header/stamp
+  split: the dead leader's in-flight frame carries its own tenure's
+  header, which the exact match refuses at any later-term receiver. The
+  33-step countermodel `finding_stale_replicate_replay_lc_violation` + its
+  corollary `lc_core_commit_term_keyed_is_false` no longer type-check and
+  were DELETED (full traces in the LB2-rerun report + the lean gate doc).
+- **Finding #8 (model-fidelity, LC1)**: keying the exact match to
+  `currentTerm` left a CANDIDATE hole Rust does not have — a node that
+  crash-opened its gate at its own led term and then `startElection`ed
+  kept the gate open while `currentTerm` ran ahead of its data-plane
+  regime, accepting a current-header `serveTail` byte its map never
+  reconciled against (Rust drops it: header ≠ handle). Refuted
+  `Reachable → FramesCurrentAuthored` via a 24-step kernel trace
+  (`finding_candidate_stale_gate_fca_violation` +
+  `fca_unconditional_is_false`, commit `ce17fb7`). Fixed by LC1b's
+  `dataTerm` handle (adjudicated repair option 1): the pivotal accept now
+  requires `hdr = dataTerm`, and the poisoned candidate's handle still
+  names its pre-bump term — the trace's final step no longer type-checks
+  and both finding-theorems were DELETED (full trace in the LC1 task
+  report §Finding #8).
+
+## Status of the discharge
+
+`frames_current_authored : Reachable w → FramesCurrentAuthored w` is NOT
+attempted here: per the LC1 adjudication it is FOLDED INTO LC2's
+map-machinery bundle (`MapsWF` + the accept-arm crux clauses — the LC1
+report's analysis showed the `deliverReplicate` induction case needs
+leader-map/last-entry and gate-sync facts that LC2 builds anyway). The
+definition below stays, as the predicate the endgame consumes. -/
 
 namespace Uc2.Cert
 
@@ -113,8 +111,9 @@ landing at a position the map's existing entries already attribute to that
 stamp) leaves `termAt` unchanged and consistent — witnessed reachably by
 `nonvacuity_serve_tail_catchup_trace` below. It excluded Finding #7's
 replay (stamp 2 at a position the reconciled map attributed to term 3),
-and it is violated by Finding #8's candidate-window accept (stamp 1 at a
-position the carried-over map attributes to term 2).
+and it was violated by Finding #8's candidate-window accept (stamp 1 at a
+position the carried-over map attributes to term 2) until LC1b keyed the
+guard to the `dataTerm` handle.
 
 ### Faithfulness
 
@@ -124,11 +123,8 @@ of "every accepted byte was authenticated by the stream the map's frontier
 currently names," which is what the exact header-match guard
 (`receiver.rs:636-639`) plus the reconcile-before-data intake gate
 (`receiver.rs:657`) jointly establish in Rust — where the compared term is
-the node-level `term_handle`. The LC1 model keys the guard to
-`currentTerm` instead, which diverges from the handle exactly in the
-candidate window; that delta is Finding #8 (above), and is why the
-predicate — true in Rust — is not yet derivable for every reachable model
-world.
+the node-level `term_handle`, mirrored since LC1b as the model's
+`dataTerm` (module-doc History, Finding #8).
 
 ### Non-circularity
 
@@ -144,118 +140,15 @@ strategy, mechanized by the arc's LC2–LC4). -/
 agrees with what its OWN term map attributes to that position. See the
 module doc immediately above for the design / faithfulness /
 non-circularity arguments; in one line, this is the model-level trace of
-Rust's exact DATA-header match (`receiver.rs:636-639`) plus the
-reconcile-before-data intake gate (`receiver.rs:657`). LC1 was tasked to
-DISCHARGE it (`Reachable w → FramesCurrentAuthored w`); that statement is
-REFUTED for the model as adjudicated (`fca_unconditional_is_false` below,
-Finding #8 — the candidate window where the model's `currentTerm` guard
-diverges from Rust's lagging `term_handle`), so the predicate remains an
-explicit per-world hypothesis pending the escalated repair. -/
+Rust's exact DATA-header match (`receiver.rs:636-639`, against the
+`dataTerm` handle since LC1b) plus the reconcile-before-data intake gate
+(`receiver.rs:657`). The unconditional discharge
+(`Reachable w → FramesCurrentAuthored w`) is SCHEDULED WITH LC2's
+map-machinery bundle (module-doc "Status of the discharge"); until it
+lands the predicate is carried as an explicit per-world hypothesis. -/
 def FramesCurrentAuthored {n : Nat} (w : World n) : Prop :=
   ∀ j : Fin n, ∀ p t v : Nat, (w.nodes j).hist p = some (t, v) →
     Uc2.TermMap.termAt (w.nodes j).dn.termMap p = t
-
-/-- **Finding #8 (machine-checked): `Reachable w → FramesCurrentAuthored w`
-is FALSE over the LC1-amended model as adjudicated** — the exact-header
-delivery guard `hhdr : hdr = currentTerm j` closes Finding #7's
-cross-stream replay but leaves a CANDIDATE hole the Rust guard does not
-have: Rust's DATA-path compares the datagram header against the node-level
-`term_handle`, which `Action::StartElection` does NOT advance
-(`node.rs` 2418–2428 — the same fact ProtocolCommit's module doc item 10c
-already records for reports: a candidate's data plane still runs at its
-PRE-bump term), while the model's `startElection` bumps the one-and-only
-`currentTerm` and touches neither the gate nor any data state. A node that
-legitimately crash-opens its gate at its own led term (Finding-#5 fix arm:
-`vote_term ≤ map_term`) and then runs `startElection` is a candidate whose
-gate is open and whose `currentTerm` now matches the NEXT leader's wire
-header — so it can accept a serve-tail byte from a stream its map never
-reconciled against. In Rust the same datagram is `dropped_stale_term`
-(header 3 ≠ handle 2).
-
-Trace (n = 3): node 0 leads term 1 and appends three term-1 bytes; node 1
-(which received none of them) leads term 2 and appends two term-2 bytes —
-map `[(2,0)]`, durable 2; node 0 crash-restarts (gate open: 1 ≤ map-last 1)
-and re-wins term 3 on its `(1, 3)` credentials — map `[(1,0),(3,3)]`, its
-term-1 bytes INHERITED below the new base; node 1 crash-restarts (gate
-boots open: term 2 ≤ map-last 2 — its own led term, honest) and
-`startElection`s to term 3 (candidate, gate STILL open, map still
-`[(2,0)]`); node 0 `serveTail`s its inherited `(pos 2, stamp 1)` byte under
-header 3; node 1 accepts it at its frontier 2 (`hhdr : 3 = 3`, gate open).
-Now node 1 holds `(1, 12)` at position 2 while its own map attributes
-position 2 to term 2 — `FramesCurrentAuthored` is FALSE at this reachable
-world. NOTE the poisoned node is a CANDIDATE: it cannot `sendReport`
-(follower-only), and every candidate→follower transition either closes the
-gate (strict adoption), truncates the poison (reconcile), or recomputes the
-gate closed (crash: term 3 > map-last 2) — so no phantom COMMIT is
-apparent from this hole; it refutes the per-node map/hist agreement
-predicate itself, not (as far as this trace goes) LC-core. -/
-theorem finding_candidate_stale_gate_fca_violation :
-    ∃ w : World 3, Reachable w ∧
-      (w.nodes 1).pn.role = .candidate ∧
-      (w.nodes 1).reconciled = true ∧
-      (w.nodes 1).hist 2 = some (1, 12) ∧
-      Uc2.TermMap.termAt (w.nodes 1).dn.termMap 2 = 2 := by
-  refine ⟨_,
-    .tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
-      (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
-      (.tail (.tail (.tail
-      -- t1: node 0 leads {0,2} and appends three term-1 bytes (never
-      -- delivered to node 1).
-      (.single (.startElection _ 0 (by decide)))
-      (.deliverRequestVote _ 2 0 1 0 0 (by decide) (by decide)))
-      (.deliverVote _ 0 2 1 (by decide) (by decide) (by decide)))
-      (.becomeLeader _ 0 (by decide) (by decide)))
-      (.leaderAppend _ 0 10 (by decide)))
-      (.leaderAppend _ 0 11 (by decide)))
-      (.leaderAppend _ 0 12 (by decide)))
-      -- t2: node 1 (empty log) wins term 2 via {1,2} and appends two
-      -- term-2 bytes — map [(2,0)], durable 2.
-      (.startElection _ 1 (by decide)))
-      (.startElection _ 1 (by decide)))
-      (.deliverRequestVote _ 2 1 2 0 0 (by decide) (by decide)))
-      (.deliverVote _ 1 2 2 (by decide) (by decide) (by decide)))
-      (.becomeLeader _ 1 (by decide) (by decide)))
-      (.leaderAppend _ 1 20 (by decide)))
-      (.leaderAppend _ 1 21 (by decide)))
-      -- t3: node 0 crash-opens (1 ≤ map-last 1) and re-wins term 3 on
-      -- (lastTerm 1, durable 3) — its term-1 bytes are now an inherited
-      -- prefix below the new base 3.
-      (.crashRestart _ 0))
-      (.startElection _ 0 (by decide)))
-      (.startElection _ 0 (by decide)))
-      (.deliverRequestVote _ 2 0 3 1 3 (by decide) (by decide)))
-      (.deliverVote _ 0 2 3 (by decide) (by decide) (by decide)))
-      (.becomeLeader _ 0 (by decide) (by decide)))
-      -- the hole: node 1 crash-opens at its own led term 2 (honest,
-      -- Finding-#5 fix arm), then startElection bumps it to term 3 with
-      -- the gate STILL open — a candidate whose currentTerm now matches
-      -- the term-3 wire header (Rust: term_handle would still be 2).
-      (.crashRestart _ 1))
-      (.startElection _ 1 (by decide)))
-      -- node 0 re-serves its INHERITED (pos 2, stamp 1) byte under
-      -- header 3; node 1 accepts it at frontier 2 against a map that
-      -- attributes position 2 to term 2.
-      (.serveTail _ 0 2 1 12 (by decide) (by decide) (by decide)))
-      (.deliverReplicate _ 1 2 3 1 12 (by decide) (by decide) (by decide)
-        (by decide)),
-    by decide, by decide, by decide, by decide⟩
-
-/-- The unconditional discharge target of this task —
-`Reachable w → FramesCurrentAuthored w` — is FALSE for the amended model
-(at n = 3, hence in general): Finding #8's world is reachable, and its
-node 1 holds a stamp its own term map contradicts. Escalated per the
-stuck-protocol; see the task report for the two candidate repairs (model a
-lagging data-plane term handle, or close the model gate at
-`startElection`). -/
-theorem fca_unconditional_is_false :
-    ¬ ∀ (w : World 3), Reachable w → FramesCurrentAuthored w := by
-  intro h
-  obtain ⟨w, hw, -, -, hh, ht⟩ := finding_candidate_stale_gate_fca_violation
-  have := h w hw 1 2 1 12 hh
-  omega
-
-#print axioms finding_candidate_stale_gate_fca_violation
-#print axioms fca_unconditional_is_false
 
 /-! ## Frame provenance (UNCONDITIONAL — no `hprov` needed)
 

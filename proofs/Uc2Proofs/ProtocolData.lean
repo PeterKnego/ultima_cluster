@@ -97,11 +97,23 @@ data plane the spike havoc'd — the data-stamped term map
 
 Derived-credential discipline (module doc, item 3): every constructor keeps
 `pn.lastTerm = lastTermOf termMap` and `pn.durable` = the append/accept
-frontier bounding `hist`'s defined prefix. -/
+frontier bounding `hist`'s defined prefix.
+
+`dataTerm` (LC1b, Finding-#8 fix) is the node-level **data-plane term
+handle** (`node.rs` `term_handle`): the term the receiver's DATA-path
+exact-match compares against (`receiver.rs:635`). Rust stores it ONLY at
+`Action::BecomeLeader` (`node.rs:2462`) and `Action::BecomeFollower`
+(`node.rs:2490` — fired by every strict term adoption), and boots it to the
+recovered current term (`node.rs:513`); `Action::StartElection`
+(`node.rs:2440-2450`) does NOT touch it, so a candidate's data plane keeps
+running at its PRE-bump term — the lag `currentTerm` alone cannot express,
+which Finding #8 exploited. Invariantly `dataTerm ≤ currentTerm`
+(`LogMatching.lean`'s `StampInv.data_le`). -/
 structure Node (n : Nat) where
-  pn      : PNode n
-  termMap : TermMap
-  hist    : Nat → Option (Nat × Nat)
+  pn       : PNode n
+  termMap  : TermMap
+  hist     : Nat → Option (Nat × Nat)
+  dataTerm : Nat
 
 /-- The data wire frames (decision 8; the election wire keeps `Uc2.Msg`).
 
@@ -137,7 +149,7 @@ def World.init (n : Nat) : World n :=
   { nodes := fun _ =>
       { pn := { currentTerm := 0, votedFor := none, role := .follower,
                 votesReceived := ∅, lastTerm := 0, durable := 0 },
-        termMap := [], hist := fun _ => none },
+        termMap := [], hist := fun _ => none, dataTerm := 0 },
     sent := [], dsent := [] }
 
 /-- Receiver-side accept of one stamped record at exactly the frontier, with
@@ -149,7 +161,8 @@ def Node.recvReplicate {n : Nat} (d : Node n) (pos t v : Nat) : Node n :=
       lastTerm := lastTermOf (observeTerm d.termMap t pos)
       durable := pos + 1 }
     termMap := observeTerm d.termMap t pos
-    hist := Function.update d.hist pos (some (t, v)) }
+    hist := Function.update d.hist pos (some (t, v))
+    dataTerm := d.dataTerm }
 
 /-- `Event::TermMapReceived`, non-stale arm (`election.rs` 656–664 +
 `reconcile_term_map` 1079–1133, collapsed atomically with the node's
@@ -171,12 +184,14 @@ def Node.applyGossip {n : Nat} (d : Node n) (t : Nat) (entries : TermMap) :
     { pn := { (if d.pn.currentTerm < t then d.pn.adoptTerm t else d.pn) with
                 lastTerm := lastTermOf o.newMap, durable := o.validUpTo }
       termMap := o.newMap
-      hist := fun p => if p < o.validUpTo then d.hist p else none }
+      hist := fun p => if p < o.validUpTo then d.hist p else none
+      dataTerm := if d.pn.currentTerm < t then t else d.dataTerm }
   | .noCommonPrefix =>
     { pn := { (if d.pn.currentTerm < t then d.pn.adoptTerm t else d.pn) with
                 lastTerm := 0, durable := 0 }
       termMap := []
-      hist := fun _ => none }
+      hist := fun _ => none
+      dataTerm := if d.pn.currentTerm < t then t else d.dataTerm }
 
 /-- One cluster transition. Constructors 1–7 restate the election model's
 steps verbatim over the `pn` projection (`havocData` is dropped — the real
@@ -201,15 +216,21 @@ inductive Step {n : Nat} : World n → World n → Prop
               (w.nodes i).pn.lastTerm (w.nodes i).pn.durable]
           dsent := w.dsent }
   /-- `Uc2.Step.deliverRequestVote` on `pn` (`election.rs` 600–627,
-  `handle_request_vote` 1202–1227). The voter's `logOk` inputs are real. -/
+  `handle_request_vote` 1202–1227). The voter's `logOk` inputs are real.
+  LC1b: a strict adoption fires `Action::BecomeFollower`, which stores the
+  data-plane term handle (`node.rs:2490`); same-term delivery leaves it. -/
   | deliverRequestVote (w : World n) (j c : Fin n)
       (newTerm cLastTerm cDurable : Nat)
       (hmsg : Uc2.Msg.requestVote c newTerm cLastTerm cDurable ∈ w.sent)
       (hterm : (w.nodes j).pn.currentTerm ≤ newTerm) :
       Step w
         { nodes := Function.update w.nodes j
-            { w.nodes j with pn :=
-              ((w.nodes j).pn.recvRequestVote c newTerm cLastTerm cDurable).1 }
+            { w.nodes j with
+              pn :=
+                ((w.nodes j).pn.recvRequestVote c newTerm cLastTerm cDurable).1
+              dataTerm :=
+                if (w.nodes j).pn.currentTerm < newTerm then newTerm
+                else (w.nodes j).dataTerm }
           sent := w.sent ++
             [.vote j c newTerm
               ((w.nodes j).pn.recvRequestVote c newTerm cLastTerm cDurable).2]
@@ -235,13 +256,15 @@ inductive Step {n : Nat} : World n → World n → Prop
                 votesReceived := insert v (w.nodes i).pn.votesReceived } }
           sent := w.sent
           dsent := w.dsent }
-  /-- `Uc2.Step.deliverVoteHigherTerm` on `pn` (`election.rs` 633–636). -/
+  /-- `Uc2.Step.deliverVoteHigherTerm` on `pn` (`election.rs` 633–636).
+  LC1b: strict adoption → `BecomeFollower` stores the handle
+  (`node.rs:2490`). -/
   | deliverVoteHigherTerm (w : World n) (i v : Fin n) (t : Nat) (g : Bool)
       (hmsg : Uc2.Msg.vote v i t g ∈ w.sent)
       (hterm : (w.nodes i).pn.currentTerm < t) :
       Step w
         { nodes := Function.update w.nodes i
-            { w.nodes i with pn := (w.nodes i).pn.adoptTerm t }
+            { w.nodes i with pn := (w.nodes i).pn.adoptTerm t, dataTerm := t }
           sent := w.sent
           dsent := w.dsent }
   /-- `election.rs::become_leader` (1003–1057), now with its data half
@@ -260,17 +283,23 @@ inductive Step {n : Nat} : World n → World n → Prop
                 lastTerm := (w.nodes i).pn.currentTerm }
               termMap := prunePush (w.nodes i).termMap
                 (w.nodes i).pn.currentTerm (w.nodes i).pn.durable
-              hist := (w.nodes i).hist }
+              hist := (w.nodes i).hist
+              -- LC1b: `Action::BecomeLeader` stores the handle (node.rs:2462)
+              dataTerm := (w.nodes i).pn.currentTerm }
           sent := w.sent
           dsent := w.dsent }
   /-- `Uc2.Step.crashRestart` (decision 3): the vote record persists
   (`StableValue`), volatile role/tally reset — and the data plane persists
-  too (journal recovery; fsync lag collapsed, module doc item 4). -/
+  too (journal recovery; fsync lag collapsed, module doc item 4). LC1b: the
+  handle boots to the recovered current term (`node.rs:513`) — the model's
+  `currentTerm` IS that recovered `max(vote, map)` value. -/
   | crashRestart (w : World n) (i : Fin n) :
       Step w
         { nodes := Function.update w.nodes i
-            { w.nodes i with pn :=
-              { (w.nodes i).pn with role := .follower, votesReceived := ∅ } }
+            { w.nodes i with
+              pn :=
+                { (w.nodes i).pn with role := .follower, votesReceived := ∅ }
+              dataTerm := (w.nodes i).pn.currentTerm }
           sent := w.sent
           dsent := w.dsent }
   /-- Leader append (decision 3): a `.leader` stamps `(currentTerm, v)` at its
@@ -286,7 +315,8 @@ inductive Step {n : Nat} : World n → World n → Prop
                 durable := (w.nodes i).pn.durable + 1 }
               termMap := (w.nodes i).termMap
               hist := Function.update (w.nodes i).hist (w.nodes i).pn.durable
-                (some ((w.nodes i).pn.currentTerm, v)) }
+                (some ((w.nodes i).pn.currentTerm, v))
+              dataTerm := (w.nodes i).dataTerm }
           sent := w.sent
           dsent := w.dsent ++
             [.replicate (w.nodes i).pn.durable (w.nodes i).pn.currentTerm
@@ -294,9 +324,12 @@ inductive Step {n : Nat} : World n → World n → Prop
   /-- Replication delivery (decision 4): accept a stamped record only at
   exactly the receiver's frontier (`uc2_log` writer rule — reordered and
   duplicated deliveries become no-ops, never corruption) and only when the
-  wire HEADER term EXACTLY matches the receiver's adopted term (LC1
-  amendment, Finding #7 fix: `receiver.rs:636-639` `dropped_stale_term` —
-  adoption itself comes only from consensus datagrams, never from DATA).
+  wire HEADER term EXACTLY matches the receiver's data-plane term handle
+  `dataTerm` (LC1 amendment, Finding #7 fix; LC1b, Finding #8 fix — keyed
+  to the HANDLE, not `currentTerm`, because a candidate's handle lags its
+  bumped term: `receiver.rs:636-639` `dropped_stale_term` compares
+  `self.term`, the handle — adoption itself comes only from consensus
+  datagrams, never from DATA).
   The old `stamp ≤ currentTerm` guard is gone: its job moved to the
   emission sites (`leaderAppend` stamps `hdr = stamp = currentTerm`;
   `serveTail` re-serves an existing hist stamp under the current header),
@@ -306,7 +339,7 @@ inductive Step {n : Nat} : World n → World n → Prop
   | deliverReplicate (w : World n) (j : Fin n) (pos hdr t v : Nat)
       (hmsg : Frame.replicate pos hdr t v ∈ w.dsent)
       (hpos : pos = (w.nodes j).pn.durable)
-      (hhdr : hdr = (w.nodes j).pn.currentTerm) :
+      (hhdr : hdr = (w.nodes j).dataTerm) :
       Step w
         { nodes := Function.update w.nodes j
             ((w.nodes j).recvReplicate pos t v)

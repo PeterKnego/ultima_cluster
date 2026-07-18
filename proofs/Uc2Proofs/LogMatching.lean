@@ -210,6 +210,16 @@ private theorem applyGossip_no_adopt {n : Nat} (d : Node n) {t : Nat}
   cases hrec : reconcile d.termMap d.pn.durable entries <;>
     simp [Node.applyGossip, hrec, h]
 
+/-- `applyGossip`'s handle store: the data-plane term handle advances to the
+gossip term exactly on a strict adoption (`Action::BecomeFollower`,
+`node.rs:2490`), else stays. -/
+private theorem applyGossip_dataTerm {n : Nat} (d : Node n) (t : Nat)
+    (entries : TermMap) :
+    (d.applyGossip t entries).dataTerm =
+      if d.pn.currentTerm < t then t else d.dataTerm := by
+  cases hrec : reconcile d.termMap d.pn.durable entries <;>
+    simp [Node.applyGossip, hrec]
+
 /-- Same-map gossip is the identity on the data plane (`reconcile_self`). -/
 private theorem applyGossip_self {n : Nat} (d : Node n) (t : Nat) :
     (d.applyGossip t d.termMap).pn.durable = d.pn.durable ∧
@@ -291,79 +301,123 @@ Jointly inductive; `dinv_step`'s `deliverReplicate` case re-derives the old
 its whole tenure exactly as before. -/
 
 /-- Frame stamps never exceed their wire header; held stamps never exceed
-the holder's current term. -/
+the holder's current term; and the data-plane term handle lags the
+(monotone) `currentTerm` (LC1b — the handle is stored only from
+`currentTerm`-valued sources: `becomeLeader`, strict adoptions, boot). -/
 structure StampInv {n : Nat} (w : World n) : Prop where
   /-- `stamp ≤ hdr` for every replicate frame ever shipped. -/
   frame_le : ∀ p hdr t v, Frame.replicate p hdr t v ∈ w.dsent → t ≤ hdr
   /-- A node's held stamps are bounded by its (monotone) `currentTerm`. -/
   hist_le : ∀ j : Fin n, ∀ p t v, (w.nodes j).hist p = some (t, v) →
       t ≤ (w.nodes j).pn.currentTerm
+  /-- The data-plane term handle never exceeds `currentTerm`. -/
+  data_le : ∀ j : Fin n, (w.nodes j).dataTerm ≤ (w.nodes j).pn.currentTerm
 
 private theorem stamp_init (n : Nat) : StampInv (World.init n) := by
-  constructor
+  refine ⟨?_, ?_, ?_⟩
   · intro p hdr t v h
     simp [World.init] at h
   · intro j p t v h
     simp [World.init] at h
+  · intro j
+    exact Nat.le_refl 0
 
 private theorem stamp_step {n : Nat} {w w' : World n} (h : StampInv w)
     (hs : Step w w') : StampInv w' := by
   cases hs with
   | startElection i hrole =>
-    refine ⟨h.frame_le, ?_⟩
-    intro k p t v hh
-    rcases eq_or_ne k i with rfl | hne
-    · simp only [Function.update_self] at hh ⊢
-      exact Nat.le_succ_of_le (h.hist_le k p t v hh)
-    · simp only [Function.update_of_ne hne] at hh ⊢
-      exact h.hist_le k p t v hh
+    refine ⟨h.frame_le, ?_, ?_⟩
+    · intro k p t v hh
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self] at hh ⊢
+        exact Nat.le_succ_of_le (h.hist_le k p t v hh)
+      · simp only [Function.update_of_ne hne] at hh ⊢
+        exact h.hist_le k p t v hh
+    · intro k
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self]
+        exact Nat.le_succ_of_le (h.data_le k)
+      · simp only [Function.update_of_ne hne]
+        exact h.data_le k
   | deliverRequestVote j c nt clt cd hmsg hterm =>
-    refine ⟨h.frame_le, ?_⟩
-    intro k p t v hh
-    rcases eq_or_ne k j with rfl | hne
-    · simp only [Function.update_self] at hh ⊢
-      rw [recv_term _ _ _ _ _ hterm]
-      exact Nat.le_trans (h.hist_le k p t v hh) hterm
-    · simp only [Function.update_of_ne hne] at hh ⊢
-      exact h.hist_le k p t v hh
+    refine ⟨h.frame_le, ?_, ?_⟩
+    · intro k p t v hh
+      rcases eq_or_ne k j with rfl | hne
+      · simp only [Function.update_self] at hh ⊢
+        rw [recv_term _ _ _ _ _ hterm]
+        exact Nat.le_trans (h.hist_le k p t v hh) hterm
+      · simp only [Function.update_of_ne hne] at hh ⊢
+        exact h.hist_le k p t v hh
+    · intro k
+      rcases eq_or_ne k j with rfl | hne
+      · simp only [Function.update_self]
+        rw [recv_term _ _ _ _ _ hterm]
+        have := h.data_le k
+        split <;> omega
+      · simp only [Function.update_of_ne hne]
+        exact h.data_le k
   | rejectStaleRequestVote j c nt clt cd hmsg hstale =>
-    exact ⟨h.frame_le, h.hist_le⟩
+    exact ⟨h.frame_le, h.hist_le, h.data_le⟩
   | deliverVote i v t hmsg hrole hterm =>
-    refine ⟨h.frame_le, ?_⟩
-    intro k p t' v' hh
-    rcases eq_or_ne k i with rfl | hne
-    · simp only [Function.update_self] at hh ⊢
-      exact h.hist_le k p t' v' hh
-    · simp only [Function.update_of_ne hne] at hh ⊢
-      exact h.hist_le k p t' v' hh
+    refine ⟨h.frame_le, ?_, ?_⟩
+    · intro k p t' v' hh
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self] at hh ⊢
+        exact h.hist_le k p t' v' hh
+      · simp only [Function.update_of_ne hne] at hh ⊢
+        exact h.hist_le k p t' v' hh
+    · intro k
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self]
+        exact h.data_le k
+      · simp only [Function.update_of_ne hne]
+        exact h.data_le k
   | deliverVoteHigherTerm i v t g hmsg hterm =>
-    refine ⟨h.frame_le, ?_⟩
-    intro k p t' v' hh
-    rcases eq_or_ne k i with rfl | hne
-    · simp only [Function.update_self] at hh ⊢
-      exact Nat.le_trans (h.hist_le k p t' v' hh)
-        (Nat.le_of_lt (show (w.nodes k).pn.currentTerm <
-          ((w.nodes k).pn.adoptTerm t).currentTerm from hterm))
-    · simp only [Function.update_of_ne hne] at hh ⊢
-      exact h.hist_le k p t' v' hh
+    refine ⟨h.frame_le, ?_, ?_⟩
+    · intro k p t' v' hh
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self] at hh ⊢
+        exact Nat.le_trans (h.hist_le k p t' v' hh)
+          (Nat.le_of_lt (show (w.nodes k).pn.currentTerm <
+            ((w.nodes k).pn.adoptTerm t).currentTerm from hterm))
+      · simp only [Function.update_of_ne hne] at hh ⊢
+        exact h.hist_le k p t' v' hh
+    · intro k
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self]
+        exact Nat.le_refl _
+      · simp only [Function.update_of_ne hne]
+        exact h.data_le k
   | becomeLeader i hrole hquorum =>
-    refine ⟨h.frame_le, ?_⟩
-    intro k p t v hh
-    rcases eq_or_ne k i with rfl | hne
-    · simp only [Function.update_self] at hh ⊢
-      exact h.hist_le k p t v hh
-    · simp only [Function.update_of_ne hne] at hh ⊢
-      exact h.hist_le k p t v hh
+    refine ⟨h.frame_le, ?_, ?_⟩
+    · intro k p t v hh
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self] at hh ⊢
+        exact h.hist_le k p t v hh
+      · simp only [Function.update_of_ne hne] at hh ⊢
+        exact h.hist_le k p t v hh
+    · intro k
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self]
+        exact Nat.le_refl _
+      · simp only [Function.update_of_ne hne]
+        exact h.data_le k
   | crashRestart i =>
-    refine ⟨h.frame_le, ?_⟩
-    intro k p t v hh
-    rcases eq_or_ne k i with rfl | hne
-    · simp only [Function.update_self] at hh ⊢
-      exact h.hist_le k p t v hh
-    · simp only [Function.update_of_ne hne] at hh ⊢
-      exact h.hist_le k p t v hh
+    refine ⟨h.frame_le, ?_, ?_⟩
+    · intro k p t v hh
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self] at hh ⊢
+        exact h.hist_le k p t v hh
+      · simp only [Function.update_of_ne hne] at hh ⊢
+        exact h.hist_le k p t v hh
+    · intro k
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self]
+        exact Nat.le_refl _
+      · simp only [Function.update_of_ne hne]
+        exact h.data_le k
   | leaderAppend i v hrole =>
-    constructor
+    refine ⟨?_, ?_, ?_⟩
     · intro p hdr t v' hf
       rcases List.mem_append.mp hf with hf | hf
       · exact h.frame_le p hdr t v' hf
@@ -380,52 +434,74 @@ private theorem stamp_step {n : Nat} {w w' : World n} (h : StampInv w)
           exact h.hist_le k p t v' hh
       · simp only [Function.update_of_ne hne] at hh ⊢
         exact h.hist_le k p t v' hh
+    · intro k
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self]
+        exact h.data_le k
+      · simp only [Function.update_of_ne hne]
+        exact h.data_le k
   | deliverReplicate j pos hdr t v hmsg hpos hhdr =>
-    refine ⟨h.frame_le, ?_⟩
-    intro k p t' v' hh
-    rcases eq_or_ne k j with rfl | hne
-    · simp only [Function.update_self, Node.recvReplicate] at hh ⊢
-      by_cases hp : p = pos
-      · subst hp
-        rw [Function.update_self, Option.some.injEq, Prod.mk.injEq] at hh
-        have := h.frame_le _ _ _ _ hmsg
-        omega
-      · rw [Function.update_of_ne hp] at hh
+    refine ⟨h.frame_le, ?_, ?_⟩
+    · intro k p t' v' hh
+      rcases eq_or_ne k j with rfl | hne
+      · simp only [Function.update_self, Node.recvReplicate] at hh ⊢
+        by_cases hp : p = pos
+        · subst hp
+          rw [Function.update_self, Option.some.injEq, Prod.mk.injEq] at hh
+          have h1 := h.frame_le _ _ _ _ hmsg
+          have h2 := h.data_le k
+          omega
+        · rw [Function.update_of_ne hp] at hh
+          exact h.hist_le k p t' v' hh
+      · simp only [Function.update_of_ne hne] at hh ⊢
         exact h.hist_le k p t' v' hh
-    · simp only [Function.update_of_ne hne] at hh ⊢
-      exact h.hist_le k p t' v' hh
+    · intro k
+      rcases eq_or_ne k j with rfl | hne
+      · simp only [Function.update_self, Node.recvReplicate]
+        exact h.data_le k
+      · simp only [Function.update_of_ne hne]
+        exact h.data_le k
   | serveTail i p t v hrole hhist hp =>
-    constructor
-    · intro p' hdr t' v' hf
-      rcases List.mem_append.mp hf with hf | hf
-      · exact h.frame_le p' hdr t' v' hf
-      · rw [List.mem_singleton, Frame.replicate.injEq] at hf
-        obtain ⟨rfl, rfl, rfl, rfl⟩ := hf
-        exact h.hist_le i _ _ _ hhist
-    · exact h.hist_le
+    refine ⟨?_, h.hist_le, h.data_le⟩
+    intro p' hdr t' v' hf
+    rcases List.mem_append.mp hf with hf | hf
+    · exact h.frame_le p' hdr t' v' hf
+    · rw [List.mem_singleton, Frame.replicate.injEq] at hf
+      obtain ⟨rfl, rfl, rfl, rfl⟩ := hf
+      exact h.hist_le i _ _ _ hhist
   | shipTermMap i hrole =>
-    constructor
-    · intro p hdr t v hf
-      rcases List.mem_append.mp hf with hf | hf
-      · exact h.frame_le p hdr t v hf
-      · simp at hf
-    · exact h.hist_le
+    refine ⟨?_, h.hist_le, h.data_le⟩
+    intro p hdr t v hf
+    rcases List.mem_append.mp hf with hf | hf
+    · exact h.frame_le p hdr t v hf
+    · simp at hf
   | deliverTermMap j t entries hmsg hterm =>
-    refine ⟨h.frame_le, ?_⟩
-    intro k p t' v' hh
-    rcases eq_or_ne k j with rfl | hne
-    · simp only [Function.update_self] at hh ⊢
-      have hold := h.hist_le k p t' v' (applyGossip_hist _ _ _ _ hh)
-      by_cases hadopt : (w.nodes k).pn.currentTerm < t
-      · rw [(applyGossip_adopt _ entries hadopt).2]
-        omega
-      · rw [(applyGossip_no_adopt _ entries hadopt).2.1]
-        exact hold
-    · simp only [Function.update_of_ne hne] at hh ⊢
-      exact h.hist_le k p t' v' hh
+    refine ⟨h.frame_le, ?_, ?_⟩
+    · intro k p t' v' hh
+      rcases eq_or_ne k j with rfl | hne
+      · simp only [Function.update_self] at hh ⊢
+        have hold := h.hist_le k p t' v' (applyGossip_hist _ _ _ _ hh)
+        by_cases hadopt : (w.nodes k).pn.currentTerm < t
+        · rw [(applyGossip_adopt _ entries hadopt).2]
+          omega
+        · rw [(applyGossip_no_adopt _ entries hadopt).2.1]
+          exact hold
+      · simp only [Function.update_of_ne hne] at hh ⊢
+        exact h.hist_le k p t' v' hh
+    · intro k
+      rcases eq_or_ne k j with rfl | hne
+      · simp only [Function.update_self, applyGossip_dataTerm]
+        by_cases hadopt : (w.nodes k).pn.currentTerm < t
+        · rw [if_pos hadopt, (applyGossip_adopt _ entries hadopt).2]
+        · rw [if_neg hadopt, (applyGossip_no_adopt _ entries hadopt).2.1]
+          exact h.data_le k
+      · simp only [Function.update_of_ne hne]
+        exact h.data_le k
 
-/-- **Stamp truthfulness holds in every reachable world** (public: the LC
-layer consumes `frame_le` alongside `hist_frame_provenance`). -/
+/-- **Stamp truthfulness holds in every reachable world.** Public by
+intent: `dinv_step` consumes it here (re-deriving the deleted `hstamp`
+delivery guard), and it is the designated supplier of `stamp ≤ hdr` /
+handle-lag facts for the LC-closure layers as they land. -/
 theorem reachable_stamp {n : Nat} {w : World n} (hw : Reachable w) :
     StampInv w := by
   have h : Relation.ReflTransGen Step (World.init n) w := hw
@@ -896,7 +972,8 @@ theorem dinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
                   termMap := (w.nodes i).termMap
                   hist := Function.update (w.nodes i).hist
                     (w.nodes i).pn.durable
-                    (some ((w.nodes i).pn.currentTerm, v)) }
+                    (some ((w.nodes i).pn.currentTerm, v))
+                  dataTerm := (w.nodes i).dataTerm }
               sent := w.sent
               dsent := w.dsent ++
                 [.replicate (w.nodes i).pn.durable
@@ -986,9 +1063,12 @@ theorem dinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         exact hc.pinned
   | deliverReplicate j pos hdr t v hmsg hpos hhdr =>
     -- the old `≤`-guard, re-derived from emission-side truthfulness + the
-    -- exact header match (LC1: `stamp ≤ hdr = currentTerm`)
-    have hstamp : t ≤ (w.nodes j).pn.currentTerm :=
-      hhdr ▸ (reachable_stamp hw).frame_le pos hdr t v hmsg
+    -- exact handle match + the lagging handle (LC1/LC1b:
+    -- `stamp ≤ hdr = dataTerm ≤ currentTerm`)
+    have hstamp : t ≤ (w.nodes j).pn.currentTerm := by
+      have h1 := (reachable_stamp hw).frame_le pos hdr t v hmsg
+      have h2 := (reachable_stamp hw).data_le j
+      omega
     have hsub : ∀ p t₀ v₀,
         Occ { nodes := Function.update w.nodes j
                 ((w.nodes j).recvReplicate pos t v)

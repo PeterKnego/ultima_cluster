@@ -139,7 +139,7 @@ designer calls documented inline):
    only shrinks the reachable set (scope note for the re-gate); (c)
    candidate reports: Rust's node-level `term_handle` moves only on
    `Become{Leader,Follower}` (`Action::StartElection` touches neither term
-   handle nor gate, `node.rs` 2418–2428), so a candidate's reports carry
+   handle nor gate, `node.rs` 2440–2450), so a candidate's reports carry
    its PRE-BUMP term — deliverable only to the previous-term leader,
    equivalent to having reported before candidacy. `sendReport` is
    follower-only; the model has one term per node, so allowing candidates
@@ -199,6 +199,9 @@ def Node.pn {n : Nat} (c : Node n) : PNode n := c.dn.pn
 /-- Data-plane history sugar (position ↦ (term-stamp, payload)). -/
 def Node.hist {n : Nat} (c : Node n) : Nat → Option (Nat × Nat) := c.dn.hist
 
+/-- Data-plane term-handle sugar (LC1b — `node.rs` `term_handle`). -/
+def Node.dataTerm {n : Nat} (c : Node n) : Nat := c.dn.dataTerm
+
 /-- The commit wire: the AppendPosition datagram (`receiver.rs` 1062–1073,
 `DGRAM_KIND_APPEND_POSITION`; consumed as `Event::Report { from, term,
 durable }`, `election.rs` 545–573). Term-scoped: the header's
@@ -225,7 +228,7 @@ def World.init (n : Nat) : World n :=
   { nodes := fun _ =>
       { dn := { pn := { currentTerm := 0, votedFor := none, role := .follower,
                         votesReceived := ∅, lastTerm := 0, durable := 0 },
-                termMap := [], hist := fun _ => none }
+                termMap := [], hist := fun _ => none, dataTerm := 0 }
         tracker := CommitTracker.new (n - 1) n
         commitIdx := 0
         reconciled := true }
@@ -250,7 +253,7 @@ defer to `Uc2Proofs/ProtocolData.lean`'s originals and name only the
 commit-relevant Rust delta. -/
 inductive Step {n : Nat} : World n → World n → Prop
   /-- `Data.Step.startElection`. Commit delta: NONE — `Action::StartElection`
-  touches neither the term handle nor the gate (`node.rs` 2418–2428); the
+  touches neither the term handle nor the gate (`node.rs` 2440–2450); the
   candidate's tracker is untouched until `become_leader`. -/
   | startElection (w : World n) (i : Fin n)
       (hrole : (w.nodes i).pn.role ≠ .leader) :
@@ -281,8 +284,13 @@ inductive Step {n : Nat} : World n → World n → Prop
       Step w
         { nodes := Function.update w.nodes j
             { w.nodes j with
-              dn := { (w.nodes j).dn with pn :=
-                ((w.nodes j).pn.recvRequestVote c newTerm cLastTerm cDurable).1 }
+              dn := { (w.nodes j).dn with
+                pn :=
+                  ((w.nodes j).pn.recvRequestVote c newTerm cLastTerm
+                    cDurable).1
+                dataTerm :=
+                  if (w.nodes j).pn.currentTerm < newTerm then newTerm
+                  else (w.nodes j).dn.dataTerm }
               reconciled :=
                 if (w.nodes j).pn.currentTerm < newTerm then false
                 else (w.nodes j).reconciled }
@@ -327,7 +335,9 @@ inductive Step {n : Nat} : World n → World n → Prop
       Step w
         { nodes := Function.update w.nodes i
             { w.nodes i with
-              dn := { (w.nodes i).dn with pn := (w.nodes i).pn.adoptTerm t }
+              dn := { (w.nodes i).dn with
+                pn := (w.nodes i).pn.adoptTerm t
+                dataTerm := t }
               reconciled := false }
           sent := w.sent
           dsent := w.dsent
@@ -349,7 +359,8 @@ inductive Step {n : Nat} : World n → World n → Prop
                         lastTerm := (w.nodes i).pn.currentTerm }
                       termMap := Uc2.Data.prunePush (w.nodes i).dn.termMap
                         (w.nodes i).pn.currentTerm (w.nodes i).pn.durable
-                      hist := (w.nodes i).dn.hist }
+                      hist := (w.nodes i).dn.hist
+                      dataTerm := (w.nodes i).pn.currentTerm }
               tracker := (w.nodes i).tracker.resetReports
               commitIdx := (w.nodes i).commitIdx
               reconciled := true }
@@ -371,8 +382,10 @@ inductive Step {n : Nat} : World n → World n → Prop
   | crashRestart (w : World n) (i : Fin n) :
       Step w
         { nodes := Function.update w.nodes i
-            { dn := { (w.nodes i).dn with pn :=
-                { (w.nodes i).pn with role := .follower, votesReceived := ∅ } }
+            { dn := { (w.nodes i).dn with
+                pn :=
+                  { (w.nodes i).pn with role := .follower, votesReceived := ∅ }
+                dataTerm := (w.nodes i).pn.currentTerm }
               tracker := CommitTracker.new (n - 1) n
               commitIdx := (w.nodes i).commitIdx
               reconciled := decide ((w.nodes i).pn.currentTerm ≤
@@ -393,7 +406,8 @@ inductive Step {n : Nat} : World n → World n → Prop
                 termMap := (w.nodes i).dn.termMap
                 hist := Function.update (w.nodes i).dn.hist
                   (w.nodes i).pn.durable
-                  (some ((w.nodes i).pn.currentTerm, v)) } }
+                  (some ((w.nodes i).pn.currentTerm, v))
+                dataTerm := (w.nodes i).dn.dataTerm } }
           sent := w.sent
           dsent := w.dsent ++
             [.replicate (w.nodes i).pn.durable (w.nodes i).pn.currentTerm
@@ -409,7 +423,7 @@ inductive Step {n : Nat} : World n → World n → Prop
   | deliverReplicate (w : World n) (j : Fin n) (pos hdr t v : Nat)
       (hmsg : Uc2.Data.Frame.replicate pos hdr t v ∈ w.dsent)
       (hpos : pos = (w.nodes j).pn.durable)
-      (hhdr : hdr = (w.nodes j).pn.currentTerm)
+      (hhdr : hdr = (w.nodes j).dataTerm)
       (hgate : (w.nodes j).reconciled = true) :
       Step w
         { nodes := Function.update w.nodes j
