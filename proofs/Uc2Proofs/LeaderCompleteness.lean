@@ -67,12 +67,19 @@ equality-on-one-term alternative would have killed.
 
 ## Status of the discharge
 
-`frames_current_authored : Reachable w → FramesCurrentAuthored w` is NOT
-attempted here: per the LC1 adjudication it is FOLDED INTO LC2's
-map-machinery bundle (`MapsWF` + the accept-arm crux clauses — the LC1
-report's analysis showed the `deliverReplicate` induction case needs
-leader-map/last-entry and gate-sync facts that LC2 builds anyway). The
-definition below stays, as the predicate the endgame consumes. -/
+`frames_current_authored : Reachable w → FramesCurrentAuthored w` is
+**REFUTED — Finding #9** (LC2, this file's final section): even under the
+LC1b `dataTerm` delivery guard, the intake-gate REOPEN is keyed to
+`currentTerm` (`deliverTermMap`'s unconditional `reconciled := true`,
+mirroring `node.rs:2403-2413` `t >= term_before`), so a candidate whose
+handle lags its bumped term reopens intake for the handle-term stream by
+cleanly reconciling a HIGHER-term map — and then accepts a cross-stream
+old-stamped byte its map never attributed. Machine-checked below
+(`finding_candidate_gate_reopen_fca_violation`, 56-step kernel trace,
+n = 5). Rust keys the reopen identically, so this is a candidate REAL
+protocol gap — controller adjudication pending (LC2 task report). The
+definition below stays, as the predicate the endgame consumes; LC2's
+`MapsWF` bundle (`Uc2Proofs/MapWF.lean`) landed independently. -/
 
 namespace Uc2.Cert
 
@@ -143,9 +150,10 @@ non-circularity arguments; in one line, this is the model-level trace of
 Rust's exact DATA-header match (`receiver.rs:636-639`, against the
 `dataTerm` handle since LC1b) plus the reconcile-before-data intake gate
 (`receiver.rs:657`). The unconditional discharge
-(`Reachable w → FramesCurrentAuthored w`) is SCHEDULED WITH LC2's
-map-machinery bundle (module-doc "Status of the discharge"); until it
-lands the predicate is carried as an explicit per-world hypothesis. -/
+(`Reachable w → FramesCurrentAuthored w`) is REFUTED — Finding #9, the
+gate-reopen keying (module-doc "Status of the discharge" + this file's
+final section); until a repair is adjudicated the predicate is carried as
+an explicit per-world hypothesis. -/
 def FramesCurrentAuthored {n : Nat} (w : World n) : Prop :=
   ∀ j : Fin n, ∀ p t v : Nat, (w.nodes j).hist p = some (t, v) →
     Uc2.TermMap.termAt (w.nodes j).dn.termMap p = t
@@ -516,5 +524,149 @@ theorem nonvacuity_serve_tail_catchup_trace :
     by decide⟩
 
 #print axioms nonvacuity_serve_tail_catchup_trace
+
+/-! ## Finding #9 — the candidate-window GATE REOPEN refutes FCA (LC2)
+
+The LC1b `dataTerm` repair keyed DELIVERY to the lagging handle, but the
+intake-gate REOPEN is still keyed to `currentTerm`: `deliverTermMap`
+reopens the gate for any processed map (`hterm : currentTerm ≤ t`),
+mirroring `node.rs`'s clean-reconcile arm (`t >= term_before` where
+`term_before` is `sm.current_term()`, node.rs:2403-2413) — NOT the term
+handle. A candidate (handle T, `currentTerm` T+1, `awaiting_reconcile`
+latched by the pre-candidacy adoption of T) that cleanly reconciles the
+(T+1)-leader's map therefore reopens intake for the handle-T stream
+against a map that never reconciled with the T-stream. Rust has the same
+keying, so this is a candidate REAL protocol gap, not (only) a model
+artifact — controller adjudication pending (LC2 task report, Finding #9).
+
+Trace (n = 5, nodes 0..4, every enabling honest): node 4 leads term 1 and
+appends four stamp-1 bytes; node 0 replicates byte 0, node 3 all four.
+Node 1 leads term 2 on `(1,1)` and appends stamp-2 bytes at positions 1-2,
+which node 0 replicates after a clean reconcile (map `[(1,0),(2,1)]`,
+durable 3). Node 3 wins term 4 on `(1,4)` with voters {4,2} — node 0
+ADOPTS 4 in the losing vote exchange (handle 4, gate CLOSED) — and
+`serveTail`s its inherited stamp-1 byte at position 3 under header 4.
+Node 0 `startElection`s to 5 (candidate, handle still 4, gate still
+closed). Node 1 crash-restarts and wins term 5 on `(2,3)`, ships its map
+`[(1,0),(2,1),(5,3)]`; node 0 reconciles it CLEANLY (`validUpTo = 3` =
+durable, no truncation, `5 ≤ 5` non-adopt) — the gate REOPENS while the
+handle still names term 4. Node 0 then accepts the term-4 leader's
+serveTail frame `(pos 3, hdr 4, stamp 1, 13)` at its frontier: stamp
+`1 ≤ lastTermOf [(1,0),(2,1)] = 2` means `observeTerm` is a no-op, so
+`hist 0 3 = some (1, 13)` while `termAt [(1,0),(2,1)] 3 = 2` —
+`FramesCurrentAuthored` is FALSE at a reachable world. Rust's identical
+reopen lets the same node then report a term-4-stamped durable over
+content (positions 1-2, stamp-2 bytes) the term-4 leader does NOT hold —
+the phantom-commit shape the gate exists to prevent. -/
+
+/-- **Finding #9 (machine-checked).** The candidate-window gate reopen:
+a reachable world in which node 0 holds a stamp-1 byte at a position its
+own term map attributes to term 2. See the section comment above for the
+full 56-step scenario and the Rust keying (`node.rs:2403-2413`). -/
+theorem finding_candidate_gate_reopen_fca_violation :
+    ∃ w : World 5, Reachable w ∧
+      (w.nodes 0).hist 3 = some (1, 13) ∧
+      (w.nodes 0).dn.termMap.termAt 3 = 2 := by
+  refine ⟨_,
+    .tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
+      (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
+      (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
+      (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
+      (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
+      (.tail (.tail (.tail (.tail (.tail
+      -- term 1: node 4 leads {4,0,1}, appends bytes 0-3; node 0 takes
+      -- byte 0, node 3 takes all four (reconcile-then-replicate each).
+      (.single (.startElection _ 4 (by decide)))
+      (.deliverRequestVote _ 0 4 1 0 0 (by decide) (by decide)))
+      (.deliverRequestVote _ 1 4 1 0 0 (by decide) (by decide)))
+      (.deliverRequestVote _ 3 4 1 0 0 (by decide) (by decide)))
+      (.deliverVote _ 4 0 1 (by decide) (by decide) (by decide)))
+      (.deliverVote _ 4 1 1 (by decide) (by decide) (by decide)))
+      (.becomeLeader _ 4 (by decide) (by decide)))
+      (.leaderAppend _ 4 10 (by decide)))
+      (.leaderAppend _ 4 11 (by decide)))
+      (.leaderAppend _ 4 12 (by decide)))
+      (.leaderAppend _ 4 13 (by decide)))
+      (.shipTermMap _ 4 (by decide)))
+      (.deliverTermMap _ 0 1 [(1, 0)] (by decide) (by decide)))
+      (.deliverReplicate _ 0 0 1 1 10 (by decide) (by decide) (by decide)
+        (by decide)))
+      (.deliverTermMap _ 1 1 [(1, 0)] (by decide) (by decide)))
+      (.deliverReplicate _ 1 0 1 1 10 (by decide) (by decide) (by decide)
+        (by decide)))
+      (.deliverTermMap _ 3 1 [(1, 0)] (by decide) (by decide)))
+      (.deliverReplicate _ 3 0 1 1 10 (by decide) (by decide) (by decide)
+        (by decide)))
+      (.deliverReplicate _ 3 1 1 1 11 (by decide) (by decide) (by decide)
+        (by decide)))
+      (.deliverReplicate _ 3 2 1 1 12 (by decide) (by decide) (by decide)
+        (by decide)))
+      (.deliverReplicate _ 3 3 1 1 13 (by decide) (by decide) (by decide)
+        (by decide)))
+      -- term 2: node 1 leads {1,0,2} on (1,1), appends stamp-2 bytes at
+      -- positions 1-2; node 0 reconciles cleanly and takes both.
+      (.startElection _ 1 (by decide)))
+      (.deliverRequestVote _ 0 1 2 1 1 (by decide) (by decide)))
+      (.deliverRequestVote _ 2 1 2 1 1 (by decide) (by decide)))
+      (.deliverVote _ 1 0 2 (by decide) (by decide) (by decide)))
+      (.deliverVote _ 1 2 2 (by decide) (by decide) (by decide)))
+      (.becomeLeader _ 1 (by decide) (by decide)))
+      (.leaderAppend _ 1 21 (by decide)))
+      (.leaderAppend _ 1 22 (by decide)))
+      (.shipTermMap _ 1 (by decide)))
+      (.deliverTermMap _ 0 2 [(1, 0), (2, 1)] (by decide) (by decide)))
+      (.deliverReplicate _ 0 1 2 2 21 (by decide) (by decide) (by decide)
+        (by decide)))
+      (.deliverReplicate _ 0 2 2 2 22 (by decide) (by decide) (by decide)
+        (by decide)))
+      -- term 4: node 3 wins on (1,4) with {3,4,2}; node 0 ADOPTS 4 in the
+      -- losing exchange (handle 4, gate closed); the new leader serveTails
+      -- its inherited stamp-1 byte at position 3 under header 4.
+      (.startElection _ 3 (by decide)))
+      (.startElection _ 3 (by decide)))
+      (.startElection _ 3 (by decide)))
+      (.deliverRequestVote _ 4 3 4 1 4 (by decide) (by decide)))
+      (.deliverRequestVote _ 2 3 4 1 4 (by decide) (by decide)))
+      (.deliverRequestVote _ 0 3 4 1 4 (by decide) (by decide)))
+      (.deliverVote _ 3 4 4 (by decide) (by decide) (by decide)))
+      (.deliverVote _ 3 2 4 (by decide) (by decide) (by decide)))
+      (.becomeLeader _ 3 (by decide) (by decide)))
+      (.serveTail _ 3 3 1 13 (by decide) (by decide) (by decide)))
+      -- term 5: node 0 startElections (candidate, handle STILL 4, gate
+      -- still closed); node 1 crash-restarts and wins term 5 on (2,3),
+      -- ships its map; node 0 reconciles it CLEANLY (validUpTo = durable,
+      -- 5 ≤ 5 non-adopt) — the gate REOPENS at handle-regime 4.
+      (.crashRestart _ 1))
+      (.startElection _ 1 (by decide)))
+      (.startElection _ 1 (by decide)))
+      (.startElection _ 1 (by decide)))
+      (.startElection _ 0 (by decide)))
+      (.deliverRequestVote _ 2 1 5 2 3 (by decide) (by decide)))
+      (.deliverRequestVote _ 4 1 5 2 3 (by decide) (by decide)))
+      (.deliverVote _ 1 2 5 (by decide) (by decide) (by decide)))
+      (.deliverVote _ 1 4 5 (by decide) (by decide) (by decide)))
+      (.becomeLeader _ 1 (by decide) (by decide)))
+      (.shipTermMap _ 1 (by decide)))
+      (.deliverTermMap _ 0 5 [(1, 0), (2, 1), (5, 3)] (by decide)
+        (by decide)))
+      -- the poisoned accept: the term-4 serveTail frame at node 0's
+      -- frontier — stamp 1 ≤ lastTermOf [(1,0),(2,1)] = 2, observeTerm
+      -- no-op, hist/map disagree.
+      (.deliverReplicate _ 0 3 4 1 13 (by decide) (by decide) (by decide)
+        (by decide)),
+    by decide, by decide⟩
+
+/-- **Corollary (the LC2 discharge target is FALSE).** Even under the
+LC1b `dataTerm` delivery guard, `Reachable w → FramesCurrentAuthored w`
+does not hold — the gate-reopen keying is the remaining hole. -/
+theorem fca_gate_reopen_unconditional_is_false :
+    ¬ ∀ (w : World 5), Reachable w → FramesCurrentAuthored w := by
+  intro h
+  obtain ⟨w, hw, hh, ht⟩ := finding_candidate_gate_reopen_fca_violation
+  have := h w hw 0 3 1 13 hh
+  omega
+
+#print axioms finding_candidate_gate_reopen_fca_violation
+#print axioms fca_gate_reopen_unconditional_is_false
 
 end Uc2.Cert
