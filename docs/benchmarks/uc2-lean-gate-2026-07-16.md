@@ -370,6 +370,47 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    phantom class only, so the benign transient can never satisfy the pin.
    Full probe data in the scenario-file config comment.
 
+6. **Finding #7 — MODEL-FIDELITY gap, NOT a Rust bug (open, discharge
+   scheduled).** Surfaced by Tier B(b)'s LB2 re-run, after both #6a/#6b were
+   fixed (`.superpowers/sdd/task-LB2-rerun-report.md`): the LA1 `≤`-guard
+   over-approximation on `deliverReplicate` (`hstamp : t ≤ currentTerm`,
+   already flagged in its own docstring as the model's conservative
+   consequence of two Rust guards — see the Phase 2 spike memo's Tier B(a)
+   §3 item 4) is sound for `Uc2.Data.log_matching` but unsound for leader
+   completeness: it lets a follower accept a dead leader's in-flight stale
+   frame interleaved with the live leader's stream — a "Frankenstein log"
+   real UC structurally forbids — and then honestly report a durable
+   frontier covering the leader's commit range with divergent content
+   underneath. Machine-checked as a 33-step kernel-decided countermodel
+   (`finding_stale_replicate_replay_lc_violation` /
+   `lc_core_commit_term_keyed_is_false`, kept in
+   `Uc2Proofs/LeaderCompleteness.lean` — they refute the unconditional
+   `leader_completeness` statement, which stays refuted regardless of any
+   conditional route). Rust evidence: `uc2_net/src/receiver.rs:636-639`
+   (`if h.leadership_term_id != term { dropped_stale_term; return; }`) —
+   exact header-match, not `≤`; real replication re-serves old-stamped
+   bytes during catch-up/NAK-repair strictly inside the CURRENT leader's
+   stream, a distinction the model's record-stamp-only `Frame.replicate`
+   cannot express. **No Rust change indicated; no sim change indicated** —
+   this is a model-fidelity gap, not a protocol defect.
+
+   **Disposition: OPEN, discharge scheduled as "Option 1."** User directive
+   was a hybrid: land a conditional `leader_completeness` now (carrying a
+   new hypothesis, `FramesCurrentAuthored`, that assumes away exactly this
+   gap — designed, hand-verified sufficient/faithful/non-circular, and
+   machine-checked non-vacuous in `task-LB2b-report.md`, though the
+   `leader_completeness` theorem itself remains open for unrelated reasons)
+   while scheduling the real fix as a follow-up: split `Frame.replicate`'s
+   record stamp from a header provenance term (mirroring
+   `receiver.rs:636-639` exactly) plus a new `serveTail` leader-re-serve
+   step, which discharges `FramesCurrentAuthored` by construction rather
+   than by hypothesis — at the cost of `Uc2.Data.log_matching`
+   (`LogMatching.lean`, 1046 lines) needing to re-green under the extended
+   model per the LA1 layering rules. Not started as of this gate. Full
+   record, cost accounting, and the options for what to do next:
+   `docs/benchmarks/uc2-lean-phase2-spike-2026-07-17.md`'s **"Tier B(b)
+   actuals + re-gate"** section.
+
 ### Restatements (recorded for completeness, not spec gaps)
 
 - `commit_certified_run` (C3, run form) was **strengthened**, not weakened: an
@@ -446,8 +487,35 @@ stretch prefix-form is dropped with a countermodel (false in the model,
 in the lineage/map reading only — see the memo). Measured cost (~6.2
 S2-equivalents) and the re-priced (b)/(c) estimates, plus a GO recommendation
 for (b) leader completeness, are in the memo's **"Tier B(a) actuals +
-re-gate"** section (same file as above). Next formal-methods decision: (b)
-leader completeness, per that section's recommendation.
+re-gate"** section (same file as above).
+
+**Tier B(b) leader-completeness sub-spike complete 2026-07-18** (branch
+`uc2/lean-leader-completeness`): **election safety + log-matching proved;
+leader completeness conditional-partial (`FramesCurrentAuthored`), 2 shipped
+bugs found+fixed en route.** Spelled out: `Uc2.Data.log_matching` and both
+levels of `election_safety` stay green, lifted into a new commit-plane layer
+(`Uc2Proofs/ProtocolCommit.lean`, kernel `CommitTracker` consumed, ghost
+committed ledger); `leader_completeness` itself is NOT proved — a
+conditional hypothesis (`FramesCurrentAuthored`) plus two supporting
+unconditional lemmas plus a required non-vacuity trace are landed and
+machine-checked in `Uc2Proofs/LeaderCompleteness.lean`, but the theorem
+closing the induction is open (Finding #7 above names exactly the gap the
+hypothesis carries away; discharging it is the scheduled "Option 1"
+follow-up). Along the way, the sub-spike's adversarial invariant design
+found and FIXED two real, shipped safety bugs — Finding #5 (a boot-time
+phantom-commit hazard on the commit path) and Finding #6b (a Raft
+§5.4.2/Figure-8-class acked-write-loss bug) — plus re-keyed one statement
+gap (Finding #6a). All four findings and their dispositions are in this
+doc's Findings section (items 4-6 above); the full actuals (measured
+cost — this sub-spike ran ~6-12× over its own 3–6 S2-equivalent estimate,
+the opposite of Tier B(a)'s in-range result), the hybrid-plan follow-ups, and
+the honest re-price of (c) state-machine safety (now gated on finishing
+(b)) are in the memo's **"Tier B(b) actuals + re-gate"** section (same file
+as above). Next formal-methods decision: presented, not resolved, in that
+section's recommendation — finish `leader_completeness` (Option 2 more
+sessions, on sonnet or fable), do the Option 1 model refinement first, or
+pause further proving on leader completeness given the two shipped-bug fixes
+already banked.
 
 ---
 
@@ -457,7 +525,14 @@ prune (see its Disposition paragraph); Phase 1.5 attempted and exited at the
 aeneas/Lean-4.32 version wall (see Phase 1.5 status above). The Phase 2
 election-safety spike (spec §7) is complete — see the Phase 2 spike section
 above and its memo. Its Tier B(a) log-matching sub-spike is also complete
-(see the Phase 2 spike section) — `log_matching` is proved, and the memo's
-re-gate section prices and recommends GO on (b) leader completeness next.
-Other options when desired: a Phase 1.5 retry once aeneas supports
-Lean ≥ 4.32.
+(see the Phase 2 spike section) — `log_matching` is proved. Its Tier B(b)
+leader-completeness sub-spike is also complete, but did not finish: election
+safety and log-matching stay proved, `leader_completeness` itself lands only
+conditionally (open theorem, `FramesCurrentAuthored` hypothesis), and the
+sub-spike found and fixed two real, shipped safety bugs (Findings #5, #6b)
+plus one statement re-key (#6a) along the way (Finding #7, model-fidelity,
+is the reason the conditional route exists at all) — see the Phase 2 spike
+section above and the memo's "Tier B(b) actuals + re-gate" section for the
+full record, cost accounting, and the presented (not resolved) options for
+what to do next. Other options when desired: a Phase 1.5 retry once aeneas
+supports Lean ≥ 4.32.
