@@ -409,7 +409,8 @@ mod tests {
         // Asserts every observed record is a 4-byte u32 (no torn payloads).
         // `Overwritten` is acceptable (slow-consumer recovery).
         let reader = |mut sub: BroadcastConsumer,
-                      stop: std::sync::Arc<std::sync::atomic::AtomicBool>| {
+                      stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+                      started: std::sync::Arc<std::sync::atomic::AtomicBool>| {
             std::thread::spawn(move || {
                 let mut seen = 0usize;
                 let mut buf = Vec::new();
@@ -421,6 +422,7 @@ mod tests {
                         Ok(Some(_rec)) => {
                             assert_eq!(buf.len(), 4, "torn read?");
                             seen += 1;
+                            started.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         Ok(None) => {
                             if stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -441,17 +443,35 @@ mod tests {
             })
         };
 
-        let a_handle = reader(sub_a, stop.clone());
-        let b_handle = reader(sub_b, stop.clone());
+        let a_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let b_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let a_handle = reader(sub_a, stop.clone(), a_started.clone());
+        let b_handle = reader(sub_b, stop.clone(), b_started.clone());
 
-        // Writer: 1000 records, ~24 B each => ~6 wraps on a 4 KiB ring.
+        // Writer: ≥1000 records, ~24 B each => ~6+ wraps on a 4 KiB ring.
         // yield_now between writes gives reader threads schedule time so they
         // can keep pace and meaningfully exercise the wrap-race code path.
+        //
+        // The writer must NOT stop before both readers have read something: the
+        // slow-consumer `Overwritten` reset jumps to the live edge, so a reader
+        // whose first try_read lands after the last write legitimately sees
+        // zero records (observed as a CI flake on a contended 2-vCPU runner).
+        // Keep the ring live until both readers have joined in, with a hard
+        // time cap so a genuinely broken ring still terminates (and the final
+        // assertion then reports the zero count).
         let writer = std::thread::spawn(move || {
-            for i in 0..1000u32 {
-                let payload = i.to_le_bytes();
+            let cap = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut i = 0u64;
+            loop {
+                let payload = (i as u32).to_le_bytes();
                 producer.write(1, 0, [0; 8], &payload).expect("write");
+                i += 1;
                 std::thread::yield_now();
+                let both_started = a_started.load(std::sync::atomic::Ordering::Relaxed)
+                    && b_started.load(std::sync::atomic::Ordering::Relaxed);
+                if i >= 1000 && (both_started || std::time::Instant::now() >= cap) {
+                    break;
+                }
             }
         });
 
