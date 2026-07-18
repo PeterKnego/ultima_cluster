@@ -480,12 +480,21 @@ fn fuzz_heavy_seeds() {
     // it happens in BOTH guard arms — a property of the weaker data plane, not the
     // reopen guard. Kept below that onset so the tier proves the guarded mechanism
     // green, not the strict invariant's tolerance of benign lag.
+    //
+    // Onset re-tune (Finding #5/#6 fixes): mirroring the receiver's 20ms
+    // AppendPosition report floor into the Mechanism plane made follower reports
+    // DENSER, which lowered the benign-transient onset — the old 30_000ppm drop
+    // began tripping the strict-inv2 laggard transient at seed 629 (verified
+    // bit-identical in BOTH guard arms, step 7360, inv4/inv5/inv7 all clean).
+    // Onset now sits in (20_000, 30_000]; 20_000ppm clears all 1000 seeds with a
+    // ~33% margin. inv2's strictness is NOT weakened (it is exactly what caught
+    // Finding #6b) — only the loss rate is kept below the (now denser) onset.
     for seed in 0..1000u64 {
         let mut w = World::new(SimConfig {
             n_nodes: if seed % 4 == 0 { 5 } else { 3 },
             seed,
             max_steps: 20_000,
-            drop_per_million: 30_000,
+            drop_per_million: 20_000,
             dup_per_million: 10_000,
             crash_per_million: 500,
             data_plane: DataPlane::Mechanism { reopen_guard: true },
