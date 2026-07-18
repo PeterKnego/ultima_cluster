@@ -1,155 +1,80 @@
 import Mathlib.Tactic.FinCases
 import Uc2Proofs.ProtocolCommit
 
-/-! LB2b (Option-2 hybrid) — LEADER COMPLETENESS under an explicit
-provenance hypothesis `FramesCurrentAuthored`.
+/-! LC1 (Option-1 frame-provenance refinement) — the header/stamp split
+landed; `FramesCurrentAuthored`'s unconditional discharge REFUTED
+(Finding #8).
 
-## Status: BLOCKED on the FULL conditional theorem, past-ceiling — but the
-## hypothesis design + its supporting UNCONDITIONAL lemmas + its required
-## non-vacuity ARE landed and machine-checked (see the module doc further
-## down, "`FramesCurrentAuthored` — the Option-2 provenance hypothesis").
+## What LC1 landed
 
-Finding #7 (below) proved the FIXED, unconditional LC-core statement is
-FALSE over the CURRENT model: `deliverReplicate`'s stamp guard
-`hstamp : t ≤ currentTerm` (LA1's documented `≤`-over-approximation of two
-Rust guards — an exact HEADER-term match plus the reconcile-before-data
-intake gate, `uc2_net/src/receiver.rs` 636–639/657) lets a follower replay a
-DEAD leader's stale in-flight frame across a reconcile boundary. This task's
-job was to prove the CONDITIONAL form instead — LC-core plus exactly one
-added hypothesis, `FramesCurrentAuthored w` (defined below: a node's held
-content always agrees with what its OWN term map attributes to that
-position — the model-level consequence of the same two Rust guards, a
-provenance/content-canonicity fact that never mentions `committed` or
-leader-hist completeness — see the predicate's own docstring for the full
-faithfulness / non-circularity argument). Hand-verified against the Finding
-#7 world: it is FALSE there (node 1's replayed entry is stamped 2 while its
-own reconciled term map attributes position 1 to term 3), so the hypothesis
-is SUFFICIENT to exclude the known countermodel, and
-`nonvacuity_leader_completeness_trace` (below) proves it is not vacuous —
-LB1's plain commit trace (current-leader-authored replication only)
-satisfies it, machine-checked.
+The LB2-rerun report's "recommended fix (faithful)", adjudicated as the
+LC-closure arc's decisions 1–2 and applied in `ProtocolData.lean` /
+`ProtocolCommit.lean`:
 
-**What is NOT landed: the `leader_completeness` theorem itself.** Closing
-the induction (the `becomeLeader` endgame in particular) needs supporting
-invariant infrastructure this codebase does not yet have — a term-map
-well-formedness (`Ascending`) invariant, and a message-indexed report-
-provenance clause (the `grant_state`/S2 pattern, applied to `CMsg.report`)
-tying a folded report's durable frontier back to the reporter's term-map
-state at SEND time. Design work for both is recorded in
-`.superpowers/sdd/task-LB2b-report.md`; per the task's stuck-protocol, this
-exceeds the effort ceiling and is reported BLOCKED rather than sorried or
-forced through with a weakened statement. `Reachable w →
-FramesCurrentAuthored w` remains FALSE (Finding #7), so the hypothesis
-stays an explicit, carried assumption either way; a later, separate task
-(Option 1: split the frame's wire HEADER term from its record STAMP, plus a
-`serveTail` re-serve constructor) is expected to DISCHARGE it unconditionally
-for every reachable world — that model refinement is NOT this task.
+- `Frame.replicate (pos hdr stamp payload)` — the wire header
+  (`leadership_term_id`) and the record stamp are now separate fields;
+- delivery requires an EXACT header match
+  (`hhdr : hdr = currentTerm j`, `receiver.rs:636-639`
+  `dropped_stale_term`) plus the existing intake gate; the old
+  `hstamp : stamp ≤ currentTerm` delivery guard is gone — its content
+  moved to emission-side truthfulness (`LogMatching.lean`'s `StampInv`);
+- `leaderAppend` emits `hdr = stamp = currentTerm`; the new leader-only
+  `serveTail` step re-ships a held byte under the CURRENT header with its
+  ORIGINAL stamp (the NAK-repair/journal-replay catch-up path);
+- `observeTerm` stays keyed on the record STAMP (unchanged semantics).
+
+Under the amended shape, **Finding #7's pivotal step no longer
+type-checks**: the dead term-2 leader's in-flight frame carries header 2,
+and a follower reconciled to term 3 requires header 3 — so the
+cross-stream stale-replicate replay (the 33-step countermodel
+`finding_stale_replicate_replay_lc_violation` + its corollary
+`lc_core_commit_term_keyed_is_false`, which lived here) is unreachable and
+both finding-theorems are DELETED per the arc's decision 3 (the #5/#6b
+precedent; their full traces live in the LB2-rerun report and the lean
+gate doc). `nonvacuity_serve_tail_catchup_trace` (below) proves the
+amendment did NOT gut the legitimate inherited-prefix catch-up that the
+rejected equality-on-one-term alternative would have killed.
+
+## Finding #8 — the discharge target is FALSE over the amended model
+(`finding_candidate_stale_gate_fca_violation` + `fca_unconditional_is_false`)
+
+The arc's decision 3 called for `frames_current_authored : Reachable w →
+FramesCurrentAuthored w`. That statement is REFUTED by a 24-step
+kernel-checked trace (see the finding theorem's docstring): the model's
+exact-match guard compares the header against `currentTerm`, but Rust's
+DATA path compares it against the node-level `term_handle`, which
+`Action::StartElection` does NOT advance (`node.rs` 2418–2428 — the same
+handle-lag `ProtocolCommit.lean`'s module doc item 10c records for
+reports). A CANDIDATE that bumped `currentTerm` past its last
+gate-opening regime therefore accepts, in the model, current-header bytes
+its map never reconciled against — in Rust the identical datagram is
+`dropped_stale_term`. Model-fidelity gap in the ADJUDICATED enabling
+(`hhdr` keyed to `currentTerm`), not a Rust bug; escalated per the
+stuck-protocol rather than weakened (candidate repairs are in the LC1 task
+report: model the lagging data-plane term handle, or close the model gate
+at `startElection`).
+
+`FramesCurrentAuthored` itself (definition below) is KEPT: it remains the
+Option-2 provenance predicate whose per-world truth the endgame consumes,
+with its faithfulness/non-circularity arguments unchanged (LB2b report).
+The unconditional provenance lemmas (`hist_frame_provenance`,
+`committed_frame_provenance`) are re-proven under the split frame shape
+(the wire header is existential — consumers care about the record stamp).
 
 ## History
 
-The original FIXED LC-core contract (LB2 brief, decision 5) was refuted
-twice over by machine-checked countermodels that lived in this file
-(commit `14cdcfc`; full traces and Rust evidence in
-`.superpowers/sdd/task-LB2-report.md` and the lean gate doc):
-
-- **Finding #6a (statement gap)**: the ghost recorded the data STAMP while
-  Raft's Leader Completeness (§5.4.3) keys on the COMMIT term. FIXED by
-  re-keying the ghost to `(position, stamp, commitTerm, payload)`
-  (`Uc2Proofs/ProtocolCommit.lean`, module doc item 1).
-- **Finding #6b (PROTOCOL gap, Raft §5.4.2 / Figure 8 — a REAL v2.x
-  acked-write-loss bug)**: an old-term-only range could commit at the
-  election base before the NewTerm frame was quorum-durable. FIXED in Rust
-  (`election.rs::rank_leader` commit clamp) and mirrored as
-  `leaderAdvanceCommit`'s `hbase` enabling (module doc item 9).
-
-## Finding #7 — the re-keyed LC-core is STILL false in this model
-(`finding_stale_replicate_replay_lc_violation`, 33-step kernel trace,
-n = 3, + `lc_core_commit_term_keyed_is_false`)
-
-**The re-keyed FIXED statement**
-
-```
-theorem leader_completeness {n : Nat} (w : World n) (hw : Reachable w)
-    (p t T v : Nat) (hc : (p, t, T, v) ∈ w.committed)
-    (i : Fin n) (hi : (w.nodes i).pn.role = .leader)
-    (ht : T < (w.nodes i).pn.currentTerm) :
-    (w.nodes i).hist p = some (t, v)
-```
-
-is refuted (in the `T < currentTerm` FIXED-contract form, hence a fortiori
-in the `T ≤` strengthening) by a reachable trace whose pivot is
-**cross-stream stale-frame replay**: `deliverReplicate`'s stamp guard
-`hstamp : t ≤ currentTerm` (inherited verbatim from the data model, LA1
-module doc item 6) lets a follower that has just reconciled CLEANLY against
-the current T-leader's map re-accept a **stale lower-term replicate frame
-from a dead leader's stream** at its truncated frontier, then accept a
-genuine T-stamped byte on top. Its data-stamped map now ends in a `(T, b)`
-entry, its durable covers the leader's commit range, and its intake gate
-never closed — so its AppendPosition report at term T is truthful,
-gate-open, and folded by the T-leader's tracker, certifying (through the
-Finding-#6b clamp, which is satisfied: the range crosses the T base) a
-commit range containing a position where the reporter's CONTENT diverges
-from the leader's log. The reporter then wins term T+1 on its
-`(lastTerm = T, durable ≥ k)` credentials — a leader above the commit term
-that does not hold the committed entry.
-
-**Trace shape** (n = 3; every enabling condition honest — no staleness
-beyond ordinary in-flight frames, one crash used only to free node 0 from
-its own stale leadership):
-
-- t1: node 0 leads {0,1}, appends `(pos 0, stamp 1, payload 10)`; node 1
-  reconciles (gate opens) and accepts it.
-- t2: node 1 leads {1,2} and appends `(pos 1, stamp 2, payload 20)` — the
-  future stale frame — reaching durable 2.
-- t3: node 0 (crash-restarted to follower) wins {0,2} on credentials
-  `(1, 1)`; `prunePush` opens its map `[(1,0),(3,1)]` (base₃ = 1); it
-  appends `(pos 1, stamp 3, payload 30)` and `(pos 2, stamp 3, payload 31)`
-  and gossips its map. Node 1 adopts term 3 via the RequestVote (gate
-  closes), reconciles against the t3 map — its divergent t2 tail dies at
-  `validUpTo = 1`, gate REOPENS — and then:
-  - **re-accepts its own stale t2 frame** `(1, 2, 20)` at its truncated
-    frontier 1 (`hstamp : 2 ≤ 3` — the over-approximation), then
-  - accepts the leader's genuine `(2, 3, 31)` at frontier 2, so its map
-    grows `[(1,0),(2,1),(3,2)]` — LAST ENTRY TERM 3 — durable 3.
-- Node 1 reports `(term 3, durable 3)` (follower, gate open — truthful);
-  the leader folds it; the kernel `advance` fires at k = 3; `hbase` holds
-  (base₃ = 1 < 3); the ghost commits `(1, 3, 3, 30)` from the LEADER's
-  hist — while node 1's hist at 1 is `(2, 20)`.
-- t4: node 1 wins {1,2} on `(lastTerm 3, durable 3)`. Final world:
-  `(1, 3, 3, 30) ∈ committed`, node 1 is leader, `3 < currentTerm 1 = 4`,
-  `hist 1 1 = some (2, 20) ≠ some (3, 30)`.
-
-**Classification: MODEL-FIDELITY gap, not a Rust bug.** Verified in source
-this session: `uc2_net/src/receiver.rs:635-639` drops any DATA datagram
-whose header `leadership_term_id` is not EXACTLY the adopted term
-(`dropped_stale_term`) — record stamps ride inside the datagram BODY under
-the CURRENT leader's header (catch-up/NAK repair re-serves old-stamped
-records under the new leadership term), while adoption comes only from
-consensus datagrams. So in Rust a follower's post-reconcile intake is
-scoped to the live T-leader's stream and the Frankenstein log above is
-structurally impossible. The model's `Frame.replicate pos term payload`
-conflates the record STAMP with the datagram HEADER term, and the `≤`
-guard (documented in LA1 as "the model's ≤ consequence of two Rust
-guards") is sound for LOG MATCHING (which is per-(pos, stamp) and does not
-care which stream delivered a byte) but UNSOUND for LEADER COMPLETENESS.
-
-**Why no local repair exists inside this task's staging envelope**: the
-faithful fix gives frames both a header term and a record stamp
-(acceptance requires `header = currentTerm`; `observeTerm` keeps stamping
-by the record stamp; a leader re-serves its hist under its own header via
-a new serve-tail step) — a `Uc2Proofs/ProtocolData.lean` amendment that
-re-opens the LA2 preservation proof, i.e. controller territory under the
-LA1 rules, exactly like the #6a ghost re-key was. The alternatives
-(equality-`hstamp`, or an enabling that names the live same-term leader's
-content) under-approximate Rust — they erase the real catch-up-of-
-old-stamped-bytes behavior the model exists to cover — and are recorded in
-the task report as explicit controller trade-offs, not applied here.
-
-The LC-core proof against the repaired model remains the next re-run's
-deliverable; the invariant architecture (holders quorum + canonical-prefix
-`SplitsAt` + Cert-at-T + the grant-time freshness chain) and the
-establishment-order analysis this trace fell out of are in
-`.superpowers/sdd/task-LB2-rerun-report.md`. -/
+- **Finding #6a (statement gap)**: ghost re-keyed to
+  `(position, stamp, commitTerm, payload)` (`ProtocolCommit.lean`, item 1).
+- **Finding #6b (PROTOCOL gap, Raft §5.4.2/Fig-8 — a real v2.x
+  acked-write-loss bug)**: fixed in Rust (`rank_leader` commit clamp),
+  mirrored as `leaderAdvanceCommit`'s `hbase`.
+- **Finding #7 (model-fidelity)**: single-term frames + the `≤` stamp
+  guard admitted a cross-stream stale-replicate replay — sound for log
+  matching, unsound for leader completeness. Fixed by THIS amendment;
+  finding-theorems deleted (traces in the LB2-rerun report + gate doc).
+- **Finding #8 (model-fidelity, THIS task)**: the amended guard's
+  `currentTerm` keying leaves a candidate hole vs Rust's lagging
+  `term_handle`; `Reachable → FramesCurrentAuthored` refuted below. -/
 
 namespace Uc2.Cert
 
@@ -167,212 +92,170 @@ private theorem advance_fires {t : CommitTracker} {own : Nat}
   subst hown
   exact hk
 
-/-- **Finding #7 (KEPT — documents why `FramesCurrentAuthored` is needed).**
-The cross-stream stale-replicate replay trace (module doc): a reachable
-world satisfying every hypothesis of the re-keyed FIXED LC-core — a
-genuinely committed `(1, 3, 3, 30)` (through the kernel tracker AND the #6b
-`hbase` clamp) and a leader strictly above the commit term — whose leader
-holds DIFFERENT content at the committed position (`(2, 20)`, its replayed
-stale byte). This is exactly why the FIXED statement can only be proven
-CONDITIONAL on `FramesCurrentAuthored` (BLOCKED for now — see the module
-doc's Status section): this trace's final world does NOT satisfy
-`FramesCurrentAuthored` (node 1's replayed entry at position 1 is stamped 2
-while node 1's own term map, frozen by the clean reconcile against node 0's
-`[(1,0),(3,1)]`, attributes position 1 to term 3 — `termAt ≠` the held
-stamp), so `hprov` correctly excludes it. Option 1 (the header/stamp frame
-split + `serveTail`, a separate follow-up task) is expected to make this
-trace UNREACHABLE outright, discharging `FramesCurrentAuthored`
-unconditionally; until then this countermodel remains the reachability
-witness that the UNCONDITIONAL statement below it (`lc_core_...is_false`)
-is genuinely false, and that `hprov` is doing real work, not padding. -/
-theorem finding_stale_replicate_replay_lc_violation :
-    ∃ w : World 3, Reachable w ∧
-      (1, 3, 3, 30) ∈ w.committed ∧
-      (w.nodes 1).pn.role = .leader ∧
-      3 < (w.nodes 1).pn.currentTerm ∧
-      (w.nodes 1).hist 1 = some (2, 20) ∧
-      (w.nodes 1).hist 1 ≠ some (3, 30) := by
-  refine ⟨_,
-    .tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
-      (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
-      (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
-      (.tail (.tail
-      -- t1: node 0 leads {0,1} and replicates (0, 1, 10) to node 1.
-      (.single (.startElection _ 0 (by decide)))
-      (.deliverRequestVote _ 1 0 1 0 0 (by decide) (by decide)))
-      (.deliverVote _ 0 1 1 (by decide) (by decide) (by decide)))
-      (.becomeLeader _ 0 (by decide) (by decide)))
-      (.leaderAppend _ 0 10 (by decide)))
-      (.shipTermMap _ 0 (by decide)))
-      (.deliverTermMap _ 1 1 [(1, 0)] (by decide) (by decide)))
-      (.deliverReplicate _ 1 0 1 10 (by decide) (by decide) (by decide)
-        (by decide)))
-      -- t2: node 1 leads {1,2}; its (1, 2, 20) append is the stale frame.
-      (.startElection _ 1 (by decide)))
-      (.deliverRequestVote _ 2 1 2 1 1 (by decide) (by decide)))
-      (.deliverVote _ 1 2 2 (by decide) (by decide) (by decide)))
-      (.becomeLeader _ 1 (by decide) (by decide)))
-      (.leaderAppend _ 1 20 (by decide)))
-      -- t3: node 0 (crash-restarted follower) wins {0,2} at term 3.
-      (.crashRestart _ 0))
-      (.startElection _ 0 (by decide)))
-      (.startElection _ 0 (by decide)))
-      (.deliverRequestVote _ 2 0 3 1 1 (by decide) (by decide)))
-      (.deliverVote _ 0 2 3 (by decide) (by decide) (by decide)))
-      (.becomeLeader _ 0 (by decide) (by decide)))
-      (.leaderAppend _ 0 30 (by decide)))
-      (.leaderAppend _ 0 31 (by decide)))
-      (.shipTermMap _ 0 (by decide)))
-      -- node 1: adopt t3 (gate closes), reconcile clean (tail dies,
-      -- gate reopens) ...
-      (.deliverRequestVote _ 1 0 3 1 1 (by decide) (by decide)))
-      (.deliverTermMap _ 1 3 [(1, 0), (3, 1)] (by decide) (by decide)))
-      -- ... then REPLAY the stale t2 frame at the truncated frontier
-      -- (hstamp: 2 ≤ 3 — the over-approximation) and a genuine t3 byte.
-      (.deliverReplicate _ 1 1 2 20 (by decide) (by decide) (by decide)
-        (by decide)))
-      (.deliverReplicate _ 1 2 3 31 (by decide) (by decide) (by decide)
-        (by decide)))
-      -- the truthful gate-open report certifies the commit at k = 3
-      -- (hbase: base₃ = 1 < 3 — the #6b clamp is satisfied).
-      (.sendReport _ 1 (by decide) (by decide)))
-      (.deliverReport _ 0 1 3 3 (by decide) (by decide) (by decide)
-        (by decide)))
-      (.leaderAdvanceCommit _ 0 3 (by decide) ⟨(3, 1), by decide⟩
-        (advance_fires ⟨[3, 0], 2, 0⟩ 3 3 (by decide) (by decide)
-          (by simp [CommitTracker.advance, CommitTracker.ranking,
-                List.mergeSort]))))
-      -- t4: the divergent reporter wins on (lastTerm 3, durable 3).
-      (.startElection _ 1 (by decide)))
-      (.deliverRequestVote _ 2 1 4 3 3 (by decide) (by decide)))
-      (.deliverVote _ 1 2 4 (by decide) (by decide) (by decide)))
-      (.becomeLeader _ 1 (by decide) (by decide)),
-    by decide, by decide, by decide, by decide, by decide⟩
+/-! ## `FramesCurrentAuthored` — the Option-2 provenance predicate (LB2b)
 
-/-- The re-keyed FIXED LC-core statement (`T < currentTerm` form, at
-n = 3) is FALSE for the post-#6a/#6b model **without the provenance
-hypothesis** — hence so is the `T ≤` strengthening (the countermodel
-satisfies the strictly stronger hypothesis). KEPT (not deleted): it would
-only become redundant once a `leader_completeness` theorem exists whose
-ADDED hypothesis (`FramesCurrentAuthored w`) this countermodel's world is
-shown to fail — which is exactly the shape this task designed
-(`FramesCurrentAuthored` below, verified by hand against this trace) but did
-NOT reach a machine-checked `leader_completeness` for (BLOCKED — see the
-module doc's Status section). Until that theorem lands, this is the
-machine-checked record of exactly why an unconditional statement cannot
-work over the current model, motivating the conditional route. -/
-theorem lc_core_commit_term_keyed_is_false :
-    ¬ ∀ (w : World 3), Reachable w →
-        ∀ (p t T v : Nat), (p, t, T, v) ∈ w.committed →
-        ∀ i : Fin 3, (w.nodes i).pn.role = .leader →
-        T < (w.nodes i).pn.currentTerm →
-        (w.nodes i).hist p = some (t, v) := by
-  intro h
-  obtain ⟨w, hw, hc, hrole, hterm, -, hne⟩ :=
-    finding_stale_replicate_replay_lc_violation
-  exact hne (h w hw 1 3 3 30 hc 1 hrole hterm)
+### Design (LB2b, unchanged by LC1)
 
-#print axioms finding_stale_replicate_replay_lc_violation
-#print axioms lc_core_commit_term_keyed_is_false
+The Rust invariant the single-term frame model lost was: **the term MAP is
+exactly the receiver's own record of which header-authenticated segment
+produced which byte range** — `observeTerm` grows the map only when a
+just-accepted stamp exceeds the map's frontier, and Rust's exact
+header-match means every BYTE accepted while the map's frontier sits at
+term `u` was authenticated by the term-`u` stream. Consequently, in real
+UC, a node's held content at a position is ALWAYS the term its OWN term
+map attributes to that position — `hist j p = some (t, v) →
+termMap_j.termAt p = t`. `FramesCurrentAuthored` asserts exactly this,
+for every node, at the given world.
 
-/-! ## `FramesCurrentAuthored` — the Option-2 provenance hypothesis
+It is UNAFFECTED by legitimate inherited-prefix catch-up: `observeTerm`
+only ever GROWS the map, so a genuine catch-up delivery (old stamp,
+landing at a position the map's existing entries already attribute to that
+stamp) leaves `termAt` unchanged and consistent — witnessed reachably by
+`nonvacuity_serve_tail_catchup_trace` below. It excluded Finding #7's
+replay (stamp 2 at a position the reconciled map attributed to term 3),
+and it is violated by Finding #8's candidate-window accept (stamp 1 at a
+position the carried-over map attributes to term 2).
 
-**The hardest part of this task, per the brief: design a hypothesis that is
-sufficient (closes Finding #7), faithful (exactly the strength of
-`receiver.rs` 636–639 + the intake gate, no stronger), and non-circular
-(never mentions `committed` or leader-hist completeness directly).**
-
-### Design
-
-`Frame.replicate pos term payload` (`ProtocolData.lean`) conflates two
-things Rust keeps separate: the datagram's wire HEADER (`leadership_term_id`,
-checked for EXACT equality against the receiver's adopted term,
-`receiver.rs:636-639`) and the record's own STAMP (the term the byte was
-originally written under, which can be OLDER than the header on a legitimate
-catch-up/NAK-repair re-serve — the current leader re-ships an INHERITED
-prefix byte under ITS OWN header). `deliverReplicate`'s `hstamp : t ≤
-currentTerm` is LA1's documented `≤`-collapse of both guards into the single
-stamp field. The Rust invariant this loses is: **the term MAP is exactly the
-receiver's own record of which header-authenticated segment produced which
-byte range** — `observeTerm` grows the map only when a just-accepted stamp
-exceeds the map's frontier, and Rust's exact header-match means every BYTE
-accepted while the map's frontier sits at term `u` was authenticated by the
-term-`u` stream. Consequently, in real UC, a node's held content at a
-position is ALWAYS the term its OWN term map attributes to that position —
-`hist j p = some (t, v) → termMap_j.termAt p = t`. `FramesCurrentAuthored`
-asserts exactly this, for every node, at the given world.
-
-Why this survives the Finding-#7 replay unscathed for LEGITIMATE catch-up
-but excludes the replay: `observeTerm` only ever GROWS the map (case
-`t > lastTermOf m`), never shrinks or rewrites it, so a genuine inherited-
-prefix delivery (stamp `t` strictly below the map's current frontier,
-landing at a position the map's EXISTING entries already attribute to `t`)
-leaves `termAt` unchanged and consistent — `FramesCurrentAuthored` says
-nothing against it. Finding #7's replay is a `t ≤ lastTermOf m` delivery
-whose stamp (2) does NOT match what the receiver's OWN (already-reconciled-
-to-the-live-leader) map attributes to that position (3, per node 1's map
-`[(1,0),(3,1)]` after its clean reconcile) — `FramesCurrentAuthored` is
-FALSE at that world (see the amended Finding #7 docstring above), so `hprov`
-rules the countermodel out.
-
-### Faithfulness argument (for the docstring, as the brief requires)
+### Faithfulness
 
 The predicate speaks ONLY about a node's own two local fields (`hist`,
-`termMap`) agreeing with each other — it is the direct, node-local
-CONSEQUENCE of "every accepted byte was authenticated by the stream the
-map's frontier currently names," which is exactly what the exact
-header-match guard (`receiver.rs:636-639`) plus the reconcile-before-data
-intake gate (`receiver.rs:657`, closing ingestion until the map itself is
-resynchronized) jointly establish in Rust. It asserts NOTHING stronger:
-it does not require `t = currentTerm` (that would forbid legitimate
-inherited-prefix catch-up — the rejected `hstamp`-equality alternative the
-LB2-rerun report already documented as an under-approximation), and it does
-not reach into ANY other node's state, `committed`, or `dsent` — a node's
-own consistency is checkable from its own two fields alone.
+`termMap`) agreeing with each other — the direct, node-local consequence
+of "every accepted byte was authenticated by the stream the map's frontier
+currently names," which is what the exact header-match guard
+(`receiver.rs:636-639`) plus the reconcile-before-data intake gate
+(`receiver.rs:657`) jointly establish in Rust — where the compared term is
+the node-level `term_handle`. The LC1 model keys the guard to
+`currentTerm` instead, which diverges from the handle exactly in the
+candidate window; that delta is Finding #8 (above), and is why the
+predicate — true in Rust — is not yet derivable for every reachable model
+world.
 
-### Non-circularity argument (for the docstring, as the brief requires)
+### Non-circularity
 
 The predicate never mentions `committed`, never mentions "every leader has
-the entry," and never mentions cross-node agreement. It is symmetric in
-every position and every node, including nodes that are followers, nodes
-with no committed content anywhere near them, and worlds with an EMPTY
-`committed` ledger (vacuously about nothing). The bridge from
-`FramesCurrentAuthored` to leader completeness is NOT a rewrite of the
-hypothesis; it would be the theorem's OWN work, combining the hypothesis
-with an already-proven, UNCONDITIONAL fact (`Uc2.Data.log_matching`) and an
-INDUCTIVE, hprov-FREE invariant (NOT mechanized by this task — see the
-module doc's Status section and the task report) that a committed entry's
-stamp is exactly what every sufficiently-advanced later leader's term map
-attributes to its position. The hand-verified argument for why that
-invariant needs no `hprov` (it survives the Finding-#7 replay unscathed,
-since `observeTerm` only ever GROWS a term map — a `t ≤ lastTermOf`
-delivery, replay included, cannot corrupt it) is recorded in the task
-report; mechanizing it needs a term-map well-formedness (`Ascending`)
-invariant plus a message-indexed report-provenance clause this codebase
-does not yet have, which is why this task stops short of it.
+the entry," and never mentions cross-node agreement; it is meaningful (and
+checkable) per node from its own two fields alone, in worlds with an empty
+`committed` ledger included. Any bridge to leader completeness is the
+consuming theorem's own work (combining it with `Uc2.Data.log_matching`
+and a `termAt`-based committed-entry invariant — the LB2b report's proof
+strategy, mechanized by the arc's LC2–LC4). -/
 
-**Sufficiency, checked by hand against Finding #7**: node 1's replayed
-entry is stamped 2, but node 1's own (correctly-reconciled) term map
-attributes position 1 to term 3 — `FramesCurrentAuthored` is FALSE at that
-world, so it excludes the known countermodel; see the amended Finding #7
-docstring above. -/
-
-/-- **The Option-2 hybrid hypothesis.** A node's held content always agrees
-with what its OWN term map attributes to that position. See the module doc
-immediately above for the full faithfulness / non-circularity / sufficiency
-argument; in one line, this is the model-level trace of Rust's exact
-DATA-header match (`receiver.rs:636-639`) plus the reconcile-before-data
-intake gate (`receiver.rs:657`): an accepted byte's term is always the term
-the receiver's own (header-authenticated) map segment names for that byte.
-`Reachable w → FramesCurrentAuthored w` is FALSE over the CURRENT model
-(Finding #7 above is the countermodel) — it is designed to be carried as an
-EXPLICIT hypothesis on a `leader_completeness` theorem (NOT mechanized by
-this task — BLOCKED, see the module doc's Status section), not derived,
-pending the Option-1 model refinement (header/stamp split + `serveTail`)
-that is expected to discharge it unconditionally. -/
+/-- **The Option-2 provenance predicate.** A node's held content always
+agrees with what its OWN term map attributes to that position. See the
+module doc immediately above for the design / faithfulness /
+non-circularity arguments; in one line, this is the model-level trace of
+Rust's exact DATA-header match (`receiver.rs:636-639`) plus the
+reconcile-before-data intake gate (`receiver.rs:657`). LC1 was tasked to
+DISCHARGE it (`Reachable w → FramesCurrentAuthored w`); that statement is
+REFUTED for the model as adjudicated (`fca_unconditional_is_false` below,
+Finding #8 — the candidate window where the model's `currentTerm` guard
+diverges from Rust's lagging `term_handle`), so the predicate remains an
+explicit per-world hypothesis pending the escalated repair. -/
 def FramesCurrentAuthored {n : Nat} (w : World n) : Prop :=
   ∀ j : Fin n, ∀ p t v : Nat, (w.nodes j).hist p = some (t, v) →
     Uc2.TermMap.termAt (w.nodes j).dn.termMap p = t
+
+/-- **Finding #8 (machine-checked): `Reachable w → FramesCurrentAuthored w`
+is FALSE over the LC1-amended model as adjudicated** — the exact-header
+delivery guard `hhdr : hdr = currentTerm j` closes Finding #7's
+cross-stream replay but leaves a CANDIDATE hole the Rust guard does not
+have: Rust's DATA-path compares the datagram header against the node-level
+`term_handle`, which `Action::StartElection` does NOT advance
+(`node.rs` 2418–2428 — the same fact ProtocolCommit's module doc item 10c
+already records for reports: a candidate's data plane still runs at its
+PRE-bump term), while the model's `startElection` bumps the one-and-only
+`currentTerm` and touches neither the gate nor any data state. A node that
+legitimately crash-opens its gate at its own led term (Finding-#5 fix arm:
+`vote_term ≤ map_term`) and then runs `startElection` is a candidate whose
+gate is open and whose `currentTerm` now matches the NEXT leader's wire
+header — so it can accept a serve-tail byte from a stream its map never
+reconciled against. In Rust the same datagram is `dropped_stale_term`
+(header 3 ≠ handle 2).
+
+Trace (n = 3): node 0 leads term 1 and appends three term-1 bytes; node 1
+(which received none of them) leads term 2 and appends two term-2 bytes —
+map `[(2,0)]`, durable 2; node 0 crash-restarts (gate open: 1 ≤ map-last 1)
+and re-wins term 3 on its `(1, 3)` credentials — map `[(1,0),(3,3)]`, its
+term-1 bytes INHERITED below the new base; node 1 crash-restarts (gate
+boots open: term 2 ≤ map-last 2 — its own led term, honest) and
+`startElection`s to term 3 (candidate, gate STILL open, map still
+`[(2,0)]`); node 0 `serveTail`s its inherited `(pos 2, stamp 1)` byte under
+header 3; node 1 accepts it at its frontier 2 (`hhdr : 3 = 3`, gate open).
+Now node 1 holds `(1, 12)` at position 2 while its own map attributes
+position 2 to term 2 — `FramesCurrentAuthored` is FALSE at this reachable
+world. NOTE the poisoned node is a CANDIDATE: it cannot `sendReport`
+(follower-only), and every candidate→follower transition either closes the
+gate (strict adoption), truncates the poison (reconcile), or recomputes the
+gate closed (crash: term 3 > map-last 2) — so no phantom COMMIT is
+apparent from this hole; it refutes the per-node map/hist agreement
+predicate itself, not (as far as this trace goes) LC-core. -/
+theorem finding_candidate_stale_gate_fca_violation :
+    ∃ w : World 3, Reachable w ∧
+      (w.nodes 1).pn.role = .candidate ∧
+      (w.nodes 1).reconciled = true ∧
+      (w.nodes 1).hist 2 = some (1, 12) ∧
+      Uc2.TermMap.termAt (w.nodes 1).dn.termMap 2 = 2 := by
+  refine ⟨_,
+    .tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
+      (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
+      (.tail (.tail (.tail
+      -- t1: node 0 leads {0,2} and appends three term-1 bytes (never
+      -- delivered to node 1).
+      (.single (.startElection _ 0 (by decide)))
+      (.deliverRequestVote _ 2 0 1 0 0 (by decide) (by decide)))
+      (.deliverVote _ 0 2 1 (by decide) (by decide) (by decide)))
+      (.becomeLeader _ 0 (by decide) (by decide)))
+      (.leaderAppend _ 0 10 (by decide)))
+      (.leaderAppend _ 0 11 (by decide)))
+      (.leaderAppend _ 0 12 (by decide)))
+      -- t2: node 1 (empty log) wins term 2 via {1,2} and appends two
+      -- term-2 bytes — map [(2,0)], durable 2.
+      (.startElection _ 1 (by decide)))
+      (.startElection _ 1 (by decide)))
+      (.deliverRequestVote _ 2 1 2 0 0 (by decide) (by decide)))
+      (.deliverVote _ 1 2 2 (by decide) (by decide) (by decide)))
+      (.becomeLeader _ 1 (by decide) (by decide)))
+      (.leaderAppend _ 1 20 (by decide)))
+      (.leaderAppend _ 1 21 (by decide)))
+      -- t3: node 0 crash-opens (1 ≤ map-last 1) and re-wins term 3 on
+      -- (lastTerm 1, durable 3) — its term-1 bytes are now an inherited
+      -- prefix below the new base 3.
+      (.crashRestart _ 0))
+      (.startElection _ 0 (by decide)))
+      (.startElection _ 0 (by decide)))
+      (.deliverRequestVote _ 2 0 3 1 3 (by decide) (by decide)))
+      (.deliverVote _ 0 2 3 (by decide) (by decide) (by decide)))
+      (.becomeLeader _ 0 (by decide) (by decide)))
+      -- the hole: node 1 crash-opens at its own led term 2 (honest,
+      -- Finding-#5 fix arm), then startElection bumps it to term 3 with
+      -- the gate STILL open — a candidate whose currentTerm now matches
+      -- the term-3 wire header (Rust: term_handle would still be 2).
+      (.crashRestart _ 1))
+      (.startElection _ 1 (by decide)))
+      -- node 0 re-serves its INHERITED (pos 2, stamp 1) byte under
+      -- header 3; node 1 accepts it at frontier 2 against a map that
+      -- attributes position 2 to term 2.
+      (.serveTail _ 0 2 1 12 (by decide) (by decide) (by decide)))
+      (.deliverReplicate _ 1 2 3 1 12 (by decide) (by decide) (by decide)
+        (by decide)),
+    by decide, by decide, by decide, by decide⟩
+
+/-- The unconditional discharge target of this task —
+`Reachable w → FramesCurrentAuthored w` — is FALSE for the amended model
+(at n = 3, hence in general): Finding #8's world is reachable, and its
+node 1 holds a stamp its own term map contradicts. Escalated per the
+stuck-protocol; see the task report for the two candidate repairs (model a
+lagging data-plane term handle, or close the model gate at
+`startElection`). -/
+theorem fca_unconditional_is_false :
+    ¬ ∀ (w : World 3), Reachable w → FramesCurrentAuthored w := by
+  intro h
+  obtain ⟨w, hw, -, -, hh, ht⟩ := finding_candidate_stale_gate_fca_violation
+  have := h w hw 1 2 1 12 hh
+  omega
+
+#print axioms finding_candidate_stale_gate_fca_violation
+#print axioms fca_unconditional_is_false
 
 /-! ## Frame provenance (UNCONDITIONAL — no `hprov` needed)
 
@@ -381,13 +264,20 @@ currently holds traces back to an actual `replicate` frame that was put on
 the wire — `hist` entries are never minted out of thin air. Only
 `leaderAppend` (co-emits the matching frame in the same step) and
 `deliverReplicate` (copies FROM an already-wired frame, `hmsg`) ever write a
-`some` into `hist`; `deliverTermMap`'s truncation only ERASES entries. Pure
+`some` into `hist`; `serveTail` re-emits an existing entry's frame (a
+fortiori covered); `deliverTermMap`'s truncation only ERASES entries. Pure
 structural fact, independent of `hprov`. -/
 
-/-- The frame-provenance invariant, carried through the induction. -/
+/-- The frame-provenance invariant, carried through the induction. Post-LC1
+(header/stamp split) the wire header is EXISTENTIAL: a held `(t, v)` at `p`
+traces to a frame `replicate p hdr t v` for SOME header `hdr` (fresh appends
+have `hdr = stamp`; `serveTail` re-serves keep the old stamp under a newer
+header — the consumer cares about the record stamp, and a per-case-sharpened
+`hdr` form would buy nothing downstream while complicating every erasure
+case). -/
 private def HistFrameProvenance {n : Nat} (w : World n) : Prop :=
   ∀ j : Fin n, ∀ p t v : Nat, (w.nodes j).hist p = some (t, v) →
-    Uc2.Data.Frame.replicate p t v ∈ w.dsent
+    ∃ hdr, Uc2.Data.Frame.replicate p hdr t v ∈ w.dsent
 
 private theorem hfp_init (n : Nat) : HistFrameProvenance (World.init n) := by
   intro j p t v h
@@ -436,28 +326,37 @@ private theorem hfp_step {n : Nat} {w w' : World n} (h : HistFrameProvenance w)
       by_cases hp : p = (w.nodes i).pn.durable
       · subst hp
         rw [Function.update_self, Option.some.injEq, Prod.mk.injEq] at hh
+        refine ⟨(w.nodes i).pn.currentTerm, ?_⟩
         rw [← hh.1, ← hh.2]
         exact List.mem_append_right _ (by simp)
       · rw [Function.update_of_ne hp] at hh
-        exact List.mem_append_left _ (h i p t v' hh)
+        obtain ⟨hdr, hf⟩ := h i p t v' hh
+        exact ⟨hdr, List.mem_append_left _ hf⟩
     · simp only [Node.hist, Function.update_of_ne (Ne.symm hne)] at hh
-      exact List.mem_append_left _ (h j p t v' hh)
-  | deliverReplicate j pos t v hmsg hpos hstamp hgate =>
+      obtain ⟨hdr, hf⟩ := h j p t v' hh
+      exact ⟨hdr, List.mem_append_left _ hf⟩
+  | deliverReplicate j pos hdr t v hmsg hpos hhdr hgate =>
     intro k p t' v' hh
     rcases eq_or_ne j k with rfl | hne
     · simp only [Node.hist, Function.update_self, Uc2.Data.Node.recvReplicate] at hh
       by_cases hp : p = pos
       · subst hp
         rw [Function.update_self, Option.some.injEq, Prod.mk.injEq] at hh
+        refine ⟨hdr, ?_⟩
         rw [← hh.1, ← hh.2]
         exact hmsg
       · rw [Function.update_of_ne hp] at hh
         exact h j p t' v' hh
     · simp only [Node.hist, Function.update_of_ne (Ne.symm hne)] at hh
       exact h k p t' v' hh
+  | serveTail i p t v hrole hhist hp =>
+    intro k p' t' v' hh
+    obtain ⟨hdr, hf⟩ := h k p' t' v' hh
+    exact ⟨hdr, List.mem_append_left _ hf⟩
   | shipTermMap i hrole =>
     intro k p t v hh
-    exact List.mem_append_left _ (h k p t v hh)
+    obtain ⟨hdr, hf⟩ := h k p t v hh
+    exact ⟨hdr, List.mem_append_left _ hf⟩
   | deliverTermMap j t entries hmsg hterm =>
     intro k p t' v' hh
     rcases eq_or_ne j k with rfl | hne
@@ -505,7 +404,7 @@ the `leaderAdvanceCommit` event (`ghostEntries` reads straight off the
 committing leader's `hist`). Unconditional (no `hprov`). -/
 private def CommittedFrameProvenance {n : Nat} (w : World n) : Prop :=
   ∀ p stamp T v : Nat, (p, stamp, T, v) ∈ w.committed →
-    Uc2.Data.Frame.replicate p stamp v ∈ w.dsent
+    ∃ hdr, Uc2.Data.Frame.replicate p hdr stamp v ∈ w.dsent
 
 private theorem cfp_init (n : Nat) : CommittedFrameProvenance (World.init n) := by
   intro p stamp T v h
@@ -525,11 +424,17 @@ private theorem cfp_step {n : Nat} {w w' : World n} (hw : Reachable w)
   | crashRestart _ => intro p stamp T v hh; exact h p stamp T v hh
   | leaderAppend i v hrole =>
     intro p stamp T v' hh
-    exact List.mem_append_left _ (h p stamp T v' hh)
-  | deliverReplicate _ _ _ _ _ _ _ _ => intro p stamp T v hh; exact h p stamp T v hh
+    obtain ⟨hdr, hf⟩ := h p stamp T v' hh
+    exact ⟨hdr, List.mem_append_left _ hf⟩
+  | deliverReplicate _ _ _ _ _ _ _ _ _ => intro p stamp T v hh; exact h p stamp T v hh
+  | serveTail i p t v hrole hhist hp =>
+    intro p' stamp T v' hh
+    obtain ⟨hdr, hf⟩ := h p' stamp T v' hh
+    exact ⟨hdr, List.mem_append_left _ hf⟩
   | shipTermMap i hrole =>
     intro p stamp T v hh
-    exact List.mem_append_left _ (h p stamp T v hh)
+    obtain ⟨hdr, hf⟩ := h p stamp T v hh
+    exact ⟨hdr, List.mem_append_left _ hf⟩
   | deliverTermMap _ _ _ _ _ => intro p stamp T v hh; exact h p stamp T v hh
   | sendReport _ _ _ => intro p stamp T v hh; exact h p stamp T v hh
   | deliverReport _ _ _ _ _ _ _ _ => intro p stamp T v hh; exact h p stamp T v hh
@@ -557,11 +462,14 @@ theorem committed_frame_provenance {n : Nat} {w : World n} (hw : Reachable w) :
 #print axioms hist_frame_provenance
 #print axioms committed_frame_provenance
 
-/-! ## Non-vacuity of the conditional
+/-! ## Non-vacuity of `FramesCurrentAuthored` + LC-core premises
 
-Required deliverable (brief): a reachable world satisfying BOTH `hprov` and
-non-trivial LC-core premises, so the conditional theorem is not vacuously
-true of an empty hypothesis set. Reuses LB1's `nonvacuity_commit_completeness_trace`
+Required deliverable (LB2b, re-greened by LC1 under the split frame
+shape): a reachable world satisfying BOTH `FramesCurrentAuthored` and
+non-trivial LC-core premises — with the unconditional discharge refuted
+(Finding #8), this stays the witness that the predicate is satisfiable on
+honest commit traces, not vacuous.
+Reuses LB1's `nonvacuity_commit_completeness_trace`
 shape (`ProtocolCommit.lean`) — the SAME 14-step trace, rebuilt here so its
 concrete `hist`/`termMap` values are available to check `FramesCurrentAuthored`
 directly: node 0 leads term 1, appends `42` at position 0, gossips, node 1
@@ -581,7 +489,7 @@ private theorem nonvacuity_lc_trace :
       (0, 1, 1, 42) ∈ w.committed ∧
       (w.nodes 1).pn.role = .leader ∧
       1 < (w.nodes 1).pn.currentTerm ∧
-      w.dsent = [.replicate 0 1 42, .gossip 1 [(1, 0)]] ∧
+      w.dsent = [.replicate 0 1 1 42, .gossip 1 [(1, 0)]] ∧
       (w.nodes 0).dn.termMap.termAt 0 = 1 ∧
       (w.nodes 1).dn.termMap.termAt 0 = 1 ∧
       (w.nodes 2).hist 0 = none := by
@@ -595,7 +503,7 @@ private theorem nonvacuity_lc_trace :
       (.leaderAppend _ 0 42 (by decide)))
       (.shipTermMap _ 0 (by decide)))
       (.deliverTermMap _ 1 1 [(1, 0)] (by decide) (by decide)))
-      (.deliverReplicate _ 1 0 1 42 (by decide) (by decide) (by decide)
+      (.deliverReplicate _ 1 0 1 1 42 (by decide) (by decide) (by decide)
         (by decide)))
       (.sendReport _ 1 (by decide) (by decide)))
       (.deliverReport _ 0 1 1 1 (by decide) (by decide) (by decide)
@@ -621,18 +529,99 @@ theorem nonvacuity_leader_completeness_trace :
   -- Route through the UNCONDITIONAL frame-provenance lemma: `dsent` is flat
   -- (not per-node `Function.update`-nested), so pinning `(p, t, v)` this way
   -- avoids ever unfolding the 14-step `hist` chain symbolically.
-  have hfp := hist_frame_provenance hw j p t v hh
-  rw [hdsent] at hfp
+  obtain ⟨hdr, hf⟩ := hist_frame_provenance hw j p t v hh
+  rw [hdsent] at hf
   simp only [List.mem_cons, List.not_mem_nil, or_false,
-    Uc2.Data.Frame.replicate.injEq] at hfp
-  rcases hfp with ⟨rfl, rfl, rfl⟩ | hfp
+    Uc2.Data.Frame.replicate.injEq] at hf
+  rcases hf with ⟨rfl, rfl, rfl, rfl⟩ | hf
   · have hj : j = 0 ∨ j = 1 ∨ j = 2 := by omega
     rcases hj with rfl | rfl | rfl
     · exact ht0
     · exact ht1
     · rw [hh2] at hh; cases hh
-  · exact absurd hfp (by simp)
+  · exact absurd hf (by simp)
 
 #print axioms nonvacuity_leader_completeness_trace
+
+/-! ## Non-vacuity of `serveTail` catch-up (the amendment did not gut #6a)
+
+The rerun report's rejected-alternative hazard: an exact-match delivery
+guard on the SINGLE-term frame would have made old-stamped bytes
+unre-acquirable after truncation, gutting the inherited-prefix catch-up
+that the #6a/Fig-8 re-key exists for. The header/stamp split + `serveTail`
+must keep it alive: this trace shows a follower whose divergent tail dies
+in a reconcile and which then RE-ACQUIRES an old-stamped inherited byte
+from the new leader's `serveTail` re-serve — old stamp, CURRENT header —
+ending durably past it on the live stream. -/
+
+/-- **Non-vacuity (`serveTail` catch-up).** Node 0 leads term 1 with two
+bytes; node 1 replicates only the first. Node 1 wins term 2 on `(1, 1)`
+and appends a divergent `(pos 1, stamp 2, 20)`. Node 0 re-wins term 3
+(inheriting its term-1 bytes below the new base 2) and appends
+`(pos 2, stamp 3, 31)`. Node 1 reconciles against the term-3 map
+`[(1,0),(3,2)]`: its divergent tail dies at `validUpTo = 1` (gate reopens).
+Node 0 `serveTail`s its inherited `(pos 1, stamp 1, 11)` byte under
+header 3; node 1 re-acquires it at its truncated frontier — the exact
+catch-up path Rust's NAK-repair/journal-replay serves inside the current
+leader's stream — then takes the live `(2, 3, 3, 31)` frame, ending at
+durable 3. -/
+theorem nonvacuity_serve_tail_catchup_trace :
+    ∃ w w' w'' w''' w'''' : World 3,
+      Reachable w ∧ Step w w' ∧ Step w' w'' ∧ Step w'' w''' ∧
+      Step w''' w'''' ∧
+      -- divergent tail before the reconcile:
+      (w.nodes 1).hist 1 = some (2, 20) ∧
+      -- the term-3 gossip truncates it and reopens the gate:
+      (w'.nodes 1).hist 1 = none ∧ (w'.nodes 1).pn.durable = 1 ∧
+      (w'.nodes 1).reconciled = true ∧
+      -- the follower RE-ACQUIRES the old-stamped byte via serveTail:
+      (w'''.nodes 1).hist 1 = some (1, 11) ∧
+      -- and ends durably past it on the live stream:
+      (w''''.nodes 1).hist 2 = some (3, 31) ∧
+      (w''''.nodes 1).pn.durable = 3 := by
+  refine ⟨_, _, _, _, _,
+    .tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
+      (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
+      (.tail
+      -- t1: node 0 leads {0,2}, appends 10@0 and 11@1; node 1 reconciles
+      -- (adopt + gate open) and replicates only byte 0.
+      (.single (.startElection _ 0 (by decide)))
+      (.deliverRequestVote _ 2 0 1 0 0 (by decide) (by decide)))
+      (.deliverVote _ 0 2 1 (by decide) (by decide) (by decide)))
+      (.becomeLeader _ 0 (by decide) (by decide)))
+      (.leaderAppend _ 0 10 (by decide)))
+      (.leaderAppend _ 0 11 (by decide)))
+      (.shipTermMap _ 0 (by decide)))
+      (.deliverTermMap _ 1 1 [(1, 0)] (by decide) (by decide)))
+      (.deliverReplicate _ 1 0 1 1 10 (by decide) (by decide) (by decide)
+        (by decide)))
+      -- t2: node 1 wins term 2 on (lastTerm 1, durable 1) and appends the
+      -- divergent (1, 2, 20) — map [(1,0),(2,1)], durable 2.
+      (.startElection _ 1 (by decide)))
+      (.deliverRequestVote _ 2 1 2 1 1 (by decide) (by decide)))
+      (.deliverVote _ 1 2 2 (by decide) (by decide) (by decide)))
+      (.becomeLeader _ 1 (by decide) (by decide)))
+      (.leaderAppend _ 1 20 (by decide)))
+      -- t3: node 0 crash-opens and re-wins term 3 on (lastTerm 1,
+      -- durable 2) — map [(1,0),(3,2)], its term-1 bytes inherited —
+      -- appends 31@2 and gossips.
+      (.crashRestart _ 0))
+      (.startElection _ 0 (by decide)))
+      (.startElection _ 0 (by decide)))
+      (.deliverRequestVote _ 2 0 3 1 2 (by decide) (by decide)))
+      (.deliverVote _ 0 2 3 (by decide) (by decide) (by decide)))
+      (.becomeLeader _ 0 (by decide) (by decide)))
+      (.leaderAppend _ 0 31 (by decide)))
+      (.shipTermMap _ 0 (by decide)),
+    .deliverTermMap _ 1 3 [(1, 0), (3, 2)] (by decide) (by decide),
+    .serveTail _ 0 1 1 11 (by decide) (by decide) (by decide),
+    .deliverReplicate _ 1 1 3 1 11 (by decide) (by decide) (by decide)
+      (by decide),
+    .deliverReplicate _ 1 2 3 3 31 (by decide) (by decide) (by decide)
+      (by decide),
+    by decide, by decide, by decide, by decide, by decide, by decide,
+    by decide⟩
+
+#print axioms nonvacuity_serve_tail_catchup_trace
 
 end Uc2.Cert

@@ -396,23 +396,41 @@ inductive Step {n : Nat} : World n → World n → Prop
                   (some ((w.nodes i).pn.currentTerm, v)) } }
           sent := w.sent
           dsent := w.dsent ++
-            [.replicate (w.nodes i).pn.durable (w.nodes i).pn.currentTerm v]
+            [.replicate (w.nodes i).pn.durable (w.nodes i).pn.currentTerm
+              (w.nodes i).pn.currentTerm v]
           csent := w.csent
           committed := w.committed }
   /-- `Data.Step.deliverReplicate` + the intake gate on the DATA arm: a
   closed gate DROPS inbound data (`receiver.rs` 659–665 `dropped_gated`) —
   reconcile-before-data, the ordering `become_leader`'s phantom-prune NOTE
-  leans on. Enabling-only strengthening of the data model's step. -/
-  | deliverReplicate (w : World n) (j : Fin n) (pos t v : Nat)
-      (hmsg : Uc2.Data.Frame.replicate pos t v ∈ w.dsent)
+  leans on. Enabling-only strengthening of the data model's step (which
+  post-LC1 carries the exact wire-header match `hhdr`,
+  `receiver.rs:636-639` `dropped_stale_term`). -/
+  | deliverReplicate (w : World n) (j : Fin n) (pos hdr t v : Nat)
+      (hmsg : Uc2.Data.Frame.replicate pos hdr t v ∈ w.dsent)
       (hpos : pos = (w.nodes j).pn.durable)
-      (hstamp : t ≤ (w.nodes j).pn.currentTerm)
+      (hhdr : hdr = (w.nodes j).pn.currentTerm)
       (hgate : (w.nodes j).reconciled = true) :
       Step w
         { nodes := Function.update w.nodes j
             { w.nodes j with dn := (w.nodes j).dn.recvReplicate pos t v }
           sent := w.sent
           dsent := w.dsent
+          csent := w.csent
+          committed := w.committed }
+  /-- `Data.Step.serveTail` (LC1): a leader re-ships a held byte under its
+  CURRENT term as wire header, original stamp kept — the NAK-repair /
+  deep-NAK / journal-replay catch-up path. Commit delta: NONE (the sender
+  agent's retransmit path touches no consensus state). -/
+  | serveTail (w : World n) (i : Fin n) (p t v : Nat)
+      (hrole : (w.nodes i).pn.role = .leader)
+      (hhist : (w.nodes i).hist p = some (t, v))
+      (hp : p < (w.nodes i).pn.durable) :
+      Step w
+        { nodes := w.nodes
+          sent := w.sent
+          dsent := w.dsent ++
+            [.replicate p (w.nodes i).pn.currentTerm t v]
           csent := w.csent
           committed := w.committed }
   /-- `Data.Step.shipTermMap` — no state, no commit delta. -/
@@ -595,10 +613,12 @@ theorem step_project {n : Nat} {w w' : World n} (h : Step w w') :
   | leaderAppend i v hrole =>
     rw [project_mk]
     exact .single (Uc2.Data.Step.leaderAppend w.project i v hrole)
-  | deliverReplicate j pos t v hmsg hpos hstamp hgate =>
+  | deliverReplicate j pos hdr t v hmsg hpos hhdr hgate =>
     rw [project_mk]
     exact .single
-      (Uc2.Data.Step.deliverReplicate w.project j pos t v hmsg hpos hstamp)
+      (Uc2.Data.Step.deliverReplicate w.project j pos hdr t v hmsg hpos hhdr)
+  | serveTail i p t v hrole hhist hp =>
+    exact .single (Uc2.Data.Step.serveTail w.project i p t v hrole hhist hp)
   | shipTermMap i hrole =>
     exact .single (Uc2.Data.Step.shipTermMap w.project i hrole)
   | deliverTermMap j t entries hmsg hterm =>
@@ -697,7 +717,7 @@ theorem nonvacuity_commit_completeness_trace :
       (.leaderAppend _ 0 42 (by decide)))
       (.shipTermMap _ 0 (by decide)))
       (.deliverTermMap _ 1 1 [(1, 0)] (by decide) (by decide)))
-      (.deliverReplicate _ 1 0 1 42 (by decide) (by decide) (by decide)
+      (.deliverReplicate _ 1 0 1 1 42 (by decide) (by decide) (by decide)
         (by decide)))
       (.sendReport _ 1 (by decide) (by decide)))
       (.deliverReport _ 0 1 1 1 (by decide) (by decide) (by decide)

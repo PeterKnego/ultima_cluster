@@ -45,18 +45,20 @@ documented inline):
    admits no data event into the window in Rust, and a crash inside it
    self-heals to the same post-state (persist-before-truncate +
    `rederive_term_map`), so the model's atomic effect is the committed outcome.
-6. **Stamp gate on replication** (load-bearing, mirrors two Rust guards): a
-   receiver accepts a stamped record only when `stamp ≤ currentTerm`. In UC a
-   datagram whose header term exceeds the node's term forces adoption (and
-   demotion) BEFORE any byte is accepted, and the node's `awaiting_reconcile`
-   intake gate forces reconcile-before-data on new-term adoption — the
-   `become_leader` phantom-prune comment (`election.rs` ~1039) leans on exactly
-   that gate. Without this guard the model admits a genuine LM violation: a
-   deposed-but-uninformed leader could accept a higher-term byte at its
-   frontier, keep appending at its own stale term, later truncate via its own
-   stale gossip, and re-append different payloads under already-shipped
-   `(position, term)` pairs. With it, raising `currentTerm` (gossip, votes)
-   must precede accepting new-term data — the Rust ordering.
+6. **Header gate on replication** (load-bearing; LC1 amendment — the
+   original LA1 form was a single-term `stamp ≤ currentTerm` collapse of two
+   Rust guards, which Finding #7 proved unsound for leader completeness): a
+   receiver accepts a record only when the frame's wire HEADER term exactly
+   equals its adopted term (`receiver.rs:636-639` `dropped_stale_term`); in
+   UC adoption comes only from consensus datagrams, and the
+   `awaiting_reconcile` intake gate forces reconcile-before-data on new-term
+   adoption — the `become_leader` phantom-prune comment (`election.rs`
+   ~1039) leans on exactly that gate. The old stamp bound is now an
+   emission-side INVARIANT (`LogMatching.lean`'s `StampInv`:
+   `stamp ≤ hdr`, and held stamps ≤ the holder's term), which still gives
+   LM what it needs: raising `currentTerm` (gossip, votes) must precede
+   accepting new-term data — the Rust ordering. Old-stamped bytes travel
+   only inside the CURRENT leader's stream via `serveTail` (catch-up).
 7. **Full-map gossip** (simplification): `shipTermMap` ships the whole term
    map, not `term_map_wire_tail()`'s bounded window. The window is what makes
    `NoCommonPrefix` reachable in production (purged prefixes); reconcile's
@@ -105,13 +107,21 @@ structure Node (n : Nat) where
 
 - `replicate` mirrors one stamped record of the leader's replication stream
   (`uc2_net` sender off the log buffer; NAK repair re-serves the same bytes,
-  which the sent-set semantics covers as re-delivery).
+  which the sent-set semantics covers as re-delivery). **LC1 amendment
+  (Finding #7 fix)**: the frame carries BOTH terms Rust keeps separate —
+  `hdr` is the datagram's wire header (`leadership_term_id`, checked for
+  EXACT equality against the receiver's adopted term,
+  `receiver.rs:636-639`), `stamp` is the record's own term stamp (the term
+  the byte was originally written under, which can be OLDER than the header
+  on a legitimate catch-up/NAK-repair re-serve — see `Step.serveTail`).
+  Emission is truthful: `leaderAppend` emits `hdr = stamp = currentTerm`;
+  `serveTail` re-ships an old-stamped byte under the CURRENT header.
 - `gossip` mirrors `Action::ShipTermMap` (`DGRAM_KIND_TERM_MAP`): the shipping
   leader's `current_term` plus its map (full map — module doc, item 7).
 
 No addressing: both are broadcast, and their semantics are content-keyed. -/
 inductive Frame where
-  | replicate (pos term payload : Nat)
+  | replicate (pos hdr stamp payload : Nat)
   | gossip (term : Nat) (entries : TermMap)
 deriving DecidableEq
 
@@ -279,25 +289,47 @@ inductive Step {n : Nat} : World n → World n → Prop
                 (some ((w.nodes i).pn.currentTerm, v)) }
           sent := w.sent
           dsent := w.dsent ++
-            [.replicate (w.nodes i).pn.durable (w.nodes i).pn.currentTerm v] }
+            [.replicate (w.nodes i).pn.durable (w.nodes i).pn.currentTerm
+              (w.nodes i).pn.currentTerm v] }
   /-- Replication delivery (decision 4): accept a stamped record only at
   exactly the receiver's frontier (`uc2_log` writer rule — reordered and
-  duplicated deliveries become no-ops, never corruption) and only when
-  `stamp ≤ currentTerm` (module doc, item 6 — the model's `≤` consequence of
-  two Rust guards: `uc2_net`'s receiver DROPS a DATA datagram whose header
-  term doesn't match the adopted term (adoption itself comes only from
-  consensus datagrams, never from DATA) plus the `awaiting_reconcile`
-  reconcile-before-data intake gate, `node.rs` / `election.rs` ~1039 NOTE).
-  Folds the `DataTermObserved` map growth (`Node.recvReplicate`). -/
-  | deliverReplicate (w : World n) (j : Fin n) (pos t v : Nat)
-      (hmsg : Frame.replicate pos t v ∈ w.dsent)
+  duplicated deliveries become no-ops, never corruption) and only when the
+  wire HEADER term EXACTLY matches the receiver's adopted term (LC1
+  amendment, Finding #7 fix: `receiver.rs:636-639` `dropped_stale_term` —
+  adoption itself comes only from consensus datagrams, never from DATA).
+  The old `stamp ≤ currentTerm` guard is gone: its job moved to the
+  emission sites (`leaderAppend` stamps `hdr = stamp = currentTerm`;
+  `serveTail` re-serves an existing hist stamp under the current header),
+  where `LogMatching.lean`'s `StampInv` proves `stamp ≤ hdr` invariantly.
+  Folds the `DataTermObserved` map growth (`Node.recvReplicate`) — still
+  keyed on the record STAMP, unchanged semantics. -/
+  | deliverReplicate (w : World n) (j : Fin n) (pos hdr t v : Nat)
+      (hmsg : Frame.replicate pos hdr t v ∈ w.dsent)
       (hpos : pos = (w.nodes j).pn.durable)
-      (hstamp : t ≤ (w.nodes j).pn.currentTerm) :
+      (hhdr : hdr = (w.nodes j).pn.currentTerm) :
       Step w
         { nodes := Function.update w.nodes j
             ((w.nodes j).recvReplicate pos t v)
           sent := w.sent
           dsent := w.dsent }
+  /-- Tail re-serve (LC1 amendment, decision 2 — truth at emission): a
+  leader re-ships any byte it durably holds under its CURRENT term as the
+  wire header, keeping the record's original stamp. This is the
+  NAK-repair / deep-NAK / journal-replay path by which OLD-stamped bytes
+  legitimately reach a reconciled follower inside the CURRENT leader's
+  stream (`uc2_net` sender serving retransmits off the log buffer /
+  journal under its own `leadership_term_id`) — what keeps
+  inherited-prefix catch-up (the #6a/Fig-8 case) alive now that delivery
+  requires an exact header match. -/
+  | serveTail (w : World n) (i : Fin n) (p t v : Nat)
+      (hrole : (w.nodes i).pn.role = .leader)
+      (hhist : (w.nodes i).hist p = some (t, v))
+      (hp : p < (w.nodes i).pn.durable) :
+      Step w
+        { nodes := w.nodes
+          sent := w.sent
+          dsent := w.dsent ++
+            [.replicate p (w.nodes i).pn.currentTerm t v] }
   /-- `Action::ShipTermMap` (`election.rs` 1056 + the leader's idle re-gossip
   tick): a leader ships its current term + map on the data wire, any time. -/
   | shipTermMap (w : World n) (i : Fin n)
@@ -408,10 +440,12 @@ theorem step_project {n : Nat} {w w' : World n} (h : Step w w') :
     rw [project_mk]
     exact .single (Uc2.Step.havocData w.project i (w.nodes i).pn.lastTerm
       ((w.nodes i).pn.durable + 1))
-  | deliverReplicate j pos t v hmsg hpos hstamp =>
+  | deliverReplicate j pos hdr t v hmsg hpos hhdr =>
     rw [project_mk]
     exact .single (Uc2.Step.havocData w.project j
       (lastTermOf (observeTerm (w.nodes j).termMap t pos)) (pos + 1))
+  | serveTail i p t v hrole hhist hp =>
+    exact .refl
   | shipTermMap i hrole =>
     exact .refl
   | deliverTermMap j t entries hmsg hterm =>
@@ -481,7 +515,7 @@ theorem nonvacuity_log_matching_trace :
       (.deliverVote _ 0 1 1 (by decide) (by decide) (by decide)))
       (.becomeLeader _ 0 (by decide) (by decide)))
       (.leaderAppend _ 0 42 (by decide)))
-      (.deliverReplicate _ 1 0 1 42 (by decide) (by decide) (by decide)))
+      (.deliverReplicate _ 1 0 1 1 42 (by decide) (by decide) (by decide)))
       (.shipTermMap _ 0 (by decide)))
       (.deliverTermMap _ 1 1 [(1, 0)] (by decide) (by decide)),
     by decide, by decide⟩

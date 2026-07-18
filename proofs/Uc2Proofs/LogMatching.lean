@@ -75,7 +75,7 @@ theorem nonvacuity_truncation_trace :
       (.becomeLeader _ 0 (by decide) (by decide)))
       (.leaderAppend _ 0 42 (by decide)))
       (.leaderAppend _ 0 43 (by decide)))
-      (.deliverReplicate _ 1 0 1 42 (by decide) (by decide) (by decide)))
+      (.deliverReplicate _ 1 0 1 1 42 (by decide) (by decide) (by decide)))
       (.startElection _ 1 (by decide)))
       (.deliverRequestVote _ 2 1 2 1 1 (by decide) (by decide)))
       (.deliverVote _ 1 2 2 (by decide) (by decide) (by decide)))
@@ -83,7 +83,7 @@ theorem nonvacuity_truncation_trace :
       (.leaderAppend _ 1 99 (by decide)))
       (.shipTermMap _ 1 (by decide)),
     .deliverTermMap _ 0 2 [(1, 0), (2, 1)] (by decide) (by decide),
-    .deliverReplicate _ 0 1 2 99 (by decide) (by decide) (by decide),
+    .deliverReplicate _ 0 1 2 2 99 (by decide) (by decide) (by decide),
     by decide, by decide, by decide, by decide, by decide, by decide,
     by decide⟩
 
@@ -92,12 +92,14 @@ theorem nonvacuity_truncation_trace :
 /-! ## Occurrences -/
 
 /-- A stamped payload *occurrence* anywhere in the world: an in-flight
-`replicate` frame, or a node's history entry. Coherence is stated over
-occurrences so that delivery — a copy from `dsent` into a `hist` — can never
-mint a new payload, and so that `leaderAppend`'s freshness obligation covers
-the frames the leader already shipped. -/
+`replicate` frame (under ANY wire header — occurrences are keyed on the
+record STAMP `t`, which is what LM is about; the LC1 header/stamp split
+leaves this quantification existential), or a node's history entry.
+Coherence is stated over occurrences so that delivery — a copy from `dsent`
+into a `hist` — can never mint a new payload, and so that `leaderAppend`'s
+freshness obligation covers the frames the leader already shipped. -/
 def Occ {n : Nat} (w : World n) (p t v : Nat) : Prop :=
-  Frame.replicate p t v ∈ w.dsent ∨
+  (∃ hdr, Frame.replicate p hdr t v ∈ w.dsent) ∨
     ∃ i : Fin n, (w.nodes i).hist p = some (t, v)
 
 /-- The cross-time writer certificate for term `t`: evidence, stable under
@@ -275,6 +277,163 @@ private theorem recv_durable {n : Nat} (s : PNode n) (c : Fin n)
         PNode.recvRequestVote.grantIfFresh] <;>
       split_ifs <;> rfl
 
+/-! ## Emission-side stamp truthfulness (LC1)
+
+The header/stamp frame split deleted the delivery-side `stamp ≤ currentTerm`
+guard; its job moved to the emission sites. `StampInv` is the invariant that
+carries it: every replicate frame's record stamp is bounded by its wire
+header (`leaderAppend` emits `stamp = hdr`; `serveTail` re-serves a held
+stamp, bounded by the leader's term via `hist_le`), and every held stamp is
+bounded by the holder's monotone `currentTerm` (delivery accepts only under
+an exact header match, so a fresh entry's stamp is `≤ hdr = currentTerm`).
+Jointly inductive; `dinv_step`'s `deliverReplicate` case re-derives the old
+`≤`-guard from `frame_le + hhdr`, which is what freezes a leader's map for
+its whole tenure exactly as before. -/
+
+/-- Frame stamps never exceed their wire header; held stamps never exceed
+the holder's current term. -/
+structure StampInv {n : Nat} (w : World n) : Prop where
+  /-- `stamp ≤ hdr` for every replicate frame ever shipped. -/
+  frame_le : ∀ p hdr t v, Frame.replicate p hdr t v ∈ w.dsent → t ≤ hdr
+  /-- A node's held stamps are bounded by its (monotone) `currentTerm`. -/
+  hist_le : ∀ j : Fin n, ∀ p t v, (w.nodes j).hist p = some (t, v) →
+      t ≤ (w.nodes j).pn.currentTerm
+
+private theorem stamp_init (n : Nat) : StampInv (World.init n) := by
+  constructor
+  · intro p hdr t v h
+    simp [World.init] at h
+  · intro j p t v h
+    simp [World.init] at h
+
+private theorem stamp_step {n : Nat} {w w' : World n} (h : StampInv w)
+    (hs : Step w w') : StampInv w' := by
+  cases hs with
+  | startElection i hrole =>
+    refine ⟨h.frame_le, ?_⟩
+    intro k p t v hh
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self] at hh ⊢
+      exact Nat.le_succ_of_le (h.hist_le k p t v hh)
+    · simp only [Function.update_of_ne hne] at hh ⊢
+      exact h.hist_le k p t v hh
+  | deliverRequestVote j c nt clt cd hmsg hterm =>
+    refine ⟨h.frame_le, ?_⟩
+    intro k p t v hh
+    rcases eq_or_ne k j with rfl | hne
+    · simp only [Function.update_self] at hh ⊢
+      rw [recv_term _ _ _ _ _ hterm]
+      exact Nat.le_trans (h.hist_le k p t v hh) hterm
+    · simp only [Function.update_of_ne hne] at hh ⊢
+      exact h.hist_le k p t v hh
+  | rejectStaleRequestVote j c nt clt cd hmsg hstale =>
+    exact ⟨h.frame_le, h.hist_le⟩
+  | deliverVote i v t hmsg hrole hterm =>
+    refine ⟨h.frame_le, ?_⟩
+    intro k p t' v' hh
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self] at hh ⊢
+      exact h.hist_le k p t' v' hh
+    · simp only [Function.update_of_ne hne] at hh ⊢
+      exact h.hist_le k p t' v' hh
+  | deliverVoteHigherTerm i v t g hmsg hterm =>
+    refine ⟨h.frame_le, ?_⟩
+    intro k p t' v' hh
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self] at hh ⊢
+      exact Nat.le_trans (h.hist_le k p t' v' hh)
+        (Nat.le_of_lt (show (w.nodes k).pn.currentTerm <
+          ((w.nodes k).pn.adoptTerm t).currentTerm from hterm))
+    · simp only [Function.update_of_ne hne] at hh ⊢
+      exact h.hist_le k p t' v' hh
+  | becomeLeader i hrole hquorum =>
+    refine ⟨h.frame_le, ?_⟩
+    intro k p t v hh
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self] at hh ⊢
+      exact h.hist_le k p t v hh
+    · simp only [Function.update_of_ne hne] at hh ⊢
+      exact h.hist_le k p t v hh
+  | crashRestart i =>
+    refine ⟨h.frame_le, ?_⟩
+    intro k p t v hh
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self] at hh ⊢
+      exact h.hist_le k p t v hh
+    · simp only [Function.update_of_ne hne] at hh ⊢
+      exact h.hist_le k p t v hh
+  | leaderAppend i v hrole =>
+    constructor
+    · intro p hdr t v' hf
+      rcases List.mem_append.mp hf with hf | hf
+      · exact h.frame_le p hdr t v' hf
+      · rw [List.mem_singleton, Frame.replicate.injEq] at hf
+        omega
+    · intro k p t v' hh
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self] at hh ⊢
+        by_cases hp : p = (w.nodes k).pn.durable
+        · subst hp
+          rw [Function.update_self, Option.some.injEq, Prod.mk.injEq] at hh
+          omega
+        · rw [Function.update_of_ne hp] at hh
+          exact h.hist_le k p t v' hh
+      · simp only [Function.update_of_ne hne] at hh ⊢
+        exact h.hist_le k p t v' hh
+  | deliverReplicate j pos hdr t v hmsg hpos hhdr =>
+    refine ⟨h.frame_le, ?_⟩
+    intro k p t' v' hh
+    rcases eq_or_ne k j with rfl | hne
+    · simp only [Function.update_self, Node.recvReplicate] at hh ⊢
+      by_cases hp : p = pos
+      · subst hp
+        rw [Function.update_self, Option.some.injEq, Prod.mk.injEq] at hh
+        have := h.frame_le _ _ _ _ hmsg
+        omega
+      · rw [Function.update_of_ne hp] at hh
+        exact h.hist_le k p t' v' hh
+    · simp only [Function.update_of_ne hne] at hh ⊢
+      exact h.hist_le k p t' v' hh
+  | serveTail i p t v hrole hhist hp =>
+    constructor
+    · intro p' hdr t' v' hf
+      rcases List.mem_append.mp hf with hf | hf
+      · exact h.frame_le p' hdr t' v' hf
+      · rw [List.mem_singleton, Frame.replicate.injEq] at hf
+        obtain ⟨rfl, rfl, rfl, rfl⟩ := hf
+        exact h.hist_le i _ _ _ hhist
+    · exact h.hist_le
+  | shipTermMap i hrole =>
+    constructor
+    · intro p hdr t v hf
+      rcases List.mem_append.mp hf with hf | hf
+      · exact h.frame_le p hdr t v hf
+      · simp at hf
+    · exact h.hist_le
+  | deliverTermMap j t entries hmsg hterm =>
+    refine ⟨h.frame_le, ?_⟩
+    intro k p t' v' hh
+    rcases eq_or_ne k j with rfl | hne
+    · simp only [Function.update_self] at hh ⊢
+      have hold := h.hist_le k p t' v' (applyGossip_hist _ _ _ _ hh)
+      by_cases hadopt : (w.nodes k).pn.currentTerm < t
+      · rw [(applyGossip_adopt _ entries hadopt).2]
+        omega
+      · rw [(applyGossip_no_adopt _ entries hadopt).2.1]
+        exact hold
+    · simp only [Function.update_of_ne hne] at hh ⊢
+      exact h.hist_le k p t' v' hh
+
+/-- **Stamp truthfulness holds in every reachable world** (public: the LC
+layer consumes `frame_le` alongside `hist_frame_provenance`). -/
+theorem reachable_stamp {n : Nat} {w : World n} (hw : Reachable w) :
+    StampInv w := by
+  have h : Relation.ReflTransGen Step (World.init n) w := hw
+  clear hw
+  induction h with
+  | refl => exact stamp_init n
+  | tail _ hstep ih => exact stamp_step ih hstep
+
 /-! ## Occurrence decomposition -/
 
 /-- Occurrences of the standard one-node-update successor world. -/
@@ -282,7 +441,7 @@ private theorem occ_mk {n : Nat} (w : World n) (i : Fin n) (d : Node n)
     (s : List (Uc2.Msg n)) (ds : List Frame) (p t v : Nat) :
     Occ { nodes := Function.update w.nodes i d, sent := s, dsent := ds }
         p t v ↔
-      (Frame.replicate p t v ∈ ds ∨ d.hist p = some (t, v)) ∨
+      ((∃ hdr, Frame.replicate p hdr t v ∈ ds) ∨ d.hist p = some (t, v)) ∨
         ∃ k, k ≠ i ∧ (w.nodes k).hist p = some (t, v) := by
   simp only [Occ]
   constructor
@@ -324,7 +483,7 @@ private theorem coherent_of_sub {n : Nat} {w w' : World n}
 /-- Certificate transport: the quorum rides the growing `sent` set; the pin
 is re-supplied by the caller (frozen fields, or a strict term bump); the
 no-foreign-grant obligation only needs the NEW messages checked. -/
-private theorem Cert.transport {n : Nat} {w w' : World n} {t : Nat}
+theorem Cert.transport {n : Nat} {w w' : World n} {t : Nat}
     {ℓ : Fin n} (hc : Cert w t ℓ)
     (hsent : ∀ m : Uc2.Msg n, m ∈ w.sent → m ∈ w'.sent)
     (hnew : ∀ c : Fin n, Uc2.Msg.vote ℓ c t true ∈ w'.sent →
@@ -352,7 +511,7 @@ private theorem pinned_bump {n : Nat} {t : Nat} {ℓ : Fin n} {p q : PNode n}
 /-- A live leader certifies its own term: the tally is the quorum
 (`leader_quorum`/`votes_sound`), the self-vote is the pin (`self_vote`), and
 `grant_state` + `self_vote` rule out any foreign grant at its term. -/
-private theorem cert_of_leader {n : Nat} {w : World n}
+theorem cert_of_leader {n : Nat} {w : World n}
     (hpInv : Uc2.Inv w.project) {i : Fin n}
     (hrole : (w.nodes i).pn.role = .leader) :
     Cert w ((w.nodes i).pn.currentTerm) i := by
@@ -376,7 +535,7 @@ candidate's tally-quorum and the certificate's grant-quorum intersect; every
 arm of the case split names the candidate as the certified writer, whose pin
 then contradicts candidacy (either the term moved strictly past `t`, or
 `role ≠ .candidate`). -/
-private theorem cert_blocks_candidate {n : Nat} {w : World n}
+theorem cert_blocks_candidate {n : Nat} {w : World n}
     (hpInv : Uc2.Inv w.project) {j : Fin n} {t : Nat}
     (hrole : (w.nodes j).pn.role = .candidate)
     (hterm : (w.nodes j).pn.currentTerm = t)
@@ -741,18 +900,18 @@ theorem dinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
               sent := w.sent
               dsent := w.dsent ++
                 [.replicate (w.nodes i).pn.durable
-                  (w.nodes i).pn.currentTerm v] }
+                  (w.nodes i).pn.currentTerm (w.nodes i).pn.currentTerm v] }
           p t v₀ →
         Occ w p t v₀ ∨
           (p = (w.nodes i).pn.durable ∧
            t = (w.nodes i).pn.currentTerm ∧ v₀ = v) := by
       intro p t v₀ hOcc
       rw [occ_mk] at hOcc
-      rcases hOcc with (hf | hd) | ⟨k, hne, hk⟩
+      rcases hOcc with (⟨hdr, hf⟩ | hd) | ⟨k, hne, hk⟩
       · rcases List.mem_append.mp hf with hf | hf
-        · exact .inl (.inl hf)
+        · exact .inl (.inl ⟨hdr, hf⟩)
         · rw [List.mem_singleton, Frame.replicate.injEq] at hf
-          exact .inr ⟨hf.1, hf.2.1, hf.2.2⟩
+          exact .inr ⟨hf.1, hf.2.2.1, hf.2.2.2⟩
       · by_cases hp : p = (w.nodes i).pn.durable
         · subst hp
           have hd' : Function.update (w.nodes i).hist
@@ -825,7 +984,11 @@ theorem dinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         exact hc.pinned
       · simp only [Function.update_of_ne hne]
         exact hc.pinned
-  | deliverReplicate j pos t v hmsg hpos hstamp =>
+  | deliverReplicate j pos hdr t v hmsg hpos hhdr =>
+    -- the old `≤`-guard, re-derived from emission-side truthfulness + the
+    -- exact header match (LC1: `stamp ≤ hdr = currentTerm`)
+    have hstamp : t ≤ (w.nodes j).pn.currentTerm :=
+      hhdr ▸ (reachable_stamp hw).frame_le pos hdr t v hmsg
     have hsub : ∀ p t₀ v₀,
         Occ { nodes := Function.update w.nodes j
                 ((w.nodes j).recvReplicate pos t v)
@@ -842,7 +1005,7 @@ theorem dinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           rw [Function.update_self, Option.some.injEq,
             Prod.mk.injEq] at hd'
           obtain ⟨rfl, rfl⟩ := hd'
-          exact .inl hmsg
+          exact .inl ⟨hdr, hmsg⟩
         · have hd' : Function.update (w.nodes j).hist pos
               (some (t, v)) p = some (t₀, v₀) := hd
           rw [Function.update_of_ne hp] at hd'
@@ -900,6 +1063,41 @@ theorem dinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         exact hc.pinned
       · simp only [Function.update_of_ne hne]
         exact hc.pinned
+  | serveTail i p t v hrole hhist hp =>
+    -- pure re-emission: the served frame copies an EXISTING hist occurrence
+    -- (`hhist`), so the occurrence set is unchanged and every clause
+    -- transports along `hsub` (the routine copy-step the rerun report
+    -- predicted)
+    have hsub : ∀ p₀ t₀ v₀,
+        Occ { nodes := w.nodes, sent := w.sent,
+              dsent := w.dsent ++
+                [.replicate p (w.nodes i).pn.currentTerm t v] }
+          p₀ t₀ v₀ → Occ w p₀ t₀ v₀ := by
+      intro p₀ t₀ v₀ hOcc
+      rcases hOcc with ⟨hdr, hf⟩ | hk
+      · rcases List.mem_append.mp hf with hf | hf
+        · exact .inl ⟨hdr, hf⟩
+        · rw [List.mem_singleton, Frame.replicate.injEq] at hf
+          obtain ⟨rfl, -, rfl, rfl⟩ := hf
+          exact .inr ⟨i, hhist⟩
+      · exact .inr hk
+    refine ⟨coherent_of_sub hsub h, ?_, ?_, h.map_pinned, ?_⟩
+    · intro k hk p₀ v₀ hOcc
+      exact h.frontier k hk p₀ v₀ (hsub _ _ _ hOcc)
+    · intro k hk es hg
+      rcases List.mem_append.mp hg with hg | hg
+      · exact h.gossip_pinned k hk es hg
+      · simp at hg
+    · intro t₀ hcg
+      have hkey : ∃ ℓ, Cert w t₀ ℓ := by
+        rcases hcg with ⟨p₀, v₀, hOcc⟩ | ⟨es, hg⟩
+        · exact h.cert t₀ (.inl ⟨p₀, v₀, hsub _ _ _ hOcc⟩)
+        · rcases List.mem_append.mp hg with hg | hg
+          · exact h.cert t₀ (.inr ⟨es, hg⟩)
+          · simp at hg
+      obtain ⟨ℓ, hc⟩ := hkey
+      exact ⟨ℓ, hc.transport (fun m hm => hm) (fun c' hcm => .inl hcm)
+        hc.pinned⟩
   | shipTermMap i hrole =>
     have hsub : ∀ p t v,
         Occ { nodes := w.nodes, sent := w.sent,
@@ -907,9 +1105,9 @@ theorem dinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
                 [.gossip (w.nodes i).pn.currentTerm (w.nodes i).termMap] }
           p t v → Occ w p t v := by
       intro p t v hOcc
-      rcases hOcc with hf | hk
+      rcases hOcc with ⟨hdr, hf⟩ | hk
       · rcases List.mem_append.mp hf with hf | hf
-        · exact .inl hf
+        · exact .inl ⟨hdr, hf⟩
         · simp at hf
       · exact .inr hk
     refine ⟨coherent_of_sub hsub h, ?_, ?_, h.map_pinned, ?_⟩
@@ -1042,5 +1240,9 @@ theorem log_matching {n : Nat} (w : World n) (hw : Reachable w)
   (reachable_dinv hw).coherent p t vi vj (.inr ⟨i, hi⟩) (.inr ⟨j, hj⟩)
 
 #print axioms log_matching
+#print axioms reachable_stamp
+#print axioms Cert.transport
+#print axioms cert_of_leader
+#print axioms cert_blocks_candidate
 
 end Uc2.Data
