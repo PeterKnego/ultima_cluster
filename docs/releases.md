@@ -40,6 +40,36 @@ Safety fixes in this line:
   violating advance) plus a `uc2_consensus` unit pin
   (`commit_clamped_to_new_term_base_never_certifies_old_term_only_range`).
   Remedy: upgrade; no back-port is planned.
+- **Intake-gate reopen was keyed to `current_term`, not the data-plane term
+  handle — a candidate cross-stream accept / acked-write-loss window**
+  (Finding #9, lean LC-closure effort; affects all prior v2 releases): the
+  receiver filters inbound DATA on the node-level `term_handle`
+  (`receiver.rs:635` `dropped_stale_term`), but both intake-gate REOPEN sites
+  keyed off `current_term` — the clean-reconcile arm (`node.rs` feed,
+  `t >= sm.current_term()`) and the truncation-ack arm (`on_truncated`). A
+  CANDIDATE's handle LAGS its `StartElection`-bumped `current_term`
+  (`Action::StartElection` stores no handle, `node.rs:2440-2450`), so a
+  candidate that adopted term T (handle T, gate closed), campaigned to T+1,
+  then cleanly reconciled a term-T+1 leader's map REOPENED intake for its
+  stale handle-T stream — and then accepted a term-T `serveTail`/NAK-repair
+  byte its own term map never attributed (a cross-stream write), which its
+  role-blind AppendPosition report (`receiver.rs:1049-1078`, retargeted to the
+  new leader) could then feed into a commit over content that leader does not
+  hold (§5.4.2 / Figure-8 acked-write-loss family, same class as #6b).
+  Requires a candidate with a lagged handle + a clean higher-term reconcile +
+  a co-term leader ranking the report; never observed outside the directed
+  reproduction (no production deployment exists — pre-release fix). Fixed:
+  BOTH reopen arms now fire only when `current_term == adopted_term` (== the
+  `term_handle` the receiver filters at); a candidate's data intake stays
+  CLOSED until it resolves (win / step-down / higher-term adoption re-keys the
+  handle), costing nothing in steady state (followers always satisfy the
+  equality). Found by the Lean LC-closure model (`n=5`, 56-step kernel-checked
+  countermodel `finding_candidate_gate_reopen_fca_violation`, later deleted
+  with the fix), reproduced RED-first and pinned by the sim
+  (`finding9_lagged_handle_candidate_reopen_needs_handle_keyed`: the
+  `handle_keyed:false` counterfactual reopens a lagged-handle candidate's gate,
+  the shipped `handle_keyed:true` keeps it closed + converges). Remedy:
+  upgrade; no back-port is planned.
 - **Boot-open intake gate could certify a phantom commit** (Finding #5, lean
   leader-completeness effort; affects all prior v2 releases): a voter that
   granted a term-T vote (persisted), held a divergent tail, and crashed before

@@ -323,7 +323,7 @@ fn mechanism_unguarded_reopen_is_caught_by_oracle() {
     for seed in 0..200 {
         let mut cfg = nasty_reconcile_config(seed); // helper: high churn, partitions, crashes
         cfg.crash_per_million = 1_000; // red-arm rate, see the doc comment above
-        cfg.data_plane = DataPlane::Mechanism { reopen_guard: false };
+        cfg.data_plane = DataPlane::Mechanism { reopen_guard: false, handle_keyed: true };
         if let Err(v) = World::new(cfg).run()
             && v.invariant.contains("phantom")
         {
@@ -344,7 +344,7 @@ fn mechanism_unguarded_reopen_is_caught_by_oracle() {
 fn mechanism_guarded_survives_the_same_storm() {
     for seed in 0..200 {
         let mut cfg = nasty_reconcile_config(seed);
-        cfg.data_plane = DataPlane::Mechanism { reopen_guard: true };
+        cfg.data_plane = DataPlane::Mechanism { reopen_guard: true, handle_keyed: true };
         World::new(cfg).run().unwrap_or_else(|v| panic!("seed {seed}: {v:?}"));
     }
 }
@@ -394,7 +394,7 @@ fn raw_m3_forged_report_phantom_commit_is_caught() {
 #[test]
 fn no_common_prefix_reaches_wipe_and_fatal_when_disabled() {
     let mut cfg = base_cfg(1);
-    cfg.data_plane = DataPlane::Mechanism { reopen_guard: true };
+    cfg.data_plane = DataPlane::Mechanism { reopen_guard: true, handle_keyed: true };
     let mut w = World::new(cfg);
     w.run_until_leader().expect("elect leader");
     let leader = w.current_leader().unwrap();
@@ -439,7 +439,7 @@ fn fuzz_default_seeds() {
             drop_per_million: 20_000,
             dup_per_million: 5_000,
             crash_per_million: 500,
-            data_plane: DataPlane::Mechanism { reopen_guard: true },
+            data_plane: DataPlane::Mechanism { reopen_guard: true, handle_keyed: true },
             ..SimConfig::default()
         });
         if let Err(v) = w.run() {
@@ -497,7 +497,7 @@ fn fuzz_heavy_seeds() {
             drop_per_million: 20_000,
             dup_per_million: 10_000,
             crash_per_million: 500,
-            data_plane: DataPlane::Mechanism { reopen_guard: true },
+            data_plane: DataPlane::Mechanism { reopen_guard: true, handle_keyed: true },
             ..SimConfig::default()
         });
         if let Err(v) = w.run() {
@@ -1121,7 +1121,7 @@ fn serving_gate_refuses_the_premature_proposal() {
 fn rebooted_unreconciled_voter_must_not_certify_phantom_commit() {
     let mut w = World::new(SimConfig {
         drop_per_million: 0,
-        data_plane: DataPlane::Mechanism { reopen_guard: true },
+        data_plane: DataPlane::Mechanism { reopen_guard: true, handle_keyed: true },
         max_steps: 200_000,
         ..base_cfg(3)
     });
@@ -1253,7 +1253,7 @@ fn old_term_range_must_not_commit_before_new_term_quorum() {
         seed: 3,
         max_steps: 400_000,
         drop_per_million: 0,
-        data_plane: DataPlane::Mechanism { reopen_guard: true },
+        data_plane: DataPlane::Mechanism { reopen_guard: true, handle_keyed: true },
         ..SimConfig::default()
     });
     // Phase 1: elect the term-1 leader; a genuine committed prefix lands on
@@ -1414,3 +1414,128 @@ fn parked_violation_surfaces_without_a_step() {
     );
 }
 
+
+
+fn drive_to_candidate_lagged(seed: u64, handle_keyed: bool) -> Option<(World, usize, u32)> {
+    let mut w = World::new(SimConfig {
+        drop_per_million: 0,
+        data_plane: DataPlane::Mechanism { reopen_guard: true, handle_keyed },
+        max_steps: 2_000_000,
+        ..base_cfg(seed)
+    });
+    w.run_until_leader().ok()?;
+    let l1 = w.current_leader()?;
+    w.run_steps(300).ok()?;
+    let others: Vec<usize> = (0..3).filter(|&i| i != l1).collect();
+    let (a, b) = (others[0], others[1]);
+    w.partition(l1, a);
+    w.partition(l1, b);
+    w.run_until(|w| w.current_leader().is_some_and(|l| l != l1)).ok()?;
+    let l2 = w.current_leader()?;
+    let f = if l2 == a { b } else { a };
+    w.run_steps(300).ok()?;
+    w.partition(l2, f);
+    w.unpartition(l1, f);
+    // Step finely; the instant f is a closed-gate follower at term >= 3, isolate
+    // it so it times out into candidacy with the handle frozen at that term.
+    let mut adopted = 0u32;
+    for _ in 0..2000 {
+        w.run_steps(10).ok()?;
+        if !w.node_is_candidate(f) && w.node_adopted_term(f) >= 3 && !w.node_intake_gate(f) {
+            adopted = w.node_adopted_term(f);
+            break;
+        }
+    }
+    if adopted == 0 { return None; }
+    w.heal();
+    w.partition_node(f);
+    for _ in 0..2000 {
+        w.run_steps(10).ok()?;
+        if w.node_is_candidate(f) && w.node_adopted_term(f) == adopted
+            && w.node_term(f) > adopted && !w.node_intake_gate(f) {
+            let ct = w.node_term(f);
+            return Some((w, f, ct));
+        }
+    }
+    None
+}
+
+/// Finding #9 (lean LC2 — candidate cross-stream accept; adjudicated a REAL
+/// reachable acked-write-loss gap, §5.4.2 / #6b family): the intake-gate REOPEN
+/// was keyed to `current_term`, not the data-plane term handle the receiver
+/// filters DATA at. A CANDIDATE's handle lags its `StartElection`-bumped
+/// `current_term` (StartElection stores no handle), so a candidate that cleanly
+/// reconciles a co/higher-term map REOPENED intake for its stale handle-term
+/// stream — the door through which a cross-stream old-term byte is then accepted
+/// (the acked-write-loss source). The fix keys BOTH reopen arms (clean reconcile
+/// in `feed`, truncation ack in `on_truncated`) to `current_term == adopted_term`
+/// (== the handle); a candidate never reopens.
+///
+/// Directed twin over the SAME reachable state (`drive_to_candidate_lagged`: a
+/// lagged-handle candidate — handle < current_term, gate CLOSED — reached by
+/// natural elections + partitions), asserting the ROOT MECHANISM the fix changes:
+///   - RED (`handle_keyed:false`, the counterfactual): the candidate cleanly
+///     reconciles the candidate-term leader's map (identity, no truncation) and
+///     the gate WRONGLY REOPENS — the exact violating event that lets a
+///     cross-stream byte in.
+///   - GREEN (`handle_keyed:true`, shipped): the gate STAYS CLOSED on the same
+///     reconcile, and the candidate still CONVERGES once unpartitioned (liveness:
+///     no stranded candidate — it adopts a real leader's term / steps down).
+///
+/// Scope note (two deeper couplings the sim cannot cheaply cross — the reopen is
+/// the fix's exact lever, so it is what this pins; the end-to-end acked-write-loss
+/// is proved authoritatively by the machine-checked Lean countermodel
+/// `finding_candidate_gate_reopen_fca_violation`, n=5, 56 steps):
+///   (1) the sim's DATA-accept path keys on `current_term`, not the term handle
+///       (`deliver` `Msg::Data`: `if term == cur`), so a current-term Data frame
+///       carries a `LeaderSeen` that RESOLVES the candidacy (adopts the term as a
+///       clean follower) before the accept — the sim cannot express a
+///       handle-filtered DATA accept while `current_term > handle` (the LC1b
+///       header/handle split the Lean model added lives only there);
+///   (2) the report-path phantom the reopened gate feeds needs a co-term leader
+///       to rank the divergent report — a multi-actor setup the storm does not
+///       isolate (the discriminating-seed probe found none: at storm rates every
+///       counterfactual catch is the documented benign both-arms inv2 laggard).
+/// Working seed: 7 (f becomes a term-4 candidate, handle 3, map [(1,0),(2,1344)]).
+#[test]
+fn finding9_lagged_handle_candidate_reopen_needs_handle_keyed() {
+    // ---- RED: the counterfactual reopens the lagged-handle candidate's gate. ----
+    let (mut w, f, ct) =
+        drive_to_candidate_lagged(7, false).expect("reach the lagged-handle candidate (red)");
+    assert!(!w.node_intake_gate(f), "precondition: candidate's gate is closed");
+    assert!(
+        w.node_adopted_term(f) < w.node_term(f),
+        "precondition: the handle ({}) lags current_term ({})",
+        w.node_adopted_term(f),
+        w.node_term(f)
+    );
+    let map = w.node_map(f);
+    // The candidate-term leader's map (identical to f's -> a clean, no-truncation
+    // reconcile). `from` is any peer id; delivery bypasses the partition table.
+    let from = (0..3).find(|&i| i != f).unwrap();
+    w.inject_term_map(from, f, ct, map.clone()).expect("clean reconcile (red)");
+    assert!(
+        w.node_intake_gate(f),
+        "RED (violating event): the lagged-handle candidate's clean reconcile of a \
+         co-term map WRONGLY reopened the intake gate for its stale handle-term stream"
+    );
+
+    // ---- GREEN: the shipped fix keeps the gate closed; the candidate converges. ----
+    let (mut w, f, ct) =
+        drive_to_candidate_lagged(7, true).expect("reach the lagged-handle candidate (green)");
+    assert!(!w.node_intake_gate(f), "precondition: candidate's gate is closed");
+    let map = w.node_map(f);
+    let from = (0..3).find(|&i| i != f).unwrap();
+    w.inject_term_map(from, f, ct, map.clone()).expect("clean reconcile (green)");
+    assert!(
+        !w.node_intake_gate(f),
+        "GREEN: the fix must keep a lagged-handle candidate's gate CLOSED on a clean reconcile"
+    );
+    // Liveness: unpartition; the candidate must converge (adopt a real leader's
+    // term / step down and reconcile), not strand with a permanently shut gate.
+    w.heal();
+    let converged = w
+        .run_until(|w| w.current_leader().is_some() && !w.node_is_candidate(f) && w.node_intake_gate(f))
+        .expect("run");
+    assert!(converged, "GREEN liveness: the candidate must converge once unpartitioned");
+}

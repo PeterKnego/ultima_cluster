@@ -460,8 +460,22 @@ inductive Step {n : Nat} : World n → World n → Prop
   /-- `Data.Step.deliverTermMap`. Commit delta: reconciliation for the
   (possibly just-adopted) term completes atomically with the truncation
   pipeline (LA1 module doc, item 5), so the gate reopens — the
-  clean-reconcile arm (`node.rs` ~2381–2391) and the matching-epoch
-  `on_truncated` reopen (~2710–2722) collapsed into the same atomic step. -/
+  clean-reconcile arm (`node.rs` ~2403–2413) and the matching-epoch
+  `on_truncated` reopen (~2731–2743) collapsed into the same atomic step.
+
+  **Finding #9 (lean LC2) — the reopen is HANDLE-KEYED.** Both Rust reopen
+  arms now fire only when `current_term == adopted_term` (== `term_handle`,
+  the term the receiver filters DATA at). A CANDIDATE's handle lags its
+  `StartElection`-bumped `currentTerm`, so reconciling a co/higher-term map
+  must NOT reopen intake for its stale handle-term stream — otherwise it
+  accepts a cross-stream old-stamped byte its map never attributed
+  (acked-write-loss, §5.4.2 / #6b family; the deleted
+  `finding_candidate_gate_reopen_fca_violation` was the n=5 countermodel).
+  Mirrored as: `reconciled` becomes `true` only when the post-step regime is
+  handle-aligned — on a strict adoption (`currentTerm < t`) `BecomeFollower`
+  re-keyed the handle to `t`, so it aligns; otherwise it reopens iff the
+  (unchanged) `dataTerm` already equals `currentTerm` (a follower, never a
+  lagged candidate). -/
   | deliverTermMap (w : World n) (j : Fin n) (t : Nat) (entries : TermMap)
       (hmsg : Uc2.Data.Frame.gossip t entries ∈ w.dsent)
       (hterm : (w.nodes j).pn.currentTerm ≤ t) :
@@ -469,7 +483,9 @@ inductive Step {n : Nat} : World n → World n → Prop
         { nodes := Function.update w.nodes j
             { w.nodes j with
               dn := (w.nodes j).dn.applyGossip t entries
-              reconciled := true }
+              reconciled :=
+                if (w.nodes j).pn.currentTerm < t then true
+                else decide ((w.nodes j).dn.dataTerm = (w.nodes j).pn.currentTerm) }
           sent := w.sent
           dsent := w.dsent
           csent := w.csent

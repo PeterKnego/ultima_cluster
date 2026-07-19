@@ -306,7 +306,15 @@ inductive Step {n : Nat} : World n → World n → Prop
   own append frontier for arbitrary `v`, advancing the frontier — the client
   submit → log-buffer append of `node.rs`'s leader path, with the emitted
   `replicate` frame standing for the sender agent's stream off the buffer.
-  The append is immediately durable (module doc, item 4). -/
+  The append is immediately durable (module doc, item 4).
+
+  Emission note (LC2 amendment 6): the model emits the frame header as
+  `currentTerm`, while Rust stamps it from the node-level `term_handle`
+  (`dataTerm`). For a LEADER these COINCIDE — `dataTerm = currentTerm` holds
+  invariantly (`MapWF.lean`'s `reachable_leader_dataTerm`), since a leader's
+  handle was stored at `becomeLeader` (`node.rs:2462`) and no candidate-style
+  lag applies while it leads — so the model's `currentTerm` header is faithful
+  at every replicate emission site (`leaderAppend` here, and `serveTail`). -/
   | leaderAppend (w : World n) (i : Fin n) (v : Nat)
       (hrole : (w.nodes i).pn.role = .leader) :
       Step w

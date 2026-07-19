@@ -2405,6 +2405,22 @@ impl Consensus {
                 && !produced_truncate
                 && self.pending_truncation.is_none()
                 && t >= term_before
+                // Finding #9 (lean LC2, gate doc): reopen ONLY when the SM's
+                // active term equals the data-plane term handle the receiver
+                // filters DATA at (`adopted_term` == `term_handle`,
+                // receiver.rs:635 `dropped_stale_term`). `Action::StartElection`
+                // bumps `current_term` but stores NO handle (node.rs:2440-2450),
+                // so a CANDIDATE runs its data plane at a LAGGING handle. Without
+                // this check, a candidate that cleanly reconciles a HIGHER-term
+                // leader's map (non-adopt: `t` not `> current_term`) reopens
+                // intake for its stale handle-term stream and then accepts a
+                // cross-stream `serveTail` byte its map never attributed —
+                // Finding #9's candidate cross-stream accept (acked-write-loss,
+                // §5.4.2 / #6b family). When the map ADOPTS a strictly higher
+                // term, `BecomeFollower` re-keyed the handle to `t` first, so
+                // `current_term == adopted_term` holds and the reopen fires as
+                // before.
+                && self.sm.current_term() == self.adopted_term
             {
                 // Clean reconcile for the adopted term: reopen and clear the
                 // awaiting-reconcile latch (M-3).
@@ -2737,7 +2753,17 @@ impl Consensus {
         if matching {
             self.pending_truncation = None;
             self.truncations.fetch_add(1, Ordering::Relaxed);
-            if !self.awaiting_reconcile {
+            // Finding #9 (lean LC2): same handle-keying as the clean-reconcile
+            // reopen in `feed`. A CANDIDATE's truncating reconcile (handle lags
+            // its bumped `current_term`) must NOT reopen intake for its stale
+            // handle regime when the ack lands — `Action::Truncate` cleared
+            // `awaiting_reconcile` (node.rs ~2599) so the old `!awaiting_reconcile`
+            // gate alone would reopen. `current_term == adopted_term` fails for a
+            // candidate (its handle still names the pre-bump term); it holds for a
+            // follower whose adoption re-keyed the handle. The candidate stays
+            // closed until it resolves (BecomeLeader / step-down / higher-term
+            // adoption).
+            if !self.awaiting_reconcile && self.sm.current_term() == self.adopted_term {
                 self.open_gate();
             }
         }

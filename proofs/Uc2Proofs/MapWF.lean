@@ -1087,6 +1087,112 @@ theorem reachable_mapsWF {n : Nat} {w : World n} (hw : Reachable w) :
 #print axioms reachable_mapInv
 #print axioms reachable_mapsWF
 
+/-! ### `leader ⇒ dataTerm = currentTerm` (LC2 amendment 6)
+
+The emission-site coincidence: the model emits replicate-frame headers as
+`currentTerm`, while Rust stamps them from the node-level `term_handle`
+(`dataTerm`). This lemma is what makes them agree for a LEADER — the handle
+is stored at `becomeLeader` (`node.rs:2462`) and no candidate-style lag
+applies while the node leads (only `startElection`, which a leader never
+runs, opens the lag). A one-clause invariant; every constructor either
+keeps a leader's `(role, currentTerm, dataTerm)` triple or converts the
+node OFF leader (adoptions / crash) or opens leadership afresh
+(`becomeLeader`, which sets `dataTerm := currentTerm`). -/
+
+/-- Invariant: a leader's data-plane handle equals its current term. -/
+def LeaderDataTerm {n : Nat} (w : World n) : Prop :=
+  ∀ j : Fin n, (w.nodes j).pn.role = .leader →
+    (w.nodes j).dataTerm = (w.nodes j).pn.currentTerm
+
+private theorem ldt_init (n : Nat) : LeaderDataTerm (World.init n) := by
+  intro j hr; simp [World.init] at hr
+
+private theorem ldt_step {n : Nat} {w w' : World n} (h : LeaderDataTerm w)
+    (hs : Step w w') : LeaderDataTerm w' := by
+  cases hs with
+  | startElection i hrole =>
+    intro k hr
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self] at hr ⊢; simp at hr
+    · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
+  | deliverRequestVote j c nt clt cd hmsg hterm =>
+    intro k hr
+    rcases eq_or_ne k j with rfl | hne
+    · simp only [Function.update_self] at hr ⊢
+      by_cases hadopt : (w.nodes k).pn.currentTerm < nt
+      · rw [recv_adopt_role _ _ _ _ _ hadopt] at hr; cases hr
+      · have hfr := recv_frame (w.nodes k).pn c nt clt cd hadopt
+        rw [if_neg hadopt, hfr.2]
+        exact h k (hfr.1 ▸ hr)
+    · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
+  | rejectStaleRequestVote j c nt clt cd hmsg hstale => intro k hr; exact h k hr
+  | deliverVote i v t hmsg hrole hterm =>
+    intro k hr
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self] at hr ⊢; exact h k hr
+    · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
+  | deliverVoteHigherTerm i v t g hmsg hterm =>
+    intro k hr
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self] at hr ⊢; simp [PNode.adoptTerm] at hr
+    · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
+  | becomeLeader i hrole hquorum =>
+    intro k hr
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self]
+    · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
+  | crashRestart i =>
+    intro k hr
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self] at hr; simp at hr
+    · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
+  | leaderAppend i v hrole =>
+    intro k hr
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self] at hr ⊢; exact h k hrole
+    · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
+  | deliverReplicate j pos hdr t v hmsg hpos hhdr =>
+    intro k hr
+    rcases eq_or_ne k j with rfl | hne
+    · simp only [Function.update_self] at hr ⊢
+      obtain ⟨_, hd, _, hro, hct, hdt⟩ := recvReplicate_fields (w.nodes k) pos t v
+      rw [hdt, hct]; rw [hro] at hr; exact h k hr
+    · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
+  | serveTail i p t v hrole hhist hp => intro k hr; exact h k hr
+  | shipTermMap i hrole => intro k hr; exact h k hr
+  | deliverTermMap j t entries hmsg hterm =>
+    intro k hr
+    rcases eq_or_ne k j with rfl | hne
+    · simp only [Function.update_self] at hr ⊢
+      cases hrec : reconcile (w.nodes k).termMap (w.nodes k).pn.durable
+          entries with
+      | noCommonPrefix =>
+        obtain ⟨_, _, _, hro, hct, hdt⟩ := applyGossip_ncp (w.nodes k) t hrec
+        by_cases hadopt : (w.nodes k).pn.currentTerm < t
+        · rw [hro, if_pos hadopt] at hr; cases hr
+        · rw [hdt, hct, if_neg hadopt, if_neg hadopt]
+          rw [hro, if_neg hadopt] at hr; exact h k hr
+      | ok o =>
+        obtain ⟨_, _, _, hro, hct, hdt⟩ := applyGossip_ok (w.nodes k) t hrec
+        by_cases hadopt : (w.nodes k).pn.currentTerm < t
+        · rw [hro, if_pos hadopt] at hr; cases hr
+        · rw [hdt, hct, if_neg hadopt, if_neg hadopt]
+          rw [hro, if_neg hadopt] at hr; exact h k hr
+    · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
+
+/-- **`leader ⇒ dataTerm = currentTerm`** in every reachable world
+(LC2 amendment 6): the emission-site coincidence that makes the model's
+`currentTerm` replicate headers faithful to Rust's `term_handle` stamp. -/
+theorem reachable_leader_dataTerm {n : Nat} {w : World n} (hw : Reachable w) :
+    LeaderDataTerm w := by
+  have h : Relation.ReflTransGen Step (World.init n) w := hw
+  clear hw
+  induction h with
+  | refl => exact ldt_init n
+  | tail _ hstep ih => exact ldt_step ih hstep
+
+#print axioms reachable_leader_dataTerm
+
 end Data
 
 namespace Cert
