@@ -536,3 +536,33 @@ section above and the memo's "Tier B(b) actuals + re-gate" section for the
 full record, cost accounting, and the presented (not resolved) options for
 what to do next. Other options when desired: a Phase 1.5 retry once aeneas
 supports Lean ≥ 4.32.
+
+---
+
+## Tier B(b) closure arc (LC1–LC4h) — banked 2026-07-19
+
+The Option-1 follow-up (retire Finding #7's model debt, prove
+`leader_completeness` UNCONDITIONALLY) ran and is **banked, not finished**.
+Net change to the proof corpus's standing:
+
+- `frames_current_authored` is now **discharged unconditionally** (was the
+  hypothesis that made the prior arc's `leader_completeness` conditional).
+  `election_safety` and `log_matching` stay proved under the refined model.
+- `leader_completeness` is **reduced to one named obligation** — the `canon`
+  invariant — with its assembly, crux, canon statement/consumer-interface,
+  antitonicity, and a machine-checked `k>0` satisfiability witness all landed.
+  Finding #11: canon needs joint/well-founded induction (the corpus's standard
+  single-`ReflTransGen`-shell shape provably cannot reach its monotone-forward
+  antecedent's newly-born instances); F-A confirms this is scope, not falsity.
+  Remaining ≈7–12 S2-eq / 3–4 tasks to a complete unconditional theorem.
+- **Two real shipped consensus bugs found and fixed**: Finding #9 (intake-gate
+  reopen keyed to `currentTerm` not the term handle — acked-write-loss, fixed in
+  Rust `node.rs:2423` + model mirror + directed sim regression pin, releases.md
+  filed) and Finding #8 (the model-fidelity gap that exposed #9). Combined with
+  the prior sub-spike (#5, #6b), this proof effort has now driven **four real
+  shipped-bug fixes**, all in the election-time term-handle/gate/commit window.
+
+Full actuals, findings ledger (#8–#11), the joint-induction blueprint, the
+resume notes, and the (c) re-price are in the memo's **"Tier B(b) CLOSURE ARC"**
+section (`uc2-lean-phase2-spike-2026-07-17.md`). Resume is clean: nothing decays;
+the branch is merged and the canon blueprint + kernel-cost traps are on record.
