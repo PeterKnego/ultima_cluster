@@ -451,4 +451,270 @@ theorem cand_cred {n : Nat} {w : World n} (hw : Reachable w)
 
 #print axioms cand_cred
 
+/-! ## `committed_term_at_leaders` — the statement, and the assembly it feeds
+
+The LC endgame's shape (LB2b's four steps): a committed entry's position is
+inside every later-or-equal-term leader's durable frontier, and that
+leader's OWN term map attributes the position to the committed stamp. With
+that, `frames_current_authored` pins the held stamp and `Uc2.Data`'s
+`coherent` (log matching, at the frame occurrence `committed_frame_provenance`
+produces) pins the payload. -/
+
+/-- **`committed_term_at_leaders`**, predicate form (`T ≤` — the
+strengthened relation the brief asks for; the `becomeLeader` case at
+`u = T` is vacuous by `cert_blocks_candidate` against `RepQuorum`'s own
+certificate, so `≤` costs nothing over `<`). -/
+def CommittedTermAtLeaders {n : Nat} (w : World n) : Prop :=
+  ∀ (p stamp T v : Nat), (p, stamp, T, v) ∈ w.committed →
+    ∀ i : Fin n, (w.nodes i).pn.role = .leader →
+      T ≤ (w.nodes i).pn.currentTerm →
+      p < (w.nodes i).pn.durable ∧
+        Uc2.TermMap.termAt (w.nodes i).dn.termMap p = stamp
+
+/-- **The assembly.** Leader completeness follows from
+`CommittedTermAtLeaders` and the landed stack alone:
+
+1. `reachable_hist_defined` — `p < durable i` means `i` holds SOMETHING at `p`;
+2. `frames_current_authored` — what it holds is stamped by its own map's
+   attribution at `p`, which CTL pins to `stamp`;
+3. `committed_frame_provenance` — the committed `(stamp, v)` is a real
+   `replicate` frame on the data wire, i.e. an `Occ` at `(p, stamp)`;
+4. `Data.DInv.coherent` (log matching) — two occurrences at the same
+   `(position, stamp)` carry the same payload. -/
+private theorem lc_of_ctl {n : Nat} {w : World n} (hw : Reachable w)
+    (hctl : CommittedTermAtLeaders w)
+    (p t T v : Nat) (hc : (p, t, T, v) ∈ w.committed)
+    (i : Fin n) (hi : (w.nodes i).pn.role = .leader)
+    (ht : T ≤ (w.nodes i).pn.currentTerm) :
+    (w.nodes i).hist p = some (t, v) := by
+  obtain ⟨hpd, hattr⟩ := hctl p t T v hc i hi ht
+  obtain ⟨⟨t', v'⟩, hh⟩ := reachable_hist_defined hw i p hpd
+  have hst : t' = t := ((frames_current_authored hw i p t' v' hh).symm.trans
+    hattr)
+  subst hst
+  obtain ⟨hdr, hfr⟩ := committed_frame_provenance hw p t' T v hc
+  have hv : v = v' :=
+    (Data.reachable_dinv (reachable_project hw)).coherent p t' v v'
+      (.inl ⟨hdr, hfr⟩) (.inr ⟨i, hh⟩)
+  rw [hh, hv]
+
+/-! ## Canon consumption: a shared below-`k` prefix forbids a cut below `k`
+
+The single reconcile-side fact the (unmechanized) canon layer exists to
+feed. Adjudicated fact: `reconcile` cuts at the first ENTRY mismatch
+(`commonPrefixLen` compares whole entries), so `termAt`-level agreement
+cannot control the cut position — but LITERAL agreement of the entries
+whose bases sit below `k` does, and bounds the cut at or above `k`. This is
+the consumption side of canon: it is stated and proved here independently
+of how the shared prefix `P` is established (that is canon's own,
+unmechanized induction). -/
+
+/-- `commonPrefixLen` splits over a shared literal prefix. -/
+private theorem cpl_append : ∀ (P a b : TermMap),
+    Uc2.commonPrefixLen (P ++ a) (P ++ b) = P.length + Uc2.commonPrefixLen a b
+  | [], a, b => by simp
+  | e :: P, a, b => by
+    have ih := cpl_append P a b
+    simp [Uc2.commonPrefixLen]
+    omega
+
+/-- An index at or past a prefix's length reads out of the suffix. -/
+private theorem mem_suffix_of_getElem {P a : TermMap} {i : Nat}
+    {e : Nat × Nat} (hi : P.length ≤ i) (h : (P ++ a)[i]? = some e) :
+    e ∈ a := by
+  rw [List.getElem?_append_right hi] at h
+  exact List.mem_of_getElem? h
+
+/-- Lower bound for the clamped rebuild: `validUpTo` is a `min` of the
+durable with the two slot-`cp` bases, so any common floor on all three is a
+floor on the outcome. -/
+private theorem clamped_ge {own leader : TermMap} {d k cp : Nat}
+    {o : Uc2.Outcome}
+    (h : Uc2.reconcile.reconcileClamped own d leader cp = .ok o)
+    (hd : k ≤ d)
+    (ho : ∀ e, own[cp]? = some e → k ≤ e.2)
+    (hl : ∀ e, leader[cp]? = some e → k ≤ e.2) :
+    k ≤ o.validUpTo := by
+  obtain ⟨v, m⟩ := o
+  dsimp only [Uc2.Outcome.validUpTo]
+  rcases hoe : own[cp]? with _ | e <;> rcases hle : leader[cp]? with _ | f <;>
+    simp only [Uc2.reconcile.reconcileClamped, hoe, hle,
+      Uc2.ReconcileResult.ok.injEq, Uc2.Outcome.mk.injEq] at h <;>
+    obtain ⟨hv, -⟩ := h
+  · omega
+  · have h2 := hl f hle
+    simp only [Nat.min_def] at hv
+    split_ifs at hv <;> omega
+  · have h1 := ho e hoe
+    simp only [Nat.min_def] at hv
+    split_ifs at hv <;> omega
+  · have h1 := ho e hoe
+    have h2 := hl f hle
+    simp only [Nat.min_def] at hv
+    split_ifs at hv <;> omega
+
+/-- **Canon consumption.** Two maps that share a literal (nonempty) prefix
+`P`, with every entry BEYOND `P` on either side opening at or above `k`,
+reconcile cleanly at any durable at-or-above `k` without cutting below `k`.
+
+`hP` (nonempty shared prefix) is exactly what rules out the
+`NoCommonPrefix` wipe arm; in the intended consumer `P` is the below-`k`
+canonical prefix of the `T`-tenure, nonempty because `MapFloor` pins a
+map's head base to `0 < k`. -/
+theorem reconcile_ge_of_canon {P a b : TermMap} {d k : Nat}
+    (hP : P ≠ [])
+    (ha : ∀ e ∈ a, k ≤ e.2) (hb : ∀ e ∈ b, k ≤ e.2) (hd : k ≤ d) :
+    ∃ o : Uc2.Outcome,
+      Uc2.reconcile (P ++ a) d (P ++ b) = .ok o ∧ k ≤ o.validUpTo := by
+  obtain ⟨l0, ls, hPeq⟩ : ∃ l0 ls, P = l0 :: ls := by
+    cases P with
+    | nil => exact absurd rfl hP
+    | cons l0 ls => exact ⟨l0, ls, rfl⟩
+  have hlen1 : 1 ≤ P.length := by rw [hPeq]; simp
+  have hlen : P.length ≤ Uc2.commonPrefixLen (P ++ a) (P ++ b) := by
+    rw [cpl_append]; omega
+  have hcons : P ++ b = l0 :: (ls ++ b) := by rw [hPeq]; rfl
+  have hclamped :
+      Uc2.reconcile (P ++ a) d (P ++ b)
+        = Uc2.reconcile.reconcileClamped (P ++ a) d (P ++ b)
+            (Uc2.commonPrefixLen (P ++ a) (P ++ b)) := by
+    conv_lhs => rw [hcons]
+    rw [Uc2.reconcile_eq_clamped (P ++ a) d l0 (ls ++ b)
+      (Or.inr (by rw [← hcons]; omega)), ← hcons]
+  have hoa : ∀ e, (P ++ a)[Uc2.commonPrefixLen (P ++ a) (P ++ b)]? = some e →
+      k ≤ e.2 := fun e he => ha e (mem_suffix_of_getElem hlen he)
+  have hob : ∀ e, (P ++ b)[Uc2.commonPrefixLen (P ++ a) (P ++ b)]? = some e →
+      k ≤ e.2 := fun e he => hb e (mem_suffix_of_getElem hlen he)
+  rcases hres : Uc2.reconcile (P ++ a) d (P ++ b) with o | _
+  · exact ⟨o, rfl, clamped_ge (hclamped.symm.trans hres) hd hoa hob⟩
+  · exfalso
+    rw [hclamped] at hres
+    simp [Uc2.reconcile.reconcileClamped] at hres
+
+#print axioms reconcile_ge_of_canon
+
+/-! ## The `becomeLeader` crux, mechanized against an explicit hypothesis
+bundle
+
+`committed_term_at_leaders` is NOT landed (see the task report). What IS
+landed here is its crux — the `becomeLeader` case — proved in full against
+`CruxInputs`, the three facts the still-unmechanized canon layer has to
+supply. Everything else in the crux (the quorum routing, the four-way case
+split, the F3 reporter-is-candidate slot, and the `T < clt` reduction) is
+discharged from the landed stack.
+
+**Item 1 of the LC4e brief, answered and machine-checked: the `EntryIdentity`
+shortcut is NOT needed.** LC4d's design record routed the `clt > T` arm
+through an entry-identity step plus a term-descent recursion. Neither is
+required: `cand_frontier` (below) shows a quorate candidate's CURRENT map
+frontier already dominates the `lastTerm` it advertised at campaign time, so
+`T < clt` puts the candidate itself strictly past `T` in the SAME pre-state,
+where canon's past-`T` floor applies directly. -/
+
+/-- A quorate candidate's CURRENT map frontier and durable dominate the
+credentials it advertised at campaign time — `cand_cred` restated on the map
+frontier via the derived-credential sync. -/
+theorem cand_frontier {n : Nat} {w : World n} (hw : Reachable w)
+    (i : Fin n) (u clt cd : Nat) (hm : Msg.requestVote i u clt cd ∈ w.sent)
+    (hrl : (w.nodes i).pn.role = .candidate)
+    (hct : (w.nodes i).pn.currentTerm = u)
+    (hquorum : n / 2 + 1 ≤ (w.nodes i).pn.votesReceived.card) :
+    clt ≤ Data.lastTermOf (w.nodes i).dn.termMap ∧
+      cd ≤ (w.nodes i).pn.durable := by
+  obtain ⟨h1, h2⟩ := cand_cred hw i u clt cd hm hrl hct hquorum
+  exact ⟨(reachable_lastTerm_sync hw i) ▸ h1, h2⟩
+
+#print axioms cand_frontier
+
+/-- The facts the `becomeLeader` crux consumes that the canon layer still
+owes. All three are era-conditioned consequences of canonical-prefix
+agreement; none is landed. -/
+structure CruxInputs {n : Nat} (w : World n) (T k : Nat) : Prop where
+  /-- Canon's past-`T` floor: a map frontier strictly past `T` implies the
+  node is durable through `k` (no above-`T` byte lives below `k`). -/
+  past_floor : ∀ j : Fin n, T < Data.lastTermOf (w.nodes j).dn.termMap →
+      k ≤ (w.nodes j).pn.durable
+  /-- The `T`-tenure writer's own floor (it committed through `k`, and canon
+  forbids any later reconcile from cutting it back below `k`). -/
+  writer_floor : ∀ ℓ : Fin n, Data.Cert w.project T ℓ →
+      k ≤ (w.nodes ℓ).pn.durable
+  /-- B2′: the writer-grant analog of `reachable_grant_report`. The writer
+  never reports (`sendReport` is follower-only), so its quorum slot needs its
+  own credential-comparison invariant — same shape as B2's good arm, with the
+  writer's own `k`-floor in place of a report's. -/
+  writer_grant : ∀ (ℓ c : Fin n) (u : Nat), Data.Cert w.project T ℓ →
+      ℓ ≠ c → T < u → Msg.vote ℓ c u true ∈ w.sent →
+      ∃ clt cd, Msg.requestVote c u clt cd ∈ w.sent ∧
+        (T < clt ∨ (clt = T ∧ k ≤ cd))
+
+/-- **The `becomeLeader` crux.** A quorate candidate at a term above `T`
+is already durable through `k`: its tally meets the commit quorum in some
+member `y`, and every way `y` can sit in that intersection forces the
+candidate's own frontier past `k`.
+
+- `y = c` and `y` is the writer — `writer_floor` directly;
+- `y = c` and `y` reported — **F3**: `reachable_report_era_floor` (B1)
+  directly, no grant event needed (a self-vote emits no message);
+- `y ≠ c` and `y` reported — `reachable_grant_report` (B2), whose escape arm
+  `Era` kills, instantiated at `RepQuorum`'s own `bT < k ≤ d` base witness;
+- `y ≠ c` and `y` is the writer — `writer_grant` (B2′).
+
+The last two both land on the same dichotomy, closed by `cand_frontier`:
+`clt = T` gives `k ≤ cd ≤ durable c` outright, and `T < clt` puts `c` itself
+past `T`, where `past_floor` applies.
+
+Scope honesty: this is the DURABLE-FLOOR half of the crux.
+`CommittedTermAtLeaders` additionally carries the attribution half
+(`termAt (termMap c) p = stamp`), which reads off canon's prefix agreement
+directly and is not part of this statement. -/
+theorem crux_become_leader {n : Nat} {w : World n} (hw : Reachable w)
+    {T k : Nat} (hrq : RepQuorum w T k) (hera : Era w T)
+    (hin : CruxInputs w T k)
+    (c : Fin n) (hrole : (w.nodes c).pn.role = .candidate)
+    (hquorum : n / 2 + 1 ≤ (w.nodes c).pn.votesReceived.card)
+    (hT : T < (w.nodes c).pn.currentTerm) :
+    k ≤ (w.nodes c).pn.durable := by
+  obtain ⟨h1T, ℓ, Q, bT, v0, hcert, hbTk, horig, hQcard, hQ⟩ := hrq
+  obtain ⟨y, hy⟩ := Uc2.quorum_intersect n (w.nodes c).pn.votesReceived Q
+    hquorum hQcard
+  rw [Finset.mem_inter] at hy
+  -- the shared dichotomy both grant routes land on
+  have hclose : ∀ clt cd : Nat,
+      Msg.requestVote c ((w.nodes c).pn.currentTerm) clt cd ∈ w.sent →
+      (T < clt ∨ (clt = T ∧ k ≤ cd)) → k ≤ (w.nodes c).pn.durable := by
+    intro clt cd hrv harm
+    obtain ⟨hfr, hdur⟩ := cand_frontier hw c ((w.nodes c).pn.currentTerm)
+      clt cd hrv hrole rfl hquorum
+    rcases harm with hlt | ⟨rfl, hkcd⟩
+    · exact hin.past_floor c (Nat.lt_of_lt_of_le hlt hfr)
+    · omega
+  rcases eq_or_ne y c with rfl | hyc
+  · -- the self-vote slot: no grant message exists, so route on `Q` alone
+    rcases hQ y hy.2 with rfl | ⟨d, hkd, hrp⟩
+    · exact hin.writer_floor y hcert
+    · exact le_trans hkd (reachable_report_era_floor hw y T d hrp h1T hera).1
+  · -- a real grant from `y`
+    have hvs := (Uc2.reachable_inv
+      (Data.reachable_project (reachable_project hw))).votes_sound c
+      (by rw [show (w.project.project.nodes c).role = Role.candidate from hrole]
+          decide) y hy.1
+    have hvote : Msg.vote y c ((w.nodes c).pn.currentTerm) true ∈ w.sent := by
+      rcases hvs with rfl | hv
+      · exact absurd rfl hyc
+      · exact hv
+    rcases hQ y hy.2 with rfl | ⟨d, hkd, hrp⟩
+    · obtain ⟨clt, cd, hrv, harm⟩ :=
+        hin.writer_grant y c ((w.nodes c).pn.currentTerm) hcert hyc hT hvote
+      exact hclose clt cd hrv harm
+    · obtain ⟨clt, cd, hrv, harm⟩ := reachable_grant_report hw y c
+        ((w.nodes c).pn.currentTerm) T d hyc hvote hrp hT h1T
+      rcases harm with ⟨u'', es, hu, hg⟩ | hgood
+      · exact absurd (hera u'' es hg) (by omega)
+      · exact hclose clt cd hrv
+          (by rcases hgood bT v0 horig (by omega) with h | ⟨h1, h2⟩
+              · exact .inl h
+              · exact .inr ⟨h1, by omega⟩)
+
+#print axioms crux_become_leader
+
 end Uc2.Cert
