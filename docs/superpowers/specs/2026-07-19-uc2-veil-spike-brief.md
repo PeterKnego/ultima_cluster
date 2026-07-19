@@ -1,9 +1,11 @@
 # UC v2 — Veil spike brief: bounded model-checking as a bug-hunting oracle for M7 reconfig + the election-time coherence window (NOT for closing the LC theorem)
 
-**Date:** 2026-07-19 (amended twice same day — first after the Tier B(b)
-*actuals* landed, then again after the **Tier B(b) closure arc** (LC1–LC4h,
-merge `aceb01e`) landed and materially retargeted this brief. The original
-draft pitched Veil as an invariant-discovery oracle for a *blocked
+**Date:** 2026-07-19 (amended three times same day — first after the Tier
+B(b) *actuals* landed; again after the **Tier B(b) closure arc** (LC1–LC4h,
+merge `aceb01e`) landed and materially retargeted this brief; and a third
+time (**Amendment 3**, controller review) to reorder the spike and harden
+its calibration — see the Amendment-3 block below and §3. The original draft
+pitched Veil as an invariant-discovery oracle for a *blocked
 `leader_completeness` theorem*; the closure arc changed what "blocked"
 means, and that framing is now wrong. See §2.)
 **Status:** RECOMMENDATION — not started. Dispatch brief for a future
@@ -20,6 +22,32 @@ consensus bugs the empirical stack structurally missed. **Explicitly NOT
 recommended:** using Veil to help close `leader_completeness` — the sole
 remaining obligation (canon) has no countermodel and needs a proof
 technique (joint induction), not a CTI. See §2.
+
+**Amendment 3 (controller review, 2026-07-19) — folded in below:** the §2
+retraction and the two hard guardrails are endorsed unchanged (they are the
+document's load-bearing calls). Four scope corrections were folded into §3–§4
+and the exit criteria, because as originally sequenced the spike led with its
+riskiest, deepest, most-likely-to-abstract-wrong half:
+  1. **Lead with M7, not the coherence window** — M7 is higher expected
+     value (no model to duplicate, shallow bugs in seconds) and lower
+     abstraction risk; the coherence-window hunt is the riskier *second*
+     half. §3 resequenced; §4's "any point after the port" downgraded.
+  2. **Must-pass calibration moves to the *shallowest* known bug (Finding
+     #5**, 1-node few-step boot-gate phantom). #6b/#9 rediscovery is a
+     *depth-probe / stretch*, NOT a gate: a bounded checker missing a deep
+     3-term Figure-8 interleaving is a statement about the bug's depth, not
+     the tool's fitness — so a #6b miss must NOT be read as "tool wrong,
+     M7 fails too" (the original exit logic's overreach, corrected below).
+  3. **Frame-provenance abstraction is promoted into an explicit Bar-2
+     obligation** — #9 is a which-bytes-land-where bug, so the relational
+     abstraction of frame content must be shown to *preserve the
+     stale-stream-vs-current-stream distinction* before the forward hunt,
+     or V2 is blind to the class it was calibrated on.
+  4. **Hard session-1 re-gate at "port + Bar-1"** — the "1–2 session"
+     anchor is optimistic for an unfamiliar toolchain + a three-plane
+     relational port; checkpoint and re-decide there rather than commit the
+     whole box to a hopeful V2. Plus: front-load the `veil-2.0-preview`
+     maturity check *before* the port, not mid-spike.
 
 ---
 
@@ -166,47 +194,81 @@ what's left is a proof-power gap, not a discovery gap.)
    Never on any `lake build` path, CI gate, or "proved" claim unless a
    deliberate later decision says so (see §4 CI note).
 
-## 3. The spike (1–2 sessions, time-boxed)
+## 3. The spike (time-boxed; session-1 re-gate is mandatory)
 
-- **V1 — package + port + CALIBRATE AGAINST KNOWN BUGS.** Create
-  `proofs-veil/` on Veil's toolchain. Port the current world — election
-  plane + B(b) commit plane + the LC1/LC1b frame plane (header term +
-  `dataTerm` lagging handle + `serveTail`), from `Protocol.lean`,
-  `ProtocolCommit.lean`, `ProtocolData.lean` (frame content relationally
-  abstracted). Then the sharp calibration, which the B(b) arc uniquely
-  makes possible:
+Resequenced per Amendment 3: M7 (the higher-value, lower-abstraction-risk
+target) comes BEFORE the coherence-window hunt (deeper bugs, riskier content
+abstraction). Session 1 ends at a hard re-gate.
+
+- **V0 — pre-flight maturity check (before any port).** Confirm the
+  explicit-state checker + CTI inference actually exist and run in a usable
+  state at the pinned Veil revision (`main` @ v4.24.0, or `veil-2.0-preview`
+  — re-check per §6). If the checker lives only in a preview branch that
+  doesn't build, that is the finding: write it up and exit before spending
+  a session on a port. Front-loaded deliberately — do not discover this
+  mid-spike.
+- **V1 — package + port + Bar 1.** Create `proofs-veil/` on Veil's
+  toolchain. Port the current world — election plane + B(b) commit plane +
+  the LC1/LC1b frame plane (header term + `dataTerm` lagging handle +
+  `serveTail`), from `Protocol.lean`, `ProtocolCommit.lean`,
+  `ProtocolData.lean` (frame content relationally abstracted — see V2's
+  abstraction obligation, which this port must be built to satisfy).
   - **Bar 1:** `#check_invariants` certifies the already-proved invariants
     (election `Inv`, B(a) `DInv`) inductive.
-  - **Bar 2 (the decisive one):** point the explicit-state checker at the
-    **pre-fix** model (revert the #6b commit clamp, or the #9
-    `current_term`-keyed reopen) and confirm it **rediscovers the known
-    countermodel** (Figure-8 old-term commit loss / cross-stream phantom
-    accept) within a small node/step bound.
-  Either bar failing → exit, cheap. A checker that can't reproduce a bug
-  we already have in hand will not find the next one.
-- **V2 — hunt forward on the current model.** With calibration passed, run
-  the checker on the *fixed* current model across 3–5 nodes, biased toward
-  the election-time coherence window (concurrent `startElection` /
-  `crashRestart` / gate-reopen / commit interleavings). Goal: a fifth
-  countermodel, or bounded evidence of its absence at depth. Any hit →
-  reconfirm in Rust, file a directed sim regression (the #5/#6b/#8/#9
-  workflow). This is the spike's headline deliverable.
+  - **Bar 2 (must-pass, retargeted): rediscover the SHALLOWEST known bug.**
+    Point the checker at the **pre-fix** model with the Finding-#5 boot gate
+    reverted (boot intake gate open over an unreconciled vote) and confirm
+    it rediscovers that phantom-commit at a **1-node, few-step** bound. This
+    is the true tool-fitness gate — a shallow, cheap trace the checker MUST
+    reach.
+  - **Bar 2b (abstraction obligation, also must-pass): the frame
+    abstraction preserves the #9 distinction.** #9 is a
+    which-bytes-land-where bug, so demonstrate — as a tiny directed check —
+    that the relational abstraction of frame content still distinguishes a
+    stale-handle-term stream byte from a current-term stream byte at the
+    same position. If the abstraction erases this, the coherence-window hunt
+    (V2) is blind to the class it targets; fix the abstraction or record it
+    as the reason the window hunt is out of scope.
+  **>>> SESSION-1 RE-GATE (mandatory).** Stop here. V0 + V1 + both must-pass
+  bars is a full session's honest budget for an unfamiliar toolchain and a
+  three-plane relational port. Re-decide before spending session 2: if V0
+  or either must-pass bar failed, that IS the spike's finding — write it up
+  and exit. Only a clean re-gate authorizes V-M7 / V2.
+- **V-M7 — the primary hunt (do this FIRST after the re-gate; see §4).**
+  Add the config-relation + one-at-a-time change steps and explicit-state
+  check election + commit safety across a config change on 3–5 nodes. Best
+  fit, no model to duplicate, shallow bugs surface in seconds. This is the
+  spike's primary deliverable.
+- **V2 — coherence-window forward hunt (second, riskier).** Only if Bar 2b
+  showed the abstraction preserves the #9 distinction: run the checker on
+  the *fixed* current model across 3–5 nodes, biased toward the
+  election-time window (concurrent `startElection` / `crashRestart` /
+  gate-reopen / commit interleavings). **Depth-probe (stretch, NOT a
+  gate):** how deep a bound is needed before the checker rediscovers #6b's
+  3-term Figure-8 / #9's cross-stream accept — this calibrates the forward
+  hunt's confidence and tells you whether "absence at depth N" means
+  anything. Goal: a fifth countermodel, or honest bounded-coverage
+  evidence. Any hit → reconfirm in Rust, file a directed sim regression (the
+  #5/#6b/#8/#9 workflow).
 - **V3 — report + go/no-go.** Gate-doc writeup
   (`docs/benchmarks/uc2-veil-spike-<date>.md`): port fidelity, both
-  calibration bars, any new countermodel, bound/depth reached, wall-clock
-  in S2-equivalents.
+  must-pass bars, the #6b/#9 depth-probe result, M7 findings, any new
+  window countermodel, bound/depth reached, wall-clock in S2-equivalents.
 
 **Exit criteria (decide honestly — the repo rewards findings over outcomes;
 the closure arc banked rather than force a proof, same discipline):**
 
 - **KEEP** (stand up a nightly Veil model-check job, extend to M7 §4) iff
-  BOTH calibration bars passed AND V2 either found a real interleaving or
-  gave credible bounded coverage of the window at a useful depth.
+  Bar 1 + both must-pass bars (2, 2b) passed AND at least one of {V-M7
+  surfaced/cleared a config-change scenario, V2 found a real interleaving or
+  gave credible bounded coverage} landed.
 - **DROP** iff the frame/commit-plane abstraction contorted against the
-  decidable fragment, or the checker couldn't rediscover a known bug (Bar
-  2). Dropping does NOT drop M7 (§4) if only the Tier-B/bug-hunt fit
-  failed and the reconfig fit is untried — but if Bar 1/2 failed outright,
-  the tool is wrong for this codebase and M7 likely fails too; note that.
+  decidable fragment (Bar 2b unfixable), or the checker couldn't rediscover
+  the **shallow** Finding-#5 bug (Bar 2). Only a Bar-1/Bar-2 failure
+  licenses "the tool is wrong for this codebase, M7 likely fails too" — a
+  *deep-bug* miss (the #6b/#9 depth-probe coming up empty at a tractable
+  bound) does NOT: it is expected state-explosion behaviour and says nothing
+  about M7's shallow-bug fit, which is judged on its own at V-M7.
 - **Do NOT** spend any of the box trying to help canon — see §2.
 
 ## 4. M7 reconfiguration — the primary standalone target
@@ -232,7 +294,11 @@ in the same election-time coherence window the four bugs came from and has
 - If it survives, a nightly job next to the `elle` tier is cheap — but per
   guardrail 3, adding it to CI is a deliberate follow-up, not part of the
   spike.
-- Timing: any point after V1's port exists; independent of everything else.
+- Timing (Amendment 3): M7 is the PRIMARY hunt and runs FIRST after the
+  session-1 re-gate (V-M7 in §3), before the riskier coherence-window V2 —
+  it needs only V1's port + Bar-1, not Bar-2b's frame-abstraction result
+  (config/quorum reasoning is relational, not byte-content), so it is the
+  cleanest place to spend the tool's first real forward run.
 
 ## 5. What NOT to do
 
