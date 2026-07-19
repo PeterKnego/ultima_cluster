@@ -471,11 +471,18 @@ inductive Step {n : Nat} : World n → World n → Prop
   accepts a cross-stream old-stamped byte its map never attributed
   (acked-write-loss, §5.4.2 / #6b family; the deleted
   `finding_candidate_gate_reopen_fca_violation` was the n=5 countermodel).
-  Mirrored as: `reconciled` becomes `true` only when the post-step regime is
-  handle-aligned — on a strict adoption (`currentTerm < t`) `BecomeFollower`
-  re-keyed the handle to `t`, so it aligns; otherwise it reopens iff the
-  (unchanged) `dataTerm` already equals `currentTerm` (a follower, never a
-  lagged candidate). -/
+  Mirrored MONOTONELY (LC2b F1 fix): Rust's clean arm only ever REOPENS (it
+  requires `awaiting_reconcile` latched; nothing on the clean-map path CLOSES
+  the gate — that happens only at strict adoption `BecomeFollower` and at
+  `Truncate` emission). The first LC2-fix mirror `reconciled := decide(dataTerm
+  = currentTerm)` wrongly CLOSED a carried-open lagged candidate's gate on a
+  clean non-adopt map — an under-approximation dropping Rust's post-map
+  carried-open accepts from the reachable set. Repaired: on a strict adoption
+  (`currentTerm < t`) `BecomeFollower` re-keyed the handle to `t`, so the
+  regime aligns and the gate ends OPEN; otherwise the gate STAYS as it was and
+  additionally REOPENS iff the (unchanged) `dataTerm` already equals
+  `currentTerm` (a follower — never a lagged candidate). `reconciled ||
+  decide(...)` is reopen-only (never closes). -/
   | deliverTermMap (w : World n) (j : Fin n) (t : Nat) (entries : TermMap)
       (hmsg : Uc2.Data.Frame.gossip t entries ∈ w.dsent)
       (hterm : (w.nodes j).pn.currentTerm ≤ t) :
@@ -485,7 +492,8 @@ inductive Step {n : Nat} : World n → World n → Prop
               dn := (w.nodes j).dn.applyGossip t entries
               reconciled :=
                 if (w.nodes j).pn.currentTerm < t then true
-                else decide ((w.nodes j).dn.dataTerm = (w.nodes j).pn.currentTerm) }
+                else (w.nodes j).reconciled ||
+                  decide ((w.nodes j).dn.dataTerm = (w.nodes j).pn.currentTerm) }
           sent := w.sent
           dsent := w.dsent
           csent := w.csent

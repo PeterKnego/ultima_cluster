@@ -1524,6 +1524,12 @@ fn finding9_lagged_handle_candidate_reopen_needs_handle_keyed() {
     let (mut w, f, ct) =
         drive_to_candidate_lagged(7, true).expect("reach the lagged-handle candidate (green)");
     assert!(!w.node_intake_gate(f), "precondition: candidate's gate is closed");
+    assert!(
+        w.node_adopted_term(f) < w.node_term(f),
+        "precondition: the handle ({}) lags current_term ({})",
+        w.node_adopted_term(f),
+        w.node_term(f)
+    );
     let map = w.node_map(f);
     let from = (0..3).find(|&i| i != f).unwrap();
     w.inject_term_map(from, f, ct, map.clone()).expect("clean reconcile (green)");
@@ -1538,4 +1544,45 @@ fn finding9_lagged_handle_candidate_reopen_needs_handle_keyed() {
         .run_until(|w| w.current_leader().is_some() && !w.node_is_candidate(f) && w.node_intake_gate(f))
         .expect("run");
     assert!(converged, "GREEN liveness: the candidate must converge once unpartitioned");
+}
+
+/// Finding #9 — F2 twin for the SEPARATE truncating-ack reopen arm
+/// (`on_truncated`/`on_truncated_feedback`), a distinct expression at a distinct
+/// site from the clean-reconcile arm. A lagged-handle candidate whose reconcile
+/// TRUNCATES (a divergent map) must not reopen its stale handle-stream intake
+/// when the archive ack lands. Same reachable candidate as the clean twin;
+/// inject a DIVERGENT co-term map (`[(1,0),(3,1344)]` vs f's `[(1,0),(2,1344)]`
+/// — truncates at base 1344), then let the truncation ack process.
+///   - RED (`handle_keyed:false`): the ack REOPENS the candidate's gate (bug).
+///   - GREEN (`handle_keyed:true`): the ack leaves it CLOSED.
+#[test]
+fn finding9_truncating_arm_reopen_needs_handle_keyed() {
+    for (handle_keyed, expect_open) in [(false, true), (true, false)] {
+        let (mut w, f, ct) = drive_to_candidate_lagged(7, handle_keyed)
+            .expect("reach the lagged-handle candidate");
+        assert!(!w.node_intake_gate(f), "precondition: candidate's gate is closed");
+        assert!(
+            w.node_adopted_term(f) < w.node_term(f),
+            "precondition: the handle ({}) lags current_term ({})",
+            w.node_adopted_term(f),
+            w.node_term(f)
+        );
+        let from = (0..3).find(|&i| i != f).unwrap();
+        // A divergent co-term map: term 3 opened at base 1344 where f holds term
+        // 2 -> reconcile truncates at 1344 (produces Action::Truncate).
+        let truncs_before = w.truncations();
+        w.inject_term_map(from, f, ct, vec![(1, 0), (2, 1344), (4, 2800)]).expect("divergent reconcile");
+        // Let the archive truncation ack land (on_truncated_feedback runs the
+        // truncating-arm reopen check).
+        w.run_steps(50).expect("process the truncation ack");
+        assert!(
+            w.truncations() > truncs_before,
+            "the divergent map must actually truncate (arm precondition)"
+        );
+        assert_eq!(
+            w.node_intake_gate(f),
+            expect_open,
+            "truncating-arm reopen: handle_keyed={handle_keyed} expected gate open={expect_open}"
+        );
+    }
 }

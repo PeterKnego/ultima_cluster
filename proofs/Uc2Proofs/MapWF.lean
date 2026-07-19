@@ -1193,6 +1193,172 @@ theorem reachable_leader_dataTerm {n : Nat} {w : World n} (hw : Reachable w) :
 
 #print axioms reachable_leader_dataTerm
 
+/-! ### `lastTermOf (map j) ≤ dataTerm j` (LC2b — MapDataBound)
+
+A clean, self-contained bound the FCA endgame (and LC3) consume: a node's
+term map never names a term above its data-plane handle. Terms enter the
+map only via `observeTerm` (a stamp `≤ hdr = dataTerm`, `StampInv.frame_le`
++ the delivery guard) or `prunePush`/`crashRestart` (both at
+`currentTerm = dataTerm`); `deliverTermMap` only ever SHRINKS the map (a
+prefix of the old, or a wipe), so the last term cannot rise above the
+(monotone) handle. -/
+
+/-- `lastTermOf` of an ascending map's prefix never exceeds the whole map's
+last term. -/
+private theorem lastTermOf_take_le {m : TermMap} (hwf : TermMap.Ascending m)
+    (k : Nat) : lastTermOf (m.take k) ≤ lastTermOf m := by
+  cases hlt : (m.take k).getLast? with
+  | none => simp [lastTermOf, hlt]
+  | some e =>
+    have hem : e ∈ m := List.mem_of_mem_take (List.mem_of_getLast? hlt)
+    cases hlm : m.getLast? with
+    | none =>
+      rw [List.getLast?_eq_none_iff] at hlm; subst hlm; cases hem
+    | some l =>
+      rw [lastTermOf_getLast hlt, lastTermOf_getLast hlm]
+      rcases List.mem_iff_getElem.mp hem with ⟨idx, hidx, rfl⟩
+      have hlpos : 0 < m.length := by omega
+      have hlast : l = m[m.length - 1] := by
+        have : m.getLast? = some m[m.length - 1] := by
+          rw [List.getLast?_eq_getElem?]
+          exact List.getElem?_eq_getElem (by omega)
+        rw [hlm, Option.some.injEq] at this; exact this
+      have hlge : m[m.length - 1]? = some m[m.length - 1] :=
+        List.getElem?_eq_getElem (by omega)
+      by_cases hi : idx = m.length - 1
+      · subst hi; rw [hlast]
+      · have hmem2 : m[idx] ∈ m.take (m.length - 1) := by
+          rw [List.mem_iff_getElem]
+          exact ⟨idx, by rw [List.length_take]; omega,
+            by rw [List.getElem_take]⟩
+        have := hwf.take_term_lt hlge m[idx] hmem2
+        rw [hlast]; omega
+
+/-- A node's map term never exceeds its data-plane handle. -/
+def MapLeDataTerm {n : Nat} (w : World n) : Prop :=
+  ∀ j : Fin n, lastTermOf (w.nodes j).termMap ≤ (w.nodes j).dataTerm
+
+private theorem mldt_init (n : Nat) : MapLeDataTerm (World.init n) := by
+  intro j; simp [World.init, lastTermOf]
+
+private theorem lastTermOf_prunePush' (m : TermMap) (t d : Nat) :
+    lastTermOf (prunePush m t d) = t := by
+  show lastTermOf ((m.reverse.dropWhile (fun e => e.2 == d)).reverse ++ [(t, d)])
+    = t
+  rw [lastTermOf, getLast?_append_singleton]; rfl
+
+private theorem lastTermOf_observeTerm (m : TermMap) (t pos : Nat) :
+    lastTermOf (observeTerm m t pos) = max (lastTermOf m) t := by
+  unfold observeTerm
+  by_cases h : lastTermOf m < t
+  · rw [if_pos h, lastTermOf, List.getLast?_concat]
+    simp only [Option.map_some, Option.getD_some]
+    omega
+  · rw [if_neg h]; omega
+
+private theorem mldt_step {n : Nat} {w w' : World n} (hw : Reachable w)
+    (h : MapLeDataTerm w) (hs : Step w w') : MapLeDataTerm w' := by
+  have hstamp := reachable_stamp hw
+  have hwf := fun j => ((reachable_mapInv hw).node j).asc
+  cases hs with
+  | startElection i hrole =>
+    intro k; rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self]; exact h k
+    · simp only [Function.update_of_ne hne]; exact h k
+  | deliverRequestVote j c nt clt cd hmsg hterm =>
+    intro k; rcases eq_or_ne k j with rfl | hne
+    · simp only [Function.update_self]
+      by_cases hadopt : (w.nodes k).pn.currentTerm < nt
+      · rw [if_pos hadopt]
+        have := h k; have := hstamp.data_le k; omega
+      · rw [if_neg hadopt]; exact h k
+    · simp only [Function.update_of_ne hne]; exact h k
+  | rejectStaleRequestVote j c nt clt cd hmsg hstale => intro k; exact h k
+  | deliverVote i v t hmsg hrole hterm =>
+    intro k; rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self]; exact h k
+    · simp only [Function.update_of_ne hne]; exact h k
+  | deliverVoteHigherTerm i v t g hmsg hterm =>
+    intro k; rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self]
+      exact Nat.le_trans (h k) (Nat.le_trans (hstamp.data_le k) (Nat.le_of_lt hterm))
+    · simp only [Function.update_of_ne hne]; exact h k
+  | becomeLeader i hrole hquorum =>
+    intro k; rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self]
+      rw [lastTermOf_prunePush']
+    · simp only [Function.update_of_ne hne]; exact h k
+  | crashRestart i =>
+    intro k; rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self]
+      -- recovered currentTerm ≥ map last term; dataTerm := currentTerm
+      have hrec : lastTermOf (w.nodes k).termMap ≤ (w.nodes k).pn.currentTerm :=
+        Nat.le_trans (h k) (hstamp.data_le k)
+      exact hrec
+    · simp only [Function.update_of_ne hne]; exact h k
+  | leaderAppend i v hrole =>
+    intro k; rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self]; exact h k
+    · simp only [Function.update_of_ne hne]; exact h k
+  | deliverReplicate j pos hdr t v hmsg hpos hhdr =>
+    intro k; rcases eq_or_ne k j with rfl | hne
+    · simp only [Function.update_self]
+      obtain ⟨hm, _, _, _, _, hdt⟩ := recvReplicate_fields (w.nodes k) pos t v
+      rw [hm, hdt, lastTermOf_observeTerm]
+      have h1 := hstamp.frame_le pos hdr t v hmsg
+      refine max_le (h k) ?_
+      rw [hhdr] at h1; exact h1
+    · simp only [Function.update_of_ne hne]; exact h k
+  | serveTail i p t v hrole hhist hp => intro k; exact h k
+  | shipTermMap i hrole => intro k; exact h k
+  | deliverTermMap j t entries hmsg hterm =>
+    intro k; rcases eq_or_ne k j with rfl | hne
+    · simp only [Function.update_self]
+      cases hrec : reconcile (w.nodes k).termMap (w.nodes k).pn.durable
+          entries with
+      | noCommonPrefix =>
+        obtain ⟨hm, _, _, _, _, _⟩ := applyGossip_ncp (w.nodes k) t hrec
+        rw [hm]; simp [lastTermOf]
+      | ok o =>
+        obtain ⟨hm, _, _, _, _, hdt⟩ := applyGossip_ok (w.nodes k) t hrec
+        rw [hm, hdt]
+        cases entries with
+        | nil =>
+          rw [show reconcile (w.nodes k).termMap (w.nodes k).pn.durable []
+              = ReconcileResult.ok ⟨(w.nodes k).pn.durable,
+                (w.nodes k).termMap⟩ from rfl] at hrec
+          injection hrec with hrec'; subst hrec'
+          by_cases hadopt : (w.nodes k).pn.currentTerm < t
+          · rw [if_pos hadopt]
+            exact Nat.le_trans (h k) (Nat.le_trans (hstamp.data_le k)
+              (Nat.le_of_lt hadopt))
+          · rw [if_neg hadopt]; exact h k
+        | cons l0 ls =>
+          have hmap : o.newMap = (w.nodes k).termMap.take
+              (commonPrefixLen (w.nodes k).termMap (l0 :: ls)) :=
+            reconcile_ok_newMap_take (hwf k) hrec
+          rw [hmap]
+          have hshrink := lastTermOf_take_le (hwf k)
+            (commonPrefixLen (w.nodes k).termMap (l0 :: ls))
+          by_cases hadopt : (w.nodes k).pn.currentTerm < t
+          · rw [if_pos hadopt]
+            exact Nat.le_trans hshrink (Nat.le_trans (h k)
+              (Nat.le_trans (hstamp.data_le k) (Nat.le_of_lt hadopt)))
+          · rw [if_neg hadopt]; exact Nat.le_trans hshrink (h k)
+    · simp only [Function.update_of_ne hne]; exact h k
+
+/-- **`lastTermOf (map j) ≤ dataTerm j`** in every reachable world (LC2b) —
+the FCA/LC3-consumable handle bound. -/
+theorem reachable_map_le_dataTerm {n : Nat} {w : World n} (hw : Reachable w) :
+    MapLeDataTerm w := by
+  have h : Relation.ReflTransGen Step (World.init n) w := hw
+  clear hw
+  induction h with
+  | refl => exact mldt_init n
+  | tail hsteps hstep ih => exact mldt_step hsteps ih hstep
+
+#print axioms reachable_map_le_dataTerm
+
 end Data
 
 namespace Cert
