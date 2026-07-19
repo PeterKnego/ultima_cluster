@@ -850,4 +850,219 @@ theorem crux_become_leader {n : Nat} {w : World n} (hw : Reachable w)
 
 #print axioms crux_become_leader
 
+/-! ## F-6 — reports are stamped with `currentTerm`, not `dataTerm`
+
+`sendReport` (`ProtocolCommit.lean` L516–525) emits
+`report j (w.nodes j).pn.currentTerm (w.nodes j).pn.durable` — the datagram's
+`leadership_term_id`, i.e. the node-level term handle, NOT the data plane's
+`dataTerm`. Combined with `currentTerm` monotonicity this **totally orders**
+every `T`-report before every above-`T` grant by the same node: the report
+was emitted while `y.currentTerm = T`, and `y` can only grant at `u > T`
+after adopting `u`, which is strictly later.
+
+This is the pivot of canon's three birth base cases, so it lands as its own
+machine-checked lemma rather than a docstring (the LC4f report's own
+recommendation, and this arc's rule that prose is not evidence). -/
+
+/-- `recvRequestVote` never lowers the term: it either adopts strictly
+upward or leaves `currentTerm` alone, and every grant/reject arm returns a
+node differing only in `votedFor`. -/
+private theorem recvRequestVote_currentTerm_le {n : Nat} (s : PNode n)
+    (c : Fin n) (nt clt cd : Nat) :
+    s.currentTerm ≤ (s.recvRequestVote c nt clt cd).1.currentTerm := by
+  unfold PNode.recvRequestVote
+  by_cases h : s.currentTerm < nt
+  · -- adopted strictly upward: `votedFor` is cleared, so the fresh-grant arm
+    simp only [h, if_true, PNode.adoptTerm]
+    unfold PNode.recvRequestVote.grantIfFresh
+    split <;> simp <;> omega
+  · -- no adoption: every arm returns `s` up to `votedFor`
+    simp only [h, if_false]
+    split
+    · split
+      · split <;> simp
+      · unfold PNode.recvRequestVote.grantIfFresh
+        split <;> simp
+    · unfold PNode.recvRequestVote.grantIfFresh
+      split <;> simp
+
+/-- `applyGossip` adopts a strictly-higher gossip term and otherwise leaves
+`currentTerm` alone — on both the `.ok` and the `.noCommonPrefix` arm. -/
+private theorem applyGossip_currentTerm_le {n : Nat} (d : Data.Node n)
+    (t : Nat) (entries : TermMap) :
+    d.pn.currentTerm ≤ (d.applyGossip t entries).pn.currentTerm := by
+  unfold Data.Node.applyGossip
+  split <;>
+  · dsimp only
+    split <;> simp [PNode.adoptTerm] <;> omega
+
+/-- **`currentTerm` is monotone across every step.** The term handle rises at
+`startElection` (self-bump), at `deliverRequestVote`/`deliverTermMap` (adopt
+upward) and at `deliverVoteHigherTerm` (strict adoption); the remaining
+eleven constructors leave it fixed. -/
+theorem step_currentTerm_mono {n : Nat} {w w' : World n} (hs : Step w w')
+    (j : Fin n) :
+    (w.nodes j).pn.currentTerm ≤ (w'.nodes j).pn.currentTerm := by
+  cases hs with
+  | rejectStaleRequestVote i c nt clt cd hmsg hstale => exact le_refl _
+  | serveTail i p t v hrole hhist hp => exact le_refl _
+  | shipTermMap i hrole => exact le_refl _
+  | sendReport i hrole hgate => exact le_refl _
+  | startElection i hrole =>
+    rcases eq_or_ne j i with rfl | hne
+    · simp [Node.pn, Function.update_self]
+    · simp [Node.pn, Function.update_of_ne hne]
+  | deliverRequestVote i c nt clt cd hmsg hterm =>
+    rcases eq_or_ne j i with rfl | hne
+    · simpa [Node.pn, Function.update_self] using
+        recvRequestVote_currentTerm_le (w.nodes j).pn c nt clt cd
+    · simp [Node.pn, Function.update_of_ne hne]
+  | deliverVote i v t hmsg hrole hterm =>
+    rcases eq_or_ne j i with rfl | hne
+    · simp [Node.pn, Function.update_self]
+    · simp [Node.pn, Function.update_of_ne hne]
+  | deliverVoteHigherTerm i v t g hmsg hterm =>
+    rcases eq_or_ne j i with rfl | hne
+    · simp only [Node.pn] at hterm ⊢
+      simp [Function.update_self, PNode.adoptTerm]
+      omega
+    · simp [Node.pn, Function.update_of_ne hne]
+  | becomeLeader i hrole hquorum =>
+    rcases eq_or_ne j i with rfl | hne
+    · simp [Node.pn, Function.update_self]
+    · simp [Node.pn, Function.update_of_ne hne]
+  | crashRestart i =>
+    rcases eq_or_ne j i with rfl | hne
+    · simp [Node.pn, Function.update_self]
+    · simp [Node.pn, Function.update_of_ne hne]
+  | leaderAppend i v hrole =>
+    rcases eq_or_ne j i with rfl | hne
+    · simp [Node.pn, Function.update_self]
+    · simp [Node.pn, Function.update_of_ne hne]
+  | deliverReplicate i pos hdr t v hmsg hpos hhdr hgate =>
+    rcases eq_or_ne j i with rfl | hne
+    · simp [Node.pn, Function.update_self, Data.Node.recvReplicate]
+    · simp [Node.pn, Function.update_of_ne hne]
+  | deliverTermMap i t entries hmsg hterm =>
+    rcases eq_or_ne j i with rfl | hne
+    · simpa [Node.pn, Function.update_self] using
+        applyGossip_currentTerm_le (w.nodes j).dn t entries
+    · simp [Node.pn, Function.update_of_ne hne]
+  | deliverReport i src t d hmsg hrole hterm hsrc =>
+    rcases eq_or_ne j i with rfl | hne
+    · simp [Node.pn, Function.update_self]
+    · simp [Node.pn, Function.update_of_ne hne]
+  | leaderAdvanceCommit i k hrole hbase hadv =>
+    rcases eq_or_ne j i with rfl | hne
+    · simp [Node.pn, Function.update_self]
+    · simp [Node.pn, Function.update_of_ne hne]
+
+#print axioms step_currentTerm_mono
+
+/-- **F-6, the stamping fact.** `sendReport` is the ONLY constructor that
+appends to `csent`, and it stamps the datagram with the emitter's
+`pn.currentTerm` and `pn.durable` — not with `dataTerm`. So a report that is
+new at a step pins its emitter's term handle, durable, role and gate in the
+PRE-state of that step. -/
+theorem step_report_new {n : Nat} {w w' : World n} (hs : Step w w')
+    {y : Fin n} {T d : Nat}
+    (hnew : CMsg.report y T d ∈ w'.csent)
+    (hold : CMsg.report y T d ∉ w.csent) :
+    T = (w.nodes y).pn.currentTerm ∧ d = (w.nodes y).pn.durable ∧
+      (w.nodes y).pn.role = .follower ∧ (w.nodes y).reconciled = true := by
+  cases hs with
+  | sendReport i hrole hgate =>
+    rcases List.mem_append.mp hnew with h | h
+    · exact absurd h hold
+    · rw [List.mem_singleton] at h
+      injection h with h1 h2 h3
+      subst h1; subst h2; subst h3
+      exact ⟨rfl, rfl, hrole, hgate⟩
+  | _ => exact absurd hnew hold
+
+#print axioms step_report_new
+
+/-- A report never outruns its emitter's term handle. -/
+def ReportStamp {n : Nat} (w : World n) : Prop :=
+  ∀ (y : Fin n) (T d : Nat), CMsg.report y T d ∈ w.csent →
+    T ≤ (w.nodes y).pn.currentTerm
+
+private theorem rs_step {n : Nat} {w w' : World n} (h : ReportStamp w)
+    (hs : Step w w') : ReportStamp w' := by
+  intro y T d hm
+  by_cases hold : CMsg.report y T d ∈ w.csent
+  · exact le_trans (h y T d hold) (step_currentTerm_mono hs y)
+  · rw [(step_report_new hs hm hold).1]
+    exact step_currentTerm_mono hs y
+
+/-- **F-6.** Every `T`-report on the commit wire was stamped at its emitter's
+own `currentTerm`, which since then can only have risen. -/
+theorem reachable_report_stamp {n : Nat} {w : World n} (hw : Reachable w) :
+    ReportStamp w := by
+  induction hw with
+  | refl => intro y T d hm; simp [World.init] at hm
+  | tail _ hstep ih => exact rs_step ih hstep
+
+#print axioms reachable_report_stamp
+
+/-- **F-6's ordering corollary — the birth-case pivot.** At the step that
+emits a `T`-report, the emitter's term handle is exactly `T`, so it sits
+strictly below every `u > T`. Since `currentTerm` is monotone and a node can
+only grant a vote at `u` once its handle has reached `u`, **every `T`-report
+by `y` strictly precedes every above-`T` grant by `y`** — the interleaving
+(report-after-grant) that would have been an acked-write-loss in the #6b
+family is foreclosed structurally, by the stamping discipline alone. -/
+theorem report_before_grant {n : Nat} {w w' : World n} (hs : Step w w')
+    {y : Fin n} {T d u : Nat}
+    (hnew : CMsg.report y T d ∈ w'.csent)
+    (hold : CMsg.report y T d ∉ w.csent) (hu : T < u) :
+    (w.nodes y).pn.currentTerm < u := by
+  rw [← (step_report_new hs hnew hold).1]; exact hu
+
+#print axioms report_before_grant
+
+/-! ## The `past_floor` / (P0) layering probe — DECIDED, with a witness
+
+The LC4f report left one structural question open: `CruxInputs.past_floor`
+"may not belong to canon at all — it is close to CTL's own conclusion and
+may be better carried as CTL's induction hypothesis". Settled here by
+binder analysis plus a machine-checked witness, not by prose.
+
+**`past_floor` STAYS IN CANON.** The two statements are keyed on different
+binders, and no implication bridges them:
+
+- `CommittedTermAtLeaders` concludes about node `i` only under
+  `(w.nodes i).pn.role = .leader`;
+- `past_floor` quantifies over EVERY node `j` with
+  `T < lastTermOf (termMap j)`, most of which are followers.
+
+For CTL to supply `past_floor` one would need
+`T < lastTermOf (termMap j) → (w.nodes j).pn.role = .leader`. That is false,
+and `crashRestart` is the witness: it sets `role := .follower` while leaving
+`dn.termMap` **untouched**, so any node whose frontier is past `T` can be a
+follower in the very next world. `past_floor` is therefore exactly the
+durable half of canon's (P1), and CTL's leader-keyed conclusion cannot reach
+its `j`.
+
+**(P0) is OUT of canon** — for the dual reason, and it was never in: (P0)
+(`termAt C p' = stamp'` for term-`T` committed entries below `k`) is
+literally the attribution conjunct of `CommittedTermAtLeaders`' own
+conclusion, restricted to the canonical prefix. It also mentions
+`w.committed`, and keeping the commit plane out of canon's statement is
+precisely why LC4f rejected re-keying canon on `w.committed`. (P0) is CTL's
+obligation and stays with LC4i, as the LC4e report already scoped it. -/
+
+/-- **The `past_floor` probe witness.** `crashRestart` demotes a node to
+follower while preserving its term map verbatim — so a map frontier past `T`
+carries NO role information, and a leader-keyed invariant (CTL) can never
+discharge an all-nodes frontier-keyed floor (`past_floor`). -/
+theorem crashRestart_demotes_keeping_map {n : Nat} (w : World n) (i : Fin n) :
+    ∃ w' : World n, Step w w' ∧
+      (w'.nodes i).dn.termMap = (w.nodes i).dn.termMap ∧
+      (w'.nodes i).pn.role = .follower :=
+  ⟨_, Step.crashRestart w i, by simp [Function.update_self],
+    by simp [Node.pn, Function.update_self]⟩
+
+#print axioms crashRestart_demotes_keeping_map
+
 end Uc2.Cert
