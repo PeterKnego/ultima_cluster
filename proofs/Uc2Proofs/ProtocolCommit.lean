@@ -139,7 +139,7 @@ designer calls documented inline):
    only shrinks the reachable set (scope note for the re-gate); (c)
    candidate reports: Rust's node-level `term_handle` moves only on
    `Become{Leader,Follower}` (`Action::StartElection` touches neither term
-   handle nor gate, `node.rs` 2418–2428), so a candidate's reports carry
+   handle nor gate, `node.rs` 2440–2450), so a candidate's reports carry
    its PRE-BUMP term — deliverable only to the previous-term leader,
    equivalent to having reported before candidacy. `sendReport` is
    follower-only; the model has one term per node, so allowing candidates
@@ -199,6 +199,9 @@ def Node.pn {n : Nat} (c : Node n) : PNode n := c.dn.pn
 /-- Data-plane history sugar (position ↦ (term-stamp, payload)). -/
 def Node.hist {n : Nat} (c : Node n) : Nat → Option (Nat × Nat) := c.dn.hist
 
+/-- Data-plane term-handle sugar (LC1b — `node.rs` `term_handle`). -/
+def Node.dataTerm {n : Nat} (c : Node n) : Nat := c.dn.dataTerm
+
 /-- The commit wire: the AppendPosition datagram (`receiver.rs` 1062–1073,
 `DGRAM_KIND_APPEND_POSITION`; consumed as `Event::Report { from, term,
 durable }`, `election.rs` 545–573). Term-scoped: the header's
@@ -225,7 +228,7 @@ def World.init (n : Nat) : World n :=
   { nodes := fun _ =>
       { dn := { pn := { currentTerm := 0, votedFor := none, role := .follower,
                         votesReceived := ∅, lastTerm := 0, durable := 0 },
-                termMap := [], hist := fun _ => none }
+                termMap := [], hist := fun _ => none, dataTerm := 0 }
         tracker := CommitTracker.new (n - 1) n
         commitIdx := 0
         reconciled := true }
@@ -250,7 +253,7 @@ defer to `Uc2Proofs/ProtocolData.lean`'s originals and name only the
 commit-relevant Rust delta. -/
 inductive Step {n : Nat} : World n → World n → Prop
   /-- `Data.Step.startElection`. Commit delta: NONE — `Action::StartElection`
-  touches neither the term handle nor the gate (`node.rs` 2418–2428); the
+  touches neither the term handle nor the gate (`node.rs` 2440–2450); the
   candidate's tracker is untouched until `become_leader`. -/
   | startElection (w : World n) (i : Fin n)
       (hrole : (w.nodes i).pn.role ≠ .leader) :
@@ -281,8 +284,13 @@ inductive Step {n : Nat} : World n → World n → Prop
       Step w
         { nodes := Function.update w.nodes j
             { w.nodes j with
-              dn := { (w.nodes j).dn with pn :=
-                ((w.nodes j).pn.recvRequestVote c newTerm cLastTerm cDurable).1 }
+              dn := { (w.nodes j).dn with
+                pn :=
+                  ((w.nodes j).pn.recvRequestVote c newTerm cLastTerm
+                    cDurable).1
+                dataTerm :=
+                  if (w.nodes j).pn.currentTerm < newTerm then newTerm
+                  else (w.nodes j).dn.dataTerm }
               reconciled :=
                 if (w.nodes j).pn.currentTerm < newTerm then false
                 else (w.nodes j).reconciled }
@@ -327,7 +335,9 @@ inductive Step {n : Nat} : World n → World n → Prop
       Step w
         { nodes := Function.update w.nodes i
             { w.nodes i with
-              dn := { (w.nodes i).dn with pn := (w.nodes i).pn.adoptTerm t }
+              dn := { (w.nodes i).dn with
+                pn := (w.nodes i).pn.adoptTerm t
+                dataTerm := t }
               reconciled := false }
           sent := w.sent
           dsent := w.dsent
@@ -349,7 +359,8 @@ inductive Step {n : Nat} : World n → World n → Prop
                         lastTerm := (w.nodes i).pn.currentTerm }
                       termMap := Uc2.Data.prunePush (w.nodes i).dn.termMap
                         (w.nodes i).pn.currentTerm (w.nodes i).pn.durable
-                      hist := (w.nodes i).dn.hist }
+                      hist := (w.nodes i).dn.hist
+                      dataTerm := (w.nodes i).pn.currentTerm }
               tracker := (w.nodes i).tracker.resetReports
               commitIdx := (w.nodes i).commitIdx
               reconciled := true }
@@ -371,8 +382,10 @@ inductive Step {n : Nat} : World n → World n → Prop
   | crashRestart (w : World n) (i : Fin n) :
       Step w
         { nodes := Function.update w.nodes i
-            { dn := { (w.nodes i).dn with pn :=
-                { (w.nodes i).pn with role := .follower, votesReceived := ∅ } }
+            { dn := { (w.nodes i).dn with
+                pn :=
+                  { (w.nodes i).pn with role := .follower, votesReceived := ∅ }
+                dataTerm := (w.nodes i).pn.currentTerm }
               tracker := CommitTracker.new (n - 1) n
               commitIdx := (w.nodes i).commitIdx
               reconciled := decide ((w.nodes i).pn.currentTerm ≤
@@ -393,26 +406,45 @@ inductive Step {n : Nat} : World n → World n → Prop
                 termMap := (w.nodes i).dn.termMap
                 hist := Function.update (w.nodes i).dn.hist
                   (w.nodes i).pn.durable
-                  (some ((w.nodes i).pn.currentTerm, v)) } }
+                  (some ((w.nodes i).pn.currentTerm, v))
+                dataTerm := (w.nodes i).dn.dataTerm } }
           sent := w.sent
           dsent := w.dsent ++
-            [.replicate (w.nodes i).pn.durable (w.nodes i).pn.currentTerm v]
+            [.replicate (w.nodes i).pn.durable (w.nodes i).pn.currentTerm
+              (w.nodes i).pn.currentTerm v]
           csent := w.csent
           committed := w.committed }
   /-- `Data.Step.deliverReplicate` + the intake gate on the DATA arm: a
   closed gate DROPS inbound data (`receiver.rs` 659–665 `dropped_gated`) —
   reconcile-before-data, the ordering `become_leader`'s phantom-prune NOTE
-  leans on. Enabling-only strengthening of the data model's step. -/
-  | deliverReplicate (w : World n) (j : Fin n) (pos t v : Nat)
-      (hmsg : Uc2.Data.Frame.replicate pos t v ∈ w.dsent)
+  leans on. Enabling-only strengthening of the data model's step (which
+  post-LC1 carries the exact wire-header match `hhdr`,
+  `receiver.rs:636-639` `dropped_stale_term`). -/
+  | deliverReplicate (w : World n) (j : Fin n) (pos hdr t v : Nat)
+      (hmsg : Uc2.Data.Frame.replicate pos hdr t v ∈ w.dsent)
       (hpos : pos = (w.nodes j).pn.durable)
-      (hstamp : t ≤ (w.nodes j).pn.currentTerm)
+      (hhdr : hdr = (w.nodes j).dataTerm)
       (hgate : (w.nodes j).reconciled = true) :
       Step w
         { nodes := Function.update w.nodes j
             { w.nodes j with dn := (w.nodes j).dn.recvReplicate pos t v }
           sent := w.sent
           dsent := w.dsent
+          csent := w.csent
+          committed := w.committed }
+  /-- `Data.Step.serveTail` (LC1): a leader re-ships a held byte under its
+  CURRENT term as wire header, original stamp kept — the NAK-repair /
+  deep-NAK / journal-replay catch-up path. Commit delta: NONE (the sender
+  agent's retransmit path touches no consensus state). -/
+  | serveTail (w : World n) (i : Fin n) (p t v : Nat)
+      (hrole : (w.nodes i).pn.role = .leader)
+      (hhist : (w.nodes i).hist p = some (t, v))
+      (hp : p < (w.nodes i).pn.durable) :
+      Step w
+        { nodes := w.nodes
+          sent := w.sent
+          dsent := w.dsent ++
+            [.replicate p (w.nodes i).pn.currentTerm t v]
           csent := w.csent
           committed := w.committed }
   /-- `Data.Step.shipTermMap` — no state, no commit delta. -/
@@ -428,8 +460,36 @@ inductive Step {n : Nat} : World n → World n → Prop
   /-- `Data.Step.deliverTermMap`. Commit delta: reconciliation for the
   (possibly just-adopted) term completes atomically with the truncation
   pipeline (LA1 module doc, item 5), so the gate reopens — the
-  clean-reconcile arm (`node.rs` ~2381–2391) and the matching-epoch
-  `on_truncated` reopen (~2710–2722) collapsed into the same atomic step. -/
+  clean-reconcile arm (`node.rs` ~2403–2413) and the matching-epoch
+  `on_truncated` reopen (~2731–2743) collapsed into the same atomic step.
+
+  **Finding #9 (lean LC2) — the reopen is HANDLE-KEYED.** Both Rust reopen
+  arms now fire only when `current_term == adopted_term` (== `term_handle`,
+  the term the receiver filters DATA at). A CANDIDATE's handle lags its
+  `StartElection`-bumped `currentTerm`, so reconciling a co/higher-term map
+  must NOT reopen intake for its stale handle-term stream — otherwise it
+  accepts a cross-stream old-stamped byte its map never attributed
+  (acked-write-loss, §5.4.2 / #6b family; the deleted
+  `finding_candidate_gate_reopen_fca_violation` was the n=5 countermodel).
+  Mirrored MONOTONELY (LC2b F1 fix): Rust's clean arm only ever REOPENS (it
+  requires `awaiting_reconcile` latched; nothing on the clean-map path CLOSES
+  the gate — that happens only at strict adoption `BecomeFollower` and at
+  `Truncate` emission). The first LC2-fix mirror `reconciled := decide(dataTerm
+  = currentTerm)` wrongly CLOSED a carried-open lagged candidate's gate on a
+  clean non-adopt map — an under-approximation dropping Rust's post-map
+  carried-open accepts from the reachable set. Repaired: on a strict adoption
+  (`currentTerm < t`) `BecomeFollower` re-keyed the handle to `t`, so the
+  regime aligns and the gate ends OPEN; otherwise the gate STAYS as it was and
+  additionally REOPENS iff the (unchanged) `dataTerm` already equals
+  `currentTerm` (a follower — never a lagged candidate). `reconciled ||
+  decide(...)` is reopen-only (never closes).
+
+  Known over-approx edge (LC2b review, B1): on a carried-open lagged
+  candidate's non-adopt TRUNCATING reconcile, Rust CLOSES the gate at
+  `Action::Truncate` emission (node.rs ~2599) and the handle-keyed ack keeps
+  it closed, while this mirror deliberately keeps it OPEN — a model-only
+  superset of Rust's behaviors (the sound direction for proof transfer;
+  probed, no countermodel — the LC3 provenance induction covers the state). -/
   | deliverTermMap (w : World n) (j : Fin n) (t : Nat) (entries : TermMap)
       (hmsg : Uc2.Data.Frame.gossip t entries ∈ w.dsent)
       (hterm : (w.nodes j).pn.currentTerm ≤ t) :
@@ -437,7 +497,10 @@ inductive Step {n : Nat} : World n → World n → Prop
         { nodes := Function.update w.nodes j
             { w.nodes j with
               dn := (w.nodes j).dn.applyGossip t entries
-              reconciled := true }
+              reconciled :=
+                if (w.nodes j).pn.currentTerm < t then true
+                else (w.nodes j).reconciled ||
+                  decide ((w.nodes j).dn.dataTerm = (w.nodes j).pn.currentTerm) }
           sent := w.sent
           dsent := w.dsent
           csent := w.csent
@@ -595,10 +658,12 @@ theorem step_project {n : Nat} {w w' : World n} (h : Step w w') :
   | leaderAppend i v hrole =>
     rw [project_mk]
     exact .single (Uc2.Data.Step.leaderAppend w.project i v hrole)
-  | deliverReplicate j pos t v hmsg hpos hstamp hgate =>
+  | deliverReplicate j pos hdr t v hmsg hpos hhdr hgate =>
     rw [project_mk]
     exact .single
-      (Uc2.Data.Step.deliverReplicate w.project j pos t v hmsg hpos hstamp)
+      (Uc2.Data.Step.deliverReplicate w.project j pos hdr t v hmsg hpos hhdr)
+  | serveTail i p t v hrole hhist hp =>
+    exact .single (Uc2.Data.Step.serveTail w.project i p t v hrole hhist hp)
   | shipTermMap i hrole =>
     exact .single (Uc2.Data.Step.shipTermMap w.project i hrole)
   | deliverTermMap j t entries hmsg hterm =>
@@ -697,7 +762,7 @@ theorem nonvacuity_commit_completeness_trace :
       (.leaderAppend _ 0 42 (by decide)))
       (.shipTermMap _ 0 (by decide)))
       (.deliverTermMap _ 1 1 [(1, 0)] (by decide) (by decide)))
-      (.deliverReplicate _ 1 0 1 42 (by decide) (by decide) (by decide)
+      (.deliverReplicate _ 1 0 1 1 42 (by decide) (by decide) (by decide)
         (by decide)))
       (.sendReport _ 1 (by decide) (by decide)))
       (.deliverReport _ 0 1 1 1 (by decide) (by decide) (by decide)

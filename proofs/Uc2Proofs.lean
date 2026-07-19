@@ -8,4 +8,11 @@ import Uc2Proofs.ElectionSafety
 import Uc2Proofs.ProtocolData
 import Uc2Proofs.LogMatching
 import Uc2Proofs.ProtocolCommit
+import Uc2Proofs.MapWF
 import Uc2Proofs.LeaderCompleteness
+import Uc2Proofs.ReportProvenance
+import Uc2Proofs.LcClosure
+import Uc2Proofs.TakeDiscipline
+import Uc2Proofs.StageB
+import Uc2Proofs.StageC
+import Uc2Proofs.CanonWitness

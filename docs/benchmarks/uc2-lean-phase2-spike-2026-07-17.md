@@ -1125,3 +1125,113 @@ hybrid-vs-full-refinement decision after Finding #7 itself):
 This memo does not recommend among these four — §5's honest re-price and
 §3's honest cost accounting are offered as the inputs to that call, not a
 conclusion in place of it.
+
+---
+
+## Tier B(b) CLOSURE ARC (LC1–LC4h) — actuals + banked disposition (2026-07-18/19)
+
+This section closes the Tier B(b) arc. The user chose **Option 1** from the
+recommendation above (retire the Finding #7 model-fidelity debt and prove
+`leader_completeness` UNCONDITIONALLY, no `FramesCurrentAuthored` hypothesis).
+The arc ran as a subagent-driven plan (`docs/superpowers/plans/2026-07-18-uc2-lean-lc-closure.md`,
+tasks LC1–LC5). It is now **banked, not finished**: the theorem is reduced to a
+single named, machine-checked-satisfiable obligation with a complete blueprint,
+and the user banked rather than spend the disproportionate remainder. Branch
+`uc2/lean-lc-closure` merges to main.
+
+### What LANDED (all sorry-free, standard axioms, model files untouched except the two Rust/model fixes below)
+
+- **The Finding #7 model refinement** (LC1/LC1b): replicate frames carry a wire
+  header term (provenance) distinct from the record stamp; delivery is exact-match
+  on a **lagging `dataTerm` handle** mirroring `uc2_net/src/receiver.rs`; the
+  `serveTail` re-serve step models NAK-repair/journal-replay. `log_matching` and
+  `election_safety` re-green under the amended model.
+- **`frames_current_authored` DISCHARGED** hypothesis-free (LC3) — the theorem
+  that made the prior arc's `leader_completeness` *conditional* is now an
+  unconditional lemma. It sits in the 21-clause message-indexed `ProvInv` bundle.
+- The full supporting stack: `MapsWF` (LC2, 12-clause map well-formedness),
+  the Stage-A take-discipline bundle (LC4b, 6 clauses), the Stage-B credential
+  layer (LC4c: `RepQuorum` commit production, era-conditioned reporter floor,
+  gossip-witnessed grant transport), the `leader_completeness` ASSEMBLY itself
+  (`lc_of_ctl`, LC4e — composes first-try in `T ≤` form once its one input lands),
+  the becomeLeader crux (`crux_become_leader` against the typed `CruxInputs`
+  bundle), and the canon **statement + consumer-interface pin** (`canon_reconcile_clean`)
+  + antitonicity result (`repquorum_anti`) + a machine-checked **satisfiability
+  witness** that canon holds nontrivially at `k > 0` (LC4h/F-A).
+
+### The two REAL, SHIPPED bugs this arc found and fixed (the headline deliverable)
+
+Both are in the same neighborhood — the **term-handle / intake-gate coherence
+window during elections** — and both are acked-write-loss class, invisible to
+the empirical stack (sim/elle/lincheck) for the interleaving-coverage reason
+Findings #5/#6b already established, not an oracle-design gap:
+
+- **Finding #8** (model-fidelity, fixed in-model): delivery keyed to `currentTerm`
+  admitted a cross-stream frame a candidate's lagging handle would drop in Rust.
+  Fixed by the `dataTerm` lagging-handle model (LC1b) — no Rust bug, but it forced
+  the faithful model that then exposed:
+- **Finding #9 — CONFIRMED REAL Rust bug, acked-write-loss, fixed** (commit
+  `4ce6eb3`): the intake-gate **reopen** was keyed to `currentTerm`, not the term
+  handle, so a candidate whose handle lags could reopen DATA intake for the stale
+  handle-term stream against a map never reconciled with it — a cross-stream accept
+  whose handle-stamped reports can certify a phantom commit past the Finding-#6b
+  clamp. Independently confirmed reachable link-by-link in Rust. Fix keys BOTH
+  reopen arms to `current_term == adopted_term` (`node.rs:2423`); paired model
+  mirror + a directed RED/GREEN sim regression pin. releases.md entry filed.
+
+Counting the prior sub-spike, this proof effort has now found and fixed **four
+real shipped consensus bugs** (#5, #6b, #9 as Rust fixes; #8 as the model-fidelity
+gap that exposed #9), plus statement re-keys (#6a) and model-fidelity findings
+(#7). Every one lives in the election-time term/gate/commit coherence window.
+
+### Where `leader_completeness` actually stands
+
+Reduced to ONE named obligation: the **canon** invariant (entry-level
+canonical-prefix agreement), which discharges `CruxInputs`, which discharges
+`committed_term_at_leaders`, which — via the already-landed `lc_of_ctl` — yields
+`leader_completeness` in the `T ≤` form for free. Canon's statement, its
+consumer interface, its antitonicity, and a nontrivial satisfiability witness
+are all landed. **Finding #11** established that canon cannot be proved by the
+single-`ReflTransGen`-shell induction every other invariant in this corpus uses:
+its `RepQuorum` antecedent is monotone-forward (a conjunction of existentials over
+append-only wires — provably never antitone, so there is nothing to re-condition
+toward), so newly-born instances get nothing from the induction hypothesis and
+need **joint/well-founded induction** — machinery this corpus has never used.
+F-A's witness confirms this is **scope, not falsity** (canon is not false; no
+countermodel exists; nothing implicates `reconcile`-vs-Rust). The blueprint,
+the kernel-cost traps, and the pointwise-vs-pairwise `agree` observation for the
+joint shape are all recorded in the LC4g/LC4h reports for a clean resume.
+
+### Cost actuals + honest estimate history
+
+Arc spent **≈13.3 S2-equivalents** against an original **5–8** estimate. The
+overrun was NOT calibration drift — it was three real findings (#8, #9, #11) plus
+a canon layer that resisted the corpus's standard proof shape, none foreseeable
+before the invariant-design pass that found them. The estimate was re-gated with
+the user **four times** (5–8 → 5–6.5 authorized → ~7.5–9 mid-point → ~6–8.5 after
+a machine-checked design pass → ~7–12 after Finding #11); notably the design
+pass's *downward* re-price was itself overturned by Finding #11, because the pass
+declared a base case payable on a prose argument that silently assumed a
+durable-stability fact this arc's own landed countermodel refutes. **Remaining to
+a complete `leader_completeness`: ≈7–12 S2-equivalents / 3–4 tasks**, joint
+induction unavoidable.
+
+### Process finding adopted mid-arc
+
+The arc's mandated bare-vs-conditioned **statement** audit caught five false
+statement drafts but missed Finding #11, because #11 is a false step inside an
+*argument* — a fact owned by no clause. Adopted rule for any future resume: a
+design pass may not declare an obligation payable or a contingency retired until
+it lands the argument's intermediate facts as a typed `structure`, one field per
+fact, each citing a landed theorem or flagged as an open obligation with an owner
+(the `CruxInputs` device the arc already certified — LC4f simply did not apply it
+to its own cost argument).
+
+### Re-price of (c) state-machine safety
+
+Unchanged in structure from the prior memo: (c) composes an inv4-analog
+(non-truncation of committed bytes) with an inv5-analog over `leader_completeness`,
+so it stays gated on finishing (b). With (b)'s remainder now ≈7–12 S2-eq and (c)
+previously priced 4–9 on top, a complete (c) is **≈11–21 S2-equivalents of new
+work** from the banked state. The two shipped-bug fixes (#8/#9) are permanent
+value independent of whether either theorem is ever completed.

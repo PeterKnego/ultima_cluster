@@ -103,7 +103,18 @@ pub enum DataPlane {
     /// map delivered mid-truncation reopens the gate early, the raw divergent
     /// durable (still un-truncated) escapes into the leader's commit ranking, and
     /// the oracle must catch the resulting phantom commit.
-    Mechanism { reopen_guard: bool },
+    ///
+    /// `handle_keyed: true` mirrors `uc2_node` post-Finding-#9 (lean LC2, gate
+    /// doc): BOTH gate-reopen arms (clean reconcile in `feed`, truncation ack in
+    /// `on_truncated`) reopen ONLY when `current_term == adopted_term` — the SM's
+    /// active term equals the data-plane term handle the receiver filters DATA at.
+    /// `handle_keyed: false` is the Finding-#9 COUNTERFACTUAL: a CANDIDATE (whose
+    /// handle lags its `StartElection`-bumped `current_term`) that cleanly
+    /// reconciles a higher-term leader's map reopens intake for its stale
+    /// handle-term stream, then accepts a cross-stream old-term byte its map never
+    /// attributed and reports it — the acked-write-loss phantom the oracle catches
+    /// (§5.4.2 / #6b family).
+    Mechanism { reopen_guard: bool, handle_keyed: bool },
 }
 
 /// Deterministic xorshift64 — the crate-local RNG (matches the SM's / fault
@@ -1050,15 +1061,23 @@ impl World {
         // across the window), then reopen the gate — UNLESS a newer term adopted
         // mid-truncation re-armed the reconcile latch, in which case that term's
         // fresh reconcile must complete first (mirrors uc2_node::on_truncated).
-        if matches!(self.cfg.data_plane, DataPlane::Mechanism { .. }) {
+        if let DataPlane::Mechanism { handle_keyed, .. } = self.cfg.data_plane {
             if let Some(t) = nd.pending_trunc_to.take() {
                 nd.durable = t;
                 nd.append = t;
             }
             self.record_committed(node);
             // Reconciliation for this term is complete (durable clamped to the
-            // consistent truncation point, pruned map adopted): reopen the gate.
-            self.reopen_gate(node, now);
+            // consistent truncation point, pruned map adopted): reopen the gate —
+            // UNLESS (Finding #9, lean LC2) this is a CANDIDATE whose handle lags
+            // its bumped `current_term`. A candidate's truncating reconcile
+            // settling must not reopen its stale handle-stream intake; it stays
+            // closed until the candidate resolves (win / step-down / adopt).
+            let handle_ok = !handle_keyed
+                || self.nodes[node].sm.current_term() == self.nodes[node].adopted_term;
+            if handle_ok {
+                self.reopen_gate(node, now);
+            }
         }
         // inv8 — revert correctness, pinned at the exact point the truncation
         // SETTLES (durable clamped, map adopted, config reverted/kept per spec
@@ -1265,7 +1284,7 @@ impl World {
                 // unchanged), and the UNGUARDED heuristic would reopen the gate
                 // mid-truncation — letting the raw divergent durable escape into
                 // the leader's commit ranking (the M4 C-1 phantom-commit path).
-                if let DataPlane::Mechanism { reopen_guard } = self.cfg.data_plane {
+                if let DataPlane::Mechanism { reopen_guard, handle_keyed } = self.cfg.data_plane {
                     // CLEAN-RECONCILE reopen: a term map that was processed
                     // (`term >= ours`) and needed NO truncation completes
                     // reconciliation for the adopted term, so a CLOSED gate
@@ -1280,9 +1299,19 @@ impl World {
                     // commit a8d98f4).
                     let produced_truncate = self.stat_truncations > truncs_before;
                     let guard_ok = !reopen_guard || !self.nodes[to].truncating;
+                    // Finding #9 (lean LC2): reopen only when the SM's active term
+                    // equals the term handle the receiver filters DATA at
+                    // (`adopted_term`). A candidate's handle lags its bumped
+                    // `current_term` (StartElection stores no handle), so
+                    // reconciling a higher-term map must not reopen its stale
+                    // handle-stream intake. `handle_keyed: false` is the
+                    // counterfactual that leaves the hole open.
+                    let handle_ok = !handle_keyed
+                        || self.nodes[to].sm.current_term() == self.nodes[to].adopted_term;
                     if !self.nodes[to].intake_gate
                         && !produced_truncate
                         && guard_ok
+                        && handle_ok
                         && term >= term_before
                     {
                         self.reopen_gate(to, now);
@@ -1891,6 +1920,32 @@ impl World {
     /// A node's current SM term.
     pub fn node_term(&self, node: usize) -> u32 {
         self.nodes[node].sm.current_term()
+    }
+
+    /// True iff `node` is up and in `Role::Candidate` (mid-election). Finding #9
+    /// scripts need to observe the candidate window (handle lags `current_term`).
+    pub fn node_is_candidate(&self, node: usize) -> bool {
+        self.nodes[node].up && matches!(self.nodes[node].sm.role(), Role::Candidate)
+    }
+
+    /// A node's data-plane term handle shadow (`uc2_node::adopted_term` ==
+    /// `term_handle`, the term the receiver filters DATA at). Lags `current_term`
+    /// for a candidate. Finding #9 discriminator.
+    pub fn node_adopted_term(&self, node: usize) -> u32 {
+        self.nodes[node].adopted_term
+    }
+
+    /// A node's intake-gate state (`Mechanism` only): `true` = OPEN. Finding #9's
+    /// direct observable — the candidate cross-stream accept requires a wrongly
+    /// reopened gate.
+    pub fn node_intake_gate(&self, node: usize) -> bool {
+        self.nodes[node].intake_gate
+    }
+
+    /// A node's data-stamped term map (`(term, base)` boundaries). Finding #9
+    /// scripts read it to craft a clean-reconciling injected map.
+    pub fn node_map(&self, node: usize) -> Vec<(u32, u64)> {
+        self.nodes[node].term_map.clone()
     }
 
     // ----------------------------------------------------------- accessors
