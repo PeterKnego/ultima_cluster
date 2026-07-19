@@ -1000,4 +1000,18 @@ theorem bare_report_durable_stability_is_false :
 
 #print axioms bare_report_durable_stability_is_false
 
+/-- The `¬∀` corollary in the house finding-theorem style (review M-2):
+the bare within-regime durable-stability statement — amendment 2's
+quoted form — is not a theorem of the model. -/
+theorem bare_report_durable_stability_not_universal :
+    ¬ ∀ (n : Nat) (w : World n), Reachable w →
+      ∀ (u : Fin n) (T d : Nat), CMsg.report u T d ∈ w.csent →
+        (w.nodes u).dataTerm = T → d ≤ (w.nodes u).pn.durable := by
+  intro hall
+  obtain ⟨w, hw, hm, hdt, hdur⟩ := bare_report_durable_stability_is_false
+  have h := hall 5 w hw 0 1 3 hm hdt
+  omega
+
+#print axioms bare_report_durable_stability_not_universal
+
 end Uc2.Cert

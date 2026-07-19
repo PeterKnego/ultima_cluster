@@ -1820,4 +1820,68 @@ theorem reachable_tkInv {n : Nat} {w : World n} (hw : Reachable w) :
 #print axioms reachable_gossip_ne
 #print axioms reachable_tkInv
 
+/-! ## Within-regime stability, in its true regime-scoped form
+
+The LC4b review's bonus (verdict 2): given the two take-facts, a
+same-regime reconcile is provably CLEAN — the full common prefix survives
+and `validUpTo` is exactly the durable. This is the regime-scoped repair
+of the refuted amendment-2 statement (see
+`bare_report_durable_stability_is_false`). -/
+
+private theorem commonPrefixLen_take_self : ∀ (es : TermMap) (m : Nat),
+    commonPrefixLen (es.take m) es = min m es.length
+  | [], m => by simp [commonPrefixLen]
+  | e :: es, 0 => by simp [commonPrefixLen]
+  | e :: es, m + 1 => by
+    simp only [List.take_succ_cons, commonPrefixLen, if_true]
+    rw [commonPrefixLen_take_self es m]
+    simp only [List.length_cons]
+    omega
+
+/-- **Take-disciplined reconciles are clean**: a node whose map is a take of
+the delivered map, with its durable at-or-below the first beyond-take
+entry's base, reconciles as the identity (`validUpTo = durable`, map
+kept). -/
+theorem take_reconcile_clean {own es : TermMap} {d : Nat}
+    (hown : own = es.take own.length)
+    (hbound : ∀ f ∈ es[own.length]?, d ≤ f.2) :
+    Uc2.reconcile own d es = .ok ⟨d, own⟩ := by
+  cases es with
+  | nil =>
+    simp [Uc2.reconcile]
+  | cons l0 ls =>
+    have hlen : own.length ≤ (l0 :: ls).length := by
+      have h1 : own.length = ((l0 :: ls).take own.length).length := by
+        conv_lhs => rw [hown]
+      rw [List.length_take] at h1
+      omega
+    have hcp : commonPrefixLen own (l0 :: ls) = own.length := by
+      conv_lhs => rw [hown]
+      rw [commonPrefixLen_take_self]
+      omega
+    have hgate : own = [] ∨ commonPrefixLen own (l0 :: ls) ≠ 0 := by
+      by_cases hoe : own = []
+      · exact .inl hoe
+      · right
+        rw [hcp]
+        intro hc
+        exact hoe (List.length_eq_zero_iff.mp hc)
+    rw [Uc2.reconcile_eq_clamped own d l0 ls hgate, hcp]
+    have hnone : own[own.length]? = none :=
+      List.getElem?_eq_none (Nat.le_refl _)
+    simp only [Uc2.reconcile.reconcileClamped, hnone]
+    cases hes : (l0 :: ls)[own.length]? with
+    | none =>
+      dsimp only
+      simp [List.take_of_length_le (Nat.le_refl own.length),
+        List.drop_of_length_le (Nat.le_refl own.length)]
+    | some f =>
+      have hd := hbound f hes
+      have hnlt : ¬ f.2 < d := by omega
+      dsimp only
+      simp [hnlt, List.take_of_length_le (Nat.le_refl own.length),
+        List.drop_of_length_le (Nat.le_refl own.length)]
+
+#print axioms take_reconcile_clean
+
 end Uc2.Cert
