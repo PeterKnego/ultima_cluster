@@ -147,7 +147,7 @@ structure DInv {n : Nat} (w : World n) : Prop where
 
 /-! ## Model-function toolkit -/
 
-private theorem commonPrefixLen_self : ∀ m : TermMap,
+theorem commonPrefixLen_self : ∀ m : TermMap,
     commonPrefixLen m m = m.length
   | [] => rfl
   | _ :: es => by
@@ -155,7 +155,7 @@ private theorem commonPrefixLen_self : ∀ m : TermMap,
 
 /-- Reconciling against one's own map is the identity — the leader-side
 no-truncation fact `gossip_pinned` cashes in. -/
-private theorem reconcile_self (m : TermMap) (d : Nat) :
+theorem reconcile_self (m : TermMap) (d : Nat) :
     reconcile m d m = .ok ⟨d, m⟩ := by
   cases m with
   | nil => rfl
@@ -170,21 +170,21 @@ private theorem reconcile_self (m : TermMap) (d : Nat) :
       List.append_nil]
 
 /-- `become_leader`'s pruned push always lands `(t, d)` last. -/
-private theorem lastTermOf_prunePush (m : TermMap) (t d : Nat) :
+theorem lastTermOf_prunePush (m : TermMap) (t d : Nat) :
     lastTermOf (prunePush m t d) = t := by
   simp [prunePush, lastTermOf]
 
 /-- `DataTermObserved` is a no-op at or below the map's frontier term — with
 the `stamp ≤ currentTerm` guard and `map_pinned`, a leader's map is frozen
 for its whole tenure. -/
-private theorem observeTerm_of_le {m : TermMap} {t : Nat}
+theorem observeTerm_of_le {m : TermMap} {t : Nat}
     (h : t ≤ lastTermOf m) (pos : Nat) : observeTerm m t pos = m := by
   simp [observeTerm, Nat.not_lt.mpr h]
 
 /-! ## `applyGossip` / `recvReplicate` / `recvRequestVote` toolkit -/
 
 /-- Truncation/wipe only ERASES history — never rewrites. -/
-private theorem applyGossip_hist {n : Nat} (d : Node n) (t : Nat)
+theorem applyGossip_hist {n : Nat} (d : Node n) (t : Nat)
     (entries : TermMap) (p : Nat) {tv : Nat × Nat}
     (h : (d.applyGossip t entries).hist p = some tv) :
     d.hist p = some tv := by
@@ -195,14 +195,14 @@ private theorem applyGossip_hist {n : Nat} (d : Node n) (t : Nat)
     · cases h
   · cases h
 
-private theorem applyGossip_adopt {n : Nat} (d : Node n) {t : Nat}
+theorem applyGossip_adopt {n : Nat} (d : Node n) {t : Nat}
     (entries : TermMap) (h : d.pn.currentTerm < t) :
     (d.applyGossip t entries).pn.role = .follower ∧
     (d.applyGossip t entries).pn.currentTerm = t := by
   cases hrec : reconcile d.termMap d.pn.durable entries <;>
     simp [Node.applyGossip, hrec, h, PNode.adoptTerm]
 
-private theorem applyGossip_no_adopt {n : Nat} (d : Node n) {t : Nat}
+theorem applyGossip_no_adopt {n : Nat} (d : Node n) {t : Nat}
     (entries : TermMap) (h : ¬ d.pn.currentTerm < t) :
     (d.applyGossip t entries).pn.role = d.pn.role ∧
     (d.applyGossip t entries).pn.currentTerm = d.pn.currentTerm ∧
@@ -213,7 +213,7 @@ private theorem applyGossip_no_adopt {n : Nat} (d : Node n) {t : Nat}
 /-- `applyGossip`'s handle store: the data-plane term handle advances to the
 gossip term exactly on a strict adoption (`Action::BecomeFollower`,
 `node.rs:2490`), else stays. -/
-private theorem applyGossip_dataTerm {n : Nat} (d : Node n) (t : Nat)
+theorem applyGossip_dataTerm {n : Nat} (d : Node n) (t : Nat)
     (entries : TermMap) :
     (d.applyGossip t entries).dataTerm =
       if d.pn.currentTerm < t then t else d.dataTerm := by
@@ -221,12 +221,12 @@ private theorem applyGossip_dataTerm {n : Nat} (d : Node n) (t : Nat)
     simp [Node.applyGossip, hrec]
 
 /-- Same-map gossip is the identity on the data plane (`reconcile_self`). -/
-private theorem applyGossip_self {n : Nat} (d : Node n) (t : Nat) :
+theorem applyGossip_self {n : Nat} (d : Node n) (t : Nat) :
     (d.applyGossip t d.termMap).pn.durable = d.pn.durable ∧
     (d.applyGossip t d.termMap).termMap = d.termMap := by
   simp [Node.applyGossip, reconcile_self]
 
-private theorem recvReplicate_pn {n : Nat} (d : Node n) (pos t v : Nat) :
+theorem recvReplicate_pn {n : Nat} (d : Node n) (pos t v : Nat) :
     (d.recvReplicate pos t v).pn.role = d.pn.role ∧
     (d.recvReplicate pos t v).pn.currentTerm = d.pn.currentTerm ∧
     (d.recvReplicate pos t v).pn.votedFor = d.pn.votedFor ∧
@@ -236,7 +236,7 @@ private theorem recvReplicate_pn {n : Nat} (d : Node n) (pos t v : Nat) :
 /- The next four restate `ElectionSafety.lean`'s private `recvRequestVote`
 characterization lemmas (private there, so re-proved here verbatim). -/
 
-private theorem recv_term {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
+theorem recv_term {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
     (hle : s.currentTerm ≤ nt) :
     ((s.recvRequestVote c nt lt d).1).currentTerm = nt := by
   by_cases hadopt : s.currentTerm < nt
@@ -249,7 +249,7 @@ private theorem recv_term {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
         PNode.recvRequestVote.grantIfFresh] <;>
       split_ifs <;> simp [heq]
 
-private theorem recv_voted_current {n : Nat} (s : PNode n) (c x : Fin n)
+theorem recv_voted_current {n : Nat} (s : PNode n) (c x : Fin n)
     (nt lt d : Nat) (heq : s.currentTerm = nt)
     (hvf : s.votedFor = some (s.currentTerm, x)) :
     (s.recvRequestVote c nt lt d).1 = s ∧
@@ -258,7 +258,7 @@ private theorem recv_voted_current {n : Nat} (s : PNode n) (c x : Fin n)
   by_cases hx : x = c <;>
     simp [PNode.recvRequestVote, if_neg hnadopt, hvf, hx]
 
-private theorem recv_frame {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
+theorem recv_frame {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
     (hnadopt : ¬ s.currentTerm < nt) :
     ((s.recvRequestVote c nt lt d).1).role = s.role ∧
     ((s.recvRequestVote c nt lt d).1).currentTerm = s.currentTerm := by
@@ -267,7 +267,7 @@ private theorem recv_frame {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
       PNode.recvRequestVote.grantIfFresh] <;>
     split_ifs <;> simp
 
-private theorem recv_adopt_role {n : Nat} (s : PNode n) (c : Fin n)
+theorem recv_adopt_role {n : Nat} (s : PNode n) (c : Fin n)
     (nt lt d : Nat) (hadopt : s.currentTerm < nt) :
     ((s.recvRequestVote c nt lt d).1).role = .follower := by
   simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
@@ -275,7 +275,7 @@ private theorem recv_adopt_role {n : Nat} (s : PNode n) (c : Fin n)
   split_ifs <;> rfl
 
 /-- `recvRequestVote` never touches the data plane (`durable`). -/
-private theorem recv_durable {n : Nat} (s : PNode n) (c : Fin n)
+theorem recv_durable {n : Nat} (s : PNode n) (c : Fin n)
     (nt lt d : Nat) :
     ((s.recvRequestVote c nt lt d).1).durable = s.durable := by
   by_cases hadopt : s.currentTerm < nt

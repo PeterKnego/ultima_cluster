@@ -68,16 +68,14 @@ equality-on-one-term alternative would have killed.
 ## Status of the discharge
 
 `frames_current_authored : Reachable w → FramesCurrentAuthored w` is
-DEFERRED to the next task — but the Finding #9 gate-reopen hole that
-REFUTED it under the first LC2 pass is now FIXED (task LC2-fix; see the
-"Finding #9" History section at the end of this file). Both Rust reopen
-arms are handle-keyed (`current_term == adopted_term`), mirrored in
-`deliverTermMap`; the candidate non-adopt reopen that manufactured the
-countermodel is gone from the reachable set, so the discharge is again
-plausible over the repaired model. LC2's `MapsWF` bundle
-(`Uc2Proofs/MapWF.lean`) landed independently, alongside the amendment-6
-lemma `reachable_leader_dataTerm` (`leader ⇒ dataTerm = currentTerm`). The
-definition below stays, as the predicate the endgame consumes. -/
+**PROVEN** (task LC3, `Uc2Proofs/ReportProvenance.lean`): the predicate is
+the `fca` clause of the message-indexed provenance bundle
+`Uc2.Cert.ProvInv`, whose frame/gossip-indexed clauses carry the D-tenure
+attribution through the append-only wire — closing the serveTail residual
+(a header-`D` frame accepted AFTER the `D`-leader stepped down) that no
+state-only invariant could see. The definition stays HERE, as the predicate
+the endgame consumes; the discharge and its supporting bundle live in
+`ReportProvenance.lean` (which imports this file). -/
 
 namespace Uc2.Cert
 
@@ -149,11 +147,9 @@ Rust's exact DATA-header match (`receiver.rs:636-639`, against the
 `dataTerm` handle since LC1b) plus the reconcile-before-data intake gate
 (`receiver.rs:657`) — the latter now HANDLE-KEYED on both reopen arms
 (Finding #9 fix, task LC2-fix). The unconditional discharge
-(`Reachable w → FramesCurrentAuthored w`) is DEFERRED to the next task on
-the repaired semantics (the Finding #9 candidate-window reopen that
-refuted it is fixed — see the History section at the end of this file);
-until it lands the predicate is carried as an explicit per-world
-hypothesis. -/
+(`Reachable w → FramesCurrentAuthored w`) is PROVEN:
+`Uc2.Cert.frames_current_authored` in `Uc2Proofs/ReportProvenance.lean`
+(task LC3), as the `fca` clause of the `ProvInv` bundle. -/
 def FramesCurrentAuthored {n : Nat} (w : World n) : Prop :=
   ∀ j : Fin n, ∀ p t v : Nat, (w.nodes j).hist p = some (t, v) →
     Uc2.TermMap.termAt (w.nodes j).dn.termMap p = t
@@ -557,8 +553,7 @@ DELETED (this section) in the same commit as the fix. Sim regression pin:
 `uc2_sim` `finding9_lagged_handle_candidate_reopen_needs_handle_keyed`
 (RED under the `handle_keyed:false` counterfactual → GREEN under the fix).
 
-`frames_current_authored` itself remains DEFERRED to the next task, now on
-the repaired (handle-keyed reopen) semantics — the candidate non-adopt
-reopen that refuted it is gone from the reachable set. -/
+`frames_current_authored` itself is PROVEN on the repaired (handle-keyed
+reopen) semantics — task LC3, `Uc2Proofs/ReportProvenance.lean`. -/
 
 end Uc2.Cert

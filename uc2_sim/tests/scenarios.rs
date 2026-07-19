@@ -1551,8 +1551,10 @@ fn finding9_lagged_handle_candidate_reopen_needs_handle_keyed() {
 /// site from the clean-reconcile arm. A lagged-handle candidate whose reconcile
 /// TRUNCATES (a divergent map) must not reopen its stale handle-stream intake
 /// when the archive ack lands. Same reachable candidate as the clean twin;
-/// inject a DIVERGENT co-term map (`[(1,0),(3,1344)]` vs f's `[(1,0),(2,1344)]`
-/// — truncates at base 1344), then let the truncation ack process.
+/// inject a DIVERGENT co-term map (`[(1,0),(2,1344),(4,2800)]` vs f's
+/// `[(1,0),(2,1344)]` — shared prefix intact, term 4 opening at 2800 truncates
+/// f's UNCOMMITTED tail at 2800; a below-committed cut would trip inv4), then
+/// let the truncation ack process.
 ///   - RED (`handle_keyed:false`): the ack REOPENS the candidate's gate (bug).
 ///   - GREEN (`handle_keyed:true`): the ack leaves it CLOSED.
 #[test]
@@ -1568,8 +1570,9 @@ fn finding9_truncating_arm_reopen_needs_handle_keyed() {
             w.node_term(f)
         );
         let from = (0..3).find(|&i| i != f).unwrap();
-        // A divergent co-term map: term 3 opened at base 1344 where f holds term
-        // 2 -> reconcile truncates at 1344 (produces Action::Truncate).
+        // A divergent co-term map: shared prefix [(1,0),(2,1344)], then term 4
+        // opened at 2800 inside f's uncommitted term-2 tail -> reconcile
+        // truncates at 2800 (produces Action::Truncate).
         let truncs_before = w.truncations();
         w.inject_term_map(from, f, ct, vec![(1, 0), (2, 1344), (4, 2800)]).expect("divergent reconcile");
         // Let the archive truncation ack land (on_truncated_feedback runs the

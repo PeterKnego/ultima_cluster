@@ -482,7 +482,14 @@ inductive Step {n : Nat} : World n → World n → Prop
   regime aligns and the gate ends OPEN; otherwise the gate STAYS as it was and
   additionally REOPENS iff the (unchanged) `dataTerm` already equals
   `currentTerm` (a follower — never a lagged candidate). `reconciled ||
-  decide(...)` is reopen-only (never closes). -/
+  decide(...)` is reopen-only (never closes).
+
+  Known over-approx edge (LC2b review, B1): on a carried-open lagged
+  candidate's non-adopt TRUNCATING reconcile, Rust CLOSES the gate at
+  `Action::Truncate` emission (node.rs ~2599) and the handle-keyed ack keeps
+  it closed, while this mirror deliberately keeps it OPEN — a model-only
+  superset of Rust's behaviors (the sound direction for proof transfer;
+  probed, no countermodel — the LC3 provenance induction covers the state). -/
   | deliverTermMap (w : World n) (j : Fin n) (t : Nat) (entries : TermMap)
       (hmsg : Uc2.Data.Frame.gossip t entries ∈ w.dsent)
       (hterm : (w.nodes j).pn.currentTerm ≤ t) :

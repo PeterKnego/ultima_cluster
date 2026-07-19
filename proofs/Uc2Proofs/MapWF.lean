@@ -206,76 +206,15 @@ structure MapInv {n : Nat} (w : World n) : Prop where
 
 /-! ### Local toolkit (kernel/model bridges)
 
-`commonPrefixLen_self`/`reconcile_self` and the four `recvRequestVote`
-characterizations are re-proved private copies of `LogMatching.lean`'s
-(private there — the LB2b `advance_fires` precedent). -/
+`commonPrefixLen_self`/`reconcile_self` and the `recvRequestVote`
+characterizations come from `LogMatching.lean` (de-privatized there in LC3,
+per the decision-4 pattern — this file's private re-proofs were deleted). -/
 
-private theorem commonPrefixLen_self : ∀ m : TermMap,
-    commonPrefixLen m m = m.length
-  | [] => rfl
-  | _ :: es => by
-    simp [commonPrefixLen, commonPrefixLen_self es]
-
-private theorem reconcile_self (m : TermMap) (d : Nat) :
-    reconcile m d m = .ok ⟨d, m⟩ := by
-  cases m with
-  | nil => rfl
-  | cons e es =>
-    have hnone : (e :: es)[(e :: es).length]? = none :=
-      List.getElem?_eq_none (Nat.le_refl _)
-    simp only [reconcile, commonPrefixLen_self]
-    rw [if_neg (by simp)]
-    simp only [reconcile.reconcileClamped, hnone,
-      List.take_of_length_le (Nat.le_refl _),
-      List.drop_of_length_le (Nat.le_refl _), List.filter_nil,
-      List.append_nil]
-
-private theorem recv_term {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
-    (hle : s.currentTerm ≤ nt) :
-    ((s.recvRequestVote c nt lt d).1).currentTerm = nt := by
-  by_cases hadopt : s.currentTerm < nt
-  · simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
-      PNode.recvRequestVote.grantIfFresh]
-    split_ifs <;> rfl
-  · have heq : s.currentTerm = nt := by omega
-    rcases hvf : s.votedFor with _ | ⟨vt, vid⟩ <;>
-      simp only [PNode.recvRequestVote, if_neg hadopt, hvf,
-        PNode.recvRequestVote.grantIfFresh] <;>
-      split_ifs <;> simp [heq]
-
-private theorem recv_frame {n : Nat} (s : PNode n) (c : Fin n) (nt lt d : Nat)
-    (hnadopt : ¬ s.currentTerm < nt) :
-    ((s.recvRequestVote c nt lt d).1).role = s.role ∧
-    ((s.recvRequestVote c nt lt d).1).currentTerm = s.currentTerm := by
-  rcases hvf : s.votedFor with _ | ⟨vt, vid⟩ <;>
-    simp only [PNode.recvRequestVote, if_neg hnadopt, hvf,
-      PNode.recvRequestVote.grantIfFresh] <;>
-    split_ifs <;> simp
-
-private theorem recv_adopt_role {n : Nat} (s : PNode n) (c : Fin n)
-    (nt lt d : Nat) (hadopt : s.currentTerm < nt) :
-    ((s.recvRequestVote c nt lt d).1).role = .follower := by
-  simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
-    PNode.recvRequestVote.grantIfFresh]
-  split_ifs <;> rfl
-
-private theorem recv_durable {n : Nat} (s : PNode n) (c : Fin n)
-    (nt lt d : Nat) :
-    ((s.recvRequestVote c nt lt d).1).durable = s.durable := by
-  by_cases hadopt : s.currentTerm < nt
-  · simp only [PNode.recvRequestVote, if_pos hadopt, PNode.adoptTerm,
-      PNode.recvRequestVote.grantIfFresh]
-    split_ifs <;> rfl
-  · rcases hvf : s.votedFor with _ | ⟨vt, vid⟩ <;>
-      simp only [PNode.recvRequestVote, if_neg hadopt, hvf,
-        PNode.recvRequestVote.grantIfFresh] <;>
-      split_ifs <;> rfl
-
-private theorem lastTermOf_getLast {m : TermMap} {l : Nat × Nat}
+theorem lastTermOf_getLast {m : TermMap} {l : Nat × Nat}
     (h : m.getLast? = some l) : lastTermOf m = l.1 := by
   simp [lastTermOf, h]
 
-private theorem getLast?_append_singleton {α : Type _} :
+theorem getLast?_append_singleton {α : Type _} :
     ∀ (l : List α) (a : α), (l ++ [a]).getLast? = some a
   | [], _ => rfl
   | x :: xs, a => by
@@ -287,7 +226,7 @@ private theorem getLast?_append_singleton {α : Type _} :
 
 /-- The pruned slice of `prunePush` is a PREFIX of the original map
 (reverse-dropWhile-reverse drops a suffix). -/
-private theorem prunePush_prefix (m : TermMap) (d : Nat) :
+theorem prunePush_prefix (m : TermMap) (d : Nat) :
     (m.reverse.dropWhile (fun e => e.2 == d)).reverse <+: m := by
   rw [← List.reverse_suffix, List.reverse_reverse]
   exact List.dropWhile_suffix _
@@ -297,7 +236,7 @@ well-formedness payload: given candidate-grade inputs (ascending, floored,
 frontier-bounded, terms strictly below the new term `c`), the pushed map is
 ascending, floored, nonempty, ends exactly at `(c, d)`, and keeps terms
 ≤ `c`. -/
-private theorem prunePush_wf {m : TermMap} {c d : Nat}
+theorem prunePush_wf {m : TermMap} {c d : Nat}
     (hasc : TermMap.Ascending m)
     (hflr : ∀ e, m.head? = some e → e.2 = 0)
     (hne : 0 < d → m ≠ [])
@@ -379,7 +318,7 @@ private theorem prunePush_wf {m : TermMap} {c d : Nat}
 
 /-- `reconcileClamped`'s `validUpTo` is bounded BELOW by anything below the
 durable and both boundary bases (the `≤` twin of R2's strict form). -/
-private theorem reconcileClamped_ge {own leader : TermMap} {d k : Nat}
+theorem reconcileClamped_ge {own leader : TermMap} {d k : Nat}
     {o : Outcome} (p : Nat)
     (h : reconcile.reconcileClamped own d leader k = .ok o)
     (hp : p ≤ d)
@@ -409,7 +348,7 @@ private theorem reconcileClamped_ge {own leader : TermMap} {d k : Nat}
 /-- Every surviving entry of a clean reconcile (against an ASCENDING
 shipped map) keeps its base at or below the new frontier `validUpTo` — the
 `last_base` transport across `deliverTermMap`. -/
-private theorem newMap_base_le {own : TermMap} {d : Nat} {l0 : Nat × Nat}
+theorem newMap_base_le {own : TermMap} {d : Nat} {l0 : Nat × Nat}
     {ls : TermMap} {o : Outcome}
     (hwf : TermMap.Ascending own) (hlwf : TermMap.Ascending (l0 :: ls))
     (hlast : ∀ l, own.getLast? = some l → l.2 ≤ d)
@@ -437,7 +376,7 @@ private theorem newMap_base_le {own : TermMap} {d : Nat} {l0 : Nat × Nat}
     exact hlwf.take_base_le hf x hx'
 
 /-- `applyGossip`'s field values on a clean reconcile. -/
-private theorem applyGossip_ok {n : Nat} (nd : Node n) (t : Nat)
+theorem applyGossip_ok {n : Nat} (nd : Node n) (t : Nat)
     {entries : TermMap} {o : Outcome}
     (hrec : reconcile nd.termMap nd.pn.durable entries = .ok o) :
     (nd.applyGossip t entries).termMap = o.newMap ∧
@@ -454,7 +393,7 @@ private theorem applyGossip_ok {n : Nat} (nd : Node n) (t : Nat)
     simp [Node.applyGossip, hrec, hadopt, PNode.adoptTerm]
 
 /-- `applyGossip`'s field values on the wipe arm. -/
-private theorem applyGossip_ncp {n : Nat} (nd : Node n) (t : Nat)
+theorem applyGossip_ncp {n : Nat} (nd : Node n) (t : Nat)
     {entries : TermMap}
     (hrec : reconcile nd.termMap nd.pn.durable entries = .noCommonPrefix) :
     (nd.applyGossip t entries).termMap = [] ∧
@@ -469,7 +408,7 @@ private theorem applyGossip_ncp {n : Nat} (nd : Node n) (t : Nat)
   by_cases hadopt : nd.pn.currentTerm < t <;>
     simp [Node.applyGossip, hrec, hadopt, PNode.adoptTerm]
 
-private theorem recvReplicate_fields {n : Nat} (nd : Node n) (pos t v : Nat) :
+theorem recvReplicate_fields {n : Nat} (nd : Node n) (pos t v : Nat) :
     (nd.recvReplicate pos t v).termMap = observeTerm nd.termMap t pos ∧
     (nd.recvReplicate pos t v).pn.durable = pos + 1 ∧
     (nd.recvReplicate pos t v).hist
@@ -1205,7 +1144,7 @@ prefix of the old, or a wipe), so the last term cannot rise above the
 
 /-- `lastTermOf` of an ascending map's prefix never exceeds the whole map's
 last term. -/
-private theorem lastTermOf_take_le {m : TermMap} (hwf : TermMap.Ascending m)
+theorem lastTermOf_take_le {m : TermMap} (hwf : TermMap.Ascending m)
     (k : Nat) : lastTermOf (m.take k) ≤ lastTermOf m := by
   cases hlt : (m.take k).getLast? with
   | none => simp [lastTermOf, hlt]
@@ -1241,13 +1180,7 @@ def MapLeDataTerm {n : Nat} (w : World n) : Prop :=
 private theorem mldt_init (n : Nat) : MapLeDataTerm (World.init n) := by
   intro j; simp [World.init, lastTermOf]
 
-private theorem lastTermOf_prunePush' (m : TermMap) (t d : Nat) :
-    lastTermOf (prunePush m t d) = t := by
-  show lastTermOf ((m.reverse.dropWhile (fun e => e.2 == d)).reverse ++ [(t, d)])
-    = t
-  rw [lastTermOf, getLast?_append_singleton]; rfl
-
-private theorem lastTermOf_observeTerm (m : TermMap) (t pos : Nat) :
+theorem lastTermOf_observeTerm (m : TermMap) (t pos : Nat) :
     lastTermOf (observeTerm m t pos) = max (lastTermOf m) t := by
   unfold observeTerm
   by_cases h : lastTermOf m < t
@@ -1286,7 +1219,7 @@ private theorem mldt_step {n : Nat} {w w' : World n} (hw : Reachable w)
   | becomeLeader i hrole hquorum =>
     intro k; rcases eq_or_ne k i with rfl | hne
     · simp only [Function.update_self]
-      rw [lastTermOf_prunePush']
+      rw [lastTermOf_prunePush]
     · simp only [Function.update_of_ne hne]; exact h k
   | crashRestart i =>
     intro k; rcases eq_or_ne k i with rfl | hne
