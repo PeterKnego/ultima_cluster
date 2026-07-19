@@ -593,6 +593,115 @@ theorem reconcile_ge_of_canon {P a b : TermMap} {d k : Nat}
 
 #print axioms reconcile_ge_of_canon
 
+/-! ## F-3 — the `preK` → `++` bridge
+
+Canon's clauses are phrased with `preK m k` (the below-`k` initial segment);
+`reconcile_ge_of_canon` consumes a LITERAL `P ++ a` decomposition with every
+beyond-`P` entry at-or-above `k`. `takeWhile_append_dropWhile` supplies the
+split definitionally, but the "beyond" half needs ascending bases — without
+it `dropWhile` can retain a below-`k` entry. `MapsWF` supplies `Ascending`;
+this packages the two so canon never re-derives the conversion. -/
+
+/-- The below-`k` initial segment of a map. An initial segment (not a
+filter) precisely because bases ascend. -/
+def preK (m : TermMap) (k : Nat) : TermMap := m.takeWhile (fun e => e.2 < k)
+
+private theorem asc_head_le {m : TermMap} {a : Nat × Nat}
+    (h : TermMap.Ascending (a :: m)) : ∀ f ∈ m, a.2 ≤ f.2 := by
+  intro f hf
+  obtain ⟨j, hj⟩ := List.getElem?_of_mem hf
+  exact TermMap.Ascending.head_base_le h hj
+
+/-- **The bridge.** An ascending map splits as `preK m k ++ a` with every
+entry of the tail `a` opening at or above `k` — exactly the `ha`/`hb` shape
+`reconcile_ge_of_canon` demands. -/
+theorem preK_split : ∀ {m : TermMap}, TermMap.Ascending m → ∀ k : Nat,
+    ∃ a : TermMap, m = preK m k ++ a ∧ ∀ e ∈ a, k ≤ e.2 := by
+  intro m
+  induction m with
+  | nil => intro _ k; exact ⟨[], rfl, by simp⟩
+  | cons a t ih =>
+    intro hwf k
+    by_cases hak : a.2 < k
+    · obtain ⟨s, hs, hge⟩ := ih hwf.tail k
+      refine ⟨s, ?_, hge⟩
+      show a :: t = List.takeWhile _ (a :: t) ++ s
+      rw [List.takeWhile_cons_of_pos (by simpa using hak)]
+      exact congrArg (a :: ·) hs
+    · refine ⟨a :: t, ?_, ?_⟩
+      · show a :: t = List.takeWhile _ (a :: t) ++ (a :: t)
+        rw [List.takeWhile_cons_of_neg (by simpa using hak)]
+        simp
+      · intro e he
+        rcases List.mem_cons.mp he with rfl | het
+        · omega
+        · exact Nat.le_trans (by omega) (asc_head_le hwf e het)
+
+#print axioms preK_split
+
+/-! ## F-2 — birth-site confinement for canon's antecedent
+
+The LC4e review's F-2: canon keyed on `RepQuorum w T k` is monotone-FORWARD
+(`RepQuorum.step` only transports `w → w'`), so at every step where a NEW
+`(T, k)` pair enters the antecedent the induction hypothesis supplies
+nothing and the whole bundle must be established ex nihilo. The review
+located those births at "a report delivery, a vote delivery, or an append".
+
+That over-counts. `RepQuorum`'s certificate conjunct is *recoverable* from
+its base-frame conjunct: a `replicate bT T T v0` frame is an `Occ` at term
+`T`, so `DInv.cert` mints a term-`T` certificate in ANY world holding that
+frame, and `cert_uniq` identifies it with the one the post-state carries.
+So the certificate can never be the last conjunct to complete, and the
+election plane — where certificates are actually born (`deliverRequestVote`
+completing a grant quorum, `becomeLeader` flipping `role` out of
+`.candidate` so `Cert.pinned`'s right disjunct closes) — cannot birth
+`RepQuorum` at all.
+
+What remains: `RepQuorum` is antitone across any step that adds no
+`replicate` frame and no `report` message. Reading that off the `Step`
+constructors, canon's births are confined to exactly THREE sites —
+`leaderAppend` and `serveTail` (the `replicate` conjunct) and `sendReport`
+(the `k`-floored report quorum). The three hard map-surgery cases
+(`deliverTermMap`, `deliverReplicate`, `becomeLeader`), plus
+`leaderAdvanceCommit`, `shipTermMap` and the whole election plane, are
+**birth-free**: their IH always reaches. -/
+
+/-- **Birth-site confinement.** `RepQuorum` is antitone across any step that
+adds no `replicate` frame and no `report` message. -/
+theorem repquorum_anti {n : Nat} {w w' : World n} (hw : Reachable w)
+    (hstep : Step w w')
+    (hd : ∀ p hdr t v, Frame.replicate p hdr t v ∈ w'.dsent →
+      Frame.replicate p hdr t v ∈ w.dsent)
+    (hcs : ∀ (u : Fin n) (t d : Nat), CMsg.report u t d ∈ w'.csent →
+      CMsg.report u t d ∈ w.csent)
+    {T k : Nat} (h : RepQuorum w' T k) : RepQuorum w T k := by
+  obtain ⟨hT, ℓ, Q, bT, v0, hcert, hbTk, horig, hQcard, hQ⟩ := h
+  have horig' := hd _ _ _ _ horig
+  obtain ⟨ℓ', hc'⟩ := (Data.reachable_dinv (reachable_project hw)).cert T
+    (.inl ⟨bT, v0, .inl ⟨T, horig'⟩⟩)
+  have heq : ℓ = ℓ' :=
+    Data.cert_uniq (Uc2.reachable_inv (Data.reachable_project
+      (reachable_project (hw.tail hstep)))) hcert
+      (Data.cert_drtg (step_project hstep) hc')
+  subst heq
+  refine ⟨hT, ℓ, Q, bT, v0, hc', hbTk, horig', hQcard, ?_⟩
+  intro u hu
+  rcases hQ u hu with rfl | ⟨d, hkd, hm⟩
+  · exact .inl rfl
+  · exact .inr ⟨d, hkd, hcs _ _ _ hm⟩
+
+/-- The form the birth-free constructors are instantiated at: both data
+wires unchanged. Covers `becomeLeader`, `deliverTermMap`,
+`deliverReplicate`, `leaderAdvanceCommit`, `deliverReport`, `crashRestart`
+and the entire election plane definitionally. -/
+theorem repquorum_anti_of_wires {n : Nat} {w w' : World n} (hw : Reachable w)
+    (hstep : Step w w') (hd : w'.dsent = w.dsent) (hc : w'.csent = w.csent)
+    {T k : Nat} (h : RepQuorum w' T k) : RepQuorum w T k :=
+  repquorum_anti hw hstep (fun _ _ _ _ hf => hd ▸ hf)
+    (fun _ _ _ hm => hc ▸ hm) h
+
+#print axioms repquorum_anti
+
 /-! ## The `becomeLeader` crux, mechanized against an explicit hypothesis
 bundle
 
@@ -627,9 +736,33 @@ theorem cand_frontier {n : Nat} {w : World n} (hw : Reachable w)
 #print axioms cand_frontier
 
 /-- The facts the `becomeLeader` crux consumes that the canon layer still
-owes. All three are era-conditioned consequences of canonical-prefix
-agreement; none is landed. -/
+owes; none is landed.
+
+**F-1 — READ THE CONDITIONING BEFORE TARGETING THESE.** The three floor
+clauses are **FALSE for arbitrary `(T, k)`**, and the target
+`∀ w T k, Reachable w → CruxInputs w T k` is therefore unprovable:
+
+- `past_floor` fails for any `k` above some node's durable, and for a node
+  whose frontier is past `T` but which has not yet replicated through `k`;
+- `writer_floor` fails for a sharper, already-adjudicated reason —
+  **certificates exist without wins**, so `Cert w T ℓ` alone implies nothing
+  about `ℓ` ever having led at `T`, appended, or reached `durable ≥ k`.
+
+The conditioning that makes them provable is `RepQuorum w T k`, which is
+therefore carried as a FIELD (`rq`) rather than left to the consumption
+site: `k` is meaningful only as a position a term-`T` quorum actually
+reached, above the tenure's own base frame. The discharge obligation is
+consequently `∀ w T k, Reachable w → RepQuorum w T k → <the three floors>`,
+and `crux_become_leader` reads `RepQuorum` back out of the bundle.
+
+`Era w T` is deliberately NOT a field: it stays an explicit hypothesis of
+`crux_become_leader`, because canon's era-free reporter clause ((P6) in the
+LC4e design record) is expected to retire it, and baking it in here would
+entrench a conditioning the eventual `committed_term_at_leaders` cannot
+supply. -/
 structure CruxInputs {n : Nat} (w : World n) (T k : Nat) : Prop where
+  /-- The conditioning. Every clause below is false without it. -/
+  rq : RepQuorum w T k
   /-- Canon's past-`T` floor: a map frontier strictly past `T` implies the
   node is durable through `k` (no above-`T` byte lives below `k`). -/
   past_floor : ∀ j : Fin n, T < Data.lastTermOf (w.nodes j).dn.termMap →
@@ -668,13 +801,13 @@ Scope honesty: this is the DURABLE-FLOOR half of the crux.
 (`termAt (termMap c) p = stamp`), which reads off canon's prefix agreement
 directly and is not part of this statement. -/
 theorem crux_become_leader {n : Nat} {w : World n} (hw : Reachable w)
-    {T k : Nat} (hrq : RepQuorum w T k) (hera : Era w T)
+    {T k : Nat} (hera : Era w T)
     (hin : CruxInputs w T k)
     (c : Fin n) (hrole : (w.nodes c).pn.role = .candidate)
     (hquorum : n / 2 + 1 ≤ (w.nodes c).pn.votesReceived.card)
     (hT : T < (w.nodes c).pn.currentTerm) :
     k ≤ (w.nodes c).pn.durable := by
-  obtain ⟨h1T, ℓ, Q, bT, v0, hcert, hbTk, horig, hQcard, hQ⟩ := hrq
+  obtain ⟨h1T, ℓ, Q, bT, v0, hcert, hbTk, horig, hQcard, hQ⟩ := hin.rq
   obtain ⟨y, hy⟩ := Uc2.quorum_intersect n (w.nodes c).pn.votesReceived Q
     hquorum hQcard
   rw [Finset.mem_inter] at hy
