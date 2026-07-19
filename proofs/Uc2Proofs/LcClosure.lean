@@ -943,4 +943,61 @@ theorem advance_report_quorum {n : Nat} {w : World n} (hw : Reachable w)
 
 #print axioms advance_report_quorum
 
+/-! ## F-LC4-1 guard: BARE within-regime durable stability is FALSE
+
+The LC4 review's countermodel, machine-checked (review-LC2-verdict.md,
+F-LC4-1): `report u T d ∈ csent → dataTerm u = T → d ≤ durable u` — the
+LC3-review L1 statement that became amendment 2 — is refuted by a
+data-less later leader's map zero-cutting a lagged candidate. Node 4 leads
+term 1 and replicates 3 bytes to node 0, which reports `(0, 1, 3)` and
+then campaigns (ct 2, handle still 1, gate carried open). Node 2 — with
+NO data — wins term 2 on the two other data-less voters and ships
+`prunePush [] 2 0 = [(2,0)]`. Node 0 delivers it non-adopt:
+`commonPrefixLen [(1,0)] [(2,0)] = 0`, the NoCommonPrefix gate misses
+(`0 < 0` is false), and `reconcileClamped` zero-cuts via the pinned
+`same_base_different_term_truncates_to_zero` arm — durable 0, map wiped,
+`dataTerm` still 1 = T. Any true durable-floor must therefore be
+commit/RepQuorum-conditioned (the quorum blocks the data-less winner via
+`quorum_intersect` + `logOk`): see the LC4b design record. -/
+theorem bare_report_durable_stability_is_false :
+    ∃ w : World 5, Reachable w ∧
+      CMsg.report 0 1 3 ∈ w.csent ∧
+      (w.nodes 0).dataTerm = 1 ∧
+      (w.nodes 0).pn.durable = 0 := by
+  refine ⟨_,
+    .tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
+      (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
+      (.tail (.tail (.tail (.tail
+      (.single (.startElection _ 4 (by decide)))
+      (.deliverRequestVote _ 0 4 1 0 0 (by decide) (by decide)))
+      (.deliverRequestVote _ 1 4 1 0 0 (by decide) (by decide)))
+      (.deliverVote _ 4 0 1 (by decide) (by decide) (by decide)))
+      (.deliverVote _ 4 1 1 (by decide) (by decide) (by decide)))
+      (.becomeLeader _ 4 (by decide) (by decide)))
+      (.leaderAppend _ 4 10 (by decide)))
+      (.leaderAppend _ 4 11 (by decide)))
+      (.leaderAppend _ 4 12 (by decide)))
+      (.shipTermMap _ 4 (by decide)))
+      (.deliverTermMap _ 0 1 [(1, 0)] (by decide) (by decide)))
+      (.deliverReplicate _ 0 0 1 1 10 (by decide) (by decide) (by decide)
+        (by decide)))
+      (.deliverReplicate _ 0 1 1 1 11 (by decide) (by decide) (by decide)
+        (by decide)))
+      (.deliverReplicate _ 0 2 1 1 12 (by decide) (by decide) (by decide)
+        (by decide)))
+      (.sendReport _ 0 (by decide) (by decide)))
+      (.startElection _ 0 (by decide)))
+      (.startElection _ 2 (by decide)))
+      (.startElection _ 2 (by decide)))
+      (.deliverRequestVote _ 1 2 2 0 0 (by decide) (by decide)))
+      (.deliverRequestVote _ 3 2 2 0 0 (by decide) (by decide)))
+      (.deliverVote _ 2 1 2 (by decide) (by decide) (by decide)))
+      (.deliverVote _ 2 3 2 (by decide) (by decide) (by decide)))
+      (.becomeLeader _ 2 (by decide) (by decide)))
+      (.shipTermMap _ 2 (by decide)))
+      (.deliverTermMap _ 0 2 [(2, 0)] (by decide) (by decide)),
+    by decide, by decide, by decide⟩
+
+#print axioms bare_report_durable_stability_is_false
+
 end Uc2.Cert

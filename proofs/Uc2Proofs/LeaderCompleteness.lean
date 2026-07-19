@@ -136,8 +136,12 @@ the entry," and never mentions cross-node agreement; it is meaningful (and
 checkable) per node from its own two fields alone, in worlds with an empty
 `committed` ledger included. Any bridge to leader completeness is the
 consuming theorem's own work (combining it with `Uc2.Data.log_matching`
-and a `termAt`-based committed-entry invariant — the LB2b report's proof
-strategy, mechanized by the arc's LC2–LC4). -/
+and a committed-entry invariant — the LB2b report's proof strategy; the
+arc's LC2–LC3 built the attribution-level (`termAt`) machinery, LC4 the
+commit-event plumbing (`LcClosure.lean`), and the remaining ENTRY-level
+canonical-prefix closure is the LC4b/LC4c arc — see
+`.superpowers/sdd/task-LC4-report.md` for the design record and the
+F-LC4-1 guard `bare_report_durable_stability_is_false`). -/
 
 /-- **The Option-2 provenance predicate.** A node's held content always
 agrees with what its OWN term map attributes to that position. See the
