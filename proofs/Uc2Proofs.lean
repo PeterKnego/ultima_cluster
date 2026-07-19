@@ -14,3 +14,4 @@ import Uc2Proofs.ReportProvenance
 import Uc2Proofs.LcClosure
 import Uc2Proofs.TakeDiscipline
 import Uc2Proofs.StageB
+import Uc2Proofs.StageC
