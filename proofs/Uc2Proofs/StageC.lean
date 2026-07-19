@@ -1065,4 +1065,201 @@ theorem crashRestart_demotes_keeping_map {n : Nat} (w : World n) (i : Fin n) :
 
 #print axioms crashRestart_demotes_keeping_map
 
+/-! ## Canon — the canonical below-`k` prefix bundle
+
+Pairwise form: the LC4f design pass deleted the existential canonical map
+`C` in favour of "any two `k`-covering maps agree below `k`", which is what
+every consumer (`reconcile_ge_of_canon`, the crux) actually needs and which
+removes a witness that would otherwise be threaded through all 15
+constructors.
+
+**READ THE CONDITIONING (F-1 applies here exactly as it does to
+`CruxInputs`).** `Canon w T k` is **FALSE for arbitrary `(T, k)`** — take `k`
+above every node's durable and `past_floor`/`rep_floor` fail immediately. The
+discharge obligation is
+`∀ w T k, Reachable w → RepQuorum w T k → Canon w T k`, never
+`∀ w T k, Reachable w → Canon w T k`. `RepQuorum` is what makes `k`
+meaningful: a position a term-`T` quorum actually reached, above the tenure's
+own base frame. Canon deliberately keeps that antecedent and is NOT
+era-conditioned (an `Era` hypothesis would be unavailable to CTL) and NOT
+joint with a wins statement (`repquorum_anti` confines births to three
+constructors, which retires the joint-induction contingency).
+
+Statement audit against this arc's adjudicated facts:
+
+- `agree` is **literal** `preK` equality, not `termAt` agreement — the shape
+  `reconcile_ge_of_canon` consumes, and the shape the "reconcile cuts at the
+  first ENTRY mismatch" fact demands.
+- `past_floor`/`rep_floor` are **not** bare durable stability
+  (`bare_report_durable_stability_is_false`): both are `k`-conditioned, and
+  `rep_floor` is B1 with `Era` traded for the `k ≤ d` conditioning — the
+  direction the guard theorem permits.
+- `past_floor` is canon's, not CTL's: see the layering probe above. -/
+
+/-- The maps canon forces into agreement below `k`: a past-`T` node's map, a
+`T`-regime node's map once it is durable through `k`, a `k`-floored `T`
+reporter's map, and any above-`T` gossip's entries. -/
+def Canonical {n : Nat} (w : World n) (T k : Nat) (m : TermMap) : Prop :=
+  (∃ j : Fin n, m = (w.nodes j).dn.termMap ∧
+      (T < Data.lastTermOf m ∨
+        (Data.lastTermOf m = T ∧ k ≤ (w.nodes j).pn.durable) ∨
+        (∃ d, k ≤ d ∧ CMsg.report j T d ∈ w.csent)))
+  ∨ (∃ u : Nat, T < u ∧ Frame.gossip u m ∈ w.dsent)
+
+/-- **Canon.** Under `RepQuorum w T k` (see the conditioning note above). -/
+structure Canon {n : Nat} (w : World n) (T k : Nat) : Prop where
+  /-- (P1)/(P3)/(P5)/(P6), prefix half, PAIRWISE — no existential witness. -/
+  agree : ∀ m₁ m₂ : TermMap, Canonical w T k m₁ → Canonical w T k m₂ →
+      preK m₁ k = preK m₂ k
+  /-- (P1) durable half — this is `CruxInputs.past_floor`. -/
+  past_floor : ∀ j : Fin n, T < Data.lastTermOf (w.nodes j).dn.termMap →
+      k ≤ (w.nodes j).pn.durable
+  /-- (P2) a past-`T` node's above-`T` entries all open at or above `k`. -/
+  above : ∀ j : Fin n, T < Data.lastTermOf (w.nodes j).dn.termMap →
+      ∀ e ∈ (w.nodes j).dn.termMap, T < e.1 → k ≤ e.2
+  /-- (P3) above-half: an above-`T` gossip's above-`T` entries open at or
+  above `k`. -/
+  gossip_above : ∀ (u : Nat) (es : TermMap), Frame.gossip u es ∈ w.dsent →
+      T < u → ∀ e ∈ es, T < e.1 → k ≤ e.2
+  /-- (P4) the data wire: no above-`T` byte lives below `k`. -/
+  wire : ∀ pos hdr t v : Nat, Frame.replicate pos hdr t v ∈ w.dsent →
+      T < t → k ≤ pos
+  /-- (P6) durable half — B1 without its `Era` condition. -/
+  rep_floor : ∀ (y : Fin n) (d : Nat), CMsg.report y T d ∈ w.csent →
+      k ≤ d → k ≤ (w.nodes y).pn.durable
+
+/-- **Canon's statement matches its consumer, machine-checked.** Canon's
+`agree` clause plus `preK_split` is exactly what `reconcile_ge_of_canon`
+consumes: two `k`-covering maps reconcile CLEANLY (never `.noCommonPrefix`)
+and never cut `validUpTo` below `k`. This is the interface obligation the
+LC4f brief pins — "canon's statement must be exactly what this consumes" —
+discharged as a theorem rather than asserted in prose.
+
+`Ascending` comes from `MapsWF` at every call site; `preK m₁ k ≠ []` is the
+`NoCommonPrefix`-wipe exclusion (`MapFloor` pins a nonempty map's head base
+below `k` at the consumer). -/
+theorem canon_reconcile_clean {n : Nat} {w : World n} {T k : Nat}
+    (hc : Canon w T k) {m₁ m₂ : TermMap}
+    (h1 : Canonical w T k m₁) (h2 : Canonical w T k m₂)
+    (hw1 : TermMap.Ascending m₁) (hw2 : TermMap.Ascending m₂)
+    (hne : preK m₁ k ≠ []) {d : Nat} (hd : k ≤ d) :
+    ∃ o, Uc2.reconcile m₁ d m₂ = .ok o ∧ k ≤ o.validUpTo := by
+  obtain ⟨a, ha, hae⟩ := preK_split hw1 k
+  obtain ⟨b, hb, hbe⟩ := preK_split hw2 k
+  have hP : preK m₁ k = preK m₂ k := hc.agree m₁ m₂ h1 h2
+  have hne2 : preK m₂ k ≠ [] := hP ▸ hne
+  have h1' : m₁ = preK m₂ k ++ a := by rw [← hP]; exact ha
+  have hrw : Uc2.reconcile m₁ d m₂
+      = Uc2.reconcile (preK m₂ k ++ a) d (preK m₂ k ++ b) := by
+    rw [← h1', ← hb]
+  rw [hrw]
+  exact reconcile_ge_of_canon hne2 hae hbe hd
+
+#print axioms canon_reconcile_clean
+
+/-- **The conditioning is load-bearing, machine-checked.** `Canon` is FALSE
+in a reachable world at `(T, k) = (1, 3)`: F-LC4-1's landed countermodel has
+`report 0 1 3` on the commit wire and `(w.nodes 0).pn.durable = 0`, which
+refutes `rep_floor` outright. So the F-1 note above is not a stylistic
+caution — `∀ w T k, Reachable w → Canon w T k` is refutable, and every
+discharge of canon must carry `RepQuorum w T k`.
+
+In that world `RepQuorum w 1 3` indeed fails (node 0 is the only reporter, so
+any `Q` is contained in `{ℓ, 0}` and cannot reach `5/2+1 = 3`) — that is the
+quorum fact which blocks the data-less term-2 winner, exactly as the
+countermodel's own docstring prescribes. That containment is read off the
+trace by hand and is NOT machine-checked here; the refutation of bare `Canon`
+below is. -/
+theorem bare_canon_is_false :
+    ∃ w : World 5, Reachable w ∧ ¬ Canon w 1 3 := by
+  obtain ⟨w, hw, hm, _, hdur⟩ := bare_report_durable_stability_is_false
+  refine ⟨w, hw, fun hc => ?_⟩
+  have h := hc.rep_floor 0 3 hm (le_refl 3)
+  omega
+
+#print axioms bare_canon_is_false
+
+/-- `Canonical` is read off term maps, durables and the two wires only. -/
+private theorem canonical_transport {n : Nat} {w w' : World n} {T k : Nat}
+    (hmap : ∀ j : Fin n, (w'.nodes j).dn.termMap = (w.nodes j).dn.termMap)
+    (hdur : ∀ j : Fin n, (w'.nodes j).pn.durable = (w.nodes j).pn.durable)
+    (hds : w'.dsent = w.dsent) (hcs : w'.csent = w.csent)
+    {m : TermMap} (h : Canonical w' T k m) : Canonical w T k m := by
+  rcases h with ⟨j, hm, hcase⟩ | ⟨u, hu, hg⟩
+  · refine .inl ⟨j, hm.trans (hmap j), ?_⟩
+    rcases hcase with h1 | ⟨h1, h2⟩ | ⟨d, hd, hr⟩
+    · exact .inl h1
+    · exact .inr (.inl ⟨h1, by rw [← hdur j]; exact h2⟩)
+    · exact .inr (.inr ⟨d, hd, by rw [← hcs]; exact hr⟩)
+  · exact .inr ⟨u, hu, by rw [← hds]; exact hg⟩
+
+/-- **Canon transports across every step that touches no term map, no
+durable and neither data wire.** Instantiated definitionally by the eight
+birth-free, canon-inert constructors: `startElection`,
+`deliverRequestVote`, `rejectStaleRequestVote`, `deliverVote`,
+`deliverVoteHigherTerm`, `crashRestart`, `deliverReport` and
+`leaderAdvanceCommit` (all of which move only election state, the tracker or
+the commit watermark). Paired with `repquorum_anti_of_wires` — which pulls
+the antecedent back so the IH applies — these eight constructors close. -/
+theorem canon_transport {n : Nat} {w w' : World n} {T k : Nat}
+    (h : Canon w T k)
+    (hmap : ∀ j : Fin n, (w'.nodes j).dn.termMap = (w.nodes j).dn.termMap)
+    (hdur : ∀ j : Fin n, (w'.nodes j).pn.durable = (w.nodes j).pn.durable)
+    (hds : w'.dsent = w.dsent) (hcs : w'.csent = w.csent) :
+    Canon w' T k where
+  agree m₁ m₂ h1 h2 :=
+    h.agree m₁ m₂ (canonical_transport hmap hdur hds hcs h1)
+      (canonical_transport hmap hdur hds hcs h2)
+  past_floor j hj := by
+    rw [hdur j]; exact h.past_floor j (by rwa [hmap j] at hj)
+  above j hj e he ht := by
+    rw [hmap j] at hj he; exact h.above j hj e he ht
+  gossip_above u es hg hu e he ht :=
+    h.gossip_above u es (by rwa [hds] at hg) hu e he ht
+  wire pos hdr t v hf ht := h.wire pos hdr t v (by rwa [hds] at hf) ht
+  rep_floor y d hr hkd := by
+    rw [hdur y]; exact h.rep_floor y d (by rwa [hcs] at hr) hkd
+
+#print axioms canon_transport
+
+/-! ## Finding #11 — canon's birth base cases are NOT payable from F-6
+
+**Canon's 15-constructor induction is NOT landed** (task LC4g stopped at its
+ceiling per the stuck protocol; never sorried, never weakened). What blocks
+it is a gap in the LC4f design record's base-case argument, found by the
+mandatory bare-vs-conditioned audit. Canon is **not** suspected false — this
+is a scope/design finding, not a Finding #10 (nothing here implicates
+`reconcile`'s entry-equality semantics against the Rust).
+
+LC4f argued the three birth base cases are payable because F-6's stamping
+discipline means "every member of the `k`-floored quorum `Q` was already
+durable through `k` **at the moment it granted** to any later winner". F-6 as
+mechanized above (`report_before_grant`) delivers the **ordering** half of
+that sentence — a `T`-report by `y` strictly precedes every above-`T` grant
+by `y` — and that half is real and useful: it rules out the newly-reporting
+node `j` itself sitting in a later winner's quorum, since `j.currentTerm = T`
+at the emission step.
+
+It does **not** deliver the **stability** half. "Was durable through `k` at
+report time" does not give "is durable through `k` at grant time", and that
+implication is exactly what this arc has already adjudicated as FALSE:
+`bare_report_durable_stability_is_false` (`LcClosure.lean`) is a landed
+25-step countermodel in which node 0 reports durable 3 and is later
+zero-cut to durable 0 by a data-less winner's gossip. The base-case argument
+silently assumes the refuted statement.
+
+Concretely, at a `sendReport` birth of `(T, k)` with an above-`T` gossip
+already on the wire (a reachable configuration — a live-but-stale `T` writer
+is not forbidden), the obligation is canon's own (P3) for that gossip. The
+available route is B2 (`reachable_grant_report`) on the quorum-intersection
+member, but B2's **escape arm is precisely "an above-`T` gossip exists"**,
+which is the case hypothesis — so B2 returns nothing. `crux_become_leader`
+escapes this only because it assumes `Era w T`, and canon deliberately drops
+`Era` (CTL cannot supply it). The base case therefore carries the genuine
+cross-term Raft content: it needs induction on the winner's term, or canon
+made joint with a wins statement — i.e. the LC4e review's F-2 concern and its
++2–3 joint-induction contingency, which `repquorum_anti` confined but did not
+retire. Birth confinement is correct and load-bearing; it is just not
+sufficient. -/
+
 end Uc2.Cert
