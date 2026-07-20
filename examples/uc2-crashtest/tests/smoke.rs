@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use uc_lincheck::register::{Cmd, CmdResp};
 
 mod common;
-use common::{connect_with_retry, spawn_node, spawn_service, submit_until_ok, wait_for_path};
+use common::{connect_with_retry, spawn_node, spawn_service, submit_until_ok, wait_for_ready};
 
 #[test]
 fn write_then_read_across_processes() {
@@ -27,7 +27,7 @@ fn write_then_read_across_processes() {
     //    tear the children down on Drop (incl. on panic), so no orphaned
     //    processes. ──────────────────────────────────────────────────────
     let _node = spawn_node(&inst);
-    wait_for_path(&inst.join("cnc2.dat"), Duration::from_secs(10));
+    wait_for_ready(&inst, Duration::from_secs(10));
     let _svc = spawn_service(&inst);
 
     let client = connect_with_retry(&inst, Duration::from_secs(10));

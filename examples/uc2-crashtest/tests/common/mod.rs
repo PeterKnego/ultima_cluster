@@ -109,6 +109,26 @@ pub fn wait_for_path(path: &Path, timeout: Duration) {
     }
 }
 
+/// Full readiness barrier for a freshly-spawned node (initial boot, fresh
+/// instance dir). A successful `Client::connect` opens AND validates every
+/// IPC artifact in sequence — the cnc page plus all rings, each magic-checked
+/// — so it is a true "node fully initialized" signal.
+///
+/// This is strictly stronger than `wait_for_path(cnc2.dat)`, which returns as
+/// soon as the FIRST-created file exists: the node creates `cnc2.dat` before
+/// its ring buffers (`node.rs` — the log buffer's creation *needs* the cnc
+/// page, so the order can't be swapped), leaving a window where cnc2.dat is
+/// present but a ring is still being created / magic-written. A service or
+/// warm-up client attaching in that window sees `ring error: No such file` or
+/// `magic mismatch` — harmless on a fast box (window ~0), but a real failure
+/// on a loaded CI runner. Gate warm-up on this, not on file existence.
+///
+/// Fresh-boot only: on a respawn over a SAME dir use `wait_for_fresh_instance`,
+/// since a stale leftover cnc2.dat can let `connect` validate the OLD page.
+pub fn wait_for_ready(instance_dir: &Path, timeout: Duration) {
+    drop(connect_with_retry(instance_dir, timeout));
+}
+
 /// Wait until a node respawned on the SAME instance dir has actually
 /// completed its boot sequence, distinguishing it from the stale files left
 /// behind by the node it replaced. `Client::connect` only succeeds once

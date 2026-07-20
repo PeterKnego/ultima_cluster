@@ -378,7 +378,7 @@ fn linearizable_under_service_sigkill() {
     // would evaluate the RHS (spawn the new child) FIRST and only drop the
     // old `Reap` as part of the assignment, racing the two processes.
     let _node = spawn_node(&inst);
-    wait_for_path(&inst.join("cnc2.dat"), Duration::from_secs(10));
+    wait_for_ready(&inst, Duration::from_secs(10));
     let svc = Arc::new(Mutex::new(Some(spawn_service(&inst))));
 
     let dir = Arc::new(inst.clone());
@@ -479,7 +479,7 @@ fn node_sigkill_recovery_once(run: u32) {
     // when the new one tries to acquire it, the new node fails outright
     // with `AlreadyRunning` instead of merely racing on data.
     let node = Arc::new(Mutex::new(Some(spawn_node(&inst))));
-    wait_for_path(&inst.join("cnc2.dat"), Duration::from_secs(10));
+    wait_for_ready(&inst, Duration::from_secs(10));
     let svc = Arc::new(Mutex::new(Some(spawn_service(&inst))));
 
     let dir = Arc::new(inst.clone());
@@ -951,7 +951,7 @@ fn sigkill_mid_config_window() {
         let d = tmp.path().join(format!("n{i}"));
         std::fs::create_dir_all(&d).unwrap();
         node_procs.push(Some(spawn_node_multi(&d, i, addrs[i as usize], &members_str)));
-        wait_for_path(&d.join("cnc2.dat"), Duration::from_secs(10));
+        wait_for_ready(&d, Duration::from_secs(10));
         dirs.push(d);
     }
     let mut svc_procs: Vec<Option<Reap>> = dirs.iter().map(|d| Some(spawn_service(d))).collect();
