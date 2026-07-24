@@ -349,3 +349,32 @@ at all. Adjudicated against the Rust and fixed:
 Running total for the session: **8 model-fidelity gaps, every one adjudicated against
 the Rust before being fixed.** The recurring lesson is that the checker finds the
 MODEL's bugs long before UC's, and that a CE is a question, not an answer.
+
+#### PROBES B + C RESULTS (re-run with fidelity fixes 7+8; 15m32s for all three)
+| Probe | Knobs | Bound | Result | Reading |
+|---|---|---|---|---|
+| A | pre-fix, proxy ON | maxDepth 12 | ❌ `no_cross_stream_reopen` at **depth 7** | unchanged by fixes 7+8 |
+| B | **post-fix**, proxy ON | maxDepth 12 | ✅ no violation, 879650 states | guard closes the reopen — **within depth 12** |
+| C | pre-fix, proxy OFF | maxDepth 13 | ✅ no violation, 1288622 states | full acked-write-loss **NOT reachable within depth 13** |
+
+**READ B AND C AS BOUNDED, NOT SAFE.** Both passed a `maxDepth`, and per this
+session's own toolchain finding `✅ No violation` renders identically for
+`exploredAllReachableStates` and `reachedDepthBound` (`TraceDisplay.lean:104`). So B is
+"the shipped guard admits no cross-stream reopen within depth 12", not "proved safe";
+C is "not found within depth 13", not "absent".
+
+#### THE CALIBRATION ANSWER (this is the deliverable the brief asked for)
+**#9 splits cleanly into a shallow enabling condition and a deep consequence:**
+ * the ENABLING CONDITION (intake open at a lagging handle) is at **depth 7, 1m44s**;
+ * the FULL acked-write-loss is **beyond depth 13** even pre-fix, after 1.29M states.
+
+So for the V2 forward hunt at n=3/Fin 3: **"absence at depth ~13" is worth very little
+for a full data-loss property, but a great deal for an invariant-shaped proxy.** The
+practical guidance that falls out — hunt PROXY INVARIANTS (the conditions the shipped
+guards establish), not end-to-end loss properties. The four known bugs all have such a
+proxy (#5: report escaping an unreconciled boot; #9: intake open at a lagging handle),
+and the proxy sits ~6 steps shallower than the loss it enables. That is the single most
+useful thing this probe produced, and it directly shapes how V2 should be run.
+
+Consistent with session 3's ReconfigLC wall (a ~13-step CE, no verdict in 700s): the
+wall is real, but it sits ABOVE the proxy depth, which is why the probe still landed.
