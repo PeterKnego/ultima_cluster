@@ -135,3 +135,143 @@ Reconfig.lean (session 3). Landing a clean guarded-SAFE/ablated-UNSAFE leader_co
 EITHER (a) abstract-quorum reformulation + inductive proof (local, ~LC-arc S2-equiv effort), OR
 (b) a much larger box for deeper bounded explicit-state coverage (helps the CE only; the SAFE
 direction is exponential, not compute-bound). USER DECISION PENDING (AWS offered).
+
+---
+
+### SESSION 4 (2026-07-24) — Bar-2 / Bar-2b: the boot-gate commit plane
+
+New model `BootGate.lean` (n=3, term=Fin 2), targeting **Finding #5** — the SHALLOWEST
+of the four known coherence-window bugs, which is precisely why the brief makes it the
+tool-fitness gate. Knob `bootGateFix`: false = pre-fix (gate boots open
+unconditionally), true = shipped fix (`node.rs:533-534`, gate closes iff
+`vote_term > map_term`). Both Rust anchors re-read before modeling.
+
+DELIBERATELY NOT the TSet encoding — the excluded-node quorum encoding from
+ElectionMC.lean sidesteps the SMT `List`-universe wall that stopped ReconfigLC.lean.
+
+#### The Bar-2b distinction is STRUCTURAL, not bolted on
+Two independent relations at the single tracked position P:
+ * `durableTo N`  — bytes at P landed. This is what AppendPosition reports.
+ * `holdsEntry N` — those bytes are the CURRENT leader's entry E (whose stream they
+                    came from).
+`staleStreamAppend` vs `replicate` are the two arms; AppendPosition reports the former
+and NEVER attests the latter, which IS the bug class. Erasing the distinction would
+blind the V2 hunt — hence the brief's abstraction obligation.
+
+#### THREE MODEL-FIDELITY BUGS caught by hand-tracing the CE before trusting a verdict
+All three biased the result the SAME way — making the shipped fix look ineffective —
+which is the failure mode to be paranoid about, since a Bar-2 red is the spike's DROP
+verdict. Found by re-deriving the intended 8-step CE against the model text, NOT by
+running it:
+ 1. **Term adoption did not close the intake gate.** Real UC closes it in
+    `Action::BecomeFollower` on a strictly new term (`node.rs:2511-2513`; test
+    `node.rs:3456` drives exactly this via a higher-term RequestVote). Without it the
+    model admits a SHALLOWER phantom commit that is NOT Finding #5 — an unreconciled
+    divergent follower reporting at the new term without ever crashing. Bar-2 would
+    have "passed" on the wrong bug AND the post-fix run would have been spuriously
+    UNSAFE. With it, the boot gate is the ONLY remaining route to reporting an
+    unreconciled divergent tail — i.e. the model became discriminating.
+ 2. **`replicate` accepted data from a higher-term leader.** A node behind the
+    leader's term has not adopted it, so its gate is shut and the frame is dropped.
+    Now requires `curTerm j = curTerm i`; adoption goes through `reconcile` only.
+ 3. **A standalone `shipTermMap` advanced `mapTerm` independently.** This let
+    `mapTerm` catch up to `voteTerm` with the divergent tail still intact, SILENTLY
+    BYPASSING the fix's own `vote_term > map_term` predicate. Deleted: receiving the
+    term map IS the reconciliation trigger, so `reconcile` now both adopts the term
+    and truncates a divergent tail (a clean tail survives).
+
+#### TOOLCHAIN LESSONS (cost two wasted 3-10 min builds; recorded so the next session doesn't repeat them)
+ * **Veil relation assignments take `Bool`, not `Prop`.** `certified V := V ≠ q` does
+   not elaborate; only literals (`true`/`false`) and `if <Prop> then r := <Bool>`.
+   Props belong in conditions and requires. (First diagnosis — "ghost relations break
+   in an assignment RHS" — was WRONG; the second failure on a bare `≠` disproved it.)
+ * **An elaboration error does NOT fail the `#model_check`; it silently VOIDS it.**
+   The failed assignment was the one populating the certifying set, so
+   `no_phantom_commit` became VACUOUSLY TRUE and the run cheerfully reported
+   "✅ No violation (explored 500029 states)". Twice. **Always confirm zero
+   `error: Examples/...` lines before reading any verdict.**
+ * **Run a syntax-only pass first** (detach the `#model_check` commands): 29s vs 10min.
+ * **`✅ No violation` does NOT distinguish exhaustion from a depth bound** —
+   `TraceDisplay.lean:104` renders `exploredAllReachableStates` and
+   `reachedDepthBound` identically. A SAFE verdict is only exhaustive if NO `maxDepth`
+   was passed. (This retroactively qualifies how ReconfigLC's `maxDepth := 13` runs
+   must be read.)
+ * **Batch all knob variants as multiple `#model_check` commands in one file** — the
+   Veil library is cached, so only the model recompiles; 4 verdicts for 1 build.
+ * `sat trace` at the 7 actions a genuine commit needs blows up `simp` (max steps
+   exceeded). Non-vacuity is instead a **knob-gated canary safety** run on the
+   explicit-state engine, where a REPORTED VIOLATION is the good news (its trace is
+   the witness). Same trick encodes the Bar-2b directed check.
+
+#### THREE MORE fidelity gaps — these the CHECKER found, via the post-fix CE
+The pre-fix run passed immediately, but the post-fix run kept coming back UNSAFE. Each
+CE was a model artifact, not a residual UC hazard; each was adjudicated against the
+Rust before being "fixed" (the discipline matters — patching a model until it goes
+green is exactly how a spike talks itself into a false KEEP):
+ 4. **A leader committed an entry it never authored.** `commitEntry` required only
+    `durableTo i`, so the leader committed off its own stale tail with `holdsEntry =
+    []` — nobody in the cluster held E. ReconfigLC.lean had it right
+    (`nset.contains i entryHolders`); weakening it was my error. Now `require holdsEntry i`.
+ 5. **Reports were stamped with the CONSENSUS term, not the receiver's HANDLE term.**
+    `term_handle.store` has exactly two call sites — `BecomeLeader` (node.rs:2478) and
+    `BecomeFollower` (node.rs:2506). There is NO candidate path, so a node starting its
+    own election keeps stamping the OLD term and a same-term leader rejects its reports
+    as stale. The model had an independent candidate (never in contact with the leader)
+    certifying a commit. Now `handleTerm` is separate state from `curTerm`.
+    **This cuts FOR Finding #5 too:** the handle is seeded at boot with `boot_term`
+    (node.rs:513) = recovered max(vote_term, map_term), which is exactly what lets the
+    rebooted unreconciled voter stamp a SAME-TERM report. Independent confirmation that
+    node.rs:2404-2418 (Finding #9's own fix) names the same lagging-handle distinction:
+    "`Action::StartElection` bumps `current_term` but stores NO handle ... so a
+    CANDIDATE runs its data plane at a LAGGING handle."
+ 6. **Stale-stream bytes materialised on a node already synced to the sitting leader.**
+    The CE had node 0 reconcile at term 1 and THEN sprout foreign bytes at P. DATA is
+    filtered at `adopted_term == term_handle` (receiver.rs:635 `dropped_stale_term`;
+    node.rs:2404-2418), so a synced node receives that leader's stream and nothing
+    else. Guarded with `∀ L, leader L → tlt (handleTerm j) (curTerm L)`.
+    **NARROWING — recorded honestly:** this also rules out the ordering where a node
+    takes a divergent tail FROM the sitting older-term leader. With one tracked entry
+    at one tracked position that class is still represented (take the stale bytes while
+    no leader sits — which is what the Bar-2 CE does), but RUN 2's SAFE verdict is
+    therefore **"safe within this restriction", NOT unqualified**.
+
+### SESSION 4 VERDICTS (n=3, term=Fin 2; one build, four `#model_check` runs, 7m33s)
+Elaboration clean (zero `error: Examples/...` lines) — checked explicitly, since a
+silent elaboration failure VOIDS a run into a vacuous pass (see toolchain lessons).
+
+| Run | Knobs | Result | Reading |
+|---|---|---|---|
+| 1 | `bootGateFix := false` | ❌ `no_phantom_commit` | **BAR 2 — PASS** |
+| 2 | `bootGateFix := true` | ✅ no violation, **312009 states, EXHAUSTIVE** (no maxDepth) | fix calibrated: CE gone |
+| 3 | `+ vacuityCanary` | ❌ `genuine_commit_canary` | **non-vacuity CONFIRMED** — RUN 2's SAFE is not "nothing ever commits" |
+| 4 | `+ bar2bCanary` | ❌ `bar2b_stream_distinction` | **BAR 2b — PASS** (violation = the good outcome) |
+
+**BAR 2 CE is exactly the Finding-#5 shape, 8 steps** — every element of the shipped
+bug's description present, in order:
+```
+staleStreamAppend(j=1)             node 1 acquires a divergent tail
+startElection(i=0, t=1)
+deliverRequestVoteGrant(c=0,j=1,t=1)  node 1 GRANTS term 1 → gate closes, mapTerm stays 0
+becomeLeader(i=0, q=2)
+crashRestart(j=1)                  reboots: vote_term 1 > map_term 0; PRE-FIX gate boots OPEN
+appendEntry(i=0)
+sendReport(j=1)                    unreconciled voter reports divergent durable AT TERM 1
+commitEntry(i=0, q=2)              phantom commit — holders {0}, no quorum holds E
+```
+Bar-2 was the spike's true tool-fitness gate and its failure would have been the DROP
+verdict; it passes on a model that ALSO calibrates the fix correctly (runs 1+2 together),
+which is the pairing that makes either verdict worth anything.
+
+**BAR 2b PASS in its commit-plane form** — the gate doc's deferred row. The checker
+exhibits a reachable state with two nodes both holding bytes at P, one from an earlier
+leader's stream (`¬holdsEntry`) and one from the current leader's (`holdsEntry`): a
+stale-handle-term stream byte and a current-term stream byte AT THE SAME POSITION,
+distinguished. The V2 window hunt is therefore not blind to its target class.
+
+**NOT ATTEMPTED this session: the #9/#6b depth probe** (brief's explicit stretch, NOT a
+gate — coming up empty there does not license a DROP, and neither does not running it).
+It is now much cheaper than it was: `handleTerm` is in place, and node.rs:2404-2418
+spells out #9's shape (a CANDIDATE that cleanly reconciles a HIGHER-term leader's map
+without adopting reopens intake for its LAGGING handle-term stream and accepts a
+cross-stream byte). Modeling it needs reconcile-without-adopt + a reopen keyed on
+`SM term == handle term`, behind a `finding9Fix` knob — the natural next session.

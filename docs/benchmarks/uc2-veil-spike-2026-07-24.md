@@ -33,9 +33,17 @@ produced real design-assurance findings:
   the checker **rediscovers the textbook disjoint-quorum data-loss shape**
   (calibration passed); and **Finding F-M7-2** pins down exactly what a faithful
   leader-completeness check for M7 requires.
-- **V2 (coherence-window forward hunt):** NOT run this session — deferred with
-  its commit-plane Bar-2/Bar-2b calibration (see §6). Per Amendment-3 V-M7 was
-  the primary and was taken first; V2 is the next session's work.
+- **Bar-2 + Bar-2b (session 4):** **both PASS** — the two remaining must-pass
+  bars are now discharged (§3a). A pre-fix `BootGate.lean` yields the Finding-#5
+  phantom commit as an 8-step CE matching the shipped bug's shape exactly, the
+  post-fix model is clean over an exhaustive 312009 states, non-vacuity is
+  witnessed, and the frame abstraction demonstrably still distinguishes a
+  stale-handle-term stream byte from a current-term one at the same position.
+  Six model-fidelity gaps were found and adjudicated against the Rust along the
+  way — the substantive output of the session.
+- **V2 (coherence-window forward hunt):** NOT run. Bar-2b (its precondition) now
+  passes, so it is unblocked for the next session. The #9/#6b depth probe — an
+  explicit stretch item, never a gate — was also not attempted (§6).
 
 No claim in `proofs/` or any "proved" status is affected. Nothing was migrated
 out of `proofs/`.
@@ -80,11 +88,71 @@ LC arc's Finding #8 (a model-fidelity gap forcing a faithful model).
 | Bar | Definition | Result |
 |---|---|---|
 | **Bar-1** | `#check_invariants` certifies the already-proved election `Inv` inductive | **PASS** — 43 ✅, `election_safety` + 5 clauses inductive via cvc5, all-n (session 1) |
-| **Bar-2** (shallowest known bug, Finding #5) | rediscover the boot-gate phantom commit from a pre-fix commit-plane model | **NOT RUN** — needs the commit plane; deferred to V2 (§6) |
-| **Bar-2b** (frame abstraction preserves the bug class) | show the abstraction still distinguishes the hazard it targets | **PASS in V-M7 form** — the reconfig model demonstrably reproduces the disjoint-quorum data-loss shape (§4); the commit-plane #9 variant is deferred with Bar-2 |
+| **Bar-2** (shallowest known bug, Finding #5) | rediscover the boot-gate phantom commit from a pre-fix commit-plane model | **PASS** (session 4) — `BootGate.lean`, pre-fix run returns the phantom commit as an **8-step CE matching Finding #5's shape exactly**; the post-fix run is clean and exhaustive (§3a) |
+| **Bar-2b** (frame abstraction preserves the bug class) | show the abstraction still distinguishes the hazard it targets | **PASS** — in V-M7 form (the reconfig model reproduces the disjoint-quorum data-loss shape, §4) **and now in its commit-plane #9 form** (session 4, §3a) |
 
-Per Amendment-3, V-M7 needs only V1's port + Bar-1 (both passed), so it ran
-first; Bar-2/Bar-2b's *coherence-window* form is V2 work.
+All three must-pass bars are now discharged. Per Amendment-3, V-M7 needed only
+V1's port + Bar-1 (both passed) so it ran first; Bar-2/Bar-2b's commit-plane
+form landed in session 4.
+
+## 3a. Bar-2 / Bar-2b — the boot-gate commit plane (session 4)
+
+Model `proofs-veil/models/BootGate.lean`, log
+`proofs-veil/logs/bootgate-bar2-bar2b-runs.log`. One build, four `#model_check`
+runs at n=3 / term=Fin 2, 7m33s. Knob `bootGateFix`: false = pre-fix (gate boots
+open unconditionally), true = the shipped fix (`node.rs:533-534`, gate closes iff
+`vote_term > map_term`).
+
+| Run | Knobs | Result | Reading |
+|---|---|---|---|
+| 1 | `bootGateFix := false` | ❌ `no_phantom_commit` | **BAR 2 — PASS** |
+| 2 | `bootGateFix := true` | ✅ no violation, **312009 states, exhaustive** | fix calibrated: the CE is gone |
+| 3 | `+ vacuityCanary` | ❌ `genuine_commit_canary` | **non-vacuity confirmed** — run 2's SAFE is not "nothing ever commits" |
+| 4 | `+ bar2bCanary` | ❌ `bar2b_stream_distinction` | **BAR 2b — PASS** (a violation is the good outcome for a canary) |
+
+Runs 1 and 2 are only worth anything *as a pair*: the checker finds the bug in
+the pre-fix model AND loses it in the post-fix one, on the same model. Run 3
+exists because a SAFE verdict over a model that can never commit would be
+worthless.
+
+**Bar-2's CE is the Finding-#5 shape, in order:** node 1 takes a divergent tail
+→ node 0 starts an election → node 1 GRANTS term 1 (gate closes, `mapTerm` stays
+0) → node 0 wins → **node 1 crash-restarts and, pre-fix, boots its gate OPEN with
+`vote_term 1 > map_term 0`** → node 0 appends → node 1 reports its divergent
+durable AT TERM 1 → node 0 commits with holders `{0}`, no quorum holding E.
+
+**Bar-2b** is discharged by construction and then witnessed: the model keeps
+`durableTo` (bytes at P landed — what AppendPosition reports) independent of
+`holdsEntry` (those bytes are the current leader's), and the checker exhibits a
+reachable state where two nodes hold bytes at the SAME position from DIFFERENT
+streams. The V2 window hunt is therefore not blind to its target class.
+
+### Fidelity work — six gaps, and why they matter more than the verdicts
+
+Three gaps were caught by hand-tracing the intended CE against the model text
+before running it; three more were caught by adjudicating the post-fix CE against
+the Rust rather than accepting it. Every one of the first three biased the result
+the *same* way — making the shipped fix look ineffective — which is the dangerous
+direction, since a Bar-2 red is the spike's DROP verdict. Full detail in
+`proofs-veil/spike-ledger.md`; the headline three:
+
+- **Term adoption must close the intake gate** (`node.rs:2511-2513`). Without it
+  the model admits a shallower phantom commit that is *not* Finding #5, so Bar-2
+  would have "passed" on the wrong bug.
+- **Reports are stamped with the receiver's HANDLE term, not the consensus term.**
+  `term_handle.store` has exactly two call sites (`BecomeLeader`,
+  `BecomeFollower`) — no candidate path. This independently rediscovers the
+  distinction `node.rs:2404-2418` already names for Finding #9 ("a CANDIDATE runs
+  its data plane at a LAGGING handle"), and it is also what makes Finding #5 work:
+  the handle is seeded at boot from `boot_term = max(vote_term, map_term)`.
+- **Stale-stream bytes cannot appear on a node synced to the sitting leader** —
+  DATA is filtered at `adopted_term == term_handle` (`receiver.rs:635`).
+
+**Qualification on run 2, stated plainly:** that last guard also rules out the
+ordering where a node takes a divergent tail *from* the sitting older-term leader.
+With one tracked entry at one tracked position the class is still represented (the
+Bar-2 CE takes its stale bytes while no leader sits), but run 2's SAFE is
+therefore **"safe within this restriction", not unqualified**.
 
 ## 4. V-M7 — the primary hunt (results)
 
@@ -158,21 +226,38 @@ Both are expected to hold by construction; the value is a directed confirmation.
 
 ## 6. Disposition + next steps
 
-**KEEP.** Bar-1 passed, V-M7 landed real assurance + a sharp fidelity finding,
-and both Veil engines are confirmed on the UC model. The tool fits.
+**KEEP — and now on the brief's own terms.** The exit criterion was: KEEP iff
+Bar-1 + both must-pass bars (2, 2b) passed AND at least one of {V-M7 surfaced or
+cleared a config-change scenario, V2 gave a real interleaving or credible bounded
+coverage} landed. **All three bars have now passed** (Bar-1 session 1, Bar-2 and
+Bar-2b session 4) and V-M7 landed. The DROP conditions are both explicitly
+excluded: Bar-2b is not unfixable, and the checker *did* rediscover the shallow
+Finding-#5 bug — which was the only failure that would have licensed "the tool is
+wrong for this codebase".
 
-Next session (V2 + the commit plane), in priority order:
+Next session, in priority order:
 
-1. **Commit/log plane** for `Reconfig.lean`: couple `adopt` to the committed
-   prefix + a committed-entry marker, then check **leader_completeness**
-   (committed-entry survival). Expect guarded-SAFE / ablated-UNSAFE on the *same*
-   property — the clean V-M7 result F-M7-2 scopes.
-2. **Bar-2 / Bar-2b (coherence window):** port the election-time commit plane
-   (boot intake gate + vote), revert Finding #5, confirm `#model_check`
-   rediscovers the shallow phantom-commit; then the #9 cross-stream depth-probe.
-3. **V2 forward hunt** for a fifth countermodel in the election-time coherence
-   window on the *fixed* model.
-4. If it survives: a nightly Veil model-check job next to the `elle` tier — a
+1. **V2 forward hunt** — now unblocked (Bar-2b was its precondition): run the
+   *fixed* model biased toward the election-time window (concurrent
+   `startElection` / `crashRestart` / gate-reopen / commit interleavings), hunting
+   a fifth countermodel. `BootGate.lean` is the natural base — it already carries
+   the gate, the vote, the lagging `handleTerm`, and the commit plane.
+2. **#9 / #6b depth probe** (stretch, NOT a gate). Much cheaper now: `handleTerm`
+   is in place and `node.rs:2404-2418` spells out #9's shape — a CANDIDATE that
+   cleanly reconciles a HIGHER-term leader's map *without adopting* reopens intake
+   for its lagging handle-term stream and accepts a cross-stream byte. Needs
+   reconcile-without-adopt + a reopen keyed on `SM term == handle term`, behind a
+   `finding9Fix` knob. Calibrates whether "absence at depth N" means anything.
+3. **Lift run 2's narrowing** (§3a qualification): let a node take a divergent
+   tail from the sitting older-term leader, which needs per-term stream identity
+   (a second tracked entry, or an `entryTerm`) rather than one tracked entry. Would
+   upgrade run 2's SAFE from "within this restriction" to unqualified.
+4. **`Reconfig.lean` commit/log plane** (F-M7-2) — still open, still blocked on the
+   tractability boundary characterised in session 3; **USER DECISION PENDING**
+   between (a) abstract-quorum reformulation + inductive proof (local, ~LC-arc
+   S2-equivalent) and (b) a larger box for deeper bounded coverage (CE-only; the
+   SAFE direction is exponential, not compute-bound). Unchanged by this session.
+5. If V2 survives: a nightly Veil model-check job next to the `elle` tier — a
    deliberate CI follow-up, not part of the spike (guardrail 3).
 
 ## 7. Cost
