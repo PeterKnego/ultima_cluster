@@ -1,0 +1,920 @@
+⚠ [711/1046] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1046] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1046] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+✖ [1418/1418] Building Examples.UC.ReconfigLC (32s)
+trace: .> LEAN_PATH=/home/claude/veil-spike/veil-preview/.lake/packages/cvc5/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Cli/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/batteries/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Qq/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/aesop/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/proofwidgets/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/importGraph/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/plausible/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/mathlib/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/auto/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/smt/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Loom/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/build/lib/lean /home/claude/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /home/claude/veil-spike/veil-preview/Examples/UC/ReconfigLC.lean -o /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/ReconfigLC.olean -i /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/ReconfigLC.ilean -c /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/ReconfigLC.c --setup /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/ReconfigLC.setup.json --json
+error: Examples/UC/ReconfigLC.lean:231:0: 26 verification conditions could not be discharged automatically
+Initialization must establish the invariant:
+  doesNotThrow ... ✅
+  election_safety ... 💥
+      Exceptions:
+        initializer_election_safety_0_WP, initializer_election_safety_tr_0_TR
+          incorrect number of universe levels List
+  leader_completeness ... 💥
+      Exceptions:
+        initializer_leader_completeness_0_WP, initializer_leader_completeness_tr_0_TR
+          incorrect number of universe levels List
+The following set of actions must preserve the invariant and successfully terminate:
+  deliverRequestVoteGrant
+    doesNotThrow ... ✅
+    election_safety ... 💥
+      Exceptions:
+        deliverRequestVoteGrant_election_safety_0_WP, deliverRequestVoteGrant_election_safety_tr_0_TR
+          incorrect number of universe levels List
+    leader_completeness ... 💥
+      Exceptions:
+        deliverRequestVoteGrant_leader_completeness_0_WP, deliverRequestVoteGrant_leader_completeness_tr_0_TR
+          incorrect number of universe levels List
+  replicate
+    doesNotThrow ... ✅
+    election_safety ... 💥
+      Exceptions:
+        replicate_election_safety_0_WP, replicate_election_safety_tr_0_TR
+          incorrect number of universe levels List
+    leader_completeness ... 💥
+      Exceptions:
+        replicate_leader_completeness_0_WP, replicate_leader_completeness_tr_0_TR
+          incorrect number of universe levels List
+  becomeLeader
+    doesNotThrow ... ✅
+    election_safety ... 💥
+      Exceptions:
+        becomeLeader_election_safety_0_WP, becomeLeader_election_safety_tr_0_TR
+          incorrect number of universe levels List
+    leader_completeness ... 💥
+      Exceptions:
+        becomeLeader_leader_completeness_0_WP, becomeLeader_leader_completeness_tr_0_TR
+          incorrect number of universe levels List
+  deliverVote
+    doesNotThrow ... ✅
+    election_safety ... 💥
+      Exceptions:
+        deliverVote_election_safety_0_WP, deliverVote_election_safety_tr_0_TR
+          incorrect number of universe levels List
+    leader_completeness ... 💥
+      Exceptions:
+        deliverVote_leader_completeness_0_WP, deliverVote_leader_completeness_tr_0_TR
+          incorrect number of universe levels List
+  crashRestart
+    doesNotThrow ... ✅
+    election_safety ... 💥
+      Exceptions:
+        crashRestart_election_safety_0_WP, crashRestart_election_safety_tr_0_TR
+          incorrect number of universe levels List
+    leader_completeness ... 💥
+      Exceptions:
+        crashRestart_leader_completeness_0_WP, crashRestart_leader_completeness_tr_0_TR
+          incorrect number of universe levels List
+  proposeAdd
+    doesNotThrow ... ✅
+    election_safety ... 💥
+      Exceptions:
+        proposeAdd_election_safety_0_WP, proposeAdd_election_safety_tr_0_TR
+          incorrect number of universe levels List
+    leader_completeness ... 💥
+      Exceptions:
+        proposeAdd_leader_completeness_0_WP, proposeAdd_leader_completeness_tr_0_TR
+          incorrect number of universe levels List
+  commitEntry
+    doesNotThrow ... ✅
+    election_safety ... 💥
+      Exceptions:
+        commitEntry_election_safety_0_WP, commitEntry_election_safety_tr_0_TR
+          incorrect number of universe levels List
+    leader_completeness ... 💥
+      Exceptions:
+        commitEntry_leader_completeness_0_WP, commitEntry_leader_completeness_tr_0_TR
+          incorrect number of universe levels List
+  adopt
+    doesNotThrow ... ✅
+    election_safety ... 💥
+      Exceptions:
+        adopt_election_safety_0_WP, adopt_election_safety_tr_0_TR
+          incorrect number of universe levels List
+    leader_completeness ... 💥
+      Exceptions:
+        adopt_leader_completeness_0_WP, adopt_leader_completeness_tr_0_TR
+          incorrect number of universe levels List
+  commitCfg
+    doesNotThrow ... ✅
+    election_safety ... 💥
+      Exceptions:
+        commitCfg_election_safety_0_WP, commitCfg_election_safety_tr_0_TR
+          incorrect number of universe levels List
+    leader_completeness ... 💥
+      Exceptions:
+        commitCfg_leader_completeness_0_WP, commitCfg_leader_completeness_tr_0_TR
+          incorrect number of universe levels List
+  proposeRemove
+    doesNotThrow ... ✅
+    election_safety ... 💥
+      Exceptions:
+        proposeRemove_election_safety_0_WP, proposeRemove_election_safety_tr_0_TR
+          incorrect number of universe levels List
+    leader_completeness ... 💥
+      Exceptions:
+        proposeRemove_leader_completeness_0_WP, proposeRemove_leader_completeness_tr_0_TR
+          incorrect number of universe levels List
+  appendEntry
+    doesNotThrow ... ✅
+    election_safety ... 💥
+      Exceptions:
+        appendEntry_election_safety_0_WP, appendEntry_election_safety_tr_0_TR
+          incorrect number of universe levels List
+    leader_completeness ... 💥
+      Exceptions:
+        appendEntry_leader_completeness_0_WP, appendEntry_leader_completeness_tr_0_TR
+          incorrect number of universe levels List
+  startElection
+    doesNotThrow ... ✅
+    election_safety ... 💥
+      Exceptions:
+        startElection_election_safety_0_WP, startElection_election_safety_tr_0_TR
+          incorrect number of universe levels List
+    leader_completeness ... 💥
+      Exceptions:
+        startElection_leader_completeness_0_WP, startElection_leader_completeness_tr_0_TR
+          incorrect number of universe levels List
+info: Examples/UC/ReconfigLC.lean:231:0: Insert theorem stubs for undischarged verification conditions:
+
+  [apply] #check_invariants
+  
+  @[veil]
+  theorem initializer_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+        (@initializer.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+          nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+        (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+          nodeSet_inhabited tot nset ρ_sub)
+        (fun _ _ => True)
+        (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+          nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem initializer_leader_completeness (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+        (@initializer.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+          nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+        (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+          nodeSet_inhabited tot nset ρ_sub)
+        (fun _ _ => True)
+        (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+          nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem startElection_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ]
+      [startElection_dec_0 : delta% @UcReconfigLC.startElection._veil_dec_type_0 node term χ tot nodeSet χ_rep] :
+      ∀ (i : node) (t : term),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@startElection.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub startElection_dec_0 i t)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem startElection_leader_completeness (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ]
+      [startElection_dec_0 : delta% @UcReconfigLC.startElection._veil_dec_type_0 node term χ tot nodeSet χ_rep] :
+      ∀ (i : node) (t : term),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@startElection.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub startElection_dec_0 i t)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem deliverRequestVoteGrant_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ]
+      [deliverRequestVoteGrant_dec_0 :
+        delta% @UcReconfigLC.deliverRequestVoteGrant._veil_dec_type_0 node term χ tot nodeSet χ_rep]
+      [deliverRequestVoteGrant_dec_1 : delta% @UcReconfigLC.deliverRequestVoteGrant._veil_dec_type_1 node term tot]
+      [deliverRequestVoteGrant_dec_2 :
+        delta% @UcReconfigLC.deliverRequestVoteGrant._veil_dec_type_2 node term χ tot nodeSet χ_rep] :
+      ∀ (j : node) (c : node) (t : term),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@deliverRequestVoteGrant.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet
+            nodeSet_dec_eq nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub deliverRequestVoteGrant_dec_0
+            deliverRequestVoteGrant_dec_1 deliverRequestVoteGrant_dec_2 j c t)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem deliverRequestVoteGrant_leader_completeness (ρ : Type) (σ : Type) (node : Type)
+      [node_dec_eq : DecidableEq.{1} node] [node_inhabited : Inhabited.{1} node] (term : Type)
+      [term_dec_eq : DecidableEq.{1} term] [term_inhabited : Inhabited.{1} term] (nodeSet : Type)
+      [nodeSet_dec_eq : DecidableEq.{1} nodeSet] [nodeSet_inhabited : Inhabited.{1} nodeSet]
+      [tot : TotalOrderWithZero term] [nset : TSet node nodeSet] (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ]
+      [deliverRequestVoteGrant_dec_0 :
+        delta% @UcReconfigLC.deliverRequestVoteGrant._veil_dec_type_0 node term χ tot nodeSet χ_rep]
+      [deliverRequestVoteGrant_dec_1 : delta% @UcReconfigLC.deliverRequestVoteGrant._veil_dec_type_1 node term tot]
+      [deliverRequestVoteGrant_dec_2 :
+        delta% @UcReconfigLC.deliverRequestVoteGrant._veil_dec_type_2 node term χ tot nodeSet χ_rep] :
+      ∀ (j : node) (c : node) (t : term),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@deliverRequestVoteGrant.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet
+            nodeSet_dec_eq nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub deliverRequestVoteGrant_dec_0
+            deliverRequestVoteGrant_dec_1 deliverRequestVoteGrant_dec_2 j c t)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem deliverVote_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node) (v : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@deliverVote.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i v)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem deliverVote_leader_completeness (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node) (v : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@deliverVote.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i v)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem becomeLeader_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@becomeLeader.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem becomeLeader_leader_completeness (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@becomeLeader.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem crashRestart_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@crashRestart.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem crashRestart_leader_completeness (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@crashRestart.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem appendEntry_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@appendEntry.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem appendEntry_leader_completeness (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@appendEntry.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem replicate_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ]
+      [replicate_dec_0 : delta% @UcReconfigLC.replicate._veil_dec_type_0 node χ term tot nodeSet χ_rep] :
+      ∀ (i : node) (j : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@replicate.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub replicate_dec_0 i j)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem replicate_leader_completeness (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ]
+      [replicate_dec_0 : delta% @UcReconfigLC.replicate._veil_dec_type_0 node χ term tot nodeSet χ_rep] :
+      ∀ (i : node) (j : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@replicate.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub replicate_dec_0 i j)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem commitEntry_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@commitEntry.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem commitEntry_leader_completeness (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@commitEntry.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem proposeRemove_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node) (x : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@proposeRemove.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i x)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem proposeRemove_leader_completeness (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node) (x : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@proposeRemove.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i x)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem proposeAdd_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node) (x : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@proposeAdd.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i x)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem proposeAdd_leader_completeness (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node) (x : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@proposeAdd.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i x)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem adopt_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ]
+      [adopt_dec_0 : delta% @UcReconfigLC.adopt._veil_dec_type_0 node χ term tot nodeSet χ_rep] :
+      ∀ (j : node) (i : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@adopt.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub adopt_dec_0 j i)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem adopt_leader_completeness (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ]
+      [adopt_dec_0 : delta% @UcReconfigLC.adopt._veil_dec_type_0 node χ term tot nodeSet χ_rep] :
+      ∀ (j : node) (i : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@adopt.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub adopt_dec_0 j i)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem commitCfg_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@commitCfg.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+  
+  @[veil]
+  theorem commitCfg_leader_completeness (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (nodeSet : Type) [nodeSet_dec_eq : DecidableEq.{1} nodeSet]
+      [nodeSet_inhabited : Inhabited.{1} nodeSet] [tot : TotalOrderWithZero term] [nset : TSet node nodeSet]
+      (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term nodeSet __veil_f)
+            (State.Label.toCodomain node term nodeSet __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term nodeSet) ρ] :
+      ∀ (i : node),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@commitCfg.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub i)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited nodeSet nodeSet_dec_eq
+            nodeSet_inhabited tot nset χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+error: Lean exited with code 1
+Some required targets logged failures:
+- Examples.UC.ReconfigLC
+error: build failed
