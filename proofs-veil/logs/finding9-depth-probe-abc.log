@@ -1,0 +1,171 @@
+⚠ [711/1273] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1273] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1273] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+✖ [1418/1418] Building Examples.UC.Finding9 (930s)
+trace: .> LEAN_PATH=/home/claude/veil-spike/veil-preview/.lake/packages/cvc5/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Cli/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/batteries/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Qq/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/aesop/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/proofwidgets/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/importGraph/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/plausible/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/mathlib/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/auto/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/smt/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Loom/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/build/lib/lean /home/claude/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /home/claude/veil-spike/veil-preview/Examples/UC/Finding9.lean -o /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/Finding9.olean -i /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/Finding9.ilean -c /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/Finding9.c --setup /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/Finding9.setup.json --json
+error: Examples/UC/Finding9.lean:290:0: ❌ Violation: safety_failure (violates: no_cross_stream_reopen)
+  Theory:
+    finding9Fix = false
+    proxyOn = true
+  State 0 (via init):
+    awaitingReconcile = []
+    candidate = []
+    committed = false
+    curTerm = [[0, 0], [1, 0], [2, 0]]
+    durableTo = []
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 0], [2, 0]]
+    hasVoted = []
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = []
+    tailAttributed = [0, 1, 2]
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 0], [1, 0], [2, 0]]
+  State 1 (via startElection(i=1, t=1)):
+    awaitingReconcile = []
+    candidate = [1]
+    committed = false
+    curTerm = [[0, 0], [1, 1], [2, 0]]
+    durableTo = []
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 0], [2, 0]]
+    hasVoted = [1]
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[1, 1]]
+    tailAttributed = [0, 1, 2]
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 0], [1, 1], [2, 0]]
+  State 2 (via startElection(i=0, t=2)):
+    awaitingReconcile = []
+    candidate = [0, 1]
+    committed = false
+    curTerm = [[0, 2], [1, 1], [2, 0]]
+    durableTo = []
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 0], [2, 0]]
+    hasVoted = [0, 1]
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[0, 2], [1, 1]]
+    tailAttributed = [0, 1, 2]
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 2], [1, 1], [2, 0]]
+  State 3 (via deliverRequestVoteGrant(c=0, j=1, t=2)):
+    awaitingReconcile = [1]
+    candidate = [0]
+    committed = false
+    curTerm = [[0, 2], [1, 2], [2, 0]]
+    durableTo = []
+    gateOpen = [0, 2]
+    handleTerm = [[0, 0], [1, 2], [2, 0]]
+    hasVoted = [0, 1]
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[0, 2], [1, 1]]
+    tailAttributed = [0, 1, 2]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 2]]]
+    voteTerm = [[0, 2], [1, 2], [2, 0]]
+  State 4 (via deliverRequestVoteGrant(c=1, j=2, t=1)):
+    awaitingReconcile = [1, 2]
+    candidate = [0]
+    committed = false
+    curTerm = [[0, 2], [1, 2], [2, 1]]
+    durableTo = []
+    gateOpen = [0]
+    handleTerm = [[0, 0], [1, 2], [2, 1]]
+    hasVoted = [0, 1, 2]
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[0, 2], [1, 1]]
+    tailAttributed = [0, 1, 2]
+    voteCand = [[0, 0], [1, 0], [2, 1]]
+    voteMsg = [[1, [0, 2]], [2, [1, 1]]]
+    voteTerm = [[0, 2], [1, 2], [2, 1]]
+  State 5 (via startElection(i=2, t=2)):
+    awaitingReconcile = [1, 2]
+    candidate = [0, 2]
+    committed = false
+    curTerm = [[0, 2], [1, 2], [2, 2]]
+    durableTo = []
+    gateOpen = [0]
+    handleTerm = [[0, 0], [1, 2], [2, 1]]
+    hasVoted = [0, 1, 2]
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[0, 2], [1, 1], [2, 2]]
+    tailAttributed = [0, 1, 2]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 2]], [2, [1, 1]]]
+    voteTerm = [[0, 2], [1, 2], [2, 2]]
+  State 6 (via becomeLeader(i=0, q=2)):
+    awaitingReconcile = [1, 2]
+    candidate = [2]
+    committed = false
+    curTerm = [[0, 2], [1, 2], [2, 2]]
+    durableTo = []
+    gateOpen = [0]
+    handleTerm = [[0, 2], [1, 2], [2, 1]]
+    hasVoted = [0, 1, 2]
+    holdsEntry = []
+    leader = [0]
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[0, 2], [1, 1], [2, 2]]
+    tailAttributed = [0, 1, 2]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 2]], [2, [1, 1]]]
+    voteTerm = [[0, 2], [1, 2], [2, 2]]
+  State 7 (via reconcileNonAdopt(i=0, j=2)):
+    awaitingReconcile = [1]
+    candidate = [2]
+    committed = false
+    curTerm = [[0, 2], [1, 2], [2, 2]]
+    durableTo = []
+    gateOpen = [0, 2]
+    handleTerm = [[0, 2], [1, 2], [2, 1]]
+    hasVoted = [0, 1, 2]
+    holdsEntry = []
+    leader = [0]
+    mapTerm = [[0, 0], [1, 0], [2, 2]]
+    report = []
+    reqVote = [[0, 2], [1, 1], [2, 2]]
+    tailAttributed = [0, 1, 2]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 2]], [2, [1, 1]]]
+    voteTerm = [[0, 2], [1, 2], [2, 2]]
+info: Examples/UC/Finding9.lean:294:0: ✅ No violation (explored 879650 states)
+info: Examples/UC/Finding9.lean:300:0: ✅ No violation (explored 1288622 states)
+error: Lean exited with code 1
+Some required targets logged failures:
+- Examples.UC.Finding9
+error: build failed
+
+real	15m31.754s
+user	56m7.588s
+sys	0m33.470s

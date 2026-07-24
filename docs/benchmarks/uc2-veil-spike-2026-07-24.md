@@ -156,9 +156,37 @@ full acked-write-loss — deep). They are knob-gated because BFS halts at the
 first violation, so the depth-7 proxy would otherwise mask the deep hunt.
 Expressing #9's loss at all required new state, `tailAttributed`: the byte is one
 "its map never attributed", so a later clean reconcile cannot detect or truncate
-it. **The deep-property depth is still being measured** (probes B/C were
-re-running when this was written; their first attempt returned a knob-independent
-artifact CE, since fixed — see the ledger).
+it.
+
+| Probe | Knobs | Bound | Result |
+|---|---|---|---|
+| A | pre-fix, proxy ON | maxDepth 12 | ❌ `no_cross_stream_reopen` at **depth 7**, 1m44s |
+| B | **post-fix**, proxy ON | maxDepth 12 | ✅ no violation, 879650 states — guard closes the reopen |
+| C | pre-fix, proxy OFF | maxDepth 13 | ✅ no violation, 1288622 states — full loss **not reached** |
+
+**B and C are BOUNDED results, not safety claims.** Both passed a `maxDepth`, and
+`✅ No violation` renders identically for exhaustion and for a depth bound
+(`TraceDisplay.lean:104`). B reads as "no cross-stream reopen within depth 12
+under the shipped guard"; C as "the full acked-write-loss was not reached within
+depth 13", not "it is absent".
+
+### The calibration answer
+
+**#9 splits into a shallow enabling condition and a deep consequence:** the
+enabling condition (intake open at a lagging handle) sits at **depth 7 / 1m44s**,
+while the full acked-write-loss is **beyond depth 13** even pre-fix, after 1.29M
+states. For the V2 forward hunt at n=3 / Fin 3 that means: *absence at depth ~13
+is worth very little for an end-to-end data-loss property, and a great deal for
+an invariant-shaped proxy.*
+
+The practical guidance — **hunt proxy invariants (the conditions the shipped
+guards establish), not end-to-end loss properties.** Each of the four known bugs
+has such a proxy (#5: a report escaping an unreconciled boot; #9: intake open at
+a lagging handle), and the proxy sits roughly six steps shallower than the loss
+it enables. This is the most useful thing the probe produced and it directly
+shapes how V2 should be run. It is also consistent with session 3's ReconfigLC
+wall: the wall is real, but it sits *above* the proxy depth, which is why this
+probe landed where that one stalled.
 
 ### Fidelity work — eight gaps, and why they matter more than the verdicts
 
@@ -272,17 +300,17 @@ wrong for this codebase".
 
 Next session, in priority order:
 
-1. **V2 forward hunt** — now unblocked (Bar-2b was its precondition): run the
-   *fixed* model biased toward the election-time window (concurrent
-   `startElection` / `crashRestart` / gate-reopen / commit interleavings), hunting
-   a fifth countermodel. `BootGate.lean` is the natural base — it already carries
-   the gate, the vote, the lagging `handleTerm`, and the commit plane.
-2. **#9 / #6b depth probe** (stretch, NOT a gate). Much cheaper now: `handleTerm`
-   is in place and `node.rs:2404-2418` spells out #9's shape — a CANDIDATE that
-   cleanly reconciles a HIGHER-term leader's map *without adopting* reopens intake
-   for its lagging handle-term stream and accepts a cross-stream byte. Needs
-   reconcile-without-adopt + a reopen keyed on `SM term == handle term`, behind a
-   `finding9Fix` knob. Calibrates whether "absence at depth N" means anything.
+1. **V2 forward hunt** — now unblocked (Bar-2b was its precondition), and the
+   depth probe (§3b) says how to run it: **hunt proxy invariants, not end-to-end
+   loss properties**, since the proxy sits ~6 steps shallower and the loss is out
+   of reach at n=3. `Finding9.lean` is the better base of the two — it carries the
+   gate, the vote, the lagging `handleTerm`, `tailAttributed`, and the commit
+   plane. Bias toward the election-time window (concurrent `startElection` /
+   `crashRestart` / gate-reopen / commit interleavings) hunting a fifth
+   countermodel.
+2. ~~#9 / #6b depth probe~~ — **DONE (§3b).** #9's enabling condition at depth 7;
+   full loss beyond depth 13. The **#6b Figure-8 half was not attempted** and
+   remains open if a second calibration point is wanted.
 3. **Lift run 2's narrowing** (§3a qualification): let a node take a divergent
    tail from the sitting older-term leader, which needs per-term stream identity
    (a second tracked entry, or an `entryTerm`) rather than one tracked entry. Would
