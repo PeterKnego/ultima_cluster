@@ -37,6 +37,11 @@ truncation × recovery — not about the math. UC's bet: that surface is exactly
 what `uc2_sim` + the WGL capstones + the crashtest were built to hold. M7 is
 the first place v2 deliberately exceeds the reference.
 
+> **See also:** `docs/notes/uc2-m7-vs-aeron-cluster-standby-2026-07-24.md` — a
+> full M7-vs-Aeron-Cluster-Standby comparison plus a sketch of what an "async
+> cross-region learner" (UC's Standby analog) would take against the current
+> design.
+
 ## 2. As-built baseline (what this design changes)
 
 Membership today is 100 % boot config, zero durable state:
