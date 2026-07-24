@@ -113,3 +113,25 @@ concrete Rust-reconfirm questions for a future session (brief's "any hit → rec
 ### V-M7 STATUS: strong checkpoint. Deliverables archived to worktree proofs-veil/.
 election_safety proven robust; checker calibrated on the disjoint-quorum class; the precise
 leader_completeness property scoped to a commit-plane extension. Gate doc written (V3).
+
+### SESSION 3 cont. — commit-plane extension (leader_completeness). STOPPED by user mid-run.
+Built ReconfigLC.lean: adds commit/log plane (single committed entry E: committed/committedTerm/
+entryHolders) + UN-abstracted up-to-date election restriction + prefixCoupling knob (the F-M7-2
+mechanism: adopt-requires-committed-prefix). Safety = leader_completeness.
+MODEL BUG CAUGHT+FIXED: up-to-date restriction must key on LOG contents (entryHolders), not
+`committed` — else a pre-commit vote strands a soon-to-commit entry (a real Raft subtlety; first
+(F,F) run produced that spurious CE, cfg unchanged). Fixed: drop the `committed ∧` gate.
+TRACTABILITY BOUNDARY (the finding — both walls hit, precisely characterized):
+ * #check_invariants (SMT, all-n): 💥 "incorrect number of universe levels List" on the concrete
+   TSet ops (count/intersection/subsets are List-backed) — concrete-set model CANNOT take the SMT
+   inductiveness path. Would need an abstract-quorum (member/quorumin relations + adjacency
+   assumptions, VerticalPaxos-style) reformulation + LC-arc-style supporting invariants.
+ * #model_check (explicit-state): concrete cardinality OK, but config+commit state space EXPLODES
+   at n=3 — (F,F) unbounded 700s no verdict; (F,F) maxDepth:=13 (syntax works) still exploring at
+   10min (breadth at each depth is the blowup, not depth). CE is deep (~13 steps: append+replicate+
+   commit E, then config-walk, then losing election).
+STATUS: model + property faithful and built; the disjoint-quorum PRECURSOR already shown in
+Reconfig.lean (session 3). Landing a clean guarded-SAFE/ablated-UNSAFE leader_completeness needs
+EITHER (a) abstract-quorum reformulation + inductive proof (local, ~LC-arc S2-equiv effort), OR
+(b) a much larger box for deeper bounded explicit-state coverage (helps the CE only; the SAFE
+direction is exponential, not compute-bound). USER DECISION PENDING (AWS offered).
