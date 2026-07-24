@@ -41,9 +41,16 @@ produced real design-assurance findings:
   stale-handle-term stream byte from a current-term one at the same position.
   Six model-fidelity gaps were found and adjudicated against the Rust along the
   way — the substantive output of the session.
+- **Depth probe (sessions 4b/4c, stretch — never a gate):** run on BOTH #9 and
+  #6b, and it produced the session's most reusable result. Each bug splits into a
+  **shallow proxy invariant** (the condition its shipped guard establishes) and a
+  **deep end-to-end loss**: #9's proxy at **depth 7**, #6b's §5.4.2 proxy at
+  **depth 5**, while #9's full loss is beyond depth 13 and #6b's needed 46 steps
+  in Lean. Hence the operating rule for V2: **hunt proxy invariants, not
+  end-to-end loss properties** (§3b, §3c). #6b's full-loss depth remains
+  **unmeasured** — blocked by a hard `Fin 4` memory wall on this box (§3c).
 - **V2 (coherence-window forward hunt):** NOT run. Bar-2b (its precondition) now
-  passes, so it is unblocked for the next session. The #9/#6b depth probe — an
-  explicit stretch item, never a gate — was also not attempted (§6).
+  passes, so it is unblocked for the next session — and §3b/§3c say how to aim it.
 
 No claim in `proofs/` or any "proved" status is affected. Nothing was migrated
 out of `proofs/`.
@@ -188,10 +195,50 @@ shapes how V2 should be run. It is also consistent with session 3's ReconfigLC
 wall: the wall is real, but it sits *above* the proxy depth, which is why this
 probe landed where that one stalled.
 
-### Fidelity work — eight gaps, and why they matter more than the verdicts
+## 3c. The #6b Figure-8 probe (session 4c) — second calibration point
 
-Eight across the session (six in `BootGate.lean`, two more surfaced by the #9
-probe). Three were caught by hand-tracing the intended CE against the model text
+Model `proofs-veil/models/Figure8.lean`, log
+`proofs-veil/logs/figure8-probeD.log`. Chosen as the sharpest available test of
+§3b's guidance: #6b's full loss was machine-checked in Lean as a **46-step, n=5**
+countermodel, while its proxy — the Raft §5.4.2 barrier — should be trivial. If
+the guidance were overfit to #9, #6b is where that would show.
+
+**Probe D (pre-fix, n=3 / Fin 3): proxy CE at DEPTH 5, in 1m22s.** A new leader
+(`new_term_pos = None`) takes one honest post-reconcile AppendPosition floor
+report and commits the inherited old-term range with no quorum on this term's
+NewTerm frame — the §5.4.2 barrier violated in five steps.
+
+**The guidance holds on a second bug, and the split is wider here:** proxy at
+depth 5 versus a full loss that needed 46 steps in Lean. §3b's rule is not
+overfit to #9.
+
+### The box wall — an honest negative, and a hard operational limit
+
+A faithful Figure-8 needs **three election terms** (rival at T1, leader at T2,
+rival again at T3), so the full-loss probes require `term := Fin 4`. At n=3 /
+Fin 4 / maxDepth 13, `lean` reached **12.1 GB RSS** and drove the box to 2.37 GB
+available — **killed under the box-safety rule** (no swap; an OOM SIGKILLs the
+largest process and can take the session with it). Lean buffers verdicts until
+the file finishes elaborating, so 15+ minutes produced **no partial output**.
+
+**Operational limit for this box: `term := Fin 4` at n=3 is not viable for this
+model class.** Fin 3 runs stayed comfortable throughout (≥12.6 GB free). This is
+a sharper constraint than session 3's ReconfigLC time-wall — that one merely
+failed to converge; this one endangers the session.
+
+**Consequence, stated plainly: the #6b full-loss depth is UNMEASURED, not
+absent.** Probes E and F never ran, so nothing is known about whether the clamp
+prevents the loss itself as opposed to its proxy. An earlier pre-patch run that
+appeared to find a loss at depth 8 was an artifact (a leader committing a range
+it had already discarded) and is **retracted, not banked**.
+
+### Fidelity work — eleven gaps, and why they matter more than the verdicts
+
+Eleven across the session (six in `BootGate.lean`, two from the #9 probe, three
+from the #6b probe). One recurred **three separate times**: letting a leader
+commit a range it does not itself hold — the standing trap of this modeling
+style, since `rank_leader` ranks the quorum-th durable *including the leader's
+own*. Three were caught by hand-tracing the intended CE against the model text
 before running it; five were caught by adjudicating a counterexample against the
 Rust rather than accepting it. Every one of the first three biased the result the
 *same* way — making the shipped fix look ineffective — which is the dangerous
@@ -308,9 +355,11 @@ Next session, in priority order:
    plane. Bias toward the election-time window (concurrent `startElection` /
    `crashRestart` / gate-reopen / commit interleavings) hunting a fifth
    countermodel.
-2. ~~#9 / #6b depth probe~~ — **DONE (§3b).** #9's enabling condition at depth 7;
-   full loss beyond depth 13. The **#6b Figure-8 half was not attempted** and
-   remains open if a second calibration point is wanted.
+2. ~~#9 / #6b depth probe~~ — **DONE (§3b, §3c).** #9's enabling condition at
+   depth 7 (full loss beyond depth 13); #6b's §5.4.2 proxy at depth 5. **Still
+   open: #6b's full-loss depth**, blocked by the `Fin 4` box wall (§3c) — it
+   needs either a bigger box or an abstraction that expresses a 3-term Figure-8
+   without a fourth term value.
 3. **Lift run 2's narrowing** (§3a qualification): let a node take a divergent
    tail from the sitting older-term leader, which needs per-term stream identity
    (a second tracked entry, or an `entryTerm`) rather than one tracked entry. Would
