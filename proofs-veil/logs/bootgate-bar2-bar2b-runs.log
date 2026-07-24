@@ -1,0 +1,421 @@
+⚠ [711/1261] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1261] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1261] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+✖ [1418/1418] Building Examples.UC.BootGate (451s)
+trace: .> LEAN_PATH=/home/claude/veil-spike/veil-preview/.lake/packages/cvc5/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Cli/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/batteries/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Qq/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/aesop/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/proofwidgets/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/importGraph/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/plausible/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/mathlib/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/auto/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/smt/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Loom/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/build/lib/lean /home/claude/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /home/claude/veil-spike/veil-preview/Examples/UC/BootGate.lean -o /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/BootGate.olean -i /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/BootGate.ilean -c /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/BootGate.c --setup /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/BootGate.setup.json --json
+error: Examples/UC/BootGate.lean:338:0: ❌ Violation: safety_failure (violates: no_phantom_commit)
+  Theory:
+    bar2bCanary = false
+    bootGateFix = false
+    vacuityCanary = false
+  State 0 (via init):
+    candidate = []
+    committed = false
+    curTerm = [[0, 0], [1, 0], [2, 0]]
+    durableTo = []
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 0], [2, 0]]
+    hasVoted = []
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = []
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 0], [1, 0], [2, 0]]
+  State 1 (via staleStreamAppend(j=1)):
+    candidate = []
+    committed = false
+    curTerm = [[0, 0], [1, 0], [2, 0]]
+    durableTo = [1]
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 0], [2, 0]]
+    hasVoted = []
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = []
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 0], [1, 0], [2, 0]]
+  State 2 (via startElection(i=0, t=1)):
+    candidate = [0]
+    committed = false
+    curTerm = [[0, 1], [1, 0], [2, 0]]
+    durableTo = [1]
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 0], [2, 0]]
+    hasVoted = [0]
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 1], [1, 0], [2, 0]]
+  State 3 (via deliverRequestVoteGrant(c=0, j=1, t=1)):
+    candidate = [0]
+    committed = false
+    curTerm = [[0, 1], [1, 1], [2, 0]]
+    durableTo = [1]
+    gateOpen = [0, 2]
+    handleTerm = [[0, 0], [1, 1], [2, 0]]
+    hasVoted = [0, 1]
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 4 (via becomeLeader(i=0, q=2)):
+    candidate = []
+    committed = false
+    curTerm = [[0, 1], [1, 1], [2, 0]]
+    durableTo = [1]
+    gateOpen = [0, 2]
+    handleTerm = [[0, 1], [1, 1], [2, 0]]
+    hasVoted = [0, 1]
+    holdsEntry = []
+    leader = [0]
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 5 (via crashRestart(j=1)):
+    candidate = []
+    committed = false
+    curTerm = [[0, 1], [1, 1], [2, 0]]
+    durableTo = [1]
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 1], [1, 1], [2, 0]]
+    hasVoted = [0, 1]
+    holdsEntry = []
+    leader = [0]
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 6 (via appendEntry(i=0)):
+    candidate = []
+    committed = false
+    curTerm = [[0, 1], [1, 1], [2, 0]]
+    durableTo = [0, 1]
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 1], [1, 1], [2, 0]]
+    hasVoted = [0, 1]
+    holdsEntry = [0]
+    leader = [0]
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 7 (via sendReport(j=1)):
+    candidate = []
+    committed = false
+    curTerm = [[0, 1], [1, 1], [2, 0]]
+    durableTo = [0, 1]
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 1], [1, 1], [2, 0]]
+    hasVoted = [0, 1]
+    holdsEntry = [0]
+    leader = [0]
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = [[1, 1]]
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 8 (via commitEntry(i=0, q=2)):
+    candidate = []
+    committed = true
+    curTerm = [[0, 1], [1, 1], [2, 0]]
+    durableTo = [0, 1]
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 1], [1, 1], [2, 0]]
+    hasVoted = [0, 1]
+    holdsEntry = [0]
+    leader = [0]
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = [[1, 1]]
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+info: Examples/UC/BootGate.lean:342:0: ✅ No violation (explored 312009 states)
+error: Examples/UC/BootGate.lean:348:0: ❌ Violation: safety_failure (violates: genuine_commit_canary)
+  Theory:
+    bar2bCanary = false
+    bootGateFix = true
+    vacuityCanary = true
+  State 0 (via init):
+    candidate = []
+    committed = false
+    curTerm = [[0, 0], [1, 0], [2, 0]]
+    durableTo = []
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 0], [2, 0]]
+    hasVoted = []
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = []
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 0], [1, 0], [2, 0]]
+  State 1 (via startElection(i=2, t=1)):
+    candidate = [2]
+    committed = false
+    curTerm = [[0, 0], [1, 0], [2, 1]]
+    durableTo = []
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 0], [2, 0]]
+    hasVoted = [2]
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[2, 1]]
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 0], [1, 0], [2, 1]]
+  State 2 (via deliverRequestVoteGrant(c=2, j=1, t=1)):
+    candidate = [2]
+    committed = false
+    curTerm = [[0, 0], [1, 1], [2, 1]]
+    durableTo = []
+    gateOpen = [0, 2]
+    handleTerm = [[0, 0], [1, 1], [2, 0]]
+    hasVoted = [1, 2]
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[2, 1]]
+    voteCand = [[0, 0], [1, 2], [2, 2]]
+    voteMsg = [[1, [2, 1]]]
+    voteTerm = [[0, 0], [1, 1], [2, 1]]
+  State 3 (via becomeLeader(i=2, q=0)):
+    candidate = []
+    committed = false
+    curTerm = [[0, 0], [1, 1], [2, 1]]
+    durableTo = []
+    gateOpen = [0, 2]
+    handleTerm = [[0, 0], [1, 1], [2, 1]]
+    hasVoted = [1, 2]
+    holdsEntry = []
+    leader = [2]
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[2, 1]]
+    voteCand = [[0, 0], [1, 2], [2, 2]]
+    voteMsg = [[1, [2, 1]]]
+    voteTerm = [[0, 0], [1, 1], [2, 1]]
+  State 4 (via reconcile(i=2, j=1)):
+    candidate = []
+    committed = false
+    curTerm = [[0, 0], [1, 1], [2, 1]]
+    durableTo = []
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 1], [2, 1]]
+    hasVoted = [1, 2]
+    holdsEntry = []
+    leader = [2]
+    mapTerm = [[0, 0], [1, 1], [2, 0]]
+    report = []
+    reqVote = [[2, 1]]
+    voteCand = [[0, 0], [1, 2], [2, 2]]
+    voteMsg = [[1, [2, 1]]]
+    voteTerm = [[0, 0], [1, 1], [2, 1]]
+  State 5 (via appendEntry(i=2)):
+    candidate = []
+    committed = false
+    curTerm = [[0, 0], [1, 1], [2, 1]]
+    durableTo = [2]
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 1], [2, 1]]
+    hasVoted = [1, 2]
+    holdsEntry = [2]
+    leader = [2]
+    mapTerm = [[0, 0], [1, 1], [2, 0]]
+    report = []
+    reqVote = [[2, 1]]
+    voteCand = [[0, 0], [1, 2], [2, 2]]
+    voteMsg = [[1, [2, 1]]]
+    voteTerm = [[0, 0], [1, 1], [2, 1]]
+  State 6 (via replicate(i=2, j=1)):
+    candidate = []
+    committed = false
+    curTerm = [[0, 0], [1, 1], [2, 1]]
+    durableTo = [1, 2]
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 1], [2, 1]]
+    hasVoted = [1, 2]
+    holdsEntry = [1, 2]
+    leader = [2]
+    mapTerm = [[0, 0], [1, 1], [2, 0]]
+    report = []
+    reqVote = [[2, 1]]
+    voteCand = [[0, 0], [1, 2], [2, 2]]
+    voteMsg = [[1, [2, 1]]]
+    voteTerm = [[0, 0], [1, 1], [2, 1]]
+  State 7 (via sendReport(j=1)):
+    candidate = []
+    committed = false
+    curTerm = [[0, 0], [1, 1], [2, 1]]
+    durableTo = [1, 2]
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 1], [2, 1]]
+    hasVoted = [1, 2]
+    holdsEntry = [1, 2]
+    leader = [2]
+    mapTerm = [[0, 0], [1, 1], [2, 0]]
+    report = [[1, 1]]
+    reqVote = [[2, 1]]
+    voteCand = [[0, 0], [1, 2], [2, 2]]
+    voteMsg = [[1, [2, 1]]]
+    voteTerm = [[0, 0], [1, 1], [2, 1]]
+  State 8 (via commitEntry(i=2, q=0)):
+    candidate = []
+    committed = true
+    curTerm = [[0, 0], [1, 1], [2, 1]]
+    durableTo = [1, 2]
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 1], [2, 1]]
+    hasVoted = [1, 2]
+    holdsEntry = [1, 2]
+    leader = [2]
+    mapTerm = [[0, 0], [1, 1], [2, 0]]
+    report = [[1, 1]]
+    reqVote = [[2, 1]]
+    voteCand = [[0, 0], [1, 2], [2, 2]]
+    voteMsg = [[1, [2, 1]]]
+    voteTerm = [[0, 0], [1, 1], [2, 1]]
+error: Examples/UC/BootGate.lean:352:0: ❌ Violation: safety_failure (violates: bar2b_stream_distinction)
+  Theory:
+    bar2bCanary = true
+    bootGateFix = true
+    vacuityCanary = false
+  State 0 (via init):
+    candidate = []
+    committed = false
+    curTerm = [[0, 0], [1, 0], [2, 0]]
+    durableTo = []
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 0], [2, 0]]
+    hasVoted = []
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = []
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 0], [1, 0], [2, 0]]
+  State 1 (via startElection(i=1, t=1)):
+    candidate = [1]
+    committed = false
+    curTerm = [[0, 0], [1, 1], [2, 0]]
+    durableTo = []
+    gateOpen = [0, 1, 2]
+    handleTerm = [[0, 0], [1, 0], [2, 0]]
+    hasVoted = [1]
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[1, 1]]
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 0], [1, 1], [2, 0]]
+  State 2 (via deliverRequestVoteGrant(c=1, j=0, t=1)):
+    candidate = [1]
+    committed = false
+    curTerm = [[0, 1], [1, 1], [2, 0]]
+    durableTo = []
+    gateOpen = [1, 2]
+    handleTerm = [[0, 1], [1, 0], [2, 0]]
+    hasVoted = [0, 1]
+    holdsEntry = []
+    leader = []
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[1, 1]]
+    voteCand = [[0, 1], [1, 1], [2, 2]]
+    voteMsg = [[0, [1, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 3 (via becomeLeader(i=1, q=2)):
+    candidate = []
+    committed = false
+    curTerm = [[0, 1], [1, 1], [2, 0]]
+    durableTo = []
+    gateOpen = [1, 2]
+    handleTerm = [[0, 1], [1, 1], [2, 0]]
+    hasVoted = [0, 1]
+    holdsEntry = []
+    leader = [1]
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[1, 1]]
+    voteCand = [[0, 1], [1, 1], [2, 2]]
+    voteMsg = [[0, [1, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 4 (via staleStreamAppend(j=2)):
+    candidate = []
+    committed = false
+    curTerm = [[0, 1], [1, 1], [2, 0]]
+    durableTo = [2]
+    gateOpen = [1, 2]
+    handleTerm = [[0, 1], [1, 1], [2, 0]]
+    hasVoted = [0, 1]
+    holdsEntry = []
+    leader = [1]
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[1, 1]]
+    voteCand = [[0, 1], [1, 1], [2, 2]]
+    voteMsg = [[0, [1, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 5 (via appendEntry(i=1)):
+    candidate = []
+    committed = false
+    curTerm = [[0, 1], [1, 1], [2, 0]]
+    durableTo = [1, 2]
+    gateOpen = [1, 2]
+    handleTerm = [[0, 1], [1, 1], [2, 0]]
+    hasVoted = [0, 1]
+    holdsEntry = [1]
+    leader = [1]
+    mapTerm = [[0, 0], [1, 0], [2, 0]]
+    report = []
+    reqVote = [[1, 1]]
+    voteCand = [[0, 1], [1, 1], [2, 2]]
+    voteMsg = [[0, [1, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+error: Lean exited with code 1
+Some required targets logged failures:
+- Examples.UC.BootGate
+error: build failed
+
+real	7m33.301s
+user	16m14.658s
+sys	0m17.444s
