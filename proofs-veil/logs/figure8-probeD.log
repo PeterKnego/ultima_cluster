@@ -1,0 +1,121 @@
+⚠ [711/911] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/911] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/911] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1389/1408] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+✖ [1418/1418] Building Examples.UC.Figure8 (75s)
+trace: .> LEAN_PATH=/home/claude/veil-spike/veil-preview/.lake/packages/cvc5/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Cli/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/batteries/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Qq/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/aesop/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/proofwidgets/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/importGraph/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/plausible/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/mathlib/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/auto/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/smt/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Loom/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/build/lib/lean /home/claude/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /home/claude/veil-spike/veil-preview/Examples/UC/Figure8.lean -o /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/Figure8.olean -i /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/Figure8.ilean -c /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/Figure8.c --setup /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/Figure8.setup.json --json
+error: Examples/UC/Figure8.lean:234:0: ❌ Violation: safety_failure (violates: no_old_term_only_commit)
+  Theory:
+    clampFix = false
+    proxyOn = true
+  State 0 (via init):
+    candidate = []
+    commitTerm = 0
+    committedOld = false
+    curTerm = [[0, 0], [1, 0], [2, 0]]
+    hasVoted = []
+    lastTerm = [[0, 0], [1, 0], [2, 0]]
+    leader = []
+    newTermAppended = []
+    newTermTerm = [[0, 0], [1, 0], [2, 0]]
+    oldRangeHeld = [0, 1, 2]
+    reportedOld = []
+    reqVote = []
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 0], [1, 0], [2, 0]]
+  State 1 (via startElection(i=1, t=2)):
+    candidate = [1]
+    commitTerm = 0
+    committedOld = false
+    curTerm = [[0, 0], [1, 2], [2, 0]]
+    hasVoted = [1]
+    lastTerm = [[0, 0], [1, 0], [2, 0]]
+    leader = []
+    newTermAppended = []
+    newTermTerm = [[0, 0], [1, 0], [2, 0]]
+    oldRangeHeld = [0, 1, 2]
+    reportedOld = []
+    reqVote = [[1, 2]]
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 0], [1, 2], [2, 0]]
+  State 2 (via deliverRequestVoteGrant(c=1, j=0, t=2)):
+    candidate = [1]
+    commitTerm = 0
+    committedOld = false
+    curTerm = [[0, 2], [1, 2], [2, 0]]
+    hasVoted = [0, 1]
+    lastTerm = [[0, 0], [1, 0], [2, 0]]
+    leader = []
+    newTermAppended = []
+    newTermTerm = [[0, 0], [1, 0], [2, 0]]
+    oldRangeHeld = [0, 1, 2]
+    reportedOld = []
+    reqVote = [[1, 2]]
+    voteCand = [[0, 1], [1, 1], [2, 2]]
+    voteMsg = [[0, [1, 2]]]
+    voteTerm = [[0, 2], [1, 2], [2, 0]]
+  State 3 (via becomeLeader(i=1, q=2)):
+    candidate = []
+    commitTerm = 0
+    committedOld = false
+    curTerm = [[0, 2], [1, 2], [2, 0]]
+    hasVoted = [0, 1]
+    lastTerm = [[0, 0], [1, 0], [2, 0]]
+    leader = [1]
+    newTermAppended = []
+    newTermTerm = [[0, 0], [1, 0], [2, 0]]
+    oldRangeHeld = [0, 1, 2]
+    reportedOld = []
+    reqVote = [[1, 2]]
+    voteCand = [[0, 1], [1, 1], [2, 2]]
+    voteMsg = [[0, [1, 2]]]
+    voteTerm = [[0, 2], [1, 2], [2, 0]]
+  State 4 (via reportOldRange(j=0)):
+    candidate = []
+    commitTerm = 0
+    committedOld = false
+    curTerm = [[0, 2], [1, 2], [2, 0]]
+    hasVoted = [0, 1]
+    lastTerm = [[0, 0], [1, 0], [2, 0]]
+    leader = [1]
+    newTermAppended = []
+    newTermTerm = [[0, 0], [1, 0], [2, 0]]
+    oldRangeHeld = [0, 1, 2]
+    reportedOld = [0]
+    reqVote = [[1, 2]]
+    voteCand = [[0, 1], [1, 1], [2, 2]]
+    voteMsg = [[0, [1, 2]]]
+    voteTerm = [[0, 2], [1, 2], [2, 0]]
+  State 5 (via commitOldRange(i=1, q=2)):
+    candidate = []
+    commitTerm = 2
+    committedOld = true
+    curTerm = [[0, 2], [1, 2], [2, 0]]
+    hasVoted = [0, 1]
+    lastTerm = [[0, 0], [1, 0], [2, 0]]
+    leader = [1]
+    newTermAppended = []
+    newTermTerm = [[0, 0], [1, 0], [2, 0]]
+    oldRangeHeld = [0, 1, 2]
+    reportedOld = [0]
+    reqVote = [[1, 2]]
+    voteCand = [[0, 1], [1, 1], [2, 2]]
+    voteMsg = [[0, [1, 2]]]
+    voteTerm = [[0, 2], [1, 2], [2, 0]]
+error: Lean exited with code 1
+Some required targets logged failures:
+- Examples.UC.Figure8
+error: build failed
+
+real	1m21.996s
+user	1m39.160s
+sys	0m6.416s

@@ -378,3 +378,69 @@ useful thing this probe produced, and it directly shapes how V2 should be run.
 
 Consistent with session 3's ReconfigLC wall (a ~13-step CE, no verdict in 700s): the
 wall is real, but it sits ABOVE the proxy depth, which is why the probe still landed.
+
+---
+
+### SESSION 4c — the #6b FIGURE-8 PROBE (`Figure8.lean`): second calibration point
+Chosen as the SHARPEST possible test of the guidance the #9 probe produced ("hunt
+proxy invariants, not end-to-end loss"): #6b's full loss was machine-checked in Lean
+as a **46-step, n=5** countermodel, while its proxy — the Raft §5.4.2 barrier — should
+be trivial. If the guidance were overfit to #9, #6b would show it.
+
+TARGET (election.rs:1421-1465): `rank_leader` pushed `AdvanceCommit` off the
+positions-only `CommitTracker` UNCONDITIONALLY, so right after an election, honest
+post-reconcile AppendPosition floor reports certify the ELECTION BASE before this
+term's NewTerm frame is quorum-durable — an OLD-TERM-ONLY commit below the §5.4.2
+barrier. Knob `clampFix` (`ranked >= new_term_pos`; `None` ⇒ no advance).
+
+#### PROBE D RESULT — **proxy CE at DEPTH 5**, 1m22s (n=3, term=Fin 3, pre-fix)
+```
+1 startElection(i=1,t=2)
+2 grant(c=1,j=0,t=2)
+3 becomeLeader(i=1,q=2)      new leader, new_term_pos = None
+4 reportOldRange(j=0)        honest post-reconcile AppendPosition floor
+5 commitOldRange(i=1,q=2)    PRE-FIX advances on a bare quorum of position reports
+                             -> old range committed with NO quorum on the NewTerm frame
+```
+**Shallower than #9's proxy (depth 5 vs 7) — the guidance HOLDS on a second bug, and
+the split is even wider here** (proxy at 5 vs a full loss Lean needed 46 steps for).
+
+#### PROBE E/F — THE BOX WALL (the honest negative, and a hard operational limit)
+A faithful Figure-8 needs THREE election terms (rival at T1, leader at T2, rival again
+at T3), so the full-loss probes require **term = Fin 4**. At n=3/Fin 4, maxDepth 13:
+**`lean` reached 12.1 GB RSS and drove the box to 2.37 GB available — KILLED under the
+box-safety rule** (no swap; an OOM here SIGKILLs the largest process and can take the
+harness with it). Lean buffers verdicts until the file finishes elaborating, so the run
+produced **NO partial output** — 15+ minutes bought nothing.
+**Operational rule for this box: term = Fin 4 at n=3 is NOT viable for this model
+class.** Fin 3 runs peaked comfortably (12.6 GB free throughout); Fin 4 exhausts a
+15 GB box. This is a sharper limit than session 3's ReconfigLC time-wall — that one
+merely failed to converge, this one endangers the session.
+
+**CONSEQUENCE — the #6b full-loss depth is UNMEASURED, not "absent".** Probes E and F
+never ran, so nothing is known about whether the clamp prevents the loss itself as
+opposed to its proxy. The earlier pre-patch run that appeared to find a loss at depth 8
+was an ARTIFACT (see below) and is retracted, not banked.
+
+#### THREE more fidelity artifacts (session total: 11, all Rust-adjudicated)
+The first Figure8 run returned three violations; two were mine:
+ 9. **`becomeLeader` wiped `newTermDurable` globally.** A STALE candidate winning an
+    OLD term then retroactively falsified a properly-barriered EARLIER commit — the
+    property was destroyed by later state rather than violated at the commit. Fixed by
+    making the barrier TERM-KEYED and monotone (`newTermTerm : node -> term` plus a
+    recorded `commitTerm`), so evidence cannot be erased by a subsequent election.
+10. **`commitOldRange` did not require the leader to hold the range it commits** —
+    a leader that had already discarded the old range committed it anyway. **This is
+    the THIRD time this session the same gap appeared** (BootGate #4, and again here);
+    it is the standing trap of this modeling style. `rank_leader` ranks the quorum-th
+    durable, which INCLUDES the leader's own.
+11. **`authorDivergentTail` let a LEADER discard its own prefix.** Replaced with
+    `divergeFromOldRange` (a node that simply never received the inherited tail,
+    allowed only before any commit) — absence, not a leader truncating itself.
+
+#### A vacuity trap avoided (worth recording)
+A post-fix PROXY run was deliberately NOT included: the clamp's `require` IS the
+proxy's condition, so post-fix the property holds BY CONSTRUCTION and the run would be
+vacuous — a green proving nothing. The meaningful post-fix calibration is against the
+FULL loss, which is exactly what the box wall blocked. Noting this because a vacuous
+green here would have looked like a successful calibration.
