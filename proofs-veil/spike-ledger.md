@@ -275,3 +275,77 @@ spells out #9's shape (a CANDIDATE that cleanly reconciles a HIGHER-term leader'
 without adopting reopens intake for its LAGGING handle-term stream and accepts a
 cross-stream byte). Modeling it needs reconcile-without-adopt + a reopen keyed on
 `SM term == handle term`, behind a `finding9Fix` knob — the natural next session.
+
+---
+
+### SESSION 4b — the #9/#6b DEPTH PROBE (`Finding9.lean`)
+Brief's explicit STRETCH item, NOT a gate: "how deep a bound is needed before the
+checker rediscovers #6b's 3-term Figure-8 / #9's cross-stream accept — this calibrates
+the forward hunt's confidence and tells you whether 'absence at depth N' means
+anything". Coming up empty here does not license a DROP.
+
+TARGET (node.rs:2404-2423, shipped guard `sm.current_term() == adopted_term`):
+`Action::StartElection` bumps `current_term` but stores NO handle (node.rs:2440-2450),
+so a CANDIDATE runs its data plane at a LAGGING handle. Pre-fix, a candidate that
+cleanly reconciles a HIGHER-term leader's map (non-adopt) REOPENS intake for its stale
+handle-term stream and then accepts a cross-stream byte its map never attributed.
+
+#### Modeling: `tailAttributed` is what makes #9 expressible at all
+#9's damage is INVISIBLE TO RECONCILIATION — the byte is one "its map never
+attributed", so a later clean reconcile cannot detect it and does NOT truncate it.
+`staleStreamAppend` (an ordinary divergent tail, taken under a term whose map DID
+attribute it) sets `tailAttributed := true` and IS truncated on reconcile;
+`crossStreamAccept` sets it FALSE and SURVIVES reconcile. Without that distinction the
+model cannot express #9's loss. Not question-begging: `crossStreamAccept` still
+requires `gateOpen`, so the checker must FIND the bad reopen itself.
+
+#### Two properties at deliberately different depths
+ * `no_cross_stream_reopen` (PROXY, shallow) — the invariant the shipped guard
+   establishes: intake never open while the handle lags the map.
+ * `no_phantom_commit` (FULL, deep) — the acked-write-loss itself.
+Knob-gated (`proxyOn`) because BFS halts at the FIRST violation: leaving the depth-7
+proxy on MASKS the deep hunt entirely.
+
+Scope trims: `crashRestart` DROPPED (that is #5's mechanism, banked in BootGate.lean),
+so any CE here is in the #9 class. `staleStreamAppend`'s guard RELAXED vs BootGate to
+`∀ L, leader L → handleTerm j ≠ curTerm L` — strictly more permissive (better for a
+hunt), still blocks the artifact BootGate needed it for.
+
+#### PROBE A RESULT — the headline number
+**#9's cross-stream reopen is reachable at DEPTH 7, in 1m44s** (n=3, term=Fin 3,
+maxDepth 12, pre-fix). BFS returns the SHALLOWEST violation, so 7 is the MINIMUM depth
+and "unreachable at any smaller bound" follows for free — no ladder of runs needed.
+The trace is exactly the Rust comment's scenario:
+```
+1 startElection(i=1,t=1)
+2 startElection(i=0,t=2)
+3 grant(c=0,j=1,t=2)        node 1 adopts term 2
+4 grant(c=1,j=2,t=1)        node 2 adopts term 1 -> handle:=1, gate CLOSED, awaiting
+5 startElection(i=2,t=2)    node 2 CANDIDATE at 2 -> curTerm 2, handle STAYS 1 (LAGGING)
+6 becomeLeader(i=0,q=2)     node 0 leader at term 2
+7 reconcileNonAdopt(j=2,i=0)  candidate reconciles a HIGHER-term leader's map, non-adopt
+                              -> PRE-FIX reopens intake for its STALE handle-term stream
+```
+End state: node 2 has `gateOpen`, `handleTerm=1`, `mapTerm=2` — intake open at a
+lagging handle, the precise hazard the shipped guard forbids.
+
+**This is a much better result than expected.** Session 3's ReconfigLC wall (a ~13-step
+CE unreachable in 700s) suggested deep-bug probes were hopeless at n=3; #9's *enabling
+condition* turns out to be shallow and cheap. term=Fin 3 was structural here (adopt T1
+-> candidate at T2 -> leader at T2), and it stayed affordable — RAM never below 12.6GB
+free, so the box-safety ceiling was never approached.
+
+#### TWO MORE fidelity artifacts — found by the checker, masking the real hunt
+The first B/C runs both returned the SAME 11-step CE involving NEITHER
+`crossStreamAccept` NOR `reconcileNonAdopt` — i.e. knob-INDEPENDENT, so not a #9 path
+at all. Adjudicated against the Rust and fixed:
+ 7. **`reconcileAdopt` did not clear the role flags.** Adopting a strictly higher term
+    IS a `BecomeFollower` — the node STEPS DOWN. Without it a sitting leader adopted a
+    higher term, stayed flagged `leader`, and committed at the new term.
+ 8. **A brand-new leader reported over a divergent tail.** `BecomeLeader` PRIMES the
+    counters (node.rs:2472-2483: "collapse volatile via prime(base) — old bytes above
+    base must never be streamable"), so a new leader's divergent tail is dropped and
+    cannot be reported as durable.
+Running total for the session: **8 model-fidelity gaps, every one adjudicated against
+the Rust before being fixed.** The recurring lesson is that the checker finds the
+MODEL's bugs long before UC's, and that a CE is a question, not an answer.

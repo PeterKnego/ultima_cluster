@@ -127,14 +127,49 @@ durable AT TERM 1 → node 0 commits with holders `{0}`, no quorum holding E.
 reachable state where two nodes hold bytes at the SAME position from DIFFERENT
 streams. The V2 window hunt is therefore not blind to its target class.
 
-### Fidelity work — six gaps, and why they matter more than the verdicts
+## 3b. The #9 depth probe (session 4b) — stretch item, NOT a gate
 
-Three gaps were caught by hand-tracing the intended CE against the model text
-before running it; three more were caught by adjudicating the post-fix CE against
-the Rust rather than accepting it. Every one of the first three biased the result
-the *same* way — making the shipped fix look ineffective — which is the dangerous
-direction, since a Bar-2 red is the spike's DROP verdict. Full detail in
-`proofs-veil/spike-ledger.md`; the headline three:
+Model `proofs-veil/models/Finding9.lean`, log
+`proofs-veil/logs/finding9-depth-probe.log`. The brief asks how deep a bound is
+needed before the checker rediscovers #9's cross-stream accept, to calibrate
+whether "absence at depth N" means anything for the forward hunt.
+
+**Headline: #9's cross-stream reopen is reachable at DEPTH 7, in 1m44s**
+(n=3, term=Fin 3, pre-fix). BFS returns the shallowest violation, so 7 is the
+*minimum* depth and "unreachable at any smaller bound" follows for free — no
+ladder of runs required. The trace is exactly the scenario `node.rs:2404-2423`
+describes: a node adopts term 1 (handle := 1, gate closed), becomes a
+**candidate at term 2** so its handle stays at 1 — `StartElection` bumps
+`current_term` but stores no handle — and then cleanly reconciles a term-2
+leader's map *without adopting*, which pre-fix **reopens intake for its stale
+handle-term stream**. End state: `gateOpen`, `handleTerm = 1`, `mapTerm = 2`.
+
+**This is materially better news than session 3 suggested.** The ReconfigLC wall
+(a ~13-step CE unreachable in 700s) implied deep-bug probes were hopeless at
+n=3; #9's *enabling condition* turns out to be shallow and cheap. `term = Fin 3`
+was structural (adopt T1 → candidate at T2 → leader at T2) and stayed
+affordable — RAM never dropped below 12.6 GB free.
+
+The probe distinguishes two properties on purpose: `no_cross_stream_reopen` (the
+invariant the shipped guard establishes — shallow) and `no_phantom_commit` (the
+full acked-write-loss — deep). They are knob-gated because BFS halts at the
+first violation, so the depth-7 proxy would otherwise mask the deep hunt.
+Expressing #9's loss at all required new state, `tailAttributed`: the byte is one
+"its map never attributed", so a later clean reconcile cannot detect or truncate
+it. **The deep-property depth is still being measured** (probes B/C were
+re-running when this was written; their first attempt returned a knob-independent
+artifact CE, since fixed — see the ledger).
+
+### Fidelity work — eight gaps, and why they matter more than the verdicts
+
+Eight across the session (six in `BootGate.lean`, two more surfaced by the #9
+probe). Three were caught by hand-tracing the intended CE against the model text
+before running it; five were caught by adjudicating a counterexample against the
+Rust rather than accepting it. Every one of the first three biased the result the
+*same* way — making the shipped fix look ineffective — which is the dangerous
+direction, since a Bar-2 red is the spike's DROP verdict. The standing lesson:
+**the checker finds the model's bugs long before UC's, so a CE is a question, not
+an answer.** Full detail in `proofs-veil/spike-ledger.md`; the headline three:
 
 - **Term adoption must close the intake gate** (`node.rs:2511-2513`). Without it
   the model admits a shallower phantom commit that is *not* Finding #5, so Bar-2
