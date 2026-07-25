@@ -17,7 +17,8 @@
 - **SPDX header on every new file:** `// SPDX-License-Identifier: Apache-2.0` then `// Copyright 2026 Peter Knego`.
 - **`cargo clippy --workspace --all-targets -- -D warnings` must pass with zero warnings.**
 - **This is an instrument, not a gate.** No PASS/FAIL bar, no nonzero exit on a slow number. The only nonzero exits are for *harness* failures (unresolved reads, non-monotonic reads).
-- **Local runs are SMOKE.** Every report print must say so; a fleet run is a separate, user-approved step.
+- **Local runs verify WIRING, not performance (spec §3.1).** This box carries a concurrent Veil model-check session (`lean` at ~384% CPU / 7.2 GB RSS, load ~4.2, ~7 GB available). A local run's job is to prove reads resolve, the monotonic guard holds, and teardown is clean — **no local number goes in the report and no local run evaluates the decision rule for the record.** Keep local runs short (a few seconds, few rungs) and use the reduced smoke buffer; the box has no swap and an OOM SIGKILLs the largest process, which could take the neighbouring session down.
+- **The AWS fleet run is the measurement** (Task 7). It costs money and requires explicit user approval before `terraform apply`.
 - **Decision rule is pre-committed** (spec §2): Rung A is justified iff the linearizable plateau is ≤70% of the snapshot plateau AND `uc2-consensus` or `uc2-receiver` is top-occupancy. Borderline 65–75% ⇒ not justified without a fleet run. The harness prints this evaluation; it never adjusts the threshold.
 
 ---
@@ -267,6 +268,12 @@ const EGRESS_NODE: &str = "egress_node.broadcast";
 const ALL_APP_ID: &str = "uc2-read-profile-smoke";
 
 const NODE_BUFFER_BYTES: usize = 256 << 20;
+/// In-process smoke/ladder buffer. Deliberately far smaller than the fleet's
+/// 256 MiB: `all`/`ladder` boot THREE nodes in one process, and this box is
+/// shared with a concurrent model-checking session (no swap — an OOM SIGKILLs
+/// the largest process). Local runs prove wiring, not throughput, so the hot
+/// window does not need to be large.
+const SMOKE_BUFFER_BYTES: usize = 32 << 20;
 const NODE_MAX_PAYLOAD: usize = 512;
 const ELECTION_TIMEOUT_MIN_NS: u64 = 150_000_000;
 const ELECTION_TIMEOUT_MAX_NS: u64 = 300_000_000;
@@ -466,6 +473,7 @@ fn node_config(
     instance_dir: PathBuf,
     app_id: String,
     admission_bytes: u64,
+    buffer_bytes: usize,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -473,7 +481,7 @@ fn node_config(
         bind,
         instance_dir,
         app_id,
-        buffer_bytes: NODE_BUFFER_BYTES,
+        buffer_bytes,
         max_payload: NODE_MAX_PAYLOAD,
         admission_bytes,
         election_timeout_min_ns: ELECTION_TIMEOUT_MIN_NS,
@@ -493,8 +501,15 @@ fn run_node(a: NodeArgs) -> anyhow::Result<()> {
     );
     let id = a.id;
     let members = parse_members(&a.members);
-    let cfg =
-        node_config(a.id, members, a.bind, a.instance_dir, a.app_id, a.admission_kib * 1024);
+    let cfg = node_config(
+        a.id,
+        members,
+        a.bind,
+        a.instance_dir,
+        a.app_id,
+        a.admission_kib * 1024,
+        NODE_BUFFER_BYTES,
+    );
     let _node = Node::start(cfg)?;
     println!("read_profile node {id} up (pid {}); parking", std::process::id());
     loop {
@@ -572,6 +587,7 @@ fn boot_cluster(
             instance_dir.clone(),
             app_id.into(),
             256 * 1024,
+            SMOKE_BUFFER_BYTES,
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let svc =
@@ -1598,23 +1614,99 @@ Expected: zero warnings. Fix anything reported.
 Run: `cargo test --workspace`
 Expected: passes — no existing test's behavior changed (production code is untouched).
 
-- [ ] **Step 4: Produce the smoke numbers**
+- [ ] **Step 4: Verify end-to-end wiring at minimal scale**
 
-Run: `cargo run -p uc2_node --release --example read_profile -- ladder --secs 6 --readers 1,4,16,64,256,1024 --write-rate 20000 2>&1 | tee target/read_profile_smoke.log`
-Expected: completes, both verdict blocks printed.
+**This is a wiring check, not a measurement** (Global Constraints): the box carries a concurrent model-check session, so the numbers printed here are noise and must not be recorded anywhere.
 
-- [ ] **Step 5: Write the report doc**
+Run: `cargo run -p uc2_node --release --example read_profile -- ladder --secs 3 --readers 1,16 --write-rate 5000`
+Expected: 8 rung lines (2 mixes × 2 arms × 2 concurrencies), both verdict blocks print without panicking, every rung shows `reads/s > 0` and no regression, exit 0.
 
-Create `docs/benchmarks/uc2-read-profile-2026-07-25.md` with: the ladder table for both arms and both mixes; the per-agent occupancy ranking at each plateau; the decision rule evaluated clause by clause with the verdict; and a section addressing each of the spec §6 threats to validity with what the run actually showed — specifically whether both arms plateaued together (`QUERY_DRAIN_PER_CYCLE` suspect), whether the client sustained the target concurrency, and the reminder that the mixed arm's delta includes the frontier wait. Mark every number **LOCAL SMOKE**.
+Before running, check the box is not already saturated: `uptime && free -g`. If available memory is under ~3 GB, wait — do not risk an OOM that could kill the neighbouring session.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add uc2_node/examples/read_profile.rs docs/benchmarks/uc2-read-profile-2026-07-25.md
-git commit -m "docs(read-profile): module doc and local smoke result record
+git add uc2_node/examples/read_profile.rs
+git commit -m "docs(read-profile): module doc; harness verified end to end
 
-Smoke numbers only — a fleet run is a separate, user-approved step. The
-verdict recorded here is what the decision rule returned, not a preference."
+Wiring verified locally (reads resolve, monotonic guard holds, clean
+teardown). No numbers recorded: this box carries a concurrent model-check
+session, so the real ladder runs on the AWS fleet."
+```
+
+---
+
+### Task 7: The AWS fleet run — the actual measurement
+
+Everything before this task produces an instrument. This task produces the data. **It spends real money and must not `terraform apply` without explicit user approval** (Step 3 is a hard stop).
+
+**Files:**
+- Modify: `bench-infra/scripts/m6_fleet_gate.py` (add a read-profile mode)
+- Create: `docs/benchmarks/uc2-read-profile-<run-date>.md`
+
+**Interfaces:**
+- Consumes: the `read_profile` binary's `node` / `service` / `client` roles and their CLI flags (Tasks 2–3), including `--node-pid` for occupancy.
+- Produces: a `--read-profile` mode on the orchestrator, and the report doc.
+
+- [ ] **Step 1: Read the orchestrator before touching it**
+
+Read `bench-infra/scripts/m6_fleet_gate.py` — specifically the `Host` class (`probe`, `ctl`, start/stop), the `--local` vs `--fleet` connectivity split, the durable-fs guard, and how an existing scenario is structured. **Follow those patterns rather than inventing parallel plumbing**; this plan deliberately does not pre-write the Python, because the host abstractions are the orchestrator's own and must be used as they are.
+
+Fleet operational facts that already bit previous runs (from the M6/M7 gate history): `rsync` ships the local tree (no git push); ansible builds as root (`sudo cargo`, `CARGO_HOME=/opt/bench/.cargo`); `/opt/bench` is the NVMe mount and instance dirs must live there; remote daemons need `systemd-run` (a bare `ssh &` hangs); ssh needs `-i <key>` with `SSH_AUTH_SOCK` unset.
+
+- [ ] **Step 2: Add the `--read-profile` mode**
+
+Requirements for the new mode (3 hosts, one role per host):
+
+- Start a `read_profile node` + `read_profile service` per host; wait for exactly one leader; abort if two hosts ever report serving.
+- Sweep the ladder by invoking `read_profile client` **on the leader's host** (shmem is same-host only), once per rung: `--readers` from the sweep list × `--mode {lin,snap}` × `--write-rate {0, W}`, passing `--node-pid` (the node role prints its pid at startup — capture it) so occupancy is sampled from the *node* process, not the client.
+- Collect each rung's `reads/s`, `p50`, `p99`, `in-flight at end`, `read regression`, and the occupancy ranking; emit them as machine-readable JSON alongside the human log.
+- **Exit code:** 0 even for an unfavourable verdict — this is an instrument, not a gate. Exit 1 **only** on harness failure: any rung with `read regression != 0`, or unresolved reads on more than one rung.
+- Reuse the existing per-rung teardown discipline: a fresh cluster per rung, so no rung inherits the previous one's warm state or leader.
+
+- [ ] **Step 3: Validate with `--local`, then STOP for approval**
+
+Run the orchestrator in `--local` mode (real separate processes on loopback) with a short sweep to validate the orchestration itself — not to collect numbers.
+
+Expected: all rungs run, JSON emitted, exit 0.
+
+**Then stop.** Report to the user: the sweep plan, the host class and count, the estimated run time, and ask for explicit approval before `terraform apply`. Do not proceed on inferred consent.
+
+- [ ] **Step 4: Provision, run, collect**
+
+Only after approval:
+
+```bash
+cd bench-infra && make up-uc          # terraform apply + ansible provision
+# then the orchestrator in --fleet mode with the full sweep
+```
+
+Capture the full log and the JSON to the worktree.
+
+- [ ] **Step 5: Destroy the fleet and VERIFY it is gone**
+
+```bash
+cd bench-infra && make destroy
+terraform -chdir=terraform state list   # MUST be empty
+```
+
+The real terraform state is `bench-infra/terraform/` (the repo-root terraform directory is an empty decoy). A run left up bills indefinitely — verify the state list is empty rather than trusting `destroy`'s output.
+
+- [ ] **Step 6: Write the report doc**
+
+Create `docs/benchmarks/uc2-read-profile-<run-date>.md` with: the ladder table for both arms and both mixes; the per-agent occupancy ranking at each plateau; the decision rule evaluated clause by clause with the verdict; and a section addressing each spec §6 threat with what the run actually showed — specifically whether both arms plateaued together (`QUERY_DRAIN_PER_CYCLE` suspect), whether the client sustained the target concurrency, and the reminder that the mixed arm's delta includes the frontier wait. Record the fleet host class and the exact sweep.
+
+Record the verdict the rule returned, including if it declines Rung A. **A "measured, declined" outcome is a successful run of this plan, not a failure.**
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add bench-infra/scripts/m6_fleet_gate.py docs/benchmarks/uc2-read-profile-*.md
+git commit -m "bench(read-profile): fleet read-profile mode and the measured verdict
+
+Three-host AWS run of the concurrency ladder across both arms and both write
+mixes. The decision rule from the spec is evaluated on fleet numbers; the
+verdict recorded is what the rule returned."
 ```
 
 ---

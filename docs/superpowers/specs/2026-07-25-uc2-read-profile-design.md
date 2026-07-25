@@ -96,13 +96,33 @@ cargo run -p uc2_node --release --example read_profile -- all     --secs S   # l
 - Env caps `UC2_RP_MAX_SECS`, `UC2_RP_MAX_READERS` clip from above when set
   nonzero; unset is a no-op (the fleet's mode).
 
-**Local runs are labeled SMOKE, never a result.** One box shares its cores
-across 3 nodes' worth of polling agents plus 3 services plus the load
-generator; the M5 gate doc's own disclaimer applies verbatim. A 3-host fleet run
-remains a separate, user-approved step — the harness is built fleet-ready so
-that step needs no rewrite.
+### 3.1 Where measurement happens — AWS, not this box
 
-### 3.1 The client role must bypass `uc2_client`
+**The AWS fleet run is the measurement. Local runs verify wiring and produce no
+numbers.** This is stronger than the usual "local smoke is directional"
+disclaimer, for two reasons:
+
+1. **The box is shared.** A concurrent session runs the Veil V2 model-check;
+   during this spec's authoring `lean` held 384% CPU and 7.2 GB RSS at load
+   average 4.2 with ~7 GB available. A busy-spin/yield cluster measured
+   alongside that is measuring the neighbour.
+2. **The structure is wrong anyway.** One box shares its cores across 3 nodes'
+   worth of polling agents plus 3 services plus the load generator; the M5 gate
+   doc's disclaimer applies verbatim.
+
+Consequences, binding on the implementation:
+
+- Local runs exist to prove the harness resolves reads, guards monotonicity, and
+  tears down cleanly. **No local run produces a row in the report, and no local
+  run evaluates the decision rule for the record.**
+- Local runs stay small and short (seconds, few rungs, reduced log-buffer size)
+  to avoid contending with — or OOM-killing — the neighbouring session. The box
+  has no swap; an OOM SIGKILLs the largest process and can take a session with
+  it.
+- The 3-host AWS fleet run is where the ladder is swept for real. It costs money
+  and requires explicit user approval before `terraform apply`.
+
+### 3.2 The client role must bypass `uc2_client`
 
 `uc2_client::query_linearizable` routes through `send_and_await`
 (`uc2_client/src/client.rs:154-184`), which **blocks on a channel per call**.
@@ -196,8 +216,9 @@ To be stated in the report, not discovered afterwards:
 3. **The load generator may be the bottleneck.** Report client-side in-flight
    depth and confirm the target concurrency is actually sustained; a plateau
    caused by the harness proves nothing about the node.
-4. **Shared-core smoke.** Local numbers are directional only. Anything used to
-   justify building code gets a fleet run first.
+4. **Shared-core smoke is not evidence at all here** (§3.1) — the box carries a
+   concurrent model-checking session. Local runs verify wiring; the fleet run
+   measures. No local number reaches the report.
 5. **Yield-rate proxy is ordinal, not absolute.** It ranks agents; it does not
    measure duty-cycle occupancy. Clause (b) is written to need only the ranking.
 
