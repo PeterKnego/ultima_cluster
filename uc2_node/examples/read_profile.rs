@@ -1,8 +1,107 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! Linearizable-read profile harness. See
+//! Linearizable-read profile harness: does UC's ReadIndex barrier cost read
+//! *capacity*, or are the single-writer agents bottlenecked elsewhere (apply
+//! frontier, egress broadcast)? This is the gating open question (§6.1) of
+//! `docs/superpowers/specs/2026-07-24-uc2-leader-lease-design.md`, which
+//! proposes batch-probe coalescing (Rung A) and a clock-based lease (Rung B)
+//! but says to measure before building either. Full design:
 //! `docs/superpowers/specs/2026-07-25-uc2-read-profile-design.md`.
+//!
+//! ```text
+//! cargo run -p uc2_node --release --example read_profile -- node    --id N --bind A --members ID@ADDR,... --instance-dir D [--admission-kib K]
+//! cargo run -p uc2_node --release --example read_profile -- service --instance-dir D
+//! cargo run -p uc2_node --release --example read_profile -- client  --instance-dir D --secs S --readers K [--mode lin|snap] [--write-rate W] [--node-pid P]
+//! cargo run -p uc2_node --release --example read_profile -- all     --secs S --readers K [--mode lin|snap] [--write-rate W]   # local smoke, NOT a fleet number
+//! cargo run -p uc2_node --release --example read_profile -- ladder --secs S --readers 1,4,16,64,256,1024 [--write-rate W]     # local smoke sweep, NOT a fleet number
+//! ```
+//!
+//! **`node`/`service`** are thin fleet-role wrappers (one process per host,
+//! systemd-run-friendly) over the real SDK stack: `Node::start` for the
+//! consensus/log/IPC side, `ServiceBuilder` running the trivial [`ProfileSm`]
+//! counter for the apply side. Both park forever once started — the harness
+//! owns their lifecycle.
+//!
+//! **`client`** is the measuring role, `m5_gate`'s pattern reused verbatim: it
+//! bypasses `uc2_client`'s per-op channel machinery and instead opens the same
+//! `cnc.dat` + `query.ring` + both egress broadcasts a real client would,
+//! stamping its own `local_seq` and correlating answers through a
+//! preallocated `Box<[AtomicU64]>` slot array. See `run_read_measurement`.
+//!
+//! ## The A/B: what a "linearizable" vs. "snapshot" read actually differs by
+//!
+//! `--mode` sets exactly one bit on the query record — `FLAG_V2_LINEARIZABLE`.
+//! The fork is `uc2_node/src/node.rs:1956`, inside `drain_query_ring`: with the
+//! flag clear the node forwards the query straight to the service
+//! (`node.rs:1958`); with it set, the node opens a READ_PROBE quorum barrier
+//! and waits for the service to catch up to the confirmed read position before
+//! forwarding. Admission, the per-cycle query drain cap, the service, and the
+//! egress path are all identical between the two arms. That means the
+//! **lin-vs-snap throughput delta is the barrier's end-to-end cost, measured
+//! without instrumenting any production code** — the harness is entirely an
+//! attaching party (like `uc2_client`), never a participant in the traced path.
+//!
+//! **Caveat that changes what the delta means between the two workload arms:**
+//! a snapshot read skips BOTH the READ_PROBE barrier AND the wait for the
+//! service to catch up to the leader's commit frontier ("the frontier wait").
+//! In the read-only arm (`--write-rate 0`) the frontier wait is free regardless
+//! — with nothing committing, `service_applied >= commit_at` already holds
+//! when a read is admitted — so there the delta isolates the barrier alone. In
+//! the mixed arm the frontier wait is real work a linearizable read pays and a
+//! snapshot read does not, so there the delta is barrier-cost **plus**
+//! frontier-wait cost, not the barrier alone. `run_ladder`'s closing
+//! `REMINDER:` line restates this so it cannot be missed reading the output.
+//!
+//! ## The occupancy proxy: yield rate, not CPU time
+//!
+//! The four node agents are already named threads (`uc2-consensus`,
+//! `uc2-sender`, `uc2-receiver`, `uc2-archive` — see `AgentRunner::spawn`), so
+//! in principle `/proc/<pid>/task/*/stat` CPU time would rank them directly.
+//! It doesn't: every agent idles on `IdleStrategy::Yield`
+//! (`uc2_log/src/agent.rs:28` → `std::thread::yield_now()`), so an agent with
+//! nothing to do still burns a core spinning through empty duty cycles and its
+//! CPU% saturates by construction — CPU time carries no signal about which
+//! agent is actually busy. What differs is the yield RATE: each empty duty
+//! cycle costs one `sched_yield`, which the kernel counts in
+//! `/proc/<pid>/task/<tid>/status`'s `voluntary_ctxt_switches`, so a BUSY agent
+//! (spending its time on real work between polls) yields LESS often than an
+//! idle one. `sample_yields`/`occupancy_delta` turn that into an ORDINAL
+//! ranking (fewest yields/sec = busiest) — it is not a duty-cycle percentage
+//! and is not meant to be read as one.
+//!
+//! ## Env caps (sandbox safety, m1–m5 pattern)
+//!
+//! `UC2_RP_MAX_SECS`, `UC2_RP_MAX_READERS` clip `--secs`/`--readers` from
+//! ABOVE when set to a nonzero value; unset (the fleet's mode) is a no-op.
+//! `env_cap` is applied per-role and, in `ladder`, per-rung.
+//!
+//! ## The decision rule is a pre-commitment, not a tunable
+//!
+//! `evaluate_decision_rule` implements the design spec's §2 rule VERBATIM:
+//! build Rung A iff (a) the linearizable plateau is ≤70% of the snapshot
+//! plateau (65–75% is a borderline band that does NOT license a decision on
+//! local smoke) AND (b) `uc2-consensus` or `uc2-receiver` is the top-occupancy
+//! agent at that plateau. The 70% figure and the agent list were fixed before
+//! any run and are not adjusted once numbers exist — changing this function to
+//! fit a result would defeat the entire point of pre-committing it.
+//!
+//! ## *** LOCAL RUNS ARE WIRING VERIFICATION, NOT MEASUREMENT ***
+//!
+//! `all` and `ladder` boot 3 nodes + 3 services in-process (real file-backed
+//! shmem, just not real separate OS processes) — one dev box shares its core
+//! count across 3 nodes' worth of polling agents (consensus/sender/receiver/
+//! archive ×3) plus 3 services plus the load generator, nothing like the
+//! fleet's one-role-per-host budget (`m5_gate`'s precedent, restated here).
+//!
+//! On THIS box it is worse than the usual local-smoke disclaimer: **this box
+//! runs a concurrent Veil model-checking session with no swap.** Any number
+//! this harness prints locally describes contention with that neighbour, not
+//! the read path. The real ladder runs on a 3-host AWS fleet — a separate,
+//! user-approved step, per the design spec §3.1. Local runs exist ONLY to
+//! prove the harness resolves reads, the monotonic-read guard holds, and
+//! teardown is clean; their numbers must never be recorded in a doc or used to
+//! evaluate the decision rule for the record.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
