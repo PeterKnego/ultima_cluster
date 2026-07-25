@@ -908,8 +908,169 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_ladder(_a: LadderArgs) -> anyhow::Result<()> {
-    anyhow::bail!("ladder role lands in Task 5")
+/// One measured point: an arm at one concurrency under one write mix.
+#[derive(Debug, Clone)]
+struct Rung {
+    pub readers: u64,
+    pub mode: Mode,
+    pub write_rate: u64,
+    pub reads_per_sec: f64,
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+    pub top_agent: Option<String>,
+}
+
+/// The decision rule from the spec (§2), evaluated verbatim and never tuned:
+///
+///   Build Rung A iff (a) the linearizable plateau is <=70% of the snapshot
+///   plateau AND (b) uc2-consensus or uc2-receiver is the top-occupancy agent.
+///   Borderline 65-75% => NOT justified without a fleet run.
+///
+/// Plateau = the best rate that arm reached across the ladder (the ladder's
+/// point is to climb until the rate stops improving, so the max IS the plateau).
+fn evaluate_decision_rule(rungs: &[Rung], write_rate: u64) -> String {
+    let plateau = |mode: Mode| -> Option<&Rung> {
+        rungs
+            .iter()
+            .filter(|r| r.mode == mode && r.write_rate == write_rate)
+            .max_by(|a, b| a.reads_per_sec.total_cmp(&b.reads_per_sec))
+    };
+    let (Some(lin), Some(snap)) = (plateau(Mode::Lin), plateau(Mode::Snap)) else {
+        return "VERDICT: INCONCLUSIVE — both arms must have at least one rung.".into();
+    };
+    if snap.reads_per_sec <= 0.0 {
+        return "VERDICT: INCONCLUSIVE — the snapshot arm measured zero reads/s.".into();
+    }
+    let ratio = lin.reads_per_sec / snap.reads_per_sec * 100.0;
+    let top = lin.top_agent.clone().unwrap_or_else(|| "(not sampled)".into());
+    let probe_agent_is_top = top == "uc2-consensus" || top == "uc2-receiver";
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "  linearizable plateau : {:>12.0} reads/s (at {} readers, p50={:.3}ms p99={:.3}ms)\n",
+        lin.reads_per_sec, lin.readers, lin.p50_ms, lin.p99_ms
+    ));
+    out.push_str(&format!(
+        "  snapshot plateau     : {:>12.0} reads/s (at {} readers, p50={:.3}ms p99={:.3}ms)\n",
+        snap.reads_per_sec, snap.readers, snap.p50_ms, snap.p99_ms
+    ));
+    out.push_str(&format!("  ratio (lin/snap)     : {ratio:.1}%  [rule: <=70% and not 65-75%]\n"));
+    out.push_str(&format!("  top-occupancy agent  : {top}  [rule: uc2-consensus or uc2-receiver]\n"));
+
+    // Both arms cross the same per-cycle query drain, so equal plateaus point at
+    // the drain cap rather than at the barrier (spec §6.2).
+    if (ratio - 100.0).abs() < 2.0 {
+        out.push_str(
+            "  NOTE: the two arms plateau within 2% of each other — suspect \
+             QUERY_DRAIN_PER_CYCLE (node.rs:186) as the ceiling, not the probe.\n",
+        );
+    }
+
+    let verdict = if (65.0..=75.0).contains(&ratio) {
+        format!(
+            "VERDICT: BORDERLINE ({ratio:.1}% is inside the 65-75% band) — \
+             NOT justified on this data; resolve with a fleet run or decline."
+        )
+    } else if ratio <= 70.0 && probe_agent_is_top {
+        "VERDICT: Rung A JUSTIFIED — both clauses met.".to_string()
+    } else if ratio > 70.0 {
+        format!(
+            "VERDICT: Rung A NOT JUSTIFIED — clause (a) unmet: the barrier costs \
+             only {:.1}% of read capacity.",
+            100.0 - ratio
+        )
+    } else {
+        format!(
+            "VERDICT: Rung A NOT JUSTIFIED — clause (b) unmet: the top-occupancy agent \
+             is {top}, not a probe-touching agent. Removing probe traffic would not \
+             move this ceiling; profile {top} instead."
+        )
+    };
+    out.push_str(&verdict);
+    out
+}
+
+fn run_ladder(a: LadderArgs) -> anyhow::Result<()> {
+    let root = a.root.unwrap_or_else(|| PathBuf::from("target/read_profile_ladder"));
+    let secs = env_cap("UC2_RP_MAX_SECS", a.secs);
+    println!("*** LOCAL SMOKE — NOT a fleet number *** (3 nodes + 3 services on one box)");
+
+    let mut rungs: Vec<Rung> = Vec::new();
+    for &write_rate in &[0u64, a.write_rate] {
+        for mode in [Mode::Snap, Mode::Lin] {
+            for &readers in &a.readers {
+                let readers = env_cap("UC2_RP_MAX_READERS", readers);
+                // A fresh cluster per rung: a rung must not inherit the previous
+                // rung's warm caches, log-buffer fill, or leader.
+                let (nodes, services, dirs, leader) = boot_cluster(&root, ALL_APP_ID)?;
+                let (stats, occ) = run_read_measurement(
+                    &dirs[leader],
+                    ALL_APP_ID,
+                    secs,
+                    readers,
+                    mode,
+                    write_rate,
+                    Some(PathBuf::from("/proc/self/task")),
+                );
+                stop_cluster(nodes, services);
+                anyhow::ensure!(
+                    stats.regression == 0,
+                    "linearizable read regressed by {} at readers={readers}",
+                    stats.regression
+                );
+                if stats.inflight_at_end != 0 {
+                    println!(
+                        "  WARNING: {} reads unresolved at readers={readers} \
+                         (rung recorded, treat with suspicion)",
+                        stats.inflight_at_end
+                    );
+                }
+                // In `all`/`ladder` mode /proc/self/task holds the harness's own
+                // threads too; only the named agent threads are of interest.
+                let top_agent = occ
+                    .iter()
+                    .find(|o| o.name.starts_with("uc2-"))
+                    .map(|o| o.name.clone());
+                println!(
+                    "  rung: mode={:<5} readers={readers:<5} writes/s={write_rate:<7} \
+                     reads/s={:>10.0}  p50={:.3}ms  top={}",
+                    match mode { Mode::Lin => "lin", Mode::Snap => "snap" },
+                    stats.reads_per_sec,
+                    stats.p50_ms,
+                    top_agent.clone().unwrap_or_else(|| "-".into())
+                );
+                rungs.push(Rung {
+                    readers,
+                    mode,
+                    write_rate,
+                    reads_per_sec: stats.reads_per_sec,
+                    p50_ms: stats.p50_ms,
+                    p99_ms: stats.p99_ms,
+                    top_agent,
+                });
+            }
+        }
+        if write_rate == a.write_rate && a.write_rate == 0 {
+            break; // read-only and mixed are the same sweep; do not run it twice
+        }
+    }
+
+    println!();
+    println!("================== decision rule (spec §2) ==================");
+    for &write_rate in &[0u64, a.write_rate] {
+        let mix = if write_rate == 0 { "read-only arm" } else { "mixed arm" };
+        println!("-- {mix} (writes/s = {write_rate}) --");
+        println!("{}", evaluate_decision_rule(&rungs, write_rate));
+        if write_rate == a.write_rate && a.write_rate == 0 {
+            break;
+        }
+    }
+    println!("============================================================");
+    println!(
+        "REMINDER: local smoke. The read-only arm is the clean isolation; the mixed arm's \
+         delta includes the frontier wait, since a snapshot read skips that too."
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -979,5 +1140,74 @@ mod tests {
         let got = occupancy_delta(&before, &after, 1.0);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "uc2-consensus");
+    }
+
+    fn rung(readers: u64, mode: Mode, rps: f64, top: &str) -> Rung {
+        Rung {
+            readers,
+            mode,
+            write_rate: 0,
+            reads_per_sec: rps,
+            p50_ms: 0.1,
+            p99_ms: 0.2,
+            top_agent: Some(top.to_string()),
+        }
+    }
+
+    #[test]
+    fn rule_justifies_rung_a_when_gap_and_consensus_is_top() {
+        let rungs = vec![
+            rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"),
+            rung(64, Mode::Lin, 500_000.0, "uc2-consensus"), // 50% of snapshot
+        ];
+        let out = evaluate_decision_rule(&rungs, 0);
+        // "NOT JUSTIFIED" also contains "JUSTIFIED", so assert both directions.
+        assert!(out.contains("Rung A JUSTIFIED"), "got: {out}");
+        assert!(!out.contains("NOT JUSTIFIED"), "got: {out}");
+    }
+
+    #[test]
+    fn rule_declines_when_ratio_is_above_the_band() {
+        let rungs = vec![
+            rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"),
+            rung(64, Mode::Lin, 900_000.0, "uc2-consensus"), // 90%
+        ];
+        let out = evaluate_decision_rule(&rungs, 0);
+        assert!(out.contains("NOT JUSTIFIED"), "got: {out}");
+    }
+
+    #[test]
+    fn rule_declines_in_the_borderline_band_even_with_the_right_top_agent() {
+        let rungs = vec![
+            rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"),
+            rung(64, Mode::Lin, 700_000.0, "uc2-consensus"), // 70% — inside 65..=75
+        ];
+        let out = evaluate_decision_rule(&rungs, 0);
+        assert!(out.contains("BORDERLINE"), "got: {out}");
+        assert!(
+            !out.contains("Rung A JUSTIFIED"),
+            "borderline must not read as justified: {out}"
+        );
+    }
+
+    #[test]
+    fn rule_declines_when_a_non_probe_agent_is_top() {
+        let rungs = vec![
+            rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"),
+            rung(64, Mode::Lin, 400_000.0, "uc2-apply"), // big gap, wrong bottleneck
+        ];
+        let out = evaluate_decision_rule(&rungs, 0);
+        assert!(out.contains("NOT JUSTIFIED"), "got: {out}");
+        assert!(out.contains("uc2-apply"), "verdict should name the actual top agent: {out}");
+    }
+
+    #[test]
+    fn rule_flags_equal_plateaus_as_the_drain_cap_suspect() {
+        let rungs = vec![
+            rung(64, Mode::Snap, 500_000.0, "uc2-consensus"),
+            rung(64, Mode::Lin, 499_000.0, "uc2-consensus"), // within 1%
+        ];
+        let out = evaluate_decision_rule(&rungs, 0);
+        assert!(out.contains("QUERY_DRAIN_PER_CYCLE"), "got: {out}");
     }
 }
