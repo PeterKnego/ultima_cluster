@@ -512,3 +512,56 @@ blocked measurements only (#6b full-loss depth; ReconfigLC leader_completeness C
    (exit 139, `Unknown constant ...crashRestart.ext.wp_local_eq.pred`). Fix: split into
    `require`-guarded arms — zero conditionals, identical semantics (the requires
    partition the space), and the shipped fix's two branches read explicitly.
+
+#### SESSION 5b — n=4 WITH STATE CONSTRAINTS: **no viable window on this box**
+Follow-on to the exhaustive n=3 hunt, asking the one question n=3 cannot: does a FOURTH
+node enable a coherence-window bug three cannot? Not idle — at n=4 the majority is
+3-of-4, so two successive quorums can overlap in exactly TWO nodes (no n=3 analogue),
+and #6b's full loss needed n=5 in Lean. Separate file `V2Hunt4.lean` because
+`state_constraint` is MODULE-level and would otherwise retroactively narrow
+`V2Hunt.lean`'s exhaustive n=3 result.
+
+**ATTEMPT 1 — C1+C2+C3, maxDepth 10: completed, 143,901 states, 6m31s — and VACUOUS.**
+The tell was the state count: 143,901 at n=4 against 11.7M at n=3. A LARGER
+configuration yielding 80x FEWER states is a symptom, not a result. A vacuity canary
+confirmed it: `¬committed` was never violated ⇒ **no commit is reachable at all**, so
+`no_phantom_commit` and most of the battery were trivially true.
+CULPRIT — **C1, "at most one node awaiting reconciliation", was a BAD CONSTRAINT.** It
+sounded like an anomaly bound, but `deliverRequestVoteGrant` sets
+`awaitingReconcile := true` on EVERY node adopting a new term, and at n=4 a candidate
+needs THREE granters — so >=2 nodes awaiting reconcile is the MAINLINE ELECTION PATH.
+C1 pruned normal elections; no leader could assemble a 3-of-4 quorum. **C1 is kept in
+the file as a RETIRED constraint with this explanation — a better warning than its
+absence.** Had this been reported as "n=4 clean, 143,901 states" it would have read as
+coverage while being the exact opposite.
+
+**ATTEMPT 2 — C2+C3 only, maxDepth 10: KILLED at >60 min with ZERO output.**
+As established in session 4c, Lean buffers verdicts until elaboration ends, so a killed
+run yields nothing. ~2.5 h across both attempts bought one vacuity finding.
+
+**WHY THERE IS NO CHEAPER RETRY (the structural result).** A commit at n=4 needs ~10
+steps minimum — startElection, TWO grants (3-of-4 majority), becomeLeader, appendEntry,
+two replicates, two reports, commitEntry — versus ~7 at n=3. So:
+ * **maxDepth < 10 ⇒ VACUOUS BY CONSTRUCTION** (nothing can commit; the battery goes
+   trivially true, exactly as attempt 1 did).
+ * **maxDepth >= 10 ⇒ INTRACTABLE on this box** (attempt 2, killed).
+**The window between vacuous and intractable does not exist at n=4 here.** That is a
+sharper statement than "we ran out of time": lowering the bound cannot help, because
+the bound is what makes the run mean anything.
+
+**CAPACITY ENVELOPE, now complete:**
+| Configuration | Outcome |
+|---|---|
+| n=3 / Fin 3, exhaustive, unconstrained | **AFFORDABLE** — 11.7M states, 93 min, ~7 GB |
+| n=3 / Fin 4 | not viable — 12.1 GB RSS, killed (session 4c) |
+| n=4 / Fin 3, constrained, maxDepth <10 | vacuous by construction |
+| n=4 / Fin 3, constrained, maxDepth >=10 | not viable — killed at >60 min |
+So **n=3 / Fin 3 is the frontier for this model class on a 15 GB box**, in BOTH
+directions (more terms, more nodes). Pushing either axis needs a bigger box or a
+structurally cheaper abstraction — not a tuning tweak.
+
+**RULE ADOPTED: every constrained run must be PAIRED WITH A VACUITY CANARY, RUN FIRST.**
+Constraints can silently destroy the behaviour they were meant to make searchable, and
+a clean verdict looks identical either way. Same class of trap as "an elaboration error
+silently VOIDS a `#model_check`" (session 4) — a green that means nothing. The canary is
+the only cheap way to tell the two apart.
