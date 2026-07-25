@@ -42,19 +42,37 @@ Fixed before any run, so the outcome cannot be rationalized after the fact:
 > **Build Rung A iff both hold:**
 > **(a)** the linearizable-read throughput plateau is **≤ 70%** of the
 > snapshot-read plateau at matched concurrency; **and**
-> **(b)** `uc2-consensus` or `uc2-receiver` is the **top-occupancy agent** at
-> that plateau.
+> **(b)** the gap is present in the **read-only arm** (that arm's lin/snap ratio
+> independently satisfies clause (a)'s ≤ 70% threshold), AND at that plateau the
+> client sustained **≥ 90% of target concurrency**, AND neither arm is degraded
+> per the >5% retries/redirects guard.
 
 The 70% figure is a pre-commitment, not a target to be adjusted once the numbers
-are in. Two tie-break rules, also fixed in advance:
+are in. One tie-break rule, also fixed in advance:
 
 - **Borderline (65–75%)** does not license building on local smoke. Resolve it
   with a fleet run, or treat it as not justified.
-- **(b) is a ranking, and ties do not count.** If the top two agents are within
-  the run-to-run spread of the yield-rate proxy, clause (b) is unmet and the
-  escalation in §4.3 decides it. Operationalized in `evaluate_decision_rule` as:
-  the runner-up must yield **at least 20% more** than the top agent (the ranking
-  is ascending in yields — fewest = busiest); anything closer is a tie.
+
+**Why (b) is a real second criterion and not (a) restated:**
+
+- The **read-only** requirement is the substantive part. With no writes in
+  flight the service frontier is already caught up when a read is admitted, so
+  the lin-vs-snap delta there is the barrier alone. A gap that appears *only* in
+  the mixed arm is frontier-wait cost, not barrier cost — exactly the
+  misattribution clause (b) exists to catch, and a case where Rung A would move
+  nothing.
+- The **sustained-concurrency** requirement uses the in-flight depth sampling of
+  §6 threat 3: if the client was the ceiling, the plateau describes the harness,
+  not the node.
+
+The concurrency floor is gated on the **mean** sampled depth, not the minimum: a
+minimum is a single 10 ms sample and is dominated by scheduler noise (one
+descheduling of the single send thread drives it to zero), whereas "sustained the
+target concurrency" over a throughput plateau is a claim about the window. The
+minimum is reported alongside as context.
+
+A verdict of "clause (b) unmet" always names **which** sub-condition failed
+(read-only gap absent / concurrency not sustained / read-only arm degraded).
 
 A third guard, added around — not inside — the pre-committed thresholds:
 
@@ -72,20 +90,45 @@ Why both clauses:
   cost, which pipelining already hides; Rung A amortizes coordination, it does
   not remove a round-trip from a serial dependency chain. Only a gap that
   survives to the *plateau* is a capacity gap.
-- **(b) is what predicts the fix works.** If the apply frontier or the egress
-  broadcast saturates first, deleting probe traffic entirely moves nothing.
+- **(b) is what predicts the fix works.** If the gap is really the frontier wait,
+  or if the ceiling was the load generator, deleting probe traffic moves nothing.
 
 **Outcomes:**
 
 | Result | Disposition |
 | --- | --- |
 | (a) and (b) | Rung A is justified; proceed to a Rung-A implementation plan. |
-| (a) only | Latency-shaped, not capacity-shaped. Rung A shelved; record why. |
-| (b) only | The agent is busy with something other than probes — profile *that*. |
+| (a) only, read-only gap absent | The gap is frontier-wait cost, not barrier cost. Rung A moves nothing; record why. |
+| (a) only, concurrency not sustained | The plateau is the harness's, not the node's. Re-run with a stronger load generator before ruling. |
 | neither | Both rungs null for this workload. The brief gets a "measured, declined" section and the read path is left alone. |
 
 Rung B is out of scope for this decision regardless of outcome — it stays
 sequenced behind the Veil V2 coherence-window result, per the brief's §5.
+
+### 2.1 Amendment, 2026-07-25 — clause (b) reformulated
+
+**This amendment was made before any measurement data existed.** No `client`,
+`all`, or `ladder` run had produced a number that was recorded anywhere, and the
+fleet run had not been scheduled; the only runs executed were local wiring
+verification whose numbers §3.1 forbids from reaching the report. That provenance
+is the point of a pre-commitment: the record must show the rule was changed
+because its instrument was broken, not because a result was unwelcome.
+
+**What changed and why.** The original clause (b) — "`uc2-consensus` or
+`uc2-receiver` is the top-occupancy agent" — depended on the §4.3 yield-rate
+proxy, which was **measured non-functional** (see §4.3). A yield-idling agent is
+indistinguishable from a busy one at the OS level, so *no* external proxy can
+rank these agents; the clause was unanswerable as written, not merely
+noisy.
+
+**What did not change.** Clause (a)'s 70% threshold, the 65–75% borderline band,
+the borderline-before-justified ordering, and the >5% degraded guard are all
+untouched. Only clause (b)'s content was replaced, with a formulation that
+discharges the same job — *rule out that something other than the barrier
+explains the gap* — from data the harness already collects.
+
+**What was dropped.** The "ties do not count" tie-break went with the ranking it
+broke ties in; there is no ranking left for it to apply to.
 
 ## 3. Harness shape
 
@@ -177,68 +220,75 @@ distinguish latency cost from capacity cost, which is exactly the distinction
 clause (a) of the decision rule turns on. Report the full curve, not just the
 peak.
 
-### 4.3 Secondary signal — agent occupancy
+### 4.3 Agent occupancy — MEASURED NON-FUNCTIONAL, retained as diagnostic only
+
+**Status (2026-07-25): this section's metric does not work, and clause (b) no
+longer depends on it.** The text below records what was tried, what was measured,
+and why no external proxy can succeed — kept rather than deleted so the failure
+is not re-attempted.
 
 Every agent thread is already named by `AgentRunner::spawn` via
 `thread::Builder::name` (`uc2_log/src/agent.rs:53`): `uc2-consensus`,
 `uc2-sender`, `uc2-receiver`, `uc2-archive`, `uc2-apply`. All are ≤15 chars, so
-they survive intact in `/proc/<pid>/task/<tid>/comm`. Attribution is free.
+they survive intact in `/proc/<pid>/task/<tid>/comm`. Attribution is free — the
+*attribution* was never the problem.
 
-**CPU time is the wrong metric here.** The node agents idle on
+**The original plan.** CPU time is unusable: the node agents idle on
 `IdleStrategy::Yield` (`agent.rs:28` → `std::thread::yield_now()`), so an *idle*
-agent still burns a core in a yield loop; CPU% is near-saturated by construction
-and carries almost no signal.
+agent still burns a core in a yield loop and CPU% is saturated by construction.
+The intended substitute was the yield RATE — `voluntary_ctxt_switches` from
+`/proc/<pid>/task/<tid>/status`, differenced across the measurement window — on
+the premise that each `sched_yield` from an empty duty cycle increments it, so a
+busy agent yields rarely and an idle one yields at its loop rate.
 
-**The usable proxy is the yield rate:** `voluntary_ctxt_switches` from
-`/proc/<pid>/task/<tid>/status`, sampled at the start and end of the measurement
-window. Each `sched_yield` from an empty duty cycle increments it, so
+**The premise is false.** Measured twice, independently:
 
-```text
-occupancy(agent) ≈ 1 − normalized(voluntary_ctxt_switches per second)
-```
+| Probe | `sched_yield()` calls | Δ `voluntary_ctxt_switches` | Δ `nonvoluntary` |
+| --- | --- | --- | --- |
+| Rust/Python, 2 s | 1,483,000 | **+1** | +34 |
+| C, direct | 2,000,000 | **+0** | +677 |
 
-A busy agent yields rarely; an idle one yields at its loop rate. Ranking agents
-by this is enough to discharge clause (b), which asks only which agent is
-*top*-occupancy, not for an absolute duty-cycle percentage.
+`sched_yield` leaves the task `TASK_RUNNING`, so the kernel accounts any
+resulting switch as *non*voluntary — and with no other runnable task on the CPU
+it often performs no switch at all. The nonvoluntary deltas are ordinary
+preemption noise, not duty-cycle signal. A local `ladder` run shows the
+consequence directly: every node agent reports ~0 yields/s, and the ranking
+degenerates into the sampler's `(pid, tid)` tie-break.
 
-Two things the sampler must get right, both of which are load-bearing for
-clause (b):
+**No external proxy can work here, and this is structural.** A yield-idling agent
+and a fully busy agent are indistinguishable from outside the process: both burn
+100% of a core, neither ever blocks, and neither reaches a scheduler state the
+kernel exposes differently. `nonvoluntary_ctxt_switches` measures how often the
+scheduler preempted the thread — a function of system load, not of the agent's
+duty cycle. There is no third field that separates them.
+
+**The only true occupancy metric would be internal.** Feature-gated duty-cycle
+counters in `AgentRunner` — work-done vs. empty-poll counts per duty cycle,
+dumped by the node role at exit — would measure occupancy directly and correctly.
+That means changing `uc2_node`, which this instrument deliberately does not do
+(the whole design is "attach, never participate"), so it remains available if
+occupancy is ever wanted for its own sake. It is **not** needed for the decision:
+clause (b) was reformulated (§2.1) to be answerable from data the harness already
+collects.
+
+**What the harness still does.** The sampler is retained and is correct as far as
+it goes — keyed by `(pid, tid)` rather than by thread name, and sampling the union
+of the node and service PIDs. Two things it must get right, kept because they are
+real bugs if regressed:
 
 - **Samples are keyed by `(pid, tid)`, never by thread name.** Agent names are
   static, so any process running more than one node has several threads called
   `uc2-consensus`. A name-keyed before/after join differences unrelated threads;
   the mis-paired rows saturate to zero and then sort to the *front* of an
-  ascending-by-yields ranking, impersonating the busiest agent. Rows are reported
-  as `name#tid`.
-- **The service's PID must be sampled too.** On a fleet the service is a separate
-  process, so a node-only sample contains no `uc2-apply` at all — and clause (b)
-  would then rank a set in which the apply frontier, the exact hypothesis it
-  exists to rule out, cannot appear. The client takes `--node-pid` *and*
-  `--service-pid` and samples the union.
+  ascending ranking, impersonating the busiest agent.
+- **The service's PID must be sampled too** (`--node-pid` *and* `--service-pid`).
+  On a fleet the service is a separate process, so a node-only sample contains no
+  `uc2-apply` at all.
 
-> **OPEN — the proxy does not work as specified (found 2026-07-25, during the
-> harness fix wave).** `sched_yield` does **not** increment
-> `voluntary_ctxt_switches` on this kernel. Measured directly (Linux 7.0.0, 4
-> cores): 1,483,000 `sched_yield()` calls over 2 s produced **1** voluntary and
-> 34 nonvoluntary context switches — `sched_yield` leaves the task
-> `TASK_RUNNING`, so the kernel accounts any resulting switch as *non*voluntary,
-> and with no other runnable task on the CPU it often causes no switch at all.
-> A local `ladder` run confirms the consequence: every agent reports ~0 yields/s
-> and the ranking degenerates into the sampler's `(pid, tid)` tie-break.
->
-> **Clause (b) is therefore unmeasurable until this is resolved**, and the fleet
-> ladder must not be run for the record before it is. Note that this result
-> *strengthens* the reason given above for rejecting CPU time (the agents really
-> do spin without yielding to the scheduler), so the replacement is a design
-> decision — not a mechanical substitution — and plausibly the §4.3 escalation
-> below (a `profiling`-gated counter set in `uc2_node`) is now the primary path
-> rather than the reserve one.
-
-**Escalation, if the proxy is ambiguous** (e.g. two agents rank within noise):
-fall back to a `profiling`-feature-gated counter set in `uc2_node` — probe
-sends, acks processed, `ReadPhase` transitions — dumped by the node role at
-exit. Deliberately held in reserve: it perturbs the hot path it measures and
-enlarges the diff, and the A/B may well settle the question without it.
+Its output is printed under an explicit caveat stating that near-zero rows are
+the expected reading and that it does **not** feed the decision rule. The
+`profiling`-gated escalation described above remains the fallback if a future
+question genuinely needs per-agent occupancy.
 
 ## 5. Workload arms
 
@@ -280,8 +330,10 @@ To be stated in the report, not discovered afterwards:
 4. **Shared-core smoke is not evidence at all here** (§3.1) — the box carries a
    concurrent model-checking session. Local runs verify wiring; the fleet run
    measures. No local number reaches the report.
-5. **Yield-rate proxy is ordinal, not absolute.** It ranks agents; it does not
-   measure duty-cycle occupancy. Clause (b) is written to need only the ranking.
+5. **The yield-rate proxy measures nothing** (§4.3, measured 2026-07-25:
+   2,000,000 `sched_yield()` calls → +0 `voluntary_ctxt_switches`). Its output is
+   printed as a labelled diagnostic and must not be quoted as occupancy or used
+   to attribute a bottleneck to an agent. Clause (b) does not read it (§2.1).
 6. **The two arms are not symmetric under back-pressure: a snapshot read can be
    DROPPED where a linearizable read is RETRIED.** This is production behaviour,
    not a harness defect, and it biases the A/B in the direction that makes the
@@ -323,9 +375,14 @@ To be stated in the report, not discovered afterwards:
 A report under `docs/benchmarks/uc2-read-profile-<date>.md`, gate-doc-shaped:
 
 - the concurrency ladder, both arms, both workload mixes (throughput + p50/p99);
-- per-agent yield-rate ranking at each plateau;
+- per-rung health: retries, redirects, unresolved-at-end, and the sustained
+  in-flight depth (mean and minimum) against target — a rung that fails these is
+  not a data point;
 - the decision rule evaluated clause by clause, with an explicit verdict line;
-- every threat in §6 addressed with what the run actually showed.
+  clause (b) names which sub-condition decided it;
+- every threat in §6 addressed with what the run actually showed;
+- the yield-rate diagnostic may be included only if labelled non-functional per
+  §4.3; it is not evidence about any agent.
 
 No exit code, no bar, no PASS/FAIL — the verdict is a disposition on Rung A.
 

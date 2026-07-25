@@ -84,27 +84,28 @@
 //! cannot see `uc2-apply` — the very agent clause (b) exists to rule out. Pass
 //! `--service-pid` too; the sampler takes the union of both task dirs.
 //!
-//! ### *** UNRESOLVED: the yield-rate proxy does not appear to work ***
+//! ### The yield-rate proxy is DEAD — it is diagnostic output, not a signal
 //!
 //! The premise above — that `sched_yield` increments `voluntary_ctxt_switches` —
-//! **does not hold on this kernel**, and the proxy therefore currently carries no
-//! signal at all. Measured directly (Linux 7.0.0, 4 cores): a thread that called
-//! `sched_yield()` **1,483,000** times over 2 s recorded **1** voluntary and 34
-//! nonvoluntary context switches. `sched_yield` leaves the task `TASK_RUNNING`,
-//! so any switch it does cause is accounted NONvoluntary — and with no other
-//! runnable task on the CPU it often causes no switch at all.
+//! **does not hold**. Measured twice independently: 1,483,000 `sched_yield()`
+//! calls produced **+1** voluntary context switch (Rust/Python probe), and
+//! 2,000,000 calls produced **+0** (C probe, +677 nonvoluntary = preemption
+//! noise). `sched_yield` leaves the task `TASK_RUNNING`, so any switch it causes
+//! is accounted NONvoluntary — and with no other runnable task on the CPU it
+//! often causes no switch at all.
 //!
-//! The `ladder` output agrees: every agent thread reports ~0 yields/s and the
-//! ranking degenerates into the `(pid, tid)` tie-break, so **clause (b) of the
-//! decision rule is presently unmeasurable** — a rank produced this way is
-//! arbitrary, not "the busiest agent". This is a defect in the SPEC's §4.3
-//! metric, not in the joining/keying logic here (which is now correct and
-//! tested), and picking the replacement signal is a design decision, not a
-//! mechanical fix: `nonvoluntary_ctxt_switches` measures preemption rather than
-//! duty cycle, and the spec's own reason for rejecting CPU time (agents spin, so
-//! CPU% saturates) is *strengthened* by this result rather than weakened.
-//! **Do not run the fleet ladder for the record until clause (b) has a working
-//! metric** — clause (a) would still be measured, but the rule needs both.
+//! This is not fixable with a different `/proc` field. A yield-idling agent and
+//! a busy one are **indistinguishable at the OS level**: both burn 100% of a
+//! core, neither ever blocks. Only feature-gated duty-cycle counters inside
+//! `AgentRunner` could measure true occupancy, and adding those means touching
+//! `src/` — out of scope here.
+//!
+//! So the ranking ranks nothing, and **clause (b) was reformulated to be
+//! answerable from data the harness already collects** (see
+//! [`evaluate_clause_b`]). The sampler is kept — correctly keyed by
+//! `(pid, tid)`, tested, and printed under an explicit caveat — because it
+//! becomes useful the moment real duty-cycle counters land. It does **not** feed
+//! the decision rule.
 //!
 //! ## Env caps (sandbox safety, m1–m5 pattern)
 //!
@@ -117,13 +118,20 @@
 //! `evaluate_decision_rule` implements the design spec's §2 rule VERBATIM:
 //! build Rung A iff (a) the linearizable plateau is ≤70% of the snapshot
 //! plateau (65–75% is a borderline band that does NOT license a decision on
-//! local smoke) AND (b) `uc2-consensus` or `uc2-receiver` is the top-occupancy
-//! agent at that plateau — **and ties do not count**: spec §2's second tie-break
-//! rule says clause (b) is unmet when the top two agents sit inside the yield
-//! proxy's run-to-run spread (implemented as: the runner-up must yield at least
-//! 20% more than the top). The 70% figure, the band, and the agent list were
-//! fixed before any run and are not adjusted once numbers exist — changing this
-//! function to fit a result would defeat the entire point of pre-committing it.
+//! local smoke) AND (b) that gap is present in the **read-only arm**, the client
+//! sustained ≥90% of target concurrency there, and neither read-only arm is
+//! degraded. The 70% figure and the band were fixed before any run and are not
+//! adjusted once numbers exist — changing this function to fit a result would
+//! defeat the entire point of pre-committing it.
+//!
+//! Clause (b) was **amended on 2026-07-25, before any measurement data existed**,
+//! because its original formulation (which agent is top-occupancy) rested on a
+//! metric that turned out to measure nothing — see the dead-proxy section below
+//! and the spec's dated amendment note. The amended clause discharges the same
+//! job: rule out that something other than the barrier explains the gap. The
+//! read-only arm is the substantive part — with no writes in flight the frontier
+//! wait is free, so a gap there is barrier cost, whereas a gap that appears only
+//! under write load is frontier-wait cost.
 //!
 //! Two guards sit AROUND (not inside) those thresholds, because a broken run
 //! must not read as a favourable one:
@@ -227,11 +235,22 @@ const DEPTH_WARMUP: Duration = Duration::from_millis(100);
 /// and the build signal distinguishable.
 const DEGRADED_FRACTION: f64 = 0.05;
 
-/// Clause (b) is a RANKING and spec §2 says ties do not count. The runner-up
-/// must yield at least this much more than the top agent before the top is
-/// treated as a distinct bottleneck rather than a coin flip inside the yield
-/// proxy's run-to-run spread.
-const TIE_MARGIN: f64 = 0.20;
+/// Clause (a)'s pre-committed threshold: the linearizable plateau must be at or
+/// below this percentage of the snapshot plateau. Fixed before any run existed
+/// and NOT a tunable. The 65-75% borderline band around it is spelled out
+/// literally at the one place it is tested.
+const RATIO_THRESHOLD: f64 = 70.0;
+
+/// Clause (b)'s concurrency floor: the client must have sustained at least this
+/// fraction of the target in-flight depth, or the plateau describes the load
+/// generator rather than the node (spec §6, threat 3).
+///
+/// Gated on the MEAN sampled depth, not the minimum: the minimum is a single
+/// 10 ms sample and is dominated by scheduler noise (one descheduling of the
+/// single send thread drives it to 0), whereas "sustained the target
+/// concurrency" over a throughput plateau is a statement about the window. The
+/// minimum is still reported alongside as context.
+const SUSTAINED_FRACTION: f64 = 0.90;
 
 #[derive(Parser)]
 #[command(
@@ -1281,10 +1300,18 @@ fn print_read_report(mode: Mode, readers: u64, write_rate: u64, s: &ReadStats, o
     if occ.is_empty() {
         println!("agent occupancy       : (not sampled — pass --node-pid and --service-pid)");
     } else {
-        println!("agent occupancy (busiest first, fewer yields = busier; rows are name#tid):");
+        println!(
+            "agent yield rates (DIAGNOSTIC ONLY — does NOT feed the decision rule; a \
+             yield-idling agent is indistinguishable from a busy one, see below):"
+        );
         for o in occ {
             println!("    pid {:<8} {:<24} {:>12.0} yields/s", o.pid, o.label(), o.yields_per_sec);
         }
+        println!(
+            "    ^ sched_yield does NOT increment voluntary_ctxt_switches (measured: 2,000,000 \
+             yields -> +0). Near-zero rows are the expected reading, not a bug, and rank \
+             nothing. Clause (b) is evaluated from the read-only arm instead (spec §2, §4.3)."
+        );
     }
     println!("=================================================================");
 }
@@ -1470,6 +1497,12 @@ impl Rung {
     fn is_degraded(&self) -> bool {
         self.degraded_fraction() > DEGRADED_FRACTION
     }
+
+    /// Mean sustained in-flight depth as a fraction of the target concurrency.
+    /// See [`SUSTAINED_FRACTION`] for why the mean and not the minimum.
+    fn sustained_fraction(&self) -> f64 {
+        if self.readers == 0 { 0.0 } else { self.inflight_mean / self.readers as f64 }
+    }
 }
 
 /// `(retried + not_leader) / (reads + retried + not_leader)`; 0 when nothing
@@ -1613,11 +1646,88 @@ fn rung_from_json(line: &str) -> Option<Rung> {
     })
 }
 
+/// Which sub-condition of clause (b) failed, if any.
+#[derive(Debug, Clone, PartialEq)]
+enum ClauseB {
+    Met,
+    /// The read-only arm has no rungs to evaluate.
+    NoReadOnlyData,
+    /// The gap is NOT present in the read-only arm — so it is frontier-wait
+    /// cost, not barrier cost.
+    NoReadOnlyGap { ratio: f64 },
+    /// The client did not sustain the target concurrency, so the plateau
+    /// describes the harness rather than the node.
+    ConcurrencyNotSustained { arm: &'static str, mean: f64, target: u64, pct: f64 },
+    /// A read-only arm collapsed into retries/redirects.
+    ReadOnlyArmDegraded { arm: &'static str, pct: f64 },
+}
+
+/// Evaluate clause (b) over the READ-ONLY rungs, whatever mix is being reported.
+///
+/// **Why the read-only arm is the substantive test.** With no writes in flight,
+/// `service_applied >= commit_at` already holds when a read is admitted, so the
+/// frontier wait is free and the lin-vs-snap delta there is the barrier ALONE.
+/// A gap that shows up only in the mixed arm is frontier-wait cost — the exact
+/// misattribution clause (b) exists to catch. The concurrency floor uses the
+/// depth sampling from spec §6 threat 3: if the client was the ceiling, the
+/// plateau says nothing about the node.
+fn evaluate_clause_b(rungs: &[Rung]) -> ClauseB {
+    let plateau = |mode: Mode| -> Option<&Rung> {
+        rungs
+            .iter()
+            .filter(|r| r.mode == mode && r.write_rate == 0)
+            .max_by(|a, b| a.reads_per_sec.total_cmp(&b.reads_per_sec))
+    };
+    let (Some(lin), Some(snap)) = (plateau(Mode::Lin), plateau(Mode::Snap)) else {
+        return ClauseB::NoReadOnlyData;
+    };
+    if snap.reads_per_sec <= 0.0 {
+        return ClauseB::NoReadOnlyData;
+    }
+    for r in [lin, snap] {
+        if r.is_degraded() {
+            return ClauseB::ReadOnlyArmDegraded {
+                arm: r.arm_name(),
+                pct: r.degraded_fraction() * 100.0,
+            };
+        }
+    }
+    let ratio = lin.reads_per_sec / snap.reads_per_sec * 100.0;
+    if ratio > RATIO_THRESHOLD {
+        return ClauseB::NoReadOnlyGap { ratio };
+    }
+    // Both arms: a client-limited SNAPSHOT arm corrupts the ratio just as badly
+    // as a client-limited linearizable one.
+    for r in [lin, snap] {
+        let pct = r.sustained_fraction() * 100.0;
+        if r.sustained_fraction() < SUSTAINED_FRACTION {
+            return ClauseB::ConcurrencyNotSustained {
+                arm: r.arm_name(),
+                mean: r.inflight_mean,
+                target: r.readers,
+                pct,
+            };
+        }
+    }
+    ClauseB::Met
+}
+
 /// The decision rule from the spec (§2), evaluated verbatim and never tuned:
 ///
-///   Build Rung A iff (a) the linearizable plateau is <=70% of the snapshot
-///   plateau AND (b) uc2-consensus or uc2-receiver is the top-occupancy agent.
+///   Build Rung A iff (a) the linearizable plateau is <=RATIO_THRESHOLD% of the
+///   snapshot plateau at the reported mix, AND (b) that gap is also present in
+///   the READ-ONLY arm, the client sustained >=90% of target concurrency there,
+///   and neither read-only arm is degraded.
 ///   Borderline 65-75% => NOT justified without a fleet run.
+///
+/// Clause (b) was AMENDED on 2026-07-25, **before any measurement data existed**
+/// (see the spec's dated amendment note): the original clause asked which agent
+/// was top-occupancy, which the yield-rate proxy turned out to be incapable of
+/// answering — a yield-idling agent is indistinguishable from a busy one at the
+/// OS level. The amended clause discharges the same job (rule out that something
+/// other than the barrier explains the gap) from data the harness already
+/// collects. Clause (a)'s threshold, the borderline band, the
+/// borderline-before-justified ordering, and the degraded guard are unchanged.
 ///
 /// Plateau = the best rate that arm reached across the ladder (the ladder's
 /// point is to climb until the rate stops improving, so the max IS the plateau).
@@ -1635,21 +1745,9 @@ fn evaluate_decision_rule(rungs: &[Rung], write_rate: u64) -> String {
         return "VERDICT: INCONCLUSIVE — the snapshot arm measured zero reads/s.".into();
     }
     let ratio = lin.reads_per_sec / snap.reads_per_sec * 100.0;
-    let top_rank = lin.agents.first();
-    let runner_up = lin.agents.get(1);
-    let top = top_rank.map(|a| a.name.clone()).unwrap_or_else(|| "(not sampled)".into());
-    let top_label = top_rank.map(|a| a.label.clone()).unwrap_or_else(|| "(not sampled)".into());
-    let probe_agent_is_top = top == "uc2-consensus" || top == "uc2-receiver";
-    // Spec §2: "(b) is a ranking, and ties do not count." The runner-up must
-    // yield materially MORE than the top (the ranking is ascending in yields,
-    // fewest = busiest) before the top counts as a distinct bottleneck.
-    let tie = match (top_rank, runner_up) {
-        (Some(t), Some(r)) => {
-            !(r.yields_per_sec > t.yields_per_sec
-                && r.yields_per_sec - t.yields_per_sec >= TIE_MARGIN * t.yields_per_sec)
-        }
-        _ => false,
-    };
+    // Clause (b) is always evaluated over the READ-ONLY rungs, even when the
+    // mixed arm is the one being reported.
+    let clause_b = evaluate_clause_b(rungs);
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -1660,19 +1758,17 @@ fn evaluate_decision_rule(rungs: &[Rung], write_rate: u64) -> String {
         "  snapshot plateau     : {:>12.0} reads/s (at {} readers, p50={:.3}ms p99={:.3}ms)\n",
         snap.reads_per_sec, snap.readers, snap.p50_ms, snap.p99_ms
     ));
-    out.push_str(&format!("  ratio (lin/snap)     : {ratio:.1}%  [rule: <=70% and not 65-75%]\n"));
     out.push_str(&format!(
-        "  top-occupancy agent  : {top_label}  [rule: uc2-consensus or uc2-receiver]\n"
+        "  ratio (lin/snap)     : {ratio:.1}%  [clause (a): <={RATIO_THRESHOLD:.0}% and not \
+         65-75%]\n"
     ));
-    if let (Some(t), Some(r)) = (top_rank, runner_up) {
-        out.push_str(&format!(
-            "  runner-up agent      : {} ({:.0} vs {:.0} yields/s; tie rule needs +{:.0}%)\n",
-            r.label,
-            r.yields_per_sec,
-            t.yields_per_sec,
-            TIE_MARGIN * 100.0
-        ));
-    }
+    // Short tag here; the verdict line below carries the full explanation.
+    out.push_str(&format!(
+        "  clause (b)           : {}  [read-only gap + >={:.0}% sustained concurrency + \
+         no degraded arm]\n",
+        clause_b_tag(&clause_b),
+        SUSTAINED_FRACTION * 100.0
+    ));
     for r in [lin, snap] {
         out.push_str(&format!(
             "  {:<20} : {} reads, {} retried, {} not_leader ({:.1}% degraded), \
@@ -1725,37 +1821,62 @@ fn evaluate_decision_rule(rungs: &[Rung], write_rate: u64) -> String {
             "VERDICT: BORDERLINE ({ratio:.1}% is inside the 65-75% band) — \
              NOT justified on this data; resolve with a fleet run or decline."
         )
-    } else if ratio <= 70.0 && probe_agent_is_top && !tie {
+    } else if ratio <= RATIO_THRESHOLD && clause_b == ClauseB::Met {
         "VERDICT: Rung A JUSTIFIED — both clauses met.".to_string()
-    } else if ratio > 70.0 {
+    } else if ratio > RATIO_THRESHOLD {
         format!(
             "VERDICT: Rung A NOT JUSTIFIED — clause (a) unmet: the barrier costs \
              at most {:.1}% of read capacity.",
             (100.0 - ratio).max(0.0)
         )
-    } else if probe_agent_is_top && tie {
-        let r = runner_up.expect("tie implies a runner-up");
-        let t = top_rank.expect("tie implies a top agent");
-        format!(
-            "VERDICT: Rung A NOT JUSTIFIED — clause (b) unmet by TIE: {} ({:.0} yields/s) and \
-             {} ({:.0} yields/s) are within the yield proxy's run-to-run spread (under \
-             {:.0}% apart). Spec §2: '(b) is a ranking, and ties do not count' — escalate \
-             per spec §4.3 or decline.",
-            t.label,
-            t.yields_per_sec,
-            r.label,
-            r.yields_per_sec,
-            TIE_MARGIN * 100.0
-        )
     } else {
         format!(
-            "VERDICT: Rung A NOT JUSTIFIED — clause (b) unmet: the top-occupancy agent \
-             is {top_label}, not a probe-touching agent. Removing probe traffic would not \
-             move this ceiling; profile {top} instead."
+            "VERDICT: Rung A NOT JUSTIFIED — clause (b) unmet: {}.",
+            clause_b_reason(&clause_b)
         )
     };
     out.push_str(&verdict);
     out
+}
+
+/// Short tag for the summary line.
+fn clause_b_tag(c: &ClauseB) -> &'static str {
+    match c {
+        ClauseB::Met => "met",
+        ClauseB::NoReadOnlyData => "UNMET (no read-only rungs)",
+        ClauseB::NoReadOnlyGap { .. } => "UNMET (no gap in the read-only arm)",
+        ClauseB::ConcurrencyNotSustained { .. } => "UNMET (concurrency not sustained)",
+        ClauseB::ReadOnlyArmDegraded { .. } => "UNMET (read-only arm degraded)",
+    }
+}
+
+/// Spell out WHICH sub-condition of clause (b) failed — a bare "unmet" is
+/// useless in a report.
+fn clause_b_reason(c: &ClauseB) -> String {
+    match c {
+        ClauseB::Met => "met".to_string(),
+        ClauseB::NoReadOnlyData => "the read-only arm (write_rate=0) has no usable rungs, so \
+             the barrier's cost cannot be isolated from the frontier wait"
+            .to_string(),
+        ClauseB::NoReadOnlyGap { ratio } => format!(
+            "the gap is ABSENT in the read-only arm (lin/snap = {ratio:.1}% there, above the \
+             {RATIO_THRESHOLD:.0}% threshold). With no writes in flight the frontier wait is \
+             free, so a gap that appears only under write load is frontier-wait cost, not \
+             barrier cost — removing probe traffic would not move it"
+        ),
+        // One decimal: at {:.0} a 89.4% shortfall prints as "90%, floor 90%",
+        // which reads as a contradiction of the verdict it is explaining.
+        ClauseB::ConcurrencyNotSustained { arm, mean, target, pct } => format!(
+            "the client did not sustain the target concurrency in the read-only {arm} arm \
+             (mean in-flight depth {mean:.1} of target {target} = {pct:.1}%, floor {:.1}%). \
+             The plateau describes the LOAD GENERATOR, not the node",
+            SUSTAINED_FRACTION * 100.0
+        ),
+        ClauseB::ReadOnlyArmDegraded { arm, pct } => format!(
+            "the read-only {arm} arm is degraded ({pct:.1}% retries/redirects), so its ratio \
+             is not a measurement"
+        ),
+    }
 }
 
 fn run_ladder(a: LadderArgs) -> anyhow::Result<()> {
@@ -1801,7 +1922,7 @@ fn run_ladder(a: LadderArgs) -> anyhow::Result<()> {
                     "  rung: mode={:<5} readers={readers:<5} writes/s={write_rate:<7} \
                      reads/s={:>10.0}  p50={:.3}ms  retried={} not_leader={} \
                      ({:.1}% degraded) overwritten={} inflight_end={} depth(mean/min)={:.1}/{} \
-                     top={}",
+                     top(diag)={}",
                     r.mode_str(),
                     r.reads_per_sec,
                     r.p50_ms,
@@ -2030,9 +2151,9 @@ mod tests {
         AgentRank { name: name.to_string(), label: format!("{name}#{tid}"), yields_per_sec: yields }
     }
 
-    /// A healthy rung whose ranking has an unambiguous top agent: `top` is the
-    /// busiest (lowest yield rate) and the runner-up is 10x above it, well
-    /// clear of the tie margin.
+    /// A HEALTHY read-only rung: no retries, target concurrency fully
+    /// sustained. `top` only populates the diagnostic yield ranking, which no
+    /// longer gates anything.
     fn rung(readers: u64, mode: Mode, rps: f64, top: &str) -> Rung {
         Rung {
             readers,
@@ -2054,7 +2175,7 @@ mod tests {
     }
 
     #[test]
-    fn rule_justifies_rung_a_when_gap_and_consensus_is_top() {
+    fn rule_justifies_rung_a_when_the_read_only_gap_is_real() {
         let rungs = vec![
             rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"),
             rung(64, Mode::Lin, 500_000.0, "uc2-consensus"), // 50% of snapshot
@@ -2076,7 +2197,7 @@ mod tests {
     }
 
     #[test]
-    fn rule_declines_in_the_borderline_band_even_with_the_right_top_agent() {
+    fn rule_declines_in_the_borderline_band_even_when_clause_b_is_met() {
         let rungs = vec![
             rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"),
             rung(64, Mode::Lin, 700_000.0, "uc2-consensus"), // 70% — inside 65..=75
@@ -2089,15 +2210,24 @@ mod tests {
         );
     }
 
+    /// The occupancy ranking no longer gates anything: an identical gap is
+    /// justified regardless of which agent tops the (dead) yield ranking.
     #[test]
-    fn rule_declines_when_a_non_probe_agent_is_top() {
-        let rungs = vec![
+    fn rule_ignores_the_diagnostic_agent_ranking() {
+        let with_apply_top = vec![
             rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"),
-            rung(64, Mode::Lin, 400_000.0, "uc2-apply"), // big gap, wrong bottleneck
+            rung(64, Mode::Lin, 400_000.0, "uc2-apply"),
         ];
-        let out = evaluate_decision_rule(&rungs, 0);
-        assert!(out.contains("NOT JUSTIFIED"), "got: {out}");
-        assert!(out.contains("uc2-apply"), "verdict should name the actual top agent: {out}");
+        let with_consensus_top = vec![
+            rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"),
+            rung(64, Mode::Lin, 400_000.0, "uc2-consensus"),
+        ];
+        assert_eq!(
+            evaluate_decision_rule(&with_apply_top, 0),
+            evaluate_decision_rule(&with_consensus_top, 0),
+            "the yield ranking must not change the verdict"
+        );
+        assert!(evaluate_decision_rule(&with_apply_top, 0).contains("Rung A JUSTIFIED"));
     }
 
     #[test]
@@ -2197,38 +2327,108 @@ mod tests {
         assert_eq!(degraded_fraction(90, 5, 5), 0.1);
     }
 
-    // --- I1: spec §2's tie rule --------------------------------------------
+    // --- the amended clause (b) (2026-07-25) --------------------------------
+    //
+    // (b) = the gap is present in the READ-ONLY arm, the client sustained >=90%
+    // of target concurrency there, and neither read-only arm is degraded.
 
-    #[test]
-    fn rule_declines_when_the_top_two_agents_are_within_the_proxy_spread() {
-        let mut lin = rung(64, Mode::Lin, 500_000.0, "uc2-consensus");
-        // uc2-consensus edges uc2-apply by 0.2% — a coin flip, not a ranking.
-        lin.agents = vec![agent("uc2-consensus", 10, 1_000.0), agent("uc2-apply", 11, 1_002.0)];
-        let rungs = vec![rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"), lin];
-        let out = evaluate_decision_rule(&rungs, 0);
-        assert!(out.contains("clause (b) unmet by TIE"), "got: {out}");
-        assert!(!out.contains("Rung A JUSTIFIED"), "a tie must not justify building: {out}");
-        assert!(out.contains("uc2-consensus#10") && out.contains("uc2-apply#11"), "got: {out}");
+    /// Helper: a mixed-arm rung (write_rate = 20_000).
+    fn mixed(readers: u64, mode: Mode, rps: f64) -> Rung {
+        let mut r = rung(readers, mode, rps, "uc2-consensus");
+        r.write_rate = 20_000;
+        r
     }
 
+    /// THE case clause (b) exists to catch: no gap without writes, a big gap
+    /// with them. That is frontier-wait cost, not barrier cost.
     #[test]
-    fn rule_accepts_a_ranking_that_clears_the_tie_margin() {
-        let mut lin = rung(64, Mode::Lin, 500_000.0, "uc2-consensus");
-        // Runner-up yields exactly 20% more: at the margin, so it counts.
-        lin.agents = vec![agent("uc2-consensus", 10, 1_000.0), agent("uc2-apply", 11, 1_200.0)];
-        let rungs = vec![rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"), lin];
-        let out = evaluate_decision_rule(&rungs, 0);
+    fn rule_declines_when_the_gap_is_absent_in_the_read_only_arm() {
+        let rungs = vec![
+            // Read-only: lin/snap = 95% — no barrier cost when nothing commits.
+            rung(64, Mode::Snap, 1_000_000.0, "uc2-consensus"),
+            rung(64, Mode::Lin, 950_000.0, "uc2-consensus"),
+            // Mixed: lin/snap = 40% — but that is the frontier wait.
+            mixed(64, Mode::Snap, 1_000_000.0),
+            mixed(64, Mode::Lin, 400_000.0),
+        ];
+        let out = evaluate_decision_rule(&rungs, 20_000);
+        assert!(out.contains("NOT JUSTIFIED"), "got: {out}");
+        assert!(out.contains("clause (b) unmet"), "got: {out}");
+        assert!(out.contains("ABSENT in the read-only arm"), "got: {out}");
+        assert!(out.contains("frontier-wait cost"), "the reason must be named: {out}");
+        assert!(out.contains("95.0%"), "the read-only ratio must be quoted: {out}");
+    }
+
+    /// The same mixed gap IS justified when the read-only arm shows it too.
+    #[test]
+    fn rule_justifies_a_mixed_gap_that_is_also_present_read_only() {
+        let rungs = vec![
+            rung(64, Mode::Snap, 1_000_000.0, "uc2-consensus"),
+            rung(64, Mode::Lin, 500_000.0, "uc2-consensus"), // 50% read-only
+            mixed(64, Mode::Snap, 1_000_000.0),
+            mixed(64, Mode::Lin, 400_000.0),
+        ];
+        let out = evaluate_decision_rule(&rungs, 20_000);
         assert!(out.contains("Rung A JUSTIFIED"), "got: {out}");
         assert!(!out.contains("NOT JUSTIFIED"), "got: {out}");
     }
 
     #[test]
-    fn rule_declines_on_a_tie_just_under_the_margin() {
+    fn rule_declines_when_the_client_did_not_sustain_concurrency() {
         let mut lin = rung(64, Mode::Lin, 500_000.0, "uc2-consensus");
-        lin.agents = vec![agent("uc2-consensus", 10, 1_000.0), agent("uc2-apply", 11, 1_199.0)];
-        let rungs = vec![rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"), lin];
+        lin.inflight_mean = 40.0; // 62.5% of target 64 — the client was the ceiling
+        let rungs = vec![rung(64, Mode::Snap, 1_000_000.0, "uc2-consensus"), lin];
         let out = evaluate_decision_rule(&rungs, 0);
-        assert!(out.contains("clause (b) unmet by TIE"), "got: {out}");
+        assert!(out.contains("NOT JUSTIFIED"), "got: {out}");
+        assert!(out.contains("did not sustain the target concurrency"), "got: {out}");
+        assert!(out.contains("LOAD GENERATOR"), "got: {out}");
+        assert!(out.contains("62.5%"), "the shortfall must be quantified: {out}");
+    }
+
+    /// A client-limited SNAPSHOT arm corrupts the ratio just as badly.
+    #[test]
+    fn rule_declines_when_the_snapshot_arm_was_client_limited() {
+        let mut snap = rung(64, Mode::Snap, 1_000_000.0, "uc2-consensus");
+        snap.inflight_mean = 32.0; // 50%
+        let rungs = vec![snap, rung(64, Mode::Lin, 500_000.0, "uc2-consensus")];
+        let out = evaluate_decision_rule(&rungs, 0);
+        assert!(out.contains("did not sustain the target concurrency"), "got: {out}");
+        assert!(out.contains("snapshot arm"), "the arm must be named: {out}");
+    }
+
+    #[test]
+    fn rule_accepts_concurrency_exactly_at_the_floor() {
+        let mut lin = rung(64, Mode::Lin, 500_000.0, "uc2-consensus");
+        lin.inflight_mean = 57.6; // exactly 90% of 64
+        let rungs = vec![rung(64, Mode::Snap, 1_000_000.0, "uc2-consensus"), lin];
+        let out = evaluate_decision_rule(&rungs, 0);
+        assert!(out.contains("Rung A JUSTIFIED"), "got: {out}");
+    }
+
+    /// Clause (b) reads the READ-ONLY arm, so a degraded read-only arm blocks a
+    /// verdict on the MIXED arm even though the mixed arm itself is healthy.
+    #[test]
+    fn rule_declines_when_the_read_only_arm_is_degraded() {
+        let mut ro_lin = rung(64, Mode::Lin, 500_000.0, "uc2-consensus");
+        ro_lin.reads = 90_000;
+        ro_lin.retried = 10_000; // 10%
+        let rungs = vec![
+            rung(64, Mode::Snap, 1_000_000.0, "uc2-consensus"),
+            ro_lin,
+            mixed(64, Mode::Snap, 1_000_000.0),
+            mixed(64, Mode::Lin, 400_000.0),
+        ];
+        let out = evaluate_decision_rule(&rungs, 20_000);
+        assert!(out.contains("NOT JUSTIFIED"), "got: {out}");
+        assert!(out.contains("read-only linearizable arm is degraded"), "got: {out}");
+    }
+
+    #[test]
+    fn rule_declines_a_mixed_verdict_with_no_read_only_rungs_at_all() {
+        let rungs = vec![mixed(64, Mode::Snap, 1_000_000.0), mixed(64, Mode::Lin, 400_000.0)];
+        let out = evaluate_decision_rule(&rungs, 20_000);
+        assert!(out.contains("NOT JUSTIFIED"), "got: {out}");
+        assert!(out.contains("no usable rungs"), "got: {out}");
     }
 
     // --- I8: the verdict must never print a negative cost -------------------
