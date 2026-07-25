@@ -49,8 +49,13 @@ produced real design-assurance findings:
   in Lean. Hence the operating rule for V2: **hunt proxy invariants, not
   end-to-end loss properties** (§3b, §3c). #6b's full-loss depth remains
   **unmeasured** — blocked by a hard `Fin 4` memory wall on this box (§3c).
-- **V2 (coherence-window forward hunt):** NOT run. Bar-2b (its precondition) now
-  passes, so it is unblocked for the next session — and §3b/§3c say how to aim it.
+- **V2 (coherence-window forward hunt):** **RUN — exhaustive, no violation over
+  11,697,699 states** (n=3, term=Fin 3, all shipped fixes on, seven guard-shaped
+  invariants, no depth bound, no state constraints; §3d). **No fifth
+  coherence-window bug at this scale.** Per the brief's exit criteria this is the
+  acceptable non-discovery outcome, and it is stronger than the "credible bounded
+  coverage" it asks for — the search was exhaustive over the model's reachable
+  space, not depth-limited.
 
 No claim in `proofs/` or any "proved" status is affected. Nothing was migrated
 out of `proofs/`.
@@ -264,6 +269,60 @@ With one tracked entry at one tracked position the class is still represented (t
 Bar-2 CE takes its stale bytes while no leader sits), but run 2's SAFE is
 therefore **"safe within this restriction", not unqualified**.
 
+## 3d. V2 — the coherence-window forward hunt (session 5)
+
+Model `proofs-veil/models/V2Hunt.lean`, log
+`proofs-veil/logs/v2-hunt-run1.log`. **The only part of the spike that hunts an
+unknown bug.** Everything before it was backward-looking calibration — revert a
+known fix, confirm the checker finds the known bug, restore it, confirm the CE
+disappears. Here every shipped fix is ON, so a counterexample would be a bug
+nobody knows about. Gated on Bar-2b, which is what makes a *null* result
+informative rather than vacuous.
+
+Base: `Finding9.lean` with `crashRestart` restored (the brief asks for concurrent
+`startElection` / `crashRestart` / gate-reopen / commit interleavings, and crash
+was the one window ingredient that model had dropped). 17 actions, 7 invariants,
+aimed per §3b/§3c at **proxy invariants** — `no_cross_stream_reopen` (#9's guard),
+`no_phantom_commit` (#5/#6b class), `no_unattributed_report`,
+`gate_shut_while_unreconciled`, `handle_never_leads_current`,
+`leader_handle_is_current`, and `election_safety` as a tripwire.
+
+**Result: exhaustive, no violation — 11,697,699 states in 93m10s.** Verified
+before being believed: zero `error: Examples/...` lines (not a voided run) and no
+`maxDepth` anywhere, so `✅ No violation` here is `exploredAllReachableStates`
+rather than `reachedDepthBound` — the two render identically.
+
+**What it does and does not establish.** It does: over this model's entire
+reachable space at n=3 / Fin 3, with all shipped fixes in place, none of the seven
+guard-shaped invariants can be violated. It does **not**: generalise to UC. It
+inherits every abstraction obligation recorded for `BootGate.lean` /
+`Finding9.lean` (nondeterministic grant guard, collapsed tally, one tracked entry
+at one tracked position, concrete excluded-node quorums, the narrowed
+`staleStreamAppend` guard), and says nothing about n≥4 or a fourth term value.
+**It is not a proof; `proofs/` remains the sole record.**
+
+**`state_constraint` was deliberately not used — and turned out not to be needed.**
+Constraints *prune* states, so for a hunt whose value is finding something unknown,
+narrowing first is self-defeating: you cannot find what you pruned. Run 1 was
+unconstrained to establish an honest baseline, and it completed, so the lever was
+never spent. It stays in reserve for n=4, where it would buy tractability at a cost
+that would then have to be stated.
+
+### Capacity envelope — this answers the "do we need a bigger box" question
+
+11.7M states is ~9× the largest prior run and finished with `lean` peaking near
+7 GB against a 15 GB box.
+
+| Configuration | Outcome |
+|---|---|
+| n=3 / Fin 3, exhaustive, 17-action model | **affordable** — 11.7M states, ~93 min, ~7 GB |
+| n=3 / **Fin 4** | **not viable** — 12.1 GB RSS, killed (§3c) |
+
+**A larger AWS box is not required for the V2 forward hunt as scoped** — the local
+box does it exhaustively. A bigger box remains a narrow purchase for the two
+blocked measurements only: #6b's full-loss depth, and ReconfigLC's
+`leader_completeness` counterexample hunt.
+
 ## 4. V-M7 — the primary hunt (results)
 
 Three decisive `#model_check` runs at n=3 with concrete `ExtTreeSet (Fin 3)`
@@ -347,14 +406,11 @@ wrong for this codebase".
 
 Next session, in priority order:
 
-1. **V2 forward hunt** — now unblocked (Bar-2b was its precondition), and the
-   depth probe (§3b) says how to run it: **hunt proxy invariants, not end-to-end
-   loss properties**, since the proxy sits ~6 steps shallower and the loss is out
-   of reach at n=3. `Finding9.lean` is the better base of the two — it carries the
-   gate, the vote, the lagging `handleTerm`, `tailAttributed`, and the commit
-   plane. Bias toward the election-time window (concurrent `startElection` /
-   `crashRestart` / gate-reopen / commit interleavings) hunting a fifth
-   countermodel.
+1. ~~V2 forward hunt~~ — **DONE (§3d).** Exhaustive at n=3 / Fin 3 over 11.7M
+   states, no violation; no fifth coherence-window bug at this scale. The natural
+   follow-on is **n=4 / Fin 3**, which is the untested corner of the envelope and
+   is where `state_constraint` (unspent so far) would be used to buy tractability —
+   at a narrowing cost that must be stated explicitly.
 2. ~~#9 / #6b depth probe~~ — **DONE (§3b, §3c).** #9's enabling condition at
    depth 7 (full loss beyond depth 13); #6b's §5.4.2 proxy at depth 5. **Still
    open: #6b's full-loss depth**, blocked by the `Fin 4` box wall (§3c) — it
