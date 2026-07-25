@@ -833,7 +833,8 @@ fn print_read_report(mode: Mode, readers: u64, write_rate: u64, s: &ReadStats, o
     println!("dup answers dropped   : {}", s.duplicates);
     println!("broadcast overwritten : {}", s.overwritten);
     println!("in-flight at end      : {}", s.inflight_at_end);
-    println!("read regression      : {}", s.regression);
+    println!("read regression       : {}", s.regression);
+    println!("max read value        : {}", s.max_read_value);
     println!("elapsed (drain-incl.) : {:.3} s", s.elapsed.as_secs_f64());
     println!("reads/s               : {:.0}", s.reads_per_sec);
     println!("p50                   : {:.3} ms", s.p50_ms);
