@@ -52,7 +52,19 @@ are in. Two tie-break rules, also fixed in advance:
   with a fleet run, or treat it as not justified.
 - **(b) is a ranking, and ties do not count.** If the top two agents are within
   the run-to-run spread of the yield-rate proxy, clause (b) is unmet and the
-  escalation in §4.3 decides it.
+  escalation in §4.3 decides it. Operationalized in `evaluate_decision_rule` as:
+  the runner-up must yield **at least 20% more** than the top agent (the ranking
+  is ascending in yields — fewest = busiest); anything closer is a tie.
+
+A third guard, added around — not inside — the pre-committed thresholds:
+
+- **A degraded arm cannot certify a plateau.** A linearizable rung that collapses
+  into `MSG_V2_RETRY` (read-barrier timeout, momentary `!can_serve`) resolves few
+  genuine reads across the full elapsed window, which is a *low* ratio — the same
+  shape as the result that justifies building. An arm whose
+  `(retried + not_leader) / (reads + retried + not_leader)` exceeds **5%** yields
+  `INCONCLUSIVE` instead of any verdict, so the failure mode and the build signal
+  stay distinguishable.
 
 Why both clauses:
 
@@ -83,8 +95,9 @@ New example: `uc2_node/examples/read_profile.rs`, following the established
 ```text
 cargo run -p uc2_node --release --example read_profile -- node    --id N --bind A --members … --instance-dir D
 cargo run -p uc2_node --release --example read_profile -- service --instance-dir D
-cargo run -p uc2_node --release --example read_profile -- client  --instance-dir D --secs S --readers K [--mode lin|snap] [--write-rate W]
+cargo run -p uc2_node --release --example read_profile -- client  --instance-dir D --secs S --readers K [--mode lin|snap] [--write-rate W] [--node-pid P] [--service-pid Q]
 cargo run -p uc2_node --release --example read_profile -- all     --secs S   # local smoke, NOT a fleet number
+cargo run -p uc2_node --release --example read_profile -- decide  --rungs FILE [--write-rate W]
 ```
 
 - `node` / `service` are thin fleet-role wrappers over the real SDK stack
@@ -95,6 +108,12 @@ cargo run -p uc2_node --release --example read_profile -- all     --secs S   # l
   `m4_gate`/`m5_gate` precedent and the standing box rule in CLAUDE.md).
 - Env caps `UC2_RP_MAX_SECS`, `UC2_RP_MAX_READERS` clip from above when set
   nonzero; unset is a no-op (the fleet's mode).
+- Each `client` run prints one **rung JSON line** to stdout alongside its human
+  report. On the fleet the ladder is one `client` process per rung under external
+  orchestration, so `decide --rungs FILE` replays those lines through the *same*
+  `evaluate_decision_rule` the unit tests pin. The orchestrator never
+  re-implements the rule — a rule re-implemented outside its tests is no longer a
+  pre-commitment.
 
 ### 3.1 Where measurement happens — AWS, not this box
 
@@ -182,6 +201,39 @@ A busy agent yields rarely; an idle one yields at its loop rate. Ranking agents
 by this is enough to discharge clause (b), which asks only which agent is
 *top*-occupancy, not for an absolute duty-cycle percentage.
 
+Two things the sampler must get right, both of which are load-bearing for
+clause (b):
+
+- **Samples are keyed by `(pid, tid)`, never by thread name.** Agent names are
+  static, so any process running more than one node has several threads called
+  `uc2-consensus`. A name-keyed before/after join differences unrelated threads;
+  the mis-paired rows saturate to zero and then sort to the *front* of an
+  ascending-by-yields ranking, impersonating the busiest agent. Rows are reported
+  as `name#tid`.
+- **The service's PID must be sampled too.** On a fleet the service is a separate
+  process, so a node-only sample contains no `uc2-apply` at all — and clause (b)
+  would then rank a set in which the apply frontier, the exact hypothesis it
+  exists to rule out, cannot appear. The client takes `--node-pid` *and*
+  `--service-pid` and samples the union.
+
+> **OPEN — the proxy does not work as specified (found 2026-07-25, during the
+> harness fix wave).** `sched_yield` does **not** increment
+> `voluntary_ctxt_switches` on this kernel. Measured directly (Linux 7.0.0, 4
+> cores): 1,483,000 `sched_yield()` calls over 2 s produced **1** voluntary and
+> 34 nonvoluntary context switches — `sched_yield` leaves the task
+> `TASK_RUNNING`, so the kernel accounts any resulting switch as *non*voluntary,
+> and with no other runnable task on the CPU it often causes no switch at all.
+> A local `ladder` run confirms the consequence: every agent reports ~0 yields/s
+> and the ranking degenerates into the sampler's `(pid, tid)` tie-break.
+>
+> **Clause (b) is therefore unmeasurable until this is resolved**, and the fleet
+> ladder must not be run for the record before it is. Note that this result
+> *strengthens* the reason given above for rejecting CPU time (the agents really
+> do spin without yielding to the scheduler), so the replacement is a design
+> decision — not a mechanical substitution — and plausibly the §4.3 escalation
+> below (a `profiling`-gated counter set in `uc2_node`) is now the primary path
+> rather than the reserve one.
+
 **Escalation, if the proxy is ambiguous** (e.g. two agents rank within noise):
 fall back to a `profiling`-feature-gated counter set in `uc2_node` — probe
 sends, acks processed, `ReadPhase` transitions — dumped by the node role at
@@ -215,12 +267,56 @@ To be stated in the report, not discovered afterwards:
    is drain-capped", which is a different (and cheaper) fix than either rung.
 3. **The load generator may be the bottleneck.** Report client-side in-flight
    depth and confirm the target concurrency is actually sustained; a plateau
-   caused by the harness proves nothing about the node.
+   caused by the harness proves nothing about the node. Implemented as a 10 ms
+   sampler over `sent - resolved` across the send window (the first 100 ms
+   discarded as pipeline fill), reporting **mean and minimum** depth against the
+   target per rung — a mean at target hides a stall, and "sustained" is the word
+   the threat uses. This matters concretely: the client's send path is a single
+   thread and its matcher is a single thread taking a histogram lock per
+   response, so at high `--readers` the *client* is a plausible ceiling — and if
+   both arms hit it the ratio goes to 100% and the barrier reads as free (a false
+   negative). `evaluate_decision_rule`'s equal-plateau note names the load
+   generator alongside `QUERY_DRAIN_PER_CYCLE` for this reason.
 4. **Shared-core smoke is not evidence at all here** (§3.1) — the box carries a
    concurrent model-checking session. Local runs verify wiring; the fleet run
    measures. No local number reaches the report.
 5. **Yield-rate proxy is ordinal, not absolute.** It ranks agents; it does not
    measure duty-cycle occupancy. Clause (b) is written to need only the ranking.
+6. **The two arms are not symmetric under back-pressure: a snapshot read can be
+   DROPPED where a linearizable read is RETRIED.** This is production behaviour,
+   not a harness defect, and it biases the A/B in the direction that makes the
+   barrier look free.
+
+   `drain_query_ring` forwards a snapshot read immediately and **discards
+   `forward_svc_query`'s return value** (`node.rs:1956-1959`): if the `svc_query`
+   ring is full at that instant, the query is gone — no retry, no answer, no
+   `MSG_V2_RETRY`. The linearizable path does the opposite. A pending read whose
+   forward fails **restores the query bytes and retries on the next duty cycle**
+   (`node.rs:2101-2111`), so a full ring costs it latency, never the query.
+
+   Consequences for the measurement:
+
+   - The snapshot arm can lose queries permanently under saturation. Because the
+     client's send governor paces on `sent - resolved`, a lost query never
+     reopens its slot: the governor's window closes by exactly the number lost,
+     the snapshot arm's offered load decays, and its measured rate falls. The
+     lin/snap ratio then rises — potentially **past 100%**, i.e. "the barrier is
+     free" or better — as an artifact of the snapshot arm being throttled by its
+     own losses.
+   - **A snapshot rung with `inflight_at_end != 0` is INVALID, not merely
+     suspicious.** For the linearizable arm an unresolved tail can be a slow
+     drain; for the snapshot arm it is the signature of exactly this drop, and
+     the rung must be discarded rather than recorded with a caveat.
+   - **Local wiring runs cannot surface this.** Filling `svc_query` requires the
+     service to fall roughly 30k reads behind the node's drain — reachable at
+     fleet read rates, not at the rates a shared dev box produces. Absence of the
+     symptom locally is not evidence of its absence on the fleet.
+
+   The harness does not paper over it: the client emits `inflight_at_end` per
+   rung and `evaluate_decision_rule` prints an explicit note whenever the ratio
+   exceeds 100%. Fixing the asymmetry would mean changing `src/`, which this work
+   does not do — it is recorded here so the fleet report reads a ratio > 100% as
+   a measurement artifact rather than as a result.
 
 ## 7. Output
 

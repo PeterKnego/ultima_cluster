@@ -12,9 +12,10 @@
 //! ```text
 //! cargo run -p uc2_node --release --example read_profile -- node    --id N --bind A --members ID@ADDR,... --instance-dir D [--admission-kib K]
 //! cargo run -p uc2_node --release --example read_profile -- service --instance-dir D
-//! cargo run -p uc2_node --release --example read_profile -- client  --instance-dir D --secs S --readers K [--mode lin|snap] [--write-rate W] [--node-pid P]
+//! cargo run -p uc2_node --release --example read_profile -- client  --instance-dir D --secs S --readers K [--mode lin|snap] [--write-rate W] [--node-pid P] [--service-pid Q]
 //! cargo run -p uc2_node --release --example read_profile -- all     --secs S --readers K [--mode lin|snap] [--write-rate W]   # local smoke, NOT a fleet number
 //! cargo run -p uc2_node --release --example read_profile -- ladder --secs S --readers 1,4,16,64,256,1024 [--write-rate W]     # local smoke sweep, NOT a fleet number
+//! cargo run -p uc2_node --release --example read_profile -- decide --rungs FILE                                              # evaluate the rule over collected rung JSON lines
 //! ```
 //!
 //! **`node`/`service`** are thin fleet-role wrappers (one process per host,
@@ -70,6 +71,41 @@
 //! ranking (fewest yields/sec = busiest) — it is not a duty-cycle percentage
 //! and is not meant to be read as one.
 //!
+//! **Rows are keyed by `(pid, tid)`, never by thread name.** Agent names are
+//! static (`AgentRunner::spawn`), so a process running three nodes — which is
+//! exactly what `all`/`ladder` do — has three threads called `uc2-consensus`,
+//! three called `uc2-apply`, and so on. Joining the before/after samples by name
+//! would difference unrelated threads, and a mis-paired row saturates to zero,
+//! which then sorts to the FRONT of the ascending ranking and impersonates the
+//! busiest agent. Rows are therefore labelled `name#tid` for humans and joined
+//! on `(pid, tid)` for the ranking.
+//!
+//! **On a fleet the service is a separate process**, so `--node-pid` alone
+//! cannot see `uc2-apply` — the very agent clause (b) exists to rule out. Pass
+//! `--service-pid` too; the sampler takes the union of both task dirs.
+//!
+//! ### *** UNRESOLVED: the yield-rate proxy does not appear to work ***
+//!
+//! The premise above — that `sched_yield` increments `voluntary_ctxt_switches` —
+//! **does not hold on this kernel**, and the proxy therefore currently carries no
+//! signal at all. Measured directly (Linux 7.0.0, 4 cores): a thread that called
+//! `sched_yield()` **1,483,000** times over 2 s recorded **1** voluntary and 34
+//! nonvoluntary context switches. `sched_yield` leaves the task `TASK_RUNNING`,
+//! so any switch it does cause is accounted NONvoluntary — and with no other
+//! runnable task on the CPU it often causes no switch at all.
+//!
+//! The `ladder` output agrees: every agent thread reports ~0 yields/s and the
+//! ranking degenerates into the `(pid, tid)` tie-break, so **clause (b) of the
+//! decision rule is presently unmeasurable** — a rank produced this way is
+//! arbitrary, not "the busiest agent". This is a defect in the SPEC's §4.3
+//! metric, not in the joining/keying logic here (which is now correct and
+//! tested), and picking the replacement signal is a design decision, not a
+//! mechanical fix: `nonvoluntary_ctxt_switches` measures preemption rather than
+//! duty cycle, and the spec's own reason for rejecting CPU time (agents spin, so
+//! CPU% saturates) is *strengthened* by this result rather than weakened.
+//! **Do not run the fleet ladder for the record until clause (b) has a working
+//! metric** — clause (a) would still be measured, but the rule needs both.
+//!
 //! ## Env caps (sandbox safety, m1–m5 pattern)
 //!
 //! `UC2_RP_MAX_SECS`, `UC2_RP_MAX_READERS` clip `--secs`/`--readers` from
@@ -82,9 +118,26 @@
 //! build Rung A iff (a) the linearizable plateau is ≤70% of the snapshot
 //! plateau (65–75% is a borderline band that does NOT license a decision on
 //! local smoke) AND (b) `uc2-consensus` or `uc2-receiver` is the top-occupancy
-//! agent at that plateau. The 70% figure and the agent list were fixed before
-//! any run and are not adjusted once numbers exist — changing this function to
-//! fit a result would defeat the entire point of pre-committing it.
+//! agent at that plateau — **and ties do not count**: spec §2's second tie-break
+//! rule says clause (b) is unmet when the top two agents sit inside the yield
+//! proxy's run-to-run spread (implemented as: the runner-up must yield at least
+//! 20% more than the top). The 70% figure, the band, and the agent list were
+//! fixed before any run and are not adjusted once numbers exist — changing this
+//! function to fit a result would defeat the entire point of pre-committing it.
+//!
+//! Two guards sit AROUND (not inside) those thresholds, because a broken run
+//! must not read as a favourable one:
+//!
+//! - **Degraded arms are inconclusive.** A linearizable rung that collapses into
+//!   `MSG_V2_RETRY` (read-barrier timeout, momentary `!can_serve`) resolves few
+//!   genuine reads over the full elapsed window, which is a LOW ratio — i.e. it
+//!   presents exactly like the result that justifies building Rung A. An arm
+//!   whose `(retried + not_leader)` share of resolved ops exceeds
+//!   [`DEGRADED_FRACTION`] yields INCONCLUSIVE instead of any verdict.
+//! - **The rule is reachable from the fleet path.** The `client` role emits one
+//!   JSON rung record per run (`rung_to_json`) and `decide --rungs FILE` feeds
+//!   those lines to the SAME `evaluate_decision_rule`, so the externally
+//!   orchestrated fleet ladder never re-implements the rule in Python.
 //!
 //! ## *** LOCAL RUNS ARE WIRING VERIFICATION, NOT MEASUREMENT ***
 //!
@@ -121,8 +174,8 @@ use uc2_service::{ServiceBuilder, ServiceConfig, StateMachine};
 use uc_protocol::ring::{BroadcastConsumer, BroadcastRing, MpscRing, RingError};
 use uc_protocol::v2::cnc::NODE_FLAG_CAN_SERVE;
 use uc_protocol::v2::ipc::{
-    FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_QUERY, MSG_V2_RESPONSE, MSG_V2_RETRY,
-    MSG_V2_SUBMIT, client_from_extra, extra_client,
+    FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_QUERY, MSG_V2_RESPONSE,
+    MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client,
 };
 
 /// Well-known file names under the instance dir — the shared contract with
@@ -157,6 +210,29 @@ const HIST_MAX_NS: u64 = 60_000_000_000;
 const DRAIN_GRACE: Duration = Duration::from_secs(5);
 const LEADER_WAIT: Duration = Duration::from_secs(30);
 
+/// Sampling period for client-side in-flight depth (spec §6, threat 3: "report
+/// client-side in-flight depth and confirm the target concurrency is actually
+/// sustained; a plateau caused by the harness proves nothing about the node").
+const DEPTH_SAMPLE_PERIOD: Duration = Duration::from_millis(10);
+/// In-flight depth samples taken inside this warm-up window are discarded: the
+/// send loop starts at zero in flight and needs a moment to fill the pipeline,
+/// so including the ramp would report a minimum of ~0 for every rung.
+const DEPTH_WARMUP: Duration = Duration::from_millis(100);
+
+/// An arm is DEGRADED — and therefore cannot certify a plateau — when this
+/// fraction of its resolved ops came back as `MSG_V2_RETRY`/`MSG_V2_NOT_LEADER`
+/// rather than as genuine answers. A degraded linearizable arm resolves few
+/// reads over the full elapsed window, which looks exactly like the low ratio
+/// that justifies Rung A; refusing to rule on it is what keeps the failure mode
+/// and the build signal distinguishable.
+const DEGRADED_FRACTION: f64 = 0.05;
+
+/// Clause (b) is a RANKING and spec §2 says ties do not count. The runner-up
+/// must yield at least this much more than the top agent before the top is
+/// treated as a distinct bottleneck rather than a coin flip inside the yield
+/// proxy's run-to-run spread.
+const TIE_MARGIN: f64 = 0.20;
+
 #[derive(Parser)]
 #[command(
     name = "read_profile",
@@ -179,6 +255,9 @@ enum Role {
     All(AllArgs),
     /// Local smoke: sweep the concurrency ladder across both arms and both mixes.
     Ladder(LadderArgs),
+    /// Evaluate the pre-committed decision rule over rung JSON lines collected
+    /// from `client` runs (the fleet path — see `run_decide`).
+    Decide(DecideArgs),
 }
 
 #[derive(clap::Args)]
@@ -233,9 +312,24 @@ struct ClientArgs {
     #[arg(long, default_value_t = 0)]
     write_rate: u64,
     /// PID of the node process, for /proc agent-occupancy sampling. Omit to
-    /// skip occupancy (the client cannot see another process's threads).
+    /// skip its threads (the client cannot see another process's threads).
     #[arg(long)]
     node_pid: Option<u32>,
+    /// PID of the SERVICE process. On a fleet the service is a separate
+    /// process, so without this `uc2-apply` — the apply-frontier hypothesis
+    /// clause (b) exists to rule out — cannot appear in the ranking at all.
+    #[arg(long)]
+    service_pid: Option<u32>,
+}
+
+#[derive(clap::Args)]
+struct DecideArgs {
+    /// File of rung JSON lines (one per `client` run; other lines ignored).
+    #[arg(long)]
+    rungs: PathBuf,
+    /// Which write mix to evaluate; must match the rungs' `write_rate`.
+    #[arg(long, default_value_t = 0)]
+    write_rate: u64,
 }
 
 #[derive(clap::Args)]
@@ -275,6 +369,7 @@ fn main() -> anyhow::Result<()> {
         Role::Client(a) => run_client_role(a),
         Role::All(a) => run_all(a),
         Role::Ladder(a) => run_ladder(a),
+        Role::Decide(a) => run_decide(a),
     }
 }
 
@@ -288,17 +383,49 @@ fn main() -> anyhow::Result<()> {
 /// This is an ordinal signal (it ranks agents); it is not a duty-cycle percentage.
 #[derive(Debug, Clone, PartialEq)]
 struct Occupancy {
+    /// The bare thread name (`uc2-consensus`, …) — what the decision rule's
+    /// clause (b) matches against.
     pub name: String,
+    pub pid: u32,
+    pub tid: u32,
     pub yields_per_sec: f64,
 }
 
-/// Read `(thread_name, voluntary_ctxt_switches)` for every thread under a
+impl Occupancy {
+    /// Human-facing row label. `name` alone is ambiguous whenever more than one
+    /// instance of an agent exists in the sampled set (three nodes in one
+    /// process, in `all`/`ladder`), so rows are shown as `name#tid`.
+    fn label(&self) -> String {
+        format!("{}#{}", self.name, self.tid)
+    }
+}
+
+/// One thread's `voluntary_ctxt_switches` reading, keyed by `(pid, tid)`.
+///
+/// **The key is the point.** Thread names are static and repeat across agent
+/// instances, so a before/after join on NAME differences unrelated threads; the
+/// mis-paired rows saturate to zero and then sort to the front of the
+/// ascending-by-yields ranking, impersonating the busiest agent.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ThreadSample {
+    pub pid: u32,
+    pub tid: u32,
+    pub name: String,
+    pub yields: u64,
+}
+
+/// Read `(pid, tid, name, voluntary_ctxt_switches)` for every thread under a
 /// `/proc/<pid>/task` directory. Threads that vanish mid-scan (exited between
-/// readdir and read) are skipped rather than failing the sample.
-fn sample_yields(task_dir: &Path) -> std::io::Result<Vec<(String, u64)>> {
+/// readdir and read) are skipped rather than failing the sample; so are
+/// directory entries whose name is not a tid.
+fn sample_yields(pid: u32, task_dir: &Path) -> std::io::Result<Vec<ThreadSample>> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(task_dir)? {
         let path = entry?.path();
+        let Some(tid) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse().ok())
+        else {
+            continue;
+        };
         let Ok(comm) = std::fs::read_to_string(path.join("comm")) else { continue };
         let Ok(status) = std::fs::read_to_string(path.join("status")) else { continue };
         let yields = status
@@ -306,32 +433,56 @@ fn sample_yields(task_dir: &Path) -> std::io::Result<Vec<(String, u64)>> {
             .find_map(|l| l.strip_prefix("voluntary_ctxt_switches:"))
             .and_then(|v| v.trim().parse::<u64>().ok());
         let Some(yields) = yields else { continue };
-        out.push((comm.trim().to_string(), yields));
+        out.push(ThreadSample { pid, tid, name: comm.trim().to_string(), yields });
     }
     Ok(out)
 }
 
-/// Join two samples by thread name and rank by yield rate ASCENDING — fewest
+/// Sample the UNION of several processes' task dirs. On a fleet the node and
+/// the service are separate processes; sampling only the node's makes
+/// `uc2-apply` structurally invisible to clause (b), which is precisely the
+/// hypothesis clause (b) exists to rule out. Returns `None` only when NO dir
+/// could be sampled.
+fn sample_all(dirs: &[(u32, PathBuf)]) -> Option<Vec<ThreadSample>> {
+    let mut out = Vec::new();
+    let mut any = false;
+    for (pid, dir) in dirs {
+        if let Ok(mut s) = sample_yields(*pid, dir) {
+            any = true;
+            out.append(&mut s);
+        }
+    }
+    any.then_some(out)
+}
+
+/// Join two samples by `(pid, tid)` and rank by yield rate ASCENDING — fewest
 /// yields first, i.e. busiest agent first. Threads missing from either sample
 /// are dropped (they did not exist for the whole window, so their rate is not
 /// comparable).
-fn occupancy_delta(
-    before: &[(String, u64)],
-    after: &[(String, u64)],
-    secs: f64,
-) -> Vec<Occupancy> {
+fn occupancy_delta(before: &[ThreadSample], after: &[ThreadSample], secs: f64) -> Vec<Occupancy> {
     let mut out: Vec<Occupancy> = after
         .iter()
-        .filter_map(|(name, late)| {
-            let (_, early) = before.iter().find(|(n, _)| n == name)?;
+        .filter_map(|late| {
+            let early = before.iter().find(|e| e.pid == late.pid && e.tid == late.tid)?;
             Some(Occupancy {
-                name: name.clone(),
-                yields_per_sec: late.saturating_sub(*early) as f64 / secs,
+                name: late.name.clone(),
+                pid: late.pid,
+                tid: late.tid,
+                yields_per_sec: late.yields.saturating_sub(early.yields) as f64 / secs,
             })
         })
         .collect();
-    out.sort_by(|a, b| a.yields_per_sec.total_cmp(&b.yields_per_sec));
+    out.sort_by(|a, b| {
+        a.yields_per_sec.total_cmp(&b.yields_per_sec).then_with(|| a.tid.cmp(&b.tid))
+    });
     out
+}
+
+/// The agent rows of an occupancy ranking, busiest first: only threads whose
+/// name starts with `uc2-` (the harness's own threads and the runtime's share
+/// the sampled process in `all`/`ladder`).
+fn agent_rows(occ: &[Occupancy]) -> Vec<&Occupancy> {
+    occ.iter().filter(|o| o.name.starts_with("uc2-")).collect()
 }
 
 /// The harness state machine: a counter. `apply` is the cheapest possible
@@ -541,8 +692,24 @@ struct ReadStats {
     retried: u64,
     not_leader: u64,
     duplicates: u64,
+    /// `MSG_V2_RESPONSE` records addressed to this client with
+    /// `FLAG_V2_IS_QUERY` CLEAR — a submit response, not a query answer. The
+    /// read client sends only queries, so this must be 0; it is counted (and
+    /// deliberately NOT resolved, so it surfaces as an unresolved read) rather
+    /// than being silently counted as a read.
+    wrong_kind: u64,
     overwritten: u64,
     inflight_at_end: u64,
+    /// Client-side in-flight depth sampled ACROSS the send window (spec §6,
+    /// threat 3), not at the end: if the load generator cannot sustain the
+    /// target concurrency, a plateau says nothing about the node.
+    inflight_mean: f64,
+    inflight_min: u64,
+    inflight_samples: u64,
+    /// Background-write load actually delivered, not merely requested.
+    writes_attempted: u64,
+    writes_accepted: u64,
+    writes_dropped: u64,
     elapsed: Duration,
     reads_per_sec: f64,
     p50_ms: f64,
@@ -562,6 +729,7 @@ struct MatcherCtx {
     not_leader: Arc<AtomicU64>,
     retried: Arc<AtomicU64>,
     duplicates: Arc<AtomicU64>,
+    wrong_kind: Arc<AtomicU64>,
     overwritten: Arc<AtomicU64>,
     last_response_ns: Arc<AtomicU64>,
     max_read_value: Arc<AtomicU64>,
@@ -607,8 +775,14 @@ fn poll_egress(ring: &mut BroadcastConsumer, ctx: &MatcherCtx, buf: &mut Vec<u8>
             let claimed = ctx.owner[idx]
                 .compare_exchange(expected, 0, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok();
+            // A genuine query answer carries FLAG_V2_IS_QUERY
+            // (`uc2_service/src/egress.rs:66`). This client sends nothing but
+            // queries, so the check cannot fire today — having it makes "the
+            // responses counted were query answers" structural rather than
+            // incidental, matching `uc2_client`'s own matcher kind check.
+            let is_query = rec.flags & FLAG_V2_IS_QUERY != 0;
             match rec.msg_type {
-                MSG_V2_RESPONSE if claimed => {
+                MSG_V2_RESPONSE if claimed && is_query => {
                     let now = ctx.t0.elapsed().as_nanos() as u64;
                     let send = ctx.send_ns[idx].load(Ordering::Acquire);
                     let lat = now.saturating_sub(send).min(HIST_MAX_NS);
@@ -622,6 +796,12 @@ fn poll_egress(ring: &mut BroadcastConsumer, ctx: &MatcherCtx, buf: &mut Vec<u8>
                     ctx.reads.fetch_add(1, Ordering::Relaxed);
                     ctx.resolved.fetch_add(1, Ordering::Relaxed);
                     ctx.last_response_ns.fetch_max(now, Ordering::Relaxed);
+                }
+                // Claimed, but not a query answer: do NOT resolve it — the read
+                // then shows up as unresolved and the run fails loudly instead
+                // of counting a submit response as a read.
+                MSG_V2_RESPONSE if claimed => {
+                    ctx.wrong_kind.fetch_add(1, Ordering::Relaxed);
                 }
                 MSG_V2_RESPONSE => {
                     ctx.duplicates.fetch_add(1, Ordering::Relaxed);
@@ -663,7 +843,7 @@ fn run_read_measurement(
     readers: u64,
     mode: Mode,
     write_rate: u64,
-    node_task_dir: Option<PathBuf>,
+    task_dirs: &[(u32, PathBuf)],
 ) -> (ReadStats, Vec<Occupancy>) {
     let cnc = CncPage::open_file(&instance_dir.join(CNC_FILE), app_id)
         .unwrap_or_else(|e| panic!("cnc attach {instance_dir:?}: {e}"));
@@ -704,6 +884,7 @@ fn run_read_measurement(
         not_leader: Arc::new(AtomicU64::new(0)),
         retried: Arc::new(AtomicU64::new(0)),
         duplicates: Arc::new(AtomicU64::new(0)),
+        wrong_kind: Arc::new(AtomicU64::new(0)),
         overwritten: Arc::new(AtomicU64::new(0)),
         last_response_ns: Arc::new(AtomicU64::new(0)),
         max_read_value: Arc::new(AtomicU64::new(0)),
@@ -721,6 +902,7 @@ fn run_read_measurement(
     let not_leader = Arc::clone(&ctx.not_leader);
     let retried = Arc::clone(&ctx.retried);
     let duplicates = Arc::clone(&ctx.duplicates);
+    let wrong_kind = Arc::clone(&ctx.wrong_kind);
     let overwritten = Arc::clone(&ctx.overwritten);
     let last_response_ns = Arc::clone(&ctx.last_response_ns);
     let max_read_value = Arc::clone(&ctx.max_read_value);
@@ -749,17 +931,58 @@ fn run_read_measurement(
             .expect("spawn matcher thread")
     };
 
-    let writer = spawn_writer(instance_dir, app_id, write_rate, Arc::clone(&stop));
+    // The writer stops with the SEND window, not with the matcher: background
+    // writes running on through the drain would keep loading the node while the
+    // read tail is being collected.
+    let writer_stop = Arc::new(AtomicBool::new(false));
+    let writer = spawn_writer(instance_dir, app_id, write_rate, Arc::clone(&writer_stop));
 
     // Sample agent occupancy across the measurement window only (after warm-up
     // attach, before drain) so boot-time yields do not pollute the rate.
-    let occ_before = node_task_dir.as_ref().and_then(|d| sample_yields(d).ok());
+    let occ_before = sample_all(task_dirs);
     let occ_t0 = Instant::now();
+
+    let deadline = t0 + Duration::from_secs(secs);
+
+    // Client-side in-flight depth sampler (spec §6, threat 3). A coarse timer
+    // on its own thread: the send loop must not pay for this, and the matcher
+    // already holds the histogram lock per response.
+    //
+    // Bounded by the send DEADLINE, not by the stop flag: a sample that lands
+    // in the gap between the send loop ending and the flag being observed reads
+    // the drain, and since the drain empties the pipeline it would drive the
+    // reported MINIMUM to zero on every rung — destroying the one number that
+    // says whether the target concurrency was sustained.
+    let depth = Arc::new(DepthStats::default());
+    let depth_sampler = {
+        let depth = Arc::clone(&depth);
+        let sent = Arc::clone(&sent);
+        let resolved = Arc::clone(&resolved);
+        let stop = Arc::clone(&writer_stop);
+        let start = Instant::now();
+        thread::Builder::new()
+            .name("rp-depth".into())
+            .spawn(move || {
+                loop {
+                    thread::sleep(DEPTH_SAMPLE_PERIOD);
+                    if stop.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                        break;
+                    }
+                    if start.elapsed() < DEPTH_WARMUP {
+                        continue; // pipeline still filling; the ramp is not a plateau
+                    }
+                    let d = sent
+                        .load(Ordering::Relaxed)
+                        .wrapping_sub(resolved.load(Ordering::Relaxed));
+                    depth.record(d);
+                }
+            })
+            .expect("spawn depth sampler thread")
+    };
 
     // Send loop: keep `readers` reads in flight. `RingError::Full` means
     // yield+retry, exactly like the real uc2_client.
     let mut local_seq: u32 = 0;
-    let deadline = t0 + Duration::from_secs(secs);
     'send: while Instant::now() < deadline {
         // Pause while the attached node is not a serving leader: without this a
         // leadership flip degenerates into a NOT_LEADER feedback flood that
@@ -792,7 +1015,19 @@ fn run_read_measurement(
     }
     let send_window_end_ns = t0.elapsed().as_nanos() as u64;
     let occ_secs = occ_t0.elapsed().as_secs_f64();
-    let occ_after = node_task_dir.as_ref().and_then(|d| sample_yields(d).ok());
+    let occ_after = sample_all(task_dirs);
+    // End of the send window: stop the write load and the depth sampler here,
+    // BEFORE the drain, so neither describes (or perturbs) the tail.
+    writer_stop.store(true, Ordering::Relaxed);
+    depth_sampler.join().expect("depth sampler thread panicked");
+    let writes = match writer {
+        Some(w) => {
+            let counters = Arc::clone(&w.counters);
+            w.handle.join().expect("writer thread panicked");
+            counters.snapshot()
+        }
+        None => (0, 0, 0),
+    };
 
     let drain_deadline = Instant::now() + DRAIN_GRACE;
     while resolved.load(Ordering::Relaxed) < sent.load(Ordering::Relaxed)
@@ -802,9 +1037,6 @@ fn run_read_measurement(
     }
     stop.store(true, Ordering::Relaxed);
     matcher.join().expect("matcher thread panicked");
-    if let Some(w) = writer {
-        w.join().expect("writer thread panicked");
-    }
 
     let sends = sent.load(Ordering::Relaxed);
     let resolved_n = resolved.load(Ordering::Relaxed);
@@ -833,8 +1065,15 @@ fn run_read_measurement(
             retried: retried.load(Ordering::Relaxed),
             not_leader: not_leader.load(Ordering::Relaxed),
             duplicates: duplicates.load(Ordering::Relaxed),
+            wrong_kind: wrong_kind.load(Ordering::Relaxed),
             overwritten: overwritten.load(Ordering::Relaxed),
             inflight_at_end: sends.saturating_sub(resolved_n),
+            inflight_mean: depth.mean(),
+            inflight_min: depth.min(),
+            inflight_samples: depth.samples(),
+            writes_attempted: writes.0,
+            writes_accepted: writes.1,
+            writes_dropped: writes.2,
             elapsed,
             reads_per_sec,
             p50_ms,
@@ -860,6 +1099,91 @@ fn await_serving(cnc: &CncPage, timeout: Duration) {
     }
 }
 
+/// Client-side in-flight depth, sampled across the send window (spec §6,
+/// threat 3). Mean AND minimum: a mean near the target hides a stall, and the
+/// question the threat asks is whether the target concurrency was *sustained*.
+#[derive(Debug)]
+struct DepthStats {
+    sum: AtomicU64,
+    samples: AtomicU64,
+    min: AtomicU64,
+}
+
+impl Default for DepthStats {
+    fn default() -> Self {
+        Self { sum: AtomicU64::new(0), samples: AtomicU64::new(0), min: AtomicU64::new(u64::MAX) }
+    }
+}
+
+impl DepthStats {
+    fn record(&self, depth: u64) {
+        self.sum.fetch_add(depth, Ordering::Relaxed);
+        self.samples.fetch_add(1, Ordering::Relaxed);
+        self.min.fetch_min(depth, Ordering::Relaxed);
+    }
+    fn samples(&self) -> u64 {
+        self.samples.load(Ordering::Relaxed)
+    }
+    fn mean(&self) -> f64 {
+        let n = self.samples();
+        if n == 0 { 0.0 } else { self.sum.load(Ordering::Relaxed) as f64 / n as f64 }
+    }
+    fn min(&self) -> u64 {
+        match self.min.load(Ordering::Relaxed) {
+            u64::MAX => 0,
+            v => v,
+        }
+    }
+}
+
+/// Attempted / accepted / dropped-full counts for the background writer.
+///
+/// **Why this exists:** the writer discards on `RingError::Full` and its pacing
+/// clock advances regardless, so without counters a mixed arm whose writes were
+/// all dropped IS the read-only arm — while the report prints the REQUESTED
+/// rate in the same shape as a measured quantity, and the A/B delta gets
+/// attributed to the frontier wait that never happened.
+#[derive(Debug, Default)]
+struct WriterCounters {
+    attempted: AtomicU64,
+    accepted: AtomicU64,
+    dropped: AtomicU64,
+}
+
+impl WriterCounters {
+    /// Fold one `try_write` result into the counters. `Full` is a DROP (the
+    /// write never reached the node); any other error is returned to the caller
+    /// to fail the run.
+    fn record(&self, res: Result<(), RingError>) -> Result<(), RingError> {
+        self.attempted.fetch_add(1, Ordering::Relaxed);
+        match res {
+            Ok(()) => {
+                self.accepted.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(RingError::Full) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `(attempted, accepted, dropped)`.
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.attempted.load(Ordering::Relaxed),
+            self.accepted.load(Ordering::Relaxed),
+            self.dropped.load(Ordering::Relaxed),
+        )
+    }
+}
+
+struct WriterHandle {
+    handle: thread::JoinHandle<()>,
+    counters: Arc<WriterCounters>,
+}
+
 /// Background write load for the mixed arm: a paced submitter on its OWN
 /// `client_id`, so its responses are filtered out of the read matcher at the
 /// `cid != ctx.client_id` check and cannot inflate the read rate.
@@ -868,53 +1192,56 @@ fn await_serving(cnc: &CncPage, timeout: Duration) {
 /// makes that arm the clean isolation: with no writes in flight,
 /// `service_applied >= commit_at` already holds when a read is admitted, so the
 /// frontier wait is free and the A/B delta is the barrier alone.
+///
+/// The delivered rate is COUNTED, not assumed — see [`WriterCounters`].
 fn spawn_writer(
     instance_dir: &Path,
     app_id: &str,
     write_rate: u64,
     stop: Arc<AtomicBool>,
-) -> Option<thread::JoinHandle<()>> {
+) -> Option<WriterHandle> {
     if write_rate == 0 {
         return None;
     }
     let dir = instance_dir.to_path_buf();
     let app_id = app_id.to_string();
-    Some(
-        thread::Builder::new()
-            .name("rp-writer".into())
-            .spawn(move || {
-                let cnc = CncPage::open_file(&dir.join(CNC_FILE), &app_id)
-                    .unwrap_or_else(|e| panic!("writer cnc attach: {e}"));
-                let client_id = cnc.status().next_client_id.fetch_add(1) as u32;
-                let (ingress, _c) = MpscRing::open(&dir.join(INGRESS_RING))
-                    .unwrap_or_else(|e| panic!("writer open ingress.ring: {e}"))
-                    .into_split();
-                let payload =
-                    bincode::serde::encode_to_vec(vec![0xABu8; 64], bincode::config::standard())
-                        .expect("encode write payload");
-                let period = Duration::from_nanos(1_000_000_000 / write_rate.max(1));
-                let mut local_seq: u32 = 0;
-                let mut next = Instant::now();
-                while !stop.load(Ordering::Relaxed) {
-                    let now = Instant::now();
-                    if now < next {
-                        thread::sleep((next - now).min(Duration::from_millis(1)));
-                        continue;
-                    }
-                    next += period;
-                    if cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE == 0 {
-                        continue;
-                    }
-                    let extra = extra_client(client_id, local_seq);
-                    match ingress.try_write(MSG_V2_SUBMIT, 0, extra, &payload) {
-                        Ok(()) | Err(RingError::Full) => {}
-                        Err(e) => panic!("writer ingress.ring error: {e}"),
-                    }
-                    local_seq = local_seq.wrapping_add(1);
+    let counters = Arc::new(WriterCounters::default());
+    let thread_counters = Arc::clone(&counters);
+    let handle = thread::Builder::new()
+        .name("rp-writer".into())
+        .spawn(move || {
+            let cnc = CncPage::open_file(&dir.join(CNC_FILE), &app_id)
+                .unwrap_or_else(|e| panic!("writer cnc attach: {e}"));
+            let client_id = cnc.status().next_client_id.fetch_add(1) as u32;
+            let (ingress, _c) = MpscRing::open(&dir.join(INGRESS_RING))
+                .unwrap_or_else(|e| panic!("writer open ingress.ring: {e}"))
+                .into_split();
+            let payload =
+                bincode::serde::encode_to_vec(vec![0xABu8; 64], bincode::config::standard())
+                    .expect("encode write payload");
+            let period = Duration::from_nanos(1_000_000_000 / write_rate.max(1));
+            let mut local_seq: u32 = 0;
+            let mut next = Instant::now();
+            while !stop.load(Ordering::Relaxed) {
+                let now = Instant::now();
+                if now < next {
+                    thread::sleep((next - now).min(Duration::from_millis(1)));
+                    continue;
                 }
-            })
-            .expect("spawn writer thread"),
-    )
+                next += period;
+                if cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE == 0 {
+                    continue;
+                }
+                let extra = extra_client(client_id, local_seq);
+                let res = ingress.try_write(MSG_V2_SUBMIT, 0, extra, &payload);
+                if let Err(e) = thread_counters.record(res) {
+                    panic!("writer ingress.ring error: {e}");
+                }
+                local_seq = local_seq.wrapping_add(1);
+            }
+        })
+        .expect("spawn writer thread");
+    Some(WriterHandle { handle, counters })
 }
 
 fn print_read_report(mode: Mode, readers: u64, write_rate: u64, s: &ReadStats, occ: &[Occupancy]) {
@@ -925,13 +1252,26 @@ fn print_read_report(mode: Mode, readers: u64, write_rate: u64, s: &ReadStats, o
     println!();
     println!("========== uc2 read profile: {arm} ==========");
     println!("readers (in-flight)   : {readers}");
-    println!("background writes/s   : {write_rate}");
+    println!(
+        "background writes/s   : target {write_rate}, accepted {}, dropped {} (of {} attempts)",
+        s.writes_accepted, s.writes_dropped, s.writes_attempted
+    );
     println!("reads resolved        : {}", s.reads);
     println!("retries               : {}", s.retried);
     println!("not_leader redirects  : {}", s.not_leader);
+    println!(
+        "degraded fraction     : {:.1}%  [>{:.0}% = arm degraded, no verdict]",
+        degraded_fraction(s.reads, s.retried, s.not_leader) * 100.0,
+        DEGRADED_FRACTION * 100.0
+    );
     println!("dup answers dropped   : {}", s.duplicates);
+    println!("wrong-kind answers    : {}", s.wrong_kind);
     println!("broadcast overwritten : {}", s.overwritten);
     println!("in-flight at end      : {}", s.inflight_at_end);
+    println!(
+        "in-flight depth       : mean {:.1}, min {} (target {readers}, {} samples)",
+        s.inflight_mean, s.inflight_min, s.inflight_samples
+    );
     println!("read regression       : {}", s.regression);
     println!("max read value        : {}", s.max_read_value);
     println!("elapsed (drain-incl.) : {:.3} s", s.elapsed.as_secs_f64());
@@ -939,11 +1279,11 @@ fn print_read_report(mode: Mode, readers: u64, write_rate: u64, s: &ReadStats, o
     println!("p50                   : {:.3} ms", s.p50_ms);
     println!("p99                   : {:.3} ms", s.p99_ms);
     if occ.is_empty() {
-        println!("agent occupancy       : (not sampled — pass --node-pid)");
+        println!("agent occupancy       : (not sampled — pass --node-pid and --service-pid)");
     } else {
-        println!("agent occupancy (busiest first, fewer yields = busier):");
+        println!("agent occupancy (busiest first, fewer yields = busier; rows are name#tid):");
         for o in occ {
-            println!("    {:<22} {:>12.0} yields/s", o.name, o.yields_per_sec);
+            println!("    pid {:<8} {:<24} {:>12.0} yields/s", o.pid, o.label(), o.yields_per_sec);
         }
     }
     println!("=================================================================");
@@ -963,7 +1303,7 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
         readers,
         a.mode,
         a.write_rate,
-        Some(PathBuf::from("/proc/self/task")),
+        &self_task_dirs(),
     );
     print_read_report(a.mode, readers, a.write_rate, &stats, &occ);
     stop_cluster(nodes, services);
@@ -978,10 +1318,36 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `all`/`ladder` run every role inside ONE process, so its own task dir holds
+/// all three nodes' agents AND all three services' apply threads. Correctly
+/// keyed by `(pid, tid)`, that is exactly the union the fleet builds from two
+/// PIDs.
+fn self_task_dirs() -> Vec<(u32, PathBuf)> {
+    vec![(std::process::id(), PathBuf::from("/proc/self/task"))]
+}
+
 fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
     let secs = env_cap("UC2_RP_MAX_SECS", a.secs);
     let readers = env_cap("UC2_RP_MAX_READERS", a.readers);
-    let task_dir = a.node_pid.map(|p| PathBuf::from(format!("/proc/{p}/task")));
+    // The union of node + service task dirs. Without the service's, `uc2-apply`
+    // — the apply-frontier hypothesis clause (b) exists to rule out — is not in
+    // the sampled set at all on a fleet, where the service is its own process.
+    let task_dirs: Vec<(u32, PathBuf)> = [a.node_pid, a.service_pid]
+        .into_iter()
+        .flatten()
+        .map(|p| (p, PathBuf::from(format!("/proc/{p}/task"))))
+        .collect();
+    if task_dirs.is_empty() {
+        eprintln!(
+            "WARNING: neither --node-pid nor --service-pid given — clause (b) of the \
+             decision rule cannot be evaluated from this run."
+        );
+    } else if a.service_pid.is_none() {
+        eprintln!(
+            "WARNING: --service-pid not given — uc2-apply is invisible to the occupancy \
+             ranking, so clause (b) cannot rule out the apply frontier."
+        );
+    }
     let (stats, occ) = run_read_measurement(
         &a.instance_dir,
         &a.app_id,
@@ -989,9 +1355,13 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
         readers,
         a.mode,
         a.write_rate,
-        task_dir,
+        &task_dirs,
     );
     print_read_report(a.mode, readers, a.write_rate, &stats, &occ);
+    // One machine-readable rung record, so the fleet ladder (one `client`
+    // process per rung, external orchestration) can feed `decide --rungs` and
+    // evaluate the SAME pre-committed rule rather than re-implementing it.
+    println!("{}", rung_to_json(&Rung::from_stats(readers, a.mode, a.write_rate, &stats, &occ)));
     anyhow::ensure!(
         stats.regression == 0,
         "LINEARIZABLE READ REGRESSED by {} — a read returned a value lower than one \
@@ -1007,16 +1377,240 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One agent's place in a rung's occupancy ranking. `name` is the bare thread
+/// name (what clause (b) matches); `label` is `name#tid` (what a human needs to
+/// tell three `uc2-consensus` threads apart).
+#[derive(Debug, Clone, PartialEq)]
+struct AgentRank {
+    pub name: String,
+    pub label: String,
+    pub yields_per_sec: f64,
+}
+
 /// One measured point: an arm at one concurrency under one write mix.
+///
+/// This carries the health of the run, not just its rate. A rung that collapsed
+/// into retries, or one whose load generator never sustained the target depth,
+/// produces a rate that means nothing — and the decision rule has to be able to
+/// see that rather than reading it as a favourable number.
 #[derive(Debug, Clone)]
 struct Rung {
     pub readers: u64,
     pub mode: Mode,
     pub write_rate: u64,
+    pub reads: u64,
     pub reads_per_sec: f64,
     pub p50_ms: f64,
     pub p99_ms: f64,
-    pub top_agent: Option<String>,
+    pub retried: u64,
+    pub not_leader: u64,
+    pub overwritten: u64,
+    pub inflight_at_end: u64,
+    pub inflight_mean: f64,
+    pub inflight_min: u64,
+    pub regression: u64,
+    /// Occupancy ranking, busiest (fewest yields) first, agent threads only.
+    pub agents: Vec<AgentRank>,
+}
+
+impl Rung {
+    fn from_stats(
+        readers: u64,
+        mode: Mode,
+        write_rate: u64,
+        s: &ReadStats,
+        occ: &[Occupancy],
+    ) -> Rung {
+        Rung {
+            readers,
+            mode,
+            write_rate,
+            reads: s.reads,
+            reads_per_sec: s.reads_per_sec,
+            p50_ms: s.p50_ms,
+            p99_ms: s.p99_ms,
+            retried: s.retried,
+            not_leader: s.not_leader,
+            overwritten: s.overwritten,
+            inflight_at_end: s.inflight_at_end,
+            inflight_mean: s.inflight_mean,
+            inflight_min: s.inflight_min,
+            regression: s.regression,
+            agents: agent_rows(occ)
+                .into_iter()
+                .map(|o| AgentRank {
+                    name: o.name.clone(),
+                    label: o.label(),
+                    yields_per_sec: o.yields_per_sec,
+                })
+                .collect(),
+        }
+    }
+
+    fn mode_str(&self) -> &'static str {
+        match self.mode {
+            Mode::Lin => "lin",
+            Mode::Snap => "snap",
+        }
+    }
+
+    fn arm_name(&self) -> &'static str {
+        match self.mode {
+            Mode::Lin => "linearizable",
+            Mode::Snap => "snapshot",
+        }
+    }
+
+    /// Share of resolved ops that came back as a retry or a redirect rather
+    /// than as a genuine answer. See [`DEGRADED_FRACTION`].
+    fn degraded_fraction(&self) -> f64 {
+        degraded_fraction(self.reads, self.retried, self.not_leader)
+    }
+
+    fn is_degraded(&self) -> bool {
+        self.degraded_fraction() > DEGRADED_FRACTION
+    }
+}
+
+/// `(retried + not_leader) / (reads + retried + not_leader)`; 0 when nothing
+/// resolved at all (an empty run is caught by the zero-rate check instead).
+fn degraded_fraction(reads: u64, retried: u64, not_leader: u64) -> f64 {
+    let denom = reads + retried + not_leader;
+    if denom == 0 { 0.0 } else { (retried + not_leader) as f64 / denom as f64 }
+}
+
+/// Serialize a rung as one JSON object on one line.
+///
+/// Hand-rolled on purpose: this example must not add a dependency, and the
+/// format only has to survive the round trip to [`rung_from_json`] that
+/// `decide` performs. That round trip is what makes the pre-committed rule
+/// reachable from the FLEET path — where each rung is a separate `client`
+/// process under external orchestration — instead of being re-implemented in
+/// the orchestrator, which would defeat the point of pinning it in tested code.
+fn rung_to_json(r: &Rung) -> String {
+    let agents = r
+        .agents
+        .iter()
+        .map(|a| {
+            format!(
+                "{{\"name\":\"{}\",\"label\":\"{}\",\"yields_per_sec\":{}}}",
+                json_escape(&a.name),
+                json_escape(&a.label),
+                a.yields_per_sec
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"rung\":1,\"mode\":\"{}\",\"readers\":{},\"write_rate\":{},\"reads\":{},\
+         \"reads_per_sec\":{},\"p50_ms\":{},\"p99_ms\":{},\"retried\":{},\"not_leader\":{},\
+         \"overwritten\":{},\"inflight_at_end\":{},\"inflight_mean\":{},\"inflight_min\":{},\
+         \"regression\":{},\"agents\":[{}]}}",
+        r.mode_str(),
+        r.readers,
+        r.write_rate,
+        r.reads,
+        r.reads_per_sec,
+        r.p50_ms,
+        r.p99_ms,
+        r.retried,
+        r.not_leader,
+        r.overwritten,
+        r.inflight_at_end,
+        r.inflight_mean,
+        r.inflight_min,
+        r.regression,
+        agents
+    )
+}
+
+/// Minimal escaping for the only strings this emits — thread names out of
+/// `/proc/<pid>/task/<tid>/comm`.
+fn json_escape(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .flat_map(|c| match c {
+            '"' | '\\' => vec!['\\', c],
+            c => vec![c],
+        })
+        .collect()
+}
+
+/// Pull `"<key>":<scalar>` out of a flat JSON object slice. Deliberately
+/// literal-minded: the only producer is [`rung_to_json`].
+fn json_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let pat = format!("\"{key}\":");
+    let start = line.find(&pat)? + pat.len();
+    let rest = &line[start..];
+    let end = rest.find([',', '}', ']']).unwrap_or(rest.len());
+    Some(rest[..end].trim())
+}
+
+fn json_str<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let pat = format!("\"{key}\":\"");
+    let start = line.find(&pat)? + pat.len();
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+fn json_u64(line: &str, key: &str) -> Option<u64> {
+    json_field(line, key)?.parse().ok()
+}
+
+fn json_f64(line: &str, key: &str) -> Option<f64> {
+    json_field(line, key)?.parse().ok()
+}
+
+/// Parse one rung JSON line. Returns `None` for anything that is not one (blank
+/// lines, the human report the same stdout carries), so an orchestrator can tee
+/// a whole `client` run into the rung file without filtering it first.
+fn rung_from_json(line: &str) -> Option<Rung> {
+    let line = line.trim();
+    if !line.starts_with('{') || !line.contains("\"rung\":") {
+        return None;
+    }
+    let (agents_blob, head) = match line.find("\"agents\":[") {
+        Some(i) => {
+            let rest = &line[i + "\"agents\":[".len()..];
+            let end = rest.find(']')?;
+            (&rest[..end], &line[..i])
+        }
+        None => ("", line),
+    };
+    let agents = agents_blob
+        .split("},{")
+        .filter(|s| s.contains("\"name\":"))
+        .filter_map(|s| {
+            Some(AgentRank {
+                name: json_str(s, "name")?.to_string(),
+                label: json_str(s, "label").unwrap_or_default().to_string(),
+                yields_per_sec: json_f64(s, "yields_per_sec")?,
+            })
+        })
+        .collect();
+    let mode = match json_str(head, "mode")? {
+        "lin" => Mode::Lin,
+        "snap" => Mode::Snap,
+        _ => return None,
+    };
+    Some(Rung {
+        readers: json_u64(head, "readers")?,
+        mode,
+        write_rate: json_u64(head, "write_rate")?,
+        reads: json_u64(head, "reads")?,
+        reads_per_sec: json_f64(head, "reads_per_sec")?,
+        p50_ms: json_f64(head, "p50_ms").unwrap_or(0.0),
+        p99_ms: json_f64(head, "p99_ms").unwrap_or(0.0),
+        retried: json_u64(head, "retried").unwrap_or(0),
+        not_leader: json_u64(head, "not_leader").unwrap_or(0),
+        overwritten: json_u64(head, "overwritten").unwrap_or(0),
+        inflight_at_end: json_u64(head, "inflight_at_end").unwrap_or(0),
+        inflight_mean: json_f64(head, "inflight_mean").unwrap_or(0.0),
+        inflight_min: json_u64(head, "inflight_min").unwrap_or(0),
+        regression: json_u64(head, "regression").unwrap_or(0),
+        agents,
+    })
 }
 
 /// The decision rule from the spec (§2), evaluated verbatim and never tuned:
@@ -1041,8 +1635,21 @@ fn evaluate_decision_rule(rungs: &[Rung], write_rate: u64) -> String {
         return "VERDICT: INCONCLUSIVE — the snapshot arm measured zero reads/s.".into();
     }
     let ratio = lin.reads_per_sec / snap.reads_per_sec * 100.0;
-    let top = lin.top_agent.clone().unwrap_or_else(|| "(not sampled)".into());
+    let top_rank = lin.agents.first();
+    let runner_up = lin.agents.get(1);
+    let top = top_rank.map(|a| a.name.clone()).unwrap_or_else(|| "(not sampled)".into());
+    let top_label = top_rank.map(|a| a.label.clone()).unwrap_or_else(|| "(not sampled)".into());
     let probe_agent_is_top = top == "uc2-consensus" || top == "uc2-receiver";
+    // Spec §2: "(b) is a ranking, and ties do not count." The runner-up must
+    // yield materially MORE than the top (the ranking is ascending in yields,
+    // fewest = busiest) before the top counts as a distinct bottleneck.
+    let tie = match (top_rank, runner_up) {
+        (Some(t), Some(r)) => {
+            !(r.yields_per_sec > t.yields_per_sec
+                && r.yields_per_sec - t.yields_per_sec >= TIE_MARGIN * t.yields_per_sec)
+        }
+        _ => false,
+    };
 
     let mut out = String::new();
     out.push_str(&format!(
@@ -1054,34 +1661,96 @@ fn evaluate_decision_rule(rungs: &[Rung], write_rate: u64) -> String {
         snap.reads_per_sec, snap.readers, snap.p50_ms, snap.p99_ms
     ));
     out.push_str(&format!("  ratio (lin/snap)     : {ratio:.1}%  [rule: <=70% and not 65-75%]\n"));
-    out.push_str(&format!("  top-occupancy agent  : {top}  [rule: uc2-consensus or uc2-receiver]\n"));
+    out.push_str(&format!(
+        "  top-occupancy agent  : {top_label}  [rule: uc2-consensus or uc2-receiver]\n"
+    ));
+    if let (Some(t), Some(r)) = (top_rank, runner_up) {
+        out.push_str(&format!(
+            "  runner-up agent      : {} ({:.0} vs {:.0} yields/s; tie rule needs +{:.0}%)\n",
+            r.label,
+            r.yields_per_sec,
+            t.yields_per_sec,
+            TIE_MARGIN * 100.0
+        ));
+    }
+    for r in [lin, snap] {
+        out.push_str(&format!(
+            "  {:<20} : {} reads, {} retried, {} not_leader ({:.1}% degraded), \
+             in-flight mean {:.1} / min {} vs target {}\n",
+            format!("{} arm health", r.arm_name()),
+            r.reads,
+            r.retried,
+            r.not_leader,
+            r.degraded_fraction() * 100.0,
+            r.inflight_mean,
+            r.inflight_min,
+            r.readers
+        ));
+    }
 
     // Both arms cross the same per-cycle query drain, so equal plateaus point at
-    // the drain cap rather than at the barrier (spec §6.2).
+    // the drain cap — or at the harness — rather than at the barrier
+    // (spec §6, threats 2 and 3).
     if (ratio - 100.0).abs() < 2.0 {
         out.push_str(
             "  NOTE: the two arms plateau within 2% of each other — suspect \
-             QUERY_DRAIN_PER_CYCLE (node.rs:186) as the ceiling, not the probe.\n",
+             QUERY_DRAIN_PER_CYCLE (node.rs:186) as the ceiling, or the LOAD GENERATOR \
+             itself (single send thread, single matcher thread taking the histogram lock \
+             per response): if both arms hit the CLIENT's ceiling the ratio goes to 100% \
+             and the barrier reads as free. Check the in-flight depth lines above against \
+             the target before believing either.\n",
+        );
+    }
+    if ratio > 100.0 {
+        out.push_str(
+            "  NOTE: the linearizable arm OUT-RAN the snapshot arm (ratio > 100%). The \
+             barrier cannot make reads faster, so this rung pair is measuring something \
+             else — a stalled or query-losing snapshot arm, or run-to-run noise — and must \
+             be re-examined rather than read as 'the barrier is free'.\n",
         );
     }
 
-    let verdict = if (65.0..=75.0).contains(&ratio) {
+    let verdict = if lin.is_degraded() || snap.is_degraded() {
+        // A degraded linearizable arm resolves few genuine reads over the full
+        // elapsed window: a LOW ratio, which is exactly the shape of the result
+        // that justifies building. Refuse to rule rather than certify it.
+        let bad = if lin.is_degraded() { lin } else { snap };
+        format!(
+            "VERDICT: INCONCLUSIVE — {} arm degraded ({:.1}% retries/redirects)",
+            bad.arm_name(),
+            bad.degraded_fraction() * 100.0
+        )
+    } else if (65.0..=75.0).contains(&ratio) {
         format!(
             "VERDICT: BORDERLINE ({ratio:.1}% is inside the 65-75% band) — \
              NOT justified on this data; resolve with a fleet run or decline."
         )
-    } else if ratio <= 70.0 && probe_agent_is_top {
+    } else if ratio <= 70.0 && probe_agent_is_top && !tie {
         "VERDICT: Rung A JUSTIFIED — both clauses met.".to_string()
     } else if ratio > 70.0 {
         format!(
             "VERDICT: Rung A NOT JUSTIFIED — clause (a) unmet: the barrier costs \
-             only {:.1}% of read capacity.",
-            100.0 - ratio
+             at most {:.1}% of read capacity.",
+            (100.0 - ratio).max(0.0)
+        )
+    } else if probe_agent_is_top && tie {
+        let r = runner_up.expect("tie implies a runner-up");
+        let t = top_rank.expect("tie implies a top agent");
+        format!(
+            "VERDICT: Rung A NOT JUSTIFIED — clause (b) unmet by TIE: {} ({:.0} yields/s) and \
+             {} ({:.0} yields/s) are within the yield proxy's run-to-run spread (under \
+             {:.0}% apart). Spec §2: '(b) is a ranking, and ties do not count' — escalate \
+             per spec §4.3 or decline.",
+            t.label,
+            t.yields_per_sec,
+            r.label,
+            r.yields_per_sec,
+            TIE_MARGIN * 100.0
         )
     } else {
         format!(
             "VERDICT: Rung A NOT JUSTIFIED — clause (b) unmet: the top-occupancy agent \
-             is {top}, not a probe-touching agent. Removing probe traffic would not \
+             is {top_label}, not a probe-touching agent. Removing probe traffic would not \
              move this ceiling; profile {top} instead."
         )
     };
@@ -1109,7 +1778,7 @@ fn run_ladder(a: LadderArgs) -> anyhow::Result<()> {
                     readers,
                     mode,
                     write_rate,
-                    Some(PathBuf::from("/proc/self/task")),
+                    &self_task_dirs(),
                 );
                 stop_cluster(nodes, services);
                 anyhow::ensure!(
@@ -1124,29 +1793,28 @@ fn run_ladder(a: LadderArgs) -> anyhow::Result<()> {
                         stats.inflight_at_end
                     );
                 }
-                // In `all`/`ladder` mode /proc/self/task holds the harness's own
-                // threads too; only the named agent threads are of interest.
-                let top_agent = occ
-                    .iter()
-                    .find(|o| o.name.starts_with("uc2-"))
-                    .map(|o| o.name.clone());
+                let r = Rung::from_stats(readers, mode, write_rate, &stats, &occ);
+                // Health goes on the rung line, not just in the report: a rung
+                // that collapsed into retries has a LOW rate, which is the same
+                // shape as the result that justifies building Rung A.
                 println!(
                     "  rung: mode={:<5} readers={readers:<5} writes/s={write_rate:<7} \
-                     reads/s={:>10.0}  p50={:.3}ms  top={}",
-                    match mode { Mode::Lin => "lin", Mode::Snap => "snap" },
-                    stats.reads_per_sec,
-                    stats.p50_ms,
-                    top_agent.clone().unwrap_or_else(|| "-".into())
+                     reads/s={:>10.0}  p50={:.3}ms  retried={} not_leader={} \
+                     ({:.1}% degraded) overwritten={} inflight_end={} depth(mean/min)={:.1}/{} \
+                     top={}",
+                    r.mode_str(),
+                    r.reads_per_sec,
+                    r.p50_ms,
+                    r.retried,
+                    r.not_leader,
+                    r.degraded_fraction() * 100.0,
+                    r.overwritten,
+                    r.inflight_at_end,
+                    r.inflight_mean,
+                    r.inflight_min,
+                    r.agents.first().map(|a| a.label.clone()).unwrap_or_else(|| "-".into())
                 );
-                rungs.push(Rung {
-                    readers,
-                    mode,
-                    write_rate,
-                    reads_per_sec: stats.reads_per_sec,
-                    p50_ms: stats.p50_ms,
-                    p99_ms: stats.p99_ms,
-                    top_agent,
-                });
+                rungs.push(r);
             }
         }
         if write_rate == a.write_rate && a.write_rate == 0 {
@@ -1172,15 +1840,70 @@ fn run_ladder(a: LadderArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Evaluate the pre-committed rule over rung records collected from `client`
+/// runs — the FLEET path. Each fleet rung is a separate `client` process under
+/// external orchestration, so without this the orchestrator would have to
+/// re-implement the rule, and a rule re-implemented outside its unit tests is
+/// no longer a pre-commitment.
+fn run_decide(a: DecideArgs) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(&a.rungs)
+        .map_err(|e| anyhow::anyhow!("read {:?}: {e}", a.rungs))?;
+    let rungs: Vec<Rung> = text.lines().filter_map(rung_from_json).collect();
+    anyhow::ensure!(!rungs.is_empty(), "no rung records found in {:?}", a.rungs);
+    println!("rungs parsed: {} (write_rate filter: {})", rungs.len(), a.write_rate);
+    for r in &rungs {
+        println!(
+            "  {:<4} readers={:<6} writes/s={:<7} reads/s={:>10.0} p50={:.3}ms \
+             ({:.1}% degraded) inflight_end={} depth(mean/min)={:.1}/{}",
+            r.mode_str(),
+            r.readers,
+            r.write_rate,
+            r.reads_per_sec,
+            r.p50_ms,
+            r.degraded_fraction() * 100.0,
+            r.inflight_at_end,
+            r.inflight_mean,
+            r.inflight_min
+        );
+        if r.regression != 0 {
+            println!("    WARNING: this rung recorded a read regression of {}", r.regression);
+        }
+    }
+    println!();
+    println!("================== decision rule (spec §2) ==================");
+    println!("{}", evaluate_decision_rule(&rungs, a.write_rate));
+    println!("============================================================");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
 
+    /// Scratch root for test artifacts: the workspace `target/` directory, on
+    /// real ext4. NEVER `/tmp` — RAM-backed tmpfs with no swap on the dev box.
+    fn scratch_root() -> PathBuf {
+        let root = std::env::var("CARGO_TARGET_TMPDIR").map(PathBuf::from).unwrap_or_else(|_| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/read_profile_tests")
+        });
+        fs::create_dir_all(&root).expect("create scratch root");
+        assert!(!root.starts_with("/tmp"), "test scratch must not live on tmpfs: {root:?}");
+        root
+    }
+
     /// Build a synthetic `/proc/<pid>/task` tree: one dir per thread, each
-    /// holding a `comm` and a `status` file in the kernel's format.
+    /// holding a `comm` and a `status` file in the kernel's format. Threads are
+    /// numbered from 1000, so tids are `1000 + index`.
+    ///
+    /// `tempdir_in(<target dir>)` rather than `tempdir()`: `/tmp` on the dev box
+    /// is RAM-backed tmpfs with no swap (CLAUDE.md), which is also why
+    /// `run_node`/`boot_cluster` refuse a `/tmp` instance dir. Writing test
+    /// scratch there would contradict the assertion this file makes. (Examples
+    /// do not get `CARGO_TARGET_TMPDIR` — that is integration-test-only — so
+    /// [`scratch_root`] derives the same ext4 location from the manifest dir.)
     fn fake_task_dir(threads: &[(&str, u64)]) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = tempfile::tempdir_in(scratch_root()).expect("tempdir");
         for (i, (name, yields)) in threads.iter().enumerate() {
             let t = dir.path().join(format!("{}", 1000 + i));
             fs::create_dir(&t).unwrap();
@@ -1197,17 +1920,18 @@ mod tests {
         dir
     }
 
+    fn sample(pid: u32, tid: u32, name: &str, yields: u64) -> ThreadSample {
+        ThreadSample { pid, tid, name: name.to_string(), yields }
+    }
+
     #[test]
-    fn samples_name_and_yield_count_per_thread() {
+    fn samples_pid_tid_name_and_yield_count_per_thread() {
         let dir = fake_task_dir(&[("uc2-consensus", 100), ("uc2-sender", 250)]);
-        let mut got = sample_yields(dir.path()).expect("sample");
+        let mut got = sample_yields(7, dir.path()).expect("sample");
         got.sort();
         assert_eq!(
             got,
-            vec![
-                ("uc2-consensus".to_string(), 100),
-                ("uc2-sender".to_string(), 250)
-            ]
+            vec![sample(7, 1000, "uc2-consensus", 100), sample(7, 1001, "uc2-sender", 250)]
         );
     }
 
@@ -1216,15 +1940,32 @@ mod tests {
         let dir = fake_task_dir(&[("uc2-consensus", 100)]);
         // A thread that exited between readdir and read: dir exists, files don't.
         fs::create_dir(dir.path().join("2000")).unwrap();
-        let got = sample_yields(dir.path()).expect("sample");
-        assert_eq!(got, vec![("uc2-consensus".to_string(), 100)]);
+        let got = sample_yields(7, dir.path()).expect("sample");
+        assert_eq!(got, vec![sample(7, 1000, "uc2-consensus", 100)]);
+    }
+
+    #[test]
+    fn sample_all_unions_task_dirs_and_keeps_pids_distinct() {
+        // The fleet shape: node process and service process, sampled together.
+        let node = fake_task_dir(&[("uc2-consensus", 100)]);
+        let svc = fake_task_dir(&[("uc2-apply", 400)]);
+        let mut got = sample_all(&[(11, node.path().into()), (22, svc.path().into())])
+            .expect("union sample");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                sample(11, 1000, "uc2-consensus", 100),
+                sample(22, 1000, "uc2-apply", 400),
+            ]
+        );
     }
 
     #[test]
     fn delta_ranks_busiest_first_and_normalizes_by_time() {
-        let before = vec![("uc2-consensus".into(), 100u64), ("uc2-sender".into(), 100)];
+        let before = vec![sample(1, 10, "uc2-consensus", 100), sample(1, 11, "uc2-sender", 100)];
         // Over 2 s: consensus yielded 20 times (busy), sender 2000 (idle).
-        let after = vec![("uc2-consensus".into(), 120u64), ("uc2-sender".into(), 2100)];
+        let after = vec![sample(1, 10, "uc2-consensus", 120), sample(1, 11, "uc2-sender", 2100)];
         let got = occupancy_delta(&before, &after, 2.0);
         assert_eq!(got[0].name, "uc2-consensus", "busiest (fewest yields) ranks first");
         assert_eq!(got[0].yields_per_sec, 10.0);
@@ -1234,22 +1975,81 @@ mod tests {
 
     #[test]
     fn delta_ignores_threads_absent_from_either_sample() {
-        let before = vec![("uc2-consensus".into(), 100u64), ("gone".into(), 5)];
-        let after = vec![("uc2-consensus".into(), 120u64), ("new".into(), 5)];
+        let before = vec![sample(1, 10, "uc2-consensus", 100), sample(1, 11, "gone", 5)];
+        let after = vec![sample(1, 10, "uc2-consensus", 120), sample(1, 12, "new", 5)];
         let got = occupancy_delta(&before, &after, 1.0);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "uc2-consensus");
     }
 
+    /// C1: `all`/`ladder` sample a process running THREE nodes, so three
+    /// threads are named `uc2-consensus`. A name-keyed join differences
+    /// unrelated threads; the mis-paired rows saturate to 0 and 0 sorts to the
+    /// FRONT of the ascending ranking, impersonating the busiest agent.
+    #[test]
+    fn delta_pairs_same_named_threads_by_tid_not_by_name() {
+        let before = vec![
+            sample(1, 10, "uc2-consensus", 100),
+            sample(1, 11, "uc2-consensus", 5_000),
+            sample(1, 12, "uc2-consensus", 9_000),
+        ];
+        let after = vec![
+            sample(1, 10, "uc2-consensus", 200),   // +100
+            sample(1, 11, "uc2-consensus", 5_020), // +20  <- the busy one
+            sample(1, 12, "uc2-consensus", 9_300), // +300
+        ];
+        let got = occupancy_delta(&before, &after, 1.0);
+        assert_eq!(got.len(), 3);
+        // Name-keyed, tids 11 and 12 would difference against tid 10's `before`
+        // (5000-100, 9000-100 — or saturate to 0 in the other direction).
+        assert_eq!(
+            got.iter().map(|o| (o.tid, o.yields_per_sec)).collect::<Vec<_>>(),
+            vec![(11, 20.0), (10, 100.0), (12, 300.0)]
+        );
+        assert_eq!(got[0].label(), "uc2-consensus#11", "rows must be distinguishable");
+        assert!(
+            got.iter().all(|o| o.yields_per_sec > 0.0),
+            "no row may saturate to 0 through a mis-pair: {got:?}"
+        );
+    }
+
+    /// Same tid number in two different processes must not be joined either
+    /// (tids are per-process in principle; `(pid, tid)` is the key).
+    #[test]
+    fn delta_does_not_join_across_processes() {
+        let before = vec![sample(1, 10, "uc2-apply", 100), sample(2, 10, "uc2-apply", 7_000)];
+        let after = vec![sample(1, 10, "uc2-apply", 150), sample(2, 10, "uc2-apply", 7_400)];
+        let got = occupancy_delta(&before, &after, 1.0);
+        assert_eq!(
+            got.iter().map(|o| (o.pid, o.yields_per_sec)).collect::<Vec<_>>(),
+            vec![(1, 50.0), (2, 400.0)]
+        );
+    }
+
+    fn agent(name: &str, tid: u32, yields: f64) -> AgentRank {
+        AgentRank { name: name.to_string(), label: format!("{name}#{tid}"), yields_per_sec: yields }
+    }
+
+    /// A healthy rung whose ranking has an unambiguous top agent: `top` is the
+    /// busiest (lowest yield rate) and the runner-up is 10x above it, well
+    /// clear of the tie margin.
     fn rung(readers: u64, mode: Mode, rps: f64, top: &str) -> Rung {
         Rung {
             readers,
             mode,
             write_rate: 0,
+            reads: rps as u64,
             reads_per_sec: rps,
             p50_ms: 0.1,
             p99_ms: 0.2,
-            top_agent: Some(top.to_string()),
+            retried: 0,
+            not_leader: 0,
+            overwritten: 0,
+            inflight_at_end: 0,
+            inflight_mean: readers as f64,
+            inflight_min: readers,
+            regression: 0,
+            agents: vec![agent(top, 10, 100.0), agent("uc2-archive", 11, 1_000.0)],
         }
     }
 
@@ -1308,5 +2108,234 @@ mod tests {
         ];
         let out = evaluate_decision_rule(&rungs, 0);
         assert!(out.contains("QUERY_DRAIN_PER_CYCLE"), "got: {out}");
+        // I5: the load generator is the OTHER candidate for an equal plateau —
+        // if both arms hit the client's ceiling the barrier reads as free.
+        assert!(out.contains("LOAD GENERATOR"), "got: {out}");
+    }
+
+    // --- I2: the borderline band's EDGES, both directions ------------------
+    //
+    // The pre-existing tests probed only 70.0, which is simultaneously the
+    // in-band value and the clause-(a) threshold — so narrowing the band to
+    // (69.5..=70.5) passed all of them while turning a 66% result from
+    // BORDERLINE into JUSTIFIED. Narrowing is the dangerous direction; these
+    // pin both edges.
+
+    fn ratio_verdict(lin_rps: f64) -> String {
+        let rungs = vec![
+            rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"),
+            rung(64, Mode::Lin, lin_rps, "uc2-consensus"),
+        ];
+        evaluate_decision_rule(&rungs, 0)
+    }
+
+    #[test]
+    fn rule_treats_both_band_edges_as_borderline() {
+        for lin in [650_000.0, 750_000.0] {
+            let out = ratio_verdict(lin);
+            assert!(out.contains("BORDERLINE"), "{lin} reads/s must be BORDERLINE: {out}");
+            assert!(!out.contains("Rung A JUSTIFIED"), "got: {out}");
+        }
+    }
+
+    #[test]
+    fn rule_does_not_extend_the_band_past_its_edges() {
+        // 64.9%: below the band, clause (a) met, probe agent on top -> JUSTIFIED.
+        let low = ratio_verdict(649_000.0);
+        assert!(!low.contains("BORDERLINE"), "64.9% is outside the band: {low}");
+        assert!(low.contains("Rung A JUSTIFIED"), "got: {low}");
+        assert!(!low.contains("NOT JUSTIFIED"), "got: {low}");
+        // 75.1%: above the band and above the threshold -> clause (a) unmet.
+        let high = ratio_verdict(751_000.0);
+        assert!(!high.contains("BORDERLINE"), "75.1% is outside the band: {high}");
+        assert!(high.contains("NOT JUSTIFIED"), "got: {high}");
+    }
+
+    // --- C3: a degraded arm must not certify a plateau ---------------------
+
+    #[test]
+    fn rule_refuses_to_rule_on_a_degraded_linearizable_arm() {
+        // The dangerous shape: the lin arm collapsed into RETRY, so it resolved
+        // few genuine reads — a LOW ratio, i.e. the same signal as "the barrier
+        // is expensive, build Rung A".
+        let mut lin = rung(64, Mode::Lin, 100_000.0, "uc2-consensus");
+        lin.reads = 100_000;
+        lin.retried = 20_000; // 16.7% > 5%
+        let rungs = vec![rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"), lin];
+        let out = evaluate_decision_rule(&rungs, 0);
+        assert!(out.contains("VERDICT: INCONCLUSIVE"), "got: {out}");
+        assert!(out.contains("linearizable arm degraded"), "got: {out}");
+        assert!(out.contains("16.7% retries/redirects"), "got: {out}");
+        assert!(!out.contains("JUSTIFIED"), "a degraded arm must not reach a verdict: {out}");
+    }
+
+    #[test]
+    fn rule_refuses_to_rule_on_a_degraded_snapshot_arm() {
+        let mut snap = rung(64, Mode::Snap, 1_000_000.0, "uc2-apply");
+        snap.reads = 100_000;
+        snap.not_leader = 10_000; // 9.1% > 5%
+        let rungs = vec![snap, rung(64, Mode::Lin, 500_000.0, "uc2-consensus")];
+        let out = evaluate_decision_rule(&rungs, 0);
+        assert!(out.contains("VERDICT: INCONCLUSIVE"), "got: {out}");
+        assert!(out.contains("snapshot arm degraded"), "got: {out}");
+    }
+
+    #[test]
+    fn rule_still_rules_just_below_the_degraded_threshold() {
+        let mut lin = rung(64, Mode::Lin, 500_000.0, "uc2-consensus");
+        lin.reads = 96_000;
+        lin.retried = 4_000; // exactly 4% — under the 5% bar
+        let rungs = vec![rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"), lin];
+        let out = evaluate_decision_rule(&rungs, 0);
+        assert!(!out.contains("INCONCLUSIVE"), "got: {out}");
+        assert!(out.contains("Rung A JUSTIFIED"), "got: {out}");
+    }
+
+    #[test]
+    fn degraded_fraction_is_zero_when_nothing_resolved() {
+        assert_eq!(degraded_fraction(0, 0, 0), 0.0);
+        assert_eq!(degraded_fraction(90, 5, 5), 0.1);
+    }
+
+    // --- I1: spec §2's tie rule --------------------------------------------
+
+    #[test]
+    fn rule_declines_when_the_top_two_agents_are_within_the_proxy_spread() {
+        let mut lin = rung(64, Mode::Lin, 500_000.0, "uc2-consensus");
+        // uc2-consensus edges uc2-apply by 0.2% — a coin flip, not a ranking.
+        lin.agents = vec![agent("uc2-consensus", 10, 1_000.0), agent("uc2-apply", 11, 1_002.0)];
+        let rungs = vec![rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"), lin];
+        let out = evaluate_decision_rule(&rungs, 0);
+        assert!(out.contains("clause (b) unmet by TIE"), "got: {out}");
+        assert!(!out.contains("Rung A JUSTIFIED"), "a tie must not justify building: {out}");
+        assert!(out.contains("uc2-consensus#10") && out.contains("uc2-apply#11"), "got: {out}");
+    }
+
+    #[test]
+    fn rule_accepts_a_ranking_that_clears_the_tie_margin() {
+        let mut lin = rung(64, Mode::Lin, 500_000.0, "uc2-consensus");
+        // Runner-up yields exactly 20% more: at the margin, so it counts.
+        lin.agents = vec![agent("uc2-consensus", 10, 1_000.0), agent("uc2-apply", 11, 1_200.0)];
+        let rungs = vec![rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"), lin];
+        let out = evaluate_decision_rule(&rungs, 0);
+        assert!(out.contains("Rung A JUSTIFIED"), "got: {out}");
+        assert!(!out.contains("NOT JUSTIFIED"), "got: {out}");
+    }
+
+    #[test]
+    fn rule_declines_on_a_tie_just_under_the_margin() {
+        let mut lin = rung(64, Mode::Lin, 500_000.0, "uc2-consensus");
+        lin.agents = vec![agent("uc2-consensus", 10, 1_000.0), agent("uc2-apply", 11, 1_199.0)];
+        let rungs = vec![rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"), lin];
+        let out = evaluate_decision_rule(&rungs, 0);
+        assert!(out.contains("clause (b) unmet by TIE"), "got: {out}");
+    }
+
+    // --- I8: the verdict must never print a negative cost -------------------
+
+    #[test]
+    fn rule_never_reports_a_negative_barrier_cost() {
+        // The lin arm out-ran the snapshot arm: ratio 114.2%.
+        let rungs = vec![
+            rung(64, Mode::Snap, 700_000.0, "uc2-apply"),
+            rung(64, Mode::Lin, 800_000.0, "uc2-consensus"),
+        ];
+        let out = evaluate_decision_rule(&rungs, 0);
+        assert!(!out.contains("-14.2%"), "negative cost must not be printed: {out}");
+        assert!(out.contains("at most 0.0%"), "got: {out}");
+        assert!(out.contains("OUT-RAN"), "ratio > 100% must be called out: {out}");
+    }
+
+    // --- I3: the rule is reachable from the fleet path ----------------------
+
+    #[test]
+    fn rung_json_round_trips() {
+        let mut r = rung(256, Mode::Lin, 123_456.75, "uc2-receiver");
+        r.write_rate = 20_000;
+        r.retried = 3;
+        r.not_leader = 4;
+        r.overwritten = 5;
+        r.inflight_at_end = 6;
+        r.inflight_mean = 251.5;
+        r.inflight_min = 240;
+        r.regression = 0;
+        let line = rung_to_json(&r);
+        let back = rung_from_json(&line).expect("parses");
+        assert_eq!(back.readers, r.readers);
+        assert_eq!(back.mode, r.mode);
+        assert_eq!(back.write_rate, r.write_rate);
+        assert_eq!(back.reads, r.reads);
+        assert_eq!(back.reads_per_sec, r.reads_per_sec);
+        assert_eq!(back.p50_ms, r.p50_ms);
+        assert_eq!(back.p99_ms, r.p99_ms);
+        assert_eq!(back.retried, r.retried);
+        assert_eq!(back.not_leader, r.not_leader);
+        assert_eq!(back.overwritten, r.overwritten);
+        assert_eq!(back.inflight_at_end, r.inflight_at_end);
+        assert_eq!(back.inflight_mean, r.inflight_mean);
+        assert_eq!(back.inflight_min, r.inflight_min);
+        assert_eq!(back.agents, r.agents);
+    }
+
+    #[test]
+    fn rung_json_ignores_non_rung_lines() {
+        assert!(rung_from_json("").is_none());
+        assert!(rung_from_json("========== uc2 read profile: snapshot ==========").is_none());
+        assert!(rung_from_json("{\"something\":1}").is_none());
+    }
+
+    /// The whole point of I3: the SAME `evaluate_decision_rule` runs over rungs
+    /// that made the round trip through stdout, so the fleet orchestrator never
+    /// re-implements the pre-committed rule.
+    #[test]
+    fn decision_rule_is_identical_over_serialized_rungs() {
+        let rungs = vec![
+            rung(64, Mode::Snap, 1_000_000.0, "uc2-apply"),
+            rung(64, Mode::Lin, 500_000.0, "uc2-consensus"),
+        ];
+        let text: String =
+            rungs.iter().map(|r| format!("noise\n{}\n", rung_to_json(r))).collect();
+        let parsed: Vec<Rung> = text.lines().filter_map(rung_from_json).collect();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(evaluate_decision_rule(&parsed, 0), evaluate_decision_rule(&rungs, 0));
+    }
+
+    // --- I4: the write load is measured, not asserted -----------------------
+
+    #[test]
+    fn writer_counters_separate_accepted_from_dropped() {
+        let c = WriterCounters::default();
+        c.record(Ok(())).expect("ok");
+        c.record(Err(RingError::Full)).expect("full is a drop, not a failure");
+        c.record(Ok(())).expect("ok");
+        assert_eq!(c.snapshot(), (3, 2, 1), "(attempted, accepted, dropped)");
+    }
+
+    #[test]
+    fn writer_counters_surface_non_full_errors() {
+        let c = WriterCounters::default();
+        assert!(c.record(Err(RingError::BadCrc)).is_err(), "a real ring error must not be hidden");
+        assert_eq!(c.snapshot(), (1, 0, 0), "a failed write is neither accepted nor a drop");
+    }
+
+    // --- I5: in-flight depth is sampled across the window -------------------
+
+    #[test]
+    fn depth_stats_report_mean_and_minimum() {
+        let d = DepthStats::default();
+        for v in [64, 64, 32, 64] {
+            d.record(v);
+        }
+        assert_eq!(d.samples(), 4);
+        assert_eq!(d.mean(), 56.0);
+        assert_eq!(d.min(), 32, "a mean near target must not hide a stall");
+    }
+
+    #[test]
+    fn depth_stats_are_empty_not_wrong_when_never_sampled() {
+        let d = DepthStats::default();
+        assert_eq!(d.samples(), 0);
+        assert_eq!(d.mean(), 0.0);
+        assert_eq!(d.min(), 0, "u64::MAX sentinel must never escape");
     }
 }
