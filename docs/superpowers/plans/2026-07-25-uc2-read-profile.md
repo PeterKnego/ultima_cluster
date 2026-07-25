@@ -238,7 +238,7 @@ Everything needed to stand a cluster up and elect a leader, with no measurement 
   - `fn await_single_leader(nodes: &[Node], secs: u64) -> usize`
   - `fn boot_cluster(root: &Path, app_id: &str) -> (Vec<Node>, Vec<Service>, Vec<PathBuf>, usize)` — boots 3 nodes + 3 services, waits for exactly one leader, returns them plus the leader's index. (`Service` = the value returned by `ServiceBuilder::start()`.)
   - CLI enum `Role { Node, Service, Client, All, Ladder }` (`Client`/`Ladder` bodies land in Tasks 3/5).
-  - Constants `CNC_FILE`, `QUERY_RING`, `EGRESS_SERVICE`, `EGRESS_NODE`, `INGRESS_RING`, `ALL_APP_ID`.
+  - Constants `CNC_FILE`, `QUERY_RING`, `EGRESS_SERVICE`, `EGRESS_NODE`, `ALL_APP_ID`. (`INGRESS_RING` is deliberately NOT defined here — nothing writes to the ingress ring until Task 4's writer, so defining it now would build with a dead-code warning.)
 
 - [ ] **Step 1: Write the imports, CLI, and constants**
 
