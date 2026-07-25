@@ -444,3 +444,71 @@ proxy's condition, so post-fix the property holds BY CONSTRUCTION and the run wo
 vacuous — a green proving nothing. The meaningful post-fix calibration is against the
 FULL loss, which is exactly what the box wall blocked. Noting this because a vacuous
 green here would have looked like a successful calibration.
+
+---
+
+### SESSION 5 — V2 COHERENCE-WINDOW FORWARD HUNT (`V2Hunt.lean`)
+The ONLY part of the spike that hunts an UNKNOWN bug. Everything before it was
+backward-looking calibration (revert a known fix → confirm the checker finds the known
+bug → restore → confirm it disappears). Here EVERY SHIPPED FIX IS ON, so a
+counterexample would be a bug nobody knows about. Gated on Bar-2b (passed), which is
+what makes a NULL result informative rather than vacuous.
+
+Base: `Finding9.lean` (gate + vote + lagging `handleTerm` + `tailAttributed` + commit
+plane) with `crashRestart` RESTORED — the brief asks for concurrent
+`startElection`/`crashRestart`/gate-reopen/commit interleavings, and crash was the one
+window ingredient Finding9 had dropped. 17 actions, 7 invariants.
+
+AIMED PER THE DEPTH-PROBE CALIBRATION: proxy invariants, not loss properties. Each is a
+condition a shipped guard establishes — `no_cross_stream_reopen` (#9's guard),
+`no_phantom_commit` (#5/#6b class), `no_unattributed_report`,
+`gate_shut_while_unreconciled`, `handle_never_leads_current`,
+`leader_handle_is_current`, `election_safety` (tripwire).
+
+#### RESULT — **EXHAUSTIVE, NO VIOLATION: 11,697,699 states, 93m10s** (n=3, term=Fin 3)
+Verified before being believed: **zero `error: Examples/...` lines** (so not a voided
+run — the vacuous-pass trap that bit twice in session 4) and **no `maxDepth` anywhere**
+(so `✅ No violation` here is `exploredAllReachableStates`, NOT `reachedDepthBound` —
+the two render identically, `TraceDisplay.lean:104`).
+
+**No fifth coherence-window bug at this scale.** Per the brief's own exit criteria this
+is the acceptable non-discovery outcome ("a fifth countermodel, OR honest
+bounded-coverage evidence") — and it is stronger than bounded: it is exhaustive over
+the model's entire reachable space.
+
+#### WHAT THIS DOES AND DOES NOT ESTABLISH
+DOES: over the reachable state space of this model at n=3/Fin 3, with all shipped fixes
+in place, none of the seven guard-shaped invariants can be violated — 11.7M states, no
+depth bound, no state constraints.
+DOES NOT: it is exhaustive *for this model*, not for UC. It inherits every abstraction
+obligation recorded for `BootGate.lean`/`Finding9.lean` (nondeterministic grant guard,
+collapsed vote tally, ONE tracked entry at ONE tracked position, concrete excluded-node
+quorums, the narrowed `staleStreamAppend` guard), and it says nothing about n≥4 or
+about a 4th term value. **It is not a proof; `proofs/` remains the sole record.**
+
+#### state_constraint: DELIBERATELY NOT USED — and not needed
+`state_constraint` PRUNES states (a state is explored only if all constraints hold), so
+for a hunt whose whole value is finding something UNKNOWN, narrowing first is
+self-defeating: you cannot find what you pruned. Run 1 was therefore unconstrained, to
+establish an honest baseline before spending any narrowing. **It completed, so the
+lever was never needed at n=3** — constraints stay in reserve for n=4, where they would
+buy tractability at a cost that would then have to be stated explicitly.
+
+#### CAPACITY DATA POINT — and it answers the AWS question empirically
+11.7M states is ~9x the largest prior run (Finding9 probe C, 1.29M) and it finished with
+`lean` peaking near 7 GB against a 15 GB box — comfortable. Combined with the Fin-4
+wall from session 4c, the box envelope is now pinned:
+ * **n=3 / Fin 3, exhaustive, 17-action model: AFFORDABLE (~11.7M states, ~93 min, ~7 GB).**
+ * **n=3 / Fin 4: NOT viable (12.1 GB RSS, killed).**
+So a larger AWS box is NOT required for the V2 forward hunt as scoped — the local box
+does it exhaustively. A bigger box remains a narrow, specific purchase for the two
+blocked measurements only (#6b full-loss depth; ReconfigLC leader_completeness CE).
+
+#### TWO MORE TOOLCHAIN GOTCHAS (cost three failed builds)
+ * **`veil module` RESETS `maxHeartbeats` to 500000 when it opens**
+   (`Veil/Base.lean:52`, `veilDefaultOptions`), silently clobbering any `set_option`
+   placed BEFORE the module declaration. It must go INSIDE module scope.
+ * **A single action carrying six conditional assignments SEGFAULTS the elaborator**
+   (exit 139, `Unknown constant ...crashRestart.ext.wp_local_eq.pred`). Fix: split into
+   `require`-guarded arms — zero conditionals, identical semantics (the requires
+   partition the space), and the shipped fix's two branches read explicitly.
