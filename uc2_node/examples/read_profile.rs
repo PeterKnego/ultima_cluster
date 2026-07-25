@@ -23,7 +23,7 @@ use uc_protocol::ring::{BroadcastConsumer, BroadcastRing, MpscRing, RingError};
 use uc_protocol::v2::cnc::NODE_FLAG_CAN_SERVE;
 use uc_protocol::v2::ipc::{
     FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_QUERY, MSG_V2_RESPONSE, MSG_V2_RETRY,
-    client_from_extra, extra_client,
+    MSG_V2_SUBMIT, client_from_extra, extra_client,
 };
 
 /// Well-known file names under the instance dir — the shared contract with
@@ -34,6 +34,7 @@ const CNC_FILE: &str = "cnc2.dat";
 const QUERY_RING: &str = "query.ring";
 const EGRESS_SERVICE: &str = "egress_service.broadcast";
 const EGRESS_NODE: &str = "egress_node.broadcast";
+const INGRESS_RING: &str = "ingress.ring";
 
 const ALL_APP_ID: &str = "uc2-read-profile-smoke";
 
@@ -449,6 +450,9 @@ struct ReadStats {
     p99_ms: f64,
     /// Highest counter value any read returned — fed to the Task 4 monotonic guard.
     max_read_value: u64,
+    /// Largest observed regression (`prev - v` for a read that returned less
+    /// than a previously-returned value). Zero means the guard never fired.
+    regression: u64,
 }
 
 struct MatcherCtx {
@@ -462,6 +466,14 @@ struct MatcherCtx {
     overwritten: Arc<AtomicU64>,
     last_response_ns: Arc<AtomicU64>,
     max_read_value: Arc<AtomicU64>,
+    /// Highest value returned by any read SO FAR, used to detect a REGRESSION.
+    /// `ProfileSm::query` returns a monotonically non-decreasing counter, so a
+    /// linearizable read that returns less than a previously-returned value is a
+    /// stale answer — a harness or read-path defect either way. Snapshot reads
+    /// are NOT guarded: a snapshot read is served from local applied state with
+    /// no barrier, so it may legitimately regress on a follower.
+    guard_monotonic: bool,
+    regression: Arc<AtomicU64>,
     hist: Arc<Mutex<Histogram<u64>>>,
     client_id: u32,
     t0: Instant,
@@ -503,7 +515,10 @@ fn poll_egress(ring: &mut BroadcastConsumer, ctx: &MatcherCtx, buf: &mut Vec<u8>
                     let lat = now.saturating_sub(send).min(HIST_MAX_NS);
                     let _ = ctx.hist.lock().unwrap().record(lat);
                     if let Some(v) = decode_query_answer(buf) {
-                        ctx.max_read_value.fetch_max(v, Ordering::Relaxed);
+                        let prev = ctx.max_read_value.fetch_max(v, Ordering::Relaxed);
+                        if ctx.guard_monotonic && v < prev {
+                            ctx.regression.fetch_max(prev - v, Ordering::Relaxed);
+                        }
                     }
                     ctx.reads.fetch_add(1, Ordering::Relaxed);
                     ctx.resolved.fetch_add(1, Ordering::Relaxed);
@@ -593,6 +608,8 @@ fn run_read_measurement(
         overwritten: Arc::new(AtomicU64::new(0)),
         last_response_ns: Arc::new(AtomicU64::new(0)),
         max_read_value: Arc::new(AtomicU64::new(0)),
+        guard_monotonic: mode == Mode::Lin,
+        regression: Arc::new(AtomicU64::new(0)),
         hist: Arc::new(Mutex::new(
             Histogram::new_with_bounds(1, HIST_MAX_NS, 3).expect("histogram"),
         )),
@@ -608,6 +625,7 @@ fn run_read_measurement(
     let overwritten = Arc::clone(&ctx.overwritten);
     let last_response_ns = Arc::clone(&ctx.last_response_ns);
     let max_read_value = Arc::clone(&ctx.max_read_value);
+    let regression = Arc::clone(&ctx.regression);
     let hist = Arc::clone(&ctx.hist);
 
     let matcher = {
@@ -723,6 +741,7 @@ fn run_read_measurement(
             p50_ms,
             p99_ms,
             max_read_value: max_read_value.load(Ordering::Relaxed),
+            regression: regression.load(Ordering::Relaxed),
         },
         occupancy,
     )
@@ -742,15 +761,61 @@ fn await_serving(cnc: &CncPage, timeout: Duration) {
     }
 }
 
-/// Background write load. Task 3 ships the no-op (`write_rate` is ignored);
-/// Task 4 replaces the body with the real paced writer.
+/// Background write load for the mixed arm: a paced submitter on its OWN
+/// `client_id`, so its responses are filtered out of the read matcher at the
+/// `cid != ctx.client_id` check and cannot inflate the read rate.
+///
+/// Returns `None` when `write_rate == 0` (the read-only arm), which is what
+/// makes that arm the clean isolation: with no writes in flight,
+/// `service_applied >= commit_at` already holds when a read is admitted, so the
+/// frontier wait is free and the A/B delta is the barrier alone.
 fn spawn_writer(
-    _instance_dir: &Path,
-    _app_id: &str,
-    _write_rate: u64,
-    _stop: Arc<AtomicBool>,
+    instance_dir: &Path,
+    app_id: &str,
+    write_rate: u64,
+    stop: Arc<AtomicBool>,
 ) -> Option<thread::JoinHandle<()>> {
-    None
+    if write_rate == 0 {
+        return None;
+    }
+    let dir = instance_dir.to_path_buf();
+    let app_id = app_id.to_string();
+    Some(
+        thread::Builder::new()
+            .name("rp-writer".into())
+            .spawn(move || {
+                let cnc = CncPage::open_file(&dir.join(CNC_FILE), &app_id)
+                    .unwrap_or_else(|e| panic!("writer cnc attach: {e}"));
+                let client_id = cnc.status().next_client_id.fetch_add(1) as u32;
+                let (ingress, _c) = MpscRing::open(&dir.join(INGRESS_RING))
+                    .unwrap_or_else(|e| panic!("writer open ingress.ring: {e}"))
+                    .into_split();
+                let payload =
+                    bincode::serde::encode_to_vec(vec![0xABu8; 64], bincode::config::standard())
+                        .expect("encode write payload");
+                let period = Duration::from_nanos(1_000_000_000 / write_rate.max(1));
+                let mut local_seq: u32 = 0;
+                let mut next = Instant::now();
+                while !stop.load(Ordering::Relaxed) {
+                    let now = Instant::now();
+                    if now < next {
+                        thread::sleep((next - now).min(Duration::from_millis(1)));
+                        continue;
+                    }
+                    next += period;
+                    if cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE == 0 {
+                        continue;
+                    }
+                    let extra = extra_client(client_id, local_seq);
+                    match ingress.try_write(MSG_V2_SUBMIT, 0, extra, &payload) {
+                        Ok(()) | Err(RingError::Full) => {}
+                        Err(e) => panic!("writer ingress.ring error: {e}"),
+                    }
+                    local_seq = local_seq.wrapping_add(1);
+                }
+            })
+            .expect("spawn writer thread"),
+    )
 }
 
 fn print_read_report(mode: Mode, readers: u64, write_rate: u64, s: &ReadStats, occ: &[Occupancy]) {
@@ -768,6 +833,7 @@ fn print_read_report(mode: Mode, readers: u64, write_rate: u64, s: &ReadStats, o
     println!("dup answers dropped   : {}", s.duplicates);
     println!("broadcast overwritten : {}", s.overwritten);
     println!("in-flight at end      : {}", s.inflight_at_end);
+    println!("read regression      : {}", s.regression);
     println!("elapsed (drain-incl.) : {:.3} s", s.elapsed.as_secs_f64());
     println!("reads/s               : {:.0}", s.reads_per_sec);
     println!("p50                   : {:.3} ms", s.p50_ms);
@@ -801,6 +867,13 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     );
     print_read_report(a.mode, readers, a.write_rate, &stats, &occ);
     stop_cluster(nodes, services);
+    anyhow::ensure!(
+        stats.regression == 0,
+        "LINEARIZABLE READ REGRESSED by {} — a read returned a value lower than one \
+         already returned. Either the harness is mis-wired or the read path is serving \
+         stale state; the throughput numbers above are meaningless either way.",
+        stats.regression
+    );
     anyhow::ensure!(stats.inflight_at_end == 0, "{} reads never resolved", stats.inflight_at_end);
     Ok(())
 }
@@ -819,6 +892,13 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
         task_dir,
     );
     print_read_report(a.mode, readers, a.write_rate, &stats, &occ);
+    anyhow::ensure!(
+        stats.regression == 0,
+        "LINEARIZABLE READ REGRESSED by {} — a read returned a value lower than one \
+         already returned. Either the harness is mis-wired or the read path is serving \
+         stale state; the throughput numbers above are meaningless either way.",
+        stats.regression
+    );
     anyhow::ensure!(
         stats.inflight_at_end == 0,
         "{} reads never resolved — the run did not complete; its numbers describe nothing",
