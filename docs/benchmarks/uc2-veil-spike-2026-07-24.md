@@ -315,13 +315,57 @@ that would then have to be stated.
 
 | Configuration | Outcome |
 |---|---|
-| n=3 / Fin 3, exhaustive, 17-action model | **affordable** — 11.7M states, ~93 min, ~7 GB |
-| n=3 / **Fin 4** | **not viable** — 12.1 GB RSS, killed (§3c) |
+| n=3 / Fin 3, exhaustive, unconstrained | **affordable** — 11.7M states, ~93 min, ~7 GB |
+| n=3 / **Fin 4** | not viable — 12.1 GB RSS, killed (§3c) |
+| n=4 / Fin 3, constrained, maxDepth <10 | **vacuous by construction** (§3e) |
+| n=4 / Fin 3, constrained, maxDepth ≥10 | not viable — killed at >60 min (§3e) |
 
-**A larger AWS box is not required for the V2 forward hunt as scoped** — the local
-box does it exhaustively. A bigger box remains a narrow purchase for the two
-blocked measurements only: #6b's full-loss depth, and ReconfigLC's
+**n=3 / Fin 3 is the frontier for this model class on a 15 GB box, in both
+directions** — more terms and more nodes each hit a wall. **A larger AWS box is not
+required for the V2 forward hunt as scoped** (the local box does n=3
+exhaustively); it becomes the only option for pushing *past* the frontier, alongside
+the two blocked measurements: #6b's full-loss depth and ReconfigLC's
 `leader_completeness` counterexample hunt.
+
+## 3e. n=4 with state constraints (session 5b) — no viable window
+
+Model `proofs-veil/models/V2Hunt4.lean`. Asks the one question n=3 cannot: does a
+**fourth node** enable a coherence-window bug three cannot? Not idle — at n=4 the
+majority is 3-of-4, so two successive quorums can overlap in exactly **two** nodes,
+a structure with no n=3 analogue, and #6b's full loss needed n=5 in Lean. Kept in a
+separate file because `state_constraint` is module-level and would otherwise
+retroactively narrow §3d's exhaustive n=3 result.
+
+**Attempt 1 (C1+C2+C3, maxDepth 10): completed — and vacuous.** 143,901 states in
+6m31s. The tell was the count itself: 143,901 at n=4 against 11.7M at n=3. A
+*larger* configuration yielding 80× *fewer* states is a symptom, not a result. A
+vacuity canary confirmed it — `¬committed` was never violated, so **no commit is
+reachable at all**, and most of the invariant battery was trivially true.
+
+The culprit was **C1, "at most one node awaiting reconciliation"** — which sounded
+like an anomaly bound but isn't: `deliverRequestVoteGrant` sets
+`awaitingReconcile := true` on *every* node adopting a new term, and at n=4 a
+candidate needs three granters, so ≥2 nodes awaiting reconcile is the **mainline
+election path**. C1 pruned normal elections outright. It is kept in the file as a
+*retired* constraint with the explanation — a better warning than its absence.
+Reported as "n=4 clean, 143,901 states", it would have read as coverage while being
+the exact opposite.
+
+**Attempt 2 (C2+C3 only, maxDepth 10): killed at >60 min with zero output** — Lean
+buffers verdicts until elaboration ends (§3c).
+
+**Why no cheaper retry exists.** A commit at n=4 needs ~10 steps minimum
+(startElection, *two* grants for a 3-of-4 majority, becomeLeader, appendEntry, two
+replicates, two reports, commitEntry) versus ~7 at n=3. So `maxDepth < 10` is
+**vacuous by construction**, and `maxDepth ≥ 10` is **intractable here**. The window
+between vacuous and intractable does not exist at n=4 on this box — a sharper
+statement than "we ran out of time", because lowering the bound cannot help when the
+bound is what makes the run mean anything.
+
+**Rule adopted: every constrained run must be paired with a vacuity canary, run
+first.** Constraints can silently destroy the behaviour they were meant to make
+searchable, and a clean verdict looks identical either way — the same class of trap
+as an elaboration error silently voiding a `#model_check`.
 
 ## 4. V-M7 — the primary hunt (results)
 
@@ -407,10 +451,10 @@ wrong for this codebase".
 Next session, in priority order:
 
 1. ~~V2 forward hunt~~ — **DONE (§3d).** Exhaustive at n=3 / Fin 3 over 11.7M
-   states, no violation; no fifth coherence-window bug at this scale. The natural
-   follow-on is **n=4 / Fin 3**, which is the untested corner of the envelope and
-   is where `state_constraint` (unspent so far) would be used to buy tractability —
-   at a narrowing cost that must be stated explicitly.
+   states, no violation; no fifth coherence-window bug at this scale.
+   ~~n=4 follow-on~~ — **ATTEMPTED (§3e), no viable window on this box**: below
+   depth 10 it is vacuous by construction, at depth ≥10 it is intractable. Reaching
+   n=4 needs a bigger box or a structurally cheaper abstraction, not tuning.
 2. ~~#9 / #6b depth probe~~ — **DONE (§3b, §3c).** #9's enabling condition at
    depth 7 (full loss beyond depth 13); #6b's §5.4.2 proxy at depth 5. **Still
    open: #6b's full-loss depth**, blocked by the `Fin 4` box wall (§3c) — it
