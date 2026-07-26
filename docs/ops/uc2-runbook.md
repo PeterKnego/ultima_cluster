@@ -248,7 +248,7 @@ scenarios write directly); no new IPC ring, no new port.
 | `promote id` | 2 | id is a learner; its reported durable ≥ commit − slack (default: one admission window) | learner → voter |
 | `demote id` | 3 | id is a voter; would not leave 0 voters; id is not the leader's own | voter → learner |
 | `remove-learner id` | 4 | id is a learner | removed **and tombstoned** |
-| `remove-voter id` | 5 | id is a voter; would not leave 0 voters | removed **and tombstoned**; if `id` is the current leader, it keeps serving until its own removal **commits**, then steps down (→ §8's failover class) |
+| `remove-voter id` | 5 | id is a voter; would not leave 0 voters | removed **and tombstoned**; if `id` is the current leader, it keeps serving until its own removal **commits**, then steps down (the ~200 ms failover class) |
 
 ### Reason codes (`uc2ctl`'s refusal output / wire `reason` field)
 
@@ -323,8 +323,10 @@ FRESH id on that host (tombstoned ids never rejoin).
 **Leader self-removal**: `remove-voter <the-leader's-own-id>`, run against
 that same leader's own instance dir (or any node — it forwards). The leader
 keeps serving until its own removal **commits**, then steps down; the
-remaining voters elect a new leader (the existing ~200 ms failover class —
-§8). Zero committed entries are lost across the handoff.
+remaining voters elect a new leader (the existing ~200 ms failover class).
+Reads accepted during the window are served (§7); reads still in flight at the
+halt are answered `MSG_V2_RETRY`. Zero committed entries are lost across the
+handoff.
 
 ### Staleness warning (informational, never blocking)
 
@@ -391,7 +393,50 @@ config change is not a tested or safe configuration.
 
 ---
 
-## 7. Gate binaries
+## 7. The linearizable read path (Rung A batch-probe rounds)
+
+Since `16eff8f` (2026-07-26), linearizable reads are certified by **one shared
+in-flight READ_PROBE round** instead of a probe round per read: a round issued
+while reads are waiting certifies exactly the reads that were already parked
+when it went out (an ordering rule — never a position comparison), and the next
+round starts the moment the previous completes. Plain-language account:
+`docs/notes/uc2-read-barrier-explained.md`; normative spec:
+`docs/superpowers/specs/2026-07-26-uc2-rung-a-batch-probe-design.md`.
+
+What an operator needs to know:
+
+- **The wire is unchanged.** `READ_PROBE`/`READ_PROBE_ACK` datagrams are
+  byte-identical to pre-Rung-A; a follower cannot tell a shared round from a
+  per-read probe. A rolling upgrade is therefore version-mixed-safe **on the
+  read path** (the §6 rule still governs config changes: finish the roll before
+  reconfiguring).
+- **Probe traffic no longer scales with read rate.** At most one round is in
+  flight (~1 round per RTT, self-clocking, no knob); under datagram loss the
+  round retransmits every **2 ms** with the same nonce. The per-read **1 s**
+  deadline → `MSG_V2_RETRY` remains the outer backstop, unchanged.
+- **Envelope** (3×c6id.2xlarge fleet;
+  `docs/benchmarks/uc2-read-profile-2026-07-26-after-rung-a.md`):
+  ~953k linearizable reads/s at
+  p50 1.08 ms under 20k writes/s — within ~3% of barrier-less throughput. A
+  *lone* read still pays exactly one probe RTT (~0.16 ms LAN p50), same as
+  before; batching wins only appear under concurrent reads.
+- **Interaction with §6 reconfiguration:** any voter-set change voids the
+  in-flight round; parked reads are NOT dropped — they wait for the next round,
+  issued under the new config (worst case one extra round-trip, no
+  client-visible error). During **leader self-removal** the leader keeps
+  serving reads until its removal commits (each is certified by an ack set
+  that provably intersects every possible old- and new-config election
+  quorum); at the commit-time halt, anything still in flight is answered
+  `MSG_V2_RETRY` (since `9e7526b`) — clients redirect as usual.
+- **Diagnostics:** a burst of reads all resolving `RETRY` after ~1 s means the
+  round cannot reach quorum — partition or deposition, exactly what a per-read
+  barrier stall meant before. Sub-second read stalls under packet loss should
+  NOT occur (the 2 ms retransmit recovers them); if observed, suspect
+  something other than loss.
+
+---
+
+## 8. Gate binaries
 
 The `m*_gate` example binaries (`cargo run -p uc2_node --example m6_gate --
 all --secs N`) run the milestone scenarios and **exit 1 on an honest FAIL** — a
@@ -401,7 +446,7 @@ tmpfs with a quota) and want journals on a real disk; pass an explicit
 
 ---
 
-## 8. Reading an elle failure
+## 9. Reading an elle failure
 
 Two scripts adjudicate transactional safety with the vendored elle-cli 0.1.9
 (list-append workload). Both write histories to **disk** (`$HOME/.cache/uc2-elle*`),
@@ -423,7 +468,7 @@ hand for per-anomaly explanations + SVG cycle plots:
 - An `unknown` verdict is a cycle-search timeout, never a pass — shrink
   `ELLE_TARGET_OPS` (or raise the checker heap) and re-run.
 - A `serializable`-clean but `strong-serializable`-dirty history is a real-time
-  (stale-read) violation — suspect the READ_PROBE barrier / leader-change path.
+  (stale-read) violation — suspect the READ_PROBE round (§7) / leader-change path.
 
 ### `scripts/elle_mutation.sh` — the mutation tier / teeth (weekly)
 
@@ -449,7 +494,7 @@ catch. The clean-tier passes are never run mutated, so a clean-build
 
 ---
 
-## 9. Changing a proved kernel (commit.rs / reconcile.rs / log_ok)
+## 10. Changing a proved kernel (commit.rs / reconcile.rs / log_ok)
 
 The Lean model (`proofs/Uc2Model/`) mirrors these 1:1 and the nightly
 `lean-proofs` job replays 100k conformance vectors. When you change kernel
