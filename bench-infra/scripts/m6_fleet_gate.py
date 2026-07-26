@@ -34,6 +34,19 @@ the two gate binaries — spec §9.6's M7 fleet-gate row explicitly reuses them)
                  (subprocess for `--local`, ssh for `--fleet`), mirroring how
                  `Host.probe()` already reads a remote node's cnc.
 
+  --read-profile : NOT a gate — an INSTRUMENT. A 3-host read_profile ladder
+                 (`uc2_node/examples/read_profile.rs`; design spec
+                 `docs/superpowers/specs/2026-07-25-uc2-read-profile-design.md`,
+                 plan Task 7): one `node` + one `service` per host, the
+                 measuring `client` on the leader's host (the query ring is
+                 same-host shared memory), sweeping
+                 `--readers x {lin,snap} x {0, W}` with a FRESH cluster per
+                 rung. The pre-committed decision rule is NEVER re-implemented
+                 here: the rung JSON lines the clients print are collected to a
+                 file and `read_profile decide --rungs FILE` returns the
+                 verdict. Exit 0 even for an unfavourable verdict; exit 1 only
+                 on harness failure. See the "read-profile mode" section.
+
 Two host-connectivity modes, SAME scenario logic (both milestones):
   --local  : all nodes are local processes on 127.0.0.1 (loopback UDP, real
              separate processes — validates the orchestrator + is itself a
@@ -119,12 +132,18 @@ def assert_durable_fs(fstype, where, host):
 class LocalHost:
     """A node that runs as local subprocesses (loopback UDP)."""
 
-    def __init__(self, gate_bin, node_dir, log_dir, ctl_bin=None):
+    def __init__(self, gate_bin, node_dir, log_dir, ctl_bin=None, probe_bin=None):
         self.gate = gate_bin
         self.dir = str(node_dir)
         self.logs = Path(log_dir)
         self.procs = {}  # unit -> Popen
         self.ctl_bin = ctl_bin  # M7 only: path to the uc2ctl binary
+        # Binary that serves the `probe` role. Defaults to the gate binary
+        # (M6/M7: same binary owns node/service/probe). --read-profile splits
+        # them: `read_profile` has no `probe` role, so the read-profile mode
+        # points this at `m7_gate` — its `probe` only opens `cnc2.dat` with an
+        # `--app-id` and prints the counters, which is app-agnostic.
+        self.probe_bin = probe_bin or gate_bin
 
     def bind_addr(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -163,6 +182,33 @@ class LocalHost:
         p = self.procs.get(unit)
         return None if p is None else p.poll()
 
+    def unit_pid(self, unit):
+        """PID of a running unit, or None. Read-profile mode only: the client's
+        `--node-pid` / `--service-pid` feed a DIAGNOSTIC /proc occupancy sample
+        and nothing else — a None here costs the run nothing (the decision rule
+        does not use the sample). `start_unit` execs the binary directly, so the
+        Popen pid IS the node/service process."""
+        p = self.procs.get(unit)
+        return None if p is None or p.poll() is not None else p.pid
+
+    def run_foreground(self, args, timeout):
+        """Run a NON-daemon role to completion and return `(rc, combined_out)`.
+        Distinct from `start_unit`, which fires off a parked daemon and never
+        looks at its output: the read-profile `client` role exits on its own and
+        its stdout carries the rung JSON line, while a NONZERO exit means the
+        rung failed its validity checks and deliberately emitted no such line
+        (spec §6 threat 6) — so both halves have to come back to the caller."""
+        try:
+            r = subprocess.run([self.gate] + args, capture_output=True, text=True,
+                               timeout=timeout)
+            return r.returncode, (r.stdout or "") + (r.stderr or "")
+        except subprocess.TimeoutExpired as e:
+            out = (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) \
+                else (e.stdout or "")
+            err = (e.stderr or b"").decode(errors="replace") if isinstance(e.stderr, bytes) \
+                else (e.stderr or "")
+            return 124, out + err + f"\n[orchestrator] TIMEOUT after {timeout}s\n"
+
     def divergence_detected(self, unit):
         """Fix 1: the loadclient divergence signal comes from its LOG, not its
         exit code — both m6_gate/m7_gate's loadclient print an unambiguous
@@ -183,7 +229,7 @@ class LocalHost:
         measures an on-host commit rate (see `m7_gate probe --rate-secs`) —
         the returned dict then carries a `"rate"` field. `rate_secs == 0`
         (default): unchanged, instant single-sample read."""
-        args = [self.gate, "probe", "--instance-dir", self.dir, "--app-id", APP]
+        args = [self.probe_bin, "probe", "--instance-dir", self.dir, "--app-id", APP]
         if rate_secs > 0:
             args += ["--rate-secs", str(rate_secs)]
         out = subprocess.check_output(args, text=True, timeout=15 + rate_secs)
@@ -199,7 +245,7 @@ class LocalHost:
         path = self.logs / f"rateprobe-{time.time_ns()}.json"
         f = open(path, "w")
         p = subprocess.Popen(
-            [self.gate, "probe", "--instance-dir", self.dir, "--app-id", APP,
+            [self.probe_bin, "probe", "--instance-dir", self.dir, "--app-id", APP,
              "--rate-secs", str(secs)],
             stdout=f, stderr=subprocess.DEVNULL,
         )
@@ -271,7 +317,8 @@ class SshHost:
     UC_SRC = "/opt/bench/uc"
 
     def __init__(self, gate_bin, node_dir, public_ip, private_ip, ssh_user, ssh_key,
-                 ctl_bin=None, unit_prefix="m6", remote_root="/opt/bench/m6"):
+                 ctl_bin=None, unit_prefix="m6", remote_root="/opt/bench/m6",
+                 probe_bin=None):
         self.gate = gate_bin           # path to the gate binary ON the remote host
         self.dir = str(node_dir)       # instance dir ON the remote host
         self.public_ip = public_ip
@@ -282,6 +329,8 @@ class SshHost:
         self.ctl_bin = ctl_bin          # M7 only: path to uc2ctl on the remote host
         self.unit_prefix = unit_prefix  # systemd unit / log-file name prefix
         self.remote_root = remote_root  # instance-dir parent on the remote host
+        # See `LocalHost.__init__` for why this is separable from `gate`.
+        self.probe_bin = probe_bin or gate_bin
 
     def _ssh(self, cmd, **kw):
         # SSH_AUTH_SOCK is left to the caller's env (unset it before running the
@@ -372,6 +421,36 @@ class SshHost:
             return None
         return code
 
+    def unit_pid(self, unit):
+        """See `LocalHost.unit_pid` (diagnostic-only PIDs). systemd's MainPID is
+        the `ExecStart` process — i.e. the gate binary itself — and reads 0 for
+        a unit that is not running."""
+        r = self._ssh(
+            f"systemctl show -p MainPID --value {self.unit_prefix}-{unit} 2>/dev/null",
+            capture_output=True,
+        )
+        try:
+            pid = int((r.stdout or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return None
+        return pid or None
+
+    def run_foreground(self, args, timeout):
+        """See `LocalHost.run_foreground`. Fleet equivalent: a plain BLOCKING
+        ssh command, not `systemd-run` — the read-profile `client` role runs for
+        `--secs` and exits, so it is the same shape as `probe --rate-secs`
+        (which already blocks for its whole window over ssh). systemd-run is
+        only needed for the roles that PARK forever, where a bare `ssh ... &`
+        hangs the connection."""
+        quoted = " ".join(f"'{a}'" for a in args)
+        try:
+            r = self._ssh(f"sudo {self.gate} {quoted}", capture_output=True, timeout=timeout)
+            return r.returncode, (r.stdout or "") + (r.stderr or "")
+        except subprocess.TimeoutExpired as e:
+            out = e.stdout if isinstance(e.stdout, str) else (e.stdout or b"").decode(errors="replace")
+            err = e.stderr if isinstance(e.stderr, str) else (e.stderr or b"").decode(errors="replace")
+            return 124, (out or "") + (err or "") + f"\n[orchestrator] TIMEOUT after {timeout}s\n"
+
     def divergence_detected(self, unit):
         """See `LocalHost.divergence_detected` — same log-grep signal, over
         ssh, against the unit's append-log file (the same path `start_unit`
@@ -381,7 +460,7 @@ class SshHost:
         return r.returncode == 0
 
     def probe(self, rate_secs=0.0):
-        cmd = f"sudo {self.gate} probe --instance-dir {self.dir} --app-id {APP}"
+        cmd = f"sudo {self.probe_bin} probe --instance-dir {self.dir} --app-id {APP}"
         if rate_secs > 0:
             cmd += f" --rate-secs {rate_secs}"
         r = self._ssh(cmd, capture_output=True)
@@ -399,7 +478,7 @@ class SshHost:
         cmd = (
             f"sudo rm -f {path}; "
             f"sudo systemd-run --unit={unit} --collect -p StandardOutput=file:{path} "
-            f"{self.gate} probe --instance-dir {self.dir} --app-id {APP} --rate-secs {secs}"
+            f"{self.probe_bin} probe --instance-dir {self.dir} --app-id {APP} --rate-secs {secs}"
         )
         r = self._ssh(cmd, capture_output=True)
         if r.returncode != 0:
@@ -1139,9 +1218,298 @@ def run_gate_m7(hosts, members_seed, stop_file):
     return ok, verdicts
 
 
+# --------------------------------------------------------- read-profile mode
+#
+# `--read-profile` runs the linearizable-read profile ladder of
+# `uc2_node/examples/read_profile.rs` across 3 hosts (one `node` + one
+# `service` per host, the measuring `client` on the leader's host because the
+# query ring is same-host shared memory). Design:
+# `docs/superpowers/specs/2026-07-25-uc2-read-profile-design.md`; plan Task 7.
+#
+# THIS IS AN INSTRUMENT, NOT A GATE. The decision rule (spec §2) is a
+# pre-commitment implemented and unit-tested in Rust — `evaluate_decision_rule`
+# — and is NEVER re-implemented here: the orchestrator collects one rung JSON
+# line per client run and shells out to `read_profile decide --rungs FILE` for
+# the verdict. A rule re-derived in Python would sit outside the tests that pin
+# it and would stop being a pre-commitment. Consequently an unfavourable (or
+# INCONCLUSIVE) verdict still exits 0; only HARNESS failure exits 1.
+#
+# Three structural facts drive the shape below:
+#   * Fresh cluster per rung (M6/M7's own teardown discipline): no rung inherits
+#     the previous one's leader, warm buffers, or journal.
+#   * BOTH write mixes are required. Clause (b) is evaluated on the READ-ONLY
+#     arm, so a sweep missing `--write-rate 0` cannot produce a verdict at all.
+#   * Exit codes are the validity signal, not stdout. A client that fails its
+#     validity checks (`inflight_at_end != 0`, or a read regression) exits
+#     nonzero and deliberately prints NO rung JSON line — spec §6 threat 6 calls
+#     such a rung INVALID, not merely suspicious. Teeing stdout without checking
+#     the exit code would silently drop rungs that must be reported as failures,
+#     so `rp_run_rung` records the failure and never fabricates a substitute.
+
+RP_LEADER_WAIT = 40.0     # s — same budget M6/M7 give a fresh cluster's election
+RP_BOOT_SETTLE = 2.0      # s — node -> service start gap (M6/M7 use the same)
+RP_CLIENT_SLACK = 180.0   # s — added to --secs for the client's own leader wait
+                          #     (30 s), write ramp, and 5 s drain grace
+RP_MODES = ("lin", "snap")
+
+
+def rp_members(hosts):
+    """`id@addr` seed for the 3 read-profile voters. Addresses are the ones
+    `main()` already pinned onto hosts 0-2 (local `bind_addr()` mints a fresh
+    ephemeral port on every call — the M7 bug re-learned here would be a node
+    listening on a port no peer replicates to)."""
+    return ",".join(f"{i}@{hosts[i].bind_addr()}" for i in range(3))
+
+
+def rp_start_cluster(hosts, members, admission_kib):
+    """Boot a FRESH 3-node read_profile cluster and return the leader's host
+    index (or None if no single leader appeared). Mirrors `run_gate`'s bring-up
+    order exactly: wipe every instance dir, start the nodes, settle, start the
+    services, then `wait_leader` — which itself raises on split-brain (two hosts
+    reporting leader+can_serve)."""
+    for h in hosts:
+        h.reset_dir()
+    for i in range(3):
+        hosts[i].start_unit("node", [
+            "node", "--id", str(i), "--bind", hosts[i].bind_addr(),
+            "--instance-dir", hosts[i].dir, "--members", members,
+            "--app-id", APP, "--admission-kib", str(admission_kib),
+        ])
+    time.sleep(RP_BOOT_SETTLE)
+    for i in range(3):
+        hosts[i].start_unit("service", [
+            "service", "--instance-dir", hosts[i].dir, "--app-id", APP,
+        ])
+    return wait_leader(hosts, [0, 1, 2], RP_LEADER_WAIT)
+
+
+def rp_assert_single_serving(hosts, when):
+    """Re-check, AFTER the measured window, that exactly one host still reports
+    leader+can_serve. `wait_leader` only proves it at boot; the requirement is
+    that two hosts never serve at any point in a rung. A host whose probe fails
+    (node gone) is not 'serving' and does not trip this."""
+    serving = []
+    for i in range(3):
+        try:
+            p = hosts[i].probe()
+            if p["leader"] and p["can_serve"]:
+                serving.append(i)
+        except Exception:
+            pass
+    if len(serving) > 1:
+        raise RuntimeError(f"split-brain {when}: hosts {serving} all serve")
+    return serving
+
+
+def rp_extract_rung(out):
+    """Return the client's machine-readable rung JSON line, or None. The client
+    prints its human report first and the rung line last; anything that parses
+    as an object carrying `"rung"` is it."""
+    found = None
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.startswith("{") or '"rung"' not in line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "rung" in obj:
+            found = line
+    return found
+
+
+def rp_regression(out, rung_line):
+    """Reads-went-backwards signal for a rung, from BOTH places it can appear:
+    the report's `read regression : N` line (printed even on the failing path,
+    before the client's `ensure` aborts) and the rung JSON's own field. A
+    nonzero here is a HARNESS-level failure — the numbers describe nothing and
+    the run must exit 1 — so it is read defensively rather than trusted to one
+    source."""
+    worst = 0
+    for line in out.splitlines():
+        if "read regression" in line and ":" in line:
+            try:
+                worst = max(worst, int(line.split(":", 1)[1].strip()))
+            except ValueError:
+                pass
+    if "READ REGRESSED" in out:
+        worst = max(worst, 1)
+    if rung_line:
+        try:
+            worst = max(worst, int(json.loads(rung_line).get("regression", 0)))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return worst
+
+
+def rp_run_rung(hosts, members, readers, mode, write_rate, secs, admission_kib, out_dir):
+    """One rung: fresh cluster, one `client` run on the leader's host, teardown.
+
+    Returns `(ok, rung_line_or_None, regression, detail)`. `ok` is False for any
+    rung that did not produce a valid measurement — no leader, split-brain, or a
+    nonzero client exit."""
+    tag = f"w{write_rate}-{mode}-r{readers}"
+    log(f"-- rung {tag}: booting a fresh 3-node cluster")
+    try:
+        leader = rp_start_cluster(hosts, members, admission_kib)
+    except RuntimeError as e:          # split-brain out of wait_leader
+        return False, None, 0, f"cluster bring-up failed: {e}"
+    if leader is None:
+        return False, None, 0, f"no leader elected within {RP_LEADER_WAIT:.0f}s"
+    log(f"-- rung {tag}: leader is host {leader}; running client there")
+
+    args = [
+        "client", "--instance-dir", hosts[leader].dir, "--app-id", APP,
+        "--secs", str(secs), "--readers", str(readers),
+        "--mode", mode, "--write-rate", str(write_rate),
+    ]
+    # DIAGNOSTIC only (agent yield-rate sample). Absence does not impair the
+    # run: clause (b) no longer uses the occupancy ranking, so a missing pid is
+    # not worth failing — or even warning loudly — over.
+    for flag, unit in (("--node-pid", "node"), ("--service-pid", "service")):
+        try:
+            pid = hosts[leader].unit_pid(unit)
+        except Exception:
+            pid = None
+        if pid:
+            args += [flag, str(pid)]
+
+    rc, out = hosts[leader].run_foreground(args, timeout=secs + RP_CLIENT_SLACK)
+    (out_dir / f"client-{tag}.log").write_text(out)
+
+    rung_line = rp_extract_rung(out) if rc == 0 else None
+    regression = rp_regression(out, rung_line)
+
+    try:
+        rp_assert_single_serving(hosts, f"after rung {tag}")
+    except RuntimeError as e:
+        return False, None, regression, str(e)
+
+    if rc != 0:
+        tail = " | ".join(l for l in out.strip().splitlines()[-4:])
+        return False, None, regression, f"client exited {rc} (INVALID rung, no JSON emitted): {tail}"
+    if rung_line is None:
+        return False, None, regression, "client exited 0 but printed no rung JSON line"
+    return True, rung_line, regression, "ok"
+
+
+def rp_decide(decide_bin, rungs_path, write_rate, hosts, out_dir):
+    """Shell out to `read_profile decide` for the verdict — never re-implement
+    the rule here (see the section header). Prefers a LOCAL binary; on a fleet
+    where the example was only ever built remotely (rsync ships the tree, ansible
+    builds as root on the hosts) it falls back to running `decide` on host 0 with
+    the rung file piped over ssh. `decide` is a pure function of the file, so
+    where it runs is immaterial."""
+    text = rungs_path.read_text()
+    if decide_bin and Path(decide_bin).exists():
+        r = subprocess.run([decide_bin, "decide", "--rungs", str(rungs_path),
+                            "--write-rate", str(write_rate)],
+                           capture_output=True, text=True, timeout=120)
+        out, rc = (r.stdout or "") + (r.stderr or ""), r.returncode
+    elif hosts and hasattr(hosts[0], "_ssh"):
+        remote = f"{hosts[0].remote_root}/rungs.jsonl"
+        hosts[0]._ssh(f"sudo tee {remote} >/dev/null", input=text, capture_output=True)
+        r = hosts[0]._ssh(
+            f"sudo {hosts[0].gate} decide --rungs {remote} --write-rate {write_rate}",
+            capture_output=True,
+        )
+        out, rc = (r.stdout or "") + (r.stderr or ""), r.returncode
+    else:
+        return 1, f"no read_profile binary available to run `decide` (looked at {decide_bin})"
+    (out_dir / f"verdict-write-rate-{write_rate}.txt").write_text(out)
+    return rc, out
+
+
+def run_read_profile(hosts, members, sweep, secs, write_rate, admission_kib,
+                     decide_bin, out_dir):
+    """The read-profile sweep: `readers` x {lin,snap} x {0, write_rate}, a fresh
+    cluster per rung, then the Rust decision rule over the collected rungs.
+
+    Returns `(harness_ok, verdicts)` — `harness_ok` False ONLY on harness
+    failure (a nonzero read regression on any rung, or client failures on more
+    than one rung). An unfavourable or INCONCLUSIVE verdict is a RESULT, not a
+    failure: this mode is an instrument."""
+    verdicts = []
+    rung_lines, failures, regressions = [], [], []
+    mixes = [0, write_rate] if write_rate else [0]
+    if not write_rate:
+        log("NOTE: --rp-write-rate 0 — running the read-only arm only. The mixed "
+            "arm is then absent; clause (b) is still evaluable (it reads the "
+            "read-only arm), but the mixed-mix verdict will not exist.")
+
+    total = len(mixes) * len(sweep) * len(RP_MODES)
+    n = 0
+    for mix in mixes:
+        for readers in sweep:
+            for mode in RP_MODES:
+                n += 1
+                log(f"== rung {n}/{total}: readers={readers} mode={mode} writes/s={mix} ==")
+                try:
+                    ok, line, regression, detail = rp_run_rung(
+                        hosts, members, readers, mode, mix, secs, admission_kib, out_dir)
+                except Exception as e:   # bring-up/probe blew up: one failed rung
+                    ok, line, regression, detail = False, None, 0, f"orchestrator error: {e!r}"
+                finally:
+                    for h in hosts:
+                        try:
+                            h.teardown()
+                        except Exception:
+                            pass
+                if regression:
+                    # Loud, and fatal to the RUN: a read returned a value lower
+                    # than one already returned. Either the harness is mis-wired
+                    # or the read path served stale state; every number in the
+                    # sweep is suspect until that is explained.
+                    log(f"  *** READ REGRESSION on rung {mode}/r{readers}/w{mix}: {regression} ***")
+                    regressions.append(f"{mode}/r{readers}/w{mix}={regression}")
+                if ok:
+                    rung_lines.append(line)
+                    log(f"  rung collected: {line}")
+                else:
+                    log(f"  *** RUNG FAILED ({mode}/r{readers}/w{mix}): {detail}")
+                    failures.append(f"{mode}/r{readers}/w{mix}: {detail}")
+
+    rungs_path = out_dir / "rungs.jsonl"
+    rungs_path.write_text("".join(l + "\n" for l in rung_lines))
+    log(f"collected {len(rung_lines)}/{total} rungs -> {rungs_path}")
+    verdicts.append((
+        "rung-collection",
+        len(failures) <= 1,
+        f"{len(rung_lines)}/{total} rungs valid, {len(failures)} client failure(s)"
+        + ("; " + " | ".join(failures) if failures else ""),
+    ))
+
+    # The verdict, from the SAME Rust rule its unit tests pin — one evaluation
+    # per write mix present (clause (b) always reads the read-only rungs out of
+    # the same file, whichever mix is being reported).
+    if rung_lines:
+        for mix in mixes:
+            log(f"== decision rule (write_rate={mix}) ==")
+            rc, out = rp_decide(decide_bin, rungs_path, mix, hosts, out_dir)
+            print(out, flush=True)
+            verdict_line = next(
+                (l.strip() for l in out.splitlines() if l.strip().startswith("VERDICT:")),
+                "<no VERDICT line — see the decide output>",
+            )
+            verdicts.append((
+                f"decide(write_rate={mix})",
+                True,   # a verdict is a RESULT; only harness failure fails the run
+                verdict_line if rc == 0 else f"decide exited {rc}: {verdict_line}",
+            ))
+    else:
+        verdicts.append(("decide", False, "no valid rungs to evaluate"))
+
+    harness_ok = not regressions and len(failures) <= 1
+    if regressions:
+        verdicts.append(("read-regression-guard", False, "; ".join(regressions)))
+    log(f"artifacts: {out_dir}")
+    return harness_ok, verdicts
+
+
 # ---------------------------------------------------------------- entrypoints
 
-def build_local_hosts(gate_bin, root, count=4, ctl_bin=None):
+def build_local_hosts(gate_bin, root, count=4, ctl_bin=None, probe_bin=None):
     root = Path(root)
     if root.exists():
         subprocess.run(["rm", "-rf", str(root)], check=True)
@@ -1161,12 +1529,14 @@ def build_local_hosts(gate_bin, root, count=4, ctl_bin=None):
         # logs don't clobber each other.
         log_dir = root / f"log{i}"
         log_dir.mkdir()
-        hosts.append(LocalHost(gate_bin, node_dir, log_dir, ctl_bin=ctl_bin))
+        hosts.append(LocalHost(gate_bin, node_dir, log_dir, ctl_bin=ctl_bin,
+                               probe_bin=probe_bin))
     return hosts
 
 
 def build_fleet_hosts(gate_bin, ssh_user, ssh_key, hosts_arg, count=4,
-                       ctl_bin=None, unit_prefix="m6", remote_root="/opt/bench/m6"):
+                       ctl_bin=None, unit_prefix="m6", remote_root="/opt/bench/m6",
+                       probe_bin=None):
     if hosts_arg:
         # "pub1/priv1,pub2/priv2,..." — `count` entries.
         entries = [tuple(h.split("/")) for h in hosts_arg.split(",")]
@@ -1184,6 +1554,7 @@ def build_fleet_hosts(gate_bin, ssh_user, ssh_key, hosts_arg, count=4,
         hosts.append(SshHost(
             gate_bin, f"{remote_root}/n{i}", pub, priv, ssh_user, ssh_key,
             ctl_bin=ctl_bin, unit_prefix=unit_prefix, remote_root=remote_root,
+            probe_bin=probe_bin,
         ))
     return hosts
 
@@ -1195,6 +1566,23 @@ def main():
     ap.add_argument("--local", action="store_true", help="run local processes (loopback UDP)")
     ap.add_argument("--fleet", action="store_true", help="run over ssh on remote hosts")
     ap.add_argument("--m7", action="store_true", help="run the M7 reconfig scenarios instead of M6")
+    ap.add_argument("--read-profile", action="store_true",
+                    help="run the read_profile linearizable-read ladder (3 hosts) instead of a gate")
+    ap.add_argument("--rp-readers", default="1,4,16,64,256,1024",
+                    help="read-profile: comma-separated concurrency sweep")
+    ap.add_argument("--rp-secs", type=int, default=20,
+                    help="read-profile: measured seconds per rung")
+    ap.add_argument("--rp-write-rate", type=int, default=20000,
+                    help="read-profile: writes/s for the MIXED arm (the read-only arm, "
+                         "write_rate=0, is always run — clause (b) needs it)")
+    ap.add_argument("--rp-admission-kib", type=int, default=256,
+                    help="read-profile: node admission window (the harness default)")
+    ap.add_argument("--rp-out", default="",
+                    help="read-profile: artifact dir (default /home/claude/.cache/"
+                         "uc2-read-profile/<ts>; must NOT be under /tmp — RAM tmpfs)")
+    ap.add_argument("--rp-decide-bin", default="",
+                    help="read-profile: LOCAL read_profile binary used for `decide` "
+                         "(fleet fallback: runs it on host 0 over ssh)")
     ap.add_argument("--bin", default="", help="path to the gate binary (m6_gate/m7_gate)")
     ap.add_argument("--ctl-bin", default="", help="M7: path to the uc2ctl binary")
     ap.add_argument("--root", default="/home/claude/.cache/m6_fleet", help="local root dir")
@@ -1206,9 +1594,18 @@ def main():
 
     if args.local == args.fleet:
         raise SystemExit("choose exactly one of --local / --fleet")
+    if args.m7 and args.read_profile:
+        raise SystemExit("--m7 and --read-profile are different experiments; choose one")
 
-    n_hosts = 5 if args.m7 else 4
-    gate_name = "m7_gate" if args.m7 else "m6_gate"
+    # read-profile: 3 hosts, the `read_profile` example as the role binary.
+    # `read_profile` has NO `probe` role, so leader detection borrows m7_gate's
+    # (it only opens `cnc2.dat` under an --app-id — app-agnostic); `probe_bin`
+    # is the seam. APP is the read_profile roles' default app id.
+    n_hosts = 3 if args.read_profile else (5 if args.m7 else 4)
+    gate_name = "read_profile" if args.read_profile else ("m7_gate" if args.m7 else "m6_gate")
+    probe_name = "m7_gate" if args.read_profile else gate_name
+    if args.read_profile:
+        APP = "uc2-read-profile"
     if args.m7:
         APP = "m7-gate"
         if args.local:
@@ -1219,27 +1616,46 @@ def main():
             M7_LOAD_ARGS = ["--rate", "300"]
 
     if args.local:
-        gate = args.bin or f"/home/claude/.cache/cargo-target/release/examples/{gate_name}"
-        ctl_bin = (args.ctl_bin or "/home/claude/.cache/cargo-target/release/examples/uc2ctl") if args.m7 else None
-        hosts = build_local_hosts(gate, args.root, count=n_hosts, ctl_bin=ctl_bin)
+        local_examples = "/home/claude/.cache/cargo-target/release/examples"
+        gate = args.bin or f"{local_examples}/{gate_name}"
+        probe_bin = f"{local_examples}/{probe_name}"
+        ctl_bin = (args.ctl_bin or f"{local_examples}/uc2ctl") if args.m7 else None
+        hosts = build_local_hosts(gate, args.root, count=n_hosts, ctl_bin=ctl_bin,
+                                  probe_bin=probe_bin)
         stop_file = str(Path(args.root) / "STOP")
+        # `decide` is a pure function of the rung file; locally it is the same
+        # binary that ran the rungs.
+        decide_bin = args.rp_decide_bin or gate
     else:
-        gate = args.bin or f"/opt/bench/uc/target/release/examples/{gate_name}"
-        ctl_bin = (args.ctl_bin or "/opt/bench/uc/target/release/examples/uc2ctl") if args.m7 else None
-        remote_root = "/opt/bench/m7" if args.m7 else "/opt/bench/m6"
+        remote_examples = "/opt/bench/uc/target/release/examples"
+        gate = args.bin or f"{remote_examples}/{gate_name}"
+        probe_bin = f"{remote_examples}/{probe_name}"
+        ctl_bin = (args.ctl_bin or f"{remote_examples}/uc2ctl") if args.m7 else None
+        remote_root = ("/opt/bench/rp" if args.read_profile
+                       else ("/opt/bench/m7" if args.m7 else "/opt/bench/m6"))
+        unit_prefix = "rp" if args.read_profile else ("m7" if args.m7 else "m6")
         hosts = build_fleet_hosts(
             gate, args.ssh_user, args.ssh_key, args.hosts, count=n_hosts,
-            ctl_bin=ctl_bin, unit_prefix=("m7" if args.m7 else "m6"), remote_root=remote_root,
+            ctl_bin=ctl_bin, unit_prefix=unit_prefix, remote_root=remote_root,
+            probe_bin=probe_bin,
         )
         # Fleet: build the example(s) on each host (release builds no examples
         # by default) + mkdir the instance-dir parent. The loadclient
         # stop-file lives on whichever remote host currently runs it and is
         # never created locally; teardown kills the unit instead.
         stop_file = f"{remote_root}_STOP"
-        examples = (gate_name, "uc2ctl") if args.m7 else (gate_name,)
+        if args.read_profile:
+            # m7_gate too: it supplies the `probe` role read_profile lacks.
+            examples = (gate_name, probe_name)
+        else:
+            examples = (gate_name, "uc2ctl") if args.m7 else (gate_name,)
         log(f"preparing fleet hosts (build {', '.join(examples)} + mkdir)...")
         for h in hosts:
             h.prepare(examples=examples)
+        # No local build is implied by a fleet run (rsync ships the tree;
+        # ansible builds ON the hosts), so `decide` may have to run remotely —
+        # `rp_decide` falls back to host 0 when this path does not exist.
+        decide_bin = args.rp_decide_bin
 
     addr = {i: hosts[i].bind_addr() for i in range(n_hosts)}
     # Re-pin the ORIGINAL voters' addresses onto their hosts so start_node
@@ -1250,8 +1666,9 @@ def main():
     for i in range(3):  # the 3 original voters, in both M6 and M7 topologies
         hosts[i]._fixed_addr = addr[i]
         hosts[i].bind_addr = (lambda h=hosts[i]: h._fixed_addr)
-    if not args.m7:
+    if not args.m7 and not args.read_profile:
         # M6: the 4th host is a single pre-provisioned learner, fixed too.
+        # (read-profile has exactly 3 hosts and no learner at all.)
         hosts[3]._fixed_addr = addr[3]
         hosts[3].bind_addr = (lambda h=hosts[3]: h._fixed_addr)
 
@@ -1263,11 +1680,36 @@ def main():
 
     mode = "LOCAL" if args.local else "FLEET"
     conn = f"{n_hosts} procs, loopback UDP" if args.local else f"{n_hosts} hosts"
-    log(f"== {'M7' if args.m7 else 'M6'} {mode} ({conn}) gate ==")
+    what = "READ-PROFILE" if args.read_profile else ("M7" if args.m7 else "M6")
+    log(f"== {what} {mode} ({conn}) {'ladder' if args.read_profile else 'gate'} ==")
     ok = False
     verdicts = []
     try:
-        if args.m7:
+        if args.read_profile:
+            sweep = [int(x) for x in args.rp_readers.split(",") if x.strip()]
+            if not sweep:
+                raise SystemExit("--rp-readers is empty")
+            out_dir = Path(args.rp_out or (
+                "/home/claude/.cache/uc2-read-profile/" + time.strftime("%Y%m%d-%H%M%S")))
+            # Artifacts are logs, not journals — but /tmp on the dev box is
+            # RAM-backed with no swap (CLAUDE.md), and a sweep's client logs
+            # are not what should be competing with the nodes for RAM.
+            if str(out_dir.resolve()).startswith("/tmp"):
+                raise SystemExit(f"--rp-out {out_dir} is under /tmp (RAM tmpfs, no swap) — "
+                                 f"put run artifacts on real disk")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            members = ",".join(f"{i}@{addr[i]}" for i in range(3))
+            log(f"sweep: readers={sweep} x modes={list(RP_MODES)} x writes/s="
+                f"{[0, args.rp_write_rate] if args.rp_write_rate else [0]}, "
+                f"{args.rp_secs}s per rung, fresh cluster per rung")
+            log("*** INSTRUMENT, not a gate: an unfavourable verdict still exits 0 ***")
+            if args.local:
+                log("*** LOCAL: orchestration proof only — these numbers are NOT data "
+                    "(3 nodes + 3 services + client share one box) ***")
+            ok, verdicts = run_read_profile(
+                hosts, members, sweep, args.rp_secs, args.rp_write_rate,
+                args.rp_admission_kib, decide_bin, out_dir)
+        elif args.m7:
             members_seed = ",".join(f"{i}@{addr[i]}" for i in range(3))
             ok, verdicts = run_gate_m7(hosts, members_seed, stop_file)
         else:
@@ -1279,7 +1721,9 @@ def main():
         # Local: signal the loadclient to finish cleanly via its stop-file. Fleet:
         # the stop-file is on whichever remote host runs it (not reachable from
         # here) — the per-host teardown kills the loadclient unit instead.
-        if args.local:
+        if args.local and not args.read_profile:
+            # read-profile has no loadclient: its `client` role is foreground
+            # and already exited, so there is nothing to signal.
             Path(stop_file).write_text("stop")
             time.sleep(1.0)
         for h in hosts:
@@ -1291,7 +1735,15 @@ def main():
     log("== results ==")
     for name, v_ok, detail in verdicts:
         log(f"  [{'PASS' if v_ok else 'FAIL'}] {name} — {detail}")
-    log(f"RESULT: {'PASS' if ok else 'FAIL (honest)'}")
+    if args.read_profile:
+        # The VERDICT is printed above by `read_profile decide`; this line is
+        # only about whether the instrument ran. Exit 1 means the measurement
+        # is not trustworthy (a read regression, or client failures on more
+        # than one rung) — never "the rule declined to justify Rung A".
+        log(f"RESULT: run {'OK' if ok else 'FAILED (harness)'} — the verdict is the "
+            f"`decide` block above, and does not affect this exit code")
+    else:
+        log(f"RESULT: {'PASS' if ok else 'FAIL (honest)'}")
     sys.exit(0 if ok else 1)
 
 
