@@ -437,6 +437,58 @@ model:
 
 Both are expected to hold by construction; the value is a directed confirmation.
 
+### §5 DISCHARGED 2026-07-26 — both CONFIRMED-SAFE (directed Rust trace, post-Rung-A code)
+
+Run against `main` @ `29e324f`, i.e. AFTER the Rung A batch-probe rework of the
+read barrier, so the answers hold for the current read path, not the one this
+doc's line anchors point at.
+
+**Q1 (self-removed-leader read window): CONFIRMED-SAFE.** The window is real and
+deliberate — a self-removing leader keeps serving from append until the removing
+config commits (Ongaro's rule: C_new must be replicated by a leader that still
+exists; `adopt_config` defers the halt, election.rs:1307-1310) — but every read
+served in it is certified by an ack set that **intersects every possible C_new
+and C_old election quorum**: adoption-at-append re-derives the round quorum over
+C_new (`rebuild_peer_maps` also voids the in-flight round), and the removed
+leader needs ⌈n/2⌉ *genuine* C_new ackers on top of its (non-voter) self-seed —
+a set no C_new majority can avoid, with the follower ack-iff-term-equal filter
+making the intersection sound and the Rung A ordering rule guaranteeing ack
+sends postdate admission. At commit, `StepDownRemoved` → `halt()` → `do_work`
+short-circuits and the commit counter freezes. Notable subtlety the trace
+corrected: **commit does NOT imply a quorum of followers has already adopted**
+(Reports come from the receiver's durable counter; adoption waits for the
+consensus agent's archive-observation drain), so follower probe-refusal must
+never be cited as the guard — the quorum-intersection argument is.
+
+**Q2 (adopt-requires-committed-prefix): CONFIRMED-SAFE.** The Veil model's
+`adopt`-without-prefix move has no Rust counterpart: config frames are detected
+only in the archive's recorded-block walk over the CONTIGUOUS fsynced prefix
+(receiver publishes `append` only at the contiguous frontier; archive records
+and fsyncs only that prefix; the consensus drain belt-checks `position <=
+durable`), Reports carry exactly that contiguous durable frontier, commit is
+bounded by leader-own-durable, and the below-floor path substitutes committed
+snapshot state + the snapshot-carried authoritative config with
+empty-journal-only floor adoption. Adjacency needs no guard beyond the single
+shared `ClusterConfig::apply` (±1 voter, one change in flight).
+
+**Adjacent observations from the trace (non-blocking, recorded here):**
+
+1. **Liveness blemish:** reads admitted in the same duty cycle as
+   `StepDownRemoved` (raw `sm.can_serve()` window, ≤64 reads) are parked
+   forever — `do_work` short-circuits before their deadline can RETRY them;
+   client timeout is the only recovery. Bounded, liveness-only.
+2. `maybe_adopt_incoming_snapshot` fiat-adopts the snapshot's config/lineage on
+   `durable < pos` and only then sends `AdoptFloor`, which the archive refuses
+   for a non-empty journal — a mid-life follower completing an inbound transfer
+   in an odd interleaving could have SM config/lineage overwritten while its
+   physical log stays put. Normal paths wipe-and-rejoin first.
+3. The self-removal commit window is deliberately more permissive than Ongaro
+   §4.2.2 (documented decision, election.rs:1337-1381); Q1's read arithmetic is
+   independent of it, but a future tightening should revisit both sites.
+4. `on_read_probe_ack` completes a round without re-checking term/serving at
+   the completion site — verified safe under both intra-drain orderings; the
+   safety is carried by `advance_pending_reads`' subsequent checks.
+
 ## 6. Disposition + next steps
 
 **KEEP — and now on the brief's own terms.** The exit criterion was: KEEP iff
