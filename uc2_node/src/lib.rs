@@ -28,6 +28,7 @@ pub mod ipc;
 #[cfg(feature = "mutation-testing")]
 pub(crate) mod mutation;
 mod node;
+mod read_round;
 
 pub use ipc::{InstanceDir, IpcError};
 pub use node::{DEFAULT_JOURNAL_SEGMENT_BYTES, Node, NodeConfig, PurgePolicy, SubmitError};

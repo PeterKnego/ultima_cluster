@@ -38,6 +38,7 @@ use uc_protocol::v2::ipc::{
 };
 
 use crate::ipc::InstanceDir;
+use crate::read_round::ProbeRound;
 use uc2_log::buffer::FrameRead;
 use uc_protocol::v2::datagram::{
     CONFIG_PROPOSAL_BODY_LEN, CONFIG_REPLY_BODY_LEN, ConfigProposalBody, ConfigReplyBody,
@@ -220,15 +221,13 @@ struct PendingRead {
     local_seq: u32,
     /// The raw query bytes (forwarded verbatim after `expected_epoch`).
     query: Vec<u8>,
-    /// Unique per read; scopes the READ_PROBE round so acks attribute correctly.
-    nonce: u64,
+    /// Rung A ordering gate (spec §3.2): the seq of the NEXT probe round at
+    /// admission. A round with `round.seq >= round_seq` was issued after this
+    /// read arrived and may certify it; a smaller/absent round may not.
+    round_seq: u64,
     /// Read index: the commit position at admission. The read may only be
     /// answered once the service has applied at least this far.
     commit_at: u64,
-    /// Distinct nodes that have confirmed this read's index (self seeded).
-    ackers: Vec<NodeId>,
-    /// Majority of the membership — the ack count that confirms the read index.
-    quorum: usize,
     /// Absolute `now_ns` deadline; past it the read is retried.
     deadline_ns: u64,
     phase: ReadPhase,
@@ -788,6 +787,8 @@ impl Node {
             query_ring,
             svc_query,
             pending_reads: Vec::new(),
+            current_round: None,
+            next_round_seq: 1,
             next_nonce: 0,
             admission_bytes: cfg.admission_bytes,
             pending_ring_ingress: None,
@@ -1051,8 +1052,14 @@ struct Consensus {
     /// (the ReadIndex barrier state machine). Small — one entry per outstanding
     /// client read; walked every duty cycle (bounded by outstanding reads).
     pending_reads: Vec<PendingRead>,
-    /// Monotonic per-node read nonce (never reset — uniquely scopes each read's
-    /// READ_PROBE round so acks attribute to the right pending read).
+    /// Rung A: the single in-flight READ_PROBE round, if any. At most one
+    /// exists; it certifies exactly the reads waiting when it was issued.
+    current_round: Option<ProbeRound>,
+    /// Rung A: the seq the NEXT round will carry. Reads record it at
+    /// admission; `maybe_issue_round` consumes-and-increments it.
+    next_round_seq: u64,
+    /// Monotonic per-node nonce — scopes each probe ROUND (no longer each
+    /// read) so acks attribute to the right round on the wire.
     next_nonce: u64,
     /// Mirror of `NodeConfig::admission_bytes` (the `append - commit` door
     /// budget for the ring drain).
@@ -1292,8 +1299,10 @@ impl Consensus {
 
         // 3c. Drain the client query ring (Task 11): snapshot reads forward to
         // the service immediately (epoch check skipped); linearizable reads open
-        // a ReadIndex barrier (nonce'd READ_PROBE to every follower) or are
-        // redirected `MSG_V2_NOT_LEADER` while not serving. Bounded per cycle.
+        // a ReadIndex barrier (parked awaiting certification by the shared probe
+        // round — one nonce'd READ_PROBE round in flight at a time, issued at the
+        // end of this drain and from advance_pending_reads) or are redirected
+        // `MSG_V2_NOT_LEADER` while not serving. Bounded per cycle.
         did |= self.drain_query_ring();
 
         // 3d. Advance in-flight linearizable reads: quorum acks arrive via
@@ -1417,6 +1426,14 @@ impl Consensus {
         self.peers = peers;
         self.learner_ids = learner_ids;
         self.peer_band = peer_band;
+        // Rung A §4/§5: ANY voter-set change voids the in-flight probe round —
+        // a round whose quorum was captured under the old config must not
+        // certify under the new one (a resized quorum could elect elsewhere
+        // before the old-config ack count means anything; mirrors the
+        // leader-lease brief's M7 invalidation rule). Pending reads are NOT
+        // dropped — they wait for the next round, issued with a freshly
+        // captured quorum by the same duty cycle's advance_pending_reads.
+        self.current_round = None;
         // Re-publish `id_and_role` for the (possibly changed) membership next
         // cycle; prune reported-durable entries for ids no longer in the band.
         self.peer_band_published = false;
@@ -1902,6 +1919,52 @@ impl Consensus {
         }
     }
 
+    /// Rung A §4: issue a probe round iff at least one read awaits quorum and
+    /// no round is in flight. Self-clocking — called at the end of
+    /// `drain_query_ring` and from `advance_pending_reads`, so a completed
+    /// round is immediately followed by the next while demand persists (~1
+    /// round per RTT, independent of read rate; a lone read still gets its
+    /// own immediate round, one RTT, exactly today's latency).
+    fn maybe_issue_round(&mut self) {
+        if self.current_round.is_some() {
+            return;
+        }
+        if !self.pending_reads.iter().any(|r| r.phase == ReadPhase::AwaitQuorum) {
+            return;
+        }
+        let quorum = self.peers.len().div_ceil(2) + 1;
+        if quorum <= 1 {
+            // A legal 2->1 voter shrink can strand AwaitQuorum reads across
+            // rebuild_peer_maps (which voids the round but keeps the reads).
+            // A sole voter's majority is itself alone — no election can
+            // succeed at any term without our vote, so we cannot be
+            // unknowingly deposed — which is exactly admission's single-node
+            // fast-path argument. Certify the stranded reads directly; no
+            // round is created.
+            for r in self.pending_reads.iter_mut() {
+                if r.phase == ReadPhase::AwaitQuorum {
+                    r.phase = ReadPhase::AwaitApplied;
+                }
+            }
+            return;
+        }
+        let seq = self.next_round_seq;
+        self.next_round_seq += 1;
+        let nonce = self.next_nonce;
+        self.next_nonce += 1;
+        let round = ProbeRound::new(
+            seq,
+            nonce,
+            quorum,
+            self.id,
+            self.sm.current_term(),
+            self.cnc.counters().commit.load_acquire(),
+            self.now_ns(),
+        );
+        self.current_round = Some(round);
+        self.send_read_probe(nonce);
+    }
+
     /// Follower side of a READ_PROBE: membership-check the probing leader, then
     /// reply a READ_PROBE_ACK **iff** the datagram's term still equals our
     /// current term. A stale leader's probe (a lower/older term) dies here — this
@@ -1918,28 +1981,39 @@ impl Consensus {
     }
 
     /// Leader side of a READ_PROBE_ACK: membership-check the acker, match the
-    /// pending read by nonce, and count DISTINCT ackers (a duplicate ack from the
-    /// same node does not advance the count). On reaching quorum the read moves
-    /// to `AwaitApplied`.
+    /// ONE in-flight round by nonce, and count DISTINCT ackers. On quorum the
+    /// round certifies every read that was already waiting when it was issued
+    /// (the §3.2 ordering rule) — never a read admitted mid-round.
     fn on_read_probe_ack(&mut self, nonce: u64, from: NodeId) {
-        // M6 Task 7 (the constraint block): the read quorum is over VOTERS only.
-        // The probe loop already targets voting peers, but re-check membership here
-        // so a learner's (or any non-voter's) ack can never complete a read quorum
-        // — even a forged/misrouted one. `peers` is the voting set minus self.
+        // The read quorum is over VOTERS only (M6 Task 7 constraint): re-check
+        // membership so a learner's (or forged/misrouted) ack can never
+        // complete a round. `peers` is the voting set minus self.
         if !self.peers.contains(&from) {
             return;
         }
+        let Some(round) = self.current_round.as_mut() else { return };
+        if round.nonce != nonce {
+            return; // an abandoned/completed round's straggler ack
+        }
+        if !round.record_ack(from) {
+            return;
+        }
+        // Quorum: consume the round and release its certification set.
+        let round = self.current_round.take().expect("matched above");
         for r in self.pending_reads.iter_mut() {
-            if r.nonce == nonce && r.phase == ReadPhase::AwaitQuorum {
-                if !r.ackers.contains(&from) {
-                    r.ackers.push(from);
-                }
-                if r.ackers.len() >= r.quorum {
-                    r.phase = ReadPhase::AwaitApplied;
-                }
-                return;
+            if r.phase == ReadPhase::AwaitQuorum && round.certifies(r.round_seq) {
+                // §3.2 redundancy check (never the gate): commit is monotonic,
+                // so a read waiting at issue has commit_at <= the round's.
+                debug_assert!(
+                    r.commit_at <= round.commit_at_issue,
+                    "ordering rule implies the position bound"
+                );
+                r.phase = ReadPhase::AwaitApplied;
             }
         }
+        // Mid-round arrivals (round_seq > seq) stay AwaitQuorum; the next
+        // round — issued by advance_pending_reads this same duty cycle — will
+        // cover them.
     }
 
     /// Drain the client query ring (bounded). Snapshot reads forward straight to
@@ -1978,14 +2052,11 @@ impl Consensus {
                     }
                     let n = self.peers.len() + 1;
                     let quorum = n / 2 + 1;
-                    let nonce = self.next_nonce;
-                    self.next_nonce += 1;
                     let commit_at = self.cnc.counters().commit.load_acquire();
                     let deadline_ns = self.now_ns() + READ_BARRIER_TIMEOUT_NS;
-                    let mut ackers = Vec::with_capacity(n);
-                    ackers.push(self.id); // self-ack (acks: 1)
-                    // Single-node (quorum 1): skip straight to AwaitApplied.
-                    let phase = if ackers.len() >= quorum {
+                    // Single-node (quorum 1): skip straight to AwaitApplied —
+                    // unchanged by Rung A; such reads never touch a round.
+                    let phase = if quorum <= 1 {
                         ReadPhase::AwaitApplied
                     } else {
                         ReadPhase::AwaitQuorum
@@ -1995,10 +2066,10 @@ impl Consensus {
                         client_id,
                         local_seq,
                         query: buf,
-                        nonce,
+                        // Rung A §3.2: record the NEXT round's seq — only a
+                        // round issued at-or-after this admission may certify.
+                        round_seq: self.next_round_seq,
                         commit_at,
-                        ackers,
-                        quorum,
                         deadline_ns,
                         phase,
                     };
@@ -2013,13 +2084,7 @@ impl Consensus {
                     ) {
                         read.phase = ReadPhase::AwaitApplied;
                     }
-                    // Computed AFTER the mutation override so a barrier-skipped read
-                    // does not also emit a probe whose ACKs match no awaiting read.
-                    let need_probe = read.phase == ReadPhase::AwaitQuorum;
                     self.pending_reads.push(read);
-                    if need_probe {
-                        self.send_read_probe(nonce);
-                    }
                 }
                 Ok(None) => break,
                 // Corrupt record: stop this cycle (retried at the same unread
@@ -2027,6 +2092,10 @@ impl Consensus {
                 Err(_) => break,
             }
         }
+        // Rung A: one round for everything admitted this cycle (issue site 1
+        // of 2; the other is advance_pending_reads, which chains rounds while
+        // demand persists).
+        self.maybe_issue_round();
         did
     }
 
@@ -2037,10 +2106,24 @@ impl Consensus {
     /// TOCTOU close) — is forwarded to the service and dropped.
     fn advance_pending_reads(&mut self) -> bool {
         if self.pending_reads.is_empty() {
+            // Rung A: a round with no waiting reads certifies nobody — drop it
+            // so the next admission starts a fresh round instead of waiting
+            // out a stale one (its straggler acks no-op on the nonce check).
+            self.current_round = None;
             return false;
         }
         let now = self.now_ns();
         let can_serve = self.sm.can_serve();
+        // Rung A §4: a round never survives lost serving or a term change
+        // (the voter-set trigger lives in rebuild_peer_maps). Checked against
+        // the RAW can_serve, before the mutation shadow below: the tooth keeps
+        // READS resolving on an isolated leader, but mutated reads bypass
+        // rounds at admission, so no round should outlive real leadership.
+        if let Some(round) = &self.current_round
+            && (!can_serve || round.term != self.sm.current_term())
+        {
+            self.current_round = None;
+        }
         // `skip-read-barrier` tooth: keep resolving reads from local applied
         // state even after leadership is lost, so an isolated leader answers
         // stale reads instead of RETRY-ing (matches the admission bypass above).
@@ -2113,6 +2196,21 @@ impl Consensus {
             }
             i += 1;
         }
+        // Rung A §4: re-probe a stuck round on the 2 ms interval (same seq,
+        // same nonce — the certification set cannot widen), and chain the next
+        // round the moment the previous completed while demand persists.
+        let retransmit_nonce = self.current_round.as_mut().and_then(|round| {
+            if round.should_retransmit(now) {
+                round.mark_sent(now);
+                Some(round.nonce)
+            } else {
+                None
+            }
+        });
+        if let Some(nonce) = retransmit_nonce {
+            self.send_read_probe(nonce);
+        }
+        self.maybe_issue_round();
         did
     }
 
@@ -3375,6 +3473,8 @@ mod tests {
             query_ring,
             svc_query,
             pending_reads: Vec::new(),
+            current_round: None,
+            next_round_seq: 1,
             next_nonce: 0,
             admission_bytes: 256 * 1024,
             pending_ring_ingress: None,
@@ -3671,15 +3771,13 @@ mod tests {
     }
 
     /// Push a linearizable read into the barrier for the harness node.
-    fn mk_read(cons: &Consensus, commit_at: u64, quorum: usize, deadline_ns: u64) -> PendingRead {
+    fn mk_read(commit_at: u64, round_seq: u64, deadline_ns: u64) -> PendingRead {
         PendingRead {
             client_id: 7,
             local_seq: 1,
             query: Vec::new(),
-            nonce: 42,
+            round_seq,
             commit_at,
-            ackers: vec![cons.id], // self-ack (acks: 1)
-            quorum,
             deadline_ns,
             phase: ReadPhase::AwaitQuorum,
         }
@@ -3695,44 +3793,187 @@ mod tests {
         drive_to_serving_leader(&mut h);
 
         // A read requiring a 3-way quorum, with a read index above the (zero)
-        // service_applied so the forward waits for catch-up.
+        // service_applied so the forward waits for catch-up. The round is
+        // constructed directly at quorum 3 (the harness cluster would compute
+        // 2) so distinct-acker counting is observable across two peer acks.
         let far = h.cons.now_ns() + 10_000_000_000;
-        let read = mk_read(&h.cons, /*commit_at*/ 6048, /*quorum*/ 3, far);
-        h.cons.pending_reads.push(read);
+        h.cons.pending_reads.push(mk_read(6048, 1, far));
+        let term = h.cons.sm.current_term();
+        let now = h.cons.now_ns();
+        h.cons.current_round =
+            Some(crate::read_round::ProbeRound::new(1, 42, 3, h.cons.id, term, 6048, now));
+        h.cons.next_round_seq = 2;
 
         // A non-member ack (id 99 is not in [0,1,2]) is dropped by the
         // membership check.
         h.cons.on_read_probe_ack(42, 99);
-        assert_eq!(h.cons.pending_reads[0].ackers, vec![1]);
+        assert_eq!(h.cons.current_round.as_ref().unwrap().acks(), 1);
 
         // Distinct acker 0, then a DUPLICATE 0 that must not advance the count.
         h.cons.on_read_probe_ack(42, 0);
         h.cons.on_read_probe_ack(42, 0);
-        assert_eq!(h.cons.pending_reads[0].ackers, vec![1, 0]);
+        assert_eq!(h.cons.current_round.as_ref().unwrap().acks(), 2);
         assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitQuorum);
 
-        // The second distinct acker reaches quorum 3 → AwaitApplied.
+        // The second distinct acker reaches quorum 3 → the round completes,
+        // certifies the waiting read, and is consumed.
         h.cons.on_read_probe_ack(42, 2);
         assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitApplied);
+        assert!(h.cons.current_round.is_none(), "a completed round is consumed");
 
-        // Service not yet caught up (applied 0 < commit_at 6048): the read stays
-        // parked, never forwarded.
+        // Service not yet caught up (applied 0 < commit_at 6048): parked.
         assert!(!h.cons.advance_pending_reads());
         assert_eq!(h.cons.pending_reads.len(), 1);
 
-        // Service catches up (applied >= commit_at) BUT no service has attached
-        // this generation yet (service_epoch still 0) — the sentinel-collision
-        // guard (IMPORTANT #1) treats a captured epoch of 0 as NOT ready, so the
-        // read stays parked, never forwarded on the skip-the-check sentinel.
+        // Caught up BUT service_epoch still 0: the sentinel-collision guard
+        // keeps it parked (unchanged behavior).
         h.cons.cnc.service().service_applied.store_release(6048);
         assert!(!h.cons.advance_pending_reads());
         assert_eq!(h.cons.pending_reads.len(), 1, "epoch-0 must not forward");
 
-        // A real incarnation attaches (epoch 1). NOW the capture-recheck bracket
-        // passes with a live epoch → forwarded to svc_query and dropped.
+        // A real incarnation attaches (epoch 1) → forwarded and dropped.
         h.cons.cnc.service().service_epoch.store_release(1);
         assert!(h.cons.advance_pending_reads());
         assert!(h.cons.pending_reads.is_empty(), "caught-up read must forward and drop");
+    }
+
+    /// Rung A §3.2, the crux: a round certifies ONLY reads admitted before it
+    /// was issued. Read B, admitted mid-round, records the next seq and must
+    /// stay AwaitQuorum when round 1 completes — then the follow-up round
+    /// covers it.
+    #[test]
+    fn round_certifies_only_reads_admitted_before_issue() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let far = h.cons.now_ns() + 10_000_000_000;
+
+        // Read A admitted, then the round is issued (harness quorum: 2).
+        h.cons.pending_reads.push(mk_read(6048, h.cons.next_round_seq, far));
+        h.cons.maybe_issue_round();
+        let round = h.cons.current_round.as_ref().expect("round issued");
+        let (seq, nonce) = (round.seq, round.nonce);
+
+        // Read B admitted MID-ROUND: records seq+1.
+        h.cons.pending_reads.push(mk_read(6048, h.cons.next_round_seq, far));
+        assert_eq!(h.cons.pending_reads[1].round_seq, seq + 1);
+
+        // One peer ack reaches the harness quorum of 2 → round completes.
+        h.cons.on_read_probe_ack(nonce, 0);
+        assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitApplied, "A certified");
+        assert_eq!(
+            h.cons.pending_reads[1].phase,
+            ReadPhase::AwaitQuorum,
+            "B admitted mid-round must NOT be certified by this round"
+        );
+        assert!(h.cons.current_round.is_none());
+
+        // The next round (fresh seq) covers B.
+        h.cons.maybe_issue_round();
+        let nonce2 = h.cons.current_round.as_ref().unwrap().nonce;
+        assert_ne!(nonce2, nonce, "a new round, not a retransmit");
+        h.cons.on_read_probe_ack(nonce2, 2);
+        assert_eq!(h.cons.pending_reads[1].phase, ReadPhase::AwaitApplied);
+    }
+
+    /// Rung A §4: a voter-set change (any rebuild_peer_maps) voids the round;
+    /// pending reads survive and the next round covers them under a fresh seq.
+    #[test]
+    fn voter_set_change_voids_round_but_keeps_reads() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let far = h.cons.now_ns() + 10_000_000_000;
+        h.cons.pending_reads.push(mk_read(6048, h.cons.next_round_seq, far));
+        h.cons.maybe_issue_round();
+        let old_nonce = h.cons.current_round.as_ref().unwrap().nonce;
+
+        // Same-membership rebuild (the trigger is the rebuild itself — the
+        // node cannot distinguish "same voters" cheaply and must not try).
+        let members = [0u32, 1, 2];
+        let config = ClusterConfig::genesis(
+            members.iter().map(|id| (*id, addr_to_pair(h.cons.id_to_addr[id]))).collect(),
+            Vec::new(),
+        );
+        h.cons.rebuild_peer_maps(&config);
+        assert!(h.cons.current_round.is_none(), "voter-set change voids the round");
+        assert_eq!(h.cons.pending_reads.len(), 1, "reads survive the void");
+        assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitQuorum);
+
+        // A straggler ack for the voided round is a no-op.
+        h.cons.on_read_probe_ack(old_nonce, 0);
+        assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitQuorum);
+
+        // The next round (fresh seq + nonce, fresh-config quorum) covers it.
+        h.cons.maybe_issue_round();
+        let round = h.cons.current_round.as_ref().unwrap();
+        assert_ne!(round.nonce, old_nonce);
+        let nonce2 = round.nonce;
+        h.cons.on_read_probe_ack(nonce2, 0);
+        assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitApplied);
+    }
+
+    /// Rung A §4: a round stamped with a stale term is abandoned by
+    /// advance_pending_reads (driven directly — the harness stamps a
+    /// mismatched term rather than running a full re-election).
+    #[test]
+    fn stale_term_round_is_abandoned() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let far = h.cons.now_ns() + 10_000_000_000;
+        h.cons.pending_reads.push(mk_read(6048, 1, far));
+        let stale_term = h.cons.sm.current_term() - 1;
+        let now = h.cons.now_ns();
+        h.cons.current_round =
+            Some(crate::read_round::ProbeRound::new(1, 42, 2, h.cons.id, stale_term, 6048, now));
+        h.cons.next_round_seq = 2;
+
+        h.cons.advance_pending_reads();
+        // The stale round is gone; the read survived (deadline far away) and a
+        // FRESH round was chained in the same call (issue site 2 of 2).
+        let round = h.cons.current_round.as_ref().expect("fresh round chained");
+        assert_eq!(round.term, h.cons.sm.current_term());
+        assert_ne!(round.nonce, 42);
+    }
+
+    /// Rung A: a round with no waiting reads is dropped, not waited out.
+    #[test]
+    fn round_with_no_waiting_reads_is_dropped() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let term = h.cons.sm.current_term();
+        let now = h.cons.now_ns();
+        h.cons.current_round =
+            Some(crate::read_round::ProbeRound::new(1, 42, 2, h.cons.id, term, 6048, now));
+        assert!(!h.cons.advance_pending_reads());
+        assert!(h.cons.current_round.is_none());
+    }
+
+    /// A legal 2->1 voter shrink strands AwaitQuorum reads (the round is
+    /// voided, the reads kept): the sole-voter guard in maybe_issue_round
+    /// must certify them directly instead of tripping the quorum>=2 assert
+    /// or wedging them until the 1 s deadline.
+    #[test]
+    fn shrink_to_sole_voter_certifies_stranded_reads() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let far = h.cons.now_ns() + 10_000_000_000;
+        h.cons.pending_reads.push(mk_read(6048, h.cons.next_round_seq, far));
+        h.cons.maybe_issue_round();
+        assert!(h.cons.current_round.is_some());
+
+        // Adopt a config whose only voter is self (id 1): the round is voided,
+        // the read survives...
+        let config = ClusterConfig::genesis(
+            vec![(1u32, addr_to_pair(h.cons.id_to_addr[&1]))],
+            Vec::new(),
+        );
+        h.cons.rebuild_peer_maps(&config);
+        assert!(h.cons.current_round.is_none());
+        assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitQuorum);
+
+        // ...and the next issue attempt certifies it directly, creating no round.
+        h.cons.maybe_issue_round();
+        assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitApplied);
+        assert!(h.cons.current_round.is_none(), "sole voter needs no round");
     }
 
     /// Task 11 barrier, sentinel-collision guard (M5 final review IMPORTANT #1):
@@ -3750,7 +3991,7 @@ mod tests {
 
         let far = h.cons.now_ns() + 10_000_000_000;
         // Single-node quorum (1) so the read is AwaitApplied immediately.
-        let mut read = mk_read(&h.cons, /*commit_at*/ 6048, /*quorum*/ 1, far);
+        let mut read = mk_read(/*commit_at*/ 6048, /*round_seq*/ 1, far);
         read.phase = ReadPhase::AwaitApplied;
         h.cons.pending_reads.push(read);
 
@@ -3775,7 +4016,7 @@ mod tests {
         let mut h = harness();
         drive_to_serving_leader(&mut h);
         // deadline_ns = 0 is already in the past.
-        let read = mk_read(&h.cons, 0, 2, 0);
+        let read = mk_read(0, 1, 0);
         h.cons.pending_reads.push(read);
         assert!(h.cons.advance_pending_reads());
         assert!(h.cons.pending_reads.is_empty(), "past-deadline read must retry + drop");
@@ -3789,7 +4030,7 @@ mod tests {
         let mut h = harness(); // boots a FOLLOWER: can_serve == false
         assert!(!h.cons.sm.can_serve());
         let far = h.cons.now_ns() + 10_000_000_000;
-        let read = mk_read(&h.cons, 0, 2, far); // deadline far off; only depose fires
+        let read = mk_read(0, 1, far); // deadline far off; only depose fires
         h.cons.pending_reads.push(read);
         assert!(h.cons.advance_pending_reads());
         assert!(h.cons.pending_reads.is_empty(), "a non-serving node retries in-flight reads");

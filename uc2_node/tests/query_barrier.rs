@@ -197,3 +197,78 @@ fn stale_leader_fails_linearizable_read_confirmation() {
         n.stop();
     }
 }
+
+/// Rung A capstone: a burst of CONCURRENT linearizable reads — batched through
+/// shared probe rounds on the leader — all observe the committed total, and
+/// after the leader is partitioned a concurrent burst is answered
+/// RETRY/NOT_LEADER, never a stale value. One client per thread: `Client` ops
+/// are per-connection sequential, and concurrency is the point here.
+#[test]
+fn concurrent_batched_reads_stay_linearizable_across_partition() {
+    let mut c = spawn_cluster(3);
+    let leader = await_single_leader(&c.nodes, 30);
+    let leader_dir = c.dirs[leader].clone();
+
+    let svc = ServiceBuilder::new(ServiceConfig::new(&leader_dir, APP), CountSm::default())
+        .start()
+        .unwrap();
+    let client = Client::connect(&leader_dir, APP).unwrap();
+    drive_submits(&client, 100);
+
+    // Healthy burst: 8 readers x 5 linearizable reads, all concurrent. Every
+    // read must observe the full committed total (no writes are in flight, so
+    // any other value is a stale or torn answer).
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = leader_dir.clone();
+                s.spawn(move || {
+                    let cl = Client::connect(&dir, APP).unwrap();
+                    for _ in 0..5 {
+                        let v: u64 = cl.query_linearizable(&()).expect("healthy lin read");
+                        assert_eq!(v, 100, "stale/torn linearizable read");
+                    }
+                    cl.shutdown();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+
+    // Partition the leader from BOTH followers, then fire a concurrent burst.
+    // No round can complete; every read must resolve RETRY (or NOT_LEADER once
+    // the leader steps down) within the ~1 s barrier deadline — never Ok.
+    for f in (0..3).filter(|&i| i != leader) {
+        cut(&c.nodes, leader, f, &c.members);
+    }
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = leader_dir.clone();
+                s.spawn(move || {
+                    let cl = Client::connect(&dir, APP).unwrap();
+                    let started = Instant::now();
+                    let res: Result<u64, ClientError> = cl.query_linearizable(&());
+                    let elapsed = started.elapsed();
+                    assert!(
+                        matches!(res, Err(ClientError::Retry) | Err(ClientError::NotLeader { .. })),
+                        "isolated leader answered a batched linearizable read (got {res:?})"
+                    );
+                    assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+                    cl.shutdown();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+
+    client.shutdown();
+    svc.stop();
+    for n in c.nodes.drain(..) {
+        n.stop();
+    }
+}
