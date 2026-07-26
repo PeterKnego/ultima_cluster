@@ -81,6 +81,10 @@ impl ProbeRound {
         self.ackers.len() >= self.quorum
     }
 
+    /// Test/introspection only — the node's production path only needs the
+    /// bool `record_ack` returns; the count itself is never consumed outside
+    /// the harness assertions.
+    #[cfg(test)]
     pub(crate) fn acks(&self) -> usize {
         self.ackers.len()
     }
