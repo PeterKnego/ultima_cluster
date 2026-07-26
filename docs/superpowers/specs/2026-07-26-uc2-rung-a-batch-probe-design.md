@@ -161,6 +161,11 @@ struct ProbeRound {
     seq: u64,
     /// Wire-level ack matching; the existing READ_PROBE nonce, now per-round.
     nonce: u64,
+    /// Issue-time term — carrier for §4's term-change abandon trigger.
+    term: u32,
+    /// Commit position at issue — used ONLY for §3.2's redundancy
+    /// `debug_assert!`, never as the certification gate.
+    commit_at_issue: u64,
     /// Distinct voting ackers, self-seeded (acks: 1), same discipline as today.
     ackers: Vec<NodeId>,
     /// Voter majority at issue time.
