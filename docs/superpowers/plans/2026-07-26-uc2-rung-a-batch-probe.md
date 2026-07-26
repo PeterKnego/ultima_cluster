@@ -258,7 +258,20 @@ Pure and exhaustively unit-tested; the node wires it in next."
 
 ### Task 2: Wire the round into the node (admission, ack, certify)
 
-Replaces the per-read probe with the shared round on the happy path. After this task the tree is fully working but unhardened: no retransmit and no abandon triggers yet (Task 3) — a stuck round falls through to the existing 1 s deadline → RETRY path, so every existing test still passes.
+> **AMENDED during execution (2026-07-26): Tasks 2 and 3 land as ONE commit.**
+> The original claim below — that a stuck round "falls through to the existing
+> 1 s deadline → RETRY path, so every existing test still passes" — is FALSE,
+> and `lin_partition_v2::linearizable_under_lossy_links` proved it (~1/4 pass
+> on a Task-2-only tree vs 3/3 on base). The deadline path recovers the READS,
+> but nothing in Task 2 recovers the ROUND: its only clearing site is quorum
+> completion, so a round whose probes/acks are lost under the test's 10% loss
+> wedges forever, `maybe_issue_round` refuses from then on, and every later
+> linearizable read RETRYs — which also flattens writes, because lincheck
+> client threads retry an op before proceeding to their next. Task 3's
+> retransmit is load-bearing liveness, not hardening. The task split below is
+> retained for its step-by-step content; execute both before committing.
+
+Replaces the per-read probe with the shared round on the happy path.
 
 **Files:**
 - Modify: `uc2_node/src/node.rs` — `PendingRead` (~line 218), `Consensus` fields (~1053), construction (~790), `drain_query_ring` (~1979-2022), `on_read_probe_ack` (~1924-1943), in-file tests (`mk_read` ~3675, `barrier_counts_distinct_ackers_then_forwards_on_service_catchup` ~3690, and the epoch-sentinel test that also uses `mk_read`)
