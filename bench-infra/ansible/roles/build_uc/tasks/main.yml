@@ -10,18 +10,29 @@
       - "--exclude=bench-infra"   # don't ship .env secret or .terraform bloat
   when: uc_src_mode == "rsync"
 
-# ultima_cluster's Cargo.toml has external path deps ../ultima_db (+ its
-# ultima_journal). Ship the sibling repo to {{ ud_src_dir }} so that, with the
-# UC tree at {{ uc_src_dir }} (= /opt/bench/uc), `../ultima_db` resolves to
-# /opt/bench/ultima_db on the host. Without this, cargo build fails.
-- name: (rsync mode) Sync sibling ultima_db (external path dep) to host
+# OPT-IN (ud_sync, default false). NOT needed for a normal build: ultima-db
+# resolves from crates.io and ultima_journal is an in-tree workspace member, so
+# the workspace builds standalone — verified on the 2026-07-26 read-profile
+# fleet run, where this task failed on all three hosts and every cargo build
+# still succeeded.
+#
+# It IS needed when Cargo.toml's `[patch.crates-io] ultima-db = { path =
+# "../ultima_db" }` line is uncommented for lockstep development: the UC tree
+# sits at {{ uc_src_dir }} (= /opt/bench/uc), so `../ultima_db` must resolve to
+# /opt/bench/ultima_db on the host. Enable with `-e ud_sync=true`.
+#
+# (The prior comment here claimed "without this, cargo build fails". That was
+# true when ultima_db was an unconditional path dep and is no longer.)
+- name: (rsync mode, opt-in) Sync sibling ultima_db for [patch.crates-io] lockstep builds
   ansible.posix.synchronize:
     src: "{{ ud_local_path }}/"
     dest: "{{ ud_src_dir }}/"
     rsync_opts:
       - "--exclude=target"
       - "--exclude=.git"
-  when: uc_src_mode == "rsync"
+  when:
+    - uc_src_mode == "rsync"
+    - ud_sync | bool
 
 - name: (git mode) Clone UC at pinned ref
   ansible.builtin.git:

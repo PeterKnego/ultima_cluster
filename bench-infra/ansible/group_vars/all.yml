@@ -29,8 +29,30 @@ jdk_version: "21"
 uc_src_mode: "rsync"                     # 'rsync' local working tree | 'git'
 uc_git_ref: ""                           # used when uc_src_mode=git
 uc_repo_url: ""                          # used when uc_src_mode=git
+
+# The tree that gets shipped is the tree you run the playbook FROM — this is
+# playbook-relative on purpose, so running from a git worktree ships that
+# worktree. That is usually what you want, and it is also a live foot-gun:
+# running `make up-uc` from the main checkout while your work sits on a
+# worktree branch ships the main checkout's tree, and the build then fails on
+# the hosts with a confusing "no example target named X". Run the playbook from
+# the tree you actually want on the hosts.
 uc_local_path: "{{ playbook_dir }}/../.."  # repo root (ultima_cluster), for rsync mode
-ud_local_path: "{{ playbook_dir }}/../../../ultima_db"  # sibling repo (external path dep)
+
+# --- Sibling ultima_db (OFF by default) ---
+# Only needed when Cargo.toml's `[patch.crates-io] ultima-db = { path =
+# "../ultima_db" }` line is uncommented for lockstep local development. The
+# DEFAULT build resolves ultima-db from crates.io and ultima_journal from the
+# in-tree workspace member, so no sibling checkout is required and this sync is
+# skipped. Enable with `-e ud_sync=true` when running in lockstep mode.
+ud_sync: false
+# Resolved against the MAIN worktree, not `playbook_dir`: the sibling lives
+# next to the main checkout, so a playbook-relative path breaks when the
+# playbook runs from `.claude/worktrees/<name>/`. `--git-common-dir` points at
+# the main checkout's .git regardless of which worktree we are in. Evaluated
+# lazily, so the git lookup only runs when ud_sync is true.
+ud_local_path: >-
+  {{ (lookup('pipe', 'git -C ' ~ playbook_dir ~ ' rev-parse --path-format=absolute --git-common-dir') | dirname | dirname) ~ '/ultima_db' }}
 
 # --- Layout on hosts ---
 remote_home: "/opt/bench"
