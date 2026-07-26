@@ -1931,7 +1931,21 @@ impl Consensus {
             return;
         }
         let quorum = self.peers.len().div_ceil(2) + 1;
-        debug_assert!(quorum >= 2, "AwaitQuorum reads cannot exist at quorum 1");
+        if quorum <= 1 {
+            // A legal 2->1 voter shrink can strand AwaitQuorum reads across
+            // rebuild_peer_maps (which voids the round but keeps the reads).
+            // A sole voter's majority is itself alone — no election can
+            // succeed at any term without our vote, so we cannot be
+            // unknowingly deposed — which is exactly admission's single-node
+            // fast-path argument. Certify the stranded reads directly; no
+            // round is created.
+            for r in self.pending_reads.iter_mut() {
+                if r.phase == ReadPhase::AwaitQuorum {
+                    r.phase = ReadPhase::AwaitApplied;
+                }
+            }
+            return;
+        }
         let seq = self.next_round_seq;
         self.next_round_seq += 1;
         let nonce = self.next_nonce;
@@ -3929,6 +3943,35 @@ mod tests {
             Some(crate::read_round::ProbeRound::new(1, 42, 2, h.cons.id, term, 6048, now));
         assert!(!h.cons.advance_pending_reads());
         assert!(h.cons.current_round.is_none());
+    }
+
+    /// A legal 2->1 voter shrink strands AwaitQuorum reads (the round is
+    /// voided, the reads kept): the sole-voter guard in maybe_issue_round
+    /// must certify them directly instead of tripping the quorum>=2 assert
+    /// or wedging them until the 1 s deadline.
+    #[test]
+    fn shrink_to_sole_voter_certifies_stranded_reads() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let far = h.cons.now_ns() + 10_000_000_000;
+        h.cons.pending_reads.push(mk_read(6048, h.cons.next_round_seq, far));
+        h.cons.maybe_issue_round();
+        assert!(h.cons.current_round.is_some());
+
+        // Adopt a config whose only voter is self (id 1): the round is voided,
+        // the read survives...
+        let config = ClusterConfig::genesis(
+            vec![(1u32, addr_to_pair(h.cons.id_to_addr[&1]))],
+            Vec::new(),
+        );
+        h.cons.rebuild_peer_maps(&config);
+        assert!(h.cons.current_round.is_none());
+        assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitQuorum);
+
+        // ...and the next issue attempt certifies it directly, creating no round.
+        h.cons.maybe_issue_round();
+        assert_eq!(h.cons.pending_reads[0].phase, ReadPhase::AwaitApplied);
+        assert!(h.cons.current_round.is_none(), "sole voter needs no round");
     }
 
     /// Task 11 barrier, sentinel-collision guard (M5 final review IMPORTANT #1):
