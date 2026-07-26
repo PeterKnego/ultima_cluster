@@ -1299,8 +1299,10 @@ impl Consensus {
 
         // 3c. Drain the client query ring (Task 11): snapshot reads forward to
         // the service immediately (epoch check skipped); linearizable reads open
-        // a ReadIndex barrier (nonce'd READ_PROBE to every follower) or are
-        // redirected `MSG_V2_NOT_LEADER` while not serving. Bounded per cycle.
+        // a ReadIndex barrier (parked awaiting certification by the shared probe
+        // round — one nonce'd READ_PROBE round in flight at a time, issued at the
+        // end of this drain and from advance_pending_reads) or are redirected
+        // `MSG_V2_NOT_LEADER` while not serving. Bounded per cycle.
         did |= self.drain_query_ring();
 
         // 3d. Advance in-flight linearizable reads: quorum acks arrive via

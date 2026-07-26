@@ -270,6 +270,11 @@ Pure and exhaustively unit-tested; the node wires it in next."
 > client threads retry an op before proceeding to their next. Task 3's
 > retransmit is load-bearing liveness, not hardening. The task split below is
 > retained for its step-by-step content; execute both before committing.
+>
+> **Second execution amendment:** the `debug_assert!(quorum >= 2)` shown in
+> `maybe_issue_round` below was replaced during review (commit `a020467`) by a
+> sole-voter guard that certifies stranded reads directly — a legal 2→1 voter
+> shrink reaches it with a read parked `AwaitQuorum`. See spec §4.1.
 
 Replaces the per-read probe with the shared round on the happy path.
 

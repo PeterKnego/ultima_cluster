@@ -139,11 +139,35 @@ At most **one round in flight at a time** — self-clocking, no timer, no knob:
   reads remain (the mid-round arrivals).
 - **Abandon** — set `current_round = None` without certifying anyone — on any
   of: `can_serve` going false, a term change, or **a voter-set change** (the M7
-  case, §5). For the first two, the existing `advance_pending_reads` logic
-  already drops the pending reads to `MSG_V2_RETRY`; for a voter-set change the
-  reads stay pending and wait for the next round, issued under the new config.
-  A round object must never survive into a new term, a re-election, or a new
-  voter set.
+  case, §5) — except a shrink to a SOLE voter, §4.1. For the first two, the
+  existing `advance_pending_reads` logic already drops the pending reads to
+  `MSG_V2_RETRY`; for a voter-set change the reads stay pending and wait for
+  the next round, issued under the new config. A round object must never
+  survive into a new term, a re-election, or a new voter set.
+
+### 4.1 Sole-voter shrink — the one certification path besides the ordering rule
+
+A legal voter removal can shrink the config to a single voter while reads are
+parked `AwaitQuorum` (the void above deliberately keeps them). For that case
+`maybe_issue_round` has a second, deliberate certification path: when
+`peers.len() == 0` — which implies self is the adopted config's only voter (a
+REMOVED node always retains the other voters in its peer set, so a removed
+node can never trigger this) — the stranded reads are flipped to
+`AwaitApplied` directly and no round is created.
+
+Soundness: with a sole voter, no election at any term can succeed without this
+node's own vote, so it cannot be unknowingly deposed — self-confirmation is
+valid at every instant, trivially postdating every read's admission. This is
+the same argument as admission's single-node fast path, applied at the issue
+site.
+
+Two things an auditor should know: the sweep itself checks neither `can_serve`
+nor term — its safety additionally rests on the forward-time gate
+(`advance_pending_reads` RETRYs every pending read, whatever its phase,
+whenever `can_serve` is false, before any forward to the service). And the
+complete set of `AwaitApplied` flip sites in `node.rs` is exactly four: the
+admission single-node fast path, the quorum certification sweep, this
+sole-voter sweep, and the feature-gated `skip-read-barrier` mutation tooth.
 
 ## 5. Data structures
 
@@ -193,7 +217,8 @@ elect elsewhere before the old-config ack count means anything). This mirrors
 the parent brief's lease-invalidation rule for M7 ("any `config.state`
 transition that changes voters must void the current lease"); pending reads are
 NOT dropped — they simply wait for the next round, issued under the new config
-with a freshly captured quorum.
+with a freshly captured quorum — or, on a shrink to a sole voter, are certified
+directly (§4.1).
 
 ## 6. Verification
 
