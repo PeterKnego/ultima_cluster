@@ -1,9 +1,42 @@
 # UC v2 — Leader Lease & Read-Barrier Throughput: Exploratory Design Brief
 
+> **STATUS (2026-07-26): RESOLVED — Rung A shipped and re-measured; Rung B
+> discharged for the LAN goal. Do not pick up Rung B from this brief.**
+>
+> The measure-first sequencing this brief mandated (§6.1) ran to completion,
+> two days after the brief was written:
+>
+> - **Measurement:** `docs/benchmarks/uc2-read-profile-2026-07-26.md` — the
+>   barrier cost ~58% of read capacity; the pre-committed rule returned
+>   "Rung A JUSTIFIED" on both write mixes.
+> - **Rung A built:** spec
+>   `docs/superpowers/specs/2026-07-26-uc2-rung-a-batch-probe-design.md`,
+>   merged `16eff8f`. NOTE: this brief's §3 certification sketch ("piggyback
+>   if their `commit_at` is already `<= P_confirmed`") was **rejected as
+>   unsafe** during design — a round's confirmation can predate a read's
+>   admission while a quiet period makes the positions equal. The shipped rule
+>   certifies by ordering (round seq at admission), not position. See that
+>   spec's §3.1 and `docs/notes/uc2-read-barrier-explained.md`.
+> - **Re-measurement:**
+>   `docs/benchmarks/uc2-read-profile-2026-07-26-after-rung-a.md` — barrier
+>   cost now ~0% (lin/snap 100.2% read-only, 96.7% mixed; ~953k linearizable
+>   reads/s at p50 1.08 ms on the 3-host fleet).
+> - **Rung B verdict, per §2's own rule ("measure after A before committing
+>   to B"): no remaining LAN justification.** The residual 0–3.3% is inside
+>   run noise; a bounded-clock-drift assumption in read safety would buy
+>   nothing measurable. Rung B would be revived only by the WAN/cross-region
+>   motivation §7 explicitly scopes out (the async-learner / Standby story),
+>   as its own project. Its verification prerequisite (the Veil
+>   coherence-window work, §5) has since been satisfied — the V2 hunt came
+>   back exhaustive-clean — so if WAN ever becomes the goal, only the WAN
+>   case itself needs making.
+>
+> The text below is retained unamended as the historical record of the
+> pre-measurement reasoning.
+
 **Date:** 2026-07-24
-**Status:** Exploratory brief (NOT an implementation spec). Captures the idea,
-the mechanism, the correctness tension, and open questions — enough to inform
-sequencing and to revisit later. No commitment to build.
+**Status:** superseded — see the resolution block above. Originally: exploratory
+brief (NOT an implementation spec), no commitment to build.
 **Motivation:** LAN read throughput (co-located cluster, high read rates).
 **Author:** design dialogue, Peter Knego + Claude.
 
