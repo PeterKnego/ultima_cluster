@@ -2039,7 +2039,12 @@ impl Consensus {
                     // STALE reads (a real-time-only anomaly the strict model
                     // catches; see scripts/elle_mutation.sh). Reads only: writes
                     // stay gated by the real `can_serve` at the ingress drain.
-                    let can_serve = self.sm.can_serve();
+                    //
+                    // `!halt_removed`: a halt earlier in this SAME cycle does
+                    // not clear the SM's serving field, so the raw check alone
+                    // would admit reads no one can ever answer (Veil §5
+                    // discharge, observation 1) — refuse them here instead.
+                    let can_serve = self.sm.can_serve() && !self.halt_removed;
                     #[cfg(feature = "mutation-testing")]
                     let can_serve = can_serve
                         || matches!(
@@ -2113,7 +2118,9 @@ impl Consensus {
             return false;
         }
         let now = self.now_ns();
-        let can_serve = self.sm.can_serve();
+        // `!halt_removed`: sweep reads admitted after a same-cycle halt (the
+        // SM's serving field survives step-down; Veil §5 discharge, obs. 1).
+        let can_serve = self.sm.can_serve() && !self.halt_removed;
         // Rung A §4: a round never survives lost serving or a term change
         // (the voter-set trigger lives in rebuild_peer_maps). Checked against
         // the RAW can_serve, before the mutation shadow below: the tooth keeps
@@ -2821,9 +2828,10 @@ impl Consensus {
     /// off `halt_removed` regardless — but `Node::is_leader()`/`can_serve()`
     /// read these two atomics DIRECTLY, bypassing that mask entirely. Without
     /// this, `StepDownRemoved`'s leader case (the SM's `serving` field is
-    /// never cleared by step-down — it has no reason to be, nothing else
-    /// reads it once halted) would leave an embedded caller's `is_leader()`/
-    /// `can_serve()` reporting stale `true` forever after a real halt. A
+    /// never cleared by step-down — the read path's own checks conjoin
+    /// `!halt_removed` for exactly that reason) would leave an embedded
+    /// caller's `is_leader()`/`can_serve()` reporting stale `true` forever
+    /// after a real halt. A
     /// removed FOLLOWER's flags were already `false` here (only a LEADER
     /// reaches `StepDownRemoved`), so this is a no-op there — the fix is
     /// entirely about the self-removal leader case Task 8 introduces.
@@ -2831,6 +2839,20 @@ impl Consensus {
         self.halt_removed = true;
         self.leader_flag.store(false, Ordering::Release);
         self.can_serve_flag.store(false, Ordering::Release);
+        // Veil §5 discharge, observation 1 (the parked-reads liveness
+        // blemish): `do_work` short-circuits every SUBSEQUENT cycle, so a
+        // read still parked here would never reach its deadline RETRY — the
+        // client's own timeout would be its only recovery. Answer everything
+        // in flight with the standard side-effect-free RETRY now, and drop
+        // the probe round: the consensus agent is parked, so no ack could
+        // ever complete it. Reads admitted LATER in this same halting cycle
+        // (the raw `sm.can_serve()` stays true — step-down never clears the
+        // SM's serving field) are refused/swept by the `halt_removed`
+        // conjunctions in `drain_query_ring` and `advance_pending_reads`.
+        self.current_round = None;
+        for r in std::mem::take(&mut self.pending_reads) {
+            self.send_retry(r.client_id, r.local_seq);
+        }
     }
 
     /// Archive-truncation feedback (slot ack). The map was already persisted
@@ -4034,6 +4056,41 @@ mod tests {
         h.cons.pending_reads.push(read);
         assert!(h.cons.advance_pending_reads());
         assert!(h.cons.pending_reads.is_empty(), "a non-serving node retries in-flight reads");
+    }
+
+    /// Veil §5 discharge, observation 1 (the parked-reads liveness blemish): a
+    /// halt (`HaltRemoved`/`StepDownRemoved`) must answer every parked read
+    /// with the standard side-effect-free RETRY and void the round — `do_work`
+    /// short-circuits every subsequent cycle, so nothing else can ever reach
+    /// their deadline path, and no ack can ever complete the round.
+    #[test]
+    fn halt_retries_parked_reads_and_voids_the_round() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        let far = h.cons.now_ns() + 10_000_000_000;
+        h.cons.pending_reads.push(mk_read(6048, h.cons.next_round_seq, far));
+        h.cons.maybe_issue_round();
+        assert!(h.cons.current_round.is_some());
+
+        h.cons.halt();
+        assert!(h.cons.pending_reads.is_empty(), "parked reads must be RETRYed at halt");
+        assert!(h.cons.current_round.is_none(), "nothing can ever complete a halted round");
+    }
+
+    /// A read that slips in AFTER `halt()` within the same duty cycle — the
+    /// raw `sm.can_serve()` is still true, because step-down never clears the
+    /// SM's serving field — must still be swept to RETRY by
+    /// `advance_pending_reads`' halt gate before the cycle ends.
+    #[test]
+    fn read_admitted_after_halt_is_still_retried() {
+        let mut h = harness();
+        drive_to_serving_leader(&mut h);
+        h.cons.halt();
+        assert!(h.cons.sm.can_serve(), "premise: the SM serving field survives halt");
+        let far = h.cons.now_ns() + 10_000_000_000;
+        h.cons.pending_reads.push(mk_read(6048, h.cons.next_round_seq, far));
+        assert!(h.cons.advance_pending_reads());
+        assert!(h.cons.pending_reads.is_empty(), "halt gate must RETRY same-cycle admissions");
     }
 
     // ---- M7 Task 6: persist-revert-BEFORE-truncate (`Action::Truncate` exec) ----
