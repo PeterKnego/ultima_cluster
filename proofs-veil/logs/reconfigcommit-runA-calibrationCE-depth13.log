@@ -1,0 +1,278 @@
+⚠ [711/1128] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1128] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1128] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+✖ [1418/1418] Building Examples.UC.ReconfigCommit (1224s)
+trace: .> LEAN_PATH=/home/claude/veil-spike/veil-preview/.lake/packages/cvc5/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Cli/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/batteries/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Qq/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/aesop/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/proofwidgets/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/importGraph/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/plausible/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/mathlib/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/auto/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/smt/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Loom/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/build/lib/lean /home/claude/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /home/claude/veil-spike/veil-preview/Examples/UC/ReconfigCommit.lean -o /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/ReconfigCommit.olean -i /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/ReconfigCommit.ilean -c /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/ReconfigCommit.c --setup /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/ReconfigCommit.setup.json --json
+error: Examples/UC/ReconfigCommit.lean:355:0: ❌ Violation: safety_failure (violates: leader_completeness)
+  Theory:
+    adjacencyGuard = true
+    crashEnabled = false
+    genesis = [0, 1, 2]
+    p2On = true
+    prefixCoupling = false
+    vacuityCanary = false
+  State 0 (via init):
+    candidate = []
+    cfg = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    committed = false
+    committedTerm = 0
+    curTerm = [[0, 0], [1, 0], [2, 0]]
+    hasAdopted = []
+    hasProposal = []
+    hasVoted = []
+    holdsE = []
+    leader = []
+    pending = []
+    propAfterE = []
+    proposed = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = []
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 0], [1, 0], [2, 0]]
+  State 1 (via startElection(i=0, t=1)):
+    candidate = [0]
+    cfg = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    committed = false
+    committedTerm = 0
+    curTerm = [[0, 1], [1, 0], [2, 0]]
+    hasAdopted = []
+    hasProposal = []
+    hasVoted = [0]
+    holdsE = []
+    leader = []
+    pending = []
+    propAfterE = []
+    proposed = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = []
+    voteTerm = [[0, 1], [1, 0], [2, 0]]
+  State 2 (via deliverRequestVoteGrant(c=0, j=1, t=1)):
+    candidate = [0]
+    cfg = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    committed = false
+    committedTerm = 0
+    curTerm = [[0, 1], [1, 1], [2, 0]]
+    hasAdopted = []
+    hasProposal = []
+    hasVoted = [0, 1]
+    holdsE = []
+    leader = []
+    pending = []
+    propAfterE = []
+    proposed = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 3 (via becomeLeader(i=0, q=[0, 1])):
+    candidate = []
+    cfg = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    committed = false
+    committedTerm = 0
+    curTerm = [[0, 1], [1, 1], [2, 0]]
+    hasAdopted = []
+    hasProposal = []
+    hasVoted = [0, 1]
+    holdsE = []
+    leader = [0]
+    pending = []
+    propAfterE = []
+    proposed = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 4 (via appendEntry(i=0)):
+    candidate = []
+    cfg = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    committed = false
+    committedTerm = 0
+    curTerm = [[0, 1], [1, 1], [2, 0]]
+    hasAdopted = []
+    hasProposal = []
+    hasVoted = [0, 1]
+    holdsE = [0]
+    leader = [0]
+    pending = []
+    propAfterE = []
+    proposed = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 5 (via replicate(i=0, j=2)):
+    candidate = []
+    cfg = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    committed = false
+    committedTerm = 0
+    curTerm = [[0, 1], [1, 1], [2, 1]]
+    hasAdopted = []
+    hasProposal = []
+    hasVoted = [0, 1]
+    holdsE = [0, 2]
+    leader = [0]
+    pending = []
+    propAfterE = []
+    proposed = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 6 (via commitEntry(i=0, q=[0, 2])):
+    candidate = []
+    cfg = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    committed = true
+    committedTerm = 1
+    curTerm = [[0, 1], [1, 1], [2, 1]]
+    hasAdopted = []
+    hasProposal = []
+    hasVoted = [0, 1]
+    holdsE = [0, 2]
+    leader = [0]
+    pending = []
+    propAfterE = []
+    proposed = [[0, [0, 1, 2]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 7 (via proposeRemove(i=0, x=2)):
+    candidate = []
+    cfg = [[0, [0, 1]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    committed = true
+    committedTerm = 1
+    curTerm = [[0, 1], [1, 1], [2, 1]]
+    hasAdopted = [[0, 0]]
+    hasProposal = [0]
+    hasVoted = [0, 1]
+    holdsE = [0, 2]
+    leader = [0]
+    pending = [0]
+    propAfterE = [0]
+    proposed = [[0, [0, 1]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 8 (via adopt(i=0, j=1)):
+    candidate = []
+    cfg = [[0, [0, 1]], [1, [0, 1]], [2, [0, 1, 2]]]
+    committed = true
+    committedTerm = 1
+    curTerm = [[0, 1], [1, 1], [2, 1]]
+    hasAdopted = [[0, 0], [1, 0]]
+    hasProposal = [0]
+    hasVoted = [0, 1]
+    holdsE = [0, 2]
+    leader = [0]
+    pending = [0]
+    propAfterE = [0]
+    proposed = [[0, [0, 1]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 9 (via commitCfg(i=0, q=[0, 1])):
+    candidate = []
+    cfg = [[0, [0, 1]], [1, [0, 1]], [2, [0, 1, 2]]]
+    committed = true
+    committedTerm = 1
+    curTerm = [[0, 1], [1, 1], [2, 1]]
+    hasAdopted = [[0, 0], [1, 0]]
+    hasProposal = []
+    hasVoted = [0, 1]
+    holdsE = [0, 2]
+    leader = [0]
+    pending = []
+    propAfterE = [0]
+    proposed = [[0, [0, 1]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 10 (via proposeRemove(i=0, x=0)):
+    candidate = []
+    cfg = [[0, [1]], [1, [0, 1]], [2, [0, 1, 2]]]
+    committed = true
+    committedTerm = 1
+    curTerm = [[0, 1], [1, 1], [2, 1]]
+    hasAdopted = [[0, 0]]
+    hasProposal = [0]
+    hasVoted = [0, 1]
+    holdsE = [0, 2]
+    leader = [0]
+    pending = [0]
+    propAfterE = [0]
+    proposed = [[0, [1]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 11 (via adopt(i=0, j=1)):
+    candidate = []
+    cfg = [[0, [1]], [1, [1]], [2, [0, 1, 2]]]
+    committed = true
+    committedTerm = 1
+    curTerm = [[0, 1], [1, 1], [2, 1]]
+    hasAdopted = [[0, 0], [1, 0]]
+    hasProposal = [0]
+    hasVoted = [0, 1]
+    holdsE = [0, 2]
+    leader = [0]
+    pending = [0]
+    propAfterE = [0]
+    proposed = [[0, [1]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1]]
+    voteCand = [[0, 0], [1, 0], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 1], [2, 0]]
+  State 12 (via startElection(i=1, t=2)):
+    candidate = [1]
+    cfg = [[0, [1]], [1, [1]], [2, [0, 1, 2]]]
+    committed = true
+    committedTerm = 1
+    curTerm = [[0, 1], [1, 2], [2, 1]]
+    hasAdopted = [[0, 0], [1, 0]]
+    hasProposal = [0]
+    hasVoted = [0, 1]
+    holdsE = [0, 2]
+    leader = [0]
+    pending = [0]
+    propAfterE = [0]
+    proposed = [[0, [1]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1], [1, 2]]
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 2], [2, 0]]
+  State 13 (via becomeLeader(i=1, q=[1])):
+    candidate = []
+    cfg = [[0, [1]], [1, [1]], [2, [0, 1, 2]]]
+    committed = true
+    committedTerm = 1
+    curTerm = [[0, 1], [1, 2], [2, 1]]
+    hasAdopted = [[0, 0], [1, 0]]
+    hasProposal = [0]
+    hasVoted = [0, 1]
+    holdsE = [0, 2]
+    leader = [0, 1]
+    pending = [0]
+    propAfterE = [0]
+    proposed = [[0, [1]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1], [1, 2]]
+    voteCand = [[0, 0], [1, 1], [2, 2]]
+    voteMsg = [[1, [0, 1]]]
+    voteTerm = [[0, 1], [1, 2], [2, 0]]
+error: Lean exited with code 1
+Some required targets logged failures:
+- Examples.UC.ReconfigCommit
+error: build failed
+EXIT=1

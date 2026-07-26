@@ -565,3 +565,130 @@ Constraints can silently destroy the behaviour they were meant to make searchabl
 a clean verdict looks identical either way. Same class of trap as "an elaboration error
 silently VOIDS a `#model_check`" (session 4) — a green that means nothing. The canary is
 the only cheap way to tell the two apart.
+
+---
+
+### SESSION 6 (2026-07-26, fable) — the Reconfig COMMIT/LOG PLANE, option-(a) arc, bars 1–2
+Brief: docs/superpowers/specs/2026-07-26-uc2-veil-reconfig-commit-plane-brief.md (user-decided
+option (a); this session = build + calibrate + CHECKPOINT, proof push deliberately NOT started).
+Worktree: .claude/worktrees/uc2-veil-commit-plane (branch uc2/veil-commit-plane off main 59c1b60).
+Ground truth: the DISCHARGED §5 Q2 mechanism chain (gate doc, CONFIRMED-SAFE) — first session of
+the spike where model refinement starts from a verified Rust map, not guesses.
+
+#### New models (Reconfig.lean untouched, archived as the spike artifact)
+* **ReconfigCommit.lean** — entry-level commit/log plane over the reconfig model: holdsE /
+  committed / committedTerm; commitEntry = quorum-witness majority of the leader's CURRENT
+  config, every member holding E (Q2 links 1+2 by construction), leader holding E (link 3 —
+  the thrice-recurring trap, honored from the start); propAfterE recorded at PROPOSE time
+  (whether the config entry sits after E in the proposer's stream); THE KNOB prefixCoupling
+  gates adopt on (¬propAfterE i ∨ holdsE j). Knob does NOT weaken commitEntry counting —
+  that would admit a depth-~7 phantom commit BFS would return INSTEAD of the config-walk CE
+  (the session-4 "wrong bug" trap). State diet vs ReconfigLC: tally collapsed via
+  quorum-witness params (drops votes : node→nodeSet, 512×), elecQuorum dropped (P1 not
+  chased per brief), crashRestart knob-gated OFF in bounded runs. This turned ReconfigLC's
+  700-s no-verdict wall into a 26-min decisive CE.
+* **ReconfigCommitSMT.lean** — the abstract-quorum sketch for the inductive route (defs +
+  property statements ONLY; #check_invariants deliberately not run): cfgid/quorum types,
+  cmember/qmember/quorumOf + C5 same-config intersection, succCfg with apply's ±1 shape,
+  adjacent_cfg_quorum_intersection stated as a LOUDLY-MARKED assumption that next session
+  must DISCHARGE as a theorem (routes r1 concrete-majority-instantiation proof / r2
+  in-module counting, r2 risks the List-universe wall), commitCfgid/commitQuorum history
+  variables, P2 stated, seed invariant clauses incl. the load-bearing candidate
+  electable_cfgs_contain_holder (expected to be REFINED by the CTI loop, not survive).
+
+#### BAR 1 — CALIBRATION PASSED (uncoupled CE = the F-M7-2 shape, depth 13)
+Run A (coupling OFF, adjacency ON, n=3/Fin 3, maxDepth 14): ❌ leader_completeness at
+DEPTH 13, ~26 min, matching the pre-run hand-derived trace step for step:
+commit E under {0,1,2} with holders {0,2} → VALID adjacent walk {0,1,2}→{0,1}→{1} adopted
+by NON-holder 1 (the knobbed adopt-without-prefix move, twice) → node 1 self-elects at t2
+under {1} holding nothing. Every step except the two adopts is real-UC-legal; the two-hop
+chain is FORCED by the up-to-date restriction (holder refuses non-holder under {0,1}), so
+the shallowest CE sits exactly at the class the plane exists to see. Log:
+logs/reconfigcommit-runA-calibrationCE-depth13.log.
+
+#### TWO MODEL-FIDELITY GAPS (the session's substantive fidelity output; both would have
+#### fired in BOTH knob positions = broken the calibration architecture, not flattered it)
+12. **commitCfg was ungated ("sound superset" — WRONG).** Attempt-1 returned a depth-11 CE
+    riding it: config chain to {0} with ZERO follower adoptions (states 4→7→8), then a solo
+    commitEntry(0,q={0}) invisible to a legitimately-elected t2 leader. Adjudicated
+    UNREACHABLE in Rust: a config entry commits like any entry — C_new-quorum durable past
+    it (Q1's "⌈n/2⌉ genuine C_new ackers", removed leader's self-ack a non-voter seed;
+    ChangePending clears only at commit). The over-approx was not "sound direction" here
+    because the artifact CE is knob-INDEPENDENT and would mask the class the knob isolates.
+    FIX: hasAdopted (J I) evidence (cleared per propose, proposer self-adopts at append,
+    set at adopt) + commitCfg (i, q) requiring a C_new-majority of hasAdopted witnesses
+    (∩ cfg i automatically discards a removed leader's self-ack). Log of the artifact CE:
+    logs/reconfigcommit-runA-attempt1-artifactCE.log.
+13. **Vote granting was not membership-gated on the voter's ADOPTED config** (Q2 link 5;
+    caught by hand-tracing the post-12 model, session-4 discipline). Without it even the
+    COUPLED model loses E: a PRE-E config walk shrinks the voter set legitimately (config
+    entries preceding E carry no prefix obligation — propAfterE=false), E commits under the
+    shrunken config, then a stale-config candidate assembles an old-config quorum from
+    voters who moved on — grants real UC refuses (M7 membership-gated solicitation/
+    granting, tombstones). FIX: require nset.contains c (cfg j) in the grant arm.
+    LOAD-BEARING for P2: this gate, not adjacency, is what blocks stale-config elections
+    after legal pre-E shrinks.
+
+#### Recorded obligations/narrowings (non-gap)
+* Report plane collapsed (counting toward E's commit ⟹ holdsE by construction): justified
+  by Q2 links 1+2 CONFIRMED-SAFE; the stale-report class stays banked in BootGate/Finding9 —
+  this plane cannot re-find #5/#9-class bugs, by design.
+* Below-floor/snapshot (Q2 link 4) not modeled; snapshot-carried-config argued equivalent-
+  or-stronger under the coupling, unchecked.
+* No leader step-down on self-removal (session-3 carry-over): benign for P2 (a self-removed
+  leader holds E; Q1's deliberate serve-until-commit window), would over-count for
+  "current leader" properties.
+* Adopt window closes at commitCfg (hasProposal cleared): real UC allows later adoption via
+  journal replay/snapshot; benign under coupling (late adopters hold the prefix a fortiori),
+  but the coupled clean verdict is "clean within this restriction".
+
+#### Coupled runs + box data
+* Run B (coupling ON, maxDepth 15): ABANDONED at ~50 min — lean 6.5 GB RSS, 3 GB avail and
+  falling; killed before OOM, NO verdict (Lean buffers until elaboration ends).
+* Run B (coupling ON, maxDepth 13 = the calibration horizon): TWO attempts died at almost
+  exactly ~60 min wall with NO verdict and NO OOM/memwatch evidence (attempt 2 had 7 GB
+  available minutes before death) — diagnosed as the **harness background-task ~60-min
+  ceiling** killing the pipeline, a NEW toolchain gotcha for runs of this size: Lean buffers
+  verdicts until elaboration ends, so any external kill loses everything. Attempt 1 was
+  initially misread as a kernel OOM (2.9 GB avail at last poll made it look imminent);
+  attempt 2 falsified that. WORKAROUND: `setsid`-detach the `lake build` from the task
+  lifecycle and poll the log file. Also reclaimed ~4 GB of foreign idle rust-analyzer
+  daemons before attempt 2 (recoverable tooling, no git/session state) — kept as headroom
+  hygiene even though memory was not the killer.
+* THE ACCIDENTAL BATCH (recorded honestly): an earlier edit removed the block-comment
+  OPENER guarding runs C/D, so the setsid-detached build ran B+C+D SEQUENTIALLY (~80 min,
+  lean peak ~7.7 GB observed) and then hit a parse error on the now-dangling
+  `RUNS-DISABLED-END -/` marker line. Adjudicated per the zero-error discipline: the only
+  `error:` lines are the EXPECTED canary violation and the trailing junk AT LINE 393,
+  positioned AFTER the final verdict — the model itself elaborated cleanly and every
+  verdict carries a state count or concrete trace, so the verdicts stand (the session-4
+  voiding trap is an error INSIDE the model definition, which this is not). Marker line
+  removed from the archived file; a fresh full build would re-run B/C/D.
+* **RUN B VERDICT: ✅ No violation, 4,211,943 states (coupling ON, maxDepth 13 = the
+  calibration horizon). BOUNDED, not safe** — same-model pairing with run A's ❌ at 13:
+  the checker finds the loss without the mechanism and loses it with the mechanism.
+  Also re-verifies election_safety in the coupled model through d13.
+* **RUN C VERDICT: ❌ p2_antecedent_canary at depth 10 — non-vacuity WITNESSED** (the
+  good outcome): a commit + a later-term leader under a changed config is reachable with
+  the coupling ON, so B's clean is not "nothing interesting happens". The witness's shape
+  is itself a finding — see the stream-conflation obligation below.
+* **RUN D VERDICT: ✅ No violation, 9,160,143 states (UNCOUPLED model, p2 gated off,
+  maxDepth 14)** — election_safety regression-clean in the strictly-larger uncoupled
+  behaviour set through depth 14 (run A additionally guarantees no election_safety
+  violation at depth ≤ 12 in that model, BFS shallowest-violation).
+* NEW OBLIGATION (from run C's witness — the checker teaching again): with ONE tracked
+  entry and NO per-term stream identity, a STALE t1 leader can commit E counting a holder
+  whose `holdsE` came from its own t2 APPEND (trace: leader 2 appends at t1; node 0 wins
+  t2, proposes remove, appends "E"; stale leader 2 commits with q={0,2}). Real UC rejects
+  this — reports are handle-term-stamped and a t1 leader drops t2 reports (BootGate/
+  Finding9 carry that machinery; this plane collapsed it, obligation above). This is an
+  OVER-approximation (extra behaviours — sound direction for the P2 verdicts), and it is
+  exactly the brief's optional "run-2 narrowing lift" (per-term stream identity / an
+  `entryTerm`) surfacing in the commit plane. NOT forced now (per brief: "do not force
+  it"); flagged for the SMT session as a likely source of nuisance CTIs.
+
+#### Checkpoint
+Memo: docs/benchmarks/uc2-veil-commit-plane-checkpoint-2026-07-26.md (re-estimate: 1–2
+LC-task S2-equiv — anchor plausible as a floor; adjacency-lemma discharge separable
+~0.5–1; stale-config-candidate case = expected CTI hotspot; canon-obligation note).
+STOPPED at the re-gate per the brief; proof push awaits user go/no-go.
