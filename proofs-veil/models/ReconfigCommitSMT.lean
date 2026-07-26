@@ -1,9 +1,23 @@
 import Veil
 
-/- UC v2.1 (M7) reconfig commit plane — ABSTRACT-QUORUM SKETCH for the SMT/inductive
-   route (option (a), session-1 deliverable: definitions + property statements ONLY.
-   `#check_invariants` is deliberately NOT run here — the invariant hunt is the NEXT
-   session's work. Scratch — NEVER the record).
+/- UC v2.1 (M7) reconfig commit plane — ABSTRACT-QUORUM model for the SMT/inductive
+   route (option (a)). Scratch — NEVER the record.
+
+   SESSION-2 (bar 3, part 1) STATE — see proofs-veil/spike-ledger.md §SESSION 7:
+     * `#check_invariants` IS run (bottom of file). Run 3: **170 ✅ / 6 ❌** —
+       12 of 16 clauses CERTIFIED INDUCTIVE, all-n, via cvc5, in ~93 s.
+     * STILL OPEN: `election_safety` (1 CTI), `leader_completeness` = P2 (2 CTIs),
+       `electable_cfgs_contain_holder` (3 CTIs). All four are blocked on the SAME
+       two adjudicated model-fidelity gaps (ledger items 14/15 = MODEL-EDIT-1/2),
+       which are DELIBERATELY NOT APPLIED pending the mid-arc Fable gate:
+         - MODEL-EDIT-1: `commitEntry` must count only reports term-stamped with
+           the committing leader's own term (election.rs:545-552/566-570). Without
+           it P2 is REACHABLY FALSE here (Figure-8 shape at n=5 — ledger 14).
+         - MODEL-EDIT-2: vote granting must respect CONFIG-entry currency, not just
+           E (log_ok over `durable`, election.rs:342-350/1240-1247, and config
+           frames live in `durable` — gate doc §5 Q2 link 1).
+     * GHOST STATE (elecCfg / gotEAt / isCommitLeader / commitElecCfg) appears in NO
+       `require` — the reachable behaviour set is unchanged by it.
 
    WHY THIS FILE EXISTS: the concrete-TSet model (ReconfigCommit.lean) cannot take
    the SMT inductiveness path — TSet's List-backed count/intersection ops break VC
@@ -13,19 +27,22 @@ import Veil
    evolution as an abstract successor relation whose ±1 shape is axiomatized from
    `ClusterConfig::apply` (the unique shared transition, one change in flight).
 
-   THE ADJACENCY OBLIGATION — a theorem, not an axiom (brief requirement):
-   `adjacent_cfg_quorum_intersection` below is stated as an `assumption` in this
-   sketch, but next session it MUST be discharged, not assumed. It is true for
+   THE ADJACENCY OBLIGATION — **DISCHARGED (route r1), see QuorumAdjacency.lean**:
+   `adjacent_cfg_quorum_intersection` below is an `assumption` here, but it is now a
+   PROVED THEOREM of the intended interpretation (cfgid = Finset node, quorum =
+   strict-majority subset, succCfg = ±1 voter) — as are the other three assumptions
+   of the bundle, so no verdict over it is vacuous. Original note follows. It is true for
    majority quorums under ±1 change (arithmetic: for |C| = n, a C-quorum has
    ≥ ⌊n/2⌋+1 members and a (C∖{x})-quorum ≥ ⌊(n-1)/2⌋+1, and
    ⌊n/2⌋ + ⌊(n-1)/2⌋ + 1 = n > n-1 forces intersection even after deleting x;
    the add case is symmetric), but that arithmetic is NOT derivable in the
    relational fragment. Two candidate discharge routes, next session's choice:
-     (r1) prove it as a plain Lean theorem over a concrete majority interpretation
-          of `quorumOf` (count-based over Finset), and cite it as the instantiation
-          obligation of the assumption — the assumption then has a proved witness;
-     (r2) enrich the module with enough counting theory to derive it in-module
-          (risk: reopens the List-universe wall).
+     (r1) [CHOSEN + DONE] prove it as a plain Lean theorem over a concrete majority
+          interpretation of `quorumOf` (count-based over Finset), and cite it as the
+          instantiation obligation of the assumption — the assumption then has a
+          proved witness. Also proves the BUNDLE satisfiable (anti-vacuity).
+     (r2) [not taken] enrich the module with enough counting theory to derive it
+          in-module (risk: reopens the List-universe wall).
 
    FIDELITY NOTES CARRIED FROM ReconfigCommit.lean (same plane, abstract dress):
      * report plane collapsed: commit-quorum membership requires `holdsE` by
@@ -84,6 +101,22 @@ individual committedTerm : term
 individual commitCfgid   : cfgid    -- the config in force at commit time
 individual commitQuorum  : quorum   -- the certifying quorum (all E-holders)
 
+-- GHOST / HISTORY STATE (session 2). None of these appear in any `require`, so
+-- the reachable behaviour set is UNCHANGED — they exist only so the induction
+-- can name facts the plain state forgets. (Distinct from a MODEL-EDIT, which
+-- changes what the model can do; see spike-ledger.md session 7.)
+--   elecCfg N       : the config N's CURRENT leadership was certified against
+--                     (`cfgOf N` at becomeLeader — a later `propose` moves
+--                     `cfgOf` but must not retroactively re-certify the win).
+--   gotEAt N        : the term at which N ACQUIRED E (curTerm at append/replicate).
+--   isCommitLeader  : the node that performed the commit (its election evidence
+--                     must outlive its leadership for the same-term case of P2).
+--   commitElecCfg   : that node's elecCfg at commit time.
+function elecCfg (N : node) : cfgid
+function gotEAt  (N : node) : term
+relation isCommitLeader (N : node)
+individual commitElecCfg : cfgid
+
 #gen_state
 
 -- ---------- quorum theory (Lean C5 idiom) ----------
@@ -124,6 +157,10 @@ after_init {
   reqVote C T := false
   voteMsg V C T := false
   cfgOf N := genesisC
+  elecCfg N := genesisC
+  gotEAt N := tot.zero
+  isCommitLeader N := false
+  commitElecCfg := genesisC
   pending N := false
   hasProposal N := false
   proposedC N := genesisC
@@ -171,6 +208,7 @@ action becomeLeader (i : node) (q : quorum) {
   require ∀ V, qmember V q → (V = i ∨ voteMsg V i (curTerm i))
   leader i := true
   candidate i := false
+  elecCfg i := cfgOf i
 }
 
 action crashRestart (i : node) {
@@ -183,6 +221,7 @@ action crashRestart (i : node) {
 action appendEntry (i : node) {
   require leader i
   require ¬ committed
+  if ¬ holdsE i then gotEAt i := curTerm i
   holdsE i := true
 }
 
@@ -190,6 +229,7 @@ action replicate (i : node) (j : node) {
   require leader i
   require holdsE i
   require tot.le (curTerm j) (curTerm i)
+  if ¬ holdsE j then gotEAt j := curTerm i
   candidate j := false
   leader j := false
   curTerm j := curTerm i
@@ -206,6 +246,9 @@ action commitEntry (i : node) (q : quorum) {
   committedTerm := curTerm i
   commitCfgid := cfgOf i
   commitQuorum := q
+  isCommitLeader N := false
+  isCommitLeader i := true
+  commitElecCfg := elecCfg i
 }
 
 -- ---------- config plane ----------
@@ -268,8 +311,11 @@ invariant [grant_uniq]
   voteMsg V C1 T ∧ voteMsg V C2 T → C1 = C2
 invariant [self_vote]
   (candidate I ∨ leader I) → (hasVoted I ∧ voteTerm I = curTerm I ∧ voteCand I = I)
+-- CTI-1 fix (run 1, `propose`): a leader's win is certified against the config
+-- in force AT ELECTION TIME; `propose` moves `cfgOf` without re-certifying, so
+-- the clause must name `elecCfg`, not `cfgOf`.
 invariant [leader_quorum]
-  leader I → ∃ (q : quorum), quorumOf q (cfgOf I) ∧
+  leader I → ∃ (q : quorum), quorumOf q (elecCfg I) ∧
     (∀ V, qmember V q → (V = I ∨ voteMsg V I (curTerm I)))
 
 -- commit-plane clauses:
@@ -279,6 +325,31 @@ invariant [commit_quorum_sound]  -- ...and is a quorum of the config in force at
   committed → quorumOf commitQuorum commitCfgid
 invariant [commit_term_bound]    -- E was committed at a term some leader actually reached
   committed → ∃ N, tot.le committedTerm (curTerm N)
+
+-- CTI-3 fix (run 1, `becomeLeader`): the up-to-date grant guard says a HOLDER
+-- never grants to a NON-holder — but only at grant time. `gotEAt` supplies the
+-- ordering: a grant at a term strictly ABOVE the voter's acquisition term must
+-- postdate that acquisition (grants raise curTerm; replicate/append require
+-- curTerm <= source), so the guard applied and the candidate holds E.
+invariant [holder_grants_are_covered]
+  (voteMsg V C T ∧ holdsE V ∧ tlt (gotEAt V) T) → holdsE C
+
+-- the commit leader's election evidence must outlive its leadership: P2's
+-- same-term case (curTerm L = committedTerm) closes through grant_uniq against
+-- THIS quorum, not through the transient `leader` flag.
+invariant [commit_leader_evidence]
+  committed → ∃ (i : node), isCommitLeader i ∧ holdsE i ∧
+    (∃ (q : quorum), quorumOf q commitElecCfg ∧
+      (∀ V, qmember V q → (V = i ∨ voteMsg V i committedTerm)))
+
+-- ghost-state soundness (keeps the commit-leader evidence usable: without these
+-- the solver invents pre-states with two commit leaders, or one before any commit)
+invariant [commit_leader_unique]
+  (isCommitLeader I ∧ isCommitLeader J) → I = J
+invariant [commit_leader_only_after_commit]
+  isCommitLeader I → committed
+invariant [gotE_bounded]
+  holdsE V → tot.le (gotEAt V) (curTerm V)
 
 -- THE LOAD-BEARING CANDIDATE (early signal, unproved): after commit, EVERY config
 -- any node has adopted only has quorums that contain an E-holder — the invariant
@@ -291,6 +362,6 @@ invariant [electable_cfgs_contain_holder]
 
 #gen_spec
 
--- NEXT SESSION: #check_invariants (cvc5, all-n) — deliberately not run in this
--- sketch; the clause set above is a seed, not a claim.
--- #check_invariants
+-- RUN 3 (session 2): (a)-class clause repairs complete (ghost state only —
+-- no action guard changed, so the reachable behaviour set is run-1's).
+#check_invariants

@@ -1,0 +1,764 @@
+Sun Jul 26 23:31:46 UTC 2026
+⚠ [711/1187] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1187] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1187] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+✖ [1418/1418] Building Examples.UC.ReconfigCommitSMT (91s)
+trace: .> LEAN_PATH=/home/claude/veil-spike/veil-preview/.lake/packages/cvc5/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Cli/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/batteries/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Qq/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/aesop/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/proofwidgets/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/importGraph/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/plausible/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/mathlib/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/auto/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/smt/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Loom/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/build/lib/lean /home/claude/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /home/claude/veil-spike/veil-preview/Examples/UC/ReconfigCommitSMT.lean -o /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/ReconfigCommitSMT.olean -i /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/ReconfigCommitSMT.ilean -c /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/ReconfigCommitSMT.c --setup /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/ReconfigCommitSMT.setup.json --json
+error: Examples/UC/ReconfigCommitSMT.lean:350:0: Initialization must establish the invariant:
+  doesNotThrow ... ✅
+  election_safety ... ✅
+  leader_completeness ... ✅
+  grant_state ... ✅
+  grant_uniq ... ✅
+  self_vote ... ✅
+  leader_quorum ... ✅
+  commit_backed ... ✅
+  commit_quorum_sound ... ✅
+  commit_term_bound ... ✅
+  holder_grants_are_covered ... ✅
+  commit_leader_evidence ... ✅
+  commit_leader_unique ... ✅
+  commit_leader_only_after_commit ... ✅
+  gotE_bounded ... ✅
+  electable_cfgs_contain_holder ... ✅
+The following set of actions must preserve the invariant and successfully terminate:
+  propose
+    doesNotThrow ... ✅
+    election_safety ... ✅
+    leader_completeness ... ✅
+    grant_state ... ✅
+    grant_uniq ... ✅
+    self_vote ... ✅
+    leader_quorum ... ✅
+    commit_backed ... ✅
+    commit_quorum_sound ... ✅
+    commit_term_bound ... ✅
+    holder_grants_are_covered ... ✅
+    commit_leader_evidence ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    gotE_bounded ... ✅
+    electable_cfgs_contain_holder ... ❌
+      Counterexample (WP):
+        Theory:
+          cmember = [[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2]]
+          genesisC = 0
+          qmember = [[0, 1], [1, 0]]
+          quorumOf = [[0, 0], [1, 1]]
+          succCfg = [[0, 0], [2, 0]]
+          tot.le = [[0, 0]]
+          tot.zero = 0
+        Pre-state:
+          candidate = []
+          cfgOf = [[0, 2], [1, 2]]
+          commitCfgid = 1
+          commitElecCfg = 0
+          commitQuorum = 1
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 0], [1, 2]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = []
+          hasProposal = []
+          hasVoted = [0, 1]
+          holdsE = [0]
+          isCommitLeader = [0]
+          leader = [0]
+          pending = []
+          propAfterE = []
+          proposedC = [[0, 0], [1, 0]]
+          reqVote = []
+          voteCand = [[0, 0], [1, 0]]
+          voteMsg = [[[1, 0], 0]]
+          voteTerm = [[0, 0], [1, 0]]
+        Action: propose(d=0, i=0)
+      Counterexample (TR):
+        Theory:
+          cmember = [[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2]]
+          genesisC = 0
+          qmember = [[0, 1], [1, 0]]
+          quorumOf = [[0, 1], [1, 0]]
+          succCfg = [[2, 1]]
+          tot.le = [[0, 0]]
+          tot.zero = 0
+        Pre-state:
+          candidate = []
+          cfgOf = [[0, 2], [1, 2]]
+          commitCfgid = 0
+          commitElecCfg = 1
+          commitQuorum = 1
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 1], [1, 2]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [0]
+          isCommitLeader = [0]
+          leader = [0]
+          pending = [1]
+          propAfterE = [0, 1]
+          proposedC = [[0, 0], [1, 2]]
+          reqVote = [[0, 0], [1, 0]]
+          voteCand = [[0, 0], [1, 0]]
+          voteMsg = [[[1, 0], 0]]
+          voteTerm = [[0, 0], [1, 0]]
+        Action: propose(d=1, i=0)
+        Post-state:
+          candidate = []
+          cfgOf = [[0, 1], [1, 2]]
+          commitCfgid = 0
+          commitElecCfg = 1
+          commitQuorum = 1
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 1], [1, 2]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [0]
+          isCommitLeader = [0]
+          leader = [0]
+          pending = [0, 1]
+          propAfterE = [0, 1]
+          proposedC = [[0, 1], [1, 2]]
+          reqVote = [[0, 0], [1, 0]]
+          voteCand = [[0, 0], [1, 0]]
+          voteMsg = [[[1, 0], 0]]
+          voteTerm = [[0, 0], [1, 0]]
+  deliverRequestVoteGrant
+    doesNotThrow ... ✅
+    election_safety ... ✅
+    leader_completeness ... ✅
+    grant_state ... ✅
+    grant_uniq ... ✅
+    self_vote ... ✅
+    leader_quorum ... ✅
+    commit_backed ... ✅
+    commit_quorum_sound ... ✅
+    commit_term_bound ... ✅
+    holder_grants_are_covered ... ✅
+    commit_leader_evidence ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    gotE_bounded ... ✅
+    electable_cfgs_contain_holder ... ✅
+  replicate
+    doesNotThrow ... ✅
+    election_safety ... ✅
+    leader_completeness ... ✅
+    grant_state ... ✅
+    grant_uniq ... ✅
+    self_vote ... ✅
+    leader_quorum ... ✅
+    commit_backed ... ✅
+    commit_quorum_sound ... ✅
+    commit_term_bound ... ✅
+    holder_grants_are_covered ... ✅
+    commit_leader_evidence ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    gotE_bounded ... ✅
+    electable_cfgs_contain_holder ... ✅
+  becomeLeader
+    doesNotThrow ... ✅
+    election_safety ... ❌
+      Counterexample (WP):
+        Theory:
+          cmember = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          genesisC = 0
+          qmember = [[0, 0], [1, 1]]
+          quorumOf = [[0, 0], [1, 1]]
+          succCfg = []
+          tot.le = [[0, 0]]
+          tot.zero = 0
+        Pre-state:
+          candidate = [0]
+          cfgOf = [[0, 0], [1, 0]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitQuorum = 0
+          committed = false
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 1], [1, 1]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = []
+          hasProposal = []
+          hasVoted = [0, 1]
+          holdsE = []
+          isCommitLeader = []
+          leader = [1]
+          pending = []
+          propAfterE = []
+          proposedC = [[0, 0], [1, 0]]
+          reqVote = []
+          voteCand = [[0, 0], [1, 1]]
+          voteMsg = []
+          voteTerm = [[0, 0], [1, 0]]
+        Action: becomeLeader(i=0, q=0)
+      Counterexample (TR):
+        Theory:
+          cmember = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          genesisC = 0
+          qmember = [[0, 0], [1, 1]]
+          quorumOf = [[0, 0], [1, 1]]
+          succCfg = []
+          tot.le = [[0, 0]]
+          tot.zero = 0
+        Pre-state:
+          candidate = [0]
+          cfgOf = [[0, 0], [1, 0]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitQuorum = 0
+          committed = false
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 1], [1, 1]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = []
+          isCommitLeader = []
+          leader = [1]
+          pending = [0, 1]
+          propAfterE = [0, 1]
+          proposedC = [[0, 0], [1, 0]]
+          reqVote = [[0, 0], [1, 0]]
+          voteCand = [[0, 0], [1, 1]]
+          voteMsg = []
+          voteTerm = [[0, 0], [1, 0]]
+        Action: becomeLeader(i=0, q=0)
+        Post-state:
+          candidate = []
+          cfgOf = [[0, 0], [1, 0]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitQuorum = 0
+          committed = false
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 0], [1, 1]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = []
+          isCommitLeader = []
+          leader = [0, 1]
+          pending = [0, 1]
+          propAfterE = [0, 1]
+          proposedC = [[0, 0], [1, 0]]
+          reqVote = [[0, 0], [1, 0]]
+          voteCand = [[0, 0], [1, 1]]
+          voteMsg = []
+          voteTerm = [[0, 0], [1, 0]]
+    leader_completeness ... ❌
+      Counterexample (WP):
+        Theory:
+          cmember = [[0, 0], [1, 0]]
+          genesisC = 0
+          qmember = [[1, 0]]
+          quorumOf = [[0, 0]]
+          succCfg = []
+          tot.le = [[0, 0]]
+          tot.zero = 0
+        Pre-state:
+          candidate = [0]
+          cfgOf = [[0, 0], [1, 0]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = []
+          hasProposal = []
+          hasVoted = [0, 1]
+          holdsE = [1]
+          isCommitLeader = [1]
+          leader = []
+          pending = []
+          propAfterE = []
+          proposedC = [[0, 0], [1, 0]]
+          reqVote = []
+          voteCand = [[0, 0], [1, 0]]
+          voteMsg = [[[0, 0], 0], [[1, 0], 0]]
+          voteTerm = [[0, 0], [1, 0]]
+        Action: becomeLeader(i=0, q=0)
+      Counterexample (TR):
+        Theory:
+          cmember = [[0, 0], [1, 0]]
+          genesisC = 0
+          qmember = [[1, 0]]
+          quorumOf = [[0, 0]]
+          succCfg = []
+          tot.le = [[0, 0]]
+          tot.zero = 0
+        Pre-state:
+          candidate = [0]
+          cfgOf = [[0, 0], [1, 0]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [1]
+          isCommitLeader = [1]
+          leader = []
+          pending = [0, 1]
+          propAfterE = [0, 1]
+          proposedC = [[0, 0], [1, 0]]
+          reqVote = [[0, 0], [1, 0]]
+          voteCand = [[0, 0], [1, 0]]
+          voteMsg = [[[0, 0], 0], [[1, 0], 0]]
+          voteTerm = [[0, 0], [1, 0]]
+        Action: becomeLeader(i=0, q=0)
+        Post-state:
+          candidate = []
+          cfgOf = [[0, 0], [1, 0]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [1]
+          isCommitLeader = [1]
+          leader = [0]
+          pending = [0, 1]
+          propAfterE = [0, 1]
+          proposedC = [[0, 0], [1, 0]]
+          reqVote = [[0, 0], [1, 0]]
+          voteCand = [[0, 0], [1, 0]]
+          voteMsg = [[[0, 0], 0], [[1, 0], 0]]
+          voteTerm = [[0, 0], [1, 0]]
+    grant_state ... ✅
+    grant_uniq ... ✅
+    self_vote ... ✅
+    leader_quorum ... ✅
+    commit_backed ... ✅
+    commit_quorum_sound ... ✅
+    commit_term_bound ... ✅
+    holder_grants_are_covered ... ✅
+    commit_leader_evidence ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    gotE_bounded ... ✅
+    electable_cfgs_contain_holder ... ✅
+  crashRestart
+    doesNotThrow ... ✅
+    election_safety ... ✅
+    leader_completeness ... ✅
+    grant_state ... ✅
+    grant_uniq ... ✅
+    self_vote ... ✅
+    leader_quorum ... ✅
+    commit_backed ... ✅
+    commit_quorum_sound ... ✅
+    commit_term_bound ... ✅
+    holder_grants_are_covered ... ✅
+    commit_leader_evidence ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    gotE_bounded ... ✅
+    electable_cfgs_contain_holder ... ✅
+  commitEntry
+    doesNotThrow ... ✅
+    election_safety ... ✅
+    leader_completeness ... ❌
+      Counterexample (WP):
+        Theory:
+          cmember = [[0, 0], [1, 0], [2, 0]]
+          genesisC = 0
+          qmember = [[2, 0]]
+          quorumOf = [[0, 0]]
+          succCfg = []
+          tot.le = [[0, 0], [1, 0], [1, 1]]
+          tot.zero = 1
+        Pre-state:
+          candidate = []
+          cfgOf = [[0, 0], [1, 0], [2, 0]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitQuorum = 0
+          committed = false
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 1], [2, 0]]
+          elecCfg = [[0, 0], [1, 0], [2, 0]]
+          gotEAt = [[0, 1], [1, 1], [2, 0]]
+          hasAdopted = []
+          hasProposal = []
+          hasVoted = [0, 1, 2]
+          holdsE = [1, 2]
+          isCommitLeader = []
+          leader = [0, 1]
+          pending = []
+          propAfterE = []
+          proposedC = [[0, 0], [1, 0], [2, 0]]
+          reqVote = []
+          voteCand = [[0, 0], [1, 1], [2, 0]]
+          voteMsg = [[[2, 0], 0], [[2, 1], 1]]
+          voteTerm = [[0, 0], [1, 1], [2, 0]]
+        Action: commitEntry(i=1, q=0)
+      Counterexample (TR):
+        Theory:
+          cmember = [[0, 0], [1, 0], [2, 0]]
+          genesisC = 0
+          qmember = [[0, 0]]
+          quorumOf = [[0, 0]]
+          succCfg = []
+          tot.le = [[0, 0], [0, 1], [1, 1]]
+          tot.zero = 0
+        Pre-state:
+          candidate = []
+          cfgOf = [[0, 0], [1, 0], [2, 0]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitQuorum = 0
+          committed = false
+          committedTerm = 0
+          curTerm = [[0, 1], [1, 1], [2, 0]]
+          elecCfg = [[0, 0], [1, 0], [2, 0]]
+          gotEAt = [[0, 1], [1, 0], [2, 0]]
+          hasAdopted = [[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2], [2, 0], [2, 1], [2, 2]]
+          hasProposal = [0, 1, 2]
+          hasVoted = [0, 1, 2]
+          holdsE = [0, 2]
+          isCommitLeader = []
+          leader = [1, 2]
+          pending = [0, 1, 2]
+          propAfterE = [0, 1, 2]
+          proposedC = [[0, 0], [1, 0], [2, 0]]
+          reqVote = [[0, 0], [0, 1], [1, 0], [1, 1], [2, 0], [2, 1]]
+          voteCand = [[0, 1], [1, 1], [2, 2]]
+          voteMsg = [[[0, 1], 1], [[0, 2], 0], [[1, 1], 1]]
+          voteTerm = [[0, 1], [1, 1], [2, 0]]
+        Action: commitEntry(i=2, q=0)
+        Post-state:
+          candidate = []
+          cfgOf = [[0, 0], [1, 0], [2, 0]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 1], [1, 1], [2, 0]]
+          elecCfg = [[0, 0], [1, 0], [2, 0]]
+          gotEAt = [[0, 1], [1, 0], [2, 0]]
+          hasAdopted = [[0, 0], [0, 1], [0, 2], [1, 0], [1, 1], [1, 2], [2, 0], [2, 1], [2, 2]]
+          hasProposal = [0, 1, 2]
+          hasVoted = [0, 1, 2]
+          holdsE = [0, 2]
+          isCommitLeader = [2]
+          leader = [1, 2]
+          pending = [0, 1, 2]
+          propAfterE = [0, 1, 2]
+          proposedC = [[0, 0], [1, 0], [2, 0]]
+          reqVote = [[0, 0], [0, 1], [1, 0], [1, 1], [2, 0], [2, 1]]
+          voteCand = [[0, 1], [1, 1], [2, 2]]
+          voteMsg = [[[0, 1], 1], [[0, 2], 0], [[1, 1], 1]]
+          voteTerm = [[0, 1], [1, 1], [2, 0]]
+    grant_state ... ✅
+    grant_uniq ... ✅
+    self_vote ... ✅
+    leader_quorum ... ✅
+    commit_backed ... ✅
+    commit_quorum_sound ... ✅
+    commit_term_bound ... ✅
+    holder_grants_are_covered ... ✅
+    commit_leader_evidence ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    gotE_bounded ... ✅
+    electable_cfgs_contain_holder ... ❌
+      Counterexample (WP):
+        Theory:
+          cmember = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          genesisC = 0
+          qmember = [[0, 0], [1, 1]]
+          quorumOf = [[0, 0], [1, 1]]
+          succCfg = []
+          tot.le = [[0, 0]]
+          tot.zero = 0
+        Pre-state:
+          candidate = []
+          cfgOf = [[0, 0], [1, 1]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitQuorum = 0
+          committed = false
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 1], [1, 1]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = []
+          hasProposal = []
+          hasVoted = [0, 1]
+          holdsE = [1]
+          isCommitLeader = []
+          leader = [1]
+          pending = []
+          propAfterE = []
+          proposedC = [[0, 0], [1, 0]]
+          reqVote = []
+          voteCand = [[0, 0], [1, 1]]
+          voteMsg = []
+          voteTerm = [[0, 0], [1, 0]]
+        Action: commitEntry(i=1, q=1)
+      Counterexample (TR):
+        Theory:
+          cmember = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          genesisC = 0
+          qmember = [[0, 0], [1, 1]]
+          quorumOf = [[0, 0], [1, 1]]
+          succCfg = []
+          tot.le = [[0, 0]]
+          tot.zero = 0
+        Pre-state:
+          candidate = []
+          cfgOf = [[0, 0], [1, 1]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitQuorum = 0
+          committed = false
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 1], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [1]
+          isCommitLeader = []
+          leader = [1]
+          pending = [0, 1]
+          propAfterE = [0, 1]
+          proposedC = [[0, 0], [1, 0]]
+          reqVote = [[0, 0], [1, 0]]
+          voteCand = [[0, 1], [1, 1]]
+          voteMsg = [[[0, 1], 0], [[1, 1], 0]]
+          voteTerm = [[0, 0], [1, 0]]
+        Action: commitEntry(i=1, q=1)
+        Post-state:
+          candidate = []
+          cfgOf = [[0, 0], [1, 1]]
+          commitCfgid = 1
+          commitElecCfg = 0
+          commitQuorum = 1
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 1], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [1]
+          isCommitLeader = [1]
+          leader = [1]
+          pending = [0, 1]
+          propAfterE = [0, 1]
+          proposedC = [[0, 0], [1, 0]]
+          reqVote = [[0, 0], [1, 0]]
+          voteCand = [[0, 1], [1, 1]]
+          voteMsg = [[[0, 1], 0], [[1, 1], 0]]
+          voteTerm = [[0, 0], [1, 0]]
+  adopt
+    doesNotThrow ... ✅
+    election_safety ... ✅
+    leader_completeness ... ✅
+    grant_state ... ✅
+    grant_uniq ... ✅
+    self_vote ... ✅
+    leader_quorum ... ✅
+    commit_backed ... ✅
+    commit_quorum_sound ... ✅
+    commit_term_bound ... ✅
+    holder_grants_are_covered ... ✅
+    commit_leader_evidence ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    gotE_bounded ... ✅
+    electable_cfgs_contain_holder ... ❌
+      Counterexample (WP):
+        Theory:
+          cmember = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          genesisC = 0
+          qmember = [[0, 0], [1, 1]]
+          quorumOf = [[0, 0], [1, 1]]
+          succCfg = []
+          tot.le = [[0, 0]]
+          tot.zero = 0
+        Pre-state:
+          candidate = []
+          cfgOf = [[0, 1], [1, 1]]
+          commitCfgid = 1
+          commitElecCfg = 0
+          commitQuorum = 1
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = []
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [1]
+          isCommitLeader = [1]
+          leader = []
+          pending = []
+          propAfterE = []
+          proposedC = [[0, 0], [1, 0]]
+          reqVote = []
+          voteCand = [[0, 1], [1, 1]]
+          voteMsg = [[[0, 1], 0]]
+          voteTerm = [[0, 0], [1, 0]]
+        Action: adopt(i=0, j=1)
+      Counterexample (TR):
+        Theory:
+          cmember = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          genesisC = 0
+          qmember = [[0, 1], [1, 0]]
+          quorumOf = [[0, 1], [1, 0]]
+          succCfg = []
+          tot.le = [[0, 0]]
+          tot.zero = 0
+        Pre-state:
+          candidate = []
+          cfgOf = [[0, 0], [1, 0]]
+          commitCfgid = 0
+          commitElecCfg = 1
+          commitQuorum = 1
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 1], [1, 1]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [0]
+          isCommitLeader = [0]
+          leader = []
+          pending = [0, 1]
+          propAfterE = [0, 1]
+          proposedC = [[0, 1], [1, 1]]
+          reqVote = [[0, 0], [1, 0]]
+          voteCand = [[0, 0], [1, 0]]
+          voteMsg = [[[1, 0], 0]]
+          voteTerm = [[0, 0], [1, 0]]
+        Action: adopt(i=1, j=0)
+        Post-state:
+          candidate = []
+          cfgOf = [[0, 1], [1, 0]]
+          commitCfgid = 0
+          commitElecCfg = 1
+          commitQuorum = 1
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 1], [1, 1]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [0]
+          isCommitLeader = [0]
+          leader = []
+          pending = [0, 1]
+          propAfterE = [0, 1]
+          proposedC = [[0, 1], [1, 1]]
+          reqVote = [[0, 0], [1, 0]]
+          voteCand = [[0, 0], [1, 0]]
+          voteMsg = [[[1, 0], 0]]
+          voteTerm = [[0, 0], [1, 0]]
+  commitCfg
+    doesNotThrow ... ✅
+    election_safety ... ✅
+    leader_completeness ... ✅
+    grant_state ... ✅
+    grant_uniq ... ✅
+    self_vote ... ✅
+    leader_quorum ... ✅
+    commit_backed ... ✅
+    commit_quorum_sound ... ✅
+    commit_term_bound ... ✅
+    holder_grants_are_covered ... ✅
+    commit_leader_evidence ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    gotE_bounded ... ✅
+    electable_cfgs_contain_holder ... ✅
+  appendEntry
+    doesNotThrow ... ✅
+    election_safety ... ✅
+    leader_completeness ... ✅
+    grant_state ... ✅
+    grant_uniq ... ✅
+    self_vote ... ✅
+    leader_quorum ... ✅
+    commit_backed ... ✅
+    commit_quorum_sound ... ✅
+    commit_term_bound ... ✅
+    holder_grants_are_covered ... ✅
+    commit_leader_evidence ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    gotE_bounded ... ✅
+    electable_cfgs_contain_holder ... ✅
+  startElection
+    doesNotThrow ... ✅
+    election_safety ... ✅
+    leader_completeness ... ✅
+    grant_state ... ✅
+    grant_uniq ... ✅
+    self_vote ... ✅
+    leader_quorum ... ✅
+    commit_backed ... ✅
+    commit_quorum_sound ... ✅
+    commit_term_bound ... ✅
+    holder_grants_are_covered ... ✅
+    commit_leader_evidence ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    gotE_bounded ... ✅
+    electable_cfgs_contain_holder ... ✅
+warning: Examples/UC/ReconfigCommitSMT.lean:350:0: Trusting SMT solver for 159 goals. `set_option veil.smt.trust false` to enable proof reconstruction.
+error: Lean exited with code 1
+Some required targets logged failures:
+- Examples.UC.ReconfigCommitSMT
+error: build failed
+
+real	1m32.789s
+user	2m9.638s
+sys	0m2.991s
+Sun Jul 26 23:33:19 UTC 2026

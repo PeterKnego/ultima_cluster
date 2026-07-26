@@ -692,3 +692,159 @@ Memo: docs/benchmarks/uc2-veil-commit-plane-checkpoint-2026-07-26.md (re-estimat
 LC-task S2-equiv — anchor plausible as a floor; adjacency-lemma discharge separable
 ~0.5–1; stale-config-candidate case = expected CTI hotspot; canon-obligation note).
 STOPPED at the re-gate per the brief; proof push awaits user go/no-go.
+
+---
+
+### SESSION 7 (2026-07-26, opus) — BAR 3, the inductive proof push (part 1)
+Brief §"Re-gate outcome + bar-3 execution policy" (GO on bar 3; Opus drives the CTI
+loop, Fable gates twice). Worktree `.claude/worktrees/uc2-veil-commit-plane` @ `87e251d`.
+Runs in `/home/claude/veil-spike/veil-preview`, logs in `/home/claude/veil-spike/runs/`.
+Ground truth for every adjudication below: gate doc `uc2-veil-spike-2026-07-24.md` §5
+(the DISCHARGED Q2 chain) + the Rust it points at.
+
+#### ADJACENCY OBLIGATION — DISCHARGED, route **r1** (`QuorumAdjacency.lean`)
+Route choice + justification (checkpoint question 2): **r1** (plain-Lean proof over a
+concrete majority interpretation), because r1 buys a SECOND thing r2 does not — a
+**satisfiability witness for the whole abstract quorum bundle**. `#check_invariants`
+verdicts over Veil `assumption`s are vacuous if the assumptions are inconsistent, and
+this arc's bundle is 4 assumptions deep (`same_cfg_quorum_intersection`,
+`quorum_member_sound`, `succ_shape`, `adjacent_cfg_quorum_intersection`). r1 exhibits
+the intended interpretation (cfgid = `Finset node`, quorum = strict-majority subset,
+succCfg = ±1 voter) and proves ALL FOUR hold there, so every green in this arc is
+non-vacuous by construction. r2 (in-module counting) would have proved less and risked
+the `TSet` List-universe wall that killed `ReconfigLC.lean`'s SMT path.
+* `adjacent_cfg_intersection` + `same_cfg_intersection` + `quorum_member_sound_concrete`
+  + `succ_shape_concrete` + `self_is_quorum`: **all proved, `#print axioms` = only
+  `propext, Classical.choice, Quot.sound`** (no `sorry`, no model assumption).
+  Build: `lake build Examples.UC.QuorumAdjacency` green (1.6 s).
+* The counting core is one lemma (`inter_of_card`: two subsets of a carrier whose sizes
+  sum past it must meet) + `omega` on `card_union_add_card_inter`; the add case runs
+  against carrier `d` (|d| ≤ |c|+1), the remove case against carrier `c` (|c| ≤ |d|+1).
+  **The adjacency lemma is now a theorem, not an axiom** — the brief's requirement.
+
+#### (a)-CLASS CLAUSE WORK — 12 of 16 clauses CERTIFIED INDUCTIVE, all-n, cvc5
+Three runs, each ~60–95 s (the SMT route is ~25× cheaper per verdict than session 6's
+explicit-state runs — a material finding for planning: iterate freely here).
+* **Run 1** (`smt-run1-seed.log`, 63 s) — the session-1 seed set: 114 ✅ / 7 ❌.
+* **Run 2** (`smt-run2-ghost.log`, 74 s) — 137 ✅ / 6 ❌.
+* **Run 3** (`smt-run3-ghost-final.log`, 93 s) — **170 ✅ / 6 ❌**, final (a)-class state.
+
+**GHOST STATE ADDED (NOT a MODEL-EDIT — no `require` mentions any of it, so the
+reachable behaviour set is bit-for-bit run-1's; recorded here to keep the distinction
+auditable):** `elecCfg N` (config a leader's win was certified against), `gotEAt N`
+(term at which N acquired E), `isCommitLeader N` + `commitElecCfg` (the commit leader's
+election evidence, which must outlive its `leader` flag).
+
+CTIs adjudicated **(a) = missing/weak clause**, one line each:
+1. **`leader_quorum` ❌ under `propose`** — the clause named `cfgOf I`, which `propose`
+   MOVES; a leader's win is certified against the config in force AT ELECTION TIME and a
+   later proposal must not retroactively re-certify it. Fix: state it over `elecCfg I`.
+   ⇒ INDUCTIVE.
+2. **`leader_completeness` ❌ under `becomeLeader` with a holder's grant in the
+   pre-state** — the up-to-date guard (`¬(holdsE j ∧ ¬holdsE c)`) is a GRANT-TIME fact
+   the state forgets. Fix: `holder_grants_are_covered` — `voteMsg V C T ∧ holdsE V ∧
+   gotEAt V < T → holdsE C`; sound because a grant at a term strictly above the voter's
+   acquisition term must POSTDATE the acquisition (grants raise `curTerm`;
+   append/replicate require `curTerm ≤ source`), so the guard did apply. ⇒ INDUCTIVE.
+3. Ghost soundness clauses (`commit_leader_unique`, `commit_leader_only_after_commit`,
+   `gotE_bounded`) — the solver otherwise invents pre-states with two commit leaders.
+   ⇒ all INDUCTIVE.
+
+**Certified inductive (all-n, cvc5, 11/11 obligations each):** `grant_state`,
+`grant_uniq`, `self_vote`, `leader_quorum`, `commit_backed`, `commit_quorum_sound`,
+`commit_term_bound`, `holder_grants_are_covered`, `commit_leader_evidence`,
+`commit_leader_unique`, `commit_leader_only_after_commit`, `gotE_bounded`
+(+ `doesNotThrow`). **Still open:** `election_safety` (1 CTI, `becomeLeader`),
+`leader_completeness` = P2 (2 CTIs, `becomeLeader` + `commitEntry`),
+`electable_cfgs_contain_holder` (3 CTIs — the load-bearing candidate, as predicted).
+
+#### TWO MODEL-FIDELITY GAPS — ADJUDICATED, ANCHORED, **NOT YET APPLIED**
+Both are (b)-class = model infidelity. Per the bar-3 policy the ledger entry is written
+BEFORE the edit; the edits themselves are held for the mid-arc Fable gate (below), so
+nothing in run 3 is built on an unaudited model change.
+
+14. **PROPOSED `MODEL-EDIT-1` — `commitEntry` counts reports that are not the leader's.**
+    The model's `commitEntry` requires only `holdsE V` for quorum members. Real UC
+    counts a follower only via a **term-stamped Report**: `uc2_consensus/src/election.rs:545-552`
+    drops `term < current_term` ("stale report: dropped") and turns `term > current_term`
+    into `adopt_term` + return, so only a report whose sender was at the LEADER'S OWN
+    term ever reaches `self.tracker.on_durable(slot, durable)` (election.rs:566-570);
+    Raft §5.4.2's companion clamp is `new_term_pos` (election.rs:1451-1456, Finding #6b).
+    *Why it matters (hand-derived, n=5, every step legal in the CURRENT model):*
+    leader 0 wins t1 and appends E; node 2 wins t2 (grants from 1,4 — all non-holders,
+    so the up-to-date guard permits it) and does NOT hold E; node 3 wins t3 (grants from
+    1,4) and `appendEntry`s — which this one-tracked-entry plane CONFLATES with E —
+    then replicates to node 1; stale leader 0, never deposed, commits with q={0,1,3}.
+    Result: `committed`, `committedTerm = t1`, leader 2 at t2 ≥ t1 holding nothing =
+    **P2 reachably FALSE in the model as it stands**. This is the classical Figure-8
+    shape (n=5, matching #6b's Lean countermodel), i.e. the class UC FIXED and whose
+    machinery this plane collapsed (session-6 obligation 7, "no per-term stream
+    identity" — the brief's optional run-2 narrowing lift, now NOT optional).
+    *Proposed edit (minimal, over-approximating):* `commitEntry` additionally requires
+    `∀ V, qmember V q → tot.le (gotEAt V) (curTerm i)` — the quorum member acquired E at
+    a term no later than the committing leader's. Strictly WEAKER than the Rust gate
+    (which demands the report term EQUAL the leader's term), so it keeps more
+    behaviours = the sound direction, and it needs no new message plane: `gotEAt` is
+    already the ghost variable added for CTI-2. Every real UC behaviour satisfies it
+    (a follower reporting at T1 is at curTerm T1, and `curTerm` only rises after
+    acquisition). NOT applied this session.
+15. **PROPOSED `MODEL-EDIT-2` — vote granting ignores CONFIG-entry currency.**
+    Run-3 CTI (`election_safety` ❌ under `becomeLeader`): node 0 self-elects under
+    config `{0}` while node 1 is leader at the SAME term under config `{1}` — two
+    disjoint singleton quorums of NON-ADJACENT configs. First adjudicated as (a) and
+    REJECTED as (a): a config-lineage invariant kills this particular CTI but not the
+    class — hand-derived n=5 trace over a perfectly legal single-server chain
+    `{0..4} → {0,1,2,3} → {0,1,2}`: nodes 0 and 4 never adopt (a C_1 commit needs only
+    3 of 4, a C_2 commit only 2 of 3), then node 0 wins term T under the stale `{0..4}`
+    with grants from 3,4 while node 2 wins the SAME term under `{0,1,2}` with a grant
+    from 1. Both wins are legal in the model ⇒ no invariant can exclude it ⇒ (b).
+    *Rust adjudication — NOT a real bug:* real UC's grant is gated on
+    `log_ok` — `(cand_last_term, cand_last_durable) >= (our_term, our_durable)`
+    (`uc2_consensus/src/election.rs:342-350` free-function form, `:1240-1247` method,
+    call site `:1222`) — and **config frames ARE log entries inside `durable`**, the
+    contiguous fsynced frontier (gate doc §5 Q2 link 1, CONFIRMED-SAFE). Node 3, holding
+    the C_1 config entry, has a strictly longer log than candidate node 0 at equal
+    `last_term`, so it REFUSES. UC additionally carries Ongaro's single-server-change
+    errata precondition: `propose_config` returns `NotServing` unless the leader has
+    committed an entry of its own term (`uc2_consensus/src/election.rs:876-878`, comment
+    "the single-server-change precondition") — a second guard the model also lacks.
+    *Proposed edit:* extend the grant guard with config currency — an immutable strict
+    chain order `cfgLt` (⊇ `succCfg`, transitive, irreflexive) plus
+    `require ¬ cfgLt (cfgOf c) (cfgOf j)` in `deliverRequestVoteGrant`: a voter refuses
+    a candidate whose adopted config is strictly behind its own. This is the SAME
+    abstraction of `log_ok` the model ALREADY applies to E (`¬(holdsE j ∧ ¬holdsE c)`),
+    just extended to the other log content this plane tracks; the session-1 model's
+    asymmetry — E guarded, config entries not — IS the infidelity.
+    *Recorded narrowing (honest, both directions):* like the existing E-guard, this is
+    STRONGER than `log_ok`, which would grant to a candidate that lacks the voter's
+    entries but carries a higher `last_term` on a divergent branch. Excluding those is
+    an UNDER-approximation, justified only by the canonical-prefix property this plane
+    already assumes at its boundary (session-6 obligation 3; `proofs/`'s open `canon`).
+    The E-guard has carried this unrecorded since `Reconfig.lean` — recording it now for
+    BOTH. NOT applied this session.
+
+#### Why the four open clauses need exactly those two edits (the induction, sketched)
+With `MODEL-EDIT-2`, `electable_cfgs_contain_holder` becomes provable by the shape the
+discharged adjacency lemma was built for: a committed config C_{k+1} is held by a
+C_{k+1}-quorum of adopters; **adjacency** says that quorum meets every C_k-quorum; the
+log-currency guard makes those adopters refuse any candidate stuck at C_k — so no
+quorum of any adopted config is free of "current" nodes, and by chain induction none is
+free of an E-holder once E commits. P2 then closes in two cases: `curTerm L >
+committedTerm` via `holder_grants_are_covered` (already inductive) against a
+`commitQuorum` member — which needs `MODEL-EDIT-1` to guarantee `gotEAt V ≤
+committedTerm`; and `curTerm L = committedTerm` via `commit_leader_evidence` +
+`grant_uniq` (already inductive). Both edits are load-bearing; neither is optional.
+
+#### Calibration cross-check
+**No model edit was applied**, so the session-6 calibration pair is untouched by
+construction — `ReconfigCommit.lean` (the explicit-state twin) is byte-identical to
+session 6's and was not rebuilt. The cross-check obligation transfers, unspent, to the
+session that applies MODEL-EDIT-1/2: coupling OFF must still exhibit the depth-13 CE,
+coupling ON + canary must still witness non-vacuity.
+
+#### STOP POINT: mid-arc Fable gate (bar-3 policy, gate 1)
+Trigger: **two adjudicated (b)-class model edits, both load-bearing for every remaining
+clause.** Per policy ("before any accumulated MODEL modifications are built upon"), they
+are specified and Rust-anchored above but deliberately NOT applied — the gate audits the
+proposals, so no proof work rests on an unaudited change. Not a wall: the route to P2 is
+mapped and the adjacency lemma, the ghost apparatus and 12 inductive clauses are banked.

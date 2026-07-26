@@ -325,3 +325,113 @@ induction will have to state explicitly:
 P2 inductive, all-n, cvc5, CTI-adjudicated against the Q2 chain) awaits the
 user's go/no-go with §7's re-estimate on the table. Gate doc §6 item 4 remains
 open pending that decision; this checkpoint is its bar-1/bar-2 record.
+
+---
+
+# Session 2 (bar 3, part 1) — the inductive proof push, to the mid-arc gate
+
+**Date:** 2026-07-26 (same day, second session). **Branch:** `uc2/veil-commit-plane`.
+**Policy in force:** the brief's "Re-gate outcome + bar-3 execution policy" — Opus
+drives the CTI loop; hard Rust-anchored ledger rule before any model edit;
+any-hit-→-Rust; two Fable gates. **This session ends at gate 1 (mid-arc).**
+
+## S2.1 TL;DR
+
+- **The adjacency obligation is DISCHARGED** — route **r1**, `proofs-veil/models/
+  QuorumAdjacency.lean`, sorry-free (`#print axioms` = `propext, Classical.choice,
+  Quot.sound` only). It proves not just adjacency but **all four** assumptions of the
+  abstract quorum bundle over the intended interpretation, so the bundle is
+  **satisfiable** and no `#check_invariants` green in this arc is vacuous.
+- **12 of 16 invariant clauses are CERTIFIED INDUCTIVE, all-n, via cvc5** (run 3:
+  **170 ✅ / 6 ❌**), including the two new load-bearing clauses this session designed
+  (`holder_grants_are_covered`, `commit_leader_evidence`). All the added state is
+  **ghost** — it appears in no `require`, so the reachable behaviour set is unchanged
+  and the session-6 calibration is untouched by construction.
+- **Still open: `election_safety` (1 CTI), P2 `leader_completeness` (2), and the
+  load-bearing `electable_cfgs_contain_holder` (3).** All four are blocked on the
+  SAME two adjudicated model-fidelity gaps, which are **specified and Rust-anchored
+  but deliberately NOT applied** (ledger items 14/15).
+- **P2 is REACHABLY FALSE in the model as session 1 left it** — an n=5 Figure-8
+  trace, every step legal, where a never-deposed stale t1 leader commits E by counting
+  a node that acquired "E" from a t3 leader's own append (the one-tracked-entry plane
+  conflates the two streams). That is the collapsed per-term-stream-identity
+  obligation (session-6 item 7) turning from "nuisance CTI source" into a hard
+  blocker. It is the class UC *fixed* (Finding #6b, `new_term_pos`).
+- **Operational finding: the SMT route costs ~60–95 s per full verdict table** —
+  ~25× cheaper per run than session 6's explicit-state runs, and no memory pressure
+  (peak well under the watchdog). Plan bar-3 sessions as many small runs.
+
+## S2.2 The adjacency route (checkpoint question 2, answered)
+
+**r1 chosen.** The trade-off in the session-1 memo was framed as "low-risk new proof
+text (r1) vs List-universe wall risk (r2)". The decisive argument turned out to be a
+different one: **Veil `assumption`s are free, and an inconsistent bundle makes every
+verdict vacuously green.** This arc's bundle is four assumptions deep. r1 discharges
+adjacency *and* exhibits a model of the whole bundle; r2 would have discharged
+adjacency alone. The proof is ~60 lines: one counting lemma (two subsets of a carrier
+whose sizes sum past it must meet, via `card_union_add_card_inter` + `omega`), then
+the add case against carrier `d` (|d| ≤ |c|+1) and the remove case against carrier `c`
+(|c| ≤ |d|+1). Cost: well under an hour, no wall.
+
+## S2.3 The CTI loop — what closed, and how
+
+| CTI (run 1) | Verdict | Fix |
+|---|---|---|
+| `leader_quorum` ❌ `propose` | (a) weak clause | clause named `cfgOf I`, which `propose` moves; restate over ghost `elecCfg I` (config at election time) ⇒ inductive |
+| `leader_completeness` ❌ `becomeLeader` (holder's grant in pre-state) | (a) missing clause | the up-to-date guard is a GRANT-TIME fact the state forgets; new clause `holder_grants_are_covered` with ghost `gotEAt` supplying the ordering ⇒ inductive |
+| solver-invented multi-commit-leader pre-states | (a) ghost soundness | `commit_leader_unique`, `commit_leader_only_after_commit`, `gotE_bounded` ⇒ all inductive |
+| `election_safety` ❌ `becomeLeader` | **(b) model infidelity** | MODEL-EDIT-2 (below) — tried (a) first and rejected it with a legal-chain n=5 trace |
+| `leader_completeness` ❌ ×2, `electable_cfgs_contain_holder` ❌ ×3 | blocked | need MODEL-EDIT-1 **and** -2 |
+
+## S2.4 The two gaps put to the gate (full text: ledger items 14/15)
+
+1. **MODEL-EDIT-1 — `commitEntry` counts reports that are not the leader's.**
+   Rust: `uc2_consensus/src/election.rs:545-552` (stale report dropped; higher-term
+   report becomes `adopt_term`) so only own-term reports reach
+   `tracker.on_durable` (`:566-570`); companion clamp `new_term_pos` (`:1451-1456`,
+   Finding #6b). Proposed edit: `commitEntry` also requires
+   `∀ V ∈ q, gotEAt V ≤ curTerm i` — strictly WEAKER than the Rust gate, i.e. an
+   over-approximation (the sound direction), and it reuses a ghost variable already
+   present rather than adding a message plane.
+2. **MODEL-EDIT-2 — granting ignores CONFIG-entry currency.**
+   Rust: `log_ok` = `(cand_last_term, cand_last_durable) >= (our_term, our_durable)`
+   (`election.rs:342-350`, `:1240-1247`, call site `:1222`) over `durable`, the
+   contiguous fsynced frontier that CONTAINS config frames (gate doc §5 Q2 link 1);
+   plus Ongaro's errata precondition, `propose_config` → `NotServing` unless the
+   leader committed an entry of its own term (`election.rs:876-878`). Proposed edit:
+   an immutable strict chain order `cfgLt` plus `require ¬ cfgLt (cfgOf c) (cfgOf j)`
+   in the grant arm — **the same `log_ok` abstraction the model already applies to E,
+   extended to the other log content it tracks**; the session-1 asymmetry IS the gap.
+   Recorded narrowing (for BOTH the new guard and the pre-existing E-guard, which has
+   carried it unrecorded since `Reconfig.lean`): it is stronger than `log_ok`, which
+   would grant to a divergent higher-`last_term` candidate; excluding those rests on
+   the canonical-prefix property this plane already assumes at its boundary.
+
+**Neither is applied.** Nothing in run 3 rests on an unaudited model change.
+
+## S2.5 Why these two, and what they buy (the induction, sketched)
+
+`electable_cfgs_contain_holder` becomes provable in exactly the shape the discharged
+adjacency lemma was built for: a committed config C_{k+1} is held by a C_{k+1}-quorum
+of adopters; **adjacency** makes that quorum meet every C_k-quorum; **MODEL-EDIT-2**
+makes those adopters refuse a candidate stuck at C_k. Chain induction then says no
+quorum of any adopted config is free of "current" nodes — and, once E commits, free of
+an E-holder. P2 closes in two cases: `curTerm L > committedTerm` via the
+already-inductive `holder_grants_are_covered` against a `commitQuorum` member (which
+needs **MODEL-EDIT-1** to guarantee `gotEAt V ≤ committedTerm`), and
+`curTerm L = committedTerm` via the already-inductive `commit_leader_evidence` +
+`grant_uniq`. Both edits are load-bearing; neither is optional; the four mechanisms
+§8 predicted are all present in that argument, with adjacency now a theorem.
+
+## S2.6 Disposition
+
+**STOP at Fable gate 1 (mid-arc), per the bar-3 policy** — trigger: two adjudicated
+(b)-class edits, both load-bearing for every remaining clause. This is *not* a wall:
+the route to P2 is mapped, and the adjacency lemma, the ghost apparatus and 12
+inductive clauses are banked and independent of the gate's verdict. What the gate
+should audit: ledger items 14 and 15 against the Q2 chain — in particular whether
+MODEL-EDIT-2's `cfgLt` guard is the right abstraction of `log_ok` or whether the
+divergent-branch narrowing it introduces is too much assurance to give away.
+Next session, on a GO: apply both edits, re-run the session-6 calibration pair
+(coupling OFF must still CE at depth 13; ON + canary must still witness), then
+resume the CTI loop on `electable_cfgs_contain_holder` → P2.
