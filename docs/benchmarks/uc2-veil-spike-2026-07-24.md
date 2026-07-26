@@ -516,11 +516,14 @@ Next session, in priority order:
    tail from the sitting older-term leader, which needs per-term stream identity
    (a second tracked entry, or an `entryTerm`) rather than one tracked entry. Would
    upgrade run 2's SAFE from "within this restriction" to unqualified.
-4. **`Reconfig.lean` commit/log plane** (F-M7-2) — still open, still blocked on the
-   tractability boundary characterised in session 3; **USER DECISION PENDING**
-   between (a) abstract-quorum reformulation + inductive proof (local, ~LC-arc
-   S2-equivalent) and (b) a larger box for deeper bounded coverage (CE-only; the
-   SAFE direction is exponential, not compute-bound). Unchanged by this session.
+4. **`Reconfig.lean` commit/log plane** (F-M7-2) — **DECIDED 2026-07-26:
+   option (a)**, abstract-quorum reformulation + inductive proof. Dispatch
+   brief:
+   `docs/superpowers/specs/2026-07-26-uc2-veil-reconfig-commit-plane-brief.md`
+   — which now inherits the discharged §5 Q2 trace as the verified Rust
+   ground-truth map for the commit plane. Option (b) rejected: the SAFE
+   direction is exponential, so a bigger box buys CE depth only, never the
+   assurance result this item exists for.
 5. If V2 survives: a nightly Veil model-check job next to the `elle` tier — a
    deliberate CI follow-up, not part of the spike (guardrail 3).
 
