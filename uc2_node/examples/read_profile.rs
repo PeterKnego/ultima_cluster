@@ -56,9 +56,10 @@
 //!
 //! ## The occupancy proxy: yield rate, not CPU time
 //!
-//! The four node agents are already named threads (`uc2-consensus`,
-//! `uc2-sender`, `uc2-receiver`, `uc2-archive` — see `AgentRunner::spawn`), so
-//! in principle `/proc/<pid>/task/*/stat` CPU time would rank them directly.
+//! **The original plan.** The four node agents are already named threads
+//! (`uc2-consensus`, `uc2-sender`, `uc2-receiver`, `uc2-archive` — see
+//! `AgentRunner::spawn`), so in principle `/proc/<pid>/task/*/stat` CPU time
+//! would rank them directly.
 //! It doesn't: every agent idles on `IdleStrategy::Yield`
 //! (`uc2_log/src/agent.rs:28` → `std::thread::yield_now()`), so an agent with
 //! nothing to do still burns a core spinning through empty duty cycles and its
@@ -81,8 +82,9 @@
 //! on `(pid, tid)` for the ranking.
 //!
 //! **On a fleet the service is a separate process**, so `--node-pid` alone
-//! cannot see `uc2-apply` — the very agent clause (b) exists to rule out. Pass
-//! `--service-pid` too; the sampler takes the union of both task dirs.
+//! cannot see `uc2-apply` in the diagnostic sample. Pass `--service-pid` too;
+//! the sampler takes the union of both task dirs. (Diagnostic only — see
+//! below; this does not affect the decision rule.)
 //!
 //! ### The yield-rate proxy is DEAD — it is diagnostic output, not a signal
 //!
@@ -335,8 +337,9 @@ struct ClientArgs {
     #[arg(long)]
     node_pid: Option<u32>,
     /// PID of the SERVICE process. On a fleet the service is a separate
-    /// process, so without this `uc2-apply` — the apply-frontier hypothesis
-    /// clause (b) exists to rule out — cannot appear in the ranking at all.
+    /// process, so without this `uc2-apply` cannot appear in the diagnostic
+    /// occupancy sample at all. Diagnostic only — clause (b) no longer uses
+    /// the occupancy ranking (see the module doc).
     #[arg(long)]
     service_pid: Option<u32>,
 }
@@ -402,8 +405,9 @@ fn main() -> anyhow::Result<()> {
 /// This is an ordinal signal (it ranks agents); it is not a duty-cycle percentage.
 #[derive(Debug, Clone, PartialEq)]
 struct Occupancy {
-    /// The bare thread name (`uc2-consensus`, …) — what the decision rule's
-    /// clause (b) matches against.
+    /// The bare thread name (`uc2-consensus`, …) — used only to label rows of
+    /// the diagnostic occupancy sample; clause (b) no longer matches against
+    /// it (see the module doc).
     pub name: String,
     pub pid: u32,
     pub tid: u32,
@@ -459,9 +463,9 @@ fn sample_yields(pid: u32, task_dir: &Path) -> std::io::Result<Vec<ThreadSample>
 
 /// Sample the UNION of several processes' task dirs. On a fleet the node and
 /// the service are separate processes; sampling only the node's makes
-/// `uc2-apply` structurally invisible to clause (b), which is precisely the
-/// hypothesis clause (b) exists to rule out. Returns `None` only when NO dir
-/// could be sampled.
+/// `uc2-apply` structurally invisible to the diagnostic occupancy sample.
+/// Diagnostic only — clause (b) no longer uses this ranking (see the module
+/// doc). Returns `None` only when NO dir could be sampled.
 fn sample_all(dirs: &[(u32, PathBuf)]) -> Option<Vec<ThreadSample>> {
     let mut out = Vec::new();
     let mut any = false;
@@ -1356,9 +1360,10 @@ fn self_task_dirs() -> Vec<(u32, PathBuf)> {
 fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
     let secs = env_cap("UC2_RP_MAX_SECS", a.secs);
     let readers = env_cap("UC2_RP_MAX_READERS", a.readers);
-    // The union of node + service task dirs. Without the service's, `uc2-apply`
-    // — the apply-frontier hypothesis clause (b) exists to rule out — is not in
-    // the sampled set at all on a fleet, where the service is its own process.
+    // The union of node + service task dirs, for the DIAGNOSTIC occupancy
+    // sample only (does not feed the decision rule). Without the service's,
+    // `uc2-apply` is not in the sampled set at all on a fleet, where the
+    // service is its own process.
     let task_dirs: Vec<(u32, PathBuf)> = [a.node_pid, a.service_pid]
         .into_iter()
         .flatten()
@@ -1366,13 +1371,15 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
         .collect();
     if task_dirs.is_empty() {
         eprintln!(
-            "WARNING: neither --node-pid nor --service-pid given — clause (b) of the \
-             decision rule cannot be evaluated from this run."
+            "NOTE: neither --node-pid nor --service-pid given — the agent-occupancy \
+             diagnostic sample will be empty. This does not affect the decision rule: \
+             clause (b) no longer uses the occupancy ranking (see the module doc)."
         );
     } else if a.service_pid.is_none() {
         eprintln!(
-            "WARNING: --service-pid not given — uc2-apply is invisible to the occupancy \
-             ranking, so clause (b) cannot rule out the apply frontier."
+            "NOTE: --service-pid not given — uc2-apply is invisible to the occupancy \
+             diagnostic sample. This does not affect the decision rule: clause (b) no \
+             longer uses the occupancy ranking (see the module doc)."
         );
     }
     let (stats, occ) = run_read_measurement(
@@ -1385,10 +1392,6 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
         &task_dirs,
     );
     print_read_report(a.mode, readers, a.write_rate, &stats, &occ);
-    // One machine-readable rung record, so the fleet ladder (one `client`
-    // process per rung, external orchestration) can feed `decide --rungs` and
-    // evaluate the SAME pre-committed rule rather than re-implementing it.
-    println!("{}", rung_to_json(&Rung::from_stats(readers, a.mode, a.write_rate, &stats, &occ)));
     anyhow::ensure!(
         stats.regression == 0,
         "LINEARIZABLE READ REGRESSED by {} — a read returned a value lower than one \
@@ -1401,12 +1404,20 @@ fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
         "{} reads never resolved — the run did not complete; its numbers describe nothing",
         stats.inflight_at_end
     );
+    // Emit the machine-readable rung JSON only AFTER both validity checks
+    // above pass. Spec §6 threat 6: a rung with inflight_at_end != 0 (or a
+    // regression) is INVALID, not merely suspicious — its numbers describe
+    // nothing. An orchestrator that tees stdout without checking exit codes
+    // must never see an invalid rung's JSON on the machine-readable line. Do
+    // not hoist this back above the ensures.
+    println!("{}", rung_to_json(&Rung::from_stats(readers, a.mode, a.write_rate, &stats, &occ)));
     Ok(())
 }
 
-/// One agent's place in a rung's occupancy ranking. `name` is the bare thread
-/// name (what clause (b) matches); `label` is `name#tid` (what a human needs to
-/// tell three `uc2-consensus` threads apart).
+/// One agent's place in a rung's DIAGNOSTIC occupancy ranking (does not feed
+/// the decision rule — see the module doc). `name` is the bare thread name;
+/// `label` is `name#tid` (what a human needs to tell three `uc2-consensus`
+/// threads apart).
 #[derive(Debug, Clone, PartialEq)]
 struct AgentRank {
     pub name: String,
