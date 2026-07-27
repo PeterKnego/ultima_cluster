@@ -1802,3 +1802,30 @@ every earlier run: **zero**. Consequences, all binding:
 * **Why it mattered anyway:** the CTI-driven work item that item 29 produced (item 30, the
   same-term grant wrinkle) is UNAFFECTED — run 16's ❌ is a real CTI, independent of how
   run 14 was read.
+
+#### TRUTH ARGUMENT T12 — `leader_reach_strict` (written BEFORE run 17, per the truth rule)
+**T12** `((candidate I ∨ leader I) ∧ ¬ cfgLt (elecCfg I) C) → tlt (reachAt I C) (curTerm I)`.
+*Truth.* A role is created only by `startElection`, which sets `elecCfg i := cfgOf i` and
+bumps `curTerm i := t` with `tlt (curTerm i) t` STRICT. Every config C at-or-below the frozen
+`elecCfg i = cfgOf i` has already been reached by i, so `reach_bound` stamps it at or before
+the PRE-bump term, hence strictly below t. Nothing re-stamps it while the role persists:
+`propose` writes `reachAt i Z` only for Z with `cfgLt (cfgOf i) Z`, and `eleccfg_not_ahead` +
+`cfglt_trans` put every such Z strictly ABOVE `elecCfg i`, i.e. outside the antecedent;
+`adopt`, `replicate` and `crashRestart` clear the role; a strict-raise grant clears the role
+and an equal-term grant changes neither `curTerm` nor `reachAt`; `becomeLeader` re-freezes
+`elecCfg i := cfgOf i`, which for a candidate equals the already-covered `elecCfg i`
+(`cand_cfg_frozen`). For C = genesisC the antecedent is free (`genesis_least`) and
+`reachAt I genesisC` is never written by either writer (both stamp only configs STRICTLY
+ABOVE the mover's current one, and genesis is least), so it sits at `tot.zero`.
+*What it is for.* **(i) Task 1** — item 30's same-term grant corner, closed from the OTHER
+side. A grant-time config ghost does NOT close it: the model genuinely permits a voter to
+grant at config X and then adopt a higher config at the SAME term (`adopt` requires only
+`tot.le (curTerm j) (curTerm i)`), so the pre-state the solver builds is legal on the voter's
+side. What is NOT legal is the run-16 CTI's other side — the incumbent leader whose
+`reachAt` of its own ELECTION config equals its term (node 1: `elecCfg 1 = cfgOf 1 = cfg1`,
+`reachAt 1 cfg1 = curTerm 1`). T12 excludes exactly that, and it is what T8's chain needs to
+instantiate `reach_quorum_below` at the winner with a STRICT bound.
+**(ii) Task 2** — instantiated at `C := genesisC` it yields `reachAt I genesisC < curTerm I`,
+which with the theory's `zero_le` IS `role_positive_term` (T10) — derived, without putting
+`tot.zero` into the hypothesis set of every VC, the diagnosed cause of run 15's ~7 h wall
+(item 28). This is the "restate over an existing bounded ghost" option, taken.
