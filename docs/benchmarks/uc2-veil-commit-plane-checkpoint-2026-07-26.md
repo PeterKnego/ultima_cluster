@@ -435,3 +435,100 @@ divergent-branch narrowing it introduces is too much assurance to give away.
 Next session, on a GO: apply both edits, re-run the session-6 calibration pair
 (coupling OFF must still CE at depth 13; ON + canary must still witness), then
 resume the CTI loop on `electable_cfgs_contain_holder` → P2.
+
+---
+
+# Session 2, part 2 — post-gate-1: edits applied, chain induction, ~5h checkpoint
+
+Gate 1 ruled: both infidelity adjudications CONFIRMED against the Rust, the
+(a)-rejection for EDIT-2 confirmed sound, the r1 witness verified non-vacuous.
+EDIT-1 approved as specified; EDIT-2 approved with three required revisions. All
+revisions implemented; work continued under the same policy to the time bound.
+
+## S2.7 What gate 1 changed (all implemented)
+
+- **CRITICAL (gate finding, verified):** with `cfgid ↦ Finset node` the `cfgLt`
+  axioms are **unsatisfiable** (add-x-then-remove-x makes `succCfg` symmetric ⇒
+  `cfgLt c c`), which by this arc's own anti-vacuity doctrine would void every
+  subsequent green. `QuorumAdjacency.lean` now carries **two chain-indexed
+  witnesses** and proves the full bundle over them, `#print axioms` clean:
+  **W1** `ℕ × Finset V` (permits branching — proves the model does not secretly
+  assume linearity) and **W2** `ℕ` over a fixed ±1 chain (adds successor
+  functionality, order totality, immediacy, connectedness, least-genesis).
+  Bookkeeping recorded: once `cfglt_total` is assumed, **W1 no longer witnesses the
+  bundle — satisfiability now rests on W2**, and W1 is kept precisely to document
+  which assumption buys linearity.
+- **Narrowing (n2)** recorded (gate-supplied): `cfgOf` conflates holding a config
+  entry with having adopted it; real UC can `log_ok`-grant to a candidate durable
+  past a config frame whose adoption still lags the archive re-scan
+  (`election.rs:889-899`).
+- **Both narrowings + the conditionality are now in the MODEL HEADERS** of
+  `ReconfigCommit.lean` and `ReconfigCommitSMT.lean`, verbatim in the required form:
+  **any SAFE verdict from this plane is CONDITIONAL — on the canonical-prefix /
+  contiguity discipline (Q2 chain, CONFIRMED-SAFE in Rust) and on the data-plane
+  freshness / Finding-#6b `new_term_pos` clamp (proved at the Lean tier).**
+- Ledger citation corrected: the E-guard entered with **`ReconfigLC.lean:108`**
+  (session 3), not `Reconfig.lean` (which has no commit plane at all).
+- `gotEAt` recorded as promoted from ghost to load-bearing by EDIT-1.
+
+## S2.8 Calibration cross-check — BOTH PASS (21m10s, one detached twin build)
+
+| run | knobs | verdict |
+|---|---|---|
+| **A2** | coupling OFF, EDIT-2 on, adds off | **❌ `leader_completeness` at depth 13** — the session-6 CE survives trace-for-trace. EDIT-2 did not break the plane's eyesight. |
+| **C2** | coupling ON, canary | **❌ `p2_antecedent_canary` at depth 10** — non-vacuity still witnessed. |
+
+C2 did *not* shift to the depth-11 witness the gate anticipated, and that is correct:
+the shift was predicated on EDIT-1, which is deliberately absent from the twin (gate
+direction — a `gotEAt` function is a ~x27 state multiplier at `Fin 3`). The twin now
+over-approximates the proof model: strictly more behaviours, the sound direction for
+a CE calibrator.
+
+## S2.9 Three further model edits — and why they were unavoidable
+
+Applied with ledger-first discipline (items 19-21); **all three are UNAUDITED and
+gate 2 must review them:**
+
+- **EDIT-2b `cfglt_total`** — config history is one chain, not a tree. Applied under
+  gate 1's explicit chain-indexing sanction; a narrowing inside the (n1) boundary;
+  witnessed by W2's already-proved `l_cfglt_total`.
+- **EDIT-2c** — `adopt` may not move a node's config BACKWARD (the archive walks
+  recorded blocks in log-position order; gate doc §5 Q2 link 1).
+- **EDIT-3 `serving`** — `propose` requires the leader's own config to be committed.
+  **Required: without it `election_safety` is reachably FALSE in the model.** The
+  n=5 trace: `pending` is per-node, so a leader B that adopted A's uncommitted `C1`
+  and won a term can propose `C2` with `C1` still uncommitted; two leaders then split
+  the same term across disjoint `C0`- and `C2`-quorums. Real UC forbids it —
+  `propose_config` → `NotServing` unless the leader committed an entry of its own
+  term (`election.rs:876-878`, "the single-server-change precondition", Ongaro's
+  errata), and commit is prefix-closed, so that own-term commit also commits `C1`.
+  Session 1 modeled one-in-flight per NODE; the real mechanism is cluster-wide.
+
+Plus a five-part chain-order assumption package (`cfglt_total`, `succ_immediate`,
+`cfglt_connected`, `genesis_least`, W1→W2 witness migration) — every part proved of
+W2, so the bundle stays satisfiable and no verdict is vacuous.
+
+## S2.10 Where the induction stands (run 8, banked)
+
+**290 ✅ / 7 ❌. 22 invariant clauses + `doesNotThrow` certified inductive, all-n**
+(12 at gate 1). Nine new config-chain clauses joined the bundle. **P2's CTI count fell
+from 2 to 1** — `commitEntry` no longer breaks it, i.e. EDIT-1 + `commitq_gotE` closed
+the Figure-8-shaped half exactly as designed.
+
+Open: `election_safety` (1), `leader_completeness` (1), `eleccfg_not_stale` (2),
+`electable_cfgs_contain_holder` (3). **The entire residue is one argument** — the
+stale-config election — and it now has a diagnosed hole rather than a mystery:
+the adjacency intersection between a leader's electing quorum and a committed config's
+adopter quorum can land on **the candidate itself**, which is legitimately at-or-past
+the newer config (it may have advanced after its own election). The fix has a template
+already in this model: freeze the grant-time config the way `gotEAt` freezes the
+acquisition term (`cfgAt` ghost + the same grant-postdates-adoption ordering, since
+`adopt` requires `curTerm j <= curTerm i`). **Ghost state plus clauses — not a further
+model edit.**
+
+## S2.11 Disposition
+
+**~5-hour checkpoint per the bar-3 policy. Not certification, not a wall.** Next
+session opens on the `cfgAt` hole with no new mechanism expected. Gate 2 must audit
+ledger items 19-21 and the chain-order assumption package, and the final claim must
+carry the conditionality of S2.7 verbatim.

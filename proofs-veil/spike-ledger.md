@@ -848,3 +848,175 @@ clause.** Per policy ("before any accumulated MODEL modifications are built upon
 are specified and Rust-anchored above but deliberately NOT applied — the gate audits the
 proposals, so no proof work rests on an unaudited change. Not a wall: the route to P2 is
 mapped and the adjacency lemma, the ghost apparatus and 12 inductive clauses are banked.
+
+#### GATE 1 (Fable) RULED — both adjudications CONFIRMED; edits applied with revisions
+Ruling: MODEL-EDIT-1 approved as specified; MODEL-EDIT-2 approved WITH three required
+revisions; both infidelity adjudications confirmed against the Rust (no stop-the-arc
+finding); the (a)-rejection for EDIT-2 confirmed sound; the r1 witness verified
+non-vacuous. Actions taken, in order:
+
+**CORRECTION to item 15 (gate-supplied, verified here):** "unrecorded since
+`Reconfig.lean`" is WRONG — `Reconfig.lean` has no commit plane and no E-guard at all
+(`grep holdsE` = nothing; its grant arm is `Reconfig.lean:104`). The E-guard entered
+with **`ReconfigLC.lean:108`** (session 3), half-noted in the inline comment above it
+("sound for the single-entry model (no divergent logs)") and never ledgered. Fixed.
+
+**ITEM 14 anchor emphasis (gate-required):** the PRIMARY Rust anchor for MODEL-EDIT-1
+is the **report term gate** — `uc2_consensus/src/election.rs:545-552` (stale dropped /
+higher adopts) gating `tracker.on_durable` at `:566-570`. The `new_term_pos` clamp
+(`:1451-1456`) is a COMPANION only: its own class is excluded from this plane by the
+E-guard narrowing, not by the clamp.
+
+**MODEL-EDIT-1 APPLIED** (`commitEntry`: `∀ V ∈ q, gotEAt V ≤ curTerm i`). Consequence
+recorded per the gate: **`gotEAt` is promoted from ghost to load-bearing** — the
+"history state appears in no `require`" claim now covers only `elecCfg`,
+`isCommitLeader`, `commitElecCfg`. Model header updated accordingly.
+
+16. **`MODEL-EDIT-2` REVISION (a) — `cfgid` RE-WITNESSED AS CHAIN-INDEXED (critical).**
+    Gate finding, verified: with `cfgid ↦ Finset node`, add-x-then-remove-x gives
+    `succCfg c d ∧ succCfg d c`, so any transitive superset of `succCfg` yields
+    `cfgLt c c` — the `cfgLt` axioms are **UNSATISFIABLE** under the r1 interpretation,
+    and by this arc's own anti-vacuity doctrine no green over them would count.
+    FIX (also the more faithful reading — in UC a config IS a log entry at a position):
+    `QuorumAdjacency.lean` now carries TWO witnesses and proves ALL SEVEN assumptions
+    over them, `#print axioms` clean:
+      * **W1** `ICfg = ℕ × Finset V` — `succCfg (k,s)(k',s') := k'=k+1 ∧ ±1`,
+        `cfgLt := index <`. Permits BRANCHING config history, so it also proves the
+        model does not secretly assume linearity. (`i_*` theorems; plus
+        `i_succ_inhabited`, so `succCfg` is not vacuously empty.)
+      * **W2** `LCfg = ℕ` over a fixed ±1 chain — additionally proves `succCfg`
+        FUNCTIONALITY and `cfgLt` TOTALITY, held in reserve for the branch-shaped
+        CTIs the gate predicted. (`l_*` theorems.)
+17. **`MODEL-EDIT-2` REVISION (b) — second narrowing recorded (gate-supplied).**
+    `cfgOf` conflates HOLDING a config entry with having ADOPTED it. In Rust a
+    candidate can be durable past a newer config frame — so `log_ok`
+    (`election.rs:1240-1247`) GRANTS — while its adopted config still lags, adoption
+    completing only on the archive re-scan (`election.rs:889-899`). The cfgLt guard
+    refuses that grant; real UC performs it. P2-benign under the same boundary
+    assumption (durable past the frame ⇒ holds the prefix ⇒ holds E, by contiguity),
+    but a DISTINCT exclusion from narrowing (n1) and recorded as such.
+18. **`MODEL-EDIT-2` REVISION (c) — twin mirrored, EDIT-1 deliberately NOT.**
+    `ReconfigCommit.lean` gets the strict-subset form of the guard
+    (`strictlyAhead a b := a ⊊ b`), valid there because `proposeAdd` is knob-gated OFF
+    (`addEnabled := false`) making the reachable config space REMOVE-ONLY from a full
+    genesis — a restriction that cannot destroy either calibration trace, both of which
+    are remove-only. **EDIT-1 is SKIPPED in the twin** (gate-directed): a per-node
+    acquisition-term function is a ~x27 state multiplier at `Fin 3`, past this box's
+    explicit-state envelope. The twin therefore now OVER-approximates the proof model —
+    strictly more behaviours, the sound direction for a CE calibrator. Divergence
+    recorded in the twin's header.
+
+**THE GATE'S BINDING JUDGMENT (implemented, not re-litigated):** the cfgLt narrowing is
+ACCEPTABLE as a documented boundary assumption and must NOT be weakened to faithful
+`log_ok` (importing `log_ok` alone into a one-tracked-entry plane makes the Figure-8
+grant model-legal with nothing here to stop it; fidelity would mean merging in the
+Figure8/Finding9 plane, banked elsewhere). Consequences implemented:
+narrowings (n1)+(n2) are recorded in the MODEL HEADERS of BOTH files, not only here;
+and **the arc's eventual SAFE verdict is CONDITIONAL — on the canonical-prefix /
+contiguity discipline (Q2 chain, CONFIRMED-SAFE in Rust) and on the data-plane
+freshness / Finding-#6b `new_term_pos` clamp (proved at the Lean tier)** — stated in
+exactly that form in both headers (LC-arc `FramesCurrentAuthored` precedent). Prior
+verdicts stand: CEs remain valid, the election-plane results predate the narrowing, and
+the session-6 bounded cleans were knob calibration.
+
+#### RUN 5 (post-EDIT-1+2): 170 ✅ / 6 ❌ — unchanged, AS EXPECTED
+The edits add MECHANISM; the clause set does not yet CONSUME it, and
+`#check_invariants` CTIs start from arbitrary Inv-satisfying states, so the same six
+obligations fail until the invariant bundle names the new facts. Log
+`smt-run5-edits12.log` (2m33s). The post-edit `election_safety` CTI is now visibly
+**branch-shaped** — `cfgLt = []`, i.e. two INCOMPARABLE configs, plus an `elecCfg` that
+sits outside its own node's config history — exactly the class the gate predicted.
+
+19. **`MODEL-EDIT-2b` (chain linearization) — NEW, UNAUDITED, applied under the gate's
+    chain-indexing sanction.** Assumption added: `cfglt_total`
+    (`∀ c d, c = d ∨ cfgLt c d ∨ cfgLt d c`). This is the abstract encoding of "real UC
+    linearizes config history through the log" that the gate named when it told me to
+    expect branch CTIs and treat them as artifacts of the un-graded successor relation.
+    It is a NARROWING (it excludes divergent config branches) and it sits INSIDE the
+    already-declared boundary: narrowing (n1) already assumes the canonical-prefix
+    discipline, of which "one config history, not a tree" is a direct consequence.
+    Witness: **W2's `l_cfglt_total`, already proved** — no new anti-vacuity debt.
+20. **`MODEL-EDIT-2c` (no config regression) — NEW, UNAUDITED.** `adopt` additionally
+    requires `¬ cfgLt (proposedC i) (cfgOf j)`: a node never adopts a config it is
+    already past. Rust: config frames are adopted from the archive's recorded-block
+    walk over the contiguous fsynced prefix, i.e. **in log-position order** (gate doc §5
+    Q2 link 1, CONFIRMED-SAFE); a node's adopted config only moves forward. Without it
+    the model lets `cfgOf` move BACKWARD, which breaks every chain-order clause.
+21. **`MODEL-EDIT-3` (`serving`: cluster-wide one-in-flight) — NEW, UNAUDITED, and
+    REQUIRED: without it election_safety is REACHABLY FALSE in the model.**
+    *The counterexample (n=5, every step legal in the post-EDIT-2 model):* leader A at
+    `C0` proposes `C1` (uncommitted, `pending A`); B adopts `C1`, later wins a term
+    under `C1` (grants from nodes at `C0`/`C1` — the cfgLt guard permits, they are not
+    ahead), and — having `¬pending B`, since `pending` is PER-NODE — proposes `C2` with
+    `C1` still uncommitted. Now only B is past `C0`. At one term T, X (at `C0`) takes a
+    `C0`-quorum {3,4,+1} and B takes a disjoint `C2`-quorum from the other two `C0`
+    nodes (who do not refuse: the candidate is AHEAD, not behind). **Two leaders at T.**
+    *Rust adjudication — NOT a real bug:* `propose_config` returns `NotServing` unless
+    the leader has committed an entry of its OWN term (`uc2_consensus/src/election.rs:876-878`,
+    comment "the single-server-change precondition" — Ongaro's single-server-change
+    errata). Commit is prefix-closed, so committing an own-term entry that postdates
+    `C1`'s frame COMMITS `C1`. Hence in real UC B cannot propose `C2` while `C1` is
+    uncommitted. Session 1 modeled one-in-flight PER NODE (`pending i`); the real
+    mechanism is cluster-wide, carried by `serving` + prefix-closed commit.
+    *Edit:* ghost `cfgCommitted C` set at `commitCfg`, and `propose` requires
+    `cfgOf i = genesisC ∨ cfgCommitted (cfgOf i)` — the consequence of `serving` that
+    this plane can express without a per-term commit plane. `cfgCommitted` is thereby
+    load-bearing, not ghost.
+    **GATE-2 MUST AUDIT ITEMS 19-21** — they are three model edits beyond gate 1's two.
+
+#### CALIBRATION CROSS-CHECK (gate-required) — **BOTH PASS**
+One detached twin build, 21m10s, `twin-runA2C2-gate1.log`:
+* **RUN A2 (coupling OFF, EDIT-2 on, addEnabled off): ❌ `leader_completeness` at
+  DEPTH 13** — the session-6 calibration CE SURVIVES, trace-for-trace identical
+  (`startElection(0,t1) / grant / becomeLeader(0,{0,1}) / appendEntry(0) /
+  replicate(0→2) / commitEntry(0,{0,2}) / proposeRemove(0,x=2) / adopt(1←0) /
+  commitCfg(0,{0,1}) / proposeRemove(0,x=0) / adopt(1←0) / startElection(1,t2) /
+  becomeLeader(1,{1})`). **EDIT-2 did not break the plane's eyesight.**
+* **RUN C2 (coupling ON, canary): ❌ `p2_antecedent_canary` at DEPTH 10** —
+  non-vacuity still witnessed, same stale-t1-leader-commit shape as session 6.
+  NOTE, against the gate's expectation that it might shift to the depth-11 witness:
+  it did NOT, and that is CORRECT — the shift was predicated on EDIT-1, which is
+  deliberately absent from the twin (item 18), so the depth-10 witness stays legal
+  there. Had EDIT-1 been mirrored, the shift would be the expected outcome.
+
+#### RUNS 6-8 — the config-chain induction, and where it stands at the session stop
+| run | added | verdict |
+|---|---|---|
+| 6 | MODEL-EDIT-2b/2c/3 + chain bookkeeping clauses | 246 ✅ / 7 ❌ (4m16s) |
+| 7 | chain-order theory (`succ_immediate`, `cfglt_connected`) + `chain_committed_below`, `eleccfg_not_stale`, `commitq_gotE`, `pending_iff_proposal`; `commitCfg` bookkeeping corrected to the PROPOSED config | 289 ✅ / 8 ❌ (5m44s) |
+| 8 | `genesis_least` (+ W2 witness `l_genesis_least`) | **290 ✅ / 7 ❌** (4m56s) — BANKED |
+
+**22 invariant clauses + `doesNotThrow` CERTIFIED INDUCTIVE, all-n** (up from 12 at
+gate 1): the four election clauses, the four commit clauses, `holder_grants_are_covered`,
+`commit_leader_evidence`, the three ghost-soundness clauses, and the NINE new
+config-chain clauses (`cfg_from_genesis`, `proposal_from_genesis`,
+`proposal_is_own_cfg`, `eleccfg_not_ahead`, `adopters_not_behind`,
+`committed_cfg_quorum`, `pending_iff_proposal`, `commitq_gotE`,
+`chain_committed_below`, `commit_cfg_backed`).
+**P2's CTI count fell from 2 to 1** — `commitEntry` no longer breaks it, i.e.
+MODEL-EDIT-1 + `commitq_gotE` closed the Figure-8-shaped half exactly as designed.
+**Still open: `election_safety` (1), `leader_completeness` (1), `eleccfg_not_stale` (2),
+`electable_cfgs_contain_holder` (3)** — all four now failing ONLY at `becomeLeader`
+(plus `propose`/`adopt`/`commitEntry`/`commitCfg` for the two config clauses), i.e.
+the whole residue is ONE argument: the stale-config election.
+
+22. **THE IDENTIFIED HOLE (next session's first move, no new mechanism needed).**
+    `eleccfg_not_stale` ("no leader was elected under a config strictly below a
+    committed one") is provable in outline — `cfglt_connected` gives a succ-step out of
+    the stale config, the adjacency lemma meets that config's adopter quorum against the
+    leader's electing quorum, and MODEL-EDIT-2's guard makes the adopters refuse — EXCEPT
+    that the intersection member can be **the candidate itself**, which is legitimately
+    at-or-past the newer config (it may have advanced AFTER its own election). The fix is
+    structural and already has a template in this model: freeze the GRANT-TIME config the
+    way `gotEAt` freezes the acquisition term (a `cfgAt V` ghost + the same
+    grant-postdates-adoption ordering: `adopt` requires `curTerm j <= curTerm i`, so a
+    grant at a term strictly above `cfgAt V` postdates V's adoption and the guard did
+    apply). This is GHOST state plus clauses — **not a further model edit.**
+
+#### SESSION-2 STOP: ~5-hour checkpoint (bar-3 policy), NOT certification, NOT a wall
+Reached the time bound with the induction converged onto a single open argument and with
+**three model edits (items 19-21) plus a five-assumption chain-order package
+(`cfglt_total`, `succ_immediate`, `cfglt_connected`, `genesis_least`, and the W1→W2
+witness migration) that are UNAUDITED.** Gate 2 must audit those before the final claim.
+Every assumption added is proved of witness W2 in `QuorumAdjacency.lean` (`#print axioms`
+clean), so the bundle remains satisfiable and no verdict above is vacuous.

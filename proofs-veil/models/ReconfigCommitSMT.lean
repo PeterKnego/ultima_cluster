@@ -3,6 +3,38 @@ import Veil
 /- UC v2.1 (M7) reconfig commit plane — ABSTRACT-QUORUM model for the SMT/inductive
    route (option (a)). Scratch — NEVER the record.
 
+   ===== FABLE-GATE-1 AMENDMENTS (2026-07-26) — READ FIRST =====
+   * MODEL-EDIT-1 and MODEL-EDIT-2 are now APPLIED (gate-1 approved; EDIT-2 with
+     required revisions). See spike-ledger.md items 14/15 + the gate-1 entry.
+   * `gotEAt` is NO LONGER GHOST — MODEL-EDIT-1 reads it in a `require`, so the
+     run-1 behaviour-equivalence claim below applies only to the OTHER three
+     history variables (`elecCfg`, `isCommitLeader`, `commitElecCfg`), which still
+     appear in no guard.
+   * `cfgid` is CHAIN-INDEXED in the intended interpretation (a config is a log
+     ENTRY at a position, not a bare voter set). This is forced: with
+     `cfgid ↦ Finset node`, add-x-then-remove-x makes `succCfg` symmetric, so the
+     `cfgLt` axioms below are UNSATISFIABLE and every verdict over them vacuous.
+     Witnesses W1/W2 in QuorumAdjacency.lean discharge all SEVEN assumptions.
+   ** DOCUMENTED NARROWINGS (gate-1 ruling, binding) **
+     (n1) The config-currency grant guard — like the pre-existing E-guard — is
+          STRONGER than real `log_ok`, which would grant to a candidate that lacks
+          the voter's entries but carries a higher `last_term` on a divergent
+          branch. Deliberate: faithful `log_ok` in a one-tracked-entry plane makes
+          the Figure-8 grant model-legal with nothing here to stop it; fidelity
+          would require merging in the Figure8/Finding9 plane, banked elsewhere.
+     (n2) `cfgOf` conflates HOLDING a config entry with having ADOPTED it. In Rust
+          a candidate can be durable past a newer config frame (so `log_ok`
+          GRANTS) while its adopted config lags until the archive re-scan
+          (election.rs:889-899). This guard refuses that grant; real UC performs
+          it. P2-benign under the same boundary assumption (durable past the frame
+          ⇒ holds the prefix ⇒ holds E, by contiguity), but a distinct exclusion.
+   ** CONDITIONALITY (binding on any claim made from this model) **
+     Any SAFE verdict here is CONDITIONAL — on the canonical-prefix/contiguity
+     discipline (Q2 chain, CONFIRMED-SAFE in Rust) and on the data-plane
+     freshness / Finding-#6b `new_term_pos` clamp (proved at the Lean tier). It is
+     NEVER an unconditional claim. (Precedent: the LC arc's FramesCurrentAuthored.)
+   =============================================================
+
    SESSION-2 (bar 3, part 1) STATE — see proofs-veil/spike-ledger.md §SESSION 7:
      * `#check_invariants` IS run (bottom of file). Run 3: **170 ✅ / 6 ❌** —
        12 of 16 clauses CERTIFIED INDUCTIVE, all-n, via cvc5, in ~93 s.
@@ -16,8 +48,9 @@ import Veil
          - MODEL-EDIT-2: vote granting must respect CONFIG-entry currency, not just
            E (log_ok over `durable`, election.rs:342-350/1240-1247, and config
            frames live in `durable` — gate doc §5 Q2 link 1).
-     * GHOST STATE (elecCfg / gotEAt / isCommitLeader / commitElecCfg) appears in NO
-       `require` — the reachable behaviour set is unchanged by it.
+     * HISTORY STATE: `elecCfg` / `isCommitLeader` / `commitElecCfg` appear in NO
+       `require` (behaviour-preserving). `gotEAt` DID — until MODEL-EDIT-1 promoted
+       it to load-bearing; it is now part of the model, not scaffolding.
 
    WHY THIS FILE EXISTS: the concrete-TSet model (ReconfigCommit.lean) cannot take
    the SMT inductiveness path — TSet's List-backed count/intersection ops break VC
@@ -72,6 +105,10 @@ immutable relation qmember (N : node) (Q : quorum)
 immutable relation quorumOf (Q : quorum) (C : cfgid)
 -- single-server successor: D = C plus-or-minus exactly one voter (apply's shape).
 immutable relation succCfg (C : cfgid) (D : cfgid)
+-- MODEL-EDIT-2: the config CHAIN ORDER (`C` strictly precedes `D` in the log). In the
+-- intended interpretation this is the config entry's POSITION order — see the gate-1
+-- header note on why a bare voter-set reading is unsatisfiable.
+immutable relation cfgLt (C : cfgid) (D : cfgid)
 immutable individual genesisC : cfgid
 
 -- election plane (tally collapsed, as the concrete model)
@@ -93,6 +130,8 @@ relation propAfterE (I : node)
 -- J is durable past I's current config entry (the adoption evidence a config
 -- commit counts) — see ReconfigCommit.lean's session gap 1.
 relation hasAdopted (J : node) (I : node)
+-- MODEL-EDIT-3 (ledger 21): which configs have COMMITTED (a C_new quorum adopted).
+relation cfgCommitted (C : cfgid)
 
 -- commit/log plane (one tracked entry E) + history variables for the induction
 relation holdsE (N : node)
@@ -136,7 +175,31 @@ assumption [succ_shape]
     ∃ x, (∀ n, cmember n d ↔ (cmember n c ∨ n = x)) ∨
          (∀ n, cmember n d ↔ (cmember n c ∧ n ≠ x))
 
--- !!! OBLIGATION — TO BE PROVED NEXT SESSION, NOT ASSUMED (see header) !!!
+-- MODEL-EDIT-2 chain-order axioms. All three are PROVED of witnesses W1 and W2 in
+-- QuorumAdjacency.lean (`i_cfglt_irrefl` / `i_cfglt_trans` / `i_succ_cfglt`).
+assumption [cfglt_irrefl]
+  ∀ (c : cfgid), ¬ cfgLt c c
+assumption [cfglt_trans]
+  ∀ (c d e : cfgid), cfgLt c d → cfgLt d e → cfgLt c e
+assumption [succ_cfglt]
+  ∀ (c d : cfgid), succCfg c d → cfgLt c d
+-- MODEL-EDIT-2b (ledger 19): config history is ONE CHAIN, not a tree — real UC
+-- linearizes it through the log. A NARROWING, inside the (n1) canonical-prefix
+-- boundary already declared. Witness: QuorumAdjacency.lean `l_cfglt_total` (W2).
+assumption [cfglt_total]
+  ∀ (c d : cfgid), c = d ∨ cfgLt c d ∨ cfgLt d c
+-- the order is GENERATED by succCfg: no room strictly between a config and its
+-- successor, and every strict step upward starts with a succ-step that does not
+-- overshoot. Witnesses: `l_succ_immediate` / `l_cfglt_connected` (W2).
+-- genesis is the least config (witness: `l_genesis_least`, W2 with genesisC := 0).
+assumption [genesis_least]
+  ∀ (c : cfgid), ¬ cfgLt c genesisC
+assumption [succ_immediate]
+  ∀ (c d e : cfgid), succCfg c d → cfgLt c e → cfgLt e d → False
+assumption [cfglt_connected]
+  ∀ (c d : cfgid), cfgLt c d → ∃ e, succCfg c e ∧ (e = d ∨ cfgLt e d)
+
+-- !!! OBLIGATION — DISCHARGED, route r1 (QuorumAdjacency.lean) !!!
 -- consecutive-config quorum intersection, from the ±1 shape. Stated here so P2's
 -- invariant hunt can proceed; its discharge (route r1 or r2) is a hard exit
 -- criterion for the proof push.
@@ -166,6 +229,7 @@ after_init {
   proposedC N := genesisC
   propAfterE N := false
   hasAdopted J I := false
+  cfgCommitted C := false
   holdsE N := false
   committed := false
   committedTerm := tot.zero
@@ -193,6 +257,11 @@ action deliverRequestVoteGrant (j : node) (c : node) (t : term) {
   require cmember c (cfgOf j)                -- granting membership-gated on the
                                              -- voter's ADOPTED config (link 5;
                                              -- session gap 2 — load-bearing for P2)
+  -- MODEL-EDIT-2 (gate-1 approved w/ revisions): `log_ok` covers CONFIG entries too —
+  -- a voter whose adopted config is strictly AHEAD of the candidate's refuses. Rust:
+  -- election.rs:342-350 / :1240-1247, over `durable`, which contains config frames
+  -- (gate doc §5 Q2 link 1). Narrowings (n1)/(n2) in the header.
+  require ¬ cfgLt (cfgOf c) (cfgOf j)
   if tlt (curTerm j) t then candidate j := false
   if tlt (curTerm j) t then leader j := false
   curTerm j := t
@@ -242,6 +311,15 @@ action commitEntry (i : node) (q : quorum) {
   require holdsE i                           -- link 3: leader holds what it commits
   require quorumOf q (cfgOf i)               -- quorum-durable under config in force
   require ∀ V, qmember V q → holdsE V        -- links 1+2: counting ⟹ holding
+  -- MODEL-EDIT-1 (gate-1 approved as specified): a leader counts only reports
+  -- TERM-STAMPED WITH ITS OWN TERM. Rust (primary anchor): election.rs:545-552 drops
+  -- `term < current_term` ("stale report: dropped") and turns `term > current_term`
+  -- into adopt_term+return, so only own-term reports reach `tracker.on_durable`
+  -- (:566-570). Companion only: the Figure-8 `new_term_pos` clamp (:1451-1456).
+  -- Stated over the acquisition term, i.e. STRICTLY WEAKER than the Rust gate (which
+  -- demands report term = leader term) — an over-approximation, the sound direction.
+  -- Without it P2 is REACHABLY FALSE here (n=5 Figure-8 trace, ledger item 14).
+  require ∀ V, qmember V q → tot.le (gotEAt V) (curTerm i)
   committed := true
   committedTerm := curTerm i
   commitCfgid := cfgOf i
@@ -257,6 +335,12 @@ action commitEntry (i : node) (q : quorum) {
 action propose (i : node) (d : cfgid) {
   require leader i
   require ¬ pending i
+  -- MODEL-EDIT-3 (ledger 21): one change in flight CLUSTER-WIDE, not per node. Rust:
+  -- propose_config → NotServing unless the leader committed an entry of its OWN term
+  -- (election.rs:876-878, "the single-server-change precondition"); commit is
+  -- prefix-closed, so that own-term commit also commits the leader's own config entry.
+  -- Without this, election_safety is REACHABLY FALSE here (n=5 trace, ledger 21).
+  require cfgOf i = genesisC ∨ cfgCommitted (cfgOf i)
   require succCfg (cfgOf i) d
   cfgOf i := d
   proposedC i := d
@@ -275,6 +359,10 @@ action adopt (j : node) (i : node) {
   require hasProposal i
   require tot.le (curTerm j) (curTerm i)
   require (¬ propAfterE i) ∨ holdsE j
+  -- MODEL-EDIT-2c (ledger 20): config frames are adopted from the archive's
+  -- recorded-block walk over the contiguous prefix, i.e. IN LOG-POSITION ORDER
+  -- (gate doc §5 Q2 link 1) — a node's adopted config never moves backward.
+  require ¬ cfgLt (proposedC i) (cfgOf j)
   candidate j := false
   leader j := false
   curTerm j := curTerm i
@@ -285,8 +373,12 @@ action adopt (j : node) (i : node) {
 -- config entry commits like any entry: a C_new quorum of adopters (session gap 1).
 action commitCfg (i : node) (q : quorum) {
   require pending i
-  require quorumOf q (cfgOf i)
+  -- bookkeeping correction (session 2): the entry that commits is the PROPOSED
+  -- config, and its C_new quorum is a quorum OF THAT config. Session 1 wrote
+  -- `cfgOf i`, relying on the (reachable-state-only) identity proposedC i = cfgOf i.
+  require quorumOf q (proposedC i)
   require ∀ V, qmember V q → hasAdopted V i
+  cfgCommitted (proposedC i) := true
   pending i := false
   hasProposal i := false
 }
@@ -351,6 +443,47 @@ invariant [commit_leader_only_after_commit]
 invariant [gotE_bounded]
   holdsE V → tot.le (gotEAt V) (curTerm V)
 
+-- ---- config-chain bookkeeping (consumes MODEL-EDIT-2/2b/2c/3) ----
+invariant [cfg_from_genesis]
+  cfgOf N = genesisC ∨ cfgLt genesisC (cfgOf N)
+invariant [proposal_from_genesis]
+  hasProposal I → (proposedC I = genesisC ∨ cfgLt genesisC (proposedC I))
+invariant [proposal_is_own_cfg]
+  hasProposal I → (proposedC I = cfgOf I ∨ cfgLt (proposedC I) (cfgOf I))
+invariant [eleccfg_not_ahead]
+  elecCfg N = cfgOf N ∨ cfgLt (elecCfg N) (cfgOf N)
+invariant [adopters_not_behind]
+  hasAdopted V I → ¬ cfgLt (cfgOf V) (proposedC I)
+-- MODEL-EDIT-3's payload: a committed config was adopted by a quorum of ITSELF, and
+-- those adopters are at-or-past it forever after (adopters_not_behind + no regression).
+invariant [committed_cfg_quorum]
+  cfgCommitted D → ∃ (q : quorum), quorumOf q D ∧ (∀ V, qmember V q → ¬ cfgLt (cfgOf V) D)
+invariant [pending_iff_proposal]
+  pending I ↔ hasProposal I
+-- EDIT-1's payload, carried to the induction: every commit-quorum member acquired E
+-- no later than the commit term (so any grant it makes at a HIGHER term postdates the
+-- acquisition, and `holder_grants_are_covered` fires).
+invariant [commitq_gotE]
+  committed → (∀ V, qmember V commitQuorum → tot.le (gotEAt V) committedTerm)
+-- EDIT-3's payload: every config strictly below one that some node has adopted has
+-- already COMMITTED (one change in flight cluster-wide).
+invariant [chain_committed_below]
+  cfgLt D (cfgOf N) → (D = genesisC ∨ cfgCommitted D)
+-- ...hence no leader was ever elected under a config strictly below a committed one:
+-- a committed D has a quorum of at-or-past-D adopters, which (adjacency) meets every
+-- quorum of D's predecessor, and those adopters refuse a candidate that is behind.
+-- OPEN TARGET #2 (fails at becomeLeader/commitCfg — kept as the honest marker).
+-- Identified structural hole: the adjacency intersection between a leader's electing
+-- quorum and a committed config's adopter quorum can land on the CANDIDATE ITSELF,
+-- which is legitimately at-or-past the newer config (it may have advanced after its
+-- own election). Closing it needs the grant-time config frozen the way `gotEAt`
+-- freezes the acquisition term — a `cfgAt` ghost plus the same
+-- grant-postdates-adoption ordering argument. Next session's first move.
+invariant [eleccfg_not_stale]
+  (leader I ∧ cfgCommitted D) → ¬ cfgLt (elecCfg I) D
+invariant [commit_cfg_backed]
+  cfgCommitted D → (D = genesisC ∨ cfgLt genesisC D)
+
 -- THE LOAD-BEARING CANDIDATE (early signal, unproved): after commit, EVERY config
 -- any node has adopted only has quorums that contain an E-holder — the invariant
 -- that blocks a non-holder's election. Expect the CTI loop to refine this (e.g.
@@ -362,6 +495,5 @@ invariant [electable_cfgs_contain_holder]
 
 #gen_spec
 
--- RUN 3 (session 2): (a)-class clause repairs complete (ghost state only —
--- no action guard changed, so the reachable behaviour set is run-1's).
+-- RUN 8 (session 2, final): + genesis_least. BANKED STATE at the session-2 stop.
 #check_invariants

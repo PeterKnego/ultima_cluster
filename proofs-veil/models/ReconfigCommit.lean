@@ -3,6 +3,35 @@ import Veil
 /- UC v2.1 (M7) reconfiguration — COMMIT/LOG PLANE, session 1 of the option-(a) arc
    (scratch — NEVER the record; the record is `proofs/`).
 
+   ===== SESSION-2 / FABLE-GATE-1 AMENDMENTS (2026-07-26) — READ FIRST =====
+   (1) MODEL-EDIT-2 APPLIED (grant arm): a voter refuses a candidate whose adopted
+       config is STRICTLY AHEAD of its own — `log_ok` extended from E to the CONFIG
+       entries that share the log (election.rs:342-350 / :1240-1247 over `durable`;
+       config frames live in `durable`, gate doc §5 Q2 link 1).
+       ** DOCUMENTED NARROWING (gate-1 ruling, binding): this guard — like the
+       pre-existing E-guard — is STRONGER than real `log_ok`, which WOULD grant to a
+       candidate that lacks the voter's entries but carries a higher `last_term` on a
+       divergent branch. Excluding those behaviours is deliberate: importing faithful
+       `log_ok` into a one-tracked-entry plane makes the Figure-8 grant model-legal
+       with nothing here to stop it, and restoring fidelity would mean merging in the
+       whole Figure8/Finding9 plane — already banked separately. A second exclusion:
+       `cfg` conflates HOLDING a config entry with having ADOPTED it (in Rust a
+       candidate can be durable past a newer config frame — so `log_ok` grants —
+       while its adopted config lags until the archive re-scan, election.rs:889-899).
+       ** CONSEQUENCE: any SAFE verdict from this plane is CONDITIONAL — on the
+       canonical-prefix/contiguity discipline (Q2, CONFIRMED-SAFE in Rust) and on the
+       data-plane freshness / Finding-#6b `new_term_pos` clamp (proved at the Lean
+       tier). It is never an unconditional claim. **
+   (2) MODEL-EDIT-1 (own-term-stamped commit reports) is APPLIED IN THE SMT TWIN ONLY,
+       deliberately NOT here: it needs a per-node acquisition-term function, a ~x27
+       state multiplier at Fin 3 that is past this box's explicit-state envelope. This
+       model therefore OVER-approximates the proof model (strictly more behaviours) —
+       the sound direction for its job, which is CE calibration, not assurance.
+   (3) `proposeAdd` is knob-gated OFF (addEnabled) for the re-runs: strict-subset is a
+       valid config order only on a remove-only chain. Both calibration traces are
+       remove-only, so this cannot destroy them.
+   =========================================================================
+
    Brief: docs/superpowers/specs/2026-07-26-uc2-veil-reconfig-commit-plane-brief.md.
    Closes the modeling gap of Finding F-M7-2 (gate doc §4): `Reconfig.lean`'s `adopt`
    granted a config without requiring the committed prefix, so quorum-overlap /
@@ -91,6 +120,12 @@ immutable individual prefixCoupling : Bool   -- THE knob (F-M7-2 mechanism)
 immutable individual crashEnabled : Bool
 immutable individual vacuityCanary : Bool
 immutable individual p2On : Bool
+-- GATE-1 twin restriction: proposeAdd is knob-gated OFF for the EDIT-2 re-runs so the
+-- reachable config space is REMOVE-ONLY from a full genesis — the precondition that
+-- makes strict-subset a valid "further along the config chain" order here. Both the
+-- run-A CE and the run-C canary witness are remove-only traces, so the restriction
+-- cannot destroy either. (The SMT twin uses an abstract chain order instead.)
+immutable individual addEnabled : Bool
 
 -- election plane (tally collapsed — no votes set, no deliverVote)
 relation candidate (N : node)
@@ -127,6 +162,11 @@ theory ghost relation tlt (x y : term) := tot.le x y ∧ x ≠ y
 theory ghost relation majorityOf (q c : nodeSet) := nset.count q * 2 > nset.count c
 theory ghost relation adjacent (a b : nodeSet) :=
   nset.count (nset.diff a b) + nset.count (nset.diff b a) ≤ 1
+-- MODEL-EDIT-2 (gate-1 approved, twin form): `a` is STRICTLY AHEAD of `b` in the
+-- config chain. Remove-only chain (addEnabled := false) ⇒ later = strictly fewer
+-- voters ⇒ strict subset. Abstract-model counterpart: `cfgLt (cfgOf c) (cfgOf j)`.
+theory ghost relation strictlyAhead (a b : nodeSet) :=
+  nset.count (nset.diff a b) = 0 ∧ nset.count (nset.diff b a) > 0
 
 after_init {
   candidate N := false
@@ -171,6 +211,12 @@ action deliverRequestVoteGrant (j : node) (c : node) (t : term) {
   require tot.le (curTerm j) t
   require ¬ (hasVoted j ∧ voteTerm j = t ∧ voteCand j ≠ c)
   require ¬ (holdsE j ∧ ¬ holdsE c)
+  -- MODEL-EDIT-2 (gate-1 approved): log_ok covers CONFIG entries too — a voter whose
+  -- adopted config is strictly ahead of the candidate's refuses the grant. Same
+  -- abstraction of `log_ok` the line above already makes for E, extended to the other
+  -- log content this plane tracks. Rust: election.rs:342-350 / :1240-1247 over
+  -- `durable`, which contains config frames (gate doc §5 Q2 link 1).
+  require ¬ strictlyAhead (cfg j) (cfg c)
   -- FIDELITY (Q2 link 5, this session's gap 2): vote GRANTING is membership-gated
   -- on the voter's ADOPTED config — j refuses a candidate outside cfg j. Without
   -- this, even the COUPLED model loses E: a pre-E config walk shrinks the voter
@@ -265,6 +311,7 @@ action proposeRemove (i : node) (x : node) {
 }
 
 action proposeAdd (i : node) (x : node) {
+  require addEnabled
   require leader i
   require ¬ pending i
   require ¬ nset.contains x (cfg i)
@@ -354,13 +401,14 @@ open Std
 -- checker's relabeling: E held by {0,2}, walk {0,1,2}→{0,1}→{1} adopted by
 -- non-holder 1, self-election at t2). Steps 8/11 are the knobbed move; all others
 -- real-UC-legal. Log: proofs-veil/logs/reconfigcommit-runA-calibrationCE-depth13.log.
-/- RUN-A-BANKED
+-- RE-RUN A2 (gate-1 cross-check, EDIT-2 applied, EDIT-1 deliberately NOT — see the
+-- header divergence note): the calibration CE MUST survive both guards, else the
+-- plane's eyesight is broken and EDIT-2 must be reverted.
 #model_check { node := Fin 3, term := Fin 3, nodeSet := ExtTreeSet (Fin 3) compare }
   { genesis := Std.ExtTreeSet.empty.insertMany (List.finRange 3),
-    adjacencyGuard := true, prefixCoupling := false,
+    adjacencyGuard := true, prefixCoupling := false, addEnabled := false,
     crashEnabled := false, vacuityCanary := false, p2On := true }
   (maxDepth := 14)
-RUN-A-BANKED-END -/
 
 -- RUN B — coupling ON, same regime, maxDepth 13 = THE CALIBRATION HORIZON (the
 -- depth at which the uncoupled model exhibits the loss). A maxDepth-15 attempt was
@@ -372,11 +420,13 @@ RUN-A-BANKED-END -/
 -- RESULT (2026-07-26): ✅ No violation, 4,211,943 states (maxDepth 13 — bounded).
 -- (B+C+D ran in ONE ~80-min detached build after two ~60-min attempts were killed
 -- by the harness background-task ceiling — see the ledger's toolchain note.)
+/- RUN-B-BANKED (session 6: ✅ 4,211,943 states, maxDepth 13)
 #model_check { node := Fin 3, term := Fin 3, nodeSet := ExtTreeSet (Fin 3) compare }
   { genesis := Std.ExtTreeSet.empty.insertMany (List.finRange 3),
-    adjacencyGuard := true, prefixCoupling := true,
+    adjacencyGuard := true, prefixCoupling := true, addEnabled := true,
     crashEnabled := false, vacuityCanary := false, p2On := true }
   (maxDepth := 13)
+RUN-B-BANKED-END -/
 
 -- RUN C — non-vacuity for RUN B: a reported canary violation is the GOOD outcome
 -- (witness that P2's antecedent is realizable with the coupling on).
@@ -386,17 +436,21 @@ RUN-A-BANKED-END -/
 -- identity; real UC's handle-term-stamped reports reject this). An OVER-approximation
 -- (sound direction for the safety verdicts), ledgered; the SMT session may need an
 -- `entryTerm` if this class produces nuisance CTIs.
+-- RE-RUN C2 (gate-1 cross-check): the canary MUST still witness non-vacuity with
+-- EDIT-2 applied. If it stops witnessing altogether that is a non-vacuity FAILURE.
 #model_check { node := Fin 3, term := Fin 3, nodeSet := ExtTreeSet (Fin 3) compare }
   { genesis := Std.ExtTreeSet.empty.insertMany (List.finRange 3),
-    adjacencyGuard := true, prefixCoupling := true,
+    adjacencyGuard := true, prefixCoupling := true, addEnabled := false,
     crashEnabled := false, vacuityCanary := true, p2On := true }
 
 -- RUN D — election-safety regression in the UNCOUPLED model (p2 gated off so BFS
 -- does not stop at RUN A's expected CE). Bounded to RUN A's horizon.
 -- RESULT (2026-07-26): ✅ No violation, 9,160,143 states (maxDepth 14 — bounded).
+/- RUN-D-BANKED (session 6: ✅ 9,160,143 states, maxDepth 14)
 #model_check { node := Fin 3, term := Fin 3, nodeSet := ExtTreeSet (Fin 3) compare }
   { genesis := Std.ExtTreeSet.empty.insertMany (List.finRange 3),
-    adjacencyGuard := true, prefixCoupling := false,
+    adjacencyGuard := true, prefixCoupling := false, addEnabled := true,
     crashEnabled := false, vacuityCanary := false, p2On := false }
   (maxDepth := 14)
+RUN-D-BANKED-END -/
 
