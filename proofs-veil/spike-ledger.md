@@ -1920,3 +1920,70 @@ wanted for task 1.
   means "add one clause at a time and watch the wall" is necessary but no longer
   sufficient: at this bundle size a single clause mentioning role state in a strict term
   conclusion can make the run unfinishable regardless of the solver budget.
+
+#### 36. TASK 3 — THE CROSS-CONFIG HOLDER SUPPLY: a hand map, and where a mechanism enters
+The task's instruction was to try ghost/clause routes first and to STOP for a gate only if a
+new `require`/`assumption` is genuinely needed. The clause work could not be MEASURED this
+session (item 35: the bundle would not absorb even one new clause), so what follows is a
+WRITTEN map, explicitly labelled **unverified by the checker** — it is a plan and an
+adjudication, not a result. Split P2@`becomeLeader` by the two cases of its antecedent:
+
+**(A) SAME TERM (`curTerm i = committedTerm`) — no new mechanism; ghost + clauses.** Run 16's
+CTI here has `leader = []` and `isCommitLeader = [1]`: the commit leader crash-restarted
+(`crashRestart` clears `leader` without touching `curTerm`), so `election_safety` cannot be
+invoked and the argument must run against FROZEN evidence. That is T13/T14 plus one ghost
+(`commitElecQuorum := elecQuorum i` at `commitEntry`) — T8's chain replayed with
+`(elecQuorum I, elecCfg I, curTerm I)` replaced by `(commitElecQuorum, commitElecCfg,
+committedTerm)`. Ghost-only, read in no `require`: **count-exempt, no gate**.
+
+**(B) STRICT (`committedTerm < curTerm i`) — three of four sub-cases close on existing
+machinery.** Write `CL = cfgOf i` (= `elecCfg i` after the action).
+* `CL < commitCfgid`: `cfglt_connected` gives a succ-step `CL → E` with `E ≤ commitCfgid`.
+  If `E < commitCfgid`, `reach_quorum_below` at the commit leader (bounded by T14(iv):
+  `reachAt cl commitCfgid ≤ committedTerm < curTerm i`) yields a quorum of E reached
+  strictly before `curTerm i`; `adjacent_cfg_quorum_intersection` meets it against the
+  electing quorum, and `grant_reach_covered` forces `cfgOf i ≥ E > CL` — contradiction.
+  If `E = commitCfgid`, adjacency meets the electing quorum against `commitQuorum` directly,
+  and the meeting member holds E with `gotEAt ≤ committedTerm < curTerm i`, so
+  `holder_grants_are_covered` gives `holdsE i`.
+* `CL = commitCfgid`: `same_cfg_quorum_intersection` with `commitQuorum`, same finish.
+* `CL = succ commitCfgid`: `adjacent_cfg_quorum_intersection` with `commitQuorum`, same finish.
+* **`CL ≥ 2 steps above commitCfgid`: THE RESIDUE.** Needs "every quorum of `CL` contains an
+  E-holder", which comes from "**∃ an ALL-holder quorum of `pred CL`**" plus adjacency. That
+  propagates up the config chain iff every config above `commitCfgid` was proposed by an
+  E-holder — i.e. `propAfterE` at the proposer, which `adopt`'s coupling require then pushes
+  onto every adopter, making the certifying quorum all-holders.
+
+**WHERE THE MECHANISM ENTERS (the honest adjudication).** The propagation has exactly one
+hole: a **STALE leader** (term < `committedTerm`) proposing from a config at-or-above
+`commitCfgid` without holding E. For a proposer at a config STRICTLY above `commitCfgid`
+the model already kills it — `no_stale_election` with `D := pred CL` forces
+`elecCfg cl ≥ pred CL > commitCfgid`, contradicting `eleccfg_not_ahead`
+(`elecCfg cl ≤ cfgOf cl = commitCfgid`). The surviving hole is the proposer sitting EXACTLY
+at `commitCfgid`. Two candidate closures, in the order they should be tried:
+* **(i) CLAUSE-ONLY, tried first.** Members of the commit leader's FROZEN electing quorum sit
+  at terms `≥ committedTerm` (`grant_state` on grants at `committedTerm`), whereas the stale
+  proposal's certifying quorum has `reachAt V D ≤ cfgCommitTerm D` (`committed_cfg_quorum`,
+  already inductive) with `cfgCommitTerm D ≤` the stale term. When `commitElecCfg =
+  commitCfgid` the two quorums are ADJACENT and must intersect — contradiction, abstractly,
+  with no new mechanism. It fails only when the commit leader was elected under a config
+  strictly BELOW its commit config (`commitElecCfg < commitCfgid`, legal: elect, then
+  propose), where the two quorums are ≥ 2 apart and the abstract fragment has no
+  intersection to offer.
+* **(ii) MODEL-EDIT-5, the gate request if (i) does not close it.** `commitEntry`'s report
+  gate is deliberately the WEAK form — `tot.le (gotEAt V) (curTerm i)`, over the ACQUISITION
+  term — and its own comment records that this is "STRICTLY WEAKER than the Rust gate (which
+  demands report term = leader term) — an over-approximation, the sound direction". The
+  faithful strengthening is one more conjunct/require: `∀ V, qmember V q →
+  tot.le (curTerm i) (curTerm V)`. Rust anchor: `election.rs:545-552` drops
+  `term < current_term` ("stale report: dropped") and turns `term > current_term` into
+  adopt_term+return, so a report that reaches `tracker.on_durable` (`:566-570`) was made at
+  the leader's OWN term; terms are monotone and persisted, so a counted member's term is
+  `≥ committedTerm` forever after. It is a NARROWING (it excludes model behaviours), so it
+  needs the gate's audit exactly as EDIT-4 did — and under the count corrective it takes the
+  model to **36 requires**, so it is a STOP-for-gate, not a driver decision.
+**NOT REQUESTED THIS SESSION.** The gate-1c template demands a reachability trace and an
+over-approximation argument from the CHECKER's evidence; the cost wall (item 35) meant no
+run could produce the CTI that would justify (ii), and route (i) was never measured. Asking
+for a `require` on a hand argument alone would invert the arc's discipline. **The request is
+therefore PREPARED, not made.**
