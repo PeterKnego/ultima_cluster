@@ -40,6 +40,19 @@ import Veil
          (d3) MODEL-EDIT-2c, forward-only adoption (the version gate).
          (d4) MODEL-EDIT-3, cluster-wide one-in-flight (`config_pending`): this model
               keeps session 1's PER-NODE `pending i` only.
+         (d5) MODEL-EDIT-4 (gate 1c, 2026-07-27), the proposer's OWN-TERM bound on the
+              predecessor config's commit term (`cfgCommitTerm (cfgOf i) <= curTerm i`,
+              abstracting `config_pending()` = `config_position > commit_seen`,
+              election.rs:856-858/:879-880, where a LEADER's `commit_seen` has exactly
+              two writers — the leader-excluded gossip intake :594-595 and `rank_leader`
+              :1457 behind the :1451-1456 clamp). DELIBERATELY NOT MIRRORED here: this
+              model has no `cfgCommitTerm` at all (no per-config commit-term function),
+              and adding one is a state multiplier past this box's explicit-state
+              envelope — the same reason (d1) was skipped. Consequence: the twin
+              over-approximates the SMT model on this axis TOO, which is the sound
+              direction for a CE calibrator. RE-VERIFIED after the edit
+              (twin-runA2C2-gate1c.log): RUN A2 ❌ leader_completeness at DEPTH 13 and
+              RUN C2 ❌ p2_antecedent_canary at DEPTH 10, both trace-for-trace as before.
    (3) `proposeAdd` is knob-gated OFF (addEnabled) for the re-runs: strict-subset is a
        valid config order only on a remove-only chain. Both calibration traces are
        remove-only, so this cannot destroy them.

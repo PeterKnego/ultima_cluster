@@ -748,3 +748,76 @@ mechanism: `reach_quorum_below` closes at `propose`, `no_stale_election` closes 
 `commitCfg` by the same argument, and P2's last CTI is the same-term
 commit-leader-self-vote hole, which is clause-only (`voteterm_bounded` +
 `commit_leader_self_vote`).
+
+---
+
+# Session 4 (bar 3, part 4) — gate-1c ruled, MODEL-EDIT-4 applied, the residue map executed
+
+**Date:** 2026-07-27. Worktree `.claude/worktrees/uc2-veil-commit-plane` (from `64b4acf`).
+Runs in `/home/claude/veil-spike/veil-preview`, logs `/home/claude/veil-spike/runs/` and
+`proofs-veil/logs/`. Full detail in `proofs-veil/spike-ledger.md` §SESSION 9.
+
+## S4.1 The gate-1c ruling, recorded before any run
+
+**MODEL-EDIT-4 APPROVED** with five binding amendments, all now in the ledger and in the
+model (three inline at the edit site, two in the header):
+
+* **(a)** `cfgCommitTerm` is the **proposer-stamped** term at `commitCfg`-fire time
+  (`ReconfigCommitSMT.lean:439`), NOT the real certification term — the proposer's term
+  drifts upward, so the stamp can exceed the term a quorum actually certified at.
+* **(b)** The over-approximation holds via `commitCfg`'s scheduling freedom (it may fire at
+  the earliest enabling point, before causally-independent term raises) PLUS the
+  `election.rs:545-552` own-term report gate (a certifying quorum's adoption evidence is
+  causally independent of any term above the certifying leader's). **Without this argument
+  the edit is unproven** — it is recorded, not assumed.
+* **(c)** PROHIBITION: the `≤` must never be strengthened to `=`. Item 26's "(in fact =)"
+  is true only of the authorizing advance; `=` would under-approximate, since a leader's
+  SECOND proposal compares against a config committed in an earlier term.
+* **(d)** Corner, for the final claim verbatim: `commit_seen` is **not** reset at
+  `become_leader` (`election.rs:1040-1056`), so a fresh leader carries follower-period
+  commit state; that inherited value cannot satisfy the serving latch (`:522-527`) without
+  a pre-existing completeness violation — same conditionality bucket as (n1).
+* **(e)** Run 12's `propose` CTI is an **unreachable** pre-state (leader at `curTerm` zero);
+  the reachability evidence is the gate's hand trace, recorded in the ledger.
+
+Also ratified: the run-8 retraction; the `electable_cfgs_contain_holder` correction; the
+true inventory **34/11 at all three commits** (session 7's "35" was a miscount both times);
+and that a CTI-bearing run ending `exit code 1 / build failed` is the NORMAL shape.
+
+**The open-clause truth rule** (gate 1c, binding, recorded verbatim in the ledger and the
+model header): a clause with open CTIs is a live hypothesis for every verdict in its
+bundle; no run's greens may be quoted as progress unless every clause still open in that
+run carries either a written truth argument or an explicit conditional label; a clause
+later found false VOIDS the quoted greens of every run that carried it.
+
+**Session-labelling reconciliation:** the ledger numbers sessions globally across the whole
+Veil spike, this memo numbers them within the commit-plane arc — ledger "SESSION 7" = memo
+Session 2, ledger "SESSION 8" = memo Session 3, ledger "SESSION 9" = this Session 4; items
+22–24 sit under the SESSION 7 heading because they were written in that session's
+post-gate-1b continuation.
+
+## S4.2 MODEL-EDIT-4 applied — new baseline 35 `require`s / 11 assumptions
+
+Applied in `propose` as a SECOND `require`
+(`cfgOf i = genesisC ∨ tot.le (cfgCommitTerm (cfgOf i)) (curTerm i)`) rather than as a
+conjunct in the existing one: the forms are equivalent by distribution, and the split makes
+the mechanical count honest at the mandated 35. `cfgCommitTerm` is moved OUT of the model
+header's ghost list — load-bearing now, as `gotEAt` became at gate 1. `QuorumAdjacency.lean`
+is untouched (no new assumption ⇒ no new witness/anti-vacuity debt).
+
+## S4.3 The twin calibration cross-check — DISCHARGED, both pass
+
+The debt transferred twice (sessions 2 and 3) is spent. One detached build,
+`proofs-veil/logs/twin-runA2C2-gate1c.log`, exactly two `error: Examples/` lines — both the
+expected violations:
+
+| run | knobs | verdict |
+|---|---|---|
+| A2 | coupling OFF, adjacency ON, addEnabled OFF, maxDepth 14 | ❌ `leader_completeness` at **depth 13** — the calibration CE survives, trace-for-trace |
+| C2 | coupling ON, canary | ❌ `p2_antecedent_canary` at **depth 10** — non-vacuity still witnessed |
+
+**Divergence (d5) recorded** in the twin header: MODEL-EDIT-4 is deliberately NOT mirrored
+(the twin has no `cfgCommitTerm` at all; a per-config commit-term function is a state
+multiplier past the explicit-state envelope, the same reason (d1) was skipped). The twin
+over-approximates on this axis too — the sound direction for a calibrator. The divergence
+list is now **(d1)–(d5)**, complete.

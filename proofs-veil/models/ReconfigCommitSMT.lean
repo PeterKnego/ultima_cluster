@@ -46,6 +46,29 @@ import Veil
      NEVER an unconditional claim. (Precedent: the LC arc's FramesCurrentAuthored.)
    =============================================================
 
+   ===== GATE-1c AMENDMENTS (2026-07-27) — MODEL-EDIT-4 APPROVED + APPLIED =====
+   * MODEL-EDIT-4 is APPLIED in `propose` (see the three gate amendments (a)/(b)/(c)
+     recorded inline there). **NEW BASELINE: 35 `require`s / 11 `assumption`s.**
+     `cfgCommitTerm` is thereby LOAD-BEARING, no longer ghost.
+   * GATE AMENDMENT (d) — CORNER, belongs in the final claim verbatim: `commit_seen` is
+     NOT reset at `become_leader` (election.rs:1040-1056), so a fresh leader carries
+     commit state inherited from its follower period. That inherited value cannot satisfy
+     the serving latch (:522-527 needs `commit_seen ≥` the fresh NewTerm position)
+     without a pre-existing completeness violation — the SAME conditionality bucket as
+     narrowing (n1) below.
+   * GATE AMENDMENT (e): run 12's `propose` CTI is an UNREACHABLE pre-state (leader at
+     `curTerm` zero). The reachability evidence is the gate's hand trace: proposer p
+     proposes cfg2 at t_p; node 0 adopts and wins t1 > t_p; a second cfg2-adopter wins
+     t0 > t1, and p's grant to it lifts `curTerm p` to t0; `commitCfg` stamps
+     `cfgCommitTerm cfg2 = t0`; leader 0 at t1 < t0 legally proposes past cfg2.
+   * THE OPEN-CLAUSE TRUTH RULE (gate 1c, binding): a clause with open CTIs is a LIVE
+     HYPOTHESIS for every verdict in its bundle. No run's greens may be quoted as
+     progress unless every clause still open in that run carries either a WRITTEN truth
+     argument (it holds in all reachable states of the current model) or an explicit
+     CONDITIONAL label naming what its truth awaits. A clause later found false VOIDS the
+     quoted greens of every run that carried it.
+   =============================================================
+
    SESSION-3 (bar 3, part 3) STATE — see proofs-veil/spike-ledger.md §SESSION 8:
      * `#check_invariants` IS run (bottom of file). **RUN 12: 409 OK / 8 CTI —
        32 clauses + `doesNotThrow` CERTIFIED INDUCTIVE, all-n, via cvc5.**
@@ -73,8 +96,9 @@ import Veil
        supports (`no_stale_election`@becomeLeader, `leader_completeness`@commitEntry)
        are CONDITIONAL on that approval.**
      * HISTORY STATE: `elecCfg` / `isCommitLeader` / `commitElecCfg` / `cfgAt` /
-       `reachAt` / `cfgCommitTerm` appear in NO `require`. `gotEAt` DID — MODEL-EDIT-1
-       promoted it to load-bearing; MODEL-EDIT-4 would do the same to `cfgCommitTerm`.
+       `reachAt` / `elecQuorum` appear in NO `require`. `gotEAt` and `cfgCommitTerm`
+       do NOT belong to that list: MODEL-EDIT-1 promoted `gotEAt` to load-bearing and
+       MODEL-EDIT-4 has now promoted `cfgCommitTerm` the same way.
 
    WHY THIS FILE EXISTS: the concrete-TSet model (ReconfigCommit.lean) cannot take
    the SMT inductiveness path — TSet's List-backed count/intersection ops break VC
@@ -192,6 +216,14 @@ function cfgCommitTerm (C : cfgid) : term
 --                   reaches C. Written at the two `cfgOf` writers (propose/adopt) for
 --                   EVERY config the move newly covers; read in NO `require`.
 function reachAt (N : node) (C : cfgid) : term
+--   elecQuorum N  : SESSION-4 GHOST (gate-1c corrected residue map) — the quorum N's
+--                   CURRENT leadership was certified against, frozen at `becomeLeader`.
+--                   `leader_quorum`'s ∃q is NOT a substitute: its witness can be
+--                   supplied by LATE grants made against a MOVED config, and
+--                   `cand_cfg_frozen` (the `becomeLeader`-time bridge) is unavailable
+--                   for a LONGSTANDING leader — which is exactly why
+--                   `no_stale_election` fails at `commitCfg`. Read in NO `require`.
+function elecQuorum (N : node) : quorum
 function gotEAt  (N : node) : term
 relation isCommitLeader (N : node)
 individual commitElecCfg : cfgid
@@ -322,6 +354,7 @@ action becomeLeader (i : node) (q : quorum) {
   leader i := true
   candidate i := false
   elecCfg i := cfgOf i
+  elecQuorum i := q                          -- GHOST: freeze the CERTIFYING quorum
 }
 
 action crashRestart (i : node) {
@@ -388,6 +421,33 @@ action propose (i : node) (d : cfgid) {
   -- prefix-closed so an own-term commit also commits the adopted config entry.
   -- Without this, election_safety is REACHABLY FALSE here (n=5 trace, ledger 21).
   require cfgOf i = genesisC ∨ cfgCommitted (cfgOf i)
+  -- MODEL-EDIT-4 (ledger 26; GATE 1c APPROVED with binding amendments (a)-(e)).
+  -- The clause above uses `cfgCommitted`, a GLOBAL flag set by any node at any term,
+  -- so the model let a LOW-term leader propose past a config that committed at a HIGH
+  -- term. Real UC's gate is the LEADER'S OWN, own-term-certified commit view:
+  -- `config_pending()` = `config_position > commit_seen` (election.rs:856-858) enforced
+  -- at :879-880, and a LEADER's `commit_seen` has exactly TWO writers — the gossip
+  -- intake at :594-595, which is literally leader-excluded, and `rank_leader` at :1457,
+  -- behind the Finding-#6b clamp at :1451-1456 (init :431). So a leader may propose past
+  -- C only after IT ITSELF ranked a commit covering C's frame, at its own term.
+  -- Written as a SECOND require rather than a conjunct inside the first: the two are
+  -- equivalent by distribution (`g ∨ (a ∧ b)` = `(g ∨ a) ∧ (g ∨ b)`) and this makes the
+  -- mechanical count honest at 35.
+  -- ** GATE AMENDMENT (a): `cfgCommitTerm` is the PROPOSER-STAMPED term at commitCfg-fire
+  --    time (:439 below), NOT the real certification term — the proposer's term drifts
+  --    upward, so the stamp can EXCEED the term a quorum actually certified at.
+  -- ** GATE AMENDMENT (b) — the over-approximation argument, without which this edit is
+  --    unproven: every real UC behaviour maps into a model behaviour satisfying this
+  --    require, because (i) `commitCfg` has no message plane and may fire at the EARLIEST
+  --    enabling point, before causally-independent term raises, so the real certification
+  --    term is always an available stamp; and (ii) the own-term report gate
+  --    (election.rs:545-552) makes a certifying quorum's adoption evidence causally
+  --    independent of any term above the certifying leader's — any member touched by a
+  --    higher term would depose that leader before ranking it.
+  -- ** GATE AMENDMENT (c) — PROHIBITION: never strengthen this `≤` to `=`. Ledger 26's
+  --    "(in fact =)" holds only for the AUTHORIZING advance; `=` would UNDER-approximate,
+  --    since a leader's SECOND proposal compares against a config committed earlier.
+  require cfgOf i = genesisC ∨ tot.le (cfgCommitTerm (cfgOf i)) (curTerm i)
   require succCfg (cfgOf i) d
   -- GHOST: freeze the term at which i first reaches each config this move covers.
   reachAt i Z := if (cfgLt (cfgOf i) Z ∧ ¬ cfgLt d Z) then curTerm i else reachAt i Z
@@ -529,9 +589,19 @@ invariant [cand_cfg_frozen]
 -- at a term strictly above the voter's last config change POSTDATES that change, so the
 -- config-currency guard applied with exactly the voter's CURRENT config — and the
 -- candidate's config at that moment was its frozen `elecCfg`.
-invariant [grant_cfg_covered]
-  (voteMsg V C T ∧ curTerm C = T ∧ (candidate C ∨ leader C) ∧ tlt (cfgAt V) T)
-    → ¬ cfgLt (elecCfg C) (cfgOf V)
+-- **RETIRED, SESSION 4 (gate-1c map; retirement pre-sanctioned).** WRITTEN RULING: this
+-- is the session-2 `elecCfg`-flavoured ANCESTOR of `grant_reach_covered`. It has never
+-- been inductive (1 CTI at the grant arm in every run since 9) because its conclusion
+-- names `elecCfg C`, which a candidate that has WON and then PROPOSED no longer matches —
+-- a late same-term grant compares against the MOVED `cfgOf C`. `grant_reach_covered`
+-- states the preservable form and IS inductive; every consumer in the residue map (the
+-- `elecq_*` route below, `no_stale_election`, `election_safety`) goes through
+-- `cfgOf`/the frozen quorum. NOTHING consumes this clause. Under the gate's open-clause
+-- truth rule its retirement is MANDATORY, not optional: a clause with open CTIs and no
+-- truth argument is a live FALSE hypothesis for every green around it.
+-- invariant [grant_cfg_covered]
+--   (voteMsg V C T ∧ curTerm C = T ∧ (candidate C ∨ leader C) ∧ tlt (cfgAt V) T)
+--     → ¬ cfgLt (elecCfg C) (cfgOf V)
 -- NOTE (run-9 finding): the `tot.le (cfgAt V) (cfgCommitTerm D)` conjunct that the
 -- `no_stale_election` argument wants CANNOT be carried here — an adopter's `cfgAt`
 -- RISES when it later moves further along the chain, so the bound is not preserved
@@ -619,9 +689,82 @@ invariant [commit_cfg_backed]
 -- but because the config-currency guard makes nodes 0,1,2 (at C2) and 3 (at C1) REFUSE a
 -- C0-stale candidate. So the clause must be restricted to configs at-or-above the commit
 -- config; the stale side is the `no_stale_election` argument's job, not this one's.
-invariant [electable_cfgs_contain_holder]
-  (committed ∧ ¬ cfgLt (cfgOf N) commitCfgid) →
-    (∀ (q : quorum), quorumOf q (cfgOf N) → ∃ V, qmember V q ∧ holdsE V)
+-- **RETIRED, SESSION 4 (gate-1c map-or-retire, RETIRE taken).** WRITTEN RULING: item 25
+-- already established the UNRESTRICTED form is FALSE in reachable states. The RESTRICTED
+-- form below (configs at-or-above `commitCfgid`) still has 3 open CTIs and **no truth
+-- argument can be written for it**: the natural chain induction upward from `commitCfgid`
+-- FAILS at the successor step — `adjacent_cfg_quorum_intersection` says a quorum of
+-- `succ C` MEETS every quorum of C, but the meeting member need not be the holder the
+-- inductive hypothesis supplies. Carrying it would repeat exactly the defect of run 8 and
+-- of item 25 (an unproved clause propping up its neighbours' greens), so under the truth
+-- rule it leaves the bundle. THIS RETIREMENT IS A MEASUREMENT: if P2 and election_safety
+-- close without it, "P2's argument nowhere consumes it" is EARNED; if they do not, the
+-- residue is honestly re-described as needing a cross-config holder-supply argument.
+-- invariant [electable_cfgs_contain_holder]
+--   (committed ∧ ¬ cfgLt (cfgOf N) commitCfgid) →
+--     (∀ (q : quorum), quorumOf q (cfgOf N) → ∃ V, qmember V q ∧ holdsE V)
+
+-- ---- SESSION 4: the CERTIFYING-QUORUM route + the persistent no-foreign-grant carrier ----
+-- (gate-1c corrected residue map; truth arguments T2/T3/T4/T5/T6/T7 in the ledger.)
+
+-- T2 — `leader_quorum` with its ∃q replaced by the FROZEN ghost witness. Sound because
+-- `becomeLeader`'s own require establishes it at the only site that creates leadership,
+-- and every action that changes `curTerm I` also CLEARS `leader I`.
+invariant [elecq_witness]
+  leader I → (quorumOf (elecQuorum I) (elecCfg I) ∧
+    (∀ V, qmember V (elecQuorum I) → (V = I ∨ voteMsg V I (curTerm I))))
+-- T3 — THE CLAUSE THE GATE'S MAP REQUIRES. A member of the FROZEN certifying quorum that
+-- had already reached D when it granted forces the leader's ELECTION config at-or-past D.
+-- Grants in the frozen quorum all PREDATE `becomeLeader`, i.e. were made while I was a
+-- CANDIDATE, and a candidate's config cannot move (`adopt` clears candidacy, `propose`
+-- requires `leader`), so `cand_cfg_frozen` gives `elecCfg I = cfgOf I` across that window
+-- and the MODEL-EDIT-2 currency guard applied with `cfgOf V >= D`. The antecedent cannot
+-- be created AFTER the win: `grant_state` gives `curTerm I <= curTerm V`, and a later
+-- `propose`/`adopt` stamps `reachAt V D` with the MOVER's term, which is >= `curTerm V`.
+invariant [elecq_grant_covers_reach]
+  (leader I ∧ qmember V (elecQuorum I) ∧ ¬ cfgLt (cfgOf V) D ∧ tlt (reachAt V D) (curTerm I))
+    → ¬ cfgLt (elecCfg I) D
+-- T4 — a candidate reached every config it holds STRICTLY BEFORE its own term:
+-- `startElection` bumps strictly past a term that already bounds `reachAt` (`reach_bound`),
+-- and nothing re-stamps while candidacy persists. Excludes run 12's `election_safety` CTI
+-- (a candidate at `tot.zero` whose `reachAt` equals its term).
+invariant [cand_reach_strict]
+  (candidate I ∧ ¬ cfgLt (cfgOf I) C) → tlt (reachAt I C) (curTerm I)
+-- T5/T6/T7 — the same-term commit-leader-self-vote hole (P2's last CTI). `grant_state`'s
+-- FIRST disjunct absorbs a stray `voteMsg` without constraining `voteCand`, so the absence
+-- of a foreign grant at `committedTerm` must be carried PERSISTENTLY; the two supports
+-- below are what make the carrier preserved at the grant arm.
+invariant [voteterm_bounded]
+  tot.le (voteTerm V) (curTerm V)
+-- RUN-14 CORRECTION: `hasVoted I` is part of the fact, not a detail. Without it the
+-- grant guard `¬(hasVoted j ∧ voteTerm j = t ∧ voteCand j ≠ c)` passes VACUOUSLY for a
+-- commit leader the solver gives `hasVoted = []`, and both this clause and the carrier
+-- fail at the grant arm. `self_vote` supplies it at commit time and NO action ever
+-- clears `hasVoted`.
+invariant [commit_leader_self_vote]
+  isCommitLeader I → (hasVoted I ∧ tot.le committedTerm (voteTerm I) ∧
+    (voteTerm I = committedTerm → voteCand I = I))
+invariant [commit_leader_no_foreign_grant]
+  (isCommitLeader V ∧ C ≠ V) → ¬ voteMsg V C committedTerm
+
+-- ---- RUN-15 additions: the two clause-only facts P2's remaining CTIs need ----
+-- T10 — NO ROLE AT THE ZERO TERM. `candidate` is created only by `startElection`, which
+-- requires `tlt (curTerm i) t` and sets `curTerm i := t`; with `zero_le`, t is strictly
+-- above `tot.zero`, and `curTerm` only rises. `becomeLeader` inherits it from candidacy.
+-- Excludes the run-14 `commitEntry` P2 CTI, whose committing leader sits AT `tot.zero`.
+invariant [role_positive_term]
+  (candidate I ∨ leader I) → tlt tot.zero (curTerm I)
+-- T11 — THE COMMIT LEADER IS AT-OR-PAST THE CONFIG IT COMMITTED UNDER. `commitEntry` sets
+-- `commitCfgid := cfgOf i` at the same instant it sets `isCommitLeader i`, and `cfgOf` is
+-- FORWARD-ONLY (propose moves along `succCfg`; adopt requires `¬cfgLt (proposedC i) (cfgOf j)`),
+-- so it can never fall back below. Load-bearing: with `chain_committed_below` it forces
+-- every config strictly below `commitCfgid` to be COMMITTED, which (via
+-- `committed_cfg_quorum`) SUPPLIES THE QUORUMS the adjacency chain needs. The run-14
+-- `becomeLeader` P2 CTI exploits exactly their absence — it interprets the intermediate
+-- config as having NO quorum at all, so `adjacent_cfg_quorum_intersection` is vacuous and
+-- the chain from the commit config down to the stale candidate's config breaks.
+invariant [commit_leader_at_commit_cfg]
+  isCommitLeader I → ¬ cfgLt (cfgOf I) commitCfgid
 
 #gen_spec
 
