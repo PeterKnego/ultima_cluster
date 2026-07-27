@@ -1891,11 +1891,16 @@ STRICT bound. **Task 1's answer: a clause, not a ghost — no new state at all.*
 #### 34. TASK 2 — A TRACTABLE `role_positive_term`: T12 SUBSUMES IT (encoding recorded)
 `role_positive_term` = `(candidate I ∨ leader I) → tlt tot.zero (curTerm I)` cost ~7 h
 (run 15) because it is the first clause to put `tot.zero` into every VC's hypothesis set.
-**T12 at `C := genesisC` yields it without naming `tot.zero` at all:** `reachAt I genesisC`
-is never written by either `reachAt` writer (both stamp only configs STRICTLY ABOVE the
-mover's current config, and `genesis_least` puts genesis below every config), so it sits at
-`tot.zero` from `after_init`; T12 gives `reachAt I genesisC < curTerm I`, and the theory's
-`zero_le` closes `tot.zero < curTerm I`. This is the "restate over an existing bounded ghost"
+**T12 at `C := genesisC` yields it without naming `tot.zero` at all:** the antecedent is free
+(`genesis_least`), so T12 gives `reachAt I genesisC < curTerm I`, and the theory's `zero_le`
+(`tot.zero ≤ x` for every x) then closes `tot.zero < curTerm I`.
+**PRECISION (the step that actually carries it):** the derivation runs through `zero_le`, NOT
+through `reachAt I genesisC = tot.zero`. That equation is true in every REACHABLE state —
+neither `reachAt` writer ever stamps genesis, since both stamp only configs STRICTLY ABOVE
+the mover's current config — but it is NOT available to the solver, which is free to invent
+a pre-state where it fails, and run 16's own CTI does exactly that (`tot.zero = 1` while
+`reachAt 1 genesisC = 0`). `zero_le` is an axiom of `TotalOrderWithZero` and needs no such
+help. This is the "restate over an existing bounded ghost"
 option of the map, and it needs no clause of its own — it is an instance of one already
 wanted for task 1.
 

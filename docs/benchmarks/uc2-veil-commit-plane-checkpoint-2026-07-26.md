@@ -964,9 +964,11 @@ CLAUSE, not a ghost, and it adds no state:
 > tlt (reachAt I C) (curTerm I)`
 
 and **task 2 falls out of it for free**: at `C := genesisC` (antecedent free by
-`genesis_least`, and `reachAt N genesisC` is never written by either writer, so it sits at
-`tot.zero`) T12 plus `zero_le` IS `role_positive_term` — the ~7 h clause of run 15 — without
-putting `tot.zero` into every VC's hypothesis set. That is the "restate over an existing
+`genesis_least`) T12 plus the theory's `zero_le` IS `role_positive_term` — the ~7 h clause of
+run 15 — without putting `tot.zero` into every VC's hypothesis set. The derivation runs
+through `zero_le`, *not* through "`reachAt N genesisC` is never written": that equation holds
+in every reachable state but is not available to the solver, and run 16's own CTI invents a
+pre-state where it fails. That is the "restate over an existing
 bounded ghost" option, and it costs no clause of its own.
 
 ## S5.3 What actually happened: three runs, no verdict
