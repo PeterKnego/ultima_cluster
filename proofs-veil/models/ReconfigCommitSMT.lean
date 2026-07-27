@@ -46,22 +46,35 @@ import Veil
      NEVER an unconditional claim. (Precedent: the LC arc's FramesCurrentAuthored.)
    =============================================================
 
-   SESSION-2 (bar 3, part 1) STATE — see proofs-veil/spike-ledger.md §SESSION 7:
-     * `#check_invariants` IS run (bottom of file). Run 3: **170 ✅ / 6 ❌** —
-       12 of 16 clauses CERTIFIED INDUCTIVE, all-n, via cvc5, in ~93 s.
-     * STILL OPEN: `election_safety` (1 CTI), `leader_completeness` = P2 (2 CTIs),
-       `electable_cfgs_contain_holder` (3 CTIs). All four are blocked on the SAME
-       two adjudicated model-fidelity gaps (ledger items 14/15 = MODEL-EDIT-1/2),
-       which are DELIBERATELY NOT APPLIED pending the mid-arc Fable gate:
-         - MODEL-EDIT-1: `commitEntry` must count only reports term-stamped with
-           the committing leader's own term (election.rs:545-552/566-570). Without
-           it P2 is REACHABLY FALSE here (Figure-8 shape at n=5 — ledger 14).
-         - MODEL-EDIT-2: vote granting must respect CONFIG-entry currency, not just
-           E (log_ok over `durable`, election.rs:342-350/1240-1247, and config
-           frames live in `durable` — gate doc §5 Q2 link 1).
-     * HISTORY STATE: `elecCfg` / `isCommitLeader` / `commitElecCfg` appear in NO
-       `require` (behaviour-preserving). `gotEAt` DID — until MODEL-EDIT-1 promoted
-       it to load-bearing; it is now part of the model, not scaffolding.
+   SESSION-3 (bar 3, part 3) STATE — see proofs-veil/spike-ledger.md §SESSION 8:
+     * `#check_invariants` IS run (bottom of file). **RUN 12: 409 OK / 8 CTI —
+       32 clauses + `doesNotThrow` CERTIFIED INDUCTIVE, all-n, via cvc5.**
+     * NEW THIS SESSION (clause/ghost ONLY — 34 `require`s / 11 assumptions,
+       unchanged from run 10): the per-(node, config) first-reach ghost `reachAt`
+       and its clauses (`reach_bound`, `reach_mono`, `grant_reach_covered`,
+       `eleccfg_covers_early_reach`, `adopted_reach_bound`, the strengthened
+       `committed_cfg_quorum`, and `reach_quorum_below`).
+     * CORRECTION: `electable_cfgs_contain_holder` as stated through run 11 was
+       FALSE in reachable states (ledger 25) — restricted here to configs
+       at-or-above `commitCfgid`.
+     * STILL OPEN: `reach_quorum_below` (1 CTI, `propose`),
+       `electable_cfgs_contain_holder` (3), `grant_cfg_covered` (1 — RETIRE in
+       favour of `grant_reach_covered`, ledger 27), `election_safety` (1),
+       `leader_completeness` = P2 (1), `no_stale_election` (1).
+     * !! THE WHOLE RESIDUE IS BLOCKED ON ONE UNAPPROVED EDIT !!
+       **MODEL-EDIT-4 (ledger 26, REQUESTED AT GATE 1c, NOT APPLIED):** `propose`
+       must also require `tot.le (cfgCommitTerm (cfgOf i)) (curTerm i)`. The model's
+       `cfgCommitted` is a GLOBAL flag; real UC's gate is the LEADER'S OWN
+       own-term-certified commit view (`config_pending()` = `config_position >
+       commit_seen`, election.rs:854-858 enforced :879-880; a leader's `commit_seen`
+       has one writer, `rank_leader` :1421-1457, clamped to `new_term_pos`; the
+       gossip intake :594-595 is explicitly non-leader). Until it is approved,
+       **`reach_quorum_below` is expected FALSE here, and the two run-12 greens it
+       supports (`no_stale_election`@becomeLeader, `leader_completeness`@commitEntry)
+       are CONDITIONAL on that approval.**
+     * HISTORY STATE: `elecCfg` / `isCommitLeader` / `commitElecCfg` / `cfgAt` /
+       `reachAt` / `cfgCommitTerm` appear in NO `require`. `gotEAt` DID — MODEL-EDIT-1
+       promoted it to load-bearing; MODEL-EDIT-4 would do the same to `cfgCommitTerm`.
 
    WHY THIS FILE EXISTS: the concrete-TSet model (ReconfigCommit.lean) cannot take
    the SMT inductiveness path — TSet's List-backed count/intersection ops break VC
@@ -170,6 +183,15 @@ function elecCfg (N : node) : cfgid
 --   cfgCommitTerm C: the term in which config C committed.
 function cfgAt (N : node) : term
 function cfgCommitTerm (C : cfgid) : term
+--   reachAt N C   : SESSION-3 GHOST — the term at which N FIRST reached C-or-later
+--                   ("reached C" := ¬ cfgLt (cfgOf N) C, a MONOTONE predicate because
+--                   MODEL-EDIT-2c makes adoption forward-only). This is the
+--                   per-(node, config) ordering fact the run-9 finding (ledger 24)
+--                   showed `cfgAt` cannot carry: `cfgAt V` RISES when V moves further
+--                   along the chain, whereas `reachAt V C` FREEZES the moment V
+--                   reaches C. Written at the two `cfgOf` writers (propose/adopt) for
+--                   EVERY config the move newly covers; read in NO `require`.
+function reachAt (N : node) (C : cfgid) : term
 function gotEAt  (N : node) : term
 relation isCommitLeader (N : node)
 individual commitElecCfg : cfgid
@@ -242,6 +264,7 @@ after_init {
   gotEAt N := tot.zero
   cfgAt N := tot.zero
   cfgCommitTerm C := tot.zero
+  reachAt N C := tot.zero
   isCommitLeader N := false
   commitElecCfg := genesisC
   pending N := false
@@ -366,6 +389,8 @@ action propose (i : node) (d : cfgid) {
   -- Without this, election_safety is REACHABLY FALSE here (n=5 trace, ledger 21).
   require cfgOf i = genesisC ∨ cfgCommitted (cfgOf i)
   require succCfg (cfgOf i) d
+  -- GHOST: freeze the term at which i first reaches each config this move covers.
+  reachAt i Z := if (cfgLt (cfgOf i) Z ∧ ¬ cfgLt d Z) then curTerm i else reachAt i Z
   cfgOf i := d
   cfgAt i := curTerm i
   proposedC i := d
@@ -394,6 +419,9 @@ action adopt (j : node) (i : node) {
   candidate j := false
   leader j := false
   curTerm j := curTerm i
+  -- GHOST: same freeze, at the adopter (the term is the proposer's, which is also
+  -- j's new term — `adopt` requires curTerm j <= curTerm i).
+  reachAt j Z := if (cfgLt (cfgOf j) Z ∧ ¬ cfgLt (proposedC i) Z) then curTerm i else reachAt j Z
   cfgOf j := proposedC i
   cfgAt j := curTerm i
   hasAdopted j i := true
@@ -510,8 +538,46 @@ invariant [grant_cfg_covered]
 -- (it broke a previously-inductive clause at propose/adopt/commitCfg). The ordering
 -- fact needed is per-(node, config) — "the term at which V FIRST reached D or later" —
 -- which needs its own ghost. Next session's first move; see the ledger.
+-- ---- SESSION 3: THE PER-(node, config) FIRST-REACH GHOST (ledger 24's alternative) ----
+-- `reachAt N C` freezes when N first reaches C-or-later; these five clauses are its
+-- soundness + the two grant-ordering facts the stale-config argument needs.
+invariant [reach_bound]                 -- a reached config was reached by now
+  ¬ cfgLt (cfgOf N) C → tot.le (reachAt N C) (curTerm N)
+invariant [reach_mono]                  -- earlier configs are reached no later
+  (cfgLt C D ∧ ¬ cfgLt (cfgOf N) D) → tot.le (reachAt N C) (reachAt N D)
+-- SESSION 3, run 12: the clause the stale-config argument actually consumes. For any
+-- config C some node N has reached and any E strictly below it, E has a quorum that
+-- reached E no later than N reached C. Instantiated at N := a member of a committed D's
+-- certifying quorum, it delivers "a quorum of succ(stale cfg) reached it strictly before
+-- the stale leader's term", which is exactly what adjacency + `grant_reach_covered` need.
+-- EXPECTED TO FAIL at `propose`/`adopt` in run 12: its preservation needs the proposer's
+-- own-term bound on the PREDECESSOR's commit term, which the model's GLOBAL
+-- `cfgCommitted` flag does not carry. See ledger item 25 (MODEL-EDIT-4 request).
+invariant [reach_quorum_below]
+  (cfgLt E C ∧ ¬ cfgLt (cfgOf N) C) →
+    (E = genesisC ∨ ∃ (q : quorum), quorumOf q E ∧
+      (∀ V, qmember V q → ¬ cfgLt (cfgOf V) E ∧ tot.le (reachAt V E) (reachAt N C)))
+-- GRANT-POSTDATES-ADOPTION, per-(node, config). A voter that had ALREADY reached D
+-- when it granted at T forces the candidate to be at-or-past D — that is exactly the
+-- MODEL-EDIT-2 guard `¬ cfgLt (cfgOf c) (cfgOf j)`, frozen by the strict term bound.
+-- NOTE the conclusion is over `cfgOf C`, NOT `elecCfg C`: a candidate that has WON and
+-- then PROPOSED can still receive late grants at the same term, at which point the
+-- guard compares against its MOVED config. `cfgOf` is forward-only, so this form is
+-- preserved; `cand_cfg_frozen` bridges it back to `elecCfg` at `becomeLeader`, which
+-- is the only action that can newly create a stale-config leader.
+invariant [grant_reach_covered]
+  (voteMsg V C T ∧ ¬ cfgLt (cfgOf V) D ∧ tlt (reachAt V D) T) → ¬ cfgLt (cfgOf C) D
+-- ...and the V = I disjunct of the same intersection: a leader/candidate that itself
+-- reached D strictly before its own term stood for election at-or-past D.
+invariant [eleccfg_covers_early_reach]
+  ((candidate I ∨ leader I) ∧ ¬ cfgLt (cfgOf I) D ∧ tlt (reachAt I D) (curTerm I))
+    → ¬ cfgLt (elecCfg I) D
+-- the bound that lets `commitCfg` establish the reach conjunct of committed_cfg_quorum
+invariant [adopted_reach_bound]
+  hasAdopted V I → tot.le (reachAt V (proposedC I)) (curTerm I)
 invariant [committed_cfg_quorum]
-  cfgCommitted D → ∃ (q : quorum), quorumOf q D ∧ (∀ V, qmember V q → ¬ cfgLt (cfgOf V) D)
+  cfgCommitted D → ∃ (q : quorum), quorumOf q D ∧
+    (∀ V, qmember V q → ¬ cfgLt (cfgOf V) D ∧ tot.le (reachAt V D) (cfgCommitTerm D))
 invariant [pending_iff_proposal]
   pending I ↔ hasProposal I
 -- EDIT-1's payload, carried to the induction: every commit-quorum member acquired E
@@ -542,11 +608,24 @@ invariant [commit_cfg_backed]
 -- restricting to configs reachable along succCfg from commitCfgid, or threading
 -- propAfterE through the proposal chain); it is where the adjacency lemma and the
 -- prefix coupling must meet.
+-- SESSION-3 CORRECTION — THE CLAUSE AS FIRST STATED IS **FALSE IN REACHABLE STATES**,
+-- and by the run-8 lesson (ledger session 8, task 1) that made it an unsound hypothesis
+-- for every green around it. Countermodel, every step legal in this model (n=5, W2
+-- interpretation): genesis C0={0..4}; leader 0 commits C1=C0∖{4} (adopters 0,1,2 — a
+-- 3-of-4 quorum) and then C2=C1∖{3} (adopters 0,1 — a 2-of-3 quorum); node 4 never
+-- adopts and stays at C0. Now `appendEntry(0)` + `replicate(0→1)` + `commitEntry(0,{0,1})`
+-- commits E under `commitCfgid = C2`. `cfgOf 4 = C0`, and the C0-quorum {2,3,4} holds
+-- no E. Real UC is safe there NOT because such a quorum contains a holder — it does not —
+-- but because the config-currency guard makes nodes 0,1,2 (at C2) and 3 (at C1) REFUSE a
+-- C0-stale candidate. So the clause must be restricted to configs at-or-above the commit
+-- config; the stale side is the `no_stale_election` argument's job, not this one's.
 invariant [electable_cfgs_contain_holder]
-  committed → (∀ N (q : quorum), quorumOf q (cfgOf N) → ∃ V, qmember V q ∧ holdsE V)
+  (committed ∧ ¬ cfgLt (cfgOf N) commitCfgid) →
+    (∀ (q : quorum), quorumOf q (cfgOf N) → ∃ V, qmember V q ∧ holdsE V)
 
 #gen_spec
 
--- RUN 10 (post-gate-1b, final): cfgAt template + the (a)-class clause repairs run 9
--- demanded. Ghost state + clauses ONLY — no new `require`, no new assumption.
+-- RUN 12 (session 3): + `reach_quorum_below` (expected ❌ at propose/adopt — the
+-- MODEL-EDIT-4 evidence) and the CORRECTED `electable_cfgs_contain_holder`. Clause-only:
+-- verified 34 requires / 11 assumptions, identical to the run-10/run-11 baseline.
 #check_invariants

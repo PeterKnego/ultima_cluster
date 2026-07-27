@@ -1114,3 +1114,245 @@ argument, now with two named sub-obligations (the per-(node,config) reach ghost 
 `electable_cfgs_contain_holder` (3). Gate-2 scope, as directed: the final conditionality
 wording must carry (n1)+(n2)+(n3) verbatim, and the twin<->SMT divergence list (d1)-(d4)
 must be complete at close — both are now written into the model headers.
+
+---
+
+### SESSION 8 (2026-07-27, opus) — BAR 3, part 2: the P2 regression diagnosed + the reach ghost
+Fresh context by design (the arc's continuity mechanism is this ledger). Worktree
+`.claude/worktrees/uc2-veil-commit-plane` @ `ce4ab33`; runs in
+`/home/claude/veil-spike/veil-preview`, logs `/home/claude/veil-spike/runs/`.
+Baseline inventory verified MECHANICALLY before any banked run (gate-1b corrective):
+**34 `require`s / 11 `assumption`s** in the run-10 model. NOTE a bookkeeping
+correction: session 7 recorded "35 requires"; the mechanical count
+(`grep -cE '^\s*require '`) is **34**, and 34/11 is the number this session holds
+itself to. The discrepancy is a miscount in the prior entry, not a model change
+(`git diff ce4ab33` over the model is empty at session start).
+
+#### TASK 1 — THE RUN-8 → RUN-10 P2 REGRESSION: **(c)**, NOT the predecessor's (a)
+Verdict: **(c) — run 8's counting was propped up by a clause that is FALSE in
+reachable states.** The predecessor's suspicion — that writing `elecCfg` at
+`startElection` changed what `commitElecCfg` snapshots — is **REFUTED**.
+
+*Evidence 1 (trace inspection, run-10 `commitEntry` TR CTI, `smt-run10-final.log:769-830`).*
+The CTI pre-state has `candidate = []` and `leader = [0,1]`. `elecCfg` is written at
+`startElection` ONLY for candidates, and `becomeLeader` overwrites it for every leader,
+so in a candidate-free pre-state the two write-site regimes are POINTWISE IDENTICAL.
+`commitEntry` does not write `elecCfg`. The new write site cannot be reached by this CTI.
+
+*Evidence 2 (the actual mechanism).* The same pre-state VIOLATES run 8's
+`eleccfg_not_stale` (`(leader I ∧ cfgCommitted D) → ¬ cfgLt (elecCfg I) D`): node 1 is
+`leader`, `cfgCommitted` holds of cfg2, `elecCfg 1 = cfg1`, and `cfgLt cfg1 cfg2`. Under
+run 8's bundle the solver could not propose it at all. Run 10 replaced that clause with
+the term-conditioned `no_stale_election`, which is STRICTLY WEAKER (its antecedent adds
+`tlt (cfgCommitTerm D) (curTerm I)`, and in this CTI every `cfgCommitTerm` equals node
+1's own term, so it is vacuous there). **That replacement is the ONLY weakening between
+the two bundles** — run 10 otherwise only ADDS clauses (`role_exclusive`,
+`reqvote_term_reached`, `vote_term_reached`, `cand_cfg_frozen`, `grant_cfg_covered`),
+and added clauses can only help.
+
+*Evidence 3 (mechanical, DIAGNOSTIC RUN D1 — `logs/smt-D1-diag-regression.log`).*
+Run-10's model with run-8's `eleccfg_not_stale` restored VERBATIM as an extra clause
+(`DIAG_eleccfg_not_stale`), nothing else changed: **353 ✅ / 10 ❌, and
+`leader_completeness` fails at `becomeLeader` ONLY — the `commitEntry` CTI is GONE.**
+P2 is back to exactly run 8's single CTI. Regression fully accounted for.
+
+*What this means, stated honestly:* **run 8 is NOT a valid reference state for P2's CTI
+count.** `eleccfg_not_stale` is false in reachable states (ledger item 23; re-verified in
+the Rust this session — a LEADER leaves `Role::Leader` in exactly two places:
+`adopt_term` on a strictly HIGHER term (`election.rs:1059-1061`, `self.role =
+Role::Follower`; reached from the higher-term arms at `:534-535` and the Report/
+LeaderSeen handlers) and the M7 self-removal/demotion latch
+(`election.rs:1505` / `:1539`). The two `step_down_to_follower` call sites at `:541`
+and `:592` are guarded by `matches!(self.role, Role::Candidate)` — candidate-only.
+There is NO check-quorum step-down, so a leader elected under an old config keeps its
+flag indefinitely while the cluster commits later configs). A clause that is
+false in reachable states is an UNSOUND hypothesis for every other clause in the bundle,
+and P2-at-`commitEntry` was resting on it. Run 10's "regression" is the bundle becoming
+HONEST, not weaker. The ledger's session-7 line "run 8 remains the reference state for
+P2's CTI count" is hereby **retracted**; run 10's 2 CTIs is the true baseline, and
+the session-7 count of 22 inductive clauses at run 8 was likewise inflated by the same
+unsound hypothesis (how much is unmeasured — the honest re-baseline is run 10's 26).
+
+*Process note (no new rule needed, but worth the ink):* this is the second time this arc
+that a clause I wrote — not the model — was the defect (item 23 was the first). The
+lesson generalizes the gate-1b corrective: a NON-INDUCTIVE clause is not merely "an open
+obligation", it is a live hypothesis for every other clause, so an open clause that later
+turns out FALSE silently inflates every green around it. **Every clause with open CTIs
+must be re-argued for TRUTH (not just inductiveness) before its neighbours' greens are
+quoted as progress.**
+
+#### TASK 2 — THE PER-(node, config) FIRST-REACH GHOST: **WORKS** (run 11)
+Ghost `reachAt (N : node) (C : cfgid) : term` — the term at which N FIRST reached
+C-or-later, where "reached C" := `¬ cfgLt (cfgOf N) C`, a MONOTONE predicate because
+MODEL-EDIT-2c makes adoption forward-only. Written at the only two `cfgOf` writers
+(`propose`, `adopt`) for EVERY config the move newly covers (not just the target — a
+node that jumps several links freezes all of them at that term); read in NO `require`,
+so the gate-1b corrective is satisfied by count: **34 `require`s / 11 assumptions,
+identical to run 10.** This is the ledger-item-24 alternative: `cfgAt` RISES as an
+adopter walks on, `reachAt V C` FREEZES the moment V reaches C.
+
+**RUN 11 — 398 ✅ / 9 ❌.** All five new clauses inductive on the first attempt, and
+the `committed_cfg_quorum` strengthening that BROKE under `cfgAt` in run 9 is now
+inductive: `reach_bound` (a reached config was reached by now), `reach_mono` (earlier
+configs are reached no later), `grant_reach_covered`, `eleccfg_covers_early_reach`,
+`adopted_reach_bound`, and `committed_cfg_quorum` carrying
+`tot.le (reachAt V D) (cfgCommitTerm D)`. **31 clauses + `doesNotThrow` inductive**
+(run 10: 26). The nine CTIs are the SAME nine as run 10, clause-for-clause and
+action-for-action — no regression, and P2 stays at 2. Log `smt-run11-reachghost.log`.
+
+Two design notes worth carrying:
+* `grant_reach_covered` concludes over **`cfgOf C`, not `elecCfg C`** — a candidate that
+  has WON and then PROPOSED can still receive late grants at the same term, at which
+  point the MODEL-EDIT-2 guard compares against its MOVED config. `cfgOf` is
+  forward-only so that form is preserved; `cand_cfg_frozen` bridges back to `elecCfg`
+  at `becomeLeader`, the only action that can newly create a stale-config leader.
+  (The `elecCfg`-flavoured `grant_cfg_covered` from session 2 is still ❌ at the grant
+  arm — this is almost certainly why.)
+* the same-term wrinkle the brief warned about is real and is handled structurally, not
+  by term-strictness: `eleccfg_covers_early_reach` supplies the `V = i` disjunct.
+
+25. **`electable_cfgs_contain_holder` IS FALSE IN REACHABLE STATES — the arc's SECOND
+    false clause, and the run-8 lesson applies to it.** Countermodel, every step legal in
+    this model (n=5 over the W2 interpretation): genesis `C0={0..4}`; leader 0 commits
+    `C1=C0∖{4}` (adopters 0,1,2 = a 3-of-4 quorum) and then `C2=C1∖{3}` (adopters 0,1 =
+    a 2-of-3 quorum); node 4 never adopts and stays at `C0`. Then `appendEntry(0)` +
+    `replicate(0→1)` + `commitEntry(0,{0,1})` commits E under `commitCfgid = C2`. Now
+    `cfgOf 4 = C0` and the `C0`-quorum `{2,3,4}` contains no E-holder. **Real UC is safe
+    there for a different reason than the clause asserts**: not because a stale config's
+    quorums contain holders — they do not — but because the config-currency guard makes
+    nodes 0,1,2 (at `C2`) and 3 (at `C1`) REFUSE a `C0`-stale candidate
+    (`election.rs:342-350`/`:1240-1247` over `durable`, gate doc §5 Q2 link 1). The
+    clause is therefore RESTRICTED (run 12) to configs at-or-above `commitCfgid`; the
+    stale side belongs to `no_stale_election`, not here. **Consequence, stated plainly:
+    run 11's 398 ✅ were computed with a false clause in the bundle, exactly the defect
+    task 1 found in run 8. Run 12 re-measures with it corrected, and run 12's numbers —
+    not run 11's — are the honest ones.** (This is the third time in this arc that a
+    clause I wrote, not the model, was the defect: items 23, 25, and run 8's
+    `eleccfg_not_stale`.)
+
+26. **`MODEL-EDIT-4` — PROPOSED, **NOT APPLIED**: `propose`'s config-commit gate is a
+    GLOBAL flag where real UC's is the LEADER'S OWN, own-term-certified commit view.
+    THIS IS THE SESSION'S STOP POINT — a new `require` beyond the 34/11 baseline, so per
+    the gate-1b corrective nothing is built on it and no run carrying it is banked.**
+
+    *The model as it stands.* `propose` requires
+    `cfgOf i = genesisC ∨ cfgCommitted (cfgOf i)`. `cfgCommitted C` is a GLOBAL relation
+    set by any `commitCfg`, by any node, at any term. Nothing relates the term at which
+    C committed to the proposer's term. Consequence: a leader at a LOW term may propose
+    past a config that committed at a HIGH term, so `cfgCommitTerm` is not monotone
+    along the config chain.
+
+    *Rust adjudication — the real gate is strictly tighter (so this is (b)-class
+    infidelity, an OVER-approximation, not a UC bug).* `propose_config` refuses unless
+    BOTH `self.serving` (`uc2_consensus/src/election.rs:876-877`, `NotServing`, the
+    single-server-change precondition) and `!self.config_pending()`
+    (`:879-880`, `ChangePending`), where `config_pending()` is
+    `config_position > commit_seen` (`:854-858`). And a **LEADER's `commit_seen` has
+    exactly one writer**: `rank_leader` (`:1421-1457`), gated by the Finding-#6b clamp
+    `c >= new_term_pos` — this term's NewTerm frame. The gossip intake at `:594-595` is
+    explicitly `if !matches!(self.role, Role::Leader)`, so a leader NEVER adopts another
+    node's commit index. Therefore a leader may propose past config C only after IT
+    ITSELF ranked a commit covering C's frame, at its OWN term ⇒ in real UC the commit
+    that authorises the proposal is certified at a term ≤ (in fact =) the proposer's.
+
+    *Proposed edit (minimal, still OVER-approximating — the sound direction).* Replace
+    the `propose` require with
+    `require cfgOf i = genesisC ∨ (cfgCommitted (cfgOf i) ∧ tot.le (cfgCommitTerm (cfgOf i)) (curTerm i))`.
+    Weaker than the Rust gate (which forces the proposer's OWN term, not merely
+    at-or-below it), so every real UC behaviour still satisfies it. Consequence to
+    record if approved: **`cfgCommitTerm` is promoted from ghost to load-bearing**,
+    exactly as MODEL-EDIT-1 promoted `gotEAt`. No new `assumption`, so no new
+    anti-vacuity/witness debt in `QuorumAdjacency.lean`.
+
+    *Why it is load-bearing (the residue reduces to it).* The stale-config argument needs
+    a quorum of `E = succ(elecCfg I)` whose members ALL reached E strictly before I's
+    term. `committed_cfg_quorum` (now carrying the `reachAt` bound) supplies that for the
+    config D named in `no_stale_election`'s antecedent, but the adjacency lemma can only
+    be applied at E, and when `E < D` the bound has to travel DOWN the chain. The clause
+    that carries it is `reach_quorum_below` (added in run 12):
+    `cfgLt E C ∧ ¬ cfgLt (cfgOf N) C → E = genesisC ∨ ∃q, quorumOf q E ∧ ∀V ∈ q,
+     (¬ cfgLt (cfgOf V) E ∧ tot.le (reachAt V E) (reachAt N C))`.
+    Hand proof of its preservation: at `adopt` it goes through unaided (instantiate the
+    pre-state clause at the PROPOSER, which is already at `proposedC i`, and use
+    `reach_bound`); at `propose` the only sub-case that does not close is `E = cfgOf i`
+    — which needs precisely `cfgCommitTerm (cfgOf i) ≤ curTerm i`, i.e. MODEL-EDIT-4.
+    With `reach_quorum_below`, `no_stale_election` closes at BOTH its CTI sites by one
+    argument: instantiate at a member of D's certifying quorum (nonempty via
+    `same_cfg_quorum_intersection` at `q1 = q2`), get a quorum of E reached strictly
+    before `curTerm I`, meet it against I's electing quorum by
+    `adjacent_cfg_quorum_intersection`, and discharge the two disjuncts with
+    `grant_reach_covered` (V ≠ I) and the `¬ cfgLt (cfgOf V) E` conjunct itself (V = I).
+
+    *Alternatives considered and rejected.* (i) A ghost-only fix is impossible: the
+    offending behaviour (low-term leader proposing past a high-term-committed config) is
+    REACHABLE in the model, so no invariant can exclude it — same adjudication shape as
+    MODEL-EDIT-3 (ledger 21). (ii) Chain-monotonicity of `cfgCommitTerm` as a standalone
+    clause is not preservable without the edit either, because a config can legally
+    RE-commit at a higher term between a proposal and its commit. (iii) Requiring
+    `leader i` in `commitCfg` would be an UNDER-approximation — real UC does let a
+    successor leader commit a dead proposer's config entry — and is not needed: the
+    same-term case is already vacuous under `no_stale_election`'s strict `tlt`.
+
+27. **NEXT SESSION'S REMAINING MAP (hand-derived this session, no new mechanism beyond
+    item 26).** After MODEL-EDIT-4 + `reach_quorum_below` close `no_stale_election`, P2's
+    two CTIs need only clause work: the `becomeLeader` one is the same-term
+    commit-leader-self-vote hole (the commit leader's own vote is carried by
+    `commit_leader_evidence`'s `V = i` disjunct, which survives losing the `leader` flag
+    but records no `voteMsg`, so `grant_uniq` cannot fire). Fix, clause-only:
+    `voteterm_bounded` (`tot.le (voteTerm V) (curTerm V)`) plus
+    `commit_leader_self_vote` (`isCommitLeader I → tot.le committedTerm (voteTerm I) ∧
+    (voteTerm I = committedTerm → voteCand I = I)`) — sound because a node that
+    self-voted at T can only re-grant at T to itself (`deliverRequestVoteGrant`'s
+    `voteCand j ≠ c` guard) and `voteTerm` only rises. `grant_cfg_covered` (session 2's
+    `elecCfg`-flavoured clause, still ❌) should be RETIRED in favour of
+    `grant_reach_covered`, whose `cfgOf`-flavoured conclusion is the preservable one.
+
+#### RUN 12 — the corrected clause + `reach_quorum_below`: **409 ✅ / 8 ❌**
+Clause-only (34 requires / 11 assumptions re-verified before launch; the model diff adds
+no `require` and no `assumption` — mechanically checked with
+`git diff | grep -E '^\+' | grep -E 'require|assumption \['`, which returns only comment
+lines). Log `smt-run12-reachquorum.log`.
+
+| run | content | verdict | P2 |
+|---|---|---|---|
+| 10 | cfgAt template (session 2 close) | 343 ✅ / 9 ❌ | 2 CTIs |
+| D1 | run 10 + run-8's `eleccfg_not_stale` restored (DIAGNOSTIC, not progress) | 353 ✅ / 10 ❌ | 1 CTI |
+| 11 | + the `reachAt` ghost and its 5 clauses | 398 ✅ / 9 ❌ | 2 CTIs |
+| 12 | + `reach_quorum_below`, `electable_cfgs_contain_holder` CORRECTED | **409 ✅ / 8 ❌** | **1 CTI** |
+
+**32 clauses + `doesNotThrow` inductive** (38 properties, 6 with CTIs). Movement vs
+run 11: `no_stale_election` at `becomeLeader` ✅ and `leader_completeness` at
+`commitEntry` ✅ — P2 and `no_stale_election` each fall from 2 CTIs to 1. Remaining:
+`reach_quorum_below` (1, `propose`), `electable_cfgs_contain_holder` (3),
+`grant_cfg_covered` (1), `election_safety` (1, `becomeLeader`),
+`leader_completeness` (1, `becomeLeader`), `no_stale_election` (1, `commitCfg`).
+
+**HONESTY CONDITION ON THOSE TWO NEW GREENS (the run-8 lesson, applied to myself in
+advance).** `reach_quorum_below` is itself NOT inductive, so it is a live hypothesis for
+everything around it — and it is very likely FALSE in the model as it stands. Its own
+CTI says so, and the CTI is the MODEL-EDIT-4 shape exactly:
+
+> `propose` CTI (WP), chain `genesis=cfg1 → cfg2 → cfg0`, terms `t1 < t0`:
+> `cfgCommitted = {cfg2}` with **`cfgCommitTerm cfg2 = t0`**, `leader 0` at
+> **`curTerm 0 = t1`**, `cfgOf 0 = cfg2`. `propose(i=0, d=cfg0)` is LEGAL in the model
+> (`cfgCommitted (cfgOf 0)` holds) — a leader at the LOW term proposing past a config
+> that committed at the HIGH term. Node 1 reached `cfg2` at `t0`, so the newly reached
+> `cfg0` cannot carry a `cfg2`-quorum bounded by `reachAt 0 cfg0 = t1`.
+
+Real UC cannot reach it (item 26's chain: the proposer's own `commit_seen`). So:
+**run 12's two new greens are CONDITIONAL on MODEL-EDIT-4 being approved and applied**,
+and this table must NOT be quoted as unconditional progress until it is. The clause and
+the run are banked in exactly that conditional form.
+
+#### SESSION-3 STOP: **MODEL-EDIT-4 GATE (gate 1c)** — a well-argued new-`require` request
+Not certification, not a wall. Stop point per the brief: "New require/assumption needed →
+stop for gate (state precisely what and why)". Item 26 is the request; run 12's CTI at
+`propose` is its mechanical evidence; items 25/27 are the accompanying corrections and
+the map after it. Everything banked here is clause/ghost-only at 34 requires / 11
+assumptions, so no run in this session violated the count-based corrective.
+`QuorumAdjacency.lean` is UNTOUCHED — no new assumption, hence no new witness debt, and
+the `#print axioms` audit of the seventeen witness theorems still covers the bundle.
+The twin `ReconfigCommit.lean` is UNTOUCHED — this session applied no model edit, so the
+gate-1 calibration cross-check obligation transfers, unspent, to whichever session applies
+MODEL-EDIT-4; divergences (d1)-(d4) remain complete and correct as written.
+Conditionality (n1)+(n2)+(n3) unchanged and still in both model headers.
