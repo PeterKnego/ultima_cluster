@@ -1829,3 +1829,45 @@ instantiate `reach_quorum_below` at the winner with a STRICT bound.
 which with the theory's `zero_le` IS `role_positive_term` (T10) — derived, without putting
 `tot.zero` into the hypothesis set of every VC, the diagnosed cause of run 15's ~7 h wall
 (item 28). This is the "restate over an existing bounded ghost" option, taken.
+
+#### TRUTH ARGUMENTS T13/T14 — the FROZEN commit-leadership evidence (written BEFORE run 18)
+P2's `becomeLeader` CTI (ledger 31) is, in its SAME-TERM half, an `election_safety` argument
+against a leadership that no longer carries the `leader` flag: the commit leader may have
+crash-restarted (`crashRestart` clears `leader` without touching `curTerm`), so run 16's CTI
+has `leader = []` and `isCommitLeader = [1]`. The `elecQuorum` ghost route (T2/T3) is
+therefore replayed over the commit leader's evidence, FROZEN at `commitEntry` — the same
+lesson as the `elecQuorum` ghost itself: `commit_leader_evidence`'s `∃q` can be witnessed by
+LATE grants against a MOVED config, a frozen ghost cannot.
+
+**T13 `commitq_grant_covers_reach`** — `(committed ∧ qmember V commitElecQuorum ∧
+¬cfgLt (cfgOf V) D ∧ tlt (reachAt V D) committedTerm) → ¬ cfgLt commitElecCfg D`.
+*Truth.* Identical in shape to T3, with `(elecQuorum I, elecCfg I, curTerm I)` replaced by
+the frozen `(commitElecQuorum, commitElecCfg, committedTerm)`. At `commitEntry` the clause is
+exactly T3 instantiated at the committing leader (`leader i` is a `require`, and the three
+ghosts are written from that leader's live values in the same step). Afterwards it cannot be
+falsified: `commitElecQuorum`/`commitElecCfg`/`committedTerm` are frozen (`commitEntry`
+requires `¬ committed`, so it fires at most once), `cfgOf V` is forward-only, and the
+antecedent's last conjunct cannot turn true later — V granted at `committedTerm`, so
+`grant_state` gives `committedTerm ≤ curTerm V`, and any later `propose`/`adopt` that makes V
+newly reach D stamps `reachAt V D` with the MOVER's term, which is `≥ curTerm V ≥
+committedTerm` (`adopt` requires `tot.le (curTerm j) (curTerm i)`).
+
+**T14 `commit_leader_frozen_reach`** — `isCommitLeader I → (¬cfgLt (cfgOf I) commitElecCfg ∧
+¬cfgLt commitCfgid commitElecCfg ∧ tlt (reachAt I commitElecCfg) committedTerm ∧
+tot.le (reachAt I commitCfgid) committedTerm)`.
+*Truth.* All four are read off `commitEntry` and then frozen. (i) `eleccfg_not_ahead` gives
+`elecCfg i ≤ cfgOf i` at the commit, and `cfgOf` is forward-only. (ii) `commitCfgid := cfgOf i`
+at the same instant, so `commitElecCfg = elecCfg i ≤ cfgOf i = commitCfgid`, both frozen.
+(iii) T12 at the committing leader with `C := elecCfg i` (antecedent by `cfglt_irrefl`) gives
+`reachAt i (elecCfg i) < curTerm i = committedTerm`. (iv) `reach_bound` at `C := cfgOf i`
+gives `reachAt i (cfgOf i) ≤ curTerm i = committedTerm`. Preservation: `reachAt I C` for a
+config I has ALREADY reached is never re-stamped (both writers stamp only configs the move
+NEWLY covers), and `isCommitLeader` cannot change once `committed` is set.
+*What T13+T14 buy.* P2's same-term case at `becomeLeader` becomes T8's chain run between the
+new leader's frozen evidence and the commit leader's: order `commitElecCfg` against
+`cfgOf i`; equal → `same_cfg_quorum_intersection`; adjacent → `adjacent_cfg_quorum_intersection`;
+otherwise `cfglt_connected` + `reach_quorum_below` (instantiated at whichever side is higher,
+with the STRICT bound supplied by T12 on the new leader's side and T14(iii) on the commit
+leader's) + adjacency + T13/T3 contradicts the strict step. Any meeting member then grants to
+both at `committedTerm`, so `grant_uniq` (with `self_vote`/`grant_state` for the `V = I` and
+`V = cl` corners) forces the new leader to BE the commit leader, which holds E.
