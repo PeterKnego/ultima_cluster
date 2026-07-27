@@ -980,3 +980,64 @@ bounded ghost" option, and it costs no clause of its own.
 Run 18 is the informative one: removing the quantified `C` — and with it the solver's
 instantiation search — did **not** measurably help. The cost is the clause's presence in
 every VC's hypothesis set, not its shape.
+
+## S5.4 The slice device — and the clause is machine-certified
+
+The way past the wall is not a cheaper clause but a smaller **bundle**. `#check_invariants`
+proves, per clause and per action, `Inv_bundle(s) ∧ action(s,s') → clause(s')`. Prove a
+clause against a SUBSET of the invariant conjunction and the full-bundle VC is *implied*
+(`Inv_full → Inv_slice` only weakens the antecedent). **A slice ✅ transfers to the full
+bundle; a slice ❌ or ⏱️ transfers in neither direction.** The slice is a cost device, not a
+weakening.
+
+**Run 20** — the model unchanged (same 35 requires / 11 assumptions, same actions), only the
+nine clauses T12's preservation consumes: **110 ✅ / 0 ❌ / 0 ⏱️ in 80 seconds**.
+`leader_reach_strict` is **CERTIFIED INDUCTIVE, all-n, cvc5**, and by monotonicity that
+certification holds in the full bundle. Tasks 1 and 2's clause is true *mechanically*, not
+only by argument.
+
+## S5.5 A toolchain finding that rewrites one of this session's own inferences
+
+`set_option veil.smt.timeout N in <command>` **does not propagate to the solver calls.** The
+option must be set at FILE SCOPE. Three runs on the same file prove it: run 19 (full bundle,
+"12 s", inline) behaved exactly like the 60 s default and was killed at 96 min with no
+verdict; run 22 (slice, "900 s", inline) finished in the same 3 minutes as run 21 at the
+default; run 23 (same slice, 900 s at file scope) went from 3 minutes to 30.
+
+**Consequence, recorded against this session's own earlier claim:** run 19 was never a 12 s
+run, so it is not evidence about where the cost lives, and S5.3's inference that the cost sits
+"upstream of the solver" is **withdrawn**. The flat 7.60 GB RSS with falling CPU is the
+ordinary signature of long sequential solver calls. What survives unchanged: runs 17 and 18
+were both killed at ~30 minutes with no verdict, and the ∀C → ground bisection did not help.
+
+## S5.6 Task 1's real status, and task 3's map
+
+**`election_safety`@`becomeLeader` is OPEN (⏱️), not refuted.** Run 21 (the 17-clause
+election slice) gives **206 ✅ / 2 ❌ / 1 ⏱️** — ✅ at every action except `becomeLeader`; the
+two ❌ are `reach_quorum_below` at `propose`/`adopt`, slice artifacts from deliberately
+omitting the three clauses its preservation consumes. Run 23 re-ran that VC pair with 900 s
+apiece and it is **still ⏱️** — 15 minutes of solver time each without a counterexample.
+Run 16's ❌ at this VC is *superseded*: its pre-state has `reachAt 1 (elecCfg 1) = curTerm 1`,
+which violates T12, so it is not a pre-state of any T12-bearing bundle. But "no longer
+refuted" is not "proved": under the truth rule the clause is carried with option (a) — the
+written argument T8 + T12 — and its mechanical verdict is quoted as OPEN. **The obstacle
+moved from a missing invariant to solver search.**
+
+**Task 3 (the cross-config holder supply) is mapped, not measured.** Written out in ledger 36:
+the SAME-TERM half of P2@`becomeLeader` needs only a ghost (`commitElecQuorum`) plus T13/T14,
+because the commit leader may have crash-restarted and the argument must run against frozen
+evidence — count-exempt, no gate. Of the STRICT half's four sub-cases, three close on existing
+machinery (`CL < commitCfgid` by chain contradiction or adjacency; `CL = commitCfgid` by
+same-config intersection; `CL = succ commitCfgid` by adjacency — each finishing through
+`holder_grants_are_covered`). The residue is `CL` two or more steps above `commitCfgid`, which
+needs an ALL-holder quorum one level down, which propagates up the chain iff every config
+above `commitCfgid` was proposed by an E-holder. That has exactly one hole — a stale leader
+sitting EXACTLY at `commitCfgid` — and two candidate closures: **(i)** clause-only, via the
+commit leader's frozen electing quorum sitting at terms `≥ committedTerm` against
+`committed_cfg_quorum`'s reach bound (works abstractly whenever `commitElecCfg = commitCfgid`);
+**(ii)** **MODEL-EDIT-5**, strengthening `commitEntry`'s deliberately-weak report gate to the
+own-term form `∀ V ∈ q, tot.le (curTerm i) (curTerm V)` — Rust anchor `election.rs:546-551`
+(stale dropped / higher adopts) with `tracker.on_durable` at `:569`. That is a new `require`
+(36) and therefore a gate stop. **It is PREPARED, NOT REQUESTED:** the gate template demands a
+checker-produced reachability trace, and the cost wall meant no run could produce one. Asking
+for a `require` on a hand argument alone would invert the arc's discipline.
