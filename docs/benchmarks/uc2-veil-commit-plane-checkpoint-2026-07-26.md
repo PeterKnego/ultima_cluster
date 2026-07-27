@@ -1301,3 +1301,201 @@ Banked, all of it clause/ghost-only at an unchanged **35 `require`s / 11 `assump
 
 **A box lesson, since it cost a 15-minute run:** two Lean verification processes in parallel
 drove MemAvailable to 4 GB against memwatch's 2.5 GB floor. Run these ONE AT A TIME.
+
+---
+
+# SESSION 7 (2026-07-27, opus) — the per-action sweep, and the T24 refutation
+
+## S7.1 Two source-level findings that shrink the closure criterion
+
+**(i) The initialisation obligations are bundle-independent — mechanically, not by
+argument.** Amendment clause (A) claimed it; the VC generator says it outright.
+`DeclarationKind.assumesInvariantsForInductionVC`
+(`Veil/Frontend/DSL/Module/VCGen/Induction.lean:132-134`) returns `false` for
+`.procedure .initializer`, and `mkInductionPrecondition` (`:136-143`) then builds the VC
+with the precondition `fun _ _ => True` rather than `@Invariants …`. An init VC is
+therefore `Assumptions → wp(after_init)(clause)` — **no invariant of any bundle appears in
+it**. Every init ✅ this arc has produced, in any slice, is a full-bundle certification of
+that clause's init obligation, with nothing to transfer. Transfer question (B)/(D)
+consequently shrinks to the ACTION obligations alone.
+
+Corollary, recorded so nobody looks for it: init VCs carry `action = `initializer``
+(`Veil/Core/UI/Verifier/VerificationResults.lean:352`) and `getCheckableAction?`
+(`Elaborators.lean:425-430`) admits only `.action` procedures, so `#check_action
+initializer` is REJECTED. The init obligations are covered by the runs that already
+report them, not by the sweep.
+
+**(ii) `Invariants` includes the safeties.** `Module.assembleInvariants`
+(`Veil/Frontend/DSL/Module/Util/Assemble.lean:130`) assembles the `.invariantLike` set —
+`invariant`, `safety` and `trusted invariant` clauses together. So `leader_completeness`
+(P2) and `election_safety` are PRE-state hypotheses in every VC, and a clause may lean on
+P2 for its current-term case as part of the same mutual induction. This is what makes the
+holder-supply chain's "current leader" case free, and it is why the residue below is
+exactly the STALE leader.
+
+## S7.2 The T24 refutation — item 45's chain is false, not merely unproved
+
+Session 6 left the strict half of P2 with a written, unmeasured chain whose first link was
+`T24 : (committed ∧ cfgLt commitCfgid (cfgOf N)) → holdsE N`, and whose one open case was
+"the STALE proposer sitting exactly at `commitCfgid`". **That case is a reachable model
+behaviour.** Five legal actions produce a state violating T24 (full step-by-step
+justification, with the `require` checked at each step, in ledger truth argument T19):
+a leader elected at term 1 under genesis, a second leader elected at term 2 whose quorum
+excludes the first (so the first keeps its `leader` flag — nothing else clears it), a
+commit at term 2 under genesis, and then a `propose` by the term-1 leader, which passes
+**both** config gates through their `cfgOf i = genesisC` disjunct. The proposer moves
+strictly above `commitCfgid` holding nothing.
+
+The obvious repair — term-guarding the clause with `tot.le committedTerm (curTerm N)` — is
+false too, by the same trace plus an `adopt` and a vote grant that raise the adopter's term
+above `committedTerm` without giving it the entry.
+
+**P2 itself is NOT violated in that trace**, and the reason is the shape of the real
+argument: the stale leader can create configs, but it cannot create ELECTABILITY. Every
+quorum of the config it creates meets `commitQuorum` by
+`adjacent_cfg_quorum_intersection`, so it contains an E-holder, and the up-to-date grant
+guard forbids a holder from granting to a non-holder. So this is a clause refutation and a
+correction to the map — **not** a possibly-real CTI, and not a stop-the-arc finding.
+
+**The corrected chain (ledger T20).** The holder supply is indexed by COMMITTED CONFIG, not
+by node, because `propose` requires `cfgOf i = genesisC ∨ cfgCommitted (cfgOf i)`: a config
+two steps above genesis exists only if the one below it committed, and a commit is a quorum
+fact. `T20 : (committed ∧ (D = commitCfgid ∨ (cfgCommitted D ∧ cfgLt commitCfgid D))) →
+∃ q, quorumOf q D ∧ ∀ V ∈ q, holdsE V`, with the base from `commit_backed` +
+`commit_quorum_sound` and the step running the proposer's election quorum against the
+predecessor's holder quorum. It is WRITTEN, NOT MEASURED: its step needs a link from a
+committed config back to its proposer, which the state does not currently name, so it
+likely needs one more ghost — a next-session opening move, not an end-of-session bolt-on.
+
+## S7.3 The closure-criterion amendment, as this session leaves it
+
+Session 6 drafted (A)–(D) and did not self-ratify them. Two of the four are now settled by
+the source, and one is materially reduced:
+
+* **(A) Action-partitioned full-bundle verification — UNCHANGED, and now exercised.** The
+  identity claim (a `#check_action A` ✅ *is* the full-bundle verdict for that
+  (clause, action) pair) is what gate 2 is asked to ratify, against
+  `Elaborators.lean:421-465` and `Server.lean:34,49-59`. This session ran it on nine of the
+  ten actions.
+* **(B) Slice certification — still needed, but only for the ACTION obligations** of the
+  clauses whose action was not measured directly (see the per-action table).
+* **(C) The ⏱️ protocol — unchanged, and it bit twice this session** (`leader_completeness`
+  @ `commitEntry`, `election_safety` @ `becomeLeader`).
+* **(D) Ghost extension — SHRUNK.** It was needed for run-16-sourced greens. After this
+  session's sweep, run 16 is no longer the source for any action that the sweep covered, so
+  (D) applies only to the actions the sweep could not measure. The INIT half of the
+  transfer question is gone outright (S7.1(i)).
+
+**One clarification the dossier must carry, because it changes what every ✅ in the arc
+means.** Each clause is verified through two VCs — a WP-style primary and a TR-style
+alternative — and `effectiveStatus`
+(`Veil/Core/UI/Verifier/VerificationResults.lean:120-136`) reports the clause with the best
+of the two ("conclusive outcomes win over sibling errors"). So **a ✅ means "the primary or
+its TR alternative discharged", and a ⏱️ means neither did.** The `commitCfg` run made this
+visible: two of its VCs returned solver-unsat but produced no Lean witness
+(`Induction.lean:47-58`, most plausibly downstream of the `LocalRProp` typeclass-synthesis
+heartbeat warning that every per-action run carries), Veil `throwError`s, and the build
+exits 1 — on an action whose clause table is nonetheless 49 ✅ / 0 ❌ / 0 ⏱️.
+
+## S7.4 The per-action sweep — the dossier's spine
+
+Every row is `ReconfigCommitSMTAct<action>.lean`: **the model verbatim** — 35 `require`s /
+11 `assumption`s / 46 invariants + 2 safeties, each file diffed against
+`ReconfigCommitSMT.lean` before launch and identical modulo the module name, the file-scope
+`veil.smt.timeout` and the `#check_action` line — run one Lean process at a time with
+memwatch armed. A fully green action reports **49 ✅** (46 invariants + 2 safeties +
+`doesNotThrow`).
+
+| action | run / log | verdict | wall |
+|---|---|---|---|
+| `startElection` | `smt-act-startElection.log` | **49 ✅ / 0 ❌ / 0 ⏱️** | 212 s |
+| `deliverRequestVoteGrant` | `smt-act-deliverRequestVoteGrant.log` | **49 ✅ / 0 ❌ / 0 ⏱️** | 502 s |
+| `becomeLeader` | run 28 `smt-run28-actionBL-frozen.log` (and run 30 at 900 s) | 47 ✅ / **1 ❌** / **1 ⏱️** | 614 s |
+| `crashRestart` | `smt-act-crashRestart.log` | **49 ✅ / 0 ❌ / 0 ⏱️** | 703 s |
+| `appendEntry` | `smt-act-appendEntry.log` | **49 ✅ / 0 ❌ / 0 ⏱️** | 835 s |
+| `replicate` | `smt-act-replicate.log` | **49 ✅ / 0 ❌ / 0 ⏱️** | 1037 s |
+| `commitEntry` | run 35 `smt-run35-act-commitEntry.log` | 48 ✅ / 0 ❌ / **1 ⏱️** | 1535 s |
+| `commitCfg` | `smt-act-commitCfg.log` | **49 ✅ / 0 ❌ / 0 ⏱️** (build exits 1, S7.3) | 1641 s |
+| `adopt` | `smt-act-adopt-t20.log` (**20 s** per VC) | **49 ✅ / 0 ❌ / 0 ⏱️** (build exits 1, S7.3) | 1407 s |
+| `propose` | `smt-act-propose.log` (60 s), `smt-act-propose-t20.log` (20 s) | **KILLED, NO VERDICT** ×2 | 3300 s + 1900 s |
+
+`adopt` is quoted at a **20 s** per-VC budget rather than 60 s: the 60 s run was cut at 36 s
+to make room for it, and a proof found at 20 s is a proof (any VC that did not close would
+have been reported ⏱️ = OPEN, and none was). Every other row is at 60 s.
+
+**Clause-level reading of the nine measured actions: all 46 invariant clauses are ✅ at
+every one of them.** The only non-greens in the whole sweep are the two properties:
+* `election_safety` — ⏱️ at `becomeLeader`, ✅ at the other eight measured actions;
+* `leader_completeness` — ❌ at `becomeLeader`, **⏱️ at `commitEntry`**, ✅ at the other seven.
+
+**Session 6's hole 3 moved, and only half way.** `leader_completeness` @ `commitEntry` was a
+❌ in run 16 and was predicted (session 5) to fall to T12. Run 35 shows **no counterexample
+survives** — but the VC does not discharge at 60 s either, so under the ⏱️ protocol it is
+**OPEN**, not green. The prediction is confirmed in kind and unconfirmed in verdict.
+
+**`propose` is a cost wall of its own.** Killed at 3300 s at 60 s per VC and again at
+1900 s at **20 s** per VC — a 3× cut in the solver budget moved nothing. Since every
+per-action file elaborates the same module (`startElection` finished end-to-end in 212 s),
+the missing time is per-VC WP/TR generation and SMT translation for the model's heaviest
+action: five `require`s plus the conditional `reachAt i Z := if … then … else …` update
+that the WP must push through every clause mentioning `reachAt`.
+
+**What covers `propose` in the dossier** (all of it pre-existing, none of it new):
+run 16 for the 40 run-16-era clauses (transfer (D)), and the all-ten-action slice
+certifications for the six later clauses — T12 (run 20), T15 (run 26), T17 (run 27),
+T18 + T14 (run 31), T13 (run 34). So **every clause has a verdict at every action**; what
+`propose` alone lacks is a verdict that needs no transfer argument.
+
+## S7.5 The crux VC — one lever measured, one lever not attempted
+
+Session 6 named two levers for `election_safety`@`becomeLeader`: a different solver
+configuration, or a manual discharge through the `@[veil] theorem … := by unveil; …` stub.
+
+**The configuration lever is measured and NEGATIVE.** `mkVeilSmtTactic`
+(`Veil/Frontend/DSL/Tactic.lean:872-886`) passes cvc5 exactly three extra options, one of
+which — `finite-model-find`, default TRUE — is a model-finding mode and a known drag on
+hard unsat goals. Run 36 is run 32's eleven-clause slice verbatim with
+`veil.smt.finiteModelFind false` at file scope, 300 s per VC: **11 ✅ / 0 ❌ / 1 ⏱️ in
+650 s** — same tally, same wall, same single ⏱️. The measurement grid is now
+{full bundle, 17-clause slice, 11-clause slice} × {60 s, 300 s, 900 s} × {fmf on, fmf off},
+and the VC pair times out in every cell.
+
+**The manual lever was NOT attempted, and that is an omission, not a result.** The box runs
+one Lean process at a time and the per-action sweep — the session's stated first priority —
+used it end to end; each manual iteration costs a full module elaboration. What the session
+adds is the *shape* the attempt should take: `mkVeilSmtTactic` hands the solver every `Prop`
+in context (`getPropsInContext`), so the productive move is the Ivy/mypyvy idiom — `unveil`,
+`have` the two or three assumption INSTANCES the T8/T17 chain needs (`cfglt_connected` at
+`(elecCfg L, elecCfg i)`, then `adjacent_cfg_quorum_intersection` at the succ-step it
+returns, plus `same_cfg_quorum_intersection` in the equal case), then `veil_smt` with those
+as ground hypotheses. That is the next session's first Lean command.
+
+## S7.6 Disposition — STOP at the checkpoint, still NOT gate 2
+
+Gate 2's precondition remains **bundle closed with zero ⏱️**, and it is not met: one ❌ and
+two ⏱️ survive. Everything this session is measurement-only — **`ReconfigCommitSMT.lean`
+was not edited**, so the bundle stands at 46 invariants + 2 safeties, 35 `require`s / 11
+`assumption`s, `QuorumAdjacency.lean` untouched and its seventeen-witness `#print axioms`
+audit still covering the bundle. No gate request is made; MODEL-EDIT-5 stays PREPARED, NOT
+REQUESTED (session 6 showed it would not even exclude the CTI in hand, and this session's
+T24 work does not resurrect it).
+
+**Banked:**
+* **The per-action sweep** (S7.4): **nine of ten actions** with a criterion-(A) full-bundle
+  verdict, **all 46 invariant clauses ✅ at every measured action**, and the residue reduced
+  to two properties at two actions plus ONE unmeasured action.
+* **Two source-level findings** (S7.1) that shrink the closure criterion: init obligations
+  are bundle-independent *in the VC generator*, and `Invariants` includes the safeties.
+* **A third** (S7.3): what a ✅ means — best-of {WP primary, TR alternative}.
+* **The T24 refutation** (S7.2): session 6's holder-supply chain is false in a reachable
+  state, its obvious term-guarded repair is false too, and the corrected chain (T20,
+  indexed by COMMITTED CONFIG) is written with the ghost it will need identified.
+* **The crux VC's configuration lever, measured and negative** (S7.5).
+
+**Open, and this is the complete list:**
+1. `election_safety` @ `becomeLeader` — ⏱️ / OPEN in every cell of the grid.
+2. `leader_completeness` @ `becomeLeader` — ❌ (the strict half; the clause chain that
+   would close it is now T20, not T24).
+3. `leader_completeness` @ `commitEntry` — ⏱️ / OPEN at 60 s (no counterexample survives).
+4. `propose` — no criterion-(A) verdict (killed at both 60 s and 20 s per VC); covered by
+   run 16 + the all-ten-action slices, i.e. by transfer.
