@@ -198,9 +198,9 @@ import Veil
 -- 3 min to 30 min). At 5 s the whole 41-clause bundle is bounded by ~490 x 5 s ~ 41 min,
 -- which is what makes a full-bundle measurement possible at all this session. Greens at
 -- 5 s are real greens; ⏱️ are OPEN verdicts (ledger 32).
-set_option veil.smt.timeout 5
+set_option veil.smt.timeout 60
 
-veil module UcReconfigCommitSMT
+veil module UcReconfigCommitSMTManualFull
 
 type node
 type term
@@ -1002,4 +1002,89 @@ invariant [cfgq_holders]
 -- proof found at 12 s is a proof), and every VC that does not is reported as ⏱️ = OPEN, per
 -- the session-5 ⏱️ protocol (ledger 32). Greens from this configuration are quotable; ⏱️
 -- are not, and the clause carrying one is OPEN regardless of the tally.
-#check_invariants
+@[veil]
+theorem becomeLeader_election_safety (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+    [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+    [term_inhabited : Inhabited.{1} term] (cfgid : Type) [cfgid_dec_eq : DecidableEq.{1} cfgid]
+    [cfgid_inhabited : Inhabited.{1} cfgid] (quorum : Type) [quorum_dec_eq : DecidableEq.{1} quorum]
+    [quorum_inhabited : Inhabited.{1} quorum] [tot : TotalOrderWithZero term] (χ : State.Label → Type)
+    [χ_rep :
+      ∀ __veil_f,
+        Veil.FieldRepresentation (State.Label.toDomain node term cfgid quorum __veil_f)
+          (State.Label.toCodomain node term cfgid quorum __veil_f) (χ __veil_f)]
+    [χ_rep_lawful :
+      ∀ __veil_f,
+        Veil.LawfulFieldRepresentation (State.Label.toDomain node term cfgid quorum __veil_f)
+          (State.Label.toCodomain node term cfgid quorum __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+    [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term cfgid quorum) ρ]
+    [becomeLeader_dec_0 :
+      delta% @UcReconfigCommitSMTManualFull.becomeLeader._veil_dec_type_0 node quorum χ term cfgid χ_rep] :
+    ∀ (i : node) (q : quorum),
+      Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+        (@becomeLeader.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited cfgid cfgid_dec_eq
+          cfgid_inhabited quorum quorum_dec_eq quorum_inhabited tot χ χ_rep χ_rep_lawful σ_sub ρ_sub becomeLeader_dec_0
+          i q)
+        (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited cfgid cfgid_dec_eq
+          cfgid_inhabited quorum quorum_dec_eq quorum_inhabited tot ρ_sub)
+        (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited cfgid cfgid_dec_eq
+          cfgid_inhabited quorum quorum_dec_eq quorum_inhabited tot χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+        (@election_safety ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited cfgid cfgid_dec_eq
+          cfgid_inhabited quorum quorum_dec_eq quorum_inhabited tot χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+  unveil
+  classical
+  rcases has with ⟨hsame, hqms, hshape, hirr, htrans, hsucclt, htotal, hgen, himm, hconn, hadj⟩
+  rcases hinv with ⟨hes, _, hgs, hgu, hsv, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, hccf, _, _, _, hgrc, _, _, _, _, _, _, _, _, hew, hegcr, _, _, _, _, _, _, _, hrbmq, _, _, _, _, _, _, _, _, _, _⟩
+  intro hcand hquo hgrants N1 N2 hL1 hL2 hterm
+  have hfroz : st.elecCfg i = st.cfgOf i := hccf i hcand
+  have crux : ∀ L, st.leader L = true → st.curTerm L = st.curTerm i → L = i := by
+    intro L hL hLt
+    obtain ⟨hLq, hLg⟩ := hew L hL
+    have common : ∀ V, th.qmember V q = true → th.qmember V (st.elecQuorum L) = true → L = i := by
+      intro V hVq hVL
+      rcases hgrants V hVq with rfl | hv1
+      · rcases hLg V hVL with rfl | hv2
+        · rfl
+        · rcases hgs V L (st.curTerm L) hv2 with ⟨_, hne⟩ | ⟨_, _, _, hvc⟩
+          · exact absurd hLt hne
+          · have := (hsv V (Or.inl hcand)).2.2
+            rw [hvc] at this; exact this
+      · rcases hLg V hVL with rfl | hv2
+        · rcases hgs V i (st.curTerm i) hv1 with ⟨_, hne⟩ | ⟨_, _, _, hvc⟩
+          · exact absurd hLt.symm hne
+          · have := (hsv V (Or.inr hL)).2.2
+            rw [hvc] at this; exact this.symm
+        · exact hgu V L (st.curTerm L) i hv2 (by rw [hLt]; exact hv1)
+    rcases htotal (st.elecCfg L) (st.cfgOf i) with heq | hlt | hgt
+    · obtain ⟨V, hV1, hV2⟩ := hsame (st.cfgOf i) q (st.elecQuorum L) hquo (by rw [← heq]; exact hLq)
+      exact common V hV1 hV2
+    · obtain ⟨E, hsE, hcase⟩ := hconn _ _ hlt
+      rcases hcase with rfl | hlt2
+      · obtain ⟨V, hV1, hV2⟩ := hadj (st.elecCfg L) (st.cfgOf i) (st.elecQuorum L) q hsE hLq hquo
+        exact common V hV2 hV1
+      · obtain ⟨V, hVq, hVc, hVr1, hVr2⟩ :=
+          hrbmq i (st.elecCfg L) E (st.elecQuorum L) (Or.inl hcand) hsE (by rw [hfroz]; exact hlt2) hLq
+        have hfalse := hegcr L V E hL hVq hVc (by rw [hLt]; exact hVr1) (by rw [hLt]; exact hVr2)
+        have htrue := hsucclt _ _ hsE
+        rw [hfalse] at htrue; exact absurd htrue (by simp)
+    · obtain ⟨E, hsE, hcase⟩ := hconn _ _ hgt
+      rcases hcase with rfl | hlt2
+      · obtain ⟨V, hV1, hV2⟩ := hadj (st.cfgOf i) (st.elecCfg L) q (st.elecQuorum L) hsE hquo hLq
+        exact common V hV1 hV2
+      · obtain ⟨V, hVq, hVc, hVr1, hVr2⟩ :=
+          hrbmq L (st.cfgOf i) E q (Or.inr hL) hsE hlt2 hquo
+        have htrue := hsucclt _ _ hsE
+        rcases hgrants V hVq with rfl | hv1
+        · rw [hVc] at htrue; exact absurd htrue (by simp)
+        · have hfalse := hgrc V i (st.curTerm i) E hv1 hVc (by rw [← hLt]; exact hVr1)
+            (by rw [← hLt]; exact hVr2)
+          rw [hfalse] at htrue; exact absurd htrue (by simp)
+  by_cases h1 : i = N1
+  · by_cases h2 : i = N2
+    · rw [← h1, ← h2]
+    · exact h1 ▸ (crux N2 (hL2 h2) (by rw [← hterm, ← h1])).symm
+  · by_cases h2 : i = N2
+    · exact (h2 ▸ (crux N1 (hL1 h1) (by rw [hterm, ← h2])))
+    · exact hes N1 N2 (hL1 h1) (hL2 h2) hterm
+
+#check_action becomeLeader

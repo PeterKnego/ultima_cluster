@@ -198,9 +198,9 @@ import Veil
 -- 3 min to 30 min). At 5 s the whole 41-clause bundle is bounded by ~490 x 5 s ~ 41 min,
 -- which is what makes a full-bundle measurement possible at all this session. Greens at
 -- 5 s are real greens; ⏱️ are OPEN verdicts (ledger 32).
-set_option veil.smt.timeout 5
+set_option veil.smt.timeout 60
 
-veil module UcReconfigCommitSMT
+veil module UcReconfigCommitSMTActbecomeLeaderS8
 
 type node
 type term
@@ -949,28 +949,28 @@ invariant [commit_leader_frozen_reach]
      tlt (reachAt I commitElecCfg) committedTerm ∧
      tot.le (reachAt I commitCfgid) committedTerm)
 
--- ---- SESSION 8: THE HOLDER-SUPPLY MACHINERY (T20's certified half; ledger T32-T37) ----
+-- ---- SESSION 8: THE HOLDER-SUPPLY MACHINERY (T20's certified half; ledger T26-T31) ----
 -- Session 12 refuted T24 (holder supply indexed by NODE) and left T20 (indexed by
 -- COMMITTED CONFIG) written-but-unmeasured, needing a config→proposer link. These six
 -- clauses ARE that link plus the coupling's payload; each has a written truth argument
 -- (ledger session 13) and each is ghost-only — 35 requires / 11 assumptions unchanged.
--- T32 — the predecessor, NAMED. The chain axioms connect only upward (`cfglt_connected`
+-- T26 — the predecessor, NAMED. The chain axioms connect only upward (`cfglt_connected`
 -- hands out `succ c`), so a VC cannot otherwise get from "X is two steps above the commit
 -- config" to "X's immediate predecessor". `propose`'s own `require succCfg (cfgOf i) d` is
 -- the fact; the ghost carries it.
 invariant [cfgpred_succ]
   cfgSeen D → succCfg (cfgPred D) D
--- T33 — a live proposal's config has been seen (both written at `propose`).
+-- T27 — a live proposal's config has been seen (both written at `propose`).
 invariant [proposal_seen]
   hasProposal I → cfgSeen (proposedC I)
--- T34 — every config any node sits at above genesis was proposed (cfgOf moves only at
--- `propose`, to a seen d, and at `adopt`, to `proposedC i` — seen by T33).
+-- T28 — every config any node sits at above genesis was proposed (cfgOf moves only at
+-- `propose`, to a seen d, and at `adopt`, to `proposedC i` — seen by T27).
 invariant [cfg_seen_adopted]
   cfgLt genesisC (cfgOf N) → cfgSeen (cfgOf N)
--- T35 — ...and so was every committed config (`commitCfg` fires on `proposedC i`).
+-- T29 — ...and so was every committed config (`commitCfg` fires on `proposedC i`).
 invariant [cfg_seen_committed]
   cfgCommitted D → cfgSeen D
--- T36 — THE COUPLING'S PAYLOAD, in the form the frozen adopter quorum needs. `adopt`
+-- T30 — THE COUPLING'S PAYLOAD, in the form the frozen adopter quorum needs. `adopt`
 -- requires `(¬ propAfterE i) ∨ holdsE j`, so under a HOLDER-authored proposal every
 -- adopter holds E — and held it already at adoption time, whence the `gotEAt` bound
 -- (`gotE_bounded` + `adopt`'s `curTerm j <= curTerm i`, with `curTerm` monotone). The
@@ -978,7 +978,7 @@ invariant [cfg_seen_committed]
 -- is written in the same step.
 invariant [adopted_holds]
   (hasAdopted V I ∧ propAfterE I) → (holdsE V ∧ tot.le (gotEAt V) (curTerm I))
--- T37 — the frozen adopter quorum of a committed config: it IS a quorum of that config,
+-- T31 — the frozen adopter quorum of a committed config: it IS a quorum of that config,
 -- and under holder-backing all of its members hold E, acquired no later than the config's
 -- commit term. This is the ALL-HOLDER quorum the retired `electable_cfgs_contain_holder`
 -- could not supply: adjacency then meets it against any quorum of the SUCCESSOR config,
@@ -1002,4 +1002,4 @@ invariant [cfgq_holders]
 -- proof found at 12 s is a proof), and every VC that does not is reported as ⏱️ = OPEN, per
 -- the session-5 ⏱️ protocol (ledger 32). Greens from this configuration are quotable; ⏱️
 -- are not, and the clause carrying one is OPEN regardless of the tally.
-#check_invariants
+#check_action becomeLeader
