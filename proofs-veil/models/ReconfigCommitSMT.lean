@@ -69,6 +69,31 @@ import Veil
      quoted greens of every run that carried it.
    =============================================================
 
+   SESSION-4 (bar 3, part 4) STATE — see proofs-veil/spike-ledger.md §SESSION 9:
+     * **RUN 16: 470 ✅ / 3 ❌ — 40 clauses + `doesNotThrow` INDUCTIVE, all-n, cvc5**
+       (run 12: 32; run 14: 38). 35 requires / 11 assumptions, verified before every run.
+     * ADDED: MODEL-EDIT-4 (above); the `elecQuorum` certifying-quorum ghost and
+       `elecq_witness` / `elecq_grant_covers_reach`; `cand_reach_strict`;
+       `voteterm_bounded` / `commit_leader_self_vote` / `commit_leader_no_foreign_grant`
+       (the persistent carrier); `commit_leader_at_commit_cfg`.
+       CLOSED: `reach_quorum_below`, `no_stale_election` (both sites).
+     * RETIRED with written rulings (below, at their sites): `grant_cfg_covered` and
+       `electable_cfgs_contain_holder`.
+     * WITHDRAWN FOR COST, NOT TRUTH: `role_positive_term` — run 15 carried it for
+       2h28m wall / 3h10m CPU with NO verdict. `veil.smt.timeout` is 60 s PER VC, so at
+       this bundle size a single expensive clause converts a 10-min run into a ~7-h one
+       with no partial output.
+     * !! **`election_safety`'s RUN-14 GREEN IS RETRACTED** (ledger 29): run 16's CTI was
+       hand-checked to satisfy run 14's bundle as well, so the earlier ✅ was not sound.
+       A ✅ here means "not refuted by this bundle at this solver configuration".
+     * STILL OPEN: `election_safety` (1, `becomeLeader`) — the SAME-TERM GRANT WRINKLE:
+       `grant_reach_covered`'s bound is STRICT, so a voter that reached its config at the
+       very term it granted at is uncovered; needs a GRANT-TIME config ghost (the `gotEAt`
+       pattern applied to the grant), not a model edit. `leader_completeness` (2):
+       `becomeLeader` needs the cross-config HOLDER supply (`commit_leader_at_commit_cfg`
+       recovers the QUORUM supply only); `commitEntry` awaits a cheaper
+       `role_positive_term`.
+
    SESSION-3 (bar 3, part 3) STATE — see proofs-veil/spike-ledger.md §SESSION 8:
      * `#check_invariants` IS run (bottom of file). **RUN 12: 409 OK / 8 CTI —
        32 clauses + `doesNotThrow` CERTIFIED INDUCTIVE, all-n, via cvc5.**
@@ -752,8 +777,17 @@ invariant [commit_leader_no_foreign_grant]
 -- requires `tlt (curTerm i) t` and sets `curTerm i := t`; with `zero_le`, t is strictly
 -- above `tot.zero`, and `curTerm` only rises. `becomeLeader` inherits it from candidacy.
 -- Excludes the run-14 `commitEntry` P2 CTI, whose committing leader sits AT `tot.zero`.
-invariant [role_positive_term]
-  (candidate I ∨ leader I) → tlt tot.zero (curTerm I)
+-- !! WITHDRAWN IN RUN 16 — TRACTABILITY, NOT TRUTH (the clause is true; see T10). !!
+-- Run 15 carried it and ran **2h28m wall / 3h10m CPU at 139%** with NO verdict before
+-- being killed under the box rule (Lean buffers until elaboration ends, so the run
+-- yielded nothing). It is the FIRST clause in this bundle to put `tot.zero` into the
+-- hypothesis set of every VC, which forces `zero_le` instantiation across the whole
+-- term theory alongside the existing `tlt`/`tot.le` clauses — the prime suspect for the
+-- blow-up. Withdrawn to isolate it; the `commitEntry` P2 CTI it excludes therefore
+-- REMAINS OPEN in run 16, and finding a cheaper encoding of "no role at the zero term"
+-- is named work for the next session.
+-- invariant [role_positive_term]
+--   (candidate I ∨ leader I) → tlt tot.zero (curTerm I)
 -- T11 — THE COMMIT LEADER IS AT-OR-PAST THE CONFIG IT COMMITTED UNDER. `commitEntry` sets
 -- `commitCfgid := cfgOf i` at the same instant it sets `isCommitLeader i`, and `cfgOf` is
 -- FORWARD-ONLY (propose moves along `succCfg`; adopt requires `¬cfgLt (proposedC i) (cfgOf j)`),

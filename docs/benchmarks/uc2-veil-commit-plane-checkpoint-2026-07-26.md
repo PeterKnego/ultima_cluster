@@ -821,3 +821,95 @@ expected violations:
 multiplier past the explicit-state envelope, the same reason (d1) was skipped). The twin
 over-approximates on this axis too — the sound direction for a calibrator. The divergence
 list is now **(d1)–(d5)**, complete.
+
+## S4.4 The corrected residue map, executed
+
+Truth arguments **T1–T11** were written into the ledger BEFORE each inductiveness hunt, as
+the truth rule requires.
+
+| run | content | verdict | open |
+|---|---|---|---|
+| 12 | (session 3 close, conditional on EDIT-4) | 409 ✅ / 8 ❌ | 6 clauses |
+| 13 | **MODEL-EDIT-4 alone**, no clause change | **410 ✅ / 7 ❌** | 5 clauses |
+| 14 | `elecQuorum` ghost + `elecq_witness` + `elecq_grant_covers_reach` + `cand_reach_strict` + `voteterm_bounded` + `commit_leader_self_vote` + `commit_leader_no_foreign_grant`; `grant_cfg_covered` and `electable_cfgs_contain_holder` RETIRED | **457 ✅ / 4 ❌** | 3 clauses |
+
+**Run 13 confirms the gate's one VALID map item**: `reach_quorum_below` is INDUCTIVE, so
+run 12's two conditionally-banked greens (`no_stale_election`@`becomeLeader`,
+`leader_completeness`@`commitEntry`) are discharged from their conditional form.
+
+**Run 14 closes both of the gate's identified GAPS plus its OMISSION:**
+* `no_stale_election` — INDUCTIVE at both sites. The certifying-quorum ghost is exactly
+  what was missing: `leader_quorum`'s ∃q can be witnessed by a LATE grant made against a
+  MOVED config, whereas the frozen `elecQuorum` carries only grants that predate
+  `becomeLeader`, i.e. were made while `cand_cfg_frozen` pins `elecCfg I = cfgOf I`.
+* `election_safety` — INDUCTIVE (the gate's unmapped clause, mapped by T8 and proved).
+  `cand_reach_strict` excludes the run-12 CTI (a role at the zero term); the non-adjacent
+  case goes frozen-quorum → `reach_quorum_below` → adjacency → `elecq_grant_covers_reach`.
+* P2's `becomeLeader` CTI in run 12 was exactly the same-term commit-leader-self-vote hole
+  the gate described, and the persistent carrier
+  (`isCommitLeader V → ∀C ≠ V, ¬voteMsg V C committedTerm`) is what excludes it —
+  `grant_state`'s first disjunct absorbs the stray `voteMsg` without constraining
+  `voteCand`, so the two supporting clauses alone are not enough. Confirmed against the
+  log.
+
+**The `electable_cfgs_contain_holder` retirement, measured rather than asserted.** P2
+regained a `commitEntry` CTI the instant the clause left the bundle, so **P2's argument DID
+consume it** and the "nothing consumes it" ruling is not earned as written. What the CTIs
+then showed is sharper: what P2 consumes is not the clause's (false) content but the
+**quorum-supply** it smuggled in — the `becomeLeader` CTI interprets the intermediate
+configs of a 3-link chain as having NO quorums, which makes
+`adjacent_cfg_quorum_intersection` vacuous and breaks the chain from the commit config
+down. In a reachable state those quorums must exist (`propose` requires the predecessor
+committed; `commitCfg` requires a quorum of it), and the clause that recovers it is
+`commit_leader_at_commit_cfg` (T11) via `chain_committed_below` + `committed_cfg_quorum`.
+This is a strictly better outcome than keeping the original clause: the supply is now
+derived from mechanisms already inductive, instead of assumed by a clause no one could
+prove.
+
+## S4.5 The tractability wall, and a retracted certification
+
+**Run 15 (run 14's set + `role_positive_term` + `commit_leader_at_commit_cfg`) ran 2h28m
+wall / 3h10m CPU at 139% and was killed with NO verdict.** `veil.smt.timeout` is **60 s per
+VC** (`Veil/Base.lean:140`), so a `#check_invariants` run is bounded — but at this bundle
+size that bound is ~410 × 60 s ≈ **6.8 hours**, and Lean buffers everything until
+elaboration ends, so a killed run yields nothing. Operational rule adopted: at 40+ clauses,
+add ONE clause at a time and treat a run exceeding ~3× the previous run's wall as a signal
+to kill and bisect.
+
+**Run 16 (same file minus `role_positive_term`): 470 ✅ / 3 ❌ in 10 minutes** — a 15×
+difference that isolates the blocker. `role_positive_term` is the first clause in the
+bundle to put `tot.zero` into every VC's hypothesis set, forcing `zero_le` instantiation
+across the term theory. It is TRUE (T10 stands); it is withdrawn for COST. **40 clauses +
+`doesNotThrow` inductive** — up from 32 at run 12.
+
+**A certification claim is retracted.** Run 16's `election_safety` CTI was hand-checked
+against **run 14's** bundle, clause by clause, and satisfies it: the two clauses run 16
+adds are vacuous in that state. Since adding invariants only strengthens each VC's
+antecedent, run 14's ✅ was not sound, and **run 14's `election_safety` green is retracted**
+under the truth rule. The conservative reading now in force: a `#check_invariants` ✅ means
+"not refuted by this bundle at this solver configuration", and a later ❌ on a STRONGER
+bundle voids it. *How* run 14 produced the ✅ is a tool-level question carried to gate 2.
+No Rust adjudication changes; one certification claim does.
+
+**The defect is precisely named.** `grant_reach_covered`'s ordering bound is STRICT
+(`tlt (reachAt V D) T`), so it says nothing when a voter reached its config at the very
+term it granted at — the intra-term order of the two events is what decides, and the state
+does not record it. The `V = I` analogue was already handled structurally
+(`eleccfg_covers_early_reach`); the `V ≠ I` analogue needs the same treatment: a
+**grant-time config ghost**, the `gotEAt`/`cfgAt` pattern applied to the grant. Ghost +
+clauses, not a model edit.
+
+## S4.6 Disposition
+
+**Stop at the ~5-hour checkpoint — NOT gate 2.** Gate 2's precondition (bundle closed,
+truth arguments on file) is not met: `election_safety` has one CTI and P2 has two. Banked:
+the gate-1c ruling and the truth rule; MODEL-EDIT-4 at a mechanically verified **35/11**
+before every run; the twin cross-check discharged with **(d1)–(d5)** complete; **40 clauses
++ `doesNotThrow` inductive**; truth arguments T1–T11; two written retirements (one of which
+measured NEGATIVE and is reported that way); one retraction; one tractability wall.
+`QuorumAdjacency.lean` untouched — no new assumption, no new witness debt.
+
+Next session, in order: (1) the grant-time config ghost for the same-term wrinkle;
+(2) a cheaper encoding of "no role at the zero term"; (3) the cross-config HOLDER supply
+for P2@`becomeLeader` — the one place a new mechanism may genuinely be needed, and hence
+the likeliest next gate request; (4) gate 2 only when all three land.

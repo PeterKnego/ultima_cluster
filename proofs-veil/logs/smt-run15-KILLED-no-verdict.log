@@ -1,0 +1,19 @@
+⚠ [711/1258] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1258] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1258] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+✖ [1418/1418] Building Examples.UC.ReconfigCommitSMT (8935s)
+trace: .> LEAN_PATH=/home/claude/veil-spike/veil-preview/.lake/packages/cvc5/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Cli/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/batteries/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Qq/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/aesop/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/proofwidgets/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/importGraph/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/plausible/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/mathlib/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/auto/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/smt/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Loom/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/build/lib/lean /home/claude/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /home/claude/veil-spike/veil-preview/Examples/UC/ReconfigCommitSMT.lean -o /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/ReconfigCommitSMT.olean -i /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/ReconfigCommitSMT.ilean -c /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/ReconfigCommitSMT.c --setup /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/ReconfigCommitSMT.setup.json --json
+error: Lean exited with code 137
+Some required targets logged failures:
+- Examples.UC.ReconfigCommitSMT
+error: build failed
+EXIT=1
+# KILLED 04:53 after 2h28m wall / 3h10m CPU at 139% — no verdict (Lean buffers until elaboration ends). Cause under test: role_positive_term (first clause to put tot.zero in the hypothesis set).
