@@ -1,0 +1,137 @@
+⚠ [711/1162] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1162] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1162] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+⚠ [1418/1418] Built Examples.UC.ReconfigCommitSMTSlice (77s)
+info: Examples/UC/ReconfigCommitSMTSlice.lean:553:0: Initialization must establish the invariant:
+  doesNotThrow ... ✅
+  role_exclusive ... ✅
+  cand_cfg_frozen ... ✅
+  eleccfg_not_ahead ... ✅
+  reach_bound ... ✅
+  reach_mono ... ✅
+  cfg_from_genesis ... ✅
+  self_vote ... ✅
+  grant_state ... ✅
+  leader_reach_strict ... ✅
+The following set of actions must preserve the invariant and successfully terminate:
+  propose
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+  deliverRequestVoteGrant
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+  replicate
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+  becomeLeader
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+  crashRestart
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+  commitEntry
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+  adopt
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+  commitCfg
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+  appendEntry
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+  startElection
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+warning: Examples/UC/ReconfigCommitSMTSlice.lean:553:0: Trusting SMT solver for 99 goals. `set_option veil.smt.trust false` to enable proof reconstruction.
+Build completed successfully (1418 jobs).
+EXIT=0
