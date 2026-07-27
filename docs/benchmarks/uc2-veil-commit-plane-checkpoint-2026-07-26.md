@@ -1043,3 +1043,32 @@ own-term form `∀ V ∈ q, tot.le (curTerm i) (curTerm V)` — Rust anchor `ele
 (36) and therefore a gate stop. **It is PREPARED, NOT REQUESTED:** the gate template demands a
 checker-produced reachability trace, and the cost wall meant no run could produce one. Asking
 for a `require` on a hand argument alone would invert the arc's discipline.
+
+## S5.7 Disposition
+
+**Stop at the ~5-hour checkpoint — NOT gate 2, and no gate request made.** Gate 2's
+precondition is not met, and it now has an extra clause of its own: **the bundle must close
+with zero ⏱️**, not merely with no ❌.
+
+Run 24 — the full 41-clause bundle at a file-scope 5 s per VC, which should have bounded it
+at ~41 minutes — was still buffering at 61 minutes and was killed. That yields the session's
+last finding: **a per-VC solver budget bounds the solver, not the run**; the remainder is VC
+generation and elaboration at this bundle size, which no timeout setting touches. The cost
+model for this bundle is two-term, and only the slice device attacks the second term.
+**Run 16 (470 ✅ / 3 ❌ / 0 ⏱️) therefore remains the banked baseline, and nothing quoted from
+this session comes from a full-bundle run.**
+
+Banked, all clause-only at an unchanged **35 requires / 11 assumptions**, `QuorumAdjacency.lean`
+untouched: the ⏱️ protocol and the dissolution of the tool-soundness question; **T12 certified
+inductive in 80 seconds**; the slice device with its monotonicity argument; two toolchain
+findings; truth arguments T12/T13/T14 written before their runs; an honest re-label of
+`election_safety` as OPEN rather than refuted; and task 3 mapped with MODEL-EDIT-5 prepared
+but deliberately not requested.
+
+**Next session, in order — and all three are now slice-shaped work, which is the change:**
+(1) close `election_safety`@`becomeLeader` by cutting its chain into named lemma clauses,
+each certified in its own slice, rather than asking one VC to find the whole instantiation
+sequence; (2) apply the `commitElecQuorum` ghost + T13/T14 and certify them in a slice
+(count-exempt, no gate); (3) try route (i) of the holder-supply map in a slice, and only if
+it fails does MODEL-EDIT-5 become a gate request — carrying a checker-produced CTI, not a
+hand trace; (4) gate 2 only when the bundle closes with zero ⏱️.
