@@ -1989,3 +1989,59 @@ over-approximation argument from the CHECKER's evidence; the cost wall (item 35)
 run could produce the CTI that would justify (ii), and route (i) was never measured. Asking
 for a `require` on a hand argument alone would invert the arc's discipline. **The request is
 therefore PREPARED, not made.**
+
+#### 37. **THE SLICE DEVICE — and T12 CERTIFIED INDUCTIVE in 80 seconds** (run 20)
+The way past item 35's wall is not a cheaper clause but a smaller BUNDLE. `#check_invariants`
+proves, per clause and per action, `Inv_bundle(s) ∧ action(s,s') → clause(s')`. If a clause
+is proved against a SUBSET of the invariant conjunction, the full-bundle VC is IMPLIED
+(`Inv_full → Inv_slice` weakens the antecedent), so **a slice ✅ TRANSFERS to the full bundle;
+a slice ❌/⏱️ does not transfer in either direction.** The slice is a cost device, not a
+weakening — and it is the standing answer to "one expensive clause makes the whole run
+unfinishable".
+* **RUN 20** — `ReconfigCommitSMTSlice.lean`: the model UNCHANGED (same 35 requires / 11
+  assumptions, same actions) with only the nine clauses T12's preservation consumes
+  (`role_exclusive`, `cand_cfg_frozen`, `eleccfg_not_ahead`, `reach_bound`, `reach_mono`,
+  `cfg_from_genesis`, `self_vote`, `grant_state`, `leader_reach_strict`).
+  **110 ✅ / 0 ❌ / 0 ⏱️ in 80 SECONDS.** Log `smt-run20-slice-T12.log`.
+  **`leader_reach_strict` (T12) is CERTIFIED INDUCTIVE, all-n, cvc5** — and by the
+  monotonicity above that certification holds in the full bundle. Tasks 1 and 2's clause is
+  therefore TRUE mechanically, not just by argument.
+
+#### 38. **TOOLCHAIN FINDING — `set_option veil.smt.timeout N in <cmd>` DOES NOT PROPAGATE**
+The option must be set at **FILE SCOPE**. Evidence, three runs on the same file:
+* run 19 (full bundle, `set_option ... 12 in #check_invariants`): behaved exactly like the
+  60 s default — killed at **96 min, no verdict**, and its "12 s × 490 VCs ≈ 98 min" bound
+  never applied. Log `smt-run19-KILLED-tmo12-no-verdict.log`.
+* run 22 (election slice, `set_option ... 900 in #check_invariants`): finished in the SAME
+  3 min as run 21 at the default, with the same single ⏱️ — the 900 s never applied.
+* run 23 (same slice, `set_option veil.smt.timeout 900` at FILE SCOPE, before
+  `veil module`): the run went from 3 min to **30 min** — the budget applied.
+**Consequence for the record: run 19 was never a 12 s run, so it is NOT evidence about where
+the cost lives, and item 35's inference that the cost is "upstream of the solver" is
+WITHDRAWN — the flat 7.60 GB RSS plus falling CPU across runs 17/18/19 is the ordinary
+signature of long sequential solver calls.** What survives item 35 unchanged: runs 17 and 18
+were both killed at ~30 min with no verdict, and the ∀C→ground bisection did not help.
+
+#### 39. **TASK 1's MECHANICAL STATUS: `election_safety`@`becomeLeader` is OPEN (⏱️), NOT REFUTED**
+* **RUN 21** — `ReconfigCommitSMTElecSlice.lean`: `election_safety` plus the seventeen
+  clauses T8's chain consumes (including T12). **206 ✅ / 2 ❌ / 1 ⏱️ in 3 min.**
+  The two ❌ are `reach_quorum_below` at `propose`/`adopt` — **slice artifacts**: the slice
+  deliberately omits `chain_committed_below`, `committed_cfg_quorum` and
+  `adopted_reach_bound`, which are exactly what its preservation consumes and which made it
+  inductive in the full bundle from run 13 on. They do not touch `election_safety`'s verdict:
+  each VC assumes the slice conjunction independently.
+  **`election_safety` is ✅ at every action EXCEPT `becomeLeader`, where it is ⏱️.**
+* **RUN 23** — the same slice at a FILE-SCOPE 900 s per VC (30 min): the `becomeLeader` VC
+  pair (`becomeLeader_election_safety_0_WP` / `_tr_0_TR`) is **STILL ⏱️**. Not a CTI at
+  15 minutes of solver time apiece — the goal is a multi-step first-order chain
+  (`cfglt_connected` → `reach_quorum_below` → `adjacent_cfg_quorum_intersection` → T3),
+  which is where SMT instantiation search is weakest.
+* **WHAT CHANGED, AND WHAT DID NOT.** Run 16's ❌ at this VC is **superseded**: its
+  pre-state has `reachAt 1 (elecCfg 1) = curTerm 1`, which VIOLATES T12, so it is not a
+  pre-state of any T12-bearing bundle (hand check; T12 was designed against exactly it).
+  But "no longer refuted" is not "proved". **Under the truth rule `election_safety` is
+  carried with option (a) — the WRITTEN truth argument T8 (session 4) plus T12 (item 33) —
+  and its mechanical verdict is OPEN (⏱️), which must be quoted as such wherever this
+  session's greens are quoted.** The honest one-line status: task 1's DEFECT is diagnosed
+  and its clause is machine-certified true; the PROPERTY it was meant to close is not
+  mechanically closed, and the obstacle is now solver search, not a missing invariant.
