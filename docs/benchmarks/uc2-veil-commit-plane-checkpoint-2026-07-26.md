@@ -1519,7 +1519,9 @@ open items are stated as open.
 * **T20's machinery is certified.** Four count-exempt ghosts (`cfgSeen`, `cfgPred`, `cfgQ`,
   `cfgBacked`) and seven clauses (T32–T37) — truth arguments written first — are inductive at
   INIT and at **all ten actions** (run 37, 110 ✅ / 0 ❌ / 0 ⏱️, 77 s), and green in the full
-  bundle at `becomeLeader` (run 38) and `commitEntry` (run 41).
+  bundle at `becomeLeader` (run 38) and `commitEntry` (run 41). Two further ghost-soundness
+  clauses (T39/T40) were added in response to run 41's CTI and certified the same way (run 44),
+  taking the bundle to **55 invariants + 2 safeties** at an unchanged 35/11.
 * **P2's strict half narrowed, then REFUTED its own candidate clause — twice.** With T20's
   machinery in place the `becomeLeader` CTI survives only by denying that the intermediate
   config's proposal was authored by an E-holder, i.e. the residue looked like the single clause
@@ -1529,8 +1531,11 @@ open items are stated as open.
   frozen adopter quorum). Neither went into the bundle. The honest residue is therefore a
   cross-config holder-supply argument this plane does not yet carry — a WEAKER claim than
   "one clause away", and it is the one the evidence supports.
-* **`propose`** has no criterion-(A) verdict and cannot get one on this box; it is covered under
-  amendment (B) by three slices with explicitly recorded hypothesis sets.
+* **`propose` is certified 57 of 57 under amendment (B).** It has no criterion-(A) verdict and
+  cannot get one on this box, but the wall is a BUNDLE-SIZE cliff between ~15 and ~17 clauses,
+  not a solver-budget one — so nine ≤13-clause slices with recorded hypothesis sets cover every
+  clause of the bundle at that action (union checked mechanically). The run-16 + ghost-extension
+  transfer is no longer load-bearing there.
 * **Bar 3 is not declared done.** This is gate 2's dossier, and the open list is complete.
 
 ## S8.1 What was added to the model, and why it is count-exempt
