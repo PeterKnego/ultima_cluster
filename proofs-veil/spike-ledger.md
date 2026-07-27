@@ -1975,10 +1975,12 @@ at `commitCfgid`. Two candidate closures, in the order they should be tried:
   term — and its own comment records that this is "STRICTLY WEAKER than the Rust gate (which
   demands report term = leader term) — an over-approximation, the sound direction". The
   faithful strengthening is one more conjunct/require: `∀ V, qmember V q →
-  tot.le (curTerm i) (curTerm V)`. Rust anchor: `election.rs:545-552` drops
-  `term < current_term` ("stale report: dropped") and turns `term > current_term` into
-  adopt_term+return, so a report that reaches `tracker.on_durable` (`:566-570`) was made at
-  the leader's OWN term; terms are monotone and persisted, so a counted member's term is
+  tot.le (curTerm i) (curTerm V)`. Rust anchor, re-verified line by line this session:
+  `election.rs:546-548` drops `term < self.current_term` (`return; // stale report: dropped`,
+  `:547`) and `:549-551` turns `term > self.current_term` into `adopt_term(term, None, out);
+  return` (`:550`), so the ONLY reports reaching `tracker.on_durable` (`:569`, inside the
+  `Role::Leader` + `follower_slot` arm at `:566-571`) are OWN-TERM reports — a counted
+  member was at the leader's term when it reported. Terms are monotone and persisted, so a counted member's term is
   `≥ committedTerm` forever after. It is a NARROWING (it excludes model behaviours), so it
   needs the gate's audit exactly as EDIT-4 did — and under the count corrective it takes the
   model to **36 requires**, so it is a STOP-for-gate, not a driver decision.
