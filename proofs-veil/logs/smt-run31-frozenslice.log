@@ -1,0 +1,565 @@
+⚠ [711/1091] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1091] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1091] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+✖ [1418/1418] Building Examples.UC.ReconfigCommitSMTFrozenSlice (103s)
+trace: .> LEAN_PATH=/home/claude/veil-spike/veil-preview/.lake/packages/cvc5/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Cli/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/batteries/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Qq/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/aesop/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/proofwidgets/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/importGraph/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/plausible/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/mathlib/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/auto/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/smt/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Loom/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/build/lib/lean /home/claude/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /home/claude/veil-spike/veil-preview/Examples/UC/ReconfigCommitSMTFrozenSlice.lean -o /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/ReconfigCommitSMTFrozenSlice.olean -i /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/ReconfigCommitSMTFrozenSlice.ilean -c /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/ReconfigCommitSMTFrozenSlice.c --setup /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/ReconfigCommitSMTFrozenSlice.setup.json --json
+error: Examples/UC/ReconfigCommitSMTFrozenSlice.lean:630:0: Initialization must establish the invariant:
+  doesNotThrow ... ✅
+  role_exclusive ... ✅
+  cand_cfg_frozen ... ✅
+  eleccfg_not_ahead ... ✅
+  reach_bound ... ✅
+  reach_mono ... ✅
+  cfg_from_genesis ... ✅
+  self_vote ... ✅
+  grant_state ... ✅
+  leader_reach_strict ... ✅
+  elecq_witness ... ✅
+  elecq_grant_covers_reach ... ✅
+  commit_leader_unique ... ✅
+  commit_leader_only_after_commit ... ✅
+  commit_leader_at_commit_cfg ... ✅
+  commitq_witness ... ✅
+  commitq_grant_covers_reach ... ✅
+  commit_leader_frozen_reach ... ✅
+The following set of actions must preserve the invariant and successfully terminate:
+  propose
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+    elecq_witness ... ✅
+    elecq_grant_covers_reach ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    commit_leader_at_commit_cfg ... ✅
+    commitq_witness ... ✅
+    commitq_grant_covers_reach ... ❌
+      Counterexample (WP):
+        Theory:
+          cfgLt = [[1, 0]]
+          cmember = [[0, 0], [0, 1]]
+          genesisC = 1
+          qmember = [[0, 0]]
+          quorumOf = [[0, 0], [0, 1]]
+          succCfg = [[1, 0]]
+          tot.le = [[0, 0], [1, 0], [1, 1], [2, 0], [2, 1], [2, 2]]
+          tot.zero = 2
+        Pre-state:
+          candidate = []
+          cfgAt = [[0, 0]]
+          cfgCommitTerm = [[0, 0], [1, 0]]
+          cfgCommitted = []
+          cfgOf = [[0, 1]]
+          commitCfgid = 0
+          commitElecCfg = 1
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 1]]
+          elecCfg = [[0, 1]]
+          elecQuorum = [[0, 0]]
+          gotEAt = [[0, 0]]
+          hasAdopted = []
+          hasProposal = []
+          hasVoted = [0]
+          holdsE = [0]
+          isCommitLeader = []
+          leader = [0]
+          pending = []
+          propAfterE = []
+          proposedC = [[0, 0]]
+          reachAt = [[0, 0, 0], [0, 1, 2]]
+          reqVote = []
+          voteCand = [[0, 0]]
+          voteMsg = []
+          voteTerm = [[0, 1]]
+        Action: propose(d=0, i=0)
+      Counterexample (TR):
+        Theory:
+          cfgLt = [[0, 1]]
+          cmember = [[0, 0], [0, 1]]
+          genesisC = 0
+          qmember = [[0, 0]]
+          quorumOf = [[0, 0]]
+          succCfg = [[0, 1]]
+          tot.le = [[0, 0], [1, 0], [1, 1], [2, 0], [2, 1], [2, 2]]
+          tot.zero = 2
+        Pre-state:
+          candidate = []
+          cfgAt = [[0, 0]]
+          cfgCommitTerm = [[0, 1], [1, 0]]
+          cfgCommitted = [0, 1]
+          cfgOf = [[0, 0]]
+          commitCfgid = 1
+          commitElecCfg = 0
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 1]]
+          elecCfg = [[0, 0]]
+          elecQuorum = [[0, 0]]
+          gotEAt = [[0, 0]]
+          hasAdopted = [[0, 0]]
+          hasProposal = [0]
+          hasVoted = [0]
+          holdsE = [0]
+          isCommitLeader = []
+          leader = [0]
+          pending = []
+          propAfterE = [0]
+          proposedC = [[0, 1]]
+          reachAt = [[0, 0, 2], [0, 1, 1]]
+          reqVote = [[0, 0], [0, 1], [0, 2]]
+          voteCand = [[0, 0]]
+          voteMsg = []
+          voteTerm = [[0, 1]]
+        Action: propose(d=1, i=0)
+        Post-state:
+          candidate = []
+          cfgAt = [[0, 1]]
+          cfgCommitTerm = [[0, 1], [1, 0]]
+          cfgCommitted = [0, 1]
+          cfgOf = [[0, 1]]
+          commitCfgid = 1
+          commitElecCfg = 0
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 1]]
+          elecCfg = [[0, 0]]
+          elecQuorum = [[0, 0]]
+          gotEAt = [[0, 0]]
+          hasAdopted = [[0, 0]]
+          hasProposal = [0]
+          hasVoted = [0]
+          holdsE = [0]
+          isCommitLeader = []
+          leader = [0]
+          pending = [0]
+          propAfterE = [0]
+          proposedC = [[0, 1]]
+          reachAt = [[0, 0, 2], [0, 1, 1]]
+          reqVote = [[0, 0], [0, 1], [0, 2]]
+          voteCand = [[0, 0]]
+          voteMsg = []
+          voteTerm = [[0, 1]]
+    commit_leader_frozen_reach ... ✅
+  deliverRequestVoteGrant
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+    elecq_witness ... ✅
+    elecq_grant_covers_reach ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    commit_leader_at_commit_cfg ... ✅
+    commitq_witness ... ✅
+    commitq_grant_covers_reach ... ✅
+    commit_leader_frozen_reach ... ✅
+  replicate
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+    elecq_witness ... ✅
+    elecq_grant_covers_reach ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    commit_leader_at_commit_cfg ... ✅
+    commitq_witness ... ✅
+    commitq_grant_covers_reach ... ✅
+    commit_leader_frozen_reach ... ✅
+  becomeLeader
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+    elecq_witness ... ✅
+    elecq_grant_covers_reach ... ❌
+      Counterexample (WP):
+        Theory:
+          cfgLt = [[1, 0]]
+          cmember = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          genesisC = 1
+          qmember = [[0, 0], [1, 0]]
+          quorumOf = [[0, 1]]
+          succCfg = [[1, 0]]
+          tot.le = [[0, 0], [0, 1], [1, 1]]
+          tot.zero = 0
+        Pre-state:
+          candidate = [0]
+          cfgAt = [[0, 0], [1, 0]]
+          cfgCommitTerm = [[0, 0], [1, 0]]
+          cfgCommitted = []
+          cfgOf = [[0, 1], [1, 0]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 1], [1, 1]]
+          elecCfg = [[0, 1], [1, 0]]
+          elecQuorum = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = []
+          hasProposal = []
+          hasVoted = [0, 1]
+          holdsE = []
+          isCommitLeader = []
+          leader = []
+          pending = []
+          propAfterE = []
+          proposedC = [[0, 0], [1, 0]]
+          reachAt = [[0, 0, 0], [0, 1, 0], [1, 0, 0], [1, 1, 0]]
+          reqVote = []
+          voteCand = [[0, 0], [1, 0]]
+          voteMsg = [[[0, 0], 0], [[0, 0], 1], [[0, 1], 0], [[1, 0], 0], [[1, 0], 1], [[1, 1], 0]]
+          voteTerm = [[0, 1], [1, 1]]
+        Action: becomeLeader(i=0, q=0)
+      Counterexample (TR):
+        Theory:
+          cfgLt = [[1, 0]]
+          cmember = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          genesisC = 1
+          qmember = [[0, 0]]
+          quorumOf = [[0, 1]]
+          succCfg = [[1, 0]]
+          tot.le = [[0, 0], [1, 0], [1, 1]]
+          tot.zero = 1
+        Pre-state:
+          candidate = [1]
+          cfgAt = [[0, 0], [1, 0]]
+          cfgCommitTerm = [[0, 0], [1, 0]]
+          cfgCommitted = [0, 1]
+          cfgOf = [[0, 0], [1, 1]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 1
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 0], [1, 1]]
+          elecQuorum = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [0, 1]
+          isCommitLeader = []
+          leader = []
+          pending = [0, 1]
+          propAfterE = [0, 1]
+          proposedC = [[0, 0], [1, 1]]
+          reachAt = [[0, 0, 1], [0, 1, 1], [1, 0, 0], [1, 1, 1]]
+          reqVote = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          voteCand = [[0, 1], [1, 1]]
+          voteMsg = [[[0, 0], 1], [[0, 1], 0], [[0, 1], 1], [[1, 0], 1], [[1, 1], 0], [[1, 1], 1]]
+          voteTerm = [[0, 0], [1, 0]]
+        Action: becomeLeader(i=1, q=0)
+        Post-state:
+          candidate = []
+          cfgAt = [[0, 0], [1, 0]]
+          cfgCommitTerm = [[0, 0], [1, 0]]
+          cfgCommitted = [0, 1]
+          cfgOf = [[0, 0], [1, 1]]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 1
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 0], [1, 1]]
+          elecQuorum = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [0, 1]
+          isCommitLeader = []
+          leader = [1]
+          pending = [0, 1]
+          propAfterE = [0, 1]
+          proposedC = [[0, 0], [1, 1]]
+          reachAt = [[0, 0, 1], [0, 1, 1], [1, 0, 0], [1, 1, 1]]
+          reqVote = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          voteCand = [[0, 1], [1, 1]]
+          voteMsg = [[[0, 0], 1], [[0, 1], 0], [[0, 1], 1], [[1, 0], 1], [[1, 1], 0], [[1, 1], 1]]
+          voteTerm = [[0, 0], [1, 0]]
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    commit_leader_at_commit_cfg ... ✅
+    commitq_witness ... ✅
+    commitq_grant_covers_reach ... ✅
+    commit_leader_frozen_reach ... ✅
+  crashRestart
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+    elecq_witness ... ✅
+    elecq_grant_covers_reach ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    commit_leader_at_commit_cfg ... ✅
+    commitq_witness ... ✅
+    commitq_grant_covers_reach ... ✅
+    commit_leader_frozen_reach ... ✅
+  commitEntry
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+    elecq_witness ... ✅
+    elecq_grant_covers_reach ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    commit_leader_at_commit_cfg ... ✅
+    commitq_witness ... ✅
+    commitq_grant_covers_reach ... ✅
+    commit_leader_frozen_reach ... ✅
+  adopt
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+    elecq_witness ... ✅
+    elecq_grant_covers_reach ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    commit_leader_at_commit_cfg ... ✅
+    commitq_witness ... ✅
+    commitq_grant_covers_reach ... ❌
+      Counterexample (WP):
+        Theory:
+          cfgLt = [[0, 1]]
+          cmember = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          genesisC = 0
+          qmember = [[0, 0], [1, 0]]
+          quorumOf = []
+          succCfg = [[0, 1]]
+          tot.le = [[0, 0], [0, 1], [1, 1]]
+          tot.zero = 0
+        Pre-state:
+          candidate = []
+          cfgAt = [[0, 0], [1, 0]]
+          cfgCommitTerm = [[0, 0], [1, 0]]
+          cfgCommitted = []
+          cfgOf = [[0, 0], [1, 0]]
+          commitCfgid = 1
+          commitElecCfg = 0
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 1
+          curTerm = [[0, 0], [1, 0]]
+          elecCfg = [[0, 0], [1, 0]]
+          elecQuorum = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = []
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = []
+          isCommitLeader = []
+          leader = []
+          pending = []
+          propAfterE = []
+          proposedC = [[0, 1], [1, 1]]
+          reachAt = [[0, 0, 0], [0, 1, 1], [1, 0, 0], [1, 1, 1]]
+          reqVote = []
+          voteCand = [[0, 1], [1, 1]]
+          voteMsg = []
+          voteTerm = [[0, 1], [1, 1]]
+        Action: adopt(i=1, j=0)
+      Counterexample (TR):
+        Theory:
+          cfgLt = [[0, 1]]
+          cmember = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          genesisC = 0
+          qmember = [[0, 0], [1, 0]]
+          quorumOf = []
+          succCfg = [[0, 1]]
+          tot.le = [[0, 0], [1, 0], [1, 1]]
+          tot.zero = 1
+        Pre-state:
+          candidate = []
+          cfgAt = [[0, 0], [1, 0]]
+          cfgCommitTerm = [[0, 0], [1, 0]]
+          cfgCommitted = [0, 1]
+          cfgOf = [[0, 0], [1, 0]]
+          commitCfgid = 1
+          commitElecCfg = 0
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 1], [1, 1]]
+          elecCfg = [[0, 0], [1, 0]]
+          elecQuorum = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [0, 1]
+          isCommitLeader = []
+          leader = []
+          pending = [0, 1]
+          propAfterE = [0]
+          proposedC = [[0, 1], [1, 1]]
+          reachAt = [[0, 0, 1], [0, 1, 1], [1, 0, 1], [1, 1, 0]]
+          reqVote = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          voteCand = [[0, 0], [1, 1]]
+          voteMsg = []
+          voteTerm = [[0, 1], [1, 0]]
+        Action: adopt(i=1, j=0)
+        Post-state:
+          candidate = []
+          cfgAt = [[0, 1], [1, 0]]
+          cfgCommitTerm = [[0, 0], [1, 0]]
+          cfgCommitted = [0, 1]
+          cfgOf = [[0, 1], [1, 0]]
+          commitCfgid = 1
+          commitElecCfg = 0
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 1], [1, 1]]
+          elecCfg = [[0, 0], [1, 0]]
+          elecQuorum = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [0, 1]
+          isCommitLeader = []
+          leader = []
+          pending = [0, 1]
+          propAfterE = [0]
+          proposedC = [[0, 1], [1, 1]]
+          reachAt = [[0, 0, 1], [0, 1, 1], [1, 0, 1], [1, 1, 0]]
+          reqVote = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          voteCand = [[0, 0], [1, 1]]
+          voteMsg = []
+          voteTerm = [[0, 1], [1, 0]]
+    commit_leader_frozen_reach ... ✅
+  commitCfg
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+    elecq_witness ... ✅
+    elecq_grant_covers_reach ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    commit_leader_at_commit_cfg ... ✅
+    commitq_witness ... ✅
+    commitq_grant_covers_reach ... ✅
+    commit_leader_frozen_reach ... ✅
+  appendEntry
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+    elecq_witness ... ✅
+    elecq_grant_covers_reach ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    commit_leader_at_commit_cfg ... ✅
+    commitq_witness ... ✅
+    commitq_grant_covers_reach ... ✅
+    commit_leader_frozen_reach ... ✅
+  startElection
+    doesNotThrow ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    eleccfg_not_ahead ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    cfg_from_genesis ... ✅
+    self_vote ... ✅
+    grant_state ... ✅
+    leader_reach_strict ... ✅
+    elecq_witness ... ✅
+    elecq_grant_covers_reach ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    commit_leader_at_commit_cfg ... ✅
+    commitq_witness ... ✅
+    commitq_grant_covers_reach ... ✅
+    commit_leader_frozen_reach ... ✅
+warning: Examples/UC/ReconfigCommitSMTFrozenSlice.lean:630:0: Trusting SMT solver for 184 goals. `set_option veil.smt.trust false` to enable proof reconstruction.
+error: Lean exited with code 1
+Some required targets logged failures:
+- Examples.UC.ReconfigCommitSMTFrozenSlice
+error: build failed
+EXIT=1 WALL=104s

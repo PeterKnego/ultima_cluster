@@ -2095,3 +2095,360 @@ divergences (d1)–(d5) complete; both remain gate-2 scope for the final claim's
    does MODEL-EDIT-5 become a gate request — and then it must carry a checker-produced CTI,
    not the hand trace.
 4. Gate 2 when, and only when, the bundle closes with **zero ⏱️** — the new precondition.
+
+---
+
+### SESSION 11 (2026-07-27, opus) — BAR 3, part 5: SLICE CERTIFICATION to closure
+Fresh context by design. Worktree `.claude/worktrees/uc2-veil-commit-plane` @ `c93a943`;
+runs in `/home/claude/veil-spike/veil-preview`, logs `/home/claude/veil-spike/runs/`.
+Baseline verified mechanically before the first launch: **35 `require`s / 11 `assumption`s**
+(`grep -cE '^\s*require '` / `grep -cE '^assumption \['` on `ReconfigCommitSMT.lean`).
+
+#### 41. **TOOLING FINDING — `#check_action <name>`: an ACTION-DIMENSION slice that needs NO transfer argument**
+`Veil/Frontend/DSL/Module/Syntax.lean:308` declares `#check_action ident`, elaborated at
+`Veil/Frontend/DSL/Module/Elaborators.lean:454-465` through the same
+`runFilteredInvariantCheck` as `#check_invariants` but with the filter
+`isInductionForAction actionName` (`:421-423`) instead of `VCMetadata.isInduction`. The
+filter is passed to `Verifier.startFiltered` (`Veil/Core/Tools/Verifier/Server.lean:34`,
+`startReadyTasksLocked :49-59`), i.e. it gates which dischargers are ever STARTED — so the
+run pays for one action's VCs, not the bundle's.
+**Why this matters more than the clause slice.** A clause slice needs the
+antecedent-weakening transfer argument (item 37) because it verifies a clause against a
+SUBSET of the invariant conjunction. `#check_action` changes nothing about the VC — same
+full `Invariants` hypothesis, same `Assumptions`, same goal — it merely selects which VCs
+run. **A ✅ from `#check_action A` IS the full-bundle verdict for that (clause, action)
+pair; no transfer, no weakening, nothing to ratify.** Coverage of the full bundle is then
+the union over the ten actions plus the initialisation obligations, each measurable
+separately — which is exactly what the two-term cost model (item 40) said was needed and
+what run 24 could not buy.
+
+#### TRUTH ARGUMENTS T15 / T17 — written BEFORE their hunt (the gate-1c truth rule)
+Task 1 asks for `election_safety`'s chain cut into named lemma clauses. The cut is
+constrained by what `#check_invariants` actually proves: `Inv(s) ∧ action(s,s') → clause(s')`
+— the POST-state instances of sibling clauses are NOT hypotheses. **So a lemma only helps
+if its PRE-state instance shortens the post-state derivation.** That rules out the obvious
+decomposition (an intermediate "two same-term leaders have equal election configs" clause):
+at `becomeLeader` its VC is the same crux as `election_safety`'s, because the new leader's
+quorum comes from the ACTION's `require`, not from any invariant. What does help is
+pre-composing the SUPPORT steps of T8's chain, which is what T15 and T17 do. Depth of the
+`becomeLeader` derivation drops from 5 nested instantiations (`cfglt_connected` →
+`reach_quorum_below` → compose with `leader_reach_strict` → `adjacent_cfg_quorum_intersection`
+→ `elecq_grant_covers_reach`) to 3 (`cfglt_connected` → T17 → the grant clause).
+
+**T15 `role_below_quorum_strict`** —
+`((candidate I ∨ leader I) ∧ cfgLt C (elecCfg I)) → (C = genesisC ∨ ∃ q, quorumOf q C ∧
+∀ V, qmember V q → (¬ cfgLt (cfgOf V) C ∧ tlt (reachAt V C) (curTerm I)))`.
+*Truth.* `eleccfg_not_ahead` gives `elecCfg I = cfgOf I ∨ cfgLt (elecCfg I) (cfgOf I)`; with
+`cfglt_irrefl` + `cfglt_trans` that yields `¬ cfgLt (cfgOf I) (elecCfg I)` — the role has
+REACHED its own election config. `reach_quorum_below` at `(E := C, C := elecCfg I, N := I)`
+then gives `C = genesisC` or a quorum q of C, every member at-or-past C, with
+`tot.le (reachAt V C) (reachAt I (elecCfg I))`. `leader_reach_strict` (T12, CERTIFIED
+INDUCTIVE, run 20) gives `tlt (reachAt I (elecCfg I)) (curTerm I)`; composing `≤` with `<`
+in `TotalOrderWithZero` gives the strict bound. So T15 holds in EVERY state satisfying two
+clauses already in the bundle, a fortiori in every reachable state.
+*Preservation, action by action (what the VC must actually re-derive from the PRE-state).*
+`becomeLeader i q` — i is a CANDIDATE in the pre-state and `cand_cfg_frozen` gives
+`elecCfg i = cfgOf i`, which is exactly what the action re-assigns, so `elecCfg i` is
+UNCHANGED and `cfgOf`/`reachAt`/`curTerm` are untouched: the pre-state instance carries
+verbatim (this is WHY T15 is stated over `candidate ∨ leader` and not over `leader` alone).
+`startElection i t` — creates the role; `elecCfg i := cfgOf i` and `curTerm i := t` with
+`tlt (curTerm i) t` STRICT, so `reach_quorum_below` at `(C, cfgOf i, i)` plus `reach_bound`
+at `(i, cfgOf i)` re-establish it with the strict bound coming from the bump, not from T12.
+`deliverRequestVoteGrant j c t` — a strict raise clears both role flags; an equal-term grant
+changes neither `curTerm` nor `elecCfg` nor `cfgOf` nor `reachAt`. `replicate` / `adopt` /
+`crashRestart` — clear the role of the only node they touch. `propose i d` — `elecCfg` and
+`curTerm` are unchanged; `cfgOf i` moves FORWARD along `succCfg` and `reachAt i Z` is stamped
+only for Z with `cfgLt (cfgOf i) Z`, all of which are strictly above `cfgOf i ≥ elecCfg i > C`,
+so `reachAt i C` is untouched and `¬ cfgLt (cfgOf i) C` survives the forward move. `adopt j i`
+— identical at the adopter, with forward-onlyness from MODEL-EDIT-2c's
+`¬ cfgLt (proposedC i) (cfgOf j)`. `appendEntry` / `commitEntry` / `commitCfg` — touch none
+of `leader`, `candidate`, `elecCfg`, `cfgOf`, `reachAt`, `curTerm`.
+*Consumes:* `reach_quorum_below`, `leader_reach_strict`, `reach_bound`, `eleccfg_not_ahead`,
+`cand_cfg_frozen`, `role_exclusive`, and the chain-order assumptions.
+
+**T17 `role_below_meets_quorum`** —
+`((candidate I ∨ leader I) ∧ succCfg F E ∧ cfgLt E (elecCfg I) ∧ quorumOf Q F) →
+∃ V, qmember V Q ∧ ¬ cfgLt (cfgOf V) E ∧ tlt (reachAt V E) (curTerm I)`.
+*Truth.* T15 at `(I, C := E)` gives either `E = genesisC` — impossible, since `succCfg F E`
+gives `cfgLt F E` (`succ_cfglt`) and `genesis_least` forbids anything strictly below genesis
+— or a quorum `q_E` of E whose members are at-or-past E and reached E strictly before
+`curTerm I`. `adjacent_cfg_quorum_intersection` at `(F, E, Q, q_E)` (its three hypotheses are
+`succCfg F E`, `quorumOf Q F`, `quorumOf q_E E`) yields a member V of BOTH, and V's
+membership in `q_E` carries the two conclusions. So T17, like T15, is a one-step consequence
+of clauses/assumptions already present, in every state.
+*Preservation.* Identical frame analysis to T15 — the clause mentions the same mutable
+symbols (`candidate`, `leader`, `elecCfg`, `cfgOf`, `reachAt`, `curTerm`); `succCfg`,
+`quorumOf`, `qmember`, `cfgLt` are IMMUTABLE. At `becomeLeader` the pre-state instance
+carries verbatim (`cand_cfg_frozen`); at `startElection` it is re-derived through
+`reach_quorum_below` + `reach_bound` + adjacency.
+*Consumes:* T15 + `adjacent_cfg_quorum_intersection` + `succ_cfglt` + `genesis_least`
+(and, at `startElection`, the same supports T15 needs there).
+*What T17 buys `election_safety`@`becomeLeader`.* Post-state pair (the new leader i, an
+incumbent L) at one term T, with `elecCfg i = cfgOf i` (`cand_cfg_frozen`) and the action's
+`require`s supplying `quorumOf q (cfgOf i)` and `∀ V ∈ q, V = i ∨ voteMsg V i T`. Three cases
+by `cfglt_total` on `(elecCfg L, elecCfg i)`: **equal** — `same_cfg_quorum_intersection` on
+`q` and `elecQuorum L` (`elecq_witness`) gives a common voter, `grant_uniq` (with `self_vote`
++ `grant_state` for the `V = i` / `V = L` corners) forces `i = L`; **`elecCfg L < elecCfg i`**
+— `cfglt_connected` gives `succCfg (elecCfg L) E` with `E = elecCfg i` (adjacency on the two
+quorums, then `grant_uniq`, as above) or `cfgLt E (elecCfg i)`, where T17 at
+`(I := i, F := elecCfg L, E, Q := elecQuorum L)` hands over a member of `elecQuorum L` that
+reached E strictly before T, and `elecq_grant_covers_reach` at `(L, V, E)` gives
+`¬ cfgLt (elecCfg L) E` against `succ_cfglt`; **`elecCfg i < elecCfg L`** — mirror image,
+with T17 at `(I := L, F := elecCfg i, E, Q := q)` and `grant_reach_covered` at
+`(V, i, T, E)` giving `¬ cfgLt (cfgOf i) E`, again against `succ_cfglt` (the `V = i` corner
+is immediate: `i ∈ q_E` already says `¬ cfgLt (cfgOf i) E`).
+
+#### 42. RUN 25 — the first FULL-BUNDLE verdict since run 16, at `becomeLeader`: **42 ✅ / 1 ❌ / 1 ⏱️ in 393 s**
+`ReconfigCommitSMTActBL.lean` = `ReconfigCommitSMT.lean` verbatim (35 requires / 11
+assumptions re-verified at launch, 41 invariants + 2 safeties) with `#check_invariants`
+replaced by `#check_action becomeLeader` and the file-scope budget raised 5 s → 60 s (the
+run-16 default). Log `smt-run25-actionBL.log`. Compare run 24: the same bundle, all
+actions, 5 s per VC — **killed at 61 min with no verdict**. The action filter is the cost
+device the two-term model asked for.
+* `election_safety`@`becomeLeader` — **⏱️** (`becomeLeader_election_safety_0_WP` /
+  `_tr_0_TR`, TIMEOUT). Unchanged in kind from runs 21/23: OPEN, not refuted, carried on
+  the written T8 + T12 argument. 60 s here vs 900 s there; the 900 s measurement stands as
+  the stronger one.
+* `leader_completeness`@`becomeLeader` — **❌, and this is the session's most useful
+  artifact**: the first CHECKER-PRODUCED P2 CTI since run 16, at full bundle strength.
+* Everything else at this action — **42 ✅**, i.e. the full-bundle certification of 41
+  clauses + `doesNotThrow` + `election_safety`'s sibling at `becomeLeader`, with NO transfer
+  argument needed (item 41).
+
+**THE CTI, ADJUDICATED (F-M7-1 discipline, before any clause is written).** Chain
+`genesis(1) → 2 → 0`; two terms (`tot.zero = 1 < 0`); quorums `q1 = {1}` of genesis,
+`q0 = {0}` of cfg 0, `q2 = {0,1}` of cfg 2. Node 1 is the commit leader — elected under
+GENESIS, `commitCfgid = genesis`, `commitElecCfg = genesis`, `commitQuorum = {1}`,
+`committedTerm = 0`, `holdsE = {1}` — and has since crash-restarted (`leader = []`). Node 0
+is a candidate at the SAME term 0 sitting at the TOP config with `elecCfg 0 = cfgOf 0 = 0`,
+and `becomeLeader(i=0, q={0})` elects it. Two configs apart, so
+`adjacent_cfg_quorum_intersection` never forces `q0 ∩ q1 ≠ ∅`: P2 fails. **It is a MODEL
+ARTIFACT, not a UC behaviour, and the pre-state is UNREACHABLE in the model itself** — for
+node 0 to sit at cfg 0 it must have adopted cfg 2 and cfg 0; the only possible proposer is
+node 1; `commitCfgid = genesis` forces those proposals to POSTDATE the commit, hence
+`propAfterE 1 = true`; and `adopt`'s coupling require then demands `holdsE 0`, which the
+CTI denies (`hasAdopted = []` in the WP model confirms node 0 never adopted anything). This
+is exactly the SAME-TERM half of ledger item 36's map, and it is excluded by the frozen
+commit-evidence clauses written there: with T18 forcing `quorumOf commitElecQuorum
+commitElecCfg` the ghost must be `q1 = {1}`, and T13 at `(V := 1, D := 2)` — antecedent
+`qmember 1 commitElecQuorum`, `¬ cfgLt (cfgOf 1) 2`, `tlt (reachAt 1 2) committedTerm`, all
+true here — concludes `¬ cfgLt commitElecCfg 2`, contradicting `cfgLt genesis 2`. **No
+stop-the-arc finding; no new `require`; the fix is the already-written ghost + clauses.**
+
+#### TRUTH ARGUMENT T18 — `commitq_witness` (written BEFORE its run, per the truth rule)
+**T18** `(committed ∧ isCommitLeader I) → (quorumOf commitElecQuorum commitElecCfg ∧
+∀ V, qmember V commitElecQuorum → (V = I ∨ voteMsg V I committedTerm))`.
+*Truth.* This is `elecq_witness` (T2, already inductive) frozen at the commit. `commitEntry`
+requires `leader i`, so in its pre-state `elecq_witness` gives
+`quorumOf (elecQuorum i) (elecCfg i)` and `∀ V ∈ elecQuorum i, V = i ∨ voteMsg V i (curTerm i)`;
+the action writes `commitElecQuorum := elecQuorum i`, `commitElecCfg := elecCfg i`,
+`committedTerm := curTerm i` and `isCommitLeader i := true` in the SAME step, so the clause
+holds immediately after. It is preserved because `commitEntry` requires `¬ committed` and so
+fires at most once — all four written components are frozen thereafter — `voteMsg` is never
+retracted by any action, and `isCommitLeader` is only ever written at that same site.
+*Why the ghost is needed at all (and why `commit_leader_evidence`'s `∃q` is not a substitute).*
+Identical to the `elecQuorum` lesson of session 4: the existential witness can be supplied by
+LATE grants made against a MOVED config, whereas the argument needs the quorum that actually
+certified the commit leader's election. `commitElecQuorum` is read in NO `require`, so it is
+GHOST — the count stays at 35 requires / 11 assumptions and no gate is needed (bar-3 policy).
+
+#### 43. RUNS 26 / 27 — **T15 and T17 CERTIFIED INDUCTIVE** (83 s and 91 s)
+Both slices are the model VERBATIM (35 requires / 11 assumptions re-verified in each file
+before launch) with the invariant conjunction cut to the clause's own support set.
+* **RUN 26** `ReconfigCommitSMTT15Slice.lean` — **130 ✅ / 2 ❌ / 0 ⏱️ in 83 s**.
+  `role_below_quorum_strict` (T15) is ✅ at INIT and at all ten actions.
+  Hypothesis set (recorded for the transfer audit): `role_exclusive`, `cand_cfg_frozen`,
+  `eleccfg_not_ahead`, `reach_bound`, `reach_mono`, `cfg_from_genesis`, `self_vote`,
+  `grant_state`, `leader_reach_strict`, `reach_quorum_below` — all ten members of the FULL
+  bundle, so `Inv_full → Inv_slice` and the ✅ transfers (item 37).
+* **RUN 27** `ReconfigCommitSMTT17Slice.lean` — **141 ✅ / 2 ❌ / 0 ⏱️ in 91 s**.
+  `role_below_meets_quorum` (T17) is ✅ at INIT and at all ten actions. Hypothesis set = run
+  26's plus `role_below_quorum_strict` (certified by run 26).
+* **THE TWO ❌ IN EACH ARE THE SAME KNOWN SLICE ARTIFACT** — `reach_quorum_below` at
+  `propose` and `adopt`, from deliberately omitting the three clauses its preservation
+  consumes (`chain_committed_below`, `committed_cfg_quorum`, `adopted_reach_bound`). That
+  clause is inductive in the FULL bundle from run 13 onward and again in run 25; the run-21
+  precedent for reading such a ❌ as a slice artifact applies unchanged. **Neither ❌ touches
+  the target clause's verdict**: each VC assumes the slice conjunction independently.
+
+#### MODEL EDIT (GHOST + FIVE CLAUSES) — count UNCHANGED at **35 `require`s / 11 `assumption`s**
+Applied to `ReconfigCommitSMT.lean`: the ghost `individual commitElecQuorum : quorum`
+(written only at `commitEntry`, read in NO `require` — count-exempt, no gate per bar-3
+policy), and five clauses: `role_below_quorum_strict` (T15), `role_below_meets_quorum` (T17),
+`commitq_witness` (T18), `commitq_grant_covers_reach` (T13), `commit_leader_frozen_reach`
+(T14). Bundle: 41 → **46 invariants** + 2 safeties. `QuorumAdjacency.lean` UNTOUCHED, so the
+seventeen-witness `#print axioms` audit still covers the bundle. Truth arguments T13/T14
+(session 5), T15/T17/T18 (this session) were all written BEFORE their runs.
+
+#### 44. RUN 28 — the enlarged bundle at `becomeLeader`: **47 ✅ / 1 ❌ / 1 ⏱️ in 614 s**
+`ReconfigCommitSMTActBL.lean` regenerated from the edited model (46 invariants + 2 safeties;
+35 requires / 11 assumptions re-verified at launch), `#check_action becomeLeader`, 60 s per
+VC. Log `smt-run28-actionBL-frozen.log`.
+* **All five new clauses are ✅ at `becomeLeader`** — `role_below_quorum_strict`,
+  `role_below_meets_quorum`, `commitq_witness`, `commitq_grant_covers_reach`,
+  `commit_leader_frozen_reach` — i.e. T13/T14/T18 land at the action they were written for,
+  in the FULL bundle, with no transfer argument (item 41).
+* **`leader_completeness`'s SAME-TERM CTI IS GONE, EXACTLY AS PREDICTED.** Run 25's CTI had
+  `committedTerm = curTerm i`; run 28's has `committedTerm = 2 < curTerm i = 0` in a
+  three-term theory (`tot.zero = 1 < 2 < 0`). The frozen commit evidence closed the same-term
+  half of ledger item 36 case (A) — a prediction written before the run and confirmed by it.
+* **`election_safety`@`becomeLeader` is STILL ⏱️** at 60 s even with T15/T17 present.
+* Residue at this action: `leader_completeness` (1 ❌, the STRICT half) and
+  `election_safety` (1 ⏱️).
+
+#### 45. THE STRICT-HALF CTI, ADJUDICATED — and the map that item 36 was missing
+Run 28's CTI: chain `genesis(1) → 2 → 0`; `commitCfgid = commitElecCfg = genesis`,
+`commitQuorum = commitElecQuorum = {1}`, `committedTerm = 2`, `holdsE = {1}`,
+`isCommitLeader = {1}`, `leader = []` (the commit leader crash-restarted). Candidate 0 sits
+at the TOP config with `elecCfg 0 = cfgOf 0 = 0` and `curTerm 0 = 0 > committedTerm`;
+`becomeLeader(i=0, q={0})` elects it with a quorum TWO STEPS above `commitCfgid`, which
+adjacency never forces to meet `commitQuorum`. **MODEL ARTIFACT, pre-state unreachable in
+the model**: node 0 can only sit at cfg 0 by adopting cfg 2 then cfg 0; every such proposal
+postdates the commit (`commitCfgid = genesis` freezes the commit leader at genesis), so
+`propAfterE` was set at the proposer and `adopt`'s coupling demands `holdsE 0` — which the
+CTI denies (`hasAdopted = []` again). **Adjudicated as needing CLAUSES, not a `require`.**
+
+**WHERE MODEL-EDIT-5 ACTUALLY BITES — a correction to item 36 that matters for the gate.**
+MODEL-EDIT-5 (own-term report gate) does **NOT** exclude this CTI: it would make
+`commitQuorum`'s members sit at terms ≥ `committedTerm`, which creates no intersection
+between a genesis quorum and a quorum two configs above it. So **run 28's CTI is NOT the
+reachability trace that justifies MODEL-EDIT-5**, and the request is again NOT made. What
+this CTI calls for is the holder-supply chain, clause-only.
+
+**THE CHAIN, AS FAR AS IT IS NOW UNDERSTOOD (written map; UNMEASURED — no run backs it).**
+The clause the CTI wants is
+`T24 above_commit_cfg_implies_holder : (committed ∧ cfgLt commitCfgid (cfgOf N)) → holdsE N`
+— a node strictly above the commit config holds E. It reduces, through `adopt`'s coupling
+require and `propose`'s `propAfterE` write, to
+`T23 : (committed ∧ hasProposal I ∧ cfgLt commitCfgid (proposedC I)) → propAfterE I`,
+whose two cases are: proposer strictly above `commitCfgid` (T24 at the proposer — a
+legitimate mutual induction, since every VC gets the whole pre-state bundle), and proposer
+sitting EXACTLY at `commitCfgid` — item 36's named hole. For a CURRENT proposer
+(`committedTerm ≤ curTerm I`) that hole closes on `leader_completeness` ITSELF, which is in
+the bundle. **The residue is therefore precisely the STALE proposer at `commitCfgid`.**
+*Route (i), now understood mechanically (item 36 stated it, this is the derivation).* The
+contradiction is not about the stale leader's own E-holding — a stale leader legitimately
+need not hold E — but about who can ADOPT from it. `adopt` requires
+`tot.le (curTerm j) (curTerm i)`, so every adopter of a stale proposal sits at a term ≤ the
+stale term < `committedTerm`; whereas every member of `commitElecQuorum` sits at a term
+≥ `committedTerm` (`grant_state` on grants at `committedTerm`, plus `curTerm` monotone).
+When `commitElecCfg = commitCfgid` the proposal's config is `succ commitCfgid`, ADJACENT to
+`commitElecCfg`, so the two quorums must intersect — contradiction, no new mechanism. When
+`commitElecCfg < commitCfgid` (legal: elect, then propose) they are ≥ 2 apart and the
+abstract fragment offers no intersection — and THAT is where MODEL-EDIT-5 enters, because it
+upgrades `commitQuorum` (which sits at `commitCfgid`, adjacent to the proposal's config)
+from "acquired E early" to "at a term ≥ `committedTerm`", supplying the same contradiction
+one config higher.
+*The general form the clause work needs* (this session's addition to the map):
+`T27 : (committed ∧ cfgCommitted D ∧ cfgLt commitElecCfg D) → tot.le committedTerm (cfgCommitTerm D)`
+— no config above the commit leader's ELECTION config commits at a term below
+`committedTerm`. Its proof runs `cfglt_connected` from `commitElecCfg` up to D, uses
+`committed_cfg_quorum`'s reach bound (`reachAt V D ≤ cfgCommitTerm D`) plus
+`reach_quorum_below` to push a quorum down to the successor of `commitElecCfg`, meets it
+against `commitElecQuorum` by adjacency, and closes with **T13**
+(`commitq_grant_covers_reach`) against `succ_cfglt` — i.e. it is the frozen-commit twin of
+T17's chain, and route (i) is its `D = succ commitCfgid` instance.
+**STATUS: WRITTEN, NOT MEASURED.** No `#check_action`/slice run in this session carries
+T23/T24/T27; they are a plan, not a result, and are labelled as such. The honest residue of
+the strict half is "a clause-only chain of three further clauses whose truth arguments are
+sketched but not completed, with MODEL-EDIT-5 as the fallback for its last sub-case only".
+
+#### 46. **TASK 1's VERDICT: the lemma cut is CERTIFIED, the crux VC is STILL ⏱️** (runs 30, 32)
+Both lemmas are machine-certified (runs 26/27) and both are in the bundle; the goal they were
+cut to shorten still does not discharge. Every configuration tried, recorded so the next
+session does not repeat them:
+* **RUN 30** — full bundle, `#check_action becomeLeader`, **FILE-SCOPE `veil.smt.timeout 900`**:
+  **47 ✅ / 1 ❌ / 1 ⏱️ in 1945 s.** Log `smt-run30-actionBL-900s.log`. Fifteen minutes of
+  solver time on `becomeLeader_election_safety_0_WP` / `_tr_0_TR` WITH T15 and T17 present:
+  still TIMEOUT, no counterexample.
+* **RUN 32** — `ReconfigCommitSMTElecSlice2.lean`, an ELEVEN-clause election slice
+  (`election_safety` + `grant_state`, `grant_uniq`, `self_vote`, `role_exclusive`,
+  `cand_cfg_frozen`, `eleccfg_not_ahead`, `elecq_witness`, `elecq_grant_covers_reach`,
+  `grant_reach_covered`, `role_below_meets_quorum`), `#check_action becomeLeader`, file-scope
+  300 s: **11 ✅ / 0 ❌ / 1 ⏱️ in 639 s.** Log `smt-ElecSlice2.log`. Note the **0 ❌** — this
+  slice has no artifacts at all; the ONLY undischarged VC in it is the crux.
+* **The measurement grid is now**: {full bundle, 17-clause slice, 11-clause slice} ×
+  {60 s, 300 s, 900 s} — and `election_safety`@`becomeLeader` is ⏱️ in all of them.
+  Runs 21/23 measured the 17-clause slice at 60 s and 900 s; run 28 the full bundle at 60 s;
+  run 30 at 900 s; run 32 the 11-clause slice at 300 s.
+**HONEST READING.** The clause work is done and certified: the same-term grant defect (item
+30) is closed by T12, and the two instantiation steps that T8's chain needs are pre-composed
+into T15/T17 and CERTIFIED INDUCTIVE. What remains is a first-order instantiation search that
+cvc5 does not complete at any budget or bundle size tried. **Under the truth rule the clause
+stays OPEN (⏱️), carried on the written argument T8 + T12 + the T17 chain (S6.2).** The next
+lever is not another invariant: it is either a MANUAL discharge of that one VC (Veil emits
+the `@[veil] theorem becomeLeader_election_safety … := by unveil; sorry` stub for exactly
+this purpose — the stub text is in `smt-run21-elecslice.log`), or a different solver
+configuration. Both are named work, neither was attempted this session.
+
+#### 47. RUN 31 — the frozen-evidence slice at ALL actions + INIT: **195 ✅ / 3 ❌ / 0 ⏱️ in 104 s**
+`ReconfigCommitSMTFrozenSlice.lean`, 17 clauses, model verbatim (35/11). Log
+`smt-FrozenSlice.log`.
+* **`commitq_witness` (T18) — ✅ at INIT and at all ten actions. CERTIFIED INDUCTIVE.**
+* **`commit_leader_frozen_reach` (T14) — ✅ at INIT and at all ten actions. CERTIFIED INDUCTIVE.**
+* `commitq_grant_covers_reach` (T13) — ✅ at INIT and at eight actions, **❌ at `propose` and
+  `adopt`**; ✅ at `becomeLeader` in the FULL bundle (run 28). Diagnosed as a SLICE ARTIFACT:
+  T13's preservation at the two `reachAt` writers needs `committedTerm ≤ curTerm` for the
+  commit leader in the `V = cl` corner, which comes from `commit_leader_self_vote` +
+  `voteterm_bounded` — neither of which the slice carried. Run 33 (`FrozenSlice2`) adds those
+  two plus `reach_quorum_below` and `cand_reach_strict`; **its result is the one hole this
+  session leaves in the T13 row of the dossier.**
+* The third ❌ is `elecq_grant_covers_reach`, likewise a slice artifact (its preservation
+  consumes `cand_reach_strict` / `reach_bound`, omitted here); it is inductive in the full
+  bundle from run 14 on and again at `becomeLeader` in runs 25/28/30.
+  **RUN 33** (`FrozenSlice2`, 21 clauses, 154 s) — **237 ✅ / 5 ❌ / 0 ⏱️**: T13 still ❌ at
+  `propose`/`adopt`, and its CTI named the real omission. The pre-state has
+  `committed = true` with `isCommitLeader = []` — a state `commitEntry` cannot produce (it
+  writes both in one step) and which makes EVERY commit-leader clause vacuous, so nothing
+  bounds `commitElecQuorum` members' terms. The missing full-bundle clause is
+  `commit_leader_evidence`.
+  **RUN 34** (`FrozenSlice3` = run 33 + `commit_leader_evidence`, 157 s) —
+  **250 ✅ / 3 ❌ / 0 ⏱️**, and **`commitq_grant_covers_reach` (T13) is ✅ at INIT and at all
+  ten actions: CERTIFIED INDUCTIVE.** The three residual ❌ are the standing slice artifacts
+  (`reach_quorum_below` at `propose`/`adopt`, `elecq_grant_covers_reach` at one action), all
+  inductive in the full bundle.
+
+#### 48. WHERE THE BUNDLE STANDS — and the two things that are NOT covered
+**Certified, with the run that did it:**
+* the 40 clauses of run 16's bundle, all ten actions + INIT (run 16, 470 ✅ / 3 ❌ / 0 ⏱️),
+  carried forward by antecedent weakening + the GHOST-EXTENSION transfer (see the memo's
+  amendment clause (D), which asks gate 2 to rule on that transfer explicitly);
+* `leader_reach_strict` (T12) — run 20, 110 ✅ / 0 ❌ / 0 ⏱️;
+* `role_below_quorum_strict` (T15) — run 26, 130 ✅ / 2 ❌ / 0 ⏱️;
+* `role_below_meets_quorum` (T17) — run 27, 141 ✅ / 2 ❌ / 0 ⏱️;
+* `commitq_witness` (T18) + `commit_leader_frozen_reach` (T14) — run 31, 195 ✅ / 3 ❌ / 0 ⏱️;
+* `commitq_grant_covers_reach` (T13) — run 34, 250 ✅ / 3 ❌ / 0 ⏱️;
+* **the WHOLE bundle at `becomeLeader`, with no transfer argument at all** — run 28,
+  47 ✅ / 1 ❌ / 1 ⏱️, and run 30 at 900 s per VC, same tally.
+**NOT covered, stated as holes:**
+1. `election_safety` @ `becomeLeader` — **⏱️ / OPEN** in all six runs that have measured it.
+2. `leader_completeness` @ `becomeLeader` — **❌**, the STRICT half (item 45); clause-only
+   work, mapped but unmeasured.
+3. `leader_completeness` @ `commitEntry` — ❌ in run 16, expected to close on T12 (which
+   subsumes the withdrawn `role_positive_term`), **UNMEASURED since T12 landed**. The
+   `#check_action commitEntry` run was started and killed at 15 min for box memory when it
+   collided with run 30; it is the single cheapest outstanding measurement and should be the
+   next session's first command.
+4. The other eight actions have not been re-measured on the enlarged bundle under criterion
+   (A); their coverage rests on the run-16 + ghost-extension transfer.
+
+#### SESSION-6 STOP — the ~5-hour checkpoint, **NOT gate 2**
+Gate 2's precondition (bundle closed with zero ⏱️) is NOT met: one ⏱️ and two ❌ remain.
+**No gate request is made** — MODEL-EDIT-5 is still PREPARED, NOT REQUESTED, and item 45
+strengthens that position by showing MODEL-EDIT-5 would not even exclude run 28's CTI.
+Everything this session is clause/ghost-only at an unchanged **35 `require`s / 11
+`assumption`s**, `QuorumAdjacency.lean` untouched, so the seventeen-witness `#print axioms`
+audit still covers the bundle. Conditionality (n1)+(n2)+(n3), gate amendment (d) and
+divergences (d1)–(d5) are unchanged and remain gate-2 scope.
+
+**NEXT SESSION'S MAP:**
+1. `#check_action commitEntry` on the full bundle — the cheapest open measurement (hole 3).
+2. The remaining eight `#check_action` runs, to put the whole bundle under criterion (A) and
+   retire the ghost-extension transfer entirely (hole 4). Budget ~10 min each, ONE AT A TIME
+   (running two Lean processes in parallel cost this session a 15-minute run to memory
+   pressure).
+3. `election_safety`@`becomeLeader`: stop adding invariants. Either discharge that one VC
+   MANUALLY through Veil's `@[veil] theorem … := by unveil; …` stub, or change the solver
+   configuration. The invariant side is done and certified.
+4. The strict half of P2: the T23/T24/T27 chain of item 45, clause-only.
+5. Gate 2 only when (1)–(4) land with zero ⏱️.

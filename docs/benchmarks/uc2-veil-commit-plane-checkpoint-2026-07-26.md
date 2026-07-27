@@ -1072,3 +1072,232 @@ sequence; (2) apply the `commitElecQuorum` ghost + T13/T14 and certify them in a
 (count-exempt, no gate); (3) try route (i) of the holder-supply map in a slice, and only if
 it fails does MODEL-EDIT-5 become a gate request — carrying a checker-produced CTI, not a
 hand trace; (4) gate 2 only when the bundle closes with zero ⏱️.
+
+---
+
+# Session 6 (bar 3, part 6) — 2026-07-27, opus: closure by ACTION PARTITION
+
+*Ledger: `proofs-veil/spike-ledger.md` §SESSION 11, items 41–47. Model at session start
+`c93a943`; baseline **35 `require`s / 11 `assumption`s**, verified mechanically before every
+launch and unchanged at session end.*
+
+## S6.1 The finding that reorganises the arc: `#check_action`
+
+Veil exposes a per-action verification command, `#check_action <name>`
+(`Veil/Frontend/DSL/Module/Syntax.lean:308`), elaborated through the same
+`runFilteredInvariantCheck` as `#check_invariants` but with the filter
+`isInductionForAction` rather than `VCMetadata.isInduction`
+(`Veil/Frontend/DSL/Module/Elaborators.lean:421-465`). The filter is applied where
+dischargers are *started* (`Veil/Core/Tools/Verifier/Server.lean:34,49-59`), so the run pays
+for one action's verification conditions instead of the bundle's.
+
+**Why this is stronger than the clause slice.** A clause slice needs the
+antecedent-weakening transfer argument, because it proves a clause against a *subset* of the
+invariant conjunction. `#check_action` changes nothing about any VC — same `Invariants`
+hypothesis, same `Assumptions`, same goal. **A ✅ from `#check_action A` *is* the
+full-bundle verdict for that (clause, action) pair.** Nothing to ratify, nothing to transfer.
+
+The measurement that makes the point: run 24 (session 5) put the whole bundle at 5 s per VC
+and was killed at 61 minutes with no verdict. **Run 25 — the same bundle, at
+`becomeLeader`, 60 s per VC — finished in 393 seconds with 42 ✅ / 1 ❌ / 1 ⏱️**, and the ❌
+was the first checker-produced `leader_completeness` counterexample since run 16.
+
+## S6.2 Task 1 — the chain cut into lemma clauses, and what the cut can and cannot do
+
+The cut is constrained by what `#check_invariants` proves: `Inv(s) ∧ action(s,s') →
+clause(s')`. The POST-state instances of sibling clauses are **not** hypotheses. So the
+obvious decomposition — an intermediate "two same-term leaders have equal election configs"
+clause — buys nothing: at `becomeLeader` its VC is the same crux as `election_safety`'s,
+because the new leader's quorum comes from the action's `require`, not from any invariant.
+What *does* help is pre-composing the SUPPORT steps, which is what the two new lemmas do.
+
+* **T15 `role_below_quorum_strict`** pre-composes `reach_quorum_below` with
+  `leader_reach_strict` (T12): every config strictly below a role's election config is
+  genesis or carries a quorum whose members are at-or-past it *and reached it strictly
+  before that role's term*. Stated over `candidate ∨ leader` so that at `becomeLeader` the
+  pre-state instance carries verbatim (`cand_cfg_frozen`).
+  **RUN 26 — 130 ✅ / 2 ❌ / 0 ⏱️ in 83 s. CERTIFIED INDUCTIVE.**
+* **T17 `role_below_meets_quorum`** pre-composes T15 with
+  `adjacent_cfg_quorum_intersection`, so that no single VC has to find the
+  `cfglt_connected` → `reach_quorum_below` → adjacency → grant-clause sequence.
+  **RUN 27 — 141 ✅ / 2 ❌ / 0 ⏱️ in 91 s. CERTIFIED INDUCTIVE.**
+
+In both runs the two ❌ are the known slice artifact (`reach_quorum_below` at
+`propose`/`adopt`, from omitting the three clauses its preservation consumes); that clause is
+inductive in the full bundle from run 13 on, and again in run 25. Neither ❌ touches the
+target clause's verdict — each VC assumes the slice conjunction independently.
+
+Truth arguments T15 and T17 were written into the ledger **before** either run, per the
+gate-1c truth rule; so were T13/T14 (session 5) and T18 (this session).
+
+## S6.3 Task 2 — the frozen commit evidence, and a prediction that held
+
+The `commitElecQuorum` ghost (written only at `commitEntry`, read in **no** `require` —
+count-exempt, no gate) plus `commitq_witness` (T18), `commitq_grant_covers_reach` (T13) and
+`commit_leader_frozen_reach` (T14) went into the full bundle together with T15/T17: **46
+invariants + 2 safeties, still 35 requires / 11 assumptions**, `QuorumAdjacency.lean`
+untouched, so the seventeen-witness `#print axioms` audit still covers the bundle.
+
+Run 25's `leader_completeness` counterexample was adjudicated *before* the clauses landed:
+same-term (`committedTerm = curTerm i`), commit leader crash-restarted, electing quorum two
+configs above `commitCfgid`, model-artifact (the pre-state is unreachable — node 0 could only
+sit at the top config by adopting, and every such adoption postdates the commit, so `adopt`'s
+coupling requires it to hold E, which the CTI denies). The prediction recorded was that T18
++ T13 exclude it.
+
+**RUN 28 confirmed it: 47 ✅ / 1 ❌ / 1 ⏱️ in 614 s.** All five new clauses ✅ at
+`becomeLeader`; the same-term CTI is gone; what remains is a **strict-half** CTI
+(`committedTerm < curTerm i` in a three-term theory).
+
+## S6.4 The closure-criterion amendment — DRAFTED, NOT SELF-RATIFIED (gate 2 rules)
+
+Session 5 left the arc with an unreachable closure criterion: a single `#check_invariants`
+run over the whole bundle, which run 24 showed this box cannot finish. Session 5's proposed
+replacement was slice-certification-with-coverage. **`#check_action` makes a strictly
+stronger criterion available, and the amendment below proposes it as primary, with slice
+certification demoted to a documented fallback.** Nothing here is self-ratified; the greens
+of this session are quoted under the labels the amendment defines, and gate 2 decides.
+
+> **PROPOSED AMENDMENT (bar 3 closure criterion).** The bundle CLOSES when both hold:
+>
+> **(A) Action-partitioned full-bundle verification.** For every action `A` of the model,
+> a `#check_action A` run over the FULL bundle reports **0 ❌ and 0 ⏱️**; and for every
+> clause, the initialisation obligation is ✅ in some run. This is *logically identical* to a
+> single `#check_invariants` run: `#check_action` applies a filter over which verification
+> conditions are STARTED and changes no VC's statement — same `Assumptions`, same
+> `Invariants` hypothesis, same goal — and the initialisation obligation is
+> `after_init → clause` per clause, with no other clause in its antecedent, hence
+> bundle-independent. **There is therefore no weakening to ratify in (A); what gate 2 is
+> asked to ratify is the IDENTITY claim, against `Elaborators.lean:421-465` and
+> `Server.lean:34,49-59`.**
+>
+> **(B) Slice certification, as a FALLBACK where (A) is unaffordable.** A clause may be
+> certified in a slice — the model verbatim, the invariant conjunction cut to a recorded
+> subset — and the certification transfers to the full bundle by antecedent weakening
+> (`Inv_full → Inv_slice`). Each such clause must carry, in the dossier: its certifying run,
+> the run's **explicit hypothesis set** (every member of which must be a clause of the full
+> bundle), its log and line, and the ⏱️-inclusive quote of that run. **A slice ❌ or ⏱️
+> transfers in neither direction**, and any ❌ appearing in a certifying slice must be
+> named as a slice artifact with the run that certifies that clause in the full bundle.
+>
+> **(C) The ⏱️ protocol is part of the criterion**, not an addendum: every banked run is
+> grepped (`grep -c "⏱️"`) and quoted as **"N ✅ / M ❌ / K ⏱️"**; a nonzero K anywhere in a
+> certifying run leaves the clauses carrying it OPEN regardless of the tally.
+>
+> **(D) A THIRD transfer, which this session had to use and which gate 2 must rule on
+> separately: GHOST EXTENSION.** Run 16's greens are quoted for clauses whose full-bundle
+> re-measurement this session did not repeat. Between run 16's bundle and the current one
+> there are two differences: six ADDED clauses (antecedent weakening — sound, same argument
+> as (B)) and one ADDED GHOST state component (`commitElecQuorum`), written only at
+> `commitEntry` and appearing in no run-16 clause. The claim is that a fresh state symbol
+> occurring in neither the hypothesis nor the goal of a VC cannot invalidate that VC. **It is
+> believed sound and is the standard ghost-extension argument this arc has relied on since
+> session 2, but it has never been ratified, and until it is, every run-16-sourced green in
+> the dossier below is labelled `transfer: run-16 + ghost-extension`.**
+
+## S6.5 The slice-coverage dossier (clause → certifying run → hypothesis set → transfer)
+
+Bundle at session end: **46 invariants + 2 safeties + `doesNotThrow`**, at **35 `require`s /
+11 `assumption`s**. Actions: `startElection`, `deliverRequestVoteGrant`, `becomeLeader`,
+`crashRestart`, `appendEntry`, `replicate`, `commitEntry`, `propose`, `adopt`, `commitCfg`
+(ten), plus the initialisation obligation.
+
+| clause group | certifying run | actions covered | init | transfer needed |
+|---|---|---|---|---|
+| the 40 clauses of run 16's bundle | **run 16** (470 ✅ / 3 ❌ / 0 ⏱️, `smt-run16-commitleadercfg.log`) | all ten, except the three ❌ below | ✅ | run-16 + ghost-extension (D) |
+| `leader_reach_strict` (T12) | **run 20** (110 ✅ / 0 ❌ / 0 ⏱️, `smt-run20-slice-T12.log`) | all ten | ✅ | slice (B), 9-clause hypothesis set |
+| `role_below_quorum_strict` (T15) | **run 26** (130 ✅ / 2 ❌ / 0 ⏱️, `smt-run26-T15slice.log`) | all ten | ✅ | slice (B), 10-clause hypothesis set |
+| `role_below_meets_quorum` (T17) | **run 27** (141 ✅ / 2 ❌ / 0 ⏱️, `smt-run27-T17slice.log`) | all ten | ✅ | slice (B), 11-clause hypothesis set |
+| all 46 invariants + `doesNotThrow` **at `becomeLeader`** | **run 28** (47 ✅ / 1 ❌ / 1 ⏱️, `smt-run28-actionBL-frozen.log`) | `becomeLeader` | n/a | **NONE** — criterion (A) |
+| `commitq_witness` (T18), `commitq_grant_covers_reach` (T13), `commit_leader_frozen_reach` (T14) | run 28 at `becomeLeader`; **run 31** (slice S3) elsewhere | see S6.6 | see S6.6 | (A) at `becomeLeader`, (B) elsewhere |
+
+**OPEN, and therefore the reason this is not gate 2's precondition:**
+* `election_safety` @ `becomeLeader` — **⏱️** in every run that has ever measured it
+  (14, 21, 23 at 900 s, 25, 28, and run 30 below). OPEN under the ⏱️ protocol; carried on
+  the written truth argument T8 + T12 + the T17 chain.
+* `leader_completeness` @ `becomeLeader` — **❌**, the strict half (S6.7).
+* `leader_completeness` @ `commitEntry` — ❌ in run 16; expected to close on T12, which
+  subsumes the withdrawn `role_positive_term` (session 5, item 34). **UNMEASURED since T12
+  landed** — the `#check_action commitEntry` run was started and killed for box memory when
+  it collided with run 30 (S6.6), so this is an honest hole, not a claim.
+
+## S6.6 Coverage of the frozen-evidence clauses — three slices, and a CTI that named its own fix
+
+Run 28 certified T18/T13/T14 at `becomeLeader` in the full bundle. The other nine actions and
+the initialisation obligation were covered by slice, in three attempts, each of which is
+worth recording because the failures were informative rather than wasteful:
+
+* **Run 31** (`FrozenSlice`, 17 clauses, 104 s) — **195 ✅ / 3 ❌ / 0 ⏱️**. `commitq_witness`
+  and `commit_leader_frozen_reach` ✅ at INIT and all ten actions: **CERTIFIED**.
+  `commitq_grant_covers_reach` ❌ at `propose`/`adopt`.
+* **Run 33** (`FrozenSlice2` = +`voteterm_bounded`, `commit_leader_self_vote`,
+  `reach_quorum_below`, `cand_reach_strict`, 154 s) — **237 ✅ / 5 ❌ / 0 ⏱️**; T13 still ❌,
+  **and its counterexample named the omission**: a pre-state with `committed = true` and
+  `isCommitLeader = []`, which `commitEntry` cannot produce (it writes both in one step) and
+  which makes every commit-leader clause vacuous, so nothing bounds `commitElecQuorum`
+  members' terms.
+* **Run 34** (`FrozenSlice3` = +`commit_leader_evidence`, 157 s) —
+  **250 ✅ / 3 ❌ / 0 ⏱️**, and **`commitq_grant_covers_reach` is ✅ at INIT and all ten
+  actions: CERTIFIED**. The three residual ❌ are the standing slice artifacts
+  (`reach_quorum_below` at `propose`/`adopt`, `elecq_grant_covers_reach` at one action), all
+  inductive in the full bundle.
+
+## S6.7 What did NOT close, stated plainly
+
+**`election_safety`@`becomeLeader` is still ⏱️, and it is no longer an invariant problem.**
+The measurement grid is now {full bundle, 17-clause slice, 11-clause slice} × {60 s, 300 s,
+900 s per VC}, and the VC pair `becomeLeader_election_safety_0_WP` / `_tr_0_TR` times out in
+every cell. **Run 32** is the cleanest statement of it: an eleven-clause slice built around
+T17, **11 ✅ / 0 ❌ / 1 ⏱️ in 639 s** — no artifacts at all, and the *only* undischarged VC in
+the file is the crux. The clause work the last two sessions called for is done and
+machine-certified (T12 in run 20, T15 in run 26, T17 in run 27); what remains is a
+first-order instantiation search cvc5 does not complete. The next lever is a **manual
+discharge** of that single VC through the `@[veil] theorem … := by unveil; …` stub Veil emits
+for exactly this purpose, or a different solver configuration — not another invariant.
+
+**`leader_completeness`@`becomeLeader`: the same-term half closed, the strict half did not.**
+Run 28's CTI has `committedTerm < curTerm i` in a three-term theory, with the new leader's
+electing quorum two configs above `commitCfgid`. It is again a model artifact with an
+unreachable pre-state (`hasAdopted = []` while sitting two adoptions above genesis). Two
+things follow, both recorded in ledger 45:
+1. **MODEL-EDIT-5 would not exclude it.** The own-term report gate puts `commitQuorum`'s
+   members at terms ≥ `committedTerm`; it creates no intersection between a genesis quorum
+   and a quorum two configs above. So this CTI is **not** the reachability trace that would
+   justify the gate request, and **the request is again NOT made**.
+2. **What the CTI wants is a clause chain**, and the session's contribution is to have
+   derived it: `T24 : (committed ∧ cfgLt commitCfgid (cfgOf N)) → holdsE N`, reduced through
+   `adopt`'s coupling and `propose`'s `propAfterE` write to
+   `T23 : (committed ∧ hasProposal I ∧ cfgLt commitCfgid (proposedC I)) → propAfterE I`,
+   whose only open case is a STALE proposer sitting exactly at `commitCfgid` — item 36's
+   named hole. Route (i) is now understood mechanically: the contradiction is not about the
+   stale leader's own E-holding but about **who can adopt from it** (`adopt` requires
+   `curTerm j ≤ curTerm i`, so every adopter is staler than `committedTerm`, whereas every
+   member of `commitElecQuorum` is at a term ≥ `committedTerm`), and it closes by adjacency
+   whenever `commitElecCfg = commitCfgid`. Its general form is
+   `T27 : (committed ∧ cfgCommitted D ∧ cfgLt commitElecCfg D) → committedTerm ≤ cfgCommitTerm D`.
+   **Written, not measured** — no run in this session carries T23/T24/T27.
+
+## S6.8 Disposition
+
+**Stop at the checkpoint. NOT gate 2, and no gate request made.** One ⏱️ and two ❌ remain, so
+the precondition (bundle closed with zero ⏱️) is unmet.
+
+Banked, all of it clause/ghost-only at an unchanged **35 `require`s / 11 `assumption`s**,
+`QuorumAdjacency.lean` untouched:
+* **`#check_action`** — an action-dimension partition of the bundle that needs no transfer
+  argument, and the first full-bundle verdicts since run 16 (runs 25, 28, 30).
+* **Five new clauses, every one certified**: T15 (run 26), T17 (run 27), T18 + T14 (run 31),
+  T13 (run 34) — plus the `commitElecQuorum` ghost.
+* **A predicted CTI death**: run 25's same-term P2 counterexample was adjudicated as a model
+  artifact and predicted to fall to T18 + T13 *before* the clauses were written; run 28
+  confirms it.
+* **The closure-criterion amendment, drafted for gate 2** (S6.4), including the
+  ghost-extension transfer that this session had to use and that has never been ratified.
+* **Task 1's honest verdict**: the lemma cut is certified and the crux VC is still ⏱️; the
+  obstacle is solver search, and the next lever is manual discharge, not more invariants.
+* **Task 3's honest verdict**: the holder-supply chain is derived one level deeper than item
+  36 had it, MODEL-EDIT-5 is shown *not* to answer the CTI in hand, and no `require` is
+  requested.
+
+**A box lesson, since it cost a 15-minute run:** two Lean verification processes in parallel
+drove MemAvailable to 4 GB against memwatch's 2.5 GB floor. Run these ONE AT A TIME.

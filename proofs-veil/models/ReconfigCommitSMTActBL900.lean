@@ -198,9 +198,9 @@ import Veil
 -- 3 min to 30 min). At 5 s the whole 41-clause bundle is bounded by ~490 x 5 s ~ 41 min,
 -- which is what makes a full-bundle measurement possible at all this session. Greens at
 -- 5 s are real greens; ⏱️ are OPEN verdicts (ledger 32).
-set_option veil.smt.timeout 5
+set_option veil.smt.timeout 900
 
-veil module UcReconfigCommitSMT
+veil module UcReconfigCommitSMTActBL900
 
 type node
 type term
@@ -929,4 +929,4 @@ invariant [commit_leader_frozen_reach]
 -- proof found at 12 s is a proof), and every VC that does not is reported as ⏱️ = OPEN, per
 -- the session-5 ⏱️ protocol (ledger 32). Greens from this configuration are quotable; ⏱️
 -- are not, and the clause carrying one is OPEN regardless of the tally.
-#check_invariants
+#check_action becomeLeader
