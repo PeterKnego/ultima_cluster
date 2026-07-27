@@ -1,0 +1,71 @@
+⚠ [711/1146] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1146] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1146] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+⚠ [1418/1418] Built Examples.UC.T3940Slice (50s)
+info: Examples/UC/T3940Slice.lean:616:0: Initialization must establish the invariant:
+  doesNotThrow ... ✅
+  pending_iff_proposal ... ✅
+  propafter_holds ... ✅
+  cfgbacked_committed ... ✅
+The following set of actions must preserve the invariant and successfully terminate:
+  propose
+    doesNotThrow ... ✅
+    pending_iff_proposal ... ✅
+    propafter_holds ... ✅
+    cfgbacked_committed ... ✅
+  deliverRequestVoteGrant
+    doesNotThrow ... ✅
+    pending_iff_proposal ... ✅
+    propafter_holds ... ✅
+    cfgbacked_committed ... ✅
+  replicate
+    doesNotThrow ... ✅
+    pending_iff_proposal ... ✅
+    propafter_holds ... ✅
+    cfgbacked_committed ... ✅
+  becomeLeader
+    doesNotThrow ... ✅
+    pending_iff_proposal ... ✅
+    propafter_holds ... ✅
+    cfgbacked_committed ... ✅
+  crashRestart
+    doesNotThrow ... ✅
+    pending_iff_proposal ... ✅
+    propafter_holds ... ✅
+    cfgbacked_committed ... ✅
+  commitEntry
+    doesNotThrow ... ✅
+    pending_iff_proposal ... ✅
+    propafter_holds ... ✅
+    cfgbacked_committed ... ✅
+  adopt
+    doesNotThrow ... ✅
+    pending_iff_proposal ... ✅
+    propafter_holds ... ✅
+    cfgbacked_committed ... ✅
+  commitCfg
+    doesNotThrow ... ✅
+    pending_iff_proposal ... ✅
+    propafter_holds ... ✅
+    cfgbacked_committed ... ✅
+  appendEntry
+    doesNotThrow ... ✅
+    pending_iff_proposal ... ✅
+    propafter_holds ... ✅
+    cfgbacked_committed ... ✅
+  startElection
+    doesNotThrow ... ✅
+    pending_iff_proposal ... ✅
+    propafter_holds ... ✅
+    cfgbacked_committed ... ✅
+warning: Examples/UC/T3940Slice.lean:616:0: Trusting SMT solver for 32 goals. `set_option veil.smt.trust false` to enable proof reconstruction.
+Build completed successfully (1418 jobs).
+EXIT=0 WALL=51s

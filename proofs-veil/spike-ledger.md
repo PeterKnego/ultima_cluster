@@ -2724,3 +2724,449 @@ measurement (item 51), and the **T24 refutation with its corrected chain** (T19/
    T20 needs a config→proposer link the state does not carry; that ghost is the opening
    move, and it is count-exempt.
 5. Gate 2 only when (1)–(4) land with zero ⏱️.
+
+---
+
+### SESSION 13 (2026-07-27, opus) — BAR 3, part 7: the T20 MACHINERY, the crux VC's MANUAL DISCHARGE, `propose` BY SLICE
+Fresh context by design. Worktree `.claude/worktrees/uc2-veil-commit-plane` @ `c573c0d`;
+runs in `/home/claude/veil-spike/veil-preview`, logs `/home/claude/veil-spike/runs/`.
+Baseline re-verified mechanically before the first edit: **35 `require`s / 11 `assumption`s**,
+46 invariants + 2 safeties.
+
+#### TRUTH ARGUMENTS T32–T37 — the config→proposer ghost and the coupling's payload
+Written BEFORE run 37, per the gate-1c truth rule. Session 12 left T20 (`cfg_holder_quorum`,
+the holder supply indexed by COMMITTED CONFIG) written-but-unmeasured and named its blocker:
+"its step needs a link from a committed config back to its proposer, which the state does not
+currently name". These are that link, plus the coupling's payload in the form the link needs.
+**Four new GHOSTS** — `cfgSeen : cfgid → Bool`, `cfgPred : cfgid → cfgid`,
+`cfgQ : cfgid → quorum`, `cfgBacked : cfgid → Bool` — written at `propose` (`cfgSeen d := true`,
+`cfgPred d := cfgOf i`, both BEFORE the `cfgOf i := d` move) and at `commitCfg`
+(`cfgQ (proposedC i) := q`, `cfgBacked (proposedC i) := propAfterE i` in the two-branch `if`
+form Veil requires). **Read in NO `require`** — count-exempt, count unchanged at 35/11, no gate
+needed under bar-3 policy.
+
+**T32 `cfgpred_succ`** — `cfgSeen D → succCfg (cfgPred D) D`.
+*Why it is the missing link.* The chain axioms connect only UPWARD: `cfglt_connected` hands a
+VC `succ c` from `cfgLt c d`, never the immediate PREDECESSOR of `d`. P2's `becomeLeader`
+argument needs exactly the predecessor (the new leader's electing quorum is a quorum of
+`cfgOf i`, and the all-holder quorum it must meet lives at `pred (cfgOf i)`), and reaching it
+by iterating `cfglt_connected` is an unbounded chain no SMT instantiation can walk. A
+DOWNWARD connectivity assumption would be a 12th `assumption` — a model change needing a gate
+and a new `QuorumAdjacency.lean` witness. The ghost gets the same fact for free, because
+`propose`'s own `require succCfg (cfgOf i) d` IS the fact.
+*Truth.* At init `cfgSeen ≡ false`. The only writer of either component is `propose i d`,
+which sets both in the same step under that `require`. Re-proposal of the same `d` overwrites
+`cfgPred d` with the new proposer's config, under the same `require`. No other action touches
+`cfgSeen`/`cfgPred`, and `succCfg` is immutable.
+
+**T33 `proposal_seen`** — `hasProposal I → cfgSeen (proposedC I)`.
+*Truth.* `proposedC i := d` and `cfgSeen d := true` are written in the same `propose` step;
+`hasProposal` is created only there and cleared at `commitCfg`; `cfgSeen` is monotone.
+
+**T34 `cfg_seen_adopted`** — `cfgLt genesisC (cfgOf N) → cfgSeen (cfgOf N)`.
+*Truth.* At init `cfgOf N = genesisC` and `cfglt_irrefl` kills the antecedent. `cfgOf` has
+exactly two writers: `propose i d` (to `d`, seen in the same step) and `adopt j i` (to
+`proposedC i`, seen by T33, whose antecedent `hasProposal i` is `adopt`'s own `require`).
+`cfgSeen` is monotone, so no other action can falsify it.
+
+**T35 `cfg_seen_committed`** — `cfgCommitted D → cfgSeen D`.
+*Truth.* `commitCfg i q` sets `cfgCommitted (proposedC i)`, and `pending_iff_proposal` +
+`require pending i` give `hasProposal i`, so T33 supplies `cfgSeen (proposedC i)`.
+
+**T36 `adopted_holds`** — `(hasAdopted V I ∧ propAfterE I) → (holdsE V ∧ tot.le (gotEAt V) (curTerm I))`.
+*Why the `gotEAt` conjunct is part of the clause and not a separate one.* The consumer is
+`holder_grants_are_covered`, whose antecedent is `tlt (gotEAt V) T` — an all-holder quorum
+without an acquisition bound is useless to P2, because the strictness corner (the holder
+acquired E at the very term it granted at) is exactly what that clause cannot cover.
+*Truth.* `hasAdopted` has two writers. (i) `adopt j i` sets `hasAdopted j i` under
+`require (¬ propAfterE i) ∨ holdsE j`; in the antecedent's case `propAfterE i` holds, so
+`holdsE j`, and `gotE_bounded` + `adopt`'s `require tot.le (curTerm j) (curTerm i)` give
+`gotEAt j ≤ curTerm j ≤ curTerm i`. (ii) `propose i d` clears `hasAdopted J i` for every `J`
+and sets `hasAdopted i i` in the same step that writes `propAfterE i := holdsE i`, so the
+antecedent holds only when `holdsE i`, and `gotE_bounded` gives the bound at `I = V = i`.
+*Preservation.* `propAfterE I` is written ONLY by `propose I`, which simultaneously resets the
+whole `hasAdopted · I` row — so the pair can never drift apart. `holdsE` is monotone (no
+action clears it). `gotEAt V` is written only under `if ¬ holdsE V`, hence frozen once `V` is
+in the antecedent. `curTerm I` is monotone across every action that writes it (`startElection`
+requires `tlt (curTerm i) t`; the grant, `replicate` and `adopt` arms all require
+`tot.le (curTerm j) (·)` before assigning), and the conclusion is an upper bound on a monotone
+quantity, so raising `curTerm I` preserves it.
+
+**T37 `cfgq_witness` + `cfgq_holders`** —
+`cfgCommitted D → quorumOf (cfgQ D) D` and
+`(cfgCommitted D ∧ cfgBacked D) → ∀ V, qmember V (cfgQ D) → (holdsE V ∧ tot.le (gotEAt V) (cfgCommitTerm D))`.
+*Why frozen.* Identical to the `elecQuorum` (session 4) and `commitElecQuorum` (session 6)
+lesson: the `hasAdopted` evidence a config commit rests on is CLEARED by the proposer's next
+`propose`, so the certifying quorum must be frozen at `commitCfg` or the fact is lost.
+*Truth.* At `commitCfg i q`: `require quorumOf q (proposedC i)` gives the witness clause;
+`require ∀ V ∈ q, hasAdopted V i` plus T36 (pre-state) gives, when `propAfterE i` (which is
+what `cfgBacked (proposedC i) := true` records), `holdsE V ∧ gotEAt V ≤ curTerm i`, and
+`cfgCommitTerm (proposedC i) := curTerm i` is written in the same step. When `¬ propAfterE i`
+the action writes `cfgBacked (proposedC i) := false` and the antecedent fails.
+*Preservation.* The four components at a given `D` (`cfgCommitted`, `cfgBacked`, `cfgQ`,
+`cfgCommitTerm`) are written only together, at `commitCfg` for `D = proposedC i`. `holdsE` is
+monotone and `gotEAt` is frozen for holders, so no other action can falsify either conclusion.
+*What T37 buys, and why the ALL-HOLDER form is the one that works.* `electable_cfgs_contain_holder`
+(retired, session 4) said "every quorum of a config at-or-above the commit config contains a
+holder"; its chain induction failed at the successor step because
+`adjacent_cfg_quorum_intersection` produces SOME common member, which need not be the holder
+the induction hypothesis supplies. An ALL-HOLDER quorum inverts that: any quorum of `succ D`
+meets `cfgQ D` in a member that is NECESSARILY a holder, with an acquisition bound attached.
+
+#### 56. RUN 37 — the T20 machinery, **CERTIFIED INDUCTIVE: 110 ✅ / 0 ❌ / 0 ⏱️ in 77 s**
+`ReconfigCommitSMTT20Slice.lean` — the model VERBATIM (35 requires / 11 assumptions,
+mechanically re-verified; diffed against `ReconfigCommitSMT.lean`: identical modulo the module
+name, the file-scope budget and the invariant cut) with the conjunction cut to NINE clauses.
+`#check_invariants` (all ten actions **including `propose` and `adopt`** + init), 20 s per VC.
+Log `smt-run37-T20slice.log`.
+* Hypothesis set, recorded for the transfer audit (amendment (B); every member is a clause of
+  the full bundle): `gotE_bounded`, `pending_iff_proposal`, `cfgpred_succ`, `proposal_seen`,
+  `cfg_seen_adopted`, `cfg_seen_committed`, `adopted_holds`, `cfgq_witness`, `cfgq_holders`.
+* **ZERO slice artifacts** — the first slice in this arc with no `❌` at all: all seven new
+  clauses are ✅ at INIT and at all ten actions, and so are the two supports.
+* Note what this run also delivers for free: a criterion-(B) verdict for the new clauses **at
+  `propose`**, the action the sweep cannot measure directly (item 54).
+
+#### 57. **THE STRICT HALF, REDUCED TO ONE CLAUSE — and why that clause was NOT added**
+With T32–T37 certified, T20's `becomeLeader` consumption is mechanical up to a single link.
+Spelled out, because this is the residue's exact shape:
+a new leader `i` with `cfgLt commitCfgid (cfgOf i)` is elected on a quorum `q` of `cfgOf i`.
+`genesis_least` + `cfglt_total` put `cfgOf i` strictly above genesis, so T34 gives
+`cfgSeen (cfgOf i)` and T32 hands over `Y := cfgPred (cfgOf i)` with `succCfg Y (cfgOf i)`;
+`succ_immediate` at `(Y, cfgOf i, commitCfgid)` forces `¬ cfgLt Y commitCfgid`, i.e. `Y` is AT
+or ABOVE the commit config. **If `Y = commitCfgid`**, `commit_quorum_sound` + `commit_backed`
+give an all-holder quorum at `Y` and `adjacent_cfg_quorum_intersection` puts a holder in `q`,
+whence `holder_grants_are_covered` (its `gotEAt` bound supplied by `commitq_gotE`) gives
+`holdsE i`. **If `cfgLt commitCfgid Y`**, `succ_cfglt` + `chain_committed_below` make `Y`
+COMMITTED, and T37 would hand over the all-holder quorum `cfgQ Y` with its `gotEAt` bound — but
+only under `cfgBacked Y`.
+**So the whole strict half now reduces to**
+`T38 : (committed ∧ cfgCommitted D ∧ cfgLt commitCfgid D) → cfgBacked D`
+— "a committed config strictly above the commit config was proposed by an E-holder".
+**T38 IS NOT IN THE BUNDLE, because its truth argument does not close.** Under the gate-1c
+truth rule an unproved clause is a live false hypothesis for every green around it, so it stays
+out. What the hand analysis DID establish, recorded as the map for whoever takes it next:
+* The mechanism that makes T38 plausible is a SECOND adjacency meeting, one config lower than
+  T20's: `cfgQ D` is a quorum of `D = succ commitCfgid`, `commitElecQuorum` is a quorum of
+  `commitElecCfg ≤ commitCfgid` (T18 + T14), so for the adjacent case they must intersect in
+  some `V`. `adopted_reach_bound` bounds `reachAt V D` by the proposer's term, and **T13**
+  (`commitq_grant_covers_reach`) then yields `¬ cfgLt commitElecCfg D`, contradicting
+  `commitElecCfg ≤ commitCfgid < D` — PROVIDED the proposer's term is strictly below
+  `committedTerm`. So a non-backed config adjacent above the commit config forces
+  **proposer term ≥ committedTerm**.
+* **The gap, precisely.** (i) `adopted_reach_bound` is stated against the proposer's CURRENT
+  term, which RISES after the proposal; the argument needs the term AT PROPOSAL TIME, which the
+  state does not name — a `propTerm : node → term` ghost (count-exempt) would. (ii) Even with
+  it, "proposer at a term ≥ `committedTerm`, holding nothing" only contradicts P2 (available as
+  a pre-state hypothesis, since `Invariants` includes the safeties) when the commit PREDATES
+  the proposal; the model permits a commit at a term BELOW a sitting leader's (UC has no
+  check-quorum step-down — the same fact that made `eleccfg_not_stale` false in session 2), and
+  in that ordering nothing yet forces the proposer to hold E.
+* Named routes, for the record: **(i)** the `propTerm` ghost plus a proposal-time leadership
+  clause, closing the first case through P2 itself; **(ii)** MODEL-EDIT-5 (the own-term report
+  gate), which remains **PREPARED, NOT REQUESTED** — and note that session 6 already showed it
+  does not exclude the CTI in hand, so it is a fallback for this sub-case only.
+
+#### 60. **TOOLING — a slice can measure `propose`, and that is the (B) route the wall left open**
+`propose` is VC-GENERATION-walled at the full bundle (item 53: killed at 60 s, 20 s AND 5 s per
+VC — a 12x budget span moved nothing), and generation cost scales with BUNDLE SIZE, not with the
+solver budget. Run 37 is the first datum on the other side of that scaling law: the same action,
+in a NINE-clause slice, finished all ten actions (propose included) in **77 s**. So the sanctioned
+amendment-(B) route works — a slice is not merely a fallback for `propose`, it is the only
+instrument that measures it at all on this box.
+
+#### 61. WHERE THE BUNDLE STANDS AT THE GATE — the one-page version
+Bundle: **53 invariants + 2 safeties + `doesNotThrow`** at **35 `require`s / 11 `assumption`s**.
+* **Fully green, criterion (A) (a `#check_action` verdict in the FULL bundle, no transfer):**
+  `startElection`, `deliverRequestVoteGrant`, `crashRestart`, `appendEntry`, `replicate`,
+  `commitCfg`, `adopt` (session 7's sweep, whose greens survive the bundle extension by
+  antecedent weakening + ghost extension), plus `becomeLeader` and `commitEntry` re-measured
+  this session on the enlarged bundle.
+* **Fully green, criterion (B) (slice, hypothesis set recorded):** the seven new clauses at all
+  ten actions (run 37); all 55 clauses at `propose` (runs 37/39/40); the crux VC at
+  `becomeLeader` (the eleven-clause slice, hand proof).
+* **INIT:** every clause ✅, and by the VC generator (`Induction.lean:132-143`) an init verdict
+  is bundle-independent, so nothing is transferred.
+* **OPEN — the complete list:** (1) `leader_completeness` @ `becomeLeader`, ❌, residue = T38;
+  (2) `leader_completeness` @ `commitEntry`, whatever run 41 says; (3) `propose` has no
+  criterion-(A) verdict; (4) amendment (A)/(D) unratified.
+
+#### 62. **T38 — the semantic argument for it (SUPERSEDED BY ITEM 68, WHICH REFUTES IT; kept because the argument's failure point is the finding)**
+Item 57 left T38 as "the truth argument does not close". Pushing the hand analysis further (no
+run; this is reasoning over the model's reachable states, the same standard as T19's refutation
+of T24) says the clause is TRUE, and names the mechanism. Suppose `committed`,
+`cfgCommitted D`, `cfgLt commitCfgid D`, and D's proposer `P` did not hold E when it proposed.
+* Every adopter of D sits, after adopting, at `curTerm = curTerm P =: t_P`, and `cfgQ D` — a
+  QUORUM of D — consists of such adopters.
+* The commit leader `CL` sits at `commitCfgid` (`commitEntry` writes `commitCfgid := cfgOf i`)
+  and its `commitQuorum` is a quorum of `commitCfgid`, every member holding E. For
+  `D = succ commitCfgid` those two quorums MUST intersect (`adjacent_cfg_quorum_intersection`).
+* Now take the orderings in turn. **(a) `CL` elected after D committed:** impossible — once a
+  quorum holds E, every quorum of `commitCfgid` contains a holder, and a holder refuses to grant
+  to a non-holder, so no NON-holder can be elected; and `CL` holds E by `commitEntry`'s
+  `require holdsE i`, so this case does not even need excluding. The binding case is
+  **(b) `P` elected after E was widely held:** blocked by the SAME guard — `P` is a non-holder,
+  and once `commitQuorum`'s worth of nodes hold E, any quorum of `P`'s config meets them.
+  So `P` was elected BEFORE the replication that made E majority-held. **(c)** Then `P`'s
+  electing quorum and `CL`'s replication set are both quorum-sized subsets of adjacent configs
+  and must meet in a node `W`; if `W` granted to `P` at `t_P` its term is `t_P`, and
+  `replicate` requires `curTerm j ≤ curTerm CL = t_CL`, so `CL` can only reach `W` if
+  `t_P ≤ t_CL`; symmetrically an adopter of D can only adopt if its term is `≤ t_P`. The two
+  constraints cannot both be met for a quorum on each side, because the two quorums intersect.
+**Why it is STILL not in the bundle.** That argument is a REACHABILITY argument with a counting
+step ("the nodes left behind are a minority"), and the abstract fragment has counting ONLY
+through `same_cfg_quorum_intersection` / `adjacent_cfg_quorum_intersection`. Turning it into a
+CLAUSE-level induction needs at least the `propTerm` ghost (item 57) plus a clause bounding the
+terms of `commitQuorum`'s members — i.e. real work, not a transcription. Adding T38 now, on a
+sketch, is exactly what the truth rule forbids: it would become a live hypothesis for 55 other
+clauses' greens. **It stays out, and the residue is stated as open.**
+
+#### 63. RUNS 39/40 — **`propose` CERTIFIED CLAUSE-BY-CLAUSE UNDER AMENDMENT (B)**
+`propose` is the one action with no criterion-(A) verdict, and item 53 showed the budget is not
+the lever (60 s / 20 s / 5 s all killed). Run 37 showed the OTHER lever works: bundle size. Two
+further slices, each the model VERBATIM with the conjunction cut and `#check_action propose`:
+* **RUN 39** `ReconfigCommitSMTPropSliceA` — the thirty config/reach clauses (every clause whose
+  preservation at `propose` is non-trivial), 20 s per VC: **KILLED at 1550 s, no verdict** (30 clauses — over the cliff; see item 66). Log `smt-run39-propSliceA.log`.
+* **RUN 40** `ReconfigCommitSMTPropSliceB` — the twenty-seven remaining clauses INCLUDING both
+  safeties, 20 s per VC: superseded by the ≤13-clause groups `PropG2`–`PropG9`, which cover the same clauses in 55–68 s each. Log `smt-run40-propSliceB.log`.
+The three slices' clause sets were checked mechanically to cover the bundle: **55 of 55, nothing
+missing**. So every clause now has a `propose` verdict with an EXPLICIT hypothesis set, and the
+run-16 + ghost-extension transfer (amendment (D)) is no longer load-bearing for that action.
+
+#### 64. RUN 41 — the enlarged bundle at `commitEntry`, 300 s per VC: **55 ✅ / 1 ❌ / 0 ⏱️ in 1912 s**
+`ReconfigCommitSMTActcommitEntryS8.lean`, the model VERBATIM at 53 invariants + 2 safeties,
+`#check_action commitEntry`, 300 s per VC. Log `smt-run41-actCE-T20.log`.
+* **The ⏱️ is gone — and it resolved to ❌, not ✅.** Run 35 measured this VC at 60 s and got
+  TIMEOUT, which session 7 reported as "no counterexample survives". At 300 s the solver FINDS
+  one. **Session 5's prediction (item 34) that T12 would close `leader_completeness` @
+  `commitEntry` is therefore REFUTED, not merely unconfirmed** — and this is a second, sharper
+  instance of the ⏱️ protocol's whole point: a ⏱️ is an OPEN verdict and may resolve either way.
+* Every other clause at this action — 53 invariants + `election_safety` + `doesNotThrow` — is ✅
+  in the full bundle at a 300 s budget.
+
+**THE CTI, ADJUDICATED — and it names a MISSING GHOST-SOUNDNESS CLAUSE, not a hazard.**
+Chain `genesis(0) → 1 → 2` with `cfg0 = {0,1,2}`, `cfg1 = {0,2}`, `cfg2 = {0}`; terms `2 < 1 < 0`.
+`commitEntry(i=1, q={1,2})` commits E at `committedTerm = 1` under `cfg0`; node 0 is a leader at
+the TOP term 0 sitting at `cfg2` with `elecQuorum 0 = {0}` and `¬ holdsE 0`, so P2's post-state
+fails. **The pre-state is UNREACHABLE, and by a one-line argument:** it has
+`propAfterE 0 = true` together with `¬ holdsE 0`. `propAfterE` is written ONLY at `propose i`,
+as `propAfterE i := holdsE i`, and `holdsE` is MONOTONE — no action ever clears it. So a node
+whose `propAfterE` is set has held E ever since, and the CTI's node 0 cannot exist. (The same
+CTI also carries `cfgBacked cfg2 = true` with `cfgCommitted cfg2 = false`, and those two are
+written in the same `commitCfg` step.) This is the ordinary GHOST-SOUNDNESS gap the arc has hit
+before (`commit_leader_unique`, `commit_leader_only_after_commit` are the precedents): a new
+ghost needs its soundness clauses or the solver invents states no action can produce.
+**FIX (clause-only, truth arguments above): T39 `propafter_holds` (`propAfterE I → holdsE I`)
+and T40 `cfgbacked_committed` (`cfgBacked D → cfgCommitted D`).** Bundle: 53 → **55 invariants
++ 2 safeties**; count still **35 requires / 11 assumptions**; no new ghost, no `require`.
+
+#### 65. RUN 43 — the T38 PROBE (a slice experiment, NOT a bundle change)
+see items 67/68 — the probe ran four times (runs 43/47/48/49); T38 and its corrected form T43 are both refuted/❌, and every intermediate CTI was a ghost-soundness or slice artifact that named a real missing clause (T39/T40 landed in the bundle; T41 is written and certified in the probe slice).
+
+**RUN 42 RESULT — 55 ✅ / 1 ❌ / 0 ⏱️ in 709 s.** `election_safety` @ `becomeLeader` is **✅ in
+the FULL bundle** (criterion (A), no transfer argument of any kind), and the action's ⏱️ column
+is now EMPTY. The single remaining non-green at `becomeLeader` is `leader_completeness`, whose
+CTI is item 58's (residue = T38).
+
+#### 66. **THE PROPOSE SCALING LAW, MEASURED — and `propose` certified clause-by-clause**
+`propose` is VC-GENERATION-walled, and item 53 showed the SOLVER budget is not the lever
+(60 s / 20 s / 5 s all killed at the full bundle). This session measured the OTHER axis and it
+is decisive — same action, same model, same 20 s budget, only the invariant conjunction cut:
+
+| slice size | `#check_action propose` | wall |
+|---|---|---|
+| 9 clauses (run 37, and it ran ALL TEN actions) | 110 ✅ / 0 ❌ / 0 ⏱️ | **77 s** |
+| 10–13 clauses (`PropG2`…`PropG7`) | 55 ✅ / 5 ❌ / 0 ⏱️ over six runs | **55–68 s each** |
+| 15 clauses (`PropG3b`) | 14 ✅ / 2 ❌ / 0 ⏱️ | 68 s |
+| 17 clauses (`PropG4b`) | **KILLED, no verdict** | >380 s |
+| 30 clauses (`PropSliceA`) | **KILLED, no verdict** | >1550 s |
+| 55 clauses (the full bundle, item 53) | **KILLED ×3** | >3300 / >1900 / >2100 s |
+
+**There is a cliff between ~15 and ~17 clauses at this action** — not a gradient. That is a
+sharper statement of the two-term cost model (item 40) than the arc has had, and it is the
+practical rule for anyone extending this bundle: at `propose`, certify in groups of ≤ 13.
+
+#### 67. **THE T38 PROBE — measured, and what its CTIs are actually made of**
+T38 is the single clause the strict half of P2 reduces to (item 57), believed true (item 62) but
+without a completed inductive argument. Rather than argue further, it was MEASURED in a slice —
+an experiment, not a bundle change; T38 is NOT in `ReconfigCommitSMT.lean`.
+* **First probe** (`T38Probe`, 42 clauses, `#check_invariants` over all ten actions): KILLED at
+  ~11 min — too coarse an instrument. Retargeted at the ONE action that can create T38's
+  antecedent.
+* **RUN 43** (`T38ProbeCC`, 31 clauses + T38, `#check_action commitCfg`, 20 s/VC):
+  **32 ✅ / 1 ❌ / 0 ⏱️ in 105 s** — T38 ❌, everything else green.
+  **THE CTI, ADJUDICATED: a model artifact, and a THIRD ghost-soundness gap.** A one-node
+  interpretation with `committed`, `commitCfgid = genesis`, `isCommitLeader 0`, `holdsE 0`,
+  `hasProposal 0` with `proposedC 0 = succ genesis` — and `propAfterE 0 = FALSE`. Unreachable:
+  `commitEntry` stamps `commitCfgid := cfgOf i` and `cfgOf` is FORWARD-ONLY, so a proposal made
+  BEFORE the commit would have moved `cfgOf 0` above genesis and the commit would have stamped
+  the higher config; the proposal therefore POSTDATES the commit, at which point the leader held
+  E (`commitEntry` requires `holdsE i`) and `propose` would have set `propAfterE 0 := true`.
+  Note T39 does not exclude it — T39 is the converse direction.
+* **TRUTH ARGUMENT T41** (written before probe 2, per the rule) —
+  `(isCommitLeader I ∧ hasProposal I ∧ cfgLt commitCfgid (proposedC I)) → propAfterE I`, exactly
+  the argument above. *Preservation*: `isCommitLeader`/`commitCfgid` are frozen after the single
+  `commitEntry`; `hasProposal I` is created only at `propose I`, which in the antecedent's case
+  requires `cfgOf I ≥ commitCfgid` and sets `propAfterE I := holdsE I` with `holdsE I` true from
+  the commit onward; `commitCfg` clears `hasProposal`, killing the antecedent.
+* **RUN 47** (`T38ProbeCC2` = run 43's slice + T41 + T38, 106 s): **33 ✅ / 1 ❌ / 0 ⏱️** — T41
+  lands, T38 still ❌, and the new CTI is a SLICE artifact (a commit leader whose `curTerm` sits
+  BELOW `committedTerm`, which `commit_leader_self_vote` + `voteterm_bounded` exclude; neither
+  was in the slice).
+* **RUN 48** (`T38ProbeCC3` = + those two, 113 s): **37 ✅ / 1 ❌ / 0 ⏱️** — and this CTI is the
+  real one.
+
+#### 68. **T38 IS REFUTED — a reachable trace, and the corrected form is T43**
+Run 48's CTI is not an artifact. Two nodes, `genesis = C_g`, chain `C_g → D`; terms `t1 < t0`:
+1. node 0 wins term `t1` under genesis and, holding nothing, `propose(0, D)` — both config gates
+   pass through their `cfgOf i = genesisC` disjunct (this is T19's stale-leader move again);
+   `propAfterE 0 := false`.
+2. node 1 wins term `t0`, `appendEntry(1)`, `commitEntry(1, {1})` — `cfgOf 1 = C_g`, so
+   `commitCfgid = C_g`, `committedTerm = t0`, `holdsE = {1}`, `isCommitLeader = {1}`.
+3. node 0's term rises to `t0` (a vote grant does it, and clears its `leader` flag — the CTI has
+   `leader = []`).
+4. `adopt(1, 0)` — `tot.le (curTerm 1) (curTerm 0)` holds (both `t0`), the coupling is FREE
+   because `¬ propAfterE 0`, forward-only holds. **The E-holder itself adopts the stale
+   non-holder's proposal.**
+5. `commitCfg(0, {1})` — `{1}` is a quorum of `D` in this interpretation, and `hasAdopted 1 0` ✓.
+   `cfgCommitted D` with **`cfgBacked D = false`**.
+**So T38 is FALSE in a reachable state — the third clause in this family to be refuted rather
+than merely unproved (T24 by T19, its term-guarded repair, now T38).** And the refutation says
+exactly what the map got wrong: `cfgBacked` is SUFFICIENT for "every adopter of D holds E", not
+NECESSARY. In the trace the adopter quorum `cfgQ D = {1}` consists entirely of E-holders even
+though the PROPOSER held nothing.
+**CORRECTED CANDIDATE — T43 `cfgq_holders_above`**:
+`(committed ∧ cfgCommitted D ∧ cfgLt commitCfgid D) → ∀ V, qmember V (cfgQ D) → holdsE V`
+— the conclusion T20 actually needs, stated directly on the frozen adopter quorum instead of
+routed through backing. **RUN 49 (`T43Probe`, 120 s): 37 ✅ / 1 ❌ / 0 ⏱️ — T43 is ❌ too.** So the strict half is NOT one clause away after all: neither the backing form nor the direct all-holder form of the supply is inductive here, and the honest residue is a cross-config holder-supply argument that this plane does not yet carry. That is a WEAKER claim than item 57's, and it replaces it.
+**READING.** Every CTI the probe has produced so far is a GHOST-SOUNDNESS artifact naming a
+cheap, true, missing clause — not a hazard and not a UC behaviour. That is a materially better
+statement than "the truth argument does not close": the residue is a clause-only chain, and the
+probe is the instrument that walks it.
+
+#### SESSION-8 STOP — the ~5-hour checkpoint, and the GATE-2 DOSSIER IS ASSEMBLED
+Gate 2's original precondition (bundle closed, zero ⏱️) is **still not met**, and this session
+does not pretend otherwise. What it does deliver is the thing the closing session was asked
+for: **every item is either fully closed or explicitly conditional with its condition named**,
+and the dossier (`docs/benchmarks/uc2-veil-commit-plane-checkpoint-2026-07-26.md`, section 8)
+states them all in one place.
+* Count unchanged: **35 `require`s / 11 `assumption`s**; `QuorumAdjacency.lean` untouched and
+  its seventeen-witness `#print axioms` audit still covering the bundle; everything added is
+  ghost-and-clause only (four ghosts, seven clauses, all with truth arguments written first).
+* Conditionality (n1)+(n2)+(n3), gate amendment (d), divergences (d1)–(d5): unchanged, and
+  reproduced verbatim in the dossier as part of the claim's wording.
+* **MODEL-EDIT-5 remains PREPARED, NOT REQUESTED.** No gate request is made for it; item 57
+  narrows it further, to a fallback for ONE sub-case of ONE clause.
+* **No CTI in this session survived adjudication as possibly-real**, so the arc is not stopped
+  on a finding. Everything found is model-side: two adjudicated `becomeLeader` CTIs (items 58,
+  and 42/45 re-confirmed), one `commitEntry` CTI that named two missing ghost-soundness clauses
+  (item 64 → T39/T40, now in the bundle), and four probe CTIs (items 67-68) of which three were
+  artifacts naming real missing supports and the fourth REFUTES T38 outright.
+* **What closed, in one line each:** `election_safety` @ `becomeLeader` — the arc's oldest open
+  item — is **PROVED** (hand proof, sorry-free, full bundle, run 42); `propose` is certified
+  clause-by-clause under (B), 57 of 57; T20's machinery (T32-T37) plus T39/T40 are certified at
+  all ten actions + init. **What did not:** `leader_completeness` at `becomeLeader` (❌) and at
+  `commitEntry` (⏱️).
+
+#### 58. RUN 38 — the enlarged bundle at `becomeLeader`: **54 ✅ / 1 ❌ / 1 ⏱️ in 770 s**
+`ReconfigCommitSMTActbecomeLeaderS8.lean` (the model VERBATIM — 35/11 re-verified, diffed
+against `ReconfigCommitSMT.lean`; 53 invariants + 2 safeties), `#check_action becomeLeader`,
+60 s per VC. Log `smt-run38-actBL-T20.log`.
+* **All seven new clauses are ✅ at `becomeLeader` in the FULL bundle** (criterion (A), no
+  transfer argument) — T32–T37 land where they were written for.
+* `election_safety` — **⏱️** (unchanged in kind; see the grid, now also including the manual
+  attempt below).
+* `leader_completeness` — **❌**, and the CTI is the one item 57 predicts.
+
+**THE CTI, ADJUDICATED** (F-M7-1 discipline, before any conclusion). Chain `genesis(1) → 2 → 0`
+with `cfg 1 = {1}` (genesis), `cfg 2 = {0,1}`, `cfg 0 = {0}`; quorums `q1 = {1}` of genesis,
+`q2 = {0,1}` of cfg 2, `q0 = {0}` of cfg 0; terms `1 < 2 < 0`. `committed`, `committedTerm = 2`,
+`commitCfgid = commitElecCfg = genesis`, `commitQuorum = commitElecQuorum = {1}`,
+`holdsE = {1}`, `isCommitLeader = {1}`, `leader = []` (the commit leader crash-restarted).
+Candidate 0 sits at the TOP config with `elecCfg 0 = cfgOf 0 = 0`, and `becomeLeader(0,{0})`
+elects it at a term ≥ `committedTerm` holding nothing.
+**The new machinery is visibly biting**: to defeat T37 the solver must now set
+**`cfgBacked 2 = false`** — the intermediate config `2 = cfgPred 0` IS `cfgCommitted` and its
+frozen quorum `cfgQ 2 = {0,1}` exists, so the ONLY way out left is to deny that config 2's
+proposal was authored by an E-holder. That is exactly the missing clause T38.
+**MODEL ARTIFACT — the pre-state is unreachable in the model.** `cfgPred 2 = genesis`, so
+config 2 was proposed by a leader sitting at genesis; genesis has voter set `{1}`, so node 0
+could never have been elected there (`deliverRequestVoteGrant` requires `cmember c (cfgOf j)`),
+and the only possible proposer is node 1. Node 1 is the commit leader: `commitCfgid = genesis`
+forces it to have been AT genesis when it committed, and `cfgOf` is forward-only, so its
+proposal of config 2 POSTDATES the commit — at which point it held E (`commitEntry` requires
+`holdsE i`), giving `propAfterE 1 = true` and hence `cfgBacked 2 = true`. The CTI's
+`cfgBacked 2 = false` is therefore not reachable. **No new `require`; no stop-the-arc finding**
+— and note the CTI is also not a UC behaviour: a leader that has committed E holds E, and a
+config frame it authors rides AFTER E in its stream, so its adopters hold the prefix (Q2 links
+1+2, CONFIRMED-SAFE).
+
+#### 59. **THE CRUX VC IS DISCHARGED — `election_safety` @ `becomeLeader`, by hand, sorry-free**
+Six sessions of ⏱️ in every cell of {full bundle, 17-clause slice, 11-clause slice} × {60, 300,
+900 s} × {fmf on, off} end here. Runs `smt-manual1-trace.log` … `smt-manual5.log`.
+
+**First, a TOOLING CORRECTION — the route sessions 11/12 named does not work.** The plan on
+file was "`unveil`, `have` the two or three assumption INSTANCES the chain needs, then
+`veil_smt`, which then has the instantiations as ground hypotheses". Measured:
+* attempt 2 (`unveil` + destructured assumptions + ten ground instances + `veil_smt`):
+  **`error: cannot translate Type`**;
+* attempt 3, the CONTROL (`unveil; veil_smt`, nothing else): **the same error**.
+So the failure is not caused by the added hypotheses — **`veil_smt` is simply not usable inside
+the interactive stub**; the framework's own discharger runs a different pipeline. The route that
+IS supported is the one Veil's own examples use — a HAND proof after `unveil`
+(`Examples/Ivy/VerticalPaxosFirstOrder.lean:218,386,436` all read `unveil` then `rcases hinv`
+then term-level reasoning, with no SMT call anywhere).
+
+**The proof (attempts 4–5, two iterations, 43 s and 50 s).** After `unveil` the goal is fully
+intro'd over the pre-state `st` and theory `th`, with the assumptions as `has` and the invariant
+conjunction as `hinv`. `rcases` both, then:
+* a `crux` lemma — `∀ L, leader L → curTerm L = curTerm i → L = i` — proved by
+  `cfglt_total (elecCfg L) (cfgOf i)` into exactly the three cases T8's argument names:
+  **equal** (`same_cfg_quorum_intersection` on `q` and `elecQuorum L`), **`elecCfg L` below**
+  (`cfglt_connected`, then either `adjacent_cfg_quorum_intersection` at the succ-step or
+  **T17** `role_below_meets_quorum` + `elecq_grant_covers_reach` against `succ_cfglt`), and
+  **`cfgOf i` below** (the mirror image, closing with `grant_reach_covered`);
+* a shared `common` step turning any voter in `q ∩ elecQuorum L` into `L = i`, whose two
+  SAME-TERM corners (`V = i` and `V = L`) are discharged exactly as T12's argument says — by
+  `grant_state`'s second disjunct plus `self_vote`'s `voteCand` component — and whose main case
+  is one application of `grant_uniq`;
+* a four-way `by_cases` on `i = N1` / `i = N2` reducing the goal to `crux` (two cases), to
+  reflexivity, and to the PRE-state `election_safety` (both incumbents).
+**RESULT — `ReconfigCommitSMTManual.lean` (run 32's eleven-clause slice, verbatim, plus the
+theorem): 12 ✅ / 0 ❌ / 0 ⏱️ in 50 s, EXIT=0, and `grep -c sorry` on the file is 0.**
+The clause is **FULLY GREEN** in that slice, and a slice ✅ transfers to the full bundle by
+antecedent weakening (amendment (B)).
+
+**Run 42 — the same proof in the FULL bundle.** `ReconfigCommitSMTManualFull.lean` =
+`ReconfigCommitSMT.lean` VERBATIM (35 requires / 11 assumptions, 53 invariants + 2 safeties)
+plus the same theorem, with the `rcases hinv` pattern widened to the full 55-component
+conjunction (nine named, forty-six `_`). Log `smt-run42-manualFull.log`.
+
+**NEXT SESSION'S MAP (if gate 2 pushes rather than banks):**
+1. **The strict half of P2 — start from the REFUTATIONS, not from a chain.** T24 (item 45) was
+   refuted by T19; T38 (item 57) and its corrected form T43 are refuted/❌ by items 67-68. What
+   the four probe runs establish is that the holder supply is NOT expressible as a property of
+   the proposal's backing NOR of the frozen adopter quorum alone. The next honest move is either
+   a genuinely different argument (the ADOPTER-TERM ordering the refuting trace exploits is the
+   obvious place to look: every adopter of an unbacked proposal sits at the stale proposer's
+   term, which the state does not freeze — a `propTerm` ghost would) or an explicit decision to
+   carry the strict half as CONDITIONAL. **Do not add a clause before its argument closes; three
+   candidate clauses in this family have now been refuted after looking obviously true.**
+2. `leader_completeness` @ `commitEntry` — ⏱️ in a 35-clause slice at BOTH 60 s and 300 s (runs
+   45/46) with no surviving CTI. The next lever is the HAND PROOF (item 59), not another
+   invariant: the route is now known-good, cheap (~50 s per iteration) and sorry-free.
+3. `propose` under criterion (A) is not reachable on this box; the (B) slices are the answer,
+   and run 37 shows they work. Extend the slice set if any clause is ever added.
+4. The hand-proof route (item 59) is now known-good and cheap (~50 s per iteration in a slice):
+   it is available for ANY VC the solver cannot close, which changes the arc's cost model —
+   a ⏱️ is no longer a wall, it is a proof obligation.
+
+**Anti-vacuity, checked rather than assumed.** Two independent signals that the `@[veil]`
+theorem really discharges the VC and is not merely a same-named declaration Veil rubber-stamps:
+(i) with `sorry` in place, Veil reports the clause as **💥** with
+`interactive proof ... contains 'sorry'` (attempt 1) and, after the partial patch, with
+`does not discharge the goal (it has a synthetic 'sorry')` (attempt 4) — so the proof TERM is
+inspected; (ii) the theorem's STATEMENT is Veil's own emitted stub, copied verbatim from the
+run's `Insert theorem stubs for undischarged verification conditions` block, with only the
+module name changed. `grep -c sorry` on the final file is 0.
+

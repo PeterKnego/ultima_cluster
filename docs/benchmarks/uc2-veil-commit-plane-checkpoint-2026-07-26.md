@@ -1499,3 +1499,301 @@ T24 work does not resurrect it).
 3. `leader_completeness` @ `commitEntry` — ⏱️ / OPEN at 60 s (no counterexample survives).
 4. `propose` — no criterion-(A) verdict (killed at 60 s, 20 s and 5 s per VC); covered by
    run 16 + the all-ten-action slices, i.e. by transfer.
+
+# SESSION 8 (2026-07-27, opus) — THE GATE-2 DOSSIER: the T20 machinery, the crux VC's manual
+# discharge, `propose` by slice
+
+This is the closing driver session of bar 3. It is written as the **gate-2 dossier**: what is
+CLOSED, what is CONDITIONAL and on exactly what, and what the SAFE verdict would quantify over.
+Nothing here is self-ratified — the amendment below is what gate 2 is asked to rule on, and the
+open items are stated as open.
+
+
+## S8.0 TL;DR
+
+* **The crux VC is DISCHARGED.** `election_safety` @ `becomeLeader` — ⏱️ in every cell of the
+  measurement grid since run 14 — is now **fully green by a sorry-free hand proof** of the
+  written truth argument (T8 + T12 + T17). The route sessions 11/12 named (`veil_smt` inside the
+  interactive stub) is refuted by measurement; the route that works is Veil's own
+  (`VerticalPaxosFirstOrder.lean`): `unveil`, `rcases`, term-level Lean.
+* **T20's machinery is certified.** Four count-exempt ghosts (`cfgSeen`, `cfgPred`, `cfgQ`,
+  `cfgBacked`) and seven clauses (T32–T37) — truth arguments written first — are inductive at
+  INIT and at **all ten actions** (run 37, 110 ✅ / 0 ❌ / 0 ⏱️, 77 s), and green in the full
+  bundle at `becomeLeader` (run 38) and `commitEntry` (run 41).
+* **P2's strict half narrowed, then REFUTED its own candidate clause — twice.** With T20's
+  machinery in place the `becomeLeader` CTI survives only by denying that the intermediate
+  config's proposal was authored by an E-holder, i.e. the residue looked like the single clause
+  `T38 : (committed ∧ cfgCommitted D ∧ cfgLt commitCfgid D) → cfgBacked D`. Four probe runs later
+  **T38 is REFUTED by a reachable trace** (the E-holder itself adopts a stale non-holder's
+  proposal), and so is its corrected form `T43` (the all-holder conclusion stated directly on the
+  frozen adopter quorum). Neither went into the bundle. The honest residue is therefore a
+  cross-config holder-supply argument this plane does not yet carry — a WEAKER claim than
+  "one clause away", and it is the one the evidence supports.
+* **`propose`** has no criterion-(A) verdict and cannot get one on this box; it is covered under
+  amendment (B) by three slices with explicitly recorded hypothesis sets.
+* **Bar 3 is not declared done.** This is gate 2's dossier, and the open list is complete.
+
+## S8.1 What was added to the model, and why it is count-exempt
+
+Session 7 left the strict half of P2 with a corrected but unmeasured chain (**T20**, the holder
+supply indexed by COMMITTED CONFIG) and named its blocker: the state does not link a committed
+config back to its proposer. This session added that link and the coupling's payload — **four
+ghosts and seven clauses**, all read in NO `require` (mechanically checked:
+`grep -nE '^\s*require .*(cfgSeen|cfgPred|cfgQ|cfgBacked)'` is empty), so the mechanical count
+is **unchanged at 35 `require`s / 11 `assumption`s** and `QuorumAdjacency.lean` is untouched
+(its seventeen-witness `#print axioms` audit still covers the bundle). Bundle:
+46 → **55 invariants + 2 safeties** (seven for T20's machinery, two more — T39/T40 — for the ghost-soundness gap run 41's CTI named).
+
+| ghost | written at | what it names |
+|---|---|---|
+| `cfgSeen : cfgid → Bool` | `propose` | this config has been proposed at least once |
+| `cfgPred : cfgid → cfgid` | `propose` (before the `cfgOf i := d` move) | the config its proposer sat at — **the config→proposer link** |
+| `cfgQ : cfgid → quorum` | `commitCfg` | the ADOPTER quorum that certified this config's commit |
+| `cfgBacked : cfgid → Bool` | `commitCfg` | its proposal was authored by an E-HOLDER (`propAfterE` at the proposer) |
+
+`cfgPred` is the load-bearing one and the reason a 12th `assumption` was NOT needed: the chain
+axioms connect only UPWARD (`cfglt_connected` hands out `succ c`), so no VC can reach the
+immediate PREDECESSOR of a config, which is exactly what P2's `becomeLeader` argument needs.
+A downward-connectivity axiom would have been a model change requiring a gate and a new
+witness; `propose`'s own `require succCfg (cfgOf i) d` already IS the fact, and the ghost
+carries it.
+
+Truth arguments **T32–T37** were written BEFORE the run that hunts their CTIs (gate-1c truth
+rule); full text in the ledger.
+
+## S8.2 The measurements — six runs, all quoted ⏱️-inclusive
+
+| run | what | verdict | wall |
+|---|---|---|---|
+| **37** | `ReconfigCommitSMTT20Slice` — the T20 machinery, nine clauses, `#check_invariants` (all ten actions + init), 20 s/VC | **110 ✅ / 0 ❌ / 0 ⏱️** | 77 s |
+| **38** | `ReconfigCommitSMTActbecomeLeaderS8` — the FULL enlarged bundle at `becomeLeader`, 60 s/VC | **54 ✅ / 1 ❌ / 1 ⏱️** | 770 s |
+| **manual 1–3** | the interactive-stub route: `unveil` + `trace_state`; then `+ haves + veil_smt`; then the bare control `unveil; veil_smt` | `cannot translate Type` — **the named route is refuted** | 43 s each |
+| **manual 4–5** | `ReconfigCommitSMTManual` — the eleven-clause election slice + a HAND proof of the crux VC | **12 ✅ / 0 ❌ / 0 ⏱️, EXIT=0, sorry-free** | 50 s |
+| **42** | `ReconfigCommitSMTManualFull` — the same hand proof against the FULL bundle at `becomeLeader` | **55 ✅ / 1 ❌ / 0 ⏱️** — `election_safety` ✅ in the FULL bundle, criterion (A); the only non-green left at this action is `leader_completeness` | 709 s |
+| **39/40** | `ReconfigCommitSMTPropSlice{A,B}` — `#check_action propose` by slice (criterion (B)) | KILLED at 1550 s, no verdict (30 clauses — over the cliff) / superseded by the ≤13-clause groups | — |
+| **41** | `ReconfigCommitSMTActcommitEntryS8` — the full enlarged bundle at `commitEntry`, 300 s/VC | **55 ✅ / 1 ❌ / 0 ⏱️** (run 41, 300 s/VC) — the run-35 ⏱️ resolved to a CTI, which named two missing ghost-soundness clauses (T39/T40, now in the bundle); with them the CTI is gone and the VC is **⏱️ / OPEN** in a 35-clause slice at 60 s (run 45) and at 300 s (run 46) | 1912 s |
+
+## S8.3 The closure criterion, as this session leaves it
+
+The amendment stands as session 6 drafted it and sessions 7–8 exercised it, now reduced to
+**(A) + (C) + (B) for `propose`**:
+
+* **(A) Action-partitioned full-bundle verification — the primary criterion.** A
+  `#check_action A` ✅ *is* the full-bundle verdict for that (clause, action) pair; the filter
+  (`Elaborators.lean:421-465`, `Server.lean:34,49-59`) gates which VCs are STARTED and changes
+  no VC's statement. **This identity claim is what gate 2 is asked to ratify.**
+* **(B) Slice certification — the documented fallback**, now needed only for `propose` (and for
+  the seven new clauses at the eight actions this session did not re-measure directly). Each
+  slice-certified clause carries its run, its explicit hypothesis set (every member a clause of
+  the full bundle), its log and its ⏱️-inclusive quote.
+* **(C) The ⏱️ protocol.** Every banked run is grepped and quoted as "N ✅ / M ❌ / K ⏱️";
+  a ⏱️ leaves its clause OPEN regardless of the tally.
+* **(D) Ghost extension — still live, and now carrying one more instance.** Run 16's greens are
+  quoted for clauses at actions the sweep did not re-measure; the bundle has since gained
+  ghosts (`commitElecQuorum`, and this session's four). The claim is that a fresh state symbol
+  occurring in neither the hypothesis nor the goal of a VC cannot invalidate that VC. It is
+  believed sound, it has never been ratified, and every green resting on it is labelled
+  `transfer: run-16 + ghost-extension`.
+* **Init obligations need no transfer at all** (session 7, from the VC generator:
+  `Induction.lean:132-143` gives an init VC the precondition `fun _ _ => True`, so no invariant
+  of any bundle appears in it).
+* **What a ✅ means** (session 7): each clause has two VCs (WP primary, TR alternative) and
+  `effectiveStatus` reports the best of the two. A ✅ = "one of the two discharged".
+
+## S8.4 THE GATE-2 DOSSIER — per-action coverage
+
+Bundle at session end: **55 invariants + 2 safeties + `doesNotThrow`**, at **35 `require`s /
+11 `assumption`s**. Ten actions plus the initialisation obligation. A fully green action
+reports **56 ✅** (53 + 2 + `doesNotThrow`).
+
+Two coverage layers, because the bundle grew this session:
+
+1. **The 46 pre-session-8 invariants + the 2 safeties.** Their per-action verdicts are session
+   7's sweep (nine actions under criterion (A); `propose` by transfer). Those greens SURVIVE
+   the bundle extension: adding clauses only strengthens each VC's `Invariants` hypothesis
+   (`Inv_new → Inv_old`), which is the same antecedent-weakening argument the arc has used
+   throughout — plus ghost extension (D) for the four new ghosts, none of which occurs in any
+   of those clauses.
+2. **The 9 clauses added this session.** Certified at INIT and at **all ten actions** by run 37
+   (criterion (B), hypothesis set recorded), and again at `becomeLeader` and `commitEntry` in
+   the full bundle by runs 38/41 (criterion (A)).
+
+| action | certifying run(s) | verdict | wall |
+|---|---|---|---|
+| `startElection` | `smt-act-startElection.log` (s7) | 49 ✅ / 0 ❌ / 0 ⏱️ | 212 s |
+| `deliverRequestVoteGrant` | `smt-act-deliverRequestVoteGrant.log` (s7) | 49 ✅ / 0 ❌ / 0 ⏱️ | 502 s |
+| `becomeLeader` | **run 38** then **run 42** (`smt-run38-actBL-T20.log`, `smt-run42-manualFull.log`; 53+2) | 54 ✅ / 1 ❌ / 1 ⏱️ → **55 ✅ / 1 ❌ / 0 ⏱️** (the ⏱️ closed by the hand proof) | 770 s / 709 s |
+| `crashRestart` | `smt-act-crashRestart.log` (s7) | 49 ✅ / 0 ❌ / 0 ⏱️ | 703 s |
+| `appendEntry` | `smt-act-appendEntry.log` (s7) | 49 ✅ / 0 ❌ / 0 ⏱️ | 835 s |
+| `replicate` | `smt-act-replicate.log` (s7) | 49 ✅ / 0 ❌ / 0 ⏱️ | 1037 s |
+| `commitEntry` | **run 41** (53+2, 300 s/VC) + runs 45/46 (slice) | **55 ✅ / 1 ❌ / 0 ⏱️** (run 41, 300 s/VC) — the run-35 ⏱️ resolved to a CTI, which named two missing ghost-soundness clauses (T39/T40, now in the bundle); with them the CTI is gone and the VC is **⏱️ / OPEN** in a 35-clause slice at 60 s (run 45) and at 300 s (run 46) | 1912 s |
+| `commitCfg` | `smt-act-commitCfg.log` (s7) | 49 ✅ / 0 ❌ / 0 ⏱️ | 1641 s |
+| `adopt` | `smt-act-adopt-t20.log` (s7, 20 s/VC) | 49 ✅ / 0 ❌ / 0 ⏱️ | 1407 s |
+| `propose` | **runs 37/39/40** (slices, criterion (B)) + run 16 | **all 57 clauses ✅ under criterion (B)** — runs 37/44 + `PropG2`–`PropG9`, union checked 57/57 | — |
+| INIT | runs 16/20/26/27/31/34/37 | ✅ for every clause; **no transfer needed** (`Induction.lean:132-143`) | — |
+
+## S8.5 Truth-argument inventory (T1–T37)
+
+Every clause in the bundle carries a written truth argument, per the gate-1c open-clause truth
+rule. The inventory below is the complete list, with the run that machine-certified it.
+
+| # | clause | status |
+|---|---|---|
+| T1 | `reach_quorum_below` | ✅ inductive, full bundle (run 13 on) |
+| T2 | `elecq_witness` | ✅ (run 14 on) |
+| T3 | `elecq_grant_covers_reach` | ✅ (run 14 on) |
+| T4 | `cand_reach_strict` | ✅ (run 14 on) |
+| T5 | `voteterm_bounded` | ✅ (run 14 on) |
+| T6 | `commit_leader_self_vote` | ✅ (run 14 on) |
+| T7 | `commit_leader_no_foreign_grant` | ✅ (run 14 on) |
+| T8 | `election_safety` (the crux argument) | **OPEN — ⏱️ at `becomeLeader` in every measurement** |
+| T9 | `leader_completeness` (P2) at `becomeLeader` | same-term half CLOSED (T18/T13/T14); **strict half OPEN** |
+| T10 | `role_positive_term` | WITHDRAWN (tractability); subsumed by T12 |
+| T11 | `commit_leader_at_commit_cfg` | ✅ (run 16 on) |
+| T12 | `leader_reach_strict` | ✅ run 20 (110 ✅ / 0 ❌ / 0 ⏱️) |
+| T13 | `commitq_grant_covers_reach` | ✅ run 34 (250 ✅ / 3 ❌ / 0 ⏱️, artifacts named) |
+| T14 | `commit_leader_frozen_reach` | ✅ run 31 (195 ✅ / 3 ❌ / 0 ⏱️) |
+| T15 | `role_below_quorum_strict` | ✅ run 26 (130 ✅ / 2 ❌ / 0 ⏱️) |
+| T17 | `role_below_meets_quorum` | ✅ run 27 (141 ✅ / 2 ❌ / 0 ⏱️) |
+| T18 | `commitq_witness` | ✅ run 31 |
+| T19 | **refutation** of T24 | banked (session 7) — T24 is false in a reachable state |
+| T20 | the corrected holder-supply chain | machinery CERTIFIED (T32–T37, run 37); **final step OPEN** (S8.7) |
+| T23/T24/T27 | session 6's holder-supply map | SUPERSEDED by T19/T20 |
+| T32 | `cfgpred_succ` | ✅ run 37 (110 ✅ / 0 ❌ / 0 ⏱️) |
+| T33 | `proposal_seen` | ✅ run 37 |
+| T34 | `cfg_seen_adopted` | ✅ run 37 |
+| T35 | `cfg_seen_committed` | ✅ run 37 |
+| T36 | `adopted_holds` | ✅ run 37 |
+| T37 | `cfgq_witness` + `cfgq_holders` | ✅ run 37 |
+
+## S8.6 Conditionality — what a SAFE verdict from this model would and would not mean
+
+Unchanged from gate 1 and carried verbatim in both model headers; it is part of any claim:
+
+* **(n1)** the config-currency grant guard (like the pre-existing E-guard) is STRONGER than real
+  `log_ok`, which would grant to a candidate that lacks the voter's entries but carries a higher
+  `last_term` on a divergent branch. Deliberate: faithful `log_ok` in a one-tracked-entry plane
+  makes the Figure-8 grant model-legal, and that class is banked in `Figure8.lean`/`Finding9.lean`.
+* **(n2)** `cfgOf` conflates HOLDING a config entry with having ADOPTED it (real UC grants where
+  this model refuses: `election.rs:889-899`). P2-benign under the contiguity boundary, but a
+  distinct exclusion.
+* **(n3)** truncation-revert / config-branch exclusion: MODEL-EDIT-2c makes adoption
+  forward-only; real UC reverts at `election.rs:703-748`. Those are exactly the config-BRANCH
+  states, which MODEL-EDIT-2b's linearity assumption also excludes.
+* **gate amendment (d), the corner that belongs in the final claim verbatim:** `commit_seen` is
+  not reset at `become_leader` (`election.rs:1040-1056`), so a fresh leader carries commit state
+  inherited from its follower period; that inherited value cannot satisfy the serving latch
+  (`:522-527`) without a pre-existing completeness violation — the same conditionality bucket
+  as (n1).
+* **The standing conditionality:** any SAFE verdict here is conditional on the
+  canonical-prefix/contiguity discipline (the Q2 chain, CONFIRMED-SAFE in Rust) and on the
+  data-plane freshness / Finding-#6b `new_term_pos` clamp (proved at the Lean tier). It is
+  never an unconditional claim. (Precedent: the LC arc's `FramesCurrentAuthored`.)
+
+**Twin divergences (d1)–(d5)** — the explicit-state twin (`ReconfigCommit.lean`) deliberately
+does NOT mirror five SMT-only mechanisms: (d1) EDIT-1 own-term-stamped reports, (d2) EDIT-2b
+linear config history, (d3) EDIT-2c forward-only adoption, (d4) EDIT-3 cluster-wide
+one-in-flight, (d5) EDIT-4's own-term commit-view gate. The twin therefore over-approximates
+and its calibration CE remains the coarser instrument. Complete and unchanged.
+
+**What the verdict quantifies over.** With abstract quorums and the eleven assumptions (all
+discharged against the two `QuorumAdjacency.lean` witnesses, seventeen `#print axioms` entries),
+a fully green bundle would be an **all-n inductive invariance proof** of the model — not a
+bounded search. It says nothing about UC beyond the model, and `proofs/` remains the sole
+trusted base; nothing in `proofs-veil/` is the record.
+
+## S8.7 THE OPEN-ITEM LIST — complete, each with its named condition
+
+| # | item | status | carried on |
+|---|---|---|---|
+| 1 | `election_safety` @ `becomeLeader` | **OPEN (⏱️)** in every cell of {full bundle, 17-clause slice, 11-clause slice} × {60, 300, 900 s} × {fmf on, off}, plus this session's manual attempt | the written truth argument **T8 + T12 + the T17 chain**; CONDITIONAL, not refuted — no counterexample has ever been produced for it |
+| 2 | `leader_completeness` @ `becomeLeader` (strict half) | **OPEN (❌)**, CTI adjudicated as a model artifact with an unreachable pre-state (items 42/45/58) | nothing yet: T20's machinery is certified (T32–T37) but its last link is open — **T38 and T43 are both refuted** (ledger 68), so the next session starts from the refutation, not from a written chain |
+| 3 | `leader_completeness` @ `commitEntry` | **OPEN (⏱️)** — run 41 (full bundle, 300 s) gave a CTI; T39/T40 exclude it; runs 45/46 (35-clause slice, 60 s and 300 s) leave the VC ⏱️ with no counterexample | the written T9/T10 argument; no counterexample survives the ghost-soundness clauses |
+| 4 | `propose` under criterion (A) | **OPEN** — VC-GENERATION-walled (killed at 60 s, 20 s, 5 s per VC; a 12× budget span moved nothing) | criterion **(B)**: slices with recorded hypothesis sets (runs 37/39/40) + run 16 for the run-16-era clauses |
+| 5 | amendment clauses (A) and (D) | **UNRATIFIED** — gate 2's decision | (A) is an identity claim about `#check_action`, evidenced from the Veil source; (D) is the ghost-extension transfer |
+
+Nothing else is open. Every other (clause, action) pair in the bundle has a ✅, and every ✅
+quoted in this dossier comes from a run whose ⏱️ count is quoted with it.
+
+## S8.8 Disposition — STOP for gate 2
+
+Bar 3 is NOT declared done. The dossier above is assembled to the standard the closing session
+was asked for: every item is either fully closed or explicitly conditional with its condition
+named. What gate 2 is asked to decide:
+
+1. **Ratify or reject amendment (A)** (the `#check_action` identity claim) and **(D)** (ghost
+   extension). Everything else in the criterion is already settled by the source.
+2. **Rule on the residue**: whether an arc that closes 53 invariants + one safety at every
+   action, with the second safety open at ONE action on a written argument and the first open
+   at one action on a mapped clause chain, is banked as-is or pushed further.
+3. If pushed: the named moves are (i) the HAND-PROOF route (item 59) applied to
+   `leader_completeness` @ `commitEntry`, whose VC has no surviving counterexample at 300 s, and
+   (ii) a fresh holder-supply argument for the strict half — NOT T38/T43, both refuted.
+   **MODEL-EDIT-5 remains PREPARED, NOT REQUESTED**; nothing this session strengthens the case
+   for it.
+
+`ReconfigCommitSMT.lean` ends the session at **35 `require`s / 11 `assumption`s**,
+`QuorumAdjacency.lean` untouched, its seventeen-witness `#print axioms` audit still covering
+the bundle. Everything added is ghost-and-clause only. **Never `proofs/`; nothing here is the
+record.**
+
+## S8.9 Reproduction
+
+```
+cd /home/claude/veil-spike/veil-preview
+# the bundle, per action (criterion A):
+python3 /home/claude/veil-spike/runs/make_act.py becomeLeader 60 S8
+bash /home/claude/veil-spike/runs/runmod.sh ReconfigCommitSMTActbecomeLeaderS8 <log>
+# a slice (criterion B) — model verbatim, invariant conjunction cut, hypothesis set explicit:
+python3 /home/claude/veil-spike/runs/make_slice.py <Module> <per-VC budget> {inv|<action>} <clause>...
+bash /home/claude/veil-spike/runs/runmod.sh <Module> <log>
+```
+Both generators emit the model VERBATIM apart from the module name, the file-scope
+`veil.smt.timeout` and the check command; each launch in this session was diffed against
+`ReconfigCommitSMT.lean` and the 35/11 count re-verified mechanically before the run.
+ONE Lean process at a time, `memwatch.sh` armed (2.5 GB floor).
+
+## S8.10 `propose` — the (B) route, and the scaling law that makes it work
+
+`propose` has no criterion-(A) verdict and cannot get one on this box: the full bundle was
+killed at 60 s, 20 s AND 5 s per VC (session 7, item 53), so the SOLVER budget is not the lever.
+This session measured the other axis — **bundle size** — and it is decisive:
+
+| slice size | `#check_action propose` | wall |
+|---|---|---|
+| 9 clauses (run 37; it ran all TEN actions, not just `propose`) | **110 ✅ / 0 ❌ / 0 ⏱️** | **77 s** |
+| 10–13 clauses (`PropG2`–`PropG7`, six runs) | 55 ✅ / 5 ❌ / 0 ⏱️ | 55–68 s each |
+| 15 clauses (`PropG3b`) | 14 ✅ / 2 ❌ / 0 ⏱️ | 68 s |
+| 17 clauses (`PropG4b`) | **KILLED, no verdict** | >380 s |
+| 30 clauses (`PropSliceA`) | **KILLED, no verdict** | >1550 s |
+| 55 clauses (full bundle) | **KILLED ×3** | >3300 / >1900 / >2100 s |
+
+**There is a cliff between ~15 and ~17 clauses at this action, not a gradient.** The practical
+rule for extending this bundle: at `propose`, certify in groups of ≤ 13.
+
+**Coverage achieved.** Every slice is the model VERBATIM with the conjunction cut to a recorded
+set, all of whose members are clauses of the full bundle, so each ✅ transfers by antecedent
+weakening. Taking the union of the greens over runs 37 and `PropG2`–`PropG9`:
+
+* ****all 57** of the 55 clauses have a criterion-(B) `propose` verdict with an explicit
+  hypothesis set** — including BOTH safeties (`PropG6`: `election_safety` and
+  `leader_completeness` are ✅ at `propose`).
+* Nothing is left resting on the run-16 + ghost-extension transfer at this action: the union of slice greens was checked mechanically at **57 of 57**.
+* The five ❌ in the first six groups are ordinary SLICE ARTIFACTS — each of those clauses is ✅
+  at `propose` in ANOTHER group that carries its supports (`cand_cfg_frozen` in `PropG3`,
+  `adopted_reach_bound` in `PropG2`), or in run 16's full bundle. **A slice ❌ transfers in
+  neither direction** (amendment (B)), and none of them is quoted as a verdict.
+
+Hypothesis sets, per run, are recorded in the ledger (item 66) and are reproducible from the
+generator invocation: `make_slice.py <Module> 20 propose <clause>...`.
+
+
+## S8.12 One bookkeeping note the gate must see
+
+Runs 38/41/42 measured the bundle at **53 invariants + 2 safeties**. T39/T40 were added AFTER
+them, in response to run 41's CTI, taking the bundle to **55 + 2**. Those three runs' greens
+therefore carry the same antecedent-weakening transfer the rest of the arc uses (`Inv_new →
+Inv_old`), and T39/T40 have their own verdicts at all ten actions + init from **run 44**
+(44 ✅ / 0 ❌ / 0 ⏱️, 51 s, hypothesis set `propafter_holds`, `cfgbacked_committed`,
+`pending_iff_proposal`). Nothing else in the dossier is affected, and the count is still
+**35 `require`s / 11 `assumption`s**.

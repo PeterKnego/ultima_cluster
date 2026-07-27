@@ -1,0 +1,179 @@
+⚠ [711/1209] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1209] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1209] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+✖ [1418/1418] Building Examples.UC.T38ProbeCC2 (104s)
+trace: .> LEAN_PATH=/home/claude/veil-spike/veil-preview/.lake/packages/cvc5/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Cli/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/batteries/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Qq/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/aesop/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/proofwidgets/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/importGraph/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/plausible/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/mathlib/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/auto/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/smt/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Loom/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/build/lib/lean /home/claude/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /home/claude/veil-spike/veil-preview/Examples/UC/T38ProbeCC2.lean -o /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/T38ProbeCC2.olean -i /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/T38ProbeCC2.ilean -c /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/T38ProbeCC2.c --setup /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/T38ProbeCC2.setup.json --json
+error: Examples/UC/T38ProbeCC2.lean:694:0: The following set of actions must preserve the invariant and successfully terminate:
+  commitCfg
+    doesNotThrow ... ✅
+    election_safety ... ✅
+    leader_completeness ... ✅
+    commit_backed ... ✅
+    commit_quorum_sound ... ✅
+    holder_grants_are_covered ... ✅
+    commit_leader_evidence ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    gotE_bounded ... ✅
+    cfg_from_genesis ... ✅
+    proposal_is_own_cfg ... ✅
+    adopters_not_behind ... ✅
+    adopted_reach_bound ... ✅
+    committed_cfg_quorum ... ✅
+    pending_iff_proposal ... ✅
+    commitq_gotE ... ✅
+    chain_committed_below ... ✅
+    commit_cfg_backed ... ✅
+    commit_leader_at_commit_cfg ... ✅
+    commitq_witness ... ✅
+    commitq_grant_covers_reach ... ✅
+    commit_leader_frozen_reach ... ✅
+    cfgpred_succ ... ✅
+    proposal_seen ... ✅
+    cfg_seen_adopted ... ✅
+    cfg_seen_committed ... ✅
+    adopted_holds ... ✅
+    cfgq_witness ... ✅
+    cfgq_holders ... ✅
+    propafter_holds ... ✅
+    cfgbacked_committed ... ✅
+    commit_leader_prop_after ... ✅
+    committed_above_backed ... ❌
+      Counterexample (WP):
+        Theory:
+          cfgLt = [[1, 0]]
+          cmember = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          genesisC = 1
+          qmember = [[1, 0]]
+          quorumOf = [[0, 0], [0, 1]]
+          succCfg = [[1, 0]]
+          tot.le = [[0, 0], [0, 1], [1, 1]]
+          tot.zero = 0
+        Pre-state:
+          candidate = []
+          cfgAt = [[0, 0], [1, 0]]
+          cfgBacked = []
+          cfgCommitTerm = [[0, 0], [1, 0]]
+          cfgCommitted = []
+          cfgOf = [[0, 0], [1, 0]]
+          cfgPred = [[0, 1], [1, 1]]
+          cfgQ = [[0, 0], [1, 0]]
+          cfgSeen = [0]
+          commitCfgid = 1
+          commitElecCfg = 1
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 1
+          curTerm = [[0, 1], [1, 0]]
+          elecCfg = [[0, 0], [1, 0]]
+          elecQuorum = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[1, 0]]
+          hasProposal = [0]
+          hasVoted = []
+          holdsE = [1]
+          isCommitLeader = [1]
+          leader = []
+          pending = [0]
+          propAfterE = []
+          proposedC = [[0, 0], [1, 1]]
+          reachAt = [[0, 0, 0], [0, 1, 0], [1, 0, 1], [1, 1, 0]]
+          reqVote = []
+          voteCand = [[0, 0], [1, 0]]
+          voteMsg = [[[0, 0], 1], [[0, 1], 0], [[0, 1], 1], [[1, 0], 0], [[1, 1], 0], [[1, 1], 1]]
+          voteTerm = [[0, 0], [1, 0]]
+        Action: commitCfg(i=0, q=0)
+      Counterexample (TR):
+        Theory:
+          cfgLt = [[0, 1]]
+          cmember = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          genesisC = 0
+          qmember = [[1, 0]]
+          quorumOf = [[0, 0], [0, 1]]
+          succCfg = [[0, 1]]
+          tot.le = [[0, 0], [0, 1], [1, 1]]
+          tot.zero = 0
+        Pre-state:
+          candidate = [0, 1]
+          cfgAt = [[0, 1], [1, 0]]
+          cfgBacked = []
+          cfgCommitTerm = [[0, 1], [1, 0]]
+          cfgCommitted = []
+          cfgOf = [[0, 1], [1, 1]]
+          cfgPred = [[0, 0], [1, 0]]
+          cfgQ = [[0, 0], [1, 0]]
+          cfgSeen = [1]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 1
+          curTerm = [[0, 1], [1, 1]]
+          elecCfg = [[0, 0], [1, 0]]
+          elecQuorum = [[0, 0], [1, 0]]
+          gotEAt = [[0, 1], [1, 0]]
+          hasAdopted = [[1, 0]]
+          hasProposal = [0]
+          hasVoted = [0, 1]
+          holdsE = [1]
+          isCommitLeader = [1]
+          leader = [1]
+          pending = [0]
+          propAfterE = [1]
+          proposedC = [[0, 1], [1, 0]]
+          reachAt = [[0, 0, 1], [0, 1, 0], [1, 0, 0], [1, 1, 1]]
+          reqVote = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          voteCand = [[0, 0], [1, 1]]
+          voteMsg = [[[0, 0], 1], [[0, 1], 0], [[0, 1], 1], [[1, 1], 0], [[1, 1], 1]]
+          voteTerm = [[0, 1], [1, 0]]
+        Action: commitCfg(i=0, q=0)
+        Post-state:
+          candidate = [0, 1]
+          cfgAt = [[0, 1], [1, 0]]
+          cfgBacked = []
+          cfgCommitTerm = [[0, 1], [1, 1]]
+          cfgCommitted = [1]
+          cfgOf = [[0, 1], [1, 1]]
+          cfgPred = [[0, 0], [1, 0]]
+          cfgQ = [[0, 0], [1, 0]]
+          cfgSeen = [1]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 1
+          curTerm = [[0, 1], [1, 1]]
+          elecCfg = [[0, 0], [1, 0]]
+          elecQuorum = [[0, 0], [1, 0]]
+          gotEAt = [[0, 1], [1, 0]]
+          hasAdopted = [[1, 0]]
+          hasProposal = []
+          hasVoted = [0, 1]
+          holdsE = [1]
+          isCommitLeader = [1]
+          leader = [1]
+          pending = []
+          propAfterE = [1]
+          proposedC = [[0, 1], [1, 0]]
+          reachAt = [[0, 0, 1], [0, 1, 0], [1, 0, 0], [1, 1, 1]]
+          reqVote = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          voteCand = [[0, 0], [1, 1]]
+          voteMsg = [[[0, 0], 1], [[0, 1], 0], [[0, 1], 1], [[1, 1], 0], [[1, 1], 1]]
+          voteTerm = [[0, 1], [1, 0]]
+warning: Examples/UC/T38ProbeCC2.lean:694:0: Trusting SMT solver for 32 goals. `set_option veil.smt.trust false` to enable proof reconstruction.
+error: Lean exited with code 1
+Some required targets logged failures:
+- Examples.UC.T38ProbeCC2
+error: build failed
+EXIT=1 WALL=106s
