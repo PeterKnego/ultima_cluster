@@ -1871,3 +1871,52 @@ with the STRICT bound supplied by T12 on the new leader's side and T14(iii) on t
 leader's) + adjacency + T13/T3 contradicts the strict step. Any meeting member then grants to
 both at `committedTerm`, so `grant_uniq` (with `self_vote`/`grant_state` for the `V = I` and
 `V = cl` corners) forces the new leader to BE the commit leader, which holds E.
+
+#### 33. TASK 1 — THE SAME-TERM GRANT CORNER: the fix is NOT a grant-time ghost
+The session's map said "freeze the config at grant time (the `gotEAt`/`cfgAt`-family pattern;
+ghost-only)". **Written truth analysis says that ghost does not close it, and names what
+does.** A grant-time ghost `grantCfgT V T := cfgOf V` would give
+`voteMsg V C T → ¬ cfgLt (cfgOf C) (grantCfgT V T)`, which is TRUE and preserved — but it is
+**not violated by run 16's CTI**: the model genuinely permits node 2 to grant to a genesis
+candidate while at genesis and THEN adopt a higher config at the SAME term (`adopt` requires
+only `tot.le (curTerm j) (curTerm i)`, and the proposer sits at that term). The solver simply
+picks `grantCfgT 2 T = cfg0`, satisfies the new clause, and keeps the CTI. **The voter's side
+of that CTI is legal behaviour; the LEADER's side is not.** Run 16's pre-state has the
+incumbent leader (node 1) with `elecCfg 1 = cfgOf 1 = cfg1` and `reachAt 1 cfg1 = curTerm 1`
+— it reached its own ELECTION config at the very term it was elected in, which
+`startElection`'s strict bump makes unreachable. That is T12 (`leader_reach_strict`), and it
+is also what T8's chain needs to instantiate `reach_quorum_below` at the winner with a
+STRICT bound. **Task 1's answer: a clause, not a ghost — no new state at all.**
+
+#### 34. TASK 2 — A TRACTABLE `role_positive_term`: T12 SUBSUMES IT (encoding recorded)
+`role_positive_term` = `(candidate I ∨ leader I) → tlt tot.zero (curTerm I)` cost ~7 h
+(run 15) because it is the first clause to put `tot.zero` into every VC's hypothesis set.
+**T12 at `C := genesisC` yields it without naming `tot.zero` at all:** `reachAt I genesisC`
+is never written by either `reachAt` writer (both stamp only configs STRICTLY ABOVE the
+mover's current config, and `genesis_least` puts genesis below every config), so it sits at
+`tot.zero` from `after_init`; T12 gives `reachAt I genesisC < curTerm I`, and the theory's
+`zero_le` closes `tot.zero < curTerm I`. This is the "restate over an existing bounded ghost"
+option of the map, and it needs no clause of its own — it is an instance of one already
+wanted for task 1.
+
+#### 35. **THE COST WALL MOVED, AND IT IS NOT WHERE RUN 15 PUT IT** (three killed runs)
+* **RUN 17** — T12 in its ∀C form (`((candidate I ∨ leader I) ∧ ¬ cfgLt (elecCfg I) C) →
+  tlt (reachAt I C) (curTerm I)`), clause-only, 35/11 verified before launch:
+  **KILLED at 29m42s (RSS 7.58 GB), NO VERDICT**, under the item-28 3x-wall rule
+  (run 16 = 10 min). Log `smt-run17-KILLED-3x-no-verdict.log`.
+* **RUN 18** — the BISECTION: the same clause at the only two instances its consumers use
+  (`C := elecCfg I` and `C := genesisC`), no quantified `C`, no instantiation search:
+  **KILLED at 30m47s (RSS 7.62 GB), NO VERDICT.** Log `smt-run18-KILLED-3x-no-verdict.log`.
+  **So the quantified `C` is NOT the cost** — the ground form is not measurably cheaper.
+* **RUN 19** — the diagnostic that should have bounded it: `veil.smt.timeout` lowered
+  60 s → **12 s** (the option is `Veil/Base.lean:140`; a proof found at 12 s is still a
+  proof, and every VC that does not close is reported ⏱️ = OPEN under the session-5
+  protocol, so greens from this configuration remain quotable). Same trajectory: 31 min,
+  RSS 7.60 GB, still buffering.
+* **WHAT THE THREE RUNS TOGETHER SAY.** A per-VC solver bound does not bound the run, and
+  the RSS curve is a smooth climb rather than a plateau — so the cost of this clause is
+  **not** in the solver but upstream of it, in VC generation/elaboration. That is a
+  DIFFERENT wall from item 28's (which the 60 s × N arithmetic explained exactly), and it
+  means "add one clause at a time and watch the wall" is necessary but no longer
+  sufficient: at this bundle size a single clause mentioning role state in a strict term
+  conclusion can make the run unfinishable regardless of the solver budget.
