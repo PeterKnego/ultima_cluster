@@ -532,3 +532,73 @@ model edit.**
 session opens on the `cfgAt` hole with no new mechanism expected. Gate 2 must audit
 ledger items 19-21 and the chain-order assumption package, and the final claim must
 carry the conditionality of S2.7 verbatim.
+
+---
+
+# Session 2, part 3 — post-gate-1b: recording debts, the cfgAt step, close
+
+Gate 1b: no stop-the-arc Rust finding; edits 19-21 APPROVED; run-8 greens STAND in
+their declared conditional form. A **process breach was confirmed** — runs 6-8 were
+built on three unaudited edits — and the rule is now a COUNT: any new `require` or
+assumption stops the session for a gate before another run is banked. Adopted.
+
+## S2.12 Recording debts — all five discharged
+
+- **(n3) added to both model headers and ledger items 19/20**: MODEL-EDIT-2c makes
+  adoption forward-only, but real UC moves the adopted config BACKWARD in exactly one
+  place — the M7 truncation revert (`election.rs:703-748`). Those are the
+  config-BRANCH states, which EDIT-2b's linearity also excludes. Item 19's claim is
+  **sharpened**: UC linearizes config history only for the CANONICAL history — across
+  branches two configs can share a `version`, which is exactly why the forward gate is
+  a version COMPARISON, not a global order (so the gate is not independent evidence
+  for linearity).
+- **Item 20 primary anchor amended** to the version gate `election.rs:751-756` +
+  `config.rs:133` (bump by one); archive position-order now supporting; snapshot fiat
+  adoption verified forward via its `durable < floor` gate.
+- **Item 21 primary reassigned to `config_pending()`** (`election.rs:854-858`,
+  enforced `:879-881`) — the literal abstraction of the model's require, blocking the
+  same-leader path; `serving` is complementary, blocking the new-leader path.
+- **Axiom audit completed**: `#print axioms` now covers all seventeen witness
+  theorems including the three newest; all clean; banked in
+  `proofs-veil/logs/quorumadjacency-axioms.log`. The claim is now mechanically backed.
+- **Twin divergence list completed**: FOUR SMT-only mechanisms, not one — (d1) EDIT-1,
+  (d2) EDIT-2b linear history, (d3) EDIT-2c forward-only adoption, (d4) EDIT-3
+  cluster-wide one-in-flight. All over-approximate in the twin.
+
+## S2.13 The cfgAt step — applied, compliant, not yet closed
+
+Ghost + clauses only; **mechanically verified: 35 `require`s and 11 assumptions in both
+the banked run-8 model and this one.** `cfgAt N` mirrors `gotEAt`; `elecCfg` is now
+frozen from CANDIDACY (sound: a candidate's config cannot move — `adopt` clears
+candidacy, `propose` requires `leader`).
+
+**The gate's correction to my diagnosis is confirmed**: both holes were real. The
+granter-advanced-after-granting shape needed `cfgAt`; the `V = i` disjunct needed
+`elecCfg` frozen from candidacy plus `cand_cfg_frozen`/`role_exclusive`.
+
+Two findings from the attempt:
+
+1. **`eleccfg_not_stale` was FALSE as stated — a defect in my invariant, not the
+   model.** A stale leader is legal in UC (no check-quorum step-down), so a leader
+   elected under an old config keeps its flag while later configs commit. The property
+   is about TERMS; replaced by the term-conditioned `no_stale_election`.
+2. **The ordering bound cannot ride on `committed_cfg_quorum`** — strengthening it
+   with `cfgAt V ≤ cfgCommitTerm D` broke a previously inductive clause, because an
+   adopter's `cfgAt` RISES when it later moves further along the chain. The fact the
+   argument needs is per-(node, config) — "the term at which V FIRST reached D or
+   later" — and needs its own ghost. Reverted.
+
+**Run 10: 343 ✅ / 9 ❌ — 26 clauses inductive (up from 22), but P2 regressed from 1
+CTI to 2** and the template clause `grant_cfg_covered` is not yet inductive. Net:
+more machinery certified, the target not closer. Run 8 remains the reference for P2's
+CTI count; run 10 is what the file carries. The regression's likely source —
+`elecCfg` now written at `startElection` as well as `becomeLeader`, changing what
+`commitElecCfg` snapshots in non-reachable pre-states — is UNDIAGNOSED.
+
+## S2.14 Disposition
+
+**Session close, past the ~5-hour bound. Not certification, not a wall.** The residue
+is still the single stale-config-election argument, now with two named sub-obligations
+(the per-(node,config) reach ghost; the run-10 P2 regression). Gate-2 scope as
+directed: (n1)+(n2)+(n3) verbatim in the final conditionality, and the (d1)-(d4)
+divergence list complete — both are now written into the model headers.

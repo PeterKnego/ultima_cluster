@@ -254,3 +254,6 @@ end UcQuorumAdjacency
 #print axioms UcQuorumAdjacency.l_succ_functional
 #print axioms UcQuorumAdjacency.l_adjacent_cfg_intersection
 #print axioms UcQuorumAdjacency.l_succ_shape
+#print axioms UcQuorumAdjacency.l_genesis_least
+#print axioms UcQuorumAdjacency.l_succ_immediate
+#print axioms UcQuorumAdjacency.l_cfglt_connected

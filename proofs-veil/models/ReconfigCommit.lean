@@ -18,15 +18,28 @@ import Veil
        `cfg` conflates HOLDING a config entry with having ADOPTED it (in Rust a
        candidate can be durable past a newer config frame — so `log_ok` grants —
        while its adopted config lags until the archive re-scan, election.rs:889-899).
+       A third, (n3): the SMT twin's forward-only adoption + linear config history
+       exclude the TRUNCATION-REVERT branch states (election.rs:703-748 moves the
+       adopted config BACKWARD when truncation removes the frame behind it); UC's
+       config history is linear only for the CANONICAL history — across branches two
+       configs can share a `version`, which is why the forward gate at :751-756 is a
+       version comparison, not a global order.
        ** CONSEQUENCE: any SAFE verdict from this plane is CONDITIONAL — on the
        canonical-prefix/contiguity discipline (Q2, CONFIRMED-SAFE in Rust) and on the
        data-plane freshness / Finding-#6b `new_term_pos` clamp (proved at the Lean
        tier). It is never an unconditional claim. **
-   (2) MODEL-EDIT-1 (own-term-stamped commit reports) is APPLIED IN THE SMT TWIN ONLY,
-       deliberately NOT here: it needs a per-node acquisition-term function, a ~x27
-       state multiplier at Fin 3 that is past this box's explicit-state envelope. This
-       model therefore OVER-approximates the proof model (strictly more behaviours) —
-       the sound direction for its job, which is CE calibration, not assurance.
+   (2) TWIN <-> SMT DIVERGENCE LIST (complete, as of session 2 close). FOUR mechanisms
+       live in the SMT proof model ONLY; this model has none of them, so it strictly
+       OVER-approximates the proof model — more behaviours, the sound direction for a
+       CE calibrator, and the reason a clean verdict here is weaker than one there:
+         (d1) MODEL-EDIT-1, own-term-stamped commit reports. Omitted deliberately: a
+              per-node acquisition-term function is a ~x27 state multiplier at Fin 3,
+              past this box's explicit-state envelope.
+         (d2) MODEL-EDIT-2b, linear config history (`cfglt_total`). Here the config
+              order is the concrete strict-subset relation, which is only partial.
+         (d3) MODEL-EDIT-2c, forward-only adoption (the version gate).
+         (d4) MODEL-EDIT-3, cluster-wide one-in-flight (`config_pending`): this model
+              keeps session 1's PER-NODE `pending i` only.
    (3) `proposeAdd` is knob-gated OFF (addEnabled) for the re-runs: strict-subset is a
        valid config order only on a remove-only chain. Both calibration traces are
        remove-only, so this cannot destroy them.

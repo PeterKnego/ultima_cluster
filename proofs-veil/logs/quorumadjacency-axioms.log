@@ -1,0 +1,79 @@
+⚠ [595/595] Built Examples.UC.QuorumAdjacency (1.9s)
+warning: Examples/UC/QuorumAdjacency.lean:56:0: automatically included section variable(s) unused in theorem `UcQuorumAdjacency.quorum_member_sound_concrete`:
+  [DecidableEq V]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq V] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Examples/UC/QuorumAdjacency.lean:98:0: automatically included section variable(s) unused in theorem `UcQuorumAdjacency.succ_shape_concrete`:
+  [DecidableEq V]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq V] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Examples/UC/QuorumAdjacency.lean:104:0: automatically included section variable(s) unused in theorem `UcQuorumAdjacency.self_is_quorum`:
+  [DecidableEq V]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq V] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Examples/UC/QuorumAdjacency.lean:143:0: automatically included section variable(s) unused in theorem `UcQuorumAdjacency.i_quorum_member_sound`:
+  [DecidableEq V]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq V] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Examples/UC/QuorumAdjacency.lean:150:0: automatically included section variable(s) unused in theorem `UcQuorumAdjacency.i_succ_shape`:
+  [DecidableEq V]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq V] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Examples/UC/QuorumAdjacency.lean:159:0: automatically included section variable(s) unused in theorem `UcQuorumAdjacency.i_cfglt_irrefl`:
+  [DecidableEq V]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq V] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Examples/UC/QuorumAdjacency.lean:162:0: automatically included section variable(s) unused in theorem `UcQuorumAdjacency.i_cfglt_trans`:
+  [DecidableEq V]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq V] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Examples/UC/QuorumAdjacency.lean:165:0: automatically included section variable(s) unused in theorem `UcQuorumAdjacency.i_succ_cfglt`:
+  [DecidableEq V]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq V] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Examples/UC/QuorumAdjacency.lean:186:0: automatically included section variable(s) unused in theorem `UcQuorumAdjacency.l_quorum_member_sound`:
+  [DecidableEq V]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq V] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+warning: Examples/UC/QuorumAdjacency.lean:193:0: automatically included section variable(s) unused in theorem `UcQuorumAdjacency.l_succ_shape`:
+  [DecidableEq V]
+consider restructuring your `variable` declarations so that the variables are not in scope or explicitly omit them:
+  omit [DecidableEq V] in theorem ...
+
+Note: This linter can be disabled with `set_option linter.unusedSectionVars false`
+info: Examples/UC/QuorumAdjacency.lean:243:0: 'UcQuorumAdjacency.adjacent_cfg_intersection' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:244:0: 'UcQuorumAdjacency.same_cfg_intersection' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:245:0: 'UcQuorumAdjacency.i_adjacent_cfg_intersection' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:246:0: 'UcQuorumAdjacency.i_cfglt_irrefl' depends on axioms: [propext, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:247:0: 'UcQuorumAdjacency.i_cfglt_trans' depends on axioms: [propext, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:248:0: 'UcQuorumAdjacency.i_succ_cfglt' depends on axioms: [propext, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:249:0: 'UcQuorumAdjacency.i_succ_shape' depends on axioms: [propext, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:250:0: 'UcQuorumAdjacency.i_same_cfg_intersection' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:251:0: 'UcQuorumAdjacency.i_quorum_member_sound' depends on axioms: [propext, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:252:0: 'UcQuorumAdjacency.i_succ_inhabited' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:253:0: 'UcQuorumAdjacency.l_cfglt_total' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:254:0: 'UcQuorumAdjacency.l_succ_functional' depends on axioms: [propext, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:255:0: 'UcQuorumAdjacency.l_adjacent_cfg_intersection' depends on axioms: [propext, Classical.choice, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:256:0: 'UcQuorumAdjacency.l_succ_shape' depends on axioms: [propext, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:257:0: 'UcQuorumAdjacency.l_genesis_least' depends on axioms: [propext]
+info: Examples/UC/QuorumAdjacency.lean:258:0: 'UcQuorumAdjacency.l_succ_immediate' depends on axioms: [propext, Quot.sound]
+info: Examples/UC/QuorumAdjacency.lean:259:0: 'UcQuorumAdjacency.l_cfglt_connected' depends on axioms: [propext, Quot.sound]
+Build completed successfully (595 jobs).

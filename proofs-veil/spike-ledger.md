@@ -1020,3 +1020,97 @@ Reached the time bound with the induction converged onto a single open argument 
 witness migration) that are UNAUDITED.** Gate 2 must audit those before the final claim.
 Every assumption added is proved of witness W2 in `QuorumAdjacency.lean` (`#print axioms`
 clean), so the bundle remains satisfiable and no verdict above is vacuous.
+
+#### GATE 1b RULED — edits 19-21 APPROVED; run-8 greens STAND (conditional form)
+No stop-the-arc Rust finding. The EDIT-3 chain was verified link-by-link in the code,
+and the pre-edit CE was confirmed not-a-real-bug (doubly unreachable: `ChangePending`
+on the adopted `config_position` AND `serving` forcing C1 committed first).
+**PROCESS BREACH CONFIRMED AND CORRECTED:** runs 6-8 were built on three unaudited
+edits. No contamination (ledger-first + checkpoint-not-certification labeling), but the
+rule is now a COUNT, not a judgment call — **any new `require` or assumption beyond the
+gate-1b-audited set stops the session for a gate before another `#check_invariants` run
+is banked.** Ghost state stays exempt only while it passes the no-`require` test.
+"Sanctioned in spirit by a prior gate" is not a category. Recorded and adopted.
+
+**RECORDING DEBTS DISCHARGED (gate-1b required):**
+* **(a) NARROWING (n3) — truncation-revert / config-branch exclusion.** Added to BOTH
+  model headers and to items 19/20. MODEL-EDIT-2c makes adoption forward-only; real UC
+  moves the adopted config BACKWARD in exactly one place — `election.rs:703-748`, the
+  M7 truncation revert (`to < config_position` ⇒ revert one history level, or keep the
+  config by fiat on a wipe). Those are the CONFIG-BRANCH states, which MODEL-EDIT-2b's
+  linearity assumption also excludes. **Item 19's claim is hereby sharpened: UC
+  linearizes config history only for the CANONICAL history** — across branches two
+  configs can share a `version`, which is exactly why the forward gate is a version
+  COMPARISON (`:751-756`) and not a global order. The version gate itself relies on
+  linearity; it is not independent evidence for it.
+* **(b) ITEM 20 primary anchor amended** to the VERSION GATE `election.rs:751-756`
+  (`ConfigObserved` returns early on `config.version <= self.config.version`) plus
+  `config.rs:133` (`next.version += 1`, bump by exactly one). The archive's
+  position-ordered recorded-block walk is now cited as SUPPORTING, and snapshot fiat
+  adoption was verified forward via its `durable < floor` gate.
+* **(c) ITEM 21 supplementary anchor added, and the primary reassigned.** The model's
+  `require cfgOf i = genesisC ∨ cfgCommitted (cfgOf i)` is the LITERAL abstraction of
+  **`config_pending()` — `config_position > commit_seen` (election.rs:854-858),
+  enforced at `:879-881`** — which blocks the SAME-leader C1→C2 path. `serving`
+  (`:876-878`) is COMPLEMENTARY: it blocks the NEW-leader path. `config_pending` is
+  now cited primary.
+* **(d) AXIOM AUDIT COMPLETED.** The `#print axioms` block now covers all seventeen
+  witness theorems, including the three newest (`l_genesis_least`, `l_succ_immediate`,
+  `l_cfglt_connected`). All clean — `[propext, Classical.choice, Quot.sound]` or less
+  (`l_genesis_least`: `[propext]` alone). Banked: `logs/quorumadjacency-axioms.log`.
+  The "clean" claim is now mechanically backed, not asserted.
+* **(e) TWIN DIVERGENCE LIST COMPLETED** in `ReconfigCommit.lean`'s header — FOUR
+  SMT-only mechanisms, not one: (d1) EDIT-1 own-term-stamped reports, (d2) EDIT-2b
+  linear config history, (d3) EDIT-2c forward-only adoption, (d4) EDIT-3 cluster-wide
+  one-in-flight (the twin keeps session 1's per-node `pending i`). All four
+  over-approximate in the twin — sound for its calibrator role, and the reason a clean
+  verdict there is strictly weaker than one in the SMT model.
+
+#### THE cfgAt STEP (gate ruling 3) — template applied, NOT yet closed
+Ghost state + clauses ONLY. Mechanically verified against the banked run-8 model:
+**35 `require`s and 11 assumptions in both** — no new guard, no new assumption, so the
+gate-1b corrective is satisfied and these runs are bankable.
+* Ghosts added: `cfgAt N` (term of N's last config change — the `gotEAt` mirror; `adopt`
+  requires `curTerm j <= curTerm i`, so a grant at a term strictly above `cfgAt V`
+  postdates V's adoption) and `cfgCommitTerm C`. `elecCfg` is now frozen from
+  CANDIDACY (set at `startElection`), which is sound because a candidate's config
+  cannot move: `adopt` clears candidacy and `propose` requires `leader`.
+* **The gate's correction to my diagnosis is confirmed in the model.** Both holes were
+  real and both had to be addressed: the granter-advanced-after-granting shape (fixed by
+  `cfgAt` + `grant_cfg_covered`) and the `V = i` disjunct (which needed `elecCfg`
+  frozen from candidacy plus `cand_cfg_frozen` + `role_exclusive`).
+23. **`eleccfg_not_stale` WAS FALSE AS STATED — my own proof sketch, corrected.**
+    A STALE LEADER IS LEGAL in UC: there is no check-quorum step-down (elle gate doc),
+    so a leader elected under an old config keeps its flag while the cluster commits
+    later configs. The property is about TERMS, not the leader flag. Replaced by
+    `no_stale_election`: `leader I ∧ cfgCommitted D ∧ cfgCommitTerm D < curTerm I →
+    ¬ cfgLt (elecCfg I) D`. (Not a model defect — a defect in the invariant I wrote.)
+24. **RUN-9 FINDING — the ordering bound cannot ride on `committed_cfg_quorum`.**
+    Strengthening it with `tot.le (cfgAt V) (cfgCommitTerm D)` BROKE a previously
+    inductive clause (3 new CTIs at propose/adopt/commitCfg): an adopter's `cfgAt`
+    RISES when it later moves further along the chain, so the bound is not preserved.
+    The fact the argument needs is per-(node, config) — "the term at which V FIRST
+    reached D or later" — and needs its own ghost. Reverted; recorded in the model.
+
+| run | content | verdict |
+|---|---|---|
+| 9 | cfgAt template, first cut | 305 ✅ / 14 ❌ (3m30s) — 4 regressions, all (a)-class |
+| 10 | + `role_exclusive`, `reqvote_term_reached`, `vote_term_reached`, bound reverted | **343 ✅ / 9 ❌** (5m41s) |
+
+**RUN 10 vs RUN 8, honestly: 26 clauses inductive (up from 22) but P2 regressed from 1
+CTI to 2** (`commitEntry` returned), and the template clause `grant_cfg_covered` is
+itself not yet inductive (1 CTI at the grant arm). Net: more machinery certified, the
+target not closer. Both logs are banked; **run 8 remains the reference state for P2's
+CTI count**, run 10 is the state carried in the file (strictly more clauses + the
+template). The P2 regression's likely source — `elecCfg` now being written at
+`startElection` as well as `becomeLeader`, which changes what `commitElecCfg` snapshots
+in non-reachable pre-states — is UNDIAGNOSED and is the next session's second task.
+
+#### SESSION-2 CLOSE (past the ~5-hour bound)
+Not certification, not a wall: the residue is still the single stale-config-election
+argument, now with two named sub-obligations (the per-(node,config) reach ghost of item
+24; the run-10 P2 regression). Open clauses: `election_safety` (1),
+`leader_completeness` (2), `grant_cfg_covered` (1), `no_stale_election` (2),
+`electable_cfgs_contain_holder` (3). Gate-2 scope, as directed: the final conditionality
+wording must carry (n1)+(n2)+(n3) verbatim, and the twin<->SMT divergence list (d1)-(d4)
+must be complete at close — both are now written into the model headers.
