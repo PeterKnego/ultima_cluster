@@ -913,3 +913,70 @@ Next session, in order: (1) the grant-time config ghost for the same-term wrinkl
 (2) a cheaper encoding of "no role at the zero term"; (3) the cross-config HOLDER supply
 for P2@`becomeLeader` — the one place a new mechanism may genuinely be needed, and hence
 the likeliest next gate request; (4) gate 2 only when all three land.
+
+---
+
+# Session 5 (bar 3, part 5) — the ⏱️ protocol, and a cost wall that moved
+
+**Date:** 2026-07-27. Worktree `.claude/worktrees/uc2-veil-commit-plane` (from `3bfb6f9`).
+Runs in `/home/claude/veil-spike/veil-preview`, logs `/home/claude/veil-spike/runs/`.
+Full detail in `proofs-veil/spike-ledger.md` §SESSION 10 (items 32–37).
+
+## S5.1 The controller finding — item 29's "tool anomaly" is dissolved
+
+Session 4 retracted run 14's `election_safety` ✅ and left "how did the tool produce an
+unsound ✅" as a gate-2 question. **The answer is that it never did.** Veil prints a THIRD
+verdict marker — **⏱️, one per timed-out VC** — which the headline tally does not surface:
+
+```
+smt-run14-elecq-carrier.log:408-411
+  election_safety ... ⏱️
+    Exceptions:
+      becomeLeader_election_safety_0_WP, becomeLeader_election_safety_tr_0_TR
+        unable to prove goal. Try providing more hints. Reason: TIMEOUT
+```
+
+A full audit of every banked log — re-verified mechanically this session with
+`grep -c "⏱️"` — finds **exactly three ⏱️ VCs in the whole arc**: run 12
+(`leader_completeness`), run 13 (`leader_completeness`), run 14 (`election_safety`). Runs 8,
+11 and 16 are timeout-clean.
+
+**Binding protocol from here: a ⏱️ VC is an OPEN verdict — not a green, not a red.** Every
+run is grepped for ⏱️ before it is banked, the count is quoted alongside the others
+(**"N ✅ / M ❌ / K ⏱️"**), and any clause carrying one is OPEN regardless of the tally.
+Corrections that follow: runs 12/13's "P2 at 1 CTI" was **1 CTI + 1 ⏱️**; run 14's
+`election_safety` was never green, so the session-4 retraction stands with a corrected
+cause; **run 16 (470 ✅ / 3 ❌ / 0 ⏱️) is timeout-clean and remains the baseline.** No tool
+distrust is warranted, and the gate-2 investigation item is dissolved.
+
+## S5.2 Tasks 1 and 2 — one clause answers both, and it is not the clause the map predicted
+
+The map called for a **grant-time config ghost**. Written analysis says that ghost does not
+close the CTI: the model genuinely permits a voter to grant while at config X and then adopt
+a higher config at the SAME term (`adopt` requires only `tot.le (curTerm j) (curTerm i)`), so
+the solver satisfies any grant-time clause and keeps the counterexample. **The voter's side
+of run 16's CTI is legal; the leader's side is not** — the incumbent has
+`reachAt 1 (elecCfg 1) = curTerm 1`, i.e. it reached its own ELECTION config at the very term
+it was elected in, which `startElection`'s strict bump forbids. The fix is therefore a
+CLAUSE, not a ghost, and it adds no state:
+
+> **T12 `leader_reach_strict`** — `((candidate I ∨ leader I) ∧ ¬ cfgLt (elecCfg I) C) →
+> tlt (reachAt I C) (curTerm I)`
+
+and **task 2 falls out of it for free**: at `C := genesisC` (antecedent free by
+`genesis_least`, and `reachAt N genesisC` is never written by either writer, so it sits at
+`tot.zero`) T12 plus `zero_le` IS `role_positive_term` — the ~7 h clause of run 15 — without
+putting `tot.zero` into every VC's hypothesis set. That is the "restate over an existing
+bounded ghost" option, and it costs no clause of its own.
+
+## S5.3 What actually happened: three runs, no verdict
+
+| run | change | outcome |
+|---|---|---|
+| 17 | T12, ∀C form (clause-only, 35/11 verified) | **KILLED 29m42s, RSS 7.58 GB, NO VERDICT** (3×-wall rule; run 16 = 10 min) |
+| 18 | T12 bisected to its two GROUND instances (`C := elecCfg I`, `C := genesisC`) | **KILLED 30m47s, RSS 7.62 GB, NO VERDICT** |
+| 19 | same file, `veil.smt.timeout` 60 s → **12 s** | (see S5.4) |
+
+Run 18 is the informative one: removing the quantified `C` — and with it the solver's
+instantiation search — did **not** measurably help. The cost is the clause's presence in
+every VC's hypothesis set, not its shape.
