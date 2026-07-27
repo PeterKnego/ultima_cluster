@@ -3017,19 +3017,56 @@ an experiment, not a bundle change; T38 is NOT in `ReconfigCommitSMT.lean`.
   real one.
 
 #### 68. **T38 IS REFUTED — a reachable trace, and the corrected form is T43**
-Run 48's CTI is not an artifact. Two nodes, `genesis = C_g`, chain `C_g → D`; terms `t1 < t0`:
+**[CORRECTED 2026-07-27 by the gate-2 corrections session — see the two ⚠ blocks below. The
+conclusion (T38 is false) STANDS; the route to it did not, as first written.]**
+
+⚠ **CORRECTION 1 — what is refuted, and by what.** As first written this item said run 48's
+printed CTI "is not an artifact", i.e. that the printed interpretation is itself reachable. That
+is **wrong**: the printed CTI has `voteMsg = []` together with `hasProposal = [0]`, and in its own
+theory those two exclude node 0 ever having been a leader (no grant of any kind was ever sent, so
+nothing could have elected it), while `propose` requires `leader i`. **The printed CTI is
+unreachable as printed.** The true statement — and the one the rest of this item establishes — is
+that the **CLAUSE T38 is refuted by the corrected legal trace below**, which is a different state
+from the one the solver printed. A refutation of a clause does not require the solver's own
+witness to be reachable; it requires *some* reachable state to falsify it, and that is what the
+trace supplies.
+
+Two nodes, `genesis = C_g`, chain `C_g → D`; terms `t1 < t0`:
 1. node 0 wins term `t1` under genesis and, holding nothing, `propose(0, D)` — both config gates
    pass through their `cfgOf i = genesisC` disjunct (this is T19's stale-leader move again);
    `propAfterE 0 := false`.
 2. node 1 wins term `t0`, `appendEntry(1)`, `commitEntry(1, {1})` — `cfgOf 1 = C_g`, so
    `commitCfgid = C_g`, `committedTerm = t0`, `holdsE = {1}`, `isCommitLeader = {1}`.
-3. node 0's term rises to `t0` (a vote grant does it, and clears its `leader` flag — the CTI has
-   `leader = []`).
+3. **`replicate(1, 0)`** raises node 0's term to `t0`. ⚠ **CORRECTION 2 (gate-2 verified against
+   the model):** as first written this step read "node 0's term rises to `t0` — a vote grant does
+   it". That is **mechanically impossible** in this trace, in either ordering:
+   * **post-propose** — `propose(0, D)` moves the proposer with `cfgOf 0 := D` (`:551`), so node 0
+     now sits at `D`; the only other node, node 1, is at `cfgOf 1 = C_g`. A grant
+     `deliverRequestVoteGrant(j = 0, c = 1, t0)` must clear the config-currency guard
+     `require ¬ cfgLt (cfgOf c) (cfgOf j)` (`:430`) — here `¬ cfgLt C_g D`, which is **FALSE**,
+     since `C_g → D` is exactly the chain step. The guard REFUSES. (With n = 2 there is no third
+     candidate to grant to, so no other grant exists.)
+   * **pre-propose** — a grant at `t0` placed BEFORE step 1 raises node 0's term first, and
+     `:431-432` (`if tlt (curTerm j) t then candidate j := false` / `... leader j := false`) clear
+     node 0's leadership on that same rise. `propose` requires `leader i` (`:504`), so **step 1
+     itself dies** and there is no proposal to commit.
+   **In n = 2 the only legal term-raiser left is `replicate(1, 0)`** (`:464-472`): node 1 is
+   `leader` and `holdsE 1` (step 2), `tot.le (curTerm 0 = t1) (curTerm 1 = t0)` holds, and the
+   action sets `curTerm 0 := t0`, `leader 0 := false` and
+   **`holdsE 0 := true`**. That last write is not a problem for the refutation — it makes node 0
+   an E-HOLDER, but `cfgBacked` records `propAfterE`, and **`propAfterE 0` stays `false`**: it is
+   written ONLY by `propose` (`propAfterE i := holdsE i`, `:555`), which already ran at step 1 when
+   node 0 held nothing. Acquiring E later never retro-backs the proposal.
 4. `adopt(1, 0)` — `tot.le (curTerm 1) (curTerm 0)` holds (both `t0`), the coupling is FREE
    because `¬ propAfterE 0`, forward-only holds. **The E-holder itself adopts the stale
    non-holder's proposal.**
 5. `commitCfg(0, {1})` — `{1}` is a quorum of `D` in this interpretation, and `hasAdopted 1 0` ✓.
    `cfgCommitted D` with **`cfgBacked D = false`**.
+
+**The corrected trace is LEGAL END-TO-END** — every `require` of every step was re-verified
+against `ReconfigCommitSMT.lean` by gate 2 — and the state it reaches satisfies
+`committed ∧ cfgCommitted D ∧ cfgLt commitCfgid D ∧ ¬ cfgBacked D`, i.e. T38's antecedent with
+T38's conclusion false.
 **So T38 is FALSE in a reachable state — the third clause in this family to be refuted rather
 than merely unproved (T24 by T19, its term-guarded repair, now T38).** And the refutation says
 exactly what the map got wrong: `cfgBacked` is SUFFICIENT for "every adopter of D holds E", not
@@ -3043,6 +3080,59 @@ routed through backing. **RUN 49 (`T43Probe`, 120 s): 37 ✅ / 1 ❌ / 0 ⏱️ 
 cheap, true, missing clause — not a hazard and not a UC behaviour. That is a materially better
 statement than "the truth argument does not close": the residue is a clause-only chain, and the
 probe is the instrument that walks it.
+⚠ **CORRECTION 3 (gate-2):** the READING above is SUPERSEDED for the last two probe runs. Runs
+43/47 fit it; runs 48 and 49 do not — their clauses are **refuted by legal traces**, not blocked
+by missing supports, and the residue is therefore **not** a clause-only chain. See the honesty
+note in the dossier's S8.7 and item 69.
+
+#### 69. **T43 IS REFUTED TOO — the adjudication run 49 should have carried, supplied by gate 2**
+
+⚠ **LEDGER-RULE BREACH, LOGGED AS SUCH.** Session 13 banked run 49's `❌` (item 68, last block:
+"RUN 49 (`T43Probe`, 120 s): 37 ✅ / 1 ❌ / 0 ⏱️ — T43 is ❌ too") **with no adjudication of its
+counterexample**. That is a direct breach of the arc's hard rule, in force since F-M7-1 and
+restated at gate 1c: *every `❌` is adjudicated — artifact, model gap, or real — before any
+conclusion is drawn from it.* The conclusion drawn in item 68 ("neither the backing form nor the
+direct all-holder form of the supply is inductive here") was therefore, as banked, an unbacked
+inference from a bare tally. The breach is recorded here rather than quietly repaired: the
+finding stands, but it stood on nothing until gate 2 supplied the trace below.
+
+**THE ADJUDICATION — T43 is refuted by a legal trace (n = 3).** Gate 2 constructed it and
+verified every `require` against `ReconfigCommitSMT.lean` `:562-604` (`adopt` and `commitCfg`).
+Genesis `C_g` has voter set `{0,1}` with `{1}` a quorum; `D` has voter set `{0,1,2}` with `{1,2}`
+a quorum; `succCfg C_g D`; terms `t1 < t0`.
+1. Node 0 wins `t1` under genesis and, holding nothing, `propose(0, D)` — the stale-leader move
+   of T19/item 68, through the `cfgOf i = genesisC` disjunct; `propAfterE 0 := false`,
+   `proposedC 0 = D`, `pending 0`.
+2. **Node 2 adopts EARLY, at the low term:** `adopt(2, 0)` — `2 ≠ 0` ✓; `hasProposal 0` ✓;
+   `tot.le (curTerm 2) (curTerm 0 = t1)` ✓ (node 2 has never moved); the coupling
+   `(¬ propAfterE 0) ∨ holdsE 2` is FREE through its first disjunct ✓; forward-only
+   `¬ cfgLt (proposedC 0 = D) (cfgOf 2 = C_g)` ✓. Node 2 lands at `cfgOf 2 = D`,
+   `curTerm 2 = t1`, `hasAdopted 2 0` — and **`¬ holdsE 2`**: nothing has ever replicated to it.
+3. Node 1 wins `t0` under genesis on `{1}`, `appendEntry(1)`, `commitEntry(1, {1})` — `cfgOf 1 =
+   C_g`, so `commitCfgid = C_g`, `committedTerm = t0`, `holdsE 1`, `isCommitLeader 1`.
+4. **`replicate(1, 0)` raises the proposer** to `t0` (`leader 1` ✓, `holdsE 1` ✓,
+   `tot.le (curTerm 0 = t1) (curTerm 1 = t0)` ✓) — exactly the term-raiser item 68's correction 2
+   identifies as the only legal one. It sets `curTerm 0 := t0`, `holdsE 0 := true`; `propAfterE 0`
+   is untouched (only `propose` writes it) and stays **false**.
+5. **Node 1 adopts:** `adopt(1, 0)` — `tot.le (curTerm 1 = t0) (curTerm 0 = t0)` ✓ (this step is
+   the reason step 4 is needed: before the raise, `t0 ≤ t1` is false and the adopt is illegal);
+   coupling free through `¬ propAfterE 0` ✓; forward-only `¬ cfgLt D C_g` ✓. `hasAdopted 1 0`.
+6. **`commitCfg(0, {1,2})`** — `pending 0` ✓; `quorumOf {1,2} D` ✓ (the interpretation's quorum
+   of `D`); `∀ V ∈ {1,2}, hasAdopted V 0` ✓ (node 2 at step 2, node 1 at step 5). This freezes
+   **`cfgQ D = {1,2}`** and, since `¬ propAfterE 0`, `cfgBacked D := false`; `cfgCommitted D`,
+   `cfgCommitTerm D := t0`.
+
+The reached state has `committed`, `cfgCommitted D`, `cfgLt commitCfgid (= C_g) D` — T43's
+antecedent — and `qmember 2 (cfgQ D)` with **`¬ holdsE 2`**, so T43's conclusion
+`∀ V, qmember V (cfgQ D) → holdsE V` is FALSE. **T43 is refuted in a reachable state**, and the
+mechanism is the one item 68's refutation already exposed, one level down: the frozen adopter
+quorum is frozen at `commitCfg` time, but its members adopted at *different* times, and an
+adopter that came in EARLY, at the stale proposer's low term, need never have received E.
+**So the strict half is genuinely not one clause away.** Neither the proposal-backing form (T38)
+nor the direct all-holder form on the frozen quorum (T43) is inductive here, and — with item 62's
+semantic argument having died with T38 — there is now **no written model-level truth argument on
+file for P2's strict half at all**. That is the honest residue, and it is what the dossier's
+S8.7 honesty note records.
 
 #### SESSION-8 STOP — the ~5-hour checkpoint, and the GATE-2 DOSSIER IS ASSEMBLED
 Gate 2's original precondition (bundle closed, zero ⏱️) is **still not met**, and this session
@@ -3170,3 +3260,67 @@ inspected; (ii) the theorem's STATEMENT is Veil's own emitted stub, copied verba
 run's `Insert theorem stubs for undischarged verification conditions` block, with only the
 module name changed. `grep -c sorry` on the final file is 0.
 
+
+---
+
+### GATE 2 (2026-07-27, opus) — CONVENED, RULED, **BANK**; and the corrections session that followed
+
+Gate 2 was convened on the session-8 dossier
+(`docs/benchmarks/uc2-veil-commit-plane-checkpoint-2026-07-26.md` §S8.0–S8.12) and on session 13
+of this ledger (items 56–68). **No runs, no model edits, no proof work** — `ReconfigCommitSMT.lean`
+is byte-unchanged from session 8's close (35 `require`s / 11 `assumption`s, 55 invariants + 2
+safeties), `QuorumAdjacency.lean` untouched, `proofs/` never touched by this arc.
+
+**VERDICT: BANK.** The citable claim is gate 2's R6 paragraph, stamped VERBATIM into the dossier
+as its closing section "GATE 2 VERDICT — the citable claim". It is to be quoted whole; the
+conditions (n1)(n2)(n3), the gate-1c corner (d), the twin divergences (d1)–(d5) and the boundary
+statement are inseparable from it.
+
+**Rulings.**
+* **(A)** action-partitioned full-bundle verification (the `#check_action` identity claim) —
+  **RATIFIED**.
+* **(B)** slice certification with recorded hypothesis sets — **RATIFIED**.
+* **(C)** the ⏱️ protocol — **RATIFIED**.
+* **(D)** ghost extension — **RATIFIED CONDITIONALLY**: conditional on the two mechanical
+  side-conditions (the ghost occurs in no `require`; it occurs in neither the hypothesis nor the
+  goal of the transferred VC) being **re-verified on every future ghost addition**. Every green
+  resting on (D) **keeps its `transfer:` label** — the label is not to be dropped.
+* **Residue** (P2 open at `becomeLeader` ❌ and at `commitEntry` ⏱️) — **BANK**. Not pushed.
+* **Optional coda**, if anything at all is done further: the hand-proof route (item 59) applied to
+  **P2 @ `commitEntry` ONLY**, in a **single hard-timeboxed session**. **The strict half is NOT to
+  be reopened in this arc.**
+
+**R1 strengthening.** The crux VC's discharge is stronger than session 8 claimed: `#print axioms`
+on the hand proof gives `[propext, Classical.choice, Quot.sound]` — plain Lean, **no
+`veil.smt.trust`**. `election_safety` @ `becomeLeader` is **kernel-checked**, the only VC in the
+bundle with that status; every other ✅ is a solver verdict under `veil.smt.trust`.
+
+**Bookkeeping nit.** Item 59 cites five manual attempts; only **two** are banked in
+`proofs-veil/logs/` — `smt-manual3-control.log` and `smt-manual5.log`. The three intermediate
+logs were not retained. Completeness nit, not a defect: both load-bearing claims (the tooling
+correction, the anti-vacuity signals) are reproducible from the two banked logs plus the models.
+
+**DEFECTS FOUND — all narrative-layer, none in the model or the runs — and the corrections
+applied by this session:**
+1. Dossier S8.5 (T8 row) and S8.7 (item 1) still called `election_safety` @ `becomeLeader`
+   "OPEN (⏱️) … CONDITIONAL, not refuted" — pre-hand-proof text contradicting S8.0/S8.2/S8.4/S8.8
+   and run 42. **CORRECTED**: FULLY GREEN, discharged by the sorry-free hand proof, statement
+   byte-identical to the Veil stub, axiom profile kernel-checked; run 42 = 55 ✅ / 1 ❌ / 0 ⏱️.
+2. Dossier S8.4's "a fully green action reports 56 ✅ (53 + 2 + `doesNotThrow`)" was stale
+   post-T39/T40. **CORRECTED** to 58 (55 + 2 + `doesNotThrow`), consistent with S8.12.
+3. The S8.5 inventory stopped at T37; T39/T40's truth arguments existed only inside item 64's
+   adjudication text. **CORRECTED**: inventory retitled T1–T40, rows added with one-line truth
+   summaries citing item 64, plus a note placing T38/T41/T43 as probe-only.
+4. Ledger item 68's step 3 ("a vote grant does it") was mechanically impossible, and its opening
+   claimed run 48's PRINTED CTI is reachable. **CORRECTED** in place (corrections 1–3 there): the
+   printed CTI is unreachable as printed (`voteMsg = []` with `hasProposal = [0]`); the CLAUSE is
+   refuted by a corrected trace whose only legal term-raiser in n = 2 is `replicate(1,0)`.
+5. Run 49's ❌ was banked with **no adjudication** — a breach of the arc's hard `❌` rule.
+   **LOGGED AS A BREACH** and repaired: item 69 records gate 2's legal n = 3 trace refuting T43.
+6. **Honesty correction (R3):** P2's strict half has **no complete written model-level truth
+   argument on file** — item 62's argument died with T38. It is carried on absence of a surviving
+   counterexample (300 s) + interpretation-level CTI adjudications + the Rust Q2 chain. Recorded
+   in the dossier's S8.7 honesty note and in item 69.
+
+**ARC STATUS: BANKED**, pending the user's merge decision. Nothing in `proofs-veil/` is the
+record; `proofs/` remains the sole trusted base.

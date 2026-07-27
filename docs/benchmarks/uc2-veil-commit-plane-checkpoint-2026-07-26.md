@@ -1609,7 +1609,8 @@ The amendment stands as session 6 drafted it and sessions 7–8 exercised it, no
 
 Bundle at session end: **55 invariants + 2 safeties + `doesNotThrow`**, at **35 `require`s /
 11 `assumption`s**. Ten actions plus the initialisation obligation. A fully green action
-reports **56 ✅** (53 + 2 + `doesNotThrow`).
+reports **58 ✅** (55 + 2 + `doesNotThrow`). (Runs 38/41/42 predate T39/T40 and were
+measured on the 53 + 2 bundle — see S8.12; their tallies are quoted against that bundle.)
 
 Two coverage layers, because the bundle grew this session:
 
@@ -1637,7 +1638,7 @@ Two coverage layers, because the bundle grew this session:
 | `propose` | **runs 37/39/40** (slices, criterion (B)) + run 16 | **all 57 clauses ✅ under criterion (B)** — runs 37/44 + `PropG2`–`PropG9`, union checked 57/57 | — |
 | INIT | runs 16/20/26/27/31/34/37 | ✅ for every clause; **no transfer needed** (`Induction.lean:132-143`) | — |
 
-## S8.5 Truth-argument inventory (T1–T37)
+## S8.5 Truth-argument inventory (T1–T40)
 
 Every clause in the bundle carries a written truth argument, per the gate-1c open-clause truth
 rule. The inventory below is the complete list, with the run that machine-certified it.
@@ -1651,7 +1652,7 @@ rule. The inventory below is the complete list, with the run that machine-certif
 | T5 | `voteterm_bounded` | ✅ (run 14 on) |
 | T6 | `commit_leader_self_vote` | ✅ (run 14 on) |
 | T7 | `commit_leader_no_foreign_grant` | ✅ (run 14 on) |
-| T8 | `election_safety` (the crux argument) | **OPEN — ⏱️ at `becomeLeader` in every measurement** |
+| T8 | `election_safety` (the crux argument) | **FULLY GREEN — DISCHARGED.** The six-session ⏱️ at `becomeLeader` is closed by the sorry-free hand proof (`ReconfigCommitSMTManual.lean`, item 59), whose statement is **byte-identical to the Veil-emitted stub** and whose axiom profile is `[propext, Classical.choice, Quot.sound]` — kernel-checked, no `veil.smt.trust` (gate-2 R1). Run 42 (full bundle, criterion (A)): **55 ✅ / 1 ❌ / 0 ⏱️** |
 | T9 | `leader_completeness` (P2) at `becomeLeader` | same-term half CLOSED (T18/T13/T14); **strict half OPEN** |
 | T10 | `role_positive_term` | WITHDRAWN (tractability); subsumed by T12 |
 | T11 | `commit_leader_at_commit_cfg` | ✅ (run 16 on) |
@@ -1670,6 +1671,14 @@ rule. The inventory below is the complete list, with the run that machine-certif
 | T35 | `cfg_seen_committed` | ✅ run 37 |
 | T36 | `adopted_holds` | ✅ run 37 |
 | T37 | `cfgq_witness` + `cfgq_holders` | ✅ run 37 |
+| T39 | `propafter_holds` (`propAfterE I → holdsE I`) — *truth:* `propAfterE` is written ONLY at `propose i`, as `propAfterE i := holdsE i`, and `holdsE` is MONOTONE (no action clears it), so a node whose `propAfterE` is set has held E ever since (argument written in ledger item 64's adjudication) | ✅ run 44 (44 ✅ / 0 ❌ / 0 ⏱️, 51 s — all ten actions + init); ✅ in the full bundle at `commitEntry` by construction of the CTI it excludes |
+| T40 | `cfgbacked_committed` (`cfgBacked D → cfgCommitted D`) — *truth:* `cfgBacked (proposedC i)` and `cfgCommitted (proposedC i)` are written in the SAME `commitCfg` step, and neither is ever cleared (argument written in ledger item 64's adjudication) | ✅ run 44 (same run/tally) |
+
+*Not in the bundle, recorded so the inventory is complete:* **T38** (`… → cfgBacked D`) and
+**T43** (`cfgq_holders_above`) are both **REFUTED by reachable traces** (ledger items 68 and 69) —
+they were probe-slice experiments and never entered `ReconfigCommitSMT.lean`; **T41**
+(`isCommitLeader ∧ hasProposal ∧ cfgLt commitCfgid (proposedC I) → propAfterE I`) is certified
+inside the probe slice only (run 47) and is likewise not a bundle clause.
 
 ## S8.6 Conditionality — what a SAFE verdict from this model would and would not mean
 
@@ -1711,14 +1720,27 @@ trusted base; nothing in `proofs-veil/` is the record.
 
 | # | item | status | carried on |
 |---|---|---|---|
-| 1 | `election_safety` @ `becomeLeader` | **OPEN (⏱️)** in every cell of {full bundle, 17-clause slice, 11-clause slice} × {60, 300, 900 s} × {fmf on, off}, plus this session's manual attempt | the written truth argument **T8 + T12 + the T17 chain**; CONDITIONAL, not refuted — no counterexample has ever been produced for it |
-| 2 | `leader_completeness` @ `becomeLeader` (strict half) | **OPEN (❌)**, CTI adjudicated as a model artifact with an unreachable pre-state (items 42/45/58) | nothing yet: T20's machinery is certified (T32–T37) but its last link is open — **T38 and T43 are both refuted** (ledger 68), so the next session starts from the refutation, not from a written chain |
-| 3 | `leader_completeness` @ `commitEntry` | **OPEN (⏱️)** — run 41 (full bundle, 300 s) gave a CTI; T39/T40 exclude it; runs 45/46 (35-clause slice, 60 s and 300 s) leave the VC ⏱️ with no counterexample | the written T9/T10 argument; no counterexample survives the ghost-soundness clauses |
+| 1 | `election_safety` @ `becomeLeader` | **CLOSED — FULLY GREEN.** No longer an open item: the ⏱️ that stood in every cell of {full bundle, 17-clause slice, 11-clause slice} × {60, 300, 900 s} × {fmf on, off} is **discharged by the sorry-free hand proof** (`ReconfigCommitSMTManual.lean`, item 59), statement **byte-identical to the Veil-emitted stub**, axiom profile `[propext, Classical.choice, Quot.sound]` — kernel-checked, carrying no `veil.smt.trust` (gate-2 R1). Run 42 in the FULL bundle, criterion (A): **55 ✅ / 1 ❌ / 0 ⏱️** | nothing conditional at this VC beyond the model's standing conditionality (S8.6): it is a proof, not a solver verdict |
+| 2 | `leader_completeness` @ `becomeLeader` (strict half) | **OPEN (❌)**, CTI adjudicated as a model artifact with an unreachable pre-state (items 42/45/58) | **NO written model-level truth argument is on file.** T20's machinery is certified (T32–T37) but its last link is open; **item 62's semantic argument died with T38**, and both T38 and its corrected form T43 are **refuted by reachable traces** (ledger 68/69). What the item is carried on is therefore *not* an argument but: interpretation-level CTI adjudications (each `becomeLeader` CTI shown unreachable by hand) + the Rust-side Q2 contiguity chain. The next session starts from the refutations, not from a chain |
+| 3 | `leader_completeness` @ `commitEntry` | **OPEN (⏱️)** — run 41 (full bundle, 300 s) gave a CTI; T39/T40 exclude it; runs 45/46 (35-clause slice, 60 s and 300 s) leave the VC ⏱️ with no counterexample | **no surviving counterexample at 300 s** — an absence, not a proof. The T9/T10 sketch is not a completed model-level argument for this VC |
 | 4 | `propose` under criterion (A) | **OPEN** — VC-GENERATION-walled (killed at 60 s, 20 s, 5 s per VC; a 12× budget span moved nothing) | criterion **(B)**: slices with recorded hypothesis sets (runs 37/39/40) + run 16 for the run-16-era clauses |
 | 5 | amendment clauses (A) and (D) | **UNRATIFIED** — gate 2's decision | (A) is an identity claim about `#check_action`, evidenced from the Veil source; (D) is the ghost-extension transfer |
 
 Nothing else is open. Every other (clause, action) pair in the bundle has a ✅, and every ✅
 quoted in this dossier comes from a run whose ⏱️ count is quoted with it.
+
+**HONESTY NOTE on P2's strict half (gate-2 R3), which governs every statement of it above.**
+Session 8 narrowed the strict half to one clause and then refuted that clause — twice. Item 62's
+semantic argument for T38 was the last *written* model-level truth argument for the strict half,
+and it **died with T38** (ledger 68); the corrected all-holder form T43 died with it (ledger 69).
+So: **the strict half of `leader_completeness` has NO complete written model-level truth argument
+on file.** It is carried on exactly three things, none of which is an argument about the model's
+reachable states in the sense the truth rule requires — (i) the absence of any surviving
+counterexample (300 s at `commitEntry`), (ii) interpretation-level adjudications of the CTIs that
+were produced (each shown unreachable by hand, one CTI at a time), and (iii) the Rust-side Q2
+contiguity chain, which is evidence about UC, not about this model. Any wording that suggests
+the residue is "one clause away", or that a written chain merely awaits mechanisation, is
+superseded by this note.
 
 ## S8.8 Disposition — STOP for gate 2
 
@@ -1802,3 +1824,81 @@ Inv_old`), and T39/T40 have their own verdicts at all ten actions + init from **
 (44 ✅ / 0 ❌ / 0 ⏱️, 51 s, hypothesis set `propafter_holds`, `cfgbacked_committed`,
 `pending_iff_proposal`). Nothing else in the dossier is affected, and the count is still
 **35 `require`s / 11 `assumption`s**.
+
+# GATE 2 VERDICT — the citable claim
+
+Gate 2 convened 2026-07-27 on the dossier above (sections S8.0–S8.12) and on ledger session 13
+(items 56–68). **Verdict: BANK.** The paragraph below is the gate's R6 output and is **the only
+form in which this arc's result may be cited**; it is reproduced verbatim, and it is to be quoted
+whole — the conditions are inseparable from the claim.
+
+> **What is proved.** Over the abstract-quorum commit-plane model
+> `proofs-veil/models/ReconfigCommitSMT.lean` (35 `require`s / 11 `assumption`s, all eleven
+> assumptions discharged against the chain-indexed witnesses in `QuorumAdjacency.lean`, seventeen
+> `#print axioms` entries clean), the bundle of 55 invariants is inductively invariant, all-n — a
+> proof, not a bounded search — and `election_safety` holds across live single-server
+> reconfiguration with a commit/log plane: inductive at every action, with the crux VC
+> (`becomeLeader`) discharged by a sorry-free hand proof whose statement is byte-identical to
+> Veil's generated obligation and whose axiom profile is `[propext, Classical.choice, Quot.sound]`
+> (kernel-checked; solver verdicts elsewhere carry `veil.smt.trust`). Coverage is criterion (A)
+> (full-bundle `#check_action`) at nine of ten actions and criterion (B) (verbatim-model slices
+> with recorded hypothesis sets, union mechanically 57/57) at `propose`; init obligations are
+> bundle-independent by the VC generator. **What is conditional.** `leader_completeness` (P2: a
+> leader at a term ≥ the commit term holds the tracked entry) is proved preserved at eight actions
+> + init + `propose`, and remains OPEN at `becomeLeader` (counterexamples adjudicated unreachable;
+> the invariant route through proposal-backing is closed — T24, T38, T43 all refuted in reachable
+> states) and at `commitEntry` (timeout with no surviving counterexample at 300 s). This residue is
+> carried on the absence of any surviving counterexample and on the Rust-side Q2 contiguity chain —
+> not on a completed model-level argument. **Conditions, verbatim and inseparable from the claim:**
+> (n1) the config-currency grant guard, like the E-guard, is stronger than real `log_ok` (divergent
+> higher-`last_term` grants excluded; the Figure-8 class is banked in
+> `Figure8.lean`/`Finding9.lean`); (n2) `cfgOf` conflates holding a config entry with having
+> adopted it (real UC grants where the model refuses, `election.rs:889-899`); (n3)
+> truncation-revert/config-branch states are excluded (forward-only adoption + linear history; real
+> UC reverts at `election.rs:703-748`); gate-1c corner (d): `commit_seen` is not reset at
+> `become_leader` (`election.rs:1040-1056`), so a fresh leader carries follower-period commit state,
+> which cannot satisfy the serving latch (`:522-527`) without a pre-existing completeness violation
+> — the same conditionality bucket as (n1). Any SAFE verdict is conditional on the
+> canonical-prefix/contiguity discipline (Q2 chain, CONFIRMED-SAFE in Rust, gate doc §5) and the
+> data-plane freshness / Finding-#6b `new_term_pos` clamp (proved at the Lean tier); it is never
+> unconditional. The explicit-state twin diverges by (d1) own-term-stamped reports, (d2) linear
+> config history, (d3) forward-only adoption, (d4) cluster-wide one-in-flight, (d5) the own-term
+> commit-view gate — it over-approximates, and its calibration CE is the coarser instrument.
+> **Boundary:** the report plane is collapsed by construction (counting toward E's commit ⟹ holding
+> E), so this arc can never re-find #5/#9-class report bugs — by design, that class stays banked in
+> `BootGate.lean`/`Finding9.lean`; the below-floor/snapshot path is argued, not checked; the adopt
+> window closes at `commitCfg`. This model says nothing about UC beyond it; `proofs-veil/` is never
+> the record and `proofs/` remains the sole trusted base.
+
+## Gate-2 rulings, in summary
+
+| ruling | disposition |
+|---|---|
+| **(A)** action-partitioned full-bundle verification (the `#check_action` identity claim) | **RATIFIED** |
+| **(B)** slice certification with recorded hypothesis sets | **RATIFIED** |
+| **(C)** the ⏱️ protocol (a ⏱️ leaves its clause OPEN regardless of the tally) | **RATIFIED** |
+| **(D)** ghost extension (a fresh state symbol in neither hypothesis nor goal cannot invalidate a VC) | **RATIFIED, CONDITIONALLY** — conditional on the two mechanical side-conditions being **re-verified on every future ghost addition** (the symbol occurs in no `require`, and in neither the hypothesis nor the goal of the transferred VC). Greens resting on it **keep their `transfer:` label**; the label is not to be dropped |
+| **residue** (P2 open at `becomeLeader` and `commitEntry`) | **BANK.** The arc is not pushed further on the strict half |
+| **optional coda** | the hand-proof route (item 59) applied to **P2 @ `commitEntry` ONLY**, in a **single hard-timeboxed session**. Nothing else. **The strict half is not to be reopened in this arc** |
+
+**R1 strengthening, recorded.** The crux VC's discharge is stronger than the dossier originally
+claimed: `#print axioms` on the hand proof reports `[propext, Classical.choice, Quot.sound]` — the
+plain Lean axiom set, with **no `veil.smt.trust`**. `election_safety` @ `becomeLeader` is therefore
+**kernel-checked**, not solver-trusted, and it is the one VC in the bundle with that status.
+
+**Bookkeeping nit, recorded.** Item 59 cites five manual attempts (`smt-manual1-trace.log` …
+`smt-manual5.log`); only **two** are banked in `proofs-veil/logs/` — `smt-manual3-control.log` (the
+`unveil; veil_smt` control that produced `cannot translate Type`) and `smt-manual5.log` (the final
+sorry-free run). The three intermediate attempt logs were not retained. The claims they support
+(the tooling correction and the anti-vacuity signals) are reproducible from the two banked logs
+plus the model files, so this is a completeness nit, not a defect in the result.
+
+**Defects found by gate 2, all narrative-layer, all corrected in this document** (no model change,
+no re-run): (1) S8.5/S8.7 still described the crux VC as OPEN/CONDITIONAL, contradicting S8.0,
+S8.2, S8.4, S8.8 and run 42 — corrected; (2) S8.4's "56 ✅" was stale post-T39/T40 — corrected to
+58; (3) the S8.5 inventory stopped at T37 and the T39/T40 truth arguments lived only inside ledger
+item 64's adjudication text — lifted into the inventory. Plus the R3 honesty correction on P2's
+strict half (S8.7) and the two ledger repairs (ledger items 68 and 69).
+
+**Arc status: BANKED, pending the user's merge decision.** Nothing in `proofs-veil/` is the
+record; `proofs/` was never touched by this arc and remains the sole trusted base.
