@@ -1417,7 +1417,7 @@ memwatch armed. A fully green action reports **49 ✅** (46 invariants + 2 safet
 | `commitEntry` | run 35 `smt-run35-act-commitEntry.log` | 48 ✅ / 0 ❌ / **1 ⏱️** | 1535 s |
 | `commitCfg` | `smt-act-commitCfg.log` | **49 ✅ / 0 ❌ / 0 ⏱️** (build exits 1, S7.3) | 1641 s |
 | `adopt` | `smt-act-adopt-t20.log` (**20 s** per VC) | **49 ✅ / 0 ❌ / 0 ⏱️** (build exits 1, S7.3) | 1407 s |
-| `propose` | `smt-act-propose.log` (60 s), `smt-act-propose-t20.log` (20 s) | **KILLED, NO VERDICT** ×2 | 3300 s + 1900 s |
+| `propose` | `smt-act-propose.log` (60 s), `-t20.log` (20 s), `-t5.log` (5 s) | **KILLED, NO VERDICT** ×3 | 3300 + 1900 + 2100 s |
 
 `adopt` is quoted at a **20 s** per-VC budget rather than 60 s: the 60 s run was cut at 36 s
 to make room for it, and a proof found at 20 s is a proof (any VC that did not close would
@@ -1433,8 +1433,8 @@ every one of them.** The only non-greens in the whole sweep are the two properti
 survives** — but the VC does not discharge at 60 s either, so under the ⏱️ protocol it is
 **OPEN**, not green. The prediction is confirmed in kind and unconfirmed in verdict.
 
-**`propose` is a cost wall of its own.** Killed at 3300 s at 60 s per VC and again at
-1900 s at **20 s** per VC — a 3× cut in the solver budget moved nothing. Since every
+**`propose` is a cost wall of its own.** Killed at 60 s, at 20 s and at 5 s per VC — a 12×
+span of solver budgets moved nothing. Since every
 per-action file elaborates the same module (`startElection` finished end-to-end in 212 s),
 the missing time is per-VC WP/TR generation and SMT translation for the model's heaviest
 action: five `require`s plus the conditional `reachAt i Z := if … then … else …` update
@@ -1497,5 +1497,5 @@ T24 work does not resurrect it).
 2. `leader_completeness` @ `becomeLeader` — ❌ (the strict half; the clause chain that
    would close it is now T20, not T24).
 3. `leader_completeness` @ `commitEntry` — ⏱️ / OPEN at 60 s (no counterexample survives).
-4. `propose` — no criterion-(A) verdict (killed at both 60 s and 20 s per VC); covered by
+4. `propose` — no criterion-(A) verdict (killed at 60 s, 20 s and 5 s per VC); covered by
    run 16 + the all-ten-action slices, i.e. by transfer.

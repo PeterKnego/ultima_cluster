@@ -9,3 +9,4 @@ warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `Strin
 Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
 ⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
 warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+EXIT=124 WALL=2100s

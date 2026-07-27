@@ -2648,9 +2648,10 @@ discharged"**, and ⏱️ means neither was. In `commitCfg`'s two cases the sibl
 `proven` AND the erroring one was itself solver-unsat, so nothing here weakens the run;
 it is recorded because the exit code is 1 on an otherwise clean action, and a future
 session must not read that as a failure.
-* **`propose` at 20 s per VC — KILLED at 1900 s, NO VERDICT** (`smt-act-propose-t20.log`).
-  Together with the 60 s kill this is a real cost datum: **lowering the per-VC solver budget
-  by 3x did not move `propose` at all.** Since every per-action file elaborates the SAME
+* **`propose` at 20 s per VC — KILLED at 1900 s, NO VERDICT** (`smt-act-propose-t20.log`),
+  and **at 5 s per VC — KILLED at 2100 s, NO VERDICT** (`smt-act-propose-t5.log`).
+  Together with the 60 s kill this is a decisive cost datum: **three budgets spanning 12x
+  (60 s / 20 s / 5 s) moved `propose` not at all.** Since every per-action file elaborates the SAME
   module (`startElection` finished in 212 s end-to-end, so module elaboration is ≤ ~200 s),
   the missing time is in the per-VC WP/TR GENERATION and SMT TRANSLATION for this action —
   `propose` is the model's heaviest action (five `require`s plus the conditional
@@ -2708,10 +2709,12 @@ Banked: the per-action sweep (items 50/52/54), three source-level tooling findin
 measurement (item 51), and the **T24 refutation with its corrected chain** (T19/T20).
 
 **NEXT SESSION'S MAP:**
-1. `#check_action propose` — the one action with no criterion-(A) verdict. It is killed at
-   both 60 s and 20 s per VC, so the lever is not the solver budget: either a 5 s budget,
-   or `veil.experimental.wpCompact` / `generateWpLocalEq` (`Veil/Base.lean:145-155`, both
-   default true — worth a read before a run), or accept the transfer and say so.
+1. `#check_action propose` — the one action with no criterion-(A) verdict, killed at 60 s,
+   20 s AND 5 s per VC, so the solver budget is definitively not the lever. The remaining
+   candidates are `veil.experimental.wpCompact` / `generateWpLocalEq`
+   (`Veil/Base.lean:145-155`, both default true) and `veil.smt.trust` /
+   `synthInstance.maxHeartbeats` (every per-action run carries a `LocalRProp`
+   typeclass-synthesis heartbeat warning) — or accept the transfer and say so explicitly.
 2. `leader_completeness` @ `commitEntry` — ⏱️ at 60 s with NO surviving counterexample.
    Re-measure at 600 s (`ReconfigCommitSMTActcommitEntry600.lean` is prepared and unused);
    this is the cheapest of the three open items and the likeliest to close.
