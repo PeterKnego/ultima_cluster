@@ -1758,3 +1758,47 @@ they remain gate-2 scope for the final claim's wording.**
 3. The cross-config HOLDER supply for P2@`becomeLeader` (item 31) — the one place where a
    new mechanism might genuinely be needed, and therefore the likeliest next gate request.
 4. Gate 2 when, and only when, all three land.
+
+---
+
+### SESSION 10 (2026-07-27, opus) — BAR 3, part 4: the ⏱️ protocol, the same-term grant corner
+Fresh context by design. Worktree `.claude/worktrees/uc2-veil-commit-plane` @ `3bfb6f9`;
+runs in `/home/claude/veil-spike/veil-preview`, logs `/home/claude/veil-spike/runs/`.
+
+#### 32. CONTROLLER FINDING — item 29's "tool-level anomaly" is **DISSOLVED: a MISREAD, not unsoundness**
+Session 4 (ledger SESSION 9, item 29) retracted run 14's `election_safety` ✅ and left open
+"how run 14 produced an unsound ✅ is a tool-level question for gate 2". The controller
+audited every banked log directly. **Run 14 never reported ✅ for `election_safety`.** Veil
+prints a THIRD verdict marker — **⏱️, one per timed-out VC** — and the headline tally does
+not force it on the reader's attention:
+```
+smt-run14-elecq-carrier.log:408-411
+  election_safety ... ⏱️
+    Exceptions:
+      becomeLeader_election_safety_0_WP, becomeLeader_election_safety_tr_0_TR
+        unable to prove goal. Try providing more hints. Reason: TIMEOUT
+```
+Full audit, re-verified mechanically this session (`grep -c "⏱️"` over every `.log` in
+`/home/claude/veil-spike/runs/`): **exactly three ⏱️ VCs exist in the whole arc** —
+`smt-run12-reachquorum.log:783` (`leader_completeness`, `commitEntry_leader_completeness_0_WP`
+/ `_tr_0_TR`), `smt-run13-edit4.log:677` (same clause, same VC names), and
+`smt-run14-elecq-carrier.log:408` (`election_safety` at `becomeLeader`). Runs 8, 11, 16 and
+every earlier run: **zero**. Consequences, all binding:
+
+* **PROTOCOL RULE (binding from here on): a ⏱️ VC is an OPEN verdict, never a green and
+  never a red.** Before banking any run, `grep -c "⏱️"` its log; a nonzero count is quoted
+  alongside the ✅/❌ counts and every clause carrying one is OPEN regardless of the tally.
+  **Quote format from here: "N ✅ / M ❌ / K ⏱️".**
+* **LEDGER CORRECTIONS.** Run 12's and run 13's residues were quoted as "P2 at 1 CTI"; the
+  truthful reading is **1 CTI + 1 ⏱️ VC** (the `commitEntry` VC pair never returned).
+  Run 14's `election_safety` **was never green** — the session-4 retraction of it STANDS,
+  with this corrected cause. Run 16's counts are **timeout-clean** (0 ⏱️) and stand as the
+  current baseline: **470 ✅ / 3 ❌ / 0 ⏱️**.
+* **NO TOOL DISTRUST IS WARRANTED.** The "gate 2 must investigate an unsound ✅" item is
+  DISSOLVED into this entry. Item 29's *conservative reading* of what a ✅ means ("not
+  refuted by this bundle at this solver configuration") is retained as good hygiene, but
+  its stated cause — a spurious pre-solver discharge — is withdrawn: nothing in the arc
+  has produced a ✅ that a stronger bundle later refuted, once ⏱️ is read correctly.
+* **Why it mattered anyway:** the CTI-driven work item that item 29 produced (item 30, the
+  same-term grant wrinkle) is UNAFFECTED — run 16's ❌ is a real CTI, independent of how
+  run 14 was read.
