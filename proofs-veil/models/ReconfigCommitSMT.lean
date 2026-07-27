@@ -69,6 +69,35 @@ import Veil
      quoted greens of every run that carried it.
    =============================================================
 
+   SESSION-5 (bar 3, part 5) STATE — see proofs-veil/spike-ledger.md §SESSION 10 (32-40):
+     * **⏱️ PROTOCOL (BINDING).** Veil prints THREE verdict markers per VC, and ⏱️ (one per
+       TIMED-OUT VC) is an **OPEN** verdict — never a green, never a red. Grep every log
+       (`grep -c "⏱️"`) before banking it and quote **"N ✅ / M ❌ / K ⏱️"**. Whole-arc audit:
+       exactly three ⏱️ ever — runs 12, 13, 14. **Run 14's `election_safety` was a ⏱️, never
+       a ✅**: the session-4 retraction STANDS with a corrected cause, and NO tool distrust is
+       warranted (the "unsound ✅" gate-2 item is dissolved). Run 16 = 470 ✅ / 3 ❌ / 0 ⏱️,
+       timeout-clean, still the baseline.
+     * **ADDED: `leader_reach_strict` (T12)** — CERTIFIED INDUCTIVE, all-n, cvc5, in an
+       80-SECOND nine-clause SLICE (run 20, `ReconfigCommitSMTSlice.lean`). A slice ✅
+       TRANSFERS to the full bundle (`Inv_full → Inv_slice` only weakens each VC's
+       antecedent); a slice ❌/⏱️ transfers neither way. It answers BOTH open tasks: the
+       same-term grant corner (the SESSION-4 note below predicting a GRANT-TIME ghost is
+       SUPERSEDED — the voter's side of that CTI is legal, the leader's side is not), and,
+       at `C := genesisC` with the theory's `zero_le`, the withdrawn `role_positive_term`.
+     * `election_safety`@`becomeLeader`: **OPEN (⏱️), NO LONGER REFUTED.** Run 16's CTI
+       violates T12 (hand check: `reachAt 1 (elecCfg 1) = curTerm 1`). Runs 21/23 (a
+       17-clause election slice) leave that VC ⏱️ even at 900 s per VC. Carried under the
+       truth rule with the WRITTEN argument T8 + T12. The obstacle is now solver search,
+       not a missing invariant.
+     * P2 residue UNCHANGED and mapped (ledger 36): same-term half = the `commitElecQuorum`
+       ghost + T13/T14 (written, count-exempt, UNMEASURED); strict half = the cross-config
+       HOLDER supply, with **MODEL-EDIT-5 PREPARED BUT NOT REQUESTED**.
+     * **TOOLCHAIN: `set_option veil.smt.timeout N in <cmd>` DOES NOT PROPAGATE** — it must
+       be FILE SCOPE (as at the top of this file). Runs 17/18/19 died at ~30/30/96 min with
+       no verdict; run 19 was therefore never the 12 s run it was launched as.
+     * COUNT UNCHANGED: **35 `require`s / 11 `assumption`s**, verified before every launch.
+       Everything added this session is clause-only; `QuorumAdjacency.lean` untouched.
+
    SESSION-4 (bar 3, part 4) STATE — see proofs-veil/spike-ledger.md §SESSION 9:
      * **RUN 16: 470 ✅ / 3 ❌ — 40 clauses + `doesNotThrow` INDUCTIVE, all-n, cvc5**
        (run 12: 32; run 14: 38). 35 requires / 11 assumptions, verified before every run.
@@ -161,6 +190,15 @@ import Veil
        adopting a distant config models the snapshot-carried-config / deep-replay
        path, which is legal in UC exactly because it implies holding the prefix.
      * crashRestart included un-knobbed (free under induction). -/
+
+-- RUN 24 (session 5): FILE-SCOPE per-VC budget. TOOLCHAIN FINDING: `set_option
+-- veil.smt.timeout N in #check_invariants` does NOT propagate to the solver calls (run 19
+-- at "12 s" and run 22 at "900 s" both behaved exactly like the 60 s default); the option
+-- must be set at FILE SCOPE, as here (proved by run 23, where the same slice went from
+-- 3 min to 30 min). At 5 s the whole 41-clause bundle is bounded by ~490 x 5 s ~ 41 min,
+-- which is what makes a full-bundle measurement possible at all this session. Greens at
+-- 5 s are real greens; ⏱️ are OPEN verdicts (ledger 32).
+set_option veil.smt.timeout 5
 
 veil module UcReconfigCommitSMT
 
@@ -755,6 +793,36 @@ invariant [elecq_grant_covers_reach]
 -- (a candidate at `tot.zero` whose `reachAt` equals its term).
 invariant [cand_reach_strict]
   (candidate I ∧ ¬ cfgLt (cfgOf I) C) → tlt (reachAt I C) (curTerm I)
+-- T12 (SESSION 5) — THE SAME-TERM GRANT CORNER, closed from the OTHER side. The run-16
+-- `election_safety` CTI (ledger 30) has a voter that reached its config AT the very term it
+-- granted at, which `grant_reach_covered`'s STRICT bound cannot cover. A grant-time config
+-- ghost does NOT close it (the model genuinely permits granting at cfg C and adopting a
+-- higher config at the same term — `adopt` only requires `curTerm j <= curTerm i`). What IS
+-- excluded is the OTHER side of that CTI: the incumbent LEADER reached its own ELECTION
+-- config at its own term. A leader's `elecCfg` was frozen while it was a CANDIDATE, and
+-- `startElection` bumps STRICTLY past a term that already bounds every reach stamp
+-- (`reach_bound`) — so every config at-or-below `elecCfg I` was reached strictly before
+-- `curTerm I`. This generalises `cand_reach_strict` from `cfgOf`/candidates to
+-- `elecCfg`/both roles; for a candidate the two coincide (`cand_cfg_frozen`).
+-- PRESERVATION: `propose` stamps only configs STRICTLY ABOVE `cfgOf i >= elecCfg i`
+-- (`eleccfg_not_ahead` + `cfglt_trans`), i.e. outside the antecedent; `adopt`/`replicate`/
+-- `crashRestart` clear the role; a strict-raise grant clears the role and an equal-term
+-- grant changes nothing; `becomeLeader` re-freezes `elecCfg i := cfgOf i` = the candidate's
+-- already-covered config. SECOND CONSUMER (task 2): at `C := genesisC` (antecedent free by
+-- `genesis_least`) this yields `reachAt I genesisC < curTerm I`, and with `zero_le` that IS
+-- `role_positive_term` — WITHOUT putting `tot.zero` into every VC's hypothesis set, which
+-- is what made run 15 intractable (ledger 28).
+-- !! RUN 17 (the ∀C form, `((candidate I ∨ leader I) ∧ ¬ cfgLt (elecCfg I) C) →
+--    tlt (reachAt I C) (curTerm I)`) WAS KILLED AT 29m42s under the 3x-wall rule (item 28),
+--    NO VERDICT. Bisected to the GROUND form below: the same clause at the only two
+--    instantiations its consumers use — `C := elecCfg I` (antecedent by `cfglt_irrefl`) and
+--    `C := genesisC` (antecedent by `genesis_least`). The quantified `C` ranges over `cfgid`
+--    in the hypothesis set of every VC, which is the cost; the ground form both removes that
+--    search AND hands the solver the two instances directly. T12's truth argument is
+--    unchanged — these are two of its instances.
+invariant [leader_reach_strict]
+  (candidate I ∨ leader I) →
+    (tlt (reachAt I (elecCfg I)) (curTerm I) ∧ tlt (reachAt I genesisC) (curTerm I))
 -- T5/T6/T7 — the same-term commit-leader-self-vote hole (P2's last CTI). `grant_state`'s
 -- FIRST disjunct absorbs a stray `voteMsg` without constraining `voteCand`, so the absence
 -- of a foreign grant at `committedTerm` must be carried PERSISTENTLY; the two supports
@@ -805,4 +873,11 @@ invariant [commit_leader_at_commit_cfg]
 -- RUN 12 (session 3): + `reach_quorum_below` (expected ❌ at propose/adopt — the
 -- MODEL-EDIT-4 evidence) and the CORRECTED `electable_cfgs_contain_holder`. Clause-only:
 -- verified 34 requires / 11 assumptions, identical to the run-10/run-11 baseline.
+-- RUN 19 (session 5): `veil.smt.timeout` LOWERED from its 60 s default to 12 s. Runs 17/18
+-- (the ∀C form and the GROUND form of `leader_reach_strict`) were both KILLED at ~30 min
+-- under the 3x-wall rule with NO verdict, because Lean buffers everything until elaboration
+-- ends. A lower per-VC bound makes the run FINISH: every VC that closes still closes (a
+-- proof found at 12 s is a proof), and every VC that does not is reported as ⏱️ = OPEN, per
+-- the session-5 ⏱️ protocol (ledger 32). Greens from this configuration are quotable; ⏱️
+-- are not, and the clause carrying one is OPEN regardless of the tally.
 #check_invariants

@@ -2050,3 +2050,48 @@ were both killed at ~30 min with no verdict, and the ∀C→ground bisection did
   session's greens are quoted.** The honest one-line status: task 1's DEFECT is diagnosed
   and its clause is machine-certified true; the PROPERTY it was meant to close is not
   mechanically closed, and the obstacle is now solver search, not a missing invariant.
+
+#### 40. RUN 24 — the bounded full-bundle measurement: **KILLED at 61 min, NO VERDICT**
+The full 41-clause bundle (T12 included, 35/11 re-verified at launch) with a **FILE-SCOPE**
+`veil.smt.timeout 5`, which should bound it at ~490 VCs × 5 s ≈ 41 min. It was still
+buffering at 61 min and was killed. Log `smt-run24-KILLED-filescope5s-no-verdict.log`.
+**What that adds:** a per-VC solver budget bounds the SOLVER, not the RUN — the remaining
+time is VC generation and Lean elaboration at this bundle size, which no `veil.smt.timeout`
+touches. So the honest cost model for this bundle is now two-term, and only the SLICE device
+(item 37) attacks the second term. **No full-bundle verdict was obtained this session; run
+16 (470 ✅ / 3 ❌ / 0 ⏱️, timeout-clean) therefore REMAINS THE BANKED BASELINE**, and nothing
+in this session's greens is quoted from a full-bundle run.
+
+#### SESSION-5 STOP: the ~5-hour checkpoint — **NOT gate 2, and no gate request made**
+Gate 2's precondition (bundle closed, zero ⏱️, truth arguments on file for everything
+retained) is NOT met. Banked, all of it clause-only at an unchanged **35 requires / 11
+assumptions** (`QuorumAdjacency.lean` untouched, so the seventeen-witness `#print axioms`
+audit still covers the bundle):
+* The **⏱️ protocol** and the dissolution of item 29's tool-soundness question (item 32).
+* **T12 CERTIFIED INDUCTIVE** in 80 s (run 20) — tasks 1 and 2 answered by one clause, with
+  the map's predicted grant-time ghost shown NOT to close the corner (item 33) and the
+  cheaper `role_positive_term` encoding recorded (item 34).
+* The **SLICE DEVICE** with its monotonicity argument (item 37) — the standing answer to a
+  bundle that will not absorb another clause.
+* Two toolchain findings: the non-propagating `set_option` (item 38) and the two-term cost
+  model (item 40).
+* Truth arguments **T12, T13, T14** written BEFORE their runs, per the truth rule.
+* `election_safety`@`becomeLeader` re-labelled honestly: **OPEN (⏱️), no longer refuted**,
+  carried on the written T8+T12 argument (item 39).
+* Task 3 MAPPED (item 36) with MODEL-EDIT-5 **prepared, not requested** — the Rust anchor is
+  pinned to `election.rs:546-551` / `:569`, but the checker never produced the reachability
+  trace the gate template requires, and a `require` will not be asked for on a hand argument.
+**Conditionality (n1)+(n2)+(n3) plus gate amendment (d) unchanged and in the model header;
+divergences (d1)–(d5) complete; both remain gate-2 scope for the final claim's wording.**
+
+**NEXT SESSION'S MAP (all three are now slice-shaped work, which is the change):**
+1. **Close `election_safety`@`becomeLeader` by SLICING, not by adding clauses.** The VC does
+   not discharge in one shot at 900 s; the route is to cut the chain into named lemma
+   clauses, each certified in its own small slice, so no single VC has to find the whole
+   `cfglt_connected` → `reach_quorum_below` → adjacency → T3 instantiation sequence.
+2. **P2's same-term half**: apply the `commitElecQuorum` ghost + T13/T14 (already written)
+   and certify them in a slice; ghost-only, count-exempt, no gate.
+3. **P2's strict half**: try route (i) of item 36 (clause-only) in a slice. Only if it fails
+   does MODEL-EDIT-5 become a gate request — and then it must carry a checker-produced CTI,
+   not the hand trace.
+4. Gate 2 when, and only when, the bundle closes with **zero ⏱️** — the new precondition.
