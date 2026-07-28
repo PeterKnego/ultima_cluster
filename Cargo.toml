@@ -62,7 +62,16 @@ hdrhistogram = "7"
 # (Aes256Gcm::new unresolved). snow 0.9.6 declared chacha20poly1305
 # non-optional, so every prior release linked it anyway — this costs nothing
 # new. The chacha path is linked but never invoked.
-snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-aes-gcm", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom", "std"] }
+#
+# `risky-raw-split` is enabled deliberately (ruling 2026-07-28, spec §5): UC
+# takes the two transport keys out of the finished handshake and seals with
+# its OWN envelope, because snow's transport modes hard-code empty associated
+# data (cipherstate.rs:170) and would leave the 16-byte header unauthenticated
+# on the pairwise path. The "risky" in the name is snow warning that the
+# caller then owns nonce management — which this design does deliberately and
+# structurally, per-sender-per-boot, in `uc2_crypto::schedule::derive_send_key`.
+# Pure feature flag: no new crates, no version movement.
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-aes-gcm", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom", "std", "risky-raw-split"] }
 aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"

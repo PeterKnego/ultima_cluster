@@ -25,6 +25,7 @@
 //! - `rotation` (T8): key-epoch rotation.
 //! - `transport` (T9): wiring into `uc2_net`.
 
+pub mod handshake;
 pub mod identity;
 pub mod replay;
 pub mod schedule;
@@ -73,4 +74,16 @@ pub enum CryptoError {
     /// indexing into the buffer, never after.
     #[error("datagram too short to be a sealed frame")]
     TooShort,
+    /// No pairwise session with this peer is usable yet (`handshake.rs`, T6):
+    /// the handshake has not completed, or every session for the peer was
+    /// dropped. The caller's move is to drop the datagram and let
+    /// `Peers::tick` bring the link up — not to fall back to sending in the
+    /// clear, which would make the whole feature optional per datagram.
+    #[error("no established pairwise session with node {0}")]
+    NoSession(NodeId),
+    /// The datagram opened correctly but its counter has already been seen
+    /// under this key (`replay::ReplayWindow`). AEAD stops forgery, not
+    /// replay, and a replayed `VOTE` or admin datagram is not harmless.
+    #[error("counter {0} was already seen under this key")]
+    Replayed(u64),
 }
