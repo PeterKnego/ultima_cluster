@@ -546,8 +546,22 @@ Next session, in priority order:
    - The claim carries three named narrowings, five twin divergences, and a
      designed-in boundary (this plane can never re-find #5/#9-class report
      bugs — that class stays banked in `BootGate.lean`/`Finding9.lean`).
-5. If V2 survives: a nightly Veil model-check job next to the `elle` tier — a
-   deliberate CI follow-up, not part of the spike (guardrail 3).
+5. ~~If V2 survives: a nightly Veil model-check job next to the `elle` tier~~ —
+   **DECIDED 2026-07-28: NOT BUILT, and this item is closed, not deferred.**
+   V2 did survive, so the option was live; the reason to decline is that a Veil
+   model has **no conformance rig by construction** (guardrail 1), so a nightly
+   run cannot detect the thing a nightly gate exists to detect — Rust drifting
+   away from the model. It would catch only rot in an external preview-branch
+   toolchain, and would cost a veil + mathlib + cvc5/z3-FFI build per run plus a
+   standing-down of the guardrail-2 isolation that keeps "never the record"
+   structurally true rather than merely asserted. The `lean-proofs` nightly job
+   already covers model-vs-Rust drift where it is meaningful, because `proofs/`
+   HAS a conformance rig (100k vectors/night). Replacement measure, landed the
+   same day: a **Reproduce** section in `proofs-veil/README.md` lifting the V0
+   setup recipe out of the ledger (preview-branch clone, mathlib cache, the npm
+   infoview stub, `lake build Examples.UC.<Module>` vs `lake env lean` FFI trap,
+   the ~5.7 GB RSS memory-watch), so on-demand reruns cost minutes, not a
+   session. Revisit only if Veil ever acquires a conformance path to the Rust.
 
 ## 7. Cost
 

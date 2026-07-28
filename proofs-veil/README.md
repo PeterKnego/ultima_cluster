@@ -52,6 +52,42 @@ checker for bug-finding and design assurance** — never as a proof of record.
 - `logs/` — the decisive `#model_check` runs (see the gate doc + checkpoint memo).
 - `spike-ledger.md` — the running SDD ledger across all sessions.
 
+## Reproducing a run (there is deliberately NO CI job — see below)
+
+Guardrail 2 means nothing here builds in this repo or on any CI gate, so
+re-running a model is a manual, on-demand act. The recipe (extracted from
+`spike-ledger.md`'s V0 section, which is the primary record):
+
+1. Clone `verse-lab/veil` at branch **`veil-2.0-preview`** — the ONLY branch with
+   the explicit-state `#model_check` reachability engine. `main` pins Lean 4.24
+   and has SMT (`#check_invariants`) only. The spike used
+   `/home/claude/veil-spike/veil-preview`, which is what
+   `scripts/runmod.sh` hardcodes.
+2. `lake exe cache get` (mathlib, ~8010 files), then `lake build` bounded to
+   `-j3` — the full build is ~1418 jobs and this box has no swap.
+3. Expect ONE failure: the npm infoview widget (browser trace visualization, not
+   core). Work around it offline by stubbing
+   `.lake/build/js/{RefreshComponent,traceDisplay,verificationResults}.js` and
+   commenting `needs := #[widgetJsAll]` in the lakefile. Core + ModelChecker are
+   unaffected; the text trace — the artifact that matters — prints fine.
+4. Copy the model under `Examples/UC/` in that checkout and run it with
+   **`lake build Examples.UC.<Module>`** (`scripts/runmod.sh` does exactly this).
+   NOT `lake env lean`: `#model_check` runs at elaboration and needs the cvc5/z3
+   `.so` FFI under `.lake/packages/`, which the interpreter misses
+   (`cvc5.TermManager.new` symbol error).
+5. Watch memory. Peak `lean` RSS on decisive explicit-state runs was ~5.7 GB and
+   this box has no swap (see `CLAUDE.md`); the spike ran an active memory-watch
+   that killed on <2.5 GB free. Logs belong on real disk, never `/tmp`.
+
+**Why no nightly job** (adjudicated 2026-07-28, closing the gate doc's §6 item 5):
+a Veil model has no conformance rig by construction (guardrail 1), so it cannot
+detect Rust drift — the thing a nightly gate exists to catch. What it WOULD catch
+is rot in an external preview-branch toolchain, at the price of building veil +
+mathlib + FFI on every run and standing an isolation guardrail down. The
+`lean-proofs` nightly job already covers model-vs-Rust drift for the trusted base,
+because `proofs/` DOES have a conformance rig. On-demand reproduction, per the
+recipe above, is the right cadence for a scratch instrument.
+
 ## Results (see `docs/benchmarks/uc2-veil-spike-2026-07-24.md`)
 
 - **V0/V1 + Bar-1**: PASS (sessions 1–2). Both Veil engines confirmed on the UC
