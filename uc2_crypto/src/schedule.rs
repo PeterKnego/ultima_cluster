@@ -70,7 +70,12 @@ impl GroupKey {
 /// [`derive_send_key`]. Not secret on its own (it is not key material by
 /// itself — it is a public separator, exchanged alongside the handshake in
 /// T6), so it is not zeroized.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `Hash` added (T9 review round 1, F1): `Transport`'s group-scope replay
+/// window is keyed by `(sender, epoch, salt)` — the salt has to be part of
+/// the key so a recurring epoch number (`GroupPlane::next_epoch` restarts at
+/// 0 on every fresh process) under a NEW boot salt starts a fresh window
+/// instead of colliding with the old boot's high-water mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BootSalt(pub [u8; 16]);
 
 /// Derives the per-sender-per-boot sealing key: `HKDF-SHA256` with `salt`

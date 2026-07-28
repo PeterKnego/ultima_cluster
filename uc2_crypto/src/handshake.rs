@@ -354,6 +354,49 @@ impl Peers {
             .map(|session| session.boot_salt)
     }
 
+    /// The boot salt of the `pending` session with `peer`, if any — the salt
+    /// a peer began advertising after a restart, before its PAIRWISE path
+    /// has switched over (see the module docs' "simultaneous open" /
+    /// `pending` discussion, and [`HandshakeAction::Established`]'s
+    /// `confirmed` field).
+    ///
+    /// Added for T9's group-scope open path (review round 1, F2): a
+    /// restarted peer's group-sealed fan-out uses its NEW salt immediately,
+    /// but [`Peers::peer_boot_salt`] alone won't report it until a PAIRWISE
+    /// datagram happens to promote `pending` on its own — which, for a
+    /// restarted leader whose steady-state traffic to a given follower is
+    /// almost entirely group-scope, may not happen for a long time. A caller
+    /// that fails to open under [`Peers::peer_boot_salt`]'s salt should try
+    /// this one too, exactly as [`Peers::open_pairwise`] already tries
+    /// `current` then `pending` for its own traffic.
+    pub fn peer_pending_boot_salt(&self, peer: NodeId) -> Option<BootSalt> {
+        self.peers
+            .get(&peer)
+            .and_then(|entry| entry.pending.as_ref())
+            .map(|session| session.boot_salt)
+    }
+
+    /// Promotes `peer`'s `pending` session to `current` — exactly what a
+    /// successful [`Peers::open_pairwise`] trial under `pending` does
+    /// internally, exposed for a caller (T9's group-scope open path) that
+    /// independently proved the peer has adopted the pending session via a
+    /// GROUP-scope open rather than a pairwise one. Sets the same
+    /// `promoted` flag `open_pairwise`'s own promotion does, so the next
+    /// [`Peers::tick`] announces `Established { confirmed: true }` either
+    /// way. A no-op (returns `false`) if `peer` has no pending session.
+    pub fn promote_pending(&mut self, peer: NodeId) -> bool {
+        let Some(entry) = self.peers.get_mut(&peer) else {
+            return false;
+        };
+        if entry.pending.is_some() {
+            entry.current = entry.pending.take();
+            entry.promoted = true;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Asks for a link to `peer`. Idempotent: a second call while a handshake
     /// is in flight, or while a session is up, produces no traffic. The intent
     /// is remembered, so [`Peers::tick`] keeps retrying if this attempt cannot

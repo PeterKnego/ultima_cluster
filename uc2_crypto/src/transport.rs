@@ -49,20 +49,38 @@
 //! operation from reading "the" current epoch.
 //!
 //! # Carried requirement #3 — `peer_boot_salt`, not a cached `Established` salt
+//! (revised after review round 1 — F1/F2 were a real bug in the original version)
 //!
 //! Opening group traffic from `from` requires deriving `from`'s sealing key,
-//! which needs `from`'s boot salt. [`Transport::open`]'s group branch calls
-//! [`Peers::peer_boot_salt`] FRESH on every call rather than caching a salt
-//! observed from a past `HandshakeAction::Established` action — a session can
-//! be established-but-unpromoted (`confirmed: false`) for up to 30s after a
-//! peer restart (`handshake.rs`'s `PENDING_TTL_NS`), during which the peer's
-//! GROUP-scoped fan-out already uses its new salt even though the PAIRWISE
-//! path has not switched yet. A cached salt from the wrong side of that
-//! window derives the wrong key and every group datagram from a just-restarted
-//! peer fails to open until the cache is somehow invalidated. `peer_boot_salt`
-//! always reports the salt of the session in force right now, so this class
-//! of staleness cannot occur no matter how the caller's own bookkeeping is
-//! shaped.
+//! which needs `from`'s boot salt. [`Transport::open_group`] never caches a
+//! salt across calls — no `Transport` field holds one, and nothing observed
+//! from a past `HandshakeAction::Established` action is stored. Every call
+//! re-derives from whatever [`Peers`] reports RIGHT NOW.
+//!
+//! **The first version of this section claimed that calling
+//! [`Peers::peer_boot_salt`] fresh on every call was BY ITSELF enough to
+//! close this staleness class "no matter how the caller's own bookkeeping is
+//! shaped." That was wrong, and review round 1 (F1, F2) demonstrated it with
+//! a probe: a restarted peer's group traffic came back `Err(AuthFailed)`,**
+//! because `peer_boot_salt` reports only the PAIRWISE session's `current`
+//! salt — and a restarted peer's session lands in `pending` (WireGuard-style,
+//! `handshake.rs`) until something PROVES the peer adopted it. Nothing but a
+//! successful PAIRWISE open drives that promotion on `open_pairwise`'s own,
+//! and a restarted LEADER's steady-state traffic to a given follower is
+//! almost entirely GROUP-scope — so the pairwise proof needed to make
+//! `peer_boot_salt` start reporting the new salt may not arrive for a long
+//! time, not just the 30s `PENDING_TTL_NS` bound this doc originally (wrongly)
+//! implied.
+//!
+//! The fix, in [`Transport::open_group`]: try the current salt via
+//! `peer_boot_salt` first (the common case), and on failure ALSO try the
+//! `pending` session's salt via [`Peers::peer_pending_boot_salt`] — mirroring
+//! `open_pairwise`'s own current-then-pending trial — promoting `pending` via
+//! [`Peers::promote_pending`] on a group-scope success, since that is exactly
+//! as strong a proof the peer adopted its new session as a pairwise success
+//! would be. See [`Transport::open_group`]'s own doc for the full account,
+//! including F1 (the replay-window key had to widen to include the salt too
+//! — see the next paragraph).
 //!
 //! # Carried requirement #4 — cipher caching on the fan-out hot path
 //!
@@ -83,15 +101,21 @@
 //! `handshake.rs`'s private `Session` state from outside its own module for
 //! a case the measured bar does not require.
 //!
-//! [`Transport::open`]'s group branch deliberately does NOT cache a cipher
-//! (unlike the seal side): caching it correctly would need a cache key wide
-//! enough to invalidate on a peer's boot-salt change independent of any
-//! epoch rotation (see carried requirement #3 above) — solvable, but the
-//! measured perf bar this task answers to is about the SEND path (finding
-//! (f) in the plan ledger), and getting the receive-side invalidation wrong
-//! would silently reintroduce the exact staleness class #3 exists to close.
-//! Left as a documented, deliberately deferred optimization rather than a
-//! rushed one.
+//! [`Transport::open_group`] deliberately does NOT cache a cipher (unlike the
+//! seal side): it still pays one `Aes256Gcm::new` per received group-scope
+//! datagram — that cost is real, not free, just not the one the measured
+//! finding (f) was about (finding (f), in the plan ledger, is specifically
+//! the SEND-side fan-out cost). Caching the receive side correctly would
+//! need a cache key wide enough to invalidate on a peer's boot-salt change
+//! independent of any epoch rotation — solvable (review round 1's F1 fix
+//! shows the shape: key on `(sender, epoch, salt)`), but getting a CACHE's
+//! invalidation wrong is a materially worse failure mode than the
+//! uncached version paying an avoidable ~133 ns: review round 1's F2 was
+//! exactly this class of bug in the uncached code (using the wrong salt,
+//! full stop, not merely a stale cache entry), and a wrong invalidation rule
+//! would have been the same bug wearing a cache. Left as a documented,
+//! deliberately deferred optimization, not a claim that the receive path is
+//! free.
 //!
 //! # Carried requirement #5 — `open_detached`
 //!
@@ -109,7 +133,7 @@ use crate::handshake::Peers;
 use crate::identity::{Allowlist, Identity};
 use crate::replay::ReplayWindow;
 use crate::rotation::{RotationPolicy, RotationReason, RotationState};
-use crate::schedule::derive_send_key;
+use crate::schedule::{BootSalt, derive_send_key};
 use crate::seal::{open_in_place, seal_with};
 use crate::{CryptoError, NodeId};
 use aes_gcm::aead::generic_array::GenericArray;
@@ -118,6 +142,7 @@ use rand::TryRngCore;
 use rand::rngs::OsRng;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use uc_protocol::v2::crypto::{DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_KEY, DGRAM_KIND_HS_RESP};
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION,
     DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
@@ -151,6 +176,16 @@ pub enum CryptoConfig {
 pub enum Scope {
     Group,
     Pairwise,
+    /// The bootstrap handshake kinds (`HS_INIT`/`HS_RESP`, spec §5) — no
+    /// session and no key exist yet for these; they are what CREATES a
+    /// session, driven directly via [`Peers::initiate`]/[`Peers::on_message`],
+    /// never through [`Transport::seal`]/[`Transport::open`]. Named
+    /// explicitly (review F4) rather than left to the catch-all: the
+    /// catch-all's `Pairwise` default is safe for a genuinely unknown FUTURE
+    /// kind (worst case, a missed fan-out optimization), but would be
+    /// actively wrong here — attempting to AEAD-seal/open a handshake
+    /// message under a nonexistent pairwise session, rather than refusing.
+    Unsealed,
 }
 
 /// The crate's facade: one `seal`/`open` pair, the counter, and the key
@@ -169,11 +204,31 @@ pub struct Transport {
     /// Rebuilt only when the epoch actually changes.
     seal_cache: Option<(u16, Aes256Gcm)>,
     /// Anti-replay state for RECEIVED group-scope traffic, one window per
-    /// (sender, epoch) — `GroupPlane` itself tracks no receive-side replay
-    /// state (that is a `Peers`/`Session` concept on the pairwise side; the
-    /// group side has no `Session` to hang a window off, so `Transport` is
-    /// where it has to live).
-    group_replay: HashMap<(NodeId, u16), ReplayWindow>,
+    /// (sender, epoch, salt) — `GroupPlane` itself tracks no receive-side
+    /// replay state (that is a `Peers`/`Session` concept on the pairwise
+    /// side; the group side has no `Session` to hang a window off, so
+    /// `Transport` is where it has to live). The key is 3-wide, not
+    /// `(sender, epoch)` — review round 1, F1: `GroupPlane::next_epoch`
+    /// restarts at 0 on every fresh process, so a restarted sender's epoch
+    /// numbers recur; the salt (fresh per process start) is what keeps a
+    /// recurring epoch number from colliding with a stale high-water mark
+    /// left over from the sender's previous boot. See
+    /// [`Transport::open_group`]'s doc for the full account.
+    ///
+    /// F6 (review round 1, minor, deferred): entries are never pruned — no
+    /// counterpart to `KeySchedule::retire_below`, no eviction when a peer
+    /// leaves the cluster. Widening the key (the F1 fix above) makes this
+    /// LESS harmful than it was: a stale entry for a peer's old boot is
+    /// permanently dead weight, never a false positive, since it can only
+    /// ever be looked up again under the salt that produced it. Still
+    /// unbounded growth over a very long-lived cluster with many
+    /// restarts/removals; left as a known gap rather than fixed here — a
+    /// real fix wants to hang off the SAME membership-change signal
+    /// `rotation.rs`'s `Removal` trigger already observes
+    /// (`on_committed_config`), which is a small enough addition to belong
+    /// in whichever task next touches this map, not squeezed into a review
+    /// fix round.
+    group_replay: HashMap<(NodeId, u16, BootSalt), ReplayWindow>,
 }
 
 impl Transport {
@@ -212,7 +267,7 @@ impl Transport {
         OsRng
             .try_fill_bytes(&mut salt_bytes)
             .expect("the OS RNG is unavailable");
-        let boot_salt = crate::schedule::BootSalt(salt_bytes);
+        let boot_salt = BootSalt(salt_bytes);
 
         let peers = Peers::new(identity, allowlist, self_id, boot_salt);
 
@@ -258,6 +313,17 @@ impl Transport {
             | DGRAM_KIND_CONFIG_PROPOSAL
             | DGRAM_KIND_CONFIG_REPLY => Scope::Pairwise,
 
+            // Bootstrap: no session exists yet, so neither AEAD scope
+            // applies — see [`Scope::Unsealed`]'s doc. Named explicitly
+            // (review F4), not left to the catch-all below.
+            DGRAM_KIND_HS_INIT | DGRAM_KIND_HS_RESP => Scope::Unsealed,
+            // Rides the ALREADY-established pairwise channel (group.rs:
+            // "the node layer seals the HS_KEY body over the peer's
+            // already-established pairwise channel and sends it") — this
+            // one DOES go through `Transport::seal`/`open` like any other
+            // pairwise kind, unlike its 18/19 bootstrap siblings above.
+            DGRAM_KIND_HS_KEY => Scope::Pairwise,
+
             // Every kind this crate knows about is named above. Anything
             // else — a future kind not yet added to this match, or garbage
             // read off the wire before the kind is even validated — is
@@ -282,26 +348,22 @@ impl Transport {
     /// closed with [`CryptoError::NoGroupKey`] if no epoch has ever
     /// activated yet — NEVER falls back to sending `buf` unsealed.
     ///
-    /// For `Scope::Pairwise`: `peer` MUST be `Some` — see the panic note
-    /// below — and this seals under that peer's established session via
-    /// [`Peers::seal_pairwise`].
+    /// For `Scope::Pairwise`: `peer` MUST be `Some` — a `None` here returns
+    /// [`CryptoError::MissingPeer`] rather than sealing anything (see that
+    /// variant's doc for why this is a `Result`, not a panic) — and this
+    /// seals under that peer's established session via [`Peers::seal_pairwise`].
     ///
-    /// Either branch allocates the next value from [`Transport`]'s single
-    /// counter before attempting the seal; a failed attempt (e.g.
-    /// `NoSession`) simply burns that counter value rather than reusing it —
-    /// harmless (counters need only never repeat, not be dense) and simpler
-    /// than threading the allocation back out of a failed call.
+    /// For `Scope::Unsealed` (the `HS_INIT`/`HS_RESP` handshake bootstrap
+    /// kinds): always [`CryptoError::UnsealedKind`]. These never have a
+    /// session to seal under BY DESIGN — they are driven directly via
+    /// [`Peers::initiate`]/[`Peers::on_message`], never through this facade.
     ///
-    /// # Panics
-    ///
-    /// If `Transport::scope_of(kind) == Scope::Pairwise` and `peer` is
-    /// `None`. This is a caller-contract violation, not attacker-controlled
-    /// input (`kind` and `peer` are the CALLER's own routing decision, never
-    /// bytes off the wire — the crate's "never panic on untrusted input"
-    /// rule is about `open`, which is where adversarial bytes actually
-    /// enter), so it panics loudly rather than inventing a
-    /// `CryptoError::NoSession(0)` that would misrepresent an internal bug
-    /// as "no session with node 0" in an operator's logs.
+    /// Either non-`Unsealed` branch allocates the next value from
+    /// [`Transport`]'s single counter before attempting the seal; a failed
+    /// attempt (e.g. `NoSession`) simply burns that counter value rather
+    /// than reusing it — harmless (counters need only never repeat, not be
+    /// dense) and simpler than threading the allocation back out of a
+    /// failed call.
     pub fn seal(
         &mut self,
         kind: u8,
@@ -312,13 +374,13 @@ impl Transport {
         match Self::scope_of(kind) {
             Scope::Group => self.seal_group(buf, now_ns),
             Scope::Pairwise => {
-                let peer = peer.expect(
-                    "Transport::seal: scope_of(kind) == Pairwise requires Some(peer) — \
-                     caller-contract violation, not attacker input",
-                );
+                let Some(peer) = peer else {
+                    return Err(CryptoError::MissingPeer(kind));
+                };
                 let counter = self.next_counter();
                 self.peers.seal_pairwise(peer, buf, counter)
             }
+            Scope::Unsealed => Err(CryptoError::UnsealedKind(kind)),
         }
     }
 
@@ -331,13 +393,21 @@ impl Transport {
             .sealing_epoch(now_ns)
             .ok_or(CryptoError::NoGroupKey)?;
 
-        buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2].copy_from_slice(&epoch.to_le_bytes());
-
+        // F3 (review round 1): `sealing_epoch` and `schedule().get(epoch)`
+        // CAN disagree — `sealing_epoch` can name an epoch `KeySchedule`'s
+        // 2-deep window has since evicted (reachable: two mints in a row
+        // that never activate before being superseded; see
+        // `seal_group_fails_closed_when_sealing_epoch_names_an_epoch_evicted_from_the_schedule`).
+        // The cipher/key lookup — the only fallible step left — MUST resolve
+        // before `buf` is mutated at all, or a failure here leaves the
+        // caller's staged datagram corrupted even though the call "failed".
+        // This is byte-for-byte mutant 3's failure mode from the original
+        // task report, reachable for real via this path.
         let counter = self.next_counter();
-        {
-            let cipher = self.group_seal_cipher(epoch)?;
-            seal_with(buf, cipher, counter)?;
-        }
+        let cipher = self.group_seal_cipher(epoch)?;
+
+        buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2].copy_from_slice(&epoch.to_le_bytes());
+        seal_with(buf, cipher, counter)?;
         self.rotation.on_bytes_sealed(buf.len() as u64);
         Ok(())
     }
@@ -380,17 +450,19 @@ impl Transport {
     ///
     /// `Scope::Group`: looks up the key for the epoch NAMED IN THE DATAGRAM's
     /// header via `group.schedule().get(epoch)` — never `.current()`, see
-    /// carried requirement #2 — derives `from`'s send key using
-    /// [`Peers::peer_boot_salt`] fetched FRESH on this call (carried
-    /// requirement #3, never a cached salt), opens, and checks+records the
-    /// counter in this sender+epoch's replay window. An epoch this node has
-    /// never seen (rotated out, or a peer on a newer epoch we have not yet
-    /// received `HS_KEY` for) is [`CryptoError::NoGroupKey`] — never a panic,
-    /// always self-heals once `HS_KEY` lands (spec §5/§6).
+    /// carried requirement #2. An epoch this node has never seen (rotated
+    /// out, or a peer on a newer epoch we have not yet received `HS_KEY`
+    /// for) is [`CryptoError::NoGroupKey`] — never a panic, always self-heals
+    /// once `HS_KEY` lands (spec §5/§6). See [`Transport::open_group`] for
+    /// the salt-trial and replay-window details (review F1/F2 fixed a real
+    /// liveness bug here — read that method's doc before touching it).
     ///
     /// `Scope::Pairwise`: delegates entirely to [`Peers::open_pairwise`],
     /// which owns that peer's session lookup, current/pending trial, and
     /// replay window.
+    ///
+    /// `Scope::Unsealed`: always [`CryptoError::UnsealedKind`] — see
+    /// [`Scope::Unsealed`]'s doc.
     pub fn open(&mut self, from: NodeId, buf: &mut Vec<u8>) -> Result<(), CryptoError> {
         if buf.len() < DATAGRAM_HEADER_LEN {
             return Err(CryptoError::TooShort);
@@ -399,32 +471,134 @@ impl Transport {
         match Self::scope_of(header.kind) {
             Scope::Group => self.open_group(from, header.key_epoch, buf),
             Scope::Pairwise => self.peers.open_pairwise(from, buf).map(|_counter| ()),
+            Scope::Unsealed => Err(CryptoError::UnsealedKind(header.kind)),
         }
     }
 
+    /// Opens a group-scope datagram from `from` under the epoch named in its
+    /// header.
+    ///
+    /// # Review F1/F2 (round 1) — a real liveness bug, fixed here
+    ///
+    /// The FIRST version of this method derived `from`'s key using only
+    /// [`Peers::peer_boot_salt`] (the PAIRWISE session's salt — `entry.current`
+    /// only) and recorded replay state keyed by `(from, epoch)` alone. Both
+    /// were wrong, and compounded each other:
+    ///
+    /// - **F1**: [`crate::group::GroupPlane::next_epoch`] starts at 0 on
+    ///   EVERY fresh process, so a restarted peer's first post-restart mint
+    ///   recurs the SAME epoch number it used pre-restart. A `(from, epoch)`
+    ///   replay window survives the restart (it lives in THIS node's memory,
+    ///   not the restarted peer's), so the restarted peer's fresh counter
+    ///   (starting back at 1) lands under the OLD boot's high-water mark and
+    ///   is rejected as a replay — permanently, since the mark only grows.
+    /// - **F2**: `Peers::peer_boot_salt` reports the salt of the PAIRWISE
+    ///   session in force — but a restarted peer's session lands in
+    ///   `pending` (WireGuard-style, `handshake.rs`) until something PROVES
+    ///   the peer adopted it, and nothing but a successful PAIRWISE open
+    ///   drives that promotion on its own. A restarted LEADER's steady-state
+    ///   traffic to a given follower is almost entirely GROUP-scope, so that
+    ///   proof may not arrive for a long time — `peer_boot_salt` alone keeps
+    ///   reporting the peer's OLD, pre-restart salt, and every group
+    ///   datagram from the restarted peer fails AEAD authentication.
+    ///
+    /// The fix mirrors [`Peers::open_pairwise`]'s own current-then-pending
+    /// trial: try the CURRENT session's salt first (the common case, and the
+    /// only one most datagrams ever need); if that fails, try the PENDING
+    /// session's salt (via [`Peers::peer_pending_boot_salt`]), and — a group-
+    /// scope success under `pending` is exactly as strong a proof the peer
+    /// adopted its new session as a pairwise success would be — promote it
+    /// via [`Peers::promote_pending`]. The replay window is now keyed by
+    /// `(from, epoch, salt)`, not `(from, epoch)`: the salt that actually
+    /// opened the datagram is part of the key, so a recurring epoch number
+    /// under a NEW salt starts a brand-new window rather than colliding with
+    /// the old boot's.
     fn open_group(
         &mut self,
         from: NodeId,
         epoch: u16,
         buf: &mut Vec<u8>,
     ) -> Result<(), CryptoError> {
+        // Epoch validity is salt-independent — check once, up front, so an
+        // unknown epoch is always `NoGroupKey` regardless of whether any
+        // session (current or pending) even exists yet.
+        if self.group.schedule().get(epoch).is_none() {
+            return Err(CryptoError::NoGroupKey);
+        }
+
+        let mut last_err = CryptoError::NoSession(from);
+
+        if let Some(salt) = self.peers.peer_boot_salt(from) {
+            match self.open_group_under_salt(from, epoch, &salt, buf) {
+                Ok(counter) => return self.finish_group_open(from, epoch, salt, counter),
+                Err(e) => last_err = e,
+            }
+        }
+
+        // Trial 2 — F2's fix. `open_pairwise` tries `pending` on the receive
+        // path already; group traffic gets the same trial here instead of
+        // waiting on a pairwise datagram that may not come.
+        if let Some(salt) = self.peers.peer_pending_boot_salt(from) {
+            match self.open_group_under_salt(from, epoch, &salt, buf) {
+                Ok(counter) => {
+                    self.peers.promote_pending(from);
+                    return self.finish_group_open(from, epoch, salt, counter);
+                }
+                Err(e) => last_err = e,
+            }
+        }
+
+        Err(last_err)
+    }
+
+    /// One salt trial: derive `from`'s key under `epoch` and `salt`, and
+    /// attempt to open `buf` with it. `&self` only — no session-table
+    /// mutation happens here, so a caller can try multiple salts against the
+    /// same `buf` without any intermediate `&mut self` step (`open_in_place`
+    /// leaves `buf` byte-for-byte unchanged on failure, same discipline
+    /// `open_pairwise` relies on for its own current/pending trial).
+    fn open_group_under_salt(
+        &self,
+        from: NodeId,
+        epoch: u16,
+        salt: &BootSalt,
+        buf: &mut Vec<u8>,
+    ) -> Result<u64, CryptoError> {
         let group_key = self
             .group
             .schedule()
             .get(epoch)
             .ok_or(CryptoError::NoGroupKey)?;
-        // Fresh every call — carried requirement #3. Never cache this value
-        // across calls; see the module docs for why a cached salt can be
-        // stale for up to 30s after a peer restart.
-        let salt = self
-            .peers
-            .peer_boot_salt(from)
-            .ok_or(CryptoError::NoSession(from))?;
-        let key: Zeroizing<[u8; 32]> = Zeroizing::new(derive_send_key(group_key, from, &salt));
+        let key: Zeroizing<[u8; 32]> = Zeroizing::new(derive_send_key(group_key, from, salt));
+        open_in_place(buf, &key)
+    }
 
-        let counter = open_in_place(buf, &key)?;
-
-        let window = self.group_replay.entry((from, epoch)).or_default();
+    /// Records `counter` in the `(from, epoch, salt)` replay window — see
+    /// this key's rationale in [`Transport::open_group`]'s F1 discussion.
+    ///
+    /// F7 (review round 1, minor, documented not fixed): by the time this
+    /// runs, `open_in_place` has already decrypted `buf` in place and
+    /// shrunk it (the `Vec`-based `open_*` contract). If `check_and_set`
+    /// rejects the counter as a replay, `buf` is left decrypted+shrunk
+    /// anyway — asymmetric with [`Transport::seal_group`]'s untouched-
+    /// on-failure property. This is not a new inconsistency introduced
+    /// here: it is the SAME order `Peers::open_pairwise` already uses
+    /// (open, then a separate `replay_check` step) — AEAD-open-then-replay-
+    /// check is this crate's established order (`seal.rs`'s module docs:
+    /// "AEAD stops forgery, not replay"), and restoring the pre-open bytes
+    /// on a replay-rejection would need a full buffer copy on every group
+    /// open to cover a rejection path that is rare by construction (a
+    /// replay is, definitionally, not routine traffic). Left matching the
+    /// pairwise path's existing behavior rather than fixed to something
+    /// inconsistent with it.
+    fn finish_group_open(
+        &mut self,
+        from: NodeId,
+        epoch: u16,
+        salt: BootSalt,
+        counter: u64,
+    ) -> Result<(), CryptoError> {
+        let window = self.group_replay.entry((from, epoch, salt)).or_default();
         if window.check_and_set(counter) {
             Ok(())
         } else {
@@ -432,13 +606,37 @@ impl Transport {
         }
     }
 
+    /// Forwards to [`RotationState::on_became_leader`] — call this whenever
+    /// the node layer observes it has just become leader. Added T9 review
+    /// round 1 (F5): without this, [`Transport::rotation_due`] could never
+    /// report [`RotationReason::BecameLeader`], and there was no compile
+    /// error to catch a future task forgetting to wire it — `RotationState`
+    /// was reachable in theory but not through anything `Transport` exposed.
+    pub fn on_became_leader(&mut self) {
+        self.rotation.on_became_leader();
+    }
+
+    /// Forwards to [`RotationState::on_committed_config`] — call this on
+    /// EVERY committed config change, promotes and demotes included, not
+    /// only removals (`rotation.rs`'s own doc: the pure function needs to
+    /// see demotes to correctly NOT rotate on them). Added T9 review round 1
+    /// (F5): this is the ONLY path that can latch
+    /// [`RotationReason::Removal`] — `rotation.rs` names it "the
+    /// security-relevant trigger" because a removed node keeps decrypting
+    /// captured group traffic until the key actually changes — and it was
+    /// unreachable through `Transport` before this fix.
+    pub fn on_committed_config(&mut self, tombstone_count: usize) {
+        self.rotation.on_committed_config(tombstone_count);
+    }
+
     /// Forwards to [`RotationState::take_due`]. See `rotation.rs` — this is
     /// a pure decision, driven by whatever the node layer has fed into the
-    /// underlying [`RotationState`] via its own event methods (a later
-    /// task's wiring: this crate does not yet expose
-    /// `on_became_leader`/`on_committed_config` through `Transport`, only
-    /// `on_bytes_sealed`, which [`Transport::seal`]'s group branch drives
-    /// automatically on every successful group seal).
+    /// underlying [`RotationState`] via [`Transport::on_became_leader`],
+    /// [`Transport::on_committed_config`], and `on_bytes_sealed` (which
+    /// [`Transport::seal`]'s group branch drives automatically on every
+    /// successful group seal — the only one of the three with no separate
+    /// public entry point, since it is purely a function of what `Transport`
+    /// itself just did).
     pub fn rotation_due(&mut self, now_ns: u64) -> Option<RotationReason> {
         self.rotation.take_due(now_ns)
     }
@@ -491,9 +689,95 @@ mod tests {
     #[test]
     fn every_wire_kind_has_an_assigned_scope() {
         // Guards against a future kind silently defaulting to the wrong scope.
-        for k in 1..=DGRAM_KIND_CONFIG_REPLY {
-            let _ = Transport::scope_of(k);
+        //
+        // Review round 1 (F4): the brief-mandated form of this test —
+        // `for k in 1..=17 { let _ = scope_of(k); }` — discards its return
+        // value and can only ever catch a PANIC, never a wrong
+        // classification (every kind here is ALSO covered, correctly, by
+        // `fan_out_kinds_take_the_group_key_and_the_rest_are_pairwise`, so
+        // this test was never adding coverage beyond "does not panic").
+        // Strengthened in place to actually assert, rather than adding a
+        // second near-duplicate test.
+        for k in [
+            DGRAM_KIND_DATA,
+            DGRAM_KIND_HEARTBEAT,
+            DGRAM_KIND_COMMIT_POSITION,
+            DGRAM_KIND_READ_PROBE,
+        ] {
+            assert_eq!(Transport::scope_of(k), Scope::Group, "kind {k}");
         }
+        for k in [
+            DGRAM_KIND_NAK,
+            DGRAM_KIND_STATUS,
+            DGRAM_KIND_APPEND_POSITION,
+            DGRAM_KIND_READ_PROBE_ACK,
+            DGRAM_KIND_REQUEST_VOTE,
+            DGRAM_KIND_VOTE,
+            DGRAM_KIND_TERM_MAP,
+            DGRAM_KIND_SNAP_BEGIN,
+            DGRAM_KIND_SNAP_CHUNK,
+            DGRAM_KIND_SNAP_NAK,
+            DGRAM_KIND_SNAP_DONE,
+            DGRAM_KIND_CONFIG_PROPOSAL,
+            DGRAM_KIND_CONFIG_REPLY,
+        ] {
+            assert_eq!(Transport::scope_of(k), Scope::Pairwise, "kind {k}");
+        }
+        // The full 1..=17 sweep still runs too, now checked against the same
+        // partition instead of merely not-panicking.
+        for k in 1..=DGRAM_KIND_CONFIG_REPLY {
+            let expect_group = matches!(
+                k,
+                DGRAM_KIND_DATA
+                    | DGRAM_KIND_HEARTBEAT
+                    | DGRAM_KIND_COMMIT_POSITION
+                    | DGRAM_KIND_READ_PROBE
+            );
+            let want = if expect_group {
+                Scope::Group
+            } else {
+                Scope::Pairwise
+            };
+            assert_eq!(Transport::scope_of(k), want, "kind {k}");
+        }
+    }
+
+    #[test]
+    fn handshake_bootstrap_kinds_are_unsealed_hs_key_is_pairwise() {
+        // F4: HS_INIT(18)/HS_RESP(19) must never be classified Pairwise (or
+        // Group) — no session exists yet for them, they ARE the bootstrap.
+        // HS_KEY(20) rides an ALREADY-established pairwise channel and stays
+        // Pairwise. Before this fix, all three fell through `scope_of`'s
+        // catch-all to `Pairwise` — HS_KEY correctly by luck, HS_INIT/HS_RESP
+        // for the wrong reason (failed closed only because no session
+        // exists yet, not because the design says so).
+        assert_eq!(Transport::scope_of(DGRAM_KIND_HS_INIT), Scope::Unsealed);
+        assert_eq!(Transport::scope_of(DGRAM_KIND_HS_RESP), Scope::Unsealed);
+        assert_eq!(Transport::scope_of(DGRAM_KIND_HS_KEY), Scope::Pairwise);
+    }
+
+    #[test]
+    fn seal_and_open_refuse_unsealed_kinds_rather_than_attempting_anything() {
+        let mut t = node_transport("unsealed-kind-seal", 1, PRIV_SOLO, &[]);
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader {
+                position: 0,
+                leadership_term_id: 0,
+                kind: DGRAM_KIND_HS_INIT,
+                flags: 0,
+                key_epoch: 0,
+            },
+        );
+        assert!(matches!(
+            t.seal(DGRAM_KIND_HS_INIT, None, &mut d, 0),
+            Err(CryptoError::UnsealedKind(k)) if k == DGRAM_KIND_HS_INIT
+        ));
+        assert!(matches!(
+            t.open(2, &mut d),
+            Err(CryptoError::UnsealedKind(k)) if k == DGRAM_KIND_HS_INIT
+        ));
     }
 
     #[test]
@@ -646,9 +930,13 @@ mod tests {
     /// that one directly — it lives in a different file's private test
     /// module — but the shape is identical, and it is exercising the exact
     /// same public `Peers` API this crate's own reviewed handshake tests do,
-    /// not anything transport.rs invents). Runs until both sides report
-    /// `Established { confirmed: true }` or the exchange quiesces.
-    fn establish(a: &mut Transport, b: &mut Transport, mut acts: Vec<HandshakeAction>) {
+    /// not anything transport.rs invents). Runs until the exchange quiesces.
+    /// Does NOT assert anything about the resulting session state — a
+    /// second handshake against a peer that already has a `current` session
+    /// (the restart scenario) legitimately lands in `pending`, not
+    /// `current`; see [`establish`] for the common "first-ever handshake"
+    /// case that DOES assert.
+    fn pump_handshake(a: &mut Transport, b: &mut Transport, mut acts: Vec<HandshakeAction>) {
         let (a_id, b_id) = (a.self_id, b.self_id);
         for _ in 0..8 {
             let mut next = Vec::new();
@@ -667,8 +955,47 @@ mod tests {
             }
             acts = next;
         }
+    }
+
+    /// [`pump_handshake`] plus the assertion that both sides landed on
+    /// `current` — the right check for a peer's FIRST-EVER handshake, wrong
+    /// for a second one against an already-established peer (see
+    /// [`pump_handshake`]'s doc).
+    fn establish(a: &mut Transport, b: &mut Transport, acts: Vec<HandshakeAction>) {
+        let (a_id, b_id) = (a.self_id, b.self_id);
+        pump_handshake(a, b, acts);
         assert!(a.peers.is_established(b_id), "a failed to establish with b");
         assert!(b.peers.is_established(a_id), "b failed to establish with a");
+    }
+
+    /// Drives a `GroupPlane::mint`'s `HS_KEY` delivery actions to
+    /// completion: feeds each delivery to `follower`, and each resulting ack
+    /// back to `leader`, activating the epoch once the mint's peer set is
+    /// fully acked. Bypasses the pairwise AEAD layer entirely (feeds
+    /// `GroupPlane::on_key_message` directly rather than sealing/opening
+    /// over the peers' pairwise session) — `group.rs`'s own tests establish
+    /// that this module's job (`GroupPlane`'s mint/ack/activate state
+    /// machine) is correct in isolation; this helper only needs it to KEY
+    /// synchronization, not to re-prove that layer.
+    fn deliver_group_key(
+        leader: &mut Transport,
+        follower: &mut Transport,
+        actions: Vec<HandshakeAction>,
+    ) {
+        let (leader_id, follower_id) = (leader.self_id, follower.self_id);
+        for act in actions {
+            let HandshakeAction::Send { to, body, .. } = act else {
+                panic!("mint must emit a Send action")
+            };
+            assert_eq!(to, follower_id);
+            let reply = follower.group.on_key_message(leader_id, &body);
+            for r in reply {
+                let HandshakeAction::Send { body: rbody, .. } = r else {
+                    panic!("a well-formed delivery must ack back")
+                };
+                leader.group.on_key_message(follower_id, &rbody);
+            }
+        }
     }
 
     // ---- Beyond the mandated five. Every prior task in this plan shipped
@@ -742,6 +1069,62 @@ mod tests {
         assert_eq!(
             got, epoch,
             "the sealed header must carry the epoch that was actually used to seal it"
+        );
+    }
+
+    #[test]
+    fn seal_group_fails_closed_when_sealing_epoch_names_an_epoch_evicted_from_the_schedule() {
+        // F3 (review round 1): sealing_epoch() and schedule().get(epoch) can
+        // disagree. Reproduction: mint e0 with no peers (activates
+        // immediately once folded); mint e1 with a peer that never acks
+        // (folds e0 into active_epoch, since e0 HAD activated); mint e2 with
+        // a peer that never acks EITHER, before e1 ever activates — e1 is
+        // dropped unactivated, and KeySchedule's 2-deep window evicts e0 (the
+        // schedule now only holds {e1, e2}). active_epoch is untouched by an
+        // unactivated fold, so it STILL names e0 — which sealing_epoch falls
+        // back to (e2 hasn't activated yet either), and schedule().get(e0)
+        // is now None.
+        let mut t = node_transport("evicted-epoch-seal", 1, PRIV_SOLO, &[]);
+        t.group.mint(&[], 0); // e0: vacuous peers
+        t.group.mint(&[9], 1); // folds e0 (activated) into active_epoch; mints e1 (peer 9 never acks)
+        t.group.mint(&[9], 2); // e1 never activated -> dropped; schedule evicts e0; active_epoch still names e0
+        assert_eq!(
+            t.group.sealing_epoch(2),
+            Some(0),
+            "fixture must reproduce sealing_epoch naming a stale active_epoch"
+        );
+        assert!(
+            t.group.schedule().get(0).is_none(),
+            "e0 must actually be evicted from the 2-deep schedule for this test to mean anything"
+        );
+
+        // A non-zero sentinel key_epoch, so ANY write to the header field —
+        // even one that coincidentally writes the "correct" value 0 — is
+        // observable as a buffer change. data_datagram()'s default of 0
+        // would make a stamp-then-fail bug invisible here (the exact
+        // near-miss disclosed in the original task report for mutant 3).
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader {
+                position: 0,
+                leadership_term_id: 0,
+                kind: DGRAM_KIND_DATA,
+                flags: 0,
+                key_epoch: 0xBEEF,
+            },
+        );
+        d.extend_from_slice(b"payload");
+        let before = d.clone();
+
+        assert!(matches!(
+            t.seal(DGRAM_KIND_DATA, None, &mut d, 2),
+            Err(CryptoError::NoGroupKey)
+        ));
+        assert_eq!(
+            d, before,
+            "an evicted-epoch seal failure must leave the buffer completely untouched, \
+             not just the sealing_epoch()==None path the earlier test covers"
         );
     }
 
@@ -852,26 +1235,7 @@ mod tests {
         // pairwise channel (exactly what the node layer will do in a later
         // task — GroupPlane never touches sockets itself).
         let (epoch, key_actions) = a.group.mint(&[2], 0);
-        for act in key_actions {
-            let HandshakeAction::Send { to, kind, body } = act else {
-                panic!("mint emits Send")
-            };
-            assert_eq!(to, 2);
-            let reply = b.group.on_key_message(1, &body);
-            for r in reply {
-                let HandshakeAction::Send {
-                    kind: rkind,
-                    body: rbody,
-                    ..
-                } = r
-                else {
-                    panic!("ack is Send")
-                };
-                let _ = kind; // (HS_KEY, unused beyond the assert above)
-                a.group.on_key_message(2, &rbody);
-                let _ = rkind;
-            }
-        }
+        deliver_group_key(&mut a, &mut b, key_actions);
         assert_eq!(
             a.group.sealing_epoch(0),
             Some(epoch),
@@ -949,18 +1313,7 @@ mod tests {
         let acts = a.peers.initiate(2, 0);
         establish(&mut a, &mut b, acts);
         let (_epoch, key_actions) = a.group.mint(&[2], 0);
-        for act in key_actions {
-            let HandshakeAction::Send { body, .. } = act else {
-                unreachable!()
-            };
-            let reply = b.group.on_key_message(1, &body);
-            for r in reply {
-                let HandshakeAction::Send { body: rbody, .. } = r else {
-                    unreachable!()
-                };
-                a.group.on_key_message(2, &rbody);
-            }
-        }
+        deliver_group_key(&mut a, &mut b, key_actions);
 
         let mut d = data_datagram();
         a.seal(DGRAM_KIND_DATA, None, &mut d, 0).unwrap();
@@ -999,6 +1352,150 @@ mod tests {
             t.rotation_due(0),
             None,
             "nothing due yet on a fresh transport"
+        );
+    }
+
+    #[test]
+    fn on_became_leader_and_on_committed_config_are_reachable_and_drive_rotation_due() {
+        // F5: before this fix, RotationState::on_became_leader and
+        // on_committed_config had no Transport method to call them through —
+        // rotation_due could only ever return Periodic. This proves both
+        // event methods are wired all the way through to the pure decision.
+        let mut leader = node_transport("f5-became-leader", 1, PRIV_SOLO, &[]);
+        leader.on_became_leader();
+        assert_eq!(leader.rotation_due(0), Some(RotationReason::BecameLeader));
+        assert_eq!(leader.rotation_due(0), None, "consumed exactly once");
+
+        let mut removal = node_transport("f5-committed-config", 1, PRIV_SOLO, &[]);
+        removal.on_committed_config(0); // baseline observation, not a trigger
+        assert_eq!(removal.rotation_due(0), None);
+        removal.on_committed_config(1); // tombstone count grew -> Removal
+        assert_eq!(
+            removal.rotation_due(0),
+            Some(RotationReason::Removal),
+            "on_committed_config must be reachable — it is the ONLY path to \
+             the security-relevant Removal trigger (rotation.rs)"
+        );
+    }
+
+    #[test]
+    fn sealing_a_pairwise_kind_with_no_peer_returns_missingpeer_not_a_panic() {
+        // Adjudicated in review round 1: the original `.expect(...)` panic
+        // was reachability-safe (no attacker-controlled path reaches this),
+        // but it defeats scope_of's OWN stated design rationale — a future
+        // fan-out kind added to uc2_net without updating scope_of would
+        // degrade from "missed optimization" (the catch-all's whole point)
+        // to "node crash". A Result closes that gap structurally.
+        let mut t = node_transport("missing-peer", 1, PRIV_SOLO, &[]);
+        let mut d = vote_datagram();
+        assert!(matches!(
+            t.seal(DGRAM_KIND_VOTE, None, &mut d, 0),
+            Err(CryptoError::MissingPeer(k)) if k == DGRAM_KIND_VOTE
+        ));
+    }
+
+    #[test]
+    fn group_traffic_from_a_restarted_leader_opens_correctly_not_replayed_not_authfailed() {
+        // Reproduces F1 + F2 together, with a REAL restart: two entirely
+        // separate `Transport` instances for the SAME node id (`l1`, `l2`,
+        // matching a real process crash+restart — same on-disk identity key,
+        // fresh `OsRng` boot salt, fresh `GroupPlane` per `Transport::new`),
+        // driven against ONE persistent follower `f` whose in-memory state
+        // (session table, group_replay) survives across both.
+        //
+        // F1: `GroupPlane::next_epoch` always starts at 0 on a fresh
+        // process, so `l2`'s first mint recurs `l1`'s first epoch number.
+        // F2: `f` already has a `current` pairwise session with node 1 (from
+        // `l1`); `l2`'s fresh handshake lands in `f`'s `pending` (WireGuard-
+        // style) until proven adopted — and `l2`, playing the leader, sends
+        // ONLY group-scope traffic here, never anything pairwise.
+        let mut f = node_transport(
+            "restart-f",
+            2,
+            PRIV_B,
+            &[(1, public_of(PRIV_A)), (2, public_of(PRIV_B))],
+        );
+
+        // --- l's first lifetime ---
+        let mut l1 = node_transport(
+            "restart-l1",
+            1,
+            PRIV_A,
+            &[(1, public_of(PRIV_A)), (2, public_of(PRIV_B))],
+        );
+        let acts = l1.peers.initiate(2, 0);
+        establish(&mut l1, &mut f, acts);
+        let (epoch1, key_actions) = l1.group.mint(&[2], 0);
+        deliver_group_key(&mut l1, &mut f, key_actions);
+        // `sealing_epoch` is only meaningful on the MINTING side (l1) — f
+        // only installs the key into its schedule on delivery, it never
+        // tracks pending/activation for a key it merely received.
+        assert_eq!(l1.group.sealing_epoch(0), Some(epoch1));
+        assert!(
+            f.group.schedule().get(epoch1).is_some(),
+            "f must have installed the delivered key"
+        );
+
+        for _ in 0..3 {
+            let mut d = data_datagram();
+            l1.seal(DGRAM_KIND_DATA, None, &mut d, 0).unwrap();
+            f.open(1, &mut d)
+                .expect("l1's traffic opens fine before the restart");
+        }
+
+        // --- l "restarts": brand-new Transport, same identity (same
+        // PRIV_A), fresh boot salt (Transport::new mints one from OsRng
+        // every call, exactly like a real restart), fresh GroupPlane
+        // (next_epoch back at 0). ---
+        let mut l2 = node_transport(
+            "restart-l2",
+            1,
+            PRIV_A,
+            &[(1, public_of(PRIV_A)), (2, public_of(PRIV_B))],
+        );
+        let acts = l2.peers.initiate(2, 0);
+        // Deliberately NOT `establish`: f's `is_established(1)` is ALREADY
+        // true (against the STALE l1 session) before this pump even runs,
+        // so asserting it here would pass for the wrong reason. l2's fresh
+        // handshake lands in f's `pending`, not `current`.
+        pump_handshake(&mut l2, &mut f, acts);
+        assert!(
+            f.peers.peer_pending_boot_salt(1).is_some(),
+            "fixture must land l2's session in f's pending slot, not replace current"
+        );
+        assert_ne!(
+            f.peers.peer_boot_salt(1),
+            f.peers.peer_pending_boot_salt(1),
+            "l1's (current) and l2's (pending) boot salts must actually differ for this test to mean anything"
+        );
+
+        let (epoch2, key_actions) = l2.group.mint(&[2], 0);
+        assert_eq!(
+            epoch2, epoch1,
+            "GroupPlane::next_epoch restarts at 0 on every fresh process — the epoch number recurs"
+        );
+        deliver_group_key(&mut l2, &mut f, key_actions);
+
+        let mut d = data_datagram();
+        l2.seal(DGRAM_KIND_DATA, None, &mut d, 0).unwrap(); // l2's own counter starts at 1 again too
+        assert!(
+            f.open(1, &mut d).is_ok(),
+            "group traffic from a restarted peer must open — neither AuthFailed \
+             (F2: stale current-session salt) nor Replayed (F1: replay window \
+             keyed only by (sender, epoch), colliding with the recurring epoch number)"
+        );
+
+        // The promotion side-effect: a group-scope success under the
+        // pending salt must promote it exactly as a pairwise success would —
+        // `current` now reports l2's salt, and `pending` is empty again.
+        assert_eq!(
+            f.peers.peer_boot_salt(1),
+            Some(l2.peers.boot_salt()),
+            "current must now be l2's session, not l1's stale one"
+        );
+        assert!(
+            f.peers.peer_pending_boot_salt(1).is_none(),
+            "pending must be cleared once promoted"
         );
     }
 

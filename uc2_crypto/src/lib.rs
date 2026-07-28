@@ -102,4 +102,30 @@ pub enum CryptoError {
     /// never a signal to fall back to sending or accepting cleartext.
     #[error("no usable group key")]
     NoGroupKey,
+    /// `Transport::seal` was called with a `Scope::Pairwise`-classified
+    /// `kind` (`u8`, carried for the operator log) and `peer: None`. A
+    /// caller-contract violation (`kind`/`peer` are the caller's own routing
+    /// decision, never bytes off the wire), but returned as a `Result`
+    /// rather than panicked (T9 review round 1, adjudicated): `scope_of`'s
+    /// deliberate `_ => Pairwise` catch-all exists precisely so that an
+    /// unclassified FUTURE kind degrades to a missed optimization, never a
+    /// crash — panicking here would convert exactly that miss into a node
+    /// crash the moment a new fan-out kind is added to `uc2_net` without
+    /// updating `scope_of`, defeating the design rationale sitting right
+    /// beside it.
+    #[error("Transport::seal: Pairwise-scope kind {0} requires Some(peer)")]
+    MissingPeer(u8),
+    /// `Transport::seal`/`open` was called with a `Scope::Unsealed` kind
+    /// (`u8`, carried for the operator log) — the `HS_INIT`/`HS_RESP`
+    /// handshake bootstrap kinds (spec §5). No session and no key exist yet
+    /// for these; they are what CREATES a session and must be driven
+    /// directly via `Peers::initiate`/`Peers::on_message`, never through
+    /// this facade. Added T9 review round 1 (F4): the pre-fix `scope_of`
+    /// left these kinds unclassified, falling through to the `Pairwise`
+    /// catch-all — which fails closed today (no session exists, so
+    /// `NoSession`/`AuthFailed`), but for the wrong stated reason, and a
+    /// future refactor of the catch-all's behavior could silently change
+    /// that. Named explicitly instead.
+    #[error("Transport::seal/open: kind {0} is Scope::Unsealed — never goes through seal/open")]
+    UnsealedKind(u8),
 }
