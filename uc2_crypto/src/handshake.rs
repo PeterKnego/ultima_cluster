@@ -1348,19 +1348,88 @@ mod tests {
         );
         assert!(!a.is_established(B_ID));
 
-        // And the link is not wedged: the peer got past `read_message`, so it
-        // is the allowlisted key holder misbehaving rather than an off-path
-        // attacker, and the dead attempt is dropped so `tick` rebuilds a fresh
-        // one on the backoff clock.
-        let retry = a.tick(HS_RETRY_MAX_NS * 2);
+        // NOTE: whether the link is left WEDGED is not observable here — see
+        // `a_mismatched_id_leaves_no_dead_handshake_behind`, which is the test
+        // for that property. `tick` emits an `HS_INIT` under either
+        // implementation, so asserting on it proves nothing.
+    }
+
+    #[test]
+    fn a_mismatched_id_leaves_no_dead_handshake_behind() {
+        // The second round trip, which is the only thing that distinguishes
+        // "drop the attempt" from "retain it" after a check that follows a
+        // successful `read_message`.
+        //
+        // `tick`'s retransmit branch resends the CACHED message 1 bytes without
+        // inspecting whether `hs.state` is still usable, so both
+        // implementations emit an `HS_INIT` after the mismatch — which is why
+        // the assertion that used to live in the test above was worthless. What
+        // separates them is what happens when the peer ANSWERS that retransmit:
+        // a retained, already-finished `HandshakeState` fails every subsequent
+        // `read_message` with `HandshakeAlreadyFinished`, re-enters the
+        // retain-on-read-failure branch, and the link never comes up again.
+        let allow = [(A_ID, public_of(PRIV_A)), (B_ID, public_of(PRIV_B))];
+        let mut a = node(PRIV_A, A_ID, &allow, 0xA1);
+        let mut liar = node_claiming_the_wrong_id();
+
+        let msg1 = a
+            .initiate(B_ID, 0)
+            .into_iter()
+            .find_map(|act| match act {
+                HandshakeAction::Send { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("message 1");
+        let msg2 = liar
+            .on_message(A_ID, DGRAM_KIND_HS_INIT, &msg1, 0)
+            .into_iter()
+            .find_map(|act| match act {
+                HandshakeAction::Send { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("message 2");
+        assert!(matches!(
+            a.on_message(B_ID, DGRAM_KIND_HS_RESP, &msg2, 0).as_slice(),
+            [HandshakeAction::Failed { .. }]
+        ));
+
+        // The peer's misconfiguration is corrected — or, equivalently, the
+        // honest holder of that key answers the retry.
+        let mut b = node(PRIV_B, B_ID, &allow, 0xB2);
+        let retry_msg1 = a
+            .tick(HS_RETRY_MAX_NS * 2)
+            .into_iter()
+            .find_map(|act| match act {
+                HandshakeAction::Send { to, kind, body }
+                    if to == B_ID && kind == DGRAM_KIND_HS_INIT =>
+                {
+                    Some(body)
+                }
+                _ => None,
+            })
+            .expect("tick retries the handshake");
+        let reply = b
+            .on_message(A_ID, DGRAM_KIND_HS_INIT, &retry_msg1, 0)
+            .into_iter()
+            .find_map(|act| match act {
+                HandshakeAction::Send { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("the peer answers the retry");
+
+        let out = a.on_message(B_ID, DGRAM_KIND_HS_RESP, &reply, 0);
         assert!(
-            retry.iter().any(|act| matches!(
-                act,
-                HandshakeAction::Send { to, kind, .. }
-                    if *to == B_ID && *kind == DGRAM_KIND_HS_INIT
-            )),
-            "a fresh handshake is started rather than the dead one retained: {retry:?}"
+            matches!(
+                out.as_slice(),
+                [HandshakeAction::Established {
+                    peer: B_ID,
+                    confirmed: true,
+                    ..
+                }]
+            ),
+            "a dead handshake was retained and now rejects every reply: {out:?}"
         );
+        assert_traffic_flows(&mut a, &mut b, 1);
     }
 
     #[test]
