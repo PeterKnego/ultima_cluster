@@ -321,6 +321,19 @@ impl Peers {
             .is_some_and(|entry| entry.current.is_some())
     }
 
+    /// Re-reads the allowlist file if the rate limit and mtime both permit —
+    /// see [`Allowlist::reload_if_stale`]. Exposed as its own entry point
+    /// (distinct from [`Peers::tick`]'s own internal call) so a caller
+    /// wanting to know WHETHER a reload attempt failed (e.g. `uc2ctl`
+    /// surfacing an operator typo, or `Transport::allowlist_reload_if_stale`
+    /// in T9) is not stuck with `tick`'s deliberate `let _ = ..` — a busy-spin
+    /// polling loop must not refuse every peer just because a file read
+    /// blipped, but an explicit, less-frequent caller may reasonably want the
+    /// error.
+    pub fn allowlist_reload_if_stale(&mut self, now_ns: u64) -> Result<bool, CryptoError> {
+        self.allowlist.reload_if_stale(now_ns)
+    }
+
     /// The boot salt of the session currently in use with `peer` — the input to
     /// *that peer's* group-key derivation
     /// ([`crate::schedule::derive_send_key`]). The same value arrives in
