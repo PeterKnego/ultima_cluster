@@ -548,6 +548,7 @@ fn removed_follower_halts_and_zombie_cannot_disrupt() {
             leadership_term_id: huge_term,
             kind: DGRAM_KIND_REQUEST_VOTE,
             flags: 0,
+            key_epoch: 0,
         },
     );
     write_request_vote_body(
@@ -562,6 +563,7 @@ fn removed_follower_halts_and_zombie_cannot_disrupt() {
             leadership_term_id: huge_term,
             kind: DGRAM_KIND_APPEND_POSITION,
             flags: 0,
+            key_epoch: 0,
         },
     );
 

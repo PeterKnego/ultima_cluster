@@ -99,6 +99,7 @@ fn stale_term_stream_is_ignored() {
                 leadership_term_id: TERM - 1,
                 kind: DGRAM_KIND_DATA,
                 flags: 0,
+                key_epoch: 0,
             },
         );
         ghost.send_to(&d, faddr).unwrap();

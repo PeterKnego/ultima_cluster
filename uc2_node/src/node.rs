@@ -2901,7 +2901,7 @@ impl Consensus {
         let mut d = vec![0u8; DATAGRAM_HEADER_LEN + body.len()];
         write_datagram_header(
             &mut d,
-            &DatagramHeader { position, leadership_term_id: term, kind, flags: 0 },
+            &DatagramHeader { position, leadership_term_id: term, kind, flags: 0, key_epoch: 0 },
         );
         d[DATAGRAM_HEADER_LEN..].copy_from_slice(body);
         let _ = self.sock.send_to(&d, to);

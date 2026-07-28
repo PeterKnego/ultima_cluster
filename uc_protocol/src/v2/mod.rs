@@ -6,6 +6,7 @@
 
 pub mod cnc;
 pub mod config;
+pub mod crypto;
 pub mod datagram;
 pub mod frame;
 pub mod ipc;

@@ -21,7 +21,9 @@ pub const OFF_DGRAM_POSITION: usize = 0; // u64 LE — meaning depends on kind
 pub const OFF_DGRAM_TERM_ID: usize = 8; // u32 LE — leadership_term_id
 pub const OFF_DGRAM_KIND: usize = 12; // u8
 pub const OFF_DGRAM_FLAGS: usize = 13; // u8
-pub const OFF_DGRAM_RESERVED: usize = 14; // u16 — zero; future per-datagram PSK-MAC slot
+/// u16 LE — M8 key epoch (0 = cleartext). Was `OFF_DGRAM_RESERVED`; the v2
+/// spec set this slot aside for exactly this purpose.
+pub const OFF_DGRAM_KEY_EPOCH: usize = 14;
 
 /// Payload = run of complete frames starting at `position`.
 pub const DGRAM_KIND_DATA: u8 = 1;
@@ -355,6 +357,7 @@ pub struct DatagramHeader {
     pub leadership_term_id: u32,
     pub kind: u8,
     pub flags: u8,
+    pub key_epoch: u16,
 }
 
 /// `buf` must be at least `DATAGRAM_HEADER_LEN` bytes.
@@ -364,7 +367,7 @@ pub fn write_datagram_header(buf: &mut [u8], h: &DatagramHeader) {
         .copy_from_slice(&h.leadership_term_id.to_le_bytes());
     buf[OFF_DGRAM_KIND] = h.kind;
     buf[OFF_DGRAM_FLAGS] = h.flags;
-    buf[OFF_DGRAM_RESERVED..OFF_DGRAM_RESERVED + 2].copy_from_slice(&0u16.to_le_bytes());
+    buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2].copy_from_slice(&h.key_epoch.to_le_bytes());
 }
 
 /// `buf` must be at least `DATAGRAM_HEADER_LEN` bytes.
@@ -376,6 +379,9 @@ pub fn read_datagram_header(buf: &[u8]) -> DatagramHeader {
         ),
         kind: buf[OFF_DGRAM_KIND],
         flags: buf[OFF_DGRAM_FLAGS],
+        key_epoch: u16::from_le_bytes(
+            buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2].try_into().unwrap(),
+        ),
     }
 }
 
@@ -438,6 +444,7 @@ mod tests {
             leadership_term_id: 9,
             kind: DGRAM_KIND_DATA,
             flags: 0x5a,
+            key_epoch: 0,
         };
         let mut buf = [0u8; DATAGRAM_HEADER_LEN];
         write_datagram_header(&mut buf, &h);
@@ -447,20 +454,52 @@ mod tests {
         // trip alone isn't enough (both sides could agree on a wrong
         // layout). position=0xDEAD_BEEF_0000_0040 -> LE
         // [0x40,0,0,0,0xEF,0xBE,0xAD,0xDE]; term=9 -> [9,0,0,0]; kind=1;
-        // flags=0x5a; reserved=[0,0].
+        // flags=0x5a; key_epoch=0 -> [0,0].
         assert_eq!(
             buf,
             [0x40, 0x00, 0x00, 0x00, 0xEF, 0xBE, 0xAD, 0xDE, 9, 0, 0, 0, 1, 0x5a, 0, 0]
         );
-        // reserved slot stays zero (future per-datagram PSK-MAC home, spec §5)
-        assert_eq!(&buf[OFF_DGRAM_RESERVED..OFF_DGRAM_RESERVED + 2], &[0, 0]);
-        // layout: position(8) term(4) kind(1) flags(1) reserved(2) = 16
+        // cleartext epoch stays zero here (M8: this slot is key_epoch)
+        assert_eq!(&buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2], &[0, 0]);
+        // layout: position(8) term(4) kind(1) flags(1) key_epoch(2) = 16
         assert_eq!(OFF_DGRAM_POSITION, 0);
         assert_eq!(OFF_DGRAM_TERM_ID, 8);
         assert_eq!(OFF_DGRAM_KIND, 12);
         assert_eq!(OFF_DGRAM_FLAGS, 13);
-        assert_eq!(OFF_DGRAM_RESERVED, 14);
+        assert_eq!(OFF_DGRAM_KEY_EPOCH, 14);
         assert_eq!(DATAGRAM_HEADER_LEN, 16);
+    }
+
+    #[test]
+    fn key_epoch_occupies_the_reserved_slot_and_round_trips() {
+        let mut buf = [0u8; DATAGRAM_HEADER_LEN];
+        let h = DatagramHeader {
+            position: 4096,
+            leadership_term_id: 7,
+            kind: DGRAM_KIND_DATA,
+            flags: 0,
+            key_epoch: 0xBEEF,
+        };
+        write_datagram_header(&mut buf, &h);
+        // Pinned at the old reserved offset — the slot the v2 spec set aside.
+        assert_eq!(&buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2], &0xBEEFu16.to_le_bytes());
+        assert_eq!(OFF_DGRAM_KEY_EPOCH, 14);
+        assert_eq!(read_datagram_header(&buf), h);
+    }
+
+    #[test]
+    fn cleartext_datagrams_carry_epoch_zero() {
+        let mut buf = [0u8; DATAGRAM_HEADER_LEN];
+        let h = DatagramHeader {
+            position: 0,
+            leadership_term_id: 0,
+            kind: DGRAM_KIND_HEARTBEAT,
+            flags: 0,
+            key_epoch: 0,
+        };
+        write_datagram_header(&mut buf, &h);
+        assert_eq!(buf[OFF_DGRAM_KEY_EPOCH], 0);
+        assert_eq!(buf[OFF_DGRAM_KEY_EPOCH + 1], 0);
     }
 
     #[test]

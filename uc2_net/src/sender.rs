@@ -568,6 +568,7 @@ impl Sender {
                 leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind,
                 flags: 0,
+                key_epoch: 0,
             },
         );
         self.scratch.extend_from_slice(&self.run[..body_bytes]);
@@ -825,6 +826,7 @@ impl Sender {
                 leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind,
                 flags: 0,
+                key_epoch: 0,
             },
         );
         self.scratch.extend_from_slice(payload);
@@ -844,6 +846,7 @@ impl Sender {
                 leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind: DGRAM_KIND_DATA,
                 flags: 0,
+                key_epoch: 0,
             },
         );
         self.scratch.extend_from_slice(body);

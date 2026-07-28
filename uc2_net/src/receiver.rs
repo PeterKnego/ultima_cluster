@@ -905,6 +905,7 @@ impl FollowerReceiver {
                 leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind: DGRAM_KIND_SNAP_DONE,
                 flags: 0,
+                key_epoch: 0,
             },
         );
         write_snap_begin_body(
@@ -991,6 +992,7 @@ impl FollowerReceiver {
                     leadership_term_id: term,
                     kind: DGRAM_KIND_SNAP_NAK,
                     flags: 0,
+                    key_epoch: 0,
                 },
             );
             write_snap_nak_body(
@@ -1038,6 +1040,7 @@ impl FollowerReceiver {
                     leadership_term_id: term,
                     kind: DGRAM_KIND_NAK,
                     flags: 0,
+                    key_epoch: 0,
                 },
             );
             write_nak_body(&mut d[DATAGRAM_HEADER_LEN..], &NakBody { position: start, length: len });
@@ -1068,6 +1071,7 @@ impl FollowerReceiver {
                     leadership_term_id: term,
                     kind: DGRAM_KIND_APPEND_POSITION,
                     flags: 0,
+                    key_epoch: 0,
                 },
             );
             let _ = self.sock.send_to(&d, self.cfg.leader);
@@ -1093,6 +1097,7 @@ impl FollowerReceiver {
                     leadership_term_id: term,
                     kind: DGRAM_KIND_STATUS,
                     flags: 0,
+                    key_epoch: 0,
                 },
             );
             write_status_body(
@@ -1172,7 +1177,7 @@ mod tests {
             let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
             write_datagram_header(
                 &mut d,
-                &DatagramHeader { position, leadership_term_id: term, kind, flags: 0 },
+                &DatagramHeader { position, leadership_term_id: term, kind, flags: 0, key_epoch: 0 },
             );
             d.extend_from_slice(body);
             self.sock.send_to(&d, to).unwrap();
