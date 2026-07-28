@@ -1,0 +1,217 @@
+⚠ [711/1224] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1224] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1224] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+✖ [1418/1418] Building Examples.UC.ReconfigCommitSMTManualCE (69s)
+trace: .> LEAN_PATH=/home/claude/veil-spike/veil-preview/.lake/packages/cvc5/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Cli/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/batteries/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Qq/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/aesop/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/proofwidgets/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/importGraph/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/plausible/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/mathlib/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/auto/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/smt/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Loom/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/build/lib/lean /home/claude/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /home/claude/veil-spike/veil-preview/Examples/UC/ReconfigCommitSMTManualCE.lean -o /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/ReconfigCommitSMTManualCE.olean -i /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/ReconfigCommitSMTManualCE.ilean -c /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/ReconfigCommitSMTManualCE.c --setup /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/ReconfigCommitSMTManualCE.setup.json --json
+info: Examples/UC/ReconfigCommitSMTManualCE.lean:686:2: node : Type
+node_inhabited : Inhabited node
+term : Type
+term_inhabited : Inhabited term
+cfgid : Type
+cfgid_inhabited : Inhabited cfgid
+quorum : Type
+quorum_inhabited : Inhabited quorum
+tot : TotalOrderWithZero term
+i : node
+q : quorum
+th : Theory node term cfgid quorum
+st.candidate st.leader : node → Bool
+st.curTerm : node → term
+st.hasVoted : node → Bool
+st.voteTerm : node → term
+st.voteCand : node → node
+st.reqVote : node → term → Bool
+st.voteMsg : node → node → term → Bool
+st.cfgOf : node → cfgid
+st.pending st.hasProposal : node → Bool
+st.proposedC : node → cfgid
+st.propAfterE : node → Bool
+st.hasAdopted : node → node → Bool
+st.cfgCommitted : cfgid → Bool
+st.holdsE : node → Bool
+st.committed : Bool
+st.committedTerm : term
+st.commitCfgid : cfgid
+st.commitQuorum : quorum
+st.elecCfg : node → cfgid
+st.cfgAt : node → term
+st.cfgCommitTerm : cfgid → term
+st.reachAt : node → cfgid → term
+st.elecQuorum : node → quorum
+st.gotEAt : node → term
+st.isCommitLeader : node → Bool
+st.commitElecCfg : cfgid
+st.commitElecQuorum : quorum
+st.cfgSeen : cfgid → Bool
+st.cfgPred : cfgid → cfgid
+st.cfgQ : cfgid → quorum
+st.cfgBacked : cfgid → Bool
+hsame :
+  ∀ (c : cfgid) (q1 q2 : quorum),
+    th.quorumOf q1 c = true → th.quorumOf q2 c = true → ∃ n, th.qmember n q1 = true ∧ th.qmember n q2 = true
+hqms : ∀ (c : cfgid) (q : quorum) (n : node), th.quorumOf q c = true → th.qmember n q = true → th.cmember n c = true
+hshape :
+  ∀ (c d : cfgid),
+    th.succCfg c d = true →
+      ∃ x,
+        (∀ (n : node), th.cmember n d = true ↔ th.cmember n c = true ∨ n = x) ∨
+          ∀ (n : node), th.cmember n d = true ↔ th.cmember n c = true ∧ ¬n = x
+hirr : ∀ (c : cfgid), th.cfgLt c c = false
+htrans : ∀ (c d e : cfgid), th.cfgLt c d = true → th.cfgLt d e = true → th.cfgLt c e = true
+hsucclt : ∀ (c d : cfgid), th.succCfg c d = true → th.cfgLt c d = true
+htotal : ∀ (c d : cfgid), c = d ∨ th.cfgLt c d = true ∨ th.cfgLt d c = true
+hgen : ∀ (c : cfgid), th.cfgLt c th.genesisC = false
+himm : ∀ (c d e : cfgid), th.succCfg c d = true → th.cfgLt c e = true → th.cfgLt e d = false
+hconn : ∀ (c d : cfgid), th.cfgLt c d = true → ∃ e, th.succCfg c e = true ∧ (e = d ∨ th.cfgLt e d = true)
+hadj :
+  ∀ (c d : cfgid) (q1 q2 : quorum),
+    th.succCfg c d = true →
+      th.quorumOf q1 c = true → th.quorumOf q2 d = true → ∃ n, th.qmember n q1 = true ∧ th.qmember n q2 = true
+hes : ∀ (N1 N2 : node), st.leader N1 = true → st.leader N2 = true → st.curTerm N1 = st.curTerm N2 → N1 = N2
+hlc :
+  ∀ (L : node),
+    st.committed = true →
+      st.leader L = true → TotalOrderWithZero.le st.committedTerm (st.curTerm L) → st.holdsE L = true
+hgs :
+  ∀ (V C : node) (T : term),
+    st.voteMsg V C T = true →
+      TotalOrderWithZero.le T (st.curTerm V) ∧ ¬T = st.curTerm V ∨
+        st.curTerm V = T ∧ st.hasVoted V = true ∧ st.voteTerm V = T ∧ st.voteCand V = C
+hsv :
+  ∀ (I : node),
+    st.candidate I = true ∨ st.leader I = true → st.hasVoted I = true ∧ st.voteTerm I = st.curTerm I ∧ st.voteCand I = I
+hhgc :
+  ∀ (V C : node) (T : term),
+    st.voteMsg V C T = true →
+      st.holdsE V = true → TotalOrderWithZero.le (st.gotEAt V) T → ¬st.gotEAt V = T → st.holdsE C = true
+hgeb : ∀ (V : node), st.holdsE V = true → TotalOrderWithZero.le (st.gotEAt V) (st.curTerm V)
+hena : ∀ (N : node), st.elecCfg N = st.cfgOf N ∨ th.cfgLt (st.elecCfg N) (st.cfgOf N) = true
+hre : ∀ (I : node), st.candidate I = true → st.leader I = false
+hrb : ∀ (N : node) (C : cfgid), th.cfgLt (st.cfgOf N) C = false → TotalOrderWithZero.le (st.reachAt N C) (st.curTerm N)
+hrqb :
+  ∀ (E C : cfgid) (N : node),
+    th.cfgLt E C = true →
+      th.cfgLt (st.cfgOf N) C = false →
+        E = th.genesisC ∨
+          ∃ q,
+            th.quorumOf q E = true ∧
+              ∀ (V : node),
+                th.qmember V q = true →
+                  th.cfgLt (st.cfgOf V) E = false ∧ TotalOrderWithZero.le (st.reachAt V E) (st.reachAt N C)
+hccq :
+  ∀ (D : cfgid),
+    st.cfgCommitted D = true →
+      ∃ q,
+        th.quorumOf q D = true ∧
+          ∀ (V : node),
+            th.qmember V q = true →
+              th.cfgLt (st.cfgOf V) D = false ∧ TotalOrderWithZero.le (st.reachAt V D) (st.cfgCommitTerm D)
+hccb : ∀ (D : cfgid) (N : node), th.cfgLt D (st.cfgOf N) = true → D = th.genesisC ∨ st.cfgCommitted D = true
+hnse :
+  ∀ (I : node) (D : cfgid),
+    st.leader I = true →
+      st.cfgCommitted D = true →
+        TotalOrderWithZero.le (st.cfgCommitTerm D) (st.curTerm I) →
+          ¬st.cfgCommitTerm D = st.curTerm I → th.cfgLt (st.elecCfg I) D = false
+hew :
+  ∀ (I : node),
+    st.leader I = true →
+      th.quorumOf (st.elecQuorum I) (st.elecCfg I) = true ∧
+        ∀ (V : node), th.qmember V (st.elecQuorum I) = true → V = I ∨ st.voteMsg V I (st.curTerm I) = true
+hegcr :
+  ∀ (I V : node) (D : cfgid),
+    st.leader I = true →
+      th.qmember V (st.elecQuorum I) = true →
+        th.cfgLt (st.cfgOf V) D = false →
+          TotalOrderWithZero.le (st.reachAt V D) (st.curTerm I) →
+            ¬st.reachAt V D = st.curTerm I → th.cfgLt (st.elecCfg I) D = false
+hlrs :
+  ∀ (I : node),
+    st.candidate I = true ∨ st.leader I = true →
+      (TotalOrderWithZero.le (st.reachAt I (st.elecCfg I)) (st.curTerm I) ∧
+          ¬st.reachAt I (st.elecCfg I) = st.curTerm I) ∧
+        TotalOrderWithZero.le (st.reachAt I th.genesisC) (st.curTerm I) ∧ ¬st.reachAt I th.genesisC = st.curTerm I
+hcqw : ∀ (D : cfgid), st.cfgCommitted D = true → th.quorumOf (st.cfgQ D) D = true
+⊢ st.leader i = true →
+    st.committed = false →
+      st.holdsE i = true →
+        th.quorumOf q (st.cfgOf i) = true →
+          (∀ (V : node), th.qmember V q = true → st.holdsE V = true) →
+            (∀ (V : node), th.qmember V q = true → TotalOrderWithZero.le (st.gotEAt V) (st.curTerm i)) →
+              ∀ (L : node),
+                st.leader L = true → TotalOrderWithZero.le (st.curTerm i) (st.curTerm L) → st.holdsE L = true
+warning: Examples/UC/ReconfigCommitSMTManualCE.lean:652:8: declaration uses `sorry`
+error: Examples/UC/ReconfigCommitSMTManualCE.lean:689:0: 1 verification condition could not be discharged automatically
+The following set of actions must preserve the invariant and successfully terminate:
+  commitEntry
+    doesNotThrow ... ✅
+    election_safety ... ✅
+    leader_completeness ... 💥
+      Exceptions:
+        commitEntry_leader_completeness_INTERACTIVE
+          interactive proof `ReconfigCommitSMTManualCE.commitEntry_leader_completeness` contains `sorry`
+    grant_state ... ✅
+    self_vote ... ✅
+    holder_grants_are_covered ... ✅
+    gotE_bounded ... ✅
+    eleccfg_not_ahead ... ✅
+    role_exclusive ... ✅
+    reach_bound ... ✅
+    reach_quorum_below ... ✅
+    committed_cfg_quorum ... ✅
+    chain_committed_below ... ✅
+    no_stale_election ... ✅
+    elecq_witness ... ✅
+    elecq_grant_covers_reach ... ✅
+    leader_reach_strict ... ✅
+    cfgq_witness ... ✅
+warning: Examples/UC/ReconfigCommitSMTManualCE.lean:689:0: Trusting SMT solver for 16 goals. `set_option veil.smt.trust false` to enable proof reconstruction.
+info: Examples/UC/ReconfigCommitSMTManualCE.lean:689:0: Insert theorem stubs for undischarged verification conditions:
+
+  [apply] #check_action commitEntry
+  
+  @[veil]
+  theorem commitEntry_leader_completeness (ρ : Type) (σ : Type) (node : Type) [node_dec_eq : DecidableEq.{1} node]
+      [node_inhabited : Inhabited.{1} node] (term : Type) [term_dec_eq : DecidableEq.{1} term]
+      [term_inhabited : Inhabited.{1} term] (cfgid : Type) [cfgid_dec_eq : DecidableEq.{1} cfgid]
+      [cfgid_inhabited : Inhabited.{1} cfgid] (quorum : Type) [quorum_dec_eq : DecidableEq.{1} quorum]
+      [quorum_inhabited : Inhabited.{1} quorum] [tot : TotalOrderWithZero term] (χ : State.Label → Type)
+      [χ_rep :
+        ∀ __veil_f,
+          Veil.FieldRepresentation (State.Label.toDomain node term cfgid quorum __veil_f)
+            (State.Label.toCodomain node term cfgid quorum __veil_f) (χ __veil_f)]
+      [χ_rep_lawful :
+        ∀ __veil_f,
+          Veil.LawfulFieldRepresentation (State.Label.toDomain node term cfgid quorum __veil_f)
+            (State.Label.toCodomain node term cfgid quorum __veil_f) (χ __veil_f) (χ_rep __veil_f)]
+      [σ_sub : IsSubStateOf (@State χ) σ] [ρ_sub : IsSubReaderOf (@Theory node term cfgid quorum) ρ]
+      [commitEntry_dec_0 : delta% @ReconfigCommitSMTManualCE.commitEntry._veil_dec_type_0 quorum χ node term cfgid χ_rep]
+      [commitEntry_dec_1 :
+        delta% @ReconfigCommitSMTManualCE.commitEntry._veil_dec_type_1 node quorum χ term cfgid tot χ_rep] :
+      ∀ (i : node) (q : quorum),
+        Veil.VeilM.meetsSpecificationIfSuccessfulAssuming
+          (@commitEntry.ext ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited cfgid cfgid_dec_eq
+            cfgid_inhabited quorum quorum_dec_eq quorum_inhabited tot χ χ_rep χ_rep_lawful σ_sub ρ_sub commitEntry_dec_0
+            commitEntry_dec_1 i q)
+          (@Assumptions ρ node node_dec_eq node_inhabited term term_dec_eq term_inhabited cfgid cfgid_dec_eq
+            cfgid_inhabited quorum quorum_dec_eq quorum_inhabited tot ρ_sub)
+          (@Invariants ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited cfgid cfgid_dec_eq
+            cfgid_inhabited quorum quorum_dec_eq quorum_inhabited tot χ χ_rep χ_rep_lawful σ_sub ρ_sub)
+          (@leader_completeness ρ σ node node_dec_eq node_inhabited term term_dec_eq term_inhabited cfgid cfgid_dec_eq
+            cfgid_inhabited quorum quorum_dec_eq quorum_inhabited tot χ χ_rep χ_rep_lawful σ_sub ρ_sub) :=
+    by
+    unveil
+    sorry
+error: Lean exited with code 1
+Some required targets logged failures:
+- Examples.UC.ReconfigCommitSMTManualCE
+error: build failed
+EXIT=1 WALL=71s

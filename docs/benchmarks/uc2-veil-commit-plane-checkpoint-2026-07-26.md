@@ -1902,3 +1902,142 @@ strict half (S8.7) and the two ledger repairs (ledger items 68 and 69).
 
 **Arc status: BANKED, pending the user's merge decision.** Nothing in `proofs-veil/` is the
 record; `proofs/` was never touched by this arc and remains the sole trusted base.
+
+# CODA (post-gate-2, 2026-07-28) — P2 @ `commitEntry`: **NOT CLOSED**, and the residue identified
+
+This is the single hard-timeboxed coda session gate 2 sanctioned (ruling: "the hand-proof route
+(item 59) applied to **P2 @ `commitEntry` ONLY**"). **The GATE 2 VERDICT above is UNCHANGED and
+is still the only citable form of this arc's result**: nothing here closes a VC, nothing here
+amends the claim, no clause and no ghost was added, `ReconfigCommitSMT.lean` is untouched at
+`ae3c67b` (re-verified before the first run: **35 `require`s / 11 `assumption`s, 55 invariants +
+2 safeties**). The strict half at `becomeLeader` was not reopened.
+
+**Outcome: the proof did not land — and the reason is now a fact, not a timeout.** The hand proof
+reduces `leader_completeness` @ `commitEntry` to **exactly one case**, and that case is the
+**cross-config holder supply** — the same residue the dossier's S8.7 honesty note records for P2's
+strict half at `becomeLeader`. The two open items are therefore **one item**, not two.
+
+## C.1 What was done
+
+| # | run | what | verdict | wall |
+|---|---|---|---|---|
+| coda-1 | `smt-coda1-stub.log` | `P2CEManual`, 12-clause slice, `#check_action commitEntry`, 60 s/VC | **12 ✅ / 1 ❌ / 0 ⏱️** — `leader_completeness` ❌ | 139 s |
+| coda-2 | `smt-coda2-probe17.log` | `P2CEProbe2`, 17 clauses (+`committed_cfg_quorum`, `chain_committed_below`, `no_stale_election`, `cfgq_witness`, `leader_reach_strict`) | **17 ✅ / 0 ❌ / 1 ⏱️** — the coda-1 CTI is killed; the VC is ⏱️ and **the stub is emitted** | 167 s |
+| coda-3 | `smt-coda3-stubCE.log` | the same 17-clause slice under the proof module name `ReconfigCommitSMTManualCE` — **STUB ELICITATION** | 17 ✅ / 0 ❌ / 1 ⏱️, stub emitted | 166 s |
+| coda-4 | `smt-coda4-probe-trace.log` | the stub statement + `unveil; rcases; trace_state; sorry` — **the ANTI-VACUITY CONTROL** | **💥** `interactive proof ... contains 'sorry'` — the theorem IS consumed for this VC | 63 s |
+| coda-5 | `smt-coda5-proof1.log` | the **partial hand proof**: same-term half + all three config cases except one | **💥** (one `sorry`), **zero tactic errors** — every other case elaborates | 65 s |
+| coda-6 | `smt-coda6-probe24.log` | `P2CEProbe3`, 24 clauses (+ the whole T20 machinery: `cfgpred_succ`, `cfg_seen_adopted`, `cfg_seen_committed`, `adopted_holds`, `cfgq_holders`, `propafter_holds`, `cfgbacked_committed`) | **24 ✅ / 0 ❌ / 1 ⏱️** — still no counterexample, still no proof | 221 s |
+
+Method as gate 2 required: the stub was **elicited** (coda-3), the sorry-version was **rejected
+with 💥** (coda-4 — the anti-vacuity control, banked), and the theorem statement in
+`proofs-veil/models/ReconfigCommitSMTManualCE.lean` is **byte-identical (whitespace-normalised)
+to the Veil-emitted stub** (mechanically diffed). Every slice is `ReconfigCommitSMT.lean`
+VERBATIM with the invariant conjunction cut (`make_slice.py`), 35/11 re-verified.
+
+## C.2 The proof, and exactly where it sticks
+
+After `unveil` the obligation is (verbatim from coda-4's `trace_state`):
+
+```
+st.leader i = true → st.committed = false → st.holdsE i = true →
+  th.quorumOf q (st.cfgOf i) = true →
+  (∀ V, th.qmember V q = true → st.holdsE V = true) →
+  (∀ V, th.qmember V q = true → le (st.gotEAt V) (st.curTerm i)) →
+  ∀ L, st.leader L = true → le (st.curTerm i) (st.curTerm L) → st.holdsE L = true
+```
+
+Note `st.committed = false` in the pre-state: **P2 itself is vacuous as a pre-state hypothesis at
+this action**, and so is every `committed`- or `isCommitLeader`-gated clause in the bundle
+(`commit_backed`, `commit_quorum_sound`, `commit_term_bound`, `commit_leader_evidence`,
+`commitq_gotE`, `commitq_witness`, `commitq_grant_covers_reach`, `commit_leader_*`). The
+frozen-commit-leadership machinery (T18/T13/T14) is therefore **unavailable at `commitEntry`** —
+a structural difference from `becomeLeader` that the arc had not previously recorded.
+
+**PROVED (sorry-free, zero tactic errors):**
+
+* **Same-term half** (`curTerm L = curTerm i`) — pre-state `election_safety` collapses `L` to the
+  committing leader, which holds E by `commitEntry`'s own `require holdsE i`. (This is T9's
+  same-term case, but it closes here through `election_safety` rather than through
+  `commit_leader_evidence`, which is vacuous.)
+* **The finisher** — any E-holder `V` in `elecQuorum L` with `gotEAt V ≤ curTerm i` transports E
+  to `L`: either `V = L`, or `V` granted to `L` at `curTerm L > curTerm i ≥ gotEAt V` and
+  `holder_grants_are_covered` fires.
+* **Case (a), `elecCfg L = cfgOf i`** — `same_cfg_quorum_intersection` on `q` and `elecQuorum L`.
+* **Case (b), `elecCfg L` strictly BELOW `cfgOf i`** — impossible. `cfglt_connected` gives a
+  succ-step; the adjacent sub-case meets the quorums directly, and for a gap,
+  `reach_quorum_below` at `(E, cfgOf i, i)` supplies a quorum of `E` whose members reached `E` no
+  later than `i` reached its own config, `reach_bound` bounds that by `curTerm i < curTerm L`,
+  adjacency meets it against `elecQuorum L`, and `elecq_grant_covers_reach` then forces
+  `¬ cfgLt (elecCfg L) E`, contradicting `succ_cfglt`.
+* **Case (c) ADJACENT, `succCfg (cfgOf i) (elecCfg L)`** — `adjacent_cfg_quorum_intersection`
+  bridges `q` to `elecQuorum L`.
+
+**THE ONE OPEN CASE — case (c) with a GAP:** `cfgLt (cfgOf i) E` and `cfgLt E (elecCfg L)` where
+`succCfg (cfgOf i) E`, i.e. **`elecCfg L` is two or more `succCfg` steps above `cfgOf i`**. The
+single `sorry` in the file is the named `have`:
+
+```
+holder_supply : ∃ V, th.qmember V (st.elecQuorum L) = true ∧ st.holdsE V = true ∧
+                     le (st.gotEAt V) (st.curTerm i)
+```
+
+## C.3 Why it does not close — stated as an argument, not as a timeout
+
+1. `holdsE L` can be concluded in exactly two ways in this bundle: `L` is itself a member of the
+   all-holder quorum `q`, or a **holder granted to `L`** (`holder_grants_are_covered`). Both need
+   a holder inside `elecQuorum L`.
+2. The only all-holder set the pre-state names is `q`, a quorum of `cfgOf i`.
+   `adjacent_cfg_quorum_intersection` bridges **exactly one** `succCfg` step, so it reaches
+   quorums of `succ (cfgOf i)` and no further.
+3. The intermediate config `E` **is** committed (`chain_committed_below` via `eleccfg_not_ahead`,
+   with `E = genesisC` excluded by `genesis_least`), and `committed_cfg_quorum` / `cfgq_witness`
+   name a quorum of it — but adjacency puts only **ONE** holder in that quorum, and one holder
+   does not license the next step. Repeating the step needs the **all-holder** form, which is
+   `cfgq_holders` gated on `cfgBacked E` — i.e. **T38**, refuted in a reachable state (ledger 68)
+   — or its direct form **T43**, likewise refuted (ledger 69). Coda-6 measured this: adding the
+   entire T20 machinery changes nothing.
+4. `no_stale_election` at `(i, E)` is the natural exclusion of the gap, and it **fails in the
+   wrong direction**: since `elecCfg i ≤ cfgOf i < E`, the clause yields not a contradiction but
+   `tot.le (curTerm i) (cfgCommitTerm E)`. No clause in the bundle bounds `cfgCommitTerm` from
+   above.
+5. Walking the chain from `cfgOf i` up to `elecCfg L` step by step is not available: `cfgLt` has
+   **no well-foundedness axiom**, so there is no induction along the config chain in this
+   fragment. Adding one would be a 12th `assumption` — a model change, a gate, and a new
+   `QuorumAdjacency.lean` witness. **Not requested.**
+
+**So the residue at `commitEntry` is the cross-config HOLDER SUPPLY — the same residue as P2's
+strict half at `becomeLeader`.** Gate 2's open items 2 and 3 are one item.
+
+## C.4 What this changes, and what it does not
+
+* **It does not change the citable claim.** P2 remains OPEN at `becomeLeader` (❌) and at
+  `commitEntry` (⏱️); the conditionality paragraph is unchanged and remains the only citable form.
+* **It sharpens the honesty note (S8.7).** S8.7 recorded `commitEntry` as carried on "no surviving
+  counterexample at 300 s — an absence, not a proof". That absence is now **explained**: the VC is
+  not solver-hard by accident, it needs a fact the bundle does not contain. The next reader should
+  not expect a bigger budget, a different solver configuration, or another hand-proof iteration to
+  close it.
+* **It retires one of gate 2's two "if pushed" moves.** Gate 2 named (i) the hand-proof route at
+  `commitEntry` and (ii) a fresh holder-supply argument for the strict half. Move (i) is now
+  **executed and exhausted**: it lands three of four cases and then arrives at move (ii). There is
+  one piece of work left in this arc, not two.
+* **Cost model, corrected.** Item 59 recorded "a ⏱️ is no longer a wall, it is a proof
+  obligation". That is right, and the coda adds the other half: a hand proof can also **discharge
+  the question without discharging the VC** — here at a cost of six runs and ~13 minutes of solver
+  wall, which is what turned a six-month-shaped unknown into a named missing lemma.
+
+## C.5 Artifacts
+
+`proofs-veil/models/ReconfigCommitSMTManualCE.lean` (the partial proof — **one** `sorry`,
+mechanically counted, at the named `holder_supply`), `proofs-veil/models/P2CEProbe3.lean` (the
+24-clause probe), and the six logs `proofs-veil/logs/smt-coda{1..6}-*.log`. Reproduction:
+
+```
+cd /home/claude/veil-spike/veil-preview
+python3 /home/claude/veil-spike/runs/make_slice.py ReconfigCommitSMTManualCE 60 commitEntry <17 clauses>
+python3 /home/claude/veil-spike/runs/coda_insert.py ReconfigCommitSMTManualCE <proof-body>
+bash /home/claude/veil-spike/runs/runmod.sh ReconfigCommitSMTManualCE <log>
+```
+
+**Never `proofs/`; nothing in `proofs-veil/` is the record. The GATE 2 VERDICT above stands
+verbatim and unamended.**

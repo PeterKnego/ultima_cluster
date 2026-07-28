@@ -3324,3 +3324,92 @@ applied by this session:**
 
 **ARC STATUS: BANKED**, pending the user's merge decision. Nothing in `proofs-veil/` is the
 record; `proofs/` remains the sole trusted base.
+
+---
+
+### CODA SESSION (2026-07-28, opus) — gate 2's sanctioned coda: P2 @ `commitEntry` by hand. **NOT CLOSED.**
+
+Hard-timeboxed, single-goal session (gate-2 ruling: "the hand-proof route (item 59) applied to
+**P2 @ `commitEntry` ONLY** ... The strict half is not to be reopened in this arc"). Scope
+respected: `becomeLeader` untouched, **no model change, no clause, no ghost** —
+`ReconfigCommitSMT.lean` is byte-unchanged at `ae3c67b`, re-verified mechanically before the
+first run at **35 `require`s / 11 `assumption`s / 55 invariants + 2 safeties**.
+
+#### 70. THE STUB, AND THE ANTI-VACUITY CONTROL (method, per gate 2)
+Veil emits a theorem stub only for **undischarged (⏱️)** VCs, not for refuted (❌) ones — so a
+slice small enough to give a fast verdict gives no stub. The 12-clause slice `P2CEManual`
+(run coda-1, `smt-coda1-stub.log`, **12 ✅ / 1 ❌ / 0 ⏱️ in 139 s**) refutes the VC and prints a
+CTI instead. Adding five supports (`committed_cfg_quorum`, `chain_committed_below`,
+`no_stale_election`, `cfgq_witness`, `leader_reach_strict`) kills that CTI: run coda-2
+(`P2CEProbe2`, 17 clauses) is **17 ✅ / 0 ❌ / 1 ⏱️ in 167 s** and DOES emit the stub. Run coda-3
+re-elicits it under the proof module name (`ReconfigCommitSMTManualCE`, 166 s).
+**ANTI-VACUITY CONTROL (banked, `smt-coda4-probe-trace.log`):** the stub statement with
+`unveil; classical; rcases; trace_state; sorry` is **REJECTED with 💥** —
+`interactive proof 'ReconfigCommitSMTManualCE.commitEntry_leader_completeness' contains 'sorry'`
+— so the `@[veil]` theorem really is consumed for this VC. The statement in the banked file is
+**byte-identical (whitespace-normalised) to the emitted stub**, mechanically diffed.
+
+#### 71. THE COARSE CTI (run coda-1) — the SHAPE of the difficulty, named by the solver
+Not banked as a finding (it is a slice artifact: it has `cfgLt 2 1` with `cfgCommitted = []`,
+which `chain_committed_below` excludes — hence coda-2's green). Its SHAPE is the diagnostic and
+it is exactly the case the hand proof later isolates: chain `genesis(0) → 2 → 1`;
+`commitEntry(i = 1, q = {1,2})` with `cfgOf 1 = genesis`; the violating leader is node 0 with
+`elecCfg 0 = 1` — **TWO succ-steps above the committing leader's config** — and
+`elecQuorum 0 = {0}` disjoint from `q`.
+
+#### 72. **THE HAND PROOF — three of four cases PROVED, one case OPEN, and the open case NAMED**
+`proofs-veil/models/ReconfigCommitSMTManualCE.lean`, run coda-5 (`smt-coda5-proof1.log`, 65 s):
+💥 for the single `sorry`, and **zero tactic errors** — every other branch elaborates.
+`grep -c sorry` on the file is **1**, at the named `have`.
+After `unveil` the pre-state carries `st.committed = false`, so **P2 itself and every
+`committed`/`isCommitLeader`-gated clause are VACUOUS as pre-state hypotheses at this action** —
+including the whole frozen-commit-leadership package T18/T13/T14. That is a structural
+difference from `becomeLeader` which the arc had not recorded, and it is why T9's same-term
+argument (which routes through `commit_leader_evidence`) is not the argument that works here.
+* **PROVED — same-term half:** `election_safety` in the pre-state collapses `L` to `i`, and
+  `commitEntry`'s own `require holdsE i` finishes.
+* **PROVED — the finisher:** any E-holder in `elecQuorum L` with `gotEAt ≤ curTerm i` transports
+  E to L (`elecq_witness` + `holder_grants_are_covered`, the strict term gap supplying `tlt`).
+* **PROVED — case (a)** `elecCfg L = cfgOf i`: `same_cfg_quorum_intersection`.
+* **PROVED — case (b)** `elecCfg L` strictly BELOW `cfgOf i`, INCLUDING the gap: `cfglt_connected`
+  → adjacency, or `reach_quorum_below` at `(E, cfgOf i, i)` + `reach_bound` + adjacency +
+  `elecq_grant_covers_reach` against `succ_cfglt`. (`E = genesisC` dies on `genesis_least`.)
+* **PROVED — case (c) ADJACENT:** `adjacent_cfg_quorum_intersection`.
+* **OPEN — case (c) with a GAP:** `elecCfg L` two or more `succCfg` steps above `cfgOf i`. The
+  `sorry` is `holder_supply : ∃ V, qmember V (elecQuorum L) ∧ holdsE V ∧ le (gotEAt V) (curTerm i)`.
+
+#### 73. **WHY THE GAP CASE DOES NOT CLOSE — an argument, not a timeout**
+1. `holdsE L` is derivable only via `L ∈ q` or via a **holder's grant**
+   (`holder_grants_are_covered`); both need a holder INSIDE `elecQuorum L`.
+2. The only all-holder set the pre-state names is `q`, a quorum of `cfgOf i`, and
+   `adjacent_cfg_quorum_intersection` bridges **exactly one** succ-step.
+3. The intermediate config `E` IS committed and HAS a named quorum (`chain_committed_below` +
+   `eleccfg_not_ahead`, then `committed_cfg_quorum` / `cfgq_witness`) — but adjacency puts only
+   **one** holder in it, and repeating the step needs the ALL-HOLDER form: `cfgq_holders` gated on
+   `cfgBacked E` = **T38 (refuted, item 68)**, or its direct form **T43 (refuted, item 69)**.
+4. `no_stale_election` at `(i, E)` — the natural exclusion of the gap — fails in the WRONG
+   DIRECTION: with `elecCfg i ≤ cfgOf i < E` it yields `tot.le (curTerm i) (cfgCommitTerm E)`,
+   and nothing in the bundle bounds `cfgCommitTerm` from above.
+5. `cfgLt` carries **no well-foundedness axiom**, so chain induction is unavailable in this
+   fragment; supplying one would be a 12th `assumption` — model change, gate, new witness.
+   **NOT REQUESTED.**
+**MEASURED, not merely argued (run coda-6, `P2CEProbe3`, `smt-coda6-probe24.log`):** the same
+17-clause slice PLUS the entire T20 machinery (`cfgpred_succ`, `cfg_seen_adopted`,
+`cfg_seen_committed`, `adopted_holds`, `cfgq_witness`, `cfgq_holders`, `propafter_holds`,
+`cfgbacked_committed`) is **24 ✅ / 0 ❌ / 1 ⏱️ in 221 s** — no counterexample, and no proof.
+
+#### 74. **THE FINDING — gate 2's two open P2 items are ONE item**
+The residue at `commitEntry` is the **cross-config HOLDER SUPPLY**, which is verbatim the residue
+S8.7 records for P2's strict half at `becomeLeader`. This does not change the citable claim (P2
+stays OPEN at both actions, conditionality unchanged), but it does three things: it **explains**
+the ⏱️ that S8.7 could only record as "an absence, not a proof"; it **retires** gate-2 "if
+pushed" move (i) (the hand-proof route at `commitEntry` — executed, and it terminates in move
+(ii)); and it corrects item 59's cost model — a hand proof can **settle the question without
+discharging the VC**, which is what six runs and ~13 minutes of solver wall bought here.
+**No CTI in this session survived adjudication as possibly-real; nothing found is a UC behaviour.**
+
+#### CODA DISPOSITION
+Timebox honoured; the proof did NOT land and is banked as partial, with the stuck point named at
+clause granularity. **No model or bundle change of any kind** (the count corrective is intact),
+`becomeLeader` not reopened, GATE 2 VERDICT text not edited. Dossier: the checkpoint's
+`# CODA (post-gate-2, 2026-07-28)` section. **Never `proofs/`; nothing here is the record.**

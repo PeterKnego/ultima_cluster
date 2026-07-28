@@ -1,0 +1,81 @@
+  unveil
+  classical
+  rcases has with ⟨hsame, hqms, hshape, hirr, htrans, hsucclt, htotal, hgen, himm, hconn, hadj⟩
+  rcases hinv with ⟨hes, hlc, hgs, hsv, hhgc, hgeb, hena, hre, hrb, hrqb, hccq, hccb, hnse, hew,
+    hegcr, hlrs, hcqw⟩
+  intro hleader hncomm hholdsi hquo hqh hqg L hL hterm
+  by_cases hEq : st.curTerm L = st.curTerm i
+  · -- SAME-TERM HALF (T9): `election_safety` in the pre-state collapses L to the
+    -- committing leader, which holds E by `commitEntry`'s own `require holdsE i`.
+    rw [hes L i hL hleader hEq]; exact hholdsi
+  · -- STRICT HALF: committedTerm = curTerm i < curTerm L.
+    have hne : ¬ st.curTerm i = st.curTerm L := fun h => hEq h.symm
+    obtain ⟨hLq, hLg⟩ := hew L hL
+    -- THE FINISHER. Any E-HOLDER in L's frozen certifying quorum whose acquisition term is
+    -- bounded by curTerm i transports E to L: it is either L itself, or it granted to L at
+    -- curTerm L > curTerm i >= gotEAt V, and `holder_grants_are_covered` fires.
+    have finish : ∀ V, st.holdsE V = true →
+        TotalOrderWithZero.le (st.gotEAt V) (st.curTerm i) →
+        th.qmember V (st.elecQuorum L) = true → st.holdsE L = true := by
+      intro V hVh hVg hVL
+      rcases hLg V hVL with rfl | hv
+      · exact hVh
+      · refine hhgc V L (st.curTerm L) hv hVh (tot.le_trans _ _ _ hVg hterm) ?_
+        intro hgeq
+        rw [hgeq] at hVg
+        exact hne (tot.le_antisymm _ _ hterm hVg)
+    rcases htotal (st.elecCfg L) (st.cfgOf i) with heq | hlt | hgt
+    · -- (a) SAME CONFIG: `same_cfg_quorum_intersection` on q and elecQuorum L.
+      obtain ⟨V, hV1, hV2⟩ :=
+        hsame (st.cfgOf i) q (st.elecQuorum L) hquo (by rw [← heq]; exact hLq)
+      exact finish V (hqh V hV1) (hqg V hV1) hV2
+    · -- (b) elecCfg L STRICTLY BELOW cfgOf i.
+      obtain ⟨E, hsE, hcase⟩ := hconn _ _ hlt
+      rcases hcase with rfl | hlt2
+      · -- adjacent: the two quorums meet directly.
+        obtain ⟨V, hV1, hV2⟩ := hadj _ _ _ _ hsE hLq hquo
+        exact finish V (hqh V hV2) (hqg V hV2) hV1
+      · -- a gap BELOW: `reach_quorum_below` at (E, cfgOf i, i) supplies a quorum of E all of
+        -- whose members reached E no later than i reached its own config, which `reach_bound`
+        -- bounds by curTerm i < curTerm L. Adjacency meets it against elecQuorum L, and
+        -- `elecq_grant_covers_reach` then forces elecCfg L to be at-or-past E — contradicting
+        -- succCfg (elecCfg L) E. So case (b) with a gap is impossible.
+        rcases hrqb E (st.cfgOf i) i hlt2 (hirr _) with hgenE | ⟨q', hq'E, hq'm⟩
+        · have h1 := hsucclt _ _ hsE
+          rw [hgenE, hgen] at h1
+          exact absurd h1 (by simp)
+        · obtain ⟨V, hV1, hV2⟩ := hadj _ _ _ _ hsE hLq hq'E
+          obtain ⟨hVc, hVr⟩ := hq'm V hV2
+          have hb : TotalOrderWithZero.le (st.reachAt V E) (st.curTerm i) :=
+            tot.le_trans _ _ _ hVr (hrb i (st.cfgOf i) (hirr _))
+          have hfalse := hegcr L V E hL hV1 hVc (tot.le_trans _ _ _ hb hterm) (by
+            intro hgeq
+            rw [hgeq] at hb
+            exact hne (tot.le_antisymm _ _ hterm hb))
+          have htrue := hsucclt _ _ hsE
+          rw [hfalse] at htrue
+          exact absurd htrue (by simp)
+    · -- (c) cfgOf i STRICTLY BELOW elecCfg L.
+      obtain ⟨E, hsE, hcase⟩ := hconn _ _ hgt
+      rcases hcase with rfl | hlt2
+      · -- adjacent: `adjacent_cfg_quorum_intersection` bridges q to elecQuorum L.
+        obtain ⟨V, hV1, hV2⟩ := hadj _ _ _ _ hsE hquo hLq
+        exact finish V (hqh V hV1) (hqg V hV1) hV2
+      · -- ===================== THE RESIDUE — THIS CASE DOES NOT CLOSE =====================
+        -- elecCfg L is TWO OR MORE succCfg steps above cfgOf i. `adjacent_cfg_quorum_
+        -- intersection` bridges exactly one step, so the all-holder quorum q (of cfgOf i)
+        -- cannot be met against elecQuorum L (of elecCfg L). What is needed is an ALL-HOLDER
+        -- quorum at the intermediate config E — the CROSS-CONFIG HOLDER SUPPLY. The bundle
+        -- supplies a quorum of E (E is committed: `chain_committed_below` + `eleccfg_not_ahead`,
+        -- and `committed_cfg_quorum`/`cfgq_witness` name one), and adjacency puts ONE holder in
+        -- it — but ONE holder is not enough to repeat the step, and the two clauses that stated
+        -- the all-holder form (T38 `cfgBacked`, T43 `cfgq_holders_above`) are BOTH REFUTED in
+        -- reachable states (ledger items 68/69). `no_stale_election` at (i, E) yields only
+        -- `curTerm i <= cfgCommitTerm E`, which is the wrong direction. The chain has no
+        -- well-foundedness axiom, so induction along it is unavailable in this fragment.
+        -- This is the SAME residue as P2's strict half at `becomeLeader`.
+        have holder_supply : ∃ V, th.qmember V (st.elecQuorum L) = true ∧
+            st.holdsE V = true ∧ TotalOrderWithZero.le (st.gotEAt V) (st.curTerm i) := by
+          sorry
+        obtain ⟨V, hVL, hVh, hVg⟩ := holder_supply
+        exact finish V hVh hVg hVL
