@@ -34,6 +34,7 @@
 use crate::CryptoError;
 use aes_gcm::aead::{AeadInPlace, generic_array::GenericArray};
 use aes_gcm::{Aes256Gcm, KeyInit};
+use std::ops::Range;
 use uc_protocol::v2::crypto::{COUNTER_LEN, CRYPTO_OVERHEAD, TAG_LEN, read_counter, write_counter};
 use uc_protocol::v2::datagram::DATAGRAM_HEADER_LEN;
 
@@ -60,7 +61,25 @@ fn nonce_bytes(counter: u64) -> [u8; 12] {
 /// straight into `Aes256Gcm::new`, which is the only place its bytes are
 /// read. The cipher built from it is a function-local dropped at the end of
 /// this call, never stored.
+///
+/// Builds a fresh `Aes256Gcm` for this one call. On the hot fan-out path
+/// (measured: `Aes256Gcm::new` is ~9% of a seal) a caller sealing many
+/// datagrams under the SAME key should build the cipher once and call
+/// [`seal_with`] directly instead — see `transport.rs`'s per-epoch cache,
+/// which is exactly this: one seal, N sends, one cipher construction.
 pub fn seal_in_place(buf: &mut Vec<u8>, key: &[u8; 32], counter: u64) -> Result<(), CryptoError> {
+    seal_with(buf, &Aes256Gcm::new(GenericArray::from_slice(key)), counter)
+}
+
+/// Same contract as [`seal_in_place`], but takes an already-constructed
+/// cipher instead of a raw key — the sibling `derive_send_key`'s doc and the
+/// module docs above call for: a caller sealing many datagrams under one key
+/// (the group-key fan-out is the canonical case) builds `cipher` once and
+/// passes it to every call, instead of paying `Aes256Gcm::new`'s ~133 ns per
+/// datagram. `seal_in_place` is unchanged and remains the reviewed primitive;
+/// this is the only place the AEAD calls live — `seal_in_place` is now a
+/// thin wrapper over this function, not a fork of it.
+pub fn seal_with(buf: &mut Vec<u8>, cipher: &Aes256Gcm, counter: u64) -> Result<(), CryptoError> {
     if buf.len() < DATAGRAM_HEADER_LEN {
         return Err(CryptoError::TooShort);
     }
@@ -71,7 +90,6 @@ pub fn seal_in_place(buf: &mut Vec<u8>, key: &[u8; 32], counter: u64) -> Result<
 
     let nonce_arr = nonce_bytes(counter);
     let nonce = GenericArray::from_slice(&nonce_arr);
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
 
     let (header, rest) = buf.split_at_mut(DATAGRAM_HEADER_LEN);
     let (_counter, payload) = rest.split_at_mut(COUNTER_LEN);
@@ -105,8 +123,76 @@ pub fn seal_in_place(buf: &mut Vec<u8>, key: &[u8; 32], counter: u64) -> Result<
 /// socket read's reported byte count before calling this.
 ///
 /// `key` is borrowed straight into `Aes256Gcm::new`, same discipline as
-/// `seal_in_place`.
+/// `seal_in_place`. Builds a fresh cipher per call — see [`open_with`] for a
+/// caller opening many datagrams under one key.
 pub fn open_in_place(buf: &mut Vec<u8>, key: &[u8; 32]) -> Result<u64, CryptoError> {
+    open_with(buf, &Aes256Gcm::new(GenericArray::from_slice(key)))
+}
+
+/// Same contract as [`open_in_place`], but takes an already-constructed
+/// cipher — the receive-side counterpart to [`seal_with`], for a caller
+/// opening many datagrams under the same key (e.g. one sender's group-scope
+/// traffic under one epoch) without paying `Aes256Gcm::new` per datagram.
+pub fn open_with(buf: &mut Vec<u8>, cipher: &Aes256Gcm) -> Result<u64, CryptoError> {
+    let (counter, _plaintext_len) = open_core(buf, cipher)?;
+    // Strip tag then counter so the caller sees the original header ++
+    // plaintext layout. Order matters only for which indices are valid at
+    // each step; both are plain in-place Vec shrinks, no allocation.
+    let new_len = buf.len() - TAG_LEN;
+    buf.truncate(new_len);
+    buf.drain(DATAGRAM_HEADER_LEN..DATAGRAM_HEADER_LEN + COUNTER_LEN);
+    Ok(counter)
+}
+
+/// Slice-based sibling of [`open_in_place`]/[`open_with`] for a caller that
+/// cannot afford `open_in_place`'s `Vec` shrink — e.g. a receiver reading
+/// into a persistent, oversized scratch buffer, where `truncate(n) -> open
+/// -> resize(65536, 0)` would memset 64 KiB per datagram (the same order of
+/// cost as the crypto itself; see the module docs' "Untrusted input"
+/// section and `transport.rs`'s carried requirement #5).
+///
+/// Decrypts `buf` in place (the plaintext overwrites the ciphertext at the
+/// SAME offset it already occupied — `buf`'s length is unchanged, nothing is
+/// shifted or truncated) and returns `(counter, plaintext_range)`, where
+/// `plaintext_range` is the byte range **within the ORIGINAL, still-full-length
+/// `buf`** holding the decrypted plaintext — i.e. everything after the
+/// cleartext header AND the 8-byte counter field, which is still physically
+/// present in `buf` at `DATAGRAM_HEADER_LEN..DATAGRAM_HEADER_LEN+COUNTER_LEN`
+/// (unlike [`open_with`], this function has no way to remove it from a plain
+/// slice). A caller wants `&buf[..DATAGRAM_HEADER_LEN]` for the header and
+/// `&buf[plaintext_range]` for the payload; the 8 bytes in between are the
+/// spent counter field, not part of either.
+///
+/// **Invariant, same as [`open_in_place`]:** `buf.len()` must be exactly the
+/// length of the received datagram, never a fixed-size buffer with trailing
+/// unwritten bytes — both the AAD scope and the ciphertext region are
+/// derived purely from `buf.len()`.
+pub fn open_detached(buf: &mut [u8], key: &[u8; 32]) -> Result<(u64, Range<usize>), CryptoError> {
+    open_detached_with(buf, &Aes256Gcm::new(GenericArray::from_slice(key)))
+}
+
+/// [`open_detached`] with a caller-supplied cipher — see [`open_with`] for
+/// why a caller opening many datagrams under one key wants this instead of
+/// rebuilding the cipher every call.
+pub fn open_detached_with(
+    buf: &mut [u8],
+    cipher: &Aes256Gcm,
+) -> Result<(u64, Range<usize>), CryptoError> {
+    let (counter, plaintext_len) = open_core(buf, cipher)?;
+    let start = DATAGRAM_HEADER_LEN + COUNTER_LEN;
+    Ok((counter, start..start + plaintext_len))
+}
+
+/// Shared decrypt-in-place core for the `open_*` family: length-checks,
+/// reads the counter, builds the nonce, and authenticates+decrypts the
+/// ciphertext region under AAD = the header. Returns `(counter,
+/// plaintext_len)` — `plaintext_len` is the length of the now-decrypted
+/// region starting at `DATAGRAM_HEADER_LEN + COUNTER_LEN`; callers differ
+/// only in what they do with that fact afterwards ([`open_with`] shrinks a
+/// `Vec`, [`open_detached_with`] just reports the range). This is the ONE
+/// place `decrypt_in_place_detached` is called — every `open_*` entry point
+/// is a thin wrapper over this, never a fork of the AEAD logic.
+fn open_core(buf: &mut [u8], cipher: &Aes256Gcm) -> Result<(u64, usize), CryptoError> {
     if buf.len() < DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD {
         return Err(CryptoError::TooShort);
     }
@@ -114,7 +200,6 @@ pub fn open_in_place(buf: &mut Vec<u8>, key: &[u8; 32]) -> Result<u64, CryptoErr
     let counter = read_counter(&buf[DATAGRAM_HEADER_LEN..DATAGRAM_HEADER_LEN + COUNTER_LEN]);
     let nonce_arr = nonce_bytes(counter);
     let nonce = GenericArray::from_slice(&nonce_arr);
-    let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
 
     let (header, rest) = buf.split_at_mut(DATAGRAM_HEADER_LEN);
     let (_counter, ciphertext_and_tag) = rest.split_at_mut(COUNTER_LEN);
@@ -129,13 +214,7 @@ pub fn open_in_place(buf: &mut Vec<u8>, key: &[u8; 32]) -> Result<u64, CryptoErr
         .decrypt_in_place_detached(nonce, &*header, ciphertext, tag)
         .map_err(|_| CryptoError::AuthFailed)?;
 
-    // Strip tag then counter so the caller sees the original header ++
-    // plaintext layout. Order matters only for which indices are valid at
-    // each step; both are plain in-place Vec shrinks, no allocation.
-    let new_len = buf.len() - TAG_LEN;
-    buf.truncate(new_len);
-    buf.drain(DATAGRAM_HEADER_LEN..DATAGRAM_HEADER_LEN + COUNTER_LEN);
-    Ok(counter)
+    Ok((counter, split_at))
 }
 
 #[cfg(test)]
