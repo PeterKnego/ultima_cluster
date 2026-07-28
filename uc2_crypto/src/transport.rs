@@ -129,7 +129,7 @@
 //! this module; it exists for the lower layer this facade sits on top of.
 
 use crate::group::GroupPlane;
-use crate::handshake::Peers;
+use crate::handshake::{HandshakeAction, Peers};
 use crate::identity::{Allowlist, Identity};
 use crate::replay::ReplayWindow;
 use crate::rotation::{RotationPolicy, RotationReason, RotationState};
@@ -646,6 +646,28 @@ impl Transport {
     /// [`Peers::tick`] does internally.
     pub fn allowlist_reload_if_stale(&mut self, now_ns: u64) -> Result<bool, CryptoError> {
         self.peers.allowlist_reload_if_stale(now_ns)
+    }
+
+    /// Forwards to [`GroupPlane::mint`] — call this when [`Transport::rotation_due`]
+    /// reports a reason (T12's node-layer job: "drain `rotation_due` ... and mint
+    /// when it returns `Some`"). Returns the fresh epoch plus one `HS_KEY` delivery
+    /// action per named peer, for the caller to seal (`Scope::Pairwise`, via this
+    /// same `Transport::seal`) and send over that peer's already-established
+    /// pairwise channel.
+    ///
+    /// Added ahead of T12 (found while implementing T10): before this method,
+    /// `GroupPlane` was reachable ONLY through this struct's private `group`
+    /// field, so nothing outside this crate could EVER mint a group epoch —
+    /// every `Scope::Group` seal was permanently `Err(NoGroupKey)` from any
+    /// external caller, T10's own send-seam included (its tests need an
+    /// activated epoch to exercise the seal path at all; see
+    /// `sealing_before_a_group_key_exists_is_an_error_not_a_cleartext_send`
+    /// for the state every fresh `Transport` starts in). A pure forwarder,
+    /// same shape as [`Transport::on_became_leader`]/[`Transport::on_committed_config`]/
+    /// [`Transport::rotation_due`] above — `GroupPlane` itself is unchanged
+    /// and stays unit-testable in isolation.
+    pub fn mint_group_key(&mut self, peers: &[NodeId], now_ns: u64) -> (u16, Vec<HandshakeAction>) {
+        self.group.mint(peers, now_ns)
     }
 }
 

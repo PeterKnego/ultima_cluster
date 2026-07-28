@@ -1288,6 +1288,7 @@ name = "uc2_net"
 version = "0.1.0"
 dependencies = [
  "tempfile",
+ "uc2_crypto",
  "uc2_log",
  "uc_protocol",
  "ultima-journal",

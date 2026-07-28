@@ -19,9 +19,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
+use uc2_crypto::Transport;
 use uc2_log::archive::find_block;
 use uc2_log::buffer::{LogBuffer, SliceRead};
 use uc2_log::cnc::CncPage;
+use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT, DGRAM_KIND_SNAP_BEGIN,
     DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_FIXED_LEN, SnapBeginBody,
@@ -133,6 +135,14 @@ pub struct SenderConfig {
     pub initial_window: u64,
     /// Max steady-state datagrams per duty cycle (bounded work).
     pub dgrams_per_cycle: usize,
+    /// M8: whether this sender's DATA/HEARTBEAT datagrams are sealed under
+    /// wire crypto. Kept as an explicit `SenderConfig` field — rather than
+    /// derived from `Sender::crypto.is_some()` — so `crypto_overhead()` is
+    /// computable on a bare `SenderConfig`, before any `Sender` exists (the
+    /// MTU-budget math wants this independent of construction order).
+    /// `Sender::with_crypto` asserts this always agrees with whether a
+    /// `Transport` was actually supplied, so the two can never drift.
+    pub crypto_enabled: bool,
 }
 
 impl SenderConfig {
@@ -143,7 +153,17 @@ impl SenderConfig {
             heartbeat_ns: 100_000_000,
             initial_window: 65_536,
             dgrams_per_cycle: 8,
+            crypto_enabled: false,
         }
+    }
+
+    /// M8: bytes a sealed datagram adds beyond `DATAGRAM_HEADER_LEN` —
+    /// `CRYPTO_OVERHEAD` (the 8-byte counter + 16-byte AEAD tag) when crypto
+    /// is on, else 0 (cleartext: the wire is byte-for-byte pre-M8). Every
+    /// site that sizes a run/replay/journal-chunk read against the MTU must
+    /// subtract this, or a sealed datagram silently exceeds `mtu`.
+    pub fn crypto_overhead(&self) -> usize {
+        if self.crypto_enabled { CRYPTO_OVERHEAD } else { 0 }
     }
 }
 
@@ -182,6 +202,12 @@ pub struct SenderStats {
     pub snap_chunks: AtomicU64,
     /// M6 Task 6: SNAP_CHUNK datagrams sent specifically to repair a peer NAK.
     pub snap_chunk_naks: AtomicU64,
+    /// M8: a DATA/HEARTBEAT datagram whose `Transport::seal` call failed
+    /// (`NoGroupKey`, an evicted epoch, etc.) — dropped rather than sent.
+    /// Never fatal: a dropped DATA self-heals via NAK repair (the follower's
+    /// contiguous frontier never advances past it); a dropped HEARTBEAT is
+    /// superseded by the next one. Observability only.
+    pub seal_failures: AtomicU64,
 }
 
 pub struct Sender {
@@ -242,6 +268,14 @@ pub struct Sender {
     /// peer's `advertised_limit` from its flow-control view (bounded — a pass over
     /// ≤8 slots, no per-datagram cnc writes). Diagnostics only.
     peer_obs: Option<PeerObs>,
+    /// M8 (Task 10): wire crypto, if enabled. `None` = every datagram this
+    /// sender assembles stays cleartext, byte-for-byte what pre-M8 code
+    /// produced. `Some` seals every DATA/HEARTBEAT datagram once inside
+    /// `assemble`/`seal_scratch` — `fan_out`'s loop still sends the SAME
+    /// sealed bytes to every follower (one seal, N sends; see the module
+    /// docs and `SenderConfig::crypto_enabled`'s doc for how this stays in
+    /// sync with the MTU budget).
+    crypto: Option<Transport>,
 }
 
 /// M6 Task 9: the sender's observability handle — the cnc page plus the
@@ -279,9 +313,44 @@ impl Sender {
         term: TermHandle,
         role: Arc<AtomicBool>,
     ) -> Sender {
+        Self::with_crypto(
+            buffer, sock, followers, learners, cluster_size, ctrl, cfg, term, role, None,
+        )
+    }
+
+    /// M8 (Task 10): the innermost constructor — `with_learners`/`new` are thin
+    /// wrappers over this with `crypto: None`. `crypto: Some(transport)` seals
+    /// every DATA/HEARTBEAT datagram `assemble` builds; `cfg.crypto_enabled`
+    /// MUST already agree with `crypto.is_some()` (asserted below) — the MTU
+    /// budget every read site computes from `cfg.crypto_overhead()` would
+    /// otherwise silently disagree with what this constructor is about to do.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_crypto(
+        buffer: Arc<LogBuffer>,
+        sock: FaultSocket,
+        followers: Vec<SocketAddr>,
+        learners: &[SocketAddr],
+        cluster_size: usize,
+        ctrl: mpsc::Receiver<CtrlMsg>,
+        cfg: SenderConfig,
+        term: TermHandle,
+        role: Arc<AtomicBool>,
+        crypto: Option<Transport>,
+    ) -> Sender {
+        assert_eq!(
+            cfg.crypto_enabled,
+            crypto.is_some(),
+            "SenderConfig::crypto_enabled must agree with whether a Transport was supplied \
+             (mismatch here is exactly the class of bug that lets a sealed datagram overrun \
+             the MTU: the budget math trusts crypto_enabled, not crypto.is_some())"
+        );
         assert!(
-            align_frame_len(HEADER_LEN + buffer.max_payload()) + DATAGRAM_HEADER_LEN <= cfg.mtu,
-            "a max-size frame must fit one datagram (raise mtu — the jumbo-frame knob)"
+            align_frame_len(HEADER_LEN + buffer.max_payload())
+                + DATAGRAM_HEADER_LEN
+                + cfg.crypto_overhead()
+                <= cfg.mtu,
+            "a max-size frame (+ crypto overhead, if enabled) must fit one datagram \
+             (raise mtu — the jumbo-frame knob)"
         );
         // Voting followers pace commit; learners are fanned-out to but never enter
         // `limit()`.
@@ -312,6 +381,7 @@ impl Sender {
             snap: None,
             snap_session_seq: 0,
             peer_obs: None,
+            crypto,
         }
     }
 
@@ -468,7 +538,9 @@ impl Sender {
 
         let append = self.buffer.counters().append.load_acquire();
         let limit = self.flow.limit();
-        let budget = self.cfg.mtu - DATAGRAM_HEADER_LEN;
+        // M8: shrunk by crypto_overhead() when crypto is on, so a run's body
+        // plus the counter+tag `assemble`/`seal_scratch` add never exceeds mtu.
+        let budget = self.cfg.mtu - DATAGRAM_HEADER_LEN - self.cfg.crypto_overhead();
         let mut dgrams = 0;
         while dgrams < self.cfg.dgrams_per_cycle && self.sent < append && self.sent < limit {
             // don't read more than the flow limit allows in one datagram
@@ -523,14 +595,19 @@ impl Sender {
         let now = self.now_ns();
         if now - self.last_heartbeat_ns >= self.cfg.heartbeat_ns {
             self.last_heartbeat_ns = now;
-            self.assemble(append, DGRAM_KIND_HEARTBEAT, 0);
-            for &to in &self.followers {
-                let _ = self.sock.send_to(&self.scratch, to);
+            // M8: a failed seal drops this heartbeat (counted inside
+            // assemble/seal_scratch) rather than sending it half-built; the
+            // interval marker above still advances, so a persistent NoGroupKey
+            // condition doesn't spin — the next heartbeat simply retries.
+            if self.assemble(append, DGRAM_KIND_HEARTBEAT, 0) {
+                for &to in &self.followers {
+                    let _ = self.sock.send_to(&self.scratch, to);
+                }
+                // CommitPosition gossip (spec §6, on-advance + the 100 ms floor) is
+                // the consensus agent's job now (`Action::GossipCommit`) — the
+                // sender no longer ranks or gossips commit at all (M4 carry #5).
+                self.stats.heartbeats.fetch_add(1, Ordering::Relaxed);
             }
-            // CommitPosition gossip (spec §6, on-advance + the 100 ms floor) is
-            // the consensus agent's job now (`Action::GossipCommit`) — the
-            // sender no longer ranks or gossips commit at all (M4 carry #5).
-            self.stats.heartbeats.fetch_add(1, Ordering::Relaxed);
             did = true;
         }
 
@@ -557,8 +634,11 @@ impl Sender {
         }
     }
 
-    /// Header + the first `body_bytes` of `self.run` into `self.scratch`.
-    fn assemble(&mut self, position: u64, kind: u8, body_bytes: usize) {
+    /// Header + the first `body_bytes` of `self.run` into `self.scratch`, then
+    /// seal it (M8) if crypto is enabled. Returns `false` if a seal attempt
+    /// failed — `self.scratch` must then NOT be sent (see `seal_scratch`'s
+    /// doc); every caller checks the return value before touching the socket.
+    fn assemble(&mut self, position: u64, kind: u8, body_bytes: usize) -> bool {
         self.scratch.clear();
         self.scratch.resize(DATAGRAM_HEADER_LEN, 0);
         write_datagram_header(
@@ -568,15 +648,52 @@ impl Sender {
                 leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind,
                 flags: 0,
+                // M8: always written as 0 here — `Transport::seal`'s group
+                // branch stamps the REAL epoch into this field itself, as the
+                // last write before sealing (the header is AAD, so it must be
+                // final before the AEAD call). Cleartext mode leaves it 0,
+                // matching pre-M8 wire output exactly.
                 key_epoch: 0,
             },
         );
         self.scratch.extend_from_slice(&self.run[..body_bytes]);
+        self.seal_scratch(kind)
     }
 
-    /// One scan, N sends (identical datagram to every follower).
+    /// M8 (Task 10): seal `self.scratch` in place under crypto, if enabled.
+    /// `kind` here is always `DGRAM_KIND_DATA` or `DGRAM_KIND_HEARTBEAT` — the
+    /// only two kinds this module ever assembles — both `Scope::Group`, so
+    /// `peer: None` is always the right call (group scope ignores it; the
+    /// whole point of the group key is that the SAME sealed bytes go to every
+    /// destination). Returns `true` when `self.scratch` is ready to send —
+    /// always true in cleartext mode. Returns `false` on a seal failure
+    /// (`NoGroupKey`, an evicted epoch, etc.): the datagram is dropped (never
+    /// sent half-sealed or with stale plaintext) and `SenderStats::seal_failures`
+    /// is bumped. This is never fatal to the agent — a dropped DATA self-heals
+    /// via NAK repair once a group key is available; a dropped HEARTBEAT is
+    /// superseded by the next interval.
+    fn seal_scratch(&mut self, kind: u8) -> bool {
+        let Some(crypto) = self.crypto.as_mut() else {
+            return true; // cleartext mode: nothing to do
+        };
+        let now_ns = self.base.elapsed().as_nanos() as u64;
+        match crypto.seal(kind, None, &mut self.scratch, now_ns) {
+            Ok(()) => true,
+            Err(_) => {
+                self.stats.seal_failures.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    /// One scan, N sends (identical datagram to every follower). If sealing
+    /// fails, nothing is sent this cycle to ANY follower (a half fan-out —
+    /// some followers sealed, some not — is not a state this function ever
+    /// produces): `assemble` already counted the failure.
     fn fan_out(&mut self, position: u64, body_bytes: usize) {
-        self.assemble(position, DGRAM_KIND_DATA, body_bytes);
+        if !self.assemble(position, DGRAM_KIND_DATA, body_bytes) {
+            return;
+        }
         for &to in &self.followers {
             let _ = self.sock.send_to(&self.scratch, to);
             self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
@@ -587,16 +704,22 @@ impl Sender {
     /// Retransmit [pos, pos+len) to ONE follower, MTU chunk by MTU chunk.
     /// `len` is capped by the follower (Task 8), so this is bounded work.
     fn serve_nak(&mut self, to: SocketAddr, pos: u64, len: u32) {
-        let budget = self.cfg.mtu - DATAGRAM_HEADER_LEN;
+        let budget = self.cfg.mtu - DATAGRAM_HEADER_LEN - self.cfg.crypto_overhead();
         let end = pos + len as u64;
         let mut p = pos;
         while p < end {
             match self.buffer.read_run_validated(p, budget, &mut self.run) {
                 SliceRead::Run(r) => {
-                    self.assemble(p, DGRAM_KIND_DATA, r.bytes);
-                    let _ = self.sock.send_to(&self.scratch, to);
-                    self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
-                    self.stats.bytes.fetch_add(r.bytes as u64, Ordering::Relaxed);
+                    // M8: a failed seal drops just this one retransmitted
+                    // datagram (counted inside assemble/seal_scratch) — `p`
+                    // still advances past it; the follower's contiguous
+                    // frontier stays put and it re-NAKs, same as any other
+                    // lost datagram.
+                    if self.assemble(p, DGRAM_KIND_DATA, r.bytes) {
+                        let _ = self.sock.send_to(&self.scratch, to);
+                        self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
+                        self.stats.bytes.fetch_add(r.bytes as u64, Ordering::Relaxed);
+                    }
                     p += r.advance;
                 }
                 SliceRead::NotCommitted => break,
@@ -638,7 +761,11 @@ impl Sender {
         let Some(journal) = self.replay.clone() else {
             return false; // no replay source wired (M2/M3 posture)
         };
-        let budget = self.cfg.mtu - DATAGRAM_HEADER_LEN;
+        // M8: chunk_frames -> send_replay_dgram seals these too (still DATA,
+        // and scope is decided by kind, never by destination or by which
+        // source — ring or journal — served it), so this budget shrinks by
+        // crypto_overhead() exactly like serve_nak's ring-path budget above.
+        let budget = self.cfg.mtu - DATAGRAM_HEADER_LEN - self.cfg.crypto_overhead();
         let mut p = pos;
         let mut emitted = 0usize;
         let mut served_any = false;
@@ -815,7 +942,18 @@ impl Sender {
         let _ = self.sock.send_to(&self.scratch, peer);
     }
 
-    /// Assemble a snapshot-session datagram (header + explicit body) into scratch.
+    /// Assemble a snapshot-session datagram (header + explicit body) into
+    /// scratch.
+    ///
+    /// M8 (Task 10) deliberately does NOT seal here. `SNAP_BEGIN`/`SNAP_CHUNK`
+    /// are `Scope::Pairwise` (`Transport::scope_of`) — sealing them needs the
+    /// destination's `NodeId`, and `Sender` has no `SocketAddr -> NodeId`
+    /// mapping (nothing in `uc2_net` does, as of this task; `SnapSession` and
+    /// every follower-facing field in this module are keyed by `SocketAddr`
+    /// only). Wiring Pairwise-scope kinds through `uc2_net` is out of this
+    /// task's scope (`assemble`/`fan_out`/`serve_nak`, all `Scope::Group`) and
+    /// left for whichever later task adds that mapping — snapshot transfer
+    /// stays cleartext under M8 until then. Tracked, not silently dropped.
     fn assemble_snap(&mut self, position: u64, kind: u8, payload: &[u8]) {
         self.scratch.clear();
         self.scratch.resize(DATAGRAM_HEADER_LEN, 0);
@@ -836,6 +974,12 @@ impl Sender {
     /// run) and send it to one follower. Same framing as `fan_out`/`assemble`,
     /// but the body is copied from the caller's slice (the ring path stages it
     /// in `self.run`; here it lives in the journal block).
+    ///
+    /// M8: this is still `DGRAM_KIND_DATA`, so it is sealed exactly like
+    /// `assemble`'s output — scope is decided by kind, never by which source
+    /// (ring vs. journal) served the bytes. Does not call `assemble` itself
+    /// (its body is a caller slice, not `self.run` — borrowing both at once
+    /// would conflict), but shares the same `seal_scratch` step.
     fn send_replay_dgram(&mut self, to: SocketAddr, position: u64, body: &[u8]) {
         self.scratch.clear();
         self.scratch.resize(DATAGRAM_HEADER_LEN, 0);
@@ -850,6 +994,9 @@ impl Sender {
             },
         );
         self.scratch.extend_from_slice(body);
+        if !self.seal_scratch(DGRAM_KIND_DATA) {
+            return; // dropped: the follower re-NAKs, same as any lost datagram
+        }
         let _ = self.sock.send_to(&self.scratch, to);
         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
         self.stats.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
@@ -947,6 +1094,7 @@ mod tests {
     use uc2_log::buffer::Appender;
     use uc2_log::cnc::{CncMeta, CncPage};
     use uc2_log::region::Region;
+    use uc_protocol::v2::crypto::{COUNTER_LEN, TAG_LEN, read_counter};
     use uc_protocol::v2::datagram::read_datagram_header;
     use uc_protocol::v2::frame::{
         read_header, write_header_except_length, FrameHeader, FRAME_TYPE_MESSAGE, HEADER_LEN,
@@ -1003,6 +1151,25 @@ mod tests {
         fn drain(&self) {
             let mut buf = [0u8; 2048];
             while self.sock.recv_from(&mut buf).unwrap().is_some() {}
+        }
+        /// M8 (Task 10): the raw wire bytes (header ++ whatever crypto did to
+        /// the body), unlike `recv` which parses the header — the crypto-seam
+        /// tests need to inspect/compare the actual bytes on the wire. Shorter
+        /// deadline than `recv`'s: callers use this to drain "however many
+        /// datagrams are queued right now" (`while let Some(d) = f.recv_raw()`),
+        /// and a send always precedes the first call in the same thread, so
+        /// datagrams are already queued on this loopback socket by the time
+        /// this polls.
+        fn recv_raw(&self) -> Option<Vec<u8>> {
+            let mut buf = [0u8; 2048];
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                if let Some((n, _)) = self.sock.recv_from(&mut buf).unwrap() {
+                    return Some(buf[..n].to_vec());
+                }
+                std::thread::yield_now();
+            }
+            None
         }
     }
 
@@ -1550,4 +1717,447 @@ mod tests {
         assert_eq!(b.counters().sent.load_acquire(), 3 * 96);
     }
 
+    // ----------------------------------------------------------- M8 (Task 10)
+    // The send seam: `assemble` seals once (Group scope — DATA/HEARTBEAT are
+    // the only kinds this module ever assembles), `fan_out`'s loop still sends
+    // the identical sealed bytes N times. See sender.rs's module docs and
+    // `SenderConfig::crypto_enabled` for how the MTU budget stays in sync.
+
+    #[cfg(test)]
+    impl Sender {
+        /// Test-only: inject a NAK directly into the queue, bypassing the
+        /// ctrl channel (`sender_with_crypto_*` helpers below hand back no
+        /// `Sender`-side channel handle) — the next `do_work()` serves it via
+        /// the exact same `serve_nak` path a real `CtrlMsg::Nak` would.
+        fn on_nak(&mut self, from: SocketAddr, position: u64, length: u32) {
+            self.naks.push_back((from, position, length));
+        }
+    }
+
+    /// A well-formed `Enabled` `Transport` with a fresh key file + an empty
+    /// allowlist, mirroring `uc2_crypto::transport::tests::node_transport`
+    /// (same discipline: real key material under `CARGO_TARGET_TMPDIR`,
+    /// never `/tmp` — see CLAUDE.md). `mint_group_key(&[], 0)` mints with a
+    /// vacuous peer set, which activates immediately (`all()` over an empty
+    /// set), so the returned `Transport` can seal `DGRAM_KIND_DATA`/
+    /// `DGRAM_KIND_HEARTBEAT` right away — no handshake or ack needed for a
+    /// sender-only unit test that never opens on the other end.
+    ///
+    /// Mints TWICE, not once: `GroupPlane::next_epoch` starts at 0 on a fresh
+    /// process, so a single mint's epoch is 0 — indistinguishable from
+    /// `assemble`'s zero-initialized `key_epoch` header field, which would
+    /// make a stamp-then-fail-to-stamp mutant invisible to any test that
+    /// checks `key_epoch != 0`. `uc2_crypto::transport`'s own
+    /// `seal_group_stamps_the_chosen_epoch_into_the_header` test names this
+    /// exact trap and fixes it the same way (mint twice so the epoch under
+    /// test is provably not the field's zero-init default). First caught
+    /// here by `sealed_fan_out_seals_once_and_sends_identical_bytes_to_every_follower`
+    /// actually failing red against a real (if accidental) epoch-0 fixture —
+    /// not a hypothetical.
+    fn crypto_transport(self_id: u32) -> Transport {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::var("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc2_net_tests")
+            })
+            .join("uc2-net-sender-crypto")
+            .join(format!("t{seq}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!dir.starts_with("/tmp"), "test scratch must not live on tmpfs: {dir:?}");
+
+        let key_path = dir.join("node.key");
+        std::fs::write(&key_path, [0x77u8; 32]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let allow_path = dir.join("allowlist");
+        std::fs::write(&allow_path, "").unwrap();
+
+        let cfg = uc2_crypto::CryptoConfig::Enabled {
+            key_path,
+            allowlist_path: allow_path,
+            rotation: uc2_crypto::rotation::RotationPolicy::default(),
+        };
+        let mut t = Transport::new(&cfg, self_id).unwrap().unwrap();
+        t.mint_group_key(&[], 0); // epoch 0 — indistinguishable from the unsealed default
+        t.mint_group_key(&[], 0); // epoch 1 — provably not zero-init
+        t
+    }
+
+    /// `n` fresh followers, a `Sender` with crypto enabled fanning out to all
+    /// of them, plus its buffer (tests append through it directly).
+    fn sender_with_crypto_n(n: usize) -> (Sender, Vec<Fake>) {
+        let b = buffer();
+        let followers: Vec<Fake> = (0..n).map(|_| Fake::new()).collect();
+        let (_tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX; // no heartbeats racing the data-recv asserts
+        cfg.crypto_enabled = true;
+        let crypto = crypto_transport(1);
+        let s = Sender::with_crypto(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            followers.iter().map(|f| f.addr()).collect(),
+            &[],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+            Some(crypto),
+        );
+        (s, followers)
+    }
+
+    fn sender_with_crypto_to_two_followers() -> (Sender, Fake, Fake) {
+        let (s, mut fs) = sender_with_crypto_n(2);
+        let f2 = fs.pop().unwrap();
+        let f1 = fs.pop().unwrap();
+        (s, f1, f2)
+    }
+
+    fn sender_with_crypto_to_one_follower() -> (Sender, Fake) {
+        let (s, mut fs) = sender_with_crypto_n(1);
+        (s, fs.pop().unwrap())
+    }
+
+    fn sender_without_crypto() -> (Sender, Fake) {
+        let b = buffer();
+        let f = Fake::new();
+        let (_tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f.addr()],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+        );
+        (s, f)
+    }
+
+    /// Appends `payload` (chunked to the buffer's `max_payload` if it doesn't
+    /// fit one frame) and drains it out via `do_work` — real frames through
+    /// the real ring, so a NAK re-read of the same position (the retransmit
+    /// test) sees the same committed bytes the first send did.
+    fn append_and_flush(s: &mut Sender, payload: &[u8]) {
+        let mut a = Appender::new(Arc::clone(&s.buffer), 9);
+        let max = s.buffer.max_payload();
+        for chunk in payload.chunks(max) {
+            loop {
+                match a.append(4, 0, chunk) {
+                    Ok(_) => break,
+                    Err(uc2_log::buffer::AppendError::WouldOverrun) => {
+                        s.do_work(); // drain some backlog, then retry the append
+                    }
+                    Err(e) => panic!("append_and_flush: {e}"),
+                }
+            }
+        }
+        s.do_work();
+    }
+
+    #[test]
+    fn sealed_fan_out_seals_once_and_sends_identical_bytes_to_every_follower() {
+        // The whole point of the group key: one seal, N sends. If this regresses to
+        // per-peer sealing the datagrams would differ.
+        let (mut s, f1, f2) = sender_with_crypto_to_two_followers();
+        append_and_flush(&mut s, b"hello");
+        let d1 = f1.recv_raw().expect("follower 1 got a datagram");
+        let d2 = f2.recv_raw().expect("follower 2 got a datagram");
+        assert_eq!(d1, d2, "byte-identical: sealed once, fanned out");
+
+        // "payload is not cleartext": compare against what an UNSEALED sender
+        // produces for the IDENTICAL payload, at the SAME length. Comparing
+        // against the raw literal b"hello" would be vacuous either way — the
+        // frame layer always wraps a 32-byte header even in cleartext mode
+        // (see cleartext_mode_is_byte_identical_to_pre_m8_output below), so
+        // the body never equals the bare payload regardless of whether
+        // sealing actually ran. This is the same fix seal.rs's own
+        // `payload_ciphertext_region_is_actually_sealed` applied to the
+        // mandated T5 test for the identical reason.
+        let (mut plain, pf) = sender_without_crypto();
+        append_and_flush(&mut plain, b"hello");
+        let plain_d = pf.recv_raw().expect("cleartext datagram");
+
+        assert_eq!(
+            d1.len(),
+            plain_d.len() + CRYPTO_OVERHEAD,
+            "sealing adds exactly the counter+tag overhead, nothing else"
+        );
+        let ct_start = DATAGRAM_HEADER_LEN + COUNTER_LEN;
+        let ct_end = d1.len() - TAG_LEN;
+        assert_ne!(
+            &d1[ct_start..ct_end],
+            &plain_d[DATAGRAM_HEADER_LEN..],
+            "payload is not cleartext"
+        );
+        assert_ne!(read_datagram_header(&d1).key_epoch, 0, "stamped with the epoch");
+    }
+
+    #[test]
+    fn mtu_budget_shrinks_by_the_crypto_overhead_so_sealed_datagrams_still_fit() {
+        let cfg_plain = SenderConfig::new(9);
+        let mut cfg_sealed = SenderConfig::new(9);
+        cfg_sealed.crypto_enabled = true;
+        assert_eq!(
+            cfg_sealed.mtu - DATAGRAM_HEADER_LEN - cfg_sealed.crypto_overhead(),
+            cfg_plain.mtu - DATAGRAM_HEADER_LEN - CRYPTO_OVERHEAD
+        );
+        let (mut s, f) = sender_with_crypto_to_one_follower();
+        // MANY MINIMAL (empty-payload, 32-byte-aligned) frames, not one big
+        // chunked payload: `read_run_validated` packs whole frames into a run
+        // up to `budget`, so coarse frames (e.g. 288 bytes, this buffer's
+        // default max_payload) leave slack on both sides of the 24-byte
+        // crypto overhead and can pack IDENTICALLY whether or not the
+        // subtraction happened — never actually exercising the boundary this
+        // test exists to pin (confirmed: the first draft of this test, using
+        // a single 4096-byte payload, passed against a mutant that dropped
+        // the `- self.cfg.crypto_overhead()` term entirely; see the task
+        // report's mutation section). 32-byte frames make the packed run
+        // size land exactly where 24 bytes is the difference between fitting
+        // and not: budget 1368 (correct) packs 42 frames = 1344B body
+        // (sealed 1384B, fits); budget 1392 (missing the subtraction) packs
+        // 43 = 1376B body (sealed 1416B > the 1408B MTU).
+        let mut a = Appender::new(Arc::clone(&s.buffer), 9);
+        for i in 0..64u64 {
+            a.append(4, i, &[]).unwrap();
+        }
+        s.do_work();
+        let mut saw_any = false;
+        while let Some(d) = f.recv_raw() {
+            saw_any = true;
+            assert!(d.len() <= cfg_sealed.mtu, "a sealed datagram must not exceed the MTU");
+        }
+        assert!(saw_any, "fixture must actually produce datagrams for this to mean anything");
+    }
+
+    #[test]
+    fn serve_nak_mtu_budget_also_shrinks_by_the_crypto_overhead() {
+        // The task brief names TWO known budget sites: the run-read budget in
+        // `do_work` (pinned above) and `serve_nak`'s own budget — a mutant
+        // that fixes only one would still pass a suite that only exercises
+        // the live-stream path. Same fine-grained-frame construction as
+        // above (needed for the same reason: coarse frames never straddle
+        // the 24-byte boundary).
+        let (mut s, f) = sender_with_crypto_to_one_follower();
+        let mut a = Appender::new(Arc::clone(&s.buffer), 9);
+        for i in 0..64u64 {
+            a.append(4, i, &[]).unwrap();
+        }
+        s.do_work();
+        f.drain(); // discard the live-stream copies; only the NAK-served retransmit matters here
+        s.on_nak(f.addr(), 0, 64 * 32);
+        s.do_work();
+        let mut saw_any = false;
+        while let Some(d) = f.recv_raw() {
+            saw_any = true;
+            assert!(d.len() <= s.cfg.mtu, "a NAK-served sealed datagram must not exceed the MTU");
+        }
+        assert!(saw_any, "fixture must actually produce datagrams for this to mean anything");
+    }
+
+    #[test]
+    fn a_nak_retransmit_reuses_the_position_but_never_the_counter() {
+        // The nonce hazard, pinned at the seam: position repeats, counters must not.
+        let (mut s, f) = sender_with_crypto_to_one_follower();
+        append_and_flush(&mut s, b"payload");
+        let first = f.recv_raw().unwrap();
+        s.on_nak(f.addr(), read_datagram_header(&first).position, 7);
+        s.do_work();
+        let retx = f.recv_raw().unwrap();
+        assert_eq!(read_datagram_header(&retx).position, read_datagram_header(&first).position);
+        assert_ne!(
+            read_counter(&retx[DATAGRAM_HEADER_LEN..]),
+            read_counter(&first[DATAGRAM_HEADER_LEN..]),
+            "a repeated position must not mean a repeated nonce"
+        );
+    }
+
+    #[test]
+    fn cleartext_mode_is_byte_identical_to_pre_m8_output() {
+        // Flag-day safety: with crypto off, nothing on the wire changes — the
+        // datagram is exactly DATAGRAM_HEADER_LEN + the frame layer's own
+        // bytes (no crypto suffix), and the payload is readable in the clear
+        // at its normal frame offset.
+        let (mut s, f) = sender_without_crypto();
+        append_and_flush(&mut s, b"hello");
+        let d = f.recv_raw().unwrap();
+        assert_eq!(
+            d.len(),
+            DATAGRAM_HEADER_LEN + align_frame_len(HEADER_LEN + 5),
+            "no crypto overhead: exactly the datagram header + one aligned frame"
+        );
+        assert_eq!(
+            &d[DATAGRAM_HEADER_LEN + HEADER_LEN..DATAGRAM_HEADER_LEN + HEADER_LEN + 5],
+            b"hello"
+        );
+        assert_eq!(read_datagram_header(&d).key_epoch, 0);
+    }
+
+    // ---- Mutation-testing companions (task instructions: "write two or
+    // three wrong implementations ... check whether the suite catches
+    // them"). These tests exist to KILL specific mutants; see the task
+    // report for the red-then-green transcripts proving each one actually
+    // fails against the mutant it targets.
+
+    #[test]
+    fn heartbeats_are_sealed_too_not_just_data() {
+        // Every mandated test above drives DATA through fan_out. HEARTBEAT is
+        // the other Group-scope kind assemble() ever builds (do_work's
+        // heartbeat block) — a mutant that seals only inside fan_out (instead
+        // of centrally in assemble/seal_scratch) would pass all four mandated
+        // tests while leaving every HEARTBEAT cleartext.
+        let (mut s, f) = sender_with_crypto_to_one_follower();
+        s.cfg.heartbeat_ns = 1; // fire on the very next do_work
+        s.do_work();
+        let d = f.recv_raw().expect("heartbeat datagram");
+        assert_eq!(read_datagram_header(&d).kind, DGRAM_KIND_HEARTBEAT);
+        assert_ne!(read_datagram_header(&d).key_epoch, 0, "heartbeat must be sealed too");
+        assert_eq!(
+            d.len(),
+            DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD,
+            "empty-body heartbeat, sealed: header + counter + tag, nothing else"
+        );
+    }
+
+    #[test]
+    fn a_journal_replayed_nak_is_sealed_exactly_like_a_ring_served_one() {
+        // Pins the "serve_nak and send_replay_dgram also build DATA
+        // datagrams; both take the group key" requirement from the task
+        // brief. A mutant that seals only inside assemble() (which
+        // send_replay_dgram does NOT call — it builds scratch inline) would
+        // pass every mandated test, since none of them lap the ring, and
+        // would ship deep-NAK catch-up permanently cleartext even with
+        // crypto on everywhere else — worse, the receiver (T11) would then
+        // see a cleartext DATA where it expects a sealed one and reject it
+        // as `peer_appears_cleartext`, silently wedging deep recovery.
+        let b = Arc::new(LogBuffer::new(Region::heap_zeroed(4096), test_cnc(4096), 256));
+        // tempfile::tempdir() (not a fixed path): matches
+        // journal_replay_serves_deep_nak_with_identical_wire_format above —
+        // a fresh, auto-cleaned, guaranteed-unique dir per run, unlike the
+        // key/allowlist fixtures (crypto_transport) which reuse the
+        // CARGO_TARGET_TMPDIR discipline because they're a handful of bytes,
+        // not journal segments.
+        let dir = tempfile::tempdir().unwrap();
+        let acfg = uc2_log::archive::ArchiveConfig {
+            segment_size_bytes: 4 * 1024 * 1024,
+            ..uc2_log::archive::ArchiveConfig::new(dir.path())
+        };
+        let mut arch = uc2_log::archive::Archive::open(acfg).unwrap();
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        let mut n = 0u64;
+        while a.position() < 3 * 4096 {
+            match a.append(1, n, &[n as u8; 64]) {
+                Ok(_) => n += 1,
+                Err(uc2_log::buffer::AppendError::WouldOverrun) => {
+                    arch.do_work(&b).unwrap();
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        while arch.do_work(&b).unwrap() {}
+
+        let f1 = Fake::new();
+        let (_tx, rx) = mpsc::sync_channel(64);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        cfg.crypto_enabled = true;
+        let mut s = Sender::with_crypto(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f1.addr()],
+            &[],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+            Some(crypto_transport(1)),
+        );
+        s.set_replay_source(arch.journal_arc());
+        // NAK for position 0 (lapped long ago -> served from the journal)
+        s.on_nak(f1.addr(), 0, 4096);
+        s.do_work();
+        let d = f1.recv_raw().expect("replayed datagram");
+        let h = read_datagram_header(&d);
+        assert_eq!(h.kind, DGRAM_KIND_DATA);
+        assert_eq!(h.position, 0);
+        assert_ne!(h.key_epoch, 0, "journal-replayed DATA must be sealed too");
+        assert!(
+            s.stats().replay_datagrams.load(Ordering::Relaxed) >= 1,
+            "fixture must actually exercise the journal-replay path"
+        );
+    }
+
+    #[test]
+    fn a_failed_group_seal_drops_the_datagram_rather_than_sending_it_half_built() {
+        // Mutant target: sealing that mutates self.scratch before the key
+        // lookup can fail (the exact class transport.rs's own review round 1
+        // caught, F3) would ship a corrupted or partially-sealed datagram
+        // instead of dropping it. Construct a Sender with crypto ENABLED but
+        // whose Transport never minted a group key — every seal attempt must
+        // fail closed (NoGroupKey), and NOTHING must reach the wire.
+        let b = buffer();
+        let f = Fake::new();
+        let (_tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        cfg.crypto_enabled = true;
+        let dir = std::env::var("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc2_net_tests")
+            })
+            .join("uc2-net-sender-crypto-no-mint");
+        std::fs::create_dir_all(&dir).unwrap();
+        let key_path = dir.join("node.key");
+        std::fs::write(&key_path, [0x99u8; 32]).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let allow_path = dir.join("allowlist");
+        std::fs::write(&allow_path, "").unwrap();
+        let ccfg = uc2_crypto::CryptoConfig::Enabled {
+            key_path,
+            allowlist_path: allow_path,
+            rotation: uc2_crypto::rotation::RotationPolicy::default(),
+        };
+        let crypto = Transport::new(&ccfg, 1).unwrap().unwrap(); // NOT minted
+        let mut s = Sender::with_crypto(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f.addr()],
+            &[],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+            Some(crypto),
+        );
+        append_and_flush(&mut s, b"hello");
+        assert!(f.recv_raw().is_none(), "an unsealable datagram must never reach the wire");
+        assert!(
+            s.stats().seal_failures.load(Ordering::Relaxed) > 0,
+            "the failure must be counted, not silently swallowed"
+        );
+        assert_eq!(
+            b.counters().sent.load_acquire(),
+            align_frame_len(HEADER_LEN + 5) as u64,
+            "the buffer cursor still advances (a seal failure is fire-and-forget \
+             packet loss from the ring's point of view, same as a lost UDP \
+             datagram — NAK repair recovers it, not a stalled cursor)"
+        );
+    }
 }
