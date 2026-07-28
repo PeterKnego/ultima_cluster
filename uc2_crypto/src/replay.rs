@@ -190,4 +190,88 @@ mod tests {
         assert!(!w.check_and_set(u64::MAX / 2), "still tracked after the jump");
         assert!(!w.check_and_set(1), "the old counter fell out of the window");
     }
+
+    // The four tests above never move a tracked run across a `u64` word
+    // boundary via the shift path (test 1's only shift is by 1 bit inside
+    // word 0; tests 3 and 4 both land in the `jump >= REPLAY_WINDOW_BITS`
+    // wipe path). A wrong `word_shift`/`bit_shift` computation in
+    // `shift_left` would ship green against them, and the failure mode is
+    // silent and asymmetric: a lost bit wrongly ACCEPTS a replay, a
+    // misplaced bit wrongly REJECTS fresh traffic (a liveness bug — the
+    // node quietly drops valid input). This test forces the shift path to
+    // actually carry bits across two different word boundaries and checks
+    // both failure directions explicitly.
+    #[test]
+    fn shift_preserves_and_places_bits_correctly_across_word_boundaries() {
+        let mut w = ReplayWindow::new();
+        // Accept 1..=70 in order: relative to highest = 70, the tracked
+        // run occupies distances 0..=69, which spans word 0 (bits 0..63)
+        // into word 1 (bits 64..69).
+        for c in 1..=70u64 {
+            assert!(w.check_and_set(c), "counter {c} is fresh and in order");
+        }
+        // Advance by 100 (word_shift = 1, bit_shift = 36: a genuine
+        // cross-word carry, not a whole-word-multiple shift) — this is
+        // still the shift path (100 < REPLAY_WINDOW_BITS), and it lands
+        // the old run at distances 100..169, crossing the word1/word2
+        // boundary this time.
+        assert!(w.check_and_set(170));
+
+        // Direction A — a bit lost in the shift wrongly ACCEPTS a replay:
+        // every previously-accepted counter must still read as seen.
+        assert!(!w.check_and_set(70), "near edge of the old run must survive the cross-word shift");
+        assert!(!w.check_and_set(35), "middle of the old run must survive the cross-word shift");
+        assert!(!w.check_and_set(1), "far edge of the old run must survive the cross-word shift");
+
+        // Direction B — a bit misplaced by the shift wrongly REJECTS
+        // fresh traffic: distance 20 (counter 150) was never set by
+        // either the original run (distances 0..69, now 100..169) or by
+        // accepting 170 itself (distance 0), so it must be accepted.
+        assert!(w.check_and_set(150), "never-before-seen counter must not be corrupted into a false replay");
+    }
+
+    // Pins the two off-by-one boundaries the mandated tests never hit:
+    // the window's own edge (distance == REPLAY_WINDOW_BITS - 1 is the
+    // oldest counter still verifiable; REPLAY_WINDOW_BITS itself is one
+    // step too old).
+    #[test]
+    fn distance_edge_is_inclusive_one_past_is_not() {
+        let mut w = ReplayWindow::new();
+        assert!(w.check_and_set(REPLAY_WINDOW_BITS + 1)); // highest = 1025
+        assert!(
+            w.check_and_set(2),
+            "distance == REPLAY_WINDOW_BITS - 1 (1023) is still inside the window"
+        );
+        assert!(
+            !w.check_and_set(1),
+            "distance == REPLAY_WINDOW_BITS (1024) is one step too old to verify"
+        );
+    }
+
+    // Pins the shift-vs-wipe boundary in the *advance* branch: a jump of
+    // REPLAY_WINDOW_BITS - 1 must take the real shift path (the old
+    // counter is still just inside the window afterwards, at the far
+    // edge) — only observable if the implementation actually shifts
+    // rather than wiping. A jump of exactly REPLAY_WINDOW_BITS takes the
+    // wipe path; the outcome for the old counter is the same reject
+    // either way, so this only pins that the wipe boundary itself doesn't
+    // panic or misbehave.
+    #[test]
+    fn jump_boundary_shifts_below_window_width_and_wipes_at_it() {
+        let mut w = ReplayWindow::new();
+        assert!(w.check_and_set(1));
+        assert!(w.check_and_set(1 + REPLAY_WINDOW_BITS - 1)); // jump = 1023, shift path
+        assert!(
+            !w.check_and_set(1),
+            "jump == REPLAY_WINDOW_BITS - 1 must shift (not wipe): the old counter is still barely in-window"
+        );
+
+        let mut w2 = ReplayWindow::new();
+        assert!(w2.check_and_set(1));
+        assert!(w2.check_and_set(1 + REPLAY_WINDOW_BITS)); // jump = 1024, wipe path
+        assert!(
+            !w2.check_and_set(1),
+            "jump == REPLAY_WINDOW_BITS wipes; the old counter is unverifiable either way"
+        );
+    }
 }
