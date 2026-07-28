@@ -23,7 +23,8 @@
 //! - `handshake` (T6): Noise IK.
 //! - `group` (T7): group-key distribution.
 //! - `rotation` (T8): key-epoch rotation.
-//! - `transport` (T9): wiring into `uc2_net`.
+//! - `transport` (T9): the facade — scope-by-kind, config, boot refusal,
+//!   the single `seal`/`open` entry point `uc2_net` (T10/T11) calls.
 
 pub mod group;
 pub mod handshake;
@@ -32,8 +33,10 @@ pub mod replay;
 pub mod rotation;
 pub mod schedule;
 pub mod seal;
+pub mod transport;
 
 pub use handshake::HandshakeAction;
+pub use transport::{CryptoConfig, Scope, Transport};
 
 /// Node identifier — matches `uc2_consensus::election::NodeId` (both `u32`,
 /// intentionally not re-exported from there: this crate stays dependency-thin
@@ -90,4 +93,13 @@ pub enum CryptoError {
     /// replay, and a replayed `VOTE` or admin datagram is not harmless.
     #[error("counter {0} was already seen under this key")]
     Replayed(u64),
+    /// Sealing (or opening) a `Scope::Group` datagram with no usable group
+    /// key: no epoch has ever activated yet (send side), or the epoch named
+    /// in a received datagram's header is not one this node holds (receive
+    /// side — a peer on a newer epoch we have not received `HS_KEY` for, or
+    /// a rotated-out one). Both cases self-heal through the existing NAK
+    /// repair path once `HS_KEY` lands (`group.rs`, T7/T9); this variant is
+    /// never a signal to fall back to sending or accepting cleartext.
+    #[error("no usable group key")]
+    NoGroupKey,
 }
