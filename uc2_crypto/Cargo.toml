@@ -1,0 +1,19 @@
+[package]
+name = "uc2_crypto"
+description = "UC v2 wire crypto: Noise IK handshake, group-key schedule, AEAD seal/open (spec 2026-07-28, M8)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+uc_protocol = { path = "../uc_protocol" }
+snow = { workspace = true }
+aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+x25519-dalek = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
