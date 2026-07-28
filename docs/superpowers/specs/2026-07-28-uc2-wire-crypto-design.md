@@ -220,6 +220,26 @@ at runtime, which UC's peers never do.
 The handshake carries the peer's `boot_salt` and rides the same socket under new
 datagram kinds (18/19 handshake, 20 group-key delivery; 16/17 are M7 admin).
 
+**Noise supplies the key exchange only — not the record layer** (decided
+2026-07-28, during implementation). At the end of the handshake UC takes the two
+32-byte transport keys via `dangerously_get_raw_split()` and seals pairwise
+datagrams with §4's envelope, the same one the group path uses. This is not a
+convenience: **snow's transport modes hard-code empty associated data**
+(`cipherstate.rs:170` = `encrypt_ad(nonce, &[], ..)`), because the Noise spec
+gives transport messages no AD. Using them would have left the 16-byte header
+**unauthenticated on the pairwise path** while the group path authenticated it —
+and `DGRAM_KIND_APPEND_POSITION` is a pairwise, *header-only* kind whose entire
+semantic content is the header, read straight into the leader's commit ranking
+(`receiver.rs:120`). An on-path attacker could inflate a follower's reported
+durable position on an otherwise-valid datagram and drive the leader to commit
+over a range no quorum holds — the Finding #6b acked-write-loss class,
+reintroduced through the transport rather than through consensus.
+
+Raw split keeps forward secrecy (the keys still come from the ephemeral DH),
+keeps UC's ownership of the nonce counter, and yields **one envelope and one
+reviewed AEAD path for both key scopes**. The `dangerously_` name reflects that
+the caller must manage nonces itself — which §4 does deliberately.
+
 #### Rejected identity alternatives (decided 2026-07-28)
 
 Recorded so the reasoning survives, since each has a plausible future that would
