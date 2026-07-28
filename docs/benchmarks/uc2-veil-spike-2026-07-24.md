@@ -516,14 +516,36 @@ Next session, in priority order:
    tail from the sitting older-term leader, which needs per-term stream identity
    (a second tracked entry, or an `entryTerm`) rather than one tracked entry. Would
    upgrade run 2's SAFE from "within this restriction" to unqualified.
-4. **`Reconfig.lean` commit/log plane** (F-M7-2) — **DECIDED 2026-07-26:
-   option (a)**, abstract-quorum reformulation + inductive proof. Dispatch
-   brief:
-   `docs/superpowers/specs/2026-07-26-uc2-veil-reconfig-commit-plane-brief.md`
-   — which now inherits the discharged §5 Q2 trace as the verified Rust
-   ground-truth map for the commit plane. Option (b) rejected: the SAFE
-   direction is exponential, so a bigger box buys CE depth only, never the
-   assurance result this item exists for.
+4. **`Reconfig.lean` commit/log plane** (F-M7-2) — **EXECUTED AND BANKED,
+   2026-07-28 (main `fab2308`). F-M7-2 is DISCHARGED.** Option (a) was
+   decided 2026-07-26 (brief:
+   `docs/superpowers/specs/2026-07-26-uc2-veil-reconfig-commit-plane-brief.md`;
+   option (b) rejected — the SAFE direction is exponential, a bigger box buys
+   CE depth only) and the arc ran to completion: 8 driver sessions, 5 audit
+   gates, 1 coda, on branch `uc2/veil-commit-plane`, merged.
+
+   **Outcome, in brief** (the citable claim is the "GATE 2 VERDICT" section of
+   `docs/benchmarks/uc2-veil-commit-plane-checkpoint-2026-07-26.md`, verbatim
+   only, together with its CODA section):
+   - **PROVED, inductive, all-n:** `election_safety` across live single-server
+     reconfiguration with a commit/log plane — 55 invariants + 2 safeties over
+     `proofs-veil/models/ReconfigCommitSMT.lean` (35 requires / 11 assumptions,
+     all assumptions discharged against the chain-indexed witnesses in
+     `QuorumAdjacency.lean`). The crux VC (`becomeLeader`) is closed by a
+     sorry-free hand proof, kernel-checked `[propext, Classical.choice,
+     Quot.sound]` — a stronger evidence class than the solver verdicts.
+   - **The F-M7-2 calibration pair holds:** without the adoption-prefix
+     coupling the checker exhibits the data-loss CE (depth 13); with it, clean
+     — the false positive this item existed to repair is now a controlled
+     instrument.
+   - **CONDITIONAL:** `leader_completeness` at `becomeLeader` + `commitEntry`,
+     which the coda proved share ONE residue (cross-config holder supply);
+     no surviving counterexample anywhere; the invariant route to it is
+     provably dead (three candidate clauses refuted in reachable states). Any
+     future push needs a new mechanism + a new gate, outside this arc.
+   - The claim carries three named narrowings, five twin divergences, and a
+     designed-in boundary (this plane can never re-find #5/#9-class report
+     bugs — that class stays banked in `BootGate.lean`/`Finding9.lean`).
 5. If V2 survives: a nightly Veil model-check job next to the `elle` tier — a
    deliberate CI follow-up, not part of the spike (guardrail 3).
 
