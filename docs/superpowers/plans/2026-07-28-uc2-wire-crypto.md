@@ -373,11 +373,11 @@ Add to the root `Cargo.toml`: `"uc2_crypto"` in `members`, and under `[workspace
 # M8 wire crypto. Versions verified against crates.io 2026-07-28. The AEAD/hash
 # generation deliberately MATCHES the one snow pins internally (aes-gcm 0.10 /
 # sha2 0.10 era) so the binary carries ONE AES-GCM implementation, not two.
-snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-aes-gcm", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom", "std"] }
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-aes-gcm", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom", "std", "risky-raw-split"] }
 aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
-x25519-dalek = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }  # StaticSecret is NOT in the default feature set
 zeroize = { version = "1", features = ["derive"] }
 base64 = "0.22"
 ```
@@ -726,7 +726,13 @@ git commit -m "feat(uc2_crypto): AES-256-GCM seal/open in place, header as AAD"
 - Consumes: `Identity`, `Allowlist`, `BootSalt`, `NodeId`, `CryptoError`.
 - Produces: `HandshakeAction` enum (`Send { to: NodeId, kind: u8, body: Vec<u8> }`, `Established { peer: NodeId, boot_salt: BootSalt }`, `Failed { peer: NodeId, reason: &'static str }`); `Peers::new(identity: Identity, allowlist: Allowlist, self_id: NodeId, boot_salt: BootSalt)`; `Peers::initiate(&mut self, peer: NodeId, now_ns: u64) -> Vec<HandshakeAction>`; `Peers::on_message(&mut self, from: NodeId, kind: u8, body: &[u8], now_ns: u64) -> Vec<HandshakeAction>`; `Peers::tick(&mut self, now_ns: u64) -> Vec<HandshakeAction>`; `Peers::seal_pairwise(&mut self, peer: NodeId, buf: &mut Vec<u8>, counter: u64) -> Result<(), CryptoError>`; `Peers::open_pairwise(&mut self, peer: NodeId, buf: &mut Vec<u8>) -> Result<u64, CryptoError>`.
 
-The pattern string is `Noise_IK_25519_AESGCM_SHA256`. The handshake payload carries the sender's `NodeId` and `BootSalt`. Use `snow`'s **stateless** transport mode (`into_stateless_transport_mode()`) so UC supplies its own nonce counter — the stateful mode's internal counter would fight the envelope.
+The pattern string is `Noise_IK_25519_AESGCM_SHA256`. The handshake payload carries the sender's `NodeId` and `BootSalt`.
+
+**Take the transport keys by raw split; do NOT use snow's transport modes** (ruling 2026-07-28, correcting this plan's original instruction to use `into_stateless_transport_mode()`). At the end of the handshake call `HandshakeState::dangerously_get_raw_split()`, bind the two 32-byte keys into `Zeroizing` in the same statement, pick tx/rx by role, and route pairwise datagrams through Task 5's `seal_in_place`/`open_in_place`.
+
+Why the original instruction was wrong: **snow's transport modes hard-code empty associated data** — `cipherstate.rs:170` is literally `encrypt_ad(nonce, &[], plaintext, out)`, because the Noise spec gives transport messages no AD. Using them would leave the 16-byte header **unauthenticated on the pairwise path** while the group path authenticates it, and that is not cosmetic: `DGRAM_KIND_APPEND_POSITION` is a pairwise, *header-only* kind whose entire semantic content is the header, and `receiver.rs:120` reads the follower's durable position straight out of `h.position`. An on-path attacker could inflate it on an otherwise-valid datagram and drive the leader to commit over a range no quorum holds — the Finding #6b acked-write-loss class the Lean effort found and fixed, reintroduced through the transport.
+
+Raw split keeps every property the stateless instruction was protecting and adds uniformity: one envelope and one AEAD path for both key scopes, header authenticated everywhere, 24-byte overhead unchanged, forward secrecy retained (the keys still come from the ephemeral DH), and UC still owns the nonce counter. Cost is enabling snow's `risky-raw-split` feature — a pure feature flag, no new crates, no version movement. The `dangerously_` name reflects that the caller must manage nonces itself, which is exactly what this design does deliberately (see §4's per-sender-per-boot derivation).
 
 - [ ] **Step 1: Write the failing tests**
 
