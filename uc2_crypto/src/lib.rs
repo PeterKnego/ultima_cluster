@@ -28,6 +28,7 @@
 pub mod identity;
 pub mod replay;
 pub mod schedule;
+pub mod seal;
 
 /// Node identifier — matches `uc2_consensus::election::NodeId` (both `u32`,
 /// intentionally not re-exported from there: this crate stays dependency-thin
@@ -52,4 +53,16 @@ pub enum CryptoError {
     DuplicateAllowlistId(NodeId),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// AEAD tag verification failed: wrong key, tampered ciphertext, or a
+    /// tampered header (the header is authenticated as associated data —
+    /// see `seal.rs`). Deliberately carries no detail: telling an attacker
+    /// *which* check failed narrows their next guess for free.
+    #[error("AEAD authentication failed")]
+    AuthFailed,
+    /// A sealed datagram (or a buffer claiming to be one) is shorter than
+    /// `DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD` — too short to hold even an
+    /// empty payload's header, counter, and tag. Checked before any
+    /// indexing into the buffer, never after.
+    #[error("datagram too short to be a sealed frame")]
+    TooShort,
 }
