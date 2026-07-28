@@ -11,6 +11,7 @@
 use crate::{CryptoError, NodeId};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use zeroize::Zeroizing;
@@ -46,12 +47,25 @@ impl Identity {
             }
         }
 
-        let bytes = std::fs::read(key_path)?;
-        let raw: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| CryptoError::KeyFileInvalid(key_path.display().to_string()))?;
-        let private = Zeroizing::new(raw);
+        // Read straight into an already-`Zeroizing`-wrapped buffer: a
+        // `std::fs::read` into a plain `Vec<u8>`, or a `TryInto<[u8; 32]>`
+        // landing in a bare `let raw = ..;` binding, would each leave an
+        // un-scrubbed copy of the private key sitting in freed memory after
+        // this function returns — arrays are `Copy`, so even a `Zeroizing::
+        // new(raw)` right after such a binding zeroizes only the wrapper's
+        // copy, not the original `raw` slot. Writing directly into the
+        // wrapped buffer means no unwrapped copy of the key ever exists.
+        let invalid = || CryptoError::KeyFileInvalid(key_path.display().to_string());
+        let mut file = std::fs::File::open(key_path)?;
+        let mut private = Zeroizing::new([0u8; 32]);
+        file.read_exact(&mut *private).map_err(|_| invalid())?;
+        // `read_exact` is happy to read the first 32 bytes of a longer file;
+        // confirm nothing follows so an oversized key file is rejected
+        // outright rather than silently truncated.
+        let mut probe = [0u8; 1];
+        if file.read(&mut probe)? != 0 {
+            return Err(invalid());
+        }
 
         let secret = x25519_dalek::StaticSecret::from(*private);
         let public = x25519_dalek::PublicKey::from(&secret);
