@@ -232,7 +232,11 @@ Run: `cargo build --workspace 2>&1 | grep -c "missing field"` to get the count, 
 
 - [ ] **Step 9: Bump the wire version**
 
-In `uc_protocol/src/v2/cnc.rs` set `CNC_V2_VERSION` to the 0.4.0 packing, and in `uc_protocol/src/version.rs` set `CURRENT` to 0.4.0. Leave `MIN_COMPATIBLE` at 0.3.0 — a 0.4.0 node still accepts a 0.3.0 peer, and the T6 doc note that these constants are non-enforcing stays accurate.
+In `uc_protocol/src/version.rs` set `CURRENT` to 0.4.0. **Leave `CNC_V2_VERSION` and `MIN_COMPATIBLE` alone** (ruling 2026-07-28, correcting this plan's original text, which wrongly assumed the two schemes track each other):
+
+- `CNC_V2_VERSION` is `(2 << 24) | (0 << 16)` — packed major=2, minor=0 — and has never tracked `version::CURRENT`'s semver; it stayed put across both the 0.2.0 and 0.3.0 bumps. Packing "0.4.0" into it would set **major 2 → 0**, which `cnc::version_compatible`'s `local_major == peer_major` test reads as a total incompatibility, not a bump.
+- It gates the **shmem cnc page at local IPC attach** (`uc2_log/src/cnc.rs:298`), and M8 does not change that page's layout — only the UDP datagram format. Bumping it would refuse old service/client binaries for a change that cannot affect them.
+- `MIN_COMPATIBLE` is `0.1.0` (not 0.3.0) and has never been bumped. The T6 note that these constants have no enforcement call sites stays accurate.
 
 - [ ] **Step 10: Run the full protocol suite**
 
