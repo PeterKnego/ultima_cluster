@@ -11,6 +11,20 @@
 //! [  ciphertext                                            ]
 //! [ 16B AES-256-GCM tag                                    ]
 //! ```
+//!
+//! The 96-bit GCM nonce a peer must reconstruct from the wire counter is
+//! `0u32 ‖ counter`, with `counter` placed **big-endian** in the low 8
+//! bytes — note this is the opposite byte order from the counter's own
+//! on-wire encoding above (`u64 LE`). The wire field and the nonce built
+//! from it are two different things: only the LE field is transmitted; the
+//! big-endian nonce is an ephemeral value both sides derive identically and
+//! never send. Getting this order backwards in a second-language
+//! implementation does not error — it produces a self-consistent peer that
+//! silently fails to interoperate (every datagram it seals or opens
+//! disagrees with a peer using the canonical order), so this sentence is
+//! the only thing pinning it: this crate is core-only and carries no crypto
+//! code to enforce it by type. See `uc2_crypto::seal` for the actual
+//! AEAD implementation and its known-answer test.
 
 /// Per-sender monotonic counter; the low 64 bits of the 96-bit GCM nonce.
 pub const COUNTER_LEN: usize = 8;

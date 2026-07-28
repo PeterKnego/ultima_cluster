@@ -57,6 +57,14 @@ pub enum CryptoError {
     /// tampered header (the header is authenticated as associated data —
     /// see `seal.rs`). Deliberately carries no detail: telling an attacker
     /// *which* check failed narrows their next guess for free.
+    ///
+    /// `seal_in_place` also maps its (effectively unreachable — only past
+    /// AES-GCM's ~64 GiB plaintext ceiling, never reachable for an
+    /// MTU-bounded UC datagram) encrypt-side failure to this same variant.
+    /// That path never runs against attacker-controlled input, so an
+    /// operator using `AuthFailed` as an attack indicator should read it as
+    /// "someone tampered with or forged a datagram," not worry about the
+    /// dead encrypt-side branch muddying that signal.
     #[error("AEAD authentication failed")]
     AuthFailed,
     /// A sealed datagram (or a buffer claiming to be one) is shorter than

@@ -95,6 +95,15 @@ pub fn seal_in_place(buf: &mut Vec<u8>, key: &[u8; 32], counter: u64) -> Result<
 /// (`replay::ReplayWindow::check_and_set`); this function does not itself
 /// consult replay state.
 ///
+/// **Invariant the caller must uphold:** `buf.len()` must be exactly the
+/// length of the received datagram — not a fixed-size receive buffer with
+/// trailing unwritten/stale bytes. This function has no way to distinguish
+/// "the sender's payload legitimately ended here" from "the caller handed
+/// over garbage past the real datagram boundary"; both the AAD scope and
+/// the ciphertext region are derived purely from `buf.len()`. A caller
+/// reading into a reusable, oversized buffer must truncate it to the
+/// socket read's reported byte count before calling this.
+///
 /// `key` is borrowed straight into `Aes256Gcm::new`, same discipline as
 /// `seal_in_place`.
 pub fn open_in_place(buf: &mut Vec<u8>, key: &[u8; 32]) -> Result<u64, CryptoError> {
@@ -205,5 +214,143 @@ mod tests {
         assert_eq!(d.len(), DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD);
         assert_eq!(open_in_place(&mut d, &key).unwrap(), 7);
         assert_eq!(d.len(), DATAGRAM_HEADER_LEN);
+    }
+
+    // -- Task 5 review remediation: the six tests above all pass against
+    // two independently-verified wrong implementations (a no-encryption
+    // mutant that authenticates everything but never encrypts the payload,
+    // and an AAD-stops-at-byte-14 mutant that leaves `key_epoch`
+    // unauthenticated). The tests below close those gaps plus two adjacent
+    // ones the review flagged in the same pass.
+
+    #[test]
+    fn every_header_byte_is_authenticated() {
+        // The only header-tamper coverage above flips d[0] (`position`).
+        // An AAD that silently stopped at byte 14 would leave `key_epoch`
+        // (offset 14..16) rewritable — a downgrade primitive against the
+        // key-rotation path (M8 T8) — while still passing every test above.
+        // Sweep every header byte individually.
+        let key = [9u8; 32];
+        for i in 0..DATAGRAM_HEADER_LEN {
+            let mut d = dgram(b"payload", 1);
+            seal_in_place(&mut d, &key, 1).unwrap();
+            d[i] ^= 0xFF;
+            assert!(
+                matches!(open_in_place(&mut d, &key), Err(CryptoError::AuthFailed)),
+                "header byte {i} is not authenticated"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_ciphertext_region_is_actually_sealed() {
+        // The "payload is sealed" assertion in
+        // round_trips_and_leaves_the_header_in_the_clear compares a 30-byte
+        // slice (8B counter + 5B... here 15B ciphertext + 16B tag) against
+        // the 14-byte plaintext array — Rust's slice equality is false on
+        // length alone, so that assertion is vacuously true even against a
+        // mutant that never encrypts anything. Compare only the ciphertext
+        // region (same length as the plaintext) against the plaintext.
+        let key = [9u8; 32];
+        let mut d = dgram(b"frames go here", 1);
+        seal_in_place(&mut d, &key, 42).unwrap();
+        let ct_start = DATAGRAM_HEADER_LEN + COUNTER_LEN;
+        let ct_end = d.len() - TAG_LEN;
+        assert_ne!(&d[ct_start..ct_end], &b"frames go here"[..]);
+    }
+
+    #[test]
+    fn counter_is_written_little_endian_on_the_wire() {
+        // Pins the wire byte order, not just internal write/read
+        // round-trip agreement — a peer implementation could agree with
+        // itself on the wrong order and still fail to interoperate.
+        let key = [9u8; 32];
+        let mut d = dgram(b"x", 1);
+        seal_in_place(&mut d, &key, 42).unwrap();
+        assert_eq!(
+            &d[DATAGRAM_HEADER_LEN..DATAGRAM_HEADER_LEN + COUNTER_LEN],
+            &42u64.to_le_bytes()[..]
+        );
+    }
+
+    #[test]
+    fn nonce_does_not_truncate_the_counter() {
+        // A nonce that dropped the counter's high bits would repeat a
+        // (key, nonce) pair periodically (e.g. every 256 datagrams if only
+        // the low byte survived) — catastrophic under GCM: a repeated
+        // nonce under one key leaks the authentication subkey and breaks
+        // every message ever sealed under that key, not just the one
+        // repeat. Two counters that agree only in their low byte must
+        // still seal to different ciphertext.
+        //
+        // Compares only the ciphertext-and-tag region, NOT the whole
+        // datagram: the wire counter field itself always differs between
+        // the two seals (that's just `write_counter` doing its job), so
+        // comparing the full buffers would be exactly the same vacuous
+        // mistake the review flagged in the mandated "payload is sealed"
+        // check — always unequal regardless of whether the nonce actually
+        // collided.
+        let key = [9u8; 32];
+        let mut a = dgram(b"same plaintext", 1);
+        let mut b = a.clone();
+        seal_in_place(&mut a, &key, 42).unwrap();
+        seal_in_place(&mut b, &key, 42 + (1u64 << 40)).unwrap();
+        let ct_and_tag_start = DATAGRAM_HEADER_LEN + COUNTER_LEN;
+        assert_ne!(
+            &a[ct_and_tag_start..],
+            &b[ct_and_tag_start..],
+            "counters differing above the low byte must not collide in the nonce"
+        );
+    }
+
+    #[test]
+    fn known_answer_test_pins_the_whole_sealed_envelope() {
+        // Freezes the entire envelope — header AAD scope, nonce
+        // construction, counter placement, ciphertext, tag — against
+        // silent future drift. This is the multi-language wire format
+        // (uc_protocol::v2::crypto); a second-language peer has nothing
+        // but this kind of byte-exact vector to implement against.
+        let key = [0x42u8; 32];
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(&mut d, &DatagramHeader {
+            position: 4096,
+            leadership_term_id: 3,
+            kind: 1,
+            flags: 0,
+            key_epoch: 7,
+        });
+        d.extend_from_slice(b"hello");
+        seal_in_place(&mut d, &key, 42).unwrap();
+        assert_eq!(
+            d,
+            vec![
+                // header: position=4096 LE, term=3 LE, kind=1, flags=0, key_epoch=7 LE
+                0, 16, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 1, 0, 7, 0,
+                // counter=42 LE
+                42, 0, 0, 0, 0, 0, 0, 0,
+                // ciphertext (5 bytes) ++ tag (16 bytes)
+                0x1f, 0x6e, 0xff, 0x14, 0xe1, 0x85, 0x66, 0xea, 0x05, 0x95, 0xf8, 0x56, 0x38,
+                0x7d, 0xd1, 0x6c, 0x3b, 0xe5, 0xa0, 0xbd, 0x58,
+            ],
+            "sealed envelope byte-for-byte KAT (key=[0x42;32], counter=42, \
+             header {{position:4096, term:3, kind:1, flags:0, key_epoch:7}}, \
+             payload=b\"hello\")"
+        );
+    }
+
+    #[test]
+    fn boundary_length_with_garbage_bytes_fails_closed() {
+        // The truncation sweep in
+        // a_truncated_datagram_is_rejected_not_indexed_out_of_bounds covers
+        // 0..DATAGRAM_HEADER_LEN+CRYPTO_OVERHEAD but never that upper bound
+        // itself — the exact minimal shape of a well-formed empty-payload
+        // sealed frame (ciphertext_and_tag.len() == TAG_LEN, split_at ==
+        // 0). A "nothing to decrypt, skip the tag check" special-case for
+        // an empty ciphertext region would wrongly accept this: random
+        // bytes, not a valid seal, must still fail closed rather than
+        // either panic or silently open.
+        let key = [9u8; 32];
+        let mut d = vec![0x5Au8; DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD];
+        assert!(matches!(open_in_place(&mut d, &key), Err(CryptoError::AuthFailed)));
     }
 }
