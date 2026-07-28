@@ -26,6 +26,7 @@
 //! - `transport` (T9): wiring into `uc2_net`.
 
 pub mod identity;
+pub mod schedule;
 
 /// Node identifier — matches `uc2_consensus::election::NodeId` (both `u32`,
 /// intentionally not re-exported from there: this crate stays dependency-thin
