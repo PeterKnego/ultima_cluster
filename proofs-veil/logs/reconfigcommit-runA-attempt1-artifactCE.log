@@ -1,0 +1,60 @@
+    proposed = [[0, [0]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1], [2, 2]]
+    voteCand = [[0, 0], [1, 2], [2, 2]]
+    voteMsg = [[1, [0, 1]], [1, [2, 2]]]
+    voteTerm = [[0, 1], [1, 2], [2, 2]]
+  State 9 (via appendEntry(i=0)):
+    candidate = [2]
+    cfg = [[0, [0]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    committed = false
+    committedTerm = 0
+    curTerm = [[0, 1], [1, 2], [2, 2]]
+    hasProposal = [0]
+    hasVoted = [0, 1, 2]
+    holdsE = [0]
+    leader = [0]
+    pending = [0]
+    propAfterE = []
+    proposed = [[0, [0]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1], [2, 2]]
+    voteCand = [[0, 0], [1, 2], [2, 2]]
+    voteMsg = [[1, [0, 1]], [1, [2, 2]]]
+    voteTerm = [[0, 1], [1, 2], [2, 2]]
+  State 10 (via becomeLeader(i=2, q=[1, 2])):
+    candidate = []
+    cfg = [[0, [0]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    committed = false
+    committedTerm = 0
+    curTerm = [[0, 1], [1, 2], [2, 2]]
+    hasProposal = [0]
+    hasVoted = [0, 1, 2]
+    holdsE = [0]
+    leader = [0, 2]
+    pending = [0]
+    propAfterE = []
+    proposed = [[0, [0]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1], [2, 2]]
+    voteCand = [[0, 0], [1, 2], [2, 2]]
+    voteMsg = [[1, [0, 1]], [1, [2, 2]]]
+    voteTerm = [[0, 1], [1, 2], [2, 2]]
+  State 11 (via commitEntry(i=0, q=[0])):
+    candidate = []
+    cfg = [[0, [0]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    committed = true
+    committedTerm = 1
+    curTerm = [[0, 1], [1, 2], [2, 2]]
+    hasProposal = [0]
+    hasVoted = [0, 1, 2]
+    holdsE = [0]
+    leader = [0, 2]
+    pending = [0]
+    propAfterE = []
+    proposed = [[0, [0]], [1, [0, 1, 2]], [2, [0, 1, 2]]]
+    reqVote = [[0, 1], [2, 2]]
+    voteCand = [[0, 0], [1, 2], [2, 2]]
+    voteMsg = [[1, [0, 1]], [1, [2, 2]]]
+    voteTerm = [[0, 1], [1, 2], [2, 2]]
+error: Lean exited with code 1
+Some required targets logged failures:
+- Examples.UC.ReconfigCommit
+error: build failed

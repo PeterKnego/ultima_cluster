@@ -113,3 +113,47 @@ checkpoint suggests otherwise, that is what the checkpoint is for.
   survives Rust adjudication, that is a **finding**, handled by the spike's
   "any hit → Rust" rule, not silently modeled away.
 - Not the nightly Veil CI job (separate follow-up, still optional).
+
+---
+
+## Re-gate outcome + bar-3 execution policy (added 2026-07-26, post-checkpoint)
+
+**Re-gate decision (Peter): GO on bar 3** — the inductive proof push — with the
+checkpoint's re-estimate (1–2 LC-task S2-equivalents; the anchor is a floor,
+not a ceiling) accepted. The arc continues on `uc2/veil-commit-plane`
+(unmerged until the arc concludes).
+
+**Model-tier policy (binding on every bar-3 session):**
+
+- **Opus drives** the invariant-hunting loop, clause porting, lemma work, and
+  run orchestration. Rationale: `#check_invariants` is the referee — the
+  driver must only be right about what to try next, not about whether a proof
+  holds — and the harness (calibration knobs, vacuity canaries, ledger)
+  bounds the damage of a wrong guess.
+- **Fable gates twice**, because the two silent-failure points are judgment,
+  not mechanics:
+  1. **Mid-arc:** before any accumulated MODEL modifications are built upon,
+     a Fable review of those edits against the Rust (the Q2 chain) — the
+     "fixing the model until the proof passes" trap is the one that converts
+     assurance into vacuity.
+  2. **End-of-arc:** a Fable review of the whole claim (model + invariants +
+     what the SAFE verdict actually quantifies over) before anything is
+     called done.
+- **Hard ledger rule, with teeth:** every CTI adjudicated as "model artifact"
+  and every model edit requires a written, Rust-anchored ledger entry
+  (file:line into the Q2 chain or the code) BEFORE proceeding. No entry, no
+  next step. (F-M7-1 discipline; the spike's three same-direction fidelity
+  bugs are the reason this is a rule and not a habit.)
+- **Any-hit-→-Rust unchanged:** a CTI that survives adjudication as possibly
+  REAL stops the arc and goes to the Rust side; it is a finding, never
+  something to model away.
+
+**Adjacency-lemma route (checkpoint question 2):** driver's choice between
+r1 (concrete-instantiation proof) and r2 (in-module counting), justified in
+the ledger when made — it is a technical implementation choice, not a
+resource commitment, and the checkpoint memo carries both routes' trade-offs.
+
+**Canon (checkpoint question 3):** remains observe-only for this arc. The
+checkpoint's finding — that the prefix coupling is the canon-style property
+and its removal is machine-checked acked-write loss — is recorded; closing
+canon stays a `proofs/` matter outside this arc's scope.

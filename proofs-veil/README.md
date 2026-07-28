@@ -35,7 +35,21 @@ checker for bug-finding and design assurance** — never as a proof of record.
   cardinality idiom applied to a *changing* set); single-server change via
   `insert`/`remove`; one-in-flight; term-coupled adoption; `adjacencyGuard`
   toggle. Safety: `election_safety` + `quorum_overlap`.
-- `logs/` — the three decisive `#model_check` runs (see the gate doc).
+- `models/ReconfigCommit.lean` — **the commit/log plane over the reconfig model**
+  (option-(a) arc, session 1 — brief
+  `docs/superpowers/specs/2026-07-26-uc2-veil-reconfig-commit-plane-brief.md`):
+  entry-level `holdsE`/`committed` plane mirroring the discharged Q2 Rust chain,
+  `prefixCoupling` knob (the F-M7-2 mechanism). Calibration: coupling OFF →
+  ❌ `leader_completeness` at depth 13 (the F-M7-2 shape); coupling ON → ✅ clean
+  through the same horizon (4,211,943 states — bounded, not a proof) + canary
+  witnessed + election-safety regression clean (9,160,143 states, uncoupled,
+  d14). Checkpoint memo:
+  `docs/benchmarks/uc2-veil-commit-plane-checkpoint-2026-07-26.md`.
+- `models/ReconfigCommitSMT.lean` — the abstract-quorum (C5) sketch for the
+  inductive route: definitions + P2 + seed invariant clauses; the ±1 adjacency
+  lemma stated as a marked TO-BE-PROVED obligation. Elaborates green;
+  `#check_invariants` deliberately not yet run (next session).
+- `logs/` — the decisive `#model_check` runs (see the gate doc + checkpoint memo).
 - `spike-ledger.md` — the running SDD ledger across all sessions.
 
 ## Results (see `docs/benchmarks/uc2-veil-spike-2026-07-24.md`)

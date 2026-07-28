@@ -1,0 +1,28 @@
+⚠ [711/1263] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1263] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1263] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+⚠ [1418/1418] Built Examples.UC.PropG2 (66s)
+info: Examples/UC/PropG2.lean:633:0: The following set of actions must preserve the invariant and successfully terminate:
+  propose
+    doesNotThrow ... ✅
+    cfg_from_genesis ... ✅
+    proposal_is_own_cfg ... ✅
+    adopters_not_behind ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    reach_quorum_below ... ✅
+    adopted_reach_bound ... ✅
+    committed_cfg_quorum ... ✅
+    pending_iff_proposal ... ✅
+    chain_committed_below ... ✅
+warning: Examples/UC/PropG2.lean:633:0: Trusting SMT solver for 10 goals. `set_option veil.smt.trust false` to enable proof reconstruction.
+Build completed successfully (1418 jobs).
+EXIT=0 WALL=68s

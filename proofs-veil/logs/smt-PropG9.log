@@ -1,0 +1,31 @@
+⚠ [711/1288] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1288] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1288] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+⚠ [1418/1418] Built Examples.UC.PropG9 (63s)
+info: Examples/UC/PropG9.lean:645:0: The following set of actions must preserve the invariant and successfully terminate:
+  propose
+    doesNotThrow ... ✅
+    grant_state ... ✅
+    self_vote ... ✅
+    commit_leader_evidence ... ✅
+    commit_leader_unique ... ✅
+    commit_leader_only_after_commit ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    voteterm_bounded ... ✅
+    commit_leader_self_vote ... ✅
+    commit_leader_at_commit_cfg ... ✅
+    commitq_witness ... ✅
+    commitq_grant_covers_reach ... ✅
+    commit_leader_frozen_reach ... ✅
+warning: Examples/UC/PropG9.lean:645:0: Trusting SMT solver for 13 goals. `set_option veil.smt.trust false` to enable proof reconstruction.
+Build completed successfully (1418 jobs).
+EXIT=0 WALL=65s

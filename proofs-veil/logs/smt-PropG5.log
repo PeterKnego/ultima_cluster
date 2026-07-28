@@ -1,0 +1,159 @@
+⚠ [711/1194] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1194] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1194] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+✖ [1418/1418] Building Examples.UC.PropG5 (60s)
+trace: .> LEAN_PATH=/home/claude/veil-spike/veil-preview/.lake/packages/cvc5/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Cli/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/batteries/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Qq/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/aesop/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/proofwidgets/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/importGraph/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/LeanSearchClient/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/plausible/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/mathlib/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/auto/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/smt/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/packages/Loom/.lake/build/lib/lean:/home/claude/veil-spike/veil-preview/.lake/build/lib/lean /home/claude/.elan/toolchains/leanprover--lean4---v4.28.0/bin/lean /home/claude/veil-spike/veil-preview/Examples/UC/PropG5.lean -o /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/PropG5.olean -i /home/claude/veil-spike/veil-preview/.lake/build/lib/lean/Examples/UC/PropG5.ilean -c /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/PropG5.c --setup /home/claude/veil-spike/veil-preview/.lake/build/ir/Examples/UC/PropG5.setup.json --json
+error: Examples/UC/PropG5.lean:643:0: The following set of actions must preserve the invariant and successfully terminate:
+  propose
+    doesNotThrow ... ✅
+    cfg_from_genesis ... ✅
+    eleccfg_not_ahead ... ✅
+    role_exclusive ... ✅
+    cand_cfg_frozen ... ✅
+    reach_bound ... ✅
+    reach_mono ... ✅
+    reach_quorum_below ... ✅
+    adopted_reach_bound ... ❌
+      Counterexample (WP):
+        Theory:
+          cfgLt = [[0, 1]]
+          cmember = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          genesisC = 0
+          qmember = []
+          quorumOf = []
+          succCfg = [[0, 1]]
+          tot.le = [[0, 0], [1, 0], [1, 1]]
+          tot.zero = 1
+        Pre-state:
+          candidate = []
+          cfgAt = [[0, 0], [1, 0]]
+          cfgBacked = []
+          cfgCommitTerm = [[0, 0], [1, 0]]
+          cfgCommitted = []
+          cfgOf = [[0, 0], [1, 0]]
+          cfgPred = [[0, 0], [1, 0]]
+          cfgQ = [[0, 0], [1, 0]]
+          cfgSeen = []
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = false
+          committedTerm = 0
+          curTerm = [[0, 0], [1, 1]]
+          elecCfg = [[0, 0], [1, 0]]
+          elecQuorum = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[0, 1]]
+          hasProposal = []
+          hasVoted = []
+          holdsE = [0, 1]
+          isCommitLeader = []
+          leader = [0]
+          pending = []
+          propAfterE = []
+          proposedC = [[0, 0], [1, 1]]
+          reachAt = [[0, 0, 1], [0, 1, 1], [1, 0, 1], [1, 1, 1]]
+          reqVote = []
+          voteCand = [[0, 0], [1, 0]]
+          voteMsg = []
+          voteTerm = [[0, 0], [1, 0]]
+        Action: propose(d=1, i=0)
+      Counterexample (TR):
+        Theory:
+          cfgLt = [[0, 1]]
+          cmember = [[0, 1]]
+          genesisC = 0
+          qmember = [[0, 0], [1, 0]]
+          quorumOf = []
+          succCfg = [[0, 1]]
+          tot.le = [[0, 0], [1, 0], [1, 1]]
+          tot.zero = 1
+        Pre-state:
+          candidate = []
+          cfgAt = [[0, 0], [1, 0]]
+          cfgBacked = [0, 1]
+          cfgCommitTerm = [[0, 0], [1, 0]]
+          cfgCommitted = []
+          cfgOf = [[0, 0], [1, 0]]
+          cfgPred = [[0, 0], [1, 0]]
+          cfgQ = [[0, 0], [1, 0]]
+          cfgSeen = [0, 1]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 1], [1, 0]]
+          elecCfg = [[0, 0], [1, 0]]
+          elecQuorum = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[1, 0]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [0, 1]
+          isCommitLeader = [0, 1]
+          leader = [1]
+          pending = [0]
+          propAfterE = [0, 1]
+          proposedC = [[0, 1], [1, 0]]
+          reachAt = [[0, 0, 1], [0, 1, 0], [1, 0, 1], [1, 1, 1]]
+          reqVote = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          voteCand = [[0, 0], [1, 0]]
+          voteMsg = [[[0, 0], 0], [[0, 0], 1], [[0, 1], 0], [[0, 1], 1], [[1, 0], 0], [[1, 0], 1], [[1, 1], 0], [[1, 1], 1]]
+          voteTerm = [[0, 0], [1, 0]]
+        Action: propose(d=1, i=1)
+        Post-state:
+          candidate = []
+          cfgAt = [[0, 0], [1, 0]]
+          cfgBacked = [0, 1]
+          cfgCommitTerm = [[0, 0], [1, 0]]
+          cfgCommitted = []
+          cfgOf = [[0, 0], [1, 1]]
+          cfgPred = [[0, 0], [1, 0]]
+          cfgQ = [[0, 0], [1, 0]]
+          cfgSeen = [0, 1]
+          commitCfgid = 0
+          commitElecCfg = 0
+          commitElecQuorum = 0
+          commitQuorum = 0
+          committed = true
+          committedTerm = 0
+          curTerm = [[0, 1], [1, 0]]
+          elecCfg = [[0, 0], [1, 0]]
+          elecQuorum = [[0, 0], [1, 0]]
+          gotEAt = [[0, 0], [1, 0]]
+          hasAdopted = [[1, 0], [1, 1]]
+          hasProposal = [0, 1]
+          hasVoted = [0, 1]
+          holdsE = [0, 1]
+          isCommitLeader = [0, 1]
+          leader = [1]
+          pending = [0, 1]
+          propAfterE = [0, 1]
+          proposedC = [[0, 1], [1, 1]]
+          reachAt = [[0, 0, 1], [0, 1, 0], [1, 0, 1], [1, 1, 0]]
+          reqVote = [[0, 0], [0, 1], [1, 0], [1, 1]]
+          voteCand = [[0, 0], [1, 0]]
+          voteMsg = [[[0, 0], 0], [[0, 0], 1], [[0, 1], 0], [[0, 1], 1], [[1, 0], 0], [[1, 0], 1], [[1, 1], 0], [[1, 1], 1]]
+          voteTerm = [[0, 0], [1, 0]]
+    committed_cfg_quorum ... ✅
+    chain_committed_below ... ✅
+    leader_reach_strict ... ✅
+    role_below_quorum_strict ... ✅
+    role_below_meets_quorum ... ✅
+warning: Examples/UC/PropG5.lean:643:0: Trusting SMT solver for 12 goals. `set_option veil.smt.trust false` to enable proof reconstruction.
+error: Lean exited with code 1
+Some required targets logged failures:
+- Examples.UC.PropG5
+error: build failed
+EXIT=1 WALL=62s

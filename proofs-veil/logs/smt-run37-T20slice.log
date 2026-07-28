@@ -1,0 +1,137 @@
+⚠ [711/1251] Replayed Loom.MonadAlgebras.WP.Attr
+warning: Loom/MonadAlgebras/WP/Attr.lean:27:34: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+warning: Loom/MonadAlgebras/WP/Attr.lean:26:77: `Lean.Meta.DiscrTree.insertCore` has been deprecated: Use `Lean.Meta.DiscrTree.insertKeyValue` instead
+⚠ [747/1251] Replayed Smt.Reconstruct.BitVec.Bitblast
+warning: Smt/Reconstruct/BitVec/Bitblast.lean:36:4: declaration uses `sorry`
+⚠ [798/1251] Replayed Smt.Data.Sexp
+warning: Smt/Data/Sexp.lean:89:10: `String.next` has been deprecated: Use `String.Pos.Raw.next` instead
+
+Note: The updated constant is in a different namespace. Dot notation may need to be changed (e.g., from `x.next` to `Pos.Raw.next x`).
+⚠ [1390/1418] Replayed Veil.Core.UI.Verifier.VerificationResults
+warning: Veil/Core/UI/Verifier/VerificationResults.lean:31:2: A widget module with the same hash(JS source code) was already registered at ProofWidgets.RefreshComponent.
+⚠ [1418/1418] Built Examples.UC.ReconfigCommitSMTT20Slice (75s)
+info: Examples/UC/ReconfigCommitSMTT20Slice.lean:629:0: Initialization must establish the invariant:
+  doesNotThrow ... ✅
+  gotE_bounded ... ✅
+  pending_iff_proposal ... ✅
+  cfgpred_succ ... ✅
+  proposal_seen ... ✅
+  cfg_seen_adopted ... ✅
+  cfg_seen_committed ... ✅
+  adopted_holds ... ✅
+  cfgq_witness ... ✅
+  cfgq_holders ... ✅
+The following set of actions must preserve the invariant and successfully terminate:
+  propose
+    doesNotThrow ... ✅
+    gotE_bounded ... ✅
+    pending_iff_proposal ... ✅
+    cfgpred_succ ... ✅
+    proposal_seen ... ✅
+    cfg_seen_adopted ... ✅
+    cfg_seen_committed ... ✅
+    adopted_holds ... ✅
+    cfgq_witness ... ✅
+    cfgq_holders ... ✅
+  deliverRequestVoteGrant
+    doesNotThrow ... ✅
+    gotE_bounded ... ✅
+    pending_iff_proposal ... ✅
+    cfgpred_succ ... ✅
+    proposal_seen ... ✅
+    cfg_seen_adopted ... ✅
+    cfg_seen_committed ... ✅
+    adopted_holds ... ✅
+    cfgq_witness ... ✅
+    cfgq_holders ... ✅
+  replicate
+    doesNotThrow ... ✅
+    gotE_bounded ... ✅
+    pending_iff_proposal ... ✅
+    cfgpred_succ ... ✅
+    proposal_seen ... ✅
+    cfg_seen_adopted ... ✅
+    cfg_seen_committed ... ✅
+    adopted_holds ... ✅
+    cfgq_witness ... ✅
+    cfgq_holders ... ✅
+  becomeLeader
+    doesNotThrow ... ✅
+    gotE_bounded ... ✅
+    pending_iff_proposal ... ✅
+    cfgpred_succ ... ✅
+    proposal_seen ... ✅
+    cfg_seen_adopted ... ✅
+    cfg_seen_committed ... ✅
+    adopted_holds ... ✅
+    cfgq_witness ... ✅
+    cfgq_holders ... ✅
+  crashRestart
+    doesNotThrow ... ✅
+    gotE_bounded ... ✅
+    pending_iff_proposal ... ✅
+    cfgpred_succ ... ✅
+    proposal_seen ... ✅
+    cfg_seen_adopted ... ✅
+    cfg_seen_committed ... ✅
+    adopted_holds ... ✅
+    cfgq_witness ... ✅
+    cfgq_holders ... ✅
+  commitEntry
+    doesNotThrow ... ✅
+    gotE_bounded ... ✅
+    pending_iff_proposal ... ✅
+    cfgpred_succ ... ✅
+    proposal_seen ... ✅
+    cfg_seen_adopted ... ✅
+    cfg_seen_committed ... ✅
+    adopted_holds ... ✅
+    cfgq_witness ... ✅
+    cfgq_holders ... ✅
+  adopt
+    doesNotThrow ... ✅
+    gotE_bounded ... ✅
+    pending_iff_proposal ... ✅
+    cfgpred_succ ... ✅
+    proposal_seen ... ✅
+    cfg_seen_adopted ... ✅
+    cfg_seen_committed ... ✅
+    adopted_holds ... ✅
+    cfgq_witness ... ✅
+    cfgq_holders ... ✅
+  commitCfg
+    doesNotThrow ... ✅
+    gotE_bounded ... ✅
+    pending_iff_proposal ... ✅
+    cfgpred_succ ... ✅
+    proposal_seen ... ✅
+    cfg_seen_adopted ... ✅
+    cfg_seen_committed ... ✅
+    adopted_holds ... ✅
+    cfgq_witness ... ✅
+    cfgq_holders ... ✅
+  appendEntry
+    doesNotThrow ... ✅
+    gotE_bounded ... ✅
+    pending_iff_proposal ... ✅
+    cfgpred_succ ... ✅
+    proposal_seen ... ✅
+    cfg_seen_adopted ... ✅
+    cfg_seen_committed ... ✅
+    adopted_holds ... ✅
+    cfgq_witness ... ✅
+    cfgq_holders ... ✅
+  startElection
+    doesNotThrow ... ✅
+    gotE_bounded ... ✅
+    pending_iff_proposal ... ✅
+    cfgpred_succ ... ✅
+    proposal_seen ... ✅
+    cfg_seen_adopted ... ✅
+    cfg_seen_committed ... ✅
+    adopted_holds ... ✅
+    cfgq_witness ... ✅
+    cfgq_holders ... ✅
+warning: Examples/UC/ReconfigCommitSMTT20Slice.lean:629:0: Trusting SMT solver for 98 goals. `set_option veil.smt.trust false` to enable proof reconstruction.
+Build completed successfully (1418 jobs).
+EXIT=0 WALL=77s
