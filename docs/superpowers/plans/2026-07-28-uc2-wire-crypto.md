@@ -373,7 +373,7 @@ Add to the root `Cargo.toml`: `"uc2_crypto"` in `members`, and under `[workspace
 # M8 wire crypto. Versions verified against crates.io 2026-07-28. The AEAD/hash
 # generation deliberately MATCHES the one snow pins internally (aes-gcm 0.10 /
 # sha2 0.10 era) so the binary carries ONE AES-GCM implementation, not two.
-snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-aes-gcm", "use-sha2", "use-curve25519", "use-getrandom", "std"] }
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-aes-gcm", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom", "std"] }
 aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
@@ -386,6 +386,19 @@ base64 = "0.22"
 API changes across RustCrypto generations (`aead` 0.5→0.6, `digest` 0.10→0.11)
 and mixing generations reintroduces the duplicate-implementation problem this
 block exists to avoid. Report the resolution failure instead.
+
+**Why `use-chacha20poly1305` is enabled even though the pattern is AES-GCM-only**
+(found by the Task 2 implementer, independently verified 2026-07-28): snow 0.10.0
+**does not compile with AES-GCM alone**. `src/resolvers/default.rs:23-24` imports
+`KeyInit` and `AeadInPlace` only under `#[cfg(any(feature = "use-chacha20poly1305",
+feature = "use-xchacha20poly1305"))]`, while the AES path calls `Aes256Gcm::new(..)`
+— an upstream bug, not a version-resolution problem. Enabling the chacha feature
+is the fix, and it costs nothing we were not already paying: snow 0.9.6 declares
+`chacha20poly1305` **non-optional**, so every available snow version links it
+regardless. The pattern string stays `Noise_IK_25519_AESGCM_SHA256`, so the chacha
+code is linked but never called, and this does NOT reintroduce the duplicate-AEAD
+problem the version pin exists to prevent — there is still exactly one aes-gcm in
+the tree, which is what that ruling was about.
 
 - [ ] **Step 4: Implement `lib.rs` error type and `identity.rs`**
 
