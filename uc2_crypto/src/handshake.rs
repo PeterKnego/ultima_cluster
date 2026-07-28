@@ -141,7 +141,12 @@ const PENDING_TTL_NS: u64 = 30_000_000_000;
 /// What the caller must do next. The driver never touches a socket itself.
 #[derive(Debug)]
 pub enum HandshakeAction {
-    /// Send `body` to `to` as datagram kind `kind` (18 or 19).
+    /// Send `body` to `to` as datagram kind `kind`. Emitted by this module
+    /// for the handshake kinds (18/19); [`crate::group::GroupPlane`] (T7)
+    /// reuses this same action/kind to deliver and ack the group key over
+    /// an established pairwise channel (kind 20) — deliberate, so the node
+    /// layer keeps one `HandshakeAction` match site for the whole crate
+    /// rather than a second parallel action type.
     Send { to: NodeId, kind: u8, body: Vec<u8> },
     /// A handshake with `peer` completed, and `boot_salt` is **the peer's**
     /// salt — the input to that peer's group-key derivation

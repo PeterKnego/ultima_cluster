@@ -74,6 +74,26 @@
 //! `Vec<u8>` DOES carry the plaintext key — that is unavoidable: it is the
 //! very thing being delivered, sealed by the caller over the pairwise
 //! channel before it ever reaches a socket.
+//!
+//! [`GroupPlane::on_key_message`]'s receive path (a peer installing a
+//! `MSG_KEY` delivery) copies the wire bytes into the SAME kind of
+//! `Zeroizing`-wrapped buffer before constructing the `GroupKey` — a receive
+//! path is not exempt just because the bytes came from the network instead
+//! of an RNG; it is handling the identical live, cluster-wide secret.
+//!
+//! **The crate-wide rule, stated positively so it doesn't have to be
+//! rediscovered per call site:** every place that touches raw key-material
+//! bytes — minted, derived, split off a finished handshake, or received off
+//! the wire — binds them into a zeroizing type in the SAME statement that
+//! produces them, with no bare `[u8; 32]`/`Vec<u8>` intermediate at any
+//! point, receive paths included. This exact class of gap has been caught
+//! four times in this crate under different shapes — `Identity::load`'s
+//! read buffer (T2), `GroupKey`'s inner field almost staying `pub` (T3),
+//! the `derive_send_key` call-site contract (T5), and `on_key_message`'s
+//! receive-side copy here (T7, fixed post-review) — never as a correctness
+//! bug, always as key material sitting in freed memory a moment longer than
+//! it needed to. Follow the pattern at an existing call site rather than
+//! writing a fresh one from scratch.
 
 use crate::handshake::HandshakeAction;
 #[cfg(test)]
@@ -238,9 +258,24 @@ impl GroupPlane {
         match body.first().copied() {
             Some(MSG_KEY) if body.len() == KEY_MSG_LEN => {
                 let epoch = u16::from_le_bytes([body[1], body[2]]);
-                let mut key = [0u8; 32];
+                // Written straight into a zeroizing buffer, same discipline
+                // as `mint`'s send path (see the module docs' "Key material
+                // handled here" section) — this is received, live,
+                // cluster-wide key material, not a throwaway local.
+                let mut key = zeroize::Zeroizing::new([0u8; 32]);
                 key.copy_from_slice(&body[3..KEY_MSG_LEN]);
-                self.schedule.install(epoch, GroupKey::new(key));
+                // NO `epoch_is_newer` freshness check here: under UDP
+                // reordering a late duplicate of an OLDER `HS_KEY` can
+                // install after a newer one, which flips which epoch
+                // `KeySchedule::current()`/`previous()` LABEL. Confirmed
+                // harmless in this task's scope — `KeySchedule::get()` and
+                // `retire_below()` both key off the epoch NUMBER, not the
+                // current/previous label, and `GroupPlane::sealing_epoch`
+                // (the only sealing-side epoch source) never reads
+                // `schedule.current()` directly. A future caller (T9/T12)
+                // MUST go through `sealing_epoch`, not `schedule.current()`,
+                // or this reordering hazard becomes live.
+                self.schedule.install(epoch, GroupKey::new(*key));
                 vec![HandshakeAction::Send {
                     to: from,
                     kind: DGRAM_KIND_HS_KEY,
