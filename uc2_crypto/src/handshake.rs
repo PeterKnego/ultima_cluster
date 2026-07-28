@@ -143,11 +143,32 @@ const PENDING_TTL_NS: u64 = 30_000_000_000;
 pub enum HandshakeAction {
     /// Send `body` to `to` as datagram kind `kind` (18 or 19).
     Send { to: NodeId, kind: u8, body: Vec<u8> },
-    /// A pairwise session with `peer` is usable, and `boot_salt` is **the
-    /// peer's** salt — the input to that peer's group-key derivation
+    /// A handshake with `peer` completed, and `boot_salt` is **the peer's**
+    /// salt — the input to that peer's group-key derivation
     /// ([`crate::schedule::derive_send_key`]). Learning the peer's salt is the
     /// point of the payload exchange; our own is already known.
-    Established { peer: NodeId, boot_salt: BootSalt },
+    ///
+    /// `confirmed` says whether this session is **in force for sealing**:
+    ///
+    /// - `true` — it is `current`. [`Peers::seal_pairwise`] uses it now, and
+    ///   [`Peers::peer_boot_salt`] returns this salt.
+    /// - `false` — it is parked as `pending` because a live session already
+    ///   exists (we completed as *responder*, which in a 1-RTT pattern proves
+    ///   nothing about whether our message 2 arrived — see the module docs).
+    ///   The peer's *group*-sealed fan-out already uses this salt, so the
+    ///   caller needs it; the *pairwise* path does not switch until the peer
+    ///   proves it is using the new session, at which point this action is
+    ///   emitted again with `confirmed: true`.
+    ///
+    /// The flag is a field rather than a doc note deliberately: a caller that
+    /// caches the salt for the pairwise path without noticing the distinction
+    /// gets a bug that only surfaces after a peer restart. Destructuring is
+    /// forced to acknowledge it.
+    Established {
+        peer: NodeId,
+        boot_salt: BootSalt,
+        confirmed: bool,
+    },
     /// The handshake with `peer` was refused. `reason` is for operator logs; it
     /// is never sent on the wire, so it may name the failed check.
     Failed { peer: NodeId, reason: &'static str },
@@ -160,8 +181,6 @@ struct Initiating {
     /// a fresh DH. Re-sending the identical bytes also keeps the peer on one
     /// responder session instead of manufacturing a new one per retry.
     msg1: Vec<u8>,
-    attempts: u32,
-    last_send_ns: u64,
 }
 
 /// One established pairwise session: the two directional keys, the peer's boot
@@ -211,6 +230,13 @@ impl Session {
 /// call. Same hazard `identity.rs` documents for the private key and
 /// `schedule.rs` for `derive_send_key`'s return: arrays are `Copy`, so wrapping
 /// a value does not scrub the slot it was copied from.
+///
+/// **The scrub covers OUR copy only.** snow keeps its own copy of the same two
+/// keys in `HandshakeState::cipherstates` (the split runs there first) and
+/// snow 0.10 implements `Zeroize` nowhere, so dropping the `HandshakeState`
+/// leaves that copy in freed memory regardless of what this function does.
+/// Upstream's to fix; recorded here so nobody reads this scrub as a guarantee
+/// that no unwrapped copy of the transport keys exists in the process.
 fn split_keys(state: &mut snow::HandshakeState) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
     let mut raw = state.dangerously_get_raw_split();
     let keys = (Zeroizing::new(raw.0), Zeroizing::new(raw.1));
@@ -228,6 +254,18 @@ struct PeerEntry {
     /// add-a-node-at-runtime case once the operator drops the key in.
     desired: bool,
     hs: Option<Initiating>,
+    /// Attempt counter and clock for the backoff, held on the ENTRY rather than
+    /// on `hs`: a `start_initiator` that fails (the peer's key has not landed
+    /// in the allowlist yet) leaves no `hs` behind, and gating only the
+    /// retransmit would leave that failure path ungated. UC's agents busy-spin,
+    /// so "ungated" means a `Failed` action and a heap allocation per poll
+    /// iteration, not per second.
+    attempts: u32,
+    last_attempt_ns: u64,
+    /// Set by [`Peers::open_pairwise`] when a `pending` session is promoted, so
+    /// the next [`Peers::tick`] can announce it. The promotion happens on the
+    /// receive path, which returns a `Result`, not actions.
+    promoted: bool,
     /// The session used for sealing, and tried first for opening.
     current: Option<Session>,
     /// A session we completed as responder while `current` was already live.
@@ -365,17 +403,31 @@ impl Peers {
                 entry.pending = None;
             }
 
-            match entry.hs.as_mut() {
+            if entry.promoted {
+                entry.promoted = false;
+                if let Some(session) = entry.current.as_ref() {
+                    actions.push(HandshakeAction::Established {
+                        peer: *peer,
+                        boot_salt: session.boot_salt,
+                        confirmed: true,
+                    });
+                }
+            }
+
+            // ONE clock for both the retransmit and the failure path. See
+            // `PeerEntry::attempts`.
+            if now_ns.saturating_sub(entry.last_attempt_ns) < retry_delay_ns(entry.attempts) {
+                continue;
+            }
+            match entry.hs.as_ref() {
                 Some(hs) => {
-                    if now_ns.saturating_sub(hs.last_send_ns) >= retry_delay_ns(hs.attempts) {
-                        hs.attempts = hs.attempts.saturating_add(1);
-                        hs.last_send_ns = now_ns;
-                        actions.push(HandshakeAction::Send {
-                            to: *peer,
-                            kind: DGRAM_KIND_HS_INIT,
-                            body: hs.msg1.clone(),
-                        });
-                    }
+                    entry.attempts = entry.attempts.saturating_add(1);
+                    entry.last_attempt_ns = now_ns;
+                    actions.push(HandshakeAction::Send {
+                        to: *peer,
+                        kind: DGRAM_KIND_HS_INIT,
+                        body: hs.msg1.clone(),
+                    });
                 }
                 None => {
                     if entry.desired && entry.current.is_none() {
@@ -447,6 +499,11 @@ impl Peers {
                     let result = replay_check(session, counter);
                     if result.is_ok() {
                         entry.current = entry.pending.take();
+                        // The next `tick` announces this as
+                        // `Established { confirmed: true }` — the seal path and
+                        // `peer_boot_salt` have just switched, and a caller that
+                        // only saw the `confirmed: false` action needs to know.
+                        entry.promoted = true;
                     }
                     return result;
                 }
@@ -468,6 +525,15 @@ impl Peers {
             peers,
         } = self;
 
+        // Stamp the attempt BEFORE anything that can fail, so every outcome —
+        // sent, refused by the allowlist, refused by snow — lands on the same
+        // backoff clock. `tick` gates on this.
+        {
+            let entry = peers.entry(peer).or_default();
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.last_attempt_ns = now_ns;
+        }
+
         let Some(peer_public) = authorized_key(allowlist, peer, now_ns) else {
             return vec![fail(peer, "peer is not in the allowlist")];
         };
@@ -487,8 +553,6 @@ impl Peers {
         entry.hs = Some(Initiating {
             state: Box::new(state),
             msg1: msg1.clone(),
-            attempts: 1,
-            last_send_ns: now_ns,
         });
 
         vec![HandshakeAction::Send {
@@ -515,13 +579,27 @@ impl Peers {
         // the peer's message 1 on the floor, because the peer (being higher) is
         // about to drop its own attempt and answer ours. Deterministic, so the
         // race converges on exactly one session rather than two.
-        let entry = peers.entry(from).or_default();
-        if entry.hs.is_some() {
-            if *self_id < from {
-                return Vec::new();
+        //
+        // NOTHING IS MUTATED HERE. At this point `body` is unauthenticated —
+        // `from` is a claim the transport made, and the pattern has not run.
+        // Tearing our own in-flight handshake down on the strength of these
+        // bytes would hand anyone who can reach the port a free
+        // handshake-cancel: 116 bytes of noise with the source id of an
+        // allowlisted lower-id peer, sustained, keeps a well-defined half of
+        // every peer pair permanently down — a quorum problem, not a nuisance.
+        // The losing side's teardown is therefore DEFERRED to the install block
+        // below, after `read_message`, the payload decode, the id bind, and the
+        // static-key check have all passed. Same rule `on_resp` follows for
+        // message 2; a later refactor must not hoist it back up here.
+        let losing_the_race = match peers.get(&from) {
+            Some(entry) if entry.hs.is_some() => {
+                if *self_id < from {
+                    return Vec::new();
+                }
+                true
             }
-            entry.hs = None;
-        }
+            _ => false,
+        };
 
         let mut state = match build_responder(identity) {
             Ok(state) => state,
@@ -561,10 +639,16 @@ impl Peers {
 
         let session = Session::from_finished_handshake(&mut state, false, peer_salt, now_ns);
         let entry = peers.entry(from).or_default();
+        // Authenticated at last — so now, and only now, the loser of a
+        // simultaneous open gives up its own attempt.
+        if losing_the_race {
+            entry.hs = None;
+        }
         // Responder completion is UNCONFIRMED: we have no idea whether message
         // 2 arrives. If a session is already live, park this one in `pending`
         // and keep sealing under the proven one.
-        if entry.current.is_none() {
+        let confirmed = entry.current.is_none();
+        if confirmed {
             entry.current = Some(session);
         } else {
             entry.pending = Some(session);
@@ -579,6 +663,7 @@ impl Peers {
             HandshakeAction::Established {
                 peer: from,
                 boot_salt: peer_salt,
+                confirmed,
             },
         ]
     }
@@ -614,27 +699,32 @@ impl Peers {
             return vec![fail(from, "handshake message 2 rejected")];
         };
 
+        // Past `read_message` the sender is AUTHENTICATED — only the holder of
+        // the static key we pinned from the allowlist can produce a message 2
+        // this handshake accepts. So the checks below, unlike the read itself,
+        // are not attacker-triggerable, and the attempt is deliberately NOT
+        // restored on their failure: a peer that is misconfigured (or was just
+        // revoked) must not leave a dead, already-finished handshake behind for
+        // `tick` to retransmit forever. Dropping it makes `tick` build a fresh
+        // one on the backoff clock instead of wedging the link.
         let Some((claimed_id, peer_salt)) = decode_payload(&payload[..len]) else {
-            entry.hs = Some(hs);
             return vec![fail(from, "malformed handshake payload")];
         };
         if claimed_id != from {
-            entry.hs = Some(hs);
             return vec![fail(from, "handshake payload claims a different node id")];
         }
         // We pinned the responder's static key from the allowlist when we built
         // message 1, so a wrong key already fails the DH above. Re-checking
         // against the *current* allowlist closes the case where the operator
-        // revoked the peer while this handshake was in flight — and there the
-        // handshake is deliberately NOT restored: a revoked peer must not keep
-        // a live attempt.
+        // revoked the peer while this handshake was in flight.
         let authorized = authorized_key(allowlist, from, now_ns)
             .is_some_and(|expected| hs.state.get_remote_static() == Some(expected.as_slice()));
         if !authorized {
             return vec![fail(from, "static key does not match the allowlist")];
         }
+        // Unreachable in `IK` (reading message 2 completes the pattern), kept
+        // as a belt: never split a handshake that did not finish.
         if !hs.state.is_handshake_finished() {
-            entry.hs = Some(hs);
             return vec![fail(from, "handshake did not complete")];
         }
 
@@ -648,6 +738,7 @@ impl Peers {
         vec![HandshakeAction::Established {
             peer: from,
             boot_salt: peer_salt,
+            confirmed: true,
         }]
     }
 }
@@ -1009,9 +1100,11 @@ mod tests {
         assert!(a_up && b_up, "a race still converges on a working session");
     }
 
-    // The body below is quoted verbatim from the task brief, nested `if`s
-    // included; collapsing it would silently diverge the suite from the
-    // specified test.
+    // The body below is quoted from the task brief, nested `if`s included;
+    // collapsing it would silently diverge the suite from the specified test.
+    // The single divergence is `, ..` in the `Established` pattern, forced by
+    // the `confirmed` field the review asked for — the compile error IS the
+    // "make the discrimination visible" fix doing its job.
     #[allow(clippy::collapsible_if)]
     #[test]
     fn established_peers_carry_the_boot_salt_for_key_derivation() {
@@ -1019,7 +1112,10 @@ mod tests {
         let acts = a.initiate(B_ID, 0);
         let mut seen = None;
         for act in a.on_message_all(&mut b, acts) {
-            if let HandshakeAction::Established { peer, boot_salt } = act {
+            if let HandshakeAction::Established {
+                peer, boot_salt, ..
+            } = act
+            {
                 if peer == B_ID {
                     seen = Some(boot_salt)
                 }
@@ -1112,7 +1208,9 @@ mod tests {
         let acts = b2.initiate(A_ID, 5_000_000_000);
         let mut established_salt = None;
         for act in b2.on_message_all(&mut a, acts) {
-            if let HandshakeAction::Established { peer, boot_salt } = act
+            if let HandshakeAction::Established {
+                peer, boot_salt, ..
+            } = act
                 && peer == B_ID
             {
                 established_salt = Some(boot_salt);
@@ -1176,6 +1274,185 @@ mod tests {
         }
         assert_eq!(reasons, vec!["static key does not match the allowlist"]);
         assert!(!a.is_established(B_ID));
+    }
+
+    /// A node holding `private` but claiming an id different from the one the
+    /// allowlist binds that key to — the payload-vs-`from` mismatch case.
+    fn node_claiming_the_wrong_id() -> Peers {
+        let allow = [(A_ID, public_of(PRIV_A)), (B_ID, public_of(PRIV_B))];
+        node(PRIV_B, 42, &allow, 0xB2)
+    }
+
+    #[test]
+    fn a_payload_claiming_a_different_node_id_is_refused_on_message_one() {
+        // The ruling-mandated bind: the id in the authenticated payload must
+        // match the id the transport demultiplexed. Without it the two
+        // identities the rest of the system keys on — the session's `NodeId`
+        // and the static key the allowlist authorized — are only accidentally
+        // the same thing.
+        let (mut a, mut liar) = (authorized_pair().0, node_claiming_the_wrong_id());
+        let acts = liar.initiate(A_ID, 0);
+        let mut reasons = Vec::new();
+        for act in acts {
+            if let HandshakeAction::Send { kind, body, .. } = act {
+                // The key IS the one A lists for id 2, so the static-key check
+                // passes; only the payload's claimed id (42) is wrong.
+                for r in a.on_message(B_ID, kind, &body, 0) {
+                    match r {
+                        HandshakeAction::Failed { reason, .. } => reasons.push(reason),
+                        other => panic!("expected refusal, got {other:?}"),
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            reasons,
+            vec!["handshake payload claims a different node id"]
+        );
+        assert!(!a.is_established(B_ID));
+    }
+
+    #[test]
+    fn a_payload_claiming_a_different_node_id_is_refused_on_message_two() {
+        // Same bind on the initiator side, where the responder is the liar.
+        let mut a = authorized_pair().0;
+        let mut liar = node_claiming_the_wrong_id();
+
+        let msg1 = a
+            .initiate(B_ID, 0)
+            .into_iter()
+            .find_map(|act| match act {
+                HandshakeAction::Send { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("message 1");
+        let msg2 = liar
+            .on_message(A_ID, DGRAM_KIND_HS_INIT, &msg1, 0)
+            .into_iter()
+            .find_map(|act| match act {
+                HandshakeAction::Send { body, .. } => Some(body),
+                _ => None,
+            })
+            .expect("message 2");
+
+        let out = a.on_message(B_ID, DGRAM_KIND_HS_RESP, &msg2, 0);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [HandshakeAction::Failed {
+                    reason: "handshake payload claims a different node id",
+                    ..
+                }]
+            ),
+            "got {out:?}"
+        );
+        assert!(!a.is_established(B_ID));
+
+        // And the link is not wedged: the peer got past `read_message`, so it
+        // is the allowlisted key holder misbehaving rather than an off-path
+        // attacker, and the dead attempt is dropped so `tick` rebuilds a fresh
+        // one on the backoff clock.
+        let retry = a.tick(HS_RETRY_MAX_NS * 2);
+        assert!(
+            retry.iter().any(|act| matches!(
+                act,
+                HandshakeAction::Send { to, kind, .. }
+                    if *to == B_ID && *kind == DGRAM_KIND_HS_INIT
+            )),
+            "a fresh handshake is started rather than the dead one retained: {retry:?}"
+        );
+    }
+
+    #[test]
+    fn an_unproven_pending_session_expires_after_the_ttl() {
+        // The TTL is load-bearing for the whole current/pending design: it is
+        // what stops an attacker (or a dead peer) from pinning a session slot
+        // indefinitely. Tested through the front door — a peer whose pending
+        // session expired can no longer be opened — and at the boundary, so an
+        // inverted or missing comparison fails.
+        for (elapsed, opens) in [(PENDING_TTL_NS - 1, true), (PENDING_TTL_NS, false)] {
+            let allow = [(A_ID, public_of(PRIV_A)), (B_ID, public_of(PRIV_B))];
+            let mut a = node(PRIV_A, A_ID, &allow, 0xA1);
+            let mut b = node(PRIV_B, B_ID, &allow, 0xB2);
+            let acts = a.initiate(B_ID, 0);
+            assert_eq!(pump(&mut a, &mut b, acts), (true, true));
+
+            // A restarts and re-handshakes; B parks the new session as pending
+            // (installed at now_ns = 0, which is what `on_message_all` feeds).
+            let mut a2 = node(PRIV_A, A_ID, &allow, 0xDD);
+            let acts = a2.initiate(B_ID, 0);
+            let _ = a2.on_message_all(&mut b, acts);
+
+            b.tick(elapsed);
+
+            let mut d = sealed_test_datagram();
+            a2.seal_pairwise(B_ID, &mut d, 1).unwrap();
+            assert_eq!(
+                b.open_pairwise(A_ID, &mut d).is_ok(),
+                opens,
+                "pending session at {elapsed} ns of a {PENDING_TTL_NS} ns TTL"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_session_is_flagged_and_its_promotion_announced() {
+        // `Established` alone cannot tell a caller whether the seal path
+        // actually switched, and the two answers can differ for as long as the
+        // pending TTL. The flag makes that visible at the destructuring site;
+        // the re-announcement on promotion gives the caller the later edge.
+        let allow = [(A_ID, public_of(PRIV_A)), (B_ID, public_of(PRIV_B))];
+        let mut a = node(PRIV_A, A_ID, &allow, 0xA1);
+        let mut b = node(PRIV_B, B_ID, &allow, 0xB2);
+
+        let acts = a.initiate(B_ID, 0);
+        for act in a.on_message_all(&mut b, acts) {
+            if let HandshakeAction::Established { confirmed, .. } = act {
+                assert!(confirmed, "a first session is in force immediately");
+            }
+        }
+
+        let mut a2 = node(PRIV_A, A_ID, &allow, 0xDD);
+        let acts = a2.initiate(B_ID, 0);
+        let mut flags = Vec::new();
+        for act in a2.on_message_all(&mut b, acts) {
+            if let HandshakeAction::Established {
+                peer, confirmed, ..
+            } = act
+                && peer == A_ID
+            {
+                flags.push(confirmed);
+            }
+        }
+        assert_eq!(
+            flags,
+            vec![false],
+            "B parked the restarted peer's session: NOT in force"
+        );
+        assert_eq!(
+            b.peer_boot_salt(A_ID),
+            Some(a.boot_salt()),
+            "and the salt in force is still the old one"
+        );
+
+        // A2 proves it is using the new session.
+        assert_traffic_flows(&mut a2, &mut b, 1);
+        let announced: Vec<_> = b
+            .tick(1_000_000_000)
+            .into_iter()
+            .filter_map(|act| match act {
+                HandshakeAction::Established {
+                    peer,
+                    boot_salt,
+                    confirmed,
+                } if peer == A_ID => Some((boot_salt, confirmed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(announced, vec![(a2.boot_salt(), true)], "promotion announced");
+        assert_eq!(b.peer_boot_salt(A_ID), Some(a2.boot_salt()));
+        // Announced exactly once, not on every subsequent tick.
+        assert!(b.tick(2_000_000_000).is_empty());
     }
 
     #[test]
@@ -1285,6 +1562,89 @@ mod tests {
         let (a_up, b_up) = pump(&mut a, &mut b, acts);
         assert!(a_up && b_up, "a forged message 2 must not cancel the link");
         assert_traffic_flows(&mut a, &mut b, 1);
+    }
+
+    #[test]
+    fn a_spoofed_message_one_cannot_cancel_an_in_flight_handshake() {
+        // The mirror of `a_forged_message_two_cannot_cancel_an_in_flight_handshake`,
+        // on the `on_init` side. The simultaneous-open tiebreak must not act on
+        // UNAUTHENTICATED bytes: B is the higher id, so the rule says "drop ours
+        // and respond" — and if that runs before the message is authenticated,
+        // anyone who can put 116 bytes on the port with the source id of an
+        // allowlisted lower-id peer destroys B's in-flight handshake for free,
+        // no key material required. Sustained, that keeps a well-defined half
+        // of every peer pair permanently down, which in a Raft cluster is a
+        // quorum problem.
+        let (mut a, mut b) = authorized_pair();
+        let acts = b.initiate(A_ID, 0);
+
+        // Sustained, in the shape of the reviewer's probe: 20 rounds of spray.
+        for round in 0..20u64 {
+            for junk in [
+                vec![0u8; 116],
+                vec![0xFF; 116],
+                vec![],
+                vec![0xAB; 48],
+                vec![0x5A; 1500],
+            ] {
+                let out = b.on_message(A_ID, DGRAM_KIND_HS_INIT, &junk, round);
+                assert!(
+                    !out.iter()
+                        .any(|act| matches!(act, HandshakeAction::Send { .. })),
+                    "garbage must not be answered"
+                );
+                assert!(
+                    !out.iter()
+                        .any(|act| matches!(act, HandshakeAction::Established { .. })),
+                    "garbage must not establish"
+                );
+            }
+        }
+
+        // The attempt is still there to retransmit — the observable the probe
+        // watched: under the defect, `tick` had nothing left to resend.
+        assert!(
+            b.tick(HS_RETRY_MAX_NS * 2).iter().any(|act| matches!(
+                act,
+                HandshakeAction::Send { to, kind, .. }
+                    if *to == A_ID && *kind == DGRAM_KIND_HS_INIT
+            )),
+            "the in-flight handshake survived the spray"
+        );
+
+        // B's handshake is still in flight, so the REAL peer still completes it.
+        let (a_up, b_up) = pump(&mut a, &mut b, acts);
+        assert!(
+            a_up && b_up,
+            "a spoofed message 1 must not cancel our in-flight handshake"
+        );
+        assert_traffic_flows(&mut b, &mut a, 1);
+    }
+
+    #[test]
+    fn a_peer_not_yet_in_the_allowlist_is_retried_on_the_backoff_clock() {
+        // UC's agents busy-spin — that is the core architectural choice of the
+        // whole system — so an ungated failure path costs a `Failed` action and
+        // a heap allocation PER POLL ITERATION, not per second. The retry
+        // clock must gate the failure path exactly as it gates the retransmit.
+        let mut a = node(PRIV_A, A_ID, &[(A_ID, public_of(PRIV_A))], 0xA1);
+        assert!(matches!(
+            a.initiate(B_ID, 0).as_slice(),
+            [HandshakeAction::Failed { .. }]
+        ));
+
+        for now in [1, 1_000, 1_000_000, HS_RETRY_BASE_NS - 1] {
+            assert!(
+                a.tick(now).is_empty(),
+                "no work at all before the backoff elapses (poll at {now} ns)"
+            );
+        }
+        assert_eq!(
+            a.tick(HS_RETRY_BASE_NS).len(),
+            1,
+            "exactly one retry at the deadline"
+        );
+        assert!(a.tick(HS_RETRY_BASE_NS + 1).is_empty(), "and then quiet again");
     }
 
     #[test]
