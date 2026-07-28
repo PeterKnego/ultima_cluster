@@ -29,6 +29,7 @@ pub mod group;
 pub mod handshake;
 pub mod identity;
 pub mod replay;
+pub mod rotation;
 pub mod schedule;
 pub mod seal;
 
