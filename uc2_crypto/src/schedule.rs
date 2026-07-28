@@ -45,8 +45,26 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// The cluster-wide group key for one epoch. Zeroized on drop — this is
 /// long-lived key material shared by the whole cluster, held in the
 /// `KeySchedule` for as long as an epoch stays live.
+///
+/// The inner array is deliberately private: `derive(Zeroize, ZeroizeOnDrop)`
+/// only scrubs the wrapper's own storage, so a `pub` field on a `Copy` array
+/// would let any caller write `let raw = group_key.0;` and hold an
+/// un-zeroized copy of live cluster key material forever — the same hazard
+/// `identity.rs` documents (and was fixed for, commit 818eecb) for
+/// `Identity::private`. Construct via [`GroupKey::new`]; read via
+/// [`GroupKey::as_bytes`].
 #[derive(Zeroize, ZeroizeOnDrop)]
-pub struct GroupKey(pub [u8; 32]);
+pub struct GroupKey([u8; 32]);
+
+impl GroupKey {
+    pub fn new(bytes: [u8; 32]) -> Self {
+        GroupKey(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
 
 /// A random value chosen once per process start and mixed into
 /// [`derive_send_key`]. Not secret on its own (it is not key material by
@@ -56,7 +74,7 @@ pub struct GroupKey(pub [u8; 32]);
 pub struct BootSalt(pub [u8; 16]);
 
 /// Derives the per-sender-per-boot sealing key: `HKDF-SHA256` with `salt`
-/// as the HKDF salt, `group.0` as the input keying material, and
+/// as the HKDF salt, `group`'s bytes as the input keying material, and
 /// `b"uc2/send" ‖ sender.to_le_bytes()` as the info string, expanded to 32
 /// bytes.
 ///
@@ -67,12 +85,22 @@ pub struct BootSalt(pub [u8; 16]);
 /// can never repeat a nonce under a key still live for the previous boot).
 /// Deterministic in all three inputs, so every peer that holds the same
 /// group key derives the same sender's key identically.
+///
+/// # Callers must
+///
+/// This returns bare, un-wrapped key material — the signature is pinned by
+/// the design for T5/T9 to consume directly. The raw `[u8; 32]` must be
+/// wrapped into a zeroizing type (e.g. `Zeroizing<[u8; 32]>`, or moved
+/// straight into an AEAD key type) in the SAME statement that calls this
+/// function, never bound to a bare intermediate (`let raw = derive_send_key(...)`)
+/// that outlives the wrap — that intermediate is exactly the un-scrubbed
+/// copy this crate's zeroize discipline exists to prevent.
 pub fn derive_send_key(group: &GroupKey, sender: NodeId, salt: &BootSalt) -> [u8; 32] {
     let mut info = [0u8; 8 + 4];
     info[..8].copy_from_slice(b"uc2/send");
     info[8..].copy_from_slice(&sender.to_le_bytes());
 
-    let hkdf = Hkdf::<Sha256>::new(Some(&salt.0), &group.0);
+    let hkdf = Hkdf::<Sha256>::new(Some(&salt.0), group.as_bytes());
     let mut out = [0u8; 32];
     hkdf.expand(&info, &mut out)
         .expect("32-byte output is within HKDF-SHA256's valid expand length");
