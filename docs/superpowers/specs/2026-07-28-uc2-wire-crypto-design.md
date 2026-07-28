@@ -206,14 +206,45 @@ in a key and `uc2ctl add-learner` works without restarting anything.
 
 ### Handshake
 
-**Noise via `snow`**, not a hand-rolled AKE. The sketch this design started from
-— signed ephemeral keys, transcript binding, lower-id-wins on simultaneous open
-— is Noise `IK`/`XX` with worse review; `snow` is pure Rust over the same
-primitives. UC keeps ownership of what Noise does not cover: the group key
-schedule, rotation policy, the datagram envelope, and the replay window.
+**Noise `IK` via `snow`**, not a hand-rolled AKE. The sketch this design started
+from — signed ephemeral keys, transcript binding, lower-id-wins on simultaneous
+open — is Noise with worse review; `snow` is pure Rust over the same primitives.
+UC keeps ownership of what Noise does not cover: the group key schedule, rotation
+policy, the datagram envelope, and the replay window.
+
+`IK` is the right pattern because its precondition — *the initiator already knows
+the responder's static public key* — is exactly what the allowlist is. That gives
+1-RTT establishment. `XX` exists for peers that must discover each other's keys
+at runtime, which UC's peers never do.
 
 The handshake carries the peer's `boot_salt` and rides the same socket under new
 datagram kinds (18/19 handshake, 20 group-key delivery; 16/17 are M7 admin).
+
+#### Rejected identity alternatives (decided 2026-07-28)
+
+Recorded so the reasoning survives, since each has a plausible future that would
+reopen it:
+
+- **A separate Ed25519 signing identity over the X25519 static key.** Rejected as
+  a second identity to distribute and rotate for no gain the pattern does not
+  already give. It earns its place on the day node identity must be
+  **non-exportable** — an Ed25519 key can live in an HSM or agent that will sign
+  but will never perform X25519 DH, whereas a Noise static key must be in process
+  memory to be used. Revisit *as* that project, not speculatively.
+- **A CA and per-node certificates instead of an allowlist.** The operationally
+  strongest alternative, and the one that interacts with M7: an allowlist costs
+  O(N) key distribution per membership change (the joiner's key to every peer,
+  every peer's key to the joiner), while a CA costs one public key distributed
+  once. At 3–5 nodes the allowlist wins on simplicity. If the deferred
+  cross-region learner story ever means dozens of learners, this is the thing to
+  reconsider first — certs scale where allowlists do not.
+- **`IKpsk2` (a cluster-wide PSK mixed into the handshake).** Would make joining
+  require **two independent secrets** — a node's private key *and* the cluster
+  PSK — so a stolen key file alone is insufficient. Real defense-in-depth given
+  that key files sit on disk on an untrusted network. Rejected for M8 on operator
+  cost: another secret to distribute, and rotating it is a flag day. The upgrade
+  path is cheap (a pattern string change plus PSK plumbing) if the posture later
+  warrants it.
 
 **No wall-clock dependency**: freshness comes from random nonces, never
 timestamps. Deliberate — the M7 fleet gate's first run failed largely on ssh
@@ -305,7 +336,10 @@ Stated, not hidden:
    pairwise-sealed kinds. This is inherent to seal-once-send-to-many and is what
    ATS's stream key accepts too; the alternative is N seals per fan-out.
 4. **No compromised-host story.** A host with the identity private key is a
-   cluster member by definition.
+   cluster member by definition. Under plain `IK` the key file **is** the whole
+   credential — there is no second factor — so file permissions and host
+   security carry that weight. `IKpsk2` (§5) is the designed-in upgrade if that
+   becomes unacceptable.
 
 ## 8. Testing and gates
 
