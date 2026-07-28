@@ -1,0 +1,546 @@
+//! Group-key distribution and activation (spec §5 "Group key lifecycle").
+//!
+//! [`GroupPlane`] is the **leader's** minting/delivery/ack bookkeeping AND
+//! the **follower's** receive/install/ack-back logic — one type plays both
+//! roles depending on which methods the node layer calls, exactly like
+//! [`crate::handshake::Peers`] plays both initiator and responder. It never
+//! touches a socket or a pairwise key: it emits [`HandshakeAction`]s
+//! describing what to send, and the node layer (T12) seals the `HS_KEY`
+//! body over the peer's already-established pairwise channel and sends it.
+//! That split — no sockets, no clock reads (`now_ns` is always explicit) —
+//! is what makes this unit-testable and, later, `uc2_sim`-drivable.
+//!
+//! # The liveness trap
+//!
+//! The leader may only seal fan-out under a new epoch once peers can
+//! actually open it, but it must never let a dead peer block replication
+//! forever. [`GroupPlane::sealing_epoch`] resolves this: an epoch is safe to
+//! seal under once every peer named in the [`GroupPlane::mint`] call has
+//! acked it, **or** [`ACTIVATION_TIMEOUT_NS`] has elapsed since minting,
+//! whichever comes first. A peer that missed the key simply fails to open
+//! group-sealed datagrams and recovers through the system's existing NAK
+//! repair path once `HS_KEY` lands on it (a later `tick`/retry, not
+//! anything this module invents) — no new recovery mechanism here, by
+//! design.
+//!
+//! # Epoch bookkeeping: mint-time reconciliation, not stored derived state
+//!
+//! Exactly one epoch is "pending" (minted, not yet folded into history) at a
+//! time. [`GroupPlane::sealing_epoch`] is a pure function of the CURRENT
+//! pending epoch's ack/timeout state plus `active_epoch` — the last epoch
+//! that was ever seen to satisfy the activation rule. When [`GroupPlane::
+//! mint`] is called again, it first reconciles: if the outgoing pending
+//! epoch had already activated (by the SAME rule, evaluated at the new
+//! mint's `now_ns`), it is folded into `active_epoch` before being replaced.
+//! This is what makes `sealing_epoch` correctly return the OLD epoch while a
+//! freshly-minted one is still waiting on acks, rather than momentarily
+//! going back to `None` — a rotation must never make the leader stop
+//! sealing group traffic altogether.
+//!
+//! An outgoing pending epoch that had NOT yet activated when superseded is
+//! simply dropped — it never got to be "the" active epoch, and superseding
+//! it (a second mint before the first settled) is not a case this design
+//! needs to preserve history for; `active_epoch` still holds whatever the
+//! last real activation was.
+//!
+//! # Wire format for the `HS_KEY` body (opaque to `uc_protocol`, like
+//! `handshake.rs`'s handshake payload)
+//!
+//! `DGRAM_KIND_HS_KEY` (20) carries two different message shapes over the
+//! SAME kind — delivery (leader -> peer) and ack (peer -> leader) — because
+//! both ride the pairwise channel the handshake already authenticated, and
+//! giving them their own kind would cost a second demux constant for no
+//! safety gain:
+//!
+//! ```text
+//! delivery: [ 1B type=0 ][ 2B epoch LE ][ 32B group key ]   (35 bytes)
+//! ack:      [ 1B type=1 ][ 2B epoch LE ]                    ( 3 bytes)
+//! ```
+//!
+//! [`GroupPlane::on_key_message`] is fed bytes that arrived over the
+//! network (already opened by the pairwise session, but their CONTENT is
+//! still an unauthenticated claim as far as this module is concerned) — it
+//! never panics and never installs anything from a message that fails the
+//! type tag or exact-length check.
+//!
+//! # Key material handled here
+//!
+//! [`GroupPlane::mint`] is the one place in this crate where fresh entropy
+//! is legitimate. The 32 random bytes are written straight into a
+//! `Zeroizing`-wrapped buffer (never a bare array) before being handed to
+//! [`GroupKey::new`] for the schedule and copied into the delivery body for
+//! the wire — the same "no unwrapped copy of live key material outlives a
+//! statement" discipline `identity.rs`/`handshake.rs` document. The body
+//! `Vec<u8>` DOES carry the plaintext key — that is unavoidable: it is the
+//! very thing being delivered, sealed by the caller over the pairwise
+//! channel before it ever reaches a socket.
+
+use crate::handshake::HandshakeAction;
+#[cfg(test)]
+use crate::schedule::epoch_is_newer;
+use crate::schedule::{GroupKey, KeySchedule};
+use crate::NodeId;
+use rand::rngs::OsRng;
+use rand::TryRngCore;
+use std::collections::HashSet;
+use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
+
+/// How long the leader waits for every reachable peer to ack a freshly
+/// minted epoch before sealing under it anyway. The liveness half of the
+/// activation rule — see the module docs.
+pub const ACTIVATION_TIMEOUT_NS: u64 = 2_000_000_000;
+
+const MSG_KEY: u8 = 0;
+const MSG_ACK: u8 = 1;
+/// `type(1) + epoch(2) + key(32)`.
+const KEY_MSG_LEN: usize = 1 + 2 + 32;
+/// `type(1) + epoch(2)`.
+const ACK_MSG_LEN: usize = 1 + 2;
+
+/// One in-flight mint: the epoch, when it was minted, the peer set it must
+/// clear to activate by consensus (rather than by timeout), and who has
+/// acked so far.
+struct PendingEpoch {
+    epoch: u16,
+    minted_at: u64,
+    peers: Vec<NodeId>,
+    acked: HashSet<NodeId>,
+}
+
+/// The group-key mint/delivery/ack/activation state machine. See the module
+/// docs for the split between this and the node layer.
+pub struct GroupPlane {
+    self_id: NodeId,
+    schedule: KeySchedule,
+    /// Monotonically bumped on every [`GroupPlane::mint`] call, independent
+    /// of whether the PREVIOUS mint ever activated — epoch numbers must
+    /// advance across mints regardless of ack/timeout outcome, so a caller
+    /// can always tell "later minted" from "earlier minted" via
+    /// [`crate::schedule::epoch_is_newer`].
+    next_epoch: u16,
+    /// The last epoch this plane has ever seen satisfy the activation rule.
+    /// `None` until the very first mint activates.
+    active_epoch: Option<u16>,
+    pending: Option<PendingEpoch>,
+}
+
+impl GroupPlane {
+    pub fn new(self_id: NodeId) -> GroupPlane {
+        GroupPlane {
+            self_id,
+            schedule: KeySchedule::new(),
+            next_epoch: 0,
+            active_epoch: None,
+            pending: None,
+        }
+    }
+
+    pub fn self_id(&self) -> NodeId {
+        self.self_id
+    }
+
+    pub fn schedule(&self) -> &KeySchedule {
+        &self.schedule
+    }
+
+    /// Mints a fresh group-key epoch, installs it into the schedule (so it
+    /// is immediately OPENABLE — installation is not gated on activation;
+    /// only SEALING is, via [`GroupPlane::sealing_epoch`]), and emits one
+    /// `HS_KEY` delivery per peer in `peers` for the caller to seal over
+    /// that peer's pairwise channel and send.
+    ///
+    /// Before minting, reconciles the outgoing pending epoch (if any) into
+    /// `active_epoch` if it had already satisfied the activation rule as of
+    /// `now_ns` — see the module docs. This is what lets `sealing_epoch`
+    /// keep returning a still-good older epoch while the new one is
+    /// outstanding, instead of momentarily going back to `None`.
+    pub fn mint(&mut self, peers: &[NodeId], now_ns: u64) -> (u16, Vec<HandshakeAction>) {
+        self.fold_pending_if_activated(now_ns);
+
+        let epoch = self.next_epoch;
+        self.next_epoch = self.next_epoch.wrapping_add(1);
+
+        // Written straight into the zeroizing wrapper: no bare `[u8; 32]`
+        // ever holds the fresh key, matching `identity.rs`'s
+        // read-straight-into-Zeroizing discipline for the private key file.
+        let mut key_bytes = zeroize::Zeroizing::new([0u8; 32]);
+        OsRng
+            .try_fill_bytes(&mut *key_bytes)
+            .expect("the OS RNG is unavailable");
+
+        self.schedule.install(epoch, GroupKey::new(*key_bytes));
+
+        let actions = peers
+            .iter()
+            .map(|&peer| HandshakeAction::Send {
+                to: peer,
+                kind: DGRAM_KIND_HS_KEY,
+                body: encode_key_delivery(epoch, &key_bytes),
+            })
+            .collect();
+
+        self.pending = Some(PendingEpoch {
+            epoch,
+            minted_at: now_ns,
+            peers: peers.to_vec(),
+            acked: HashSet::new(),
+        });
+
+        (epoch, actions)
+    }
+
+    /// Records that `from` acked `epoch`. A no-op if `epoch` is not the
+    /// current pending epoch (a late ack for a superseded mint, or a
+    /// forged/garbled epoch number) or if `from` was not one of the peers
+    /// [`GroupPlane::mint`] was told to deliver to — an ack from an
+    /// unexpected peer must not let a wrong count-based activation check
+    /// slip past the actual peer-set requirement.
+    pub fn on_ack(&mut self, from: NodeId, epoch: u16) {
+        if let Some(pending) = &mut self.pending
+            && pending.epoch == epoch
+            && pending.peers.contains(&from)
+        {
+            pending.acked.insert(from);
+        }
+    }
+
+    /// The epoch it is safe to SEAL new group traffic under, if any: the
+    /// pending epoch once it has activated (every named peer acked, or the
+    /// activation timeout elapsed), else the last epoch that ever
+    /// activated, else `None` before anything ever has.
+    ///
+    /// Pure: does not mutate `pending`/`active_epoch` itself (that
+    /// reconciliation happens in [`GroupPlane::mint`]) — calling this
+    /// repeatedly with different `now_ns` values, including ones the leader
+    /// never explicitly re-mints against, always yields the answer that
+    /// `now_ns` implies.
+    pub fn sealing_epoch(&self, now_ns: u64) -> Option<u16> {
+        if let Some(pending) = &self.pending
+            && Self::is_activated(pending, now_ns)
+        {
+            return Some(pending.epoch);
+        }
+        self.active_epoch
+    }
+
+    /// Feeds in a received `HS_KEY` body (kind 20), already opened by the
+    /// pairwise session — `from` is therefore an authenticated sender, but
+    /// the BODY's content is still parsed as untrusted bytes: a length or
+    /// type-tag mismatch is refused without installing or acking anything,
+    /// never a panic.
+    ///
+    /// A well-formed delivery (`MSG_KEY`) installs the epoch into the
+    /// schedule (making it immediately openable) and returns an action to
+    /// send an ack back to `from`. A well-formed ack (`MSG_ACK`) is folded
+    /// straight into [`GroupPlane::on_ack`] and returns no actions — acks
+    /// never need a reply.
+    pub fn on_key_message(&mut self, from: NodeId, body: &[u8]) -> Vec<HandshakeAction> {
+        match body.first().copied() {
+            Some(MSG_KEY) if body.len() == KEY_MSG_LEN => {
+                let epoch = u16::from_le_bytes([body[1], body[2]]);
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&body[3..KEY_MSG_LEN]);
+                self.schedule.install(epoch, GroupKey::new(key));
+                vec![HandshakeAction::Send {
+                    to: from,
+                    kind: DGRAM_KIND_HS_KEY,
+                    body: encode_ack(epoch),
+                }]
+            }
+            Some(MSG_ACK) if body.len() == ACK_MSG_LEN => {
+                let epoch = u16::from_le_bytes([body[1], body[2]]);
+                self.on_ack(from, epoch);
+                Vec::new()
+            }
+            _ => vec![HandshakeAction::Failed {
+                peer: from,
+                reason: "malformed group-key message",
+            }],
+        }
+    }
+
+    fn fold_pending_if_activated(&mut self, now_ns: u64) {
+        if let Some(pending) = self.pending.take()
+            && Self::is_activated(&pending, now_ns)
+        {
+            self.active_epoch = Some(pending.epoch);
+        }
+        // Else: superseded before it ever activated. Simply dropped —
+        // `active_epoch` still holds whatever the last real activation
+        // was (or `None`, if there never was one).
+    }
+
+    /// The activation rule itself: every peer named at mint time has acked,
+    /// OR the bounded timeout has elapsed since minting. `all()` over an
+    /// empty peer set is vacuously `true`, so a mint with no peers (e.g. a
+    /// single-node cluster) activates immediately without a special case.
+    fn is_activated(pending: &PendingEpoch, now_ns: u64) -> bool {
+        let all_acked = pending.peers.iter().all(|p| pending.acked.contains(p));
+        let timed_out = now_ns.saturating_sub(pending.minted_at) > ACTIVATION_TIMEOUT_NS;
+        all_acked || timed_out
+    }
+}
+
+fn encode_key_delivery(epoch: u16, key: &[u8; 32]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(KEY_MSG_LEN);
+    body.push(MSG_KEY);
+    body.extend_from_slice(&epoch.to_le_bytes());
+    body.extend_from_slice(key);
+    body
+}
+
+fn encode_ack(epoch: u16) -> Vec<u8> {
+    let mut body = Vec::with_capacity(ACK_MSG_LEN);
+    body.push(MSG_ACK);
+    body.extend_from_slice(&epoch.to_le_bytes());
+    body
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_minted_epoch_only_activates_once_every_peer_acks() {
+        let mut g = GroupPlane::new(1);
+        let (epoch, actions) = g.mint(&[2, 3], 0);
+        assert_eq!(actions.len(), 2, "one HS_KEY per peer");
+        assert_eq!(g.sealing_epoch(0), None, "must not seal under an unacked epoch");
+        g.on_ack(2, epoch);
+        assert_eq!(g.sealing_epoch(0), None, "one ack is not enough");
+        g.on_ack(3, epoch);
+        assert_eq!(g.sealing_epoch(0), Some(epoch));
+    }
+
+    #[test]
+    fn a_dead_peer_cannot_block_replication_forever() {
+        // The liveness trap: peer 3 never acks. After the activation timeout we
+        // seal anyway; peer 3 recovers via the existing NAK path once it gets
+        // the key.
+        let mut g = GroupPlane::new(1);
+        let (epoch, _) = g.mint(&[2, 3], 0);
+        g.on_ack(2, epoch);
+        assert_eq!(g.sealing_epoch(ACTIVATION_TIMEOUT_NS - 1), None);
+        assert_eq!(g.sealing_epoch(ACTIVATION_TIMEOUT_NS + 1), Some(epoch));
+    }
+
+    #[test]
+    fn the_previous_epoch_stays_openable_during_the_overlap() {
+        let mut g = GroupPlane::new(1);
+        let (e1, _) = g.mint(&[2], 0);
+        g.on_ack(2, e1);
+        let (e2, _) = g.mint(&[2], 1_000);
+        g.on_ack(2, e2);
+        assert!(g.schedule().get(e1).is_some(), "in-flight e1 datagrams still open");
+        assert!(g.schedule().get(e2).is_some());
+    }
+
+    #[test]
+    fn epochs_advance_monotonically_across_mints() {
+        let mut g = GroupPlane::new(1);
+        let (e1, _) = g.mint(&[2], 0);
+        let (e2, _) = g.mint(&[2], 1);
+        assert!(epoch_is_newer(e2, e1));
+    }
+
+    #[test]
+    fn a_malformed_key_message_is_refused_without_installing_anything() {
+        let mut g = GroupPlane::new(2);
+        for body in [vec![], vec![0u8; 3], vec![0xFF; 200]] {
+            let _ = g.on_key_message(1, &body);
+        }
+        assert!(g.schedule().current().is_none(), "nothing was installed from garbage");
+    }
+
+    // -- Beyond the mandated five. Every prior task in this plan shipped
+    // mandated tests that a wrong implementation passed anyway (T4's
+    // word-boundary shift, T5's no-encryption/AAD-truncation mutants, T6's
+    // simultaneous-open-onto-two-sessions mutant). The five above observe
+    // only the two leader-side entry points (`mint`/`on_ack`) and the
+    // follower-side refusal path; they never exercise `on_key_message`'s
+    // success path, never check WHO an ack must come from, never check that
+    // a stale-epoch ack is ignored, and never pin the exact activation-rule
+    // reconciliation across a second mint. Each test below is paired with
+    // the specific wrong implementation it was written to kill (see the
+    // task report for the actual red-then-green transcripts).
+
+    #[test]
+    fn a_well_formed_delivery_installs_the_key_and_acks_back_to_the_sender() {
+        // Exercises on_key_message's SUCCESS path end to end: this is the
+        // one the five mandated tests never touch (they only feed it
+        // garbage). A leader mints; a follower processes the delivery
+        // action; the follower's schedule must hold the SAME key bytes
+        // (not merely "some" key — an off-by-one in the 1/2/32 byte layout,
+        // e.g. swapping the epoch and type-tag bytes, or reading the key
+        // from the wrong offset, would still "install something" and pass
+        // the mandated garbage test while shipping a peer that can never
+        // open real traffic).
+        let mut leader = GroupPlane::new(1);
+        let (epoch, actions) = leader.mint(&[2], 0);
+        let HandshakeAction::Send { to, kind, body } = &actions[0] else {
+            panic!("mint must emit a Send action");
+        };
+        assert_eq!(*to, 2);
+        assert_eq!(*kind, DGRAM_KIND_HS_KEY);
+
+        let mut follower = GroupPlane::new(2);
+        let reply = follower.on_key_message(1, body);
+        assert_eq!(
+            follower.schedule().get(epoch).map(|k| *k.as_bytes()),
+            leader.schedule().get(epoch).map(|k| *k.as_bytes()),
+            "the follower must install the EXACT bytes the leader minted"
+        );
+
+        // The reply must be the ack, addressed back to the leader, and
+        // feeding it to the leader must be what actually activates the
+        // epoch — not merely "on_key_message returned something".
+        assert_eq!(reply.len(), 1);
+        let HandshakeAction::Send {
+            to: ack_to,
+            kind: ack_kind,
+            body: ack_body,
+        } = &reply[0]
+        else {
+            panic!("a well-formed delivery must ack back")
+        };
+        assert_eq!(*ack_to, 1);
+        assert_eq!(*ack_kind, DGRAM_KIND_HS_KEY);
+
+        assert_eq!(leader.sealing_epoch(0), None, "not yet fed the ack");
+        let ack_actions = leader.on_key_message(2, ack_body);
+        assert!(ack_actions.is_empty(), "an ack needs no reply");
+        assert_eq!(
+            leader.sealing_epoch(0),
+            Some(epoch),
+            "on_key_message's ack path must actually drive on_ack, not merely parse"
+        );
+    }
+
+    #[test]
+    fn an_ack_from_a_peer_outside_the_mint_set_does_not_count() {
+        // A wrong implementation might activate once it has seen
+        // `peers.len()` acks from ANYONE, rather than acks from every
+        // NAMED peer specifically. Peer 9 (never in the mint list, e.g. a
+        // stale/forged sender id) acking twice must not substitute for
+        // peer 3's real ack.
+        let mut g = GroupPlane::new(1);
+        let (epoch, _) = g.mint(&[2, 3], 0);
+        g.on_ack(2, epoch);
+        g.on_ack(9, epoch);
+        g.on_ack(9, epoch);
+        assert_eq!(
+            g.sealing_epoch(0),
+            None,
+            "an ack from a peer outside the mint set must not count toward activation"
+        );
+        g.on_ack(3, epoch);
+        assert_eq!(g.sealing_epoch(0), Some(epoch));
+    }
+
+    #[test]
+    fn an_ack_for_a_stale_epoch_does_not_activate_the_current_one() {
+        // A wrong implementation might key acks only by peer id (dropping
+        // the epoch check, or comparing against the WRONG epoch), so a
+        // leftover/delayed ack for the epoch that was just superseded
+        // wrongly counts toward the new one. Real scenario: peer 3's ack
+        // for e1 is delayed in flight; by the time it arrives the leader
+        // has already minted e2 (e.g. a fresh election). It must not
+        // silently activate e2.
+        let mut g = GroupPlane::new(1);
+        let (e1, _) = g.mint(&[2, 3], 0);
+        g.on_ack(3, e1); // peer 3 acks e1 promptly, well before it is superseded
+        let (e2, _) = g.mint(&[2, 3], 1_000);
+        assert_ne!(e1, e2);
+        g.on_ack(2, e2); // peer 2 acks the NEW epoch
+        // A duplicate/delayed ack for the OLD epoch arrives from peer 3 after
+        // e2 was minted. If it were wrongly counted against the current
+        // pending epoch, this alone would complete e2's ack set (2 and 3)
+        // and prematurely activate it.
+        g.on_ack(3, e1);
+        assert_eq!(
+            g.sealing_epoch(1_000),
+            None,
+            "a stale ack tagged with the OLD epoch must not complete the NEW epoch's ack set"
+        );
+        g.on_ack(3, e2);
+        assert_eq!(g.sealing_epoch(1_000), Some(e2));
+    }
+
+    #[test]
+    fn sealing_epoch_falls_back_to_the_last_activated_epoch_while_a_new_one_is_pending() {
+        // The property the module doc calls out as the whole reason
+        // `mint` reconciles before replacing `pending`: a rotation must
+        // never make the leader go back to sealing NOTHING while the new
+        // epoch's acks are still outstanding. None of the five mandated
+        // tests mint twice with the first one having already fully
+        // activated, so a naive "sealing_epoch only ever looks at
+        // `pending`" implementation (returning `None` the instant a new
+        // mint starts) would still pass all five.
+        let mut g = GroupPlane::new(1);
+        let (e1, _) = g.mint(&[2, 3], 0);
+        g.on_ack(2, e1);
+        g.on_ack(3, e1);
+        assert_eq!(g.sealing_epoch(0), Some(e1));
+
+        // Re-mint with peer 3 unreachable; e2 has not activated yet.
+        let (e2, _) = g.mint(&[2, 3], 1_000);
+        g.on_ack(2, e2);
+        assert_eq!(
+            g.sealing_epoch(1_500),
+            Some(e1),
+            "still sealing under the last GOOD epoch, not None, while e2 awaits peer 3"
+        );
+
+        // Once e2 activates (by ack or timeout), sealing moves onto it.
+        g.on_ack(3, e2);
+        assert_eq!(g.sealing_epoch(1_500), Some(e2));
+    }
+
+    #[test]
+    fn epoch_boundary_exactly_at_the_timeout_has_not_yet_elapsed() {
+        // Pins the boundary the mandated timeout test straddles but never
+        // lands on exactly: the brief's wording is "once now_ns EXCEEDS
+        // minted_at + ACTIVATION_TIMEOUT_NS", i.e. strictly greater. At
+        // exactly the deadline the peer has not yet had the full bounded
+        // window; a `>=` implementation would activate one instant early
+        // and both readings pass the mandated test (which only checks
+        // TIMEOUT-1 and TIMEOUT+1).
+        let mut g = GroupPlane::new(1);
+        let (_, _) = g.mint(&[2], 0);
+        assert_eq!(
+            g.sealing_epoch(ACTIVATION_TIMEOUT_NS),
+            None,
+            "exactly at the deadline the bounded window has not yet been exceeded"
+        );
+    }
+
+    #[test]
+    fn a_second_mint_before_the_first_activates_still_advances_and_the_dropped_one_never_activates_later(
+    ) {
+        // If `fold_pending_if_activated` mistakenly evaluated the
+        // OUTGOING pending epoch's timeout against a stale `minted_at`
+        // read after replacement (or leaked the old PendingEpoch into the
+        // new one), a late ack for the abandoned e1 could resurrect it.
+        // Also checks on_key_message's ack path can't resurrect a fully
+        // superseded epoch either.
+        let mut g = GroupPlane::new(1);
+        let (e1, _) = g.mint(&[2, 3], 0);
+        // Neither peer acks e1 before it is superseded well within the
+        // activation timeout.
+        let (e2, _) = g.mint(&[2, 3], 100);
+        assert!(epoch_is_newer(e2, e1));
+        assert_eq!(
+            g.sealing_epoch(100),
+            None,
+            "e1 never activated and is gone; e2 has no acks yet"
+        );
+        let ack_body = encode_ack(e1);
+        let actions = g.on_key_message(2, &ack_body);
+        assert!(actions.is_empty());
+        assert_eq!(
+            g.sealing_epoch(100),
+            None,
+            "a late ack for the abandoned e1 must not resurrect anything"
+        );
+    }
+}

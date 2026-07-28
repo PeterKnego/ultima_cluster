@@ -25,11 +25,14 @@
 //! - `rotation` (T8): key-epoch rotation.
 //! - `transport` (T9): wiring into `uc2_net`.
 
+pub mod group;
 pub mod handshake;
 pub mod identity;
 pub mod replay;
 pub mod schedule;
 pub mod seal;
+
+pub use handshake::HandshakeAction;
 
 /// Node identifier — matches `uc2_consensus::election::NodeId` (both `u32`,
 /// intentionally not re-exported from there: this crate stays dependency-thin
