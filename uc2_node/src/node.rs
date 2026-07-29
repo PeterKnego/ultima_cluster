@@ -1004,10 +1004,6 @@ impl Node {
         self.archive_first_base.load(Ordering::Acquire)
     }
 
-    /// M7 Task 6: the cnc-mirrored `ConfigRecord.config.version` — bumped by
-    /// `Action::ConfigAdopted` (ordinary adoption) AND by the snapshot-install
-    /// fiat path (`maybe_adopt_incoming_snapshot`). Exposed for tests asserting
-    /// a joiner's config converges with the leader's after a snapshot install.
     /// M8 (Task 12): the newest node-to-node group-key epoch this node has
     /// MINTED, or `None` if it never has (a follower that has not yet led, or
     /// a node with [`CryptoConfig::Disabled`]).
@@ -1022,6 +1018,10 @@ impl Node {
         }
     }
 
+    /// M7 Task 6: the cnc-mirrored `ConfigRecord.config.version` — bumped by
+    /// `Action::ConfigAdopted` (ordinary adoption) AND by the snapshot-install
+    /// fiat path (`maybe_adopt_incoming_snapshot`). Exposed for tests asserting
+    /// a joiner's config converges with the leader's after a snapshot install.
     pub fn config_version(&self) -> u64 {
         self.cnc.config_version()
     }
@@ -1691,7 +1691,7 @@ impl Consensus {
         //     session or an in-flight handshake produces no traffic.
         if self.crypto_peers_dirty {
             self.crypto_peers_dirty = false;
-            let peers = self.crypto_peer_set();
+            let peers = self.gossip_targets();
             let acts = self
                 .crypto
                 .as_ref()
@@ -1725,7 +1725,7 @@ impl Consensus {
             let due = self.crypto.as_ref().and_then(|c| c.rotation_due(now));
             match due {
                 Some(reason) => {
-                    let peers = self.crypto_peer_set();
+                    let peers = self.gossip_targets();
                     let minted =
                         self.crypto.as_ref().map(|c| c.mint_group_key(&peers, now));
                     if let Some((epoch, acts)) = minted {
@@ -1771,14 +1771,6 @@ impl Consensus {
         self.crypto_exec(acts);
     }
 
-    /// Every peer this node maintains a pairwise link with and delivers the
-    /// group key to: voting peers plus learners, both minus self. Learners
-    /// are peers like any other here (spec §5) — they replicate the fan-out
-    /// and therefore need the group key.
-    fn crypto_peer_set(&self) -> Vec<NodeId> {
-        self.peers.iter().chain(self.learner_ids.iter()).copied().collect()
-    }
-
     /// Execute the crate's `HandshakeAction`s. The driver never touches a
     /// socket itself — that split is what keeps `Peers`/`GroupPlane` pure and
     /// unit-testable — so this is the one place actions become datagrams.
@@ -1795,11 +1787,17 @@ impl Consensus {
         // enqueue anything, so the real bound is 2 rounds. A cap makes that
         // structural rather than argued.
         let mut budget = 4 * CRYPTO_HS_DRAIN_PER_CYCLE + 64;
-        while let Some(act) = queue.pop_front() {
+        // Checked BEFORE the pop: decrementing after popping would silently
+        // DISCARD the action that exhausted the budget rather than merely
+        // stopping short of the rest of the queue. Only reachable on a mint to
+        // >=320 peers (`MAX_MEMBERS` is 8), and the re-delivery sweep would
+        // cover the loss anyway — but "drop one datagram, at a boundary, on a
+        // path nobody exercises" is exactly the shape of bug that survives
+        // until it matters.
+        while budget > 0
+            && let Some(act) = queue.pop_front()
+        {
             budget -= 1;
-            if budget == 0 {
-                break;
-            }
             match act {
                 HandshakeAction::Send { to, kind, body } => self.crypto_send(to, kind, body),
                 HandshakeAction::Established { peer, boot_salt: _, confirmed: _ } => {
@@ -2491,6 +2489,14 @@ impl Consensus {
     /// maps go to both (learners replicate + reconcile); votes and READ_PROBEs go
     /// to voters only. Collected into an owned Vec so the caller can `self.send`
     /// inside the loop (which needs `&mut self`).
+    ///
+    /// M8 (Task 12) reuses this VERBATIM as the crypto peer set — every peer
+    /// this node keeps a pairwise link with and delivers the group key to.
+    /// That is the same set by definition (spec §5: "learners are peers like
+    /// any other" — they replicate the fan-out, so they need the group key),
+    /// and T12 originally had a character-identical private copy. One
+    /// definition, so a future change to the fan-out cannot leave the crypto
+    /// plane silently keyed for the old one.
     fn gossip_targets(&self) -> Vec<NodeId> {
         self.peers.iter().chain(self.learner_ids.iter()).copied().collect()
     }
@@ -4014,6 +4020,19 @@ mod tests {
         crypto: Option<SharedTransport>,
         peer_override: &[(NodeId, SocketAddr)],
     ) -> Harness {
+        // Reproduce the REAL gap between the two `Instant` origins (T12
+        // review, M4). In `Node::start_with_socket` the `SharedTransport`'s
+        // base is taken as the very first statement and `Consensus::base` only
+        // after `Archive::open` (a journal segment scan plus recovery),
+        // `rederive_term_map` (an archive replay), `NodeState::open`,
+        // `CncPage::create_file`, the log-buffer mmap and every ring — on a
+        // node with a large journal, comfortably seconds apart. A harness that
+        // took both origins microseconds apart would make the one-clock rule
+        // structurally untestable, which is exactly how the first round left
+        // this mutant alive with a story instead of a test.
+        if crypto.is_some() {
+            std::thread::sleep(std::time::Duration::from_nanos(HARNESS_CRYPTO_CLOCK_GAP_NS));
+        }
         let dir = tempfile::tempdir().unwrap();
         let cnc = test_cnc();
         let buffer = Arc::new(LogBuffer::new(
@@ -5288,6 +5307,12 @@ mod tests {
     use uc_protocol::v2::crypto::{DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_RESP};
     use uc_protocol::v2::datagram::read_datagram_header;
 
+    /// The deliberate skew `harness_with_crypto` inserts between the
+    /// `SharedTransport`'s `Instant` origin and the `Consensus` agent's own —
+    /// see that function and
+    /// `the_crypto_plane_reads_the_transports_clock_not_the_consensus_agents`.
+    const HARNESS_CRYPTO_CLOCK_GAP_NS: u64 = 5_000_000;
+
     const T12_PRIV_SELF: [u8; 32] = [0x31; 32];
     const T12_PRIV_PEER: [u8; 32] = [0x32; 32];
 
@@ -5630,6 +5655,57 @@ mod tests {
             allowlist_path: allowlist_path_of(&self_cfg),
             peer2_sock,
         }
+    }
+
+    /// **One clock source** (checklist item 6). Every crypto call must take
+    /// its `now_ns` from `SharedTransport`'s origin — the one the sender and
+    /// receiver agents' halves also read — never from `Consensus::base`.
+    ///
+    /// The first round of this task recorded the corresponding mutant as an
+    /// undetectable survivor, on the reasoning that the two origins are
+    /// "microseconds apart during the same `start_with_socket`". **That was
+    /// wrong.** They bracket the whole of recovery — `Archive::open`,
+    /// `rederive_term_map`, `NodeState::open`, `CncPage::create_file`, the
+    /// log-buffer mmap, the rings — which on a node with a large journal is
+    /// seconds, not microseconds. `harness_with_crypto` now reproduces that
+    /// gap deliberately.
+    ///
+    /// The skew also has the HARMFUL sign, which is why this is a liveness
+    /// bug and not a rounding error: the transport's origin is the EARLIER
+    /// one, so its `now_ns` is the LARGER. A node driving `GroupPlane::mint`
+    /// off `Consensus::now_ns` would stamp `minted_at` in the SMALLER base
+    /// while the sender evaluates `sealing_epoch(shared_now)` in the larger —
+    /// making every freshly minted epoch look as though its
+    /// `ACTIVATION_TIMEOUT_NS` had already elapsed, and sealing under an
+    /// epoch no peer has acked. That is precisely the "activation grace
+    /// elapses instantly" failure the one-clock rule exists to prevent.
+    ///
+    /// Discriminating in both directions: `crypto_now_ns` must TRACK the
+    /// transport's clock (within a millisecond of a direct read) and must
+    /// DIVERGE from the agent's own by at least the injected gap.
+    #[test]
+    fn the_crypto_plane_reads_the_transports_clock_not_the_consensus_agents() {
+        let h = crypto_harness();
+        let transport_now = h.h.cons.crypto.as_ref().unwrap().now_ns();
+        let crypto_now = h.h.cons.crypto_now_ns();
+        let agent_now = h.h.cons.now_ns();
+
+        assert!(
+            crypto_now.abs_diff(transport_now) < 1_000_000,
+            "crypto_now_ns must read the SharedTransport's origin \
+             (transport {transport_now}, crypto_now_ns {crypto_now})"
+        );
+        assert!(
+            crypto_now > agent_now,
+            "the transport's origin is the EARLIER one, so its elapsed reading \
+             must be the LARGER (crypto_now_ns {crypto_now}, Consensus::now_ns {agent_now})"
+        );
+        assert!(
+            crypto_now - agent_now >= HARNESS_CRYPTO_CLOCK_GAP_NS,
+            "the two clocks must differ by at least the construction gap \
+             ({} ns observed, {HARNESS_CRYPTO_CLOCK_GAP_NS} ns injected)",
+            crypto_now - agent_now
+        );
     }
 
     /// Rotation trigger 1: a new leader always mints.

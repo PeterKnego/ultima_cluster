@@ -774,10 +774,23 @@ pub struct SharedTransport {
     boot_salt: BootSalt,
     base: Instant,
     key: Arc<Mutex<KeyState>>,
-    /// **The process's one nonce counter**, shared by EVERY seal path in
-    /// this process — [`SendHalf::seal`] (the sender agent's hot path) and
-    /// [`SharedTransport::seal_pairwise_control`] (the node layer's rare
-    /// control sends) alike.
+    /// **This `SharedTransport` family's one nonce counter**, shared by every
+    /// seal path reachable from it — [`SendHalf::seal`] (the sender agent's
+    /// hot path) and [`SharedTransport::seal_pairwise_control`] (the node
+    /// layer's rare control sends) alike, across every clone.
+    ///
+    /// Scoped to this family, NOT to the OS process, and the distinction is
+    /// load-bearing for whoever reads this next: the legacy [`Transport`]
+    /// facade above still owns a private `counter: u64` of its own. That is
+    /// safe today because `Transport` is never constructed in production
+    /// (only `SharedTransport` is — see the M8 ownership-correction section)
+    /// and a `Transport` built in a test holds its own independently minted
+    /// group key and its own handshake sessions, so its key material is
+    /// disjoint from any `SharedTransport`'s. It is NOT safe to generalize
+    /// this doc into "any sealer in the process draws from here": a future
+    /// task that wires a `Transport` alongside a `SharedTransport` over
+    /// SHARED key material would reintroduce exactly the two-counters-one-key
+    /// hazard this field exists to close.
     ///
     /// Added T12. Before it, the counter lived by value inside `SendHalf`,
     /// which was sound only while `SendHalf` was the sole sealer in the
@@ -1189,8 +1202,10 @@ impl SendHalf {
     }
 }
 
-/// Allocates the next value from the process-wide nonce counter (T12) — see
-/// [`SharedTransport`]'s `counter` field doc. Starts at 1 and never repeats;
+/// Allocates the next value from a [`SharedTransport`] family's shared nonce
+/// counter (T12) — see that struct's `counter` field doc, including why the
+/// legacy [`Transport`]'s own private counter is NOT this one. Starts at 1 and
+/// never repeats within the family;
 /// `Relaxed` suffices because the only requirement is uniqueness, not any
 /// ordering relative to other memory (every `fetch_add` returns a distinct
 /// value regardless of ordering).
@@ -1198,7 +1213,20 @@ impl SendHalf {
 /// A failed seal simply burns its value — see [`Transport::seal`]'s doc;
 /// counters need only never repeat, not be dense.
 fn next_counter(counter: &AtomicU64) -> u64 {
-    counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    let prev = counter.fetch_add(1, Ordering::Relaxed);
+    // `fetch_add` wraps silently where the pre-T12 `self.counter += 1` would
+    // have panicked in a debug build. Named rather than left implicit: a wrap
+    // WOULD repeat every nonce under any key still in use, which is the one
+    // thing this counter exists to prevent. It is unreachable in practice —
+    // 2^64 seals at the M5 gate's 1.64M/s is ~350,000 years, and a process
+    // restart mints a fresh `boot_salt` (a new key space) long before that —
+    // so this is a debug-build tripwire for a logic error that reset or
+    // corrupted the counter, not a runtime guard against honest exhaustion.
+    debug_assert!(
+        prev != u64::MAX,
+        "the nonce counter wrapped: every nonce under the current keys repeats from here"
+    );
+    prev.wrapping_add(1)
 }
 
 /// The receive-side half of the [`SharedTransport`] split — see the module
