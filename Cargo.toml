@@ -72,7 +72,13 @@ hdrhistogram = "7"
 # structurally, per-sender-per-boot, in `uc2_crypto::schedule::derive_send_key`.
 # Pure feature flag: no new crates, no version movement.
 snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-aes-gcm", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom", "std", "risky-raw-split"] }
-aes-gcm = "0.10"
+# `zeroize` scrubs the GHASH subkey; the paired `aes` feature below scrubs the
+# AES round keys (T5 review remedy — AES round keys are invertible back to the
+# 32-byte key, so a core dump / swap read could otherwise recover a live
+# per-sender key). Additive features, no new crates, no version movement:
+# `aes` 0.8.4 feature-unifies with the copy `aes-gcm` already links.
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+aes = { version = "0.8", default-features = false, features = ["zeroize"] }
 hkdf = "0.12"
 sha2 = "0.10"
 # `static_secrets` is required for `StaticSecret` — not in the 2.x default

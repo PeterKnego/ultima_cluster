@@ -10,6 +10,10 @@ authors.workspace = true
 uc_protocol = { path = "../uc_protocol" }
 snow = { workspace = true }
 aes-gcm = { workspace = true }
+# Declared only to force `zeroize` on the `aes` copy `aes-gcm` already links,
+# so the AES round keys are scrubbed on drop (T5 review remedy). Not used
+# directly.
+aes = { workspace = true }
 hkdf = { workspace = true }
 sha2 = { workspace = true }
 x25519-dalek = { workspace = true }
