@@ -3989,7 +3989,7 @@ mod tests {
     /// `trunc_tx` send). The SM is seeded as a healed ex-leader whose durable tail
     /// diverges from the current leader's map, so a term-map delivery truncates.
     fn harness() -> Harness {
-        harness_with_crypto(None, None)
+        harness_with_crypto(None, &[])
     }
 
     /// As [`harness`], but with the crypto plane wired exactly as
@@ -3998,7 +3998,7 @@ mod tests {
     /// handshake can be driven against this node.
     fn harness_with_crypto(
         crypto: Option<SharedTransport>,
-        peer_override: Option<(NodeId, SocketAddr)>,
+        peer_override: &[(NodeId, SocketAddr)],
     ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let cnc = test_cnc();
@@ -4018,9 +4018,9 @@ mod tests {
         let mut id_to_addr = HashMap::new();
         let mut addr_to_id = HashMap::new();
         for (i, id) in members.iter().enumerate() {
-            let addr: SocketAddr = match peer_override {
-                Some((oid, oaddr)) if oid == *id => oaddr,
-                _ => format!("127.0.0.1:{}", 9100 + i).parse().unwrap(),
+            let addr: SocketAddr = match peer_override.iter().find(|(oid, _)| oid == id) {
+                Some((_, oaddr)) => *oaddr,
+                None => format!("127.0.0.1:{}", 9100 + i).parse().unwrap(),
             };
             id_to_addr.insert(*id, addr);
             addr_to_id.insert(addr, *id);
@@ -5356,6 +5356,14 @@ mod tests {
         }
     }
 
+    /// The allowlist path inside an `Enabled` config.
+    fn allowlist_path_of(cfg: &CryptoConfig) -> PathBuf {
+        match cfg {
+            CryptoConfig::Enabled { allowlist_path, .. } => allowlist_path.clone(),
+            CryptoConfig::Disabled => unreachable!("fixture builds an Enabled config"),
+        }
+    }
+
     /// A minimal single-voter `NodeConfig` over a fresh instance dir.
     fn test_node_config() -> (NodeConfig, PathBuf) {
         let dir = crypto_scratch_dir("node-config");
@@ -5471,6 +5479,11 @@ mod tests {
         /// away whatever it was not looking for would silently eat the one a
         /// later assertion depends on (which it did, first time round).
         stash: Vec<Vec<u8>>,
+        /// The node's own allowlist file — an operator's runtime edit.
+        allowlist_path: PathBuf,
+        /// Node 2's address, bound for real but deliberately NOT in the
+        /// allowlist at construction: the M7 "operator drops a key in" case.
+        peer2_sock: UdpSocket,
     }
 
     impl CryptoHarness {
@@ -5583,8 +5596,19 @@ mod tests {
         let peer_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         peer_sock.set_nonblocking(true).unwrap();
         let peer_addr = peer_sock.local_addr().unwrap();
-        let h = harness_with_crypto(Some(crypto), Some((0, peer_addr)));
-        CryptoHarness { h, peer, peer_recv, peer_sock, stash: Vec::new() }
+        let peer2_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer2_sock.set_nonblocking(true).unwrap();
+        let peer2_addr = peer2_sock.local_addr().unwrap();
+        let h = harness_with_crypto(Some(crypto), &[(0, peer_addr), (2, peer2_addr)]);
+        CryptoHarness {
+            h,
+            peer,
+            peer_recv,
+            peer_sock,
+            stash: Vec::new(),
+            allowlist_path: allowlist_path_of(&self_cfg),
+            peer2_sock,
+        }
     }
 
     /// Rotation trigger 1: a new leader always mints.
@@ -5794,6 +5818,65 @@ mod tests {
         // Synchronously, on the adoption itself — not one duty cycle later.
         let after = h.h.cons.crypto_peer_ids().unwrap().snapshot();
         assert_eq!(after.get(&addr), Some(&9), "the joiner is resolvable immediately");
+    }
+
+    /// Spec §5: "an operator drops in a key and `uc2ctl add-learner` works
+    /// without restarting anything." Node 2 is a configured member whose
+    /// public key is NOT in this node's allowlist at boot, so every
+    /// handshake attempt toward it is refused. Appending its key to the
+    /// allowlist file must be enough — no restart, no reconstruction.
+    ///
+    /// Discriminating: the FIRST half asserts refusals are actually
+    /// happening (so the fixture reaches the case at all), and the second
+    /// asserts an `HS_INIT` lands on node 2's real socket afterwards.
+    /// Deleting the duty cycle's `allowlist_reload_if_stale` call fails the
+    /// second half.
+    ///
+    /// Costs ~1s of wall clock by construction: `Allowlist::reload_if_stale`
+    /// refuses to touch the disk more than once per second, and its clock is
+    /// `SharedTransport`'s own `Instant`, which a test cannot advance.
+    #[test]
+    fn an_allowlist_edit_authorizes_a_new_peer_without_a_restart() {
+        let mut h = crypto_harness();
+        h.h.cons.do_work();
+        assert!(
+            h.h.cons.crypto_handshake_failures.load(Ordering::Relaxed) > 0,
+            "node 2 starts unauthorized, so the initiate toward it is refused"
+        );
+        // Nothing HANDSHAKE-shaped goes to an unauthorized peer. (Consensus
+        // traffic does — this duty cycle's Tick starts an election, and
+        // REQUEST_VOTE is not sealed until T17 — so the drain filters by
+        // kind rather than asserting the socket is silent, which it is not.)
+        let mut probe = [0u8; 2048];
+        while let Ok((n, _)) = h.peer2_sock.recv_from(&mut probe) {
+            assert_ne!(
+                read_datagram_header(&probe[..n]).kind,
+                DGRAM_KIND_HS_INIT,
+                "an unauthorized peer must not be handshaked with"
+            );
+        }
+
+        // The operator drops node 2's key in.
+        let peer2_pub = identity_public("allowlist-edit-peer2-pub", [0x37; 32]);
+        let mut text = std::fs::read_to_string(&h.allowlist_path).unwrap();
+        text.push_str(&format!("2 {}\n", b64_32(&peer2_pub)));
+        std::fs::write(&h.allowlist_path, text).unwrap();
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            h.h.cons.do_work();
+            if let Ok((n, _)) = h.peer2_sock.recv_from(&mut probe)
+                && n >= DATAGRAM_HEADER_LEN
+                && read_datagram_header(&probe[..n]).kind == DGRAM_KIND_HS_INIT
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the allowlist edit never took effect — a restart would have been required"
+            );
+            std::thread::yield_now();
+        }
     }
 
     /// A handshake datagram from a source address this node has no `NodeId`
