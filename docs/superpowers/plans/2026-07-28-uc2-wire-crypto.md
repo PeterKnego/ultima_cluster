@@ -1154,6 +1154,17 @@ git commit -m "feat(uc2_crypto): transport facade — scope-by-kind, config, boo
 - Consumes: `uc2_crypto::{Transport, CryptoError}`.
 - Produces: `Sender::with_crypto(...)` builder arm; `SenderConfig::crypto_overhead(&self) -> usize`.
 
+> **OWNERSHIP CORRECTION (ruling 2026-07-29, supersedes this task's original "move `Transport` into `Sender`" shape).**
+> `Sender` and `FollowerReceiver` are **separate agents spawned on separate threads** (`AgentRunner::spawn("uc2-sender"…)` / `("uc2-receiver"…)`), but a single `Transport` owns the handshake sessions, the group-key plane, the nonce counter, and the receive replay windows — which Task 11 needs for `open` and Task 12 needs for minting, rotation, and handshake routing. Moving it by value into `Sender` makes all of that unreachable, and both naive escapes are wrong: a mutex sits on the busy-spin per-datagram path this system's whole architecture exists to avoid, and two `Transport`s means **two boot salts**, so peers would derive the sender's group key from the receiver's advertised salt and group `open` would break cluster-wide.
+>
+> **Required shape: split into a send half and a receive half over shared key state.**
+> - One owner of the **shared key state** — handshake sessions (`Peers`), the group-key plane (`GroupPlane`), and the process's single `boot_salt` — held behind an `Arc`. It is mutated only on handshake and rotation events, which are rare, so a lock there is acceptable.
+> - A **send half** owning the nonce counter and the seal-cipher cache, used only by the sender agent.
+> - A **receive half** owning the replay windows, used only by the receiver agent.
+> - Each agent mutates only its own half, so **nothing new lands on the per-datagram hot path**.
+>
+> **Pick ONE clock source explicitly.** The sender currently feeds `Transport` its own agent's `Instant` base, while Task 12 would supply a different agent's. `GroupPlane::sealing_epoch(now_ns)` compares that against the mint timestamp, so two unrelated bases mean the activation grace period either never elapses or elapses instantly. Thread one base through, or take `now_ns` from a single shared origin.
+
 - [ ] **Step 1: Write the failing test**
 
 ```rust
@@ -1236,6 +1247,9 @@ git commit -m "feat(uc2_net): seal seam in assemble; fan-out still seals once fo
 ---
 
 ### Task 11: `uc2_net` receive seam
+
+> **Read this before you start: cleartext SNAP datagrams arrive ON PURPOSE.**
+> Task 10 left `SNAP_BEGIN`/`SNAP_CHUNK` unsealed because pairwise sealing needs an established handshake session, which nothing drives until Task 12. Task 17 closes this. **Do not let the receive path drop them**, or snapshot transfer wedges with crypto ON and learners, cold nodes, and below-floor recovery can never converge — while equally, do not build a permanent exemption that silently accepts unauthenticated snapshot traffic forever. Route them through a **single, named, temporary allowance** that Task 17 deletes in one edit, and make its name say so.
 
 **Files:**
 - Modify: `uc2_net/src/receiver.rs:582-615` (`do_work`, `on_datagram`), receiver stats struct
@@ -1643,6 +1657,87 @@ Expected: all green. Budget ~10 minutes.
 ```bash
 git add docs uc2_node/examples/m5_gate.rs CLAUDE.md
 git commit -m "docs(m8): gate doc with pre-committed bar, runbook ops section, releases 0.4.0"
+```
+
+---
+
+### Task 17: Seal the remaining pairwise sends in `uc2_net`
+
+**EXECUTION ORDER: runs immediately after Task 12 and BEFORE Task 13.** It is numbered 17 only because it was added after the plan was written (ruling 2026-07-29); the capstones (T15) and the throughput gate (T16) must measure a build in which this is done, or they measure the wrong system.
+
+**Why this task exists.** Task 10 sealed the group-scope fan-out but left every pairwise-scope send in `uc2_net` cleartext, because pairwise sealing needs an established handshake session and nothing drives `Peers` until Task 12. That is a defensible task boundary and an indefensible end state:
+
+- **Confidentiality:** `send_snap_chunk` streams raw bytes out of the service-built snapshot artifact — the complete serialized state machine. The header carries the file offset, so a passive observer reassembles the entire database from a capture with no work.
+- **Integrity, which is worse:** `send_snap_begin` ships `SnapBeginBody.config`, the encoded cluster `ConfigRecord`, and the receive path feeds it to `maybe_adopt_incoming_snapshot`. Unsealed means unauthenticated, so an on-path attacker can forge a snapshot session to a joining or below-floor node and install **attacker-chosen application state and attacker-chosen membership**. That is a consensus-integrity primitive, not a privacy footnote.
+
+**Files:**
+- Modify: `uc2_net/src/sender.rs` (`assemble_snap`, `send_snap_begin`, `send_snap_chunk`, and the `send_snap_chunk` MTU budget at ~:908 which Task 10 deliberately left un-subtracted while SNAP was cleartext)
+- Modify: `uc2_net/src/receiver.rs` (the sends at ~:906, :993, :1041, :1072, :1098 — `SNAP_NAK`, `SNAP_DONE`, `NAK`, `STATUS`, `APPEND_POSITION`)
+- Modify: `uc2_net/src/receiver.rs` — delete the temporary cleartext-SNAP allowance Task 11 added
+- Test: inline in both files
+
+**Interfaces:**
+- Consumes: the receive/send halves from Task 10's corrected ownership split, and the `SocketAddr -> NodeId` mapping Task 11 builds for peer resolution.
+- Produces: no new public API; this is the completion of the scope-by-kind rule.
+
+- [ ] **Step 1: Write the failing tests**
+
+One per send site, asserting the datagram is sealed. The shape that discriminates (learned the hard way at three separate sites in Task 10): assert on the **ciphertext region specifically**, not on whole-datagram inequality, and pin the MTU boundary with frame sizes fine enough that the 24-byte overhead crosses a packing boundary — at the default 1408 MTU only 32-byte (empty-payload) frames discriminate, so use those or tune `cfg.mtu`.
+
+```rust
+#[test]
+fn a_snapshot_chunk_is_sealed_and_respects_the_shrunken_mtu_budget() {
+    let (mut s, f) = sender_with_crypto_and_established_session();
+    let sess = begin_snapshot_session(&mut s, &f);
+    s.send_snap_chunk(&mut sess, 0, false);
+    let d = f.recv_raw().expect("a chunk was sent");
+    assert_ne!(
+        &d[DATAGRAM_HEADER_LEN + COUNTER_LEN..d.len() - TAG_LEN],
+        &raw_snapshot_bytes()[..],
+        "snapshot payload must not be readable on the wire"
+    );
+    assert!(d.len() <= s.cfg.mtu, "a sealed chunk must not exceed the MTU");
+}
+
+#[test]
+fn a_forged_snapshot_begin_cannot_install_a_config() {
+    // The integrity half: this is the reason the task exists.
+    let mut c = SealedCluster::new(2);
+    c.pump_until_established();
+    c.inject_cleartext_snap_begin_with_config(0, hostile_config());
+    c.pump();
+    assert_eq!(c.node(0).config(), &c.original_config(), "unauthenticated config refused");
+}
+```
+
+- [ ] **Step 2: Run to verify they fail**
+
+Run: `cargo test -p uc2_net snap`
+Expected: FAIL — chunks are cleartext, forged begin is accepted.
+
+- [ ] **Step 3: Seal the sender's snapshot path**
+
+Route `assemble_snap` through the send half exactly as `assemble` does, resolve the destination's `NodeId` from the session's peer address, and subtract `CRYPTO_OVERHEAD` from the chunk budget at `send_snap_chunk` so a sealed chunk still fits the MTU.
+
+- [ ] **Step 4: Seal the receiver's pairwise sends**
+
+`SNAP_NAK`, `SNAP_DONE`, `NAK`, `STATUS`, `APPEND_POSITION` — all pairwise scope, all currently cleartext.
+
+- [ ] **Step 5: Delete Task 11's temporary allowance**
+
+Remove it in one edit and confirm the receive path now refuses unsealed SNAP.
+
+- [ ] **Step 6: Mutation-test your own work**
+
+At minimum: drop the MTU subtraction at the new site; seal with the wrong peer id; leave one receiver send unsealed. Confirm the suite catches each.
+
+- [ ] **Step 7: Run and commit**
+
+Run: `cargo test -p uc2_net && cargo test -p uc2_crypto && cargo clippy --workspace --all-targets -- -D warnings`
+
+```bash
+git add uc2_net/src
+git commit -m "feat(uc2_net): seal the remaining pairwise sends — snapshot sessions and control datagrams"
 ```
 
 ---
