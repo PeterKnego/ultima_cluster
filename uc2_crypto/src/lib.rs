@@ -36,7 +36,7 @@ pub mod seal;
 pub mod transport;
 
 pub use handshake::HandshakeAction;
-pub use transport::{CryptoConfig, Scope, Transport};
+pub use transport::{CryptoConfig, ReceiveHalf, Scope, SendHalf, SharedTransport, Transport};
 
 /// Node identifier — matches `uc2_consensus::election::NodeId` (both `u32`,
 /// intentionally not re-exported from there: this crate stays dependency-thin

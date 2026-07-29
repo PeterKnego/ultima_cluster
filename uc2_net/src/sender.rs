@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
-use uc2_crypto::Transport;
+use uc2_crypto::{Scope, SendHalf, Transport};
 use uc2_log::archive::find_block;
 use uc2_log::buffer::{LogBuffer, SliceRead};
 use uc2_log::cnc::CncPage;
@@ -275,7 +275,21 @@ pub struct Sender {
     /// sealed bytes to every follower (one seal, N sends; see the module
     /// docs and `SenderConfig::crypto_enabled`'s doc for how this stays in
     /// sync with the MTU budget).
-    crypto: Option<Transport>,
+    ///
+    /// A `SendHalf`, NOT a `Transport` (review round 1, 2026-07-29 ruling):
+    /// `Sender` and `FollowerReceiver` (T11) are separate agents on separate
+    /// threads, but a single process has exactly one set of handshake
+    /// sessions, one group-key plane, and one boot salt. Owning a whole
+    /// `Transport` by value here would make all of that permanently
+    /// unreachable by the receiver and the node layer (T12) — see
+    /// `uc2_crypto::transport`'s "M8 ownership correction" module docs for
+    /// the full account, including why the two naive fixes (a mutex around
+    /// the whole `Transport`, or one `Transport` per agent) are both wrong.
+    /// `SendHalf` owns only the nonce counter and the seal-cipher cache
+    /// (sender-exclusive, no lock); the handshake/group-key state it reads
+    /// through `seal` lives in the shared, `Arc<Mutex<_>>`-guarded state a
+    /// `uc2_crypto::SharedTransport` hands this half out from.
+    crypto: Option<uc2_crypto::SendHalf>,
 }
 
 /// M6 Task 9: the sender's observability handle — the cnc page plus the
@@ -319,11 +333,18 @@ impl Sender {
     }
 
     /// M8 (Task 10): the innermost constructor — `with_learners`/`new` are thin
-    /// wrappers over this with `crypto: None`. `crypto: Some(transport)` seals
+    /// wrappers over this with `crypto: None`. `crypto: Some(send_half)` seals
     /// every DATA/HEARTBEAT datagram `assemble` builds; `cfg.crypto_enabled`
     /// MUST already agree with `crypto.is_some()` (asserted below) — the MTU
     /// budget every read site computes from `cfg.crypto_overhead()` would
     /// otherwise silently disagree with what this constructor is about to do.
+    ///
+    /// Takes a `SendHalf` (from `uc2_crypto::SharedTransport::send_half`),
+    /// never a whole `Transport` — see `crypto` field's doc above for why.
+    /// The caller (the node layer, T12) owns the `SharedTransport` and calls
+    /// `send_half()` exactly once per process; this constructor has no way
+    /// to enforce that single-call discipline itself (it only ever sees the
+    /// `SendHalf` already handed out).
     #[allow(clippy::too_many_arguments)]
     pub fn with_crypto(
         buffer: Arc<LogBuffer>,
@@ -335,12 +356,12 @@ impl Sender {
         cfg: SenderConfig,
         term: TermHandle,
         role: Arc<AtomicBool>,
-        crypto: Option<Transport>,
+        crypto: Option<SendHalf>,
     ) -> Sender {
         assert_eq!(
             cfg.crypto_enabled,
             crypto.is_some(),
-            "SenderConfig::crypto_enabled must agree with whether a Transport was supplied \
+            "SenderConfig::crypto_enabled must agree with whether a SendHalf was supplied \
              (mismatch here is exactly the class of bug that lets a sealed datagram overrun \
              the MTU: the budget math trusts crypto_enabled, not crypto.is_some())"
         );
@@ -620,10 +641,20 @@ impl Sender {
     }
 
     /// M6 Task 9 (extracted M7): fill each tracked peer's `advertised_limit`
-    /// cnc slot from the current `FlowControl` view. Called once per duty cycle
-    /// AND immediately after a `SetPeers` rebuild (M7) so a reconfigured peer's
-    /// slot doesn't wait out a stale cycle. Bounded (≤8 slots); a no-op when
-    /// `set_peer_slots` was never called (non-leader / unit tests).
+    /// cnc slot from the current `FlowControl` view, and (M8, Task 10 review
+    /// round 1) mirror the cumulative seal-failure count into the cnc page.
+    /// Called once per duty cycle AND immediately after a `SetPeers` rebuild
+    /// (M7) so a reconfigured peer's slot doesn't wait out a stale cycle.
+    /// Bounded (≤8 slots + 1 line); a no-op when `set_peer_slots` was never
+    /// called (non-leader / unit tests).
+    ///
+    /// `seal_failures` specifically: `SenderStats::seal_failures` alone is
+    /// process-internal — invisible to an operator or a monitoring agent
+    /// outside this node. A PERSISTENT seal failure (e.g. crypto enabled but
+    /// no group key ever activated) silently drops live DATA *and*
+    /// HEARTBEAT, so a follower may never even learn there is a gap to NAK
+    /// for — exactly the condition an operator must be able to see
+    /// externally, the same way `advertised_limit` already is.
     fn refresh_peer_obs(&mut self) {
         if let Some((cnc, slots)) = &self.peer_obs {
             for (addr, idx) in slots {
@@ -631,6 +662,7 @@ impl Sender {
                     cnc.peer_slot(*idx).advertised_limit.store_release(limit);
                 }
             }
+            cnc.store_seal_failures(self.stats.seal_failures.load(Ordering::Relaxed));
         }
     }
 
@@ -673,10 +705,35 @@ impl Sender {
     /// via NAK repair once a group key is available; a dropped HEARTBEAT is
     /// superseded by the next interval.
     fn seal_scratch(&mut self, kind: u8) -> bool {
+        // M8 review round 1 (2026-07-29, Minor): this function always calls
+        // `seal` with `peer: None`, which is only correct for `Scope::Group`
+        // kinds (Group ignores `peer`; Pairwise needs `Some(peer)` or gets
+        // `MissingPeer` -> silently dropped in crypto mode while the SAME
+        // call would work fine in cleartext, since cleartext never reaches
+        // `seal` at all). Previously enforced only by a doc comment on this
+        // function and on `assemble`/`fan_out`/`serve_nak`/`send_replay_dgram`
+        // (every caller today IS `DGRAM_KIND_DATA` or `DGRAM_KIND_HEARTBEAT`,
+        // both Group) — a future caller passing a Pairwise kind through this
+        // path would compile fine and fail only at runtime, silently, in
+        // crypto mode specifically. Pinned structurally instead.
+        debug_assert!(
+            matches!(Transport::scope_of(kind), Scope::Group),
+            "seal_scratch is only ever correct for Scope::Group kinds (peer: None); \
+             kind {kind} is not one — a Pairwise/Unsealed kind needs a real caller-supplied \
+             peer and must not go through this path"
+        );
         let Some(crypto) = self.crypto.as_mut() else {
             return true; // cleartext mode: nothing to do
         };
-        let now_ns = self.base.elapsed().as_nanos() as u64;
+        // M8 review round 1 (2026-07-29): `now_ns` MUST come from the
+        // SendHalf's own canonical clock (ultimately `SharedTransport`'s
+        // single `base: Instant`, shared with every other half/agent that
+        // touches crypto), never from `self.base` (this Sender agent's own,
+        // otherwise-unrelated clock used for heartbeat cadence). Two
+        // different clock origins would make `GroupPlane::sealing_epoch`'s
+        // activation-grace-period comparison meaningless — see
+        // `uc2_crypto::transport`'s "One clock source" module docs.
+        let now_ns = crypto.now_ns();
         match crypto.seal(kind, None, &mut self.scratch, now_ns) {
             Ok(()) => true,
             Err(_) => {
@@ -1734,14 +1791,15 @@ mod tests {
         }
     }
 
-    /// A well-formed `Enabled` `Transport` with a fresh key file + an empty
-    /// allowlist, mirroring `uc2_crypto::transport::tests::node_transport`
-    /// (same discipline: real key material under `CARGO_TARGET_TMPDIR`,
-    /// never `/tmp` — see CLAUDE.md). `mint_group_key(&[], 0)` mints with a
-    /// vacuous peer set, which activates immediately (`all()` over an empty
-    /// set), so the returned `Transport` can seal `DGRAM_KIND_DATA`/
-    /// `DGRAM_KIND_HEARTBEAT` right away — no handshake or ack needed for a
-    /// sender-only unit test that never opens on the other end.
+    /// A well-formed `Enabled` `uc2_crypto::SharedTransport` with a fresh key
+    /// file + an empty allowlist (same fixture discipline as
+    /// `uc2_crypto::transport::tests::node_transport`: real key material
+    /// under `CARGO_TARGET_TMPDIR`, never `/tmp` — see CLAUDE.md).
+    /// `mint_group_key(&[], 0)` mints with a vacuous peer set, which
+    /// activates immediately (`all()` over an empty set), so the `SendHalf`
+    /// this returns can seal `DGRAM_KIND_DATA`/`DGRAM_KIND_HEARTBEAT` right
+    /// away — no handshake or ack needed for a sender-only unit test that
+    /// never opens on the other end.
     ///
     /// Mints TWICE, not once: `GroupPlane::next_epoch` starts at 0 on a fresh
     /// process, so a single mint's epoch is 0 — indistinguishable from
@@ -1754,7 +1812,13 @@ mod tests {
     /// here by `sealed_fan_out_seals_once_and_sends_identical_bytes_to_every_follower`
     /// actually failing red against a real (if accidental) epoch-0 fixture —
     /// not a hypothetical.
-    fn crypto_transport(self_id: u32) -> Transport {
+    ///
+    /// Returns a `SendHalf`, not the `SharedTransport` itself — `Sender`
+    /// (review round 1, 2026-07-29) owns only the send half, never a whole
+    /// `Transport`/`SharedTransport`; letting the `SharedTransport` this
+    /// function built go out of scope is fine, since `SendHalf` holds its
+    /// own `Arc` clone of the shared key state, keeping it alive.
+    fn crypto_transport(self_id: u32) -> SendHalf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::var("CARGO_TARGET_TMPDIR")
@@ -1782,10 +1846,10 @@ mod tests {
             allowlist_path: allow_path,
             rotation: uc2_crypto::rotation::RotationPolicy::default(),
         };
-        let mut t = Transport::new(&cfg, self_id).unwrap().unwrap();
-        t.mint_group_key(&[], 0); // epoch 0 — indistinguishable from the unsealed default
-        t.mint_group_key(&[], 0); // epoch 1 — provably not zero-init
-        t
+        let shared = uc2_crypto::SharedTransport::new(&cfg, self_id).unwrap().unwrap();
+        shared.mint_group_key(&[], 0); // epoch 0 — indistinguishable from the unsealed default
+        shared.mint_group_key(&[], 0); // epoch 1 — provably not zero-init
+        shared.send_half()
     }
 
     /// `n` fresh followers, a `Sender` with crypto enabled fanning out to all
@@ -2099,25 +2163,137 @@ mod tests {
     }
 
     #[test]
+    fn journal_replayed_nak_mtu_budget_also_shrinks_by_the_crypto_overhead() {
+        // Review round 1 (2026-07-29) finding: serve_nak_from_journal's OWN
+        // budget line (the third MTU-budget site, alongside do_work's
+        // run-read budget and serve_nak's — this one added by this task
+        // itself) had NO size assertion anywhere. The test above
+        // (`a_journal_replayed_nak_is_sealed_exactly_like_a_ring_served_one`)
+        // asserts the datagram is SEALED but never asserts its SIZE, and its
+        // 64-byte payloads make 96-byte frames — at the default 1408 MTU,
+        // floor(1368/96) == floor(1392/96) == 14, the SAME coarse-granularity
+        // blindness fixed twice already at the other two budget sites.
+        // Reproduced instead at cfg.mtu = 1360 (the reviewer's own repro
+        // number): floor(1320/96) = 13 correct frames (1360-16-24-... =>
+        // sealed 16+13*96+24=1288, fits) vs floor(1344/96) = 14 buggy frames
+        // (sealed 16+14*96+24=1384 > 1360) — reverting only this site's
+        // `- self.cfg.crypto_overhead()` panics here with exactly that
+        // "1384 > mtu" overrun.
+        let b = Arc::new(LogBuffer::new(Region::heap_zeroed(4096), test_cnc(4096), 256));
+        let dir = tempfile::tempdir().unwrap();
+        let acfg = uc2_log::archive::ArchiveConfig {
+            segment_size_bytes: 4 * 1024 * 1024,
+            ..uc2_log::archive::ArchiveConfig::new(dir.path())
+        };
+        let mut arch = uc2_log::archive::Archive::open(acfg).unwrap();
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        let mut n = 0u64;
+        while a.position() < 3 * 4096 {
+            match a.append(1, n, &[n as u8; 64]) {
+                Ok(_) => n += 1,
+                Err(uc2_log::buffer::AppendError::WouldOverrun) => {
+                    arch.do_work(&b).unwrap();
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        while arch.do_work(&b).unwrap() {}
+
+        let f1 = Fake::new();
+        let (_tx, rx) = mpsc::sync_channel(64);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        cfg.crypto_enabled = true;
+        cfg.mtu = 1360; // the exact boundary the review reproduced the overrun at
+        let mut s = Sender::with_crypto(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f1.addr()],
+            &[],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+            Some(crypto_transport(1)),
+        );
+        s.set_replay_source(arch.journal_arc());
+        s.on_nak(f1.addr(), 0, 4096);
+        s.do_work();
+        let mut saw_any = false;
+        while let Some(d) = f1.recv_raw() {
+            saw_any = true;
+            assert!(
+                d.len() <= s.cfg.mtu,
+                "a journal-replayed sealed datagram must not exceed the MTU"
+            );
+        }
+        assert!(saw_any, "fixture must actually produce datagrams for this to mean anything");
+        assert!(
+            s.stats().replay_datagrams.load(Ordering::Relaxed) >= 1,
+            "fixture must actually exercise the journal-replay path"
+        );
+    }
+
+    #[test]
     fn a_failed_group_seal_drops_the_datagram_rather_than_sending_it_half_built() {
         // Mutant target: sealing that mutates self.scratch before the key
         // lookup can fail (the exact class transport.rs's own review round 1
         // caught, F3) would ship a corrupted or partially-sealed datagram
         // instead of dropping it. Construct a Sender with crypto ENABLED but
-        // whose Transport never minted a group key — every seal attempt must
-        // fail closed (NoGroupKey), and NOTHING must reach the wire.
+        // whose SharedTransport never minted a group key — every seal
+        // attempt must fail closed (NoGroupKey), and NOTHING must reach the
+        // wire.
         let b = buffer();
         let f = Fake::new();
         let (_tx, rx) = mpsc::sync_channel(16);
         let mut cfg = SenderConfig::new(9);
         cfg.heartbeat_ns = u64::MAX;
         cfg.crypto_enabled = true;
+        let mut s = Sender::with_crypto(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f.addr()],
+            &[],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+            Some(unminted_crypto_send_half(1)),
+        );
+        append_and_flush(&mut s, b"hello");
+        assert!(f.recv_raw().is_none(), "an unsealable datagram must never reach the wire");
+        assert!(
+            s.stats().seal_failures.load(Ordering::Relaxed) > 0,
+            "the failure must be counted, not silently swallowed"
+        );
+        assert_eq!(
+            b.counters().sent.load_acquire(),
+            align_frame_len(HEADER_LEN + 5) as u64,
+            "the buffer cursor still advances (a seal failure is fire-and-forget \
+             packet loss from the ring's point of view, same as a lost UDP \
+             datagram — NAK repair recovers it, not a stalled cursor)"
+        );
+    }
+
+    /// An `Enabled` `SendHalf` from a `SharedTransport` that NEVER minted a
+    /// group key — every `Scope::Group` seal through it fails closed with
+    /// `NoGroupKey`. Factored out of
+    /// `a_failed_group_seal_drops_the_datagram_rather_than_sending_it_half_built`
+    /// so `a_persistent_seal_failure_is_visible_in_the_cnc_band` (review
+    /// round 1) can reuse the identical fixture rather than a third copy of
+    /// the key/allowlist boilerplate.
+    fn unminted_crypto_send_half(self_id: u32) -> SendHalf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::var("CARGO_TARGET_TMPDIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| {
                 std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc2_net_tests")
             })
-            .join("uc2-net-sender-crypto-no-mint");
+            .join("uc2-net-sender-crypto-no-mint")
+            .join(format!("t{seq}"));
         std::fs::create_dir_all(&dir).unwrap();
         let key_path = dir.join("node.key");
         std::fs::write(&key_path, [0x99u8; 32]).unwrap();
@@ -2133,7 +2309,24 @@ mod tests {
             allowlist_path: allow_path,
             rotation: uc2_crypto::rotation::RotationPolicy::default(),
         };
-        let crypto = Transport::new(&ccfg, 1).unwrap().unwrap(); // NOT minted
+        let shared = uc2_crypto::SharedTransport::new(&ccfg, self_id).unwrap().unwrap(); // NOT minted
+        shared.send_half()
+    }
+
+    #[test]
+    fn a_persistent_seal_failure_is_visible_in_the_cnc_band() {
+        // Review round 1 (2026-07-29), Minor: `seal_failures` was stats-only
+        // (an `AtomicU64` invisible outside this process). A PERSISTENT
+        // failure (this fixture: crypto on, no group key ever minted) drops
+        // DATA *and* HEARTBEAT silently — exactly the condition an operator
+        // must be able to see externally, the same way `advertised_limit`
+        // already is via `set_peer_slots`/`refresh_peer_obs`.
+        let b = buffer();
+        let f = Fake::new();
+        let (_tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        cfg.crypto_enabled = true;
         let mut s = Sender::with_crypto(
             Arc::clone(&b),
             FaultSocket::bind("127.0.0.1:0").unwrap(),
@@ -2144,20 +2337,20 @@ mod tests {
             cfg,
             term_handle(9),
             always_leader(),
-            Some(crypto),
+            Some(unminted_crypto_send_half(1)),
         );
+        let cnc = test_cnc(1 << 16);
+        s.set_peer_slots(Arc::clone(&cnc), vec![]);
+        assert_eq!(cnc.seal_failures(), 0, "nothing has failed yet");
         append_and_flush(&mut s, b"hello");
-        assert!(f.recv_raw().is_none(), "an unsealable datagram must never reach the wire");
         assert!(
-            s.stats().seal_failures.load(Ordering::Relaxed) > 0,
-            "the failure must be counted, not silently swallowed"
+            cnc.seal_failures() > 0,
+            "a persistent seal failure must be visible in the cnc band, not just in-process stats"
         );
         assert_eq!(
-            b.counters().sent.load_acquire(),
-            align_frame_len(HEADER_LEN + 5) as u64,
-            "the buffer cursor still advances (a seal failure is fire-and-forget \
-             packet loss from the ring's point of view, same as a lost UDP \
-             datagram — NAK repair recovers it, not a stalled cursor)"
+            cnc.seal_failures(),
+            s.stats().seal_failures.load(Ordering::Relaxed),
+            "the cnc mirror must agree with the in-process counter it mirrors"
         );
     }
 }

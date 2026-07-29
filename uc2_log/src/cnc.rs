@@ -22,8 +22,9 @@ use std::sync::Arc;
 use uc_protocol::v2::cnc::{
     self, CNC_MAX_PEER_SLOTS, CNC_OFF_ADMIN_REQ, CNC_OFF_ADMIN_RESP, CNC_OFF_ADMISSION_BYTES,
     CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE, CNC_OFF_CONFIG_PENDING, CNC_OFF_CONFIG_VERSION,
-    CNC_OFF_HEADER_CRC, CNC_OFF_PEER_SLOTS, CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SNAPSHOT_POS,
-    CNC_OFF_TERM, CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_V2_VERSION, CncHeader,
+    CNC_OFF_HEADER_CRC, CNC_OFF_PEER_SLOTS, CNC_OFF_SEAL_FAILURES, CNC_OFF_SERVICE_APPLIED,
+    CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_TERM, CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_V2_VERSION,
+    CncHeader,
 };
 
 use crate::counters::{LogCounters, PaddedAtomicU64};
@@ -450,6 +451,22 @@ impl CncPage {
         unsafe { (*ptr).store_release(v) }
     }
 
+    /// M8 (Task 10 review round 1): cumulative sender-side seal-failure count
+    /// — see `CNC_OFF_SEAL_FAILURES`'s doc for why this is externally
+    /// observable rather than process-internal-only stats.
+    pub fn seal_failures(&self) -> u64 {
+        // SAFETY: offset 3776, size 8.
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_SEAL_FAILURES) as *const PaddedAtomicU64 };
+        unsafe { (*ptr).load_acquire() }
+    }
+
+    /// M8 (Task 10 review round 1): store the cumulative seal-failure count.
+    pub fn store_seal_failures(&self, v: u64) {
+        // SAFETY: offset 3776, size 8.
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_SEAL_FAILURES) as *const PaddedAtomicU64 };
+        unsafe { (*ptr).store_release(v) }
+    }
+
     /// M7: config pending (1 = uncommitted, 0 = stable).
     pub fn config_pending(&self) -> u64 {
         // SAFETY: offset 3520, size 8.
@@ -668,6 +685,8 @@ mod tests {
         assert_eq!(CNC_OFF_ADMIN_RESP, 3648);
         // Post-M7 (0.3.0): admission_bytes.
         assert_eq!(CNC_OFF_ADMISSION_BYTES, 3712);
+        // M8 (Task 10 review round 1): seal_failures.
+        assert_eq!(CNC_OFF_SEAL_FAILURES, 3776);
     }
 
     #[test]
@@ -913,6 +932,20 @@ mod tests {
             u64::from_le_bytes(raw[3712..3720].try_into().unwrap()),
             256 * 1024,
             "offset pin: the value must live at 3712 exactly"
+        );
+    }
+
+    #[test]
+    fn seal_failures_roundtrip_and_offset_pin() {
+        let page = CncPage::heap(&test_meta());
+        assert_eq!(page.seal_failures(), 0, "fresh page reads 0 (no failures yet / cleartext node)");
+        page.store_seal_failures(7);
+        assert_eq!(page.seal_failures(), 7);
+        let raw = page.page();
+        assert_eq!(
+            u64::from_le_bytes(raw[3776..3784].try_into().unwrap()),
+            7,
+            "offset pin: the value must live at 3776 exactly"
         );
     }
 

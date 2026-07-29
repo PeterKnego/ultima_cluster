@@ -142,6 +142,8 @@ use rand::TryRngCore;
 use rand::rngs::OsRng;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use uc_protocol::v2::crypto::{DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_KEY, DGRAM_KIND_HS_RESP};
 use uc_protocol::v2::datagram::{
     DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, DGRAM_KIND_COMMIT_POSITION,
@@ -668,6 +670,406 @@ impl Transport {
     /// and stays unit-testable in isolation.
     pub fn mint_group_key(&mut self, peers: &[NodeId], now_ns: u64) -> (u16, Vec<HandshakeAction>) {
         self.group.mint(peers, now_ns)
+    }
+}
+
+// =============================================================================
+// M8 ownership correction (ruling 2026-07-29, Task 10 review round 1) — the
+// Arc-shareable split `uc2_net` actually consumes.
+// =============================================================================
+//
+// [`Transport`] above is this crate's original single-threaded facade —
+// every one of its tests (unchanged by this section) exercises it directly,
+// and it stays the primary correctness harness for the handshake/AEAD/
+// rotation logic. **It is not what `uc2_net` uses.**
+//
+// `uc2_net`'s `Sender` and (T11) `FollowerReceiver` are separate agents
+// spawned on separate threads, but ONE process has exactly one set of
+// handshake sessions, one group-key plane, and one boot salt. Task 10's
+// original plan text said to move `Transport` by value into `Sender` — that
+// makes the sessions, group plane, and receive replay state permanently
+// unreachable by the receiver (T11) and the node layer (T12: minting,
+// rotation, handshake routing). The two naive fixes are both wrong: wrapping
+// the WHOLE `Transport` in a mutex lands a lock on the send agent's
+// busy-spin per-datagram path; giving each agent its OWN `Transport` gives
+// each its OWN boot salt, so a follower would derive the leader's group key
+// from the WRONG salt and group-scope `open` would fail cluster-wide the
+// instant a real second agent existed (see `Peers`/`GroupPlane`'s own docs:
+// `boot_salt` is one-per-PROCESS, never one-per-`Transport`).
+//
+// The corrected shape, per the 2026-07-29 ruling:
+// - [`KeyState`] — handshake sessions (`Peers`), the group-key plane
+//   (`GroupPlane`), and rotation triggering (`RotationState`), behind
+//   [`SharedTransport`]'s `Arc<Mutex<_>>`. Mutated only on handshake
+//   completion and rotation events (mint/ack/became-leader/committed-config)
+//   — all rare — so the lock costs nothing at the throughput this crate is
+//   built for. `RotationState::on_bytes_sealed` is the one call on this path
+//   that fires on every successful group seal, not just on a rare event —
+//   but it runs under the SAME lock acquisition [`SendHalf::seal_group`]
+//   already needs for `GroupPlane::sealing_epoch`/the cipher-cache miss
+//   path, so it is not an ADDITIONAL lock.
+// - [`SendHalf`] — the nonce counter and the seal-cipher cache. Exclusive to
+//   whichever ONE agent calls `seal` (the sender agent). Constructing a
+//   SECOND `SendHalf` from the same [`SharedTransport`] would give it an
+//   independent counter starting back at 0 under the SAME key — a repeated
+//   `(key, nonce)` pair, catastrophic under AES-GCM — so
+//   [`SharedTransport::send_half`] must be called exactly once per process.
+// - [`ReceiveHalf`] — the group-scope receive replay windows (the pairwise
+//   ones already live inside `Peers`/`Session`, which is shared). Exclusive
+//   to whichever ONE agent calls `open` (the receiver agent, T11), for the
+//   same single-instance reason.
+//
+// `self_id` and the process `boot_salt` are invariant for the process's
+// lifetime (set once in [`SharedTransport::new`], never mutated after), so
+// both halves carry their own plain `Copy` values rather than reaching
+// through the lock to read them on every call.
+//
+// **One clock source.** [`GroupPlane::sealing_epoch`]`(now_ns)` compares
+// `now_ns` against the mint timestamp to decide whether the activation grace
+// period elapsed. If the sender agent and a future minting/rotating agent
+// each computed `now_ns` from their OWN independently-started `Instant`,
+// that comparison would be meaningless — the grace period would either never
+// elapse or elapse instantly, purely depending on which agent happened to
+// start first and by how much (an `Instant` has no relation to any other
+// process's or thread's `Instant` except by comparing elapsed durations from
+// a COMMON origin). [`SharedTransport`] records ONE `base: Instant` at
+// construction and copies it (a `Copy` type, no lock needed) into every half
+// it hands out, so `now_ns()` means the same thing everywhere it is called.
+// This does NOT reintroduce a clock read inside the crate's core logic —
+// `seal`/`open`/`mint` still take `now_ns: u64` as an explicit parameter,
+// exactly like `Transport`, so a test or the deterministic sim can still
+// drive them with a hand-picked value; `now_ns()` only fixes what a REAL
+// caller (`uc2_net`) should compute that parameter from, and does so by
+// construction rather than by convention.
+
+/// The handshake/rotation state actually shared across agents — see the
+/// module section docs above. Not `pub`: reachable only through
+/// [`SharedTransport`]'s methods and the two halves it hands out.
+struct KeyState {
+    peers: Peers,
+    group: GroupPlane,
+    rotation: RotationState,
+}
+
+/// The Arc-shareable production facade `uc2_net`/`uc2_node` construct once
+/// per process and hand [`SendHalf`]/[`ReceiveHalf`] out from. See the
+/// module section docs above.
+#[derive(Clone)]
+pub struct SharedTransport {
+    self_id: NodeId,
+    boot_salt: BootSalt,
+    base: Instant,
+    key: Arc<Mutex<KeyState>>,
+}
+
+impl SharedTransport {
+    /// Same contract as [`Transport::new`]: `Disabled` yields `Ok(None)`;
+    /// `Enabled` loads identity/allowlist from disk (boot refusal on
+    /// failure) and mints a fresh per-process `boot_salt` from the OS RNG.
+    pub fn new(cfg: &CryptoConfig, self_id: NodeId) -> Result<Option<SharedTransport>, CryptoError> {
+        let (key_path, allowlist_path, rotation) = match cfg {
+            CryptoConfig::Disabled => return Ok(None),
+            CryptoConfig::Enabled { key_path, allowlist_path, rotation } => {
+                (key_path, allowlist_path, *rotation)
+            }
+        };
+
+        let identity = Identity::load(key_path)?;
+        let allowlist = Allowlist::load(allowlist_path)?;
+
+        let mut salt_bytes = [0u8; 16];
+        OsRng
+            .try_fill_bytes(&mut salt_bytes)
+            .expect("the OS RNG is unavailable");
+        let boot_salt = BootSalt(salt_bytes);
+
+        let peers = Peers::new(identity, allowlist, self_id, boot_salt);
+
+        Ok(Some(SharedTransport {
+            self_id,
+            boot_salt,
+            base: Instant::now(),
+            key: Arc::new(Mutex::new(KeyState {
+                peers,
+                group: GroupPlane::new(self_id),
+                rotation: RotationState::new(rotation),
+            })),
+        }))
+    }
+
+    pub fn self_id(&self) -> NodeId {
+        self.self_id
+    }
+
+    /// The canonical crypto clock — see the module section docs' "One clock
+    /// source" paragraph. Every [`SendHalf`]/[`ReceiveHalf`] handed out by
+    /// this [`SharedTransport`] computes `now_ns` from the SAME origin.
+    pub fn now_ns(&self) -> u64 {
+        self.base.elapsed().as_nanos() as u64
+    }
+
+    /// Hands out the send half. Call exactly once per process — see
+    /// [`SendHalf`]'s doc above on why a second one is unsafe (nonce reuse).
+    pub fn send_half(&self) -> SendHalf {
+        SendHalf {
+            self_id: self.self_id,
+            boot_salt: self.boot_salt,
+            base: self.base,
+            key: Arc::clone(&self.key),
+            counter: 0,
+            seal_cache: None,
+        }
+    }
+
+    /// Hands out the receive half. Call exactly once per process — see
+    /// [`ReceiveHalf`]'s doc above.
+    pub fn receive_half(&self) -> ReceiveHalf {
+        ReceiveHalf {
+            base: self.base,
+            key: Arc::clone(&self.key),
+            group_replay: HashMap::new(),
+        }
+    }
+
+    /// Forwards to [`GroupPlane::mint`] — see [`Transport::mint_group_key`]'s
+    /// doc (identical rationale and forwarding shape; this is the
+    /// `SharedTransport`-side entry point T12's node layer calls).
+    pub fn mint_group_key(&self, peers: &[NodeId], now_ns: u64) -> (u16, Vec<HandshakeAction>) {
+        self.key.lock().unwrap().group.mint(peers, now_ns)
+    }
+
+    /// Forwards to [`RotationState::on_became_leader`] — see
+    /// [`Transport::on_became_leader`]'s doc.
+    pub fn on_became_leader(&self) {
+        self.key.lock().unwrap().rotation.on_became_leader();
+    }
+
+    /// Forwards to [`RotationState::on_committed_config`] — see
+    /// [`Transport::on_committed_config`]'s doc.
+    pub fn on_committed_config(&self, tombstone_count: usize) {
+        self.key.lock().unwrap().rotation.on_committed_config(tombstone_count);
+    }
+
+    /// Forwards to [`RotationState::take_due`] — see
+    /// [`Transport::rotation_due`]'s doc.
+    pub fn rotation_due(&self, now_ns: u64) -> Option<RotationReason> {
+        self.key.lock().unwrap().rotation.take_due(now_ns)
+    }
+
+    /// Forwards to [`Peers::allowlist_reload_if_stale`] — see
+    /// [`Transport::allowlist_reload_if_stale`]'s doc.
+    pub fn allowlist_reload_if_stale(&self, now_ns: u64) -> Result<bool, CryptoError> {
+        self.key.lock().unwrap().peers.allowlist_reload_if_stale(now_ns)
+    }
+}
+
+/// The send-side half of the [`SharedTransport`] split — see the module
+/// section docs above. Exclusive to the ONE agent that calls `seal`.
+pub struct SendHalf {
+    self_id: NodeId,
+    boot_salt: BootSalt,
+    base: Instant,
+    key: Arc<Mutex<KeyState>>,
+    /// The one counter this half ever allocates a nonce from — see
+    /// [`Transport`]'s module docs' "The counter" section; the same
+    /// single-ever-increasing-counter reasoning applies unchanged, just
+    /// scoped to this one `SendHalf` instance instead of a whole `Transport`.
+    counter: u64,
+    /// One cached cipher for whichever epoch was last sealed under — see
+    /// [`Transport::group_seal_cipher`]'s doc (carried requirement #4);
+    /// identical caching, just living on this half instead of on `Transport`.
+    seal_cache: Option<(u16, Aes256Gcm)>,
+}
+
+impl SendHalf {
+    /// The canonical crypto clock — see [`SharedTransport::now_ns`]'s doc.
+    pub fn now_ns(&self) -> u64 {
+        self.base.elapsed().as_nanos() as u64
+    }
+
+    /// Same contract as [`Transport::seal`] — see that method's doc for the
+    /// full per-scope account. `Scope::Group` locks the shared [`KeyState`]
+    /// once (for `GroupPlane::sealing_epoch` and, on a cache miss, the key
+    /// lookup) — see the module section docs' `RotationState::on_bytes_sealed`
+    /// paragraph for why this is not an ADDITIONAL lock beyond that one.
+    /// `Scope::Pairwise` locks it once for `Peers::seal_pairwise` (unicast,
+    /// low-rate control traffic — a lock here was already the design before
+    /// this split; see `Transport`'s own carried requirement #4 doc).
+    pub fn seal(
+        &mut self,
+        kind: u8,
+        peer: Option<NodeId>,
+        buf: &mut Vec<u8>,
+        now_ns: u64,
+    ) -> Result<(), CryptoError> {
+        match Transport::scope_of(kind) {
+            Scope::Group => self.seal_group(buf, now_ns),
+            Scope::Pairwise => {
+                let Some(peer) = peer else {
+                    return Err(CryptoError::MissingPeer(kind));
+                };
+                let counter = self.next_counter();
+                self.key.lock().unwrap().peers.seal_pairwise(peer, buf, counter)
+            }
+            Scope::Unsealed => Err(CryptoError::UnsealedKind(kind)),
+        }
+    }
+
+    fn seal_group(&mut self, buf: &mut Vec<u8>, now_ns: u64) -> Result<(), CryptoError> {
+        if buf.len() < DATAGRAM_HEADER_LEN {
+            return Err(CryptoError::TooShort);
+        }
+        let mut key = self.key.lock().unwrap();
+        let epoch = key.group.sealing_epoch(now_ns).ok_or(CryptoError::NoGroupKey)?;
+
+        // Same ordering discipline as Transport::seal_group (T9 review F3):
+        // the fallible cipher/key lookup MUST resolve before `buf` is
+        // mutated at all, or a failure here leaves the caller's staged
+        // datagram corrupted even though the call "failed". Inlined
+        // (not `self.next_counter()`) because `key` above already holds a
+        // borrow of `self.key`, and Rust's borrow checker does not split
+        // `self.counter` from that borrow through a `&mut self` method call
+        // — only through direct field access like this.
+        self.counter += 1;
+        let counter = self.counter;
+        let cipher = Self::group_seal_cipher(
+            &mut self.seal_cache,
+            &key.group,
+            epoch,
+            self.self_id,
+            &self.boot_salt,
+        )?;
+
+        buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2].copy_from_slice(&epoch.to_le_bytes());
+        seal_with(buf, cipher, counter)?;
+        key.rotation.on_bytes_sealed(buf.len() as u64);
+        Ok(())
+    }
+
+    /// Returns the cached cipher for `epoch`, rebuilding it (and touching
+    /// `group`/the shared lock, already held by the caller) only if the
+    /// last cached epoch does not match. See [`Transport::group_seal_cipher`]'s
+    /// doc (carried requirement #4) — identical logic, adapted to take its
+    /// inputs as parameters instead of `&mut self` fields, since this half's
+    /// `self_id`/`boot_salt` are local `Copy` fields and `group` lives behind
+    /// the shared lock.
+    fn group_seal_cipher<'a>(
+        cache: &'a mut Option<(u16, Aes256Gcm)>,
+        group: &GroupPlane,
+        epoch: u16,
+        self_id: NodeId,
+        boot_salt: &BootSalt,
+    ) -> Result<&'a Aes256Gcm, CryptoError> {
+        let stale = !matches!(cache, Some((e, _)) if *e == epoch);
+        if stale {
+            let group_key = group.schedule().get(epoch).ok_or(CryptoError::NoGroupKey)?;
+            let key: Zeroizing<[u8; 32]> =
+                Zeroizing::new(derive_send_key(group_key, self_id, boot_salt));
+            let cipher = Aes256Gcm::new(GenericArray::from_slice(&*key));
+            *cache = Some((epoch, cipher));
+        }
+        Ok(&cache.as_ref().unwrap().1)
+    }
+
+    fn next_counter(&mut self) -> u64 {
+        self.counter += 1;
+        self.counter
+    }
+}
+
+/// The receive-side half of the [`SharedTransport`] split — see the module
+/// section docs above. Exclusive to the ONE agent that calls `open`.
+pub struct ReceiveHalf {
+    base: Instant,
+    key: Arc<Mutex<KeyState>>,
+    /// Anti-replay state for RECEIVED group-scope traffic — see
+    /// [`Transport`]'s `group_replay` field doc for the full rationale
+    /// (3-wide key, F1/F6/F7 from T9 review round 1); identical logic, just
+    /// living on this half instead of on `Transport`.
+    group_replay: HashMap<(NodeId, u16, BootSalt), ReplayWindow>,
+}
+
+impl ReceiveHalf {
+    /// The canonical crypto clock — see [`SharedTransport::now_ns`]'s doc.
+    pub fn now_ns(&self) -> u64 {
+        self.base.elapsed().as_nanos() as u64
+    }
+
+    /// Same contract as [`Transport::open`].
+    pub fn open(&mut self, from: NodeId, buf: &mut Vec<u8>) -> Result<(), CryptoError> {
+        if buf.len() < DATAGRAM_HEADER_LEN {
+            return Err(CryptoError::TooShort);
+        }
+        let header = read_datagram_header(buf);
+        match Transport::scope_of(header.kind) {
+            Scope::Group => self.open_group(from, header.key_epoch, buf),
+            Scope::Pairwise => self.key.lock().unwrap().peers.open_pairwise(from, buf).map(|_counter| ()),
+            Scope::Unsealed => Err(CryptoError::UnsealedKind(header.kind)),
+        }
+    }
+
+    /// Same contract and salt-trial behavior as [`Transport::open_group`] —
+    /// see that method's doc for the full F1/F2 (T9 review round 1) account.
+    fn open_group(&mut self, from: NodeId, epoch: u16, buf: &mut Vec<u8>) -> Result<(), CryptoError> {
+        let mut key = self.key.lock().unwrap();
+        if key.group.schedule().get(epoch).is_none() {
+            return Err(CryptoError::NoGroupKey);
+        }
+
+        let mut last_err = CryptoError::NoSession(from);
+
+        if let Some(salt) = key.peers.peer_boot_salt(from) {
+            match Self::open_group_under_salt(&key.group, from, epoch, &salt, buf) {
+                Ok(counter) => {
+                    drop(key);
+                    return Self::finish_group_open(&mut self.group_replay, from, epoch, salt, counter);
+                }
+                Err(e) => last_err = e,
+            }
+        }
+
+        if let Some(salt) = key.peers.peer_pending_boot_salt(from) {
+            match Self::open_group_under_salt(&key.group, from, epoch, &salt, buf) {
+                Ok(counter) => {
+                    key.peers.promote_pending(from);
+                    drop(key);
+                    return Self::finish_group_open(&mut self.group_replay, from, epoch, salt, counter);
+                }
+                Err(e) => last_err = e,
+            }
+        }
+
+        Err(last_err)
+    }
+
+    /// One salt trial — see [`Transport::open_group_under_salt`]'s doc.
+    fn open_group_under_salt(
+        group: &GroupPlane,
+        from: NodeId,
+        epoch: u16,
+        salt: &BootSalt,
+        buf: &mut Vec<u8>,
+    ) -> Result<u64, CryptoError> {
+        let group_key = group.schedule().get(epoch).ok_or(CryptoError::NoGroupKey)?;
+        let key: Zeroizing<[u8; 32]> = Zeroizing::new(derive_send_key(group_key, from, salt));
+        open_in_place(buf, &key)
+    }
+
+    /// Records `counter` in the `(from, epoch, salt)` replay window — see
+    /// [`Transport::finish_group_open`]'s doc (including F7, T9 review round 1).
+    fn finish_group_open(
+        group_replay: &mut HashMap<(NodeId, u16, BootSalt), ReplayWindow>,
+        from: NodeId,
+        epoch: u16,
+        salt: BootSalt,
+        counter: u64,
+    ) -> Result<(), CryptoError> {
+        let window = group_replay.entry((from, epoch, salt)).or_default();
+        if window.check_and_set(counter) {
+            Ok(())
+        } else {
+            Err(CryptoError::Replayed(counter))
+        }
     }
 }
 
@@ -1528,5 +1930,224 @@ mod tests {
         // (last_reload_attempt_ns starts at 0, and this call also happens at
         // now_ns=0), so this must be a false/no-op, not an error.
         assert!(matches!(t.allowlist_reload_if_stale(0), Ok(false)));
+    }
+
+    // ------------------------------------------------- M8 ownership split
+    // (SharedTransport / SendHalf / ReceiveHalf, T10 review round 1 fix,
+    // 2026-07-29). These mirror Transport's own end-to-end tests above —
+    // the point is to prove the split is BEHAVIORALLY IDENTICAL to the
+    // monolithic facade it was carved out of, not merely that it compiles.
+
+    /// [`SharedTransport`] sibling of [`node_transport`] — same fixture
+    /// discipline (real key material under `CARGO_TARGET_TMPDIR`, per-tag
+    /// scratch dir so parallel tests never race on the same file).
+    fn shared_node_transport(
+        tag: &str,
+        self_id: NodeId,
+        private: [u8; 32],
+        allow: &[(NodeId, [u8; 32])],
+    ) -> SharedTransport {
+        let dir = scratch_dir(tag);
+        let key_path = dir.join("node.key");
+        std::fs::write(&key_path, private).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let allow_path = dir.join("allowlist");
+        let mut text = String::new();
+        for (id, public) in allow {
+            use base64::Engine;
+            text.push_str(&format!(
+                "{id} {}\n",
+                base64::engine::general_purpose::STANDARD.encode(public)
+            ));
+        }
+        std::fs::write(&allow_path, text).unwrap();
+
+        let cfg = CryptoConfig::Enabled {
+            key_path,
+            allowlist_path: allow_path,
+            rotation: RotationPolicy::default(),
+        };
+        SharedTransport::new(&cfg, self_id).unwrap().unwrap()
+    }
+
+    /// Drives a real Noise IK handshake between two [`SharedTransport`]s'
+    /// shared `Peers` directly (same shape as [`pump_handshake`]/[`establish`]
+    /// above, adapted for the `Arc<Mutex<KeyState>>` each locks into
+    /// independently — this is legitimate here even though `SharedTransport`
+    /// is `Clone`+`Arc`-backed: `a` and `b` are two DIFFERENT nodes' state in
+    /// this test, not two handles to the SAME node).
+    fn shared_establish(a: &SharedTransport, b: &SharedTransport) {
+        let (a_id, b_id) = (a.self_id(), b.self_id());
+        let mut acts = {
+            let mut ak = a.key.lock().unwrap();
+            ak.peers.initiate(b_id, 0)
+        };
+        for _ in 0..8 {
+            let mut next = Vec::new();
+            for act in acts.drain(..) {
+                if let HandshakeAction::Send { to, kind, body } = act {
+                    if to == b_id {
+                        next.extend(b.key.lock().unwrap().peers.on_message(a_id, kind, &body, 0));
+                    } else if to == a_id {
+                        next.extend(a.key.lock().unwrap().peers.on_message(b_id, kind, &body, 0));
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            acts = next;
+        }
+        assert!(a.key.lock().unwrap().peers.is_established(b_id), "a failed to establish with b");
+        assert!(b.key.lock().unwrap().peers.is_established(a_id), "b failed to establish with a");
+    }
+
+    /// Mints a group key on `leader` and delivers it to `follower` — same
+    /// shape as [`deliver_group_key`] above, bypassing the pairwise AEAD
+    /// layer (this only needs to key-synchronize `GroupPlane`, not re-prove
+    /// the handshake layer).
+    fn shared_deliver_group_key(leader: &SharedTransport, follower: &SharedTransport, peers: &[NodeId]) -> u16 {
+        let (leader_id, follower_id) = (leader.self_id(), follower.self_id());
+        let (epoch, actions) = leader.mint_group_key(peers, 0);
+        for act in actions {
+            let HandshakeAction::Send { to, body, .. } = act else {
+                panic!("mint must emit a Send action")
+            };
+            assert_eq!(to, follower_id);
+            let reply = follower.key.lock().unwrap().group.on_key_message(leader_id, &body);
+            for r in reply {
+                let HandshakeAction::Send { body: rbody, .. } = r else {
+                    panic!("a well-formed delivery must ack back")
+                };
+                leader.key.lock().unwrap().group.on_key_message(follower_id, &rbody);
+            }
+        }
+        epoch
+    }
+
+    #[test]
+    fn shared_transport_group_scope_round_trips_through_send_and_receive_halves() {
+        // The core proof this correction actually works: a SendHalf derived
+        // from the LEADER's SharedTransport seals, a ReceiveHalf derived
+        // from the FOLLOWER's SharedTransport opens — through the split
+        // public API only (send_half/receive_half), not by reaching into
+        // KeyState. Mirrors Transport's own
+        // group_scope_round_trips_end_to_end_through_seal_and_open.
+        let leader = shared_node_transport(
+            "split-group-e2e-leader",
+            1,
+            PRIV_A,
+            &[(1, public_of(PRIV_A)), (2, public_of(PRIV_B))],
+        );
+        let follower = shared_node_transport(
+            "split-group-e2e-follower",
+            2,
+            PRIV_B,
+            &[(1, public_of(PRIV_A)), (2, public_of(PRIV_B))],
+        );
+        shared_establish(&leader, &follower);
+        // A vacuous throwaway mint first: GroupPlane::next_epoch starts at 0
+        // on a fresh process, so the FIRST-EVER mint's epoch is 0 —
+        // indistinguishable from a header's zero-initialized key_epoch field
+        // (same trap `seal_group_stamps_the_chosen_epoch_into_the_header`
+        // names on Transport directly; hit for real here on first run).
+        let _ = leader.mint_group_key(&[], 0);
+        let epoch = shared_deliver_group_key(&leader, &follower, &[2]);
+        assert_ne!(epoch, 0, "fixture should not accidentally observe the zero-init epoch");
+
+        let mut send = leader.send_half();
+        let mut recv = follower.receive_half();
+
+        let mut d = data_datagram();
+        let plain = d.clone();
+        send.seal(DGRAM_KIND_DATA, None, &mut d, 0).unwrap();
+        assert_ne!(d, plain, "sealing must actually change the buffer");
+        recv.open(1, &mut d).expect("follower's ReceiveHalf must open what leader's SendHalf sealed");
+        // `open` does NOT restore the header's `key_epoch` to whatever the
+        // caller staged before sealing -- `seal_group` permanently stamps
+        // the REAL epoch it sealed under (by design: the receiver needs to
+        // see which epoch to trust), and open never rewrites it. Comparing
+        // the WHOLE buffer against `plain` (which used the zero-init
+        // default) would only pass by the SAME "mint #1 is epoch 0"
+        // coincidence `seal_group_stamps_the_chosen_epoch_into_the_header`
+        // guards against directly -- caught here for real by minting a
+        // second (non-zero) epoch first. Check the epoch explicitly, then
+        // the rest of the buffer.
+        assert_eq!(
+            read_datagram_header(&d).key_epoch,
+            epoch,
+            "the header keeps the REAL epoch after open, not whatever was staged before seal"
+        );
+        assert_eq!(
+            &d[DATAGRAM_HEADER_LEN..],
+            &plain[DATAGRAM_HEADER_LEN..],
+            "payload is byte-exact after the round trip"
+        );
+        assert_eq!(
+            &d[..OFF_DGRAM_KEY_EPOCH],
+            &plain[..OFF_DGRAM_KEY_EPOCH],
+            "every header field OTHER than key_epoch is unchanged"
+        );
+    }
+
+    #[test]
+    fn shared_transport_pairwise_scope_round_trips_through_send_and_receive_halves() {
+        let a = shared_node_transport(
+            "split-pairwise-e2e-a",
+            1,
+            PRIV_A,
+            &[(1, public_of(PRIV_A)), (2, public_of(PRIV_B))],
+        );
+        let b = shared_node_transport(
+            "split-pairwise-e2e-b",
+            2,
+            PRIV_B,
+            &[(1, public_of(PRIV_A)), (2, public_of(PRIV_B))],
+        );
+        shared_establish(&a, &b);
+
+        let mut send = a.send_half();
+        let mut recv = b.receive_half();
+
+        let mut d = vote_datagram();
+        let plain = d.clone();
+        send.seal(DGRAM_KIND_VOTE, Some(2), &mut d, 0).unwrap();
+        assert_ne!(d, plain);
+        recv.open(1, &mut d).expect("b's ReceiveHalf must open what a's SendHalf sealed");
+        assert_eq!(d, plain);
+    }
+
+    #[test]
+    fn send_half_and_receive_half_agree_on_now_ns_because_they_share_one_clock() {
+        // The "one clock source" requirement, pinned structurally: both
+        // halves derive `now_ns()` from the SAME `SharedTransport::base`, so
+        // calling both back-to-back must yield near-identical values — NOT
+        // two independently-started `Instant`s (which this fixture cannot
+        // literally simulate without sleeping, but the shared-origin
+        // property IS directly checkable: both must be small, close, and
+        // monotonically consistent with a SINGLE elapsed-since-construction
+        // clock rather than each starting back near zero independently).
+        let t = shared_node_transport("shared-clock", 1, PRIV_SOLO, &[]);
+        let send = t.send_half();
+        let recv = t.receive_half();
+        let (n1, n2) = (send.now_ns(), recv.now_ns());
+        // Both computed from the identical `base`, microseconds apart at
+        // most (this line of code, not a network hop) -- an independent
+        // per-half Instant::now() origin would instead read close to ZERO
+        // on EACH call (since each would have JUST started), making this
+        // assertion vacuously true either way; the discriminating check is
+        // that `t.now_ns()` (the canonical source) also agrees, monotonically.
+        let t_ns = t.now_ns();
+        assert!(n2 >= n1, "receive half's clock must not run behind the send half's");
+        assert!(t_ns >= n2, "SharedTransport's own now_ns must not run behind either half's");
+        assert!(
+            t_ns - n1 < 50_000_000,
+            "all three readings must be close together (same origin), not independently-started clocks: {n1} vs {t_ns}"
+        );
     }
 }
