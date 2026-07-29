@@ -142,6 +142,7 @@ use rand::TryRngCore;
 use rand::rngs::OsRng;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use uc_protocol::v2::crypto::{DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_KEY, DGRAM_KIND_HS_RESP};
@@ -754,12 +755,26 @@ struct KeyState {
 /// The Arc-shareable production facade `uc2_net`/`uc2_node` construct once
 /// per process and hand [`SendHalf`]/[`ReceiveHalf`] out from. See the
 /// module section docs above.
+///
+/// **Round-2 review fix (2026-07-29):** `send_half`/`receive_half` singleness
+/// was originally documentation-only ("call exactly once per process"). That
+/// is not enforceable: both methods take `&self`, `SharedTransport` is
+/// `Clone`, and every half starts its own nonce counter at `0` — so ANY
+/// holder of ANY clone calling `send_half` a second time silently mints a
+/// second counter that starts back at `0` under the SAME group key. That is
+/// a repeated `(key, nonce)` pair under AES-256-GCM: not a wrong answer, a
+/// full authentication-subkey compromise for every message ever sealed
+/// under that key. A doc comment cannot bind a call site it will never see.
+/// `send_half_taken`/`receive_half_taken` make the SECOND call impossible
+/// instead of merely discouraged — see both methods below.
 #[derive(Clone)]
 pub struct SharedTransport {
     self_id: NodeId,
     boot_salt: BootSalt,
     base: Instant,
     key: Arc<Mutex<KeyState>>,
+    send_half_taken: Arc<AtomicBool>,
+    receive_half_taken: Arc<AtomicBool>,
 }
 
 impl SharedTransport {
@@ -794,6 +809,8 @@ impl SharedTransport {
                 group: GroupPlane::new(self_id),
                 rotation: RotationState::new(rotation),
             })),
+            send_half_taken: Arc::new(AtomicBool::new(false)),
+            receive_half_taken: Arc::new(AtomicBool::new(false)),
         }))
     }
 
@@ -808,9 +825,28 @@ impl SharedTransport {
         self.base.elapsed().as_nanos() as u64
     }
 
-    /// Hands out the send half. Call exactly once per process — see
-    /// [`SendHalf`]'s doc above on why a second one is unsafe (nonce reuse).
+    /// Hands out the send half. Enforced (round-2 review fix), not merely
+    /// documented, to be callable exactly once per process — across EVERY
+    /// clone of this `SharedTransport`, since `send_half_taken` is an `Arc`
+    /// shared by all of them. A second call panics rather than silently
+    /// minting a second nonce counter over the same key — see
+    /// [`SharedTransport`]'s doc above and [`SendHalf`]'s doc for why that
+    /// would be catastrophic, not just wrong.
+    ///
+    /// # Panics
+    /// If called more than once (on this `SharedTransport` or any clone of
+    /// it).
     pub fn send_half(&self) -> SendHalf {
+        self.send_half_taken
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .expect(
+                "SharedTransport::send_half called more than once for the same process (directly \
+                 or via a clone) — a second SendHalf would start its nonce counter back at 0 \
+                 under the SAME group key: a repeated (key, nonce) pair under AES-256-GCM, which \
+                 leaks the authentication subkey and breaks every message ever sealed under that \
+                 key, not just the repeat. Call this exactly once per process and hand the result \
+                 to the sender agent.",
+            );
         SendHalf {
             self_id: self.self_id,
             boot_salt: self.boot_salt,
@@ -821,9 +857,22 @@ impl SharedTransport {
         }
     }
 
-    /// Hands out the receive half. Call exactly once per process — see
-    /// [`ReceiveHalf`]'s doc above.
+    /// Hands out the receive half. Same enforced-once discipline as
+    /// [`SharedTransport::send_half`] — see that method's doc.
+    ///
+    /// # Panics
+    /// If called more than once (on this `SharedTransport` or any clone of
+    /// it).
     pub fn receive_half(&self) -> ReceiveHalf {
+        self.receive_half_taken
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .expect(
+                "SharedTransport::receive_half called more than once for the same process \
+                 (directly or via a clone) — two receive halves would keep two independent \
+                 group-replay windows, each seeing only part of the traffic, which can accept a \
+                 counter one of them should have rejected as a replay. Call this exactly once \
+                 per process and hand the result to the receiver agent.",
+            );
         ReceiveHalf {
             base: self.base,
             key: Arc::clone(&self.key),
@@ -2149,5 +2198,51 @@ mod tests {
             t_ns - n1 < 50_000_000,
             "all three readings must be close together (same origin), not independently-started clocks: {n1} vs {t_ns}"
         );
+    }
+
+    // ---- Round-2 review fix (2026-07-29): send_half/receive_half must be
+    // enforced single-call, not merely documented — a second SendHalf would
+    // start its nonce counter back at 0 under the SAME group key.
+
+    #[test]
+    #[should_panic(expected = "send_half called more than once")]
+    fn a_second_send_half_from_the_same_shared_transport_panics() {
+        let t = shared_node_transport("second-send-half-same", 1, PRIV_SOLO, &[]);
+        let _first = t.send_half();
+        let _second = t.send_half(); // must panic: would nonce-collide with `_first`
+    }
+
+    #[test]
+    #[should_panic(expected = "send_half called more than once")]
+    fn a_second_send_half_via_a_clone_of_shared_transport_also_panics() {
+        // The whole point: SharedTransport is Clone, so the enforcement
+        // cannot be a plain (non-Arc) field on the struct — it must be
+        // shared across every clone, exactly like `key` is. A holder of a
+        // CLONE, not the original, is the realistic way a second SendHalf
+        // would ever get minted (e.g. two components of the node layer each
+        // holding their own clone, one of them wrongly assuming it owns
+        // "the" send half).
+        let t = shared_node_transport("second-send-half-clone", 1, PRIV_SOLO, &[]);
+        let clone = t.clone();
+        let _first = t.send_half();
+        let _second = clone.send_half(); // must panic: same underlying counter state
+    }
+
+    #[test]
+    #[should_panic(expected = "receive_half called more than once")]
+    fn a_second_receive_half_from_the_same_shared_transport_panics() {
+        let t = shared_node_transport("second-receive-half-same", 1, PRIV_SOLO, &[]);
+        let _first = t.receive_half();
+        let _second = t.receive_half(); // must panic: independent replay windows would diverge
+    }
+
+    #[test]
+    fn send_half_and_receive_half_are_independent_single_call_budgets() {
+        // Calling send_half() must not consume receive_half()'s allowance,
+        // or vice versa -- they are two SEPARATE flags, not one shared "any
+        // half taken" bit. Both succeed once each on the SAME SharedTransport.
+        let t = shared_node_transport("independent-budgets", 1, PRIV_SOLO, &[]);
+        let _send = t.send_half();
+        let _recv = t.receive_half(); // must NOT panic
     }
 }

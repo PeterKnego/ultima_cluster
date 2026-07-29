@@ -1008,9 +1008,22 @@ impl Sender {
     /// mapping (nothing in `uc2_net` does, as of this task; `SnapSession` and
     /// every follower-facing field in this module are keyed by `SocketAddr`
     /// only). Wiring Pairwise-scope kinds through `uc2_net` is out of this
-    /// task's scope (`assemble`/`fan_out`/`serve_nak`, all `Scope::Group`) and
-    /// left for whichever later task adds that mapping — snapshot transfer
-    /// stays cleartext under M8 until then. Tracked, not silently dropped.
+    /// task's scope (`assemble`/`fan_out`/`serve_nak`, all `Scope::Group`).
+    ///
+    /// **This is worse than a confidentiality gap.** `send_snap_chunk` ships
+    /// the raw bytes of the service-built snapshot artifact — the complete
+    /// serialized state machine — in the clear. Worse, `send_snap_begin`'s
+    /// body carries `SnapBeginBody.config`, the encoded cluster
+    /// `ConfigRecord`, and the receive path feeds that straight into
+    /// `maybe_adopt_incoming_snapshot`. Unsealed means unauthenticated: an
+    /// on-path attacker can forge a `SNAP_BEGIN` to a joining or below-floor
+    /// node and install **attacker-chosen application state AND
+    /// attacker-chosen cluster membership** — a consensus-integrity
+    /// primitive, not a privacy footnote. Ruled acceptable ONLY as a
+    /// temporary state, closed by Task 17 ("Seal the remaining pairwise
+    /// sends in `uc2_net`", runs immediately after Task 12 and before the
+    /// T15 capstones / T16 throughput gate so neither measures a build with
+    /// this gap still open) — see that task's brief for the full account.
     fn assemble_snap(&mut self, position: u64, kind: u8, payload: &[u8]) {
         self.scratch.clear();
         self.scratch.resize(DATAGRAM_HEADER_LEN, 0);
