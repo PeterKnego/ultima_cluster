@@ -941,7 +941,7 @@ impl Node {
             crypto_committed_config_version: None,
             crypto_peers_dirty: true,
             crypto_hs_key_seal_failures: Arc::new(AtomicU64::new(0)),
-            crypto_hs_unknown_source: Arc::new(AtomicU64::new(0)),
+            crypto_unresolved_peer: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
             crypto_last_log_ns: 0,
         };
@@ -1363,9 +1363,16 @@ struct Consensus {
     /// the clear. Self-healing: the re-delivery sweep retries once the
     /// handshake completes.
     crypto_hs_key_seal_failures: Arc<AtomicU64>,
-    /// Inbound handshake datagrams from a source address this node has no
-    /// `NodeId` for (a stranger, or a peer removed from the config).
-    crypto_hs_unknown_source: Arc<AtomicU64>,
+    /// Handshake-plane datagrams dropped because an address and a `NodeId`
+    /// could not be matched up — in EITHER direction: an inbound datagram
+    /// from a source address this node has no id for (a stranger, or a peer
+    /// removed from the config), or an outbound action naming a peer id with
+    /// no address in the adopted config (a config change that raced the
+    /// action). Both are the same operator-visible condition — "the crypto
+    /// plane and the membership view disagree about who exists" — so they
+    /// share one counter rather than two that would always have to be read
+    /// together.
+    crypto_unresolved_peer: Arc<AtomicU64>,
     /// `HandshakeAction::Failed` observations — a peer that is not (yet) in
     /// the allowlist, or whose handshake did not authenticate.
     crypto_handshake_failures: Arc<AtomicU64>,
@@ -1609,7 +1616,7 @@ impl Consensus {
                 // stranger (or a removed peer) — counted and dropped, never
                 // fed to the handshake state machine under a guessed id.
                 let Some(&peer) = self.addr_to_id.get(&from) else {
-                    self.crypto_hs_unknown_source.fetch_add(1, Ordering::Relaxed);
+                    self.crypto_unresolved_peer.fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
                 let now = crypto.now_ns();
@@ -1854,7 +1861,7 @@ impl Consensus {
     /// clear, which would make the whole feature optional per datagram.
     fn crypto_send(&mut self, to: NodeId, kind: u8, body: Vec<u8>) {
         let Some(&addr) = self.id_to_addr.get(&to) else {
-            self.crypto_hs_unknown_source.fetch_add(1, Ordering::Relaxed);
+            self.crypto_unresolved_peer.fetch_add(1, Ordering::Relaxed);
             return;
         };
         let mut d = vec![0u8; DATAGRAM_HEADER_LEN + body.len()];
@@ -4172,7 +4179,7 @@ mod tests {
             crypto_committed_config_version: None,
             crypto_peers_dirty: true,
             crypto_hs_key_seal_failures: Arc::new(AtomicU64::new(0)),
-            crypto_hs_unknown_source: Arc::new(AtomicU64::new(0)),
+            crypto_unresolved_peer: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
             crypto_last_log_ns: 0,
         };
@@ -5904,7 +5911,7 @@ mod tests {
         let stranger: SocketAddr = "127.0.0.1:9199".parse().unwrap();
         h.h.hs_tx.try_send((stranger, DGRAM_KIND_HS_INIT, vec![0xAB; 116])).unwrap();
         h.h.cons.do_work();
-        assert_eq!(h.h.cons.crypto_hs_unknown_source.load(Ordering::Relaxed), 1);
+        assert_eq!(h.h.cons.crypto_unresolved_peer.load(Ordering::Relaxed), 1);
         assert_eq!(
             h.h.cons.crypto_handshake_failures.load(Ordering::Relaxed),
             failures,
