@@ -819,6 +819,20 @@ impl SharedTransport {
         self.self_id
     }
 
+    /// This process's boot salt — see the module docs and `schedule.rs`:
+    /// documented as "a public separator, not secret material" (unlike
+    /// `self_id`, it changes every process lifetime, which is the whole
+    /// point — see `Transport::new`'s own doc for why `boot_salt` is never
+    /// wrapped in a zeroizing type). Exposed for the same reason `self_id`
+    /// is: a caller outside this crate that needs to derive the exact key a
+    /// real seal would use (e.g. a test constructing a scenario `mint`
+    /// itself can no longer reach, like epoch 0 — see `group.rs`'s
+    /// reservation of epoch 0 as the wire's cleartext sentinel) has no
+    /// other way to reach it.
+    pub fn boot_salt(&self) -> BootSalt {
+        self.boot_salt
+    }
+
     /// The canonical crypto clock — see the module section docs' "One clock
     /// source" paragraph. Every [`SendHalf`]/[`ReceiveHalf`] handed out by
     /// this [`SharedTransport`] computes `now_ns` from the SAME origin.
@@ -1768,18 +1782,23 @@ mod tests {
         // unactivated fold, so it STILL names e0 — which sealing_epoch falls
         // back to (e2 hasn't activated yet either), and schedule().get(e0)
         // is now None.
+        //
+        // `e0`/`e1`/`e2` are LABELS for "1st/2nd/3rd mint", not literal
+        // epoch numbers: `GroupPlane::new` now starts `next_epoch` at 1 (0
+        // is reserved as the wire's cleartext sentinel — see its doc), so
+        // e0/e1/e2 are epochs 1/2/3, not 0/1/2.
         let mut t = node_transport("evicted-epoch-seal", 1, PRIV_SOLO, &[]);
-        t.group.mint(&[], 0); // e0: vacuous peers
-        t.group.mint(&[9], 1); // folds e0 (activated) into active_epoch; mints e1 (peer 9 never acks)
-        t.group.mint(&[9], 2); // e1 never activated -> dropped; schedule evicts e0; active_epoch still names e0
+        t.group.mint(&[], 0); // e0 = epoch 1: vacuous peers
+        t.group.mint(&[9], 1); // e1 = epoch 2: folds e0 (activated) into active_epoch; peer 9 never acks
+        t.group.mint(&[9], 2); // e2 = epoch 3: e1 never activated -> dropped; schedule evicts e0; active_epoch still names e0
         assert_eq!(
             t.group.sealing_epoch(2),
-            Some(0),
-            "fixture must reproduce sealing_epoch naming a stale active_epoch"
+            Some(1),
+            "fixture must reproduce sealing_epoch naming a stale active_epoch (e0 = epoch 1)"
         );
         assert!(
-            t.group.schedule().get(0).is_none(),
-            "e0 must actually be evicted from the 2-deep schedule for this test to mean anything"
+            t.group.schedule().get(1).is_none(),
+            "e0 (epoch 1) must actually be evicted from the 2-deep schedule for this test to mean anything"
         );
 
         // A non-zero sentinel key_epoch, so ANY write to the header field —
@@ -1932,9 +1951,34 @@ mod tests {
         assert_ne!(d, plain, "sealing must actually change the buffer");
         b.open(1, &mut d)
             .expect("b must be able to open what a sealed");
+        // `open` does NOT restore the header's `key_epoch` to whatever the
+        // caller staged before sealing -- `seal_group` permanently stamps
+        // the REAL epoch it sealed under (the receiver needs to see which
+        // epoch to trust), so a byte-exact whole-buffer comparison against
+        // `plain` (whose `key_epoch` is the zero-init default) is only ever
+        // true if the epoch under test happens to BE 0 -- exactly the
+        // fixture trap this file's own tests name repeatedly elsewhere
+        // (`seal_group_stamps_the_chosen_epoch_into_the_header`,
+        // `shared_transport_group_scope_round_trips_through_send_and_receive_halves`).
+        // `GroupPlane`'s first-ever mint is now epoch 1, not 0 (0 is
+        // reserved as the wire's cleartext sentinel — see `GroupPlane::new`'s
+        // doc), so this single-mint fixture no longer coincides with that
+        // trap by accident; assert the epoch explicitly rather than lean on
+        // it staying that way.
         assert_eq!(
-            d, plain,
-            "round trip through the public facade is byte-exact"
+            read_datagram_header(&d).key_epoch,
+            epoch,
+            "the header keeps the REAL epoch after open, not whatever was staged before seal"
+        );
+        assert_eq!(
+            &d[DATAGRAM_HEADER_LEN..],
+            &plain[DATAGRAM_HEADER_LEN..],
+            "payload is byte-exact after the round trip"
+        );
+        assert_eq!(
+            &d[..OFF_DGRAM_KEY_EPOCH],
+            &plain[..OFF_DGRAM_KEY_EPOCH],
+            "every header field OTHER than key_epoch is unchanged"
         );
     }
 

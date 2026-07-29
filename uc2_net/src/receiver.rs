@@ -790,23 +790,33 @@ impl FollowerReceiver {
         let h = read_datagram_header(&buf[..n]);
 
         // ---- T17 TEMPORARY ALLOWANCE — grep "T17" ------------------------
-        // SNAP_BEGIN/SNAP_CHUNK ship cleartext until Task 17 seals the
-        // remaining pairwise sends in `uc2_net` (T10 left them unsealed:
-        // pairwise sealing needs an established handshake session, which
-        // nothing drives until Task 12; see `assemble_snap`'s doc in
-        // `sender.rs` for the send-side half of this same disclosure).
-        // Dropping them here — treating them as "must be sealed like
-        // everything else" — would wedge snapshot transfer the moment
-        // crypto is ON: a learner, a cold-started node, or a below-floor
-        // follower can ONLY converge via a snapshot session, and this is
-        // that session's entire wire path. This allowance is exactly what
-        // makes forged-membership injection possible until T17 lands:
-        // `SNAP_BEGIN` carries `SnapBeginBody.config` straight into
-        // `maybe_adopt_incoming_snapshot`, so an on-path attacker can forge
-        // a session and install attacker-chosen application state AND
-        // attacker-chosen cluster membership on a joining/below-floor node.
-        // Task 17 deletes this `if` in one edit and confirms the receive
-        // path then refuses unsealed SNAP.
+        // SNAP_BEGIN/SNAP_CHUNK (leader -> receiving node) ship cleartext
+        // until Task 17/T17 seals the remaining pairwise sends in `uc2_net`
+        // (T10 left them unsealed: pairwise sealing needs an established
+        // handshake session, which nothing drives until Task 12; see
+        // `assemble_snap`'s doc in `sender.rs` for the send-side half of
+        // this same disclosure). Dropping them here — treating them as
+        // "must be sealed like everything else" — would refuse a snapshot
+        // session's opening chunks outright the moment crypto is ON. This
+        // allowance is a PARTIAL mitigation, not a fix for snapshot
+        // wedging, and does NOT widen to cover it: `SNAP_NAK`/`SNAP_DONE`
+        // (the receiving node's OWN replies, the OTHER direction of the
+        // same session — chunk-loss retry and completion signaling) are
+        // EQUALLY cleartext pre-T17 and are NOT allowed through this seam,
+        // so a session still stalls on its first lost chunk and never
+        // signals completion until T17 lands (review round 1, finding 3) —
+        // narrowing further than that is not possible without widening the
+        // allowance, and the whole pairwise plane is down pre-T17 anyway
+        // (no live traffic exists on the other side of that gap yet, so
+        // there is no window being left open by NOT widening). This
+        // allowance is also exactly what makes forged-membership injection
+        // possible until T17 lands: `SNAP_BEGIN` carries
+        // `SnapBeginBody.config` straight into `maybe_adopt_incoming_snapshot`,
+        // so an on-path attacker can forge a session and install
+        // attacker-chosen application state AND attacker-chosen cluster
+        // membership on a joining/below-floor node. Task 17 deletes this
+        // `if` in one edit and confirms the receive path then refuses
+        // unsealed SNAP.
         if matches!(h.kind, DGRAM_KIND_SNAP_BEGIN | DGRAM_KIND_SNAP_CHUNK) {
             return Some(n);
         }
@@ -2539,14 +2549,13 @@ mod tests {
             acts = next;
         }
 
-        // A vacuous throwaway mint first: `GroupPlane::next_epoch` starts at
-        // 0 on a fresh process, so the FIRST-EVER mint's epoch is 0 --
-        // indistinguishable from a header's zero-initialized `key_epoch`
-        // field. Same trap `uc2_crypto::transport`'s own tests name
-        // explicitly; hit for real in this harness's first draft.
-        let _ = peer.mint_group_key(&[], 0);
+        // `GroupPlane::next_epoch` now starts at 1, not 0 -- epoch 0 is
+        // reserved as the wire's cleartext sentinel (`group.rs`'s
+        // `GroupPlane::new` doc; the fix for the review finding that this
+        // very fixture used to dodge by minting twice). A single mint
+        // already gives a non-zero epoch; no throwaway mint needed anymore.
         let (epoch, mint_acts) = peer.mint_group_key(&[RECV_ID], 0);
-        assert_ne!(epoch, 0, "fixture must not accidentally observe the zero-init epoch");
+        assert_ne!(epoch, 0, "epoch 0 is reserved and must never be minted");
         for act in mint_acts {
             let uc2_crypto::HandshakeAction::Send { to, body, .. } = act else {
                 panic!("mint must emit a Send action")
@@ -2563,6 +2572,79 @@ mod tests {
 
         let send = peer.send_half();
         (recv, send, epoch)
+    }
+
+    /// T11 review round 1, finding 1: a mint-once-style fixture that
+    /// reaches REAL epoch 0 on the receiver's schedule, despite
+    /// `GroupPlane::mint` no longer being able to produce epoch 0 itself
+    /// (fix 2 of the same review round — 0 is now reserved, see
+    /// `group.rs`'s `GroupPlane::new` doc). This is not a synthetic
+    /// shortcut: it hand-crafts a real, well-formed `HS_KEY` DELIVERY body
+    /// for epoch 0, per `uc2_crypto::group`'s own documented wire format
+    /// (`[1B type=0][2B epoch LE][32B group key]`), and feeds it through
+    /// the SAME `on_group_key_message` entry point a real opened HS_KEY
+    /// datagram would use. `GroupPlane::on_key_message`'s install path has
+    /// no "refuse epoch 0" guard (nor should it grow one just for this: the
+    /// receive-side shape check this fixture exists to test must hold
+    /// regardless of how epoch 0 ever got into a schedule -- a mismatched
+    /// peer running older code, a bug elsewhere, or exactly this fixture --
+    /// not merely because THIS crate's own minter now avoids it).
+    ///
+    /// Returns `(receiver's SharedTransport, the AES key that seals as
+    /// PEER_ID under epoch 0)` — the caller manually seals with
+    /// `uc2_crypto::seal::seal_in_place` (like `send_sealed_under_epoch`
+    /// already does for OTHER epochs) rather than through a `SendHalf`,
+    /// since `SendHalf::seal`'s `sealing_epoch()` is driven by `mint`/fold
+    /// state that (correctly, post-fix-2) can never point at epoch 0.
+    fn established_crypto_pair_with_forced_epoch_zero(tag: &str) -> (uc2_crypto::SharedTransport, [u8; 32]) {
+        let peer_pub = identity_public(&format!("{tag}-peer-pub"), PRIV_PEER);
+        let recv_pub = identity_public(&format!("{tag}-recv-pub"), PRIV_RECV);
+        let peer = crypto_shared(
+            &format!("{tag}-peer"),
+            PEER_ID,
+            PRIV_PEER,
+            &[(PEER_ID, peer_pub), (RECV_ID, recv_pub)],
+        );
+        let recv = crypto_shared(
+            &format!("{tag}-recv"),
+            RECV_ID,
+            PRIV_RECV,
+            &[(PEER_ID, peer_pub), (RECV_ID, recv_pub)],
+        );
+
+        let mut acts = peer.initiate(RECV_ID, 0);
+        for _ in 0..8 {
+            let mut next = Vec::new();
+            for act in acts.drain(..) {
+                if let uc2_crypto::HandshakeAction::Send { to, kind, body } = act {
+                    if to == RECV_ID {
+                        next.extend(recv.on_handshake_message(PEER_ID, kind, &body, 0));
+                    } else if to == PEER_ID {
+                        next.extend(peer.on_handshake_message(RECV_ID, kind, &body, 0));
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            acts = next;
+        }
+
+        let key_bytes = [0x5Au8; 32];
+        let mut body = vec![0u8]; // MSG_KEY = 0 (delivery)
+        body.extend_from_slice(&0u16.to_le_bytes()); // epoch = 0
+        body.extend_from_slice(&key_bytes);
+        let reply = recv.on_group_key_message(PEER_ID, &body);
+        assert!(!reply.is_empty(), "a well-formed delivery must ack back");
+
+        // The AES key a real seal under (epoch 0, sender = PEER_ID) would
+        // use -- derived exactly as `SendHalf::seal_group` derives it,
+        // using the peer's REAL (OS-RNG, per-process) boot salt, reachable
+        // via the `boot_salt()` getter added for exactly this purpose.
+        let group_key = uc2_crypto::schedule::GroupKey::new(key_bytes);
+        let seal_key = uc2_crypto::schedule::derive_send_key(&group_key, PEER_ID, &peer.boot_salt());
+
+        (recv, seal_key)
     }
 
     /// A crypto-capable fake leader endpoint: a real, established
@@ -2655,6 +2737,106 @@ mod tests {
         r.set_peer_ids([(peer_addr, PEER_ID)]);
 
         (r, CryptoPeer { sock: peer_sock, send: peer_send, epoch }, b)
+    }
+
+    /// T11 review round 1, finding 1: a receiver whose schedule holds a
+    /// REAL, genuinely epoch-0 group key (see
+    /// `established_crypto_pair_with_forced_epoch_zero`'s doc) plus a raw
+    /// peer socket and the AES key needed to seal AS `PEER_ID` under that
+    /// epoch by hand (`uc2_crypto::seal::seal_in_place`, same pattern
+    /// `CryptoPeer::send_sealed_under_epoch` already uses for other
+    /// epochs).
+    fn receiver_with_forced_epoch_zero() -> (FollowerReceiver, FaultSocket, [u8; 32], Arc<LogBuffer>) {
+        let (recv_shared, seal_key) = established_crypto_pair_with_forced_epoch_zero("forced-epoch-zero");
+        let b = buffer();
+        let peer_sock = FaultSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+
+        let mut cfg = FollowerConfig::new(peer_addr);
+        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.status_floor_ns = u64::MAX;
+        cfg.append_pos_floor_ns = u64::MAX;
+
+        let recv_half = recv_shared.receive_half();
+        let mut r = FollowerReceiver::with_crypto(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            cfg,
+            term_handle(TERM),
+            dummy_route(),
+            Some(recv_half),
+        );
+        r.set_peer_ids([(peer_addr, PEER_ID)]);
+
+        (r, peer_sock, seal_key, b)
+    }
+
+    #[test]
+    fn a_real_epoch_zero_sealed_data_datagram_is_admitted_not_diagnosed_as_cleartext() {
+        // T11 review round 1, finding 1: the discriminating conjunct
+        // (`key_epoch == 0 AND too-short-to-be-sealed`) was untested on its
+        // OWN terms -- every existing fixture dodges epoch 0 entirely, so
+        // the naive, WRONG guard (`key_epoch == 0` alone) passed all 70
+        // tests. This is the "reaches real epoch 0" half: a genuinely
+        // 46-byte SEALED DATA datagram (well past the 40-byte floor) under
+        // epoch 0 must be admitted exactly like any other epoch, not
+        // diagnosed as a cleartext peer.
+        use Ordering::Relaxed;
+        let (mut r, mut peer_sock, seal_key, b) = receiver_with_forced_epoch_zero();
+        let to = r.local_addr();
+
+        let runs = frame_runs(&[b"aaaa"], 4096);
+        let (pos, bytes, advance) = &runs[0];
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader { position: *pos, leadership_term_id: TERM, kind: DGRAM_KIND_DATA, flags: 0, key_epoch: 0 },
+        );
+        d.extend_from_slice(bytes);
+        uc2_crypto::seal::seal_in_place(&mut d, &seal_key, 1).unwrap();
+        assert!(d.len() >= DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD, "must be a genuinely sealed-length datagram");
+        peer_sock.send_to(&d, to).unwrap();
+
+        drive_until(&mut r, || b.counters().append.load_acquire() == *advance);
+        let st = r.stats();
+        assert_eq!(st.peer_appears_cleartext.load(Relaxed), 0, "a real epoch-0 seal must not be misdiagnosed");
+        assert_eq!(st.dropped_auth_failed.load(Relaxed), 0);
+        assert_eq!(st.dropped_unknown_epoch.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn a_real_epoch_zero_sealed_heartbeat_at_exactly_the_forty_byte_floor_is_admitted() {
+        // The zero-margin boundary case: an empty-payload HEARTBEAT seals to
+        // EXACTLY `DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD` (40) bytes -- the
+        // shortest a validly sealed frame can ever be, and exactly the
+        // length the cleartext-shape check's `n < 40` compares against. If
+        // that boundary were off by one (`<=` instead of `<`), this is the
+        // one case that would catch it: real, minimal, sealed, epoch 0.
+        use Ordering::Relaxed;
+        let (mut r, mut peer_sock, seal_key, _b) = receiver_with_forced_epoch_zero();
+        let to = r.local_addr();
+
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader { position: 0, leadership_term_id: TERM, kind: DGRAM_KIND_HEARTBEAT, flags: 0, key_epoch: 0 },
+        );
+        uc2_crypto::seal::seal_in_place(&mut d, &seal_key, 1).unwrap();
+        assert_eq!(d.len(), DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD, "the minimal sealed frame is exactly 40 bytes");
+        peer_sock.send_to(&d, to).unwrap();
+
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // HEARTBEAT carries no counter to drive `append`; `datagrams` is the
+        // "reached on_datagram" signal (see the T17-allowance test's own
+        // doc for the same idiom).
+        while st.datagrams.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "the 40-byte epoch-0 HEARTBEAT was never admitted");
+            r.do_work();
+        }
+        assert_eq!(st.peer_appears_cleartext.load(Relaxed), 0, "a real epoch-0 seal must not be misdiagnosed");
+        assert_eq!(st.dropped_auth_failed.load(Relaxed), 0);
+        assert_eq!(st.dropped_unknown_epoch.load(Relaxed), 0);
     }
 
     #[test]
@@ -2868,17 +3050,23 @@ mod tests {
     fn snap_datagrams_are_admitted_cleartext_even_with_crypto_enabled() {
         // The T17 temporary allowance (`crypto_admit`'s "T17 TEMPORARY
         // ALLOWANCE" comment, grep "T17"): SNAP_BEGIN/SNAP_CHUNK ship
-        // cleartext until Task 17 seals the remaining pairwise sends.
-        // Dropping them here would wedge snapshot transfer with crypto ON —
-        // a learner, a cold node, or a below-floor follower can ONLY
-        // converge via a snapshot session. Proven by `stats.datagrams`
-        // (bumped in `on_datagram` for every non-consensus, current-term
-        // datagram BEFORE the kind-specific dispatch) ticking at all — a
-        // raw, unsealed SNAP_BEGIN reaching `on_datagram` proves
-        // `crypto_admit` let it through without attempting to authenticate
-        // it; SNAP_BEGIN's own body-too-short guard then drops it for an
-        // entirely unrelated (non-crypto) reason, since this fixture never
-        // configures snapshot intake — irrelevant to what this test pins.
+        // cleartext until Task 17/T17 seals the remaining pairwise sends.
+        // Dropping them here would refuse a snapshot session's opening
+        // chunks outright the moment crypto is ON -- a PARTIAL mitigation,
+        // not a fix for snapshot wedging in general: `SNAP_NAK`/`SNAP_DONE`
+        // (the OTHER direction of the same session) are equally cleartext
+        // pre-T17 and are NOT covered by this allowance, so a session still
+        // stalls on its first lost chunk and never signals completion until
+        // T17 lands (review round 1, finding 3 — see `crypto_admit`'s own
+        // comment for the full account of why NOT widening is correct).
+        // Proven by `stats.datagrams` (bumped in `on_datagram` for every
+        // non-consensus, current-term datagram BEFORE the kind-specific
+        // dispatch) ticking at all — a raw, unsealed SNAP_BEGIN reaching
+        // `on_datagram` proves `crypto_admit` let it through without
+        // attempting to authenticate it; SNAP_BEGIN's own body-too-short
+        // guard then drops it for an entirely unrelated (non-crypto)
+        // reason, since this fixture never configures snapshot intake —
+        // irrelevant to what this test pins.
         use Ordering::Relaxed;
         let (mut r, mut peer, _b) = receiver_with_crypto();
         let to = r.local_addr();

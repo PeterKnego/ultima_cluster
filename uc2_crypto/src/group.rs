@@ -149,7 +149,14 @@ impl GroupPlane {
         GroupPlane {
             self_id,
             schedule: KeySchedule::new(),
-            next_epoch: 0,
+            // 0 is reserved: `uc_protocol::v2::datagram::OFF_DGRAM_KEY_EPOCH`'s
+            // own doc says "0 = cleartext", and `uc2_net`'s receive seam
+            // (T11) relies on that being true to diagnose a genuinely
+            // cleartext peer distinctly from a generic auth failure. Start
+            // minting at 1 so the first epoch a fresh process ever mints is
+            // never the wire's cleartext sentinel — see `mint`'s wrap guard
+            // for the corresponding "never mint 0 again" rule on overflow.
+            next_epoch: 1,
             active_epoch: None,
             pending: None,
         }
@@ -179,6 +186,13 @@ impl GroupPlane {
 
         let epoch = self.next_epoch;
         self.next_epoch = self.next_epoch.wrapping_add(1);
+        if self.next_epoch == 0 {
+            // 0 is reserved (see `new`'s doc) -- `wrapping_add` would
+            // otherwise recur to it every 65,536 mints. Years-to-decades
+            // away under any real rotation cadence, but the reservation is
+            // only actually complete if BOTH the start and the wrap skip it.
+            self.next_epoch = 1;
+        }
 
         // Written straight into the zeroizing wrapper: no bare `[u8; 32]`
         // ever holds the fresh key, matching `identity.rs`'s

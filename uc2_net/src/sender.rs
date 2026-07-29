@@ -1020,10 +1020,12 @@ impl Sender {
     /// node and install **attacker-chosen application state AND
     /// attacker-chosen cluster membership** — a consensus-integrity
     /// primitive, not a privacy footnote. Ruled acceptable ONLY as a
-    /// temporary state, closed by Task 17 ("Seal the remaining pairwise
+    /// temporary state, closed by Task 17/T17 ("Seal the remaining pairwise
     /// sends in `uc2_net`", runs immediately after Task 12 and before the
     /// T15 capstones / T16 throughput gate so neither measures a build with
     /// this gap still open) — see that task's brief for the full account.
+    /// T11's receiver-side counterpart of this same disclosure is
+    /// `receiver.rs`'s `crypto_admit`, grep "T17 TEMPORARY ALLOWANCE".
     fn assemble_snap(&mut self, position: u64, kind: u8, payload: &[u8]) {
         self.scratch.clear();
         self.scratch.resize(DATAGRAM_HEADER_LEN, 0);
