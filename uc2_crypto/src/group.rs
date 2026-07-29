@@ -257,6 +257,64 @@ impl GroupPlane {
         self.active_epoch
     }
 
+    /// The peers of the newest minted epoch that have not acked it yet —
+    /// empty if nothing has ever been minted, or once everyone has acked.
+    ///
+    /// Added T12, with [`GroupPlane::redeliver_to`], to close a liveness gap
+    /// this module shipped with: [`GroupPlane::mint`] emits each peer's
+    /// `HS_KEY` delivery EXACTLY ONCE and nothing ever re-emits it. The
+    /// datagram rides UDP, so a single drop leaves that peer unable to open
+    /// ANY group-scope traffic — and it cannot recover on its own: the spec's
+    /// "recovers through the existing NAK repair path once `HS_KEY` lands"
+    /// is only true if something makes `HS_KEY` land again, and a NAK'd
+    /// retransmit is itself `DATA`, sealed under the very epoch the peer is
+    /// missing. Without re-delivery the peer stays dark until the NEXT
+    /// rotation, which by default is an hour away (`RotationPolicy`'s 1h /
+    /// 1 TiB) — i.e. a lost handshake datagram silently costs a replica.
+    /// The node layer polls this on its maintenance tick and re-delivers.
+    pub fn unacked_peers(&self) -> Vec<NodeId> {
+        match &self.pending {
+            Some(p) => p.peers.iter().copied().filter(|id| !p.acked.contains(id)).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Re-emits the newest minted epoch's `HS_KEY` delivery to each of
+    /// `peers`, for the caller to seal pairwise and send again — see
+    /// [`GroupPlane::unacked_peers`] for why this exists.
+    ///
+    /// Deliberately does NOT consult the ack set: the caller also uses this
+    /// for a peer that has ALREADY acked but has since RESTARTED (a fresh
+    /// `HandshakeAction::Established` for a peer we thought was done), whose
+    /// new process holds no keys at all. Empty if nothing has been minted,
+    /// or if the pending epoch's key is somehow absent from the schedule
+    /// (unreachable — `mint` installs before it returns — but expressed as a
+    /// filter rather than an `unwrap`, per this crate's no-panic rule).
+    ///
+    /// Delivers the PENDING (newest minted) epoch, not
+    /// [`GroupPlane::sealing_epoch`]'s answer. Those differ only in the
+    /// bounded window between a mint and its activation, during which a
+    /// restarted peer may be unable to open the still-current older epoch —
+    /// self-healing within [`ACTIVATION_TIMEOUT_NS`], and the alternative
+    /// (shipping the older key too) would widen key exposure to buy back at
+    /// most two seconds.
+    pub fn redeliver_to(&self, peers: &[NodeId]) -> Vec<HandshakeAction> {
+        let Some(pending) = &self.pending else {
+            return Vec::new();
+        };
+        let Some(key) = self.schedule.get(pending.epoch) else {
+            return Vec::new();
+        };
+        peers
+            .iter()
+            .map(|&peer| HandshakeAction::Send {
+                to: peer,
+                kind: DGRAM_KIND_HS_KEY,
+                body: encode_key_delivery(pending.epoch, key.as_bytes()),
+            })
+            .collect()
+    }
+
     /// Feeds in a received `HS_KEY` body (kind 20), already opened by the
     /// pairwise session — `from` is therefore an authenticated sender, but
     /// the BODY's content is still parsed as untrusted bytes: a length or
@@ -591,5 +649,64 @@ mod tests {
             None,
             "a late ack for the abandoned e1 must not resurrect anything"
         );
+    }
+
+    // ---- M8 Task 12: `HS_KEY` re-delivery -------------------------------
+
+    #[test]
+    fn unacked_peers_names_exactly_who_still_owes_an_ack() {
+        let mut g = GroupPlane::new(1);
+        assert!(g.unacked_peers().is_empty(), "nothing minted, nobody owes anything");
+        let (epoch, _) = g.mint(&[2, 3], 0);
+        assert_eq!(g.unacked_peers(), vec![2, 3]);
+        g.on_ack(2, epoch);
+        assert_eq!(g.unacked_peers(), vec![3]);
+        g.on_ack(3, epoch);
+        assert!(g.unacked_peers().is_empty(), "fully acked: the sweep goes quiet");
+    }
+
+    /// The liveness gap this pair closes: `mint` emits each delivery ONCE,
+    /// over UDP. A peer that loses it can open no group-scope traffic and
+    /// cannot self-heal — a NAK'd retransmit is itself `DATA` sealed under
+    /// the epoch it is missing — so without re-delivery it stays dark until
+    /// the next rotation, an hour away by default.
+    #[test]
+    fn a_lost_key_delivery_can_be_re_sent_byte_identically() {
+        let mut g = GroupPlane::new(1);
+        let (epoch, first) = g.mint(&[2, 3], 0);
+        let again = g.redeliver_to(&g.unacked_peers());
+        assert_eq!(again.len(), 2);
+        for (a, b) in first.iter().zip(again.iter()) {
+            let (HandshakeAction::Send { to: t1, kind: k1, body: b1 }, HandshakeAction::Send { to: t2, kind: k2, body: b2 }) = (a, b) else {
+                panic!("mint and redeliver must both emit Send actions");
+            };
+            assert_eq!((t1, k1, b1), (t2, k2, b2), "the SAME epoch's key, verbatim");
+        }
+        // And it really is the minted epoch, not a fresh one.
+        let HandshakeAction::Send { body, .. } = &again[0] else { unreachable!() };
+        assert_eq!(u16::from_le_bytes([body[1], body[2]]), epoch);
+    }
+
+    /// A peer that ALREADY acked but has since restarted holds no keys at
+    /// all, and `unacked_peers` will never name it — so `redeliver_to` must
+    /// not consult the ack set. (The node layer drives this off a fresh
+    /// `HandshakeAction::Established`.)
+    #[test]
+    fn redelivery_to_an_already_acked_peer_still_ships_the_key() {
+        let mut g = GroupPlane::new(1);
+        let (epoch, _) = g.mint(&[2], 0);
+        g.on_ack(2, epoch);
+        assert!(g.unacked_peers().is_empty());
+        let acts = g.redeliver_to(&[2]);
+        assert_eq!(acts.len(), 1, "a restarted peer is re-keyed on demand");
+        let HandshakeAction::Send { to, kind, body } = &acts[0] else { unreachable!() };
+        assert_eq!((*to, *kind), (2, DGRAM_KIND_HS_KEY));
+        assert_eq!(u16::from_le_bytes([body[1], body[2]]), epoch);
+    }
+
+    #[test]
+    fn redelivery_before_any_mint_is_a_no_op_not_a_panic() {
+        let g = GroupPlane::new(1);
+        assert!(g.redeliver_to(&[2, 3]).is_empty());
     }
 }

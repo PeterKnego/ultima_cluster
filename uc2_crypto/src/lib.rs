@@ -128,4 +128,16 @@ pub enum CryptoError {
     /// that. Named explicitly instead.
     #[error("Transport::seal/open: kind {0} is Scope::Unsealed — never goes through seal/open")]
     UnsealedKind(u8),
+    /// [`transport::SharedTransport::seal_pairwise_control`] (T12 — the node
+    /// layer's own seal path for rare unicast control datagrams) was called
+    /// with a [`Scope::Group`](transport::Scope::Group) `kind`. Group sealing
+    /// belongs on the fan-out path, which owns the epoch stamping and the
+    /// per-epoch cipher cache; routing a fan-out kind through the control
+    /// path would seal it correctly but bypass both, so it is refused rather
+    /// than quietly done the slow way. A caller-contract violation (`kind`
+    /// is the caller's own routing decision, never bytes off the wire) —
+    /// returned as a `Result` rather than panicked, for the same reason
+    /// [`CryptoError::MissingPeer`] is.
+    #[error("seal_pairwise_control: kind {0} is Scope::Group — seal it on the fan-out path")]
+    NotPairwiseKind(u8),
 }

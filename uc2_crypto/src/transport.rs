@@ -143,7 +143,7 @@ use rand::rngs::OsRng;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use uc_protocol::v2::crypto::{DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_KEY, DGRAM_KIND_HS_RESP};
@@ -774,6 +774,31 @@ pub struct SharedTransport {
     boot_salt: BootSalt,
     base: Instant,
     key: Arc<Mutex<KeyState>>,
+    /// **The process's one nonce counter**, shared by EVERY seal path in
+    /// this process — [`SendHalf::seal`] (the sender agent's hot path) and
+    /// [`SharedTransport::seal_pairwise_control`] (the node layer's rare
+    /// control sends) alike.
+    ///
+    /// Added T12. Before it, the counter lived by value inside `SendHalf`,
+    /// which was sound only while `SendHalf` was the sole sealer in the
+    /// process. T12 gives the node's consensus agent its own seal path (it
+    /// must seal `HS_KEY` deliveries pairwise, and it cannot hold a second
+    /// `SendHalf` — see [`SharedTransport::send_half`]'s single-call
+    /// enforcement), and T17 extends that path to the node's own consensus
+    /// datagrams and to `uc2_net`'s pairwise `SNAP`/`NAK`/`STATUS` sends. The
+    /// moment two paths seal under the SAME key — and they do: a pairwise
+    /// `Session`'s `seal_key` is per-peer, not per-agent — two independent
+    /// counters both starting at 0 would repeat a `(key, nonce)` pair under
+    /// AES-256-GCM, the exact catastrophe `send_half`'s single-call guard
+    /// exists to prevent. One shared `AtomicU64` makes the module docs'
+    /// stated invariant ("the counter never repeats, full stop") true
+    /// process-wide instead of per-half.
+    ///
+    /// Cost on the hot path: one uncontended `fetch_add` per seal in place
+    /// of a plain increment — a rounding error against the AEAD itself, and
+    /// far cheaper than the alternative of taking the `KeyState` lock to
+    /// reach a counter stored there.
+    counter: Arc<AtomicU64>,
     send_half_taken: Arc<AtomicBool>,
     receive_half_taken: Arc<AtomicBool>,
 }
@@ -810,6 +835,7 @@ impl SharedTransport {
                 group: GroupPlane::new(self_id),
                 rotation: RotationState::new(rotation),
             })),
+            counter: Arc::new(AtomicU64::new(0)),
             send_half_taken: Arc::new(AtomicBool::new(false)),
             receive_half_taken: Arc::new(AtomicBool::new(false)),
         }))
@@ -867,7 +893,7 @@ impl SharedTransport {
             boot_salt: self.boot_salt,
             base: self.base,
             key: Arc::clone(&self.key),
-            counter: 0,
+            counter: Arc::clone(&self.counter),
             seal_cache: None,
         }
     }
@@ -973,6 +999,81 @@ impl SharedTransport {
         self.key.lock().unwrap().peers.on_message(from, kind, body, now_ns)
     }
 
+    /// Forwards to [`Peers::tick`] — the monotonic maintenance tick that
+    /// retransmits unanswered `HS_INIT`s with backoff, restarts handshakes
+    /// for links the caller asked for that are not up, expires unproven
+    /// `pending` sessions, and announces a promoted session as
+    /// `Established { confirmed: true }`.
+    ///
+    /// Added T12 (same pure-forwarder shape and rationale as T11's three
+    /// handshake forwarders above): `Peers::tick` was unreachable from
+    /// outside this crate, so nothing could ever retransmit a lost `HS_INIT`
+    /// — a single dropped handshake datagram would have left that link
+    /// permanently down, since `initiate` is idempotent and produces no
+    /// traffic once a handshake is in flight.
+    pub fn tick(&self, now_ns: u64) -> Vec<HandshakeAction> {
+        self.key.lock().unwrap().peers.tick(now_ns)
+    }
+
+    /// Whether a pairwise session with `peer` is usable for sealing right
+    /// now — forwards to [`Peers::is_established`]. Diagnostics/observability
+    /// for the node layer (T12); never a gate on whether to send in the
+    /// clear.
+    pub fn is_established(&self, peer: NodeId) -> bool {
+        self.key.lock().unwrap().peers.is_established(peer)
+    }
+
+    /// Seals one **pairwise-scope control datagram** under `peer`'s
+    /// established session — the node layer's own seal path, distinct from
+    /// [`SendHalf::seal`] (which belongs exclusively to the sender agent).
+    ///
+    /// Added T12, and it is the reason [`SharedTransport`]'s `counter` field
+    /// exists. The node's consensus agent must seal `HS_KEY` deliveries
+    /// (`GroupPlane` emits the body and deliberately never touches a socket
+    /// or a pairwise key), and T17 extends this path to the node's own
+    /// `VOTE`/`REQUEST_VOTE`/`TERM_MAP`/`CONFIG_*` sends. It cannot take a
+    /// second [`SendHalf`] to do that — [`SharedTransport::send_half`]
+    /// panics on a second call, by design. Locking here is free at these
+    /// rates: every kind that routes through this method is rare, unicast
+    /// control traffic, exactly the traffic class `Transport`'s carried
+    /// requirement #4 already declined to optimize.
+    ///
+    /// `kind` MUST classify as [`Scope::Pairwise`]; a `Group` kind returns
+    /// [`CryptoError::NotPairwiseKind`] rather than being sealed the wrong
+    /// way (group sealing belongs on the fan-out path, which owns the
+    /// epoch-stamping and the cipher cache), and an `Unsealed` handshake
+    /// bootstrap kind returns [`CryptoError::UnsealedKind`] exactly as
+    /// [`Transport::seal`] does.
+    pub fn seal_pairwise_control(
+        &self,
+        kind: u8,
+        peer: NodeId,
+        buf: &mut Vec<u8>,
+    ) -> Result<(), CryptoError> {
+        match Transport::scope_of(kind) {
+            Scope::Pairwise => {
+                let counter = next_counter(&self.counter);
+                self.key.lock().unwrap().peers.seal_pairwise(peer, buf, counter)
+            }
+            Scope::Unsealed => Err(CryptoError::UnsealedKind(kind)),
+            Scope::Group => Err(CryptoError::NotPairwiseKind(kind)),
+        }
+    }
+
+    /// Forwards to [`GroupPlane::unacked_peers`] — the peers of the newest
+    /// minted epoch that have not acked it yet. Drives the node layer's
+    /// `HS_KEY` re-delivery timer (T12).
+    pub fn unacked_group_key_peers(&self) -> Vec<NodeId> {
+        self.key.lock().unwrap().group.unacked_peers()
+    }
+
+    /// Forwards to [`GroupPlane::redeliver_to`] — re-emits the newest minted
+    /// epoch's `HS_KEY` delivery to `peers`, for the node layer to seal and
+    /// send again (T12).
+    pub fn redeliver_group_key_to(&self, peers: &[NodeId]) -> Vec<HandshakeAction> {
+        self.key.lock().unwrap().group.redeliver_to(peers)
+    }
+
     /// Forwards to [`GroupPlane::on_key_message`] — feeds an ALREADY-OPENED
     /// `HS_KEY` body (kind 20, `Scope::Pairwise` — opened via
     /// [`ReceiveHalf::open_slice`]/[`Transport::open`] like any other
@@ -992,11 +1093,10 @@ pub struct SendHalf {
     boot_salt: BootSalt,
     base: Instant,
     key: Arc<Mutex<KeyState>>,
-    /// The one counter this half ever allocates a nonce from — see
-    /// [`Transport`]'s module docs' "The counter" section; the same
-    /// single-ever-increasing-counter reasoning applies unchanged, just
-    /// scoped to this one `SendHalf` instance instead of a whole `Transport`.
-    counter: u64,
+    /// The PROCESS's one counter, shared with every other seal path — see
+    /// [`SharedTransport`]'s `counter` field doc (T12) for why this is an
+    /// `Arc<AtomicU64>` rather than a `u64` owned by this half.
+    counter: Arc<AtomicU64>,
     /// One cached cipher for whichever epoch was last sealed under — see
     /// [`Transport::group_seal_cipher`]'s doc (carried requirement #4);
     /// identical caching, just living on this half instead of on `Transport`.
@@ -1030,7 +1130,7 @@ impl SendHalf {
                 let Some(peer) = peer else {
                     return Err(CryptoError::MissingPeer(kind));
                 };
-                let counter = self.next_counter();
+                let counter = next_counter(&self.counter);
                 self.key.lock().unwrap().peers.seal_pairwise(peer, buf, counter)
             }
             Scope::Unsealed => Err(CryptoError::UnsealedKind(kind)),
@@ -1047,13 +1147,8 @@ impl SendHalf {
         // Same ordering discipline as Transport::seal_group (T9 review F3):
         // the fallible cipher/key lookup MUST resolve before `buf` is
         // mutated at all, or a failure here leaves the caller's staged
-        // datagram corrupted even though the call "failed". Inlined
-        // (not `self.next_counter()`) because `key` above already holds a
-        // borrow of `self.key`, and Rust's borrow checker does not split
-        // `self.counter` from that borrow through a `&mut self` method call
-        // — only through direct field access like this.
-        self.counter += 1;
-        let counter = self.counter;
+        // datagram corrupted even though the call "failed".
+        let counter = next_counter(&self.counter);
         let cipher = Self::group_seal_cipher(
             &mut self.seal_cache,
             &key.group,
@@ -1092,11 +1187,18 @@ impl SendHalf {
         }
         Ok(&cache.as_ref().unwrap().1)
     }
+}
 
-    fn next_counter(&mut self) -> u64 {
-        self.counter += 1;
-        self.counter
-    }
+/// Allocates the next value from the process-wide nonce counter (T12) — see
+/// [`SharedTransport`]'s `counter` field doc. Starts at 1 and never repeats;
+/// `Relaxed` suffices because the only requirement is uniqueness, not any
+/// ordering relative to other memory (every `fetch_add` returns a distinct
+/// value regardless of ordering).
+///
+/// A failed seal simply burns its value — see [`Transport::seal`]'s doc;
+/// counters need only never repeat, not be dense.
+fn next_counter(counter: &AtomicU64) -> u64 {
+    counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
 }
 
 /// The receive-side half of the [`SharedTransport`] split — see the module
@@ -1351,6 +1453,7 @@ impl ReceiveHalf {
 mod tests {
     use super::*;
     use crate::handshake::HandshakeAction;
+    use uc_protocol::v2::crypto::read_counter;
     use uc_protocol::v2::datagram::*;
 
     #[test]
@@ -2688,5 +2791,99 @@ mod tests {
         assert_ne!(d, plain);
         recv.open(1, &mut d).expect("a session + group key built ENTIRELY through the pub forwarders must open");
         assert_eq!(&d[DATAGRAM_HEADER_LEN..], &plain[DATAGRAM_HEADER_LEN..]);
+    }
+
+    // ---- M8 Task 12: the node layer's own seal path -----------------------
+    /// A staged (cleartext header + payload) datagram of an arbitrary kind —
+    /// `data_datagram`'s generalization, for the T12 control-path tests.
+    fn staged(kind: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(
+            &mut v,
+            &DatagramHeader { position: 4096, leadership_term_id: 3, kind, flags: 0, key_epoch: 0 },
+        );
+        v.extend_from_slice(payload);
+        v
+    }
+
+
+    /// The counter is per-PROCESS, not per-`SendHalf`. Before T12 it lived by
+    /// value inside `SendHalf`, which was sound only while that half was the
+    /// process's sole sealer. The node layer now seals `HS_KEY` (and, from
+    /// T17, its own consensus datagrams) through
+    /// `seal_pairwise_control` — under the SAME per-peer session key the
+    /// sender's `SendHalf` uses for pairwise kinds. Two independent counters
+    /// both starting at 0 would repeat a `(key, nonce)` pair under
+    /// AES-256-GCM: not a wrong answer, an authentication-subkey compromise
+    /// for every message ever sealed under that key.
+    ///
+    /// Discriminating: the two paths are interleaved deliberately, and the
+    /// assertion is on the counters actually stamped on the wire. Give
+    /// `SendHalf` its own `u64` again and the two sequences both start at 1.
+    #[test]
+    fn the_nonce_counter_is_shared_across_every_seal_path_in_the_process() {
+        let a_pub = public_of(PRIV_A);
+        let b_pub = public_of(PRIV_B);
+        let a = shared_node_transport("t12-counter-a-t", 1, PRIV_A, &[(2, b_pub)]);
+        let b = shared_node_transport("t12-counter-b-t", 2, PRIV_B, &[(1, a_pub)]);
+        shared_establish(&a, &b);
+        shared_deliver_group_key(&a, &b, &[2]);
+
+        let mut send = a.send_half();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            // Sender agent's path (group scope, the fan-out hot path).
+            let mut d = staged(DGRAM_KIND_DATA, b"xx");
+            send.seal(DGRAM_KIND_DATA, None, &mut d, 0).unwrap();
+            seen.push(read_counter(&d[DATAGRAM_HEADER_LEN..]));
+            // Node layer's path (pairwise scope, control traffic).
+            let mut c = staged(DGRAM_KIND_HS_KEY, b"yy");
+            a.seal_pairwise_control(DGRAM_KIND_HS_KEY, 2, &mut c).unwrap();
+            seen.push(read_counter(&c[DATAGRAM_HEADER_LEN..]));
+        }
+        let mut sorted = seen.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len(), "a counter repeated across the two paths: {seen:?}");
+        assert_eq!(seen, vec![1, 2, 3, 4, 5, 6, 7, 8], "one interleaved sequence, no gaps");
+    }
+
+    /// A control-path seal is a REAL seal: the peer's `ReceiveHalf` opens it,
+    /// and the plaintext is not on the wire.
+    #[test]
+    fn a_control_path_seal_opens_on_the_peers_receive_half() {
+        let a_pub = public_of(PRIV_A);
+        let b_pub = public_of(PRIV_B);
+        let a = shared_node_transport("t12-ctrl-a-t", 1, PRIV_A, &[(2, b_pub)]);
+        let b = shared_node_transport("t12-ctrl-b-t", 2, PRIV_B, &[(1, a_pub)]);
+        shared_establish(&a, &b);
+
+        let mut d = staged(DGRAM_KIND_HS_KEY, b"group-key-body");
+        a.seal_pairwise_control(DGRAM_KIND_HS_KEY, 2, &mut d).unwrap();
+        assert!(
+            !d.windows(14).any(|w| w == b"group-key-body"),
+            "the body must not be readable on the wire"
+        );
+        let mut recv = b.receive_half();
+        recv.open(1, &mut d).expect("the peer opens it under the same session");
+        assert_eq!(&d[DATAGRAM_HEADER_LEN..], b"group-key-body");
+    }
+
+    /// The scope guard: a fan-out kind must not be sealed through the control
+    /// path (it would bypass the epoch stamping and the cipher cache), and a
+    /// bootstrap kind has nothing to seal under.
+    #[test]
+    fn the_control_seal_path_refuses_group_and_bootstrap_kinds() {
+        let a = shared_node_transport("t12-scope-guard", 1, PRIV_A, &[]);
+        let mut d = staged(DGRAM_KIND_DATA, b"x");
+        assert!(matches!(
+            a.seal_pairwise_control(DGRAM_KIND_DATA, 2, &mut d),
+            Err(CryptoError::NotPairwiseKind(DGRAM_KIND_DATA))
+        ));
+        let mut d = staged(DGRAM_KIND_HS_INIT, b"x");
+        assert!(matches!(
+            a.seal_pairwise_control(DGRAM_KIND_HS_INIT, 2, &mut d),
+            Err(CryptoError::UnsealedKind(DGRAM_KIND_HS_INIT))
+        ));
     }
 }
