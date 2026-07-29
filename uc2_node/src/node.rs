@@ -6074,10 +6074,14 @@ mod tests {
             h.h.cons.crypto_handshake_failures.load(Ordering::Relaxed) > 0,
             "node 2 starts unauthorized, so the initiate toward it is refused"
         );
-        // Nothing HANDSHAKE-shaped goes to an unauthorized peer. (Consensus
-        // traffic does — this duty cycle's Tick starts an election, and
-        // REQUEST_VOTE is not sealed until T17 — so the drain filters by
-        // kind rather than asserting the socket is silent, which it is not.)
+        // Nothing HANDSHAKE-shaped goes to an unauthorized peer. The drain
+        // filters by kind rather than asserting the socket is silent: T17
+        // made every consensus datagram fail-closed too, so in practice
+        // almost nothing reaches node 2 now (a `REQUEST_VOTE` toward it is
+        // dropped as unsealable, counted in `crypto_seal_failures`) — but
+        // "an HS_INIT must never appear" is the property this test is about,
+        // and asserting silence would couple it to the unrelated question of
+        // exactly which kinds the election path attempts this cycle.
         let mut probe = [0u8; 2048];
         while let Ok((n, _)) = h.peer2_sock.recv_from(&mut probe) {
             assert_ne!(
