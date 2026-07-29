@@ -1776,12 +1776,19 @@ impl Consensus {
     /// socket itself — that split is what keeps `Peers`/`GroupPlane` pure and
     /// unit-testable — so this is the one place actions become datagrams.
     fn crypto_exec(&mut self, actions: Vec<HandshakeAction>) {
-        let mut queue = actions;
+        let mut queue = std::collections::VecDeque::from(actions);
+        // FIFO, not LIFO: `Peers::on_init` emits `[Send(HS_RESP),
+        // Established]` in that order, and popping from the back would send
+        // this leader's `HS_KEY` re-key BEFORE the `HS_RESP` that lets the
+        // peer complete the session and open it. Self-healing (the re-delivery
+        // sweep retries within 200 ms) but a wasted round trip on every
+        // link-up, for no reason other than the container's pop end.
+        //
         // Belt: `Established` can enqueue a re-delivery, which cannot itself
         // enqueue anything, so the real bound is 2 rounds. A cap makes that
         // structural rather than argued.
         let mut budget = 4 * CRYPTO_HS_DRAIN_PER_CYCLE + 64;
-        while let Some(act) = queue.pop() {
+        while let Some(act) = queue.pop_front() {
             budget -= 1;
             if budget == 0 {
                 break;
