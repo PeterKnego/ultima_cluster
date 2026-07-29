@@ -20,6 +20,14 @@ test-support = []
 
 [dependencies]
 uc2_consensus = { path = "../uc2_consensus" }
+# T13: crypto-plane sim coverage (Peers/GroupPlane are pure (input, now_ns) ->
+# Vec<Action> transition functions with no sockets/clock reads, so the world
+# can drive them exactly like ElectionSm). uc_protocol/base64 are only needed
+# to name the handshake datagram kinds and format the sim's own on-disk
+# allowlist fixture.
+uc2_crypto = { path = "../uc2_crypto" }
+uc_protocol = { path = "../uc_protocol" }
+base64 = { workspace = true }
 
 [dev-dependencies]
 # Self dev-dependency turns on `test-support` for the integration tests

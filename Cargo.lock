@@ -1341,8 +1341,11 @@ dependencies = [
 name = "uc2_sim"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "uc2_consensus",
+ "uc2_crypto",
  "uc2_sim",
+ "uc_protocol",
 ]
 
 [[package]]
