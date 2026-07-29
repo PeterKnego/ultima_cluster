@@ -1674,7 +1674,8 @@ git commit -m "docs(m8): gate doc with pre-committed bar, runbook ops section, r
 - Modify: `uc2_net/src/sender.rs` (`assemble_snap`, `send_snap_begin`, `send_snap_chunk`, and the `send_snap_chunk` MTU budget at ~:908 which Task 10 deliberately left un-subtracted while SNAP was cleartext)
 - Modify: `uc2_net/src/receiver.rs` (the sends at ~:906, :993, :1041, :1072, :1098 — `SNAP_NAK`, `SNAP_DONE`, `NAK`, `STATUS`, `APPEND_POSITION`)
 - Modify: `uc2_net/src/receiver.rs` — delete the temporary cleartext-SNAP allowance Task 11 added
-- Test: inline in both files
+- **Modify: `uc2_node/src/node.rs` — the node's OWN direct sends** (~:1918 `READ_PROBE`, :2371 `CONFIG_PROPOSAL`, :2551 `VOTE`, :2558 `REQUEST_VOTE`, :2569 `COMMIT_POSITION`, :2641/:2651 `TERM_MAP`). **Scope extension ruled 2026-07-29 after the Task 11 review.** Task 10 sealed only what flows through `Sender::seal_scratch`; the node emits consensus datagrams on its own socket path, and Task 11's receive rule drops anything unsealed once crypto is on. Without this, a crypto-enabled cluster has **no elections, no commit gossip and no linearizable reads** — it does not run at all. This is not optional polish; it is the difference between a working cluster and a dead one.
+- Test: inline in all three files
 
 **Interfaces:**
 - Consumes: the receive/send halves from Task 10's corrected ownership split, and the `SocketAddr -> NodeId` mapping Task 11 builds for peer resolution.
