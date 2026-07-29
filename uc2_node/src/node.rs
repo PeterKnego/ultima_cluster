@@ -21,8 +21,12 @@ use uc2_log::counters::LogCounters;
 use uc2_log::state::{ConfigRecord, NodeState, StoredConfig, StoredMember, TermMap, TermMapEntry, VoteRecord};
 use uc2_net::TermHandle;
 use uc2_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
-use uc2_net::receiver::{FollowerConfig, FollowerReceiver, NetEvent};
+use uc2_net::receiver::{
+    CryptoIntake, FollowerConfig, FollowerReceiver, HandshakeDatagram, NetEvent, PeerIds,
+};
 use uc2_net::sender::{CtrlMsg, Sender, SenderConfig};
+use uc2_crypto::{CryptoConfig, HandshakeAction, Scope, SharedTransport, Transport};
+use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
 use uc_protocol::ring::{
     BroadcastProducer, BroadcastRing, MpscConsumer, MpscRing, SpscProducer, SpscRing,
 };
@@ -158,6 +162,17 @@ pub struct NodeConfig {
     /// segments). Production default `64 MiB` ([`DEFAULT_JOURNAL_SEGMENT_BYTES`]);
     /// tests shrink it so a purge is observable without writing gigabytes.
     pub journal_segment_bytes: u64,
+    /// M8 (Task 12): node-to-node wire crypto.
+    /// [`CryptoConfig::Disabled`] — the `Default` — is byte-for-byte today's
+    /// cleartext behavior for every M1–M7 deployment.
+    ///
+    /// `Enabled` is a **boot refusal** if the key or allowlist file is
+    /// missing, malformed, or group/world-readable: [`Node::start`] returns
+    /// `Err` before a single agent is spawned, exactly as the M7
+    /// self-tombstone refusal does. A node configured to authenticate must
+    /// never silently fall back to cleartext — that would make the whole
+    /// feature opt-out per boot, by accident.
+    pub crypto: CryptoConfig,
 }
 
 /// Production default journal segment size (matches `ArchiveConfig::new`).
@@ -183,6 +198,29 @@ const NET_DRAIN_PER_CYCLE: usize = 4096;
 const INGRESS_PER_CYCLE: usize = 256;
 /// NetEvent channel depth (T7 observability: a full channel counts a drop).
 const NET_EVENT_CAPACITY: usize = 4096;
+/// M8: handshake-plane channel depth (kinds 18/19/20, receiver → consensus).
+/// Handshake traffic is a handful of datagrams per peer per link-up, so this
+/// is deep enough to never fill in practice; a full channel drops and counts
+/// (`FollowerStats::dropped_handshake`) and `Peers::tick` re-initiates.
+const HANDSHAKE_CAPACITY: usize = 256;
+/// M8: handshake datagrams drained per duty cycle (bounded work, like the
+/// NetEvent drain).
+const CRYPTO_HS_DRAIN_PER_CYCLE: usize = 64;
+/// M8: minimum spacing between crypto maintenance passes (allowlist reload,
+/// `Peers::tick`, rotation check). The consensus agent busy-spins, so this
+/// keeps three mutex acquisitions off the per-cycle path; 20 ms is well
+/// inside every deadline it feeds (handshake retry base 200 ms, allowlist
+/// reload floor 1 s, group-key activation timeout 2 s).
+const CRYPTO_MAINTENANCE_NS: u64 = 20_000_000;
+/// M8: how often un-acked `HS_KEY` deliveries are re-sent while a minted
+/// epoch is still outstanding. Matches the handshake's own retry base — a
+/// lost key delivery is exactly as fatal to a link as a lost `HS_INIT`, and
+/// `GroupPlane::mint` emits each delivery only once.
+const CRYPTO_HS_KEY_REDELIVER_NS: u64 = 200_000_000;
+/// M8: floor on operator-facing crypto diagnostics (per node, aggregate), so
+/// a sustained fault cannot spam stderr at duty-cycle rate. The COUNTERS are
+/// always exact; only the printing is throttled.
+const CRYPTO_LOG_INTERVAL_NS: u64 = 1_000_000_000;
 /// Query records drained per duty cycle (bounded work, like the ingress ring).
 const QUERY_DRAIN_PER_CYCLE: usize = 64;
 /// A linearizable read's confirmation deadline (spec §7): if the read-index
@@ -292,6 +330,9 @@ pub struct Node {
     /// observing exactly what a SNAP_BEGIN this node ships would carry, not a
     /// proxy for it. Exposed via [`Node::snapshot_config_bytes`].
     config_bytes: Arc<Mutex<Vec<u8>>>,
+    /// M8 (Task 12): the newest group-key epoch this node has minted (0 =
+    /// never). Written by the consensus agent; read by [`Node::crypto_epoch`].
+    crypto_epoch: Arc<AtomicU32>,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
     _instance: InstanceDir,
     _rings: Rings,
@@ -317,6 +358,24 @@ impl Node {
         // 1. flock FIRST — one node per instance dir. A contended lock (a live
         // node already owns this dir) surfaces as an io error whose Display
         // carries "AlreadyRunning" (the harness matches on it).
+        // M8 (Task 12): build the crypto plane FIRST — ahead of the instance
+        // flock, the archive, the cnc page, the rings, and every agent spawn.
+        // An `Enabled` config whose key/allowlist file is missing, malformed
+        // or group/world-readable is a clean early return, the same shape as
+        // the M7 self-tombstone refusal below: an orchestrator sees a failed
+        // unit rather than a node quietly running in the clear. Placed before
+        // the flock specifically so a misconfigured node leaves NOTHING
+        // behind — no lock, no instance files, nothing to clean up.
+        // `Disabled` yields `None` and nothing downstream changes.
+        let crypto = SharedTransport::new(&cfg.crypto, cfg.id).map_err(|e| {
+            io::Error::other(format!(
+                "node {} refuses to start: crypto is enabled but its key material is \
+                 unusable ({e}); a node configured to authenticate must never fall back \
+                 to cleartext",
+                cfg.id
+            ))
+        })?;
+
         let instance = InstanceDir::acquire(&cfg.instance_dir).map_err(to_io)?;
 
         // Three clones of the one node socket: the receiver recvs (and sends
@@ -534,6 +593,9 @@ impl Node {
         let truncations = Arc::new(AtomicU64::new(0));
         let wipes = Arc::new(AtomicU64::new(0));
         let reports_implausible = Arc::new(AtomicU64::new(0));
+        // M8 (Task 12): the newest group epoch this node has minted, mirrored
+        // off the consensus agent for `Node::crypto_epoch`.
+        let crypto_epoch = Arc::new(AtomicU32::new(0));
 
         // Peer maps and the follower set, derived from the adopted config —
         // shared with `Consensus::rebuild_peer_maps` (M7's live-reconfiguration
@@ -566,7 +628,27 @@ impl Node {
 
         // Sender (streams when leader; commit ranking is entirely the
         // consensus agent's job — the sender never ranks or gossips commit).
+        // M8 (Task 12): hand each half out EXACTLY ONCE, here, and give one to
+        // each agent. `SharedTransport::send_half`/`receive_half` panic on a
+        // second call (a second `SendHalf` would restart the nonce counter
+        // under a live key; a second `ReceiveHalf` would split the replay
+        // windows) — this is the one place in the process that calls either.
+        let crypto_send = crypto.as_ref().map(|c| c.send_half());
+        let crypto_recv = crypto.as_ref().map(|c| c.receive_half());
+        // The handshake plane (kinds 18/19/20): the receiver demuxes them off
+        // the socket, the consensus agent drives `Peers`/`GroupPlane`.
+        let (hs_tx, hs_rx) = mpsc::sync_channel::<HandshakeDatagram>(HANDSHAKE_CAPACITY);
+        // The live sender-identity map the receive seam resolves peers
+        // through, seeded from the RECOVERED config (not the possibly-stale
+        // seed) and republished by the consensus agent on every adoption.
+        let crypto_peer_ids = crypto.as_ref().map(|_| {
+            let ids = PeerIds::new();
+            ids.store(addr_to_id.iter().map(|(a, i)| (*a, *i)).collect::<Vec<_>>());
+            ids
+        });
+
         let mut sender_cfg = SenderConfig::new(boot_term);
+        sender_cfg.crypto_enabled = crypto_send.is_some();
         sender_cfg.heartbeat_ns = 20_000_000; // 20 ms: brisk tail-loss detection
         let journal = archive.journal_arc();
         // A learner never leads, so its sender streams to no one: give it a solo
@@ -585,7 +667,7 @@ impl Node {
         } else {
             (followers, learner_addrs.clone(), sender_cluster_size(&config, cfg.id))
         };
-        let mut sender = Sender::with_learners(
+        let mut sender = Sender::with_crypto(
             Arc::clone(&buffer),
             send_sock,
             sender_followers,
@@ -595,6 +677,7 @@ impl Node {
             sender_cfg,
             Arc::clone(&term_handle),
             Arc::clone(&leader_flag),
+            crypto_send,
         );
         sender.set_replay_source(journal);
         // M6 Task 6: snapshot session wiring. `snap_dir` holds the position-tagged
@@ -646,12 +729,22 @@ impl Node {
         rcfg.seed = cfg.seed ^ 0x5DEE_CE66_1D0C_2A11;
         rcfg.status_floor_ns = 20_000_000;
         rcfg.append_pos_floor_ns = 20_000_000;
-        let mut receiver = FollowerReceiver::new(
+        // M8 (Task 12): the receive half, the sender-identity map, and the
+        // handshake route travel together in one `CryptoIntake` — forgetting
+        // any of the three is a compile error, not a silent cluster-wide
+        // `dropped_unknown_peer`/`dropped_handshake`.
+        let receiver_crypto = crypto_recv.map(|half| CryptoIntake {
+            half,
+            peer_ids: crypto_peer_ids.clone().expect("peer ids exist iff crypto does"),
+            handshake: hs_tx,
+        });
+        let mut receiver = FollowerReceiver::with_crypto(
             Arc::clone(&buffer),
             recv_sock,
             rcfg,
             Arc::clone(&term_handle),
             net_tx,
+            receiver_crypto,
         );
         // Cloned: the consensus agent keeps its own producer half to drive
         // `CtrlMsg::SetPeers` (M7 config adoption, `Consensus::exec`).
@@ -838,6 +931,19 @@ impl Node {
             last_admin_seq: 0,
             pending_admin_fwd: None,
             last_config_reply: None,
+            crypto,
+            crypto_hs_rx: Some(hs_rx),
+            crypto_peer_ids,
+            crypto_epoch: Arc::clone(&crypto_epoch),
+            crypto_last_maint_ns: None,
+            crypto_maint_ns: CRYPTO_MAINTENANCE_NS,
+            crypto_last_redeliver_ns: None,
+            crypto_committed_config_version: None,
+            crypto_peers_dirty: true,
+            crypto_hs_key_seal_failures: Arc::new(AtomicU64::new(0)),
+            crypto_hs_unknown_source: Arc::new(AtomicU64::new(0)),
+            crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
+            crypto_last_log_ns: 0,
         };
         let consensus_agent =
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
@@ -858,6 +964,7 @@ impl Node {
             sender_stats,
             partition_handles,
             config_bytes: Arc::clone(&config_bytes),
+            crypto_epoch,
             _instance: instance,
             _rings: rings,
             // Stop order: consensus first (stops writing the term handle), then
@@ -901,6 +1008,20 @@ impl Node {
     /// `Action::ConfigAdopted` (ordinary adoption) AND by the snapshot-install
     /// fiat path (`maybe_adopt_incoming_snapshot`). Exposed for tests asserting
     /// a joiner's config converges with the leader's after a snapshot install.
+    /// M8 (Task 12): the newest node-to-node group-key epoch this node has
+    /// MINTED, or `None` if it never has (a follower that has not yet led, or
+    /// a node with [`CryptoConfig::Disabled`]).
+    ///
+    /// Minting is leader-only (spec §5) and `GroupPlane::sealing_epoch`
+    /// answers only for an epoch this node itself minted, so this doubles as
+    /// "can this node seal group-scope traffic at all yet".
+    pub fn crypto_epoch(&self) -> Option<u16> {
+        match self.crypto_epoch.load(Ordering::Acquire) {
+            0 => None,
+            e => Some(e as u16),
+        }
+    }
+
     pub fn config_version(&self) -> u64 {
         self.cnc.config_version()
     }
@@ -1196,6 +1317,61 @@ struct Consensus {
     /// idempotent under retry without relying on `ChangePending` to happen to
     /// refuse the repeat. `None` until the first forwarded proposal is handled.
     last_config_reply: Option<(u64, ConfigReplyBody)>,
+
+    // ---- M8 (Task 12): the crypto plane -----------------------------------
+    /// The process's shared handshake/group-key/rotation state. `None` =
+    /// [`CryptoConfig::Disabled`], and every field below is inert.
+    ///
+    /// This agent holds the `SharedTransport` itself (not a `SendHalf` — that
+    /// went to the sender agent, and `send_half` is single-call by
+    /// construction): it drives the handshake, mints and re-delivers group
+    /// keys, and seals its own `HS_KEY` sends through
+    /// `SharedTransport::seal_pairwise_control`.
+    crypto: Option<SharedTransport>,
+    /// Handshake-plane datagrams (kinds 18/19/20) demuxed off the receive
+    /// seam. `HS_INIT`/`HS_RESP` arrive verbatim; `HS_KEY` arrives ALREADY
+    /// OPENED (the receiver's `crypto_admit` decrypts it first).
+    crypto_hs_rx: Option<mpsc::Receiver<HandshakeDatagram>>,
+    /// The live `SocketAddr -> NodeId` map the receive seam resolves senders
+    /// through. Republished by `rebuild_peer_maps` on every adopted config —
+    /// M7 adds nodes at runtime, and a joiner this map does not know is a
+    /// joiner whose every datagram is dropped as `dropped_unknown_peer`.
+    crypto_peer_ids: Option<PeerIds>,
+    /// Newest group epoch THIS node minted, mirrored for observability
+    /// ([`Node::crypto_epoch`]). `0` = never minted; `GroupPlane` reserves
+    /// epoch 0 as the wire's cleartext sentinel and never mints it, so 0 is
+    /// an unambiguous "none".
+    crypto_epoch: Arc<AtomicU32>,
+    /// `SharedTransport::now_ns` of the last maintenance pass (`None` until
+    /// the first, so the very first duty cycle runs one).
+    crypto_last_maint_ns: Option<u64>,
+    /// Spacing between maintenance passes — [`CRYPTO_MAINTENANCE_NS`] in
+    /// production; the unit-test harness sets 0 so a single `do_work` is a
+    /// full pass.
+    crypto_maint_ns: u64,
+    /// `SharedTransport::now_ns` of the last un-acked `HS_KEY` re-delivery.
+    crypto_last_redeliver_ns: Option<u64>,
+    /// `ClusterConfig::version` of the newest config observed COMMITTED —
+    /// the edge that feeds `RotationState::on_committed_config`. `None`
+    /// until the first observation.
+    crypto_committed_config_version: Option<u64>,
+    /// Set when the peer set changed (boot, or an adopted config): the next
+    /// maintenance pass asks `Peers::initiate` for a link to everyone.
+    crypto_peers_dirty: bool,
+    /// `HS_KEY` deliveries that could not be sealed (no established pairwise
+    /// session with that peer yet) and were therefore DROPPED, never sent in
+    /// the clear. Self-healing: the re-delivery sweep retries once the
+    /// handshake completes.
+    crypto_hs_key_seal_failures: Arc<AtomicU64>,
+    /// Inbound handshake datagrams from a source address this node has no
+    /// `NodeId` for (a stranger, or a peer removed from the config).
+    crypto_hs_unknown_source: Arc<AtomicU64>,
+    /// `HandshakeAction::Failed` observations — a peer that is not (yet) in
+    /// the allowlist, or whose handshake did not authenticate.
+    crypto_handshake_failures: Arc<AtomicU64>,
+    /// `now_ns` of the last printed crypto diagnostic (see
+    /// [`CRYPTO_LOG_INTERVAL_NS`]).
+    crypto_last_log_ns: u64,
 }
 
 impl Consensus {
@@ -1368,7 +1544,390 @@ impl Consensus {
             self.cnc.store_config_pending(false);
             did = true;
         }
+
+        // 13. M8 (Task 12): the crypto plane — route inbound handshake
+        // traffic, observe committed config changes (rotation trigger 3),
+        // and run the rate-limited maintenance pass (allowlist reload,
+        // `Peers::tick`, rotation + mint). Placed LAST so it observes this
+        // cycle's committed config (step 1c's adoption + step 2's commit
+        // advance) rather than the previous one's: a removal must revoke in
+        // the same cycle its commit lands, not the next.
+        did |= self.crypto_cycle();
         did
+    }
+
+    // ---- M8 (Task 12): the crypto plane ----------------------------------
+    //
+    // Everything below is a no-op when `crypto` is `None`. The ordering
+    // inside `crypto_cycle` is load-bearing and pinned by
+    // `a_committed_remove_rotates_but_a_committed_demote_does_not`: the
+    // committed-config observation must precede the rotation check in the
+    // SAME cycle, or a removal's revocation waits a whole maintenance
+    // interval behind the commit that authorized it.
+
+    /// The crypto duty cycle: route inbound handshake traffic, observe
+    /// committed config changes (rotation trigger 3), then run the
+    /// rate-limited maintenance pass (allowlist, `Peers::tick`, rotation).
+    fn crypto_cycle(&mut self) -> bool {
+        if self.crypto.is_none() {
+            return false;
+        }
+        let mut did = self.crypto_drain_handshake_route();
+        did |= self.crypto_observe_committed_config();
+        did |= self.crypto_maintenance();
+        did
+    }
+
+    /// The one clock the crypto plane is ever driven by — `SharedTransport`'s
+    /// own `Instant` origin, shared with the `SendHalf`/`ReceiveHalf` the
+    /// sender and receiver agents hold. NEVER `Consensus::now_ns` (this
+    /// agent's independent base): `GroupPlane::sealing_epoch` compares
+    /// `now_ns` against the MINT timestamp, so two unrelated origins make the
+    /// activation grace period either never elapse or elapse instantly. This
+    /// accessor exists so no call site here has to remember that.
+    fn crypto_now_ns(&self) -> u64 {
+        self.crypto.as_ref().map(|c| c.now_ns()).unwrap_or(0)
+    }
+
+    /// Drain the handshake-plane route into `Peers`/`GroupPlane` and execute
+    /// whatever they ask for. Bounded per cycle like every other drain.
+    fn crypto_drain_handshake_route(&mut self) -> bool {
+        let mut actions: Vec<HandshakeAction> = Vec::new();
+        let mut did = false;
+        {
+            let (Some(crypto), Some(rx)) = (self.crypto.as_ref(), self.crypto_hs_rx.as_ref())
+            else {
+                return false;
+            };
+            for _ in 0..CRYPTO_HS_DRAIN_PER_CYCLE {
+                let Ok((from, kind, body)) = rx.try_recv() else {
+                    break;
+                };
+                did = true;
+                // The crypto layer identifies peers by `NodeId`; the wire
+                // knows only addresses. An address with no mapping is a
+                // stranger (or a removed peer) — counted and dropped, never
+                // fed to the handshake state machine under a guessed id.
+                let Some(&peer) = self.addr_to_id.get(&from) else {
+                    self.crypto_hs_unknown_source.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                let now = crypto.now_ns();
+                match kind {
+                    DGRAM_KIND_HS_KEY => {
+                        // Already OPENED by the receive seam (kind 20 is
+                        // `Scope::Pairwise`), so `from` is authenticated.
+                        actions.extend(crypto.on_group_key_message(peer, &body));
+                    }
+                    _ => {
+                        // `HS_INIT`/`HS_RESP` — raw wire bytes, and the first
+                        // thing in this process to see them. `Peers::on_message`
+                        // treats `peer` as a CLAIM until the pattern and the
+                        // allowlist agree, and never panics on `body`.
+                        actions.extend(crypto.on_handshake_message(peer, kind, &body, now));
+                    }
+                }
+            }
+        }
+        self.crypto_exec(actions);
+        did
+    }
+
+    /// Rotation trigger 3 (spec §5): feed `RotationState` the tombstone count
+    /// of every config change that has COMMITTED — promotes and demotes
+    /// included, not only removals.
+    ///
+    /// Feeding it only removals would break it: it establishes a baseline on
+    /// its FIRST observation and latches only on strict GROWTH of the count,
+    /// so a first-ever call carrying a removal would be swallowed as the
+    /// baseline and revoke nothing.
+    ///
+    /// The commit edge is `!sm.config_pending()` — literally
+    /// `config_position <= commit_seen`, the same crossing `rank_leader`
+    /// computes for `StepDownRemoved`, observed here at the node layer so it
+    /// is available to FOLLOWERS too (a follower must keep its baseline in
+    /// step, or the epoch it eventually mints as a future leader would judge
+    /// growth against a stale count). Keyed on `version` rather than a bare
+    /// edge so it fires exactly once per committed change, and re-fires
+    /// correctly across a truncation revert (which re-adopts a LOWER version:
+    /// the count moves down, which is not growth, and the subsequent
+    /// re-adoption forward then latches — over-rotating on a revert, never
+    /// under-rotating).
+    fn crypto_observe_committed_config(&mut self) -> bool {
+        if self.sm.config_pending() {
+            return false;
+        }
+        let version = self.sm.config().version;
+        if self.crypto_committed_config_version == Some(version) {
+            return false;
+        }
+        self.crypto_committed_config_version = Some(version);
+        let tombstones = self.sm.config().tombstones.len();
+        if let Some(crypto) = self.crypto.as_ref() {
+            crypto.on_committed_config(tombstones);
+        }
+        true
+    }
+
+    /// The rate-limited maintenance pass — see [`CRYPTO_MAINTENANCE_NS`].
+    fn crypto_maintenance(&mut self) -> bool {
+        let now = self.crypto_now_ns();
+        if let Some(last) = self.crypto_last_maint_ns
+            && now.saturating_sub(last) < self.crypto_maint_ns
+        {
+            return false;
+        }
+        self.crypto_last_maint_ns = Some(now);
+
+        // (a) Membership churn: publish the sender-identity map and ask for a
+        //     link to every peer. `initiate` is idempotent — a peer with a
+        //     session or an in-flight handshake produces no traffic.
+        if self.crypto_peers_dirty {
+            self.crypto_peers_dirty = false;
+            let peers = self.crypto_peer_set();
+            let acts = self
+                .crypto
+                .as_ref()
+                .map(|c| peers.iter().flat_map(|&p| c.initiate(p, now)).collect::<Vec<_>>())
+                .unwrap_or_default();
+            self.crypto_exec(acts);
+        }
+
+        // (b) Notice an operator dropping a new peer's public key in. M7 adds
+        //     nodes at runtime; without this caller the joiner would need a
+        //     cluster-wide restart to be authorized (spec §5). Self-rate-
+        //     limited to once a second and touches no disk before that gate,
+        //     so calling it every pass is cheap.
+        if let Some(crypto) = self.crypto.as_ref()
+            && let Err(e) = crypto.allowlist_reload_if_stale(now)
+        {
+            self.crypto_log(now, format_args!("allowlist reload failed: {e}"));
+        }
+
+        // (c) Handshake upkeep: retransmit unanswered `HS_INIT`s with
+        //     backoff, restart links asked for but not up, expire unproven
+        //     pending sessions, announce promotions.
+        let acts = self.crypto.as_ref().map(|c| c.tick(now)).unwrap_or_default();
+        self.crypto_exec(acts);
+
+        // (d) Rotation — LEADER ONLY. `GroupPlane::mint` is the leader's
+        //     prerogative (spec §5); a follower simply lets its latches
+        //     accumulate, and `on_became_leader` clears them all with one
+        //     mint the moment it wins an election.
+        if self.leader_flag.load(Ordering::Relaxed) {
+            let due = self.crypto.as_ref().and_then(|c| c.rotation_due(now));
+            match due {
+                Some(reason) => {
+                    let peers = self.crypto_peer_set();
+                    let minted =
+                        self.crypto.as_ref().map(|c| c.mint_group_key(&peers, now));
+                    if let Some((epoch, acts)) = minted {
+                        self.crypto_epoch.store(epoch as u32, Ordering::Release);
+                        self.crypto_last_redeliver_ns = Some(now);
+                        eprintln!(
+                            "node {}: minted group key epoch {epoch} for {} peer(s) ({reason:?})",
+                            self.id,
+                            peers.len()
+                        );
+                        self.crypto_exec(acts);
+                    }
+                }
+                None => self.crypto_redeliver_unacked(now),
+            }
+        }
+        true
+    }
+
+    /// Re-send the newest minted epoch's `HS_KEY` to every peer that has not
+    /// acked it. `GroupPlane::mint` emits each delivery exactly once and the
+    /// datagram rides UDP, so without this a single drop leaves that peer
+    /// unable to open ANY group-scope traffic until the next rotation — an
+    /// hour away by default. The spec's "recovers through the existing NAK
+    /// repair path once `HS_KEY` lands" is only true if something makes it
+    /// land again: a NAK'd retransmit is itself `DATA`, sealed under the very
+    /// epoch the peer is missing.
+    fn crypto_redeliver_unacked(&mut self, now: u64) {
+        if let Some(last) = self.crypto_last_redeliver_ns
+            && now.saturating_sub(last) < CRYPTO_HS_KEY_REDELIVER_NS
+        {
+            return;
+        }
+        self.crypto_last_redeliver_ns = Some(now);
+        let acts = self
+            .crypto
+            .as_ref()
+            .map(|c| {
+                let unacked = c.unacked_group_key_peers();
+                if unacked.is_empty() { Vec::new() } else { c.redeliver_group_key_to(&unacked) }
+            })
+            .unwrap_or_default();
+        self.crypto_exec(acts);
+    }
+
+    /// Every peer this node maintains a pairwise link with and delivers the
+    /// group key to: voting peers plus learners, both minus self. Learners
+    /// are peers like any other here (spec §5) — they replicate the fan-out
+    /// and therefore need the group key.
+    fn crypto_peer_set(&self) -> Vec<NodeId> {
+        self.peers.iter().chain(self.learner_ids.iter()).copied().collect()
+    }
+
+    /// Execute the crate's `HandshakeAction`s. The driver never touches a
+    /// socket itself — that split is what keeps `Peers`/`GroupPlane` pure and
+    /// unit-testable — so this is the one place actions become datagrams.
+    fn crypto_exec(&mut self, actions: Vec<HandshakeAction>) {
+        let mut queue = actions;
+        // Belt: `Established` can enqueue a re-delivery, which cannot itself
+        // enqueue anything, so the real bound is 2 rounds. A cap makes that
+        // structural rather than argued.
+        let mut budget = 4 * CRYPTO_HS_DRAIN_PER_CYCLE + 64;
+        while let Some(act) = queue.pop() {
+            budget -= 1;
+            if budget == 0 {
+                break;
+            }
+            match act {
+                HandshakeAction::Send { to, kind, body } => self.crypto_send(to, kind, body),
+                HandshakeAction::Established { peer, boot_salt: _, confirmed: _ } => {
+                    // NOTHING is cached from this action, deliberately.
+                    //
+                    // The plan told this task to "record the salt so
+                    // `derive_send_key(group, peer, salt)` can open that
+                    // peer's group-sealed traffic". That instruction is
+                    // superseded: T9's review round 1 (findings F1/F2) moved
+                    // that responsibility INSIDE `uc2_crypto` — see
+                    // `transport.rs`'s "carried requirement #3". A cached
+                    // salt is exactly the bug F2 demonstrated. The action's
+                    // `confirmed: bool` is why: a session can be established
+                    // but UNPROMOTED for up to 30s after a peer restart, so
+                    // the salt in hand here is not necessarily the one in
+                    // force, and `ReceiveHalf::open` re-reads the live one
+                    // (current, then pending) on EVERY datagram instead.
+                    //
+                    // What DOES belong here is the other half of a peer
+                    // restart: a peer whose session just came (back) up holds
+                    // no group key at all — its new process minted none and
+                    // was never delivered ours. Re-deliver, unconditionally:
+                    // `GroupPlane` still counts it as acked from its previous
+                    // life, so the un-acked sweep alone would never cover it.
+                    if self.leader_flag.load(Ordering::Relaxed) {
+                        let extra = self
+                            .crypto
+                            .as_ref()
+                            .map(|c| c.redeliver_group_key_to(&[peer]))
+                            .unwrap_or_default();
+                        queue.extend(extra);
+                    }
+                }
+                HandshakeAction::Failed { peer, reason } => {
+                    self.crypto_handshake_failures.fetch_add(1, Ordering::Relaxed);
+                    // Eager allowlist reload on a refused handshake: the
+                    // likeliest cause is an M7 joiner whose key the operator
+                    // has just dropped in but this node has not re-read yet
+                    // (spec §5). `reload_if_stale` rate-limits itself to once
+                    // a second, so an attacker cannot turn a stream of forged
+                    // handshakes into a stream of disk reads. The peer's own
+                    // `HS_INIT` retransmit (200 ms backoff, never gives up)
+                    // is what retries the handshake once the reload lands.
+                    let now = self.crypto_now_ns();
+                    if let Some(crypto) = self.crypto.as_ref() {
+                        let _ = crypto.allowlist_reload_if_stale(now);
+                    }
+                    self.crypto_log(
+                        now,
+                        format_args!("handshake with node {peer} refused: {reason}"),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Build, seal (if the kind calls for it) and send one handshake-plane
+    /// datagram. A seal failure DROPS the datagram — it is never sent in the
+    /// clear, which would make the whole feature optional per datagram.
+    fn crypto_send(&mut self, to: NodeId, kind: u8, body: Vec<u8>) {
+        let Some(&addr) = self.id_to_addr.get(&to) else {
+            self.crypto_hs_unknown_source.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN + body.len()];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader {
+                position: 0,
+                leadership_term_id: self.sm.current_term(),
+                kind,
+                flags: 0,
+                key_epoch: 0,
+            },
+        );
+        d[DATAGRAM_HEADER_LEN..].copy_from_slice(&body);
+
+        // `HS_INIT`/`HS_RESP` are `Scope::Unsealed` BY DESIGN — they are what
+        // creates the session there is nothing to seal under yet. `HS_KEY`
+        // (kind 20) rides the ALREADY-established pairwise channel and is
+        // sealed here, by the node layer: `GroupPlane` emits the body and
+        // deliberately never touches a socket or a pairwise key. Which is
+        // which comes from `Transport::scope_of`, the single place that rule
+        // is encoded, rather than a second `kind` match here.
+        if !matches!(Transport::scope_of(kind), Scope::Unsealed) {
+            let sealed = self
+                .crypto
+                .as_ref()
+                .map(|c| c.seal_pairwise_control(kind, to, &mut d));
+            match sealed {
+                Some(Ok(())) => {}
+                other => {
+                    self.crypto_hs_key_seal_failures.fetch_add(1, Ordering::Relaxed);
+                    let now = self.crypto_now_ns();
+                    self.crypto_log(
+                        now,
+                        format_args!(
+                            "dropped a kind-{kind} datagram for node {to}: {}",
+                            match other {
+                                Some(Err(e)) => e.to_string(),
+                                _ => "crypto disabled".to_string(),
+                            }
+                        ),
+                    );
+                    return;
+                }
+            }
+        }
+        let _ = self.sock.send_to(&d, addr);
+    }
+
+    /// Throttled operator diagnostic — see [`CRYPTO_LOG_INTERVAL_NS`]. The
+    /// counters this accompanies are always exact; only printing is floored.
+    fn crypto_log(&mut self, now: u64, args: std::fmt::Arguments<'_>) {
+        if now.saturating_sub(self.crypto_last_log_ns) < CRYPTO_LOG_INTERVAL_NS
+            && self.crypto_last_log_ns != 0
+        {
+            return;
+        }
+        self.crypto_last_log_ns = now;
+        eprintln!("node {}: crypto: {args}", self.id);
+    }
+
+    /// Newest group epoch this node has minted, or `None` if it never has.
+    #[cfg(test)]
+    fn crypto_epoch(&self) -> Option<u16> {
+        match self.crypto_epoch.load(Ordering::Acquire) {
+            0 => None,
+            e => Some(e as u16),
+        }
+    }
+
+    /// `HS_KEY` deliveries dropped because they could not be sealed.
+    #[cfg(test)]
+    fn crypto_hs_key_seal_failures(&self) -> u64 {
+        self.crypto_hs_key_seal_failures.load(Ordering::Relaxed)
+    }
+
+    /// The live sender-identity map handed to the receive seam.
+    #[cfg(test)]
+    fn crypto_peer_ids(&self) -> Option<&PeerIds> {
+        self.crypto_peer_ids.as_ref()
     }
 
     /// M6 Task 9: refresh the cnc observability band. Writes the static
@@ -1439,6 +1998,19 @@ impl Consensus {
         self.peer_band_published = false;
         let live: Vec<NodeId> = self.peer_band.iter().map(|(id, _)| *id).collect();
         self.peer_reported.retain(|id, _| live.contains(id));
+        // M8 (Task 12): republish the receive seam's sender-identity map
+        // SYNCHRONOUSLY, here — not on the next maintenance pass. M7 adds
+        // nodes at runtime, and the joiner's first datagrams can arrive
+        // before this node's next duty cycle; an address the map does not
+        // know is dropped as `dropped_unknown_peer` before it is ever
+        // authenticated. The handshake half (asking `Peers` for a link to the
+        // new peer) is deferred to the maintenance pass — it takes the shared
+        // lock and produces datagrams, neither of which belongs on an
+        // adoption path that also runs during boot recovery.
+        if let Some(ids) = self.crypto_peer_ids.as_ref() {
+            ids.store(self.addr_to_id.iter().map(|(a, i)| (*a, *i)).collect::<Vec<_>>());
+            self.crypto_peers_dirty = true;
+        }
     }
 
     /// M7 Task 9: rebuild the sender's net layer (`CtrlMsg::SetPeers`) AND this
@@ -2602,6 +3174,19 @@ impl Consensus {
                 self.leader_flag.store(true, Ordering::Release);
                 // We ARE the leader of this term (leader_hint published on the page).
                 self.cnc.status().leader_hint.store_release(self.id as u64);
+                // M8 (Task 12), rotation trigger 1 (spec §5): a new leader
+                // ALWAYS mints a fresh epoch. This one rule absorbs leader
+                // self-removal (the outgoing leader steps down at the same
+                // commit crossing, so it cannot be the rotator), crash
+                // handoff, and any rotation a dead leader missed. It is also
+                // what makes this node able to seal group traffic AT ALL:
+                // `GroupPlane::sealing_epoch` answers only for an epoch this
+                // node itself minted, so a leader that never minted returns
+                // `NoGroupKey` for every `DATA`. The latch is consumed by the
+                // next maintenance pass, which does the actual mint.
+                if let Some(crypto) = self.crypto.as_ref() {
+                    crypto.on_became_leader();
+                }
             }
             Action::BecomeFollower { term, .. } => {
                 // T7 review finding 1: stepping down from leader (or adopting a
@@ -3356,6 +3941,10 @@ mod tests {
     /// senders/receivers don't disconnect while we drive `feed` directly.
     struct Harness {
         cons: Consensus,
+        /// M8 Task 12: the producer half of the handshake route the receiver
+        /// agent would own in a real node — lets a test inject a handshake
+        /// datagram exactly as `crypto_admit` would deliver one.
+        hs_tx: mpsc::SyncSender<HandshakeDatagram>,
         // Kept alive: dropping these would disconnect the consensus's endpoints.
         _net_tx: mpsc::SyncSender<NetEvent>,
         _obs_tx: mpsc::SyncSender<(u32, u64)>,
@@ -3400,6 +3989,17 @@ mod tests {
     /// `trunc_tx` send). The SM is seeded as a healed ex-leader whose durable tail
     /// diverges from the current leader's map, so a term-map delivery truncates.
     fn harness() -> Harness {
+        harness_with_crypto(None, None)
+    }
+
+    /// As [`harness`], but with the crypto plane wired exactly as
+    /// `Node::start_with_socket` wires it (M8 Task 12). `peer_override`
+    /// replaces one member's address with a real, bound socket so a genuine
+    /// handshake can be driven against this node.
+    fn harness_with_crypto(
+        crypto: Option<SharedTransport>,
+        peer_override: Option<(NodeId, SocketAddr)>,
+    ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let cnc = test_cnc();
         let buffer = Arc::new(LogBuffer::new(
@@ -3418,7 +4018,10 @@ mod tests {
         let mut id_to_addr = HashMap::new();
         let mut addr_to_id = HashMap::new();
         for (i, id) in members.iter().enumerate() {
-            let addr: SocketAddr = format!("127.0.0.1:{}", 9100 + i).parse().unwrap();
+            let addr: SocketAddr = match peer_override {
+                Some((oid, oaddr)) if oid == *id => oaddr,
+                _ => format!("127.0.0.1:{}", 9100 + i).parse().unwrap(),
+            };
             id_to_addr.insert(*id, addr);
             addr_to_id.insert(addr, *id);
         }
@@ -3463,6 +4066,12 @@ mod tests {
         // Not asserted on by any test in this module — a dropped receiver just
         // makes `sender_ctrl.send` return an ignored `Err` (`exec`'s `let _ =`).
         let (sender_ctrl, _sender_ctrl_rx) = mpsc::sync_channel::<CtrlMsg>(64);
+        let (hs_tx, hs_rx) = mpsc::sync_channel::<HandshakeDatagram>(64);
+        let crypto_peer_ids_seed = crypto.as_ref().map(|_| {
+            let ids = PeerIds::new();
+            ids.store(addr_to_id.iter().map(|(a, i)| (*a, *i)).collect::<Vec<_>>());
+            ids
+        });
 
         let sock = FaultSocket::from_socket(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
         let intake_gate = Arc::new(AtomicBool::new(true));
@@ -3542,10 +4151,28 @@ mod tests {
             last_admin_seq: 0,
             pending_admin_fwd: None,
             last_config_reply: None,
+            // M8 Task 12. `crypto_maint_ns: 0` makes ONE `do_work` a full
+            // maintenance pass — the production 20 ms floor is a hot-path
+            // concern, not a behavior under test, and rate-limiting here
+            // would only make these tests sleep.
+            crypto_peer_ids: crypto_peer_ids_seed,
+            crypto,
+            crypto_hs_rx: Some(hs_rx),
+            crypto_epoch: Arc::new(AtomicU32::new(0)),
+            crypto_last_maint_ns: None,
+            crypto_maint_ns: 0,
+            crypto_last_redeliver_ns: None,
+            crypto_committed_config_version: None,
+            crypto_peers_dirty: true,
+            crypto_hs_key_seal_failures: Arc::new(AtomicU64::new(0)),
+            crypto_hs_unknown_source: Arc::new(AtomicU64::new(0)),
+            crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
+            crypto_last_log_ns: 0,
         };
 
         Harness {
             cons,
+            hs_tx,
             _net_tx: net_tx,
             _obs_tx: obs_tx,
             _cfg_obs_tx: cfg_obs_tx,
@@ -3786,7 +4413,10 @@ mod tests {
         let append = h.cons.cnc.counters().append.load_acquire();
         assert_eq!(append, 6048);
         h.cons.feed(Event::DurableAdvanced { durable: append });
-        let addr0: SocketAddr = "127.0.0.1:9100".parse().unwrap(); // member 0
+        // Member 0's address as THIS harness knows it — `harness_with_crypto`
+        // may have replaced it with a real bound socket, and a Report from an
+        // address the node cannot resolve is (correctly) ignored.
+        let addr0 = h.cons.id_to_addr[&0];
         h.cons.feed_net(NetEvent::Report { from: addr0, term: 3, durable: append });
         assert!(h.cons.sm.can_serve(), "commit did not open the serving gate");
         append
@@ -4628,5 +5258,577 @@ mod tests {
         assert_eq!(stored_to_cluster(&rec.config), v2);
         assert_eq!(stored_to_cluster(&rec.prev), v1, "prev is the level rederivation folded from");
         assert_eq!(state.config_record().unwrap(), rec, "the rederived record is itself persisted");
+    }
+
+    // ==================================================================
+    // M8 Task 12: wire-crypto node wiring
+    // ==================================================================
+    //
+    // Fixtures mirror `uc2_net::receiver`'s crypto fixtures (same key-file
+    // and allowlist shapes) rather than inventing a second convention: real
+    // `Identity` key files, a real allowlist, a real `SharedTransport`.
+    // Nothing here fakes a session — the handshake test drives a genuine
+    // Noise IK exchange over a real UDP socket pair.
+
+    use uc2_crypto::schedule::epoch_is_newer;
+    use uc_protocol::v2::crypto::{DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_RESP};
+    use uc_protocol::v2::datagram::read_datagram_header;
+
+    const T12_PRIV_SELF: [u8; 32] = [0x31; 32];
+    const T12_PRIV_PEER: [u8; 32] = [0x32; 32];
+
+    /// Scratch on real disk (`CARGO_TARGET_TMPDIR`), never `/tmp` — that is
+    /// RAM-backed tmpfs with no swap on this box (CLAUDE.md).
+    fn crypto_scratch_dir(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::var("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc2_node_tests")
+            })
+            .join("uc2-node-crypto")
+            .join(format!("{tag}-{seq}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!dir.starts_with("/tmp"), "test scratch must not live on tmpfs: {dir:?}");
+        dir
+    }
+
+    fn write_key_file(path: &std::path::Path, private: [u8; 32]) {
+        std::fs::write(path, private).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    /// Standard-alphabet base64 with padding — matches `uc2_crypto::identity`'s
+    /// allowlist parser. Hand-rolled rather than adding a `base64`
+    /// dev-dependency to `uc2_node` for one fixture.
+    fn b64_32(bytes: &[u8; 32]) -> String {
+        const ALPHABET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+            let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHABET[((n >> 6) & 0x3F) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+        }
+        out
+    }
+
+    fn identity_public(tag: &str, private: [u8; 32]) -> [u8; 32] {
+        let dir = crypto_scratch_dir(tag);
+        let key_path = dir.join("node.key");
+        write_key_file(&key_path, private);
+        uc2_crypto::identity::Identity::load(&key_path).unwrap().public_bytes()
+    }
+
+    /// A real `CryptoConfig::Enabled` over freshly written key/allowlist files.
+    fn enabled_crypto_config(
+        tag: &str,
+        private: [u8; 32],
+        allow: &[(NodeId, [u8; 32])],
+    ) -> CryptoConfig {
+        let dir = crypto_scratch_dir(tag);
+        let key_path = dir.join("node.key");
+        write_key_file(&key_path, private);
+        let allowlist_path = dir.join("allowlist");
+        let mut text = String::new();
+        for (id, public) in allow {
+            text.push_str(&format!("{id} {}\n", b64_32(public)));
+        }
+        std::fs::write(&allowlist_path, text).unwrap();
+        CryptoConfig::Enabled {
+            key_path,
+            allowlist_path,
+            rotation: uc2_crypto::rotation::RotationPolicy::default(),
+        }
+    }
+
+    /// A minimal single-voter `NodeConfig` over a fresh instance dir.
+    fn test_node_config() -> (NodeConfig, PathBuf) {
+        let dir = crypto_scratch_dir("node-config");
+        let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let cfg = NodeConfig {
+            id: 1,
+            members: vec![(1, bind)],
+            learners: Vec::new(),
+            bind,
+            instance_dir: dir.clone(),
+            app_id: "t12".into(),
+            buffer_bytes: 1 << 20,
+            max_payload: 256,
+            admission_bytes: 256 * 1024,
+            election_timeout_min_ns: 20_000_000,
+            election_timeout_max_ns: 40_000_000,
+            seed: 1,
+            faults: FaultConfig::default(),
+            purge: PurgePolicy::Disabled,
+            journal_segment_bytes: DEFAULT_JOURNAL_SEGMENT_BYTES,
+            crypto: CryptoConfig::Disabled,
+        };
+        (cfg, dir)
+    }
+
+    /// Mirrors the M7 self-tombstone boot refusal: a node that cannot
+    /// authenticate must not silently fall back to cleartext.
+    #[test]
+    fn a_node_configured_for_crypto_with_unreadable_key_files_refuses_to_start() {
+        let (mut cfg, _dir) = test_node_config();
+        cfg.crypto = CryptoConfig::Enabled {
+            key_path: "/nonexistent/key".into(),
+            allowlist_path: "/nonexistent/allow".into(),
+            rotation: Default::default(),
+        };
+        let err = match Node::start(cfg) {
+            Err(e) => e,
+            Ok(_) => panic!("a node with unreadable key files must refuse to start"),
+        };
+        assert!(
+            err.to_string().contains("crypto is enabled"),
+            "the refusal must name the crypto config, got: {err}"
+        );
+    }
+
+    /// The refusal must be a CLEAN EARLY RETURN, before any agent is spawned
+    /// and before any instance file is created — the same shape as the M7
+    /// tombstone refusal. Discriminating: a valid key with an unreadable
+    /// ALLOWLIST must still refuse (so the check is not just
+    /// `Identity::load`), and the instance directory must be left untouched
+    /// (a node that got as far as `CncPage::create_file` would leave one
+    /// behind, and would have taken the flock).
+    #[test]
+    fn crypto_boot_refusal_leaves_no_instance_files_and_no_lock() {
+        let (mut cfg, dir) = test_node_config();
+        let good = enabled_crypto_config("refusal-good-key", T12_PRIV_SELF, &[]);
+        let CryptoConfig::Enabled { key_path, .. } = good else { unreachable!() };
+        cfg.crypto = CryptoConfig::Enabled {
+            key_path,
+            allowlist_path: "/nonexistent/allow".into(),
+            rotation: Default::default(),
+        };
+        assert!(Node::start(cfg).is_err(), "an unreadable allowlist is also a refusal");
+        // `cnc2.dat`, matching `InstanceDir::cnc_path` — asserting on a name
+        // the node never writes would make this half of the test vacuous.
+        assert!(
+            !dir.join("cnc2.dat").exists(),
+            "the refusal must precede instance-file creation"
+        );
+        assert!(
+            !dir.join("instance.lock").exists(),
+            "the refusal must precede taking the instance flock"
+        );
+    }
+
+    #[test]
+    fn default_config_is_disabled_so_existing_deployments_are_untouched() {
+        assert!(matches!(test_node_config().0.crypto, CryptoConfig::Disabled));
+        assert!(matches!(CryptoConfig::default(), CryptoConfig::Disabled));
+    }
+
+    /// A real, crypto-enabled single-voter node boots, elects itself, and
+    /// mints a group epoch — the whole construction path (`SharedTransport`,
+    /// both halves handed out exactly once, the receiver's `CryptoIntake`,
+    /// the consensus agent's crypto cycle) exercised through `Node::start`.
+    #[test]
+    fn a_crypto_enabled_node_boots_and_mints_an_epoch_on_winning_its_election() {
+        let (mut cfg, _dir) = test_node_config();
+        cfg.crypto = enabled_crypto_config("solo-node", T12_PRIV_SELF, &[]);
+        let node = Node::start(cfg).expect("a well-configured crypto node boots");
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while node.crypto_epoch().is_none() {
+            assert!(Instant::now() < deadline, "a fresh leader never minted a group epoch");
+            std::thread::yield_now();
+        }
+        assert!(node.is_leader(), "the sole voter elected itself");
+        node.stop();
+    }
+
+    // ---- the bare-`Consensus` crypto harness ----
+
+    /// A [`Harness`] with crypto wired as `Node::start_with_socket` wires it,
+    /// plus a live peer transport (node 0) reachable over a real UDP socket
+    /// so a genuine handshake can be driven against the node under test.
+    struct CryptoHarness {
+        h: Harness,
+        peer: SharedTransport,
+        peer_recv: uc2_crypto::ReceiveHalf,
+        peer_sock: UdpSocket,
+        /// Datagrams read off the peer socket while hunting for a different
+        /// kind. Kept rather than discarded: the node can emit an `HS_RESP`
+        /// and an `HS_KEY` in the SAME duty cycle, and a helper that threw
+        /// away whatever it was not looking for would silently eat the one a
+        /// later assertion depends on (which it did, first time round).
+        stash: Vec<Vec<u8>>,
+    }
+
+    impl CryptoHarness {
+        fn crypto_epoch(&self) -> Option<u16> {
+            self.h.cons.crypto_epoch()
+        }
+
+        /// Election + first commit, then one duty cycle so the crypto
+        /// maintenance pass runs (the mint `on_became_leader` latched).
+        fn drive_to_leader(&mut self) {
+            drive_to_serving_leader(&mut self.h);
+            self.h.cons.do_work();
+        }
+
+        /// Adopt + commit a config demoting `id` to a learner — NO tombstone.
+        fn commit_config_demoting(&mut self, id: NodeId) {
+            let mut c = self.h.cons.sm.config().clone();
+            let addr = c.voters.iter().find(|(v, _)| *v == id).map(|(_, a)| *a).unwrap();
+            c.voters.retain(|(v, _)| *v != id);
+            c.learners.push((id, addr));
+            c.version += 1;
+            self.h.cons.feed(Event::ConfigObserved { position: 40, config: c });
+            self.h.cons.do_work();
+        }
+
+        /// Adopt + commit a config removing `id` — the tombstone set grows.
+        fn commit_config_removing(&mut self, id: NodeId) {
+            let mut c = self.h.cons.sm.config().clone();
+            c.voters.retain(|(v, _)| *v != id);
+            c.learners.retain(|(v, _)| *v != id);
+            c.tombstones.push(id);
+            c.version += 1;
+            self.h.cons.feed(Event::ConfigObserved { position: 41, config: c });
+            self.h.cons.do_work();
+        }
+
+        /// Inject a handshake-plane datagram exactly as the receiver's
+        /// `crypto_admit` would deliver one (`HS_KEY` bodies arrive already
+        /// opened), then run one duty cycle.
+        fn deliver_handshake(&mut self, kind: u8, body: &[u8]) {
+            let from = self.peer_sock.local_addr().unwrap();
+            self.h.hs_tx.try_send((from, kind, body.to_vec())).unwrap();
+            self.h.cons.do_work();
+        }
+
+        /// The next RAW datagram of `want` the node sent to the peer socket,
+        /// checking the stash first and stashing anything else it reads.
+        fn recv_kind_raw(&mut self, want: u8) -> Option<Vec<u8>> {
+            if let Some(i) = self.stash.iter().position(|d| {
+                d.len() >= DATAGRAM_HEADER_LEN && read_datagram_header(d).kind == want
+            }) {
+                return Some(self.stash.remove(i));
+            }
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            let mut buf = vec![0u8; 65_536];
+            while Instant::now() < deadline {
+                let Ok((n, _)) = self.peer_sock.recv_from(&mut buf) else {
+                    self.h.cons.do_work();
+                    std::thread::yield_now();
+                    continue;
+                };
+                if n < DATAGRAM_HEADER_LEN {
+                    continue;
+                }
+                if read_datagram_header(&buf[..n]).kind == want {
+                    return Some(buf[..n].to_vec());
+                }
+                self.stash.push(buf[..n].to_vec());
+            }
+            None
+        }
+
+        /// As [`CryptoHarness::recv_kind_raw`], but returns the datagram's
+        /// BODY, opened if the kind is a sealed one — so a successful return
+        /// is itself the assertion that the node sealed it correctly.
+        fn recv_kind(&mut self, want: u8) -> Option<Vec<u8>> {
+            let mut d = self.recv_kind_raw(want)?;
+            let n = d.len();
+            Some(if matches!(Transport::scope_of(want), Scope::Unsealed) {
+                d[DATAGRAM_HEADER_LEN..n].to_vec()
+            } else {
+                let len = self
+                    .peer_recv
+                    .open_slice(1, &mut d, n)
+                    .expect("the node's sealed datagram must open under our session");
+                d[DATAGRAM_HEADER_LEN..len].to_vec()
+            })
+        }
+    }
+
+    /// The single `HandshakeAction::Send` body of `kind` in `acts`.
+    fn expect_send(acts: &[HandshakeAction], kind: u8) -> Vec<u8> {
+        acts.iter()
+            .find_map(|a| match a {
+                HandshakeAction::Send { kind: k, body, .. } if *k == kind => Some(body.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no Send of kind {kind} in {acts:?}"))
+    }
+
+    fn crypto_harness() -> CryptoHarness {
+        let self_pub = identity_public("harness-self-pub", T12_PRIV_SELF);
+        let peer_pub = identity_public("harness-peer-pub", T12_PRIV_PEER);
+        // The harness node is id 1 and trusts node 0; node 0 trusts node 1.
+        let self_cfg = enabled_crypto_config("harness-self", T12_PRIV_SELF, &[(0, peer_pub)]);
+        let peer_cfg = enabled_crypto_config("harness-peer", T12_PRIV_PEER, &[(1, self_pub)]);
+        let crypto = SharedTransport::new(&self_cfg, 1).unwrap().unwrap();
+        let peer = SharedTransport::new(&peer_cfg, 0).unwrap().unwrap();
+        let peer_recv = peer.receive_half();
+        let peer_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer_sock.set_nonblocking(true).unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let h = harness_with_crypto(Some(crypto), Some((0, peer_addr)));
+        CryptoHarness { h, peer, peer_recv, peer_sock, stash: Vec::new() }
+    }
+
+    /// Rotation trigger 1: a new leader always mints.
+    #[test]
+    fn winning_an_election_mints_a_fresh_epoch() {
+        let mut h = crypto_harness();
+        let before = h.crypto_epoch();
+        assert!(before.is_none(), "a node that has never led has never minted");
+        h.drive_to_leader();
+        assert!(epoch_is_newer(h.crypto_epoch().unwrap(), before.unwrap_or(0)));
+    }
+
+    /// Rotation trigger 3: a committed `Remove*` revokes; a committed demote
+    /// does not. Also the discriminating test for feeding
+    /// `on_committed_config` on EVERY committed change rather than only
+    /// removals — under "removals only" the first removal would merely seed
+    /// `RotationState`'s baseline and rotate nothing.
+    #[test]
+    fn a_committed_remove_rotates_but_a_committed_demote_does_not() {
+        let mut h = crypto_harness();
+        h.drive_to_leader();
+        let e0 = h.crypto_epoch().unwrap();
+
+        h.commit_config_demoting(2);
+        assert_eq!(h.crypto_epoch().unwrap(), e0, "a demote keeps the node replicating");
+
+        h.commit_config_removing(3);
+        assert!(epoch_is_newer(h.crypto_epoch().unwrap(), e0), "a removal revokes");
+    }
+
+    /// The mint's `HandshakeAction::Send`s must be CONSUMED by this layer:
+    /// sealed pairwise and pushed at the socket. With no established session
+    /// the seal fails — and the node must count that drop, never send the
+    /// key in the clear. A node that ignored the mint's actions entirely
+    /// leaves this counter at 0.
+    #[test]
+    fn a_mint_hands_every_peer_an_hs_key_delivery_this_layer_must_seal() {
+        let mut h = crypto_harness();
+        assert_eq!(h.h.cons.crypto_hs_key_seal_failures(), 0);
+        h.drive_to_leader();
+        assert_eq!(
+            h.h.cons.crypto_hs_key_seal_failures(),
+            2,
+            "one HS_KEY per peer (nodes 0 and 2), neither sealable without a session"
+        );
+    }
+
+    /// The whole handshake plane end to end: a real Noise IK exchange driven
+    /// through the node's handshake route, then a real group-key delivery
+    /// SEALED BY THIS LAYER over the established pairwise channel, opened and
+    /// acked by the peer, with the ack folded back into the group plane.
+    #[test]
+    fn handshake_routing_establishes_a_session_then_delivers_a_sealed_group_key() {
+        let mut h = crypto_harness();
+
+        // 1. Peer 0 initiates; its HS_INIT arrives on the node's handshake
+        //    route exactly as `crypto_admit` would deliver it.
+        let acts = h.peer.initiate(1, h.peer.now_ns());
+        let init = expect_send(&acts, DGRAM_KIND_HS_INIT);
+        h.deliver_handshake(DGRAM_KIND_HS_INIT, &init);
+
+        // 2. The node answered HS_RESP on its own socket, in the clear
+        //    (`Scope::Unsealed` — there is nothing to seal under yet).
+        let resp = h.recv_kind(DGRAM_KIND_HS_RESP).expect("the node answered the HS_INIT");
+        let acts = h.peer.on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, h.peer.now_ns());
+        assert!(
+            acts.iter().any(|a| matches!(a, HandshakeAction::Established { peer: 1, .. })),
+            "the peer's session with the node is up: {acts:?}"
+        );
+        assert!(h.h.cons.crypto.as_ref().unwrap().is_established(0), "and the node's with it");
+
+        // 3. The node becomes leader and mints. The HS_KEY for peer 0 is now
+        //    sealable over the established pairwise session — and `recv_kind`
+        //    OPENS it, which is itself the assertion that it went out sealed.
+        h.drive_to_leader();
+        let epoch = h.crypto_epoch().expect("the new leader minted");
+        let body = h.recv_kind(DGRAM_KIND_HS_KEY).expect("an HS_KEY was delivered");
+        assert_eq!(
+            u16::from_le_bytes([body[1], body[2]]),
+            epoch,
+            "the delivered epoch is the one the node minted"
+        );
+
+        // 4. The peer opens + installs it and acks; the ack rides back.
+        let acts = h.peer.on_group_key_message(1, &body);
+        let ack = expect_send(&acts, DGRAM_KIND_HS_KEY);
+        h.deliver_handshake(DGRAM_KIND_HS_KEY, &ack);
+    }
+
+    /// A lost `HS_KEY` must be re-sent. `GroupPlane::mint` emits each
+    /// delivery exactly once; the datagram rides UDP, and a peer that misses
+    /// it can open no group-scope traffic at all — it cannot self-heal
+    /// through NAK repair, because a NAK'd retransmit is itself `DATA` sealed
+    /// under the very epoch it is missing.
+    #[test]
+    fn an_unacked_group_key_is_redelivered_not_lost_until_the_next_rotation() {
+        let mut h = crypto_harness();
+
+        // Establish a session with peer 0 (as above), then mint.
+        let acts = h.peer.initiate(1, h.peer.now_ns());
+        let init = expect_send(&acts, DGRAM_KIND_HS_INIT);
+        h.deliver_handshake(DGRAM_KIND_HS_INIT, &init);
+        let resp = h.recv_kind(DGRAM_KIND_HS_RESP).expect("HS_RESP");
+        h.peer.on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, h.peer.now_ns());
+        h.drive_to_leader();
+
+        // Drop the first delivery on the floor (never acked), then let the
+        // re-delivery timer come due.
+        let first = h.recv_kind(DGRAM_KIND_HS_KEY).expect("the initial delivery");
+        h.h.cons.crypto_last_redeliver_ns = None;
+        h.h.cons.do_work();
+        let again = h.recv_kind(DGRAM_KIND_HS_KEY).expect("an un-acked epoch is re-delivered");
+        assert_eq!(again, first, "the same epoch's key, re-sent verbatim");
+
+        // Once acked, the sweep goes quiet: nothing further is re-delivered.
+        let acts = h.peer.on_group_key_message(1, &again);
+        let ack = expect_send(&acts, DGRAM_KIND_HS_KEY);
+        h.deliver_handshake(DGRAM_KIND_HS_KEY, &ack);
+        assert!(
+            h.h.cons.crypto.as_ref().unwrap().unacked_group_key_peers() == vec![2],
+            "only the unreachable peer 2 is still outstanding"
+        );
+    }
+
+    /// A peer that RESTARTS holds no group key at all — its new process
+    /// minted none and was never delivered ours — and `GroupPlane` still
+    /// counts it as acked from its previous life, so the un-acked sweep
+    /// alone would never re-key it. The leader must re-deliver off the fresh
+    /// `HandshakeAction::Established`. Without this a restarted follower
+    /// opens no `DATA` until the next rotation (an hour, by default).
+    ///
+    /// Discriminating: the peer here is a genuinely NEW `SharedTransport`
+    /// (new boot salt, new session), and the delivery it receives is opened
+    /// under the NEW session's key — which the OLD session's key would fail.
+    #[test]
+    fn a_peer_that_reestablishes_after_a_restart_is_re_keyed_immediately() {
+        let mut h = crypto_harness();
+        let self_pub = identity_public("restart-self-pub", T12_PRIV_SELF);
+
+        // First life: handshake, then this node leads and mints.
+        let acts = h.peer.initiate(1, h.peer.now_ns());
+        let init = expect_send(&acts, DGRAM_KIND_HS_INIT);
+        h.deliver_handshake(DGRAM_KIND_HS_INIT, &init);
+        let resp = h.recv_kind(DGRAM_KIND_HS_RESP).expect("HS_RESP");
+        h.peer.on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, h.peer.now_ns());
+        h.drive_to_leader();
+        let epoch = h.crypto_epoch().unwrap();
+        let first = h.recv_kind(DGRAM_KIND_HS_KEY).expect("first-life delivery");
+        let acts = h.peer.on_group_key_message(1, &first);
+        let ack = expect_send(&acts, DGRAM_KIND_HS_KEY);
+        h.deliver_handshake(DGRAM_KIND_HS_KEY, &ack);
+        assert!(
+            !h.h.cons.crypto.as_ref().unwrap().unacked_group_key_peers().contains(&0),
+            "peer 0 has acked; the un-acked sweep will never name it again"
+        );
+
+        // The peer restarts: a brand-new process, new boot salt, new session.
+        let peer_cfg =
+            enabled_crypto_config("harness-peer-restarted", T12_PRIV_PEER, &[(1, self_pub)]);
+        h.peer = SharedTransport::new(&peer_cfg, 0).unwrap().unwrap();
+        h.peer_recv = h.peer.receive_half();
+        let acts = h.peer.initiate(1, h.peer.now_ns());
+        let init = expect_send(&acts, DGRAM_KIND_HS_INIT);
+        h.deliver_handshake(DGRAM_KIND_HS_INIT, &init);
+        let resp = h.recv_kind(DGRAM_KIND_HS_RESP).expect("HS_RESP after restart");
+        h.peer.on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, h.peer.now_ns());
+        h.h.cons.do_work();
+
+        // A fresh `Established` for a peer that was already fully acked
+        // produced a NEW `HS_KEY` on the wire. Asserted on the RAW datagram,
+        // not an opened one: as responder the node parks the restarted
+        // peer's session as `pending` (WireGuard-style — nothing has yet
+        // PROVEN the peer adopted it), so `seal_pairwise` still uses the OLD
+        // session's key here and the restarted peer cannot open THIS one.
+        // The peer's own steady-state pairwise traffic promotes `pending`,
+        // at which point `Peers::tick` re-announces
+        // `Established { confirmed: true }` and this same path re-keys it
+        // openably. What this test pins is the part that lives in THIS
+        // layer: the re-delivery fires at all, which the un-acked sweep
+        // alone would never do for an already-acked peer.
+        let raw = h.recv_kind_raw(DGRAM_KIND_HS_KEY).expect("the restarted peer is re-keyed");
+        assert_eq!(
+            raw.len(),
+            DATAGRAM_HEADER_LEN + 35 + uc_protocol::v2::crypto::CRYPTO_OVERHEAD,
+            "a sealed 35-byte key delivery, not something else"
+        );
+        assert!(epoch > 0, "the epoch in force is a real minted one");
+    }
+
+    /// M7 runtime node-add: the `SocketAddr -> NodeId` map the receive seam
+    /// resolves senders through must follow a committed config change, or the
+    /// joiner's every datagram is dropped as `dropped_unknown_peer` until the
+    /// whole cluster restarts — the case spec §5 exists to serve.
+    #[test]
+    fn a_committed_config_change_republishes_the_receivers_peer_id_map() {
+        let mut h = crypto_harness();
+        h.drive_to_leader();
+        let before = h.h.cons.crypto_peer_ids().unwrap().snapshot();
+        assert!(!before.values().any(|id| *id == 9), "node 9 is not a member yet");
+
+        let mut c = h.h.cons.sm.config().clone();
+        let addr: SocketAddr = "127.0.0.1:9109".parse().unwrap();
+        c.learners.push((9, addr_to_pair(addr)));
+        c.version += 1;
+        h.h.cons.feed(Event::ConfigObserved { position: 42, config: c });
+
+        // Synchronously, on the adoption itself — not one duty cycle later.
+        let after = h.h.cons.crypto_peer_ids().unwrap().snapshot();
+        assert_eq!(after.get(&addr), Some(&9), "the joiner is resolvable immediately");
+    }
+
+    /// A handshake datagram from a source address this node has no `NodeId`
+    /// for is counted and dropped — never fed to the handshake state machine
+    /// under a guessed id.
+    #[test]
+    fn a_handshake_from_an_unmapped_address_is_dropped_and_counted() {
+        let mut h = crypto_harness();
+        h.h.cons.do_work(); // settle the boot-time `initiate` sweep first
+        let failures = h.h.cons.crypto_handshake_failures.load(Ordering::Relaxed);
+        let stranger: SocketAddr = "127.0.0.1:9199".parse().unwrap();
+        h.h.hs_tx.try_send((stranger, DGRAM_KIND_HS_INIT, vec![0xAB; 116])).unwrap();
+        h.h.cons.do_work();
+        assert_eq!(h.h.cons.crypto_hs_unknown_source.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            h.h.cons.crypto_handshake_failures.load(Ordering::Relaxed),
+            failures,
+            "it never reached the handshake state machine at all"
+        );
+    }
+
+    /// A garbage `HS_INIT` from a MAPPED peer reaches `Peers::on_message` and
+    /// comes back as a refusal — counted, logged, never a panic. This is the
+    /// node's first sight of attacker-controlled bytes.
+    #[test]
+    fn a_garbage_handshake_from_a_mapped_peer_is_refused_not_fatal() {
+        let mut h = crypto_harness();
+        h.h.cons.do_work(); // settle the boot-time `initiate` sweep first
+        let failures = h.h.cons.crypto_handshake_failures.load(Ordering::Relaxed);
+        let from = h.peer_sock.local_addr().unwrap();
+        h.h.hs_tx.try_send((from, DGRAM_KIND_HS_INIT, vec![0xAB; 116])).unwrap();
+        h.h.cons.do_work();
+        assert!(
+            h.h.cons.crypto_handshake_failures.load(Ordering::Relaxed) > failures,
+            "a mapped peer's garbage HS_INIT reaches Peers::on_message and is refused"
+        );
     }
 }

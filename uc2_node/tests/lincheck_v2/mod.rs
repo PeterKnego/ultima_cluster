@@ -151,6 +151,7 @@ fn make_config(
         purge: ccfg.purge,
         learners: Vec::new(),
         journal_segment_bytes: ccfg.journal_segment_bytes,
+        crypto: uc2_node::CryptoConfig::Disabled,
     }
 }
 
