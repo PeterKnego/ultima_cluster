@@ -59,11 +59,83 @@ use crate::sender::CtrlMsg;
 /// state machine from this route yet; that is Task 12's node-layer wiring
 /// (`uc2_crypto::SharedTransport::initiate`/`on_handshake_message`/
 /// `on_group_key_message`, T11's own plan-gap addition). Until a route is
-/// installed via [`FollowerReceiver::set_handshake_route`], these are
-/// dropped and counted (`FollowerStats::dropped_handshake`) — never silently
-/// absorbed, and never fed to `on_datagram`, which has no idea what an
-/// HS_INIT is.
+/// supplied in [`CryptoIntake::handshake`] (T12 made it a constructor
+/// argument, not an optional setter), these are dropped and counted
+/// (`FollowerStats::dropped_handshake`) — never silently absorbed, and never
+/// fed to `on_datagram`, which has no idea what an HS_INIT is.
 pub type HandshakeDatagram = (SocketAddr, u8, Vec<u8>);
+
+/// M8 (Task 12): the live `SocketAddr -> NodeId` map `crypto_admit` resolves
+/// a datagram's sender through before it can authenticate anything, shared
+/// with whoever owns membership (the node's consensus agent).
+///
+/// **Shared and versioned, not a snapshot.** Task 11 took the map by value at
+/// construction, which is correct only for a cluster whose membership never
+/// changes — and M7 changes membership at runtime. After an `add-learner`
+/// commits, a node that still held the boot-time map would resolve nothing
+/// for the joiner and drop every datagram it sends as `dropped_unknown_peer`
+/// until the whole cluster restarted, defeating the very case §5 of the spec
+/// exists to serve (the allowlist half of which is handled by
+/// `Peers::allowlist_reload_if_stale`).
+///
+/// The receiver re-reads the map only when `generation` changes — one
+/// `Relaxed` load per duty cycle (not per datagram), and the `Mutex` is
+/// touched only on an actual membership change. `store` is the sole writer's
+/// entry point; it replaces the map wholesale and then bumps `generation`
+/// (that order matters: a reader that observes the new generation is
+/// guaranteed to find the new map behind it).
+#[derive(Clone, Default)]
+pub struct PeerIds {
+    generation: Arc<AtomicU64>,
+    map: Arc<Mutex<HashMap<SocketAddr, NodeId>>>,
+}
+
+impl PeerIds {
+    /// An empty map at generation 0.
+    pub fn new() -> PeerIds {
+        PeerIds::default()
+    }
+
+    /// Replaces the whole map and publishes it (bumping `generation`, which
+    /// is what makes a running receiver pick it up). Called by the node's
+    /// consensus agent at boot and on every adopted `ClusterConfig`.
+    pub fn store(&self, ids: impl IntoIterator<Item = (SocketAddr, NodeId)>) {
+        let next: HashMap<SocketAddr, NodeId> = ids.into_iter().collect();
+        *self.map.lock().unwrap() = next;
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// A copy of the current map — for tests and diagnostics, never on a
+    /// per-datagram path.
+    pub fn snapshot(&self) -> HashMap<SocketAddr, NodeId> {
+        self.map.lock().unwrap().clone()
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+}
+
+/// M8 (Task 12): everything the receive path needs to run with crypto on,
+/// taken as ONE value so none of the three pieces can be forgotten.
+///
+/// Task 11 shipped the half as a constructor argument and the other two as
+/// separate `set_peer_ids`/`set_handshake_route` setters, documented but not
+/// enforced ("if T12 forgets `set_peer_ids`, every crypto-scoped datagram
+/// silently becomes `dropped_unknown_peer`" — T11's own hand-off note).
+/// A silent, total, cluster-wide failure that nothing catches is not a
+/// documentation problem; bundling the three makes the mistake a compile
+/// error instead.
+pub struct CryptoIntake {
+    /// The process's single [`ReceiveHalf`] (`SharedTransport::receive_half`).
+    pub half: ReceiveHalf,
+    /// The live sender-identity map — see [`PeerIds`].
+    pub peer_ids: PeerIds,
+    /// Where handshake-plane datagrams (kinds 18/19/20) go — see
+    /// [`HandshakeDatagram`]. Nothing in `uc2_net` drives the handshake state
+    /// machine; the node layer does.
+    pub handshake: mpsc::SyncSender<HandshakeDatagram>,
+}
 
 /// Consensus-plane events demuxed off the shared UDP socket and routed to the
 /// consensus agent (Task 8) over the [`FollowerReceiver::new`] constructor's
@@ -295,7 +367,7 @@ pub struct FollowerStats {
     /// M8 (Task 11): a sealed datagram failed AEAD authentication — wrong
     /// key, tampered ciphertext, tampered header, or an unresolvable sender
     /// (no `SocketAddr -> NodeId` mapping installed — see
-    /// [`FollowerReceiver::set_peer_ids`] — is folded in here too: from the
+    /// [`CryptoIntake::peer_ids`] — is folded in here too: from the
     /// wire's point of view an unrecognized sender IS "could not
     /// authenticate this," the same bucket).
     pub dropped_auth_failed: AtomicU64,
@@ -319,14 +391,14 @@ pub struct FollowerStats {
     /// rollout," diagnosable as such rather than a generic auth failure.
     pub peer_appears_cleartext: AtomicU64,
     /// M8 (Task 11): a would-be-sealed datagram arrived from a `SocketAddr`
-    /// with no entry in [`FollowerReceiver::set_peer_ids`]'s map. Counted
+    /// with no entry in [`CryptoIntake::peer_ids`]'s map. Counted
     /// separately from `dropped_auth_failed` for operator diagnosability
     /// (a misconfigured peer map vs. a genuine forgery look identical on
     /// the wire but very different to fix) even though both are folded
     /// into `dropped_auth_failed` for the mandated counter's own semantics.
     pub dropped_unknown_peer: AtomicU64,
     /// M8 (Task 11): a handshake-plane datagram (kind 18/19/20) could not be
-    /// forwarded — no route installed via `set_handshake_route`, or the
+    /// forwarded — no route supplied in [`CryptoIntake::handshake`], or the
     /// route's channel was full/disconnected. Harmless by the same
     /// reasoning as `net_drops`: `Peers::tick`/a retry re-initiates.
     pub dropped_handshake: AtomicU64,
@@ -463,10 +535,18 @@ pub struct FollowerReceiver {
     /// panic on an unrecognized address, since that address is exactly as
     /// attacker-controlled as anything else arriving on this socket. Empty
     /// by default (every existing non-crypto call site is unaffected); the
-    /// node layer (T12) installs it via [`FollowerReceiver::set_peer_ids`]
-    /// from the SAME `id_to_addr` map it already builds for the sender's
+    /// node layer (T12) supplies it in [`CryptoIntake`] from the SAME
+    /// `id_to_addr` map it already builds for the sender's
     /// `sender_peer_slots` (`node.rs:640`), inverted.
+    ///
+    /// This is a LOCAL COPY, refreshed from `peer_ids_src` once per duty
+    /// cycle (T12) rather than locked per datagram — see [`PeerIds`].
     peer_ids: HashMap<SocketAddr, NodeId>,
+    /// M8 (Task 12): the shared, versioned source `peer_ids` mirrors, plus
+    /// the generation last mirrored. `None` when crypto is off (nothing
+    /// consults `peer_ids` then — `crypto_admit` returns on its first line).
+    peer_ids_src: Option<PeerIds>,
+    peer_ids_gen: u64,
     /// M8 (Task 11): handshake-plane route (kinds 18/19/20 — see
     /// [`HandshakeDatagram`]'s doc). `None` = dropped and counted
     /// (`dropped_handshake`) — the T11 scope is "route it somewhere safe,"
@@ -500,21 +580,32 @@ impl FollowerReceiver {
     }
 
     /// M8 (Task 11): the innermost constructor — `new` is a thin wrapper over
-    /// this with `crypto: None`. Takes a `ReceiveHalf` (from
+    /// this with `crypto: None`. Takes a [`ReceiveHalf`] (from
     /// `uc2_crypto::SharedTransport::receive_half`), never a whole
     /// `Transport`/`SharedTransport` — see the `crypto` field's doc for why.
     /// The caller (the node layer, T12) owns the `SharedTransport` and calls
     /// `receive_half()` exactly once per process; this constructor has no
     /// way to enforce that single-call discipline itself (it only ever sees
     /// the `ReceiveHalf` already handed out).
+    ///
+    /// M8 (Task 12): the half arrives inside a [`CryptoIntake`], alongside
+    /// the sender-identity map and the handshake route, so enabling crypto
+    /// without wiring both of those is a compile error rather than a silent
+    /// cluster-wide drop — see [`CryptoIntake`]'s doc.
     pub fn with_crypto(
         buffer: Arc<LogBuffer>,
         sock: FaultSocket,
         cfg: FollowerConfig,
         term: TermHandle,
         route: mpsc::SyncSender<NetEvent>,
-        crypto: Option<ReceiveHalf>,
+        crypto: Option<CryptoIntake>,
     ) -> Self {
+        let (crypto, peer_ids_src, hs_route) = match crypto {
+            Some(CryptoIntake { half, peer_ids, handshake }) => {
+                (Some(half), Some(peer_ids), Some(handshake))
+            }
+            None => (None, None, None),
+        };
         let start = buffer.counters().append.load_acquire();
         let status_bytes =
             if cfg.status_bytes == 0 { buffer.capacity() / 4 } else { cfg.status_bytes };
@@ -551,28 +642,28 @@ impl FollowerReceiver {
             #[cfg(test)]
             straddle_hook: None,
             crypto,
-            peer_ids: HashMap::new(),
-            hs_route: None,
+            peer_ids: peer_ids_src.as_ref().map(PeerIds::snapshot).unwrap_or_default(),
+            peer_ids_gen: peer_ids_src.as_ref().map(PeerIds::generation).unwrap_or(0),
+            peer_ids_src,
+            hs_route,
             cleartext_peer_log: HashMap::new(),
         }
     }
 
-    /// M8 (Task 11): install the `SocketAddr -> NodeId` map `crypto_admit`
-    /// needs to resolve a datagram's sender before it can call
-    /// `ReceiveHalf::open_slice`. Without this call every crypto-scoped
-    /// datagram is dropped as `dropped_unknown_peer`/`dropped_auth_failed`
-    /// (an empty map resolves nothing) — harmless on a node with crypto
-    /// disabled (this is never consulted; see `crypto_admit`'s first line).
-    pub fn set_peer_ids(&mut self, ids: impl IntoIterator<Item = (SocketAddr, NodeId)>) {
-        self.peer_ids = ids.into_iter().collect();
-    }
-
-    /// M8 (Task 11): install the handshake-plane route (kinds 18/19/20 —
-    /// see [`HandshakeDatagram`]'s doc). Without this call handshake
-    /// datagrams are dropped and counted (`dropped_handshake`) — this
-    /// receiver never drives `Peers`/`GroupPlane` itself.
-    pub fn set_handshake_route(&mut self, tx: mpsc::SyncSender<HandshakeDatagram>) {
-        self.hs_route = Some(tx);
+    /// M8 (Task 12): mirror the shared [`PeerIds`] map if the writer has
+    /// published a new generation since the last duty cycle. One `Acquire`
+    /// load per cycle in the common (unchanged) case; the `Mutex` is touched
+    /// only when membership actually changed. See [`PeerIds`] for why the
+    /// map cannot simply be a boot-time snapshot.
+    fn refresh_peer_ids(&mut self) {
+        let Some(src) = self.peer_ids_src.as_ref() else {
+            return;
+        };
+        let published = src.generation();
+        if published != self.peer_ids_gen {
+            self.peer_ids = src.snapshot();
+            self.peer_ids_gen = published;
+        }
     }
 
     pub fn stats(&self) -> Arc<FollowerStats> {
@@ -729,6 +820,10 @@ impl FollowerReceiver {
         self.resync_after_truncation();
         // And, after a snapshot install, forward to the adopted floor (M6 Task 8).
         self.resync_after_snapshot_install();
+        // M8 (Task 12): pick up a membership change before authenticating
+        // anything this cycle — a joiner added by M7 at runtime must be
+        // resolvable without a restart (see `PeerIds`).
+        self.refresh_peer_ids();
         let mut did = false;
         self.activity_emitted = false; // one LeaderActivity per cycle (node mode)
         for _ in 0..64 {
@@ -923,7 +1018,7 @@ impl FollowerReceiver {
     }
 
     /// Forwards a handshake-plane datagram (kind 18/19/20) to
-    /// [`FollowerReceiver::set_handshake_route`]'s channel, if installed.
+    /// [`CryptoIntake::handshake`]'s channel, if crypto is on.
     /// Drops and counts (`dropped_handshake`) otherwise — no route, or a
     /// full/disconnected one (harmless: `Peers::tick`/a retry re-initiates,
     /// same reasoning as the consensus route's own full-channel drops).
@@ -935,7 +1030,7 @@ impl FollowerReceiver {
     }
 
     /// Resolves `from` to the `NodeId` [`ReceiveHalf::open_slice`] needs —
-    /// see [`FollowerReceiver::set_peer_ids`].
+    /// see [`PeerIds`] and [`CryptoIntake::peer_ids`].
     #[inline]
     fn peer_id_of(&self, from: SocketAddr) -> Option<NodeId> {
         self.peer_ids.get(&from).copied()
@@ -1557,6 +1652,20 @@ mod tests {
     fn dummy_route() -> mpsc::SyncSender<NetEvent> {
         let (tx, _rx) = mpsc::sync_channel(16);
         tx
+    }
+
+    /// A dummy handshake route for the crypto fixtures below — same
+    /// dropped-receiver shape (and same harmlessness) as `dummy_route`.
+    /// Tests that INSPECT handshake datagrams keep their own live receiver.
+    fn dummy_handshake_route() -> mpsc::SyncSender<HandshakeDatagram> {
+        let (tx, _rx) = mpsc::sync_channel(16);
+        tx
+    }
+
+    fn peer_ids_of(ids: impl IntoIterator<Item = (SocketAddr, NodeId)>) -> PeerIds {
+        let p = PeerIds::new();
+        p.store(ids);
+        p
     }
 
     fn follower(b: &Arc<LogBuffer>, leader: SocketAddr) -> FollowerReceiver {
@@ -2715,6 +2824,17 @@ mod tests {
     /// established `CryptoPeer`, and the shared `LogBuffer` (so tests can
     /// check whether admitted DATA actually landed).
     fn receiver_with_crypto() -> (FollowerReceiver, CryptoPeer, Arc<LogBuffer>) {
+        let (r, peer, b, _ids) = receiver_with_crypto_ids(true);
+        (r, peer, b)
+    }
+
+    /// As `receiver_with_crypto`, but hands back the live [`PeerIds`] handle
+    /// and lets the caller start with an EMPTY map — the M7 runtime-node-add
+    /// shape (T12): a peer whose address this node had no mapping for at
+    /// construction, published later without a restart.
+    fn receiver_with_crypto_ids(
+        registered: bool,
+    ) -> (FollowerReceiver, CryptoPeer, Arc<LogBuffer>, PeerIds) {
         let (recv_shared, peer_send, epoch) = established_crypto_pair("recv-with-crypto");
         let b = buffer();
         let peer_sock = FaultSocket::bind("127.0.0.1:0").unwrap();
@@ -2726,17 +2846,22 @@ mod tests {
         cfg.append_pos_floor_ns = u64::MAX;
 
         let recv_half = recv_shared.receive_half();
-        let mut r = FollowerReceiver::with_crypto(
+        let peer_ids =
+            if registered { peer_ids_of([(peer_addr, PEER_ID)]) } else { PeerIds::new() };
+        let r = FollowerReceiver::with_crypto(
             Arc::clone(&b),
             FaultSocket::bind("127.0.0.1:0").unwrap(),
             cfg,
             term_handle(TERM),
             dummy_route(),
-            Some(recv_half),
+            Some(CryptoIntake {
+                half: recv_half,
+                peer_ids: peer_ids.clone(),
+                handshake: dummy_handshake_route(),
+            }),
         );
-        r.set_peer_ids([(peer_addr, PEER_ID)]);
 
-        (r, CryptoPeer { sock: peer_sock, send: peer_send, epoch }, b)
+        (r, CryptoPeer { sock: peer_sock, send: peer_send, epoch }, b, peer_ids)
     }
 
     /// T11 review round 1, finding 1: a receiver whose schedule holds a
@@ -2758,15 +2883,18 @@ mod tests {
         cfg.append_pos_floor_ns = u64::MAX;
 
         let recv_half = recv_shared.receive_half();
-        let mut r = FollowerReceiver::with_crypto(
+        let r = FollowerReceiver::with_crypto(
             Arc::clone(&b),
             FaultSocket::bind("127.0.0.1:0").unwrap(),
             cfg,
             term_handle(TERM),
             dummy_route(),
-            Some(recv_half),
+            Some(CryptoIntake {
+                half: recv_half,
+                peer_ids: peer_ids_of([(peer_addr, PEER_ID)]),
+                handshake: dummy_handshake_route(),
+            }),
         );
-        r.set_peer_ids([(peer_addr, PEER_ID)]);
 
         (r, peer_sock, seal_key, b)
     }
@@ -2849,6 +2977,43 @@ mod tests {
         drive_until(&mut r, || b.counters().append.load_acquire() == *advance);
         let s = b.recordable_slice(0, 1 << 20).unwrap();
         assert_eq!(&s[32..36], b"aaaa", "downstream sees plaintext, byte-identical to the cleartext path");
+    }
+
+    /// M8 (Task 12), the M7 runtime-node-add shape: a peer whose address had
+    /// no `NodeId` mapping when this receiver was constructed must become
+    /// resolvable the moment membership publishes it — WITHOUT a restart.
+    ///
+    /// Discriminating on purpose: the FIRST half asserts the datagram is
+    /// dropped as `dropped_unknown_peer` (so the fixture genuinely starts
+    /// with no mapping — a fixture that silently registered the peer would
+    /// make the second half vacuous), and the second half asserts the very
+    /// same peer's next datagram lands in the log buffer after nothing but a
+    /// `PeerIds::store`. Reverting `refresh_peer_ids` to a no-op fails the
+    /// second half; never publishing an empty map fails the first.
+    #[test]
+    fn a_peer_id_published_after_construction_is_resolvable_without_a_restart() {
+        use Ordering::Relaxed;
+        let (mut r, mut peer, b, ids) = receiver_with_crypto_ids(false);
+        let to = r.local_addr();
+        let peer_addr = peer.sock.local_addr().unwrap();
+        let runs = frame_runs(&[b"aaaa", b"bb"], 4096);
+
+        // Unregistered: a genuinely well-formed sealed DATA is refused.
+        let (pos, bytes, _) = &runs[0];
+        peer.send_sealed_data(to, *pos, bytes);
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_unknown_peer.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "unregistered peer never counted");
+            r.do_work();
+        }
+        assert_eq!(b.counters().append.load_acquire(), 0, "nothing was admitted");
+
+        // Membership publishes the joiner. No restart, no reconstruction.
+        ids.store([(peer_addr, PEER_ID)]);
+        let (pos, bytes, advance) = &runs[0];
+        peer.send_sealed_data(to, *pos, bytes);
+        drive_until(&mut r, || b.counters().append.load_acquire() == *advance);
     }
 
     #[test]
@@ -3012,7 +3177,7 @@ mod tests {
 
     #[test]
     fn a_datagram_from_an_unregistered_address_is_dropped_and_counted_not_authenticated() {
-        // Every other test's peer is registered via `set_peer_ids` (built
+        // Every other test's peer is registered via `CryptoIntake::peer_ids` (built
         // into `receiver_with_crypto`). Nothing exercises the OTHER branch
         // of `peer_id_of` -- a real sealed-LOOKING datagram from a
         // `SocketAddr` this receiver has no `NodeId` mapping for -- until
