@@ -134,13 +134,14 @@ use crate::identity::{Allowlist, Identity};
 use crate::replay::ReplayWindow;
 use crate::rotation::{RotationPolicy, RotationReason, RotationState};
 use crate::schedule::{BootSalt, derive_send_key};
-use crate::seal::{open_in_place, seal_with};
+use crate::seal::{open_detached, open_in_place, seal_with};
 use crate::{CryptoError, NodeId};
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::{Aes256Gcm, KeyInit};
 use rand::TryRngCore;
 use rand::rngs::OsRng;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -877,6 +878,7 @@ impl SharedTransport {
             base: self.base,
             key: Arc::clone(&self.key),
             group_replay: HashMap::new(),
+            pairwise_scratch: Vec::new(),
         }
     }
 
@@ -909,6 +911,63 @@ impl SharedTransport {
     /// [`Transport::allowlist_reload_if_stale`]'s doc.
     pub fn allowlist_reload_if_stale(&self, now_ns: u64) -> Result<bool, CryptoError> {
         self.key.lock().unwrap().peers.allowlist_reload_if_stale(now_ns)
+    }
+
+    // ---- T11 plan gap: handshake driving was unreachable from outside this
+    // crate ---------------------------------------------------------------
+    //
+    // Neither `Transport` nor `SharedTransport` exposed ANY way for another
+    // crate to drive `Peers::initiate`/`Peers::on_message` or
+    // `GroupPlane::on_key_message` — every existing forwarder (above) covers
+    // the rare admin/rotation events, not the handshake bootstrap itself.
+    // `CryptoError::UnsealedKind`'s own doc already says HS_INIT/HS_RESP
+    // "must be driven directly via `Peers::initiate`/`Peers::on_message`,
+    // never through this facade" — but nothing let a caller outside
+    // `uc2_crypto` reach those methods to do so. T11 (the receive seam)
+    // needs this to route HS_INIT/HS_RESP/HS_KEY (kinds 18-20) anywhere
+    // useful, and its own test suite needs it to build two nodes with a
+    // real established session + a shared group key (`open_group` requires
+    // `Peers::peer_boot_salt`, which only a completed handshake populates —
+    // there is no way to fake that from outside this crate either).
+    //
+    // Same class of gap, and the same "flag prominently and add the pure
+    // forwarder" resolution, as T10's `mint_group_key` addition (see that
+    // method's doc and the T10 report's "Plan gap found and fixed" section):
+    // each of these three methods is a one-line lock-and-forward with zero
+    // design surface of its own (the forwarded function, its signature, and
+    // its semantics are already reviewed and shipped in `handshake.rs`/
+    // `group.rs`), and Task 12's node-level handshake driver will need
+    // exactly these calls verbatim regardless of who adds them first.
+
+    /// Forwards to [`Peers::initiate`] — starts (or restarts) a handshake
+    /// with `peer`, returning the `HS_INIT` [`HandshakeAction::Send`] (or a
+    /// `Failed` action if `peer` is not allowlisted).
+    pub fn initiate(&self, peer: NodeId, now_ns: u64) -> Vec<HandshakeAction> {
+        self.key.lock().unwrap().peers.initiate(peer, now_ns)
+    }
+
+    /// Forwards to [`Peers::on_message`] — feeds a received `HS_INIT`/
+    /// `HS_RESP` datagram's body (kinds 18/19, `Scope::Unsealed` — never
+    /// opened first) into the handshake state machine.
+    pub fn on_handshake_message(
+        &self,
+        from: NodeId,
+        kind: u8,
+        body: &[u8],
+        now_ns: u64,
+    ) -> Vec<HandshakeAction> {
+        self.key.lock().unwrap().peers.on_message(from, kind, body, now_ns)
+    }
+
+    /// Forwards to [`GroupPlane::on_key_message`] — feeds an ALREADY-OPENED
+    /// `HS_KEY` body (kind 20, `Scope::Pairwise` — opened via
+    /// [`ReceiveHalf::open_slice`]/[`Transport::open`] like any other
+    /// pairwise datagram before reaching here) into the group-key plane.
+    /// `body` carries either a key delivery or an ack — `GroupPlane` tells
+    /// the two apart internally (see its module docs); the returned actions
+    /// are the ack to seal and send back, if `body` was a delivery.
+    pub fn on_group_key_message(&self, from: NodeId, body: &[u8]) -> Vec<HandshakeAction> {
+        self.key.lock().unwrap().group.on_key_message(from, body)
     }
 }
 
@@ -1036,6 +1095,16 @@ pub struct ReceiveHalf {
     /// (3-wide key, F1/F6/F7 from T9 review round 1); identical logic, just
     /// living on this half instead of on `Transport`.
     group_replay: HashMap<(NodeId, u16, BootSalt), ReplayWindow>,
+    /// Reused scratch buffer for [`ReceiveHalf::open_slice`]'s `Pairwise`
+    /// branch — see that method's doc for why this exists at all
+    /// (`Peers::open_pairwise` only takes `&mut Vec<u8>`, and this half's
+    /// contract with its caller is a persistent, reused receive buffer, not
+    /// a fresh allocation per datagram). Cleared and refilled every call,
+    /// never shrunk in a way that gives up its allocation — `Vec::clear`
+    /// keeps capacity, so after the first few calls settle at the largest
+    /// pairwise datagram seen, this steady-states to zero further
+    /// allocation.
+    pairwise_scratch: Vec<u8>,
 }
 
 impl ReceiveHalf {
@@ -1119,6 +1188,148 @@ impl ReceiveHalf {
         } else {
             Err(CryptoError::Replayed(counter))
         }
+    }
+
+    /// T11 (`uc2_net`'s receive seam): the zero-copy-on-the-hot-path sibling
+    /// of [`ReceiveHalf::open`], for a caller holding a persistent, reused,
+    /// oversized receive buffer instead of a right-sized `Vec` — the shape
+    /// `uc2_net`'s `FollowerReceiver::do_work` already uses (a 64 KiB
+    /// `recv_buf`, `recv_from`'d into fresh each duty cycle). [`open`]
+    /// requires `buf.len()` to already equal the received datagram's exact
+    /// length (see [`crate::seal::open_in_place`]'s invariant); satisfying
+    /// that from a fixed 64 KiB buffer means `truncate(n) -> open ->
+    /// resize(65536, 0)` — that `resize` memsets up to 64 KiB PER DATAGRAM
+    /// (T5 review carry (d); `crate::seal::open_detached`'s doc), the same
+    /// order of cost as the AEAD open itself. `open_detached` exists
+    /// precisely so a caller never has to pay that: it decrypts in place at
+    /// the SAME offsets, no truncation, no resize.
+    ///
+    /// Takes `buf` (the receive buffer's full backing storage) and `n` (the
+    /// exact received length — `recv_from`'s return, NOT `buf.len()`).
+    /// Reads and writes only `buf[..n]`; nothing past `n` is ever touched.
+    /// On success, returns the length of the now-plaintext datagram, laid
+    /// out identically to what `open`/`open_in_place` would have left in a
+    /// Vec (`header ++ plaintext`, starting at `buf[0]`) — the caller passes
+    /// `&buf[..len]` on to whatever parses a cleartext datagram today.
+    ///
+    /// `Scope::Group` (the hot path — DATA/HEARTBEAT/COMMIT_POSITION/
+    /// READ_PROBE) is genuinely zero-copy: [`open_group_detached`] decrypts
+    /// in place via [`open_detached`], then this function does one
+    /// `copy_within` to close the 8-byte spent-counter gap `open_detached`
+    /// leaves between the header and the plaintext (see that function's
+    /// doc) — a move bounded by the PAYLOAD's length, not the buffer's
+    /// capacity, and nothing beyond that single move.
+    ///
+    /// `Scope::Pairwise` (control traffic — NAK/STATUS/VOTE/etc., low rate)
+    /// goes through [`ReceiveHalf::pairwise_scratch`] instead: `Peers::
+    /// open_pairwise` only takes `&mut Vec<u8>` (no slice-based sibling
+    /// exists — unlike the group path, nothing on the pairwise side has
+    /// needed one before this), so this copies `buf[..n]` into a reused
+    /// scratch `Vec`, opens that, and copies the result back. A real copy,
+    /// not zero-copy, but bounded by the datagram's size (never the 64 KiB
+    /// buffer) and never a fresh allocation after the scratch vec's
+    /// capacity settles — see that field's doc for why this tradeoff is
+    /// fine for control-plane traffic specifically (the same reasoning
+    /// `Transport`'s own module docs give for not extending cipher caching
+    /// to the pairwise send path: unicast, low-rate).
+    ///
+    /// `Scope::Unsealed` (`HS_INIT`/`HS_RESP`) is refused with
+    /// [`CryptoError::UnsealedKind`] — same contract as [`open`]; the caller
+    /// must route these to the handshake driver without calling this at
+    /// all (see [`SharedTransport::on_handshake_message`]).
+    pub fn open_slice(&mut self, from: NodeId, buf: &mut [u8], n: usize) -> Result<usize, CryptoError> {
+        if n < DATAGRAM_HEADER_LEN {
+            return Err(CryptoError::TooShort);
+        }
+        let header = read_datagram_header(&buf[..n]);
+        match Transport::scope_of(header.kind) {
+            Scope::Group => {
+                let range = self.open_group_detached(from, header.key_epoch, &mut buf[..n])?;
+                let total = DATAGRAM_HEADER_LEN + (range.end - range.start);
+                buf.copy_within(range, DATAGRAM_HEADER_LEN);
+                Ok(total)
+            }
+            Scope::Pairwise => self.open_pairwise_via_scratch(from, &mut buf[..n]),
+            Scope::Unsealed => Err(CryptoError::UnsealedKind(header.kind)),
+        }
+    }
+
+    /// Slice-based sibling of [`ReceiveHalf::open_group`] — same salt-trial
+    /// contract (current, then pending; see that method's doc for the full
+    /// F1/F2 account), just calling [`open_detached`] instead of
+    /// [`crate::seal::open_in_place`]/[`crate::seal::open_with`] so the
+    /// caller's buffer is decrypted in place rather than shrunk. Kept as a
+    /// deliberate near-duplicate of `open_group` rather than a generic
+    /// refactor of both: `open_group` is already reviewed and shipped
+    /// (T9/T10), and entangling its Vec-shrinking contract with this
+    /// slice-based one over a shared-code refactor is a bigger, riskier
+    /// change than the ~30 lines of duplication costs.
+    fn open_group_detached(
+        &mut self,
+        from: NodeId,
+        epoch: u16,
+        buf: &mut [u8],
+    ) -> Result<Range<usize>, CryptoError> {
+        let mut key = self.key.lock().unwrap();
+        if key.group.schedule().get(epoch).is_none() {
+            return Err(CryptoError::NoGroupKey);
+        }
+
+        let mut last_err = CryptoError::NoSession(from);
+
+        if let Some(salt) = key.peers.peer_boot_salt(from) {
+            match Self::open_group_detached_under_salt(&key.group, from, epoch, &salt, buf) {
+                Ok((counter, range)) => {
+                    drop(key);
+                    Self::finish_group_open(&mut self.group_replay, from, epoch, salt, counter)?;
+                    return Ok(range);
+                }
+                Err(e) => last_err = e,
+            }
+        }
+
+        if let Some(salt) = key.peers.peer_pending_boot_salt(from) {
+            match Self::open_group_detached_under_salt(&key.group, from, epoch, &salt, buf) {
+                Ok((counter, range)) => {
+                    key.peers.promote_pending(from);
+                    drop(key);
+                    Self::finish_group_open(&mut self.group_replay, from, epoch, salt, counter)?;
+                    return Ok(range);
+                }
+                Err(e) => last_err = e,
+            }
+        }
+
+        Err(last_err)
+    }
+
+    /// One salt trial, slice-based — see [`Transport::open_group_under_salt`]'s
+    /// doc for the shared rationale.
+    fn open_group_detached_under_salt(
+        group: &GroupPlane,
+        from: NodeId,
+        epoch: u16,
+        salt: &BootSalt,
+        buf: &mut [u8],
+    ) -> Result<(u64, Range<usize>), CryptoError> {
+        let group_key = group.schedule().get(epoch).ok_or(CryptoError::NoGroupKey)?;
+        let key: Zeroizing<[u8; 32]> = Zeroizing::new(derive_send_key(group_key, from, salt));
+        open_detached(buf, &key)
+    }
+
+    /// `Scope::Pairwise` branch of [`ReceiveHalf::open_slice`] — see that
+    /// method's doc and [`ReceiveHalf::pairwise_scratch`]'s field doc for
+    /// why this copies rather than decrypting truly in place.
+    fn open_pairwise_via_scratch(&mut self, from: NodeId, buf: &mut [u8]) -> Result<usize, CryptoError> {
+        self.pairwise_scratch.clear();
+        self.pairwise_scratch.extend_from_slice(buf);
+        {
+            let mut key = self.key.lock().unwrap();
+            key.peers.open_pairwise(from, &mut self.pairwise_scratch)?;
+        }
+        let len = self.pairwise_scratch.len();
+        buf[..len].copy_from_slice(&self.pairwise_scratch);
+        Ok(len)
     }
 }
 
@@ -2244,5 +2455,194 @@ mod tests {
         let t = shared_node_transport("independent-budgets", 1, PRIV_SOLO, &[]);
         let _send = t.send_half();
         let _recv = t.receive_half(); // must NOT panic
+    }
+
+    // ---- T11: `open_slice` (the zero-copy-on-the-hot-path receive entry
+    // point `uc2_net`'s `FollowerReceiver` calls) and the three handshake-
+    // driving forwarders (`initiate`/`on_handshake_message`/
+    // `on_group_key_message`) T11's own receiver test suite needs, since
+    // nothing outside this crate could reach `Peers`/`GroupPlane` before
+    // this task — see the forwarders' doc comments for the full account.
+
+    #[test]
+    fn open_slice_group_scope_matches_open_and_touches_nothing_past_n() {
+        let leader = shared_node_transport(
+            "open-slice-group-leader",
+            1,
+            PRIV_A,
+            &[(1, public_of(PRIV_A)), (2, public_of(PRIV_B))],
+        );
+        let follower = shared_node_transport(
+            "open-slice-group-follower",
+            2,
+            PRIV_B,
+            &[(1, public_of(PRIV_A)), (2, public_of(PRIV_B))],
+        );
+        shared_establish(&leader, &follower);
+        let _ = leader.mint_group_key(&[], 0); // vacuous mint 0 -- see epoch-0 trap note above
+        let epoch = shared_deliver_group_key(&leader, &follower, &[2]);
+        assert_ne!(epoch, 0);
+
+        let mut send = leader.send_half();
+        // ONE receive half for both opens below -- two DIFFERENT sealed
+        // datagrams (the send half's counter is monotonic per call, so no
+        // replay collision), letting `open` and `open_slice` be compared
+        // against the SAME key/session/replay state instead of building a
+        // second independent (and therefore differently-keyed) node.
+        let mut recv = follower.receive_half();
+
+        // Reference: a sealed datagram opened the already-reviewed way.
+        let mut d1 = data_datagram();
+        send.seal(DGRAM_KIND_DATA, None, &mut d1, 0).unwrap();
+        recv.open(1, &mut d1).expect("Vec-based open must succeed");
+        let want = d1; // header ++ plaintext, per `open`'s own contract
+
+        // Same content, a fresh counter, opened via `open_slice` instead --
+        // into an oversized buffer, sentinel-filled PAST `n` so touching
+        // anything past the real datagram length is directly observable.
+        let mut d2 = data_datagram();
+        send.seal(DGRAM_KIND_DATA, None, &mut d2, 0).unwrap();
+        let n = d2.len();
+        let mut oversized = vec![0xEEu8; 256];
+        oversized[..n].copy_from_slice(&d2);
+        let sentinel_tail = oversized[n..].to_vec();
+
+        let len = recv
+            .open_slice(1, &mut oversized, n)
+            .expect("slice-based open_slice must succeed identically");
+        assert_eq!(&oversized[..len], &want[..], "open_slice output matches open's Vec output exactly");
+        assert_eq!(oversized[n..], sentinel_tail[..], "nothing past n was ever touched");
+        assert_eq!(oversized.len(), 256, "the buffer's own length is never resized -- it is a slice call");
+    }
+
+    #[test]
+    fn open_slice_pairwise_scope_round_trips() {
+        let a = shared_node_transport(
+            "open-slice-pairwise-a",
+            1,
+            PRIV_A,
+            &[(1, public_of(PRIV_A)), (2, public_of(PRIV_B))],
+        );
+        let b = shared_node_transport(
+            "open-slice-pairwise-b",
+            2,
+            PRIV_B,
+            &[(1, public_of(PRIV_A)), (2, public_of(PRIV_B))],
+        );
+        shared_establish(&a, &b);
+
+        let mut send = a.send_half();
+        let mut recv = b.receive_half();
+
+        let mut d = vote_datagram();
+        let plain = d.clone();
+        send.seal(DGRAM_KIND_VOTE, Some(2), &mut d, 0).unwrap();
+        let n = d.len();
+
+        let mut buf = vec![0x33u8; 128];
+        buf[..n].copy_from_slice(&d);
+        let len = recv.open_slice(1, &mut buf, n).expect("pairwise open_slice must succeed");
+        assert_eq!(&buf[..len], &plain[..], "pairwise open_slice round-trips byte-exact, like open");
+    }
+
+    #[test]
+    fn open_slice_refuses_unsealed_kinds_rather_than_attempting_anything() {
+        let b = shared_node_transport("open-slice-unsealed", 2, PRIV_B, &[]);
+        let mut recv = b.receive_half();
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader {
+                position: 0,
+                leadership_term_id: 0,
+                kind: DGRAM_KIND_HS_INIT,
+                flags: 0,
+                key_epoch: 0,
+            },
+        );
+        let n = d.len();
+        assert!(matches!(
+            recv.open_slice(1, &mut d, n),
+            Err(CryptoError::UnsealedKind(k)) if k == DGRAM_KIND_HS_INIT
+        ));
+    }
+
+    #[test]
+    fn open_slice_never_panics_on_truncated_or_random_input() {
+        // The untrusted-input contract, at the seam T11 owns: anyone who can
+        // reach the UDP port controls `n` and every byte in `buf`.
+        let b = shared_node_transport("open-slice-truncated", 2, PRIV_B, &[]);
+        let mut recv = b.receive_half();
+        for n in [0usize, 1, 15, 16, 17, 39, 40, 1500] {
+            let mut buf = vec![0xABu8; n.max(1500)];
+            let _ = recv.open_slice(1, &mut buf, n); // must not panic, whatever it returns
+        }
+    }
+
+    #[test]
+    fn shared_transport_handshake_and_group_key_forwarders_drive_a_real_session() {
+        // Unlike `shared_establish`/`shared_deliver_group_key` above (which
+        // reach into the private `key` field -- legitimate for THIS crate's
+        // own tests), this test uses ONLY the public forwarders T11 needs
+        // from OUTSIDE the crate: `initiate`, `on_handshake_message`,
+        // `on_group_key_message`. Proves those three are sufficient, on
+        // their own, to stand up a real session + shared group key and then
+        // round-trip a sealed datagram through `send_half`/`receive_half`.
+        let a = shared_node_transport(
+            "fwd-handshake-a",
+            1,
+            PRIV_A,
+            &[(1, public_of(PRIV_A)), (2, public_of(PRIV_B))],
+        );
+        let b = shared_node_transport(
+            "fwd-handshake-b",
+            2,
+            PRIV_B,
+            &[(1, public_of(PRIV_A)), (2, public_of(PRIV_B))],
+        );
+
+        let mut acts = a.initiate(2, 0);
+        for _ in 0..8 {
+            let mut next = Vec::new();
+            for act in acts.drain(..) {
+                if let HandshakeAction::Send { to, kind, body } = act {
+                    if to == 2 {
+                        next.extend(b.on_handshake_message(1, kind, &body, 0));
+                    } else if to == 1 {
+                        next.extend(a.on_handshake_message(2, kind, &body, 0));
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            acts = next;
+        }
+
+        let _ = a.mint_group_key(&[], 0); // vacuous first mint -- epoch-0 trap
+        let (epoch, mint_acts) = a.mint_group_key(&[2], 0);
+        assert_ne!(epoch, 0);
+        for act in mint_acts {
+            let HandshakeAction::Send { to, body, .. } = act else {
+                panic!("mint must emit a Send action")
+            };
+            assert_eq!(to, 2);
+            let reply = b.on_group_key_message(1, &body);
+            for r in reply {
+                let HandshakeAction::Send { body: rbody, .. } = r else {
+                    panic!("a well-formed delivery must ack back")
+                };
+                a.on_group_key_message(2, &rbody);
+            }
+        }
+
+        let mut send = a.send_half();
+        let mut recv = b.receive_half();
+        let mut d = data_datagram();
+        let plain = d.clone();
+        send.seal(DGRAM_KIND_DATA, None, &mut d, 0).unwrap();
+        assert_ne!(d, plain);
+        recv.open(1, &mut d).expect("a session + group key built ENTIRELY through the pub forwarders must open");
+        assert_eq!(&d[DATAGRAM_HEADER_LEN..], &plain[DATAGRAM_HEADER_LEN..]);
     }
 }
