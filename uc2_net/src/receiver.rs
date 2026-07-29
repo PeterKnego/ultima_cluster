@@ -3369,9 +3369,9 @@ mod tests {
     /// T17.
     ///
     /// Discriminating on the CIPHERTEXT REGION specifically, not on
-    /// whole-datagram inequality: the 32-byte header is cleartext in both
-    /// modes, so `sealed != cleartext` would pass even if the body went out
-    /// verbatim. Each assertion compares the opened plaintext against the
+    /// whole-datagram inequality: the 16-byte `DATAGRAM_HEADER_LEN` is
+    /// cleartext in both modes, so `sealed != cleartext` would pass even if
+    /// the body went out verbatim. Each assertion compares the opened plaintext against the
     /// body the pre-T17 code put on the wire, and separately asserts that
     /// exact body is NOT findable in the wire bytes.
     #[test]

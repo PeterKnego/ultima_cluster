@@ -2675,8 +2675,8 @@ mod tests {
         let raw = t17_snapshot_bytes();
         for d in &chunks {
             // The ciphertext region specifically — not whole-datagram
-            // inequality, which the 32-byte header alone would satisfy even
-            // if the payload went out verbatim.
+            // inequality, which the cleartext 16-byte `DATAGRAM_HEADER_LEN`
+            // alone would satisfy even if the payload went out verbatim.
             let ct = &d[DATAGRAM_HEADER_LEN + COUNTER_LEN..d.len() - TAG_LEN];
             assert!(
                 !raw.windows(ct.len().min(raw.len())).any(|w| w == ct),

@@ -260,7 +260,17 @@ fn await_single_leader(nodes: &[Node], candidates: &[usize], secs: u64) -> usize
 /// * the linearizable read needs sealed `READ_PROBE` (group) and
 ///   `READ_PROBE_ACK` (pairwise).
 ///
-/// Any one of those left cleartext and this test hangs on its deadline.
+/// Any one of those left cleartext and this test hangs on its deadline —
+/// but note WHY, because the dependency is not self-evident (T17 review, M3):
+/// it hangs because T11's receive rule DROPS unsealed traffic once crypto is
+/// on, not because this test can see the wire. A hypothetical build with both
+/// sides relaxed — sends left cleartext AND the receive rule admitting them —
+/// would pass this test and the one below it. The on-the-wire property is
+/// pinned separately and directly, by
+/// `uc2_node::node::tests::every_consensus_datagram_the_node_emits_is_sealed`,
+/// which opens each datagram on a peer's real `ReceiveHalf`. This test proves
+/// the two halves COMPOSE into a working cluster; that one proves the bytes
+/// are actually sealed.
 #[test]
 fn a_crypto_enabled_cluster_elects_replicates_and_serves_a_linearizable_read() {
     let _g = serialize();

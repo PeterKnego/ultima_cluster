@@ -197,6 +197,21 @@ impl GroupPlane {
     /// the grace elapse, and a cluster that cold-starts with one member down
     /// never seals a single `DATA` datagram. See
     /// `a_superseding_mint_inherits_an_unactivated_epochs_activation_clock`.
+    ///
+    /// **Say plainly what inheriting the clock costs** (T17 review, M1): an
+    /// inherited clock can report an epoch ACTIVATED within milliseconds of
+    /// the mint that created it — once the inherited grace has already
+    /// elapsed, the very next mint is sealable immediately, with none of its
+    /// own `HS_KEY` deliveries acked. The un-inherited timeout never did
+    /// that; it always gave each epoch its own full 2 s. The consequence is
+    /// bounded and benign — a peer that has not yet installed epoch N simply
+    /// cannot open traffic sealed under it, exactly as if the datagram had
+    /// been lost, and it self-heals the moment the `HS_KEY` (or the node
+    /// layer's re-delivery sweep) lands. Nothing is sealed under a key no
+    /// peer will ever hold, and no peer accepts anything it could not have
+    /// accepted before. But the cost is real and is paid to buy back the
+    /// liveness the reset destroyed: without it there is no epoch to be
+    /// late for, because the cluster never forms at all.
     pub fn mint(&mut self, peers: &[NodeId], now_ns: u64) -> (u16, Vec<HandshakeAction>) {
         // T17 (2026-07-29) — the activation clock is INHERITED, not restarted,
         // when this mint supersedes a pending epoch that never activated. See

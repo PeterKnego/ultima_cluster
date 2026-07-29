@@ -1375,15 +1375,21 @@ struct Consensus {
     /// the clear. Self-healing: the re-delivery sweep retries once the
     /// handshake completes.
     crypto_hs_key_seal_failures: Arc<AtomicU64>,
-    /// Handshake-plane datagrams dropped because an address and a `NodeId`
-    /// could not be matched up — in EITHER direction: an inbound datagram
-    /// from a source address this node has no id for (a stranger, or a peer
-    /// removed from the config), or an outbound action naming a peer id with
-    /// no address in the adopted config (a config change that raced the
-    /// action). Both are the same operator-visible condition — "the crypto
-    /// plane and the membership view disagree about who exists" — so they
-    /// share one counter rather than two that would always have to be read
-    /// together.
+    /// Datagrams dropped because an address and a `NodeId` could not be
+    /// matched up — in EITHER direction: an inbound datagram from a source
+    /// address this node has no id for (a stranger, or a peer removed from
+    /// the config), or an outbound send naming a peer id with no address in
+    /// the adopted config (a config change that raced it). All are the same
+    /// operator-visible condition — "the crypto plane and the membership view
+    /// disagree about who exists" — so they share one counter rather than
+    /// several that would always have to be read together.
+    ///
+    /// T17 widened this past the handshake plane: `Consensus::send` and
+    /// `Consensus::fan_out_group` both count here when a consensus datagram
+    /// cannot be addressed. The fan-out's site fires in CLEARTEXT mode too
+    /// (its address lookup is not crypto-gated), so a non-zero value on a
+    /// node with crypto disabled is meaningful rather than a bug — it means
+    /// the same membership inconsistency, seen without the crypto plane.
     crypto_unresolved_peer: Arc<AtomicU64>,
     /// `HandshakeAction::Failed` observations — a peer that is not (yet) in
     /// the allowlist, or whose handshake did not authenticate.
@@ -3639,9 +3645,20 @@ impl Consensus {
             }
         }
         for id in targets {
-            if let Some(&addr) = self.id_to_addr.get(id) {
-                let _ = self.sock.send_to(&d, addr);
-            }
+            // T17 review, M4: count what is skipped. `Consensus::send` bumps
+            // `crypto_unresolved_peer` on exactly this condition (a peer id
+            // with no address in the adopted config — a config change that
+            // raced the send); the fan-out silently dropped it. Counted
+            // UNCONDITIONALLY, unlike `send`'s crypto-gated site: this lookup
+            // runs in both modes, because the pre-T17 code was
+            // `self.id_to_addr[&id]`, which PANICKED the consensus agent on a
+            // miss. Turning that panic into a silent skip was the right
+            // trade; turning it into an invisible one was not.
+            let Some(&addr) = self.id_to_addr.get(id) else {
+                self.crypto_unresolved_peer.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let _ = self.sock.send_to(&d, addr);
         }
     }
 }
@@ -6196,10 +6213,12 @@ mod tests {
     /// peer's own `ReceiveHalf`.
     ///
     /// `recv_kind` opening the datagram IS the discriminating assertion, and
-    /// it discriminates in every case: a CLEARTEXT `COMMIT_POSITION` (32
-    /// bytes) or `VOTE` (40) is shorter than the 48-byte minimum sealed frame
-    /// and comes back `TooShort`, while a cleartext `TERM_MAP`/`READ_PROBE`
-    /// is long enough to *claim* to be sealed and comes back `AuthFailed`.
+    /// it discriminates in every case: a CLEARTEXT `COMMIT_POSITION` (16
+    /// bytes — `DATAGRAM_HEADER_LEN`, an empty body) or `VOTE`
+    /// (16 + `VOTE_BODY_LEN` = 32) is shorter than the 40-byte minimum sealed
+    /// frame (`DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD`) and comes back
+    /// `TooShort`, while a cleartext `TERM_MAP`/`READ_PROBE` is long enough to
+    /// *claim* to be sealed and comes back `AuthFailed`.
     /// The body checks below add the second half: the plaintext must not be
     /// findable in the wire bytes.
     #[test]
@@ -6264,6 +6283,41 @@ mod tests {
         );
         let cr = h.recv_kind(DGRAM_KIND_CONFIG_REPLY).expect("CONFIG_REPLY must open");
         assert_eq!(cr.len(), CONFIG_REPLY_BODY_LEN);
+    }
+
+    /// T17 review, M4: a fan-out target with no address in the adopted config
+    /// is SKIPPED — and counted. Before this it was skipped silently, and
+    /// before T17 it was `self.id_to_addr[&id]`, which panicked the consensus
+    /// agent outright.
+    ///
+    /// Deliberately driven with crypto OFF: this lookup is not crypto-gated
+    /// (unlike `Consensus::send`'s), so the cleartext path is the one that
+    /// would go uncounted if the increment sat inside a `crypto.is_some()`
+    /// arm. Also asserts the RESOLVABLE targets in the same call still get
+    /// their datagram, so "count it" cannot be satisfied by dropping the
+    /// whole fan-out.
+    #[test]
+    fn a_fan_out_target_with_no_address_is_counted_not_silently_skipped() {
+        // An EPHEMERAL port, overridden into node 0's slot in the member map
+        // — never a hardcoded one, which would race any other test binary
+        // cargo happens to run concurrently.
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sink.set_nonblocking(true).unwrap();
+        let mut h = harness_with_crypto(None, &[(0, sink.local_addr().unwrap())]);
+        assert_eq!(h.cons.crypto_unresolved_peer.load(Ordering::Relaxed), 0);
+
+        // Node 99 is in no config this harness ever adopted; node 0 is.
+        h.cons.fan_out_group(&[0, 99], DGRAM_KIND_COMMIT_POSITION, 4096, 2, &[]);
+
+        assert_eq!(
+            h.cons.crypto_unresolved_peer.load(Ordering::Relaxed),
+            1,
+            "the unaddressable target must be counted, not dropped in silence"
+        );
+        let mut buf = [0u8; 2048];
+        let (n, _) = sink.recv_from(&mut buf).expect("the RESOLVABLE target still got its datagram");
+        assert_eq!(read_datagram_header(&buf[..n]).kind, DGRAM_KIND_COMMIT_POSITION);
+        assert_eq!(read_datagram_header(&buf[..n]).position, 4096);
     }
 
     /// A group-scope kind is sealed ONCE and the identical bytes go to every
