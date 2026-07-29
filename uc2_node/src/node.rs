@@ -5289,6 +5289,13 @@ mod tests {
             })
             .join("uc2-node-crypto")
             .join(format!("{tag}-{seq}"));
+        // Wipe first. `SEQ` is unique WITHIN a process but restarts at 0 on
+        // the next `cargo test`, and test order is not deterministic, so a
+        // dir that held a booted node's `instance.lock`/`cnc2.dat` in one run
+        // can be handed to the boot-refusal test in the next — which asserts
+        // exactly that those files are absent. Observed as a real
+        // cross-run flake during the mutation campaign, not hypothesized.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(!dir.starts_with("/tmp"), "test scratch must not live on tmpfs: {dir:?}");
         dir
