@@ -899,12 +899,31 @@ fn crypto_snapshot(nodes: &[Node]) -> Vec<CryptoSnapshot> {
 /// seal with `NoSession` and is dropped (fail-closed, no cleartext fallback —
 /// which is the correct behaviour). Those drops cost nothing: the reports are
 /// periodic and self-healing, and the position they carry is monotone, so the
-/// next one that lands supersedes every one that did not. Counting them as
-/// "the encrypted arm dropped 500k datagrams" would be alarming and wrong.
-/// What matters for the gate is the delta ACROSS THE MEASURED WINDOW, printed
-/// below: a nonzero `auth_failed`/`replay`/`seal_failures` there would mean the
-/// throughput number describes a degraded system rather than a working
-/// encrypted one, and the gate would say so.
+/// next one that lands supersedes every one that did not. The delta ACROSS THE
+/// MEASURED WINDOW, printed below, discards that boot transient.
+///
+/// **The leader's in-window `seal_failures` are expected and benign — read the
+/// other counters, not that one, for degradation.** A node reports its own
+/// durable/append position to `cfg.leader`, and on the leader that address is
+/// *itself*. A node holds no pairwise Noise session with itself, so every one
+/// of the leader's self-addressed `APPEND_POSITION`/`STATUS` reports fails to
+/// seal with `NoSession` and is counted — continuously, not just at boot. This
+/// is a **pre-existing v2 self-send** (the receiver has always addressed those
+/// reports to `cfg.leader` in cleartext too); wire crypto did not introduce it,
+/// it merely made it *visible* by counting the fast-fail. It is harmless: the
+/// leader's own position reaches its commit ranking in memory, never over the
+/// wire, so nothing is lost — the linearizability capstones (T15) pass with
+/// crypto on. It is also symmetric across the two gate arms (cleartext sends
+/// the same self-addressed datagram, just without a counter), so it does not
+/// move the throughput ratio. Suppressing the self-addressed report is a small
+/// efficiency win filed as a post-M8 follow-up, not a correctness fix.
+///
+/// So the fail-closed check the gate actually reads is: **zero in-window
+/// `auth_failed` / `replay` / `unknown_epoch` on every node, and zero in-window
+/// `seal_failures` on the FOLLOWERS.** A nonzero there would mean traffic did
+/// not make it through the crypto plane and the throughput number describes a
+/// degraded system. The leader's `seal_failures` line is annotated below so a
+/// reader is not alarmed by the one counter that is supposed to climb.
 fn print_crypto_observability(
     nodes: &[Node],
     leader: usize,
@@ -933,6 +952,12 @@ fn print_crypto_observability(
             a.hs_failures - b.hs_failures,
         );
     }
+    println!(
+        "(the leader's in-window seal_failures are its own APPEND_POSITION/STATUS reports\n \
+         addressed to cfg.leader == itself — a pre-existing v2 self-send, no self-session,\n \
+         benign; the followers' seal_failures and everyone's auth_failed/replay/unknown_epoch\n \
+         are the fail-closed check and must be 0.)"
+    );
     println!("==========================================================================");
 }
 
