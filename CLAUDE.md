@@ -19,6 +19,27 @@ local proof stack; the 5-host fleet run is a separate, user-approved step
 `docs/benchmarks/uc2-m7-gate-2026-07-13.md`). This bumps the wire protocol
 version once (`FRAME_TYPE_CONFIG=4`, admin datagram kinds 16/17).
 
+**M8 (wire crypto) ships authenticated, encrypted node↔node UDP — opt-in, off
+by default** (branch `uc2/m8-wire-crypto`; design spec
+`docs/superpowers/specs/2026-07-28-uc2-wire-crypto-design.md`; gate doc
+`docs/benchmarks/uc2-m8-gate-2026-07-29.md`). This **changes v2.0's stated
+security posture**: encryption/auth was an *explicit non-goal* ("trusted
+private network, same as stock Aeron"); it is now available and **flag-day
+opt-in** (a cluster runs all-encrypted or all-cleartext, no mixed mode). Noise
+`IK` handshake over an allowlist of X25519 static keys, AES-256-GCM over the
+datagram envelope with the 16-byte header authenticated as AAD, a rotating
+cluster group key for the fan-out plane, RFC-6479 anti-replay. Threat model:
+a network-path adversary (read/inject/replay/corrupt, no private key); **out
+of model**: a compromised host or a malicious cluster member (the group key is
+symmetric — any holder can forge fan-out traffic as any node, a documented
+residual). Bumps the wire protocol to **0.4.0** (`version::CURRENT`; the
+`cnc.dat` page layout and its `CNC_V2_VERSION` gate are unchanged — M8 touches
+the UDP datagram format, not the shmem page). The full local proof stack and
+all four correctness capstones pass with crypto ON (T15, anti-vacuity proven);
+the cross-host fleet A/B is a separate, user-approved step (`v2.2.0` tags only
+once it lands). Do not reintroduce `quinn`/QUIC for this — UC seals its own
+reliable-UDP transport directly.
+
 **The v1 stack (an `openraft`-based design) has been retired** and its crates
 deleted — v2 owns consensus, elections, and transport directly. Do not
 reintroduce `openraft`, `quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client`
@@ -85,6 +106,13 @@ Workspace crates:
 - `uc2_net` — own reliable-UDP transport (no QUIC): sender/receiver polling
   agents, NAK-based retransmit off the log buffer, quorum-paced flow control,
   snapshot sessions. A seeded fault layer drives the sim.
+- `uc2_crypto` — **M8 wire crypto (opt-in, off by default)**: pure-sync,
+  socket-free crypto plane for node↔node UDP. Noise `IK` handshake (`snow`,
+  X25519), per-peer pairwise keys + a rotating cluster group key, AES-256-GCM
+  seal/open over the datagram envelope (16-byte header authenticated as AAD),
+  RFC-6479 anti-replay, and the `SharedTransport`/`SendHalf`/`ReceiveHalf`
+  split that keeps the per-datagram hot path off a lock. `uc2_net` calls it at
+  two seams; `uc2_node` owns config, handshake routing, and key rotation.
 - `uc2_consensus` — pure-sync Raft-safety core over **byte positions**:
   `CommitTracker` (quorum-th highest committed position), `ElectionSm`
   (lexicographic `(last_term, last_durable)` vote, data-stamped term map,
