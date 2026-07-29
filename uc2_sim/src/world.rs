@@ -157,20 +157,43 @@ impl XorShift64 {
 
 /// Scratch root for T13's sim-generated crypto identities, on real disk
 /// (never `/tmp` — RAM-backed tmpfs, no swap on the dev box; CLAUDE.md).
-/// `CARGO_TARGET_TMPDIR` is set for the integration-test binary
-/// (`uc2_sim/tests/scenarios.rs`) that is `World::enable_crypto_plane`'s only
-/// caller; falls back to a package-relative `target/` directory for any
-/// other caller, mirroring `uc2_crypto`'s own test scratch helpers. Keyed by
-/// seed so parallel test threads (different seeds) never collide, and a
-/// single seed always regenerates byte-identical key material.
-fn crypto_scratch_dir(seed: u64) -> std::path::PathBuf {
-    let d = std::env::var("CARGO_TARGET_TMPDIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc2_sim_crypto_tests")
-        })
+///
+/// **Not `CARGO_TARGET_TMPDIR`.** That env var is a compile-time-only value
+/// cargo sets for the specific `tests/*.rs` binary target being built —
+/// retrievable via `env!()` from code compiled AS PART OF that target
+/// (`uc2_crypto`'s own test helpers do exactly that, from inside
+/// `tests/*.rs` files). `World::enable_crypto_plane` lives in THIS crate's
+/// `src/` (the library target, a separate compilation unit from
+/// `tests/scenarios.rs`), so `env!("CARGO_TARGET_TMPDIR")` here would fail
+/// to compile — the same gap `uc2_crypto/src/identity.rs`'s test helper
+/// documents for its own inline `#[cfg(test)]` module. A RUNTIME
+/// `std::env::var("CARGO_TARGET_TMPDIR")` compiles, but confirmed dead:
+/// the variable is never actually present in the running test process's
+/// environment (`Err(NotPresent)`, checked directly). So this always uses
+/// the package-relative fallback; no `env::var` attempt is made.
+///
+/// **Unique per call, not keyed by seed** (T13 review finding I-1): an
+/// earlier version keyed this directory by `cfg.seed` alone, reasoning
+/// "parallel test THREADS with different seeds never collide" — true, but
+/// wrong scope: `cargo test` runs different TESTS concurrently, and
+/// several committed scenarios pin seeds (7, 11, 13, 17, 21) that all sit
+/// inside the oracle-twin fuzz's `0..60` sweep, so two unrelated tests can
+/// legitimately race on the SAME seed at the SAME time — one test's
+/// `fs::write` (truncate-then-write) racing another's concurrent
+/// `Identity::load` (read) on the identical path. Reproduced: 118/1600
+/// concurrent calls panicked with `KeyFileInvalid` before this fix. Keying
+/// by a process-wide monotonic counter instead (nothing later ever needs
+/// to find this directory again by seed — it is written and read back
+/// within the same `enable_crypto_plane` call and never touched again)
+/// makes every call's directory disjoint by construction; no seed
+/// collision is possible regardless of how many tests share a seed.
+fn crypto_scratch_dir() -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../target/uc2_sim_crypto_tests")
         .join("uc2-sim-crypto")
-        .join(format!("seed-{seed}"));
+        .join(format!("call-{n}-{:?}", std::thread::current().id()));
     std::fs::create_dir_all(&d).expect("create sim crypto scratch dir");
     assert!(!d.starts_with("/tmp"), "sim crypto scratch must not live on tmpfs: {d:?}");
     d
@@ -340,8 +363,17 @@ pub enum Msg {
     Ack { from: NodeId, term: u32, append: u64 },
     /// Follower -> leader durable report: drives quorum commit ranking.
     Report { from: NodeId, term: u32, durable: u64 },
-    /// Leader -> follower commit gossip.
-    CommitGossip { term: u32, commit: u64 },
+    /// Leader -> follower commit gossip. `epoch` (T13, model-fidelity fix):
+    /// production classifies `DGRAM_KIND_COMMIT_POSITION` as
+    /// `Scope::Group` (`uc2_crypto::transport::scope_of`), sealed and
+    /// gated exactly like `DATA`/`HEARTBEAT` — an earlier version of this
+    /// sim left `CommitGossip` entirely ungated, which was a real
+    /// model-fidelity gap (flagged in T13 review): the root-cause account
+    /// for the churn finding above cited "CommitGossip is never
+    /// crypto-gated" as part of why a follower can still learn about a new
+    /// leader through an ungated path, which was false relative to
+    /// production. Gated the same way `Data` is, below.
+    CommitGossip { term: u32, commit: u64, epoch: Option<u16> },
     RequestVote { from: NodeId, new_term: u32, last_term: u32, last_durable: u64 },
     Vote { from: NodeId, term: u32, granted: bool },
     /// Leader -> follower term-map ship (drives reconciliation).
@@ -485,23 +517,37 @@ struct NodeCrypto {
     /// Next virtual time at which this node's `GroupPlane::unacked_peers`
     /// re-delivery sweep (the T12 fix for `mint`'s single-shot `HS_KEY`
     /// delivery — see `group.rs`'s module doc) may run again. See
-    /// `CRYPTO_SWEEP_INTERVAL_NS` for why the cadence is deliberately
-    /// SLOWER than `uc2_crypto::group::ACTIVATION_TIMEOUT_NS`.
+    /// `CRYPTO_SWEEP_INTERVAL_NS`.
     next_sweep_ns: u64,
 }
 
 /// T13: how often (of virtual time) a crypto-enabled node's maintenance tick
 /// re-polls `GroupPlane::unacked_peers` and re-sends via `redeliver_to`.
-/// Deliberately chosen SLOWER than `uc2_crypto::group::ACTIVATION_TIMEOUT_NS`
-/// (2s): a real, bounded retry — exactly what `redeliver_to`'s contract
-/// requires — but slow enough that a scripted single-datagram drop
-/// (`World::drop_next_key_delivery_to`) and the leader's own 2s
-/// ack-or-timeout activation rule are cleanly separated in virtual time
-/// instead of racing at network speed. Production's own `uc2_node` cadence
-/// is a separate, independently-tuned parameter outside this crate's
-/// concern; the sim only needs a genuine bounded retry, not a specific
-/// number.
-const CRYPTO_SWEEP_INTERVAL_NS: u64 = 2_500_000_000;
+///
+/// Fast, not slow — revised from an earlier 2.5s choice (T13 review): once
+/// `Msg::CommitGossip` was correctly gated the same as `DATA`/`HEARTBEAT`
+/// (matching production's `Scope::Group` classification of
+/// `COMMIT_POSITION` — a model-fidelity fix, see `Msg::CommitGossip`'s
+/// doc), a node that cannot open ANY current group traffic genuinely hears
+/// NOTHING from its leader — no back-channel keeps it pacified — so it
+/// calls its own election on the SM's normal ~150-300ms timeout regardless
+/// of how the redelivery sweep is tuned. A sweep slower than that window
+/// does not "cleanly separate" a scripted gap from the activation timeout
+/// (the original rationale) — it just guarantees an election fires before
+/// the sweep ever gets a chance to matter, which then recovers the peer
+/// through an unrelated fresh mint instead of through
+/// `redeliver_to` — not wrong, but not what a script trying to exercise
+/// the redelivery path specifically wants. A sweep this fast, paired with
+/// `World::block_key_delivery_to`'s explicit TIME WINDOW (rather than a
+/// one-shot drop count) for holding a gap open exactly as long as a script
+/// needs, keeps the redelivery path independently exercisable: the block
+/// window can still be built wide enough to force the leader down the
+/// `ACTIVATION_TIMEOUT_NS` (2s) path, while the sweep recovers the peer
+/// within one election-timeout's worth of the window closing. Production's
+/// own `uc2_node` cadence is a separate, independently-tuned parameter
+/// outside this crate's concern; the sim only needs a genuine bounded
+/// retry, not a specific number.
+const CRYPTO_SWEEP_INTERVAL_NS: u64 = 50_000_000;
 
 /// T13: what a crypto-enabled leader may do with an outgoing `DATA` send
 /// right now — see `World::data_seal_gate`.
@@ -582,12 +628,16 @@ pub struct World {
     stat_restarts: u32,
 
     // ---- T13: crypto plane ----
-    /// One-shot armed drops of the very next `HS_KEY` (kind 20) delivery
-    /// addressed to a given node index — see
-    /// `World::drop_next_key_delivery_to`. Applied at the "socket," before
-    /// the fault dice, so it is deterministic regardless of
-    /// `drop_per_million`.
-    drop_next_key_to: HashMap<usize, u32>,
+    /// `HS_KEY` (kind 20) deliveries addressed to a given node index are
+    /// dropped while `self.now < deadline` — see
+    /// `World::block_key_delivery_to`. Applied at the "socket," before the
+    /// fault dice, so it is deterministic regardless of `drop_per_million`.
+    /// A time WINDOW rather than a one-shot drop count (T13 review): with
+    /// `CRYPTO_SWEEP_INTERVAL_NS` fast, a script needs to hold a gap open
+    /// for a specific, possibly long, span of virtual time (e.g. past
+    /// `ACTIVATION_TIMEOUT_NS`), not survive some number of retry attempts
+    /// whose count would depend on the sweep cadence.
+    key_delivery_blocked_until: HashMap<usize, u64>,
 }
 
 /// Read-out of a completed run.
@@ -672,7 +722,7 @@ impl World {
             stat_truncations: 0,
             stat_wipes: 0,
             stat_restarts: 0,
-            drop_next_key_to: HashMap::new(),
+            key_delivery_blocked_until: HashMap::new(),
             nodes,
             cfg,
         };
@@ -1468,21 +1518,19 @@ impl World {
     /// or `GroupPlane`. `Send` rides the SAME lossy/partitionable
     /// `send`/`deliver` pipe as every other message (kinds 18/19/20), with
     /// one scripted exception applied at the "socket" (before the fault
-    /// dice): a one-shot armed drop of the very next `HS_KEY` addressed to a
-    /// given node, per [`World::drop_next_key_delivery_to`].
-    /// `Established`/`Failed` need no world-level bookkeeping — session
-    /// liveness is queried directly off `Peers`/`GroupPlane` by the
-    /// accessors below, not shadowed here.
+    /// dice): every `HS_KEY` addressed to a node currently inside its
+    /// [`World::block_key_delivery_to`] window is dropped, for as long as
+    /// that window is open. `Established`/`Failed` need no world-level
+    /// bookkeeping — session liveness is queried directly off
+    /// `Peers`/`GroupPlane` by the accessors below, not shadowed here.
     fn dispatch_handshake_actions(&mut self, node: usize, actions: Vec<HandshakeAction>, now: u64) {
         for act in actions {
             if let HandshakeAction::Send { to, kind, body } = act {
                 let to_idx = to as usize;
                 if kind == DGRAM_KIND_HS_KEY
-                    && let Some(remaining) = self.drop_next_key_to.get_mut(&to_idx)
-                    && *remaining > 0
+                    && self.key_delivery_blocked_until.get(&to_idx).is_some_and(|&d| now < d)
                 {
-                    *remaining -= 1;
-                    continue; // dropped at the "socket" — one-shot
+                    continue; // dropped at the "socket" — inside the blocked window
                 }
                 self.send(node, to_idx, Msg::Handshake { kind, body }, now);
             }
@@ -1500,18 +1548,14 @@ impl World {
         let peers: Vec<u32> = self.config_peers(node).iter().map(|&p| p as u32).collect();
         let crypto = self.nodes[node].crypto.as_mut().unwrap();
         let (_epoch, actions) = crypto.group.mint(&peers, now);
-        // Push this node's own redelivery-sweep schedule a fresh full
-        // interval out from THIS mint, rather than leaving it on whatever
-        // free-running phase it was on relative to world-start. Two
-        // reasons: (1) it is a reasonable real policy on its own (no point
+        // Push this node's own redelivery-sweep schedule a fresh interval
+        // out from THIS mint: a reasonable real policy on its own (no point
         // re-checking for unacked peers immediately after just delivering
-        // everyone the newest key); (2) it makes `World::drop_next_key_delivery_to`
-        // scenarios deterministic regardless of WHEN in a run the mint
-        // happens to land relative to the sweep's prior phase — without
-        // this, a mint that happened to occur shortly before an
-        // already-scheduled sweep could let the sweep redeliver before a
-        // scripted scenario's timeout-path window closes, an artifact of
-        // sim scheduling rather than anything `GroupPlane` itself does.
+        // everyone the newest key). With `CRYPTO_SWEEP_INTERVAL_NS` fast
+        // (50ms) this is a minor phase-alignment nicety rather than the
+        // load-bearing determinism guard it was when the sweep was slow —
+        // `World::block_key_delivery_to`'s explicit time window is what
+        // scripted scenarios rely on now.
         crypto.next_sweep_ns = now + CRYPTO_SWEEP_INTERVAL_NS;
         self.dispatch_handshake_actions(node, actions, now);
     }
@@ -1641,7 +1685,25 @@ impl World {
             Msg::Report { from: rep, term, durable } => {
                 self.feed(to, Event::Report { from: rep, term, durable }, now, step)
             }
-            Msg::CommitGossip { term, commit } => {
+            Msg::CommitGossip { term, commit, epoch } => {
+                // T13: same crypto gate as Msg::Data, checked FIRST and with
+                // the same zero-side-effect shape (see the long comment on
+                // the Data arm above for why the ordering matters) — an
+                // unopenable Group-scope datagram is dropped BEFORE
+                // leader_hint/feed, exactly like a lost datagram. No Nak
+                // here: CommitGossip carries no byte range to repair, and
+                // the leader re-ships it continuously (the idle gossip
+                // floor), so it self-heals the same way a lost CommitGossip
+                // already does today.
+                if let Some(epoch) = epoch {
+                    let openable = self.nodes[to]
+                        .crypto
+                        .as_ref()
+                        .is_some_and(|c| c.group.schedule().get(epoch).is_some());
+                    if !openable {
+                        return Ok(());
+                    }
+                }
                 self.nodes[to].leader_hint = Some(from);
                 self.feed(to, Event::CommitGossip { term, commit }, now, step)
             }
@@ -1932,9 +1994,19 @@ impl World {
                 }
             }
             Action::GossipCommit { commit } => {
-                let term = self.nodes[node].sm.current_term();
-                for p in self.config_peers(node) {
-                    self.send(node, p, Msg::CommitGossip { term, commit }, now);
+                // T13: gated exactly like on_tick's DATA replication loop —
+                // production classifies COMMIT_POSITION as Scope::Group too
+                // (see Msg::CommitGossip's doc).
+                let gate = self.data_seal_gate(node, now);
+                if gate != SealGate::Withhold {
+                    let epoch = match gate {
+                        SealGate::Sealed(e) => Some(e),
+                        _ => None,
+                    };
+                    let term = self.nodes[node].sm.current_term();
+                    for p in self.config_peers(node) {
+                        self.send(node, p, Msg::CommitGossip { term, commit, epoch }, now);
+                    }
                 }
             }
             Action::ShipTermMap { entries } => {
@@ -2171,7 +2243,7 @@ impl World {
             "enable_crypto_plane: n ({n}) exceeds the world's node count ({})",
             self.cfg.n_nodes
         );
-        let dir = crypto_scratch_dir(self.cfg.seed);
+        let dir = crypto_scratch_dir();
 
         let mut identities = Vec::with_capacity(n);
         for i in 0..n {
@@ -2266,14 +2338,17 @@ impl World {
             .is_some_and(|c| c.group.schedule().get(epoch).is_some())
     }
 
-    /// Arms a one-shot drop of the very next `HS_KEY` (kind 20) delivery
-    /// addressed to `node` — applied at the "socket," before the fault dice,
-    /// so it is deterministic regardless of `drop_per_million`. Models a
-    /// single lost key-distribution datagram (the exact shape of the T12
-    /// regression this task's brief calls out) without perturbing the
-    /// general loss model. Stacks: two calls arm two drops.
-    pub fn drop_next_key_delivery_to(&mut self, node: usize) {
-        *self.drop_next_key_to.entry(node).or_insert(0) += 1;
+    /// Drops every `HS_KEY` (kind 20) delivery addressed to `node` while
+    /// `self.now < until_ns` — applied at the "socket," before the fault
+    /// dice, so it is deterministic regardless of `drop_per_million`.
+    /// Models a key-distribution gap of a specific, scripted DURATION (the
+    /// T12 regression this task's brief calls out is the `until_ns ==
+    /// self.now` / "just the next one" special case) without perturbing
+    /// the general loss model. A later call replaces any earlier deadline
+    /// for the same node (does not stack); pass an already-past `until_ns`
+    /// to clear a block early.
+    pub fn block_key_delivery_to(&mut self, node: usize, until_ns: u64) {
+        self.key_delivery_blocked_until.insert(node, until_ns);
     }
 
     /// The current leader (or node 0, if none is serving — e.g. before the
@@ -2573,6 +2648,14 @@ impl World {
     /// The global commit high-water (max commit any node ever certified).
     pub fn max_commit(&self) -> u64 {
         self.checker.global_max_commit
+    }
+
+    /// The world's current virtual-time instant (ns). T13: lets a scripted
+    /// scenario compute an ABSOLUTE deadline for e.g.
+    /// `World::block_key_delivery_to` relative to "now," without needing
+    /// its own separate clock.
+    pub fn now(&self) -> u64 {
+        self.now
     }
 
     /// A node's own committed high-water (durable across restart).

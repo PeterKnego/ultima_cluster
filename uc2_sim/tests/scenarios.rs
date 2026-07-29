@@ -1630,29 +1630,91 @@ fn crypto_cfg(seed: u64) -> SimConfig {
 ///
 /// `drop_per_million: 50_000` (5%), not the brief's illustrative 20%: at
 /// 20% (and even at 10%), this specific test — a full election+replication
-/// world, not just the handshake — hits a genuine, PRE-EXISTING transient a
-/// few percent of the time (confirmed on ~1 in 8-20 seeds at 10-20%, ZERO in
-/// 200+ seeds at the same rate with crypto OFF): a node that has not yet
-/// reconciled a stale, previously-legitimate term entry at position 0 can
-/// coincide with an unrelated majority-only commit landing on a NEWER term
-/// at that same position, which `check_prefix_consistency` correctly refuses
-/// to treat as "merely behind." The crypto plane does not create this state illegally — the same
-/// shape is reachable without crypto too — but the group-key activation
-/// grace's WITHHOLD window (a freshly-elected leader cannot seal ANY group
-/// traffic, heartbeats included, until its epoch activates) measurably
-/// raises leader-churn, which raises how often this rare transient is
-/// actually reached. See the task report ("Concerns") for the full
-/// reproduction and the case this is a pre-existing invariant-checker
-/// tolerance gap rather than a new defect; 5% is the rate at which 80+ seeds
-/// of THIS exact scenario, and separately the scenario-4/cold-start shapes,
-/// came back clean.
+/// world, not just the handshake — hits a `check_prefix_consistency`
+/// (inv2) firing a few percent of the time. **Confirmed, by the T13
+/// review, to be a checker OVER-APPROXIMATION, not a State-Machine-Safety
+/// violation**: 13 firings reproduced across three configurations were
+/// each checked by hand — SM-Safety held in 13/13, every one healed within
+/// 0-10 further steps, and in every case the "divergent" node had
+/// committed NOTHING at or above the divergence point (a textbook
+/// uncommitted divergent tail correctly awaiting truncation; inv2 is
+/// strictly stronger than SM-Safety and does not yet tolerate this
+/// transient shape). **Confirmed pre-existing** with crypto entirely OFF —
+/// not merely "reachable in principle": reproduced at 80% loss, seed 35,
+/// identical shape. **The mechanism is a real, production-faithful design
+/// consequence of M8, not a sim artifact**: `scope_of` classifies both
+/// `DATA` and `HEARTBEAT` as `Scope::Group`, and `seal_scratch` drops both
+/// on `NoGroupKey` — so a freshly-elected leader is silent (no
+/// heartbeats either) until its epoch activates, in production as much as
+/// here. Measured directly: max term reached at 20% loss is 1.2 without
+/// crypto vs. 3.7 with it — roughly 3x the election churn, invisible
+/// below ~5%. One mitigating fact: the T17 inherited-clock fix (`mint`'s
+/// doc) BOUNDS this — once a process's `active_epoch` latches, that
+/// process pays the dark window at most once, not once per election. See
+/// `known_red_inv2_over_approximation_at_20pct_loss` below for a
+/// pinned standing repro, and the task report ("Concerns") for the full
+/// account. **Empirical accuracy note (I-4):** even at the 5% rate used
+/// here, this is measurably rare rather than zero — 600 seeds at exactly
+/// 5% turned up 2 firings (seeds 82 and 318, both the same shape, both
+/// during the very first commit race), i.e. ~0.33%, not clean. The five
+/// seeds this file actually pins (1, 11, 13, 17, 21) are individually
+/// stable (3/3 repeat runs each came back green, re-verified against this
+/// commit) so the suite will not flake in CI, but "narrower" is the honest
+/// claim — not "clean."
 #[test]
 fn handshakes_complete_under_loss_and_reorder() {
-    let mut w = World::new(SimConfig { drop_per_million: 50_000, ..crypto_cfg(7) });
+    // seed 1, not 7: T13 review (I-2) applied the retry-disabled mutant
+    // across 40 seeds at this exact rate and found seed 7 is the one that
+    // does NOT discriminate (survives on luck — a pair only needs its one
+    // shot at message 1 + message 2 to land). Seed 1 fails under the same
+    // mutant (confirmed below and in the task report's re-verification).
+    let mut w = World::new(SimConfig { drop_per_million: 50_000, ..crypto_cfg(1) });
     w.enable_crypto_plane(3);
     assert!(
         w.run_until_within(|w| w.all_peer_sessions_established(), 60_000_000_000).unwrap(),
         "every pairwise session must establish within 60s of virtual time despite 5% loss"
+    );
+}
+
+/// T13 review (I-4): a pinned, standing repro of the `check_prefix_consistency`
+/// (inv2) over-approximation documented on
+/// `handshakes_complete_under_loss_and_reorder` above — NOT a regression
+/// gate for this crate (nothing here is expected to ever be "fixed" by a
+/// change in `uc2_sim` or `uc2_crypto`; the candidate fix, if one is ever
+/// made, lives in `check_prefix_consistency` itself). `#[ignore]`d because
+/// it is EXPECTED to return `Err` — an ordinary `.unwrap()` would abort the
+/// whole test binary rather than just fail one test. Run explicitly with
+/// `cargo test -p uc2_sim --test scenarios -- --ignored
+/// known_red_inv2_over_approximation_at_20pct_loss`.
+///
+/// Seed 71, not seed 1: this exact repro is sensitive to precisely how
+/// many `self.draw()` calls a run consumes (it is a coincidental-timing
+/// transient, not a structural one), so the T13 review's own suggested
+/// seed (1) stopped reproducing once the I-4 fix below (gating
+/// `CommitGossip`, which changes how many sends — and therefore RNG draws
+/// — a withheld tick consumes) landed; re-swept 0..150 at this exact rate
+/// against the code CommitGossip fix included and re-pinned on the first
+/// hit. If this ever stops firing again, re-sweep rather than assume the
+/// underlying transient is gone — see the note above about deleting vs.
+/// silently leaving a stale "known red" green.
+///
+/// If this ever stops firing (the checker's tolerance widened, or the
+/// activation-grace design changed), DELETE this test rather than leaving
+/// it silently green — a green `#[ignore]`d "known red" is worse than no
+/// test at all, since nobody re-checks an ignored test's premise.
+#[test]
+#[ignore = "expected-red diagnostic (checker over-approximation, not a regression gate) — see doc comment"]
+fn known_red_inv2_over_approximation_at_20pct_loss() {
+    let mut w = World::new(SimConfig { drop_per_million: 200_000, ..crypto_cfg(71) });
+    w.enable_crypto_plane(3);
+    let err = w.run_until_within(|_w| false, 60_000_000_000).expect_err(
+        "seed 71 @ 20% loss is EXPECTED to trip the inv2 over-approximation; if it no longer \
+         does, don't just delete this assert — re-sweep for a fresh repro seed and update \
+         the doc comment on handshakes_complete_under_loss_and_reorder",
+    );
+    assert!(
+        err.invariant.contains("inv2") || err.invariant.contains("prefix"),
+        "expected the term-map prefix consistency (inv2) over-approximation, got: {err}"
     );
 }
 
@@ -1731,18 +1793,49 @@ fn rotation_during_a_partition_converges_once_healed() {
 /// eventually happened, per the brief's explicit instruction.
 ///
 /// Timing is scripted rather than left to a network-speed race:
-/// `drop_next_key_delivery_to` only breaks the ONE next `HS_KEY` delivery,
-/// and the group-key activation rule (`GroupPlane::sealing_epoch`) keeps
+/// `block_key_delivery_to` holds a real gap open for a SCRIPTED WINDOW, and
+/// the group-key activation rule (`GroupPlane::sealing_epoch`) keeps
 /// sealing under the OLD epoch until either every named peer acks the new
 /// one OR the 2s timeout elapses — so if the redelivery sweep (a real,
 /// bounded retry, `World`'s `CRYPTO_SWEEP_INTERVAL_NS`) reaches `victim`
 /// before the timeout, `victim` acks and full-consensus activation and
 /// "victim already has the key" happen in the same instant: no gap, no
 /// NAK, by design (a nice liveness property, but the wrong shape for THIS
-/// test). Running past the activation grace BEFORE the sweep can fire
-/// forces the leader down the timeout arm while `victim` still lacks the
-/// key, which is `group.rs`'s documented liveness trap, deliberately
-/// triggered.
+/// test). Holding the block open past the activation grace forces the
+/// leader down the timeout arm while `victim` still lacks the key, which
+/// is `group.rs`'s documented liveness trap, deliberately triggered; the
+/// block is released with only a small margin so the (fast) redelivery
+/// sweep reaches `victim` comfortably inside its own election timeout —
+/// see `block_key_delivery_to`'s call site below for why that margin
+/// matters now that `Msg::CommitGossip` is correctly gated (T13 review).
+///
+/// **Discrimination, two independent checks, one of which the T13 review
+/// found does NOT hold end-to-end anymore — disclosed, not hidden:**
+///
+/// 1. Sim-side: bypassing the crypto gate (receiver treats every epoch as
+///    openable) makes `nak_count(victim)` stay 0 while convergence still
+///    happens — proving that assertion is load-bearing, not vacuous. Still
+///    holds; re-verified against this commit.
+/// 2. Production-side: `GroupPlane::unacked_peers -> []` (bug #1, T12's
+///    fix reverted) — this does **NOT** turn this test red, for the SAME
+///    structural reason documented on
+///    `rotation_during_a_partition_converges_once_healed` above: once
+///    `victim` cannot open ANY current group traffic (heartbeats
+///    included, now that `CommitGossip` is properly gated), it calls its
+///    own election on the SM's ordinary ~150-300ms timeout, and that
+///    ALWAYS triggers a fresh `BecomeLeader` auto-mint whose one-shot
+///    delivery is untouched by the mutant. This is unavoidable in an
+///    end-to-end scenario with live elections, not a scripting mistake —
+///    a full election-capable world cannot isolate "redelivery sweep
+///    specifically" from "the SM's own liveness recovery" once a peer
+///    goes fully deaf for longer than one election timeout, and a peer
+///    that has lost E2 is fully deaf by construction. The mutation-verified
+///    regression coverage for `unacked_peers`/`redeliver_to` themselves
+///    remains `uc2_crypto::group`'s own unit tests
+///    (`a_lost_key_delivery_can_be_re_sent_byte_identically` et al.),
+///    unaffected by this scenario's re-election confound. See the task
+///    report for the reproduction (with `DBG`-level tracing) that pinned
+///    this down.
 #[test]
 fn a_node_that_missed_an_epoch_recovers_via_the_existing_nak_path() {
     let mut w = World::new(crypto_cfg(13));
@@ -1759,9 +1852,24 @@ fn a_node_that_missed_an_epoch_recovers_via_the_existing_nak_path() {
     let leader = w.current_leader().expect("a leader must be elected");
     let victim = (0..3).find(|&i| i != leader).expect("a 3-node cluster has a non-leader");
 
-    w.drop_next_key_delivery_to(victim);
+    // Blocked for a SCRIPTED WINDOW (T13 review), not a one-shot drop: hold
+    // the gap open past uc2_crypto::group::ACTIVATION_TIMEOUT_NS (2s) so the
+    // leader is forced down the timeout arm of `sealing_epoch` while victim
+    // still lacks the key, then release with a small margin (50ms) so the
+    // fast redelivery sweep (`CRYPTO_SWEEP_INTERVAL_NS`, 50ms) reaches
+    // victim comfortably inside its own ~150-300ms election timeout —
+    // otherwise victim, unable to open ANY current group traffic
+    // (`Msg::CommitGossip` is gated the same as `Msg::Data` — see its doc),
+    // calls its own election, and recovers via an unrelated fresh mint
+    // instead of via the redelivery path this scenario is about (found the
+    // hard way: an earlier version used a one-shot drop, and once
+    // `CommitGossip` gating landed, a several-second-wide gap reliably
+    // triggered a full re-election storm that masked the T12 fix's own
+    // role — see the task report).
+    let deadline = w.now() + 2_050_000_000;
+    w.block_key_delivery_to(victim, deadline);
     w.rotate_group_key();
-    w.run_for(2_100_000_000).unwrap(); // just past ACTIVATION_TIMEOUT_NS
+    w.run_for(2_050_000_000).unwrap(); // just past ACTIVATION_TIMEOUT_NS
     assert_ne!(w.current_epoch(), 0);
     assert!(
         !w.node_has_group_epoch(victim, w.current_epoch()),
@@ -1803,23 +1911,6 @@ fn every_existing_safety_invariant_still_holds_with_the_crypto_plane_on() {
     assert!(w.max_commit() > 0, "a crypto-gated cluster must still make genuine commit progress");
 }
 
-/// Bonus (brief: "a cold-start-with-a-member-down scenario is worth
-/// having"): reproduces the SECOND real bug this task's brief calls out —
-/// `GroupPlane::mint` used to restart the activation clock on EVERY mint,
-/// and the node layer mints on every `BecomeLeader` while elections retry
-/// (150-300ms) far faster than the 2s activation grace, so a cluster
-/// cold-starting with one member permanently unreachable — and therefore
-/// churning leadership among the survivors — never activated an epoch and
-/// never sealed a single `DATA`: a livelock. Fixed by inheriting the
-/// un-activated epoch's clock (`mint`'s doc,
-/// `a_superseding_mint_inherits_an_unactivated_epochs_activation_clock`).
-///
-/// `partition_node(2)` stands in for "never comes up" (permanently
-/// unreachable, for the group-key plane's purposes); a moderate crash rate
-/// on the two survivors forces exactly the repeated-mint-faster-than-grace
-/// condition the fix targets. See the task report for the mutation proof
-/// (reverting `mint`'s inherited-clock fix in `uc2_crypto` and re-running
-/// this test).
 /// Discrimination proof for scenario 4: the crypto plane's additions to
 /// `World` (the seal gate, `Msg::Nak`, the maintenance tick) must not mask
 /// or weaken the sim's EXISTING bug-catching machinery. Crypto-enabled
@@ -1860,6 +1951,38 @@ fn crypto_plane_does_not_mask_the_mechanism_phantom_commit_oracle() {
     );
 }
 
+/// Bonus (brief: "a cold-start-with-a-member-down scenario is worth
+/// having"): reproduces the SHAPE of the SECOND real bug this task's brief
+/// calls out — `GroupPlane::mint` used to restart the activation clock on
+/// EVERY mint, and the node layer mints on every `BecomeLeader` while
+/// elections retry (150-300ms) far faster than the 2s activation grace, so
+/// a cluster cold-starting with one member permanently unreachable — and
+/// therefore churning leadership among the survivors — never activated an
+/// epoch and never sealed a single `DATA`: a livelock. Fixed by inheriting
+/// the un-activated epoch's clock (`mint`'s doc,
+/// `a_superseding_mint_inherits_an_unactivated_epochs_activation_clock`).
+///
+/// `partition_node(2)` stands in for "never comes up" (permanently
+/// unreachable, for the group-key plane's purposes); a moderate crash rate
+/// on the two survivors was meant to force the repeated-mint-faster-than-
+/// grace condition the fix targets.
+///
+/// **This does NOT carry a mutation proof — do not cite it as T17
+/// regression protection.** T13 review (I-3/the "one thing you do not need
+/// to fix, but should record" item): reverting `mint`'s inherited-clock fix
+/// does not turn this test red at any `(seed, crash_rate)` tried, and the
+/// reviewer found the structural reason: `World::on_restart` never touches
+/// `Node::crypto`, so a simulated crash in this sim preserves the crashed
+/// node's Noise sessions, group-key schedule, and latched `active_epoch`
+/// intact — a REAL process restart loses all three. The T17 mutant is
+/// therefore unreachable through this test's wiring at ANY crash rate, not
+/// merely hard to hit; `crash_per_million` churns leadership without ever
+/// making a node's crypto state actually disappear. The authoritative,
+/// mutation-verified regression test for T17 remains
+/// `uc2_crypto::group::a_superseding_mint_inherits_an_unactivated_epochs_activation_clock`.
+/// This test still earns its keep as a plain liveness check: a 3-node
+/// cluster with one member permanently unreachable, under real crash
+/// churn on the survivors, must still elect and commit.
 #[test]
 fn cold_start_with_a_member_down_still_forms_and_seals() {
     let mut w = World::new(SimConfig {
