@@ -5,11 +5,22 @@
 //! **≥400,000 msgs/s @ p50 ≤ 1.0 ms, fsync on, 3×c6id**).
 //!
 //! ```text
-//! cargo run -p uc2_node --release --example m5_gate -- node    --id N --bind A --members … --instance-dir D [--admission-kib K]
+//! cargo run -p uc2_node --release --example m5_gate -- node    --id N --bind A --members … --instance-dir D [--admission-kib K] [--crypto-key K --crypto-allowlist A]
 //! cargo run -p uc2_node --release --example m5_gate -- service --instance-dir D
 //! cargo run -p uc2_node --release --example m5_gate -- client  --instance-dir D --secs S [--payload 64] [--inflight 4096]
-//! cargo run -p uc2_node --release --example m5_gate -- all     --secs S   # local smoke, NOT the gate
+//! cargo run -p uc2_node --release --example m5_gate -- all     --secs S [--crypto]   # local smoke, NOT the gate
 //! ```
+//!
+//! **M8 (`--crypto`)** runs the SAME measurement with wire crypto ON, so the
+//! two arms differ in exactly one thing. `all --crypto` generates a fresh
+//! X25519 identity per node plus one shared allowlist under the run root and
+//! boots every node with `CryptoConfig::Enabled`; the fleet `node` role takes
+//! `--crypto-key`/`--crypto-allowlist` instead (an operator's real key
+//! material, not generated). The M8 gate doc
+//! (`docs/benchmarks/uc2-m8-gate-2026-07-29.md`) pre-commits the decide rule:
+//! encrypted `responses/s` ≥ 90% of the cleartext control. Nothing else about
+//! the harness changes between arms — same seed, same payload, same inflight,
+//! same duration.
 //!
 //! **`node`/`service`** are thin fleet-role wrappers (one process per host,
 //! systemd-run-friendly) over the real M5 SDK stack: `Node::start` for the
@@ -124,6 +135,15 @@ struct NodeArgs {
     /// The fleet protocol sweeps 64/128/256.
     #[arg(long, default_value_t = 256)]
     admission_kib: u64,
+    /// M8: this node's 32-byte raw X25519 private key file. Supplying it (with
+    /// `--crypto-allowlist`) boots the node under `CryptoConfig::Enabled`;
+    /// omitting both is the cleartext control arm.
+    #[arg(long, requires = "crypto_allowlist")]
+    crypto_key: Option<PathBuf>,
+    /// M8: the `id base64(public)` allowlist naming every member (see the
+    /// runbook's wire-crypto section for the format).
+    #[arg(long, requires = "crypto_key")]
+    crypto_allowlist: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -160,6 +180,12 @@ struct AllArgs {
     /// fresh dir under `target/` (never `/tmp` — see the guard in `run_all`).
     #[arg(long)]
     root: Option<PathBuf>,
+    /// M8: run the ENCRYPTED arm — generate a fresh X25519 identity per node
+    /// plus one shared allowlist under the run root, and boot every node with
+    /// `CryptoConfig::Enabled`. Everything else (seed, payload, inflight,
+    /// duration) is identical to the cleartext control.
+    #[arg(long, default_value_t = false)]
+    crypto: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -254,6 +280,72 @@ const NODE_MAX_PAYLOAD: usize = 512;
 const ELECTION_TIMEOUT_MIN_NS: u64 = 150_000_000;
 const ELECTION_TIMEOUT_MAX_NS: u64 = 300_000_000;
 
+// ------------------------------------------------------------ M8 key material
+//
+// The encrypted arm needs a real X25519 identity per node and a real allowlist
+// on disk — `CryptoConfig::Enabled` refuses to boot without them (spec §5's
+// fail-closed rule). The `all` smoke generates its own; the fleet `node` role
+// is handed an operator's.
+
+/// Deterministic per-node private key. Reproducibility matters for a gate
+/// harness — the two arms must differ ONLY in whether crypto is on — and these
+/// bytes never leave the run root. Same fixture shape as
+/// `uc2_node/tests/crypto_cluster.rs`.
+fn gate_private_key(i: usize) -> [u8; 32] {
+    [0x60u8 + i as u8; 32]
+}
+
+/// Standard-alphabet base64 with padding, matching `uc2_crypto::identity`'s
+/// allowlist parser. Hand-rolled rather than adding a `base64` dependency to
+/// `uc2_node` for one fixture (the crypto_cluster test does the same).
+fn b64_32(bytes: &[u8; 32]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Writes `n` key files plus one shared allowlist naming every node under
+/// `dir`, and returns each node's `(key_path, allowlist_path)`. Public keys are
+/// DERIVED through `uc2_crypto::identity::Identity` rather than hardcoded, so a
+/// wrong derivation shows up as a cluster that will not form, not as a silently
+/// wrong fixture.
+fn write_crypto_material(dir: &Path, n: usize) -> Vec<(PathBuf, PathBuf)> {
+    std::fs::create_dir_all(dir).expect("create crypto material dir");
+    let mut key_paths = Vec::with_capacity(n);
+    let mut publics = Vec::with_capacity(n);
+    for i in 0..n {
+        let key_path = dir.join(format!("node{i}.key"));
+        std::fs::write(&key_path, gate_private_key(i)).expect("write key file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 key file");
+        }
+        publics.push(
+            uc2_crypto::identity::Identity::load(&key_path).expect("load identity").public_bytes(),
+        );
+        key_paths.push(key_path);
+    }
+    let mut text = String::new();
+    for (i, public) in publics.iter().enumerate() {
+        text.push_str(&format!("{i} {}\n", b64_32(public)));
+    }
+    let allow_path = dir.join("allowlist");
+    std::fs::write(&allow_path, text).expect("write allowlist");
+    key_paths.into_iter().map(|k| (k, allow_path.clone())).collect()
+}
+
 fn node_config(
     id: NodeId,
     members: Vec<(NodeId, SocketAddr)>,
@@ -261,6 +353,7 @@ fn node_config(
     instance_dir: PathBuf,
     app_id: String,
     admission_bytes: u64,
+    crypto: uc2_node::CryptoConfig,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -278,7 +371,7 @@ fn node_config(
         purge: uc2_node::PurgePolicy::Disabled,
         learners: Vec::new(),
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
-        crypto: uc2_node::CryptoConfig::Disabled,
+        crypto,
     }
 }
 
@@ -290,6 +383,16 @@ fn run_node(a: NodeArgs) -> anyhow::Result<()> {
     );
     let id = a.id;
     let members = parse_members(&a.members);
+    // clap's `requires` makes these all-or-nothing, so the `Some`/`Some` and
+    // `None`/`None` cases are the only reachable ones.
+    let crypto = match (a.crypto_key, a.crypto_allowlist) {
+        (Some(key_path), Some(allowlist_path)) => uc2_node::CryptoConfig::Enabled {
+            key_path,
+            allowlist_path,
+            rotation: uc2_crypto::rotation::RotationPolicy::default(),
+        },
+        _ => uc2_node::CryptoConfig::Disabled,
+    };
     let cfg = node_config(
         a.id,
         members,
@@ -297,6 +400,7 @@ fn run_node(a: NodeArgs) -> anyhow::Result<()> {
         a.instance_dir,
         a.app_id,
         a.admission_kib * 1024,
+        crypto,
     );
     let _node = Node::start(cfg)?;
     println!("m5_gate node {id} up; parking (killed externally by the harness)");
@@ -738,6 +842,47 @@ fn print_report(s: &ClientStats) {
     }
 }
 
+/// M8 gate evidence (T10 review's standing requirement): show that the measured
+/// load actually drove the crypto planes CONCURRENTLY, in both directions, and
+/// that nothing was silently failing closed.
+///
+/// A sender-only microbenchmark could not surface the `KeyState` mutex
+/// contention at all, so the gate has to demonstrate rather than assert that
+/// the load was two-sided. The demonstration is per-node `seals` (every AEAD
+/// seal on every path draws exactly one nonce counter value, so this is a
+/// count, not an estimate): the leader's seals are its `DATA`/`HEARTBEAT`
+/// fan-out plus `COMMIT_POSITION` (group) and `TERM_MAP` (pairwise, one per
+/// peer per commit advance); each follower's seals are its `APPEND_POSITION`/
+/// `STATUS`/`NAK` reports. Nonzero on BOTH sides means each node was sealing
+/// while simultaneously OPENING the other side's traffic — replication could
+/// not have converged otherwise.
+///
+/// The drop counters are the fail-closed check: a nonzero `auth_failed`,
+/// `replay` or `seal_failures` means some traffic did not make it through the
+/// crypto plane, and any throughput number measured alongside that describes a
+/// degraded system rather than a working encrypted one.
+fn print_crypto_observability(nodes: &[Node], leader: usize) {
+    println!("---------------------------- M8 crypto plane -----------------------------");
+    println!("leader                : n{leader} (group epoch {:?})", nodes[leader].crypto_epoch());
+    for (i, n) in nodes.iter().enumerate() {
+        let s = n.crypto_stats();
+        println!(
+            "n{i}{}: seals {:>10} | auth_failed {} | replay {} | unknown_peer {} | \
+             unknown_epoch {} | cleartext_peer {} | seal_failures {} | hs_failures {}",
+            if i == leader { " (leader)" } else { "         " },
+            n.crypto_seal_count(),
+            s.dropped_auth_failed.load(Ordering::Relaxed),
+            s.dropped_replay.load(Ordering::Relaxed),
+            s.dropped_unknown_peer.load(Ordering::Relaxed),
+            s.dropped_unknown_epoch.load(Ordering::Relaxed),
+            s.peer_appears_cleartext.load(Ordering::Relaxed),
+            s.seal_failures.load(Ordering::Relaxed),
+            n.crypto_handshake_failures(),
+        );
+    }
+    println!("==========================================================================");
+}
+
 fn run_client_role(a: ClientArgs) -> anyhow::Result<()> {
     let secs = env_cap("UC2_M5_MAX_SECS", a.secs);
     let inflight = env_cap("UC2_M5_MAX_INFLIGHT", a.inflight);
@@ -787,8 +932,16 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
          + 3 services + the client; the real bar is only claimable on the 3xc6id fleet run. \
          See docs/benchmarks/uc2-m5-gate-2026-07-12.md."
     );
+    println!(
+        "arm                   : {}",
+        if a.crypto { "ENCRYPTED (M8 wire crypto ON)" } else { "cleartext control" }
+    );
 
     const N: usize = 3;
+    // Generated ONCE for the whole run, before any node boots — every node
+    // must see the same allowlist.
+    let material =
+        if a.crypto { Some(write_crypto_material(&root.join("crypto"), N)) } else { None };
     let socks: Vec<UdpSocket> =
         (0..N).map(|_| UdpSocket::bind("127.0.0.1:0").expect("bind")).collect();
     let members: Vec<(NodeId, SocketAddr)> =
@@ -800,6 +953,17 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     for (i, sock) in socks.into_iter().enumerate() {
         let addr = members[i].1;
         let instance_dir = root.join(format!("n{i}"));
+        let crypto = match &material {
+            Some(m) => {
+                let (key_path, allowlist_path) = m[i].clone();
+                uc2_node::CryptoConfig::Enabled {
+                    key_path,
+                    allowlist_path,
+                    rotation: uc2_crypto::rotation::RotationPolicy::default(),
+                }
+            }
+            None => uc2_node::CryptoConfig::Disabled,
+        };
         let cfg = node_config(
             i as NodeId,
             members.clone(),
@@ -807,6 +971,7 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
             instance_dir.clone(),
             ALL_APP_ID.into(),
             256 * 1024,
+            crypto,
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let svc = ServiceBuilder::new(ServiceConfig::new(&instance_dir, ALL_APP_ID), CountSm::default())
@@ -824,6 +989,9 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
     let inflight = env_cap("UC2_M5_MAX_INFLIGHT", a.inflight);
     let stats = run_client_measurement(&dirs[leader], ALL_APP_ID, secs, a.payload, inflight);
     print_report(&stats);
+    if a.crypto {
+        print_crypto_observability(&nodes, leader);
+    }
 
     // Node-first-then-service teardown, per slot (v1/lincheck_v2 precedent: a
     // node's shutdown must not wait on a service that tears down first).

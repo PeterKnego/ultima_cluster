@@ -1052,6 +1052,15 @@ impl Node {
         }
     }
 
+    /// M8 Task 16 (throughput gate): how many AEAD seals this node has
+    /// performed across every path — forwards to [`SharedTransport::seal_count`].
+    /// `0` under [`CryptoConfig::Disabled`]. Observability only; the gate
+    /// harness uses it to show the measured load genuinely drove the seal path
+    /// from more than one agent rather than assuming it did.
+    pub fn crypto_seal_count(&self) -> u64 {
+        self.crypto.as_ref().map_or(0, |c| c.seal_count())
+    }
+
     /// M8 Task 14 (adversarial tier): whether this node currently has an
     /// established pairwise Noise session with `peer` — forwards to
     /// [`SharedTransport::is_established`]. `false` under

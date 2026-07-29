@@ -879,6 +879,26 @@ impl SharedTransport {
         self.base.elapsed().as_nanos() as u64
     }
 
+    /// How many seals this family has performed — the current value of the
+    /// shared nonce counter (see the `counter` field doc). Every successful
+    /// AEAD seal on every path reachable from this `SharedTransport` draws
+    /// exactly one counter value, so this is a direct count of AEAD work done,
+    /// not an estimate.
+    ///
+    /// Added M8 Task 16 for the throughput gate, which has to show that the
+    /// measured load actually exercised the seal path CONCURRENTLY from more
+    /// than one agent (T10 review's standing requirement) rather than assume
+    /// it. Observability only — nothing branches on this value.
+    ///
+    /// Slight over-count by design: a seal that FAILS (no usable group key,
+    /// no session with the peer) still burns its counter value, because
+    /// counter allocation precedes the fallible key lookup so that a failure
+    /// cannot leave the caller's staged datagram half-mutated. Failures are
+    /// separately visible as `seal_failures` in the sender/receiver stats.
+    pub fn seal_count(&self) -> u64 {
+        self.counter.load(Ordering::Relaxed)
+    }
+
     /// Hands out the send half. Enforced (round-2 review fix), not merely
     /// documented, to be callable exactly once per process — across EVERY
     /// clone of this `SharedTransport`, since `send_half_taken` is an `Arc`
