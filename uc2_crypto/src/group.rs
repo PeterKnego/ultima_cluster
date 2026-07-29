@@ -38,10 +38,17 @@
 //! sealing group traffic altogether.
 //!
 //! An outgoing pending epoch that had NOT yet activated when superseded is
-//! simply dropped — it never got to be "the" active epoch, and superseding
-//! it (a second mint before the first settled) is not a case this design
-//! needs to preserve history for; `active_epoch` still holds whatever the
-//! last real activation was.
+//! dropped as an EPOCH — it never got to be "the" active epoch, and
+//! superseding it (a second mint before the first settled) is not a case this
+//! design needs to preserve history for; `active_epoch` still holds whatever
+//! the last real activation was. **Its activation CLOCK, however, is
+//! inherited by the superseding mint** (T17): the grace measures "time since
+//! this node first tried to distribute a key to this peer set", not "time
+//! since the latest mint". Restarting the clock per mint was a real cold-start
+//! livelock — the node layer mints on every `BecomeLeader` and elections
+//! retry every 150-300 ms, an order of magnitude faster than the 2 s grace, so
+//! a cluster booting with one member down could never seal a single `DATA`
+//! datagram. See [`GroupPlane::mint`] and its two regression tests.
 //!
 //! # Wire format for the `HS_KEY` body (opaque to `uc_protocol`, like
 //! `handshake.rs`'s handshake payload)
@@ -181,7 +188,33 @@ impl GroupPlane {
     /// `now_ns` — see the module docs. This is what lets `sealing_epoch`
     /// keep returning a still-good older epoch while the new one is
     /// outstanding, instead of momentarily going back to `None`.
+    ///
+    /// If the outgoing epoch had NOT activated, the new epoch INHERITS its
+    /// activation clock rather than restarting the grace from `now_ns` (T17).
+    /// Without that, a caller that re-mints faster than
+    /// [`ACTIVATION_TIMEOUT_NS`] — which the node layer does, minting on every
+    /// `BecomeLeader` while elections retry every 150-300 ms — can never let
+    /// the grace elapse, and a cluster that cold-starts with one member down
+    /// never seals a single `DATA` datagram. See
+    /// `a_superseding_mint_inherits_an_unactivated_epochs_activation_clock`.
     pub fn mint(&mut self, peers: &[NodeId], now_ns: u64) -> (u16, Vec<HandshakeAction>) {
+        // T17 (2026-07-29) — the activation clock is INHERITED, not restarted,
+        // when this mint supersedes a pending epoch that never activated. See
+        // `a_superseding_mint_inherits_an_unactivated_epochs_activation_clock`
+        // for the full account: stamping `now_ns` unconditionally livelocks
+        // any cluster that cold-starts with a member down, because the node
+        // layer mints on EVERY `BecomeLeader` and the election timeout
+        // (150-300 ms) is an order of magnitude shorter than the 2 s grace, so
+        // the grace never elapses and the leader can never seal `DATA`.
+        //
+        // Read BEFORE `fold_pending_if_activated`, which `take()`s `pending`
+        // unconditionally (an un-activated pending is simply dropped, so its
+        // timestamp would be gone by the time we needed it).
+        let inherited_clock = self
+            .pending
+            .as_ref()
+            .filter(|p| !Self::is_activated(p, now_ns))
+            .map(|p| p.minted_at);
         self.fold_pending_if_activated(now_ns);
 
         let epoch = self.next_epoch;
@@ -215,7 +248,11 @@ impl GroupPlane {
 
         self.pending = Some(PendingEpoch {
             epoch,
-            minted_at: now_ns,
+            // T17: the inherited clock, if this mint supersedes a pending
+            // epoch that never activated — see the block at the top of this
+            // function. `now_ns` for the ordinary case (nothing pending, or
+            // the outgoing epoch just folded into `active_epoch`).
+            minted_at: inherited_clock.unwrap_or(now_ns),
             peers: peers.to_vec(),
             acked: HashSet::new(),
         });
@@ -708,5 +745,75 @@ mod tests {
     fn redelivery_before_any_mint_is_a_no_op_not_a_panic() {
         let g = GroupPlane::new(1);
         assert!(g.redeliver_to(&[2, 3]).is_empty());
+    }
+
+    /// **T17 (2026-07-29), a real cold-start livelock — found by T17's own
+    /// capstone, fixed here.**
+    ///
+    /// `mint` used to stamp `minted_at = now_ns` unconditionally, so a mint
+    /// that SUPERSEDED a still-unactivated pending epoch restarted the
+    /// activation grace from zero. That is a livelock whenever a leader
+    /// re-mints faster than [`ACTIVATION_TIMEOUT_NS`], and the node layer
+    /// does exactly that: rotation trigger 1 mints on EVERY `BecomeLeader`,
+    /// and the election timeout (150-300 ms in production config) is an order
+    /// of magnitude shorter than the 2 s grace.
+    ///
+    /// The reachable, ordinary scenario: a 3-member cluster cold-starts with
+    /// one member down (a rolling restart, or one host slow to boot). The
+    /// absent member can never ack, so activation depends entirely on the
+    /// timeout. No epoch has ever activated, so `active_epoch` is `None` and
+    /// `sealing_epoch` returns `None` — the leader can seal no `DATA`, no
+    /// `HEARTBEAT` and no `COMMIT_POSITION`. The live follower therefore sees
+    /// no leader activity, times out, and starts a fresh election; the winner
+    /// mints again, resetting the clock. The grace never elapses and the
+    /// cluster never forms. Reproduced end-to-end before this fix by
+    /// `uc2_node/tests/crypto_cluster.rs`'s
+    /// `a_cluster_forms_even_when_one_member_never_comes_up`, which hung for
+    /// its full 60 s deadline.
+    ///
+    /// The fix inherits the superseded epoch's clock, so the grace measures
+    /// "time since this node FIRST tried to distribute a key to this peer
+    /// set". No security property moves: sealing under an epoch some peer
+    /// never acked is exactly what the timeout already permits, and a peer
+    /// that has not acked could not open the superseded epoch either.
+    ///
+    /// Discriminating: the loop re-mints every 300 ms, which under the old
+    /// rule keeps `now - minted_at` pinned at 0 forever.
+    #[test]
+    fn a_superseding_mint_inherits_an_unactivated_epochs_activation_clock() {
+        let mut g = GroupPlane::new(1);
+        g.mint(&[2, 3], 0);
+        g.on_ack(2, 1); // peer 3 is down and never acks
+        let mut t = 0u64;
+        for _ in 0..20 {
+            t += 300_000_000; // one election timeout apart
+            assert_eq!(g.mint(&[2, 3], t).1.len(), 2, "each mint re-delivers to both peers");
+            g.on_ack(2, g.sealing_epoch(t).unwrap_or(0)); // peer 2 keeps acking
+        }
+        assert!(
+            t > ACTIVATION_TIMEOUT_NS,
+            "the loop must actually run past the grace for this to mean anything"
+        );
+        assert!(
+            g.sealing_epoch(t).is_some(),
+            "a leader re-minting faster than the activation grace must still eventually seal — \
+             otherwise a cluster that cold-starts with one member down never forms"
+        );
+    }
+
+    /// The other direction: inheriting the clock must NOT make an epoch
+    /// activate EARLY. A single mint with an unacked peer is unsealable until
+    /// the grace genuinely elapses.
+    #[test]
+    fn inheriting_the_clock_does_not_activate_an_epoch_before_the_grace_elapses() {
+        let mut g = GroupPlane::new(1);
+        g.mint(&[2, 3], 1_000_000_000);
+        assert!(g.sealing_epoch(1_500_000_000).is_none(), "half a grace in: not yet");
+        g.mint(&[2, 3], 1_500_000_000);
+        assert!(
+            g.sealing_epoch(2_000_000_000).is_none(),
+            "the inherited clock starts at the FIRST mint (1.0s), so 2.0s is still inside it"
+        );
+        assert!(g.sealing_epoch(3_100_000_000).is_some(), "past the grace from the first mint");
     }
 }
