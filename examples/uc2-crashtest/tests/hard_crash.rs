@@ -371,14 +371,24 @@ fn linearizable_under_service_sigkill() {
     let inst = tmp.path().join("inst");
     std::fs::create_dir_all(&inst).unwrap();
 
+    // M8 Task 15: UC2_CRYPTO=1 boots this single node with wire crypto
+    // Enabled instead of the pre-M8 Disabled default.
+    let crypto_on = crypto_from_env();
+    let crypto = crypto_on.then(|| provision_crypto(&inst, &[0]));
+    let crypto_args =
+        crypto.as_ref().map(|m| (m.key_paths[&0].as_path(), m.allowlist_path.as_path()));
+
     // Node held for the whole test; service held behind a Mutex<Option<_>>
     // so the fault loop can SIGKILL + respawn it. `Option` (not a bare
     // `Reap`) matters: it lets us explicitly `.take()` (kill + reap the OLD
     // process) BEFORE spawning the new one — `*g = spawn_service(&inst)`
     // would evaluate the RHS (spawn the new child) FIRST and only drop the
     // old `Reap` as part of the assignment, racing the two processes.
-    let _node = spawn_node(&inst);
+    let _node = spawn_node_with(&inst, crypto_args);
     wait_for_ready(&inst, Duration::from_secs(10));
+    if crypto_on {
+        assert_crypto_epoch_active(&inst, Duration::from_secs(10));
+    }
     let svc = Arc::new(Mutex::new(Some(spawn_service(&inst))));
 
     let dir = Arc::new(inst.clone());
@@ -421,7 +431,10 @@ fn linearizable_under_service_sigkill() {
     let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
 
     let ok = History::ok_count(&entries);
-    eprintln!("[hard_crash] seed={seed} ops={} ok={ok} — checking linearizability", entries.len());
+    eprintln!(
+        "[hard_crash] seed={seed} ops={} ok={ok} crypto={crypto_on} — checking linearizability",
+        entries.len()
+    );
     assert!(
         ok >= 50,
         "liveness: only {ok} ops completed Ok (<50) — cluster failed to progress under service SIGKILL"
@@ -471,6 +484,14 @@ fn node_sigkill_recovery_once(run: u32) {
     let inst = tmp.path().join("inst");
     std::fs::create_dir_all(&inst).unwrap();
 
+    // M8 Task 15: UC2_CRYPTO=1 boots this single node with wire crypto
+    // Enabled instead of the pre-M8 Disabled default. Same key/allowlist
+    // reused across the restart below (same instance dir, same node id).
+    let crypto_on = crypto_from_env();
+    let crypto = crypto_on.then(|| provision_crypto(&inst, &[0]));
+    let crypto_args =
+        crypto.as_ref().map(|m| (m.key_paths[&0].as_path(), m.allowlist_path.as_path()));
+
     // `Mutex<Option<_>>` (not a bare `Reap`), same rationale as the
     // service-kill test above: an explicit `.take()` kills + reaps the OLD
     // process before the new one is spawned. This matters MORE here than
@@ -478,8 +499,11 @@ fn node_sigkill_recovery_once(run: u32) {
     // instance dir, so if the old node's process hasn't actually exited yet
     // when the new one tries to acquire it, the new node fails outright
     // with `AlreadyRunning` instead of merely racing on data.
-    let node = Arc::new(Mutex::new(Some(spawn_node(&inst))));
+    let node = Arc::new(Mutex::new(Some(spawn_node_with(&inst, crypto_args))));
     wait_for_ready(&inst, Duration::from_secs(10));
+    if crypto_on {
+        assert_crypto_epoch_active(&inst, Duration::from_secs(10));
+    }
     let svc = Arc::new(Mutex::new(Some(spawn_service(&inst))));
 
     let dir = Arc::new(inst.clone());
@@ -509,7 +533,7 @@ fn node_sigkill_recovery_once(run: u32) {
     {
         let mut g = node.lock().unwrap();
         g.take(); // kill + reap the OLD node, BEFORE spawning the new one (flock!)
-        *g = Some(spawn_node(&inst));
+        *g = Some(spawn_node_with(&inst, crypto_args));
     }
     // `wait_for_path(cnc2.dat)` would be VACUOUS here — the file never
     // disappeared (only the process holding it died), so it'd return
@@ -539,7 +563,7 @@ fn node_sigkill_recovery_once(run: u32) {
     let ok = History::ok_count(&entries);
     eprintln!(
         "[node_sigkill_recovery] run={run} ops={} ok_before_kill={ok_before_kill} \
-         ok_after_recovery={ok_after_recovery} ok_total={ok}",
+         ok_after_recovery={ok_after_recovery} ok_total={ok} crypto={crypto_on}",
         entries.len()
     );
     assert!(
@@ -603,9 +627,17 @@ fn addr_to_wire(addr: SocketAddr) -> (u32, u16) {
 
 /// Spawn a node process as one voter of an `n`-member cluster (unlike
 /// `common::spawn_node`, which always boots a single-node default).
-fn spawn_node_multi(instance_dir: &Path, id: u32, bind: SocketAddr, members: &str) -> Reap {
-    let child = Command::new(NODE_BIN)
-        .arg("--instance-dir")
+/// `crypto` (M8 Task 15): `--crypto-key`/`--crypto-allowlist`, when the
+/// UC2_CRYPTO=1 switch is on.
+fn spawn_node_multi(
+    instance_dir: &Path,
+    id: u32,
+    bind: SocketAddr,
+    members: &str,
+    crypto: Option<(&Path, &Path)>,
+) -> Reap {
+    let mut cmd = Command::new(NODE_BIN);
+    cmd.arg("--instance-dir")
         .arg(instance_dir)
         .arg("--app-id")
         .arg(APP_ID)
@@ -614,7 +646,11 @@ fn spawn_node_multi(instance_dir: &Path, id: u32, bind: SocketAddr, members: &st
         .arg("--bind")
         .arg(bind.to_string())
         .arg("--members")
-        .arg(members)
+        .arg(members);
+    if let Some((key_path, allowlist_path)) = crypto {
+        cmd.arg("--crypto-key").arg(key_path).arg("--crypto-allowlist").arg(allowlist_path);
+    }
+    let child = cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
@@ -945,18 +981,32 @@ fn sigkill_mid_config_window() {
     let members: Vec<(u32, SocketAddr)> = (0..N as u32).map(|i| (i, addrs[i as usize])).collect();
     let members_str = members_arg(&members);
 
+    // M8 Task 15: UC2_CRYPTO=1 boots this real 3-PROCESS cluster with wire
+    // crypto Enabled on every node — a genuine multi-process handshake, not
+    // the in-process fixture the other capstones use. Only ids 0..N ever
+    // boot a real process (the `spare_id`s below name an admin-protocol
+    // target that never actually starts a node — see the loop's comment).
+    let crypto_on = crypto_from_env();
+    let crypto = crypto_on.then(|| provision_crypto(tmp.path(), &(0..N as u32).collect::<Vec<_>>()));
+    let crypto_args_for = |id: u32| -> Option<(&Path, &Path)> {
+        crypto.as_ref().map(|m| (m.key_paths[&id].as_path(), m.allowlist_path.as_path()))
+    };
+
     let mut dirs: Vec<PathBuf> = Vec::with_capacity(N);
     let mut node_procs: Vec<Option<Reap>> = Vec::with_capacity(N);
     for i in 0..N as u32 {
         let d = tmp.path().join(format!("n{i}"));
         std::fs::create_dir_all(&d).unwrap();
-        node_procs.push(Some(spawn_node_multi(&d, i, addrs[i as usize], &members_str)));
+        node_procs.push(Some(spawn_node_multi(&d, i, addrs[i as usize], &members_str, crypto_args_for(i))));
         wait_for_ready(&d, Duration::from_secs(10));
         dirs.push(d);
     }
     let mut svc_procs: Vec<Option<Reap>> = dirs.iter().map(|d| Some(spawn_service(d))).collect();
 
-    await_single_leader_multi(&dirs, 30);
+    let leader0 = await_single_leader_multi(&dirs, 30);
+    if crypto_on {
+        assert_crypto_epoch_active(&dirs[leader0], Duration::from_secs(10));
+    }
 
     let dirs = Arc::new(dirs);
     let history = Arc::new(History::default());
@@ -1037,7 +1087,13 @@ fn sigkill_mid_config_window() {
         // Restart on the SAME id/bind/members; wait for a genuinely FRESH
         // cnc instance (not the stale pre-truncate leftover) before the
         // service reattaches.
-        node_procs[li] = Some(spawn_node_multi(&dirs[li], li as u32, addrs[li], &members_str));
+        node_procs[li] = Some(spawn_node_multi(
+            &dirs[li],
+            li as u32,
+            addrs[li],
+            &members_str,
+            crypto_args_for(li as u32),
+        ));
         wait_for_fresh_cnc_instance(&dirs[li], old_instance_id, Duration::from_secs(10));
         svc_procs[li] = Some(spawn_service(&dirs[li]));
 
@@ -1080,7 +1136,7 @@ fn sigkill_mid_config_window() {
     eprintln!(
         "[sigkill_mid_config_window] ops={} ok={ok} runs={RUNS} \
          observed_pending={observed_pending_count}/{RUNS} committed={committed_count}/{RUNS} \
-         final_config_version={committed_version}",
+         final_config_version={committed_version} crypto={crypto_on}",
         entries.len()
     );
     assert!(

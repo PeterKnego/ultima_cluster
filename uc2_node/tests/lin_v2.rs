@@ -220,6 +220,7 @@ fn linearizable_under_purge_and_snapshot_churn() {
         journal_segment_bytes: 16 * 1024,
         snapshot_interval_bytes: 32 * 1024,
         spare_node: false,
+        crypto: false,
     };
 
     let seed: u64 =
@@ -519,6 +520,328 @@ fn linearizable_under_reconfig_churn() {
         }
         Verdict::Inconclusive => {
             panic!("checker Inconclusive under reconfig churn (seed={seed}); raise THROTTLE / lower TARGET_OPS")
+        }
+    }
+}
+
+// ======================================================= M8 Task 15: crypto ON
+//
+// The same three capstones above, byte-for-byte, except every node boots
+// with wire crypto `Enabled` (`ClusterCfg::crypto = true` — see
+// `lincheck_v2`'s M8 Task 15 fixture). The WGL checker is untouched: if
+// sealing, the replay window, or key rotation perturbed ordering, durability,
+// or recovery under failover/purge/reconfig churn, this is what would show
+// it. Each test also asserts the elected leader genuinely MINTED a crypto
+// group epoch right after boot — proof the switch actually engaged, not just
+// that the cluster (harmlessly) still formed with it silently doing nothing.
+
+/// `linearizable_under_failover_v2`, crypto ON.
+#[test]
+fn linearizable_under_failover_with_crypto() {
+    const DEFAULT_SEED: u64 = 0x1107;
+    const TARGET_OPS: usize = 800;
+    const N_WORKERS: u32 = 3;
+    const THROTTLE: Duration = Duration::from_millis(20);
+    const FAULT_PERIOD: Duration = Duration::from_secs(1);
+    const BUDGET: Duration = Duration::from_secs(115);
+
+    let seed: u64 =
+        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SEED);
+
+    let ccfg = ClusterCfg { crypto: true, ..ClusterCfg::default() };
+
+    let _g = serialize();
+    let dir = tempdir();
+    let mut cluster: LinClusterV2 =
+        LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let leader0 = cluster.await_single_serving(30);
+    assert!(
+        cluster.crypto_epoch_of(leader0).is_some(),
+        "crypto was configured but the elected leader never minted a group epoch — \
+         wire crypto did not actually engage"
+    );
+
+    let dirs = Arc::new(cluster.dirs());
+    let history = Arc::new(History::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let last_seen = Arc::new(AtomicU64::new(0));
+
+    let handles = spawn_workers(&dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS);
+
+    let mut frng = StdRng::seed_from_u64(seed ^ 0xFA17);
+    let mut faults = 0u32;
+    let start = Instant::now();
+    while History::ok_count(&history.snapshot()) < TARGET_OPS {
+        std::thread::sleep(FAULT_PERIOD);
+        if frng.random_bool(0.5) {
+            cluster.kill_and_restart_leader();
+        } else {
+            cluster.crash_and_restart_leader_service();
+        }
+        faults += 1;
+        if start.elapsed() > BUDGET {
+            break;
+        }
+    }
+    let elapsed = start.elapsed();
+
+    stop.store(true, Ordering::Relaxed);
+    join_workers(handles);
+    cluster.stop();
+
+    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let ok = History::ok_count(&entries);
+    eprintln!(
+        "[lin_v2 crypto] seed={seed} faults={faults} ops={} ok={ok} elapsed={:.1}s — checking",
+        entries.len(),
+        elapsed.as_secs_f64()
+    );
+
+    assert!(
+        ok * 100 >= entries.len() * 80,
+        "liveness: only {ok}/{} ops Ok (<80%) — crypto-enabled cluster failed to progress",
+        entries.len()
+    );
+    assert!(
+        elapsed < Duration::from_secs(120),
+        "crypto-enabled capstone took {elapsed:?} — exceeded the 120 s/seed budget"
+    );
+
+    match check_register(&entries) {
+        Verdict::Linearizable => {}
+        Verdict::Violation => {
+            dump_history(&entries, seed);
+            panic!("LINEARIZABILITY VIOLATION under crypto+failover (seed={seed}); history dumped");
+        }
+        Verdict::Inconclusive => {
+            panic!("checker Inconclusive under crypto+failover (seed={seed}); raise THROTTLE / lower TARGET_OPS")
+        }
+    }
+}
+
+/// `linearizable_under_purge_and_snapshot_churn`, crypto ON.
+#[test]
+fn linearizable_under_purge_and_snapshot_churn_with_crypto() {
+    const DEFAULT_SEED: u64 = 0x1107;
+    const TARGET_OPS: usize = 700;
+    const N_WORKERS: u32 = 3;
+    const THROTTLE: Duration = Duration::from_millis(20);
+    const FAULT_PERIOD: Duration = Duration::from_millis(1200);
+    let budget = Duration::from_secs(
+        std::env::var("UC2_LIN_BUDGET_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(115),
+    );
+
+    let ccfg = ClusterCfg {
+        purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
+        journal_segment_bytes: 16 * 1024,
+        snapshot_interval_bytes: 32 * 1024,
+        spare_node: false,
+        crypto: true,
+    };
+
+    let seed: u64 =
+        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SEED);
+
+    let _g = serialize();
+    let dir = tempdir();
+    let mut cluster: LinClusterV2 = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let leader0 = cluster.await_single_serving(30);
+    assert!(
+        cluster.crypto_epoch_of(leader0).is_some(),
+        "crypto was configured but the elected leader never minted a group epoch — \
+         wire crypto did not actually engage"
+    );
+
+    let dirs = Arc::new(cluster.dirs());
+    let history = Arc::new(History::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let last_seen = Arc::new(AtomicU64::new(0));
+
+    let handles = spawn_workers(&dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS);
+
+    let mut frng = StdRng::seed_from_u64(seed ^ 0xFA17);
+    let mut faults = 0u32;
+    let mut follower_svc_faults = 0u32;
+    let start = Instant::now();
+    while History::ok_count(&history.snapshot()) < TARGET_OPS
+        || cluster.max_archive_first_base() == 0
+    {
+        std::thread::sleep(FAULT_PERIOD);
+        match frng.random_range(0..3u8) {
+            0 => cluster.kill_and_restart_leader(),
+            1 => cluster.crash_and_restart_leader_service(),
+            _ => {
+                cluster.crash_and_restart_random_follower_service(&mut frng);
+                follower_svc_faults += 1;
+            }
+        }
+        faults += 1;
+        if start.elapsed() > budget {
+            break;
+        }
+    }
+    let elapsed = start.elapsed();
+
+    let purge_floor = cluster.max_archive_first_base();
+
+    stop.store(true, Ordering::Relaxed);
+    join_workers(handles);
+    cluster.stop();
+
+    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let ok = History::ok_count(&entries);
+    eprintln!(
+        "[lin_v2 crypto+purge] seed={seed} faults={faults} (follower-svc={follower_svc_faults}) \
+         ops={} ok={ok} purge_floor={purge_floor} elapsed={:.1}s — checking",
+        entries.len(),
+        elapsed.as_secs_f64()
+    );
+
+    assert!(
+        purge_floor > 0,
+        "purge never advanced the archive floor (max first_base = 0) — the crypto+purge \
+         capstone did not exercise snapshot-backed purge; raise op volume / shrink segments"
+    );
+
+    assert!(
+        ok * 100 >= entries.len() * 80,
+        "liveness: only {ok}/{} ops Ok (<80%) — crypto-enabled cluster failed to progress under purge",
+        entries.len()
+    );
+    assert!(
+        elapsed < Duration::from_secs(120),
+        "crypto+purge capstone took {elapsed:?} — exceeded the 120 s/seed budget"
+    );
+
+    match check_register(&entries) {
+        Verdict::Linearizable => {}
+        Verdict::Violation => {
+            dump_history(&entries, seed);
+            panic!("LINEARIZABILITY VIOLATION under crypto+purge (seed={seed}); history dumped");
+        }
+        Verdict::Inconclusive => {
+            panic!("checker Inconclusive under crypto+purge (seed={seed}); raise THROTTLE / lower TARGET_OPS")
+        }
+    }
+}
+
+/// `linearizable_under_reconfig_churn`, crypto ON. The spare's freshly
+/// allocated ids (100, 101, ...) are pre-provisioned crypto material too
+/// (`lincheck_v2::crypto_ids_for`), so every add/promote/demote/remove cycle
+/// boots the joining node sealed from the start.
+#[test]
+fn linearizable_under_reconfig_churn_with_crypto() {
+    const DEFAULT_SEED: u64 = 0x1107;
+    const TARGET_OPS: usize = 600;
+    const MAX_OPS: usize = 1500;
+    const N_WORKERS: u32 = 3;
+    const THROTTLE: Duration = Duration::from_millis(150);
+    const FAULT_PERIOD: Duration = Duration::from_millis(1200);
+    let budget_secs: u64 = std::env::var("UC2_LIN_BUDGET_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(120);
+    let budget = Duration::from_secs(budget_secs.saturating_sub(5));
+
+    let ccfg = ClusterCfg { spare_node: true, crypto: true, ..ClusterCfg::default() };
+
+    let seed: u64 =
+        std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_SEED);
+
+    let _g = serialize();
+    let dir = tempdir();
+    let mut cluster: LinClusterV2 = LinClusterV2::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
+    let leader0 = cluster.await_single_serving(30);
+    assert!(
+        cluster.crypto_epoch_of(leader0).is_some(),
+        "crypto was configured but the elected leader never minted a group epoch — \
+         wire crypto did not actually engage"
+    );
+
+    let dirs = Arc::new(cluster.dirs());
+    let history = Arc::new(History::default());
+    let stop = Arc::new(AtomicBool::new(false));
+    let last_seen = Arc::new(AtomicU64::new(0));
+
+    let handles = spawn_workers(&dirs, &history, &stop, &last_seen, seed, THROTTLE, N_WORKERS);
+
+    const MIN_CONFIG_OPS: u32 = 4;
+    let mut frng = StdRng::seed_from_u64(seed ^ 0xFA17);
+    let mut faults = 0u32;
+    let mut config_arm_picks = 0u32;
+    let start = Instant::now();
+    loop {
+        let snap = history.snapshot();
+        if snap.len() >= MAX_OPS {
+            break;
+        }
+        if History::ok_count(&snap) >= TARGET_OPS && cluster.config_ops_accepted >= MIN_CONFIG_OPS {
+            break;
+        }
+        std::thread::sleep(FAULT_PERIOD);
+        match frng.random_range(0..4u8) {
+            0 if !cluster.spare_is_voting() => cluster.kill_and_restart_leader(),
+            0 => {}
+            1 => cluster.crash_and_restart_random_follower_service(&mut frng),
+            2 => {
+                if !cluster.spare_is_voting() {
+                    cluster.partition_minority();
+                    std::thread::sleep(Duration::from_millis(800));
+                    cluster.heal();
+                    cluster.await_reconverged(20);
+                }
+            }
+            _ => {
+                config_arm_picks += 1;
+                cluster.random_config_op(&mut frng);
+            }
+        }
+        faults += 1;
+        if start.elapsed() > budget {
+            break;
+        }
+    }
+    let elapsed = start.elapsed();
+
+    let config_ops_accepted = cluster.config_ops_accepted;
+
+    stop.store(true, Ordering::Relaxed);
+    join_workers(handles);
+    cluster.stop();
+
+    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let ok = History::ok_count(&entries);
+    eprintln!(
+        "[lin_v2 crypto+reconfig] seed={seed} faults={faults} (config-arm picks={config_arm_picks}) \
+         ops={} ok={ok} config_ops_accepted={config_ops_accepted} elapsed={:.1}s — checking",
+        entries.len(),
+        elapsed.as_secs_f64()
+    );
+
+    assert!(
+        config_ops_accepted >= 3,
+        "vacuous: crypto+reconfig churn never actually reconfigured (config_ops_accepted={config_ops_accepted})"
+    );
+
+    assert!(
+        ok * 100 >= entries.len() * 80,
+        "liveness: only {ok}/{} ops Ok (<80%) — crypto-enabled cluster failed to progress under reconfig churn",
+        entries.len()
+    );
+    assert!(
+        elapsed < Duration::from_secs(budget_secs),
+        "crypto+reconfig-churn capstone took {elapsed:?} — exceeded the {budget_secs} s/seed budget \
+         (override via UC2_LIN_BUDGET_SECS)"
+    );
+
+    match check_register(&entries) {
+        Verdict::Linearizable => {}
+        Verdict::Violation => {
+            dump_history(&entries, seed);
+            panic!("LINEARIZABILITY VIOLATION under crypto+reconfig churn (seed={seed}); history dumped");
+        }
+        Verdict::Inconclusive => {
+            panic!("checker Inconclusive under crypto+reconfig churn (seed={seed}); raise THROTTLE / lower TARGET_OPS")
         }
     }
 }

@@ -22,6 +22,15 @@ JAVA_XMX="${ELLE_JAVA_XMX:-2g}"
 # ELLE_CARGO_FEATURES=--features\ mutation-testing). The mutation PROOF lives in
 # scripts/elle_mutation.sh; this stays empty for the normal clean tier.
 CARGO_FEATURES="${ELLE_CARGO_FEATURES:-}"
+# M8 Task 15: UC2_CRYPTO=1 re-runs every pass below with wire crypto Enabled
+# on every node (see uc2_node/tests/elle_v2.rs's crypto_from_env / lincheck_v2's
+# ClusterCfg::crypto). Inherited by the `cargo test` subshell below like any
+# other exported var — named here only so it shows up in the run's own log line
+# and so a history cached under a DIFFERENT ELLE_DIR is never silently reused
+# across the crypto/no-crypto boundary (the caller must point ELLE_DIR at a
+# fresh directory to force regeneration either way — see the pass-generation
+# loop's `[ ! -f "$hist" ]` check below).
+UC2_CRYPTO="${UC2_CRYPTO:-0}"
 
 PASSES=("$@")
 [ ${#PASSES[@]} -eq 0 ] && PASSES=(quiet failover partition purge reconfig)
@@ -71,9 +80,9 @@ require false "$(verdict "$STRICT_MODEL" "$FIX_RT")" "realtime fixture rejected 
 for pass in "${PASSES[@]}"; do
     hist="$ELLE_DIR/$pass/history.edn"
     if [ ! -f "$hist" ]; then
-        echo "== generating $pass history (elle_v2 driver) =="
+        echo "== generating $pass history (elle_v2 driver, crypto=$UC2_CRYPTO) =="
         # shellcheck disable=SC2086
-        (cd "$ROOT" && ELLE_DIR="$ELLE_DIR" cargo test -p uc2_node --release $CARGO_FEATURES \
+        (cd "$ROOT" && ELLE_DIR="$ELLE_DIR" UC2_CRYPTO="$UC2_CRYPTO" cargo test -p uc2_node --release $CARGO_FEATURES \
             --test elle_v2 -- --ignored --exact "elle_$pass" --nocapture)
     fi
     echo "== $pass: $(wc -l < "$hist") events =="
@@ -81,4 +90,4 @@ for pass in "${PASSES[@]}"; do
     require "true|" "$(classify "$STRICT_MODEL" "$hist")" "$pass clean under $STRICT_MODEL"
 done
 
-echo "elle consistency check passed (${PASSES[*]})"
+echo "elle consistency check passed (${PASSES[*]}, crypto=$UC2_CRYPTO)"

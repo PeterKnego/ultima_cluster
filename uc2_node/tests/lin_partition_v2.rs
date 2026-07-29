@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use lincheck_v2::{LinClusterV2, join_workers, serialize, spawn_workers};
+use lincheck_v2::{ClusterCfg, LinClusterV2, join_workers, serialize, spawn_workers};
 use uc2_net::fault::FaultConfig;
 use uc_lincheck::checker::{Verdict, check_register};
 use uc_lincheck::history::{Entry, History, Outcome};
@@ -103,10 +103,27 @@ impl Run {
     /// Boot a 3-node cluster (optionally with per-node `faults`), wait for a
     /// leader, and start the workers.
     fn start(seed: u64, faults: FaultConfig) -> Run {
+        Self::start_cfg(seed, faults, ClusterCfg::default())
+    }
+
+    /// As [`start`](Self::start) but with an explicit `ClusterCfg` (M8 Task
+    /// 15: the crypto-enabled scenario variants pass `crypto: true`). When
+    /// crypto is on, asserts the elected leader genuinely MINTED a group
+    /// epoch right after boot — proof the switch actually engaged, not just
+    /// that the cluster (harmlessly) still formed with it silently doing
+    /// nothing.
+    fn start_cfg(seed: u64, faults: FaultConfig, ccfg: ClusterCfg) -> Run {
         set_fast_client_timeout();
         let dir = tempdir();
-        let cluster = LinClusterV2::start(dir.path(), 3, faults);
-        cluster.await_single_serving(30);
+        let cluster = LinClusterV2::start_cfg(dir.path(), 3, faults, ccfg);
+        let leader0 = cluster.await_single_serving(30);
+        if ccfg.crypto {
+            assert!(
+                cluster.crypto_epoch_of(leader0).is_some(),
+                "crypto was configured but the elected leader never minted a group epoch — \
+                 wire crypto did not actually engage"
+            );
+        }
         let dirs = Arc::new(cluster.dirs());
         let history = Arc::new(History::default());
         let stop = Arc::new(AtomicBool::new(false));
@@ -132,8 +149,8 @@ impl Run {
 
 // ============================================================ 1. minority
 
-fn run_minority(seed: u64) -> Result<(), String> {
-    let r = Run::start(seed, FaultConfig::default());
+fn run_minority(seed: u64, ccfg: ClusterCfg) -> Result<(), String> {
+    let r = Run::start_cfg(seed, FaultConfig::default(), ccfg);
 
     std::thread::sleep(Duration::from_millis(1000)); // warm up
     let before = r.ok_now();
@@ -178,7 +195,7 @@ fn run_minority(seed: u64) -> Result<(), String> {
 fn minority_partition_and_heal() {
     let _g = serialize();
     for attempt in 1..=3 {
-        match run_minority(7) {
+        match run_minority(7, ClusterCfg::default()) {
             Ok(()) => return,
             Err(e) => eprintln!("[lin_partition_v2::minority] attempt {attempt}/3 transient: {e}"),
         }
@@ -186,10 +203,24 @@ fn minority_partition_and_heal() {
     panic!("minority: failed after 3 transient attempts");
 }
 
+/// M8 Task 15: same scenario, wire crypto `Enabled` on every node.
+#[test]
+fn minority_partition_and_heal_with_crypto() {
+    let _g = serialize();
+    let ccfg = ClusterCfg { crypto: true, ..ClusterCfg::default() };
+    for attempt in 1..=3 {
+        match run_minority(7, ccfg) {
+            Ok(()) => return,
+            Err(e) => eprintln!("[lin_partition_v2::minority-crypto] attempt {attempt}/3 transient: {e}"),
+        }
+    }
+    panic!("minority-with-crypto: failed after 3 transient attempts");
+}
+
 // ====================================================== 2. leader isolation
 
-fn run_leader_isolation(seed: u64) -> Result<(), String> {
-    let r = Run::start(seed, FaultConfig::default());
+fn run_leader_isolation(seed: u64, ccfg: ClusterCfg) -> Result<(), String> {
+    let r = Run::start_cfg(seed, FaultConfig::default(), ccfg);
 
     std::thread::sleep(Duration::from_millis(1000));
     let old_leader = r.cluster.leader().ok_or("no pre-partition leader")?;
@@ -250,7 +281,7 @@ fn run_leader_isolation(seed: u64) -> Result<(), String> {
 fn leader_isolation_elects_new_leader() {
     let _g = serialize();
     for attempt in 1..=3 {
-        match run_leader_isolation(42) {
+        match run_leader_isolation(42, ClusterCfg::default()) {
             Ok(()) => return,
             Err(e) => eprintln!("[lin_partition_v2::leader-isolation] attempt {attempt}/3 transient: {e}"),
         }
@@ -258,10 +289,26 @@ fn leader_isolation_elects_new_leader() {
     panic!("leader-isolation: failed after 3 transient attempts");
 }
 
+/// M8 Task 15: same scenario, wire crypto `Enabled` on every node.
+#[test]
+fn leader_isolation_elects_new_leader_with_crypto() {
+    let _g = serialize();
+    let ccfg = ClusterCfg { crypto: true, ..ClusterCfg::default() };
+    for attempt in 1..=3 {
+        match run_leader_isolation(42, ccfg) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("[lin_partition_v2::leader-isolation-crypto] attempt {attempt}/3 transient: {e}")
+            }
+        }
+    }
+    panic!("leader-isolation-with-crypto: failed after 3 transient attempts");
+}
+
 // ======================================================== 3. quorum loss
 
-fn run_quorum_loss(seed: u64) -> Result<(), String> {
-    let r = Run::start(seed, FaultConfig::default());
+fn run_quorum_loss(seed: u64, ccfg: ClusterCfg) -> Result<(), String> {
+    let r = Run::start_cfg(seed, FaultConfig::default(), ccfg);
 
     std::thread::sleep(Duration::from_millis(1000));
 
@@ -297,12 +344,26 @@ fn run_quorum_loss(seed: u64) -> Result<(), String> {
 fn total_quorum_loss_fails_clean_then_recovers() {
     let _g = serialize();
     for attempt in 1..=3 {
-        match run_quorum_loss(88_888) {
+        match run_quorum_loss(88_888, ClusterCfg::default()) {
             Ok(()) => return,
             Err(e) => eprintln!("[lin_partition_v2::quorum-loss] attempt {attempt}/3 transient: {e}"),
         }
     }
     panic!("quorum-loss: failed after 3 transient attempts");
+}
+
+/// M8 Task 15: same scenario, wire crypto `Enabled` on every node.
+#[test]
+fn total_quorum_loss_fails_clean_then_recovers_with_crypto() {
+    let _g = serialize();
+    let ccfg = ClusterCfg { crypto: true, ..ClusterCfg::default() };
+    for attempt in 1..=3 {
+        match run_quorum_loss(88_888, ccfg) {
+            Ok(()) => return,
+            Err(e) => eprintln!("[lin_partition_v2::quorum-loss-crypto] attempt {attempt}/3 transient: {e}"),
+        }
+    }
+    panic!("quorum-loss-with-crypto: failed after 3 transient attempts");
 }
 
 // ========================================================= 4. lossy links

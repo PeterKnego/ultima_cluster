@@ -13,11 +13,12 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use uc2_consensus::election::NodeId;
 use uc2_net::fault::FaultConfig;
-use uc2_node::{Node, NodeConfig};
+use uc2_node::{CryptoConfig, Node, NodeConfig};
 
 #[derive(Parser)]
 struct Args {
@@ -33,6 +34,15 @@ struct Args {
     /// Defaults to a single-node cluster of just `--id` at `--bind`.
     #[arg(long)]
     members: Option<String>,
+    /// M8 Task 15 (UC2_CRYPTO=1 path): this node's X25519 private key file.
+    /// Must be paired with `--crypto-allowlist`; when either is absent the
+    /// node boots with `CryptoConfig::Disabled` (the pre-M8 default).
+    #[arg(long)]
+    crypto_key: Option<PathBuf>,
+    /// M8 Task 15: the shared allowlist naming every trusted peer's public
+    /// key. See `--crypto-key`.
+    #[arg(long)]
+    crypto_allowlist: Option<PathBuf>,
 }
 
 fn parse_members(s: &str) -> Vec<(NodeId, SocketAddr)> {
@@ -66,6 +76,18 @@ fn main() -> anyhow::Result<()> {
         None => vec![(args.id, args.bind)],
     };
 
+    // M8 Task 15: crypto ON iff BOTH a key and an allowlist were given.
+    let crypto = match (&args.crypto_key, &args.crypto_allowlist) {
+        (Some(key_path), Some(allowlist_path)) => CryptoConfig::Enabled {
+            key_path: key_path.clone(),
+            allowlist_path: allowlist_path.clone(),
+            rotation: uc2_crypto::rotation::RotationPolicy::default(),
+        },
+        _ => CryptoConfig::Disabled,
+    };
+    let crypto_enabled = matches!(crypto, CryptoConfig::Enabled { .. });
+
+    let instance_dir = args.instance_dir.clone();
     let cfg = NodeConfig {
         id: args.id,
         members,
@@ -82,13 +104,29 @@ fn main() -> anyhow::Result<()> {
         purge: uc2_node::PurgePolicy::Disabled,
         learners: Vec::new(),
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
-        crypto: uc2_node::CryptoConfig::Disabled,
+        crypto,
     };
 
-    let _node = Node::start(cfg)?;
-    // Park forever: the node's agent threads keep running in the background;
-    // this process is torn down by a real SIGKILL from the test harness.
+    let node = Node::start(cfg)?;
+    // Anti-vacuity signal (M8 Task 15): a real crypto epoch is a LEADER-ONLY
+    // mint (`Node::crypto_epoch`'s doc), so this only fires once this process
+    // actually wins an election under crypto — proof wire crypto genuinely
+    // engaged, not merely that `--crypto-key`/`--crypto-allowlist` were
+    // parsed. The test harness (a SEPARATE process, no `Node` handle) polls
+    // for this sentinel file on disk rather than piping/parsing stdout.
+    // Harmless overhead when crypto is disabled (`crypto_epoch()` always
+    // `None` then, so the loop body below never writes).
+    let mut last_epoch: Option<u16> = None;
     loop {
-        std::thread::park();
+        if crypto_enabled
+            && let Some(e) = node.crypto_epoch()
+            && last_epoch != Some(e)
+        {
+            let _ = std::fs::write(instance_dir.join("crypto_epoch_active"), e.to_string());
+            last_epoch = Some(e);
+        }
+        // Not a park(): this process is torn down by a real SIGKILL from the
+        // test harness, but while alive it polls its own crypto epoch.
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
