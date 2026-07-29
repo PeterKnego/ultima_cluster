@@ -142,6 +142,14 @@ impl FaultSocket {
     pub fn set_faults(&mut self, cfg: FaultConfig) {
         self.rng = XorShift64::new(cfg.seed);
         self.cfg = cfg;
+        // M8 Task 14 review (M-3): a reconfiguration is a fresh seeded run —
+        // leftover `held`/`history` state from a PRIOR `FaultConfig` would
+        // let a later `replay_per_million` pick up (or a later `reorder_
+        // per_million` flush) a datagram sent under a completely different
+        // configuration, breaking the "one seed, one deterministic sequence"
+        // contract this whole module exists for.
+        self.held = None;
+        self.history.clear();
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -425,26 +433,6 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_at_zero_never_touches_the_rng_or_the_datagram() {
-        // The discriminating property for the "costs nothing by default"
-        // claim: with corrupt_per_million at its Default (0), the received
-        // bytes are byte-identical AND the drop-sequence RNG draw is
-        // unperturbed (same shape as `empty_partition_set_does_not_consume_rng`).
-        let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
-        let to = rx.local_addr().unwrap();
-        let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
-        tx.set_faults(FaultConfig { seed: 99, drop_per_million: 500_000, ..Default::default() });
-        for i in 0..100u8 {
-            tx.send_to(&[i], to).unwrap();
-        }
-        let mut rng = XorShift64::new(99);
-        let expected: Vec<Vec<u8>> =
-            (0..100u8).filter(|_| !rng.chance(500_000)).map(|i| vec![i]).collect();
-        let got = recv_all(&rx, expected.len());
-        assert_eq!(got, expected, "corrupt_per_million=0 must be byte-for-byte inert");
-    }
-
-    #[test]
     fn replay_redelivers_a_stashed_datagram_in_addition_to_the_current_one() {
         let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
         let to = rx.local_addr().unwrap();
@@ -461,7 +449,17 @@ mod tests {
     }
 
     #[test]
-    fn replay_at_zero_never_records_history_or_touches_the_rng() {
+    fn corrupt_and_replay_knobs_at_zero_are_byte_for_byte_inert() {
+        // The discriminating property for the "costs nothing by default"
+        // claim on BOTH new knobs at once (merged from two near-duplicate
+        // tests during T14 review — each on its own was byte-for-byte the
+        // pre-existing `empty_partition_set_does_not_consume_rng`, testing
+        // only that leaving the OTHER (drop) knob's sequence undisturbed;
+        // the only genuinely new signal was `history.is_empty()`, kept
+        // here): with `corrupt_per_million`/`replay_per_million` at their
+        // Default (0), the received bytes are byte-identical to a plain
+        // seeded drop run, the drop-sequence RNG draw is unperturbed, and no
+        // replay history is ever recorded.
         let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
         let to = rx.local_addr().unwrap();
         let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
@@ -473,7 +471,7 @@ mod tests {
         let expected: Vec<Vec<u8>> =
             (0..100u8).filter(|_| !rng.chance(500_000)).map(|i| vec![i]).collect();
         let got = recv_all(&rx, expected.len());
-        assert_eq!(got, expected, "replay_per_million=0 must be byte-for-byte inert");
+        assert_eq!(got, expected, "corrupt/replay at 0 must be byte-for-byte inert");
         assert!(tx.history.is_empty(), "replay_per_million=0 must never record history");
     }
 }

@@ -90,13 +90,19 @@ fn serialize() -> MutexGuard<'static, ()> {
 
 // ------------------------------------------------------------ fixtures
 
-fn scratch_dir(tag: &str) -> PathBuf {
+/// Returns the `TempDir` itself (T14 review, M-1) — NOT `.keep()`'d. The
+/// first version of this file leaked a whole tempdir per test run
+/// (~200 MB), which drove the shared dev box to 91% disk before it was
+/// caught; every call site now holds the returned value as `dir_handle` for
+/// the test's whole lifetime (`let dir = dir_handle.path();` for the `&Path`
+/// every existing call site already expects) so the directory is reclaimed
+/// on drop, exactly like `crypto_cluster.rs`'s own `_dir: tempfile::TempDir`.
+fn scratch_dir(tag: &str) -> tempfile::TempDir {
     let dir = tempfile::Builder::new()
         .prefix(&format!("uc2-adv-{tag}-"))
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .expect("tempdir")
-        .keep();
-    assert!(!dir.starts_with("/tmp"), "test scratch must not live on tmpfs");
+        .expect("tempdir");
+    assert!(!dir.path().starts_with("/tmp"), "test scratch must not live on tmpfs");
     dir
 }
 
@@ -386,11 +392,12 @@ impl FakePeer {
 #[test]
 fn a_replayed_vote_cannot_be_recounted() {
     let _g = serialize();
-    let dir = scratch_dir("replay-vote");
+    let dir_handle = scratch_dir("replay-vote");
+    let dir = dir_handle.path();
     let victim_priv = [0x51u8; 32];
     let voter_priv = [0x52u8; 32];
-    let victim_pub = identity_public(&dir, "victim-pub-probe", victim_priv);
-    let voter_pub = identity_public(&dir, "voter-pub-probe", voter_priv);
+    let victim_pub = identity_public(dir, "victim-pub-probe", victim_priv);
+    let voter_pub = identity_public(dir, "voter-pub-probe", voter_priv);
 
     // Bind the victim's socket first so `FakePeer`s can address it, and
     // reserve a THIRD member slot that never comes up (majority is 2 of 3,
@@ -400,14 +407,14 @@ fn a_replayed_vote_cannot_be_recounted() {
     let victim_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let victim_addr = victim_sock.local_addr().unwrap();
 
-    let mut peer1 = FakePeer::new(&dir, "peer1", 1, voter_priv, 0, victim_addr, victim_pub);
+    let mut peer1 = FakePeer::new(dir, "peer1", 1, voter_priv, 0, victim_addr, victim_pub);
     let members = vec![(0, victim_addr), (1, peer1.addr()), (2, dead_slot)];
     let allowlist = [(1u32, voter_pub)];
     let key_path = dir.join("victim.key");
     write_key_file(&key_path, victim_priv);
     let allowlist_path = dir.join("victim.allowlist");
     write_allowlist(&allowlist_path, &allowlist);
-    let cfg = victim_config(0, members, &dir, key_path, allowlist_path, FaultConfig::default());
+    let cfg = victim_config(0, members, dir, key_path, allowlist_path, FaultConfig::default());
     let victim = Node::start_with_socket(cfg, victim_sock).expect("victim boots");
 
     assert!(peer1.try_establish(Duration::from_secs(10)), "the honest peer must establish");
@@ -475,24 +482,40 @@ fn a_replayed_vote_cannot_be_recounted() {
 #[test]
 fn a_peer_removed_from_the_allowlist_cannot_re_establish() {
     let _g = serialize();
-    let dir = scratch_dir("revoke-peer");
+    let dir_handle = scratch_dir("revoke-peer");
+    let dir = dir_handle.path();
     let victim_priv = [0x61u8; 32];
     let peer_priv = [0x62u8; 32];
-    let victim_pub = identity_public(&dir, "victim-pub", victim_priv);
-    let peer_pub = identity_public(&dir, "peer-pub", peer_priv);
+    let victim_pub = identity_public(dir, "victim-pub", victim_priv);
+    let peer_pub = identity_public(dir, "peer-pub", peer_priv);
 
     let dead_slot = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
     let victim_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let victim_addr = victim_sock.local_addr().unwrap();
 
-    let mut peer_v1 = FakePeer::new(&dir, "peer-v1", 2, peer_priv, 0, victim_addr, victim_pub);
+    let mut peer_v1 = FakePeer::new(dir, "peer-v1", 2, peer_priv, 0, victim_addr, victim_pub);
     let members = vec![(0, victim_addr), (1, dead_slot), (2, peer_v1.addr())];
     let key_path = dir.join("victim.key");
     write_key_file(&key_path, victim_priv);
     let allowlist_path = dir.join("victim.allowlist");
-    write_allowlist(&allowlist_path, &[(2u32, peer_pub)]);
+    // T14 review, I-2: id 1 (`dead_slot`) MUST be allowlisted with SOME
+    // well-formed key even though nothing ever legitimately dials from it.
+    // Without this, the victim's own proactive `gossip_targets` dialing
+    // (`Peers::initiate`) refuses id 1 on its OWN allowlist-presence check
+    // every retry cycle (a few times a second) and bumps
+    // `crypto_handshake_failures` purely as background noise, unrelated to
+    // any attack — the reviewer reproduced `delta=3` over this test's own
+    // window with NO attacker present at all, which would have made the
+    // "actively refused" assertion below pass regardless of whether the
+    // revocation check does anything. With id 1 allowlisted, `initiate`
+    // proceeds normally (an unanswered `HS_INIT` into a dead address is
+    // silent retries, never a `Failed` action), so `crypto_handshake_
+    // failures` moves ONLY when this test's own revoked-peer dial is
+    // refused.
+    let dead_slot_dummy_pub = [0x33u8; 32]; // never a real key; nothing ever authenticates as id 1
+    write_allowlist(&allowlist_path, &[(1u32, dead_slot_dummy_pub), (2u32, peer_pub)]);
     let cfg =
-        victim_config(0, members.clone(), &dir, key_path, allowlist_path.clone(), FaultConfig::default());
+        victim_config(0, members.clone(), dir, key_path, allowlist_path.clone(), FaultConfig::default());
     let victim = Node::start_with_socket(cfg, victim_sock).expect("victim boots");
 
     // Proves the key is genuinely legitimate (not vacuously-invalid fixture
@@ -500,8 +523,12 @@ fn a_peer_removed_from_the_allowlist_cannot_re_establish() {
     assert!(peer_v1.try_establish(Duration::from_secs(10)), "the real key must establish while allowlisted");
     assert!(victim.has_crypto_session_with(2));
 
-    // Revoke: rewrite the allowlist file WITHOUT node 2's entry.
-    write_allowlist(&allowlist_path, &[]);
+    // Revoke: rewrite the allowlist file WITHOUT node 2's entry. Id 1's
+    // dummy entry STAYS — dropping it here would reopen exactly the I-2
+    // background-noise hole (the victim's own dial to `dead_slot` would
+    // start refusing on ITS OWN allowlist check again, contaminating the
+    // very delta this test measures right after this point).
+    write_allowlist(&allowlist_path, &[(1u32, dead_slot_dummy_pub)]);
     // `Allowlist::reload_if_stale`'s minimum interval is 1s (identity.rs);
     // the live node's crypto-maintenance pass polls it every 20ms, so
     // sleeping past 1s guarantees at least one reload attempt has run.
@@ -519,7 +546,7 @@ fn a_peer_removed_from_the_allowlist_cannot_re_establish() {
     let peer2_slot = peer_v1.addr();
     drop(peer_v1);
     let mut peer_v2 =
-        FakePeer::new_at(&dir, "peer-v2", 2, peer_priv, 0, victim_addr, victim_pub, peer2_slot);
+        FakePeer::new_at(dir, "peer-v2", 2, peer_priv, 0, victim_addr, victim_pub, peer2_slot);
     assert_eq!(peer_v2.addr(), peer2_slot, "must redial from id 2's exact registered slot");
     let established = peer_v2.try_establish(Duration::from_secs(5));
 
@@ -533,29 +560,77 @@ fn a_peer_removed_from_the_allowlist_cannot_re_establish() {
     victim.stop();
 }
 
+/// T14 review, I-2 regression pin: the SAME fixture as the test above,
+/// minus the attack — proving `crypto_handshake_failures` has zero
+/// background rate on its own (id 1's dead slot is now allowlisted with a
+/// dummy key precisely so the victim's own proactive dialing never refuses
+/// itself). Before this fix the reviewer measured `delta=3` here with NO
+/// attacker present at all, which meant the "actively refused" assertion in
+/// the test above could never have failed regardless of whether revocation
+/// worked. If this test ever goes red, the fix above has regressed and that
+/// assertion is worthless again.
+#[test]
+fn a_revoked_peer_fixture_has_zero_handshake_failure_background_rate() {
+    let _g = serialize();
+    let dir_handle = scratch_dir("revoke-peer-control");
+    let dir = dir_handle.path();
+    let victim_priv = [0x61u8; 32];
+    let peer_priv = [0x62u8; 32];
+    let victim_pub = identity_public(dir, "victim-pub", victim_priv);
+    let peer_pub = identity_public(dir, "peer-pub", peer_priv);
+
+    let dead_slot = UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    let victim_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let victim_addr = victim_sock.local_addr().unwrap();
+
+    let peer_v1 = FakePeer::new(dir, "peer-v1", 2, peer_priv, 0, victim_addr, victim_pub);
+    let members = vec![(0, victim_addr), (1, dead_slot), (2, peer_v1.addr())];
+    let key_path = dir.join("victim.key");
+    write_key_file(&key_path, victim_priv);
+    let allowlist_path = dir.join("victim.allowlist");
+    let dead_slot_dummy_pub = [0x33u8; 32];
+    write_allowlist(&allowlist_path, &[(1u32, dead_slot_dummy_pub), (2u32, peer_pub)]);
+    let cfg =
+        victim_config(0, members.clone(), dir, key_path, allowlist_path.clone(), FaultConfig::default());
+    let victim = Node::start_with_socket(cfg, victim_sock).expect("victim boots");
+
+    // Let the victim settle (its own handshakes with peer_v1's real slot
+    // complete) before sampling, then watch for the same ~5s window the
+    // real attack's dial takes.
+    std::thread::sleep(Duration::from_millis(1_200));
+    let f0 = victim.crypto_handshake_failures();
+    std::thread::sleep(Duration::from_secs(5));
+    let f1 = victim.crypto_handshake_failures();
+    assert_eq!(f1, f0, "background handshake-failure rate must be zero with no attacker present");
+
+    victim.stop();
+}
+
 /// **An impostor cannot borrow a peer's identity slot** — the Task 6
 /// finding this brief calls out by name: a Noise-IK responder learns the
 /// initiator's static key from message 1, so "the key decrypts" is not
-/// proof of identity. Two independent sub-attacks, matching the two checks
-/// the fix added (`handshake.rs` module docs: `get_remote_static()` vs
-/// `Allowlist::lookup`, plus binding the claimed id to the transport
-/// source):
+/// proof of identity. Two sub-attacks:
 ///
 /// (a) a brand-new, nowhere-allowlisted keypair claims the id that matches
-///     its OWN address slot exactly — refused by the key-vs-allowlist check
-///     (claimed id and transport source agree; the key itself is wrong).
-/// (b) a REAL, validly-allowlisted key (peer 1's) claims ITS OWN true id
-///     while physically sending from the address slot the victim has
-///     registered for a DIFFERENT peer (2) — refused by the claimed-id-vs-
-///     transport-source binding (the key is genuine; the slot is wrong).
+///     its OWN address slot exactly (claimed id and transport source
+///     agree) — refused by the key-vs-allowlist check
+///     (`get_remote_static()` vs `Allowlist::lookup`): the key itself is
+///     wrong for that slot.
+/// (b) a real, validly-allowlisted-under-a-different-id key claims ITS OWN
+///     true id while physically sending from the address slot the victim
+///     has registered for a DIFFERENT id — refused, but **not proven to be
+///     isolated to the claimed-id-vs-transport-source binding check** (see
+///     the correction at its construction site below; this was originally
+///     over-claimed and was corrected during T14 review, I-3).
 #[test]
 fn an_impostor_cannot_borrow_a_peers_identity_slot() {
     let _g = serialize();
-    let dir = scratch_dir("impostor");
+    let dir_handle = scratch_dir("impostor");
+    let dir = dir_handle.path();
     let victim_priv = [0x71u8; 32];
     let peer2_priv = [0x73u8; 32]; // genuinely allowlisted under id 2
-    let victim_pub = identity_public(&dir, "victim-pub", victim_priv);
-    let peer2_pub = identity_public(&dir, "peer2-pub", peer2_priv);
+    let victim_pub = identity_public(dir, "victim-pub", victim_priv);
+    let peer2_pub = identity_public(dir, "peer2-pub", peer2_priv);
 
     let victim_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let victim_addr = victim_sock.local_addr().unwrap();
@@ -583,7 +658,7 @@ fn an_impostor_cannot_borrow_a_peers_identity_slot() {
     // Genuinely allowlisted under its TRUE id — the allowlist alone must
     // not be enough to let either impostor in.
     write_allowlist(&allowlist_path, &[(2u32, peer2_pub)]);
-    let cfg = victim_config(9, members, &dir, key_path, allowlist_path.clone(), FaultConfig::default());
+    let cfg = victim_config(9, members, dir, key_path, allowlist_path.clone(), FaultConfig::default());
     let victim = Node::start_with_socket(cfg, victim_sock).expect("victim boots");
 
     // Sub-attack (a): a fresh, unrelated keypair claims id 2 while sitting
@@ -593,7 +668,7 @@ fn an_impostor_cannot_borrow_a_peers_identity_slot() {
     let f0 = victim.crypto_handshake_failures();
     let random_priv = [0x99u8; 32];
     let mut impostor_a =
-        FakePeer::new_at(&dir, "impostor-a", 2, random_priv, 9, victim_addr, victim_pub, slot2_addr);
+        FakePeer::new_at(dir, "impostor-a", 2, random_priv, 9, victim_addr, victim_pub, slot2_addr);
     assert_eq!(impostor_a.addr(), slot2_addr, "must occupy id 2's exact registered slot");
     let est_a = impostor_a.try_establish(Duration::from_secs(4));
     assert!(!est_a, "a key that does not match id 2's allowlisted key must be refused");
@@ -602,19 +677,38 @@ fn an_impostor_cannot_borrow_a_peers_identity_slot() {
     assert!(f1 > f0, "sub-attack (a) must have been actively refused, not just silently absent");
     drop(impostor_a); // free slot2_addr's port for sub-attack (b)
 
-    // Sub-attack (b): a REAL, validly-allowlisted-elsewhere key (peer 2's
-    // own real key would trivially work here, so use a genuinely different,
-    // real identity: reuse the random keypair from (a), but this time claim
-    // an id (1) that does NOT match the slot it is sent from (2) — the
-    // pure claimed-id-vs-transport-source binding, isolated from the
-    // key-vs-allowlist check (a already covers that one; this key is not
-    // even allowlisted under EITHER id, so if the claimed-id check were
-    // missing, this would fail the very next check instead — deliberately
-    // not what we are pinning here. To isolate the binding check
-    // specifically, give the victim a genuine allowlist entry for id 1 too,
-    // so the ONLY thing wrong with this attempt is the slot mismatch.
+    // Sub-attack (b): peer 1's real, genuinely-allowlisted-under-id-1 key,
+    // claiming its own true id (1) but sent from the address slot the
+    // victim has registered for id 2.
+    //
+    // CORRECTED CLAIM (T14 review, I-3 — the original comment here claimed
+    // this "isolates" the claimed-id-vs-transport-source binding check from
+    // the key-vs-allowlist check; that is WRONG and was disproven by the
+    // reviewer). `on_init`'s `expected_public` is looked up by `from` — the
+    // TRANSPORT-resolved id (2 here), never the claimed id — so adding an
+    // allowlist entry for id 1 changes nothing about what this attempt is
+    // checked against: `expected_public` is still peer 2's key, and the
+    // presented key is peer 1's, so the key-vs-allowlist check ALSO refuses
+    // this attempt on its own. The reviewer confirmed by deleting
+    // `claimed_id != from` from both `on_init` and `on_resp`: all tests in
+    // this file stay green, and the refusal reason silently changes from
+    // "claims a different node id" to "static key does not match the
+    // allowlist" — proving the claimed-id binding is NOT what this
+    // sub-attack's assertions actually depend on.
+    //
+    // This sub-attack therefore still demonstrates a real, useful property
+    // (a real key at the wrong slot is refused, full stop) but does NOT
+    // isolate the claimed-id-vs-transport-source check specifically. Doing
+    // that would require an attacker who already holds the REAL key for the
+    // slot they occupy (id 2's real key here) while claiming a different
+    // id — which means holding a genuine cluster member's private key, the
+    // "malicious cluster member" case this file's own threat model
+    // explicitly places out of scope. Whether that check is independently
+    // isolatable AT ALL within the stated threat model (attacker holds no
+    // node's private key) is therefore left an open question rather than
+    // forced into a test that would not actually mean what its name claims.
     let peer1_priv = [0x74u8; 32];
-    let peer1_pub = identity_public(&dir, "peer1-pub", peer1_priv);
+    let peer1_pub = identity_public(dir, "peer1-pub", peer1_priv);
     write_allowlist(&allowlist_path, &[(1u32, peer1_pub), (2u32, peer2_pub)]);
     // Force the reload the victim's own maintenance pass will otherwise
     // pick up on its own cadence (same 1s minimum interval as the
@@ -622,7 +716,7 @@ fn an_impostor_cannot_borrow_a_peers_identity_slot() {
     std::thread::sleep(Duration::from_millis(1_200));
 
     let mut impostor_b =
-        FakePeer::new_at(&dir, "impostor-b", 1, peer1_priv, 9, victim_addr, victim_pub, slot2_addr);
+        FakePeer::new_at(dir, "impostor-b", 1, peer1_priv, 9, victim_addr, victim_pub, slot2_addr);
     assert_eq!(impostor_b.addr(), slot2_addr, "must occupy id 2's exact registered slot");
     // Not asserted: `impostor_b.transport.is_established(9)`. The victim's
     // OWN proactive dial to id 2's slot (`gossip_targets`, unrelated to
@@ -651,7 +745,8 @@ fn an_impostor_cannot_borrow_a_peers_identity_slot() {
 #[test]
 fn a_downgrade_to_cleartext_is_refused() {
     let _g = serialize();
-    let dir = scratch_dir("cleartext-downgrade");
+    let dir_handle = scratch_dir("cleartext-downgrade");
+    let dir = dir_handle.path();
     let victim_priv = [0x81u8; 32];
     let attacker_addr_holder = UdpSocket::bind("127.0.0.1:0").unwrap();
     let registered_addr = attacker_addr_holder.local_addr().unwrap();
@@ -667,7 +762,7 @@ fn a_downgrade_to_cleartext_is_refused() {
     // the attacker below never attempts a handshake at all, it only injects
     // DATA-shaped bytes claiming to originate from that registered address.
     write_allowlist(&allowlist_path, &[(1u32, [0x22; 32])]);
-    let cfg = victim_config(0, members, &dir, key_path, allowlist_path, FaultConfig::default());
+    let cfg = victim_config(0, members, dir, key_path, allowlist_path, FaultConfig::default());
     let victim = Node::start_with_socket(cfg, victim_sock).expect("victim boots");
 
     let append_before = victim.counters().append.load_acquire();
@@ -731,6 +826,56 @@ fn a_downgrade_to_cleartext_is_refused() {
     assert!(
         victim.crypto_stats().dropped_unknown_peer.load(Relaxed) > unknown_peer_before,
         "case C (unregistered sender) must have been rejected too"
+    );
+
+    // Case D — T14 review, I-4: the brief's OWN stated property is "must
+    // not reach the log buffer OR THE CONSENSUS EVENT ROUTE" (emphasis the
+    // brief's), and cases A-C only ever exercise the log buffer. Kinds 5-11
+    // (APPEND_POSITION/COMMIT_POSITION/REQUEST_VOTE/VOTE/TERM_MAP/
+    // READ_PROBE/READ_PROBE_ACK) are forwarded to the consensus agent RAW,
+    // before DATA's incidental (and here irrelevant) term-staleness gate —
+    // so a cleartext-downgrade bypass that happened to leave DATA harmless
+    // (case A/B's `append` assertion can pass for the WRONG reason: a
+    // forged `leadership_term_id: 0` gets absorbed by `dropped_stale_term`
+    // regardless of whether crypto ever ran) would still be free to hijack
+    // an election via this route. A cleartext `REQUEST_VOTE` claiming a
+    // term far beyond anything a short test window could reach by natural
+    // election churn (this victim never has a real quorum partner, so it
+    // legitimately re-campaigns and its own term DOES grow on its own —
+    // this must tolerate that, not assume a frozen term).
+    let term_before_d = victim.current_term();
+    let injected_term = term_before_d + 1000;
+    let mut rv_body = [0u8; uc_protocol::v2::datagram::REQUEST_VOTE_BODY_LEN];
+    uc_protocol::v2::datagram::write_request_vote_body(
+        &mut rv_body,
+        &RequestVoteBody { new_term: injected_term, last_term: 0, last_durable: 0 },
+    );
+    let mut rv_dgram = vec![0u8; DATAGRAM_HEADER_LEN + rv_body.len()];
+    write_datagram_header(
+        &mut rv_dgram,
+        &DatagramHeader {
+            position: 0,
+            leadership_term_id: injected_term,
+            kind: DGRAM_KIND_REQUEST_VOTE,
+            flags: 0,
+            key_epoch: 0,
+        },
+    );
+    rv_dgram[DATAGRAM_HEADER_LEN..].copy_from_slice(&rv_body);
+    assert!(
+        rv_dgram.len() < DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD,
+        "must be shorter than any real seal, same shape as case A"
+    );
+    registered.send_to(&rv_dgram, victim_addr).unwrap();
+
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        victim.current_term() < term_before_d + 500,
+        "a cleartext REQUEST_VOTE must not hijack the term toward the injected value (before {}, \
+         injected {}, now {})",
+        term_before_d,
+        injected_term,
+        victim.current_term()
     );
 
     victim.stop();
@@ -799,6 +944,16 @@ fn spawn_storm_cluster(faults: FaultConfig) -> (tempfile::TempDir, Vec<Node>, Ve
         write_allowlist(&allowlist_path, &allowlist);
         let instance_dir = dir.path().join(format!("n{i}"));
         dirs.push(instance_dir.clone());
+        // T14 review, M-7: every node's `FaultSocket` otherwise shared the
+        // SAME `faults.seed`, so their corrupt/replay draw sequences were
+        // correlated (each XorShift64 instance starts from identical
+        // state) rather than independent — derive a distinct per-node seed
+        // the same way `crypto_cluster.rs`'s own election-seed derivation
+        // does, so the three nodes' hostile-wire noise is uncorrelated.
+        let node_faults = FaultConfig {
+            seed: faults.seed ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            ..faults
+        };
         let cfg = NodeConfig {
             id: i as u32,
             members: members.clone(),
@@ -812,7 +967,7 @@ fn spawn_storm_cluster(faults: FaultConfig) -> (tempfile::TempDir, Vec<Node>, Ve
             election_timeout_min_ns: 150_000_000,
             election_timeout_max_ns: 300_000_000,
             seed: 0xA1B2_C3D4 ^ i as u64,
-            faults,
+            faults: node_faults,
             purge: uc2_node::PurgePolicy::Disabled,
             journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
             crypto: CryptoConfig::Enabled {
@@ -907,60 +1062,120 @@ fn heavy_corruption_and_replay_injection_never_panics_and_never_diverges() {
         let _ = n.wipes();
     }
 
+    // T14 review, C-1 (CRITICAL, fixed): the floor of bytes a node has BOTH
+    // quorum-committed AND durably recorded to its OWN log — what `apply`
+    // actually reads (`min(commit, durable)`), never raw gossiped `commit`
+    // alone. `Event::CommitGossip` sets `commit_seen`/emits `AdvanceCommit`
+    // with NO clamp to the receiver's own `durable`/`append` (every real
+    // consumer clamps downstream instead), so "commit >= target" does NOT
+    // mean a node holds those bytes yet — it can legitimately be up to one
+    // fsync/replication cycle behind its own gossiped commit. Reading past
+    // `durable` there is reading never-written buffer, not divergence.
+    fn readable_floor(n: &Node) -> u64 {
+        let c = n.counters();
+        c.commit.load_acquire().min(c.durable.load_acquire())
+    }
+
     // Quiesce: give the cluster a window to settle on a single leader and
-    // converge commit positions, without the storm having been turned off
+    // converge readable floors, without the storm having been turned off
     // — the property is "never diverges under load," not "converges once
     // calm."
     let settle_deadline = Instant::now() + Duration::from_secs(60);
     let target = loop {
         if let Some(leader) = nodes.iter().position(|n| n.can_serve()) {
-            let target = nodes[leader].counters().commit.load_acquire();
+            let target = readable_floor(&nodes[leader]);
             if target > 0 {
                 break target;
             }
         }
-        assert!(Instant::now() < settle_deadline, "no serving leader with committed bytes ever emerged");
+        assert!(
+            Instant::now() < settle_deadline,
+            "no serving leader with committed+durable bytes ever emerged"
+        );
         std::thread::yield_now();
     };
     loop {
         let laggards: Vec<usize> =
-            (0..nodes.len()).filter(|&i| nodes[i].counters().commit.load_acquire() < target).collect();
+            (0..nodes.len()).filter(|&i| readable_floor(&nodes[i]) < target).collect();
         if laggards.is_empty() {
             break;
         }
         assert!(
             Instant::now() < settle_deadline,
-            "nodes {laggards:?} never converged to commit {target} under the storm"
+            "nodes {laggards:?} never converged to a readable floor of {target} under the storm"
         );
         std::thread::yield_now();
     }
 
     // Divergence check: every node's committed frame content up to the
-    // converged floor must agree byte-for-byte, not just the position.
-    let mut sample = Vec::new();
-    let mut pos = 0u64;
-    while pos < target {
-        let mut refs: Vec<Vec<u8>> = Vec::with_capacity(nodes.len());
-        for n in &nodes {
+    // converged floor must agree byte-for-byte. Walks REAL frame
+    // boundaries via `align_frame_len(header.length)` — T14 review, C-1
+    // (CRITICAL, fixed): the original version strode a fixed 256 bytes,
+    // which violates `read_frame_validated`'s own documented contract
+    // ("pos must be a frame start"; a mid-frame `pos` "misreads a payload
+    // byte as the length word ... garbage") and only accidentally landed on
+    // real frame starts when every frame happened to be exactly 256/n
+    // bytes. Leader churn under the storm appends 32-byte `NEW_TERM`
+    // frames; an odd count of those shifts every later frame off any fixed
+    // stride, and the resulting garbage read (`len_read=256, type_read=0`
+    // in the diagnosed failure — neither a real length nor a valid
+    // `FRAME_TYPE`) spanned mid-frame past one node's real `append` into
+    // its never-initialized buffer tail, manufacturing a "divergence" that
+    // was never real.
+    /// Reads a frame at `pos` on `n`, briefly retrying `NotCommitted`/
+    /// `Overrun` before treating it as a genuine anomaly. `pos < target`
+    /// (every node's own converged `min(commit, durable)`) SHOULD make
+    /// this always succeed on the first try — a node reporting otherwise
+    /// there is exactly the ambiguity the ORIGINAL, pre-fix `target`
+    /// computation allowed and this fix removes — but a tiny window
+    /// between a counter's release-store and this thread's next poll is
+    /// cheap insurance against turning an unrelated scheduling hiccup into
+    /// a false failure, which would itself be a false alarm on the very
+    /// property this fix targets.
+    fn read_frame_with_retry(n: &Node, pos: u64) -> (uc_protocol::v2::frame::FrameHeader, Vec<u8>) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
             let mut out = Vec::new();
             match n.read_frame_validated(pos, &mut out) {
-                uc2_log::buffer::FrameRead::Frame(_) => refs.push(out),
-                _ => refs.push(Vec::new()), // not yet visible locally is fine below target check tolerance
+                uc2_log::buffer::FrameRead::Frame(h) => return (h, out),
+                other => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "node reported {other:?} at position {pos} < converged readable floor, \
+                         still not Frame after 2s of retrying"
+                    );
+                    std::thread::yield_now();
+                }
             }
-        }
-        let non_empty: Vec<&Vec<u8>> = refs.iter().filter(|r| !r.is_empty()).collect();
-        if non_empty.len() >= 2 {
-            let first = non_empty[0];
-            for other in &non_empty[1..] {
-                assert_eq!(first, *other, "divergent committed content at position {pos}");
-            }
-        }
-        sample.push(pos);
-        pos += 256; // coarse stride; exact frame boundaries are handled by read_frame_validated
-        if sample.len() > 200 {
-            break; // bounded sampling cost
         }
     }
+
+    let mut pos = 0u64;
+    let mut frames_compared = 0usize;
+    const MAX_FRAMES: usize = 50_000; // generous; a real divergence would show far sooner
+    while pos < target && frames_compared < MAX_FRAMES {
+        let mut refs: Vec<Vec<u8>> = Vec::with_capacity(nodes.len());
+        let mut step: Option<u64> = None;
+        for n in &nodes {
+            let (h, out) = read_frame_with_retry(n, pos);
+            if step.is_none() {
+                step = Some(uc_protocol::v2::frame::align_frame_len(h.length as usize) as u64);
+            }
+            refs.push(out);
+        }
+        let first = &refs[0];
+        for other in &refs[1..] {
+            assert_eq!(first, other, "divergent committed content at position {pos}");
+        }
+        frames_compared += 1;
+        let step = step.expect("every branch above either sets `step` or panics");
+        assert!(step > 0, "align_frame_len returned 0 at position {pos} — a genuinely corrupt frame");
+        pos += step;
+    }
+    assert!(
+        frames_compared > 0,
+        "the divergence check never read a single real frame up to the converged floor {target}"
+    );
 
     for n in nodes.drain(..) {
         n.stop();
