@@ -511,3 +511,106 @@ behavior:
    then `cd proofs && lake exe conform $HOME/.cache/uc2-conform/vectors.jsonl`.
 4. (If Phase 1.5 landed) regenerate the Aeneas translation and repair
    `proofs/Aeneas/Equiv.lean`; refresh `proofs/Aeneas/SOURCES.sha256`.
+
+## 11. Wire crypto (M8, opt-in, off by default)
+
+Authenticated + encrypted node↔node UDP. **Flag day:** a cluster is either
+all-encrypted or all-cleartext — there is no mixed mode and no permissive
+window. A node with crypto enabled drops unsealed peer traffic; a cleartext
+node cannot parse sealed traffic. So every node in a cluster flips together, in
+a coordinated restart. Design + threat model:
+`docs/superpowers/specs/2026-07-28-uc2-wire-crypto-design.md`.
+
+### Key material
+
+Each node needs two files:
+
+* **Private identity key** — the node's raw **32-byte X25519 secret**, mode
+  **`0600`**. The node *refuses to start* if any group/world permission bit is
+  set (`mode & 0o077 != 0`), and if the file is shorter than 32 bytes. Only the
+  first 32 bytes are read.
+* **Allowlist** — one line per authorized peer:
+  `<node id> <base64 X25519 public key> [# comment]`. Blank lines and
+  `#` comments are ignored. Standard base64 (with padding). A node's own id may
+  be present or absent; a peer whose id is not listed, or whose presented static
+  key does not match the listed one, cannot establish. The file is re-read at
+  runtime (mtime-gated, ~1 s) and eagerly on a handshake from an unknown id, so
+  an M7 node-add authorizes the joiner **without a restart** — drop its key line
+  into every existing node's allowlist and it converges.
+
+Generating a private key (the public half derivation currently needs a helper —
+see the gap note below):
+
+```bash
+head -c 32 /dev/urandom > node-N.key   # any 32 bytes is a valid X25519 secret
+chmod 600 node-N.key
+```
+
+> **Tooling gap — read before a real deployment.** There is **no `uc2ctl
+> gen-key` yet**. The private-key recipe above is complete, but deriving the
+> **base64 public key** for the allowlist requires code — the derivation exists
+> in `uc2_crypto::identity::Identity::public_bytes()` and is exercised by the
+> `m5_gate --crypto` harness (`write_crypto_material`), but is not exposed as an
+> operator CLI. **A `uc2ctl gen-key` / `uc2_crypto` keygen binary is the first
+> required follow-up before anyone runs this in production.** Until then, keys
+> and allowlists are generated programmatically (as the tests and gate harness
+> do).
+
+### Enabling it
+
+In `NodeConfig`, set `crypto: CryptoConfig::Enabled { key_path, allowlist_path,
+rotation: RotationPolicy::default() }` (default is `Disabled`). The fleet gate
+binary takes `--crypto-key K --crypto-allowlist A` on the `node` role; the local
+`m5_gate all --crypto` generates fresh material per node for a smoke run.
+
+`RotationPolicy` governs the cluster group key: it rotates **on becoming
+leader**, on a **timer / byte budget** (whichever first — default 1 h / 1 TiB),
+and on a **committed `Remove*`** (so a removed node stops being able to decrypt
+fresh fan-out traffic). A demote does **not** rotate — a demoted node is still
+a cluster member that must keep replicating.
+
+### Flag-day rollout procedure
+
+1. Generate a keypair per node; assemble one allowlist listing every node's id
+   + public key; distribute the allowlist to every node and each node's own
+   private key (mode `0600`) to that node only.
+2. Stop the cluster (or roll it, but note a crypto node and a cleartext node
+   cannot talk — a rolling flip runs split until the last node flips, so a
+   coordinated restart is simpler and is the supported path).
+3. Restart every node with `CryptoConfig::Enabled`.
+4. Confirm from any node's cnc page / logs: the leader minted a group epoch
+   (`crypto_epoch()` is `Some`), and the drop counters (below) are quiet.
+
+### Reading the crypto drop counters
+
+The receiver counts each reason it dropped a datagram; these surface in stats
+and (for `seal_failures`) in the cnc page. In steady state on a **follower**
+they are all zero; a nonzero value is a signal:
+
+| counter | meaning |
+|---|---|
+| `auth_failed` | tag/AAD verification failed — tampering, or a key mismatch. Should be **0**. |
+| `replay` | a counter already seen under this `(sender, epoch)` — a replay, or a duplicate the anti-replay window is correctly refusing. Small counts under loss/reorder are normal; sustained growth is an attack signal. |
+| `unknown_peer` | a datagram from a source address with no `NodeId` mapping — usually a missing allowlist entry or a stale peer set. |
+| `unknown_epoch` | sealed under a group epoch this node has not yet installed — expected briefly after a rotation until the `HS_KEY` lands; self-heals. |
+| `cleartext_peer` | `key_epoch == 0` from a peer while crypto is on — **the flag-day-mixed-cluster diagnostic**: a peer is very likely running cleartext. Distinct from `auth_failed` on purpose. |
+| `seal_failures` | this node could not seal an outbound datagram (no session / no group key). **On a follower, must be 0.** **On the leader it climbs continuously and is benign** — see below. |
+| `hs_failures` | handshake attempts refused (unknown id, bad static key, revoked peer). |
+
+> **The leader's `seal_failures` is expected to climb — do not alarm on it.**
+> A node reports its durable/append position to `cfg.leader`; on the leader that
+> address is *itself*, and a node holds no pairwise session with itself, so each
+> self-addressed `APPEND_POSITION`/`STATUS` fails to seal. This is a pre-existing
+> v2 self-send (cleartext did it too, uncounted) and is harmless — the leader's
+> own position reaches its commit ranking in memory. It is on the follow-up
+> list to suppress. **Judge health by the *followers'* `seal_failures` (must be
+> 0) and by `auth_failed`/`replay`/`unknown_epoch` everywhere.**
+
+### Wire version
+
+M8 bumps the wire protocol to **0.4.0** (`version::CURRENT`). This is
+independent of the `cnc.dat` page version (`CNC_V2_VERSION`, unchanged): M8
+changes the UDP datagram format, not the shmem page, so service/client IPC
+compatibility is unaffected. The datagram grows by **24 bytes** (8-byte counter
++ 16-byte GCM tag); the payload budget shrinks accordingly and the harness/MTU
+math already accounts for it.

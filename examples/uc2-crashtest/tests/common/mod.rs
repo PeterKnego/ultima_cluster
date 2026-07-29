@@ -16,12 +16,14 @@
 //! hence the crate-level `allow(dead_code)`.
 #![allow(dead_code)]
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use uc2_client::{Client, ClientError};
+use uc2_crypto::identity::Identity;
 use uc_lincheck::register::{Cmd, CmdResp};
 
 static INIT_CLIENT_TIMEOUT: Once = Once::new();
@@ -50,6 +52,115 @@ pub const NODE_BIN: &str = env!("CARGO_BIN_EXE_uc2-crashtest-node");
 pub const SERVICE_BIN: &str = env!("CARGO_BIN_EXE_uc2-crashtest-service");
 pub const APP_ID: &str = "uc2-crashtest";
 
+// -------------------------------------------------- M8 Task 15: crypto ON
+//
+// `UC2_CRYPTO=1` re-runs every hard-crash test in this crate with wire
+// crypto `Enabled` on every real node PROCESS it spawns. Honored uniformly:
+// every test below checks this once at the top and threads the answer
+// through its own `spawn_node`/`spawn_node_multi` calls.
+//
+// This alone does NOT mean every test exercises a genuine multi-process
+// seal/open path, though — that needs a real PEER to seal traffic with.
+// `linearizable_under_service_sigkill` and `node_sigkill_recovery` boot
+// SINGLE-node clusters (`node.crypto_epoch()` logs `for 0 peer(s)`): with
+// no peer, no inter-node datagram is ever sealed, and client/service IPC is
+// shmem, never sealed. Under crypto they prove only that enabling it
+// doesn't break single-node boot/apply/recovery. `sigkill_mid_config_window`
+// and `leader_node_sigkill_recovery_multi` are the real 3-PROCESS clusters
+// (a genuine multi-process handshake + seal/open path, not the in-process
+// fixture `uc2_node/tests/crypto_cluster.rs`/`lincheck_v2` exercise) —
+// `leader_node_sigkill_recovery_multi` in particular is the one that
+// SIGKILLs a NODE process (not just the admin protocol) and so is the one
+// that forces the restarted process to re-run the Noise handshake with its
+// live peers before its consensus datagrams are accepted again.
+
+/// `UC2_CRYPTO=1` re-runs the hard-crash capstones with wire crypto enabled.
+pub fn crypto_from_env() -> bool {
+    std::env::var("UC2_CRYPTO").ok().as_deref() == Some("1")
+}
+
+fn crypto_private_key(id: u32) -> [u8; 32] {
+    let mut k = [0x71u8; 32];
+    k[0..4].copy_from_slice(&id.to_le_bytes());
+    k
+}
+
+/// Standard-alphabet base64 with padding, matching `uc2_crypto::identity`'s
+/// allowlist parser — same hand-rolled encoder as `uc2_node/tests/
+/// crypto_cluster.rs` and `lincheck_v2::mod`'s own fixtures (independent
+/// test binaries, no shared crate to put one canonical copy in).
+fn crypto_b64_32(bytes: &[u8; 32]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// One keypair per id in `ids` plus a single shared allowlist naming all of
+/// them.
+pub struct CrashtestCrypto {
+    pub key_paths: HashMap<u32, PathBuf>,
+    pub allowlist_path: PathBuf,
+}
+
+pub fn provision_crypto(dir: &Path, ids: &[u32]) -> CrashtestCrypto {
+    let mut key_paths = HashMap::with_capacity(ids.len());
+    let mut publics = Vec::with_capacity(ids.len());
+    for &id in ids {
+        let node_dir = dir.join(format!("keys{id}"));
+        std::fs::create_dir_all(&node_dir).unwrap();
+        let key_path = node_dir.join("node.key");
+        std::fs::write(&key_path, crypto_private_key(id)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let public = Identity::load(&key_path).unwrap().public_bytes();
+        publics.push((id, public));
+        key_paths.insert(id, key_path);
+    }
+    let mut text = String::new();
+    for (id, public) in &publics {
+        text.push_str(&format!("{id} {}\n", crypto_b64_32(public)));
+    }
+    let allowlist_path = dir.join("crypto-allowlist");
+    std::fs::write(&allowlist_path, text).unwrap();
+    CrashtestCrypto { key_paths, allowlist_path }
+}
+
+/// Anti-vacuity (M8 Task 15): poll for `instance_dir/crypto_epoch_active`,
+/// which the node bin's own background poll loop writes ONLY once
+/// `Node::crypto_epoch()` reports `Some` — a real, leader-only group-key
+/// mint (see `uc2-crashtest-node.rs`'s main loop). This is checked from a
+/// SEPARATE test process with no `Node` handle of its own, hence the
+/// filesystem sentinel rather than an in-process counter read. Proof that
+/// `--crypto-key`/`--crypto-allowlist` did something real, not merely that
+/// they were parsed — a build where the switch silently no-opped would
+/// still elect a leader and pass every other assertion in this file.
+pub fn assert_crypto_epoch_active(instance_dir: &Path, timeout: Duration) {
+    let path = instance_dir.join("crypto_epoch_active");
+    let deadline = Instant::now() + timeout;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "UC2_CRYPTO=1 but {} never appeared within {timeout:?} — this node never minted a \
+             crypto group epoch as leader; wire crypto did not actually engage",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// A spawned child that is killed (SIGKILL) and reaped on Drop. This is what
 /// makes the tests panic-safe: an assertion failure unwinds through the
 /// `Reap` and the node/service processes are torn down rather than
@@ -68,11 +179,19 @@ impl Drop for Reap {
 /// Spawn the node-only binary (creates instance_dir/cnc2.dat, runs the v2
 /// sync single-node cluster on ephemeral `--bind`/`--id 0` defaults).
 pub fn spawn_node(instance_dir: &Path) -> Reap {
-    let child = Command::new(NODE_BIN)
-        .arg("--instance-dir")
-        .arg(instance_dir)
-        .arg("--app-id")
-        .arg(APP_ID)
+    spawn_node_with(instance_dir, None)
+}
+
+/// As [`spawn_node`] but optionally passing `--crypto-key`/
+/// `--crypto-allowlist` (M8 Task 15's `UC2_CRYPTO=1` path). `None` is
+/// byte-for-byte the pre-M8 [`spawn_node`] behavior.
+pub fn spawn_node_with(instance_dir: &Path, crypto: Option<(&Path, &Path)>) -> Reap {
+    let mut cmd = Command::new(NODE_BIN);
+    cmd.arg("--instance-dir").arg(instance_dir).arg("--app-id").arg(APP_ID);
+    if let Some((key_path, allowlist_path)) = crypto {
+        cmd.arg("--crypto-key").arg(key_path).arg("--crypto-allowlist").arg(allowlist_path);
+    }
+    let child = cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()

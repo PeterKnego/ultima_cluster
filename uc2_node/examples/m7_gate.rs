@@ -393,6 +393,7 @@ fn make_config(
         faults: FaultConfig::default(),
         purge,
         journal_segment_bytes,
+        crypto: uc2_node::CryptoConfig::Disabled,
     }
 }
 

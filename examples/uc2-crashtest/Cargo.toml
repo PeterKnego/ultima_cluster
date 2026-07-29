@@ -22,6 +22,11 @@ uc2_node      = { path = "../../uc2_node" }
 uc2_service   = { path = "../../uc2_service" }
 uc2_net       = { path = "../../uc2_net" }
 uc2_consensus = { path = "../../uc2_consensus" }
+# M8 Task 15: crypto-material fixture (key generation) for the hard-crash
+# tests' UC2_CRYPTO=1 path, plus the node bin's --crypto-key/--crypto-allowlist
+# CLI wiring. Already a transitive dep via uc2_node; declared directly because
+# both the bin and the integration tests reference it by name.
+uc2_crypto    = { path = "../../uc2_crypto" }
 # pulls in the `RegisterSm: uc2_service::StateMachine` impl (the `v2` feature is
 # now uc-lincheck's only SDK target).
 uc-lincheck   = { path = "../../uc-lincheck", default-features = false, features = ["v2"] }

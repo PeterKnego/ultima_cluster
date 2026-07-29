@@ -21,13 +21,31 @@
 //!   crash-rate at each tick.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use uc2_consensus::config::{Addr, ClusterConfig, ConfigOp, ProposeError};
 use uc2_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId, Role};
 use uc2_consensus::reconcile::MAX_TERM_MAP_WIRE_ENTRIES;
 
 use crate::invariants::{InvariantChecker, InvariantViolation};
+
+// ---- T13: crypto-plane sim coverage --------------------------------------
+//
+// `Peers` (handshake.rs) and `GroupPlane` (group.rs) are pure `(input,
+// now_ns) -> Vec<HandshakeAction>` transition functions with no sockets and
+// no clock reads — a hard requirement laid on every earlier M8 task
+// specifically so this sim could drive them exactly like `ElectionSm`. See
+// `World::enable_crypto_plane` for the wiring and the module-level doc
+// comment above `NodeCrypto` for the two deliberate sim-only modeling
+// choices (the crypto-plane redelivery-sweep cadence, and the "DATA send
+// withheld/gated by the group epoch" rule).
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use uc2_crypto::group::GroupPlane;
+use uc2_crypto::handshake::{HandshakeAction, Peers};
+use uc2_crypto::identity::{Allowlist, Identity};
+use uc2_crypto::schedule::BootSalt;
+use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
 
 /// Bytes appended per served frame (a fixed 96-B command frame in the model).
 const FRAME: u64 = 96;
@@ -133,6 +151,79 @@ impl XorShift64 {
         self.0 = x;
         x
     }
+}
+
+// ---- T13: crypto-plane sim fixtures --------------------------------------
+
+/// Scratch root for T13's sim-generated crypto identities, on real disk
+/// (never `/tmp` — RAM-backed tmpfs, no swap on the dev box; CLAUDE.md).
+///
+/// **Not `CARGO_TARGET_TMPDIR`.** That env var is a compile-time-only value
+/// cargo sets for the specific `tests/*.rs` binary target being built —
+/// retrievable via `env!()` from code compiled AS PART OF that target
+/// (`uc2_crypto`'s own test helpers do exactly that, from inside
+/// `tests/*.rs` files). `World::enable_crypto_plane` lives in THIS crate's
+/// `src/` (the library target, a separate compilation unit from
+/// `tests/scenarios.rs`), so `env!("CARGO_TARGET_TMPDIR")` here would fail
+/// to compile — the same gap `uc2_crypto/src/identity.rs`'s test helper
+/// documents for its own inline `#[cfg(test)]` module. A RUNTIME
+/// `std::env::var("CARGO_TARGET_TMPDIR")` compiles, but confirmed dead:
+/// the variable is never actually present in the running test process's
+/// environment (`Err(NotPresent)`, checked directly). So this always uses
+/// the package-relative fallback; no `env::var` attempt is made.
+///
+/// **Unique per call, not keyed by seed** (T13 review finding I-1): an
+/// earlier version keyed this directory by `cfg.seed` alone, reasoning
+/// "parallel test THREADS with different seeds never collide" — true, but
+/// wrong scope: `cargo test` runs different TESTS concurrently, and
+/// several committed scenarios pin seeds (7, 11, 13, 17, 21) that all sit
+/// inside the oracle-twin fuzz's `0..60` sweep, so two unrelated tests can
+/// legitimately race on the SAME seed at the SAME time — one test's
+/// `fs::write` (truncate-then-write) racing another's concurrent
+/// `Identity::load` (read) on the identical path. Reproduced: 118/1600
+/// concurrent calls panicked with `KeyFileInvalid` before this fix. Keying
+/// by a process-wide monotonic counter instead (nothing later ever needs
+/// to find this directory again by seed — it is written and read back
+/// within the same `enable_crypto_plane` call and never touched again)
+/// makes every call's directory disjoint by construction; no seed
+/// collision is possible regardless of how many tests share a seed.
+fn crypto_scratch_dir() -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../target/uc2_sim_crypto_tests")
+        .join("uc2-sim-crypto")
+        .join(format!("call-{n}-{:?}", std::thread::current().id()));
+    std::fs::create_dir_all(&d).expect("create sim crypto scratch dir");
+    assert!(!d.starts_with("/tmp"), "sim crypto scratch must not live on tmpfs: {d:?}");
+    d
+}
+
+/// Deterministic (NOT cryptographically meaningful — this is a sim fixture,
+/// not key generation for anything real) 32-byte "private key" for a sim
+/// node: this module's own `XorShift64`, seeded from the world seed and node
+/// index, filled 8 bytes at a time. Any 32 bytes are a valid X25519 scalar
+/// (`StaticSecret::from` clamps internally), so this only needs to be
+/// deterministic and distinct per `(seed, node)`.
+fn deterministic_key_bytes(seed: u64, node: u64) -> [u8; 32] {
+    let mut rng = XorShift64::new(seed ^ 0xA11CE_u64.wrapping_mul(node.wrapping_add(1)) ^ 0x5EED);
+    let mut bytes = [0u8; 32];
+    for chunk in bytes.chunks_mut(8) {
+        chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
+    }
+    bytes
+}
+
+/// Deterministic 16-byte boot salt for a sim node — same rationale as
+/// [`deterministic_key_bytes`], a disjoint RNG stream (distinct XOR
+/// constants) so a node's key and its salt never accidentally coincide.
+fn deterministic_salt_bytes(seed: u64, node: u64) -> [u8; 16] {
+    let mut rng = XorShift64::new(seed ^ 0xB00F_u64.wrapping_mul(node.wrapping_add(1)) ^ 0x5A17);
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_mut(8) {
+        chunk.copy_from_slice(&rng.next_u64().to_le_bytes());
+    }
+    bytes
 }
 
 /// Simulation configuration. `Default` yields a quiet 3-node cluster with the
@@ -260,17 +351,49 @@ pub enum Msg {
     /// Accepted iff `term == current`, `from_pos == append` (contiguity), and
     /// the prev-term check passes; else dropped, and the leader retries from the
     /// follower's acked position (backing off on a later tick).
-    Data { term: u32, seg_term: u32, from_pos: u64, to_pos: u64, prev_term: u32 },
+    ///
+    /// `epoch` (T13): `None` for a crypto-disabled world (unchanged pre-M8
+    /// behavior) or a scripted `inject_data` craft; `Some(e)` when the
+    /// sending leader is crypto-enabled — the group-key epoch it is
+    /// currently *sealing* under (`GroupPlane::sealing_epoch`). A receiver
+    /// that has not installed `e` cannot open it in the real system; see the
+    /// crypto gate at the top of `deliver`'s `Msg::Data` arm.
+    Data { term: u32, seg_term: u32, from_pos: u64, to_pos: u64, prev_term: u32, epoch: Option<u16> },
     /// Follower -> leader replication ack: drives the per-follower send cursor.
     Ack { from: NodeId, term: u32, append: u64 },
     /// Follower -> leader durable report: drives quorum commit ranking.
     Report { from: NodeId, term: u32, durable: u64 },
-    /// Leader -> follower commit gossip.
-    CommitGossip { term: u32, commit: u64 },
+    /// Leader -> follower commit gossip. `epoch` (T13, model-fidelity fix):
+    /// production classifies `DGRAM_KIND_COMMIT_POSITION` as
+    /// `Scope::Group` (`uc2_crypto::transport::scope_of`), sealed and
+    /// gated exactly like `DATA`/`HEARTBEAT` — an earlier version of this
+    /// sim left `CommitGossip` entirely ungated, which was a real
+    /// model-fidelity gap (flagged in T13 review): the root-cause account
+    /// for the churn finding above cited "CommitGossip is never
+    /// crypto-gated" as part of why a follower can still learn about a new
+    /// leader through an ungated path, which was false relative to
+    /// production. Gated the same way `Data` is, below.
+    CommitGossip { term: u32, commit: u64, epoch: Option<u16> },
     RequestVote { from: NodeId, new_term: u32, last_term: u32, last_durable: u64 },
     Vote { from: NodeId, term: u32, granted: bool },
     /// Leader -> follower term-map ship (drives reconciliation).
     TermMap { term: u32, entries: Vec<(u32, u64)> },
+    /// T13: follower -> leader gap-repair request, addressed at whichever
+    /// leader most recently reached it — the sim's model of the real
+    /// reliable-UDP NAK path (`uc2_net`'s receiver-driven retransmit
+    /// request). Only ever emitted here by the crypto gate (`Msg::Data`'s
+    /// receive handling): the byte-push replication model this sim already
+    /// runs is otherwise a continuous leader-driven resend, so `Msg::Nak` is
+    /// the one place a genuine receiver-initiated repair round-trip is
+    /// observable and countable (`World::nak_count`).
+    Nak { from: NodeId, want_from: u64 },
+    /// T13: an opaque handshake/rotation datagram — Noise `IK` message 1/2
+    /// (kind 18/19, `uc2_crypto::handshake::Peers`) or an `HS_KEY`
+    /// delivery/ack (kind 20, `uc2_crypto::group::GroupPlane`) — routed
+    /// through the SAME lossy/partitionable `send`/`deliver` path as every
+    /// consensus message, per the task brief ("routes kinds 18/19/20
+    /// through the existing lossy link model").
+    Handshake { kind: u8, body: Vec<u8> },
 }
 
 /// A scheduled simulation event.
@@ -374,6 +497,74 @@ struct Node {
     /// from the cluster). Like a crash, but no restart is ever scheduled and
     /// `restart()` refuses.
     halted: bool,
+    // ---- T13: crypto plane ----
+    /// `Some` once `World::enable_crypto_plane` has wired this node; `None`
+    /// (the default) reproduces the pre-M8 abstract model byte-for-byte —
+    /// every crypto-plane sim addition is a no-op unless this is set.
+    crypto: Option<NodeCrypto>,
+    /// T13: count of `Msg::Nak` gap-repair requests this node has SENT — see
+    /// `World::nak_count`.
+    nak_sent: u32,
+}
+
+/// T13: one node's crypto-plane state. `peers`/`group` are pure `(input,
+/// now_ns) -> Vec<HandshakeAction>` transition functions (no sockets, no
+/// clock reads) — `uc2_crypto::handshake`/`uc2_crypto::group`'s own design
+/// constraint, which is what makes this drivable at all.
+struct NodeCrypto {
+    peers: Peers,
+    group: GroupPlane,
+    /// Next virtual time at which this node's `GroupPlane::unacked_peers`
+    /// re-delivery sweep (the T12 fix for `mint`'s single-shot `HS_KEY`
+    /// delivery — see `group.rs`'s module doc) may run again. See
+    /// `CRYPTO_SWEEP_INTERVAL_NS`.
+    next_sweep_ns: u64,
+}
+
+/// T13: how often (of virtual time) a crypto-enabled node's maintenance tick
+/// re-polls `GroupPlane::unacked_peers` and re-sends via `redeliver_to`.
+///
+/// Fast, not slow — revised from an earlier 2.5s choice (T13 review): once
+/// `Msg::CommitGossip` was correctly gated the same as `DATA`/`HEARTBEAT`
+/// (matching production's `Scope::Group` classification of
+/// `COMMIT_POSITION` — a model-fidelity fix, see `Msg::CommitGossip`'s
+/// doc), a node that cannot open ANY current group traffic genuinely hears
+/// NOTHING from its leader — no back-channel keeps it pacified — so it
+/// calls its own election on the SM's normal ~150-300ms timeout regardless
+/// of how the redelivery sweep is tuned. A sweep slower than that window
+/// does not "cleanly separate" a scripted gap from the activation timeout
+/// (the original rationale) — it just guarantees an election fires before
+/// the sweep ever gets a chance to matter, which then recovers the peer
+/// through an unrelated fresh mint instead of through
+/// `redeliver_to` — not wrong, but not what a script trying to exercise
+/// the redelivery path specifically wants. A sweep this fast, paired with
+/// `World::block_key_delivery_to`'s explicit TIME WINDOW (rather than a
+/// one-shot drop count) for holding a gap open exactly as long as a script
+/// needs, keeps the redelivery path independently exercisable: the block
+/// window can still be built wide enough to force the leader down the
+/// `ACTIVATION_TIMEOUT_NS` (2s) path, while the sweep recovers the peer
+/// within one election-timeout's worth of the window closing. Production's
+/// own `uc2_node` cadence is a separate, independently-tuned parameter
+/// outside this crate's concern; the sim only needs a genuine bounded
+/// retry, not a specific number.
+const CRYPTO_SWEEP_INTERVAL_NS: u64 = 50_000_000;
+
+/// T13: what a crypto-enabled leader may do with an outgoing `DATA` send
+/// right now — see `World::data_seal_gate`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SealGate {
+    /// Crypto is off for this node: unchanged pre-M8 behavior (`Msg::Data`
+    /// carries `epoch: None`, and the receive-side gate never triggers).
+    NotGated,
+    /// Crypto is on, but no group epoch has EVER activated yet (a fresh
+    /// leader must mint + activate before it can seal `DATA` at all — the
+    /// T9 review note this task's brief quotes). The caller withholds the
+    /// send entirely rather than emit something claiming a nonexistent
+    /// epoch.
+    Withhold,
+    /// Safe to seal under this epoch right now
+    /// (`GroupPlane::sealing_epoch`'s answer).
+    Sealed(u16),
 }
 
 /// The simulator. Construct with [`World::new`], drive with [`World::run`] (or
@@ -435,6 +626,18 @@ pub struct World {
     stat_truncations: u32,
     stat_wipes: u32,
     stat_restarts: u32,
+
+    // ---- T13: crypto plane ----
+    /// `HS_KEY` (kind 20) deliveries addressed to a given node index are
+    /// dropped while `self.now < deadline` — see
+    /// `World::block_key_delivery_to`. Applied at the "socket," before the
+    /// fault dice, so it is deterministic regardless of `drop_per_million`.
+    /// A time WINDOW rather than a one-shot drop count (T13 review): with
+    /// `CRYPTO_SWEEP_INTERVAL_NS` fast, a script needs to hold a gap open
+    /// for a specific, possibly long, span of virtual time (e.g. past
+    /// `ACTIVATION_TIMEOUT_NS`), not survive some number of retry attempts
+    /// whose count would depend on the sweep cadence.
+    key_delivery_blocked_until: HashMap<usize, u64>,
 }
 
 /// Read-out of a completed run.
@@ -492,6 +695,8 @@ impl World {
                 cfg_prev: genesis.clone(),
                 cfg_prev_pos: 0,
                 halted: false,
+                crypto: None,
+                nak_sent: 0,
             });
         }
         let checker = InvariantChecker::new(cfg.seed, n);
@@ -517,6 +722,7 @@ impl World {
             stat_truncations: 0,
             stat_wipes: 0,
             stat_restarts: 0,
+            key_delivery_blocked_until: HashMap::new(),
             nodes,
             cfg,
         };
@@ -649,6 +855,71 @@ impl World {
             }
         }
         Ok(pred(self))
+    }
+
+    /// T13: step until `pred` holds, or `duration_ns` of VIRTUAL TIME has
+    /// elapsed from the current instant (the step-count budget is still the
+    /// ultimate backstop). Distinct from [`World::run_until`] — which is
+    /// bounded only by the step count — because the crypto scenarios need a
+    /// wall-clock-shaped deadline ("handshakes must converge within N
+    /// seconds"), not a step count, and changing `run_until`'s own signature
+    /// would touch every existing call site in this crate for no reason.
+    /// Same `Ok(bool)` timeout contract as `run_until` (ledger minor x): a
+    /// timeout is `Ok(false)`, never silently swallowed.
+    pub fn run_until_within(
+        &mut self,
+        mut pred: impl FnMut(&World) -> bool,
+        duration_ns: u64,
+    ) -> Result<bool, InvariantViolation> {
+        if let Some(v) = self.pending_violation.take() {
+            return Err(v); // ledger minor g: don't drop a parked violation
+        }
+        let deadline = self.now.saturating_add(duration_ns);
+        while !pred(self) {
+            if self.steps >= self.cfg.max_steps || self.term_map_cap_reached() {
+                break;
+            }
+            let Some(Reverse(next)) = self.queue.peek() else {
+                break;
+            };
+            if next.time > deadline {
+                break;
+            }
+            if !self.step_once()? {
+                break;
+            }
+        }
+        Ok(pred(self))
+    }
+
+    /// T13: run events until `duration_ns` of virtual time has elapsed from
+    /// the current instant (or the step budget runs out) — for scenarios
+    /// that need to let a scripted window of time pass (e.g. past
+    /// `uc2_crypto::group::ACTIVATION_TIMEOUT_NS`) without a specific
+    /// predicate to wait on. If the queue's next event already lands past
+    /// the deadline, this is a no-op (the sim has nothing to do in the
+    /// window — every crypto scenario keeps periodic ticks running, so this
+    /// is not the common case).
+    pub fn run_for(&mut self, duration_ns: u64) -> Result<(), InvariantViolation> {
+        if let Some(v) = self.pending_violation.take() {
+            return Err(v);
+        }
+        let deadline = self.now.saturating_add(duration_ns);
+        loop {
+            if self.steps >= self.cfg.max_steps || self.term_map_cap_reached() {
+                break;
+            }
+            let Some(Reverse(next)) = self.queue.peek() else {
+                break;
+            };
+            if next.time > deadline {
+                break;
+            }
+            if !self.step_once()? {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Step at most `k` events (bounded also by the global budget).
@@ -803,7 +1074,17 @@ impl World {
     /// Build a `Data` message from leader `node`'s log for the byte range
     /// starting at `from`, clipped to a single term segment (so the follower
     /// stamps it at the correct base) and carrying the Raft `prev_term`.
-    fn make_data(&self, node: usize, from: u64, append: u64, term: u32) -> Msg {
+    /// `epoch` (T13) is stamped straight onto the message — see
+    /// `World::data_seal_gate`, the only caller that computes a non-`None`
+    /// value.
+    fn make_data(
+        &self,
+        node: usize,
+        from: u64,
+        append: u64,
+        term: u32,
+        epoch: Option<u16>,
+    ) -> Msg {
         let map = &self.nodes[node].term_map;
         let to = match next_boundary(map, from) {
             Some(b) if b < append => b,
@@ -811,7 +1092,21 @@ impl World {
         };
         let seg_term = term_at(map, from);
         let prev_term = if from == 0 { 0 } else { term_at(map, from - 1) };
-        Msg::Data { term, seg_term, from_pos: from, to_pos: to, prev_term }
+        Msg::Data { term, seg_term, from_pos: from, to_pos: to, prev_term, epoch }
+    }
+
+    /// T13: what `node` may do with an outgoing `DATA` send right now (see
+    /// `SealGate`). Pure — does not mutate `GroupPlane` state (activation
+    /// reconciliation happens inside `GroupPlane::mint`, exactly as it does
+    /// on the send-key side of the real crate).
+    fn data_seal_gate(&self, node: usize, now: u64) -> SealGate {
+        match &self.nodes[node].crypto {
+            None => SealGate::NotGated,
+            Some(c) => match c.group.sealing_epoch(now) {
+                Some(e) => SealGate::Sealed(e),
+                None => SealGate::Withhold,
+            },
+        }
     }
 
     fn blocked(&self, a: usize, b: usize) -> bool {
@@ -868,13 +1163,42 @@ impl World {
             if self.nodes[node].sm.can_serve() && !self.quiet {
                 self.nodes[node].append += FRAME;
             }
-            let ap = self.nodes[node].append;
-            let term = self.nodes[node].sm.current_term();
-            for p in self.config_peers(node) {
-                let from = self.nodes[node].cursors[p].min(ap);
-                let msg = self.make_data(node, from, ap, term);
-                self.send(node, p, msg, now);
+            // T13: a crypto-enabled leader withholds DATA until a group epoch
+            // has activated (mint + ack-or-timeout) — see `SealGate`. A
+            // crypto-disabled node is `NotGated` and this is unconditionally
+            // true, so the pre-M8 behavior is untouched.
+            let gate = self.data_seal_gate(node, now);
+            if gate != SealGate::Withhold {
+                let epoch = match gate {
+                    SealGate::Sealed(e) => Some(e),
+                    _ => None,
+                };
+                let ap = self.nodes[node].append;
+                let term = self.nodes[node].sm.current_term();
+                for p in self.config_peers(node) {
+                    let from = self.nodes[node].cursors[p].min(ap);
+                    let msg = self.make_data(node, from, ap, term, epoch);
+                    self.send(node, p, msg, now);
+                }
             }
+        }
+
+        // T13: crypto-plane maintenance — the pairwise handshake driver's own
+        // tick (retransmit backoff, allowlist reload, `pending` TTL expiry)
+        // plus the group-key unacked-peer redelivery sweep (the T12 fix for
+        // `GroupPlane::mint`'s single-shot `HS_KEY` delivery — see
+        // `CRYPTO_SWEEP_INTERVAL_NS`). A no-op for a crypto-disabled node.
+        let mut crypto_actions: Vec<HandshakeAction> = Vec::new();
+        if let Some(crypto) = self.nodes[node].crypto.as_mut() {
+            crypto_actions.extend(crypto.peers.tick(now));
+            if now >= crypto.next_sweep_ns {
+                crypto.next_sweep_ns = now + CRYPTO_SWEEP_INTERVAL_NS;
+                let unacked = crypto.group.unacked_peers();
+                crypto_actions.extend(crypto.group.redeliver_to(&unacked));
+            }
+        }
+        if !crypto_actions.is_empty() {
+            self.dispatch_handshake_actions(node, crypto_actions, now);
         }
 
         self.push(SimEvent::Tick { node }, now + self.cfg.tick_interval_ns);
@@ -1167,6 +1491,75 @@ impl World {
         }
     }
 
+    // ------------------------------------------------------- T13: crypto plane
+
+    /// Feeds a received handshake/rotation datagram (kind 18/19/20) into
+    /// `to`'s crypto plane and dispatches whatever it emits. A no-op if `to`
+    /// is not crypto-enabled (a stray `Msg::Handshake` can only originate
+    /// from a crypto-enabled sender, so this is defensive, not a live path).
+    fn deliver_handshake(&mut self, to: usize, from: usize, kind: u8, body: Vec<u8>, now: u64) {
+        let from_id = self.nodes[from].id;
+        let Some(crypto) = self.nodes[to].crypto.as_mut() else {
+            return;
+        };
+        // `HS_KEY` (20) rides the pairwise channel but is `GroupPlane`'s
+        // message, not `Peers`' — `Peers::on_message` deliberately ignores
+        // it (see `handshake.rs`'s `on_message` doc); the node layer is what
+        // splits the two, and this mirrors that split.
+        let actions = if kind == DGRAM_KIND_HS_KEY {
+            crypto.group.on_key_message(from_id, &body)
+        } else {
+            crypto.peers.on_message(from_id, kind, &body, now)
+        };
+        self.dispatch_handshake_actions(to, actions, now);
+    }
+
+    /// Executes a batch of [`HandshakeAction`]s emitted by `node`'s `Peers`
+    /// or `GroupPlane`. `Send` rides the SAME lossy/partitionable
+    /// `send`/`deliver` pipe as every other message (kinds 18/19/20), with
+    /// one scripted exception applied at the "socket" (before the fault
+    /// dice): every `HS_KEY` addressed to a node currently inside its
+    /// [`World::block_key_delivery_to`] window is dropped, for as long as
+    /// that window is open. `Established`/`Failed` need no world-level
+    /// bookkeeping — session liveness is queried directly off
+    /// `Peers`/`GroupPlane` by the accessors below, not shadowed here.
+    fn dispatch_handshake_actions(&mut self, node: usize, actions: Vec<HandshakeAction>, now: u64) {
+        for act in actions {
+            if let HandshakeAction::Send { to, kind, body } = act {
+                let to_idx = to as usize;
+                if kind == DGRAM_KIND_HS_KEY
+                    && self.key_delivery_blocked_until.get(&to_idx).is_some_and(|&d| now < d)
+                {
+                    continue; // dropped at the "socket" — inside the blocked window
+                }
+                self.send(node, to_idx, Msg::Handshake { kind, body }, now);
+            }
+        }
+    }
+
+    /// The mint half of [`World::rotate_group_key`], split out so
+    /// `Action::BecomeLeader`'s auto-mint can call it without going back
+    /// through `current_leader()`.
+    fn mint_group_key_on(&mut self, node: usize) {
+        if self.nodes[node].crypto.is_none() {
+            return;
+        }
+        let now = self.now;
+        let peers: Vec<u32> = self.config_peers(node).iter().map(|&p| p as u32).collect();
+        let crypto = self.nodes[node].crypto.as_mut().unwrap();
+        let (_epoch, actions) = crypto.group.mint(&peers, now);
+        // Push this node's own redelivery-sweep schedule a fresh interval
+        // out from THIS mint: a reasonable real policy on its own (no point
+        // re-checking for unacked peers immediately after just delivering
+        // everyone the newest key). With `CRYPTO_SWEEP_INTERVAL_NS` fast
+        // (50ms) this is a minor phase-alignment nicety rather than the
+        // load-bearing determinism guard it was when the sweep was slow —
+        // `World::block_key_delivery_to`'s explicit time window is what
+        // scripted scenarios rely on now.
+        crypto.next_sweep_ns = now + CRYPTO_SWEEP_INTERVAL_NS;
+        self.dispatch_handshake_actions(node, actions, now);
+    }
+
     // ------------------------------------------------------------- delivery
 
     fn deliver(
@@ -1178,7 +1571,50 @@ impl World {
         step: u64,
     ) -> Result<(), InvariantViolation> {
         match msg {
-            Msg::Data { term, seg_term, from_pos, to_pos, prev_term } => {
+            Msg::Data { term, seg_term, from_pos, to_pos, prev_term, epoch } => {
+                // T13: crypto-plane gate — checked FIRST, before ANYTHING else
+                // touches state. `epoch` is only ever `Some` when the sending
+                // leader is crypto-enabled (see `data_seal_gate`); a receiver
+                // that has not installed that epoch cannot open the real
+                // AEAD-sealed datagram this message stands in for. AEAD tag
+                // verification covers the WHOLE frame (the v2 header is
+                // authenticated as associated data — `uc2_protocol::v2`'s
+                // sealed-datagram layout), so a failed open means NOTHING in
+                // this message — not even `term` — is trustworthy yet; this
+                // must behave exactly like the datagram never arrived at all
+                // (zero side effects), not like "arrived but unusable." A
+                // real network-level drop (the `send()` dice) already has
+                // this shape for free (the whole event is never delivered);
+                // moving the crypto gate to the top gives it the same shape
+                // deliberately — putting it AFTER `leader_hint`/`LeaderSeen`
+                // would credit an unauthenticated claim with live-leader
+                // liveness effects, which was a genuine bug caught here (see
+                // the task report for the reproduction: at high loss, an
+                // early crypto-gate ordering let a node adopt term liveness
+                // from a datagram it could not open, producing a real inv2
+                // term-map divergence — `w.enable_crypto_plane` had no
+                // effect on the SAME seed/config without this ordering bug).
+                if let Some(epoch) = epoch {
+                    let openable = self.nodes[to]
+                        .crypto
+                        .as_ref()
+                        .is_some_and(|c| c.group.schedule().get(epoch).is_some());
+                    if !openable {
+                        // Exactly like a lost datagram, EXCEPT the follower can
+                        // tell it happened (unlike a plain loss, which is
+                        // invisible to it) and asks the leader to repair the
+                        // gap: the SAME `Msg::Nak` request an ordinary
+                        // lost-datagram gap would produce in the real
+                        // reliable-UDP receiver. No new recovery mechanism —
+                        // `uc2_crypto::group`'s own module doc is explicit this
+                        // must self-heal through the existing repair path once
+                        // `HS_KEY` lands, never a bespoke one.
+                        self.nodes[to].nak_sent += 1;
+                        let (id, want_from) = (self.nodes[to].id, self.nodes[to].append);
+                        self.send(to, from, Msg::Nak { from: id, want_from }, now);
+                        return Ok(());
+                    }
+                }
                 self.nodes[to].leader_hint = Some(from);
                 self.feed(to, Event::LeaderSeen { term }, now, step)?;
                 if self.nodes[to].truncating {
@@ -1249,7 +1685,25 @@ impl World {
             Msg::Report { from: rep, term, durable } => {
                 self.feed(to, Event::Report { from: rep, term, durable }, now, step)
             }
-            Msg::CommitGossip { term, commit } => {
+            Msg::CommitGossip { term, commit, epoch } => {
+                // T13: same crypto gate as Msg::Data, checked FIRST and with
+                // the same zero-side-effect shape (see the long comment on
+                // the Data arm above for why the ordering matters) — an
+                // unopenable Group-scope datagram is dropped BEFORE
+                // leader_hint/feed, exactly like a lost datagram. No Nak
+                // here: CommitGossip carries no byte range to repair, and
+                // the leader re-ships it continuously (the idle gossip
+                // floor), so it self-heals the same way a lost CommitGossip
+                // already does today.
+                if let Some(epoch) = epoch {
+                    let openable = self.nodes[to]
+                        .crypto
+                        .as_ref()
+                        .is_some_and(|c| c.group.schedule().get(epoch).is_some());
+                    if !openable {
+                        return Ok(());
+                    }
+                }
                 self.nodes[to].leader_hint = Some(from);
                 self.feed(to, Event::CommitGossip { term, commit }, now, step)
             }
@@ -1317,6 +1771,32 @@ impl World {
                         self.reopen_gate(to, now);
                     }
                 }
+                Ok(())
+            }
+            Msg::Nak { from: acker, want_from } => {
+                // T13: gap-repair request — see the crypto gate in the
+                // `Msg::Data` arm above. `to` here is the leader the request
+                // is addressed to; a stale/former leader simply ignores it
+                // (the requester will re-address its next attempt once it
+                // adopts the real current leader via a subsequent `Data`).
+                if matches!(self.nodes[to].sm.role(), Role::Leader) {
+                    let gate = self.data_seal_gate(to, now);
+                    if gate != SealGate::Withhold {
+                        let epoch = match gate {
+                            SealGate::Sealed(e) => Some(e),
+                            _ => None,
+                        };
+                        let ap = self.nodes[to].append;
+                        let term = self.nodes[to].sm.current_term();
+                        let from_pos = want_from.min(ap);
+                        let msg = self.make_data(to, from_pos, ap, term, epoch);
+                        self.send(to, acker as usize, msg, now);
+                    }
+                }
+                Ok(())
+            }
+            Msg::Handshake { kind, body } => {
+                self.deliver_handshake(to, from, kind, body, now);
                 Ok(())
             }
         }
@@ -1427,9 +1907,21 @@ impl World {
                 // Immediate heartbeat so followers re-arm (avoids a spurious
                 // competing election right after we win). The NewTerm frame
                 // [base, pos) is the new term; prev_term is whatever preceded it.
-                for p in self.config_peers(node) {
-                    let msg = self.make_data(node, base, pos, term);
-                    self.send(node, p, msg, now);
+                // T13: gated exactly like the on_tick replication loop — a
+                // crypto-enabled leader that has never minted has nothing to
+                // seal this frame under yet (the auto-mint below fires in
+                // this SAME action batch, so the very next tick's resend
+                // picks it up once activated).
+                let gate = self.data_seal_gate(node, now);
+                if gate != SealGate::Withhold {
+                    let epoch = match gate {
+                        SealGate::Sealed(e) => Some(e),
+                        _ => None,
+                    };
+                    for p in self.config_peers(node) {
+                        let msg = self.make_data(node, base, pos, term, epoch);
+                        self.send(node, p, msg, now);
+                    }
                 }
                 // Intake gate (Mechanism): a leader is the source of truth — gate
                 // open, no reconcile pending (mirrors uc2_node::exec BecomeLeader).
@@ -1437,6 +1929,16 @@ impl World {
                 nd.adopted_term = term;
                         nd.intake_gate = true;
                 nd.pending_trunc_to = None;
+
+                // T13/T17 parity: the real node layer mints a fresh group-key
+                // epoch on every BecomeLeader (`uc2_crypto::rotation`'s
+                // trigger 1). A REAL shipped bug (T17) was a cold-start
+                // livelock caused by exactly this call racing the
+                // (much shorter) election-timeout retry loop, fixed by
+                // `GroupPlane::mint`'s inherited-activation-clock change —
+                // mirroring the wiring here lets the sim catch a regression
+                // of either that fix or the mint-on-elect call itself.
+                self.mint_group_key_on(node);
             }
             Action::BecomeFollower { term, leader } => {
                 self.nodes[node].leader_hint = leader.map(|l| l as usize);
@@ -1492,9 +1994,19 @@ impl World {
                 }
             }
             Action::GossipCommit { commit } => {
-                let term = self.nodes[node].sm.current_term();
-                for p in self.config_peers(node) {
-                    self.send(node, p, Msg::CommitGossip { term, commit }, now);
+                // T13: gated exactly like on_tick's DATA replication loop —
+                // production classifies COMMIT_POSITION as Scope::Group too
+                // (see Msg::CommitGossip's doc).
+                let gate = self.data_seal_gate(node, now);
+                if gate != SealGate::Withhold {
+                    let epoch = match gate {
+                        SealGate::Sealed(e) => Some(e),
+                        _ => None,
+                    };
+                    let term = self.nodes[node].sm.current_term();
+                    for p in self.config_peers(node) {
+                        self.send(node, p, Msg::CommitGossip { term, commit, epoch }, now);
+                    }
                 }
             }
             Action::ShipTermMap { entries } => {
@@ -1703,6 +2215,179 @@ impl World {
         self.quiet = quiet;
     }
 
+    // ---------------------------------------------------- T13: crypto plane
+
+    /// Turns on the crypto plane for the first `n` nodes (normally
+    /// `cfg.n_nodes`). Builds real on-disk X25519 identities and a shared
+    /// allowlist under a per-seed scratch directory on real disk (never
+    /// `/tmp` — RAM-backed tmpfs, no swap on the dev box; CLAUDE.md), wires a
+    /// `Peers` + `GroupPlane` per node, and has every node initiate a
+    /// handshake to every other. `HS_INIT`/`HS_RESP`/`HS_KEY` (kinds
+    /// 18/19/20) then ride the SAME lossy/partitionable `send`/`deliver`
+    /// path as every other message — see `Msg::Handshake`.
+    ///
+    /// The generated key BYTES are deterministic (derived from `cfg.seed`
+    /// and the node index via this module's own `XorShift64`), so a seed's
+    /// *schedule* — ordering, loss, reorder, partition, and the timer
+    /// domain — replays byte-for-byte across runs. The Noise handshake's own
+    /// ephemeral keys (`snow`, via the OS RNG) and `GroupPlane::mint`'s fresh
+    /// group-key material do NOT reproduce byte-for-byte even so — this sim
+    /// deliberately does not depend on that; see the task report for why
+    /// `snow::Builder::fixed_ephemeral_key_for_testing_only` was not used.
+    ///
+    /// # Panics
+    /// If `n` exceeds `cfg.n_nodes`, or the scratch-directory I/O fails.
+    pub fn enable_crypto_plane(&mut self, n: usize) {
+        assert!(
+            n <= self.cfg.n_nodes,
+            "enable_crypto_plane: n ({n}) exceeds the world's node count ({})",
+            self.cfg.n_nodes
+        );
+        let dir = crypto_scratch_dir();
+
+        let mut identities = Vec::with_capacity(n);
+        for i in 0..n {
+            let key_path = dir.join(format!("node-{i}.key"));
+            std::fs::write(&key_path, deterministic_key_bytes(self.cfg.seed, i as u64))
+                .expect("sim crypto scratch: write key file");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                    .expect("sim crypto scratch: chmod key file");
+            }
+            identities.push(Identity::load(&key_path).expect("sim-generated key must load"));
+        }
+
+        let allow_path = dir.join("allowlist");
+        let mut text = String::new();
+        for (i, id) in identities.iter().enumerate() {
+            text.push_str(&format!("{i} {}\n", BASE64.encode(id.public_bytes())));
+        }
+        std::fs::write(&allow_path, text).expect("sim crypto scratch: write allowlist");
+
+        for (i, identity) in identities.into_iter().enumerate() {
+            let allowlist =
+                Allowlist::load(&allow_path).expect("sim-generated allowlist must load");
+            let boot_salt = BootSalt(deterministic_salt_bytes(self.cfg.seed, i as u64));
+            self.nodes[i].crypto = Some(NodeCrypto {
+                peers: Peers::new(identity, allowlist, i as u32, boot_salt),
+                group: GroupPlane::new(i as u32),
+                next_sweep_ns: 0,
+            });
+        }
+
+        let now = self.now;
+        for i in 0..n {
+            for p in 0..n {
+                if p == i {
+                    continue;
+                }
+                let actions =
+                    self.nodes[i].crypto.as_mut().unwrap().peers.initiate(p as u32, now);
+                self.dispatch_handshake_actions(i, actions, now);
+            }
+        }
+    }
+
+    /// True once every crypto-enabled node's pairwise session with every
+    /// other crypto-enabled node is established, in BOTH directions
+    /// (`Peers::is_established` from each side — a one-directional check
+    /// would pass for the WireGuard-style `current`/`pending` split even
+    /// when only one side has promoted).
+    pub fn all_peer_sessions_established(&self) -> bool {
+        let ids: Vec<usize> =
+            (0..self.nodes.len()).filter(|&i| self.nodes[i].crypto.is_some()).collect();
+        ids.iter().all(|&i| {
+            ids.iter().all(|&j| {
+                i == j
+                    || self.nodes[i]
+                        .crypto
+                        .as_ref()
+                        .is_some_and(|c| c.peers.is_established(j as u32))
+            })
+        })
+    }
+
+    /// The current leader's most-recently-minted group-key epoch — the
+    /// epoch `World::rotate_group_key` last produced, or its own
+    /// auto-minted-on-`BecomeLeader` epoch if `rotate_group_key` was never
+    /// called. `0` (the wire's reserved cleartext sentinel — never a real
+    /// mint, see `GroupPlane::new`) if there is no current leader, or it
+    /// isn't crypto-enabled, or it has never minted.
+    pub fn current_epoch(&self) -> u16 {
+        let Some(leader) = self.current_leader() else {
+            return 0;
+        };
+        self.nodes[leader]
+            .crypto
+            .as_ref()
+            .and_then(|c| c.group.schedule().current())
+            .map(|(e, _)| e)
+            .unwrap_or(0)
+    }
+
+    /// Whether `node` has installed `epoch` into its group-key schedule
+    /// (openable — not necessarily the epoch it currently SEALS under; see
+    /// `sealing_epoch` vs `schedule` in `uc2_crypto::group::GroupPlane`).
+    /// `false` if `node` is not crypto-enabled.
+    pub fn node_has_group_epoch(&self, node: usize, epoch: u16) -> bool {
+        self.nodes[node]
+            .crypto
+            .as_ref()
+            .is_some_and(|c| c.group.schedule().get(epoch).is_some())
+    }
+
+    /// Drops every `HS_KEY` (kind 20) delivery addressed to `node` while
+    /// `self.now < until_ns` — applied at the "socket," before the fault
+    /// dice, so it is deterministic regardless of `drop_per_million`.
+    /// Models a key-distribution gap of a specific, scripted DURATION (the
+    /// T12 regression this task's brief calls out is the `until_ns ==
+    /// self.now` / "just the next one" special case) without perturbing
+    /// the general loss model. A later call replaces any earlier deadline
+    /// for the same node (does not stack); pass an already-past `until_ns`
+    /// to clear a block early.
+    pub fn block_key_delivery_to(&mut self, node: usize, until_ns: u64) {
+        self.key_delivery_blocked_until.insert(node, until_ns);
+    }
+
+    /// The current leader (or node 0, if none is serving — e.g. before the
+    /// first election) mints a fresh group-key epoch and fans out `HS_KEY`
+    /// to every other admitted node, through the normal send/deliver path.
+    /// Mirrors the node layer: only the leader ever mints
+    /// (`uc2_crypto::rotation`). A no-op if the minter is not
+    /// crypto-enabled.
+    pub fn rotate_group_key(&mut self) {
+        let node = self.current_leader().unwrap_or(0);
+        self.mint_group_key_on(node);
+    }
+
+    /// The current leader's durable (fsync'd) position; `0` if there is no
+    /// current leader.
+    pub fn leader_durable(&self) -> u64 {
+        self.current_leader().map(|l| self.nodes[l].durable).unwrap_or(0)
+    }
+
+    /// Directly advances the current leader's append (write) position by
+    /// `bytes`, letting the normal per-tick replication loop carry it to
+    /// followers — through the crypto gate, if enabled — exactly like an
+    /// ordinary client write growing the log. A no-op if there is no
+    /// current leader.
+    pub fn append_and_replicate(&mut self, bytes: u64) {
+        if let Some(leader) = self.current_leader() {
+            self.nodes[leader].append += bytes;
+        }
+    }
+
+    /// How many `Msg::Nak` gap-repair requests `node` has SENT so far — the
+    /// sim's model of the existing reliable-UDP NAK-repair path (see the
+    /// crypto gate in `deliver`'s `Msg::Data` arm). Proves a convergence
+    /// went through that path specifically, not merely that it eventually
+    /// happened some other way.
+    pub fn nak_count(&self, node: usize) -> u32 {
+        self.nodes[node].nak_sent
+    }
+
     /// Number of truncations any node has performed so far (for mid-run assertions).
     pub fn truncations(&self) -> u32 {
         self.stat_truncations
@@ -1750,7 +2435,10 @@ impl World {
         self.steps += 1;
         let step = self.steps;
         let now = self.now;
-        let msg = Msg::Data { term, seg_term, from_pos, to_pos, prev_term };
+        // `epoch: None` — this bypasses the network model entirely (a
+        // scripted craft), so it also bypasses the T13 crypto gate exactly
+        // like the pre-M8 behavior; see `Msg::Data`'s doc.
+        let msg = Msg::Data { term, seg_term, from_pos, to_pos, prev_term, epoch: None };
         self.deliver(to, from, msg, now, step)?;
         // Mirror `step_once`'s post-event invariant 2 sweep.
         let maps: Vec<Vec<(u32, u64)>> = self.nodes.iter().map(|n| n.term_map.clone()).collect();
@@ -1960,6 +2648,14 @@ impl World {
     /// The global commit high-water (max commit any node ever certified).
     pub fn max_commit(&self) -> u64 {
         self.checker.global_max_commit
+    }
+
+    /// The world's current virtual-time instant (ns). T13: lets a scripted
+    /// scenario compute an ABSOLUTE deadline for e.g.
+    /// `World::block_key_delivery_to` relative to "now," without needing
+    /// its own separate clock.
+    pub fn now(&self) -> u64 {
+        self.now
     }
 
     /// A node's own committed high-water (durable across restart).

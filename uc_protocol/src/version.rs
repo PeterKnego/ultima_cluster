@@ -22,7 +22,12 @@ impl ProtocolVersion {
     }
 }
 
-// 0.3.0: post-M7 follow-ups — cnc admission_bytes @3712, admin reason codes 11/12 (additive).
+// 0.4.0: M8 wire-crypto layouts — key_epoch header field (datagram.rs),
+// crypto envelope constants + kinds 18-20 (v2::crypto). No cnc-page change:
+// M8 alters the UDP datagram format, not the shmem cnc page, so
+// `CNC_V2_VERSION` is deliberately left untouched — bumping it would refuse
+// old service/client binaries at local IPC attach over a change that cannot
+// affect them.
 //
 // NB (post-M7 loose-end): these two constants and `ProtocolVersion::
 // compatible_with` are NOT on any live enforcement path — grep the workspace
@@ -33,10 +38,12 @@ impl ProtocolVersion {
 // `uc_protocol::v2::cnc::version_compatible(local, peer)` over the packed
 // `CNC_V2_VERSION` u32 (that module is `core`-only, so it re-spells the
 // same-major / peer-minor-not-newer rule directly rather than depend on this
-// type). Keep `CURRENT` in step with `CNC_V2_VERSION` by convention when you
-// bump the wire version; it documents the semver of the protocol but does not
-// itself enforce anything.
-pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 3, 0);
+// type). The two version lines are INDEPENDENT, not lockstep: `CNC_V2_VERSION`
+// gates the cnc shmem page format at local IPC attach and has its own history
+// (stuck at major=2/minor=0 since M5 while `CURRENT` moved 0.1.0 through
+// 0.4.0); `CURRENT` documents the semver of the wire *datagram* protocol but
+// does not itself enforce anything.
+pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 4, 0);
 pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["uc_protocol", "uc2_log", "uc2_net", "uc2_consensus", "uc2_sim", "uc2_node", "uc2_service", "uc2_client", "uc-lincheck", "ultima_journal", "examples/uc2-crashtest"]
+members = ["uc_protocol", "uc2_log", "uc2_net", "uc2_consensus", "uc2_sim", "uc2_node", "uc2_service", "uc2_client", "uc2_crypto", "uc-lincheck", "ultima_journal", "examples/uc2-crashtest"]
 
 [workspace.package]
 edition = "2024"
@@ -51,6 +51,41 @@ wait-timeout = "0.2"
 # cli + bench harness (uc2 gate examples)
 clap = { version = "4", features = ["derive"] }
 hdrhistogram = "7"
+
+# M8 wire crypto. Versions verified against crates.io 2026-07-28. The AEAD/hash
+# generation deliberately MATCHES the one snow pins internally (aes-gcm 0.10 /
+# sha2 0.10 era) so the binary carries ONE AES-GCM implementation, not two.
+# `use-chacha20poly1305` is enabled despite the handshake pattern being
+# AES-GCM-only (Noise_IK_25519_AESGCM_SHA256): snow 0.10.0 has an upstream bug
+# where resolvers/default.rs only imports `KeyInit`/`AeadInPlace` under the
+# chacha cfg, so the AES-only feature combination fails to compile
+# (Aes256Gcm::new unresolved). snow 0.9.6 declared chacha20poly1305
+# non-optional, so every prior release linked it anyway — this costs nothing
+# new. The chacha path is linked but never invoked.
+#
+# `risky-raw-split` is enabled deliberately (ruling 2026-07-28, spec §5): UC
+# takes the two transport keys out of the finished handshake and seals with
+# its OWN envelope, because snow's transport modes hard-code empty associated
+# data (cipherstate.rs:170) and would leave the 16-byte header unauthenticated
+# on the pairwise path. The "risky" in the name is snow warning that the
+# caller then owns nonce management — which this design does deliberately and
+# structurally, per-sender-per-boot, in `uc2_crypto::schedule::derive_send_key`.
+# Pure feature flag: no new crates, no version movement.
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-aes-gcm", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom", "std", "risky-raw-split"] }
+# `zeroize` scrubs the GHASH subkey; the paired `aes` feature below scrubs the
+# AES round keys (T5 review remedy — AES round keys are invertible back to the
+# 32-byte key, so a core dump / swap read could otherwise recover a live
+# per-sender key). Additive features, no new crates, no version movement:
+# `aes` 0.8.4 feature-unifies with the copy `aes-gcm` already links.
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+aes = { version = "0.8", default-features = false, features = ["zeroize"] }
+hkdf = "0.12"
+sha2 = "0.10"
+# `static_secrets` is required for `StaticSecret` — not in the 2.x default
+# feature set (which targets ephemeral-only Diffie-Hellman).
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = { version = "1", features = ["derive"] }
+base64 = "0.22"
 
 [profile.release]
 lto = "thin"

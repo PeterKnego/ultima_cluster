@@ -22,6 +22,15 @@ JAVA_XMX="${ELLE_JAVA_XMX:-2g}"
 # ELLE_CARGO_FEATURES=--features\ mutation-testing). The mutation PROOF lives in
 # scripts/elle_mutation.sh; this stays empty for the normal clean tier.
 CARGO_FEATURES="${ELLE_CARGO_FEATURES:-}"
+# M8 Task 15: UC2_CRYPTO=1 re-runs every pass below with wire crypto Enabled
+# on every node (see uc2_node/tests/elle_v2.rs's crypto_from_env / lincheck_v2's
+# ClusterCfg::crypto). Inherited by the `cargo test` subshell below like any
+# other exported var — named here only so it shows up in the run's own log line
+# and so a history cached under a DIFFERENT ELLE_DIR is never silently reused
+# across the crypto/no-crypto boundary (the caller must point ELLE_DIR at a
+# fresh directory to force regeneration either way — see the pass-generation
+# loop's `[ ! -f "$hist" ]` check below).
+UC2_CRYPTO="${UC2_CRYPTO:-0}"
 
 PASSES=("$@")
 [ ${#PASSES[@]} -eq 0 ] && PASSES=(quiet failover partition purge reconfig)
@@ -70,10 +79,29 @@ require false "$(verdict "$STRICT_MODEL" "$FIX_RT")" "realtime fixture rejected 
 
 for pass in "${PASSES[@]}"; do
     hist="$ELLE_DIR/$pass/history.edn"
-    if [ ! -f "$hist" ]; then
-        echo "== generating $pass history (elle_v2 driver) =="
+    crypto_sidecar="$ELLE_DIR/$pass/crypto"
+    if [ -f "$hist" ]; then
+        # M8 Task 15 review fix: a cached history under a reused ELLE_DIR can
+        # predate this posture check entirely (pre-Task-15 dir) or have been
+        # generated under the OTHER crypto posture — either way, adjudicating
+        # it and printing the REQUESTED posture (rather than the one it was
+        # actually generated under) is exactly the vacuity risk this whole
+        # task exists to close, one layer up: a UC2_CRYPTO=1 run against a
+        # directory of cleartext histories would otherwise print "crypto=1"
+        # having sealed nothing. Refuse rather than silently trust the ask.
+        cached_crypto="0"
+        if [ -f "$crypto_sidecar" ]; then
+            cached_crypto="$(cat "$crypto_sidecar")"
+        fi
+        if [ "$cached_crypto" != "$UC2_CRYPTO" ]; then
+            echo "error: $hist was generated under crypto=$cached_crypto but UC2_CRYPTO=$UC2_CRYPTO was requested." >&2
+            echo "hint: point ELLE_DIR at a fresh directory, or delete $ELLE_DIR/$pass to regenerate under the requested posture." >&2
+            exit 1
+        fi
+    else
+        echo "== generating $pass history (elle_v2 driver, crypto=$UC2_CRYPTO) =="
         # shellcheck disable=SC2086
-        (cd "$ROOT" && ELLE_DIR="$ELLE_DIR" cargo test -p uc2_node --release $CARGO_FEATURES \
+        (cd "$ROOT" && ELLE_DIR="$ELLE_DIR" UC2_CRYPTO="$UC2_CRYPTO" cargo test -p uc2_node --release $CARGO_FEATURES \
             --test elle_v2 -- --ignored --exact "elle_$pass" --nocapture)
     fi
     echo "== $pass: $(wc -l < "$hist") events =="
@@ -81,4 +109,4 @@ for pass in "${PASSES[@]}"; do
     require "true|" "$(classify "$STRICT_MODEL" "$hist")" "$pass clean under $STRICT_MODEL"
 done
 
-echo "elle consistency check passed (${PASSES[*]})"
+echo "elle consistency check passed (${PASSES[*]}, crypto=$UC2_CRYPTO)"

@@ -42,6 +42,7 @@
 
 #![allow(dead_code)] // each test file uses a different subset of the harness API
 
+use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -54,9 +55,11 @@ use rand::{Rng, SeedableRng};
 
 use uc2_client::{Client, ClientError};
 use uc2_consensus::election::NodeId;
+use uc2_crypto::identity::Identity;
+use uc2_crypto::rotation::RotationPolicy;
 use uc2_log::cnc::{AdminReq, AdminResp, CncPage};
 use uc2_net::fault::FaultConfig;
-use uc2_node::{Node, NodeConfig};
+use uc2_node::{CryptoConfig, Node, NodeConfig};
 use uc2_service::{ServiceBuilder, ServiceConfig, SnapshotPolicy, SnapshotStateMachine};
 
 use uc_lincheck::history::{History, Outcome};
@@ -82,6 +85,98 @@ fn seed_for(i: usize) -> u64 {
     0xA1B2_C3D4_5566_7788 ^ (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+// --------------------------------------------------- M8 Task 15: crypto ON
+//
+// Re-running the project's correctness capstones with wire crypto enabled
+// (spec 2026-07-28, task 15). `ClusterCfg::crypto` is the switch; when set,
+// `LinClusterV2` generates one X25519 keypair per node id (base `0..n` plus,
+// for `spare_node` clusters, a generous block of M7 spare ids) and a single
+// shared allowlist, then boots every node with `CryptoConfig::Enabled`
+// instead of `Disabled`. Mirrors `uc2_node/tests/crypto_cluster.rs`'s own
+// fixture (`write_crypto_material`), generalized from a contiguous `0..n`
+// index to an explicit id LIST — the M7 spare's ids are not contiguous with
+// the base members and are allocated lazily (`LinClusterV2::next_spare_id`).
+
+/// Deterministic per-id private key. Distinct byte pattern from
+/// `crypto_cluster.rs`'s own fixture (pure coincidence would be harmless,
+/// but there is no reason to share key material between two independent
+/// test binaries).
+fn crypto_private_key(id: NodeId) -> [u8; 32] {
+    let mut k = [0x70u8; 32];
+    k[0..4].copy_from_slice(&id.to_le_bytes());
+    k
+}
+
+fn crypto_write_key_file(path: &Path, private: [u8; 32]) {
+    std::fs::write(path, private).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+/// Standard-alphabet base64 with padding, matching `uc2_crypto::identity`'s
+/// allowlist parser — hand-rolled the same way `crypto_cluster.rs` does,
+/// rather than adding a `base64` dev-dependency for one fixture.
+fn crypto_b64_32(bytes: &[u8; 32]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Every id a crypto-enabled cluster of `n` base members might ever need a
+/// key for: `0..n` plus, when `spare_node` is set, a generous block of the
+/// M7 reconfig-churn capstone's spare ids (`LinClusterV2::next_spare_id`
+/// starts at 100 and increments once per add/remove cycle — a full budgeted
+/// run cycles through at most a couple dozen).
+fn crypto_ids_for(n: usize, spare_node: bool) -> Vec<NodeId> {
+    let mut ids: Vec<NodeId> = (0..n as NodeId).collect();
+    if spare_node {
+        ids.extend(100..200);
+    }
+    ids
+}
+
+/// One keypair per id in `ids` plus a single shared allowlist naming all of
+/// them (every node trusts every other node — the same posture
+/// `crypto_cluster.rs` and a `uc2ctl`-managed operator allowlist both use).
+struct CryptoMaterial {
+    key_paths: HashMap<NodeId, PathBuf>,
+    allowlist_path: PathBuf,
+}
+
+fn write_crypto_material(dir: &Path, ids: &[NodeId]) -> CryptoMaterial {
+    let mut key_paths = HashMap::with_capacity(ids.len());
+    let mut publics = Vec::with_capacity(ids.len());
+    for &id in ids {
+        let node_dir = dir.join(format!("keys{id}"));
+        std::fs::create_dir_all(&node_dir).unwrap();
+        let key_path = node_dir.join("node.key");
+        crypto_write_key_file(&key_path, crypto_private_key(id));
+        let public = Identity::load(&key_path).unwrap().public_bytes();
+        publics.push((id, public));
+        key_paths.insert(id, key_path);
+    }
+    let mut text = String::new();
+    for (id, public) in &publics {
+        text.push_str(&format!("{id} {}\n", crypto_b64_32(public)));
+    }
+    let allowlist_path = dir.join("crypto-allowlist");
+    std::fs::write(&allowlist_path, text).unwrap();
+    CryptoMaterial { key_paths, allowlist_path }
+}
+
 /// Per-node config with the shared harness knobs (election 150–300 ms for
 /// sub-second failover, 4 MiB ring, small payloads). `faults` is applied to
 /// every one of the node's sockets (drop/dup/reorder), used by the lossy-links
@@ -103,6 +198,12 @@ pub struct ClusterCfg {
     /// default) reserves nothing — [`random_config_op`](LinClusterV2::random_config_op)
     /// panics if called on a cluster that didn't ask for one.
     pub spare_node: bool,
+    /// M8 Task 15: boot every node (base members AND, for a `spare_node`
+    /// cluster, every id the spare cycles through) with wire crypto
+    /// `Enabled` instead of `Disabled` — see the module docs above this
+    /// struct. `false` (the default) is byte-for-byte the pre-M8 posture:
+    /// every existing capstone is unaffected.
+    pub crypto: bool,
 }
 
 impl Default for ClusterCfg {
@@ -112,6 +213,7 @@ impl Default for ClusterCfg {
             journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
             snapshot_interval_bytes: 0,
             spare_node: false,
+            crypto: false,
         }
     }
 }
@@ -123,6 +225,7 @@ fn make_config(
     addr: SocketAddr,
     faults: FaultConfig,
     ccfg: ClusterCfg,
+    crypto: CryptoConfig,
 ) -> NodeConfig {
     // M7 Task 10: a `spare_node` cluster runs a REAL 4th node (its own full
     // set of polling agent threads + a service) on top of the base 3 — on a
@@ -151,6 +254,7 @@ fn make_config(
         purge: ccfg.purge,
         learners: Vec::new(),
         journal_segment_bytes: ccfg.journal_segment_bytes,
+        crypto,
     }
 }
 
@@ -258,6 +362,9 @@ pub struct LinClusterV2<SM: SnapshotStateMachine + Default = RegisterSm> {
     /// `pub` — the capstone reads it directly (`cluster.config_ops_accepted`).
     // counts LOCAL leader accepts (status=0 replies), not durable commits — a late-crash accept may be reverted; the capstone's non-vacuity floor only needs "the arm exercised reconfig", so accepts are the right denominator.
     pub config_ops_accepted: u32,
+    /// M8 Task 15: `Some` iff `ClusterCfg::crypto` was set — the provisioned
+    /// keypairs/allowlist every node (base member or spare) boots with.
+    crypto: Option<CryptoMaterial>,
 }
 
 impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
@@ -278,12 +385,37 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
         let members: Vec<(NodeId, SocketAddr)> =
             socks.iter().enumerate().map(|(i, s)| (i as NodeId, s.local_addr().unwrap())).collect();
 
+        // M8 Task 15: provision crypto material up front (base members plus,
+        // for a `spare_node` cluster, the whole spare id block) so every
+        // `make_config` call below — including later restarts and the
+        // spare's cycle — can look its own `CryptoConfig` up by id.
+        let crypto = ccfg
+            .crypto
+            .then(|| write_crypto_material(root, &crypto_ids_for(n, ccfg.spare_node)));
+        let crypto_config_for = |id: NodeId| -> CryptoConfig {
+            match &crypto {
+                Some(m) => CryptoConfig::Enabled {
+                    key_path: m.key_paths[&id].clone(),
+                    allowlist_path: m.allowlist_path.clone(),
+                    rotation: RotationPolicy::default(),
+                },
+                None => CryptoConfig::Disabled,
+            }
+        };
+
         let mut nodes = Vec::with_capacity(n);
         for (i, sock) in socks.into_iter().enumerate() {
             let addr = members[i].1;
             let instance_dir = root.join(format!("n{i}"));
-            let cfg =
-                make_config(i as NodeId, members.clone(), instance_dir.clone(), addr, faults, ccfg);
+            let cfg = make_config(
+                i as NodeId,
+                members.clone(),
+                instance_dir.clone(),
+                addr,
+                faults,
+                ccfg,
+                crypto_config_for(i as NodeId),
+            );
             let node = Node::start_with_socket(cfg, sock).expect("node start");
             // A follower's service follows the committed log too, so every node
             // carries a service from boot — the new leader after a failover
@@ -317,7 +449,42 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
             spare_phase: SparePhase::Idle,
             next_spare_id: 100,
             config_ops_accepted: 0,
+            crypto,
         }
+    }
+
+    /// M8 Task 15: this id's `CryptoConfig` — `Enabled` (looked up in the
+    /// provisioned material) iff `ClusterCfg::crypto` was set, else
+    /// `Disabled`. Used by every (re)boot path — initial start, a leader
+    /// restart, and the spare's fresh-id spawn — so a crypto-enabled
+    /// cluster stays crypto-enabled across every fault this harness injects.
+    fn crypto_config_for(&self, id: NodeId) -> CryptoConfig {
+        match &self.crypto {
+            Some(m) => CryptoConfig::Enabled {
+                key_path: m
+                    .key_paths
+                    .get(&id)
+                    .unwrap_or_else(|| panic!("no provisioned crypto key for id {id} — widen crypto_ids_for"))
+                    .clone(),
+                allowlist_path: m.allowlist_path.clone(),
+                rotation: RotationPolicy::default(),
+            },
+            None => CryptoConfig::Disabled,
+        }
+    }
+
+    /// M8 Task 15: the crypto epoch node `node` has MINTED, if any (see
+    /// `Node::crypto_epoch`'s doc: leader-only, `None` under
+    /// `CryptoConfig::Disabled` or before this node has ever led, `None`
+    /// also if the node isn't currently live). The crypto-enabled capstone
+    /// variants assert this is `Some` right after the initial election —
+    /// proof crypto was genuinely exercised (a real group key minted and
+    /// sealing traffic), not merely configured. A build where the `crypto`
+    /// switch silently did nothing would still elect a leader and pass
+    /// every liveness/linearizability bar; this is the check that catches
+    /// that specific failure mode.
+    pub fn crypto_epoch_of(&self, node: usize) -> Option<u16> {
+        self.nodes[node].node.as_ref().and_then(|n| n.crypto_epoch())
     }
 
     /// The fixed `(node-id → instance-dir)` map workers route over (index i = id
@@ -478,7 +645,8 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
         // Restart on the persisted dir + same port (static membership): recovers
         // durable state, rejoins in the current term.
         let sock = rebind(addr);
-        let cfg = make_config(id, self.members.clone(), dir.clone(), addr, self.faults, self.ccfg);
+        let crypto = self.crypto_config_for(id);
+        let cfg = make_config(id, self.members.clone(), dir.clone(), addr, self.faults, self.ccfg, crypto);
         let node = Node::start_with_socket(cfg, sock).expect("leader node restart");
         let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);
         self.nodes[li].node = Some(node);
@@ -696,8 +864,16 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
                 self.next_spare_id += 1;
                 let dir = spare_root.join(format!("id{id}"));
                 std::fs::create_dir_all(&dir).expect("spare instance dir");
-                let cfg =
-                    make_config(id, self.members.clone(), dir.clone(), spare_addr, self.faults, self.ccfg);
+                let crypto = self.crypto_config_for(id);
+                let cfg = make_config(
+                    id,
+                    self.members.clone(),
+                    dir.clone(),
+                    spare_addr,
+                    self.faults,
+                    self.ccfg,
+                    crypto,
+                );
                 let sock = rebind(spare_addr);
                 let node = Node::start_with_socket(cfg, sock).expect("spare node start");
                 let service = spawn_service(&dir, self.ccfg.snapshot_interval_bytes);

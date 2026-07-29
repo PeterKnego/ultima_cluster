@@ -148,6 +148,7 @@ fn make_config(
         faults: FaultConfig::default(),
         purge: uc2_node::PurgePolicy::Disabled,
         journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+        crypto: uc2_node::CryptoConfig::Disabled,
     }
 }
 
@@ -367,6 +368,7 @@ fn fresh_learner_joins_a_purged_leader_via_snapshot_session() {
         faults: FaultConfig::default(),
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: SEG,
+        crypto: uc2_node::CryptoConfig::Disabled,
     };
 
     let v_dir = dir.path().join("v0");

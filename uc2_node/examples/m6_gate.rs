@@ -293,6 +293,7 @@ fn make_config(
         faults: FaultConfig::default(),
         purge: PurgePolicy::BelowSnapshot { slack_bytes: 0 },
         journal_segment_bytes: SEGMENT_BYTES,
+        crypto: uc2_node::CryptoConfig::Disabled,
     }
 }
 

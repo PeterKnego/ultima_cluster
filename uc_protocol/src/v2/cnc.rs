@@ -130,6 +130,20 @@ const _: () = assert!(CNC_OFF_ADMIN_RESP + 64 <= CNC_PAGE_LEN);
 pub const CNC_OFF_ADMISSION_BYTES: usize = 3712;
 const _: () = assert!(CNC_OFF_ADMISSION_BYTES + 64 <= CNC_PAGE_LEN);
 
+/// M8 (Task 10 review round 1, 2026-07-29): cumulative count of DATA/HEARTBEAT
+/// datagrams the sender agent dropped because `Transport::seal` failed
+/// (`NoGroupKey`, an evicted epoch, etc.) — mirrors `SenderStats::seal_failures`.
+/// Writer: sender agent, once per duty cycle (same cadence as the peer-slot
+/// band's `advertised_limit`, never per-datagram). 0 on a cleartext node or one
+/// that has never hit a seal failure. Exists because a PERSISTENT seal failure
+/// is exactly the condition an operator must see externally: it silently drops
+/// live DATA *and* HEARTBEAT, so a follower may never even learn there is a gap
+/// to NAK for — `seal_failures` alone (process-internal `AtomicU64` stats) is
+/// invisible to anything outside the node process. Next free reserved-band
+/// offset after this line: 3840.
+pub const CNC_OFF_SEAL_FAILURES: usize = 3776;
+const _: () = assert!(CNC_OFF_SEAL_FAILURES + 64 <= CNC_PAGE_LEN);
+
 pub const NODE_FLAG_LEADER: u64 = 1;
 pub const NODE_FLAG_CAN_SERVE: u64 = 2;
 
@@ -424,5 +438,7 @@ mod tests {
         assert_eq!(CNC_OFF_ADMIN_RESP, 3648);
         // Post-M7 (0.3.0): admission_bytes.
         assert_eq!(CNC_OFF_ADMISSION_BYTES, 3712);
+        // M8 (Task 10 review round 1): seal_failures.
+        assert_eq!(CNC_OFF_SEAL_FAILURES, 3776);
     }
 }

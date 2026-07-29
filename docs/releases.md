@@ -1,5 +1,74 @@
 # ultima_cluster releases
 
+## Unreleased (wire protocol 0.4.0) — M8 wire crypto
+
+**Opt-in, off by default.** Authenticated + encrypted node↔node UDP transport.
+A cluster runs either all-encrypted or all-cleartext — **flag day, no mixed
+mode**. Nothing changes for a deployment that does not set `CryptoConfig`.
+Design: `docs/superpowers/specs/2026-07-28-uc2-wire-crypto-design.md`. Gate:
+`docs/benchmarks/uc2-m8-gate-2026-07-29.md`. Operator setup: runbook §11.
+
+- **Identity + handshake.** Each node holds an X25519 static keypair; peers are
+  authorized by an allowlist (`node id → static public key`, SSH
+  `authorized_keys`-style, re-read at runtime so M7 node-adds need no restart).
+  Noise `IK` (`Noise_IK_25519_AESGCM_SHA256`, via `snow`) establishes per-peer
+  pairwise keys; the allowlist is enforced explicitly on the responder side.
+- **Two key scopes, split by datagram kind.** Pairwise keys seal the unicast /
+  low-rate kinds; a **cluster group key** seals the byte-identical fan-out
+  (`DATA`/`HEARTBEAT`/`COMMIT_POSITION`/`READ_PROBE`) so the leader seals once
+  and sends N times. The group key is minted by the leader, delivered per peer
+  over the pairwise channel, and **rotates** on becoming leader, on a timer /
+  byte budget, and on a committed `Remove*`.
+- **Wire envelope.** The 16-byte datagram header stays cleartext and is
+  authenticated as AES-256-GCM **associated data** (so `position`/`term`/`kind`/
+  `key_epoch` cannot be rewritten undetected); an 8-byte per-sender counter and
+  a 16-byte tag follow the payload — **24 bytes overhead**. The nonce is
+  `0 ‖ counter` under a key derived **per sender per boot**
+  (`HKDF(group_key, sender_id ‖ boot_salt)`), which makes counter reuse after a
+  restart impossible by construction. RFC-6479 sliding-window anti-replay per
+  `(sender, epoch)`.
+- **Wire protocol → 0.4.0** (`version::CURRENT`). The `cnc.dat` page layout and
+  its live `CNC_V2_VERSION` compatibility gate are **unchanged** — M8 changes
+  the UDP datagram format, not the shmem page, so a 0.4.0 node's service/client
+  IPC still accepts the older peers it did before. A new cnc observability
+  field (`seal_failures`) is added in the reserved band.
+- **Threat model.** A network-path adversary (read / inject / replay / reorder /
+  corrupt, no node private key). **Out of model, documented residuals:** a
+  compromised host; a malicious cluster member (the group key is symmetric, so
+  any holder can forge fan-out traffic as any node); a removed node retains
+  decryption of captured traffic until the next rotation; cleartext headers
+  leak positions/terms/kinds to a passive observer.
+- **Boot refusal.** An `Enabled` node whose key files are missing or unreadable
+  refuses to start (it must not silently fall back to cleartext).
+- **Correctness.** The full local proof stack and all four capstones
+  (`lin_v2`, `lin_partition_v2`, the multi-process SIGKILL crashtest, and the
+  elle tier under both models) pass with crypto ON, with the anti-vacuity of
+  "crypto was actually on" proven by mutation (T15). Deterministic sim coverage
+  of the handshake under loss/partition and key rotation (T13); an adversarial
+  tier proving a replayed VOTE is refused, a revoked/impostor peer cannot
+  establish, a cleartext downgrade is refused, and a corruption+replay storm
+  neither panics nor diverges (T14).
+- **Throughput (local same-box A/B, gate doc):** encrypted median **94.1%** of
+  the cleartext control — a **5.9% regression, PASS** against the pre-committed
+  ≤10% bar — on a deliberately worst-case contention box (3 in-process nodes,
+  4 cores). Hardware AES-NI dispatch verified (8.2× vs a forced-software build).
+  The definitive absolute number is the cross-host fleet A/B, owner-approved
+  separately.
+- **Known benign observability wart:** on an encrypted leader, the in-window
+  `seal_failures` counter climbs continuously — the receiver reports its
+  position to `cfg.leader`, which on the leader is *itself*, and there is no
+  self-session, so each self-addressed report fails to seal. Pre-existing v2
+  self-send made visible by the counter; harmless (the leader's position
+  reaches commit ranking in memory). A follow-up will suppress the
+  self-addressed report.
+- **Deferred / follow-up:** the lock-free `sealing_epoch` fast path (not needed
+  — arm A passed); suppressing the leader self-send; a release-mode OOB-read in
+  `uc2_log`'s `read_frame_validated` (`debug_assert!`-only bounds guard,
+  pre-existing v2 code from `72f649b`, out of M8 scope, surfaced during T14).
+
+*The 0.3.0 items below ship in the same next tag; 0.4.0 supersedes the version
+number.*
+
 ## Unreleased (wire protocol 0.3.0)
 Post-M7 follow-up hardening (no new externally-visible features). Wire protocol
 bumped **0.2.0 → 0.3.0**, additive only:

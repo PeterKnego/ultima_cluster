@@ -48,6 +48,14 @@ fn env_f64(name: &str, default: f64) -> f64 {
     std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
+/// M8 Task 15: `UC2_CRYPTO=1` re-runs the clean elle tier with wire crypto
+/// enabled on every node (see `lincheck_v2::ClusterCfg::crypto`) — honored
+/// uniformly by every pass through [`run_pass`], mirroring `scripts/
+/// elle_check.sh`'s own env-switch convention.
+fn crypto_from_env() -> bool {
+    std::env::var("UC2_CRYPTO").ok().as_deref() == Some("1")
+}
+
 fn elle_dir() -> PathBuf {
     // Default to DISK, never /tmp: /tmp is RAM-backed tmpfs with no swap on this
     // box and a 50k-event history OOM-kills the run (see CLAUDE.md). The
@@ -145,7 +153,7 @@ fn elle_worker(
 #[allow(clippy::too_many_arguments)]
 fn run_pass<F, V>(
     name: &str,
-    ccfg: ClusterCfg,
+    mut ccfg: ClusterCfg,
     default_target_ops: u64,
     default_workers: u64,
     min_ok_pct: u64,
@@ -162,12 +170,25 @@ fn run_pass<F, V>(
     let keys = env_u64("ELLE_KEYS", 8) as u32;
     let target = env_u64("ELLE_TARGET_OPS", default_target_ops);
     let budget = Duration::from_secs(env_u64("ELLE_BUDGET_SECS", 120));
+    // M8 Task 15: honor UC2_CRYPTO=1 uniformly across every pass.
+    ccfg.crypto = crypto_from_env();
 
     let _g = serialize();
     let dir = tempdir();
     let mut cluster =
         LinClusterV2::<ListAppendSm>::start_cfg(dir.path(), 3, FaultConfig::default(), ccfg);
-    cluster.await_single_serving(30);
+    let leader0 = cluster.await_single_serving(30);
+    // Anti-vacuity (M8 Task 15): if crypto was supposed to be on, the elected
+    // leader must have actually MINTED a group epoch — proof the switch did
+    // something real, not just that the cluster formed (which it would do
+    // even if `crypto` silently had no effect).
+    if ccfg.crypto {
+        assert!(
+            cluster.crypto_epoch_of(leader0).is_some(),
+            "[elle {name}] UC2_CRYPTO=1 but the elected leader never minted a crypto group \
+             epoch — wire crypto did not actually engage"
+        );
+    }
 
     let dirs = Arc::new(cluster.dirs());
     let rec = Arc::new(EdnRecorder::new(n_workers as u64));
@@ -210,6 +231,15 @@ fn run_pass<F, V>(
     let out = elle_dir().join(name);
     rec.write_to(&out.join("history.edn")).expect("write history");
     std::fs::write(out.join("seed"), format!("{seed}\n")).expect("write seed");
+    // M8 Task 15 review fix: record the posture this history was ACTUALLY
+    // generated under, beside the existing `seed` sidecar. `scripts/
+    // elle_check.sh`'s cache-reuse check (`[ ! -f "$hist" ]`) is otherwise
+    // blind to a stale ELLE_DIR crossing the crypto boundary — a directory
+    // of crypto histories re-adjudicated under `UC2_CRYPTO=0` (or the more
+    // dangerous mirror: `UC2_CRYPTO=1` against cleartext histories) would
+    // print a posture it never actually ran. The sidecar lets the script
+    // refuse that mismatch instead of silently trusting the caller's ask.
+    std::fs::write(out.join("crypto"), if ccfg.crypto { "1\n" } else { "0\n" }).expect("write crypto sidecar");
 
     let (ok, completed) = (rec.ok_count(), rec.completed_count());
     eprintln!(
@@ -313,6 +343,7 @@ fn elle_purge() {
         journal_segment_bytes: 16 * 1024,
         snapshot_interval_bytes: 32 * 1024,
         spare_node: false,
+        crypto: false,
     };
     run_pass(
         "purge",

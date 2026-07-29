@@ -12,6 +12,7 @@ uc_protocol = { path = "../uc_protocol" }
 uc2_log = { path = "../uc2_log" }
 uc2_net = { path = "../uc2_net" }
 uc2_consensus = { path = "../uc2_consensus" }
+uc2_crypto = { path = "../uc2_crypto" }
 ultima-journal = { workspace = true }
 thiserror = { workspace = true }
 fs2 = { workspace = true }

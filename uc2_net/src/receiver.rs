@@ -15,6 +15,7 @@
 //! agent over a bounded channel (control is kHz; a full channel drops, and
 //! NAK backoff / status refresh recover).
 
+use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -23,8 +24,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
+use uc2_crypto::{CryptoError, NodeId, ReceiveHalf};
 use uc2_log::buffer::LogBuffer;
 use uc2_log::writer::PositionedWriter;
+use uc_protocol::v2::crypto::{CRYPTO_OVERHEAD, DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_KEY, DGRAM_KIND_HS_RESP};
 use uc_protocol::v2::datagram::{
     ConfigProposalBody, ConfigReplyBody, DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION,
     DGRAM_KIND_COMMIT_POSITION,
@@ -46,6 +49,115 @@ use crate::TermHandle;
 use crate::fault::FaultSocket;
 use crate::rebuild::{NakConfig, NakTimer, Rebuilt};
 use crate::sender::CtrlMsg;
+
+/// M8 (Task 11): a handshake-plane datagram (kinds 18/19/20) forwarded off
+/// the receive seam, `(from, kind, opened-body-if-any)`. `HS_INIT`/`HS_RESP`
+/// (18/19, `Scope::Unsealed`) carry their body verbatim off the wire — no
+/// session exists yet to open them under. `HS_KEY` (20, `Scope::Pairwise`)
+/// carries its body AFTER `ReceiveHalf::open_slice` has already decrypted
+/// it — see `crypto_admit`. Nothing in `uc2_net` drives the actual handshake
+/// state machine from this route yet; that is Task 12's node-layer wiring
+/// (`uc2_crypto::SharedTransport::initiate`/`on_handshake_message`/
+/// `on_group_key_message`, T11's own plan-gap addition). Until a route is
+/// supplied in [`CryptoIntake::handshake`] (T12 made it a constructor
+/// argument, not an optional setter), these are dropped and counted
+/// (`FollowerStats::dropped_handshake`) — never silently absorbed, and never
+/// fed to `on_datagram`, which has no idea what an HS_INIT is.
+pub type HandshakeDatagram = (SocketAddr, u8, Vec<u8>);
+
+/// M8 (Task 12): the live `SocketAddr -> NodeId` map `crypto_admit` resolves
+/// a datagram's sender through before it can authenticate anything, shared
+/// with whoever owns membership (the node's consensus agent).
+///
+/// **Shared and versioned, not a snapshot.** Task 11 took the map by value at
+/// construction, which is correct only for a cluster whose membership never
+/// changes — and M7 changes membership at runtime. After an `add-learner`
+/// commits, a node that still held the boot-time map would resolve nothing
+/// for the joiner and drop every datagram it sends as `dropped_unknown_peer`
+/// until the whole cluster restarted, defeating the very case §5 of the spec
+/// exists to serve (the allowlist half of which is handled by
+/// `Peers::allowlist_reload_if_stale`).
+///
+/// The receiver re-reads the map only when `generation` changes — one
+/// `Relaxed` load per duty cycle (not per datagram), and the `Mutex` is
+/// touched only on an actual membership change. `store` is the sole writer's
+/// entry point; it replaces the map wholesale and then bumps `generation`
+/// (that order matters: a reader that observes the new generation is
+/// guaranteed to find the new map behind it).
+#[derive(Clone, Default)]
+pub struct PeerIds {
+    generation: Arc<AtomicU64>,
+    map: Arc<Mutex<HashMap<SocketAddr, NodeId>>>,
+}
+
+impl PeerIds {
+    /// An empty map at generation 0.
+    pub fn new() -> PeerIds {
+        PeerIds::default()
+    }
+
+    /// Replaces the whole map and publishes it (bumping `generation`, which
+    /// is what makes a running receiver pick it up). Called by the node's
+    /// consensus agent at boot and on every adopted `ClusterConfig`.
+    pub fn store(&self, ids: impl IntoIterator<Item = (SocketAddr, NodeId)>) {
+        let next: HashMap<SocketAddr, NodeId> = ids.into_iter().collect();
+        *self.map.lock().unwrap() = next;
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// A copy of the current map — for tests and diagnostics, never on a
+    /// per-datagram path.
+    pub fn snapshot(&self) -> HashMap<SocketAddr, NodeId> {
+        self.map.lock().unwrap().clone()
+    }
+
+    /// The publication generation — bumped by `store`. A mirroring agent
+    /// re-snapshots only when this changes (one `Acquire` load per duty
+    /// cycle). `pub` since T17: `uc2_net::sender::Sender` mirrors this map
+    /// too, for the pairwise snapshot seals.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+}
+
+/// M8 (Task 12): everything the receive path needs to run with crypto on,
+/// taken as ONE value so none of the three pieces can be forgotten.
+///
+/// Task 11 shipped the half as a constructor argument and the other two as
+/// separate `set_peer_ids`/`set_handshake_route` setters, documented but not
+/// enforced ("if T12 forgets `set_peer_ids`, every crypto-scoped datagram
+/// silently becomes `dropped_unknown_peer`" — T11's own hand-off note).
+/// A silent, total, cluster-wide failure that nothing catches is not a
+/// documentation problem; bundling the three makes the mistake a compile
+/// error instead.
+pub struct CryptoIntake {
+    /// The process's single [`ReceiveHalf`] (`SharedTransport::receive_half`).
+    pub half: ReceiveHalf,
+    /// The live sender-identity map — see [`PeerIds`].
+    pub peer_ids: PeerIds,
+    /// Where handshake-plane datagrams (kinds 18/19/20) go — see
+    /// [`HandshakeDatagram`]. Nothing in `uc2_net` drives the handshake state
+    /// machine; the node layer does.
+    pub handshake: mpsc::SyncSender<HandshakeDatagram>,
+    /// M8 (Task 17): the process's `SharedTransport`, for SEALING this
+    /// receiver's own outgoing control datagrams (`NAK`, `STATUS`,
+    /// `APPEND_POSITION`, `SNAP_NAK`, `SNAP_DONE` — every one of them
+    /// `Scope::Pairwise`).
+    ///
+    /// A `SharedTransport` clone and NOT a second `SendHalf`, deliberately:
+    /// `SharedTransport::send_half` is single-call by design and the one half
+    /// went to the sender agent. A second half would start a second nonce
+    /// counter at 0 under the SAME per-peer session key the sender already
+    /// seals under — a repeated `(key, nonce)` pair under AES-256-GCM, which
+    /// leaks the authentication subkey for every message ever sealed under
+    /// that key, not just the repeat. `SharedTransport::seal_pairwise_control`
+    /// draws from the process's one shared `Arc<AtomicU64>` instead.
+    ///
+    /// Locking here is free at these rates: NAK/STATUS/APPEND_POSITION are
+    /// per-duty-cycle-at-most control traffic (kHz), not the per-datagram
+    /// receive path, and the snapshot kinds are rarer still.
+    pub transport: uc2_crypto::SharedTransport,
+}
 
 /// Consensus-plane events demuxed off the shared UDP socket and routed to the
 /// consensus agent (Task 8) over the [`FollowerReceiver::new`] constructor's
@@ -233,6 +345,11 @@ impl FollowerConfig {
     }
 }
 
+/// M8 (Task 11): minimum spacing between `note_cleartext_peer`'s operator
+/// `eprintln!` for the SAME peer address — the counter still increments on
+/// every occurrence; only the log line is throttled.
+const CLEARTEXT_LOG_INTERVAL_NS: u64 = 30_000_000_000; // 30s
+
 #[derive(Default)]
 pub struct FollowerStats {
     pub datagrams: AtomicU64,
@@ -269,6 +386,59 @@ pub struct FollowerStats {
     /// `do_work` top resyncs the tracker to the primed floor and NAKs forward. See
     /// the generation recheck in the DATA arm.
     pub dropped_straddle: AtomicU64,
+    /// M8 (Task 11): a sealed datagram failed AEAD authentication — wrong
+    /// key, tampered ciphertext, tampered header, or an unresolvable sender
+    /// (no `SocketAddr -> NodeId` mapping installed — see
+    /// [`CryptoIntake::peer_ids`] — is folded in here too: from the
+    /// wire's point of view an unrecognized sender IS "could not
+    /// authenticate this," the same bucket).
+    pub dropped_auth_failed: AtomicU64,
+    /// M8 (Task 11): a sealed datagram's counter was already seen under its
+    /// (sender, epoch, salt) replay window — `uc2_crypto::CryptoError::Replayed`.
+    pub dropped_replay: AtomicU64,
+    /// M8 (Task 11): a sealed datagram named a group-key epoch this node
+    /// does not hold (never minted, or rotated out) —
+    /// `uc2_crypto::CryptoError::NoGroupKey`. Self-heals once `HS_KEY`
+    /// lands for the epoch (`uc2_crypto::group`'s docs); never a signal to
+    /// fall back to accepting cleartext.
+    pub dropped_unknown_epoch: AtomicU64,
+    /// M8 (Task 11): the specific, rate-limited flag-day-rollout diagnostic
+    /// — a datagram arrived that is BOTH stamped `key_epoch == 0` (the wire
+    /// format's documented cleartext sentinel) AND shorter than any validly
+    /// sealed frame could ever be, while THIS node has crypto enabled. See
+    /// `crypto_admit`'s doc for why both signals are required (a real,
+    /// if numerically unlucky, epoch-0 SEALED datagram is never long
+    /// enough to trip this). Distinct from `dropped_auth_failed` — the
+    /// brief's own framing: "the likeliest operator error under flag-day
+    /// rollout," diagnosable as such rather than a generic auth failure.
+    pub peer_appears_cleartext: AtomicU64,
+    /// M8 (Task 11): a would-be-sealed datagram arrived from a `SocketAddr`
+    /// with no entry in [`CryptoIntake::peer_ids`]'s map. Counted
+    /// separately from `dropped_auth_failed` for operator diagnosability
+    /// (a misconfigured peer map vs. a genuine forgery look identical on
+    /// the wire but very different to fix) even though both are folded
+    /// into `dropped_auth_failed` for the mandated counter's own semantics.
+    pub dropped_unknown_peer: AtomicU64,
+    /// M8 (Task 11): a handshake-plane datagram (kind 18/19/20) could not be
+    /// forwarded — no route supplied in [`CryptoIntake::handshake`], or the
+    /// route's channel was full/disconnected. Harmless by the same
+    /// reasoning as `net_drops`: `Peers::tick`/a retry re-initiates.
+    pub dropped_handshake: AtomicU64,
+    /// M8 (Task 17): an OUTGOING datagram this receiver could not seal —
+    /// `NAK`, `STATUS`, `APPEND_POSITION`, `SNAP_NAK` or `SNAP_DONE`, all
+    /// `Scope::Pairwise`. Either no `SocketAddr -> NodeId` entry names the
+    /// destination, or no established pairwise session with it exists yet.
+    /// The datagram is DROPPED — never sent in the clear, which would make
+    /// the whole feature optional per destination.
+    ///
+    /// Self-healing rather than fatal, and each kind for its own reason: a
+    /// dropped `NAK` re-fires on the NAK timer's backoff; a dropped `STATUS`/
+    /// `APPEND_POSITION` re-fires because its cursor is NOT advanced on
+    /// failure (so the next duty cycle still sees the threshold crossed); a
+    /// dropped `SNAP_NAK` re-fires on the snapshot NAK timer; a dropped
+    /// `SNAP_DONE` costs only the leader's session slot, which times out —
+    /// the local artifact is already renamed and installed by then.
+    pub seal_failures: AtomicU64,
 }
 
 /// M7 Task 6: the `(position, config)` companion cells `set_snapshot_intake`
@@ -378,6 +548,60 @@ pub struct FollowerReceiver {
     /// in the DATA arm, so a test can deterministically inject a straddling prime.
     #[cfg(test)]
     straddle_hook: Option<Box<dyn Fn() + Send>>,
+    /// M8 (Task 11): wire crypto, if enabled. `None` = every inbound datagram
+    /// is handled exactly as pre-M8 — `crypto_admit` becomes a pass-through.
+    /// `Some` decrypts (or diagnoses/drops) a datagram BEFORE `on_datagram`
+    /// ever sees it, so every parser in this file stays unaware crypto
+    /// exists at all — see `crypto_admit`'s doc.
+    ///
+    /// A `ReceiveHalf`, not a whole `Transport`/`SharedTransport` — same
+    /// ownership split as `Sender`'s `crypto: Option<SendHalf>` (T10, see
+    /// its field doc and `uc2_crypto::transport`'s "M8 ownership
+    /// correction" module docs): this receiver agent owns only the group-
+    /// scope replay windows (receiver-exclusive, no lock); the shared
+    /// handshake sessions/group-key plane/boot-salt live behind the
+    /// `Arc<Mutex<_>>` a `uc2_crypto::SharedTransport` hands this half out
+    /// from.
+    crypto: Option<ReceiveHalf>,
+    /// M8 (Task 17): the SEND-side crypto handle for this receiver's own
+    /// outgoing control datagrams — see [`CryptoIntake::transport`] for why
+    /// this is a `SharedTransport` clone rather than a second `SendHalf`.
+    /// `None` (crypto off) leaves every send byte-for-byte pre-M8.
+    crypto_seal: Option<uc2_crypto::SharedTransport>,
+    /// M8 (Task 11): `SocketAddr -> NodeId` map, needed to resolve `from`
+    /// before `crypto.open_slice` can be called (the crypto layer identifies
+    /// peers by `NodeId`; `uc2_net`'s wire layer has only ever known
+    /// `SocketAddr`s — see `crypto_admit`'s doc and the module docs). `None`
+    /// entries (an address not in this map) are dropped and counted
+    /// (`dropped_unknown_peer`, folded into `dropped_auth_failed`) — never a
+    /// panic on an unrecognized address, since that address is exactly as
+    /// attacker-controlled as anything else arriving on this socket. Empty
+    /// by default (every existing non-crypto call site is unaffected); the
+    /// node layer (T12) supplies it in [`CryptoIntake`] from the SAME
+    /// `id_to_addr` map it already builds for the sender's
+    /// `sender_peer_slots` (`node.rs:640`), inverted.
+    ///
+    /// This is a LOCAL COPY, refreshed from `peer_ids_src` once per duty
+    /// cycle (T12) rather than locked per datagram — see [`PeerIds`].
+    peer_ids: HashMap<SocketAddr, NodeId>,
+    /// M8 (Task 12): the shared, versioned source `peer_ids` mirrors, plus
+    /// the generation last mirrored. `None` when crypto is off (nothing
+    /// consults `peer_ids` then — `crypto_admit` returns on its first line).
+    peer_ids_src: Option<PeerIds>,
+    peer_ids_gen: u64,
+    /// M8 (Task 11): handshake-plane route (kinds 18/19/20 — see
+    /// [`HandshakeDatagram`]'s doc). `None` = dropped and counted
+    /// (`dropped_handshake`) — the T11 scope is "route it somewhere safe,"
+    /// not "drive the handshake" (Task 12's node-layer job).
+    hs_route: Option<mpsc::SyncSender<HandshakeDatagram>>,
+    /// M8 (Task 11): last-diagnosed-at (`now_ns`) per peer, for the
+    /// rate-limited "peer appears cleartext" diagnostic (`note_cleartext_peer`).
+    /// Bounded by construction: only ever gains an entry for an address that
+    /// ALREADY resolved via `peer_ids` (a known, configured cluster peer) —
+    /// never for an arbitrary spoofed source address — so this cannot be
+    /// grown into an unbounded-memory vector by a flood of forged source
+    /// addresses.
+    cleartext_peer_log: HashMap<SocketAddr, u64>,
 }
 
 impl FollowerReceiver {
@@ -394,6 +618,36 @@ impl FollowerReceiver {
         term: TermHandle,
         route: mpsc::SyncSender<NetEvent>,
     ) -> Self {
+        Self::with_crypto(buffer, sock, cfg, term, route, None)
+    }
+
+    /// M8 (Task 11): the innermost constructor — `new` is a thin wrapper over
+    /// this with `crypto: None`. Takes a [`ReceiveHalf`] (from
+    /// `uc2_crypto::SharedTransport::receive_half`), never a whole
+    /// `Transport`/`SharedTransport` — see the `crypto` field's doc for why.
+    /// The caller (the node layer, T12) owns the `SharedTransport` and calls
+    /// `receive_half()` exactly once per process; this constructor has no
+    /// way to enforce that single-call discipline itself (it only ever sees
+    /// the `ReceiveHalf` already handed out).
+    ///
+    /// M8 (Task 12): the half arrives inside a [`CryptoIntake`], alongside
+    /// the sender-identity map and the handshake route, so enabling crypto
+    /// without wiring both of those is a compile error rather than a silent
+    /// cluster-wide drop — see [`CryptoIntake`]'s doc.
+    pub fn with_crypto(
+        buffer: Arc<LogBuffer>,
+        sock: FaultSocket,
+        cfg: FollowerConfig,
+        term: TermHandle,
+        route: mpsc::SyncSender<NetEvent>,
+        crypto: Option<CryptoIntake>,
+    ) -> Self {
+        let (crypto, peer_ids_src, hs_route, crypto_seal) = match crypto {
+            Some(CryptoIntake { half, peer_ids, handshake, transport }) => {
+                (Some(half), Some(peer_ids), Some(handshake), Some(transport))
+            }
+            None => (None, None, None, None),
+        };
         let start = buffer.counters().append.load_acquire();
         let status_bytes =
             if cfg.status_bytes == 0 { buffer.capacity() / 4 } else { cfg.status_bytes };
@@ -429,6 +683,29 @@ impl FollowerReceiver {
             prime_gen: None,
             #[cfg(test)]
             straddle_hook: None,
+            crypto,
+            crypto_seal,
+            peer_ids: peer_ids_src.as_ref().map(PeerIds::snapshot).unwrap_or_default(),
+            peer_ids_gen: peer_ids_src.as_ref().map(PeerIds::generation).unwrap_or(0),
+            peer_ids_src,
+            hs_route,
+            cleartext_peer_log: HashMap::new(),
+        }
+    }
+
+    /// M8 (Task 12): mirror the shared [`PeerIds`] map if the writer has
+    /// published a new generation since the last duty cycle. One `Acquire`
+    /// load per cycle in the common (unchanged) case; the `Mutex` is touched
+    /// only when membership actually changed. See [`PeerIds`] for why the
+    /// map cannot simply be a boot-time snapshot.
+    fn refresh_peer_ids(&mut self) {
+        let Some(src) = self.peer_ids_src.as_ref() else {
+            return;
+        };
+        let published = src.generation();
+        if published != self.peer_ids_gen {
+            self.peer_ids = src.snapshot();
+            self.peer_ids_gen = published;
         }
     }
 
@@ -586,6 +863,10 @@ impl FollowerReceiver {
         self.resync_after_truncation();
         // And, after a snapshot install, forward to the adopted floor (M6 Task 8).
         self.resync_after_snapshot_install();
+        // M8 (Task 12): pick up a membership change before authenticating
+        // anything this cycle — a joiner added by M7 at runtime must be
+        // resolvable without a restart (see `PeerIds`).
+        self.refresh_peer_ids();
         let mut did = false;
         self.activity_emitted = false; // one LeaderActivity per cycle (node mode)
         for _ in 0..64 {
@@ -596,7 +877,14 @@ impl FollowerReceiver {
                 _ => None,
             };
             if let Some((n, from)) = got {
-                self.on_datagram(&buf[..n], from);
+                // M8 (Task 11): decrypt (or diagnose/drop) BEFORE on_datagram
+                // ever sees the bytes — see `crypto_admit`'s doc. `Some(len)`
+                // = admitted, plaintext, `buf[..len]` is what `on_datagram`
+                // parses (byte-identical to the pre-M8 shape whether crypto
+                // is on or off); `None` = dropped here, already counted.
+                if let Some(len) = self.crypto_admit(&mut buf, n, from) {
+                    self.on_datagram(&buf[..len], from);
+                }
                 did = true;
             }
             self.recv_buf = buf;
@@ -606,6 +894,198 @@ impl FollowerReceiver {
         }
         did |= self.upkeep();
         did
+    }
+
+    /// M8 (Task 11): the receive-side counterpart to `Sender::seal_scratch`
+    /// (T10) — the ONE place a datagram is decrypted, diagnosed, or dropped
+    /// for a crypto-related reason, so `on_datagram` and everything it calls
+    /// stays completely unaware crypto exists.
+    ///
+    /// `buf` is `self.recv_buf`'s full 64 KiB backing storage (see
+    /// `do_work`); `n` is `recv_from`'s reported length, never `buf.len()`.
+    /// Only `buf[..n]` is ever read; `ReceiveHalf::open_slice` decrypts in
+    /// place there and reports how much of it is now plaintext — this is
+    /// the zero-copy-on-the-hot-path property T9's `open_detached` (and its
+    /// `ReceiveHalf::open_slice` wrapper) exist for: no `truncate(n) -> open
+    /// -> resize(65536, 0)`, which would memset up to 64 KiB PER DATAGRAM
+    /// (T5 review carry (d)) — the same order of cost as the AEAD open
+    /// itself.
+    ///
+    /// Every untrusted-input path here ends in a drop-and-count, never a
+    /// panic and never a propagated `Err` — see the module docs' binding
+    /// rule ("a node must not be killable by a datagram").
+    fn crypto_admit(&mut self, buf: &mut [u8], n: usize, from: SocketAddr) -> Option<usize> {
+        use Ordering::Relaxed;
+        if self.crypto.is_none() {
+            return Some(n); // crypto disabled: byte-for-byte the pre-M8 path
+        }
+        if n < DATAGRAM_HEADER_LEN {
+            // Too short even for a header. `on_datagram`'s own malformed
+            // check (below `DATAGRAM_HEADER_LEN`) handles this identically
+            // whether crypto is on or off — no need to duplicate it here.
+            return Some(n);
+        }
+        let h = read_datagram_header(&buf[..n]);
+
+        // T11's temporary cleartext-SNAP allowance USED TO SIT HERE and was
+        // DELETED by T17 (2026-07-29), which is what makes this comment worth
+        // keeping. It admitted SNAP_BEGIN/SNAP_CHUNK unauthenticated, because
+        // the send side (`sender.rs`'s `assemble_snap`) could not seal them
+        // until a `SocketAddr -> NodeId` map and a driven handshake both
+        // existed. Both now do, both directions of a snapshot session are
+        // sealed, and SNAP is authenticated exactly like every other pairwise
+        // kind by falling through to `open_slice` below. The hole it left
+        // open — a forged `SNAP_BEGIN` carrying `SnapBeginBody.config`
+        // straight into `maybe_adopt_incoming_snapshot`, i.e. attacker-chosen
+        // application state AND attacker-chosen cluster membership on a
+        // joining or below-floor node — is closed by that fall-through.
+        // Pinned by `an_unsealed_snap_begin_is_refused_now_that_t17_landed`.
+
+        // Handshake bootstrap (`Scope::Unsealed`, spec §5): no session and
+        // no key exist yet for these — they are what CREATES a session.
+        // Never goes through `open_slice`; hand the raw wire body to
+        // whichever agent drives `Peers` (Task 12's node wiring).
+        if matches!(h.kind, DGRAM_KIND_HS_INIT | DGRAM_KIND_HS_RESP) {
+            self.route_handshake(from, h.kind, buf[DATAGRAM_HEADER_LEN..n].to_vec());
+            return None;
+        }
+
+        // Everything else (`Scope::Group` + `Scope::Pairwise`, including
+        // `HS_KEY`) needs a resolved sender identity before anything can be
+        // authenticated at all.
+        let Some(peer_id) = self.peer_id_of(from) else {
+            self.stats.dropped_unknown_peer.fetch_add(1, Relaxed);
+            self.stats.dropped_auth_failed.fetch_add(1, Relaxed);
+            return None;
+        };
+
+        // Mixed-mode diagnostic (the brief's own framing: "the likeliest
+        // operator error under flag-day rollout"). `key_epoch == 0` is
+        // `uc_protocol`'s documented cleartext sentinel
+        // (`v2::datagram::OFF_DGRAM_KEY_EPOCH`'s doc: "0 = cleartext") --
+        // but `GroupPlane::next_epoch` starts at 0 too, so a fresh mint's
+        // FIRST epoch can legitimately BE 0 (see `transport.rs`'s own
+        // fixture traps, T9/T10). `key_epoch == 0` alone is therefore not
+        // proof of anything. What IS proof: a genuinely cleartext datagram
+        // carries no counter/tag, so it is STRICTLY SHORTER than any
+        // validly sealed frame could ever be
+        // (`n < DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD`) — a shape a real
+        // sealed frame, even one sealed under epoch 0, can never take (the
+        // minimal empty-payload sealed frame is EXACTLY
+        // `DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD` bytes, never less).
+        // Requiring BOTH signals means a real epoch-0 sealed datagram is
+        // never misdiagnosed; only a datagram that is BOTH stamped 0 AND
+        // too short to be lying about being sealed gets this specific
+        // diagnostic instead of a generic auth failure.
+        if h.key_epoch == 0 && n < DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD {
+            self.note_cleartext_peer(from);
+            return None;
+        }
+
+        let crypto = self.crypto.as_mut().expect("checked Some at the top of this function");
+        match crypto.open_slice(peer_id, buf, n) {
+            Ok(len) => {
+                if h.kind == DGRAM_KIND_HS_KEY {
+                    // Sealed, now opened -- route the PLAINTEXT body, not
+                    // the wire bytes.
+                    self.route_handshake(from, h.kind, buf[DATAGRAM_HEADER_LEN..len].to_vec());
+                    None
+                } else {
+                    Some(len)
+                }
+            }
+            Err(CryptoError::Replayed(_)) => {
+                self.stats.dropped_replay.fetch_add(1, Relaxed);
+                None
+            }
+            Err(CryptoError::NoGroupKey) => {
+                self.stats.dropped_unknown_epoch.fetch_add(1, Relaxed);
+                None
+            }
+            Err(_) => {
+                // AuthFailed (wrong key / tampered), TooShort (past the
+                // cleartext-shape check above -- long enough to CLAIM to be
+                // sealed but still fails), NoSession (no established
+                // pairwise session with this peer yet), UnsealedKind
+                // (unreachable here: HS_INIT/HS_RESP already routed above),
+                // MissingPeer (unreachable: `open_slice` never needs
+                // `peer: Some`) -- every remaining case is "this did not
+                // authenticate," the generic bucket the mixed-mode
+                // diagnostic above exists to be distinguishable FROM.
+                self.stats.dropped_auth_failed.fetch_add(1, Relaxed);
+                None
+            }
+        }
+    }
+
+    /// The rate-limited "peer appears cleartext" diagnostic — see
+    /// `crypto_admit`'s doc for the discriminating condition. The counter
+    /// always increments (undercounting would hide the problem); the
+    /// operator-facing `eprintln!` is throttled to once per
+    /// [`CLEARTEXT_LOG_INTERVAL_NS`] per peer so a sustained mismatch (a
+    /// whole node still on cleartext) cannot spam stderr at datagram rate.
+    fn note_cleartext_peer(&mut self, from: SocketAddr) {
+        use Ordering::Relaxed;
+        self.stats.peer_appears_cleartext.fetch_add(1, Relaxed);
+        let now = self.now_ns();
+        let due = self
+            .cleartext_peer_log
+            .get(&from)
+            .is_none_or(|&last| now.saturating_sub(last) >= CLEARTEXT_LOG_INTERVAL_NS);
+        if due {
+            self.cleartext_peer_log.insert(from, now);
+            eprintln!(
+                "uc2_net: peer {from} appears to be running with crypto disabled (datagram too \
+                 short to be a sealed frame, key_epoch=0) -- this node has crypto enabled; check \
+                 for a flag-day rollout mismatch"
+            );
+        }
+    }
+
+    /// Forwards a handshake-plane datagram (kind 18/19/20) to
+    /// [`CryptoIntake::handshake`]'s channel, if crypto is on.
+    /// Drops and counts (`dropped_handshake`) otherwise — no route, or a
+    /// full/disconnected one (harmless: `Peers::tick`/a retry re-initiates,
+    /// same reasoning as the consensus route's own full-channel drops).
+    fn route_handshake(&mut self, from: SocketAddr, kind: u8, body: Vec<u8>) {
+        let sent = self.hs_route.as_ref().is_some_and(|tx| tx.try_send((from, kind, body)).is_ok());
+        if !sent {
+            self.stats.dropped_handshake.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Resolves `from` to the `NodeId` [`ReceiveHalf::open_slice`] needs —
+    /// see [`PeerIds`] and [`CryptoIntake::peer_ids`].
+    #[inline]
+    fn peer_id_of(&self, from: SocketAddr) -> Option<NodeId> {
+        self.peer_ids.get(&from).copied()
+    }
+
+    /// M8 (Task 17): the send-side counterpart of `crypto_admit` — the ONE
+    /// place this receiver's own outgoing datagrams are sealed. Every caller
+    /// (`NAK`, `STATUS`, `APPEND_POSITION`, `SNAP_NAK`, `SNAP_DONE`) is
+    /// `Scope::Pairwise`; `seal_pairwise_control` itself refuses anything
+    /// else, so a future group-scope kind routed through here fails loudly in
+    /// the counter rather than being sealed the wrong way.
+    ///
+    /// Returns whether the datagram reached the socket. `false` means it was
+    /// DROPPED — there is deliberately no cleartext fallback (see
+    /// [`FollowerStats::seal_failures`] for why each dropped kind is
+    /// self-healing). With crypto off this is a pass-through: the same
+    /// `sock.send_to` the pre-M8 code made, on the same bytes.
+    fn seal_and_send(&mut self, to: SocketAddr, kind: u8, d: &mut Vec<u8>) -> bool {
+        if let Some(transport) = self.crypto_seal.as_ref() {
+            let Some(&peer_id) = self.peer_ids.get(&to) else {
+                self.stats.seal_failures.fetch_add(1, Ordering::Relaxed);
+                return false;
+            };
+            if transport.seal_pairwise_control(kind, peer_id, d).is_err() {
+                self.stats.seal_failures.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+        let _ = self.sock.send_to(d, to);
+        true
     }
 
     fn on_datagram(&mut self, d: &[u8], from: SocketAddr) {
@@ -905,6 +1385,7 @@ impl FollowerReceiver {
                 leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind: DGRAM_KIND_SNAP_DONE,
                 flags: 0,
+                key_epoch: 0,
             },
         );
         write_snap_begin_body(
@@ -916,7 +1397,10 @@ impl FollowerReceiver {
                 config: vec![], // the DONE ack carries no config — only SNAP_BEGIN ships it
             },
         );
-        let _ = self.sock.send_to(&d, intake.peer);
+        // M8 (T17): sealed or dropped. A dropped DONE costs only the leader's
+        // session slot (it times out); the local artifact is already renamed,
+        // so the install below must proceed either way.
+        self.seal_and_send(intake.peer, DGRAM_KIND_SNAP_DONE, &mut d);
         // M7 Task 6: publish the carried config BEFORE the position signal — the
         // consensus agent's install handler samples the position (Acquire) and
         // only then reads this cell, so publishing it first (the mutex itself is
@@ -991,13 +1475,16 @@ impl FollowerReceiver {
                     leadership_term_id: term,
                     kind: DGRAM_KIND_SNAP_NAK,
                     flags: 0,
+                    key_epoch: 0,
                 },
             );
             write_snap_nak_body(
                 &mut d[DATAGRAM_HEADER_LEN..],
                 &SnapNakBody { session, offset: start, length },
             );
-            let _ = self.sock.send_to(&d, peer);
+            if !self.seal_and_send(peer, DGRAM_KIND_SNAP_NAK, &mut d) {
+                return false; // dropped; the snapshot NAK timer re-fires
+            }
             return true;
         }
         false
@@ -1038,12 +1525,17 @@ impl FollowerReceiver {
                     leadership_term_id: term,
                     kind: DGRAM_KIND_NAK,
                     flags: 0,
+                    key_epoch: 0,
                 },
             );
             write_nak_body(&mut d[DATAGRAM_HEADER_LEN..], &NakBody { position: start, length: len });
-            let _ = self.sock.send_to(&d, self.cfg.leader);
-            self.stats.naks_sent.fetch_add(1, Relaxed);
-            did = true;
+            // M8 (T17): sealed or dropped. A dropped NAK re-fires on the
+            // timer's own backoff — the same recovery a lost NAK already has.
+            let leader = self.cfg.leader;
+            if self.seal_and_send(leader, DGRAM_KIND_NAK, &mut d) {
+                self.stats.naks_sent.fetch_add(1, Relaxed);
+                did = true;
+            }
         }
 
         // Single durable load reused by AppendPosition + status below.
@@ -1068,13 +1560,22 @@ impl FollowerReceiver {
                     leadership_term_id: term,
                     kind: DGRAM_KIND_APPEND_POSITION,
                     flags: 0,
+                    key_epoch: 0,
                 },
             );
-            let _ = self.sock.send_to(&d, self.cfg.leader);
-            self.ap_reported = durable;
-            self.last_ap_ns = now;
-            self.stats.append_positions_sent.fetch_add(1, Relaxed);
-            did = true;
+            // M8 (T17): sealed or dropped. The cursors advance ONLY on a
+            // real send — a dropped report whose cursor advanced anyway would
+            // be lost until `durable` next moved, which on an idle follower
+            // is never. Leaving them put means the next duty cycle still sees
+            // the threshold crossed and retries, so the report resumes the
+            // instant the pairwise session comes up.
+            let leader = self.cfg.leader;
+            if self.seal_and_send(leader, DGRAM_KIND_APPEND_POSITION, &mut d) {
+                self.ap_reported = durable;
+                self.last_ap_ns = now;
+                self.stats.append_positions_sent.fetch_add(1, Relaxed);
+                did = true;
+            }
         }
 
         // Status: every quarter-window of progress, or on the time floor.
@@ -1093,17 +1594,22 @@ impl FollowerReceiver {
                     leadership_term_id: term,
                     kind: DGRAM_KIND_STATUS,
                     flags: 0,
+                    key_epoch: 0,
                 },
             );
             write_status_body(
                 &mut d[DATAGRAM_HEADER_LEN..],
                 &StatusBody { contiguous_position: contiguous, receive_window: window },
             );
-            let _ = self.sock.send_to(&d, self.cfg.leader);
-            self.status_at = contiguous;
-            self.last_status_ns = now;
-            self.stats.statuses_sent.fetch_add(1, Relaxed);
-            did = true;
+            // M8 (T17): sealed or dropped; cursors advance only on a real
+            // send — see the AppendPosition site above for why.
+            let leader = self.cfg.leader;
+            if self.seal_and_send(leader, DGRAM_KIND_STATUS, &mut d) {
+                self.status_at = contiguous;
+                self.last_status_ns = now;
+                self.stats.statuses_sent.fetch_add(1, Relaxed);
+                did = true;
+            }
         }
 
         // M6 Task 6: drive an inbound snapshot transfer's NAK repair. Poll twice
@@ -1172,7 +1678,7 @@ mod tests {
             let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
             write_datagram_header(
                 &mut d,
-                &DatagramHeader { position, leadership_term_id: term, kind, flags: 0 },
+                &DatagramHeader { position, leadership_term_id: term, kind, flags: 0, key_epoch: 0 },
             );
             d.extend_from_slice(body);
             self.sock.send_to(&d, to).unwrap();
@@ -1219,6 +1725,20 @@ mod tests {
     fn dummy_route() -> mpsc::SyncSender<NetEvent> {
         let (tx, _rx) = mpsc::sync_channel(16);
         tx
+    }
+
+    /// A dummy handshake route for the crypto fixtures below — same
+    /// dropped-receiver shape (and same harmlessness) as `dummy_route`.
+    /// Tests that INSPECT handshake datagrams keep their own live receiver.
+    fn dummy_handshake_route() -> mpsc::SyncSender<HandshakeDatagram> {
+        let (tx, _rx) = mpsc::sync_channel(16);
+        tx
+    }
+
+    fn peer_ids_of(ids: impl IntoIterator<Item = (SocketAddr, NodeId)>) -> PeerIds {
+        let p = PeerIds::new();
+        p.store(ids);
+        p
     }
 
     fn follower(b: &Arc<LogBuffer>, leader: SocketAddr) -> FollowerReceiver {
@@ -2068,4 +2588,1036 @@ mod tests {
     // AppendPosition -> `NetEvent::Report` by
     // `consensus_kinds_route_raw_to_the_consensus_agent`, NAK -> the sender's
     // channel by `sender_route_demuxes_nak_and_status` (this file).
+
+    // ----------------------------------------------------------- M8 (Task 11)
+    // The receive seam: `crypto_admit` decrypts (or diagnoses/drops) BEFORE
+    // `on_datagram` ever sees the bytes, so every parser above (proven by
+    // the 19 tests above this section, unmodified) stays completely unaware
+    // crypto exists. This section builds a real, two-node, established
+    // Noise-IK session + a real minted-and-delivered group key over a
+    // genuine UDP socket pair, using ONLY `uc2_crypto`'s public API (the
+    // `initiate`/`on_handshake_message`/`on_group_key_message` forwarders
+    // T11 added to `SharedTransport` for exactly this — see that crate's
+    // `transport.rs` module docs for why nothing outside it could do this
+    // before this task).
+
+    use std::sync::atomic::AtomicU64 as StdAtomicU64;
+
+    const PEER_ID: NodeId = 1; // the fake leader
+    const RECV_ID: NodeId = 2; // the receiver under test
+    const PRIV_PEER: [u8; 32] = [0x11; 32];
+    const PRIV_RECV: [u8; 32] = [0x22; 32];
+
+    fn crypto_scratch_dir(tag: &str) -> PathBuf {
+        static SEQ: StdAtomicU64 = StdAtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::var("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc2_net_tests")
+            })
+            .join("uc2-net-receiver-crypto")
+            .join(format!("{tag}-{seq}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!dir.starts_with("/tmp"), "test scratch must not live on tmpfs: {dir:?}");
+        dir
+    }
+
+    fn write_key_file(path: &std::path::Path, private: [u8; 32]) {
+        std::fs::write(path, private).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    /// Derives a node's public key from its raw private key bytes, via a
+    /// throwaway `uc2_crypto::identity::Identity` — `uc2_net` has no X25519
+    /// dependency of its own (nor should it gain one just for test fixture
+    /// plumbing); `Identity::public_bytes` is already the crate's own public
+    /// accessor for exactly this.
+    fn identity_public(tag: &str, private: [u8; 32]) -> [u8; 32] {
+        let dir = crypto_scratch_dir(tag);
+        let key_path = dir.join("node.key");
+        write_key_file(&key_path, private);
+        uc2_crypto::identity::Identity::load(&key_path).unwrap().public_bytes()
+    }
+
+    /// Minimal standard-alphabet base64 WITH padding, matching
+    /// `uc2_crypto::identity`'s allowlist parser (which uses the `base64`
+    /// crate's `STANDARD` engine) — hand-rolled here rather than adding a
+    /// `base64` dev-dependency to `uc2_net` just for one test fixture's
+    /// allowlist-file text. 32 bytes in, 44 base64 chars out (one trailing
+    /// `=`), same as any other X25519 public key this codebase writes.
+    fn b64_32(bytes: &[u8; 32]) -> String {
+        const ALPHABET: &[u8] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+            let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(ALPHABET[((n >> 18) & 0x3F) as usize] as char);
+            out.push(ALPHABET[((n >> 12) & 0x3F) as usize] as char);
+            out.push(if chunk.len() > 1 { ALPHABET[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+            out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3F) as usize] as char } else { '=' });
+        }
+        out
+    }
+
+    fn crypto_shared(
+        tag: &str,
+        self_id: NodeId,
+        private: [u8; 32],
+        allow: &[(NodeId, [u8; 32])],
+    ) -> uc2_crypto::SharedTransport {
+        let dir = crypto_scratch_dir(tag);
+        let key_path = dir.join("node.key");
+        write_key_file(&key_path, private);
+        let allow_path = dir.join("allowlist");
+        let mut text = String::new();
+        for (id, public) in allow {
+            text.push_str(&format!("{id} {}\n", b64_32(public)));
+        }
+        std::fs::write(&allow_path, text).unwrap();
+        let cfg = uc2_crypto::CryptoConfig::Enabled {
+            key_path,
+            allowlist_path: allow_path,
+            rotation: uc2_crypto::rotation::RotationPolicy::default(),
+        };
+        uc2_crypto::SharedTransport::new(&cfg, self_id).unwrap().unwrap()
+    }
+
+    /// Builds a real PEER (`PEER_ID`) and RECEIVER (`RECV_ID`) `SharedTransport`
+    /// pair, drives a genuine Noise-IK handshake between them to completion,
+    /// then mints a group key on the peer and delivers it to the receiver —
+    /// all through `SharedTransport`'s public forwarders only (`initiate`/
+    /// `on_handshake_message`/`on_group_key_message`), never by reaching
+    /// into private crate internals (this IS a different crate). Returns
+    /// `(receiver's SharedTransport, peer's SharedTransport, the real minted
+    /// epoch)`. T17 returns the peer's whole `SharedTransport` rather than
+    /// just its `SendHalf`: the receiver under test now SEALS its own
+    /// outgoing control datagrams, so the fixture peer needs a `ReceiveHalf`
+    /// to open them with as well.
+    fn established_crypto_pair(tag: &str) -> (uc2_crypto::SharedTransport, uc2_crypto::SharedTransport, u16) {
+        let peer_pub = identity_public(&format!("{tag}-peer-pub"), PRIV_PEER);
+        let recv_pub = identity_public(&format!("{tag}-recv-pub"), PRIV_RECV);
+        let peer = crypto_shared(
+            &format!("{tag}-peer"),
+            PEER_ID,
+            PRIV_PEER,
+            &[(PEER_ID, peer_pub), (RECV_ID, recv_pub)],
+        );
+        let recv = crypto_shared(
+            &format!("{tag}-recv"),
+            RECV_ID,
+            PRIV_RECV,
+            &[(PEER_ID, peer_pub), (RECV_ID, recv_pub)],
+        );
+
+        let mut acts = peer.initiate(RECV_ID, 0);
+        for _ in 0..8 {
+            let mut next = Vec::new();
+            for act in acts.drain(..) {
+                if let uc2_crypto::HandshakeAction::Send { to, kind, body } = act {
+                    if to == RECV_ID {
+                        next.extend(recv.on_handshake_message(PEER_ID, kind, &body, 0));
+                    } else if to == PEER_ID {
+                        next.extend(peer.on_handshake_message(RECV_ID, kind, &body, 0));
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            acts = next;
+        }
+
+        // `GroupPlane::next_epoch` now starts at 1, not 0 -- epoch 0 is
+        // reserved as the wire's cleartext sentinel (`group.rs`'s
+        // `GroupPlane::new` doc; the fix for the review finding that this
+        // very fixture used to dodge by minting twice). A single mint
+        // already gives a non-zero epoch; no throwaway mint needed anymore.
+        let (epoch, mint_acts) = peer.mint_group_key(&[RECV_ID], 0);
+        assert_ne!(epoch, 0, "epoch 0 is reserved and must never be minted");
+        for act in mint_acts {
+            let uc2_crypto::HandshakeAction::Send { to, body, .. } = act else {
+                panic!("mint must emit a Send action")
+            };
+            assert_eq!(to, RECV_ID);
+            let reply = recv.on_group_key_message(PEER_ID, &body);
+            for r in reply {
+                let uc2_crypto::HandshakeAction::Send { body: rbody, .. } = r else {
+                    panic!("a well-formed delivery must ack back")
+                };
+                peer.on_group_key_message(RECV_ID, &rbody);
+            }
+        }
+
+        (recv, peer, epoch)
+    }
+
+    /// T11 review round 1, finding 1: a mint-once-style fixture that
+    /// reaches REAL epoch 0 on the receiver's schedule, despite
+    /// `GroupPlane::mint` no longer being able to produce epoch 0 itself
+    /// (fix 2 of the same review round — 0 is now reserved, see
+    /// `group.rs`'s `GroupPlane::new` doc). This is not a synthetic
+    /// shortcut: it hand-crafts a real, well-formed `HS_KEY` DELIVERY body
+    /// for epoch 0, per `uc2_crypto::group`'s own documented wire format
+    /// (`[1B type=0][2B epoch LE][32B group key]`), and feeds it through
+    /// the SAME `on_group_key_message` entry point a real opened HS_KEY
+    /// datagram would use. `GroupPlane::on_key_message`'s install path has
+    /// no "refuse epoch 0" guard (nor should it grow one just for this: the
+    /// receive-side shape check this fixture exists to test must hold
+    /// regardless of how epoch 0 ever got into a schedule -- a mismatched
+    /// peer running older code, a bug elsewhere, or exactly this fixture --
+    /// not merely because THIS crate's own minter now avoids it).
+    ///
+    /// Returns `(receiver's SharedTransport, the AES key that seals as
+    /// PEER_ID under epoch 0)` — the caller manually seals with
+    /// `uc2_crypto::seal::seal_in_place` (like `send_sealed_under_epoch`
+    /// already does for OTHER epochs) rather than through a `SendHalf`,
+    /// since `SendHalf::seal`'s `sealing_epoch()` is driven by `mint`/fold
+    /// state that (correctly, post-fix-2) can never point at epoch 0.
+    fn established_crypto_pair_with_forced_epoch_zero(tag: &str) -> (uc2_crypto::SharedTransport, [u8; 32]) {
+        let peer_pub = identity_public(&format!("{tag}-peer-pub"), PRIV_PEER);
+        let recv_pub = identity_public(&format!("{tag}-recv-pub"), PRIV_RECV);
+        let peer = crypto_shared(
+            &format!("{tag}-peer"),
+            PEER_ID,
+            PRIV_PEER,
+            &[(PEER_ID, peer_pub), (RECV_ID, recv_pub)],
+        );
+        let recv = crypto_shared(
+            &format!("{tag}-recv"),
+            RECV_ID,
+            PRIV_RECV,
+            &[(PEER_ID, peer_pub), (RECV_ID, recv_pub)],
+        );
+
+        let mut acts = peer.initiate(RECV_ID, 0);
+        for _ in 0..8 {
+            let mut next = Vec::new();
+            for act in acts.drain(..) {
+                if let uc2_crypto::HandshakeAction::Send { to, kind, body } = act {
+                    if to == RECV_ID {
+                        next.extend(recv.on_handshake_message(PEER_ID, kind, &body, 0));
+                    } else if to == PEER_ID {
+                        next.extend(peer.on_handshake_message(RECV_ID, kind, &body, 0));
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            acts = next;
+        }
+
+        let key_bytes = [0x5Au8; 32];
+        let mut body = vec![0u8]; // MSG_KEY = 0 (delivery)
+        body.extend_from_slice(&0u16.to_le_bytes()); // epoch = 0
+        body.extend_from_slice(&key_bytes);
+        let reply = recv.on_group_key_message(PEER_ID, &body);
+        assert!(!reply.is_empty(), "a well-formed delivery must ack back");
+
+        // The AES key a real seal under (epoch 0, sender = PEER_ID) would
+        // use -- derived exactly as `SendHalf::seal_group` derives it,
+        // using the peer's REAL (OS-RNG, per-process) boot salt, reachable
+        // via the `boot_salt()` getter added for exactly this purpose.
+        let group_key = uc2_crypto::schedule::GroupKey::new(key_bytes);
+        let seal_key = uc2_crypto::schedule::derive_send_key(&group_key, PEER_ID, &peer.boot_salt());
+
+        (recv, seal_key)
+    }
+
+    /// A crypto-capable fake leader endpoint: a real, established
+    /// `uc2_crypto::SendHalf` plus a raw socket, able to send both
+    /// correctly-sealed traffic and deliberately malformed/forged/replayed
+    /// datagrams for T11's negative tests.
+    struct CryptoPeer {
+        sock: FaultSocket,
+        send: uc2_crypto::SendHalf,
+        /// T17: opens what the RECEIVER seals (its NAK/STATUS/APPEND_POSITION
+        /// /SNAP_NAK/SNAP_DONE are `Scope::Pairwise` sealed datagrams now).
+        recv: uc2_crypto::ReceiveHalf,
+        epoch: u16,
+        /// T17: datagrams of a kind `await_raw` was not asked for yet.
+        stash: Vec<Vec<u8>>,
+    }
+
+    impl CryptoPeer {
+        fn header(position: u64, kind: u8, key_epoch: u16) -> DatagramHeader {
+            DatagramHeader { position, leadership_term_id: TERM, kind, flags: 0, key_epoch }
+        }
+
+        /// A real, correctly-sealed DATA datagram — exactly what a peer with
+        /// crypto enabled and an established session sends in production.
+        fn send_sealed_data(&mut self, to: SocketAddr, position: u64, payload: &[u8]) {
+            let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+            write_datagram_header(&mut d, &Self::header(position, DGRAM_KIND_DATA, 0));
+            d.extend_from_slice(payload);
+            let now = self.send.now_ns();
+            self.send.seal(DGRAM_KIND_DATA, None, &mut d, now).unwrap();
+            self.sock.send_to(&d, to).unwrap();
+        }
+
+        /// The header claims the REAL active epoch (so the receiver's
+        /// schedule lookup succeeds and reaches the AEAD check at all), but
+        /// the bytes are sealed under an unrelated, made-up key nobody
+        /// installed — an on-path forgery, not a replay or an unknown epoch.
+        fn send_sealed_with_wrong_key(&mut self, to: SocketAddr, position: u64, payload: &[u8]) {
+            let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+            write_datagram_header(&mut d, &Self::header(position, DGRAM_KIND_DATA, self.epoch));
+            d.extend_from_slice(payload);
+            uc2_crypto::seal::seal_in_place(&mut d, &[0x99u8; 32], 1).unwrap();
+            self.sock.send_to(&d, to).unwrap();
+        }
+
+        /// Sealed (under an arbitrary key -- it never gets that far), but
+        /// stamped with an epoch the receiver never minted or received.
+        fn send_sealed_under_epoch(&mut self, to: SocketAddr, epoch: u16, position: u64, payload: &[u8]) {
+            let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+            write_datagram_header(&mut d, &Self::header(position, DGRAM_KIND_DATA, epoch));
+            d.extend_from_slice(payload);
+            uc2_crypto::seal::seal_in_place(&mut d, &[0x77u8; 32], 1).unwrap();
+            self.sock.send_to(&d, to).unwrap();
+        }
+
+        /// The old, pre-M8 cleartext wire shape: no counter, no tag,
+        /// `key_epoch` left at its zero-init default. Exactly what a peer
+        /// running with crypto disabled sends.
+        fn send_cleartext_data(&mut self, to: SocketAddr, position: u64, payload: &[u8]) {
+            let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+            write_datagram_header(&mut d, &Self::header(position, DGRAM_KIND_DATA, 0));
+            d.extend_from_slice(payload);
+            self.sock.send_to(&d, to).unwrap();
+        }
+
+        /// Byte-for-byte capture-and-resend, or arbitrary garbage.
+        fn send_raw(&mut self, to: SocketAddr, bytes: &[u8]) {
+            self.sock.send_to(bytes, to).unwrap();
+        }
+    }
+
+    /// The T11 fixture: a `FollowerReceiver` with crypto enabled, a real
+    /// established `CryptoPeer`, and the shared `LogBuffer` (so tests can
+    /// check whether admitted DATA actually landed).
+    fn receiver_with_crypto() -> (FollowerReceiver, CryptoPeer, Arc<LogBuffer>) {
+        let (r, peer, b, _ids) = receiver_with_crypto_ids(true);
+        (r, peer, b)
+    }
+
+    /// As `receiver_with_crypto`, but hands back the live [`PeerIds`] handle
+    /// and lets the caller start with an EMPTY map — the M7 runtime-node-add
+    /// shape (T12): a peer whose address this node had no mapping for at
+    /// construction, published later without a restart.
+    fn receiver_with_crypto_ids(
+        registered: bool,
+    ) -> (FollowerReceiver, CryptoPeer, Arc<LogBuffer>, PeerIds) {
+        let (recv_shared, peer_shared, epoch) = established_crypto_pair("recv-with-crypto");
+        let b = buffer();
+        let peer_sock = FaultSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+
+        let mut cfg = FollowerConfig::new(peer_addr);
+        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.status_floor_ns = u64::MAX;
+        cfg.append_pos_floor_ns = u64::MAX;
+
+        let recv_half = recv_shared.receive_half();
+        let peer_ids =
+            if registered { peer_ids_of([(peer_addr, PEER_ID)]) } else { PeerIds::new() };
+        let r = FollowerReceiver::with_crypto(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            cfg,
+            term_handle(TERM),
+            dummy_route(),
+            Some(CryptoIntake {
+                half: recv_half,
+                peer_ids: peer_ids.clone(),
+                handshake: dummy_handshake_route(),
+                transport: recv_shared.clone(),
+            }),
+        );
+
+        let peer = CryptoPeer {
+            sock: peer_sock,
+            send: peer_shared.send_half(),
+            recv: peer_shared.receive_half(),
+            epoch,
+            stash: Vec::new(),
+        };
+        (r, peer, b, peer_ids)
+    }
+
+    /// T11 review round 1, finding 1: a receiver whose schedule holds a
+    /// REAL, genuinely epoch-0 group key (see
+    /// `established_crypto_pair_with_forced_epoch_zero`'s doc) plus a raw
+    /// peer socket and the AES key needed to seal AS `PEER_ID` under that
+    /// epoch by hand (`uc2_crypto::seal::seal_in_place`, same pattern
+    /// `CryptoPeer::send_sealed_under_epoch` already uses for other
+    /// epochs).
+    fn receiver_with_forced_epoch_zero() -> (FollowerReceiver, FaultSocket, [u8; 32], Arc<LogBuffer>) {
+        let (recv_shared, seal_key) = established_crypto_pair_with_forced_epoch_zero("forced-epoch-zero");
+        let b = buffer();
+        let peer_sock = FaultSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+
+        let mut cfg = FollowerConfig::new(peer_addr);
+        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.status_floor_ns = u64::MAX;
+        cfg.append_pos_floor_ns = u64::MAX;
+
+        let recv_half = recv_shared.receive_half();
+        let r = FollowerReceiver::with_crypto(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            cfg,
+            term_handle(TERM),
+            dummy_route(),
+            Some(CryptoIntake {
+                half: recv_half,
+                peer_ids: peer_ids_of([(peer_addr, PEER_ID)]),
+                handshake: dummy_handshake_route(),
+                transport: recv_shared.clone(),
+            }),
+        );
+
+        (r, peer_sock, seal_key, b)
+    }
+
+    #[test]
+    fn a_real_epoch_zero_sealed_data_datagram_is_admitted_not_diagnosed_as_cleartext() {
+        // T11 review round 1, finding 1: the discriminating conjunct
+        // (`key_epoch == 0 AND too-short-to-be-sealed`) was untested on its
+        // OWN terms -- every existing fixture dodges epoch 0 entirely, so
+        // the naive, WRONG guard (`key_epoch == 0` alone) passed all 70
+        // tests. This is the "reaches real epoch 0" half: a genuinely
+        // 46-byte SEALED DATA datagram (well past the 40-byte floor) under
+        // epoch 0 must be admitted exactly like any other epoch, not
+        // diagnosed as a cleartext peer.
+        use Ordering::Relaxed;
+        let (mut r, mut peer_sock, seal_key, b) = receiver_with_forced_epoch_zero();
+        let to = r.local_addr();
+
+        let runs = frame_runs(&[b"aaaa"], 4096);
+        let (pos, bytes, advance) = &runs[0];
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader { position: *pos, leadership_term_id: TERM, kind: DGRAM_KIND_DATA, flags: 0, key_epoch: 0 },
+        );
+        d.extend_from_slice(bytes);
+        uc2_crypto::seal::seal_in_place(&mut d, &seal_key, 1).unwrap();
+        assert!(d.len() >= DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD, "must be a genuinely sealed-length datagram");
+        peer_sock.send_to(&d, to).unwrap();
+
+        drive_until(&mut r, || b.counters().append.load_acquire() == *advance);
+        let st = r.stats();
+        assert_eq!(st.peer_appears_cleartext.load(Relaxed), 0, "a real epoch-0 seal must not be misdiagnosed");
+        assert_eq!(st.dropped_auth_failed.load(Relaxed), 0);
+        assert_eq!(st.dropped_unknown_epoch.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn a_real_epoch_zero_sealed_heartbeat_at_exactly_the_forty_byte_floor_is_admitted() {
+        // The zero-margin boundary case: an empty-payload HEARTBEAT seals to
+        // EXACTLY `DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD` (40) bytes -- the
+        // shortest a validly sealed frame can ever be, and exactly the
+        // length the cleartext-shape check's `n < 40` compares against. If
+        // that boundary were off by one (`<=` instead of `<`), this is the
+        // one case that would catch it: real, minimal, sealed, epoch 0.
+        use Ordering::Relaxed;
+        let (mut r, mut peer_sock, seal_key, _b) = receiver_with_forced_epoch_zero();
+        let to = r.local_addr();
+
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(
+            &mut d,
+            &DatagramHeader { position: 0, leadership_term_id: TERM, kind: DGRAM_KIND_HEARTBEAT, flags: 0, key_epoch: 0 },
+        );
+        uc2_crypto::seal::seal_in_place(&mut d, &seal_key, 1).unwrap();
+        assert_eq!(d.len(), DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD, "the minimal sealed frame is exactly 40 bytes");
+        peer_sock.send_to(&d, to).unwrap();
+
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // HEARTBEAT carries no counter to drive `append`; `datagrams` is the
+        // "reached on_datagram" signal (see the T17-allowance test's own
+        // doc for the same idiom).
+        while st.datagrams.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "the 40-byte epoch-0 HEARTBEAT was never admitted");
+            r.do_work();
+        }
+        assert_eq!(st.peer_appears_cleartext.load(Relaxed), 0, "a real epoch-0 seal must not be misdiagnosed");
+        assert_eq!(st.dropped_auth_failed.load(Relaxed), 0);
+        assert_eq!(st.dropped_unknown_epoch.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn a_sealed_datagram_opens_and_dispatches_exactly_as_cleartext_did() {
+        let (mut r, mut peer, b) = receiver_with_crypto();
+        let to = r.local_addr();
+        let runs = frame_runs(&[b"aaaa", b"bb", b"cccccc"], 4096);
+        let (pos, bytes, advance) = &runs[0];
+        peer.send_sealed_data(to, *pos, bytes);
+        drive_until(&mut r, || b.counters().append.load_acquire() == *advance);
+        let s = b.recordable_slice(0, 1 << 20).unwrap();
+        assert_eq!(&s[32..36], b"aaaa", "downstream sees plaintext, byte-identical to the cleartext path");
+    }
+
+    /// M8 (Task 12), the M7 runtime-node-add shape: a peer whose address had
+    /// no `NodeId` mapping when this receiver was constructed must become
+    /// resolvable the moment membership publishes it — WITHOUT a restart.
+    ///
+    /// Discriminating on purpose: the FIRST half asserts the datagram is
+    /// dropped as `dropped_unknown_peer` (so the fixture genuinely starts
+    /// with no mapping — a fixture that silently registered the peer would
+    /// make the second half vacuous), and the second half asserts the very
+    /// same peer's next datagram lands in the log buffer after nothing but a
+    /// `PeerIds::store`. Reverting `refresh_peer_ids` to a no-op fails the
+    /// second half; never publishing an empty map fails the first.
+    #[test]
+    fn a_peer_id_published_after_construction_is_resolvable_without_a_restart() {
+        use Ordering::Relaxed;
+        let (mut r, mut peer, b, ids) = receiver_with_crypto_ids(false);
+        let to = r.local_addr();
+        let peer_addr = peer.sock.local_addr().unwrap();
+        let runs = frame_runs(&[b"aaaa", b"bb"], 4096);
+
+        // Unregistered: a genuinely well-formed sealed DATA is refused.
+        let (pos, bytes, _) = &runs[0];
+        peer.send_sealed_data(to, *pos, bytes);
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_unknown_peer.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "unregistered peer never counted");
+            r.do_work();
+        }
+        assert_eq!(b.counters().append.load_acquire(), 0, "nothing was admitted");
+
+        // Membership publishes the joiner. No restart, no reconstruction.
+        ids.store([(peer_addr, PEER_ID)]);
+        let (pos, bytes, advance) = &runs[0];
+        peer.send_sealed_data(to, *pos, bytes);
+        drive_until(&mut r, || b.counters().append.load_acquire() == *advance);
+    }
+
+    #[test]
+    fn a_forged_datagram_under_an_unknown_key_is_dropped_and_counted() {
+        use Ordering::Relaxed;
+        let (mut r, mut peer, b) = receiver_with_crypto();
+        let to = r.local_addr();
+        peer.send_sealed_with_wrong_key(to, 0, b"forged-payload");
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_auth_failed.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "forged datagram never counted");
+            r.do_work();
+        }
+        for _ in 0..50 {
+            r.do_work();
+        }
+        assert_eq!(st.dropped_auth_failed.load(Relaxed), 1);
+        assert_eq!(b.counters().append.load_acquire(), 0, "forged bytes never reach the log buffer");
+    }
+
+    #[test]
+    fn a_replayed_datagram_is_dropped_and_counted() {
+        use Ordering::Relaxed;
+        let (mut r, mut peer, b) = receiver_with_crypto();
+        let to = r.local_addr();
+        let runs = frame_runs(&[b"aaaa"], 4096);
+        let (pos, bytes, advance) = &runs[0];
+
+        // Capture the exact sealed wire bytes by having the peer send once,
+        // draining it off a mirror socket bound to the same recv address is
+        // not needed -- send twice with the SAME counter would be a cleaner
+        // "replay," but `SendHalf::seal` always advances the counter. Build
+        // the sealed datagram once by hand (same shape `send_sealed_data`
+        // uses) so the identical bytes can be captured and resent verbatim.
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(&mut d, &CryptoPeer::header(*pos, DGRAM_KIND_DATA, 0));
+        d.extend_from_slice(bytes);
+        let now = peer.send.now_ns();
+        peer.send.seal(DGRAM_KIND_DATA, None, &mut d, now).unwrap();
+
+        peer.send_raw(to, &d);
+        drive_until(&mut r, || b.counters().append.load_acquire() == *advance);
+
+        let st = r.stats();
+        // Baseline BEFORE the replay, not just "append unchanged after" --
+        // a mutant that treats a failed replay check as SUCCESS still
+        // leaves `append` unchanged in this fixture, because the
+        // AEAD-decrypted-but-wrongly-admitted bytes carry the ALREADY-
+        // consumed position and `on_datagram`'s own `h.position < contiguous`
+        // dup guard (or, depending on exact byte layout, its malformed-frame
+        // guard) also happens to reject it -- "append didn't move" is true
+        // either way, so it does not by itself prove the REPLAY check (not
+        // some unrelated downstream guard) is what caught this. Pin that the
+        // datagram is dropped HERE, before `on_datagram`, by checking that
+        // NEITHER of `on_datagram`'s own drop counters moved at all -- if a
+        // future change let a replayed-but-decrypted datagram reach
+        // `on_datagram`, one of those would tick even though `append` stays
+        // put.
+        let dup0 = st.dropped_dup.load(Relaxed);
+        let malformed0 = st.dropped_malformed.load(Relaxed);
+
+        peer.send_raw(to, &d); // byte-for-byte capture and resend
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_replay.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "replayed datagram never counted");
+            r.do_work();
+        }
+        for _ in 0..20 {
+            r.do_work();
+        }
+        assert_eq!(st.dropped_replay.load(Relaxed), 1);
+        assert_eq!(b.counters().append.load_acquire(), *advance, "the replay did not double-apply");
+        assert_eq!(
+            st.dropped_dup.load(Relaxed), dup0,
+            "the replay must never reach on_datagram at all, not merely be re-rejected there as a dup"
+        );
+        assert_eq!(
+            st.dropped_malformed.load(Relaxed), malformed0,
+            "the replay must never reach on_datagram at all, not merely be re-rejected there as malformed"
+        );
+    }
+
+    #[test]
+    fn a_cleartext_peer_is_diagnosed_specifically_not_as_a_generic_auth_failure() {
+        // The likeliest operator error under flag-day rollout.
+        use Ordering::Relaxed;
+        let (mut r, mut peer, b) = receiver_with_crypto();
+        let to = r.local_addr();
+        peer.send_cleartext_data(to, 0, b"frames"); // key_epoch == 0, no counter/tag
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.peer_appears_cleartext.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "cleartext peer never diagnosed");
+            r.do_work();
+        }
+        for _ in 0..50 {
+            r.do_work();
+        }
+        assert_eq!(st.peer_appears_cleartext.load(Relaxed), 1);
+        assert_eq!(st.dropped_auth_failed.load(Relaxed), 0, "distinguishable from a generic auth failure");
+        assert_eq!(b.counters().append.load_acquire(), 0);
+    }
+
+    #[test]
+    fn an_unknown_epoch_is_dropped_without_killing_the_node() {
+        use Ordering::Relaxed;
+        let (mut r, mut peer, b) = receiver_with_crypto();
+        let to = r.local_addr();
+        peer.send_sealed_under_epoch(to, 999, 0, b"frames");
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_unknown_epoch.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "unknown-epoch datagram never counted");
+            r.do_work();
+        }
+        assert_eq!(st.dropped_unknown_epoch.load(Relaxed), 1);
+        assert_eq!(b.counters().append.load_acquire(), 0);
+        // "without killing the node" -- the receiver keeps functioning for
+        // legitimate traffic afterwards.
+        peer.send_sealed_data(to, 0, &frame_runs(&[b"ok"], 4096)[0].1);
+        let advance = frame_runs(&[b"ok"], 4096)[0].2;
+        drive_until(&mut r, || b.counters().append.load_acquire() == advance);
+    }
+
+    #[test]
+    fn truncated_and_random_datagrams_never_panic() {
+        // Anyone who can reach the port must not be able to kill the node.
+        // The brief's own trace list: zero-length, 15-byte, 16-byte,
+        // all-zeroes, and 64 KiB of garbage -- covered explicitly below,
+        // plus a broader length sweep for good measure.
+        let (mut r, mut peer, _b) = receiver_with_crypto();
+        let to = r.local_addr();
+        for len in [0usize, 1, 15, 16, 17, 39, 40, 1500] {
+            peer.send_raw(to, &vec![0xABu8; len]);
+            for _ in 0..3 {
+                r.do_work();
+            }
+        }
+        // All-zeroes, at both the header-only and a payload-bearing length
+        // -- byte 12 (`kind`) is 0 (an unrecognized kind, `Scope::Pairwise`
+        // by `scope_of`'s catch-all), `key_epoch` (bytes 14-15) is 0 too, so
+        // this also exercises the mixed-mode cleartext-shape check's other
+        // branch (the SHORT all-zero case) alongside the plain auth-failure
+        // path (the LONG one, long enough to not trip that check).
+        for len in [15usize, 16, 40, 1500] {
+            peer.send_raw(to, &vec![0u8; len]);
+            for _ in 0..3 {
+                r.do_work();
+            }
+        }
+        // A 64 KiB garbage datagram too, since the receive buffer is
+        // exactly that size -- the boundary the "never memset the whole
+        // buffer" property lives at.
+        peer.send_raw(to, &vec![0xCDu8; 65_000]);
+        for _ in 0..3 {
+            r.do_work();
+        }
+    }
+
+    #[test]
+    fn a_datagram_from_an_unregistered_address_is_dropped_and_counted_not_authenticated() {
+        // Every other test's peer is registered via `CryptoIntake::peer_ids` (built
+        // into `receiver_with_crypto`). Nothing exercises the OTHER branch
+        // of `peer_id_of` -- a real sealed-LOOKING datagram from a
+        // `SocketAddr` this receiver has no `NodeId` mapping for -- until
+        // this test. Uses a SECOND, entirely unregistered socket sending
+        // the exact same sealed bytes a legitimate peer would.
+        use Ordering::Relaxed;
+        let (mut r, mut peer, b) = receiver_with_crypto();
+        let to = r.local_addr();
+
+        // A genuinely well-formed sealed DATA datagram (peer's real
+        // SendHalf, real established session) -- the ONLY thing wrong with
+        // it is who it arrives FROM.
+        let runs = frame_runs(&[b"aaaa"], 4096);
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(&mut d, &CryptoPeer::header(runs[0].0, DGRAM_KIND_DATA, 0));
+        d.extend_from_slice(&runs[0].1);
+        let now = peer.send.now_ns();
+        peer.send.seal(DGRAM_KIND_DATA, None, &mut d, now).unwrap();
+
+        let mut stranger = FaultSocket::bind("127.0.0.1:0").unwrap();
+        stranger.send_to(&d, to).unwrap();
+
+        let st = r.stats();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while st.dropped_unknown_peer.load(Relaxed) < 1 {
+            assert!(Instant::now() < deadline, "datagram from an unregistered address never counted");
+            r.do_work();
+        }
+        assert_eq!(st.dropped_unknown_peer.load(Relaxed), 1);
+        assert_eq!(st.dropped_auth_failed.load(Relaxed), 1, "folded into the mandated auth-failed bucket too");
+        assert_eq!(b.counters().append.load_acquire(), 0, "an unresolvable sender's bytes never land");
+    }
+
+    // ======================================================================
+    // M8 Task 17: this receiver's OWN outgoing control datagrams
+    // ======================================================================
+
+    impl CryptoPeer {
+        /// A real, correctly-sealed PAIRWISE datagram (the shape T17's
+        /// snapshot session actually uses on the leader side).
+        fn send_sealed_pairwise(&mut self, to: SocketAddr, kind: u8, position: u64, body: &[u8]) {
+            let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+            write_datagram_header(&mut d, &Self::header(position, kind, 0));
+            d.extend_from_slice(body);
+            let now = self.send.now_ns();
+            self.send.seal(kind, Some(RECV_ID), &mut d, now).unwrap();
+            self.sock.send_to(&d, to).unwrap();
+        }
+
+        /// Wait for a raw datagram of `kind` from the receiver under test,
+        /// pumping it in between. Returns the WIRE bytes (still sealed).
+        /// Datagrams of OTHER kinds read along the way are stashed, not
+        /// discarded — the three control kinds this drains for are emitted in
+        /// an order the test does not control, and dropping the ones that
+        /// arrive early would make the test flaky rather than discriminating.
+        fn await_raw(&mut self, r: &mut FollowerReceiver, kind: u8) -> Option<Vec<u8>> {
+            if let Some(i) = self.stash.iter().position(|d| read_datagram_header(d).kind == kind) {
+                return Some(self.stash.remove(i));
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut buf = [0u8; 4096];
+            while Instant::now() < deadline {
+                r.do_work();
+                while let Some((n, _)) = self.sock.recv_from(&mut buf).unwrap() {
+                    if n < DATAGRAM_HEADER_LEN {
+                        continue;
+                    }
+                    if read_datagram_header(&buf[..n]).kind == kind {
+                        return Some(buf[..n].to_vec());
+                    }
+                    self.stash.push(buf[..n].to_vec());
+                }
+                std::thread::yield_now();
+            }
+            None
+        }
+
+        /// `await_raw`, then assert the datagram is a REAL seal by opening it
+        /// on this peer's own `ReceiveHalf`. Returns `(wire bytes, plaintext
+        /// body)`.
+        fn await_sealed(
+            &mut self,
+            r: &mut FollowerReceiver,
+            kind: u8,
+        ) -> (Vec<u8>, Vec<u8>) {
+            let wire = self.await_raw(r, kind).unwrap_or_else(|| panic!("no kind-{kind} arrived"));
+            let mut d = wire.clone();
+            let n = d.len();
+            let len = self
+                .recv
+                .open_slice(RECV_ID, &mut d, n)
+                .unwrap_or_else(|e| panic!("kind {kind} did not open as a sealed datagram: {e}"));
+            (wire, d[DATAGRAM_HEADER_LEN..len].to_vec())
+        }
+    }
+
+    /// NAK, STATUS and APPEND_POSITION — the three the follower sends to its
+    /// leader every duty cycle. All `Scope::Pairwise`, all cleartext before
+    /// T17.
+    ///
+    /// Discriminating on the CIPHERTEXT REGION specifically, not on
+    /// whole-datagram inequality: the 16-byte `DATAGRAM_HEADER_LEN` is
+    /// cleartext in both modes, so `sealed != cleartext` would pass even if
+    /// the body went out verbatim. Each assertion compares the opened plaintext against the
+    /// body the pre-T17 code put on the wire, and separately asserts that
+    /// exact body is NOT findable in the wire bytes.
+    #[test]
+    fn the_followers_nak_status_and_append_position_are_all_sealed() {
+        let (mut r, mut peer, b) = receiver_with_crypto();
+        // The shared fixture pins the STATUS/AppendPosition TIME floors to
+        // `u64::MAX` (so its own tests are not perturbed by background
+        // control traffic); this test needs all three kinds to actually fire.
+        r.cfg.status_floor_ns = 1;
+        r.cfg.append_pos_floor_ns = 1;
+        let to = r.local_addr();
+
+        // A gap: send frame 2 without frame 1, so the NAK timer arms.
+        let runs = frame_runs(&[b"aaaa", b"bbbb"], 32);
+        assert!(runs.len() >= 2, "fixture must produce two separate runs");
+        peer.send_sealed_data(to, runs[1].0, &runs[1].1);
+
+        let (nak_wire, nak_body) = peer.await_sealed(&mut r, DGRAM_KIND_NAK);
+        let nak = read_nak_body(&nak_body);
+        assert_eq!(nak.position, 0, "the follower NAKs from its contiguous frontier");
+        let mut expect = vec![0u8; NAK_BODY_LEN];
+        write_nak_body(&mut expect, &NakBody { position: nak.position, length: nak.length });
+        assert!(
+            !nak_wire.windows(NAK_BODY_LEN).any(|w| w == expect.as_slice()),
+            "the NAK body must not be readable on the wire"
+        );
+        assert_eq!(
+            nak_wire.len(),
+            DATAGRAM_HEADER_LEN + NAK_BODY_LEN + CRYPTO_OVERHEAD,
+            "exactly the counter+tag overhead, nothing else"
+        );
+
+        let (st_wire, st_body) = peer.await_sealed(&mut r, DGRAM_KIND_STATUS);
+        let status = read_status_body(&st_body);
+        let mut expect = vec![0u8; STATUS_BODY_LEN];
+        write_status_body(&mut expect, &status);
+        assert!(
+            !st_wire.windows(STATUS_BODY_LEN).any(|w| w == expect.as_slice()),
+            "the STATUS body must not be readable on the wire"
+        );
+
+        // APPEND_POSITION carries its payload entirely in the HEADER
+        // (`position` = durable), which stays cleartext by design — the seal
+        // authenticates it as AAD rather than hiding it. So the assertion
+        // here is the one that actually discriminates: it must OPEN, and it
+        // must be exactly `DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD` long.
+        let (ap_wire, ap_body) = peer.await_sealed(&mut r, DGRAM_KIND_APPEND_POSITION);
+        assert!(ap_body.is_empty(), "APPEND_POSITION carries no body");
+        assert_eq!(
+            ap_wire.len(),
+            DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD,
+            "an empty-payload sealed frame is exactly header + counter + tag"
+        );
+        let _ = b;
+    }
+
+    /// The other direction of a snapshot session — the receiving node's own
+    /// replies. T11's allowance explicitly did NOT cover these, so before
+    /// T17 a session stalled on its first lost chunk and never signalled
+    /// completion.
+    #[test]
+    fn the_snapshot_intakes_snap_nak_and_snap_done_are_sealed() {
+        let (mut r, mut peer, _b) = receiver_with_crypto();
+        let dir = tempfile::tempdir().unwrap();
+        r.set_snapshot_intake(dir.path().to_path_buf(), None);
+        let to = r.local_addr();
+
+        // Open a session of 64 bytes, then deliver ONLY the second half so a
+        // gap at [0,32) forces a SNAP_NAK.
+        const TOTAL: u64 = 64;
+        let mut begin = vec![0u8; SNAP_BEGIN_FIXED_LEN];
+        write_snap_begin_body(
+            &mut begin,
+            &SnapBeginBody { session: 7, snapshot_pos: 4096, total_len: TOTAL, config: vec![] },
+        );
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &begin);
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, 32, &[0xEEu8; 32]);
+
+        let (nak_wire, nak_body) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_NAK);
+        let nak = read_snap_nak_body(&nak_body).expect("a well-formed SNAP_NAK body");
+        assert_eq!(nak.session, 7);
+        assert_eq!(nak.offset, 0, "the gap is the first 32 bytes");
+        assert_eq!(
+            nak_wire.len(),
+            DATAGRAM_HEADER_LEN + SNAP_NAK_BODY_LEN + CRYPTO_OVERHEAD,
+            "exactly the counter+tag overhead"
+        );
+
+        // Fill the gap; the intake completes and acks SNAP_DONE.
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_CHUNK, 0, &[0xDDu8; 32]);
+        let (done_wire, done_body) = peer.await_sealed(&mut r, DGRAM_KIND_SNAP_DONE);
+        let done = read_snap_begin_body(&done_body).expect("a well-formed SNAP_DONE body");
+        assert_eq!(done.session, 7);
+        assert_eq!(done.snapshot_pos, 4096);
+        assert_eq!(
+            done_wire.len(),
+            DATAGRAM_HEADER_LEN + SNAP_BEGIN_FIXED_LEN + CRYPTO_OVERHEAD,
+            "exactly the counter+tag overhead"
+        );
+        assert!(
+            dir.path().join("snap-4096.ultsnap").exists(),
+            "the sealed session actually completed end to end"
+        );
+    }
+
+    /// Fail-closed: with no `SocketAddr -> NodeId` entry for the leader there
+    /// is no pairwise key, and NOTHING may go out. The pre-T17 code would
+    /// have sent all three in the clear.
+    #[test]
+    fn a_control_send_with_no_resolvable_peer_is_dropped_not_sent_in_the_clear() {
+        use Ordering::Relaxed;
+        // `registered: false` → the peer map is empty, so the leader address
+        // resolves to nothing.
+        let (mut r, peer, _b, _ids) = receiver_with_crypto_ids(false);
+        let st = r.stats();
+        // Force a gap so the NAK timer arms, and let the status/AP floors fire.
+        r.leader_append = 4096;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && st.seal_failures.load(Relaxed) == 0 {
+            r.do_work();
+            std::thread::yield_now();
+        }
+        assert!(
+            st.seal_failures.load(Relaxed) > 0,
+            "an unsealable control datagram must be counted, not silently sent"
+        );
+        assert_eq!(st.naks_sent.load(Relaxed), 0, "no NAK reached the wire");
+        assert_eq!(st.statuses_sent.load(Relaxed), 0, "no STATUS reached the wire");
+        assert_eq!(st.append_positions_sent.load(Relaxed), 0, "no AppendPosition reached the wire");
+        let mut buf = [0u8; 4096];
+        assert!(
+            peer.sock.recv_from(&mut buf).unwrap().is_none(),
+            "not one cleartext control datagram reached the leader"
+        );
+    }
+
+    /// The deleted allowance, inverted. Before T17 this exact datagram was
+    /// admitted unauthenticated and its `SnapBeginBody.config` flowed into
+    /// `maybe_adopt_incoming_snapshot` — attacker-chosen membership.
+    #[test]
+    fn an_unsealed_snap_begin_is_refused_now_that_t17_landed() {
+        use Ordering::Relaxed;
+        let (mut r, mut peer, _b) = receiver_with_crypto();
+        let dir = tempfile::tempdir().unwrap();
+        r.set_snapshot_intake(dir.path().to_path_buf(), None);
+        let to = r.local_addr();
+        let st = r.stats();
+        let before = st.datagrams.load(Relaxed);
+
+        // A well-formed, entirely cleartext SNAP_BEGIN carrying a hostile
+        // membership record — exactly the forgery T11's allowance admitted.
+        let hostile = b"ATTACKER-CHOSEN-MEMBERSHIP".to_vec();
+        let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN + hostile.len()];
+        write_snap_begin_body(
+            &mut body,
+            &SnapBeginBody {
+                session: 1,
+                snapshot_pos: 4096,
+                total_len: 32,
+                config: hostile.clone(),
+            },
+        );
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(&mut d, &CryptoPeer::header(0, DGRAM_KIND_SNAP_BEGIN, 0));
+        d.extend_from_slice(&body);
+        // Long enough that the mixed-mode "peer appears cleartext" shortcut
+        // (which needs `n < DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD`) does NOT
+        // fire — so this datagram genuinely reaches, and is rejected by, the
+        // AEAD check rather than being screened out for its length.
+        assert!(d.len() > DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD);
+        peer.send_raw(to, &d);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.dropped_auth_failed.load(Relaxed) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "an unsealed SNAP_BEGIN was neither authenticated nor rejected — the T17 \
+                 allowance is still admitting it"
+            );
+            r.do_work();
+        }
+        assert_eq!(
+            st.datagrams.load(Relaxed),
+            before,
+            "the forged SNAP_BEGIN must never reach on_datagram at all"
+        );
+        assert!(
+            r.snap_intake.is_none(),
+            "no snapshot intake may be opened by an unauthenticated SNAP_BEGIN"
+        );
+        assert_eq!(st.peer_appears_cleartext.load(Relaxed), 0, "not the mixed-mode diagnostic");
+    }
+
+    /// Same rule for `SNAP_CHUNK`: the artifact's bytes may not be written
+    /// into an intake by anyone who can reach the UDP port.
+    #[test]
+    fn an_unsealed_snap_chunk_is_refused_now_that_t17_landed() {
+        use Ordering::Relaxed;
+        let (mut r, mut peer, _b) = receiver_with_crypto();
+        let dir = tempfile::tempdir().unwrap();
+        r.set_snapshot_intake(dir.path().to_path_buf(), None);
+        let to = r.local_addr();
+        let st = r.stats();
+
+        // Open a REAL (sealed) session first, so an intake exists and the
+        // only thing wrong with the chunk below is that it is unsealed.
+        let mut begin = vec![0u8; SNAP_BEGIN_FIXED_LEN];
+        write_snap_begin_body(
+            &mut begin,
+            &SnapBeginBody { session: 3, snapshot_pos: 4096, total_len: 64, config: vec![] },
+        );
+        peer.send_sealed_pairwise(to, DGRAM_KIND_SNAP_BEGIN, 0, &begin);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.snap_intake.is_none() {
+            assert!(Instant::now() < deadline, "the sealed SNAP_BEGIN never opened an intake");
+            r.do_work();
+        }
+
+        let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+        write_datagram_header(&mut d, &CryptoPeer::header(0, DGRAM_KIND_SNAP_CHUNK, 0));
+        d.extend_from_slice(&[0xAAu8; 64]);
+        let before_auth = st.dropped_auth_failed.load(Relaxed);
+        peer.send_raw(to, &d);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while st.dropped_auth_failed.load(Relaxed) == before_auth {
+            assert!(Instant::now() < deadline, "an unsealed SNAP_CHUNK was admitted");
+            r.do_work();
+        }
+        let intake = r.snap_intake.as_ref().expect("the real session is still open");
+        assert_eq!(intake.got.contiguous(), 0, "no forged bytes landed in the .part");
+    }
+
+    #[test]
+    fn crypto_disabled_receiver_is_unaffected_by_the_new_seam() {
+        // `crypto_admit` must be a complete pass-through when `crypto` is
+        // `None` -- pins the "byte-for-byte the pre-M8 path" claim in its
+        // own doc comment, at the seam, not just via the 19 unmodified
+        // tests above (which never construct a crypto-enabled receiver at
+        // all and so can't by themselves prove the new code path is inert).
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+        let runs = frame_runs(&[b"aaaa"], 4096);
+        leader.send(to, DGRAM_KIND_DATA, runs[0].0, TERM, &runs[0].1);
+        drive_until(&mut r, || b.counters().append.load_acquire() == runs[0].2);
+    }
 }
