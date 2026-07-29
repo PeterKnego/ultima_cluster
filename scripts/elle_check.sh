@@ -79,7 +79,26 @@ require false "$(verdict "$STRICT_MODEL" "$FIX_RT")" "realtime fixture rejected 
 
 for pass in "${PASSES[@]}"; do
     hist="$ELLE_DIR/$pass/history.edn"
-    if [ ! -f "$hist" ]; then
+    crypto_sidecar="$ELLE_DIR/$pass/crypto"
+    if [ -f "$hist" ]; then
+        # M8 Task 15 review fix: a cached history under a reused ELLE_DIR can
+        # predate this posture check entirely (pre-Task-15 dir) or have been
+        # generated under the OTHER crypto posture — either way, adjudicating
+        # it and printing the REQUESTED posture (rather than the one it was
+        # actually generated under) is exactly the vacuity risk this whole
+        # task exists to close, one layer up: a UC2_CRYPTO=1 run against a
+        # directory of cleartext histories would otherwise print "crypto=1"
+        # having sealed nothing. Refuse rather than silently trust the ask.
+        cached_crypto="0"
+        if [ -f "$crypto_sidecar" ]; then
+            cached_crypto="$(cat "$crypto_sidecar")"
+        fi
+        if [ "$cached_crypto" != "$UC2_CRYPTO" ]; then
+            echo "error: $hist was generated under crypto=$cached_crypto but UC2_CRYPTO=$UC2_CRYPTO was requested." >&2
+            echo "hint: point ELLE_DIR at a fresh directory, or delete $ELLE_DIR/$pass to regenerate under the requested posture." >&2
+            exit 1
+        fi
+    else
         echo "== generating $pass history (elle_v2 driver, crypto=$UC2_CRYPTO) =="
         # shellcheck disable=SC2086
         (cd "$ROOT" && ELLE_DIR="$ELLE_DIR" UC2_CRYPTO="$UC2_CRYPTO" cargo test -p uc2_node --release $CARGO_FEATURES \

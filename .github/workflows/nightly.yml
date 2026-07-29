@@ -12,6 +12,14 @@ name: nightly
 #                  interleaving exploration; needs `--cfg loom` + release).
 #   * crashtest  — multi-process SIGKILL-mid-load linearizability
 #                  (uc2-crashtest bins spawned via CARGO_BIN_EXE_*).
+#   * crashtest-crypto / elle-crypto — M8 Task 15: the crashtest and elle
+#                  clean tiers re-run with UC2_CRYPTO=1 (wire crypto Enabled
+#                  on every spawned node). The lincheck crypto variants
+#                  (lin_v2/lin_partition_v2's *_with_crypto tests) need no
+#                  separate job — `cargo test --workspace` in `capstones`
+#                  picks them up automatically. These two do, because
+#                  UC2_CRYPTO is an opt-in env switch the plain `crashtest`/
+#                  `elle` jobs never set.
 # Runners are small (4 vCPU) vs the dev fleet; the capstones spin multi-node
 # clusters of busy-polling agents, hence the generous timeouts. A red run here
 # with a green ci.yml usually means a timing-sensitive capstone, not a logic
@@ -75,6 +83,22 @@ jobs:
       - name: Multi-process SIGKILL linearizability
         run: cargo test -p uc2-crashtest --features hard-crash-tests
 
+  # M8 Task 15: the same suite with wire crypto Enabled on every node the
+  # crashtest bins spawn (UC2_CRYPTO=1 — see examples/uc2-crashtest/tests/
+  # common/mod.rs). A separate job (not a matrix leg on `crashtest`) so a
+  # crypto-specific regression is never conflated with a cleartext one, same
+  # rationale as every other split in this file.
+  crashtest-crypto:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      UC2_CRYPTO: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Multi-process SIGKILL linearizability (crypto ON)
+        run: cargo test -p uc2-crashtest --features hard-crash-tests
+
   # Elle transactional-safety tier: 5 list-append passes (quiet/failover/
   # partition/purge/reconfig), each adjudicated by the vendored elle-cli under
   # `serializable` AND `strong-serializable` — anomaly set must be empty. The jar
@@ -94,6 +118,31 @@ jobs:
           distribution: temurin
           java-version: '21'
       - name: Elle clean tier (5 passes, both consistency models)
+        run: scripts/elle_check.sh
+
+  # M8 Task 15: the same 5-pass clean tier with wire crypto Enabled on every
+  # node (UC2_CRYPTO=1 — see uc2_node/tests/elle_v2.rs's crypto_from_env).
+  # A dedicated ELLE_DIR: CI runners are ephemeral (no cross-job reuse), but
+  # naming it explicitly keeps the crypto/cleartext histories unambiguous in
+  # any artifact upload and matches `scripts/elle_check.sh`'s own posture
+  # sidecar check (a mismatched ELLE_DIR now fails loudly rather than
+  # silently adjudicating the wrong posture).
+  elle-crypto:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      ELLE_TARGET_OPS: 8000
+      ELLE_BUDGET_SECS: 300
+      ELLE_DIR: /home/runner/.cache/uc2-elle-crypto
+      UC2_CRYPTO: '1'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Elle clean tier, crypto ON (5 passes, both consistency models)
         run: scripts/elle_check.sh
 
   # Lean proofs gate (Phase 1): builds the sorry-free Uc2Model/Uc2Proofs

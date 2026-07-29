@@ -66,6 +66,19 @@ use uc_lincheck::register::{Cmd, CmdResp};
 mod common;
 use common::*;
 
+/// A tempdir on the ext4 target volume (mirrors `uc2_node/tests/lin_v2.rs`'s
+/// own `tempdir()`): `/tmp` on this box is RAM-backed tmpfs with NO swap
+/// (see CLAUDE.md), and instance dirs + journal segments are real disk
+/// writes, not something to park on tmpfs. Every `tempfile::tempdir()` call
+/// in this file uses this helper instead of the bare (defaults-to-`/tmp`)
+/// `tempfile::tempdir()`.
+fn tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("uc2-crashtest-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir")
+}
+
 // ------------------------------------------------------ reconnecting conn
 
 /// One worker's client connection to the (single) node instance dir,
@@ -367,7 +380,7 @@ fn linearizable_under_service_sigkill() {
     shorten_client_timeout();
     let seed: u64 = std::env::var("LIN_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempdir();
     let inst = tmp.path().join("inst");
     std::fs::create_dir_all(&inst).unwrap();
 
@@ -480,7 +493,7 @@ fn node_sigkill_recovery_once(run: u32) {
     shorten_client_timeout();
     let seed: u64 = 0xC0FFEE_u64 ^ (run as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempdir();
     let inst = tmp.path().join("inst");
     std::fs::create_dir_all(&inst).unwrap();
 
@@ -974,7 +987,7 @@ fn warmup_write_multi(dirs: &Arc<Vec<PathBuf>>, history: &History, last_seen: &A
 #[test]
 fn sigkill_mid_config_window() {
     shorten_client_timeout();
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = tempdir();
 
     const N: usize = 3;
     let addrs: Vec<SocketAddr> = (0..N).map(|_| free_addr()).collect();
@@ -1145,5 +1158,143 @@ fn sigkill_mid_config_window() {
     );
 
     assert_linearizable(&entries, "sigkill_mid_config_window", "all");
+    // node_procs / svc_procs dropped here → killed + reaped.
+}
+
+// ============================================================== test 4 (M8)
+//
+// M8 Task 15 review fix: `linearizable_under_service_sigkill` and
+// `node_sigkill_recovery` above are SINGLE-node clusters — under
+// `UC2_CRYPTO=1` the lone node mints a group epoch "for 0 peer(s)" and no
+// inter-node datagram is ever sealed, so those two only prove crypto
+// doesn't break single-node boot/apply/recovery. This is the crate's real
+// proof that SIGKILL-mid-load is safe over SEALED multi-process transport:
+// a real 3-process cluster, SIGKILL the CURRENT LEADER's node process (not
+// just its service, and not just the admin protocol like
+// `sigkill_mid_config_window`), restart it on the same id/bind/members, and
+// require the concurrent WGL workload to both RESUME progressing and stay
+// linearizable. Under crypto the restarted process must re-run the Noise
+// handshake with both live peers before its consensus datagrams are
+// accepted again (`uc2_crypto`'s receive-side drop-unsealed rule), and the
+// survivors' COMMIT_POSITION/DATA fan-out to it is sealed under the
+// (possibly still-active) group epoch — so this specifically exercises the
+// post-restart re-handshake path that `sigkill_mid_config_window`'s
+// same-process admin race does not.
+
+/// Spawn a node process as one voter of an `n`-member cluster on a FRESH
+/// `CARGO_TARGET_TMPDIR`-rooted dir (unlike `sigkill_mid_config_window`,
+/// which shares one `tempdir()` across all `RUNS`, this test only needs one
+/// cluster for its 3 repeats, matching `node_sigkill_recovery`'s own
+/// run-3-times-for-stability shape).
+#[test]
+fn leader_node_sigkill_recovery_multi() {
+    for run in 0..3u32 {
+        leader_node_sigkill_recovery_multi_once(run);
+    }
+}
+
+fn leader_node_sigkill_recovery_multi_once(run: u32) {
+    shorten_client_timeout();
+    let seed: u64 = 0xDEADBEEF_u64 ^ (run as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+
+    let tmp = tempdir();
+
+    const N: usize = 3;
+    let addrs: Vec<SocketAddr> = (0..N).map(|_| free_addr()).collect();
+    let members: Vec<(u32, SocketAddr)> = (0..N as u32).map(|i| (i, addrs[i as usize])).collect();
+    let members_str = members_arg(&members);
+
+    // M8 Task 15: UC2_CRYPTO=1 boots this real 3-PROCESS cluster with wire
+    // crypto Enabled on every node.
+    let crypto_on = crypto_from_env();
+    let crypto = crypto_on.then(|| provision_crypto(tmp.path(), &(0..N as u32).collect::<Vec<_>>()));
+    let crypto_args_for = |id: u32| -> Option<(&Path, &Path)> {
+        crypto.as_ref().map(|m| (m.key_paths[&id].as_path(), m.allowlist_path.as_path()))
+    };
+
+    let mut dirs: Vec<PathBuf> = Vec::with_capacity(N);
+    let mut node_procs: Vec<Option<Reap>> = Vec::with_capacity(N);
+    for i in 0..N as u32 {
+        let d = tmp.path().join(format!("n{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        node_procs.push(Some(spawn_node_multi(&d, i, addrs[i as usize], &members_str, crypto_args_for(i))));
+        wait_for_ready(&d, Duration::from_secs(10));
+        dirs.push(d);
+    }
+    let mut svc_procs: Vec<Option<Reap>> = dirs.iter().map(|d| Some(spawn_service(d))).collect();
+
+    let leader0 = await_single_leader_multi(&dirs, 30);
+    if crypto_on {
+        assert_crypto_epoch_active(&dirs[leader0], Duration::from_secs(10));
+    }
+
+    let dirs = Arc::new(dirs);
+    let history = Arc::new(History::default());
+    let last_seen = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    warmup_write_multi(&dirs, &history, &last_seen);
+
+    const N_WORKERS: u32 = 3;
+    let handles =
+        spawn_workers_multi(&dirs, &history, &stop, &last_seen, seed, Duration::from_millis(15), N_WORKERS);
+
+    // Let some load land before the kill.
+    std::thread::sleep(Duration::from_millis(500));
+    let ok_before_kill = History::ok_count(&history.snapshot());
+
+    let li = await_single_leader_multi(&dirs, 20);
+    let old_id = open_cnc(&dirs[li]).and_then(|c| c.try_instance_id());
+
+    // SIGKILL the leader's NODE process (Reap reassignment), then its
+    // SERVICE (node-first-then-service, the v2.0 external-supervisor
+    // contract restated in `node_sigkill_recovery`'s doc: a service never
+    // self-heals across a node restart). The other two are a majority
+    // (2/3), so quorum is never lost and a serving leader exists throughout.
+    node_procs[li] = None;
+    svc_procs[li] = None;
+    node_procs[li] = Some(spawn_node_multi(
+        &dirs[li],
+        li as u32,
+        addrs[li],
+        &members_str,
+        crypto_args_for(li as u32),
+    ));
+    wait_for_fresh_cnc_instance(&dirs[li], old_id, Duration::from_secs(10));
+    svc_procs[li] = Some(spawn_service(&dirs[li]));
+
+    // The restarted node rejoins — under crypto, only after re-running the
+    // Noise handshake with both live peers — and the cluster re-converges
+    // to a single serving leader (which may or may not be the restarted
+    // node itself).
+    let leader1 = await_single_leader_multi(&dirs, 20);
+    if crypto_on {
+        assert_crypto_epoch_active(&dirs[leader1], Duration::from_secs(10));
+    }
+
+    std::thread::sleep(Duration::from_secs(2));
+    let ok_after_recovery = History::ok_count(&history.snapshot());
+
+    stop.store(true, Ordering::Relaxed);
+    join_workers(handles);
+
+    let entries = Arc::try_unwrap(history).ok().expect("sole history owner").into_entries();
+    let ok = History::ok_count(&entries);
+    eprintln!(
+        "[leader_node_sigkill_recovery_multi] run={run} ops={} ok_before_kill={ok_before_kill} \
+         ok_after_recovery={ok_after_recovery} ok_total={ok} crypto={crypto_on}",
+        entries.len()
+    );
+    assert!(
+        ok >= 20,
+        "liveness: only {ok} ops completed Ok (<20) across the leader-node SIGKILL (run {run})"
+    );
+    assert!(
+        ok_after_recovery > ok_before_kill,
+        "ok count did not grow after the leader-node SIGKILL+restart (stuck at {ok_before_kill}, run {run}) \
+         — the cluster failed to resume serving after recovery"
+    );
+
+    assert_linearizable(&entries, "leader_node_sigkill_recovery_multi", &format!("run{run}"));
     // node_procs / svc_procs dropped here → killed + reaped.
 }

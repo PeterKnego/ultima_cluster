@@ -55,11 +55,24 @@ pub const APP_ID: &str = "uc2-crashtest";
 // -------------------------------------------------- M8 Task 15: crypto ON
 //
 // `UC2_CRYPTO=1` re-runs every hard-crash test in this crate with wire
-// crypto `Enabled` on every real node PROCESS it spawns (a genuine
-// multi-process handshake + seal/open path, not the in-process fixture
-// `uc2_node/tests/crypto_cluster.rs`/`lincheck_v2` exercise). Honored
-// uniformly: every test below checks this once at the top and threads the
-// answer through its own `spawn_node`/`spawn_node_multi` calls.
+// crypto `Enabled` on every real node PROCESS it spawns. Honored uniformly:
+// every test below checks this once at the top and threads the answer
+// through its own `spawn_node`/`spawn_node_multi` calls.
+//
+// This alone does NOT mean every test exercises a genuine multi-process
+// seal/open path, though — that needs a real PEER to seal traffic with.
+// `linearizable_under_service_sigkill` and `node_sigkill_recovery` boot
+// SINGLE-node clusters (`node.crypto_epoch()` logs `for 0 peer(s)`): with
+// no peer, no inter-node datagram is ever sealed, and client/service IPC is
+// shmem, never sealed. Under crypto they prove only that enabling it
+// doesn't break single-node boot/apply/recovery. `sigkill_mid_config_window`
+// and `leader_node_sigkill_recovery_multi` are the real 3-PROCESS clusters
+// (a genuine multi-process handshake + seal/open path, not the in-process
+// fixture `uc2_node/tests/crypto_cluster.rs`/`lincheck_v2` exercise) —
+// `leader_node_sigkill_recovery_multi` in particular is the one that
+// SIGKILLs a NODE process (not just the admin protocol) and so is the one
+// that forces the restarted process to re-run the Noise handshake with its
+// live peers before its consensus datagrams are accepted again.
 
 /// `UC2_CRYPTO=1` re-runs the hard-crash capstones with wire crypto enabled.
 pub fn crypto_from_env() -> bool {

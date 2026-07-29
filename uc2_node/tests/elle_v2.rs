@@ -231,6 +231,15 @@ fn run_pass<F, V>(
     let out = elle_dir().join(name);
     rec.write_to(&out.join("history.edn")).expect("write history");
     std::fs::write(out.join("seed"), format!("{seed}\n")).expect("write seed");
+    // M8 Task 15 review fix: record the posture this history was ACTUALLY
+    // generated under, beside the existing `seed` sidecar. `scripts/
+    // elle_check.sh`'s cache-reuse check (`[ ! -f "$hist" ]`) is otherwise
+    // blind to a stale ELLE_DIR crossing the crypto boundary — a directory
+    // of crypto histories re-adjudicated under `UC2_CRYPTO=0` (or the more
+    // dangerous mirror: `UC2_CRYPTO=1` against cleartext histories) would
+    // print a posture it never actually ran. The sidecar lets the script
+    // refuse that mismatch instead of silently trusting the caller's ask.
+    std::fs::write(out.join("crypto"), if ccfg.crypto { "1\n" } else { "0\n" }).expect("write crypto sidecar");
 
     let (ok, completed) = (rec.ok_count(), rec.completed_count());
     eprintln!(
