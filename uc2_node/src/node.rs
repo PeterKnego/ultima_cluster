@@ -333,6 +333,23 @@ pub struct Node {
     /// M8 (Task 12): the newest group-key epoch this node has minted (0 =
     /// never). Written by the consensus agent; read by [`Node::crypto_epoch`].
     crypto_epoch: Arc<AtomicU32>,
+    /// M8 Task 14 (adversarial tier): a clone of the same [`SharedTransport`]
+    /// the consensus agent owns — `SharedTransport` is cheap to clone (an
+    /// `Arc`-backed handle onto shared key state) and `is_established` reads
+    /// through the same `Mutex` any other clone would, so this adds no new
+    /// synchronization. `None` under [`CryptoConfig::Disabled`]. Exposed via
+    /// [`Node::has_crypto_session_with`] for adversarial/integration tests
+    /// that need to observe pairwise session state from outside the crate
+    /// (e.g. "a peer revoked from the allowlist never re-establishes").
+    crypto: Option<SharedTransport>,
+    /// M8 Task 14: a clone of the same handshake-failure counter the
+    /// consensus agent bumps on every refused `HS_INIT`/`HS_RESP` (bad
+    /// claimed-id/transport-source binding, or a key not on the allowlist —
+    /// `handshake.rs`'s `on_init`/`on_resp`). Exposed via
+    /// [`Node::crypto_handshake_failures`] so an adversarial test can assert
+    /// a forged or revoked handshake attempt was actually REFUSED, not just
+    /// that it happened not to succeed within some timeout.
+    crypto_handshake_failures: Arc<AtomicU64>,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
     _instance: InstanceDir,
     _rings: Rings,
@@ -596,6 +613,9 @@ impl Node {
         // M8 (Task 12): the newest group epoch this node has minted, mirrored
         // off the consensus agent for `Node::crypto_epoch`.
         let crypto_epoch = Arc::new(AtomicU32::new(0));
+        // M8 Task 14: named (rather than inlined at the `Consensus` literal)
+        // so `Node` can hold its own clone for `Node::crypto_handshake_failures`.
+        let crypto_handshake_failures = Arc::new(AtomicU64::new(0));
 
         // Peer maps and the follower set, derived from the adopted config —
         // shared with `Consensus::rebuild_peer_maps` (M7's live-reconfiguration
@@ -942,7 +962,7 @@ impl Node {
             last_admin_seq: 0,
             pending_admin_fwd: None,
             last_config_reply: None,
-            crypto,
+            crypto: crypto.clone(),
             crypto_hs_rx: Some(hs_rx),
             crypto_peer_ids,
             crypto_epoch: Arc::clone(&crypto_epoch),
@@ -953,7 +973,7 @@ impl Node {
             crypto_peers_dirty: true,
             crypto_hs_key_seal_failures: Arc::new(AtomicU64::new(0)),
             crypto_unresolved_peer: Arc::new(AtomicU64::new(0)),
-            crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
+            crypto_handshake_failures: Arc::clone(&crypto_handshake_failures),
             crypto_seal_failures: Arc::new(AtomicU64::new(0)),
             crypto_last_log_ns: 0,
         };
@@ -977,6 +997,8 @@ impl Node {
             partition_handles,
             config_bytes: Arc::clone(&config_bytes),
             crypto_epoch,
+            crypto,
+            crypto_handshake_failures,
             _instance: instance,
             _rings: rings,
             // Stop order: consensus first (stops writing the term handle), then
@@ -1028,6 +1050,42 @@ impl Node {
             0 => None,
             e => Some(e as u16),
         }
+    }
+
+    /// M8 Task 14 (adversarial tier): whether this node currently has an
+    /// established pairwise Noise session with `peer` — forwards to
+    /// [`SharedTransport::is_established`]. `false` under
+    /// [`CryptoConfig::Disabled`] (nothing to establish) as well as while
+    /// crypto is enabled but no session with `peer` has completed (never
+    /// attempted, still in flight, or refused — e.g. `peer` was removed from
+    /// the allowlist and a fresh handshake attempt was rejected). Exposed
+    /// for adversarial/integration tests that need to observe session state
+    /// from outside the crate without inferring it indirectly from cluster
+    /// liveness.
+    pub fn has_crypto_session_with(&self, peer: NodeId) -> bool {
+        self.crypto.as_ref().is_some_and(|c| c.is_established(peer))
+    }
+
+    /// M8 Task 14: handshakes this node's consensus agent has REFUSED —
+    /// `handshake.rs`'s `on_init`/`on_resp` claimed-id/transport-source
+    /// binding check or allowlist-key check failing. `0` under
+    /// [`CryptoConfig::Disabled`]. Distinguishes "an attacker's handshake
+    /// attempt was actively refused" from "nothing happened to arrive yet" —
+    /// the difference between a discriminating adversarial test and a timeout
+    /// racing an absence.
+    pub fn crypto_handshake_failures(&self) -> u64 {
+        self.crypto_handshake_failures.load(Ordering::Relaxed)
+    }
+
+    /// M8 Task 14: this node's receive-path crypto drop counters
+    /// (`dropped_replay`, `dropped_auth_failed`, `peer_appears_cleartext`,
+    /// `dropped_unknown_peer`, …) — the same `Arc<FollowerStats>` the
+    /// receiver agent bumps. Exposed for adversarial tests that need to
+    /// prove a specific DEFENSE (the anti-replay window, the auth-failure
+    /// path) actually engaged, not merely that an attack's payload effect
+    /// was absent (which downstream idempotency could also explain).
+    pub fn crypto_stats(&self) -> &uc2_net::receiver::FollowerStats {
+        &self.route_drops
     }
 
     /// M7 Task 6: the cnc-mirrored `ConfigRecord.config.version` — bumped by

@@ -8,7 +8,7 @@
 //! held datagram is therefore delayed by at most one send — heartbeats keep
 //! sends coming, so nothing is held forever).
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, RwLock};
@@ -40,11 +40,33 @@ pub struct FaultConfig {
     pub drop_per_million: u32,
     pub dup_per_million: u32,
     pub reorder_per_million: u32,
+    /// M8 Task 14 (adversarial tier): flips one pseudo-random bit of the
+    /// datagram before it hits the wire — an on-path attacker's bit-level
+    /// corruption (or a lossy/noisy link's), not a benign fault. Applied to
+    /// a private copy; the caller's buffer is never mutated. Zero (the
+    /// default) costs nothing: the corrupt branch is skipped without ever
+    /// touching the RNG, so it does not perturb the drop/dup/reorder draw
+    /// sequence any existing seeded test depends on.
+    pub corrupt_per_million: u32,
+    /// M8 Task 14: with this probability, ALSO re-delivers one uniformly
+    /// random previously-sent datagram from a bounded history (distinct
+    /// from `dup_per_million`, which always re-sends the CURRENT datagram
+    /// immediately) — an on-path attacker capturing and replaying old wire
+    /// bytes at an arbitrary later time. Zero (the default) costs nothing:
+    /// no history is even recorded when this is 0.
+    pub replay_per_million: u32,
 }
 
 impl Default for FaultConfig {
     fn default() -> Self {
-        Self { seed: 1, drop_per_million: 0, dup_per_million: 0, reorder_per_million: 0 }
+        Self {
+            seed: 1,
+            drop_per_million: 0,
+            dup_per_million: 0,
+            reorder_per_million: 0,
+            corrupt_per_million: 0,
+            replay_per_million: 0,
+        }
     }
 }
 
@@ -74,12 +96,23 @@ impl PartitionHandle {
     }
 }
 
+/// Bound on the replay-history ring (see [`FaultSocket::remember`]) — old
+/// enough to span a handful of datagrams' worth of "attacker captured this
+/// a while ago", small enough that a sustained high-rate sender never grows
+/// unbounded memory from it.
+const REPLAY_HISTORY_CAP: usize = 32;
+
 pub struct FaultSocket {
     sock: UdpSocket,
     cfg: FaultConfig,
     rng: XorShift64,
     held: Option<(Vec<u8>, SocketAddr)>,
     blocked: PartitionHandle,
+    /// M8 Task 14: a bounded ring of recently-sent (datagram, destination)
+    /// pairs, used only by the `replay_per_million` fault — empty and never
+    /// grown while that knob is 0 (the default), so this costs nothing on
+    /// the hot path in production.
+    history: VecDeque<(Vec<u8>, SocketAddr)>,
 }
 
 impl FaultSocket {
@@ -96,6 +129,7 @@ impl FaultSocket {
             cfg,
             held: None,
             blocked: PartitionHandle::default(),
+            history: VecDeque::new(),
         })
     }
 
@@ -141,14 +175,75 @@ impl FaultSocket {
             self.held = Some((buf.to_vec(), to));
             return Ok(());
         }
-        self.raw_send(buf, to)?;
+
+        // Corrupt: flip one pseudo-random bit in a PRIVATE copy before it
+        // ever reaches the wire. `chance` is only called when the knob is
+        // set, so a 0 (the default) draws nothing from the RNG and leaves
+        // the drop/dup/reorder sequence any existing seeded test depends on
+        // byte-identical to before this task.
+        let corrupted;
+        let out: &[u8] = if self.cfg.corrupt_per_million > 0
+            && !buf.is_empty()
+            && self.rng.chance(self.cfg.corrupt_per_million)
+        {
+            let mut c = buf.to_vec();
+            let i = (self.rng.next_u64() % c.len() as u64) as usize;
+            let bit = 1u8 << (self.rng.next_u64() % 8);
+            c[i] ^= bit;
+            corrupted = c;
+            &corrupted
+        } else {
+            buf
+        };
+
+        self.raw_send(out, to)?;
         if self.cfg.dup_per_million > 0 && self.rng.chance(self.cfg.dup_per_million) {
-            self.raw_send(buf, to)?;
+            self.raw_send(out, to)?;
         }
-        if let Some((b, a)) = self.held.take() {
-            self.raw_send(&b, a)?;
+        let flushed_held = self.held.take();
+        if let Some((b, a)) = &flushed_held {
+            self.raw_send(b, *a)?;
+        }
+        // Replay: independently of everything above, re-deliver one
+        // uniformly random datagram from the bounded history — an on-path
+        // attacker resending old captured ciphertext at an unrelated later
+        // time. Drawn BEFORE this call's own datagram(s) are remembered, so
+        // a datagram can never "replay itself" on the very call that sent
+        // it for the first time — only a datagram from a STRICTLY EARLIER
+        // call is eligible. A no-op (not just a no-draw) until at least one
+        // datagram from an earlier call has ever been remembered.
+        if self.cfg.replay_per_million > 0
+            && self.rng.chance(self.cfg.replay_per_million)
+            && let Some((rb, ra)) = self.pick_replay()
+        {
+            self.raw_send(&rb, ra)?;
+        }
+        if self.cfg.replay_per_million > 0 {
+            self.remember(out, to);
+            if let Some((b, a)) = flushed_held {
+                self.remember(&b, a);
+            }
         }
         Ok(())
+    }
+
+    /// Push `(buf, to)` onto the bounded replay history, evicting the oldest
+    /// entry once full. Only ever called while `replay_per_million > 0`.
+    fn remember(&mut self, buf: &[u8], to: SocketAddr) {
+        if self.history.len() == REPLAY_HISTORY_CAP {
+            self.history.pop_front();
+        }
+        self.history.push_back((buf.to_vec(), to));
+    }
+
+    /// A uniformly random entry from the replay history, or `None` if
+    /// nothing has been remembered yet.
+    fn pick_replay(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
+        if self.history.is_empty() {
+            return None;
+        }
+        let i = (self.rng.next_u64() % self.history.len() as u64) as usize;
+        self.history.get(i).cloned()
     }
 
     fn raw_send(&self, buf: &[u8], to: SocketAddr) -> io::Result<()> {
@@ -305,5 +400,80 @@ mod tests {
             (0..100u8).filter(|_| !rng.chance(500_000)).map(|i| vec![i]).collect();
         let got = recv_all(&rx, expected.len());
         assert_eq!(got, expected, "empty partition set perturbed the seeded drop sequence");
+    }
+
+    // ================================================================
+    // M8 Task 14: corrupt/replay knobs (adversarial tier)
+    // ================================================================
+
+    #[test]
+    fn corrupt_flips_exactly_one_bit_and_leaves_length_unchanged() {
+        let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        let to = rx.local_addr().unwrap();
+        let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        // Certainty (1_000_000/million): every send is corrupted.
+        tx.set_faults(FaultConfig { seed: 3, corrupt_per_million: 1_000_000, ..Default::default() });
+        let original = vec![0xAAu8; 32];
+        tx.send_to(&original, to).unwrap();
+        let got = recv_all(&rx, 1);
+        assert_eq!(got.len(), 1);
+        let corrupted = &got[0];
+        assert_eq!(corrupted.len(), original.len(), "corruption must not change the length");
+        let diff_bits: u32 =
+            corrupted.iter().zip(&original).map(|(a, b)| (a ^ b).count_ones()).sum();
+        assert_eq!(diff_bits, 1, "corruption must flip EXACTLY one bit, got {diff_bits}");
+    }
+
+    #[test]
+    fn corrupt_at_zero_never_touches_the_rng_or_the_datagram() {
+        // The discriminating property for the "costs nothing by default"
+        // claim: with corrupt_per_million at its Default (0), the received
+        // bytes are byte-identical AND the drop-sequence RNG draw is
+        // unperturbed (same shape as `empty_partition_set_does_not_consume_rng`).
+        let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        let to = rx.local_addr().unwrap();
+        let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        tx.set_faults(FaultConfig { seed: 99, drop_per_million: 500_000, ..Default::default() });
+        for i in 0..100u8 {
+            tx.send_to(&[i], to).unwrap();
+        }
+        let mut rng = XorShift64::new(99);
+        let expected: Vec<Vec<u8>> =
+            (0..100u8).filter(|_| !rng.chance(500_000)).map(|i| vec![i]).collect();
+        let got = recv_all(&rx, expected.len());
+        assert_eq!(got, expected, "corrupt_per_million=0 must be byte-for-byte inert");
+    }
+
+    #[test]
+    fn replay_redelivers_a_stashed_datagram_in_addition_to_the_current_one() {
+        let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        let to = rx.local_addr().unwrap();
+        let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        // Certainty: every send after the first also re-delivers a past one.
+        tx.set_faults(FaultConfig { seed: 5, replay_per_million: 1_000_000, ..Default::default() });
+        tx.send_to(b"one", to).unwrap();
+        tx.send_to(b"two", to).unwrap();
+        // "one" once (its own send), "two" once (its own send) plus at least
+        // one replay of something already seen ("one" is the only candidate
+        // for the replay following "two"'s send).
+        let got = recv_all(&rx, 3);
+        assert_eq!(got, vec![b"one".to_vec(), b"two".to_vec(), b"one".to_vec()]);
+    }
+
+    #[test]
+    fn replay_at_zero_never_records_history_or_touches_the_rng() {
+        let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        let to = rx.local_addr().unwrap();
+        let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        tx.set_faults(FaultConfig { seed: 99, drop_per_million: 500_000, ..Default::default() });
+        for i in 0..100u8 {
+            tx.send_to(&[i], to).unwrap();
+        }
+        let mut rng = XorShift64::new(99);
+        let expected: Vec<Vec<u8>> =
+            (0..100u8).filter(|_| !rng.chance(500_000)).map(|i| vec![i]).collect();
+        let got = recv_all(&rx, expected.len());
+        assert_eq!(got, expected, "replay_per_million=0 must be byte-for-byte inert");
+        assert!(tx.history.is_empty(), "replay_per_million=0 must never record history");
     }
 }
