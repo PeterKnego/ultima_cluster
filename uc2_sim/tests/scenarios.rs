@@ -1687,16 +1687,35 @@ fn handshakes_complete_under_loss_and_reorder() {
 /// `cargo test -p uc2_sim --test scenarios -- --ignored
 /// known_red_inv2_over_approximation_at_20pct_loss`.
 ///
-/// Seed 71, not seed 1: this exact repro is sensitive to precisely how
-/// many `self.draw()` calls a run consumes (it is a coincidental-timing
-/// transient, not a structural one), so the T13 review's own suggested
-/// seed (1) stopped reproducing once the I-4 fix below (gating
-/// `CommitGossip`, which changes how many sends — and therefore RNG draws
-/// — a withheld tick consumes) landed; re-swept 0..150 at this exact rate
-/// against the code CommitGossip fix included and re-pinned on the first
-/// hit. If this ever stops firing again, re-sweep rather than assume the
-/// underlying transient is gone — see the note above about deleting vs.
-/// silently leaving a stale "known red" green.
+/// Seed 78, not seed 1 or seed 71: this exact repro is sensitive to
+/// precisely how many `self.draw()` calls a run consumes (it is a
+/// coincidental-timing transient, not a structural one), so a seed pin is
+/// only valid against the EXACT code it was swept against. This has now
+/// bitten twice — a lesson worth stating plainly rather than repeating
+/// silently a third time:
+///
+/// - The T13 review's own suggested seed (1) stopped reproducing once
+///   `CommitGossip` was gated the same as `Data` (a Minor from that same
+///   review round — more `send()` calls consumed on a withheld tick shifts
+///   every subsequent RNG draw).
+/// - The FIRST replacement (71) was swept and verified AGAINST THAT
+///   intermediate build, but `CRYPTO_SWEEP_INTERVAL_NS` and
+///   `block_key_delivery_to` were reworked (2.5s one-shot-count ->
+///   50ms time-window) in the SAME fix round, AFTER seed 71 was picked and
+///   "verified" — invalidating it again before it was ever re-checked
+///   against the code that actually got committed. The stale "4/4 stable"
+///   claim in an earlier draft of this report measured a build that was
+///   never the one shipped; it should have been re-run one more time,
+///   after the LAST change in the round, not the second-to-last.
+///
+/// Re-swept 0..150 against the exact code in the commit this test ships
+/// with, confirmed multiple independent hits (78, 111, 141), and pinned
+/// 78 (5/5 separate `cargo test` process invocations green — i.e. the
+/// `Err` fired in all 5 — re-verified again immediately before this
+/// commit). If this ever stops firing again: re-sweep AND re-verify
+/// against the exact final diff being committed, not an intermediate
+/// state, and paste the actual multi-run output into the task report
+/// rather than asserting stability from memory.
 ///
 /// If this ever stops firing (the checker's tolerance widened, or the
 /// activation-grace design changed), DELETE this test rather than leaving
@@ -1705,11 +1724,12 @@ fn handshakes_complete_under_loss_and_reorder() {
 #[test]
 #[ignore = "expected-red diagnostic (checker over-approximation, not a regression gate) — see doc comment"]
 fn known_red_inv2_over_approximation_at_20pct_loss() {
-    let mut w = World::new(SimConfig { drop_per_million: 200_000, ..crypto_cfg(71) });
+    let mut w = World::new(SimConfig { drop_per_million: 200_000, ..crypto_cfg(78) });
     w.enable_crypto_plane(3);
     let err = w.run_until_within(|_w| false, 60_000_000_000).expect_err(
-        "seed 71 @ 20% loss is EXPECTED to trip the inv2 over-approximation; if it no longer \
-         does, don't just delete this assert — re-sweep for a fresh repro seed and update \
+        "seed 78 @ 20% loss is EXPECTED to trip the inv2 over-approximation; if it no longer \
+         does, don't just delete this assert — re-sweep for a fresh repro seed against the \
+         EXACT commit being shipped, re-verify with several separate process runs, and update \
          the doc comment on handshakes_complete_under_loss_and_reorder",
     );
     assert!(
