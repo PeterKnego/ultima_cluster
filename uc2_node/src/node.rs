@@ -24,7 +24,7 @@ use uc2_net::fault::{FaultConfig, FaultSocket, PartitionHandle};
 use uc2_net::receiver::{
     CryptoIntake, FollowerConfig, FollowerReceiver, HandshakeDatagram, NetEvent, PeerIds,
 };
-use uc2_net::sender::{CtrlMsg, Sender, SenderConfig};
+use uc2_net::sender::{CtrlMsg, Sender, SenderConfig, SenderCrypto};
 use uc2_crypto::{CryptoConfig, HandshakeAction, Scope, SharedTransport, Transport};
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
 use uc_protocol::ring::{
@@ -677,7 +677,13 @@ impl Node {
             sender_cfg,
             Arc::clone(&term_handle),
             Arc::clone(&leader_flag),
-            crypto_send,
+            // M8 (Task 17): the half travels with the live peer-id map — the
+            // snapshot session's `SNAP_BEGIN`/`SNAP_CHUNK` are `Scope::Pairwise`
+            // and need a `NodeId` for the destination. See `SenderCrypto`.
+            crypto_send.map(|half| SenderCrypto {
+                half,
+                peer_ids: crypto_peer_ids.clone().expect("peer ids exist iff crypto does"),
+            }),
         );
         sender.set_replay_source(journal);
         // M6 Task 6: snapshot session wiring. `snap_dir` holds the position-tagged
@@ -733,10 +739,15 @@ impl Node {
         // handshake route travel together in one `CryptoIntake` — forgetting
         // any of the three is a compile error, not a silent cluster-wide
         // `dropped_unknown_peer`/`dropped_handshake`.
+        // M8 (Task 17) adds the fourth piece: the `SharedTransport` itself,
+        // for SEALING the receiver's own `NAK`/`STATUS`/`APPEND_POSITION`/
+        // `SNAP_NAK`/`SNAP_DONE`. A clone, never a second `SendHalf` — see
+        // `CryptoIntake::transport`.
         let receiver_crypto = crypto_recv.map(|half| CryptoIntake {
             half,
             peer_ids: crypto_peer_ids.clone().expect("peer ids exist iff crypto does"),
             handshake: hs_tx,
+            transport: crypto.clone().expect("the receive half exists iff crypto does"),
         });
         let mut receiver = FollowerReceiver::with_crypto(
             Arc::clone(&buffer),
@@ -943,6 +954,7 @@ impl Node {
             crypto_hs_key_seal_failures: Arc::new(AtomicU64::new(0)),
             crypto_unresolved_peer: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
+            crypto_seal_failures: Arc::new(AtomicU64::new(0)),
             crypto_last_log_ns: 0,
         };
         let consensus_agent =
@@ -1376,6 +1388,20 @@ struct Consensus {
     /// `HandshakeAction::Failed` observations — a peer that is not (yet) in
     /// the allowlist, or whose handshake did not authenticate.
     crypto_handshake_failures: Arc<AtomicU64>,
+    /// M8 (Task 17): CONSENSUS-plane datagrams this agent could not seal and
+    /// therefore DROPPED — `READ_PROBE`, `COMMIT_POSITION`, `TERM_MAP`,
+    /// `VOTE`, `REQUEST_VOTE`, `CONFIG_PROPOSAL`, `CONFIG_REPLY`. Kept
+    /// separate from `crypto_hs_key_seal_failures` (the handshake plane)
+    /// because the two mean different things to an operator: a handshake-plane
+    /// drop is the ordinary bring-up transient, while a SUSTAINED
+    /// consensus-plane drop means this node cannot participate in consensus
+    /// at all — no votes, no gossip, no read barrier.
+    ///
+    /// Never a cleartext fallback. Self-healing on its own cadence: votes and
+    /// `REQUEST_VOTE`s re-fire on the election timeout, gossip and term maps
+    /// on the gossip floor, and a `READ_PROBE` round on the read path's own
+    /// retry.
+    crypto_seal_failures: Arc<AtomicU64>,
     /// `now_ns` of the last printed crypto diagnostic (see
     /// [`CRYPTO_LOG_INTERVAL_NS`]).
     crypto_last_log_ns: u64,
@@ -1934,6 +1960,13 @@ impl Consensus {
     #[cfg(test)]
     fn crypto_hs_key_seal_failures(&self) -> u64 {
         self.crypto_hs_key_seal_failures.load(Ordering::Relaxed)
+    }
+
+    /// M8 (Task 17): consensus-plane datagrams dropped because they could not
+    /// be sealed.
+    #[cfg(test)]
+    fn crypto_seal_failures(&self) -> u64 {
+        self.crypto_seal_failures.load(Ordering::Relaxed)
     }
 
     /// The live sender-identity map handed to the receive seam.
@@ -2505,10 +2538,11 @@ impl Consensus {
         let term = self.sm.current_term();
         let mut body = [0u8; READ_PROBE_BODY_LEN];
         write_read_probe_body(&mut body, &ReadProbeBody { nonce, from: self.id });
-        for id in self.peers.clone() {
-            let addr = self.id_to_addr[&id];
-            self.send(addr, DGRAM_KIND_READ_PROBE, 0, term, &body);
-        }
+        // M8 (T17): `Scope::Group` — one seal, N sends. Every voter gets the
+        // byte-identical probe, so a per-destination seal here would be N
+        // AEAD calls and N nonces for one logical round.
+        let targets = self.peers.clone();
+        self.fan_out_group(&targets, DGRAM_KIND_READ_PROBE, 0, term, &body);
     }
 
     /// Rung A §4: issue a probe round iff at least one read awaits quorum and
@@ -3241,10 +3275,9 @@ impl Consensus {
                 // Voters AND learners: a learner advances its commit off this
                 // gossip exactly like a follower (it just never gossips back a
                 // Report that counts).
-                for id in self.gossip_targets() {
-                    let addr = self.id_to_addr[&id];
-                    self.send(addr, DGRAM_KIND_COMMIT_POSITION, commit, term, &[]);
-                }
+                // M8 (T17): `Scope::Group` — one seal, N sends.
+                let targets = self.gossip_targets();
+                self.fan_out_group(&targets, DGRAM_KIND_COMMIT_POSITION, commit, term, &[]);
             }
             Action::ShipTermMap { entries } => {
                 let term = self.sm.current_term();
@@ -3502,14 +3535,114 @@ impl Consensus {
         self.intake_gate.store(false, Ordering::Release);
     }
 
-    fn send(&mut self, to: SocketAddr, kind: u8, position: u64, term: u32, body: &[u8]) {
+    /// Stage one consensus datagram: cleartext header + body, `key_epoch`
+    /// left at 0 (a group-scope seal stamps the real epoch itself, as the
+    /// last write before the AEAD call, since the header is AAD; a
+    /// pairwise-scope seal never uses the field at all).
+    fn stage(kind: u8, position: u64, term: u32, body: &[u8]) -> Vec<u8> {
         let mut d = vec![0u8; DATAGRAM_HEADER_LEN + body.len()];
         write_datagram_header(
             &mut d,
             &DatagramHeader { position, leadership_term_id: term, kind, flags: 0, key_epoch: 0 },
         );
         d[DATAGRAM_HEADER_LEN..].copy_from_slice(body);
+        d
+    }
+
+    /// One **pairwise-scope** consensus datagram to one peer (`VOTE`,
+    /// `REQUEST_VOTE`, `TERM_MAP`, `READ_PROBE_ACK`, `CONFIG_PROPOSAL`,
+    /// `CONFIG_REPLY`), sealed (M8 Task 17) if crypto is enabled.
+    ///
+    /// Sealed through `SharedTransport::seal_pairwise_control`, NOT through a
+    /// second `SendHalf`: `SharedTransport::send_half` is single-call by
+    /// design and the one half went to the sender agent. Two halves would
+    /// mean two nonce counters over one key, and a repeated nonce under
+    /// AES-256-GCM leaks the authentication subkey rather than one message.
+    /// The control path draws from the process's one shared counter.
+    ///
+    /// Fail-closed: a destination with no `NodeId` (`addr_to_id`) or no
+    /// established session is DROPPED and counted, never sent in the clear.
+    fn send(&mut self, to: SocketAddr, kind: u8, position: u64, term: u32, body: &[u8]) {
+        debug_assert!(
+            matches!(Transport::scope_of(kind), Scope::Pairwise),
+            "Consensus::send seals with one destination's pairwise key; kind {kind} is not \
+             Scope::Pairwise — a fan-out kind belongs in `fan_out_group`, which seals ONCE"
+        );
+        let mut d = Self::stage(kind, position, term, body);
+        if self.crypto.is_some() {
+            let Some(&peer) = self.addr_to_id.get(&to) else {
+                self.crypto_unresolved_peer.fetch_add(1, Ordering::Relaxed);
+                self.crypto_seal_failures.fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            let sealed = self
+                .crypto
+                .as_ref()
+                .expect("checked Some just above")
+                .seal_pairwise_control(kind, peer, &mut d);
+            if let Err(e) = sealed {
+                self.crypto_seal_failures.fetch_add(1, Ordering::Relaxed);
+                let now = self.crypto_now_ns();
+                self.crypto_log(
+                    now,
+                    format_args!("dropped a kind-{kind} datagram for node {peer}: {e}"),
+                );
+                return;
+            }
+        }
         let _ = self.sock.send_to(&d, to);
+    }
+
+    /// One **group-scope** consensus datagram (`COMMIT_POSITION`,
+    /// `READ_PROBE`) fanned out to `targets`: staged once, sealed ONCE, then
+    /// the identical bytes sent N times — which is the entire reason group
+    /// scope exists (spec §3: "a leader seals once and sends N times").
+    ///
+    /// `READ_PROBE` is why the group branch had to reach `SharedTransport` at
+    /// all (`seal_group_control`, ruling 2026-07-29):
+    /// `seal_pairwise_control` explicitly refuses group kinds, and routing
+    /// the read barrier's probe through the sender agent would need a new
+    /// cross-agent channel on the linearizable-read hot path.
+    ///
+    /// Fail-closed and ALL-OR-NOTHING: a failed seal sends to nobody. A
+    /// half fan-out (some peers served, some not) is not a state this
+    /// produces — same discipline as `Sender::fan_out`.
+    fn fan_out_group(
+        &mut self,
+        targets: &[NodeId],
+        kind: u8,
+        position: u64,
+        term: u32,
+        body: &[u8],
+    ) {
+        debug_assert!(
+            matches!(Transport::scope_of(kind), Scope::Group),
+            "fan_out_group seals once for every destination, which is only correct for \
+             Scope::Group kinds; kind {kind} is not one"
+        );
+        let mut d = Self::stage(kind, position, term, body);
+        if self.crypto.is_some() {
+            // `now_ns` from the crypto plane's own clock, never
+            // `Consensus::base` — `GroupPlane::sealing_epoch` compares it
+            // against the mint timestamp. See `crypto_now_ns`'s doc and
+            // `uc2_crypto::transport`'s "One clock source" module docs.
+            let now = self.crypto_now_ns();
+            let sealed = self
+                .crypto
+                .as_ref()
+                .expect("checked Some just above")
+                .seal_control(kind, None, &mut d, now);
+            if let Err(e) = sealed {
+                self.crypto_seal_failures.fetch_add(1, Ordering::Relaxed);
+                self.crypto_log(now, format_args!("dropped a kind-{kind} fan-out: {e}"));
+                return;
+            }
+        }
+        for id in targets {
+            if let Some(&addr) = self.id_to_addr.get(id) {
+                let _ = self.sock.send_to(&d, addr);
+            }
+        }
     }
 }
 
@@ -4200,6 +4333,7 @@ mod tests {
             crypto_hs_key_seal_failures: Arc::new(AtomicU64::new(0)),
             crypto_unresolved_peer: Arc::new(AtomicU64::new(0)),
             crypto_handshake_failures: Arc::new(AtomicU64::new(0)),
+            crypto_seal_failures: Arc::new(AtomicU64::new(0)),
             crypto_last_log_ns: 0,
         };
 
@@ -5993,6 +6127,199 @@ mod tests {
             failures,
             "it never reached the handshake state machine at all"
         );
+    }
+
+    // ======================================================================
+    // M8 Task 17: the node's OWN consensus sends
+    // ======================================================================
+    //
+    // T10 sealed only what flows through `Sender::seal_scratch`. The
+    // consensus agent emits `READ_PROBE`, `COMMIT_POSITION`, `TERM_MAP`,
+    // `VOTE`, `REQUEST_VOTE` and the `CONFIG_*` pair on its OWN socket, and
+    // T11's receive rule drops anything unsealed once crypto is on. Without
+    // this task a crypto-enabled cluster has no elections, no commit gossip
+    // and no linearizable reads — it does not run at all.
+
+    impl CryptoHarness {
+        /// A real Noise-IK session with peer 0, then leadership (which mints),
+        /// then a real group-key delivery + ack — after this the peer can open
+        /// BOTH scopes of the node's traffic. Factored out of the four T12
+        /// tests that each spelled it inline.
+        fn establish_and_key_peer(&mut self) {
+            let acts = self.peer.initiate(1, self.peer.now_ns());
+            let init = expect_send(&acts, DGRAM_KIND_HS_INIT);
+            self.deliver_handshake(DGRAM_KIND_HS_INIT, &init);
+            let resp = self.recv_kind(DGRAM_KIND_HS_RESP).expect("the node answered the HS_INIT");
+            self.peer.on_handshake_message(1, DGRAM_KIND_HS_RESP, &resp, self.peer.now_ns());
+            assert!(self.h.cons.crypto.as_ref().unwrap().is_established(0));
+
+            self.drive_to_leader();
+            let body = self.recv_kind(DGRAM_KIND_HS_KEY).expect("the new leader delivered a key");
+            let acts = self.peer.on_group_key_message(1, &body);
+            let ack = expect_send(&acts, DGRAM_KIND_HS_KEY);
+            self.deliver_handshake(DGRAM_KIND_HS_KEY, &ack);
+
+            // The node's own mint names BOTH configured peers (0 and 2), and
+            // node 2 is deliberately unauthorized in this fixture, so it can
+            // never ack — which leaves the epoch un-ACTIVATED until the full
+            // `ACTIVATION_TIMEOUT_NS` (2 s) grace elapses, and
+            // `GroupPlane::sealing_epoch` answers `None` until then. Re-mint
+            // naming ONLY peer 0 so a single ack activates it at once, rather
+            // than sleeping two real seconds in every group-scope test.
+            // Delivered straight to the peer (the node's own HS_KEY seal/send
+            // path is what the test above this one pins), and the ACK rides
+            // back through the ordinary handshake route so the group plane
+            // records it exactly as it would in production.
+            let now = self.h.cons.crypto_now_ns();
+            let (_epoch, acts) =
+                self.h.cons.crypto.as_ref().unwrap().mint_group_key(&[0], now);
+            for act in acts {
+                let HandshakeAction::Send { body, .. } = act else {
+                    panic!("a mint must emit a Send action")
+                };
+                let reply = self.peer.on_group_key_message(1, &body);
+                let ack = expect_send(&reply, DGRAM_KIND_HS_KEY);
+                self.deliver_handshake(DGRAM_KIND_HS_KEY, &ack);
+            }
+            assert!(
+                self.h.cons.crypto.as_ref().unwrap().unacked_group_key_peers().is_empty(),
+                "the re-minted epoch is fully acked, so it activates immediately"
+            );
+        }
+    }
+
+    /// Every kind the consensus agent emits, both scopes, opened on the
+    /// peer's own `ReceiveHalf`.
+    ///
+    /// `recv_kind` opening the datagram IS the discriminating assertion, and
+    /// it discriminates in every case: a CLEARTEXT `COMMIT_POSITION` (32
+    /// bytes) or `VOTE` (40) is shorter than the 48-byte minimum sealed frame
+    /// and comes back `TooShort`, while a cleartext `TERM_MAP`/`READ_PROBE`
+    /// is long enough to *claim* to be sealed and comes back `AuthFailed`.
+    /// The body checks below add the second half: the plaintext must not be
+    /// findable in the wire bytes.
+    #[test]
+    fn every_consensus_datagram_the_node_emits_is_sealed() {
+        let mut h = crypto_harness();
+        h.establish_and_key_peer();
+
+        // --- Scope::Group. Driven through `exec` rather than waited for on
+        // the gossip cadence: the harness pins `gossip_floor_ns` to
+        // `u64::MAX` (no idle re-gossip), so waiting would be a race on
+        // whether a commit happened to advance this cycle.
+        h.h.cons.exec(Action::GossipCommit { commit: 6016 }, &mut Vec::new());
+        let commit_raw = h.recv_kind_raw(DGRAM_KIND_COMMIT_POSITION).expect("commit gossip");
+        assert_ne!(
+            read_datagram_header(&commit_raw).key_epoch,
+            0,
+            "a group-scope seal stamps the real epoch into the header"
+        );
+        let mut d = commit_raw.clone();
+        let n = d.len();
+        h.peer_recv
+            .open_slice(1, &mut d, n)
+            .expect("COMMIT_POSITION must open on the group path");
+
+        // --- Scope::Pairwise, the term map that rides the same cadence.
+        h.h.cons.exec(
+            Action::ShipTermMap { entries: vec![(2, 0), (3, 6016)] },
+            &mut Vec::new(),
+        );
+        let map_raw = h.recv_kind_raw(DGRAM_KIND_TERM_MAP).expect("term map");
+        let mut d = map_raw.clone();
+        let n = d.len();
+        let len = h.peer_recv.open_slice(1, &mut d, n).expect("TERM_MAP must open pairwise");
+        let map_body = d[DATAGRAM_HEADER_LEN..len].to_vec();
+        assert!(!map_body.is_empty(), "a real term map, not an empty body");
+        assert!(
+            !map_raw.windows(map_body.len()).any(|w| w == map_body.as_slice()),
+            "the term map's bytes must not be readable on the wire"
+        );
+
+        // --- Scope::Group, driven directly (a read round needs no client).
+        h.h.cons.send_read_probe(0xABCD_1234);
+        let probe = h.recv_kind(DGRAM_KIND_READ_PROBE).expect("READ_PROBE must open");
+        assert_eq!(&probe[..8], &0xABCD_1234u64.to_le_bytes(), "the nonce survives the seal");
+
+        // --- Scope::Pairwise, driven through `exec` exactly as the SM would.
+        h.h.cons.exec(Action::SendVoteRejection { to: 0, term: 42 }, &mut Vec::new());
+        let vote = h.recv_kind(DGRAM_KIND_VOTE).expect("VOTE must open");
+        assert_eq!(vote.len(), VOTE_BODY_LEN);
+
+        h.h.cons.exec(
+            Action::StartElection { new_term: 43, last_term: 2, last_durable: 6016 },
+            &mut Vec::new(),
+        );
+        let rv = h.recv_kind(DGRAM_KIND_REQUEST_VOTE).expect("REQUEST_VOTE must open");
+        assert_eq!(rv.len(), REQUEST_VOTE_BODY_LEN);
+
+        let peer_addr = h.peer_sock.local_addr().unwrap();
+        h.h.cons.send_config_reply(
+            peer_addr,
+            &ConfigReplyBody { nonce: 77, status: 0, reason: 0, version: 5 },
+        );
+        let cr = h.recv_kind(DGRAM_KIND_CONFIG_REPLY).expect("CONFIG_REPLY must open");
+        assert_eq!(cr.len(), CONFIG_REPLY_BODY_LEN);
+    }
+
+    /// A group-scope kind is sealed ONCE and the identical bytes go to every
+    /// peer — the reason group scope exists at all (spec §3), and the reason
+    /// this had to reach `SharedTransport` rather than being sealed per
+    /// destination inside `send`.
+    ///
+    /// Discriminating: per-destination sealing would draw a fresh counter for
+    /// each peer, so the two datagrams would differ in their counter field
+    /// even though everything else matched.
+    #[test]
+    fn a_group_scope_fan_out_seals_once_and_sends_identical_bytes_to_every_peer() {
+        let mut h = crypto_harness();
+        h.establish_and_key_peer();
+        // Drain whatever is already queued, then force one fresh gossip.
+        let mut sink = [0u8; 4096];
+        while h.peer_sock.recv_from(&mut sink).is_ok() {}
+        while h.peer2_sock.recv_from(&mut sink).is_ok() {}
+        h.stash.clear();
+        h.h.cons.exec(Action::GossipCommit { commit: 6016 }, &mut Vec::new());
+
+        let a = h.recv_kind_raw(DGRAM_KIND_COMMIT_POSITION).expect("peer 0 got the gossip");
+        let mut b = None;
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while Instant::now() < deadline && b.is_none() {
+            if let Ok((n, _)) = h.peer2_sock.recv_from(&mut sink)
+                && n >= DATAGRAM_HEADER_LEN
+                && read_datagram_header(&sink[..n]).kind == DGRAM_KIND_COMMIT_POSITION
+            {
+                b = Some(sink[..n].to_vec());
+            }
+        }
+        let b = b.expect("peer 2 got the gossip");
+        assert_eq!(a, b, "byte-identical: sealed once, fanned out — not one seal per destination");
+    }
+
+    /// Fail-closed on the consensus plane: with no established session and no
+    /// group key, every send is DROPPED and counted — never emitted in the
+    /// clear, which is what a crypto-enabled cluster's peers would then have
+    /// to accept for the cluster to work at all.
+    #[test]
+    fn a_consensus_send_that_cannot_be_sealed_is_dropped_and_counted() {
+        let mut h = crypto_harness();
+        // No handshake driven: no pairwise session, and this node has never
+        // led so it holds no group key either.
+        assert_eq!(h.h.cons.crypto_seal_failures(), 0);
+        h.h.cons.exec(Action::SendVoteRejection { to: 0, term: 7 }, &mut Vec::new());
+        h.h.cons.exec(Action::GossipCommit { commit: 6016 }, &mut Vec::new());
+        assert!(
+            h.h.cons.crypto_seal_failures() >= 2,
+            "both the pairwise VOTE and the group gossip must be counted as dropped"
+        );
+        let mut buf = [0u8; 4096];
+        while let Ok((n, _)) = h.peer_sock.recv_from(&mut buf) {
+            let kind = read_datagram_header(&buf[..n]).kind;
+            assert!(
+                matches!(Transport::scope_of(kind), Scope::Unsealed),
+                "only the handshake bootstrap kinds may leave this node unsealed, saw kind {kind}"
+            );
+        }
     }
 
     /// A garbage `HS_INIT` from a MAPPED peer reaches `Peers::on_message` and

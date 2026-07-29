@@ -16,6 +16,11 @@ use std::sync::atomic::AtomicU32;
 /// datagram terms — see `sender`'s node-mode notes).
 pub type TermHandle = Arc<AtomicU32>;
 
+/// Test-only crypto fixtures shared by `sender`'s and `receiver`'s unit
+/// tests (M8 Task 17) — see the module docs. Never compiled into the library.
+#[cfg(test)]
+pub(crate) mod crypto_testkit;
+
 pub mod fault;
 pub mod flow;
 pub mod rebuild;

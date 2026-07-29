@@ -1064,13 +1064,103 @@ impl SharedTransport {
         buf: &mut Vec<u8>,
     ) -> Result<(), CryptoError> {
         match Transport::scope_of(kind) {
+            // The guard this entry point exists for: a fan-out kind reaching
+            // the PAIRWISE control path is a routing bug, and refusing it is
+            // what keeps `seal_control`'s group branch (below) the only way a
+            // group kind can ever be sealed off the sender agent's path.
+            Scope::Group => Err(CryptoError::NotPairwiseKind(kind)),
+            // T17: one implementation, two entry points — `seal_control`
+            // owns the actual seal so the two cannot drift (in particular so
+            // they cannot end up drawing from two different counters).
+            _ => self.seal_control(kind, Some(peer), buf, 0),
+        }
+    }
+
+    /// Seals one **control datagram** of ANY scope under this
+    /// `SharedTransport` — the node layer's own seal path, and the superset
+    /// of [`SharedTransport::seal_pairwise_control`].
+    ///
+    /// Added T17, by the 2026-07-29 ruling. T12 shipped only the pairwise
+    /// branch, which was enough for `HS_KEY`. It is not enough for the node's
+    /// OWN consensus sends: `READ_PROBE` and `COMMIT_POSITION` are
+    /// [`Scope::Group`] ([`Transport::scope_of`] — they fan out to every
+    /// peer), they are emitted by the consensus agent on its own socket, and
+    /// that agent **cannot hold a [`SendHalf`]** —
+    /// [`SharedTransport::send_half`] is single-call by design and the one
+    /// half went to the sender agent. A second half would mean a second nonce
+    /// counter starting back at 0 under the same key: a repeated
+    /// `(key, nonce)` under AES-256-GCM, which leaks the authentication
+    /// subkey for every message ever sealed under that key. So the group seal
+    /// is reachable HERE instead, drawing from the same `Arc<AtomicU64>`
+    /// every other path draws from — nonce-safety by construction rather than
+    /// by a cross-agent protocol.
+    ///
+    /// Scope dispatch is identical to [`Transport::seal`]'s: `Group` ignores
+    /// `peer` (the same sealed bytes go to every destination — that is what
+    /// the group key is for) and stamps the sealing epoch into the header;
+    /// `Pairwise` requires `Some(peer)` and returns
+    /// [`CryptoError::MissingPeer`] otherwise; `Unsealed` is always
+    /// [`CryptoError::UnsealedKind`]. `now_ns` is read only by the group
+    /// branch (`GroupPlane::sealing_epoch`'s activation grace) and must come
+    /// from [`SharedTransport::now_ns`] — see the module section docs' "One
+    /// clock source" paragraph.
+    pub fn seal_control(
+        &self,
+        kind: u8,
+        peer: Option<NodeId>,
+        buf: &mut Vec<u8>,
+        now_ns: u64,
+    ) -> Result<(), CryptoError> {
+        match Transport::scope_of(kind) {
+            Scope::Group => self.seal_group_control(buf, now_ns),
             Scope::Pairwise => {
+                let Some(peer) = peer else {
+                    return Err(CryptoError::MissingPeer(kind));
+                };
                 let counter = next_counter(&self.counter);
                 self.key.lock().unwrap().peers.seal_pairwise(peer, buf, counter)
             }
             Scope::Unsealed => Err(CryptoError::UnsealedKind(kind)),
-            Scope::Group => Err(CryptoError::NotPairwiseKind(kind)),
         }
+    }
+
+    /// The group branch of [`SharedTransport::seal_control`]. Same three
+    /// steps as [`SendHalf::seal_group`] — resolve the sealing epoch, stamp
+    /// it into the header, seal under this node's per-epoch-per-boot send key
+    /// — and the same T9-review-F3 ordering discipline: **every fallible
+    /// lookup resolves before `buf` is mutated at all**, so a failure leaves
+    /// the caller's staged datagram byte-for-byte intact rather than
+    /// half-built.
+    ///
+    /// Deliberately does NOT carry [`SendHalf`]'s per-epoch cipher cache. The
+    /// cache exists for the measured fan-out hot path — one `Aes256Gcm::new`
+    /// (~133 ns) amortized over a whole `DATA` fan-out at M5-gate rates. The
+    /// callers here are the consensus agent's `READ_PROBE` (one seal per read
+    /// round, ~one per RTT) and `COMMIT_POSITION` gossip (one seal per commit
+    /// advance) — each of which seals ONCE and then sends the identical bytes
+    /// to every peer, so the per-fan-out construction cost is already
+    /// amortized exactly as the cache would amortize it. Caching behind
+    /// `&self` would mean putting mutable state in `KeyState` for a saving
+    /// the measured bar does not ask for; `transport.rs`'s carried
+    /// requirement #4 makes the same call for the pairwise path.
+    fn seal_group_control(&self, buf: &mut Vec<u8>, now_ns: u64) -> Result<(), CryptoError> {
+        if buf.len() < DATAGRAM_HEADER_LEN {
+            return Err(CryptoError::TooShort);
+        }
+        let mut key = self.key.lock().unwrap();
+        let epoch = key.group.sealing_epoch(now_ns).ok_or(CryptoError::NoGroupKey)?;
+        // `sealing_epoch` and `schedule().get(epoch)` CAN disagree (T9 review
+        // F3): resolve the key BEFORE touching `buf`.
+        let group_key = key.group.schedule().get(epoch).ok_or(CryptoError::NoGroupKey)?;
+        let send_key: Zeroizing<[u8; 32]> =
+            Zeroizing::new(derive_send_key(group_key, self.self_id, &self.boot_salt));
+        let cipher = Aes256Gcm::new(GenericArray::from_slice(&*send_key));
+
+        let counter = next_counter(&self.counter);
+        buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2].copy_from_slice(&epoch.to_le_bytes());
+        seal_with(buf, &cipher, counter)?;
+        key.rotation.on_bytes_sealed(buf.len() as u64);
+        Ok(())
     }
 
     /// Forwards to [`GroupPlane::unacked_peers`] — the peers of the newest
@@ -2913,5 +3003,136 @@ mod tests {
             a.seal_pairwise_control(DGRAM_KIND_HS_INIT, 2, &mut d),
             Err(CryptoError::UnsealedKind(DGRAM_KIND_HS_INIT))
         ));
+    }
+
+    // ---- M8 Task 17: the GROUP branch of the control seal path ------------
+    //
+    // `READ_PROBE` and `COMMIT_POSITION` are `Scope::Group` and are emitted by
+    // the node's consensus agent on its own socket — not by the sender agent.
+    // The consensus agent cannot hold a `SendHalf` (`send_half` is single-call
+    // by design, and the one half went to the sender agent), so the group seal
+    // has to be reachable from `SharedTransport` itself. Ruling 2026-07-29.
+
+    /// A group-scope control seal is a REAL group seal: it stamps the sealing
+    /// epoch into the header, hides the payload, and the peer's `ReceiveHalf`
+    /// opens it through the ordinary group path (same key derivation, same
+    /// replay window) — no separate wire dialect for the node layer.
+    #[test]
+    fn a_group_control_seal_opens_on_the_peers_receive_half() {
+        let a_pub = public_of(PRIV_A);
+        let b_pub = public_of(PRIV_B);
+        let a = shared_node_transport("t17-group-ctrl-a", 1, PRIV_A, &[(2, b_pub)]);
+        let b = shared_node_transport("t17-group-ctrl-b", 2, PRIV_B, &[(1, a_pub)]);
+        shared_establish(&a, &b);
+        let epoch = shared_deliver_group_key(&a, &b, &[2]);
+        assert_ne!(epoch, 0, "epoch 0 is the cleartext sentinel");
+
+        let mut d = staged(DGRAM_KIND_READ_PROBE, b"read-probe-body");
+        let now = a.now_ns();
+        a.seal_control(DGRAM_KIND_READ_PROBE, None, &mut d, now)
+            .expect("a group kind seals on the control path");
+        assert!(
+            !d.windows(15).any(|w| w == b"read-probe-body"),
+            "the body must not be readable on the wire"
+        );
+        assert_eq!(
+            read_datagram_header(&d).key_epoch,
+            epoch,
+            "the group branch must stamp the sealing epoch into the header"
+        );
+        let mut recv = b.receive_half();
+        recv.open(1, &mut d).expect("the peer opens it on the group path");
+        assert_eq!(&d[DATAGRAM_HEADER_LEN..], b"read-probe-body");
+    }
+
+    /// The whole reason this lives on `SharedTransport` instead of a second
+    /// `SendHalf`: every seal path in the process must draw from ONE counter.
+    /// Interleaves all three — the sender agent's group fan-out, the node
+    /// layer's group control seal, and the node layer's pairwise control seal
+    /// — and asserts one gapless sequence on the wire.
+    #[test]
+    fn the_group_control_path_draws_from_the_same_process_counter() {
+        let a_pub = public_of(PRIV_A);
+        let b_pub = public_of(PRIV_B);
+        let a = shared_node_transport("t17-counter-a", 1, PRIV_A, &[(2, b_pub)]);
+        let b = shared_node_transport("t17-counter-b", 2, PRIV_B, &[(1, a_pub)]);
+        shared_establish(&a, &b);
+        shared_deliver_group_key(&a, &b, &[2]);
+
+        let mut send = a.send_half();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let mut d = staged(DGRAM_KIND_DATA, b"xx");
+            send.seal(DGRAM_KIND_DATA, None, &mut d, 0).unwrap();
+            seen.push(read_counter(&d[DATAGRAM_HEADER_LEN..]));
+
+            let mut g = staged(DGRAM_KIND_COMMIT_POSITION, b"");
+            a.seal_control(DGRAM_KIND_COMMIT_POSITION, None, &mut g, a.now_ns()).unwrap();
+            seen.push(read_counter(&g[DATAGRAM_HEADER_LEN..]));
+
+            let mut c = staged(DGRAM_KIND_VOTE, b"yy");
+            a.seal_pairwise_control(DGRAM_KIND_VOTE, 2, &mut c).unwrap();
+            seen.push(read_counter(&c[DATAGRAM_HEADER_LEN..]));
+        }
+        assert_eq!(
+            seen,
+            (1..=9).collect::<Vec<u64>>(),
+            "one interleaved sequence across all three seal paths, no repeats: {seen:?}"
+        );
+    }
+
+    /// `seal_control` is scope-dispatched, exactly like `Transport::seal`: a
+    /// pairwise kind still needs a peer, a bootstrap kind is still refused,
+    /// and a group kind ignores whatever peer it is handed (the same sealed
+    /// bytes go to every destination — that is what the group key is FOR).
+    #[test]
+    fn seal_control_dispatches_by_scope_like_transport_seal() {
+        let a_pub = public_of(PRIV_A);
+        let b_pub = public_of(PRIV_B);
+        let a = shared_node_transport("t17-dispatch-a", 1, PRIV_A, &[(2, b_pub)]);
+        let b = shared_node_transport("t17-dispatch-b", 2, PRIV_B, &[(1, a_pub)]);
+        shared_establish(&a, &b);
+        shared_deliver_group_key(&a, &b, &[2]);
+
+        // Pairwise with no peer: refused, not sealed under some default.
+        let mut d = staged(DGRAM_KIND_VOTE, b"x");
+        assert!(matches!(
+            a.seal_control(DGRAM_KIND_VOTE, None, &mut d, 0),
+            Err(CryptoError::MissingPeer(DGRAM_KIND_VOTE))
+        ));
+        // Bootstrap: nothing to seal under.
+        let mut d = staged(DGRAM_KIND_HS_INIT, b"x");
+        assert!(matches!(
+            a.seal_control(DGRAM_KIND_HS_INIT, None, &mut d, 0),
+            Err(CryptoError::UnsealedKind(DGRAM_KIND_HS_INIT))
+        ));
+        // Group with a peer named: the peer is ignored, and the bytes are the
+        // same bytes any other destination would get.
+        let mut with_peer = staged(DGRAM_KIND_READ_PROBE, b"probe");
+        let mut without = staged(DGRAM_KIND_READ_PROBE, b"probe");
+        a.seal_control(DGRAM_KIND_READ_PROBE, Some(2), &mut with_peer, a.now_ns()).unwrap();
+        a.seal_control(DGRAM_KIND_READ_PROBE, Some(9), &mut without, a.now_ns()).unwrap();
+        assert_eq!(
+            read_datagram_header(&with_peer).key_epoch,
+            read_datagram_header(&without).key_epoch,
+            "a group seal must not vary with the destination"
+        );
+        // Node 9 does not exist; a pairwise seal would have failed `NoSession`.
+    }
+
+    /// Fails CLOSED before any group epoch has activated — never a cleartext
+    /// send, and `buf` is left untouched so a caller that ignores the error
+    /// cannot ship a half-mutated datagram (the same ordering discipline
+    /// `SendHalf::seal_group` carries from T9 review F3).
+    #[test]
+    fn group_control_seal_before_any_epoch_fails_closed_and_leaves_buf_untouched() {
+        let a = shared_node_transport("t17-no-group-key", 1, PRIV_A, &[]);
+        let mut d = staged(DGRAM_KIND_COMMIT_POSITION, b"payload");
+        let before = d.clone();
+        assert!(matches!(
+            a.seal_control(DGRAM_KIND_COMMIT_POSITION, None, &mut d, a.now_ns()),
+            Err(CryptoError::NoGroupKey)
+        ));
+        assert_eq!(d, before, "a failed seal must not mutate the staged datagram");
     }
 }

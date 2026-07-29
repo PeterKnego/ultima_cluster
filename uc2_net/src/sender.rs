@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
-use uc2_crypto::{Scope, SendHalf, Transport};
+use uc2_crypto::{NodeId, Scope, SendHalf, Transport};
 use uc2_log::archive::find_block;
 use uc2_log::buffer::{LogBuffer, SliceRead};
 use uc2_log::cnc::CncPage;
@@ -29,6 +29,8 @@ use uc_protocol::v2::datagram::{
     DGRAM_KIND_SNAP_CHUNK, DatagramHeader, MTU_DEFAULT, SNAP_BEGIN_FIXED_LEN, SnapBeginBody,
     write_datagram_header, write_snap_begin_body,
 };
+#[cfg(test)]
+use uc_protocol::v2::datagram::read_snap_begin_body;
 use uc_protocol::v2::frame::{
     FRAME_ALIGNMENT, FRAME_TYPE_PADDING, HEADER_LEN, align_frame_len, read_header,
 };
@@ -37,6 +39,7 @@ use ultima_journal::Journal;
 use crate::TermHandle;
 use crate::fault::FaultSocket;
 use crate::flow::FlowControl;
+use crate::receiver::PeerIds;
 
 /// Datagrams a single served NAK may replay from the journal before yielding
 /// (spec §5 "bounded, separately paced"). The follower's NAK backoff
@@ -202,11 +205,20 @@ pub struct SenderStats {
     pub snap_chunks: AtomicU64,
     /// M6 Task 6: SNAP_CHUNK datagrams sent specifically to repair a peer NAK.
     pub snap_chunk_naks: AtomicU64,
-    /// M8: a DATA/HEARTBEAT datagram whose `Transport::seal` call failed
-    /// (`NoGroupKey`, an evicted epoch, etc.) — dropped rather than sent.
+    /// M8: an outgoing datagram this sender could not seal — dropped rather
+    /// than sent. Covers both scopes (T17 widened it from T10's DATA/HEARTBEAT
+    /// only):
+    /// * `Scope::Group` (DATA/HEARTBEAT): `NoGroupKey`, an evicted epoch.
+    /// * `Scope::Pairwise` (SNAP_BEGIN/SNAP_CHUNK, T17): `NoSession` with the
+    ///   destination, or no `SocketAddr -> NodeId` entry to name one.
+    ///
     /// Never fatal: a dropped DATA self-heals via NAK repair (the follower's
     /// contiguous frontier never advances past it); a dropped HEARTBEAT is
-    /// superseded by the next one. Observability only.
+    /// superseded by the next one; a dropped SNAP chunk is re-requested by the
+    /// peer's snapshot NAK timer, and a dropped SNAP_BEGIN is retried next
+    /// duty cycle (the session does not latch as begun). Observability only —
+    /// mirrored into the cnc band by `refresh_peer_obs`, since a PERSISTENT
+    /// failure (crypto on, no key/session ever) is silent from outside.
     pub seal_failures: AtomicU64,
 }
 
@@ -290,6 +302,40 @@ pub struct Sender {
     /// through `seal` lives in the shared, `Arc<Mutex<_>>`-guarded state a
     /// `uc2_crypto::SharedTransport` hands this half out from.
     crypto: Option<uc2_crypto::SendHalf>,
+    /// M8 (Task 17): `SocketAddr -> NodeId`, needed to seal the PAIRWISE-scope
+    /// snapshot-session kinds (`SNAP_BEGIN`/`SNAP_CHUNK`). Group-scope kinds
+    /// (`DATA`/`HEARTBEAT`) never consult this — the group key is the same for
+    /// every destination, which is the whole point of the scope split.
+    ///
+    /// A LOCAL COPY, refreshed once per duty cycle from `peer_ids_src` rather
+    /// than locked per datagram — identical discipline to
+    /// `FollowerReceiver::peer_ids`; see [`PeerIds`] for why a boot-time
+    /// snapshot is wrong (M7 changes membership at runtime, and a snapshot
+    /// session's destination is exactly the joining node a stale map would
+    /// not know about).
+    peer_ids: HashMap<SocketAddr, NodeId>,
+    /// The shared, versioned source `peer_ids` mirrors, plus the generation
+    /// last mirrored. `None` when crypto is off (nothing consults `peer_ids`
+    /// then — `assemble_snap` returns before it looks).
+    peer_ids_src: Option<PeerIds>,
+    peer_ids_gen: u64,
+}
+
+/// M8 (Task 17): everything the SEND path needs to run with crypto on, taken
+/// as ONE value so neither piece can be forgotten — the same bundling
+/// discipline (and the same reason) as `receiver::CryptoIntake`.
+///
+/// T10 shipped the half alone, which was sufficient only while every sealed
+/// kind was `Scope::Group` (group sealing ignores the destination). T17 seals
+/// the PAIRWISE snapshot kinds, which need a `NodeId` for the destination —
+/// and a `Sender` handed a `SendHalf` with no way to resolve one would seal
+/// nothing and drop every snapshot chunk, silently, forever. A compile error
+/// instead.
+pub struct SenderCrypto {
+    /// The process's single [`SendHalf`] (`SharedTransport::send_half`).
+    pub half: SendHalf,
+    /// The live sender-identity map — see [`PeerIds`].
+    pub peer_ids: PeerIds,
 }
 
 /// M6 Task 9: the sender's observability handle — the cnc page plus the
@@ -333,15 +379,18 @@ impl Sender {
     }
 
     /// M8 (Task 10): the innermost constructor — `with_learners`/`new` are thin
-    /// wrappers over this with `crypto: None`. `crypto: Some(send_half)` seals
-    /// every DATA/HEARTBEAT datagram `assemble` builds; `cfg.crypto_enabled`
+    /// wrappers over this with `crypto: None`. `crypto: Some(..)` seals
+    /// every DATA/HEARTBEAT datagram `assemble` builds and (T17) every
+    /// `SNAP_BEGIN`/`SNAP_CHUNK` `assemble_snap` builds; `cfg.crypto_enabled`
     /// MUST already agree with `crypto.is_some()` (asserted below) — the MTU
     /// budget every read site computes from `cfg.crypto_overhead()` would
     /// otherwise silently disagree with what this constructor is about to do.
     ///
-    /// Takes a `SendHalf` (from `uc2_crypto::SharedTransport::send_half`),
-    /// never a whole `Transport` — see `crypto` field's doc above for why.
-    /// The caller (the node layer, T12) owns the `SharedTransport` and calls
+    /// Takes a [`SenderCrypto`] (a `SendHalf` from
+    /// `uc2_crypto::SharedTransport::send_half`, plus the live [`PeerIds`]
+    /// map T17's pairwise seals resolve destinations through), never a whole
+    /// `Transport` — see the `crypto` field's doc above for why. The caller
+    /// (the node layer, T12) owns the `SharedTransport` and calls
     /// `send_half()` exactly once per process; this constructor has no way
     /// to enforce that single-call discipline itself (it only ever sees the
     /// `SendHalf` already handed out).
@@ -356,8 +405,12 @@ impl Sender {
         cfg: SenderConfig,
         term: TermHandle,
         role: Arc<AtomicBool>,
-        crypto: Option<SendHalf>,
+        crypto: Option<SenderCrypto>,
     ) -> Sender {
+        let (crypto, peer_ids_src) = match crypto {
+            Some(SenderCrypto { half, peer_ids }) => (Some(half), Some(peer_ids)),
+            None => (None, None),
+        };
         assert_eq!(
             cfg.crypto_enabled,
             crypto.is_some(),
@@ -403,6 +456,26 @@ impl Sender {
             snap_session_seq: 0,
             peer_obs: None,
             crypto,
+            peer_ids: peer_ids_src.as_ref().map(PeerIds::snapshot).unwrap_or_default(),
+            peer_ids_gen: peer_ids_src.as_ref().map(PeerIds::generation).unwrap_or(0),
+            peer_ids_src,
+        }
+    }
+
+    /// M8 (Task 17): mirror the shared [`PeerIds`] map if the writer has
+    /// published a new generation since the last duty cycle. One `Acquire`
+    /// load per cycle in the common (unchanged) case; the `Mutex` is touched
+    /// only when membership actually changed. Identical to
+    /// `FollowerReceiver::refresh_peer_ids` — see [`PeerIds`] for why the map
+    /// cannot simply be a boot-time snapshot.
+    fn refresh_peer_ids(&mut self) {
+        let Some(src) = self.peer_ids_src.as_ref() else {
+            return;
+        };
+        let published = src.generation();
+        if published != self.peer_ids_gen {
+            self.peer_ids = src.snapshot();
+            self.peer_ids_gen = published;
         }
     }
 
@@ -442,6 +515,11 @@ impl Sender {
     /// `dgrams_per_cycle` datagrams, heartbeat on interval.
     pub fn do_work(&mut self) -> bool {
         let mut did = false;
+
+        // M8 (Task 17): pick up a membership change before anything this
+        // cycle can need to resolve a destination's `NodeId` (a snapshot
+        // session's peer is very often exactly the node that just joined).
+        self.refresh_peer_ids();
 
         while let Ok(m) = self.ctrl.try_recv() {
             match m {
@@ -914,9 +992,26 @@ impl Sender {
 
         let mut did = false;
         if !sess.begun {
-            self.send_snap_begin(sess.peer, sess.session, sess.snapshot_pos, sess.total_len, &sess.config);
-            sess.begun = true;
-            did = true;
+            // M8 (Task 17): `begun` latches only on a datagram that actually
+            // reached the wire. A seal failure (no session with this peer yet)
+            // must leave the session un-begun so the NEXT cycle retries the
+            // BEGIN — latching it unconditionally would open a session whose
+            // peer never learned it existed, and every chunk after it would be
+            // dropped by a receiver with no intake.
+            if self.send_snap_begin(sess.peer, sess.session, sess.snapshot_pos, sess.total_len, &sess.config) {
+                sess.begun = true;
+                did = true;
+            } else {
+                // Nothing else in this session can make progress until the
+                // peer has the BEGIN; keep the slot and retry next cycle.
+                // `false` (no work done) deliberately: a session whose peer
+                // has no key yet must not keep the agent's duty loop hot, and
+                // `last_activity_ns` is left un-refreshed so the session is
+                // abandoned on the ordinary `SNAP_SESSION_TIMEOUT_NS` path if
+                // the link never comes up.
+                self.snap = Some(sess);
+                return false;
+            }
         }
 
         let mut emitted = 0usize;
@@ -962,7 +1057,15 @@ impl Sender {
         if offset >= sess.total_len {
             return 0;
         }
-        let want = ((sess.total_len - offset) as usize).min(self.cfg.mtu - DATAGRAM_HEADER_LEN);
+        // M8 (Task 17): `- crypto_overhead()`. T10 deliberately left this
+        // un-subtracted while SNAP was cleartext — the ONE of the four MTU
+        // budget sites in this file that did not need it then. A sealed chunk
+        // adds the 8-byte counter and the 16-byte tag, so without this the
+        // datagram overruns `mtu` by exactly `CRYPTO_OVERHEAD` on every full
+        // chunk (which, at the default 1408, is every chunk of a snapshot
+        // bigger than one datagram — i.e. all of them).
+        let budget = self.cfg.mtu - DATAGRAM_HEADER_LEN - self.cfg.crypto_overhead();
+        let want = ((sess.total_len - offset) as usize).min(budget);
         let mut buf = vec![0u8; want];
         if sess.file.seek(SeekFrom::Start(offset)).is_err() {
             return 0;
@@ -970,7 +1073,14 @@ impl Sender {
         if sess.file.read_exact(&mut buf).is_err() {
             return 0;
         }
-        self.assemble_snap(offset, DGRAM_KIND_SNAP_CHUNK, &buf);
+        if !self.assemble_snap(sess.peer, offset, DGRAM_KIND_SNAP_CHUNK, &buf) {
+            // Sealed-or-dropped: never a cleartext fallback. Reported as 0
+            // bytes sent, which leaves the sequential cursor exactly where it
+            // was (retried next cycle) and drops a repair request (the peer's
+            // snapshot NAK timer re-fires) — the same shape a lost datagram
+            // already takes on this path.
+            return 0;
+        }
         let _ = self.sock.send_to(&self.scratch, sess.peer);
         self.stats.snap_chunks.fetch_add(1, Ordering::Relaxed);
         if is_nak {
@@ -982,6 +1092,8 @@ impl Sender {
     /// Ship SNAP_BEGIN (header `position` = 0; body carries session/pos/len/config).
     /// M7 Task 6: `config` is the encoded `ConfigRecord.config` this session's
     /// `SnapshotSource` closure captured at open time — the body grows to fit it.
+    /// Returns `false` if the datagram could not be sealed and was therefore
+    /// dropped (M8 Task 17) — the caller must NOT latch the session as begun.
     fn send_snap_begin(
         &mut self,
         peer: SocketAddr,
@@ -989,44 +1101,55 @@ impl Sender {
         snapshot_pos: u64,
         total_len: u64,
         config: &[u8],
-    ) {
+    ) -> bool {
         let mut body = vec![0u8; SNAP_BEGIN_FIXED_LEN + config.len()];
         write_snap_begin_body(
             &mut body,
             &SnapBeginBody { session, snapshot_pos, total_len, config: config.to_vec() },
         );
-        self.assemble_snap(0, DGRAM_KIND_SNAP_BEGIN, &body);
+        if !self.assemble_snap(peer, 0, DGRAM_KIND_SNAP_BEGIN, &body) {
+            return false;
+        }
         let _ = self.sock.send_to(&self.scratch, peer);
+        true
     }
 
     /// Assemble a snapshot-session datagram (header + explicit body) into
-    /// scratch.
+    /// scratch, then seal it (M8 Task 17) if crypto is enabled. Returns
+    /// `false` when a seal was attempted and failed — `self.scratch` must
+    /// then NOT be sent; both callers check.
     ///
-    /// M8 (Task 10) deliberately does NOT seal here. `SNAP_BEGIN`/`SNAP_CHUNK`
-    /// are `Scope::Pairwise` (`Transport::scope_of`) — sealing them needs the
-    /// destination's `NodeId`, and `Sender` has no `SocketAddr -> NodeId`
-    /// mapping (nothing in `uc2_net` does, as of this task; `SnapSession` and
-    /// every follower-facing field in this module are keyed by `SocketAddr`
-    /// only). Wiring Pairwise-scope kinds through `uc2_net` is out of this
-    /// task's scope (`assemble`/`fan_out`/`serve_nak`, all `Scope::Group`).
+    /// **Why this seals, when T10 left it cleartext.** `SNAP_BEGIN`/
+    /// `SNAP_CHUNK` are `Scope::Pairwise` (`Transport::scope_of`), so sealing
+    /// them needs the destination's `NodeId` — and until T12 nothing in
+    /// `uc2_net` had a `SocketAddr -> NodeId` map, nor was any handshake
+    /// driven for a pairwise session to exist under. Both now exist
+    /// (`self.peer_ids`, mirrored from the node's live [`PeerIds`]), and the
+    /// gap they left open was not a confidentiality footnote:
     ///
-    /// **This is worse than a confidentiality gap.** `send_snap_chunk` ships
-    /// the raw bytes of the service-built snapshot artifact — the complete
-    /// serialized state machine — in the clear. Worse, `send_snap_begin`'s
-    /// body carries `SnapBeginBody.config`, the encoded cluster
-    /// `ConfigRecord`, and the receive path feeds that straight into
-    /// `maybe_adopt_incoming_snapshot`. Unsealed means unauthenticated: an
-    /// on-path attacker can forge a `SNAP_BEGIN` to a joining or below-floor
-    /// node and install **attacker-chosen application state AND
-    /// attacker-chosen cluster membership** — a consensus-integrity
-    /// primitive, not a privacy footnote. Ruled acceptable ONLY as a
-    /// temporary state, closed by Task 17/T17 ("Seal the remaining pairwise
-    /// sends in `uc2_net`", runs immediately after Task 12 and before the
-    /// T15 capstones / T16 throughput gate so neither measures a build with
-    /// this gap still open) — see that task's brief for the full account.
-    /// T11's receiver-side counterpart of this same disclosure is
-    /// `receiver.rs`'s `crypto_admit`, grep "T17 TEMPORARY ALLOWANCE".
-    fn assemble_snap(&mut self, position: u64, kind: u8, payload: &[u8]) {
+    /// * `send_snap_chunk` ships the raw bytes of the service-built snapshot
+    ///   artifact — the complete serialized state machine — with the file
+    ///   offset in the header, so a passive capture reassembles the whole
+    ///   database with no work.
+    /// * `send_snap_begin`'s body carries `SnapBeginBody.config`, the encoded
+    ///   cluster `ConfigRecord`, and the receive path feeds that straight into
+    ///   `maybe_adopt_incoming_snapshot`. Unsealed means UNAUTHENTICATED: an
+    ///   on-path attacker forges a `SNAP_BEGIN` to a joining or below-floor
+    ///   node and installs **attacker-chosen application state AND
+    ///   attacker-chosen cluster membership** — a consensus-integrity
+    ///   primitive.
+    ///
+    /// Sealed through this `Sender`'s own `SendHalf` (`peer: Some(id)`), NOT
+    /// through a second half or a `SharedTransport` clone: the half already
+    /// draws from the process's one shared nonce counter, so this path is
+    /// disjoint from every other seal path by construction.
+    ///
+    /// An unresolvable destination (no `peer_ids` entry — a peer removed from
+    /// the config mid-session, or a map not yet published) drops and counts,
+    /// exactly like a failed seal. There is deliberately no cleartext
+    /// fallback anywhere on this path: one would make the entire feature
+    /// optional per destination, which is the same as not having it.
+    fn assemble_snap(&mut self, peer: SocketAddr, position: u64, kind: u8, payload: &[u8]) -> bool {
         self.scratch.clear();
         self.scratch.resize(DATAGRAM_HEADER_LEN, 0);
         write_datagram_header(
@@ -1036,10 +1159,42 @@ impl Sender {
                 leadership_term_id: self.term.load(Ordering::Relaxed),
                 kind,
                 flags: 0,
+                // Pairwise scope carries no epoch (the session key is per
+                // handshake, not per group epoch), so this stays 0 in both
+                // modes — see `crypto_admit`'s mixed-mode diagnostic, which
+                // is why it requires BOTH `key_epoch == 0` AND a
+                // too-short-to-be-sealed length before it concludes anything.
                 key_epoch: 0,
             },
         );
         self.scratch.extend_from_slice(payload);
+
+        debug_assert!(
+            matches!(Transport::scope_of(kind), Scope::Pairwise),
+            "assemble_snap seals with an explicit peer, which is only correct for \
+             Scope::Pairwise kinds; kind {kind} is not one"
+        );
+        if self.crypto.is_none() {
+            return true; // cleartext mode: byte-for-byte the pre-M8 output
+        }
+        let Some(&peer_id) = self.peer_ids.get(&peer) else {
+            self.stats.seal_failures.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        let crypto = self.crypto.as_mut().expect("checked Some just above");
+        // The SendHalf's own canonical clock, never `self.base` — see
+        // `seal_scratch`'s doc and `uc2_crypto::transport`'s "One clock
+        // source" module docs. (The pairwise branch ignores `now_ns`; passing
+        // the right one anyway keeps this call site correct if the scope of a
+        // SNAP kind is ever reclassified.)
+        let now_ns = crypto.now_ns();
+        match crypto.seal(kind, Some(peer_id), &mut self.scratch, now_ns) {
+            Ok(()) => true,
+            Err(_) => {
+                self.stats.seal_failures.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
     }
 
     /// Assemble a DATA datagram from an arbitrary body slice (a journal-replay
@@ -1887,7 +2042,7 @@ mod tests {
             cfg,
             term_handle(9),
             always_leader(),
-            Some(crypto),
+            Some(group_only_crypto(crypto)),
         );
         (s, followers)
     }
@@ -1902,6 +2057,15 @@ mod tests {
     fn sender_with_crypto_to_one_follower() -> (Sender, Fake) {
         let (s, mut fs) = sender_with_crypto_n(1);
         (s, fs.pop().unwrap())
+    }
+
+    /// Bundles a `SendHalf` with an EMPTY [`PeerIds`] map — enough for every
+    /// pre-T17 crypto test, all of which exercise `Scope::Group` kinds only
+    /// (the group key is the same for every destination, so no `NodeId`
+    /// resolution happens on those paths at all). T17's pairwise tests build
+    /// a real map instead.
+    fn group_only_crypto(half: SendHalf) -> SenderCrypto {
+        SenderCrypto { half, peer_ids: PeerIds::new() }
     }
 
     fn sender_without_crypto() -> (Sender, Fake) {
@@ -2160,7 +2324,7 @@ mod tests {
             cfg,
             term_handle(9),
             always_leader(),
-            Some(crypto_transport(1)),
+            Some(group_only_crypto(crypto_transport(1))),
         );
         s.set_replay_source(arch.journal_arc());
         // NAK for position 0 (lapped long ago -> served from the journal)
@@ -2230,7 +2394,7 @@ mod tests {
             cfg,
             term_handle(9),
             always_leader(),
-            Some(crypto_transport(1)),
+            Some(group_only_crypto(crypto_transport(1))),
         );
         s.set_replay_source(arch.journal_arc());
         s.on_nak(f1.addr(), 0, 4096);
@@ -2275,7 +2439,7 @@ mod tests {
             cfg,
             term_handle(9),
             always_leader(),
-            Some(unminted_crypto_send_half(1)),
+            Some(group_only_crypto(unminted_crypto_send_half(1))),
         );
         append_and_flush(&mut s, b"hello");
         assert!(f.recv_raw().is_none(), "an unsealable datagram must never reach the wire");
@@ -2352,7 +2516,7 @@ mod tests {
             cfg,
             term_handle(9),
             always_leader(),
-            Some(unminted_crypto_send_half(1)),
+            Some(group_only_crypto(unminted_crypto_send_half(1))),
         );
         let cnc = test_cnc(1 << 16);
         s.set_peer_slots(Arc::clone(&cnc), vec![]);
@@ -2367,5 +2531,314 @@ mod tests {
             s.stats().seal_failures.load(Ordering::Relaxed),
             "the cnc mirror must agree with the in-process counter it mirrors"
         );
+    }
+
+    // ======================================================================
+    // M8 Task 17: the snapshot session's pairwise sends
+    // ======================================================================
+    //
+    // T10 left `assemble_snap` cleartext because pairwise sealing needs an
+    // ESTABLISHED handshake session and nothing drove `Peers` until T12.
+    // `send_snap_chunk` ships the raw bytes of the service-built snapshot
+    // artifact — the complete serialized state machine, with the file offset
+    // in the header — and `send_snap_begin` ships `SnapBeginBody.config`, the
+    // encoded cluster `ConfigRecord`, straight into the receiving node's
+    // `maybe_adopt_incoming_snapshot`. Unsealed means UNAUTHENTICATED: an
+    // on-path attacker forges a session and installs attacker-chosen
+    // application state AND attacker-chosen membership.
+
+    const T17_LEADER_ID: uc2_crypto::NodeId = 1;
+    const T17_PEER_ID: uc2_crypto::NodeId = 2;
+    const T17_PRIV_LEADER: [u8; 32] = [0x41; 32];
+    const T17_PRIV_PEER: [u8; 32] = [0x42; 32];
+    /// Deliberately bigger than one MTU-worth of chunk, so `send_snap_chunk`'s
+    /// `want` is capped by the MTU budget (the term under test) rather than by
+    /// the remaining file length.
+    const T17_SNAP_LEN: usize = 8 * 1024;
+
+    /// The snapshot artifact's bytes — a recognizable, non-repeating pattern
+    /// so "is this on the wire in the clear?" is a real question.
+    fn t17_snapshot_bytes() -> Vec<u8> {
+        (0..T17_SNAP_LEN).map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8).collect()
+    }
+
+    /// The `ConfigRecord` bytes `SnapBeginBody.config` carries — the
+    /// integrity half of this task.
+    fn t17_config_bytes() -> Vec<u8> {
+        b"CLUSTER-MEMBERSHIP-RECORD".to_vec()
+    }
+
+    /// A `Sender` with crypto on and a REAL established pairwise session with
+    /// its one follower, plus a real snapshot file wired as the source.
+    /// Returns the sender, the follower endpoint, the follower's
+    /// `SharedTransport` (to open what the sender sealed), and the tempdir
+    /// that owns the snapshot file.
+    fn sender_with_crypto_and_established_session(
+        tag: &str,
+    ) -> (Sender, Fake, uc2_crypto::SharedTransport, tempfile::TempDir) {
+        use crate::crypto_testkit as tk;
+        let leader_pub = tk::identity_public(&format!("{tag}-lpub"), T17_PRIV_LEADER);
+        let peer_pub = tk::identity_public(&format!("{tag}-ppub"), T17_PRIV_PEER);
+        let allow = [(T17_LEADER_ID, leader_pub), (T17_PEER_ID, peer_pub)];
+        let area = "uc2-net-sender-t17";
+        let leader = tk::shared_transport(area, &format!("{tag}-leader"), T17_LEADER_ID, T17_PRIV_LEADER, &allow);
+        let peer = tk::shared_transport(area, &format!("{tag}-peer"), T17_PEER_ID, T17_PRIV_PEER, &allow);
+        tk::establish(&leader, T17_LEADER_ID, &peer, T17_PEER_ID);
+        tk::deliver_group_key(&leader, T17_LEADER_ID, &peer, T17_PEER_ID);
+
+        let f = Fake::new();
+        let peer_ids = PeerIds::new();
+        peer_ids.store([(f.addr(), T17_PEER_ID)]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("snap-4096.ultsnap");
+        std::fs::write(&snap_path, t17_snapshot_bytes()).unwrap();
+        let total = T17_SNAP_LEN as u64;
+
+        let b = buffer();
+        // Prime far ahead so an injected NAK at 0 is below the ring floor →
+        // unservable → upgrades to a snapshot session (the real trigger).
+        b.counters().prime(4 * b.capacity());
+        let (_tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        cfg.crypto_enabled = true;
+        let mut s = Sender::with_crypto(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f.addr()],
+            &[],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+            Some(SenderCrypto { half: leader.send_half(), peer_ids }),
+        );
+        s.set_snapshot_source(Arc::new(move || {
+            Some((4096, snap_path.clone(), total, t17_config_bytes()))
+        }));
+        (s, f, peer, dir)
+    }
+
+    /// Same shape, crypto OFF — the cleartext-parity control.
+    fn sender_without_crypto_and_snapshot_source() -> (Sender, Fake, tempfile::TempDir) {
+        let f = Fake::new();
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("snap-4096.ultsnap");
+        std::fs::write(&snap_path, t17_snapshot_bytes()).unwrap();
+        let total = T17_SNAP_LEN as u64;
+        let b = buffer();
+        b.counters().prime(4 * b.capacity());
+        let (_tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f.addr()],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+        );
+        s.set_snapshot_source(Arc::new(move || {
+            Some((4096, snap_path.clone(), total, t17_config_bytes()))
+        }));
+        (s, f, dir)
+    }
+
+    /// Drive a snapshot session and collect the raw datagrams of `kind`.
+    fn snap_datagrams(s: &mut Sender, f: &Fake, to: SocketAddr, kind: u8) -> Vec<Vec<u8>> {
+        s.on_nak(to, 0, 96); // below the ring floor → upgrades to a session
+        let mut out = Vec::new();
+        for _ in 0..4 {
+            s.do_work();
+            while let Some(d) = f.recv_raw() {
+                if d.len() >= DATAGRAM_HEADER_LEN && read_datagram_header(&d).kind == kind {
+                    out.push(d);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_snapshot_chunk_is_sealed_and_respects_the_shrunken_mtu_budget() {
+        let (mut s, f, peer, _dir) = sender_with_crypto_and_established_session("chunk-sealed");
+        let mtu = s.cfg.mtu;
+        let addr = f.addr();
+        let chunks = snap_datagrams(&mut s, &f, addr, DGRAM_KIND_SNAP_CHUNK);
+        assert!(!chunks.is_empty(), "fixture must actually produce snapshot chunks");
+
+        let raw = t17_snapshot_bytes();
+        for d in &chunks {
+            // The ciphertext region specifically — not whole-datagram
+            // inequality, which the 32-byte header alone would satisfy even
+            // if the payload went out verbatim.
+            let ct = &d[DATAGRAM_HEADER_LEN + COUNTER_LEN..d.len() - TAG_LEN];
+            assert!(
+                !raw.windows(ct.len().min(raw.len())).any(|w| w == ct),
+                "the snapshot artifact's bytes must not be readable on the wire"
+            );
+            assert!(
+                d.len() <= mtu,
+                "a SEALED chunk must still fit the MTU (got {} > {mtu}) — the chunk budget \
+                 must subtract CRYPTO_OVERHEAD",
+                d.len()
+            );
+        }
+
+        // And it is a REAL seal, not scrambling: the peer opens it, and what
+        // comes out is exactly the file's bytes at the header's offset.
+        let mut recv = peer.receive_half();
+        let mut d = chunks[0].clone();
+        let n = d.len();
+        let off = read_datagram_header(&d).position as usize;
+        let len = recv
+            .open_slice(T17_LEADER_ID, &mut d, n)
+            .expect("the peer must open the sealed chunk under the pairwise session");
+        assert_eq!(
+            &d[DATAGRAM_HEADER_LEN..len],
+            &raw[off..off + (len - DATAGRAM_HEADER_LEN)],
+            "the opened chunk must be the artifact's bytes at the header's offset"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_begin_is_sealed_so_its_carried_config_cannot_be_forged() {
+        // The integrity half: `SnapBeginBody.config` reaches the receiving
+        // node's `maybe_adopt_incoming_snapshot`. Unsealed = unauthenticated
+        // = attacker-chosen membership.
+        let (mut s, f, peer, _dir) = sender_with_crypto_and_established_session("begin-sealed");
+        let addr = f.addr();
+        let begins = snap_datagrams(&mut s, &f, addr, DGRAM_KIND_SNAP_BEGIN);
+        assert_eq!(begins.len(), 1, "exactly one SNAP_BEGIN opens a session");
+        let d = &begins[0];
+        let cfgb = t17_config_bytes();
+        assert!(
+            !d.windows(cfgb.len()).any(|w| w == cfgb.as_slice()),
+            "the cluster config must not be readable (or forgeable) on the wire"
+        );
+        let mut recv = peer.receive_half();
+        let mut open = d.clone();
+        let n = open.len();
+        let len = recv
+            .open_slice(T17_LEADER_ID, &mut open, n)
+            .expect("the peer must open the sealed SNAP_BEGIN");
+        let body = read_snap_begin_body(&open[DATAGRAM_HEADER_LEN..len]).expect("well-formed body");
+        assert_eq!(body.config, cfgb, "the config survives the round trip intact");
+        assert_eq!(body.total_len, T17_SNAP_LEN as u64);
+    }
+
+    #[test]
+    fn cleartext_mode_snapshot_output_is_byte_identical_to_pre_m8() {
+        // The other direction of the same discrimination: with crypto off,
+        // the artifact's bytes ARE on the wire and the datagram is exactly
+        // CRYPTO_OVERHEAD shorter. Without this, a mutant that seals
+        // unconditionally (or one that never seals) is half-invisible.
+        let (mut s, f, _dir) = sender_without_crypto_and_snapshot_source();
+        let addr = f.addr();
+        let chunks = snap_datagrams(&mut s, &f, addr, DGRAM_KIND_SNAP_CHUNK);
+        assert!(!chunks.is_empty(), "fixture must produce cleartext chunks");
+        let raw = t17_snapshot_bytes();
+        let d = &chunks[0];
+        let off = read_datagram_header(d).position as usize;
+        assert_eq!(
+            &d[DATAGRAM_HEADER_LEN..],
+            &raw[off..off + (d.len() - DATAGRAM_HEADER_LEN)],
+            "cleartext mode ships the artifact verbatim, exactly as pre-M8"
+        );
+
+        let (mut sealed_s, sealed_f, _p, _d2) =
+            sender_with_crypto_and_established_session("parity");
+        let sealed_addr = sealed_f.addr();
+        let sealed = snap_datagrams(&mut sealed_s, &sealed_f, sealed_addr, DGRAM_KIND_SNAP_CHUNK);
+        assert_eq!(
+            sealed[0].len(),
+            d.len(),
+            "the sealed chunk fills the SAME MTU as the cleartext one — it carries \
+             CRYPTO_OVERHEAD fewer artifact bytes, not CRYPTO_OVERHEAD more datagram bytes"
+        );
+        assert_eq!(
+            sealed[0].len() - DATAGRAM_HEADER_LEN - CRYPTO_OVERHEAD,
+            d.len() - DATAGRAM_HEADER_LEN - CRYPTO_OVERHEAD,
+            "same payload budget on both sides of the comparison"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_send_to_an_unresolvable_peer_is_dropped_not_sent_in_the_clear() {
+        // The fail-closed shape: no `SocketAddr -> NodeId` entry means no
+        // pairwise key, which must mean NO DATAGRAM — never a cleartext
+        // fallback, which would make the whole feature optional per peer.
+        let (mut s, f, _peer, _dir) = sender_with_crypto_and_established_session("unresolvable");
+        s.peer_ids.clear(); // membership map lost this address
+        s.peer_ids_src = None; // ...and no refresh will bring it back
+        let addr = f.addr();
+        let before = s.stats().seal_failures.load(Ordering::Relaxed);
+        let all = snap_datagrams(&mut s, &f, addr, DGRAM_KIND_SNAP_CHUNK);
+        assert!(all.is_empty(), "an unsealed snapshot chunk must never reach the wire");
+        let begins = snap_datagrams(&mut s, &f, addr, DGRAM_KIND_SNAP_BEGIN);
+        assert!(begins.is_empty(), "an unsealed SNAP_BEGIN must never reach the wire");
+        assert!(
+            s.stats().seal_failures.load(Ordering::Relaxed) > before,
+            "the drop must be counted, not silent"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_send_with_no_established_session_is_dropped_not_sent_in_the_clear() {
+        // Resolvable peer, but the handshake never completed — `NoSession`.
+        // Same fail-closed rule, a different error path.
+        use crate::crypto_testkit as tk;
+        let leader_pub = tk::identity_public("nosess-lpub", T17_PRIV_LEADER);
+        let peer_pub = tk::identity_public("nosess-ppub", T17_PRIV_PEER);
+        let leader = tk::shared_transport(
+            "uc2-net-sender-t17",
+            "nosess-leader",
+            T17_LEADER_ID,
+            T17_PRIV_LEADER,
+            &[(T17_LEADER_ID, leader_pub), (T17_PEER_ID, peer_pub)],
+        );
+        let f = Fake::new();
+        let peer_ids = PeerIds::new();
+        peer_ids.store([(f.addr(), T17_PEER_ID)]);
+        let dir = tempfile::tempdir().unwrap();
+        let snap_path = dir.path().join("snap-4096.ultsnap");
+        std::fs::write(&snap_path, t17_snapshot_bytes()).unwrap();
+        let total = T17_SNAP_LEN as u64;
+        let b = buffer();
+        b.counters().prime(4 * b.capacity());
+        let (_tx, rx) = mpsc::sync_channel(16);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        cfg.crypto_enabled = true;
+        let mut s = Sender::with_crypto(
+            Arc::clone(&b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            vec![f.addr()],
+            &[],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+            Some(SenderCrypto { half: leader.send_half(), peer_ids }),
+        );
+        s.set_snapshot_source(Arc::new(move || {
+            Some((4096, snap_path.clone(), total, t17_config_bytes()))
+        }));
+        let addr = f.addr();
+        s.on_nak(addr, 0, 96);
+        for _ in 0..4 {
+            s.do_work();
+        }
+        assert!(
+            f.recv_raw().is_none(),
+            "with no established session NOTHING goes out — never a cleartext fallback"
+        );
+        assert!(s.stats().seal_failures.load(Ordering::Relaxed) > 0, "counted, not silent");
     }
 }
