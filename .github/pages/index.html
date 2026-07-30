@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ultima_cluster — API documentation</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0 auto; padding: 2rem 1.25rem 4rem; max-width: 52rem;
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #1a1a1a; background: #fff;
+  }
+  a { color: #0b5fb0; }
+  h1 { font-size: 1.9rem; margin: 0 0 .25rem; }
+  h2 {
+    font-size: .8rem; text-transform: uppercase; letter-spacing: .09em;
+    margin: 2.5rem 0 .75rem; color: #666; font-weight: 600;
+  }
+  .tagline { color: #555; margin: 0 0 1.5rem; }
+  .nav { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: .5rem; }
+  .nav a {
+    padding: .35rem .7rem; border: 1px solid #d5d5d5; border-radius: 5px;
+    text-decoration: none; font-size: .9rem;
+  }
+  .nav a:hover { border-color: #0b5fb0; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { padding: .55rem 0; border-bottom: 1px solid #ececec; }
+  li:last-child { border-bottom: none; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .95em; }
+  li a { font-weight: 600; text-decoration: none; }
+  li a:hover { text-decoration: underline; }
+  .desc { color: #555; }
+  footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #ececec; color: #666; font-size: .9rem; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #ddd; background: #14171a; }
+    a { color: #6cb6ff; }
+    h2, .tagline, .desc, footer { color: #9aa4ad; }
+    .nav a { border-color: #333a41; }
+    li { border-bottom-color: #23282d; }
+  }
+</style>
+</head>
+<body>
+
+<h1>ultima_cluster</h1>
+<p class="tagline">
+  An Aeron-shaped, Rust-native State Machine Replication application server.
+  API documentation, generated from <code>main</code>.
+</p>
+
+<div class="nav">
+  <a href="https://github.com/PeterKnego/ultima_cluster">Repository</a>
+  <a href="https://github.com/PeterKnego/ultima_cluster/blob/main/docs/QUICKSTART.md">Quickstart</a>
+  <a href="https://github.com/PeterKnego/ultima_cluster/blob/main/docs/ARCHITECTURE.md">Architecture</a>
+  <a href="https://github.com/PeterKnego/ultima_cluster/blob/main/docs/VERIFICATION.md">Verification</a>
+</div>
+
+<h2>Start here</h2>
+<ul>
+  <li><a href="uc2_service/index.html">uc2_service</a> —
+    <span class="desc">the crate you write against. Implement <code>StateMachine</code> and attach it to a node.</span></li>
+  <li><a href="uc2_client/index.html">uc2_client</a> —
+    <span class="desc">submit commands, run linearizable and snapshot reads.</span></li>
+</ul>
+
+<h2>The node</h2>
+<ul>
+  <li><a href="uc2_node/index.html">uc2_node</a> —
+    <span class="desc">the process that participates in consensus, replicates the log, and makes it durable.</span></li>
+</ul>
+
+<h2>Core</h2>
+<ul>
+  <li><a href="uc2_consensus/index.html">uc2_consensus</a> —
+    <span class="desc">the pure-sync safety core: commit ranking, elections, term maps, truncation. The kernels carrying machine-checked proofs.</span></li>
+  <li><a href="uc2_log/index.html">uc2_log</a> —
+    <span class="desc">the shared-memory log ring, and the archive agent that makes it durable.</span></li>
+  <li><a href="uc2_net/index.html">uc2_net</a> —
+    <span class="desc">reliable UDP with NAK repair, quorum-paced flow control, journal replay sessions.</span></li>
+  <li><a href="uc_protocol/index.html">uc_protocol</a> —
+    <span class="desc">the canonical wire spec: cnc page layout, frame formats, lock-free rings.</span></li>
+</ul>
+
+<h2>Supporting</h2>
+<ul>
+  <li><a href="uc2_crypto/index.html">uc2_crypto</a> —
+    <span class="desc">optional authenticated and encrypted node-to-node transport. Off by default.</span></li>
+  <li><a href="ultima_journal/index.html">ultima_journal</a> —
+    <span class="desc">segmented append journal and atomic <code>StableValue</code>s.</span></li>
+  <li><a href="uc2_sim/index.html">uc2_sim</a> —
+    <span class="desc">the deterministic simulator: virtual time, seeded fault fuzz, nine whole-cluster invariants.</span></li>
+  <li><a href="uc_lincheck/index.html">uc_lincheck</a> —
+    <span class="desc">the WGL linearizability checker, history recorder, and register model.</span></li>
+</ul>
+
+<footer>
+  Rebuilt on every push to <code>main</code>. Documents public items only;
+  the <code>uc2ctl</code> admin CLI and the example crates are excluded.
+</footer>
+
+</body>
+</html>

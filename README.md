@@ -131,6 +131,8 @@ suite (capstones, sim-heavy, loom, crashtest).
 
 Start here:
 
+- **[API documentation](https://peterknego.github.io/ultima_cluster/)** — rustdoc
+  for every library crate, rebuilt on each push to `main`.
 - **[`docs/QUICKSTART.md`](/docs/QUICKSTART.md)** — zero to a running three-node
   cluster, with the state machine you write shown in full. Every command and
   output is from a real run.
