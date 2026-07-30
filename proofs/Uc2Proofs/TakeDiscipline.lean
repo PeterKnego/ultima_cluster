@@ -332,7 +332,7 @@ private theorem gne_step {n : Nat} {w w' : World n} (hw : Reachable w)
   | deliverVote i v t hmsg hrole hterm => exact h
   | deliverVoteHigherTerm i v t g hmsg hterm => exact h
   | becomeLeader i hrole hquorum => exact h
-  | absorbDurable i => exact h
+  | absorbDurable i hrole => exact h
   | crashRestart i => exact h
   | deliverReplicate j pos hdr t v hmsg hpos hhdr hgate => exact h
   | deliverTermMap j t entries hmsg hterm => exact h
@@ -570,7 +570,7 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
         have h3 : (w.nodes u).dn.pn.currentTerm < t := hterm
         omega
       · simpa [Node.dataTerm, Function.update_of_ne hne] using hdt
-  | absorbDurable i =>
+  | absorbDurable i hrole =>
     refine tk_transport h (fun k => ?_) (fun k => ?_) (fun k hr => ?_)
       (fun k hrl => ?_) (fun u T d hm => ⟨hm, fun hdt => ?_⟩) rfl
     · rcases eq_or_ne k i with rfl | hne

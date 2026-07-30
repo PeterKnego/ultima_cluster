@@ -399,8 +399,15 @@ inductive Step {n : Nat} : World n → World n → Prop
   /-- Issue #7: the consensus agent absorbing the durable counter. Commit-plane
   neutral — no tracker, commit index or report is touched; it only lets this
   node's ADVERTISED credential and future collapse base catch up with bytes it
-  has already fsynced and reported. -/
-  | absorbDurable (w : World n) (i : Fin n) :
+  has already fsynced and reported.
+  Restricted to a NON-LEADER, which costs nothing: `smDurable` is only ever READ
+  by `startElection` (the advertised credential), and that step already requires
+  `role ≠ .leader`. A leader that later stands must step down first, and can
+  absorb then — so no reachable credential is lost. The guard is what lets this
+  step reuse `provinv_election`, whose leader arm demands the data-node be
+  unchanged. -/
+  | absorbDurable (w : World n) (i : Fin n)
+      (hrole : (w.nodes i).pn.role ≠ .leader) :
       Step w
         { nodes := Function.update w.nodes i
             { w.nodes i with
@@ -669,9 +676,9 @@ theorem step_project {n : Nat} {w w' : World n} (h : Step w w') :
   | becomeLeader i hrole hquorum =>
     rw [project_mk]
     exact .single (Uc2.Data.Step.becomeLeader w.project i hrole hquorum)
-  | absorbDurable i =>
+  | absorbDurable i hrole =>
     rw [project_mk]
-    exact .single (Data.Step.absorbDurable w.project i)
+    exact .single (Data.Step.absorbDurable w.project i hrole)
   | crashRestart i =>
     rw [project_mk]
     exact .single (Uc2.Data.Step.crashRestart w.project i)
@@ -795,7 +802,7 @@ theorem nonvacuity_commit_completeness_trace :
       -- the byte it has already fsynced AND reported — that report is what let
       -- node 0 commit. Pre-split, `start_election` read the counter directly
       -- and this step did not exist.
-      (.absorbDurable _ 1))
+      (.absorbDurable _ 1 (by decide)))
       (.startElection _ 1 (by decide)))
       (.deliverRequestVote _ 2 1 2 1 1 (by decide) (by decide)))
       (.deliverVote _ 1 2 2 (by decide) (by decide) (by decide)))

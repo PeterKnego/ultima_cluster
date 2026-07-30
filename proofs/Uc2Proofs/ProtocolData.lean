@@ -320,8 +320,15 @@ inductive Step {n : Nat} : World n → World n → Prop
   reason it can lag at all: in the real node the counter is advanced by the
   archive agent, READ AND REPORTED by the receiver agent, and absorbed here by
   a third thread on its own schedule. Collapsing those into one value is what
-  made the acked-write loss fixed in `main` 26d4827 inexpressible. -/
-  | absorbDurable (w : World n) (i : Fin n) :
+  made the acked-write loss fixed in `main` 26d4827 inexpressible.
+  Restricted to a NON-LEADER, which costs nothing: `smDurable` is only ever READ
+  by `startElection` (the advertised credential), and that step already requires
+  `role ≠ .leader`. A leader that later stands must step down first, and can
+  absorb then — so no reachable credential is lost. The guard is what lets this
+  step reuse `provinv_election`, whose leader arm demands the data-node be
+  unchanged. -/
+  | absorbDurable (w : World n) (i : Fin n)
+      (hrole : (w.nodes i).pn.role ≠ .leader) :
       Step w
         { nodes := Function.update w.nodes i
             { w.nodes i with
@@ -503,7 +510,7 @@ theorem step_project {n : Nat} {w w' : World n} (h : Step w w') :
       (w.nodes i).pn.smDurable
     simp only [Function.update_idem, Function.update_self] at h2
     exact h2
-  | absorbDurable i =>
+  | absorbDurable i hrole =>
     rw [project_mk]
     exact .single (Uc2.Step.absorbDurable w.project i)
   | crashRestart i =>

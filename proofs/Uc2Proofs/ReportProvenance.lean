@@ -277,13 +277,13 @@ theorem cert_dstep {n : Nat} {dw dw' : World n} {t : Nat} {ℓ : Fin n}
       · exact absurd hrole hnc
     · simp only [Function.update_of_ne hne]
       exact hc.pinned
-  | absorbDurable i =>
+  | absorbDurable i hrole =>
+    -- issue #7: role is UNCHANGED, so the pin transfers verbatim (crashRestart
+    -- needs the detour only because it drops the node to follower).
     refine hc.transport (fun m hm => hm) (fun c h => .inl h) ?_
     rcases eq_or_ne ℓ i with rfl | hne
     · simp only [Function.update_self]
-      rcases hc.pinned with hlt | ⟨heq, hvf, -⟩
-      · exact .inl hlt
-      · exact .inr ⟨heq, hvf, by show Role.follower ≠ .candidate; decide⟩
+      exact hc.pinned
     · simp only [Function.update_of_ne hne]
       exact hc.pinned
   | crashRestart i =>
@@ -1357,32 +1357,15 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         · simp only [Function.update_of_ne hk] at hdtu ⊢
           simp only [Function.update_of_ne hkl] at hrl hctl ⊢
           exact h.report_durable u T d hrp hdtu ℓ hrl hctl
-  | absorbDurable i =>
-    -- reboot: handle re-keys to the recovered term; the Finding-#5 boot
-    -- predicate opens the gate exactly when the map's frontier reaches the
-    -- recovered term — which pins the regime UNCHANGED across the crash
-    -- (`closed_lag` rules out a pre-closed gate in that configuration).
-    have hdle := (Uc2.Data.reachable_stamp (reachable_project hw)).data_le i
-    have hmldt := Uc2.Data.reachable_map_le_dataTerm (reachable_project hw) i
-    refine provinv_election (Step.crashRestart w i) h rfl rfl rfl rfl rfl rfl
-      (fun _ => rfl) hdle ?_ ?_ (fun hl => nomatch hl)
-    · intro hcl
-      have h1 := of_decide_eq_false hcl
-      show Data.lastTermOf (w.nodes i).dn.termMap < (w.nodes i).pn.currentTerm
-      omega
-    · intro hg
-      have h1 := of_decide_eq_true hg
-      have hdle' : (w.nodes i).dataTerm ≤ (w.nodes i).pn.currentTerm := hdle
-      have hmldt' : Data.lastTermOf (w.nodes i).dn.termMap
-          ≤ (w.nodes i).dataTerm := hmldt
-      have h2 : (w.nodes i).pn.currentTerm = (w.nodes i).dataTerm := by
-        omega
-      refine ⟨h2, ?_⟩
-      cases hpre : (w.nodes i).reconciled with
-      | true => rfl
-      | false =>
-        have h3 := h.closed_lag i hpre
-        omega
+  | absorbDurable i hrole =>
+    -- issue #7: absorbing the counter changes NOTHING `provinv_election` asks
+    -- about — map, hist, durable, dataTerm, role and `reconciled` are all
+    -- untouched — so every obligation is either `rfl` or the corresponding
+    -- `ProvInv` field verbatim. The leader arm is vacuous by the step's
+    -- non-leader guard (see `Data.Step.absorbDurable`).
+    exact provinv_election (Step.absorbDurable w i hrole) h rfl rfl rfl rfl rfl rfl
+      (h.role_dt i) (Nat.le_refl _) (h.closed_lag i) (fun hr => ⟨rfl, hr⟩)
+      (fun hl => absurd hl hrole)
   | crashRestart i =>
     -- reboot: handle re-keys to the recovered term; the Finding-#5 boot
     -- predicate opens the gate exactly when the map's frontier reaches the

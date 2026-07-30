@@ -79,7 +79,7 @@ theorem nonvacuity_truncation_trace :
       -- Issue #7: node 1 must ABSORB the counter before it can advertise a
       -- credential reflecting the byte it just fsynced. Before the split this
       -- step did not exist and `start_election` read the counter directly.
-      (.absorbDurable _ 1))
+      (.absorbDurable _ 1 (by decide)))
       (.startElection _ 1 (by decide)))
       (.deliverRequestVote _ 2 1 2 1 1 (by decide) (by decide)))
       (.deliverVote _ 1 2 2 (by decide) (by decide) (by decide)))
@@ -406,7 +406,7 @@ private theorem stamp_step {n : Nat} {w w' : World n} (h : StampInv w)
         exact Nat.le_refl _
       · simp only [Function.update_of_ne hne]
         exact h.data_le k
-  | absorbDurable i =>
+  | absorbDurable i hrole =>
     -- issue #7: absorbing the counter into `smDurable` touches neither `hist`
     -- nor `dataTerm`, the only fields `StampInv` constrains.
     refine ⟨h.frame_le, ?_, ?_⟩
@@ -946,7 +946,7 @@ theorem dinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         · exact absurd hrole hnc
       · simp only [Function.update_of_ne hne]
         exact hc.pinned
-  | absorbDurable i =>
+  | absorbDurable i hrole =>
     -- issue #7: `smDurable` appears in no `DInv` field; role, frontier, map and
     -- history are all untouched, so every component transfers verbatim.
     refine ⟨?_, ?_, ?_, ?_, ?_⟩

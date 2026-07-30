@@ -591,7 +591,7 @@ private theorem minv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           hn.role_term_pos fun hh => nomatch (hrole.symm.trans hh)
     · rw [Function.update_of_ne hne]
       exact h.node k
-  | absorbDurable i =>
+  | absorbDurable i hrole =>
     -- issue #7: `NodeWF` constrains `termMap`, `pn.durable`, `pn.role`,
     -- `pn.currentTerm` and `hist`; absorbing the counter into `smDurable`
     -- touches none of them, so the whole record transfers.
@@ -1094,10 +1094,12 @@ private theorem ldt_step {n : Nat} {w w' : World n} (h : LeaderDataTerm w)
     rcases eq_or_ne k i with rfl | hne
     · simp only [Function.update_self]
     · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
-  | absorbDurable i =>
+  | absorbDurable i hrole =>
+    -- issue #7: role is UNCHANGED (unlike crashRestart, which drops to
+    -- follower and discharges this by contradiction) — the hypothesis transfers.
     intro k hr
     rcases eq_or_ne k i with rfl | hne
-    · simp only [Function.update_self] at hr; simp at hr
+    · simp only [Function.update_self] at hr ⊢; exact h k hr
     · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
   | crashRestart i =>
     intro k hr
@@ -1240,13 +1242,11 @@ private theorem mldt_step {n : Nat} {w w' : World n} (hw : Reachable w)
     · simp only [Function.update_self]
       rw [lastTermOf_prunePush]
     · simp only [Function.update_of_ne hne]; exact h k
-  | absorbDurable i =>
+  | absorbDurable i hrole =>
+    -- issue #7: `dataTerm` and `termMap` are both UNCHANGED (crashRestart resets
+    -- dataTerm := currentTerm, which is why its case needs the detour).
     intro k; rcases eq_or_ne k i with rfl | hne
-    · simp only [Function.update_self]
-      -- recovered currentTerm ≥ map last term; dataTerm := currentTerm
-      have hrec : lastTermOf (w.nodes k).termMap ≤ (w.nodes k).pn.currentTerm :=
-        Nat.le_trans (h k) (hstamp.data_le k)
-      exact hrec
+    · simp only [Function.update_self]; exact h k
     · simp only [Function.update_of_ne hne]; exact h k
   | crashRestart i =>
     intro k; rcases eq_or_ne k i with rfl | hne
