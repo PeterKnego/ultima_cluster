@@ -197,6 +197,85 @@ impl LogBuffer {
         unsafe { AtomicU32::from_ptr(self.region.ptr_at(off).cast::<u32>()) }
     }
 
+    /// DIAGNOSTIC (investigation of the nightly `elle_partition` archive
+    /// fail-stop): a human-readable post-mortem for a [`RecordableCorrupt`] —
+    /// the four counters, the region offset, a hexdump around `from`, and the
+    /// decisive question: is `from` a frame START, or does a frame beginning
+    /// BELOW it walk over it (i.e. the archive's cursor is mid-frame)?
+    pub fn corrupt_report(&self, c: &RecordableCorrupt) -> String {
+        use std::fmt::Write as _;
+        let ctr = self.cnc.counters();
+        let off = self.offset(c.from);
+        let mut s = String::new();
+        let _ = writeln!(
+            s,
+            "recordable_slice corrupt: from={} append={} end={} claimed_len={} \
+             (off={off}, capacity={}, wrapped={})",
+            c.from,
+            c.append,
+            c.end,
+            c.claimed_len,
+            self.capacity,
+            c.from >= self.capacity,
+        );
+        let _ = writeln!(
+            s,
+            "  counters: append={} durable={} sent={} commit={}",
+            ctr.append.load_acquire(),
+            ctr.durable.load_acquire(),
+            ctr.sent.load_acquire(),
+            ctr.commit.load_acquire(),
+        );
+        // Which frame, if any, covers `from`? Scan 32-aligned candidates below
+        // it: a candidate whose own length walks PAST `from` proves the cursor
+        // is mid-frame (the read word was payload, not a length).
+        let mut straddler = None;
+        let mut k = 1u64;
+        while k <= 64 && c.from >= k * frame::FRAME_ALIGNMENT as u64 {
+            let cand = c.from - k * frame::FRAME_ALIGNMENT as u64;
+            let coff = self.offset(cand);
+            let len = self.commit_word(coff).load(Ordering::Acquire);
+            if (len as usize) >= HEADER_LEN {
+                let end = cand + align_frame_len(len as usize) as u64;
+                if end > c.from {
+                    straddler = Some((cand, len, end));
+                }
+                // A frame that ends at or before `from` bounds the scan: any
+                // candidate below it is that frame's payload, not a header.
+                if end <= c.from {
+                    break;
+                }
+            }
+            k += 1;
+        }
+        match straddler {
+            Some((pos, len, end)) => {
+                let _ = writeln!(
+                    s,
+                    "  MID-FRAME: a frame at {pos} (len={len}) spans past `from` \
+                     and ends at {end}"
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    s,
+                    "  no straddling frame found below `from` in 64 slots \
+                     (bytes look unwritten or the prefix is garbage too)"
+                );
+            }
+        }
+        let lo = off.saturating_sub(64);
+        let hi = (off + 128).min(self.region.len());
+        let _ = writeln!(s, "  hexdump [{lo}, {hi}) (`from` at off={off}):");
+        // SAFETY: [lo, hi) is inside the mapped region.
+        let bytes = unsafe { std::slice::from_raw_parts(self.region.ptr_at(lo), hi - lo) };
+        for (i, chunk) in bytes.chunks(32).enumerate() {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            let _ = writeln!(s, "    {:>8}: {}", lo + i * 32, hex.join(" "));
+        }
+        s
+    }
+
     /// Contiguous committed whole frames starting at `from`, bounded by the
     /// append counter, the wrap point, and (softly) `max_bytes` — the result
     /// contains at least one whole frame if any is available, and never cuts
