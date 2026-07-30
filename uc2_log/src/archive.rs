@@ -249,9 +249,19 @@ impl Archive {
     /// done. The durable counter is advanced ONLY after Notifier::wait()
     /// returns (Consistent durability => post-fdatasync).
     pub fn do_work(&mut self, buffer: &LogBuffer) -> Result<bool, ArchiveError> {
-        let slice = buffer
-            .recordable_slice(self.durable_pos, self.cfg.max_block_bytes)
-            .map_err(ArchiveError::RecorderCorrupt)?;
+        let slice = buffer.recordable_slice(self.durable_pos, self.cfg.max_block_bytes).map_err(
+            |c| {
+                // DIAGNOSTIC (nightly elle_partition fail-stop): dump the buffer
+                // state before the caller turns this into a fail-stop panic.
+                eprintln!(
+                    "{}  archive: first_base={} next_block_seq={}",
+                    buffer.corrupt_report(&c),
+                    self.first_base,
+                    self.next_block_seq,
+                );
+                ArchiveError::RecorderCorrupt(c)
+            },
+        )?;
         if slice.is_empty() {
             return Ok(false);
         }
@@ -723,6 +733,110 @@ mod tests {
     /// archive_config_defaults).
     fn test_cfg(dir: &std::path::Path) -> ArchiveConfig {
         ArchiveConfig { segment_size_bytes: 4 * 1024 * 1024, ..ArchiveConfig::new(dir) }
+    }
+
+    /// REPRODUCTION of the nightly `elle_partition` archive fail-stop
+    /// (`RecorderCorrupt { end: 0, claimed_len: <garbage> }`).
+    ///
+    /// **This test asserts the BUG, not the fix.** It is a characterization
+    /// test: it drives the bad sequence by hand to keep an executable record of
+    /// the mechanism, and it would pass on either side of the repair — the fix
+    /// lives in `uc2_node` (`ArchiveCmd::Collapse` / `Consensus::on_collapsed`),
+    /// guarded by `leader_open_routes_the_collapse_through_the_archive` there.
+    /// If you are here because a change to `recordable_slice` turned this red,
+    /// the failure is about THIS test's premise, not your change — read
+    /// `collapse_routed_through_the_archive_keeps_the_walk_intact` below for
+    /// the behaviour that is actually contractual.
+    ///
+    /// `Action::BecomeLeader` (uc2_node `node.rs`) collapses the volatile tail
+    /// with `LogCounters::prime(base)` on the CONSENSUS thread, where
+    /// `base = ElectionSm::durable` — a value sampled in an EARLIER duty cycle
+    /// (`do_work` step 2) than the vote drain that produced the action (step 1).
+    /// The ARCHIVE agent runs concurrently and may have recorded another block
+    /// in between, leaving its private `durable_pos` STRICTLY ABOVE `base`.
+    /// Nothing resets it: unlike `ArchiveCmd::Truncate`, this prime does not go
+    /// through the archive at all.
+    ///
+    /// The new leader then rewrites the buffer from `base` with a DIFFERENT
+    /// frame layout, so the archive's cursor is left mid-frame — it reads a
+    /// payload byte as a length word. This test drives exactly that sequence.
+    #[test]
+    #[cfg_attr(miri, ignore)] // real journal files + fsync
+    fn become_leader_collapse_below_archive_cursor_corrupts_the_walk() {
+        let (b, c, dir) = setup(1 << 16);
+        let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
+
+        // Old leader's stream: 96-byte frames (32 header + 64 payload).
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        for n in 0..5u64 {
+            a.append(1, n, &[0xAB; 64]).unwrap();
+        }
+        assert_eq!(c.counters().append.load_acquire(), 480);
+
+        // The archive records the whole stream: its cursor is now 480.
+        while arch.do_work(&b).unwrap() {}
+        assert_eq!(arch.recovered_position(), 480);
+
+        // BecomeLeader with a STALE `base`: consensus sampled `durable` one
+        // block ago (384), before the archive recorded the last frame (480).
+        let base = 384;
+        assert!(base < arch.recovered_position(), "the race window: base < cursor");
+        c.counters().prime(base);
+
+        // The new leader rewrites from `base` with a different layout: a
+        // 32-byte NewTerm frame, then a 96-byte frame that STRADDLES 480.
+        let mut a2 = Appender::new(Arc::clone(&b), 2);
+        a2.append_new_term().unwrap();
+        a2.append(1, 99, &[0xAB; 64]).unwrap();
+        assert_eq!(c.counters().append.load_acquire(), 512);
+
+        // The archive resumes at its own 480 — now mid-payload of [416, 512).
+        let err = arch.do_work(&b).unwrap_err();
+        let ArchiveError::RecorderCorrupt(c) = err else { panic!("expected RecorderCorrupt: {err:?}") };
+        assert_eq!(c.from, 480);
+        assert_eq!(c.end, 0, "the very first length word is garbage (CI signature)");
+        assert_eq!(c.claimed_len, 0xABAB_ABAB, "a payload byte read as a length word");
+    }
+
+    /// The other half of the reproduction above: routing the SAME collapse
+    /// through the archive (`truncate_to(base)` on the archive's own thread,
+    /// THEN `prime`) resets `durable_pos` with it, so the new leader's frames
+    /// land exactly at the cursor and the walk stays intact. This is the
+    /// contract `uc2_node`'s `ArchiveCmd::Collapse` exists to hold.
+    #[test]
+    #[cfg_attr(miri, ignore)] // real journal files + fsync
+    fn collapse_routed_through_the_archive_keeps_the_walk_intact() {
+        let (b, c, dir) = setup(1 << 16);
+        let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
+
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        for n in 0..5u64 {
+            a.append(1, n, &[0xAB; 64]).unwrap();
+        }
+        while arch.do_work(&b).unwrap() {}
+        assert_eq!(arch.recovered_position(), 480);
+
+        // The collapse now goes through the archive FIRST — the cursor follows
+        // the cut instead of being stranded above it.
+        let base = 384;
+        arch.truncate_to(base).unwrap();
+        assert_eq!(arch.recovered_position(), base, "the cursor moved with the cut");
+        c.counters().prime(base);
+
+        let mut a2 = Appender::new(Arc::clone(&b), 2);
+        a2.append_new_term().unwrap();
+        a2.append(1, 99, &[0xAB; 64]).unwrap();
+
+        // The archive resumes at `base`, on a frame boundary of the NEW stream.
+        while arch.do_work(&b).unwrap() {}
+        assert_eq!(arch.recovered_position(), c.counters().append.load_acquire());
+
+        // And the journal no longer holds the discarded tail: replaying from
+        // `base` yields the new leader's frames, not the old term's.
+        let mut r = arch.replay_from(base).unwrap();
+        let f = r.next().unwrap().expect("the NewTerm frame");
+        assert_eq!(f.position, base);
+        assert_eq!(f.header.leadership_term_id, 2);
     }
 
     #[test]

@@ -84,6 +84,27 @@ impl TruncationSlot {
 pub(crate) enum ArchiveCmd {
     /// Drop the divergent tail at/above `to`; ack `(epoch, to)` when done.
     Truncate { epoch: u64, to: u64 },
+    /// Leader-open collapse (issue #6): drop the unreplicated volatile tail
+    /// at/above `to` (`base`, the new leader's durable frontier) and re-prime
+    /// there, then ack `(epoch, to)` on the SEPARATE collapse slot.
+    ///
+    /// Physically identical to [`ArchiveCmd::Truncate`] — the distinct variant
+    /// (and distinct ack slot) exists because the two brackets are independent:
+    /// a reconcile truncation can be in flight when an election is won, and
+    /// `TruncationSlot` holds exactly one ack.
+    ///
+    /// This MUST route through the archive agent rather than priming the
+    /// counters on the consensus thread. `base` is `ElectionSm::durable`, a
+    /// value sampled in an EARLIER duty cycle than the vote drain that produced
+    /// `BecomeLeader`, so the archive may have fsynced another block since —
+    /// leaving its private `durable_pos` strictly ABOVE `base`. Priming behind
+    /// the archive's back left its cursor mid-frame once the new leader rewrote
+    /// the buffer with a different frame layout (the nightly `elle_partition`
+    /// `RecorderCorrupt` fail-stop), and left the journal holding the discarded
+    /// tail. Running the cut ON the archive thread serializes it against that
+    /// agent's own `do_work` and resets `durable_pos` — the same discipline
+    /// `Truncate` has always had.
+    Collapse { epoch: u64, to: u64 },
     /// Drop whole journal blocks strictly below the block covering `below`
     /// (`Archive::purge_below`). No ack. Errors log-warn and drop.
     Purge { below: u64 },
@@ -92,6 +113,17 @@ pub(crate) enum ArchiveCmd {
     /// from the shipped file, so the archive advances its frontier to `pos` and
     /// the counters prime there. No ack; a conflict logs + drops.
     AdoptFloor { pos: u64 },
+}
+
+/// Issue #6: a leader open awaiting its [`ArchiveCmd::Collapse`] ack. The SM has
+/// already decided this node leads `term`; the physical half of the open (the
+/// cut to `base`, then a fresh appender + the NewTerm frame) completes on the
+/// ack, one duty cycle later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingLeaderOpen {
+    pub epoch: u64,
+    pub term: u32,
+    pub base: u64,
 }
 
 /// Journal purge policy (M6 Task 4). **Default `Disabled` — purge is OFF by
@@ -645,6 +677,11 @@ impl Node {
         // infallible single slot (one truncation in flight — the SM latch).
         let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
         let trunc_slot = TruncationSlot::default();
+        // Issue #6: the leader-open collapse rides the SAME command channel (so
+        // the archive applies both cuts in emission order) but its OWN ack slot
+        // — a reconcile truncation can still be in flight when an election is
+        // won, and one `TruncationSlot` holds exactly one ack.
+        let collapse_slot = TruncationSlot::default();
 
         // Sender (streams when leader; commit ranking is entirely the
         // consensus agent's job — the sender never ranks or gossips commit).
@@ -793,6 +830,7 @@ impl Node {
         let arc_buffer = Arc::clone(&buffer);
         let arc_cnc = Arc::clone(&cnc);
         let arc_slot = trunc_slot.clone();
+        let arc_collapse_slot = collapse_slot.clone();
         let arc_first_base = Arc::clone(&archive_first_base);
         let arc_prime_gen = Arc::clone(&prime_generation);
         let archive_agent = AgentRunner::spawn("uc2-archive", IdleStrategy::Yield, move || {
@@ -817,6 +855,46 @@ impl Node {
                         arc_first_base.store(archive.first_base(), Ordering::Release);
                         // Infallible ack: a single slot cannot drop (one in flight).
                         arc_slot.post(epoch, to);
+                    }
+                    ArchiveCmd::Collapse { epoch, to } => {
+                        // Issue #6: physically the same cut as `Truncate`, on
+                        // the same thread, for the same reason — but acked on
+                        // the collapse slot so the two brackets never share one
+                        // single-ack slot. In the common (non-racy) leader open
+                        // `to == archive.durable_pos` and `truncate_to` is a
+                        // cheap `Ok(())` no-op; the prime is what leader open
+                        // has always needed.
+                        //
+                        // CLAMP — DEAD DEFENCE, deliberately kept. `to` is
+                        // `ElectionSm::durable`, which is clamped to a pending
+                        // reconcile truncation's cut only when that cut's
+                        // `Event::Truncated` ack is fed back. So a node that had
+                        // a `Truncate { to: T }` in flight AND then opened a
+                        // leader term would send `to > T`, the archive would
+                        // apply them in channel order, and the second cut would
+                        // answer `PositionPurged` — killing this agent and
+                        // leaving the node a silent non-serving leader-elect
+                        // (gate closed, no appender, and the SM already thinks it
+                        // leads, so nothing re-elects).
+                        //
+                        // That interleaving is UNREACHABLE — a reconcile-
+                        // truncating node cannot win an election; see
+                        // `a_reconcile_truncating_node_cannot_also_open_a_leader_term`
+                        // for the two independent reasons and for the guard that
+                        // fails loudly if that ever stops being true. The clamp
+                        // costs one `min` and converts that wedge into a benign
+                        // subsumption (the earlier cut already removed everything
+                        // above `T`), so the unreachable case degrades instead of
+                        // fail-stopping. Ack the position ACTUALLY cut to, so the
+                        // node opens its term at the real frontier.
+                        let to = to.min(archive.recovered_position());
+                        archive
+                            .truncate_to(to)
+                            .expect("archive leader-open collapse fail-stop (journal I/O)");
+                        arc_cnc.counters().prime(to);
+                        arc_prime_gen.fetch_add(1, Ordering::Release);
+                        arc_first_base.store(archive.first_base(), Ordering::Release);
+                        arc_collapse_slot.post(epoch, to);
                     }
                     ArchiveCmd::Purge { below } => {
                         // Best-effort: a failed purge logs + drops (retries next
@@ -930,6 +1008,9 @@ impl Node {
             ingress_rx,
             trunc_tx,
             trunc_slot,
+            collapse_slot,
+            pending_leader_open: None,
+            next_collapse_epoch: 0,
             sender_ctrl: ctrl_tx,
             term_handle: Arc::clone(&term_handle),
             leader_flag: Arc::clone(&leader_flag),
@@ -1299,6 +1380,20 @@ struct Consensus {
     ingress_rx: mpsc::Receiver<Vec<u8>>,
     trunc_tx: mpsc::SyncSender<ArchiveCmd>,
     trunc_slot: TruncationSlot,
+    /// Issue #6: ack slot for [`ArchiveCmd::Collapse`], the leader-open cut.
+    /// Separate from `trunc_slot` because both brackets can be open at once.
+    collapse_slot: TruncationSlot,
+    /// Issue #6: the leader open that is waiting on its collapse ack. Set when
+    /// `Action::BecomeLeader` emits the cut; consumed by `on_collapsed` on the
+    /// matching ack, which finishes the open (fresh `Appender`, NewTerm frame,
+    /// gate reopen). Cleared WITHOUT finishing if the node steps down or adopts
+    /// a higher term first (`Action::BecomeFollower`) — a stale ack must never
+    /// resurrect a leadership the SM has already abandoned.
+    pending_leader_open: Option<PendingLeaderOpen>,
+    /// Issue #6: monotonic epoch allocator for `pending_leader_open`. Purely
+    /// node-local (unlike the reconcile epoch, which the SM allocates), since
+    /// the SM has no notion of the collapse round-trip.
+    next_collapse_epoch: u64,
     /// M7: this agent's own producer half of the sender's `CtrlMsg` channel —
     /// used to send `CtrlMsg::SetPeers` on config adoption (`Action::ConfigAdopted`).
     /// A clone of the same sender the receiver uses to route NAK/Status/SnapNak/
@@ -1557,12 +1652,40 @@ impl Consensus {
             did = true;
         }
 
-        // 2. Poll the durable counter; feed DurableAdvanced on change.
-        let d = self.cnc.counters().durable.load_acquire();
-        if d != self.durable_seen {
-            self.durable_seen = d;
-            self.feed(Event::DurableAdvanced { durable: d });
+        // 1e. Issue #6: drain the leader-open collapse ack (its own slot — a
+        // reconcile truncation can be in flight at the same time). This is what
+        // finishes a leader open: fresh appender, NewTerm frame, gate reopen.
+        if let Some((epoch, to)) = self.collapse_slot.take() {
+            self.on_collapsed(epoch, to);
             did = true;
+        }
+
+        // 2. Poll the durable counter; feed DurableAdvanced on change.
+        //
+        // Issue #6: NOT while a leader open is in flight. `ElectionSm::durable`
+        // is a monotonic max (`durable = durable.max(d)`), and the whole premise
+        // of the collapse is that the archive's frontier is ABOVE the `base` we
+        // are collapsing to. Between phase 1 and the archive's ack the counter
+        // still holds that higher value, so feeding it here would latch
+        // `sm.durable` above a frontier we are about to cut away — and it never
+        // comes back down (`Event::Truncated`'s `min` clamp is the reconcile
+        // path's, not ours). The SM would then ship an inflated `last_durable`
+        // vote credential and, worse, `rank_leader` would advance the commit
+        // tracker with an `own_durable` this node does not physically hold: a
+        // phantom commit. `base` IS `sm.durable`, so suppressing the feed leaves
+        // the SM exactly where it already is; `on_collapsed` re-bases
+        // `durable_seen` at the cut and the next cycle resumes from there.
+        //
+        // Pre-issue-#6 this could not arise: `prime(base)` ran synchronously in
+        // step 1, so step 2 always read the already-collapsed value. Splitting
+        // the open across two cycles is what opened the window.
+        if self.pending_leader_open.is_none() {
+            let d = self.cnc.counters().durable.load_acquire();
+            if d != self.durable_seen {
+                self.durable_seen = d;
+                self.feed(Event::DurableAdvanced { durable: d });
+                did = true;
+            }
         }
 
         // 3. Drain the in-process ingress queue (leader && serving only, the
@@ -3234,7 +3357,13 @@ impl Consensus {
         }
     }
 
-    fn exec(&mut self, act: Action, work: &mut Vec<Event>) {
+    /// `_work` is the re-entrant event queue an arm can push follow-up events
+    /// onto, drained by [`Self::feed`]'s loop. It currently has no producer:
+    /// issue #6 moved the only one (`BecomeLeader`'s `NewTermAppended`) into
+    /// `on_collapsed`, which runs from the duty cycle rather than from inside a
+    /// `feed` and so feeds directly. Kept because it is the arms' only way to
+    /// chain an event without re-entering the SM mid-batch.
+    fn exec(&mut self, act: Action, _work: &mut Vec<Event>) {
         match act {
             Action::PersistAndSendVote { to, vote } => {
                 // Persist-before-answer: the store is durable on return, THEN the
@@ -3273,34 +3402,38 @@ impl Consensus {
                 // not survive into this new leader life.
                 self.invalidate_admin_caches();
                 // Contract order (T3/T7, load-bearing): (a) term-map append +
-                // persist durable; (b) collapse volatile via prime(base) — old
-                // bytes above base must never be streamable; (c) fresh appender
-                // AFTER prime; (d) append the NewTerm frame + feed it back; (e)
+                // persist durable; (b) collapse volatile to base — old bytes
+                // above base must never be streamable; (c) fresh appender AFTER
+                // the collapse; (d) append the NewTerm frame + feed it back; (e)
                 // role flags.
+                //
+                // Issue #6: (b) is no longer a `prime(base)` on THIS thread. It
+                // is an `ArchiveCmd::Collapse` executed by the archive agent,
+                // which cuts its journal to `base`, resets its private
+                // `durable_pos`, and primes there — all serialized against its
+                // own `do_work`. Steps (c)-(e) therefore move to `on_collapsed`,
+                // one duty cycle later. See `ArchiveCmd::Collapse`'s doc for the
+                // corruption this ordering prevents.
                 let map = to_entries(self.sm.term_map());
                 self.state.store_term_map(&map).expect("term-map persist fail-stop");
                 self.term_handle.store(term, Ordering::Release);
                 // Explicit single-writer handoff (review hardening): the gate
-                // is closed across the prime so a UDP-reordered straggler that
-                // cleared the old term filter cannot race the counter reset.
+                // is closed across the collapse so a UDP-reordered straggler that
+                // cleared the old term filter cannot race the counter reset. It
+                // reopens in `on_collapsed`, once the appender exists.
                 self.close_gate();
-                self.cnc.counters().prime(base);
-                let mut appender = Appender::new(Arc::clone(&self.buffer), term);
-                appender.append_new_term().expect("NewTerm append fail-stop");
-                // The serving gate compares COMMIT (an end/frontier position)
-                // against this value, so it must be the frame's END — feeding
-                // the start would flip can_serve before the NewTerm frame is
-                // quorum-committed (at base 0: instantly). Raft §5.4.2.
-                let end = appender.position();
-                self.appender = Some(appender);
-                work.push(Event::NewTermAppended { position: end });
+                let epoch = self.next_collapse_epoch;
+                self.next_collapse_epoch += 1;
+                self.pending_leader_open = Some(PendingLeaderOpen { epoch, term, base });
+                self.trunc_tx
+                    .send(ArchiveCmd::Collapse { epoch, to: base })
+                    .expect("archive channel closed");
                 self.adopted_term = term;
                 // A leader is the source of truth; no reconcile pending (M-3).
                 self.awaiting_reconcile = false;
-                self.open_gate();
-                self.leader_flag.store(true, Ordering::Release);
-                // We ARE the leader of this term (leader_hint published on the page).
-                self.cnc.status().leader_hint.store_release(self.id as u64);
+                // NB: `leader_hint` is published in phase 2, not here — pointing
+                // clients at a node that cannot serve yet just bounces them back
+                // with `MSG_V2_NOT_LEADER` naming ourselves.
                 // M8 (Task 12), rotation trigger 1 (spec §5): a new leader
                 // ALWAYS mints a fresh epoch. This one rule absorbs leader
                 // self-removal (the outgoing leader steps down at the same
@@ -3323,6 +3456,11 @@ impl Consensus {
                 self.term_handle.store(term, Ordering::Release);
                 self.leader_flag.store(false, Ordering::Release);
                 self.appender = None;
+                // Issue #6: abandon any leader open still awaiting its collapse
+                // ack. The cut itself is already commanded and remains correct
+                // (it drops only this node's own unreplicated tail), but the
+                // ack must not install an appender for a term we no longer lead.
+                self.pending_leader_open = None;
                 // Close the intake gate on adopting a strictly NEW term; it
                 // reopens only after reconciliation for this term completes.
                 if term > self.adopted_term {
@@ -3575,6 +3713,48 @@ impl Consensus {
     /// reopen fires only if no newer term is itself awaiting reconcile (a term
     /// adopted mid-truncation re-armed `awaiting_reconcile`, and its fresh
     /// reconcile in the new term must complete first).
+    /// Issue #6, leader open phase 2: the archive finished the collapse to
+    /// `base` — it cut its journal there, reset its own `durable_pos`, and
+    /// primed the counters. Only NOW is it safe to write into the buffer: the
+    /// archive's cursor sits exactly at `base`, so the new leader's frames
+    /// cannot land mid-walk.
+    ///
+    /// A non-matching ack is dropped. That happens when the node stepped down or
+    /// adopted a higher term while the collapse was in flight
+    /// (`Action::BecomeFollower` clears `pending_leader_open`) — the physical cut
+    /// still happened and is still correct (it only dropped this node's own
+    /// unreplicated tail), but the leadership it was opening is gone.
+    fn on_collapsed(&mut self, epoch: u64, to: u64) {
+        // The archive re-primed the counters to `to`; keep our shadow in step so
+        // we don't refeed a spurious DurableAdvanced (same as `on_truncated`).
+        self.durable_seen = to;
+        let Some(open) = self.pending_leader_open.take_if(|o| o.epoch == epoch) else {
+            return;
+        };
+        // The ack carries the position the archive ACTUALLY cut to, which may be
+        // BELOW the `base` we asked for: a reconcile truncation queued ahead of
+        // this collapse already removed everything above its own cut, and the
+        // `Collapse` arm clamps rather than fail-stopping (see it for why that
+        // interleaving is reachable). Everything below is keyed off the acked
+        // `to`, never `open.base` — the appender is built from the counters the
+        // archive primed, so it opens the term at the real frontier.
+        debug_assert!(open.base >= to, "the archive never cuts ABOVE the requested base");
+        let mut appender = Appender::new(Arc::clone(&self.buffer), open.term);
+        appender.append_new_term().expect("NewTerm append fail-stop");
+        // The serving gate compares COMMIT (an end/frontier position) against
+        // this value, so it must be the frame's END — feeding the start would
+        // flip can_serve before the NewTerm frame is quorum-committed (at base
+        // 0: instantly). Raft §5.4.2.
+        let end = appender.position();
+        self.appender = Some(appender);
+        self.feed(Event::NewTermAppended { position: end });
+        self.open_gate();
+        self.leader_flag.store(true, Ordering::Release);
+        // We ARE the leader of this term — published only now that we can act
+        // like one (see the note in `Action::BecomeLeader`).
+        self.cnc.status().leader_hint.store_release(self.id as u64);
+    }
+
     fn on_truncated(&mut self, epoch: u64, to: u64) {
         // The archive re-primed the counters to `to`; keep our shadow in step so
         // we don't refeed a spurious DurableAdvanced.
@@ -3594,7 +3774,24 @@ impl Consensus {
             // follower whose adoption re-keyed the handle. The candidate stays
             // closed until it resolves (BecomeLeader / step-down / higher-term
             // adoption).
-            if !self.awaiting_reconcile && self.sm.current_term() == self.adopted_term {
+            // Issue #6: and not while a leader open is still awaiting its
+            // collapse ack. Both predicates above hold during that window
+            // (`BecomeLeader` clears `awaiting_reconcile` and sets
+            // `adopted_term`), so without this a truncation ack landing there
+            // would admit DATA between the archive's re-prime and `on_collapsed`
+            // installing the appender — a second writer at the very positions
+            // the NewTerm frame is about to take. `on_collapsed` does the reopen.
+            //
+            // Like the `ArchiveCmd::Collapse` clamp, this is DEAD DEFENCE today:
+            // it needs a reconcile truncation and a leader open in flight at
+            // once, which
+            // `a_reconcile_truncating_node_cannot_also_open_a_leader_term`
+            // shows cannot happen. Kept because the predicate is free and the
+            // failure it prevents is a torn log, not a crash.
+            if !self.awaiting_reconcile
+                && self.sm.current_term() == self.adopted_term
+                && self.pending_leader_open.is_none()
+            {
                 self.open_gate();
             }
         }
@@ -4211,6 +4408,26 @@ mod tests {
             let _ = self._trunc_rx.try_recv();
         }
 
+        /// Issue #6: stand in for the archive agent's `ArchiveCmd::Collapse`
+        /// arm (drain the command, cut+prime, ack) plus the consensus duty
+        /// cycle that drains the collapse slot. This is what finishes a leader
+        /// open now that the cut runs on the archive thread.
+        fn complete_leader_open(&mut self) {
+            let cmd = self._trunc_rx.try_recv().expect("leader open commanded a collapse");
+            let ArchiveCmd::Collapse { epoch, to } = cmd else {
+                panic!("expected Collapse, got {cmd:?}");
+            };
+            // What the archive agent does, minus the parts this harness has no
+            // `Archive` for: the real arm calls `truncate_to(to)` first (so its
+            // `PositionPurged` path is NOT covered here — see the arm's own
+            // comment) and afterwards publishes `prime_generation` and
+            // `first_base`, neither of which the consensus path reads.
+            self.cons.cnc.counters().prime(to);
+            self.cons.collapse_slot.post(epoch, to);
+            let (e, t) = self.cons.collapse_slot.take().expect("the ack was just posted");
+            self.cons.on_collapsed(e, t);
+        }
+
         /// Simulate the archive completing the truncation and the consensus
         /// duty-cycle draining the infallible slot.
         fn post_ack_and_drain(&mut self, epoch: u64, to: u64) {
@@ -4313,6 +4530,7 @@ mod tests {
         let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Vec<u8>>(64);
         let (trunc_tx, trunc_rx) = mpsc::sync_channel::<ArchiveCmd>(64);
         let trunc_slot = TruncationSlot::default();
+        let collapse_slot = TruncationSlot::default();
         // Not asserted on by any test in this module — a dropped receiver just
         // makes `sender_ctrl.send` return an ignored `Err` (`exec`'s `let _ =`).
         let (sender_ctrl, _sender_ctrl_rx) = mpsc::sync_channel::<CtrlMsg>(64);
@@ -4373,6 +4591,9 @@ mod tests {
             ingress_rx,
             trunc_tx,
             trunc_slot,
+            collapse_slot,
+            pending_leader_open: None,
+            next_collapse_epoch: 0,
             sender_ctrl,
             term_handle: Arc::new(AtomicU32::new(boot_term)),
             leader_flag: Arc::new(AtomicBool::new(false)),
@@ -4589,6 +4810,7 @@ mod tests {
         h.cons.feed(Event::Tick { now_ns: 301 });
         h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
         assert_eq!(h.cons.sm.current_term(), 3);
+        h.complete_leader_open(); // issue #6: the open lands on the archive's ack
         assert!(h.cons.leader_flag.load(Ordering::Acquire), "election did not complete");
         let append = h.cons.cnc.counters().append.load_acquire();
         assert_eq!(append, 6048, "NewTerm frame must sit at [6016, 6048)");
@@ -4653,6 +4875,169 @@ mod tests {
         assert!(!admission_open(51, 50, 0));
     }
 
+    /// Issue #6 regression: the leader-open collapse must be COMMANDED to the
+    /// archive agent, never primed on the consensus thread. Priming here left
+    /// the archive's private `durable_pos` above `base` whenever it had fsynced
+    /// a block since the (stale) `ElectionSm::durable` sample `base` comes from
+    /// — and the new leader then rewrote the buffer under its cursor
+    /// (`RecorderCorrupt`; see `uc2_log`'s
+    /// `become_leader_collapse_below_archive_cursor_corrupts_the_walk`).
+    #[test]
+    fn leader_open_routes_the_collapse_through_the_archive() {
+        let mut h = harness();
+        let before = h.cons.cnc.counters().append.load_acquire();
+        assert_eq!(before, 6016, "boot frontier");
+
+        h.cons.feed(Event::Tick { now_ns: 301 });
+        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+
+        // Phase 1: the SM leads, but NOTHING has touched the buffer yet — no
+        // prime, no appender, no NewTerm frame, intake closed, not serving.
+        assert_eq!(h.cons.sm.current_term(), 3);
+        assert_eq!(
+            h.cons.cnc.counters().append.load_acquire(),
+            before,
+            "the consensus thread must not prime or append before the archive cut"
+        );
+        assert!(h.cons.appender.is_none(), "no appender before the collapse ack");
+        assert!(!h.cons.leader_flag.load(Ordering::Acquire));
+        assert!(!h.gate_open(), "intake stays closed across the collapse");
+
+        // The command the archive agent must receive.
+        let cmd = h._trunc_rx.try_recv().expect("a collapse was commanded");
+        let ArchiveCmd::Collapse { epoch, to } = cmd else { panic!("expected Collapse: {cmd:?}") };
+        assert_eq!(to, 6016, "collapse to `base` = the SM's durable");
+        assert_eq!(h.cons.pending_leader_open, Some(PendingLeaderOpen { epoch, term: 3, base: to }));
+
+        // Phase 2: the archive cut+primed and acked. Now the open completes.
+        h.cons.cnc.counters().prime(to);
+        h.cons.collapse_slot.post(epoch, to);
+        let (e, t) = h.cons.collapse_slot.take().unwrap();
+        h.cons.on_collapsed(e, t);
+        assert!(h.cons.appender.is_some());
+        assert!(h.cons.leader_flag.load(Ordering::Acquire));
+        assert!(h.gate_open());
+        assert_eq!(
+            h.cons.cnc.counters().append.load_acquire(),
+            6048,
+            "NewTerm frame appended only after the cut"
+        );
+        assert_eq!(h.cons.pending_leader_open, None);
+    }
+
+    /// Issue #6: a collapse ack that lands AFTER the node stepped down (or
+    /// adopted a higher term) must not resurrect the abandoned leadership. The
+    /// physical cut is still correct — it dropped only this node's own
+    /// unreplicated tail — but no appender may be installed for a dead term.
+    #[test]
+    fn a_collapse_ack_after_stepping_down_does_not_resurrect_leadership() {
+        let mut h = harness();
+        h.cons.feed(Event::Tick { now_ns: 301 });
+        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+        let cmd = h._trunc_rx.try_recv().expect("a collapse was commanded");
+        let ArchiveCmd::Collapse { epoch, to } = cmd else { panic!("expected Collapse: {cmd:?}") };
+
+        // A higher term arrives while the collapse is in flight.
+        h.cons.feed(Event::RequestVote { from: 0, new_term: 9, last_term: 3, last_durable: 9000 });
+        assert!(h.cons.pending_leader_open.is_none(), "the open was abandoned");
+
+        // The late ack lands. It must be inert.
+        h.cons.cnc.counters().prime(to);
+        h.cons.on_collapsed(epoch, to);
+        assert!(h.cons.appender.is_none(), "no appender for the abandoned term");
+        assert!(!h.cons.leader_flag.load(Ordering::Acquire), "not a leader");
+        assert_eq!(
+            h.cons.cnc.counters().append.load_acquire(),
+            to,
+            "no NewTerm frame was appended"
+        );
+    }
+
+    /// Issue #6: while a leader open is in flight the duty cycle must NOT feed
+    /// `DurableAdvanced` from the archive's still-uncollapsed frontier.
+    ///
+    /// `ElectionSm::durable` is a monotonic max, and the collapse exists exactly
+    /// because that frontier is ABOVE the `base` being collapsed to. Feeding it
+    /// would latch `sm.durable` above bytes about to be cut away, with no path
+    /// back down (the `min` clamp belongs to the reconcile path's
+    /// `Event::Truncated`, which a collapse does not produce). The SM would then
+    /// ship an inflated `last_durable` vote credential and — worse — advance the
+    /// commit tracker with an `own_durable` this node does not physically hold.
+    ///
+    /// This window is a consequence of splitting leader open across two cycles:
+    /// before issue #6 the prime was synchronous, so step 2 always read the
+    /// already-collapsed value.
+    #[test]
+    fn a_pending_leader_open_suppresses_durable_feeds_from_the_stale_frontier() {
+        let mut h = harness();
+        h.cons.feed(Event::Tick { now_ns: 301 });
+        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+        let open = h.cons.pending_leader_open.expect("leader open in flight");
+        let sm_durable_at_open = h.cons.sm.durable();
+        assert_eq!(open.base, sm_durable_at_open, "base IS the SM's durable");
+
+        // The archive has NOT processed the collapse yet, and publishes a
+        // frontier above `base` — precisely the race this fix is about.
+        let stale_frontier = open.base + 4096;
+        h.cons.cnc.counters().durable.store_release(stale_frontier);
+        h.cons.do_work();
+        assert_eq!(
+            h.cons.sm.durable(),
+            sm_durable_at_open,
+            "the SM must not latch a frontier that is about to be cut away"
+        );
+
+        // After the collapse lands, feeds resume from the real frontier.
+        h.complete_leader_open();
+        let after = h.cons.cnc.counters().append.load_acquire();
+        h.cons.cnc.counters().durable.store_release(after);
+        h.cons.do_work();
+        assert_eq!(h.cons.sm.durable(), after, "feeds resume once the open completes");
+    }
+
+    /// Issue #6, load-bearing NEGATIVE result: a reconcile `Truncate` and a
+    /// leader-open `Collapse` are never in flight together, because a node that
+    /// is reconcile-truncating cannot win an election.
+    ///
+    /// Two independent reasons, both in `ElectionSm`: becoming a candidate needs
+    /// `Event::Tick`, which the truncating latch's allow-list
+    /// (`{RequestVote, Vote, Truncated}`) drops; and reaching
+    /// `reconcile_term_map` at all means adopting a map, which for a strictly
+    /// higher term runs `BecomeFollower` first, while a SAME-term map arriving
+    /// at a candidate would mean two leaders in one term.
+    ///
+    /// This matters because `ElectionSm::durable` is clamped to a pending cut
+    /// only when that cut's `Truncated` ack is fed back — so IF the interleaving
+    /// were reachable, `BecomeLeader` would carry `base > to` and the archive
+    /// would answer `PositionPurged`. The `ArchiveCmd::Collapse` arm clamps and
+    /// `on_truncated` carries a `pending_leader_open.is_none()` predicate so
+    /// that case degrades to subsumption instead of killing the archive agent —
+    /// but both are DEAD DEFENCE as long as this test holds. If it ever fails,
+    /// that defence has become live and needs real coverage.
+    #[test]
+    fn a_reconcile_truncating_node_cannot_also_open_a_leader_term() {
+        let mut h = harness();
+        // Adopt term 4 with a divergent map -> `Action::Truncate` in flight.
+        h.cons.feed(Event::RequestVote { from: 0, new_term: 4, last_term: 1, last_durable: 7000 });
+        h.cons.feed(Event::TermMapReceived { term: 4, entries: vec![(1, 0), (4, 4096)] });
+        let trunc = h._trunc_rx.try_recv().expect("a reconcile truncate was commanded");
+        assert!(matches!(trunc, ArchiveCmd::Truncate { .. }), "got {trunc:?}");
+        assert!(h.cons.pending_truncation.is_some(), "truncation bracket open");
+        assert!(!h.gate_open(), "intake closed for the truncation");
+
+        // Adopting the map made us a FOLLOWER, so a grant cannot elect us; and a
+        // `Tick` cannot make us a candidate while the latch holds.
+        h.cons.feed(Event::Tick { now_ns: 10_000_000_000 });
+        h.cons.feed(Event::Vote { from: 0, term: 4, granted: true });
+        assert!(
+            h.cons.pending_leader_open.is_none(),
+            "a truncating node opened a leader term — the Collapse clamp and \
+             on_truncated's pending_leader_open predicate are now LIVE and need \
+             real coverage, not just the defensive comments they carry"
+        );
+        assert!(h._trunc_rx.try_recv().is_err(), "no second archive command");
+    }
+
     /// Drive the harness node (id 1, boot term 2) to a SERVING leader of term 3:
     /// election timeout → candidate; one peer grant → BecomeLeader (NewTerm frame
     /// at [6016, 6048)); then advance commit past the frame via a follower's
@@ -4660,6 +5045,9 @@ mod tests {
     fn drive_to_serving_leader(h: &mut Harness) -> u64 {
         h.cons.feed(Event::Tick { now_ns: 301 });
         h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+        // Issue #6: the open now completes on the archive's collapse ack.
+        assert!(!h.cons.leader_flag.load(Ordering::Acquire), "leading before the collapse landed");
+        h.complete_leader_open();
         assert!(h.cons.leader_flag.load(Ordering::Acquire), "election did not complete");
         let append = h.cons.cnc.counters().append.load_acquire();
         assert_eq!(append, 6048);
