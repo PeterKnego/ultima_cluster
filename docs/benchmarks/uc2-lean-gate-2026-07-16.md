@@ -539,13 +539,40 @@ stays on the counter. Faithfully it is the absorbed copy, but moving it needs
 `SmLeDurable` threaded through `NodeWF.last_base` and the whole
 `MapWF`/`LcClosure`/`ReportProvenance` frontier stack. It is not needed for the
 grant-plane result: a candidate that is genuinely behind has a low counter too.
-(2) Lifting `DurableSkew`'s two statements from bare `Nat`s to worlds needs a
-counterfactual grant rule (a `logOk` reading `smDurable`) as a second step
-constructor. The split makes that possible; it is not written.
+(2) ~~Lifting `DurableSkew`'s statements to worlds.~~ **DONE** — see the
+world-level lift below.
 (3) `absorbDurable` is guarded to a non-leader — free, since the copy is only
 read by `startElection`, which already requires one — and it is what lets the
 step reuse `provinv_election`, whose leader arm demands the data-node be
 unchanged.
+
+**The world-level lift (`Uc2Proofs/DurableSkewWorld.lean`).** `DurableSkew`'s
+two statements are about bare `Nat`s: they say what follows IF a voter is ever in
+the skewed situation, not that the protocol can put one there. Both halves are
+now about REACHABLE WORLDS:
+
+- **Sound half — already in the corpus.** `Uc2.Cert.reachable_grant_report`
+  (`StageB`) establishes `GrantReport` for every reachable world. That is the
+  world-level form, and it holds because `logOk` reads the counter — the same
+  value `sendReport` stamps.
+- **False half — new.** `report_dominates_credential_false_under_stale_rule`
+  refutes the bridge's payload over an explicit **13-step reachable trace** under
+  the pre-`26d4827` grant rule. Node 0 leads term 1 and appends a byte; nodes 1
+  and 2 both replicate it, so both counters reach 1 while both absorbed copies
+  are still 0; node 1 REPORTS its counter; node 2 stands at term 2 advertising
+  its COPY (`(lastTerm 1, cd 0)`); node 1 grants on the tie. So node 1 reported
+  `1` and then certified a candidate advertising `0` — the bridge's `d ≤ cd` is
+  `1 ≤ 0`, refuted.
+- `rules_disagree_on_a_lagging_voter` isolates the disagreement from any trace:
+  at a voter with last term 1, counter 1 and copy 0, a candidate advertising
+  `(1, 0)` is REFUSED by the shipped rule and GRANTED by the stale one.
+
+The counterfactual lives in a SEPARATE relation (`StaleStep = Step ⊎ one stale
+grant rule`) rather than as a new `Step` constructor. Adding a constructor would
+demand a new case in every one of the ~30 inductions over `Step`, none of which
+have anything to say about it; this way every existing theorem is untouched. It
+is also the honest reading of the pre-fix system: the shipped protocol plus a
+grant rule that consulted the wrong value.
 
 **Two traps, for anyone doing this shape of propagation again.** A mechanical
 `crashRestart`-twin is wrong SEMANTICALLY wherever a case leans on the role

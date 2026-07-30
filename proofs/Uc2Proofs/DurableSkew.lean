@@ -42,10 +42,13 @@ world-level theorem could even *state* the distinction. **That is no longer
 true**: `PNode` now carries `durable` (the counter, reported and compared) and
 `smDurable` (the absorbed copy, advertised), and `SmLeDurable` relates them. The
 model can therefore now REACH a state where the two disagree —
-`nonvacuity_durable_skew_trace` below exhibits one — which is the precondition
-for ever lifting these two statements to worlds. Doing that lift needs a
-counterfactual grant rule (a `logOk` reading `smDurable`) as a second step
-constructor; it is not written yet.
+`nonvacuity_durable_skew_trace` below exhibits one.
+
+**The world-level lift is done**, in `Uc2Proofs/DurableSkewWorld.lean`: the sound
+half is the existing `Uc2.Cert.reachable_grant_report`, and the false half is
+`report_dominates_credential_false_under_stale_rule`, which refutes the bridge
+over a 13-step REACHABLE trace under a counterfactual grant rule. These two
+statements remain useful as the arithmetic core the world-level pair rests on.
 -/
 import Uc2Proofs.Vote
 import Uc2Proofs.ProtocolData
