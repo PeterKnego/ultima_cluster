@@ -19,6 +19,29 @@
 //! - **Faults** are seeded (drop / duplicate / delayed = reordered); partitions
 //!   and vote-blackouts are consulted at delivery; crashes are injected on the
 //!   crash-rate at each tick.
+//!
+//! ## The durable counter has TWO readers (issue #7)
+//!
+//! `Node.durable` is the shared counter. Two things read it, and they are
+//! deliberately modelled as running on **separate schedules**, because in the
+//! real node they run on separate threads:
+//!
+//! - the **report** path (`on_archive`) reads it and ships it to the leader,
+//!   which ranks reports into `commit` — mirroring `uc2_net`'s receiver reading
+//!   `counters().durable` directly;
+//! - the **consensus agent** ([`SimEvent::ConsensusStep`]) absorbs it into
+//!   `ElectionSm` via `Event::DurableAdvanced` — mirroring `Consensus::do_work`.
+//!   Everything the SM decides with its own durable position (vote grants,
+//!   the advertised election credential, a new leader's collapse base, the
+//!   own-durable commit clamp) rides that absorbed copy.
+//!
+//! They can therefore DISAGREE, which is the whole point: a node can report one
+//! durable position toward commit while judging votes by an older one. Fusing
+//! them — as this model did until issue #7, advancing the counter and feeding
+//! the SM as consecutive statements in one `ArchiveStep` — made that entire bug
+//! class unreachable here regardless of how the scheduler interleaved. The
+//! invariants were adequate the whole time; they simply had no trace to judge.
+//! See `stale_vote_credential_opens_a_term_below_a_committed_position`.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -242,6 +265,43 @@ pub struct SimConfig {
     pub crash_per_million: u32,
     pub tick_interval_ns: u64,
     pub archive_step_ns: u64,
+    /// Cadence of [`SimEvent::ConsensusStep`] — the consensus agent's duty
+    /// cycle, which is what ABSORBS the durable counter into `ElectionSm` as
+    /// `Event::DurableAdvanced`. Issue #7: this must be a SEPARATE scheduled
+    /// event from `ArchiveStep`, because in the real node the counter and the
+    /// SM's copy of it are read by two different threads, and fusing them makes
+    /// a whole bug class unreachable.
+    ///
+    /// A free-running timer, deliberately, and it does cost `max_steps` budget
+    /// on every node. A cheaper one-shot ("queue an absorb when the counter
+    /// moves") was tried and REJECTED: it models the same lag but reached the
+    /// target loss on 0 of 300 seeds where the periodic agent reaches it on 3 of
+    /// 120, because absorption then always lands relative to the last advance
+    /// and a frozen archive lets the SM catch up before any candidate times out.
+    /// Teeth beat budget. Existing scenarios were re-verified against the added
+    /// event load — including the RED arms that must still FIND their own
+    /// findings (`mechanism_unguarded_reopen_is_caught_by_oracle`, both
+    /// `finding9_*`), which still fire.
+    ///
+    /// Deliberately coarse relative to the real system (a busy-spin consensus
+    /// agent absorbs within microseconds of an fsync, not milliseconds). The
+    /// sim exaggerates every cadence — 5 ms archive steps, 10 ms ticks — because
+    /// its job is REACHABILITY, not probability: a schedule that is rare on real
+    /// hardware must be routinely explorable here or the invariants never get to
+    /// judge it.
+    pub consensus_step_ns: u64,
+    /// Issue #7 ablation knob (default `true` = the SHIPPED behaviour). When
+    /// true, delivering a `RequestVote` re-absorbs the durable counter into the
+    /// SM immediately BEFORE the grant decision — mirroring `feed_net`'s
+    /// `refresh_durable()` call in `uc2_node`.
+    ///
+    /// Set `false` to reproduce the pre-fix system, in which `log_ok` compared
+    /// candidates against a self-view up to one consensus duty cycle stale while
+    /// the receiver had already REPORTED the newer counter value for commit
+    /// ranking. That is the acked-write loss fixed in `main` 26d4827, and it is
+    /// what `inv4`/`inv5` must catch here — see
+    /// `stale_vote_credential_loses_an_acked_write`.
+    pub vote_refresh_durable: bool,
     pub latency_min_ns: u64,
     pub latency_max_ns: u64,
     /// Max bytes an `ArchiveStep` can make durable in one step.
@@ -304,6 +364,8 @@ impl Default for SimConfig {
             crash_per_million: 0,
             tick_interval_ns: 10_000_000,  // 10ms
             archive_step_ns: 5_000_000,    // 5ms
+            consensus_step_ns: 1_000_000,  // 1ms
+            vote_refresh_durable: true,
             latency_min_ns: 1_000_000,     // 1ms
             latency_max_ns: 5_000_000,     // 5ms
             archive_bytes_max: 4 * FRAME,
@@ -402,6 +464,18 @@ enum SimEvent {
     Deliver { to: usize, from: usize, msg: Msg },
     Tick { node: usize },
     ArchiveStep { node: usize },
+    /// Issue #7: the consensus agent's duty cycle, scheduled INDEPENDENTLY of
+    /// `ArchiveStep`. It is the only thing that absorbs the durable counter into
+    /// `ElectionSm` (`Event::DurableAdvanced`), mirroring `Consensus::do_work`
+    /// step 2 in `uc2_node`.
+    ///
+    /// Before this existed, `ArchiveStep` advanced the counter AND fed the SM in
+    /// one indivisible handler, so the two could never disagree — and the whole
+    /// class of "a node reports one durable to the leader while judging votes by
+    /// another" was unreachable in this world, no matter how the scheduler
+    /// interleaved. `inv4`/`inv5` were adequate all along; they simply had no
+    /// trace to convict.
+    ConsensusStep { node: usize },
     Restart { node: usize },
     /// Agent feedback for a completed truncation (`Event::Truncated`), scheduled
     /// as the next event to model the latch window. Carries the SM-allocated
@@ -438,8 +512,17 @@ struct Node {
     sm: ElectionSm,
     /// Volatile: highest byte position appended (lost beyond `durable` on crash).
     append: u64,
-    /// Durable-across-crash: the fsync'd byte position.
+    /// Durable-across-crash: the fsync'd byte position. THE COUNTER — written by
+    /// the archive (`ArchiveStep`) and read DIRECTLY by the report path, exactly
+    /// as `uc2_net`'s receiver reads `counters().durable` on its own thread.
     durable: u64,
+    /// Issue #7: the consensus agent's absorbed copy of `durable` — the shadow
+    /// `Consensus::durable_seen` keeps in `uc2_node`, used only to notice a
+    /// change. `ElectionSm`'s own `durable` is what the SM decides with; this is
+    /// the node-layer cursor that decides WHEN to tell it. The gap between this
+    /// and `durable` above is the dual-reader skew that issue #7 exists to make
+    /// expressible.
+    durable_absorbed: u64,
     /// Volatile: last certified commit (reset to 0 on crash).
     commit: u64,
     /// Persisted: the vote record (survives restart).
@@ -626,6 +709,7 @@ pub struct World {
     stat_truncations: u32,
     stat_wipes: u32,
     stat_restarts: u32,
+    stat_stale_vote_window: u64,
 
     // ---- T13: crypto plane ----
     /// `HS_KEY` (kind 20) deliveries addressed to a given node index are
@@ -676,6 +760,7 @@ impl World {
                 sm,
                 append: 0,
                 durable: 0,
+                durable_absorbed: 0,
                 commit: 0,
                 vote: None,
                 term_map: Vec::new(),
@@ -722,6 +807,7 @@ impl World {
             stat_truncations: 0,
             stat_wipes: 0,
             stat_restarts: 0,
+            stat_stale_vote_window: 0,
             key_delivery_blocked_until: HashMap::new(),
             nodes,
             cfg,
@@ -731,6 +817,7 @@ impl World {
         for id in 0..w.cfg.n_nodes {
             w.push(SimEvent::Tick { node: id }, id as u64);
             w.push(SimEvent::ArchiveStep { node: id }, w.cfg.archive_step_ns + id as u64);
+            w.push(SimEvent::ConsensusStep { node: id }, w.cfg.consensus_step_ns + id as u64);
         }
         w
     }
@@ -1126,6 +1213,7 @@ impl World {
         match ev {
             SimEvent::Tick { node } => self.on_tick(node, now, step),
             SimEvent::ArchiveStep { node } => self.on_archive(node, now, step),
+            SimEvent::ConsensusStep { node } => self.on_consensus_step(node, now, step),
             SimEvent::Restart { node } => self.on_restart(node, now),
             SimEvent::TruncatedFeedback { node, epoch, to } => {
                 self.on_truncated_feedback(node, epoch, to, now, step)
@@ -1213,7 +1301,14 @@ impl World {
                 let new_durable = (self.nodes[node].durable + want).min(self.nodes[node].append);
                 self.nodes[node].durable = new_durable;
                 self.record_committed(node);
-                self.feed(node, Event::DurableAdvanced { durable: new_durable }, now, step)?;
+                // Issue #7: the SM is NOT fed here. Advancing the counter and
+                // telling the consensus agent about it are two different
+                // threads' work in the real node, and fusing them was what made
+                // the dual-reader skew — and the acked-write loss it enables —
+                // unreachable in this world. `SimEvent::ConsensusStep` absorbs
+                // it on its own cadence; the report below deliberately reads the
+                // COUNTER, as `uc2_net`'s receiver does.
+
                 // M7 adopt-at-durable: the archive frame-scan surfaces config
                 // frames whose END the fresh durable just crossed (and whose
                 // bytes this node genuinely holds).
@@ -1295,6 +1390,33 @@ impl World {
         Ok(())
     }
 
+    /// Issue #7: the consensus agent's duty cycle. Mirrors `Consensus::do_work`
+    /// step 2 in `uc2_node` — poll the durable counter, feed `DurableAdvanced`
+    /// on change. This is the ONLY path by which `ElectionSm` learns its own
+    /// durable position, so everything the SM decides with it (`log_ok` grants,
+    /// `start_election`'s advertised credential, `become_leader`'s base,
+    /// `rank_leader`'s own-durable clamp) now rides a schedule independent of
+    /// the archive's.
+    fn on_consensus_step(&mut self, node: usize, now: u64, step: u64) -> Result<(), InvariantViolation> {
+        if self.nodes[node].up {
+            self.absorb_durable(node, now, step)?;
+        }
+        self.push(SimEvent::ConsensusStep { node }, now + self.cfg.consensus_step_ns);
+        Ok(())
+    }
+
+    /// Absorb the durable counter into the SM if it moved. Idempotent, and the
+    /// single implementation behind both the duty-cycle poll and the pre-vote
+    /// refresh — the same shape as `uc2_node`'s `refresh_durable`.
+    fn absorb_durable(&mut self, node: usize, now: u64, step: u64) -> Result<(), InvariantViolation> {
+        let d = self.nodes[node].durable;
+        if d == self.nodes[node].durable_absorbed {
+            return Ok(());
+        }
+        self.nodes[node].durable_absorbed = d;
+        self.feed(node, Event::DurableAdvanced { durable: d }, now, step)
+    }
+
     fn on_restart(&mut self, node: usize, now: u64) -> Result<(), InvariantViolation> {
         if self.nodes[node].up || self.nodes[node].halted {
             return Ok(()); // already recovered — or removed for good (M7)
@@ -1332,6 +1454,10 @@ impl World {
         let nd = &mut self.nodes[node];
         nd.sm = sm;
         nd.up = true;
+        // Issue #7: a fresh `ElectionSm` is seeded FROM `durable`, so the
+        // consensus agent's shadow starts in step with it — no phantom "advance"
+        // on the first post-restart poll.
+        nd.durable_absorbed = durable;
         nd.append = durable;
         nd.commit = 0;
         nd.truncating = false;
@@ -1707,12 +1833,35 @@ impl World {
                 self.nodes[to].leader_hint = Some(from);
                 self.feed(to, Event::CommitGossip { term, commit }, now, step)
             }
-            Msg::RequestVote { from: cand, new_term, last_term, last_durable } => self.feed(
-                to,
-                Event::RequestVote { from: cand, new_term, last_term, last_durable },
-                now,
-                step,
-            ),
+            Msg::RequestVote { from: cand, new_term, last_term, last_durable } => {
+                // Issue #7 / main 26d4827: re-absorb the counter IMMEDIATELY
+                // before the grant decision, as `feed_net` does. Raft's vote rule
+                // is sound only if a voter judges a candidate against everything
+                // the voter has DURABLY STORED — the counter, not a copy of it
+                // taken at the last duty cycle. Granting on an under-estimate of
+                // our own log is the unsafe direction: it lets a candidate behind
+                // a committed position win and collapse below it.
+                //
+                // `vote_refresh_durable: false` ablates this and reproduces the
+                // pre-fix system.
+                // Non-vacuity instrumentation: this vote is being answered while
+                // the counter is AHEAD of the consensus agent's absorbed copy —
+                // i.e. the dual-reader skew is live at the moment of the grant
+                // decision. A directed test that never trips this counter proved
+                // nothing about issue #7, whatever else it caught.
+                if self.nodes[to].durable > self.nodes[to].durable_absorbed {
+                    self.stat_stale_vote_window += 1;
+                }
+                if self.cfg.vote_refresh_durable {
+                    self.absorb_durable(to, now, step)?;
+                }
+                self.feed(
+                    to,
+                    Event::RequestVote { from: cand, new_term, last_term, last_durable },
+                    now,
+                    step,
+                )
+            }
             Msg::Vote { from: voter, term, granted } => {
                 self.feed(to, Event::Vote { from: voter, term, granted }, now, step)
             }
@@ -2596,6 +2745,14 @@ impl World {
     }
 
     /// A node's current durable (fsync'd) position.
+    /// Issue #7 non-vacuity probe: how many `RequestVote`s were answered while
+    /// this world had the durable counter ahead of a voter's absorbed copy — the
+    /// skew that `vote_refresh_durable` exists to close. Zero means the scenario
+    /// never exercised the dual-reader gap, whatever else it may have found.
+    pub fn stale_vote_windows(&self) -> u64 {
+        self.stat_stale_vote_window
+    }
+
     pub fn node_durable(&self, node: usize) -> u64 {
         self.nodes[node].durable
     }
