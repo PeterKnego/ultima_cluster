@@ -1368,6 +1368,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "uc2ctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rand",
+ "uc2_log",
+ "uc_protocol",
+]
+
+[[package]]
 name = "uc_protocol"
 version = "0.1.0"
 dependencies = [

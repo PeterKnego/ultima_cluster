@@ -157,7 +157,7 @@ RAM-backed filesystems).
 
 **Dynamic membership (M7)**: single-server reconfiguration is shipped —
 promote / demote / add / remove one member at a time, live, under load, via
-the `uc2ctl` admin tool. Joint consensus is not needed for the supported ops
+the `uc2ctl` admin CLI. Joint consensus is not needed for the supported ops
 (adjacent configs differ by one member, so majorities always intersect). Hard
 cap: **8 total members** (voters + learners) in the cnc observability band —
 unchanged from v2.0. One node per instance directory.

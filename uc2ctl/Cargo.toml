@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Peter Knego
+[package]
+name = "uc2ctl"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Admin CLI for live ultima_cluster reconfiguration"
+publish = false
+
+# Deliberately its own crate rather than a bin inside `uc2_node`: uc2ctl talks
+# to a node purely through the cnc page's admin slots, so it needs `uc2_log` and
+# `uc_protocol` but NOT `uc2_node` itself — and keeping it separate is what
+# stops `clap` becoming a dependency of the node library for every consumer.
+[dependencies]
+uc2_log = { path = "../uc2_log" }
+uc_protocol = { path = "../uc_protocol" }
+clap = { workspace = true }
+anyhow = { workspace = true }
+# A per-request nonce, so a response can never be mistaken for a stale one.
+rand = { workspace = true }
