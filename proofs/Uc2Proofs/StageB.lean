@@ -86,6 +86,11 @@ private theorem lts_step {n : Nat} {w w' : World n} (h : LastTermSync w)
     · simp only [Node.pn, Function.update_self]
       rw [Data.lastTermOf_prunePush]
     · simpa [Node.pn, Function.update_of_ne hne] using h k
+  | absorbDurable i =>
+    intro k
+    rcases eq_or_ne k i with rfl | hne
+    · simpa [Node.pn, Function.update_self] using h k
+    · simpa [Node.pn, Function.update_of_ne hne] using h k
   | crashRestart i =>
     intro k
     rcases eq_or_ne k i with rfl | hne
@@ -179,6 +184,7 @@ private theorem gle_step {n : Nat} {w w' : World n} (hw : Reachable w)
   | deliverVote i v t hmsg hrole hterm => exact h
   | deliverVoteHigherTerm i v t g hmsg hterm => exact h
   | becomeLeader i hrole hquorum => exact h
+  | absorbDurable i => exact h
   | crashRestart i => exact h
   | deliverReplicate j pos hdr t v hmsg hpos hhdr hgate => exact h
   | deliverTermMap j t entries hmsg hterm => exact h
@@ -306,6 +312,13 @@ private theorem orig_step {n : Nat} {w w' : World n} (h : OrigInv w)
     · simp only [Node.hist, Function.update_of_ne hne] at hhk
       exact hh k p t' v' hhk
   | becomeLeader i hrole hquorum =>
+    refine ⟨fun k p t v hhk => ?_, hf⟩
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Node.hist, Function.update_self] at hhk
+      exact hh k p t v hhk
+    · simp only [Node.hist, Function.update_of_ne hne] at hhk
+      exact hh k p t v hhk
+  | absorbDurable i =>
     refine ⟨fun k p t v hhk => ?_, hf⟩
     rcases eq_or_ne k i with rfl | hne
     · simp only [Node.hist, Function.update_self] at hhk
@@ -529,6 +542,13 @@ private theorem ofe_step {n : Nat} {w w' : World n} (hw : Reachable w)
     rcases eq_or_ne k i with rfl | hne
     · simp only [Node.dataTerm, Function.update_self] at hdt ⊢
       rw [Data.lastTermOf_prunePush]
+    · simp only [Node.dataTerm, Function.update_of_ne hne] at hr hdt ⊢
+      exact h T hera k (by simpa [Function.update_of_ne hne] using hr) hdt
+  | absorbDurable i =>
+    intro T hera k hr hdt
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Node.dataTerm, Function.update_self] at hr hdt ⊢
+      exact of_decide_eq_true hr
     · simp only [Node.dataTerm, Function.update_of_ne hne] at hr hdt ⊢
       exact h T hera k (by simpa [Function.update_of_ne hne] using hr) hdt
   | crashRestart i =>
@@ -835,6 +855,20 @@ private theorem ref_step {n : Nat} {w w' : World n} (hw : Reachable w)
           · simp only [Node.pn, Function.update_of_ne hne,
               Function.update_of_ne hneℓ] at hrl hct ⊢
             exact h2.lfloor ℓ hrl hct
+  | absorbDurable i =>
+    refine ref_transport h (fun k => ?_) (fun k => ?_) (fun k hrl => ?_)
+      rfl (fun u T d hm => hm)
+    · rcases eq_or_ne k i with rfl | hne
+      · simp [Function.update_self]
+      · simp [Function.update_of_ne hne]
+    · rcases eq_or_ne k i with rfl | hne
+      · simp [Node.pn, Function.update_self]
+      · simp [Node.pn, Function.update_of_ne hne]
+    · rcases eq_or_ne k i with rfl | hne
+      · simp only [Node.pn, Function.update_self] at hrl
+        exact absurd hrl (by decide)
+      · refine ⟨by simpa [Node.pn, Function.update_of_ne hne] using hrl, ?_⟩
+        simp [Node.pn, Function.update_of_ne hne]
   | crashRestart i =>
     refine ref_transport h (fun k => ?_) (fun k => ?_) (fun k hrl => ?_)
       rfl (fun u T d hm => hm)
@@ -1415,6 +1449,13 @@ private theorem rlf_step {n : Nat} {w w' : World n} (hw : Reachable w)
       exact Data.cert_blocks_candidate hInv hrole rfl hquorum hc
     · simp only [Node.pn, Function.update_of_ne hne] at hrl hct ⊢
       exact h y T d hm h1T ℓ hrl hct
+  | absorbDurable i =>
+    intro y T d hm h1T ℓ hrl hct
+    rcases eq_or_ne ℓ i with rfl | hne
+    · simp only [Node.pn, Function.update_self] at hrl
+      exact absurd hrl (by decide)
+    · simp only [Node.pn, Function.update_of_ne hne] at hrl hct ⊢
+      exact h y T d hm h1T ℓ hrl hct
   | crashRestart i =>
     intro y T d hm h1T ℓ hrl hct
     rcases eq_or_ne ℓ i with rfl | hne
@@ -1693,6 +1734,13 @@ private theorem vm_step {n : Nat} {w w' : World n} (hw : Reachable w)
       exact h j c t hvf hct hcj
     · simp only [Node.pn, Function.update_of_ne hne] at hvf hct
       exact h j c t hvf hct hcj
+  | absorbDurable i =>
+    intro j c t hvf hct hcj
+    rcases eq_or_ne j i with rfl | hne
+    · simp only [Node.pn, Function.update_self] at hvf hct
+      exact h j c t hvf hct hcj
+    · simp only [Node.pn, Function.update_of_ne hne] at hvf hct
+      exact h j c t hvf hct hcj
   | crashRestart i =>
     intro j c t hvf hct hcj
     rcases eq_or_ne j i with rfl | hne
@@ -1791,6 +1839,7 @@ private theorem gr_step {n : Nat} {w w' : World n} (hw : Reachable w)
   | deliverVote i v t hmsg hrole hterm => exact h
   | deliverVoteHigherTerm i v t g hmsg hterm => exact h
   | becomeLeader i hrole hquorum => exact h
+  | absorbDurable i => exact h
   | crashRestart i => exact h
   | deliverReport i src t d hmsg hrole hterm hsrc => exact h
   | leaderAdvanceCommit i k hrole hbase hadv => exact h

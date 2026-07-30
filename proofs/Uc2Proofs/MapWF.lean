@@ -591,6 +591,20 @@ private theorem minv_step {n : Nat} {w w' : World n} (hw : Reachable w)
           hn.role_term_pos fun hh => nomatch (hrole.symm.trans hh)
     · rw [Function.update_of_ne hne]
       exact h.node k
+  | absorbDurable i =>
+    -- issue #7: `NodeWF` constrains `termMap`, `pn.durable`, `pn.role`,
+    -- `pn.currentTerm` and `hist`; absorbing the counter into `smDurable`
+    -- touches none of them, so the whole record transfers.
+    refine ⟨?_, h.stamp_pos, h.gossip_wf⟩
+    intro k
+    show NodeWF (Function.update w.nodes i _ k)
+    rcases eq_or_ne k i with rfl | hne
+    · rw [Function.update_self]
+      have hn := h.node k
+      exact hn.pn_step rfl rfl rfl hn.leader_map hn.role_term_pos hn.map_le
+        hn.cand_dt_lt hn.cand_map_lt
+    · rw [Function.update_of_ne hne]
+      exact h.node k
   | crashRestart i =>
     refine ⟨?_, h.stamp_pos, h.gossip_wf⟩
     intro k
@@ -1080,6 +1094,11 @@ private theorem ldt_step {n : Nat} {w w' : World n} (h : LeaderDataTerm w)
     rcases eq_or_ne k i with rfl | hne
     · simp only [Function.update_self]
     · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
+  | absorbDurable i =>
+    intro k hr
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self] at hr; simp at hr
+    · simp only [Function.update_of_ne hne] at hr ⊢; exact h k hr
   | crashRestart i =>
     intro k hr
     rcases eq_or_ne k i with rfl | hne
@@ -1220,6 +1239,14 @@ private theorem mldt_step {n : Nat} {w w' : World n} (hw : Reachable w)
     intro k; rcases eq_or_ne k i with rfl | hne
     · simp only [Function.update_self]
       rw [lastTermOf_prunePush]
+    · simp only [Function.update_of_ne hne]; exact h k
+  | absorbDurable i =>
+    intro k; rcases eq_or_ne k i with rfl | hne
+    · simp only [Function.update_self]
+      -- recovered currentTerm ≥ map last term; dataTerm := currentTerm
+      have hrec : lastTermOf (w.nodes k).termMap ≤ (w.nodes k).pn.currentTerm :=
+        Nat.le_trans (h k) (hstamp.data_le k)
+      exact hrec
     · simp only [Function.update_of_ne hne]; exact h k
   | crashRestart i =>
     intro k; rcases eq_or_ne k i with rfl | hne

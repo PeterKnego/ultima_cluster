@@ -68,7 +68,7 @@ theorem nonvacuity_truncation_trace :
       (w''.nodes 0).hist 1 = some (2, 99) := by
   refine ⟨_, _, _,
     .tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
-      (.tail (.tail
+      (.tail (.tail (.tail
       (.single (.startElection _ 0 (by decide)))
       (.deliverRequestVote _ 1 0 1 0 0 (by decide) (by decide)))
       (.deliverVote _ 0 1 1 (by decide) (by decide) (by decide)))
@@ -76,6 +76,10 @@ theorem nonvacuity_truncation_trace :
       (.leaderAppend _ 0 42 (by decide)))
       (.leaderAppend _ 0 43 (by decide)))
       (.deliverReplicate _ 1 0 1 1 42 (by decide) (by decide) (by decide)))
+      -- Issue #7: node 1 must ABSORB the counter before it can advertise a
+      -- credential reflecting the byte it just fsynced. Before the split this
+      -- step did not exist and `start_election` read the counter directly.
+      (.absorbDurable _ 1))
       (.startElection _ 1 (by decide)))
       (.deliverRequestVote _ 2 1 2 1 1 (by decide) (by decide)))
       (.deliverVote _ 1 2 2 (by decide) (by decide) (by decide)))
@@ -400,6 +404,22 @@ private theorem stamp_step {n : Nat} {w w' : World n} (h : StampInv w)
       rcases eq_or_ne k i with rfl | hne
       · simp only [Function.update_self]
         exact Nat.le_refl _
+      · simp only [Function.update_of_ne hne]
+        exact h.data_le k
+  | absorbDurable i =>
+    -- issue #7: absorbing the counter into `smDurable` touches neither `hist`
+    -- nor `dataTerm`, the only fields `StampInv` constrains.
+    refine ⟨h.frame_le, ?_, ?_⟩
+    · intro k p t v hh
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self] at hh ⊢
+        exact h.hist_le k p t v hh
+      · simp only [Function.update_of_ne hne] at hh ⊢
+        exact h.hist_le k p t v hh
+    · intro k
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self]
+        exact h.data_le k
       · simp only [Function.update_of_ne hne]
         exact h.data_le k
   | crashRestart i =>
@@ -924,6 +944,43 @@ theorem dinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         rcases hc.pinned with hlt | ⟨-, -, hnc⟩
         · exact .inl hlt
         · exact absurd hrole hnc
+      · simp only [Function.update_of_ne hne]
+        exact hc.pinned
+  | absorbDurable i =>
+    -- issue #7: `smDurable` appears in no `DInv` field; role, frontier, map and
+    -- history are all untouched, so every component transfers verbatim.
+    refine ⟨?_, ?_, ?_, ?_, ?_⟩
+    · intro p t v v' h1 h2
+      exact h.coherent p t v v' (occ_pn_sub h1 rfl) (occ_pn_sub h2 rfl)
+    · intro k hk p v hOcc
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self] at hk hOcc ⊢
+        exact h.frontier k hk p v (occ_pn_sub hOcc rfl)
+      · simp only [Function.update_of_ne hne] at hk hOcc ⊢
+        exact h.frontier k hk p v (occ_pn_sub hOcc rfl)
+    · intro k hk es hg
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self] at hk hg ⊢
+        exact h.gossip_pinned k hk es hg
+      · simp only [Function.update_of_ne hne] at hk hg ⊢
+        exact h.gossip_pinned k hk es hg
+    · intro k hk
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self] at hk ⊢
+        exact h.map_pinned k hk
+      · simp only [Function.update_of_ne hne] at hk ⊢
+        exact h.map_pinned k hk
+    · intro t hcg
+      have hcg' : (∃ p v, Occ w p t v) ∨
+          (∃ es, Frame.gossip t es ∈ w.dsent) := by
+        rcases hcg with ⟨p, v, hOcc⟩ | hg
+        · exact .inl ⟨p, v, occ_pn_sub hOcc rfl⟩
+        · exact .inr hg
+      obtain ⟨ℓ, hc⟩ := h.cert t hcg'
+      refine ⟨ℓ, hc.transport (fun m hm => hm) (fun c hcm => .inl hcm) ?_⟩
+      rcases eq_or_ne ℓ i with rfl | hne
+      · simp only [Function.update_self]
+        exact hc.pinned
       · simp only [Function.update_of_ne hne]
         exact hc.pinned
   | crashRestart i =>

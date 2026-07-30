@@ -215,6 +215,11 @@ private theorem hfp_step {n : Nat} {w w' : World n} (h : HistFrameProvenance w)
     rcases eq_or_ne k i with rfl | hne
     · simp only [Node.hist, Function.update_self] at hh; exact h k p t v hh
     · simp only [Node.hist, Function.update_of_ne hne] at hh; exact h k p t v hh
+  | absorbDurable i =>
+    intro k p t v hh
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Node.hist, Function.update_self] at hh; exact h k p t v hh
+    · simp only [Node.hist, Function.update_of_ne hne] at hh; exact h k p t v hh
   | crashRestart i =>
     intro k p t v hh
     rcases eq_or_ne k i with rfl | hne
@@ -322,6 +327,7 @@ private theorem cfp_step {n : Nat} {w w' : World n} (hw : Reachable w)
   | deliverVote _ _ _ _ _ _ => intro p stamp T v hh; exact h p stamp T v hh
   | deliverVoteHigherTerm _ _ _ _ _ _ => intro p stamp T v hh; exact h p stamp T v hh
   | becomeLeader _ _ _ => intro p stamp T v hh; exact h p stamp T v hh
+  | absorbDurable _ => intro p stamp T v hh; exact h p stamp T v hh
   | crashRestart _ => intro p stamp T v hh; exact h p stamp T v hh
   | leaderAppend i v hrole =>
     intro p stamp T v' hh

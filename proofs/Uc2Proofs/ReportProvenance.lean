@@ -277,6 +277,15 @@ theorem cert_dstep {n : Nat} {dw dw' : World n} {t : Nat} {ℓ : Fin n}
       · exact absurd hrole hnc
     · simp only [Function.update_of_ne hne]
       exact hc.pinned
+  | absorbDurable i =>
+    refine hc.transport (fun m hm => hm) (fun c h => .inl h) ?_
+    rcases eq_or_ne ℓ i with rfl | hne
+    · simp only [Function.update_self]
+      rcases hc.pinned with hlt | ⟨heq, hvf, -⟩
+      · exact .inl hlt
+      · exact .inr ⟨heq, hvf, by show Role.follower ≠ .candidate; decide⟩
+    · simp only [Function.update_of_ne hne]
+      exact hc.pinned
   | crashRestart i =>
     refine hc.transport (fun m hm => hm) (fun c h => .inl h) ?_
     rcases eq_or_ne ℓ i with rfl | hne
@@ -1348,6 +1357,32 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
         · simp only [Function.update_of_ne hk] at hdtu ⊢
           simp only [Function.update_of_ne hkl] at hrl hctl ⊢
           exact h.report_durable u T d hrp hdtu ℓ hrl hctl
+  | absorbDurable i =>
+    -- reboot: handle re-keys to the recovered term; the Finding-#5 boot
+    -- predicate opens the gate exactly when the map's frontier reaches the
+    -- recovered term — which pins the regime UNCHANGED across the crash
+    -- (`closed_lag` rules out a pre-closed gate in that configuration).
+    have hdle := (Uc2.Data.reachable_stamp (reachable_project hw)).data_le i
+    have hmldt := Uc2.Data.reachable_map_le_dataTerm (reachable_project hw) i
+    refine provinv_election (Step.crashRestart w i) h rfl rfl rfl rfl rfl rfl
+      (fun _ => rfl) hdle ?_ ?_ (fun hl => nomatch hl)
+    · intro hcl
+      have h1 := of_decide_eq_false hcl
+      show Data.lastTermOf (w.nodes i).dn.termMap < (w.nodes i).pn.currentTerm
+      omega
+    · intro hg
+      have h1 := of_decide_eq_true hg
+      have hdle' : (w.nodes i).dataTerm ≤ (w.nodes i).pn.currentTerm := hdle
+      have hmldt' : Data.lastTermOf (w.nodes i).dn.termMap
+          ≤ (w.nodes i).dataTerm := hmldt
+      have h2 : (w.nodes i).pn.currentTerm = (w.nodes i).dataTerm := by
+        omega
+      refine ⟨h2, ?_⟩
+      cases hpre : (w.nodes i).reconciled with
+      | true => rfl
+      | false =>
+        have h3 := h.closed_lag i hpre
+        omega
   | crashRestart i =>
     -- reboot: handle re-keys to the recovered term; the Finding-#5 boot
     -- predicate opens the gate exactly when the map's frontier reaches the

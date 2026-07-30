@@ -141,6 +141,11 @@ private theorem ctb_step {n : Nat} {w w' : World n} (h : CampaignTermBound w)
     rcases eq_or_ne k i with rfl | hne
     · simpa [Node.pn, Function.update_self] using h k u clt cd hm
     · simpa [Node.pn, Function.update_of_ne hne] using h k u clt cd hm
+  | absorbDurable i =>
+    intro k u clt cd hm
+    rcases eq_or_ne k i with rfl | hne
+    · simpa [Node.pn, Function.update_self] using h k u clt cd hm
+    · simpa [Node.pn, Function.update_of_ne hne] using h k u clt cd hm
   | crashRestart i =>
     intro k u clt cd hm
     rcases eq_or_ne k i with rfl | hne
@@ -304,6 +309,16 @@ private theorem ccr_step {n : Nat} {w w' : World n} (hw : Reachable w)
       · exact .inl hleft
       · exact .inr ⟨ℓ, hcert hcL⟩
   | becomeLeader i hrole hquorum =>
+    intro k u clt cd hm hrl hct
+    rcases eq_or_ne k i with rfl | hne
+    · exfalso
+      simp only [Node.pn, Function.update_self] at hrl
+      exact absurd hrl (by decide)
+    · simp only [Node.pn, Function.update_of_ne hne] at hrl hct ⊢
+      rcases h k u clt cd hm hrl hct with hleft | ⟨ℓ, hcL⟩
+      · exact .inl hleft
+      · exact .inr ⟨ℓ, hcert hcL⟩
+  | absorbDurable i =>
     intro k u clt cd hm hrl hct
     rcases eq_or_ne k i with rfl | hne
     · exfalso
@@ -928,6 +943,10 @@ theorem step_currentTerm_mono {n : Nat} {w w' : World n} (hs : Step w w')
       omega
     · simp [Node.pn, Function.update_of_ne hne]
   | becomeLeader i hrole hquorum =>
+    rcases eq_or_ne j i with rfl | hne
+    · simp [Node.pn, Function.update_self]
+    · simp [Node.pn, Function.update_of_ne hne]
+  | absorbDurable i =>
     rcases eq_or_ne j i with rfl | hne
     · simp [Node.pn, Function.update_self]
     · simp [Node.pn, Function.update_of_ne hne]

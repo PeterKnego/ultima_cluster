@@ -109,6 +109,13 @@ private theorem hd_step {n : Nat} {w w' : World n} (h : HistDefined w)
       exact h k p hp
     · simp only [Node.hist, Node.pn, Function.update_of_ne hne] at hp ⊢
       exact h k p hp
+  | absorbDurable i =>
+    intro k p hp
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Node.hist, Node.pn, Function.update_self] at hp ⊢
+      exact h k p hp
+    · simp only [Node.hist, Node.pn, Function.update_of_ne hne] at hp ⊢
+      exact h k p hp
   | crashRestart i =>
     intro k p hp
     rcases eq_or_ne k i with rfl | hne
@@ -226,6 +233,7 @@ private theorem gu_step {n : Nat} {w w' : World n} (hw : Reachable w)
   | deliverVote i v t hmsg hrole hterm => exact h
   | deliverVoteHigherTerm i v t g hmsg hterm => exact h
   | becomeLeader i hrole hquorum => exact h
+  | absorbDurable i => exact h
   | crashRestart i => exact h
   | leaderAppend i v hrole => exact gu_frame_append h rfl
   | deliverReplicate j pos hdr t v hmsg hpos hhdr hgate => exact h
@@ -321,6 +329,13 @@ private theorem nsr_step {n : Nat} {w w' : World n} (hw : Reachable w)
       refine h k ?_ d hmem
       rw [hrole]
       decide
+    · simp only [Node.pn, Function.update_of_ne hne] at hnf hmem
+      exact h k hnf d hmem
+  | absorbDurable i =>
+    intro k hnf d hmem
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Node.pn, Function.update_self] at hnf
+      exact hnf rfl
     · simp only [Node.pn, Function.update_of_ne hne] at hnf hmem
       exact h k hnf d hmem
   | crashRestart i =>
@@ -485,7 +500,80 @@ private theorem rgw_step {n : Nat} {w w' : World n} (hw : Reachable w)
           simp [Node.dataTerm, Node.pn, Function.update_self]
       · exact .inl ⟨by simp [Node.dataTerm, Function.update_of_ne hne],
           by simpa [Function.update_of_ne hne] using hr⟩
-    | crashRestart i =>
+    | absorbDurable i =>
+      rcases eq_or_ne k i with rfl | hne
+      · simp only [Function.update_self] at hr
+        have hle : (w.nodes k).dn.pn.currentTerm ≤
+            Data.lastTermOf (w.nodes k).dn.termMap := of_decide_eq_true hr
+        have h2 : Data.lastTermOf (w.nodes k).dn.termMap ≤
+            (w.nodes k).dn.dataTerm :=
+          Data.reachable_map_le_dataTerm (reachable_project hw) k
+        have h3 : (w.nodes k).dn.dataTerm ≤ (w.nodes k).dn.pn.currentTerm :=
+          (Data.reachable_stamp (reachable_project hw)).data_le k
+        refine .inl ⟨?_, ?_⟩
+        · simp only [Node.dataTerm, Node.pn, Function.update_self]
+          omega
+        · by_contra hcl
+          have h4 : Data.lastTermOf (w.nodes k).dn.termMap <
+              (w.nodes k).dn.dataTerm :=
+            (reachable_provInv hw).closed_lag k (Bool.eq_false_iff.mpr hcl)
+          omega
+      · exact .inl ⟨by simp [Node.dataTerm, Function.update_of_ne hne],
+          by simpa [Function.update_of_ne hne] using hr⟩
+    | leaderAppend i v hrole =>
+      refine .inl ⟨?_, ?_⟩ <;> rcases eq_or_ne k i with rfl | hne
+      · simp [Node.dataTerm, Function.update_self]
+      · simp [Node.dataTerm, Function.update_of_ne hne]
+      · simpa [Function.update_self] using hr
+      · simpa [Function.update_of_ne hne] using hr
+    | deliverReplicate j pos hdr t v hmsg hpos2 hhdr hgate =>
+      refine .inl ⟨?_, ?_⟩ <;> rcases eq_or_ne k j with rfl | hne
+      · simp [Node.dataTerm, Function.update_self, Uc2.Data.Node.recvReplicate]
+      · simp [Node.dataTerm, Function.update_of_ne hne]
+      · simpa [Function.update_self] using hr
+      · simpa [Function.update_of_ne hne] using hr
+    | serveTail i p t v hrole hhist hp => exact .inl ⟨rfl, hr⟩
+    | shipTermMap i hrole => exact .inl ⟨rfl, hr⟩
+    | deliverTermMap j t entries hmsg hterm =>
+      rcases eq_or_ne k j with rfl | hne
+      · simp only [Node.dataTerm, Function.update_self] at hr hpos ⊢
+        rw [Data.applyGossip_dataTerm] at hpos ⊢
+        by_cases hadopt : (w.nodes k).dn.pn.currentTerm < t
+        · rw [if_pos hadopt]
+          exact .inr (.inl ⟨entries, hmsg⟩)
+        · rw [if_neg hadopt]
+          have hadopt' : ¬ (w.nodes k).pn.currentTerm < t := hadopt
+          rw [if_neg hadopt'] at hr
+          simp only [Bool.or_eq_true] at hr
+          rcases hr with hr | hdec
+          · exact .inl ⟨rfl, hr⟩
+          · have hdteq : (w.nodes k).dn.dataTerm =
+                (w.nodes k).pn.currentTerm := of_decide_eq_true hdec
+            have hteq : t = (w.nodes k).pn.currentTerm :=
+              Nat.le_antisymm (Nat.not_lt.mp hadopt') hterm
+            rw [hdteq, ← hteq]
+            exact .inr (.inl ⟨entries, hmsg⟩)
+      · exact .inl ⟨by simp [Node.dataTerm, Function.update_of_ne hne],
+          by simpa [Function.update_of_ne hne] using hr⟩
+    | sendReport j hrole hgate => exact .inl ⟨rfl, hr⟩
+    | deliverReport i src t d hmsg hrole hterm hsrc =>
+      refine .inl ⟨?_, ?_⟩ <;> rcases eq_or_ne k i with rfl | hne
+      · simp [Node.dataTerm, Function.update_self]
+      · simp [Node.dataTerm, Function.update_of_ne hne]
+      · simpa [Function.update_self] using hr
+      · simpa [Function.update_of_ne hne] using hr
+    | leaderAdvanceCommit i kk hrole hbase hadv =>
+      refine .inl ⟨?_, ?_⟩ <;> rcases eq_or_ne k i with rfl | hne
+      · simp [Node.dataTerm, Function.update_self]
+      · simp [Node.dataTerm, Function.update_of_ne hne]
+      · simpa [Function.update_self] using hr
+      · simpa [Function.update_of_ne hne] using hr
+
+/-- **Regime witness** in every reachable world. -/
+theorem reachable_regime_witness {n : Nat} {w : World n} (hw : Reachable w) :
+    RegimeWitness w := by
+  induction hw with
+  | crashRestart i =>
       rcases eq_or_ne k i with rfl | hne
       · simp only [Function.update_self] at hr
         have hle : (w.nodes k).dn.pn.currentTerm ≤
@@ -672,6 +760,16 @@ private theorem ti_step {n : Nat} {w w' : World n} (h : TrackerInv w)
         = List.replicate (w.nodes k).tracker.reported.length 0 from rfl,
         getD_replicate_zero'] at hpos
       omega
+    · obtain ⟨h1, h2, h3⟩ := h k
+      simp only [Node.pn, Function.update_of_ne hne]
+      exact ⟨h1, h2, h3⟩
+  | absorbDurable i =>
+    intro k
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Node.pn, Function.update_self]
+      refine ⟨rfl, by simp [CommitTracker.new], ?_⟩
+      intro hldr
+      exact absurd hldr (by decide)
     · obtain ⟨h1, h2, h3⟩ := h k
       simp only [Node.pn, Function.update_of_ne hne]
       exact ⟨h1, h2, h3⟩

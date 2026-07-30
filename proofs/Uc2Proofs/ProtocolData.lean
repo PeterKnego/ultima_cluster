@@ -148,7 +148,8 @@ structure World (n : Nat) where
 def World.init (n : Nat) : World n :=
   { nodes := fun _ =>
       { pn := { currentTerm := 0, votedFor := none, role := .follower,
-                votesReceived := ∅, lastTerm := 0, durable := 0 },
+                votesReceived := ∅, lastTerm := 0, durable := 0,
+                smDurable := 0 },
         termMap := [], hist := fun _ => none, dataTerm := 0 },
     sent := [], dsent := [] }
 
@@ -160,6 +161,9 @@ def Node.recvReplicate {n : Nat} (d : Node n) (pos t v : Nat) : Node n :=
   { pn := { d.pn with
       lastTerm := lastTermOf (observeTerm d.termMap t pos)
       durable := pos + 1 }
+      -- Issue #7: `smDurable` is deliberately NOT touched. A counter advance is
+      -- the archive fsyncing; the consensus agent learns of it only on its own
+      -- duty cycle (`absorbDurable`). That lag IS the modelled phenomenon.
     termMap := observeTerm d.termMap t pos
     hist := Function.update d.hist pos (some (t, v))
     dataTerm := d.dataTerm }
@@ -182,13 +186,14 @@ def Node.applyGossip {n : Nat} (d : Node n) (t : Nat) (entries : TermMap) :
   match reconcile d.termMap d.pn.durable entries with
   | .ok o =>
     { pn := { (if d.pn.currentTerm < t then d.pn.adoptTerm t else d.pn) with
-                lastTerm := lastTermOf o.newMap, durable := o.validUpTo }
+                lastTerm := lastTermOf o.newMap, durable := o.validUpTo,
+                smDurable := min d.pn.smDurable o.validUpTo }
       termMap := o.newMap
       hist := fun p => if p < o.validUpTo then d.hist p else none
       dataTerm := if d.pn.currentTerm < t then t else d.dataTerm }
   | .noCommonPrefix =>
     { pn := { (if d.pn.currentTerm < t then d.pn.adoptTerm t else d.pn) with
-                lastTerm := 0, durable := 0 }
+                lastTerm := 0, durable := 0, smDurable := 0 }
       termMap := []
       hist := fun _ => none
       dataTerm := if d.pn.currentTerm < t then t else d.dataTerm }
@@ -200,7 +205,13 @@ election mirrors defer to `Uc2Proofs/Protocol.lean`'s originals. -/
 inductive Step {n : Nat} : World n → World n → Prop
   /-- `Uc2.Step.startElection` on `pn` (`election.rs::start_election`
   974–1001). The broadcast credentials `(lastTerm, durable)` are now the REAL
-  derived values, no longer havoc payload. -/
+  derived values, no longer havoc payload.
+
+  Issue #7: the advertised credential is `smDurable`, the consensus agent's
+  ABSORBED copy — `start_election` reads `ElectionSm::durable`, not the counter.
+  Under-advertising is conservative (it loses elections, it cannot win one it
+  should not), which is exactly why the Rust fix left this side alone and
+  re-read the counter on the GRANT side instead. -/
   | startElection (w : World n) (i : Fin n)
       (hrole : (w.nodes i).pn.role ≠ .leader) :
       Step w
@@ -213,7 +224,7 @@ inductive Step {n : Nat} : World n → World n → Prop
                 votesReceived := {i} } }
           sent := w.sent ++
             [.requestVote i ((w.nodes i).pn.currentTerm + 1)
-              (w.nodes i).pn.lastTerm (w.nodes i).pn.durable]
+              (w.nodes i).pn.lastTerm (w.nodes i).pn.smDurable]
           dsent := w.dsent }
   /-- `Uc2.Step.deliverRequestVote` on `pn` (`election.rs` 600–627,
   `handle_request_vote` 1202–1227). The voter's `logOk` inputs are real.
@@ -281,6 +292,7 @@ inductive Step {n : Nat} : World n → World n → Prop
             { pn := { (w.nodes i).pn with
                 role := .leader
                 lastTerm := (w.nodes i).pn.currentTerm }
+              -- counter — `Action::BecomeLeader`'s `base` is `ElectionSm::durable`.
               termMap := prunePush (w.nodes i).termMap
                 (w.nodes i).pn.currentTerm (w.nodes i).pn.durable
               hist := (w.nodes i).hist
@@ -300,6 +312,21 @@ inductive Step {n : Nat} : World n → World n → Prop
               pn :=
                 { (w.nodes i).pn with role := .follower, votesReceived := ∅ }
               dataTerm := (w.nodes i).pn.currentTerm }
+          sent := w.sent
+          dsent := w.dsent }
+  /-- Issue #7: the consensus agent's duty cycle absorbing the durable counter
+  into `ElectionSm` (`Consensus::do_work` step 2 / `refresh_durable` in
+  `uc2_node`). The ONLY way `smDurable` catches up with `durable`, and the
+  reason it can lag at all: in the real node the counter is advanced by the
+  archive agent, READ AND REPORTED by the receiver agent, and absorbed here by
+  a third thread on its own schedule. Collapsing those into one value is what
+  made the acked-write loss fixed in `main` 26d4827 inexpressible. -/
+  | absorbDurable (w : World n) (i : Fin n) :
+      Step w
+        { nodes := Function.update w.nodes i
+            { w.nodes i with
+              pn := { (w.nodes i).pn with
+                        smDurable := (w.nodes i).pn.durable } }
           sent := w.sent
           dsent := w.dsent }
   /-- Leader append (decision 3): a `.leader` stamps `(currentTerm, v)` at its
@@ -435,7 +462,8 @@ private theorem applyGossip_pn {n : Nat} (d : Node n) (t : Nat)
     (d.applyGossip t entries).pn
       = { (if d.pn.currentTerm < t then d.pn.adoptTerm t else d.pn) with
           lastTerm := (d.applyGossip t entries).pn.lastTerm,
-          durable := (d.applyGossip t entries).pn.durable } := by
+          durable := (d.applyGossip t entries).pn.durable,
+          smDurable := (d.applyGossip t entries).pn.smDurable } := by
   cases hrec : reconcile d.termMap d.pn.durable entries <;>
     simp [Node.applyGossip, hrec]
 
@@ -472,19 +500,24 @@ theorem step_project {n : Nat} {w w' : World n} (h : Step w w') :
           { w.project.nodes i with role := .leader },
          sent := w.project.sent } : Uc2.World n)
       i (w.nodes i).pn.currentTerm (w.nodes i).pn.durable
+      (w.nodes i).pn.smDurable
     simp only [Function.update_idem, Function.update_self] at h2
     exact h2
+  | absorbDurable i =>
+    rw [project_mk]
+    exact .single (Uc2.Step.absorbDurable w.project i)
   | crashRestart i =>
     rw [project_mk]
     exact .single (Uc2.Step.crashRestart w.project i)
   | leaderAppend i v hrole =>
     rw [project_mk]
     exact .single (Uc2.Step.havocData w.project i (w.nodes i).pn.lastTerm
-      ((w.nodes i).pn.durable + 1))
+      ((w.nodes i).pn.durable + 1) (w.nodes i).pn.smDurable)
   | deliverReplicate j pos hdr t v hmsg hpos hhdr =>
     rw [project_mk]
     exact .single (Uc2.Step.havocData w.project j
-      (lastTermOf (observeTerm (w.nodes j).termMap t pos)) (pos + 1))
+      (lastTermOf (observeTerm (w.nodes j).termMap t pos)) (pos + 1)
+      (w.nodes j).pn.smDurable)
   | serveTail i p t v hrole hhist hp =>
     exact .refl
   | shipTermMap i hrole =>
@@ -500,12 +533,14 @@ theorem step_project {n : Nat} {w w' : World n} (h : Step w w') :
            sent := w.project.sent } : Uc2.World n)
         j ((w.nodes j).applyGossip t entries).pn.lastTerm
         ((w.nodes j).applyGossip t entries).pn.durable
+        ((w.nodes j).applyGossip t entries).pn.smDurable
       simp only [Function.update_idem, Function.update_self] at h2
       exact h2
     · rw [if_neg hadopt]
       exact .single (Uc2.Step.havocData w.project j
         ((w.nodes j).applyGossip t entries).pn.lastTerm
-        ((w.nodes j).applyGossip t entries).pn.durable)
+        ((w.nodes j).applyGossip t entries).pn.durable
+        ((w.nodes j).applyGossip t entries).pn.smDurable)
 
 /-- Boot projects to boot. -/
 theorem project_init (n : Nat) :
