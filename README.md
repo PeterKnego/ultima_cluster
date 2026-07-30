@@ -30,6 +30,16 @@ Every gate record commits its pass/fail rule to the repository *before* the run.
   [gate record](/docs/benchmarks/uc2-m8-gate-2026-07-29.md). Wire protocol 0.4.0,
   unreleased.
 
+## Try it
+
+```bash
+cargo run -p counter --bin counter-single
+```
+
+A replicated counter — node, service, and client in one process. For a real
+three-node cluster, a leader kill, and a follower read that proves replication
+happened, see **[`docs/QUICKSTART.md`](/docs/QUICKSTART.md)**.
+
 ## Shape
 
 ```
@@ -121,6 +131,9 @@ suite (capstones, sim-heavy, loom, crashtest).
 
 Start here:
 
+- **[`docs/QUICKSTART.md`](/docs/QUICKSTART.md)** — zero to a running three-node
+  cluster, with the state machine you write shown in full. Every command and
+  output is from a real run.
 - **[`docs/ARCHITECTURE.md`](/docs/ARCHITECTURE.md)** — how it works: positions
   instead of indices, the four agents, the data and control planes, the apply
   path. Written for someone who knows Raft and has not read the specs.
