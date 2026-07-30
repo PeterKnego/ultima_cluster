@@ -69,7 +69,13 @@ bytes for a range the buffer now holds *new* bytes for. A follower that falls fa
 enough behind is served from the journal. That is the real hazard; the crash was
 just the tripwire that led us to it.
 
-## An open question this leaves behind
+## An open question this left behind — since investigated, and it was a real bug
+
+*Resolved 2026-07-30, after this note was first written. The section below is the
+original open question; the answer follows it. Both are kept because the shape of
+the wrong guess is instructive.*
+
+
 
 If `base` is a stale durable sample, the collapse discards bytes this node had
 already made durable. Were any of them **committed**? A new leader whose log is
@@ -94,10 +100,79 @@ That is a *different* bug from the one this note is about, in a different plane
 un-excluded, because the obvious safety argument fails. It predates the fix
 described below and is unaffected by it. Tracked as a follow-up on issue #6.
 
-Worth noting what the fix changes about it: before, the collapse dropped those
-bytes from the buffer but silently left them in the journal, so the node's two
-stores disagreed. Now they agree. That is strictly better for reasoning about
-the system, even though it does not make the underlying question go away.
+### The answer: real, and I had the location wrong
+
+It is reachable, and the demonstration is deterministic. But the framing above
+puts the defect in the wrong place, which is worth correcting because the wrong
+version is the more natural one to reach for.
+
+**The collapse is not the bug.** A stale-low `base` is *conservative* for the
+candidate — it makes it look less caught-up than it is. The bug is in the
+**grant**. `log_ok` compares a candidate against `ElectionSm::durable`, and Raft's
+vote rule is sound only if a voter compares against everything the voter has
+durably stored. The shared counter is that. An absorbed copy of it, taken up to a
+duty cycle earlier, is not. Granting on an under-estimate of your own log is the
+unsafe direction: it lets a candidate that is behind a committed position collect
+your vote. The collapse then merely executes the loss that the grant authorised.
+
+The full chain, three nodes all in term 2:
+
+1. B's archive fsyncs to 1000. B's *receiver* agent reports 1000 to leader A on
+   its own thread. B's `ElectionSm.durable` still says 900 — the consensus agent
+   drains network events before it polls the counter.
+2. A (own durable 1000) ranks B's report and commits 1000. The client is acked.
+3. C, honestly at 900, campaigns advertising 900.
+4. A refuses. **B grants** — `(2,900) >= (2,900)` is a tie, and `log_ok_order`
+   grants on `>=`. B compared against its stale self-view, not the 1000 it had
+   already reported.
+5. C wins on B's vote alone and collapses to 900. The acked write is gone.
+
+**Fixed** by re-absorbing the counter immediately before the grant decision, and
+at the top of the duty cycle so that candidates advertise on the same footing —
+fixing only the grant side would leave candidates systematically
+under-advertising against voters who compare fresh, losing elections for no
+reason. Regression test
+`a_vote_is_refused_against_a_fresh_read_of_our_own_log`, red-verified.
+
+### Why nothing caught it, which is the more interesting half
+
+Four layers of correctness machinery, and the bug was invisible to all of them —
+not by bad luck, but because each one collapses the very distinction that carries
+it.
+
+**The simulator** advances a node's durable and feeds `DurableAdvanced` into the
+state machine as consecutive statements in one archive event, and derives the
+follower's commit report from that same value. Its scheduler only interleaves at
+event boundaries, and it has no consensus-agent event at all — so "the receiver
+reads the counter, the consensus agent reads it a cycle later" has no counterpart
+to schedule apart. Its invariants are perfectly adequate: `committed-never-truncated`
+and `leader completeness` are exactly Raft State-Machine-Safety and are fed real
+node state. The oracles would have convicted. The world simply cannot produce the
+trace.
+
+**The Lean model** does the same collapse, and there it is sharper. `PNode.durable`
+is one number playing all four roles — reported, compared, advertised, collapsed
+to. The lemma that a reported position is at most the reporter's durable is
+discharged *by reflexivity*, because in the model they are the same term. That
+lemma is then composed with `log_ok` to derive precisely the informal safety
+argument the bug refutes. A `leader_completeness` proof completed over that model
+would be completed over a model that assumes the bug away.
+
+And the model had already learned this lesson once. `dataTerm` exists as a
+separate field because collapsing the node's *term handle* into `currentTerm` hid
+a real hole. The durable counter has exactly the same shape — one model field
+standing for two independently-read node-level values — and had not been split.
+
+**The conformance harness** drives three pure kernels and never builds a state
+machine or an event sequence, so it operates entirely below the level at which
+the behaviour exists. It covers the `900 >= 900` tie thoroughly; the gap is
+*which* durable gets passed in.
+
+The generalizable lesson is the same one as the archive cursor, one level up.
+There, the mistake was reasoning about one of five writers of a counter. Here, it
+is modelling two readers of a counter as one. **A concurrent system's bugs live
+in the distinctions its model erases** — so when a model collapses two things
+into one, that collapse is a proof obligation, not a simplification.
 
 ## The fix, and the rule it encodes
 

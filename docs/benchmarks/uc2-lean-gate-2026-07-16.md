@@ -411,6 +411,62 @@ real gap in the Rust that the proof work surfaced but did not itself resolve.
    `docs/benchmarks/uc2-lean-phase2-spike-2026-07-17.md`'s **"Tier B(b)
    actuals + re-gate"** section.
 
+### Finding #12 — model-fidelity: `PNode.durable` collapses TWO independently-read node values (found 2026-07-30 from the Rust side; **real Rust bug, fixed**)
+
+**Not found by the proofs — found while investigating issue #6 and recorded here
+because it invalidates a load-bearing lemma.** In the Rust node the shared
+`durable` byte-position counter has two independent readers on two threads:
+
+- the **receiver** agent reads it directly and reports it to the leader, which
+  ranks those reports into `commit`
+  (`uc2_net/src/receiver.rs`, the `DGRAM_KIND_APPEND_POSITION` send);
+- the **consensus** agent polls it a duty cycle later into `ElectionSm::durable`
+  (`node.rs`, `Consensus::do_work`), which is what `log_ok` compares, what
+  `start_election` advertises, and what `become_leader` uses as `base`.
+
+So a voter could grant while comparing against a self-view LOWER than the value
+it had already reported for commit purposes — letting a candidate behind a
+committed position win and collapse below it (acked-write loss). Fixed in Rust
+by re-absorbing the counter immediately before the grant decision, and at the top
+of the duty cycle so candidates advertise symmetrically; regression test
+`a_vote_is_refused_against_a_fresh_read_of_our_own_log` (red-verified).
+
+**Why the model could not have caught it, and why that matters here.**
+`PNode.durable` (`Protocol.lean`) is ONE `Nat` serving all four roles; neither
+`ProtocolData` nor `ProtocolCommit` adds a second. The derived lemma
+`ReportEraFloor` (`StageB.lean`) — "a reported `d` is `≤` the reporter's
+durable" — has its `sendReport` case discharged by **`Nat.le_refl`**, because in
+the model `d` *is* `pn.durable`. `GrantReport` then composes that floor with
+`log_ok` (the `omega` in `StageB.lean`) to conclude `d ≤ cd`. **That composition
+is exactly the informal safety argument this bug refutes**, and it closes only
+because the two durables are literally the same term. Any future
+`leader_completeness` completed over the current model would be completed over a
+model that assumes this bug away.
+
+Secondary: under decision 4 ("fsync lag collapsed", `ProtocolData.lean`)
+`durable` IS the append frontier, so `base = durable` always and there are never
+bytes above `durable` to discard — the model has no collapse-discards-bytes step
+either.
+
+**This is the same shape as Finding #8**, which split `dataTerm` out of
+`currentTerm` after collapsing the node-level term handle hid a real hole. The
+durable counter has not been given the same treatment. Splitting it invalidates
+`ReportEraFloor`'s reflexivity proof and everything composed from it, so it is
+scoped as its own piece of work, not a patch. Note `bare_report_durable_stability_is_false`
+(`LcClosure.lean`) is NOT this: it breaks the same shape of statement via
+gossip-driven reconcile truncation, which `Era`-conditioning repairs — the Rust
+hazard needs no truncation, no gossip and no term change on the voter, so
+`Era`-conditioning does not exclude it.
+
+**`uc2_sim` is blind to it too**, and for a mirror-image reason: `world.rs`
+advances the node's durable and feeds `Event::DurableAdvanced` as consecutive
+statements in one `ArchiveStep` handler, with the commit report derived from the
+same value — and `SimEvent` has no consensus-agent step at all. The invariants
+(`inv4` committed-never-truncated, `inv5` leader completeness) WOULD catch the
+resulting loss; the world model cannot generate the trace. Making it expressible
+needs a `SimEvent::ConsensusStep` carrying `DurableAdvanced`, or a separate
+`Node.reported_durable` with a deferred feed.
+
 ### Restatements (recorded for completeness, not spec gaps)
 
 - `commit_certified_run` (C3, run form) was **strengthened**, not weakened: an

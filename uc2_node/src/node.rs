@@ -1588,6 +1588,13 @@ impl Consensus {
         }
         let mut did = false;
 
+        // 0. Absorb the durable counter BEFORE anything that reads our own log
+        // as a credential — `Event::Tick` may start a candidacy in step 4, and
+        // `start_election` advertises `ElectionSm::durable` as `last_durable`.
+        // Step 2 keeps its own call for advances that land mid-cycle. See
+        // `refresh_durable`.
+        did |= self.refresh_durable();
+
         // 1. Drain the NetEvent channel → SM events.
         for _ in 0..NET_DRAIN_PER_CYCLE {
             match self.net_rx.try_recv() {
@@ -1679,13 +1686,8 @@ impl Consensus {
         // Pre-issue-#6 this could not arise: `prime(base)` ran synchronously in
         // step 1, so step 2 always read the already-collapsed value. Splitting
         // the open across two cycles is what opened the window.
-        if self.pending_leader_open.is_none() {
-            let d = self.cnc.counters().durable.load_acquire();
-            if d != self.durable_seen {
-                self.durable_seen = d;
-                self.feed(Event::DurableAdvanced { durable: d });
-                did = true;
-            }
+        if self.refresh_durable() {
+            did = true;
         }
 
         // 3. Drain the in-process ingress queue (leader && serving only, the
@@ -3089,6 +3091,17 @@ impl Consensus {
             }
             NetEvent::RequestVote { from, body } => {
                 let Some(id) = self.addr_to_id.get(&from).copied() else { return };
+                // Re-absorb the durable counter IMMEDIATELY before the grant
+                // decision. `log_ok` compares the candidate against
+                // `ElectionSm::durable`, and Raft's vote rule is sound only if
+                // that reflects everything we have durably stored — which the
+                // counter does and a copy taken earlier in this cycle may not.
+                // Once per cycle is NOT enough: the archive can advance the
+                // counter (and the receiver agent report the new value toward
+                // the leader's commit ranking) between the top-of-cycle refresh
+                // and this datagram's turn in the drain loop. See
+                // `refresh_durable`.
+                self.refresh_durable();
                 Event::RequestVote {
                     from: id,
                     new_term: body.new_term,
@@ -3713,6 +3726,46 @@ impl Consensus {
     /// reopen fires only if no newer term is itself awaiting reconcile (a term
     /// adopted mid-truncation re-armed `awaiting_reconcile`, and its fresh
     /// reconcile in the new term must complete first).
+    /// Absorb the shared `durable` counter into `ElectionSm`. Returns whether
+    /// anything moved.
+    ///
+    /// **This must run immediately before any decision that reads
+    /// `ElectionSm::durable` as "our log".** That counter has two independent
+    /// readers on two threads: the RECEIVER agent reads it directly and reports
+    /// it to the leader, which ranks those reports into `commit`
+    /// (`uc2_net/src/receiver.rs`, the `DGRAM_KIND_APPEND_POSITION` send); this
+    /// is the consensus agent's absorbed copy. Raft's vote rule is only sound if
+    /// a voter compares a candidate against everything the voter has DURABLY
+    /// STORED — and the counter is that, while a stale copy of it is not.
+    ///
+    /// Granting on an UNDER-estimate of our own log is the unsafe direction: it
+    /// lets a candidate that is behind a committed position collect our vote,
+    /// win, and collapse the log below that commit — acked-write loss. See
+    /// `a_vote_is_granted_against_a_stale_self_view_of_our_own_log`.
+    ///
+    /// Symmetry matters as much as freshness: `start_election` advertises this
+    /// same field as `last_durable`, so refreshing only the GRANT side would
+    /// leave candidates systematically under-advertising against voters who
+    /// compare fresh — elections lost for no reason. Hence the call at the top
+    /// of the duty cycle (before `Event::Tick` can start a candidacy) as well as
+    /// the one immediately before answering a `RequestVote`.
+    ///
+    /// The `pending_leader_open` guard is issue #6's: mid-collapse the counter
+    /// still holds the pre-cut frontier while `base` is the authoritative one,
+    /// and `base` IS `sm.durable`, so leaving it alone is exactly right.
+    fn refresh_durable(&mut self) -> bool {
+        if self.pending_leader_open.is_some() {
+            return false;
+        }
+        let d = self.cnc.counters().durable.load_acquire();
+        if d == self.durable_seen {
+            return false;
+        }
+        self.durable_seen = d;
+        self.feed(Event::DurableAdvanced { durable: d });
+        true
+    }
+
     /// Issue #6, leader open phase 2: the archive finished the collapse to
     /// `base` — it cut its journal there, reset its own `durable_pos`, and
     /// primed the counters. Only NOW is it safe to write into the buffer: the
@@ -4950,6 +5003,65 @@ mod tests {
             h.cons.cnc.counters().append.load_acquire(),
             to,
             "no NewTerm frame was appended"
+        );
+    }
+
+    /// REGRESSION (issue #6 follow-up): a node must not grant a vote by
+    /// comparing the candidate against a STALE self-view of its own log.
+    ///
+    /// The shared `durable` counter has two independent readers on two threads.
+    /// The RECEIVER agent reads it and reports it to the leader, which ranks
+    /// those reports into `commit` (`uc2_net/src/receiver.rs`, the
+    /// `DGRAM_KIND_APPEND_POSITION` send reads `counters().durable` directly).
+    /// The CONSENSUS agent polls the same counter in `do_work` step 2 and feeds
+    /// `DurableAdvanced` into `ElectionSm.durable` — the field `log_ok` compares
+    /// against. Step 1 drains network events (including `RequestVote`) BEFORE
+    /// step 2 refreshes that field, so a vote decision can use a self-view a
+    /// full duty cycle behind what this node already reported for commit.
+    ///
+    /// Granting on an UNDER-estimate of our own log is the unsafe direction: it
+    /// lets a candidate that is behind a committed position collect our vote,
+    /// win, and collapse the log below that commit — acked-write loss.
+    ///
+    /// Driven through `feed_net`, not `feed`, because the fix is the fresh
+    /// absorb on the network path; a test that fed `Event::RequestVote` directly
+    /// would bypass it and pass either way.
+    #[test]
+    fn a_vote_is_refused_against_a_fresh_read_of_our_own_log() {
+        let mut h = harness();
+        let addr0: SocketAddr = "127.0.0.1:9100".parse().unwrap(); // member 0
+        // Harness seed: term map [(1,0),(2,4096)], durable 6016 — the SM's
+        // `(our_term, our_durable)` is `(2, 6016)`.
+        let boot = 6016;
+        // The archive fsyncs another block: the COUNTER moves. The receiver agent
+        // reports 10112 to the leader on its own thread, and the leader may rank
+        // it into `commit`. The consensus agent has not absorbed it yet.
+        let fsynced = boot + 4096;
+        h.cons.cnc.counters().durable.store_release(fsynced);
+
+        // A candidate level with our STALE view and 4096 bytes behind our real
+        // one. Pre-fix this was GRANTED (a tie under `log_ok_order`'s `>=`).
+        h.cons.feed_net(NetEvent::RequestVote {
+            from: addr0,
+            body: RequestVoteBody { new_term: 9, last_term: 2, last_durable: boot },
+        });
+        assert_ne!(
+            h.cons.state.vote().map(|v| (v.term, v.voted_for)),
+            Some((9, 0)),
+            "granted to a candidate at {boot} while our own durable counter stood at \
+             {fsynced} — it could win and collapse below a commit our report certified"
+        );
+
+        // Nothing is broken about granting per se: a candidate that really is
+        // caught up still gets the vote.
+        h.cons.feed_net(NetEvent::RequestVote {
+            from: addr0,
+            body: RequestVoteBody { new_term: 10, last_term: 2, last_durable: fsynced },
+        });
+        assert_eq!(
+            h.cons.state.vote().map(|v| (v.term, v.voted_for)),
+            Some((10, 0)),
+            "a candidate level with our REAL durable must still be granted"
         );
     }
 
