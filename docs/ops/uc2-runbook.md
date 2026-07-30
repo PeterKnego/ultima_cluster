@@ -226,13 +226,23 @@ field). Operators: serialize admin clients (`uc2ctl`, `m7_gate`) per instance di
 
 ### `uc2ctl` — the five ops
 
+`uc2ctl` is a normal binary in the workspace, so an operator host can install it
+once rather than building from a checkout each time:
+
 ```text
-cargo run -p uc2_node --example uc2ctl -- add-learner   --instance-dir D --app-id A --id N --addr ip:port
-cargo run -p uc2_node --example uc2ctl -- promote        --instance-dir D --app-id A --id N
-cargo run -p uc2_node --example uc2ctl -- demote         --instance-dir D --app-id A --id N
-cargo run -p uc2_node --example uc2ctl -- remove-learner --instance-dir D --app-id A --id N
-cargo run -p uc2_node --example uc2ctl -- remove-voter   --instance-dir D --app-id A --id N
-cargo run -p uc2_node --example uc2ctl -- status         --instance-dir D --app-id A
+cargo install --path uc2ctl        # then just: uc2ctl status --instance-dir D --app-id A
+```
+
+It reaches the node through the instance directory's shared memory, not the
+network, so **it must run on the same host as the node it administers.**
+
+```text
+cargo run -p uc2ctl -- add-learner   --instance-dir D --app-id A --id N --addr ip:port
+cargo run -p uc2ctl -- promote        --instance-dir D --app-id A --id N
+cargo run -p uc2ctl -- demote         --instance-dir D --app-id A --id N
+cargo run -p uc2ctl -- remove-learner --instance-dir D --app-id A --id N
+cargo run -p uc2ctl -- remove-voter   --instance-dir D --app-id A --id N
+cargo run -p uc2ctl -- status         --instance-dir D --app-id A
 ```
 
 Point `--instance-dir` at **any** node in the cluster, not necessarily the
