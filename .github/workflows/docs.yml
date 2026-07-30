@@ -1,0 +1,84 @@
+name: docs
+
+# Publishes rustdoc for the workspace's library crates to GitHub Pages on every
+# push to main. `ultima_cluster` is not on crates.io, so there is no docs.rs to
+# render its API — without this, reading the API means cloning and running
+# `cargo doc` yourself.
+#
+# Deliberately NOT gated on rustdoc warnings: the tree carries pre-existing
+# intra-doc-link warnings, and a docs *deploy* is the wrong place to discover
+# them. Add `RUSTDOCFLAGS: -D warnings` here once they are cleared, or gate them
+# in ci.yml where a failure blocks the PR that caused it.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, and never cancel one midway — a half-published site is
+# worse than a stale one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+
+      # --lib drops the bins (uc2ctl is an operator CLI, not an API), and the
+      # two example crates are excluded outright. `-F uc2_service/ultima_db`
+      # documents the StoreStateMachine adapter, which the default build never
+      # compiles — same reasoning as ci.yml's second clippy pass.
+      - name: Build rustdoc
+        run: >
+          cargo doc --workspace --no-deps --lib
+          --exclude counter --exclude uc2-crashtest
+          -F uc2_service/ultima_db
+
+      - name: Install the landing page
+        run: cp .github/pages/index.html target/doc/index.html
+
+      # A workspace produces no root index, so the landing page is hand-written
+      # — which means it can silently fall behind a newly added crate. Fail
+      # loudly instead: a crate that ships without a link is unreachable from
+      # the front door, and nobody would notice.
+      - name: Guard against landing-page drift
+        run: |
+          missing=0
+          for dir in target/doc/*/; do
+            crate=$(basename "$dir")
+            case "$crate" in src|static.files|trait.impl|type.impl|search.index) continue ;; esac
+            [ -f "$dir/index.html" ] || continue
+            if ! grep -q "\"$crate/index.html\"" target/doc/index.html; then
+              echo "::error::crate '$crate' is documented but not linked from .github/pages/index.html"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

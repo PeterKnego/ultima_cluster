@@ -1,7 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! UC v2 service-side SDK (M5, spec §7).
+//! The service SDK: where your state machine runs.
+//!
+//! This is the crate you write against. Implement [`StateMachine`] — a
+//! synchronous, deterministic `apply` and `query` — and
+//! [`ServiceBuilder::start`] attaches it to a running node and begins applying
+//! the committed log. See `docs/QUICKSTART.md` for a complete example, and
+//! `examples/counter/src/lib.rs` for the smallest useful state machine.
+//!
+//! `apply` must be deterministic: same state plus same command must produce the
+//! same next state on every replica, forever. No clocks, no randomness, no I/O.
+//! Side effects that genuinely need the outside world belong in
+//! [`OutputHandler`] (async, leader-only, at-least-once).
 //!
 //! The user implements [`StateMachine`] (sync, deterministic `apply`/`query`)
 //! and optionally [`OutputHandler`] (async, leader-only side effects, Task 12).

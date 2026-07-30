@@ -16,13 +16,23 @@
 //! `app_id` check, one JSON-ish/plain-text report line, exit code carries the
 //! verdict (`0` = accepted, `1` = refused/timeout/attach error).
 //!
+//! Runs on the SAME HOST as the node it administers — it reaches the node
+//! through shared memory, not the network, so there is no remote mode. The
+//! fleet orchestrator ssh's to each host and invokes it locally.
+//!
 //! ```text
-//! cargo run -p uc2_node --example uc2ctl -- add-learner --instance-dir D --app-id A --id 4 --addr 127.0.0.1:5004
-//! cargo run -p uc2_node --example uc2ctl -- promote        --instance-dir D --app-id A --id 4
-//! cargo run -p uc2_node --example uc2ctl -- demote         --instance-dir D --app-id A --id 4
-//! cargo run -p uc2_node --example uc2ctl -- remove-learner --instance-dir D --app-id A --id 4
-//! cargo run -p uc2_node --example uc2ctl -- remove-voter   --instance-dir D --app-id A --id 4
-//! cargo run -p uc2_node --example uc2ctl -- status         --instance-dir D --app-id A
+//! uc2ctl add-learner    --instance-dir D --app-id A --id 4 --addr 127.0.0.1:5004
+//! uc2ctl promote        --instance-dir D --app-id A --id 4
+//! uc2ctl demote         --instance-dir D --app-id A --id 4
+//! uc2ctl remove-learner --instance-dir D --app-id A --id 4
+//! uc2ctl remove-voter   --instance-dir D --app-id A --id 4
+//! uc2ctl status         --instance-dir D --app-id A
+//! ```
+//!
+//! From a source checkout, without installing:
+//!
+//! ```text
+//! cargo run -p uc2ctl -- status --instance-dir D --app-id A
 //! ```
 
 use std::path::PathBuf;
@@ -42,7 +52,11 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Parser)]
-#[command(name = "uc2ctl", about = "UC v2 M7 admin CLI: live cluster reconfiguration")]
+#[command(
+    name = "uc2ctl",
+    version,
+    about = "ultima_cluster admin CLI: live cluster reconfiguration"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

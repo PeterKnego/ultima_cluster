@@ -5,15 +5,8 @@ server**: Raft-style consensus safety over a shared-memory log buffer, with the
 user's deterministic business logic running in a separate process at
 memory-channel speed.
 
-**Status: v2.0** — milestones M1–M6 complete, every gate passed on real
-hardware. Measured on a 3×`c6id.2xlarge` AWS fleet (fsync on, linearizable):
-
-**M7 (live single-server reconfiguration)** is implemented and green on the
-full local proof stack (sim invariants, WGL capstones incl. a reconfig-churn
-arm, crashtest, multi-process `--local` orchestrator run) — see
-[`docs/benchmarks/uc2-m7-gate-2026-07-13.md`](docs/benchmarks/uc2-m7-gate-2026-07-13.md).
-The 5-host fleet run (the gate's headline number) is a separate,
-user-approved step; `v2.1.0` is tagged only once it lands.
+**Status: v2.0**, milestones M1–M6 complete. Every gate below passed on a
+3×`c6id.2xlarge` AWS fleet with fsync on and linearizable reads:
 
 | Gate | Result |
 |---|---|
@@ -22,6 +15,30 @@ user-approved step; `v2.1.0` is tagged only once it lands.
 | Leader failover (M4) | p50 202 ms, 10/10 zero committed loss |
 | Learner join under load (M6, 4-host) | commit-rate dip **0.9 %** (gate < 10 %) |
 | Below-floor snapshot reconstruction (M6) | worst **2.80 s** across 5 purge cycles, zero read divergence |
+
+Every gate record commits its pass/fail rule to the repository *before* the run.
+
+**Since v2.0:**
+
+- **M7 — live single-server reconfiguration.** Implemented and green on the full
+  local proof stack (sim invariants, WGL capstones including a reconfig-churn arm,
+  crashtest, multi-process orchestrator run) —
+  [gate record](/docs/benchmarks/uc2-m7-gate-2026-07-13.md). The 5-host fleet run is
+  a separate step; `v2.1.0` is tagged only once it lands.
+- **M8 — opt-in wire crypto.** Authenticated and encrypted node↔node UDP, off by
+  default; **PASS** at 94.1% of cleartext throughput —
+  [gate record](/docs/benchmarks/uc2-m8-gate-2026-07-29.md). Wire protocol 0.4.0,
+  unreleased.
+
+## Try it
+
+```bash
+cargo run -p counter --bin counter-single
+```
+
+A replicated counter — node, service, and client in one process. For a real
+three-node cluster, a leader kill, and a follower read that proves replication
+happened, see **[`docs/QUICKSTART.md`](/docs/QUICKSTART.md)**.
 
 ## Shape
 
@@ -42,7 +59,7 @@ Raft log index). No locks on the hot path; no async in the consensus core.
   own reliable UDP (NAK repair served from the buffer, quorum-paced flow
   control). Consensus is a control plane: coalesced durable-position gossip.
 - **Durability** is the archive agent recording the buffer into
-  [`ultima_journal`](ultima_journal/) in ≤1 MiB CRC'd blocks, fsync per block.
+  [`ultima_journal`](/ultima_journal) in ≤1 MiB CRC'd blocks, fsync per block.
 - **Your code** implements a sync, deterministic `StateMachine`
   (`apply(position, cmd)`, `query`) — optionally `SnapshotStateMachine`
   (enables journal purge) and an async leader-only `OutputHandler`. The apply
@@ -56,21 +73,27 @@ Raft log index). No locks on the hot path; no async in the consensus core.
 
 ## Correctness story
 
-Three independent layers, all in CI:
+Machine-checked proofs, checked properties, and bug-hunting — kept clearly
+separated, because those words mean very different things.
 
-1. **Deterministic simulation** (`uc2_sim`) — virtual-time cluster with safety
-   invariants (no split-brain, no phantom commit, no divergent adoption) under
-   seeded fault fuzz; the election/truncation state machine is pure-sync and
-   fully sim-driven.
-2. **WGL linearizability capstones** (`uc-lincheck` + `uc2_node/tests`) — a
-   concurrent CAS-register history checked for linearizability while the
-   harness kills leaders, crashes services, partitions the network, and (the
-   M6 tier) runs snapshot-backed purge underneath.
-3. **Multi-process hard-crash** (`examples/uc2-crashtest`) — real node +
-   service processes SIGKILLed mid-load, recovery required to stay linearizable.
+- **Proved (Lean 4, sorry-free, standard axioms only):** the consensus safety
+  kernels; `election_safety` and `log_matching` over an N-node protocol model. A
+  conformance rig replays 100,000+ vectors of *real Rust output* through the Lean
+  model and diffs it bit for bit. `leader_completeness` is reduced to one named
+  obligation and remains **open**.
+- **Checked:** nine whole-cluster invariants under seeded fault fuzz (`uc2_sim`);
+  WGL linearizability under leader kills, partitions, and purge; Elle
+  transactional safety under both the serializable and strict real-time models,
+  with a mutation tier proving the harness can actually fail; multi-process
+  `SIGKILL` recovery; a `loom` model of frame visibility.
+- **Bug-hunted only:** Veil bounded model checking — deliberately excluded from
+  the trust story and never the proof of record.
 
-Plus a `loom` model of the frame-visibility protocol and offset-pin tests that
-freeze the wire and cnc layouts.
+The proof effort has found and fixed **four real, shipped safety bugs** that the
+fuzz and crash tiers had missed, two of them acked-write-loss class.
+
+**→ [`docs/VERIFICATION.md`](/docs/VERIFICATION.md)** for the full picture,
+including what is *not* verified and how to reproduce every layer.
 
 ## Workspace
 
@@ -106,12 +129,29 @@ suite (capstones, sim-heavy, loom, crashtest).
 
 ## Documentation
 
-- **Design specs (canonical):** [`docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md`](docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md) (M1–M6) + [`docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md`](docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md) (M7)
-- **Milestone gate records:** [`docs/benchmarks/`](docs/benchmarks/) (`uc2-m1` … `uc2-m7`)
-- **Operations runbook:** [`docs/ops/uc2-runbook.md`](docs/ops/uc2-runbook.md) — instance-dir layout, durability requirements, cnc decoding, purge enablement, live reconfiguration ops (`uc2ctl`)
-- **v1 history:** [`docs/tasks/`](docs/tasks/) — the retired openraft-based v1 stack's consolidated record (kept as the negative-results archive that shaped v2)
+Start here:
 
-Bench/fleet tooling lives under [`bench-infra/`](bench-infra/) (terraform +
+- **[API documentation](https://peterknego.github.io/ultima_cluster/)** — rustdoc
+  for every library crate, rebuilt on each push to `main`.
+- **[`docs/QUICKSTART.md`](/docs/QUICKSTART.md)** — zero to a running three-node
+  cluster, with the state machine you write shown in full. Every command and
+  output is from a real run.
+- **[`docs/ARCHITECTURE.md`](/docs/ARCHITECTURE.md)** — how it works: positions
+  instead of indices, the four agents, the data and control planes, the apply
+  path. Written for someone who knows Raft and has not read the specs.
+- **[`docs/VERIFICATION.md`](/docs/VERIFICATION.md)** — what is proved, what is
+  checked, what is only bug-hunted, and how to reproduce each.
+- **[`docs/ops/uc2-runbook.md`](/docs/ops/uc2-runbook.md)** — operations:
+  instance-dir layout, durability requirements, cnc decoding, purge enablement,
+  live reconfiguration (`uc2ctl`), wire crypto setup.
+
+Reference:
+
+- **Design specs (canonical):** [`docs/superpowers/specs/`](/docs/superpowers/specs) — [the v2 core design](/docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md) (M1–M6), [reconfiguration](/docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md) (M7), [wire crypto](/docs/superpowers/specs/2026-07-28-uc2-wire-crypto-design.md) (M8)
+- **Milestone gate records:** [`docs/benchmarks/`](/docs/benchmarks) (`uc2-m1` … `uc2-m8`)
+- **v1 history:** [`docs/tasks/`](/docs/tasks) — the retired openraft-based v1 stack's consolidated record (kept as the negative-results archive that shaped v2)
+
+Bench/fleet tooling lives under [`bench-infra/`](/bench-infra) (terraform +
 ansible + the fleet-gate orchestrator; refuses to run journal-bearing gates on
 RAM-backed filesystems).
 
@@ -122,8 +162,16 @@ promote / demote / add / remove one member at a time, live, under load, via
 the `uc2ctl` admin CLI. Joint consensus is not needed for the supported ops
 (adjacent configs differ by one member, so majorities always intersect). Hard
 cap: **8 total members** (voters + learners) in the cnc observability band —
-unchanged from v2.0. Trusted-network posture — no wire encryption (a PSK-MAC
-slot is reserved in the datagram header). One node per instance directory.
+unchanged from v2.0. One node per instance directory.
+
+**Wire security (M8)**: authenticated + encrypted node↔node UDP is available and
+**off by default** — X25519 identities on a runtime-reloadable allowlist, Noise
+`IK` handshake, a rotating cluster group key for the byte-identical fan-out,
+24 B/datagram overhead. A cluster runs either all-encrypted or all-cleartext;
+there is no mixed mode. With crypto disabled the posture is a trusted private
+network. The threat model is a network-path adversary; a compromised host and a
+malicious cluster member are explicitly out of model (see
+[`docs/VERIFICATION.md`](/docs/VERIFICATION.md) §10 and runbook §11).
 
 ## License
 

@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! UC v2 replication data plane (M2).
-//! Spec: docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md §5.
+//! The replication data plane: reliable UDP with NAK repair, quorum-paced flow
+//! control, and journal replay sessions.
+//!
+//! Datagrams are self-locating — each carries the absolute stream position of
+//! its first byte — so a follower writes them straight into its own log buffer
+//! at the right offset, and duplicates or reordering are idempotent by
+//! construction. Loss is repaired by NAK, served by re-reading the log buffer.
+//!
+//! Spec: `docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md` §5.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;

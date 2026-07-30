@@ -337,17 +337,27 @@ class SshHost:
         # orchestrator — a forwarded agent hangs ssh here, bench-infra gotcha).
         return subprocess.run(self.ssh + [self.target, cmd], text=True, **kw)
 
-    def prepare(self, examples=("m6_gate",)):
+    def prepare(self, examples=("m6_gate",), bins=()):
         """Build the given examples (release builds no examples by default),
         create the instance-dir parent, and report its filesystem type (the
         journal lives under the instance dir — a tmpfs here would silently void
         every durability claim, so the caller hard-fails on volatile fs types).
         Idempotent; ~9 s on a warm target per example."""
         example_flags = " ".join(f"--example {e}" for e in examples)
+        env = "sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup"
+        # `uc2ctl` is its own workspace crate (a real bin, not a uc2_node
+        # example), so it needs a second `-p` build; its artifact lands in
+        # target/release/ rather than target/release/examples/.
+        bin_build = (
+            f" && {env} {self.CARGO} build --release "
+            f"--manifest-path {self.UC_SRC}/Cargo.toml "
+            + " ".join(f"-p {b}" for b in bins)
+        ) if bins else ""
         r = self._ssh(
-            f"sudo env CARGO_HOME=/opt/bench/.cargo RUSTUP_HOME=/opt/bench/.rustup "
+            f"{env} "
             f"{self.CARGO} build --release {example_flags} "
             f"--manifest-path {self.UC_SRC}/Cargo.toml -p uc2_node "
+            f"{bin_build} "
             f"&& sudo mkdir -p {self.remote_root} "
             f"&& echo FSTYPE=$(stat -f -c %T {self.remote_root}) && echo PREPARED",
             capture_output=True,
@@ -1616,10 +1626,11 @@ def main():
             M7_LOAD_ARGS = ["--rate", "300"]
 
     if args.local:
-        local_examples = "/home/claude/.cache/cargo-target/release/examples"
+        local_release = "/home/claude/.cache/cargo-target/release"
+        local_examples = f"{local_release}/examples"
         gate = args.bin or f"{local_examples}/{gate_name}"
         probe_bin = f"{local_examples}/{probe_name}"
-        ctl_bin = (args.ctl_bin or f"{local_examples}/uc2ctl") if args.m7 else None
+        ctl_bin = (args.ctl_bin or f"{local_release}/uc2ctl") if args.m7 else None
         hosts = build_local_hosts(gate, args.root, count=n_hosts, ctl_bin=ctl_bin,
                                   probe_bin=probe_bin)
         stop_file = str(Path(args.root) / "STOP")
@@ -1627,10 +1638,11 @@ def main():
         # binary that ran the rungs.
         decide_bin = args.rp_decide_bin or gate
     else:
-        remote_examples = "/opt/bench/uc/target/release/examples"
+        remote_release = "/opt/bench/uc/target/release"
+        remote_examples = f"{remote_release}/examples"
         gate = args.bin or f"{remote_examples}/{gate_name}"
         probe_bin = f"{remote_examples}/{probe_name}"
-        ctl_bin = (args.ctl_bin or f"{remote_examples}/uc2ctl") if args.m7 else None
+        ctl_bin = (args.ctl_bin or f"{remote_release}/uc2ctl") if args.m7 else None
         remote_root = ("/opt/bench/rp" if args.read_profile
                        else ("/opt/bench/m7" if args.m7 else "/opt/bench/m6"))
         unit_prefix = "rp" if args.read_profile else ("m7" if args.m7 else "m6")
@@ -1648,10 +1660,11 @@ def main():
             # m7_gate too: it supplies the `probe` role read_profile lacks.
             examples = (gate_name, probe_name)
         else:
-            examples = (gate_name, "uc2ctl") if args.m7 else (gate_name,)
-        log(f"preparing fleet hosts (build {', '.join(examples)} + mkdir)...")
+            examples = (gate_name,)
+        bins = ("uc2ctl",) if args.m7 else ()
+        log(f"preparing fleet hosts (build {', '.join(examples + bins)} + mkdir)...")
         for h in hosts:
-            h.prepare(examples=examples)
+            h.prepare(examples=examples, bins=bins)
         # No local build is implied by a fleet run (rsync ships the tree;
         # ansible builds ON the hosts), so `decide` may have to run remotely —
         # `rp_decide` falls back to host 0 when this path does not exist.

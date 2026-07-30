@@ -76,7 +76,7 @@ cargo clippy --workspace --all-targets -- -D warnings     # lint (must pass with
 cargo run -p uc2_node --release --example m5_gate # throughput gate harness (see the gate doc)
 cargo run -p uc2_node --release --example m6_gate -- all --secs 6 --cycles 5   # snapshots/learners/purge gate
 cargo run -p uc2_node --release --example m7_gate -- all --secs 6             # live reconfig gate (replace/resize/self-removal)
-cargo run -p uc2_node --example uc2ctl -- status --instance-dir D --app-id A  # M7 admin CLI: add/promote/demote/remove/status
+cargo run -p uc2ctl -- status --instance-dir D --app-id A  # M7 admin CLI: add/promote/demote/remove/status
 scripts/elle_check.sh                            # elle consistency tier: 5 list-append passes, both models (needs java+jq)
 scripts/elle_mutation.sh                         # elle mutation testing: control clean + 3 injected consensus bugs caught
 (cd proofs && lake exe cache get && lake build)   # Lean proofs: model + theorems + conform checker (needs elan)
