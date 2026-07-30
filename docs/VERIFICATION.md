@@ -99,6 +99,22 @@ Finding #11 records why the remaining step needs joint/well-founded induction
 rather than the corpus's standard shape, and confirms this is a matter of scope
 rather than falsity. Estimated 3–4 further tasks.
 
+**And a caveat that matters more than the open theorem itself.** The model's
+`PNode.durable` is a single `Nat`, while the real node's durable counter has
+**two independent readers on two threads** — the receiver, which reports it for
+commit ranking, and the consensus agent, which absorbs it a duty cycle later for
+vote credentials. Because the model collapses them, the derived lemma
+`ReportEraFloor` discharges its `sendReport` case by `Nat.le_refl`: trivially
+true in the model, and false in the real system. That composition is exactly the
+informal safety argument that Finding #12 refuted with a shipped acked-write-loss
+bug.
+
+So: **`leader_completeness`, if completed over the current model, would be
+completed over a model that assumes that bug away.** Splitting the counter
+invalidates `ReportEraFloor`'s reflexivity proof and everything composed from
+it, so it is scoped as its own piece of work rather than a patch. The Rust is
+fixed and the `uc2_sim` half is closed (§2); the Lean half is open.
+
 State-machine safety is not attempted and is gated on finishing the above.
 
 ### The trusted base
@@ -136,7 +152,9 @@ hand-written edge case, so every `reconcile.rs` unit test (all 10) and every
 next to the corresponding model definition, checked on every `lake build`.
 
 **The residual gap, stated plainly.** The rig covers the three consensus kernels,
-not the whole node. Extraction of the real Rust into Lean via
+not the whole node — and the durable-counter collapse above is a concrete
+instance of what that leaves uncovered: a hazard the model could not express at
+all, so no amount of vector replay against it would have surfaced the bug. Extraction of the real Rust into Lean via
 [Aeneas](https://github.com/AeneasVerif/aeneas) — the approach used successfully
 in [`ultima_db`](https://github.com/PeterKnego/ultima_db), where proofs run
 against mechanically translated code — was attempted here and **exited at a
@@ -173,6 +191,13 @@ Directed scenarios stage specific historical bugs as permanent regression pins �
 including `rebooted_unreconciled_voter_must_not_certify_phantom_commit` (Finding
 #5) and `old_term_range_must_not_commit_before_new_term_quorum` (Finding #6b),
 both verified RED before their fix and GREEN after.
+
+The simulator was itself blind to the durable dual-reader hazard until recently:
+`world.rs` advanced the counter and fed `DurableAdvanced` in the same handler, so
+the report path and the vote-credential path could never disagree.
+`SimEvent::ConsensusStep` now absorbs the counter on its own cadence — exactly as
+the two threads do — pinned by
+`stale_vote_credential_opens_a_term_below_a_committed_position`.
 
 ```bash
 cargo test -p uc2_sim                          # standard tier
@@ -354,6 +379,12 @@ The most important section, and the one most projects omit.
 
 - **`leader_completeness` is not proved** (§1). Election safety and log matching
   are; the remaining theorem is reduced to one named obligation and is open.
+- **The model collapses the durable counter's two independent readers into one
+  value** (§1), which makes a load-bearing lemma trivially true in the model and
+  false in the real system. A real acked-write-loss bug lived in exactly that gap
+  (Finding #12) — found from the Rust side, not by the proofs. Rust fixed,
+  `uc2_sim` closed, Lean split still open. Until it is done, proofs composed over
+  that lemma are weaker than they look.
 - **State-machine safety is not attempted**, and is gated on the above.
 - **The proofs cover the consensus kernels and protocol model, not the whole
   node.** The reliable-UDP data plane, the archive/journal path, the IPC ring
