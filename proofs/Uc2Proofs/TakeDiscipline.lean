@@ -571,6 +571,10 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
         omega
       · simpa [Node.dataTerm, Function.update_of_ne hne] using hdt
   | absorbDurable i hrole =>
+    -- issue #7: absorbing the counter changes only `pn.smDurable`, so every
+    -- `tk_transport` obligation is the identity on the field it names. (The
+    -- crashRestart case below needs real work because it resets role, tally and
+    -- `dataTerm`.)
     refine tk_transport h (fun k => ?_) (fun k => ?_) (fun k hr => ?_)
       (fun k hrl => ?_) (fun u T d hm => ⟨hm, fun hdt => ?_⟩) rfl
     · rcases eq_or_ne k i with rfl | hne
@@ -580,38 +584,17 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
       · simp [Node.pn, Function.update_self]
       · simp [Node.pn, Function.update_of_ne hne]
     · rcases eq_or_ne k i with rfl | hne
-      · simp only [Node.dataTerm, Function.update_self] at hr ⊢
-        have hle : (w.nodes k).dn.pn.currentTerm ≤
-            Data.lastTermOf (w.nodes k).dn.termMap := of_decide_eq_true hr
-        have h2 : Data.lastTermOf (w.nodes k).dn.termMap ≤
-            (w.nodes k).dn.dataTerm :=
-          Data.reachable_map_le_dataTerm (reachable_project hw) k
-        have h3 : (w.nodes k).dn.dataTerm ≤ (w.nodes k).dn.pn.currentTerm :=
-          (Data.reachable_stamp (reachable_project hw)).data_le k
-        refine ⟨?_, ?_⟩
-        · by_contra hcl
-          have h4 : Data.lastTermOf (w.nodes k).dn.termMap <
-              (w.nodes k).dn.dataTerm :=
-            (reachable_provInv hw).closed_lag k (Bool.eq_false_iff.mpr hcl)
-          omega
-        · show (w.nodes k).dn.pn.currentTerm = (w.nodes k).dn.dataTerm
-          omega
+      · refine ⟨by simpa [Function.update_self] using hr, ?_⟩
+        simp [Node.dataTerm, Function.update_self]
       · refine ⟨by simpa [Function.update_of_ne hne] using hr, ?_⟩
         simp [Node.dataTerm, Function.update_of_ne hne]
     · rcases eq_or_ne k i with rfl | hne
-      · simp only [Node.pn, Function.update_self] at hrl
-        exact absurd hrl (by decide)
+      · refine ⟨by simpa [Node.pn, Function.update_self] using hrl, ?_⟩
+        simp [Node.pn, Function.update_self]
       · refine ⟨by simpa [Node.pn, Function.update_of_ne hne] using hrl, ?_⟩
         simp [Node.pn, Function.update_of_ne hne]
     · rcases eq_or_ne u i with rfl | hne
-      · simp only [Node.dataTerm, Function.update_self] at hdt
-        have h1 : T ≤ (w.nodes u).dn.dataTerm :=
-          (reachable_provInv hw).report_dt u T d hm
-        have h2 : (w.nodes u).dn.dataTerm ≤ (w.nodes u).dn.pn.currentTerm :=
-          (Data.reachable_stamp (reachable_project hw)).data_le u
-        have hdt' : (w.nodes u).dn.pn.currentTerm = T := hdt
-        show (w.nodes u).dn.dataTerm = T
-        omega
+      · simpa [Node.dataTerm, Function.update_self] using hdt
       · simpa [Node.dataTerm, Function.update_of_ne hne] using hdt
   | crashRestart i =>
     refine tk_transport h (fun k => ?_) (fun k => ?_) (fun k hr => ?_)

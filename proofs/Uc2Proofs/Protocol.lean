@@ -139,6 +139,26 @@ where
       ({ s with votedFor := some (s.currentTerm, c) }, true)
     else (s, false)
 
+/-- Issue #7: the vote path is durable-agnostic — neither `durable` (the
+counter) nor `smDurable` (the absorbed copy) is touched by adopting a term or by
+answering a `RequestVote`. Needed to carry `SmLeDurable` across those steps. -/
+@[simp] theorem adoptTerm_durable {n : Nat} (s : PNode n) (t : Nat) :
+    (s.adoptTerm t).durable = s.durable := rfl
+
+@[simp] theorem adoptTerm_smDurable {n : Nat} (s : PNode n) (t : Nat) :
+    (s.adoptTerm t).smDurable = s.smDurable := rfl
+
+@[simp] theorem recvRequestVote_durable {n : Nat} (s : PNode n) (c : Fin n)
+    (nt clt cd : Nat) : (s.recvRequestVote c nt clt cd).1.durable = s.durable := by
+  simp only [PNode.recvRequestVote, PNode.recvRequestVote.grantIfFresh]
+  split <;> split_ifs <;> rfl
+
+@[simp] theorem recvRequestVote_smDurable {n : Nat} (s : PNode n) (c : Fin n)
+    (nt clt cd : Nat) :
+    (s.recvRequestVote c nt clt cd).1.smDurable = s.smDurable := by
+  simp only [PNode.recvRequestVote, PNode.recvRequestVote.grantIfFresh]
+  split <;> split_ifs <;> rfl
+
 /-- The whole cluster: per-node state plus the append-only sent set
 (decision 1). -/
 structure World (n : Nat) where

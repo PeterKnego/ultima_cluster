@@ -434,6 +434,75 @@ def Reachable {n : Nat} (w : World n) : Prop :=
 theorem reachable_init (n : Nat) : Reachable (World.init n) :=
   Relation.ReflTransGen.refl
 
+/-! ## The absorbed copy never exceeds the counter (issue #7) -/
+
+/-- Issue #7: `smDurable` — the consensus agent's absorbed copy — is at or below
+`durable`, the counter. Every step preserves it for one of three reasons: the
+counter GROWS while the copy stands still (`leaderAppend`, `deliverReplicate` —
+that lag is the modelled phenomenon); a truncation clamps BOTH (`deliverTermMap`
+via `applyGossip`'s `min`, mirroring `Event::Truncated` in `election.rs`); or
+`absorbDurable` sets them equal. Nothing else touches either field.
+
+Needed because a candidate advertises the COPY (`startElection`) while the
+downstream credential reasoning in `StageC` is stated against the COUNTER. -/
+def SmLeDurable {n : Nat} (w : World n) : Prop :=
+  ∀ k : Fin n, (w.nodes k).pn.smDurable ≤ (w.nodes k).pn.durable
+
+theorem reachable_smLeDurable {n : Nat} {w : World n} (hw : Reachable w) :
+    SmLeDurable w := by
+  induction hw with
+  | refl => intro k; exact Nat.le_refl _
+  | tail _ hs ih =>
+    intro k
+    cases hs with
+    | startElection i _ =>
+      rcases eq_or_ne k i with rfl | hne
+      · simpa [Function.update_self] using ih k
+      · simpa [Function.update_of_ne hne] using ih k
+    | deliverRequestVote j c nt clt cd hmsg hterm =>
+      rcases eq_or_ne k j with rfl | hne
+      · simpa [Function.update_self] using ih k
+      · simpa [Function.update_of_ne hne] using ih k
+    | rejectStaleRequestVote j c nt clt cd hmsg hstale => simpa using ih k
+    | deliverVote i v t hmsg hrole hterm =>
+      rcases eq_or_ne k i with rfl | hne
+      · simpa [Function.update_self] using ih k
+      · simpa [Function.update_of_ne hne] using ih k
+    | deliverVoteHigherTerm i v t g hmsg hterm =>
+      rcases eq_or_ne k i with rfl | hne
+      · simpa [Function.update_self] using ih k
+      · simpa [Function.update_of_ne hne] using ih k
+    | becomeLeader i hrole hquorum =>
+      rcases eq_or_ne k i with rfl | hne
+      · simpa [Function.update_self] using ih k
+      · simpa [Function.update_of_ne hne] using ih k
+    | absorbDurable i hrole =>
+      rcases eq_or_ne k i with rfl | hne
+      · simp [Function.update_self]
+      · simpa [Function.update_of_ne hne] using ih k
+    | crashRestart i =>
+      rcases eq_or_ne k i with rfl | hne
+      · simpa [Function.update_self] using ih k
+      · simpa [Function.update_of_ne hne] using ih k
+    | leaderAppend i v hrole =>
+      rcases eq_or_ne k i with rfl | hne
+      · have := ih k; simp only [Function.update_self]; omega
+      · simpa [Function.update_of_ne hne] using ih k
+    | deliverReplicate j pos hdr t v hmsg hpos hhdr =>
+      rcases eq_or_ne k j with rfl | hne
+      · have := ih k
+        simp only [Function.update_self, Node.recvReplicate]
+        omega
+      · simpa [Function.update_of_ne hne] using ih k
+    | serveTail i p t v hrole hhist hp => simpa using ih k
+    | shipTermMap i hrole => simpa using ih k
+    | deliverTermMap j t entries hmsg hterm =>
+      rcases eq_or_ne k j with rfl | hne
+      · have := ih k
+        simp only [Function.update_self, Node.applyGossip]
+        split <;> simp <;> omega
+      · simpa [Function.update_of_ne hne] using ih k
+
 /-! ## Projection onto the election model
 
 Erase the data plane: keep the `pn` slice and the election wire. Every data

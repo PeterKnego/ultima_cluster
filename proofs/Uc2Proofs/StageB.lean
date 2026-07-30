@@ -545,10 +545,12 @@ private theorem ofe_step {n : Nat} {w w' : World n} (hw : Reachable w)
     · simp only [Node.dataTerm, Function.update_of_ne hne] at hr hdt ⊢
       exact h T hera k (by simpa [Function.update_of_ne hne] using hr) hdt
   | absorbDurable i hrole =>
+    -- issue #7: `dataTerm` is UNCHANGED, so the hypothesis transfers (the
+    -- crashRestart case re-derives it because the reboot re-keys `dataTerm`).
     intro T hera k hr hdt
     rcases eq_or_ne k i with rfl | hne
     · simp only [Node.dataTerm, Function.update_self] at hr hdt ⊢
-      exact of_decide_eq_true hr
+      exact h T hera k hr hdt
     · simp only [Node.dataTerm, Function.update_of_ne hne] at hr hdt ⊢
       exact h T hera k (by simpa [Function.update_of_ne hne] using hr) hdt
   | crashRestart i =>
@@ -865,8 +867,10 @@ private theorem ref_step {n : Nat} {w w' : World n} (hw : Reachable w)
       · simp [Node.pn, Function.update_self]
       · simp [Node.pn, Function.update_of_ne hne]
     · rcases eq_or_ne k i with rfl | hne
-      · simp only [Node.pn, Function.update_self] at hrl
-        exact absurd hrl (by decide)
+      · -- issue #7: role UNCHANGED, so this is absurd by the step's own
+        -- non-leader guard rather than by crashRestart's drop to follower.
+        simp only [Node.pn, Function.update_self] at hrl
+        exact absurd hrl hrole
       · refine ⟨by simpa [Node.pn, Function.update_of_ne hne] using hrl, ?_⟩
         simp [Node.pn, Function.update_of_ne hne]
   | crashRestart i =>
@@ -1450,10 +1454,11 @@ private theorem rlf_step {n : Nat} {w w' : World n} (hw : Reachable w)
     · simp only [Node.pn, Function.update_of_ne hne] at hrl hct ⊢
       exact h y T d hm h1T ℓ hrl hct
   | absorbDurable i hrole =>
+    -- issue #7: absurd by the step's non-leader guard (role is UNCHANGED here).
     intro y T d hm h1T ℓ hrl hct
     rcases eq_or_ne ℓ i with rfl | hne
     · simp only [Node.pn, Function.update_self] at hrl
-      exact absurd hrl (by decide)
+      exact absurd hrl hrole
     · simp only [Node.pn, Function.update_of_ne hne] at hrl hct ⊢
       exact h y T d hm h1T ℓ hrl hct
   | crashRestart i =>
