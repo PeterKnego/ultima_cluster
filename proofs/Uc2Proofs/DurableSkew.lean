@@ -35,14 +35,20 @@ whether or not the full `PNode` split (issue #7's Lean half) has landed:
 The gap between them is exactly the bug 26d4827 fixed.
 
 NOTE on scope. These are statements about the *join*, over bare `Nat`s and the
-real `logOk` kernel, deliberately independent of `PNode`. That is the honest
-level: as long as `PNode.durable` remains one field, no world-level theorem in
-this corpus can even *state* the distinction, so a world-level countermodel is
-not available to write. See the gate doc's Finding #12 and the WIP branch
-`uc2/lean-durable-split-wip` for the model split that would lift these to the
-world level.
+real `logOk` kernel, deliberately independent of `PNode`.
+
+They were written when `PNode.durable` was still ONE field, at which point no
+world-level theorem could even *state* the distinction. **That is no longer
+true**: `PNode` now carries `durable` (the counter, reported and compared) and
+`smDurable` (the absorbed copy, advertised), and `SmLeDurable` relates them. The
+model can therefore now REACH a state where the two disagree —
+`nonvacuity_durable_skew_trace` below exhibits one — which is the precondition
+for ever lifting these two statements to worlds. Doing that lift needs a
+counterfactual grant rule (a `logOk` reading `smDurable`) as a second step
+constructor; it is not written yet.
 -/
 import Uc2Proofs.Vote
+import Uc2Proofs.ProtocolData
 
 namespace Uc2.DurableSkew
 
@@ -106,6 +112,26 @@ decision (`refresh_durable` in `uc2_node`, called from `feed_net`'s
 `NetEvent::RequestVote` arm) makes the SAME scenario refuse the vote. -/
 example : logOk 2 1000 2 900 = false := by decide
 
+/-- Issue #7 NON-VACUITY: the split is not cosmetic — the model can actually
+reach a state where the absorbed copy LAGS the counter, which is the whole
+phenomenon. Node 0 wins term 1 and appends a byte, moving its counter to 1; its
+consensus agent has not polled, so `smDurable` is still 0.
+
+Before the split this state was not merely unreachable, it was inexpressible:
+there was one field, so `smDurable < durable` had no meaning. -/
+theorem nonvacuity_durable_skew_trace :
+    ∃ w : Uc2.Data.World 3, Uc2.Data.Reachable w ∧
+      (w.nodes 0).pn.smDurable < (w.nodes 0).pn.durable := by
+  refine ⟨_,
+    .tail (.tail (.tail (.tail
+      (.single (.startElection _ 0 (by decide)))
+      (.deliverRequestVote _ 1 0 1 0 0 (by decide) (by decide)))
+      (.deliverVote _ 0 1 1 (by decide) (by decide) (by decide)))
+      (.becomeLeader _ 0 (by decide) (by decide)))
+      (.leaderAppend _ 0 42 (by decide)),
+    by decide⟩
+
+#print axioms nonvacuity_durable_skew_trace
 #print axioms grant_bridge_sound_on_counter
 #print axioms grant_bridge_false_on_absorbed_copy
 
