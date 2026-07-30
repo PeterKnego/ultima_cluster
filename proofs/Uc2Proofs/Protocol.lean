@@ -60,7 +60,31 @@ structure PNode (n : Nat) where
   role          : Role
   votesReceived : Finset (Fin n)
   lastTerm      : Nat
+  /-- THE COUNTER (`cnc` `LogCounters::durable`). Two things read it, on two
+  different threads in the real node: the receiver agent, which REPORTS it to
+  the leader for commit ranking, and — since `main` 26d4827 — `log_ok`, which
+  re-reads it immediately before answering a `RequestVote`. Raft's vote rule is
+  sound only if a voter judges a candidate against everything it has DURABLY
+  STORED, and this is that.
+
+  Issue #7: this field used to serve FOUR roles at once, and the collapse made
+  `ReportEraFloor`'s `sendReport` case provable by `Nat.le_refl` — a proof that
+  the reported position is at most the vote-visible one BECAUSE THEY WERE THE
+  SAME TERM. That identity is false in the real system, and the acked-write loss
+  it hides is real. See `smDurable`. -/
   durable       : Nat
+  /-- The consensus agent's ABSORBED COPY of `durable` (`ElectionSm::durable`,
+  fed by `Event::DurableAdvanced` from `Consensus::do_work`). Always `≤ durable`
+  (`SmLeDurable`), and strictly below it whenever the archive has fsynced since
+  the agent last polled.
+
+  Used for exactly the two roles that legitimately lag in the real node: the
+  `last_durable` credential a candidate ADVERTISES (`start_election`) and the
+  base a new leader COLLAPSES to (`become_leader`). Staleness is CONSERVATIVE
+  for both — a candidate that under-advertises merely loses elections it could
+  have won. It is unsafe only on the grant side, which is why `logOk` reads
+  `durable` and not this. -/
+  smDurable     : Nat
 deriving DecidableEq
 
 /-- The two election wire messages. `src`/`dst` stand in for the Rust
@@ -115,6 +139,26 @@ where
       ({ s with votedFor := some (s.currentTerm, c) }, true)
     else (s, false)
 
+/-- Issue #7: the vote path is durable-agnostic — neither `durable` (the
+counter) nor `smDurable` (the absorbed copy) is touched by adopting a term or by
+answering a `RequestVote`. Needed to carry `SmLeDurable` across those steps. -/
+@[simp] theorem adoptTerm_durable {n : Nat} (s : PNode n) (t : Nat) :
+    (s.adoptTerm t).durable = s.durable := rfl
+
+@[simp] theorem adoptTerm_smDurable {n : Nat} (s : PNode n) (t : Nat) :
+    (s.adoptTerm t).smDurable = s.smDurable := rfl
+
+@[simp] theorem recvRequestVote_durable {n : Nat} (s : PNode n) (c : Fin n)
+    (nt clt cd : Nat) : (s.recvRequestVote c nt clt cd).1.durable = s.durable := by
+  simp only [PNode.recvRequestVote, PNode.recvRequestVote.grantIfFresh]
+  split <;> split_ifs <;> rfl
+
+@[simp] theorem recvRequestVote_smDurable {n : Nat} (s : PNode n) (c : Fin n)
+    (nt clt cd : Nat) :
+    (s.recvRequestVote c nt clt cd).1.smDurable = s.smDurable := by
+  simp only [PNode.recvRequestVote, PNode.recvRequestVote.grantIfFresh]
+  split <;> split_ifs <;> rfl
+
 /-- The whole cluster: per-node state plus the append-only sent set
 (decision 1). -/
 structure World (n : Nat) where
@@ -126,7 +170,7 @@ received, empty data plane, nothing sent. -/
 def World.init (n : Nat) : World n :=
   { nodes := fun _ =>
       { currentTerm := 0, votedFor := none, role := .follower,
-        votesReceived := ∅, lastTerm := 0, durable := 0 },
+        votesReceived := ∅, lastTerm := 0, durable := 0, smDurable := 0 },
     sent := [] }
 
 /-- One cluster transition. Each constructor carries the minimal enabling
@@ -153,7 +197,7 @@ inductive Step {n : Nat} : World n → World n → Prop
               votesReceived := {i} }
           sent := w.sent ++
             [.requestVote i ((w.nodes i).currentTerm + 1)
-              (w.nodes i).lastTerm (w.nodes i).durable] }
+              (w.nodes i).lastTerm (w.nodes i).smDurable] }
   /-- `Event::RequestVote`, non-stale arm (`election.rs` lines 600–627):
   receiver `j` adopts a strictly-higher term first (lines 623–625), then runs
   `handle_request_vote` at the adopted term and answers with a `vote`
@@ -231,11 +275,32 @@ inductive Step {n : Nat} : World n → World n → Prop
           sent := w.sent }
   /-- Havoc data plane (decision 2): `lastTerm`/`durable` — the `log_ok`
   inputs — jump to arbitrary values, over-approximating UC's real
-  data-append/gossip/truncation evolution. -/
-  | havocData (w : World n) (i : Fin n) (newLastTerm newDurable : Nat) :
+  data-append/gossip/truncation evolution.
+
+  Issue #7: `smDurable` is havoc'd alongside it, and deliberately UNCONSTRAINED
+  here — the same over-approximation `durable` itself gets under decision 2.
+  This layer proves `election_safety`, which mentions neither field; the layers
+  that reason about durable positions (`ProtocolData`, `ProtocolCommit`) build
+  their own steps and never take this one, so the laxity is not observable where
+  it would matter. Keeping it unclamped is what lets every data-layer step
+  project onto this one DEFINITIONALLY, rather than threading a
+  `smDurable ≤ durable` hypothesis through `step_project`. -/
+  | havocData (w : World n) (i : Fin n) (newLastTerm newDurable newSm : Nat) :
       Step w
         { nodes := Function.update w.nodes i
-            { w.nodes i with lastTerm := newLastTerm, durable := newDurable }
+            { w.nodes i with lastTerm := newLastTerm,
+                             durable := newDurable,
+                             smDurable := newSm }
+          sent := w.sent }
+  /-- Issue #7: the consensus agent's duty cycle absorbing the counter
+  (`Consensus::do_work` step 2 / `refresh_durable`). The ONLY way `smDurable`
+  catches up, and the reason it can lag at all — in the real node this is a
+  poll on a different thread from the one that advances `durable` and from the
+  one that reports it. -/
+  | absorbDurable (w : World n) (i : Fin n) :
+      Step w
+        { nodes := Function.update w.nodes i
+            { w.nodes i with smDurable := (w.nodes i).durable }
           sent := w.sent }
   /-- `election.rs::adopt_term` fired by a data-plane trigger the spike left
   unmodeled: `Event::TermMapReceived { term }` with `term > current_term`

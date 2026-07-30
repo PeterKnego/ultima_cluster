@@ -215,6 +215,11 @@ private theorem hfp_step {n : Nat} {w w' : World n} (h : HistFrameProvenance w)
     rcases eq_or_ne k i with rfl | hne
     · simp only [Node.hist, Function.update_self] at hh; exact h k p t v hh
     · simp only [Node.hist, Function.update_of_ne hne] at hh; exact h k p t v hh
+  | absorbDurable i hrole =>
+    intro k p t v hh
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Node.hist, Function.update_self] at hh; exact h k p t v hh
+    · simp only [Node.hist, Function.update_of_ne hne] at hh; exact h k p t v hh
   | crashRestart i =>
     intro k p t v hh
     rcases eq_or_ne k i with rfl | hne
@@ -322,6 +327,7 @@ private theorem cfp_step {n : Nat} {w w' : World n} (hw : Reachable w)
   | deliverVote _ _ _ _ _ _ => intro p stamp T v hh; exact h p stamp T v hh
   | deliverVoteHigherTerm _ _ _ _ _ _ => intro p stamp T v hh; exact h p stamp T v hh
   | becomeLeader _ _ _ => intro p stamp T v hh; exact h p stamp T v hh
+  | absorbDurable _ _ => intro p stamp T v hh; exact h p stamp T v hh
   | crashRestart _ => intro p stamp T v hh; exact h p stamp T v hh
   | leaderAppend i v hrole =>
     intro p stamp T v' hh
@@ -396,7 +402,7 @@ private theorem nonvacuity_lc_trace :
       (w.nodes 2).hist 0 = none := by
   refine ⟨_,
     .tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
-      (.tail (.tail (.tail (.tail
+      (.tail (.tail (.tail (.tail (.tail
       (.single (.startElection _ 0 (by decide)))
       (.deliverRequestVote _ 1 0 1 0 0 (by decide) (by decide)))
       (.deliverVote _ 0 1 1 (by decide) (by decide) (by decide)))
@@ -413,6 +419,10 @@ private theorem nonvacuity_lc_trace :
         (advance_fires ⟨[1, 0], 2, 0⟩ 1 1 (by decide) (by decide)
           (by simp [CommitTracker.advance, CommitTracker.ranking,
                 List.mergeSort]))))
+      -- Issue #7: absorb before standing — the advertised credential is the
+      -- ABSORBED copy, so a candidate must have polled the counter to advertise
+      -- the byte it has already fsynced (and reported).
+      (.absorbDurable _ 1 (by decide)))
       (.startElection _ 1 (by decide)))
       (.deliverRequestVote _ 2 1 2 1 1 (by decide) (by decide)))
       (.deliverVote _ 1 2 2 (by decide) (by decide) (by decide)))
@@ -483,7 +493,7 @@ theorem nonvacuity_serve_tail_catchup_trace :
   refine ⟨_, _, _, _, _,
     .tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
       (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
-      (.tail
+      (.tail (.tail (.tail
       -- t1: node 0 leads {0,2}, appends 10@0 and 11@1; node 1 reconciles
       -- (adopt + gate open) and replicates only byte 0.
       (.single (.startElection _ 0 (by decide)))
@@ -498,6 +508,7 @@ theorem nonvacuity_serve_tail_catchup_trace :
         (by decide)))
       -- t2: node 1 wins term 2 on (lastTerm 1, durable 1) and appends the
       -- divergent (1, 2, 20) — map [(1,0),(2,1)], durable 2.
+      (.absorbDurable _ 1 (by decide)))
       (.startElection _ 1 (by decide)))
       (.deliverRequestVote _ 2 1 2 1 1 (by decide) (by decide)))
       (.deliverVote _ 1 2 2 (by decide) (by decide) (by decide)))
@@ -507,6 +518,7 @@ theorem nonvacuity_serve_tail_catchup_trace :
       -- durable 2) — map [(1,0),(3,2)], its term-1 bytes inherited —
       -- appends 31@2 and gossips.
       (.crashRestart _ 0))
+      (.absorbDurable _ 0 (by decide)))
       (.startElection _ 0 (by decide)))
       (.startElection _ 0 (by decide)))
       (.deliverRequestVote _ 2 0 3 1 2 (by decide) (by decide)))

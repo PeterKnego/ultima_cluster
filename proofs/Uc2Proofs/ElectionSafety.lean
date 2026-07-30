@@ -453,7 +453,37 @@ theorem inv_step {n : Nat} {w w' : World n} (h : Inv w) (hs : Step w w') :
         simp at hL'
       · simp only [Function.update_of_ne ha] at hL ⊢
         exact h.leader_quorum a hL
-  | havocData i nlt nd =>
+  | absorbDurable i =>
+    -- issue #7: the consensus agent absorbing the durable counter into
+    -- `smDurable` touches nothing the invariant mentions (no term, no vote,
+    -- no role, no tally, no message) — same shape as `havocData` below.
+    refine ⟨?_, ?_, ?_, ?_, ?_⟩
+    · intro a c' t' hmem
+      rcases eq_or_ne a i with rfl | ha
+      · simp only [Function.update_self]
+        exact h.grant_state a c' t' hmem
+      · simp only [Function.update_of_ne ha]
+        exact h.grant_state a c' t' hmem
+    · exact h.grant_uniq
+    · intro a hrole'
+      rcases eq_or_ne a i with rfl | ha
+      · simp only [Function.update_self] at hrole' ⊢
+        exact h.self_vote a hrole'
+      · simp only [Function.update_of_ne ha] at hrole' ⊢
+        exact h.self_vote a hrole'
+    · intro a hrole' u hu
+      rcases eq_or_ne a i with rfl | ha
+      · simp only [Function.update_self] at hrole' hu ⊢
+        exact h.votes_sound a hrole' u hu
+      · simp only [Function.update_of_ne ha] at hrole' hu ⊢
+        exact h.votes_sound a hrole' u hu
+    · intro a hL
+      rcases eq_or_ne a i with rfl | ha
+      · simp only [Function.update_self] at hL ⊢
+        exact h.leader_quorum a hL
+      · simp only [Function.update_of_ne ha] at hL ⊢
+        exact h.leader_quorum a hL
+  | havocData i nlt nd nsm =>
     -- the havoc data plane touches nothing the invariant mentions
     refine ⟨?_, ?_, ?_, ?_, ?_⟩
     · intro a c' t' hmem

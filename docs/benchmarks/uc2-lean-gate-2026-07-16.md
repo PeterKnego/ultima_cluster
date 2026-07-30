@@ -491,52 +491,71 @@ Two things that construction taught us, worth keeping:
   within one duty cycle of an archive advance. That is a statement about
   probability, not reachability — and reachability is what a model is for.
 
-**Lean half — PARTIALLY LANDED 2026-07-30.**
+**Lean half — LANDED IN FULL 2026-07-30.** `PNode.durable` is split.
 
-What landed: `Uc2Proofs/DurableSkew.lean`, a machine-checked PAIR isolating the
-join this finding is about.
+`PNode` now carries TWO fields where it carried one:
 
-- `grant_bridge_sound_on_counter` — with the vote comparand on the COUNTER, the
-  `omega` at `StageB` ~1899-1912 is valid. This is the shipped system, and it is
-  why `GrantReport` remains provable after 26d4827.
-- `grant_bridge_false_on_absorbed_copy` — with the vote comparand on a LAGGING
-  absorbed copy, the same join is **false, with a witness**: counter 1000,
-  already reported 1000, absorbed copy 900, candidate advertises 900, `logOk`
-  grants on the tie, and `1000 ≤ 900` is refuted. Note the copy is a perfectly
-  legitimate lag (`900 ≤ 1000`) — the unsoundness is not a corrupt value, it is
-  the join treating it as the number the report was stamped from.
+- `durable` — **the counter**. Reported for commit ranking (`sendReport`) and
+  compared by `logOk` at the voter. Keeping the vote comparand here is what
+  models the SHIPPED system (26d4827 made the grant path re-read the counter),
+  and it is why the `StageB` bridge still closes.
+- `smDurable` — **the consensus agent's absorbed copy**, advertised as the
+  `last_durable` credential by `startElection`. Under-advertising is
+  conservative: it loses elections, it cannot win one it should not.
 
-Both sorry-free (`propext`, `Quot.sound`). They are stated over bare `Nat`s and
-the real `logOk` kernel, deliberately independent of `PNode` — which is the
-honest level available: **while `PNode.durable` is one field, no world-level
-theorem in this corpus can even state the distinction**, so a world-level
-countermodel cannot be written.
+Plus a new `absorbDurable` step at all three layers modelling
+`Consensus::do_work` step 2 — without it the copy is pinned at 0 and every
+second election is vacuous. A truncation clamps the copy by `min` (mirroring
+`Event::Truncated`); a counter advance deliberately does NOT move it, because
+that lag IS the phenomenon.
 
-A refinement of the diagnosis above, worth recording because it moves the
-suspect: **the identity is used EXACTLY ONCE in the whole corpus**, at
-`StageB.lean` ~1899-1912. So the `Nat.le_refl` at `StageB:1290` is *not* where
-the bug hides — that step is sound with the report on the counter either way.
-It hides in the `omega` that joins `d ≤ durable_y` to `durable_y ≤ cd`.
-Everything downstream (`GrantReport` → `crux_become_leader` → the unlanded
-`CommittedTermAtLeaders`) inherits it through that single join.
+**`lake build` 3036 jobs, zero errors, ZERO `sorryAx` anywhere in the corpus.**
+`election_safety` and `log_matching` remain proved and lifted at both layers.
+`SmLeDurable` (`ProtocolData`) proves the copy never exceeds the counter, and is
+what discharges the credential bound in `StageC`'s `CandCredRaw` now that
+`startElection` advertises the copy — previously that step was `rfl`.
 
-What did NOT land: the `PNode` split itself. It is banked, non-building, on
-branch `uc2/lean-durable-split-wip` with a full completion note — the design
-plus five files of propagation (`Protocol`, `ElectionSafety`, `ProtocolData`,
-`LogMatching`, `ProtocolCommit` green in isolation; ~22 case sites left across
-`MapWF`/`LcClosure`/`TakeDiscipline`/`ReportProvenance`/`StageB`/`StageC`). Two
-things learned there that the next attempt should start from:
+`Uc2Proofs/DurableSkew.lean` pins the join itself:
 
-1. The mechanical `crashRestart`-twin template is WRONG wherever a case leans on
-   the role CHANGING (crashRestart drops to follower; absorbing does not). The
-   correct shape is "everything transfers" — worked examples in `LogMatching`
-   and `MapWF`.
-2. Moving role (d) — `becomeLeader`'s collapse base — to the absorbed copy
-   requires a `smDurable ≤ durable` invariant threaded through the entire
-   `MapWF`/`LcClosure`/`ReportProvenance` frontier stack (`NodeWF.last_base` and
-   friends). That is a project of its own, and it is NOT needed for the
-   grant-plane result: a candidate that is genuinely behind has a low counter
-   too, so the loss is expressible without it.
+- `grant_bridge_sound_on_counter` — comparand on the counter ⇒ the join holds.
+- `grant_bridge_false_on_absorbed_copy` — comparand on a lagging copy ⇒ the join
+  is **false, with a witness** (counter 1000, reported 1000, copy 900, candidate
+  advertises 900, `logOk` grants on the tie, `1000 ≤ 900` refuted). The copy is a
+  LEGITIMATE lag; the unsoundness is the join treating it as the number the
+  report came from.
+- `nonvacuity_durable_skew_trace` — a reachable world where the copy genuinely
+  lags the counter. Before the split this state was not merely unreachable, it
+  was **inexpressible**.
+
+**Refines the diagnosis above, and moves the suspect.** The identity is used
+EXACTLY ONCE in the corpus, at `StageB.lean` ~1899-1912. The `Nat.le_refl` at
+`StageB:1290` is NOT where the bug hid — it is sound with the report on the
+counter either way. It hid in the `omega` that joins `d ≤ durable_y` with
+`durable_y ≤ cd`. Everything downstream (`GrantReport` → `crux_become_leader` →
+the unlanded `CommittedTermAtLeaders`) inherits it through that one join.
+
+**Still open, deliberately.** (1) Role (d) — `becomeLeader`'s collapse base —
+stays on the counter. Faithfully it is the absorbed copy, but moving it needs
+`SmLeDurable` threaded through `NodeWF.last_base` and the whole
+`MapWF`/`LcClosure`/`ReportProvenance` frontier stack. It is not needed for the
+grant-plane result: a candidate that is genuinely behind has a low counter too.
+(2) Lifting `DurableSkew`'s two statements from bare `Nat`s to worlds needs a
+counterfactual grant rule (a `logOk` reading `smDurable`) as a second step
+constructor. The split makes that possible; it is not written.
+(3) `absorbDurable` is guarded to a non-leader — free, since the copy is only
+read by `startElection`, which already requires one — and it is what lets the
+step reuse `provinv_election`, whose leader arm demands the data-node be
+unchanged.
+
+**Two traps, for anyone doing this shape of propagation again.** A mechanical
+`crashRestart`-twin is wrong SEMANTICALLY wherever a case leans on the role
+CHANGING (crashRestart drops to follower and discharges obligations by
+contradiction; absorbing changes nothing, so hypotheses must TRANSFER — likewise
+wherever crashRestart REBUILDS a fact it reset, e.g. `CommitTracker.new`,
+`dataTerm := currentTerm`). And wrong STRUCTURALLY if the insertion is
+indentation-blind: it silently DISPLACES the original case and can splice a copy
+into an unrelated `induction ... with` block. That mangled `LcClosure` and cost a
+restore-from-`main`.
 
 ### Restatements (recorded for completeness, not spec gaps)
 

@@ -332,6 +332,7 @@ private theorem gne_step {n : Nat} {w w' : World n} (hw : Reachable w)
   | deliverVote i v t hmsg hrole hterm => exact h
   | deliverVoteHigherTerm i v t g hmsg hterm => exact h
   | becomeLeader i hrole hquorum => exact h
+  | absorbDurable i hrole => exact h
   | crashRestart i => exact h
   | deliverReplicate j pos hdr t v hmsg hpos hhdr hgate => exact h
   | deliverTermMap j t entries hmsg hterm => exact h
@@ -568,6 +569,32 @@ private theorem tk_step {n : Nat} {w w' : World n} (hw : Reachable w)
           (Data.reachable_stamp (reachable_project hw)).data_le u
         have h3 : (w.nodes u).dn.pn.currentTerm < t := hterm
         omega
+      · simpa [Node.dataTerm, Function.update_of_ne hne] using hdt
+  | absorbDurable i hrole =>
+    -- issue #7: absorbing the counter changes only `pn.smDurable`, so every
+    -- `tk_transport` obligation is the identity on the field it names. (The
+    -- crashRestart case below needs real work because it resets role, tally and
+    -- `dataTerm`.)
+    refine tk_transport h (fun k => ?_) (fun k => ?_) (fun k hr => ?_)
+      (fun k hrl => ?_) (fun u T d hm => ⟨hm, fun hdt => ?_⟩) rfl
+    · rcases eq_or_ne k i with rfl | hne
+      · simp [Function.update_self]
+      · simp [Function.update_of_ne hne]
+    · rcases eq_or_ne k i with rfl | hne
+      · simp [Node.pn, Function.update_self]
+      · simp [Node.pn, Function.update_of_ne hne]
+    · rcases eq_or_ne k i with rfl | hne
+      · refine ⟨by simpa [Function.update_self] using hr, ?_⟩
+        simp [Node.dataTerm, Function.update_self]
+      · refine ⟨by simpa [Function.update_of_ne hne] using hr, ?_⟩
+        simp [Node.dataTerm, Function.update_of_ne hne]
+    · rcases eq_or_ne k i with rfl | hne
+      · refine ⟨by simpa [Node.pn, Function.update_self] using hrl, ?_⟩
+        simp [Node.pn, Function.update_self]
+      · refine ⟨by simpa [Node.pn, Function.update_of_ne hne] using hrl, ?_⟩
+        simp [Node.pn, Function.update_of_ne hne]
+    · rcases eq_or_ne u i with rfl | hne
+      · simpa [Node.dataTerm, Function.update_self] using hdt
       · simpa [Node.dataTerm, Function.update_of_ne hne] using hdt
   | crashRestart i =>
     refine tk_transport h (fun k => ?_) (fun k => ?_) (fun k hr => ?_)

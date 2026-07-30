@@ -141,6 +141,11 @@ private theorem ctb_step {n : Nat} {w w' : World n} (h : CampaignTermBound w)
     rcases eq_or_ne k i with rfl | hne
     · simpa [Node.pn, Function.update_self] using h k u clt cd hm
     · simpa [Node.pn, Function.update_of_ne hne] using h k u clt cd hm
+  | absorbDurable i hrole =>
+    intro k u clt cd hm
+    rcases eq_or_ne k i with rfl | hne
+    · simpa [Node.pn, Function.update_self] using h k u clt cd hm
+    · simpa [Node.pn, Function.update_of_ne hne] using h k u clt cd hm
   | crashRestart i =>
     intro k u clt cd hm
     rcases eq_or_ne k i with rfl | hne
@@ -249,7 +254,11 @@ private theorem ccr_step {n : Nat} {w w' : World n} (hw : Reachable w)
     · simp only [Msg.requestVote.injEq] at hm
       obtain ⟨rfl, rfl, rfl, rfl⟩ := hm
       left
-      simp [Node.pn, Function.update_self]
+      -- Issue #7: `startElection` now advertises the ABSORBED copy, so the
+      -- credential is bounded by the counter via `SmLeDurable` rather than by
+      -- `rfl`. That inequality is the whole content of the split on this side.
+      simp only [Node.pn, Function.update_self]
+      exact ⟨Nat.le_refl _, Data.reachable_smLeDurable (reachable_project hw) k⟩
   | deliverRequestVote j c nt clt cd hmsg hterm =>
     intro k u clt' cd' hm hrl hct
     simp only [List.mem_append, List.mem_singleton] at hm
@@ -309,6 +318,19 @@ private theorem ccr_step {n : Nat} {w w' : World n} (hw : Reachable w)
     · exfalso
       simp only [Node.pn, Function.update_self] at hrl
       exact absurd hrl (by decide)
+    · simp only [Node.pn, Function.update_of_ne hne] at hrl hct ⊢
+      rcases h k u clt cd hm hrl hct with hleft | ⟨ℓ, hcL⟩
+      · exact .inl hleft
+      · exact .inr ⟨ℓ, hcert hcL⟩
+  | absorbDurable i hrole =>
+    -- issue #7: role is UNCHANGED, so unlike crashRestart this node may still be
+    -- a candidate — the hypothesis transfers instead of being refuted.
+    intro k u clt cd hm hrl hct
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Node.pn, Function.update_self] at hrl hct ⊢
+      rcases h k u clt cd hm hrl hct with hleft | ⟨ℓ, hcL⟩
+      · exact .inl hleft
+      · exact .inr ⟨ℓ, hcert hcL⟩
     · simp only [Node.pn, Function.update_of_ne hne] at hrl hct ⊢
       rcases h k u clt cd hm hrl hct with hleft | ⟨ℓ, hcL⟩
       · exact .inl hleft
@@ -928,6 +950,10 @@ theorem step_currentTerm_mono {n : Nat} {w w' : World n} (hs : Step w w')
       omega
     · simp [Node.pn, Function.update_of_ne hne]
   | becomeLeader i hrole hquorum =>
+    rcases eq_or_ne j i with rfl | hne
+    · simp [Node.pn, Function.update_self]
+    · simp [Node.pn, Function.update_of_ne hne]
+  | absorbDurable i hrole =>
     rcases eq_or_ne j i with rfl | hne
     · simp [Node.pn, Function.update_self]
     · simp [Node.pn, Function.update_of_ne hne]

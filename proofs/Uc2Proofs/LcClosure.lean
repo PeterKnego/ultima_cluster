@@ -109,6 +109,13 @@ private theorem hd_step {n : Nat} {w w' : World n} (h : HistDefined w)
       exact h k p hp
     · simp only [Node.hist, Node.pn, Function.update_of_ne hne] at hp ⊢
       exact h k p hp
+  | absorbDurable i hrole =>
+    intro k p hp
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Node.hist, Node.pn, Function.update_self] at hp ⊢
+      exact h k p hp
+    · simp only [Node.hist, Node.pn, Function.update_of_ne hne] at hp ⊢
+      exact h k p hp
   | crashRestart i =>
     intro k p hp
     rcases eq_or_ne k i with rfl | hne
@@ -226,6 +233,7 @@ private theorem gu_step {n : Nat} {w w' : World n} (hw : Reachable w)
   | deliverVote i v t hmsg hrole hterm => exact h
   | deliverVoteHigherTerm i v t g hmsg hterm => exact h
   | becomeLeader i hrole hquorum => exact h
+  | absorbDurable i hrole => exact h
   | crashRestart i => exact h
   | leaderAppend i v hrole => exact gu_frame_append h rfl
   | deliverReplicate j pos hdr t v hmsg hpos hhdr hgate => exact h
@@ -321,6 +329,15 @@ private theorem nsr_step {n : Nat} {w w' : World n} (hw : Reachable w)
       refine h k ?_ d hmem
       rw [hrole]
       decide
+    · simp only [Node.pn, Function.update_of_ne hne] at hnf hmem
+      exact h k hnf d hmem
+  | absorbDurable i hrole =>
+    -- issue #7: role UNCHANGED, so `hnf` transfers rather than being refuted
+    -- (crashRestart drops to follower, which is why its case closes by `hnf rfl`).
+    intro k hnf d hmem
+    rcases eq_or_ne k i with rfl | hne
+    · simp only [Node.pn, Function.update_self] at hnf hmem
+      exact h k hnf d hmem
     · simp only [Node.pn, Function.update_of_ne hne] at hnf hmem
       exact h k hnf d hmem
   | crashRestart i =>
@@ -485,6 +502,13 @@ private theorem rgw_step {n : Nat} {w w' : World n} (hw : Reachable w)
           simp [Node.dataTerm, Node.pn, Function.update_self]
       · exact .inl ⟨by simp [Node.dataTerm, Function.update_of_ne hne],
           by simpa [Function.update_of_ne hne] using hr⟩
+    | absorbDurable i hrole =>
+      -- issue #7: nothing this witness reads changes; same shape as leaderAppend
+      refine .inl ⟨?_, ?_⟩ <;> rcases eq_or_ne k i with rfl | hne
+      · simp [Node.dataTerm, Function.update_self]
+      · simp [Node.dataTerm, Function.update_of_ne hne]
+      · simpa [Function.update_self] using hr
+      · simpa [Function.update_of_ne hne] using hr
     | crashRestart i =>
       rcases eq_or_ne k i with rfl | hne
       · simp only [Function.update_self] at hr
@@ -672,6 +696,17 @@ private theorem ti_step {n : Nat} {w w' : World n} (h : TrackerInv w)
         = List.replicate (w.nodes k).tracker.reported.length 0 from rfl,
         getD_replicate_zero'] at hpos
       omega
+    · obtain ⟨h1, h2, h3⟩ := h k
+      simp only [Node.pn, Function.update_of_ne hne]
+      exact ⟨h1, h2, h3⟩
+  | absorbDurable i hrole =>
+    -- issue #7: the tracker is UNCHANGED (crashRestart resets it to
+    -- `CommitTracker.new`, which is why its case rebuilds these facts).
+    intro k
+    rcases eq_or_ne k i with rfl | hne
+    · obtain ⟨h1, h2, h3⟩ := h k
+      simp only [Node.pn, Function.update_self]
+      exact ⟨h1, h2, h3⟩
     · obtain ⟨h1, h2, h3⟩ := h k
       simp only [Node.pn, Function.update_of_ne hne]
       exact ⟨h1, h2, h3⟩

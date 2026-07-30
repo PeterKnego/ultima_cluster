@@ -227,7 +227,8 @@ watermark, gate open (`node.rs` 516 "open until a term is adopted"). -/
 def World.init (n : Nat) : World n :=
   { nodes := fun _ =>
       { dn := { pn := { currentTerm := 0, votedFor := none, role := .follower,
-                        votesReceived := ∅, lastTerm := 0, durable := 0 },
+                        votesReceived := ∅, lastTerm := 0, durable := 0,
+                        smDurable := 0 },
                 termMap := [], hist := fun _ => none, dataTerm := 0 }
         tracker := CommitTracker.new (n - 1) n
         commitIdx := 0
@@ -268,7 +269,7 @@ inductive Step {n : Nat} : World n → World n → Prop
                   votesReceived := {i} } } }
           sent := w.sent ++
             [.requestVote i ((w.nodes i).pn.currentTerm + 1)
-              (w.nodes i).pn.lastTerm (w.nodes i).pn.durable]
+              (w.nodes i).pn.lastTerm (w.nodes i).pn.smDurable]
           dsent := w.dsent
           csent := w.csent
           committed := w.committed }
@@ -357,6 +358,7 @@ inductive Step {n : Nat} : World n → World n → Prop
             { dn := { pn := { (w.nodes i).pn with
                         role := .leader
                         lastTerm := (w.nodes i).pn.currentTerm }
+                      -- copy — not the counter (`Action::BecomeLeader`).
                       termMap := Uc2.Data.prunePush (w.nodes i).dn.termMap
                         (w.nodes i).pn.currentTerm (w.nodes i).pn.durable
                       hist := (w.nodes i).dn.hist
@@ -390,6 +392,28 @@ inductive Step {n : Nat} : World n → World n → Prop
               commitIdx := (w.nodes i).commitIdx
               reconciled := decide ((w.nodes i).pn.currentTerm ≤
                 Uc2.Data.lastTermOf (w.nodes i).dn.termMap) }
+          sent := w.sent
+          dsent := w.dsent
+          csent := w.csent
+          committed := w.committed }
+  /-- Issue #7: the consensus agent absorbing the durable counter. Commit-plane
+  neutral — no tracker, commit index or report is touched; it only lets this
+  node's ADVERTISED credential and future collapse base catch up with bytes it
+  has already fsynced and reported.
+  Restricted to a NON-LEADER, which costs nothing: `smDurable` is only ever READ
+  by `startElection` (the advertised credential), and that step already requires
+  `role ≠ .leader`. A leader that later stands must step down first, and can
+  absorb then — so no reachable credential is lost. The guard is what lets this
+  step reuse `provinv_election`, whose leader arm demands the data-node be
+  unchanged. -/
+  | absorbDurable (w : World n) (i : Fin n)
+      (hrole : (w.nodes i).pn.role ≠ .leader) :
+      Step w
+        { nodes := Function.update w.nodes i
+            { w.nodes i with
+              dn := { (w.nodes i).dn with
+                        pn := { (w.nodes i).pn with
+                                  smDurable := (w.nodes i).pn.durable } } }
           sent := w.sent
           dsent := w.dsent
           csent := w.csent
@@ -652,6 +676,9 @@ theorem step_project {n : Nat} {w w' : World n} (h : Step w w') :
   | becomeLeader i hrole hquorum =>
     rw [project_mk]
     exact .single (Uc2.Data.Step.becomeLeader w.project i hrole hquorum)
+  | absorbDurable i hrole =>
+    rw [project_mk]
+    exact .single (Data.Step.absorbDurable w.project i hrole)
   | crashRestart i =>
     rw [project_mk]
     exact .single (Uc2.Data.Step.crashRestart w.project i)
@@ -754,7 +781,7 @@ theorem nonvacuity_commit_completeness_trace :
       (w.nodes 1).hist 0 = some (1, 42) := by
   refine ⟨_,
     .tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail (.tail
-      (.tail (.tail (.tail (.tail
+      (.tail (.tail (.tail (.tail (.tail
       (.single (.startElection _ 0 (by decide)))
       (.deliverRequestVote _ 1 0 1 0 0 (by decide) (by decide)))
       (.deliverVote _ 0 1 1 (by decide) (by decide) (by decide)))
@@ -771,6 +798,11 @@ theorem nonvacuity_commit_completeness_trace :
         (advance_fires ⟨[1, 0], 2, 0⟩ 1 1 (by decide) (by decide)
           (by simp [CommitTracker.advance, CommitTracker.ranking,
                 List.mergeSort]))))
+      -- Issue #7: node 1 absorbs the counter before standing, so it advertises
+      -- the byte it has already fsynced AND reported — that report is what let
+      -- node 0 commit. Pre-split, `start_election` read the counter directly
+      -- and this step did not exist.
+      (.absorbDurable _ 1 (by decide)))
       (.startElection _ 1 (by decide)))
       (.deliverRequestVote _ 2 1 2 1 1 (by decide) (by decide)))
       (.deliverVote _ 1 2 2 (by decide) (by decide) (by decide)))
