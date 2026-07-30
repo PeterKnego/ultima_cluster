@@ -107,6 +107,29 @@ does the cut, moves its own cursor, cuts the journal, primes the counters, and
 bumps the generation counter the receiver watches. Only then does the new leader
 build its appender and write its NewTerm frame.
 
+Splitting the open across two duty cycles is not free, and the bill came due in
+review. The node's consensus agent polls the durable counter every cycle and
+feeds it to the election state machine, which keeps a *monotonic max*. During the
+new in-flight window that counter still holds the archive's uncollapsed frontier
+— which, by the whole premise of this bug, sits **above** the position we are
+collapsing to. So the state machine would latch a durable frontier covering bytes
+that were about to be cut away, and nothing would ever bring it back down: the
+downward clamp lives on the reconciliation path's `Truncated` event, which a
+collapse does not produce.
+
+That is not cosmetic. That number is the node's `last_durable` vote credential,
+and it is the node's own contribution to the commit quorum — so an inflated one
+lets a leader certify a commit at a position it does not physically hold. A
+phantom commit, introduced by the fix for a corruption. The remedy is small: skip
+the durable poll entirely while a leader open is pending. The collapse target
+*is* the state machine's durable, so skipping leaves it exactly where it already
+was.
+
+The lesson generalizes past this bug: when you convert a synchronous step into an
+emit-and-wait, audit every periodic poll that runs in the gap. The old code was
+correct partly by accident — the prime happened before the poll could observe
+anything else.
+
 The rule underneath is worth stating plainly, because it is easy to violate
 again:
 

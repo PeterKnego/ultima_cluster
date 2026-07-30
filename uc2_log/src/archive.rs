@@ -738,6 +738,16 @@ mod tests {
     /// REPRODUCTION of the nightly `elle_partition` archive fail-stop
     /// (`RecorderCorrupt { end: 0, claimed_len: <garbage> }`).
     ///
+    /// **This test asserts the BUG, not the fix.** It is a characterization
+    /// test: it drives the bad sequence by hand to keep an executable record of
+    /// the mechanism, and it would pass on either side of the repair — the fix
+    /// lives in `uc2_node` (`ArchiveCmd::Collapse` / `Consensus::on_collapsed`),
+    /// guarded by `leader_open_routes_the_collapse_through_the_archive` there.
+    /// If you are here because a change to `recordable_slice` turned this red,
+    /// the failure is about THIS test's premise, not your change — read
+    /// `collapse_routed_through_the_archive_keeps_the_walk_intact` below for
+    /// the behaviour that is actually contractual.
+    ///
     /// `Action::BecomeLeader` (uc2_node `node.rs`) collapses the volatile tail
     /// with `LogCounters::prime(base)` on the CONSENSUS thread, where
     /// `base = ElectionSm::durable` — a value sampled in an EARLIER duty cycle
