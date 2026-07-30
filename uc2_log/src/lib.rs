@@ -1,8 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! UC v2 log buffer + archive (M1).
-//! Spec: docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md §4.
+//! The replicated log: a shared-memory ring buffer, and the archive agent that
+//! makes it durable.
+//!
+//! The buffer is one mmap'd power-of-2 ring per node, addressed by absolute
+//! byte position rather than by entry index — which is what lets replication be
+//! a byte-stream fan-out and lets the buffer double as the retransmit buffer.
+//! The archive agent records it to [`ultima_journal`] in CRC'd blocks with one
+//! `fdatasync` per block; that is the only fsync site in the system.
+//!
+//! Spec: `docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md` §4.
 
 pub mod agent;
 pub mod archive;

@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! UC v2 sync shmem client SDK (M5 Task 10, spec §7).
+//! The client SDK: submit commands and run reads against a cluster.
+//!
+//! Synchronous and blocking, over shared memory — no async runtime, no
+//! `openraft`, no `quinn`. A client attaches to one node's instance directory;
+//! writes are leader-only, [`Client::query_linearizable`] goes through the
+//! node's quorum read barrier, and [`Client::query_snapshot`] is answered from
+//! the local replica. See `docs/QUICKSTART.md` for a worked example.
 //!
 //! [`Client::connect`] attaches to a running node's shared-memory IPC (the
 //! cnc v2 page, the client-facing MPSC ingress/query rings, and the

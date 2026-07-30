@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! UC v2 minimal node composition (M4, spec §3.2).
+//! The `ultima_cluster` node — the process that participates in consensus,
+//! replicates the log, and makes it durable.
 //!
-//! The seed of the composition crate: agent wiring and role switching only —
-//! no discovery dir, no `instance.lock`, no cnc mmap, no client IPC (all M5).
+//! [`Node::start`] spawns the agent threads and returns immediately; the node
+//! then runs until dropped. A service (`uc2_service`) and clients
+//! (`uc2_client`) attach to it through the instance directory's shared
+//! memory. See `docs/ARCHITECTURE.md` for how the pieces fit together, and
+//! `docs/QUICKSTART.md` for a runnable cluster.
+//!
 //! One [`Node`] owns four single-writer polling agents over a shared
 //! [`uc2_log::buffer::LogBuffer`]:
 //!
