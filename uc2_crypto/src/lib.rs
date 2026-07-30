@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! UC v2 wire crypto (spec: docs/superpowers/specs/2026-07-28-uc2-wire-crypto-design.md).
+//! Optional authenticated and encrypted node-to-node transport.
+//!
+//! Off by default. X25519 identities on a runtime-reloadable allowlist, a Noise
+//! `IK` handshake for pairwise keys, and a rotating cluster group key for the
+//! byte-identical fan-out traffic so the leader seals once and sends N times.
+//! The threat model is a network-path adversary; a compromised host and a
+//! malicious cluster member are explicitly out of model — see
+//! `docs/VERIFICATION.md` §10 and runbook §11.
 //!
 //! Pure-sync, like `uc2_consensus`: no `async`, no sockets, no clock reads —
 //! time enters as an explicit `now_ns: u64` so the deterministic simulator
