@@ -5,30 +5,46 @@ server**: Raft-style consensus safety over a shared-memory log buffer, with the
 user's deterministic business logic running in a separate process at
 memory-channel speed.
 
-**Status: v2.0**, milestones M1–M6 complete. Every gate below passed on a
-3×`c6id.2xlarge` AWS fleet with fsync on and linearizable reads:
+### 1.64 M responses/s at p99 0.771 ms
 
-| Gate | Result |
-|---|---|
-| End-to-end SDK round trip (M5) | **1.64 M responses/s @ p50 0.600 ms** (4.1× the ≥400 k bar) |
-| Commit pipeline ceiling (M3) | 2.88 M commits/s @ p50 0.946 ms |
-| Leader failover (M4) | p50 202 ms, 10/10 zero committed loss |
-| Learner join under load (M6, 4-host) | commit-rate dip **0.9 %** (gate < 10 %) |
-| Below-floor snapshot reconstruction (M6) | worst **2.80 s** across 5 purge cycles, zero read divergence |
+End to end through the SDK — client submit, consensus, apply, response — with
+**every operation quorum-fsync'd before it is acked** and reads linearizable.
+p50 0.600 ms, p90 0.682 ms; the tail sits 0.17 ms above the median. Measured on
+3 × `c6id.2xlarge`, 64 B payloads.
+→ [M5 gate record](/docs/benchmarks/uc2-m5-gate-2026-07-12.md)
 
-Every gate record commits its pass/fail rule to the repository *before* the run.
+### Leader failover p50 202 ms, zero committed loss in 10 of 10 kills
 
-**Since v2.0:**
+p90 279 ms, worst 394 ms. Measured on a **4-vCPU sandbox over loopback, not the
+fleet** — failover here is timeout-dominated and real NVMe fsync is faster than
+the sandbox's ext4, so this is a conservative upper bound; the fleet
+detection-timing confirmation is still outstanding.
+→ [M4 gate record](/docs/benchmarks/uc2-m4-gate-2026-07-11.md)
 
-- **M7 — live single-server reconfiguration.** Implemented and green on the full
-  local proof stack (sim invariants, WGL capstones including a reconfig-churn arm,
-  crashtest, multi-process orchestrator run) —
-  [gate record](/docs/benchmarks/uc2-m7-gate-2026-07-13.md). The 5-host fleet run is
-  a separate step; `v2.1.0` is tagged only once it lands.
-- **M8 — opt-in wire crypto.** Authenticated and encrypted node↔node UDP, off by
-  default; **PASS** at 94.1% of cleartext throughput —
-  [gate record](/docs/benchmarks/uc2-m8-gate-2026-07-29.md). Wire protocol 0.4.0,
-  unreleased.
+---
+
+**Status: v2.1.0** — milestones M1–M7 complete. M8 (opt-in wire crypto) is
+merged and unreleased.
+
+| Gate | Result | Measured on |
+|---|---|---|
+| End-to-end SDK round trip (M5) | **1.64 M responses/s** @ p50 0.600 / p99 0.771 ms (4.1× the ≥400 k bar) | 3-host fleet |
+| Commit pipeline ceiling (M3) | 2.88 M commits/s @ p50 0.946 / p99 1.132 ms | 3-host fleet |
+| Leader failover (M4) | p50 202 ms, p90 279 ms, 10/10 zero committed loss | 4-vCPU sandbox, loopback |
+| Learner join under load (M6) | commit-rate dip **0.9 %** (gate < 10 %) | 4-host fleet |
+| Below-floor snapshot reconstruction (M6) | worst **2.80 s** across 5 purge cycles, zero read divergence | 4-host fleet |
+| Live single-server reconfiguration (M7) | per-transition dip **0.0–4.7 %**, leader self-removal handoff 3.22 s | 5-host fleet |
+| Opt-in wire crypto (M8) | **94.1 %** of cleartext throughput | 4-vCPU dev box; ratio only |
+
+Fleet runs are `c6id.2xlarge`, us-east-1, single AZ, cluster placement group,
+NVMe journals, fsync on. The two non-fleet rows say so rather than borrowing the
+fleet's credibility — M4's fleet confirmation and M8's fleet ratio are both open
+work.
+
+**Every gate record commits its pass/fail rule to this repository before the
+run.** The decide rule and the result are separate commits, in that order; git
+history is the audit trail. Records that failed their bar say so and keep the
+bar.
 
 ## Try it
 
@@ -155,7 +171,7 @@ Bench/fleet tooling lives under [`bench-infra/`](/bench-infra) (terraform +
 ansible + the fleet-gate orchestrator; refuses to run journal-bearing gates on
 RAM-backed filesystems).
 
-## Scope (v2.0 + M7)
+## Scope (v2.1)
 
 **Dynamic membership (M7)**: single-server reconfiguration is shipped —
 promote / demote / add / remove one member at a time, live, under load, via
