@@ -491,7 +491,52 @@ Two things that construction taught us, worth keeping:
   within one duty cycle of an archive advance. That is a statement about
   probability, not reachability — and reachability is what a model is for.
 
-The Lean half remains open: splitting `PNode.durable` is its own piece of work.
+**Lean half — PARTIALLY LANDED 2026-07-30.**
+
+What landed: `Uc2Proofs/DurableSkew.lean`, a machine-checked PAIR isolating the
+join this finding is about.
+
+- `grant_bridge_sound_on_counter` — with the vote comparand on the COUNTER, the
+  `omega` at `StageB` ~1899-1912 is valid. This is the shipped system, and it is
+  why `GrantReport` remains provable after 26d4827.
+- `grant_bridge_false_on_absorbed_copy` — with the vote comparand on a LAGGING
+  absorbed copy, the same join is **false, with a witness**: counter 1000,
+  already reported 1000, absorbed copy 900, candidate advertises 900, `logOk`
+  grants on the tie, and `1000 ≤ 900` is refuted. Note the copy is a perfectly
+  legitimate lag (`900 ≤ 1000`) — the unsoundness is not a corrupt value, it is
+  the join treating it as the number the report was stamped from.
+
+Both sorry-free (`propext`, `Quot.sound`). They are stated over bare `Nat`s and
+the real `logOk` kernel, deliberately independent of `PNode` — which is the
+honest level available: **while `PNode.durable` is one field, no world-level
+theorem in this corpus can even state the distinction**, so a world-level
+countermodel cannot be written.
+
+A refinement of the diagnosis above, worth recording because it moves the
+suspect: **the identity is used EXACTLY ONCE in the whole corpus**, at
+`StageB.lean` ~1899-1912. So the `Nat.le_refl` at `StageB:1290` is *not* where
+the bug hides — that step is sound with the report on the counter either way.
+It hides in the `omega` that joins `d ≤ durable_y` to `durable_y ≤ cd`.
+Everything downstream (`GrantReport` → `crux_become_leader` → the unlanded
+`CommittedTermAtLeaders`) inherits it through that single join.
+
+What did NOT land: the `PNode` split itself. It is banked, non-building, on
+branch `uc2/lean-durable-split-wip` with a full completion note — the design
+plus five files of propagation (`Protocol`, `ElectionSafety`, `ProtocolData`,
+`LogMatching`, `ProtocolCommit` green in isolation; ~22 case sites left across
+`MapWF`/`LcClosure`/`TakeDiscipline`/`ReportProvenance`/`StageB`/`StageC`). Two
+things learned there that the next attempt should start from:
+
+1. The mechanical `crashRestart`-twin template is WRONG wherever a case leans on
+   the role CHANGING (crashRestart drops to follower; absorbing does not). The
+   correct shape is "everything transfers" — worked examples in `LogMatching`
+   and `MapWF`.
+2. Moving role (d) — `becomeLeader`'s collapse base — to the absorbed copy
+   requires a `smDurable ≤ durable` invariant threaded through the entire
+   `MapWF`/`LcClosure`/`ReportProvenance` frontier stack (`NodeWF.last_base` and
+   friends). That is a project of its own, and it is NOT needed for the
+   grant-plane result: a candidate that is genuinely behind has a low counter
+   too, so the loss is expressible without it.
 
 ### Restatements (recorded for completeness, not spec gaps)
 
