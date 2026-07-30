@@ -458,14 +458,40 @@ gossip-driven reconcile truncation, which `Era`-conditioning repairs — the Rus
 hazard needs no truncation, no gossip and no term change on the voter, so
 `Era`-conditioning does not exclude it.
 
-**`uc2_sim` is blind to it too**, and for a mirror-image reason: `world.rs`
-advances the node's durable and feeds `Event::DurableAdvanced` as consecutive
-statements in one `ArchiveStep` handler, with the commit report derived from the
-same value — and `SimEvent` has no consensus-agent step at all. The invariants
-(`inv4` committed-never-truncated, `inv5` leader completeness) WOULD catch the
-resulting loss; the world model cannot generate the trace. Making it expressible
-needs a `SimEvent::ConsensusStep` carrying `DurableAdvanced`, or a separate
-`Node.reported_durable` with a deferred feed.
+**`uc2_sim` was blind to it too** (mirror-image reason), and **that half is now
+CLOSED.** `world.rs` used to advance the node's durable and feed
+`Event::DurableAdvanced` as consecutive statements in one `ArchiveStep` handler,
+with the commit report derived from the same value — and `SimEvent` had no
+consensus-agent step at all. `SimEvent::ConsensusStep` now absorbs the counter
+into the SM on its own cadence, so the report path and the vote-credential path
+read the counter on independent schedules and can disagree, exactly as the two
+threads do.
+
+Teeth, not just expressiveness: `stale_vote_credential_opens_a_term_below_a_committed_position`
+(RED, `vote_refresh_durable: false`) reaches the loss on seed 13 —
+`inv2` convicts with *"node 2 committed-position boundaries `[(1,0),(3,2976)]`
+are not a leading slice of the committed lineage prefix `[(1,0),(4,3072)]`
+(gmc=3168)"*, i.e. a term opened below a committed position. Its GREEN twin
+`fresh_vote_credential_survives_the_same_construction` is clean over the same 40
+seeds on an identical construction, so the arms discriminate on exactly one
+thing: whether the voter re-reads its own counter before answering.
+
+Two things that construction taught us, worth keeping:
+
+- **A crash storm cannot produce this.** 200 seeds of `nasty_reconcile_config`
+  find nothing, and the reason is structural: elections there only start after
+  the leader crashes, and once it has, no data flows, so every archive has
+  caught up by the time anyone campaigns — the skew is zero at vote time
+  (measured: 435k archive advances, 258 `RequestVote` deliveries, **0** with the
+  counter ahead of the absorbed copy). The bug needs a LIVE leader still
+  committing while a DIFFERENT node campaigns, i.e. partitions, not crashes.
+- **The real-hardware window is genuinely narrow**, and the sim exaggerates it
+  deliberately (`consensus_step_ns` 20 ms vs a 5 ms archive cadence; a real
+  busy-spin consensus agent absorbs in microseconds). The vote must arrive
+  within one duty cycle of an archive advance. That is a statement about
+  probability, not reachability — and reachability is what a model is for.
+
+The Lean half remains open: splitting `PNode.durable` is its own piece of work.
 
 ### Restatements (recorded for completeness, not spec gaps)
 

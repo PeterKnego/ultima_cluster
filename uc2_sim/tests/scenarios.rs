@@ -1515,12 +1515,16 @@ fn drive_to_candidate_lagged(seed: u64, handle_keyed: bool) -> Option<(World, us
 ///       to rank the divergent report — a multi-actor setup the storm does not
 ///       isolate (the discriminating-seed probe found none: at storm rates every
 ///       counterfactual catch is the documented benign both-arms inv2 laggard).
-/// Working seed: 7 (f becomes a term-4 candidate, handle 3, map [(1,0),(2,1344)]).
+/// Working seed: 3. (Was 7 before issue #7 split `SimEvent::ConsensusStep` out
+/// of `ArchiveStep`; that added an event per node per ms, which reshuffles every
+/// schedule and so re-rolls which seed reaches this state. The state itself — a
+/// lagged-handle candidate with the gate closed — is asserted as a precondition
+/// below, so a stale seed fails loudly rather than silently testing nothing.)
 #[test]
 fn finding9_lagged_handle_candidate_reopen_needs_handle_keyed() {
     // ---- RED: the counterfactual reopens the lagged-handle candidate's gate. ----
     let (mut w, f, ct) =
-        drive_to_candidate_lagged(7, false).expect("reach the lagged-handle candidate (red)");
+        drive_to_candidate_lagged(3, false).expect("reach the lagged-handle candidate (red)");
     assert!(!w.node_intake_gate(f), "precondition: candidate's gate is closed");
     assert!(
         w.node_adopted_term(f) < w.node_term(f),
@@ -1541,7 +1545,7 @@ fn finding9_lagged_handle_candidate_reopen_needs_handle_keyed() {
 
     // ---- GREEN: the shipped fix keeps the gate closed; the candidate converges. ----
     let (mut w, f, ct) =
-        drive_to_candidate_lagged(7, true).expect("reach the lagged-handle candidate (green)");
+        drive_to_candidate_lagged(3, true).expect("reach the lagged-handle candidate (green)");
     assert!(!w.node_intake_gate(f), "precondition: candidate's gate is closed");
     assert!(
         w.node_adopted_term(f) < w.node_term(f),
@@ -1579,7 +1583,7 @@ fn finding9_lagged_handle_candidate_reopen_needs_handle_keyed() {
 #[test]
 fn finding9_truncating_arm_reopen_needs_handle_keyed() {
     for (handle_keyed, expect_open) in [(false, true), (true, false)] {
-        let (mut w, f, ct) = drive_to_candidate_lagged(7, handle_keyed)
+        let (mut w, f, ct) = drive_to_candidate_lagged(3, handle_keyed)
             .expect("reach the lagged-handle candidate");
         assert!(!w.node_intake_gate(f), "precondition: candidate's gate is closed");
         assert!(
@@ -1589,11 +1593,27 @@ fn finding9_truncating_arm_reopen_needs_handle_keyed() {
             w.node_term(f)
         );
         let from = (0..3).find(|&i| i != f).unwrap();
-        // A divergent co-term map: shared prefix [(1,0),(2,1344)], then term 4
-        // opened at 2800 inside f's uncommitted term-2 tail -> reconcile
-        // truncates at 2800 (produces Action::Truncate).
+        // A divergent co-term map: f's OWN map as the shared prefix, plus the
+        // candidate term opening inside f's uncommitted tail, so reconcile
+        // truncates there (produces `Action::Truncate`).
+        //
+        // DERIVED from f's live state, not hardcoded. The cut must land strictly
+        // above f's committed high-water — a below-committed cut is an inv4
+        // violation, i.e. a broken test rather than a test of the reopen — and
+        // at or below its durable frontier. The original positions were tuned to
+        // one seed's trace and silently became wrong the moment the schedule
+        // changed (issue #7 added a per-node event, re-rolling every seed).
+        let mut map = w.node_map(f);
+        let prev_base = map.last().map(|&(_, b)| b).unwrap_or(0);
+        let cut = prev_base.max(w.node_commit_high_water(f)) + 1;
+        assert!(
+            cut <= w.node_durable(f),
+            "precondition: f needs an uncommitted tail to cut (cut {cut} > durable {})",
+            w.node_durable(f)
+        );
+        map.push((ct, cut));
         let truncs_before = w.truncations();
-        w.inject_term_map(from, f, ct, vec![(1, 0), (2, 1344), (4, 2800)]).expect("divergent reconcile");
+        w.inject_term_map(from, f, ct, map).expect("divergent reconcile");
         // Let the archive truncation ack land (on_truncated_feedback runs the
         // truncating-arm reopen check).
         w.run_steps(50).expect("process the truncation ack");
@@ -2017,4 +2037,90 @@ fn cold_start_with_a_member_down_still_forms_and_seals() {
         "the surviving majority must still form and commit despite one member \
          permanently unreachable and frequent re-election"
     );
+}
+
+/// Issue #7 — a leader that opens its term below a committed position, reached
+/// through the durable dual-reader skew. THE TEETH: this is what the
+/// `SimEvent::ConsensusStep` split exists to make reachable.
+///
+/// Construction (a live leader must still be committing while someone else
+/// campaigns — a crash storm cannot produce this, which is why 200 seeds of
+/// `nasty_reconcile_config` find nothing):
+///   1. run to a leader `l`;
+///   2. cut `c` off from `l` — `c`'s durable freezes and it will time out;
+///   3. cut `b` off from `l` a little later — `b`'s durable freezes at a
+///      position it has ALREADY REPORTED, and which `l` has therefore already
+///      ranked into `commit`, while `b`'s consensus agent has not yet absorbed
+///      it;
+///   4. `c` campaigns. `b` judges `c`'s credential against its stale absorbed
+///      copy, grants, and `c` opens a term BELOW the commit.
+///
+/// `consensus_step_ns` is deliberately coarse (20 ms vs the 5 ms archive
+/// cadence). On real hardware the consensus agent absorbs within microseconds,
+/// so this window is genuinely narrow — the bug needs a vote to arrive inside
+/// one duty cycle of an archive advance. The sim's job is REACHABILITY, not
+/// probability: a schedule that is rare on hardware must be routinely
+/// explorable here, or the invariants never get to judge it at all.
+#[test]
+fn stale_vote_credential_opens_a_term_below_a_committed_position() {
+    for seed in 0..40u64 {
+        let mut w = issue7_world(seed, false);
+        if let Err(v) = issue7_drive(&mut w) {
+            assert!(
+                w.stale_vote_windows() > 0,
+                "seed {seed} caught {} but never answered a vote across the skew — \
+                 that is some OTHER bug, not issue #7",
+                v.invariant
+            );
+            // inv2 convicts first: the bad grant produces a term boundary that is
+            // not a leading slice of the committed lineage — i.e. a term opened
+            // below a committed position. inv4/inv5 are the deeper statements of
+            // the same loss; whichever fires, a safety invariant must.
+            println!("issue #7 RED, seed {seed}: [{}] {}", v.invariant, v.detail);
+            return;
+        }
+    }
+    panic!(
+        "no seed reached the loss — if ArchiveStep and ConsensusStep have been re-fused \
+         (issue #7), or the pre-vote refresh has been moved back into the SM-fed path, \
+         this trace becomes UNREACHABLE rather than absent, and the invariants below \
+         silently stop guarding the vote-credential plane"
+    );
+}
+
+/// The GREEN twin: the shipped behaviour (`vote_refresh_durable: true`, the
+/// default) survives the IDENTICAL construction across the same seeds. The only
+/// difference between the arms is whether a voter re-reads its own durable
+/// counter before answering a `RequestVote`, so this is a genuine discrimination
+/// rather than a one-sided pin.
+#[test]
+fn fresh_vote_credential_survives_the_same_construction() {
+    for seed in 0..40u64 {
+        let mut w = issue7_world(seed, true);
+        if let Err(v) = issue7_drive(&mut w) {
+            panic!("seed {seed}: shipped behaviour must survive: {v:?}");
+        }
+    }
+}
+
+fn issue7_world(seed: u64, vote_refresh_durable: bool) -> World {
+    let mut cfg =
+        SimConfig { n_nodes: 3, drop_per_million: 0, max_steps: 200_000, ..base_cfg(seed) };
+    cfg.vote_refresh_durable = vote_refresh_durable;
+    cfg.consensus_step_ns = 4 * cfg.archive_step_ns; // see the RED doc comment
+    World::new(cfg)
+}
+
+/// Shared construction for both arms — identical modulo `vote_refresh_durable`.
+fn issue7_drive(w: &mut World) -> Result<(), InvariantViolation> {
+    w.run_until_leader()?;
+    let l = w.current_leader().expect("a leader");
+    let c = (0..3).find(|&i| i != l).expect("follower c");
+    let b = (0..3).find(|&i| i != l && i != c).expect("follower b");
+    w.run_steps(200)?;
+    w.partition(l, c); // c freezes and will campaign; b keeps streaming + reporting
+    w.run_steps(400)?;
+    w.partition(l, b); // b freezes at an already-reported, already-committed position
+    w.run()?;
+    Ok(())
 }
