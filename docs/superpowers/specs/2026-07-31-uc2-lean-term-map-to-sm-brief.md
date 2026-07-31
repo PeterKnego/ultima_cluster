@@ -113,9 +113,13 @@ claim lockstep.
 
 Sequencing that keeps the corpus green at every checkpoint:
 
+0. **Extract the map-growth reasoning into a reusable lemma FIRST.** See
+   "Correction" below — without this, step 1 is not mechanical.
+
 1. Add `observeDataTerm` and the `Cert` mirror **without** changing
    `recvReplicate` (the map then grows both ways; every existing invariant still
-   holds; pay the ~60 mechanical cases and land it green).
+   holds semantically). With step 0 done this is the ~60 mechanical cases and
+   lands green; without it, it is not.
 2. Restate the `hist`/`termMap` invariants to be lag-tolerant, still with
    `recvReplicate` growing the map (they hold trivially, so this is a pure
    statement change that can be landed and reviewed on its own).
@@ -134,3 +138,54 @@ Role (d) is not needed for the grant-plane result issue #7 is about. A candidate
 that is genuinely behind has a low counter too, so the acked-write loss is
 expressible — and is exhibited, over a reachable trace — without it. See
 `Uc2Proofs/DurableSkewWorld.lean`.
+
+
+## Correction (2026-07-31, after attempting step 1)
+
+**Step 1 as written above is NOT mechanical, and the estimate that it was is the
+one thing in this brief that was wrong.** Attempted, measured, reverted.
+
+Adding `observeDataTerm` beside `recvReplicate` leaves every existing invariant
+semantically TRUE — the map still grows on replication, so nothing lags. But each
+invariant must be **re-proved for the new constructor**, and for the map-sensitive
+ones that is not a transfer. `MapWF`'s `NodeWF` case for `deliverReplicate` is
+~90 lines across two arms (map grows / observation is idempotent), and it is
+written against `recvReplicate_fields` and `hpos : pos = durable`. The
+`observeDataTerm` analogue changes neither `hist` nor `durable`, so the
+`nonempty` and `last_base` bullets change meaning entirely and must be rewritten,
+not adapted.
+
+Every downstream file with a map-sensitive invariant (`MapWF`, `TakeDiscipline`,
+parts of `ReportProvenance`, `StageB`, `StageC`) has the same shape. The non-map
+invariants really are transfers, and those went through fine — `ProtocolData`,
+`ProtocolCommit` and `LogMatching` all reached green, the last needing one real
+argument (a reconciled node's map already ends at its own term, so with
+`hterm : t ≤ currentTerm` the observation is a no-op and `DInv`'s
+`map_pinned`/`gossip_pinned` survive).
+
+**Two constructor hypotheses were discovered by doing this, and both are keepers:**
+
+- `hbase : ∀ e, map.getLast? = some e → e.2 ≤ pos` — observations arrive in
+  position order (the archive scans recorded blocks front to back). Without it
+  `observeTerm` can append a base below the map's last and break ascending.
+  `deliverReplicate` gets this for free from `pos = durable` + `NodeWF.last_base`.
+- `hterm : t ≤ currentTerm` — the archive only observes terms this node accepted,
+  and the intake gate bounds those by the node's own term. Without it a
+  gate-open node could observe a term above its own and break the `reconciled`
+  pins.
+
+**Revised step 0.** Extract the map-growth reasoning from `deliverReplicate`'s
+`NodeWF` case into a lemma parameterised over the map change alone — something of
+the shape
+
+```lean
+theorem NodeWF.observeTerm_step (hn : NodeWF nd)
+    (hbase : ∀ e, nd.termMap.getLast? = some e → e.2 ≤ pos)
+    (hposd : pos < nd.pn.durable) (ht : 1 ≤ t) (htc : t ≤ nd.pn.currentTerm)
+    (hfields : …) : NodeWF nd'
+```
+
+so that `deliverReplicate` and `observeDataTerm` share it. That refactor is
+bounded, improves the corpus on its own, and is what makes step 1 the mechanical
+exercise this brief originally claimed it was. It should be landed and reviewed
+separately, against the CURRENT model, before any new constructor appears.
