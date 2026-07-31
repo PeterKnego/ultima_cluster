@@ -534,11 +534,49 @@ counter either way. It hid in the `omega` that joins `d ≤ durable_y` with
 `durable_y ≤ cd`. Everything downstream (`GrantReport` → `crux_become_leader` →
 the unlanded `CommittedTermAtLeaders`) inherits it through that one join.
 
-**Still open, deliberately.** (1) Role (d) — `becomeLeader`'s collapse base —
-stays on the counter. Faithfully it is the absorbed copy, but moving it needs
-`SmLeDurable` threaded through `NodeWF.last_base` and the whole
-`MapWF`/`LcClosure`/`ReportProvenance` frontier stack. It is not needed for the
-grant-plane result: a candidate that is genuinely behind has a low counter too.
+**Role (d) — ATTEMPTED 2026-07-31, and it is NOT a proof-engineering gap.**
+Moving `becomeLeader`'s collapse base from the counter to the absorbed copy was
+expected to cost only `SmLeDurable` threaded through `NodeWF.last_base`. It costs
+more than that, and the reason is a genuine fidelity finding rather than
+bookkeeping.
+
+`prunePush_wf` needs `∀ e, map.getLast? = some e → e.2 ≤ base`. With
+`base := smDurable` that is `map.last.base ≤ smDurable`, and **in the model it is
+false**: `recvReplicate` grows the term map (via `observeTerm`) and the counter
+together in one step, while `smDurable` stays put. Push a base below an existing
+entry's and the map is no longer ascending, so `NodeWF` fails — correctly. The
+model is refusing the change, not failing to prove it.
+
+**Why the Rust is nonetheless fine, and what that depends on.** In
+`Consensus::do_work` the term-observation drain is step **1b**
+(`Event::DataTermObserved`, which grows the map) and the durable poll is step
+**2** (`Event::DurableAdvanced`, which raises `ElectionSm::durable`).
+`become_leader` fires from the vote drain at step **1a**, i.e. it reads state as
+of the END of the previous cycle — and that cycle's step 2 already raised
+`durable` to cover any base its step 1b observed (an observed base is recorded,
+so the counter was at least that). Hence `map.last.base ≤ ElectionSm::durable`
+holds at every `become_leader`.
+
+That invariant is **carried entirely by feed ordering**, and nothing enforces it:
+`election.rs`'s prune loop pops only entries with `base == self.durable` and then
+pushes `(current_term, self.durable)` with no monotonicity guard. Reorder those
+two drains — or freeze the durable poll while observations keep arriving — and
+the map goes non-monotone. Worth noting that issue #6's
+`pending_leader_open` suppression does freeze step 2 while 1b keeps running; a
+`become_leader` cannot fire inside that window, but the interaction deserves a
+look if that suppression is ever widened.
+
+**What finishing role (d) actually requires:** moving the TERM MAP to the SM's
+side of the split, so it grows when the consensus agent learns (a 1b-shaped step)
+rather than when the data plane replicates. That is a second remodelling —
+separating the data-plane frontier (counter + `hist`) from the SM's view (map +
+`smDurable`) — and it reaches into `LogMatching`, `MapWF` and `ReportProvenance`,
+where the map is central. Scoped as its own project; NOT attempted, because a
+half-done version would be less faithful than what is there now.
+
+Role (d) is in any case not needed for the grant-plane result: a candidate that
+is genuinely behind has a low counter too, so the loss is expressible without
+it.
 (2) ~~Lifting `DurableSkew`'s statements to worlds.~~ **DONE** — see the
 world-level lift below.
 (3) `absorbDurable` is guarded to a non-leader — free, since the copy is only
