@@ -568,11 +568,18 @@ look if that suppression is ever widened.
 
 **What finishing role (d) actually requires:** moving the TERM MAP to the SM's
 side of the split, so it grows when the consensus agent learns (a 1b-shaped step)
-rather than when the data plane replicates. That is a second remodelling —
-separating the data-plane frontier (counter + `hist`) from the SM's view (map +
-`smDurable`) — and it reaches into `LogMatching`, `MapWF` and `ReportProvenance`,
-where the map is central. Scoped as its own project; NOT attempted, because a
-half-done version would be less faithful than what is there now.
+rather than when the data plane replicates. **Designed and costed 2026-07-31 —
+see `docs/superpowers/specs/2026-07-31-uc2-lean-term-map-to-sm-brief.md`.** The
+design is three coordinated changes (`recvReplicate` stops growing the map; a new
+`observeDataTerm` step carrying `pos < smDurable`, which makes
+`∀ e ∈ map, e.2 < smDurable` true BY CONSTRUCTION; `applyGossip` reconciles
+against `smDurable`). Measured cost: ~60 mechanical cases (two new constructors ×
+the ~30 inductions each) plus the real work — ~64 sites across eight files couple
+`hist` to `termMap`, and once the map LAGS `hist` those invariants stop being
+TRUE rather than merely unproven. NOT attempted: a half-done version is LESS
+faithful than the current model, since it would have the map lagging while the
+invariants still claim lockstep. The brief gives a four-step sequencing that
+keeps the corpus green at every checkpoint.
 
 Role (d) is in any case not needed for the grant-plane result: a candidate that
 is genuinely behind has a low counter too, so the loss is expressible without
