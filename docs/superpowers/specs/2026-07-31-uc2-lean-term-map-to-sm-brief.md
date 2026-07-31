@@ -1,0 +1,136 @@
+# Brief: move the term map to the SM's side of the durable split (Lean)
+
+**Status:** scoped, NOT started. Written 2026-07-31 after a measured probe.
+**Context:** issue #7, role (d). Prerequisite for moving `becomeLeader`'s collapse
+base from the durable counter to the consensus agent's absorbed copy.
+**Gate doc:** `docs/benchmarks/uc2-lean-gate-2026-07-16.md`, Finding #12.
+
+## Why this exists
+
+Issue #7 split `PNode.durable` into `durable` (the counter — reported, and
+compared by `logOk`) and `smDurable` (the consensus agent's absorbed copy —
+advertised as the election credential). Role (d), moving `becomeLeader`'s
+collapse base to the copy, was expected to cost only `SmLeDurable` threaded
+through `NodeWF.last_base`. It does not.
+
+`prunePush_wf` needs `∀ e, map.getLast? = some e → e.2 ≤ base`. With
+`base := smDurable` that is `map.last.base ≤ smDurable`, and **in the model it is
+false**: `Node.recvReplicate` grows the term map (via `observeTerm`) and the
+counter together in one step, while `smDurable` stays put. Collapsing to the copy
+can then push a base below an existing entry and leave the map non-ascending, so
+`NodeWF` fails — correctly.
+
+The model is refusing the change, not failing to prove it. The map is currently
+modelled as data-plane state; in the real node it is the state machine's.
+
+## What the real node does, and the dependency it rests on
+
+In `Consensus::do_work`:
+
+- step **1b** drains data-stamped term observations → `Event::DataTermObserved`,
+  which grows `ElectionSm::term_map` and re-derives `last_term` from it;
+- step **2** polls the durable counter → `Event::DurableAdvanced`, raising
+  `ElectionSm::durable`;
+- `become_leader` fires from the vote drain at step **1a**, i.e. it reads state as
+  of the END of the previous cycle.
+
+So any base observed at a cycle's 1b is covered by that same cycle's step 2
+(an observed base is recorded, so the counter was at least that), and by the time
+`become_leader` runs at the next cycle's 1a, `map.last.base ≤ ElectionSm::durable`.
+
+**Nothing enforces this.** `election.rs`'s prune loop pops only entries with
+`base == self.durable` and then pushes `(current_term, self.durable)` with no
+monotonicity guard. Reorder those two drains — or freeze the durable poll while
+observations keep arriving — and the map goes non-monotone. Issue #6's
+`pending_leader_open` suppression does freeze step 2 while 1b keeps running;
+`become_leader` cannot fire inside that window, so it is not a live hazard today,
+but it is the interaction to re-check if that suppression is ever widened.
+
+Making the model carry this dependency explicitly is the point of the work below.
+
+## Design
+
+Three coordinated changes to `Uc2Proofs/ProtocolData.lean` (mirrored in
+`ProtocolCommit.lean`):
+
+1. **`Node.recvReplicate` stops growing the map.** It writes `hist` and advances
+   `durable` only — the data plane. `termMap` and `lastTerm` are untouched.
+
+2. **New step `observeDataTerm`** — the consensus agent learning a term:
+
+   ```lean
+   | observeDataTerm (w : World n) (i : Fin n) (pos t v : Nat)
+       (hhist : (w.nodes i).hist pos = some (t, v))
+       (hpos  : pos < (w.nodes i).pn.smDurable) :
+       Step w { … termMap := observeTerm (w.nodes i).termMap t pos
+                  pn := { … with lastTerm := lastTermOf (observeTerm …) } … }
+   ```
+
+   `hpos` is the load-bearing hypothesis: it is the model-level counterpart of
+   the 1b/2 ordering, and it makes `∀ e ∈ map, e.2 < smDurable` true **by
+   construction** — which is exactly what role (d) needs, without any new
+   inductive invariant.
+
+3. **`Node.applyGossip` reconciles against `smDurable`, not `durable`.** Rust's
+   `reconcile_term_map` runs on the SM's own durable, so the post-reconcile map
+   is clamped by the SM's view. Without this, gossip is a second path that can
+   lift `map.last.base` above `smDurable`.
+
+Projections: `observeDataTerm` maps to the base layer's `havocData` (which
+already havocs `lastTerm`), so `Uc2Proofs/Protocol.lean` needs no new
+constructor and `election_safety` is unaffected.
+
+## Measured cost
+
+A probe (applied, measured, reverted) established:
+
+- **Mechanical:** two new constructors — `Data.Step.observeDataTerm` and its
+  `Cert.Step` mirror — each requiring a case in every induction over that
+  relation. That is the ~30-case grind of the split, twice, ≈ 60 cases. Known
+  quantity; the traps are recorded in the gate doc (the `crashRestart`-twin
+  template is wrong wherever a case leans on the role changing, and
+  indentation-blind insertion displaces the original case).
+- **Substantive, and the real cost:** ~64 sites across eight files couple
+  `hist` to `termMap` (`LogMatching`, `MapWF`, `ReportProvenance`,
+  `TakeDiscipline`, `LcClosure`, `StageB`, `StageC`, `LeaderCompleteness`).
+  Once the map LAGS `hist`, invariants of the form "this node's map attributes
+  every byte it holds" stop being **true**, not merely unproven. They must be
+  restated with the lag accounted for — typically by conditioning on
+  `pos < smDurable` — and every consumer re-proved.
+- Every non-vacuity trace gains an `absorbDurable` + `observeDataTerm` pair
+  wherever it previously relied on replication to grow the map.
+
+`log_matching` itself is safe: its statement quantifies over `hist` only. The
+supporting `DInv`/`MapWF`/`ProvInv`/`TkInv` stack is what needs restating.
+
+## Recommendation
+
+Run it as its own arc, in the shape the veil commit-plane arc used: a driver
+session per layer with a gate between. Do NOT attempt it inside a session that is
+also doing other work — a half-done version is **less** faithful than the current
+model, because it would have the map lagging `hist` while the invariants still
+claim lockstep.
+
+Sequencing that keeps the corpus green at every checkpoint:
+
+1. Add `observeDataTerm` and the `Cert` mirror **without** changing
+   `recvReplicate` (the map then grows both ways; every existing invariant still
+   holds; pay the ~60 mechanical cases and land it green).
+2. Restate the `hist`/`termMap` invariants to be lag-tolerant, still with
+   `recvReplicate` growing the map (they hold trivially, so this is a pure
+   statement change that can be landed and reviewed on its own).
+3. Only then remove the map growth from `recvReplicate` and switch
+   `applyGossip` to `smDurable`. By this point the invariants already tolerate
+   the lag and the change should be close to mechanical.
+4. Land role (d): `becomeLeader`'s base becomes `smDurable`, discharged by
+   `∀ e ∈ map, e.2 < smDurable` from step 2's `hpos`.
+
+Steps 1 and 2 are individually landable and individually useful; step 3 is the
+one that cannot be half-done.
+
+## What is NOT blocked on this
+
+Role (d) is not needed for the grant-plane result issue #7 is about. A candidate
+that is genuinely behind has a low counter too, so the acked-write loss is
+expressible — and is exhibited, over a reachable trace — without it. See
+`Uc2Proofs/DurableSkewWorld.lean`.
