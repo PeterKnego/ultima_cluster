@@ -157,6 +157,8 @@ Start here:
   path. Written for someone who knows Raft and has not read the specs.
 - **[`docs/VERIFICATION.md`](/docs/VERIFICATION.md)** — what is proved, what is
   checked, what is only bug-hunted, and how to reproduce each.
+- **[`docs/BENCHMARKS.md`](/docs/BENCHMARKS.md)** — every measured result, what
+  it was measured on, and the read-barrier arc.
 - **[`docs/ops/uc2-runbook.md`](/docs/ops/uc2-runbook.md)** — operations:
   instance-dir layout, durability requirements, cnc decoding, purge enablement,
   live reconfiguration (`uc2ctl`), wire crypto setup.
@@ -164,7 +166,9 @@ Start here:
 Reference:
 
 - **Design specs (canonical):** [`docs/superpowers/specs/`](/docs/superpowers/specs) — [the v2 core design](/docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md) (M1–M6), [reconfiguration](/docs/superpowers/specs/2026-07-13-uc2-reconfig-design.md) (M7), [wire crypto](/docs/superpowers/specs/2026-07-28-uc2-wire-crypto-design.md) (M8)
-- **Milestone gate records:** [`docs/benchmarks/`](/docs/benchmarks) (`uc2-m1` … `uc2-m8`)
+- **Raw gate records:** [`docs/benchmarks/`](/docs/benchmarks) — the dated
+  originals behind [`BENCHMARKS.md`](/docs/BENCHMARKS.md), including the
+  correctness gates (elle, lean, veil)
 - **v1 history:** [`docs/tasks/`](/docs/tasks) — the retired openraft-based v1 stack's consolidated record (kept as the negative-results archive that shaped v2)
 
 Bench/fleet tooling lives under [`bench-infra/`](/bench-infra) (terraform +
