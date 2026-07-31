@@ -115,6 +115,9 @@ Sequencing that keeps the corpus green at every checkpoint:
 
 0. **Extract the map-growth reasoning into a reusable lemma FIRST.** See
    "Correction" below — without this, step 1 is not mechanical.
+   **DONE 2026-07-31:** `NodeWF.observeTerm_step` in `Uc2Proofs/MapWF.lean`,
+   with `NodeWF.observeTerm_static` as the validation that it is usable without
+   `pos = durable`. `deliverReplicate`'s case is now an 18-line application.
 
 1. Add `observeDataTerm` and the `Cert` mirror **without** changing
    `recvReplicate` (the map then grows both ways; every existing invariant still
@@ -174,9 +177,13 @@ argument (a reconciled node's map already ends at its own term, so with
   gate-open node could observe a term above its own and break the `reconciled`
   pins.
 
-**Revised step 0.** Extract the map-growth reasoning from `deliverReplicate`'s
-`NodeWF` case into a lemma parameterised over the map change alone — something of
-the shape
+**Revised step 0 — LANDED 2026-07-31.** Extract the map-growth reasoning from
+`deliverReplicate`'s `NodeWF` case into a lemma parameterised over the map change
+alone. Shipped as `NodeWF.observeTerm_step`; the final hypothesis set turned out
+slightly different from the sketch below (`hposcur : pos ≤ nd.pn.durable` plus
+`hdmono` replaced the strict `pos < nd'.pn.durable`, because the empty-map
+`floor0` case needs the base to be within the CURRENT frontier to force
+`pos = 0`). Sketch as originally written:
 
 ```lean
 theorem NodeWF.observeTerm_step (hn : NodeWF nd)

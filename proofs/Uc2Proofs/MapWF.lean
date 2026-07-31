@@ -418,6 +418,164 @@ theorem recvReplicate_fields {n : Nat} (nd : Node n) (pos t v : Nat) :
     (nd.recvReplicate pos t v).dataTerm = nd.dataTerm := by
   simp [Node.recvReplicate]
 
+/-- **Map growth, factored out.** `NodeWF` survives a step whose effect on the
+term map is `observeTerm m t pos`, given only facts ABOUT THAT GROWTH — not
+facts about the particular step performing it.
+
+This reasoning used to live inline in `minv_step`'s `deliverReplicate` case,
+entangled with `recvReplicate_fields` and `hpos : pos = durable`. Stating it here
+over `nd → nd'` makes it reusable by any step that grows the map the same way
+(issue #7 role (d)'s `observeDataTerm` is the motivating one — see
+`docs/superpowers/specs/2026-07-31-uc2-lean-term-map-to-sm-brief.md`), and it is
+what turns that change from a 90-line rewrite into an application.
+
+The two ordering hypotheses are the substance:
+* `hbase` — the new base does not land below the map's current last, so the map
+  stays ascending. `deliverReplicate` gets this from `pos = durable` plus
+  `hn.last_base`; a consensus-side observation gets it from scanning recorded
+  blocks in position order.
+* `hposcur` / `hdmono` — the new base is within the frontier the node already
+  has, and the frontier never regresses. That is what `nonempty` and `last_base`
+  need, and (with `hn.nonempty`) what forces `pos = 0` when the map is empty. -/
+theorem NodeWF.observeTerm_step {n : Nat} {nd nd' : Node n} {pos t : Nat}
+    (hn : NodeWF nd)
+    (ht1 : 1 ≤ t)
+    (htd : t ≤ nd.dataTerm)
+    (htc : t ≤ nd.pn.currentTerm)
+    (hbase : ∀ e, nd.termMap.getLast? = some e → e.2 ≤ pos)
+    (hposcur : pos ≤ nd.pn.durable)
+    (hdmono : nd.pn.durable ≤ nd'.pn.durable)
+    (hmap : nd'.termMap = observeTerm nd.termMap t pos)
+    (hro : nd'.pn.role = nd.pn.role)
+    (hct : nd'.pn.currentTerm = nd.pn.currentTerm)
+    (hdt : nd'.dataTerm = nd.dataTerm)
+    (hhist : ∀ p t' v', nd'.hist p = some (t', v') →
+      t' = t ∨ nd.hist p = some (t', v')) :
+    NodeWF nd' := by
+  by_cases hg : lastTermOf nd.termMap < t
+  · -- growth arm: the map opens the new term at `pos`
+    have hm' : observeTerm nd.termMap t pos = nd.termMap ++ [(t, pos)] := by
+      simp [observeTerm, hg]
+    refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+    · rw [hmap, hm']
+      exact hn.asc.snoc fun l hl => ⟨lastTermOf_getLast hl ▸ hg, hbase l hl⟩
+    · intro e he
+      rw [hmap, hm'] at he
+      cases hmm : nd.termMap with
+      | nil =>
+        rw [hmm, List.nil_append, List.head?_cons] at he
+        injection he with he'
+        subst he'
+        -- an empty map forces `durable = 0` (`hn.nonempty`), hence `pos = 0`
+        have hd0 : ¬ 0 < nd.pn.durable := fun hd => (hn.nonempty hd) hmm
+        omega
+      | cons a rest =>
+        rw [hmm, List.cons_append, List.head?_cons] at he
+        injection he with he'
+        subst he'
+        exact hn.floor0 a (by rw [hmm]; rfl)
+    · intro _
+      rw [hmap, hm']
+      simp
+    · intro e he
+      rw [hmap, hm', getLast?_append_singleton] at he
+      cases he
+      exact le_trans hposcur hdmono
+    · intro _
+      rw [hmap, hm']
+      simp
+    · rw [hro, hct]
+      exact hn.role_term_pos
+    · intro e he
+      rw [hct]
+      rw [hmap, hm'] at he
+      rcases List.mem_append.mp he with he | he
+      · exact hn.map_le e he
+      · rw [List.mem_singleton] at he
+        subst he
+        omega
+    · rw [hro, hct, hdt]
+      exact hn.cand_dt_lt
+    · intro hr e he
+      rw [hro] at hr
+      rw [hct]
+      rw [hmap, hm'] at he
+      rcases List.mem_append.mp he with he | he
+      · exact hn.cand_map_lt hr e he
+      · rw [List.mem_singleton] at he
+        subst he
+        have := hn.cand_dt_lt hr
+        omega
+    · intro p t' v' hh
+      rcases hhist p t' v' hh with rfl | hh2
+      · omega
+      · exact hn.hist_pos p t' v' hh2
+  · -- idempotent arm: the stamp is inside the mapped region
+    have hm'' : observeTerm nd.termMap t pos = nd.termMap := by
+      simp [observeTerm, hg]
+    refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+    · rw [hmap, hm'']; exact hn.asc
+    · intro e he; rw [hmap, hm''] at he; exact hn.floor0 e he
+    · rw [hmap, hm'']
+      intro _ hnil
+      rw [hnil] at hg
+      simp [lastTermOf] at hg
+      omega
+    · intro e he
+      rw [hmap, hm''] at he
+      have := hn.last_base e he
+      omega
+    · intro hr
+      rw [hro] at hr
+      rw [hmap, hm'']
+      exact hn.leader_map hr
+    · rw [hro, hct]
+      exact hn.role_term_pos
+    · intro e he
+      rw [hct]
+      rw [hmap, hm''] at he
+      exact hn.map_le e he
+    · rw [hro, hct, hdt]
+      exact hn.cand_dt_lt
+    · intro hr e he
+      rw [hro] at hr
+      rw [hct]
+      rw [hmap, hm''] at he
+      exact hn.cand_map_lt hr e he
+    · intro p t' v' hh
+      rcases hhist p t' v' hh with rfl | hh2
+      · omega
+      · exact hn.hist_pos p t' v' hh2
+
+/-- **Validation of the extraction.** The shape a CONSENSUS-SIDE observation
+needs: the term map grows while `hist` and the frontier stand still.
+
+`observeTerm_step` exists to be reusable by a step other than `deliverReplicate`,
+and the entanglement it had to shed was `pos = durable`. This corollary is the
+check that it actually shed it — it is proved with `hdmono` discharged by `rfl`
+and no relation between `pos` and the frontier beyond `pos ≤ durable`. Issue
+#7 role (d)'s `observeDataTerm` (see
+`docs/superpowers/specs/2026-07-31-uc2-lean-term-map-to-sm-brief.md`) is exactly
+this shape, and gets `hposcur` from `pos < smDurable` plus `SmLeDurable`.
+
+Unused today; it is a statement about the lemma above, not about the model. -/
+theorem NodeWF.observeTerm_static {n : Nat} {nd nd' : Node n} {pos t : Nat}
+    (hn : NodeWF nd)
+    (ht1 : 1 ≤ t)
+    (htd : t ≤ nd.dataTerm)
+    (htc : t ≤ nd.pn.currentTerm)
+    (hbase : ∀ e, nd.termMap.getLast? = some e → e.2 ≤ pos)
+    (hposcur : pos ≤ nd.pn.durable)
+    (hmap : nd'.termMap = observeTerm nd.termMap t pos)
+    (hdur : nd'.pn.durable = nd.pn.durable)
+    (hro : nd'.pn.role = nd.pn.role)
+    (hct : nd'.pn.currentTerm = nd.pn.currentTerm)
+    (hdt : nd'.dataTerm = nd.dataTerm)
+    (hhist : nd'.hist = nd.hist) :
+    NodeWF nd' :=
+  hn.observeTerm_step ht1 htd htc hbase hposcur (Nat.le_of_eq hdur.symm) hmap hro
+    hct hdt (fun p t' v' hh => .inr (by rw [← hhist]; exact hh))
+
 /-- Rebuild `NodeWF` across an update that leaves the data plane
 (termMap, hist, durable) untouched, given role/term transport. -/
 private theorem NodeWF.pn_step {n : Nat} {nd nd' : Node n} (h : NodeWF nd)
@@ -663,117 +821,22 @@ private theorem minv_step {n : Nat} {w w' : World n} (hw : Reachable w)
       have hdl := hstamp.data_le k
       obtain ⟨hm, hd, hhst, hro, hct, hdt⟩ :=
         recvReplicate_fields (w.nodes k) pos t v
-      by_cases hg : lastTermOf (w.nodes k).termMap < t
-      · -- growth arm: the map opens the new term at the frontier
-        have hm' : observeTerm (w.nodes k).termMap t pos
-            = (w.nodes k).termMap ++ [(t, pos)] := by
-          simp [observeTerm, hg]
-        refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
-        · rw [hm, hm']
-          exact hn.asc.snoc fun l hl =>
-            ⟨lastTermOf_getLast hl ▸ hg,
-             by rw [hpos]; exact hn.last_base l hl⟩
-        · intro e he
-          rw [hm, hm'] at he
-          cases hmm : (w.nodes k).termMap with
-          | nil =>
-            rw [hmm, List.nil_append, List.head?_cons] at he
-            injection he with he'
-            subst he'
-            have hd0 : ¬ 0 < (w.nodes k).pn.durable :=
-              fun hlt => hn.nonempty hlt hmm
-            omega
-          | cons a as =>
-            rw [hmm, List.cons_append, List.head?_cons] at he
-            injection he with he'
-            subst he'
-            exact hn.floor0 a (by rw [hmm]; rfl)
-        · rw [hd, hm, hm']
-          intro _
-          simp
-        · intro e he
-          rw [hm, hm', getLast?_append_singleton] at he
-          cases he
-          rw [hd]
-          exact Nat.le_succ pos
-        · intro hr
-          rw [hm, hm']
-          simp
-        · rw [hro, hct]
-          exact hn.role_term_pos
-        · intro e he
-          rw [hct]
-          rw [hm, hm'] at he
-          rcases List.mem_append.mp he with he | he
-          · exact hn.map_le e he
-          · rw [List.mem_singleton] at he
-            subst he
-            omega
-        · rw [hro, hct, hdt]
-          exact hn.cand_dt_lt
-        · intro hr e he
-          rw [hro] at hr
-          rw [hct]
-          rw [hm, hm'] at he
-          rcases List.mem_append.mp he with he | he
-          · exact hn.cand_map_lt hr e he
-          · rw [List.mem_singleton] at he
-            subst he
-            have := hn.cand_dt_lt hr
-            omega
-        · intro p t' v' hh
-          rw [hhst] at hh
-          by_cases hp : p = pos
-          · subst hp
-            rw [Function.update_self, Option.some.injEq, Prod.mk.injEq] at hh
-            omega
-          · rw [Function.update_of_ne hp] at hh
-            exact hn.hist_pos p t' v' hh
-      · -- idempotent arm: the stamp is inside the mapped region
-        have hm'' : observeTerm (w.nodes k).termMap t pos
-            = (w.nodes k).termMap := by
-          simp [observeTerm, hg]
-        refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
-        · rw [hm, hm'']
-          exact hn.asc
-        · intro e he
-          rw [hm, hm''] at he
-          exact hn.floor0 e he
-        · rw [hd, hm, hm'']
-          intro _ hnil
-          rw [hnil] at hg
-          simp [lastTermOf] at hg
-          omega
-        · intro e he
-          rw [hm, hm''] at he
-          rw [hd]
-          have := hn.last_base e he
-          omega
-        · intro hr
-          rw [hro] at hr
-          rw [hm, hm'']
-          exact hn.leader_map hr
-        · rw [hro, hct]
-          exact hn.role_term_pos
-        · intro e he
-          rw [hct]
-          rw [hm, hm''] at he
-          exact hn.map_le e he
-        · rw [hro, hct, hdt]
-          exact hn.cand_dt_lt
-        · intro hr e he
-          rw [hro] at hr
-          rw [hct]
-          rw [hm, hm''] at he
-          exact hn.cand_map_lt hr e he
-        · intro p t' v' hh
-          rw [hhst] at hh
-          by_cases hp : p = pos
-          · subst hp
-            rw [Function.update_self, Option.some.injEq, Prod.mk.injEq] at hh
-            omega
-          · rw [Function.update_of_ne hp] at hh
-            exact hn.hist_pos p t' v' hh
+      -- The map growth is `NodeWF.observeTerm_step`; all this case has to do is
+      -- supply the ordering facts, which it gets from `pos = durable`.
+      refine hn.observeTerm_step ht1 ?_ ?_ ?_ ?_ ?_ hm hro hct hdt ?_
+      · rw [← hhdr]; exact hthdr
+      · exact Nat.le_trans (by rw [← hhdr]; exact hthdr) hdl
+      · intro l hl; rw [hpos]; exact hn.last_base l hl
+      · exact Nat.le_of_eq hpos
+      · rw [hd]; omega
+      · intro p t' v' hh
+        rw [hhst] at hh
+        by_cases hp : p = pos
+        · subst hp
+          rw [Function.update_self, Option.some.injEq, Prod.mk.injEq] at hh
+          exact .inl hh.1.symm
+        · rw [Function.update_of_ne hp] at hh
+          exact .inr hh
     · rw [Function.update_of_ne hne]
       exact h.node k
   | serveTail i p t v hrole hhist hp =>
