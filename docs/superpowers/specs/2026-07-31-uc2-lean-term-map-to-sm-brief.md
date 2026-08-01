@@ -327,3 +327,70 @@ different place than this brief assumed:
 The two extractions already landed remain the right groundwork — they are what
 step 3's real cases will be built from. What changes is that there is no cheap
 intermediate landing between here and there.
+
+
+## Scoping the FCA weakening (2026-08-01) — it needs a third field
+
+Read-only survey. `FramesCurrentAuthored` is
+`∀ j p t v, hist p = some (t,v) → termAt termMap p = t`, defined in
+`LeaderCompleteness` and discharged as `ProvInv.fca`.
+
+### Consumer census: 15 preservation sites, 4 genuine consumers
+
+**15 preservation sites** inside `provinv_step` — `exact h.fca k p t v hh` and
+three bundle transfers. These are the proof OF fca, not uses of it; under a
+weakened statement each needs the new side condition threaded, but each is a
+one-liner.
+
+**4 genuine consumers**, and they differ sharply:
+
+| site | what it needs | verdict |
+|---|---|---|
+| `StageB:444` | attribution at `e.2` for an entry `e` of the node's OWN map | **improves** — under the move, map entries satisfy the frontier condition by construction (it is exactly `observeDataTerm`'s `hpos`) |
+| `StageC:514` (`lc_of_ctl`) | attribution at a committed position on a leader | **low risk** — inside the unlanded `leader_completeness` assembly, whose hypothesis bundle (`CommittedTermAtLeaders`) is not yet fixed and can carry the condition |
+| `StageB:1126` | attribution at a served-tail position on a leader | **needs a route** to `p < frontier` |
+| `TakeDiscipline:1321` | attribution at `p` for a take-discipline pin | **needs a route** to `p < frontier` |
+
+So the consumer side is small: two sites need real work, one improves, one is
+deferred with the theorem it belongs to.
+
+### The finding: conditioning on `smDurable` is UNSOUND
+
+The obvious weakening — "attributes every byte held below `smDurable`" — is **not
+preserved by `absorbDurable`**. That step sets `smDurable := durable` and does
+NOT touch `termMap`, so every byte between the old and new `smDurable` becomes
+in-scope while still unattributed. The invariant would break on the very step
+that exists to model the consensus agent catching up.
+
+### Consequence: a third field
+
+The condition has to name what the MAP has actually absorbed, not what the
+counter-view has. That means a `mapFrontier` on the node — the archive's scan
+position — with
+
+* `observeDataTerm` advancing it (it is the step that observes),
+* `absorbDurable` leaving it alone,
+* `recvReplicate` leaving it alone,
+* an invariant chain `mapFrontier ≤ smDurable ≤ durable`,
+
+and FCA weakened to `p < mapFrontier → termAt termMap p = t`.
+
+This is a genuine addition to the model, not a restatement — and it is a THIRD
+frontier alongside the two the split already introduced. Worth stating plainly
+because it changes step 3's shape: the move is not "make the map lag", it is
+"give the map its own frontier and make everything that reads the map read that
+frontier too".
+
+### Revised size
+
+Bounded and now concrete, but larger than "weaken one theorem":
+
+1. add `mapFrontier` + the `≤ smDurable` invariant (a third `SmLeDurable`-shaped
+   induction, cheap — the existing one is the template);
+2. weaken FCA and re-thread its 15 preservation sites;
+3. fix the two consumers that need a frontier route (`StageB:1126`,
+   `TakeDiscipline:1321`);
+4. then the map-growth removal, `applyGossip` on `smDurable`, and role (d).
+
+The two extractions already landed still serve step 4. Nothing before that is
+worth landing on its own — see the step-1 degeneracy note above.
