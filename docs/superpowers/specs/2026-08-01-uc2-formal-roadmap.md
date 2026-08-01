@@ -26,12 +26,40 @@ what remains. Headline conclusions the ranking rests on:
   proving is the siege engine.** Both arcs' failure modes were asking one to
   do the other's job.
 
-**⚠ IN FLIGHT (do not collide):** the term-map-to-SM brief
-(`docs/superpowers/specs/2026-07-31-uc2-lean-term-map-to-sm-brief.md`,
-issue #7 role (d)) — step-0 refactors landed 07-31/08-01
-(`d4f04ff`, `64d519e`); the main model change is scoped, not started. Any
-session touching `Uc2Proofs/ProtocolData.lean` / `ProtocolCommit.lean` must
-read that brief first.
+## Tool portfolio (decided 2026-08-01 — applies to both repos)
+
+The portfolio is deliberately minimal: **two formalisms plus one specialized
+checker**, each in a niche nothing else covers. Rationale: a tool's real cost
+is the *standing* overhead after adoption — a toolchain that rots (precedent:
+the Aeneas/Lean-4.32 version wall), models that drift from the Rust unless
+CI-guarded, and a private pile of DSL gotchas that agent sessions pay tuition
+on (a large fraction of the Veil arc's cost was tool traps, now dead capital).
+Agent fluency is throughput: Lean and TLA+ have deep training-data presence;
+niche DSLs do not.
+
+1. **Lean (incl. Aeneas)** — the siege engine and the sole record. Aeneas is
+   the same proof language and skillset, one pipeline stage bolted on front.
+2. **TLA+/TLC** — the ONE scout: bounded explicit-state + liveness checking of
+   hand-written abstract models. Replaces Veil (retired permanently, not
+   banked — see Deprioritized). Specula, if ever trialed, is an automation
+   harness *over* this slot (it generates TLA+), never a third formalism.
+3. **loom** — weak-memory interleavings (Task F-UC-4); CI tooling, near-zero
+   standing cost. **kani is dropped** — its niche is covered by loom plus the
+   existing proptest/differential habits.
+
+The empirical stack (sim, lincheck, Elle + mutation) is testing, not sprawl —
+already in CI, already paying rent. **A new tool enters only through a gated
+spike with an exit-cheap clause** (the V0-maturity-gate / session-1-re-gate
+pattern that kept the Veil experiment a controlled cost).
+
+**Term-map-to-SM brief status:** PARKED 2026-08-01 (`d11221f`) — deliberately
+not started; `main` is green, the step-0 groundwork lemmas
+(`observeTerm_step`/`_static`, `termAt_observeTerm_self`/`_below`,
+`observeTerm_of_held_is_noop`) are landed and survive the pause, and none of
+it is on a correctness-critical path (issue #7's acked-write loss is fixed in
+Rust, sim-pinned, and refuted at world level in Lean). Anyone resuming it:
+read the brief (`docs/superpowers/specs/2026-07-31-uc2-lean-term-map-to-sm-brief.md`)
+and start at its FCA scoping section, not step 1.
 
 ---
 
@@ -184,20 +212,70 @@ arithmetic (wraparound, power-of-two masks).
 runs are slow); each test documents the ordering claim it checks and the
 `Ordering`s it would catch being weakened (mutation-check at least one:
 demote an `Acquire` to `Relaxed`, confirm loom fails — the elle-mutation
-"teeth" pattern, task47 in ultima_db).
+"teeth" pattern, task47 in ultima_db). Per the tool-portfolio decision, loom
+is the whole answer here — no kani, no weak-memory formalization.
+
+---
+
+## Task F-UC-5 — the scout slot: TLA+/TLC (opportunistic, LOW-MED priority)
+
+The portfolio's single model-checking slot. Four sanctioned uses, each small
+and independent; none blocks the Lean tasks above. Costs are session
+estimates under the standing gate/timebox discipline.
+
+- **(a) Re-run the two box-walled Veil measurements (~2–4 sessions).** The
+  ledger banked two honest "UNMEASURED, not absent" holes: the #6b full-loss
+  depth (killed at 12.1 GB RSS at n=3/Fin 4, session 4c) and the ReconfigLC
+  `leader_completeness` CE (~13 steps, no verdict in 700 s, session 3). Port
+  `Figure8.lean` / `ReconfigLC.lean` shapes to TLA+; TLC's disk-backed
+  fingerprint sets + symmetry reduction over node identities are expected to
+  turn "not viable in RAM" into "slow but finishes". Skip (b)'s ReconfigLC
+  half if F-UC-2 lands first — the theorem supersedes the bounded CE.
+- **(b) Election-liveness spec (~1–2 sessions).** The project's first
+  liveness result: everything proved or checked to date is safety-only.
+  Model `Protocol.lean`'s step relation in TLA+, check convergence
+  (eventually a leader) under fairness + message loss/timer nondeterminism.
+  A livelock CE here would be a real design finding the safety stack is
+  structurally blind to.
+- **(c) Design-time scouting of FUTURE protocol surfaces.** The standing
+  rule from the Veil post-mortem: the scout runs FIRST, at design time,
+  before fixes exist — that is the one configuration where bounded checking
+  beats proving (Amendment 3 of the 2026-07-19 brief said this and was
+  right). No current candidate (leases resolved via Rung A); applies to the
+  next new plane.
+- **(d) Specula trial — GATED, optional (~2–3 sessions max).**
+  https://github.com/specula-org/Specula — agents auto-write TLA+ specs +
+  invariants, TLC checks, violations reproduced at code level. Its
+  code-level-reproduction step attacks this project's measured cost center
+  (CE adjudication against Rust). Trial ONLY on a zero-formal-coverage
+  surface — `uc2_net`'s NAK/retransmit/flow-control plane is the designated
+  target (concurrent, complex, sim-tested only) — and ONLY under the arc's
+  discipline: a calibration gate first (revert a known fix — #5 is the
+  designated shallow one — confirm rediscovery), every CE treated as a
+  question until its code-level repro actually runs, exit cheap on a failed
+  maturity gate (the V0 pattern). Do not point it at the election/commit
+  planes: exhaustively swept, four bugs already fixed; an auto-generated
+  spec will only rediscover model-fidelity artifacts there.
+
+**Exit criteria per use:** a short memo in `docs/benchmarks/` recording
+verdicts, bounds, and abstraction obligations — bounded results are never
+the record; `proofs/` is.
 
 ---
 
 ## Deprioritized — recorded so the reasoning isn't re-litigated
 
-- **Reopening Veil / the P2 residue in the SMT fragment.** Item 73 is a
-  proof that it cannot close there. Closes via F-UC-2. The Veil toolchain
-  stays useful as a *scout* for genuinely NEW protocol surfaces (run it at
-  design time, before fixes exist — the one configuration where it beats
-  proving; the 2026-07-19 brief's Amendment 3 said this and was right). Box
-  envelope if ever revived: n=3/Fin 3 exhaustive ≈ affordable (~7 GB);
-  n=3/Fin 4 and n=4 are NOT viable on a 15 GB box (ledger, capacity
-  envelope). Every constrained run needs a vacuity canary run FIRST.
+- **Veil — RETIRED PERMANENTLY (tool-portfolio decision, 2026-08-01), not
+  merely banked.** The P2 residue closes via F-UC-2 (item 73 proves it
+  cannot close in the SMT fragment). The scout *role* survives — it moves to
+  TLA+/TLC (Task F-UC-5) — and the arc's transferable lessons apply to ANY
+  checker: run it at design time before fixes exist; every constrained run
+  needs a vacuity canary run FIRST; a green verdict must be checked for
+  silent voiding and for depth-bound-vs-exhaustive ambiguity; a CE is a
+  question, not an answer. The measured capacity envelope (n=3/Fin 3
+  exhaustive ≈ 11.7M states / ~7 GB; Fin 4 and n=4 not viable in RAM on a
+  15 GB box) stays on record as the baseline TLC's disk-backed state storage
+  is expected to beat.
 - **Linearizable-read barrier TOCTOU model.** Subtle and provable, but
   `lin_v2.rs` / `lin_partition_v2.rs` hammer it empirically with the WGL
   checker; marginal value low until the barrier changes.
