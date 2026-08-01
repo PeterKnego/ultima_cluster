@@ -1,5 +1,23 @@
 # Brief: move the term map to the SM's side of the durable split (Lean)
 
+> **STATUS: PARKED 2026-08-01.** Not started, and deliberately so. Everything
+> below is design and measurement, all of it produced by applied-then-reverted
+> probes rather than estimates. `main` is green throughout — nothing here is
+> half-landed.
+>
+> **Nothing in this brief is on a correctness critical path.** The acked-write
+> loss that motivated it (issue #7) is fixed in Rust, caught by `uc2_sim`, and
+> refuted at world level in Lean. This is model fidelity.
+>
+> **If you pick it up, start at "Scoping the FCA weakening" (last section) —
+> not at step 1.** The staging in the middle of this document was corrected
+> twice by doing it; the last two sections supersede it.
+>
+> **Landed groundwork** (green, on `main`, useful whenever this resumes):
+> `NodeWF.observeTerm_step` + `NodeWF.observeTerm_static` (`MapWF`),
+> `Data.termAt_observeTerm_self`/`_below` and `Cert.observeTerm_of_held_is_noop`
+> (`ReportProvenance`).
+
 **Status:** scoped, NOT started. Written 2026-07-31 after a measured probe.
 **Context:** issue #7, role (d). Prerequisite for moving `becomeLeader`'s collapse
 base from the durable counter to the consensus agent's absorbed copy.
