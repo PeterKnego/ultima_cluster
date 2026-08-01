@@ -196,3 +196,57 @@ so that `deliverReplicate` and `observeDataTerm` share it. That refactor is
 bounded, improves the corpus on its own, and is what makes step 1 the mechanical
 exercise this brief originally claimed it was. It should be landed and reviewed
 separately, against the CURRENT model, before any new constructor appears.
+
+
+## Step 1 measured (2026-08-01) — four files, not one
+
+With step 0 landed, step 1 was re-attempted and measured, then reverted. `main`
+untouched.
+
+**Green under the new constructors:** `ProtocolData`, `ProtocolCommit`,
+`LogMatching`, `MapWF`. Step 0 did exactly what it was for — `MapWF`'s
+`observeDataTerm` case is a **six-line application** of
+`NodeWF.observeTerm_static`, against the ~110-line rewrite it would otherwise
+have been. `LogMatching` needed one real argument (the reconciled-node no-op,
+below). So the extraction thesis is confirmed, on the file it was built for.
+
+**Still to do:** `ReportProvenance`, `TakeDiscipline`, `StageB`, `StageC` — each
+needs its own step-0-style extraction, because each couples the term map to
+something different and `deliverReplicate`'s reasoning for it is inline.
+
+Sizes of the existing `deliverReplicate` cases, as an upper bound on what has to
+be factored:
+
+| file | `deliverReplicate` case | map-dependent invariant fields |
+|---|---|---|
+| `ReportProvenance` | **376 lines** | ~5 of 21 (`closed_lag`, `frame_leader`, `gate_map_frame`, `gate_leader`, `gate_leader_eq`) |
+| `TakeDiscipline` | **274 lines** | 1 of 6 (`strict_node`) |
+| `StageB` | 135 lines | a few |
+| `LogMatching` | 82 lines | done |
+| `MapWF` | 110 lines | done (step 0) |
+
+Total inline `deliverReplicate` reasoning across the corpus: **~1036 lines**.
+That is an UPPER bound — `deliverReplicate` moves `hist`, `durable` AND the map,
+while `observeDataTerm` moves only the map, so each case's map-dependent subset
+is what actually needs factoring. For `ProvInv` that subset is real work, not
+transfer: a gate-open node that grows its map must re-establish `gate_leader`
+(`e.1 ≤ termAt (leader's map) e.2`) for the new entry, which needs the observed
+byte's attribution routed through `gate_leader_eq` — available, since
+`pos < smDurable ≤ durable` puts the byte below the frontier, but it has to be
+threaded.
+
+**Revised recommendation.** Step 1 is four more file-level efforts of the same
+shape as step 0, largest first (`ReportProvenance`), each landable and reviewable
+on its own against the current model. It is a dedicated arc, not a session.
+
+**Two facts worth keeping from the attempt**, both already validated:
+
+* The `observeDataTerm` constructor needs FOUR hypotheses, each earning its keep:
+  `hpos : pos < smDurable` (the point of the exercise), `hbase` (observations
+  arrive in position order — otherwise `observeTerm` can append below the map's
+  last), `hterm : t ≤ currentTerm` and `hdterm : t ≤ dataTerm` (the archive only
+  observes terms this node accepted; `deliverReplicate` gets both from
+  `hdr = dataTerm`).
+* `LogMatching`'s `DInv` pins (`map_pinned`, `gossip_pinned`) survive because a
+  reconciled node's map already ends at its own term, so with `hterm` the
+  observation is a NO-OP there. That argument is three lines and reusable.
