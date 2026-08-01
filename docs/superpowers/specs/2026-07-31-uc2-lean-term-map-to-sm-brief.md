@@ -280,3 +280,50 @@ only `hhist : hist pos = some (t, v)` — the byte it already holds — so it ne
 route from held-byte to frame (`DInv`'s occurrence machinery is the likely
 source). That is a small, sharp question instead of a diffuse 376-line one, which
 is what the extraction was for.
+
+
+## The `hup` question, settled — and the sequencing is wrong (2026-08-01)
+
+`Cert.observeTerm_of_held_is_noop` (`ReportProvenance`, sorry-free):
+
+```lean
+Reachable w → (w.nodes j).hist pos = some (t, v) →
+  observeTerm (w.nodes j).dn.termMap t pos = (w.nodes j).dn.termMap
+```
+
+The answer to "can a consensus-side observation supply `hup`?" is stronger than
+yes: **it never needs to.** `FramesCurrentAuthored` — proven unconditionally as
+`ProvInv`'s `fca` clause — says a node's map ALREADY attributes every byte it
+holds. So `termAt map pos = t`, hence `lastTermOf map ≥ t`, hence `observeTerm`
+does not grow. The growth arm is unreachable, and `hup` is vacuous.
+
+**Which means step 1 is degenerate.** In the current model `observeDataTerm`'s
+effect on the map is provably the identity. A constructor that provably does
+nothing cannot exercise any invariant — every case discharges by rewriting with
+the no-op and transferring. That is cheap (no per-file extraction needed, and my
+earlier "four extractions" estimate was wrong in the other direction), but it
+buys **nothing** towards step 3: the moment `recvReplicate` stops growing the
+map, `fca` is FALSE, this lemma goes with it, and every case written for step 1
+must be proved again for real.
+
+### Sequencing corrected
+
+Steps 1 and 2 are not useful preparation. The work is step 3, and it starts at a
+different place than this brief assumed:
+
+1. **Weaken `FramesCurrentAuthored`.** It is a PROVEN theorem
+   (`frames_current_authored`) with downstream consumers, and it is exactly the
+   lockstep assumption the move breaks. The honest replacement is something like
+   "a node's map attributes every byte it holds BELOW `smDurable`" — conditioned
+   on the absorbed frontier rather than unconditional. Re-prove its consumers
+   against the weakened form. This is the load-bearing step and should be scoped
+   on its own.
+2. Then `recvReplicate` stops growing the map, `applyGossip` reconciles against
+   `smDurable`, and `observeDataTerm` appears — at which point it is no longer a
+   no-op and the extractions (`NodeWF.observeTerm_step`,
+   `termAt_observeTerm_self`/`_below`) finally earn their keep.
+3. Then role (d).
+
+The two extractions already landed remain the right groundwork — they are what
+step 3's real cases will be built from. What changes is that there is no cheap
+intermediate landing between here and there.

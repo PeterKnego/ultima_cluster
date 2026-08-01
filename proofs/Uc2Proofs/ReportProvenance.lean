@@ -3351,6 +3351,38 @@ theorem frames_current_authored {n : Nat} {w : World n} (hw : Reachable w) :
   (reachable_provInv hw).fca
 
 #print axioms reachable_provInv
+/-- **Settles the `hup` question** for issue #7 role (d)'s `observeDataTerm`
+(term-map brief, `docs/superpowers/specs/2026-07-31-uc2-lean-term-map-to-sm-brief.md`).
+
+A consensus-side observation of a term the node ALREADY HOLDS is a **no-op on the
+map** — because `FramesCurrentAuthored` says the node's map already attributes
+that byte, so the map's last term is at least `t` and `observeTerm` does not
+grow.
+
+That answers the question the `termAt_observeTerm_self` extraction isolated
+("can an observation supply `hup`?") with something stronger than a yes: in the
+CURRENT model the growth arm is unreachable, so `hup` is never needed.
+
+**And it says the brief's step 1 is degenerate.** A constructor whose map effect
+is provably the identity cannot exercise any invariant, so landing it buys
+nothing towards step 3 — the moment `recvReplicate` stops growing the map, `fca`
+is FALSE, this lemma goes with it, and every case written for step 1 has to be
+proved again for real. See the brief's "Sequencing corrected" section. -/
+theorem observeTerm_of_held_is_noop {n : Nat} {w : World n} (hw : Reachable w)
+    (j : Fin n) (pos t v : Nat) (hhist : (w.nodes j).hist pos = some (t, v)) :
+    Data.observeTerm (w.nodes j).dn.termMap t pos = (w.nodes j).dn.termMap := by
+  have hattr : TermMap.termAt (w.nodes j).dn.termMap pos = t :=
+    (reachable_provInv hw).fca j pos t v hhist
+  have hasc : TermMap.Ascending (w.nodes j).dn.termMap :=
+    (reachable_mapsWF hw j).1
+  have hle : t ≤ Data.lastTermOf (w.nodes j).dn.termMap := by
+    have := TermMap.termAt_le_lastTermOf hasc pos
+    omega
+  simp only [Data.observeTerm, if_neg (by omega :
+    ¬ Data.lastTermOf (w.nodes j).dn.termMap < t)]
+
+#print axioms observeTerm_of_held_is_noop
+
 #print axioms frames_current_authored
 
 end Cert
