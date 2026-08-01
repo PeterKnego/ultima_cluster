@@ -343,6 +343,67 @@ theorem cert_drtg {n : Nat} {dw dw' : World n} {t : Nat} {ℓ : Fin n}
   | refl => exact hc
   | tail _ hstep ih => exact cert_dstep hstep ih
 
+
+/-- **Attribution at the observed position**, factored out of `provinv_step`'s
+`deliverReplicate` case (term-map brief step 0, second extraction — see
+`docs/superpowers/specs/2026-07-31-uc2-lean-term-map-to-sm-brief.md`).
+
+After growing the map with `(t, pos)`, position `pos` attributes to `t`. Each arm
+needs the caller's own reason:
+* growth arm — the appended entry IS the last, so `pos` reads back as `t`;
+* idempotent arm — the map already covers `t`, and the caller must know its last
+  entry does not out-term the observation (`hup`). `deliverReplicate` gets that
+  from `ProvInv.gate_map_frame` applied to the frame it just accepted; a
+  consensus-side observation would get it from the byte it already holds.
+
+Stated over a bare `TermMap`, so any step growing the map this way can use it —
+`observeDataTerm` (issue #7 role (d)) is the motivating one. -/
+theorem termAt_observeTerm_self {m : TermMap} {t pos : Nat}
+    (hasc : TermMap.Ascending m)
+    (hasc' : TermMap.Ascending (observeTerm m t pos))
+    (ht : 1 ≤ t)
+    (hlb : ∀ l, m.getLast? = some l → l.2 ≤ pos)
+    (hup : ∀ l, m.getLast? = some l → l.1 ≤ t) :
+    TermMap.termAt (observeTerm m t pos) pos = t := by
+  unfold observeTerm
+  by_cases hgrow : lastTermOf m < t
+  · rw [if_pos hgrow]
+    have hasc2 : TermMap.Ascending (m ++ [(t, pos)]) := by
+      have h0 := hasc'
+      rwa [observeTerm, if_pos hgrow] at h0
+    rw [TermMap.termAt_of_last_base_le hasc2
+      (getLast?_append_singleton _ _) (Nat.le_refl pos)]
+  · rw [if_neg hgrow]
+    have hle : t ≤ lastTermOf m := Nat.not_lt.mp hgrow
+    have hne : m ≠ [] := by
+      intro hemp
+      rw [hemp] at hle
+      simp [lastTermOf] at hle
+      omega
+    obtain ⟨lst, hlst⟩ :=
+      Option.ne_none_iff_exists'.mp (mt List.getLast?_eq_none_iff.mp hne)
+    have hlst1 : lastTermOf m = lst.1 := lastTermOf_getLast hlst
+    have hup' : lst.1 ≤ t := hup lst hlst
+    rw [TermMap.termAt_of_last_base_le hasc hlst (hlb lst hlst)]
+    omega
+
+/-- **Attribution below the observed position is preserved.** Fully generic: an
+entry appended at `pos` cannot change how any earlier position reads. Companion
+to `termAt_observeTerm_self`. -/
+theorem termAt_observeTerm_below {m : TermMap} {t pos : Nat} :
+    ∀ p', p' < pos →
+      TermMap.termAt (observeTerm m t pos) p' = TermMap.termAt m p' := by
+  intro p' hp'
+  unfold observeTerm
+  by_cases hgrow : lastTermOf m < t
+  · rw [if_pos hgrow]
+    refine TermMap.termAt_append_high ?_
+    intro e he
+    rw [List.mem_singleton] at he
+    subst he
+    exact hp'
+  · rw [if_neg hgrow]
+
 end Data
 
 namespace Cert
@@ -1756,49 +1817,20 @@ private theorem provinv_step {n : Nat} {w w' : World n} (hw : Reachable w)
       have := hstamp.frame_le pos hdr t v hmsg
       rwa [hhdr] at this
     have htpos : 1 ≤ t := hminv.stamp_pos pos hdr t v hmsg
+    -- The two map-growth facts are `termAt_observeTerm_self` / `_below`; this
+    -- case supplies their side conditions from `pos = durable` and the frame it
+    -- just accepted.
+    have hlbpos : ∀ l, (w.nodes j).dn.termMap.getLast? = some l → l.2 ≤ pos :=
+      fun l hl => by rw [hpos]; exact (hminv.node j).last_base l hl
     have haccept : TermMap.termAt
-        (Data.observeTerm (w.nodes j).dn.termMap t pos) pos = t := by
-      unfold Data.observeTerm
-      by_cases hgrow : Data.lastTermOf (w.nodes j).dn.termMap < t
-      · rw [if_pos hgrow]
-        have hasc2 : TermMap.Ascending
-            ((w.nodes j).dn.termMap ++ [(t, pos)]) := by
-          have h0 := hasc'
-          rwa [Data.observeTerm, if_pos hgrow] at h0
-        rw [TermMap.termAt_of_last_base_le hasc2
-          (Data.getLast?_append_singleton _ _) (Nat.le_refl pos)]
-      · rw [if_neg hgrow]
-        have hle : t ≤ Data.lastTermOf (w.nodes j).dn.termMap :=
-          Nat.not_lt.mp hgrow
-        have hne : (w.nodes j).dn.termMap ≠ [] := by
-          intro hemp
-          rw [hemp] at hle
-          simp [Data.lastTermOf] at hle
-          omega
-        obtain ⟨lst, hlst⟩ := Option.ne_none_iff_exists'.mp
-          (mt List.getLast?_eq_none_iff.mp hne)
-        have hlst1 : Data.lastTermOf (w.nodes j).dn.termMap = lst.1 :=
-          Data.lastTermOf_getLast hlst
-        have hlb : lst.2 ≤ (w.nodes j).pn.durable :=
-          (hminv.node j).last_base lst hlst
-        have hup : lst.1 ≤ t :=
-          h.gate_map_frame j hgate lst (List.mem_of_getLast? hlst) pos t v
-            hmsg' (by omega)
-        rw [TermMap.termAt_of_last_base_le hasc hlst (by omega)]
-        omega
+        (Data.observeTerm (w.nodes j).dn.termMap t pos) pos = t :=
+      Data.termAt_observeTerm_self hasc hasc' htpos hlbpos
+        (fun l hl => h.gate_map_frame j hgate l (List.mem_of_getLast? hl) pos t v
+          hmsg' (hlbpos l hl))
     have hpres : ∀ p', p' < pos →
         TermMap.termAt (Data.observeTerm (w.nodes j).dn.termMap t pos) p'
-          = TermMap.termAt (w.nodes j).dn.termMap p' := by
-      intro p' hp'
-      unfold Data.observeTerm
-      by_cases hgrow : Data.lastTermOf (w.nodes j).dn.termMap < t
-      · rw [if_pos hgrow]
-        refine TermMap.termAt_append_high ?_
-        intro e he
-        rw [List.mem_singleton] at he
-        subst he
-        exact hp'
-      · rw [if_neg hgrow]
+          = TermMap.termAt (w.nodes j).dn.termMap p' :=
+      Data.termAt_observeTerm_below
     have hjmap : (w.nodes j).pn.role = .leader →
         Data.observeTerm (w.nodes j).dn.termMap t pos
           = (w.nodes j).dn.termMap := by

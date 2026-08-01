@@ -219,7 +219,7 @@ be factored:
 
 | file | `deliverReplicate` case | map-dependent invariant fields |
 |---|---|---|
-| `ReportProvenance` | **376 lines** | ~5 of 21 (`closed_lag`, `frame_leader`, `gate_map_frame`, `gate_leader`, `gate_leader_eq`) |
+| `ReportProvenance` | **376 lines** | ~5 of 15 (`closed_lag`, `frame_leader`, `gate_map_frame`, `gate_leader`, `gate_leader_eq`) — **extraction DONE 2026-08-01** |
 | `TakeDiscipline` | **274 lines** | 1 of 6 (`strict_node`) |
 | `StageB` | 135 lines | a few |
 | `LogMatching` | 82 lines | done |
@@ -250,3 +250,33 @@ on its own against the current model. It is a dedicated arc, not a session.
 * `LogMatching`'s `DInv` pins (`map_pinned`, `gossip_pinned`) survive because a
   reconciled node's map already ends at its own term, so with `hterm` the
   observation is a NO-OP there. That argument is three lines and reusable.
+
+
+## ReportProvenance extraction — done (2026-08-01)
+
+Two lemmas, `Data.termAt_observeTerm_self` and `Data.termAt_observeTerm_below`,
+factored out of `provinv_step`'s `deliverReplicate` case. They are the map-growth
+core that case was carrying inline:
+
+* `_below` — attribution at any position strictly under `pos` is unchanged.
+  Fully generic; no hypotheses at all.
+* `_self` — after growing with `(t, pos)`, position `pos` attributes to `t`.
+  Two side conditions, both supplied by the caller: `hlb` (the map's last base is
+  at or below `pos`) and `hup` (its last entry does not out-term the
+  observation). `deliverReplicate` supplies `hlb` from `pos = durable` and `hup`
+  from `ProvInv.gate_map_frame` applied to the frame it just accepted.
+
+They live in `ReportProvenance` rather than `MapWF` because they need
+`TermMap.termAt_of_last_base_le`, which is defined there.
+
+The call site's ~40 inline lines became ~14 of application. Net +32 lines on the
+file, same as step 0 — the docstrings cost more than the proofs save, which is
+the right trade when the point is reuse.
+
+**What this makes precise.** The remaining question for `observeDataTerm`'s
+`ProvInv` case is now exactly one thing: *can a consensus-side observation supply
+`hup`?* `deliverReplicate` gets it from a frame on the wire; an observation has
+only `hhist : hist pos = some (t, v)` — the byte it already holds — so it needs a
+route from held-byte to frame (`DInv`'s occurrence machinery is the likely
+source). That is a small, sharp question instead of a diffuse 376-line one, which
+is what the extraction was for.
