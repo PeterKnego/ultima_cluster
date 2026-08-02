@@ -82,7 +82,7 @@ matched to how UC actually catches each bug**:
 | --- | --- | --- | --- | --- |
 | `commit-quorum-minus-one` | `CommitTracker` | `elle_mut_commit_quorum` (leader-isolation split-brain) | elle verdict **INVALID** (serializable AND strict) | `incompatible-order`, `strong-PL-1-cycle-exists` |
 | `skip-read-barrier` | `uc2_node` read path | `elle_mut_read_barrier` (directed 2-process probe) | elle **INVALID under the STRICT model ONLY** (valid under plain serializable) | `G-single-item-realtime` |
-| `skip-vote-order-check` | `ElectionSm::log_ok` | `elle_mut_vote_order` (minority-isolate → term climb → heal) | driver run **HARD-FAILS** (exit ≠ 0) | `uc2-archive` truncation-below-commit panic (`node.rs:716`) / reconvergence break |
+| `skip-vote-order-check` | `ElectionSm::log_ok` | `elle_mut_vote_order` (minority-isolate → term climb → heal) | driver run **HARD-FAILS** (exit ≠ 0) | *originally* an `uc2-archive` truncation-below-commit panic (`node.rs:716`); **re-based 2026-08-02 onto an explicit `CommittedTruncationWitness`** — see below |
 
 `skip-read-barrier` is the tooth that **proves the strict model earns its keep**:
 its anomaly is invisible to plain serializability and only the real-time model
@@ -96,11 +96,58 @@ isolated leader genuinely serves stale reads. Natural-worker attempts all failed
 (a pinned worker reroutes away on its first `NotLeader`'d submit; the fragile
 2-node majority never outran the most-advanced isolated node).
 
-`skip-vote-order-check` manifests as a **hard failure** (UC's truncation-below-
-commit defense panics rather than serve divergent data — defense in depth), which
-is a timing race (catch rate ≈ 2/3 per run at workers=4/hold=3000ms). The script
-**retries up to `ELLE_VOTE_ORDER_TRIES`** (3 local / 5 CI); caught iff any attempt
-hard-fails, and a clean control passes every attempt.
+`skip-vote-order-check` manifests as a **hard failure**, which is a timing race
+(whether a stale candidate wins at all). The script **retries up to
+`ELLE_VOTE_ORDER_TRIES`** (3 local / 5 CI); caught iff any attempt hard-fails,
+and a clean control passes every attempt.
+
+### 2026-08-02 — the tooth went silent, and why (oracle re-based)
+
+`elle-weekly` run 30736463470 failed: control clean, teeth 1–2 caught, **tooth 3
+missed 5/5**. Reproduced locally 3/3 on `main`.
+
+**Root cause: the oracle was borrowed from a different bug, and that bug got
+fixed.** As written, this tooth asserted nothing of its own — it was scored on
+whatever made the driver exit non-zero, and what did was the `uc2-archive`
+fail-stop above. That fail-stop was **issue #6, a genuine UC defect**: a stale
+winner opening its term below the archive's cursor corrupted the record walk.
+`2fd845e` (07-30) fixed it by routing the leader-open collapse through the
+archive agent. The injected bug still destroys committed data afterwards — it
+simply no longer crashes anything. The two preceding weeklies caught it via that
+panic (07-19 try 2, `node.rs:734`) and via a harness-side panic (07-26 try 3);
+neither was the safety property. **A mutation-testing oracle that depends on a
+defect elsewhere expires the day that defect is fixed.**
+
+The replacement is `lincheck_v2::CommittedTruncationWitness`, a background
+sampler over every node's cnc page, convicting on the property directly: **the
+committed frontier must never vanish from the cluster** — `C` = the furthest
+position any node ever called committed; a violation is every node's `durable`
+sitting below `C` for 3 consecutive samples, i.e. nobody holds it any more.
+
+Two calibration findings, both worth keeping:
+
+* A **first draft convicted per node** (`durable` steps back below *that node's*
+  own commit view) and needed an arbitrary byte margin to stay clean. Measurement
+  killed it: unmutated control runs regularly show one node cut **17–20 KB**
+  below its own commit view (107 such events in one 90 s run) while the other two
+  keep the frontier — a diverged tail being cut, not data lost. The cluster-wide
+  formulation needs no margin and has no such band.
+* Under the mutation, **all three** nodes drop below `C` together, by
+  25,888 / 62,496 / 421,152 B across three runs.
+
+Verification (4-vCPU dev box, `main` + this change):
+
+| Arm | Params | Result |
+| --- | --- | --- |
+| mutation ON | CI (`MIN_FAULTS=12 HOLD_MS=3000 WORKERS=4`) | **3/3 convicted, each on try 1** (vs the old ≈1-in-2-to-3) |
+| control | CI params | clean |
+| control | append-heavy variant (`READ_FRAC=0.05 KEYS=64`), the workload that maximises single-node dips | **4/4 clean** |
+
+Local caveat: several runs on this box died `signal: 9` (OOM) — the in-RAM EDN
+history is ~500 MB and the box had ~2 GB free. Unrelated to the witness, but note
+that **the script counts any non-zero exit as a catch**, so an OOM kill would be
+scored as a catch. The witness line in the log is what actually distinguishes
+them, which is why the failure hint now greps for it.
 
 Full run: control clean (all three passes), then commit-quorum
 `serializable=false strict=false`, read-barrier `serializable=true strict=false`,
@@ -120,7 +167,9 @@ vote-order caught on retry. Exit 0.
   `ELLE_TARGET_OPS` or raise the checker heap (`ELLE_JAVA_XMX`).
 - `reconfig` needs 1 worker (above).
 - `vote-order` is a timing race → retried; raise `ELLE_MIN_FAULTS` / `ELLE_HOLD_MS`
-  / worker count if it stops biting, never weaken the catch.
+  / worker count if it stops biting, never weaken the catch. And when a tooth
+  stops biting, ask WHY before raising the dose — see the 2026-08-02 entry above:
+  the dose was fine, the oracle had quietly expired.
 - **Never write histories to `/tmp`** — it is RAM-backed tmpfs with no swap on
   the dev box; large histories OOM-kill the run. Both scripts default `ELLE_DIR` /
   `ELLE_MUT_DIR` to `$HOME/.cache` (disk). Codified in `CLAUDE.md`.

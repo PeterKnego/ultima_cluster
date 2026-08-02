@@ -33,6 +33,8 @@ use lincheck_v2::{
     ClusterCfg, LinClusterV2, ReadOutcome, SubmitOutcome, WorkerConn, read_leader, serialize,
     submit_cmd,
 };
+#[cfg(feature = "mutation-testing")]
+use lincheck_v2::CommittedTruncationWitness;
 use uc2_net::fault::FaultConfig;
 use uc_lincheck::edn::{EdnOp, EdnRecorder, EdnType};
 use uc_lincheck::list_append::{LaCmd, LaRead, LaResp, ListAppendSm};
@@ -664,14 +666,25 @@ fn elle_mut_read_barrier() {
 /// its election timer climbs its term well above the cluster's; on heal, with
 /// the lexicographic `(last_term, last_durable)` vote check skipped, the
 /// up-to-date majority grants it their votes despite its STALER log — a stale
-/// leader that then forces truncation of committed entries. The lost committed
-/// appends (acked to a client, then gone) are an elle safety violation; UC's own
-/// truncation-below-commit defense may also crash a node, which the
-/// fatal-tolerant workers record as maybe-committed rather than aborting.
+/// leader that then forces truncation of committed entries.
+///
+/// **The oracle is [`CommittedTruncationWitness`], not a crash.** Until
+/// 2026-07-30 this tooth was scored on the driver merely exiting non-zero, and
+/// the non-zero exit came from an `uc2-archive` fail-stop — issue #6, a real UC
+/// defect, fixed by `2fd845e`. The injected bug still truncates committed bytes
+/// afterwards; it just no longer crashes anything, so the tooth went silent
+/// (weekly run 30736463470: 0/5 tries, while the two preceding weeklies caught
+/// it via that panic). The witness convicts on the safety property itself —
+/// `durable` stepping backward below a position the node had already committed
+/// — which is what the injected bug destroys and what no unrelated fix can take
+/// away.
 #[test]
 #[ignore]
 #[cfg(feature = "mutation-testing")]
 fn elle_mut_vote_order() {
+    // Armed on the first tick and dropped with the closure. The pass never kills
+    // a node, so every backward step of `durable` here is a truncation.
+    let mut witness: Option<CommittedTruncationWitness> = None;
     run_mutation_pass(
         "mut_vote_order",
         ClusterCfg::default(),
@@ -679,17 +692,25 @@ fn elle_mut_vote_order() {
         4,
         0.5,
         Duration::from_millis(1500),
-        |cluster, _rng, _faults| {
+        move |cluster, _rng, _faults| {
+            let witness =
+                witness.get_or_insert_with(|| CommittedTruncationWitness::start(&cluster.dirs()));
             // Long isolation so the minority follower's election term climbs well
             // above the cluster's: on heal it campaigns, and with the vote-order
             // check skipped the up-to-date majority grants it despite its STALER
-            // log → it wins and forces truncation of committed entries, which trips
-            // UC's own truncation-below-commit defense (archive agent panic).
+            // log → it wins and truncates committed entries cluster-wide.
             let hold = env_u64("ELLE_HOLD_MS", 3000);
             let _ = cluster.partition_minority();
             std::thread::sleep(Duration::from_millis(hold));
             cluster.heal();
             cluster.await_reconverged(20);
+            // `await_reconverged` returns the instant one node serves — and the
+            // majority's leader never stopped serving, so it returns before the
+            // healed node has even campaigned. The stale win lands in the window
+            // AFTER it, which is why the witness gets its own budget here.
+            if let Some(hit) = witness.check_within(Duration::from_millis(1500)) {
+                panic!("COMMITTED-TRUNCATION — {hit}");
+            }
         },
         |_cluster, faults| faults >= 3,
         "fewer than 3 minority-isolation cycles landed",

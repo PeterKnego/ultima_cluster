@@ -44,6 +44,7 @@ labelled as one — including where that makes a number look worse.
 |---|---|---|
 | [M5 — end-to-end SDK](/docs/benchmarks/uc2-m5-gate-2026-07-12.md) | **1,639,187 responses/s** @ p50 0.600 / p90 0.682 / p99 0.771 ms · 4.1× the ≥400 k bar | 3-host fleet |
 | [M3 — commit pipeline](/docs/benchmarks/uc2-m3-gate-2026-07-10.md) | **2,881,511 committed/s** @ p50 0.946 / p99 1.132 ms · 7.2× the bar | 3-host fleet |
+| [M2 — replication stream](/docs/benchmarks/uc2-m2-gate-2026-07-10.md) | **235–323 MB/s durable per follower** · 2.3–3.2× the ≥ 100 MB/s bar — clean *and* under 0.5 % injected loss (34,870 NAKs served, `overruns 0`) | 3-host fleet |
 | [M6 — learner join + purge](/docs/benchmarks/uc2-m6-gate-2026-07-12.md) | commit-rate dip **0.9 %** (gate < 10 %); below-floor reconstruction worst **2.80 s** over 5 purge cycles, zero read divergence | 4-host fleet |
 | [M7 — live reconfiguration](/docs/benchmarks/uc2-m7-gate-2026-07-13.md) | per-transition dip **0.0–4.7 %** (gate < 10 %); leader self-removal handoff **3.22 s** (gate < 10 s), zero committed loss | 5-host fleet |
 | [Read profile — before](/docs/benchmarks/uc2-read-profile-2026-07-26.md) | linearizable 244,052 reads/s vs snapshot 585,414 — **the barrier costs ~58 %** | 3-host fleet |
@@ -51,10 +52,10 @@ labelled as one — including where that makes a number look worse.
 | [M4 — leader failover](/docs/benchmarks/uc2-m4-gate-2026-07-11.md) | p50 **202.1 ms**, p90 279.3 ms, max 394.1 ms · **10/10 zero committed loss** | 4-vCPU sandbox, loopback — *fleet not yet run* |
 | [M8 — opt-in wire crypto](/docs/benchmarks/uc2-m8-gate-2026-07-29.md) | encrypted throughput **94.1 % of cleartext**, AES-NI confirmed | 4-vCPU dev box — *ratio only; fleet open* |
 | [M1 — solo append+fsync](/docs/benchmarks/uc2-m1-gate-2026-07-09.md) | sandbox smoke on **tmpfs**, where `fdatasync` is nearly free — an upper bound, explicitly **not** the gate | 4-vCPU sandbox |
-| [M2 — replication stream](/docs/benchmarks/uc2-m2-gate-2026-07-10.md) | single-host loopback smoke, three nodes in one process — no NIC, no wire. Explicitly **not** the gate | 4-vCPU sandbox |
 
-M1 and M2 have no fleet result. Their records say so in a banner at the top
-rather than quietly presenting the sandbox number as the gate.
+M1 has no fleet result. Its record says so in a banner at the top rather than
+quietly presenting the sandbox number as the gate — as did M2's, until the
+3-host fleet arm was run on 2026-07-11 and appended to the same record.
 
 ---
 
@@ -86,7 +87,7 @@ of snapshot-read capacity — the barrier is now free.
 **Fleet** — `c6id.2xlarge` (8 vCPU, local instance-store NVMe), `us-east-1`,
 single AZ, cluster placement group, private-IP binding, journals on the NVMe
 mount, `Durability::Consistent` (fdatasync per block), 64 B payloads. Host count
-varies by gate (3 for M3/M5/read-profile, 4 for M6, 5 for M7). Driven by
+varies by gate (3 for M2/M3/M5/read-profile, 4 for M6, 5 for M7). Driven by
 `bench-infra/scripts/m6_fleet_gate.py`, which `stat -f`s every instance-dir
 parent and **refuses to run on tmpfs or ramfs** — a journal on RAM makes every
 fsync a silent no-op and would void the durability claim while everything
@@ -128,5 +129,5 @@ the fleet orchestrator can start one process per host.
   speak to.
 - **M8's fleet ratio.** The 94.1 % is a dev-box measurement; the record lists a
   cross-host confirmation as open.
-- **M1 and M2** have never had a fleet arm. Both are superseded in practice by M3
-  and M5, which measure the same paths end to end on real hardware.
+- **M1** has never had a fleet arm. It is superseded in practice by M3 and M5,
+  which measure the same path end to end on real hardware.

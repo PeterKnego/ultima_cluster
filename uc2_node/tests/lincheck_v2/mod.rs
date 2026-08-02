@@ -1305,3 +1305,146 @@ pub fn join_workers(handles: Vec<JoinHandle<()>>) {
         }
     }
 }
+
+// -------------------------------------------- committed-truncation witness
+
+/// A background sampler that convicts UC of **truncating committed bytes** —
+/// the leader-completeness violation the elle `skip-vote-order-check` tooth
+/// injects (`scripts/elle_mutation.sh`, tooth 3/3).
+///
+/// ## Why this exists rather than a crash oracle
+///
+/// Until 2026-07-30 that tooth was scored purely on the driver exiting
+/// non-zero, and what actually produced the non-zero exit was an `uc2-archive`
+/// fail-stop: a stale winner opening its term below the archive's cursor
+/// corrupted the record walk. That was **issue #6 — a real UC defect** — and
+/// `2fd845e` fixed it by routing the leader-open collapse through the archive
+/// agent. The injected bug still does its damage afterwards; it simply no
+/// longer crashes anything, so the tooth went silent (weekly run 30736463470,
+/// 0/5 tries). An oracle that depends on a bug elsewhere expires the day that
+/// bug is fixed. This one names the safety property directly.
+///
+/// ## The predicate: the committed frontier must not vanish from the CLUSTER
+///
+/// Over `(durable, commit)` read straight off every node's cnc page:
+///
+/// * `C` = the running MAX of `commit` across all nodes — the furthest position
+///   anyone in this cluster has ever considered committed, and therefore acked
+///   to a client, applied, and output.
+/// * the witness fires when **every** node's `durable` is below `C`: the
+///   committed frontier is now held by nobody. If `C` was genuinely committed a
+///   majority held it, so every future leader holds it — no node can ever be
+///   asked to drop it, let alone all of them. This is the negation of
+///   committed-never-truncated, observed.
+///
+/// **A single node dipping below `C` is deliberately NOT convicted**, and that
+/// is the correction that makes this sound. Measurement, 2026-08-02: unmutated
+/// control runs regularly show one node's `durable` step backward 17–20 KB
+/// below its own commit view (107 such events in one 90 s run) while the other
+/// two keep the frontier — a diverged tail being cut, not data lost. An earlier
+/// draft of this witness convicted per node and needed an arbitrary byte margin
+/// to stay clean, which is exactly the fudge this formulation removes. The
+/// injected bug, by contrast, puts **all three** nodes below `C` at once.
+///
+/// `CONFIRM` consecutive samples are required so a torn read across the
+/// three pages (they are sampled in a loop, not atomically) cannot convict.
+///
+/// ## Scope
+///
+/// Armed by the vote-order pass with the mutation ON *and* OFF: under the
+/// control it must never fire, and if it ever does that is a genuine UC bug
+/// and failing loudly is the correct outcome. Restricted to passes that do not
+/// kill and restart nodes — boot recovery legitimately republishes counters,
+/// which this predicate does not model.
+pub struct CommittedTruncationWitness {
+    stop: Arc<AtomicBool>,
+    hit: Arc<Mutex<Option<String>>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl CommittedTruncationWitness {
+    /// Consecutive samples that must agree before convicting — see the type
+    /// doc's note on torn reads across the per-node pages.
+    const CONFIRM: u32 = 3;
+
+    /// Start sampling every node's cnc page at `SAMPLE`. The pages are opened
+    /// ONCE (the instance dirs are stable for the life of a pass) so the hot
+    /// loop is two atomic loads per node.
+    pub fn start(dirs: &[PathBuf]) -> Self {
+        const SAMPLE: Duration = Duration::from_millis(20);
+        let stop = Arc::new(AtomicBool::new(false));
+        let hit = Arc::new(Mutex::new(None));
+        let pages: Vec<Arc<CncPage>> =
+            dirs.iter().map(|d| Self::open_page(d)).collect::<Option<_>>().unwrap_or_default();
+        let (t_stop, t_hit) = (Arc::clone(&stop), Arc::clone(&hit));
+        let handle = std::thread::spawn(move || {
+            // The furthest position ANY node has ever called committed.
+            let mut frontier = 0u64;
+            let mut streak = 0u32;
+            while !t_stop.load(Ordering::Relaxed) {
+                // `commit` FIRST, then `durable`: commit only advances once a
+                // quorum's durable has crossed it, so sampling the frontier
+                // before the durables can never manufacture a frontier that the
+                // durables have not had a chance to reflect. The other order
+                // admits a stale-durable / fresh-commit snapshot.
+                for page in &pages {
+                    frontier = frontier.max(page.counters().commit.load_acquire());
+                }
+                let durables: Vec<u64> =
+                    pages.iter().map(|p| p.counters().durable.load_acquire()).collect();
+                let orphaned = !durables.is_empty() && durables.iter().all(|&d| d < frontier);
+                streak = if orphaned { streak + 1 } else { 0 };
+                if streak >= Self::CONFIRM {
+                    let held = durables.iter().copied().max().unwrap_or(0);
+                    let mut slot = t_hit.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(format!(
+                            "the committed frontier {frontier} is held by NO node — highest \
+                             durable across the cluster is {held}, {} committed bytes short. \
+                             Per-node durable: {durables:?}",
+                            frontier - held
+                        ));
+                    }
+                }
+                std::thread::sleep(SAMPLE);
+            }
+        });
+        Self { stop, hit, handle: Some(handle) }
+    }
+
+    /// The witness, if it has fired at any point since `start` (sticky).
+    pub fn check(&self) -> Option<String> {
+        self.hit.lock().unwrap().clone()
+    }
+
+    /// Poll up to `budget`, returning as soon as the witness fires. The stale
+    /// campaign this tooth provokes lands AFTER `heal()` returns — and after
+    /// `await_reconverged`, which returns immediately because the majority
+    /// leader never stopped serving — so the caller has to give the window
+    /// explicit time rather than sample once and move on.
+    pub fn check_within(&self, budget: Duration) -> Option<String> {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(hit) = self.check() {
+                return Some(hit);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn open_page(dir: &Path) -> Option<Arc<CncPage>> {
+        CncPage::open_file(&dir.join("cnc2.dat"), APP).ok()
+    }
+}
+
+impl Drop for CommittedTruncationWitness {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
