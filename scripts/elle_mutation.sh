@@ -17,14 +17,28 @@
 #                            anomaly. This is the tooth that proves the strict
 #                            model earns its keep.
 #   skip-vote-order-check    the driver run HARD-FAILS (exit != 0): a stale leader
-#                            wins and forces truncation of committed entries,
-#                            which trips UC's own truncation-below-commit defense
-#                            (an archive-agent panic) / breaks reconvergence. This
-#                            is a timing race, so it is retried a few times; a
-#                            clean control never fails.
+#                            wins and truncates committed entries, which the pass's
+#                            own CommittedTruncationWitness convicts on directly —
+#                            `durable` stepping backward below a position the node
+#                            had already committed. This is a timing race (whether
+#                            a stale candidate wins at all), so it is retried a few
+#                            times; a clean control never fails.
+#
+#                            NOTE 2026-08-02: until this date the tooth had no
+#                            detector of its own — it was scored on whatever
+#                            happened to make the driver exit non-zero, and what
+#                            did was an `uc2-archive` fail-stop. That was issue #6,
+#                            a REAL UC defect, fixed 07-30 by 2fd845e; the tooth
+#                            then went silent (weekly 30736463470: 0/5) even though
+#                            the injected bug still destroys committed data. An
+#                            oracle borrowed from a bug elsewhere expires when that
+#                            bug is fixed. Hence the explicit witness.
 #
 # If a mutation stops being caught: RAISE the dose (ops / cycles / hold), never
-# weaken the assertion.
+# weaken the assertion. And check WHY it stopped: an oracle that fires only as a
+# side effect of some other defect dies silently the day that defect is fixed
+# (see the vote-order note below). Prefer a detector that names the safety
+# property the mutation violates.
 #
 # Artifacts go to DISK, never /tmp — /tmp is RAM-backed tmpfs with no swap on this
 # box and large histories there OOM-kill the run (see CLAUDE.md).
@@ -114,12 +128,19 @@ caught=0
 for t in $(seq 1 "$VOTE_ORDER_TRIES"); do
     ec="$(gen vo elle_mut_vote_order skip-vote-order-check ELLE_TARGET_OPS=3000 ELLE_MIN_FAULTS=12 ELLE_WORKERS=4 ELLE_HOLD_MS=3000)"
     if [ "$ec" != 0 ]; then
-        why="$(grep -m1 -E 'panicked at|no single serving leader' "$MUT_DIR/vo.log" | sed 's/^[[:space:]]*//' | cut -c1-80)"
+        # Prefer the witness's own verdict over the bare panic location; fall back
+        # to any panic / lost-leader line (a crash is still a legitimate catch).
+        # The trailing `|| true` matters under `set -e`: a hard-fail with NO
+        # matching line (an OOM kill, say) must still report, not abort here.
+        why="$(grep -m1 -a 'COMMITTED-TRUNCATION' "$MUT_DIR/vo.log" \
+               || grep -m1 -aE 'panicked at|no single serving leader' "$MUT_DIR/vo.log" \
+               || true)"
+        why="$(printf '%s' "$why" | sed 's/^[[:space:]]*//' | cut -c1-110)"
         echo "OK: vote-order CAUGHT on try $t (exit $ec: $why)"
         caught=1; break
     fi
     echo "  try $t: reconverged (exit 0) — stale-winner race did not land, retrying"
 done
-[ "$caught" = 1 ] || fail "vote-order NOT caught in $VOTE_ORDER_TRIES tries — raise dose (ELLE_MIN_FAULTS/ELLE_HOLD_MS)"
+[ "$caught" = 1 ] || fail "vote-order NOT caught in $VOTE_ORDER_TRIES tries — raise dose (ELLE_MIN_FAULTS/ELLE_HOLD_MS), and see the 2026-08-02 entry in docs/benchmarks/uc2-elle-gate-2026-07-16.md before assuming the dose is the problem"
 
 echo "elle mutation testing passed: control clean, 3/3 teeth caught"
