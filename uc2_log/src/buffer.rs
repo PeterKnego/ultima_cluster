@@ -273,6 +273,80 @@ impl LogBuffer {
             let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
             let _ = writeln!(s, "    {:>8}: {}", lo + i * 32, hex.join(" "));
         }
+        let fpos = c.from + c.end;
+        let foff = self.offset(fpos);
+        let flo = foff.saturating_sub(64);
+        let fhi = (foff + 96).min(self.region.len());
+        let _ = writeln!(s, "  FAILING FRAME at pos={fpos} (off={foff}); hexdump [{flo}, {fhi}):");
+        // SAFETY: [flo, fhi) is inside the mapped region.
+        let fbytes = unsafe { std::slice::from_raw_parts(self.region.ptr_at(flo), fhi - flo) };
+        for (i, chunk) in fbytes.chunks(32).enumerate() {
+            let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
+            let _ = writeln!(s, "    {:>8}: {}", flo + i * 32, hex.join(" "));
+        }
+        // ZERO-COST FORENSICS (the hot path carries no instrumentation — any
+        // in-process tracing there hid the race: 0 hits in 36 traced runs
+        // against 3 in 14 untraced). Every frame header carries its term, so
+        // the buffer itself records which term wrote each region.
+        let _ = writeln!(s, "  frame walk from `from` (pos len type term):");
+        let mut w = 0u64;
+        let mut walked = Vec::new();
+        while w < c.end {
+            let o = self.offset(c.from + w);
+            let len = self.commit_word(o).load(Ordering::Acquire);
+            if (len as usize) < HEADER_LEN {
+                break;
+            }
+            let h = frame::read_header(unsafe {
+                std::slice::from_raw_parts(self.region.ptr_at(o), HEADER_LEN)
+            });
+            walked.push(format!(
+                "    {} len={} type={} term={}",
+                c.from + w,
+                len,
+                h.frame_type,
+                h.leadership_term_id
+            ));
+            w += align_frame_len(len as usize) as u64;
+        }
+        let _ = writeln!(s, "    ({} frames tile [from, from+{}))", walked.len(), c.end);
+        for line in walked.iter().take(3) {
+            let _ = writeln!(s, "{line}");
+        }
+        if walked.len() > 6 {
+            let _ = writeln!(s, "    ...");
+        }
+        for line in walked.iter().skip(walked.len().saturating_sub(3)) {
+            let _ = writeln!(s, "{line}");
+        }
+        // Where does the NEXT parseable frame start, and whose term is it? If
+        // the over-claimed region is old-term leftovers, the terms differ.
+        let _ = writeln!(s, "  forward scan from the failure for a parseable frame:");
+        let mut probe = 0u64;
+        let mut found = 0;
+        while probe < 4096 && found < 4 {
+            let pos = c.from + c.end + probe;
+            if pos >= c.append {
+                let _ = writeln!(s, "    (reached append={} after {probe} B)", c.append);
+                break;
+            }
+            let o = self.offset(pos);
+            let len = self.commit_word(o).load(Ordering::Acquire);
+            if (len as usize) >= HEADER_LEN
+                && pos + align_frame_len(len as usize) as u64 <= c.append
+            {
+                let h = frame::read_header(unsafe {
+                    std::slice::from_raw_parts(self.region.ptr_at(o), HEADER_LEN)
+                });
+                let _ = writeln!(
+                    s,
+                    "    +{probe} B: pos={pos} len={len} type={} term={}",
+                    h.frame_type, h.leadership_term_id
+                );
+                found += 1;
+            }
+            probe += frame::FRAME_ALIGNMENT as u64;
+        }
         s
     }
 
