@@ -378,6 +378,13 @@ pub struct FollowerStats {
     /// counter backward); the resync is the correct recovery for either. See
     /// [`FollowerReceiver::resync_after_truncation`].
     pub truncation_resyncs: AtomicU64,
+    /// Term-change discards: times the receiver dropped its out-of-order runs
+    /// because the term moved. A term boundary re-frames the stream above the
+    /// commit point, so runs recorded under the old term may disagree with the
+    /// new term's framing at the same positions — and `Rebuilt` unions spans,
+    /// it does not resolve them. See
+    /// [`FollowerReceiver::discard_ooo_on_term_change`].
+    pub term_change_discards: AtomicU64,
     /// Straddle drops (M6 Task 9): times a DATA datagram was discarded because a
     /// `LogCounters::prime(to)` re-primed the shared `append` counter DURING this
     /// datagram's processing (between the frontier read and the `store_release`).
@@ -477,6 +484,13 @@ pub struct FollowerReceiver {
     cfg: FollowerConfig,
     status_bytes: u64,
     rebuilt: Rebuilt,
+    /// The last frontier this receiver stored into the shared `append`
+    /// counter. If the counter is found BELOW it, a prime has intervened —
+    /// see the publish-time guard in the DATA arm.
+    last_published: u64,
+    /// The term the current out-of-order runs in `rebuilt` were accepted
+    /// under. A move discards them — see `discard_ooo_on_term_change`.
+    ooo_term: u32,
     nak: NakTimer,
     leader_append: u64,
     base: Instant,
@@ -658,6 +672,8 @@ impl FollowerReceiver {
             sock,
             status_bytes,
             rebuilt: Rebuilt::new(start),
+            last_published: start,
+            ooo_term: term.load(Ordering::Relaxed),
             nak: NakTimer::new(cfg.nak, cfg.seed),
             cfg,
             leader_append: start,
@@ -842,6 +858,7 @@ impl FollowerReceiver {
         // and is handled separately by `resync_after_snapshot_install`.
         if append < self.rebuilt.contiguous() {
             self.rebuilt = Rebuilt::new(append);
+            self.last_published = append;
             self.leader_append = append;
             self.nak.poll(None, self.now_ns()); // disarm: the old gap predates the re-prime
             // The report cursors shadow the frontier and must move with it:
@@ -853,6 +870,48 @@ impl FollowerReceiver {
             self.ap_reported = append;
             self.stats.truncation_resyncs.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Drop out-of-order runs recorded under a PREVIOUS term.
+    ///
+    /// A term boundary re-frames the stream above the commit point: the same
+    /// position can carry a 96 B data frame in term T and the next term's 32 B
+    /// NewTerm frame in T+1. Runs above the contiguous frontier are, by the
+    /// accept rule (`position < contiguous` drops), writable more than once, and
+    /// [`Rebuilt`] UNIONS overlapping spans rather than resolving them — it
+    /// tracks positions only, deliberately ("no reliance on buffer contents",
+    /// its module doc). So a stale old-term run and the new term's shorter frame
+    /// at the same position combine into a span the buffer does not tile: the
+    /// later `write_run` overwrites the head, the dead frame's tail stays as
+    /// orphaned payload, and publishing that union puts `append` over bytes no
+    /// frame walk can cross. The archive is the only reader that walks frames
+    /// there, so it fail-stops (`RecorderCorrupt`) — the LUCKY outcome; a
+    /// plausible-looking orphan word would instead have been recorded into the
+    /// journal as current-term data and served on deep-NAK replay.
+    ///
+    /// Positions BELOW the frontier are untouched: those bytes were already
+    /// published (and consistent when they were). If the new term also needs
+    /// them cut, that arrives as a reconciliation truncation, whose prime
+    /// [`resync_after_truncation`](Self::resync_after_truncation) handles —
+    /// this is the same invalidation for the case where nothing regresses
+    /// locally, which is why that resync cannot see it.
+    ///
+    /// No-op unless out-of-order state actually exists, so the ordinary
+    /// in-order path is untouched.
+    fn discard_ooo_on_term_change(&mut self, term: u32) {
+        if term == self.ooo_term {
+            return;
+        }
+        self.ooo_term = term;
+        if self.rebuilt.highest() == self.rebuilt.contiguous() {
+            return; // nothing out of order to invalidate
+        }
+        self.rebuilt = Rebuilt::new(self.rebuilt.contiguous());
+        // The armed gap and the tail-loss reference both described the old
+        // term's stream (same reasoning as the truncation resync).
+        self.nak.poll(None, self.now_ns());
+        self.leader_append = self.rebuilt.contiguous();
+        self.stats.term_change_discards.fetch_add(1, Ordering::Relaxed);
     }
 
     /// One duty cycle: drain up to 64 datagrams, then NAK/status upkeep.
@@ -1118,6 +1177,21 @@ impl FollowerReceiver {
             return;
         }
         self.stats.datagrams.fetch_add(1, Relaxed);
+        // PER DATAGRAM, not once per duty cycle. A cycle drains up to 64
+        // datagrams and the archive agent primes on its own thread, so a
+        // collapse/truncation can land BETWEEN two datagrams of one drain —
+        // after the top-of-cycle check has already passed. Every datagram after
+        // it would then publish the pre-prime `rebuilt.contiguous()` over the
+        // freshly primed floor, claiming a frontier for bytes this term never
+        // wrote. `prime_generation` does not cover this: it catches a prime that
+        // straddles a SINGLE datagram's processing, and here the prime is
+        // complete before this datagram's `gen0` sample is even taken. Cost is
+        // one acquire load per datagram; the check is false in steady state
+        // (including on a leader, whose appender legitimately runs ahead).
+        self.resync_after_truncation();
+        // This datagram is current-term traffic; if the term MOVED since the
+        // out-of-order runs were recorded, they are no longer trustworthy.
+        self.discard_ooo_on_term_change(term);
         // Learn the current leader's address from its own current-term traffic
         // (DATA/HEARTBEAT flow leader→follower). Our follower-role control
         // (NAK/STATUS/AppendPosition) is then addressed to whoever is actually
@@ -1214,6 +1288,29 @@ impl FollowerReceiver {
                         self.stats.dropped_straddle.fetch_add(1, Relaxed);
                         return;
                     }
+                    // Belt to the generation recheck's braces, and the one that
+                    // actually holds: re-evaluate the PRIME PREDICATE against the
+                    // live counter, right here, immediately before the store.
+                    // `append < contiguous` is the archive's prime signature (see
+                    // `resync_after_truncation`) — only a prime drives the counter
+                    // below our tracker. Checking it at the top of the cycle, or
+                    // even per datagram, leaves a window; checking it in the same
+                    // breath as the store does not. The generation recheck alone does not cover
+                    // this: it compares against `gen0`, which is sampled a few
+                    // instructions AFTER the per-datagram resync, so a prime
+                    // landing in that window is already reflected in `gen0` and
+                    // the recheck sees nothing to reject. Field evidence
+                    // (2026-08-02): `append` published 101,024 B past the last
+                    // real frame, over ring content from a previous lap — the
+                    // frames beyond the failure carried term 1 while the live
+                    // term was 45. Drop; the next duty cycle's resync rebases us
+                    // to the primed floor and NAKs forward.
+                    let live = self.buffer.counters().append.load_acquire();
+                    if live < self.last_published {
+                        self.stats.dropped_straddle.fetch_add(1, Relaxed);
+                        return;
+                    }
+                    self.last_published = self.rebuilt.contiguous();
                     self.buffer.counters().append.store_release(self.rebuilt.contiguous());
                 }
                 self.note_leader_activity(h.leadership_term_id);
@@ -1438,6 +1535,7 @@ impl FollowerReceiver {
         }
         if append > self.rebuilt.contiguous() {
             self.rebuilt = Rebuilt::new(append);
+            self.last_published = append;
             self.leader_append = self.leader_append.max(append);
             self.nak.poll(None, self.now_ns()); // disarm the stale below-floor gap
             self.status_at = append;
@@ -1760,6 +1858,26 @@ mod tests {
             cfg,
             term_handle(TERM),
             route,
+        )
+    }
+
+    /// As [`follower`], but hands back the live [`TermHandle`] so a test can
+    /// bump the term the way the consensus agent does.
+    fn follower_with_term(
+        b: &Arc<LogBuffer>,
+        leader: SocketAddr,
+        term: TermHandle,
+    ) -> FollowerReceiver {
+        let mut cfg = FollowerConfig::new(leader);
+        cfg.nak = NakConfig { delay_min_ns: 1, delay_max_ns: 2, backoff_ns: 1_000_000 };
+        cfg.status_floor_ns = u64::MAX;
+        cfg.append_pos_floor_ns = u64::MAX;
+        FollowerReceiver::new(
+            Arc::clone(b),
+            FaultSocket::bind("127.0.0.1:0").unwrap(),
+            cfg,
+            term,
+            dummy_route(),
         )
     }
 
@@ -2433,6 +2551,209 @@ mod tests {
     /// re-primed counter, and then ACCEPT DATA at the truncation point — pre-fix
     /// it dropped every such datagram as a dup (`position < contiguous`) and
     /// wedged `append`/`durable` at the truncation point forever.
+    /// The receiver must never move `append` BACKWARD.
+    ///
+    /// The generation recheck rejects a prime that lands after `gen0` is
+    /// sampled. It cannot see a prime that landed just BEFORE that sample —
+    /// between the per-datagram resync and the sample, a few instructions wide,
+    /// which a 4-core box running twelve busy-spin agents preempts happily.
+    /// Then `gen0` already carries the post-prime generation, the recheck finds
+    /// nothing to reject, and the pre-prime `rebuilt.contiguous()` is stored
+    /// over the freshly primed floor.
+    ///
+    /// Field evidence (2026-08-02, unmutated `main`, both earlier fixes in
+    /// place): `append` published 101,024 B past the last frame anyone actually
+    /// wrote. The forensic walk showed 15 term-45 frames tiling 928 B from
+    /// `from`, and the first parseable frame past the failure carried **term 1**
+    /// — ring content from a previous lap, never written in this generation.
+    /// The appender cannot produce that (it would have left term-45 frames), so
+    /// the receiver published it.
+    ///
+    /// The invariant is simple and does not depend on catching the prime at all:
+    /// only a prime moves `append` backward, and after a prime the tracker must
+    /// be rebased before publishing — so a frontier below the live counter means
+    /// a prime we have not caught, and the publish must be dropped.
+    #[test]
+    fn a_publish_never_moves_the_append_counter_backward() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+        let prime_gen = Arc::new(AtomicU64::new(0));
+        r.set_prime_generation(Arc::clone(&prime_gen));
+
+        // Frontier to 96.
+        let runs = frame_runs(&[&[1u8; 64], &[2u8; 64]], 96);
+        leader.send(to, DGRAM_KIND_DATA, runs[0].0, TERM, &runs[0].1);
+        drive_until(&mut r, || b.counters().append.load_acquire() == 96);
+
+        // Prime DOWN to 0 without bumping the generation — standing in for a
+        // prime whose generation bump was already visible when `gen0` was
+        // sampled, i.e. one that landed just before the sample. The recheck has
+        // nothing to compare against; only the backward guard can catch this.
+        let bh = Arc::clone(&b);
+        let fired = Arc::new(AtomicU64::new(0));
+        let fh = Arc::clone(&fired);
+        r.set_straddle_hook(Box::new(move || {
+            if fh.load(Relaxed) == 0 {
+                bh.counters().prime(0);
+                fh.fetch_add(1, Relaxed);
+            }
+        }));
+
+        let st = r.stats();
+        leader.send(to, DGRAM_KIND_DATA, runs[1].0, TERM, &runs[1].1);
+        drive_until(&mut r, || fired.load(Relaxed) == 1 && st.datagrams.load(Relaxed) == 2);
+
+        assert_eq!(
+            b.counters().append.load_acquire(),
+            0,
+            "the pre-prime frontier was published over the primed floor — \
+             `append` now covers bytes this generation never wrote"
+        );
+    }
+
+    /// A prime landing BETWEEN two datagrams of one drain must not let the
+    /// second publish the pre-prime frontier.
+    ///
+    /// `resync_after_truncation` ran once at the top of `do_work`, but a cycle
+    /// drains up to 64 datagrams and the archive primes on its own thread. A
+    /// collapse/truncation landing mid-drain is invisible to the top-of-cycle
+    /// check (already passed) AND to `prime_generation` (which catches a prime
+    /// straddling a SINGLE datagram — here the prime is complete before the next
+    /// datagram's `gen0` is sampled). Every later datagram of that drain then
+    /// stores the stale `rebuilt.contiguous()` over the primed floor: `append`
+    /// claims a frontier for bytes this term never wrote, and the archive's
+    /// frame walk fail-stops on the first byte past what was really written.
+    ///
+    /// Field signature (2026-08-02, unmutated `main`): `sent == durable == from`
+    /// with a 32 B NewTerm at `from` — the prime fingerprint — and `append`
+    /// ~88 KB beyond it while only ~1.3 KB is actually framed.
+    #[test]
+    fn a_prime_between_two_datagrams_of_one_drain_is_not_clobbered() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+        let prime_gen = Arc::new(AtomicU64::new(0));
+        r.set_prime_generation(Arc::clone(&prime_gen));
+
+        // Frontier to 96 the ordinary way.
+        let runs = frame_runs(&[&[1u8; 64], &[2u8; 64], &[3u8; 64]], 96);
+        leader.send(to, DGRAM_KIND_DATA, runs[0].0, TERM, &runs[0].1);
+        drive_until(&mut r, || b.counters().append.load_acquire() == 96);
+
+        // A and B are BOTH in flight before the drain starts, so they are
+        // processed in ONE `do_work` cycle. The hook primes the counters down to
+        // 0 (a collapse) while A is between its insert and its store — A is
+        // correctly dropped by the generation recheck. B then follows IN THE
+        // SAME DRAIN, after the prime is already complete, so nothing straddles
+        // it and the top-of-cycle resync ran before either.
+        let bh = Arc::clone(&b);
+        let pgh = Arc::clone(&prime_gen);
+        r.set_straddle_hook(Box::new(move || {
+            if pgh.load(Relaxed) == 0 {
+                bh.counters().prime(0);
+                pgh.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+        }));
+        // B sits exactly AT the (stale) frontier A left behind, so it is a
+        // FORWARD insert and publishes — the accept rule only rejects positions
+        // strictly BELOW the frontier.
+        leader.send(to, DGRAM_KIND_DATA, runs[1].0, TERM, &runs[1].1);
+        leader.send(to, DGRAM_KIND_DATA, runs[2].0, TERM, &runs[2].1);
+        let st = r.stats();
+        drive_until(&mut r, || st.datagrams.load(Relaxed) == 3);
+
+        let append = b.counters().append.load_acquire();
+        assert_eq!(
+            append, 0,
+            "append={append} was republished from the pre-prime frontier over a \
+             primed floor of 0 — a frontier for bytes this term never wrote"
+        );
+    }
+
+    /// A term boundary RE-FRAMES the stream above the commit point, so every
+    /// out-of-order run recorded under the old term is unreliable: the same
+    /// position can carry a 96 B data frame in term T and the next term's 32 B
+    /// NewTerm frame in T+1. Both sit ABOVE the contiguous frontier, so the
+    /// accept rule (`position < contiguous`) rejects neither, and [`Rebuilt`]
+    /// UNIONS their spans because it tracks positions only ("no reliance on
+    /// buffer contents", its module doc). The later `write_run` overwrites the
+    /// first 32 B and the dead frame's trailing 32 B stay behind as orphaned
+    /// payload — so the frontier is published over a span the buffer no longer
+    /// tiles with whole frames, and the archive's `recordable_slice` walk (the
+    /// only reader that crosses it) fail-stops the node.
+    ///
+    /// Found 2026-08-02 on unmutated `main`: `RecorderCorrupt`, ~2 hits in 8
+    /// append-heavy partition-churn runs, trace `ooo-insert [X, X+64)` then
+    /// `ooo-insert [X, X+32)` then a frontier LEAP to `X+64`. NOT issue #6 (a
+    /// second cross-thread primer of the counters) — a different plane, in the
+    /// receive path, which #6's fix merely stopped masking.
+    ///
+    /// The fail-stop is the LUCKY outcome: had the orphaned payload's first
+    /// word passed as a plausible length, the archive would have recorded
+    /// old-term bytes into the journal as current-term data and served them to
+    /// any follower doing deep-NAK replay.
+    #[test]
+    fn a_term_change_discards_out_of_order_runs_framed_by_the_old_term() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let term = term_handle(TERM);
+        let mut r = follower_with_term(&b, leader.addr(), Arc::clone(&term));
+        let to = r.local_addr();
+
+        // In-order prefix under term T: frontier at 96.
+        let runs = frame_runs(&[&[1u8; 64], &[2u8; 64]], 96);
+        leader.send(to, DGRAM_KIND_DATA, runs[0].0, TERM, &runs[0].1);
+        drive_until(&mut r, || b.counters().append.load_acquire() == 96);
+
+        // Out-of-order, above the frontier: term T's 96 B frame at 192, held
+        // behind the gap [96, 192).
+        leader.send(to, DGRAM_KIND_DATA, 192, TERM, &runs[1].1);
+        let st = r.stats();
+        drive_until(&mut r, || st.bytes.load(Relaxed) == 192);
+
+        // The consensus agent adopts term T+1, and its leader re-frames that
+        // same position with a 32 B NewTerm frame.
+        let new_term = TERM + 1;
+        term.store(new_term, Relaxed);
+        let nt = {
+            let nb = buffer();
+            let mut a = Appender::new(Arc::clone(&nb), new_term);
+            a.append_new_term().unwrap();
+            let mut out = Vec::new();
+            let SliceRead::Run(rr) = nb.read_run_validated(0, 96, &mut out) else {
+                panic!("new-term run")
+            };
+            assert_eq!(rr.bytes, 32, "a NewTerm frame is header-only");
+            out[..rr.bytes].to_vec()
+        };
+        leader.send(to, DGRAM_KIND_DATA, 192, new_term, &nt);
+        // Wait on the WIRE bytes landing (96 + 96 + 32), never on the fix's own
+        // counter — this test must fail on the safety assertion below when the
+        // discard is absent, not stall waiting for it.
+        drive_until(&mut r, || st.bytes.load(Relaxed) == 224);
+
+        // Fill the gap under the new term; the frontier advances and absorbs
+        // whatever out-of-order state survived.
+        leader.send(to, DGRAM_KIND_DATA, 96, new_term, &runs[1].1);
+        drive_until(&mut r, || b.counters().append.load_acquire() >= 224);
+
+        // The archive's OWN predicate: everything below `append` must walk as
+        // whole frames. Pre-fix this is Err(RecordableCorrupt) at 224 with
+        // append==288 — the union of the two framings.
+        let append = b.counters().append.load_acquire();
+        assert_eq!(append, 224, "the old term's 96 B span must not be counted");
+        let slice = b
+            .recordable_slice(0, 1 << 20)
+            .unwrap_or_else(|c| panic!("archive cannot walk [0, {append}): {}", b.corrupt_report(&c)));
+        assert_eq!(slice.len(), append as usize);
+    }
+
     #[test]
     fn truncation_regression_resyncs_rebuilt_tracker() {
         use std::sync::atomic::Ordering::Relaxed;
