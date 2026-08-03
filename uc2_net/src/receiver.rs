@@ -385,6 +385,11 @@ pub struct FollowerStats {
     /// it does not resolve them. See
     /// [`FollowerReceiver::discard_ooo_on_term_change`].
     pub term_change_discards: AtomicU64,
+    /// Times the receive frontier was rebased UP to the shared `append`
+    /// counter because something else had moved it ahead of us — in practice
+    /// this node's own appender during a leader stint. See
+    /// [`FollowerReceiver::resync_after_truncation`].
+    pub counter_ahead_resyncs: AtomicU64,
     /// Straddle drops (M6 Task 9): times a DATA datagram was discarded because a
     /// `LogCounters::prime(to)` re-primed the shared `append` counter DURING this
     /// datagram's processing (between the frontier read and the `store_release`).
@@ -856,6 +861,36 @@ impl FollowerReceiver {
         // It fires on a reconciliation truncation AND on a `BecomeLeader` collapse.
         // The FORWARD `AdoptFloor` re-prime (M6 Task 8) is NOT distinguishable here
         // and is handled separately by `resync_after_snapshot_install`.
+        // UPWARD: the shared counter is ahead of our receive frontier, which
+        // means it was moved by something other than us — this node's OWN
+        // appender during a leader stint (its appends push `append`, and the
+        // archive pushes `durable` behind them, while our tracker sits where it
+        // was when we last received). On step-down the stale-low tracker would
+        // accept the next leader's DATA at positions the archive has ALREADY
+        // RECORDED; `PositionedWriter::write_run` now refuses those writes, so
+        // without this rebase the follower would NAK for recorded positions and
+        // make no progress until something truncated. The counter is
+        // authoritative for what this node holds; follow it.
+        //
+        // Deliberately NOT gated on role. On a LIVE leader this is a no-op that
+        // fires each cycle — the receiver accepts no DATA in its own term, so
+        // there is nothing to keep — and doing it unconditionally means the
+        // tracker is already correct at the instant of step-down, with no window
+        // to reason about. (The M6 snapshot-install path keeps its own
+        // `resync_after_snapshot_install`: it is gated on an adopt-floor that
+        // must have been applied first.)
+        if append > self.rebuilt.contiguous() && self.snap_adopt_pending.is_none() {
+            self.rebuilt = Rebuilt::new(append);
+            self.last_published = append;
+            self.leader_append = self.leader_append.max(append);
+            // NOT `status_at`/`ap_reported`, unlike the downward branch. Those
+            // are reset there because a REGRESSED frontier would underflow the
+            // `contiguous - status_at` gate and would advertise positions that
+            // were just cut. Moving UP has neither problem, and clearing
+            // `ap_reported` here would swallow the very durable advance this
+            // node owes the leader for commit ranking.
+            self.stats.counter_ahead_resyncs.fetch_add(1, Ordering::Relaxed);
+        }
         if append < self.rebuilt.contiguous() {
             self.rebuilt = Rebuilt::new(append);
             self.last_published = append;
@@ -2514,9 +2549,16 @@ mod tests {
         let to = r.local_addr();
         let runs = frame_runs(&[&[1u8; 64]], 4096);
 
-        // gate closed: DATA dropped, frontier unmoved
-        b.counters().durable.store_release(960); // a durable advance to report
-        leader.send(to, DGRAM_KIND_DATA, runs[0].0, TERM, &runs[0].1);
+        // gate closed: DATA dropped, frontier unmoved. Start the node at a
+        // frontier of 960 with a durable advance to report, the way a restart
+        // leaves it — `prime` moves append/durable/sent together, because the
+        // archive only ever records what has been appended. (This used to store
+        // `durable = 960` with `append == 0`, a state the system cannot reach;
+        // `write_run`'s lower bound now rejects writes below `durable`, so the
+        // fixture had to become a reachable one.)
+        b.counters().prime(960);
+        let base = 960u64;
+        leader.send(to, DGRAM_KIND_DATA, base, TERM, &runs[0].1);
         let st = r.stats();
         let deadline = Instant::now() + Duration::from_secs(5);
         while st.dropped_gated.load(Relaxed) < 1 {
@@ -2526,7 +2568,7 @@ mod tests {
         for _ in 0..50 {
             r.do_work();
         }
-        assert_eq!(b.counters().append.load_acquire(), 0, "gated DATA advanced the log");
+        assert_eq!(b.counters().append.load_acquire(), base, "gated DATA advanced the log");
         assert_eq!(
             st.append_positions_sent.load(Relaxed),
             0,
@@ -2535,8 +2577,8 @@ mod tests {
 
         // reopen: DATA accepted AND AppendPosition now flows
         gate.store(true, Relaxed);
-        leader.send(to, DGRAM_KIND_DATA, runs[0].0, TERM, &runs[0].1);
-        drive_until(&mut r, || b.counters().append.load_acquire() == runs[0].2);
+        leader.send(to, DGRAM_KIND_DATA, base, TERM, &runs[0].1);
+        drive_until(&mut r, || b.counters().append.load_acquire() == base + runs[0].2);
         let deadline = Instant::now() + Duration::from_secs(5);
         while st.append_positions_sent.load(Relaxed) == 0 {
             assert!(Instant::now() < deadline, "AppendPosition never resumed after reopen");
@@ -2551,6 +2593,70 @@ mod tests {
     /// re-primed counter, and then ACCEPT DATA at the truncation point — pre-fix
     /// it dropped every such datagram as a dup (`position < contiguous`) and
     /// wedged `append`/`durable` at the truncation point forever.
+    /// A node that has been LEADER has pushed `append`/`durable` far past its
+    /// own receive frontier — its appender writes, its archive records, and its
+    /// receiver accepts nothing meanwhile (no DATA arrives in a term it leads).
+    /// On step-down that stale-low frontier let the next leader's DATA be
+    /// accepted at positions the archive had ALREADY RECORDED, rewriting them
+    /// under the archive's own cursor.
+    ///
+    /// Field evidence (2026-08-03, 7 of 50 soak hits, the `end=0` population):
+    /// `durable` found exactly 32 B inside a 64 B frame with `sent` marking that
+    /// frame's true start — the archive had recorded a 32 B NewTerm there and a
+    /// 64 B data frame replaced it afterwards. The archive then fail-stops on
+    /// the first frame of its OWN recorded region (`end=0`).
+    ///
+    /// Two things must hold: the recorded bytes survive, and the follower still
+    /// converges (a guard that only refused the write would wedge it NAKing for
+    /// recorded positions forever).
+    #[test]
+    fn a_leader_stint_leaves_no_stale_frontier_to_overwrite_recorded_bytes() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = buffer();
+        let mut leader = FakeLeader::new();
+        let mut r = follower(&b, leader.addr());
+        let to = r.local_addr();
+        let runs = frame_runs(&[&[1u8; 64], &[2u8; 64], &[3u8; 64]], 96);
+
+        // Receive one frame the ordinary way: frontier at 96.
+        leader.send(to, DGRAM_KIND_DATA, runs[0].0, TERM, &runs[0].1);
+        drive_until(&mut r, || b.counters().append.load_acquire() == 96);
+
+        // The leader stint: THIS node's appender writes 96..288 and its archive
+        // records all of it. The receiver's tracker is untouched at 96.
+        {
+            let mut a = Appender::new(Arc::clone(&b), TERM);
+            assert_eq!(a.position(), 96);
+            a.append(4, 7, &[9u8; 64]).unwrap();
+            a.append(4, 8, &[9u8; 64]).unwrap();
+        }
+        b.counters().durable.store_release(b.counters().append.load_acquire());
+        let recorded = b.counters().durable.load_acquire();
+        assert_eq!(recorded, 288, "the stint appended two frames");
+        let before = b.recordable_slice(96, 1 << 20).map(<[u8]>::to_vec);
+
+        // Step down: the next leader replicates ITS framing at 96 — a position
+        // this node has already journalled.
+        let st = r.stats();
+        leader.send(to, DGRAM_KIND_DATA, 96, TERM, &runs[1].1);
+        drive_until(&mut r, || st.datagrams.load(Relaxed) == 2);
+
+        // 1. the recorded region is untouched
+        assert_eq!(
+            b.recordable_slice(96, 1 << 20).map(<[u8]>::to_vec),
+            before,
+            "a recorded position was rewritten under the archive's cursor"
+        );
+        // 2. and the receiver has followed the counter, so it can still make
+        //    progress rather than NAKing for recorded positions forever.
+        assert!(
+            st.counter_ahead_resyncs.load(Relaxed) >= 1,
+            "the frontier never rebased to the counter — the follower would wedge"
+        );
+        leader.send(to, DGRAM_KIND_DATA, 288, TERM, &runs[2].1);
+        drive_until(&mut r, || b.counters().append.load_acquire() == 384);
+    }
+
     /// The receiver must never move `append` BACKWARD.
     ///
     /// The generation recheck rejects a prime that lands after `gen0` is
