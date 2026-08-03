@@ -120,7 +120,13 @@ load, and the condition is false in steady state — including on a leader, whos
 appender legitimately runs ahead of its own receiver's tracker, which is exactly
 why the check is `append < contiguous` and not `!=`.
 
-## …and part three, which is the one that mattered
+## …and part three, which I believed was the one that mattered
+
+*(It was not. A 444-run soak the next morning found 50 hits on the very build
+this section calls fixed — see "What the soak said" at the end. The mechanism
+below is real and its guard stays; the conclusion drawn from 20 clean runs was
+not. Kept as written, because the shape of the wrong conclusion is the useful
+part.)*
 
 Parts one and two were both real, both red/green tested — and the field hunt
 still reproduced at the same rate. That is worth dwelling on: **a mechanism you
@@ -200,3 +206,38 @@ time the collapse looked like a simplification rather than a proof obligation.
 `Rebuilt`'s blindness to buffer contents is still the right design. What was
 missing is that the ranges it stores are only comparable within a term, which
 makes the term part of the range's identity.
+
+---
+
+## What the soak said
+
+**50 hits in 444 runs — an 11.3 % per-run failure rate (95 % CI 8.4–14.3 %) on
+the build all three fixes landed in.** Not fixed.
+
+The three guards each close a real defect and each has a red-verified test.
+That is exactly as much as the unit tests ever proved. What they did not prove,
+and what I asserted anyway, is that the defects they close are the ones
+producing the field failure.
+
+**Every verdict in this investigation came from a ≤20-run sample of a ~10–25 %
+event.** At an 11 % rate, a clean run of 20 happens 9 % of the time — so
+"0 / 20" was never evidence of a fix; it was a coin landing the same way four or
+five times. I called it fixed twice on that basis, merged and pushed on the
+second. The soak was proposed as extra confidence on an answer already believed;
+it was in fact the first adequately powered measurement taken, and it reversed
+the conclusion.
+
+Nor is an improvement demonstrable. The pre-fix baseline was 2 hits in 8 runs —
+a 95 % interval of 3–65 %, which contains 11.3 %. Both the "fixed" claim and any
+"halved the rate" consolation claim rest on the same sand.
+
+The rule this earns, for any probabilistic failure: **choose the sample size
+from the rate you need to exclude, before the result is allowed to count as a
+verdict.** A soak is not a victory lap to run after you believe you are done. It
+is the measurement, and it belongs before the merge.
+
+The soak also bought something no small sample could: with 50 hits instead of
+one or two, the failures visibly split into **43** of the receive-path
+over-claim described above and **7** where the walk fails at `from` itself —
+the archive's own cursor mid-frame, a different plane. That second population
+did not exist as far as any earlier evidence could tell.
