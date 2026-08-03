@@ -55,6 +55,13 @@ pub struct FaultConfig {
     /// bytes at an arbitrary later time. Zero (the default) costs nothing:
     /// no history is even recorded when this is 0.
     pub replay_per_million: u32,
+    /// With this probability, `send_to` fails with `WouldBlock` and the
+    /// datagram never reaches the syscall — an ENOBUFS/EWOULDBLOCK-class
+    /// LOCAL socket failure, distinct from `drop_per_million` (wire loss
+    /// AFTER a successful syscall, surfaced as `Ok`). Zero (the default)
+    /// costs nothing: the branch draws nothing from the RNG, leaving every
+    /// existing seeded sequence undisturbed.
+    pub send_err_per_million: u32,
 }
 
 impl Default for FaultConfig {
@@ -66,6 +73,7 @@ impl Default for FaultConfig {
             reorder_per_million: 0,
             corrupt_per_million: 0,
             replay_per_million: 0,
+            send_err_per_million: 0,
         }
     }
 }
@@ -204,6 +212,16 @@ impl FaultSocket {
             buf
         };
 
+        // Send-error injection sits at the syscall boundary: branches that
+        // never reach the syscall (partition, drop, reorder-hold) cannot fail
+        // locally, and a failed call leaves held/history state untouched —
+        // exactly like a real EWOULDBLOCK.
+        if self.cfg.send_err_per_million > 0 && self.rng.chance(self.cfg.send_err_per_million) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "injected send error",
+            ));
+        }
         self.raw_send(out, to)?;
         if self.cfg.dup_per_million > 0 && self.rng.chance(self.cfg.dup_per_million) {
             self.raw_send(out, to)?;
@@ -413,6 +431,41 @@ mod tests {
     // ================================================================
     // M8 Task 14: corrupt/replay knobs (adversarial tier)
     // ================================================================
+
+    #[test]
+    fn send_err_is_deterministic_by_seed_and_nothing_hits_the_wire() {
+        // A send-error injection models an ENOBUFS/EWOULDBLOCK-class LOCAL
+        // syscall failure: `send_to` returns Err and the datagram never leaves
+        // the host — unlike `drop`, which models wire loss (successful syscall,
+        // Ok). Deterministic by seed like every other knob: the delivered set
+        // is exactly the complement of the seeded error draws.
+        let rx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        let to = rx.local_addr().unwrap();
+        let mut tx = FaultSocket::bind("127.0.0.1:0").unwrap();
+        tx.set_faults(FaultConfig {
+            seed: 99,
+            send_err_per_million: 500_000,
+            ..Default::default()
+        });
+        let mut rng = XorShift64::new(99);
+        let mut expected = Vec::new();
+        for i in 0..100u8 {
+            let r = tx.send_to(&[i], to);
+            if rng.chance(500_000) {
+                let e = r.expect_err("seeded send-error draw must surface as Err");
+                assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+            } else {
+                r.unwrap();
+                expected.push(vec![i]);
+            }
+        }
+        assert!(!expected.is_empty() && expected.len() < 100);
+        let got = recv_all(&rx, expected.len());
+        assert_eq!(
+            got, expected,
+            "delivered set must be the complement of the seeded errors"
+        );
+    }
 
     #[test]
     fn corrupt_flips_exactly_one_bit_and_leaves_length_unchanged() {

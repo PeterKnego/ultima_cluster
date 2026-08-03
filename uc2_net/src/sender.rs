@@ -220,6 +220,15 @@ pub struct SenderStats {
     /// mirrored into the cnc band by `refresh_peer_obs`, since a PERSISTENT
     /// failure (crypto on, no key/session ever) is silent from outside.
     pub seal_failures: AtomicU64,
+    /// A `send_to` that returned an error (ENOBUFS/EWOULDBLOCK class: a LOCAL
+    /// socket failure — the datagram never left the host). Previously these
+    /// were `let _ =` swallowed, indistinguishable from wire loss when
+    /// diagnosing a run; the loss itself stays non-fatal for the same reasons
+    /// as `seal_failures` (DATA self-heals via NAK, HEARTBEAT is superseded,
+    /// SNAP is re-requested). Observability only. A sustained nonzero rate at
+    /// plateau is the signal that explicit `SO_SNDBUF` sizing is worth doing
+    /// (the deferred #3b half of this change).
+    pub send_errors: AtomicU64,
 }
 
 pub struct Sender {
@@ -427,11 +436,13 @@ impl Sender {
              (raise mtu — the jumbo-frame knob)"
         );
         // Voting followers pace commit; learners are fanned-out to but never enter
-        // `limit()`.
+        // `limit()`. The bootstrap window is seeded relative to the recovered
+        // `sent` position: a leader promoted mid-stream must not start with
+        // `limit() < sent` (a silent stall until the first STATUS).
         let voting: Vec<SocketAddr> =
             followers.iter().copied().filter(|a| !learners.contains(a)).collect();
-        let flow = FlowControl::new(&voting, cluster_size, cfg.initial_window, learners);
         let sent = buffer.counters().sent.load_acquire();
+        let flow = FlowControl::new(&voting, cluster_size, sent, cfg.initial_window, learners);
         Sender {
             buffer,
             sock,
@@ -597,8 +608,13 @@ impl Sender {
                     // re-feeding every surviving address's last raw advert so
                     // ranking does not restart from the bootstrap window (mirrors
                     // `ElectionSm::rebuild_membership`'s carried-reports rationale).
-                    self.flow =
-                        FlowControl::new(&followers, cluster_size, self.cfg.initial_window, &learners);
+                    self.flow = FlowControl::new(
+                        &followers,
+                        cluster_size,
+                        self.sent,
+                        self.cfg.initial_window,
+                        &learners,
+                    );
                     for (&addr, &(contiguous, window)) in self.last_status.iter() {
                         self.flow.on_status(addr, contiguous, window);
                     }
@@ -699,8 +715,9 @@ impl Sender {
             // interval marker above still advances, so a persistent NoGroupKey
             // condition doesn't spin — the next heartbeat simply retries.
             if self.assemble(append, DGRAM_KIND_HEARTBEAT, 0) {
-                for &to in &self.followers {
-                    let _ = self.sock.send_to(&self.scratch, to);
+                for i in 0..self.followers.len() {
+                    let to = self.followers[i];
+                    self.send_scratch_counted(to);
                 }
                 // CommitPosition gossip (spec §6, on-advance + the 100 ms floor) is
                 // the consensus agent's job now (`Action::GossipCommit`) — the
@@ -821,6 +838,17 @@ impl Sender {
         }
     }
 
+    /// Send the assembled `scratch` datagram to `to`, counting — never
+    /// propagating — a send-path error (see `SenderStats::send_errors`). Every
+    /// outgoing-datagram site routes through here: an ENOBUFS/EWOULDBLOCK-class
+    /// local failure stays non-fatal, but is no longer indistinguishable from
+    /// wire loss.
+    fn send_scratch_counted(&mut self, to: SocketAddr) {
+        if self.sock.send_to(&self.scratch, to).is_err() {
+            self.stats.send_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// One scan, N sends (identical datagram to every follower). If sealing
     /// fails, nothing is sent this cycle to ANY follower (a half fan-out —
     /// some followers sealed, some not — is not a state this function ever
@@ -829,8 +857,9 @@ impl Sender {
         if !self.assemble(position, DGRAM_KIND_DATA, body_bytes) {
             return;
         }
-        for &to in &self.followers {
-            let _ = self.sock.send_to(&self.scratch, to);
+        for i in 0..self.followers.len() {
+            let to = self.followers[i];
+            self.send_scratch_counted(to);
             self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
             self.stats.bytes.fetch_add(body_bytes as u64, Ordering::Relaxed);
         }
@@ -851,7 +880,7 @@ impl Sender {
                     // frontier stays put and it re-NAKs, same as any other
                     // lost datagram.
                     if self.assemble(p, DGRAM_KIND_DATA, r.bytes) {
-                        let _ = self.sock.send_to(&self.scratch, to);
+                        self.send_scratch_counted(to);
                         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
                         self.stats.bytes.fetch_add(r.bytes as u64, Ordering::Relaxed);
                     }
@@ -1081,7 +1110,7 @@ impl Sender {
             // already takes on this path.
             return 0;
         }
-        let _ = self.sock.send_to(&self.scratch, sess.peer);
+        self.send_scratch_counted(sess.peer);
         self.stats.snap_chunks.fetch_add(1, Ordering::Relaxed);
         if is_nak {
             self.stats.snap_chunk_naks.fetch_add(1, Ordering::Relaxed);
@@ -1110,7 +1139,7 @@ impl Sender {
         if !self.assemble_snap(peer, 0, DGRAM_KIND_SNAP_BEGIN, &body) {
             return false;
         }
-        let _ = self.sock.send_to(&self.scratch, peer);
+        self.send_scratch_counted(peer);
         true
     }
 
@@ -1224,7 +1253,7 @@ impl Sender {
         if !self.seal_scratch(DGRAM_KIND_DATA) {
             return; // dropped: the follower re-NAKs, same as any lost datagram
         }
-        let _ = self.sock.send_to(&self.scratch, to);
+        self.send_scratch_counted(to);
         self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
         self.stats.bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
         self.stats.replay_datagrams.fetch_add(1, Ordering::Relaxed);
@@ -1316,6 +1345,7 @@ pub(crate) fn chunk_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fault::FaultConfig;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
     use uc2_log::buffer::Appender;
@@ -1496,6 +1526,69 @@ mod tests {
         s.do_work();
         let (h, body) = f1.recv().expect("remaining frames");
         assert_eq!((h.position, body.len()), (96, 3 * 96));
+    }
+
+    /// A leader promoted mid-stream (recovered `sent` far past `initial_window`)
+    /// must stream new frames immediately: the bootstrap flow window is seeded
+    /// RELATIVE to the sender's current position, not as an absolute limit. An
+    /// absolute seed of 65_536 would put `limit() < sent` at promotion and
+    /// silently stall every send until the first STATUS arrives.
+    #[test]
+    fn promoted_leader_streams_immediately_without_waiting_for_status() {
+        // 128 KiB ring so the append position can honestly exceed the 64 KiB
+        // bootstrap window without any archive drain.
+        let b = Arc::new(LogBuffer::new(Region::heap_zeroed(1 << 17), test_cnc(1 << 17), 256));
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        // 700 frames x 96 B = 67_200 B of history: past initial_window (65_536).
+        for i in 0..700 {
+            a.append(4, i, &[0u8; 64]).unwrap();
+        }
+        let append = b.counters().append.load_acquire();
+        assert!(append > 65_536, "history must exceed the bootstrap window");
+        // The recovered leader had already streamed everything it appended.
+        b.counters().sent.store_release(append);
+
+        let f1 = Fake::new();
+        let (mut s, _tx) = sender_to(&[&f1], &b);
+        a.append(4, 700, &[7u8; 64]).unwrap();
+        s.do_work();
+        let (h, body) = f1.recv().expect("promoted leader must stream without a STATUS");
+        assert_eq!(h.position, append);
+        assert_eq!(body.len(), 96);
+        assert_eq!(s.stats().flow_stalls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// #3a: a send-path failure (ENOBUFS/EWOULDBLOCK class) must be counted,
+    /// not silently swallowed — today it is invisible at the stats level and
+    /// indistinguishable from wire loss when diagnosing a run.
+    #[test]
+    fn send_path_errors_are_counted_not_swallowed() {
+        let b = buffer();
+        let f1 = Fake::new();
+        let mut sock = FaultSocket::bind("127.0.0.1:0").unwrap();
+        // Every send fails locally before the syscall.
+        sock.set_faults(FaultConfig { send_err_per_million: 1_000_000, ..Default::default() });
+        let (_tx, rx) = mpsc::sync_channel::<CtrlMsg>(1024);
+        let mut cfg = SenderConfig::new(9);
+        cfg.heartbeat_ns = u64::MAX;
+        let mut s = Sender::new(
+            Arc::clone(&b),
+            sock,
+            vec![f1.addr()],
+            3,
+            rx,
+            cfg,
+            term_handle(9),
+            always_leader(),
+        );
+        let mut a = Appender::new(Arc::clone(&b), 9);
+        a.append(4, 0, &[0u8; 64]).unwrap();
+        s.do_work(); // one DATA datagram to one follower, whose send errs
+        assert_eq!(
+            s.stats().send_errors.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the failed fan-out send must be counted"
+        );
     }
 
     #[test]

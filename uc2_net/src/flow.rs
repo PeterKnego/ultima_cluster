@@ -26,10 +26,15 @@ pub struct FlowControl {
 impl FlowControl {
     /// `voting_followers` are the peers whose adverts pace commit; `learners` are
     /// fanned-out to identically but excluded from `limit()`. `cluster_size` is
-    /// the VOTING cluster size (learners are not members).
+    /// the VOTING cluster size (learners are not members). `base` is the
+    /// sender's current stream position: an unknown follower is seeded as if it
+    /// had advertised `(contiguous = base, window = initial_window)`, so a
+    /// leader promoted mid-stream starts with `limit() > sent` instead of
+    /// stalling behind an absolute bootstrap limit until the first STATUS.
     pub fn new(
         voting_followers: &[SocketAddr],
         cluster_size: usize,
+        base: u64,
         initial_window: u64,
         learners: &[SocketAddr],
     ) -> Self {
@@ -37,7 +42,7 @@ impl FlowControl {
         let needed = (cluster_size / 2 + 1).saturating_sub(1);
         assert!(needed <= voting_followers.len(), "not enough voters for a quorum");
         Self {
-            followers: voting_followers.iter().map(|a| (*a, initial_window)).collect(),
+            followers: voting_followers.iter().map(|a| (*a, base + initial_window)).collect(),
             learners: learners.iter().map(|a| (*a, 0)).collect(),
             needed,
         }
@@ -93,10 +98,22 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_limit_is_relative_to_base() {
+        // A leader promoted at stream position 1 MiB seeds every unknown
+        // follower as if it had advertised (contiguous = base, window =
+        // initial): limit() = base + initial, never the absolute initial
+        // (which would sit BELOW `sent` and stall the stream until the first
+        // STATUS).
+        let (a, b) = (addr(1), addr(2));
+        let f = FlowControl::new(&[a, b], 3, 1_048_576, 65536, &[]);
+        assert_eq!(f.limit(), 1_048_576 + 65536);
+    }
+
+    #[test]
     fn three_node_limit_is_the_faster_follower() {
         let (a, b) = (addr(1), addr(2));
-        let mut f = FlowControl::new(&[a, b], 3, 65536, &[]);
-        // bootstrap: both unknown at (0, initial) -> limit = initial
+        let mut f = FlowControl::new(&[a, b], 3, 0, 65536, &[]);
+        // bootstrap at base 0: both unknown at (0, initial) -> limit = initial
         assert_eq!(f.limit(), 65536);
         f.on_status(a, 1_000_000, 100_000);
         assert_eq!(f.limit(), 1_100_000); // max(1.1M, 64k)
@@ -113,7 +130,7 @@ mod tests {
     #[test]
     fn five_node_limit_is_second_highest() {
         let fs: Vec<SocketAddr> = (1..=4).map(addr).collect();
-        let mut f = FlowControl::new(&fs, 5, 1000, &[]);
+        let mut f = FlowControl::new(&fs, 5, 0, 1000, &[]);
         for (i, a) in fs.iter().enumerate() {
             f.on_status(*a, (i as u64 + 1) * 1000, 0);
         }
@@ -124,7 +141,7 @@ mod tests {
     #[test]
     fn unknown_source_is_ignored() {
         let a = addr(1);
-        let mut f = FlowControl::new(&[a], 2, 500, &[]);
+        let mut f = FlowControl::new(&[a], 2, 0, 500, &[]);
         f.on_status(addr(9), 1 << 40, 1 << 20); // not a configured follower
         assert_eq!(f.limit(), 500);
     }
@@ -135,7 +152,7 @@ mod tests {
         // quorum statistic must stay the voters' — a learner is replicated-to but
         // never counted (M6 Task 7).
         let (a, b, l) = (addr(1), addr(2), addr(3));
-        let mut f = FlowControl::new(&[a, b], 3, 1000, &[l]);
+        let mut f = FlowControl::new(&[a, b], 3, 0, 1000, &[l]);
         f.on_status(a, 5_000, 0);
         f.on_status(b, 4_000, 0);
         assert_eq!(f.limit(), 5_000); // faster of the two voters
