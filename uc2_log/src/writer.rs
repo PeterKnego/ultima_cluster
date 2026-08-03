@@ -43,6 +43,18 @@ impl PositionedWriter {
         if position + bytes.len() as u64 > durable + b.capacity() {
             return false;
         }
+        // …and the matching bound from BELOW: `[.., durable)` is in the journal
+        // and the archive's own cursor walks it, so those bytes are immutable.
+        // The SAFETY note below has always claimed `[append, durable+capacity)`
+        // as writer-owned; only the upper half was enforced. A receiver whose
+        // gap tracker lags the shared counter — after a leader stint its own
+        // appends push `append`/`durable` far past its receive frontier —
+        // otherwise accepts a new leader's DATA at a recorded position and
+        // rewrites it under the archive (2026-08-03: `durable` found 32 B inside
+        // a 64 B frame, 7 of 50 soak hits).
+        if position < durable {
+            return false;
+        }
         // SAFETY: [off, off+len) within capacity (wrap check above); bytes in
         // [append, durable+capacity) are writer-owned (single receiver per
         // buffer, the follower analog of the appender contract); visibility
@@ -107,6 +119,34 @@ mod tests {
             assert!(w.write_run(0, &run2[..r.bytes]));
         }
         assert_eq!(follower.recordable_slice(0, 1 << 20).unwrap().len(), 384);
+    }
+
+    /// RECORDED BYTES ARE IMMUTABLE. `[.., durable)` has been written into the
+    /// journal; the buffer copy must keep agreeing with it, and the archive's
+    /// own cursor sits in there. The overrun gate above bounds writes from
+    /// ABOVE (`durable + capacity`); nothing bounded them from below, even
+    /// though the SAFETY comment on the copy already claims "bytes in
+    /// `[append, durable+capacity)` are writer-owned".
+    ///
+    /// Field evidence (2026-08-03, 7 of 50 soak hits): `durable` found sitting
+    /// exactly 32 B inside a 64 B frame, with `sent` marking that frame's true
+    /// start — the archive had recorded a 32 B frame there (a NewTerm) and
+    /// something replaced it with a 64 B data frame afterwards. The archive
+    /// then fail-stops walking its own recorded region.
+    #[test]
+    fn write_run_refuses_to_rewrite_what_the_archive_already_recorded() {
+        let (follower, fc) = buf();
+        let w = PositionedWriter::new(Arc::clone(&follower));
+        // Nothing recorded yet: the write lands.
+        assert!(w.write_run(64, &[7u8; 64]), "control: writable while durable is 0");
+        // The archive records through 128.
+        fc.counters().durable.store_release(128);
+        assert!(
+            !w.write_run(64, &[9u8; 64]),
+            "rewrote bytes below `durable` — the archive has already journalled them"
+        );
+        // At/above the recorded frontier is still fine.
+        assert!(w.write_run(128, &[9u8; 64]), "writes at the durable frontier must still land");
     }
 
     #[test]

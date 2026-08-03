@@ -241,3 +241,56 @@ one or two, the failures visibly split into **43** of the receive-path
 over-claim described above and **7** where the walk fails at `from` itself —
 the archive's own cursor mid-frame, a different plane. That second population
 did not exist as far as any earlier evidence could tell.
+
+---
+
+## Part four: the archive's own cursor, and the close
+
+The soak's 50 hits split 43 / 7. The 43 were the receive-path over-claim above.
+The **7 were a different bug entirely**, and only visible because there were 50
+hits instead of one: `end=0` — the frame walk failing at `from` ITSELF, i.e. the
+archive's own cursor mid-frame.
+
+`durable` sat exactly 32 B inside a 64 B frame, with `sent` marking that frame's
+true start. The archive only ever advances `durable` over whole frames, so when
+it recorded, that position held a **32-byte** frame — a NewTerm. Something
+replaced it with a 64-byte data frame afterwards: a write BELOW `durable`, over
+bytes already in the journal.
+
+The path is the mirror image of everything above. A node that has been LEADER
+pushes `append` and `durable` far past its own receive frontier — its appender
+writes, its archive records, and its receiver accepts nothing meanwhile, because
+no DATA arrives in a term it leads. There was a resync for the counter moving
+DOWN (a prime) and one for a snapshot floor moving UP, but none for *this*. On
+step-down the stale-low frontier accepts the next leader's DATA at positions the
+archive has already recorded.
+
+Two guards close it:
+
+- the receive frontier now rebases **up** to the shared counter, which is
+  authoritative for what this node holds — not role-gated, so the tracker is
+  already correct at the instant of step-down, with no window to reason about;
+- `write_run` refuses `position < durable`, enforcing the
+  `[append, durable+capacity)` writer-owned contract its own SAFETY comment had
+  claimed all along while enforcing only the upper half.
+
+Red-verified independently, which is what shows they are not the same guard
+twice: with only the write bound the recorded bytes survive but the follower
+**wedges**, NAKing for recorded positions forever; with only the resync it
+converges and nothing is overwritten. The resync is the fix; the bound turns
+this whole class of bug into a dropped datagram instead of silent corruption.
+
+**Verdict: 0 hits in 151 runs, per-run rate under 1.96 % at 95 % confidence —
+against a sample size fixed at 150 before the code was written.** That ordering
+is the only real difference between this verdict and the two wrong ones.
+
+## A postscript, which is not good news
+
+The same soak caught something else. On run 109, unmutated, the
+`CommittedTruncationWitness` fired: the committed frontier held by NO node,
+114,080 B short, all three nodes below it. That is acked-write loss, not a
+fail-stop — quieter and worse than everything this note describes. Roughly
+0.7 %/run, and not yet established as a real leader-completeness violation
+versus a false positive of the witness, whose soundness rests on no node's
+`commit` ever running ahead of what was genuinely committed. Its own
+investigation.
