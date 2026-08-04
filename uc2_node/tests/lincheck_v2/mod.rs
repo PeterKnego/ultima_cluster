@@ -1439,6 +1439,20 @@ impl CommittedTruncationWitness {
                         "COMMITTED DATA LOST (no node holds the frontier: every `append` \
                          is below it too)"
                     };
+                    // CONVICT ONLY ON GENUINE LOSS. A receded recorded-frontier
+                    // is reported for the record but is not a safety violation:
+                    // the bytes are still in a node's buffer and `durable`
+                    // climbs back. Measured 2026-08-04 on a dedicated host —
+                    // mutated firings were LOST 4, RECEDED 0 (one run's race
+                    // did not land), by margins of 0.5-2.5 MB, so the tooth
+                    // keeps its teeth. This also removes the ~0.2%/run spurious
+                    // failure of the tooth's CONTROL arm, which is the same
+                    // unmutated workload that fired once in the 452-run fleet
+                    // hunt on a history elle ruled VALID.
+                    if buffered >= frontier {
+                        eprintln!("[trunc-witness] {verdict} — NOT convicted");
+                        continue;
+                    }
                     let mut slot = t_hit.lock().unwrap();
                     if slot.is_none() {
                         *slot = Some(format!(
