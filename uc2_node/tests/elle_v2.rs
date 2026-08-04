@@ -685,6 +685,14 @@ fn elle_mut_vote_order() {
     // Armed on the first tick and dropped with the closure. The pass never kills
     // a node, so every backward step of `durable` here is a truncation.
     let mut witness: Option<CommittedTruncationWitness> = None;
+    // Record the hit, do NOT panic here: panicking inside the nemesis aborts
+    // the pass before `run_mutation_pass` writes its history, and the history
+    // is the INDEPENDENT oracle. If committed data really was lost, acked
+    // appends have vanished and elle will call the history invalid without any
+    // reference to this witness's own predicate; if elle calls it valid, the
+    // witness is the thing under suspicion. Fail after the write instead.
+    let hit: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
+    let hit_sink = Arc::clone(&hit);
     run_mutation_pass(
         "mut_vote_order",
         ClusterCfg::default(),
@@ -708,11 +716,18 @@ fn elle_mut_vote_order() {
             // majority's leader never stopped serving, so it returns before the
             // healed node has even campaigned. The stale win lands in the window
             // AFTER it, which is why the witness gets its own budget here.
-            if let Some(hit) = witness.check_within(Duration::from_millis(1500)) {
-                panic!("COMMITTED-TRUNCATION — {hit}");
+            if let Some(found) = witness.check_within(Duration::from_millis(1500)) {
+                let mut slot = hit_sink.lock().unwrap();
+                if slot.is_none() {
+                    eprintln!("[witness] COMMITTED-TRUNCATION — {found}");
+                    *slot = Some(found);
+                }
             }
         },
         |_cluster, faults| faults >= 3,
         "fewer than 3 minority-isolation cycles landed",
     );
+    if let Some(found) = hit.lock().unwrap().as_ref() {
+        panic!("COMMITTED-TRUNCATION — {found}");
+    }
 }
