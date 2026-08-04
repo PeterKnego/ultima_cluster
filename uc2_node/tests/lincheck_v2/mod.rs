@@ -1349,6 +1349,30 @@ pub fn join_workers(handles: Vec<JoinHandle<()>>) {
 /// `CONFIRM` consecutive samples are required so a torn read across the
 /// three pages (they are sampled in a loop, not atomically) cannot convict.
 ///
+/// ## What a firing does and does not establish (2026-08-04)
+///
+/// A 452-run fleet hunt fired this once on an UNMUTATED build, and elle ruled
+/// that run's history VALID under both `serializable` and `strong-serializable`.
+/// The two oracles disagree, and this one has the weaker case: the predicate
+/// compares the frontier against `durable`, the RECORDED frontier, so it
+/// detects the recorded frontier receding — which a prime does without the
+/// bytes going anywhere. The message therefore now reports `append` (what a
+/// node HOLDS) beside `durable` and says which case it saw:
+///
+/// * `append` still covers the frontier -> RECORDED-FRONTIER RECEDED, not loss;
+/// * every `append` is below it too -> COMMITTED DATA LOST.
+///
+/// **The conviction rule is deliberately unchanged for now**: it still fires on
+/// either. Narrowing it to the second case is the obvious next step and would
+/// also remove a ~0.2 %/run spurious failure of the mutation tooth's CONTROL
+/// arm — but only after checking that MUTATED firings really do report loss.
+/// Assuming that from the shape of the code is exactly the reasoning that
+/// produced two wrong "fixed" calls in this investigation.
+///
+/// Elle's disagreement is not proof either: that hunt ran `READ_FRAC=0.05` over
+/// 64 keys, so its power to OBSERVE a lost append is low. Settling it wants a
+/// re-run at real read coverage.
+///
 /// ## Scope
 ///
 /// Armed by the vote-order pass with the mutation ON *and* OFF: under the
@@ -1392,17 +1416,41 @@ impl CommittedTruncationWitness {
                 }
                 let durables: Vec<u64> =
                     pages.iter().map(|p| p.counters().durable.load_acquire()).collect();
+                // `append` is what a node HOLDS; `durable` only what it has
+                // RECORDED. A prime moves `durable` back without the bytes
+                // going anywhere, so a receded recorded-frontier is not by
+                // itself data loss — if any node's `append` still covers the
+                // frontier, the bytes exist and this is a false positive.
+                // Sampled here so the report can say which it was; 2026-08-04,
+                // a firing whose history elle ruled VALID could not be
+                // classified from the message because only `durable` was in it.
+                let appends: Vec<u64> =
+                    pages.iter().map(|p| p.counters().append.load_acquire()).collect();
                 let orphaned = !durables.is_empty() && durables.iter().all(|&d| d < frontier);
                 streak = if orphaned { streak + 1 } else { 0 };
                 if streak >= Self::CONFIRM {
                     let held = durables.iter().copied().max().unwrap_or(0);
+                    let buffered = appends.iter().copied().max().unwrap_or(0);
+                    let verdict = if buffered >= frontier {
+                        "RECORDED-FRONTIER RECEDED (not loss: a node still HOLDS the \
+                         frontier in its buffer — `append` covers it, only `durable` \
+                         regressed, e.g. across a prime)"
+                    } else {
+                        "COMMITTED DATA LOST (no node holds the frontier: every `append` \
+                         is below it too)"
+                    };
                     let mut slot = t_hit.lock().unwrap();
                     if slot.is_none() {
                         *slot = Some(format!(
-                            "the committed frontier {frontier} is held by NO node — highest \
-                             durable across the cluster is {held}, {} committed bytes short. \
-                             Per-node durable: {durables:?}",
-                            frontier - held
+                            "{verdict} — committed frontier {frontier}, highest durable {held} \
+                             ({} short), highest append {buffered} ({}). \
+                             Per-node durable: {durables:?} append: {appends:?}",
+                            frontier - held,
+                            if buffered >= frontier {
+                                format!("covers it by {}", buffered - frontier)
+                            } else {
+                                format!("{} short", frontier - buffered)
+                            }
                         ));
                     }
                 }
