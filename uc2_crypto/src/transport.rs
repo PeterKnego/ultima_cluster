@@ -1190,6 +1190,13 @@ impl SharedTransport {
         self.key.lock().unwrap().group.unacked_peers()
     }
 
+    /// Forwards to [`GroupPlane::peers_missing_key`] — which of `targets`
+    /// still lack the newest minted epoch, INCLUDING peers that joined after
+    /// the mint and so never appear in `unacked_group_key_peers`.
+    pub fn group_key_missing_peers(&self, targets: &[NodeId]) -> Vec<NodeId> {
+        self.key.lock().unwrap().group.peers_missing_key(targets)
+    }
+
     /// Forwards to [`GroupPlane::redeliver_to`] — re-emits the newest minted
     /// epoch's `HS_KEY` delivery to `peers`, for the node layer to seal and
     /// send again (T12).

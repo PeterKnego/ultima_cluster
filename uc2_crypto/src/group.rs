@@ -331,6 +331,32 @@ impl GroupPlane {
         }
     }
 
+    /// Which of `targets` still lack the newest minted epoch — the peers a
+    /// caller must (re)deliver to.
+    ///
+    /// This is [`GroupPlane::unacked_peers`] widened in the one direction that
+    /// matters: a peer is "missing" if it has not ACKED, INCLUDING a peer that
+    /// was never in the mint's delivery list at all. `unacked_peers` can only
+    /// ever name peers the mint knew about, so a node that joins the peer set
+    /// AFTER a mint is invisible to it — never unacked, never redelivered to,
+    /// and therefore holding no group key for as long as this leader reigns.
+    /// Its fan-out traffic is then dropped "no usable group key" indefinitely.
+    ///
+    /// Reached in the field via the ordinary boot sequence rather than any
+    /// exotic race: a node elects itself under a solo genesis config (peer set
+    /// empty, mint correct and delivered to nobody), then adopts the real
+    /// multi-voter config. Measured 2026-08-05 in `sigkill_mid_config_window`
+    /// with crypto ON — ~25 %/run failure, 34-80 mints per 15 s run against 6
+    /// for the same test without reconfiguration.
+    ///
+    /// With nothing minted every target is missing: there is no epoch to hold.
+    pub fn peers_missing_key(&self, targets: &[NodeId]) -> Vec<NodeId> {
+        match &self.pending {
+            Some(p) => targets.iter().copied().filter(|id| !p.acked.contains(id)).collect(),
+            None => targets.to_vec(),
+        }
+    }
+
     /// Re-emits the newest minted epoch's `HS_KEY` delivery to each of
     /// `peers`, for the caller to seal pairwise and send again — see
     /// [`GroupPlane::unacked_peers`] for why this exists.
@@ -458,6 +484,28 @@ fn encode_ack(epoch: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A peer that joins AFTER the mint is invisible to `unacked_peers` — it
+    /// was never in the delivery list, so it is never "unacked" and never
+    /// redelivered to, and it holds no group key for as long as this leader
+    /// reigns. `peers_missing_key` is the widened question the caller needs.
+    #[test]
+    fn a_peer_that_joined_after_the_mint_is_missing_the_key_not_merely_unacked() {
+        let mut g = GroupPlane::new(1);
+        let (epoch, _acts) = g.mint(&[0], 1_000);
+        // Node 0 was delivered to and acks; node 2 joined the peer set later.
+        g.on_ack(0, epoch);
+        assert!(g.unacked_peers().is_empty(), "0 acked, and 2 was never in the mint");
+        assert_eq!(
+            g.peers_missing_key(&[0, 2]),
+            vec![2],
+            "the late joiner must be reported as needing the key"
+        );
+        assert!(
+            !g.redeliver_to(&[2]).is_empty(),
+            "and redelivery to it must actually emit a key delivery"
+        );
+    }
 
     #[test]
     fn a_minted_epoch_only_activates_once_every_peer_acks() {
