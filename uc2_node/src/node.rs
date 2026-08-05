@@ -6551,9 +6551,23 @@ mod tests {
         let acts = h.peer.on_group_key_message(1, &again);
         let ack = expect_send(&acts, DGRAM_KIND_HS_KEY);
         h.deliver_handshake(DGRAM_KIND_HS_KEY, &ack);
+        // The GATE set and the DELIVERY set are now different questions, and
+        // peer 2 — unreachable, no established session — answers them
+        // differently. It never gated activation (option A, 2026-08-05: an
+        // `HS_KEY` is sealed pairwise, so a peer with no session provably never
+        // received the key and its ack can never come), so it is not
+        // "unacked" for the pending epoch...
+        let crypto = h.h.cons.crypto.as_ref().unwrap();
         assert!(
-            h.h.cons.crypto.as_ref().unwrap().unacked_group_key_peers() == vec![2],
-            "only the unreachable peer 2 is still outstanding"
+            crypto.unacked_group_key_peers().is_empty(),
+            "peer 0 acked, and peer 2 was never in the activation set"
+        );
+        // ...but it is still OWED the key, and redelivery must keep targeting
+        // it so it can open group traffic the moment its session exists.
+        assert_eq!(
+            crypto.group_key_missing_peers(&[0, 2]),
+            vec![2],
+            "the unreachable peer is still owed the key"
         );
     }
 

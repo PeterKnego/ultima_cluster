@@ -959,7 +959,20 @@ impl SharedTransport {
     /// doc (identical rationale and forwarding shape; this is the
     /// `SharedTransport`-side entry point T12's node layer calls).
     pub fn mint_group_key(&self, peers: &[NodeId], now_ns: u64) -> (u16, Vec<HandshakeAction>) {
-        self.key.lock().unwrap().group.mint(peers, now_ns)
+        let mut ks = self.key.lock().unwrap();
+        // Gate activation on the peers we can actually DELIVER to. An `HS_KEY`
+        // is sealed pairwise, so a peer with no established session cannot
+        // receive it at all and its ack can never come — waiting the full
+        // activation timeout for it is waiting for the impossible, and with
+        // `DATA`/`HEARTBEAT` both group-scope that wait mutes a fresh leader
+        // completely (see `GroupPlane::mint_gated` and
+        // `docs/notes/uc2-the-mute-leader.md`). Everyone still gets a delivery;
+        // an excluded peer is picked up by `peers_missing_key` once its session
+        // exists. Computed under the SAME lock as the mint, so the gate cannot
+        // be decided against a session set that changes underneath it.
+        let gate_on: Vec<NodeId> =
+            peers.iter().copied().filter(|&p| ks.peers.is_established(p)).collect();
+        ks.group.mint_gated(peers, &gate_on, now_ns)
     }
 
     /// Forwards to [`RotationState::on_became_leader`] — see

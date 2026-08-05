@@ -212,6 +212,47 @@ impl GroupPlane {
     /// accepted before. But the cost is real and is paid to buy back the
     /// liveness the reset destroyed: without it there is no epoch to be
     /// late for, because the cluster never forms at all.
+    /// As [`GroupPlane::mint`], but with the ACTIVATION SET stated separately
+    /// from the delivery set.
+    ///
+    /// Every peer in `peers` still receives an `HS_KEY` delivery — a peer that
+    /// is merely slow, or whose session comes up a moment later, must still get
+    /// the key. Only `gate_on` is required to ack before
+    /// [`GroupPlane::sealing_epoch`] will use the epoch.
+    ///
+    /// The caller passes as `gate_on` the peers it can actually deliver to. A
+    /// peer with no established pairwise session cannot be delivered to at all
+    /// — the `HS_KEY` is sealed pairwise, so the send fails outright — and so
+    /// its ack can never arrive. Waiting [`ACTIVATION_TIMEOUT_NS`] for it is
+    /// waiting for something the caller already knows is impossible.
+    ///
+    /// This narrows the WAIT, not the SECRECY. Confidentiality comes from the
+    /// delivery being sealed pairwise to an allowlisted peer; the activation
+    /// set only decides how long the leader holds off using an epoch. A peer
+    /// excluded here is picked up by [`GroupPlane::peers_missing_key`] once its
+    /// session exists, receives the key by redelivery, and acks then.
+    ///
+    /// Why it matters (2026-08-05): `DATA` and `HEARTBEAT` are both group-scope,
+    /// so a leader with no usable epoch can neither replicate nor heartbeat. A
+    /// FRESH leader has no activated epoch to fall back on, so one unreachable
+    /// peer in `gossip_targets()` — an M7 learner added but never started, or a
+    /// crashed voter — muted it for the full 2 s, against a 150-300 ms follower
+    /// election timeout. It could not survive its own mute window, so the
+    /// cluster could not hold a leader at all. See
+    /// `docs/notes/uc2-the-mute-leader.md`.
+    pub fn mint_gated(
+        &mut self,
+        peers: &[NodeId],
+        gate_on: &[NodeId],
+        now_ns: u64,
+    ) -> (u16, Vec<HandshakeAction>) {
+        let (epoch, acts) = self.mint(peers, now_ns);
+        if let Some(p) = self.pending.as_mut() {
+            p.peers.retain(|id| gate_on.contains(id));
+        }
+        (epoch, acts)
+    }
+
     pub fn mint(&mut self, peers: &[NodeId], now_ns: u64) -> (u16, Vec<HandshakeAction>) {
         // T17 (2026-07-29) — the activation clock is INHERITED, not restarted,
         // when this mint supersedes a pending epoch that never activated. See
@@ -521,6 +562,31 @@ mod tests {
             g.sealing_epoch(ACTIVATION_TIMEOUT_NS + 1),
             Some(e1),
             "the liveness half of the rule releases it"
+        );
+    }
+
+    /// Option A (2026-08-05): a peer we cannot deliver to must not gate
+    /// activation. Contrast with
+    /// `a_never_acking_peer_mutes_a_fresh_leader_for_the_activation_timeout`,
+    /// which documents the ungated behaviour this replaces at the call site.
+    #[test]
+    fn a_peer_we_cannot_deliver_to_does_not_gate_activation() {
+        let mut g = GroupPlane::new(1);
+        // 0 has a session; 100 does not, so only 0 can gate.
+        let (e1, _) = g.mint_gated(&[0, 100], &[0], 0);
+        g.on_ack(0, e1);
+        assert_eq!(
+            g.sealing_epoch(1_000),
+            Some(e1),
+            "the deliverable peer acked — the leader must be able to seal at once, \
+             not sit mute for the activation timeout waiting on a peer that \
+             provably never received the key"
+        );
+        assert_eq!(
+            g.peers_missing_key(&[0, 100]),
+            vec![100],
+            "and the excluded peer is still owed the key: redelivery must keep \
+             targeting it so it can open group traffic once its session exists"
         );
     }
 
