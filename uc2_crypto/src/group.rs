@@ -485,6 +485,45 @@ fn encode_ack(epoch: u16) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// A never-acking peer costs a fresh leader [`ACTIVATION_TIMEOUT_NS`] of
+    /// MUTE FAN-OUT — every group-scope datagram dropped "no usable group
+    /// key" — because activation is `all_acked || timed_out` and an
+    /// unreachable peer can only ever satisfy the second disjunct.
+    ///
+    /// An M7 learner that is added to the config but is not running (or is not
+    /// in the crypto allowlist) is exactly such a peer, and it sits in
+    /// `gossip_targets()`, so it is named in every mint. Rotation fires on
+    /// `BecameLeader`, so each election buys another 2 s of silence — and a
+    /// FRESH leader has no previously-activated epoch to fall back on.
+    ///
+    /// Measured NOT to be permanent, which is what a first draft of this test
+    /// wrongly asserted: a later mint folds the earlier pending epoch in once
+    /// its own 2 s has rolled past, so the leader does recover. The cost is
+    /// bounded per mint, not a closed loop.
+    ///
+    /// Field shape (2026-08-05, `sigkill_mid_config_window` + crypto, ~25 % of
+    /// runs): 34-80 mints per 15 s run against 6 for the same test without a
+    /// config change, 8-13 "no usable group key" drops, ~30x fewer client ops
+    /// than the same test with crypto off.
+    #[test]
+    fn a_never_acking_peer_mutes_a_fresh_leader_for_the_activation_timeout() {
+        let mut g = GroupPlane::new(1);
+        // Peer 0 is live; peer 100 is the unreachable learner.
+        let (e1, _) = g.mint(&[0, 100], 0);
+        g.on_ack(0, e1);
+        assert_eq!(
+            g.sealing_epoch(ACTIVATION_TIMEOUT_NS - 1),
+            None,
+            "the whole activation window: peer 100 cannot ack, and this leader \
+             has no earlier activated epoch — every fan-out is dropped"
+        );
+        assert_eq!(
+            g.sealing_epoch(ACTIVATION_TIMEOUT_NS + 1),
+            Some(e1),
+            "the liveness half of the rule releases it"
+        );
+    }
+
     /// A peer that joins AFTER the mint is invisible to `unacked_peers` — it
     /// was never in the delivery list, so it is never "unacked" and never
     /// redelivered to, and it holds no group key for as long as this leader
