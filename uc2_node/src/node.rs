@@ -1988,8 +1988,17 @@ impl Consensus {
             .crypto
             .as_ref()
             .map(|c| {
-                let unacked = c.unacked_group_key_peers();
-                if unacked.is_empty() { Vec::new() } else { c.redeliver_group_key_to(&unacked) }
+                // Ask against the CURRENT peer set, not the mint's delivery
+                // list. `unacked_group_key_peers` can only name peers the mint
+                // knew about, so a node that joined the peer set afterwards is
+                // invisible to it — never unacked, never redelivered to, and
+                // holding no group key for as long as this leader reigns, with
+                // its fan-out dropped "no usable group key" throughout. The
+                // ordinary boot sequence reaches this: a node elects itself
+                // under a solo genesis config (mint correct, delivered to
+                // nobody), then adopts the real multi-voter config.
+                let missing = c.group_key_missing_peers(&self.gossip_targets());
+                if missing.is_empty() { Vec::new() } else { c.redeliver_group_key_to(&missing) }
             })
             .unwrap_or_default();
         self.crypto_exec(acts);
