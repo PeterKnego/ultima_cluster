@@ -7,7 +7,7 @@ memory-channel speed.
 
 ## What it is
 
-Ultima_cluster is a State Machine Replication application server. You write a deterministic state machine; it runs your state machine on every node in a cluster, applying the same commands in the same order, and survives node failure without losing acknowledged writes. Replicated command log is what drives changes in user-supplied state machine.
+Ultima_cluster is a State Machine Replication application server. You write a deterministic state machine; it runs your state machine on every node in a cluster, applying the same commands in the same order, and survives node failure without losing acknowledged writes. Replicated command log is what drives changes in user-supplied state machine. Read more about in in the [ARCHITECTURE](https://github.com/PeterKnego/ultima_cluster/blob/main/docs/ARCHITECTURE.md).
 
 ## Why?
 
