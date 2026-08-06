@@ -77,21 +77,20 @@ impl StateMachine for CounterSm {
 }
 ```
 
-That is the entire contract. `apply` runs on every replica for every committed
-command in log order; `query` answers reads from local state; `last_applied`
-tells the framework where to resume after a restart.
+That is the entire contract: `apply` runs on every replica for every committed
+command in log order, `query` answers reads from local state, and
+`last_applied` tells the framework where to resume after a restart.
 
-**`apply` must be deterministic.** Same state plus same command must yield the
-same next state on every node, forever — no clocks, no randomness, no I/O, no
-`HashMap` iteration order. Note the `wrapping_add`: plain `+` panics on overflow
-in debug and wraps in release, so a replica built one way would diverge from a
-replica built the other. Contrived for a counter; entirely real for a matching
-engine.
+Notice the `wrapping_add`. `apply` must be deterministic — same state plus same
+command, same result on every node forever — and plain `+` would panic on
+overflow in debug while wrapping in release, so two replicas built differently
+would diverge. See
+[the apply contract](/docs/ARCHITECTURE.md#the-apply-path-and-the-sdk).
 
 ## 3. A real three-node cluster
 
-Now the interesting version. Five terminals — three nodes, three services, one
-client — or use `&` and one terminal, as you prefer.
+Now the interesting version. We will use five terminals: three nodes, three
+services, and one client.
 
 **Set up:**
 

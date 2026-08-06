@@ -153,7 +153,11 @@ locks, no wakeups on the hot path.
 | **archive** | Polls the buffer from `durable_position`, block-writes ≤1 MiB to `ultima_journal`, one `fdatasync` per block, then advances the durable counter. **The only fsync site in the system** |
 
 Each counter has exactly one writer, which is what lets the fast path use plain
-stores plus a single release-store commit word.
+stores plus a single release-store commit word. Each also sits on its own
+64-byte stride within the page: four agents storing to four counters on one
+cache line would contend through the coherence protocol even though they never
+touch the same field, so the padding buys back the independence the
+single-writer rule is there to provide.
 
 ## The log buffer and durability
 
