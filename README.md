@@ -5,7 +5,15 @@ server**: Raft-style consensus safety over a shared-memory log buffer, with the
 user's deterministic business logic running in a separate process at
 memory-channel speed.
 
-### 1.64 M responses/s at p99 0.771 ms
+## What it is
+
+Ultima_cluster is a State Machine Replication application server. You write a deterministic state machine; it runs your state machine on every node in a cluster, applying the same commands in the same order, and survives node failure without losing acknowledged writes. Replicated command log is what drives changes in user-supplied state machine.
+
+## Why?
+
+SMR is used when you need ultimate performance and correctness at the same time. All state is held an manipulated in memory (only occasional snapshots are persisted) and correctness is guaranteed via guaranteed order of commands across all state machines in the cluster.
+
+### High-perf: 1.64 M responses/s at p99 0.771 ms
 
 End to end through the SDK — client submit, consensus, apply, response — with
 **every operation quorum-fsync'd before it is acked** and reads linearizable.
