@@ -159,9 +159,16 @@ Start here:
   checked, what is only bug-hunted, and how to reproduce each.
 - **[`docs/BENCHMARKS.md`](/docs/BENCHMARKS.md)** — every measured result, what
   it was measured on, and the read-barrier arc.
-- **[`docs/ops/uc2-runbook.md`](/docs/ops/uc2-runbook.md)** — operations:
-  instance-dir layout, durability requirements, cnc decoding, purge enablement,
-  live reconfiguration (`uc2ctl`), wire crypto setup.
+- **[`docs/how-to/`](/docs/how-to)** — task guides for running a cluster:
+  getting nodes onto real hosts, changing membership live, encrypting node
+  traffic, bounding journal growth, diagnosing a node, investigating a red
+  correctness run, reproducing a published result.
+- **[`docs/reference/`](/docs/reference)** — the surfaces those tasks drive:
+  `uc2ctl`, the instance directory, the cnc control page, configuration and
+  environment switches, the wire protocol, the linearizable read path. The
+  library API is the rustdoc above, not here.
+- **[`docs/ops/uc2-runbook.md`](/docs/ops/uc2-runbook.md)** — the operations
+  landing page; indexes the two directories above.
 
 Reference:
 
