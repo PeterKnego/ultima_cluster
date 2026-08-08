@@ -715,8 +715,26 @@ mod tests {
     use std::sync::Arc;
     use uc_protocol::v2::frame::read_header;
 
+    /// A scratch dir on REAL DISK, never `/tmp` — `/tmp` on the dev box is
+    /// RAM-backed tmpfs with no swap, and a journal segment parked there is
+    /// resident memory racing the busy-spin node clusters (see CLAUDE.md).
+    /// `CARGO_TARGET_TMPDIR` is only set for `tests/` and `benches/`, not for
+    /// `src/` unit tests, so fall back to the target dir under the manifest.
+    /// Same discipline as `uc2_net::sender::tests::crypto_transport`.
+    fn scratch_dir() -> tempfile::TempDir {
+        let base = std::env::var("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/uc2_log_tests")
+            });
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = tempfile::Builder::new().prefix("uc2-log-").tempdir_in(&base).unwrap();
+        assert!(!dir.path().starts_with("/tmp"), "test scratch must not live on tmpfs: {dir:?}");
+        dir
+    }
+
     fn setup(cap: usize) -> (Arc<LogBuffer>, Arc<CncPage>, tempfile::TempDir) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = scratch_dir();
         let cnc = CncPage::heap(&CncMeta {
             node_id: 0,
             instance_id: 0,
@@ -1084,9 +1102,13 @@ mod tests {
     /// Helper: an archive holding `n_blocks` blocks of 4 frames each (96 B per
     /// frame → 384 B per block), one block PER SEGMENT (so a purge can actually
     /// drop whole segment files), recorded + fsynced. Returns the frame start
-    /// positions across every block. The `TempDir` is intentionally leaked so
-    /// the journal dir outlives the returned `Archive`.
-    fn archive_with_blocks(n_blocks: usize) -> (Archive, Arc<LogBuffer>, Vec<u64>) {
+    /// positions across every block. The `TempDir` is RETURNED, not
+    /// `mem::forget`-ed: the caller must bind it so the journal dir outlives
+    /// the returned `Archive` and is still reclaimed when the test ends.
+    /// Forgetting it leaked one dir per test run, forever (see `scratch_dir`).
+    fn archive_with_blocks(
+        n_blocks: usize,
+    ) -> (Archive, Arc<LogBuffer>, Vec<u64>, tempfile::TempDir) {
         let (b, _c, dir) = setup(1 << 16);
         // 384 B block cap = exactly 4 frames/block; a 408 B journal record fills
         // a 440 B segment, so the next block rolls a new segment (1 block/seg).
@@ -1104,8 +1126,7 @@ mod tests {
         }
         while arch.do_work(&b).unwrap() {}
         assert_eq!(arch.blocks_recorded(), n_blocks as u64, "one block per 4 frames");
-        std::mem::forget(dir); // keep the journal dir alive for `arch`'s lifetime
-        (arch, b, frames)
+        (arch, b, frames, dir)
     }
 
     /// The journal directory backing `a` (test accessor; `cfg` is same-module).
@@ -1121,7 +1142,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn purge_below_keeps_covering_block_and_replay_at_pos_succeeds() {
-        let (mut archive, _buffer, frames) = archive_with_blocks(4); // 4 blocks, 4 frames each
+        let (mut archive, _buffer, frames, _dir) = archive_with_blocks(4); // 4 blocks, 4 frames each
         let cut = frames[9]; // a frame inside block 2
         let new_first = archive.purge_below(cut).unwrap();
         assert!(new_first <= cut, "covering block retained");
@@ -1142,22 +1163,33 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn purge_below_is_noop_at_or_below_floor_and_survives_reopen() {
-        let (mut archive, _b, frames) = archive_with_blocks(4);
+        let (mut archive, _b, frames, _dir) = archive_with_blocks(4);
         let cut = frames[9];
         let first = archive.purge_below(cut).unwrap();
         assert_eq!(archive.purge_below(first).unwrap(), first, "no-op at floor");
         let dir = archive_dir(&archive);
         drop(archive);
-        let re = Archive::open(ArchiveConfig::new(&dir)).unwrap();
+        // Reopen with the SAME small-segment config the helper wrote with: bare
+        // `ArchiveConfig::new` would fall back to the 64 MiB production default
+        // with `preallocate_segments: true` and fallocate a 64 MiB segment just
+        // to read a recovery floor.
+        let re = Archive::open(ArchiveConfig {
+            max_block_bytes: 384,
+            segment_size_bytes: 440,
+            preallocate_segments: false,
+            ..ArchiveConfig::new(&dir)
+        })
+        .unwrap();
         assert_eq!(re.first_base(), first, "floor recovered from journal.first_seq");
         assert_eq!(re.recovered_position(), frames_end(&frames), "frontier untouched by purge");
     }
 
     /// Helper: an archive holding exactly ONE block of 4 frames (positions
     /// 0, 96, 192, 288; block [0, 384)), recorded + fsynced. Returns the frame
-    /// start positions. The `TempDir` is intentionally leaked so the journal
-    /// dir outlives the returned `Archive` (which keeps the journal open).
-    fn archive_with_one_block() -> (Archive, Arc<LogBuffer>, Vec<u64>) {
+    /// start positions. The `TempDir` is RETURNED, not `mem::forget`-ed: the
+    /// caller must bind it so the journal dir outlives the returned `Archive`
+    /// (which keeps the journal open) and is still reclaimed at end of test.
+    fn archive_with_one_block() -> (Archive, Arc<LogBuffer>, Vec<u64>, tempfile::TempDir) {
         let (b, _c, dir) = setup(1 << 16);
         // Default 1 MiB block cap: all 4 frames (384 B) land in ONE block.
         let mut arch = Archive::open(test_cfg(dir.path())).unwrap();
@@ -1170,15 +1202,14 @@ mod tests {
         assert_eq!(arch.recovered_position(), 384, "4 frames = one 384 B block");
         assert_eq!(arch.blocks_recorded(), 1, "helper must record exactly one block");
         assert_eq!(frames, vec![0, 96, 192, 288]);
-        std::mem::forget(dir); // keep the journal dir alive for `arch`'s lifetime
-        (arch, b, frames)
+        (arch, b, frames, dir)
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
     fn truncate_inside_first_block_clears_and_reappends_prefix() {
         // one block [0, N) with several frames; cut at a frame boundary inside it
-        let (mut archive, buffer, appender_frames) = archive_with_one_block(); // helper: appends 4 frames, records+fsyncs 1 block
+        let (mut archive, buffer, appender_frames, _dir) = archive_with_one_block(); // helper: appends 4 frames, records+fsyncs 1 block
         let cut = appender_frames[2]; // position of the 3rd frame = keep frames 0,1
         archive.truncate_to(cut).unwrap();
         assert_eq!(archive.recovered_position(), cut);
@@ -1191,7 +1222,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn truncate_to_zero_clears_everything() {
-        let (mut archive, _b, _f) = archive_with_one_block();
+        let (mut archive, _b, _f, _dir) = archive_with_one_block();
         archive.truncate_to(0).unwrap(); // the contested-first-election case (M4 final review I-2)
         assert_eq!(archive.recovered_position(), 0);
         assert!(archive.replay_from(0).unwrap().next().unwrap().is_none());
@@ -1384,7 +1415,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn replay_journal_from_matches_replay_from_and_handles_bounds() {
-        let (mut archive, _b, frames) = archive_with_blocks(4); // 16 frames, 4 blocks
+        let (mut archive, _b, frames, _dir) = archive_with_blocks(4); // 16 frames, 4 blocks
         let journal = archive.journal_arc();
 
         // Mid-stream frame start: identical stream to replay_from.
