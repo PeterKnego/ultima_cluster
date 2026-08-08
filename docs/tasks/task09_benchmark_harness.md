@@ -107,7 +107,7 @@ cargo run -p uc_autobench --features uc-bench-probes --bin attribution-bench \
   --release -- --config single_tmpfs --inflight 8 --count 5000
 
 # real disk (storage axis): redirect the fixture's journal TempDir to ext4.
-TMPDIR=/home/<you>/uc-bench-data cargo run -p uc_autobench \
+TMPDIR=/home/<you>/ultima/uc-bench-data cargo run -p uc_autobench \
   --features uc-bench-probes --bin attribution-bench --release -- \
   --config single_disk --inflight 8 --count 5000 \
   --out bench-out/reference/attribution.csv
