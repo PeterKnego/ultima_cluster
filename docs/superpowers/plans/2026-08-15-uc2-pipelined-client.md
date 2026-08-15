@@ -347,10 +347,18 @@ impl SlotTable {
 
     pub(crate) fn release(&self, seq: u64) {
         let slot = &self.slots[(seq as usize) & self.mask];
-        // Only the claiming thread calls release, and only before the request
-        // was ever visible on the wire — the slot is necessarily ours.
-        slot.owner.store(FREE, Ordering::Release);
-        self.inflight.fetch_sub(1, Ordering::AcqRel);
+        // AMENDED (Task-2 review, Critical): release joins the single-CAS
+        // exactly-once protocol — an unconditional store here could race a
+        // concurrent sweep/drain_abort (double-decrementing the window into a
+        // permanent WindowFull wedge) or erase a re-claimed live slot (zero
+        // completions). Only the CAS winner decrements.
+        if slot
+            .owner
+            .compare_exchange(seq + 1, FREE, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.inflight.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     pub(crate) fn resolve(&self, wire_seq: u32, expect_kind: Option<ReqKind>) -> Resolve {
