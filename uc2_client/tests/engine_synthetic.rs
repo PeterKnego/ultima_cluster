@@ -8,6 +8,7 @@
 //! slot-release obligation), and the fail-loud payload bound.
 
 use std::path::Path;
+use std::time::Duration;
 
 use uc2_client::{Consistency, Engine, EngineConfig, SubmitError};
 use uc2_log::cnc::{CncMeta, CncPage};
@@ -50,6 +51,13 @@ fn make_instance_caps(dir: &Path, app_id: &str, ingress_cap: u64, egress_cap: u6
 
 fn cfg() -> EngineConfig {
     EngineConfig { serving_gate: false, ..EngineConfig::default() }
+}
+
+/// Same shape as `meta`, but with an explicit `instance_id` (modeled on
+/// `tests/timeout_and_restart.rs`'s `meta`) — used by the restart test to
+/// recreate the cnc page in place with a KNOWN fresh id.
+fn meta_with_instance(app_id: &str, instance_id: u128) -> CncMeta {
+    CncMeta { node_id: 0, instance_id, app_id: app_id.into(), buffer_bytes: MIB, max_payload: 256 }
 }
 
 #[test]
@@ -137,4 +145,205 @@ fn try_query_is_gated_the_same_way_as_try_submit() {
     let (s, _p) = Engine::attach(dir.path(), "eng-query", cfg()).unwrap();
     s.try_query(1, b"q", Consistency::Linearizable).expect("gate off: accepted");
     s.try_query(2, b"q", Consistency::Snapshot).expect("gate off: accepted");
+}
+
+use uc_protocol::v2::ipc::{
+    FLAG_V2_IS_QUERY, MSG_V2_NOT_LEADER, MSG_V2_RESPONSE, MSG_V2_RETRY, extra_client,
+};
+
+/// Collect completions into owned tuples (payload copied out of the borrow).
+fn drain(poll: &mut uc2_client::PollHalf) -> Vec<(u64, Option<u64>, String)> {
+    let mut out = Vec::new();
+    poll.poll(|c| {
+        let tag = match &c.outcome {
+            uc2_client::Outcome::Response(b) => format!("resp:{}", b.len()),
+            uc2_client::Outcome::NotLeader { hint } => format!("notleader:{hint:?}"),
+            uc2_client::Outcome::Retry => "retry".into(),
+            uc2_client::Outcome::TimedOut => "timeout".into(),
+            uc2_client::Outcome::InstanceRestart { .. } => "restart".into(),
+        };
+        out.push((c.user_data, c.position, tag));
+    });
+    out
+}
+
+/// Egress producer for injecting answers into a synthetic dir.
+fn egress(dir: &std::path::Path) -> uc_protocol::ring::BroadcastProducer {
+    BroadcastRing::open(&dir.join("egress_service.broadcast")).unwrap().producer()
+}
+
+#[test]
+fn response_resolves_with_position_and_payload_and_duplicate_is_counted() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "eng-resp", 1 << 20, 1 << 20);
+    let (s, mut p) = Engine::attach(dir.path(), "eng-resp", cfg()).unwrap();
+    s.try_submit(0xCAFE, b"cmd").unwrap();
+
+    let mut payload = 4096u64.to_le_bytes().to_vec();
+    payload.extend_from_slice(b"answer");
+    // wire_seq 0: first request of a fresh engine (start_seq 0).
+    let mut prod = egress(dir.path());
+    prod.write(MSG_V2_RESPONSE, 0, extra_client(s.client_id(), 0), &payload).unwrap();
+    prod.write(MSG_V2_RESPONSE, 0, extra_client(s.client_id(), 0), &payload).unwrap(); // dup
+
+    let got = drain(&mut p);
+    assert_eq!(got, vec![(0xCAFE, Some(4096), "resp:6".to_string())]);
+    assert_eq!(s.stats().duplicates, 1, "second delivery counted, not re-emitted");
+    assert_eq!(s.inflight(), 0);
+}
+
+#[test]
+fn kind_mismatched_response_is_dropped_counted_and_the_real_answer_still_lands() {
+    // T14 moved from matcher.rs: query-flagged delivery vs a Submit slot.
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "eng-t14", 1 << 20, 1 << 20);
+    let (s, mut p) = Engine::attach(dir.path(), "eng-t14", cfg()).unwrap();
+    s.try_submit(7, b"cmd").unwrap();
+
+    let mut wrong = 0u64.to_le_bytes().to_vec();
+    wrong.extend_from_slice(b"x");
+    let mut prod = egress(dir.path());
+    prod.write(MSG_V2_RESPONSE, FLAG_V2_IS_QUERY, extra_client(s.client_id(), 0), &wrong).unwrap();
+    assert!(drain(&mut p).is_empty(), "kind mismatch must not complete");
+    assert_eq!(s.stats().kind_mismatch, 1);
+    assert_eq!(s.inflight(), 1, "slot survives for the real answer");
+
+    let mut right = 9u64.to_le_bytes().to_vec();
+    right.extend_from_slice(b"ok");
+    prod.write(MSG_V2_RESPONSE, 0, extra_client(s.client_id(), 0), &right).unwrap();
+    assert_eq!(drain(&mut p), vec![(7, Some(9), "resp:2".to_string())]);
+}
+
+#[test]
+fn not_leader_and_retry_resolve_kind_agnostic_with_hint_decode() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "eng-nl", 1 << 20, 1 << 20);
+    let (s, mut p) = Engine::attach(dir.path(), "eng-nl", cfg()).unwrap();
+    s.try_query(1, b"q", Consistency::Linearizable).unwrap(); // wire_seq 0
+    s.try_submit(2, b"c").unwrap();                            // wire_seq 1
+
+    let mut prod = egress(dir.path());
+    prod.write(MSG_V2_NOT_LEADER, 0, extra_client(s.client_id(), 0), &2u64.to_le_bytes()).unwrap();
+    prod.write(MSG_V2_RETRY, 0, extra_client(s.client_id(), 1), &[]).unwrap();
+
+    let got = drain(&mut p);
+    assert_eq!(got, vec![
+        (1, None, "notleader:Some(2)".to_string()),
+        (2, None, "retry".to_string()),
+    ]);
+}
+
+#[test]
+fn deadline_sweep_times_out_unanswered_requests() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "eng-to", 1 << 20, 1 << 20);
+    let (s, mut p) = Engine::attach(
+        dir.path(), "eng-to",
+        EngineConfig {
+            request_timeout: Duration::from_millis(50),
+            serving_gate: false,
+            ..EngineConfig::default()
+        },
+    ).unwrap();
+    s.try_submit(42, b"never answered").unwrap();
+    std::thread::sleep(Duration::from_millis(80));
+    // Maintenance is amortized every 64 poll cycles — loop until it fires.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = drain(&mut p);
+        if got == vec![(42, None, "timeout".to_string())] { break; }
+        assert!(got.is_empty(), "unexpected completions: {got:?}");
+        assert!(std::time::Instant::now() < deadline, "sweep never fired");
+    }
+    assert_eq!(s.stats().timed_out, 1);
+    assert_eq!(s.inflight(), 0, "nothing accepted may leak");
+}
+
+#[test]
+fn instance_restart_fails_all_inflight_and_poisons_the_send_half() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "eng-rs", 1 << 20, 1 << 20);
+    let (s, mut p) = Engine::attach(dir.path(), "eng-rs", cfg()).unwrap();
+    let attached = s.instance_id();
+    s.try_submit(1, b"a").unwrap();
+    s.try_submit(2, b"b").unwrap();
+
+    // Recreate the cnc in place with a fresh instance_id (Node::start's boot
+    // behavior; same file/inode, mmap observes the new bytes).
+    CncPage::create_file(
+        &dir.path().join("cnc2.dat"),
+        &meta_with_instance("eng-rs", 0xDEAD_BEEF),
+    ).unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut got = Vec::new();
+    while got.len() < 2 {
+        got.extend(drain(&mut p));
+        assert!(std::time::Instant::now() < deadline, "restart sweep never fired");
+    }
+    got.sort();
+    assert_eq!(got[0], (1, None, "restart".to_string()));
+    assert_eq!(got[1], (2, None, "restart".to_string()));
+
+    match s.try_submit(3, b"c") {
+        Err(SubmitError::InstanceRestart { attached: a, current }) => {
+            assert_eq!(a, attached);
+            assert_eq!(current, 0xDEAD_BEEF);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn broadcast_overwrite_is_a_stat_and_the_deadline_backstops_hung_requests() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    // Tiny egress broadcast: easy to lap.
+    make_instance_caps(dir.path(), "eng-ow", 1 << 20, 256);
+    let (s, mut p) = Engine::attach(
+        dir.path(), "eng-ow",
+        EngineConfig {
+            request_timeout: Duration::from_millis(100),
+            serving_gate: false,
+            ..EngineConfig::default()
+        },
+    ).unwrap();
+    s.try_submit(5, b"lost").unwrap();
+
+    // Lap the consumer with junk addressed to nobody.
+    let mut prod = egress(dir.path());
+    for _ in 0..64 {
+        prod.write(MSG_V2_RESPONSE, 0, extra_client(u32::MAX, 0), &[0u8; 32]).unwrap();
+    }
+    let _ = drain(&mut p); // absorbs the Overwritten signal
+    assert!(s.stats().overwritten >= 1, "overwrite must be counted");
+
+    // The affected request must NOT be eagerly failed — it resolves via the
+    // deadline (spec §4 item 6).
+    std::thread::sleep(Duration::from_millis(150));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = drain(&mut p);
+        if got == vec![(5, None, "timeout".to_string())] { break; }
+        assert!(got.is_empty());
+        assert!(std::time::Instant::now() < deadline);
+    }
+}
+
+#[test]
+fn wire_seq_wrap_roundtrips_through_a_real_ring() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "eng-wrap", 1 << 20, 1 << 20);
+    let (s, mut p) = Engine::attach(
+        dir.path(), "eng-wrap",
+        EngineConfig { start_seq: u32::MAX as u64 - 4, serving_gate: false, ..EngineConfig::default() },
+    ).unwrap();
+    let mut prod = egress(dir.path());
+    for i in 0..16u64 {
+        let wire = (u32::MAX as u64 - 4 + i) as u32; // == seq as u32, across the wrap
+        s.try_submit(i, b"w").unwrap();
+        let mut payload = i.to_le_bytes().to_vec();
+        payload.extend_from_slice(b"z");
+        prod.write(MSG_V2_RESPONSE, 0, extra_client(s.client_id(), wire), &payload).unwrap();
+        assert_eq!(drain(&mut p), vec![(i, Some(i), "resp:1".to_string())], "iteration {i}");
+    }
 }

@@ -129,7 +129,6 @@ impl SlotTable {
         }
     }
 
-    #[allow(dead_code)] // consumed from Task 4 on (PollHalf::poll's completion path)
     pub(crate) fn resolve(&self, wire_seq: u32, expect_kind: Option<ReqKind>) -> Resolve {
         let slot = &self.slots[(wire_seq as usize) & self.mask];
         let owner = slot.owner.load(Ordering::Acquire);
@@ -157,7 +156,6 @@ impl SlotTable {
         Resolve::Won { user_data }
     }
 
-    #[allow(dead_code)] // consumed from Task 4 on (PollHalf::poll's deadline sweep)
     pub(crate) fn sweep(&self, now_ns: u64, mut cb: impl FnMut(u64)) {
         for slot in self.slots.iter() {
             let owner = slot.owner.load(Ordering::Acquire);
@@ -184,7 +182,6 @@ impl SlotTable {
     /// drain_abort is exhaustive only if the caller has stopped issuing claims first;
     /// a claim racing the drain is backstopped by the deadline sweep, so pollers must
     /// keep sweeping after a drain unless claims are provably quiesced.
-    #[allow(dead_code)] // consumed on shutdown from a later task
     pub(crate) fn drain_abort(&self, mut cb: impl FnMut(u64)) {
         for slot in self.slots.iter() {
             let owner = slot.owner.load(Ordering::Acquire);

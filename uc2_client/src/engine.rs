@@ -36,12 +36,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use uc2_log::cnc::CncPage;
-use uc_protocol::ring::{BroadcastConsumer, BroadcastRing, MpscProducer, MpscRing, RingError};
+use uc_protocol::ring::{
+    BroadcastConsumer, BroadcastRing, MpscProducer, MpscRing, RecordHeader, RingError,
+};
 use uc_protocol::v2::cnc::NODE_FLAG_CAN_SERVE;
-use uc_protocol::v2::ipc::{FLAG_V2_LINEARIZABLE, MSG_V2_QUERY, MSG_V2_SUBMIT, extra_client};
+use uc_protocol::v2::ipc::{
+    FLAG_V2_IS_QUERY, FLAG_V2_LINEARIZABLE, MSG_V2_NOT_LEADER, MSG_V2_QUERY, MSG_V2_RESPONSE,
+    MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra, extra_client,
+};
 
 use crate::error::ClientError;
-use crate::slots::{ReqKind, SlotTable};
+use crate::slots::{ReqKind, Resolve, SlotTable};
 
 /// Well-known file names under the instance dir (the shared contract with
 /// `uc2_node::InstanceDir` — see `uc2_node/src/ipc.rs`). Moved here from
@@ -193,16 +198,39 @@ pub struct SendHalf {
 /// The completion side: single owner, `Send`. `poll` (Task 4) drains
 /// completions in one bounded, zero-alloc duty cycle.
 pub struct PollHalf {
-    #[allow(dead_code)] // read starting Task 4
     shared: Arc<Shared>,
-    #[allow(dead_code)] // read starting Task 4
     egress_service: BroadcastConsumer,
-    #[allow(dead_code)] // read starting Task 4
     egress_node: BroadcastConsumer,
-    #[allow(dead_code)] // scratch decode buffer, used starting Task 4
     buf: Vec<u8>,
-    #[allow(dead_code)] // duty-cycle counter, used starting Task 4
     cycle: u64,
+}
+
+/// One resolved completion, handed to the callback passed to [`PollHalf::poll`].
+/// `position` is `Some` only for [`Outcome::Response`] (the wire's `u64` LE
+/// prefix, stripped from `outcome`'s borrowed payload).
+pub struct Completion<'a> {
+    pub user_data: u64,
+    pub position: Option<u64>,
+    pub outcome: Outcome<'a>,
+}
+
+/// What became of a request. See the module's central contract: every
+/// accepted `try_submit`/`try_query` produces exactly one of these.
+#[derive(Debug)]
+pub enum Outcome<'a> {
+    /// A `MSG_V2_RESPONSE` payload, borrowed from the engine's read buffer
+    /// (the wire's `position: u64 LE` prefix already stripped).
+    Response(&'a [u8]),
+    /// A `MSG_V2_NOT_LEADER` redirect; `hint` is `None` when the node doesn't
+    /// know the current leader (wire sentinel `u64::MAX`).
+    NotLeader { hint: Option<u32> },
+    /// A `MSG_V2_RETRY` transient signal: no side effect happened yet.
+    Retry,
+    /// The per-request deadline elapsed with no answer (includes anything
+    /// lost to a broadcast overwrite — see `drain_ring`'s `Overwritten` arm).
+    TimedOut,
+    /// The node's instance restarted while this request was in flight.
+    InstanceRestart { attached: u128, current: u128 },
 }
 
 impl Engine {
@@ -352,10 +380,168 @@ impl Clone for SendHalf {
 }
 
 impl PollHalf {
-    /// Drain and dispatch completions in one bounded duty cycle. Stub as of
-    /// Task 3 — always reports zero; Task 4 fills in the real drain
-    /// (egress broadcast decode, slot resolution, deadline sweep).
-    pub fn poll(&mut self) -> usize {
-        0
+    /// Drain and dispatch completions in one bounded duty cycle: up to 128
+    /// records off each broadcast (service first, then node), plus — every
+    /// 64th call — the amortized restart check and deadline sweep. `cb` is
+    /// called once per resolved completion; returns the total emitted.
+    pub fn poll(&mut self, mut cb: impl FnMut(Completion<'_>)) -> usize {
+        self.cycle += 1;
+        let mut emitted = 0usize;
+        if self.cycle.is_multiple_of(64) {
+            emitted += maintenance(&self.shared, &mut cb);
+        }
+        emitted += drain_ring(&mut self.egress_service, &self.shared, &mut self.buf, &mut cb);
+        emitted += drain_ring(&mut self.egress_node, &self.shared, &mut self.buf, &mut cb);
+        emitted
     }
+
+    /// Fail every still-inflight request via `cb` (used on shutdown).
+    pub fn drain_abort(&mut self, cb: impl FnMut(u64)) {
+        self.shared.table.drain_abort(cb);
+    }
+
+    /// Wait handle for the service egress broadcast — for a caller that wants
+    /// to park (rather than busy-poll) between duty cycles.
+    pub fn wait_handle(&self) -> uc_protocol::ring::RingWaitHandle {
+        self.egress_service.wait_handle()
+    }
+
+    /// A point-in-time snapshot of this engine's counters.
+    pub fn stats(&self) -> EngineStats {
+        self.shared.stats.snapshot()
+    }
+}
+
+/// Drain up to 128 records off one broadcast (bounded work per call).
+fn drain_ring(
+    ring: &mut BroadcastConsumer,
+    shared: &Shared,
+    buf: &mut Vec<u8>,
+    cb: &mut impl FnMut(Completion<'_>),
+) -> usize {
+    let mut emitted = 0usize;
+    for _ in 0..128 {
+        match ring.try_read(buf) {
+            Ok(Some(rec)) => emitted += handle_record(shared, &rec, buf, cb),
+            Ok(None) => break,
+            Err(RingError::Overwritten) => {
+                // Spec §4 item 6: a stat, NOT an eager fail-all — the engine
+                // cannot know which responses were in the lost window; the
+                // deadline sweep backstops anything actually lost.
+                shared.stats.overwritten.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                shared.stats.corrupt.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    emitted
+}
+
+/// One record's routing. Returns 1 if a completion was emitted, else 0.
+fn handle_record(
+    shared: &Shared,
+    rec: &RecordHeader,
+    buf: &[u8],
+    cb: &mut impl FnMut(Completion<'_>),
+) -> usize {
+    let (cid, wire_seq) = client_from_extra(rec.header_extra);
+    if cid != shared.client_id {
+        return 0; // every client sees every broadcast record
+    }
+    match rec.msg_type {
+        MSG_V2_RESPONSE => {
+            if buf.len() < 8 {
+                // Malformed (missing position prefix): count, do NOT resolve —
+                // the slot stays live and the deadline backstops the request.
+                shared.stats.corrupt.fetch_add(1, Ordering::Relaxed);
+                return 0;
+            }
+            let delivered = if rec.flags & FLAG_V2_IS_QUERY != 0 {
+                ReqKind::Query
+            } else {
+                ReqKind::Submit
+            };
+            match shared.table.resolve(wire_seq, Some(delivered)) {
+                Resolve::Won { user_data } => {
+                    let position = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                    shared.stats.responses.fetch_add(1, Ordering::Relaxed);
+                    cb(Completion {
+                        user_data,
+                        position: Some(position),
+                        outcome: Outcome::Response(&buf[8..]),
+                    });
+                    1
+                }
+                Resolve::KindMismatch => {
+                    // T14: stale cross-generation collision — drop, count,
+                    // leave the slot for the real answer.
+                    shared.stats.kind_mismatch.fetch_add(1, Ordering::Relaxed);
+                    0
+                }
+                Resolve::Miss => {
+                    shared.stats.duplicates.fetch_add(1, Ordering::Relaxed);
+                    0
+                }
+            }
+        }
+        MSG_V2_NOT_LEADER => {
+            // Defensive hint decode (malformed payload -> unknown, never panic)
+            // — copied from the old matcher.rs.
+            let hint_raw = u64::from_le_bytes(
+                buf.get(..8).and_then(|s| s.try_into().ok()).unwrap_or([0xff; 8]),
+            );
+            let hint = if hint_raw == u64::MAX { None } else { Some(hint_raw as u32) };
+            match shared.table.resolve(wire_seq, None) {
+                // kind-agnostic: a pre-side-effect signal
+                Resolve::Won { user_data } => {
+                    shared.stats.not_leader.fetch_add(1, Ordering::Relaxed);
+                    cb(Completion { user_data, position: None, outcome: Outcome::NotLeader { hint } });
+                    1
+                }
+                _ => 0, // stale redirect for an already-resolved slot: no side effect to guard
+            }
+        }
+        MSG_V2_RETRY => match shared.table.resolve(wire_seq, None) {
+            Resolve::Won { user_data } => {
+                shared.stats.retry.fetch_add(1, Ordering::Relaxed);
+                cb(Completion { user_data, position: None, outcome: Outcome::Retry });
+                1
+            }
+            _ => 0,
+        },
+        _ => 0, // not a client-facing msg_type
+    }
+}
+
+/// Amortized slot-liveness pass (every 64 poll cycles): restart check first,
+/// then the deadline sweep.
+fn maintenance(shared: &Shared, cb: &mut impl FnMut(Completion<'_>)) -> usize {
+    let mut emitted = 0usize;
+    if !shared.dead.load(Ordering::Acquire) {
+        // Read ONCE. None = torn/zeroed header while the node recreates the
+        // cnc in place (M5 final-review semantics) -> current = 0 sentinel.
+        let observed = shared.cnc.try_instance_id();
+        if observed != Some(shared.instance_id) {
+            let current = observed.unwrap_or(0);
+            *shared.restart.lock().unwrap() = Some((shared.instance_id, current));
+            shared.dead.store(true, Ordering::Release);
+            shared.stats.restarts.fetch_add(1, Ordering::Relaxed);
+            shared.table.drain_abort(|user_data| {
+                cb(Completion {
+                    user_data,
+                    position: None,
+                    outcome: Outcome::InstanceRestart { attached: shared.instance_id, current },
+                });
+                emitted += 1;
+            });
+        }
+    }
+    let now_ns = shared.t0.elapsed().as_nanos() as u64;
+    shared.table.sweep(now_ns, |user_data| {
+        shared.stats.timed_out.fetch_add(1, Ordering::Relaxed);
+        cb(Completion { user_data, position: None, outcome: Outcome::TimedOut });
+        emitted += 1;
+    });
+    emitted
 }

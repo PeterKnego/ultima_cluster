@@ -29,6 +29,9 @@ mod slots;
 mod wait;
 
 pub use client::Client;
-pub use engine::{Consistency, Engine, EngineConfig, EngineStats, PollHalf, SendHalf, SubmitError};
+pub use engine::{
+    Completion, Consistency, Engine, EngineConfig, EngineStats, Outcome, PollHalf, SendHalf,
+    SubmitError,
+};
 pub use error::ClientError;
 pub use wait::WaitStrategy;
