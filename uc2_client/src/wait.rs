@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-#![allow(unexpected_cfgs, dead_code)]
+#![allow(unexpected_cfgs)]
 
 //! Wait strategies, PORTED from `ultima_rings` (`ultima_rings/src/wait.rs`)
 //! with attribution rather than taken as a dependency — `uc2_client`'s small
@@ -18,9 +18,10 @@
 //!
 //! In this crate: the engine (`engine.rs`) is WAITLESS by design — these
 //! strategies belong to the layer that owns a thread (`pipelined.rs`'s
-//! driver) and to `Ticket::wait` (always park/unpark; a REST worker spinning
-//! through a ~1ms consensus round trip is exactly the oversubscription
-//! failure the tables document).
+//! driver, which now drives `Idle::for_strategy`/`Idle::idle` for real) and
+//! to `Ticket::wait` (always park/unpark; a REST worker spinning through a
+//! ~1ms consensus round trip is exactly the oversubscription failure the
+//! tables document).
 
 use std::time::Duration;
 

@@ -25,6 +25,7 @@ mod client;
 mod engine;
 mod error;
 mod matcher;
+mod pipelined;
 mod slots;
 mod ticket;
 mod wait;
@@ -35,5 +36,6 @@ pub use engine::{
     SubmitError,
 };
 pub use error::ClientError;
+pub use pipelined::{PipelinedClient, PipelinedConfig};
 pub use ticket::Ticket;
 pub use wait::WaitStrategy;

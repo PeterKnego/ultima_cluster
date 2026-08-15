@@ -50,6 +50,11 @@ pub enum ClientError {
     ResponseOverwritten,
     #[error("ingress backpressure: ring stayed full past the retry window")]
     BackpressureFull,
+    /// A client-side payload cap (or the ring's own bound) was exceeded;
+    /// refused at the door, before any ring write (Task 6 — `pipelined.rs`'s
+    /// `PipelinedClient` maps `SubmitError::PayloadTooLarge` here).
+    #[error("payload too large: {len} > {max}")]
+    PayloadTooLarge { len: usize, max: usize },
     /// A transient failure the caller should retry. `MSG_V2_RETRY` is only
     /// ever emitted before a command reaches the apply barrier, so retrying
     /// is side-effect-free (relevant for a lincheck driver classifying this

@@ -173,6 +173,7 @@ fn submit_cmd(conn: &mut Conn, cmd: &Cmd, deadline: Instant) -> SubmitOutcome {
             Err(e @ ClientError::Decode(_))
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::PayloadTooLarge { .. })
             | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
         }
     }
@@ -211,6 +212,7 @@ fn read_leader(conn: &mut Conn, deadline: Instant) -> ReadOutcome {
             Err(e @ ClientError::Decode(_))
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::PayloadTooLarge { .. })
             | Err(e @ ClientError::ShutDown) => return ReadOutcome::Fatal(format!("{e:?}")),
         }
     }
@@ -835,6 +837,7 @@ fn submit_cmd_multi(conn: &mut MultiConn, cmd: &Cmd, deadline: Instant) -> Submi
             Err(e @ ClientError::Decode(_))
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::PayloadTooLarge { .. })
             | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
         }
     }
@@ -873,6 +876,7 @@ fn read_leader_multi(conn: &mut MultiConn, deadline: Instant) -> ReadOutcome {
             Err(e @ ClientError::Decode(_))
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::PayloadTooLarge { .. })
             | Err(e @ ClientError::ShutDown) => return ReadOutcome::Fatal(format!("{e:?}")),
         }
     }

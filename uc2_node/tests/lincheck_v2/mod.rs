@@ -1152,6 +1152,7 @@ pub fn submit_cmd<C: serde::Serialize, R: serde::de::DeserializeOwned>(
             Err(e @ ClientError::Decode(_))
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::PayloadTooLarge { .. })
             | Err(e @ ClientError::ShutDown) => return SubmitOutcome::Fatal(format!("{e:?}")),
         }
     }
@@ -1198,6 +1199,7 @@ pub fn read_leader<Q: serde::Serialize, QR: serde::de::DeserializeOwned>(
             Err(e @ ClientError::Decode(_))
             | Err(e @ ClientError::AppIdMismatch { .. })
             | Err(e @ ClientError::VersionMismatch { .. })
+            | Err(e @ ClientError::PayloadTooLarge { .. })
             | Err(e @ ClientError::ShutDown) => return ReadOutcome::Fatal(format!("{e:?}")),
         }
     }

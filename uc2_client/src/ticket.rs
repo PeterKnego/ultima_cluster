@@ -18,15 +18,17 @@ struct State {
     waker: Option<Waker>,
 }
 
-/// The internal core backing a Ticket (consumed from Task 6).
+/// The internal core backing a Ticket. Consumed by `pipelined.rs`'s driver:
+/// `user_data` is `Arc::into_raw(core.clone())`, reclaimed by exactly one
+/// `Arc::from_raw` per accepted request (completion callback or shutdown
+/// drain).
 pub(crate) struct TicketCore {
     inner: Mutex<State>,
     cv: Condvar,
 }
 
 impl TicketCore {
-    /// Create a new unresolved ticket core (consumed from Task 6).
-    #[allow(dead_code)]
+    /// Create a new unresolved ticket core.
     pub(crate) fn new() -> Self {
         TicketCore {
             inner: Mutex::new(State {
@@ -37,8 +39,7 @@ impl TicketCore {
         }
     }
 
-    /// Resolve with bytes (or an error). First resolution wins; later calls are ignored (consumed from Task 6).
-    #[allow(dead_code)]
+    /// Resolve with bytes (or an error). First resolution wins; later calls are ignored.
     pub(crate) fn resolve(&self, r: Result<(u64, Vec<u8>), ClientError>) {
         let mut state = self.inner.lock().unwrap();
         if state.done.is_some() {
@@ -145,8 +146,8 @@ impl<R: serde::de::DeserializeOwned> Future for Ticket<R> {
     }
 }
 
-/// Create a (Ticket, TicketCore) pair for pipelining (consumed from Task 6).
-#[allow(dead_code)]
+/// Create a (Ticket, TicketCore) pair for pipelining. Consumed by
+/// `pipelined.rs`'s `PipelinedClient::dispatch`.
 pub(crate) fn ticket_pair<R>() -> (Ticket<R>, Arc<TicketCore>) {
     let core = Arc::new(TicketCore::new());
     let ticket = Ticket {
