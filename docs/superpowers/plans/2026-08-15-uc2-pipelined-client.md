@@ -24,7 +24,7 @@
 ## Spec deviations pre-agreed (record, don't re-litigate)
 
 1. `SubmitError` gains `InstanceRestart { attached, current }` and `Outcome::InstanceRestart` carries `{ attached, current }` — the caller needs the ids and the spec enum sketch omitted them.
-2. `EngineConfig`/`PipelinedConfig` gain `serving_gate: bool` (default `true`). The `Client` shim sets `false`: today's `Client` submits regardless of `CAN_SERVE` and learns NOT_LEADER from the wire — pinned by `synthetic.rs`/`timeout_and_restart.rs`.
+2. `EngineConfig` / `PipelinedConfig` gain `serving_gate: bool` (default `true`). The `Client` shim sets `false`: today's `Client` submits regardless of `CAN_SERVE` and learns NOT_LEADER from the wire — pinned by `synthetic.rs` / `timeout_and_restart.rs`.
 3. `EngineConfig` gains `max_payload: Option<usize>` (default `None`): the node's `NodeConfig.max_payload` is NOT discoverable over IPC, so the fail-loud door check is config'd to match the deployment; `None` still maps the ring's own `TooLarge`.
 4. `EngineConfig` gains `#[doc(hidden)] start_seq: u64` (default 0) — the wrap test needs to start the internal sequence near `u32::MAX`.
 5. Module layout: the slot table lives in its own `slots.rs` (pure logic, separately unit-tested), not inside `engine.rs`.
@@ -435,7 +435,7 @@ impl SlotTable {
 }
 ```
 
-(Plus the `ReqKind`/`ClaimError`/`Resolve` definitions from the Interfaces block, and `mod slots;` in `lib.rs`.)
+(Plus the `ReqKind` / `ClaimError` / `Resolve` definitions from the Interfaces block, and `mod slots;` in `lib.rs`.)
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -460,7 +460,7 @@ git commit -m "feat(uc2_client): generation-tagged correlation slot table (exact
 - Test: `uc2_client/tests/engine_synthetic.rs` (new)
 
 **Interfaces:**
-- Consumes: `SlotTable`/`ReqKind`/`ClaimError`/`Resolve` (Task 2, exact signatures above); `CncPage::open_file`, `cnc.status().next_client_id` / `.flags.load_acquire()`, `cnc.meta().instance_id`, `cnc.try_instance_id()` (uc2_log); `MpscRing::open(..)?.into_split()`, `MpscProducer::try_write`, `BroadcastRing::open(..)?.subscribe()` (uc_protocol); ipc consts `MSG_V2_SUBMIT/MSG_V2_QUERY/FLAG_V2_LINEARIZABLE/extra_client`; `NODE_FLAG_CAN_SERVE` (uc_protocol::v2::cnc); `ClientError` (attach errors reuse it).
+- Consumes: `SlotTable` / `ReqKind` / `ClaimError` / `Resolve` (Task 2, exact signatures above); `CncPage::open_file`, `cnc.status().next_client_id` / `.flags.load_acquire()`, `cnc.meta().instance_id`, `cnc.try_instance_id()` (uc2_log); `MpscRing::open(..)?.into_split()`, `MpscProducer::try_write`, `BroadcastRing::open(..)?.subscribe()` (uc_protocol); ipc consts `MSG_V2_SUBMIT` / `MSG_V2_QUERY` / `FLAG_V2_LINEARIZABLE` / `extra_client`; `NODE_FLAG_CAN_SERVE` (uc_protocol::v2::cnc); `ClientError` (attach errors reuse it).
 - Produces (public API, consumed by Tasks 4/6/8):
 
 ```rust
@@ -748,7 +748,7 @@ git commit -m "feat(uc2_client): Engine attach + SendHalf (serving gate, window,
 - Test: `uc2_client/tests/engine_synthetic.rs` (extend)
 
 **Interfaces:**
-- Consumes: Task 2/3 items; `BroadcastConsumer::{try_read, wait_handle}`, `RingWaitHandle` (uc_protocol); ipc consts `MSG_V2_RESPONSE/MSG_V2_NOT_LEADER/MSG_V2_RETRY/FLAG_V2_IS_QUERY/client_from_extra`.
+- Consumes: Task 2/3 items; `BroadcastConsumer::{try_read, wait_handle}`, `RingWaitHandle` (uc_protocol); ipc consts `MSG_V2_RESPONSE` / `MSG_V2_NOT_LEADER` / `MSG_V2_RETRY` / `FLAG_V2_IS_QUERY` / `client_from_extra`.
 - Produces (consumed by Tasks 6/8):
 
 ```rust
@@ -1363,7 +1363,7 @@ impl PipelinedClient {
 **Key mechanics** (pin these in code comments; they carry the design):
 
 1. `user_data` = `Arc::into_raw(Arc<TicketCore>) as u64` (64-bit target asserted by `compile_error!`). The engine's exactly-one-completion contract makes this leak-free: every accepted request's raw Arc is reclaimed by exactly one `Arc::from_raw` in the driver's completion callback (or the shutdown drain). A submit that the ENGINE REFUSES reclaims immediately on the error path.
-2. One driver thread, hand-spawned (NOT `AgentRunner`: its contract forbids blocking in the duty cycle, and the Park strategy parks up to 1ms). Loop: `poll(resolve_cb)`; on `stop` flag → `poll_half.drain_abort(|ud| resolve ShutDown + reclaim)` INSIDE the thread before exiting (the PollHalf lives and dies on the driver thread — no handoff). `shutdown`/`Drop`: `stop.store(true)`, `wait_handle.wake()` (interrupt a park), join.
+2. One driver thread, hand-spawned (NOT `AgentRunner`: its contract forbids blocking in the duty cycle, and the Park strategy parks up to 1ms). Loop: `poll(resolve_cb)`; on `stop` flag → `poll_half.drain_abort(|ud| resolve ShutDown + reclaim)` INSIDE the thread before exiting (the PollHalf lives and dies on the driver thread — no handoff). `shutdown` / `Drop`: `stop.store(true)`, `wait_handle.wake()` (interrupt a park), join.
 3. Driver idle, per `driver_wait`: `BusySpin` → `spin_loop()`; `BackoffYield`/`Backoff` → `Idle::for_strategy(..).idle()`, reset on progress; `Park` → the broadcast futex protocol (reference: `uc_protocol/src/ring/broadcast.rs`'s `wake_all_unblocks_two_consumers` test): `let seq = wh.current_seq(); wh.arm(); if poll(..) == 0 && !stop { wh.park(seq, Duration::from_millis(1)); } wh.disarm();` — TIMED park (1ms cap): the handle watches only the service broadcast; the 1ms rung bounds pickup latency for the rare egress_node records (spec §5).
 4. `SendHalf` is `!Sync` → `PipelinedClient` holds `Mutex<SendHalf>`; the critical section is claim+try_write (~100ns). Max-perf callers use the Engine directly with per-thread `SendHalf` clones (say so in the rustdoc).
 5. Outcome→ticket mapping (driver): `Response` → `Ok((position, bytes.to_vec()))` (the ONE copy, spec §5); `NotLeader{hint}` → `Err(NotLeader{hint})`; `Retry` → `Err(Retry)`; `TimedOut` → `Err(Timeout(request_timeout))`; `InstanceRestart{attached,current}` → `Err(InstanceRestart{attached,current})`.
@@ -1373,7 +1373,7 @@ impl PipelinedClient {
 
 - [ ] **Step 1: Write the failing tests (tests/pipelined.rs)**
 
-Reuse `roundtrip.rs`'s harness verbatim: the `Cmd`/`CountSm` state machine, `node_config`, `wait_until` (copy them in — integration tests don't share modules). Node+service boot per test, `tempdir_in(env!("CARGO_TARGET_TMPDIR"))`.
+Reuse `roundtrip.rs`'s harness verbatim: the `Cmd` / `CountSm` state machine, `node_config`, `wait_until` (copy them in — integration tests don't share modules). Node+service boot per test, `tempdir_in(env!("CARGO_TARGET_TMPDIR"))`.
 
 ```rust
 fn connect(dir: &std::path::Path) -> uc2_client::PipelinedClient {
@@ -1553,7 +1553,7 @@ fn spawn_driver(
 }
 ```
 
-`submit`/`try_submit`/`query_*` per the Interfaces block and Key mechanics #1/#6. `shutdown(self)` = `Drop`-shared inner fn: `stop.store(true); wake.wake(); join()`.
+`submit` / `try_submit` / `query_*` per the Interfaces block and Key mechanics #1/#6. `shutdown(self)` = `Drop`-shared inner fn: `stop.store(true); wake.wake(); join()`.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1578,7 +1578,7 @@ git commit -m "feat(uc2_client): PipelinedClient — driver thread, wait strateg
 - Test: existing `uc2_client/tests/{roundtrip,synthetic,timeout_and_restart,torn_header}.rs` — UNCHANGED
 
 **Interfaces:**
-- Consumes: `PipelinedClient`/`PipelinedConfig` (Task 6, exact signatures above).
+- Consumes: `PipelinedClient` / `PipelinedConfig` (Task 6, exact signatures above).
 - Produces: `Client` with the EXACT current public surface: `connect(&Path, &str) -> Result<Client, ClientError>`, `client_id() -> u32`, `instance_id() -> u128`, `kind_mismatch_drops() -> u64`, `leader_hint() -> Option<u32>`, `submit<C,R>(&self, &C) -> Result<R, ClientError>`, `query_snapshot<Q,QR>`, `query_linearizable<Q,QR>`, `shutdown(self)`.
 
 **Behavior pins (why each config value):**
@@ -1724,15 +1724,51 @@ fn run_client_measurement(
     )
     .unwrap_or_else(|e| panic!("engine attach {instance_dir:?}: {e}"));
 
-    // wait for CAN_SERVE exactly as before (await_serving unchanged)…
-    // cmd_bytes: encode ONCE, reuse (unchanged); the engine's max_payload
-    // door replaces the old manual assert.
+    // Serving wait: replaces await_serving(&cnc, ..) — the engine exposes the
+    // same cnc flag; the client role no longer opens the cnc page itself.
+    let serve_deadline = Instant::now() + LEADER_WAIT;
+    while !send.can_serve() {
+        assert!(
+            Instant::now() < serve_deadline,
+            "no serving leader at this instance_dir within {LEADER_WAIT:?} — \
+             is this host's node the elected leader?"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 
-    let send_ns: Arc<Box<[AtomicU64]>> = /* SLOTS as before, indexed by user_data & SLOT_MASK */;
+    // One fixed payload, bincode-encoded ONCE and reused verbatim (unchanged
+    // rationale: apply never inspects the bytes; identity lives in
+    // header_extra). The engine's max_payload door replaces the old manual
+    // NODE_MAX_PAYLOAD assert — try_submit fails loud instead.
+    let raw_payload = vec![0xABu8; payload_len];
+    let cmd_bytes = bincode::serde::encode_to_vec(&raw_payload, bincode::config::standard())
+        .expect("encode fixed payload");
+
+    // Timing slots: user_data = send index; SLOTS (1<<20) >> any window, so a
+    // slot is never restamped while its request is outstanding. The old
+    // `owner` array is GONE — exactly-once resolution is the engine's job now.
+    let send_ns: Arc<Box<[AtomicU64]>> =
+        Arc::new((0..SLOTS).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice());
+    let sent = Arc::new(AtomicU64::new(0));
     let resolved = Arc::new(AtomicU64::new(0));
-    // + responses / not_leader / retried / last_response_ns / hist as before
+    let responses = Arc::new(AtomicU64::new(0));
+    let not_leader = Arc::new(AtomicU64::new(0));
+    let retried = Arc::new(AtomicU64::new(0));
+    let last_response_ns = Arc::new(AtomicU64::new(0));
+    let hist = Arc::new(Mutex::new(
+        Histogram::new_with_bounds(1, HIST_MAX_NS, 3).expect("histogram"),
+    ));
+    let stop = Arc::new(AtomicBool::new(false));
+    let t0 = Instant::now();
 
     let matcher = thread::Builder::new().name("m5-gate-poll".into()).spawn({
+        let send_ns = Arc::clone(&send_ns);
+        let resolved = Arc::clone(&resolved);
+        let responses = Arc::clone(&responses);
+        let not_leader = Arc::clone(&not_leader);
+        let retried = Arc::clone(&retried);
+        let last_response_ns = Arc::clone(&last_response_ns);
+        let hist = Arc::clone(&hist);
         let stop = Arc::clone(&stop);
         move || {
             while !stop.load(Ordering::Relaxed) {
@@ -1759,20 +1795,48 @@ fn run_client_measurement(
         }
     }).expect("spawn poll thread");
 
-    // Sender loop: user_data = send index; stamp send_ns BEFORE try_submit.
+    // Sender loop (this thread): user_data = send index; stamp send_ns
+    // BEFORE try_submit (a response cannot arrive before the request is
+    // visible). Restamping the same idx on a Backpressure retry is fine —
+    // the request was never accepted.
     let mut sent_idx: u64 = 0;
+    let deadline = t0 + Duration::from_secs(secs);
     while Instant::now() < deadline {
         let idx = (sent_idx as usize) & SLOT_MASK;
         send_ns[idx].store(t0.elapsed().as_nanos() as u64, Ordering::Release);
         match send.try_submit(sent_idx, &cmd_bytes) {
-            Ok(()) => { sent_idx += 1; }
+            Ok(()) => {
+                sent_idx += 1;
+                sent.store(sent_idx, Ordering::Relaxed);
+            }
             Err(SubmitError::Backpressure) => thread::yield_now(), // window OR ring full — engine's door
             Err(SubmitError::NotServing) => thread::sleep(Duration::from_millis(1)), // old serving-gate pause
             Err(e) => panic!("try_submit: {e}"),
         }
     }
-    // drain-grace + ClientStats exactly as before; duplicates/overwritten now
-    // read from send.stats() (duplicates, overwritten fields).
+    let send_window_end_ns = t0.elapsed().as_nanos() as u64;
+
+    // Drain grace: unchanged bound, resolution counted by the poll thread.
+    let drain_deadline = Instant::now() + DRAIN_GRACE;
+    while resolved.load(Ordering::Relaxed) < sent_idx && Instant::now() < drain_deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    stop.store(true, Ordering::Relaxed);
+    matcher.join().expect("poll thread panicked");
+
+    // ClientStats assembly: same fields and PASS computation as before, with
+    // the dedup/lap counters now sourced from the ENGINE:
+    //   sends: sent_idx
+    //   responses / not_leader / retried: the atomics above
+    //   duplicates: send.stats().duplicates
+    //   overwritten: send.stats().overwritten
+    //   inflight_at_end: send.inflight()
+    //   elapsed: Duration::from_nanos(last_response_ns.max(send_window_end_ns))
+    //     (drain-inclusive clock with the dead-tail floor — logic unchanged)
+    //   p50/p90/p99/max + responses_per_sec + pass: UNCHANGED from the
+    //     existing code (keep the strict inflight_at_end == 0 PASS term).
+    /* ... existing stats-assembly code stays, only the three sourced fields
+       change ... */
 }
 ```
 
