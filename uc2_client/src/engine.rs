@@ -101,8 +101,12 @@ pub enum Consistency {
 }
 
 /// Why a `try_submit`/`try_query` call was refused at the door. Refusal here
-/// means the slot was never claimed (or was claimed and released) — the
-/// caller's window/backpressure accounting is unaffected.
+/// means the slot was never claimed (or was claimed and SUCCESSFULLY
+/// released) — the caller's window/backpressure accounting is unaffected. A
+/// claim whose release LOST the race (some poller already completed the
+/// slot first — see `finish_write`'s doc comment) is never surfaced as a
+/// refusal; that path reports `Ok(())` instead, because a real completion
+/// already exists for it.
 #[derive(Debug, thiserror::Error)]
 pub enum SubmitError {
     #[error("backpressure: inflight window or ingress ring full")]
@@ -299,22 +303,8 @@ impl SendHalf {
             .table
             .claim(user_data, kind, deadline_ns)
             .map_err(|_| SubmitError::Backpressure)?; // WindowFull and SlotBusy alike
-        match ring.try_write(msg_type, flags, extra_client(s.client_id, seq as u32), bytes) {
-            Ok(()) => {
-                s.stats.accepted.fetch_add(1, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) => {
-                s.table.release(seq);
-                match e {
-                    RingError::Full => Err(SubmitError::Backpressure),
-                    RingError::TooLarge { len, max } => {
-                        Err(SubmitError::PayloadTooLarge { len, max })
-                    }
-                    other => Err(SubmitError::Ring(other)),
-                }
-            }
-        }
+        let write_result = ring.try_write(msg_type, flags, extra_client(s.client_id, seq as u32), bytes);
+        finish_write(&s.table, &s.stats, seq, write_result)
     }
 
     /// Submit a command; nonblocking. See the module's central contract: an
@@ -366,6 +356,59 @@ impl SendHalf {
     /// Current inflight count (claimed, not-yet-completed slots).
     pub fn inflight(&self) -> u64 {
         self.shared.table.inflight()
+    }
+}
+
+/// `send`'s post-claim tail: report the outcome of the ring write, or — the
+/// case this function exists to get right — the outcome of a ring write that
+/// FAILED but whose slot had ALREADY been completed by something else.
+///
+/// `claim()` publishes the slot (with `user_data` already stored) before
+/// `send()` ever attempts the ring write, so there is a real window between
+/// claim and write during which a concurrent `resolve`/`sweep`/`drain_abort`
+/// can legitimately win the slot's single-CAS completion protocol (slots.rs
+/// invariant 3) — e.g. an instance-restart drain, or a deadline sweep racing
+/// a slow write. When that happens, `table.release(seq)` LOSES its own CAS
+/// (the slot is already `FREE`) and returns `false`: whoever won already
+/// called the completion callback with this exact `user_data`, which for
+/// `pipelined.rs`'s driver means `Arc::from_raw` already ran for it.
+///
+/// If this function then reported the write failure as a refusal
+/// (`Err(SubmitError::Backpressure)` etc.), the caller would treat the
+/// request as "never accepted" and reclaim `user_data` itself — a SECOND
+/// `Arc::from_raw` on a pointer already reclaimed, i.e. a double-free /
+/// use-after-free on the ticket the first completion already resolved. So a
+/// lost release is reported as accepted (`Ok(())`) instead: the completion
+/// already exists (or is already in flight to the caller), same as a real
+/// `Ok(())` from the ring write — the `accepted` stat is bumped to match, so
+/// `accepted` stays the true count of requests the engine took ownership of,
+/// not just of ring writes that physically succeeded.
+fn finish_write(
+    table: &SlotTable,
+    stats: &StatCells,
+    seq: u64,
+    write_result: Result<(), RingError>,
+) -> Result<(), SubmitError> {
+    match write_result {
+        Ok(()) => {
+            stats.accepted.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        Err(e) => {
+            if !table.release(seq) {
+                // Lost the CAS: see the doc comment above. Already completed
+                // — not a refusal.
+                stats.accepted.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            match e {
+                RingError::Full => Err(SubmitError::Backpressure),
+                RingError::TooLarge { len, max } => {
+                    Err(SubmitError::PayloadTooLarge { len, max })
+                }
+                other => Err(SubmitError::Ring(other)),
+            }
+        }
     }
 }
 
@@ -544,4 +587,68 @@ fn maintenance(shared: &Shared, cb: &mut impl FnMut(Completion<'_>)) -> usize {
         emitted += 1;
     });
     emitted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::slots::ReqKind;
+
+    /// `finish_write` deterministically, WITHOUT needing to win a real race
+    /// against a second thread: `claim` a slot exactly as `send()` would,
+    /// complete it out from under ourselves via `drain_abort` (standing in
+    /// for a concurrent `resolve`/`sweep`/`drain_abort` that wins the slot's
+    /// completion between `send()`'s own `claim()` and its ring write — the
+    /// window `finish_write`'s doc comment describes), then call
+    /// `finish_write` with a write failure for that exact `seq` and assert
+    /// it reports ACCEPTED, not refused, without double-decrementing
+    /// `inflight` or double-counting `accepted`.
+    ///
+    /// This is the same shape as `slots.rs`'s
+    /// `release_after_the_slot_was_already_completed_elsewhere_loses_cleanly`
+    /// (which proves the underlying `SlotTable::release` primitive loses its
+    /// CAS cleanly) but exercises `finish_write` itself — the actual code
+    /// `send()` calls — rather than the primitive alone. A true end-to-end
+    /// reproduction would need a second OS thread to land inside the few
+    /// instructions between `send()`'s `claim()` and its `ring.try_write()`,
+    /// which isn't something a unit test can force deterministically without
+    /// adding a `#[cfg(test)]` hook into `send()` itself; driving the same
+    /// post-claim tail (`finish_write`) directly against a real,
+    /// already-raced `SlotTable` gets full coverage of the fixed branch
+    /// without that.
+    #[test]
+    fn lost_release_after_a_concurrent_completion_reports_accepted_not_refused() {
+        let table = SlotTable::new(8, 0);
+        let stats = StatCells::default();
+        let seq = table.claim(0xABCD, ReqKind::Submit, u64::MAX).unwrap();
+
+        // Something else (instance-restart drain, or the deadline sweep)
+        // wins the slot's completion before our write ever lands.
+        let mut drained = Vec::new();
+        table.drain_abort(|ud| drained.push(ud));
+        assert_eq!(drained, vec![0xABCD]);
+        assert_eq!(table.inflight(), 0);
+
+        // send()'s ring write then fails (RingError::Full, same as a
+        // genuinely full ingress ring) — finish_write must NOT report this
+        // as a refusal: the completion already happened.
+        let result = finish_write(&table, &stats, seq, Err(RingError::Full));
+        assert!(matches!(result, Ok(())), "lost release must report accepted: {result:?}");
+        assert_eq!(stats.accepted.load(Ordering::Relaxed), 1, "accepted must count this request");
+        assert_eq!(table.inflight(), 0, "must not double-decrement on a lost release");
+    }
+
+    /// The ordinary counterpart: a write failure whose release WINS (no
+    /// race) must still refuse, exactly as before the fix.
+    #[test]
+    fn ordinary_write_failure_with_an_uncontested_release_still_refuses() {
+        let table = SlotTable::new(8, 0);
+        let stats = StatCells::default();
+        let seq = table.claim(0xBEEF, ReqKind::Submit, u64::MAX).unwrap();
+
+        let result = finish_write(&table, &stats, seq, Err(RingError::Full));
+        assert!(matches!(result, Err(SubmitError::Backpressure)), "{result:?}");
+        assert_eq!(stats.accepted.load(Ordering::Relaxed), 0);
+        assert_eq!(table.inflight(), 0, "an uncontested release still frees the slot");
+    }
 }

@@ -112,6 +112,7 @@ impl SlotTable {
         Ok(seq)
     }
 
+    #[must_use = "a lost release means the slot was already completed; the caller must not treat the request as refused"]
     pub(crate) fn release(&self, seq: u64) -> bool {
         let slot = &self.slots[(seq as usize) & self.mask];
         // Joins the single-CAS completion protocol (invariant 3): only the winner
@@ -256,7 +257,7 @@ mod tests {
         let a = t.claim(1, ReqKind::Submit, u64::MAX).unwrap();
         let _b = t.claim(2, ReqKind::Submit, u64::MAX).unwrap();
         assert_eq!(t.claim(3, ReqKind::Submit, u64::MAX), Err(ClaimError::WindowFull));
-        t.release(a); // failed ring write path
+        assert!(t.release(a), "failed ring write path: release must win uncontested"); // failed ring write path
         assert_eq!(t.inflight(), 1);
         t.claim(4, ReqKind::Submit, u64::MAX).expect("window reopened by release");
     }
@@ -282,6 +283,27 @@ mod tests {
         assert_eq!(expired, vec![1]);
         assert_eq!(t.inflight(), 1);
         assert!(matches!(t.resolve(late as u32, None), Resolve::Won { user_data: 2 }));
+    }
+
+    /// The lost-release side of the exactly-once protocol (invariant 3):
+    /// once something else has already completed a slot (here, via
+    /// `drain_abort` — standing in for a real race against a concurrent
+    /// `resolve`/`sweep`/`drain_abort` that wins before `send`'s own
+    /// `release` call runs, see `engine.rs::finish_write`), a later
+    /// `release(seq)` for that same generation must lose its CAS cleanly:
+    /// return `false` and NOT double-decrement `inflight` (which the winner
+    /// already decremented).
+    #[test]
+    fn release_after_the_slot_was_already_completed_elsewhere_loses_cleanly() {
+        let t = SlotTable::new(8, 0);
+        let seq = t.claim(0xABCD, ReqKind::Submit, u64::MAX).unwrap();
+        let mut drained = Vec::new();
+        t.drain_abort(|ud| drained.push(ud));
+        assert_eq!(drained, vec![0xABCD], "drain_abort must win the completion first");
+        assert_eq!(t.inflight(), 0, "drain_abort already decremented inflight");
+
+        assert!(!t.release(seq), "a completed slot's release must lose its CAS");
+        assert_eq!(t.inflight(), 0, "a lost release must not double-decrement inflight");
     }
 
     #[test]

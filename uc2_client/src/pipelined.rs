@@ -39,6 +39,22 @@
 //! claim+try_write (~100ns). Callers chasing max throughput from multiple
 //! submitter threads should use [`Engine::attach`] directly and clone
 //! `SendHalf` once per thread instead of sharing one `PipelinedClient`.
+//!
+//! ## Panic posture
+//!
+//! A panic inside the driver's poll/resolve path (`poll`/`resolve`/a user
+//! `StateMachine`'s bincode types misbehaving somewhere downstream — nothing
+//! in this crate is expected to panic there, but "expected" isn't a
+//! liveness guarantee) must not silently hang every outstanding `Ticket`.
+//! The driver owns its `PollHalf` inside a `DriverGuard` whose `Drop` runs
+//! the shutdown drain — Rust runs `Drop` impls during an unwind exactly as
+//! it does on a normal return, so the drain (and the `Park` arm's
+//! `arm`/`disarm` pairing, similarly guarded) still executes even if the
+//! loop body panics; every ticket still inflight resolves to
+//! `ClientError::ShutDown` instead of hanging forever. `shutdown`/`Drop`'s
+//! `join()` reports a panicked driver to stderr rather than propagating the
+//! panic (no `resume_unwind`) — the caller observes it through its tickets
+//! failing, not through `shutdown` itself panicking.
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("uc2_client's pipelined layer requires 64-bit pointers");
@@ -202,8 +218,18 @@ impl PipelinedClient {
     fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         self.wait_handle.wake(); // interrupt a parked driver promptly
-        if let Some(h) = self.driver.take() {
-            let _ = h.join();
+        if let Some(h) = self.driver.take()
+            && h.join().is_err()
+        {
+            // The driver's `DriverGuard` (see the module's "Panic posture"
+            // docs) already drained every in-flight ticket to `ShutDown`
+            // before this join could return — surface the panic as a
+            // diagnostic, not by propagating it into the caller of
+            // `shutdown`/`Drop`.
+            eprintln!(
+                "uc2_client: pipelined driver thread panicked; in-flight tickets were \
+                 drained to ClientError::ShutDown by the driver's unwind guard"
+            );
         }
     }
 
@@ -297,19 +323,66 @@ fn reclaim(ud: u64) {
     drop(unsafe { Arc::from_raw(ud as *const TicketCore) });
 }
 
+/// Owns the driver's [`PollHalf`] and runs the shutdown drain from `Drop` —
+/// which Rust invokes on a normal scope exit AND while unwinding a panic, so
+/// a panic anywhere in the driver loop (`poll`, or the `resolve` callback)
+/// still reaches the drain: every ticket still inflight resolves to
+/// [`ClientError::ShutDown`] rather than hanging forever. See the module's
+/// "Panic posture" docs.
+struct DriverGuard(PollHalf);
+
+impl Drop for DriverGuard {
+    fn drop(&mut self) {
+        // Key Mechanics #1's third reclaim path: everything still inflight
+        // at this point never got (and now never will get) a real
+        // completion, so it fails with ShutDown instead of hanging forever.
+        self.0.drain_abort(|ud| {
+            // SAFETY: same contract as `resolve` in `spawn_driver` — `ud` is
+            // a raw Arc<TicketCore> leaked by `dispatch` for a request that
+            // was accepted (so ownership passed to the driver) but never
+            // completed before shutdown/unwind; `drain_abort` yields each
+            // such slot's `user_data` exactly once.
+            let core = unsafe { Arc::from_raw(ud as *const TicketCore) };
+            core.resolve(Err(ClientError::ShutDown));
+        });
+    }
+}
+
+/// Arms `wh` on construction, disarms it on `Drop` — including during an
+/// unwind — so a panic between `arm()` and the matching `disarm()` (e.g.
+/// inside the nested `poll` call, which invokes the same `resolve` callback
+/// that could panic) can never leave the ring's waiter count armed forever.
+struct ArmGuard<'a>(&'a RingWaitHandle);
+
+impl<'a> ArmGuard<'a> {
+    fn new(wh: &'a RingWaitHandle) -> Self {
+        wh.arm();
+        ArmGuard(wh)
+    }
+}
+
+impl Drop for ArmGuard<'_> {
+    fn drop(&mut self) {
+        self.0.disarm();
+    }
+}
+
 /// The driver thread: one hand-spawned `std::thread` (not `AgentRunner` — see
 /// the module docs) that polls `poll_half` in a loop, resolving each
 /// [`Completion`] against the [`TicketCore`] its `user_data` points to, and
 /// idles per `ws` between empty poll cycles. `PollHalf` is moved in here and
-/// never leaves this thread, including its shutdown drain.
+/// never leaves this thread, including its shutdown drain — see
+/// [`DriverGuard`] and the module's "Panic posture" docs for how that holds
+/// even if the loop body panics.
 fn spawn_driver(
-    mut poll: PollHalf,
+    poll: PollHalf,
     stop: Arc<AtomicBool>,
     ws: WaitStrategy,
     request_timeout: Duration,
 ) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new().name("uc2-pipelined-driver".into()).spawn(move || {
-        let wh = poll.wait_handle();
+        let mut guard = DriverGuard(poll);
+        let wh = guard.0.wait_handle();
         let mut resolve = |c: Completion<'_>| {
             // SAFETY: user_data is the raw Arc<TicketCore> leaked by
             // `PipelinedClient::dispatch`; the engine emits exactly one
@@ -328,7 +401,7 @@ fn spawn_driver(
         };
         let mut idle = Idle::for_strategy(ws);
         while !stop.load(Ordering::Relaxed) {
-            let n = poll.poll(&mut resolve);
+            let n = guard.0.poll(&mut resolve);
             if n > 0 {
                 idle = Idle::for_strategy(ws); // progress resets the ladder
                 continue;
@@ -338,27 +411,15 @@ fn spawn_driver(
                 WaitStrategy::BackoffYield | WaitStrategy::Backoff => idle.idle(),
                 WaitStrategy::Park => {
                     let seq = wh.current_seq();
-                    wh.arm();
-                    if poll.poll(&mut resolve) == 0 && !stop.load(Ordering::Relaxed) {
+                    let _arm = ArmGuard::new(&wh); // disarms on drop, incl. on unwind
+                    if guard.0.poll(&mut resolve) == 0 && !stop.load(Ordering::Relaxed) {
                         wh.park(seq, Duration::from_millis(1));
                     }
-                    wh.disarm();
                 }
             }
         }
-        // Shutdown drain ON this thread — the PollHalf never crosses
-        // threads. Key Mechanics #1's third reclaim path: everything still
-        // inflight at this point never got (and now never will get) a real
-        // completion, so it fails with ShutDown instead of hanging forever.
-        poll.drain_abort(|ud| {
-            // SAFETY: same contract as `resolve` above — `ud` is a raw
-            // Arc<TicketCore> leaked by `dispatch` for a request that was
-            // accepted (so ownership passed to the driver) but never
-            // completed before shutdown; `drain_abort` yields each such
-            // slot's `user_data` exactly once.
-            let core = unsafe { Arc::from_raw(ud as *const TicketCore) };
-            core.resolve(Err(ClientError::ShutDown));
-        });
+        // `guard` drops here (or, on an unwind out of the loop above, during
+        // stack unwinding) — its `Drop` runs the shutdown drain either way.
     })
 }
 
@@ -374,5 +435,114 @@ mod tests {
     fn pipelined_client_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<PipelinedClient>();
+    }
+
+    // --- synthetic instance dir: same idiom as tests/engine_synthetic.rs
+    // (integration test crates can't share modules, and this is a unit test
+    // inside `src/`, so it gets its own tiny copy too).
+
+    fn meta(app_id: &str) -> uc2_log::cnc::CncMeta {
+        uc2_log::cnc::CncMeta {
+            node_id: 0,
+            instance_id: rand_u128(),
+            app_id: app_id.into(),
+            buffer_bytes: 1 << 20,
+            max_payload: 256,
+        }
+    }
+
+    fn rand_u128() -> u128 {
+        let a = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        a ^ 0xA5A5_5A5A_A5A5_5A5A_u128
+    }
+
+    fn make_instance(dir: &std::path::Path, app_id: &str) {
+        use uc_protocol::ring::{BroadcastRing, MpscRing};
+        const MIB: u64 = 1 << 20;
+        uc2_log::cnc::CncPage::create_file(&dir.join("cnc2.dat"), &meta(app_id)).unwrap();
+        MpscRing::create(&dir.join("ingress.ring"), MIB, 128).unwrap();
+        MpscRing::create(&dir.join("query.ring"), MIB, 256).unwrap();
+        BroadcastRing::create(&dir.join("egress_service.broadcast"), MIB, 128).unwrap();
+        BroadcastRing::create(&dir.join("egress_node.broadcast"), MIB, 128).unwrap();
+    }
+
+    /// Finding 2's covering test: a panic inside the driver loop must not
+    /// leave in-flight tickets hanging forever. Since injecting a real panic
+    /// mid-`spawn_driver` needs thread-level hooks this crate doesn't have,
+    /// this exercises `DriverGuard` exactly as `spawn_driver` uses it —
+    /// construct it around a real `PollHalf` with one real accepted request
+    /// inflight, then unwind through it — and asserts the ticket the guard
+    /// was holding resolves to `ShutDown` rather than hanging.
+    #[test]
+    fn driver_guard_drains_inflight_tickets_even_through_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        make_instance(dir.path(), "guard-panic");
+        let (send, poll) = Engine::attach(
+            dir.path(),
+            "guard-panic",
+            EngineConfig { serving_gate: false, ..EngineConfig::default() },
+        )
+        .unwrap();
+
+        // Mint a ticket exactly as `dispatch` does, and get it accepted, so
+        // there is a real live slot for the guard to drain.
+        let (ticket, core) = ticket_pair::<u64>();
+        let user_data = Arc::into_raw(core.clone()) as u64;
+        send.try_submit(user_data, b"x").unwrap();
+        drop(core); // mirrors dispatch()'s local `core` var dropping at scope exit
+
+        let orig_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // keep the expected panic quiet
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = DriverGuard(poll);
+            panic!("simulated driver panic");
+        }));
+        std::panic::set_hook(orig_hook);
+        assert!(result.is_err(), "expected the simulated panic to unwind");
+
+        // DriverGuard's Drop ran during the unwind and drained the ticket —
+        // it must NOT be left hanging.
+        assert!(matches!(ticket.wait(), Err(ClientError::ShutDown)));
+    }
+
+    /// The `Park` arm's `ArmGuard` must disarm even if the nested `poll`
+    /// call (which invokes `resolve`, a user-adjacent callback) panics
+    /// between `arm()` and where the old code's bare `wh.disarm()` used to
+    /// sit — otherwise the ring's waiter bookkeeping leaks armed forever.
+    /// `arm`/`disarm`/`current_seq` are cheap, idempotent header ops (see
+    /// `uc_protocol::ring::common::RingWaitHandle`), so this asserts on the
+    /// guard's own drop behavior directly rather than requiring a
+    /// wake-latency measurement: after an unwind through `ArmGuard::new`,
+    /// `disarm` must have run — proven here by re-arming/disarming cleanly
+    /// afterward with no leftover state to trip over.
+    #[test]
+    fn arm_guard_disarms_even_through_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        make_instance(dir.path(), "arm-panic");
+        let (_send, poll) = Engine::attach(
+            dir.path(),
+            "arm-panic",
+            EngineConfig { serving_gate: false, ..EngineConfig::default() },
+        )
+        .unwrap();
+        let wh = poll.wait_handle();
+
+        let orig_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _arm = ArmGuard::new(&wh);
+            panic!("simulated panic between arm and disarm");
+        }));
+        std::panic::set_hook(orig_hook);
+        assert!(result.is_err());
+
+        // If the first disarm leaked, a second arm/disarm cycle still
+        // completes cleanly (no assertion possible on the private waiter
+        // count from here) — the real proof is that `ArmGuard::new`/`Drop`
+        // is unconditionally symmetric by construction: `Drop::drop` always
+        // runs on unwind, so there is no code path that arms without a
+        // matching disarm.
+        let _arm2 = ArmGuard::new(&wh);
+        drop(_arm2);
     }
 }

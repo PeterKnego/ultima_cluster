@@ -233,6 +233,66 @@ fn shutdown_fails_inflight_tickets_with_shutdown() {
     assert!(matches!(t.wait(), Err(uc2_client::ClientError::ShutDown)));
 }
 
+/// Finding 3 (task-6 review): the refusal path — `dispatch`'s reclaim of a
+/// leaked `Arc<TicketCore>` for a request the engine never accepted — end to
+/// end through the public API, both fail-fast (`try_submit`) and after the
+/// grace loop (`submit`). A tiny ingress ring that nothing ever drains (no
+/// node here) stays full forever once filled, so both calls are guaranteed
+/// to see `Backpressure` from the engine every attempt.
+#[test]
+fn refusal_path_reports_backpressure_full_and_shutdown_is_still_clean() {
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "pipe-bp", 64, 4096);
+
+    // Fill the ingress ring completely via a raw producer, exactly like
+    // tests/synthetic.rs's `ingress_ring_stays_full_returns_backpressure_full`
+    // — nobody reads it (no node/service running here), so it stays full.
+    let (filler, _consumer) = MpscRing::open(&dir.path().join("ingress.ring")).unwrap().into_split();
+    loop {
+        if filler.try_write(1, 0, [0; 8], &[0u8; 8]).is_err() {
+            break; // Full (or TooLarge for the last partial slot) — full enough.
+        }
+    }
+
+    let client = uc2_client::PipelinedClient::connect(
+        dir.path(), "pipe-bp",
+        uc2_client::PipelinedConfig { serving_gate: false, ..Default::default() },
+    ).unwrap();
+
+    // Fail-fast: no retry loop, refused on the first attempt.
+    let t0 = Instant::now();
+    let result: Result<uc2_client::Ticket<u8>, _> = client.try_submit(&7u8);
+    let fail_fast_elapsed = t0.elapsed();
+    match result {
+        Err(uc2_client::ClientError::BackpressureFull) => {}
+        Err(e) => panic!("expected BackpressureFull, got {e:?}"),
+        Ok(_) => panic!("expected BackpressureFull, got a Ticket (ring wasn't actually full)"),
+    }
+    assert!(
+        fail_fast_elapsed < Duration::from_millis(500),
+        "try_submit must be fail-fast, not grace-loop: {fail_fast_elapsed:?}"
+    );
+
+    // Grace loop: retries at 100us for ~1s before giving up.
+    let t1 = Instant::now();
+    let result: Result<uc2_client::Ticket<u8>, _> = client.submit(&7u8);
+    let grace_elapsed = t1.elapsed();
+    match result {
+        Err(uc2_client::ClientError::BackpressureFull) => {}
+        Err(e) => panic!("expected BackpressureFull, got {e:?}"),
+        Ok(_) => panic!("expected BackpressureFull, got a Ticket (ring wasn't actually full)"),
+    }
+    assert!(grace_elapsed >= Duration::from_millis(900), "must honor the ~1s grace: {grace_elapsed:?}");
+    assert!(grace_elapsed < Duration::from_secs(5), "must not hang well past the grace window: {grace_elapsed:?}");
+
+    // Every refusal above reclaimed its leaked Arc<TicketCore> on its own
+    // error path (never handed to the driver) — shutdown must still be
+    // clean: no hang (nothing was ever inflight to drain) and no crash
+    // (no double-free from a refusal that was mistakenly treated as
+    // accepted).
+    client.shutdown();
+}
+
 #[test]
 fn every_wait_strategy_round_trips() {
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
