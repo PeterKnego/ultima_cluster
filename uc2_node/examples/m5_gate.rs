@@ -547,7 +547,15 @@ fn run_client_measurement(
                     }
                     resolved.fetch_add(1, Ordering::Relaxed);
                 });
-                if n == 0 { std::hint::spin_loop(); } // dedicated-core caller: BusySpin is legitimate here
+                // Old-matcher idle parity: the pre-Engine pump slept 20us between
+                // empty poll cycles, and that idle strategy is what produced the
+                // recorded fleet numbers (1.64M resp/s). A dedicated-core fleet
+                // client can flip this to spin_loop(), but on the oversubscribed
+                // in-process smoke box (3 nodes' agents + services + this thread
+                // sharing a handful of cores) a busy-spinning poll thread steals a
+                // full core from the very consensus/apply agents being measured —
+                // harness parity with the old pump beats dogma here.
+                if n == 0 { thread::sleep(Duration::from_micros(20)); }
             }
         }
     }).expect("spawn poll thread");
