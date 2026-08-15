@@ -284,37 +284,52 @@ mod tests {
         let (mut t, core) = ticket_pair::<u64>();
         core.resolve(resolved_bytes(42));
 
-        // First poll should succeed
         let waker = noop_waker();
         let mut cx = Context::from_waker(&waker);
         let mut t_pin = unsafe { std::pin::Pin::new_unchecked(&mut t) };
+
+        // First poll: should succeed
         match t_pin.as_mut().poll(&mut cx) {
             Poll::Ready(Ok(v)) => assert_eq!(v, 42),
-            _ => panic!("Expected Ready"),
+            _ => panic!("Expected Ready on first poll"),
         }
 
-        // Second poll should panic with exact message
-        let old_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {})); // Suppress panic output
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Second poll: should panic with exact message
+        // Save original hook once at the top
+        let orig_hook = std::panic::take_hook();
+        // Install silent hook for the panicking region
+        std::panic::set_hook(Box::new(|_| {}));
+
+        // Run catch_unwind and capture result
+        let second_poll_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut t_pin = unsafe { std::pin::Pin::new_unchecked(&mut t) };
             let _ = t_pin.as_mut().poll(&mut cx);
         }));
-        std::panic::set_hook(old_hook);
 
-        assert!(result.is_err(), "Expected panic on second poll");
-        // Verify panic message by catching and checking
-        let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            std::panic::set_hook(Box::new(|_| {}));
-            let (mut t2, core2) = ticket_pair::<u64>();
-            core2.resolve(resolved_bytes(42));
-            let waker = noop_waker();
-            let mut cx = Context::from_waker(&waker);
-            let mut t_pin = unsafe { std::pin::Pin::new_unchecked(&mut t2) };
-            let _ = t_pin.as_mut().poll(&mut cx);
-            let _ = t_pin.as_mut().poll(&mut cx);
-        }));
-        assert!(msg.is_err());
+        // Restore hook UNCONDITIONALLY before any assertion
+        std::panic::set_hook(orig_hook);
+
+        // Now assert on the captured result
+        assert!(
+            second_poll_result.is_err(),
+            "Expected panic on second poll"
+        );
+
+        // Verify exact panic message by downcasting
+        let payload = second_poll_result.unwrap_err();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .unwrap_or_else(|| {
+                payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .expect("panic payload is a string")
+            });
+        assert!(
+            msg.contains("Ticket polled after completion"),
+            "wrong panic message: {msg}"
+        );
     }
 
     #[test]
