@@ -192,6 +192,59 @@ checkable against 2026-07-12's 1,639,187). Report per-arm medians, min/max
 ratios, and p50s alongside; the old binary prints no `lost` line (the field
 was added with the engine client) — parse accordingly.
 
-### A/B result
+### A/B result — **PARITY** (primary median ratio 0.9616 ≥ 0.95): the gate-run regression is attributed to fleet-to-fleet variance
 
-*(to be filled by the run)*
+Run 2026-08-15, fresh 3 × c6id.2xlarge fleet, arm A binary built on host0
+from `35daaae` (`/opt/bench/uc-old`), arm B + all node/service processes
+from main `c3011e2`. All 18 runs clean (no invalidation fired anywhere:
+zero redirects, zero lost, zero in-flight residue). Driver
+`bench-infra/scripts/m5_ab_gate.py` (`2f5c2f0`); raw consoles + JSONL in
+`bench-out/m5-ab-2026-08-15/` (local). Fleet destroyed immediately after;
+`terraform state list` verified EMPTY.
+
+**PRIMARY (256 KiB / W=1024, 6 interleaved pairs — the pre-registered
+verdict block):**
+
+| pair | A (old pump) rps @ p50 ms | B (engine) rps @ p50 ms | B/A |
+|---|---|---|---|
+| 1 | 1,487,685 @ 0.591 | 1,459,770 @ 0.680 | 0.9812 |
+| 2 | 1,505,603 @ 0.643 | 1,402,386 @ 0.671 | 0.9314 |
+| 3 | 1,465,124 @ 0.671 | 1,433,742 @ 0.680 | 0.9786 |
+| 4 | 1,449,303 @ 0.673 | 1,335,344 @ 0.771 | 0.9214 |
+| 5 | 1,480,219 @ 0.632 | 1,398,352 @ 0.709 | 0.9447 |
+| 6 | 1,464,261 @ 0.569 | 1,522,244 @ 0.612 | 1.0396 |
+
+Medians: **A = 1,472,672 · B = 1,418,064 · pairwise-median ratio = 0.9616**
+(min 0.9214, max 1.0396). **≥ 0.95 → PARITY** per the pre-committed rule.
+
+**SECONDARY (128 KiB / W=1024, 3 pairs, context only, no verdict weight):**
+ratios 0.8507 / 1.0009 / 0.8135 — median 0.8507. Noisy and small-n by
+design; two of three B runs at this point coincided with visibly degraded
+runs (p50 0.769/0.822 ms vs A's ~0.65 ms), the same run-to-run mode swings
+the primary block shows in both arms.
+
+**Reading, in order of what the data actually establishes:**
+
+1. **The decisive datum: arm A — the UNCHANGED July client — medians
+   1,472,672 on this fleet, itself −10.2% below its own 2026-07-12 number
+   (1,639,187).** The gate-run's "regression" band (−13.6%) is almost
+   entirely reproduced by the OLD binary on new hardware: fleet-to-fleet
+   variance (different physical hosts/placement) is real and ≈10% at this
+   operating point.
+2. The engine client sits ~4% below the old pump in pairwise median
+   (0.9616), with per-pair spread 0.92–1.04 — the engine WON one pair
+   outright. A small real cost of roughly this size is consistent with the
+   engine's extra per-request atomics, but it is inside the pre-committed
+   parity envelope and much smaller than run-to-run variance on a single
+   pair.
+3. Combined with the gate re-run: RULE 2's REGRESSION verdict stands as
+   recorded (the floor was computed against a different fleet's baseline),
+   but the A/B resolves its open question — **the extraction did not cost
+   the ~10-14% the raw comparison suggested; the public-Engine client is at
+   parity within ~4% on identical hardware, and both gate verdicts
+   (spec-§9 bar PASS at 3.7×, engine parity) now hold together.**
+
+No further follow-up is fleet-gated. If the residual ~4% ever matters, the
+profiling avenue stands (claim-path RMW count; the shared `inflight`
+cacheline), and the deferred raw-passthrough / SendHalf-per-thread paths
+(spec §10) are the structural wins available above the ticket layer.
