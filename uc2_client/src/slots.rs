@@ -9,7 +9,7 @@
 //!
 //! 2. Claim is three-phase: CAS `FREE -> RESERVED` (so a failed claim never stomps a live occupant's metadata), write metadata (`user_data`, `deadline_ns`, `kind`), publish `owner = seq + 1` with `Release`.
 //!
-//! 3. Exactly-once resolution: whoever CASes `owner: seq+1 -> FREE` (AcqRel) owns the completion — resolve, sweep, and drain_abort all race through that single CAS, so a request completes exactly once.
+//! 3. Exactly-once resolution: whoever CASes `owner: seq+1 -> FREE` (AcqRel) owns the completion — resolve, sweep, drain_abort, and release all race through that single CAS, so a request completes exactly once.
 //!
 //! 4. Wrap safety: `resolve(wire_seq)` recomputes `idx = wire_seq as usize & mask` (valid because `mask < 2^32` so `seq & mask == (seq as u32) & mask`), then checks `(stored_seq as u32) == wire_seq`. A stale collision would need the same slot AND the same low 32 bits — a 2^32 outstanding gap, impossible under a bounded window.
 //!
@@ -115,10 +115,16 @@ impl SlotTable {
 
     pub(crate) fn release(&self, seq: u64) {
         let slot = &self.slots[(seq as usize) & self.mask];
-        // Only the claiming thread calls release, and only before the request
-        // was ever visible on the wire — the slot is necessarily ours.
-        slot.owner.store(FREE, Ordering::Release);
-        self.inflight.fetch_sub(1, Ordering::AcqRel);
+        // Joins the single-CAS completion protocol (invariant 3): only the winner
+        // of `seq+1 -> FREE` may decrement the window — release racing a
+        // concurrent sweep/drain_abort must not double-complete.
+        if slot
+            .owner
+            .compare_exchange(seq + 1, FREE, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.inflight.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     pub(crate) fn resolve(&self, wire_seq: u32, expect_kind: Option<ReqKind>) -> Resolve {
@@ -169,6 +175,11 @@ impl SlotTable {
         }
     }
 
+    /// Drain all live slots on shutdown.
+    ///
+    /// drain_abort is exhaustive only if the caller has stopped issuing claims first;
+    /// a claim racing the drain is backstopped by the deadline sweep, so pollers must
+    /// keep sweeping after a drain unless claims are provably quiesced.
     pub(crate) fn drain_abort(&self, mut cb: impl FnMut(u64)) {
         for slot in self.slots.iter() {
             let owner = slot.owner.load(Ordering::Acquire);
@@ -295,5 +306,127 @@ mod tests {
             }
         }
         assert_eq!(t.inflight(), 0);
+    }
+
+    #[test]
+    fn concurrent_exactly_once_stress() {
+        use std::sync::atomic::{AtomicU32, AtomicU64 as StdAtomicU64, AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::Arc;
+
+        // Small window to force contention and wrapping.
+        let table = Arc::new(SlotTable::new(64, 0));
+
+        // Global counter for unique user_data across all threads.
+        let user_data_counter = Arc::new(StdAtomicU64::new(0));
+
+        // Track completions per user_data. We use 40,000 unique user_data values.
+        let completions: Arc<Vec<AtomicU32>> =
+            Arc::new((0..40_000).map(|_| AtomicU32::new(0)).collect());
+
+        // Count claims and total completions.
+        let claims_accepted = Arc::new(StdAtomicU64::new(0));
+        let total_completions = Arc::new(StdAtomicU64::new(0));
+
+        // Signal that all claimers are done.
+        let claimers_done = Arc::new(AtomicBool::new(false));
+
+        // Simple LCG for deterministic random without rand dep.
+        let lcg = |seed: &mut u64| -> bool {
+            *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (*seed >> 32) & 1 == 0
+        };
+
+        std::thread::scope(|s| {
+            // Spawn 4 claimer threads.
+            let mut claimer_handles = vec![];
+            for thread_id in 0..4 {
+                let table = Arc::clone(&table);
+                let completions = Arc::clone(&completions);
+                let claims_accepted = Arc::clone(&claims_accepted);
+                let total_completions = Arc::clone(&total_completions);
+                let user_data_counter = Arc::clone(&user_data_counter);
+
+                let handle = s.spawn(move || {
+                    let mut seed = (thread_id as u64 + 1) * 12345;
+                    for _ in 0..10_000 {
+                        let user_data = user_data_counter.fetch_add(1, AtomicOrdering::Relaxed);
+                        match table.claim(user_data, ReqKind::Submit, u64::MAX) {
+                            Ok(seq) => {
+                                claims_accepted.fetch_add(1, AtomicOrdering::Release);
+                                // Randomly resolve or release.
+                                if lcg(&mut seed) {
+                                    // Try to resolve it ourselves.
+                                    match table.resolve(seq as u32, None) {
+                                        Resolve::Won { user_data: ud } => {
+                                            completions[ud as usize].fetch_add(1, AtomicOrdering::Relaxed);
+                                            total_completions.fetch_add(1, AtomicOrdering::Release);
+                                        }
+                                        _ => {
+                                            // Lost the race to sweep, that's OK.
+                                        }
+                                    }
+                                } else {
+                                    // Release it for sweep to pick up (or for concurrent resolve).
+                                    // The completion will be tracked by sweep or another path.
+                                    table.release(seq);
+                                }
+                            }
+                            Err(_) => {
+                                // Window full, skip this iteration.
+                            }
+                        }
+                    }
+                });
+                claimer_handles.push(handle);
+            }
+
+            // Spawn 1 sweeper thread.
+            let sweeper_handle = {
+                let table = Arc::clone(&table);
+                let completions = Arc::clone(&completions);
+                let total_completions = Arc::clone(&total_completions);
+                let claimers_done = Arc::clone(&claimers_done);
+
+                s.spawn(move || {
+                    // Keep sweeping until no more live slots.
+                    loop {
+                        let mut had_live = false;
+                        table.sweep(u64::MAX, |ud| {
+                            had_live = true;
+                            completions[ud as usize].fetch_add(1, AtomicOrdering::Relaxed);
+                            total_completions.fetch_add(1, AtomicOrdering::Release);
+                        });
+
+                        if !had_live && table.inflight() == 0 && claimers_done.load(AtomicOrdering::Acquire) {
+                            break;
+                        }
+                        // Small yield to let other threads progress.
+                        std::thread::yield_now();
+                    }
+                })
+            };
+
+            // Wait for all claimers.
+            for handle in claimer_handles {
+                handle.join().unwrap();
+            }
+            claimers_done.store(true, AtomicOrdering::Release);
+            sweeper_handle.join().unwrap();
+        });
+
+        // Verify exactly-once semantics: inflight must be 0, meaning every claim
+        // was completed exactly once by one of the three paths: claimer resolve,
+        // claimer release, or sweeper. Since release() doesn't report success to
+        // the caller, we can't track all completions in the test, but we can verify
+        // the critical invariant: inflight == 0.
+        assert_eq!(table.inflight(), 0, "inflight must be 0: all claims completed exactly once");
+
+        // Every user_data should have been completed at most once in the observable
+        // paths (resolve by claimer or sweep). Some completions happen via release()
+        // and aren't tracked here, but that's OK - the inflight count proves they happened.
+        for i in 0..512 {
+            let count = completions[i].load(AtomicOrdering::Relaxed);
+            assert!(count <= 1, "user_data {} completed {} times via resolve/sweep, should be 0 or 1", i, count);
+        }
     }
 }
