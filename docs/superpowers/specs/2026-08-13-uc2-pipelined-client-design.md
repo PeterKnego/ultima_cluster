@@ -119,6 +119,9 @@ poll.poll(|c: Completion<'_>| { ... }) -> usize;   // completions emitted this c
 
 pub struct Completion<'a> {
     pub user_data: u64,
+    pub position: Option<u64>,  // the applied position (Some for Response —
+                                // the SMR idempotency key, stripped from the
+                                // egress payload prefix by the engine)
     pub outcome: Outcome<'a>,
 }
 pub enum Outcome<'a> {
@@ -141,6 +144,27 @@ this: nothing accepted may leak, double-complete, or hang forever.
 engine echoes it back and never interprets it. Uniqueness is NOT required by
 the engine (correlation is internal); reusing a live `user_data` merely makes
 the two completions indistinguishable to the caller.
+
+### The byte contract
+
+Bytes-level does NOT mean format-free: the payload format is fixed by the
+service SDK, not chosen by the engine's caller.
+
+- Submitted bytes MUST bincode-decode (standard config) as the target
+  service's `StateMachine::Command` — the ONE decode at the apply boundary
+  (`uc2_service/src/apply.rs`); query bytes likewise as `Query`. The engine
+  never inspects them.
+- `Outcome::Response` bytes are `bincode(Response)`: the egress layout is
+  `position: u64 LE ++ bincode(response)` (`uc2_service/src/egress.rs`), and
+  the engine strips the prefix, exposing it as `Completion.position`.
+- Encode-once reuse (the m5_gate trick) falls out for any service whose
+  `Command` carries opaque bytes (`Vec<u8>`/`bytes::Bytes`): bincode of a
+  byte payload is a length prefix plus the bytes, encoded once and resent
+  verbatim.
+
+In A, this contract is invisible: `PipelinedClient` bincode-encodes typed
+commands/queries at the API entry and decodes responses on the waiter's
+thread, exactly as `Client` does today (`client.rs`/`matcher.rs`).
 
 ### What the engine hides (the session-correctness inventory)
 
