@@ -147,16 +147,24 @@ the two completions indistinguishable to the caller.
 
 ### The byte contract
 
-Bytes-level does NOT mean format-free: the payload format is fixed by the
-service SDK, not chosen by the engine's caller.
+The engine itself is format-free: it never inspects submitted or returned
+payload bytes, and the node/log treat `AppCommand` as opaque `Bytes`
+end-to-end. The only format constraint is the one imposed by the OTHER
+endpoint — the target service's apply boundary — and it belongs to
+`uc2_service`, not to the engine:
 
-- Submitted bytes MUST bincode-decode (standard config) as the target
-  service's `StateMachine::Command` — the ONE decode at the apply boundary
-  (`uc2_service/src/apply.rs`); query bytes likewise as `Query`. The engine
-  never inspects them.
-- `Outcome::Response` bytes are `bincode(Response)`: the egress layout is
-  `position: u64 LE ++ bincode(response)` (`uc2_service/src/egress.rs`), and
-  the engine strips the prefix, exposing it as `Completion.position`.
+- Today's typed `StateMachine` trait makes the service framework run the
+  codec (the ONE decode at the apply boundary, `uc2_service/src/apply.rs`),
+  and the framework's chosen codec is bincode (standard config). So against
+  today's SDK, submitted bytes must decode as `bincode(Command)`, query
+  bytes as `bincode(Query)` — a property of the service SDK the engine's
+  caller targets, which a future service-side raw-passthrough capability
+  (§10) would remove entirely.
+- `Outcome::Response` bytes are the egress payload with its prefix stripped:
+  the layout is `position: u64 LE ++ response bytes`
+  (`uc2_service/src/egress.rs`; today's SDK makes the body
+  `bincode(Response)`), and the engine strips the prefix, exposing it as
+  `Completion.position`.
 - Encode-once reuse (the m5_gate trick) falls out for any service whose
   `Command` carries opaque bytes (`Vec<u8>`/`bytes::Bytes`): bincode of a
   byte payload is a length prefix plus the bytes, encoded once and resent
@@ -385,5 +393,15 @@ Acceptance (the release criterion):
   response) — measure first; only if the gate re-run shows it matters.
 - Any future `ultima_rings` hard dependency (revisit if/when that crate
   becomes the stack's shared substrate).
+- **Service-side raw passthrough** (`uc2_service` change, separate arc): a
+  way for an SM to declare "my `Command`/`Response` are bytes — hand me the
+  committed payload directly, skip the framework codec." Removes the
+  bincode wrapper for apps bringing their own format (proto, flatbuffers):
+  today they must define `Command = Vec<u8>` and pay bincode's varint
+  prefix plus an alloc-and-copy per apply (`decode_from_slice::<Vec<u8>>`),
+  which sits oddly against the "refcounted, no intermediate copies"
+  `AppCommand` philosophy. With passthrough, the engine's byte contract
+  collapses to nothing — the format becomes purely an app-level agreement
+  between gateway and state machine.
 - Cross-host redirect helpers (leader-hint-driven re-attach) — gateway
   policy, possibly a later cookbook example.
