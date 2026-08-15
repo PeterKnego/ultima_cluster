@@ -155,3 +155,43 @@ reason.
 
 **AWS: fleet destroyed immediately after the run; `terraform state list`
 verified EMPTY (the real state in `bench-infra/terraform/`).**
+
+---
+
+## A/B follow-up — PRE-REGISTERED (written & committed before the A/B data)
+
+**Question:** on identical hardware, is the engine client slower than the
+raw-pump client at the regression point, or was the −13.6% fleet-to-fleet
+variance?
+
+**Design** (one fresh fleet, same 3 × c6id.2xlarge protocol):
+- Server side IDENTICAL for both arms and all runs: node + service processes
+  from main `c3011e2`'s `m5_gate` on every host. (Verified: `git diff
+  35daaae c3011e2` touches NO server-side crate — `uc2_node/src`,
+  `uc2_service`, `uc2_log`, `uc2_net`, `uc2_consensus`, `uc_protocol` are
+  byte-identical; the two trees differ only in `uc2_client`, the m5_gate
+  CLIENT role, and docs.)
+- Arm A: the PRE-extraction client (raw ring pump) — `m5_gate` built from
+  `35daaae` (the last commit before the Task-8 client rewrite), on host0 at
+  `/opt/bench/uc-old`.
+- Arm B: the engine client — main's `m5_gate`.
+- **Primary: 6 interleaved pairs (A then B), 256 KiB admission / W=1024,
+  15 s, 64 B payloads, fresh instance dirs per RUN.** n = 6 pairs is FIXED
+  in advance (house rule: fix n before coding); no extension, no
+  re-rolls except the standing per-run invalidation rule (redirects > 0 /
+  lost > 0 / in-flight-at-end > 0 → re-run that single run once).
+- Secondary, context only (no verdict weight): 3 pairs at 128 KiB / W=1024.
+
+**Pre-committed decide rule:** pairwise ratio `r_i = B_i/A_i` on
+responses/s; **median(r) < 0.95 → ENGINE COST CONFIRMED** (the extraction
+costs ≥5% at this point and the gate doc's regression is at least partly
+real engine cost); **median(r) ≥ 0.95 → PARITY** (the −13.6% is attributed
+to fleet-to-fleet variance; note the old client's own numbers on THIS fleet
+land in the same section either way, so the variance claim is directly
+checkable against 2026-07-12's 1,639,187). Report per-arm medians, min/max
+ratios, and p50s alongside; the old binary prints no `lost` line (the field
+was added with the engine client) — parse accordingly.
+
+### A/B result
+
+*(to be filled by the run)*
