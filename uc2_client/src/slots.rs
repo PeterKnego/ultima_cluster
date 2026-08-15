@@ -14,6 +14,8 @@
 //! 4. Wrap safety: `resolve(wire_seq)` recomputes `idx = wire_seq as usize & mask` (valid because `mask < 2^32` so `seq & mask == (seq as u32) & mask`), then checks `(stored_seq as u32) == wire_seq`. A stale collision would need the same slot AND the same low 32 bits — a 2^32 outstanding gap, impossible under a bounded window.
 //!
 //! 5. A `SlotBusy` claim burns its seq (gaps in the wire sequence are harmless — correlation is by value, not continuity) and surfaces as backpressure; it means an old in-flight (a full table-length of seqs ago) still holds the slot, which the deadline sweep will clear.
+//!
+//! 6. `drain_abort` is exhaustive only after claims are quiesced — a claim racing the drain publishes after the scan passes and is backstopped by the deadline sweep, so pollers must keep sweeping unless claims are provably stopped.
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
@@ -113,7 +115,7 @@ impl SlotTable {
         Ok(seq)
     }
 
-    pub(crate) fn release(&self, seq: u64) {
+    pub(crate) fn release(&self, seq: u64) -> bool {
         let slot = &self.slots[(seq as usize) & self.mask];
         // Joins the single-CAS completion protocol (invariant 3): only the winner
         // of `seq+1 -> FREE` may decrement the window — release racing a
@@ -124,6 +126,9 @@ impl SlotTable {
             .is_ok()
         {
             self.inflight.fetch_sub(1, Ordering::AcqRel);
+            true
+        } else {
+            false
         }
     }
 
@@ -313,19 +318,25 @@ mod tests {
         use std::sync::atomic::{AtomicU32, AtomicU64 as StdAtomicU64, AtomicBool, Ordering as AtomicOrdering};
         use std::sync::Arc;
 
+        const THREADS: u64 = 4;
+        const ITERATIONS: u64 = 10_000;
+        const TOTAL_CLAIMS: u64 = THREADS * ITERATIONS;
+
         // Small window to force contention and wrapping.
         let table = Arc::new(SlotTable::new(64, 0));
 
-        // Global counter for unique user_data across all threads.
-        let user_data_counter = Arc::new(StdAtomicU64::new(0));
-
-        // Track completions per user_data. We use 40,000 unique user_data values.
+        // Track completions AND releases per user_data (one AtomicU32 per possible user_data).
+        // Encoding: completions[ud] = resolve/sweep count, released[ud] = release success count.
         let completions: Arc<Vec<AtomicU32>> =
-            Arc::new((0..40_000).map(|_| AtomicU32::new(0)).collect());
+            Arc::new((0..TOTAL_CLAIMS as usize).map(|_| AtomicU32::new(0)).collect());
+        let released: Arc<Vec<AtomicU32>> =
+            Arc::new((0..TOTAL_CLAIMS as usize).map(|_| AtomicU32::new(0)).collect());
+        // Track which user_data values were successfully claimed.
+        let claimed: Arc<Vec<AtomicU32>> =
+            Arc::new((0..TOTAL_CLAIMS as usize).map(|_| AtomicU32::new(0)).collect());
 
-        // Count claims and total completions.
+        // Count total claims accepted.
         let claims_accepted = Arc::new(StdAtomicU64::new(0));
-        let total_completions = Arc::new(StdAtomicU64::new(0));
 
         // Signal that all claimers are done.
         let claimers_done = Arc::new(AtomicBool::new(false));
@@ -337,38 +348,37 @@ mod tests {
         };
 
         std::thread::scope(|s| {
-            // Spawn 4 claimer threads.
+            // Spawn 4 claimer threads, each with disjoint user_data range.
             let mut claimer_handles = vec![];
-            for thread_id in 0..4 {
+            for thread_id in 0..THREADS {
                 let table = Arc::clone(&table);
                 let completions = Arc::clone(&completions);
+                let released = Arc::clone(&released);
+                let claimed = Arc::clone(&claimed);
                 let claims_accepted = Arc::clone(&claims_accepted);
-                let total_completions = Arc::clone(&total_completions);
-                let user_data_counter = Arc::clone(&user_data_counter);
 
                 let handle = s.spawn(move || {
-                    let mut seed = (thread_id as u64 + 1) * 12345;
-                    for _ in 0..10_000 {
-                        let user_data = user_data_counter.fetch_add(1, AtomicOrdering::Relaxed);
+                    let mut seed = (thread_id + 1) * 12345;
+                    for iteration in 0..ITERATIONS {
+                        // Each claim has a unique user_data: thread_id * ITERATIONS + iteration.
+                        let user_data = thread_id * ITERATIONS + iteration;
                         match table.claim(user_data, ReqKind::Submit, u64::MAX) {
                             Ok(seq) => {
                                 claims_accepted.fetch_add(1, AtomicOrdering::Release);
+                                claimed[user_data as usize].store(1, AtomicOrdering::Release);
                                 // Randomly resolve or release.
                                 if lcg(&mut seed) {
                                     // Try to resolve it ourselves.
-                                    match table.resolve(seq as u32, None) {
-                                        Resolve::Won { user_data: ud } => {
-                                            completions[ud as usize].fetch_add(1, AtomicOrdering::Relaxed);
-                                            total_completions.fetch_add(1, AtomicOrdering::Release);
-                                        }
-                                        _ => {
-                                            // Lost the race to sweep, that's OK.
-                                        }
+                                    if let Resolve::Won { user_data: ud } = table.resolve(seq as u32, None) {
+                                        completions[ud as usize].fetch_add(1, AtomicOrdering::Relaxed);
                                     }
+                                    // If resolve lost to sweep, sweep will count the completion.
                                 } else {
-                                    // Release it for sweep to pick up (or for concurrent resolve).
-                                    // The completion will be tracked by sweep or another path.
-                                    table.release(seq);
+                                    // Try to release. Track whether we won the CAS.
+                                    if table.release(seq) {
+                                        released[user_data as usize].fetch_add(1, AtomicOrdering::Relaxed);
+                                    }
+                                    // If release lost to sweep, sweep already counted the completion.
                                 }
                             }
                             Err(_) => {
@@ -384,23 +394,29 @@ mod tests {
             let sweeper_handle = {
                 let table = Arc::clone(&table);
                 let completions = Arc::clone(&completions);
-                let total_completions = Arc::clone(&total_completions);
                 let claimers_done = Arc::clone(&claimers_done);
 
                 s.spawn(move || {
+                    let mut sweeper_iterations = 0;
+                    const MAX_SWEEPER_ITERS: u64 = 10_000_000;
+
                     // Keep sweeping until no more live slots.
                     loop {
                         let mut had_live = false;
                         table.sweep(u64::MAX, |ud| {
                             had_live = true;
                             completions[ud as usize].fetch_add(1, AtomicOrdering::Relaxed);
-                            total_completions.fetch_add(1, AtomicOrdering::Release);
                         });
+
+                        sweeper_iterations += 1;
+                        if sweeper_iterations > MAX_SWEEPER_ITERS {
+                            panic!("sweeper failed to quiesce — inflight accounting bug?");
+                        }
 
                         if !had_live && table.inflight() == 0 && claimers_done.load(AtomicOrdering::Acquire) {
                             break;
                         }
-                        // Small yield to let other threads progress.
+                        // Yield to let other threads progress.
                         std::thread::yield_now();
                     }
                 })
@@ -414,19 +430,32 @@ mod tests {
             sweeper_handle.join().unwrap();
         });
 
-        // Verify exactly-once semantics: inflight must be 0, meaning every claim
-        // was completed exactly once by one of the three paths: claimer resolve,
-        // claimer release, or sweeper. Since release() doesn't report success to
-        // the caller, we can't track all completions in the test, but we can verify
-        // the critical invariant: inflight == 0.
-        assert_eq!(table.inflight(), 0, "inflight must be 0: all claims completed exactly once");
-
-        // Every user_data should have been completed at most once in the observable
-        // paths (resolve by claimer or sweep). Some completions happen via release()
-        // and aren't tracked here, but that's OK - the inflight count proves they happened.
-        for i in 0..512 {
-            let count = completions[i].load(AtomicOrdering::Relaxed);
-            assert!(count <= 1, "user_data {} completed {} times via resolve/sweep, should be 0 or 1", i, count);
+        // Verify exactly-once semantics: every claimed user_data completed exactly once.
+        let mut total_completions = 0u64;
+        let mut total_released = 0u64;
+        for ud in 0..TOTAL_CLAIMS as usize {
+            if claimed[ud].load(AtomicOrdering::Acquire) == 1 {
+                let comp_count = completions[ud].load(AtomicOrdering::Relaxed);
+                let rel_count = released[ud].load(AtomicOrdering::Relaxed);
+                total_completions += comp_count as u64;
+                total_released += rel_count as u64;
+                // For each claimed request, exactly one of the three paths won:
+                // resolve (by claimer), sweep (by sweeper), or release (by claimer).
+                assert_eq!(
+                    comp_count + rel_count, 1,
+                    "claimed user_data {}: completions={} + released={} must == 1 (exactly once)",
+                    ud, comp_count, rel_count
+                );
+            }
         }
+
+        let claims = claims_accepted.load(AtomicOrdering::Acquire);
+        assert_eq!(
+            claims,
+            total_completions + total_released,
+            "total accepted claims {} must equal total completions {} + releases {}",
+            claims, total_completions, total_released
+        );
+        assert_eq!(table.inflight(), 0, "inflight must be 0 at end");
     }
 }
