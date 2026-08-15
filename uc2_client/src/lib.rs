@@ -24,6 +24,8 @@
 mod client;
 mod error;
 mod matcher;
+mod wait;
 
 pub use client::Client;
 pub use error::ClientError;
+pub use wait::WaitStrategy;
