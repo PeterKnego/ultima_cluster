@@ -1,0 +1,98 @@
+# UC v2 vs Aeron Cluster — same-conditions scorecard (3 × c6id.2xlarge)
+
+**Date:** 2026-08-15
+**Status:** PRE-REGISTERED — protocol, grids, and reading rule below are
+committed BEFORE the fleet run; results land in "Results" afterward and the
+rules are not touched once data exists.
+
+## Purpose
+
+The v2 spec (§2) framed its stretch goal as "800 k parity (Aeron-parity
+territory)", quoting Aeron Cluster's ≥800 k/s @ p50 0.38 ms — measured in the
+v1 era on **3 × c6id.4xlarge** (16 vCPU). UC v2's M5-class numbers
+(1.4-1.6 M/s @ p50 0.6-0.7 ms) come from **3 × c6id.2xlarge** (8 vCPU). This
+run puts both systems on the SAME fleet, same hardware class as UC's gates,
+and produces the v2 successor to the v1 scorecard
+(`docs/tasks/task19_synccore_model_b.md` era). **Scorecard, not a gate**: no
+pass/fail threshold — best-point vs best-point plus the ratio, with every
+comparability caveat disclosed.
+
+## Conditions matrix (pre-committed)
+
+Matched exactly (same fleet, same run):
+- 3 × c6id.2xlarge, us-east-1, single AZ, cluster placement group,
+  private-IP binding, logs/archives on NVMe (`/opt/bench` / instance store).
+- Both systems measured on THIS fleet — the UC anchor re-runs here
+  (2026-08-15 A/B lesson: fleet-to-fleet variance ≈10%; cross-fleet quoting
+  is invalid).
+- 3 nodes, response only after quorum commit + apply on the leader.
+- Deterministic leader on host0 (UC: start bias; Aeron:
+  `aeron.cluster.appointed.leader.id=0`); client co-located on host0.
+- Client edge = shared memory both: UC shmem rings; Aeron client attached to
+  node0's media driver (`aeron.dir=/dev/shm/node0-driver`) with
+  `aeron:ipc` ingress AND egress.
+- 64 B opaque payload, 100% writes, one client process, snapshots off.
+- Same `os_tune`, no CPU pinning either arm.
+
+Matched with disclosed judgment calls:
+- **Durability**: UC fdatasyncs the journal per ≤1 MiB block before positions
+  count as durable. Aeron: `aeron.archive.file.sync.level=1` +
+  `catalog.file.sync.level=1` (data-sync = the fdatasync equivalent;
+  deliberately NOT level 2, which adds metadata sync UC does not pay —
+  task13's 2026-06 table used 2, which over-penalized Aeron). Sync
+  granularity differs (per-block vs per-recorder-batch): disclosed.
+- **Methodology**: UC client = bounded-window max-throughput (best of
+  admission×W sweep); Aeron `LoadTestRig` = fixed-rate pacing (best
+  sustained rate). Best-point-vs-best-point, both swept; disclosed.
+- **JVM warmup**: rig warmup phase (10 s) kept and excluded from
+  measurement — JIT needs it, UC is AOT. Temurin 21, benchmarks-repo
+  (`aeron-io/benchmarks` @ `6afb215`, Aeron 1.51) shipped launch scripts.
+- **Response bytes**: Aeron echo returns the 64 B payload; UC returns a u64
+  (8 B). ~56 B/op egress asymmetry in UC's favor; disclosed.
+
+Inherent design differences (disclosed, not equalized):
+- Threading posture: UC = 4 busy-spin agents + service (sized for 8 vCPU);
+  Aeron = benchmarks-repo shipped posture, run in BOTH driver modes (below).
+- Wire internals: each system's defaults (UC MTU 1408; Aeron repo-tuned
+  term buffers / socket buffers per `cluster.properties.j2`).
+
+## Arms and grids (pre-committed)
+
+Run order: **UC anchor → Aeron SHARED sweep → Aeron DEDICATED sweep → UC
+anchor repeat** (the bracketing anchors detect fleet drift across the
+session).
+
+1. **UC anchor** (public-Engine m5_gate client, main `8f8cb20` tree): points
+   256 KiB/W=1024 and 128 KiB/W=1024, 15 s each, run at session start AND
+   end (4 runs total). Invalidation rules as in the M5 gate doc.
+2. **Aeron shared**: `aeron.threading.mode=SHARED` on all media drivers.
+   Rate grid **{200k, 400k, 600k, 800k, 1000k, 1200k, 1400k}** msg/s ×
+   batch.size **{64, 256}**, warmup 10 s, measure 15 s per rung, fresh
+   cluster per MODE (not per rung — matches how Aeron is operated; rungs
+   are back-to-back against a running cluster, like the v1 ladder).
+3. **Aeron dedicated**: identical grid, `aeron.threading.mode=DEDICATED`
+   (Aeron's default and the v1-era 4xlarge mode) — knowingly oversubscribes
+   8 vCPU; that cost is a finding, not a flaw.
+
+**Reading rule:** an Aeron rung is VALID iff the rig sustains the offered
+rate (achieved == offered within the rig's own tolerance, no `.FAIL`
+marker, no errors in node/driver logs). Each arm's headline = the highest
+valid rate with **p50 ≤ 1.0 ms**, reported with p50/p90/p99. The scorecard
+reports: UC anchor best point, Aeron best point per mode, and the
+UC/Aeron ratio per mode. Secondary table: full grids verbatim.
+
+**IPC-ingress validation (time-boxed, before the sweeps):** bring the
+cluster up with leader-side `aeron:ipc` ingress + client IPC ingress/egress
+and verify election completes and a smoke rung passes. task13 §11's
+follower crash was a config-shape bug (global IPC channel + per-member UDP
+endpoints appended); the fix path is per-role rendering (IPC on node0 +
+client only, UDP members list otherwise) if Aeron 1.51 still appends
+endpoints. If IPC ingress cannot be made to work inside the timebox
+(~45 min), FALL BACK to UDP-loopback ingress for the client edge, disclose,
+and record the fallback as a caveat row — the run proceeds either way. If
+both edges are cheap to run, both are recorded (the IPC-vs-UDP client-edge
+delta is itself a useful row).
+
+## Results
+
+*(to be filled by the run)*
