@@ -24,6 +24,7 @@
 mod client;
 mod error;
 mod matcher;
+mod slots;
 mod wait;
 
 pub use client::Client;
