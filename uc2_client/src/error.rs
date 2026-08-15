@@ -46,6 +46,15 @@ pub enum ClientError {
     /// RETRY addressed to it) could be read. Every other in-flight request on
     /// this client fails the same way in the same instant (lapped records are
     /// unrecoverable — v1 semantics: "unknown losses").
+    ///
+    /// As of the pipelined-client rework, this variant is UNREACHABLE from
+    /// [`crate::Client`]/[`crate::PipelinedClient`]: the engine counts
+    /// broadcast overwrites as a stat (`EngineStats::overwritten`) rather than
+    /// eagerly failing every in-flight request, and lets the per-request
+    /// deadline sweep backstop anything actually lost (surfacing as
+    /// [`ClientError::Timeout`] instead). Retained for API compatibility —
+    /// external matchers (`lincheck_v2/mod.rs`, `hard_crash.rs`, the m6/m7
+    /// gates) still match on it and treat it identically to `Timeout`.
     #[error("response overwritten: consumer fell behind the broadcast ring (lapped, unknown losses)")]
     ResponseOverwritten,
     #[error("ingress backpressure: ring stayed full past the retry window")]

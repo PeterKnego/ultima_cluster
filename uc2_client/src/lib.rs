@@ -24,7 +24,6 @@
 mod client;
 mod engine;
 mod error;
-mod matcher;
 mod pipelined;
 mod slots;
 mod ticket;

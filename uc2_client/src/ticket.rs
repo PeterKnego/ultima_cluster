@@ -158,6 +158,13 @@ pub(crate) fn ticket_pair<R>() -> (Ticket<R>, Arc<TicketCore>) {
     (ticket, core)
 }
 
+/// `decode_response`'s two old byte-level cases (undersized payload, bincode
+/// decode failure) moved down here from the deleted `matcher.rs` as `Ticket`
+/// decode tests. Only the decode-failure case survives: the "undersized
+/// payload" case is now structurally impossible to reach from a `Ticket` —
+/// the ENGINE strips and validates the 8-byte `position` prefix
+/// (`engine.rs`'s `handle_record`, `MSG_V2_RESPONSE` arm) before a completion
+/// is ever produced, so a `Ticket` only ever sees the body bytes underneath.
 #[cfg(test)]
 mod tests {
     use super::*;
