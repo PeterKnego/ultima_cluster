@@ -13,7 +13,7 @@
 - Branch: all work on `uc2/pipelined-client` off current `main`.
 - **No new crate dependencies** in `uc2_client` (its small dep set is an advertised property; spec §2).
 - **No wire/protocol change**: same ring files, msg types, `header_extra` codec (`(client_id: u32, local_seq: u32)` LE), cnc layout. A new client talks to an old node.
-- **`Client`'s public API and observable behavior are pinned** by the four existing test files (`roundtrip.rs`, `synthetic.rs`, `timeout_and_restart.rs`, `torn_header.rs`) — they must pass UNCHANGED (they are the compat oracle).
+- **Compat pin:** `Client`'s public API and observable behavior are pinned by the four existing test files (`roundtrip.rs`, `synthetic.rs`, `timeout_and_restart.rs`, `torn_header.rs`) — they must pass UNCHANGED (they are the compat oracle).
 - `cargo clippy --workspace --all-targets -- -D warnings` must stay clean after every task.
 - Test scratch dirs: `tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))` in new integration tests — NEVER bare `/tmp` (RAM tmpfs, no swap; standing CLAUDE.md rule). Tiny `NamedTempFile`s in unit tests are fine (existing pattern).
 - 64-bit only assumption (`user_data` carries a pointer in layer A): add `#[cfg(not(target_pointer_width = "64"))] compile_error!` in `pipelined.rs`.
@@ -68,7 +68,7 @@ uc2_node/examples/m5_gate.rs  # REWRITE client role on public Engine (Task 8)
 cd /home/claude/ultima/ultima_cluster && git checkout -b uc2/pipelined-client
 ```
 
-- [ ] **Step 2: Write `wait.rs` (port, then adapt doc comments)**
+- [ ] **Step 2: Write wait.rs (port, then adapt doc comments)**
 
 Port from `/home/claude/ultima/ultima_rings/src/wait.rs` (read it first — it is ~277 lines including tests). Keep: the four-variant enum, `SPINS = 10`, `YIELDS = 20`, `PARK_MIN = 64µs`, `PARK_MAX = 1ms`, the `Idle` struct and its three tests verbatim (they are deterministic/wall-clock-bounded; keep the `#[cfg_attr(miri, ignore = ...)]` attribute as-is — harmless here). Drop: the `crate::notify` reference in the doc header (uc2_client's Park parks on the ring futex or a ticket condvar instead — say so). Add this attribution header under the SPDX lines:
 
@@ -95,7 +95,7 @@ Port from `/home/claude/ultima/ultima_rings/src/wait.rs` (read it first — it i
 
 `WaitStrategy` must be `pub`; `Idle`, `SPINS`, `YIELDS` stay `pub(crate)`.
 
-- [ ] **Step 3: Wire into `lib.rs`**
+- [ ] **Step 3: Wire into lib.rs**
 
 ```rust
 mod wait;
@@ -159,7 +159,7 @@ impl SlotTable {
 4. Wrap safety: `resolve(wire_seq)` recomputes `idx = wire_seq as usize & mask` (valid because `mask < 2^32` so `seq & mask == (seq as u32) & mask`), then checks `(stored_seq as u32) == wire_seq`. A stale collision would need the same slot AND the same low 32 bits — a 2^32 outstanding gap, impossible under a bounded window.
 5. A `SlotBusy` claim burns its seq (gaps in the wire sequence are harmless — correlation is by value, not continuity) and surfaces as backpressure; it means an old in-flight (a full table-length of seqs ago) still holds the slot, which the deadline sweep will clear.
 
-- [ ] **Step 1: Write the failing tests (bottom of `slots.rs`)**
+- [ ] **Step 1: Write the failing tests (bottom of slots.rs)**
 
 ```rust
 #[cfg(test)]
@@ -266,7 +266,7 @@ mod tests {
 Run: `cargo test -p uc2_client slots`
 Expected: FAIL to compile ("cannot find `SlotTable`").
 
-- [ ] **Step 3: Implement `SlotTable`**
+- [ ] **Step 3: Implement SlotTable**
 
 ```rust
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -516,7 +516,7 @@ The shared core (private): `struct Shared { cnc: Arc<CncPage>, client_id: u32, i
 
 `EngineStats` (public, `#[derive(Debug, Default, Clone, Copy)]`): `accepted, responses, duplicates, kind_mismatch, overwritten, corrupt, not_leader, retry, timed_out, restarts: u64`. Internal `StatCells` = same fields as `AtomicU64`s with a `snapshot()` method.
 
-- [ ] **Step 1: Write the failing tests (`tests/engine_synthetic.rs`)**
+- [ ] **Step 1: Write the failing tests (tests/engine_synthetic.rs)**
 
 Copy `make_instance`/`meta` helpers from `uc2_client/tests/synthetic.rs` (hand-rolled instance dirs: cnc + 4 ring files; no real node). Then:
 
@@ -605,7 +605,7 @@ fn payload_too_large_fails_loud_at_the_door() {
 Run: `cargo test -p uc2_client --test engine_synthetic`
 Expected: FAIL to compile ("cannot find `Engine`").
 
-- [ ] **Step 3: Implement `engine.rs` (attach + SendHalf + types)**
+- [ ] **Step 3: Implement engine.rs (attach + SendHalf + types)**
 
 `attach` (mirror `Client::connect`'s order — subscribe BEFORE returning, so nothing published after attach is missable):
 
@@ -782,7 +782,7 @@ impl PollHalf {
 - Maintenance, amortized: `self.cycle += 1`; when `cycle % 64 == 0` → (a) restart check: `cnc.try_instance_id()` returning `None` (torn header mid-recreate — M5 final-review semantics) or a different id → record `(attached, current)` in `shared.restart` (torn → `current = 0`), `dead.store(true)`, `stats.restarts += 1`, `table.drain_abort` emitting `InstanceRestart { attached, current }` for every in-flight; (b) deadline sweep: `table.sweep(t0.elapsed() as nanos, ..)` emitting `TimedOut`, `stats.timed_out += n`.
 - After `dead` is set, `poll` still drains rings (records may be stale) but resolves nothing new (table is empty) — no special casing needed.
 
-- [ ] **Step 1: Write the failing tests (extend `engine_synthetic.rs`)**
+- [ ] **Step 1: Write the failing tests (extend engine_synthetic.rs)**
 
 ```rust
 use uc_protocol::ring::BroadcastRing;
@@ -997,7 +997,7 @@ Expected: new tests FAIL (poll stub returns 0 → drains empty / compile errors 
 
 - [ ] **Step 3: Implement PollHalf**
 
-Structure (the record handler is one private method so the two rings share it):
+Structure: `poll` delegates to three FREE functions (`drain_ring`, `handle_record`, `maintenance`) taking `&Shared` — free functions rather than methods so the `&mut self.egress_*` / `&self.shared` / `&mut self.buf` borrows split cleanly:
 
 ```rust
 impl PollHalf {
@@ -1005,30 +1005,148 @@ impl PollHalf {
         self.cycle += 1;
         let mut emitted = 0usize;
         if self.cycle % 64 == 0 {
-            emitted += self.maintenance(&mut cb);
+            emitted += maintenance(&self.shared, &mut cb);
         }
-        for which in [RingSel::Service, RingSel::Node] {
-            for _ in 0..128 {
-                // (split borrows: take the ring out of self or use a helper fn
-                // taking (&mut BroadcastConsumer, &Shared, &mut Vec<u8>, ...))
-                match ring.try_read(&mut self.buf) {
-                    Ok(Some(rec)) => emitted += handle_record(&self.shared, &rec, &self.buf, &mut cb),
-                    Ok(None) => break,
-                    Err(RingError::Overwritten) => {
-                        self.shared.stats.overwritten.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(_) => {
-                        self.shared.stats.corrupt.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
+        emitted += drain_ring(&mut self.egress_service, &self.shared, &mut self.buf, &mut cb);
+        emitted += drain_ring(&mut self.egress_node, &self.shared, &mut self.buf, &mut cb);
         emitted
     }
 }
-```
 
-`handle_record` implements the per-msg_type behavior spelled out in this task's header. `maintenance` runs the restart check then the sweep, emitting through `cb` and returning the count. NOTE on the restart check: read `try_instance_id()` ONCE; `None` → `current = 0` (torn header, M5 final-review semantics — cite `client.rs`'s old comment, then delete it in Task 7).
+/// Drain up to 128 records off one broadcast (bounded work per call).
+fn drain_ring(
+    ring: &mut BroadcastConsumer,
+    shared: &Shared,
+    buf: &mut Vec<u8>,
+    cb: &mut impl FnMut(Completion<'_>),
+) -> usize {
+    let mut emitted = 0usize;
+    for _ in 0..128 {
+        match ring.try_read(buf) {
+            Ok(Some(rec)) => emitted += handle_record(shared, &rec, buf, cb),
+            Ok(None) => break,
+            Err(RingError::Overwritten) => {
+                // Spec §4 item 6: a stat, NOT an eager fail-all — the engine
+                // cannot know which responses were in the lost window; the
+                // deadline sweep backstops anything actually lost.
+                shared.stats.overwritten.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                shared.stats.corrupt.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    emitted
+}
+
+/// One record's routing. Returns 1 if a completion was emitted, else 0.
+fn handle_record(
+    shared: &Shared,
+    rec: &RecordHeader,
+    buf: &[u8],
+    cb: &mut impl FnMut(Completion<'_>),
+) -> usize {
+    let (cid, wire_seq) = client_from_extra(rec.header_extra);
+    if cid != shared.client_id {
+        return 0; // every client sees every broadcast record
+    }
+    match rec.msg_type {
+        MSG_V2_RESPONSE => {
+            if buf.len() < 8 {
+                // Malformed (missing position prefix): count, do NOT resolve —
+                // the slot stays live and the deadline backstops the request.
+                shared.stats.corrupt.fetch_add(1, Ordering::Relaxed);
+                return 0;
+            }
+            let delivered = if rec.flags & FLAG_V2_IS_QUERY != 0 {
+                ReqKind::Query
+            } else {
+                ReqKind::Submit
+            };
+            match shared.table.resolve(wire_seq, Some(delivered)) {
+                Resolve::Won { user_data } => {
+                    let position = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                    shared.stats.responses.fetch_add(1, Ordering::Relaxed);
+                    cb(Completion {
+                        user_data,
+                        position: Some(position),
+                        outcome: Outcome::Response(&buf[8..]),
+                    });
+                    1
+                }
+                Resolve::KindMismatch => {
+                    // T14: stale cross-generation collision — drop, count,
+                    // leave the slot for the real answer.
+                    shared.stats.kind_mismatch.fetch_add(1, Ordering::Relaxed);
+                    0
+                }
+                Resolve::Miss => {
+                    shared.stats.duplicates.fetch_add(1, Ordering::Relaxed);
+                    0
+                }
+            }
+        }
+        MSG_V2_NOT_LEADER => {
+            // Defensive hint decode (malformed payload -> unknown, never panic)
+            // — copied from the old matcher.rs.
+            let hint_raw = u64::from_le_bytes(
+                buf.get(..8).and_then(|s| s.try_into().ok()).unwrap_or([0xff; 8]),
+            );
+            let hint = if hint_raw == u64::MAX { None } else { Some(hint_raw as u32) };
+            match shared.table.resolve(wire_seq, None) {
+                // kind-agnostic: a pre-side-effect signal
+                Resolve::Won { user_data } => {
+                    shared.stats.not_leader.fetch_add(1, Ordering::Relaxed);
+                    cb(Completion { user_data, position: None, outcome: Outcome::NotLeader { hint } });
+                    1
+                }
+                _ => 0, // stale redirect for an already-resolved slot: no side effect to guard
+            }
+        }
+        MSG_V2_RETRY => match shared.table.resolve(wire_seq, None) {
+            Resolve::Won { user_data } => {
+                shared.stats.retry.fetch_add(1, Ordering::Relaxed);
+                cb(Completion { user_data, position: None, outcome: Outcome::Retry });
+                1
+            }
+            _ => 0,
+        },
+        _ => 0, // not a client-facing msg_type
+    }
+}
+
+/// Amortized slot-liveness pass (every 64 poll cycles): restart check first,
+/// then the deadline sweep.
+fn maintenance(shared: &Shared, cb: &mut impl FnMut(Completion<'_>)) -> usize {
+    let mut emitted = 0usize;
+    if !shared.dead.load(Ordering::Acquire) {
+        // Read ONCE. None = torn/zeroed header while the node recreates the
+        // cnc in place (M5 final-review semantics) -> current = 0 sentinel.
+        let observed = shared.cnc.try_instance_id();
+        if observed != Some(shared.instance_id) {
+            let current = observed.unwrap_or(0);
+            *shared.restart.lock().unwrap() = Some((shared.instance_id, current));
+            shared.dead.store(true, Ordering::Release);
+            shared.stats.restarts.fetch_add(1, Ordering::Relaxed);
+            shared.table.drain_abort(|user_data| {
+                cb(Completion {
+                    user_data,
+                    position: None,
+                    outcome: Outcome::InstanceRestart { attached: shared.instance_id, current },
+                });
+                emitted += 1;
+            });
+        }
+    }
+    let now_ns = shared.t0.elapsed().as_nanos() as u64;
+    shared.table.sweep(now_ns, |user_data| {
+        shared.stats.timed_out.fetch_add(1, Ordering::Relaxed);
+        cb(Completion { user_data, position: None, outcome: Outcome::TimedOut });
+        emitted += 1;
+    });
+    emitted
+}
+```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1074,7 +1192,7 @@ pub(crate) fn ticket_pair<R>() -> (Ticket<R>, Arc<TicketCore>);
 
 State machine: `State { done: Option<Result<(u64, Vec<u8>), ClientError>>, waker: Option<Waker> }`. `resolve`: lock → if `done.is_some()` return → set `done` → take waker → unlock → `notify_all` → `waker.wake()`. `wait`: condvar loop on `done`. Future `poll`: if `done` take → `Ready(decode)`; else store `cx.waker().clone()`, `Pending`. Decode = `bincode::serde::decode_from_slice::<R>(&bytes, standard())` mapped to `ClientError::Decode` — the position is discarded at this layer (engine users get it; A is the convenience tier, YAGNI). Polling an already-consumed future panics with `"Ticket polled after completion"` (document it).
 
-- [ ] **Step 1: Write the failing tests (bottom of `ticket.rs`)**
+- [ ] **Step 1: Write the failing tests (bottom of ticket.rs)**
 
 ```rust
 #[cfg(test)]
@@ -1253,7 +1371,7 @@ impl PipelinedClient {
 
 (Adjust: `error.rs` gains `#[error("payload too large: {len} > {max}")] PayloadTooLarge { len: usize, max: usize }` in THIS task, since `pipelined.rs` needs it.)
 
-- [ ] **Step 1: Write the failing tests (`tests/pipelined.rs`)**
+- [ ] **Step 1: Write the failing tests (tests/pipelined.rs)**
 
 Reuse `roundtrip.rs`'s harness verbatim: the `Cmd`/`CountSm` state machine, `node_config`, `wait_until` (copy them in — integration tests don't share modules). Node+service boot per test, `tempdir_in(env!("CARGO_TARGET_TMPDIR"))`.
 
@@ -1378,7 +1496,7 @@ fn every_wait_strategy_round_trips() {
 Run: `cargo test -p uc2_client --test pipelined`
 Expected: FAIL to compile ("cannot find `PipelinedClient`").
 
-- [ ] **Step 3: Implement `pipelined.rs`**
+- [ ] **Step 3: Implement pipelined.rs**
 
 Driver skeleton (the load-bearing part; everything else is the Interfaces block):
 
@@ -1470,7 +1588,7 @@ git commit -m "feat(uc2_client): PipelinedClient — driver thread, wait strateg
 - `kind_mismatch_drops()` → `self.inner.stats().kind_mismatch`.
 - `ClientError::ResponseOverwritten` becomes UNREACHABLE from `Client` (engine semantics: overwrite → stat + deadline backstop). Keep the variant (external matchers in `lincheck_v2/mod.rs`, `hard_crash.rs`, m6/m7 gates treat it identically to `Timeout` — verified 2026-08-15, classification-neutral) with a doc note: "as of the pipelined-client rework, the engine counts overwrites and lets the deadline backstop; this variant is retained for API compatibility and external matchers."
 
-- [ ] **Step 1: Rewrite `client.rs`**
+- [ ] **Step 1: Rewrite client.rs**
 
 ```rust
 pub struct Client {
@@ -1510,7 +1628,7 @@ impl Client {
 
 Keep the module-level rustdoc (updated: matcher description replaced by "a shim over `PipelinedClient` — one code path"). Move nothing else: the well-known file-name consts now live in `engine.rs` (Task 3); delete `client.rs`'s duplicates.
 
-- [ ] **Step 2: Delete `matcher.rs`, update `lib.rs`**
+- [ ] **Step 2: Delete matcher.rs, update lib.rs**
 
 ```bash
 git rm uc2_client/src/matcher.rs
@@ -1580,7 +1698,7 @@ cargo run -p uc2_node --release --example m5_gate -- all --secs 2 2>&1 | tee /ho
 
 Note `responses/s` and `p50`. (Sandbox smoke, noisy core-starved box — this is a parity sanity check, NOT the gate.)
 
-- [ ] **Step 2: Rewrite `run_client_measurement` on the engine**
+- [ ] **Step 2: Rewrite run_client_measurement on the engine**
 
 Shape (sender thread + poll thread, mirroring the old two-thread split):
 
