@@ -22,11 +22,13 @@
 //! §7; plan `docs/superpowers/plans/2026-07-11-uc2-m5-sdk.md` Task 10.
 
 mod client;
+mod engine;
 mod error;
 mod matcher;
 mod slots;
 mod wait;
 
 pub use client::Client;
+pub use engine::{Consistency, Engine, EngineConfig, EngineStats, PollHalf, SendHalf, SubmitError};
 pub use error::ClientError;
 pub use wait::WaitStrategy;

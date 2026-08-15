@@ -21,6 +21,7 @@ use uc2_log::cnc::CncPage;
 use uc_protocol::ring::{BroadcastRing, MpscProducer, MpscRing, RingError};
 use uc_protocol::v2::ipc::{FLAG_V2_LINEARIZABLE, MSG_V2_QUERY, MSG_V2_SUBMIT, extra_client};
 
+use crate::engine::{CNC_FILE, EGRESS_NODE, EGRESS_SERVICE, INGRESS_RING, QUERY_RING};
 use crate::error::ClientError;
 use crate::matcher::{
     Pending, RawResp, RegKind, Registrations, decode_response, drain_with_shutdown, spawn_matcher,
@@ -32,14 +33,6 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// write before giving up with [`ClientError::BackpressureFull`].
 const BACKPRESSURE_GRACE: Duration = Duration::from_secs(1);
 const RING_FULL_RETRY: Duration = Duration::from_micros(100);
-
-/// Well-known file names under the instance dir (the shared contract with
-/// `uc2_node::InstanceDir` — see `uc2_node/src/ipc.rs`).
-const CNC_FILE: &str = "cnc2.dat";
-const INGRESS_RING: &str = "ingress.ring";
-const QUERY_RING: &str = "query.ring";
-const EGRESS_SERVICE: &str = "egress_service.broadcast";
-const EGRESS_NODE: &str = "egress_node.broadcast";
 
 /// Sync shmem client SDK. Cheap to clone-and-share via `Arc<Client>` for
 /// concurrent `submit`/`query_*` calls from multiple threads (every method
