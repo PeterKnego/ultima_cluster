@@ -122,32 +122,36 @@ def run_rung(host0, rate, batch, tag, warmup_s=WARMUP_S, measure_s=MEASURE_S, ou
     cmd = ("sudo bash -c '" + JAVA_ENV +
            f"export JVM_OPTS=\"{jvm}\"; "
            f"timeout {warmup_s + measure_s + 90} {SCRIPTS}/cluster-client "
-           f"{CFG}/cluster-run.properties {CFG}/client-run.properties'")
+           f"{CFG}/cluster-run.properties {CFG}/client-run.properties "
+           f"> {BENCH}/rung-{tag}.out 2>&1; echo rc=$?; tail -c 4000 {BENCH}/rung-{tag}.out'")
     rc, out = sh(host0, cmd, timeout=warmup_s + measure_s + 120)
     if outdir:
         (outdir / f"{tag}.stdout.txt").write_text(out)
-    _, fail = sh(host0, f"ls {RESULTS} | grep -i '{tag}.*FAIL' || true")
-    row = parse_rig(out)
-    row.update(tag=tag, rate=rate, batch=batch, rc=rc,
-               failed_marker=bool(fail.strip()))
+    # Validity is ARTIFACT-based (the rig console is unreliable over ssh): a
+    # plain .hdr for the tag = sustained; .FAIL = not sustained; neither = broken.
+    _, ls_out = sh(host0, f"ls {RESULTS} | grep '^{tag}_' || true")
+    files = ls_out.split()
+    has_ok = any(f.endswith(".hdr") for f in files)
+    has_fail = any(f.endswith(".FAIL") for f in files)
+    row = {"tag": tag, "rate": rate, "batch": batch, "rc": rc,
+           "artifact_ok": has_ok, "failed_marker": has_fail,
+           "p50_us": None, "p90_us": None, "p99_us": None}
     return row
 
 
-PCT = {
-    "p50_us": r"^\s*50\.0+%\s+([\d.]+)",
-    "p90_us": r"^\s*90\.0+%\s+([\d.]+)",
-    "p99_us": r"^\s*99\.0+%\s+([\d.]+)",
-}
-
-
-def parse_rig(out):
-    row = {}
-    for k, rx in PCT.items():
-        m = re.search(rx, out, re.M)
-        row[k] = float(m.group(1)) if m else None
-    m = re.search(r"[Rr]ate[^\d]*([\d,]+)\s*(?:msgs?|messages)", out)
-    row["reported_rate"] = int(m.group(1).replace(",", "")) if m else None
-    return row
+def fill_percentiles(row, mode_dir):
+    """Parse the aggregator's -report.hgrm for this rung (value column is µs)."""
+    reports = list(mode_dir.glob(f"{row['tag']}_*-report.hgrm"))
+    if not reports:
+        return
+    want = {"p50_us": "0.500000000000", "p90_us": "0.900000000000",
+            "p99_us": "0.990000000000"}
+    for line in reports[0].read_text().splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            for k, pct in want.items():
+                if parts[1] == pct and row[k] is None:
+                    row[k] = float(parts[0])
 
 
 def main():
@@ -161,8 +165,10 @@ def main():
                "client_edge": None}
 
     # ---- 1. UC anchor (pre) --------------------------------------------
+    import os
     stop_aeron(hosts)
-    for adm, w in ((256, 1024), (128, 1024)):
+    pre_pts = () if os.environ.get("SKIP_PRE_ANCHOR") else ((256, 1024), (128, 1024))
+    for adm, w in pre_pts:
         print(f"== UC anchor pre adm={adm} W={w} ==", flush=True)
         row = run_point(hosts, adm, w, outdir, 1)
         print(f"   rps={row['rps']} p50={row['p50_ms']}ms"
@@ -175,7 +181,7 @@ def main():
     print("== IPC edge validation smoke (shared mode, 3s) ==", flush=True)
     start_aeron(hosts, "shared", ipc=True)
     smoke = run_rung(h0, 1000, 1, "ipc_smoke", warmup_s=2, measure_s=3, outdir=outdir)
-    ipc_ok = smoke["rc"] == 0 and not smoke["failed_marker"] and smoke["p50_us"] is not None
+    ipc_ok = smoke["artifact_ok"] and not smoke["failed_marker"]
     if not ipc_ok:
         _, node_out = sh(h0, f"tail -20 {BENCH}/node.out")
         print(f"   IPC smoke FAILED (rc={smoke['rc']}); node.out tail:\n{node_out}", flush=True)
@@ -199,6 +205,18 @@ def main():
                       f"{' FAIL-marker' if row['failed_marker'] else ''}", flush=True)
                 row["valid"] = ok
                 results["aeron"].append(row)
+        # Aggregate + pull this mode's artifacts BEFORE the next mode cleans RESULTS.
+        sh(h0, "sudo bash -c '" + JAVA_ENV +
+           f"{SCRIPTS}/../aggregate-results {RESULTS} > /dev/null 2>&1 || true'", timeout=180)
+        mode_dir = outdir / f"rig-{mode}"
+        mode_dir.mkdir(exist_ok=True)
+        subprocess.run(["rsync", "-az", "-e",
+                        f"ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -i {key} -l {user}",
+                        "--rsync-path", "sudo rsync",
+                        f"{h0.public_ip}:{RESULTS}/", str(mode_dir) + "/"], check=False)
+        for row in results["aeron"]:
+            if row.get("mode") == mode and row["valid"]:
+                fill_percentiles(row, mode_dir)
         stop_aeron(hosts)
 
     # ---- 5. UC anchor (post) -------------------------------------------
