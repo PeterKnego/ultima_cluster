@@ -64,9 +64,16 @@ pub struct EngineConfig {
     pub max_inflight: u32,
     /// Per-request deadline, enforced by the engine's deadline sweep (Task 4).
     pub request_timeout: Duration,
-    /// Optional client-side payload cap, checked before the ring write so an
-    /// oversized submit fails loud here instead of being silently dropped by
-    /// the node. `None` leaves the bound to the ring's own `TooLarge`.
+    /// Client-side payload cap, checked before the ring write so an oversized
+    /// submit fails loud here instead of being silently dropped downstream.
+    /// `None` (the default) INHERITS the attached node's own bound —
+    /// `cnc.meta().max_payload` — at `Engine::attach` time; `Some(n)` is an
+    /// explicit override. Inheriting matters because the node's bound is
+    /// typically MTU-bounded (a few hundred bytes — well under the ring's own
+    /// ~64 KiB `TooLarge` ceiling): without it, a submit that clears the
+    /// ring's door but exceeds the node's own `max_payload` is silently
+    /// dropped by the node rather than rejected here, and the caller only
+    /// finds out via the request timing out.
     pub max_payload: Option<usize>,
     /// Refuse `try_submit`/`try_query` when the node's `NODE_FLAG_CAN_SERVE`
     /// is clear (`SubmitError::NotServing`) instead of free-running into a
@@ -122,8 +129,8 @@ pub enum SubmitError {
 }
 
 /// Per-field completion counters, `Relaxed`-loaded into an [`EngineStats`]
-/// snapshot. Only `accepted` is written as of Task 3; the rest land as the
-/// poll side (Task 4) is filled in.
+/// snapshot. All counters are wired (submit side: `accepted`; poll side:
+/// the rest, via `handle_record`/`maintenance`).
 #[derive(Default)]
 struct StatCells {
     accepted: AtomicU64,
@@ -251,6 +258,10 @@ impl Engine {
         let cnc = CncPage::open_file(&instance_dir.join(CNC_FILE), app_id)?;
         let client_id = cnc.status().next_client_id.fetch_add(1) as u32;
         let instance_id = cnc.meta().instance_id;
+        // Door default: explicit `Some` overrides; `None` inherits the
+        // attached node's own bound from the cnc page (see EngineConfig::
+        // max_payload's doc for why this matters).
+        let max_payload = cfg.max_payload.or(Some(cnc.meta().max_payload as usize));
         let (ingress, _ic) = MpscRing::open(&instance_dir.join(INGRESS_RING))?.into_split();
         let (query, _qc) = MpscRing::open(&instance_dir.join(QUERY_RING))?.into_split();
         let egress_service = BroadcastRing::open(&instance_dir.join(EGRESS_SERVICE))?.subscribe();
@@ -265,7 +276,7 @@ impl Engine {
             restart: Mutex::new(None),
             t0: Instant::now(),
             timeout_ns: cfg.request_timeout.as_nanos() as u64,
-            max_payload: cfg.max_payload,
+            max_payload,
             serving_gate: cfg.serving_gate,
         });
         Ok((

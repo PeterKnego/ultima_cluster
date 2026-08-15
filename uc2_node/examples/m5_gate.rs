@@ -43,10 +43,11 @@
 //! `max(last resolved response, send-window end)`, i.e. it includes the tail
 //! drain AND cannot excise a dead tail where responses stopped arriving
 //! mid-window), p50/p90/p99/max (an hdrhistogram of `now - send_ns[slot]` per
-//! genuine first-arrival response), sends, responses, in-flight-at-end.
+//! genuine first-arrival response), sends, responses, lost, in-flight-at-end.
 //! **PASS iff `responses/s >= 400_000 && p50 <= 1.0 ms && in-flight-at-end ==
-//! 0`** (the run must have COMPLETED its work — see the pass computation for
-//! why zero, strictly); otherwise `RESULT: FAIL (honest)` + `exit(1)`.
+//! 0 && lost == 0`** (the run must have COMPLETED its work — see the pass
+//! computation for why zero, strictly); otherwise `RESULT: FAIL (honest)` +
+//! `exit(1)`.
 //!
 //! **`all`** boots 3 nodes + 3 services in-process (real file-backed shmem,
 //! just not real separate OS processes) under a tempdir guarded OFF `/tmp`
@@ -444,6 +445,12 @@ struct ClientStats {
     duplicates: u64,
     overwritten: u64,
     inflight_at_end: u64,
+    /// `Outcome::TimedOut | InstanceRestart` seen by the poll callback: the
+    /// engine's 30s deadline sweep converts a genuinely lost response into a
+    /// resolved `TimedOut` completion (or `InstanceRestart` on a node
+    /// restart), so `inflight_at_end == 0` alone no longer proves every send
+    /// got a real answer — see the PASS computation below.
+    lost: u64,
     /// Drain-inclusive: from the first send to the LAST resolved response.
     elapsed: Duration,
     p50_ms: f64,
@@ -506,11 +513,11 @@ fn run_client_measurement(
     // `owner` array is GONE — exactly-once resolution is the engine's job now.
     let send_ns: Arc<Box<[AtomicU64]>> =
         Arc::new((0..SLOTS).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice());
-    let sent = Arc::new(AtomicU64::new(0));
     let resolved = Arc::new(AtomicU64::new(0));
     let responses = Arc::new(AtomicU64::new(0));
     let not_leader = Arc::new(AtomicU64::new(0));
     let retried = Arc::new(AtomicU64::new(0));
+    let lost = Arc::new(AtomicU64::new(0));
     let last_response_ns = Arc::new(AtomicU64::new(0));
     let hist: Arc<Mutex<Histogram<u64>>> = Arc::new(Mutex::new(
         Histogram::new_with_bounds(1, HIST_MAX_NS, 3).expect("histogram"),
@@ -524,6 +531,7 @@ fn run_client_measurement(
         let responses = Arc::clone(&responses);
         let not_leader = Arc::clone(&not_leader);
         let retried = Arc::clone(&retried);
+        let lost = Arc::clone(&lost);
         let last_response_ns = Arc::clone(&last_response_ns);
         let hist = Arc::clone(&hist);
         let stop = Arc::clone(&stop);
@@ -543,7 +551,13 @@ fn run_client_measurement(
                         }
                         Outcome::NotLeader { .. } => { not_leader.fetch_add(1, Ordering::Relaxed); }
                         Outcome::Retry => { retried.fetch_add(1, Ordering::Relaxed); }
-                        Outcome::TimedOut | Outcome::InstanceRestart { .. } => {}
+                        // The engine's deadline sweep resolves a genuinely
+                        // lost response (or a node restart) into one of
+                        // these — count it so the PASS bar can't be fooled
+                        // by zero in-flight-at-end alone.
+                        Outcome::TimedOut | Outcome::InstanceRestart { .. } => {
+                            lost.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     resolved.fetch_add(1, Ordering::Relaxed);
                 });
@@ -570,10 +584,7 @@ fn run_client_measurement(
         let idx = (sent_idx as usize) & SLOT_MASK;
         send_ns[idx].store(t0.elapsed().as_nanos() as u64, Ordering::Release);
         match send.try_submit(sent_idx, &cmd_bytes) {
-            Ok(()) => {
-                sent_idx += 1;
-                sent.store(sent_idx, Ordering::Relaxed);
-            }
+            Ok(()) => sent_idx += 1,
             Err(SubmitError::Backpressure) => thread::yield_now(), // window OR ring full — engine's door
             Err(SubmitError::NotServing) => thread::sleep(Duration::from_millis(1)), // old serving-gate pause
             Err(e) => panic!("try_submit: {e}"),
@@ -615,15 +626,25 @@ fn run_client_measurement(
     };
 
     // PASS requires the run to have actually completed its work: zero
-    // in-flight at end (strict, no epsilon). A healthy run has DRAIN_GRACE
-    // (5 s) to resolve a tail of at most `inflight_cap` outstanding requests —
-    // at even 1% of the 400k/s bar that drains in ~milliseconds — so anything
-    // left means responses stopped arriving (service stalled) or were lost
-    // (broadcast overwrite): either way the throughput/latency numbers above
-    // describe a run that did not finish, and must not print PASS.
+    // in-flight at end (strict, no epsilon) AND zero lost responses. A
+    // healthy run has DRAIN_GRACE (5 s) to resolve a tail of at most
+    // `inflight_cap` outstanding requests — at even 1% of the 400k/s bar that
+    // drains in ~milliseconds — so anything left in-flight means responses
+    // stopped arriving (service stalled) or were lost (broadcast overwrite).
+    // But `inflight_at_end == 0` is NOT sufficient on its own: the engine's
+    // 30s deadline sweep, running throughout the whole timed window (not
+    // just DRAIN_GRACE), resolves a response that never arrived into
+    // `Outcome::TimedOut` (or `InstanceRestart` on a node restart) — a real
+    // completion that vacates the slot table, so `inflight()` reads 0 even
+    // though the request never got a genuine answer. Without counting those,
+    // a long run that silently loses responses throughout — never building
+    // up in-flight backlog because the sweep keeps draining the slot table —
+    // could read zero in-flight and print PASS despite real loss. `lost`
+    // (from the poll callback) closes that gap.
     let pass = responses_per_sec >= RESPONSES_PER_SEC_BAR
         && p50_ms <= P50_MS_BAR
-        && inflight_at_end == 0;
+        && inflight_at_end == 0
+        && lost.load(Ordering::Relaxed) == 0;
 
     let engine_stats = send.stats();
 
@@ -635,6 +656,7 @@ fn run_client_measurement(
         duplicates: engine_stats.duplicates,
         overwritten: engine_stats.overwritten,
         inflight_at_end,
+        lost: lost.load(Ordering::Relaxed),
         elapsed,
         p50_ms,
         p90_ms,
@@ -655,6 +677,7 @@ fn print_report(s: &ClientStats) {
     println!("dup responses dropped : {}", s.duplicates);
     println!("broadcast overwritten : {}", s.overwritten);
     println!("in-flight at end      : {}", s.inflight_at_end);
+    println!("lost (timeout/restart): {}", s.lost);
     println!("elapsed (drain-incl.) : {:.3} s", s.elapsed.as_secs_f64());
     println!("responses/s           : {:.0}", s.responses_per_sec);
     println!("p50                   : {:.3} ms", s.p50_ms);
@@ -663,7 +686,7 @@ fn print_report(s: &ClientStats) {
     println!("max                   : {:.3} ms", s.max_ms);
     println!(
         "bar                   : responses/s >= {RESPONSES_PER_SEC_BAR:.0} && p50 <= {P50_MS_BAR:.1} ms \
-         && in-flight at end == 0"
+         && in-flight at end == 0 && lost == 0"
     );
     println!("============================================================================");
     if s.pass {

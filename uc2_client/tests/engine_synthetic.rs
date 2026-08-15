@@ -135,6 +135,21 @@ fn payload_too_large_fails_loud_at_the_door() {
     assert_eq!(s.inflight(), 0, "refused submit must not hold a slot");
 }
 
+#[test]
+fn max_payload_defaults_to_the_attached_nodes_cnc_bound() {
+    // cfg().max_payload is None (inherit); the synthetic cnc's max_payload is
+    // 256 (see `meta`) — a 300-byte submit must fail loud at attach-derived
+    // bound, not be silently accepted (and later dropped by a real node).
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "eng-inherit", 1 << 20, 1 << 20);
+    let (s, _p) = Engine::attach(dir.path(), "eng-inherit", cfg()).unwrap();
+    match s.try_submit(1, &[0u8; 300]) {
+        Err(SubmitError::PayloadTooLarge { len: 300, max: 256 }) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(s.inflight(), 0, "refused submit must not hold a slot");
+}
+
 // Consistency is exercised indirectly here — try_query isn't hit by the
 // backpressure/gate/payload scenarios above, so touch it once to keep the
 // public surface honest against dead-code drift.
@@ -170,6 +185,14 @@ fn drain(poll: &mut uc2_client::PollHalf) -> Vec<(u64, Option<u64>, String)> {
 /// Egress producer for injecting answers into a synthetic dir.
 fn egress(dir: &std::path::Path) -> uc_protocol::ring::BroadcastProducer {
     BroadcastRing::open(&dir.join("egress_service.broadcast")).unwrap().producer()
+}
+
+/// Same as `egress`, but for the NODE broadcast (`egress_node.broadcast`) —
+/// where the node itself publishes NOT_LEADER/RETRY redirects (as opposed to
+/// `egress_service.broadcast`, where the service publishes RESPONSE). See
+/// `not_leader_via_the_node_broadcast_is_drained`.
+fn egress_node(dir: &std::path::Path) -> uc_protocol::ring::BroadcastProducer {
+    BroadcastRing::open(&dir.join("egress_node.broadcast")).unwrap().producer()
 }
 
 #[test]
@@ -223,6 +246,32 @@ fn not_leader_and_retry_resolve_kind_agnostic_with_hint_decode() {
     s.try_submit(2, b"c").unwrap();                            // wire_seq 1
 
     let mut prod = egress(dir.path());
+    prod.write(MSG_V2_NOT_LEADER, 0, extra_client(s.client_id(), 0), &2u64.to_le_bytes()).unwrap();
+    prod.write(MSG_V2_RETRY, 0, extra_client(s.client_id(), 1), &[]).unwrap();
+
+    let got = drain(&mut p);
+    assert_eq!(got, vec![
+        (1, None, "notleader:Some(2)".to_string()),
+        (2, None, "retry".to_string()),
+    ]);
+}
+
+#[test]
+fn not_leader_via_the_node_broadcast_is_drained() {
+    // Same shape as `not_leader_and_retry_resolve_kind_agnostic_with_hint_decode`,
+    // but injected on `egress_node.broadcast` (where the real node publishes
+    // NOT_LEADER/RETRY redirects) instead of `egress_service.broadcast`
+    // (where the service publishes RESPONSE). `PollHalf::poll` is supposed to
+    // drain BOTH rings every cycle — this pins that a dropped
+    // `drain_ring(egress_node)` call would silently pass the rest of the
+    // suite (every other test injects on the service ring only).
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    make_instance(dir.path(), "eng-nl-node", 1 << 20, 1 << 20);
+    let (s, mut p) = Engine::attach(dir.path(), "eng-nl-node", cfg()).unwrap();
+    s.try_query(1, b"q", Consistency::Linearizable).unwrap(); // wire_seq 0
+    s.try_submit(2, b"c").unwrap();                            // wire_seq 1
+
+    let mut prod = egress_node(dir.path());
     prod.write(MSG_V2_NOT_LEADER, 0, extra_client(s.client_id(), 0), &2u64.to_le_bytes()).unwrap();
     prod.write(MSG_V2_RETRY, 0, extra_client(s.client_id(), 1), &[]).unwrap();
 
