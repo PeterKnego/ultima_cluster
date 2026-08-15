@@ -28,21 +28,16 @@
 //! the apply side. Both park forever once started — the harness owns their
 //! lifecycle.
 //!
-//! **`client`** is the measuring role. It deliberately bypasses `uc2_client`'s
-//! per-op channel machinery (plan decision #6): it opens the SAME cnc page +
-//! `ingress.ring` + both egress broadcasts a real client would, but stamps its
-//! own `local_seq` and correlates responses through a preallocated
-//! `Box<[AtomicU64]>` slot array (`send_ns`, indexed `local_seq &
-//! (SLOTS-1)`) instead of a per-request channel — the pipelined correlation
-//! table the plan calls for, with no per-op wakeup cost. A second same-shaped
-//! array (`owner`) makes each slot's resolution exactly-once (see the
-//! `poll_egress`/duplicate-response doc below) — this is the ONE addition
-//! beyond a bare `send_ns` array, needed because Task 14b's service-restart
-//! catch-up replay can legitimately re-publish a response for an
-//! already-resolved `(client_id, local_seq)`. The sender also gates on the
-//! cnc `CAN_SERVE` flag (pause, don't send, while the attached node is not a
-//! serving leader) — see the send-loop comment for the redirect-flood failure
-//! mode this prevents.
+//! **`client`** is the measuring role. It runs on the PUBLIC `uc2_client`
+//! `Engine` (`Engine::attach` -> `SendHalf`/`PollHalf`) — the measured path
+//! IS the shipped path. A sender thread calls `try_submit` with `user_data`
+//! set to its local send index and stamps a preallocated `Box<[AtomicU64]>`
+//! slot array (`send_ns`, indexed `user_data & (SLOTS-1)`) before each send;
+//! a poll thread drains `PollHalf::poll` and times each `Outcome::Response`
+//! against that slot. Exactly-once resolution, the duplicate-response guard,
+//! the serving-gate pause, and NOT_LEADER/RETRY bookkeeping are the engine's
+//! job now — the old hand-rolled `owner` array and `poll_egress` matcher are
+//! gone.
 //!
 //! Reported: responses/s (drain-inclusive clock — from the first send to
 //! `max(last resolved response, send-window end)`, i.e. it includes the tail
@@ -59,7 +54,7 @@
 //! leader, and runs the SAME client measurement core against it. This is
 //! **SMOKE ONLY**: one dev box shares its core count across 3 nodes' worth of
 //! polling agents (consensus/sender/receiver/archive ×3) + 3 services + the
-//! client + its matcher — nothing like the fleet's one-role-per-host budget.
+//! client + its poll thread — nothing like the fleet's one-role-per-host budget.
 //! The doc records its numbers as smoke, never as the gate.
 //!
 //! **Env caps** (sandbox safety, m1–m4 pattern): `UC2_M5_MAX_SECS`,
@@ -82,17 +77,11 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand};
 use hdrhistogram::Histogram;
 
+use uc2_client::{Engine, EngineConfig, Outcome, SubmitError};
 use uc2_consensus::election::NodeId;
-use uc2_log::cnc::CncPage;
 use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig};
 use uc2_service::{ServiceBuilder, ServiceConfig, StateMachine};
-use uc_protocol::ring::{BroadcastConsumer, BroadcastRing, MpscRing, RingError};
-use uc_protocol::v2::cnc::NODE_FLAG_CAN_SERVE;
-use uc_protocol::v2::ipc::{
-    MSG_V2_NOT_LEADER, MSG_V2_RESPONSE, MSG_V2_RETRY, MSG_V2_SUBMIT, client_from_extra,
-    extra_client,
-};
 
 // --------------------------------------------------------------- CLI shape
 
@@ -112,7 +101,7 @@ enum Role {
     Node(NodeArgs),
     /// State-machine service, attached to a running node.
     Service(ServiceArgs),
-    /// The measuring client (bypasses uc2_client — see module docs).
+    /// The measuring client (runs on the public uc2_client Engine — see module docs).
     Client(ClientArgs),
     /// Local smoke: 3 nodes + 3 services + 1 client, all in-process. NOT the gate.
     All(AllArgs),
@@ -428,19 +417,9 @@ fn run_service(a: ServiceArgs) -> anyhow::Result<()> {
 
 // ----------------------------------------------------------- client role
 
-/// Well-known file names under the instance dir — the shared contract with
-/// `uc2_node::InstanceDir` (see `uc2_node/src/ipc.rs`) and `uc2_client`'s own
-/// private constants. Hardcoded here (rather than via `InstanceDir`, which
-/// requires the exclusive-flock `acquire()` only the owning node may take)
-/// because this is an ATTACHING party, exactly like `uc2_client`.
-const CNC_FILE: &str = "cnc2.dat";
-const INGRESS_RING: &str = "ingress.ring";
-const EGRESS_SERVICE: &str = "egress_service.broadcast";
-const EGRESS_NODE: &str = "egress_node.broadcast";
-
-/// Slot-array size for the `send_ns`/`owner` correlation tables. Vastly larger
-/// than any realistic in-flight window `W`, so a slot is never reused while
-/// its previous occupant is still outstanding.
+/// Slot-array size for the `send_ns` correlation table. Vastly larger than
+/// any realistic in-flight window `W`, so a slot is never reused while its
+/// previous occupant is still outstanding.
 const SLOTS: usize = 1 << 20;
 const SLOT_MASK: usize = SLOTS - 1;
 /// Histogram ceiling: 60 s. Any latency this bad already fails the gate by a
@@ -475,123 +454,13 @@ struct ClientStats {
     pass: bool,
 }
 
-/// Everything the matcher thread needs, bundled so `poll_egress` doesn't carry
-/// a dozen positional parameters.
-struct MatcherCtx {
-    send_ns: Arc<Box<[AtomicU64]>>,
-    owner: Arc<Box<[AtomicU64]>>,
-    resolved: Arc<AtomicU64>,
-    responses: Arc<AtomicU64>,
-    not_leader: Arc<AtomicU64>,
-    retried: Arc<AtomicU64>,
-    duplicates: Arc<AtomicU64>,
-    overwritten: Arc<AtomicU64>,
-    last_response_ns: Arc<AtomicU64>,
-    hist: Arc<Mutex<Histogram<u64>>>,
-    client_id: u32,
-    t0: Instant,
-}
-
-/// Wait for the attached instance_dir's node to report `NODE_FLAG_CAN_SERVE`
-/// (i.e. it's the serving leader). Same-host shmem means a client can only
-/// ever reach the node it's attached to — there is no cross-host redirect —
-/// so the fleet protocol arranges for the client's host to run the leader (or
-/// this simply waits out an in-progress election).
-fn await_serving(cnc: &CncPage, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE != 0 {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no serving leader at this instance_dir within {timeout:?} — \
-             is this host's node the elected leader?"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// One duty cycle of the matcher: drain a single record off `ring` (bounded to
-/// one `try_read`, matching every other agent's "bounded work per call"
-/// contract) and resolve it if it is addressed to this client.
-///
-/// **Duplicate-response tolerance (honest-notes, Task 14b):** a service that
-/// restarted mid-run replays the committed log from the top and legitimately
-/// RE-PUBLISHES historical responses under their ORIGINAL `(client_id,
-/// local_seq)` — a client waiting across that reconstruction is exactly what
-/// that at-least-once contract is for. `owner[idx]` holds `local_seq + 1`
-/// while a send is outstanding and is cleared to `0` by whichever delivery
-/// resolves it FIRST (a `compare_exchange`, so only one delivery ever wins);
-/// any later delivery for the same `local_seq` finds a mismatched (already-
-/// cleared, or reused-by-a-newer-send) owner and is dropped, counted in
-/// `duplicates`, never double-timed or double-counted toward throughput.
-fn poll_egress(ring: &mut BroadcastConsumer, ctx: &MatcherCtx, buf: &mut Vec<u8>) -> bool {
-    // `buf` is owned by the matcher loop and reused across records (try_read
-    // clears/overwrites it) — no per-record allocation on the drain path.
-    match ring.try_read(buf) {
-        Ok(Some(rec)) => {
-            let (cid, local_seq) = client_from_extra(rec.header_extra);
-            if cid != ctx.client_id {
-                return true; // addressed to another client; every client sees every record
-            }
-            let idx = (local_seq as usize) & SLOT_MASK;
-            let expected = local_seq as u64 + 1;
-            // Exactly-once resolution for this slot (see the duplicate-response
-            // doc above): only the delivery that wins the CAS counts.
-            let claimed = ctx.owner[idx]
-                .compare_exchange(expected, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok();
-            match rec.msg_type {
-                MSG_V2_RESPONSE if claimed => {
-                    let now = ctx.t0.elapsed().as_nanos() as u64;
-                    let send = ctx.send_ns[idx].load(Ordering::Acquire);
-                    let lat = now.saturating_sub(send).min(HIST_MAX_NS);
-                    let _ = ctx.hist.lock().unwrap().record(lat);
-                    ctx.responses.fetch_add(1, Ordering::Relaxed);
-                    ctx.resolved.fetch_add(1, Ordering::Relaxed);
-                    ctx.last_response_ns.fetch_max(now, Ordering::Relaxed);
-                }
-                MSG_V2_RESPONSE => {
-                    ctx.duplicates.fetch_add(1, Ordering::Relaxed);
-                }
-                MSG_V2_NOT_LEADER if claimed => {
-                    ctx.not_leader.fetch_add(1, Ordering::Relaxed);
-                    ctx.resolved.fetch_add(1, Ordering::Relaxed);
-                }
-                MSG_V2_RETRY if claimed => {
-                    ctx.retried.fetch_add(1, Ordering::Relaxed);
-                    ctx.resolved.fetch_add(1, Ordering::Relaxed);
-                }
-                // Either a stale NOT_LEADER/RETRY for an already-resolved slot
-                // (not counted as a duplicate — only MSG_V2_RESPONSE dedup is
-                // tracked; a redundant NOT_LEADER/RETRY carries no side effect
-                // to guard against), or not a client-facing msg_type at all.
-                _ => {}
-            }
-            true
-        }
-        Ok(None) => false,
-        Err(RingError::Overwritten) => {
-            // This client's own broadcast reader fell behind; any records it
-            // missed are unrecoverable. Counted, not fatal — the sender's
-            // inflight window still bounds forward progress by wall-clock
-            // deadline, and the drain grace simply times out on anything
-            // stuck this way (reported as `inflight_at_end`).
-            ctx.overwritten.fetch_add(1, Ordering::Relaxed);
-            true
-        }
-        // A corrupt/bad-crc record on the shared broadcast: drop and keep
-        // the agent alive (mirrors the node's/uc2_client's own defensive
-        // posture).
-        Err(_) => true,
-    }
-}
-
 /// The measuring client's core loop, shared by the standalone `client` role
 /// and the in-process `all` smoke (both attach through the SAME real
 /// file-backed shmem code path — `all` just happens to run in the same OS
-/// process as the node/service it targets).
+/// process as the node/service it targets). Attaches through the PUBLIC
+/// `uc2_client::Engine` — the measured path IS the shipped path: the engine
+/// owns the slot table's exactly-once resolution, the duplicate-response
+/// guard, the serving-gate pause, and NOT_LEADER/RETRY bookkeeping.
 fn run_client_measurement(
     instance_dir: &Path,
     app_id: &str,
@@ -599,173 +468,125 @@ fn run_client_measurement(
     payload_len: usize,
     inflight_cap: u64,
 ) -> ClientStats {
-    let cnc = CncPage::open_file(&instance_dir.join(CNC_FILE), app_id)
-        .unwrap_or_else(|e| panic!("cnc attach {instance_dir:?}: {e}"));
-    let client_id = cnc.status().next_client_id.fetch_add(1) as u32;
+    let (send, mut poll) = Engine::attach(
+        instance_dir,
+        app_id,
+        EngineConfig {
+            max_inflight: inflight_cap as u32,
+            request_timeout: Duration::from_secs(30), // never the limiter in a healthy run
+            max_payload: Some(NODE_MAX_PAYLOAD),
+            serving_gate: true, // the engine now owns the redirect-flood defense
+            ..EngineConfig::default()
+        },
+    )
+    .unwrap_or_else(|e| panic!("engine attach {instance_dir:?}: {e}"));
 
-    await_serving(&cnc, LEADER_WAIT);
+    // Serving wait: replaces await_serving(&cnc, ..) — the engine exposes the
+    // same cnc flag; the client role no longer opens the cnc page itself.
+    let serve_deadline = Instant::now() + LEADER_WAIT;
+    while !send.can_serve() {
+        assert!(
+            Instant::now() < serve_deadline,
+            "no serving leader at this instance_dir within {LEADER_WAIT:?} — \
+             is this host's node the elected leader?"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 
-    let (ingress_producer, _ingress_consumer) =
-        MpscRing::open(&instance_dir.join(INGRESS_RING))
-            .unwrap_or_else(|e| panic!("open ingress.ring: {e}"))
-            .into_split();
-    let mut egress_service = BroadcastRing::open(&instance_dir.join(EGRESS_SERVICE))
-        .unwrap_or_else(|e| panic!("open egress_service.broadcast: {e}"))
-        .subscribe();
-    let mut egress_node = BroadcastRing::open(&instance_dir.join(EGRESS_NODE))
-        .unwrap_or_else(|e| panic!("open egress_node.broadcast: {e}"))
-        .subscribe();
-
-    // One fixed, opaque command payload, bincode-encoded ONCE and reused
-    // verbatim for every send: `apply` never inspects the bytes (CountSm just
-    // counts arrivals) and each request is uniquely identified by
-    // `(client_id, local_seq)` in `header_extra`, not by payload content. This
-    // keeps the hot send loop free of any per-iteration encode cost.
+    // One fixed payload, bincode-encoded ONCE and reused verbatim (unchanged
+    // rationale: apply never inspects the bytes; identity lives in
+    // header_extra). The engine's max_payload door replaces the old manual
+    // NODE_MAX_PAYLOAD assert — try_submit fails loud instead.
     let raw_payload = vec![0xABu8; payload_len];
     let cmd_bytes = bincode::serde::encode_to_vec(&raw_payload, bincode::config::standard())
         .expect("encode fixed payload");
-    // Fail loud rather than silently: a `cmd_bytes` over the node's
-    // `NODE_MAX_PAYLOAD` is not rejected by the ring — the node's appender
-    // treats it as `AppendError::PayloadTooLarge` and DROPS the record with no
-    // response ever published, which would otherwise show up as a confusing
-    // "no responses, everything times out" hang rather than a clear error.
-    assert!(
-        cmd_bytes.len() <= NODE_MAX_PAYLOAD,
-        "--payload {payload_len} encodes to {} bytes > this gate's node max_payload \
-         ({NODE_MAX_PAYLOAD} B, MTU-bounded) — the node would silently drop every record",
-        cmd_bytes.len()
-    );
 
+    // Timing slots: user_data = send index; SLOTS (1<<20) >> any window, so a
+    // slot is never restamped while its request is outstanding. The old
+    // `owner` array is GONE — exactly-once resolution is the engine's job now.
     let send_ns: Arc<Box<[AtomicU64]>> =
         Arc::new((0..SLOTS).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice());
-    let owner: Arc<Box<[AtomicU64]>> =
-        Arc::new((0..SLOTS).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into_boxed_slice());
-
     let sent = Arc::new(AtomicU64::new(0));
+    let resolved = Arc::new(AtomicU64::new(0));
+    let responses = Arc::new(AtomicU64::new(0));
+    let not_leader = Arc::new(AtomicU64::new(0));
+    let retried = Arc::new(AtomicU64::new(0));
+    let last_response_ns = Arc::new(AtomicU64::new(0));
+    let hist: Arc<Mutex<Histogram<u64>>> = Arc::new(Mutex::new(
+        Histogram::new_with_bounds(1, HIST_MAX_NS, 3).expect("histogram"),
+    ));
     let stop = Arc::new(AtomicBool::new(false));
+    let t0 = Instant::now();
 
-    let ctx = MatcherCtx {
-        send_ns: Arc::clone(&send_ns),
-        owner: Arc::clone(&owner),
-        resolved: Arc::new(AtomicU64::new(0)),
-        responses: Arc::new(AtomicU64::new(0)),
-        not_leader: Arc::new(AtomicU64::new(0)),
-        retried: Arc::new(AtomicU64::new(0)),
-        duplicates: Arc::new(AtomicU64::new(0)),
-        overwritten: Arc::new(AtomicU64::new(0)),
-        last_response_ns: Arc::new(AtomicU64::new(0)),
-        hist: Arc::new(Mutex::new(
-            Histogram::new_with_bounds(1, HIST_MAX_NS, 3).expect("histogram"),
-        )),
-        client_id,
-        t0: Instant::now(),
-    };
-    let t0 = ctx.t0;
-    let resolved = Arc::clone(&ctx.resolved);
-    let responses = Arc::clone(&ctx.responses);
-    let not_leader = Arc::clone(&ctx.not_leader);
-    let retried = Arc::clone(&ctx.retried);
-    let duplicates = Arc::clone(&ctx.duplicates);
-    let overwritten = Arc::clone(&ctx.overwritten);
-    let last_response_ns = Arc::clone(&ctx.last_response_ns);
-    let hist = Arc::clone(&ctx.hist);
-
-    let matcher = {
+    let matcher = thread::Builder::new().name("m5-gate-poll".into()).spawn({
+        let send_ns = Arc::clone(&send_ns);
+        let resolved = Arc::clone(&resolved);
+        let responses = Arc::clone(&responses);
+        let not_leader = Arc::clone(&not_leader);
+        let retried = Arc::clone(&retried);
+        let last_response_ns = Arc::clone(&last_response_ns);
+        let hist = Arc::clone(&hist);
         let stop = Arc::clone(&stop);
-        thread::Builder::new()
-            .name("m5-gate-matcher".into())
-            .spawn(move || {
-                let ctx = ctx;
-                // One reusable payload buffer for the whole drain (try_read
-                // clears it per record) — no per-record allocation.
-                let mut buf = Vec::new();
-                loop {
-                    let mut did = false;
-                    did |= poll_egress(&mut egress_service, &ctx, &mut buf);
-                    did |= poll_egress(&mut egress_node, &ctx, &mut buf);
-                    if !did {
-                        if stop.load(Ordering::Relaxed) {
-                            break;
+        move || {
+            while !stop.load(Ordering::Relaxed) {
+                let n = poll.poll(|c| {
+                    match c.outcome {
+                        Outcome::Response(_) => {
+                            let idx = (c.user_data as usize) & SLOT_MASK;
+                            let now = t0.elapsed().as_nanos() as u64;
+                            let lat = now
+                                .saturating_sub(send_ns[idx].load(Ordering::Acquire))
+                                .min(HIST_MAX_NS);
+                            let _ = hist.lock().unwrap().record(lat);
+                            responses.fetch_add(1, Ordering::Relaxed);
+                            last_response_ns.fetch_max(now, Ordering::Relaxed);
                         }
-                        thread::sleep(Duration::from_micros(20));
+                        Outcome::NotLeader { .. } => { not_leader.fetch_add(1, Ordering::Relaxed); }
+                        Outcome::Retry => { retried.fetch_add(1, Ordering::Relaxed); }
+                        Outcome::TimedOut | Outcome::InstanceRestart { .. } => {}
                     }
-                }
-            })
-            .expect("spawn matcher thread")
-    };
+                    resolved.fetch_add(1, Ordering::Relaxed);
+                });
+                if n == 0 { std::hint::spin_loop(); } // dedicated-core caller: BusySpin is legitimate here
+            }
+        }
+    }).expect("spawn poll thread");
 
-    // Sender loop (this thread): the measured send side. Inflight window `W`
-    // caps outstanding requests (`sent - resolved`); admission itself is the
-    // node's ring-door window — `RingError::Full` on `try_write` just means
-    // yield+retry, exactly like the real `uc2_client`.
-    //
-    // Serving gate: pause (don't send) while the attached node is not a
-    // serving leader. Without this, a mid-run leadership flip degenerates into
-    // a NOT_LEADER feedback flood — every redirect resolves its slot
-    // instantly, reopening the inflight window, so the sender free-runs at
-    // ring speed producing tens of millions of junk redirects that starve the
-    // very consensus agents trying to re-elect (observed on the core-starved
-    // sandbox). A real client backs off on NOT_LEADER too; pausing keeps the
-    // measurement honest — a leadership stall shows up as missing throughput,
-    // not as manufactured redirect load that measures nothing.
-    let mut local_seq: u32 = 0;
+    // Sender loop (this thread): user_data = send index; stamp send_ns
+    // BEFORE try_submit (a response cannot arrive before the request is
+    // visible). Restamping the same idx on a Backpressure retry is fine —
+    // the request was never accepted.
+    let mut sent_idx: u64 = 0;
     let deadline = t0 + Duration::from_secs(secs);
-    'send: while Instant::now() < deadline {
-        if cnc.status().flags.load_acquire() & NODE_FLAG_CAN_SERVE == 0 {
-            thread::sleep(Duration::from_millis(1));
-            continue;
-        }
-        while sent.load(Ordering::Relaxed).wrapping_sub(resolved.load(Ordering::Relaxed))
-            >= inflight_cap
-        {
-            // The window never opened before the deadline: stop rather than
-            // force a send that would exceed `inflight_cap`.
-            if Instant::now() >= deadline {
-                break 'send;
-            }
-            thread::yield_now();
-        }
-        let idx = (local_seq as usize) & SLOT_MASK;
-        // Stamp BEFORE the ring write: the response cannot arrive before the
-        // request is visible to the node, so this ordering is race-free.
+    while Instant::now() < deadline {
+        let idx = (sent_idx as usize) & SLOT_MASK;
         send_ns[idx].store(t0.elapsed().as_nanos() as u64, Ordering::Release);
-        owner[idx].store(local_seq as u64 + 1, Ordering::Release);
-        let extra = extra_client(client_id, local_seq);
-        loop {
-            match ingress_producer.try_write(MSG_V2_SUBMIT, 0, extra, &cmd_bytes) {
-                Ok(()) => break,
-                Err(RingError::Full) => thread::yield_now(),
-                Err(e) => panic!("ingress.ring write error: {e}"),
+        match send.try_submit(sent_idx, &cmd_bytes) {
+            Ok(()) => {
+                sent_idx += 1;
+                sent.store(sent_idx, Ordering::Relaxed);
             }
+            Err(SubmitError::Backpressure) => thread::yield_now(), // window OR ring full — engine's door
+            Err(SubmitError::NotServing) => thread::sleep(Duration::from_millis(1)), // old serving-gate pause
+            Err(e) => panic!("try_submit: {e}"),
         }
-        sent.fetch_add(1, Ordering::Relaxed);
-        // u32 wrap is unreachable in practice: even at 1 M sends/s a u32 lasts
-        // ~71 minutes and gate runs are tens of seconds; `wrapping_add` is
-        // belt-and-suspenders, not a supported regime (a wrap would reuse
-        // low SLOT_MASK indices, which the owner CAS would surface as
-        // duplicates/unresolved slots — loudly, not silently).
-        local_seq = local_seq.wrapping_add(1);
     }
-    // When the send loop exited, relative to t0 — the measurement window's
-    // floor for the drain-inclusive denominator below.
     let send_window_end_ns = t0.elapsed().as_nanos() as u64;
 
-    // Drain grace: give outstanding requests a bounded window to resolve
-    // before reporting whatever remains as in-flight.
+    // Drain grace: unchanged bound, resolution counted by the poll thread.
     let drain_deadline = Instant::now() + DRAIN_GRACE;
-    while resolved.load(Ordering::Relaxed) < sent.load(Ordering::Relaxed)
-        && Instant::now() < drain_deadline
-    {
+    while resolved.load(Ordering::Relaxed) < sent_idx && Instant::now() < drain_deadline {
         thread::sleep(Duration::from_millis(5));
     }
-
     stop.store(true, Ordering::Relaxed);
-    matcher.join().expect("matcher thread panicked");
+    matcher.join().expect("poll thread panicked");
 
-    let sends = sent.load(Ordering::Relaxed);
+    let sends = sent_idx;
     let resp = responses.load(Ordering::Relaxed);
-    let resolved_n = resolved.load(Ordering::Relaxed);
-    let inflight_at_end = sends.saturating_sub(resolved_n);
+    // The engine's own live count of claimed-but-unresolved slots — the
+    // authoritative "did the run actually finish" signal now that the old
+    // sends-minus-resolved bookkeeping lives inside the engine's slot table.
+    let inflight_at_end = send.inflight();
     // Drain-inclusive clock, floored at the send window's end:
     // `max(last_response, send_window_end)`. Taking last_response alone would
     // let a run whose responses STOP arriving mid-window (service permanently
@@ -796,13 +617,15 @@ fn run_client_measurement(
         && p50_ms <= P50_MS_BAR
         && inflight_at_end == 0;
 
+    let engine_stats = send.stats();
+
     ClientStats {
         sends,
         responses: resp,
         not_leader: not_leader.load(Ordering::Relaxed),
         retried: retried.load(Ordering::Relaxed),
-        duplicates: duplicates.load(Ordering::Relaxed),
-        overwritten: overwritten.load(Ordering::Relaxed),
+        duplicates: engine_stats.duplicates,
+        overwritten: engine_stats.overwritten,
         inflight_at_end,
         elapsed,
         p50_ms,

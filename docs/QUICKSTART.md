@@ -162,6 +162,35 @@ snapshot read -> 21
 Node 1 was never written to directly. It has the value because it applied the
 same commands, in the same order, from its own copy of the log.
 
+**Beyond one-shot CLI calls.** `counter-client` above uses `uc2_client::Client`
+— one blocking call per command, the simplest possible shape. A gateway
+process (REST, gRPC) juggling many outstanding requests wants
+`uc2_client::PipelinedClient` instead: `submit`/`query_*` hand a typed
+command/query to a driver thread and return immediately with a `Ticket`,
+which resolves later via a blocking `wait()` or as a `std::future::Future`
+you can `.await`:
+
+```rust
+use uc2_client::{PipelinedClient, PipelinedConfig};
+
+let client = PipelinedClient::connect(&instance_dir, "my-app", PipelinedConfig::default())?;
+
+// Fire off several requests without waiting on each one individually...
+let tickets: Vec<_> = (0..8).map(|n| client.submit::<Command, Applied>(&Command::Add(n))).collect::<Result<_, _>>()?;
+
+// ...then collect the results as they resolve.
+for ticket in tickets {
+    let applied: Applied = ticket.wait()?;
+    println!("-> {applied:?}");
+}
+```
+
+`Client` is now a thin shim over exactly this machinery (submit, then
+immediately `wait()`) — same correctness guarantees, different call shape.
+For a gateway chasing maximum single-process throughput (the shape the M5 gate
+measures), attach the lower-level `uc2_client::Engine` directly instead —
+see its module docs for the `try_submit`/`poll` API.
+
 ## 4. Things worth trying
 
 **Point a write at a follower.** It refuses, and tells you who the leader is:
