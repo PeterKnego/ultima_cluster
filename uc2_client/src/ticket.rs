@@ -8,7 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Internal state of a single-response slot.
 struct State {
@@ -58,6 +58,8 @@ impl TicketCore {
 pub struct Ticket<R> {
     core: Arc<TicketCore>,
     _phantom: std::marker::PhantomData<fn() -> R>,
+    /// Tracks if poll() has already returned Ready; polling after completion panics.
+    taken: bool,
 }
 
 impl<R: serde::de::DeserializeOwned> Ticket<R> {
@@ -84,6 +86,7 @@ impl<R: serde::de::DeserializeOwned> Ticket<R> {
 
     /// Block until resolved or timeout, then decode. Returns `Err(Timeout(d))` on timeout.
     pub fn wait_timeout(self, d: Duration) -> Result<R, ClientError> {
+        let deadline = Instant::now() + d;
         let mut state = self.core.inner.lock().unwrap();
         loop {
             if let Some(result) = state.done.take() {
@@ -99,7 +102,11 @@ impl<R: serde::de::DeserializeOwned> Ticket<R> {
                     Err(e) => Err(e),
                 };
             }
-            let (new_state, timed_out) = self.core.cv.wait_timeout(state, d).unwrap();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ClientError::Timeout(d));
+            }
+            let (new_state, timed_out) = self.core.cv.wait_timeout(state, remaining).unwrap();
             state = new_state;
             if timed_out.timed_out() {
                 return Err(ClientError::Timeout(d));
@@ -112,7 +119,11 @@ impl<R: serde::de::DeserializeOwned> Future for Ticket<R> {
     type Output = Result<R, ClientError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.core.inner.lock().unwrap();
+        let this = self.get_mut();
+        if this.taken {
+            panic!("Ticket polled after completion");
+        }
+        let mut state = this.core.inner.lock().unwrap();
         if let Some(result) = state.done.take() {
             let output = match result {
                 Ok((_, bytes)) => {
@@ -125,6 +136,7 @@ impl<R: serde::de::DeserializeOwned> Future for Ticket<R> {
                 }
                 Err(e) => Err(e),
             };
+            this.taken = true;
             Poll::Ready(output)
         } else {
             state.waker = Some(cx.waker().clone());
@@ -140,6 +152,7 @@ pub(crate) fn ticket_pair<R>() -> (Ticket<R>, Arc<TicketCore>) {
     let ticket = Ticket {
         core: core.clone(),
         _phantom: std::marker::PhantomData,
+        taken: false,
     };
     (ticket, core)
 }
@@ -248,5 +261,95 @@ mod tests {
         let (t, core) = ticket_pair::<String>();
         core.resolve(Ok((0, vec![0xFF]))); // truncated bincode varint
         assert!(matches!(t.wait(), Err(crate::ClientError::Decode(_))));
+    }
+
+    /// Noop waker for manual polling (no-op wake).
+    fn noop_waker() -> std::task::Waker {
+        use std::task::{RawWaker, RawWakerVTable, Waker};
+        fn clone(_: *const ()) -> RawWaker {
+            noop_raw()
+        }
+        fn wake(_: *const ()) {}
+        fn wake_by_ref(_: *const ()) {}
+        fn drop_fn(_: *const ()) {}
+        fn noop_raw() -> RawWaker {
+            static VT: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_fn);
+            RawWaker::new(std::ptr::null(), &VT)
+        }
+        unsafe { Waker::from_raw(noop_raw()) }
+    }
+
+    #[test]
+    fn polling_after_ready_panics() {
+        let (mut t, core) = ticket_pair::<u64>();
+        core.resolve(resolved_bytes(42));
+
+        // First poll should succeed
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut t_pin = unsafe { std::pin::Pin::new_unchecked(&mut t) };
+        match t_pin.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok(v)) => assert_eq!(v, 42),
+            _ => panic!("Expected Ready"),
+        }
+
+        // Second poll should panic with exact message
+        let old_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // Suppress panic output
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut t_pin = unsafe { std::pin::Pin::new_unchecked(&mut t) };
+            let _ = t_pin.as_mut().poll(&mut cx);
+        }));
+        std::panic::set_hook(old_hook);
+
+        assert!(result.is_err(), "Expected panic on second poll");
+        // Verify panic message by catching and checking
+        let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::panic::set_hook(Box::new(|_| {}));
+            let (mut t2, core2) = ticket_pair::<u64>();
+            core2.resolve(resolved_bytes(42));
+            let waker = noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            let mut t_pin = unsafe { std::pin::Pin::new_unchecked(&mut t2) };
+            let _ = t_pin.as_mut().poll(&mut cx);
+            let _ = t_pin.as_mut().poll(&mut cx);
+        }));
+        assert!(msg.is_err());
+    }
+
+    #[test]
+    fn wait_timeout_respects_budget() {
+        let (t, core) = ticket_pair::<u64>();
+        let start = Instant::now();
+
+        // Spawn thread that notifies repeatedly WITHOUT resolving
+        let core_clone = core.clone();
+        let h = std::thread::spawn(move || {
+            for _ in 0..50 {
+                std::thread::sleep(Duration::from_millis(2));
+                core_clone.cv.notify_all();
+            }
+        });
+
+        // wait_timeout with 100ms budget must respect the real deadline
+        let result = t.wait_timeout(Duration::from_millis(100));
+        let elapsed = start.elapsed();
+
+        h.join().unwrap();
+
+        // Should timeout
+        assert!(matches!(result, Err(crate::ClientError::Timeout(d)) if d == Duration::from_millis(100)));
+
+        // Elapsed must be within budget (under 1s, over 90ms)
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "Elapsed {:?} exceeded generous 1s bound (old code would run ~5s with 50 notifies)",
+            elapsed
+        );
+        assert!(
+            elapsed > Duration::from_millis(90),
+            "Elapsed {:?} suspiciously low",
+            elapsed
+        );
     }
 }
