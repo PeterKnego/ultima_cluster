@@ -64,7 +64,12 @@ pub struct Ticket<R> {
 }
 
 impl<R: serde::de::DeserializeOwned> Ticket<R> {
-    /// Block until resolved, then decode. Returns `Err(Timeout(d))` if timeout elapses.
+    /// Block until resolved, then decode. This call itself has no local
+    /// timeout — it blocks until the driver resolves the ticket. A
+    /// `ClientError::Timeout` CAN still arrive, but only because the
+    /// engine's own deadline sweep (`request_timeout`, configured at
+    /// attach/connect time) resolved the underlying request as
+    /// `Outcome::TimedOut`; `wait()` never imposes one on its own.
     pub fn wait(self) -> Result<R, ClientError> {
         let mut state = self.core.inner.lock().unwrap();
         loop {

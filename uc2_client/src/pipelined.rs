@@ -336,6 +336,19 @@ impl Drop for DriverGuard {
         // Key Mechanics #1's third reclaim path: everything still inflight
         // at this point never got (and now never will get) a real
         // completion, so it fails with ShutDown instead of hanging forever.
+        //
+        // Ordering guarantee this drain relies on: the engine's slot-table
+        // completion protocol (engine.rs's single-CAS `resolve`/`release`)
+        // fires a callback for a given `user_data` only AFTER that slot's
+        // CAS has already moved to FREE — the callback body runs and THEN
+        // the caller's bookkeeping observes the free slot, never the other
+        // way around. So if this `Drop` runs mid-unwind out of a panicking
+        // callback, the slot that callback was resolving is necessarily
+        // still occupied (its CAS hasn't happened yet), and `drain_abort`
+        // — which only visits still-owned (non-FREE) slots — cannot also
+        // visit it: there is no interleaving where both the panicking
+        // callback's `Arc::from_raw` and this drain's `Arc::from_raw` run
+        // for the same `user_data` (double-free / use-after-free).
         self.0.drain_abort(|ud| {
             // SAFETY: same contract as `resolve` in `spawn_driver` — `ud` is
             // a raw Arc<TicketCore> leaked by `dispatch` for a request that

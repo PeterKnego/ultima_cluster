@@ -1802,6 +1802,15 @@ fn run_client_measurement(
             }
         }
     }).expect("spawn poll thread");
+    // AMENDED (Task-8 review): the SHIPPED code does NOT spin_loop() here —
+    // it sleeps 20us on empty cycles, matching the old hand-rolled matcher's
+    // idle strategy (parity with the ~1.64M resp/s fleet numbers). A
+    // busy-spinning poll thread steals a full core from the very
+    // consensus/apply agents being measured, and on the oversubscribed
+    // in-process `all` smoke box (3 nodes' agents + 3 services + this thread
+    // sharing a handful of cores) that starved the system under test. See
+    // `uc2_node/examples/m5_gate.rs`'s poll-thread comment for the shipped
+    // rationale.
 
     // Sender loop (this thread): user_data = send index; stamp send_ns
     // BEFORE try_submit (a response cannot arrive before the request is

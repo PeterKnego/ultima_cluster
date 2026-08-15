@@ -405,3 +405,34 @@ Acceptance (the release criterion):
   between gateway and state machine.
 - Cross-host redirect helpers (leader-hint-driven re-attach) — gateway
   policy, possibly a later cookbook example.
+
+## Errata (2026-08-15, post-implementation)
+
+Recorded after the final whole-branch review; the spec body above is left
+unmodified — these are the deltas between what shipped and what's written
+above.
+
+- **The driver is a hand-spawned `std::thread`, not `uc2_log::agent::AgentRunner`.**
+  `AgentRunner`'s duty-cycle contract forbids blocking, and its `Park` wait
+  strategy blocks for up to 1ms — incompatible with that contract. See
+  `pipelined.rs`'s module docs ("Threading (Key Mechanics #2)").
+- `SubmitError` gained an `InstanceRestart { attached: u128, current: u128 }`
+  variant (the node's instance restarted while the request was outstanding
+  or at the door).
+- `Outcome::InstanceRestart` carries the same `{ attached: u128, current: u128 }`
+  pair, so a poll-side caller sees exactly what changed.
+- `EngineConfig` and `PipelinedConfig` both gained `serving_gate: bool`
+  (refuse submits/queries when `NODE_FLAG_CAN_SERVE` is clear instead of
+  free-running into a dead/non-leader node) — the `Client` shim pins it
+  `false`, matching the old `Client`'s free-running behavior.
+- `EngineConfig` gained `max_payload: Option<usize>`. `None` (the default)
+  now INHERITS the attached node's own bound (`cnc.meta().max_payload`) at
+  `Engine::attach` time rather than leaving the check to the ring's own
+  (much larger, ~64 KiB) `TooLarge` bound; `Some(n)` remains an explicit
+  override. This closes a gap where a submit under the ring's bound but over
+  the node's MTU-bounded bound was silently dropped by the node instead of
+  rejected at the door.
+- `SlotTable::release` joins the single-CAS completion protocol (an
+  unconditional store there could race a concurrent sweep/drain_abort into a
+  double-decremented window or an erased re-claimed slot) — see
+  `slots.rs`'s `release` doc comment ("AMENDED, Task-2 review").
