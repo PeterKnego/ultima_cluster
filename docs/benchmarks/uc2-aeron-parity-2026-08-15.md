@@ -93,6 +93,115 @@ and record the fallback as a caveat row — the run proceeds either way. If
 both edges are cheap to run, both are recorded (the IPC-vs-UDP client-edge
 delta is itself a useful row).
 
-## Results
+## Results — UC v2 ≈ **1.6-1.8× Aeron Cluster's best sub-millisecond throughput** on identical 8-vCPU hardware; both Aeron modes knee at 800 k under the p50 ≤ 1 ms rule; shared mode wins its tails decisively
 
-*(to be filled by the run)*
+Run performed 2026-08-15 on one fleet (3 × c6id.2xlarge, cluster placement
+group). **Client edge: `aeron:ipc` as pre-registered** — the IPC smoke
+validated cleanly on Aeron 1.51 with the node0-only ingress render (task13
+§11's crash class is config-shape, now definitively dead). Fleet destroyed
+immediately after; `terraform state list` verified EMPTY. Raw artifacts
+(`.hdr`, aggregator `.hgrm` reports, rig consoles, UC consoles) in
+`bench-out/aeron-parity-2026-08-15/` (local).
+
+### Scorecard (each system's best point under its reading rule)
+
+| system | best sub-ms point | responses/s | p50 | p99 |
+|---|---|---|---|---|
+| **UC v2** (public Engine client, shmem) | 256 KiB / W=1024 | **1,282,493 – 1,433,230** (4 bracketing anchors) | 0.648–0.776 ms | 0.878–1.075 ms |
+| **Aeron Cluster, SHARED driver** (IPC client) | 800 k rate / batch 64 | **800,000** (offered==achieved) | **0.360 ms** | 1.031 ms |
+| **Aeron Cluster, DEDICATED driver** (IPC client) | 800 k rate / batch 64 | 800,000 | 0.394 ms | **38.1 ms** |
+
+**Ratio: UC/Aeron ≈ 1.60–1.79×** on max sub-millisecond throughput
+(UC bracket ÷ 800 k). The complementary truth, stated plainly: **at Aeron's
+operating point its p50 is ~1.9× lower than UC's at UC's** (0.36 vs
+0.65-0.78 ms) — Aeron buys lower median latency at its rate ceiling; UC
+sustains ~1.6-1.8× the rate inside the same 1 ms budget with comparable
+p99. The v1-era gap (Aeron 800 k vs UC-v1 56 k = 14×) is closed and
+inverted by v2.
+
+Notable: Aeron-shared's 800 k @ 0.36 ms on EIGHT vCPUs essentially
+reproduces the v1-era ≥800 k @ 0.38 ms measured on SIXTEEN (c6id.4xlarge,
+dedicated mode) — Aeron's ceiling here is not core-starved; it is the
+system's shape at this payload/replication/durability point.
+
+### Aeron grids (aggregator `.hgrm` percentiles, µs; UNSUSTAINED = `.FAIL` marker)
+
+SHARED (client edge IPC):
+
+| batch | rate | p50 | p90 | p99 | sustained |
+|---|---|---|---|---|---|
+| 64 | 200 k | 265 | 295 | — | ✓ |
+| 64 | 400 k | 338 | 400 | — | ✓ |
+| 64 | 600 k | 354 | 420 | — | ✓ |
+| 64 | **800 k** | **360** | **432** | **1031** | ✓ |
+| 64 | 1.0-1.4 M | — | — | — | ✗ `.FAIL` |
+| 256 | 200 k | 614 | 730 | — | ✓ |
+| 256 | 400 k | 491 | 617 | — | ✓ |
+| 256 | 600 k | 509 | 727 | — | ✓ |
+| 256 | 800 k | 510 | 3586 | — | ✓ (strained p90) |
+| 256 | 1.0-1.4 M | — | — | — | ✗ `.FAIL` |
+
+DEDICATED (client edge IPC) — rig sustained every rate to 1.4 M, but the
+latency bar decides:
+
+| batch | rate | p50 | p90 | p99 | p50 ≤ 1 ms |
+|---|---|---|---|---|---|
+| 64 | 200 k | 351 | 3564 | — | ✓ |
+| 64 | 400 k | 323 | 1399 | — | ✓ |
+| 64 | 600 k | 350 | 1943 | — | ✓ |
+| 64 | 800 k | 394 | 2324 | 38076 | ✓ (p99 blown) |
+| 64 | 1.0 M | 1924 | 39125 | — | ✗ |
+| 64 | 1.2 M | 1712 | 3391 | — | ✗ |
+| 64 | 1.4 M | 2404 | 5853 | — | ✗ |
+| 256 | 400 k | 995 | 5489 | — | ✓ (marginal) |
+| 256 | 600 k | 721 | 3983 | — | ✓ |
+| 256 | 800 k | 1041 | 4461 | — | ✗ |
+| 256 | 1.0-1.4 M | 1705-2494 | 21185-144703 | — | ✗ |
+
+The dedicated-mode picture is the oversubscription tax made visible:
+3 dedicated driver threads + consensus + archive + service + rig on 8 vCPU
+keeps average throughput (rates "sustain") while scheduling jitter destroys
+the distribution (p90 up to 145 ms). **On this hardware class, shared mode
+is the right Aeron configuration** — same 800 k knee, clean tails — which
+is why both modes were pre-registered arms rather than a single guess.
+
+### UC anchors (same fleet, bracketing the Aeron sweeps)
+
+| when | point | responses/s | p50 | p99 |
+|---|---|---|---|---|
+| pre | 256/1024 | 1,304,138 | 0.755 ms | 1.075 ms |
+| pre | 128/1024 | 1,318,844 | 0.757 ms | 0.878 ms |
+| post | 256/1024 | 1,433,230 | 0.648 ms | 1.035 ms |
+| post | 128/1024 | 1,282,493 | 0.776 ms | 0.944 ms |
+
+All four anchors clean (`sends == responses`, zero redirects/lost/dups/
+overwrites/in-flight). The pre→post spread (~10%) shows same-fleet,
+same-day drift — the third fleet-variance datum today, and why the
+scorecard quotes UC as a bracket, not a point.
+
+### Run-integrity disclosures (what went wrong in the harness and how it was handled)
+
+- **First launch discarded**: the initial IPC smoke returned a false
+  negative (artifact check raced the cluster's election settle) and the
+  driver fell back to UDP per pre-registration; the partial UDP shared
+  sweep (4 rungs) was discarded when the smoke was re-validated
+  interactively and IPC confirmed working. Kept for the record in
+  `run1-aborted.log`; its two valid UDP rungs (200 k p50 316 µs, 400 k)
+  are consistent with the IPC rows.
+- **Rig console is not capturable over plain ssh** (the benchmarks
+  launcher's stdout behavior); rung validity was switched to
+  artifact-based (`.hdr` vs `.hdr.FAIL` — the rig's own honesty markers)
+  and percentiles come from the benchmarks' own `aggregate-results`
+  reports, not console scraping.
+- One driver parse bug (string-vs-numeric percentile match) meant
+  percentiles were recomputed locally from the pulled `.hgrm` files; the
+  measurement itself was never affected.
+
+### Standing caveats (from the pre-registered matrix, restated)
+
+Methodology (windowed-max vs rate-paced), durability granularity
+(per-block fdatasync vs archive sync.level=1), echo-vs-count service
+(~56 B/op egress asymmetry in UC's favor), JVM warmup excluded, each
+system's shipped threading posture. None of these plausibly bridge a
+1.6-1.8× gap, but they are the reason this doc says "scorecard", not
+"proof of superiority".
