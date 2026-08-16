@@ -260,6 +260,37 @@ message size undisclosed.
   wall is the consensus/log plane, not UDP transport — consistent with the
   hot-path anatomy that seeded UC v2's design.
 
+## Eventual-durability arm — PRE-REGISTERED 2026-08-16 (before its fleet run)
+
+Both scorecard arms above ran fsync-on. This addendum pre-registers the
+matched EVENTUAL arm — both systems acking on the buffered write, durability
+by replication — which isolates what fsync costs each system:
+
+- **UC**: `UC2_JOURNAL_DURABILITY=eventual` (merged main `0901daf`, opt-in,
+  default unchanged): the archive's durable counter advances post-buffered-
+  write; the journal fsyncs asynchronously; vote/term `StableValue` stays
+  fsync'd (election-time cold path — a Raft-safety property, not a
+  throughput cost; disclosed asymmetry: Aeron's consensus-module mark file
+  likewise keeps its own behavior).
+- **Aeron**: `aeron.archive.file.sync.level=0` + `catalog.file.sync.level=0`
+  (the template's `durability: none` arm) — its native buffered-write-ack
+  posture.
+- Grids: Aeron **SHARED / batch 64 only** (the fsync-on winner; dedicated
+  and batch-256 are already characterized), same rate grid 200 k-1.4 M.
+  UC anchors 256/1024 + 128/1024 bracketing, same protocol. Same reading
+  rule (sustained + p50 ≤ 1 ms), same invalidation rules, one fleet,
+  fsync-on UC anchor points ALSO re-run on the same fleet so the
+  fsync-on-vs-eventual delta for UC is same-hardware.
+- Loss-model note for the record: this posture (either system) can lose
+  acked writes on simultaneous quorum power loss and permits a power-lost
+  node to restart with a shorter log than it acked — the standard
+  replication-durability tradeoff. UC's gates and spec guarantees remain
+  stated for fsync-on; this arm is a measurement, not a posture change.
+
+### Eventual-arm results
+
+*(to be filled by the run)*
+
 ### Standing caveats (from the pre-registered matrix, restated)
 
 Methodology (windowed-max vs rate-paced), durability granularity
