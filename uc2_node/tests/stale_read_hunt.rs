@@ -95,16 +95,15 @@ fn stale_read_hunt() {
         while !w_stop.load(Ordering::Relaxed) {
             v += 1;
             let deadline = Instant::now() + Duration::from_secs(5);
-            match submit_cmd::<_, CmdResp>(&mut conn, &Cmd::Write(v), deadline) {
-                lincheck_v2::SubmitOutcome::Ok(_) => {
-                    w_acked.store(v, Ordering::SeqCst);
-                    acks += 1;
-                }
-                // Indeterminate: the write MAY have landed; the frontier must
-                // NOT advance (we only assert against known-acked writes) but
-                // v must not be reused either (register would go backwards
-                // legitimately). Skip to a fresh value.
-                _ => {}
+            // Indeterminate outcomes: the write MAY have landed; the frontier
+            // must NOT advance (we only assert against known-acked writes) but
+            // v must not be reused either (the register would go backwards
+            // legitimately). Skip to a fresh value.
+            if let lincheck_v2::SubmitOutcome::Ok(_) =
+                submit_cmd::<_, CmdResp>(&mut conn, &Cmd::Write(v), deadline)
+            {
+                w_acked.store(v, Ordering::SeqCst);
+                acks += 1;
             }
         }
         acks
@@ -164,7 +163,7 @@ fn stale_read_hunt() {
     while t0.elapsed() < budget && !violated.load(Ordering::SeqCst) {
         std::thread::sleep(kill_period);
         let victim = cluster.leader();
-        if kills % 2 == 0 {
+        if kills.is_multiple_of(2) {
             eprintln!(
                 "[nemesis t={:.1}s] kill_and_restart_leader (leader={victim:?})",
                 t0.elapsed().as_secs_f64()
