@@ -69,3 +69,43 @@ exists to not miss. Related caution: memory `elle-tooth-oracle-expiry`
 - **Three consecutive green nightlies** after the fixes land, then update
   memory `pre-existing-test-flakes` (close what's closed, keep what's
   honestly still open) and delete/annotate this brief's QUEUED status.
+
+---
+
+## Phase 0 RESULT (2026-08-16, session start) + Phase 1 pre-commitment
+
+Phase 0 reclassified the campaign. Complete table:
+
+| night | failure | class |
+|---|---|---|
+| Aug 9 | elle-crypto failover: **`false|incompatible-order`** (4,684 events) | **SAFETY SIGNAL** |
+| Aug 10 | elle-crypto failover: **`false|incompatible-order`** (13,630 events) | **SAFETY SIGNAL** |
+| Aug 9 | resize_3_to_5_to_3 + restart_of_removed_node_refuses_to_start (reconfig.rs:1192/1663) | liveness timeout |
+| Aug 12 | linearizable_under_failover_with_crypto @ mod.rs:618 = "no survivor leader within Ns" | liveness timeout (crypto arm) |
+| Aug 14 | sigkill_mid_config_window | liveness timeout |
+| Aug 15 | node_sigkill_recovery (apply.rs:385 panics = designed fail-stop, noise) | liveness timeout |
+| Aug 16 | resize_3_to_5_to_3 | liveness timeout |
+
+**Priority ruling: the elle-crypto `incompatible-order` outranks everything**
+— a serializability-violation verdict on unmutated histories, twice, and
+possibly the same underlying event as the OPEN acked-write-loss witness
+(memory `receiver-frontier-soak`, ~0.7%/run, open since 2026-08-03). The
+timeout family waits.
+
+Facts pinned: CI seed is the DEFAULT (0x1107 = 4359 printed) every night —
+nondeterminism is real-time scheduling, not seed; no golden repro exists.
+No CI artifacts were uploaded (histories lost); local reproduction
+required. CI apparent hit rate: 2 of ~8 nightly crypto runs ≈ 25%.
+
+**Phase 1 pre-commitment (elle-crypto failover repro):**
+- Exact CI shape: `UC2_CRYPTO=1 ELLE_TARGET_OPS=8000 ELLE_BUDGET_SECS=300
+  scripts/elle_check.sh failover`, release build, default seed, fresh
+  `ELLE_DIR` per attempt under `/home/claude/elle-hunt/` (real disk).
+- **n = 12 attempts, FIXED**, arm A = unconstrained (this box is 4-core,
+  same nominal shape as ubuntu-latest). P(0 hits | true rate 25%) ≈ 3%.
+- Decide: ≥1 `incompatible-order` (either model) → REPRODUCED; preserve
+  the full ELLE_DIR + elle-cli verbose JSON (both models) for that attempt
+  — the anomaly detail IS the analysis payload — and move to history
+  analysis. 0/12 → NOT reproduced at this rate; re-plan EXPLICITLY
+  (2-core taskset arm next); no silent extension.
+- Passing attempts' dirs are deleted; failing attempts kept whole.
