@@ -43,7 +43,7 @@ fn dump_cnc(dirs: &[PathBuf]) -> String {
     use uc2_log::cnc::CncPage;
     let mut out = String::new();
     for (i, d) in dirs.iter().enumerate() {
-        match CncPage::open_file(&d.join("cnc.dat"), "lincheck-v2") {
+        match CncPage::open_file(&d.join("cnc2.dat"), "lincheck-v2") {
             Ok(page) => {
                 let c = page.counters();
                 let s = page.service();
@@ -133,11 +133,13 @@ fn stale_read_hunt() {
                             r_stop.store(true, Ordering::SeqCst);
                             eprintln!(
                                 "\n=== STALE READ CAUGHT (reader {r}, t={:.3}s) ===\n\
+                                 answered by              : node{}\n\
                                  acked frontier at invoke : {frontier}\n\
                                  linearizable read got    : {got_v} (staleness {} writes)\n\
                                  read latency             : {:?}\n\
                                  cnc state at detection:\n{}",
                                 t0.elapsed().as_secs_f64(),
+                                conn.target(),
                                 frontier - got_v,
                                 invoke.elapsed(),
                                 dump_cnc(&r_dirs),
@@ -161,12 +163,16 @@ fn stale_read_hunt() {
     let mut kills = 0u32;
     while t0.elapsed() < budget && !violated.load(Ordering::SeqCst) {
         std::thread::sleep(kill_period);
+        let victim = cluster.leader();
         if kills % 2 == 0 {
-            eprintln!("[nemesis t={:.1}s] kill_and_restart_leader", t0.elapsed().as_secs_f64());
+            eprintln!(
+                "[nemesis t={:.1}s] kill_and_restart_leader (leader={victim:?})",
+                t0.elapsed().as_secs_f64()
+            );
             cluster.kill_and_restart_leader();
         } else {
             eprintln!(
-                "[nemesis t={:.1}s] crash_and_restart_leader_service",
+                "[nemesis t={:.1}s] crash_and_restart_leader_service (leader={victim:?})",
                 t0.elapsed().as_secs_f64()
             );
             cluster.crash_and_restart_leader_service();
@@ -180,6 +186,11 @@ fn stale_read_hunt() {
     eprintln!(
         "stale_read_hunt: budget={budget:?} kills={kills} acked_writes={acks} lin_reads={reads}"
     );
+    if violated.load(Ordering::SeqCst) {
+        // Preserve the instance dirs (journals, cnc pages) for post-mortem.
+        let kept = dir.keep();
+        eprintln!("evidence: instance dirs kept at {}", kept.display());
+    }
     assert!(
         !violated.load(Ordering::SeqCst),
         "linearizable read returned a value below the acked frontier (see dump above)"

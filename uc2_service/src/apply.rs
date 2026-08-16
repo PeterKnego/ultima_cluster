@@ -141,7 +141,27 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
     let c = st.cnc.counters();
     // Apply frontier = the lesser of quorum-commit and local durability. Both
     // acquire-loaded from the shared cnc page.
-    let target = c.commit.load_acquire().min(c.durable.load_acquire());
+    let durable = c.durable.load_acquire();
+    // Log-rewind tripwire (2026-08-16 acked-write-loss hunt): `durable` below
+    // our applied cursor means the node truncated/primed the log BENEATH state
+    // this SM already applied — our state is from a dead timeline. Silently
+    // idling here serves stale answers through the whole refill and then
+    // MERGES two timelines once the log regrows past the cursor (the elle
+    // `incompatible-order` divergence). In a healthy cluster this is
+    // unreachable (truncation never cuts below commit, and applied <= commit),
+    // so fail-stop loudly like the instance-mismatch contract; the supervisor
+    // respawns a fresh service that reconstructs from the (new-timeline)
+    // journal. Gated on a matching instance id so a node-restart's zeroed page
+    // stays `check_node_instance`'s case, not ours.
+    if durable < st.follower.cursor && st.cnc.try_instance_id() == Some(st.instance_id) {
+        panic!(
+            "uc2_service: log rewound beneath the applied frontier (durable {durable} < applied \
+             cursor {}) — this incarnation's state is from a truncated timeline. Fail-stop; the \
+             supervisor respawns the service to reconstruct from the journal.",
+            st.follower.cursor,
+        );
+    }
+    let target = c.commit.load_acquire().min(durable);
     let mut progressed = false;
     loop {
         // is_leader read inline (a direct field access, not a `&self` method)

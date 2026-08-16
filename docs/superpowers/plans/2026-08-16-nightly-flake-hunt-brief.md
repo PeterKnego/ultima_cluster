@@ -136,6 +136,59 @@ mmap-shared files at boot (cnc + all rings), fixed on main `4f544dd`
 on ~450 MB histories → empty verdict misread as FAIL; runner now uses
 6g and classifies empty verdicts INVALID.
 
+## ROOT CAUSE FOUND + FIX (2026-08-16)
+
+The safety signal, the acked-write-loss witness, and (likely) the whole
+liveness-timeout family are ONE bug. Chain, each step evidence-backed
+(rig runs 1-8 in /home/claude/stale-hunt/, evidence dir kept, trace):
+
+1. **Reconcile's common-prefix match was INDEX-aligned** while the leader
+   ships a WINDOWED map (`term_map_wire_tail`, last 64 entries). After a
+   cluster's 65th lifetime leadership term, `own[0]=(1,0)` never equals
+   `leader[0]`, so `reconcile` returned `NoCommonPrefix` against every
+   HEALTHY follower → wipe-and-rejoin (`Truncate{to:0}`). The old doc
+   claim "unreachable at <= MAX_TERM_MAP_WIRE_ENTRIES terms" was tested
+   only where window == full map. The Lean model erased exactly this
+   distinction (ProtocolData.lean decision 7: "full-map gossip
+   (simplification)") — bugs live in the distinctions a model erases.
+2. **Wipe loop**: a wiped follower refills from 0 via paced deep-NAK,
+   rebuilds old map entries from replayed frames, and the next gossip
+   re-wipes it (window still above its bridge): 179 full wipes in 42 s
+   (UC2_TRUNC_TRACE, run8), each discarding up to ~570 KB of bytes its
+   own cnc commit mirror showed committed.
+3. **Loss**: kills landing while a quorum is mid-wipe/refill elect among
+   amnesiacs (honest low durable credentials), rebasing the cluster below
+   commit; the rebooted full node adopts and truncates its committed tail
+   (evidence: term-103 data 603104..655392 present in all three buffers
+   as ghost frames; all journals+term maps rebased; terms 89-123 absent).
+   ~52 KB / 1,191 acked writes lost in run 1's capture; commit counter
+   (655328) never rewound, immortal via gossip.
+4. **Divergence server**: the service never observes the rewind
+   (`applied` monotone, `durable` primed under it) — it idles serving
+   OLD-timeline answers through the refill, then RESUMES applying
+   new-timeline bytes on top: merged-timeline SMs = elle
+   `incompatible-order` (serializable!) + `G-single-item-realtime`.
+
+**Fix shipped (this branch):** (a) reconcile aligns the leader's window
+INSIDE the follower's full map by (term,base) before prefix-matching —
+`NoCommonPrefix` is now the genuine purged-prefix signal only; a window
+starting inside our bytes at an unknown term cuts there instead of
+wiping. 3 directed regression tests. (b) service log-rewind tripwire:
+`durable < applied cursor` on a matching instance id = fail-stop (the
+stale-serving/timeline-merge window closes). Deferred hardening (follow
+up in the proofs arc): commit-floor anchoring of the wire window,
+election credential floor for wiped nodes, persisted commit watermark
+so truncation-below-commit stays visible across reboots.
+
+**Acceptance pre-commitment (FIXED before running):** rig
+`stale_read_hunt` n=8 x 300 s, crypto ON, kill 500 ms, UC2_TRUNC_TRACE=1.
+Decide: 0/8 violations AND zero RECONCILE-to-0 cuts on healthy followers
+→ CONFIRMED (vs pre-fix 6/6 + 1/1). Any violation → back to Phase 1, no
+goalpost moves. Then elle failover x3 (arm A shape): expect 3/3 PASS both
+models (pre-fix valid-attempt rate 3 FAIL / 1 PASS). Then the full local
+proof stack (workspace tests, clippy, lin_v2, lin_partition_v2, sim,
+conformance) before any push.
+
 **Directed-rig pre-commitment (stale-read root cause, 2026-08-16):**
 `uc2_node/tests/stale_read_hunt.rs` (ignored; hunt tool): 3-node crypto-ON
 cluster, 1 writer acking monotone register writes, 2 linearizable readers

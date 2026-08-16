@@ -1058,6 +1058,11 @@ pub struct WorkerConn {
 }
 
 impl WorkerConn {
+    /// The node index this connection currently targets (which node answered
+    /// the last successful op) — forensics for the stale-read hunt rig.
+    pub fn target(&self) -> usize {
+        self.target
+    }
     pub fn new(dirs: Arc<Vec<PathBuf>>, start: usize) -> Self {
         // Wrap the start index to handle callers with more workers than cluster nodes
         // (e.g., 4 workers on a 3-node cluster). This mirrors the invariant enforced

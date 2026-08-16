@@ -464,6 +464,9 @@ impl Node {
             .max(4096);
         let mut archive = Archive::open(archive_cfg).map_err(to_io)?;
         let durable = archive.recovered_position();
+        if std::env::var("UC2_TRUNC_TRACE").is_ok() {
+            eprintln!("[trunc-trace n{}] BOOT recovered_durable={durable}", cfg.id);
+        }
         // M6 Task 4: node-internal mirror of the archive's lowest replayable
         // position. Written by the archive agent (after a purge), read by the
         // consensus agent (the purge guard: never issue a purge that wouldn't
@@ -839,11 +842,23 @@ impl Node {
         let arc_collapse_slot = collapse_slot.clone();
         let arc_first_base = Arc::clone(&archive_first_base);
         let arc_prime_gen = Arc::clone(&prime_generation);
+        // Forensic trace for the 2026-08-16 acked-write-loss hunt: every journal
+        // cut is rare (elections only), so an env-gated line per cut is free.
+        let trunc_trace = std::env::var("UC2_TRUNC_TRACE").is_ok();
+        let trace_id = cfg.id;
         let archive_agent = AgentRunner::spawn("uc2-archive", IdleStrategy::Yield, move || {
             let mut did = false;
             while let Ok(cmd) = trunc_rx.try_recv() {
                 match cmd {
                     ArchiveCmd::Truncate { epoch, to } => {
+                        if trunc_trace {
+                            eprintln!(
+                                "[trunc-trace n{}] RECONCILE cut to={to} pre_durable={} cnc_commit={}",
+                                trace_id,
+                                archive.recovered_position(),
+                                arc_cnc.counters().commit.load_acquire(),
+                            );
+                        }
                         // First-block cuts (a contested first election, `to`
                         // at/inside block 0) are handled by the archive via
                         // `Journal::truncate_all` + prefix re-seed (M4 carry #3)
@@ -894,6 +909,14 @@ impl Node {
                         // fail-stopping. Ack the position ACTUALLY cut to, so the
                         // node opens its term at the real frontier.
                         let to = to.min(archive.recovered_position());
+                        if trunc_trace {
+                            eprintln!(
+                                "[trunc-trace n{}] COLLAPSE cut to={to} pre_durable={} cnc_commit={}",
+                                trace_id,
+                                archive.recovered_position(),
+                                arc_cnc.counters().commit.load_acquire(),
+                            );
+                        }
                         archive
                             .truncate_to(to)
                             .expect("archive leader-open collapse fail-stop (journal I/O)");

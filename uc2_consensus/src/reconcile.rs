@@ -76,10 +76,13 @@ pub enum Reconcile {
     /// Histories share a prefix. See [`Outcome`] for the surviving bound and the
     /// reconciled map.
     Ok(Outcome),
-    /// No common entry — the leader's shipped suffix begins beyond our history.
-    /// Incremental reconciliation is impossible; a snapshot install (M6) is the
-    /// answer. The sim/harness prove this is unreachable at `<=
-    /// MAX_TERM_MAP_WIRE_ENTRIES` terms.
+    /// No common entry — the leader's shipped window begins strictly beyond
+    /// our whole byte range (`leader[0].base > own_durable`). Incremental
+    /// reconciliation is impossible; a snapshot install (M6) is the answer.
+    /// Since the 2026-08-16 alignment fix this is the GENUINE purged-prefix
+    /// signal only: a window that merely slid past our map's FRONT (lifetime
+    /// terms > `MAX_TERM_MAP_WIRE_ENTRIES`) aligns inside our history and
+    /// reconciles normally.
     NoCommonPrefix,
 }
 
@@ -93,33 +96,75 @@ pub fn reconcile(own: &[(u32, u64)], own_durable: u64, leader: &[(u32, u64)]) ->
         return Reconcile::Ok(Outcome { valid_up_to: own_durable, new_map: own.to_vec() });
     }
 
-    // Longest common prefix (entries equal in both term and base).
+    // ALIGN the leader's shipped window inside our (full) map before prefix
+    // matching. The leader ships only the last `MAX_TERM_MAP_WIRE_ENTRIES`
+    // entries (`term_map_wire_tail`), so once a cluster's LIFETIME leadership
+    // count exceeds the window, `leader[0]` is not our entry 0 — it is some
+    // entry `j` in the middle of our map. The 2026-08-16 acked-write-loss
+    // hunt found the previous index-aligned match (`own[k] == leader[k]` from
+    // k = 0) declaring `NoCommonPrefix` against every HEALTHY follower the
+    // moment the window slid (own[0]=(1,0) vs leader[0]=(term_N, base_N)),
+    // wiping followers in a loop, starving elections of durable credentials,
+    // and ultimately truncating committed bytes cluster-wide. Terms are
+    // strictly ascending in both maps, so the alignment point is unique.
+    let j = match own.iter().position(|&e| e == leader[0]) {
+        Some(j) => j,
+        None => {
+            // The leader's window start is not in our history.
+            if !own.is_empty() && leader[0].1 > own_durable {
+                // Window begins beyond our whole byte range: it has slid past
+                // our history (the genuine purged-prefix case) — incremental
+                // repair is impossible.
+                return Reconcile::NoCommonPrefix;
+            }
+            if own.is_empty() {
+                // Fresh node: nothing of ours to invalidate; our map grows
+                // only when we actually stream data.
+                return Reconcile::Ok(Outcome { valid_up_to: own_durable, new_map: Vec::new() });
+            }
+            // The window starts INSIDE our byte range but our data-stamped map
+            // never observed that term there: the bytes we hold at/above the
+            // window base belong to some other term — proven divergence.
+            // Additionally clamp at our first entry claiming a term >= the
+            // window's first term (a same-term/different-base conflict proves
+            // divergence from that entry's base onward).
+            let mut cut = own_durable.min(leader[0].1);
+            if let Some(&(_, base)) = own.iter().find(|&&(t, _)| t >= leader[0].0) {
+                cut = cut.min(base);
+            }
+            let mut new_map: Vec<(u32, u64)> = Vec::new();
+            for &(term, base) in own {
+                if base < cut {
+                    new_map.push((term, base));
+                }
+            }
+            return Reconcile::Ok(Outcome { valid_up_to: cut, new_map });
+        }
+    };
+
+    // Longest common run from the alignment point (entries equal in both term
+    // and base). `k` counts matches within the WINDOW; the shared prefix in
+    // own-map coordinates is `own[..j + k]` (entries below the window are our
+    // honest observations of history the leader simply did not ship — absence
+    // from the window is not contradiction).
     let mut k = 0;
-    while k < own.len() && k < leader.len() && own[k] == leader[k] {
+    while j + k < own.len() && k < leader.len() && own[j + k] == leader[k] {
         k += 1;
     }
 
-    // No shared entry AND our first entry begins at or below the leader's first:
-    // if the leader's earliest shipped entry begins strictly beyond our first
-    // byte, its window has slid past our history — incremental repair is out.
-    // (Empty own has no first entry, so it can never be NoCommonPrefix — a fresh
-    // node reconciles cleanly against whatever the leader shows.)
-    if k == 0 && !own.is_empty() && leader[0].1 > own[0].1 {
-        return Reconcile::NoCommonPrefix;
-    }
-
     // Our bytes are valid up to our durable, clamped down at the first point of
-    // divergence beyond the common prefix:
+    // divergence beyond the common run:
     //   - our own first uncertified entry (conflict or overhang), and/or
     //   - a leader term below our durable that our data-stamped map LACKS
     //     (proven divergence — the bytes there are ours, not that term's).
     let mut valid_up_to = own_durable;
-    if k < own.len() {
-        valid_up_to = valid_up_to.min(own[k].1);
+    if j + k < own.len() {
+        valid_up_to = valid_up_to.min(own[j + k].1);
     }
     if k < leader.len() && leader[k].1 < own_durable {
         valid_up_to = valid_up_to.min(leader[k].1);
     }
+    let k = j + k; // shared-prefix length in own-map coordinates, used below.
 
     // The reconciled map is our own surviving entries only — never an adopted
     // leader entry (reconcile never grows the map — that is `DataTermObserved`'s
@@ -291,6 +336,65 @@ mod tests {
                 assert_eq!(o.new_map, vec![]);
             }
             other => panic!("expected Ok (truncate to 0), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windowed_leader_map_aligns_against_full_own_map() {
+        // THE 2026-08-16 acked-write-loss regression. A healthy follower's
+        // FULL map vs a leader whose shipped window slid (lifetime terms >
+        // MAX_TERM_MAP_WIRE_ENTRIES): the window's first entry is our entry
+        // j > 0, not our entry 0. The old index-aligned match returned
+        // NoCommonPrefix here — wiping every healthy follower in a loop and
+        // eventually truncating committed bytes cluster-wide. Alignment must
+        // find the window inside our history and reconcile CLEAN.
+        let own: Vec<(u32, u64)> = (0..80u32).map(|i| (i + 1, i as u64 * 1000)).collect();
+        let leader: Vec<(u32, u64)> = own[16..].to_vec(); // window of the last 64
+        let durable = 80_000;
+        match reconcile(&own, durable, &leader) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, durable, "healthy follower must not truncate");
+                assert_eq!(o.new_map, own, "full map survives, below-window entries kept");
+            }
+            other => panic!("expected clean Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn windowed_alignment_still_cuts_at_real_divergence() {
+        // Same windowed shape, but our tail genuinely diverges: we hold a
+        // term-70 entry at base 69_000 where the leader's window shows term
+        // 71 opening at 68_000 (< our durable). The own-run clamp must cut
+        // at the first mismatched entry exactly as in the unwindowed case.
+        let mut own: Vec<(u32, u64)> = (0..70u32).map(|i| (i + 1, i as u64 * 1000)).collect();
+        own.push((71, 70_000)); // divergent frontier entry (our own term 71)
+        let mut leader: Vec<(u32, u64)> = own[16..70].to_vec();
+        leader.push((72, 69_500)); // leader's term 72 opened below our durable
+        match reconcile(&own, 71_000, &leader) {
+            Reconcile::Ok(o) => {
+                // Divergence at our (71, 70_000) vs leader (72, 69_500):
+                // leader-side clamp fires at 69_500.
+                assert_eq!(o.valid_up_to, 69_500);
+                assert!(o.new_map.iter().all(|&(_, b)| b < 69_500 || o.new_map.len() == 70));
+            }
+            other => panic!("expected Ok with cut, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_start_inside_our_bytes_but_unknown_term_cuts_there() {
+        // The window's first entry names a term our data-stamped history
+        // never observed, at a base BELOW our durable: the bytes we hold from
+        // that base on are provably not that term's — truncate there instead
+        // of wiping the whole log (the old code wiped).
+        let own = [(1u32, 0u64), (2, 2000)];
+        let leader = [(40u32, 4000u64), (41, 9000)];
+        match reconcile(&own, 5000, &leader) {
+            Reconcile::Ok(o) => {
+                assert_eq!(o.valid_up_to, 4000);
+                assert_eq!(o.new_map, vec![(1, 0), (2, 2000)]);
+            }
+            other => panic!("expected Ok cut at window start, got {other:?}"),
         }
     }
 
