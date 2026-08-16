@@ -314,14 +314,23 @@ UC (public Engine client, 15 s points):
   by the ≤1 MiB group commit — the same conclusion the v1-era journal
   A/Bs reached (fsync ~4% of the commit path; e2e NULL), now confirmed
   at v2 rates.
-- **Tails: a real regression.** Both eventual points show p99 ≈ 4.7 ms vs
-  0.76-1.17 ms across ALL FOUR fsync-on draws — outside the noise band and
-  consistent in both eventual runs. Mechanism (hypothesis, matching the
-  prealloc-background-fill precedent from the journal p99 investigation):
-  Eventual moves fsync to a background thread, adding a runnable that
-  contends with the busy-spin agents on the 8-vCPU box; the synchronous
-  group-commit fsync was paced INSIDE the archive's duty cycle and never
-  competed. **Recommendation: `UC2_JOURNAL_DURABILITY=eventual` has no
+- **Tails: a real regression — and mechanically expected once seen**
+  (CORRECTED 2026-08-16; the first version of this bullet hypothesized an
+  extra contending thread, which is wrong — both modes share the ONE bg
+  writer thread, and the timer-fsync correctly drops the state lock,
+  `writer.rs::fsync_active_segment`). Both eventual points show p99
+  ≈ 4.7 ms vs 0.76-1.17 ms across ALL FOUR fsync-on draws. The real
+  mechanism is PACING: Consistent fdatasyncs per ≤1 MiB block — sub-ms,
+  paced by arrival, absorbed inside each archive duty cycle — while
+  Eventual fdatasyncs on a 50 ms timer (`eventual_interval`), i.e. ~6-7 MB
+  lumps at these rates, occupying the single writer thread for several ms
+  per lump; queued appends' buffered writes (which are what resolve the
+  archive's notifier under Eventual) wait behind it, so the durable/commit
+  frontier stalls in periodic several-ms bites — visible at p99, invisible
+  at p50, the classic paced-small-flush-beats-bursty-big-flush result
+  (Postgres checkpoint smoothing / Kafka flush tuning family). Removing
+  fsync from the ACK path does not remove it from the machine.
+  **Recommendation unchanged: `UC2_JOURNAL_DURABILITY=eventual` has no
   performance case on this hardware class — keep fsync on.**
 
 Aeron (shared / batch 64 / IPC edge, `sync.level=0`):
@@ -336,12 +345,17 @@ Aeron (shared / batch 64 / IPC edge, `sync.level=0`):
 - **Latency: a large win.** At sustained rates, level 0 cuts Aeron's p50
   ~3-4× vs level 1 (84-120 µs vs 265-354 µs) — its per-recording sync sat
   directly in the ingress-to-egress path, unlike UC's.
-- **Throughput: no unlock here either.** 800 k — clean at level 1 on the
-  previous fleet — FAILED at level 0 on this one; sustained ceiling this
-  run = 600 k. One-fleet/one-run caveat applies (the same ±10% fleet
-  variance), but at minimum: removing fsync does not move Aeron's knee
-  upward. Both systems' ceilings are consensus/pipeline-bound, not
-  fsync-bound.
+- **Throughput: UNRESOLVED, stated honestly (corrected 2026-08-16 — the
+  first version of this bullet over-claimed).** 800 k failed at level 0 on
+  THIS fleet while level 1 sustained it on the PREVIOUS fleet — a
+  cross-fleet comparison, exactly the class this doc's own UC anchors exist
+  to forbid; no level-1 control ran on this fleet. So the data shows no
+  EVIDENCE of a throughput unlock, and this draw's ceiling was 600 k, but
+  whether level 0 moves Aeron's knee (either direction) needs an
+  interleaved level-1/level-0 A/B on one fleet. What survives cross-fleet
+  noise: the latency improvement (3-4×, far above the ±10% variance band)
+  and the fact that neither system converted fsync removal into measured
+  throughput.
 
 **Cross-system, eventual-vs-eventual:** UC 1.0-1.4 M sub-ms vs Aeron
 ≤600 k — the throughput ratio holds or widens; Aeron's latency lead at its
@@ -349,7 +363,8 @@ own operating point widens dramatically (≈86 µs vs ≈0.63 ms). The two
 systems spend their fsync savings on opposite ends of the
 latency-throughput trade, which is itself the cleanest statement of their
 different shapes: Aeron's recording sync is on the hot path and UC's group
-commit never was.
+commit never was. (Aeron's knee under level 0 remains unresolved per the
+correction above.)
 
 ### Standing caveats (from the pre-registered matrix, restated)
 
