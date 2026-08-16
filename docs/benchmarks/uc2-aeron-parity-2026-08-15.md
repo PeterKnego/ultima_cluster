@@ -374,3 +374,33 @@ Methodology (windowed-max vs rate-paced), durability granularity
 system's shipped threading posture. None of these plausibly bridge a
 1.6-1.8× gap, but they are the reason this doc says "scorecard", not
 "proof of superiority".
+
+## Eventual-interval retest — PRE-REGISTERED 2026-08-17 (before its fleet run)
+
+The eventual arm's p99 regression was attributed to DEFERRED-LUMP SIZE
+(50 ms timer × arrival rate ≈ 6-7 MB fsync lumps occupying the single
+writer thread). The interval is now configurable
+(`UC2_JOURNAL_EVENTUAL_FSYNC_MS`, merged main `7d19bde`; the old value was
+a hardcoded constant — it is TIME-based, not bytes or command count, so
+lump size is emergent: rate × interval). This retest tunes it down.
+
+- One UC-only fleet, one point (256 KiB / W=1024, 15 s), four arms
+  INTERLEAVED per round to fight the measured ~30% same-fleet swing:
+  **fsync-on → eventual@50 ms → eventual@5 ms → eventual@1 ms**, ×3
+  rounds. n = 3 per arm, FIXED. Standard invalidation rules per run.
+- Predicted lump sizes at ~1.3 M × 96 B: 50 ms ≈ 6.5 MB, 5 ms ≈ 0.65 MB
+  (≈ the Consistent 1 MiB block cap), 1 ms ≈ 130 KB.
+- **Decide rule (mechanism test):** the lump-size mechanism is CONFIRMED
+  iff median p99(ev@50) > 2× median p99(fsync-on) — reproducing the
+  regression — AND median p99(ev@5) ≤ 1.5× median p99(fsync-on). The
+  ev@1 arm is characterization (finer pacing than Consistent's own
+  blocks), no verdict weight. Throughput: expected inside fleet noise in
+  all arms (no rule; the no-unlock conclusion already stands).
+- Whatever the outcome, the standing recommendation (keep fsync on)
+  is NOT at stake — eventual buys no throughput regardless; this test is
+  about the mechanism and about de-footgunning the knob for any future
+  replication-durability deployment.
+
+### Interval-retest results
+
+*(to be filled by the run)*
