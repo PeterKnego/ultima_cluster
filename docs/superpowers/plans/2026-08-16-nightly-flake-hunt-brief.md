@@ -213,6 +213,21 @@ AppendEntries). Recorded in memory `reconcile-window-alignment-loss`.
 service-tripwire fail-stops are EXPECTED (documented open race) and heal
 at the next nemesis cycle on that node.
 
+**Acceptance round 2 RESULT: 8/8 PASS** — 0 violations, 0 wipes, 0
+consensus deaths across 1,332 leader kills (tripwires 13-27/run = the
+open apply/gossip race, as expected). Lean full build green (3037 jobs,
+no sorries); conformance 100k vectors zero divergence.
+
+**Elle acceptance amendment (recorded before rerun):** the first elle x3
+at `ELLE_TARGET_OPS=1M` died SIGKILL (OOM) in GENERATION all 3 attempts —
+post-fix throughput is several times higher (no wipe stalls), so a 300 s
+budget now builds a far larger in-memory history than any pre-fix run,
+and attempts overlapped the 7-worker Lean build. Amended to
+`ELLE_TARGET_OPS=80000` (pre-fix-scale op volume, bounding recorder
+memory; ~130 fault ticks/run x 3 runs keeps total exposure at CI scale)
+and `ELLE_JAVA_XMX=3g` (2 g handled larger pre-fix histories). The decide
+rule is unchanged: 3/3 PASS under both models.
+
 **Directed-rig pre-commitment (stale-read root cause, 2026-08-16):**
 `uc2_node/tests/stale_read_hunt.rs` (ignored; hunt tool): 3-node crypto-ON
 cluster, 1 writer acking monotone register writes, 2 linearizable readers
