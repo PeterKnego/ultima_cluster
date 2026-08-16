@@ -189,6 +189,30 @@ models (pre-fix valid-attempt rate 3 FAIL / 1 PASS). Then the full local
 proof stack (workspace tests, clippy, lin_v2, lin_partition_v2, sim,
 conformance) before any push.
 
+**Acceptance round 1 result (partial, alignment fix only) + TWO MORE
+DEFECTS UNMASKED:** 4 runs: 0 violations, 0 wipes (target metrics clean),
+but 3/4 runs died on failure modes the wipe loop had been masking:
+(1) `term-map persist fail-stop: PayloadTooLarge` — the persisted term
+map overflows its ~4 KiB StableValue slot at ~340 lifetime terms
+(minutes under churn; CI's Aug 12 `no survivor leader within 20s` at
+mod.rs:618 is this assert's downstream) → FIXED: persisted copy clamps
+to newest 300 entries (boot re-derives the full map from journal frames;
+SM seeds from the re-derivation).
+(2) The new service rewind tripwire fires on a REAL PRE-EXISTING
+apply/gossip race: commit gossip is position-only, so a follower holding
+a divergent old tail can apply its OLD content at positions the NEW
+timeline's gossiped commit has blessed, BEFORE the (slower, term-map-
+cadence) reconcile cut lands. Pre-fix this silently served wrong answers
+(part of the elle anomaly mass); post-fix it fail-stops the service
+incarnation (correct but loud). The underlying race is OPEN — proofs-arc
+scope (commit-plane contract: the apply bound needs a content-validated
+frontier, cf. Raft's follower commitIndex clamp to last-validated
+AppendEntries). Recorded in memory `reconcile-window-alignment-loss`.
+**Acceptance round 2 (RESTARTED, both fixes):** same protocol; success =
+0 violations + 0 healthy-follower wipes + 0 consensus-thread deaths;
+service-tripwire fail-stops are EXPECTED (documented open race) and heal
+at the next nemesis cycle on that node.
+
 **Directed-rig pre-commitment (stale-read root cause, 2026-08-16):**
 `uc2_node/tests/stale_read_hunt.rs` (ignored; hunt tool): 3-node crypto-ON
 cluster, 1 writer acking monotone register writes, 2 linearizable readers
