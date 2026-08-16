@@ -136,6 +136,56 @@ mmap-shared files at boot (cnc + all rings), fixed on main `4f544dd`
 on ~450 MB histories → empty verdict misread as FAIL; runner now uses
 6g and classifies empty verdicts INVALID.
 
+## QUORUM-PLANE RESIDUE: four fixes, REDUCED not closed — architectural finding
+
+Chasing the `prov=("gossip")` rewind found four independent defects, each
+fixed with a test (commit `a1f17e4`):
+
+1. **`CommitTracker` slots were high-water marks.** A follower's durable
+   REGRESSES on every truncation (reconcile cut, wipe, restart onto a
+   shorter journal) — constantly under churn — so the leader kept ranking a
+   quorum that no longer existed. Slots now take the latest report. Same for
+   M7's carried `last_reports`; the receiver also re-reports immediately
+   after a truncation instead of waiting out `append_pos_floor_ns`.
+2. **Term observations were delivered lossily** (`try_send`, on a comment's
+   claim they are "re-derivable from commit gossip" — they are not:
+   `observe_terms` scans each block exactly once). A storm overflowed the
+   channel; the map then permanently lacked terms whose bytes the node held,
+   so every later reconcile read the leader's newer entries as divergence.
+   Now retained/retried, and buffered across the SM's truncating latch.
+3. **The SM's `durable` could run a duty cycle AHEAD of its own term map**
+   (the archive publishes the counter inside `do_work`, hands observations
+   over afterwards). `refresh_durable` now clamps to the observation
+   frontier, so `durable` and the map describe the same prefix.
+4. **The commit-validation latch was a BOOLEAN.** A follower that reconciled
+   clean could still take a gossiped commit far past anything validated
+   (31 KB in the captured case) and apply a deposed leader's bytes. It is now
+   a POSITION (`validated_up_to`), lowered by any unconfirmed term boundary,
+   and `AppendPosition` reports are clamped to it — making the leader's
+   ranking a CONTENT quorum rather than a POSITION quorum.
+
+**Measured: rewinds 11 -> 4-7 per 300 s storm; 0 acked-write violations
+throughout. NOT closed.** Four principled fixes each moved the number
+without eliminating it — the systematic-debugging rule for that pattern is
+to stop patching and question the architecture, so this stops here.
+
+**Architectural finding (maintainer decision):** *a byte position is not a
+content identity.* UC commits POSITIONS and validates CONTENT only at
+term-map granularity, which is too coarse when leaders churn faster than
+maps propagate. Closing this properly likely means attesting content in the
+report itself — a term-or-digest stamp for the acknowledged range — which
+touches the wire protocol (another version bump) and is a design call, not
+a session patch. Everything above is defence in depth beneath that.
+
+**Behaviour changes to know about:** (a) each rig run now shows exactly one
+wipe-and-rejoin (previously zero) — clamped reports let a lagging node fall
+past the 64-entry window and take the legitimate `NoCommonPrefix` path; with
+M6 snapshots on this is a snapshot install, not a wipe. (b) The sim pin
+`raw_m3_forged_report_phantom_commit_is_caught` was STRENGTHENED: a one-shot
+forged report is now self-correcting (the sender's next honest report
+overwrites it — under high-water slots it latched forever), while a
+SUSTAINED forgery still trips inv7. Both halves are asserted.
+
 ## RESIDUE CLOSED: the apply/gossip race (2026-08-16, same day)
 
 The race the rewind tripwire exposed is now fixed rather than merely

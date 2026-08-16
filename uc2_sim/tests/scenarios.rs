@@ -368,11 +368,20 @@ fn mechanism_guarded_survives_the_same_storm() {
     }
 }
 
-/// T5's deferred third pin: a forged/corrupt raw report above the sender's real
-/// durable must be caught (RawM3) — inject_report makes it expressible.
+/// T5's deferred third pin, STRENGTHENED 2026-08-16: a forged/corrupt raw
+/// report above the sender's real durable must never silently certify bytes no
+/// quorum holds (RawM3; `inject_report` makes it expressible).
+///
+/// The contract changed with the report-slot fix. Slots used to be high-water
+/// marks, so ONE forged report poisoned the leader's ranking permanently and
+/// the phantom commit was inevitable — this pin asserted exactly that. Slots
+/// now hold the follower's LATEST report (a durable genuinely regresses when a
+/// follower truncates), which also makes a one-shot forgery SELF-CORRECTING:
+/// the sender's next honest report overwrites it. Both halves are pinned here.
 #[test]
 #[allow(clippy::field_reassign_with_default)] // pin kept verbatim per the task brief
 fn raw_m3_forged_report_phantom_commit_is_caught() {
+    // (a) One-shot forgery: corrected by the next honest report, no violation.
     let mut cfg = SimConfig::default();
     cfg.data_plane = DataPlane::RawM3;
     let mut w = World::new(cfg);
@@ -380,7 +389,30 @@ fn raw_m3_forged_report_phantom_commit_is_caught() {
     let leader = w.current_leader().unwrap();
     let f = w.majority_excluding(leader)[0];
     w.inject_report(f, w.node_term(leader), 1 << 30); // far beyond any real durable
-    assert!(w.run_steps(2_000).is_err(), "phantom durable must trip an invariant");
+    assert!(
+        w.run_steps(2_000).is_ok(),
+        "a single forged report must be overwritten by the sender's next honest \
+         report, not latched into the ranking forever"
+    );
+
+    // (b) SUSTAINED forgery still reaches — and is caught as — a phantom
+    // commit: the safety detector is intact, only the one-shot case healed.
+    let mut cfg2 = SimConfig::default();
+    cfg2.data_plane = DataPlane::RawM3;
+    let mut w2 = World::new(cfg2);
+    w2.run_until_leader().unwrap();
+    let leader2 = w2.current_leader().unwrap();
+    let f2 = w2.majority_excluding(leader2)[0];
+    let mut caught = None;
+    for _ in 0..40 {
+        let term = w2.node_term(leader2);
+        w2.inject_report(f2, term, 1 << 30);
+        if let Err(v) = w2.run_steps(50) {
+            caught = Some(v);
+            break;
+        }
+    }
+    assert!(caught.is_some(), "a persistently forged durable must trip an invariant");
 }
 
 /// M6 Task 8 — a NoCommonPrefix reconcile REACHES the wipe decision, and the
