@@ -79,6 +79,10 @@ pub struct ArchiveConfig {
     /// Opt-in for benchmarks and deployments that explicitly choose
     /// replication-durability; never the default.
     pub durability: Durability,
+    /// Eventual mode only: the journal writer's async-fsync interval (see
+    /// `JournalConfig::eventual_fsync_interval` for the lump-size trade-off).
+    /// Ignored under Consistent.
+    pub eventual_fsync_interval: std::time::Duration,
 }
 
 impl ArchiveConfig {
@@ -89,6 +93,7 @@ impl ArchiveConfig {
             segment_size_bytes: 64 * 1024 * 1024,
             preallocate_segments: true,
             durability: Durability::Consistent,
+            eventual_fsync_interval: std::time::Duration::from_millis(50),
         }
     }
 }
@@ -135,6 +140,7 @@ impl Archive {
         let jcfg = JournalConfig {
             segment_size_bytes: cfg.segment_size_bytes,
             durability: cfg.durability,
+            eventual_fsync_interval: cfg.eventual_fsync_interval,
             preallocate_segments: cfg.preallocate_segments,
             ..JournalConfig::new(&cfg.dir)
         };

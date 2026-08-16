@@ -224,6 +224,8 @@ pub(crate) struct WriterState {
     pub pipeline: Option<Arc<crate::journal::segment_pipeline::SegmentPipeline>>,
     pub segment_size: u64,
     pub durability: Durability,
+    /// See `JournalConfig::eventual_fsync_interval` (Eventual mode only).
+    pub eventual_fsync_interval: Duration,
     pub segments: Vec<SegmentFile>,
     pub last_seq: Option<u64>,
     pub first_seq: Option<u64>,
@@ -278,9 +280,11 @@ fn writer_loop(
     watermark: Arc<SeqWatermark>,
 ) {
     // Durability is fixed at Journal::open and never changes at runtime.
-    let durability = state.lock().unwrap().durability;
+    let (durability, eventual_interval) = {
+        let st = state.lock().unwrap();
+        (st.durability, st.eventual_fsync_interval)
+    };
     let mut last_eventual_fsync = Instant::now();
-    let eventual_interval = Duration::from_millis(50);
 
     loop {
         let timeout = match durability {

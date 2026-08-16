@@ -40,6 +40,14 @@ pub struct JournalConfig {
     pub dir: std::path::PathBuf,
     pub segment_size_bytes: u64,
     pub durability: crate::Durability,
+    /// [`crate::Durability::Eventual`] only: how often the writer thread
+    /// fsyncs the active segment (and publishes the durable watermark).
+    /// Ignored under `Consistent` (every block syncs before its notifier
+    /// resolves). Trade-off: a longer interval defers work but accumulates
+    /// BIGGER dirty lumps whose fsync stalls the single writer thread — the
+    /// 2026-08-16 eventual-arm bench measured a p99 regression from exactly
+    /// that at the old fixed 50 ms. Default stays 50 ms for compatibility.
+    pub eventual_fsync_interval: std::time::Duration,
     /// Opt-in (default false): preallocate each segment to `segment_size_bytes`
     /// up front so the per-commit `fdatasync` skips the ext4 metadata commit a
     /// size-extending append otherwise forces. See task on segment preallocation.
@@ -60,6 +68,7 @@ impl JournalConfig {
             dir: dir.into(),
             segment_size_bytes: 64 * 1024 * 1024,
             durability: crate::Durability::Consistent,
+            eventual_fsync_interval: std::time::Duration::from_millis(50),
             preallocate_segments: false,
             prealloc_fill: PreallocFill::FallocateZeroRange,
             prealloc_fill_chunk_bytes: 4 * 1024 * 1024,
@@ -231,6 +240,7 @@ impl Journal {
             pipeline,
             segment_size: config.segment_size_bytes,
             durability: config.durability,
+            eventual_fsync_interval: config.eventual_fsync_interval,
             segments,
             last_seq,
             first_seq,
@@ -1223,6 +1233,29 @@ mod tests {
         assert_eq!(j2.last_seq(), Some(3));
         // The torn bytes should have been truncated; subsequent append must succeed.
         j2.append(4, 0, b"new").unwrap().wait().unwrap();
+    }
+
+    /// With the configurable interval set absurdly high, Eventual mode's
+    /// append notifier still resolves at the buffered write, but the fsync
+    /// watermark must NOT advance in any reasonable window — pinning that
+    /// the interval config is actually honored (under the former fixed
+    /// 50 ms, this assertion window would see it advance).
+    #[test]
+    fn eventual_interval_is_honored_a_huge_interval_defers_the_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = JournalConfig::new(dir.path());
+        cfg.durability = crate::Durability::Eventual;
+        cfg.eventual_fsync_interval = std::time::Duration::from_secs(3600);
+        let j = Journal::open(cfg).unwrap();
+        // Seq 1, not 0: the watermark's `hwm > 0` publish guard makes seq 0
+        // unobservable, which would render this test vacuous.
+        j.append(1, 0, b"payload").unwrap().wait().unwrap(); // buffered-write ack
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            j.durable_seq(),
+            0,
+            "watermark advanced despite a 1h interval — interval config not honored"
+        );
     }
 
     /// Validates that concurrent readers and a writer thread do not deadlock or

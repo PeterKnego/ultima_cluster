@@ -449,6 +449,11 @@ impl Node {
             durability: journal_durability_from_env().map_err(to_io)?,
             ..ArchiveConfig::new(instance.journal_dir())
         };
+        if let Some(iv) = eventual_fsync_interval_from_env(archive_cfg.durability)
+            .map_err(to_io)?
+        {
+            archive_cfg.eventual_fsync_interval = iv;
+        }
         // Invariant: a block records as ONE journal record and must fit within a
         // segment. Keep the block cap comfortably below the segment size (never
         // above the production 1 MiB default). This lets tests shrink segments
@@ -4464,6 +4469,90 @@ mod journal_durability_env_tests {
             let err = journal_durability_from_env().unwrap_err();
             assert!(err.contains("fastest"), "{err}");
         });
+    }
+
+    fn with_interval_env(val: Option<&str>, f: impl FnOnce()) {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: same ENV_LOCK discipline as `with_env`.
+        unsafe {
+            match val {
+                Some(v) => std::env::set_var("UC2_JOURNAL_EVENTUAL_FSYNC_MS", v),
+                None => std::env::remove_var("UC2_JOURNAL_EVENTUAL_FSYNC_MS"),
+            }
+        }
+        f();
+        unsafe { std::env::remove_var("UC2_JOURNAL_EVENTUAL_FSYNC_MS") }
+    }
+
+    #[test]
+    fn interval_unset_is_none_and_set_maps_under_eventual() {
+        use super::eventual_fsync_interval_from_env;
+        with_interval_env(None, || {
+            assert_eq!(
+                eventual_fsync_interval_from_env(Durability::Eventual).unwrap(),
+                None
+            );
+        });
+        with_interval_env(Some("5"), || {
+            assert_eq!(
+                eventual_fsync_interval_from_env(Durability::Eventual).unwrap(),
+                Some(std::time::Duration::from_millis(5))
+            );
+        });
+    }
+
+    #[test]
+    fn interval_under_consistent_is_ignored_with_warning() {
+        use super::eventual_fsync_interval_from_env;
+        with_interval_env(Some("5"), || {
+            assert_eq!(
+                eventual_fsync_interval_from_env(Durability::Consistent).unwrap(),
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn interval_zero_or_garbage_is_refused() {
+        use super::eventual_fsync_interval_from_env;
+        with_interval_env(Some("0"), || {
+            assert!(eventual_fsync_interval_from_env(Durability::Eventual).is_err());
+        });
+        with_interval_env(Some("fast"), || {
+            assert!(eventual_fsync_interval_from_env(Durability::Eventual).is_err());
+        });
+    }
+}
+
+/// `UC2_JOURNAL_EVENTUAL_FSYNC_MS` — companion knob to
+/// `UC2_JOURNAL_DURABILITY=eventual`: the journal writer's async-fsync
+/// interval in milliseconds (default 50). Only meaningful under Eventual;
+/// if set while durability is Consistent it is IGNORED WITH A WARNING (the
+/// value is inert there, unlike a durability typo, which is refused).
+/// Zero or unparseable values are refused — fail-closed like the
+/// durability knob itself.
+fn eventual_fsync_interval_from_env(
+    durability: uc2_log::Durability,
+) -> Result<Option<std::time::Duration>, String> {
+    match std::env::var("UC2_JOURNAL_EVENTUAL_FSYNC_MS") {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(e) => Err(format!("UC2_JOURNAL_EVENTUAL_FSYNC_MS unreadable: {e}")),
+        Ok(v) => {
+            if durability != uc2_log::Durability::Eventual {
+                eprintln!(
+                    "uc2_node: UC2_JOURNAL_EVENTUAL_FSYNC_MS={v} ignored — \
+                     durability is Consistent (interval is Eventual-only)"
+                );
+                return Ok(None);
+            }
+            match v.parse::<u64>() {
+                Ok(ms) if ms > 0 => Ok(Some(std::time::Duration::from_millis(ms))),
+                _ => Err(format!(
+                    "UC2_JOURNAL_EVENTUAL_FSYNC_MS={v:?} invalid (expected a \
+                     positive integer of milliseconds); refusing to guess"
+                )),
+            }
+        }
     }
 }
 
