@@ -140,13 +140,11 @@ impl LogBuffer {
         cnc: Arc<CncPage>,
         max_payload: usize,
     ) -> Result<Self, std::io::Error> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        file.set_len(capacity)?;
+        // In-place recreate safe (never shrinks, zeros via punch-hole; a
+        // 256 MiB buffer stays sparse) — see uc_protocol's
+        // `create_shared_backing_file` for the SIGBUS contract. Cold in
+        // practice (restarts OPEN a matching buffer), hardened regardless.
+        let file = uc_protocol::ring::create_shared_backing_file(path, capacity)?;
         // SAFETY: exclusive logical ownership per the instance-dir contract
         // (one node per instance dir; instance.lock arrives with uc2_node).
         let m = unsafe { memmap2::MmapMut::map_mut(&file)? };

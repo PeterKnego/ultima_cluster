@@ -20,7 +20,7 @@ pub mod spsc;
 pub use broadcast::{BroadcastConsumer, BroadcastProducer, BroadcastRing};
 pub use common::{
     BUSY_SPIN_CHUNK, FrameHeader, PARK_CEIL, ParkMode, RecordHeader, RingError, RingHeader,
-    RingWaitHandle, SPIN_TRIES,
+    RingWaitHandle, SPIN_TRIES, create_shared_backing_file,
 };
 pub use mpsc::{MpscConsumer, MpscProducer, MpscRing};
 pub use spsc::{SpscConsumer, SpscProducer, SpscRing};

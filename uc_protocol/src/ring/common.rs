@@ -333,6 +333,70 @@ pub enum RingError {
     Overwritten,
 }
 
+/// Create — or RECREATE IN PLACE — the backing file for an mmap-shared IPC
+/// structure, without ever shrinking it.
+///
+/// Never `.truncate(true)` a file that other processes may still have
+/// mapped: between truncate-to-0 and the subsequent `set_len`, every page
+/// is beyond EOF and any mapped read/write in an attached process is a
+/// **SIGBUS** — a hard crash in THAT process. A node restart recreates the
+/// cnc page and all five ring files while the previous incarnation's
+/// service/clients still hold mappings, and attachers poll these pages
+/// continuously (found 2026-08-16: 2-of-3 crash rate in the restart-heavy
+/// elle harness once the pipelined client raised the read frequency).
+///
+/// Instead: open without truncate, grow to `len` if needed (never shrink —
+/// a pre-existing longer file keeps its tail), and ZERO the content with
+/// `fallocate(PUNCH_HOLE | KEEP_SIZE)` — content becomes zeros, length is
+/// untouched, sparseness is preserved (a 256 MiB buffer is not
+/// materialized). Attachers observe zeroed/torn content during the window,
+/// which every reader of these structures already tolerates (torn-header
+/// contracts); they never fault. Falls back to writing explicit zeros if
+/// the filesystem lacks punch-hole.
+pub fn create_shared_backing_file(
+    path: &std::path::Path,
+    len: u64,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    let cur = file.metadata()?.len();
+    if cur < len {
+        file.set_len(len)?;
+    }
+    let zero_len = cur.max(len);
+    // SAFETY: plain fallocate syscall on our own fd; no memory contract.
+    let rc = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            0,
+            zero_len as libc::off_t,
+        )
+    };
+    if rc != 0 {
+        // Punch-hole unsupported here (exotic fs): write zeros explicitly.
+        // Non-sparse, so only correct-but-slower; every real deployment
+        // target (ext4, tmpfs, xfs) supports punch-hole.
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = &file;
+        f.seek(SeekFrom::Start(0))?;
+        let zeros = vec![0u8; 64 * 1024];
+        let mut left = zero_len;
+        while left > 0 {
+            let n = left.min(zeros.len() as u64) as usize;
+            f.write_all(&zeros[..n])?;
+            left -= n as u64;
+        }
+        f.flush()?;
+    }
+    Ok(file)
+}
+
 /// Initialize the header of a freshly mmap'd ring file in place.
 ///
 /// Safe iff the caller holds exclusive access to `buf` (typical: just-created

@@ -326,13 +326,22 @@ impl CncPage {
     /// [`crate::cnc::CncPage::try_instance_id`]-driven `InstanceRestart`, instead
     /// of reading a stale detached page forever.
     pub fn create_file(path: &Path, meta: &CncMeta) -> Result<Arc<CncPage>, CncError> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        file.set_len(CNC_PAGE_LEN as u64)?;
+        // NEVER `.truncate(true)` here. A node RESTART recreates this file in
+        // place while other processes (service, clients) still hold mmaps of
+        // the previous incarnation; between truncate-to-0 and set_len the
+        // page is beyond EOF and any mapped read is a SIGBUS — a hard crash
+        // in the ATTACHED process, not this one. (Found 2026-08-16: the
+        // pipelined client polls the page orders of magnitude more often
+        // than the old client, turning this µs window from a theoretical
+        // landmine into a 2-of-3 crash rate in the restart-heavy elle
+        // harness.) `set_len` on an existing 4 KiB file is a no-op — the
+        // mapping stays valid end to end; attachers observe a zeroed/torn
+        // header during the rewrite, which `try_instance_id`/`validate`
+        // already tolerate (the documented torn-header contract).
+        // Zeroing (init historically relied on truncate for the zero body)
+        // is done by the helper's punch-hole, which never changes the file
+        // length — the whole point.
+        let file = uc_protocol::ring::create_shared_backing_file(path, CNC_PAGE_LEN as u64)?;
         // SAFETY: exclusive logical ownership per the instance-dir contract
         // (one node per instance dir; instance.lock is the flock gate,
         // uc2_node territory — this call is the creating party).
@@ -632,6 +641,70 @@ mod tests {
             buffer_bytes: 1 << 20,
             max_payload: 256,
         }
+    }
+
+    /// In-place recreate (a node restart) must leave the previous
+    /// incarnation's state fully zeroed: `init` historically relied on
+    /// `.truncate(true)` for the zero page, and the SIGBUS fix (2026-08-16)
+    /// replaced truncate with an explicit in-mapping fill — this pins that
+    /// nothing leaks through a recreate.
+    #[test]
+    fn recreate_in_place_zeroes_previous_incarnation_state() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let old = CncPage::create_file(tmp.path(), &test_meta()).unwrap();
+        // Dirty a spread of fields across the page.
+        old.counters().append.store_release(0xDEAD);
+        old.counters().commit.store_release(0xBEEF);
+        old.status().leader_hint.store_release(7);
+        old.status().flags.store_release(0xFF);
+        old.store_admission_bytes(123_456);
+        // Recreate in place with a NEW instance id.
+        let meta2 = CncMeta { instance_id: 0xA5A5_0000_1111_2222, ..test_meta() };
+        let fresh = CncPage::create_file(tmp.path(), &meta2).unwrap();
+        assert_eq!(fresh.meta().instance_id, 0xA5A5_0000_1111_2222);
+        assert_eq!(fresh.counters().append.load_acquire(), 0);
+        assert_eq!(fresh.counters().commit.load_acquire(), 0);
+        assert_eq!(fresh.status().flags.load_acquire(), 0);
+        assert_eq!(fresh.status().leader_hint.load_acquire(), u64::MAX);
+        assert_eq!(fresh.admission_bytes(), 0);
+        fresh.validate("test-app").expect("fresh page validates");
+    }
+
+    /// The SIGBUS regression tooth: a mapping of the PREVIOUS incarnation
+    /// must stay readable while the file is recreated in place — the old
+    /// `.truncate(true)` opened a beyond-EOF window in which any mapped
+    /// read was a SIGBUS (hard crash of the attached process). Post-fix the
+    /// file never shrinks, so this hammer is deterministically safe; under
+    /// the old code it crashed the test binary with signal 7 at a rate
+    /// matching the elle-harness observations.
+    #[test]
+    fn recreate_never_invalidates_existing_mappings() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let old = CncPage::create_file(tmp.path(), &test_meta()).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let reader = {
+            let old = std::sync::Arc::clone(&old);
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut torn = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    // Any result is fine (fresh id, old id, torn None) —
+                    // the property under test is "does not SIGBUS".
+                    if old.try_instance_id().is_none() {
+                        torn += 1;
+                    }
+                    std::hint::spin_loop();
+                }
+                torn
+            })
+        };
+        for i in 0..500u64 {
+            let meta = CncMeta { instance_id: 0x1000 + i as u128, ..test_meta() };
+            let _fresh = CncPage::create_file(tmp.path(), &meta).unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _torn = reader.join().expect("reader must not have crashed");
     }
 
     #[test]

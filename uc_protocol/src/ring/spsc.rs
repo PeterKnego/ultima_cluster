@@ -332,13 +332,9 @@ impl SpscRing {
             )));
         }
         let file_len = RING_HEADER_LEN + capacity_bytes as usize;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        file.set_len(file_len as u64)?;
+        // In-place recreate safe: never shrinks, zeros via punch-hole — see
+        // `create_shared_backing_file` (the SIGBUS contract).
+        let file = super::common::create_shared_backing_file(path, file_len as u64)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
         init_ring_header(&mut mmap[..], capacity_bytes, max_msg_size, 0)?;
         let base = mmap.as_mut_ptr();
