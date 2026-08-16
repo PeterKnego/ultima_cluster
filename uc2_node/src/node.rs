@@ -446,6 +446,7 @@ impl Node {
         // 2. Recover durable state from the journal.
         let mut archive_cfg = ArchiveConfig {
             segment_size_bytes: cfg.journal_segment_bytes,
+            durability: journal_durability_from_env().map_err(to_io)?,
             ..ArchiveConfig::new(instance.journal_dir())
         };
         // Invariant: a block records as ONE journal record and must fit within a
@@ -4410,6 +4411,91 @@ fn rederive_config(
         };
     }
     Ok(cur)
+}
+
+
+#[cfg(test)]
+mod journal_durability_env_tests {
+    use super::journal_durability_from_env;
+    use uc2_log::Durability;
+
+    // Serialized by a lock: std::env is process-global (house pattern —
+    // timeout_and_restart.rs isolates env in its own binary; a static lock
+    // does the same job inside one).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_env(val: Option<&str>, f: impl FnOnce()) {
+        let _g = ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK; no other test in this binary touches
+        // this variable outside `with_env`.
+        unsafe {
+            match val {
+                Some(v) => std::env::set_var("UC2_JOURNAL_DURABILITY", v),
+                None => std::env::remove_var("UC2_JOURNAL_DURABILITY"),
+            }
+        }
+        f();
+        unsafe { std::env::remove_var("UC2_JOURNAL_DURABILITY") }
+    }
+
+    #[test]
+    fn unset_and_consistent_and_case_map_to_consistent() {
+        with_env(None, || {
+            assert_eq!(journal_durability_from_env().unwrap(), Durability::Consistent);
+        });
+        with_env(Some("consistent"), || {
+            assert_eq!(journal_durability_from_env().unwrap(), Durability::Consistent);
+        });
+        with_env(Some("Consistent"), || {
+            assert_eq!(journal_durability_from_env().unwrap(), Durability::Consistent);
+        });
+    }
+
+    #[test]
+    fn eventual_maps_to_eventual() {
+        with_env(Some("eventual"), || {
+            assert_eq!(journal_durability_from_env().unwrap(), Durability::Eventual);
+        });
+    }
+
+    #[test]
+    fn unrecognized_value_is_refused_not_guessed() {
+        with_env(Some("fastest"), || {
+            let err = journal_durability_from_env().unwrap_err();
+            assert!(err.contains("fastest"), "{err}");
+        });
+    }
+}
+
+/// `UC2_JOURNAL_DURABILITY` — opt-in env knob for the archive's journal
+/// durability (the house env-toggle pattern, like `UC_JOURNAL_PREALLOC`).
+/// Unset or `consistent` = `Durability::Consistent` (fdatasync per block —
+/// the default posture every gate and spec guarantee assumes). `eventual` =
+/// `Durability::Eventual`: the durable counter advances on the buffered
+/// write and durability comes from REPLICATION, not disk (power loss can
+/// drop acked bytes; see `ArchiveConfig::durability` for the loss model) —
+/// benchmark / explicit-deployment opt-in only. Any other value is refused
+/// loudly (fail-closed: a typo must not silently pick a posture).
+fn journal_durability_from_env() -> Result<uc2_log::Durability, String> {
+    match std::env::var("UC2_JOURNAL_DURABILITY") {
+        Err(std::env::VarError::NotPresent) => Ok(uc2_log::Durability::Consistent),
+        Err(e) => Err(format!("UC2_JOURNAL_DURABILITY unreadable: {e}")),
+        Ok(v) => match v.to_ascii_lowercase().as_str() {
+            "" | "consistent" => Ok(uc2_log::Durability::Consistent),
+            "eventual" => {
+                eprintln!(
+                    "uc2_node: UC2_JOURNAL_DURABILITY=eventual — journal fsync is \
+                     ASYNCHRONOUS; acked positions may be lost on power failure \
+                     (durability by replication). Opt-in posture; not the default."
+                );
+                Ok(uc2_log::Durability::Eventual)
+            }
+            other => Err(format!(
+                "UC2_JOURNAL_DURABILITY={other:?} unrecognized (expected \
+                 'consistent' or 'eventual'); refusing to guess a durability posture"
+            )),
+        },
+    }
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {

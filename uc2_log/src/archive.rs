@@ -5,7 +5,10 @@
 //! position, block-writes whatever accumulated (≤ max_block_bytes,
 //! frame-aligned) as ONE journal record per block — seq = block index,
 //! meta = block base position — with one fdatasync per block
-//! (Durability::Consistent), then advances the durable counter. The poll
+//! (Durability::Consistent, the default), then advances the durable counter;
+//! under the opt-in Durability::Eventual the counter advances after the
+//! buffered write and the journal fsyncs asynchronously (see
+//! `ArchiveConfig::durability` for the exact loss model). The poll
 //! batching IS the group commit: fsync frequency scales with block rate,
 //! not message rate, and there is no linger anywhere.
 
@@ -61,6 +64,21 @@ pub struct ArchiveConfig {
     pub max_block_bytes: usize,
     pub segment_size_bytes: u64,
     pub preallocate_segments: bool,
+    /// Journal durability for recorded blocks. Default
+    /// [`Durability::Consistent`]: the durable counter advances only after
+    /// the block's fdatasync completes — the posture every UC gate and the
+    /// spec's stated guarantees assume.
+    ///
+    /// [`Durability::Eventual`] advances the durable counter after the
+    /// BUFFERED write (the journal fsyncs asynchronously): the archive acks
+    /// positions that live only in the page cache. Durability then comes
+    /// from replication, not disk — a process crash loses nothing, but a
+    /// power-loss/host failure can drop acked bytes, and a node can restart
+    /// with a shorter log than it reported durable (the same posture as
+    /// Aeron Archive `file.sync.level=0` or Kafka acks-without-flush).
+    /// Opt-in for benchmarks and deployments that explicitly choose
+    /// replication-durability; never the default.
+    pub durability: Durability,
 }
 
 impl ArchiveConfig {
@@ -70,6 +88,7 @@ impl ArchiveConfig {
             max_block_bytes: 1024 * 1024,
             segment_size_bytes: 64 * 1024 * 1024,
             preallocate_segments: true,
+            durability: Durability::Consistent,
         }
     }
 }
@@ -115,7 +134,7 @@ impl Archive {
     pub fn open(cfg: ArchiveConfig) -> Result<Self, ArchiveError> {
         let jcfg = JournalConfig {
             segment_size_bytes: cfg.segment_size_bytes,
-            durability: Durability::Consistent,
+            durability: cfg.durability,
             preallocate_segments: cfg.preallocate_segments,
             ..JournalConfig::new(&cfg.dir)
         };
@@ -247,7 +266,8 @@ impl Archive {
 
     /// One duty cycle: record at most one block. Returns Ok(true) if work was
     /// done. The durable counter is advanced ONLY after Notifier::wait()
-    /// returns (Consistent durability => post-fdatasync).
+    /// returns — post-fdatasync under Consistent durability, post-buffered-
+    /// write under Eventual (the journal's async fsync trails).
     pub fn do_work(&mut self, buffer: &LogBuffer) -> Result<bool, ArchiveError> {
         let slice = buffer.recordable_slice(self.durable_pos, self.cfg.max_block_bytes).map_err(
             |c| {
@@ -914,6 +934,34 @@ mod tests {
         assert!(!arch.do_work(&b).unwrap()); // caught up
         assert_eq!(c.counters().durable.load_acquire(), 960);
         assert_eq!(arch.blocks_recorded(), 1);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // real journal files
+    fn eventual_durability_records_and_advances_on_buffered_write() {
+        // The opt-in Eventual posture: the durable counter advances after the
+        // BUFFERED write (the journal's async fsync trails), and everything
+        // recorded stays readable + recoverable exactly like Consistent — the
+        // difference is the loss model under power failure, which no unit
+        // test can exercise; this pins that the plumbing selects the mode and
+        // the archive's block/counter mechanics are unchanged under it.
+        let (b, c, dir) = setup(1 << 16);
+        let cfg = ArchiveConfig {
+            durability: Durability::Eventual,
+            ..test_cfg(dir.path())
+        };
+        let mut arch = Archive::open(cfg).unwrap();
+        let mut a = Appender::new(Arc::clone(&b), 1);
+        for i in 0..10 {
+            a.append(1, i, &[7u8; 64]).unwrap();
+        }
+        assert!(arch.do_work(&b).unwrap());
+        assert!(!arch.do_work(&b).unwrap());
+        assert_eq!(c.counters().durable.load_acquire(), 960);
+        assert_eq!(arch.blocks_recorded(), 1);
+        // Recorded block is immediately readable back (page-cache read).
+        let (meta, blk) = arch.journal().read(0).unwrap().unwrap();
+        assert_eq!((meta, blk.len()), (0, 960));
     }
 
     #[test]

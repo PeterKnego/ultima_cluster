@@ -13,6 +13,10 @@
 //! Spec: `docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md` §4.
 
 pub mod agent;
+/// Re-export: `ArchiveConfig::durability`'s type, so archive callers can
+/// name the posture without a direct `ultima_journal` dependency.
+pub use ultima_journal::Durability;
+
 pub mod archive;
 pub mod buffer;
 pub mod cnc;
