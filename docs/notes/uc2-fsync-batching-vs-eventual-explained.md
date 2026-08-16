@@ -91,8 +91,8 @@ that window:
   node can restart with a shorter log than it reported durable.
 
 So "eventual" is not "more batching." It is moving the ack to the wrong
-side of the fsync. The contract "no acknowledged write survives ≠ is
-lost on power failure" is exactly what changes, and nothing else.
+side of the fsync. The contract "no acknowledged write is lost on power
+failure" is exactly what changes, and nothing else.
 
 (With quorum replication on top, eventual mode's loss model is
 "replication durability": a single node's power loss is covered by the
