@@ -228,6 +228,18 @@ memory; ~130 fault ticks/run x 3 runs keeps total exposure at CI scale)
 and `ELLE_JAVA_XMX=3g` (2 g handled larger pre-fix histories). The decide
 rule is unchanged: 3/3 PASS under both models.
 
+**Second amendment (the 80k cap was the WRONG shape):** capped runs bind
+in ~39 s with 14 fault ticks and ~14 lifetime terms — they never reach
+the >64-term regime the fix guards, so they test nothing. And post-fix
+throughput is ~8x pre-fix (84k ops/39 s vs 72k/300 s — the wipe loop was
+also a throughput disaster), which makes per-key lists (and therefore
+history memory) explode quadratically at fixed key count: the 3 g checker
+OOMed on a 168k-event history. Final gate shape: keep the FULL 300 s
+budget (242 ticks, 300+ terms — the actual bug regime), bound memory by
+workload geometry instead: `ELLE_KEYS=200` (spreads appends, shorter
+lists, smaller reads), `ELLE_WORKERS=2` (halves op rate),
+`ELLE_JAVA_XMX=6g`. Decide rule still 3/3 PASS both models.
+
 **Directed-rig pre-commitment (stale-read root cause, 2026-08-16):**
 `uc2_node/tests/stale_read_hunt.rs` (ignored; hunt tool): 3-node crypto-ON
 cluster, 1 writer acking monotone register writes, 2 linearizable readers
