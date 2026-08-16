@@ -123,3 +123,27 @@ op rate AND wider per-op vulnerability windows). Decide: ≥1
 `incompatible-order` in either arm → reproduced (keep full dir + verbose
 anomaly JSON). 0/16 → next re-plan is explicit (2-vCPU cloud VM, or land
 CI artifact-upload and wait for the next nightly hit).
+
+**Phase 1 status update (2026-08-16):** REPRODUCED on the amended
+protocol's first attempt (round 2, arm A, attempt 1):
+`strong-serializable false|G-single-item-realtime`, serializable clean —
+stale linearizable reads (2.2 s and 9.5 s of staleness) right after
+serving resumed post-failover. The CI `incompatible-order` is the
+stronger cousin of the same signal. Two follow-on facts from the same
+round: (a) attempts 2-3 died SIGBUS — root-caused to `truncate(true)` on
+mmap-shared files at boot (cnc + all rings), fixed on main `4f544dd`
+(punch-hole helper, hammer test); (b) the elle checker at `-Xmx2g` OOMs
+on ~450 MB histories → empty verdict misread as FAIL; runner now uses
+6g and classifies empty verdicts INVALID.
+
+**Directed-rig pre-commitment (stale-read root cause, 2026-08-16):**
+`uc2_node/tests/stale_read_hunt.rs` (ignored; hunt tool): 3-node crypto-ON
+cluster, 1 writer acking monotone register writes, 2 linearizable readers
+asserting every read ≥ the acked frontier snapshot taken BEFORE invoke,
+nemesis = elle's failover mix (alternating leader kill+restart /
+leader-service-only crash) every 500 ms. **n = 6 runs × 300 s, FIXED**,
+concurrent with elle hunt round 4 (contention noted; it mimics CI noise).
+Decide: ≥1 violation → root-cause payload (cnc dump + nemesis
+correlation) and move to fix; 0/6 → mechanism needs elle's op shape —
+next re-plan explicit: port the frontier witness INTO the elle harness
+as an online assert.
