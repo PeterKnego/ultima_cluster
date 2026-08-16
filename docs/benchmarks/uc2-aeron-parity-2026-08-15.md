@@ -111,8 +111,18 @@ immediately after; `terraform state list` verified EMPTY. Raw artifacts
 | **Aeron Cluster, SHARED driver** (IPC client) | 800 k rate / batch 64 | **800,000** (offered==achieved) | **0.360 ms** | 1.031 ms |
 | **Aeron Cluster, DEDICATED driver** (IPC client) | 800 k rate / batch 64 | 800,000 | 0.394 ms | **38.1 ms** |
 
-**Ratio: UC/Aeron ≈ 1.60–1.79×** on max sub-millisecond throughput
-(UC bracket ÷ 800 k). The complementary truth, stated plainly: **at Aeron's
+**Ratio: UC/Aeron ≈ 1.60–1.79× at the measured clean points** (UC bracket
+÷ 800 k). Grid-granularity disclosure (added 2026-08-16): Aeron was
+OFFERED up to 1.4 M in both modes — 800 k is the highest rung the rig
+sustained (1.0 M+ returned its own `.FAIL` achieved-rate markers in shared
+mode at both batch sizes), so Aeron-shared's true sub-ms ceiling lies in
+the unsubdivided bracket **[800 k, 1 M)**. Taking that bracket's open end,
+the conservative ratio floor is 1.28 M ÷ ~1 M ≈ **1.28×**; the honest
+statement is "UC leads by 1.3–1.8×, with the measured-point ratio
+1.6–1.8×". A finer sweep (850/900/950 k) on a future fleet would tighten
+this to ±50 k. Dedicated mode, for completeness, ACHIEVED 1.0–1.4 M
+(grid-capped, raw ceiling unfound) — Aeron moves ≥1.4 M/s through this
+pipeline when latency is sacrificed. The complementary truth, stated plainly: **at Aeron's
 operating point its p50 is ~1.9× lower than UC's at UC's** (0.36 vs
 0.65-0.78 ms) — Aeron buys lower median latency at its rate ceiling; UC
 sustains ~1.6-1.8× the rate inside the same 1 ms budget with comparable
