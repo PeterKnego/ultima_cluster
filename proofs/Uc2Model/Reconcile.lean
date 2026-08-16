@@ -49,6 +49,51 @@ where
     let newMap := own.take k ++ (own.drop k).filter (fun e => e.2 < validUpTo)
     .ok ⟨validUpTo, newMap⟩
 
+/-- `reconcile.rs::reconcile` POST the 2026-08-16 window-alignment fix. The
+Rust function now ALIGNS the leader's shipped window (`term_map_wire_tail`,
+last 64 entries) inside the follower's full map before prefix-matching —
+the old index-aligned match declared `NoCommonPrefix` against every healthy
+follower once a cluster's lifetime leadership count exceeded the window,
+wiping followers in a loop and ultimately truncating committed bytes
+cluster-wide (the Aug 2026 nightly acked-write-loss).
+
+Structurally the fix is a thin wrapper over the UNCHANGED core above: find
+the alignment index `j` of `leader[0]` in `own`, run the core on the aligned
+suffix `own.drop j` (its head equals `leader[0]`, so the core's
+NoCommonPrefix gate never fires and its clamps operate at the aligned
+offsets), and re-prepend the below-window prefix `own.take j` (our honest
+observations of history the window simply did not ship). When `leader[0]`
+is not in `own` at all: an empty `own` reconciles clean; a window starting
+strictly beyond our bytes is the genuine purged-prefix `NoCommonPrefix`; a
+window starting INSIDE our bytes at a term our data-stamped map lacks is
+proven divergence — cut there (clamped further by our first entry claiming
+a term ≥ the window's first, the same-term/different-base conflict).
+
+The theorems in `Uc2Proofs/Reconcile.lean` are stated over the CORE and are
+untouched; wrapper-level ports are queued follow-up work (see the 2026-08-16
+flake-hunt brief). Decision 7 in `ProtocolData.lean` (full-map gossip) means
+the protocol model's reachable states have `j = 0`, where the wrapper and
+the core coincide definitionally. -/
+def reconcileAligned (own : TermMap) (ownDurable : Nat) (leader : TermMap) :
+    ReconcileResult :=
+  match leader with
+  | [] => .ok ⟨ownDurable, own⟩
+  | l0 :: _ =>
+    match own.findIdx? (fun e => e == l0) with
+    | some j =>
+      match reconcile (own.drop j) ownDurable leader with
+      | .ok o => .ok ⟨o.validUpTo, own.take j ++ o.newMap⟩
+      | .noCommonPrefix => .noCommonPrefix  -- unreachable: (own.drop j).head = l0
+    | none =>
+      if own.isEmpty then .ok ⟨ownDurable, []⟩
+      else if ownDurable < l0.2 then .noCommonPrefix
+      else
+        let cut0 := min ownDurable l0.2
+        let cut := match own.find? (fun e => l0.1 ≤ e.1) with
+          | some e => min cut0 e.2
+          | none => cut0
+        .ok ⟨cut, own.filter (fun e => e.2 < cut)⟩
+
 end Uc2
 
 -- Ports of the reconcile.rs unit tests (binding contract).
@@ -84,4 +129,28 @@ section
   == .noCommonPrefix
 -- empty_own_map_reconciles_clean_at_durable_zero
 #guard reconcile [] 0 [(1, 0), (2, 5000)] == .ok ⟨0, []⟩
+
+-- 2026-08-16 window-alignment fix: wrapper guards (Rust regression tests).
+-- windowed_leader_map_aligns_against_full_own_map (shape reduced: own of 6
+-- entries, window = last 3; healthy follower reconciles CLEAN, full map kept)
+#guard reconcileAligned
+    [(1, 0), (2, 1000), (3, 2000), (4, 3000), (5, 4000), (6, 5000)] 6000
+    [(4, 3000), (5, 4000), (6, 5000)]
+  == .ok ⟨6000, [(1, 0), (2, 1000), (3, 2000), (4, 3000), (5, 4000), (6, 5000)]⟩
+-- windowed alignment still cuts at real divergence (leader term below durable
+-- that our aligned run lacks)
+#guard reconcileAligned
+    [(1, 0), (2, 1000), (3, 2000), (5, 4000)] 5000
+    [(3, 2000), (6, 4500)]
+  == .ok ⟨4000, [(1, 0), (2, 1000), (3, 2000)]⟩
+-- window_start_inside_our_bytes_but_unknown_term_cuts_there
+#guard reconcileAligned [(1, 0), (2, 2000)] 5000 [(40, 4000), (41, 9000)]
+  == .ok ⟨4000, [(1, 0), (2, 2000)]⟩
+-- genuine purged-prefix window (strictly beyond our bytes) still surfaces
+#guard reconcileAligned [(1, 0)] 5000 [(40, 1048576), (41, 2097152)]
+  == .noCommonPrefix
+-- aligned-at-0 wrapper coincides with the core on the old contract cases
+#guard reconcileAligned [(1, 0), (2, 5000)] 5000 [(1, 0), (3, 5000)]
+  == .ok ⟨5000, [(1, 0)]⟩
+#guard reconcileAligned [] 0 [(1, 0), (2, 5000)] == .ok ⟨0, []⟩
 end

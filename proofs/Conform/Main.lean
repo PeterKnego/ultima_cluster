@@ -27,7 +27,9 @@ def checkReconcile (j : Json) : Except String Bool := do
   let leader ← getMap! j "leader"
   let expect ← j.getObjVal? "expect"
   let kind ← (← expect.getObjVal? "kind").getStr?
-  match reconcile own d leader, kind with
+  -- 2026-08-16: Rust's `reconcile` is the window-ALIGNED form; the model's
+  -- `reconcile` remains the unchanged core the theorems are stated over.
+  match reconcileAligned own d leader, kind with
   | .noCommonPrefix, "no_common_prefix" => pure true
   | .ok o, "ok" => do
     let v ← getNat! expect "valid_up_to"

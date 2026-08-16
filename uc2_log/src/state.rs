@@ -57,6 +57,13 @@ pub struct ConfigRecord {
 
 pub type TermMap = Vec<TermMapEntry>;
 
+/// Newest-entries clamp for the PERSISTED term map (see
+/// [`NodeState::store_term_map`]). 300 entries ≈ 3.6 KiB of payload against
+/// the ~4 KiB StableValue slot, and leaves a wide margin over the 64-entry
+/// wire window (`MAX_TERM_MAP_WIRE_ENTRIES`) that reconciliation actually
+/// consumes.
+pub const PERSISTED_TERM_MAP_MAX_ENTRIES: usize = 300;
+
 /// Cached consensus state: vote, term map, output progress, snapshot floor, config record.
 type CacheState = (Option<VoteRecord>, TermMap, u64, u64, Option<ConfigRecord>);
 
@@ -133,9 +140,27 @@ impl NodeState {
     }
 
     /// Durable on return — the new term exists before the leader acts in it.
+    ///
+    /// The PERSISTED copy is clamped to the newest
+    /// [`PERSISTED_TERM_MAP_MAX_ENTRIES`] entries: a StableValue payload is a
+    /// single ~4 KiB slot, and an unclamped map overflows it (fail-stopping
+    /// the consensus thread) once a cluster's LIFETIME leadership count passes
+    /// ~340 — reached in minutes under election churn (found 2026-08-16 by the
+    /// stale-read hunt rig; previously masked because the wipe-and-rejoin loop
+    /// kept resetting maps). Clamping the durable cache is sound: the boot
+    /// path re-derives the FULL map from journal frame headers and seeds the
+    /// SM from that re-derivation, so the persisted copy's only job is
+    /// credentials/coverage for the newest terms. Entries older than the clamp
+    /// AND below a purged journal floor are unrecoverable — which is exactly
+    /// the M6 below-floor regime where reconciliation already answers with
+    /// snapshot install / wipe-and-rejoin, never with old map entries. The
+    /// in-memory map (`self.cache`) keeps the clamped view only as a cache of
+    /// what was stored; live consumers hold the full map in the SM.
     pub fn store_term_map(&self, m: &TermMap) -> Result<(), StableValueError> {
-        self.term_map.store(m)?.wait().map_err(durability_error)?;
-        self.cache.lock().unwrap().1 = m.clone();
+        let start = m.len().saturating_sub(PERSISTED_TERM_MAP_MAX_ENTRIES);
+        let clamped = &m[start..];
+        self.term_map.store(&clamped.to_vec())?.wait().map_err(durability_error)?;
+        self.cache.lock().unwrap().1 = clamped.to_vec();
         Ok(())
     }
 
@@ -227,6 +252,29 @@ mod tests {
             s.term_map(),
             vec![TermMapEntry { term: 1, base: 0 }, TermMapEntry { term: 3, base: 4096 }]
         );
+    }
+
+    #[test]
+    fn oversized_term_map_persists_clamped_to_newest_entries() {
+        // 2026-08-16 hunt regression: an unclamped 340+-entry map overflowed
+        // the StableValue slot (PayloadTooLarge) and fail-stopped the
+        // consensus thread. The persisted copy must clamp to the newest
+        // PERSISTED_TERM_MAP_MAX_ENTRIES and survive a reopen.
+        let dir = tempfile::tempdir().unwrap();
+        let full: TermMap = (0..400u32)
+            .map(|i| TermMapEntry { term: i + 1, base: i as u64 * 1000 })
+            .collect();
+        {
+            let s = NodeState::open(dir.path()).unwrap();
+            s.store_term_map(&full).unwrap(); // must NOT PayloadTooLarge
+            let kept = s.term_map();
+            assert_eq!(kept.len(), PERSISTED_TERM_MAP_MAX_ENTRIES);
+            assert_eq!(kept.last(), full.last());
+            assert_eq!(kept[0], full[full.len() - PERSISTED_TERM_MAP_MAX_ENTRIES]);
+        }
+        let s = NodeState::open(dir.path()).unwrap();
+        assert_eq!(s.term_map().len(), PERSISTED_TERM_MAP_MAX_ENTRIES);
+        assert_eq!(s.term_map().last(), full.last());
     }
 
     #[test]
