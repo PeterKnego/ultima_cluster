@@ -74,6 +74,20 @@ pub(crate) struct SnapshotTrigger<S: StateMachine> {
 /// per-field disjoint borrows (`follower` iterated while `sm`/`egress`/`cnc`
 /// are touched).
 pub(crate) struct ApplyState<S: StateMachine> {
+    /// **Poisoned incarnation** (2026-08-16 log-rewind contract). Set when the
+    /// node truncates the log BENEATH what this SM already applied: our state
+    /// belongs to a timeline that no longer exists. Once set, this incarnation
+    /// applies nothing further and answers every query with RETRY — it must
+    /// never serve dead-timeline state, nor resume applying on top of it (that
+    /// merge is what elle sees as `incompatible-order`). Recovery is a FRESH
+    /// incarnation, which reconstructs from the journal; `Service::is_alive`
+    /// reports poisoned so a supervisor respawns it.
+    ///
+    /// Poisoning rather than panicking is deliberate: a panic kills the apply
+    /// thread, which in-process leaves the node silently serving nothing and
+    /// re-raises at teardown, and out-of-process still needs the supervisor to
+    /// notice. A flag degrades safely in both worlds.
+    pub(crate) poisoned: Arc<AtomicBool>,
     pub(crate) follower: LogFollower,
     /// The user state machine, behind `Arc<Mutex<S>>`. `Arc` (shared, not owned)
     /// so the `Service` handle can reach it for direct queries (the test/embedded
@@ -144,22 +158,31 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
     let durable = c.durable.load_acquire();
     // Log-rewind tripwire (2026-08-16 acked-write-loss hunt): `durable` below
     // our applied cursor means the node truncated/primed the log BENEATH state
-    // this SM already applied — our state is from a dead timeline. Silently
-    // idling here serves stale answers through the whole refill and then
-    // MERGES two timelines once the log regrows past the cursor (the elle
-    // `incompatible-order` divergence). In a healthy cluster this is
-    // unreachable (truncation never cuts below commit, and applied <= commit),
-    // so fail-stop loudly like the instance-mismatch contract; the supervisor
-    // respawns a fresh service that reconstructs from the (new-timeline)
-    // journal. Gated on a matching instance id so a node-restart's zeroed page
-    // stays `check_node_instance`'s case, not ours.
-    if durable < st.follower.cursor && st.cnc.try_instance_id() == Some(st.instance_id) {
-        panic!(
-            "uc2_service: log rewound beneath the applied frontier (durable {durable} < applied \
-             cursor {}) — this incarnation's state is from a truncated timeline. Fail-stop; the \
-             supervisor respawns the service to reconstruct from the journal.",
+    // this SM already applied — our state is from a dead timeline. Idling here
+    // would serve stale answers for the whole refill and then MERGE two
+    // timelines once the log regrows past the cursor (the elle
+    // `incompatible-order` divergence). Poison the incarnation instead: stop
+    // applying, refuse every query, and let a supervisor respawn a fresh
+    // service that reconstructs from the journal. Gated on a matching instance
+    // id so a node-restart's zeroed page stays `check_node_instance`'s case.
+    if durable < st.follower.cursor
+        && st.cnc.try_instance_id() == Some(st.instance_id)
+        && !st.poisoned.swap(true, Ordering::Release)
+    {
+        eprintln!(
+            "uc2_service: log rewound beneath the applied frontier (durable {durable} < \
+             applied cursor {}) — this incarnation's state is from a truncated timeline. \
+             Poisoned: applying nothing further and refusing reads until respawned.",
             st.follower.cursor,
         );
+    }
+    if st.poisoned.load(Ordering::Acquire) {
+        // Refuse reads (RETRY, side-effect-free) so no client can observe the
+        // dead timeline; keep the heartbeat so the node sees a live-but-
+        // poisoned service rather than a hung one.
+        refuse_queries(st);
+        st.cnc.status().service_heartbeat_ns.store_release(unix_ns());
+        return false;
     }
     let target = c.commit.load_acquire().min(durable);
     let mut progressed = false;
@@ -333,6 +356,20 @@ const QUERY_DRAIN_PER_CYCLE: usize = 64;
 /// forwarded unconditionally. Both this RETRY site and the barrier's are
 /// PRE-query / side-effect-free: a query never mutates the SM (the
 /// cross-task RETRY-is-side-effect-free invariant, Task 10 review).
+/// Poisoned-incarnation read path: drain the query ring and answer every
+/// request with RETRY. Side-effect-free (the SM is never touched), so the
+/// cross-task "RETRY is side-effect-free" invariant holds here too. The client
+/// rotates to another node or retries after the supervisor respawns us.
+fn refuse_queries<S: StateMachine>(st: &mut ApplyState<S>) {
+    let mut buf = Vec::new();
+    for _ in 0..QUERY_DRAIN_PER_CYCLE {
+        match st.svc_query.try_read(&mut buf) {
+            Ok(Some(rec)) => st.egress.publish_retry(rec.header_extra),
+            _ => break,
+        }
+    }
+}
+
 fn drain_queries<S: StateMachine>(st: &mut ApplyState<S>) {
     // This incarnation's epoch, CAPTURED AT ATTACH (M5 final review #5) — fixed
     // for this incarnation's life, NOT re-read live from the page. A newer

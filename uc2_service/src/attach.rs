@@ -30,6 +30,9 @@ pub(crate) struct Attached<S: StateMachine> {
     pub(crate) instance_id: u128,
     /// This incarnation's service epoch (the post-bump value).
     pub(crate) epoch: u64,
+    /// Shared poison flag (see [`ApplyState::poisoned`]) — the `Service`
+    /// handle keeps a clone so `is_alive` can report a poisoned incarnation.
+    pub(crate) poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Run the 6-step attach. Steps 1–5 here; step 6 (spawn the threads) is the
@@ -102,8 +105,10 @@ pub(crate) fn attach<S: StateMachine>(
     //    bump-once-at-attach point; it happens before the thread is READY.
     let epoch = cnc.service().service_epoch.fetch_add(1) + 1;
 
+    let poisoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let follower = LogFollower::new(Arc::clone(&buffer), start_pos);
     let apply_state = ApplyState {
+        poisoned: Arc::clone(&poisoned),
         follower,
         sm: Arc::new(Mutex::new(sm)),
         cnc: Arc::clone(&cnc),
@@ -125,5 +130,5 @@ pub(crate) fn attach<S: StateMachine>(
         snapshot_restore: None,
     };
 
-    Ok(Attached { apply_state, buffer, cnc, instance_id, epoch })
+    Ok(Attached { apply_state, buffer, cnc, instance_id, epoch, poisoned })
 }

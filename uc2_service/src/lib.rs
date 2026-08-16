@@ -105,6 +105,7 @@ impl<S: StateMachine, O: OutputHandler<S>> ServiceBuilder<S, O> {
         let cnc = attached.cnc;
         let instance_id = attached.instance_id;
         let epoch = attached.epoch;
+        let poisoned = Arc::clone(&attached.poisoned);
 
         // 6. Spawn the apply thread. `AgentRunner::drop` already signals+joins,
         //    so a spawn failure below cannot leak a running thread. Keep a shared
@@ -146,7 +147,7 @@ impl<S: StateMachine, O: OutputHandler<S>> ServiceBuilder<S, O> {
         let apply_agent = AgentRunner::spawn("uc2-apply", APPLY_IDLE, move || apply_cycle(&mut state))?;
         agents.push(apply_agent);
 
-        Ok(Service { agents, sm, _cnc: cnc, instance_id, epoch })
+        Ok(Service { agents, sm, _cnc: cnc, instance_id, epoch, poisoned })
     }
 
     /// Like [`start`](Self::start), but ALSO spawns the M6 Task 3 snapshot
@@ -176,6 +177,7 @@ impl<S: StateMachine, O: OutputHandler<S>> ServiceBuilder<S, O> {
         let cnc = attached.cnc;
         let instance_id = attached.instance_id;
         let epoch = attached.epoch;
+        let poisoned = Arc::clone(&attached.poisoned);
 
         let mut state = attached.apply_state;
         let sm = Arc::clone(&state.sm);
@@ -252,7 +254,7 @@ impl<S: StateMachine, O: OutputHandler<S>> ServiceBuilder<S, O> {
         // it new work.
         agents.push(builder_agent);
 
-        Ok(Service { agents, sm, _cnc: cnc, instance_id, epoch })
+        Ok(Service { agents, sm, _cnc: cnc, instance_id, epoch, poisoned })
     }
 }
 
@@ -260,6 +262,9 @@ impl<S: StateMachine, O: OutputHandler<S>> ServiceBuilder<S, O> {
 /// shared-memory mappings alive.
 pub struct Service<S: StateMachine> {
     agents: Vec<AgentRunner>,
+    /// Set when the apply thread poisons this incarnation (log rewound
+    /// beneath the applied frontier). See [`Service::is_alive`].
+    poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Shared handle to the apply thread's state machine, for direct queries.
     sm: Arc<Mutex<S>>,
     /// Held for the service's life so the mmap'd cnc page stays mapped.
@@ -300,7 +305,8 @@ impl<S: StateMachine> Service<S> {
     ///
     /// [`stop`]: Self::stop
     pub fn is_alive(&self) -> bool {
-        self.agents.iter().all(|a| !a.is_finished())
+        !self.poisoned.load(std::sync::atomic::Ordering::Acquire)
+            && self.agents.iter().all(|a| !a.is_finished())
     }
 
     /// Graceful stop: signal every agent and join, propagating a work-closure
