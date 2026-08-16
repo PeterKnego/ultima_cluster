@@ -109,3 +109,17 @@ required. CI apparent hit rate: 2 of ~8 nightly crypto runs ≈ 25%.
   analysis. 0/12 → NOT reproduced at this rate; re-plan EXPLICITLY
   (2-core taskset arm next); no silent extension.
 - Passing attempts' dirs are deleted; failing attempts kept whole.
+
+**Phase 1 re-plan (pre-registered branch taken, 2026-08-16):** the first
+n=12 ran the literal CI env but the 8,000-op TARGET binds on this fast box
+(8 s, 3 fault ticks/attempt) while the 300 s BUDGET binds on slow CI
+runners (246 ticks) — ~1/80th the fault exposure per attempt; those 12
+passes are void as evidence (harness lesson recorded: equalize
+EXPOSURE — fault windows — not op counts). Amended protocol, n fixed
+before running: `ELLE_TARGET_OPS=1000000` (unreachable → budget binds →
+~250 fault ticks/attempt, matching CI), `ELLE_BUDGET_SECS=300`;
+**arm A: n=8 unconstrained; arm B: n=8 under `taskset -c 0,1`** (CI-speed
+op rate AND wider per-op vulnerability windows). Decide: ≥1
+`incompatible-order` in either arm → reproduced (keep full dir + verbose
+anomaly JSON). 0/16 → next re-plan is explicit (2-vCPU cloud VM, or land
+CI artifact-upload and wait for the next nightly hit).
