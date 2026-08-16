@@ -212,6 +212,18 @@ where
         })
     }
 
+    /// Would `value` fit in a slot? Same encoder and same bound as [`store`],
+    /// so a caller that must shrink an oversized value (e.g. keep only the
+    /// newest tail of a growing list) can ask instead of predicting the
+    /// encoded width — bincode varints make per-element size value-dependent.
+    ///
+    /// [`store`]: Self::store
+    pub fn fits(&self, value: &T) -> Result<bool, StableValueError> {
+        let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())
+            .map_err(|e| StableValueError::Serialize(e.to_string()))?;
+        Ok((bytes.len() as u32) <= self.slot_size - 17)
+    }
+
     /// Return the last stored value, or `None` if never stored (or cleared).
     pub fn load(&self) -> Result<Option<T>, StableValueError> {
         Ok(self.inner.lock().unwrap().cached.clone())

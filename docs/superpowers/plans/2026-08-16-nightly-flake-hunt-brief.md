@@ -136,6 +136,48 @@ mmap-shared files at boot (cnc + all rings), fixed on main `4f544dd`
 on ~450 MB histories → empty verdict misread as FAIL; runner now uses
 6g and classifies empty verdicts INVALID.
 
+## RESIDUE CLOSED: the apply/gossip race (2026-08-16, same day)
+
+The race the rewind tripwire exposed is now fixed rather than merely
+surfaced. **Mechanism:** commit gossip carries a POSITION ONLY. A follower
+that adopts a new term holds a tail no leader has validated yet (the
+term-map reconcile arrives on a later datagram, or a lost one). Accepting
+the new leader's commit position blessed OUR bytes at positions the NEW
+timeline owns, so the service applied a deposed leader's content there
+(elle `incompatible-order`); when the reconcile cut finally landed it was
+BENEATH the applied cursor. Raft closes this with the AppendEntries
+prevLogIndex/prevLogTerm match gating `commitIndex`; UC's equivalent
+evidence is the term-map reconcile, so the commit advance now waits for
+it.
+
+**Fix** (`uc2_consensus::ElectionSm`, the safety core, so the sim
+adjudicates it): an `awaiting_reconcile` commit-validation latch, armed on
+adopting a strictly higher term (mirroring the node's existing data-plane
+latch + intake-gate close, derived at boot from the same recovered state:
+`vote_term > map_term`), released when this term's leader map reconciles
+clean OR its truncation acks, and dropped on becoming leader. Gossip
+arriving while latched is HELD in `deferred_commit` and replayed as one
+`AdvanceCommit` on release — bounded by ONE gossip round, because the
+leader ships `ShipTermMap` alongside every `GossipCommit` on both the
+commit-advance path and the idle floor.
+
+**Model finding (third of a kind):** `ProtocolCommit.lean` §10 lists this
+exact plane as a documented omission — *"(a) commit gossip / follower
+`commit_seen` (decision 4 — YAGNI: leader completeness is about the
+leader's hist)"*. As with the windowed map (`ProtocolData` decision 7),
+the bug lived precisely in the erased distinction. The fix needs no Lean
+change (the plane is unmodeled); modeling the follower commit plane is
+now a proofs-arc item, not a YAGNI.
+
+**Acceptance pre-commitment (fixed before running):** (1) rig n=8 x 300 s
+— 0 violations, 0 wipes, 0 consensus deaths AND **0 tripwires** (the new
+metric: 13-27/run before this fix, 0 after it in a single pilot run);
+(2) elle failover x3 both models; (3) `resize_3_to_5_to_3` n=20 — the
+latch could delay config adoption, so it must not exceed the measured
+5.8% baseline materially; (4) lin_v2, lin_partition_v2, hard-crash,
+workspace, clippy, conformance 100k, `lake build`. Any miss → back to
+analysis, no goalpost moves.
+
 ## ROOT CAUSE FOUND + FIX (2026-08-16)
 
 The safety signal, the acked-write-loss witness, and (likely) the whole

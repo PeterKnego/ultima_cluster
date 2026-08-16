@@ -157,10 +157,27 @@ impl NodeState {
     /// in-memory map (`self.cache`) keeps the clamped view only as a cache of
     /// what was stored; live consumers hold the full map in the SM.
     pub fn store_term_map(&self, m: &TermMap) -> Result<(), StableValueError> {
-        let start = m.len().saturating_sub(PERSISTED_TERM_MAP_MAX_ENTRIES);
-        let clamped = &m[start..];
-        self.term_map.store(&clamped.to_vec())?.wait().map_err(durability_error)?;
-        self.cache.lock().unwrap().1 = clamped.to_vec();
+        // SIZE-driven, not count-driven. The first cut at this (2026-08-16)
+        // clamped to a fixed entry count derived from an assumed 12-byte
+        // encoding; a churn run overflowed anyway (`PayloadTooLarge { limit:
+        // 4079, got: 4085 }`), because the encoded width of an entry is not a
+        // constant — bincode's varints grow with term number and byte
+        // position, so "how many entries fit" depends on how far the cluster
+        // has run. Ask the encoder instead of predicting it: drop the OLDEST
+        // entries until the payload fits, keeping the newest (the ones
+        // reconciliation and vote credentials actually consult).
+        let mut start = m.len().saturating_sub(PERSISTED_TERM_MAP_MAX_ENTRIES);
+        let clamped = loop {
+            let candidate = m[start..].to_vec();
+            if self.term_map.fits(&candidate)? || start >= m.len() {
+                break candidate;
+            }
+            // Drop a chunk rather than one entry per pass: this runs on the
+            // consensus thread and the map only ever needs its newest tail.
+            start = (start + 16).min(m.len());
+        };
+        self.term_map.store(&clamped)?.wait().map_err(durability_error)?;
+        self.cache.lock().unwrap().1 = clamped;
         Ok(())
     }
 
@@ -274,6 +291,34 @@ mod tests {
         }
         let s = NodeState::open(dir.path()).unwrap();
         assert_eq!(s.term_map().len(), PERSISTED_TERM_MAP_MAX_ENTRIES);
+        assert_eq!(s.term_map().last(), full.last());
+    }
+
+    /// The count clamp alone was NOT enough (2026-08-16 second miss): entry
+    /// width is value-dependent under bincode varints, so a long-running
+    /// cluster's big terms + big byte positions overflowed the slot at the
+    /// "safe" entry count. Drive the clamp from the encoder, and pin it here
+    /// with values far past anything the first test used.
+    #[test]
+    fn term_map_with_large_terms_and_positions_still_fits_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = NodeState::open(dir.path()).unwrap();
+        // 5,000 lifetime terms at multi-gigabyte byte positions: every field
+        // lands in bincode's widest varint class.
+        let full: TermMap = (0..5_000u32)
+            .map(|i| TermMapEntry {
+                term: 100_000 + i,
+                base: 8_000_000_000 + (i as u64) * 1_000_003,
+            })
+            .collect();
+        s.store_term_map(&full).expect("must clamp to fit, never PayloadTooLarge");
+        let kept = s.term_map();
+        assert!(!kept.is_empty(), "the newest entries must survive");
+        assert!(kept.len() <= PERSISTED_TERM_MAP_MAX_ENTRIES);
+        assert_eq!(kept.last(), full.last(), "the clamp keeps the NEWEST tail");
+        // Survives a reopen (it really is on disk, not just cached).
+        drop(s);
+        let s = NodeState::open(dir.path()).unwrap();
         assert_eq!(s.term_map().last(), full.last());
     }
 

@@ -294,6 +294,29 @@ pub struct ElectionSm {
     truncation_epoch: u64,
     /// The reconciled map to adopt once the matching `Truncated` feedback arrives.
     pending_new_map: Option<Vec<(u32, u64)>>,
+    /// **Follower commit-validation latch (2026-08-16 apply/gossip race).**
+    /// True from the moment we adopt a strictly higher term until this term's
+    /// leader map has RECONCILED our history (clean) or its truncation has
+    /// acked. While true our tail is unvalidated: bytes we hold at positions
+    /// the new leader also owns may be a deposed leader's content. Commit
+    /// gossip carries a POSITION ONLY, so accepting it here would let the
+    /// service apply OUR bytes at positions the new timeline has blessed —
+    /// the divergence that shows up as elle `incompatible-order` (and, once
+    /// the late reconcile cut lands beneath the applied cursor, as the
+    /// service rewind fail-stop). Raft closes this with the AppendEntries
+    /// prevLogIndex/prevLogTerm match before `commitIndex` may advance; UC's
+    /// equivalent evidence is the term-map reconcile, so the commit advance
+    /// waits for it. Liveness cost is bounded by one gossip round: the leader
+    /// ships `ShipTermMap` alongside EVERY `GossipCommit`, on both the
+    /// commit-advance path (`rank_leader`) and the idle floor (`on_tick`).
+    /// The node keeps its own mirror of this latch for the DATA plane
+    /// (`awaiting_reconcile` + the intake gate); this one governs commit, and
+    /// lives here so the sim adjudicates it.
+    awaiting_reconcile: bool,
+    /// Highest commit position gossiped while `awaiting_reconcile` — replayed
+    /// as one `AdvanceCommit` the moment validation completes, so the pause
+    /// costs a round of latency and never a lost advance.
+    deferred_commit: u64,
     /// M6 Task 8: on `Reconcile::NoCommonPrefix`, wipe-and-rejoin (truncate to 0 +
     /// empty map) instead of fail-stopping. Default `true`. The sim counterfactual
     /// flips it to `false` to reproduce the OLD `Action::Fatal` behavior and prove
@@ -440,6 +463,15 @@ impl ElectionSm {
             truncating_epoch: None,
             truncation_epoch: 0,
             pending_new_map: None,
+            // Boot mirror of the node's `boot_awaiting_reconcile`
+            // (`node.rs`: `vote_term > map_term`) — derived from the SAME
+            // recovered state rather than passed in, so the two latches
+            // cannot disagree at boot: a node that voted in a term its own
+            // data-stamped map never reached comes up holding a tail no
+            // leader has yet validated.
+            awaiting_reconcile: recovered_vote.map(|(t, _)| t).unwrap_or(0)
+                > recovered_term_map.last().map(|&(t, _)| t).unwrap_or(0),
+            deferred_commit: 0,
             wipe_on_no_common_prefix: true,
             stepped_down: false,
             self_removed: false,
@@ -592,8 +624,15 @@ impl ElectionSm {
                     self.step_down_to_follower(out);
                 }
                 if !matches!(self.role, Role::Leader) && commit > self.commit_seen {
-                    self.commit_seen = commit;
-                    out.push(Action::AdvanceCommit { commit });
+                    if self.awaiting_reconcile {
+                        // Unvalidated tail: hold the position, do NOT bless our
+                        // bytes with it (see `awaiting_reconcile`). Replayed by
+                        // `finish_validation` one gossip round later at worst.
+                        self.deferred_commit = self.deferred_commit.max(commit);
+                    } else {
+                        self.commit_seen = commit;
+                        out.push(Action::AdvanceCommit { commit });
+                    }
                 }
             }
 
@@ -700,6 +739,11 @@ impl ElectionSm {
                     self.term_map = m;
                 }
                 self.truncating_epoch = None;
+                // The unvalidated tail is physically gone and `durable` was
+                // clamped to the cut above: what survives IS the validated
+                // prefix. Release the commit-validation latch and replay any
+                // commit position gossiped while we held it.
+                self.finish_validation(out);
                 // M7 truncation revert (spec §5): `config_position` is the config
                 // frame's END (the effect point) and truncation is frame-aligned,
                 // so `to < config_position` means the frame itself was removed —
@@ -1004,6 +1048,13 @@ impl ElectionSm {
         self.role = Role::Leader;
         self.serving = false;
         self.new_term_pos = None;
+        // Commit-validation latch: a leader validates against nobody — it IS
+        // this term's authority, and Leader Completeness says its log already
+        // holds every committed byte. Drop the latch and DISCARD any deferred
+        // follower-era gossip position: leader commits come only from
+        // `rank_leader`, under the §5.4.2 `new_term_pos` clamp.
+        self.awaiting_reconcile = false;
+        self.deferred_commit = 0;
         // Anchor the idle re-gossip floor to when leadership began (M-4). Without
         // this the floor stays anchored at construction, so the first leader tick
         // of a node that becomes leader long after boot immediately fires the idle
@@ -1060,6 +1111,12 @@ impl ElectionSm {
         self.current_term = new_term;
         self.role = Role::Follower;
         self.serving = false;
+        // Commit-validation latch (2026-08-16): a strictly newer term means a
+        // leader we have not reconciled against owns the history from here on.
+        // Until its map validates (or truncates) our tail, its gossiped commit
+        // position must not bless our bytes. Mirrors the node's data-plane
+        // `awaiting_reconcile` + intake-gate close on the same transition.
+        self.awaiting_reconcile = true;
         self.new_term_pos = None;
         self.votes_received.clear();
         self.voted_for = None; // new term: no vote cast yet
@@ -1071,6 +1128,30 @@ impl ElectionSm {
         // leader re-ships and we re-reconcile from there.
         out.push(Action::BecomeFollower { term: new_term, leader });
         self.halt_if_removed_follower(out);
+    }
+
+    /// Release the commit-validation latch: our history is now known to agree
+    /// with the current term's leader (its map reconciled clean, or the
+    /// truncation it demanded has acked and the surviving bytes are the
+    /// validated prefix). Replays the highest commit position gossiped while
+    /// we were holding, so the pause never loses an advance.
+    ///
+    /// A commit position ABOVE our (possibly just-truncated) durable is fine
+    /// and expected: `commit` is a cluster fact, and apply is separately
+    /// bounded by `min(commit, durable)` — we simply do not hold those bytes
+    /// yet and will NAK for them.
+    fn finish_validation(&mut self, out: &mut Vec<Action>) {
+        if !self.awaiting_reconcile {
+            return;
+        }
+        self.awaiting_reconcile = false;
+        let pending = std::mem::take(&mut self.deferred_commit);
+        // A leader never takes a follower-era gossip position — `rank_leader`
+        // owns leader commits (and clamps them to `new_term_pos`, §5.4.2).
+        if !matches!(self.role, Role::Leader) && pending > self.commit_seen {
+            self.commit_seen = pending;
+            out.push(Action::AdvanceCommit { commit: pending });
+        }
     }
 
     /// Run reconciliation against a leader-shipped map and emit the derived
@@ -1119,14 +1200,26 @@ impl ElectionSm {
                     self.truncating_epoch = Some(epoch);
                     self.pending_new_map = Some(new_map.clone());
                     out.push(Action::Truncate { epoch, to: valid_up_to, new_map });
-                } else if new_map != self.term_map {
-                    // Nothing to truncate. Post-redesign (data-stamped recording)
-                    // this branch only ever SHRINKS our map — dropping a phantom
-                    // frontier entry we opened but never got covered — never adopts
-                    // leader entries (our map grows solely via `DataTermObserved`).
-                    // Persist the shrunk map so our vote credentials stay honest.
-                    self.term_map = new_map.clone();
-                    out.push(Action::PersistTermMap { new_map });
+                    // NOTE: the latch is NOT released here — it clears on this
+                    // truncation's matching `Truncated` ack, once the
+                    // unvalidated bytes are physically gone.
+                } else {
+                    // Clean against THIS term's leader map: every byte we hold
+                    // is validated, so the commit-validation latch releases and
+                    // any deferred gossip position replays. This covers the
+                    // common case too (`new_map == term_map`, nothing to
+                    // persist), which is why it sits outside the map-changed
+                    // check below rather than inside it.
+                    self.finish_validation(out);
+                    if new_map != self.term_map {
+                        // Nothing to truncate. Post-redesign (data-stamped recording)
+                        // this branch only ever SHRINKS our map — dropping a phantom
+                        // frontier entry we opened but never got covered — never adopts
+                        // leader entries (our map grows solely via `DataTermObserved`).
+                        // Persist the shrunk map so our vote credentials stay honest.
+                        self.term_map = new_map.clone();
+                        out.push(Action::PersistTermMap { new_map });
+                    }
                 }
             }
         }
@@ -1910,11 +2003,62 @@ mod tests {
         let mut s = sm(1);
         // adopt term 1 via a grant
         step(&mut s, Event::RequestVote { from: 0, new_term: 1, last_term: 0, last_durable: 0 });
-        let acts = step(&mut s, Event::CommitGossip { term: 1, commit: 4096 });
+        // 2026-08-16: adoption arms the commit-validation latch, so this
+        // position is HELD, not applied to our (as yet unvalidated) bytes.
+        assert!(step(&mut s, Event::CommitGossip { term: 1, commit: 4096 }).is_empty());
+        // The term-1 leader's map reconciles us clean → latch releases and the
+        // held position replays exactly once.
+        let acts = step(&mut s, Event::TermMapReceived { term: 1, entries: vec![(1, 0)] });
         assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 4096 })));
         // stale-term and regressing gossip: no action
         assert!(step(&mut s, Event::CommitGossip { term: 0, commit: 9999 }).is_empty());
         assert!(step(&mut s, Event::CommitGossip { term: 1, commit: 1024 }).is_empty());
+        // Validated now: same-term gossip advances immediately (no extra round).
+        let acts = step(&mut s, Event::CommitGossip { term: 1, commit: 8192 });
+        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 8192 })));
+    }
+
+    /// **The 2026-08-16 apply/gossip race.** Commit gossip carries a POSITION
+    /// ONLY. A follower holding a deposed leader's tail must not let the new
+    /// term's commit position bless those bytes: the service would apply the
+    /// old content at positions the new timeline owns (elle
+    /// `incompatible-order`), and the reconcile cut arriving one gossip round
+    /// later would then land BENEATH the applied cursor.
+    #[test]
+    fn a_new_terms_gossip_cannot_bless_an_unvalidated_tail() {
+        let mut s = sm(1);
+        // We hold 8192 bytes, all stamped term 1.
+        step(&mut s, Event::DataTermObserved { term: 1, base: 0 });
+        step(&mut s, Event::DurableAdvanced { durable: 8192 });
+        // Term 2's leader gossips commit 8192 before its map arrives. Its 8192
+        // is not our 8192 — but we cannot know that yet, so we must NOT advance.
+        let acts = step(&mut s, Event::CommitGossip { term: 2, commit: 8192 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            "commit must not advance over a tail no leader has validated"
+        );
+        // Its map proves term 2 opened at 4096: our 4096..8192 is divergent.
+        let acts = step(
+            &mut s,
+            Event::TermMapReceived { term: 2, entries: vec![(1, 0), (2, 4096)] },
+        );
+        let (epoch, to) = acts
+            .iter()
+            .find_map(|a| match a {
+                Action::Truncate { epoch, to, .. } => Some((*epoch, *to)),
+                _ => None,
+            })
+            .expect("divergent tail must be truncated");
+        assert_eq!(to, 4096);
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            "still unvalidated until the cut actually lands"
+        );
+        // Cut acked: what survives is the validated prefix, so the held
+        // position replays. It legitimately exceeds our durable (4096) —
+        // apply stays bounded by `min(commit, durable)` and we NAK for the rest.
+        let acts = step(&mut s, Event::Truncated { epoch, to });
+        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 8192 })));
     }
 
     #[test]
