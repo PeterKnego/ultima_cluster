@@ -659,6 +659,35 @@ impl<SM: SnapshotStateMachine + Default> LinClusterV2<SM> {
     /// A fresh, EMPTY service reattaches and reconstructs the SM from the log
     /// (Task 9). Submits keep committing on the node during the gap; reads
     /// `RETRY` until the fresh service catches up, then resume.
+    /// **Stand in for the production supervisor.** A service incarnation that
+    /// hits a fail-stop contract (instance mismatch, or the log-rewind
+    /// tripwire) kills its apply thread and stops applying. In production a
+    /// supervisor respawns it; in-process nothing did, so the node silently
+    /// stopped serving and the death only surfaced at teardown, when
+    /// `AgentRunner::stop` re-raised the panic and failed the whole pass.
+    /// Respawn every dead service against the same instance dir — the fresh
+    /// incarnation reconstructs from the journal, exactly as the supervisor's
+    /// would. Returns how many were respawned (0 in a healthy run).
+    ///
+    /// Call it on the nemesis cadence: it is two atomic loads per node when
+    /// everything is alive.
+    pub fn supervise_services(&mut self) -> usize {
+        let mut respawned = 0;
+        for i in 0..self.nodes.len() {
+            let dead = self.nodes[i].service.as_ref().is_some_and(|s| !s.is_alive());
+            if !dead {
+                continue;
+            }
+            let dir = self.nodes[i].instance_dir.clone();
+            if let Some(service) = self.nodes[i].service.take() {
+                service.crash(); // drop-joins; swallows the fail-stop panic
+            }
+            self.nodes[i].service = Some(spawn_service(&dir, self.ccfg.snapshot_interval_bytes));
+            respawned += 1;
+        }
+        respawned
+    }
+
     pub fn crash_and_restart_leader_service(&mut self) {
         let Some(li) = self.leader() else { return };
         let dir = self.nodes[li].instance_dir.clone();

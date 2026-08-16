@@ -60,6 +60,16 @@ impl AgentRunner {
         Ok(AgentRunner { stop, handle: Some(handle) })
     }
 
+    /// Has this agent's thread exited? A polling agent runs until stopped, so
+    /// `true` before teardown means the work closure PANICKED (a fail-stop:
+    /// the service's instance-mismatch or log-rewind contracts, the archive's
+    /// journal I/O contract). Supervisors — the production one, and the test
+    /// harnesses that stand in for it — poll this to respawn instead of
+    /// discovering the death at teardown, when `stop()` re-raises it.
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| h.is_finished())
+    }
+
     /// Signal stop and join; propagates a panic from the work closure.
     /// Prefer this over `drop` in teardown paths that must observe failures.
     pub fn stop(mut self) {

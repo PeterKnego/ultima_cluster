@@ -290,6 +290,19 @@ impl<S: StateMachine> Service<S> {
         self.sm.lock().unwrap().query(q)
     }
 
+    /// Are all of this incarnation's agents still running? `false` means one
+    /// fail-stopped (instance-mismatch, or the log-rewind contract) and this
+    /// incarnation is finished: its SM may hold state from a truncated
+    /// timeline, so the answer is to respawn a fresh service against the same
+    /// instance dir, which reconstructs from the journal. A supervisor polls
+    /// this; without it the death is only discovered at teardown, when
+    /// [`stop`] re-raises the panic.
+    ///
+    /// [`stop`]: Self::stop
+    pub fn is_alive(&self) -> bool {
+        self.agents.iter().all(|a| !a.is_finished())
+    }
+
     /// Graceful stop: signal every agent and join, propagating a work-closure
     /// panic (fail-loud in teardown).
     pub fn stop(self) {

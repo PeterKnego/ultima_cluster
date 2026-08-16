@@ -211,8 +211,13 @@ fn run_pass<F, V>(
     let mut frng = StdRng::seed_from_u64(seed ^ 0xFA17);
     let mut faults = 0u32;
     let start = Instant::now();
+    let mut respawns = 0usize;
     while rec.ok_count() < target || !non_vacuous(&cluster, faults) {
         std::thread::sleep(fault_period);
+        // Stand in for the production supervisor BEFORE the next fault, so a
+        // fail-stopped service is reconstructed rather than silently absent
+        // for the rest of the pass (and re-raised at teardown).
+        respawns += cluster.supervise_services();
         nemesis_tick(&mut cluster, &mut frng, faults);
         faults += 1;
         if start.elapsed() > budget {
@@ -245,8 +250,8 @@ fn run_pass<F, V>(
 
     let (ok, completed) = (rec.ok_count(), rec.completed_count());
     eprintln!(
-        "[elle {name}] seed={seed} faults={faults} completed={completed} ok={ok} \
-         elapsed={:.1}s -> {}",
+        "[elle {name}] seed={seed} faults={faults} respawns={respawns} \
+         completed={completed} ok={ok} elapsed={:.1}s -> {}",
         elapsed.as_secs_f64(),
         out.join("history.edn").display()
     );
@@ -481,8 +486,10 @@ fn run_mutation_pass<F, V>(
     let mut frng = StdRng::seed_from_u64(seed ^ 0xFA17);
     let mut faults = 0u32;
     let start = Instant::now();
+    let mut respawns = 0usize;
     while rec.ok_count() < target || faults < min_faults || !non_vacuous(&cluster, faults) {
         std::thread::sleep(fault_period);
+        respawns += cluster.supervise_services();
         nemesis_tick(&mut cluster, &mut frng, faults);
         faults += 1;
         if start.elapsed() > budget {
@@ -506,8 +513,8 @@ fn run_mutation_pass<F, V>(
 
     let (ok, completed) = (rec.ok_count(), rec.completed_count());
     eprintln!(
-        "[elle {name}] seed={seed} faults={faults} completed={completed} ok={ok} \
-         read_frac={read_frac} elapsed={:.1}s -> {}",
+        "[elle {name}] seed={seed} faults={faults} respawns={respawns} \
+         completed={completed} ok={ok} read_frac={read_frac} elapsed={:.1}s -> {}",
         elapsed.as_secs_f64(),
         out.join("history.edn").display()
     );
