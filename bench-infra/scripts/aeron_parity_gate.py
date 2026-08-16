@@ -59,7 +59,7 @@ def aeron_clean(host):
              f"mkdir -p {RESULTS}\"")
 
 
-def prep_props(host, role, mode, ipc):
+def prep_props(host, role, mode, ipc, eventual=False):
     """Render per-mode node props + per-run cluster/client props on the host."""
     # node-<mode>.properties: base + threading mode (uppercase).
     cmds = [
@@ -67,6 +67,13 @@ def prep_props(host, role, mode, ipc):
         f"echo 'aeron.threading.mode={mode.upper()}' >> {CFG}/node-run.properties",
         f"cp {CFG}/cluster.properties {CFG}/cluster-run.properties",
     ]
+    if eventual:
+        # Matched eventual-durability arm: Aeron's buffered-write ack.
+        cmds += [
+            f"sed -i 's/aeron.archive.file.sync.level=1/aeron.archive.file.sync.level=0/;"
+            f"s/aeron.archive.catalog.file.sync.level=1/aeron.archive.catalog.file.sync.level=0/' "
+            f"{CFG}/cluster-run.properties",
+        ]
     if ipc and role == "node0":
         # node0-ONLY IPC ingress: strip the UDP ingress lines, add IPC channel
         # WITHOUT endpoints (the §11 crash was endpoint-append on IPC media).
@@ -86,11 +93,11 @@ def prep_props(host, role, mode, ipc):
         raise RuntimeError(f"prep_props {host.public_ip}: {out}")
 
 
-def start_aeron(hosts, mode, ipc):
+def start_aeron(hosts, mode, ipc, eventual=False):
     roles = [f"node{i}" for i in range(len(hosts))]
     for h, role in zip(hosts, roles):
         aeron_clean(h)
-        prep_props(h, role, mode, ipc)
+        prep_props(h, role, mode, ipc, eventual=eventual)
     for h in hosts:
         sh(h, "sudo bash -c '" + JAVA_ENV +
            "export JVM_OPTS=\"-Xms16M\"; "
@@ -144,14 +151,17 @@ def fill_percentiles(row, mode_dir):
     reports = list(mode_dir.glob(f"{row['tag']}_*-report.hgrm"))
     if not reports:
         return
-    want = {"p50_us": "0.500000000000", "p90_us": "0.900000000000",
-            "p99_us": "0.990000000000"}
+    want = {"p50_us": 0.50, "p90_us": 0.90, "p99_us": 0.99}
     for line in reports[0].read_text().splitlines():
         parts = line.split()
         if len(parts) >= 3:
-            for k, pct in want.items():
-                if parts[1] == pct and row[k] is None:
-                    row[k] = float(parts[0])
+            try:
+                val, pct = float(parts[0]), float(parts[1])
+            except ValueError:
+                continue
+            for k, target in want.items():
+                if row[k] is None and pct >= target:
+                    row[k] = val
 
 
 def main():
