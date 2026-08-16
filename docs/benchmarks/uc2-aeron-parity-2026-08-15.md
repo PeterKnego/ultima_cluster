@@ -108,8 +108,8 @@ immediately after; `terraform state list` verified EMPTY. Raw artifacts
 | system | best sub-ms point | responses/s | p50 | p99 |
 |---|---|---|---|---|
 | **UC v2** (public Engine client, shmem) | 256 KiB / W=1024 | **1,282,493 – 1,433,230** (4 bracketing anchors) | 0.648–0.776 ms | 0.878–1.075 ms |
-| **Aeron Cluster, SHARED driver** (IPC client) | 800 k rate / batch 64 | **800,000** (offered==achieved) | **0.360 ms** | 1.031 ms |
-| **Aeron Cluster, DEDICATED driver** (IPC client) | 800 k rate / batch 64 | 800,000 | 0.394 ms | **38.1 ms** |
+| **Aeron Cluster, SHARED driver** (IPC client) | 800 k rate / batch 64 | **800,000** (offered==achieved) | **0.360 ms** | 1.044 ms |
+| **Aeron Cluster, DEDICATED driver** (IPC client) | 800 k rate / batch 64 | 800,000 | 0.394 ms | **42.0 ms** |
 
 **Ratio: UC/Aeron ≈ 1.60–1.79× at the measured clean points** (UC bracket
 ÷ 800 k). Grid-granularity disclosure (added 2026-08-16): Aeron was
@@ -134,39 +134,59 @@ reproduces the v1-era ≥800 k @ 0.38 ms measured on SIXTEEN (c6id.4xlarge,
 dedicated mode) — Aeron's ceiling here is not core-starved; it is the
 system's shape at this payload/replication/durability point.
 
-### Aeron grids (aggregator `.hgrm` percentiles, µs; UNSUSTAINED = `.FAIL` marker)
+### Aeron grids (aggregator `.hgrm` percentiles; COMPLETE tables added
+2026-08-16 — percentile = value at the first histogram bucket ≥ the target
+quantile, the reports' native resolution; `.FAIL` rows are the rig's own
+achieved-rate failures, their latencies describe an over-offered run and
+are reported for transparency, not as operating points)
 
 SHARED (client edge IPC):
 
 | batch | rate | p50 | p90 | p99 | sustained |
 |---|---|---|---|---|---|
-| 64 | 200 k | 265 | 295 | — | ✓ |
-| 64 | 400 k | 338 | 400 | — | ✓ |
-| 64 | 600 k | 354 | 420 | — | ✓ |
-| 64 | **800 k** | **360** | **432** | **1031** | ✓ |
-| 64 | 1.0-1.4 M | — | — | — | ✗ `.FAIL` |
-| 256 | 200 k | 614 | 730 | — | ✓ |
-| 256 | 400 k | 491 | 617 | — | ✓ |
-| 256 | 600 k | 509 | 727 | — | ✓ |
-| 256 | 800 k | 510 | 3586 | — | ✓ (strained p90) |
-| 256 | 1.0-1.4 M | — | — | — | ✗ `.FAIL` |
+| 64 | 200 k | 265 µs | 295 µs | 410 µs | ✓ |
+| 64 | 400 k | 338 µs | 400 µs | 453 µs | ✓ |
+| 64 | 600 k | 354 µs | 420 µs | 1.03 ms | ✓ |
+| 64 | **800 k** | **360 µs** | **432 µs** | **1.04 ms** | ✓ |
+| 64 | 1.0 M | 1.30 s | 1.57 s | 1.66 s | ✗ `.FAIL` |
+| 64 | 1.2 M | 1.24 s | 2.64 s | 2.94 s | ✗ `.FAIL` |
+| 64 | 1.4 M | 4.89 s | 6.59 s | 6.97 s | ✗ `.FAIL` |
+| 256 | 200 k | 614 µs | 730 µs | 8.0 ms | ✓ |
+| 256 | 400 k | 491 µs | 617 µs | 25.1 ms | ✓ |
+| 256 | 600 k | 509 µs | 727 µs | 44.3 ms | ✓ |
+| 256 | 800 k | 510 µs | 3.59 ms | 53.3 ms | ✓ (tails blown) |
+| 256 | 1.0 M | 1.50 s | 2.79 s | 3.05 s | ✗ `.FAIL` |
+| 256 | 1.2 M | 2.69 s | 5.08 s | 5.41 s | ✗ `.FAIL` |
+| 256 | 1.4 M | 46 ms | 1.58 s | 1.90 s | ✗ `.FAIL` |
+
+The complete table sharpens two findings: **batch 64 is Aeron's only
+clean configuration here** (batch 256 passes the rate but its p99 runs
+8-53 ms even when sustained), and the `.FAIL` rows show what over-offer
+looks like — p50s in SECONDS, full ingress-queueing collapse, the same
+signature AWS's 2025 blog measured for OSS Cluster at a forced 1 M.
 
 DEDICATED (client edge IPC) — rig sustained every rate to 1.4 M, but the
 latency bar decides:
 
 | batch | rate | p50 | p90 | p99 | p50 ≤ 1 ms |
 |---|---|---|---|---|---|
-| 64 | 200 k | 351 | 3564 | — | ✓ |
-| 64 | 400 k | 323 | 1399 | — | ✓ |
-| 64 | 600 k | 350 | 1943 | — | ✓ |
-| 64 | 800 k | 394 | 2324 | 38076 | ✓ (p99 blown) |
-| 64 | 1.0 M | 1924 | 39125 | — | ✗ |
-| 64 | 1.2 M | 1712 | 3391 | — | ✗ |
-| 64 | 1.4 M | 2404 | 5853 | — | ✗ |
-| 256 | 400 k | 995 | 5489 | — | ✓ (marginal) |
-| 256 | 600 k | 721 | 3983 | — | ✓ |
-| 256 | 800 k | 1041 | 4461 | — | ✗ |
-| 256 | 1.0-1.4 M | 1705-2494 | 21185-144703 | — | ✗ |
+| 64 | 200 k | 351 µs | 3.56 ms | 8.0 ms | ✓ |
+| 64 | 400 k | 323 µs | 1.40 ms | 7.2 ms | ✓ |
+| 64 | 600 k | 350 µs | 1.94 ms | 4.4 ms | ✓ |
+| 64 | 800 k | 394 µs | 2.32 ms | 42.0 ms | ✓ (p99 blown) |
+| 64 | 1.0 M | 1.92 ms | 39.1 ms | 55.7 ms | ✗ |
+| 64 | 1.2 M | 1.71 ms | 3.39 ms | 27.2 ms | ✗ |
+| 64 | 1.4 M | 2.40 ms | 5.85 ms | 12.7 ms | ✗ |
+| 256 | 200 k | 1.49 ms | 6.20 ms | 10.8 ms | ✗ |
+| 256 | 400 k | 995 µs | 5.49 ms | 10.1 ms | ✓ (marginal) |
+| 256 | 600 k | 721 µs | 3.98 ms | 9.7 ms | ✓ |
+| 256 | 800 k | 1.04 ms | 4.46 ms | 11.1 ms | ✗ |
+| 256 | 1.0 M | 1.70 ms | 21.2 ms | 134.6 ms | ✗ |
+| 256 | 1.2 M | 2.49 ms | 144.7 ms | 175.6 ms | ✗ |
+| 256 | 1.4 M | 2.46 ms | 37.4 ms | 93.4 ms | ✗ |
+
+Dedicated's p99 never drops below 4.4 ms at ANY rate — on 8 vCPU the
+mode's spin threads make clean tails structurally unavailable.
 
 The dedicated-mode picture is the oversubscription tax made visible:
 3 dedicated driver threads + consensus + archive + service + rig on 8 vCPU
