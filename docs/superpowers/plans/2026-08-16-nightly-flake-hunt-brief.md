@@ -178,6 +178,43 @@ latch could delay config adoption, so it must not exceed the measured
 workspace, clippy, conformance 100k, `lake build`. Any miss → back to
 analysis, no goalpost moves.
 
+### Race-fix acceptance RESULT — pre-committed bar MISSED, reported as written
+
+The pre-committed bar was **0 tripwires**; the measured campaign gave
+**6-14/run** (n=8 x 300 s), against 13-27/run before the latch. Recorded
+as a MISS, not re-scored: the latch closes the path it names (directed
+unit test `a_new_terms_gossip_cannot_bless_an_unvalidated_tail`, and 0
+acked-write violations / 0 wipes across the campaign) but a SECOND,
+distinct defect keeps the rewind alive. The new `UC2_TRUNC_TRACE`
+provenance field names it: every surviving cut-below-commit carries
+`prov=("gossip", …)` — a follower validated cleanly against leader A,
+took A's gossiped commit C, and a LATER leader B then truncated below C.
+So either A committed C without a surviving quorum, or B is missing
+committed bytes. That is the quorum/leader-completeness plane (the
+Figure-8 / #6b family), not the apply path — **OPEN, proofs-arc scope**.
+Severity bound: no acked write was lost in 8 x 300 s, and followers never
+publish responses, so the divergence is contained to a node that then
+poisons itself.
+
+Two harness/robustness defects surfaced while accepting this, both fixed:
+(a) the tripwire's PANIC had no supervisor in-process — the apply thread
+died mid-pass, the node silently stopped applying, and the panic re-raised
+at teardown (2 of 3 `lin_partition_v2` runs, 1 of 3 elle passes — neither
+a consistency anomaly). Fixed by POISONING instead of panicking (stop
+applying, RETRY every read, keep the heartbeat) plus a real supervisor
+(`AgentRunner::is_finished`, `Service::is_alive`,
+`LinClusterV2::supervise_services`, `respawns=` in elle summaries).
+(b) the term-map slot clamp had to become SIZE-driven: entry width is
+value-dependent under bincode varints, and the race fix's ~15x throughput
+gain pushed terms/positions into wider varint classes, overflowing the
+count-based clamp (`got: 4085` vs limit 4079).
+
+Final battery on the complete change set: rig 3/3 (0 violations, 0 wipes,
+9-14 poisonings = the open residue, self-healing via respawn); elle 3/3
+both models; lin_v2 7/7; lin_partition_v2 3/3 x 7; hard-crash 4/4;
+reconfig 1/20 (baseline 5.8%); workspace exit 0; clippy clean; Lean 3037
+jobs; conformance 100k vectors.
+
 ## ROOT CAUSE FOUND + FIX (2026-08-16)
 
 The safety signal, the acked-write-loss witness, and (likely) the whole

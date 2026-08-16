@@ -110,18 +110,52 @@ downstream signature.
    theorems stand and the 100k-vector conformance suite passes with zero
    divergence against the new semantics.
 
+## The follow-on fix: commit validation
+
+The tripwire immediately exposed a real, pre-existing race, and that race
+is now fixed too. **Commit gossip is position-only.** A follower that
+adopts a new term holds a tail whose *content* no leader has validated —
+the term-map reconcile is a separate datagram, arriving later or not at
+all. Accepting the new leader's commit position blessed the follower's own
+bytes at positions the new timeline owns, so the service applied a deposed
+leader's content there and the late reconcile cut then landed beneath the
+applied cursor. Raft gates `commitIndex` on the AppendEntries
+`prevLogIndex`/`prevLogTerm` match; UC's equivalent evidence is the term-map
+reconcile, so the commit advance now waits for it — an `awaiting_reconcile`
+latch in the safety core, armed on adopting a strictly higher term and
+released when this term's leader map reconciles clean or its truncation
+acks. Held positions replay as one advance, so the cost is one gossip
+round: the leader ships its term map alongside every commit gossip.
+
+Two things that fix taught us. First, the model omitted this plane on
+purpose — `ProtocolCommit.lean` §10 lists *"commit gossip / follower
+`commit_seen`"* as a documented YAGNI omission. Same shape as the windowed
+map. Second, removing the wipe loop made the system roughly eight times
+faster, and that alone broke the term-map slot clamp: entry width under
+bincode varints is value-dependent, so bigger terms and byte positions
+overflowed a clamp that counted entries instead of asking the encoder.
+
 ## What is still open
 
-The tripwire immediately exposed a real, pre-existing race it now converts
-from silent corruption into fail-stop: **commit gossip is position-only**.
-A follower holding a not-yet-reconciled divergent tail can apply its *old*
-content at positions the *new* timeline's gossiped commit has blessed —
-the reconcile cut arrives on a slower cadence than commit gossip. Measured:
-roughly 15% of rapid failovers clip some follower this way. The principled
-fix is a content-validated apply frontier (the analog of Raft's rule that a
-follower only advances commitIndex over entries validated against the
-current leader), which touches the cnc page and the commit-plane contract —
-queued for the proofs arc rather than hot-patched. Related deferred items:
+The rewind did not go away — it went from 13-27 to 6-14 occurrences per
+300-second kill storm, and the pre-committed bar for that fix (zero) was
+missed and recorded as missed. Commit provenance tracing says every
+surviving case is `gossip`: a follower validated cleanly against leader A,
+took A's gossiped commit C, and a later leader B truncated below C. Either
+A committed C without a surviving quorum, or B is missing committed bytes.
+That is the quorum plane — the Figure-8 family — not the apply path, and
+it is proofs-arc work. Severity is bounded: no acknowledged write was lost
+across 8 x 300 s campaigns, and followers never publish responses, so the
+damage is confined to a node that then poisons itself and is respawned.
+
+A service that detects the rewind now POISONS its incarnation rather than
+panicking: it stops applying (never merging the dead timeline with the new
+one) and answers every read with RETRY (never serving dead-timeline
+state), keeping its heartbeat so a supervisor can respawn it. The panic
+version was correct in production and wrong in-process, where no
+supervisor exists: it killed the apply thread, left the node silently
+applying nothing, and re-raised at teardown, reddening capstones that had
+otherwise passed. Related deferred items:
 commit-floor anchoring of the wire window, election credential floors for
 wiped nodes, and a persisted commit watermark (today the
 truncation-below-commit defense forgets everything across a reboot because
