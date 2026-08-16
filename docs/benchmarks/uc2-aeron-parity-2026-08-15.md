@@ -287,9 +287,69 @@ by replication — which isolates what fsync costs each system:
   replication-durability tradeoff. UC's gates and spec guarantees remain
   stated for fsync-on; this arm is a measurement, not a posture change.
 
-### Eventual-arm results
+### Eventual-arm results — fsync buys neither system throughput; it costs UC nothing and costs Aeron ~3× latency; UC's async-fsync mode is a TAIL REGRESSION
 
-*(to be filled by the run)*
+Run 2026-08-16, fresh fleet (the fourth), protocol as pre-registered; fleet
+destroyed after, state verified empty. Raw data in
+`bench-out/eventual-arm-2026-08-16/` (local).
+
+**Fleet-noise context first** (it bounds every conclusion below): the four
+fsync-on anchor draws on THIS fleet spanned **1.03-1.49 M** (~30% same-arm,
+same-day swing — the widest observed yet). Single-draw deltas smaller than
+that are not findings.
+
+UC (public Engine client, 15 s points):
+
+| arm | point | resp/s | p50 | p99 |
+|---|---|---|---|---|
+| fsync-on (pre) | 256/1024 | 1,486,541 | 0.579 ms | 0.759 ms |
+| fsync-on (pre) | 128/1024 | 1,457,089 | 0.641 ms | 0.882 ms |
+| **eventual** | 256/1024 | 1,415,457 | 0.632 ms | **4.743 ms** |
+| **eventual** | 128/1024 | 1,011,713 | 0.910 ms | **4.661 ms** |
+| fsync-on (post) | 256/1024 | 1,034,955 | 0.964 ms | 1.166 ms |
+| fsync-on (post) | 128/1024 | 1,394,700 | 0.688 ms | 1.032 ms |
+
+- **Throughput: no unlock.** Eventual's draws sit inside the fsync-on arm's
+  own 1.03-1.49 M swing. UC's fdatasync was already amortized to ~nothing
+  by the ≤1 MiB group commit — the same conclusion the v1-era journal
+  A/Bs reached (fsync ~4% of the commit path; e2e NULL), now confirmed
+  at v2 rates.
+- **Tails: a real regression.** Both eventual points show p99 ≈ 4.7 ms vs
+  0.76-1.17 ms across ALL FOUR fsync-on draws — outside the noise band and
+  consistent in both eventual runs. Mechanism (hypothesis, matching the
+  prealloc-background-fill precedent from the journal p99 investigation):
+  Eventual moves fsync to a background thread, adding a runnable that
+  contends with the busy-spin agents on the 8-vCPU box; the synchronous
+  group-commit fsync was paced INSIDE the archive's duty cycle and never
+  competed. **Recommendation: `UC2_JOURNAL_DURABILITY=eventual` has no
+  performance case on this hardware class — keep fsync on.**
+
+Aeron (shared / batch 64 / IPC edge, `sync.level=0`):
+
+| rate | p50 | p90 | p99 | sustained |
+|---|---|---|---|---|
+| 200 k | 120 µs | 166 µs | 205 µs | ✓ |
+| 400 k | 84 µs | 118 µs | 152 µs | ✓ |
+| 600 k | 86 µs | 127 µs | 200 µs | ✓ |
+| 800 k-1.4 M | — | — | — | ✗ `.FAIL` |
+
+- **Latency: a large win.** At sustained rates, level 0 cuts Aeron's p50
+  ~3-4× vs level 1 (84-120 µs vs 265-354 µs) — its per-recording sync sat
+  directly in the ingress-to-egress path, unlike UC's.
+- **Throughput: no unlock here either.** 800 k — clean at level 1 on the
+  previous fleet — FAILED at level 0 on this one; sustained ceiling this
+  run = 600 k. One-fleet/one-run caveat applies (the same ±10% fleet
+  variance), but at minimum: removing fsync does not move Aeron's knee
+  upward. Both systems' ceilings are consensus/pipeline-bound, not
+  fsync-bound.
+
+**Cross-system, eventual-vs-eventual:** UC 1.0-1.4 M sub-ms vs Aeron
+≤600 k — the throughput ratio holds or widens; Aeron's latency lead at its
+own operating point widens dramatically (≈86 µs vs ≈0.63 ms). The two
+systems spend their fsync savings on opposite ends of the
+latency-throughput trade, which is itself the cleanest statement of their
+different shapes: Aeron's recording sync is on the hot path and UC's group
+commit never was.
 
 ### Standing caveats (from the pre-registered matrix, restated)
 
