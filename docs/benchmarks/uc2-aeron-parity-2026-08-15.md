@@ -444,5 +444,6 @@ ANY interval buys no throughput and weakens the contract. The knob is now
 de-footgunned, though: a deployment that explicitly chooses
 replication-durability should pair `UC2_JOURNAL_DURABILITY=eventual` with
 `UC2_JOURNAL_EVENTUAL_FSYNC_MS=1` (or a few ms), where the tail cost is
-zero. The 50 ms default is kept only for continuity with the measured
-record; it is the WORST setting measured.
+zero. (Post-retest follow-up: the DEFAULT was changed to 1 ms — the 50 ms
+value measured here was the original hardcoded constant and the worst
+setting measured; the env knob now only exists to override upward.)

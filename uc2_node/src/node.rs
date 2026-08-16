@@ -4526,7 +4526,8 @@ mod journal_durability_env_tests {
 
 /// `UC2_JOURNAL_EVENTUAL_FSYNC_MS` — companion knob to
 /// `UC2_JOURNAL_DURABILITY=eventual`: the journal writer's async-fsync
-/// interval in milliseconds (default 50). Only meaningful under Eventual;
+/// interval in milliseconds (default 1 — the tail-parity setting from the
+/// 2026-08-17 interval retest). Only meaningful under Eventual;
 /// if set while durability is Consistent it is IGNORED WITH A WARNING (the
 /// value is inert there, unlike a durability typo, which is refused).
 /// Zero or unparseable values are refused — fail-closed like the

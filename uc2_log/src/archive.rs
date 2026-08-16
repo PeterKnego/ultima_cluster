@@ -93,7 +93,7 @@ impl ArchiveConfig {
             segment_size_bytes: 64 * 1024 * 1024,
             preallocate_segments: true,
             durability: Durability::Consistent,
-            eventual_fsync_interval: std::time::Duration::from_millis(50),
+            eventual_fsync_interval: std::time::Duration::from_millis(1),
         }
     }
 }

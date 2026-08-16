@@ -45,8 +45,11 @@ pub struct JournalConfig {
     /// Ignored under `Consistent` (every block syncs before its notifier
     /// resolves). Trade-off: a longer interval defers work but accumulates
     /// BIGGER dirty lumps whose fsync stalls the single writer thread — the
-    /// 2026-08-16 eventual-arm bench measured a p99 regression from exactly
-    /// that at the old fixed 50 ms. Default stays 50 ms for compatibility.
+    /// 2026-08-16 eventual-arm bench measured a 6.65x p99 regression at the
+    /// then-default 50 ms, and the 2026-08-17 interval retest's dose-response
+    /// (6.65x @ 50 ms -> 1.51x @ 5 ms -> 1.03x @ 1 ms) pinned lump size as
+    /// the mechanism. Default is 1 ms: at these lump sizes (~rate x 1 ms)
+    /// the tail cost vs Consistent is zero.
     pub eventual_fsync_interval: std::time::Duration,
     /// Opt-in (default false): preallocate each segment to `segment_size_bytes`
     /// up front so the per-commit `fdatasync` skips the ext4 metadata commit a
@@ -68,7 +71,7 @@ impl JournalConfig {
             dir: dir.into(),
             segment_size_bytes: 64 * 1024 * 1024,
             durability: crate::Durability::Consistent,
-            eventual_fsync_interval: std::time::Duration::from_millis(50),
+            eventual_fsync_interval: std::time::Duration::from_millis(1),
             preallocate_segments: false,
             prealloc_fill: PreallocFill::FallocateZeroRange,
             prealloc_fill_chunk_bytes: 4 * 1024 * 1024,
