@@ -846,6 +846,12 @@ impl Node {
         // cut is rare (elections only), so an env-gated line per cut is free.
         let trunc_trace = std::env::var("UC2_TRUNC_TRACE").is_ok();
         let trace_id = cfg.id;
+        // Diagnostic only: the consensus thread publishes its commit
+        // provenance here each duty cycle so the archive thread's cut trace
+        // can name where the commit it is cutting below came from.
+        let trace_prov: Arc<Mutex<(&'static str, u32, u64)>> =
+            Arc::new(Mutex::new(("none", 0, 0)));
+        let cons_trace_prov = Arc::clone(&trace_prov);
         let archive_agent = AgentRunner::spawn("uc2-archive", IdleStrategy::Yield, move || {
             let mut did = false;
             while let Ok(cmd) = trunc_rx.try_recv() {
@@ -853,10 +859,11 @@ impl Node {
                     ArchiveCmd::Truncate { epoch, to } => {
                         if trunc_trace {
                             eprintln!(
-                                "[trunc-trace n{}] RECONCILE cut to={to} pre_durable={} cnc_commit={}",
+                                "[trunc-trace n{}] RECONCILE cut to={to} pre_durable={} cnc_commit={} prov={:?}",
                                 trace_id,
                                 archive.recovered_position(),
                                 arc_cnc.counters().commit.load_acquire(),
+                                trace_prov.lock().map(|p| *p).unwrap_or(("lock", 0, 0)),
                             );
                         }
                         // First-block cuts (a contested first election, `to`
@@ -1005,6 +1012,8 @@ impl Node {
 
         // Consensus agent (the single writer of the term handle + commit counter).
         let mut consensus = Consensus {
+            trace_prov: cons_trace_prov,
+            trunc_trace,
             id: cfg.id,
             sm,
             state,
@@ -1334,6 +1343,11 @@ impl Node {
 
 struct Consensus {
     id: NodeId,
+    /// Diagnostic (UC2_TRUNC_TRACE): last commit provenance, published for
+    /// the archive thread's cut trace. Both fields are inert unless the env
+    /// var is set.
+    trace_prov: Arc<Mutex<(&'static str, u32, u64)>>,
+    trunc_trace: bool,
     sm: ElectionSm,
     state: NodeState,
     /// The shared cnc v2 page — this agent is the single writer of `commit`,
@@ -3525,6 +3539,13 @@ impl Consensus {
                 self.adopted_term = term;
             }
             Action::AdvanceCommit { commit } => {
+                // Diagnostic only, and OFF the hot path unless UC2_TRUNC_TRACE
+                // asked for it — commit advances every duty cycle under load.
+                if self.trunc_trace
+                    && let Ok(mut p) = self.trace_prov.lock()
+                {
+                    *p = self.sm.commit_provenance();
+                }
                 // The ONLY commit store in the binary (both roles). M4 carry #5
                 // deleted uc2_net's two legacy sites (the sender's self-ranking
                 // tracker and the receiver's local COMMIT_POSITION store) —
@@ -4820,6 +4841,8 @@ mod tests {
             SpscRing::create(&dir.path().join("svc_query.ring"), 4096, 1024).unwrap().into_split();
 
         let cons = Consensus {
+            trace_prov: Arc::new(Mutex::new(("none", 0, 0))),
+            trunc_trace: false,
             id: 1,
             sm,
             state,

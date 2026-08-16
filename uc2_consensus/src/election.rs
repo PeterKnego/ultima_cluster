@@ -313,6 +313,9 @@ pub struct ElectionSm {
     /// (`awaiting_reconcile` + the intake gate); this one governs commit, and
     /// lives here so the sim adjudicates it.
     awaiting_reconcile: bool,
+    /// Diagnostic provenance of the last `commit_seen` move (hunt 2026-08-16).
+    commit_source: &'static str,
+    commit_source_term: u32,
     /// Highest commit position gossiped while `awaiting_reconcile` — replayed
     /// as one `AdvanceCommit` the moment validation completes, so the pause
     /// costs a round of latency and never a lost advance.
@@ -472,6 +475,8 @@ impl ElectionSm {
             awaiting_reconcile: recovered_vote.map(|(t, _)| t).unwrap_or(0)
                 > recovered_term_map.last().map(|&(t, _)| t).unwrap_or(0),
             deferred_commit: 0,
+            commit_source: "none",
+            commit_source_term: 0,
             wipe_on_no_common_prefix: true,
             stepped_down: false,
             self_removed: false,
@@ -631,6 +636,8 @@ impl ElectionSm {
                         self.deferred_commit = self.deferred_commit.max(commit);
                     } else {
                         self.commit_seen = commit;
+                        self.commit_source = "gossip";
+                        self.commit_source_term = term;
                         out.push(Action::AdvanceCommit { commit });
                     }
                 }
@@ -799,6 +806,16 @@ impl ElectionSm {
                 self.adopt_config(position, config, out);
             }
         }
+    }
+
+    /// Diagnostic (2026-08-16 hunt): how this node's `commit_seen` last moved
+    /// — `"rank"` (our own quorum ranking as leader), `"gossip"` (a leader's
+    /// commit position, post-validation), `"replay"` (a held position
+    /// released by `finish_validation`), or `"none"`. Read by the node's
+    /// `UC2_TRUNC_TRACE` output so a cut below commit names its own provenance
+    /// instead of leaving us to guess.
+    pub fn commit_provenance(&self) -> (&'static str, u32, u64) {
+        (self.commit_source, self.commit_source_term, self.commit_seen)
     }
 
     pub fn role(&self) -> Role {
@@ -1150,6 +1167,8 @@ impl ElectionSm {
         // owns leader commits (and clamps them to `new_term_pos`, §5.4.2).
         if !matches!(self.role, Role::Leader) && pending > self.commit_seen {
             self.commit_seen = pending;
+            self.commit_source = "replay";
+            self.commit_source_term = self.current_term;
             out.push(Action::AdvanceCommit { commit: pending });
         }
     }
@@ -1548,6 +1567,8 @@ impl ElectionSm {
                 return;
             }
             self.commit_seen = c;
+            self.commit_source = "rank";
+            self.commit_source_term = self.current_term;
             // This advance carries the gossip; reset the idle floor so it does
             // not double-fire right after (spec §6 re-gossip cadence).
             self.last_gossip_ns = now_ns;
