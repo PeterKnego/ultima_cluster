@@ -45,6 +45,34 @@ This is the canonical group-commit design. Postgres with
 and is uncontroversially durable; etcd's batched WAL sync, Kafka
 `acks=all`-with-flush — same family.
 
+## How the batch sizes itself (it is NOT fixed)
+
+Only the CAP is fixed. Each archive duty cycle takes everything appended
+since the durable frontier (`buffer.rs::recordable_slice`: append counter
+minus durable position), trimmed to whole frames — never splitting one —
+and capped at `max_block_bytes` (1 MiB default; the node clamps it to
+`min(1 MiB, journal_segment_bytes/2)`, floor 4 KiB; a single frame larger
+than the cap records alone as one block).
+
+There is no timer, no minimum, no Nagle-style wait. The batching window is
+the duration of the PREVIOUS block's write + fdatasync: whatever arrives
+while block N syncs becomes block N+1 — self-clocking group commit, the
+Postgres/etcd shape. Consequences:
+
+- Low rate: a lone frame records on the next duty cycle, microseconds
+  after landing — no added latency waiting for company; per-frame syncs
+  are fine when syncs are rare.
+- High rate: batches grow with load automatically (arrival rate × sync
+  duration) up to the cap; at the cap, fsync frequency = throughput ÷
+  1 MiB (~134 syncs/s at ~1.4 M × 96 B), which is why the per-op fsync
+  share is noise.
+- Worst-case added latency is structurally bounded: a frame waits at most
+  one in-flight block's sync plus its own block's, and blocks cannot
+  exceed the cap.
+
+Hence `archive.rs`'s header line: "the poll batching IS the group commit:
+fsync frequency scales with block rate, not message rate."
+
 ## "But there's still a window where bytes are only in page cache!"
 
 Yes — in every mode, always. The question is what may *escape* during
