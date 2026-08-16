@@ -197,6 +197,39 @@ scorecard quotes UC as a bracket, not a point.
   percentiles were recomputed locally from the pulled `.hgrm` files; the
   measurement itself was never affected.
 
+### Related measurements — independent corroboration of the knee (added 2026-08-16)
+
+AWS's "Aeron on AWS 2025 performance benchmark results" blog
+(aws.amazon.com/blogs/industries/aeron-on-aws-2025-performance-benchmark-results/)
+measured Aeron Cluster latency at two FIXED rates (100 k and 1 M msgs/s;
+no ceiling search) on 3 × c6in.16xlarge — 64 vCPU, network-optimized, with
+the full low-latency treatment this run deliberately skipped (CPU pinning,
+isolcpus, sysctl tuning); cluster persistence on EBS, fsync level and
+message size undisclosed.
+
+- **Their OSS Cluster @ 1 M: p50 4,948 µs / p99 8,577 µs — queueing
+  collapse.** That is this doc's knee finding, replicated independently on
+  8× our cores with full host tuning: OSS Aeron Cluster cannot do 1 M/s
+  cleanly regardless of hardware. It also mirrors our dedicated-mode
+  signature exactly (rate "sustained", distribution destroyed). The
+  "shape, not cores" conclusion above now rests on two independent
+  datasets.
+- **Their OSS Cluster @ 100 k: p50 95 µs** vs our 265-360 µs below the
+  knee — a tuning-tier and disclosure gap, not a contradiction: pinning +
+  isolation, an undisclosed (possibly async) fsync level against our
+  fsync-on requirement, and unknown payload size all stack in their favor.
+- **Fence: Aeron Premium (DPDK kernel bypass) is a different comparison
+  class.** Their Premium tier runs 1 M @ p50 106 µs (the blog's "59×"
+  claim is Premium-vs-OSS at 1 M). This doc's scorecard compares UC —
+  stock UDP sockets, no kernel bypass, fsync-on — against OSS Aeron under
+  identical conditions. No claim here extends to Premium: its throughput
+  ceiling was not measured by AWS, and comparing a kernel-bypass
+  commercial product to UC's stock-socket transport would need its own
+  matched-conditions run.
+- Their Transport-only numbers (OSS C driver: 1 M @ p50 35 µs) confirm the
+  wall is the consensus/log plane, not UDP transport — consistent with the
+  hot-path anatomy that seeded UC v2's design.
+
 ### Standing caveats (from the pre-registered matrix, restated)
 
 Methodology (windowed-max vs rate-paced), durability granularity
