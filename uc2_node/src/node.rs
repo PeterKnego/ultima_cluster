@@ -832,6 +832,11 @@ impl Node {
             Some((Arc::clone(&incoming_snapshot), Arc::clone(&incoming_snapshot_config))),
         );
         receiver.set_prime_generation(Arc::clone(&prime_generation));
+        // Validated frontier, published by the consensus agent and read by the
+        // receiver so its AppendPosition reports attest validated bytes only.
+        let validated_frontier = Arc::new(AtomicU64::new(durable));
+        let cons_validated = Arc::clone(&validated_frontier);
+        receiver.set_validated_frontier(Arc::clone(&validated_frontier));
         let route_drops = receiver.stats();
 
         // Archive agent: archive commands first (don't record blocks about to be
@@ -851,6 +856,15 @@ impl Node {
         // can name where the commit it is cutting below came from.
         let trace_prov: Arc<Mutex<(&'static str, u32, u64)>> =
             Arc::new(Mutex::new(("none", 0, 0)));
+        // Term-observation frontier: the archive agent publishes it after
+        // handing observations to the consensus agent (see `refresh_durable`).
+        // Seeded at the recovered position: at boot the map was recovered (and
+        // re-derived) from the journal, so it already describes everything we
+        // hold — clamping to 0 here would freeze the SM's durable until the
+        // first archive cycle.
+        let obs_frontier = Arc::new(AtomicU64::new(durable));
+        let arc_obs_frontier = Arc::clone(&obs_frontier);
+        let cons_obs_frontier = Arc::clone(&obs_frontier);
         let cons_trace_prov = Arc::clone(&trace_prov);
         let archive_agent = AgentRunner::spawn("uc2-archive", IdleStrategy::Yield, move || {
             let mut did = false;
@@ -971,9 +985,44 @@ impl Node {
             if archive.do_work(&arc_buffer).expect("archive fail-stop") {
                 did = true;
             }
-            for obs in archive.take_term_observations() {
-                let _ = obs_tx.try_send(obs);
-                did = true;
+            // LOSSLESS since 2026-08-16. This was `let _ = try_send(obs)`,
+            // justified as "term observations are idempotent and re-derivable
+            // from commit gossip" — they are NOT re-derivable: `observe_terms`
+            // scans each block exactly once on the recording pass, so a
+            // dropped observation is gone until a full journal re-scan at
+            // restart. An election storm bursts many NewTerm frames into one
+            // block, overflows the channel, and leaves the node's term map
+            // permanently missing those terms while it holds their bytes.
+            // Every later reconcile then reads the leader's newer entries as
+            // divergence and truncates bytes the node received from that very
+            // leader — committed and applied ones included. Retain on a full
+            // channel and retry next duty cycle, exactly like the config
+            // observations below.
+            let mut pending_obs = archive.take_term_observations();
+            let mut unsent = Vec::new();
+            for (i, obs) in pending_obs.drain(..).enumerate() {
+                if !unsent.is_empty() {
+                    unsent.push(obs); // preserve position order once blocked
+                    continue;
+                }
+                match obs_tx.try_send(obs) {
+                    Ok(()) => did = true,
+                    Err(mpsc::TrySendError::Full(o)) => {
+                        let _ = i;
+                        unsent.push(o);
+                    }
+                    // Receiver gone (shutdown): stop feeding.
+                    Err(mpsc::TrySendError::Disconnected(_)) => break,
+                }
+            }
+            if unsent.is_empty() {
+                // Everything observed so far is now in the consensus agent's
+                // hands: publish the frontier those observations describe.
+                // Ordering is the whole point — this store happens AFTER the
+                // handoff, so a reader that sees it also sees the map entries.
+                arc_obs_frontier.store(archive.recovered_position(), Ordering::Release);
+            } else {
+                archive.retain_term_observations(unsent);
             }
             // M7: forward durably-recorded CONFIG-frame observations (position-
             // ordered, detected in the same scan as the term observations above
@@ -1012,6 +1061,9 @@ impl Node {
 
         // Consensus agent (the single writer of the term handle + commit counter).
         let mut consensus = Consensus {
+            validated_frontier: cons_validated,
+            obs_frontier: cons_obs_frontier,
+            pending_obs: Vec::new(),
             trace_prov: cons_trace_prov,
             trunc_trace,
             id: cfg.id,
@@ -1343,6 +1395,15 @@ impl Node {
 
 struct Consensus {
     id: NodeId,
+    /// Mirror of `ElectionSm::validated_up_to` for the receiver's reports.
+    validated_frontier: Arc<AtomicU64>,
+    /// Position through which the archive has HANDED OVER its term
+    /// observations (see `refresh_durable`). Published by the archive agent
+    /// after the handoff, so it never runs ahead of the map.
+    obs_frontier: Arc<AtomicU64>,
+    /// Term observations held while the SM is mid-truncation (its data-plane
+    /// latch would drop them, and nothing re-derives a dropped observation).
+    pending_obs: Vec<(u32, u64)>,
     /// Diagnostic (UC2_TRUNC_TRACE): last commit provenance, published for
     /// the archive thread's cut trace. Both fields are inert unless the env
     /// var is set.
@@ -1651,10 +1712,31 @@ impl Consensus {
 
         // 1b. Drain data-stamped term observations (T4) → DataTermObserved, in
         // order (the archive ships them position-ordered).
+        // The SM's truncating latch DROPS data-plane events, and a dropped
+        // term observation is unrecoverable (see the archive's retain path):
+        // the map would stay permanently short of the bytes we hold, and the
+        // next reconcile would read the leader's newer entries as divergence
+        // and cut committed data. So buffer while a truncation is in flight
+        // and replay in position order once it acks (2026-08-16 hunt).
         while let Ok((term, base)) = self.obs_rx.try_recv() {
-            self.feed(Event::DataTermObserved { term, base });
-            did = true;
+            self.pending_obs.push((term, base));
         }
+        if self.sm.is_truncating() {
+            // Hold them; `Event::Truncated` will let the next cycle through.
+            // The truncation itself may invalidate some of these positions —
+            // that is fine, `DataTermObserved` only extends the map and the
+            // post-cut map is re-derived from what survives.
+            if !self.pending_obs.is_empty() {
+                did = true;
+            }
+        } else {
+            for (term, base) in std::mem::take(&mut self.pending_obs) {
+                self.feed(Event::DataTermObserved { term, base });
+                did = true;
+            }
+        }
+        // Observations and reconciles both move the validated frontier.
+        self.publish_validated_frontier();
 
         // 1c. Drain durably-recorded CONFIG-frame observations (M7): decode +
         // feed `Event::ConfigObserved`. This is the follower / boot-recovery
@@ -3816,13 +3898,34 @@ impl Consensus {
         if self.pending_leader_open.is_some() {
             return false;
         }
-        let d = self.cnc.counters().durable.load_acquire();
-        if d == self.durable_seen {
+        // Clamp to the TERM-OBSERVATION frontier (2026-08-16 hunt). The
+        // archive publishes the durable counter inside `do_work` and only
+        // afterwards hands over the term observations describing those same
+        // bytes, so a raw read can be a duty cycle ahead of the map. Reconcile
+        // compares the leader's map against OUR map bounded by this durable:
+        // with the raw value, bytes we had just received from that very leader
+        // — but not yet attributed — looked like an unexplained tail, i.e.
+        // divergence, and got truncated. Committed and applied ones included:
+        // that was the residual `prov=("gossip")` rewind. Feeding the observed
+        // frontier instead makes the SM's durable and its term map describe
+        // the same prefix. Lagging by at most one cycle is conservative
+        // everywhere else it is used (vote credentials, commit ranking).
+        let raw = self.cnc.counters().durable.load_acquire();
+        let d = raw.min(self.obs_frontier.load(Ordering::Acquire));
+        if d <= self.durable_seen {
             return false;
         }
         self.durable_seen = d;
         self.feed(Event::DurableAdvanced { durable: d });
+        self.publish_validated_frontier();
         true
+    }
+
+    /// Mirror the SM's validated frontier for the receiver (its
+    /// `AppendPosition` reports are clamped to it). Called wherever the
+    /// frontier can move: a durable advance, and the end of every event drain.
+    fn publish_validated_frontier(&self) {
+        self.validated_frontier.store(self.sm.validated_up_to(), Ordering::Release);
     }
 
     /// Issue #6, leader open phase 2: the archive finished the collapse to
@@ -4841,6 +4944,9 @@ mod tests {
             SpscRing::create(&dir.path().join("svc_query.ring"), 4096, 1024).unwrap().into_split();
 
         let cons = Consensus {
+            validated_frontier: Arc::new(AtomicU64::new(u64::MAX)),
+            obs_frontier: Arc::new(AtomicU64::new(u64::MAX)),
+            pending_obs: Vec::new(),
             trace_prov: Arc::new(Mutex::new(("none", 0, 0))),
             trunc_trace: false,
             id: 1,

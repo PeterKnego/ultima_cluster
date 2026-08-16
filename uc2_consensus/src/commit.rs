@@ -18,8 +18,27 @@
 //! duty cycle in M3) feeds reports in and stores the result out.
 
 pub struct CommitTracker {
-    /// Latest reported durable per follower index; monotonic per slot
-    /// (stale UDP-reordered reports never regress).
+    /// Latest reported durable per follower index — the follower's CURRENT
+    /// durable, not a high-water mark.
+    ///
+    /// This slot was monotonic-max until 2026-08-16, to keep a reordered UDP
+    /// report from regressing it. That defended the wrong direction. A
+    /// follower's durable genuinely REGRESSES whenever it truncates (a
+    /// reconcile cut, a wipe, a restart onto a shorter journal), and under
+    /// election churn that happens constantly. Holding the pre-truncation
+    /// high-water mark let the leader rank a quorum that no longer existed
+    /// and commit — then gossip — a position no live quorum held; a later
+    /// leader whose history genuinely diverges then truncated a follower
+    /// BELOW its own commit counter. That is the residue the 2026-08-16 hunt
+    /// chased after the term-map alignment and commit-validation fixes: every
+    /// surviving rewind carried `prov=("gossip")`.
+    ///
+    /// Taking the latest value instead is safe by construction in the
+    /// direction that matters: over-counting is a safety bug (a phantom
+    /// commit), under-counting is only ever a liveness delay, and `advance`
+    /// keeps `commit` itself monotone regardless. A reordered report can now
+    /// momentarily lower a slot, which at worst defers one advance until the
+    /// next report — the follower re-reports on its own floor cadence.
     reported: Vec<u64>,
     /// Reusable ranking scratch: {own} ∪ reported.
     scratch: Vec<u64>,
@@ -50,10 +69,16 @@ impl CommitTracker {
         }
     }
 
-    /// Record a follower's reported durable position (AppendPosition).
+    /// Record a follower's reported durable position (AppendPosition). Takes
+    /// the report AS GIVEN — see [`CommitTracker::reported`] for why this must
+    /// not be a high-water mark.
     pub fn on_durable(&mut self, follower_idx: usize, durable: u64) {
-        let r = &mut self.reported[follower_idx];
-        *r = (*r).max(durable);
+        self.reported[follower_idx] = durable;
+    }
+
+    /// Diagnostic (UC2_TRUNC_TRACE): the current per-follower report slots.
+    pub fn reported_slots(&self) -> &[u64] {
+        &self.reported
     }
 
     #[inline]
@@ -121,15 +146,46 @@ mod tests {
     }
 
     #[test]
-    fn reports_are_monotonic_per_follower_and_commit_never_regresses() {
+    fn commit_never_regresses_even_when_a_report_does() {
         let mut t = CommitTracker::new(2, 3);
         t.on_durable(0, 800);
         t.on_durable(1, 900);
         assert_eq!(t.advance(1000), Some(900));
-        // a stale, UDP-reordered report must not regress anything
+        // A lower report (a reordered datagram, or a follower that genuinely
+        // truncated) lowers that SLOT — per-slot values are not high-water
+        // marks since 2026-08-16 — but `commit` itself stays put.
         t.on_durable(1, 100);
         assert_eq!(t.advance(1000), None);
         assert_eq!(t.commit(), 900);
+    }
+
+    /// **The 2026-08-16 phantom-commit residue.** A follower's durable
+    /// REGRESSES whenever it truncates (reconcile cut, wipe, restart onto a
+    /// shorter journal). While the slot was a high-water mark, the leader kept
+    /// ranking against bytes that follower no longer held, committing — and
+    /// gossiping — a position no live quorum backed. A later leader whose
+    /// history genuinely diverged then truncated a follower below its own
+    /// commit counter.
+    #[test]
+    fn a_follower_that_truncates_stops_backing_the_bytes_it_dropped() {
+        let mut t = CommitTracker::new(2, 3);
+        // Both followers hold 5000; the leader commits it (quorum of 3).
+        t.on_durable(0, 5000);
+        t.on_durable(1, 5000);
+        assert_eq!(t.advance(9000), Some(5000));
+        // Follower 0 truncates back to 1000 and re-reports; follower 1 is gone
+        // (silent). The leader must NOT be able to certify anything above 1000
+        // from here: {own 9000, 1000, 5000-stale} would have ranked 5000 under
+        // the old high-water slot even though only the leader still holds it.
+        t.on_durable(0, 1000);
+        t.on_durable(1, 1000);
+        // Ranked = 2nd highest of {9000, 1000, 1000} = 1000, below the existing
+        // commit, so no advance — and crucially no NEW certification above it.
+        assert_eq!(t.advance(9000), None);
+        // A fresh, genuine quorum at 6000 still commits normally.
+        t.on_durable(0, 6000);
+        t.on_durable(1, 6000);
+        assert_eq!(t.advance(9000), Some(6000));
     }
 
     #[test]

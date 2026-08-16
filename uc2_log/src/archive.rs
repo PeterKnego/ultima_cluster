@@ -373,6 +373,19 @@ impl Archive {
         std::mem::take(&mut self.term_observations)
     }
 
+    /// Put back observations the caller could not deliver (a full channel), so
+    /// the next duty cycle retries them. They are re-queued AHEAD of anything
+    /// observed since, preserving position order — the SM's `DataTermObserved`
+    /// handler only ever extends the map, so an out-of-order delivery would
+    /// silently drop map entries. Lossless delivery matters: nothing
+    /// re-derives a dropped observation short of a restart's journal re-scan,
+    /// and a map missing terms it holds bytes for makes reconcile see false
+    /// divergence and truncate committed data (2026-08-16 hunt).
+    pub fn retain_term_observations(&mut self, mut unsent: Vec<(u32, u64)>) {
+        unsent.append(&mut self.term_observations);
+        self.term_observations = unsent;
+    }
+
     /// Truncate the archived stream to end exactly at `pos` (spec §4, election
     /// reconciliation): drop whole blocks at/above `pos` and re-append the
     /// partial prefix of the block that contains it. `pos` must be a frame

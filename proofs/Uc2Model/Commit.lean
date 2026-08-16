@@ -24,11 +24,15 @@ def new (nFollowers clusterSize : Nat) : CommitTracker :=
     quorum := clusterSize / 2 + 1
     commit := 0 }
 
-/-- `commit.rs::on_durable` — per-slot monotone (stale UDP-reordered reports
-never regress). Out-of-range `idx` is a no-op (Rust would panic; the
-conformance generator never emits it). -/
+/-- `commit.rs::on_durable`. Out-of-range `idx` is a no-op (Rust would panic;
+the conformance generator never emits it). Takes the report AS GIVEN — NOT a high-water
+mark. It was `max` until 2026-08-16; a follower's durable genuinely regresses
+when it truncates (reconcile cut, wipe, restart onto a shorter journal), and
+keeping the pre-truncation mark let the leader rank a quorum that no longer
+existed. Over-counting is a safety bug (a phantom commit); under-counting is
+only a liveness delay, and `advance` keeps `commit` monotone regardless. -/
 def onDurable (t : CommitTracker) (idx durable : Nat) : CommitTracker :=
-  { t with reported := t.reported.set idx (max (t.reported.getD idx 0) durable) }
+  { t with reported := t.reported.set idx durable }
 
 /-- `commit.rs::reset_reports` — term transition: stale-term reports must not
 certify bytes in the new term. Commit itself stays monotonic. -/

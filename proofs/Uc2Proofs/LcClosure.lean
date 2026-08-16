@@ -765,22 +765,18 @@ private theorem ti_step {n : Nat} {w w' : World n} (h : TrackerInv w)
       by_cases hseq : s = slotOf k src
       · subst hseq
         by_cases hlen : slotOf k src < (w.nodes k).tracker.reported.length
-        · have hval : (((w.nodes k).tracker.reported).set (slotOf k src)
-              (max ((w.nodes k).tracker.reported.getD (slotOf k src) 0) d)).getD
+        · -- Post-2026-08-16 the slot IS the report (no high-water max): the
+          -- reporting message itself is the provenance witness.
+          have hval : (((w.nodes k).tracker.reported).set (slotOf k src) d).getD
                 (slotOf k src) 0
-              = max ((w.nodes k).tracker.reported.getD (slotOf k src) 0) d := by
+              = d := by
             rw [List.getD_eq_getElem?_getD, List.getElem?_set_self hlen]
             rfl
           rw [hval] at hpos ⊢
-          rcases Nat.le_total ((w.nodes k).tracker.reported.getD
-              (slotOf k src) 0) d with hod | hdo
-          · exact ⟨src, d, hsrc, rfl, by omega, hterm ▸ hmsg⟩
-          · rw [Nat.max_eq_left hdo] at hpos ⊢
-            exact h3 hrole (slotOf k src) hpos
+          exact ⟨src, d, hsrc, rfl, by omega, hterm ▸ hmsg⟩
         · rw [List.set_eq_of_length_le (Nat.le_of_not_lt hlen)] at hpos ⊢
           exact h3 hrole (slotOf k src) hpos
-      · have hval : (((w.nodes k).tracker.reported).set (slotOf k src)
-            (max ((w.nodes k).tracker.reported.getD (slotOf k src) 0) d)).getD
+      · have hval : (((w.nodes k).tracker.reported).set (slotOf k src) d).getD
               s 0
             = (w.nodes k).tracker.reported.getD s 0 := by
           rw [List.getD_eq_getElem?_getD,

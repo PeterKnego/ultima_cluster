@@ -281,18 +281,13 @@ private theorem run_slot_provenance (s : CommitTracker) (evs : List Ev) (i : Nat
       · by_cases hij : j = i
         · subst hij
           by_cases hlen : j < s.reported.length
-          · have hset : (s.onDurable j dd).reported.getD j 0
-                = max (s.reported.getD j 0) dd := by
+          · -- Post-2026-08-16 the slot IS the report (no high-water max), so
+            -- the run's value is bounded by `dd` outright.
+            have hset : (s.onDurable j dd).reported.getD j 0 = dd := by
               simp [onDurable, List.getD_eq_getElem?_getD,
                 List.getElem?_set_self (by simpa using hlen)]
             rw [hset] at hle
-            have hsplit : ((s.onDurable j dd).run es).reported.getD j 0
-                  ≤ s.reported.getD j 0
-                ∨ ((s.onDurable j dd).run es).reported.getD j 0 ≤ dd := by
-              omega
-            rcases hsplit with h1 | h2
-            · exact Or.inl h1
-            · exact Or.inr ⟨dd, by simp, h2⟩
+            exact Or.inr ⟨dd, by simp, hle⟩
           · have hge : s.reported.length ≤ j := Nat.le_of_not_lt hlen
             have hset : (s.onDurable j dd).reported = s.reported := by
               simp [onDurable, List.set_eq_of_length_le hge]

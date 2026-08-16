@@ -503,6 +503,8 @@ pub struct FollowerReceiver {
     status_at: u64,
     /// Durable value last reported via AppendPosition.
     ap_reported: u64,
+    /// See [`Receiver::set_validated_frontier`]. `None` = report raw durable.
+    validated_frontier: Option<Arc<AtomicU64>>,
     last_ap_ns: u64,
     recv_buf: Vec<u8>,
     stats: Arc<FollowerStats>,
@@ -686,6 +688,7 @@ impl FollowerReceiver {
             last_status_ns: 0,
             status_at: start,
             ap_reported: start,
+            validated_frontier: None,
             last_ap_ns: 0,
             recv_buf: vec![0u8; 65_536],
             stats: Arc::new(FollowerStats::default()),
@@ -767,6 +770,17 @@ impl FollowerReceiver {
     /// receivers never see a competing prime).
     pub fn set_prime_generation(&mut self, generation: Arc<AtomicU64>) {
         self.prime_gen = Some(generation);
+    }
+
+    /// Install the node's VALIDATED frontier (`ElectionSm::validated_up_to`).
+    /// `AppendPosition` reports are clamped to it, so what this node attests
+    /// toward the leader's quorum ranking is bytes whose CONTENT is confirmed
+    /// against that leader's history — not merely bytes it happens to hold.
+    /// Reporting a raw durable that covered a deposed leader's tail let the
+    /// leader certify a commit no live quorum backed (2026-08-16 hunt).
+    /// Absent (tests, sim), reports fall back to the raw durable.
+    pub fn set_validated_frontier(&mut self, frontier: Arc<AtomicU64>) {
+        self.validated_frontier = Some(frontier);
     }
 
     /// Current prime generation (0 when no counter is installed — the recheck
@@ -903,6 +917,13 @@ impl FollowerReceiver {
             // promptly toward the leader's commit ranking.
             self.status_at = append;
             self.ap_reported = append;
+            // A truncation owes the leader an IMMEDIATE corrective report
+            // (2026-08-16). The leader's per-follower slot now takes the
+            // latest report rather than a high-water mark, so until our lower
+            // durable reaches it, it still ranks us as backing bytes we just
+            // dropped. Zeroing the send cadence makes the next duty cycle
+            // report, instead of waiting out `append_pos_floor_ns`.
+            self.last_ap_ns = 0;
             self.stats.truncation_resyncs.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1575,6 +1596,7 @@ impl FollowerReceiver {
             self.nak.poll(None, self.now_ns()); // disarm the stale below-floor gap
             self.status_at = append;
             self.ap_reported = append;
+            self.last_ap_ns = 0; // report the new frontier promptly (see above)
             self.stats.truncation_resyncs.fetch_add(1, Ordering::Relaxed);
         }
         self.snap_adopt_pending = None;
@@ -1672,7 +1694,13 @@ impl FollowerReceiver {
         }
 
         // Single durable load reused by AppendPosition + status below.
-        let durable = self.buffer.counters().durable.load_acquire();
+        let raw_durable = self.buffer.counters().durable.load_acquire();
+        // What we ATTEST toward the leader's commit ranking is the validated
+        // prefix, never the raw frontier (see `set_validated_frontier`).
+        let durable = match &self.validated_frontier {
+            Some(v) => raw_durable.min(v.load(Ordering::Acquire)),
+            None => raw_durable,
+        };
 
         // AppendPosition (spec §6): report our durable on advance (block/
         // fsync granularity, ~kHz) or on the floor. Feeds the leader's
