@@ -228,6 +228,17 @@ memory; ~130 fault ticks/run x 3 runs keeps total exposure at CI scale)
 and `ELLE_JAVA_XMX=3g` (2 g handled larger pre-fix histories). The decide
 rule is unchanged: 3/3 PASS under both models.
 
+**Gate results (2026-08-16, post-fix):** rig 8/8 PASS; elle failover 3/3
+PASS both models (85-87 fault windows, 318k ops/run — post-fix generation
+is ~8x pre-fix); Lean `lake build` green (3037 jobs, no sorries);
+conformance 100k vectors zero divergence; clippy clean; lin_v2 7/7 and
+lin_partition_v2 7/7 unloaded; workspace suite green EXCEPT
+`resize_3_to_5_to_3` (the documented pre-existing reconfig flake, memory
+`pre-existing-test-flakes`, measured 2/4 on a loaded baseline). Because
+the fix touches term maps, that flake is re-measured HEAD vs the pre-fix
+baseline (`4f544dd`) at a pre-committed n=6 each rather than assumed
+unrelated; a HEAD rate materially above baseline blocks the push.
+
 **Second amendment (the 80k cap was the WRONG shape):** capped runs bind
 in ~39 s with 14 fault ticks and ~14 lifetime terms — they never reach
 the >64-term regime the fix guards, so they test nothing. And post-fix
