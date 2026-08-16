@@ -837,6 +837,12 @@ impl Node {
         let validated_frontier = Arc::new(AtomicU64::new(durable));
         let cons_validated = Arc::clone(&validated_frontier);
         receiver.set_validated_frontier(Arc::clone(&validated_frontier));
+        // Its content attestation (protocol 0.5.0): the term covering the byte
+        // below the frontier. Published together with it; a torn pair only
+        // fails the leader's check and is re-sent on the next cadence.
+        let validated_term = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cons_validated_term = Arc::clone(&validated_term);
+        receiver.set_validated_term(Arc::clone(&validated_term));
         let route_drops = receiver.stats();
 
         // Archive agent: archive commands first (don't record blocks about to be
@@ -1062,6 +1068,7 @@ impl Node {
         // Consensus agent (the single writer of the term handle + commit counter).
         let mut consensus = Consensus {
             validated_frontier: cons_validated,
+            validated_term: cons_validated_term,
             obs_frontier: cons_obs_frontier,
             pending_obs: Vec::new(),
             trace_prov: cons_trace_prov,
@@ -1397,6 +1404,8 @@ struct Consensus {
     id: NodeId,
     /// Mirror of `ElectionSm::validated_up_to` for the receiver's reports.
     validated_frontier: Arc<AtomicU64>,
+    /// Mirror of `ElectionSm::validated_term` — the reports' attestation.
+    validated_term: Arc<std::sync::atomic::AtomicU32>,
     /// Position through which the archive has HANDED OVER its term
     /// observations (see `refresh_durable`). Published by the archive agent
     /// after the handoff, so it never runs ahead of the map.
@@ -3183,7 +3192,7 @@ impl Consensus {
     /// addresses (not a configured member) are dropped.
     fn feed_net(&mut self, ev: NetEvent) {
         let event = match ev {
-            NetEvent::Report { from, term, durable } => {
+            NetEvent::Report { from, term, durable, durable_term } => {
                 let Some(id) = self.addr_to_id.get(&from).copied() else { return };
                 // Implausibility guard (M4 I-1 carry, ported from the deleted
                 // legacy sender arm): a follower cannot hold bytes the leader
@@ -3217,7 +3226,7 @@ impl Consensus {
                     .entry(id)
                     .and_modify(|d| *d = (*d).max(durable))
                     .or_insert(durable);
-                Event::Report { from: id, term, durable }
+                Event::Report { from: id, term, durable, durable_term }
             }
             NetEvent::CommitGossip { from, term, commit } => {
                 self.learn_leader_hint(from, term);
@@ -3925,6 +3934,10 @@ impl Consensus {
     /// `AppendPosition` reports are clamped to it). Called wherever the
     /// frontier can move: a durable advance, and the end of every event drain.
     fn publish_validated_frontier(&self) {
+        // Term first, then position: a reader that samples between the two
+        // sees an older position with a newer term, which fails the leader's
+        // attestation check (the safe direction) rather than passing wrongly.
+        self.validated_term.store(self.sm.validated_term(), Ordering::Release);
         self.validated_frontier.store(self.sm.validated_up_to(), Ordering::Release);
     }
 
@@ -4945,6 +4958,7 @@ mod tests {
 
         let cons = Consensus {
             validated_frontier: Arc::new(AtomicU64::new(u64::MAX)),
+            validated_term: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             obs_frontier: Arc::new(AtomicU64::new(u64::MAX)),
             pending_obs: Vec::new(),
             trace_prov: Arc::new(Mutex::new(("none", 0, 0))),
@@ -5212,7 +5226,10 @@ mod tests {
         // it would rank {own=6048, 2^40, 0} -> 2nd highest = 2^40 -> bounded by
         // own = 6048 -> a PHANTOM commit of the whole log on leader-only
         // durability. Guarded: dropped whole + counted, commit stays 0.
-        h.cons.feed_net(NetEvent::Report { from: addr0, term: 3, durable: 1 << 40 });
+        {
+            let dt = h.cons.sm.term_at(1 << 40);
+            h.cons.feed_net(NetEvent::Report { from: addr0, term: 3, durable: 1 << 40, durable_term: dt });
+        }
         assert_eq!(
             h.cons.cnc.counters().commit.load_acquire(),
             0,
@@ -5223,7 +5240,10 @@ mod tests {
         // The drop poisoned nothing: a legitimate report (durable == append)
         // from the same follower ranks normally -> quorum {6048, 6048, 0} ->
         // commit advances to 6048.
-        h.cons.feed_net(NetEvent::Report { from: addr0, term: 3, durable: append });
+        {
+            let dt = h.cons.sm.term_at(append);
+            h.cons.feed_net(NetEvent::Report { from: addr0, term: 3, durable: append, durable_term: dt });
+        }
         assert_eq!(
             h.cons.cnc.counters().commit.load_acquire(),
             append,
@@ -5235,7 +5255,10 @@ mod tests {
         // absurd durable — must NOT be eaten by the guard; it reaches the SM
         // and triggers term adoption (the legitimate follower-leads-our-append
         // case arrives via term machinery, never inside a static term).
-        h.cons.feed_net(NetEvent::Report { from: addr0, term: 7, durable: 1 << 40 });
+        {
+            let dt = h.cons.sm.term_at(1 << 40);
+            h.cons.feed_net(NetEvent::Report { from: addr0, term: 7, durable: 1 << 40, durable_term: dt });
+        }
         assert_eq!(
             h.cons.sm.current_term(),
             7,
@@ -5505,7 +5528,10 @@ mod tests {
         // may have replaced it with a real bound socket, and a Report from an
         // address the node cannot resolve is (correctly) ignored.
         let addr0 = h.cons.id_to_addr[&0];
-        h.cons.feed_net(NetEvent::Report { from: addr0, term: 3, durable: append });
+        {
+            let dt = h.cons.sm.term_at(append);
+            h.cons.feed_net(NetEvent::Report { from: addr0, term: 3, durable: append, durable_term: dt });
+        }
         assert!(h.cons.sm.can_serve(), "commit did not open the serving gate");
         append
     }

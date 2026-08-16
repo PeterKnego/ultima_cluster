@@ -43,7 +43,15 @@ impl ProtocolVersion {
 // (stuck at major=2/minor=0 since M5 while `CURRENT` moved 0.1.0 through
 // 0.4.0); `CURRENT` documents the semver of the wire *datagram* protocol but
 // does not itself enforce anything.
-pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 4, 0);
+// 0.5.0: content-attested durable reports — `DGRAM_KIND_APPEND_POSITION`
+// gains an 8-byte body carrying the term the sender attributes to the byte
+// below its reported position (`AppendPositionBody`, datagram.rs). The 16-byte
+// header is unchanged; a 0.4.0 peer's header-only report decodes as
+// "unattested" and is simply not counted toward quorum, so a mixed-version
+// cluster degrades to stalled commits rather than to unsound ones. As with
+// 0.4.0 the cnc page is untouched (`CNC_V2_VERSION` unchanged): this alters
+// the UDP datagram format, not the shmem layout.
+pub const CURRENT: ProtocolVersion = ProtocolVersion::new(0, 5, 0);
 pub const MIN_COMPATIBLE: ProtocolVersion = ProtocolVersion::new(0, 1, 0);
 
 #[cfg(test)]

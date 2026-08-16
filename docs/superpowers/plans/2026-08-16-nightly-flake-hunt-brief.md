@@ -136,7 +136,41 @@ mmap-shared files at boot (cnc + all rings), fixed on main `4f544dd`
 on ~450 MB histories → empty verdict misread as FAIL; runner now uses
 6g and classifies empty verdicts INVALID.
 
-## QUORUM-PLANE RESIDUE: four fixes, REDUCED not closed — architectural finding
+## RESIDUE CLOSED: content attestation, wire protocol 0.5.0
+
+The architectural call below was taken: **attest content in the report.**
+`DGRAM_KIND_APPEND_POSITION` gains an 8-byte body carrying `durable_term` —
+the term the sender attributes to the byte below its reported position — and
+the leader declines any report that disagrees with its own term map. Equal
+terms at the same position imply identical prefixes (Log Matching), so this
+is precisely Raft's `(index, term)` pair and it turns commit ranking from a
+POSITION quorum into a CONTENT quorum. Header and `cnc.dat` unchanged; a
+0.4.0 peer's header-only report reads as unattested and is simply not
+counted, so a mixed cluster stalls commits rather than making unsound ones.
+
+**Attestation alone did NOT close it** (still 6 rewinds/run). The last hole
+was in the previous round's own frontier-extension rule: it extended the
+validated frontier whenever `durable` advanced, assuming bytes arriving after
+a clean reconcile come from the current leader. They need not — the archive
+also records buffer content accepted under an EARLIER term, which a later
+leader can contradict. Requiring the frontier bytes to belong to the current
+term (our map's last term == `current_term`) separates "streaming from this
+term's leader" from "catching up on a deposed leader's tail".
+
+**Result: rewinds 11 -> 0 per 300 s storm** (three runs), 0 acked-write
+violations, cuts still occur (8-11/run) but never below the applied frontier
+— which is exactly the invariant the tripwire exists to assert.
+
+**Test integrity:** two sim red-twins stopped firing because attestation
+independently defends the bug they inject (unguarded intake reopen). Rather
+than delete or weaken them, `SimConfig::attest_reports` ablates attestation
+so each twin still proves the guard it names is load-bearing. Lean: the model
+already ASSUMED this property (`sendReport` carries `hgate : reconciled`), so
+Rust is now strictly more conservative than the modelled transition and every
+safety theorem still covers it; the fidelity note is recorded in
+`ProtocolCommit.lean`. 3037 jobs green, 100k conformance vectors clean.
+
+## QUORUM-PLANE RESIDUE (superseded by the section above): four fixes
 
 Chasing the `prov=("gossip")` rewind found four independent defects, each
 fixed with a test (commit `a1f17e4`):

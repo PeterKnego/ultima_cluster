@@ -64,6 +64,46 @@ pub const DGRAM_KIND_READ_PROBE: u8 = 10;
 /// The leader counts DISTINCT ackers per nonce toward its read quorum.
 pub const DGRAM_KIND_READ_PROBE_ACK: u8 = 11;
 
+/// Length of an [`AppendPositionBody`] (protocol 0.5.0).
+pub const APPEND_POSITION_BODY_LEN: usize = 8;
+
+/// **Content attestation for a durable report** (protocol 0.5.0).
+///
+/// `DGRAM_KIND_APPEND_POSITION` used to be header-only: the header's
+/// `position` said "I hold this many bytes" and nothing about WHICH bytes. A
+/// leader ranking those reports was therefore taking a POSITION quorum, not a
+/// CONTENT one — a replica holding a deposed leader's copy of the same byte
+/// range counted toward committing the current leader's history (2026-08-16
+/// hunt). This body carries the term the SENDER attributes to the byte
+/// immediately below `position`, so the leader can check it against its own
+/// term map: equal terms at the same position imply identical prefixes (Log
+/// Matching), which is exactly Raft's `(index, term)` pair. A mismatch means
+/// the report attests other bytes and must not be counted.
+///
+/// `durable_term == 0` means "nothing attested" (an empty log at position 0);
+/// the leader treats it as a zero-length report.
+/// LE: durable_term 0..4, 4..8 zero (reserved, keeps the body 8-byte aligned).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendPositionBody {
+    pub durable_term: u32,
+}
+
+pub fn write_append_position_body(buf: &mut [u8], b: &AppendPositionBody) {
+    buf[0..4].copy_from_slice(&b.durable_term.to_le_bytes());
+    buf[4..8].fill(0);
+}
+
+/// Decode an append-position body. `None` if the buffer is shorter than
+/// [`APPEND_POSITION_BODY_LEN`] — which is also how a 0.4.0 peer's header-only
+/// report decodes, so callers treat `None` as "unattested" rather than
+/// malformed and simply decline to count it.
+pub fn read_append_position_body(buf: &[u8]) -> Option<AppendPositionBody> {
+    if buf.len() < APPEND_POSITION_BODY_LEN {
+        return None;
+    }
+    Some(AppendPositionBody { durable_term: u32::from_le_bytes(buf[0..4].try_into().unwrap()) })
+}
+
 pub const READ_PROBE_BODY_LEN: usize = 16;
 
 /// Read-barrier probe/ack body: a `nonce` scoping the round to one read, plus
@@ -550,6 +590,9 @@ mod tests {
         assert_eq!(DGRAM_KIND_NAK, 3);
         assert_eq!(DGRAM_KIND_STATUS, 4);
         assert_eq!(DGRAM_KIND_APPEND_POSITION, 5);
+        // 0.5.0: the attested-report body rides behind the unchanged header.
+        assert_eq!(APPEND_POSITION_BODY_LEN, 8);
+        assert_eq!(DATAGRAM_HEADER_LEN, 16);
         assert_eq!(DGRAM_KIND_COMMIT_POSITION, 6);
         assert_eq!(DGRAM_KIND_REQUEST_VOTE, 7);
         assert_eq!(DGRAM_KIND_VOTE, 8);
@@ -645,6 +688,21 @@ mod tests {
         // The two new kind codes are stable.
         assert_eq!(DGRAM_KIND_READ_PROBE, 10);
         assert_eq!(DGRAM_KIND_READ_PROBE_ACK, 11);
+    }
+
+    #[test]
+    fn append_position_body_roundtrip_and_short_buffer() {
+        let mut buf = [0xAAu8; APPEND_POSITION_BODY_LEN];
+        write_append_position_body(&mut buf, &AppendPositionBody { durable_term: 4_000_000_007 });
+        assert_eq!(
+            read_append_position_body(&buf),
+            Some(AppendPositionBody { durable_term: 4_000_000_007 })
+        );
+        // Reserved tail is zeroed, not left as the caller's garbage.
+        assert_eq!(&buf[4..8], &[0, 0, 0, 0]);
+        // A 0.4.0 peer's header-only report: no body at all -> unattested.
+        assert_eq!(read_append_position_body(&[]), None);
+        assert_eq!(read_append_position_body(&buf[..7]), None);
     }
 
     #[test]

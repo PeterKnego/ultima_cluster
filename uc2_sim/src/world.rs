@@ -254,6 +254,15 @@ fn deterministic_salt_bytes(seed: u64, node: u64) -> [u8; 16] {
 /// on top via struct-update syntax.
 #[derive(Clone, Debug)]
 pub struct SimConfig {
+    /// Ablation knob for the protocol-0.5.0 CONTENT ATTESTATION on durable
+    /// reports (default `true` = the shipped behaviour). With attestation on,
+    /// a leader declines a report whose `durable_term` disagrees with its own
+    /// map, which independently defends several injected bugs — including the
+    /// unguarded intake reopen, whose red-twin pins therefore need this set to
+    /// `false` to keep discriminating the guard they exist to test. When
+    /// `false`, delivery rewrites the attestation to whatever the receiving
+    /// leader expects, exactly reproducing the pre-0.5.0 position-only report.
+    pub attest_reports: bool,
     pub n_nodes: usize,
     pub seed: u64,
     pub max_steps: u64,
@@ -356,6 +365,7 @@ pub struct SimConfig {
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
+            attest_reports: true,
             n_nodes: 3,
             seed: 0,
             max_steps: 20_000,
@@ -424,7 +434,11 @@ pub enum Msg {
     /// Follower -> leader replication ack: drives the per-follower send cursor.
     Ack { from: NodeId, term: u32, append: u64 },
     /// Follower -> leader durable report: drives quorum commit ranking.
-    Report { from: NodeId, term: u32, durable: u64 },
+    /// A durable report. `durable_term` is the sender's content attestation
+    /// (protocol 0.5.0): the term IT attributes to the byte below `durable`.
+    /// The leader declines a report whose attestation disagrees with its own
+    /// map — that is what makes its ranking a content quorum.
+    Report { from: NodeId, term: u32, durable: u64, durable_term: u32 },
     /// Leader -> follower commit gossip. `epoch` (T13, model-fidelity fix):
     /// production classifies `DGRAM_KIND_COMMIT_POSITION` as
     /// `Scope::Group` (`uc2_crypto::transport::scope_of`), sealed and
@@ -1340,7 +1354,8 @@ impl World {
                         DataPlane::Mechanism { .. } => None,
                     };
                     if let Some(durable) = reportable {
-                        self.send(node, leader, Msg::Report { from: id, term, durable }, now);
+                        let durable_term = self.nodes[node].sm.term_at(durable);
+            self.send(node, leader, Msg::Report { from: id, term, durable, durable_term }, now);
                     }
                 }
             }
@@ -1364,7 +1379,8 @@ impl World {
         {
             let (id, term, durable) =
                 (self.nodes[node].id, self.nodes[node].sm.current_term(), self.nodes[node].durable);
-            self.send(node, leader, Msg::Report { from: id, term, durable }, now);
+            let durable_term = self.nodes[node].sm.term_at(durable);
+            self.send(node, leader, Msg::Report { from: id, term, durable, durable_term }, now);
         }
         // Mechanism C-1 CONTINUOUS LEAK: an erroneously-OPEN intake gate during a
         // truncation ships the stale (un-re-primed) AppendPosition = the raw
@@ -1384,7 +1400,8 @@ impl World {
         {
             let (id, term, durable) =
                 (self.nodes[node].id, self.nodes[node].sm.current_term(), self.nodes[node].durable);
-            self.send(node, leader, Msg::Report { from: id, term, durable }, now);
+            let durable_term = self.nodes[node].sm.term_at(durable);
+            self.send(node, leader, Msg::Report { from: id, term, durable, durable_term }, now);
         }
         self.push(SimEvent::ArchiveStep { node }, now + self.cfg.archive_step_ns);
         Ok(())
@@ -1613,7 +1630,8 @@ impl World {
                 self.nodes[node].sm.current_term(),
                 self.nodes[node].durable,
             );
-            self.send(node, leader, Msg::Report { from: id, term, durable }, now);
+            let durable_term = self.nodes[node].sm.term_at(durable);
+            self.send(node, leader, Msg::Report { from: id, term, durable, durable_term }, now);
         }
     }
 
@@ -1808,8 +1826,16 @@ impl World {
                 }
                 Ok(())
             }
-            Msg::Report { from: rep, term, durable } => {
-                self.feed(to, Event::Report { from: rep, term, durable }, now, step)
+            Msg::Report { from: rep, term, durable, durable_term } => {
+                // Ablation: without attestation the report is position-only
+                // (pre-0.5.0), which we model by handing the leader exactly the
+                // term it expects — the check then always passes.
+                let durable_term = if self.cfg.attest_reports {
+                    durable_term
+                } else {
+                    self.nodes[to].sm.term_at(durable)
+                };
+                self.feed(to, Event::Report { from: rep, term, durable, durable_term }, now, step)
             }
             Msg::CommitGossip { term, commit, epoch } => {
                 // T13: same crypto gate as Msg::Data, checked FIRST and with
@@ -2614,7 +2640,19 @@ impl World {
         // before followers legitimately catch up to the leader — this keeps the
         // pin deterministic. Bypasses the drop/dup fault dice (a scripted inject).
         self.push(
-            SimEvent::Deliver { to, from, msg: Msg::Report { from: id, term, durable } },
+            // The forger attests as its own map would (protocol 0.5.0): a
+            // corrupt POSITION with an otherwise honest attestation, which is
+            // what a bit-flip on the wire actually looks like.
+            SimEvent::Deliver {
+                to,
+                from,
+                msg: Msg::Report {
+                    from: id,
+                    term,
+                    durable,
+                    durable_term: self.nodes[from].sm.term_at(durable),
+                },
+            },
             now + self.cfg.latency_min_ns,
         );
     }

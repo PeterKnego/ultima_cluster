@@ -338,10 +338,17 @@ fn idle_cluster_reconciles_divergent_node_via_gossip_floor() {
 /// satisfy it (a strictly stronger assertion; oracles untouched).
 #[test]
 fn mechanism_unguarded_reopen_is_caught_by_oracle() {
+    // Protocol 0.5.0 note: with report CONTENT ATTESTATION on, this injected
+    // bug no longer MANIFESTS — the leader declines the reopened follower's
+    // report because its term attribution disagrees, so no phantom commit
+    // forms. That is defence in depth, not a reason to drop the pin: ablate
+    // attestation so this twin keeps proving the reopen guard is load-bearing
+    // on its own. (Ablation lives in `SimConfig::attest_reports`.)
     let mut caught = false;
     for seed in 0..200 {
         let mut cfg = nasty_reconcile_config(seed); // helper: high churn, partitions, crashes
         cfg.crash_per_million = 1_000; // red-arm rate, see the doc comment above
+        cfg.attest_reports = false; // isolate the reopen guard (see above)
         cfg.data_plane = DataPlane::Mechanism { reopen_guard: false, handle_keyed: true };
         if let Err(v) = World::new(cfg).run()
             && v.invariant.contains("phantom")
@@ -2002,10 +2009,13 @@ fn every_existing_safety_invariant_still_holds_with_the_crypto_plane_on() {
 /// this would go green when it must not.
 #[test]
 fn crypto_plane_does_not_mask_the_mechanism_phantom_commit_oracle() {
+    // See the sibling twin: attestation (0.5.0) independently defends this
+    // injected bug, so the pin ablates it to keep testing what it names.
     let mut caught = false;
     for seed in 0..60 {
         let mut cfg = nasty_reconcile_config(seed);
         cfg.crash_per_million = 1_000;
+        cfg.attest_reports = false; // isolate the reopen guard (see above)
         cfg.data_plane = DataPlane::Mechanism { reopen_guard: false, handle_keyed: true };
         let mut w = World::new(cfg);
         w.enable_crypto_plane(3);

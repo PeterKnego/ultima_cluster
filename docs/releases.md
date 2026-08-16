@@ -1,5 +1,41 @@
 # ultima_cluster releases
 
+## Unreleased (wire protocol 0.5.0) — content-attested durable reports
+
+**Consensus safety fix. Flag day for node↔node traffic: run one version.**
+
+A follower's `AppendPosition` report used to carry a POSITION only — "I hold
+this many bytes" — with nothing saying WHICH bytes. A leader ranking those
+reports was therefore taking a position quorum, not a content quorum, and a
+replica holding a deposed leader's copy of the same byte range counted toward
+committing the current leader's history. Under rapid leader churn that
+certified commits no live quorum backed; a later leader then truncated a
+follower BELOW its own commit counter, and the service applied — and could
+serve — bytes from a dead timeline.
+
+- **Wire protocol → 0.5.0** (`version::CURRENT`). `DGRAM_KIND_APPEND_POSITION`
+  gains an 8-byte body (`AppendPositionBody`) carrying `durable_term`: the term
+  the sender attributes to the byte below its reported position. The 16-byte
+  header is UNCHANGED, and the `cnc.dat` page is untouched
+  (`CNC_V2_VERSION` unmoved), so service/client binaries are unaffected.
+- **Leader-side check.** A report whose `durable_term` disagrees with the
+  leader's own term map is declined (counted in `reports_unattested`). Equal
+  terms at the same position imply identical prefixes (Log Matching), so this
+  is the `(index, term)` pair Raft carries — it upgrades the ranking to a
+  content quorum.
+- **Mixed-version behaviour.** A 0.4.0 peer's header-only report decodes as
+  *unattested* and is not counted. A mixed cluster therefore STALLS commits
+  rather than making unsound ones — safe, but it means upgrading all nodes.
+- Companion fixes in the same arc: the tracker's per-follower slot takes the
+  latest report instead of a high-water mark (a follower's durable regresses
+  when it truncates); term observations are delivered losslessly; the SM's
+  durable is clamped to its term-observation frontier; and the follower's
+  commit advance and its reports are both bounded by a validated frontier.
+
+Measured on the directed rig (`uc2_node/tests/stale_read_hunt.rs`, 300 s of
+500 ms-cadence leader kills): log rewinds beneath the applied frontier went
+from 11 per run to **0**, with zero acked-write loss throughout.
+
 ## Unreleased (wire protocol 0.4.0) — M8 wire crypto
 
 **Opt-in, off by default.** Authenticated + encrypted node↔node UDP transport.

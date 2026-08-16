@@ -32,13 +32,25 @@ cluster group key for the fan-out plane, RFC-6479 anti-replay. Threat model:
 a network-path adversary (read/inject/replay/corrupt, no private key); **out
 of model**: a compromised host or a malicious cluster member (the group key is
 symmetric — any holder can forge fan-out traffic as any node, a documented
-residual). Bumps the wire protocol to **0.4.0** (`version::CURRENT`; the
+residual). Bumped the wire protocol to **0.4.0** (`version::CURRENT`; the
 `cnc.dat` page layout and its `CNC_V2_VERSION` gate are unchanged — M8 touches
 the UDP datagram format, not the shmem page). The full local proof stack and
 all four correctness capstones pass with crypto ON (T15, anti-vacuity proven);
 the cross-host fleet A/B is a separate, user-approved step (`v2.2.0` tags only
 once it lands). Do not reintroduce `quinn`/QUIC for this — UC seals its own
 reliable-UDP transport directly.
+
+**Wire protocol 0.5.0 (content-attested durable reports)** — a consensus
+safety fix, not a milestone. `AppendPosition` carries an 8-byte body with the
+term the sender attributes to the byte below its reported position; the leader
+declines a report that disagrees with its own term map, which turns commit
+ranking from a POSITION quorum into a CONTENT quorum (Raft's `(index, term)`
+pair, sound by Log Matching). Header and `cnc.dat` layout unchanged; a 0.4.0
+peer's header-only report reads as unattested and is not counted, so a mixed
+cluster stalls commits rather than making unsound ones — **upgrade all nodes
+together**. Found by the 2026-08-16 nightly flake hunt; see
+`docs/superpowers/plans/2026-08-16-nightly-flake-hunt-brief.md` and
+`docs/notes/uc2-term-map-window-loss-explained.md`.
 
 **The v1 stack (an `openraft`-based design) has been retired** and its crates
 deleted — v2 owns consensus, elections, and transport directly. Do not

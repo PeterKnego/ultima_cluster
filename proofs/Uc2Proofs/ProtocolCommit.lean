@@ -549,10 +549,22 @@ inductive Step {n : Nat} : World n → World n → Prop
           committed := w.committed }
   /-- `Event::Report`, current-term leader arm (`election.rs` 545–573): the
   leader folds a member's report into its tracker via the PROVED kernel
-  `onDurable` (per-slot monotone — stale reordered deliveries never
-  regress), slot-mapped by `follower_slot`. The `term < current_term` stale
-  drop is a no-op (no constructor); the `term > current_term` adoption arm
-  is out of scope (module doc, item 10b). Data-plane stutter. -/
+  `onDurable` (which since 2026-08-16 takes the report AS GIVEN — a
+  follower's durable regresses when it truncates, so a high-water slot let a
+  leader rank a quorum that no longer existed), slot-mapped by
+  `follower_slot`. The `term < current_term` stale drop is a no-op (no
+  constructor); the `term > current_term` adoption arm is out of scope
+  (module doc, item 10b). Data-plane stutter.
+
+  **Protocol 0.5.0 (content attestation).** Rust now also declines a report
+  whose `durable_term` disagrees with the leader's own term map. This model
+  already assumes the honest case — `sendReport` carries
+  `hgate : reconciled = true`, so only a reconciled sender ever reports —
+  which is exactly the property the wire attestation now ENFORCES rather
+  than assumes. Rust is therefore strictly more conservative than this
+  transition (it accepts a subset of the reports the model admits), so every
+  safety theorem proved here continues to cover it. Modelling the declining
+  arm itself would only remove transitions. -/
   | deliverReport (w : World n) (i src : Fin n) (t d : Nat)
       (hmsg : CMsg.report src t d ∈ w.csent)
       (hrole : (w.nodes i).pn.role = .leader)

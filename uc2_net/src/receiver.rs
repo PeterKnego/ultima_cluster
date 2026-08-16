@@ -20,7 +20,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -29,7 +29,9 @@ use uc2_log::buffer::LogBuffer;
 use uc2_log::writer::PositionedWriter;
 use uc_protocol::v2::crypto::{CRYPTO_OVERHEAD, DGRAM_KIND_HS_INIT, DGRAM_KIND_HS_KEY, DGRAM_KIND_HS_RESP};
 use uc_protocol::v2::datagram::{
-    ConfigProposalBody, ConfigReplyBody, DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION,
+    APPEND_POSITION_BODY_LEN, AppendPositionBody, ConfigProposalBody, ConfigReplyBody,
+    DATAGRAM_HEADER_LEN, DGRAM_KIND_APPEND_POSITION, read_append_position_body,
+    write_append_position_body,
     DGRAM_KIND_COMMIT_POSITION,
     DGRAM_KIND_CONFIG_PROPOSAL, DGRAM_KIND_CONFIG_REPLY, DGRAM_KIND_DATA, DGRAM_KIND_HEARTBEAT,
     DGRAM_KIND_NAK, DGRAM_KIND_READ_PROBE, DGRAM_KIND_READ_PROBE_ACK, DGRAM_KIND_REQUEST_VOTE,
@@ -168,7 +170,11 @@ pub struct CryptoIntake {
 /// this duty cycle, so the SM should not time out the leader.
 #[derive(Debug, Clone)]
 pub enum NetEvent {
-    Report { from: SocketAddr, term: u32, durable: u64 },
+    /// A peer's durable report. `durable_term` is the content attestation
+    /// added in protocol 0.5.0 (the term the sender attributes to the byte
+    /// below `durable`); `0` means unattested — an empty log, or a pre-0.5.0
+    /// peer whose report is header-only.
+    Report { from: SocketAddr, term: u32, durable: u64, durable_term: u32 },
     CommitGossip { from: SocketAddr, term: u32, commit: u64 },
     RequestVote { from: SocketAddr, body: RequestVoteBody },
     Vote { from: SocketAddr, body: VoteBody },
@@ -229,7 +235,13 @@ fn consensus_event(h: &DatagramHeader, d: &[u8], from: SocketAddr) -> Option<Net
     let body = &d[DATAGRAM_HEADER_LEN..];
     match h.kind {
         DGRAM_KIND_APPEND_POSITION => {
-            Some(NetEvent::Report { from, term: h.leadership_term_id, durable: h.position })
+            Some(NetEvent::Report {
+                from,
+                term: h.leadership_term_id,
+                durable: h.position,
+                // Absent body (pre-0.5.0 peer) decodes as unattested.
+                durable_term: read_append_position_body(body).map_or(0, |b| b.durable_term),
+            })
         }
         DGRAM_KIND_COMMIT_POSITION => {
             Some(NetEvent::CommitGossip { from, term: h.leadership_term_id, commit: h.position })
@@ -505,6 +517,10 @@ pub struct FollowerReceiver {
     ap_reported: u64,
     /// See [`Receiver::set_validated_frontier`]. `None` = report raw durable.
     validated_frontier: Option<Arc<AtomicU64>>,
+    /// The term we attribute to the byte below the validated frontier — the
+    /// content attestation shipped with every report (protocol 0.5.0).
+    /// `None` (tests, sim) sends `0` = unattested.
+    validated_term: Option<Arc<AtomicU32>>,
     last_ap_ns: u64,
     recv_buf: Vec<u8>,
     stats: Arc<FollowerStats>,
@@ -689,6 +705,7 @@ impl FollowerReceiver {
             status_at: start,
             ap_reported: start,
             validated_frontier: None,
+            validated_term: None,
             last_ap_ns: 0,
             recv_buf: vec![0u8; 65_536],
             stats: Arc::new(FollowerStats::default()),
@@ -781,6 +798,12 @@ impl FollowerReceiver {
     /// Absent (tests, sim), reports fall back to the raw durable.
     pub fn set_validated_frontier(&mut self, frontier: Arc<AtomicU64>) {
         self.validated_frontier = Some(frontier);
+    }
+
+    /// Install the content attestation published alongside the frontier (the
+    /// term covering the byte below it). See [`Receiver::set_validated_frontier`].
+    pub fn set_validated_term(&mut self, term: Arc<AtomicU32>) {
+        self.validated_term = Some(term);
     }
 
     /// Current prime generation (0 when no counter is installed — the recheck
@@ -1713,7 +1736,7 @@ impl FollowerReceiver {
         if self.gate_open()
             && (durable > self.ap_reported || now - self.last_ap_ns >= self.cfg.append_pos_floor_ns)
         {
-            let mut d = vec![0u8; DATAGRAM_HEADER_LEN];
+            let mut d = vec![0u8; DATAGRAM_HEADER_LEN + APPEND_POSITION_BODY_LEN];
             write_datagram_header(
                 &mut d,
                 &DatagramHeader {
@@ -1722,6 +1745,19 @@ impl FollowerReceiver {
                     kind: DGRAM_KIND_APPEND_POSITION,
                     flags: 0,
                     key_epoch: 0,
+                },
+            );
+            // Content attestation (protocol 0.5.0): the term we attribute to
+            // the byte below the position we are reporting. Sampled from the
+            // same publisher as the frontier; a torn pair simply fails the
+            // leader's check and is re-sent next cadence.
+            write_append_position_body(
+                &mut d[DATAGRAM_HEADER_LEN..],
+                &AppendPositionBody {
+                    durable_term: self
+                        .validated_term
+                        .as_ref()
+                        .map_or(0, |t| t.load(Ordering::Acquire)),
                 },
             );
             // M8 (T17): sealed or dropped. The cursors advance ONLY on a
@@ -2301,7 +2337,14 @@ mod tests {
             {
                 assert_eq!(h.position, 960);
                 assert_eq!(h.leadership_term_id, TERM);
-                assert!(body.is_empty(), "AppendPosition is header-only");
+                // Protocol 0.5.0: the report carries its content attestation.
+                // No frontier/term installed in this fixture, so it is the
+                // "unattested" encoding (a well-formed body reading 0).
+                assert_eq!(body.len(), APPEND_POSITION_BODY_LEN);
+                assert_eq!(
+                    read_append_position_body(&body),
+                    Some(AppendPositionBody { durable_term: 0 })
+                );
                 break;
             }
         }
@@ -3868,17 +3911,18 @@ mod tests {
             "the STATUS body must not be readable on the wire"
         );
 
-        // APPEND_POSITION carries its payload entirely in the HEADER
-        // (`position` = durable), which stays cleartext by design — the seal
-        // authenticates it as AAD rather than hiding it. So the assertion
-        // here is the one that actually discriminates: it must OPEN, and it
-        // must be exactly `DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD` long.
+        // APPEND_POSITION's position rides in the HEADER, which stays
+        // cleartext by design (the seal authenticates it as AAD rather than
+        // hiding it). Since protocol 0.5.0 it also carries an 8-byte content
+        // attestation body, which IS sealed like any other payload — so the
+        // discriminating assertions are that it OPENS and that its length is
+        // exactly header + body + crypto overhead.
         let (ap_wire, ap_body) = peer.await_sealed(&mut r, DGRAM_KIND_APPEND_POSITION);
-        assert!(ap_body.is_empty(), "APPEND_POSITION carries no body");
+        assert_eq!(ap_body.len(), APPEND_POSITION_BODY_LEN);
         assert_eq!(
             ap_wire.len(),
-            DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD,
-            "an empty-payload sealed frame is exactly header + counter + tag"
+            DATAGRAM_HEADER_LEN + APPEND_POSITION_BODY_LEN + CRYPTO_OVERHEAD,
+            "sealed frame is header + attestation body + counter + tag"
         );
         let _ = b;
     }

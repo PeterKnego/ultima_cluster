@@ -85,7 +85,13 @@ pub enum Event {
     /// commit gossip) — leadership liveness (spec §6).
     LeaderSeen { term: u32 },
     /// AppendPosition report (leader role input to commit ranking).
-    Report { from: NodeId, term: u32, durable: u64 },
+    /// A follower's durable report. `durable_term` is the term the SENDER
+    /// attributes to the byte immediately below `durable` — the content
+    /// attestation added in protocol 0.5.0. Equal terms at the same position
+    /// imply identical prefixes (Log Matching), so it upgrades the leader's
+    /// ranking from a POSITION quorum to a CONTENT quorum. `0` means
+    /// unattested (an empty log, or a pre-0.5.0 peer).
+    Report { from: NodeId, term: u32, durable: u64, durable_term: u32 },
     /// CommitPosition gossip (follower role input).
     CommitGossip { term: u32, commit: u64 },
     RequestVote { from: NodeId, new_term: u32, last_term: u32, last_durable: u64 },
@@ -318,6 +324,8 @@ pub struct ElectionSm {
     /// (`awaiting_reconcile` + the intake gate); this one governs commit, and
     /// lives here so the sim adjudicates it.
     awaiting_reconcile: bool,
+    /// Reports declined for a failed content attestation (protocol 0.5.0).
+    reports_unattested: u64,
     /// Diagnostic provenance of the last `commit_seen` move (hunt 2026-08-16).
     commit_source: &'static str,
     commit_source_term: u32,
@@ -505,6 +513,7 @@ impl ElectionSm {
             // it describes every byte we hold.
             validated_up_to: durable,
             unconfirmed_boundary: false,
+            reports_unattested: 0,
             commit_source: "none",
             commit_source_term: 0,
             wipe_on_no_common_prefix: true,
@@ -592,8 +601,20 @@ impl ElectionSm {
                 // no safety gain. An unconfirmed term boundary in our own log
                 // (see `unconfirmed_boundary`) suspends the extension until a
                 // reconcile judges it.
+                // ...but ONLY while the bytes at our frontier belong to the
+                // term we are in. `durable` advancing does not mean bytes just
+                // arrived from the current leader: the archive also records
+                // buffer content accepted under an EARLIER term, which a later
+                // leader may contradict. Our map's last term IS the term of the
+                // bytes at the frontier, so requiring it to equal
+                // `current_term` distinguishes "streaming from this term's
+                // leader" (extend) from "catching up on a deposed leader's
+                // tail" (wait for reconcile to judge it).
+                let frontier_is_current_term =
+                    self.term_map.last().is_some_and(|&(t, _)| t == self.current_term);
                 if !self.awaiting_reconcile
                     && !self.unconfirmed_boundary
+                    && frontier_is_current_term
                     && self.validated_up_to >= prev
                 {
                     self.validated_up_to = self.durable;
@@ -624,7 +645,7 @@ impl ElectionSm {
                 }
             }
 
-            Event::Report { from, term, durable } => {
+            Event::Report { from, term, durable, durable_term } => {
                 if term < self.current_term {
                     return; // stale report: dropped
                 }
@@ -639,6 +660,20 @@ impl ElectionSm {
                 // catch-up precondition without waiting for a fresh report.
                 // A non-member's report (forged source, or a removed voter)
                 // is dropped here just like `follower_slot` drops it below.
+                // CONTENT ATTESTATION (protocol 0.5.0). The reported position
+                // means nothing unless the bytes below it are OUR bytes: a
+                // replica holding a deposed leader's copy of the same range
+                // used to count toward committing this history. Equal terms at
+                // the same position imply identical prefixes (Log Matching), so
+                // compare the sender's attestation against our own map and
+                // decline the report outright when they disagree. Declining is
+                // the safe direction — it can only delay a commit, never
+                // certify one — and the follower's next report (post-reconcile,
+                // post-truncation) attests correctly.
+                if durable > 0 && durable_term != self.term_at(durable) {
+                    self.reports_unattested += 1;
+                    return;
+                }
                 if self.config.contains(from) && from != self.id {
                     // LATEST, not max — same reason as `CommitTracker`'s slot
                     // (2026-08-16): a member's durable regresses when it
@@ -944,6 +979,37 @@ impl ElectionSm {
     }
 
     /// True while a truncation is in flight (the data-plane latch is held).
+    /// The term this node attributes to the byte immediately BELOW `pos` —
+    /// the last map entry that starts at or before that byte. `0` when the
+    /// position sits below our first entry (nothing to attest). This is the
+    /// `(position, term)` pair Raft carries as `(index, term)`.
+    pub fn term_at(&self, pos: u64) -> u32 {
+        if pos == 0 {
+            return 0;
+        }
+        let mut t = 0;
+        for &(term, base) in &self.term_map {
+            if base < pos {
+                t = term;
+            } else {
+                break;
+            }
+        }
+        t
+    }
+
+    /// The attestation this node publishes with its durable reports: the term
+    /// covering the byte below its validated frontier.
+    pub fn validated_term(&self) -> u32 {
+        self.term_at(self.validated_up_to)
+    }
+
+    /// Count of reports declined because their content attestation did not
+    /// match our own history (observability for the 0.5.0 change).
+    pub fn reports_unattested(&self) -> u64 {
+        self.reports_unattested
+    }
+
     /// The validated frontier — the highest position whose CONTENT this node
     /// has confirmed against the current leader's history. Published to the
     /// receiver so its `AppendPosition` reports attest validated bytes only:
@@ -1935,7 +2001,7 @@ mod tests {
         step(&mut s, Event::Vote { from: 1, term: 1, granted: true }); // majority → leader
         assert!(matches!(s.role(), Role::Leader));
         // A learner (id 9, NOT a voting member) reports a huge durable at our term.
-        let acts = step(&mut s, Event::Report { from: 9, term: 1, durable: 1 << 40 });
+        let acts = step(&mut s, Event::Report { from: 9, term: 1, durable: 1 << 40, durable_term: 1 });
         assert!(
             !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
             "a learner's Report must never advance commit (follower_slot drops it)"
@@ -2053,7 +2119,7 @@ mod tests {
         step(&mut s, Event::NewTermAppended { position: 32 });
         // own durable covers it; follower 1 reports durable 32
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
         let acts2 = step(&mut s, Event::Tick { now_ns: 310 });
         let advanced = acts
             .iter()
@@ -2087,7 +2153,7 @@ mod tests {
 
         // (a) Quorum at the election base BEFORE NewTermAppended: the ranked
         // position (100) is a prior-term-only range — no advance at all.
-        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 100 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 100, durable_term: 1 });
         assert!(
             !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
             "5.4.2: an old-term-only range must not commit while new_term_pos is None"
@@ -2098,7 +2164,8 @@ mod tests {
         // still suppressed.
         step(&mut s, Event::NewTermAppended { position: 132 });
         step(&mut s, Event::DurableAdvanced { durable: 132 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 110 });
+        let acts =
+            step(&mut s, Event::Report { from: 1, term: 2, durable: 110, durable_term: 2 });
         assert!(
             !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
             "5.4.2: a ranked position below new_term_pos must not commit"
@@ -2108,7 +2175,9 @@ mod tests {
         // (c) The quorum crosses the NewTerm frame: the first emitted advance
         // covers it (the suppressed ranks above did not eat the emission) and
         // serving latches.
-        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 132 });
+        // Byte 131 lives in the term-2 NewTerm frame (opened at 100), so the
+        // attestation is term 2.
+        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 132, durable_term: 2 });
         assert!(
             acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 132 })),
             "quorum on the NewTerm frame must commit it (and the whole inherited prefix)"
@@ -2123,7 +2192,7 @@ mod tests {
         step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
         assert!(matches!(s.role(), Role::Leader));
         // stale report: ignored, no panic, no action
-        let acts = step(&mut s, Event::Report { from: 1, term: 0, durable: 999 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 0, durable: 999, durable_term: 1 });
         assert!(acts.is_empty());
         // a higher-term RequestVote deposes
         let acts =
@@ -2159,6 +2228,44 @@ mod tests {
             !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
             "commit must not pass the validated frontier"
         );
+    }
+
+    /// **Content attestation (protocol 0.5.0).** A replica that holds a
+    /// DEPOSED leader's copy of a byte range must not help commit the current
+    /// leader's history there. The reported position is identical in both
+    /// cases — only the term attribution distinguishes them — so the leader
+    /// checks the sender's `durable_term` against its own map and declines a
+    /// mismatch. Without this, the leader's ranking is a POSITION quorum: it
+    /// certified bytes no live quorum actually held (2026-08-16 hunt).
+    #[test]
+    fn a_report_attesting_a_different_history_is_not_counted() {
+        // Leader of term 2 at base 100; its map is [(1,0),(2,100)].
+        let mut s = ElectionSm::new(cfg(0), None, &[(1, 0)], 100, 0);
+        step(&mut s, Event::Tick { now_ns: 301 });
+        step(&mut s, Event::Vote { from: 1, term: 2, granted: true });
+        assert!(matches!(s.role(), Role::Leader));
+        step(&mut s, Event::NewTermAppended { position: 132 });
+        step(&mut s, Event::DurableAdvanced { durable: 132 });
+
+        // A follower reports the same POSITION but attributes byte 131 to
+        // term 1 — it holds the deposed term-1 leader's bytes there, not ours.
+        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 132, durable_term: 1 });
+        assert!(
+            !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
+            "a report attesting another history must not certify our bytes"
+        );
+        assert_eq!(s.reports_unattested(), 1);
+        assert!(!s.can_serve(), "and therefore must not open the read path");
+
+        // Unattested (a pre-0.5.0 peer, or an empty body) is declined too.
+        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 132, durable_term: 0 });
+        assert!(!acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })));
+        assert_eq!(s.reports_unattested(), 2);
+
+        // The same follower, once reconciled, attests term 2 and counts.
+        let acts = step(&mut s, Event::Report { from: 1, term: 2, durable: 132, durable_term: 2 });
+        assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 132 })));
+        assert_eq!(s.reports_unattested(), 2, "an honest report is not counted as declined");
     }
 
     /// **The 2026-08-16 apply/gossip race.** Commit gossip carries a POSITION
@@ -2377,7 +2484,7 @@ mod tests {
         assert!(!s.can_serve());
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
         step(&mut s, Event::Tick { now_ns: 310 });
         assert!(s.can_serve());
         // Deposed by a higher term: serving must drop immediately.
@@ -2395,7 +2502,9 @@ mod tests {
         // Only a fresh NewTerm commit in this term re-enables serving.
         step(&mut s, Event::NewTermAppended { position: 64 });
         step(&mut s, Event::DurableAdvanced { durable: 64 });
-        step(&mut s, Event::Report { from: 1, term: t, durable: 64 });
+        // Attest with the term that actually covers byte 63: this term, opened
+        // at 32 by the re-election (protocol 0.5.0 content attestation).
+        step(&mut s, Event::Report { from: 1, term: t, durable: 64, durable_term: t });
         step(&mut s, Event::Tick { now_ns: 12010 });
         assert!(s.can_serve());
     }
@@ -2406,7 +2515,7 @@ mod tests {
     fn leader_adopts_higher_term_from_any_event() {
         // Report{term:5}
         let mut s = leader_term1();
-        let acts = step(&mut s, Event::Report { from: 1, term: 5, durable: 0 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 5, durable: 0, durable_term: 1 });
         assert!(acts.iter().any(|a| matches!(a, Action::BecomeFollower { term: 5, .. })));
         assert!(matches!(s.role(), Role::Follower));
         // LeaderSeen{term:5}
@@ -2511,7 +2620,7 @@ mod tests {
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
         // A follower report drives a quorum commit through rank_leader.
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
         assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 32 })));
         assert!(acts.iter().any(|a| matches!(a, Action::GossipCommit { commit: 32 })));
         assert!(
@@ -2926,12 +3035,12 @@ mod tests {
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
         // Majority of 3 is 2: own + node 2's report alone already commits 32.
-        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 32 });
+        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 32, durable_term: 1 });
         assert!(
             acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 32 })),
             "pre-adoption: quorum on the carried reports commits 32"
         );
-        step(&mut s, Event::Report { from: 3, term: 1, durable: 32 });
+        step(&mut s, Event::Report { from: 3, term: 1, durable: 32, durable_term: 1 });
 
         // Adopt v1: a higher-version config adding voter 5, fed directly as
         // the append path would (ConfigObserved does not care how the config
@@ -2948,8 +3057,8 @@ mod tests {
         // Post-adoption: fresh durable + reports from the carried members (2,3)
         // alone (no report from 5 yet) still reach quorum-of-4.
         step(&mut s, Event::DurableAdvanced { durable: 64 });
-        step(&mut s, Event::Report { from: 2, term: 1, durable: 64 });
-        let acts = step(&mut s, Event::Report { from: 3, term: 1, durable: 64 });
+        step(&mut s, Event::Report { from: 2, term: 1, durable: 64, durable_term: 1 });
+        let acts = step(&mut s, Event::Report { from: 3, term: 1, durable: 64, durable_term: 1 });
         assert!(
             acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 64 })),
             "commit advances post-adoption via the carried reports for 2 and 3"
@@ -2981,7 +3090,7 @@ mod tests {
         // Commit the NewTerm frame -> serving.
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
         step(&mut s, Event::Tick { now_ns: 310 });
         assert!(s.can_serve());
 
@@ -3010,7 +3119,7 @@ mod tests {
         assert!(matches!(s.role(), Role::Leader));
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
         assert!(s.can_serve());
 
         assert_eq!(
@@ -3030,11 +3139,11 @@ mod tests {
         assert!(matches!(s.role(), Role::Leader));
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 100_000 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100_000 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100_000, durable_term: 1 });
         assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 100_000 })));
         assert!(s.can_serve());
 
-        step(&mut s, Event::Report { from: 5, term: 1, durable: 10_000 });
+        step(&mut s, Event::Report { from: 5, term: 1, durable: 10_000, durable_term: 1 });
         assert_eq!(s.last_report(5), Some(10_000));
         assert!(!s.config_pending());
 
@@ -3043,7 +3152,7 @@ mod tests {
             Err(ProposeError::NotCaughtUp { gap: 57_232 })
         );
 
-        step(&mut s, Event::Report { from: 5, term: 1, durable: 90_000 });
+        step(&mut s, Event::Report { from: 5, term: 1, durable: 90_000, durable_term: 1 });
         assert!(s.propose_config(ConfigOp::PromoteLearner { id: 5 }, 32_768).is_ok());
     }
 
@@ -3275,7 +3384,7 @@ mod tests {
         assert!(matches!(s.role(), Role::Leader));
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
         assert!(s.can_serve(), "NewTerm committed: serving");
 
         // Propose + adopt RemoveVoter{self} (fed as the append path would;
@@ -3304,14 +3413,14 @@ mod tests {
         // still stale at 0) already ranks the quorum-of-3 and crosses;
         // follower 2's report is a same-value no-op advance (`None`).
         step(&mut s, Event::DurableAdvanced { durable: 128 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 128 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 128, durable_term: 1 });
         assert!(
             acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 128 })),
             "commit must keep advancing post-self-removal-adoption"
         );
         assert!(!acts.iter().any(|a| matches!(a, Action::StepDownRemoved)));
         assert!(matches!(s.role(), Role::Leader));
-        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 128 });
+        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 128, durable_term: 1 });
         assert!(!acts.iter().any(|a| matches!(a, Action::StepDownRemoved)));
         assert!(matches!(s.role(), Role::Leader));
     }
@@ -3326,7 +3435,7 @@ mod tests {
         step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
         assert!(s.can_serve());
 
         let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
@@ -3335,14 +3444,14 @@ mod tests {
 
         // Below config_position (64): no step-down yet.
         step(&mut s, Event::DurableAdvanced { durable: 50 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 50 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 50, durable_term: 1 });
         assert!(!acts.iter().any(|a| matches!(a, Action::StepDownRemoved)));
         assert!(matches!(s.role(), Role::Leader), "still leading pre-crossing");
 
         // Crosses config_position (64): StepDownRemoved fires alongside the
         // AdvanceCommit that crosses it.
         step(&mut s, Event::DurableAdvanced { durable: 100 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100, durable_term: 1 });
         assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 100 })));
         assert_eq!(
             acts.iter().filter(|a| matches!(a, Action::StepDownRemoved)).count(),
@@ -3352,7 +3461,7 @@ mod tests {
 
         // Further driving never re-emits it.
         step(&mut s, Event::DurableAdvanced { durable: 200 });
-        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 200 });
+        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 200, durable_term: 1 });
         assert!(
             !acts.iter().any(|a| matches!(a, Action::StepDownRemoved)),
             "must not re-emit after the first crossing"
@@ -3381,7 +3490,7 @@ mod tests {
         step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
         assert!(s.can_serve());
 
         // Adopt our OWN demote from the log. NOT via `propose_config` (it
@@ -3402,14 +3511,14 @@ mod tests {
 
         // Below config_position (64): still leading.
         step(&mut s, Event::DurableAdvanced { durable: 50 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 50 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 50, durable_term: 1 });
         assert!(!acts.iter().any(|a| matches!(a, Action::BecomeFollower { .. })));
         assert!(matches!(s.role(), Role::Leader), "still leading pre-crossing");
 
         // Commit crosses config_position (64): the demote is now certified by
         // C_new ({1,2}); relinquish leadership to a non-voting follower.
         step(&mut s, Event::DurableAdvanced { durable: 100 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 100, durable_term: 1 });
         assert!(acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 100 })));
         assert_eq!(
             acts.iter()
@@ -3425,7 +3534,7 @@ mod tests {
         // Idempotent: further reports never re-emit the step-down (also, a
         // follower's Report path never re-enters rank_leader).
         step(&mut s, Event::DurableAdvanced { durable: 200 });
-        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 200 });
+        let acts = step(&mut s, Event::Report { from: 2, term: 1, durable: 200, durable_term: 1 });
         assert!(!acts.iter().any(|a| matches!(a, Action::BecomeFollower { .. })));
     }
 
@@ -3445,7 +3554,7 @@ mod tests {
         step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
         assert!(matches!(s.role(), Role::Leader));
 
         // Adopt our own removal; config_position (200) is well above anything
@@ -3514,7 +3623,7 @@ mod tests {
         step(&mut s, Event::Vote { from: 1, term: 1, granted: true });
         step(&mut s, Event::NewTermAppended { position: 32 });
         step(&mut s, Event::DurableAdvanced { durable: 32 });
-        step(&mut s, Event::Report { from: 1, term: 1, durable: 32 });
+        step(&mut s, Event::Report { from: 1, term: 1, durable: 32, durable_term: 1 });
         assert!(s.can_serve());
 
         let new_cfg = s.propose_config(ConfigOp::RemoveVoter { id: 0 }, 0).unwrap();
@@ -3526,7 +3635,7 @@ mod tests {
         // 2 NEVER reports again (permanently silent — a lagging/partitioned
         // C_new voter). Only follower 1 reports.
         step(&mut s, Event::DurableAdvanced { durable: 1000 });
-        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 1000 });
+        let acts = step(&mut s, Event::Report { from: 1, term: 1, durable: 1000, durable_term: 1 });
         assert!(
             acts.iter().any(|a| matches!(a, Action::AdvanceCommit { commit: 1000 })),
             "own + ONE of the two C_new followers already ranks a quorum-of-3 \
@@ -3557,7 +3666,7 @@ mod tests {
         assert!(s.follower_slot(3).is_none());
 
         // The removed voter's Report must not move commit.
-        let acts = step(&mut s, Event::Report { from: 3, term: 1, durable: 1 << 30 });
+        let acts = step(&mut s, Event::Report { from: 3, term: 1, durable: 1 << 30, durable_term: 1 });
         assert!(
             !acts.iter().any(|a| matches!(a, Action::AdvanceCommit { .. })),
             "a removed voter's Report must not move commit"
