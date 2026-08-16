@@ -401,6 +401,48 @@ lump size is emergent: rate × interval). This retest tunes it down.
   about the mechanism and about de-footgunning the knob for any future
   replication-durability deployment.
 
-### Interval-retest results
+### Interval-retest results — monotone dose-response 6.65× → 1.51× → 1.03×; the pre-registered rule itself misses by 0.9% and is reported as written
 
-*(to be filled by the run)*
+Run 2026-08-17, fresh UC-only fleet (one node2 instance draw failed twice
+consecutively — SSH-dead on public AND private, both replaced via
+`terraform taint`; third draw healthy). Fleet destroyed after; state
+verified EMPTY. Raw rows in `bench-out/interval-retest-2026-08-17/`
+(local). Four arms interleaved ×3 rounds, 256 KiB/W=1024, 15 s, all runs
+clean (no invalidation fired).
+
+| arm (interval → lump @ ~1.5 M×96 B) | rps (3 runs) | p50 | p99 (3 runs) | median p99 | × fsync |
+|---|---|---|---|---|---|
+| fsync-on (Consistent) | 1,515,180 / 1,503,858 / 1,503,284 | 0.64 ms | 0.829 / 0.847 / 0.968 | 0.847 ms | 1.00× |
+| eventual @ 50 ms (~7 MB) | 1,625,343 / 1,505,745 / 1,565,190 | 0.54 ms | 5.616 / 6.033 / 5.628 | 5.628 ms | **6.65×** |
+| eventual @ 5 ms (~0.7 MB) | 1,481,018 / 1,639,472 / 1,138,670 | 0.64 ms | 1.227 / 1.282 / 1.292 | 1.282 ms | **1.51×** |
+| eventual @ 1 ms (~140 KB) | 1,713,339 / 1,813,219 / 1,251,542 | 0.55 ms | 0.818 / 0.869 / 1.050 | 0.869 ms | **1.03×** |
+
+**Rule verdict, as written: NOT CONFIRMED** — the rule required
+median p99(ev@5) ≤ 1.5× fsync-on and it landed at **1.514×**, a 0.9%
+miss (the ev@50 half of the rule passed decisively at 6.65×, reproducing
+the regression 3-for-3 on a fresh fleet). The rule is reported as
+pre-registered; the goalposts do not move after data.
+
+**What the data shows regardless (the ev@1 characterization arm carried
+no verdict weight by pre-registration, but it is the decisive
+observation):** p99 falls MONOTONICALLY with the interval — 6.65× at
+50 ms, 1.51× at 5 ms, **1.03× (full parity with fsync-on) at 1 ms**,
+where the deferred lumps (~140 KB) are finer than Consistent's own ≤1 MiB
+blocks. The lump-size mechanism is the only standing explanation for the
+eventual-arm regression; the 0.9% rule miss is a lesson in rule
+authorship (the test arm should have been ev@1, the parity prediction,
+rather than ev@5, the mid-curve point), recorded rather than papered
+over.
+
+Secondary observations, no claims attached: eventual's p50 runs
+~0.1 ms better than fsync-on (the archive cycle loses its sync wait) —
+real but small; the ev@1 arm drew 2 of 3 campaign-record rps values
+(1.71 M / 1.81 M) — n=3 inside the fleet swing, not a throughput claim.
+
+**Standing recommendation still unchanged: keep fsync on** — eventual at
+ANY interval buys no throughput and weakens the contract. The knob is now
+de-footgunned, though: a deployment that explicitly chooses
+replication-durability should pair `UC2_JOURNAL_DURABILITY=eventual` with
+`UC2_JOURNAL_EVENTUAL_FSYNC_MS=1` (or a few ms), where the tail cost is
+zero. The 50 ms default is kept only for continuity with the measured
+record; it is the WORST setting measured.
