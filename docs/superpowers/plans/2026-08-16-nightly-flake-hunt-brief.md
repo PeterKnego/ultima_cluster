@@ -239,6 +239,23 @@ the fix touches term maps, that flake is re-measured HEAD vs the pre-fix
 baseline (`4f544dd`) at a pre-committed n=6 each rather than assumed
 unrelated; a HEAD rate materially above baseline blocks the push.
 
+**Reconfig-flake control (HEAD vs pre-fix `4f544dd` worktree), rate table:**
+
+| arm | first n=6 | n=20 | decisive n=60 | cumulative |
+|---|---|---|---|---|
+| HEAD (fixed) | 1/6 | 2/20 | 2/60 | **5/86 (5.8%)** |
+| baseline `4f544dd` | 0/6 | 0/20 | 5/60 | **5/86 (5.8%)** |
+
+Verdict: **no detectable regression** — identical rates. The interim
+3/26-vs-0/26 was small-sample noise; the pre-committed response to a weak
+one-sided signal was to widen n, not to argue it away (decide rule was
+"HEAD ≥5 failures against baseline 0 blocks the push"; the decisive arm
+put baseline HIGHER). Signature is always the documented one:
+`reconfig.rs:1192 node 60 never adopted its own removal (v6)`, a 20 s
+busy-spin deadline on a removed learner — contention-sensitive, and it
+stays OPEN as the pre-existing flake it was (memory
+`pre-existing-test-flakes`). Cheap repro: ~0.5 s per pass, 20 s per fail.
+
 **Second amendment (the 80k cap was the WRONG shape):** capped runs bind
 in ~39 s with 14 fault ticks and ~14 lifetime terms — they never reach
 the >64-term regime the fix guards, so they test nothing. And post-fix
