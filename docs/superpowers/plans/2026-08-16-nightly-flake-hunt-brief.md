@@ -136,6 +136,37 @@ mmap-shared files at boot (cnc + all rings), fixed on main `4f544dd`
 on ~450 MB histories → empty verdict misread as FAIL; runner now uses
 6g and classifies empty verdicts INVALID.
 
+## LAST FLAKE CLOSED: `resize_3_to_5_to_3` (2026-08-17, main 834fc73)
+
+The final nightly failure, and it was **not** contention. A removed node
+adopts its OWN removal only if the removal frame reaches it before the leader
+stops replicating to it — and the leader stops the moment the removal commits.
+Caught with a diagnostic on the 12th attempt: the frozen node sat at
+`cfgv=5 durable=130592` while the leader ran on to `cfgv=8 durable=192960`. It
+had never received the bytes carrying its own removal and never would.
+
+That race is INTENDED. Continuing to ship cluster data to a decommissioned
+node would be the worse behaviour, and the design says so in its own risk
+table (spec 2026-07-13): *"Known-source guard + tombstones (structural);
+self-halt on seeing own removal"* — structural first, self-halt conditional.
+The test had asserted the conditional half as a 20 s guarantee.
+
+Fix: report adoption as best effort within a bounded window (it lands in
+**57/60** runs — the flake rate, now stated in the open instead of hidden in
+an assertion), then assert the GUARANTEE unconditionally — every survivor
+drops both removed ids from its peer band, so no survivor addresses them.
+Uses this suite's existing settle-poll-then-assert helpers; a first cut that
+asserted the band instantly failed **27/60**, because `publish_peer_band` runs
+inline with config adoption.
+
+Measured: **0/60** after (5/86 = 5.8% before; P(0/60 | 5.8%) ~ 2.7%), full
+reconfig suite 0/12 runs failed, workspace green.
+
+Nightly `31993025198` (head `48fc96c`, the 0.5.0 commit) had already shown
+`elle` and `elle-crypto` GREEN — the original safety signal — with this test
+as its only failure. The exit criterion is now three consecutive green
+nightlies plus the witness re-soak.
+
 ## RESIDUE CLOSED: content attestation, wire protocol 0.5.0
 
 The architectural call below was taken: **attest content in the report.**
