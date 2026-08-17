@@ -392,10 +392,20 @@ fn run_node(a: NodeArgs) -> anyhow::Result<()> {
         a.admission_kib * 1024,
         crypto,
     );
-    let _node = Node::start(cfg)?;
+    let node = Node::start(cfg)?;
     println!("m5_gate node {id} up; parking (killed externally by the harness)");
+    // Protocol 0.5.0 observability (see m6_gate): the attestation counter is
+    // process-local, so it cannot come out through the cnc page. On a quiescent
+    // throughput run this must stay 0 — a climb would mean honest reports are
+    // being declined, which would also show up as a degraded commit rate.
+    let mut last = u64::MAX;
     loop {
-        std::thread::park();
+        let now = node.reports_unattested();
+        if now != last {
+            println!("m5_gate node {id} stats: reports_unattested={now}");
+            last = now;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }
 

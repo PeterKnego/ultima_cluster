@@ -63,10 +63,12 @@ uc_target_bin: "/opt/bench/uc/target/release"
 
 # --- Aeron port bases (matches canonical cluster_localhost ranges) ---
 # member fields: ingress, consensus, log, catchup, archive-control
-aeron_port_base: { node0: 20000, node1: 21000, node2: 22000 }
+# Sized for the largest fleet any gate provisions (M7 uses 5 hosts). A missing
+# key here fails the config role for the WHOLE fleet, not just the extra host.
+aeron_port_base: { node0: 20000, node1: 21000, node2: 22000, node3: 23000, node4: 24000 }
 
 # --- UC ports (per node) ---
-uc_raft_port: { node0: 7001, node1: 7002, node2: 7003 }
+uc_raft_port: { node0: 7001, node1: 7002, node2: 7003, node3: 7004, node4: 7005 }
 uc_app_id: "uc-bench-dist"
 
 # --- Results ---

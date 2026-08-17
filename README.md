@@ -13,13 +13,22 @@ Ultima_cluster is a State Machine Replication application server. You write a de
 
 SMR is used when you need ultimate performance and correctness at the same time. All state is held an manipulated in memory (only occasional snapshots are persisted) and correctness is guaranteed via guaranteed order of commands across all state machines in the cluster.
 
-### High-perf: 1.64 M responses/s at p99 0.771 ms
+### High-perf: 1.48 M responses/s at p99 0.905 ms
 
 End to end through the SDK — client submit, consensus, apply, response — with
 **every operation quorum-fsync'd before it is acked** and reads linearizable.
-p50 0.600 ms, p90 0.682 ms; the tail sits 0.17 ms above the median. Measured on
-3 × `c6id.2xlarge`, 64 B payloads.
-→ [M5 gate record](/docs/benchmarks/uc2-m5-gate-2026-07-12.md)
+p50 0.653 ms, p90 0.757 ms. Measured on 3 × `c6id.2xlarge`, 64 B payloads,
+through the **pipelined client** (`uc2_client`'s public `Engine`) that ships
+today.
+
+The earlier 1.64 M / p50 0.600 ms headline came from the pre-pipelined client
+on an older fleet. A controlled A/B settled which part of the difference is
+real: re-running the OLD client on the NEW fleet also measured ~10 % lower, so
+most of it is fleet-to-fleet variance, and the pipelined engine's own cost is
+about 4 %. What you get in exchange is exactly-once correlation and an
+`await`-able ticket per request.
+→ [M5 gate record](/docs/benchmarks/uc2-m5-gate-2026-07-12.md) ·
+[pipelined-client re-run + A/B](/docs/benchmarks/uc2-m5-engine-gate-2026-08-15.md)
 
 ### Leader failover p50 202 ms, zero committed loss in 10 of 10 kills
 
@@ -36,7 +45,7 @@ merged and unreleased.
 
 | Gate | Result | Measured on |
 |---|---|---|
-| End-to-end SDK round trip (M5) | **1.64 M responses/s** @ p50 0.600 / p99 0.771 ms (4.1× the ≥400 k bar) | 3-host fleet |
+| End-to-end SDK round trip (M5) | **1.48 M responses/s** @ p50 0.653 / p99 0.905 ms (3.7× the ≥400 k bar), pipelined client | 3-host fleet |
 | Commit pipeline ceiling (M3) | 2.88 M commits/s @ p50 0.946 / p99 1.132 ms | 3-host fleet |
 | Leader failover (M4) | p50 202 ms, p90 279 ms, 10/10 zero committed loss | 4-vCPU sandbox, loopback |
 | Learner join under load (M6) | commit-rate dip **0.9 %** (gate < 10 %) | 4-host fleet |
@@ -130,7 +139,7 @@ including what is *not* verified and how to reproduce every layer.
 | `uc2_sim` | Deterministic simulation + invariants + fuzz |
 | `uc2_node` | The node: agents wired together, IPC surface, read barrier, gate harnesses |
 | `uc2_service` | Service SDK: `StateMachine` traits, apply agent, reconstruction; optional [`ultima-db`](https://crates.io/crates/ultima-db) store adapter (feature `ultima_db`) |
-| `uc2_client` | Sync client SDK: submit, linearizable/snapshot queries, response matcher |
+| `uc2_client` | Client SDK in three tiers: the pipelined `Engine` (split send/poll halves, exactly-once slot correlation), `PipelinedClient` + `Ticket` (`wait()` or `.await`), and a blocking `Client` shim. Submit, linearizable/snapshot queries |
 | `uc-lincheck` | WGL linearizability checker + history recorder + register model |
 | `ultima_journal` | Segmented append journal + atomic `StableValue`s |
 
