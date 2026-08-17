@@ -442,10 +442,20 @@ fn run_node(a: NodeArgs) -> anyhow::Result<()> {
         purge,
         a.journal_segment_bytes,
     );
-    let _node = Node::start(cfg)?;
+    let node = Node::start(cfg)?;
     println!("m7_gate node {} up; parking (harness owns lifecycle)", a.id);
+    // Protocol 0.5.0 observability — see the same loop in `m6_gate`.
+    let mut last = (u64::MAX, u64::MAX);
     loop {
-        thread::park();
+        let now = (node.reports_unattested(), node.wipes());
+        if now != last {
+            println!(
+                "m7_gate node {} stats: reports_unattested={} wipes={}",
+                a.id, now.0, now.1
+            );
+            last = now;
+        }
+        thread::sleep(Duration::from_millis(500));
     }
 }
 

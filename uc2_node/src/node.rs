@@ -346,6 +346,14 @@ pub struct Node {
     /// observability and the wipe-safety tests.
     wipes: Arc<AtomicU64>,
     reports_implausible: Arc<AtomicU64>,
+    /// Protocol 0.5.0: reports DECLINED because their content attestation
+    /// (`durable_term`) disagreed with our own term map. Mirrored out of the
+    /// SM each consensus duty cycle. Steady state is 0; brief nonzero runs
+    /// around elections are expected (a follower's map catches up a round
+    /// later). A SUSTAINED nonzero on a healthy cluster means honest reports
+    /// are being declined — a liveness bug, or a mixed-version fleet (a
+    /// pre-0.5.0 peer reports unattested and is never counted).
+    reports_unattested: Arc<AtomicU64>,
     /// M6 Task 4: node-internal mirror of the archive's lowest replayable
     /// position (written by the archive agent). Exposed via
     /// [`Node::archive_first_base`] for purge-safety tests.
@@ -651,6 +659,7 @@ impl Node {
         let truncations = Arc::new(AtomicU64::new(0));
         let wipes = Arc::new(AtomicU64::new(0));
         let reports_implausible = Arc::new(AtomicU64::new(0));
+        let reports_unattested = Arc::new(AtomicU64::new(0));
         // M8 (Task 12): the newest group epoch this node has minted, mirrored
         // off the consensus agent for `Node::crypto_epoch`.
         let crypto_epoch = Arc::new(AtomicU32::new(0));
@@ -1067,6 +1076,7 @@ impl Node {
 
         // Consensus agent (the single writer of the term handle + commit counter).
         let mut consensus = Consensus {
+            reports_unattested: Arc::clone(&reports_unattested),
             validated_frontier: cons_validated,
             validated_term: cons_validated_term,
             obs_frontier: cons_obs_frontier,
@@ -1169,6 +1179,7 @@ impl Node {
             truncations,
             wipes,
             reports_implausible,
+            reports_unattested,
             archive_first_base,
             route_drops,
             sender_stats,
@@ -1262,6 +1273,12 @@ impl Node {
     /// racing an absence.
     pub fn crypto_handshake_failures(&self) -> u64 {
         self.crypto_handshake_failures.load(Ordering::Relaxed)
+    }
+
+    /// Protocol 0.5.0: reports declined for a failed content attestation.
+    /// See the field docs — steady state is 0 on a single-version fleet.
+    pub fn reports_unattested(&self) -> u64 {
+        self.reports_unattested.load(Ordering::Relaxed)
     }
 
     /// M8 Task 14: this node's receive-path crypto drop counters
@@ -1402,6 +1419,8 @@ impl Node {
 
 struct Consensus {
     id: NodeId,
+    /// Mirror of `ElectionSm::reports_unattested` for `Node::reports_unattested`.
+    reports_unattested: Arc<AtomicU64>,
     /// Mirror of `ElectionSm::validated_up_to` for the receiver's reports.
     validated_frontier: Arc<AtomicU64>,
     /// Mirror of `ElectionSm::validated_term` — the reports' attestation.
@@ -3934,6 +3953,7 @@ impl Consensus {
     /// `AppendPosition` reports are clamped to it). Called wherever the
     /// frontier can move: a durable advance, and the end of every event drain.
     fn publish_validated_frontier(&self) {
+        self.reports_unattested.store(self.sm.reports_unattested(), Ordering::Relaxed);
         // Term first, then position: a reader that samples between the two
         // sees an older position with a newer term, which fails the leader's
         // attestation check (the safe direction) rather than passing wrongly.
@@ -4957,6 +4977,7 @@ mod tests {
             SpscRing::create(&dir.path().join("svc_query.ring"), 4096, 1024).unwrap().into_split();
 
         let cons = Consensus {
+            reports_unattested: Arc::new(AtomicU64::new(0)),
             validated_frontier: Arc::new(AtomicU64::new(u64::MAX)),
             validated_term: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             obs_frontier: Arc::new(AtomicU64::new(u64::MAX)),

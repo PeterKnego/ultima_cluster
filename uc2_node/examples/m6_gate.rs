@@ -315,11 +315,25 @@ fn run_node(a: NodeArgs, is_learner: bool) -> anyhow::Result<()> {
     let members = parse_members(&a.members);
     let learners = parse_members(&a.learners);
     let cfg = make_config(a.id, members, learners, a.bind, a.instance_dir, a.app_id);
-    let _node = Node::start(cfg)?;
+    let node = Node::start(cfg)?;
     let kind = if is_learner { "learner" } else { "node" };
     println!("m6_gate {kind} {} up; parking (harness owns lifecycle)", a.id);
+    // Protocol 0.5.0: `reports_unattested` is a process-local counter, so the
+    // cnc-reading `probe` role cannot see it. Emit it (with the wipe count) on
+    // change to this unit's log — the orchestrator greps the logs, and a
+    // SUSTAINED climb on a single-version fleet is the signal that honest
+    // reports are being declined (liveness), or that the fleet is mixed.
+    let mut last = (u64::MAX, u64::MAX);
     loop {
-        thread::park();
+        let now = (node.reports_unattested(), node.wipes());
+        if now != last {
+            println!(
+                "m6_gate {kind} {} stats: reports_unattested={} wipes={}",
+                a.id, now.0, now.1
+            );
+            last = now;
+        }
+        thread::sleep(Duration::from_millis(500));
     }
 }
 
