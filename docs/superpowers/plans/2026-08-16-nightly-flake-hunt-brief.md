@@ -159,7 +159,10 @@ own pre-committed n.
   cycles per run, RSS 1.0 GB.
 - **One observation kept, NOT a hit:** run 428 failed with `no single
   serving leader within 20s` — a post-heal reconvergence timeout, no
-  truncation and no elle-invalid verdict (`/home/claude/soak/run428.log`).
+  truncation and no elle-invalid verdict. Its log was then LOST to a cleanup
+  glob (`rm -rf .../run*`) that also matched the kept file — only the tally
+  line and the failure text quoted here survive. Keep preserved evidence
+  outside the directory a cleanup targets.
   1/428 = 0.23 %/run, same family as the Aug 12 nightly `mod.rs:618`
   timeout, which predates this arc. Telling "pre-existing" from "introduced
   by the validated-frontier gating" needs ~1300 runs per arm at that rate;
