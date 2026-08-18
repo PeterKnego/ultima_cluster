@@ -136,6 +136,35 @@ mmap-shared files at boot (cnc + all rings), fixed on main `4f544dd`
 on ~450 MB histories → empty verdict misread as FAIL; runner now uses
 6g and classifies empty verdicts INVALID.
 
+## ACKED-WRITE-LOSS WITNESS CLOSED (2026-08-18)
+
+The standing open item this brief was told to outrank convenience for
+(memory `receiver-frontier-soak`, open since 2026-08-03) is closed on its
+own pre-committed n.
+
+- **Protocol, fixed before launch:** control arm = `elle_mut_vote_order`
+  with the mutation feature compiled in and `UC2_MUTATION` UNSET (inert), so
+  every partition/heal cycle runs the SHIPPED vote-order check with
+  `CommittedTruncationWitness` armed. **n = 450**, chosen so that zero hits
+  excludes the ~0.7 %/run pre-fix rate at one-sided 95 %.
+- **Result: 0 hits / 449 valid runs** (450 launched, 1 errored) →
+  **0.668 %/run** upper bound, excluding both pre-fix rates (11.3 %/run
+  archive-fail-stop, ~0.7 %/run unmutated witness). Root cause was the
+  term-map window chain fixed earlier in this arc.
+- **Shape deviation, recorded not hidden:** `ELLE_KEYS=200`,
+  `ELLE_WORKERS=2`. The July shape now OOM-kills on this box (4.5 GB max RSS
+  per run) because post-fix throughput is ~8x higher and the list-append
+  values balloon before the fault minimum is met. Keys/workers change the op
+  MIX, not the fault exposure the witness feeds on — still 10 partition/heal
+  cycles per run, RSS 1.0 GB.
+- **One observation kept, NOT a hit:** run 428 failed with `no single
+  serving leader within 20s` — a post-heal reconvergence timeout, no
+  truncation and no elle-invalid verdict (`/home/claude/soak/run428.log`).
+  1/428 = 0.23 %/run, same family as the Aug 12 nightly `mod.rs:618`
+  timeout, which predates this arc. Telling "pre-existing" from "introduced
+  by the validated-frontier gating" needs ~1300 runs per arm at that rate;
+  the nightlies are the cheaper ongoing signal.
+
 ## LAST FLAKE CLOSED: `resize_3_to_5_to_3` (2026-08-17, main 834fc73)
 
 The final nightly failure, and it was **not** contention. A removed node
