@@ -39,7 +39,9 @@ mod read_round;
 
 pub use config_file::load_from_path;
 pub use ipc::{InstanceDir, IpcError};
-pub use node::{DEFAULT_JOURNAL_SEGMENT_BYTES, Node, NodeConfig, PurgePolicy, SubmitError};
+pub use node::{
+    DEFAULT_JOURNAL_SEGMENT_BYTES, DrainOutcome, Node, NodeConfig, PurgePolicy, SubmitError,
+};
 /// M8: node-to-node wire crypto configuration, re-exported so a deployment
 /// that only depends on `uc2_node` can build a [`NodeConfig`] without naming
 /// `uc2_crypto` directly. `CryptoConfig::Disabled` (the `Default`) is exactly

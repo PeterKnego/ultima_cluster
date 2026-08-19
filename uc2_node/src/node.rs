@@ -208,6 +208,17 @@ pub struct NodeConfig {
     pub crypto: CryptoConfig,
 }
 
+/// What a drain achieved before the node stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// The archive recorded every appended byte; a restart replays nothing.
+    Drained,
+    /// The deadline expired first. The node stopped anyway — the un-recorded
+    /// tail was never fsynced, so it was never acked; the restarted node
+    /// simply re-fetches it.
+    DeadlineExpired { append: u64, durable: u64 },
+}
+
 /// Production default journal segment size (matches `ArchiveConfig::new`).
 pub const DEFAULT_JOURNAL_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -1404,6 +1415,40 @@ impl Node {
         for a in self.agents {
             a.stop();
         }
+    }
+
+    /// Graceful stop that first waits for the archive to catch up.
+    ///
+    /// [`stop`](Self::stop) signals the agents and each exits at the TOP of its
+    /// next duty cycle, so bytes appended but not yet recorded are simply not in
+    /// the journal at exit. That is safe — un-recorded means un-fsynced means
+    /// never acked — but it makes the restarted node re-fetch them. Draining
+    /// first is what makes a planned restart cheap.
+    ///
+    /// The predicate is `durable >= append`, and `durable` is advanced by the
+    /// archive agent only AFTER the fsync completes
+    /// (`uc2_log::archive`), so reaching it means the bytes are on disk, not
+    /// merely queued.
+    ///
+    /// A shutdown that hangs is worse than one that costs a replay, so the wait
+    /// is hard-bounded by `deadline`. Note that ingress is still open while this
+    /// runs: a client submitting throughout can hold `append` ahead of `durable`
+    /// indefinitely, and the deadline is what bounds that case.
+    pub fn stop_draining(self, deadline: std::time::Duration) -> DrainOutcome {
+        let start = std::time::Instant::now();
+        let outcome = loop {
+            let c = self.counters();
+            let (append, durable) = (c.append.load_acquire(), c.durable.load_acquire());
+            if durable >= append {
+                break DrainOutcome::Drained;
+            }
+            if start.elapsed() >= deadline {
+                break DrainOutcome::DeadlineExpired { append, durable };
+            }
+            std::thread::yield_now();
+        };
+        self.stop();
+        outcome
     }
 
     /// Crash-stop for the harness: stop the agents WITHOUT any extra flushing —
