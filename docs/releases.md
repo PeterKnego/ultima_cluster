@@ -1,6 +1,65 @@
 # ultima_cluster releases
 
-## Unreleased (wire protocol 0.5.0) — content-attested durable reports
+## v2.3.0 — 2026-08-19 — M9 deployable node
+
+**UC is now deployable by someone who is not the author.** Before this tag the
+only way to start a node was an example binary configured in Rust source; the
+docs described a daemon the build did not produce. M9 ships it.
+
+- **A real `uc2-node` daemon.** Starts from a TOML config file
+  (`packaging/node.example.toml` is the shipped reference;
+  `docs/reference/configuration.md` documents every field). The file is a
+  one-to-one mirror of `NodeConfig` with `deny_unknown_fields` — a typo is a
+  startup refusal naming the key, not a silently-ignored setting. `[log]` and
+  `[metrics]` are reserved for M10: parsed, announced as inert on every boot,
+  never silently swallowed. `seed` defaults to a distinct per-id derivation so
+  operators cannot livelock a cluster through identical election timers.
+- **Named startup refusals.** Every rule that used to fail later and look like
+  something else now refuses at boot with the offending field named: `bind`
+  must equal this node's own members entry (the mismatch that elects a leader
+  whose followers never commit); `max_payload` must fit one datagram against
+  the MTU (the assert that used to panic inside the sender); `buffer_bytes`
+  power-of-two; membership disjointness/uniqueness/8-cap; election window
+  ordering; and an instance_dir on a RAM-backed filesystem is refused **by
+  name** — every fsync there is a silent no-op. The tmpfs override
+  (`allow_volatile_fs` / `UC2_ALLOW_VOLATILE_FS`) is never silent: the node
+  warns on every boot it is active.
+- **Clean lifecycle.** `SIGTERM` → bounded archive drain → exit 0, so a planned
+  restart rejoins from the journal instead of paying reconstruction. Packaged
+  systemd units: `TimeoutStopSec=10` (room for the drain),
+  `RestartPreventExitStatus=2` (a config refusal is not retried into a restart
+  loop), and a `BindsTo=` service unit so the service's lifecycle follows its
+  node's.
+- **Service-binary template.** `docs/how-to/write-a-service-binary.md` plus the
+  `counter` example's SIGTERM handling and `is_alive` supervision — the shape a
+  user's crate instantiates. Docs are cut over from example binaries to the
+  packaged daemon.
+- **Fleet-gated** (`docs/benchmarks/uc2-m9-gate-2026-08-19.md` is the record,
+  including run 1's honest FAIL and its diagnosis — the harness's load model,
+  not the cluster): leader stop under load **0.042 s, exit 0**; restart rejoins
+  with **no snapshot install** (snapshot builds proven at ~25 MB alongside);
+  commit rate recovered by **10.5 s observable** against a pre-committed 15 s
+  bar (the observable figure is plumbing-dominated — an upper bound). Cluster
+  switchover after a leader stop is **≈0.4 s** (derived from the ungated
+  8.5 % × 5 s dip window).
+- **Deployment model, stated plainly.** `uc2_client` is a same-host SDK: the
+  intended shape is one app client per node — the leader's serves requests, a
+  follower's answers its callers with a redirect to the leader
+  (`NotLeader` carries a leader hint). Place `instance_dir` on a real disk;
+  the node now refuses tmpfs by name.
+
+**Rollup.** v2.3.0 is the first tag since v2.1.0 and therefore ships everything
+below it: wire protocol **0.3.0** (post-M7 hardening, including the three
+consensus safety fixes found by the Lean effort), **0.4.0** (M8 wire crypto —
+opt-in and **off by default**; its cross-host fleet A/B remains a separate open
+step, which is why no v2.2.0 was cut), and **0.5.0** (content-attested durable
+reports, a consensus safety fix; **flag day** — upgrade all nodes together, a
+mixed cluster stalls commits rather than committing unsoundly). Also since
+v2.1.0: the pipelined client SDK (the public `Engine`/`PipelinedClient` tiers)
+and the Rung A linearizable-read batch-probe rounds (~953k lin reads/s @ p50
+1.08 ms mixed on the read-profile fleet).
+
+## Shipped in v2.3.0 — wire protocol 0.5.0 — content-attested durable reports
 
 **Consensus safety fix. Flag day for node↔node traffic: run one version.**
 
@@ -36,7 +95,7 @@ Measured on the directed rig (`uc2_node/tests/stale_read_hunt.rs`, 300 s of
 500 ms-cadence leader kills): log rewinds beneath the applied frontier went
 from 11 per run to **0**, with zero acked-write loss throughout.
 
-## Unreleased (wire protocol 0.4.0) — M8 wire crypto
+## Shipped in v2.3.0 — wire protocol 0.4.0 — M8 wire crypto
 
 **Opt-in, off by default.** Authenticated + encrypted node↔node UDP transport.
 A cluster runs either all-encrypted or all-cleartext — **flag day, no mixed
@@ -102,10 +161,10 @@ Design: `docs/superpowers/specs/2026-07-28-uc2-wire-crypto-design.md`. Gate:
   `uc2_log`'s `read_frame_validated` (`debug_assert!`-only bounds guard,
   pre-existing v2 code from `72f649b`, out of M8 scope, surfaced during T14).
 
-*The 0.3.0 items below ship in the same next tag; 0.4.0 supersedes the version
-number.*
+*The 0.3.0 items below shipped in the same tag (v2.3.0); 0.5.0 supersedes the
+version number.*
 
-## Unreleased (wire protocol 0.3.0)
+## Shipped in v2.3.0 — wire protocol 0.3.0
 Post-M7 follow-up hardening (no new externally-visible features). Wire protocol
 bumped **0.2.0 → 0.3.0**, additive only:
 - cnc-page `admission_bytes` field pinned at offset 3712.
