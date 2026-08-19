@@ -7,6 +7,10 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "uc2-node"
+path = "src/bin/uc2-node.rs"
+
 [dependencies]
 uc_protocol = { path = "../uc_protocol" }
 uc2_log = { path = "../uc2_log" }
@@ -17,6 +21,11 @@ ultima-journal = { workspace = true }
 thiserror = { workspace = true }
 fs2 = { workspace = true }
 rand = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+libc = { workspace = true }
+signal-hook = { workspace = true }
+clap = { workspace = true }
 
 [dev-dependencies]
 # Dev-only cycle (permitted: every edge is a dev-dependency) — the Task 11

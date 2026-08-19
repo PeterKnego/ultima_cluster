@@ -87,6 +87,11 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 zeroize = { version = "1", features = ["derive"] }
 base64 = "0.22"
 
+# M9 daemon. Versions verified against crates.io 2026-08-19.
+toml = "0.9"
+signal-hook = "0.3"
+libc = "0.2"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

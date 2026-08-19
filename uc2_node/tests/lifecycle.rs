@@ -1,0 +1,368 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
+//! M9: daemon lifecycle — drain-on-stop and restart cost.
+//!
+//! Construction follows `failover.rs`: a pre-bound socket, an instance dir
+//! under `CARGO_TARGET_TMPDIR` (ext4, never the RAM-backed `/tmp` — see
+//! CLAUDE.md "Local box"), and a sole voter that elects itself.
+
+use std::net::{SocketAddr, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use uc2_log::archive::{Archive, ArchiveConfig};
+use uc2_node::{DrainOutcome, Node, NodeConfig};
+
+const PAYLOAD: usize = 96;
+const RING: usize = 1 << 22;
+/// Enough load that the archive is genuinely behind when the stop is issued.
+/// See the drain test's comment on why a small load cannot discriminate.
+const LOAD: u64 = 5_000;
+
+fn config_for(addr: SocketAddr, instance_dir: PathBuf) -> NodeConfig {
+    NodeConfig {
+        id: 0,
+        members: vec![(0, addr)],
+        learners: Vec::new(),
+        bind: addr,
+        instance_dir,
+        app_id: "lifecycle".into(),
+        buffer_bytes: RING,
+        max_payload: 256,
+        admission_bytes: 256 * 1024,
+        election_timeout_min_ns: 150_000_000,
+        election_timeout_max_ns: 300_000_000,
+        seed: 0xA1B2_C3D4_5566_7788,
+        faults: Default::default(),
+        purge: uc2_node::PurgePolicy::Disabled,
+        journal_segment_bytes: uc2_node::DEFAULT_JOURNAL_SEGMENT_BYTES,
+        crypto: uc2_node::CryptoConfig::Disabled,
+    }
+}
+
+/// A sole-voter node on a freshly bound loopback socket, already serving.
+fn single_node(instance_dir: &Path) -> (Node, SocketAddr) {
+    let sock = UdpSocket::bind("127.0.0.1:0").expect("bind");
+    let addr = sock.local_addr().unwrap();
+    let node = Node::start_with_socket(config_for(addr, instance_dir.to_path_buf()), sock)
+        .expect("start");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !node.can_serve() {
+        assert!(Instant::now() < deadline, "sole voter never became leader");
+        std::thread::yield_now();
+    }
+    (node, addr)
+}
+
+/// Submit `n` distinct payloads, retrying a full ingress (failover.rs pattern).
+fn append_some_load(node: &Node, n: u64) {
+    for i in 0..n {
+        let mut p = vec![0u8; PAYLOAD];
+        p[..8].copy_from_slice(&i.to_le_bytes());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match node.submit(p.clone()) {
+                Ok(()) => break,
+                Err(uc2_node::SubmitError::Full) => {
+                    assert!(Instant::now() < deadline, "ingress stayed full");
+                    std::thread::yield_now();
+                }
+                Err(e) => panic!("submit to serving sole voter: {e:?}"),
+            }
+        }
+    }
+}
+
+/// The drain's whole purpose: after it reports `Drained`, the JOURNAL itself
+/// holds every appended byte.
+///
+/// Asserted by reopening the journal, not by restarting the node and reading
+/// its counters. A restart cannot discriminate: `log.buf` is file-backed, so a
+/// restarted archive picks the un-recorded tail straight back out of the buffer
+/// and catches `durable` up within milliseconds whether or not the drain ever
+/// ran. `Archive::recovered_position` is what the drain actually moves.
+///
+/// HONEST LIMIT — this pins the CONTRACT, not a behaviour difference. Mutation
+/// (replacing the drain with a bare `stop()`) does NOT turn this test red, at
+/// any load tried up to 5000 payloads. `Node::stop` tears the agents down in
+/// order and the archive is LAST (`agents: [consensus, sender, receiver,
+/// archive]`), so it keeps polling while the other three threads join and
+/// clears a backlog of this size on its own. The drain's value is that the
+/// catch-up becomes a bounded guarantee that REPORTS what it achieved, instead
+/// of an accident of teardown order — which is what Task 8's restart-cost gate
+/// measures under real load.
+#[test]
+fn stop_draining_leaves_durable_caught_up_with_append() {
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-lifecycle-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    let instance_dir = dir.path().join("n0");
+
+    let (node, _addr) = single_node(&instance_dir);
+    append_some_load(&node, LOAD);
+
+    let append_before = node.counters().append.load_acquire();
+    assert!(append_before > 0, "test must actually append something");
+
+    match node.stop_draining(Duration::from_secs(10)) {
+        DrainOutcome::Drained => {}
+        other => panic!("expected Drained, got {other:?}"),
+    }
+
+    // The node is stopped, so its archive is dropped and the journal is quiet.
+    let arch = Archive::open(ArchiveConfig::new(instance_dir.join("journal")))
+        .expect("reopen journal");
+    let recorded = arch.recovered_position();
+    assert!(
+        recorded >= append_before,
+        "stop_draining reported Drained while the journal ends at {recorded}, short of the \
+         {append_before} bytes appended — the drain did not actually drain"
+    );
+}
+
+/// A drain that cannot finish must still stop the node. A shutdown that hangs
+/// is worse than one that costs a replay.
+///
+/// This is a non-hang guard, not a proof that the deadline is honoured: when
+/// the archive happens to be already caught up the call returns `Drained`
+/// immediately and the bound is met trivially. It does catch an unbounded
+/// wait, which is the failure that matters.
+#[test]
+fn stop_draining_honours_its_deadline() {
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-lifecycle-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    let (node, _addr) = single_node(&dir.path().join("n0"));
+    append_some_load(&node, 512);
+
+    let t0 = Instant::now();
+    let outcome = node.stop_draining(Duration::from_nanos(1));
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "a 1 ns deadline must not become an unbounded wait (took {elapsed:?}, got {outcome:?})"
+    );
+}
+
+// ------------------------------------------------------- the uc2-node daemon
+
+/// Write a single-voter config and return its path plus the instance dir.
+fn daemon_config(dir: &Path, port: u16, bind: &str, extra: &str) -> (PathBuf, PathBuf) {
+    let inst = dir.join("n1");
+    std::fs::create_dir_all(&inst).unwrap();
+    let cfg = dir.join("node.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"{extra}
+id = 1
+bind = "{bind}:{port}"
+instance_dir = "{}"
+app_id = "lifecycle"
+
+[[members]]
+id = 1
+addr = "127.0.0.1:{port}"
+"#,
+            inst.display()
+        ),
+    )
+    .unwrap();
+    (cfg, inst)
+}
+
+fn scratch() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("uc2-daemon-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir")
+}
+
+#[test]
+fn daemon_starts_from_a_config_file_and_stops_cleanly_on_sigterm() {
+    use std::process::Command;
+
+    let dir = scratch();
+    let (cfg, _inst) = daemon_config(dir.path(), 19701, "127.0.0.1", "");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(&cfg)
+        .spawn()
+        .unwrap();
+
+    // Give it time to elect itself in a one-node cluster.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+
+    let start = Instant::now();
+    let status = child.wait().unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(status.success(), "clean shutdown must exit 0, got {status:?}");
+    assert!(elapsed < Duration::from_secs(1), "SIGTERM to exit took {elapsed:?}, bar is < 1s");
+}
+
+#[test]
+fn daemon_refuses_a_config_with_a_bind_mismatch() {
+    use std::process::Command;
+
+    let dir = scratch();
+    let (cfg, _inst) = daemon_config(dir.path(), 19702, "0.0.0.0", "");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "must refuse to start");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("bind"), "refusal must name the field, got: {err}");
+    // Exit 2 specifically means "this config is bad and will be bad next time".
+    // packaging/systemd/uc2-node.service keys RestartPreventExitStatus on it, so
+    // the code is a contract with the shipped unit, not an implementation
+    // detail: drifting it to 1 turns a loud refusal back into a restart loop.
+    assert_eq!(out.status.code(), Some(2), "a config refusal must exit 2, got {:?}", out.status);
+}
+
+/// A RAM-backed instance_dir is refused by default, and the override starts the
+/// node while WARNING every boot. Without this the override channel is only
+/// unit-tested; this is the assertion that the daemon actually prints it, which
+/// is the half `preflight` deliberately does not own.
+#[test]
+fn daemon_refuses_a_volatile_instance_dir_then_warns_when_overridden() {
+    use std::process::Command;
+
+    // /proc/mounts, not the code under test — see preflight's volatile_dir.
+    let Some(vol) = std::fs::read_to_string("/proc/mounts").ok().and_then(|m| {
+        m.lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            match (f.next(), f.next(), f.next()) {
+                (Some(_), Some(mp), Some("tmpfs")) if mp == "/dev/shm" || mp == "/tmp" => {
+                    Some(PathBuf::from(mp))
+                }
+                _ => None,
+            }
+        })
+    }) else {
+        eprintln!("no RAM-backed fs available; skipping");
+        return;
+    };
+
+    let inst = vol.join(format!("uc2-volatile-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&inst).unwrap();
+    let dir = scratch();
+    let write_cfg = |extra: &str| {
+        let cfg = dir.path().join(format!("node{}.toml", extra.len()));
+        std::fs::write(
+            &cfg,
+            format!(
+                "{extra}\nid = 1\nbind = \"127.0.0.1:19703\"\ninstance_dir = \"{}\"\n\
+                 app_id = \"lifecycle\"\n\n[[members]]\nid = 1\naddr = \"127.0.0.1:19703\"\n",
+                inst.display()
+            ),
+        )
+        .unwrap();
+        cfg
+    };
+
+    let out = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(write_cfg(""))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a RAM-backed instance_dir must be refused by default");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("RAM-backed"), "refusal must say why, got: {err}");
+
+    // Overridden: it starts, so SIGTERM it — but it must have warned first.
+    let child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(write_cfg("allow_volatile_fs = true"))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "the override must let the node start and stop cleanly");
+    assert!(
+        err.contains("WARNING") && err.contains("OVERRIDDEN"),
+        "the override must never be silent, got stderr: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&inst);
+}
+
+/// `[log]` and `[metrics]` are reserved for M10. The daemon must START with
+/// them present — `deny_unknown_fields` would otherwise make any
+/// forward-looking config a hard refusal — and must SAY they do nothing.
+/// Accepting a section silently is the failure mode this milestone abolishes:
+/// the operator wrote it expecting an effect.
+///
+/// Note the sections are appended AFTER `[[members]]`, not prepended: a table
+/// header at the top of the document would capture `id`/`bind`/`app_id` into
+/// it. That is also why this test does not reuse `daemon_config`'s `extra`,
+/// which prepends.
+#[test]
+fn daemon_starts_and_announces_the_m10_reserved_sections() {
+    use std::process::Command;
+
+    let dir = scratch();
+    let inst = dir.path().join("n1");
+    std::fs::create_dir_all(&inst).unwrap();
+    let cfg = dir.path().join("node.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"id = 1
+bind = "127.0.0.1:19704"
+instance_dir = "{}"
+app_id = "lifecycle"
+
+[[members]]
+id = 1
+addr = "127.0.0.1:19704"
+
+[log]
+level = "info"
+
+[metrics]
+bind = "127.0.0.1:19605"
+"#,
+            inst.display()
+        ),
+    )
+    .unwrap();
+
+    // No assertion between spawn and kill — a leaked busy-spin node burns a
+    // core and blocks cargo on the inherited pipe (see the M9 plan, Ruling 11).
+    let child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(&cfg)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        out.status.success(),
+        "a config carrying the reserved sections must start and stop cleanly, stderr: {err}"
+    );
+    assert!(
+        err.contains("RESERVED") && err.contains("NO effect"),
+        "an inert section must never be silently swallowed, got stderr: {err}"
+    );
+    assert!(
+        err.contains("[log]") && err.contains("[metrics]"),
+        "the notice must name the sections, got stderr: {err}"
+    );
+}
