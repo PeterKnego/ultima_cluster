@@ -255,6 +255,9 @@ off.
 
 ## 5. Where to go next
 
+- **[Run a cluster on real hosts](/docs/how-to/run-a-cluster.md)** — the same
+  cluster you just ran, moved onto separate machines: per-host configs, the
+  network path, where clients live, systemd supervision.
 - **[ARCHITECTURE.md](/docs/ARCHITECTURE.md)** — how it works, and why it is
   shaped this way.
 - **[VERIFICATION.md](/docs/VERIFICATION.md)** — what is proved, what is checked,

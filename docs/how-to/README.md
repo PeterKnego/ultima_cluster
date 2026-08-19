@@ -13,9 +13,10 @@ apply these guides to.
 The two guides most people need first: getting nodes onto real machines, and
 keeping the disk from filling once they are there.
 
-- [Run a cluster on real hosts](run-a-cluster.md) — durable instance
-  directories, the address rule that causes the most confusing failure in the
-  system, and process supervision that does not hang on shutdown.
+- [Run a cluster on real hosts](run-a-cluster.md) — binaries and configs onto
+  each machine, the address rule that causes the most confusing failure in the
+  system, where client processes must live, process supervision that does not
+  hang on shutdown, and what a planned restart costs.
 - [Keep the journal from growing without bound](bound-journal-growth.md) —
   snapshots first, then purging, and how to tell that it is working.
 

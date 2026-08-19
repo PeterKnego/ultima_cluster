@@ -11,8 +11,8 @@ path is kept because other documents and tooling cite it.
 ## Running a cluster
 
 - [Run a cluster on real hosts](../how-to/run-a-cluster.md) — durable instance
-  directories, the bind-address rule, and process supervision.
-  *Was §2, §4.*
+  directories, the bind-address rule, client placement, process supervision,
+  and restart cost. *Was §2, §4.*
 - [Keep the journal from growing without bound](../how-to/bound-journal-growth.md)
   — snapshots, then purging, and confirming it works. *Was §5.*
 

@@ -1,11 +1,85 @@
 # How to run a cluster on real hosts
 
 Covers the move from a single-box cluster to nodes on separate machines, where
-addresses and process supervision start to matter.
+addresses, the network path, client placement, and process supervision start to
+matter.
 
 If you have not run one at all yet, work through
 [the quickstart](../QUICKSTART.md) first — it gets three nodes up on one box
 and is a better place to meet the moving parts.
+
+## Install the binaries on each host
+
+Three binaries go onto every host, built once on a machine of the same
+architecture:
+
+```bash
+cargo build --release -p uc2_node -p uc2ctl --bins
+```
+
+- `target/release/uc2-node` — the node daemon.
+- `target/release/uc2ctl` — the admin CLI, for status and membership changes.
+- Your own service binary — the half that runs your state machine. See
+  [Write a service binary](write-a-service-binary.md).
+
+Copy them to `/usr/local/bin` on each host; that is the path the packaged
+systemd units expect.
+
+## Write one config file per host
+
+Every host gets the same `[[members]]` block — the full voting membership,
+identical everywhere — and differs only in `id`, `bind`, and (if the paths
+differ) `instance_dir`. For node 1 of a three-node cluster:
+
+```toml
+id = 1
+bind = "10.0.0.11:9100"
+instance_dir = "/srv/uc2/n1"
+app_id = "myapp"
+
+[[members]]
+id = 0
+addr = "10.0.0.10:9100"
+
+[[members]]
+id = 1
+addr = "10.0.0.11:9100"
+
+[[members]]
+id = 2
+addr = "10.0.0.12:9100"
+```
+
+[`packaging/node.example.toml`](../../packaging/node.example.toml) is the
+annotated reference copy — every optional field with its default shown — and a
+test pins it against the loader, so it cannot drift. The full surface is in
+[Configuration](../reference/configuration.md).
+
+Two properties of the file save you from whole classes of quiet failure: a
+typo'd key is a startup refusal naming the key, and every semantic rule is
+checked before the first agent spawns — the node refuses with the offending
+field named rather than failing later in a way that looks like something else.
+
+One property surprises people later: **`members` is a seed, not a setting.** It
+is authoritative only for a fresh instance directory. After the first boot the
+durable config record owns membership, and a restart with an edited `members`
+list has no effect. To change membership on a running cluster, use `uc2ctl` —
+see [Change cluster membership](change-cluster-membership.md).
+
+## Open the network path between the nodes
+
+Node-to-node replication is UDP on the `bind` port. Every node's port must be
+reachable from every other node, in both directions. Nothing else crosses the
+network: services, clients, and `uc2ctl` all attach over shared memory on the
+node's own host, so there are no client ports to open, and enabling
+[wire crypto](encrypt-node-traffic.md) later uses the same socket.
+
+The wire assumes the path carries **1408-byte UDP payloads without
+fragmentation** — comfortable headroom on any standard 1500-MTU path, but worth
+checking on overlays, VPNs, and tunnels that shrink the effective MTU. Related:
+a max-size frame plus its headers (and the crypto tag, when encryption is on)
+must fit that budget, because the node does not fragment frames. Raising
+`max_payload` past it is a startup refusal that states the exact byte need.
 
 ## Give every node a durable instance directory
 
@@ -15,14 +89,15 @@ real filesystem.
 An instance directory on `tmpfs` makes every `fsync` a silent no-op: the
 cluster will appear to work and will lose committed data on power loss. If you
 are running in a container, check what the mount actually is rather than what
-the image implies.
+the image implies. `uc2-node` refuses to start on a RAM-backed filesystem, and
+the test-only override never silences the warning.
 
 For which files must survive a power cut and which are rebuilt on boot, see
 [Instance directory](../reference/instance-directory.md).
 
 ## Bind the exact address you advertise
 
-Set each node's `NodeConfig.bind` to the same value as that node's own entry in
+Set each node's `bind` to the same value as that node's own entry in
 `members`. Not a wildcard, not `0.0.0.0` — the identical concrete address.
 
 On a multi-homed host, pick the interface address the peers actually route to
@@ -65,6 +140,11 @@ notice `SIGTERM` and a long timeout only delayed the kill. Now the timeout is
 the drain's budget: cutting it short throws away the work that makes the next
 start cheap. It must exceed `--drain-timeout-secs` (default 5).
 
+Exit codes distinguish the two ways a start can fail: **exit 2** is a config
+refusal, which the packaged unit does not retry (the same file is refused
+identically every time, and retrying only delays you seeing why); **exit 1** is
+a runtime failure — a port still held, say — which is worth retrying and is.
+
 The service half is your own binary; supervise it with
 `packaging/systemd/uc2-service@.service`, which `BindsTo` the node so the pair
 stop together and in the right order. See
@@ -75,7 +155,63 @@ If you are starting nodes over SSH, do not background with `ssh host 'cmd &'` �
 the busy-spin threads hold the pipe open and the SSH session hangs. Use
 `systemd-run`, or `setsid` with redirected stdio.
 
+## Put a client next to every node
+
+There is no network client. `uc2_client` attaches to a node over shared
+memory, so anything that submits commands or reads state must run **on a host
+that runs a node** — typically your gateway process (REST, gRPC, whatever faces
+your callers), holding one client attached to its local node.
+
+The shape that works — and the one the M9 fleet gate runs — is **one client
+per node, alive at all times**:
+
+- The leader's client serves writes and linearizable reads.
+- A follower's client completes those with `NotLeader { hint }`, where `hint`
+  is the leader's node id (`None` while an election is unresolved). Your
+  gateway answers its own callers with a redirect to the leader's host, at
+  whatever protocol level it speaks.
+- Snapshot reads are served by every replica from its own copy of the state —
+  no redirect, no quorum round-trip, may lag the leader slightly.
+
+Two mistakes to avoid, both of which the gate's first fleet run paid for:
+
+- **Do not tear down and respawn clients when leadership moves.** Keep one
+  attached everywhere and let the new leader's client simply start succeeding.
+  Respawning puts a process start plus a wait-for-serving inside your outage
+  window: on the gate fleet, that harness mistake read as a 62 % throughput
+  dip where the cluster's real dip was 8.5 %.
+- **Back off in the `NotLeader` arm.** A follower-side loop that hot-retries
+  connect/submit/`NotLeader` with no sleep burns a core on every non-leader
+  host. A couple of milliseconds is enough.
+
+`PipelinedClient::leader_hint()` exposes the same hint between requests, if
+your gateway wants to route proactively rather than on rejection.
+
+## What a planned restart costs
+
+A `systemctl restart uc2-node` (or stop, upgrade binary, start) is cheap by
+design, and the [M9 gate](../benchmarks/uc2-m9-gate-2026-08-19.md) measured it
+on a real fleet under sustained load:
+
+- **Stop is sub-second.** `SIGTERM` to process exit measured 0.042–0.098 s
+  with the archive draining under load, against a < 1 s bar.
+- **The restart replays, it does not reconstruct.** A drained node holds every
+  acked byte in its journal and rejoins by replaying a short tail; the gate
+  verifies no snapshot install occurs across the cycle.
+- **Restarting the leader costs one election.** This release ships no
+  leadership transfer, so a leader stop leaves the cluster leaderless for one
+  randomized election timeout (150–300 ms by default). On the gate fleet the
+  commit rate dipped 8.5 % over the 5 s around a leader restart and was
+  confirmed back at baseline within 10.5 s of the `SIGTERM` — an upper bound
+  dominated by the measurement's own SSH round-trips, not the cluster.
+
+For a rolling restart (a binary upgrade, say), restart followers first and the
+leader last, so the cluster pays that election exactly once.
+
 ## Confirm the cluster is actually serving
+
+On any node's host — `uc2ctl` reads the local control page, so run it there,
+not from your workstation:
 
 ```bash
 uc2ctl status --instance-dir /srv/uc2/n0 --app-id myapp
