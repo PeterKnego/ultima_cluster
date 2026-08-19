@@ -1584,9 +1584,9 @@ and does not survive a machine change.
 
 | Task | State |
 |---|---|
-| 1 — config file schema and loader | **implemented**, commit `a853c60`; **review not completed** |
-| 2 — preflight validation | not started |
-| 3 — volatile-fs refusal | **plan amended** (see Ruling 4), not started |
+| 1 — config file schema and loader | **done** — `a853c60`; re-verified + reviewed on Linux 2026-08-19 (see Ruling 6) |
+| 2 — preflight validation | **done** — `1858330`; three deviations from the brief (Ruling 7) |
+| 3 — volatile-fs refusal | **plan amended** (see Ruling 4), in progress |
 | 4–8 | not started |
 
 **Environment finding (2026-08-19):** the workspace does not build on macOS.
@@ -1640,15 +1640,37 @@ loader.
 buildability by gating the punch-hole to Linux. Withdrawn on maintainer direction
 that macOS is not a target. No code was committed for it.
 
-### Carried forward — do these first on the Linux host
+### Rulings (continued)
 
-1. **Re-verify Task 1 on Linux.** Its reported evidence (4/4 new tests, clippy
-   clean, 69/71 suite) came from a patched macOS tree. Re-run
-   `cargo test -p uc2_node` and `cargo clippy -p uc2_node --all-targets -- -D warnings`
-   before trusting it.
-2. **Review Task 1.** The task review was dispatched and cancelled mid-flight; it
-   never produced a verdict. Two things for the reviewer: the implementer added
-   `#[derive(Debug)]` to `NodeConfig` outside the brief's file list (required by the
-   brief's own `unwrap_err()` test — a plan defect, not scope creep), and Ruling 4
-   changes `load_from_path`'s signature, so Task 1's tests are amended inside Task 3.
-3. **Then resume at Task 2.**
+**Ruling 6 (Task 1) — re-verified and reviewed on Linux; APPROVED as-is.** The
+macOS evidence is superseded: `cargo test -p uc2_node --lib` is 71/71 (the
+patched-tree record said 69/71), the 4 `config_file` tests pass, and clippy is
+clean. Review verdict on the two flagged items: (a) `#[derive(Debug)]` on
+`NodeConfig` is safe to keep — `CryptoConfig::Enabled` holds key *paths*, never
+key material, so no secret can reach a debug print; (b) `faults` is correctly
+absent from the file surface (a sim knob, not an operator one). The rules the
+module does not check — duplicate ids, self-not-in-members, non-power-of-two
+buffer — are Task 2's by design, and Task 2 now covers all of them.
+`load_from_path`'s signature change under Ruling 4 remains pending in Task 3.
+
+**Ruling 7 (Task 2) — three deviations from the brief, all deliberate.**
+(a) `MAX_MEMBERS` is imported from `uc_protocol::v2::config`, not redeclared as
+a local `8`. The wire crate enforces that cap at config-frame proposal and at
+decode; a second copy is a drift hazard of exactly the kind the cnc
+offset-pinning convention exists to prevent. A test pins the two together.
+(b) The payload rule is `max_payload > buffer_bytes / 4`, not the brief's
+`max_payload * 4 > buffer_bytes` — the multiply overflows for a large
+`max_payload`, panicking in debug and **wrapping in release**, which would
+silently admit the very value the rule exists to refuse. Demonstrated rather
+than argued: the added test fails against the brief's formula with "attempt to
+multiply with overflow" and passes against the division.
+(c) `CryptoConfig`/`PurgePolicy` are imported inside the test module; at file
+scope they are unused in a non-test build and fail `clippy -D warnings`.
+*Cost if wrong:* (a) an intentional divergence from the wire cap would now need
+two edits; (b) and (c) none.
+
+### Carried forward — next on this host
+
+1. **Task 3**, as amended by Ruling 4 (two override channels, `StartupOptions`
+   returned from `load_from_path`, the Task 1 test amendments folded in).
+2. Then Tasks 4–8. The Task 8 fleet run stays a separate, user-approved step.
