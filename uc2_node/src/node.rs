@@ -146,6 +146,7 @@ pub enum PurgePolicy {
 
 /// Static-membership node configuration (M4: no discovery; M7 adds live
 /// reconfiguration on top — see `members`/`learners` below).
+#[derive(Debug)]
 pub struct NodeConfig {
     pub id: NodeId,
     /// Every VOTING member INCLUDING self (if this node is a voter), as

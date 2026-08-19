@@ -29,12 +29,14 @@
 //! §3.2 / §6; plan `docs/superpowers/plans/2026-07-11-uc2-m4-elections.md`
 //! Task 8.
 
+pub mod config_file;
 pub mod ipc;
 #[cfg(feature = "mutation-testing")]
 pub(crate) mod mutation;
 mod node;
 mod read_round;
 
+pub use config_file::load_from_path;
 pub use ipc::{InstanceDir, IpcError};
 pub use node::{DEFAULT_JOURNAL_SEGMENT_BYTES, Node, NodeConfig, PurgePolicy, SubmitError};
 /// M8: node-to-node wire crypto configuration, re-exported so a deployment
