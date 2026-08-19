@@ -1588,7 +1588,8 @@ and does not survive a machine change.
 | 2 — preflight validation | **done** — `1858330`; three deviations from the brief (Ruling 7) |
 | 3 — volatile-fs refusal | **done** — `bfdba6f`; four brief defects fixed (Ruling 8) |
 | 4 — archive drain | **done** — `e14be43`; contract pinned, limit recorded (Ruling 9) |
-| 5–8 | not started |
+| 5 — uc2-node daemon | **done** — `adf72ba`; MTU defect found + fixed (Ruling 10) |
+| 6–8 | not started |
 
 **Environment finding (2026-08-19):** the workspace does not build on macOS.
 `uc_protocol/src/ring/common.rs:374` calls `libc::fallocate` with
@@ -1707,8 +1708,37 @@ restart cannot discriminate — `log.buf` is file-backed, so a restarted archive
 pulls the tail back out of the buffer regardless.
 *Cost if wrong:* the drain is a no-op in cases the gate does not reach.
 
+**Ruling 10 (Task 5) — the shipped default config panicked the daemon on its
+first boot, and the fix is in two places because there were two faults.**
+Running the daemon for the first time produced
+`uc2_net/src/sender.rs:421: a max-size frame (+ crypto overhead, if enabled)
+must fit one datagram`. Task 1's `default_max_payload` was **1 MiB against a
+1408 B MTU** — about 700x the budget. UC does not fragment frames, so
+`Sender::new` asserts the fit at construction: every field deserialised
+perfectly and the process then died inside the transport, which is precisely
+the failure mode M9 exists to abolish.
+(a) The default is now 512 B, matching the examples' `NODE_MAX_PAYLOAD`, which
+is documented against this exact assert.
+(b) `preflight` gained `PayloadExceedsMtu`, reproducing the sender's arithmetic
+(`align_frame_len(HEADER_LEN + max_payload) + DATAGRAM_HEADER_LEN`, plus
+`CRYPTO_OVERHEAD` when crypto is on) and refusing by name with the numbers
+shown. The node never overrides the sender's `mtu`, so `MTU_DEFAULT` is the
+true budget; an ordering guard keeps the sum from overflowing on an absurd
+value.
+Two regression tests: `the_defaults_pass_preflight` (a minimal config's stated
+defaults must be *startable*, not merely parseable — the test the 1 MiB default
+would have failed) and `the_mtu_budget_accounts_for_crypto_overhead`.
+**Lesson for the remaining tasks:** Task 1 was reviewed as "deserialisation
+only, defaults are out of scope". That framing is what let a fatal default
+through — a default IS a semantic claim, and nothing had ever started a node
+from this file until Task 5.
+Also corrected: the brief's daemon predates Ruling 4 (single-value
+`load_from_path`, one-arg `check`) and silently discarded the `FsVerdict`,
+which would have made the override channel silent — the exact thing Ruling 4
+forbids. The daemon now warns on every boot, and a test asserts it.
+
 ### Carried forward — next on this host
 
-1. **Task 5** (the `uc2-node` daemon), then Tasks 6–7.
+1. **Task 6** (service template), then **Task 7** (docs).
 2. Task 8's harness is local work; its FLEET RUN stays a separate,
    user-approved step. Do not tag or record a PASS from a local run.
