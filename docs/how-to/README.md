@@ -29,6 +29,12 @@ preconditions worth reading before you start.
 - [Encrypt traffic between nodes](encrypt-node-traffic.md) — a flag day, not a
   rolling change: the whole cluster flips together.
 
+## Building on it
+
+- [Write a service binary](write-a-service-binary.md) — the lifecycle template
+  for the half that runs your state machine: signal handling, apply-agent
+  supervision, and why leaving either out fails quietly.
+
 ## When something is wrong
 
 - [Diagnose a node that is not serving](diagnose-a-node.md) — what a live node

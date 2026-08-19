@@ -48,10 +48,31 @@ fn main() -> anyhow::Result<()> {
     }
 
     let cfg = ServiceConfig::new(args.instance_dir.clone(), args.app_id);
-    let _service = ServiceBuilder::new(cfg, CounterSm::default()).start()?;
+    let service = ServiceBuilder::new(cfg, CounterSm::default()).start()?;
     println!("service attached at {}", args.instance_dir.display());
 
-    loop {
-        std::thread::park();
+    // The template every service binary should copy: a signal flag, a poll
+    // loop that supervises the apply agent, and an explicit stop. A service
+    // killed by SIGTERM's default disposition never calls `Service::stop`, so
+    // it leaves the node's shared memory attached until the OS tears it down.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        signal_hook::flag::register(sig, std::sync::Arc::clone(&stop))?;
     }
+
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        // A fail-stopped apply thread must not look like a healthy service.
+        // `is_alive` is false once the apply agent's work closure has panicked
+        // (instance mismatch, log rewind) — exit non-zero so the supervisor
+        // restarts us rather than leaving a zombie attached.
+        if !service.is_alive() {
+            eprintln!("counter-service: apply agent died; exiting for restart");
+            return Err(anyhow::anyhow!("apply agent fail-stopped"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    println!("counter-service: signalled, stopping");
+    service.stop();
+    Ok(())
 }

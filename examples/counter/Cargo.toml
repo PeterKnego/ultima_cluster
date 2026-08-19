@@ -34,3 +34,7 @@ serde         = { workspace = true }
 clap          = { version = "4", features = ["derive"] }
 anyhow        = { workspace = true }
 tempfile      = { workspace = true }
+signal-hook   = { workspace = true }
+
+[dev-dependencies]
+libc          = { workspace = true }

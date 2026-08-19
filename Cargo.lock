@@ -281,7 +281,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "serde",
+ "signal-hook",
  "tempfile",
  "uc2_client",
  "uc2_consensus",
