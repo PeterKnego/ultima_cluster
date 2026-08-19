@@ -1855,18 +1855,38 @@ run 2.
 again and the residual is the product's own election gap — at which point the
 recorded open question, not this ruling, is the path forward.
 
+**Ruling 17 (fleet run 2) — PASS on the pre-committed re-specified bar; the
+run-1 FAIL is confirmed to have been the harness's load model.** The house rule
+held in order: decide rule `da95d22` (row 3 re-specified as time-to-recover,
+≤ 15 s to the end of the first ≥ 80 %-of-baseline 2 s window, confirmed by the
+next), then the harness implementing it (`6103c0a`), then the run. Fleet run 2
+(2026-08-19, 3×c6id.2xlarge — same instance type as run 1; node3 of the 4
+provisioned came up ssh-dead and was unused, the gate needs exactly 3) passed
+all four rows: 0.042 s exit 0; no install with snapshots proven firing at
+~24–25 MB on all three nodes; recovered at 10.5 s (plumbing-dominated — an
+upper bound, not a measurement of true recovery); 6/6 refusals by name.
+The confirmation of Ruling 16 is the ungated A/B: the run-1-style 5 s dip read
+**8.5 % against run 1's 62.0 %** on identical hardware — with the per-node
+client model even the original 10 % bar would have passed, so the 62 % was the
+harness, not the cluster. Also banked: the local mechanics run caught a
+client-lifetime bug before money was spent (load clients exiting mid-poll read
+as a dead cluster — 40 s of zero-rate windows that vanished when the lifetime
+was raised to cover the poll).
+*Cost if wrong:* the 15 s bar is generous and plumbing-heavy, so a genuine
+regression in restart cost below ~10 s of degradation would pass this row —
+rows 1 and 2 remain the tight bounds on the stop and the rejoin path.
+
 ### State at handoff
 
 Tasks 1–8 are implemented and committed, plus two post-task commits from a
 whole-branch review against the spec (Rulings 14 and 15). The remaining step is
 the one the plan always reserved:
 
-1. **Fleet run 1 was executed 2026-08-19 and FAILED honestly on row 3** (62.0 %
-   vs the 10 % bar; rows 1/2/4 passed). The record, diagnosis, and the open
-   row-3 adjudication question live in the gate doc
-   (`docs/benchmarks/uc2-m9-gate-2026-08-19.md`, "Fleet run 1"); see Ruling 16.
-   Do not tag, do not record a PASS, do not claim M9 complete. `v2.3.0` tags
-   only on a fleet PASS, and fleet run 2 requires user approval.
+1. **The M9 fleet gate has PASSED — fleet run 2, 2026-08-19** (run 1 before it
+   FAILED honestly on row 3 and stays recorded; see Rulings 16–17 and the gate
+   doc `docs/benchmarks/uc2-m9-gate-2026-08-19.md`, "Fleet run 1" / "Fleet
+   run 2"). Remaining maintainer steps, none performed yet: merge
+   `uc2/m9-fleet-orchestrator` to `main`, tag `v2.3.0`, and push.
 2. Local smoke, re-run after Rulings 14–15 (`ef5cd0f`): row 1 **0.091 s, exit
    0**; row 2 **no install**, anti-vacuity satisfied (`service_snapshot_pos`
    [1899648, 1897344, 1897984], so snapshots were genuinely firing); row 4
