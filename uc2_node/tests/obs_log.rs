@@ -15,7 +15,7 @@
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use uc2_consensus::election::NodeId;
@@ -291,6 +291,37 @@ fn assert_json_lines(text: &str) {
     }
 }
 
+/// Poll the capture buffer until `pred` matches the accumulated text, or
+/// panic (with the buffer's contents) after `secs`.
+///
+/// Closes a real race, not a flaky-test workaround: `can_serve()`/
+/// `truncations()` etc. observe the state-machine transition directly
+/// (`ElectionSm`/atomics), while the matching `obs_event!` record is written
+/// by `publish_status`/the `exec` arm on its own cadence — there is a window
+/// (up to one duty cycle) where the state has already flipped but the record
+/// has not yet landed in the sink. A single post-`await_until` snapshot of
+/// the buffer can race that window; polling the buffer itself with its own
+/// deadline (not just the state) closes it the same way `await_until` closes
+/// the state race.
+fn await_capture(
+    buf: &Arc<Mutex<Vec<u8>>>,
+    secs: u64,
+    msg: &str,
+    mut pred: impl FnMut(&str) -> bool,
+) -> String {
+    let deadline = deadline_secs(secs);
+    loop {
+        let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        if pred(&text) {
+            return text;
+        }
+        if Instant::now() >= deadline {
+            panic!("{msg}\n--- capture buffer ---\n{text}--- end capture buffer ---");
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
 /// A clean boot elects one leader: the winner emits `became_leader`, and the
 /// serving-edge (leader or a follower once it can serve) emits
 /// `serving_changed` with `can_serve:true`.
@@ -302,14 +333,18 @@ fn an_election_emits_became_leader_and_followers_note_it() {
     let leader = await_single_leader(&cluster.nodes, 10);
     await_until(10, "leader never reported can_serve", || cluster.nodes[leader].can_serve());
 
-    let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-    assert_json_lines(&text);
-    assert!(text.lines().any(|l| l.contains(r#""event":"became_leader""#)), "{text}");
-    assert!(
-        text.lines().any(|l| l.contains(r#""event":"serving_changed""#)
-            && l.contains(r#""can_serve":true"#)),
-        "{text}"
+    let text = await_capture(
+        &buf,
+        5,
+        "became_leader/serving_changed records never landed in the capture buffer",
+        |t| {
+            t.lines().any(|l| l.contains(r#""event":"became_leader""#))
+                && t.lines().any(|l| {
+                    l.contains(r#""event":"serving_changed""#) && l.contains(r#""can_serve":true"#)
+                })
+        },
     );
+    assert_json_lines(&text);
 
     cluster.stop_all();
     uc2_node::obs::log::stderr_for_tests();
@@ -334,9 +369,10 @@ fn a_healed_deposed_leader_emits_log_truncated() {
         cluster.nodes[old].truncations() >= 1
     });
 
-    let text = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    let text = await_capture(&buf, 5, "log_truncated record never landed in the capture buffer", |t| {
+        t.lines().any(|l| l.contains(r#""event":"log_truncated""#))
+    });
     assert_json_lines(&text);
-    assert!(text.lines().any(|l| l.contains(r#""event":"log_truncated""#)), "{text}");
 
     cluster.stop_all();
     uc2_node::obs::log::stderr_for_tests();
