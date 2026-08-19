@@ -299,18 +299,17 @@ fn daemon_refuses_a_volatile_instance_dir_then_warns_when_overridden() {
     let _ = std::fs::remove_dir_all(&inst);
 }
 
-/// `[log]` and `[metrics]` are reserved for M10. The daemon must START with
-/// them present — `deny_unknown_fields` would otherwise make any
-/// forward-looking config a hard refusal — and must SAY they do nothing.
-/// Accepting a section silently is the failure mode this milestone abolishes:
-/// the operator wrote it expecting an effect.
+/// `[log]`/`[metrics]` now have an M10 schema: the daemon must START with
+/// them present, and it must no longer print the old M9 "RESERVED ... NO
+/// effect" notice — the sections act now (Task 7 wires the endpoint itself;
+/// this only pins that the M9-era placeholder notice is gone).
 ///
 /// Note the sections are appended AFTER `[[members]]`, not prepended: a table
 /// header at the top of the document would capture `id`/`bind`/`app_id` into
 /// it. That is also why this test does not reuse `daemon_config`'s `extra`,
 /// which prepends.
 #[test]
-fn daemon_starts_and_announces_the_m10_reserved_sections() {
+fn a_daemon_with_metrics_configured_no_longer_prints_the_reserved_notice() {
     use std::process::Command;
 
     let dir = scratch();
@@ -355,14 +354,10 @@ bind = "127.0.0.1:19605"
 
     assert!(
         out.status.success(),
-        "a config carrying the reserved sections must start and stop cleanly, stderr: {err}"
+        "a config carrying [log]/[metrics] must start and stop cleanly, stderr: {err}"
     );
     assert!(
-        err.contains("RESERVED") && err.contains("NO effect"),
-        "an inert section must never be silently swallowed, got stderr: {err}"
-    );
-    assert!(
-        err.contains("[log]") && err.contains("[metrics]"),
-        "the notice must name the sections, got stderr: {err}"
+        !err.contains("RESERVED"),
+        "the M9 placeholder notice must be gone now that the sections have a schema, got stderr: {err}"
     );
 }

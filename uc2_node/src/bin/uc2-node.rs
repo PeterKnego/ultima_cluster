@@ -39,16 +39,6 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // A config section this version parses but does not act on must never be
-    // silently swallowed — the operator wrote it expecting an effect. Same
-    // never-silent discipline as the durability override below.
-    if opts.reserved.any() {
-        eprintln!(
-            "uc2-node: NOTE: config section(s) [{}] are RESERVED for a future release \
-             and have NO effect in this version; they were parsed and ignored.",
-            opts.reserved.names().join("], [")
-        );
-    }
     match preflight::check(&cfg, &opts) {
         Ok(FsVerdict::Durable) => {}
         // The override suppresses the refusal, never the notice — and it is
