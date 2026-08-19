@@ -1570,3 +1570,85 @@ The fleet run is a **separate, user-approved step** (M1–M7 precedent). Do not 
 **3. Type consistency.** `load_from_path` (Task 1) → consumed by Task 5 under that name. `check_semantics` (Task 2) is extended by `check` (Task 3); Task 5 calls `check`, not `check_semantics` — stated explicitly in Task 3's interface block. `DrainOutcome` (Task 4) is matched in Task 5 and Task 8 with both variants named. `default_seed_for` is `pub` in Task 1 and tested there. `PreflightError` gains variants in Task 3 rather than being redefined.
 
 **4. Known risk carried from the spec.** Task 3's fs probe is Linux-only by design; the `#[cfg(not(target_os = "linux"))]` arm checks existence only. The fleet is Linux, so the gate's durability guarantee holds where it is measured; a macOS dev box gets a weaker check rather than a false refusal. Flagged here so it is a decision on the record, not an accident.
+
+---
+
+## Execution log
+
+Subagent-driven execution, started 2026-08-19 on branch `uc2/m9-deployable-node`
+(from `main` @ `4d5655f`). This section is the durable record of decisions taken
+during execution; the SDD scratch ledger under `.superpowers/sdd/` is git-ignored
+and does not survive a machine change.
+
+### Status
+
+| Task | State |
+|---|---|
+| 1 — config file schema and loader | **implemented**, commit `a853c60`; **review not completed** |
+| 2 — preflight validation | not started |
+| 3 — volatile-fs refusal | **plan amended** (see Ruling 4), not started |
+| 4–8 | not started |
+
+**Environment finding (2026-08-19):** the workspace does not build on macOS.
+`uc_protocol/src/ring/common.rs:374` calls `libc::fallocate` with
+`FALLOC_FL_PUNCH_HOLE`/`FALLOC_FL_KEEP_SIZE` and **no `cfg` gate** — Linux-only
+syscalls in unconditional code, arriving with the punch-hole SIGBUS fix
+(`4f544dd`). Verified by building `main` in a clean worktree: three `E0425`
+errors. Maintainer ruling: **macOS is not a target at this stage; Linux only.**
+The fix was therefore withdrawn rather than applied, and execution moves to a
+Linux host. Recorded here because the same unguarded assumption will bite anyone
+who tries a non-Linux build, and because it means Task 1's test evidence was
+produced on a locally-patched tree and is **not trustworthy as recorded**.
+
+### Rulings
+
+**Ruling 1 (Task 6) — the service-lifecycle test stays inside the `counter`
+package** and spawns its node half via `CARGO_BIN_EXE_counter-node`, not
+`CARGO_BIN_EXE_uc2-node`. Cargo sets `CARGO_BIN_EXE_<name>` only for the package
+that *defines* the binary, so a test in `counter` can never see `uc2-node`; the
+plan's own preference (keep `uc2_node` free of an example dependency) is only
+satisfiable this way. Task 6 asserts the *service* half's signal handling; the
+daemon's is covered by Tasks 5 and 8. *Cost if wrong:* a daemon-only startup
+regression is not caught by this particular test.
+
+**Ruling 2 (Task 3) — the filesystem-probe tests share a `static FS_ENV_LOCK`.**
+`set_var`/`remove_var` are process-global and cargo runs tests in parallel
+threads, so the override test would intermittently make the refusal test pass
+spuriously. Adding `serial_test` for three tests was not worth a new dependency.
+*Cost if wrong:* test-only complexity; no production code affected.
+
+**Ruling 3 (Task 7) — README's "Try it" section is left on
+`cargo run -p counter --bin counter-single`.** Only the three-node instructions
+move to `uc2-node --config`. M9 ships no release binaries, so "install and run"
+as the headline pre-announces M12's packaging. *Cost if wrong:* README stays
+marginally less polished for one milestone.
+
+**Ruling 4 (Task 3) — the volatile-fs override is two explicit channels, neither
+silent.** Maintainer direction: refusing a RAM-backed `instance_dir` by default is
+correct, but the override must be statable in the config file, and must warn
+rather than pass quietly. `allow_volatile_fs = true` is the primary, reviewable
+channel; `UC2_ALLOW_VOLATILE_FS=1` remains for suites that build a `NodeConfig`
+directly. Either channel downgrades the refusal to an `FsVerdict::VolatileOverridden`
+that the daemon announces on every boot — the override suppresses the refusal,
+never the notice. `preflight::check` returns the verdict instead of printing it,
+which also makes the override path unit-testable without stderr capture.
+Task 1's `load_from_path` gains a `StartupOptions` return value, amended as an
+explicit step inside Task 3. *Cost if wrong:* one extra tuple element through the
+loader.
+
+**Ruling 5 — WITHDRAWN.** Had inserted a prerequisite "Task 0" to restore macOS
+buildability by gating the punch-hole to Linux. Withdrawn on maintainer direction
+that macOS is not a target. No code was committed for it.
+
+### Carried forward — do these first on the Linux host
+
+1. **Re-verify Task 1 on Linux.** Its reported evidence (4/4 new tests, clippy
+   clean, 69/71 suite) came from a patched macOS tree. Re-run
+   `cargo test -p uc2_node` and `cargo clippy -p uc2_node --all-targets -- -D warnings`
+   before trusting it.
+2. **Review Task 1.** The task review was dispatched and cancelled mid-flight; it
+   never produced a verdict. Two things for the reviewer: the implementer added
+   `#[derive(Debug)]` to `NodeConfig` outside the brief's file list (required by the
+   brief's own `unwrap_err()` test — a plan defect, not scope creep), and Ruling 4
+   changes `load_from_path`'s signature, so Task 1's tests are amended inside Task 3.
+3. **Then resume at Task 2.**
