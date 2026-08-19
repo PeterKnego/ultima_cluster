@@ -1833,13 +1833,25 @@ exists: exit 2 is only reached from config load and preflight.
 
 ### State at handoff
 
-Tasks 1–8 are implemented, committed, and green locally. The remaining step is
+Tasks 1–8 are implemented and committed, plus two post-task commits from a
+whole-branch review against the spec (Rulings 14 and 15). The remaining step is
 the one the plan always reserved:
 
 1. **The M9 fleet run is NOT started and requires user approval.** Do not tag,
    do not record a PASS, do not claim M9 complete. `v2.3.0` tags only on a fleet
    PASS.
-2. Local smoke, repeated: rows 1 (0.083–0.095 s, exit 0), 2 (no install, with
-   snapshots proven to be firing) and 4 (6/6 refusals name their field) hold.
-   Row 3 is fleet-only.
-3. Nothing in M9 touched consensus, the wire protocol, or the cnc page layout.
+2. Local smoke, re-run after Rulings 14–15 (`ef5cd0f`): row 1 **0.091 s, exit
+   0**; row 2 **no install**, anti-vacuity satisfied (`service_snapshot_pos`
+   [1899648, 1897344, 1897984], so snapshots were genuinely firing); row 4
+   **6/6** refusals name their field. Row 3 measured at 0.0% and printed, but is
+   fleet-only — one dev-box sample decides nothing (Ruling 12). `RESULT: PASS
+   (smoke)`, which the harness itself labels as NOT an M9 PASS.
+3. Whole-workspace verification at that commit: `cargo clippy --workspace
+   --all-targets -- -D warnings` clean; `cargo test --workspace` 941 passed, 0
+   failed, 8 ignored. `cargo fmt --check` is dirty, but so is `main` (1972
+   diffs in a clean worktree) — pre-existing repo-wide drift under rustfmt
+   1.9.0 with no `rustfmt.toml`, not a branch regression and not a CLAUDE.md
+   gate.
+4. Nothing in M9 touched consensus, the wire protocol, or the cnc page layout.
+5. The branch is **unpushed and unmerged**; `main` == `origin/main` ==
+   `4d5655f`.
