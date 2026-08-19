@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use uc2_log::cnc::CncPage;
 
+pub mod http;
 pub mod log;
 pub mod metrics;
 
@@ -24,6 +25,15 @@ pub mod metrics;
 /// `admission_bytes` is deliberately NOT here — the encoder reads it from the
 /// live cnc page (`CncPage::admission_bytes()`) instead of a config-copied
 /// snapshot, so there is exactly one source of truth for it.
+///
+/// `Clone`: every field is an `Arc` or a scalar, so cloning is cheap and
+/// never diverges from the source — a clone shares the SAME underlying
+/// `Arc` allocations, not a snapshot. Task 6 (`obs::http`) needs this: the
+/// HTTP server thread owns one `ObsSources` by value (`ObsServer::serve`
+/// takes it, not a reference — no lock shared with the hot-path agents),
+/// while its tests keep a second clone to poke flags/heartbeats the running
+/// server observes.
+#[derive(Clone)]
 pub struct ObsSources {
     pub node_id: u32,
     pub cnc: Arc<CncPage>,
