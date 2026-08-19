@@ -38,6 +38,16 @@ pub enum PreflightError {
     TooManyMembers(usize),
     #[error("election_timeout_min_ns ({min}) must be < election_timeout_max_ns ({max})")]
     ElectionWindow { min: u64, max: u64 },
+    #[error("instance_dir {path} does not exist or cannot be probed: {detail}")]
+    InstanceDirUnprobeable { path: String, detail: String },
+    #[error(
+        "instance_dir {path} is on a RAM-backed filesystem ({fs}) — every fsync there is a \
+         silent no-op, so the cluster will appear to work and lose committed data on power \
+         loss. Put it on a real disk. For tests only, set allow_volatile_fs = true in the \
+         config file (or UC2_ALLOW_VOLATILE_FS=1); the node will then start and warn on \
+         every boot."
+    )]
+    VolatileFilesystem { path: String, fs: String },
 }
 
 /// Pure semantic checks over a built config. Filesystem checks are separate
@@ -94,6 +104,151 @@ pub fn check_semantics(cfg: &NodeConfig) -> Result<(), PreflightError> {
         });
     }
     Ok(())
+}
+
+
+/// Startup policy that is NOT part of the node's runtime configuration.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StartupOptions {
+    /// Permit an instance directory on a RAM-backed filesystem.
+    ///
+    /// TEST AND DEVELOPMENT ONLY. Every `fsync` on such a filesystem is a
+    /// silent no-op, so a cluster configured this way will appear to work and
+    /// will lose committed data on power loss. Setting this never silences the
+    /// startup warning — see [`FsVerdict::VolatileOverridden`].
+    pub allow_volatile_fs: bool,
+}
+
+/// What the durability probe concluded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FsVerdict {
+    /// The instance directory is on a filesystem whose `fsync` is real.
+    Durable,
+    /// It is NOT, and an override let the node start anyway. The caller MUST
+    /// warn — the override suppresses the refusal, never the notice.
+    VolatileOverridden { fs: String },
+}
+
+/// Filesystem magics that mean "this fsync is a lie".
+#[cfg(target_os = "linux")]
+const VOLATILE_MAGICS: &[i64] = &[
+    0x0102_1994, // TMPFS_MAGIC
+    0x8584_58f6, // RAMFS_MAGIC
+];
+
+/// Refuse an instance directory whose fsync is a no-op.
+///
+/// Mirrors `bench-infra/scripts/m6_fleet_gate.py:assert_durable_fs`, which has
+/// refused this for gate runs since M6 — the node itself never did.
+///
+/// An override does not skip the probe: it downgrades the refusal to a
+/// [`FsVerdict::VolatileOverridden`] the caller is obliged to warn about.
+pub fn check_durable_fs(
+    instance_dir: &std::path::Path,
+    opts: &StartupOptions,
+) -> Result<FsVerdict, PreflightError> {
+    let overridden =
+        opts.allow_volatile_fs || std::env::var_os("UC2_ALLOW_VOLATILE_FS").is_some();
+
+    // On a first boot the instance dir does not exist yet, so fall back to its
+    // parent — but EXACTLY one level. Walking further up would reach `/`, which
+    // is on real disk on any normal host, and would launder every bad path into
+    // a pass: the refusal below would become unreachable code.
+    let probe = if instance_dir.exists() {
+        instance_dir
+    } else {
+        match instance_dir.parent().filter(|p| p.exists()) {
+            Some(p) => p,
+            None => {
+                return degrade(
+                    overridden,
+                    PreflightError::InstanceDirUnprobeable {
+                        path: instance_dir.display().to_string(),
+                        detail: "neither it nor its parent directory exists".to_string(),
+                    },
+                );
+            }
+        }
+    };
+
+    match fs_kind(probe) {
+        Ok(FsKind::Durable) => Ok(FsVerdict::Durable),
+        Ok(FsKind::Volatile(fs)) => degrade(
+            overridden,
+            PreflightError::VolatileFilesystem {
+                path: instance_dir.display().to_string(),
+                fs,
+            },
+        ),
+        Err(e) => degrade(overridden, e),
+    }
+}
+
+/// One place decides what an override does to a durability failure: it becomes
+/// a verdict the caller must announce, never a silent success. Note this covers
+/// an unprobeable path as well as a volatile one — the override means "start
+/// despite a failed durability probe", whatever made the probe fail.
+fn degrade(overridden: bool, err: PreflightError) -> Result<FsVerdict, PreflightError> {
+    if overridden {
+        Ok(FsVerdict::VolatileOverridden { fs: err.to_string() })
+    } else {
+        Err(err)
+    }
+}
+
+enum FsKind {
+    Durable,
+    Volatile(String),
+}
+
+#[cfg(target_os = "linux")]
+fn fs_kind(path: &std::path::Path) -> Result<FsKind, PreflightError> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| {
+        PreflightError::InstanceDirUnprobeable {
+            path: path.display().to_string(),
+            detail: e.to_string(),
+        }
+    })?;
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid NUL-terminated path; `buf` is a zeroed statfs we
+    // own for the duration of the call.
+    if unsafe { libc::statfs(c.as_ptr(), &mut buf) } != 0 {
+        return Err(PreflightError::InstanceDirUnprobeable {
+            path: path.display().to_string(),
+            detail: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    // `statfs.f_type` is `__fsword_t`: already `i64` on 64-bit targets, but a
+    // 32-bit int on 32-bit ones. The cast is a no-op on x86_64 — hence the
+    // allow — and load-bearing anywhere else.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = buf.f_type as i64;
+    if VOLATILE_MAGICS.contains(&magic) {
+        return Ok(FsKind::Volatile(format!("magic {magic:#x}")));
+    }
+    Ok(FsKind::Durable)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fs_kind(path: &std::path::Path) -> Result<FsKind, PreflightError> {
+    // macOS and friends: the fleet is Linux, and a dev box that cannot be
+    // probed is not worth a false refusal. Existence is still required, so a
+    // typo'd path is caught.
+    if path.exists() {
+        Ok(FsKind::Durable)
+    } else {
+        Err(PreflightError::InstanceDirUnprobeable {
+            path: path.display().to_string(),
+            detail: "path does not exist".into(),
+        })
+    }
+}
+
+/// Full preflight: semantics plus the durability probe.
+pub fn check(cfg: &NodeConfig, opts: &StartupOptions) -> Result<FsVerdict, PreflightError> {
+    check_semantics(cfg)?;
+    check_durable_fs(&cfg.instance_dir, opts)
 }
 
 #[cfg(test)]
@@ -211,6 +366,145 @@ mod tests {
     #[test]
     fn the_cap_is_the_protocols_cap() {
         assert_eq!(MAX_MEMBERS, uc_protocol::v2::config::MAX_MEMBERS);
+    }
+
+    // ---- Task 3: the durability probe ----
+
+    /// `UC2_ALLOW_VOLATILE_FS` is process-global and cargo runs tests in
+    /// parallel threads. Every test that reads or writes it takes this first.
+    static FS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the env lock, tolerating poisoning. A panicking test poisons the
+    /// mutex, and `.lock().unwrap()` would then panic in every OTHER test that
+    /// takes it — turning one genuine failure into a screenful of cascade and
+    /// hiding which assertion actually broke.
+    fn fs_lock() -> std::sync::MutexGuard<'static, ()> {
+        FS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn no_override() -> StartupOptions {
+        StartupOptions { allow_volatile_fs: false }
+    }
+
+    /// A directory known to be RAM-backed, located via `/proc/mounts` — an
+    /// oracle INDEPENDENT of the code under test.
+    ///
+    /// An earlier version asked `fs_kind` itself. That made every tmpfs test
+    /// vacuous: corrupting `VOLATILE_MAGICS` simply made this return `None`,
+    /// so the tests skipped instead of failing. Proven by mutation — with the
+    /// wrong magic the suite must go RED, not quiet.
+    ///
+    /// Returns `None` only where no tmpfs is mounted at all, so an exotic
+    /// environment skips rather than reporting a false defect.
+    fn volatile_dir() -> Option<std::path::PathBuf> {
+        let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+        let mut any = None;
+        for line in mounts.lines() {
+            let mut f = line.split_whitespace();
+            let (Some(_dev), Some(mp), Some(fstype)) = (f.next(), f.next(), f.next()) else {
+                continue;
+            };
+            if fstype != "tmpfs" || !std::path::Path::new(mp).is_dir() {
+                continue;
+            }
+            // Prefer the two conventionally writable ones.
+            if mp == "/dev/shm" || mp == "/tmp" {
+                return Some(std::path::PathBuf::from(mp));
+            }
+            any.get_or_insert_with(|| std::path::PathBuf::from(mp));
+        }
+        any
+    }
+
+    #[test]
+    fn a_real_disk_directory_passes_the_fs_check() {
+        let _g = fs_lock();
+        // CARGO_MANIFEST_DIR, not CARGO_TARGET_TMPDIR: the latter is defined
+        // only for integration tests and benches, never for a unit test in
+        // src/. This crate's own source dir is on real disk.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let v = check_durable_fs(dir, &no_override()).unwrap();
+        assert_eq!(v, FsVerdict::Durable);
+    }
+
+    /// The rule this whole task exists for. Without this test nothing
+    /// exercises `VOLATILE_MAGICS` at all — a wrong magic constant would let
+    /// every other test pass while the node happily booted on tmpfs.
+    #[test]
+    fn a_tmpfs_instance_dir_is_refused() {
+        let _g = fs_lock();
+        let Some(vol) = volatile_dir() else {
+            eprintln!("no RAM-backed fs available; skipping");
+            return;
+        };
+        let msg = check_durable_fs(&vol.join("uc2-preflight-probe"), &no_override())
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("RAM-backed"), "got: {msg}");
+        assert!(msg.contains("allow_volatile_fs"), "must name the escape hatch, got: {msg}");
+    }
+
+    /// First boot: the leaf does not exist yet, so the probe must fall back to
+    /// the parent — and must NOT keep walking up to `/`, which is on real disk
+    /// and would launder any bad path into a pass.
+    #[test]
+    fn a_first_boot_instance_dir_is_probed_via_its_parent() {
+        let _g = fs_lock();
+        let leaf = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-dir-yet");
+        assert!(!leaf.exists());
+        assert_eq!(check_durable_fs(&leaf, &no_override()).unwrap(), FsVerdict::Durable);
+
+        // And the same fallback on a volatile parent still refuses.
+        if let Some(vol) = volatile_dir() {
+            assert!(check_durable_fs(&vol.join("no-such-dir-yet"), &no_override()).is_err());
+        }
+    }
+
+    #[test]
+    fn a_missing_instance_dir_parent_is_refused() {
+        let _g = fs_lock();
+        let msg = check_durable_fs(std::path::Path::new("/nonexistent-xyzzy/n1"), &no_override())
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("nonexistent-xyzzy"), "got: {msg}");
+    }
+
+    #[test]
+    fn the_config_override_bypasses_the_check_but_reports_it() {
+        let _g = fs_lock();
+        let Some(vol) = volatile_dir() else {
+            eprintln!("no RAM-backed fs available; skipping");
+            return;
+        };
+        let opts = StartupOptions { allow_volatile_fs: true };
+        // The override must suppress the REFUSAL without suppressing the
+        // NOTICE: a cluster on a RAM-backed fs must never look quiet.
+        let v = check_durable_fs(&vol.join("uc2-preflight-probe"), &opts).unwrap();
+        match v {
+            FsVerdict::VolatileOverridden { ref fs } => {
+                assert!(!fs.is_empty(), "the verdict must name what was overridden");
+            }
+            FsVerdict::Durable => panic!(
+                "an overridden check must report VolatileOverridden, \
+                 not Durable — otherwise the daemon prints nothing"
+            ),
+        }
+    }
+
+    #[test]
+    fn the_env_override_also_bypasses_the_check_and_reports_it() {
+        let _g = fs_lock();
+        let Some(vol) = volatile_dir() else {
+            eprintln!("no RAM-backed fs available; skipping");
+            return;
+        };
+        unsafe { std::env::set_var("UC2_ALLOW_VOLATILE_FS", "1") };
+        let v = check_durable_fs(&vol.join("uc2-preflight-probe"), &no_override());
+        unsafe { std::env::remove_var("UC2_ALLOW_VOLATILE_FS") };
+        assert!(
+            matches!(v, Ok(FsVerdict::VolatileOverridden { .. })),
+            "the env channel must behave exactly like the config channel"
+        );
     }
 
     #[test]

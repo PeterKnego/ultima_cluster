@@ -17,6 +17,7 @@ use uc2_consensus::election::NodeId;
 use uc2_crypto::rotation::RotationPolicy;
 use uc2_net::fault::FaultConfig;
 
+use crate::preflight::StartupOptions;
 use crate::{CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, NodeConfig, PurgePolicy};
 
 #[derive(Debug, thiserror::Error)]
@@ -79,6 +80,10 @@ struct NodeConfigFile {
     purge: Option<PurgeSection>,
     #[serde(default)]
     crypto: Option<CryptoSection>,
+    /// TEST/DEV ONLY — see [`crate::preflight::StartupOptions`]. Never
+    /// silences the startup warning.
+    #[serde(default)]
+    allow_volatile_fs: bool,
 }
 
 fn default_buffer_bytes() -> usize {
@@ -112,8 +117,9 @@ pub fn default_seed_for(id: NodeId) -> u64 {
 }
 
 /// Read and deserialise a node config file. Performs NO validation beyond what
-/// the type system enforces — call [`crate::preflight::check`] next.
-pub fn load_from_path(path: &Path) -> Result<NodeConfig, ConfigError> {
+/// the type system enforces — call [`crate::preflight::check`] next, passing it
+/// the returned [`StartupOptions`].
+pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), ConfigError> {
     let text = std::fs::read_to_string(path)
         .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
     let f: NodeConfigFile = toml::from_str(&text)
@@ -138,7 +144,7 @@ pub fn load_from_path(path: &Path) -> Result<NodeConfig, ConfigError> {
         None => CryptoConfig::Disabled,
     };
 
-    Ok(NodeConfig {
+    Ok((NodeConfig {
         id: f.id,
         members: f.members.into_iter().map(|m| (m.id, m.addr)).collect(),
         learners: f.learners.into_iter().map(|m| (m.id, m.addr)).collect(),
@@ -155,7 +161,8 @@ pub fn load_from_path(path: &Path) -> Result<NodeConfig, ConfigError> {
         purge,
         journal_segment_bytes: f.journal_segment_bytes,
         crypto,
-    })
+    },
+    StartupOptions { allow_volatile_fs: f.allow_volatile_fs }))
 }
 
 #[cfg(test)]
@@ -188,7 +195,8 @@ id = 2
 addr = "10.0.0.2:9100"
 "#,
         );
-        let cfg = load_from_path(&p).unwrap();
+        let (cfg, opts) = load_from_path(&p).unwrap();
+        assert!(!opts.allow_volatile_fs);
         assert_eq!(cfg.id, 1);
         assert_eq!(cfg.members.len(), 2);
         assert_eq!(cfg.app_id, "myapp");
@@ -255,7 +263,7 @@ key_path = "/etc/uc2/node.key"
 allowlist_path = "/etc/uc2/allowlist.toml"
 "#,
         );
-        let cfg = load_from_path(&p).unwrap();
+        let (cfg, _opts) = load_from_path(&p).unwrap();
         assert!(matches!(cfg.purge, PurgePolicy::BelowSnapshot { slack_bytes: 1048576 }));
         match cfg.crypto {
             CryptoConfig::Enabled { ref key_path, ref allowlist_path, rotation } => {
@@ -266,5 +274,29 @@ allowlist_path = "/etc/uc2/allowlist.toml"
             }
             _ => panic!("crypto section must produce CryptoConfig::Enabled"),
         }
+    }
+
+    #[test]
+    fn allow_volatile_fs_defaults_to_false_and_is_settable() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"
+id = 1
+bind = "10.0.0.1:9100"
+instance_dir = "/srv/uc2/n1"
+app_id = "myapp"
+
+[[members]]
+id = 1
+addr = "10.0.0.1:9100"
+"#;
+        let p = write(dir.path(), body);
+        let (_cfg, opts) = load_from_path(&p).unwrap();
+        assert!(!opts.allow_volatile_fs, "production default must be refuse");
+
+        // PREPENDED, not appended: `body` ends with a [[members]] table, so a
+        // key added after it belongs to that table, not to the document root.
+        let p2 = write(dir.path(), &format!("allow_volatile_fs = true\n{body}"));
+        let (_cfg, opts2) = load_from_path(&p2).unwrap();
+        assert!(opts2.allow_volatile_fs);
     }
 }
