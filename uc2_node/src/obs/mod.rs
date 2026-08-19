@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use uc2_log::cnc::CncPage;
 
 pub mod log;
+pub mod metrics;
 
 /// A read-only bundle of the `Arc`-shared counters, flags, and config values
 /// a later task's metrics encoder renders into a series — a straight
