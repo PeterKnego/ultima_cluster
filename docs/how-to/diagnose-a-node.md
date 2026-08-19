@@ -3,6 +3,11 @@
 Work out what a live node believes about itself and the cluster, when clients
 are failing, replication has stalled, or nobody appears to be leading.
 
+These interpretations ship as alert rules — see
+[Monitor a cluster](monitor-a-cluster.md#install-the-alert-rules) for the
+Prometheus rule that encodes each threshold below, so you do not have to
+watch for these by hand.
+
 Everything below is readable from the node's cnc page while it runs. Start with
 `uc2ctl status`; drop to raw offsets when you need a field it does not print,
 or when you cannot run a binary on the host.
@@ -30,6 +35,11 @@ has won an election but cannot get its first frame committed, which usually
 means it cannot reach a quorum.
 
 `leader_hint` at 832 gives the last known leader id; `u64::MAX` means unknown.
+
+This same table now also drives `/readyz`: a node reading `0x01` answers the
+probe `503` with `"NewTerm"` in the body, so a load balancer routes around it
+without needing to decode the cnc page itself. See
+[Monitor a cluster](monitor-a-cluster.md#the-probe-endpoints).
 
 ## Is the node alive, and is its service alive?
 

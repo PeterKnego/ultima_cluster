@@ -1,0 +1,69 @@
+groups:
+- name: uc2
+  interval: 15s
+  rules:
+  - alert: Uc2AgentDead
+    expr: uc2_agent_alive == 0
+    for: 0m
+    labels: { severity: critical }
+    annotations: { summary: "agent {{ $labels.agent }} fail-stopped on {{ $labels.instance }}" }
+  - alert: Uc2NoLeader
+    expr: max(uc2_is_leader) == 0
+    for: 30s
+    labels: { severity: critical }
+    annotations: { summary: "no node reports leadership — election cannot complete" }
+  - alert: Uc2LeaderNotServing
+    expr: uc2_is_leader == 1 and uc2_can_serve == 0
+    for: 30s
+    labels: { severity: critical }
+    annotations: { summary: "{{ $labels.instance }} elected but its NewTerm frame is not quorum-committed (flags 0x01)" }
+  - alert: Uc2ServiceWedged
+    expr: uc2_service_heartbeat_age_seconds > 5 and uc2_node_heartbeat_age_seconds < 3
+    for: 1m
+    labels: { severity: critical }
+    annotations: { summary: "apply loop wedged on {{ $labels.instance }}: node alive, service heartbeat stale" }
+  - alert: Uc2ReplicationStalled
+    expr: delta(uc2_commit_bytes[1m]) == 0 and delta(uc2_append_bytes[1m]) > 0
+    for: 1m
+    labels: { severity: critical }
+    annotations: { summary: "{{ $labels.instance }} appends but cannot commit — no quorum acknowledging" }
+  - alert: Uc2PeerNeverHeard
+    expr: uc2_peer_reported_durable_bytes == 0
+    for: 2m
+    labels: { severity: warning }
+    annotations: { summary: "peer {{ $labels.peer }} has never reported — check the bind-address rule first" }
+  - alert: Uc2PeerLagging
+    expr: uc2_peer_replication_lag_bytes > on(instance) group_left uc2_admission_bytes
+    for: 5m
+    labels: { severity: warning }
+    annotations: { summary: "peer {{ $labels.peer }} lags by more than the admission window" }
+  - alert: Uc2AdmissionSaturated
+    expr: uc2_admission_saturation > 0.9
+    for: 1m
+    labels: { severity: warning }
+    annotations: { summary: "ingress admission window ≥90% consumed on {{ $labels.instance }} — commit is not keeping up with append" }
+  - alert: Uc2PurgeStalled
+    expr: uc2_purge_enabled == 1 and (uc2_node_snapshot_floor_bytes - uc2_archive_first_base_bytes) > 2 * uc2_journal_segment_bytes
+    for: 10m
+    labels: { severity: warning }
+    annotations: { summary: "purge enabled but the journal head lags the snapshot floor by >2 segments on {{ $labels.instance }}" }
+  - alert: Uc2RepeatedWipes
+    expr: delta(uc2_wipes_total[10m]) > 1
+    for: 0m
+    labels: { severity: warning }
+    annotations: { summary: "{{ $labels.instance }} wiped-and-rejoined more than once in 10m" }
+  - alert: Uc2UnattestedReports
+    expr: delta(uc2_reports_unattested_total[5m]) > 0
+    for: 0m
+    labels: { severity: critical }
+    annotations: { summary: "unattested durable reports on {{ $labels.instance }} — a pre-0.5.0 peer is in the cluster; commits will stall (flag-day violation)" }
+  - alert: Uc2CleartextPeer
+    expr: delta(uc2_cleartext_peer_datagrams_total[5m]) > 0
+    for: 0m
+    labels: { severity: critical }
+    annotations: { summary: "cleartext datagrams from a peer while crypto is on — a node missed the flag day" }
+  - alert: Uc2FollowerSealFailures
+    expr: delta(uc2_receiver_seal_failures_total[5m]) > 0 and uc2_is_leader == 0
+    for: 0m
+    labels: { severity: warning }
+    annotations: { summary: "authentication failures opening peer traffic on follower {{ $labels.instance }} (a leader's seal_failures climb is benign — this one is not)" }

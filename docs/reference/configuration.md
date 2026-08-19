@@ -39,18 +39,36 @@ across nodes make every member time out at the same instant and split the vote.
 **`allow_volatile_fs`** — optional, default `false`. Test and development only;
 see [startup refusals](#startup-refusals).
 
-### Reserved sections
+### `[log]` and `[metrics]`
 
-Unknown keys are a startup refusal (`deny_unknown_fields`), with exactly two
-exceptions. `[log]` and `[metrics]` are **reserved for M10** and are accepted
-today so a config written for a later release does not refuse to start on this
-one. They have **no effect here**, and the node prints a `NOTE` naming any that
-are present on every boot — a section that does nothing must never look like a
-section that works.
+Reserved in M9 (accepted-but-inert, so a config written ahead of the release
+that defined them would not refuse to start); their schema is defined since
+M10, and both are now validated exactly like every other section — unknown
+keys inside them are a startup refusal too.
 
-Their contents are not validated: this release does not define their schema, so
-any keys inside them are accepted as-is. Every other unknown table is still
-refused by name.
+**`[log]`** — structured JSON-lines records on stderr. Optional; absent means
+the default level.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `level` | `"info"` | one of `"error"`, `"warn"`, `"info"` (each level includes the ones before it: `error` < `warn` < `info`) |
+
+**`[metrics]`** — the `/metrics`, `/healthz`, `/readyz` HTTP endpoint.
+Optional; **absent means the endpoint never opens**, not a disabled state
+with a listener.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `bind` | `127.0.0.1:9600` | the socket address the endpoint listens on |
+
+A bare `[metrics]` section with no `bind` key still opens the endpoint, on
+the default address. The endpoint is unauthenticated and read-only; see
+[Monitor a cluster](../how-to/monitor-a-cluster.md#security-note) for the
+bind/firewall guidance before exposing it beyond loopback.
+
+For the full series contract, the alert rules, the dashboard, and the
+structured-event vocabulary, see
+[Monitor a cluster](../how-to/monitor-a-cluster.md).
 
 ## Startup refusals
 
@@ -69,6 +87,8 @@ replaces:
 | `members` and `learners` must be disjoint, ids unique | Ambiguous role and peer-band aliasing. |
 | at most 8 members total | The control page's per-peer band holds 8 slots; enforced on the wire too. |
 | `election_timeout_min_ns` < `election_timeout_max_ns` | An empty randomisation window. |
+| `log.level` must be `"error"`, `"warn"`, or `"info"` | A silently-ignored typo picking the wrong verbosity. |
+| unknown keys inside `[log]`/`[metrics]` are refused, by name, like every other section | M9 accepted anything inside these two sections unvalidated; M10 defines their schema, so a typo there is now caught the same way as everywhere else. |
 
 The RAM-backed-filesystem refusal has two override channels, and **neither is
 silent** — the override suppresses the refusal, never the notice, and the
