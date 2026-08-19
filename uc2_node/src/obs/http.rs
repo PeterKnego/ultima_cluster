@@ -12,6 +12,14 @@
 //! is prompt, GET-only, `Connection: close` (no keep-alive). The handler only
 //! reads through [`ObsSources`]'s `Arc`s and atomics — it shares no lock with
 //! the hot-path agents and cannot perturb them.
+//!
+//! The accept loop is single-threaded and synchronous — `handle_conn` runs
+//! to completion before the next connection is even accepted — so every
+//! connection is bound by a hard wall-clock deadline ([`CONN_DEADLINE`]),
+//! not just a per-`read()`-call timeout: a client that trickles bytes just
+//! often enough to keep dodging each individual read's timeout would
+//! otherwise stall every other client (and [`ObsServer::stop`]) for as long
+//! as it kept trickling.
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -19,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 
@@ -38,9 +46,21 @@ const REQUEST_CAP: usize = 4096;
 /// The accept-loop poll cadence: how promptly [`ObsServer::stop`] returns.
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 
-/// Per-connection read timeout — a client that opens a socket and never
-/// sends bytes doesn't get to hold a "uc2-obs" thread hostage.
+/// Per-`read()`-call timeout. On its own this does NOT bound a connection's
+/// total duration — `SO_RCVTIMEO` budgets each syscall independently, so a
+/// client that trickles a byte every ~900ms never trips any single call's
+/// timer and never reaches [`REQUEST_CAP`] either. [`CONN_DEADLINE`] is the
+/// wall-clock backstop that actually bounds the connection.
 const READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Hard wall-clock cap on one connection's whole read phase, checked once
+/// per read-loop iteration alongside the per-call [`READ_TIMEOUT`] (which is
+/// also shrunk to whatever's left of this budget each iteration, so the
+/// last read can't itself overshoot it). Because [`ObsServer::serve`]'s
+/// accept loop handles connections synchronously, one connection that never
+/// bounds itself stalls the WHOLE server — every other client's
+/// `/metrics`/`/healthz`/`/readyz`, and [`ObsServer::stop`]'s join.
+const CONN_DEADLINE: Duration = Duration::from_secs(2);
 
 /// A running observability HTTP server: one thread, one `TcpListener`, no
 /// other state shared with the node's hot path beyond the read-only
@@ -97,22 +117,45 @@ impl ObsServer {
 }
 
 /// Handle one connection end to end: read the request (line-only parsing,
-/// capped and timed out), route it, write the response, close. No
-/// keep-alive — every response carries `Connection: close`.
+/// capped, per-call-timed-out, AND wall-clock-deadlined), route it, write
+/// the response, close. No keep-alive — every response carries
+/// `Connection: close`.
+///
+/// A connection that never completes a request within [`CONN_DEADLINE`] is
+/// dropped outright (no response written) rather than routed on a partial
+/// buffer — the client got no bytes, same as if it had never connected.
 fn handle_conn(mut stream: TcpStream, sources: &ObsSources) {
-    if stream.set_read_timeout(Some(READ_TIMEOUT)).is_err() {
-        return;
-    }
+    let deadline = Instant::now() + CONN_DEADLINE;
 
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 512];
+    let mut terminated = false;
     loop {
-        if buf.len() >= REQUEST_CAP || has_header_terminator(&buf) {
+        if buf.len() >= REQUEST_CAP || terminated {
             break;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // Wall-clock budget exhausted — a client trickling bytes just
+            // often enough to keep dodging each individual read's timeout
+            // (SO_RCVTIMEO budgets each syscall independently, not the
+            // connection as a whole) cannot hold this thread, and therefore
+            // the accept loop, hostage. Drop it and move on.
+            return;
+        }
+        if stream.set_read_timeout(Some(remaining.min(READ_TIMEOUT))).is_err() {
+            return;
         }
         match stream.read(&mut chunk) {
             Ok(0) => break,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                // Only the tail spanning the boundary between the old and
+                // new bytes can contain a terminator that wasn't already
+                // ruled out — no need to rescan bytes already checked.
+                let scan_from = buf.len().saturating_sub(3);
+                buf.extend_from_slice(&chunk[..n]);
+                terminated = buf[scan_from..].windows(4).any(|w| w == b"\r\n\r\n");
+            }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
                 break;
             }
@@ -122,10 +165,6 @@ fn handle_conn(mut stream: TcpStream, sources: &ObsSources) {
 
     let (status, content_type, body) = route(&buf, sources);
     write_response(&mut stream, status, content_type, &body);
-}
-
-fn has_header_terminator(buf: &[u8]) -> bool {
-    buf.windows(4).any(|w| w == b"\r\n\r\n")
 }
 
 /// Parse only the request line (`METHOD SPACE PATH ...`) and dispatch.

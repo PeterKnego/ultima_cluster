@@ -152,6 +152,44 @@ fn a_stale_service_heartbeat_fails_readiness_but_not_liveness() {
     srv.stop();
 }
 
+/// Fix-round-1 regression: the accept loop is single-threaded and
+/// synchronous, so an unbounded `handle_conn` stalls the WHOLE server, not
+/// just the slow connection. Open a connection, send a partial request (no
+/// `\r\n\r\n`), then go silent and hold the socket open — a SECOND client's
+/// `GET /healthz` must still complete, and within a bounded time, proving
+/// the wall-clock connection deadline (not just a per-`read()` timeout)
+/// frees the server on its own. A single partial write followed by silence
+/// is enough: the deadline must fire with no further bytes ever arriving,
+/// so the test's own wall-clock time stays bounded too.
+#[test]
+fn a_trickling_client_cannot_stall_the_server() {
+    let (srv, sources) = synthetic_server();
+    sources.cnc.status().node_heartbeat_ns.store_release(now_unix_ns());
+    sources.cnc.status().service_heartbeat_ns.store_release(now_unix_ns());
+
+    // Held open for the whole test (not dropped) — a closed socket sends
+    // FIN, which would let the server's read return `Ok(0)` and exit the
+    // read loop on its own. The point here is a connection that stays OPEN
+    // but silent, so only the wall-clock deadline can end it.
+    let mut slow = TcpStream::connect(srv.local_addr()).expect("slow client connect");
+    slow.write_all(b"GET /heal").expect("slow client partial write");
+    slow.flush().expect("slow client flush");
+
+    let start = Instant::now();
+    let (code, _) = get(srv.local_addr(), "/healthz");
+    let elapsed = start.elapsed();
+
+    assert_eq!(code, 200, "a second client must still be served");
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "second client waited {elapsed:?} for a response — the trickling/silent \
+         connection stalled the single-threaded accept loop past its wall-clock budget"
+    );
+
+    drop(slow);
+    srv.stop();
+}
+
 const APP: &str = "obs-http";
 
 /// A state machine that does nothing but exist — `a_real_single_node_cluster_serves_and_becomes_ready`
