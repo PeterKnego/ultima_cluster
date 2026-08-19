@@ -8,6 +8,11 @@ Type=simple
 ExecStart=/usr/local/bin/uc2-node --config /etc/uc2/node.toml
 Restart=on-failure
 RestartSec=1
+# A config the node REFUSED (exit 2) will be refused identically on every retry,
+# so retrying only delays the operator seeing why. Without this, systemd retries
+# five times before its start limit surfaces the failure. Exit 1 (a runtime
+# start failure — a port still held, say) IS worth retrying, so it is not listed.
+RestartPreventExitStatus=2
 # The node drains the archive on SIGTERM, so give it room — but not forever.
 # A drain that cannot finish stops anyway; the restarted node re-fetches the
 # tail. This must exceed --drain-timeout-secs (default 5).

@@ -1801,6 +1801,36 @@ volatile-fs test. `packaging/node.example.toml` and
 `docs/reference/configuration.md` document the reservation.
 *Cost if wrong:* two config names are spent, and M10 must use them.
 
+**Ruling 15 (post-task) — two review findings on the refusal surface itself,
+both fixed.** Neither was a safety issue; both undercut the thing M9 claims to
+deliver, which is a failure an operator can act on.
+(a) **`PayloadExceedsMtu` reported a sentinel instead of the requirement.** The
+overflow guard computed `need = usize::MAX` for any `max_payload > MTU_DEFAULT`,
+so a plausible `max_payload = 4096` — over the 1408 B MTU but well under
+`buffer_bytes / 4`, hence not caught by `PayloadTooLarge` first — refused with
+"needs 18446744073709551615 bytes" where the true figure is 4144. Wrong by
+fifteen orders of magnitude on the one surface whose job is refusing by name
+WITH THE NUMBERS SHOWN. Now a `checked_add` chain, with the input to
+`align_frame_len` bounded because that function rounds up by as much as
+`FRAME_ALIGNMENT - 1` and takes no checked form. Saturation survives only for
+values too large to represent, which `PayloadTooLarge` already refuses — the
+pre-existing `an_overflowing_max_payload_is_refused_not_wrapped` test still
+passes, so the overflow property was preserved, not traded away.
+(b) **The shipped systemd unit retried a config refusal.** `Restart=on-failure`
+does not distinguish the daemon's deliberate exit 2 ("this config is bad") from
+exit 1 ("start failed, possibly transiently"), so a typo'd config restarted five
+times before systemd's start limit surfaced it. Added
+`RestartPreventExitStatus=2`; exit 1 is deliberately NOT listed, since a held
+port is worth retrying. Validated with `systemd-analyze verify`.
+The exit code is now a contract with the packaging, not an implementation
+detail, so `daemon_refuses_a_config_with_a_bind_mismatch` was strengthened from
+`!success()` to `code() == Some(2)`. Drifting it to 1 turns the loud refusal
+back into a restart loop, and that is now a test failure rather than a silent
+packaging regression.
+*Cost if wrong:* (a) none — strictly more accurate; (b) a genuinely transient
+startup failure that happens to exit 2 would not be retried, but no such path
+exists: exit 2 is only reached from config load and preflight.
+
 ### State at handoff
 
 Tasks 1–8 are implemented, committed, and green locally. The remaining step is

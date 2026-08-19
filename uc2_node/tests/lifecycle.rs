@@ -222,6 +222,11 @@ fn daemon_refuses_a_config_with_a_bind_mismatch() {
     assert!(!out.status.success(), "must refuse to start");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("bind"), "refusal must name the field, got: {err}");
+    // Exit 2 specifically means "this config is bad and will be bad next time".
+    // packaging/systemd/uc2-node.service keys RestartPreventExitStatus on it, so
+    // the code is a contract with the shipped unit, not an implementation
+    // detail: drifting it to 1 turns a loud refusal back into a restart loop.
+    assert_eq!(out.status.code(), Some(2), "a config refusal must exit 2, got {:?}", out.status);
 }
 
 /// A RAM-backed instance_dir is refused by default, and the override starts the

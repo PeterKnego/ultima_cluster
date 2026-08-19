@@ -16,7 +16,7 @@ use uc2_consensus::election::NodeId;
 use uc_protocol::v2::config::MAX_MEMBERS;
 use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
 use uc_protocol::v2::datagram::{DATAGRAM_HEADER_LEN, MTU_DEFAULT};
-use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
+use uc_protocol::v2::frame::{FRAME_ALIGNMENT, HEADER_LEN, align_frame_len};
 
 use crate::{CryptoConfig, NodeConfig};
 
@@ -82,13 +82,24 @@ pub fn check_semantics(cfg: &NodeConfig) -> Result<(), PreflightError> {
     // with the arithmetic spelled out. The node never overrides the sender's
     // `mtu`, so `MTU_DEFAULT` is the real budget.
     //
-    // The `> MTU_DEFAULT` guard comes first so the sum below cannot overflow.
+    // Computed with checked arithmetic rather than guarded by a `> MTU_DEFAULT`
+    // sentinel. The sentinel was overflow-safe but reported `usize::MAX` as the
+    // requirement, so a plausible `max_payload = 4096` refused with "needs
+    // 18446744073709551615 bytes" instead of 4144 — on the one surface whose
+    // whole job is refusing by name WITH THE NUMBERS SHOWN. Saturation is now
+    // reserved for values too large to represent at all, which
+    // `PayloadTooLarge` above has already refused.
     let overhead = if matches!(cfg.crypto, CryptoConfig::Enabled { .. }) { CRYPTO_OVERHEAD } else { 0 };
-    let need = if cfg.max_payload > MTU_DEFAULT {
-        usize::MAX
-    } else {
-        align_frame_len(HEADER_LEN + cfg.max_payload) + DATAGRAM_HEADER_LEN + overhead
-    };
+    let need = cfg
+        .max_payload
+        .checked_add(HEADER_LEN)
+        // `align_frame_len` rounds UP by as much as FRAME_ALIGNMENT - 1 and
+        // would wrap on its own; it takes no checked form, so bound its input.
+        .filter(|total| *total <= usize::MAX - (FRAME_ALIGNMENT - 1))
+        .map(align_frame_len)
+        .and_then(|f| f.checked_add(DATAGRAM_HEADER_LEN))
+        .and_then(|f| f.checked_add(overhead))
+        .unwrap_or(usize::MAX);
     if need > MTU_DEFAULT {
         return Err(PreflightError::PayloadExceedsMtu {
             max_payload: cfg.max_payload,
@@ -391,6 +402,31 @@ mod tests {
         c.max_payload = usize::MAX / 2;
         let msg = check_semantics(&c).unwrap_err().to_string();
         assert!(msg.contains("max_payload"), "got: {msg}");
+    }
+
+    /// The refusal must report the REAL byte requirement, not a sentinel.
+    ///
+    /// `max_payload = 4096` is an entirely plausible operator value: it is over
+    /// the 1408 B MTU but well under `buffer_bytes / 4`, so `PayloadTooLarge`
+    /// does not fire first and this is the message the operator actually sees.
+    /// An overflow-avoidance sentinel made it read "needs 18446744073709551615
+    /// bytes", which is wrong by fifteen orders of magnitude on the one surface
+    /// whose entire job is refusing by name WITH THE NUMBERS SHOWN.
+    #[test]
+    fn the_mtu_refusal_reports_the_true_requirement_not_a_sentinel() {
+        let mut c = base();
+        c.max_payload = 4096;
+        let err = check_semantics(&c).unwrap_err();
+        let expected = align_frame_len(HEADER_LEN + 4096) + DATAGRAM_HEADER_LEN;
+        match err {
+            PreflightError::PayloadExceedsMtu { max_payload, need, mtu } => {
+                assert_eq!(max_payload, 4096);
+                assert_eq!(mtu, MTU_DEFAULT);
+                assert_eq!(need, expected, "must report what the frame actually needs");
+                assert!(need < 8192, "a sentinel leaked into the operator's message: {need}");
+            }
+            other => panic!("expected PayloadExceedsMtu, got {other:?}"),
+        }
     }
 
     /// An oversized max_payload must be a NAMED refusal, not a panic inside
