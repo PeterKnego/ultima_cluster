@@ -107,6 +107,12 @@ fn main() -> ExitCode {
     let mut last_naks_dropped = obs.sender.naks_dropped.load(Ordering::Relaxed);
     let mut last_seal_failures = obs.sender.seal_failures.load(Ordering::Relaxed)
         + obs.receiver.seal_failures.load(Ordering::Relaxed);
+    // The BASELINE the `seal_failures` record's `count` is measured against
+    // — unlike `last_seal_failures` (which advances every pass so the
+    // edge-trigger sees real ~1s-window change), this only advances when a
+    // record actually fires, so a suppressed (rate-limited) pass's failures
+    // are folded into the NEXT record instead of being silently dropped.
+    let mut last_emitted_seal_failures = last_seal_failures;
     let mut last_snapshot_pos = obs.cnc.snapshots().service_snapshot_pos.load_acquire();
     let mut last_nak_storm_emit: Option<Instant> = None;
     let mut last_seal_failures_emit: Option<Instant> = None;
@@ -163,14 +169,19 @@ fn main() -> ExitCode {
                 && last_seal_failures_emit
                     .is_none_or(|t| now.duration_since(t) >= DERIVED_EVENT_RATE_LIMIT)
             {
+                // WINDOW delta since the last EMITTED record, not the
+                // cumulative total — a reader must see "how many failed
+                // since I last heard about this", or a steady 1/10s trickle
+                // reads as an accelerating storm every time it prints.
                 uc2_node::obs_event!(
                     Warn,
                     "seal_failures",
                     node = id as u64,
-                    count = seal_failures,
+                    count = seal_failures - last_emitted_seal_failures,
                     is_leader = is_leader,
                 );
                 last_seal_failures_emit = Some(now);
+                last_emitted_seal_failures = seal_failures;
             }
             last_seal_failures = seal_failures;
 
