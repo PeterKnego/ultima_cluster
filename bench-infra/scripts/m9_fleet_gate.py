@@ -332,29 +332,17 @@ def run(nodes, members, leader_idx, fleet):
         # leaves the service running is not driving the deployment the docs
         # describe.
         leader.start_service()
-        # Do NOT tear the load client down. `load_loop`'s catch-all arm drops a
-        # failed client and retries ~every 10 ms, so a client whose node went
-        # away RECONNECTS BY ITSELF once that node is back — far cheaper than a
-        # process respawn plus its CAN_SERVE wait, which is what dominated the
-        # first measurement here (87 % dip against an in-process 0-18 % for the
-        # same event: harness cost, not cluster cost).
+        # NOTHING is done to the load clients. Every node runs one — that is
+        # the deployment shape uc2_client is an SDK for: an app client sits on
+        # each node, the LEADER's serves requests, and a follower's answers
+        # with a redirect to the leader. So when leadership moves, the new
+        # leader's client simply starts serving; there is nothing to respawn.
         #
-        # A uc2_client has no sockets and reaches only its CO-LOCATED node, so
-        # if leadership MOVED the load must follow it — that respawn cost is
-        # real and is left in the measurement. If leadership came back to the
-        # same node, self-healing covers it and nothing is respawned.
-        idx = wait_leader([n.host for n in nodes], list(range(len(nodes))), 15)
-        if idx is not None and idx != leader_idx:
-            try:
-                leader.host.kill_unit("load")
-            except Exception:
-                pass
-            nodes[idx].start_load(LOAD_SECS)
-            print(f"INFO leadership moved; load respawned on n{nodes[idx].id}", flush=True)
-        elif idx is not None:
-            print(f"INFO leadership returned to n{nodes[idx].id}; "
-                  f"load client self-healed", flush=True)
-
+        # The previous version ran ONE client pinned to the leader and
+        # respawned it on failover, paying a process spawn plus its CAN_SERVE
+        # wait INSIDE the 5 s measurement window. That is harness cost, and on
+        # the 2026-08-19 fleet run it is what leadership moving to n1 charged
+        # to row 3 (62 %).
     dip, during, baseline, err = dip_for_transition(survivor.host, action)
     if err:
         print(f"WARN transition reported: {err}", flush=True)
@@ -457,7 +445,9 @@ def main():
         sys.exit(1)
     print(f"INFO leader is n{nodes[idx].id}", flush=True)
 
-    nodes[idx].start_load(a.secs)
+    # One client per node: the leader's does the work, the followers' redirect.
+    for n in nodes:
+        n.start_load(a.secs)
     time.sleep(SETTLE_SECS)
 
     try:
