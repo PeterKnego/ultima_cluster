@@ -1589,7 +1589,9 @@ and does not survive a machine change.
 | 3 — volatile-fs refusal | **done** — `bfdba6f`; four brief defects fixed (Ruling 8) |
 | 4 — archive drain | **done** — `e14be43`; contract pinned, limit recorded (Ruling 9) |
 | 5 — uc2-node daemon | **done** — `adf72ba`; MTU defect found + fixed (Ruling 10) |
-| 6–8 | not started |
+| 6 — service template | **done** — `2e584c0` |
+| 7 — packaging + docs cutover | **done** — `0a4b49c`; quickstart executed verbatim |
+| 8 — gate harness | **done** — decide rule `71433a9`, harness `a56bcd8`. **FLEET RUN NOT STARTED** (user-approved step) |
 
 **Environment finding (2026-08-19):** the workspace does not build on macOS.
 `uc_protocol/src/ring/common.rs:374` calls `libc::fallocate` with
@@ -1737,8 +1739,47 @@ Also corrected: the brief's daemon predates Ruling 4 (single-value
 which would have made the override channel silent — the exact thing Ruling 4
 forbids. The daemon now warns on every boot, and a test asserts it.
 
-### Carried forward — next on this host
+**Ruling 11 (Task 6) — the brief's service test leaks a busy-spin child.**
+When its assertion fails, `counter-node` is never killed, and it inherits the
+harness's stdout pipe, so cargo blocks reading until EOF. One such leak burned
+**39 minutes of CPU** and hung the suite for ten minutes before being noticed.
+The test now reaps through a `Drop` guard with nulled stdio, so a failing
+assertion costs 2 seconds. Any future harness that spawns a node process must
+do the same — every UC node is busy-spin, so a leaked child is not idle.
 
-1. **Task 6** (service template), then **Task 7** (docs).
-2. Task 8's harness is local work; its FLEET RUN stays a separate,
-   user-approved step. Do not tag or record a PASS from a local run.
+**Ruling 12 (Task 8) — the smoke measures the commit-rate dip but does not gate
+it, and this was decided AFTER seeing it fail.** Recording the direction
+explicitly, because moving a bar after a red run is the move this project's
+honest-failure protocol exists to prevent. Two justifications, neither of which
+is "it went red":
+(a) **Precedent.** `<10%` dip is already a FLEET bar here. `m7_gate`'s `AllArgs`
+says in a comment that the in-process gate "does not hard-gate the fleet dip
+bar"; `m6_gate` says the same. The M9 harness was the outlier, not the fix.
+(b) **The measurement cannot adjudicate the bar.** Seven identical runs:
+0.0 / 2.1 / 10.1 / 10.9 / 14.2 / 17.5 / 18.0 % — an 18-point spread against a
+10-point bar. Noise larger than the bar makes a local verdict a coin flip in
+either direction, including the direction that would have passed.
+**The fleet bar in the gate doc is unchanged at 10%.** The smoke prints the
+number, labels it fleet-only, and its own PASS line states it is not an M9 PASS.
+Maintainer direction the same day confirms the principle: *the dev box is small,
+do not rely on it for reliable bench numbers.*
+
+**Ruling 13 (Task 8) — row 2 is anti-vacuity checked.** `incoming_snapshot_pos`
+"unchanged at 0" is also exactly what a cluster that never snapshots looks like,
+and such a cluster could not have installed one however badly the restart went.
+The row now requires positive evidence that snapshots were being built
+(`service_snapshot_pos` ~1.7 MB on all three nodes in the smoke) and reports
+INCONCLUSIVE-and-FAIL otherwise. Same discipline as Rulings 8(c) and 9.
+
+### State at handoff
+
+Tasks 1–8 are implemented, committed, and green locally. The remaining step is
+the one the plan always reserved:
+
+1. **The M9 fleet run is NOT started and requires user approval.** Do not tag,
+   do not record a PASS, do not claim M9 complete. `v2.3.0` tags only on a fleet
+   PASS.
+2. Local smoke, repeated: rows 1 (0.083–0.095 s, exit 0), 2 (no install, with
+   snapshots proven to be firing) and 4 (6/6 refusals name their field) hold.
+   Row 3 is fleet-only.
+3. Nothing in M9 touched consensus, the wire protocol, or the cnc page layout.
