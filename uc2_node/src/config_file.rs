@@ -326,4 +326,17 @@ addr = "10.0.0.1:9100"
         let (_cfg, opts2) = load_from_path(&p2).unwrap();
         assert!(opts2.allow_volatile_fs);
     }
+
+    /// The SHIPPED example config must parse and pass semantic preflight.
+    /// A packaged example that drifts out of agreement with the loader is the
+    /// exact failure M9 exists to prevent: it looks authoritative and fails at
+    /// the operator's first boot, not ours.
+    #[test]
+    fn the_packaged_example_config_is_valid() {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../packaging/node.example.toml");
+        let (cfg, opts) = load_from_path(&p).expect("packaging/node.example.toml must parse");
+        assert!(!opts.allow_volatile_fs, "the shipped example must not override durability");
+        crate::preflight::check_semantics(&cfg).expect("the shipped example must be startable");
+    }
 }

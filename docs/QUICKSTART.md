@@ -97,23 +97,51 @@ services, and one client.
 ```bash
 export BASE=~/.cache/counter-demo
 rm -rf $BASE && mkdir -p $BASE/{0,1,2}
-export MEMBERS=0@127.0.0.1:19001,1@127.0.0.1:19002,2@127.0.0.1:19003
 ```
+
+**Write a config file per node.** This is how a real node is configured — the
+same file shape you would install at `/etc/uc2/node.toml`:
+
+```bash
+for i in 0 1 2; do
+  cat > $BASE/n$i.toml <<EOF
+id = $i
+bind = "127.0.0.1:1900$((i+1))"
+instance_dir = "$BASE/$i"
+app_id = "counter"
+
+[[members]]
+id = 0
+addr = "127.0.0.1:19001"
+
+[[members]]
+id = 1
+addr = "127.0.0.1:19002"
+
+[[members]]
+id = 2
+addr = "127.0.0.1:19003"
+EOF
+done
+```
+
+Note `bind` and this node's own `members` entry are the identical address. That
+is a rule, not a coincidence — `uc2-node` refuses to start if they disagree.
 
 **Start the three nodes**, one per terminal:
 
 ```bash
-cargo run -p counter --bin counter-node -- --instance-dir $BASE/0 --id 0 --bind 127.0.0.1:19001 --members $MEMBERS
-cargo run -p counter --bin counter-node -- --instance-dir $BASE/1 --id 1 --bind 127.0.0.1:19002 --members $MEMBERS
-cargo run -p counter --bin counter-node -- --instance-dir $BASE/2 --id 2 --bind 127.0.0.1:19003 --members $MEMBERS
+cargo run -p uc2_node --bin uc2-node -- --config $BASE/n0.toml
+cargo run -p uc2_node --bin uc2-node -- --config $BASE/n1.toml
+cargo run -p uc2_node --bin uc2-node -- --config $BASE/n2.toml
 ```
 
 Within a second or so, one of them announces itself:
 
 ```text
-node 0 listening on 127.0.0.1:19001
-node 0 is now follower (term 0)
-node 0 is now LEADER (term 1)
+uc2-node: node 0 listening on 127.0.0.1:19001
+uc2-node: node 0 is now follower (term 0)
+uc2-node: node 0 is now LEADER (term 1)
 ```
 
 The other two stay followers. Which node wins is genuinely arbitrary — each has

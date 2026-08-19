@@ -1,0 +1,19 @@
+[Unit]
+Description=ultima_cluster node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/uc2-node --config /etc/uc2/node.toml
+Restart=on-failure
+RestartSec=1
+# The node drains the archive on SIGTERM, so give it room — but not forever.
+# A drain that cannot finish stops anyway; the restarted node re-fetches the
+# tail. This must exceed --drain-timeout-secs (default 5).
+TimeoutStopSec=10
+KillSignal=SIGTERM
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

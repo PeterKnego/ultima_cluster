@@ -1,0 +1,110 @@
+# ultima_cluster node configuration.
+#
+# Install as /etc/uc2/node.toml and start with:
+#     uc2-node --config /etc/uc2/node.toml
+#
+# Unknown keys are a startup REFUSAL, not a warning — a typo can never be
+# silently ignored. Every optional field below shows its default, so a file
+# stating only the required fields behaves exactly as this one does.
+
+# ---------------------------------------------------------------- required
+
+# This node's id. Must be unique in the cluster and must appear in [[members]]
+# (or [[learners]]) below.
+id = 0
+
+# The UDP address this node binds for peer traffic.
+#
+# THIS MUST BE IDENTICAL TO THIS NODE'S OWN [[members]] ENTRY — the same
+# concrete address, not a wildcard, not 0.0.0.0. A mismatch used to elect a
+# leader whose followers never advanced commit, because datagrams arrived from
+# a source address matching no member. The node now refuses to start instead.
+bind = "10.0.0.10:9100"
+
+# Where this node's control page, log buffer, journal, and state live.
+#
+# MUST be on a real disk. An instance_dir on tmpfs or ramfs makes every fsync a
+# silent no-op, so the cluster appears to work and loses committed data on
+# power loss — the node refuses to start on one.
+instance_dir = "/srv/uc2/n0"
+
+# Application identity. Every attaching party (service, clients) must present
+# the same value, so a wrong app_id reads as "wrong cluster".
+app_id = "myapp"
+
+# Every VOTING member, including this node. Learners are listed separately.
+# The cap is 8 total (voters + learners) — the size of the control page's
+# per-peer band.
+[[members]]
+id = 0
+addr = "10.0.0.10:9100"
+
+[[members]]
+id = 1
+addr = "10.0.0.11:9100"
+
+[[members]]
+id = 2
+addr = "10.0.0.12:9100"
+
+# ---------------------------------------------------------------- optional
+
+# Replicated-to but never counted: no vote, no quorum slot, no flow-control
+# window. Ids must be disjoint from [[members]]. Default: none.
+#
+# [[learners]]
+# id = 3
+# addr = "10.0.0.13:9100"
+
+# Log buffer (and retransmit buffer) capacity. Power of two. Default 64 MiB.
+# buffer_bytes = 67108864
+
+# Largest single command payload. Default 512.
+#
+# A max-size frame plus its headers — and the crypto tag when encryption is on —
+# must fit ONE datagram; the node does not fragment. Raising this past the MTU
+# budget is a startup refusal.
+# max_payload = 512
+
+# Ingress admission budget in bytes: the append-minus-commit backpressure gate.
+# Default 256 KiB.
+# admission_bytes = 262144
+
+# Randomised election timeout window. min must be < max. Defaults 150 ms/300 ms.
+# election_timeout_min_ns = 150000000
+# election_timeout_max_ns = 300000000
+
+# Seed for this node's election-timeout randomness. Defaults to a per-id value.
+#
+# Leave it alone unless you have a reason. Identical seeds across nodes make
+# every member time out at the same instant, split the vote, and livelock the
+# cluster instead of electing anyone.
+# seed = 0
+
+# Journal segment size. Purge drops whole non-active segments. Default 64 MiB.
+# journal_segment_bytes = 67108864
+
+# Journal purging. ABSENT means disabled, which is the default: a node never
+# purges unless this section is present AND the service publishes a snapshot
+# floor. See docs/how-to/bound-journal-growth.md.
+#
+# [purge]
+# below_snapshot_slack_bytes = 1048576
+
+# Node-to-node wire encryption. ABSENT means cleartext, which is the default.
+#
+# A FLAG DAY, not a rolling change: a cluster runs all-encrypted or
+# all-cleartext. Enabling it is a boot refusal if the key or allowlist is
+# missing, malformed, or group/world-readable. See
+# docs/how-to/encrypt-node-traffic.md.
+#
+# [crypto]
+# key_path = "/etc/uc2/node.key"
+# allowlist_path = "/etc/uc2/allowlist.toml"
+# rotation_interval_ns = 3600000000000   # 1 h
+# rotation_bytes = 1099511627776         # 1 TiB
+
+# TEST AND DEVELOPMENT ONLY. Permit an instance_dir on a RAM-backed filesystem.
+# This never silences the warning — the node announces the override on every
+# boot. Default false.
+# allow_volatile_fs = false

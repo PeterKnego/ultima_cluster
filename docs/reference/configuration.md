@@ -8,9 +8,67 @@ Field-level API documentation for these types is generated:
 and the `uc2_service` config types. This page states the surface, its defaults,
 and its limits.
 
+## The config file
+
+`uc2-node --config <path>` loads a TOML document that mirrors `NodeConfig`
+one-for-one. `packaging/node.example.toml` is the annotated reference copy, and
+a test asserts it stays valid.
+
+Two properties are worth stating because they change how mistakes surface:
+
+- **Unknown keys are refused.** The document is parsed with
+  `deny_unknown_fields`, so a typo is a startup error naming the offending key,
+  never a silently-ignored setting.
+- **The file is validated before anything starts.** Every rule in
+  [startup refusals](#startup-refusals) runs against the loaded config before
+  the first agent is spawned.
+
+Field names match the `NodeConfig` fields below. Three differ in shape:
+
+| TOML | Maps to |
+|---|---|
+| `[[members]]` / `[[learners]]` tables of `id` + `addr` | `Vec<(NodeId, SocketAddr)>` |
+| `[purge]` with `below_snapshot_slack_bytes` — absent means disabled | `PurgePolicy` |
+| `[crypto]` with `key_path`, `allowlist_path`, optional `rotation_interval_ns` / `rotation_bytes` — absent means cleartext | `CryptoConfig` |
+
+Two keys exist only in the file and have no `NodeConfig` field:
+
+**`seed`** — optional. Defaults to a distinct per-id value. Identical seeds
+across nodes make every member time out at the same instant and split the vote.
+
+**`allow_volatile_fs`** — optional, default `false`. Test and development only;
+see [startup refusals](#startup-refusals).
+
+## Startup refusals
+
+`uc2-node` refuses to start, naming the field, rather than failing later in a
+way that looks like something else. Each rule exists because of the failure it
+replaces:
+
+| Refusal | What it prevented |
+|---|---|
+| `bind` must equal this node's own `members` entry | A leader elects, but followers never advance `durable` or `commit` — datagrams arrive from a source address matching no member. |
+| `instance_dir` must not be on a RAM-backed filesystem | Every `fsync` is a silent no-op; the cluster appears to work and loses committed data on power loss. |
+| `max_payload` must fit one datagram | A max-size frame plus headers and any crypto tag must fit the MTU; the node does not fragment. Oversized values panic inside the sender at construction. |
+| `buffer_bytes` must be a power of two | Ring geometry. |
+| `max_payload` must be well under `buffer_bytes` | A payload approaching the ring size cannot be buffered for retransmit. |
+| this node's `id` must appear in `members` or `learners` | A node not in its own cluster. |
+| `members` and `learners` must be disjoint, ids unique | Ambiguous role and peer-band aliasing. |
+| at most 8 members total | The control page's per-peer band holds 8 slots; enforced on the wire too. |
+| `election_timeout_min_ns` < `election_timeout_max_ns` | An empty randomisation window. |
+
+The RAM-backed-filesystem refusal has two override channels, and **neither is
+silent** — the override suppresses the refusal, never the notice, and the
+warning is printed on every boot:
+
+- `allow_volatile_fs = true` in the config file, the reviewable channel that
+  shows up in a config diff;
+- `UC2_ALLOW_VOLATILE_FS=1`, for suites that build a `NodeConfig` directly and
+  never parse a file.
+
 ## `NodeConfig`
 
-Passed to `Node::start`.
+Passed to `Node::start`. The config file above is a mirror of this type.
 
 ### Identity and membership
 
@@ -88,6 +146,7 @@ Fault-injection configuration, used by the simulation and test harnesses.
 | `UC2_CRYPTO` | test and gate harnesses | `1` boots harness clusters with crypto enabled. Not read by `Node::start`; production nodes are configured through `NodeConfig::crypto`. |
 | `UC2_MUTATION` | `uc2_node`, `mutation-testing` feature only | Selects an injected consensus bug. Compiled out of the default build. |
 | `CARGO_TARGET_TMPDIR` | test harnesses | Root for test instance directories. |
+| `UC2_ALLOW_VOLATILE_FS` | `uc2_node::preflight` | Any value permits an `instance_dir` on a RAM-backed filesystem. Test and development only, and never silent — the node warns on every boot. |
 
 Harness-only variables that select workload shape — `ELLE_DIR`,
 `ELLE_TARGET_OPS`, `ELLE_WORKERS`, `ELLE_MIN_FAULTS`, `ELLE_HOLD_MS`,

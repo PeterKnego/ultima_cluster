@@ -39,15 +39,37 @@ Datagrams arrive from a source address that matches no entry in the member map,
 so the receiver cannot attribute them to a peer and the consensus agent
 discards the reports. Binding the advertised address fixes it.
 
+`uc2-node` now refuses to start on this rather than mis-binding, naming both
+the `bind` value and the `members` entry it disagrees with. The failure above is
+what you would have seen before that check existed — and is still what you get
+if you build a `NodeConfig` directly instead of loading a config file.
+
 ## Supervise the processes
 
-The reference binaries park on busy-spin agents and are slow to notice
-`SIGTERM`. Under systemd, set a short stop timeout so shutdown does not stall:
+`uc2-node` handles `SIGTERM`: it drains the archive to a bounded deadline, then
+stops the agents cleanly, so the restarted node rejoins from its journal instead
+of paying reconstruction. Install the packaged unit:
 
 ```bash
-systemd-run --unit uc2-node --property TimeoutStopSec=1 \
-    /path/to/uc2-node --instance-dir /srv/uc2/n0 --bind 10.0.0.10:9100 ...
+sudo install -m 0644 packaging/systemd/uc2-node.service /etc/systemd/system/
+sudo install -D -m 0644 packaging/node.example.toml /etc/uc2/node.toml
+sudo systemctl daemon-reload && sudo systemctl enable --now uc2-node
 ```
+
+Edit `/etc/uc2/node.toml` first — every field is commented, and the two that
+matter most are `bind` (see above) and `instance_dir`.
+
+`TimeoutStopSec` is deliberately generous (10 s) rather than short. Earlier
+guidance here recommended `TimeoutStopSec=1` *because* the binaries did not
+notice `SIGTERM` and a long timeout only delayed the kill. Now the timeout is
+the drain's budget: cutting it short throws away the work that makes the next
+start cheap. It must exceed `--drain-timeout-secs` (default 5).
+
+The service half is your own binary; supervise it with
+`packaging/systemd/uc2-service@.service`, which `BindsTo` the node so the pair
+stop together and in the right order. See
+[Write a service binary](write-a-service-binary.md) for the signal handling it
+must implement.
 
 If you are starting nodes over SSH, do not background with `ssh host 'cmd &'` —
 the busy-spin threads hold the pipe open and the SSH session hangs. Use
