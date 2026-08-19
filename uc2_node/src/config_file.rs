@@ -90,7 +90,11 @@ fn default_buffer_bytes() -> usize {
     1 << 26 // 64 MiB — a production default, not the examples' 4 MiB
 }
 fn default_max_payload() -> usize {
-    1 << 20
+    // 512 B, matching the examples' NODE_MAX_PAYLOAD. A max-size frame plus its
+    // headers (and any crypto tag) must fit ONE datagram — `uc2_net`'s Sender
+    // asserts it at construction. The previous 1 MiB default was ~700x over the
+    // 1408 B MTU budget and panicked the daemon on first boot.
+    512
 }
 fn default_admission_bytes() -> u64 {
     256 * 1024
@@ -206,6 +210,29 @@ addr = "10.0.0.2:9100"
         assert!(matches!(cfg.purge, PurgePolicy::Disabled));
         assert!(matches!(cfg.crypto, CryptoConfig::Disabled));
         assert!(cfg.learners.is_empty());
+    }
+
+    /// The defaults must produce a config the node can actually START on.
+    /// This is what a shipped 1 MiB max_payload default failed: every field
+    /// deserialised perfectly and the daemon then panicked inside the sender.
+    #[test]
+    fn the_defaults_pass_preflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            dir.path(),
+            r#"
+id = 1
+bind = "10.0.0.1:9100"
+instance_dir = "/srv/uc2/n1"
+app_id = "myapp"
+
+[[members]]
+id = 1
+addr = "10.0.0.1:9100"
+"#,
+        );
+        let (cfg, _opts) = load_from_path(&p).unwrap();
+        crate::preflight::check_semantics(&cfg).expect("stated defaults must be startable");
     }
 
     #[test]

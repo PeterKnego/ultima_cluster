@@ -14,8 +14,11 @@ use uc2_consensus::election::NodeId;
 // enforces this same cap at config-frame proposal AND at decode, and a
 // second copy here could drift out of agreement with the wire.
 use uc_protocol::v2::config::MAX_MEMBERS;
+use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
+use uc_protocol::v2::datagram::{DATAGRAM_HEADER_LEN, MTU_DEFAULT};
+use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 
-use crate::NodeConfig;
+use crate::{CryptoConfig, NodeConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreflightError {
@@ -38,6 +41,13 @@ pub enum PreflightError {
     TooManyMembers(usize),
     #[error("election_timeout_min_ns ({min}) must be < election_timeout_max_ns ({max})")]
     ElectionWindow { min: u64, max: u64 },
+    #[error(
+        "max_payload ({max_payload}) does not fit one datagram: a max-size frame needs \
+         {need} bytes against an MTU of {mtu}. The node does not fragment frames — \
+         uc2_net::sender asserts this at construction, so an oversized value panics the \
+         node instead of failing here."
+    )]
+    PayloadExceedsMtu { max_payload: usize, need: usize, mtu: usize },
     #[error("instance_dir {path} does not exist or cannot be probed: {detail}")]
     InstanceDirUnprobeable { path: String, detail: String },
     #[error(
@@ -65,6 +75,25 @@ pub fn check_semantics(cfg: &NodeConfig) -> Result<(), PreflightError> {
         return Err(PreflightError::PayloadTooLarge {
             max_payload: cfg.max_payload,
             buffer_bytes: cfg.buffer_bytes,
+        });
+    }
+    // A frame larger than one datagram panics `Sender::new` — a hard assert
+    // deep in the transport, long after the config looked fine. Refuse it here
+    // with the arithmetic spelled out. The node never overrides the sender's
+    // `mtu`, so `MTU_DEFAULT` is the real budget.
+    //
+    // The `> MTU_DEFAULT` guard comes first so the sum below cannot overflow.
+    let overhead = if matches!(cfg.crypto, CryptoConfig::Enabled { .. }) { CRYPTO_OVERHEAD } else { 0 };
+    let need = if cfg.max_payload > MTU_DEFAULT {
+        usize::MAX
+    } else {
+        align_frame_len(HEADER_LEN + cfg.max_payload) + DATAGRAM_HEADER_LEN + overhead
+    };
+    if need > MTU_DEFAULT {
+        return Err(PreflightError::PayloadExceedsMtu {
+            max_payload: cfg.max_payload,
+            need,
+            mtu: MTU_DEFAULT,
         });
     }
     if cfg.election_timeout_min_ns >= cfg.election_timeout_max_ns {
@@ -254,7 +283,7 @@ pub fn check(cfg: &NodeConfig, opts: &StartupOptions) -> Result<FsVerdict, Prefl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CryptoConfig, PurgePolicy};
+    use crate::PurgePolicy;
     use std::net::SocketAddr;
 
     fn base() -> NodeConfig {
@@ -269,7 +298,9 @@ mod tests {
             instance_dir: std::path::PathBuf::from("/srv/uc2/n1"),
             app_id: "myapp".into(),
             buffer_bytes: 1 << 26,
-            max_payload: 1 << 20,
+            // 512 B — the same budget the examples use; a frame must fit one
+            // datagram. See `a_payload_that_cannot_fit_a_datagram_is_refused`.
+            max_payload: 512,
             admission_bytes: 256 * 1024,
             election_timeout_min_ns: 150_000_000,
             election_timeout_max_ns: 300_000_000,
@@ -312,6 +343,41 @@ mod tests {
         c.max_payload = usize::MAX / 2;
         let msg = check_semantics(&c).unwrap_err().to_string();
         assert!(msg.contains("max_payload"), "got: {msg}");
+    }
+
+    /// An oversized max_payload must be a NAMED refusal, not a panic inside
+    /// `Sender::new`. This is the exact defect the shipped default carried:
+    /// 1 MiB against a 1408 B MTU, which killed the daemon on its first boot.
+    #[test]
+    fn a_payload_that_cannot_fit_a_datagram_is_refused() {
+        let mut c = base();
+        c.max_payload = 1 << 20;
+        c.buffer_bytes = 1 << 26; // large enough that the buffer rule is not what fires
+        let msg = check_semantics(&c).unwrap_err().to_string();
+        assert!(msg.contains("max_payload"), "got: {msg}");
+        assert!(msg.contains("datagram"), "must name the real constraint, got: {msg}");
+    }
+
+    /// Enabling crypto shrinks the budget, so a payload that just fits in
+    /// cleartext must be re-checked against the sealed size.
+    #[test]
+    fn the_mtu_budget_accounts_for_crypto_overhead() {
+        let mut c = base();
+        c.max_payload = MTU_DEFAULT - HEADER_LEN - DATAGRAM_HEADER_LEN;
+        let cleartext = check_semantics(&c);
+        c.crypto = CryptoConfig::Enabled {
+            key_path: "/etc/uc2/node.key".into(),
+            allowlist_path: "/etc/uc2/allowlist.toml".into(),
+            rotation: Default::default(),
+        };
+        let sealed = check_semantics(&c);
+        assert!(
+            cleartext.is_err() || sealed.is_err(),
+            "a payload at the raw MTU cannot fit once headers and any crypto tag are added"
+        );
+        if cleartext.is_ok() {
+            assert!(sealed.is_err(), "crypto overhead must tighten the budget, not loosen it");
+        }
     }
 
     #[test]

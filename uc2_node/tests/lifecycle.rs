@@ -146,3 +146,150 @@ fn stop_draining_honours_its_deadline() {
         "a 1 ns deadline must not become an unbounded wait (took {elapsed:?}, got {outcome:?})"
     );
 }
+
+// ------------------------------------------------------- the uc2-node daemon
+
+/// Write a single-voter config and return its path plus the instance dir.
+fn daemon_config(dir: &Path, port: u16, bind: &str, extra: &str) -> (PathBuf, PathBuf) {
+    let inst = dir.join("n1");
+    std::fs::create_dir_all(&inst).unwrap();
+    let cfg = dir.join("node.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"{extra}
+id = 1
+bind = "{bind}:{port}"
+instance_dir = "{}"
+app_id = "lifecycle"
+
+[[members]]
+id = 1
+addr = "127.0.0.1:{port}"
+"#,
+            inst.display()
+        ),
+    )
+    .unwrap();
+    (cfg, inst)
+}
+
+fn scratch() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("uc2-daemon-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir")
+}
+
+#[test]
+fn daemon_starts_from_a_config_file_and_stops_cleanly_on_sigterm() {
+    use std::process::Command;
+
+    let dir = scratch();
+    let (cfg, _inst) = daemon_config(dir.path(), 19701, "127.0.0.1", "");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(&cfg)
+        .spawn()
+        .unwrap();
+
+    // Give it time to elect itself in a one-node cluster.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+
+    let start = Instant::now();
+    let status = child.wait().unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(status.success(), "clean shutdown must exit 0, got {status:?}");
+    assert!(elapsed < Duration::from_secs(1), "SIGTERM to exit took {elapsed:?}, bar is < 1s");
+}
+
+#[test]
+fn daemon_refuses_a_config_with_a_bind_mismatch() {
+    use std::process::Command;
+
+    let dir = scratch();
+    let (cfg, _inst) = daemon_config(dir.path(), 19702, "0.0.0.0", "");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "must refuse to start");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("bind"), "refusal must name the field, got: {err}");
+}
+
+/// A RAM-backed instance_dir is refused by default, and the override starts the
+/// node while WARNING every boot. Without this the override channel is only
+/// unit-tested; this is the assertion that the daemon actually prints it, which
+/// is the half `preflight` deliberately does not own.
+#[test]
+fn daemon_refuses_a_volatile_instance_dir_then_warns_when_overridden() {
+    use std::process::Command;
+
+    // /proc/mounts, not the code under test — see preflight's volatile_dir.
+    let Some(vol) = std::fs::read_to_string("/proc/mounts").ok().and_then(|m| {
+        m.lines().find_map(|l| {
+            let mut f = l.split_whitespace();
+            match (f.next(), f.next(), f.next()) {
+                (Some(_), Some(mp), Some("tmpfs")) if mp == "/dev/shm" || mp == "/tmp" => {
+                    Some(PathBuf::from(mp))
+                }
+                _ => None,
+            }
+        })
+    }) else {
+        eprintln!("no RAM-backed fs available; skipping");
+        return;
+    };
+
+    let inst = vol.join(format!("uc2-volatile-probe-{}", std::process::id()));
+    std::fs::create_dir_all(&inst).unwrap();
+    let dir = scratch();
+    let write_cfg = |extra: &str| {
+        let cfg = dir.path().join(format!("node{}.toml", extra.len()));
+        std::fs::write(
+            &cfg,
+            format!(
+                "{extra}\nid = 1\nbind = \"127.0.0.1:19703\"\ninstance_dir = \"{}\"\n\
+                 app_id = \"lifecycle\"\n\n[[members]]\nid = 1\naddr = \"127.0.0.1:19703\"\n",
+                inst.display()
+            ),
+        )
+        .unwrap();
+        cfg
+    };
+
+    let out = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(write_cfg(""))
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a RAM-backed instance_dir must be refused by default");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("RAM-backed"), "refusal must say why, got: {err}");
+
+    // Overridden: it starts, so SIGTERM it — but it must have warned first.
+    let child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(write_cfg("allow_volatile_fs = true"))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "the override must let the node start and stop cleanly");
+    assert!(
+        err.contains("WARNING") && err.contains("OVERRIDDEN"),
+        "the override must never be silent, got stderr: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&inst);
+}
