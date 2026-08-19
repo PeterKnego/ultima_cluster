@@ -1586,8 +1586,9 @@ and does not survive a machine change.
 |---|---|
 | 1 — config file schema and loader | **done** — `a853c60`; re-verified + reviewed on Linux 2026-08-19 (see Ruling 6) |
 | 2 — preflight validation | **done** — `1858330`; three deviations from the brief (Ruling 7) |
-| 3 — volatile-fs refusal | **plan amended** (see Ruling 4), in progress |
-| 4–8 | not started |
+| 3 — volatile-fs refusal | **done** — `bfdba6f`; four brief defects fixed (Ruling 8) |
+| 4 — archive drain | **done** — `e14be43`; contract pinned, limit recorded (Ruling 9) |
+| 5–8 | not started |
 
 **Environment finding (2026-08-19):** the workspace does not build on macOS.
 `uc_protocol/src/ring/common.rs:374` calls `libc::fallocate` with
@@ -1669,8 +1670,45 @@ scope they are unused in a non-test build and fail `clippy -D warnings`.
 *Cost if wrong:* (a) an intentional divergence from the wire cap would now need
 two edits; (b) and (c) none.
 
+**Ruling 8 (Task 3) — four defects in the brief, all found by running it.**
+(a) The probe falls back to the instance dir's PARENT and stops there. The
+brief's ancestor walk always reaches `/`, which is on real disk on any normal
+host, so it laundered every bad path into a pass and made both the refusal
+branch and `a_missing_instance_dir_parent_is_refused` unreachable. One level is
+also exactly what first boot needs — what the brief's own comment said it wanted.
+(b) The tmpfs rule now has a test. Every test in the brief used a nonexistent
+path and none exercised `VOLATILE_MAGICS`; a wrong magic would have passed all
+of them while the node booted on tmpfs. `/dev/shm` is real tmpfs, so the rule is
+tested against the real thing.
+(c) `volatile_dir()` finds that tmpfs through `/proc/mounts`, NOT through
+`fs_kind`. Asking the code under test to locate its own input was vacuous the
+same way — mutation showed a corrupted magic merely made the tests SKIP. With
+the independent oracle the same mutation turns the suite red, failing exactly
+the 4 tmpfs-dependent tests.
+(d) `CARGO_TARGET_TMPDIR` is not defined for unit tests in `src/` (integration
+tests and benches only); the durable-path test uses `CARGO_MANIFEST_DIR`.
+Also: the env-lock guard tolerates poisoning, so one genuine failure reports as
+one failure instead of six cascades.
+
+**Ruling 9 (Task 4) — the drain test pins a contract, not a behaviour
+difference; recorded so nobody later mistakes it for the stronger claim.**
+Mutating `stop_draining` down to a bare `stop()` does NOT turn the test red at
+any load tried (up to 5000 payloads). `Node::stop` tears down agents in order
+and the archive is LAST (`[consensus, sender, receiver, archive]`), so it keeps
+polling while the other three threads join and clears a backlog of that size on
+its own. The plan's premise — that `AgentRunner` exits at the top of a duty
+cycle and so drops appended-but-unrecorded bytes — is correct as written;
+incidental teardown timing is what hides it in-process. The drain's value is
+making the catch-up a BOUNDED, self-reporting guarantee rather than an accident
+of stop order, and Task 8's gate is what measures it under real load.
+Two brief corrections: the counters are fields (`c.append.load_acquire()`), not
+methods; and the assertion is against `Archive::recovered_position`, since a
+restart cannot discriminate — `log.buf` is file-backed, so a restarted archive
+pulls the tail back out of the buffer regardless.
+*Cost if wrong:* the drain is a no-op in cases the gate does not reach.
+
 ### Carried forward — next on this host
 
-1. **Task 3**, as amended by Ruling 4 (two override channels, `StartupOptions`
-   returned from `load_from_path`, the Task 1 test amendments folded in).
-2. Then Tasks 4–8. The Task 8 fleet run stays a separate, user-approved step.
+1. **Task 5** (the `uc2-node` daemon), then Tasks 6–7.
+2. Task 8's harness is local work; its FLEET RUN stays a separate,
+   user-approved step. Do not tag or record a PASS from a local run.
