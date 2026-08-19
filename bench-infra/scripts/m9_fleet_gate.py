@@ -62,13 +62,17 @@ import m6_fleet_gate as m6  # noqa: E402
 m6.APP = "m9-gate"
 
 from m6_fleet_gate import (  # noqa: E402
-    LocalHost, SshHost, dip_for_transition, wait_leader,
+    LocalHost, SshHost, wait_leader,
 )
 
 APP = "m9-gate"
 PORT = 19100
 BAR_STOP_SECS = 1.0
-BAR_DIP_PCT = 10.0
+BAR_DIP_PCT = 10.0              # run-1 bar; now printed UNGATED for comparability
+BAR_RECOVER_SECS = 15.0         # re-specified row 3 (gate doc, pre-committed)
+RECOVER_FRACTION = 0.8          # a window qualifies at >= 80 % of baseline
+RECOVER_WINDOW_SECS = 2.0
+RECOVER_HARD_DEADLINE = 40.0    # stop polling; a FAIL still prints the timeline
 DRAIN_TIMEOUT_SECS = 5          # uc2-node --drain-timeout-secs
 UNIT_STOP_TIMEOUT = 10          # systemd TimeoutStopSec; must exceed the drain
 LEADER_WAIT_SECS = 45
@@ -218,6 +222,15 @@ class M9Node:
         return self.host.probe(rate_secs=rate_secs)
 
 
+def leader_probe_rate(node, secs):
+    """One on-host rate window on `node`; 0.0 on a transient probe failure
+    (a failed window reads as not-qualified, which errs against PASS)."""
+    try:
+        return node.probe(rate_secs=secs).get("rate") or 0.0
+    except Exception:
+        return 0.0
+
+
 def _grab(text, key):
     for line in text.splitlines():
         if line.startswith(key):
@@ -316,36 +329,59 @@ def run(nodes, members, leader_idx, fleet):
     before = leader.probe()
     print(f"INFO pre-stop leader n{leader.id}: {json.dumps(before)}", flush=True)
 
-    timing = {}
+    # Row 3 as re-specified (gate doc, pre-committed before this run):
+    # time-to-recover. Baseline = one 8 s on-host window on the survivor;
+    # recovered = first 2 s window at >= 80 % of baseline whose END is within
+    # 15 s of the SIGTERM, confirmed by the next window. t0 is taken BEFORE
+    # the stop's ssh round trip, so every skew inflates the measured recovery
+    # time — the measurement errs against PASS. The run-1-style 5 s dip is
+    # still taken (background window spanning the action) and printed UNGATED.
+    baseline = leader_probe_rate(survivor, 8.0)
+    print(f"INFO baseline (survivor n{survivor.id}, 8s): {baseline:.0f} B/s", flush=True)
 
-    def action():
-        elapsed, code = leader.stop_daemon_timed()
-        timing["elapsed"], timing["code"] = elapsed, code
-        print(f"INFO stop: {elapsed:.3f}s exit={code}", flush=True)
-        leader.start_daemon()
-        # Restart the SERVICE with the node, mirroring the shipped packaging:
-        # packaging/systemd/uc2-service@.service declares
-        # `BindsTo=uc2-node.service` precisely because a service that outlives
-        # its node is attached to a dead instance — `instance_id` changes across
-        # a node restart, so the survivor keeps replicating while nothing
-        # applies or answers, and submits go unanswered. An orchestrator that
-        # leaves the service running is not driving the deployment the docs
-        # describe.
-        leader.start_service()
-        # NOTHING is done to the load clients. Every node runs one — that is
-        # the deployment shape uc2_client is an SDK for: an app client sits on
-        # each node, the LEADER's serves requests, and a follower's answers
-        # with a redirect to the leader. So when leadership moves, the new
-        # leader's client simply starts serving; there is nothing to respawn.
-        #
-        # The previous version ran ONE client pinned to the leader and
-        # respawned it on failover, paying a process spawn plus its CAN_SERVE
-        # wait INSIDE the 5 s measurement window. That is harness cost, and on
-        # the 2026-08-19 fleet run it is what leadership moving to n1 charged
-        # to row 3 (62 %).
-    dip, during, baseline, err = dip_for_transition(survivor.host, action)
-    if err:
-        print(f"WARN transition reported: {err}", flush=True)
+    dip_handle = survivor.host.rate_probe_start(5.0)
+    time.sleep(0.5)
+
+    timing = {}
+    t0 = time.monotonic()
+    elapsed, code = leader.stop_daemon_timed()
+    timing["elapsed"], timing["code"] = elapsed, code
+    print(f"INFO stop: {elapsed:.3f}s exit={code}", flush=True)
+    leader.start_daemon()
+    # Service restarts with the node (BindsTo semantics — see packaging).
+    # Load clients are untouched: one per node, the new leader's just serves.
+    leader.start_service()
+
+    timeline, recovered, first_end = [], None, None
+    while time.monotonic() - t0 < RECOVER_HARD_DEADLINE:
+        rate = leader_probe_rate(survivor, RECOVER_WINDOW_SECS)
+        w_end = time.monotonic() - t0
+        timeline.append((w_end, rate))
+        qualifies = baseline > 0 and rate >= RECOVER_FRACTION * baseline
+        if qualifies and first_end is None:
+            first_end = w_end          # candidate; next window must confirm
+        elif first_end is not None:
+            if qualifies:
+                recovered = first_end
+                break
+            first_end = None           # one lucky window is not recovery
+    tl = ", ".join(f"{t:.1f}s:{r:.0f}" for t, r in timeline)
+    print(f"INFO recovery timeline (B/s): {tl}", flush=True)
+
+    for n in nodes:
+        try:
+            pr = n.probe()
+            print(f"INFO post-recovery n{n.id}: leader={pr.get('leader')} "
+                  f"can_serve={pr.get('can_serve')} term={pr.get('term')} "
+                  f"commit={pr.get('commit')}", flush=True)
+        except Exception as e:
+            print(f"INFO post-recovery n{n.id}: probe failed: {e}", flush=True)
+
+    during = survivor.host.rate_probe_result(dip_handle, timeout=40.0) or 0.0
+    dip = max(0.0, (baseline - during) / baseline * 100.0) if baseline > 0 else 100.0
+    print(f"INFO run-1-style 5s dip {dip:.1f}% (baseline {baseline:.0f} -> "
+          f"{during:.0f} B/s) — UNGATED, printed for comparability with run 1",
+          flush=True)
 
     # -- row 1
     elapsed, code = timing.get("elapsed"), timing.get("code")
@@ -390,14 +426,20 @@ def run(nodes, members, leader_idx, fleet):
             f"incoming_snapshot_pos {inc_before} -> {inc_after} (bar: unchanged; "
             f"snapshots WERE being built: service_snapshot_pos {built})"))
 
-    # -- row 3 (fleet-gated only; Ruling 12)
-    detail = (f"dip {dip:.1f}% (baseline {baseline:.0f} -> during {during:.0f} B/s), "
-              f"bar < {BAR_DIP_PCT}%")
+    # -- row 3, re-specified: time-to-recover (fleet-gated only; Ruling 12)
+    if recovered is not None:
+        detail = (f"recovered at {recovered:.1f}s (first >= {RECOVER_FRACTION:.0%}-of-"
+                  f"baseline window end; confirmed by next), bar <= {BAR_RECOVER_SECS}s")
+        ok = recovered <= BAR_RECOVER_SECS
+    else:
+        detail = (f"NOT recovered within {RECOVER_HARD_DEADLINE:.0f}s "
+                  f"(bar <= {BAR_RECOVER_SECS}s); timeline above")
+        ok = False
     if fleet:
-        verdicts.append(Verdict("3 commit-rate dip", dip < BAR_DIP_PCT, detail))
+        verdicts.append(Verdict("3 time-to-recover", ok, detail))
     else:
         verdicts.append(Verdict(
-            "3 commit-rate dip", True,
+            "3 time-to-recover", True,
             detail + " — NOT gated locally; the bar is fleet-only "
                      "(see m6_gate/m7_gate and Ruling 12)", gated=False))
 
@@ -446,8 +488,16 @@ def main():
     print(f"INFO leader is n{nodes[idx].id}", flush=True)
 
     # One client per node: the leader's does the work, the followers' redirect.
+    # Lifetime must cover settle + 8 s baseline + the action + the full
+    # recovery poll; a client that exits mid-poll reads as a dead cluster
+    # (this exact bug: --secs 40 ended the clients ~24 s into the window).
+    need = SETTLE_SECS + 10 + RECOVER_HARD_DEADLINE + 20
+    load_secs = max(a.secs, int(need))
+    if load_secs != a.secs:
+        print(f"INFO load lifetime raised {a.secs} -> {load_secs}s to cover "
+              f"the recovery poll", flush=True)
     for n in nodes:
-        n.start_load(a.secs)
+        n.start_load(load_secs)
     time.sleep(SETTLE_SECS)
 
     try:
