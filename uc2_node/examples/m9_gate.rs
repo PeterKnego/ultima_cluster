@@ -241,7 +241,8 @@ fn run_probe(a: ProbeArgs) -> anyhow::Result<()> {
     let c = cnc.counters();
     let mut line = format!(
         "{{\"leader\":{},\"can_serve\":{},\"term\":{},\"commit\":{},\"durable\":{},\
-         \"append\":{},\"incoming_snapshot_pos\":{},\"node_snapshot_floor\":{}",
+         \"append\":{},\"incoming_snapshot_pos\":{},\"node_snapshot_floor\":{},\
+         \"service_snapshot_pos\":{}",
         (flags & NODE_FLAG_LEADER) != 0,
         (flags & NODE_FLAG_CAN_SERVE) != 0,
         cnc.status().term.load_acquire(),
@@ -250,6 +251,12 @@ fn run_probe(a: ProbeArgs) -> anyhow::Result<()> {
         c.append.load_acquire(),
         cnc.snapshots().incoming_snapshot_pos.load_acquire(),
         cnc.snapshots().node_snapshot_floor.load_acquire(),
+        // Row 2's anti-vacuity evidence (Ruling 13): "incoming_snapshot_pos
+        // unchanged at 0" is ALSO what a cluster that never snapshots looks
+        // like. The in-process `all` mode reads this directly; the fleet
+        // orchestrator can only see what `probe` prints, so without this the
+        // fleet could only report row 2 INCONCLUSIVE.
+        cnc.snapshots().service_snapshot_pos.load_acquire(),
     );
     if let Some(r) = rate {
         line.push_str(&format!(",\"rate\":{r:.3}"));
