@@ -342,6 +342,10 @@ struct Rings {
 }
 
 pub struct Node {
+    /// M10 (Task 4): this node's id, captured from `cfg.id` at boot — nothing
+    /// else on `Node` retains it (the consensus SM has its own copy). Exposed
+    /// via [`Node::observability`].
+    node_id: NodeId,
     cnc: Arc<CncPage>,
     term_handle: TermHandle,
     leader_flag: Arc<AtomicBool>,
@@ -402,6 +406,13 @@ pub struct Node {
     /// a forged or revoked handshake attempt was actually REFUSED, not just
     /// that it happened not to succeed within some timeout.
     crypto_handshake_failures: Arc<AtomicU64>,
+    /// M10 (Task 4): mirrors `cfg.purge != PurgePolicy::Disabled` — neither
+    /// retained elsewhere on `Node` (the policy itself lives on the consensus
+    /// SM). Exposed via [`Node::observability`].
+    purge_enabled: bool,
+    /// M10 (Task 4): mirrors `cfg.journal_segment_bytes`, not otherwise kept
+    /// on `Node`. Exposed via [`Node::observability`].
+    journal_segment_bytes: u64,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
     _instance: InstanceDir,
     _rings: Rings,
@@ -1182,6 +1193,7 @@ impl Node {
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
 
         Ok(Node {
+            node_id: cfg.id,
             cnc,
             term_handle,
             leader_flag,
@@ -1201,6 +1213,8 @@ impl Node {
             crypto_epoch,
             crypto,
             crypto_handshake_failures,
+            purge_enabled: !matches!(cfg.purge, PurgePolicy::Disabled),
+            journal_segment_bytes: cfg.journal_segment_bytes,
             _instance: instance,
             _rings: rings,
             // Stop order: consensus first (stops writing the term handle), then
@@ -1388,6 +1402,37 @@ impl Node {
     /// nothing (a later legitimate report still ranks).
     pub fn reports_implausible(&self) -> u64 {
         self.reports_implausible.load(Ordering::Relaxed)
+    }
+
+    /// M10 (Task 4): a read-only bundle of this node's `Arc`-shared counters,
+    /// flags, and config values, for a later task's metrics encoder to render
+    /// into a series. A straight clone-and-collect — every `Arc` cloned here
+    /// is the SAME allocation the owning agent writes through, so this adds
+    /// no new synchronization and never goes stale relative to the source.
+    ///
+    /// `agents` is always exactly 4 entries in the FIXED order `consensus,
+    /// sender, receiver, archive` — NOT spawn order (spawn order is archive,
+    /// sender, receiver, consensus) — because a later task's metric labels
+    /// are positional against this order.
+    pub fn observability(&self) -> crate::obs::ObsSources {
+        crate::obs::ObsSources {
+            node_id: self.node_id,
+            cnc: Arc::clone(&self.cnc),
+            sender: Arc::clone(&self.sender_stats),
+            receiver: Arc::clone(&self.route_drops),
+            truncations: Arc::clone(&self.truncations),
+            wipes: Arc::clone(&self.wipes),
+            reports_unattested: Arc::clone(&self.reports_unattested),
+            reports_implausible: Arc::clone(&self.reports_implausible),
+            crypto_handshake_failures: Arc::clone(&self.crypto_handshake_failures),
+            crypto_enabled: self.crypto.is_some(),
+            purge_enabled: self.purge_enabled,
+            journal_segment_bytes: self.journal_segment_bytes,
+            agents: [("consensus", 0usize), ("sender", 1), ("receiver", 2), ("archive", 3)]
+                .into_iter()
+                .map(|(name, idx)| (name, self.agents[idx].finished_flag()))
+                .collect(),
+        }
     }
 
     /// Consensus events dropped because the NetEvent channel was full (T7

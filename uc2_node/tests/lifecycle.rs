@@ -147,6 +147,48 @@ fn stop_draining_honours_its_deadline() {
     );
 }
 
+/// M10 (Task 4) smoke: `Node::observability()` sees a live 4-agent bundle
+/// while the node runs, and every agent's flag flips true once the node is
+/// stopped (agents are told to stop and their threads join). The Arcs
+/// returned by `observability()` are cloned BEFORE `stop()` runs (which
+/// consumes the node), so polling them afterwards is genuinely observing the
+/// worker threads exit, not a stale snapshot.
+#[test]
+fn observability_reports_four_agents_alive_then_all_finished_after_stop() {
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-lifecycle-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    let (node, _addr) = single_node(&dir.path().join("n0"));
+
+    let obs = node.observability();
+    assert_eq!(obs.agents.len(), 4, "expected exactly 4 agents: {:?}", {
+        obs.agents.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+    });
+    for (name, flag) in &obs.agents {
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::Acquire),
+            "agent {name} already reports finished on a live node"
+        );
+    }
+    let names: Vec<&'static str> = obs.agents.iter().map(|(n, _)| *n).collect();
+    assert_eq!(
+        names,
+        vec!["consensus", "sender", "receiver", "archive"],
+        "agents must be reported in this fixed order regardless of spawn order"
+    );
+
+    node.stop();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for (name, flag) in &obs.agents {
+        while !flag.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "agent {name} never reported finished after stop");
+            std::thread::yield_now();
+        }
+    }
+}
+
 // ------------------------------------------------------- the uc2-node daemon
 
 /// Write a single-voter config and return its path plus the instance dir.
