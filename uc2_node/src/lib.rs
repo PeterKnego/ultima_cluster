@@ -34,6 +34,7 @@ pub mod ipc;
 #[cfg(feature = "mutation-testing")]
 pub(crate) mod mutation;
 mod node;
+pub mod obs;
 pub mod preflight;
 mod read_round;
 
