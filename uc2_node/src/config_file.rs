@@ -8,6 +8,13 @@
 //! silently-ignored setting — the same posture as M8's crypto boot refusal.
 //! This module does deserialisation ONLY; every semantic rule lives in
 //! [`crate::preflight`].
+//!
+//! There is exactly one deliberate exception to `deny_unknown_fields`: the
+//! `[log]` and `[metrics]` tables the production-readiness spec reserves for
+//! M10 are accepted as opaque tables, so that a config written for M10 does not
+//! refuse to start on an M9 node. Their presence is reported through
+//! [`crate::preflight::ReservedSections`] and announced by the daemon — never
+//! silently ignored.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -17,7 +24,7 @@ use uc2_consensus::election::NodeId;
 use uc2_crypto::rotation::RotationPolicy;
 use uc2_net::fault::FaultConfig;
 
-use crate::preflight::StartupOptions;
+use crate::preflight::{ReservedSections, StartupOptions};
 use crate::{CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, NodeConfig, PurgePolicy};
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +91,14 @@ struct NodeConfigFile {
     /// silences the startup warning.
     #[serde(default)]
     allow_volatile_fs: bool,
+    /// RESERVED for M10 — parsed, reported, and otherwise inert. See
+    /// [`crate::preflight::ReservedSections`] for why these are accepted as
+    /// opaque tables rather than validated against a schema M9 does not know.
+    #[serde(default)]
+    log: Option<toml::Table>,
+    /// RESERVED for M10 — see `log` above.
+    #[serde(default)]
+    metrics: Option<toml::Table>,
 }
 
 fn default_buffer_bytes() -> usize {
@@ -166,7 +181,10 @@ pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), Confi
         journal_segment_bytes: f.journal_segment_bytes,
         crypto,
     },
-    StartupOptions { allow_volatile_fs: f.allow_volatile_fs }))
+    StartupOptions {
+        allow_volatile_fs: f.allow_volatile_fs,
+        reserved: ReservedSections { log: f.log.is_some(), metrics: f.metrics.is_some() },
+    }))
 }
 
 #[cfg(test)]
@@ -338,5 +356,119 @@ addr = "10.0.0.1:9100"
         let (cfg, opts) = load_from_path(&p).expect("packaging/node.example.toml must parse");
         assert!(!opts.allow_volatile_fs, "the shipped example must not override durability");
         crate::preflight::check_semantics(&cfg).expect("the shipped example must be startable");
+    }
+
+    /// `[log]` and `[metrics]` are RESERVED for M10 by the production-readiness
+    /// spec (§4: "plus `[log]` and `[metrics]` sections reserved for M10").
+    /// They must PARSE today — with `deny_unknown_fields`, a config written for
+    /// M10 would otherwise be a hard startup refusal on an M9 node — and their
+    /// presence must be REPORTED, because a section that is accepted and
+    /// silently ignored is exactly the silent no-op this milestone abolishes.
+    #[test]
+    fn the_m10_reserved_sections_parse_and_are_reported_as_inert() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            dir.path(),
+            r#"
+id = 1
+bind = "10.0.0.1:9100"
+instance_dir = "/srv/uc2/n1"
+app_id = "myapp"
+
+[[members]]
+id = 1
+addr = "10.0.0.1:9100"
+
+[log]
+level = "info"
+
+[metrics]
+bind = "127.0.0.1:9600"
+"#,
+        );
+        let (cfg, opts) = load_from_path(&p).expect("reserved sections must not refuse startup");
+        assert_eq!(cfg.id, 1, "the rest of the config must still map");
+        assert!(opts.reserved.log, "[log] presence must be reported");
+        assert!(opts.reserved.metrics, "[metrics] presence must be reported");
+        assert_eq!(opts.reserved.names(), vec!["log", "metrics"]);
+    }
+
+    /// M9 does not know M10's schema, so it must not pretend to validate one.
+    /// Inventing field names here would either refuse a legitimate M10 config
+    /// or lock M10 into whatever M9 guessed. The table is reserved; its
+    /// contents are M10's to define.
+    #[test]
+    fn a_reserved_section_accepts_keys_m9_has_never_heard_of() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            dir.path(),
+            r#"
+id = 1
+bind = "10.0.0.1:9100"
+instance_dir = "/srv/uc2/n1"
+app_id = "myapp"
+
+[[members]]
+id = 1
+addr = "10.0.0.1:9100"
+
+[metrics]
+some_field_invented_in_m10 = 7
+nested = { deeper = true }
+"#,
+        );
+        let (_cfg, opts) = load_from_path(&p).expect("M10's own keys must not refuse startup");
+        assert!(opts.reserved.metrics);
+        assert!(!opts.reserved.log, "an absent section must not be reported");
+    }
+
+    /// Reserving exactly two names must not open the door generally —
+    /// `deny_unknown_fields` is still the posture for everything else.
+    #[test]
+    fn an_unreserved_unknown_section_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            dir.path(),
+            r#"
+id = 1
+bind = "10.0.0.1:9100"
+instance_dir = "/srv/uc2/n1"
+app_id = "myapp"
+
+[[members]]
+id = 1
+addr = "10.0.0.1:9100"
+
+[telemetry]
+level = "info"
+"#,
+        );
+        let err = load_from_path(&p).unwrap_err();
+        assert!(
+            err.to_string().contains("telemetry"),
+            "an unreserved section must still be refused by name, got: {err}"
+        );
+    }
+
+    /// A config with neither section reports neither — the default must be
+    /// "nothing inert", so the daemon stays quiet on a normal boot.
+    #[test]
+    fn no_reserved_sections_means_nothing_to_announce() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(
+            dir.path(),
+            r#"
+id = 1
+bind = "10.0.0.1:9100"
+instance_dir = "/srv/uc2/n1"
+app_id = "myapp"
+
+[[members]]
+id = 1
+addr = "10.0.0.1:9100"
+"#,
+        );
+        let (_cfg, opts) = load_from_path(&p).unwrap();
+        assert!(opts.reserved.names().is_empty());
     }
 }

@@ -1592,6 +1592,7 @@ and does not survive a machine change.
 | 6 — service template | **done** — `2e584c0` |
 | 7 — packaging + docs cutover | **done** — `0a4b49c`; quickstart executed verbatim |
 | 8 — gate harness | **done** — decide rule `71433a9`, harness `a56bcd8`. **FLEET RUN NOT STARTED** (user-approved step) |
+| post — spec §4 reserved `[log]`/`[metrics]` sections | **done** — gap found reviewing the branch against the spec (Ruling 14) |
 
 **Environment finding (2026-08-19):** the workspace does not build on macOS.
 `uc_protocol/src/ring/common.rs:374` calls `libc::fallocate` with
@@ -1770,6 +1771,35 @@ and such a cluster could not have installed one however badly the restart went.
 The row now requires positive evidence that snapshots were being built
 (`service_snapshot_pos` ~1.7 MB on all three nodes in the smoke) and reports
 INCONCLUSIVE-and-FAIL otherwise. Same discipline as Rulings 8(c) and 9.
+
+**Ruling 14 (post-task) — the spec's reserved `[log]`/`[metrics]` sections were
+missing, and `deny_unknown_fields` made that a shipped-schema problem.** Spec §4
+specifies the config file as "a one-to-one mirror of `NodeConfig`, **plus
+`[log]` and `[metrics]` sections reserved for M10**". The second clause was never
+implemented and appears nowhere in Tasks 1-8; the plan's own self-review §1
+asserted full spec coverage and missed it. It is not cosmetic, because
+`NodeConfigFile` is `deny_unknown_fields`: an operator who writes `[metrics]`
+gets a hard startup refusal, and M10 could not add observability config without
+amending a schema that had shipped in a tagged release.
+Three sub-decisions, all deliberate:
+(a) **Accepted as opaque `toml::Table`s, not validated.** M9 does not know
+M10's schema. Inventing field names would either refuse a legitimate M10 config
+or lock M10 into M9's guess. The table is reserved; its contents are M10's.
+(b) **Accepted is not the same as ignored.** Swallowing a section the operator
+wrote expecting an effect is precisely the silent no-op this milestone exists to
+abolish, so presence is carried out through `StartupOptions::reserved`
+(`preflight::ReservedSections`) and the daemon prints a NOTE naming them on
+every boot — the same never-silent discipline as Ruling 4's override.
+(c) **The exception is exactly two names.** A test asserts an unreserved unknown
+table (`[telemetry]`) is still refused by name, so reserving these does not
+quietly relax `deny_unknown_fields` in general.
+Five tests: four in `config_file` (parse+report, M10-unknown keys accepted,
+unreserved table still refused, absent means nothing announced) and one in
+`tests/lifecycle.rs` asserting the daemon actually prints the notice and still
+exits 0 — the half `preflight` deliberately does not own, same split as the
+volatile-fs test. `packaging/node.example.toml` and
+`docs/reference/configuration.md` document the reservation.
+*Cost if wrong:* two config names are spent, and M10 must use them.
 
 ### State at handoff
 

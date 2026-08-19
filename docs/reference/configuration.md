@@ -39,6 +39,19 @@ across nodes make every member time out at the same instant and split the vote.
 **`allow_volatile_fs`** — optional, default `false`. Test and development only;
 see [startup refusals](#startup-refusals).
 
+### Reserved sections
+
+Unknown keys are a startup refusal (`deny_unknown_fields`), with exactly two
+exceptions. `[log]` and `[metrics]` are **reserved for M10** and are accepted
+today so a config written for a later release does not refuse to start on this
+one. They have **no effect here**, and the node prints a `NOTE` naming any that
+are present on every boot — a section that does nothing must never look like a
+section that works.
+
+Their contents are not validated: this release does not define their schema, so
+any keys inside them are accepted as-is. Every other unknown table is still
+refused by name.
+
 ## Startup refusals
 
 `uc2-node` refuses to start, naming the field, rather than failing later in a

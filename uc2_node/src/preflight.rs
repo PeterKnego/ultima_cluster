@@ -146,6 +146,54 @@ pub struct StartupOptions {
     /// will lose committed data on power loss. Setting this never silences the
     /// startup warning — see [`FsVerdict::VolatileOverridden`].
     pub allow_volatile_fs: bool,
+    /// Which M10-reserved config sections the file actually carried. The
+    /// daemon MUST announce these — see [`ReservedSections`].
+    pub reserved: ReservedSections,
+}
+
+/// Config sections this version PARSES but does not yet ACT ON.
+///
+/// The production-readiness spec reserves `[log]` and `[metrics]` for M10. They
+/// are accepted here so that a config written for M10 is not a hard startup
+/// refusal on an M9 node — `NodeConfigFile` is `deny_unknown_fields`, so
+/// without an explicit reservation any forward-looking config is rejected
+/// outright.
+///
+/// Accepting them *silently* would be worse than rejecting them: an operator
+/// who writes `[metrics]` and gets no endpoint and no message has been handed
+/// exactly the silent no-op this milestone exists to abolish. So presence is
+/// recorded here and the daemon warns on every boot, the same never-silent
+/// discipline the volatile-fs override follows.
+///
+/// M9 deliberately does NOT validate the contents of these tables. It cannot:
+/// M10 has not defined their schema, and guessing would either refuse a
+/// legitimate M10 config or lock M10 into M9's guess.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReservedSections {
+    /// A `[log]` table was present.
+    pub log: bool,
+    /// A `[metrics]` table was present.
+    pub metrics: bool,
+}
+
+impl ReservedSections {
+    /// The reserved sections that were present, in config order. Empty on a
+    /// normal boot, so the daemon has nothing to say.
+    pub fn names(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.log {
+            v.push("log");
+        }
+        if self.metrics {
+            v.push("metrics");
+        }
+        v
+    }
+
+    /// True when there is something for the daemon to announce.
+    pub fn any(&self) -> bool {
+        self.log || self.metrics
+    }
 }
 
 /// What the durability probe concluded.
@@ -449,7 +497,7 @@ mod tests {
     }
 
     fn no_override() -> StartupOptions {
-        StartupOptions { allow_volatile_fs: false }
+        StartupOptions { allow_volatile_fs: false, ..Default::default() }
     }
 
     /// A directory known to be RAM-backed, located via `/proc/mounts` — an
@@ -542,7 +590,7 @@ mod tests {
             eprintln!("no RAM-backed fs available; skipping");
             return;
         };
-        let opts = StartupOptions { allow_volatile_fs: true };
+        let opts = StartupOptions { allow_volatile_fs: true, ..Default::default() };
         // The override must suppress the REFUSAL without suppressing the
         // NOTICE: a cluster on a RAM-backed fs must never look quiet.
         let v = check_durable_fs(&vol.join("uc2-preflight-probe"), &opts).unwrap();

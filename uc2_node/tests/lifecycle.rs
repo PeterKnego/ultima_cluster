@@ -293,3 +293,71 @@ fn daemon_refuses_a_volatile_instance_dir_then_warns_when_overridden() {
 
     let _ = std::fs::remove_dir_all(&inst);
 }
+
+/// `[log]` and `[metrics]` are reserved for M10. The daemon must START with
+/// them present — `deny_unknown_fields` would otherwise make any
+/// forward-looking config a hard refusal — and must SAY they do nothing.
+/// Accepting a section silently is the failure mode this milestone abolishes:
+/// the operator wrote it expecting an effect.
+///
+/// Note the sections are appended AFTER `[[members]]`, not prepended: a table
+/// header at the top of the document would capture `id`/`bind`/`app_id` into
+/// it. That is also why this test does not reuse `daemon_config`'s `extra`,
+/// which prepends.
+#[test]
+fn daemon_starts_and_announces_the_m10_reserved_sections() {
+    use std::process::Command;
+
+    let dir = scratch();
+    let inst = dir.path().join("n1");
+    std::fs::create_dir_all(&inst).unwrap();
+    let cfg = dir.path().join("node.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"id = 1
+bind = "127.0.0.1:19704"
+instance_dir = "{}"
+app_id = "lifecycle"
+
+[[members]]
+id = 1
+addr = "127.0.0.1:19704"
+
+[log]
+level = "info"
+
+[metrics]
+bind = "127.0.0.1:19605"
+"#,
+            inst.display()
+        ),
+    )
+    .unwrap();
+
+    // No assertion between spawn and kill — a leaked busy-spin node burns a
+    // core and blocks cargo on the inherited pipe (see the M9 plan, Ruling 11).
+    let child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(&cfg)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+
+    assert!(
+        out.status.success(),
+        "a config carrying the reserved sections must start and stop cleanly, stderr: {err}"
+    );
+    assert!(
+        err.contains("RESERVED") && err.contains("NO effect"),
+        "an inert section must never be silently swallowed, got stderr: {err}"
+    );
+    assert!(
+        err.contains("[log]") && err.contains("[metrics]"),
+        "the notice must name the sections, got stderr: {err}"
+    );
+}

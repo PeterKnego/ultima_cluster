@@ -108,3 +108,18 @@ addr = "10.0.0.12:9100"
 # This never silences the warning — the node announces the override on every
 # boot. Default false.
 # allow_volatile_fs = false
+
+# ---------------------------------------------------------------------------
+# RESERVED — parsed, announced, and otherwise inert in this release.
+# ---------------------------------------------------------------------------
+# `[log]` and `[metrics]` are reserved for M10 (observability). They are
+# accepted today so that a config written for a later release does not refuse
+# to start on this one, and the node prints a NOTE naming them on every boot so
+# a section that does nothing never looks like a section that works. Their
+# contents are NOT validated here — the schema is M10's to define.
+#
+# [log]
+# level = "info"
+#
+# [metrics]
+# bind = "127.0.0.1:9600"
