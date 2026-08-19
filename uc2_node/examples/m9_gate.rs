@@ -241,7 +241,8 @@ fn run_probe(a: ProbeArgs) -> anyhow::Result<()> {
     let c = cnc.counters();
     let mut line = format!(
         "{{\"leader\":{},\"can_serve\":{},\"term\":{},\"commit\":{},\"durable\":{},\
-         \"append\":{},\"incoming_snapshot_pos\":{},\"node_snapshot_floor\":{}",
+         \"append\":{},\"incoming_snapshot_pos\":{},\"node_snapshot_floor\":{},\
+         \"service_snapshot_pos\":{}",
         (flags & NODE_FLAG_LEADER) != 0,
         (flags & NODE_FLAG_CAN_SERVE) != 0,
         cnc.status().term.load_acquire(),
@@ -250,6 +251,12 @@ fn run_probe(a: ProbeArgs) -> anyhow::Result<()> {
         c.append.load_acquire(),
         cnc.snapshots().incoming_snapshot_pos.load_acquire(),
         cnc.snapshots().node_snapshot_floor.load_acquire(),
+        // Row 2's anti-vacuity evidence (Ruling 13): "incoming_snapshot_pos
+        // unchanged at 0" is ALSO what a cluster that never snapshots looks
+        // like. The in-process `all` mode reads this directly; the fleet
+        // orchestrator can only see what `probe` prints, so without this the
+        // fleet could only report row 2 INCONCLUSIVE.
+        cnc.snapshots().service_snapshot_pos.load_acquire(),
     );
     if let Some(r) = rate {
         line.push_str(&format!(",\"rate\":{r:.3}"));
@@ -325,10 +332,25 @@ fn load_loop(stop: Arc<AtomicBool>, registry: Registry, app_id: String, submitte
                 let c = client.take().unwrap();
                 c.shutdown();
                 let snapshot = registry.lock().unwrap().clone();
+                let prev = cur;
                 if !snapshot.is_empty() {
                     cur = hint
                         .and_then(|h| snapshot.iter().position(|(id, _)| *id == h))
                         .unwrap_or((cur + 1) % snapshot.len());
+                }
+                // Nowhere else to go: this driver knows only its own node (the
+                // fleet `loadclient` role registers a single instance dir, one
+                // client per node — the deployment shape the SDK is written
+                // for). Without a backoff a FOLLOWER's client hot-spins
+                // connect/submit/NotLeader/shutdown with no sleep at all,
+                // burning a core on every non-leader host and perturbing the
+                // very commit rate row 3 measures. A real app client answers
+                // its caller with a redirect to the leader and waits for the
+                // next request; it does not hammer its own node. In-process
+                // `all` mode is unaffected — its registry holds every node, so
+                // the hint moves `cur` and this arm is skipped.
+                if cur == prev {
+                    thread::sleep(Duration::from_millis(2));
                 }
             }
             Err(ClientError::BackpressureFull) | Err(ClientError::Retry) => {
