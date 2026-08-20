@@ -34,6 +34,18 @@ impl IdleStrategy {
 pub struct AgentRunner {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    finished: Arc<AtomicBool>,
+}
+
+/// Sets `finished` true on drop — fires whether the worker thread's loop
+/// returns cleanly or unwinds from a panic, since the guard lives inside the
+/// spawned closure and `Drop::drop` runs during unwind too.
+struct FinishedGuard(Arc<AtomicBool>);
+
+impl Drop for FinishedGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 impl AgentRunner {
@@ -50,14 +62,27 @@ impl AgentRunner {
     {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
+        let finished = Arc::new(AtomicBool::new(false));
+        let finished_flag = Arc::clone(&finished);
         let handle = std::thread::Builder::new().name(name.to_string()).spawn(move || {
+            let _guard = FinishedGuard(finished_flag);
             while !stop_flag.load(Ordering::Relaxed) {
                 if !work() {
                     idle.idle();
                 }
             }
         })?;
-        Ok(AgentRunner { stop, handle: Some(handle) })
+        Ok(AgentRunner { stop, handle: Some(handle), finished })
+    }
+
+    /// Shared liveness flag: false while the worker loop runs, set true when
+    /// the closure returns *or panics* (a drop-guard inside the spawned
+    /// thread sets it during unwind too). Unlike `is_finished()` (which polls
+    /// `JoinHandle::is_finished`, itself panic-safe but not cheaply shareable
+    /// across threads), this is the Arc a supervisor/observability reader can
+    /// clone and poll without borrowing the `AgentRunner`.
+    pub fn finished_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.finished)
     }
 
     /// Has this agent's thread exited? A polling agent runs until stopped, so
@@ -111,6 +136,22 @@ mod tests {
         runner.stop();
         let n = count.load(Ordering::Relaxed);
         assert!(n >= 1000);
+    }
+
+    #[test]
+    fn the_finished_flag_survives_a_panicking_agent() {
+        use std::time::{Duration, Instant};
+        let r = AgentRunner::spawn("panics", IdleStrategy::Sleep(Duration::from_millis(1)), || {
+            panic!("deliberate");
+        })
+        .unwrap();
+        let flag = r.finished_flag();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !flag.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "flag never set");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(r); // Drop swallows the panic — that behaviour is unchanged
     }
 
     #[test]

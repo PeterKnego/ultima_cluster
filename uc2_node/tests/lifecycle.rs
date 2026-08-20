@@ -7,8 +7,10 @@
 //! under `CARGO_TARGET_TMPDIR` (ext4, never the RAM-backed `/tmp` — see
 //! CLAUDE.md "Local box"), and a sole voter that elects itself.
 
-use std::net::{SocketAddr, UdpSocket};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use uc2_log::archive::{Archive, ArchiveConfig};
@@ -145,6 +147,48 @@ fn stop_draining_honours_its_deadline() {
         elapsed < Duration::from_secs(30),
         "a 1 ns deadline must not become an unbounded wait (took {elapsed:?}, got {outcome:?})"
     );
+}
+
+/// M10 (Task 4) smoke: `Node::observability()` sees a live 4-agent bundle
+/// while the node runs, and every agent's flag flips true once the node is
+/// stopped (agents are told to stop and their threads join). The Arcs
+/// returned by `observability()` are cloned BEFORE `stop()` runs (which
+/// consumes the node), so polling them afterwards is genuinely observing the
+/// worker threads exit, not a stale snapshot.
+#[test]
+fn observability_reports_four_agents_alive_then_all_finished_after_stop() {
+    let dir = tempfile::Builder::new()
+        .prefix("uc2-lifecycle-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("tempdir");
+    let (node, _addr) = single_node(&dir.path().join("n0"));
+
+    let obs = node.observability();
+    assert_eq!(obs.agents.len(), 4, "expected exactly 4 agents: {:?}", {
+        obs.agents.iter().map(|(n, _)| *n).collect::<Vec<_>>()
+    });
+    for (name, flag) in &obs.agents {
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::Acquire),
+            "agent {name} already reports finished on a live node"
+        );
+    }
+    let names: Vec<&'static str> = obs.agents.iter().map(|(n, _)| *n).collect();
+    assert_eq!(
+        names,
+        vec!["consensus", "sender", "receiver", "archive"],
+        "agents must be reported in this fixed order regardless of spawn order"
+    );
+
+    node.stop();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for (name, flag) in &obs.agents {
+        while !flag.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "agent {name} never reported finished after stop");
+            std::thread::yield_now();
+        }
+    }
 }
 
 // ------------------------------------------------------- the uc2-node daemon
@@ -299,18 +343,17 @@ fn daemon_refuses_a_volatile_instance_dir_then_warns_when_overridden() {
     let _ = std::fs::remove_dir_all(&inst);
 }
 
-/// `[log]` and `[metrics]` are reserved for M10. The daemon must START with
-/// them present — `deny_unknown_fields` would otherwise make any
-/// forward-looking config a hard refusal — and must SAY they do nothing.
-/// Accepting a section silently is the failure mode this milestone abolishes:
-/// the operator wrote it expecting an effect.
+/// `[log]`/`[metrics]` now have an M10 schema: the daemon must START with
+/// them present, and it must no longer print the old M9 "RESERVED ... NO
+/// effect" notice — the sections act now (Task 7 wires the endpoint itself;
+/// this only pins that the M9-era placeholder notice is gone).
 ///
 /// Note the sections are appended AFTER `[[members]]`, not prepended: a table
 /// header at the top of the document would capture `id`/`bind`/`app_id` into
 /// it. That is also why this test does not reuse `daemon_config`'s `extra`,
 /// which prepends.
 #[test]
-fn daemon_starts_and_announces_the_m10_reserved_sections() {
+fn a_daemon_with_metrics_configured_no_longer_prints_the_reserved_notice() {
     use std::process::Command;
 
     let dir = scratch();
@@ -355,14 +398,164 @@ bind = "127.0.0.1:19605"
 
     assert!(
         out.status.success(),
-        "a config carrying the reserved sections must start and stop cleanly, stderr: {err}"
+        "a config carrying [log]/[metrics] must start and stop cleanly, stderr: {err}"
     );
     assert!(
-        err.contains("RESERVED") && err.contains("NO effect"),
-        "an inert section must never be silently swallowed, got stderr: {err}"
+        !err.contains("RESERVED"),
+        "the M9 placeholder notice must be gone now that the sections have a schema, got stderr: {err}"
     );
+}
+
+// --------------------------------------------------------- M10 Task 7: obs wiring
+
+/// Bind `127.0.0.1:0`, note the port, and drop the listener — a "probably
+/// free" port for a config file that must name a concrete address (an OS
+/// process, unlike an in-process `TcpListener::bind(":0")`, cannot report
+/// the port it landed on back into a file another process reads at spawn
+/// time). The race window between drop and the daemon's own bind is
+/// accepted in-suite, matching the brief.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0").expect("bind ephemeral").local_addr().unwrap().port()
+}
+
+/// A minimal blocking HTTP/1.1 GET: write the request line, half-close the
+/// write side, read the response to EOF (the server sends `Connection:
+/// close`, so EOF marks the end), and split off the status code.
+fn http_get(addr: SocketAddr, path: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).expect("connect to obs endpoint");
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .expect("write request");
+    stream.shutdown(std::net::Shutdown::Write).ok();
+    let mut body = String::new();
+    stream.read_to_string(&mut body).expect("read response");
+    let status = body
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    (status, body)
+}
+
+/// Write a config with a `[metrics]` section AFTER `[[members]]` (a table
+/// header any earlier would swallow `id`/`bind`/`app_id` into it — see the
+/// comment on the sibling test above).
+fn daemon_config_with_metrics(dir: &Path, port: u16, metrics_port: u16) -> (PathBuf, PathBuf) {
+    let inst = dir.join("n1");
+    std::fs::create_dir_all(&inst).unwrap();
+    let cfg = dir.join("node.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"id = 1
+bind = "127.0.0.1:{port}"
+instance_dir = "{}"
+app_id = "lifecycle"
+
+[[members]]
+id = 1
+addr = "127.0.0.1:{port}"
+
+[metrics]
+bind = "127.0.0.1:{metrics_port}"
+"#,
+            inst.display()
+        ),
+    )
+    .unwrap();
+    (cfg, inst)
+}
+
+/// Spawn the daemon with stdout piped, collecting lines into a shared `Vec`
+/// on a background reader thread so the test can poll for a banner while the
+/// process keeps running (the pipe would otherwise fill and stall the child
+/// once its buffer is full).
+fn spawn_daemon_capturing_stdout(cfg: &Path) -> (std::process::Child, Arc<Mutex<Vec<String>>>) {
+    use std::process::Command;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_uc2-node"))
+        .arg("--config")
+        .arg(cfg)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let lines_writer = Arc::clone(&lines);
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            lines_writer.lock().unwrap().push(line);
+        }
+    });
+    (child, lines)
+}
+
+fn wait_for_line(lines: &Mutex<Vec<String>>, needle: &str, deadline: Instant) -> Option<String> {
+    loop {
+        if let Some(found) = lines.lock().unwrap().iter().find(|l| l.contains(needle)).cloned() {
+            return Some(found);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn the_daemon_serves_metrics_when_configured_and_stops_cleanly() {
+    let dir = scratch();
+    let metrics_port = free_port();
+    let (cfg, _inst) = daemon_config_with_metrics(dir.path(), 19710, metrics_port);
+    let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
+
+    let (mut child, lines) = spawn_daemon_capturing_stdout(&cfg);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let banner = wait_for_line(&lines, "observability endpoint on http://", deadline)
+        .expect("banner line naming the observability endpoint never appeared");
     assert!(
-        err.contains("[log]") && err.contains("[metrics]"),
-        "the notice must name the sections, got stderr: {err}"
+        banner.contains(&format!("http://127.0.0.1:{metrics_port}/metrics")),
+        "banner must name the configured addr, got: {banner}"
+    );
+
+    let (status, body) = http_get(metrics_addr, "/metrics");
+    assert_eq!(status, 200, "GET /metrics status, body: {body}");
+    assert!(body.contains("uc2_commit_bytes"), "metrics body missing uc2_commit_bytes: {body}");
+
+    let (status, _) = http_get(metrics_addr, "/healthz");
+    assert_eq!(status, 200, "GET /healthz status");
+
+    let start = Instant::now();
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = child.wait().unwrap();
+    let elapsed = start.elapsed();
+    assert!(status.success(), "clean shutdown must exit 0, got {status:?}");
+    assert!(elapsed < Duration::from_secs(6), "SIGTERM to exit took {elapsed:?}, over the drain budget");
+
+    assert!(
+        TcpStream::connect(metrics_addr).is_err(),
+        "the observability port must be closed after the daemon stops"
+    );
+}
+
+#[test]
+fn the_daemon_without_a_metrics_section_opens_no_port() {
+    let dir = scratch();
+    let (cfg, _inst) = daemon_config(dir.path(), 19711, "127.0.0.1", "");
+
+    let (mut child, lines) = spawn_daemon_capturing_stdout(&cfg);
+    std::thread::sleep(Duration::from_millis(1500));
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = child.wait().unwrap();
+    assert!(status.success(), "clean shutdown must exit 0, got {status:?}");
+
+    let captured = lines.lock().unwrap();
+    assert!(
+        !captured.iter().any(|l| l.contains("observability endpoint")),
+        "no [metrics] section must mean no observability banner, got: {captured:?}"
     );
 }

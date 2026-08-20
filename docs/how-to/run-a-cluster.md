@@ -225,8 +225,25 @@ start with the address check above.
 If something is wrong beyond that, see
 [Diagnose a node](diagnose-a-node.md).
 
+If the node's `[metrics]` section is on, the same question has an HTTP
+answer that a load balancer or an orchestrator can poll directly, without
+`uc2ctl` or host access:
+
+```bash
+curl -s http://127.0.0.1:9600/readyz
+```
+
+`200` means this node is fit to route traffic to (role-aware: a leader also
+needs `can_serve`, a follower just needs to be healthy); `503` names the
+reason in the body. `/healthz` answers the narrower "should this process be
+restarted?" question instead. See
+[Monitor a cluster](monitor-a-cluster.md#the-probe-endpoints) for the full
+probe semantics, and for wiring up Prometheus scraping and alerting instead
+of polling by hand.
+
 ## Where to go next
 
 - Adding or removing members later: [Change cluster membership](change-cluster-membership.md)
 - Bounding disk growth: [Keep the journal from growing without bound](bound-journal-growth.md)
 - Encrypting node traffic: [Encrypt traffic between nodes](encrypt-node-traffic.md)
+- Watching it over time: [Monitor a cluster](monitor-a-cluster.md)

@@ -8,6 +8,8 @@
 //! with a message naming the offending field is strictly better than a
 //! cluster that elects a leader and never commits.
 
+use std::net::SocketAddr;
+
 use uc2_consensus::election::NodeId;
 // The cnc PeerSlots band holds 8 entries; voters + learners share it. Reuse
 // the wire crate's constant rather than a local literal — `uc_protocol`
@@ -18,6 +20,7 @@ use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
 use uc_protocol::v2::datagram::{DATAGRAM_HEADER_LEN, MTU_DEFAULT};
 use uc_protocol::v2::frame::{FRAME_ALIGNMENT, HEADER_LEN, align_frame_len};
 
+use crate::obs::log::LogLevel;
 use crate::{CryptoConfig, NodeConfig};
 
 #[derive(Debug, thiserror::Error)]
@@ -157,54 +160,25 @@ pub struct StartupOptions {
     /// will lose committed data on power loss. Setting this never silences the
     /// startup warning — see [`FsVerdict::VolatileOverridden`].
     pub allow_volatile_fs: bool,
-    /// Which M10-reserved config sections the file actually carried. The
-    /// daemon MUST announce these — see [`ReservedSections`].
-    pub reserved: ReservedSections,
+    /// M10's observability options — see [`ObsOptions`].
+    pub obs: ObsOptions,
 }
 
-/// Config sections this version PARSES but does not yet ACT ON.
-///
-/// The production-readiness spec reserves `[log]` and `[metrics]` for M10. They
-/// are accepted here so that a config written for M10 is not a hard startup
-/// refusal on an M9 node — `NodeConfigFile` is `deny_unknown_fields`, so
-/// without an explicit reservation any forward-looking config is rejected
-/// outright.
-///
-/// Accepting them *silently* would be worse than rejecting them: an operator
-/// who writes `[metrics]` and gets no endpoint and no message has been handed
-/// exactly the silent no-op this milestone exists to abolish. So presence is
-/// recorded here and the daemon warns on every boot, the same never-silent
-/// discipline the volatile-fs override follows.
-///
-/// M9 deliberately does NOT validate the contents of these tables. It cannot:
-/// M10 has not defined their schema, and guessing would either refuse a
-/// legitimate M10 config or lock M10 into M9's guess.
+/// M10 observability options: `[log]`/`[metrics]` from the config file,
+/// typed. Both sections are optional and, like `[purge]`/`[crypto]`, ABSENT
+/// means the feature is off — no `[log]` keeps the default level (`info`);
+/// no `[metrics]` means no endpoint. A later task (Task 7) is what actually
+/// binds `metrics_bind` and applies `log_level`; this module only carries the
+/// typed values out of the config file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ReservedSections {
-    /// A `[log]` table was present.
-    pub log: bool,
-    /// A `[metrics]` table was present.
-    pub metrics: bool,
-}
-
-impl ReservedSections {
-    /// The reserved sections that were present, in config order. Empty on a
-    /// normal boot, so the daemon has nothing to say.
-    pub fn names(&self) -> Vec<&'static str> {
-        let mut v = Vec::new();
-        if self.log {
-            v.push("log");
-        }
-        if self.metrics {
-            v.push("metrics");
-        }
-        v
-    }
-
-    /// True when there is something for the daemon to announce.
-    pub fn any(&self) -> bool {
-        self.log || self.metrics
-    }
+pub struct ObsOptions {
+    /// The structured-log level filter. Defaults to [`LogLevel::Info`] when
+    /// `[log]` is absent or `level` is unstated.
+    pub log_level: LogLevel,
+    /// Where to bind the `/metrics`/`/healthz`/`/readyz` endpoint. `None`
+    /// means `[metrics]` was absent — no endpoint. `Some` when the section
+    /// was present, defaulting to `127.0.0.1:9600` if `bind` was unstated.
+    pub metrics_bind: Option<SocketAddr>,
 }
 
 /// What the durability probe concluded.

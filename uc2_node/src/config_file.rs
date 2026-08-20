@@ -9,12 +9,12 @@
 //! This module does deserialisation ONLY; every semantic rule lives in
 //! [`crate::preflight`].
 //!
-//! There is exactly one deliberate exception to `deny_unknown_fields`: the
-//! `[log]` and `[metrics]` tables the production-readiness spec reserves for
-//! M10 are accepted as opaque tables, so that a config written for M10 does not
-//! refuse to start on an M9 node. Their presence is reported through
-//! [`crate::preflight::ReservedSections`] and announced by the daemon — never
-//! silently ignored.
+//! `[log]` and `[metrics]` are M10's observability sections. Both are
+//! optional and, like `[purge]`/`[crypto]`, ABSENT means the feature is off:
+//! no `[log]` means the default level (`info`); no `[metrics]` means no
+//! endpoint. `deny_unknown_fields` applies to their contents too — a typo
+//! inside either section is a startup refusal naming the key, not a
+//! silently-ignored setting.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -24,7 +24,8 @@ use uc2_consensus::election::NodeId;
 use uc2_crypto::rotation::RotationPolicy;
 use uc2_net::fault::FaultConfig;
 
-use crate::preflight::{ReservedSections, StartupOptions};
+use crate::obs::log::LogLevel;
+use crate::preflight::{ObsOptions, StartupOptions};
 use crate::{CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, NodeConfig, PurgePolicy};
 
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +34,12 @@ pub enum ConfigError {
     Read { path: PathBuf, source: std::io::Error },
     #[error("invalid config file {path}: {source}")]
     Parse { path: PathBuf, source: toml::de::Error },
+    /// A field passed `deny_unknown_fields`/type-checking but failed its own
+    /// semantic parse (today: only `log.level`). `detail` already names the
+    /// field and echoes the bad value — see `LogLevel::from_str` — so this
+    /// variant must not repeat `field` into the message and double it up.
+    #[error("{detail}")]
+    Invalid { field: &'static str, detail: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +64,20 @@ struct CryptoSection {
     rotation_interval_ns: Option<u64>,
     #[serde(default)]
     rotation_bytes: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogSectionFile {
+    #[serde(default)]
+    level: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MetricsSectionFile {
+    #[serde(default)]
+    bind: Option<SocketAddr>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,14 +112,14 @@ struct NodeConfigFile {
     /// silences the startup warning.
     #[serde(default)]
     allow_volatile_fs: bool,
-    /// RESERVED for M10 — parsed, reported, and otherwise inert. See
-    /// [`crate::preflight::ReservedSections`] for why these are accepted as
-    /// opaque tables rather than validated against a schema M9 does not know.
+    /// Structured logging. Absent means the default level (`info`).
     #[serde(default)]
-    log: Option<toml::Table>,
-    /// RESERVED for M10 — see `log` above.
+    log: Option<LogSectionFile>,
+    /// The `/metrics`, `/healthz`, `/readyz` endpoint. Absent means no
+    /// endpoint — the same absent-means-disabled convention as
+    /// `[purge]`/`[crypto]`.
     #[serde(default)]
-    metrics: Option<toml::Table>,
+    metrics: Option<MetricsSectionFile>,
 }
 
 fn default_buffer_bytes() -> usize {
@@ -162,6 +183,13 @@ pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), Confi
         }
         None => CryptoConfig::Disabled,
     };
+    let log_level = match f.log.and_then(|l| l.level) {
+        None => LogLevel::default(),
+        Some(s) => s
+            .parse::<LogLevel>()
+            .map_err(|e| ConfigError::Invalid { field: "log.level", detail: e })?,
+    };
+    let metrics_bind = f.metrics.map(|m| m.bind.unwrap_or_else(|| "127.0.0.1:9600".parse().unwrap()));
 
     Ok((NodeConfig {
         id: f.id,
@@ -183,7 +211,7 @@ pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), Confi
     },
     StartupOptions {
         allow_volatile_fs: f.allow_volatile_fs,
-        reserved: ReservedSections { log: f.log.is_some(), metrics: f.metrics.is_some() },
+        obs: ObsOptions { log_level, metrics_bind },
     }))
 }
 
@@ -195,6 +223,25 @@ mod tests {
         let p = dir.join("node.toml");
         std::fs::write(&p, body).unwrap();
         p
+    }
+
+    /// A single-voter config with none of the optional sections — the
+    /// minimal document every optional-section test appends to.
+    const MINIMAL: &str = r#"
+id = 1
+bind = "10.0.0.1:9100"
+instance_dir = "/srv/uc2/n1"
+app_id = "myapp"
+
+[[members]]
+id = 1
+addr = "10.0.0.1:9100"
+"#;
+
+    fn load_str(body: &str) -> Result<(NodeConfig, StartupOptions), ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), body);
+        load_from_path(&p)
     }
 
     #[test]
@@ -358,72 +405,13 @@ addr = "10.0.0.1:9100"
         crate::preflight::check_semantics(&cfg).expect("the shipped example must be startable");
     }
 
-    /// `[log]` and `[metrics]` are RESERVED for M10 by the production-readiness
-    /// spec (§4: "plus `[log]` and `[metrics]` sections reserved for M10").
-    /// They must PARSE today — with `deny_unknown_fields`, a config written for
-    /// M10 would otherwise be a hard startup refusal on an M9 node — and their
-    /// presence must be REPORTED, because a section that is accepted and
-    /// silently ignored is exactly the silent no-op this milestone abolishes.
-    #[test]
-    fn the_m10_reserved_sections_parse_and_are_reported_as_inert() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = write(
-            dir.path(),
-            r#"
-id = 1
-bind = "10.0.0.1:9100"
-instance_dir = "/srv/uc2/n1"
-app_id = "myapp"
-
-[[members]]
-id = 1
-addr = "10.0.0.1:9100"
-
-[log]
-level = "info"
-
-[metrics]
-bind = "127.0.0.1:9600"
-"#,
-        );
-        let (cfg, opts) = load_from_path(&p).expect("reserved sections must not refuse startup");
-        assert_eq!(cfg.id, 1, "the rest of the config must still map");
-        assert!(opts.reserved.log, "[log] presence must be reported");
-        assert!(opts.reserved.metrics, "[metrics] presence must be reported");
-        assert_eq!(opts.reserved.names(), vec!["log", "metrics"]);
-    }
-
-    /// M9 does not know M10's schema, so it must not pretend to validate one.
-    /// Inventing field names here would either refuse a legitimate M10 config
-    /// or lock M10 into whatever M9 guessed. The table is reserved; its
-    /// contents are M10's to define.
-    #[test]
-    fn a_reserved_section_accepts_keys_m9_has_never_heard_of() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = write(
-            dir.path(),
-            r#"
-id = 1
-bind = "10.0.0.1:9100"
-instance_dir = "/srv/uc2/n1"
-app_id = "myapp"
-
-[[members]]
-id = 1
-addr = "10.0.0.1:9100"
-
-[metrics]
-some_field_invented_in_m10 = 7
-nested = { deeper = true }
-"#,
-        );
-        let (_cfg, opts) = load_from_path(&p).expect("M10's own keys must not refuse startup");
-        assert!(opts.reserved.metrics);
-        assert!(!opts.reserved.log, "an absent section must not be reported");
-    }
-
-    /// Reserving exactly two names must not open the door generally —
-    /// `deny_unknown_fields` is still the posture for everything else.
+    /// `[log]`/`[metrics]` parse into typed [`ObsOptions`] — see the
+    /// `*_sections_parse_into_obs_options` / `absent_sections_mean_off_and_info`
+    /// / `a_bare_metrics_section_gets_the_default_bind` tests below.
+    ///
+    /// Naming exactly two top-level sections must not open the door
+    /// generally — `deny_unknown_fields` is still the posture for everything
+    /// else at the document root.
     #[test]
     fn an_unreserved_unknown_section_is_still_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -450,25 +438,40 @@ level = "info"
         );
     }
 
-    /// A config with neither section reports neither — the default must be
-    /// "nothing inert", so the daemon stays quiet on a normal boot.
     #[test]
-    fn no_reserved_sections_means_nothing_to_announce() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = write(
-            dir.path(),
-            r#"
-id = 1
-bind = "10.0.0.1:9100"
-instance_dir = "/srv/uc2/n1"
-app_id = "myapp"
+    fn log_and_metrics_sections_parse_into_obs_options() {
+        let (_cfg, opts) =
+            load_str(&format!("{MINIMAL}\n[log]\nlevel = \"warn\"\n[metrics]\nbind = \"127.0.0.1:9601\"\n"))
+                .unwrap();
+        assert_eq!(opts.obs.log_level, LogLevel::Warn);
+        assert_eq!(opts.obs.metrics_bind, Some("127.0.0.1:9601".parse().unwrap()));
+    }
 
-[[members]]
-id = 1
-addr = "10.0.0.1:9100"
-"#,
-        );
-        let (_cfg, opts) = load_from_path(&p).unwrap();
-        assert!(opts.reserved.names().is_empty());
+    #[test]
+    fn a_bare_metrics_section_gets_the_default_bind() {
+        let (_cfg, opts) = load_str(&format!("{MINIMAL}\n[metrics]\n")).unwrap();
+        assert_eq!(opts.obs.metrics_bind, Some("127.0.0.1:9600".parse().unwrap()));
+    }
+
+    #[test]
+    fn absent_sections_mean_off_and_info() {
+        let (_cfg, opts) = load_str(MINIMAL).unwrap();
+        assert_eq!(opts.obs.log_level, LogLevel::Info);
+        assert_eq!(opts.obs.metrics_bind, None);
+    }
+
+    #[test]
+    fn a_bad_log_level_is_a_refusal_naming_the_field() {
+        let e = load_str(&format!("{MINIMAL}\n[log]\nlevel = \"verbose\"\n")).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("log.level") && msg.contains("verbose"), "{msg}");
+    }
+
+    #[test]
+    fn a_typo_inside_log_or_metrics_is_now_refused() {
+        // M9 accepted arbitrary keys here (schema undefined); M10 defines it, so
+        // deny_unknown_fields applies.
+        let e = load_str(&format!("{MINIMAL}\n[metrics]\nport = 9600\n")).unwrap_err();
+        assert!(e.to_string().contains("port"), "{e}");
     }
 }

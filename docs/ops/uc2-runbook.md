@@ -16,6 +16,13 @@ path is kept because other documents and tooling cite it.
 - [Keep the journal from growing without bound](../how-to/bound-journal-growth.md)
   — snapshots, then purging, and confirming it works. *Was §5.*
 
+## Observing a cluster
+
+- [Monitor a cluster](../how-to/monitor-a-cluster.md) — enabling
+  `[metrics]`, Prometheus scraping and alert rules, the Grafana dashboard,
+  the `/healthz`/`/readyz` probes, and the structured JSON-lines event
+  vocabulary.
+
 ## Changing a running cluster
 
 - [Change cluster membership without downtime](../how-to/change-cluster-membership.md)

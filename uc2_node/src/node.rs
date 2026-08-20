@@ -342,6 +342,10 @@ struct Rings {
 }
 
 pub struct Node {
+    /// M10 (Task 4): this node's id, captured from `cfg.id` at boot — nothing
+    /// else on `Node` retains it (the consensus SM has its own copy). Exposed
+    /// via [`Node::observability`].
+    node_id: NodeId,
     cnc: Arc<CncPage>,
     term_handle: TermHandle,
     leader_flag: Arc<AtomicBool>,
@@ -402,6 +406,13 @@ pub struct Node {
     /// a forged or revoked handshake attempt was actually REFUSED, not just
     /// that it happened not to succeed within some timeout.
     crypto_handshake_failures: Arc<AtomicU64>,
+    /// M10 (Task 4): mirrors `cfg.purge != PurgePolicy::Disabled` — neither
+    /// retained elsewhere on `Node` (the policy itself lives on the consensus
+    /// SM). Exposed via [`Node::observability`].
+    purge_enabled: bool,
+    /// M10 (Task 4): mirrors `cfg.journal_segment_bytes`, not otherwise kept
+    /// on `Node`. Exposed via [`Node::observability`].
+    journal_segment_bytes: u64,
     // Held for the node's life: the instance flock and the IPC ring mmaps.
     _instance: InstanceDir,
     _rings: Rings,
@@ -1158,6 +1169,7 @@ impl Node {
             adopted_incoming: 0,
             last_leader_map: Vec::new(),
             halt_removed: false,
+            last_flags: 0,
             config_bytes: Arc::clone(&config_bytes),
             last_admin_seq: 0,
             pending_admin_fwd: None,
@@ -1181,6 +1193,7 @@ impl Node {
             AgentRunner::spawn("uc2-consensus", IdleStrategy::Yield, move || consensus.do_work())?;
 
         Ok(Node {
+            node_id: cfg.id,
             cnc,
             term_handle,
             leader_flag,
@@ -1200,6 +1213,8 @@ impl Node {
             crypto_epoch,
             crypto,
             crypto_handshake_failures,
+            purge_enabled: !matches!(cfg.purge, PurgePolicy::Disabled),
+            journal_segment_bytes: cfg.journal_segment_bytes,
             _instance: instance,
             _rings: rings,
             // Stop order: consensus first (stops writing the term handle), then
@@ -1387,6 +1402,37 @@ impl Node {
     /// nothing (a later legitimate report still ranks).
     pub fn reports_implausible(&self) -> u64 {
         self.reports_implausible.load(Ordering::Relaxed)
+    }
+
+    /// M10 (Task 4): a read-only bundle of this node's `Arc`-shared counters,
+    /// flags, and config values, for a later task's metrics encoder to render
+    /// into a series. A straight clone-and-collect — every `Arc` cloned here
+    /// is the SAME allocation the owning agent writes through, so this adds
+    /// no new synchronization and never goes stale relative to the source.
+    ///
+    /// `agents` is always exactly 4 entries in the FIXED order `consensus,
+    /// sender, receiver, archive` — NOT spawn order (spawn order is archive,
+    /// sender, receiver, consensus) — because a later task's metric labels
+    /// are positional against this order.
+    pub fn observability(&self) -> crate::obs::ObsSources {
+        crate::obs::ObsSources {
+            node_id: self.node_id,
+            cnc: Arc::clone(&self.cnc),
+            sender: Arc::clone(&self.sender_stats),
+            receiver: Arc::clone(&self.route_drops),
+            truncations: Arc::clone(&self.truncations),
+            wipes: Arc::clone(&self.wipes),
+            reports_unattested: Arc::clone(&self.reports_unattested),
+            reports_implausible: Arc::clone(&self.reports_implausible),
+            crypto_handshake_failures: Arc::clone(&self.crypto_handshake_failures),
+            crypto_enabled: self.crypto.is_some(),
+            purge_enabled: self.purge_enabled,
+            journal_segment_bytes: self.journal_segment_bytes,
+            agents: [("consensus", 0usize), ("sender", 1), ("receiver", 2), ("archive", 3)]
+                .into_iter()
+                .map(|(name, idx)| (name, self.agents[idx].finished_flag()))
+                .collect(),
+        }
     }
 
     /// Consensus events dropped because the NetEvent channel was full (T7
@@ -1644,6 +1690,11 @@ struct Consensus {
     /// permanent park, never cleared (fail-stop; a removed node's only path
     /// back in is a fresh join under a new id/config, not un-halting).
     halt_removed: bool,
+    /// M10: the `flags` value `publish_status` last wrote to the cnc page —
+    /// initialised to the boot value (0: neither leader nor serving until
+    /// the first publish). Compared each cycle so `serving_changed` fires
+    /// only on the `NODE_FLAG_CAN_SERVE` bit's edge, not every cycle.
+    last_flags: u64,
     /// M7 Task 6: the snapshot-session config-carry cache — refreshed with the
     /// newly-adopted config's encoded bytes on every `Action::ConfigAdopted`;
     /// read by the sender's `SnapshotSource` closure (a separate `Arc` clone) so
@@ -2594,6 +2645,7 @@ impl Consensus {
             }
             let _ = self.trunc_tx.try_send(ArchiveCmd::AdoptFloor { pos });
         }
+        crate::obs_event!(Info, "snapshot_installed", node = self.id as u64, pos = pos);
         true
     }
 
@@ -2710,9 +2762,10 @@ impl Consensus {
     /// M7: once `halt_removed`, LEADER/CAN_SERVE are forced OFF regardless of
     /// `leader_flag`/`sm.can_serve()` — an attaching service/client must never
     /// mistake a removed, permanently-parked node for a live leader/server.
-    fn publish_status(&self) {
+    fn publish_status(&mut self) {
         let status = self.cnc.status();
-        status.term.store_release(self.sm.current_term() as u64);
+        let term = self.sm.current_term();
+        status.term.store_release(term as u64);
         let mut flags = 0u64;
         if !self.halt_removed {
             if self.leader_flag.load(Ordering::Relaxed) {
@@ -2723,6 +2776,18 @@ impl Consensus {
             }
         }
         status.flags.store_release(flags);
+        // M10: edge-detect the CAN_SERVE bit only — one branch, no allocation
+        // on the untaken (steady-state) path.
+        if (flags ^ self.last_flags) & NODE_FLAG_CAN_SERVE != 0 {
+            crate::obs_event!(
+                Info,
+                "serving_changed",
+                node = self.id as u64,
+                term = term as u64,
+                can_serve = flags & NODE_FLAG_CAN_SERVE != 0
+            );
+        }
+        self.last_flags = flags;
         let now_ns = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -3668,8 +3733,15 @@ impl Consensus {
                 if let Some(crypto) = self.crypto.as_ref() {
                     crypto.on_became_leader();
                 }
+                crate::obs_event!(
+                    Info,
+                    "became_leader",
+                    node = self.id as u64,
+                    term = term as u64,
+                    base = base
+                );
             }
-            Action::BecomeFollower { term, .. } => {
+            Action::BecomeFollower { term, leader } => {
                 // T7 review finding 1: stepping down from leader (or adopting a
                 // new term as follower) must not leave a stale nonce-dedup /
                 // forward cache answerable by a later duplicate datagram.
@@ -3693,6 +3765,21 @@ impl Consensus {
                     self.cnc.status().leader_hint.store_release(u64::MAX);
                 }
                 self.adopted_term = term;
+                match leader {
+                    Some(leader) => crate::obs_event!(
+                        Info,
+                        "became_follower",
+                        node = self.id as u64,
+                        term = term as u64,
+                        leader = leader as u64
+                    ),
+                    None => crate::obs_event!(
+                        Info,
+                        "became_follower",
+                        node = self.id as u64,
+                        term = term as u64
+                    ),
+                }
             }
             Action::AdvanceCommit { commit } => {
                 // Diagnostic only, and OFF the hot path unless UC2_TRUNC_TRACE
@@ -3798,6 +3885,13 @@ impl Consensus {
                 self.trunc_tx
                     .send(ArchiveCmd::Truncate { epoch, to })
                     .expect("archive channel closed");
+                crate::obs_event!(
+                    Warn,
+                    "log_truncated",
+                    node = self.id as u64,
+                    epoch = epoch,
+                    to = to
+                );
             }
             Action::PersistTermMap { new_map } => {
                 self.state
@@ -3812,6 +3906,7 @@ impl Consensus {
                 // `Truncate { to: 0 }` follows in the same action batch. Count it
                 // (distinct from an ordinary truncate) for observability + tests.
                 self.wipes.fetch_add(1, Ordering::Relaxed);
+                crate::obs_event!(Warn, "log_wiped", node = self.id as u64);
             }
             Action::ConfigAdopted { position, config, prev_position, prev } => {
                 // M7: the SM adopted a higher-version `ClusterConfig` — via the
@@ -3874,12 +3969,26 @@ impl Consensus {
                         self.id
                     );
                 }
+                crate::obs_event!(
+                    Info,
+                    "config_adopted",
+                    node = self.id as u64,
+                    position = position,
+                    version = config.version,
+                    prev_position = prev_position
+                );
             }
             Action::HaltRemoved => {
                 // M7: this node is not a member of the just-adopted config (and
                 // is not a leader mid-self-removal — that case keeps serving
                 // until its own removal commits). Fail-stop: park permanently.
-                eprintln!("node {}: removed from cluster config — halting", self.id);
+                crate::obs_event!(
+                    Error,
+                    "halt_removed",
+                    node = self.id as u64,
+                    term = self.sm.current_term() as u64,
+                    msg = "removed from cluster config — halting"
+                );
                 self.halt();
             }
             Action::StepDownRemoved => {
@@ -3890,7 +3999,13 @@ impl Consensus {
                 // `HaltRemoved`. The remaining C_new voters elect among
                 // themselves; this leader never depended on beyond the commit
                 // that just landed.
-                eprintln!("node {}: removed from cluster (self-removal committed) — halting", self.id);
+                crate::obs_event!(
+                    Warn,
+                    "stepdown_removed",
+                    node = self.id as u64,
+                    term = self.sm.current_term() as u64,
+                    msg = "removed from cluster (self-removal committed) — halting"
+                );
                 self.halt();
             }
         }
@@ -5089,6 +5204,7 @@ mod tests {
             adopted_incoming: 0,
             last_leader_map: Vec::new(),
             halt_removed: false,
+            last_flags: 0,
             config_bytes: Arc::new(Mutex::new(Vec::new())),
             last_admin_seq: 0,
             pending_admin_fwd: None,

@@ -19,6 +19,9 @@ keeping the disk from filling once they are there.
   hang on shutdown, and what a planned restart costs.
 - [Keep the journal from growing without bound](bound-journal-growth.md) —
   snapshots first, then purging, and how to tell that it is working.
+- [Monitor a cluster](monitor-a-cluster.md) — Prometheus scraping, the alert
+  rules, the Grafana dashboard, the `/healthz`/`/readyz` probes, and the
+  structured-event vocabulary.
 
 ## Changing a running cluster
 

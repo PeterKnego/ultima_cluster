@@ -12,9 +12,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
+use uc2_node::obs::http::ObsServer;
 use uc2_node::preflight::FsVerdict;
 use uc2_node::{DrainOutcome, Node, config_file, preflight};
 
@@ -39,16 +40,6 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // A config section this version parses but does not act on must never be
-    // silently swallowed — the operator wrote it expecting an effect. Same
-    // never-silent discipline as the durability override below.
-    if opts.reserved.any() {
-        eprintln!(
-            "uc2-node: NOTE: config section(s) [{}] are RESERVED for a future release \
-             and have NO effect in this version; they were parsed and ignored.",
-            opts.reserved.names().join("], [")
-        );
-    }
     match preflight::check(&cfg, &opts) {
         Ok(FsVerdict::Durable) => {}
         // The override suppresses the refusal, never the notice — and it is
@@ -66,6 +57,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    uc2_node::obs::log::set_level(opts.obs.log_level);
 
     let id = cfg.id;
     let bind = cfg.bind;
@@ -78,6 +70,22 @@ fn main() -> ExitCode {
     };
     println!("uc2-node: node {id} listening on {bind}");
 
+    let obs = node.observability();
+    let mut srv: Option<ObsServer> = None;
+    if let Some(addr) = opts.obs.metrics_bind {
+        match ObsServer::serve(obs.clone(), addr) {
+            Ok(s) => {
+                println!("uc2-node: observability endpoint on http://{}/metrics", s.local_addr());
+                srv = Some(s);
+            }
+            Err(e) => {
+                eprintln!("uc2-node: failed to bind observability endpoint {addr}: {e}");
+                node.stop();
+                return ExitCode::from(1);
+            }
+        }
+    }
+
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         if let Err(e) = signal_hook::flag::register(sig, Arc::clone(&stop)) {
@@ -86,6 +94,29 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     }
+
+    // Derived-events pass: how often (every 10th 100ms tick, ~1s) and how
+    // often each event may actually be recorded (rate limit) are two
+    // separate cadences. `last_*` tracks the value AS OF THE LAST PASS (so
+    // the delta each pass reflects real change since ~1s ago, no matter how
+    // recently an event last fired); `last_*_emit` tracks when an event
+    // last actually printed a record, independent of the delta cadence.
+    const DERIVED_EVENTS_EVERY_N_TICKS: u64 = 10;
+    const DERIVED_EVENT_RATE_LIMIT: Duration = Duration::from_secs(10);
+    let mut tick: u64 = 0;
+    let mut last_naks_dropped = obs.sender.naks_dropped.load(Ordering::Relaxed);
+    let mut last_seal_failures = obs.sender.seal_failures.load(Ordering::Relaxed)
+        + obs.receiver.seal_failures.load(Ordering::Relaxed);
+    // The BASELINE the `seal_failures` record's `count` is measured against
+    // — unlike `last_seal_failures` (which advances every pass so the
+    // edge-trigger sees real ~1s-window change), this only advances when a
+    // record actually fires, so a suppressed (rate-limited) pass's failures
+    // are folded into the NEXT record instead of being silently dropped.
+    let mut last_emitted_seal_failures = last_seal_failures;
+    let mut last_snapshot_pos = obs.cnc.snapshots().service_snapshot_pos.load_acquire();
+    let mut last_nak_storm_emit: Option<Instant> = None;
+    let mut last_seal_failures_emit: Option<Instant> = None;
+    let mut last_snapshot_emit: Option<Instant> = None;
 
     let mut was_leader = None;
     while !stop.load(Ordering::Relaxed) {
@@ -98,10 +129,87 @@ fn main() -> ExitCode {
             );
             was_leader = Some(is_leader);
         }
+
+        tick += 1;
+        if tick.is_multiple_of(DERIVED_EVENTS_EVERY_N_TICKS) {
+            // A dead agent makes everything downstream (the drain, the obs
+            // endpoint) meaningless — fail fast so systemd's
+            // Restart=on-failure takes over; the restarted node replays its
+            // journal. Deliberately skips stop_draining: Node's Drop
+            // swallows the panic that killed the agent, but stop_draining
+            // would re-raise it.
+            if let Some((name, _)) = obs.agents.iter().find(|(_, f)| f.load(Ordering::Acquire)) {
+                uc2_node::obs_event!(Error, "agent_failstopped", agent = *name);
+                eprintln!("uc2-node: agent {name} fail-stopped; exiting");
+                return ExitCode::FAILURE;
+            }
+
+            let now = Instant::now();
+
+            let naks_dropped = obs.sender.naks_dropped.load(Ordering::Relaxed);
+            let naks_served = obs.sender.naks_served.load(Ordering::Relaxed);
+            if naks_dropped > last_naks_dropped
+                && last_nak_storm_emit
+                    .is_none_or(|t| now.duration_since(t) >= DERIVED_EVENT_RATE_LIMIT)
+            {
+                uc2_node::obs_event!(
+                    Warn,
+                    "nak_storm",
+                    node = id as u64,
+                    naks_dropped = naks_dropped,
+                    naks_served = naks_served,
+                );
+                last_nak_storm_emit = Some(now);
+            }
+            last_naks_dropped = naks_dropped;
+
+            let seal_failures = obs.sender.seal_failures.load(Ordering::Relaxed)
+                + obs.receiver.seal_failures.load(Ordering::Relaxed);
+            if seal_failures > last_seal_failures
+                && last_seal_failures_emit
+                    .is_none_or(|t| now.duration_since(t) >= DERIVED_EVENT_RATE_LIMIT)
+            {
+                // WINDOW delta since the last EMITTED record, not the
+                // cumulative total — a reader must see "how many failed
+                // since I last heard about this", or a steady 1/10s trickle
+                // reads as an accelerating storm every time it prints.
+                uc2_node::obs_event!(
+                    Warn,
+                    "seal_failures",
+                    node = id as u64,
+                    count = seal_failures - last_emitted_seal_failures,
+                    is_leader = is_leader,
+                );
+                last_seal_failures_emit = Some(now);
+                last_emitted_seal_failures = seal_failures;
+            }
+            last_seal_failures = seal_failures;
+
+            let snapshot_pos = obs.cnc.snapshots().service_snapshot_pos.load_acquire();
+            if snapshot_pos > last_snapshot_pos
+                && last_snapshot_emit
+                    .is_none_or(|t| now.duration_since(t) >= DERIVED_EVENT_RATE_LIMIT)
+            {
+                uc2_node::obs_event!(
+                    Info,
+                    "snapshot_published",
+                    node = id as u64,
+                    pos = snapshot_pos,
+                );
+                last_snapshot_emit = Some(now);
+            }
+            last_snapshot_pos = snapshot_pos;
+        }
+
         std::thread::sleep(Duration::from_millis(100));
     }
 
     println!("uc2-node: signalled, draining");
+    if let Some(srv) = srv {
+        // Scrapes must not race teardown: stop the HTTP thread before the
+        // agents it reads through start winding down.
+        srv.stop();
+    }
     match node.stop_draining(Duration::from_secs(args.drain_timeout_secs)) {
         DrainOutcome::Drained => println!("uc2-node: drained, stopped cleanly"),
         DrainOutcome::DeadlineExpired { append, durable } => eprintln!(
