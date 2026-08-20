@@ -448,6 +448,71 @@ fn run_restore(a: &RestoreArgs) -> anyhow::Result<()> {
 
 // ---------------------------------------------------------------- M11 Task 4: quorum-loss
 
+/// Fix round 1, Important 5: the surviving node's own on-disk instance dir
+/// is identified purely by the operator-supplied `--instance-dir`; a wrong
+/// `--node-id`/`--app-id` typed against the RIGHT directory (or vice versa)
+/// would otherwise be forced silently. Cross-check them against a leftover
+/// `cnc2.dat`'s own `meta()` — WHEN ONE IS PRESENT. `cnc2.dat` is volatile
+/// (boot recreates it unconditionally, per `docs/reference/instance-directory.md`'s
+/// durable/volatile split), so its absence is expected on a truly fresh
+/// dir, or one whose cnc file was already cleaned up — not an error, just
+/// nothing to cross-check (printed, not silent). Its PRESENCE, though — the
+/// ordinary case for a survivor that was just SIGKILLed or cleanly stopped —
+/// is a strong, free signal: `CncPage::open_file` already validates
+/// magic/crc/version and the `app_id` match (returning the actual `app_id`
+/// on mismatch via `CncError::AppIdMismatch`, exactly what `run_status`
+/// relies on for every other command), so this reuses that same call rather
+/// than reimplementing header decoding.
+fn check_leftover_cnc_matches(a: &ForceSingleMemberArgs) -> anyhow::Result<()> {
+    let cnc_path = a.instance_dir.join("cnc2.dat");
+    if !cnc_path.is_file() {
+        println!(
+            "note: no leftover cnc2.dat in {:?} (volatile — recreated by boot); skipping the \
+             --node-id/--app-id cross-check",
+            a.instance_dir
+        );
+        return Ok(());
+    }
+    match CncPage::open_file(&cnc_path, &a.app_id) {
+        Ok(cnc) => {
+            let leftover_id = cnc.meta().node_id;
+            if leftover_id != a.node_id {
+                anyhow::bail!(
+                    "refusing: leftover cnc2.dat in {:?} belongs to node_id {leftover_id}, not \
+                     --node-id {} — wrong instance dir?",
+                    a.instance_dir,
+                    a.node_id
+                );
+            }
+            Ok(())
+        }
+        Err(uc2_log::cnc::CncError::AppIdMismatch { expected, actual }) => {
+            anyhow::bail!(
+                "refusing: leftover cnc2.dat in {:?} belongs to app_id {actual:?}, not --app-id \
+                 {expected:?} — wrong instance dir?",
+                a.instance_dir
+            )
+        }
+        Err(e) => {
+            println!(
+                "note: leftover cnc2.dat in {:?} could not be read ({e}) — skipping the \
+                 --node-id/--app-id cross-check",
+                a.instance_dir
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Fix round 1, Important 6: ONE `uc2_node::recovery::plan_force_single_member`
+/// call acquires the instance flock, reads the recovered config, and builds
+/// the (not-yet-written) forced record — all under that single lock. The
+/// data-loss statement is printed from the resulting `PlannedForce` (which
+/// keeps holding the lock), then `PlannedForce::commit` performs the one
+/// write, still under the SAME lock. There is no separate `recovered_config`
+/// call and no second lock/open/recover cycle in between — unlike the
+/// original version of this function, this is no longer "read, release,
+/// re-acquire, write."
 fn run_force_single_member(a: &ForceSingleMemberArgs) -> anyhow::Result<()> {
     if a.confirm_cluster != a.app_id {
         anyhow::bail!(
@@ -458,30 +523,13 @@ fn run_force_single_member(a: &ForceSingleMemberArgs) -> anyhow::Result<()> {
         );
     }
 
-    // The data-loss statement, printed BEFORE anything is written. Needs the
-    // recovered config's durable frontier and dropped-peer set, which
-    // `recovered_config` (a pure read under the same flock discipline
-    // `force_single_member` itself uses) gives us without writing anything —
-    // if this read refuses (a node is running, say), nothing below runs
-    // either.
-    let recovered = uc2_node::recovery::recovered_config(&a.instance_dir)
-        .map_err(|e| anyhow::anyhow!("force-single-member: {e}"))?;
-    let dropped: Vec<u32> = recovered
-        .voters
-        .iter()
-        .chain(recovered.learners.iter())
-        .map(|(id, _)| *id)
-        .filter(|&id| id != a.node_id)
-        .collect();
-    println!(
-        "forcing node {} to a single-member cluster at durable position {}: any write \
-         acknowledged by the old quorum but not held in this node's journal is LOST; peers {:?} \
-         are dropped from the config and must be wiped and rejoined as fresh learners.",
-        a.node_id, recovered.durable, dropped
-    );
+    check_leftover_cnc_matches(a)?;
 
-    let report = uc2_node::recovery::force_single_member(&a.instance_dir, a.node_id)
+    let planned = uc2_node::recovery::plan_force_single_member(&a.instance_dir, a.node_id)
         .map_err(|e| anyhow::anyhow!("force-single-member: {e}"))?;
+    println!("{}", planned.data_loss_statement());
+
+    let report = planned.commit().map_err(|e| anyhow::anyhow!("force-single-member: {e}"))?;
     println!("old_version={}", report.old_version);
     println!("new_version={}", report.new_version);
     println!("durable={}", report.durable);

@@ -428,6 +428,36 @@ fn addr_to_wire(addr: SocketAddr) -> (u32, u16) {
     }
 }
 
+/// Fix round 1, Minor 10: `PromoteLearner` can legitimately refuse with
+/// reason 10 (`NotCaughtUp`) even after the learner's own `config_version`
+/// has converged — config convergence and DATA/durable catch-up are two
+/// different things, and a single-shot promote right after the version
+/// check is a latent race. Retries on `NotCaughtUp` (reason 10) or a `Retry`
+/// status (2) until it succeeds or `secs` elapses; any OTHER refusal reason
+/// is a real failure, not retried.
+fn promote_until_ok(cnc: &CncPage, id: u32, secs: u64) -> AdminResp {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let resp = admin_request(cnc, 2 /* PromoteLearner */, id, 0, 0, 20);
+        if resp.status == 0 {
+            return resp;
+        }
+        let retryable = resp.status == 2 || (resp.status == 1 && resp.reason == 10);
+        assert!(
+            retryable,
+            "promote refused for a non-retryable reason: status={} reason={}",
+            resp.status, resp.reason
+        );
+        assert!(
+            Instant::now() < deadline,
+            "promote never succeeded within {secs}s (last status={} reason={})",
+            resp.status,
+            resp.reason
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// The `uc2ctl` mutating-command flow, minus the bin (same trimmed-copy
 /// convention as this file's `spawn_node_multi`/`free_addr` above, and the
 /// same choreography `uc2_node/tests/reconfig.rs`'s `admin_request` uses):
@@ -629,7 +659,15 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
     let resp = admin_request(&survivor_cnc, 1 /* AddLearner */, fresh_id, ip, port, 20);
     assert_eq!(resp.status, 0, "add-learner refused: reason={}", resp.reason);
 
-    node_procs.push(Some(spawn_node_multi(&fresh_dir, fresh_id, fresh_addr, &members_str)));
+    // Fix round 1, Minor 9: name itself in its own `--members` (the "runbook
+    // shape" every other node in this file — and every node in the codebase
+    // — boots with; the crashtest node bin has no separate `--learners` flag,
+    // so this is the only way a real, `preflight`-checked node's own
+    // `SelfNotAMember` refusal would be satisfied for this id). Harmless
+    // either way for THIS bin (preflight isn't invoked here), but this keeps
+    // the fixture honest about what a real operator would actually type.
+    let fresh_members_str = format!("{members_str},{fresh_id}@{fresh_addr}");
+    node_procs.push(Some(spawn_node_multi(&fresh_dir, fresh_id, fresh_addr, &fresh_members_str)));
     wait_for_ready(&fresh_dir, Duration::from_secs(10));
     svc_procs.push(Some(spawn_service(&fresh_dir)));
     dirs.push(fresh_dir.clone());
@@ -645,7 +683,7 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let promote_resp = admin_request(&survivor_cnc, 2 /* PromoteLearner */, fresh_id, 0, 0, 20);
+    let promote_resp = promote_until_ok(&survivor_cnc, fresh_id, 20);
     assert_eq!(promote_resp.status, 0, "promote refused: reason={}", promote_resp.reason);
 
     // A 2-voter cluster is genuinely operational: one more CAS must commit.

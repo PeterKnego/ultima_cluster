@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use uc2_log::state::{ConfigRecord, NodeState, StoredConfig, StoredMember};
-use uc2_node::recovery::{force_single_member, recovered_config};
+use uc2_node::recovery::{data_loss_statement, force_single_member, recovered_config};
 use uc2_node::{CryptoConfig, DEFAULT_JOURNAL_SEGMENT_BYTES, Node, NodeConfig, PurgePolicy};
 
 const PAYLOAD: usize = 96;
@@ -156,6 +156,86 @@ fn force_leaves_pre_existing_tombstones_untouched() {
 
     let recovered = recovered_config(dir.path()).expect("recovered_config");
     assert_eq!(recovered.tombstones, vec![99]);
+}
+
+/// Fix round 1, Critical 1 — the reviewer's empirical probe, made
+/// permanent: BEFORE the fix, a totally fresh, never-booted instance dir hit
+/// the "not a member" refusal only AFTER `recover_config_record`'s
+/// genesis-seed path had already PERSISTED an empty, zero-voter version-0
+/// record (`state.config_record()` was `None` going in, so the seed fired).
+/// This proves `state/config.state` is byte-identical before and after a
+/// refused call — not merely that the call returns `Err`.
+#[test]
+fn force_refuses_an_uninitialized_dir_without_persisting() {
+    let dir = tempdir();
+    std::fs::create_dir_all(dir.path().join("state")).unwrap();
+    // Materialize state/*.state (create-if-absent StableValue files, no
+    // value ever stored) exactly as the recovery path itself would, so
+    // `before` is a genuine "freshly created, never written" byte image.
+    drop(NodeState::open(&dir.path().join("state")).unwrap());
+    let config_state = dir.path().join("state").join("config.state");
+    let before = std::fs::read(&config_state).unwrap();
+
+    let err = force_single_member(dir.path(), 5)
+        .expect_err("a fresh instance dir has no config record yet");
+    assert!(
+        err.to_string().to_lowercase().contains("no durable config record"),
+        "unexpected message: {err}"
+    );
+
+    let after = std::fs::read(&config_state).unwrap();
+    assert_eq!(before, after, "force_single_member must not write anything when it refuses");
+    assert!(
+        NodeState::open(&dir.path().join("state")).unwrap().config_record().is_none(),
+        "no record must have been persisted by the refused call"
+    );
+}
+
+/// Fix round 1, Critical 1: the doubly-ahead compounding-crash window
+/// (`recover_config_record`'s own doc: two config adoptions durably
+/// persisted before any archive catch-up, in the same crash — nothing
+/// genuine left to revert to) must refuse rather than silently falling back
+/// to an empty seed that would overwrite the crashed survivor's real
+/// membership. Pre-seeds a record directly (the `learner.rs:412` pattern)
+/// with BOTH `position` and `prev_position` above the recovered durable
+/// frontier (`0`, for a fresh empty journal).
+#[test]
+fn force_refuses_the_doubly_ahead_crash_window_without_persisting() {
+    let dir = tempdir();
+    let addr: SocketAddr = "127.0.0.1:59932".parse().unwrap();
+    std::fs::create_dir_all(dir.path().join("state")).unwrap();
+    let cfg = StoredConfig {
+        version: 5,
+        voters: vec![stored_member(1, addr)],
+        learners: Vec::new(),
+        tombstones: Vec::new(),
+    };
+    let prev_cfg = StoredConfig { version: 4, ..cfg.clone() };
+    let rec = ConfigRecord { position: 200, config: cfg, prev_position: 100, prev: prev_cfg };
+    NodeState::open(&dir.path().join("state")).unwrap().store_config_record(&rec).unwrap();
+    let config_state = dir.path().join("state").join("config.state");
+    let before = std::fs::read(&config_state).unwrap();
+
+    let err = force_single_member(dir.path(), 1)
+        .expect_err("must refuse the doubly-ahead crash window, not fall back to an empty seed");
+    assert!(err.to_string().to_lowercase().contains("doubly-ahead"), "unexpected message: {err}");
+
+    let after = std::fs::read(&config_state).unwrap();
+    assert_eq!(before, after, "force_single_member must not write anything when it refuses");
+}
+
+/// Fix round 1, Important 3: `uc2ctl`'s data-loss statement is lifted into
+/// `uc2_node::recovery::data_loss_statement` so it cannot drift from what is
+/// tested — pinned here, byte-for-byte, against the brief's exact wording.
+#[test]
+fn data_loss_statement_pins_the_exact_wording() {
+    let msg = data_loss_statement(2, 128, &[0, 1]);
+    assert_eq!(
+        msg,
+        "forcing node 2 to a single-member cluster at durable position 128: any write \
+         acknowledged by the old quorum but not held in this node's journal is LOST; peers \
+         [0, 1] are dropped from the config and must be wiped and rejoined as fresh learners."
+    );
 }
 
 /// After a force, a fresh boot on the survivor's own instance dir must adopt
