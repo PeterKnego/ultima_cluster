@@ -426,6 +426,24 @@ impl SegmentFile {
         Ok(self.file.metadata()?.len())
     }
 
+    /// Whether ANY byte in `[from, physical EOF)` is non-zero. Used by
+    /// `Journal::open`'s heal path to skip a needless physical re-zero
+    /// (`preallocate_to`, a `fallocate`/write + `sync_data` barrier) when
+    /// there is nothing to erase — `scan()`'s `had_torn_tail` is true
+    /// whenever ANY bytes trail the last decoded record, which for a
+    /// preallocated segment is the ORDINARY clean-shutdown case (the
+    /// untouched zero preallocation), not just a genuine crash-torn
+    /// residue. A plain sequential read (no durability barrier), typically
+    /// already warm in the page cache from the scan that just ran over the
+    /// same bytes.
+    pub(crate) fn has_nonzero_residue_from(&self, from: u64) -> Result<bool, JournalError> {
+        let mut f = self.file.try_clone()?;
+        f.seek(SeekFrom::Start(from))?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        Ok(buf.iter().any(|&b| b != 0))
+    }
+
     /// Physically fill from the logical cursor `self.size` out to `total_len`
     /// per `fill`, WITHOUT advancing the cursor. Leaves the tail readable as
     /// zeros so appends overwrite already-written blocks (metadata-free commit).

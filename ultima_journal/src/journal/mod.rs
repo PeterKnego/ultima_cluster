@@ -182,21 +182,49 @@ impl Journal {
                         // — so EVERY subsequent boot heals here again, then
                         // Phase 2b replays the SAME leftover intent and hits
                         // the SAME un-erased residue: a permanently
-                        // unbootable node. Re-run the exact zero-fill used to
-                        // build a preallocated segment from scratch
-                        // (`preallocate_to`, already used elsewhere in this
-                        // fn for a segment that predates the flag) from the
-                        // healed cursor out to `segment_size_bytes` —
-                        // idempotent, and it physically overwrites the
-                        // residue with real zeros BEFORE Phase 2 / Phase 2b
-                        // below can ever observe it. Scoped to the active
-                        // segment only (never touches a sealed segment's
-                        // physical size).
-                        seg.preallocate_to(
-                            config.segment_size_bytes,
-                            config.prealloc_fill,
-                            config.prealloc_fill_chunk_bytes,
-                        )?;
+                        // unbootable node.
+                        //
+                        // ROUND 2: zeroing only up to `segment_size_bytes` is
+                        // NOT enough. `write_batch`'s roll decision
+                        // (`writer.rs`: `need_new = projected >=
+                        // st.segment_size`) is evaluated BEFORE the record
+                        // that crosses the boundary is added — the record
+                        // that pushes `projected` over the limit is still
+                        // written into the CURRENT segment, only the NEXT
+                        // record rolls. So a segment's actual physical size
+                        // ending up past `segment_size_bytes` is the ORDINARY
+                        // geometry of a nearly-full segment, not an edge
+                        // case — and a torn record can straddle that
+                        // boundary too. Zeroing only to `segment_size_bytes`
+                        // would early-return as a no-op (`preallocate_to`'s
+                        // own `total_len <= self.size` guard) whenever the
+                        // healed cursor already exceeds it, leaving the real
+                        // residue on disk. It also breaks if
+                        // `segment_size_bytes` is ever reduced between boots
+                        // for the same reason. Zero through the segment's
+                        // TRUE physical end instead: `preallocate_to` fills
+                        // `[cursor, total_len)` without extending past
+                        // `total_len`, and passing `total_len ==
+                        // physical_len` never grows `i_size` further — it
+                        // only re-zeros what is already there.
+                        let zero_to = config.segment_size_bytes.max(seg.physical_len()?);
+                        // Skip the (fallocate/write + `sync_data`) barrier
+                        // entirely when there is nothing to erase: `scan()`'s
+                        // `had_torn_tail` is true whenever ANY bytes trail
+                        // the last record, which for a preallocated segment
+                        // is the ORDINARY clean-shutdown case (the untouched
+                        // zero preallocation) on essentially every boot, not
+                        // just a genuine crash-torn residue. Without this
+                        // guard the heal branch would re-zero-and-fsync the
+                        // active segment's tail on every single preallocated
+                        // open, at a real cost against the boot-time bar.
+                        if seg.has_nonzero_residue_from(scan.last_durable_offset)? {
+                            seg.preallocate_to(
+                                zero_to,
+                                config.prealloc_fill,
+                                config.prealloc_fill_chunk_bytes,
+                            )?;
+                        }
                     }
                     scan
                 } else {
@@ -1651,6 +1679,86 @@ mod tests {
             !dir_path.join("truncate.intent").exists(),
             "the intent must be consumed, not left to wedge every subsequent boot"
         );
+    }
+
+    /// ROUND 2 regression: a torn record whose bytes STRADDLE
+    /// `config.segment_size_bytes`. `write_batch`'s roll decision
+    /// (`writer.rs`: `need_new = projected >= st.segment_size`) is evaluated
+    /// BEFORE the record that crosses the boundary is added — the record
+    /// that pushes `projected` past the limit is still written into the
+    /// CURRENT segment; only the record AFTER it rolls. So a segment's true
+    /// physical size ending up past `segment_size_bytes` is the ORDINARY
+    /// geometry of a segment nearing capacity, not a contrived edge case.
+    /// Round 1's heal capped its re-zero at `config.segment_size_bytes`,
+    /// which silently no-ops (`preallocate_to`'s own `total_len <=
+    /// self.size` early return) once the healed cursor already exceeds that
+    /// bound — leaving the real non-zero residue on disk. The segment then
+    /// rolls off (seals) with that residue sitting past the last valid
+    /// record, and a LATER open's STRICT scan of the now-sealed segment
+    /// hard-errors on it: the same permanently-unbootable outcome as the
+    /// round-1 critical, one roll later.
+    #[test]
+    fn heal_zeros_through_physical_eof_when_the_torn_record_straddles_segment_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let mut cfg = JournalConfig::new(&dir_path);
+        cfg.preallocate_segments = true;
+        cfg.segment_size_bytes = 300;
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            // Each append is its own waited (serial) batch, so `flush_run`
+            // writes it immediately: 3 records of 124 bytes on disk (4-byte
+            // length prefix + 16-byte seq/meta + 100-byte payload + 4-byte
+            // CRC) push segment0's TRUE physical/logical size to
+            // 32 (header) + 3*124 = 404 bytes — already past
+            // `segment_size_bytes` (300). This is the ordinary straddling
+            // geometry `writer.rs` produces, not something hand-engineered.
+            for i in 1..=3u64 {
+                j.append(i, 0, &[0u8; 100]).unwrap().wait().unwrap();
+            }
+        }
+        let seg_path = segment_paths(&dir_path).into_iter().next_back().unwrap();
+        let before_heal_len = std::fs::metadata(&seg_path).unwrap().len();
+        assert!(
+            before_heal_len > cfg.segment_size_bytes,
+            "test setup must actually straddle: {before_heal_len} is not > {}",
+            cfg.segment_size_bytes
+        );
+        let (torn_offset, torn_len) = write_torn_record(&seg_path, 42, 10);
+        assert!(
+            torn_offset > cfg.segment_size_bytes,
+            "the torn record itself must start past segment_size_bytes, got offset {torn_offset}"
+        );
+
+        // Open — Phase 1 must heal, and the residue must be zeroed all the
+        // way to the segment's TRUE physical EOF, not just to
+        // segment_size_bytes.
+        let j2 = Journal::open(cfg.clone()).unwrap();
+        assert!(j2.healed_torn_tail(), "must report the heal");
+        assert_eq!(j2.last_seq(), Some(3));
+
+        let after_heal = std::fs::read(&seg_path).unwrap();
+        let healed_span = &after_heal[torn_offset as usize..torn_offset as usize + torn_len];
+        assert!(
+            healed_span.iter().all(|&b| b == 0),
+            "the healed span must read back zero through physical EOF, even \
+             though it starts past config.segment_size_bytes"
+        );
+
+        // WRITER RESUMES: segment0's healed cursor (404) is already >=
+        // segment_size_bytes (300), so the very next append rolls
+        // immediately, sealing segment0 at exactly its pre-torn-record
+        // length with no new content appended past the heal.
+        j2.append(4, 0, b"y").unwrap().wait().unwrap();
+        assert_eq!(j2.last_seq(), Some(4));
+        drop(j2);
+
+        // REOPEN: segment0 is now SEALED (no longer last) — Journal::open's
+        // Phase 1 scans it with the STRICT scan(). Pre-fix, the un-erased
+        // residue past segment_size_bytes would still be sitting there and
+        // hard-error here; post-fix it reads back as clean trailing zero.
+        let j3 = Journal::open(cfg).unwrap();
+        assert_eq!(j3.last_seq(), Some(4));
     }
 
     /// With the configurable interval set absurdly high, Eventual mode's
