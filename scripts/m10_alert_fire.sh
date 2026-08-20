@@ -41,7 +41,22 @@ fi
 mkdir -p "$OUT"
 
 echo "== running m10_alerts (builds/breaks clusters, scrapes real /metrics) =="
-cargo run --manifest-path "$ROOT/Cargo.toml" -p uc2_node --release --example m10_alerts -- --all --out "$OUT"
+# Fix round 1, Finding 1: `m10_alerts --all` now isolates each scenario behind
+# `catch_unwind` internally and exits nonzero if ANY scenario panicked, but a
+# panicking scenario still means fewer `.series` files got written — under
+# `set -e` a bare nonzero exit here would abort this script BEFORE the
+# per-rule adjudication step below ever ran, which is exactly the "bare
+# backtrace instead of per-rule verdicts" failure mode being fixed. Consume
+# the exit code explicitly instead: continue to adjudication regardless, and
+# let the Python step's per-rule ScenarioMissing handling turn each missing
+# `.series` file into its own `FAIL rule=... (scenario did not produce
+# series)` line.
+m10_status=0
+cargo run --manifest-path "$ROOT/Cargo.toml" -p uc2_node --release --example m10_alerts -- --all --out "$OUT" || m10_status=$?
+if [ "$m10_status" -ne 0 ]; then
+    echo "warning: m10_alerts exited $m10_status (at least one scenario panicked — see above)." >&2
+    echo "         continuing to per-rule adjudication; affected rules will show as FAIL." >&2
+fi
 
 echo
 echo "== time-dilating scrapes into promtool input_series + adjudicating =="
@@ -79,10 +94,21 @@ def parse_series_file(path):
     return rows
 
 
+class ScenarioMissing(Exception):
+    """Raised when a scenario's `.series` file (or an expected series inside
+    it) isn't there — Fix round 1, Finding 1: this used to be a hard
+    `sys.exit` that aborted the WHOLE adjudication run on the first missing
+    file (e.g. because `m10_alerts --all` panicked partway through). Every
+    call site below is now wrapped per-rule (see the `RULE_BUILDERS` loop),
+    so one scenario's failure surfaces as that scenario's rules FAILing —
+    by name, with a reason — while every other rule still gets adjudicated
+    normally."""
+
+
 def load_scenario(name):
     path = os.path.join(OUT, f"{name}.series")
     if not os.path.isfile(path):
-        sys.exit(f"error: missing {path} — run m10_alerts --all first")
+        raise ScenarioMissing(f"{path} does not exist (scenario did not produce series)")
     return parse_series_file(path)
 
 
@@ -91,7 +117,7 @@ def select(rows, name, filt):
         r for r in rows if r["name"] == name and all(r["labels"].get(k) == v for k, v in filt.items())
     ]
     if not matches:
-        sys.exit(f"error: no series matching {name}{filt} in loaded rows")
+        raise ScenarioMissing(f"no series matching {name}{filt} in loaded rows")
     return matches[0]
 
 
@@ -144,150 +170,239 @@ def total_for(for_secs, range_secs=0, margin=60):
     return eval_time, (eval_time // INTERVAL) + 3
 
 
+def add_hold_last(r, row, metric, for_secs):
+    """LEVEL policy, tracked: append the input_series entry AND a
+    human-readable dilation-disclosure line (Fix round 1, Finding 2 — the
+    policy has to be visible at runtime, not just in code comments)."""
+    _, total = total_for(for_secs)
+    r["series"].append((f'{metric}{{{row["labels_str"]}}}', hold_last(row, total)))
+    r["dilation"].append(
+        f"series={metric} policy=hold_last for={for_secs}s samples={total} "
+        f"(last real scraped value \"{row['values'][-1]}\" held constant)"
+    )
+    return total
+
+
+def add_literal(r, row, metric, range_secs):
+    """DELTA `for: 0m` policy, tracked: the raw captured jump is used
+    verbatim inside the range window, no padding."""
+    r["series"].append((f'{metric}{{{row["labels_str"]}}}', literal(row)))
+    n = len(row["values"])
+    r["dilation"].append(
+        f"series={metric} policy=literal for=0s range={range_secs}s samples={n} "
+        f"(raw captured jump \"{' '.join(row['values'])}\" used verbatim, no padding)"
+    )
+
+
+def add_jump_then_ramp(r, row, metric, for_secs, range_secs, step=1):
+    """DELTA `for: >0` policy, tracked: real jump preserved, then a small
+    synthetic ramp keeps the condition true for the rest of the `for:`
+    sustain window (see `jump_then_ramp`'s own docstring for why)."""
+    eval_time, total = total_for(for_secs, range_secs=range_secs)
+    r["series"].append((f'{metric}{{{row["labels_str"]}}}', jump_then_ramp(row, total, step=step)))
+    r["dilation"].append(
+        f"series={metric} policy=jump_then_ramp for={for_secs}s range={range_secs}s samples={total} "
+        f"(real jump {row['values'][0]}->{row['values'][-1]} preserved, ramp synthetic +{step}/sample)"
+    )
+    return eval_time, total
+
+
+def new_rule(severity, labels_from=None):
+    return {"severity": severity, "series": [], "dilation": [], "labels_from": labels_from, "eval_time": None}
+
+
 # ---------------------------------------------------------------- rule specs
 #
-# Each entry builds the promtool `input_series` list and the `exp_samples`
-# label set (the PromQL AND/group_left/aggregation semantics of the SHIPPED
-# expr in uc2-alerts.yml, worked out by hand and cross-checked against a
-# scratch promtool run — see the task report). `real` mirrors the Task 9
-# brief's scenario table disclosure.
+# Static per-rule metadata (severity from the rule's own `labels:` block,
+# `real` mirroring the Task 9 brief's scenario table disclosure, and which
+# scenario feeds it) is separated from the DYNAMIC construction below so
+# that even a rule whose scenario failed to produce series can still be
+# reported with the right `scenario=`/`state=` in its FAIL line — Fix round
+# 1, Finding 1.
+RULE_META = {
+    "Uc2AgentDead": {"severity": "critical", "real": False, "scenario": "agent_dead"},
+    "Uc2NoLeader": {"severity": "critical", "real": True, "scenario": "no_leader"},
+    "Uc2LeaderNotServing": {"severity": "critical", "real": False, "scenario": "leader_not_serving"},
+    "Uc2ServiceWedged": {"severity": "critical", "real": True, "scenario": "service_wedged"},
+    "Uc2ReplicationStalled": {"severity": "critical", "real": True, "scenario": "leader_isolated"},
+    "Uc2AdmissionSaturated": {"severity": "warning", "real": True, "scenario": "leader_isolated"},
+    "Uc2PeerNeverHeard": {"severity": "warning", "real": True, "scenario": "peer_never_heard"},
+    "Uc2PeerLagging": {"severity": "warning", "real": True, "scenario": "follower_partitioned"},
+    "Uc2PurgeStalled": {"severity": "warning", "real": False, "scenario": "purge_stalled"},
+    "Uc2RepeatedWipes": {"severity": "warning", "real": False, "scenario": "repeated_wipes"},
+    "Uc2UnattestedReports": {"severity": "critical", "real": False, "scenario": "crypto_counters"},
+    "Uc2CleartextPeer": {"severity": "critical", "real": False, "scenario": "crypto_counters"},
+    "Uc2FollowerSealFailures": {"severity": "warning", "real": False, "scenario": "crypto_counters"},
+}
 
+
+def build_Uc2AgentDead():
+    rows = load_scenario("agent_dead")
+    row = select(rows, "uc2_agent_alive", {"agent": "archive"})
+    r = new_rule("critical", labels_from=row)
+    add_hold_last(r, row, "uc2_agent_alive", 0)
+    r["eval_time"] = total_for(0)[0]
+    return r
+
+
+def build_Uc2NoLeader():
+    rows = load_scenario("no_leader")
+    row = select(rows, "uc2_is_leader", {})
+    r = new_rule("critical", labels_from=None)  # max() strips ALL labels
+    add_hold_last(r, row, "uc2_is_leader", 30)
+    r["eval_time"] = total_for(30)[0]
+    return r
+
+
+def build_Uc2LeaderNotServing():
+    rows = load_scenario("leader_not_serving")
+    leader_row = select(rows, "uc2_is_leader", {})
+    serve_row = select(rows, "uc2_can_serve", {})
+    r = new_rule("critical", labels_from=leader_row)  # LHS of `and`
+    add_hold_last(r, leader_row, "uc2_is_leader", 30)
+    add_hold_last(r, serve_row, "uc2_can_serve", 30)
+    r["eval_time"] = total_for(30)[0]
+    return r
+
+
+def build_Uc2ServiceWedged():
+    rows = load_scenario("service_wedged")
+    svc_row = select(rows, "uc2_service_heartbeat_age_seconds", {})
+    node_row = select(rows, "uc2_node_heartbeat_age_seconds", {})
+    r = new_rule("critical", labels_from=svc_row)  # LHS of `and`
+    add_hold_last(r, svc_row, "uc2_service_heartbeat_age_seconds", 60)
+    add_hold_last(r, node_row, "uc2_node_heartbeat_age_seconds", 60)
+    r["eval_time"] = total_for(60)[0]
+    return r
+
+
+def build_Uc2ReplicationStalled():
+    rows = load_scenario("leader_isolated")
+    commit_row = select(rows, "uc2_commit_bytes", {})
+    append_row = select(rows, "uc2_append_bytes", {})
+    r = new_rule("critical", labels_from=commit_row)  # LHS: delta(uc2_commit_bytes[1m])
+    add_hold_last(r, commit_row, "uc2_commit_bytes", 60)
+    eval_time, _ = add_jump_then_ramp(r, append_row, "uc2_append_bytes", 60, 60)
+    r["eval_time"] = eval_time
+    return r
+
+
+def build_Uc2AdmissionSaturated():
+    rows = load_scenario("leader_isolated")  # shared real scenario
+    sat_row = select(rows, "uc2_admission_saturation", {})
+    r = new_rule("warning", labels_from=sat_row)
+    add_hold_last(r, sat_row, "uc2_admission_saturation", 60)
+    r["eval_time"] = total_for(60)[0]
+    return r
+
+
+def build_Uc2PeerNeverHeard():
+    rows = load_scenario("peer_never_heard")
+    # Both n0 (a follower) and n1 (the leader) show peer="2" == 0 in the real
+    # capture, for different reasons (see the task report's self-review): n1
+    # genuinely never heard from the never-started peer; n0 shows 0 for
+    # every peer because a follower doesn't track peer-reported-durable the
+    # way the leader's quorum tracker does. `select()`'s first-match pick is
+    # therefore file-order-sensitive — but both candidate rows are honest
+    # real zeros, so the alert fires correctly either way.
+    row = select(rows, "uc2_peer_reported_durable_bytes", {"peer": "2"})
+    r = new_rule("warning", labels_from=row)
+    add_hold_last(r, row, "uc2_peer_reported_durable_bytes", 120)
+    r["eval_time"] = total_for(120)[0]
+    return r
+
+
+def build_Uc2PeerLagging():
+    rows = load_scenario("follower_partitioned")
+    lag_row = select(rows, "uc2_peer_replication_lag_bytes", {"peer": "0"})
+    adm_row = select(rows, "uc2_admission_bytes", {})
+    r = new_rule("warning", labels_from=lag_row)  # group_left keeps LHS's extra labels
+    add_hold_last(r, lag_row, "uc2_peer_replication_lag_bytes", 300)
+    add_hold_last(r, adm_row, "uc2_admission_bytes", 300)
+    r["eval_time"] = total_for(300)[0]
+    return r
+
+
+def build_Uc2PurgeStalled():
+    rows = load_scenario("purge_stalled")
+    pe_row = select(rows, "uc2_purge_enabled", {})
+    floor_row = select(rows, "uc2_node_snapshot_floor_bytes", {})
+    base_row = select(rows, "uc2_archive_first_base_bytes", {})
+    seg_row = select(rows, "uc2_journal_segment_bytes", {})
+    r = new_rule("warning", labels_from=pe_row)  # LHS of `and`
+    add_hold_last(r, pe_row, "uc2_purge_enabled", 600)
+    add_hold_last(r, floor_row, "uc2_node_snapshot_floor_bytes", 600)
+    add_hold_last(r, base_row, "uc2_archive_first_base_bytes", 600)
+    add_hold_last(r, seg_row, "uc2_journal_segment_bytes", 600)
+    r["eval_time"] = total_for(600)[0]
+    return r
+
+
+def build_Uc2RepeatedWipes():
+    rows = load_scenario("repeated_wipes")
+    row = select(rows, "uc2_wipes_total", {})
+    r = new_rule("warning", labels_from=row)
+    add_literal(r, row, "uc2_wipes_total", 600)
+    r["eval_time"] = (len(row["values"]) - 1) * INTERVAL
+    return r
+
+
+def build_Uc2UnattestedReports():
+    rows = load_scenario("crypto_counters")
+    row = select(rows, "uc2_reports_unattested_total", {})
+    r = new_rule("critical", labels_from=row)
+    add_literal(r, row, "uc2_reports_unattested_total", 300)
+    r["eval_time"] = (len(row["values"]) - 1) * INTERVAL
+    return r
+
+
+def build_Uc2CleartextPeer():
+    rows = load_scenario("crypto_counters")
+    row = select(rows, "uc2_cleartext_peer_datagrams_total", {})
+    r = new_rule("critical", labels_from=row)
+    add_literal(r, row, "uc2_cleartext_peer_datagrams_total", 300)
+    r["eval_time"] = (len(row["values"]) - 1) * INTERVAL
+    return r
+
+
+def build_Uc2FollowerSealFailures():
+    rows = load_scenario("crypto_counters")
+    seal_row = select(rows, "uc2_receiver_seal_failures_total", {})
+    leader_row = select(rows, "uc2_is_leader", {})
+    r = new_rule("warning", labels_from=seal_row)  # LHS of `and`
+    add_literal(r, seal_row, "uc2_receiver_seal_failures_total", 300)
+    add_literal(r, leader_row, "uc2_is_leader", 300)
+    r["eval_time"] = (len(seal_row["values"]) - 1) * INTERVAL
+    return r
+
+
+RULE_BUILDERS = {
+    "Uc2AgentDead": build_Uc2AgentDead,
+    "Uc2NoLeader": build_Uc2NoLeader,
+    "Uc2LeaderNotServing": build_Uc2LeaderNotServing,
+    "Uc2ServiceWedged": build_Uc2ServiceWedged,
+    "Uc2ReplicationStalled": build_Uc2ReplicationStalled,
+    "Uc2AdmissionSaturated": build_Uc2AdmissionSaturated,
+    "Uc2PeerNeverHeard": build_Uc2PeerNeverHeard,
+    "Uc2PeerLagging": build_Uc2PeerLagging,
+    "Uc2PurgeStalled": build_Uc2PurgeStalled,
+    "Uc2RepeatedWipes": build_Uc2RepeatedWipes,
+    "Uc2UnattestedReports": build_Uc2UnattestedReports,
+    "Uc2CleartextPeer": build_Uc2CleartextPeer,
+    "Uc2FollowerSealFailures": build_Uc2FollowerSealFailures,
+}
+
+# Fix round 1, Finding 1: build each rule's input series independently, so
+# one rule's scenario being missing (panicked upstream, or — in principle —
+# a series this particular rule needs being absent from an otherwise-present
+# scenario file) never stops the rest of the rules from being adjudicated.
 RULES = {}
-
-
-def rule(name, severity, real, method):
-    RULES[name] = {"severity": severity, "real": real, "method": method, "series": [], "labels_from": None}
-    return RULES[name]
-
-
-# Uc2AgentDead — synthetic, for: 0m.
-r = rule("Uc2AgentDead", "critical", False, "agent_dead")
-rows = load_scenario("agent_dead")
-row = select(rows, "uc2_agent_alive", {"agent": "archive"})
-_, total = total_for(0)
-r["series"].append((f'uc2_agent_alive{{{row["labels_str"]}}}', hold_last(row, total)))
-r["labels_from"] = row
-r["eval_time"] = total_for(0)[0]
-
-# Uc2NoLeader — real, for: 30s. max(uc2_is_leader) strips ALL labels.
-r = rule("Uc2NoLeader", "critical", True, "no_leader")
-rows = load_scenario("no_leader")
-row = select(rows, "uc2_is_leader", {})
-_, total = total_for(30)
-r["series"].append((f'uc2_is_leader{{{row["labels_str"]}}}', hold_last(row, total)))
-r["labels_from"] = None  # aggregation strips labels
-r["eval_time"] = total_for(30)[0]
-
-# Uc2LeaderNotServing — synthetic, for: 30s.
-r = rule("Uc2LeaderNotServing", "critical", False, "leader_not_serving")
-rows = load_scenario("leader_not_serving")
-leader_row = select(rows, "uc2_is_leader", {})
-serve_row = select(rows, "uc2_can_serve", {})
-_, total = total_for(30)
-r["series"].append((f'uc2_is_leader{{{leader_row["labels_str"]}}}', hold_last(leader_row, total)))
-r["series"].append((f'uc2_can_serve{{{serve_row["labels_str"]}}}', hold_last(serve_row, total)))
-r["labels_from"] = leader_row  # LHS of `and`
-r["eval_time"] = total_for(30)[0]
-
-# Uc2ServiceWedged — real, for: 1m.
-r = rule("Uc2ServiceWedged", "critical", True, "service_wedged")
-rows = load_scenario("service_wedged")
-svc_row = select(rows, "uc2_service_heartbeat_age_seconds", {})
-node_row = select(rows, "uc2_node_heartbeat_age_seconds", {})
-_, total = total_for(60)
-r["series"].append((f'uc2_service_heartbeat_age_seconds{{{svc_row["labels_str"]}}}', hold_last(svc_row, total)))
-r["series"].append((f'uc2_node_heartbeat_age_seconds{{{node_row["labels_str"]}}}', hold_last(node_row, total)))
-r["labels_from"] = svc_row  # LHS of `and`
-r["eval_time"] = total_for(60)[0]
-
-# Uc2ReplicationStalled — real, delta over [1m], for: 1m.
-r = rule("Uc2ReplicationStalled", "critical", True, "leader_isolated")
-rows = load_scenario("leader_isolated")
-commit_row = select(rows, "uc2_commit_bytes", {})
-append_row = select(rows, "uc2_append_bytes", {})
-eval_time, total = total_for(60, range_secs=60)
-r["series"].append((f'uc2_commit_bytes{{{commit_row["labels_str"]}}}', hold_last(commit_row, total)))
-r["series"].append((f'uc2_append_bytes{{{append_row["labels_str"]}}}', jump_then_ramp(append_row, total)))
-r["labels_from"] = commit_row  # LHS: delta(uc2_commit_bytes[1m])
-r["eval_time"] = eval_time
-
-# Uc2AdmissionSaturated — real (same scenario), level, for: 1m.
-r = rule("Uc2AdmissionSaturated", "warning", True, "leader_isolated")
-rows = load_scenario("leader_isolated")
-sat_row = select(rows, "uc2_admission_saturation", {})
-_, total = total_for(60)
-r["series"].append((f'uc2_admission_saturation{{{sat_row["labels_str"]}}}', hold_last(sat_row, total)))
-r["labels_from"] = sat_row
-r["eval_time"] = total_for(60)[0]
-
-# Uc2PeerNeverHeard — real, for: 2m.
-r = rule("Uc2PeerNeverHeard", "warning", True, "peer_never_heard")
-rows = load_scenario("peer_never_heard")
-row = select(rows, "uc2_peer_reported_durable_bytes", {"peer": "2"})
-_, total = total_for(120)
-r["series"].append((f'uc2_peer_reported_durable_bytes{{{row["labels_str"]}}}', hold_last(row, total)))
-r["labels_from"] = row
-r["eval_time"] = total_for(120)[0]
-
-# Uc2PeerLagging — real, for: 5m. group_left keeps LHS's extra labels.
-r = rule("Uc2PeerLagging", "warning", True, "follower_partitioned")
-rows = load_scenario("follower_partitioned")
-lag_row = select(rows, "uc2_peer_replication_lag_bytes", {"peer": "0"})
-adm_row = select(rows, "uc2_admission_bytes", {})
-_, total = total_for(300)
-r["series"].append((f'uc2_peer_replication_lag_bytes{{{lag_row["labels_str"]}}}', hold_last(lag_row, total)))
-r["series"].append((f'uc2_admission_bytes{{{adm_row["labels_str"]}}}', hold_last(adm_row, total)))
-r["labels_from"] = lag_row
-r["eval_time"] = total_for(300)[0]
-
-# Uc2PurgeStalled — synthetic, for: 10m.
-r = rule("Uc2PurgeStalled", "warning", False, "purge_stalled")
-rows = load_scenario("purge_stalled")
-pe_row = select(rows, "uc2_purge_enabled", {})
-floor_row = select(rows, "uc2_node_snapshot_floor_bytes", {})
-base_row = select(rows, "uc2_archive_first_base_bytes", {})
-seg_row = select(rows, "uc2_journal_segment_bytes", {})
-_, total = total_for(600)
-r["series"].append((f'uc2_purge_enabled{{{pe_row["labels_str"]}}}', hold_last(pe_row, total)))
-r["series"].append((f'uc2_node_snapshot_floor_bytes{{{floor_row["labels_str"]}}}', hold_last(floor_row, total)))
-r["series"].append((f'uc2_archive_first_base_bytes{{{base_row["labels_str"]}}}', hold_last(base_row, total)))
-r["series"].append((f'uc2_journal_segment_bytes{{{seg_row["labels_str"]}}}', hold_last(seg_row, total)))
-r["labels_from"] = pe_row  # LHS of `and`
-r["eval_time"] = total_for(600)[0]
-
-# Uc2RepeatedWipes — synthetic (real transition, injected trigger), delta over [10m], for: 0m.
-r = rule("Uc2RepeatedWipes", "warning", False, "repeated_wipes")
-rows = load_scenario("repeated_wipes")
-row = select(rows, "uc2_wipes_total", {})
-r["series"].append((f'uc2_wipes_total{{{row["labels_str"]}}}', literal(row)))
-r["labels_from"] = row
-r["eval_time"] = (len(row["values"]) - 1) * INTERVAL
-
-# Uc2UnattestedReports — synthetic (real transition), delta over [5m], for: 0m.
-r = rule("Uc2UnattestedReports", "critical", False, "crypto_counters")
-rows = load_scenario("crypto_counters")
-row = select(rows, "uc2_reports_unattested_total", {})
-r["series"].append((f'uc2_reports_unattested_total{{{row["labels_str"]}}}', literal(row)))
-r["labels_from"] = row
-r["eval_time"] = (len(row["values"]) - 1) * INTERVAL
-
-# Uc2CleartextPeer — synthetic (real transition), delta over [5m], for: 0m.
-r = rule("Uc2CleartextPeer", "critical", False, "crypto_counters")
-rows = load_scenario("crypto_counters")
-row = select(rows, "uc2_cleartext_peer_datagrams_total", {})
-r["series"].append((f'uc2_cleartext_peer_datagrams_total{{{row["labels_str"]}}}', literal(row)))
-r["labels_from"] = row
-r["eval_time"] = (len(row["values"]) - 1) * INTERVAL
-
-# Uc2FollowerSealFailures — synthetic (real transition), delta over [5m] AND is_leader==0, for: 0m.
-r = rule("Uc2FollowerSealFailures", "warning", False, "crypto_counters")
-rows = load_scenario("crypto_counters")
-seal_row = select(rows, "uc2_receiver_seal_failures_total", {})
-leader_row = select(rows, "uc2_is_leader", {})
-r["series"].append((f'uc2_receiver_seal_failures_total{{{seal_row["labels_str"]}}}', literal(seal_row)))
-r["series"].append((f'uc2_is_leader{{{leader_row["labels_str"]}}}', literal(leader_row)))
-r["labels_from"] = seal_row  # LHS of `and`
-r["eval_time"] = (len(seal_row["values"]) - 1) * INTERVAL
+BUILD_ERRORS = {}
+for _name, _builder in RULE_BUILDERS.items():
+    try:
+        RULES[_name] = _builder()
+    except ScenarioMissing as e:
+        BUILD_ERRORS[_name] = str(e)
 
 # ------------------------------------------------------------ test generation
 
@@ -326,16 +441,39 @@ tests:
 
 
 overall_ok = True
-for name in sorted(RULES):
+for name in sorted(RULE_META):
+    meta = RULE_META[name]
+    disclosure = "real" if meta["real"] else "synthetic"
+    scenario = meta["scenario"]
+
+    if name in BUILD_ERRORS:
+        # Fix round 1, Finding 1: the scenario that was supposed to feed this
+        # rule never produced usable series (its `m10_alerts` process either
+        # panicked — isolated by catch_unwind, see the Rust harness — or, in
+        # principle, was missing an expected series inside an otherwise-
+        # present file). Report it as a named FAIL instead of aborting the
+        # whole adjudication run.
+        overall_ok = False
+        print(
+            f"FAIL rule={name} scenario={scenario} state={disclosure} "
+            f"(scenario did not produce series: {BUILD_ERRORS[name]})"
+        )
+        continue
+
     spec = RULES[name]
+    # Fix round 1, Finding 2: the time-dilation policy applied to each input
+    # series must be disclosed at RUNTIME, not just in code comments/the task
+    # report — print one line per dilated series before adjudicating.
+    for line in spec["dilation"]:
+        print(f"  dilate rule={name} {line}")
+
     path = write_test_yaml(name, spec)
     proc = subprocess.run([PROMTOOL, "test", "rules", path], capture_output=True, text=True)
-    disclosure = "real" if spec["real"] else "synthetic"
     if proc.returncode == 0:
-        print(f"PASS rule={name} scenario={spec['method']} state={disclosure}")
+        print(f"PASS rule={name} scenario={scenario} state={disclosure}")
     else:
         overall_ok = False
-        print(f"FAIL rule={name} scenario={spec['method']} state={disclosure}")
+        print(f"FAIL rule={name} scenario={scenario} state={disclosure}")
         print(proc.stdout)
         print(proc.stderr, file=sys.stderr)
 

@@ -91,19 +91,58 @@ fn main() {
     } else {
         vec![cli.scenario.expect("--scenario NAME or --all")]
     };
+    let multi = names.len() > 1;
 
+    // Fix round 1, Finding 1: one scenario's panic (e.g. `await_stable_leader`
+    // timing out on a loaded box, or the UC2_M10_FORCE_FAIL test hook below)
+    // used to take down the WHOLE `--all` run before it reached the promtool
+    // step — a gate script has to always end in per-rule verdict lines, never
+    // a bare backtrace. In `--all` mode each scenario runs behind
+    // `catch_unwind`: a panicking scenario is reported by name and SKIPPED
+    // (no `.series` file written for it — `scripts/m10_alert_fire.sh`'s
+    // Python step turns that absence into `FAIL rule=... (scenario did not
+    // produce series)` for every rule that scenario was to feed, per rule,
+    // instead of aborting there too), and the run continues to the rest.
+    // Single-scenario mode (`--scenario X`, not `--all`) still fails loudly
+    // with a nonzero exit — there's only one scenario to isolate FROM.
+    let mut failed_count = 0usize;
     for name in names {
-        let (sf, disc) = run_scenario(&name, &scratch_root);
-        let path = out_dir.join(format!("{name}.series"));
-        sf.write(&path).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
-        println!(
-            "scenario={} rules={} state={} method: {}",
-            disc.scenario,
-            disc.rules.join(","),
-            disc.state,
-            disc.method
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_scenario(&name, &scratch_root)));
+        match result {
+            Ok((sf, disc)) => {
+                let path = out_dir.join(format!("{name}.series"));
+                sf.write(&path).unwrap_or_else(|e| panic!("write {path:?}: {e}"));
+                println!(
+                    "scenario={} rules={} state={} method: {}",
+                    disc.scenario,
+                    disc.rules.join(","),
+                    disc.state,
+                    disc.method
+                );
+                println!("  wrote {} ({} series)", path.display(), sf.data.len());
+            }
+            Err(_) => {
+                failed_count += 1;
+                println!(
+                    "scenario_failed name={name} — panicked (see panic message printed above by \
+                     the default panic hook); no .series file written for this scenario"
+                );
+                if !multi {
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    if failed_count > 0 {
+        eprintln!(
+            "m10_alerts: {failed_count} of {} scenario(s) panicked — exiting nonzero. \
+             Downstream adjudication should turn each affected scenario's missing .series file \
+             into a per-rule FAIL, not abort.",
+            ALL_SCENARIOS.len()
         );
-        println!("  wrote {} ({} series)", path.display(), sf.data.len());
+        std::process::exit(1);
     }
 }
 
@@ -112,7 +151,17 @@ fn default_out_dir() -> PathBuf {
     PathBuf::from(home).join(".cache").join("uc2-m10-alerts")
 }
 
+/// Test-only forced-failure hook (Fix round 1, Finding 1's validation path):
+/// `UC2_M10_FORCE_FAIL=<scenario>` makes that one scenario panic
+/// deliberately, so the `--all` isolation path above can be exercised
+/// end-to-end without waiting for a real flake. Checked for every scenario
+/// (both `--scenario` and `--all` modes) so either invocation can be used to
+/// validate it. Documented, not removed — cheap to keep, useful for any
+/// future regression in the isolation path.
 fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
+    if std::env::var("UC2_M10_FORCE_FAIL").as_deref() == Ok(name) {
+        panic!("UC2_M10_FORCE_FAIL={name} — deliberate forced failure for scenario-isolation testing");
+    }
     match name {
         "agent_dead" => scenario_agent_dead(),
         "no_leader" => scenario_no_leader(scratch_root),
