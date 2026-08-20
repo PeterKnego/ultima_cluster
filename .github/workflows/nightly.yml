@@ -99,6 +99,20 @@ jobs:
       - name: Multi-process SIGKILL linearizability (crypto ON)
         run: cargo test -p uc2-crashtest --features hard-crash-tests
 
+  # M11 Task 3: the spec's acceptance sentence as a CI test — a node is
+  # backed up under load, its host destroyed, a new host restored from the
+  # backup alone, and it rejoins and converges. Real multi-process (3 node +
+  # service pairs), real SIGKILL, real filesystem `rm -rf`. Mirrors
+  # `crashtest`'s shape.
+  survival:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: Backup under load -> host destroyed -> restore -> rejoin
+        run: cargo test -p uc2-crashtest --features survival-tests
+
   # Elle transactional-safety tier: 5 list-append passes (quiet/failover/
   # partition/purge/reconfig), each adjudicated by the vendored elle-cli under
   # `serializable` AND `strong-serializable` — anomaly set must be empty. The jar
