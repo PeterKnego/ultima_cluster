@@ -35,6 +35,46 @@
 //! ones this module produced) rather than merely documenting it — see
 //! `a_wrong_order_copy_across_a_purge_is_detected_as_a_hole` in
 //! `uc2_node/tests/backup.rs`, the anti-vacuity test for this whole module.
+//!
+//! HONESTY NOTE on that test's reach: it hand-builds a broken artifact to
+//! prove the coverage invariant is a real check, but neither it nor
+//! `ordered_backup_never_produces_a_hole_under_purge_churn` races a live
+//! purge against an in-flight `backup_instance` copy (the churn test's purge
+//! wait always completes before the next `backup_instance` call starts). So
+//! the *ordering enforcement inside `backup_instance` itself* — as opposed to
+//! the invariant `verify_artifact` checks — currently rests on code
+//! inspection (journal-then-state-then-snapshots, each directory copied
+//! fully before the next starts) plus the hand-built proxy, not on a test
+//! that reverses the order under real concurrent purge pressure.
+//!
+//! A genuine attempt was made at the stronger racy version (background
+//! submit + snapshot-publish + purge racing 5 sequential `backup_instance`
+//! calls with no quiescence wait). It failed reproducibly (~1-in-3 runs) —
+//! but with `Io(NotFound)`, not `Hole`: `copy_dir_sorted` lists a directory
+//! once, then copies each listed name, so a concurrent purge or snapshot
+//! retention that unlinks an already-listed file before its `fs::copy` runs
+//! fails the whole backup. That is a real, separate, narrow race
+//! (`journal/`'s purge and `snapshots/`'s keep-newest-2 retention both delete
+//! files under a live node) — but tolerating it safely needs deliberate
+//! stop-at-first-gap handling (blindly skipping a vanished file risks a real
+//! GAP in the middle of the copied journal, not just a later start), not a
+//! quick patch, so it was not folded into this fix and the racy test was not
+//! kept (a test that fails 1-in-3 for a reason unrelated to what it's meant
+//! to prove is not a usable regression guard). See
+//! `uc2_node/tests/backup.rs`'s comment near
+//! `ordered_backup_never_produces_a_hole_under_purge_churn` for the same note
+//! in context.
+//!
+//! # Read-only beyond the one permitted heal
+//!
+//! [`verify_artifact`] opens the artifact's journal with
+//! `preallocate_segments: false` specifically so that healing a torn
+//! active-segment tail is, at most, a physical `truncate` (shrink only,
+//! never grow) — see the comment at its `ArchiveConfig` construction for why
+//! the default (`true`, matching boot) is wrong for a read-mostly verify
+//! path: it silently re-preallocates (GROWS) the active segment to
+//! `segment_size_bytes` on every call, an artifact mutation the "verify may
+//! heal, never hide" constraint does not permit.
 
 use std::collections::HashMap;
 use std::fs;
@@ -202,9 +242,13 @@ pub fn backup_instance(instance_dir: &Path, out: &Path) -> Result<BackupReport, 
 /// Read-only verification of a backup artifact (or, incidentally, a stopped
 /// instance directory — the layout is the same minus `cnc2.dat`/rings, which
 /// this never looks at). The ONE permitted mutation: opening the artifact's
-/// journal may heal a torn active-segment tail exactly as a real boot would
-/// (`Journal::open`) — reported via [`BackupReport::healed_torn_tail`], never
-/// hidden. Everything else is read-only.
+/// journal may heal a torn active-segment tail — a physical shrink-only
+/// `truncate` of the active segment (never a grow; see the module doc's
+/// "Read-only beyond the one permitted heal" section and the `ArchiveConfig`
+/// construction below) — reported via [`BackupReport::healed_torn_tail`],
+/// never hidden. Everything else is read-only, including a re-verify: two
+/// consecutive `verify_artifact` calls on the same artifact never change any
+/// file's size a second time.
 ///
 /// Steps (brief order, matches the semantics this module is built against):
 /// 1. Open the journal (`uc2_log::Archive::open`, which wraps
@@ -226,8 +270,26 @@ pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
     }
 
     // 1. Journal: recover positions, healing a torn tail if present.
-    let archive_cfg = ArchiveConfig::new(journal_dir(artifact));
-    let journal_files = count_files(&journal_dir(artifact))?;
+    //
+    // `preallocate_segments: false` is deliberate and load-bearing here, NOT
+    // just "use the default": `Journal::open`'s post-recovery step
+    // unconditionally re-preallocates the active segment up to
+    // `segment_size_bytes` when `preallocate_segments` is true AND the
+    // segment is physically shorter than that — which an artifact's active
+    // segment always is unless it happens to match verify's own
+    // `ArchiveConfig::new` default of 64 MiB exactly. With the default
+    // `preallocate_segments: true`, verify would silently GROW the artifact's
+    // active segment file on every call (observed 64 KiB -> 64 MiB under a
+    // small-segment test config) — a mutation far outside "heal a torn tail",
+    // and one that persists into any later restore. Verify never appends, so
+    // it has no use for the preallocation write-path optimization anyway.
+    // With `false`, a torn tail is healed by a physical `truncate` (shrink
+    // only, never grow) instead of an in-memory cursor reset — still exactly
+    // the one permitted mutation the module doc promises, just visible on
+    // disk instead of invisible.
+    let archive_cfg =
+        ArchiveConfig { preallocate_segments: false, ..ArchiveConfig::new(journal_dir(artifact)) };
+    let journal_files = count_files(&journal_dir(artifact), is_journal_segment_name)?;
     let archive =
         Archive::open(archive_cfg).map_err(|e| BackupError::Io(io::Error::other(e)))?;
     let journal_first_base = archive.first_base();
@@ -274,13 +336,25 @@ pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
     Ok(report)
 }
 
-fn count_files(dir: &Path) -> io::Result<usize> {
+fn is_journal_segment_name(name: &str) -> bool {
+    name.starts_with("seg-") && name.ends_with(".log")
+}
+
+/// Count regular files directly under `dir` matching `keep`; `0` if `dir`
+/// doesn't exist. `journal_files` uses `is_journal_segment_name` (symmetric
+/// with `scan_snapshots`'s `snap-*.ultsnap` filter) so `BackupReport::files`
+/// counts the same "meaningful artifact contents" in both directories rather
+/// than incidental control files (a `truncate.intent`, say) that `copy_dir_sorted`
+/// still copies verbatim but that aren't part of the artifact's semantic size.
+fn count_files(dir: &Path, keep: impl Fn(&str) -> bool) -> io::Result<usize> {
     if !dir.is_dir() {
         return Ok(0);
     }
     Ok(fs::read_dir(dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| keep(n))
         .count())
 }
 
@@ -419,11 +493,23 @@ fn check_manifest(path: &Path, report: &BackupReport) -> Result<(), BackupError>
         return Err(mismatch("snapshot_floor", sf.to_string(), report.snapshot_floor.to_string()));
     }
 
+    // `healed_torn_tail` is NOT a stable, re-derivable property of the
+    // artifact the way the four position fields above are — healing (with
+    // `preallocate_segments: false`, see `verify_artifact`'s `ArchiveConfig`
+    // comment) is a physical, monotonic `truncate`: the FIRST open that finds
+    // a torn tail fixes it on disk, so EVERY later open of that same,
+    // untouched artifact correctly reports `false` (there is nothing left to
+    // heal). A manifest written at backup time (which just ran that first
+    // heal) legitimately says `true` forever after, even though no later
+    // verify will ever reproduce `true` again. So only the SUSPICIOUS
+    // direction is a mismatch: the manifest recorded no heal but THIS verify
+    // found (and fixed) one anyway — a torn tail appearing in an artifact
+    // that was supposedly already clean, i.e. new corruption after the fact.
     let htt_raw = get("healed_torn_tail")?;
     let htt: bool = htt_raw.parse().map_err(|_| {
         BackupError::ManifestMismatch(format!("healed_torn_tail: not a bool ({htt_raw:?})"))
     })?;
-    if htt != report.healed_torn_tail {
+    if report.healed_torn_tail && !htt {
         return Err(mismatch(
             "healed_torn_tail",
             htt.to_string(),
@@ -494,6 +580,56 @@ mod tests {
         let mut wrong = report;
         wrong.journal_first_base += 1;
         let err = check_manifest(&dir.path().join("MANIFEST"), &wrong).unwrap_err();
+        assert!(matches!(err, BackupError::ManifestMismatch(_)));
+    }
+
+    /// Fix round 1, CRITICAL fallout: `verify_artifact` now heals a torn tail
+    /// via a physical `truncate` (see the `ArchiveConfig` comment at its
+    /// journal open), which is monotonic — the SECOND open of the same,
+    /// untouched artifact correctly finds nothing left to heal. A manifest
+    /// written right after the first heal (`healed_torn_tail=true`) must not
+    /// be flagged as mismatched by that expected, later `false`.
+    #[test]
+    fn check_manifest_allows_the_expected_true_to_false_transition_after_a_real_heal() {
+        let healed_at_backup_time = BackupReport {
+            journal_first_base: 0,
+            journal_last_pos: 5000,
+            newest_snapshot: None,
+            snapshot_floor: 0,
+            healed_torn_tail: true,
+            files: 3,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), &healed_at_backup_time).unwrap();
+
+        // Everything else identical; only healed_torn_tail differs (a later
+        // reopen of the now-clean artifact correctly finds no torn tail).
+        let mut reverified = healed_at_backup_time;
+        reverified.healed_torn_tail = false;
+        check_manifest(&dir.path().join("MANIFEST"), &reverified)
+            .expect("manifest=true, actual=false must be accepted (expected post-heal steady state)");
+    }
+
+    /// The other direction stays a real mismatch: a manifest that recorded NO
+    /// heal, but a later verify finds (and fixes) a torn tail anyway, means
+    /// something changed the artifact after backup — exactly the
+    /// tampering/bitrot case the cross-check exists to catch.
+    #[test]
+    fn check_manifest_catches_an_unexpected_new_heal() {
+        let clean_at_backup_time = BackupReport {
+            journal_first_base: 0,
+            journal_last_pos: 5000,
+            newest_snapshot: None,
+            snapshot_floor: 0,
+            healed_torn_tail: false,
+            files: 3,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), &clean_at_backup_time).unwrap();
+
+        let mut reverified = clean_at_backup_time;
+        reverified.healed_torn_tail = true;
+        let err = check_manifest(&dir.path().join("MANIFEST"), &reverified).unwrap_err();
         assert!(matches!(err, BackupError::ManifestMismatch(_)));
     }
 }

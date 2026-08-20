@@ -18,8 +18,9 @@
 //! so a purge cycle actually drops whole segment files without megabytes of
 //! churn — never `/tmp` (RAM-backed tmpfs, see CLAUDE.md "Local box").
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -304,6 +305,47 @@ fn ordered_backup_never_produces_a_hole_under_purge_churn() {
     node.stop();
 }
 
+// ------------------------------------------------- fix round 1, IMPORTANT item
+//
+// The churn test above never races a live purge against an in-flight
+// `backup_instance` copy — its purge-and-wait always completes before the
+// next `backup_instance` call starts, so the ordering enforcement inside
+// `backup_instance` (as opposed to the coverage invariant `verify_artifact`
+// checks) rests on inspection + test 3's hand-built proxy, not on a test that
+// reverses the order under real concurrent purge pressure.
+//
+// GENUINE ATTEMPT MADE at the stronger version: a background thread
+// submitting continuously and periodically publishing a fresh snapshot +
+// advancing the purge marker, racing 5 sequential `backup_instance` calls
+// with NO quiescence wait between them (so a purge could land mid-copy).
+// It reproducibly failed — but NOT with a `Hole` (the property this task
+// cares about). Two distinct, unrelated failure modes showed up depending on
+// timing:
+//
+//   1. (before the healed_torn_tail manifest fix, see backup.rs) a spurious
+//      `ManifestMismatch` — unrelated to concurrency, fixed separately.
+//   2. `Io(NotFound)` from `backup_instance`, ~5/15 runs (~33%): a real race
+//      in `copy_dir_sorted`, which lists a directory once then copies each
+//      listed name — if a concurrent purge (`journal/`) or snapshot
+//      retention (`snapshots/`) unlinks a file AFTER it was listed but
+//      BEFORE its `fs::copy` runs, the copy fails with `NotFound`.
+//
+// (2) is a real, narrow gap, but tolerating it safely is non-trivial: purge
+// only ever drops a CONTIGUOUS prefix of segments, but `copy_dir_sorted`
+// copies in the same low-to-high order purge deletes in, so silently
+// skipping a vanished file risks leaving an actual GAP in the middle of the
+// copied journal (file N deleted mid-copy while file N+1, already unlinked
+// from the delete batch's perspective too, might momentarily still be
+// present and get copied) rather than the safe "copy simply starts later"
+// outcome a clean skip-of-the-oldest would give. That needs deliberate
+// stop-at-first-gap handling, not a quick tolerate-NotFound patch — flagging
+// as a follow-up rather than folding into this round, per the review's own
+// escape hatch for a racy test that proves flaky for reasons unrelated to
+// what it's meant to prove. The racy test itself was therefore NOT kept in
+// this suite (a test that fails 1-in-3 for an unrelated reason is not a
+// usable regression guard); this comment plus the module doc's own honesty
+// note are the fix for this item.
+
 // ---------------------------------------------------------------------- Test 5
 
 #[test]
@@ -378,4 +420,100 @@ fn verify_artifact_refuses_a_non_artifact_dir() {
         Err(BackupError::NotAnArtifact) => {}
         other => panic!("expected NotAnArtifact, got {other:?}"),
     }
+}
+
+// ------------------------------------------------------ regression: fix round 1
+
+/// Recursive `relative path -> file size` snapshot of every regular file
+/// under `root`.
+fn file_sizes(root: &Path) -> BTreeMap<PathBuf, u64> {
+    fn walk(dir: &Path, root: &Path, sizes: &mut BTreeMap<PathBuf, u64>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                walk(&path, root, sizes);
+            } else {
+                let rel = path.strip_prefix(root).unwrap().to_path_buf();
+                sizes.insert(rel, entry.metadata().unwrap().len());
+            }
+        }
+    }
+    let mut sizes = BTreeMap::new();
+    walk(root, root, &mut sizes);
+    sizes
+}
+
+/// Fix round 1, CRITICAL: `verify_artifact` used to build its `ArchiveConfig`
+/// with the (production, boot-matching) default `preallocate_segments: true`
+/// and `segment_size_bytes: 64 MiB` — `Journal::open`'s post-recovery
+/// re-preallocation step then unconditionally inflated the artifact's active
+/// segment up to that mismatched default (this suite's own `SEG_BYTES = 64
+/// KiB` config reproduced 65536 -> 67108864 bytes, 1024x growth, on every
+/// verify call). The fix builds verify's journal config with
+/// `preallocate_segments: false`, so the ONE permitted mutation (healing a
+/// torn active-segment tail) is a physical `truncate` — shrink-only, never a
+/// grow — and only fires when a torn tail was actually found.
+///
+/// This test creates a real artifact under the suite's small-segment config,
+/// snapshots every file's size, runs `verify_artifact` TWICE, and asserts: no
+/// file ever grows; any shrink is accompanied by a reported
+/// `healed_torn_tail`; and the second verify changes nothing further
+/// (idempotence) and reports the identical `BackupReport`.
+#[test]
+fn verify_never_grows_the_artifacts_files_and_is_idempotent() {
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let app = "backup7";
+
+    let node = start_node(&dir, app, PurgePolicy::Disabled);
+    drive_and_quiesce(&node, 500);
+    node.stop();
+
+    let out = root.path().join("backup7-out");
+    backup_instance(&dir, &out).expect("backup_instance");
+
+    // Sanity: the active segment in this artifact is genuinely small (the
+    // suite's SEG_BYTES), i.e. this test would actually catch the reported
+    // 64 KiB -> 64 MiB regression if it reappeared.
+    let active_segment_before = file_sizes(&out)
+        .into_iter()
+        .filter(|(p, _)| p.starts_with("journal") && p.to_string_lossy().ends_with(".log"))
+        .map(|(_, size)| size)
+        .max()
+        .expect("artifact must contain at least one journal segment");
+    assert!(
+        active_segment_before <= SEG_BYTES * 2,
+        "test setup: active segment {active_segment_before} bytes is not small \
+         (SEG_BYTES={SEG_BYTES}) — this test would not catch a re-preallocation regression"
+    );
+
+    let before = file_sizes(&out);
+    let report1 = verify_artifact(&out).expect("verify #1");
+    let after1 = file_sizes(&out);
+
+    for (path, &before_size) in &before {
+        let after_size = *after1
+            .get(path)
+            .unwrap_or_else(|| panic!("file {path:?} disappeared during verify_artifact"));
+        assert!(
+            after_size <= before_size,
+            "file {path:?} grew from {before_size} to {after_size} bytes during \
+             verify_artifact — verify must never grow an artifact file"
+        );
+        if after_size < before_size {
+            assert!(
+                report1.healed_torn_tail,
+                "file {path:?} shrank ({before_size} -> {after_size}) but the report did not \
+                 say healed_torn_tail — an unreported mutation"
+            );
+        }
+    }
+
+    // Idempotence: a second verify must not change anything further, and
+    // must report the exact same recovered positions.
+    let report2 = verify_artifact(&out).expect("verify #2");
+    let after2 = file_sizes(&out);
+    assert_eq!(after1, after2, "a second verify_artifact must not mutate any file further");
+    assert_eq!(report1, report2, "a second verify_artifact must report identical positions");
 }
