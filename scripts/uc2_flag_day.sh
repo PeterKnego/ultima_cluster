@@ -48,10 +48,31 @@
 #   hook (e.g. `true`); a real local upgrade would swap the binary the
 #   `--uc2-node-bin` path points at before this script's step 5 starts it.
 #
-# Exit codes: 0 = upgraded, cluster serving, `DOWNTIME: <secs>s` printed.
-#             1 = refused/aborted (see the printed reason) — for a failure
-#                 after nodes were stopped, everything was restarted first.
-set -euo pipefail
+# Exit codes:
+#   0 = upgraded; cluster serving a single leader with matching config
+#       version; `DOWNTIME: <secs>s` printed.
+#   1 = refused before touching anything (preflight, missing
+#       --yes-traffic-stopped, bad arguments, step 6 timeout), OR aborted
+#       after stopping nodes with EVERY node CONFIRMED back up on whatever
+#       binary is currently in place (see the printed ABORT reason) — the
+#       "un-upgrade" path completed cleanly.
+#   3 = aborted after stopping nodes, and the abort path's restart (plus one
+#       retry) still left at least one node DOWN — manual operator action
+#       required (start it by hand, then check `uc2ctl status` everywhere
+#       before retrying). Deliberately distinct from 1 so a monitoring
+#       script can tell "un-upgrade succeeded" from "un-upgrade itself is in
+#       trouble" apart without parsing the log.
+set -Eeuo pipefail
+# -E (errtrace): without it, the ERR trap below is NOT inherited into shell
+# functions or command substitutions — a failure several calls deep (e.g.
+# inside status_field's grep|head|cut pipeline, reached via
+# v="$(cfg_version_of "$text")") would otherwise only surface once errexit
+# unwinds back to top-level code, which still exits the script, but the
+# clean abort/retry machinery below wants the trap active at every level,
+# not just as an unwind backstop. Every status-field read below is ALSO
+# wrapped `|| true` at the call site (steps 0/3/6) so a transient parse gap
+# feeds the intended retry/aggregate-diagnostic path instead of either the
+# trap OR a silent errexit death — belt and suspenders, not either alone.
 
 # ------------------------------------------------------------------- style
 # Same house conventions as scripts/elle_check.sh: set -euo pipefail, probe
@@ -59,6 +80,11 @@ set -euo pipefail
 # (never /tmp — RAM-backed tmpfs with no swap on the dev box, see CLAUDE.md).
 
 iso_now() { date -u +%Y-%m-%dT%H:%M:%S.%3NZ; }
+# Wall-clock (`date`), taken by THIS script's own process for both
+# LAST_STOP_TS and FIRST_SERVE_TS — not cross-host, not monotonic. A large
+# NTP step mid-run (rare, only plausible if step 6 is stuck near its 60s
+# bound) could skew the printed DOWNTIME; monotonic time isn't used because
+# the number is meant to match what an operator's own clock/logs would show.
 epoch_now() { date +%s.%N; }
 log() { printf '[%s] %s\n' "$(iso_now)" "$*"; }
 step() { printf '\n[%s] STEP %s: %s\n' "$(iso_now)" "$1" "$2"; }
@@ -82,7 +108,7 @@ SERVE_WAIT_SECS="${UC2_FLAGDAY_SERVE_WAIT_SECS:-60}"
 POLL_SECS="${UC2_FLAGDAY_POLL_SECS:-1}"
 
 usage() {
-    sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,64p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
@@ -107,6 +133,14 @@ done
 [ -n "$APP_ID" ] || die "--app-id is required"
 [ -n "$UPGRADE_CMD" ] || die "--upgrade-cmd is required"
 
+# ssh mode embeds --app-id/--instance-dir inside a single-quoted remote
+# command string (node_status below); an unescaped single quote in either
+# would break out of that quoting into the remote shell. Refuse rather than
+# build an injectable command line.
+case "$APP_ID" in
+    *"'"*) die "--app-id must not contain a single-quote character (embedded in a quoted remote command in ssh mode)" ;;
+esac
+
 MODE="ssh"
 declare -a HOSTS=()
 declare -a CFGS=()
@@ -124,6 +158,9 @@ case "$HOSTS_RAW" in
     *)
         IFS=',' read -ra HOSTS <<< "$HOSTS_RAW"
         [ -n "$INSTANCE_DIR" ] || die "--instance-dir is required in ssh mode"
+        case "$INSTANCE_DIR" in
+            *"'"*) die "--instance-dir must not contain a single-quote character (embedded in a quoted remote command in ssh mode)" ;;
+        esac
         command -v ssh >/dev/null 2>&1 || die "ssh not found (ssh mode needs it)"
         ;;
 esac
@@ -131,9 +168,14 @@ esac
 if [ "$MODE" = "local" ]; then N=${#CFGS[@]}; else N=${#HOSTS[@]}; fi
 [ "$N" -ge 1 ] || die "--hosts named zero nodes"
 
-for t in date awk grep; do
+for t in date awk grep sed head cut seq; do
     command -v "$t" >/dev/null 2>&1 || die "$t not found (required)"
 done
+if [ "$MODE" = "local" ]; then
+    for t in pgrep pkill nohup readlink; do
+        command -v "$t" >/dev/null 2>&1 || die "$t not found (required in --local mode)"
+    done
+fi
 
 SCRATCH="$HOME/.cache/uc2-flagday/run-$$"
 mkdir -p "$SCRATCH"
@@ -208,19 +250,21 @@ start_node() { # <i> -- best-effort (never trips set -e); prints "ok"/"fail"
     fi
 }
 
-start_all() { # best-effort, parallel; used both by step 5 and the abort path
+# start_all: best-effort, parallel; used by both step 5 (normal) and
+# abort_restart (the un-upgrade path). Sets the global $START_ALL_FAILED
+# array to the node indices that reported "fail" from THIS call — callers
+# react to it differently (step 5 just warns; abort_restart retries once and
+# escalates). Never trips set -e itself.
+start_all() {
     local i
     for i in $(seq 0 $((N - 1))); do
         start_node "$i" > "$SCRATCH/start.$i" 2>&1 &
     done
     wait
-    local failed=()
+    START_ALL_FAILED=()
     for i in $(seq 0 $((N - 1))); do
-        [ "$(cat "$SCRATCH/start.$i" 2>/dev/null)" = "ok" ] || failed+=("$i")
+        [ "$(cat "$SCRATCH/start.$i" 2>/dev/null)" = "ok" ] || START_ALL_FAILED+=("$i")
     done
-    if [ "${#failed[@]}" -gt 0 ]; then
-        log "WARNING: start failed for node(s): ${failed[*]} -- check manually"
-    fi
 }
 
 # --------------------------------------------------------------- abort path
@@ -239,7 +283,15 @@ abort_restart() { # <reason...>
     log "doing anything unsound; check 'uc2ctl status' on every node before trusting"
     log "the cluster is healthy, and re-run the upgrade only after every node agrees)."
     start_all
-    log "ABORT: restart issued. Exiting 1 -- the upgrade did NOT complete."
+    if [ "${#START_ALL_FAILED[@]}" -gt 0 ]; then
+        log "restart did not confirm node(s) ${START_ALL_FAILED[*]} -- retrying once"
+        start_all
+    fi
+    if [ "${#START_ALL_FAILED[@]}" -gt 0 ]; then
+        log "ABORT FINAL: node(s) STILL DOWN after restart + one retry: ${START_ALL_FAILED[*]} -- MANUAL ACTION REQUIRED: start them by hand, then confirm with 'uc2ctl status' on every node before touching this cluster again."
+        exit 3
+    fi
+    log "ABORT: restart issued and confirmed for all $N node(s). Exiting 1 -- the upgrade did NOT complete."
     exit 1
 }
 
@@ -270,7 +322,10 @@ for i in $(seq 0 $((N - 1))); do
         fi
     fi
     if text="$(node_status "$i" 2>&1)"; then
-        v="$(cfg_version_of "$text")"
+        # `|| true`: a transient parse gap (missing field in an otherwise-0
+        # exit status) must feed PRE_ISSUES below, not crash the script via
+        # errexit on this bare assignment (Fix round 1, Critical 1).
+        v="$(cfg_version_of "$text" || true)"
         if [ -z "$v" ]; then
             PRE_ISSUES+=("$label: 'uc2ctl status' output did not parse (no config: version=)")
             continue
@@ -361,7 +416,11 @@ declare -a DURABLES=()
 declare -a VERIFY_ISSUES=()
 for i in $(seq 0 $((N - 1))); do
     if text="$(node_status "$i" 2>&1)"; then
-        d="$(durable_of "$text")"
+        # `|| true`: a status that exits 0 but is missing the durable= field
+        # (malformed-but-successful) must land in VERIFY_ISSUES below with a
+        # named per-node message, not crash via errexit (Fix round 1,
+        # Critical 1 / Important 4).
+        d="$(durable_of "$text" || true)"
         if [ -z "$d" ]; then
             VERIFY_ISSUES+=("node $i: status did not parse a durable= value")
         else
@@ -421,8 +480,15 @@ fi
 # ============================================================== step 5
 
 step 5 "start ALL nodes"
-NODES_STOPPED=0   # from here, "restart" IS what we're doing -- no auto-abort needed
 start_all
+# Reset only AFTER start_all is issued (Fix round 1, Important 2): while
+# start_all itself is running, an unhandled failure should still route
+# through the abort/retry machinery, not bare-exit — moving this earlier
+# would have blinded on_err to a failure occurring mid-start.
+NODES_STOPPED=0   # from here, "restart" IS what we're doing -- no auto-abort needed
+if [ "${#START_ALL_FAILED[@]}" -gt 0 ]; then
+    log "WARNING: start failed for node(s): ${START_ALL_FAILED[*]} -- step 6 will time out and name them if they don't come up"
+fi
 log "start issued for all $N node(s)"
 
 # ============================================================== step 6
@@ -435,9 +501,15 @@ while true; do
     all_parsed=1
     for i in $(seq 0 $((N - 1))); do
         if text="$(node_status "$i" 2>&1)"; then
-            v="$(cfg_version_of "$text")"
-            l="$(leader_of "$text")"
-            c="$(can_serve_of "$text")"
+            # `|| true` on all three (Fix round 1, Critical 1): a fresh
+            # restart or an ssh-banner splice can produce a 0-exit status
+            # whose text is momentarily missing a field. Without the guard,
+            # this bare assignment would crash the whole script via errexit
+            # instead of feeding the retry loop below — the exact bug the
+            # reviewer's isolated repro demonstrated.
+            v="$(cfg_version_of "$text" || true)"
+            l="$(leader_of "$text" || true)"
+            c="$(can_serve_of "$text" || true)"
             [ -n "$v" ] || all_parsed=0
             VERS+=("$v")
             if [ "$l" = "true" ] && [ "$c" = "true" ]; then LDR_OK+=("$i"); fi
@@ -466,6 +538,6 @@ done
 
 DOWNTIME="$(awk -v a="$LAST_STOP_TS" -v b="$FIRST_SERVE_TS" 'BEGIN{printf "%.3f", b-a}')"
 step 7 "done"
-log "DOWNTIME: ${DOWNTIME}s"
+log "DOWNTIME: ${DOWNTIME}s (the stop side is exact; the convergence side is measured to within +${POLL_SECS}s of the true value -- FIRST_SERVE_TS is only ever taken at a step-6 poll boundary)"
 echo "DOWNTIME: ${DOWNTIME}s"
 exit 0
