@@ -52,6 +52,27 @@ together**. Found by the 2026-08-16 nightly flake hunt; see
 `docs/superpowers/plans/2026-08-16-nightly-flake-hunt-brief.md` and
 `docs/notes/uc2-term-map-window-loss-explained.md`.
 
+**M9 (deployable node) is complete and released (`v2.3.0`)**: the real
+`uc2-node` daemon (TOML config file, named startup refusals, SIGTERM
+drain-and-stop), the `counter-service` binary template, systemd units and
+`node.example.toml` under `packaging/`, and the restart-cost fleet gate
+(`docs/benchmarks/uc2-m9-gate-2026-08-19.md`). The production-readiness arc
+(M9–M12) is specced in
+`docs/superpowers/specs/2026-08-19-uc2-production-readiness-design.md`.
+
+**M10 (observable cluster) is merged; fleet rows pending (`v2.4.0` tags only
+when they pass)**: an in-daemon `/metrics` + `/healthz` + `/readyz` endpoint
+over the cnc page (hand-rolled `std::net`, zero new dependencies — enabled by
+the `[metrics]` config section, off when absent), transition-triggered
+JSON-lines records (`[log]` section sets the level), a fail-fast daemon on
+agent death, and shipped alert rules + Grafana dashboard under `packaging/`
+with every rule proven to fire (`scripts/m10_alert_fire.sh`, needs
+`promtool`). Readiness keys on `can_serve`, never the leader flag — the
+elected-but-not-serving `0x01` state is not ready. The peer-slot band is
+leader-authoritative (followers export zeros). Gate doc:
+`docs/benchmarks/uc2-m10-gate-2026-08-20.md`; operator docs:
+`docs/how-to/monitor-a-cluster.md`.
+
 **The v1 stack (an `openraft`-based design) has been retired** and its crates
 deleted — v2 owns consensus, elections, and transport directly. Do not
 reintroduce `openraft`, `quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client`
