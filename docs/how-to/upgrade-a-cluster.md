@@ -95,22 +95,30 @@ Every step prints a timestamp.
 
 ## The abort path is load-bearing
 
-Once nodes are stopped (step 2 onward), **any unexpected failure restarts
-every node on whatever binary is currently in place** rather than leaving the
-cluster down — this is the un-upgrade path, and it is not optional or
-best-effort. If `--upgrade-cmd` succeeded on some hosts and failed on others
-before the abort fires, the restart can bring the cluster up on a **mixed**
-version — which the 0.5.0 posture above self-stalls commits on rather than
-doing anything unsound, but it is not automatically healthy. The script says
-so explicitly in its abort log; run `uc2ctl status` on every node before
-trusting the cluster again, and re-upgrade only once every node agrees.
+From step 2 (stopping nodes) through step 4 (`--upgrade-cmd`), **any
+unexpected failure restarts every node on whatever binary is currently in
+place** rather than leaving the cluster down — this is the un-upgrade path,
+and it is not optional or best-effort. If `--upgrade-cmd` succeeded on some
+hosts and failed on others before the abort fires, the restart can bring the
+cluster up on a **mixed** version — which the 0.5.0 posture above self-stalls
+commits on rather than doing anything unsound, but it is not automatically
+healthy. The script says so explicitly in its abort log; run `uc2ctl status`
+on every node before trusting the cluster again, and re-upgrade only once
+every node agrees.
+
+**Step 6 (waiting for convergence) is not covered by this path.** By step 6
+every node has already been stopped, upgraded, and told to start — there is
+nothing left to "un-upgrade" in the way steps 2-4 mean it, so a step 6
+timeout does not trigger a restart of its own; it just gives up waiting and
+exits `1`, leaving nodes exactly as step 5 left them. See the exit-code table
+below.
 
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | upgraded; one leader serving with matching config version; `DOWNTIME: <secs>s` printed |
-| `1` | refused before touching anything (preflight, missing `--yes-traffic-stopped`, bad arguments, step 6 timeout), **or** aborted after stopping nodes with every node confirmed back up — the un-upgrade path completed cleanly |
+| `1` | three different situations, all exit `1`, **not all "nothing was touched"**: **(a)** refused before touching anything (preflight, missing `--yes-traffic-stopped`, bad arguments) — no node was stopped, upgraded, or restarted; **(b)** `abort_restart` fired on a failure at steps 2-4 (a stop that didn't confirm, disagreeing durable positions, or a failed `--upgrade-cmd`) — the un-upgrade path restarts every node and confirms every one back up before this exit; **or (c)** a **step 6 convergence timeout** — by step 6 every node has already been stopped, had `--upgrade-cmd` run, and been told to start, so this is not "nothing touched" either, but it is also NOT the un-upgrade path: a timeout does not call `abort_restart` or attempt a restart of its own, it just gives up waiting. Nodes are left exactly as step 5 left them (typically already on the NEW binary, possibly including one that never confirmed starting) — run `uc2ctl status` on every node before assuming anything |
 | `3` | aborted after stopping nodes, and the abort path's restart (plus one retry) still left at least one node down — manual operator action required: start it by hand, then check `uc2ctl status` everywhere before touching the cluster again |
 
 `3` is deliberately distinct from `1` so a monitoring wrapper can tell

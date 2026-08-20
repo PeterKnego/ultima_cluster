@@ -31,7 +31,7 @@ use uc2_client::Client;
 use uc2_log::cnc::CncPage;
 use uc2_net::fault::FaultConfig;
 use uc2_node::backup::{backup_instance, restore_artifact, verify_artifact, BackupError};
-use uc2_node::{Node, NodeConfig, PurgePolicy};
+use uc2_node::{InstanceDir, Node, NodeConfig, PurgePolicy};
 use uc2_service::snapshots::SnapshotStore;
 use uc2_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
@@ -884,4 +884,126 @@ fn restore_refuses_a_dirty_target() {
     assert_eq!(leftover, b"junk");
     assert!(!target.join("state").exists(), "refused restore must not create state/");
     assert!(!target.join("snapshots").exists(), "refused restore must not create snapshots/");
+}
+
+// ---------------------------------------------------------------------- Final review, Important 1
+
+/// Final review, Important 1: `verify_artifact` must refuse a RUNNING node's
+/// own instance directory rather than heal (physically truncate) a torn tail
+/// out from under its live writer — a narrow, real acked-write-loss race an
+/// operator typo (or swapped restore/verify arguments) could trigger.
+/// `refuse_if_live_instance_dir` (`uc2_node::backup`) closes this: a backup
+/// artifact never contains `instance.lock`, so its presence AND a held flock
+/// means `verify_artifact` was pointed at a live node's own directory.
+#[test]
+fn verify_artifact_refuses_a_running_instance_dir() {
+    let _serialize_guard = serialize();
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let app = "live-verify";
+
+    let node = start_node(&dir, app, PurgePolicy::Disabled);
+    drive_and_quiesce(&node, 200);
+
+    match verify_artifact(&dir) {
+        Err(BackupError::LooksLikeLiveInstanceDir(p)) => assert_eq!(p, dir),
+        other => panic!("expected LooksLikeLiveInstanceDir, got {other:?}"),
+    }
+
+    match node.stop_draining(Duration::from_secs(10)) {
+        uc2_node::DrainOutcome::Drained => {}
+        other => panic!("expected Drained, got {other:?}"),
+    }
+}
+
+/// Final review, Important 1: `restore_artifact`'s `artifact` argument gets
+/// the same refusal for free, via `verify_artifact`'s internal probe — a
+/// live node's own instance directory is never a valid artifact to restore
+/// FROM either. Refused before anything is read from or written to `target`.
+#[test]
+fn restore_artifact_refuses_a_running_artifact_argument() {
+    let _serialize_guard = serialize();
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let app = "live-restore-src";
+
+    let node = start_node(&dir, app, PurgePolicy::Disabled);
+    drive_and_quiesce(&node, 200);
+
+    let target = root.path().join("fresh-target");
+    match restore_artifact(&dir, &target) {
+        Err(BackupError::LooksLikeLiveInstanceDir(p)) => assert_eq!(p, dir),
+        other => panic!("expected LooksLikeLiveInstanceDir, got {other:?}"),
+    }
+    assert!(!target.exists(), "a refused restore must not create the target at all");
+
+    match node.stop_draining(Duration::from_secs(10)) {
+        uc2_node::DrainOutcome::Drained => {}
+        other => panic!("expected Drained, got {other:?}"),
+    }
+}
+
+/// Final review, Important 1: `restore_artifact`'s TARGET gets the same
+/// probe too, separately from its `artifact` argument — the window this
+/// closes is a target whose `journal/`/`state/`/`snapshots/` are all still
+/// EMPTY (so `TargetNotEmpty` alone would not catch it) because a node has
+/// only just called `InstanceDir::acquire` and not yet written anything.
+/// That boot window is real but narrow for a genuinely running node, so this
+/// pins the guard directly with `InstanceDir::acquire` (the same primitive a
+/// real boot's first step uses) rather than racing to observe it.
+#[test]
+fn restore_artifact_refuses_a_live_but_empty_target() {
+    let _serialize_guard = serialize();
+    let root = scratch();
+
+    // A real, verifiable artifact — its own source node is unrelated to the
+    // target under test and is fully stopped before restore is attempted.
+    let src_dir = root.path().join("n0-src");
+    let app = "live-restore-target";
+    let node = start_node(&src_dir, app, PurgePolicy::Disabled);
+    drive_and_quiesce(&node, 200);
+    match node.stop_draining(Duration::from_secs(10)) {
+        uc2_node::DrainOutcome::Drained => {}
+        other => panic!("expected Drained, got {other:?}"),
+    }
+    let artifact = root.path().join("live-restore-target-artifact");
+    backup_instance(&src_dir, &artifact).expect("backup_instance");
+
+    let target = root.path().join("live-empty-target");
+    let held = InstanceDir::acquire(&target).expect("acquire");
+
+    match restore_artifact(&artifact, &target) {
+        Err(BackupError::LooksLikeLiveInstanceDir(p)) => assert_eq!(p, target),
+        other => panic!("expected LooksLikeLiveInstanceDir, got {other:?}"),
+    }
+
+    drop(held);
+}
+
+/// Final review, Important 1: the flip side of the refusal — a STOPPED
+/// node's own instance directory has a leftover `instance.lock` FILE
+/// (shutdown releases the flock but never deletes the file, same as the
+/// pre-existing `restore_accepts_a_target_with_empty_dirs_and_a_stale_lock`
+/// fixture's stale lock) and must still verify fine IN PLACE, not only via a
+/// copied-out artifact. This is the legitimate case the fix's blueprint
+/// explicitly calls out as one the refusal must not break.
+#[test]
+fn verify_artifact_proceeds_on_a_stopped_nodes_dir_with_a_stale_lock() {
+    let _serialize_guard = serialize();
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let app = "stopped-verify-in-place";
+
+    let node = start_node(&dir, app, PurgePolicy::Disabled);
+    drive_and_quiesce(&node, 200);
+    match node.stop_draining(Duration::from_secs(10)) {
+        uc2_node::DrainOutcome::Drained => {}
+        other => panic!("expected Drained, got {other:?}"),
+    }
+
+    assert!(dir.join("instance.lock").is_file(), "shutdown must leave the lock FILE in place");
+
+    let report =
+        verify_artifact(&dir).expect("a stopped node's own instance dir must verify in place");
+    assert!(report.journal_last_pos > 0);
 }

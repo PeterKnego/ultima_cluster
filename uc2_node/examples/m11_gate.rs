@@ -79,8 +79,8 @@ const BAR: &[(&str, &str)] = &[
         "4",
         "disk-low observability: uc2_free_disk_bytes present in a live daemon's real /metrics \
          scrape; scripts/m10_alert_fire.sh 14/14 incl. Uc2DiskLow, exit 0; the YAML<->builders \
-         completeness cross-check trips (named FAIL) on a deliberately removed builder, then the \
-         script is restored byte-for-byte — LOCAL, GATED",
+         completeness cross-check trips (named FAIL) when a builder is deliberately removed, then \
+         the script is restored and re-verified green — LOCAL, GATED",
     ),
     (
         "5",

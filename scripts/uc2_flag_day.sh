@@ -51,11 +51,25 @@
 # Exit codes:
 #   0 = upgraded; cluster serving a single leader with matching config
 #       version; `DOWNTIME: <secs>s` printed.
-#   1 = refused before touching anything (preflight, missing
-#       --yes-traffic-stopped, bad arguments, step 6 timeout), OR aborted
-#       after stopping nodes with EVERY node CONFIRMED back up on whatever
-#       binary is currently in place (see the printed ABORT reason) — the
-#       "un-upgrade" path completed cleanly.
+#   1 = three different situations, all exit 1, NOT all "nothing touched":
+#       (a) refused before touching anything (preflight, missing
+#           --yes-traffic-stopped, bad arguments) — no node was stopped,
+#           upgraded, or restarted; OR
+#       (b) `abort_restart` fired on a failure at steps 2-4 (a stop that
+#           didn't confirm, disagreeing durable positions, or a failed
+#           upgrade-cmd) — nodes WERE stopped; the un-upgrade path restarts
+#           every node on whatever binary is currently in place and confirms
+#           EVERY node back up before this exit; OR
+#       (c) a step 6 convergence TIMEOUT — by step 6 every node has already
+#           been stopped, had --upgrade-cmd run, and been told to start
+#           (step 5), so this is NOT "nothing was touched" either. Unlike
+#           (b), a step 6 timeout does NOT call abort_restart or attempt any
+#           restart of its own — nodes are left exactly as step 5 left them
+#           (typically already running the NEW binary, possibly including
+#           some that never confirmed starting — see the pre-step-6 WARNING
+#           log line), just not yet converged on one serving leader within
+#           the bound. Check `uc2ctl status` on every node before assuming
+#           anything about cluster state after this exit.
 #   3 = aborted after stopping nodes, and the abort path's restart (plus one
 #       retry) still left at least one node DOWN — manual operator action
 #       required (start it by hand, then check `uc2ctl status` everywhere

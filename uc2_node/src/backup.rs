@@ -64,6 +64,23 @@
 //! path: it silently re-preallocates (GROWS) the active segment to
 //! `segment_size_bytes` on every call, an artifact mutation the "verify may
 //! heal, never hide" constraint does not permit.
+//!
+//! That truncate is still a real write to the active segment, and a real
+//! backup artifact never races anyone for it — but a path an operator hands
+//! to `verify_artifact`/`restore_artifact` by mistake (a typo, or swapped
+//! restore-vs-target arguments) COULD be a running node's live instance
+//! directory, in which case the truncate races the node's own writer for the
+//! same file: a narrow, real acked-write-loss hazard. [`verify_artifact`]
+//! (and, through it, `restore_artifact`'s `artifact` argument, plus
+//! `restore_artifact`'s `instance_dir` target directly) guards against this:
+//! a backup artifact NEVER contains `instance.lock` (`backup_instance` only
+//! ever copies `journal/`/`state/`/`snapshots/`), so if `<path>/instance.lock`
+//! exists AND is currently held by a running node, both functions refuse
+//! with [`BackupError::LooksLikeLiveInstanceDir`] rather than touch anything.
+//! A lock file that is present but NOT held (a stopped node's own leftover)
+//! does not trip this — verifying (or restoring into) a stopped node's own
+//! instance dir in place is the legitimate case the check must not break.
+//! See [`refuse_if_live_instance_dir`].
 
 use std::collections::HashMap;
 use std::fs;
@@ -71,6 +88,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt;
 use uc2_log::archive::{Archive, ArchiveConfig};
 use uc2_log::state::{ConfigRecord, TermMap, VoteRecord};
 use ultima_journal::{StableValue, StableValueConfig};
@@ -158,6 +176,55 @@ pub enum BackupError {
          (refusing to merge or overwrite; use a fresh instance directory)"
     )]
     TargetNotEmpty,
+    /// `verify_artifact` (and, via it, `restore_artifact`'s `artifact`
+    /// argument), plus `restore_artifact`'s `instance_dir` target, refuse a
+    /// path whose `instance.lock` is currently HELD — see
+    /// [`refuse_if_live_instance_dir`]. Backup artifacts never contain this
+    /// file (`backup_instance` only ever copies `journal/`/`state/`/
+    /// `snapshots/`), so an artifact can never trip this; a held lock means
+    /// a node is running there right now, and `verify_artifact`'s one
+    /// permitted heal (a physical truncate of the active journal segment)
+    /// against a live writer's segment is a narrow, real acked-write-loss
+    /// race — the classic operator typo / swapped restore-vs-target
+    /// argument. A lock file that is PRESENT but not held (a stopped node's
+    /// leftover) does NOT trip this — verifying a stopped node's own
+    /// instance dir in place is the legitimate case this must not break.
+    #[error(
+        "{0}: this looks like a live instance directory, not an artifact — a node holds its lock"
+    )]
+    LooksLikeLiveInstanceDir(PathBuf),
+}
+
+/// Probe `<path>/instance.lock` for a currently-running node, without ever
+/// holding the lock beyond the probe itself. Backup artifacts never contain
+/// this file (see [`BackupError::LooksLikeLiveInstanceDir`]'s doc), so its
+/// mere presence already means `path` is (or once was) a real instance
+/// directory rather than a shipped artifact; a non-blocking exclusive
+/// try-lock (`fs2`, same primitive `InstanceDir::acquire` uses to enforce
+/// one-node-per-dir) then distinguishes the two cases that matter
+/// operationally:
+///
+/// - held by someone -> a node owns this dir right now -> refuse
+///   ([`BackupError::LooksLikeLiveInstanceDir`]).
+/// - present but immediately acquirable -> nothing is currently writing (a
+///   stopped node's leftover lock file — shutdown never deletes it, only
+///   releases the flock) -> release it again right away (this function only
+///   ever probes, it is not a caller of `InstanceDir::acquire` and must not
+///   hold the dir) and let the caller proceed.
+///
+/// No `instance.lock` at all is the ordinary shipped-artifact case and is
+/// not probed further.
+fn refuse_if_live_instance_dir(path: &Path) -> Result<(), BackupError> {
+    let lock_path = path.join("instance.lock");
+    if !lock_path.is_file() {
+        return Ok(());
+    }
+    let f = fs::OpenOptions::new().read(true).write(true).open(&lock_path)?;
+    if f.try_lock_exclusive().is_err() {
+        return Err(BackupError::LooksLikeLiveInstanceDir(path.to_path_buf()));
+    }
+    let _ = f.unlock();
+    Ok(())
 }
 
 fn journal_dir(root: &Path) -> PathBuf {
@@ -340,6 +407,12 @@ pub fn backup_instance(instance_dir: &Path, out: &Path) -> Result<BackupReport, 
 /// consecutive `verify_artifact` calls on the same artifact never change any
 /// file's size a second time.
 ///
+/// Refuses BEFORE step 1, without opening anything, if `artifact` looks like
+/// a currently-RUNNING node's instance directory — see
+/// [`BackupError::LooksLikeLiveInstanceDir`] and the module doc's "Read-only
+/// beyond the one permitted heal" section. A stopped node's own instance dir
+/// verifies fine in place; only a live one is refused.
+///
 /// Steps (brief order, matches the semantics this module is built against):
 /// 1. Open the journal (`uc2_log::Archive::open`, which wraps
 ///    `ultima_journal::Journal::open` exactly as node boot does) — recovers
@@ -358,6 +431,13 @@ pub fn backup_instance(instance_dir: &Path, out: &Path) -> Result<BackupReport, 
 /// OFFLINE in the `uc2ctl` sense: filesystem-only, no cnc admin-band
 /// interaction (see [`backup_instance`]'s doc for the same point).
 pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
+    // Checked FIRST, ahead of the layout check below: a live instance dir
+    // (in particular one mid-boot, before all five `state/*.state` files
+    // exist yet) must get the precise `LooksLikeLiveInstanceDir` refusal,
+    // not a confusing `NotAnArtifact` — see that error's doc and
+    // `refuse_if_live_instance_dir`'s.
+    refuse_if_live_instance_dir(artifact)?;
+
     if !looks_like_instance_layout(artifact) {
         return Err(BackupError::NotAnArtifact);
     }
@@ -474,7 +554,13 @@ pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
 /// OFFLINE in the `uc2ctl` sense: filesystem-only, no cnc admin-band
 /// interaction — the target `instance_dir` need not (and normally must not)
 /// have a node running in it at all (see [`backup_instance`]'s doc for the
-/// same point about the source side).
+/// same point about the source side). This is enforced, not just assumed:
+/// both `artifact` (via `verify_artifact`) and `instance_dir` itself are
+/// probed for a currently-held `instance.lock` and refused with
+/// [`BackupError::LooksLikeLiveInstanceDir`] if one is found — see the
+/// module doc's "Read-only beyond the one permitted heal" section. A stale,
+/// unheld `instance.lock` left over in an otherwise-empty target (a stopped
+/// node's leftover) is unaffected — only a HELD lock refuses.
 ///
 /// No check guards `artifact == instance_dir`, or `instance_dir` nested
 /// inside `artifact` (or vice versa): none is needed. Self-restore is simply
@@ -482,7 +568,20 @@ pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
 /// (non-empty) artifact's own, so [`BackupError::TargetNotEmpty`] fires
 /// before any copy starts, same as any other already-populated target.
 pub fn restore_artifact(artifact: &Path, instance_dir: &Path) -> Result<BackupReport, BackupError> {
+    // `verify_artifact` already probes `artifact` for a live instance.lock
+    // (see `refuse_if_live_instance_dir`'s doc) — nothing more needed on
+    // that side.
     let report = verify_artifact(artifact)?;
+
+    // The TARGET needs the same probe separately: `TargetNotEmpty` below
+    // only looks at whether journal/state/snapshots hold files, but a node
+    // that has just booted (or is between `InstanceDir::acquire` and its
+    // first journal write) can hold the flock while those directories are
+    // still empty — an operator pointing restore at a live node's own,
+    // freshly-booted instance dir would sail past the emptiness check and
+    // start copying underneath it. Cheap, so it's not worth reasoning our
+    // way out of.
+    refuse_if_live_instance_dir(instance_dir)?;
 
     for dir in [journal_dir(instance_dir), state_dir(instance_dir), snapshots_dir(instance_dir)] {
         if dir.is_dir() && fs::read_dir(&dir)?.next().is_some() {

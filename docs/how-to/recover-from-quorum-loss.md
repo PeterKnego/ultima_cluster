@@ -99,22 +99,32 @@ Confirm `leader=true can_serve=true` and exactly one member in the config.
 
 The dropped peers are not tombstoned, so once their hosts are usable again
 (repaired, replaced, or simply the same host with the old instance directory
-cleared), they rejoin the same way any new member would:
+cleared), they rejoin the same way any new member would — **as a fresh id**,
+the same fresh-forever idiom every other membership change in
+[Change cluster membership](change-cluster-membership.md) uses for a
+permanently-removed (tombstoned) member:
 
 1. **Wipe the dropped peer's instance directory.** Its old `journal/` and
    `state/` reflect a config that no longer exists on the survivor's side; do
    not attempt to reuse them.
-2. **Bring it up as a fresh learner:**
+2. **Bring it up as a fresh learner, under a fresh id** (never one of the
+   original cluster's ids):
    ```bash
-   uc2ctl add-learner --instance-dir D --app-id myapp --id 1 --addr 10.0.0.11:9100
+   uc2ctl add-learner --instance-dir D --app-id myapp --id 3 --addr 10.0.0.11:9100
    ```
 3. **Promote once caught up**, exactly as in
    [Change cluster membership](change-cluster-membership.md#add-a-voter).
 
-A dropped peer may rejoin under its **old** id (it was dropped, not
-tombstoned) as long as its instance directory was wiped first — reusing a
-directory without wiping it, or reusing an id that a *different* force or
-`remove-voter` did tombstone, is undefined behaviour.
+A dropped (not tombstoned) peer's **old** id is not refused by anything in
+`force-single-member` or boot — nothing marks it as forbidden the way a
+tombstone does — but reusing it is **untested and not the recommended
+practice**, and this page does not walk through it. Every recovery path this
+project actually exercises (the `survival.rs` e2e behind
+`--features survival-tests`, and the module doc for
+`uc2_node::recovery::force_single_member`) rejoins a dropped peer under a
+fresh id, exactly like step 2 above, and explicitly never reuses the old one.
+Follow that idiom rather than the old id: it is what is actually proven,
+not merely assumed safe.
 
 ## What this is not
 

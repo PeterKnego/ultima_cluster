@@ -646,13 +646,17 @@ fn write_denied_drives_the_same_failstop_chain() {
 
     let mut acked: u64 = 0;
     let chmod_applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // A tiny watcher thread: as soon as a handful of CAS ops have landed
-    // (proving the cluster is genuinely live and node 0 is receiving
-    // replicated writes into its own journal), flip its journal/ dir to
-    // read+execute-only. Done from a side thread rather than inline in the
-    // load loop so the trigger fires on wall-clock/ack progress
-    // independently of which node the load loop happens to be talking to
-    // at that instant.
+    // A tiny watcher thread: after a fixed 400ms delay (long enough, in
+    // practice, for `warm_up` above plus the load loop's first several CAS
+    // ops to have landed and proven the cluster is genuinely live and node 0
+    // is receiving replicated writes into its own journal — NOT driven by
+    // observing any ack count or other progress signal directly), flip its
+    // journal/ dir to read+execute-only. Done from a side thread rather than
+    // inline in the load loop so the trigger fires on wall-clock elapsed
+    // time independently of which node the load loop happens to be talking
+    // to at that instant. `run_until_failstop_and_assert` below has its own,
+    // much longer (60s) bound, so a slow box just means more load lands
+    // before the chmod fires, not a flake.
     {
         let journal_dir = cluster.dirs[0].join("journal");
         let flag = Arc::clone(&chmod_applied);

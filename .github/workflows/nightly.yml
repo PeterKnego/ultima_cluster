@@ -110,8 +110,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
+      # `--test-threads=1`: each test in this multi-process suite boots a
+      # real 3-node cluster (node + service pairs); the default runner
+      # parallelism would run several of those concurrently on a 4-vCPU
+      # runner, competing for the same cores the busy-spin polling agents
+      # need (see `uc2_node/tests/backup.rs`'s `serialize()` for the same
+      # oversubscription failure mode observed there).
       - name: Backup under load -> host destroyed -> restore -> rejoin
-        run: cargo test -p uc2-crashtest --features survival-tests
+        run: cargo test -p uc2-crashtest --features survival-tests -- --test-threads=1
       # M11 Task 6: ENOSPC asserted end-to-end. A 64 MiB loopback ext4
       # filesystem (scripts/enospc_fixture.sh) needs sudo for mkfs/mount/
       # chown, which ubuntu-latest has (unlike the dev box this was
@@ -123,7 +129,7 @@ jobs:
       - name: Create the ENOSPC loopback fixture
         run: scripts/enospc_fixture.sh create /home/runner/uc2-enospc-test 64
       - name: ENOSPC fail-stop asserted; cluster survives; recovers on space return
-        run: cargo test -p uc2-crashtest --features enospc-tests
+        run: cargo test -p uc2-crashtest --features enospc-tests -- --test-threads=1
         env:
           UC2_ENOSPC_DIR: /home/runner/uc2-enospc-test
       - name: Destroy the ENOSPC loopback fixture

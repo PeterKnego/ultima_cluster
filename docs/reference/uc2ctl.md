@@ -136,7 +136,14 @@ the coverage invariant (a journal whose `first_base > 0` must be covered by a
 retained snapshot, else `Hole`), and cross-checks a `MANIFEST` if present
 (`ManifestMismatch` on tamper/bitrot). May heal the artifact's own torn
 active-segment tail (a shrink-only truncate, reported as
-`healed_torn_tail=true`); everything else is read-only.
+`healed_torn_tail=true`, which is the routine case under segment
+preallocation, not by itself a sign of trouble); everything else is
+read-only. Refuses (`LooksLikeLiveInstanceDir`) if the target's
+`instance.lock` is currently held by a running node — the truncate heal
+against a live writer's active segment is a narrow, real acked-write-loss
+race, not something a typo'd path should be able to trigger. A stopped
+node's own instance directory, lock file leftover and all, verifies fine in
+place.
 
 ```
 uc2ctl verify-backup <ARTIFACT>
@@ -154,10 +161,16 @@ fresh instance directory.
 uc2ctl restore <ARTIFACT> --instance-dir <DIR>
 ```
 
-Refuses (`TargetNotEmpty`) if `--instance-dir`'s `journal/`, `state/`, or
-`snapshots/` already contain anything — restore never merges or overwrites.
-Volatile leftovers (`cnc2.dat`, `log.buf`, rings, `instance.lock`) are fine.
-The target should not have a node running in it. Same `key=value` report as
+Runs `verify-backup` on `<ARTIFACT>` first (so `<ARTIFACT>` also gets the
+`LooksLikeLiveInstanceDir` refusal above — a live node's own instance dir is
+never a valid artifact to restore from). Refuses (`TargetNotEmpty`) if
+`--instance-dir`'s `journal/`, `state/`, or `snapshots/` already contain
+anything — restore never merges or overwrites. Volatile leftovers
+(`cnc2.dat`, `log.buf`, rings, `instance.lock`) are fine. `--instance-dir`
+itself is also refused with `LooksLikeLiveInstanceDir` if a node currently
+holds its `instance.lock` — belt-and-suspenders for the narrow window where a
+just-booted node's durable subdirectories are still empty (so
+`TargetNotEmpty` alone would not catch it). Same `key=value` report as
 `backup` (the artifact's positions, not a property re-derived from the new
 instance directory).
 

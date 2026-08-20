@@ -36,9 +36,12 @@ journal_first_base=0
 journal_last_pos=5242880
 newest_snapshot=none
 snapshot_floor=0
-healed_torn_tail=false
+healed_torn_tail=true
 files=3
 ```
+
+(`healed_torn_tail=true` here is the ordinary case, not a sign of trouble —
+see the note under "Verify before you trust it" below.)
 
 `backup` refuses an `--out` that already exists and is non-empty
 (`ArtifactExists`) rather than merging into it — always point it at a fresh
@@ -95,7 +98,11 @@ verified clean.
 ## Verify before you trust it
 
 A backup you have not verified is a directory, not a backup. Verification is
-read-only except for one permitted heal:
+read-only except for one permitted heal. `verify-backup` (and `restore`, for
+its artifact argument) refuse a path that looks like a **running** node's
+instance directory — a stopped node's own directory verifies fine in place,
+but the heal above is a real write, and racing it against a live node's own
+writer is exactly the hazard these tools must not create.
 
 ```bash
 uc2ctl verify-backup /srv/uc2-backups/n1-2026-08-20
@@ -107,7 +114,14 @@ Verify:
    tail — a copy taken mid-append looks exactly like a crash, and heals the
    same way a restart does (a physical shrink-only truncate, never a grow).
    This is the **one** mutation verify is allowed to make, and it is always
-   reported as `healed_torn_tail=true`, never hidden.
+   reported as `healed_torn_tail=true`, never hidden. Seeing
+   `healed_torn_tail=true` is **routine, not alarming**: with segment
+   preallocation on (the default), a node's active segment file is
+   physically larger than the position it has actually recovered to — the
+   zero-filled preallocated tail beyond the real data — so a backup taken of
+   a perfectly healthy, cleanly-running node reports `true` just as often as
+   one taken genuinely mid-crash-equivalent append. It is not, by itself, a
+   sign anything went wrong.
 2. Opens all five `state/*.state` files read-only.
 3. Lists `snapshots/snap-*.ultsnap` and finds the newest.
 4. Checks the **coverage invariant**: if the journal's `first_base` is above
@@ -131,11 +145,16 @@ uc2ctl restore /srv/uc2-backups/n1-2026-08-20 --instance-dir /srv/uc2/n1-new
 ```
 
 Restore runs `verify-backup` on the artifact **first** — a hole, a manifest
-mismatch, or a corrupt artifact aborts before anything is copied — then
-refuses if the target's `journal/`, `state/`, or `snapshots/` already contain
-anything (`TargetNotEmpty`): restore never merges or overwrites. Volatile
-leftovers in the target (a stale `cnc2.dat`, ring files) are fine and left
-alone; boot recreates them regardless.
+mismatch, a corrupt artifact, or the artifact looking like a running node's
+own instance dir aborts before anything is copied — then refuses if the
+target's `journal/`, `state/`, or `snapshots/` already contain anything
+(`TargetNotEmpty`): restore never merges or overwrites. Volatile leftovers in
+the target (a stale `cnc2.dat`, ring files) are fine and left alone; boot
+recreates them regardless. The target itself is also refused if a node is
+currently running in it — cheap insurance for the narrow window right after
+`InstanceDir` is acquired, before a fresh boot has written anything, where
+`journal/`/`state/`/`snapshots/` are still empty and `TargetNotEmpty` alone
+would not catch it.
 
 Once restored, start a node against `--instance-dir` as normal. First boot
 does everything else: a fresh `cnc2.dat` and `instance_id`, config/vote/term
