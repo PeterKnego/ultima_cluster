@@ -2,7 +2,12 @@
 // Copyright 2026 Peter Knego
 
 //! M11 Task 1: an offline, ordered-copy backup artifact + a read-only verify
-//! over it.
+//! over it. M11 Task 2 adds [`restore_artifact`]: copy a verified artifact's
+//! three durable directories into a fresh instance directory, refusing a
+//! target whose durable subdirectories are already non-empty. All three
+//! entry points ([`backup_instance`], [`verify_artifact`],
+//! [`restore_artifact`]) are OFFLINE — filesystem-only, no cnc admin-band
+//! interaction, unlike every other `uc2ctl` admin verb.
 //!
 //! A backup is a plain filesystem copy of an instance directory's DURABLE
 //! subdirectories (`journal/`, `state/`, `snapshots/` — see
@@ -143,6 +148,16 @@ pub enum BackupError {
     /// or a `state/*.state` file that fails to decode on BOTH slots).
     #[error("not a backup artifact: missing or corrupt journal/state layout")]
     NotAnArtifact,
+    /// `restore_artifact`'s target `instance_dir` already has a non-empty
+    /// `journal/`, `state/`, or `snapshots/` — refused rather than merged or
+    /// overwritten. Volatile leftovers (`cnc2.dat`, `log.buf`, `*.ring`,
+    /// `*.broadcast`, `instance.lock`) do NOT trigger this: boot recreates
+    /// them unconditionally, so they are harmless to leave behind.
+    #[error(
+        "restore target already has a non-empty journal/, state/, or snapshots/ directory \
+         (refusing to merge or overwrite; use a fresh instance directory)"
+    )]
+    TargetNotEmpty,
 }
 
 fn journal_dir(root: &Path) -> PathBuf {
@@ -282,6 +297,12 @@ fn copy_dir_sorted_once(
 /// refuse a hole call `verify_artifact`'s result explicitly) and writes a
 /// hand-formatted `MANIFEST` (`key=value` lines — no serde_json in this
 /// workspace) recording the recovered positions.
+///
+/// OFFLINE in the `uc2ctl` sense: this is a filesystem-only operation, with no
+/// interaction with a running node's cnc admin band whatsoever (unlike every
+/// other `uc2ctl` admin verb, which talks to a node purely through that
+/// channel). The node MAY be running throughout a call, but this function
+/// never reads or writes its cnc page.
 pub fn backup_instance(instance_dir: &Path, out: &Path) -> Result<BackupReport, BackupError> {
     if !looks_like_instance_layout(instance_dir) {
         return Err(BackupError::NotAnInstanceDir);
@@ -333,6 +354,9 @@ pub fn backup_instance(instance_dir: &Path, out: &Path) -> Result<BackupReport, 
 /// 5. If a `MANIFEST` is present, cross-check its recorded values against
 ///    what was just recovered — a re-verify of a shipped artifact must catch
 ///    tampering/bitrot at the metadata level.
+///
+/// OFFLINE in the `uc2ctl` sense: filesystem-only, no cnc admin-band
+/// interaction (see [`backup_instance`]'s doc for the same point).
 pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
     if !looks_like_instance_layout(artifact) {
         return Err(BackupError::NotAnArtifact);
@@ -400,6 +424,73 @@ pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
     let manifest_path = artifact.join("MANIFEST");
     if manifest_path.is_file() {
         check_manifest(&manifest_path, &report)?;
+    }
+
+    Ok(report)
+}
+
+/// M11 Task 2: restore a backup artifact into an `instance_dir` a node has
+/// never booted in (or one whose durable subdirectories were cleared).
+///
+/// Runs [`verify_artifact`] on `artifact` FIRST — the one permitted mutation
+/// (healing a torn active-segment tail, a physical shrink-only `truncate`)
+/// applies to the ARTIFACT, not the target; that is expected and reported via
+/// [`BackupReport::healed_torn_tail`], never hidden, exactly as it is for a
+/// standalone verify. A verify failure ([`BackupError::Hole`],
+/// [`BackupError::NotAnArtifact`], [`BackupError::ManifestMismatch`]) aborts
+/// before anything is copied.
+///
+/// Then refuses if `instance_dir`'s `journal/`, `state/`, or `snapshots/`
+/// exist and are non-empty ([`BackupError::TargetNotEmpty`]) — restore never
+/// merges or overwrites. Volatile leftovers (`cnc2.dat`, `log.buf`,
+/// `*.ring`/`*.broadcast`, `instance.lock`) are allowed and left untouched;
+/// a node's first boot recreates them unconditionally regardless of what
+/// restore did.
+///
+/// On success, copies the three durable directories into `instance_dir`
+/// (same [`copy_dir_sorted`] helper `backup_instance` uses — ordering does
+/// not matter here the way it does for a live backup, since `artifact` is a
+/// static, already-verified snapshot of a moment, not a live, concurrently-
+/// mutating instance dir; reused anyway rather than duplicated). `MANIFEST`
+/// is deliberately NOT copied into `instance_dir` — it is metadata about the
+/// artifact, not part of a node's instance-directory layout, and boot never
+/// looks for it.
+///
+/// The restored node's first boot does everything else: a fresh `cnc2.dat`
+/// page and `instance_id`, `ConfigRecord`/vote/term-map recovery from the
+/// copied `state/`, and (if the restored id is a minority of a still-healthy
+/// quorum) rejoin/repair via the normal replication path. Restoring a
+/// MINORITY of voters against a live majority is safe by construction (the
+/// healthy quorum repairs or neutralizes any rolled-back log/vote); restoring
+/// a MAJORITY is the quorum-loss procedure's domain, not this function's —
+/// it carries its own data-loss statement and is not silently equivalent to
+/// this.
+///
+/// Returns the artifact's [`BackupReport`] (i.e. what was restored, not a
+/// property of the resulting `instance_dir` — the two agree immediately
+/// after a successful call, but `instance_dir` is a live node's territory
+/// from the moment it next boots).
+///
+/// OFFLINE in the `uc2ctl` sense: filesystem-only, no cnc admin-band
+/// interaction — the target `instance_dir` need not (and normally must not)
+/// have a node running in it at all (see [`backup_instance`]'s doc for the
+/// same point about the source side).
+pub fn restore_artifact(artifact: &Path, instance_dir: &Path) -> Result<BackupReport, BackupError> {
+    let report = verify_artifact(artifact)?;
+
+    for dir in [journal_dir(instance_dir), state_dir(instance_dir), snapshots_dir(instance_dir)] {
+        if dir.is_dir() && fs::read_dir(&dir)?.next().is_some() {
+            return Err(BackupError::TargetNotEmpty);
+        }
+    }
+
+    copy_dir_sorted(&journal_dir(artifact), &journal_dir(instance_dir), |_| true)?;
+    copy_dir_sorted(&state_dir(artifact), &state_dir(instance_dir), |_| true)?;
+    let src_snapshots = snapshots_dir(artifact);
+    if src_snapshots.is_dir() {
+        copy_dir_sorted(&src_snapshots, &snapshots_dir(instance_dir), |n| {
+            parse_snap_pos(n).is_some()
+        })?;
     }
 
     Ok(report)

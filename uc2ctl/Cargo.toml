@@ -10,11 +10,18 @@ description = "Admin CLI for live ultima_cluster reconfiguration"
 publish = false
 
 # Deliberately its own crate rather than a bin inside `uc2_node`: uc2ctl talks
-# to a node purely through the cnc page's admin slots, so it needs `uc2_log` and
-# `uc_protocol` but NOT `uc2_node` itself — and keeping it separate is what
-# stops `clap` becoming a dependency of the node library for every consumer.
+# to a running node purely through the cnc page's admin slots, so the live
+# reconfiguration verbs need only `uc2_log` and `uc_protocol`, not `uc2_node`
+# itself — that split is what keeps `clap` off the node library's dependency
+# graph for every consumer. M11 Task 2's `backup`/`verify-backup`/`restore`
+# verbs are the one exception: they are OFFLINE (filesystem-only, no cnc
+# admin-band interaction at all — see `uc2_node::backup`'s module doc) and
+# reuse that module's `backup_instance`/`verify_artifact`/`restore_artifact`
+# rather than reimplementing them here, so `uc2_node` becomes a dependency
+# for THOSE three verbs specifically.
 [dependencies]
 uc2_log = { path = "../uc2_log" }
+uc2_node = { path = "../uc2_node" }
 uc_protocol = { path = "../uc_protocol" }
 clap = { workspace = true }
 anyhow = { workspace = true }

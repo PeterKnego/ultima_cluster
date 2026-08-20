@@ -29,6 +29,18 @@
 //! uc2ctl status         --instance-dir D --app-id A
 //! ```
 //!
+//! M11 Task 2 adds three OFFLINE verbs (`uc2_node::backup`) that do NOT touch
+//! a running node's cnc admin band at all — filesystem-only, so there is no
+//! `--app-id` (nothing to check it against on disk) and `backup`/`restore`
+//! take only `--instance-dir` (no `--app-id` companion, unlike every verb
+//! above):
+//!
+//! ```text
+//! uc2ctl backup        --instance-dir D --out ARTIFACT
+//! uc2ctl verify-backup  ARTIFACT
+//! uc2ctl restore        ARTIFACT --instance-dir D
+//! ```
+//!
 //! From a source checkout, without installing:
 //!
 //! ```text
@@ -104,6 +116,44 @@ struct StatusArgs {
     admission_bytes: Option<u64>,
 }
 
+// ---------------------------------------------------------------- M11 Task 2: offline backup
+
+/// `backup`/`restore` deliberately do NOT reuse `CommonArgs`: both are
+/// OFFLINE (filesystem-only — see `uc2_node::backup`'s module doc), so there
+/// is no running node's cnc page to check an `app_id` against, and dragging
+/// an unused `--app-id` flag onto these two would be actively misleading
+/// (implying a check that never happens). `verify-backup` needs neither flag
+/// at all — just the artifact path.
+#[derive(clap::Args)]
+struct BackupArgs {
+    /// The node's on-disk instance directory (same one passed to
+    /// `Node::start`). The node MAY be running throughout.
+    #[arg(long)]
+    instance_dir: PathBuf,
+    /// Destination directory for the new backup artifact. Created if absent;
+    /// refused if it already exists and is non-empty.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct VerifyBackupArgs {
+    /// Path to a backup artifact (as produced by `uc2ctl backup`).
+    artifact: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct RestoreArgs {
+    /// Path to a backup artifact (as produced by `uc2ctl backup`).
+    artifact: PathBuf,
+    /// The instance directory to restore into. Must not already have a
+    /// non-empty `journal/`, `state/`, or `snapshots/` — a fresh directory,
+    /// or a decommissioned instance dir with those cleared. Volatile
+    /// leftovers (`cnc2.dat`, `log.buf`, rings, `instance.lock`) are fine.
+    #[arg(long)]
+    instance_dir: PathBuf,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Add a fresh learner (wire op 1).
@@ -119,6 +169,22 @@ enum Cmd {
     /// Print the cluster's current config version/pending state, per-member
     /// peer-slot observability, and leader/serving flags.
     Status(StatusArgs),
+    /// OFFLINE (M11 Task 2): ordered-copy an instance directory's durable
+    /// journal/state/snapshots into a fresh backup artifact. Filesystem-only
+    /// — no cnc admin-band interaction; the node may be running throughout.
+    Backup(BackupArgs),
+    /// OFFLINE (M11 Task 2): read-only verification of a backup artifact —
+    /// recovers its positions, checks the coverage invariant, cross-checks
+    /// its `MANIFEST` if present. May heal the ARTIFACT's own torn
+    /// active-segment tail (a shrink-only truncate); everything else is
+    /// read-only. Filesystem-only, no cnc admin-band interaction.
+    VerifyBackup(VerifyBackupArgs),
+    /// OFFLINE (M11 Task 2): verify a backup artifact, then copy its three
+    /// durable directories into a fresh instance directory. Refuses a target
+    /// whose `journal/`, `state/`, or `snapshots/` is already non-empty.
+    /// Filesystem-only, no cnc admin-band interaction — the target
+    /// `instance_dir` should not have a node running in it.
+    Restore(RestoreArgs),
 }
 
 fn main() {
@@ -130,6 +196,9 @@ fn main() {
         Cmd::RemoveLearner(a) => run_mutate(&a.common, 4, a.id, (0, 0)),
         Cmd::RemoveVoter(a) => run_mutate(&a.common, 5, a.id, (0, 0)),
         Cmd::Status(a) => run_status(&a),
+        Cmd::Backup(a) => run_backup(&a),
+        Cmd::VerifyBackup(a) => run_verify_backup(&a),
+        Cmd::Restore(a) => run_restore(&a),
     };
     if let Err(e) = r {
         eprintln!("uc2ctl error: {e}");
@@ -285,5 +354,42 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
         };
         println!("  id={id} role={role} reported_durable={reported_durable}{warn}");
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- M11 Task 2: offline backup
+
+/// `BackupReport` printed as `key=value` lines, one per field, same
+/// convention as `run_status`'s output — no serde_json in this workspace.
+fn print_backup_report(r: &uc2_node::backup::BackupReport) {
+    println!("journal_first_base={}", r.journal_first_base);
+    println!("journal_last_pos={}", r.journal_last_pos);
+    println!(
+        "newest_snapshot={}",
+        r.newest_snapshot.map(|p| p.to_string()).unwrap_or_else(|| "none".to_string())
+    );
+    println!("snapshot_floor={}", r.snapshot_floor);
+    println!("healed_torn_tail={}", r.healed_torn_tail);
+    println!("files={}", r.files);
+}
+
+fn run_backup(a: &BackupArgs) -> anyhow::Result<()> {
+    let report = uc2_node::backup::backup_instance(&a.instance_dir, &a.out)
+        .map_err(|e| anyhow::anyhow!("backup: {e}"))?;
+    print_backup_report(&report);
+    Ok(())
+}
+
+fn run_verify_backup(a: &VerifyBackupArgs) -> anyhow::Result<()> {
+    let report = uc2_node::backup::verify_artifact(&a.artifact)
+        .map_err(|e| anyhow::anyhow!("verify-backup: {e}"))?;
+    print_backup_report(&report);
+    Ok(())
+}
+
+fn run_restore(a: &RestoreArgs) -> anyhow::Result<()> {
+    let report = uc2_node::backup::restore_artifact(&a.artifact, &a.instance_dir)
+        .map_err(|e| anyhow::anyhow!("restore: {e}"))?;
+    print_backup_report(&report);
     Ok(())
 }

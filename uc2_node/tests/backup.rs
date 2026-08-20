@@ -25,11 +25,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
+use uc2_client::Client;
 use uc2_log::cnc::CncPage;
 use uc2_net::fault::FaultConfig;
-use uc2_node::backup::{backup_instance, verify_artifact, BackupError};
+use uc2_node::backup::{backup_instance, restore_artifact, verify_artifact, BackupError};
 use uc2_node::{Node, NodeConfig, PurgePolicy};
 use uc2_service::snapshots::SnapshotStore;
+use uc2_service::{ServiceBuilder, ServiceConfig, StateMachine};
 
 const SEG_BYTES: u64 = 64 * 1024;
 
@@ -569,4 +573,142 @@ fn verify_never_grows_the_artifacts_files_and_is_idempotent() {
     let after2 = file_sizes(&out);
     assert_eq!(after1, after2, "a second verify_artifact must not mutate any file further");
     assert_eq!(report1, report2, "a second verify_artifact must report identical positions");
+}
+
+// ---------------------------------------------------------------------- M11 Task 2: restore
+
+/// A running total, same minimal shape as `uc2_client/tests/roundtrip.rs`'s
+/// `CountSm` — persists NOTHING itself, so a correct readback after restore
+/// can only come from the restored node's journal being replayed by a freshly
+/// (empty-)started service, exactly the M9 reconstruction path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum RestoreCmd {
+    Add(u64),
+}
+
+#[derive(Default)]
+struct RestoreCountSm {
+    total: u64,
+    last_applied: Option<u64>,
+}
+
+impl StateMachine for RestoreCountSm {
+    type Command = RestoreCmd;
+    type Response = u64;
+    type Query = ();
+    type QueryResponse = u64;
+
+    fn apply(&mut self, position: u64, cmd: RestoreCmd) -> u64 {
+        let RestoreCmd::Add(n) = cmd;
+        self.total += n;
+        self.last_applied = Some(position);
+        self.total
+    }
+
+    fn query(&self, _q: ()) -> u64 {
+        self.total
+    }
+
+    fn last_applied(&self) -> Option<u64> {
+        self.last_applied
+    }
+}
+
+/// End-to-end: back up a stopped single node's instance dir, restore the
+/// artifact into a FRESH instance dir, boot a node + service there, and
+/// confirm the restored cluster elects, serves, and reads back a value
+/// submitted (and committed) BEFORE the backup was taken.
+#[test]
+fn restore_roundtrip_boots_and_serves() {
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let app = "restore1";
+
+    let node = start_node(&dir, app, PurgePolicy::Disabled);
+    let svc = ServiceBuilder::new(ServiceConfig::new(&dir, app), RestoreCountSm::default())
+        .start()
+        .expect("start service");
+
+    let client = Client::connect(&dir, app).expect("connect client");
+    let mut expected_total = 0u64;
+    for _ in 0..50u64 {
+        let got: u64 = client.submit(&RestoreCmd::Add(1)).expect("submit");
+        expected_total += 1;
+        assert_eq!(got, expected_total, "apply order must match submission order");
+    }
+    client.shutdown();
+
+    // Node-first-then-service teardown (see `lincheck_v2/mod.rs`'s doc for
+    // why): the node's read barrier / apply-progress waits can otherwise
+    // block on a service that's already gone.
+    match node.stop_draining(Duration::from_secs(10)) {
+        uc2_node::DrainOutcome::Drained => {}
+        other => panic!("expected Drained, got {other:?}"),
+    }
+    svc.stop();
+
+    let artifact = root.path().join("restore1-artifact");
+    let backup_report = backup_instance(&dir, &artifact).expect("backup_instance");
+
+    let fresh_dir = root.path().join("n0-restored");
+    let restore_report = restore_artifact(&artifact, &fresh_dir).expect("restore_artifact");
+    assert_eq!(
+        restore_report.journal_last_pos, backup_report.journal_last_pos,
+        "restore_artifact must report the artifact's own recovered positions"
+    );
+
+    let restored_node = start_node(&fresh_dir, app, PurgePolicy::Disabled);
+    let restored_svc = ServiceBuilder::new(
+        ServiceConfig::new(&fresh_dir, app),
+        RestoreCountSm::default(),
+    )
+    .start()
+    .expect("start restored service");
+
+    let restored_client = Client::connect(&fresh_dir, app).expect("connect restored client");
+    let got: u64 = restored_client
+        .query_linearizable(&())
+        .expect("linearizable query after restore");
+    assert_eq!(got, expected_total, "restored cluster must serve the pre-backup value");
+
+    restored_client.shutdown();
+    restored_node.stop();
+    restored_svc.stop();
+}
+
+/// `restore_artifact` must refuse a target `instance_dir` whose `journal/` is
+/// already non-empty (a leftover from some earlier, un-decommissioned
+/// instance) rather than merge or overwrite into it — and must leave that
+/// leftover completely untouched.
+#[test]
+fn restore_refuses_a_dirty_target() {
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let app = "restore2";
+
+    let node = start_node(&dir, app, PurgePolicy::Disabled);
+    drive_and_quiesce(&node, 200);
+    match node.stop_draining(Duration::from_secs(10)) {
+        uc2_node::DrainOutcome::Drained => {}
+        other => panic!("expected Drained, got {other:?}"),
+    }
+
+    let artifact = root.path().join("restore2-artifact");
+    backup_instance(&dir, &artifact).expect("backup_instance");
+
+    let target = root.path().join("dirty-target");
+    std::fs::create_dir_all(target.join("journal")).unwrap();
+    std::fs::write(target.join("journal").join("leftover.log"), b"junk").unwrap();
+
+    match restore_artifact(&artifact, &target) {
+        Err(BackupError::TargetNotEmpty) => {}
+        other => panic!("expected TargetNotEmpty, got {other:?}"),
+    }
+
+    // Refused, not partially applied: the leftover file is untouched and
+    // nothing else was created under the target.
+    let leftover = std::fs::read(target.join("journal").join("leftover.log")).unwrap();
+    assert_eq!(leftover, b"junk");
+    assert!(!target.join("state").exists(), "refused restore must not create state/");
+    assert!(!target.join("snapshots").exists(), "refused restore must not create snapshots/");
 }
