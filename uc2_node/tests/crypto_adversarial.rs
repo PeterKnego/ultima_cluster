@@ -422,12 +422,25 @@ fn a_replayed_vote_cannot_be_recounted() {
     let rv = peer1
         .recv_request_vote(Duration::from_secs(10))
         .expect("the victim must campaign and send REQUEST_VOTE");
-    let vote_bytes = peer1.grant_vote(rv.new_term);
+    let mut vote_bytes = peer1.grant_vote(rv.new_term);
 
+    // Keep answering every further campaign until one grant lands INSIDE its
+    // 60-120ms election window. A grant for a term the victim has already
+    // campaigned past is (correctly) dropped by `ElectionSm`'s stale-term
+    // guard, and a peer that granted only once would then never answer again
+    // — so a single ill-timed >120ms scheduling stall (CI vCPU steal)
+    // between the RV and the grant wedged this test permanently (nightly
+    // 2026-08-18..20; reproduced deterministically with an injected 150ms
+    // sleep before a one-shot grant). `vote_bytes` ends as the grant that
+    // actually counted — exactly the ciphertext the replay attack must
+    // replay. Any RV we receive was sent by a candidate that had already
+    // abandoned every earlier term, so a late grant can depose nobody.
     let deadline = Instant::now() + Duration::from_secs(10);
     while !victim.is_leader() {
         assert!(Instant::now() < deadline, "the victim never won its own election");
-        std::thread::yield_now();
+        if let Some(rv) = peer1.recv_request_vote(Duration::from_millis(20)) {
+            vote_bytes = peer1.grant_vote(rv.new_term);
+        }
     }
     let term_before = victim.current_term();
     let replay_before = victim.crypto_stats().dropped_replay.load(Relaxed);
