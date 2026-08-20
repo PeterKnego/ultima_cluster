@@ -22,9 +22,9 @@ use std::sync::Arc;
 use uc_protocol::v2::cnc::{
     self, CNC_MAX_PEER_SLOTS, CNC_OFF_ADMIN_REQ, CNC_OFF_ADMIN_RESP, CNC_OFF_ADMISSION_BYTES,
     CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE, CNC_OFF_CONFIG_PENDING, CNC_OFF_CONFIG_VERSION,
-    CNC_OFF_HEADER_CRC, CNC_OFF_PEER_SLOTS, CNC_OFF_SEAL_FAILURES, CNC_OFF_SERVICE_APPLIED,
-    CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_TERM, CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_V2_VERSION,
-    CncHeader,
+    CNC_OFF_FREE_DISK_BYTES, CNC_OFF_HEADER_CRC, CNC_OFF_PEER_SLOTS, CNC_OFF_SEAL_FAILURES,
+    CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_TERM, CNC_PAGE_LEN,
+    CNC_PEER_SLOT_STRIDE, CNC_V2_VERSION, CncHeader,
 };
 
 use crate::counters::{LogCounters, PaddedAtomicU64};
@@ -476,6 +476,23 @@ impl CncPage {
         unsafe { (*ptr).store_release(v) }
     }
 
+    /// M11 (Task 5): free bytes on the filesystem backing the instance dir,
+    /// as of the daemon's last ~1s derived-events pass. 0 = never published
+    /// — see `CNC_OFF_FREE_DISK_BYTES`'s doc.
+    pub fn free_disk_bytes(&self) -> u64 {
+        // SAFETY: offset 3840, size 8.
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_FREE_DISK_BYTES) as *const PaddedAtomicU64 };
+        unsafe { (*ptr).load_acquire() }
+    }
+
+    /// M11 (Task 5): store the free-disk-bytes reading. Writer: the
+    /// `uc2-node` daemon's main loop only.
+    pub fn store_free_disk_bytes(&self, v: u64) {
+        // SAFETY: offset 3840, size 8.
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_FREE_DISK_BYTES) as *const PaddedAtomicU64 };
+        unsafe { (*ptr).store_release(v) }
+    }
+
     /// M7: config pending (1 = uncommitted, 0 = stable).
     pub fn config_pending(&self) -> u64 {
         // SAFETY: offset 3520, size 8.
@@ -760,6 +777,8 @@ mod tests {
         assert_eq!(CNC_OFF_ADMISSION_BYTES, 3712);
         // M8 (Task 10 review round 1): seal_failures.
         assert_eq!(CNC_OFF_SEAL_FAILURES, 3776);
+        // M11 (Task 5): free_disk_bytes.
+        assert_eq!(CNC_OFF_FREE_DISK_BYTES, 3840);
     }
 
     #[test]
@@ -1019,6 +1038,20 @@ mod tests {
             u64::from_le_bytes(raw[3776..3784].try_into().unwrap()),
             7,
             "offset pin: the value must live at 3776 exactly"
+        );
+    }
+
+    #[test]
+    fn free_disk_bytes_roundtrip_and_offset_pin() {
+        let page = CncPage::heap(&test_meta());
+        assert_eq!(page.free_disk_bytes(), 0, "fresh page reads 0 (never published)");
+        page.store_free_disk_bytes(123_456_789);
+        assert_eq!(page.free_disk_bytes(), 123_456_789);
+        let raw = page.page();
+        assert_eq!(
+            u64::from_le_bytes(raw[3840..3848].try_into().unwrap()),
+            123_456_789,
+            "offset pin: the value must live at 3840 exactly"
         );
     }
 

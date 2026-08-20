@@ -60,6 +60,7 @@ const ALL_SCENARIOS: &[&str] = &[
     "purge_stalled",
     "repeated_wipes",
     "crypto_counters",
+    "disk_low",
 ];
 
 // ------------------------------------------------------------------ CLI
@@ -173,6 +174,7 @@ fn run_scenario(name: &str, scratch_root: &Path) -> (SeriesFile, Disclosure) {
         "purge_stalled" => scenario_purge_stalled(),
         "repeated_wipes" => scenario_repeated_wipes(),
         "crypto_counters" => scenario_crypto_counters(),
+        "disk_low" => scenario_disk_low(),
         other => panic!("unknown scenario {other:?} — one of {ALL_SCENARIOS:?}"),
     }
 }
@@ -847,6 +849,49 @@ fn scenario_crypto_counters() -> (SeriesFile, Disclosure) {
                      in-process); is_leader=0 throughout (real default). Transition captured by \
                      two live HTTP scrapes of the real exporter, before and after the bump."
                 .into(),
+        },
+    )
+}
+
+// ----------------------------------------------------------- scenario 11
+
+/// Uc2DiskLow — **synthetic, disclosed** (Task 5 brief): heap-page sources
+/// with `store_free_disk_bytes(small)` — the genuinely-broken-disk state
+/// (actually filling a filesystem) is out of scope for an in-process harness
+/// and left for a fixture in a later task. `uc2_journal_segment_bytes` is
+/// real (the sources' own configured value), not synthetic — only the
+/// disk-free reading is injected.
+fn scenario_disk_low() -> (SeriesFile, Disclosure) {
+    let mut sources = synthetic_sources(0);
+    let segment_bytes = 1u64 << 20; // 1 MiB
+    sources.journal_segment_bytes = segment_bytes;
+    // < 4 segments of free disk — the rule's exact bar.
+    sources.cnc.store_free_disk_bytes(segment_bytes);
+
+    let srv = ObsServer::serve(sources.clone(), "127.0.0.1:0".parse().unwrap()).expect("bind");
+    let addr = srv.local_addr();
+    let mut sf = SeriesFile::new();
+    for _ in 0..3 {
+        sf.record_round(
+            "n0",
+            &scrape(addr),
+            &["uc2_free_disk_bytes", "uc2_journal_segment_bytes"],
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    srv.stop();
+
+    (
+        sf,
+        Disclosure {
+            scenario: "disk_low",
+            rules: &["Uc2DiskLow"],
+            state: "synthetic",
+            method: format!(
+                "synthetic ObsSources: free_disk_bytes={segment_bytes} with \
+                 journal_segment_bytes={segment_bytes} (1 segment free < the rule's 4-segment \
+                 bar) — rendered through the real exporter."
+            ),
         },
     )
 }

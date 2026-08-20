@@ -22,7 +22,12 @@
 //! 1344  archive_first_base                                  1 × 64 B line
 //! 1408  PeerSlots[8]   (per peer: id_and_role, reported_durable,
 //!                       advertised_limit, naks_served_plus_replay) 8 × 256 B
-//! 3456..4096  reserved (zero)
+//! 3456  config/admin/observability band: config_version, config_pending,
+//!       admin_req, admin_resp, admission_bytes, seal_failures,
+//!       free_disk_bytes (each field's own doc comment below pins its exact
+//!       offset and "next free" note — this line is deliberately not kept
+//!       byte-exact, to stop it drifting stale again as fields land)
+//! 3904..4096  reserved (zero)
 //! ```
 //!
 //! **crc split (deliberate):** this module is `core`-only (no_std-friendly —
@@ -143,6 +148,18 @@ const _: () = assert!(CNC_OFF_ADMISSION_BYTES + 64 <= CNC_PAGE_LEN);
 /// offset after this line: 3840.
 pub const CNC_OFF_SEAL_FAILURES: usize = 3776;
 const _: () = assert!(CNC_OFF_SEAL_FAILURES + 64 <= CNC_PAGE_LEN);
+
+/// M11 (Task 5): free bytes on the filesystem backing the instance dir, as of
+/// the daemon's last ~1s derived-events pass (`statvfs`, `f_bavail *
+/// f_frsize`). Writer: the `uc2-node` daemon's main loop only — none of the
+/// four polling agents gain a syscall for this. 0 = never published (a
+/// library/in-process user with no daemon loop, or a pre-M11 node) — readers
+/// must treat 0 as "unknown", not "zero bytes free". Exists because the
+/// archive fail-stops at ENOSPC and that must be visible externally BEFORE it
+/// hits, the same "make the wall visible" motivation as `seal_failures`
+/// above. Next free reserved-band offset after this line: 3904.
+pub const CNC_OFF_FREE_DISK_BYTES: usize = 3840;
+const _: () = assert!(CNC_OFF_FREE_DISK_BYTES + 64 <= CNC_PAGE_LEN);
 
 pub const NODE_FLAG_LEADER: u64 = 1;
 pub const NODE_FLAG_CAN_SERVE: u64 = 2;
@@ -440,5 +457,7 @@ mod tests {
         assert_eq!(CNC_OFF_ADMISSION_BYTES, 3712);
         // M8 (Task 10 review round 1): seal_failures.
         assert_eq!(CNC_OFF_SEAL_FAILURES, 3776);
+        // M11 (Task 5): free_disk_bytes.
+        assert_eq!(CNC_OFF_FREE_DISK_BYTES, 3840);
     }
 }

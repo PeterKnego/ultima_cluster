@@ -61,6 +61,7 @@ fn main() -> ExitCode {
 
     let id = cfg.id;
     let bind = cfg.bind;
+    let instance_dir = cfg.instance_dir.clone();
     let node = match Node::start(cfg) {
         Ok(n) => n,
         Err(e) => {
@@ -117,6 +118,7 @@ fn main() -> ExitCode {
     let mut last_nak_storm_emit: Option<Instant> = None;
     let mut last_seal_failures_emit: Option<Instant> = None;
     let mut last_snapshot_emit: Option<Instant> = None;
+    let mut last_statvfs_warn_emit: Option<Instant> = None;
 
     let mut was_leader = None;
     while !stop.load(Ordering::Relaxed) {
@@ -199,6 +201,27 @@ fn main() -> ExitCode {
                 last_snapshot_emit = Some(now);
             }
             last_snapshot_pos = snapshot_pos;
+
+            // M11 (Task 5): free_disk_bytes — daemon-loop-only writer, no
+            // syscall added to any of the four polling agents. On a probe
+            // failure, leave the cnc field at its last value (never write a
+            // stale-but-plausible 0) and rate-limit the warning the same way
+            // seal_failures/nak_storm do above.
+            match free_disk_bytes(&instance_dir) {
+                Some(bytes) => obs.cnc.store_free_disk_bytes(bytes),
+                None => {
+                    if last_statvfs_warn_emit
+                        .is_none_or(|t| now.duration_since(t) >= DERIVED_EVENT_RATE_LIMIT)
+                    {
+                        eprintln!(
+                            "uc2-node: statvfs({}) failed: {}",
+                            instance_dir.display(),
+                            std::io::Error::last_os_error()
+                        );
+                        last_statvfs_warn_emit = Some(now);
+                    }
+                }
+            }
         }
 
         std::thread::sleep(Duration::from_millis(100));
@@ -220,4 +243,22 @@ fn main() -> ExitCode {
         ),
     }
     ExitCode::SUCCESS
+}
+
+/// M11 (Task 5): free bytes on the filesystem backing `path`, via `statvfs`
+/// (`f_bavail * f_frsize` — bytes an unprivileged process could still write,
+/// not the raw free-block count). `None` on a probe failure (bad path,
+/// syscall error) — the caller leaves the cnc field at its last value rather
+/// than writing a stale-but-plausible 0. Same `CString`/`statfs`-family idiom
+/// as `preflight::fs_kind`, just the `statvfs` sibling call.
+fn free_disk_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid NUL-terminated path; `buf` is a zeroed statvfs
+    // this call owns for the duration of the call.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut buf) } != 0 {
+        return None;
+    }
+    Some(buf.f_bavail as u64 * buf.f_frsize as u64)
 }

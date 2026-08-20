@@ -44,6 +44,7 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_purge_enabled",
     "uc2_admission_bytes",
     "uc2_journal_segment_bytes",
+    "uc2_free_disk_bytes",
     "uc2_agent_alive",
     "uc2_append_bytes",
     "uc2_durable_bytes",
@@ -223,6 +224,19 @@ pub fn render_prometheus(s: &ObsSources) -> String {
         "Configured journal segment size in bytes.",
         s.journal_segment_bytes,
     );
+
+    // M11 (Task 5): omitted when 0 — the daemon's derived-events pass is the
+    // only writer, so an in-process library user (no daemon loop) or a
+    // pre-M11 node reads the sentinel, same convention as `uc2_leader_hint`.
+    let free_disk_bytes = s.cnc.free_disk_bytes();
+    if free_disk_bytes != 0 {
+        push_gauge(
+            &mut out,
+            "uc2_free_disk_bytes",
+            "Free bytes on the filesystem backing the instance dir, as of the daemon's last ~1s poll.",
+            free_disk_bytes,
+        );
+    }
 
     let agent_samples: Vec<(String, u64)> = s
         .agents
@@ -621,6 +635,10 @@ mod tests {
         // families are conditionally emitted).
         cnc.status().leader_hint.store_release(0);
         cnc.peer_slot(0).id_and_role.store_release(pack_id_and_role(9, CNC_PEER_ROLE_VOTER));
+        // M11 (Task 5): non-zero so `every_contract_series_is_present` sees
+        // `uc2_free_disk_bytes` — it's conditionally emitted, same as
+        // `uc2_leader_hint` above.
+        cnc.store_free_disk_bytes(1);
 
         ObsSources {
             node_id: 7,
@@ -700,6 +718,20 @@ mod tests {
         assert!(!render_prometheus(&s).contains("uc2_leader_hint"));
         s.cnc.status().leader_hint.store_release(1);
         assert!(render_prometheus(&s).contains("uc2_leader_hint 1"));
+    }
+
+    #[test]
+    fn free_disk_omitted_when_zero() {
+        let s = synthetic_sources();
+        s.cnc.store_free_disk_bytes(0);
+        assert!(!render_prometheus(&s).contains("uc2_free_disk_bytes"));
+    }
+
+    #[test]
+    fn free_disk_present_when_stored() {
+        let s = synthetic_sources();
+        s.cnc.store_free_disk_bytes(123_456_789);
+        assert!(render_prometheus(&s).contains("uc2_free_disk_bytes 123456789"));
     }
 
     #[test]

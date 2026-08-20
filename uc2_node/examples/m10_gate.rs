@@ -280,6 +280,13 @@ fn run_coverage(scratch_root: &Path) -> Verdict {
     }
     thread::sleep(Duration::from_millis(300));
 
+    // M11 (Task 5): free_disk_bytes's only writer is the real daemon's ~1s
+    // loop (see uc2-node.rs), absent here (this cluster runs in-process
+    // Node/ObsServer, no daemon binary) — store it directly so the coverage
+    // row doesn't fail on an honestly-omitted-when-0 family. The field
+    // itself is real; only its writer lives outside this harness.
+    nodes[leader_idx].n().observability().cnc.store_free_disk_bytes(1);
+
     let addr = nodes[leader_idx].obs_addr();
     let body = scrape(addr);
 

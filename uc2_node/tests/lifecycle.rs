@@ -541,6 +541,48 @@ fn the_daemon_serves_metrics_when_configured_and_stops_cleanly() {
     );
 }
 
+/// M11 (Task 5): the daemon's ~1s derived-events pass `statvfs`s the
+/// instance dir and publishes `free_disk_bytes` — a metrics-enabled daemon's
+/// scrape must contain `uc2_free_disk_bytes` with a plausible (>0) value.
+/// Only the daemon loop writes this field (none of the four polling agents
+/// gain a syscall for it), so this has to be a real spawned-process test,
+/// not an in-process `ObsSources` fixture.
+#[test]
+fn the_daemon_publishes_free_disk_bytes() {
+    let dir = scratch();
+    let metrics_port = free_port();
+    let (cfg, _inst) = daemon_config_with_metrics(dir.path(), 19712, metrics_port);
+    let metrics_addr: SocketAddr = format!("127.0.0.1:{metrics_port}").parse().unwrap();
+
+    let (mut child, lines) = spawn_daemon_capturing_stdout(&cfg);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    wait_for_line(&lines, "observability endpoint on http://", deadline)
+        .expect("banner line naming the observability endpoint never appeared");
+
+    // The derived-events pass runs every 10th 100ms tick (~1s) — wait past at
+    // least one so free_disk_bytes has actually been stored, not just left
+    // at the boot-time zero sentinel.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let value = loop {
+        let (status, body) = http_get(metrics_addr, "/metrics");
+        assert_eq!(status, 200, "GET /metrics status, body: {body}");
+        if let Some(v) = body
+            .lines()
+            .find_map(|l| l.strip_prefix("uc2_free_disk_bytes "))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            break v;
+        }
+        assert!(Instant::now() < deadline, "uc2_free_disk_bytes never appeared in a scrape");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(value > 0, "uc2_free_disk_bytes must be a plausible >0 reading, got {value}");
+
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let status = child.wait().unwrap();
+    assert!(status.success(), "clean shutdown must exit 0, got {status:?}");
+}
+
 #[test]
 fn the_daemon_without_a_metrics_section_opens_no_port() {
     let dir = scratch();

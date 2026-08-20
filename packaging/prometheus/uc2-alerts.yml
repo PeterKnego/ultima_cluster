@@ -75,3 +75,8 @@ groups:
     for: 0m
     labels: { severity: warning }
     annotations: { summary: "outgoing control frames follower {{ $labels.instance }} could not seal — check pairwise sessions/allowlist (a leader's seal_failures climb is benign, this one is not)" }
+  - alert: Uc2DiskLow
+    expr: uc2_free_disk_bytes < 4 * uc2_journal_segment_bytes
+    for: 2m
+    labels: { severity: warning }
+    annotations: { summary: "{{ $labels.instance }} has less than 4 journal segments of free disk — the archive fail-stops at ENOSPC; purge or grow the disk" }
