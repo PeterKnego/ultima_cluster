@@ -48,8 +48,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use uc2_client::Client;
-use uc2_log::cnc::CncPage;
+use uc2_log::cnc::{AdminReq, AdminResp, CncPage};
 use uc2_node::backup::{backup_instance, restore_artifact};
+use uc2_node::recovery::force_single_member;
 use uc_lincheck::register::{Cmd, CmdResp};
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 
@@ -412,6 +413,251 @@ fn a_follower_backed_up_under_load_restores_onto_a_new_host_and_converges() {
          mismatch is acked-write loss"
     );
     leader_read_client.shutdown();
+
+    // node_procs / svc_procs dropped here -> SIGKILL + reap every survivor.
+}
+
+// ------------------------------------------------- M11 Task 4: quorum loss
+
+/// `ip:u32, port:u16` wire pair for a real `SocketAddr` (IPv4 only) — the
+/// admin-request wire shape, same conversion `uc2ctl`/`reconfig.rs` use.
+fn addr_to_wire(addr: SocketAddr) -> (u32, u16) {
+    match addr {
+        SocketAddr::V4(a) => (u32::from(*a.ip()), a.port()),
+        SocketAddr::V6(_) => panic!("this harness only binds IPv4 loopback"),
+    }
+}
+
+/// The `uc2ctl` mutating-command flow, minus the bin (same trimmed-copy
+/// convention as this file's `spawn_node_multi`/`free_addr` above, and the
+/// same choreography `uc2_node/tests/reconfig.rs`'s `admin_request` uses):
+/// read the admin band's current seq, write a fresh request (`seq = old_seq +
+/// 1`, a random nonce), poll the response line for the echoed seq.
+fn admin_request(cnc: &CncPage, op: u32, id: u32, ip: u32, port: u16, secs: u64) -> AdminResp {
+    let old_seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0);
+    let seq = old_seq + 1;
+    let nonce = rand::random::<u64>();
+    cnc.write_admin_req(&AdminReq { seq, nonce, op, id, ip, port });
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(resp) = cnc.read_admin_resp(seq) {
+            return resp;
+        }
+        assert!(Instant::now() < deadline, "admin response timed out for seq {seq}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The M11 Task 4 acceptance scenario: a 3-voter cluster loses quorum (the
+/// leader AND one follower are killed permanently, leaving one survivor —
+/// below the 2-of-3 majority ANY config over this membership could ever
+/// reach), the survivor is forced to a single-member cluster via
+/// `uc2_node::recovery::force_single_member` (in-process — this test crate
+/// links `uc2_node` directly, same as the backup/restore calls above), comes
+/// back up as a sole leader, and is proven to have lost nothing durable
+/// (every write the survivor itself had DURABLY recorded before the kill
+/// reads back exactly) while being honest about the narrower loss window
+/// (writes the OLD quorum acked but that never replicated to this particular
+/// survivor MAY be lost — printed, not hidden). Finally, one of the two dead
+/// peers is wiped and rejoined as a fresh learner, then promoted, proving the
+/// forced cluster is a normal, live, growable cluster afterward — not a
+/// dead end.
+#[test]
+fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
+    shorten_client_timeout();
+    let tmp = tempdir();
+
+    const N: usize = 3;
+    let addrs: Vec<SocketAddr> = (0..N).map(|_| free_addr()).collect();
+    let members: Vec<(u32, SocketAddr)> = (0..N as u32).map(|i| (i, addrs[i as usize])).collect();
+    let members_str = members_arg(&members);
+
+    let mut dirs: Vec<PathBuf> = Vec::with_capacity(N);
+    let mut node_procs: Vec<Option<Reap>> = Vec::with_capacity(N);
+    for i in 0..N as u32 {
+        let d = tmp.path().join(format!("n{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        node_procs.push(Some(spawn_node_multi(&d, i, addrs[i as usize], &members_str)));
+        wait_for_ready(&d, Duration::from_secs(10));
+        dirs.push(d);
+    }
+    let mut svc_procs: Vec<Option<Reap>> = dirs.iter().map(|d| Some(spawn_service(d))).collect();
+
+    let leader_idx = await_single_leader(&dirs, 30);
+
+    // A short, bounded serial CAS chain against the leader — the "acked by
+    // the old quorum" upper bound the honest loss print compares against.
+    // (No background thread here, unlike the backup-under-load test above:
+    // this scenario doesn't need continued load spanning the kill, and a
+    // bounded foreground chain makes `acked` an exact, race-free count.)
+    let leader_client = connect_with_retry(&dirs[leader_idx], Duration::from_secs(10));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    submit_until_ok(&leader_client, &Cmd::Write(0), deadline);
+    let mut acked: u64 = 0;
+    for _ in 0..50u64 {
+        match submit_until_ok(&leader_client, &Cmd::Cas { old: acked, new: acked + 1 }, deadline) {
+            CmdResp::CasResult(true) => acked += 1,
+            other => panic!("unexpected response to warm-up Cas: {other:?}"),
+        }
+    }
+    leader_client.shutdown();
+
+    // Pick the survivor (a follower) and the OTHER, permanently-dead peer
+    // BEFORE killing anything.
+    let survivor_idx = find_follower(&dirs, leader_idx);
+    let dead2_idx = (0..N).find(|&i| i != leader_idx && i != survivor_idx).unwrap();
+    let survivor_id = survivor_idx as u32;
+
+    let old_instance_id =
+        connect_with_retry(&dirs[survivor_idx], Duration::from_secs(10)).instance_id();
+
+    // 1. SIGKILL the leader AND the other follower, PERMANENTLY — below the
+    // 2-of-3 majority this membership needs, so no config over it (short of
+    // force) can ever reach quorum again.
+    node_procs[leader_idx] = None;
+    svc_procs[leader_idx] = None;
+    node_procs[dead2_idx] = None;
+    svc_procs[dead2_idx] = None;
+
+    // Assert the cluster is genuinely stalled: real submit attempts against
+    // the survivor for 2s, none of which may succeed (no quorum exists).
+    let stall_client = connect_with_retry(&dirs[survivor_idx], Duration::from_secs(10));
+    let stall_deadline = Instant::now() + Duration::from_secs(2);
+    let mut committed_during_stall = false;
+    while Instant::now() < stall_deadline {
+        if let Ok(resp) = stall_client.submit::<Cmd, CmdResp>(&Cmd::Cas { old: acked, new: acked + 1 })
+        {
+            committed_during_stall = true;
+            eprintln!("[survival] unexpected commit during the stall window: {resp:?}");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !committed_during_stall,
+        "a write committed during quorum loss (only {survivor_idx} of {N} alive) — expected a stall"
+    );
+
+    // Snapshot what the survivor itself had durably applied — taken NOW, with
+    // the leader and the other follower already dead (so nothing further can
+    // ever replicate to the survivor; its state is frozen), NOT earlier —
+    // this (not `acked`) is the honest "every write with position <= the
+    // survivor's pre-force durable" bound the forced cluster must reproduce
+    // exactly. Reusing `stall_client` (rather than opening a fresh one) keeps
+    // this read immediately adjacent to the stall assertion above, with no
+    // window in which anything could still change.
+    let survivor_value_before_force: Option<u64> =
+        stall_client.query_snapshot(&()).expect("survivor's own snapshot read, state now frozen");
+    stall_client.shutdown();
+
+    // 2. Stop the survivor's own processes — `force_single_member` takes the
+    // instance's exclusive flock, so nothing may hold it.
+    node_procs[survivor_idx] = None;
+    svc_procs[survivor_idx] = None;
+
+    // 3. Force: quorum-loss recovery, in-process.
+    let force_report = force_single_member(&dirs[survivor_idx], survivor_id)
+        .expect("force_single_member on the survivor");
+    assert_eq!(force_report.new_version, force_report.old_version + 1);
+    let mut dropped = force_report.dropped_peers.clone();
+    dropped.sort_unstable();
+    let mut expect_dropped: Vec<u32> = (0..N as u32).filter(|&i| i != survivor_id).collect();
+    expect_dropped.sort_unstable();
+    assert_eq!(dropped, expect_dropped, "force must drop exactly the two dead peers");
+
+    // 4. Restart the survivor on the SAME instance dir/id/addr — the forced
+    // durable config (not `--members`, seed-only once a durable record
+    // exists) now owns membership, so it boots as a sole voter and should
+    // self-elect immediately.
+    node_procs[survivor_idx] =
+        Some(spawn_node_multi(&dirs[survivor_idx], survivor_id, addrs[survivor_idx], &members_str));
+    wait_for_fresh_instance(&dirs[survivor_idx], old_instance_id, Duration::from_secs(10));
+    svc_procs[survivor_idx] = Some(spawn_service(&dirs[survivor_idx]));
+
+    let elect_deadline = Instant::now() + Duration::from_secs(10);
+    let want = NODE_FLAG_LEADER | NODE_FLAG_CAN_SERVE;
+    loop {
+        if let Some(c) = open_cnc(&dirs[survivor_idx])
+            && c.status().flags.load_acquire() & want == want
+        {
+            break;
+        }
+        assert!(Instant::now() < elect_deadline, "forced sole voter never elected/served itself");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // 5. Every write with position <= the survivor's pre-force durable reads
+    // back EXACTLY (force touches only the config record, never the
+    // journal) — and print, honestly, how many of the writes the OLD quorum
+    // acked never made it to this particular survivor before the kill.
+    let survivor_post_client = connect_with_retry(&dirs[survivor_idx], Duration::from_secs(10));
+    let survivor_value_after_force: Option<u64> = survivor_post_client
+        .query_linearizable(&())
+        .expect("survivor's own linearizable read after force+restart");
+    assert_eq!(
+        survivor_value_after_force, survivor_value_before_force,
+        "force_single_member must not lose or invent any write the survivor already held durably"
+    );
+    let lost = acked.saturating_sub(survivor_value_before_force.unwrap_or(0));
+    eprintln!(
+        "[survival] quorum-loss recovery: {lost} acked-above-durable write(s) lost \
+         (old-quorum acked={acked}, survivor's own pre-force durable value={:?})",
+        survivor_value_before_force
+    );
+
+    // Prove the forced sole-voter cluster is genuinely live, not just
+    // read-only: one more CAS must commit immediately (quorum of 1).
+    let base = survivor_value_after_force.unwrap_or(0);
+    let live_deadline = Instant::now() + Duration::from_secs(10);
+    match submit_until_ok(&survivor_post_client, &Cmd::Cas { old: base, new: base + 1 }, live_deadline) {
+        CmdResp::CasResult(true) => {}
+        other => panic!("forced sole-voter cluster refused a live write: {other:?}"),
+    }
+    survivor_post_client.shutdown();
+
+    // 6. Wipe one dead peer's dir and rejoin it as a FRESH learner (a new id
+    // — Global Constraints: dropped peers rejoin as fresh ids, never reusing
+    // the old, never-tombstoned-but-dropped one) via the live cnc admin band
+    // on the survivor, then promote it — back to a real 2-voter cluster.
+    std::fs::remove_dir_all(&dirs[dead2_idx]).expect("wipe the dead peer's instance dir");
+    let fresh_id: u32 = N as u32; // 3 — not one of the original 0/1/2 ids.
+    let fresh_addr = free_addr();
+    let fresh_dir = dirs[dead2_idx].clone();
+
+    let survivor_cnc = open_cnc(&dirs[survivor_idx]).expect("survivor cnc for admin ops");
+    let (ip, port) = addr_to_wire(fresh_addr);
+    let resp = admin_request(&survivor_cnc, 1 /* AddLearner */, fresh_id, ip, port, 20);
+    assert_eq!(resp.status, 0, "add-learner refused: reason={}", resp.reason);
+
+    node_procs.push(Some(spawn_node_multi(&fresh_dir, fresh_id, fresh_addr, &members_str)));
+    wait_for_ready(&fresh_dir, Duration::from_secs(10));
+    svc_procs.push(Some(spawn_service(&fresh_dir)));
+    dirs.push(fresh_dir.clone());
+
+    let converge_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(c) = open_cnc(&fresh_dir)
+            && c.config_version() >= resp.version
+        {
+            break;
+        }
+        assert!(Instant::now() < converge_deadline, "fresh learner never converged its config version");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let promote_resp = admin_request(&survivor_cnc, 2 /* PromoteLearner */, fresh_id, 0, 0, 20);
+    assert_eq!(promote_resp.status, 0, "promote refused: reason={}", promote_resp.reason);
+
+    // A 2-voter cluster is genuinely operational: one more CAS must commit.
+    let final_client = connect_with_retry(&dirs[survivor_idx], Duration::from_secs(10));
+    let cur: Option<u64> = final_client.query_linearizable(&()).expect("final linearizable read");
+    let cur = cur.unwrap_or(0);
+    let final_deadline = Instant::now() + Duration::from_secs(10);
+    match submit_until_ok(&final_client, &Cmd::Cas { old: cur, new: cur + 1 }, final_deadline) {
+        CmdResp::CasResult(true) => {}
+        other => panic!("repaired 2-voter cluster refused a write: {other:?}"),
+    }
+    final_client.shutdown();
 
     // node_procs / svc_procs dropped here -> SIGKILL + reap every survivor.
 }

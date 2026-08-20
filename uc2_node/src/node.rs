@@ -4675,7 +4675,7 @@ fn rederive_term_map(
 /// free function (rather than inlined in `Node::start_with_socket`) so it is
 /// unit-testable against a real file-backed `Archive`/`NodeState` without
 /// standing up a full two-thread `Node`.
-fn recover_config_record(
+pub(crate) fn recover_config_record(
     state: &NodeState,
     archive: &Archive,
     durable: u64,
@@ -4731,7 +4731,7 @@ fn recover_config_record(
 /// prev/cur shape `Action::ConfigAdopted`'s exec arm persists, so even a
 /// multi-hop scan (more than one adoption crash-exposed in the same window)
 /// folds down to a valid one-level record.
-fn rederive_config(
+pub(crate) fn rederive_config(
     archive: &Archive,
     rec: ConfigRecord,
 ) -> Result<ConfigRecord, uc2_log::archive::ArchiveError> {

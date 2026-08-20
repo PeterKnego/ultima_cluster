@@ -41,6 +41,18 @@
 //! uc2ctl restore        ARTIFACT --instance-dir D
 //! ```
 //!
+//! M11 Task 4 adds ONE more OFFLINE verb, quorum-loss recovery. Like
+//! `backup`/`restore` it never touches a running node's cnc admin band (it
+//! takes the instance dir's exclusive flock instead — a running node is
+//! refused, not raced) — but unlike them it needs `--app-id` back, purely as
+//! a confirmation guard (`--confirm-cluster` must echo it exactly) before an
+//! operation that discards data, not as anything checked against a live
+//! node:
+//!
+//! ```text
+//! uc2ctl force-single-member --instance-dir D --app-id A --node-id N --confirm-cluster A
+//! ```
+//!
 //! From a source checkout, without installing:
 //!
 //! ```text
@@ -154,6 +166,36 @@ struct RestoreArgs {
     instance_dir: PathBuf,
 }
 
+// ---------------------------------------------------------------- M11 Task 4: quorum-loss
+
+/// OFFLINE (M11 Task 4), like `backup`/`restore` — no cnc admin-band
+/// interaction; the instance's exclusive flock stands in for the running-
+/// node check instead. `--confirm-cluster` is a confirmation guard, checked
+/// ONLY here in the CLI (the `uc2_node::recovery::force_single_member`
+/// library function has no notion of it): it must equal `--app-id` exactly,
+/// or the command refuses before touching anything.
+#[derive(clap::Args)]
+struct ForceSingleMemberArgs {
+    /// The surviving node's own on-disk instance directory. Must NOT have a
+    /// node currently running in it.
+    #[arg(long)]
+    instance_dir: PathBuf,
+    /// The cluster's application identity — printed in the data-loss
+    /// statement, and echoed by `--confirm-cluster` as the "yes, I mean it"
+    /// gate.
+    #[arg(long)]
+    app_id: String,
+    /// The surviving node's own id (must be a voter or learner, and not
+    /// tombstoned, in the recovered config).
+    #[arg(long)]
+    node_id: u32,
+    /// Must equal `--app-id` exactly, or the command refuses. Forces an
+    /// operator to type the cluster's identity a second time before an
+    /// operation that discards data.
+    #[arg(long)]
+    confirm_cluster: String,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Add a fresh learner (wire op 1).
@@ -185,6 +227,15 @@ enum Cmd {
     /// Filesystem-only, no cnc admin-band interaction — the target
     /// `instance_dir` should not have a node running in it.
     Restore(RestoreArgs),
+    /// OFFLINE (M11 Task 4): quorum-loss recovery. Forces the given
+    /// `--instance-dir` to a single-voter cluster naming `--node-id` the sole
+    /// member — the recovered config's other voters/learners are DROPPED
+    /// (never tombstoned; they wipe-and-rejoin later as fresh learners).
+    /// Prints the data-loss statement, then the resulting `ForceReport`, then
+    /// writes. Refuses if a node is running, if `--confirm-cluster` doesn't
+    /// echo `--app-id`, if `--node-id` is tombstoned, or if it isn't a member
+    /// of the recovered config. A one-way door — there is no "undo" verb.
+    ForceSingleMember(ForceSingleMemberArgs),
 }
 
 fn main() {
@@ -199,6 +250,7 @@ fn main() {
         Cmd::Backup(a) => run_backup(&a),
         Cmd::VerifyBackup(a) => run_verify_backup(&a),
         Cmd::Restore(a) => run_restore(&a),
+        Cmd::ForceSingleMember(a) => run_force_single_member(&a),
     };
     if let Err(e) = r {
         eprintln!("uc2ctl error: {e}");
@@ -391,5 +443,48 @@ fn run_restore(a: &RestoreArgs) -> anyhow::Result<()> {
     let report = uc2_node::backup::restore_artifact(&a.artifact, &a.instance_dir)
         .map_err(|e| anyhow::anyhow!("restore: {e}"))?;
     print_backup_report(&report);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- M11 Task 4: quorum-loss
+
+fn run_force_single_member(a: &ForceSingleMemberArgs) -> anyhow::Result<()> {
+    if a.confirm_cluster != a.app_id {
+        anyhow::bail!(
+            "refusing: --confirm-cluster {:?} does not match --app-id {:?} — this is a \
+             one-way, data-losing operation; type the cluster's app-id again to confirm",
+            a.confirm_cluster,
+            a.app_id
+        );
+    }
+
+    // The data-loss statement, printed BEFORE anything is written. Needs the
+    // recovered config's durable frontier and dropped-peer set, which
+    // `recovered_config` (a pure read under the same flock discipline
+    // `force_single_member` itself uses) gives us without writing anything —
+    // if this read refuses (a node is running, say), nothing below runs
+    // either.
+    let recovered = uc2_node::recovery::recovered_config(&a.instance_dir)
+        .map_err(|e| anyhow::anyhow!("force-single-member: {e}"))?;
+    let dropped: Vec<u32> = recovered
+        .voters
+        .iter()
+        .chain(recovered.learners.iter())
+        .map(|(id, _)| *id)
+        .filter(|&id| id != a.node_id)
+        .collect();
+    println!(
+        "forcing node {} to a single-member cluster at durable position {}: any write \
+         acknowledged by the old quorum but not held in this node's journal is LOST; peers {:?} \
+         are dropped from the config and must be wiped and rejoined as fresh learners.",
+        a.node_id, recovered.durable, dropped
+    );
+
+    let report = uc2_node::recovery::force_single_member(&a.instance_dir, a.node_id)
+        .map_err(|e| anyhow::anyhow!("force-single-member: {e}"))?;
+    println!("old_version={}", report.old_version);
+    println!("new_version={}", report.new_version);
+    println!("durable={}", report.durable);
+    println!("dropped_peers={:?}", report.dropped_peers);
     Ok(())
 }

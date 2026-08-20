@@ -37,6 +37,7 @@ pub(crate) mod mutation;
 mod node;
 pub mod obs;
 pub mod preflight;
+pub mod recovery;
 mod read_round;
 
 pub use config_file::load_from_path;
