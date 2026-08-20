@@ -73,6 +73,24 @@ leader-authoritative (followers export zeros). Gate doc:
 `docs/benchmarks/uc2-m10-gate-2026-08-20.md`; operator docs:
 `docs/how-to/monitor-a-cluster.md`.
 
+**M11 (survivable cluster) is merged; fleet flag-day row + true-ENOSPC CI
+evidence pending (`v2.5.0` tags when they land)**: offline
+`uc2ctl backup / verify-backup / restore` (ordered-copy artifact, verify
+asserts the purge-straddle coverage invariant, under-load-safe incl. purge
+races, refuses a live instance dir) with the backed-up-under-load →
+host-destroyed → restore → rejoin story proven as a CI crashtest;
+`uc2ctl force-single-member` for quorum loss (offline, never-persisting
+recovery wrapper, data-loss window stated, dropped peers rejoin as fresh
+ids); ENOSPC fail-stop asserted end-to-end plus a `free_disk_bytes` cnc
+field (reserved band 3840) and `Uc2DiskLow`; `scripts/uc2_flag_day.sh`
+(measured downtime, exit codes 0/1/3). The milestone's review loop also
+fixed two pre-existing journal-layer defects: a crash-torn-tail boot
+refusal (+ heal-residue wedge chain) and a masked roll-boundary
+acked-durability hole (fsync-on-seal) — see the gate doc
+`docs/benchmarks/uc2-m11-gate-2026-08-20.md`. Operator docs:
+`docs/how-to/back-up-a-cluster.md`, `recover-from-quorum-loss.md`,
+`upgrade-a-cluster.md`.
+
 **The v1 stack (an `openraft`-based design) has been retired** and its crates
 deleted — v2 owns consensus, elections, and transport directly. Do not
 reintroduce `openraft`, `quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client`
