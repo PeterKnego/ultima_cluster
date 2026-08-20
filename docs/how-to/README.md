@@ -32,6 +32,24 @@ preconditions worth reading before you start.
   grow, shrink, replace a machine, or retire the current leader.
 - [Encrypt traffic between nodes](encrypt-node-traffic.md) — a flag day, not a
   rolling change: the whole cluster flips together.
+- [Upgrade a cluster](upgrade-a-cluster.md) — a scripted flag-day binary
+  upgrade with a measured downtime number; a different flag day from
+  encryption's, driven by wire protocol 0.5.0's flag-day posture.
+
+## Surviving failures
+
+What to do before, during, and after losing a node, a disk, or a majority.
+For the disk-space wall itself — `ENOSPC` is an asserted, fail-stop failure,
+not a silent one — see
+[Diagnose a node](diagnose-a-node.md#is-the-disk-about-to-fill) under "When
+something is wrong" below.
+
+- [Back up a cluster](back-up-a-cluster.md) — an ordered-copy artifact taken
+  from a live, loaded node, verified before you trust it, restorable onto a
+  new host. The minority-restore rule lives here.
+- [Recover from quorum loss](recover-from-quorum-loss.md) — a majority of
+  voters is gone: force a survivor back into service, with the data-loss
+  window stated up front, then wipe-and-rejoin the repaired peers.
 
 ## Building on it
 

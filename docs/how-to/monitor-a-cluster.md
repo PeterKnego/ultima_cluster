@@ -107,8 +107,39 @@ table:
 | `Uc2UnattestedReports` | a pre-0.5.0 peer's un-attested durable reports are being counted — a flag-day violation; commits will stall | critical |
 | `Uc2CleartextPeer` | cleartext datagrams arrived from a peer while crypto is on — a node missed the wire-crypto flag day | critical |
 | `Uc2FollowerSealFailures` | outgoing control frames a **follower** could not seal (check pairwise sessions/allowlist) — a leader's own climb is benign and excluded by the rule | warning |
+| `Uc2DiskLow` | `uc2_free_disk_bytes` has sat below 4 journal segments' worth of free space for 2m — the archive fail-stops at `ENOSPC`; purge or grow the disk | warning |
 
 The per-peer band (`uc2_peer_reported_durable_bytes`, `uc2_peer_replication_lag_bytes`) is leader-authoritative — only the leader receives `AppendPosition` reports, so a follower's own scrape always reads 0 for every peer regardless of health (see [Diagnose a node](diagnose-a-node.md)); `Uc2PeerNeverHeard` and `Uc2PeerLagging` are scoped to `uc2_is_leader == 1` for exactly this reason, and the dashboard's per-peer panel does the same.
+
+### Watching the disk before `ENOSPC` hits it
+
+`uc2_free_disk_bytes` is `statvfs`'d against the instance directory's
+filesystem on the daemon's ~1s outer-loop cadence and gauged directly — **it
+is daemon-published only**: a node run in-process without the `uc2-node`
+daemon (a library user, a test harness) never writes it, and the field reads
+`0` and is **omitted from the scrape entirely**, same convention as
+`uc2_leader_hint`'s omission at `u64::MAX`. Do not read its absence from a
+scrape as "the disk is full" — it means no daemon is publishing it here.
+
+`Uc2DiskLow` (table above) fires 2 minutes after free space drops below four
+journal segments' worth — chosen because that is the fail-stop the archive
+actually hits: any write or fsync error on the journal, `ENOSPC` included,
+halts the writer, the archive agent panics, and the daemon exits 1 for
+systemd to restart. This is *asserted*, not merely documented — see
+`examples/uc2-crashtest/tests/enospc.rs`. Purging (or growing the disk) before
+this alert escalates is the whole point of watching it; see
+[Keep the journal from growing without bound](bound-journal-growth.md).
+
+**One documented asymmetry, worth knowing before you rely on either side going
+quiet:** the journal's own write path is fail-stop, but the *service's*
+snapshot-publish path is not. A snapshot build or publish that fails under
+disk pressure is logged and dropped — the snapshot marker simply does not
+advance, and the next policy interval tries again — rather than crashing
+anything. A disk running low can therefore degrade purge's snapshot cadence
+silently, well before the journal itself ever reaches `ENOSPC` and forces the
+loud failure. `Uc2DiskLow` and `Uc2PurgeStalled` (table above) are the two
+signals that catch this quiet half; do not assume a stalled purge will
+announce itself the way a fail-stopped archive does.
 
 ## Import the dashboard
 

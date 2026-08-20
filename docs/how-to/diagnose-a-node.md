@@ -83,6 +83,28 @@ Compare `archive_first_base` (1344) with `node_snapshot_floor` (1216).
 If purging is meant to be on, see
 [Keep the journal from growing without bound](bound-journal-growth.md).
 
+## Is the disk about to fill?
+
+Read `free_disk_bytes` at offset 3840, or scrape `uc2_free_disk_bytes` if
+`[metrics]` is on — see
+[Monitor a cluster](monitor-a-cluster.md#watching-the-disk-before-enospc-hits-it)
+for the full picture, including the `Uc2DiskLow` alert. It is written by the
+`uc2-node` daemon only, on its ~1s outer-loop cadence; `0` (and, on the
+metrics scrape, its outright absence) means no daemon is publishing it here,
+not "the disk is full."
+
+Free space under about four journal segments' worth is worth acting on before
+it reaches zero. The journal writer **fail-stops** on any write or fsync `io`
+error — `ENOSPC` included — which halts the archive agent, logs
+`agent_failstopped`, and exits the daemon with code 1 for systemd to restart.
+This is loud and asserted by design, not a silent degradation: see
+`examples/uc2-crashtest/tests/enospc.rs`. Recovery is exactly "free the space,
+then let systemd restart it" — no special procedure; the node rejoins by
+replaying its journal, the same as any other clean restart.
+
+Purging is the durable fix, not a one-time cleanup: see
+[Keep the journal from growing without bound](bound-journal-growth.md).
+
 ## Is a joiner recovering by snapshot?
 
 Watch `incoming_snapshot_pos` (1280) on the joining node. It advances when a
