@@ -483,7 +483,59 @@ fn run_until_failstop_and_assert(cluster: &mut Cluster, acked: &mut u64, bound_s
     );
 }
 
+/// Assert node 0's captured stderr names the errno behind its fail-stop, two
+/// ways: `expect_os_error` (e.g. `"os error 13"`/`"os error 28"`) and
+/// `expect_kind` (the `std::io::ErrorKind` Debug text, e.g.
+/// `"PermissionDenied"`/`"StorageFull"`).
+///
+/// Fix round 1 (review finding): `expect_os_error`'s substring survives into
+/// this panic's text only via an INCIDENTAL mechanism, not a guaranteed one.
+/// `JournalError::Clone` (`ultima_journal/src/error.rs:33`) rewraps `Io(e)`
+/// as `Io(io::Error::new(e.kind(), e.to_string()))` before the error reaches
+/// `archive.do_work(...).expect("archive fail-stop")`'s panic message; that
+/// rewrap's `e.to_string()` call renders the ORIGINAL `io::Error`'s
+/// `Display` text (which embeds `"(os error N)"`) into a plain `String`,
+/// which then lands, quoted, inside the rewrapped `Custom` variant's own
+/// Debug output — a future `JournalError`/`ArchiveError` refactor could
+/// change or drop that specific rewrap and silently stop carrying the
+/// errno text along, with no change whatsoever to the real fail-stop
+/// behavior this test exists to prove. `expect_kind` is the fix: `kind:
+/// <ErrorKind Debug>` is a field `#[derive(Debug)]` always prints directly
+/// from the ACTUAL `io::Error`, in both the `Os` and the rewrapped
+/// `Custom` variant shapes — it does not depend on the rewrap at all, so
+/// this assertion keeps discriminating the right errno even if
+/// `expect_os_error`'s incidental substring ever stops appearing.
+fn assert_errno_evidence(stderr_text: &str, expect_os_error: &str, expect_kind: &str) {
+    assert!(
+        stderr_text.contains(expect_kind),
+        "stderr missing the structurally-guaranteed '{expect_kind}' (io::Error's ErrorKind \
+         Debug text -- see assert_errno_evidence's doc):\n{stderr_text}"
+    );
+    assert!(
+        stderr_text.contains(expect_os_error),
+        "stderr missing '{expect_os_error}' -- see assert_errno_evidence's doc for why this \
+         substring is an INCIDENTAL (JournalError::Clone rewrap), not guaranteed, property:\n\
+         {stderr_text}"
+    );
+}
+
 /// Phase 2 + assertion: the two survivors keep committing without node 0.
+///
+/// `acked` is the SAME counter phase 1 (`run_until_failstop_and_assert`)
+/// left off with, not a fresh `0` -- this is what makes the "did a write
+/// that landed in the death window get silently dropped from the count"
+/// question answerable at all. Node 0 can die mid-request, so the very last
+/// CAS phase 1 submitted may have committed server-side with its response
+/// never reaching the client (a hard error, not a `CasResult`); the resync
+/// logic inside `drive_load_until` (see its doc) re-reads the register via
+/// `query_linearizable` on every reconnect specifically to fold that
+/// possibly-uncounted write back into `acked` before phase 2 continues the
+/// chain from it. Passing `before + min_acks` as `min_acks`'s target below
+/// therefore proves "at least `min_acks` MORE commits happened after node 0
+/// died", not merely "at least `min_acks` commits happened somewhere,
+/// possibly before the crash" -- the two survivors are the only source `ok`
+/// can possibly count from, by construction (`survivor_dirs` excludes
+/// node 0 entirely).
 fn assert_survivors_keep_committing(cluster: &Cluster, acked: &mut u64, min_acks: u64, bound_secs: u64) {
     let survivor_dirs = vec![cluster.dirs[1].clone(), cluster.dirs[2].clone()];
     let before = *acked;
@@ -618,6 +670,10 @@ fn write_denied_drives_the_same_failstop_chain() {
         chmod_applied.load(std::sync::atomic::Ordering::Acquire),
         "node 0 exited before the chmod trigger even ran -- this would be a false pass"
     );
+    // EACCES == errno 13, ErrorKind::PermissionDenied -- see
+    // `assert_errno_evidence`'s doc for the incidental-vs-guaranteed split.
+    let stderr_text = cluster.node0_stderr.lock().unwrap().clone();
+    assert_errno_evidence(&stderr_text, "os error 13", "PermissionDenied");
 
     assert_survivors_keep_committing(&cluster, &mut acked, 10, 20);
 
@@ -676,14 +732,12 @@ fn enospc_fails_stops_asserted_and_the_cluster_survives() {
     // as node 0's journal rolls new (small) segments.
     run_until_failstop_and_assert(&mut cluster, &mut acked, 60);
 
+    // ENOSPC == errno 28, ErrorKind::StorageFull (verified on this
+    // toolchain's std: `io::Error::from_raw_os_error(28).kind()` ==
+    // `StorageFull`) -- see `assert_errno_evidence`'s doc for the
+    // incidental-vs-guaranteed split between the two substrings checked.
     let stderr_text = cluster.node0_stderr.lock().unwrap().clone();
-    // ENOSPC == errno 28; Rust's io::Error Display embeds "(os error 28)"
-    // regardless of the OS's (possibly localized) strerror text, so this is
-    // the portable assertion -- the brief's "the io error text".
-    assert!(
-        stderr_text.contains("os error 28"),
-        "stderr does not name ENOSPC (os error 28):\n{stderr_text}"
-    );
+    assert_errno_evidence(&stderr_text, "os error 28", "StorageFull");
 
     assert_survivors_keep_committing(&cluster, &mut acked, 10, 20);
 
