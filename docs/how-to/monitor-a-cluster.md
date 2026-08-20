@@ -106,7 +106,9 @@ table:
 | `Uc2RepeatedWipes` | a node wiped-and-rejoined more than once in 10m | warning |
 | `Uc2UnattestedReports` | a pre-0.5.0 peer's un-attested durable reports are being counted — a flag-day violation; commits will stall | critical |
 | `Uc2CleartextPeer` | cleartext datagrams arrived from a peer while crypto is on — a node missed the wire-crypto flag day | critical |
-| `Uc2FollowerSealFailures` | seal failures climb on a **follower** — a leader's own climb is benign and excluded by the rule | warning |
+| `Uc2FollowerSealFailures` | outgoing control frames a **follower** could not seal (check pairwise sessions/allowlist) — a leader's own climb is benign and excluded by the rule | warning |
+
+The per-peer band (`uc2_peer_reported_durable_bytes`, `uc2_peer_replication_lag_bytes`) is leader-authoritative — only the leader receives `AppendPosition` reports, so a follower's own scrape always reads 0 for every peer regardless of health (see [Diagnose a node](diagnose-a-node.md)); `Uc2PeerNeverHeard` and `Uc2PeerLagging` are scoped to `uc2_is_leader == 1` for exactly this reason, and the dashboard's per-peer panel does the same.
 
 ## Import the dashboard
 

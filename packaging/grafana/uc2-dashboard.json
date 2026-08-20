@@ -79,7 +79,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-          "expr": "uc2_peer_replication_lag_bytes",
+          "expr": "uc2_peer_replication_lag_bytes and on(instance) uc2_is_leader == 1",
           "legendFormat": "{{instance}} -> peer {{peer}}"
         }
       ]

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! M10 gate: **observable cluster** (spec's M10 scope note in `CLAUDE.md`;
+//! M10 gate: **observable cluster** (see
+//! `docs/superpowers/specs/2026-08-19-uc2-production-readiness-design.md` §5;
 //! plan `docs/superpowers/plans/2026-08-19-uc2-m10-observable-cluster.md`).
 //!
 //! The four pre-committed bars live in
@@ -254,6 +255,16 @@ impl StateMachine for NoopSm {
 
 // ------------------------------------------------------------- row 1: coverage
 
+/// Boundary-matched family presence — see the identical helper (and its
+/// rationale: `uc2_term` is a prefix of `uc2_term_change_discards_total`, so
+/// a bare `contains` would pass even if `uc2_term` never rendered) in
+/// `uc2_node/src/obs/metrics.rs`'s `every_contract_series_is_present` test.
+fn series_present(text: &str, name: &str) -> bool {
+    text.contains(&format!("\n{name} "))
+        || text.contains(&format!("\n{name}{{"))
+        || text.contains(&format!("\n# TYPE {name} "))
+}
+
 fn run_coverage(scratch_root: &Path) -> Verdict {
     let _ = std::fs::create_dir_all(scratch_root);
     println!("== row 1: /metrics coverage ==");
@@ -274,8 +285,7 @@ fn run_coverage(scratch_root: &Path) -> Verdict {
 
     let mut missing = Vec::new();
     for name in CONTRACT_SERIES {
-        let present = body.contains(&format!("\n{name}")) || body.starts_with(name);
-        if !present {
+        if !series_present(&body, name) {
             missing.push(*name);
             println!("  MISSING family: {name}");
         }

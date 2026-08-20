@@ -298,27 +298,43 @@ def build_Uc2AdmissionSaturated():
 
 def build_Uc2PeerNeverHeard():
     rows = load_scenario("peer_never_heard")
-    # Both n0 (a follower) and n1 (the leader) show peer="2" == 0 in the real
-    # capture, for different reasons (see the task report's self-review): n1
-    # genuinely never heard from the never-started peer; n0 shows 0 for
-    # every peer because a follower doesn't track peer-reported-durable the
-    # way the leader's quorum tracker does. `select()`'s first-match pick is
-    # therefore file-order-sensitive — but both candidate rows are honest
-    # real zeros, so the alert fires correctly either way.
-    row = select(rows, "uc2_peer_reported_durable_bytes", {"peer": "2"})
+    # The fixed rule is leader-scoped (`and on(instance) uc2_is_leader == 1`),
+    # so the leader's OWN row is the one that must be adjudicated, not
+    # whichever of n0/n1 `select()` happens to hit first: both nodes show
+    # peer="2" == 0 in the real capture, but only the leader's zero is the
+    # semantically meaningful "never reported" — a follower reads 0 for
+    # every peer regardless, because it never tracks peer-reported-durable
+    # the way the leader's quorum tracker does (that asymmetry is exactly
+    # the bug this leader-scoping fixes). Find the leader from the real
+    # uc2_is_leader scrapes and select ITS peer=2 row.
+    leader_rows = [r for r in rows if r["name"] == "uc2_is_leader"]
+    leader_row = next((r for r in leader_rows if r["values"][-1] == "1"), None)
+    if leader_row is None:
+        raise ScenarioMissing("no node reported uc2_is_leader=1 in peer_never_heard capture")
+    leader_instance = leader_row["labels"]["instance"]
+    row = select(
+        rows, "uc2_peer_reported_durable_bytes", {"peer": "2", "instance": leader_instance}
+    )
     r = new_rule("warning", labels_from=row)
     add_hold_last(r, row, "uc2_peer_reported_durable_bytes", 120)
+    add_hold_last(r, leader_row, "uc2_is_leader", 120)
     r["eval_time"] = total_for(120)[0]
     return r
 
 
 def build_Uc2PeerLagging():
     rows = load_scenario("follower_partitioned")
+    # follower_partitioned only ever scrapes the LEADER's /metrics (see the
+    # Rust scenario), so every row here is already the leader's — the
+    # is_leader series added for the leader-scoped rule is just that same
+    # instance's uc2_is_leader, real and held at 1 the whole window.
     lag_row = select(rows, "uc2_peer_replication_lag_bytes", {"peer": "0"})
     adm_row = select(rows, "uc2_admission_bytes", {})
+    leader_row = select(rows, "uc2_is_leader", {})
     r = new_rule("warning", labels_from=lag_row)  # group_left keeps LHS's extra labels
     add_hold_last(r, lag_row, "uc2_peer_replication_lag_bytes", 300)
     add_hold_last(r, adm_row, "uc2_admission_bytes", 300)
+    add_hold_last(r, leader_row, "uc2_is_leader", 300)
     r["eval_time"] = total_for(300)[0]
     return r
 

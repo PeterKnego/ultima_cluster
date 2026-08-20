@@ -59,7 +59,9 @@ const READ_TIMEOUT: Duration = Duration::from_secs(1);
 /// last read can't itself overshoot it). Because [`ObsServer::serve`]'s
 /// accept loop handles connections synchronously, one connection that never
 /// bounds itself stalls the WHOLE server — every other client's
-/// `/metrics`/`/healthz`/`/readyz`, and [`ObsServer::stop`]'s join.
+/// `/metrics`/`/healthz`/`/readyz`, and [`ObsServer::stop`]'s join. Also
+/// reused as the flat `SO_SNDTIMEO` budget for [`write_response`] — a client
+/// that never reads its response is the same stall risk on the write side.
 const CONN_DEADLINE: Duration = Duration::from_secs(2);
 
 /// A running observability HTTP server: one thread, one `TcpListener`, no
@@ -265,9 +267,67 @@ fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body:
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    // Best-effort: a client that hangs up mid-write doesn't get retried —
-    // this is a scrape/probe endpoint, not a reliable transport.
+    // A client that never reads (or trickles reads just slowly enough)
+    // would otherwise block `write_all` forever — and because the accept
+    // loop is single-threaded and synchronous, that stalls every other
+    // client AND `ObsServer::stop()`'s join (the daemon's SIGTERM handler
+    // hangs). Bound it with the same budget as the read phase's wall-clock
+    // deadline (`CONN_DEADLINE`); best-effort beyond that — a client that
+    // hangs up (or stalls) mid-write doesn't get retried, this is a
+    // scrape/probe endpoint, not a reliable transport.
+    let _ = stream.set_write_timeout(Some(CONN_DEADLINE));
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body.as_bytes());
     let _ = stream.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// IMPORTANT-2 regression: `write_response`'s `write_all` had no
+    /// timeout, so a client that connects and never reads its response
+    /// could block it forever — and because `ObsServer`'s accept loop is
+    /// single-threaded and synchronous, that stalls `ObsServer::stop()`'s
+    /// join too (the daemon's SIGTERM path hangs). A real `/metrics` scrape
+    /// is only a few KB, well within default OS socket buffers, so this
+    /// drives `write_response` directly (it's private to this module) with
+    /// a body deliberately sized (32 MiB) to exceed any default socket
+    /// buffer, against a real peer socket that is held open and never
+    /// read — the only honest way to make the pre-fix hang actually
+    /// reproduce in a unit test.
+    #[test]
+    fn write_response_does_not_block_forever_on_a_client_that_never_reads() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+
+        let client = TcpStream::connect(addr).expect("client connect");
+        let (mut server_side, _peer) = listener.accept().expect("accept");
+        // `client` is held open (not dropped) and never read from — that's
+        // the whole point. `server_side` is this test's stand-in for the
+        // stream `handle_conn` would have passed to `write_response`.
+
+        let body = "x".repeat(32 * 1024 * 1024);
+        let start = Instant::now();
+        write_response(&mut server_side, 200, "text/plain", &body);
+        let elapsed = start.elapsed();
+
+        // `write_all`'s header write + the 32 MiB body write can each need
+        // their own `CONN_DEADLINE`-bounded stall before the kernel gives
+        // up on a peer that never drains its window (observed ~6.1s
+        // locally — a small fixed multiple of CONN_DEADLINE, not
+        // unbounded), so the bound here is generous. What actually
+        // distinguishes this test: with `set_write_timeout` removed, this
+        // same call hangs past 15s (verified manually — the kernel's own
+        // retransmission give-up is on the order of minutes), so 15s here
+        // is still well short of "unbounded" while comfortably clear of
+        // the bounded case.
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "write_response took {elapsed:?} against a client that never reads its \
+             response — past its wall-clock write-timeout budget (CONN_DEADLINE={CONN_DEADLINE:?})"
+        );
+        drop(client);
+    }
 }

@@ -151,7 +151,10 @@ fn push_labeled(out: &mut String, name: &str, help: &str, ty: &str, samples: &[(
 }
 
 /// Render the full M10 series contract over one snapshot of `s`'s `Arc`s
-/// and atomics. Pure — no I/O, no allocation beyond the returned `String`.
+/// and atomics. Pure — no I/O; all allocation (the labeled-sample `Vec`s,
+/// the per-line `format!` calls, and the returned `String` itself) happens
+/// only on the calling (exporter) thread, never on any hot-path agent
+/// thread.
 pub fn render_prometheus(s: &ObsSources) -> String {
     let mut out = String::with_capacity(8 * 1024);
 
@@ -646,11 +649,22 @@ mod tests {
         let s = synthetic_sources();
         let text = render_prometheus(&s);
         for name in CONTRACT_SERIES {
-            assert!(
-                text.contains(&format!("\n{name}")) || text.starts_with(name),
-                "missing series {name}"
-            );
+            assert!(series_present(&text, name), "missing series {name}");
         }
+    }
+
+    /// Boundary-matched family presence: `\n{name} ` (a bare gauge/counter
+    /// value line), `\n{name}{{` (a labeled sample line), or
+    /// `\n# TYPE {name} ` (the family header, unconditionally emitted
+    /// whenever the family renders at all, including a labeled family with
+    /// zero occupied samples). A plain substring check is live-vacuous-able:
+    /// `uc2_term` is a prefix of `uc2_term_change_discards_total`, so
+    /// `contains("\n{name}")` alone would pass even if `uc2_term` itself
+    /// never rendered.
+    fn series_present(text: &str, name: &str) -> bool {
+        text.contains(&format!("\n{name} "))
+            || text.contains(&format!("\n{name}{{"))
+            || text.contains(&format!("\n# TYPE {name} "))
     }
 
     #[test]

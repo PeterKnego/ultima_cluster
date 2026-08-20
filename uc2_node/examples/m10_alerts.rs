@@ -627,7 +627,11 @@ fn scenario_peer_never_heard(scratch_root: &Path) -> (SeriesFile, Disclosure) {
     let mut sf = SeriesFile::new();
     for _ in 0..12 {
         for (i, n) in nodes.iter().enumerate() {
-            sf.record_round(&format!("n{i}"), &scrape(n.obs_addr()), &["uc2_peer_reported_durable_bytes"]);
+            sf.record_round(
+                &format!("n{i}"),
+                &scrape(n.obs_addr()),
+                &["uc2_peer_reported_durable_bytes", "uc2_is_leader"],
+            );
         }
         thread::sleep(Duration::from_secs(1));
     }
@@ -680,7 +684,7 @@ fn scenario_follower_partitioned(scratch_root: &Path) -> (SeriesFile, Disclosure
         partition_pair(&nodes, victim_idx, o);
     }
 
-    let families = ["uc2_peer_replication_lag_bytes", "uc2_admission_bytes"];
+    let families = ["uc2_peer_replication_lag_bytes", "uc2_admission_bytes", "uc2_is_leader"];
     let mut sf = SeriesFile::new();
     let instance = format!("n{leader_idx}");
     let addr = nodes[leader_idx].obs_addr();

@@ -256,9 +256,20 @@ mod tests {
         let buf = capture_for_tests();
         set_level(LogLevel::Error);
         emit(LogLevel::Info, "noise", &[]);
-        assert!(buf.lock().unwrap().is_empty());
+        // Not an emptiness assertion: the capture buffer is a process-global
+        // sink and `TEST_LOCK` only serializes THIS file's own tests, so a
+        // concurrent node-test emission could land a line here and make an
+        // is_empty() check flaky. Assert on content instead: the suppressed
+        // event specifically must not appear.
+        {
+            let s = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+            assert!(!s.contains(r#""event":"noise""#), "{s}");
+        }
         emit(LogLevel::Error, "kept", &[]);
-        assert!(!buf.lock().unwrap().is_empty());
+        {
+            let s = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+            assert!(s.contains(r#""event":"kept""#), "{s}");
+        }
         set_level(LogLevel::Info);
         stderr_for_tests();
     }

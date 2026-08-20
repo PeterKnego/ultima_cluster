@@ -28,12 +28,20 @@ groups:
     labels: { severity: critical }
     annotations: { summary: "{{ $labels.instance }} appends but cannot commit — no quorum acknowledging" }
   - alert: Uc2PeerNeverHeard
-    expr: uc2_peer_reported_durable_bytes == 0
+    # The peer band is leader-authoritative: reported_durable is only fed by
+    # AppendPosition reports, which only the LEADER receives, so a follower's
+    # own scrape always reads 0 for every peer — that's not "never heard",
+    # it's "not the leader". Scope to the leader's own view.
+    expr: uc2_peer_reported_durable_bytes == 0 and on(instance) uc2_is_leader == 1
     for: 2m
     labels: { severity: warning }
     annotations: { summary: "peer {{ $labels.peer }} has never reported — check the bind-address rule first" }
   - alert: Uc2PeerLagging
-    expr: uc2_peer_replication_lag_bytes > on(instance) group_left uc2_admission_bytes
+    # Same leader-scoping as Uc2PeerNeverHeard above — a follower's
+    # uc2_peer_replication_lag_bytes is commit - 0 (it never tracks peers'
+    # reported_durable), so without this the rule would false-fire on every
+    # healthy follower under sustained traffic.
+    expr: (uc2_peer_replication_lag_bytes > on(instance) group_left uc2_admission_bytes) and on(instance) uc2_is_leader == 1
     for: 5m
     labels: { severity: warning }
     annotations: { summary: "peer {{ $labels.peer }} lags by more than the admission window" }
@@ -66,4 +74,4 @@ groups:
     expr: delta(uc2_receiver_seal_failures_total[5m]) > 0 and uc2_is_leader == 0
     for: 0m
     labels: { severity: warning }
-    annotations: { summary: "authentication failures opening peer traffic on follower {{ $labels.instance }} (a leader's seal_failures climb is benign — this one is not)" }
+    annotations: { summary: "outgoing control frames follower {{ $labels.instance }} could not seal — check pairwise sessions/allowlist (a leader's seal_failures climb is benign, this one is not)" }
