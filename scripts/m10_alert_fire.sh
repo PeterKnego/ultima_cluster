@@ -233,6 +233,7 @@ RULE_META = {
     "Uc2UnattestedReports": {"severity": "critical", "real": False, "scenario": "crypto_counters"},
     "Uc2CleartextPeer": {"severity": "critical", "real": False, "scenario": "crypto_counters"},
     "Uc2FollowerSealFailures": {"severity": "warning", "real": False, "scenario": "crypto_counters"},
+    "Uc2DiskLow": {"severity": "warning", "real": False, "scenario": "disk_low"},
 }
 
 
@@ -392,6 +393,17 @@ def build_Uc2FollowerSealFailures():
     return r
 
 
+def build_Uc2DiskLow():
+    rows = load_scenario("disk_low")
+    disk_row = select(rows, "uc2_free_disk_bytes", {})
+    seg_row = select(rows, "uc2_journal_segment_bytes", {})
+    r = new_rule("warning", labels_from=disk_row)
+    add_hold_last(r, disk_row, "uc2_free_disk_bytes", 120)
+    add_hold_last(r, seg_row, "uc2_journal_segment_bytes", 120)
+    r["eval_time"] = total_for(120)[0]
+    return r
+
+
 RULE_BUILDERS = {
     "Uc2AgentDead": build_Uc2AgentDead,
     "Uc2NoLeader": build_Uc2NoLeader,
@@ -406,7 +418,38 @@ RULE_BUILDERS = {
     "Uc2UnattestedReports": build_Uc2UnattestedReports,
     "Uc2CleartextPeer": build_Uc2CleartextPeer,
     "Uc2FollowerSealFailures": build_Uc2FollowerSealFailures,
+    "Uc2DiskLow": build_Uc2DiskLow,
 }
+
+# Task 5 completeness cross-check: parse every `alert:` name straight out of
+# the SHIPPED rules file and fail loudly (naming them) if any has no
+# RULE_BUILDERS entry — closing the silent-drop gap found in exploration,
+# where a rule could ship with no adjudication coverage and nothing here
+# would ever notice. Deliberately runs BEFORE any builder executes (which
+# spins up real/synthetic clusters) so a missing entry is caught fast, not
+# after minutes of cluster setup.
+ALERT_NAME_RE = re.compile(r"^\s*-\s*alert:\s*(\S+)\s*$")
+
+
+def parse_shipped_alert_names(path):
+    names = []
+    with open(path) as f:
+        for line in f:
+            m = ALERT_NAME_RE.match(line)
+            if m:
+                names.append(m.group(1))
+    return names
+
+
+_shipped_names = parse_shipped_alert_names(RULES_FILE)
+_missing_builders = [n for n in _shipped_names if n not in RULE_BUILDERS]
+if _missing_builders:
+    print(
+        f"error: {len(_missing_builders)} alert(s) in {RULES_FILE} have no RULE_BUILDERS "
+        f"entry: {_missing_builders} — every shipped alert must be adjudicated here.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 # Fix round 1, Finding 1: build each rule's input series independently, so
 # one rule's scenario being missing (panicked upstream, or — in principle —

@@ -30,6 +30,18 @@ path is kept because other documents and tooling cite it.
   replace hardware. *Was §6.*
 - [Encrypt traffic between nodes](../how-to/encrypt-node-traffic.md) — key
   material, the flag-day rollout, health counters, and rotation. *Was §11.*
+- [Upgrade a cluster](../how-to/upgrade-a-cluster.md) — a scripted flag-day
+  binary upgrade (`scripts/uc2_flag_day.sh`), the traffic-stop prerequisite,
+  and a measured downtime number.
+
+## Surviving failures
+
+- [Back up a cluster](../how-to/back-up-a-cluster.md) — an ordered-copy
+  artifact taken from a live, loaded node, verified before you trust it,
+  restorable onto a new host; the minority-restore rule.
+- [Recover from quorum loss](../how-to/recover-from-quorum-loss.md) — a
+  majority of voters is gone: force a survivor back into service with the
+  data-loss window stated up front, then wipe-and-rejoin the repaired peers.
 
 ## When something is wrong
 

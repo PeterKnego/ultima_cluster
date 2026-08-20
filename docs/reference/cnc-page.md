@@ -59,6 +59,7 @@ writer.
 | 3648 | `admin_resp` | admin response slot |
 | 3712 | `admission_bytes` | the node's configured admission window |
 | 3776 | `seal_failures` | crypto seal failures |
+| 3840 | `free_disk_bytes` | free bytes on the instance dir's filesystem; writer: the `uc2-node` daemon only, `0` = never published |
 
 Counters are absolute byte positions in the replicated log, not indices.
 

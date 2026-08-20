@@ -1448,6 +1448,7 @@ dependencies = [
  "clap",
  "rand",
  "uc2_log",
+ "uc2_node",
  "uc_protocol",
 ]
 

@@ -29,6 +29,7 @@
 //! §3.2 / §6; plan `docs/superpowers/plans/2026-07-11-uc2-m4-elections.md`
 //! Task 8.
 
+pub mod backup;
 pub mod config_file;
 pub mod ipc;
 #[cfg(feature = "mutation-testing")]
@@ -37,6 +38,7 @@ mod node;
 pub mod obs;
 pub mod preflight;
 mod read_round;
+pub mod recovery;
 
 pub use config_file::load_from_path;
 pub use ipc::{InstanceDir, IpcError};

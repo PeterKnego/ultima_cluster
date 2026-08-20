@@ -192,6 +192,15 @@ impl Archive {
         self.first_base
     }
 
+    /// Whether `open()` found and healed a torn active-segment tail (an
+    /// incomplete/garbage record left by a process that died mid-write). M11's
+    /// offline backup verify reports this rather than treating it as a failure
+    /// (the copy of a running node's log is crash-equivalent by construction).
+    #[inline]
+    pub fn healed_torn_tail(&self) -> bool {
+        self.journal.healed_torn_tail()
+    }
+
     /// Purge journal blocks strictly below the block COVERING `pos` (the
     /// covering block is retained — a replay at `pos` must succeed after).
     /// No-op if `pos <= first_base`, if no block covers `pos`, or if the

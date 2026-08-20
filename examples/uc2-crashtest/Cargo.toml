@@ -16,6 +16,16 @@ path = "src/bin/uc2-crashtest-service.rs"
 
 [features]
 hard-crash-tests = []
+# M11 Task 3: the survival crashtest (backup-under-load -> host-destroyed ->
+# restore -> rejoin, as a CI test). Empty like hard-crash-tests — just a gate
+# so the multi-process/real-SIGKILL suite doesn't run by default.
+survival-tests = []
+# M11 Task 6: the ENOSPC crashtest (examples/uc2-crashtest/tests/enospc.rs).
+# Empty like the others -- just a gate so this doesn't run by default. The
+# genuine-ENOSPC test inside is further gated on the UC2_ENOSPC_DIR env var
+# (elle-style: unset = skip cleanly); the sudo-free EACCES sibling in the
+# same file runs unconditionally once this feature is on.
+enospc-tests = []
 
 [dependencies]
 uc2_node      = { path = "../../uc2_node" }

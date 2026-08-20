@@ -84,6 +84,12 @@ pub struct Journal {
     writer: Mutex<Option<Writer>>,
     /// Fsync-durable sequence watermark (task28).
     durability: Arc<SeqWatermark>,
+    /// Whether `open()` found (and healed) a torn active-segment tail on ANY
+    /// segment scanned — an incomplete/garbage record left by a process that
+    /// died mid-write. Healing (rewind the cursor to the last durable record)
+    /// always happens; this flag lets a caller (uc2_node's offline backup
+    /// verify, M11) REPORT that it happened without re-deriving the scan.
+    healed_torn_tail: bool,
 }
 
 impl Journal {
@@ -115,10 +121,37 @@ impl Journal {
 
         // Phase 1: open each segment, fix any torn tail, collect (SegmentFile, ScanResult).
         let mut segments_with_scan: Vec<(segment::SegmentFile, segment::ScanResult)> = Vec::new();
-        for ent in entries {
+        let mut healed_torn_tail = false;
+        let n_entries = entries.len();
+        for (i, ent) in entries.into_iter().enumerate() {
             let mut seg = segment::SegmentFile::open_for_read(&ent.path())?;
-            let scan = seg.scan()?;
+            // Only the LAST (active/highest-numbered) segment can have a
+            // TORN-BY-CRASH tail — the writer only ever appends past the
+            // current end of the active segment. A ROLL cannot leave a torn
+            // tail on the segment it just sealed either: the M11 roll-fsync
+            // fix (Task 2c, `writer.rs`'s `write_batch`) fsyncs the outgoing
+            // segment k BEFORE k+1 is ever created, so any crash up through
+            // that fsync still finds k as the LAST segment on disk (k+1
+            // doesn't exist yet — scanned tail-tolerantly, not strictly, by
+            // this very branch), and any crash AFTER it finds k fully
+            // durable. There is no window where a sealed (non-last) segment
+            // can be incomplete via the roll path. Scan the true last
+            // segment tail-tolerantly so a crash mid-`append_records` (a
+            // valid length prefix over a not-yet-visible zeroed body/CRC)
+            // heals through the SAME machinery below instead of
+            // hard-erroring `Journal::open` at boot. Every other (sealed)
+            // segment keeps the strict `scan()`: a CRC mismatch there is not
+            // tail-shaped and must stay a hard error (genuine corruption of
+            // an immutable segment is a far more serious signal than a
+            // live-tail race).
+            let is_active = i + 1 == n_entries;
+            let scan = if is_active {
+                seg.scan_active_tail_tolerant()?
+            } else {
+                seg.scan()?
+            };
             let scan = if scan.had_torn_tail {
+                healed_torn_tail = true;
                 if config.preallocate_segments {
                     // Preserve the physical zero tail; only rewind the logical
                     // cursor to the last durable record. The writer resumes
@@ -126,6 +159,75 @@ impl Journal {
                     // churn). The first scan's records/index already exclude the
                     // torn tail, so reuse it directly.
                     seg.reset_cursor(scan.last_durable_offset);
+                    if is_active {
+                        // CRITICAL: `reset_cursor` is logical-only — it does
+                        // NOT erase the torn record's bytes still physically
+                        // on disk at [last_durable_offset, torn_end). For the
+                        // pre-existing `Ok(None)` torn-tail shape (a zero or
+                        // truncated length prefix) that residue was always
+                        // all-zero and harmless. But
+                        // `scan_active_tail_tolerant`'s CRC-mismatch
+                        // classification (the M11 CRC anomaly investigation)
+                        // heals a record whose REAL, non-zero partial payload
+                        // bytes are still on disk (692/2904 bytes in
+                        // run-00196, 15668/19216 in run-00751 — see the
+                        // investigation's forensics). Left unzeroed, that
+                        // residue is a record-shaped span that a LATER strict
+                        // `scan()` — `apply_truncate_to_segments`, called
+                        // from a live `truncate_after`/`truncate_all` OR from
+                        // Phase 2b below replaying an intent file in THIS
+                        // SAME open — CRC-fails on again and hard-errors.
+                        // Worse: if that later failure happens from a LIVE
+                        // `truncate_after` call, after `write_truncate_intent`
+                        // already made the intent durable, the intent is
+                        // never consumed (`?` skips `remove_truncate_intent`)
+                        // — so EVERY subsequent boot heals here again, then
+                        // Phase 2b replays the SAME leftover intent and hits
+                        // the SAME un-erased residue: a permanently
+                        // unbootable node.
+                        //
+                        // ROUND 2: zeroing only up to `segment_size_bytes` is
+                        // NOT enough. `write_batch`'s roll decision
+                        // (`writer.rs`: `need_new = projected >=
+                        // st.segment_size`) is evaluated BEFORE the record
+                        // that crosses the boundary is added — the record
+                        // that pushes `projected` over the limit is still
+                        // written into the CURRENT segment, only the NEXT
+                        // record rolls. So a segment's actual physical size
+                        // ending up past `segment_size_bytes` is the ORDINARY
+                        // geometry of a nearly-full segment, not an edge
+                        // case — and a torn record can straddle that
+                        // boundary too. Zeroing only to `segment_size_bytes`
+                        // would early-return as a no-op (`preallocate_to`'s
+                        // own `total_len <= self.size` guard) whenever the
+                        // healed cursor already exceeds it, leaving the real
+                        // residue on disk. It also breaks if
+                        // `segment_size_bytes` is ever reduced between boots
+                        // for the same reason. Zero through the segment's
+                        // TRUE physical end instead: `preallocate_to` fills
+                        // `[cursor, total_len)` without extending past
+                        // `total_len`, and passing `total_len ==
+                        // physical_len` never grows `i_size` further — it
+                        // only re-zeros what is already there.
+                        let zero_to = config.segment_size_bytes.max(seg.physical_len()?);
+                        // Skip the (fallocate/write + `sync_data`) barrier
+                        // entirely when there is nothing to erase: `scan()`'s
+                        // `had_torn_tail` is true whenever ANY bytes trail
+                        // the last record, which for a preallocated segment
+                        // is the ORDINARY clean-shutdown case (the untouched
+                        // zero preallocation) on essentially every boot, not
+                        // just a genuine crash-torn residue. Without this
+                        // guard the heal branch would re-zero-and-fsync the
+                        // active segment's tail on every single preallocated
+                        // open, at a real cost against the boot-time bar.
+                        if seg.has_nonzero_residue_from(scan.last_durable_offset)? {
+                            seg.preallocate_to(
+                                zero_to,
+                                config.prealloc_fill,
+                                config.prealloc_fill_chunk_bytes,
+                            )?;
+                        }
+                    }
                     scan
                 } else {
                     seg.truncate(scan.last_durable_offset)?;
@@ -252,9 +354,17 @@ impl Journal {
             pending: std::collections::BTreeMap::new(),
             truncate_gen: 0,
             persisted_hwm: 0,
+            // A freshly-recovered active segment is either empty or has
+            // only durably-recovered bytes (Journal::open's own healing —
+            // and any Phase-1 residue re-zero — already fsyncs what it
+            // touches via `truncate`/`preallocate_to`'s own sync); nothing
+            // written since open() has yet to be fsynced by the writer.
+            active_segment_dirty: false,
             poisoned: false,
             #[cfg(test)]
             fail_next_fsync: false,
+            #[cfg(test)]
+            seal_fsync_log: Vec::new(),
         }));
         let durability = SeqWatermark::new();
         let writer = Writer::spawn(Arc::clone(&state), Arc::clone(&durability));
@@ -262,6 +372,7 @@ impl Journal {
             state,
             writer: Mutex::new(Some(writer)),
             durability,
+            healed_torn_tail,
         })
     }
 
@@ -271,6 +382,12 @@ impl Journal {
 
     pub fn last_seq(&self) -> Option<u64> {
         self.state.lock().unwrap().last_seq
+    }
+
+    /// Whether `open()` found and healed a torn active-segment tail (see the
+    /// field doc). `false` for a clean recovery.
+    pub fn healed_torn_tail(&self) -> bool {
+        self.healed_torn_tail
     }
 
     /// Highest seq known to be fsync-durable (task28).
@@ -501,6 +618,16 @@ impl Journal {
         let dir = st.dir.clone();
         write_truncate_intent(&dir, keep_seq)?;
         apply_truncate_to_segments(&dir, &mut st.segments, keep_seq)?;
+        // Every segment that survives this call was just made durable by
+        // `apply_truncate_to_segments` itself — `SegmentFile::truncate`'s
+        // own `sync_all()` on the boundary segment (the `Some(seg_idx)`
+        // arm), or nothing at all if `keep_seq` fell below every segment's
+        // `base_seq` (the `None` arm empties `st.segments` entirely). A
+        // stale `true` surviving either case — with a possibly-DIFFERENT
+        // (or NO) active segment than whichever one set it — is exactly
+        // the shape that could reach `write_batch`'s seal block with no
+        // current segment to fsync (round-3 fix: that used to panic there).
+        st.active_segment_dirty = false;
         remove_truncate_intent(&dir)?;
 
         // Update in-memory bounds. Anything <= keep_seq survives (on disk or
@@ -561,6 +688,11 @@ impl Journal {
         let dir = st.dir.clone();
         write_truncate_intent(&dir, KEEP_NONE_SENTINEL)?;
         apply_truncate_to_segments(&dir, &mut st.segments, KEEP_NONE_SENTINEL)?;
+        // The keep-none arm always ends with a FRESH segment (`SegmentFile::
+        // create`, which syncs the header + parent dir itself) — nothing
+        // application-level is unfsynced. See `truncate_after`'s identical
+        // clear for the full round-3 rationale.
+        st.active_segment_dirty = false;
         remove_truncate_intent(&dir)?;
 
         st.first_seq = None;
@@ -1238,6 +1370,422 @@ mod tests {
         j2.append(4, 0, b"new").unwrap().wait().unwrap();
     }
 
+    /// Hand-write a record whose length prefix is real, whose first
+    /// `real_bytes` of body are REAL non-zero bytes (a genuine in-flight
+    /// partial write), and whose remaining body bytes + CRC trailer are still
+    /// zero-fill — the exact torn-write shape from the M11 CRC anomaly
+    /// investigation's forensics
+    /// (`.superpowers/sdd/2026-08-20-uc2-m11-survivable-cluster/crc-anomaly-investigation.md`):
+    /// run-00196 had 692 real bytes of a 2904-byte record before the zero
+    /// transition; run-00751 had 15668 of 19216. A crash (or, for the
+    /// preserved artifacts, a concurrent `fs::copy`) caught a record whose
+    /// length prefix AND part of its body had already landed. `real_bytes =
+    /// 0` (all-zero body) is deliberately NOT the default here: it is the one
+    /// shape where a heal that only rewinds the logical cursor
+    /// (`reset_cursor`, without physically zeroing the residue) is harmless —
+    /// using it everywhere would hide exactly the residue-left-on-disk defect
+    /// fix-round-1 shipped with (see task-2b-report.md's "Fix round 1"
+    /// section). Constructing it by hand-writing bytes reproduces the
+    /// identical on-disk shape without needing a real preallocated segment
+    /// racing a real writer thread.
+    ///
+    /// Writes at the segment's true LOGICAL end (from a clean `scan()`, not
+    /// the physical EOF) — required for a preallocated segment, where the
+    /// physical file is already full-size and `OpenOptions::append` would
+    /// land far past the real record boundary, inside the segment's ordinary
+    /// (already-tolerated) untouched zero tail rather than replacing it.
+    /// Returns `(offset written at, total byte length written)`.
+    fn write_torn_record(
+        seg_path: &std::path::Path,
+        payload_len: usize,
+        real_bytes: usize,
+    ) -> (u64, usize) {
+        use std::io::{Seek, SeekFrom, Write};
+        let offset = segment::SegmentFile::open_for_read(seg_path)
+            .unwrap()
+            .scan()
+            .unwrap()
+            .last_durable_offset;
+        let body_len = 16usize + payload_len;
+        assert!(real_bytes <= body_len, "real_bytes must fit within the body");
+        let mut bytes = Vec::with_capacity(4 + body_len + 4);
+        bytes.extend_from_slice(&(body_len as u32).to_le_bytes());
+        bytes.extend(std::iter::repeat_n(0xABu8, real_bytes)); // real (non-zero) partial write
+        bytes.extend(std::iter::repeat_n(0u8, body_len - real_bytes + 4)); // unwritten zero-fill + zero CRC trailer
+        let mut f = std::fs::OpenOptions::new().write(true).open(seg_path).unwrap();
+        f.seek(SeekFrom::Start(offset)).unwrap();
+        f.write_all(&bytes).unwrap();
+        (offset, bytes.len())
+    }
+
+    /// `read_dir` a journal directory, keeping only `seg-*.log` entries and
+    /// sorting them — zero-padded segment numbers sort lexicographically in
+    /// numeric order, so `entries.last()` is always the active segment.
+    fn segment_paths(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("seg-"))
+            .map(|e| e.path())
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// Regression for the M11 CRC anomaly: a crash-torn tail on the ACTIVE
+    /// segment (valid length prefix, zero-fill body/CRC) must heal on open,
+    /// not hard-error. Non-preallocated config (the default) — exercises the
+    /// PHYSICAL-truncate heal branch.
+    #[test]
+    fn open_heals_active_segment_crc_mismatch_zero_fill_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        {
+            let j = Journal::open(JournalConfig::new(&dir_path)).unwrap();
+            for i in 1..=3u64 {
+                j.append(i, 0, b"x").unwrap().wait().unwrap();
+            }
+        }
+        let seg_path = segment_paths(&dir_path).into_iter().next_back().unwrap();
+        write_torn_record(&seg_path, 8, 10);
+
+        // BEFORE the fix this hard-errored (JournalError::Corrupted); AFTER,
+        // it must heal and report so via `healed_torn_tail()`.
+        let j2 = Journal::open(JournalConfig::new(&dir_path)).unwrap();
+        assert!(j2.healed_torn_tail(), "must report the heal");
+        assert_eq!(
+            j2.last_seq(),
+            Some(3),
+            "recovered frontier is the last COMPLETE record, not the torn one"
+        );
+        // The journal is fully usable after the heal.
+        j2.append(4, 0, b"new").unwrap().wait().unwrap();
+        assert_eq!(j2.read(4).unwrap().unwrap().1, b"new".to_vec());
+    }
+
+    /// Same as above but with `preallocate_segments: true` (the production
+    /// default at node boot, per `uc2_node::node.rs`'s `ArchiveConfig::new`) —
+    /// exercises the CURSOR-REWIND heal branch (`reset_cursor`, physical zero
+    /// tail preserved) instead of a physical truncate.
+    #[test]
+    fn open_heals_active_segment_crc_mismatch_zero_fill_tail_preallocated() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let mut cfg = JournalConfig::new(&dir_path);
+        cfg.preallocate_segments = true;
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            for i in 1..=3u64 {
+                j.append(i, 0, b"x").unwrap().wait().unwrap();
+            }
+        }
+        let seg_path = segment_paths(&dir_path).into_iter().next_back().unwrap();
+        write_torn_record(&seg_path, 8, 10);
+
+        let j2 = Journal::open(cfg).unwrap();
+        // NOTE: `healed_torn_tail()` alone is a weak signal here — it is
+        // ALSO true for the many pre-existing `Ok(None)`-shaped torn-tail
+        // tests, so a regression that silently stopped tail-tolerating the
+        // CRC-mismatch shape specifically would not be caught by this one
+        // assertion. The load-bearing RED signal for THIS test is the
+        // `.unwrap()` on `Journal::open(cfg)` two lines up: before this fix
+        // that call returned `Err(Corrupted { reason: "record crc
+        // mismatch", .. })` and this test panicked there, never reaching
+        // this line at all.
+        assert!(j2.healed_torn_tail(), "must report the heal");
+        assert_eq!(j2.last_seq(), Some(3));
+        j2.append(4, 0, b"new").unwrap().wait().unwrap();
+        assert_eq!(j2.read(4).unwrap().unwrap().1, b"new".to_vec());
+    }
+
+    /// The strictness boundary: a CRC-mismatched record on the active segment
+    /// FOLLOWED by more valid bytes (a subsequent well-formed record) is NOT
+    /// tail-shaped — it is real corruption and `Journal::open` must still
+    /// hard-error, exactly as it did before this fix.
+    #[test]
+    fn open_hard_errors_crc_mismatch_followed_by_valid_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        {
+            let j = Journal::open(JournalConfig::new(&dir_path)).unwrap();
+            j.append(1, 0, b"x").unwrap().wait().unwrap();
+        }
+        let seg_path = segment_paths(&dir_path).into_iter().next_back().unwrap();
+        let (torn_offset, torn_len) = write_torn_record(&seg_path, 8, 10);
+        // A fully valid record written right after the torn one (at the exact
+        // byte offset the torn record's own length prefix declares as its
+        // end) — NOT tail-shaped, since something valid follows.
+        let good = segment::encode_record(2, 0, b"y");
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&seg_path).unwrap();
+            f.seek(SeekFrom::Start(torn_offset + torn_len as u64)).unwrap();
+            f.write_all(&good).unwrap();
+        }
+
+        let err = match Journal::open(JournalConfig::new(&dir_path)) {
+            Ok(_) => panic!("expected a hard error, but Journal::open succeeded"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, JournalError::Corrupted { .. }),
+            "genuine corruption (CRC-bad record followed by valid data) must still hard-error, got {err:?}"
+        );
+    }
+
+    /// Tolerance must never leak to a SEALED (non-last) segment: a CRC-bad
+    /// record there is genuine corruption of an immutable segment, not a live
+    /// tail, and must still hard-error `Journal::open`.
+    #[test]
+    fn open_hard_errors_on_sealed_segment_crc_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let mut cfg = JournalConfig::new(&dir_path);
+        cfg.segment_size_bytes = 256;
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            for i in 1..=12u64 {
+                j.append(i, 0, &[0u8; 100]).unwrap().wait().unwrap();
+            }
+        }
+        let entries = segment_paths(&dir_path);
+        assert!(
+            entries.len() >= 2,
+            "test setup must produce at least 2 segments, got {}",
+            entries.len()
+        );
+        let sealed_path = entries[0].clone();
+        // Flip the sealed segment's last byte — its final record's CRC trailer.
+        let mut bytes = std::fs::read(&sealed_path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&sealed_path, &bytes).unwrap();
+
+        let err = match Journal::open(cfg) {
+            Ok(_) => panic!("expected a hard error, but Journal::open succeeded"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, JournalError::Corrupted { .. }),
+            "CRC corruption in a sealed segment must still hard-error, got {err:?}"
+        );
+    }
+
+    /// Positive multi-segment case: a CRC-mismatched, zero-fill-tail torn
+    /// record on the LAST of several segments heals normally, and every
+    /// earlier (sealed) segment is left byte-for-byte untouched — pins that
+    /// `is_active` in `Journal::open`'s Phase 1 loop correctly targets only
+    /// the highest-numbered segment when there is more than one on disk.
+    #[test]
+    fn open_heals_torn_tail_on_the_last_of_several_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let mut cfg = JournalConfig::new(&dir_path);
+        cfg.segment_size_bytes = 256;
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            for i in 1..=12u64 {
+                j.append(i, 0, &[0u8; 100]).unwrap().wait().unwrap();
+            }
+        }
+        let entries = segment_paths(&dir_path);
+        assert!(
+            entries.len() >= 2,
+            "test setup must produce at least 2 segments, got {}",
+            entries.len()
+        );
+        let active_path = entries.last().unwrap().clone();
+        let sealed_before: Vec<Vec<u8>> = entries[..entries.len() - 1]
+            .iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect();
+        write_torn_record(&active_path, 8, 10);
+
+        let j2 = Journal::open(cfg).unwrap();
+        assert!(j2.healed_torn_tail(), "must report the heal");
+        assert_eq!(j2.last_seq(), Some(12), "the torn record was never a durable seq");
+
+        for (path, before) in entries[..entries.len() - 1].iter().zip(sealed_before) {
+            assert_eq!(
+                &std::fs::read(path).unwrap(),
+                &before,
+                "sealed segment {path:?} must be byte-for-byte untouched by the heal"
+            );
+        }
+    }
+
+    /// CRITICAL regression (fix round 1): `reset_cursor` alone rewinds the
+    /// LOGICAL cursor but leaves a torn record's real, non-zero residue
+    /// physically on disk at [last_durable_offset, torn_end). A later strict
+    /// `scan()` — e.g. inside a live `truncate_after` call's
+    /// `apply_truncate_to_segments` — re-decodes that residue, CRC-fails
+    /// again, and (since this can happen AFTER `truncate_after`'s own intent
+    /// file already went durable) leaves an unconsumed intent that wedges
+    /// EVERY subsequent `Journal::open` permanently. The fix re-zeros the
+    /// healed span in place (`preallocate_to` from the rewound cursor)
+    /// immediately in Phase 1, before any later phase can observe it. This
+    /// drives the exact sequence: heal on open, then a LIVE `truncate_after`
+    /// at a position inside the healed segment, then a reopen — all three
+    /// must succeed, and the healed span must read back zero.
+    #[test]
+    fn heal_zeros_the_residue_so_a_later_truncate_after_does_not_wedge_the_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let mut cfg = JournalConfig::new(&dir_path);
+        cfg.preallocate_segments = true;
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            for i in 1..=5u64 {
+                j.append(i, 0, b"x").unwrap().wait().unwrap();
+            }
+        }
+        let seg_path = segment_paths(&dir_path).into_iter().next_back().unwrap();
+        let (torn_offset, torn_len) = write_torn_record(&seg_path, 8, 10);
+
+        // Open — Phase 1 must heal (CRC-mismatch, real non-zero partial body).
+        let j2 = Journal::open(cfg.clone()).unwrap();
+        assert!(j2.healed_torn_tail(), "must report the heal");
+        assert_eq!(j2.last_seq(), Some(5));
+
+        // BELT: the healed span reads back all-zero on disk — the fix must
+        // have physically erased the residue, not just logically skipped it.
+        let after_heal = std::fs::read(&seg_path).unwrap();
+        let healed_span = &after_heal[torn_offset as usize..torn_offset as usize + torn_len];
+        assert!(
+            healed_span.iter().all(|&b| b == 0),
+            "the healed span must read back zero after the fix"
+        );
+
+        // WEDGE: a routine truncate_after at a position inside the healed
+        // segment must succeed — this is the live path that, pre-round-1-fix,
+        // hit the un-erased residue via apply_truncate_to_segments' strict
+        // scan() and could leave an unconsumed intent behind.
+        j2.truncate_after(3).unwrap().wait().unwrap();
+        assert_eq!(j2.last_seq(), Some(3));
+        drop(j2);
+
+        // REOPEN: must also succeed — pins against the "permanently
+        // unbootable" failure mode.
+        let j3 = Journal::open(cfg).unwrap();
+        assert_eq!(j3.last_seq(), Some(3));
+    }
+
+    /// Closes the deferred edge disclosed in task-2b-report.md: Phase 2b
+    /// (`read_truncate_intent` / `apply_truncate_to_segments`) also scans the
+    /// active segment strictly. If Phase 1's heal left non-zero residue
+    /// behind, a SINGLE `Journal::open` call that must both heal a torn tail
+    /// AND replay a pending truncate intent (e.g. a live `truncate_after`
+    /// call whose intent went durable just before a crash) would hit that
+    /// residue on the SAME open and hard-error — permanently, since Phase 2b
+    /// runs on every subsequent boot too. With the fix, the residue is
+    /// erased in Phase 1 before Phase 2b ever runs, so this now succeeds.
+    #[test]
+    fn open_heals_active_tail_and_replays_a_pending_intent_in_the_same_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let mut cfg = JournalConfig::new(&dir_path);
+        cfg.preallocate_segments = true;
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            for i in 1..=5u64 {
+                j.append(i, 0, b"x").unwrap().wait().unwrap();
+            }
+        }
+        let seg_path = segment_paths(&dir_path).into_iter().next_back().unwrap();
+        write_torn_record(&seg_path, 8, 10);
+        // A durable intent left over from an earlier truncate_after(3) call
+        // whose destructive phase (apply_truncate_to_segments) never got to
+        // run before the (separate) crash that also tore the append tail.
+        write_intent_bytes(&dir_path, 3);
+
+        let j2 = Journal::open(cfg).unwrap();
+        assert_eq!(j2.last_seq(), Some(3), "the replayed intent truncates to keep_seq=3");
+        assert!(
+            !dir_path.join("truncate.intent").exists(),
+            "the intent must be consumed, not left to wedge every subsequent boot"
+        );
+    }
+
+    /// ROUND 2 regression: a torn record whose bytes STRADDLE
+    /// `config.segment_size_bytes`. `write_batch`'s roll decision
+    /// (`writer.rs`: `need_new = projected >= st.segment_size`) is evaluated
+    /// BEFORE the record that crosses the boundary is added — the record
+    /// that pushes `projected` past the limit is still written into the
+    /// CURRENT segment; only the record AFTER it rolls. So a segment's true
+    /// physical size ending up past `segment_size_bytes` is the ORDINARY
+    /// geometry of a segment nearing capacity, not a contrived edge case.
+    /// Round 1's heal capped its re-zero at `config.segment_size_bytes`,
+    /// which silently no-ops (`preallocate_to`'s own `total_len <=
+    /// self.size` early return) once the healed cursor already exceeds that
+    /// bound — leaving the real non-zero residue on disk. The segment then
+    /// rolls off (seals) with that residue sitting past the last valid
+    /// record, and a LATER open's STRICT scan of the now-sealed segment
+    /// hard-errors on it: the same permanently-unbootable outcome as the
+    /// round-1 critical, one roll later.
+    #[test]
+    fn heal_zeros_through_physical_eof_when_the_torn_record_straddles_segment_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let mut cfg = JournalConfig::new(&dir_path);
+        cfg.preallocate_segments = true;
+        cfg.segment_size_bytes = 300;
+        {
+            let j = Journal::open(cfg.clone()).unwrap();
+            // Each append is its own waited (serial) batch, so `flush_run`
+            // writes it immediately: 3 records of 124 bytes on disk (4-byte
+            // length prefix + 16-byte seq/meta + 100-byte payload + 4-byte
+            // CRC) push segment0's TRUE physical/logical size to
+            // 32 (header) + 3*124 = 404 bytes — already past
+            // `segment_size_bytes` (300). This is the ordinary straddling
+            // geometry `writer.rs` produces, not something hand-engineered.
+            for i in 1..=3u64 {
+                j.append(i, 0, &[0u8; 100]).unwrap().wait().unwrap();
+            }
+        }
+        let seg_path = segment_paths(&dir_path).into_iter().next_back().unwrap();
+        let before_heal_len = std::fs::metadata(&seg_path).unwrap().len();
+        assert!(
+            before_heal_len > cfg.segment_size_bytes,
+            "test setup must actually straddle: {before_heal_len} is not > {}",
+            cfg.segment_size_bytes
+        );
+        let (torn_offset, torn_len) = write_torn_record(&seg_path, 42, 10);
+        assert!(
+            torn_offset > cfg.segment_size_bytes,
+            "the torn record itself must start past segment_size_bytes, got offset {torn_offset}"
+        );
+
+        // Open — Phase 1 must heal, and the residue must be zeroed all the
+        // way to the segment's TRUE physical EOF, not just to
+        // segment_size_bytes.
+        let j2 = Journal::open(cfg.clone()).unwrap();
+        assert!(j2.healed_torn_tail(), "must report the heal");
+        assert_eq!(j2.last_seq(), Some(3));
+
+        let after_heal = std::fs::read(&seg_path).unwrap();
+        let healed_span = &after_heal[torn_offset as usize..torn_offset as usize + torn_len];
+        assert!(
+            healed_span.iter().all(|&b| b == 0),
+            "the healed span must read back zero through physical EOF, even \
+             though it starts past config.segment_size_bytes"
+        );
+
+        // WRITER RESUMES: segment0's healed cursor (404) is already >=
+        // segment_size_bytes (300), so the very next append rolls
+        // immediately, sealing segment0 at exactly its pre-torn-record
+        // length with no new content appended past the heal.
+        j2.append(4, 0, b"y").unwrap().wait().unwrap();
+        assert_eq!(j2.last_seq(), Some(4));
+        drop(j2);
+
+        // REOPEN: segment0 is now SEALED (no longer last) — Journal::open's
+        // Phase 1 scans it with the STRICT scan(). Pre-fix, the un-erased
+        // residue past segment_size_bytes would still be sitting there and
+        // hard-error here; post-fix it reads back as clean trailing zero.
+        let j3 = Journal::open(cfg).unwrap();
+        assert_eq!(j3.last_seq(), Some(4));
+    }
+
     /// With the configurable interval set absurdly high, Eventual mode's
     /// append notifier still resolves at the buffered write, but the fsync
     /// watermark must NOT advance in any reasonable window — pinning that
@@ -1724,6 +2272,69 @@ mod tests {
         j.append(6, 0, b"new").unwrap().wait().unwrap();
         j.wait_durable(6).unwrap();
         assert!(j.durable_seq() >= 6);
+    }
+
+    /// ROUND 3 regression (M11 roll-fsync fix review): `active_segment_dirty`
+    /// must not survive a `truncate_after` call that empties `st.segments`
+    /// (`apply_truncate_to_segments`' `None` arm, reached when `keep_seq`
+    /// falls below every segment's `base_seq`). Under `Durability::Eventual`
+    /// with an idle-timer interval set absurdly high (the only OTHER thing
+    /// that would clear the flag pre-fix, deliberately prevented from firing
+    /// during this test), a stale `true` flag with an empty `segments` used
+    /// to reach `write_batch`'s seal block on the VERY NEXT append (which
+    /// re-creates a segment via `need_new`'s `segments.is_empty()` arm) and
+    /// panic on an `.expect` there — killing the writer thread WHILE it held
+    /// the state lock, poisoning the mutex, and leaving that append's
+    /// `Notifier` uncompleted forever (the writer died before ever reaching
+    /// the per-request `signal.complete(...)` loop). Exercises the exact
+    /// repro sequence the reviewer traced: append, truncate_after(keep_seq
+    /// below every base_seq), append again.
+    #[test]
+    fn eventual_truncate_that_empties_segments_does_not_panic_or_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let mut cfg = JournalConfig::new(&dir_path);
+        cfg.durability = crate::Durability::Eventual;
+        // Absurdly high: this test must not let the idle-timer fsync fire
+        // and accidentally mask the bug by clearing the flag itself.
+        cfg.eventual_fsync_interval = std::time::Duration::from_secs(3600);
+
+        let j = Journal::open(cfg.clone()).unwrap();
+        // Buffered write under Eventual: sets active_segment_dirty, resolves
+        // its Notifier at the write, never fsyncs.
+        j.append(1, 0, b"first").unwrap().wait().unwrap();
+
+        // keep_seq(0) is below the only segment's base_seq(1) — the `None`
+        // arm of `apply_truncate_to_segments`, which empties `st.segments`.
+        j.truncate_after(0).unwrap().wait().unwrap();
+        assert_eq!(j.last_seq(), None);
+
+        // The next append re-creates a segment via `need_new`'s
+        // `segments.is_empty()` arm — pre-fix, this is exactly where the
+        // writer thread used to panic on the stale flag.
+        let notifier = j.append(1, 0, b"second").unwrap();
+        // Bounded wait on a background thread: pre-fix, the writer thread
+        // panicked WHILE holding the state lock and never completed this
+        // Notifier, so a direct `notifier.wait()` would hang the whole test
+        // suite rather than just failing this test. A real timeout turns a
+        // hang into a clean, fast test failure instead.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(notifier.wait());
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "wait() must not hang — the writer thread must not have panicked \
+             on the stale active_segment_dirty flag",
+        );
+        result.unwrap();
+
+        assert_eq!(j.last_seq(), Some(1));
+        drop(j);
+
+        // The new record must be durable and readable after a reopen.
+        let j2 = Journal::open(cfg).unwrap();
+        assert_eq!(j2.last_seq(), Some(1));
+        assert_eq!(j2.read(1).unwrap().unwrap().1, b"second".to_vec());
     }
 
     /// Appends still queued in the writer channel when `truncate_after` runs

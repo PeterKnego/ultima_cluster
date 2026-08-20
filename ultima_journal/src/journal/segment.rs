@@ -426,6 +426,39 @@ impl SegmentFile {
         Ok(self.file.metadata()?.len())
     }
 
+    /// Whether ANY byte in `[from, physical EOF)` is non-zero. Used by
+    /// `Journal::open`'s heal path to skip a needless physical re-zero
+    /// (`preallocate_to`, a `fallocate`/write + `sync_data` barrier) when
+    /// there is nothing to erase — `scan()`'s `had_torn_tail` is true
+    /// whenever ANY bytes trail the last decoded record, which for a
+    /// preallocated segment is the ORDINARY clean-shutdown case (the
+    /// untouched zero preallocation), not just a genuine crash-torn
+    /// residue. A plain sequential read (no durability barrier), typically
+    /// already warm in the page cache from the scan that just ran over the
+    /// same bytes.
+    pub(crate) fn has_nonzero_residue_from(&self, from: u64) -> Result<bool, JournalError> {
+        let mut f = self.file.try_clone()?;
+        f.seek(SeekFrom::Start(from))?;
+        // Read in bounded chunks and return the instant a non-zero byte is
+        // found, rather than allocating + reading the WHOLE tail (up to a
+        // full `segment_size_bytes`, e.g. 64 MiB) into one `Vec` up front.
+        // The real torn-tail shape this guards puts its non-zero bytes right
+        // at the START of this range (a partial in-flight record), so the
+        // early exit is the common case for an ACTUAL heal; the all-zero
+        // (nothing to do) case still has to read to EOF, but in bounded
+        // ~1 MiB steps rather than one large allocation.
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                return Ok(false); // reached EOF, every byte read was zero
+            }
+            if buf[..n].iter().any(|&b| b != 0) {
+                return Ok(true);
+            }
+        }
+    }
+
     /// Physically fill from the logical cursor `self.size` out to `total_len`
     /// per `fill`, WITHOUT advancing the cursor. Leaves the tail readable as
     /// zeros so appends overwrite already-written blocks (metadata-free commit).
@@ -527,6 +560,112 @@ impl SegmentFile {
                         had_torn_tail,
                         index,
                     });
+                }
+            }
+        }
+    }
+
+    /// Read + decode all records like [`scan`], but with ONE additional
+    /// tolerance scoped to `Journal::open`'s ACTIVE (highest-numbered) segment:
+    /// a record whose length prefix is intact but whose CRC fails to verify is
+    /// checked for the zero-fill-tail signature described in the M11 CRC
+    /// anomaly investigation (`.superpowers/sdd/2026-08-20-uc2-m11-survivable-cluster/crc-anomaly-investigation.md`)
+    /// — a preallocated segment's un-overwritten standby space, which a crash
+    /// (or a concurrent reader racing the writer's in-flight `append_records`)
+    /// can momentarily expose mid-record. Unlike [`SegmentFile::scan_tolerant`]
+    /// (used only by a live `TailReader`, which may safely stop at the FIRST
+    /// anomaly and re-scan later), THIS method must not silently swallow real
+    /// corruption on an active segment that a caller is about to trust as
+    /// "recovered" — so it draws a strict boundary:
+    ///
+    /// - If every byte from the end of the failing record's DECLARED span
+    ///   (from its own intact length prefix) through EOF is zero, this is
+    ///   tail-shaped (nothing valid follows, consistent with preallocated
+    ///   fill never yet overwritten): classify identically to `scan`'s
+    ///   `Ok(None)` torn-tail case — stop, keep what's already decoded,
+    ///   `had_torn_tail = true`.
+    /// - If ANY byte past that point is non-zero — most importantly, a
+    ///   subsequent valid record — this is NOT tail-shaped: propagate the CRC
+    ///   mismatch as a hard `Err`, exactly like `scan()`.
+    /// - A malformed length prefix (`body_len < 16`, a different corruption
+    ///   shape unrelated to a torn write) is never eligible for tolerance —
+    ///   always a hard `Err`, exactly like `scan()`.
+    ///
+    /// Builds the sparse index the same way `scan()` does (unlike
+    /// `scan_tolerant`), since `Journal::open` installs it via `set_index` for
+    /// the recovered active segment.
+    pub(crate) fn scan_active_tail_tolerant(&self) -> Result<ScanResult, JournalError> {
+        let mut f = self.file.try_clone()?;
+        f.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        let segname = self.segname();
+        let mut records = Vec::new();
+        let mut index: Vec<(u64, u64)> = Vec::new();
+        let mut cursor = 0usize;
+        let mut last_index_offset: u64 = 0;
+        loop {
+            let abs_offset = SEGMENT_HEADER_SIZE as u64 + cursor as u64;
+            match decode_record(&buf[cursor..], &segname, abs_offset) {
+                Ok(Some((rec, n))) => {
+                    if index.is_empty()
+                        || abs_offset.saturating_sub(last_index_offset) >= SPARSE_INDEX_GAP
+                    {
+                        index.push((rec.seq, abs_offset));
+                        last_index_offset = abs_offset;
+                    }
+                    records.push(rec);
+                    cursor += n;
+                }
+                Ok(None) => {
+                    let had_torn_tail = cursor < buf.len();
+                    return Ok(ScanResult {
+                        records,
+                        last_durable_offset: SEGMENT_HEADER_SIZE as u64 + cursor as u64,
+                        had_torn_tail,
+                        index,
+                    });
+                }
+                Err(e) => {
+                    // Re-derive body_len straight from the length prefix (we
+                    // know bytes.len() >= 4 here — `decode_record` only
+                    // returns `Ok(None)` for a too-short prefix, never `Err`).
+                    // decode_record's ONLY two `Err` shapes are "body_len < 16"
+                    // (checked BEFORE the CRC read — a malformed header, never
+                    // tail-shaped) and "record crc mismatch" (requires
+                    // `body_len >= 16` AND `bytes.len() >= total`, i.e. the
+                    // full declared record is present). Using body_len to
+                    // distinguish the two avoids matching on the error's
+                    // display text.
+                    let body_len =
+                        u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    if body_len < 16 {
+                        return Err(e); // malformed header — never tail-shaped
+                    }
+                    let total = 4 + body_len + 4;
+                    // decode_record's CRC-mismatch Err already guarantees
+                    // `cursor + total <= buf.len()` (that's precisely why it
+                    // reached the CRC check instead of `Ok(None)`), so this
+                    // should never trip — but this is boot recovery code, and
+                    // a future change to `decode_record` silently weakening
+                    // that guarantee must fail safe (hard error) here rather
+                    // than panic on an out-of-bounds slice.
+                    if cursor + total > buf.len() {
+                        return Err(e);
+                    }
+                    if buf[cursor + total..].iter().all(|&b| b == 0) {
+                        // Zero-fill tail: nothing valid follows the torn
+                        // record — classify as a torn tail, same as Ok(None).
+                        return Ok(ScanResult {
+                            records,
+                            last_durable_offset: abs_offset,
+                            had_torn_tail: true,
+                            index,
+                        });
+                    }
+                    // Non-zero bytes follow (e.g. a subsequent valid record):
+                    // not tail-shaped — genuine corruption, hard error.
+                    return Err(e);
                 }
             }
         }

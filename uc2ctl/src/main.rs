@@ -29,6 +29,30 @@
 //! uc2ctl status         --instance-dir D --app-id A
 //! ```
 //!
+//! M11 Task 2 adds three OFFLINE verbs (`uc2_node::backup`) that do NOT touch
+//! a running node's cnc admin band at all — filesystem-only, so there is no
+//! `--app-id` (nothing to check it against on disk) and `backup`/`restore`
+//! take only `--instance-dir` (no `--app-id` companion, unlike every verb
+//! above):
+//!
+//! ```text
+//! uc2ctl backup        --instance-dir D --out ARTIFACT
+//! uc2ctl verify-backup  ARTIFACT
+//! uc2ctl restore        ARTIFACT --instance-dir D
+//! ```
+//!
+//! M11 Task 4 adds ONE more OFFLINE verb, quorum-loss recovery. Like
+//! `backup`/`restore` it never touches a running node's cnc admin band (it
+//! takes the instance dir's exclusive flock instead — a running node is
+//! refused, not raced) — but unlike them it needs `--app-id` back, purely as
+//! a confirmation guard (`--confirm-cluster` must echo it exactly) before an
+//! operation that discards data, not as anything checked against a live
+//! node:
+//!
+//! ```text
+//! uc2ctl force-single-member --instance-dir D --app-id A --node-id N --confirm-cluster A
+//! ```
+//!
 //! From a source checkout, without installing:
 //!
 //! ```text
@@ -104,6 +128,74 @@ struct StatusArgs {
     admission_bytes: Option<u64>,
 }
 
+// ---------------------------------------------------------------- M11 Task 2: offline backup
+
+/// `backup`/`restore` deliberately do NOT reuse `CommonArgs`: both are
+/// OFFLINE (filesystem-only — see `uc2_node::backup`'s module doc), so there
+/// is no running node's cnc page to check an `app_id` against, and dragging
+/// an unused `--app-id` flag onto these two would be actively misleading
+/// (implying a check that never happens). `verify-backup` needs neither flag
+/// at all — just the artifact path.
+#[derive(clap::Args)]
+struct BackupArgs {
+    /// The node's on-disk instance directory (same one passed to
+    /// `Node::start`). The node MAY be running throughout.
+    #[arg(long)]
+    instance_dir: PathBuf,
+    /// Destination directory for the new backup artifact. Created if absent;
+    /// refused if it already exists and is non-empty.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct VerifyBackupArgs {
+    /// Path to a backup artifact (as produced by `uc2ctl backup`).
+    artifact: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct RestoreArgs {
+    /// Path to a backup artifact (as produced by `uc2ctl backup`).
+    artifact: PathBuf,
+    /// The instance directory to restore into. Must not already have a
+    /// non-empty `journal/`, `state/`, or `snapshots/` — a fresh directory,
+    /// or a decommissioned instance dir with those cleared. Volatile
+    /// leftovers (`cnc2.dat`, `log.buf`, rings, `instance.lock`) are fine.
+    #[arg(long)]
+    instance_dir: PathBuf,
+}
+
+// ---------------------------------------------------------------- M11 Task 4: quorum-loss
+
+/// OFFLINE (M11 Task 4), like `backup`/`restore` — no cnc admin-band
+/// interaction; the instance's exclusive flock stands in for the running-
+/// node check instead. `--confirm-cluster` is a confirmation guard, checked
+/// ONLY here in the CLI (the `uc2_node::recovery::force_single_member`
+/// library function has no notion of it): it must equal `--app-id` exactly,
+/// or the command refuses before touching anything.
+#[derive(clap::Args)]
+struct ForceSingleMemberArgs {
+    /// The surviving node's own on-disk instance directory. Must NOT have a
+    /// node currently running in it.
+    #[arg(long)]
+    instance_dir: PathBuf,
+    /// The cluster's application identity — printed in the data-loss
+    /// statement, and echoed by `--confirm-cluster` as the "yes, I mean it"
+    /// gate.
+    #[arg(long)]
+    app_id: String,
+    /// The surviving node's own id (must be a voter or learner, and not
+    /// tombstoned, in the recovered config).
+    #[arg(long)]
+    node_id: u32,
+    /// Must equal `--app-id` exactly, or the command refuses. Forces an
+    /// operator to type the cluster's identity a second time before an
+    /// operation that discards data.
+    #[arg(long)]
+    confirm_cluster: String,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Add a fresh learner (wire op 1).
@@ -119,6 +211,31 @@ enum Cmd {
     /// Print the cluster's current config version/pending state, per-member
     /// peer-slot observability, and leader/serving flags.
     Status(StatusArgs),
+    /// OFFLINE (M11 Task 2): ordered-copy an instance directory's durable
+    /// journal/state/snapshots into a fresh backup artifact. Filesystem-only
+    /// — no cnc admin-band interaction; the node may be running throughout.
+    Backup(BackupArgs),
+    /// OFFLINE (M11 Task 2): read-only verification of a backup artifact —
+    /// recovers its positions, checks the coverage invariant, cross-checks
+    /// its `MANIFEST` if present. May heal the ARTIFACT's own torn
+    /// active-segment tail (a shrink-only truncate); everything else is
+    /// read-only. Filesystem-only, no cnc admin-band interaction.
+    VerifyBackup(VerifyBackupArgs),
+    /// OFFLINE (M11 Task 2): verify a backup artifact, then copy its three
+    /// durable directories into a fresh instance directory. Refuses a target
+    /// whose `journal/`, `state/`, or `snapshots/` is already non-empty.
+    /// Filesystem-only, no cnc admin-band interaction — the target
+    /// `instance_dir` should not have a node running in it.
+    Restore(RestoreArgs),
+    /// OFFLINE (M11 Task 4): quorum-loss recovery. Forces the given
+    /// `--instance-dir` to a single-voter cluster naming `--node-id` the sole
+    /// member — the recovered config's other voters/learners are DROPPED
+    /// (never tombstoned; they wipe-and-rejoin later as fresh learners).
+    /// Prints the data-loss statement, then the resulting `ForceReport`, then
+    /// writes. Refuses if a node is running, if `--confirm-cluster` doesn't
+    /// echo `--app-id`, if `--node-id` is tombstoned, or if it isn't a member
+    /// of the recovered config. A one-way door — there is no "undo" verb.
+    ForceSingleMember(ForceSingleMemberArgs),
 }
 
 fn main() {
@@ -130,6 +247,10 @@ fn main() {
         Cmd::RemoveLearner(a) => run_mutate(&a.common, 4, a.id, (0, 0)),
         Cmd::RemoveVoter(a) => run_mutate(&a.common, 5, a.id, (0, 0)),
         Cmd::Status(a) => run_status(&a),
+        Cmd::Backup(a) => run_backup(&a),
+        Cmd::VerifyBackup(a) => run_verify_backup(&a),
+        Cmd::Restore(a) => run_restore(&a),
+        Cmd::ForceSingleMember(a) => run_force_single_member(&a),
     };
     if let Err(e) = r {
         eprintln!("uc2ctl error: {e}");
@@ -285,5 +406,133 @@ fn run_status(a: &StatusArgs) -> anyhow::Result<()> {
         };
         println!("  id={id} role={role} reported_durable={reported_durable}{warn}");
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------- M11 Task 2: offline backup
+
+/// `BackupReport` printed as `key=value` lines, one per field, same
+/// convention as `run_status`'s output — no serde_json in this workspace.
+fn print_backup_report(r: &uc2_node::backup::BackupReport) {
+    println!("journal_first_base={}", r.journal_first_base);
+    println!("journal_last_pos={}", r.journal_last_pos);
+    println!(
+        "newest_snapshot={}",
+        r.newest_snapshot.map(|p| p.to_string()).unwrap_or_else(|| "none".to_string())
+    );
+    println!("snapshot_floor={}", r.snapshot_floor);
+    println!("healed_torn_tail={}", r.healed_torn_tail);
+    println!("files={}", r.files);
+}
+
+fn run_backup(a: &BackupArgs) -> anyhow::Result<()> {
+    let report = uc2_node::backup::backup_instance(&a.instance_dir, &a.out)
+        .map_err(|e| anyhow::anyhow!("backup: {e}"))?;
+    print_backup_report(&report);
+    Ok(())
+}
+
+fn run_verify_backup(a: &VerifyBackupArgs) -> anyhow::Result<()> {
+    let report = uc2_node::backup::verify_artifact(&a.artifact)
+        .map_err(|e| anyhow::anyhow!("verify-backup: {e}"))?;
+    print_backup_report(&report);
+    Ok(())
+}
+
+fn run_restore(a: &RestoreArgs) -> anyhow::Result<()> {
+    let report = uc2_node::backup::restore_artifact(&a.artifact, &a.instance_dir)
+        .map_err(|e| anyhow::anyhow!("restore: {e}"))?;
+    print_backup_report(&report);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- M11 Task 4: quorum-loss
+
+/// Fix round 1, Important 5: the surviving node's own on-disk instance dir
+/// is identified purely by the operator-supplied `--instance-dir`; a wrong
+/// `--node-id`/`--app-id` typed against the RIGHT directory (or vice versa)
+/// would otherwise be forced silently. Cross-check them against a leftover
+/// `cnc2.dat`'s own `meta()` — WHEN ONE IS PRESENT. `cnc2.dat` is volatile
+/// (boot recreates it unconditionally, per `docs/reference/instance-directory.md`'s
+/// durable/volatile split), so its absence is expected on a truly fresh
+/// dir, or one whose cnc file was already cleaned up — not an error, just
+/// nothing to cross-check (printed, not silent). Its PRESENCE, though — the
+/// ordinary case for a survivor that was just SIGKILLed or cleanly stopped —
+/// is a strong, free signal: `CncPage::open_file` already validates
+/// magic/crc/version and the `app_id` match (returning the actual `app_id`
+/// on mismatch via `CncError::AppIdMismatch`, exactly what `run_status`
+/// relies on for every other command), so this reuses that same call rather
+/// than reimplementing header decoding.
+fn check_leftover_cnc_matches(a: &ForceSingleMemberArgs) -> anyhow::Result<()> {
+    let cnc_path = a.instance_dir.join("cnc2.dat");
+    if !cnc_path.is_file() {
+        println!(
+            "note: no leftover cnc2.dat in {:?} (volatile — recreated by boot); skipping the \
+             --node-id/--app-id cross-check",
+            a.instance_dir
+        );
+        return Ok(());
+    }
+    match CncPage::open_file(&cnc_path, &a.app_id) {
+        Ok(cnc) => {
+            let leftover_id = cnc.meta().node_id;
+            if leftover_id != a.node_id {
+                anyhow::bail!(
+                    "refusing: leftover cnc2.dat in {:?} belongs to node_id {leftover_id}, not \
+                     --node-id {} — wrong instance dir?",
+                    a.instance_dir,
+                    a.node_id
+                );
+            }
+            Ok(())
+        }
+        Err(uc2_log::cnc::CncError::AppIdMismatch { expected, actual }) => {
+            anyhow::bail!(
+                "refusing: leftover cnc2.dat in {:?} belongs to app_id {actual:?}, not --app-id \
+                 {expected:?} — wrong instance dir?",
+                a.instance_dir
+            )
+        }
+        Err(e) => {
+            println!(
+                "note: leftover cnc2.dat in {:?} could not be read ({e}) — skipping the \
+                 --node-id/--app-id cross-check",
+                a.instance_dir
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Fix round 1, Important 6: ONE `uc2_node::recovery::plan_force_single_member`
+/// call acquires the instance flock, reads the recovered config, and builds
+/// the (not-yet-written) forced record — all under that single lock. The
+/// data-loss statement is printed from the resulting `PlannedForce` (which
+/// keeps holding the lock), then `PlannedForce::commit` performs the one
+/// write, still under the SAME lock. There is no separate `recovered_config`
+/// call and no second lock/open/recover cycle in between — unlike the
+/// original version of this function, this is no longer "read, release,
+/// re-acquire, write."
+fn run_force_single_member(a: &ForceSingleMemberArgs) -> anyhow::Result<()> {
+    if a.confirm_cluster != a.app_id {
+        anyhow::bail!(
+            "refusing: --confirm-cluster {:?} does not match --app-id {:?} — this is a \
+             one-way, data-losing operation; type the cluster's app-id again to confirm",
+            a.confirm_cluster,
+            a.app_id
+        );
+    }
+
+    check_leftover_cnc_matches(a)?;
+
+    let planned = uc2_node::recovery::plan_force_single_member(&a.instance_dir, a.node_id)
+        .map_err(|e| anyhow::anyhow!("force-single-member: {e}"))?;
+    println!("{}", planned.data_loss_statement());
+
+    let report = planned.commit().map_err(|e| anyhow::anyhow!("force-single-member: {e}"))?;
+    println!("old_version={}", report.old_version);
+    println!("new_version={}", report.new_version);
+    println!("durable={}", report.durable);
+    println!("dropped_peers={:?}", report.dropped_peers);
     Ok(())
 }
