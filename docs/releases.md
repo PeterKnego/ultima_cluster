@@ -1,5 +1,49 @@
 # ultima_cluster releases
 
+## v2.4.0 — 2026-08-20 — M10 observable cluster
+
+**A running cluster can now be watched, probed, and alerted on without
+touching the source.** Metrics, structured logs, health probes, and shipped
+alert rules — the whole layer reads state the hot path already publishes, and
+the fleet gate measured its cost at ~1.7% under a 1s all-nodes scrape.
+
+- **An in-daemon observability endpoint** (`[metrics]` config section, off
+  when absent): `GET /metrics` (Prometheus text, 62 metric families —
+  commit/apply/replication lag, admission saturation, heartbeat ages, per-peer
+  lag on the leader, and every repair/drop/crypto counter), `/healthz`
+  (liveness: the four agents alive + node heartbeat fresh), `/readyz`
+  (role-aware readiness). Hand-rolled over `std::net`; zero new dependencies;
+  the exporter reads the same atomics the agents publish — no lock the hot
+  path can contend on.
+- **Readiness keys on `can_serve`, never the leader flag.** The elected-but-
+  not-serving `0x01` window is exactly what a naive `leader == true` probe
+  gets wrong; the fleet gate killed leaders three times and never observed a
+  ready response from a node in that state.
+- **Transition-triggered structured logging** (`[log]` section): one JSON
+  line per election, truncation, snapshot install, config adoption, removal,
+  NAK storm, seal-failure burst, snapshot publication — never one per
+  operation. The daemon now also **fails fast when an agent fail-stops**
+  (exit 1 for systemd to restart) instead of lingering as a healthy-looking
+  zombie.
+- **Shipped ops artifacts**: `packaging/prometheus/uc2-alerts.yml` (13 rules,
+  every one proven to fire against a deliberately broken cluster via
+  promtool; the per-peer rules are leader-scoped — the peer band is
+  leader-authoritative and followers export zeros), a Grafana dashboard, and
+  `docs/how-to/monitor-a-cluster.md`.
+- **Fleet gate** (`docs/benchmarks/uc2-m10-gate-2026-08-20.md`): a 10-minute
+  healthy soak under a real Prometheus fired zero alerts with full series
+  coverage from every node; the scrape-perturbation A/B held at median 0.9830
+  against a pre-committed >= 0.95 bar; wire-0.5.0 hygiene held
+  (`reports_unattested` 0 everywhere). Runs 1-2 were honest failures —
+  harness defects, recorded in the gate doc, including one operational
+  finding worth knowing: the journal holds an fd per segment, so keep the
+  packaged unit's `LimitNOFILE` and enable purge for long-lived clusters.
+
+No wire, cnc-page, or consensus changes. `[log]`/`[metrics]`, reserved in
+v2.3.0, now have their schema — unknown keys inside them refuse at boot like
+everywhere else.
+
+
 ## v2.3.0 — 2026-08-19 — M9 deployable node
 
 **UC is now deployable by someone who is not the author.** Before this tag the
