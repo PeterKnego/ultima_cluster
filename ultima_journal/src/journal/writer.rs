@@ -247,6 +247,18 @@ pub(crate) struct WriterState {
     /// for entries still queued and unwritten (publishing those would
     /// over-report durability). Pulled back by `truncate_after`.
     pub persisted_hwm: u64,
+    /// True when the ACTIVE (last) segment has bytes written since it was
+    /// last fsynced. Set by `flush_run` whenever it actually writes;
+    /// cleared by any fsync that covers the active segment
+    /// (`fsync_active_segment`'s per-batch/per-idle-tick fsync, or
+    /// `write_batch`'s roll-time fsync-on-seal). Lets the roll-time
+    /// fsync-on-seal catch bytes left unfsynced by an EARLIER, separate
+    /// batch — not just the CURRENT batch's own `run` — which is what
+    /// closes the `Durability::Eventual` idle-timer gap (M11 roll-fsync
+    /// investigation §1.5): under Eventual a segment can accumulate several
+    /// batches' worth of unfsynced bytes (no per-batch fsync) before it
+    /// finally rolls off.
+    pub active_segment_dirty: bool,
     /// Set (under this lock) by the writer before it halts on an I/O error.
     /// `append`/`truncate_after` refuse with `Closed` once set — fail-stop:
     /// a failed fsync may have dropped dirty pages, so a later "successful"
@@ -256,6 +268,13 @@ pub(crate) struct WriterState {
     /// error, exercising the writer's fail-stop path.
     #[cfg(test)]
     pub fail_next_fsync: bool,
+    /// Test-only: records the path of every segment `sync_data()`'d by the
+    /// fsync-on-seal call in `write_batch`'s roll path (M11 roll-fsync
+    /// investigation fix) — lets a test assert precisely which segment was
+    /// made durable at a roll, since a successful `sync_data()` has no
+    /// other observable effect on file content.
+    #[cfg(test)]
+    pub seal_fsync_log: Vec<PathBuf>,
 }
 
 pub(crate) struct Writer {
@@ -515,6 +534,52 @@ fn write_batch(
         if need_new {
             // Flush whatever was accumulated for the now-full segment first.
             flush_run(&mut st, &mut run)?;
+            // Fsync-on-seal (M11 roll-fsync investigation,
+            // roll-fsync-investigation.md): `flush_run` writes into k's page
+            // cache but never fsyncs it — every later `fsync_active_segment`
+            // targets `segments.last()` only, which becomes k+1 the moment
+            // `st.segments.push(seg)` below runs. Without fsyncing k HERE,
+            // while it is still `last()`, k's bytes are acked to their
+            // callers on the strength of an fdatasync of a DIFFERENT file —
+            // silent acked-write loss on power loss, until the kernel's own
+            // writeback timer happens to flush k (unbounded, ~0-35s with
+            // Linux defaults).
+            //
+            // `st.active_segment_dirty` (set by `flush_run` whenever it
+            // actually writes, cleared by any fsync that covers the active
+            // segment) tracks this, and NOT just this call's own `run` —
+            // that distinction matters: under `Durability::Eventual` a
+            // segment can pick up MULTIPLE records across SEPARATE prior
+            // `write_batch` calls (each individually not triggering a roll)
+            // with no fsync in between (Eventual only fsyncs on its own idle
+            // timer, not per batch), so the batch that finally discovers
+            // `need_new` can have an EMPTY `run` of its own while `k` still
+            // holds real unfsynced bytes from an earlier batch. Gating only
+            // on this call's `run` (the investigation's literal one-line
+            // form) misses that inter-batch case; gating on the persistent
+            // flag catches it too — while still costing nothing on the
+            // current serial path, where every batch's own fsync (Consistent)
+            // already clears the flag before the next batch ever runs.
+            if st.active_segment_dirty {
+                // `write_batch` holds `st` for its whole body (unlike
+                // `fsync_active_segment`, which drops the lock before the
+                // syscall) — this fsync therefore briefly blocks other
+                // `append()` callers, but it fires at most once per
+                // `segment_size_bytes` of throughput (a roll), never per
+                // commit, matching the investigation's "at most one extra
+                // fdatasync per segment roll" cost accounting.
+                let sealed = st
+                    .segments
+                    .last()
+                    .expect("active_segment_dirty implies a current segment exists");
+                sealed.fsync_handle()?.sync_data().map_err(JournalError::Io)?;
+                #[cfg(test)]
+                {
+                    let p = sealed.path().to_path_buf();
+                    st.seal_fsync_log.push(p);
+                }
+                st.active_segment_dirty = false;
+            }
             let final_path = st.dir.join(format!("seg-{:020}.log", req.seq));
             let seg = match st.pipeline.clone() {
                 Some(pipe) => {
@@ -563,6 +628,10 @@ fn flush_run(
             .expect("flush_run called with a non-empty run but no active segment");
         seg.append_records(run.as_slice())?;
     }
+    // The active segment now has bytes on disk that no fsync has covered
+    // yet — see `active_segment_dirty`'s doc for why the roll-time
+    // fsync-on-seal needs this instead of just checking THIS call's `run`.
+    st.active_segment_dirty = true;
     // These records are now segment-readable, so evict them from the in-memory
     // overlay `append()` populated — under the same state lock, so a seq is in a
     // segment XOR `pending`, never double-counted by a concurrent read. Only
@@ -608,6 +677,12 @@ fn fsync_active_segment(state: &Arc<Mutex<WriterState>>) -> Result<(), JournalEr
         // retained on segment create (segment.rs) where the new directory
         // entry must be made durable.
         f.sync_data().map_err(JournalError::Io)?;
+        // This fsync covers whatever is currently the active segment — the
+        // writer thread that could have written more to it is the SAME
+        // thread executing this fsync, so nothing raced the syscall. Clear
+        // the dirty flag so a later roll's fsync-on-seal (`write_batch`)
+        // correctly sees "already durable" and skips the redundant work.
+        state.lock().unwrap().active_segment_dirty = false;
     }
     Ok(())
 }
@@ -681,5 +756,195 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
         wm.close();
         assert!(matches!(waiter.join().unwrap(), Err(JournalError::Closed)));
+    }
+
+    // -----------------------------------------------------------------
+    // M11 roll-fsync fix (Task 2c): fsync-on-seal regression tests.
+    //
+    // These drive `write_batch` DIRECTLY rather than going through a real
+    // `Journal` + background writer thread, and rather than racing the
+    // channel-drain timing that produces a real straddling batch. The
+    // roll-fsync investigation's own empirical probe (§3) found the
+    // straddle rate under real thread scheduling to be inherently
+    // non-deterministic (0-2 straddling rolls per ~120-record trial,
+    // varying by run) — a test relying on that race would be a FLAKY
+    // regression guard for exactly the bug being pinned here. Calling
+    // `write_batch` directly with a hand-built batch exercises the exact
+    // same production code path `writer_loop` calls, deterministically,
+    // every time.
+    // -----------------------------------------------------------------
+
+    fn make_writer_state(dir: &std::path::Path, segment_size: u64) -> Arc<Mutex<WriterState>> {
+        Arc::new(Mutex::new(WriterState {
+            dir: dir.to_path_buf(),
+            pipeline: None,
+            segment_size,
+            durability: Durability::Consistent,
+            eventual_fsync_interval: Duration::from_millis(1),
+            segments: Vec::new(),
+            last_seq: None,
+            first_seq: None,
+            pending: BTreeMap::new(),
+            truncate_gen: 0,
+            persisted_hwm: 0,
+            active_segment_dirty: false,
+            poisoned: false,
+            #[cfg(test)]
+            fail_next_fsync: false,
+            #[cfg(test)]
+            seal_fsync_log: Vec::new(),
+        }))
+    }
+
+    /// Build a batch of `AppendRequest`s AND seed `state.pending` with a
+    /// matching entry for each — `write_batch`'s "ownership" fence
+    /// (`writer.rs` ~487: ``owns = st.pending.get(&req.seq)...``) silently
+    /// `continue`s past any request whose seq isn't present in `pending`
+    /// with the same generation, exactly as it must for a real
+    /// `truncate_after` race. In production `Journal::append()` populates
+    /// `pending` synchronously before the request ever reaches the writer
+    /// channel; a direct `write_batch` test has to replicate that.
+    fn make_batch(
+        state: &Arc<Mutex<WriterState>>,
+        records: &[(u64, u64, &[u8])],
+    ) -> Vec<AppendRequest> {
+        let mut st = state.lock().unwrap();
+        records
+            .iter()
+            .map(|&(seq, meta, payload)| {
+                st.pending.insert(seq, (0, meta, payload.to_vec()));
+                let (signal, _notifier) = crate::notifier::Notifier::pending();
+                AppendRequest {
+                    seq,
+                    meta,
+                    payload: payload.to_vec(),
+                    signal,
+                    generation: 0,
+                }
+            })
+            .collect()
+    }
+
+    /// The core regression: a batch whose records straddle a segment roll
+    /// (some land in the outgoing segment *k* via the `need_new`-triggered
+    /// flush, before *k+1* is created) must fsync *k* right there — the
+    /// caller's single post-batch fsync only ever targets `segments.last()`,
+    /// which becomes *k+1* the instant this call returns. Three records,
+    /// 30-byte payloads (54 bytes on disk each) into a 100-byte segment:
+    /// record 1 creates segment 0 (32-byte header + 54 = 86 bytes,
+    /// projected 86 < 100 → record 2 also lands in `run`, projected 86+54=
+    /// 140 → record 3's `need_new` check (140 >= 100) fires WITH `run`
+    /// still holding records 1 and 2 — the exact straddle shape.
+    #[test]
+    fn write_batch_fsyncs_the_outgoing_segment_when_a_batch_straddles_a_roll() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_writer_state(dir.path(), 100);
+        let batch = make_batch(
+            &state,
+            &[(1, 0, &[0u8; 30]), (2, 0, &[0u8; 30]), (3, 0, &[0u8; 30])],
+        );
+        write_batch(&state, &batch).unwrap();
+
+        let st = state.lock().unwrap();
+        assert_eq!(
+            st.segments.len(),
+            2,
+            "the batch must have rolled to a 2nd segment"
+        );
+        let seg0_path = st.segments[0].path().to_path_buf();
+        assert!(
+            st.seal_fsync_log.contains(&seg0_path),
+            "the outgoing segment (holding records 1 and 2) must be fsynced \
+             at the roll, not left for a later fsync that will only ever \
+             target the NEW active segment"
+        );
+    }
+
+    /// A batch whose FIRST request alone triggers `need_new` (an empty
+    /// `run`, nothing new for THIS batch to seal into the outgoing segment)
+    /// must not fsync anything on the seal path — `k` was already fully
+    /// durable from whatever wrote its last record, and firing an extra
+    /// fsync here would be the redundant per-boot/per-batch cost the fix is
+    /// supposed to avoid on the ordinary serial path.
+    #[test]
+    fn write_batch_does_not_fsync_on_seal_when_the_run_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_writer_state(dir.path(), 100);
+        // record1 alone (54 bytes on disk) fits within segment_size (100) —
+        // need_new fires only once, on the FIRST request ever
+        // (segments.is_empty()), which is unconditionally exempt (no prior
+        // segment to seal); record1 itself is written via the batch's own
+        // trailing flush (line ~539), not a need_new-triggered one.
+        let batch = make_batch(&state, &[(1, 0, &[0u8; 30])]);
+        write_batch(&state, &batch).unwrap();
+        assert!(
+            state.lock().unwrap().seal_fsync_log.is_empty(),
+            "no rotation occurred yet — nothing should be logged by the seal path"
+        );
+    }
+
+    /// The `Durability::Eventual` variant (M11 roll-fsync investigation
+    /// §1.5): under Eventual, `write_batch` never fsyncs on its own — the
+    /// idle timer does, on its own schedule, independent of batch/roll
+    /// boundaries. So a segment can accumulate bytes across MULTIPLE
+    /// separate `write_batch` calls (none of which individually straddle a
+    /// roll — each one's own `run` is non-empty only for records that fit,
+    /// same as the ordinary non-rotating case) before a LATER, separate
+    /// batch's `need_new` finally fires with an EMPTY `run` of its own. A
+    /// fix gated only on "this call's run was non-empty" (the
+    /// investigation's literal one-liner) would miss this: three separate
+    /// `write_batch` calls, records 1 and 2 landing in segment 0 across the
+    /// first two (segment 0 not yet full after either), record 3 in the
+    /// third finally discovering `projected >= segment_size` — segment 0
+    /// must still be fsynced at that roll, from the PERSISTENT
+    /// `active_segment_dirty` flag, not the batch-local `run`. This
+    /// directly demonstrates the investigation's closure argument
+    /// (segment 0 is durable at roll time, before the Eventual idle timer
+    /// — which targets `segments.last()` only and would from here on target
+    /// segment 1 — ever needs to run) rather than merely asserting it in
+    /// prose.
+    #[test]
+    fn write_batch_closes_the_eventual_inter_batch_gap_via_the_persistent_dirty_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = make_writer_state(dir.path(), 100);
+        state.lock().unwrap().durability = Durability::Eventual;
+
+        // Batch 1: record 1 alone creates segment 0 (86 bytes on disk), no
+        // rotation, no fsync of any kind under Eventual.
+        let batch1 = make_batch(&state, &[(1, 0, &[0u8; 30])]);
+        write_batch(&state, &batch1).unwrap();
+        assert!(
+            state.lock().unwrap().seal_fsync_log.is_empty(),
+            "no rotation yet"
+        );
+
+        // Batch 2: record 2 alone. `need_new` compares against segment 0's
+        // size BEFORE this record (86 < 100) — still no rotation — but the
+        // write pushes segment 0 to 140 bytes, discovered only by the NEXT
+        // batch. Still no fsync of any kind under Eventual: segment 0 now
+        // holds two unfsynced records from two SEPARATE prior batches.
+        let batch2 = make_batch(&state, &[(2, 0, &[0u8; 30])]);
+        write_batch(&state, &batch2).unwrap();
+        assert!(
+            state.lock().unwrap().seal_fsync_log.is_empty(),
+            "still no rotation — segment 0 is dirty but not yet rolled off"
+        );
+
+        // Batch 3: record 3's `need_new` check (140 >= 100) finally fires,
+        // with an EMPTY run of its OWN — the bytes that need fsyncing came
+        // from batches 1 and 2, not this one.
+        let batch3 = make_batch(&state, &[(3, 0, &[0u8; 30])]);
+        write_batch(&state, &batch3).unwrap();
+
+        let st = state.lock().unwrap();
+        assert_eq!(st.segments.len(), 2, "batch 3 must have rolled");
+        let seg0_path = st.segments[0].path().to_path_buf();
+        assert!(
+            st.seal_fsync_log.contains(&seg0_path),
+            "segment 0 (records 1+2, written across TWO earlier batches) \
+             must be fsynced at the roll — the Eventual idle timer that \
+             would otherwise cover it may not fire for up to \
+             eventual_fsync_interval, or ever, before the next roll"
+        );
     }
 }

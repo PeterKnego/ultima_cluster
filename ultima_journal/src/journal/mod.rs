@@ -352,9 +352,17 @@ impl Journal {
             pending: std::collections::BTreeMap::new(),
             truncate_gen: 0,
             persisted_hwm: 0,
+            // A freshly-recovered active segment is either empty or has
+            // only durably-recovered bytes (Journal::open's own healing —
+            // and any Phase-1 residue re-zero — already fsyncs what it
+            // touches via `truncate`/`preallocate_to`'s own sync); nothing
+            // written since open() has yet to be fsynced by the writer.
+            active_segment_dirty: false,
             poisoned: false,
             #[cfg(test)]
             fail_next_fsync: false,
+            #[cfg(test)]
+            seal_fsync_log: Vec::new(),
         }));
         let durability = SeqWatermark::new();
         let writer = Writer::spawn(Arc::clone(&state), Arc::clone(&durability));
