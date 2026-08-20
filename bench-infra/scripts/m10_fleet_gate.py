@@ -334,9 +334,11 @@ def render_config(node_id, bind, metrics_bind, instance_dir, members):
         f'bind = "{bind}"',
         f'instance_dir = "{instance_dir}"',
         f'app_id = "{APP}"',
-        "buffer_bytes = 4194304",
+        "buffer_bytes = 67108864",     # 64 MiB — production-shaped; fleet run 2 proved 4 MiB churns elections under the m5 pump
         "max_payload = 256",
-        "journal_segment_bytes = 16384",
+        "journal_segment_bytes = 67108864",  # 64 MiB — fleet run 2: 16 KiB segments rolled ~kHz under load;
+        # the journal holds an fd per segment, so the daemons EMFILE-fail-stopped in 15-90s (1011
+        # segments on disk). Production default sizing + the packaged unit\'s nofile limit fix it.
         "",
         "[metrics]",
         f'bind = "{metrics_bind}"',
@@ -413,6 +415,10 @@ class M10Node:
                        capture_output=True)
         cmd = (
             f"sudo systemd-run --unit={self.unit} --collect "
+            # Mirror packaging/systemd/uc2-node.service's LimitNOFILE: the journal
+            # holds an fd per segment and systemd's default soft limit (1024) is
+            # what turned fleet run 2's tiny segments into EMFILE fail-stops.
+            f"-p LimitNOFILE=65536 "
             f"-p StandardOutput=append:/opt/bench/{self.unit}.log "
             f"-p StandardError=append:/opt/bench/{self.unit}.log "
             f"{self.uc2_node_bin} --config {self.cfg_path} "
