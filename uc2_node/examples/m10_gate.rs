@@ -142,14 +142,14 @@ fn main() {
     match cli.cmd {
         Cmd::Coverage(a) => {
             let root = resolve_root(a.root);
-            let v = run_coverage(&root.join("coverage"));
             print_bar();
+            let v = run_coverage(&root.join("coverage"));
             report_one(&v);
         }
         Cmd::Probes(a) => {
             let root = resolve_root(a.root);
-            let v = run_probes(&root.join("probes"));
             print_bar();
+            let v = run_probes(&root.join("probes"));
             report_one(&v);
         }
         Cmd::PerturbSmoke(a) => {
