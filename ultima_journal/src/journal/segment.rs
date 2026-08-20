@@ -609,7 +609,17 @@ impl SegmentFile {
                     if body_len < 16 {
                         return Err(e); // malformed header — never tail-shaped
                     }
-                    let total = 4 + body_len + 4; // decode_record guarantees cursor + total <= buf.len()
+                    let total = 4 + body_len + 4;
+                    // decode_record's CRC-mismatch Err already guarantees
+                    // `cursor + total <= buf.len()` (that's precisely why it
+                    // reached the CRC check instead of `Ok(None)`), so this
+                    // should never trip — but this is boot recovery code, and
+                    // a future change to `decode_record` silently weakening
+                    // that guarantee must fail safe (hard error) here rather
+                    // than panic on an out-of-bounds slice.
+                    if cursor + total > buf.len() {
+                        return Err(e);
+                    }
                     if buf[cursor + total..].iter().all(|&b| b == 0) {
                         // Zero-fill tail: nothing valid follows the torn
                         // record — classify as a torn tail, same as Ok(None).
