@@ -40,8 +40,9 @@ detection-timing confirmation is still outstanding.
 
 ---
 
-**Status: v2.1.0** — milestones M1–M7 complete. M8 (opt-in wire crypto) is
-merged and unreleased.
+**Status: v2.4.0** — milestones M1–M10 complete: the consensus core and SDK
+(M1–M6), live reconfiguration (M7), opt-in wire crypto (M8), the deployable
+`uc2-node` daemon (M9), and the observability layer (M10).
 
 | Gate | Result | Measured on |
 |---|---|---|
@@ -52,11 +53,16 @@ merged and unreleased.
 | Below-floor snapshot reconstruction (M6) | worst **2.80 s** across 5 purge cycles, zero read divergence | 4-host fleet |
 | Live single-server reconfiguration (M7) | per-transition dip **0.0–4.7 %**, leader self-removal handoff 3.22 s | 5-host fleet |
 | Opt-in wire crypto (M8) | **94.1 %** of cleartext throughput | 4-vCPU dev box; ratio only |
+| Planned leader restart (M9) | stop **0.042 s** under load, journal-tail rejoin (no snapshot), back at baseline ≤ 10.5 s | 3-host fleet |
+| Metrics scrape cost (M10) | median **0.983** scrape-on/off throughput ratio (≈1.7 % cost, bar ≥ 0.95), 1 s all-nodes scrape | 3-host fleet, interleaved A/B |
+| Alerts on a healthy cluster (M10) | **0** firing alerts over a 10-min real-Prometheus soak, 62/62 metric families from every node | 3-host fleet |
+| Readiness probe under leader kill (M10) | **0** ready-responses during the elected-not-serving window, 3 kills | 3-host fleet |
 
 Fleet runs are `c6id.2xlarge`, us-east-1, single AZ, cluster placement group,
 NVMe journals, fsync on. The two non-fleet rows say so rather than borrowing the
 fleet's credibility — M4's fleet confirmation and M8's fleet ratio are both open
-work.
+work. Full per-milestone records live in
+[`docs/benchmarks/`](/docs/benchmarks) (`uc2-m*-gate-*.md`).
 
 **Every gate record commits its pass/fail rule to this repository before the
 run.** The decide rule and the result are separate commits, in that order; git
@@ -199,7 +205,22 @@ Bench/fleet tooling lives under [`bench-infra/`](/bench-infra) (terraform +
 ansible + the fleet-gate orchestrator; refuses to run journal-bearing gates on
 RAM-backed filesystems).
 
-## Scope (v2.1)
+## Scope (v2.4)
+
+**Deployable node (M9)**: a real `uc2-node` daemon started from a TOML config
+file with named startup refusals (a typo or a semantic mistake refuses at boot
+naming the field, instead of failing later looking like something else), clean
+`SIGTERM` drain-and-stop so restarts replay a journal tail instead of paying
+reconstruction, and packaged systemd units. See
+[Run a cluster on real hosts](/docs/how-to/run-a-cluster.md).
+
+**Observability (M10)**: an in-daemon `/metrics` + `/healthz` + `/readyz`
+endpoint over the shared-memory control page (enabled by the `[metrics]`
+config section, off when absent; Prometheus text format — any collector that
+scrapes it works), transition-triggered structured JSON logging, and shipped
+alert rules + a Grafana dashboard, every rule proven to fire. Readiness keys
+on `can_serve`, never the bare leader flag. See
+[Monitor a cluster](/docs/how-to/monitor-a-cluster.md).
 
 **Dynamic membership (M7)**: single-server reconfiguration is shipped —
 promote / demote / add / remove one member at a time, live, under load, via
