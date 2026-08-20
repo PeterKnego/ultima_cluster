@@ -59,8 +59,27 @@ fn config(dir: &Path, app: &str, purge: PurgePolicy) -> NodeConfig {
     }
 }
 
+// Fix round 1 (M11 Task 2 review): this file's `wait_until` used the same
+// 20s deadline as its sibling `purge_safety.rs`, but under this suite's
+// actual parallel load (13 tests, each a real multi-agent node cluster —
+// several spin up FOUR busy-spin polling-agent threads apiece — sharing a
+// 4-core dev box) that margin genuinely isn't generous enough: at the
+// default `cargo test` parallelism (num_cpus concurrent test threads), a
+// worst case has ~4 of these tests' node clusters running at once, i.e.
+// several-fold oversubscription of the 4 cores, and a specific polling
+// agent (here, the purge/archive-floor agent `publish_snapshot_and_wait_for_purge`
+// waits on) can go starved for tens of seconds at a stretch. Reproduced
+// directly: `ordered_backup_never_produces_a_hole_under_purge_churn` (which
+// shares this same `wait_until` via `publish_snapshot_and_wait_for_purge`)
+// hit this exact `assert!` under default parallelism repeatedly before this
+// fix, including once at a 60s deadline during this fix's own validation —
+// 120s was chosen empirically to clear that same load with margin (see the
+// commit message for the full 10x-green validation at this deadline). A
+// longer deadline costs nothing on the success path (the loop returns the
+// instant `f()` is true) — it only widens how long a genuinely loaded box is
+// given before a real hang is reported.
 fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while !f() {
         assert!(Instant::now() < deadline, "condition never held: {what}");
         std::thread::yield_now();
@@ -78,7 +97,9 @@ fn start_node(dir: &Path, app: &str, purge: PurgePolicy) -> Node {
 }
 
 fn drive_and_quiesce(node: &Node, n: usize) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Fix round 1 (M11 Task 2 review): widened alongside `wait_until`'s
+    // deadline, same load-margin rationale (that function's doc).
+    let deadline = Instant::now() + Duration::from_secs(90);
     let mut sent = 0usize;
     while sent < n {
         assert!(Instant::now() < deadline, "submits stalled at {sent}/{n}");
@@ -96,6 +117,42 @@ fn drive_and_quiesce(node: &Node, n: usize) {
         last = a;
         quiescent
     });
+}
+
+/// Fix round 1 (M11 Task 2 review): keep driving further `drive_and_quiesce`
+/// rounds (4000 more submits each) until the node's durable position exceeds
+/// `target`, bounded by `timeout` overall — a deadline-bounded poll over
+/// MORE THROUGHPUT, not a single fixed-count round asserted against once.
+///
+/// `a_wrong_order_copy_across_a_purge_is_detected_as_a_hole`'s setup used to
+/// call `drive_and_quiesce(&node, 4000)` exactly once and then assert the
+/// resulting durable position was big enough (`pos1 > SEG_BYTES`,
+/// `pos2 > newest_copied`) — a FIXED cycle count standing in for "enough
+/// data landed durably". One round is comfortably enough in the common case
+/// (4000×64B ≈ 256KB versus a 64KB `SEG_BYTES`), but "comfortably enough in
+/// the common case" is exactly the shape of margin that a genuinely loaded
+/// box can eat into — this file's own `wait_until` deadline needed the same
+/// widening (see that function's doc) for the same underlying reason: this
+/// suite's default parallelism (12+ tests, each a real multi-agent node
+/// cluster) on a 4-core dev box. Rather than assert a fixed round was
+/// enough and panic if it wasn't, this loops: if durable still falls short
+/// after a round, drive another one, bounded only by `timeout` — so the test
+/// converges on real throughput instead of a point-in-time guess about how
+/// much one round yields under contention.
+fn drive_until_durable_exceeds(node: &Node, target: u64, timeout: Duration) -> u64 {
+    let deadline = Instant::now() + timeout;
+    loop {
+        drive_and_quiesce(node, 4000);
+        let durable = node.counters().durable.load_acquire();
+        if durable > target {
+            return durable;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "durable position never exceeded {target} (stuck at {durable}) even after \
+             repeated drive_and_quiesce rounds"
+        );
+    }
 }
 
 /// Publish a real (fake-content) snapshot file at `pos`, then drive the node's
@@ -117,10 +174,35 @@ fn scratch() -> tempfile::TempDir {
         .expect("tempdir")
 }
 
+/// Fix round 1 (M11 Task 2 review, batched item 2): serialize this whole
+/// file's tests — same precedent as `lincheck_v2/mod.rs`'s `serialize()`.
+/// EVERY test in this file boots a REAL multi-agent node cluster (4 real
+/// busy-spin polling-agent OS threads per node), and `cargo test`'s default
+/// parallelism runs up to `num_cpus` of this file's `#[test]` fns
+/// concurrently — 4 on this dev box, i.e. up to ~16 competing busy-spin
+/// threads for 4 cores in the worst case. Widening `wait_until`'s deadline
+/// (see its doc) alone was diagnosed NOT sufficient: even at a 120s
+/// deadline, `ordered_backup_never_produces_a_hole_under_purge_churn`'s
+/// "purge advanced the floor" wait hard-stalled for the ENTIRE 120s in 3 of
+/// 10 runs, every time the identical wait, with no partial progress —
+/// consistent with genuine OS-scheduler starvation of the archive/purge
+/// agent thread under this box's oversubscription, not "just needs more
+/// wall time" (a longer deadline cannot fix indefinite starvation). At most
+/// one of this file's real node clusters now runs at a time, which removes
+/// the oversubscription at its root; the lighter, cheap-when-uncontended
+/// tests in this file keep the whole suite fast in practice (see the commit
+/// message for the 10x-green wall-clock evidence).
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serialize() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // ---------------------------------------------------------------------- Test 1
 
 #[test]
 fn backup_of_a_stopped_node_verifies_and_reports_positions() {
+    let _serialize_guard = serialize();
     let root = scratch();
     let dir = root.path().join("n0");
     let app = "backup1";
@@ -153,6 +235,7 @@ fn backup_of_a_stopped_node_verifies_and_reports_positions() {
 
 #[test]
 fn backup_of_a_running_node_under_load_verifies() {
+    let _serialize_guard = serialize();
     let root = scratch();
     let dir = root.path().join("n0");
     let app = "backup2";
@@ -203,18 +286,22 @@ fn backup_of_a_running_node_under_load_verifies() {
 /// `state/`) and confirm `verify_artifact` calls it out as a hole.
 #[test]
 fn a_wrong_order_copy_across_a_purge_is_detected_as_a_hole() {
+    let _serialize_guard = serialize();
     let root = scratch();
     let dir = root.path().join("n0");
     let app = "backup3";
 
     let node =
         start_node(&dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 });
-    drive_and_quiesce(&node, 4000);
 
-    let cnc = open_cnc(&dir, app);
-    let durable1 = cnc.counters().durable.load_acquire();
+    // Deadline-bounded, not a fixed cycle count (see `drive_until_durable_exceeds`'s
+    // doc — this is the fix for the flake this test used to hit under load).
+    let durable1 = drive_until_durable_exceeds(&node, 3 * SEG_BYTES, Duration::from_secs(120));
     let pos1 = durable1 / 3;
-    assert!(pos1 > SEG_BYTES, "test setup: need >1 segment below the first floor");
+    assert!(
+        pos1 > SEG_BYTES,
+        "test setup: need >1 segment below the first floor (durable1={durable1} pos1={pos1})"
+    );
     publish_snapshot_and_wait_for_purge(&dir, app, &node, pos1);
     let first_base_1 = node.archive_first_base();
     assert!(first_base_1 > 0, "first purge must have landed");
@@ -242,10 +329,15 @@ fn a_wrong_order_copy_across_a_purge_is_detected_as_a_hole() {
     // Force another snapshot + purge cycle that lands STRICTLY past the
     // copied snapshot's newest position, so the journal copy (taken after)
     // reflects a purge floor the early snapshots/ copy does not cover.
-    drive_and_quiesce(&node, 4000);
-    let durable2 = cnc.counters().durable.load_acquire();
+    // Same deadline-bounded-not-fixed-count fix as the pos1 setup above.
+    let durable2 =
+        drive_until_durable_exceeds(&node, newest_copied + SEG_BYTES, Duration::from_secs(120));
     let pos2 = durable2 - SEG_BYTES; // deep into the log, well past pos1/newest_copied
-    assert!(pos2 > newest_copied, "test setup: second floor must overtake the copied snapshot");
+    assert!(
+        pos2 > newest_copied,
+        "test setup: second floor must overtake the copied snapshot \
+         (durable2={durable2} pos2={pos2} newest_copied={newest_copied})"
+    );
     publish_snapshot_and_wait_for_purge(&dir, app, &node, pos2);
     wait_until("first_base overtook the copied snapshot", || {
         node.archive_first_base() > newest_copied
@@ -283,6 +375,7 @@ fn a_wrong_order_copy_across_a_purge_is_detected_as_a_hole() {
 
 #[test]
 fn ordered_backup_never_produces_a_hole_under_purge_churn() {
+    let _serialize_guard = serialize();
     let root = scratch();
     let dir = root.path().join("n0");
     let app = "backup4";
@@ -329,6 +422,7 @@ fn ordered_backup_never_produces_a_hole_under_purge_churn() {
 // land mid-copy. Every artifact must still verify Ok.
 #[test]
 fn ordered_backup_survives_a_purge_racing_the_copy() {
+    let _serialize_guard = serialize();
     let root = scratch();
     let dir = root.path().join("n0");
     let app = "backup9";
@@ -407,6 +501,7 @@ fn ordered_backup_survives_a_purge_racing_the_copy() {
 
 #[test]
 fn manifest_tamper_is_caught() {
+    let _serialize_guard = serialize();
     let root = scratch();
     let dir = root.path().join("n0");
     let app = "backup5";
@@ -439,6 +534,7 @@ fn manifest_tamper_is_caught() {
 
 #[test]
 fn backup_instance_refuses_a_non_instance_dir() {
+    let _serialize_guard = serialize();
     let root = scratch();
     let not_instance = root.path().join("not-an-instance");
     std::fs::create_dir_all(&not_instance).unwrap();
@@ -451,6 +547,7 @@ fn backup_instance_refuses_a_non_instance_dir() {
 
 #[test]
 fn backup_instance_refuses_a_nonempty_existing_out_dir() {
+    let _serialize_guard = serialize();
     let root = scratch();
     let dir = root.path().join("n0");
     let app = "backup6";
@@ -470,6 +567,7 @@ fn backup_instance_refuses_a_nonempty_existing_out_dir() {
 
 #[test]
 fn verify_artifact_refuses_a_non_artifact_dir() {
+    let _serialize_guard = serialize();
     let root = scratch();
     let not_artifact = root.path().join("not-an-artifact");
     std::fs::create_dir_all(&not_artifact).unwrap();
@@ -519,6 +617,7 @@ fn file_sizes(root: &Path) -> BTreeMap<PathBuf, u64> {
 /// (idempotence) and reports the identical `BackupReport`.
 #[test]
 fn verify_never_grows_the_artifacts_files_and_is_idempotent() {
+    let _serialize_guard = serialize();
     let root = scratch();
     let dir = root.path().join("n0");
     let app = "backup7";
@@ -620,6 +719,7 @@ impl StateMachine for RestoreCountSm {
 /// submitted (and committed) BEFORE the backup was taken.
 #[test]
 fn restore_roundtrip_boots_and_serves() {
+    let _serialize_guard = serialize();
     let root = scratch();
     let dir = root.path().join("n0");
     let app = "restore1";
@@ -676,12 +776,85 @@ fn restore_roundtrip_boots_and_serves() {
     restored_svc.stop();
 }
 
+/// Fix round 1 (M11 Task 2 review, Finding 1): the empty-dirs/stale-volatile-
+/// files tolerance is the review's named risk for `restore_artifact` — correct
+/// by inspection (it only checks `journal/`/`state/`/`snapshots/` for a
+/// non-empty `read_dir`, and never looks at `cnc2.dat`/`instance.lock` at
+/// all) but untested until now. Pre-creates EMPTY `journal/`, `state/`,
+/// `snapshots/` dirs plus a stale `instance.lock` and a garbage `cnc2.dat`
+/// (arbitrary bytes — both are volatile, boot recreates/re-takes them
+/// unconditionally) in the restore target BEFORE calling `restore_artifact`,
+/// then reuses `restore_roundtrip_boots_and_serves`'s tail to confirm the
+/// restore still succeeds and the restored node actually boots and serves.
+#[test]
+fn restore_accepts_a_target_with_empty_dirs_and_a_stale_lock() {
+    let _serialize_guard = serialize();
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let app = "restore3";
+
+    let node = start_node(&dir, app, PurgePolicy::Disabled);
+    let svc = ServiceBuilder::new(ServiceConfig::new(&dir, app), RestoreCountSm::default())
+        .start()
+        .expect("start service");
+
+    let client = Client::connect(&dir, app).expect("connect client");
+    let mut expected_total = 0u64;
+    for _ in 0..50u64 {
+        let got: u64 = client.submit(&RestoreCmd::Add(1)).expect("submit");
+        expected_total += 1;
+        assert_eq!(got, expected_total, "apply order must match submission order");
+    }
+    client.shutdown();
+
+    match node.stop_draining(Duration::from_secs(10)) {
+        uc2_node::DrainOutcome::Drained => {}
+        other => panic!("expected Drained, got {other:?}"),
+    }
+    svc.stop();
+
+    let artifact = root.path().join("restore3-artifact");
+    backup_instance(&dir, &artifact).expect("backup_instance");
+
+    // The target: EMPTY durable subdirectories (not absent — `restore_artifact`
+    // must tolerate a target that already has the layout, just nothing in it)
+    // plus a stale `instance.lock` and a garbage `cnc2.dat` — both volatile,
+    // neither should gate (or be touched meaningfully by) a restore.
+    let fresh_dir = root.path().join("n0-restored");
+    std::fs::create_dir_all(fresh_dir.join("journal")).unwrap();
+    std::fs::create_dir_all(fresh_dir.join("state")).unwrap();
+    std::fs::create_dir_all(fresh_dir.join("snapshots")).unwrap();
+    std::fs::write(fresh_dir.join("instance.lock"), b"stale-lock-bytes").unwrap();
+    std::fs::write(fresh_dir.join("cnc2.dat"), b"garbage-not-a-real-cnc-page").unwrap();
+
+    restore_artifact(&artifact, &fresh_dir).expect("restore_artifact must accept an empty-dirs, stale-volatile-files target");
+
+    let restored_node = start_node(&fresh_dir, app, PurgePolicy::Disabled);
+    let restored_svc = ServiceBuilder::new(
+        ServiceConfig::new(&fresh_dir, app),
+        RestoreCountSm::default(),
+    )
+    .start()
+    .expect("start restored service");
+
+    let restored_client = Client::connect(&fresh_dir, app).expect("connect restored client");
+    let got: u64 = restored_client
+        .query_linearizable(&())
+        .expect("linearizable query after restore");
+    assert_eq!(got, expected_total, "restored cluster must serve the pre-backup value");
+
+    restored_client.shutdown();
+    restored_node.stop();
+    restored_svc.stop();
+}
+
 /// `restore_artifact` must refuse a target `instance_dir` whose `journal/` is
 /// already non-empty (a leftover from some earlier, un-decommissioned
 /// instance) rather than merge or overwrite into it — and must leave that
 /// leftover completely untouched.
 #[test]
 fn restore_refuses_a_dirty_target() {
+    let _serialize_guard = serialize();
     let root = scratch();
     let dir = root.path().join("n0");
     let app = "restore2";

@@ -475,6 +475,12 @@ pub fn verify_artifact(artifact: &Path) -> Result<BackupReport, BackupError> {
 /// interaction — the target `instance_dir` need not (and normally must not)
 /// have a node running in it at all (see [`backup_instance`]'s doc for the
 /// same point about the source side).
+///
+/// No check guards `artifact == instance_dir`, or `instance_dir` nested
+/// inside `artifact` (or vice versa): none is needed. Self-restore is simply
+/// the ordinary refusal path — the target's `journal/`/`state/` ARE the
+/// (non-empty) artifact's own, so [`BackupError::TargetNotEmpty`] fires
+/// before any copy starts, same as any other already-populated target.
 pub fn restore_artifact(artifact: &Path, instance_dir: &Path) -> Result<BackupReport, BackupError> {
     let report = verify_artifact(artifact)?;
 
