@@ -112,6 +112,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Backup under load -> host destroyed -> restore -> rejoin
         run: cargo test -p uc2-crashtest --features survival-tests
+      # M11 Task 6: ENOSPC asserted end-to-end. A 64 MiB loopback ext4
+      # filesystem (scripts/enospc_fixture.sh) needs sudo for mkfs/mount/
+      # chown, which ubuntu-latest has (unlike the dev box this was
+      # authored on -- see the fixture script's `sudo -n true` probe and
+      # examples/uc2-crashtest/tests/enospc.rs's module doc). The sudo-free
+      # `write_denied_drives_the_same_failstop_chain` sibling in the same
+      # test file runs unconditionally once the feature is on, with or
+      # without the fixture step below.
+      - name: Create the ENOSPC loopback fixture
+        run: scripts/enospc_fixture.sh create /home/runner/uc2-enospc-test 64
+      - name: ENOSPC fail-stop asserted; cluster survives; recovers on space return
+        run: cargo test -p uc2-crashtest --features enospc-tests
+        env:
+          UC2_ENOSPC_DIR: /home/runner/uc2-enospc-test
+      - name: Destroy the ENOSPC loopback fixture
+        if: always()
+        run: scripts/enospc_fixture.sh destroy /home/runner/uc2-enospc-test
 
   # Elle transactional-safety tier: 5 list-append passes (quiet/failover/
   # partition/purge/reconfig), each adjudicated by the vendored elle-cli under
