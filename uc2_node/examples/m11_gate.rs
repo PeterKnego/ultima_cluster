@@ -31,6 +31,11 @@
 //! `scripts/m10_alert_fire.sh`/`scripts/uc2_flag_day.sh` shelled out to
 //! directly. Every tempdir/scratch path lives on real disk under this
 //! binary's own target dir (never `/tmp` — RAM tmpfs, no swap on this box).
+//! Row 4's completeness-cross-check anti-vacuity probe runs against a
+//! **scratch copy** of `scripts/m10_alert_fire.sh` — see
+//! [`check_yaml_builders_anti_vacuity`]'s doc comment — the tracked script is
+//! never opened for writing by this binary, at any point, so a signal to
+//! this process can never leave it mutated.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -593,55 +598,91 @@ fn run_alert_fire_script() -> (bool, usize, String) {
     (out.status.success(), pass_count, combined)
 }
 
-/// Anti-vacuity: remove ONE `RULE_BUILDERS` dict entry from a working copy of
-/// the real script's text, run the mutated script IN PLACE (over the real
-/// `scripts/m10_alert_fire.sh` path — the completeness cross-check is
-/// hardcoded inside the script's own inline Python, so there is no
-/// `--rules-file` override to point a copy at instead), confirm it names the
-/// missing builder and fails, then restore the original bytes — via a `Drop`
-/// guard, so a panic anywhere in between still restores the real file.
-fn check_yaml_builders_anti_vacuity() -> (bool, String) {
+/// Anti-vacuity: run the completeness cross-check on a **scratch copy** of
+/// `scripts/m10_alert_fire.sh` with one `RULE_BUILDERS` entry removed — the
+/// tracked file at `scripts/m10_alert_fire.sh` is never opened for writing
+/// anywhere in this function, at any point, so there is no window (however
+/// short) in which a `SIGTERM`/`SIGKILL` to this gate process could leave it
+/// mutated. This replaces an earlier design (fix round 1) that mutated the
+/// real file in place and relied on a `Drop` guard to restore it — verified
+/// broken: `Drop` does not run on an unhandled signal (the default
+/// disposition kills the process immediately), and the mutated-file window
+/// was the ENTIRE ~80s `m10_alert_fire.sh` invocation below, not a couple of
+/// seconds — a `SIGTERM` landing anywhere in that window left the tracked
+/// script corrupted in the working tree. See the gate doc's dated amendment
+/// for the full incident note and the bar-wording correction that goes with
+/// it.
+///
+/// The scratch copy is made genuinely equivalent to the real script by
+/// hardcoding its `ROOT=` line to this process's own `repo_root()` (an
+/// absolute path) instead of the original `dirname($0)/..` derivation —
+/// verified empirically (see the fix-round commit) that this alone is
+/// sufficient: `$ROOT/packaging/prometheus/uc2-alerts.yml` and the `cargo
+/// run --manifest-path $ROOT/Cargo.toml` invocation both resolve to the REAL
+/// repo exactly as they would from an in-place run, no symlinks needed
+/// (`ROOT` literally IS the real repo root — the copy's own location on disk
+/// is otherwise irrelevant, since nothing else in the script derives a path
+/// from `$0`).
+fn check_yaml_builders_anti_vacuity(root: &Path) -> (bool, String) {
     let script_path = repo_root().join("scripts/m10_alert_fire.sh");
     let original = std::fs::read_to_string(&script_path).expect("read m10_alert_fire.sh");
-    let needle = "    \"Uc2DiskLow\": build_Uc2DiskLow,\n";
+
+    // Tripwire (kept from the prior design, per the review's note that it is
+    // a real partial mitigation): if the tracked file were ever left in a
+    // corrupted state by some OTHER means (e.g. a stale mutation from an
+    // older build of this gate, or a hand edit), this fails loudly here
+    // instead of silently building a scratch copy from the wrong baseline.
+    let builder_needle = "    \"Uc2DiskLow\": build_Uc2DiskLow,\n";
     assert!(
-        original.contains(needle),
+        original.contains(builder_needle),
         "m10_alert_fire.sh no longer contains the expected RULE_BUILDERS entry for Uc2DiskLow \
-         — this anti-vacuity probe needs updating to match the script's current shape"
+         (or the tracked file is unexpectedly not pristine -- check `git status`/`git diff \
+         scripts/m10_alert_fire.sh` before continuing) -- this anti-vacuity probe needs the \
+         real script's current shape to build a faithful scratch copy"
     );
-    let mutated = original.replacen(needle, "", 1);
-    assert_ne!(mutated, original, "the mutation must actually change the script's text");
+    let root_needle = "ROOT=\"$(cd \"$(dirname \"$0\")/..\" && pwd)\"\n";
+    assert!(
+        original.contains(root_needle),
+        "m10_alert_fire.sh's ROOT= line has changed shape -- this scratch-copy probe needs updating"
+    );
 
-    struct RestoreGuard<'a> {
-        path: &'a Path,
-        original: &'a str,
-    }
-    impl Drop for RestoreGuard<'_> {
-        fn drop(&mut self) {
-            std::fs::write(self.path, self.original)
-                .expect("restore scripts/m10_alert_fire.sh after the anti-vacuity trip");
-        }
-    }
-    let _guard = RestoreGuard { path: &script_path, original: &original };
+    let repo = repo_root();
+    let repo_str = repo.display().to_string();
+    assert!(!repo_str.contains('"'), "repo root path must not contain a double quote");
+    let mutated = original
+        .replacen(root_needle, &format!("ROOT=\"{repo_str}\"\n"), 1)
+        .replacen(builder_needle, "", 1);
+    assert_ne!(mutated, original, "the mutation must actually change the scratch copy's text");
 
-    std::fs::write(&script_path, &mutated).expect("write the mutated m10_alert_fire.sh in place");
+    let scratch = root.join("alerts-anti-vacuity");
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("create anti-vacuity scratch dir");
+    let scratch_script = scratch.join("m10_alert_fire_mutated.sh");
+    std::fs::write(&scratch_script, &mutated).expect("write the mutated scratch copy");
+
+    // `scripts/m10_alert_fire.sh` is never touched from here on — only the
+    // scratch copy is executed.
     let out = Command::new("bash")
-        .arg(&script_path)
-        .current_dir(repo_root())
+        .arg(&scratch_script)
         .output()
-        .unwrap_or_else(|e| panic!("spawn the mutated m10_alert_fire.sh: {e}"));
+        .unwrap_or_else(|e| panic!("spawn the mutated scratch copy of m10_alert_fire.sh: {e}"));
     let combined =
         format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     let tripped = !out.status.success()
         && combined.contains("Uc2DiskLow")
         && combined.contains("have no RULE_BUILDERS entry");
-    // `_guard` drops here (function return), restoring the original bytes
-    // whether `tripped` came back true or false.
-    drop(_guard);
 
-    let restored = std::fs::read_to_string(&script_path).expect("re-read m10_alert_fire.sh after restore");
-    let restored_ok = restored == original;
-    assert!(restored_ok, "scripts/m10_alert_fire.sh was NOT restored byte-for-byte — manual check needed");
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    // The tracked file was never opened for writing above — re-confirmed
+    // cheaply here too, so a future regression in this function trips loudly
+    // rather than silently.
+    let still_pristine = std::fs::read_to_string(&script_path).expect("re-read m10_alert_fire.sh") == original;
+    assert!(
+        still_pristine,
+        "scripts/m10_alert_fire.sh changed during the anti-vacuity probe — this function must \
+         never write to it (see its own doc comment)"
+    );
 
     (tripped, tail_str(&combined, 2000))
 }
@@ -657,8 +698,11 @@ fn run_alerts_row(root: &Path) -> Verdict {
         println!("{}", tail_str(&script_out, 4000));
     }
 
-    let (tripped, trip_out) = check_yaml_builders_anti_vacuity();
-    println!("  YAML<->builders anti-vacuity trip: tripped={tripped} (script restored byte-for-byte)");
+    let (tripped, trip_out) = check_yaml_builders_anti_vacuity(root);
+    println!(
+        "  YAML<->builders anti-vacuity trip: tripped={tripped} (run against a scratch copy — \
+         scripts/m10_alert_fire.sh itself was never opened for writing)"
+    );
     if !tripped {
         println!("{}", tail_str(&trip_out, 4000));
     }
@@ -666,7 +710,7 @@ fn run_alerts_row(root: &Path) -> Verdict {
     let pass = disk_found && script_ok && pass_count == 14 && tripped;
     let detail = format!(
         "live scrape uc2_free_disk_bytes present={disk_found}; m10_alert_fire.sh exit_ok={script_ok} \
-         PASS={pass_count}/14; anti-vacuity trip fired and script restored={tripped}"
+         PASS={pass_count}/14; anti-vacuity trip (scratch copy, tracked script untouched)={tripped}"
     );
     Verdict::new_pf("4 disk-low observability", pass, detail)
 }
@@ -706,7 +750,12 @@ fn write_flagday_node_toml(
 /// AND any the script itself started later under different, un-tracked
 /// PIDs via its own `nohup` — see `scripts/uc2_flag_day.sh`'s `--local`
 /// mode) — TERM first, then a bounded KILL sweep, regardless of how
-/// [`run_flagday_smoke`] returns, including via a panic.
+/// [`run_flagday_smoke`] returns, including via a panic. Like every `Drop`
+/// guard, this does NOT run on `SIGKILL`/an unhandled `SIGTERM` to this gate
+/// process — row 5's local smoke is ungated, so a killed run can leak
+/// orphaned local `uc2-node` processes on this dev box; a PID-file-based
+/// recovery sweep (independent of this process's own lifetime) is a
+/// candidate for a future task, not implemented here.
 struct KillGuard(Vec<PathBuf>);
 impl Drop for KillGuard {
     fn drop(&mut self) {
