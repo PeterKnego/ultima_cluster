@@ -207,13 +207,6 @@ RAM-backed filesystems).
 
 ## Scope (v2.4)
 
-**Deployable node (M9)**: a real `uc2-node` daemon started from a TOML config
-file with named startup refusals (a typo or a semantic mistake refuses at boot
-naming the field, instead of failing later looking like something else), clean
-`SIGTERM` drain-and-stop so restarts replay a journal tail instead of paying
-reconstruction, and packaged systemd units. See
-[Run a cluster on real hosts](/docs/how-to/run-a-cluster.md).
-
 **Observability (M10)**: an in-daemon `/metrics` + `/healthz` + `/readyz`
 endpoint over the shared-memory control page (enabled by the `[metrics]`
 config section, off when absent; Prometheus text format — any collector that
@@ -222,12 +215,12 @@ alert rules + a Grafana dashboard, every rule proven to fire. Readiness keys
 on `can_serve`, never the bare leader flag. See
 [Monitor a cluster](/docs/how-to/monitor-a-cluster.md).
 
-**Dynamic membership (M7)**: single-server reconfiguration is shipped —
-promote / demote / add / remove one member at a time, live, under load, via
-the `uc2ctl` admin CLI. Joint consensus is not needed for the supported ops
-(adjacent configs differ by one member, so majorities always intersect). Hard
-cap: **8 total members** (voters + learners) in the cnc observability band —
-unchanged from v2.0. One node per instance directory.
+**Deployable node (M9)**: a real `uc2-node` daemon started from a TOML config
+file with named startup refusals (a typo or a semantic mistake refuses at boot
+naming the field, instead of failing later looking like something else), clean
+`SIGTERM` drain-and-stop so restarts replay a journal tail instead of paying
+reconstruction, and packaged systemd units. See
+[Run a cluster on real hosts](/docs/how-to/run-a-cluster.md).
 
 **Wire security (M8)**: authenticated + encrypted node↔node UDP is available and
 **off by default** — X25519 identities on a runtime-reloadable allowlist, Noise
@@ -237,6 +230,13 @@ there is no mixed mode. With crypto disabled the posture is a trusted private
 network. The threat model is a network-path adversary; a compromised host and a
 malicious cluster member are explicitly out of model (see
 [`docs/VERIFICATION.md`](/docs/VERIFICATION.md) §10 and runbook §11).
+
+**Dynamic membership (M7)**: single-server reconfiguration is shipped —
+promote / demote / add / remove one member at a time, live, under load, via
+the `uc2ctl` admin CLI. Joint consensus is not needed for the supported ops
+(adjacent configs differ by one member, so majorities always intersect). Hard
+cap: **8 total members** (voters + learners) in the cnc observability band —
+unchanged from v2.0. One node per instance directory.
 
 ## License
 
