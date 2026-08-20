@@ -27,9 +27,10 @@ Design decisions worth disclosing up front (also repeated in the report):
      2's dual sampler, extended to also serve leader-detection and
      commit-rate windows (rows Q/2/3 all need one or both). Offsets are the
      pinned ones in docs/reference/cnc-page.md: `commit`@448, `node_flags`@768.
-     `M10Node.probe()` presents the SAME shape m6_fleet_gate's `wait_leader()`
-     expects (`{"leader":..,"can_serve":..}`), so `wait_leader` is imported
-     and reused UNCHANGED against `M10Node` instances. Row 2's sampler is
+     `M10Node.probe()` presents the same `{"leader":..,"can_serve":..}` shape
+     m6_fleet_gate uses; leader detection is this file's own
+     `wait_single_leader` (fleet run 1 showed m6's strict wait_leader treats
+     a deposed leader's transiently-stale flags as split-brain). Row 2's sampler is
      `sampler_start()`/`sampler_result()` — a fire-and-forget launch mirroring
      `SshHost.rate_probe_start`/`rate_probe_result` exactly (started BEFORE
      the leader kill, not after — see `sampler_start`'s docstring for why an
@@ -105,7 +106,40 @@ import m6_fleet_gate as m6  # noqa: E402
 # consistent with the m9/m5-ab precedent of stamping the app id early.
 m6.APP = "m10-gate"
 
-from m6_fleet_gate import LocalHost, SshHost, wait_leader  # noqa: E402
+from m6_fleet_gate import LocalHost, SshHost  # noqa: E402
+
+
+def wait_single_leader(nodes, secs):
+    """Tolerant replacement for m6_fleet_gate.wait_leader.
+
+    m6's wait_leader raises "split-brain" on ANY poll that sees two serving
+    voters — but a freshly deposed uc2-node keeps its leader/can_serve flags
+    until it hears the new term (there is no check-quorum step-down; the
+    read barrier, not the flag, is what protects reads), so a contested
+    first election legitimately shows a transient two-serving view for a
+    few hundred ms.  Fleet run 1 (2026-08-20) died on exactly that transient
+    in row 3's first fresh-cluster start.  Accept only a view showing
+    EXACTLY one serving voter on two consecutive polls 0.5s apart; keep
+    polling through multi-serving transients; return None after `secs`."""
+    deadline = time.time() + secs
+    prev = None
+    while time.time() < deadline:
+        serving = []
+        for i, n in enumerate(nodes):
+            try:
+                st = n.probe()
+                if st.get("leader") and st.get("can_serve"):
+                    serving.append(i)
+            except Exception:
+                pass
+        if len(serving) == 1:
+            if prev == serving[0]:
+                return serving[0]
+            prev = serving[0]
+        else:
+            prev = None
+        time.sleep(0.5)
+    return None
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -815,7 +849,7 @@ def row_quiet(nodes, a, secs):
     start_load_all(nodes, client_secs)
     time.sleep(SETTLE_SECS)
 
-    idx = wait_leader(nodes, list(range(len(nodes))), LEADER_WAIT_SECS)
+    idx = wait_single_leader(nodes, LEADER_WAIT_SECS)
     if idx is None:
         stop_cluster(nodes)
         return Verdict("Q quiet-on-healthy", False, "no leader elected before the quiet window")
@@ -857,7 +891,7 @@ def row_probes(nodes, a, k, window):
     total_violations = 0
     total_windowed = 0
     for ki in range(k):
-        idx = wait_leader(nodes, list(range(len(nodes))), LEADER_WAIT_SECS)
+        idx = wait_single_leader(nodes, LEADER_WAIT_SECS)
         if idx is None:
             stop_cluster(nodes)
             return Verdict("2 probe regime", False, f"kill {ki}: no leader elected")
@@ -934,7 +968,7 @@ def one_ab_run(nodes, a, arm, node0, pp):
     start_load_all(nodes, client_secs)
     time.sleep(SETTLE_SECS)
 
-    idx = wait_leader(nodes, list(range(len(nodes))), LEADER_WAIT_SECS)
+    idx = wait_single_leader(nodes, LEADER_WAIT_SECS)
     if idx is None:
         stop_cluster(nodes)
         return None, "no leader elected"
@@ -1082,13 +1116,21 @@ def main():
         nodes, members = setup_fleet(a)
 
     verdicts = []
+
+    def record(v):
+        # Print the moment a row completes: fleet run 1 lost the finished
+        # rows' verdicts when a later row crashed before the summary table.
+        print(f"  [row done] [{'PASS' if v.passed else 'FAIL'}] {v.row} — {v.detail}",
+              flush=True)
+        verdicts.append(v)
+
     try:
         if a.row in ("q", "all"):
-            verdicts.append(row_quiet(nodes, a, quiet_secs))
+            record(row_quiet(nodes, a, quiet_secs))
         if a.row in ("probes", "all"):
-            verdicts.append(row_probes(nodes, a, kills, SAMPLE_WINDOW))
+            record(row_probes(nodes, a, kills, SAMPLE_WINDOW))
         if a.row in ("ab", "all"):
-            verdicts.append(row_ab(nodes, a, pairs))
+            record(row_ab(nodes, a, pairs))
     finally:
         teardown(nodes, a)
 
