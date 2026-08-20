@@ -162,13 +162,29 @@ pub fn data_loss_statement(node_id: u32, durable: u64, dropped_peers: &[u32]) ->
 /// Take the instance's exclusive flock (refusing with an error if a node is
 /// currently running), open the journal `Archive` and `NodeState` exactly as
 /// boot does, and run the real `recover_config_record` — but ONLY after
-/// proving neither of its two persisting paths can fire (see the module
+/// proving neither of its two FABRICATING paths can fire (see the module
 /// doc's "`recovered_config` must never persist" section); refuses instead.
+///
+/// This rules out the fabrication hazard, but NOT every write
+/// `recover_config_record` can make: two genuine, non-fabricating,
+/// idempotent boot-semantic persists remain reachable even after the guard
+/// above — the single T5-carry revert (`node.rs`'s `recover_config_record`,
+/// the `state.store_config_record(&rec)` call after reverting to `rec.prev`,
+/// fired when `rec.position > durable` but `rec.prev_position <= durable` —
+/// the doubly-ahead case above is excluded, this is the ordinary single-crash
+/// case) and the forward re-derive fold (`rederive_config`'s own
+/// `state.store_config_record(&rederived)`, fired when the archive holds a
+/// `FRAME_TYPE_CONFIG` frame not yet folded into the persisted record). Both
+/// recover REAL, previously-adopted data (a prior config generation, or an
+/// archived frame) rather than inventing anything — the hazard this module
+/// guards against — so [`recovered_config`] is read-only in CONTRACT (never
+/// fabricates, never loses data) but not a literal zero-write guarantee.
+///
 /// Returns the still-held `InstanceDir` (and the open `NodeState`) along
 /// with the recovered record — [`recovered_config`] drops the lock
-/// immediately (a pure read, genuinely this time); [`plan_force_single_member`]
-/// keeps holding it all the way through [`PlannedForce::commit`], so the
-/// whole read-check-plan-write sequence runs under ONE flock acquisition.
+/// immediately; [`plan_force_single_member`] keeps holding it all the way
+/// through [`PlannedForce::commit`], so the whole read-check-plan-write
+/// sequence runs under ONE flock acquisition.
 fn recover_locked(instance_dir: &Path) -> io::Result<(InstanceDir, NodeState, ConfigRecord, u64)> {
     let instance = InstanceDir::acquire(instance_dir)
         .map_err(|e| io::Error::other(format!("a node is running: {e}")))?;
@@ -204,8 +220,9 @@ fn recover_locked(instance_dir: &Path) -> io::Result<(InstanceDir, NodeState, Co
         None => {
             return Err(io::Error::other(
                 "instance dir has no durable config record yet — not a previously-booted node; \
-                 force-single-member only operates on an already-initialized instance (nothing \
-                 was written)",
+                 force-single-member only operates on an already-initialized instance (no config \
+                 record was written; the dir/state-file skeleton InstanceDir::acquire and \
+                 NodeState::open create either way is not a config record)",
             ));
         }
         Some(ref rec) if rec.position > durable && rec.prev_position > durable => {
@@ -213,8 +230,8 @@ fn recover_locked(instance_dir: &Path) -> io::Result<(InstanceDir, NodeState, Co
                 "doubly-ahead crash window: the durable config record's current position ({}) \
                  AND its previous position ({}) both exceed the recovered archive frontier \
                  ({durable}) — nothing genuine is left to revert to, and force-single-member \
-                 refuses rather than falling back to an empty seed (nothing was written); wipe \
-                 this instance dir and rejoin it as a fresh id instead",
+                 refuses rather than falling back to an empty seed (no config record was \
+                 written); wipe this instance dir and rejoin it as a fresh id instead",
                 rec.position, rec.prev_position
             )));
         }

@@ -541,6 +541,34 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
     let old_instance_id =
         connect_with_retry(&dirs[survivor_idx], Duration::from_secs(10)).instance_id();
 
+    // Fix round 2 (adjudicated): pin the survivor's own commit/durable/
+    // applied frontier to be FLUSH before killing anything — load-bearing,
+    // not decoration. A leaderless follower's `commit_seen` only advances
+    // via inbound leader gossip (no local-only path closes a commit<durable
+    // gap), and the gossip floor is ~100ms; a kill landing inside that
+    // window can freeze the survivor with `durable > commit`, and
+    // `CommitTracker::new(0,1)` + the post-force `new_term_pos` clamp would
+    // then legitimately commit-and-apply that gap on its own — making the
+    // post-force read HIGHER than whatever was captured pre-force. Polling
+    // to `commit == durable == service_applied` here makes the later
+    // `assert_eq!` provably sound instead of merely the race's usual winner.
+    let survivor_cnc_pre_kill = open_cnc(&dirs[survivor_idx]).expect("survivor cnc before the kill");
+    let pin_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let commit = survivor_cnc_pre_kill.counters().commit.load_acquire();
+        let durable = survivor_cnc_pre_kill.counters().durable.load_acquire();
+        let applied = survivor_cnc_pre_kill.service().service_applied.load_acquire();
+        if commit >= durable && applied == durable {
+            break;
+        }
+        assert!(
+            Instant::now() < pin_deadline,
+            "survivor never caught commit up to durable before the kill \
+             (commit={commit} durable={durable} applied={applied})"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
     // 1. SIGKILL the leader AND the other follower, PERMANENTLY — below the
     // 2-of-3 majority this membership needs, so no config over it (short of
     // force) can ever reach quorum again.
@@ -659,13 +687,32 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
     let resp = admin_request(&survivor_cnc, 1 /* AddLearner */, fresh_id, ip, port, 20);
     assert_eq!(resp.status, 0, "add-learner refused: reason={}", resp.reason);
 
-    // Fix round 1, Minor 9: name itself in its own `--members` (the "runbook
-    // shape" every other node in this file — and every node in the codebase
-    // — boots with; the crashtest node bin has no separate `--learners` flag,
-    // so this is the only way a real, `preflight`-checked node's own
-    // `SelfNotAMember` refusal would be satisfied for this id). Harmless
-    // either way for THIS bin (preflight isn't invoked here), but this keeps
-    // the fixture honest about what a real operator would actually type.
+    // Fix round 1, Minor 9 (fix round 2: named precisely, not just
+    // "fixture-honesty"): the crashtest node bin has no `--learners` flag —
+    // everything in `--members` becomes a VOTER in `NodeConfig.members`, so
+    // appending `{fresh_id}@{fresh_addr}` here makes this fresh node's own
+    // LOCAL boot-time genesis seed (its instance dir has no config.state
+    // yet) a 4-VOTER config {0,1,2,3} at version 0, with itself believing it
+    // is a voter, not a learner. That is wrong (and momentary): the real
+    // AddLearner change (`resp` above, already committed on the survivor as
+    // a MUCH higher version, correctly listing id 3 as a learner) supersedes
+    // it the instant this node connects and replicates — `ConfigObserved`'s
+    // version-gated adoption overwrites any lower version unconditionally.
+    // It is benign even during that brief window: of its own believed 4
+    // voters, two (the original leader/dead2 addresses) are unreachable
+    // dead processes and the third (the survivor) is already the sole voter
+    // of a DIFFERENT, much-higher-version single-voter term — it cannot
+    // grant this node a vote toward a phantom 4-voter quorum it isn't even
+    // part of — so this node cannot win an election under its own stale
+    // local view before the real config arrives and corrects it. Confirmed
+    // in practice, not just argued: this test's own log output shows node 3
+    // adopting the real config (v2, then v3) promptly, never electing
+    // itself. Without this line (the original `--members = members_str`
+    // alone, not naming id 3 at all), node 3's local genesis seed would be
+    // the 3 voters {0,1,2} — NOT including its own id anywhere in
+    // members-or-learners, an even less representative boot-time shape (a
+    // real `preflight`-checked node would refuse outright via
+    // `SelfNotAMember` rather than boot with a genesis that omits itself).
     let fresh_members_str = format!("{members_str},{fresh_id}@{fresh_addr}");
     node_procs.push(Some(spawn_node_multi(&fresh_dir, fresh_id, fresh_addr, &fresh_members_str)));
     wait_for_ready(&fresh_dir, Duration::from_secs(10));
