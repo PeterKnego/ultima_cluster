@@ -27,9 +27,14 @@ Design decisions worth disclosing up front (also repeated in the report):
      2's dual sampler, extended to also serve leader-detection and
      commit-rate windows (rows Q/2/3 all need one or both). Offsets are the
      pinned ones in docs/reference/cnc-page.md: `commit`@448, `node_flags`@768.
-     `M10Node.probe()`/`.run_sampler()` present the SAME shape m6_fleet_gate's
-     `wait_leader()` expects (`{"leader":..,"can_serve":..}`), so `wait_leader`
-     is imported and reused UNCHANGED against `M10Node` instances.
+     `M10Node.probe()` presents the SAME shape m6_fleet_gate's `wait_leader()`
+     expects (`{"leader":..,"can_serve":..}`), so `wait_leader` is imported
+     and reused UNCHANGED against `M10Node` instances. Row 2's sampler is
+     `sampler_start()`/`sampler_result()` — a fire-and-forget launch mirroring
+     `SshHost.rate_probe_start`/`rate_probe_result` exactly (started BEFORE
+     the leader kill, not after — see `sampler_start`'s docstring for why an
+     after-the-kill launch would read the row non-vacuously FAIL on every
+     fleet run).
   2. `CONTRACT_SERIES` SOURCE: parsed from `uc2_node/src/obs/metrics.rs` at
      orchestrator start (regex over the `pub const CONTRACT_SERIES: &[&str] =
      &[...]` literal) rather than scraped-and-boundary-matched from a live
@@ -114,16 +119,25 @@ SETTLE_SECS = 6
 
 QUIET_SECS_FLEET = 600          # row Q: >= 10 minutes, per the bar
 QUIET_SECS_LOCAL = 60           # --local: shortened, SMOKE only
+QUIET_CLIENT_MARGIN_SECS = 120  # row Q: load-client lifetime margin (see row_quiet's docstring)
 
 K_KILLS_FLEET = 3               # row 2: repeated kills, union windowed_samples
 K_KILLS_LOCAL = 1
-SAMPLE_WINDOW = 5.0              # row 2: per-kill sampler window (s)
+# Sampler window: must cover PROBE_PRE_KILL_SETTLE + the kill + enough
+# post-kill observation to catch the ~100-300ms 0x01 window with margin —
+# widened from an earlier 5.0s (which was sized for a post-kill-only sampler
+# start; sampler-before-kill now spends part of the window pre-kill).
+SAMPLE_WINDOW = 10.0
+PROBE_PRE_KILL_SETTLE = 2.0      # row 2: let every survivor's sampler actually start polling
+                                 # before the kill fires (ssh round trips to launch
+                                 # them are ~0.4-0.8s each, sequential across survivors
+                                 # via the thread pool's own submit latency)
 
 AB_PAIRS_FLEET = 5              # row 3: interleaved A,B pairs
 AB_PAIRS_LOCAL = 1
 RATE_WINDOW = 8.0                # row 3: on-host rate-window length (s), x2 -> mean
 AB_RATIO_BAR = 0.95
-AB_CLIENT_MARGIN_SECS = 30       # load-client lifetime margin over the measured window
+AB_CLIENT_MARGIN_SECS = 30       # row 3: load-client lifetime margin over the measured window
 
 PROM_LISTEN = "127.0.0.1:9090"
 PROM_VERSION = "3.5.0"
@@ -426,8 +440,13 @@ class M10Node:
                 text=True, timeout=timeout,
             )
         else:
+            # sudo: instance dirs and `cnc2.dat` are root-owned on the fleet
+            # (SshHost's own docstring — every other fleet read in this file
+            # goes through `sudo`; a plain ssh exec runs as the login user,
+            # not root, and would read-permission-fail every probe here,
+            # which would wash out `wait_leader` silently returning None).
             quoted = " ".join(shlex.quote(a) for a in ["--cnc", self.cnc_path] + args)
-            r = self.host._ssh(f"python3 {self.tool_path} {quoted}",
+            r = self.host._ssh(f"sudo python3 {self.tool_path} {quoted}",
                                capture_output=True, timeout=timeout)
             if r.returncode != 0:
                 raise RuntimeError(f"cnc_tool on {self.host.public_ip}: {r.stderr}")
@@ -441,33 +460,86 @@ class M10Node:
             return self._run_tool(["rate", "--secs", str(rate_secs)], timeout=15 + rate_secs)
         return self._run_tool(["probe"], timeout=10)
 
-    def run_sampler(self, window):
-        """Row 2: the on-host dual sampler, run via `systemd-run --wait` on
-        the fleet (blocks until the transient unit finishes, output captured
-        to a file) or a direct blocking subprocess locally."""
+    def sampler_start(self, window):
+        """Row 2: launch the on-host dual sampler FIRST, fire-and-forget —
+        mirrors `SshHost.rate_probe_start`/`rate_probe_result` EXACTLY (a
+        `--collect` systemd-run unit with `StandardOutput=file:`, read after
+        the window elapses) rather than blocking on `systemd-run --wait`.
+        This must be started BEFORE `kill_daemon()`, not after: an ssh round
+        trip to launch a sampler is ~0.4-0.8s (m6/m9's own measured figure —
+        see `dip_for_transition`'s docstring), which dwarfs the ~100-300ms
+        `0x01` window a leader-kill produces. Starting after the kill would
+        read `windowed_samples=0` non-vacuously on every fleet run, not
+        because the property doesn't hold but because the sampler never got
+        there in time. `window` must be long enough to cover the pre-kill
+        settle AND the kill itself (row_probes uses 10s)."""
         if self.local:
-            out = subprocess.check_output(
+            path = Path(self.host.logs) / f"sampler-{self.id}-{time.time_ns()}.json"
+            f = open(path, "w")
+            p = subprocess.Popen(
                 [sys.executable, self.tool_path, "--cnc", self.cnc_path,
                  "sampler", "--http-addr", self.metrics_addr, "--window", str(window)],
-                text=True, timeout=window + 15,
+                stdout=f, stderr=subprocess.DEVNULL,
             )
-            return json.loads(out.strip().splitlines()[-1])
-        unit = f"m10-sampler-{self.id}-{int(time.time() * 1000)}"
+            return ("local", p, f, path)
+        unit = f"m10-sampler-{self.id}"
         path = f"/opt/bench/{unit}.json"
         cmd = (
-            f"sudo systemd-run --unit={unit} --collect --wait "
-            f"-p StandardOutput=file:{path} "
+            f"sudo rm -f {path}; "
+            f"sudo systemd-run --unit={unit} --collect -p StandardOutput=file:{path} "
             f"python3 {self.tool_path} --cnc {self.cnc_path} sampler "
             f"--http-addr {self.metrics_addr} --window {window}"
         )
-        r = self.host._ssh(cmd, capture_output=True, timeout=window + 30)
+        r = self.host._ssh(cmd, capture_output=True)
         if r.returncode != 0:
-            raise RuntimeError(f"sampler on {self.host.public_ip}: {r.stderr}")
-        r2 = self.host._ssh(f"sudo cat {path} 2>/dev/null", capture_output=True)
-        lines = [line for line in (r2.stdout or "").splitlines() if line.strip()]
+            raise RuntimeError(f"sampler start on {self.host.public_ip}: {r.stderr}")
+        return ("fleet", unit, path)
+
+    def sampler_result(self, handle, timeout=60.0):
+        """Wait for a `sampler_start` window to finish and return its parsed
+        JSON verdict — `rate_probe_result`'s exact shape, generalized past a
+        single `"rate"` field. A window that never produced a reading (an
+        ssh hiccup, an early-killed local process) reads as all-zero rather
+        than raising, so a transient plumbing blip cannot silently pass row 2
+        (it would show `windowed_samples=0` and get caught by the
+        non-vacuity check, not swallowed as `None`)."""
+        empty = {"samples": 0, "violations": 0, "windowed_samples": 0, "first_200_ms": None}
+        kind = handle[0]
+        if kind == "local":
+            _, p, f, path = handle
+            try:
+                p.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait(timeout=5)
+            finally:
+                f.close()
+            try:
+                text = Path(path).read_text().strip()
+                data = json.loads(text.splitlines()[-1]) if text else {}
+            except (FileNotFoundError, json.JSONDecodeError, IndexError):
+                data = {}
+            finally:
+                try:
+                    Path(path).unlink()
+                except FileNotFoundError:
+                    pass
+            return data or empty
+        _, unit, path = handle
+        dl = time.time() + timeout
+        while time.time() < dl:
+            r = self.host._ssh(f"systemctl is-active {unit}", capture_output=True)
+            if r.stdout.strip() != "active":
+                break
+            time.sleep(0.3)
+        r = self.host._ssh(f"sudo cat {path} 2>/dev/null", capture_output=True)
+        lines = [line for line in (r.stdout or "").strip().splitlines() if line.strip()]
         if not lines:
-            return {"samples": 0, "violations": 0, "windowed_samples": 0, "first_200_ms": None}
-        return json.loads(lines[-1])
+            return empty
+        try:
+            return json.loads(lines[-1])
+        except json.JSONDecodeError:
+            return empty
 
 
 # ------------------------------------------------------------- metrics scrape
@@ -649,6 +721,12 @@ def prom_alerts(node0, a):
 
 
 def check_series_presence(node0, a, nodes, series_names):
+    # `uc2_leader_hint` is the one CONTRACT_SERIES family that's genuinely
+    # conditionally emitted on propagation timing alone (omitted entirely
+    # while `leader_hint == u64::MAX`, i.e. before a node has heard of any
+    # leader — uc2_node/src/obs/metrics.rs:182-184) rather than on load —
+    # the 10-minute soak is what makes this a non-issue (every node hears a
+    # leader hint within seconds of cluster start, long before the check).
     expected = {n.metrics_addr for n in nodes}
     missing = {}
     for name in series_names:
@@ -719,8 +797,22 @@ class Verdict:
 # ------------------------------------------------------------- row Q (quiet)
 
 def row_quiet(nodes, a, secs):
+    """`secs` is the adjudicated soak duration (>= 10 min on the fleet). The
+    load-client lifetime must outlive settle + a worst-case leader wait +
+    the soak + post-soak checks — but NOT a first-time Prometheus tarball
+    download, which is unbounded on network conditions and must happen
+    BEFORE any load client starts, not be folded into its covered lifetime
+    (IMPORTANT fix: this used to run ensure_prometheus_binary() after the
+    load clients were already started, up to 630s into a budget that had no
+    margin for a slow/first-time download)."""
+    node0 = nodes[0]
+    pp = prom_paths(a)
+    ensure_prometheus_binary(node0, a, pp)   # pre-fetch BEFORE any load client starts
+    prom_setup_files(nodes, a, pp)
+
     start_cluster(nodes, a)
-    start_load_all(nodes, secs + AB_CLIENT_MARGIN_SECS)
+    client_secs = SETTLE_SECS + LEADER_WAIT_SECS + secs + QUIET_CLIENT_MARGIN_SECS
+    start_load_all(nodes, client_secs)
     time.sleep(SETTLE_SECS)
 
     idx = wait_leader(nodes, list(range(len(nodes))), LEADER_WAIT_SECS)
@@ -728,10 +820,6 @@ def row_quiet(nodes, a, secs):
         stop_cluster(nodes)
         return Verdict("Q quiet-on-healthy", False, "no leader elected before the quiet window")
 
-    node0 = nodes[0]
-    pp = prom_paths(a)
-    ensure_prometheus_binary(node0, a, pp)
-    prom_setup_files(nodes, a, pp)
     handle = start_prometheus(node0, a, pp)
     print(f"INFO row Q: leader n{idx} elected; Prometheus scraping all "
           f"{len(nodes)} nodes @1s for {secs}s (uc2-alerts.yml loaded verbatim)", flush=True)
@@ -775,11 +863,22 @@ def row_probes(nodes, a, k, window):
             return Verdict("2 probe regime", False, f"kill {ki}: no leader elected")
         leader = nodes[idx]
         survivors = [n for j, n in enumerate(nodes) if j != idx]
+
+        # Sampler-before-kill (Critical fix): launch every survivor's
+        # sampler FIRST, fire-and-forget, THEN kill — see `sampler_start`'s
+        # docstring. `window` must comfortably cover the short pre-kill
+        # settle below plus the kill itself.
+        with ThreadPoolExecutor(max_workers=len(survivors)) as ex:
+            futs = {n.id: ex.submit(n.sampler_start, window) for n in survivors}
+            handles = {nid: f.result() for nid, f in futs.items()}
+
+        time.sleep(PROBE_PRE_KILL_SETTLE)
         print(f"INFO row 2 kill {ki}: SIGKILL leader n{leader.id}", flush=True)
         leader.kill_daemon()
 
         with ThreadPoolExecutor(max_workers=len(survivors)) as ex:
-            futs = {n.id: ex.submit(n.run_sampler, window) for n in survivors}
+            futs = {n.id: ex.submit(n.sampler_result, handles[n.id], window + 30.0)
+                   for n in survivors}
             results = {nid: f.result() for nid, f in futs.items()}
 
         viol = sum(r.get("violations", 0) for r in results.values())
