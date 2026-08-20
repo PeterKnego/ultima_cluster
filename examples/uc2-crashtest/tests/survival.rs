@@ -154,17 +154,38 @@ fn find_follower(dirs: &[PathBuf], leader_idx: usize) -> usize {
 struct CasLoad {
     stop: Arc<AtomicBool>,
     acked: Arc<AtomicU64>,
-    handle: std::thread::JoinHandle<()>,
+    // `Option` (not a bare `JoinHandle`), same reason as `Reap`'s use
+    // elsewhere in this crate's harness: a type with a `Drop` impl (below)
+    // can't have a field moved out of it by value, so `stop_and_join` takes
+    // it via `.take()` instead.
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CasLoad {
     /// Stop the loop and join it — panics (propagated) if the loop itself
     /// panicked, i.e. if it ever observed an unexpected `CasResult(false)`.
-    fn stop_and_join(self) {
+    fn stop_and_join(mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Err(e) = self.handle.join() {
+        if let Some(h) = self.handle.take()
+            && let Err(e) = h.join()
+        {
             panic::resume_unwind(e);
         }
+    }
+}
+
+/// Fix round 1, Finding 2: best-effort stop on drop, no join. If the test
+/// panics (an assertion failure) before reaching `stop_and_join`, the
+/// unwind drops `CasLoad` without ever telling the load thread to stop —
+/// it keeps hammering a client whose instance dir is about to be torn down
+/// by the unwinding `tempdir`, which is pure unwind-path noise (stray
+/// errors/log lines racing process teardown), not a correctness issue.
+/// Setting the flag quiets that. Deliberately does NOT join: a `Drop`
+/// running during a panic must not itself block or panic further, and the
+/// flag alone is enough to make the loop exit on its own.
+impl Drop for CasLoad {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -190,7 +211,49 @@ fn start_cas_load(client: Client) -> CasLoad {
         }
         client.shutdown();
     });
-    CasLoad { stop, acked, handle }
+    CasLoad { stop, acked, handle: Some(handle) }
+}
+
+/// Fix round 1, Finding 1: `backup_instance` genuinely overlapping live load
+/// was true (a reviewer's independent scratch instrumentation measured
+/// 54->69 acked CAS increments during a 130ms copy) but was never asserted —
+/// a future change that accidentally serialized the backup with the load
+/// (e.g. quiescing the cluster first) would pass this test silently. This
+/// snapshots `acked` immediately before and after the copy and requires it
+/// to have strictly increased somewhere during the call.
+///
+/// One retry (remove the partial artifact dir, call `backup_instance`
+/// again) is allowed if a single attempt happens to land in a rare
+/// zero-progress window — plausible on a starved/oversubscribed CI runner
+/// where the copy is slower AND the load thread's own submit-and-wait rate
+/// is lower, unlike the ~15-ack margin observed locally in 130ms. A SECOND
+/// zero-progress attempt is treated as a genuine failure of this test's
+/// premise, not tolerated.
+fn backup_under_load_with_overlap_proof(
+    follower_dir: &Path,
+    out: &Path,
+    acked: &Arc<AtomicU64>,
+) -> uc2_node::backup::BackupReport {
+    for attempt in 1..=2 {
+        let before = acked.load(Ordering::Relaxed);
+        let report = backup_instance(follower_dir, out).expect("backup_instance under load");
+        let after = acked.load(Ordering::Relaxed);
+        if after > before {
+            return report;
+        }
+        assert!(
+            attempt < 2,
+            "backup_instance completed with ZERO overlapping CAS progress across 2 attempts \
+             (before={before}, after={after}) — the under-load half of this test's bar did not \
+             actually happen"
+        );
+        eprintln!(
+            "[survival] backup attempt {attempt} saw zero CAS progress ({before} -> {after}); \
+             retrying once (starved-CI grace)"
+        );
+        std::fs::remove_dir_all(out).expect("clear the artifact dir before the retry attempt");
+    }
+    unreachable!("loop above always returns or asserts on attempt 2")
 }
 
 // ------------------------------------------------------------- the test
@@ -230,8 +293,11 @@ fn a_follower_backed_up_under_load_restores_onto_a_new_host_and_converges() {
     // 1. Identify a FOLLOWER via the cnc flags; back it up LIVE, under load.
     let follower_idx = find_follower(&dirs, leader_idx);
     let artifact_dir = tmp.path().join("follower-backup-artifact");
-    let backup_report =
-        backup_instance(&dirs[follower_idx], &artifact_dir).expect("backup_instance under load");
+    let backup_report = backup_under_load_with_overlap_proof(
+        &dirs[follower_idx],
+        &artifact_dir,
+        &cas_load.acked,
+    );
     assert!(
         backup_report.journal_last_pos > 0,
         "backup of a loaded follower recovered no journal position"
