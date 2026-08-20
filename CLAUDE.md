@@ -60,8 +60,8 @@ drain-and-stop), the `counter-service` binary template, systemd units and
 (M9–M12) is specced in
 `docs/superpowers/specs/2026-08-19-uc2-production-readiness-design.md`.
 
-**M10 (observable cluster) is merged; fleet rows pending (`v2.4.0` tags only
-when they pass)**: an in-daemon `/metrics` + `/healthz` + `/readyz` endpoint
+**M10 (observable cluster) is complete and released (`v2.4.0`; fleet gate
+passed 2026-08-20 — scrape cost ~1.7% at a >=0.95 bar)**: an in-daemon `/metrics` + `/healthz` + `/readyz` endpoint
 over the cnc page (hand-rolled `std::net`, zero new dependencies — enabled by
 the `[metrics]` config section, off when absent), transition-triggered
 JSON-lines records (`[log]` section sets the level), a fail-fast daemon on
