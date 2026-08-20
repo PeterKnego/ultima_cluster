@@ -458,6 +458,35 @@ fn leader_self_removal_hands_off() {
 #[test]
 fn removed_follower_halts_and_zombie_cannot_disrupt() {
     let _g = serialize();
+    // A removed follower adopting its OWN removal is BEST EFFORT by design
+    // (see `resize_3_to_5_to_3`'s contract comment: the removal frame reaches
+    // the removed node only if it arrives before the leader stops replicating
+    // to it, which happens as soon as the removal commits — measured ~5% loss
+    // locally, higher on contended CI). Everything this test proves (the
+    // fail-stop freeze AND the zombie half's staged setup) sits downstream of
+    // that adoption, so retry the WHOLE fixture on a fresh cluster when the
+    // race is lost, rather than asserting the best-effort half as a
+    // guarantee (the nightly flake this replaces). Three consecutive losses
+    // at ~5% is ~0.01% — that residue IS the regression signal.
+    for attempt in 0..3 {
+        if removed_follower_halts_and_zombie_once() {
+            return;
+        }
+        eprintln!(
+            "attempt {attempt}: removed follower lost the best-effort adoption race; \
+             retrying on a fresh cluster"
+        );
+    }
+    panic!(
+        "removed follower failed to adopt its own removal 3/3 attempts — far past the \
+         measured ~5% best-effort loss rate; adoption delivery has likely regressed"
+    );
+}
+
+/// One full attempt. Returns `false` (after stopping the cluster) if the
+/// removed follower lost the best-effort race to see its own removal frame;
+/// `true` once every property is proven.
+fn removed_follower_halts_and_zombie_once() -> bool {
     let mut c = spawn_cluster(3);
     let leader = await_single_leader(&c.nodes, 20);
     let target = (0..c.nodes.len()).find(|&i| i != leader).expect("a follower exists");
@@ -471,9 +500,16 @@ fn removed_follower_halts_and_zombie_cannot_disrupt() {
 
     // It adopts its own removal (config_version reaches 1) — the same event
     // that, for a non-leader, emits `Action::HaltRemoved` synchronously.
-    let deadline = deadline_secs(20);
+    // Best-effort (see the outer test's retry contract): a bounded window,
+    // then a clean give-up instead of a hard assert.
+    let deadline = deadline_secs(10);
     while c.nodes[target].node.config_version() < 1 {
-        assert!(Instant::now() < deadline, "removed follower never adopted its own removal");
+        if Instant::now() >= deadline {
+            for h in c.nodes {
+                h.node.stop();
+            }
+            return false;
+        }
         std::thread::yield_now();
     }
 
@@ -590,6 +626,7 @@ fn removed_follower_halts_and_zombie_cannot_disrupt() {
     for h in c.nodes {
         h.node.stop();
     }
+    true
 }
 
 /// M7 Task 8 — a joining node boots from a STALE seed (a members list that
@@ -1680,6 +1717,31 @@ fn crash_mid_pending_recovers() {
 #[test]
 fn restart_of_removed_node_refuses_to_start() {
     let _g = serialize();
+    // Same retry contract as `removed_follower_halts_and_zombie_cannot_disrupt`:
+    // the boot-refusal property is only DEFINED for a node whose recovered
+    // config tombstones its own id — i.e. one that won the best-effort race
+    // to see its own removal frame (~5% measured loss). Retry the whole
+    // fixture on a fresh cluster when the race is lost; 3/3 losses is the
+    // regression signal, not a flake.
+    for attempt in 0..3 {
+        if restart_of_removed_node_once() {
+            return;
+        }
+        eprintln!(
+            "attempt {attempt}: removed learner lost the best-effort adoption race; \
+             retrying on a fresh cluster"
+        );
+    }
+    panic!(
+        "removed learner failed to adopt its own removal 3/3 attempts — far past the \
+         measured ~5% best-effort loss rate; adoption delivery has likely regressed"
+    );
+}
+
+/// One full attempt. Returns `false` (after stopping the cluster) if the
+/// removed learner lost the best-effort race to see its own removal frame;
+/// `true` once the tombstone boot refusal is proven.
+fn restart_of_removed_node_once() -> bool {
     let mut c = spawn_cluster(3);
     let leader = await_single_leader(&c.nodes, 20);
     let leader_cnc = open_cnc(&c.nodes[leader].instance_dir);
@@ -1706,9 +1768,15 @@ fn restart_of_removed_node_refuses_to_start() {
     // `recover_config_record`'s T5-carry revert to undo the tombstone on
     // restart (that revert only ever fires for a record ahead of durable).
     let removed_idx = c.nodes.iter().position(|h| h.id == removed_id).unwrap();
-    let deadline = deadline_secs(20);
+    // Best-effort (outer retry contract): bounded window, clean give-up.
+    let deadline = deadline_secs(10);
     while c.nodes[removed_idx].node.config_version() < 2 {
-        assert!(Instant::now() < deadline, "removed learner never adopted its own removal");
+        if Instant::now() >= deadline {
+            for h in c.nodes {
+                h.node.stop();
+            }
+            return false;
+        }
         std::thread::yield_now();
     }
 
@@ -1746,4 +1814,5 @@ fn restart_of_removed_node_refuses_to_start() {
     for h in c.nodes {
         h.node.stop();
     }
+    true
 }
