@@ -127,21 +127,23 @@ impl Journal {
             let mut seg = segment::SegmentFile::open_for_read(&ent.path())?;
             // Only the LAST (active/highest-numbered) segment can have a
             // TORN-BY-CRASH tail — the writer only ever appends past the
-            // current end of the active segment. NOTE: the writer does not
-            // fsync a segment at a roll boundary, so a torn tail is also
-            // reachable, at boot, on the SECOND-to-last segment (the one just
-            // rolled off of when the crash hit) — that residual gap is
-            // real and is a tracked follow-up under separate investigation
-            // (not fixed here; sealed-segment strictness is unchanged by this
-            // fix, see the M11 CRC anomaly investigation and task-2b-report.md
-            // for the boundary this comment is scoped to). Scan the true last
-            // segment tail-tolerantly so a crash mid-`append_records` (a valid
-            // length prefix over a not-yet-visible zeroed body/CRC) heals
-            // through the SAME machinery below instead of hard-erroring
-            // `Journal::open` at boot. Every other segment keeps the strict
-            // `scan()`: a CRC mismatch there is not tail-shaped and must stay
-            // a hard error (genuine corruption of an immutable segment is a
-            // far more serious signal than a live-tail race).
+            // current end of the active segment. A ROLL cannot leave a torn
+            // tail on the segment it just sealed either: the M11 roll-fsync
+            // fix (Task 2c, `writer.rs`'s `write_batch`) fsyncs the outgoing
+            // segment k BEFORE k+1 is ever created, so any crash up through
+            // that fsync still finds k as the LAST segment on disk (k+1
+            // doesn't exist yet — scanned tail-tolerantly, not strictly, by
+            // this very branch), and any crash AFTER it finds k fully
+            // durable. There is no window where a sealed (non-last) segment
+            // can be incomplete via the roll path. Scan the true last
+            // segment tail-tolerantly so a crash mid-`append_records` (a
+            // valid length prefix over a not-yet-visible zeroed body/CRC)
+            // heals through the SAME machinery below instead of
+            // hard-erroring `Journal::open` at boot. Every other (sealed)
+            // segment keeps the strict `scan()`: a CRC mismatch there is not
+            // tail-shaped and must stay a hard error (genuine corruption of
+            // an immutable segment is a far more serious signal than a
+            // live-tail race).
             let is_active = i + 1 == n_entries;
             let scan = if is_active {
                 seg.scan_active_tail_tolerant()?
@@ -616,6 +618,16 @@ impl Journal {
         let dir = st.dir.clone();
         write_truncate_intent(&dir, keep_seq)?;
         apply_truncate_to_segments(&dir, &mut st.segments, keep_seq)?;
+        // Every segment that survives this call was just made durable by
+        // `apply_truncate_to_segments` itself — `SegmentFile::truncate`'s
+        // own `sync_all()` on the boundary segment (the `Some(seg_idx)`
+        // arm), or nothing at all if `keep_seq` fell below every segment's
+        // `base_seq` (the `None` arm empties `st.segments` entirely). A
+        // stale `true` surviving either case — with a possibly-DIFFERENT
+        // (or NO) active segment than whichever one set it — is exactly
+        // the shape that could reach `write_batch`'s seal block with no
+        // current segment to fsync (round-3 fix: that used to panic there).
+        st.active_segment_dirty = false;
         remove_truncate_intent(&dir)?;
 
         // Update in-memory bounds. Anything <= keep_seq survives (on disk or
@@ -676,6 +688,11 @@ impl Journal {
         let dir = st.dir.clone();
         write_truncate_intent(&dir, KEEP_NONE_SENTINEL)?;
         apply_truncate_to_segments(&dir, &mut st.segments, KEEP_NONE_SENTINEL)?;
+        // The keep-none arm always ends with a FRESH segment (`SegmentFile::
+        // create`, which syncs the header + parent dir itself) — nothing
+        // application-level is unfsynced. See `truncate_after`'s identical
+        // clear for the full round-3 rationale.
+        st.active_segment_dirty = false;
         remove_truncate_intent(&dir)?;
 
         st.first_seq = None;
@@ -2255,6 +2272,69 @@ mod tests {
         j.append(6, 0, b"new").unwrap().wait().unwrap();
         j.wait_durable(6).unwrap();
         assert!(j.durable_seq() >= 6);
+    }
+
+    /// ROUND 3 regression (M11 roll-fsync fix review): `active_segment_dirty`
+    /// must not survive a `truncate_after` call that empties `st.segments`
+    /// (`apply_truncate_to_segments`' `None` arm, reached when `keep_seq`
+    /// falls below every segment's `base_seq`). Under `Durability::Eventual`
+    /// with an idle-timer interval set absurdly high (the only OTHER thing
+    /// that would clear the flag pre-fix, deliberately prevented from firing
+    /// during this test), a stale `true` flag with an empty `segments` used
+    /// to reach `write_batch`'s seal block on the VERY NEXT append (which
+    /// re-creates a segment via `need_new`'s `segments.is_empty()` arm) and
+    /// panic on an `.expect` there — killing the writer thread WHILE it held
+    /// the state lock, poisoning the mutex, and leaving that append's
+    /// `Notifier` uncompleted forever (the writer died before ever reaching
+    /// the per-request `signal.complete(...)` loop). Exercises the exact
+    /// repro sequence the reviewer traced: append, truncate_after(keep_seq
+    /// below every base_seq), append again.
+    #[test]
+    fn eventual_truncate_that_empties_segments_does_not_panic_or_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let mut cfg = JournalConfig::new(&dir_path);
+        cfg.durability = crate::Durability::Eventual;
+        // Absurdly high: this test must not let the idle-timer fsync fire
+        // and accidentally mask the bug by clearing the flag itself.
+        cfg.eventual_fsync_interval = std::time::Duration::from_secs(3600);
+
+        let j = Journal::open(cfg.clone()).unwrap();
+        // Buffered write under Eventual: sets active_segment_dirty, resolves
+        // its Notifier at the write, never fsyncs.
+        j.append(1, 0, b"first").unwrap().wait().unwrap();
+
+        // keep_seq(0) is below the only segment's base_seq(1) — the `None`
+        // arm of `apply_truncate_to_segments`, which empties `st.segments`.
+        j.truncate_after(0).unwrap().wait().unwrap();
+        assert_eq!(j.last_seq(), None);
+
+        // The next append re-creates a segment via `need_new`'s
+        // `segments.is_empty()` arm — pre-fix, this is exactly where the
+        // writer thread used to panic on the stale flag.
+        let notifier = j.append(1, 0, b"second").unwrap();
+        // Bounded wait on a background thread: pre-fix, the writer thread
+        // panicked WHILE holding the state lock and never completed this
+        // Notifier, so a direct `notifier.wait()` would hang the whole test
+        // suite rather than just failing this test. A real timeout turns a
+        // hang into a clean, fast test failure instead.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(notifier.wait());
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
+            "wait() must not hang — the writer thread must not have panicked \
+             on the stale active_segment_dirty flag",
+        );
+        result.unwrap();
+
+        assert_eq!(j.last_seq(), Some(1));
+        drop(j);
+
+        // The new record must be durable and readable after a reopen.
+        let j2 = Journal::open(cfg).unwrap();
+        assert_eq!(j2.last_seq(), Some(1));
+        assert_eq!(j2.read(1).unwrap().unwrap().1, b"second".to_vec());
     }
 
     /// Appends still queued in the writer channel when `truncate_after` runs

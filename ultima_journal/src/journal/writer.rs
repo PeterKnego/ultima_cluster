@@ -561,22 +561,40 @@ fn write_batch(
             // current serial path, where every batch's own fsync (Consistent)
             // already clears the flag before the next batch ever runs.
             if st.active_segment_dirty {
-                // `write_batch` holds `st` for its whole body (unlike
-                // `fsync_active_segment`, which drops the lock before the
-                // syscall) — this fsync therefore briefly blocks other
-                // `append()` callers, but it fires at most once per
-                // `segment_size_bytes` of throughput (a roll), never per
-                // commit, matching the investigation's "at most one extra
-                // fdatasync per segment roll" cost accounting.
-                let sealed = st
-                    .segments
-                    .last()
-                    .expect("active_segment_dirty implies a current segment exists");
-                sealed.fsync_handle()?.sync_data().map_err(JournalError::Io)?;
-                #[cfg(test)]
-                {
-                    let p = sealed.path().to_path_buf();
-                    st.seal_fsync_log.push(p);
+                // `active_segment_dirty` can be stale-true with NO current
+                // segment: `apply_truncate_to_segments`' None arm (keep_seq
+                // below every base_seq) empties `st.segments` without
+                // touching the flag, reachable via a live `truncate_after`/
+                // `truncate_all` call between two batches — round-3 fix
+                // review found this reachable under Eventual (nothing else
+                // clears it) and even under Consistent (the window between
+                // `write_batch` returning and the caller's
+                // `fsync_active_segment` running). An `.expect` here used to
+                // panic on that — killing the writer thread MID-BATCH while
+                // holding this very lock, poisoning it, and hanging every
+                // future `wait()` forever. `if let` degrades to "nothing to
+                // seal, just clear the stale flag" instead — safe, since (b)
+                // and (c) below (`truncate_after`/`truncate_all`,
+                // `fsync_active_segment`) now also clear this flag whenever
+                // they legitimately empty or otherwise cover `segments`, so
+                // reaching here with `segments` empty should not happen in
+                // practice either; this is the fail-safe, not the primary
+                // fix.
+                if let Some(sealed) = st.segments.last() {
+                    // `write_batch` holds `st` for its whole body (unlike
+                    // `fsync_active_segment`, which drops the lock before
+                    // the syscall) — this fsync therefore briefly blocks
+                    // other `append()` callers, but it fires at most once
+                    // per `segment_size_bytes` of throughput (a roll),
+                    // never per commit, matching the investigation's "at
+                    // most one extra fdatasync per segment roll" cost
+                    // accounting.
+                    sealed.fsync_handle()?.sync_data().map_err(JournalError::Io)?;
+                    #[cfg(test)]
+                    {
+                        let p = sealed.path().to_path_buf();
+                        st.seal_fsync_log.push(p);
+                    }
                 }
                 st.active_segment_dirty = false;
             }
@@ -677,13 +695,20 @@ fn fsync_active_segment(state: &Arc<Mutex<WriterState>>) -> Result<(), JournalEr
         // retained on segment create (segment.rs) where the new directory
         // entry must be made durable.
         f.sync_data().map_err(JournalError::Io)?;
-        // This fsync covers whatever is currently the active segment — the
-        // writer thread that could have written more to it is the SAME
-        // thread executing this fsync, so nothing raced the syscall. Clear
-        // the dirty flag so a later roll's fsync-on-seal (`write_batch`)
-        // correctly sees "already durable" and skips the redundant work.
-        state.lock().unwrap().active_segment_dirty = false;
     }
+    // Clear the dirty flag REGARDLESS of whether there was an active
+    // segment to fsync — not just inside the `if let Some(f)` arm. If
+    // `segments` is empty (e.g. a live `truncate_after`/`truncate_all` ran
+    // between the write that set the flag and this call — see
+    // `apply_truncate_to_segments`' None arm), there is nothing to fsync,
+    // but the flag must still not be left stranded `true`: a stale `true`
+    // with an empty `segments` is exactly the shape that used to reach
+    // `write_batch`'s seal block and panic on a `.expect` there (round-3
+    // fix). When there WAS an active segment, this fsync covers whatever
+    // it currently is — the writer thread that could have written more to
+    // it is the SAME thread executing this fsync, so nothing raced the
+    // syscall — so clearing here is correct either way.
+    state.lock().unwrap().active_segment_dirty = false;
     Ok(())
 }
 

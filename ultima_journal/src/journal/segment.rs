@@ -439,9 +439,24 @@ impl SegmentFile {
     pub(crate) fn has_nonzero_residue_from(&self, from: u64) -> Result<bool, JournalError> {
         let mut f = self.file.try_clone()?;
         f.seek(SeekFrom::Start(from))?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
-        Ok(buf.iter().any(|&b| b != 0))
+        // Read in bounded chunks and return the instant a non-zero byte is
+        // found, rather than allocating + reading the WHOLE tail (up to a
+        // full `segment_size_bytes`, e.g. 64 MiB) into one `Vec` up front.
+        // The real torn-tail shape this guards puts its non-zero bytes right
+        // at the START of this range (a partial in-flight record), so the
+        // early exit is the common case for an ACTUAL heal; the all-zero
+        // (nothing to do) case still has to read to EOF, but in bounded
+        // ~1 MiB steps rather than one large allocation.
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                return Ok(false); // reached EOF, every byte read was zero
+            }
+            if buf[..n].iter().any(|&b| b != 0) {
+                return Ok(true);
+            }
+        }
     }
 
     /// Physically fill from the logical cursor `self.size` out to `total_len`
