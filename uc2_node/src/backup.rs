@@ -36,34 +36,18 @@
 //! `a_wrong_order_copy_across_a_purge_is_detected_as_a_hole` in
 //! `uc2_node/tests/backup.rs`, the anti-vacuity test for this whole module.
 //!
-//! HONESTY NOTE on that test's reach: it hand-builds a broken artifact to
-//! prove the coverage invariant is a real check, but neither it nor
-//! `ordered_backup_never_produces_a_hole_under_purge_churn` races a live
-//! purge against an in-flight `backup_instance` copy (the churn test's purge
-//! wait always completes before the next `backup_instance` call starts). So
-//! the *ordering enforcement inside `backup_instance` itself* — as opposed to
-//! the invariant `verify_artifact` checks — currently rests on code
-//! inspection (journal-then-state-then-snapshots, each directory copied
-//! fully before the next starts) plus the hand-built proxy, not on a test
-//! that reverses the order under real concurrent purge pressure.
-//!
-//! A genuine attempt was made at the stronger racy version (background
-//! submit + snapshot-publish + purge racing 5 sequential `backup_instance`
-//! calls with no quiescence wait). It failed reproducibly (~1-in-3 runs) —
-//! but with `Io(NotFound)`, not `Hole`: `copy_dir_sorted` lists a directory
-//! once, then copies each listed name, so a concurrent purge or snapshot
-//! retention that unlinks an already-listed file before its `fs::copy` runs
-//! fails the whole backup. That is a real, separate, narrow race
-//! (`journal/`'s purge and `snapshots/`'s keep-newest-2 retention both delete
-//! files under a live node) — but tolerating it safely needs deliberate
-//! stop-at-first-gap handling (blindly skipping a vanished file risks a real
-//! GAP in the middle of the copied journal, not just a later start), not a
-//! quick patch, so it was not folded into this fix and the racy test was not
-//! kept (a test that fails 1-in-3 for a reason unrelated to what it's meant
-//! to prove is not a usable regression guard). See
-//! `uc2_node/tests/backup.rs`'s comment near
-//! `ordered_backup_never_produces_a_hole_under_purge_churn` for the same note
-//! in context.
+//! `a_wrong_order_copy_across_a_purge_is_detected_as_a_hole` hand-builds a
+//! broken artifact to prove the coverage invariant is a real check, and
+//! `ordered_backup_survives_a_purge_racing_the_copy` races a live purge
+//! against an in-flight `backup_instance` copy directly (background submit +
+//! snapshot-publish + purge, repeated `backup_instance` calls with no
+//! quiescence wait) — every artifact must still verify. That test's first
+//! version (before [`copy_dir_sorted`]'s whole-directory retry existed)
+//! failed reproducibly ~1-in-3 runs, but never with `Hole` — with
+//! `Io(NotFound)`: a concurrent purge or snapshot-retention unlink racing an
+//! already-listed file's `fs::copy`. See [`copy_dir_sorted`]'s doc for the
+//! fix (retry the whole directory, bounded) and why a per-file skip is
+//! unsafe (a mid-journal gap the coverage check cannot see).
 //!
 //! # Read-only beyond the one permitted heal
 //!
@@ -93,6 +77,11 @@ const SNAP_PREFIX: &str = "snap-";
 const SNAP_SUFFIX: &str = ".ultsnap";
 
 const MANIFEST_FORMAT: &str = "uc2-backup-v1";
+
+/// Bounded retry count for [`copy_dir_sorted`]'s whole-directory retry on a
+/// vanished source file. See that function's doc for why bounded and why a
+/// FULL-directory retry rather than a per-file skip.
+const MAX_COPY_RETRIES: usize = 5;
 
 /// The result of a backup or a verify: the artifact's recovered positions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +177,87 @@ fn parse_snap_pos(name: &str) -> Option<u64> {
 /// journal segment (the highest `seg-{:020}.log` name) copies last within
 /// `journal/` — no special-casing needed, the fixed-width zero-padded name
 /// already sorts it there.
-fn copy_dir_sorted(src: &Path, dst: &Path, keep: impl Fn(&str) -> bool) -> io::Result<usize> {
+///
+/// # Retrying the WHOLE directory on a vanished source file
+///
+/// `src` may be live under our feet: `journal/`'s purge and `snapshots/`'s
+/// keep-newest-2 retention both unlink files while the node keeps running,
+/// and a backup taken under load races both by design (this module's whole
+/// premise). If a file we already listed vanishes before its `fs::copy` runs
+/// (`io::ErrorKind::NotFound`), this does NOT skip just that name and
+/// continue — it discards the whole partial copy of `dst`
+/// (`fs::remove_dir_all`) and re-lists + re-copies `src` from scratch, up to
+/// [`MAX_COPY_RETRIES`] times.
+///
+/// A per-file skip is unsafe: purge unlinks a CONTIGUOUS run of segments in
+/// one call, but this loop and purge's removal loop are two independent,
+/// unsynchronized passes over the same directory, so a file mid-run can
+/// vanish while an EARLIER name (already copied) and a LATER name (not yet
+/// reached) both survive — a copy with segment N present, N+1..N+5 missing,
+/// N+6 present: a GAP in the middle of the journal. `Journal::open` cannot
+/// detect this (it derives `first_seq`/`last_seq` from whatever segment
+/// files exist, without checking they're contiguous), and neither can
+/// `verify_artifact`'s coverage-invariant hole check (it only looks at the
+/// FIRST retained segment's base against the newest snapshot) — so a
+/// mid-journal gap would silently verify clean and only surface as a missing
+/// range on replay, arbitrarily later. Restarting the WHOLE directory copy
+/// avoids this by construction: whatever set of files we successfully copy
+/// on a given attempt is exactly what `src` looked like at some single
+/// instant during that attempt (modulo the same live-tail-of-the-active-
+/// segment behavior any single copy already tolerates), never a splice of
+/// two different instants.
+///
+/// A retried copy is equivalent to having simply started that part of the
+/// backup a little LATER — which the ordering rule (module doc) already
+/// covers: `first_base` only ever advances (purge) and the newest retained
+/// snapshot position only ever advances (atomic publish, keep-newest-2), so
+/// a later start can only make the coverage invariant easier to satisfy, not
+/// harder. Retries are bounded (not unbounded) because purge/retention
+/// cadence tracks SNAPSHOT cadence — orders of magnitude slower than copying
+/// a handful of files — so a real race resolves within a retry or two;
+/// exhausting [`MAX_COPY_RETRIES`] points at something else being wrong (a
+/// permanently missing/renamed source, e.g.), which is surfaced as a loud
+/// error naming the directory and the attempt count rather than retried
+/// forever.
+///
+/// Applies uniformly to all three directories, including `state/` — nothing
+/// ever unlinks a `state/*.state` file, so the retry path is simply dead
+/// code there (a real `NotFound` under `state/` — e.g. the file never
+/// existed — surfaces immediately as an `Io` error on the FIRST attempt's
+/// very first `fs::copy`, before any retry logic even runs, since
+/// `looks_like_instance_layout` already validated the source has all five
+/// files before any copying starts).
+fn copy_dir_sorted(
+    src: &Path,
+    dst: &Path,
+    keep: impl Fn(&str) -> bool,
+) -> Result<usize, BackupError> {
+    let mut last_err: Option<io::Error> = None;
+    for _attempt in 1..=MAX_COPY_RETRIES {
+        match copy_dir_sorted_once(src, dst, &keep) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let _ = fs::remove_dir_all(dst);
+                last_err = Some(e);
+            }
+            Err(e) => return Err(BackupError::Io(e)),
+        }
+    }
+    Err(BackupError::Io(io::Error::other(format!(
+        "{}: a source file kept vanishing (likely a live purge/retention unlink racing the \
+         copy) across {MAX_COPY_RETRIES} attempts; last error: {}",
+        src.display(),
+        last_err.map(|e| e.to_string()).unwrap_or_default(),
+    ))))
+}
+
+/// One attempt at [`copy_dir_sorted`]'s job — no retry, no partial-copy
+/// cleanup on failure (the caller owns both).
+fn copy_dir_sorted_once(
+    src: &Path,
+    dst: &Path,
+    keep: &impl Fn(&str) -> bool,
+) -> io::Result<usize> {
     fs::create_dir_all(dst)?;
     let mut names: Vec<String> = fs::read_dir(src)?
         .filter_map(|e| e.ok())

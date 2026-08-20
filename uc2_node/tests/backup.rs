@@ -305,46 +305,99 @@ fn ordered_backup_never_produces_a_hole_under_purge_churn() {
     node.stop();
 }
 
-// ------------------------------------------------- fix round 1, IMPORTANT item
+// ------------------------------------------------- fix round 2: shipped racer
 //
 // The churn test above never races a live purge against an in-flight
 // `backup_instance` copy — its purge-and-wait always completes before the
-// next `backup_instance` call starts, so the ordering enforcement inside
-// `backup_instance` (as opposed to the coverage invariant `verify_artifact`
-// checks) rests on inspection + test 3's hand-built proxy, not on a test that
-// reverses the order under real concurrent purge pressure.
+// next `backup_instance` call starts, so it alone never exercised the
+// `copy_dir_sorted` vanished-file race a real backup-under-purge can hit.
 //
-// GENUINE ATTEMPT MADE at the stronger version: a background thread
-// submitting continuously and periodically publishing a fresh snapshot +
-// advancing the purge marker, racing 5 sequential `backup_instance` calls
-// with NO quiescence wait between them (so a purge could land mid-copy).
-// It reproducibly failed — but NOT with a `Hole` (the property this task
-// cares about). Two distinct, unrelated failure modes showed up depending on
-// timing:
-//
-//   1. (before the healed_torn_tail manifest fix, see backup.rs) a spurious
-//      `ManifestMismatch` — unrelated to concurrency, fixed separately.
-//   2. `Io(NotFound)` from `backup_instance`, ~5/15 runs (~33%): a real race
-//      in `copy_dir_sorted`, which lists a directory once then copies each
-//      listed name — if a concurrent purge (`journal/`) or snapshot
-//      retention (`snapshots/`) unlinks a file AFTER it was listed but
-//      BEFORE its `fs::copy` runs, the copy fails with `NotFound`.
-//
-// (2) is a real, narrow gap, but tolerating it safely is non-trivial: purge
-// only ever drops a CONTIGUOUS prefix of segments, but `copy_dir_sorted`
-// copies in the same low-to-high order purge deletes in, so silently
-// skipping a vanished file risks leaving an actual GAP in the middle of the
-// copied journal (file N deleted mid-copy while file N+1, already unlinked
-// from the delete batch's perspective too, might momentarily still be
-// present and get copied) rather than the safe "copy simply starts later"
-// outcome a clean skip-of-the-oldest would give. That needs deliberate
-// stop-at-first-gap handling, not a quick tolerate-NotFound patch — flagging
-// as a follow-up rather than folding into this round, per the review's own
-// escape hatch for a racy test that proves flaky for reasons unrelated to
-// what it's meant to prove. The racy test itself was therefore NOT kept in
-// this suite (a test that fails 1-in-3 for an unrelated reason is not a
-// usable regression guard); this comment plus the module doc's own honesty
-// note are the fix for this item.
+// A first attempt at the stronger version (before `copy_dir_sorted` retried
+// a whole directory on a vanished file, see `uc2_node/src/backup.rs`) failed
+// reproducibly ~1-in-3 runs with `Io(NotFound)`: a concurrent purge
+// (`journal/`) or snapshot-retention unlink (`snapshots/`) racing an
+// already-listed file's `fs::copy`. That was the RED evidence for the fix
+// (retry the whole directory, bounded — see `copy_dir_sorted`'s doc for why
+// a per-file skip is unsafe). This is the fixed, GREEN version of that same
+// test, now shipped as a real regression guard: background submit +
+// snapshot-publish + purge-marker loop running DURING repeated
+// `backup_instance` calls with no quiescence wait, so a purge can genuinely
+// land mid-copy. Every artifact must still verify Ok.
+#[test]
+fn ordered_backup_survives_a_purge_racing_the_copy() {
+    let root = scratch();
+    let dir = root.path().join("n0");
+    let app = "backup9";
+
+    let node = start_node(&dir, app, PurgePolicy::BelowSnapshot { slack_bytes: 0 });
+    drive_and_quiesce(&node, 3000);
+
+    let stop = AtomicBool::new(false);
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    let cnc = open_cnc(&dir, app);
+    let store = SnapshotStore::open(&dir).expect("open snapshot store");
+
+    std::thread::scope(|scope| {
+        let _guard = StopOnDrop(&stop);
+
+        // Background: submit continuously, and every 400 submits publish a
+        // fresh snapshot near the current durable frontier and advance the
+        // purge marker — driving genuine, ongoing purge/retention unlinks in
+        // both journal/ and snapshots/ throughout the whole scope.
+        scope.spawn(|| {
+            let mut i: u64 = 0;
+            let mut next_publish_at = 400u64;
+            while !stop.load(Ordering::Relaxed) {
+                let mut p = vec![0u8; 64];
+                p[..8].copy_from_slice(&i.to_le_bytes());
+                let _ = node.submit(p);
+                i += 1;
+                if i >= next_publish_at {
+                    next_publish_at = i + 400;
+                    let durable = cnc.counters().durable.load_acquire();
+                    if durable > SEG_BYTES {
+                        let pos = durable.saturating_sub(SEG_BYTES / 2).max(1);
+                        if store.publish(pos, |w| Ok(w.write_all(b"race-snapshot")?)).is_ok() {
+                            cnc.snapshots().service_snapshot_pos.store_release(pos);
+                        }
+                    }
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        for cycle in 0..5u32 {
+            // Deliberately no quiescence/purge wait here: the background
+            // thread's submits and purges are free to land during the copy.
+            let out = root.path().join(format!("backup9-out-{cycle}"));
+            let report = backup_instance(&dir, &out).unwrap_or_else(|e| {
+                panic!("backup_instance failed under a live purge race on cycle {cycle}: {e}")
+            });
+            assert!(report.files > 0);
+            // Coherence sanity check on a report that may have come from a
+            // retried (whole-directory-restarted) copy: the recovered
+            // durable frontier can never be below the recovered floor.
+            assert!(
+                report.journal_last_pos >= report.journal_first_base,
+                "incoherent report on cycle {cycle}: journal_last_pos {} < \
+                 journal_first_base {}",
+                report.journal_last_pos,
+                report.journal_first_base
+            );
+            verify_artifact(&out).unwrap_or_else(|e| {
+                panic!("verify_artifact failed under a live purge race on cycle {cycle}: {e}")
+            });
+        }
+    });
+
+    node.stop();
+}
 
 // ---------------------------------------------------------------------- Test 5
 
