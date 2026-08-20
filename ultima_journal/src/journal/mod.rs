@@ -84,6 +84,12 @@ pub struct Journal {
     writer: Mutex<Option<Writer>>,
     /// Fsync-durable sequence watermark (task28).
     durability: Arc<SeqWatermark>,
+    /// Whether `open()` found (and healed) a torn active-segment tail on ANY
+    /// segment scanned — an incomplete/garbage record left by a process that
+    /// died mid-write. Healing (rewind the cursor to the last durable record)
+    /// always happens; this flag lets a caller (uc2_node's offline backup
+    /// verify, M11) REPORT that it happened without re-deriving the scan.
+    healed_torn_tail: bool,
 }
 
 impl Journal {
@@ -115,10 +121,12 @@ impl Journal {
 
         // Phase 1: open each segment, fix any torn tail, collect (SegmentFile, ScanResult).
         let mut segments_with_scan: Vec<(segment::SegmentFile, segment::ScanResult)> = Vec::new();
+        let mut healed_torn_tail = false;
         for ent in entries {
             let mut seg = segment::SegmentFile::open_for_read(&ent.path())?;
             let scan = seg.scan()?;
             let scan = if scan.had_torn_tail {
+                healed_torn_tail = true;
                 if config.preallocate_segments {
                     // Preserve the physical zero tail; only rewind the logical
                     // cursor to the last durable record. The writer resumes
@@ -262,6 +270,7 @@ impl Journal {
             state,
             writer: Mutex::new(Some(writer)),
             durability,
+            healed_torn_tail,
         })
     }
 
@@ -271,6 +280,12 @@ impl Journal {
 
     pub fn last_seq(&self) -> Option<u64> {
         self.state.lock().unwrap().last_seq
+    }
+
+    /// Whether `open()` found and healed a torn active-segment tail (see the
+    /// field doc). `false` for a clean recovery.
+    pub fn healed_torn_tail(&self) -> bool {
+        self.healed_torn_tail
     }
 
     /// Highest seq known to be fsync-durable (task28).
