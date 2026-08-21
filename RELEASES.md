@@ -9,11 +9,11 @@ analyses, wire-version mechanics, upgrade remedies — is
 
 ## Unreleased — v2.5.0 pending — survivable cluster (M11)
 
-Merged on `main`; every gate row now passes (fleet flag-day downtime 14.0 s
-and 14.7 s against a 60 s bar; true-`ENOSPC` proven against a real loopback
-fixture after the fixes described below). Nightly's independent confirmation
-of the `ENOSPC` row is the last thing outstanding before the tag. Full
-record, including two honest FAILs and what they exposed:
+Merged on `main`; **every gate row passes**, with the fleet flag-day row
+measured at 14.0 s and 14.7 s against a 60 s bar and the true-`ENOSPC` row
+confirmed independently by CI's sudo `survival` job against a real loopback
+fixture. Full record, including the honest FAILs on the way and what they
+exposed:
 [gate record](docs/benchmarks/uc2-m11-gate-2026-08-20.md). Design deep-dive:
 [M11 explained](docs/notes/uc2-m11-survivable-cluster-explained.md).
 

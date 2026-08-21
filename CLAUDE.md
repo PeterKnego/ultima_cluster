@@ -87,8 +87,9 @@ path — now `fallocate(ZERO_RANGE)` reserves blocks up front, which costs
 startup refusal (same answer Aeron reaches via
 `aeron.term.buffer.sparse.file` + `aeron.perform.storage.checks`); (2)
 `ultima_journal`'s segment preallocator discarded the errno, so a full disk
-fail-stopped saying only "segment preallocation failed". `v2.5.0` tags once
-nightly independently confirms 3b**: offline
+fail-stopped saying only "segment preallocation failed". Nightly
+32491691229 (all 9 jobs green, `survival` included) is the independent
+confirmation; `v2.5.0` is ready to tag**: offline
 `uc2ctl backup / verify-backup / restore` (ordered-copy artifact, verify
 asserts the purge-straddle coverage invariant, under-load-safe incl. purge
 races, refuses a live instance dir) with the backed-up-under-load →
