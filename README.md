@@ -42,7 +42,8 @@ detection-timing confirmation is still outstanding.
 
 **Status: v2.4.0** — milestones M1–M10 complete: the consensus core and SDK
 (M1–M6), live reconfiguration (M7), opt-in wire crypto (M8), the deployable
-`uc2-node` daemon (M9), and the observability layer (M10).
+`uc2-node` daemon (M9), and the observability layer (M10). What each release
+introduced, with links to the detailed docs: **[RELEASES.md](/RELEASES.md)**.
 
 | Gate | Result | Measured on |
 |---|---|---|
@@ -170,6 +171,8 @@ suite (capstones, sim-heavy, loom, crashtest).
 
 Start here:
 
+- **[RELEASES.md](/RELEASES.md)** — what each release introduced, feature by
+  feature, with links to the detailed doc for each.
 - **[API documentation](https://peterknego.github.io/ultima_cluster/)** — rustdoc
   for every library crate, rebuilt on each push to `main`.
 - **[`docs/QUICKSTART.md`](/docs/QUICKSTART.md)** — zero to a running three-node
@@ -205,38 +208,12 @@ Bench/fleet tooling lives under [`bench-infra/`](/bench-infra) (terraform +
 ansible + the fleet-gate orchestrator; refuses to run journal-bearing gates on
 RAM-backed filesystems).
 
-## Scope (v2.4)
+## Scope
 
-**Observability (M10)**: an in-daemon `/metrics` + `/healthz` + `/readyz`
-endpoint over the shared-memory control page (enabled by the `[metrics]`
-config section, off when absent; Prometheus text format — any collector that
-scrapes it works), transition-triggered structured JSON logging, and shipped
-alert rules + a Grafana dashboard, every rule proven to fire. Readiness keys
-on `can_serve`, never the bare leader flag. See
-[Monitor a cluster](/docs/how-to/monitor-a-cluster.md).
-
-**Deployable node (M9)**: a real `uc2-node` daemon started from a TOML config
-file with named startup refusals (a typo or a semantic mistake refuses at boot
-naming the field, instead of failing later looking like something else), clean
-`SIGTERM` drain-and-stop so restarts replay a journal tail instead of paying
-reconstruction, and packaged systemd units. See
-[Run a cluster on real hosts](/docs/how-to/run-a-cluster.md).
-
-**Wire security (M8)**: authenticated + encrypted node↔node UDP is available and
-**off by default** — X25519 identities on a runtime-reloadable allowlist, Noise
-`IK` handshake, a rotating cluster group key for the byte-identical fan-out,
-24 B/datagram overhead. A cluster runs either all-encrypted or all-cleartext;
-there is no mixed mode. With crypto disabled the posture is a trusted private
-network. The threat model is a network-path adversary; a compromised host and a
-malicious cluster member are explicitly out of model (see
-[`docs/VERIFICATION.md`](/docs/VERIFICATION.md) §10 and runbook §11).
-
-**Dynamic membership (M7)**: single-server reconfiguration is shipped —
-promote / demote / add / remove one member at a time, live, under load, via
-the `uc2ctl` admin CLI. Joint consensus is not needed for the supported ops
-(adjacent configs differ by one member, so majorities always intersect). Hard
-cap: **8 total members** (voters + learners) in the cnc observability band —
-unchanged from v2.0. One node per instance directory.
+What is shipped, release by release — each feature with a link to its
+detailed doc — lives in **[RELEASES.md](/RELEASES.md)**. Standing limits:
+hard cap **8 total members** (voters + learners); one node per instance
+directory; wire crypto and journal purge are **off by default**.
 
 ## License
 

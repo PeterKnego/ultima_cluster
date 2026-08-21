@@ -331,6 +331,25 @@ plan; there is **no `docs/tasks/` consolidation** for v2 (that pattern was v1-er
 a feature — they are retained as historical scaffolding; the maintainer removes
 them manually if ever.
 
+## Release documentation (required for every release)
+
+The root **`RELEASES.md`** is the user-facing release document; `docs/releases.md`
+is the deep per-release engineering record behind it. **Every new release adds a
+new section at the top of `RELEASES.md`** (latest first), structured as:
+
+1. one bullet per **feature**, briefly explained, each linking to a separate
+   detailed doc (how-to / reference / `docs/notes/` explainer) — **write the
+   detailed doc if it does not exist yet**;
+2. one optional bullet for **fixed bugs**, with links to the docs that cover
+   them (if they exist);
+3. one optional bullet for **performance** results, with links to the gate /
+   benchmark docs (if they exist).
+
+Do this — plus the matching `docs/releases.md` entry and a sweep of
+QUICKSTART / how-to / reference for statements the release invalidated —
+**before tagging**, so the tag contains the writeup. README's Scope section
+stays a pointer to `RELEASES.md`, not a parallel prose copy.
+
 ## Pointers to dependent crates
 
 - `ultima_journal/` — segmented append journal + `StableValue`. In-tree workspace
