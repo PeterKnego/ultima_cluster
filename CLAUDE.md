@@ -73,8 +73,14 @@ leader-authoritative (followers export zeros). Gate doc:
 `docs/benchmarks/uc2-m10-gate-2026-08-20.md`; operator docs:
 `docs/how-to/monitor-a-cluster.md`.
 
-**M11 (survivable cluster) is merged; fleet flag-day row + true-ENOSPC CI
-evidence pending (`v2.5.0` tags when they land)**: offline
+**M11 (survivable cluster) is merged; the fleet flag-day row PASSED
+2026-08-21 (4-host fleet, downtime 14.0 s / 14.7 s vs a 60 s bar, driver
+`bench-infra/scripts/m11_fleet_gate.py`), and true-ENOSPC evidence is RED —
+nightly's `survival` job ran it for the first time and it FAILED: the test's
+single serial CAS writer moves ~15 KB/s, so the fixture's 8 MiB headroom
+needs ~550 s to exhaust against a 60 s bound. Fix the test (measured
+headroom / explicit post-warm-up ballast / longer bound), not the bar.
+`v2.5.0` tags when 3b is green**: offline
 `uc2ctl backup / verify-backup / restore` (ordered-copy artifact, verify
 asserts the purge-straddle coverage invariant, under-load-safe incl. purge
 races, refuses a live instance dir) with the backed-up-under-load →

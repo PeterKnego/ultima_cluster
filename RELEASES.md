@@ -9,8 +9,12 @@ analyses, wire-version mechanics, upgrade remedies — is
 
 ## Unreleased — v2.5.0 pending — survivable cluster (M11)
 
-Merged on `main`; the tag waits on the remaining gate rows (fleet flag-day
-measurement, CI true-ENOSPC evidence). Design deep-dive:
+Merged on `main`. The fleet flag-day row **passed** on 2026-08-21 (measured
+downtime 14.0 s and 14.7 s across two runs, against a 60 s bar); the tag now
+waits on the last gate row, true-`ENOSPC` evidence, whose first real CI run
+FAILED — the test cannot induce the fault inside its own 60 s bound (see the
+[gate record](docs/benchmarks/uc2-m11-gate-2026-08-20.md), row 3b amendment).
+Design deep-dive:
 [M11 explained](docs/notes/uc2-m11-survivable-cluster-explained.md).
 
 - **Offline backup, verify, and restore** (`uc2ctl backup / verify-backup /
