@@ -73,14 +73,22 @@ leader-authoritative (followers export zeros). Gate doc:
 `docs/benchmarks/uc2-m10-gate-2026-08-20.md`; operator docs:
 `docs/how-to/monitor-a-cluster.md`.
 
-**M11 (survivable cluster) is merged; the fleet flag-day row PASSED
-2026-08-21 (4-host fleet, downtime 14.0 s / 14.7 s vs a 60 s bar, driver
-`bench-infra/scripts/m11_fleet_gate.py`), and true-ENOSPC evidence is RED —
-nightly's `survival` job ran it for the first time and it FAILED: the test's
-single serial CAS writer moves ~15 KB/s, so the fixture's 8 MiB headroom
-needs ~550 s to exhaust against a 60 s bound. Fix the test (measured
-headroom / explicit post-warm-up ballast / longer bound), not the bar.
-`v2.5.0` tags when 3b is green**: offline
+**M11 (survivable cluster) is merged; ALL gate rows now PASS — the fleet
+flag-day row 2026-08-21 (4-host fleet, downtime 14.0 s / 14.7 s vs a 60 s
+bar, driver `bench-infra/scripts/m11_fleet_gate.py`) and true-ENOSPC against
+a real loopback fixture. Getting 3b green took a test fix (an explicit
+post-warm-up squeeze — the single serial CAS writer moves ~15 KB/s, so the
+old 8 MiB headroom needed ~550 s against a 60 s bound) and then TWO PRODUCT
+fixes it exposed: (1) the mmapped IPC files were sparse
+(`create_shared_backing_file` punched holes), so a full disk killed whichever
+process touched an unbacked page with SIGBUS instead of taking the fail-stop
+path — now `fallocate(ZERO_RANGE)` reserves blocks up front, which costs
+~78 MiB reserved per default instance dir and turns a full disk into a named
+startup refusal (same answer Aeron reaches via
+`aeron.term.buffer.sparse.file` + `aeron.perform.storage.checks`); (2)
+`ultima_journal`'s segment preallocator discarded the errno, so a full disk
+fail-stopped saying only "segment preallocation failed". `v2.5.0` tags once
+nightly independently confirms 3b**: offline
 `uc2ctl backup / verify-backup / restore` (ordered-copy artifact, verify
 asserts the purge-straddle coverage invariant, under-load-safe incl. purge
 races, refuses a live instance dir) with the backed-up-under-load →

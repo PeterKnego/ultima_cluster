@@ -9,12 +9,12 @@ analyses, wire-version mechanics, upgrade remedies — is
 
 ## Unreleased — v2.5.0 pending — survivable cluster (M11)
 
-Merged on `main`. The fleet flag-day row **passed** on 2026-08-21 (measured
-downtime 14.0 s and 14.7 s across two runs, against a 60 s bar); the tag now
-waits on the last gate row, true-`ENOSPC` evidence, whose first real CI run
-FAILED — the test cannot induce the fault inside its own 60 s bound (see the
-[gate record](docs/benchmarks/uc2-m11-gate-2026-08-20.md), row 3b amendment).
-Design deep-dive:
+Merged on `main`; every gate row now passes (fleet flag-day downtime 14.0 s
+and 14.7 s against a 60 s bar; true-`ENOSPC` proven against a real loopback
+fixture after the fixes described below). Nightly's independent confirmation
+of the `ENOSPC` row is the last thing outstanding before the tag. Full
+record, including two honest FAILs and what they exposed:
+[gate record](docs/benchmarks/uc2-m11-gate-2026-08-20.md). Design deep-dive:
 [M11 explained](docs/notes/uc2-m11-survivable-cluster-explained.md).
 
 - **Offline backup, verify, and restore** (`uc2ctl backup / verify-backup /
@@ -28,10 +28,20 @@ Design deep-dive:
   before anything is written. →
   [Recover from quorum loss](docs/how-to/recover-from-quorum-loss.md)
 - **Full-disk fail-stop, observed end-to-end**: a node that hits the disk wall
-  halts loudly instead of acking writes it cannot persist; a new
-  `uc2_free_disk_bytes` metric and the `Uc2DiskLow` alert give the operator
-  the early signal. →
-  [Monitor a cluster](docs/how-to/monitor-a-cluster.md)
+  halts loudly instead of acking writes it cannot persist, naming the errno
+  (`StorageFull` / `os error 28`) so the operator knows to free space; a new
+  `uc2_free_disk_bytes` metric and the `Uc2DiskLow` alert give the early
+  signal before the wall. Proving this end-to-end exposed two real defects,
+  both fixed here: the node's mmapped IPC files were sparse, so a full disk
+  killed whichever process (node, service, or client) next touched an
+  unbacked page with `SIGBUS` — bypassing the fail-stop path entirely — and
+  the journal's segment preallocator discarded the underlying errno, so even
+  a correct fail-stop said only "segment preallocation failed". **Operational
+  consequence:** those files now reserve their blocks at startup, so a
+  default instance dir needs ~78 MiB free before a node will boot, and a node
+  that cannot reserve it refuses to start with a named error. →
+  [Monitor a cluster](docs/how-to/monitor-a-cluster.md) ·
+  [gate record, row 3b](docs/benchmarks/uc2-m11-gate-2026-08-20.md)
 - **Measured flag-day upgrades** (`scripts/uc2_flag_day.sh`): the
   stop-all/upgrade/start-all procedure as a script with preflight refusals,
   an un-upgrade path, and a printed downtime number. →

@@ -33,6 +33,40 @@ struct Shared {
 struct Slot {
     ready: Option<PathBuf>,
     failed: bool,
+    /// WHY the preallocation failed, kept so every waiter can be told.
+    ///
+    /// `io::Error` is not `Clone` and several callers may each need to be
+    /// handed the failure, so the parts are stored and the error rebuilt per
+    /// caller. Dropping this (the original code substituted a flat
+    /// `Error::other("segment preallocation failed")`) costs the operator the
+    /// only thing they can act on: a full disk fail-stopped the node with
+    /// "segment preallocation failed" and no errno, when the truth was
+    /// `ENOSPC` (M11 gate row 3b, 2026-08-21).
+    err: Option<PreallocErr>,
+}
+
+/// The parts of a failing `io::Error` needed to rebuild it faithfully.
+#[derive(Clone)]
+struct PreallocErr {
+    kind: std::io::ErrorKind,
+    raw_os: Option<i32>,
+    display: String,
+}
+
+impl PreallocErr {
+    fn capture(e: &std::io::Error) -> Self {
+        Self { kind: e.kind(), raw_os: e.raw_os_error(), display: e.to_string() }
+    }
+
+    /// Rebuild. An OS errno round-trips exactly (`from_raw_os_error` restores
+    /// both the code and the `ErrorKind`); anything else keeps its kind and
+    /// its rendered text.
+    fn rebuild(&self) -> std::io::Error {
+        match self.raw_os {
+            Some(code) => std::io::Error::from_raw_os_error(code),
+            None => std::io::Error::new(self.kind, self.display.clone()),
+        }
+    }
 }
 
 impl SegmentPipeline {
@@ -63,9 +97,10 @@ impl SegmentPipeline {
                 slot = shared.cv.wait(slot).unwrap();
             }
             if slot.failed {
+                let err = slot.err.clone();
                 drop(slot);
                 let _ = handle.join();
-                return Err(prealloc_failed());
+                return Err(prealloc_failed(err));
             }
         }
         Ok(Arc::new(SegmentPipeline {
@@ -81,7 +116,7 @@ impl SegmentPipeline {
         let mut slot = self.shared.slot.lock().unwrap();
         loop {
             if slot.failed {
-                return Err(prealloc_failed());
+                return Err(prealloc_failed(slot.err.clone()));
             }
             if let Some(path) = slot.ready.take() {
                 // Wake the worker to prepare the next one.
@@ -121,8 +156,20 @@ impl Drop for SegmentPipeline {
     }
 }
 
-fn prealloc_failed() -> JournalError {
-    JournalError::Io(std::io::Error::other("segment preallocation failed"))
+/// The preallocation failure, carrying the ORIGINAL errno wherever one
+/// exists — this error reaches the operator verbatim, through
+/// `archive.do_work(...).expect("archive fail-stop")`'s panic text, and
+/// "segment preallocation failed" alone does not tell them whether to free
+/// disk space, fix permissions, or replace a disk.
+fn prealloc_failed(err: Option<PreallocErr>) -> JournalError {
+    match err {
+        Some(e) => JournalError::Io(e.rebuild()),
+        // The worker sets `err` under the same lock as `failed`, so this arm
+        // is unreachable in practice; it stays a plain error rather than an
+        // `unwrap` because a fail-stop path must never panic on its own
+        // bookkeeping.
+        None => JournalError::Io(std::io::Error::other("segment preallocation failed")),
+    }
 }
 
 fn next_temp_path(shared: &Shared) -> PathBuf {
@@ -153,9 +200,17 @@ fn preallocator_loop(shared: Arc<Shared>) {
                     slot.ready = Some(path);
                     shared.cv.notify_all();
                 }
-                Err(_) => {
+                Err(e) => {
                     let mut slot = shared.slot.lock().unwrap();
                     slot.failed = true;
+                    slot.err = Some(match &e {
+                        JournalError::Io(io) => PreallocErr::capture(io),
+                        other => PreallocErr {
+                            kind: std::io::ErrorKind::Other,
+                            raw_os: None,
+                            display: other.to_string(),
+                        },
+                    });
                     shared.cv.notify_all();
                     return;
                 }

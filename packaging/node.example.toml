@@ -57,6 +57,15 @@ addr = "10.0.0.12:9100"
 # addr = "10.0.0.13:9100"
 
 # Log buffer (and retransmit buffer) capacity. Power of two. Default 64 MiB.
+#
+# This space is RESERVED ON DISK when the node starts, not consumed lazily —
+# as are the IPC rings alongside it (~14 MiB), so a default instance dir needs
+# ~78 MiB free before the node will boot, plus room for the journal. A node
+# that cannot reserve it refuses to start, naming the error ("failed to start
+# node 0: io: No space left on device"), rather than starting and dying later:
+# these files are mmapped, and a write to a page with no block behind it is a
+# SIGBUS, which kills the process outright instead of taking the fail-stop
+# path. See docs/benchmarks/uc2-m11-gate-2026-08-20.md, row 3b.
 # buffer_bytes = 67108864
 
 # Largest single command payload. Default 512.

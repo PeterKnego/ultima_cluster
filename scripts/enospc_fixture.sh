@@ -35,7 +35,17 @@
 set -euo pipefail
 
 IMAGE_DIR="${UC2_ENOSPC_IMAGE_DIR:-$HOME/.cache/uc2-enospc}"
-BALLAST_HEADROOM_MB="${UC2_ENOSPC_HEADROOM_MB:-8}"
+# 24 MiB, not 8: since 2026-08-21 the instance dir's mmapped files RESERVE
+# their blocks at creation (uc_protocol's create_shared_backing_file switched
+# from PUNCH_HOLE to ZERO_RANGE so a full disk can no longer SIGBUS a running
+# process -- see the M11 gate doc, row 3b amendment 2). A node therefore needs
+# ~15 MiB of free space just to START (1 MiB log buffer + three 4 MiB rings +
+# two 1 MiB query rings), and with the old 8 MiB margin it refused to boot at
+# all -- "failed to start node 0: io: No space left on device" -- which tests
+# the startup refusal, not the under-load wall. The margin must leave room for
+# the node to boot AND warm up; the test squeezes the remainder itself when it
+# wants the wall (see `squeeze_free_space` in tests/enospc.rs).
+BALLAST_HEADROOM_MB="${UC2_ENOSPC_HEADROOM_MB:-24}"
 BALLAST_NAME="uc2-enospc-ballast"
 
 usage() {
@@ -103,7 +113,14 @@ cmd_create() {
 
   echo "enospc_fixture.sh: mounting $image at $dir"
   sudo mount -o loop "$image" "$dir"
-  sudo chown "$(id -u):$(id -g)" "$dir"
+  # `${SUDO_UID:-...}`, not `id -u`: this script is normally invoked AS
+  # `sudo scripts/enospc_fixture.sh create ...` on a box without passwordless
+  # sudo, and inside that `id -u` is 0 -- which chowned the mount back to root
+  # and left the test's daemon unable to create its instance dir ("instance dir
+  # io error: Permission denied (os error 13)", observed 2026-08-21). SUDO_UID
+  # / SUDO_GID name the INVOKING user in exactly that case, and fall back to
+  # `id` when the script is run by a real root shell with no sudo in play.
+  sudo chown "${SUDO_UID:-$(id -u)}:${SUDO_GID:-$(id -g)}" "$dir"
 
   # Ballast: fill down to BALLAST_HEADROOM_MB MiB free, measured via `df`
   # AFTER the mount+chown above (ext4 metadata/journal overhead already

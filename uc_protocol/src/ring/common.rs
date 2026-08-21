@@ -347,12 +347,37 @@ pub enum RingError {
 ///
 /// Instead: open without truncate, grow to `len` if needed (never shrink —
 /// a pre-existing longer file keeps its tail), and ZERO the content with
-/// `fallocate(PUNCH_HOLE | KEEP_SIZE)` — content becomes zeros, length is
-/// untouched, sparseness is preserved (a 256 MiB buffer is not
-/// materialized). Attachers observe zeroed/torn content during the window,
-/// which every reader of these structures already tolerates (torn-header
-/// contracts); they never fault. Falls back to writing explicit zeros if
-/// the filesystem lacks punch-hole.
+/// `fallocate(ZERO_RANGE)`. Attachers observe zeroed/torn content during the
+/// window, which every reader of these structures already tolerates
+/// (torn-header contracts); they never fault. Falls back to writing explicit
+/// zeros if the filesystem lacks `ZERO_RANGE`.
+///
+/// # Why ZERO_RANGE and not PUNCH_HOLE — the SECOND SIGBUS
+///
+/// This used to punch holes, which zeroes just as well and keeps the file
+/// SPARSE ("a 256 MiB buffer is not materialized"). That traded one SIGBUS
+/// for another. A sparse mapping has pages with no block behind them, so the
+/// first write to such a page must allocate a block AT PAGE-FAULT TIME — and
+/// on a full filesystem that allocation fails, which the kernel reports as
+/// `SIGBUS`. Not an `io::Error`: it cannot be returned, matched, or handled,
+/// and it kills whichever process — node, service, or client — touched the
+/// page. The daemon's whole fail-stop chain (journal halt → `ArchiveError` →
+/// `agent_failstopped` → exit 1) is bypassed, because nothing in it ever
+/// runs.
+///
+/// Measured directly (M11 gate row 3b, 2026-08-21, on a deliberately-filled
+/// 56 MiB loopback fixture): `log.buf` 1,048,576 bytes apparent / 81,920
+/// allocated, and the daemon exiting `code=None signal=Some(7) core=true`
+/// with no `agent_failstopped` in its stderr — plus runs where the test's own
+/// client process took the SIGBUS instead.
+///
+/// `ZERO_RANGE` reserves the blocks up front (as unwritten extents — no
+/// zeroes are actually written, so this stays fast), which moves the failure
+/// to where it can be handled: this function returns `ENOSPC` from `fallocate`
+/// and the caller refuses to start, instead of a page fault killing a running
+/// process later. The cost is real disk usage — these files are no longer
+/// sparse, so a 256 MiB log buffer occupies 256 MiB — which is the honest
+/// price of a mapping that cannot fault.
 pub fn create_shared_backing_file(
     path: &std::path::Path,
     len: u64,
@@ -371,17 +396,15 @@ pub fn create_shared_backing_file(
     let zero_len = cur.max(len);
     // SAFETY: plain fallocate syscall on our own fd; no memory contract.
     let rc = unsafe {
-        libc::fallocate(
-            file.as_raw_fd(),
-            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            0,
-            zero_len as libc::off_t,
-        )
+        libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_ZERO_RANGE, 0, zero_len as libc::off_t)
     };
     if rc != 0 {
-        // Punch-hole unsupported here (exotic fs): write zeros explicitly.
-        // Non-sparse, so only correct-but-slower; every real deployment
-        // target (ext4, tmpfs, xfs) supports punch-hole.
+        // Two different reasons to land here, and both want the same answer.
+        // ENOSPC: there is no room to back this mapping, and writing zeros
+        // will fail too -- but it fails as an `io::Error` this function can
+        // return, which is the entire point (see the SIGBUS note above).
+        // EOPNOTSUPP: an exotic filesystem without ZERO_RANGE; writing zeros
+        // both clears the content and materializes the blocks.
         use std::io::{Seek, SeekFrom, Write};
         let mut f = &file;
         f.seek(SeekFrom::Start(0))?;
