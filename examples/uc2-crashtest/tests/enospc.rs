@@ -66,7 +66,7 @@
 //! the shared `agent_failstopped`/`archive fail-stop`/exit-1 markers.
 #![cfg(feature = "enospc-tests")]
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -689,6 +689,158 @@ fn write_denied_drives_the_same_failstop_chain() {
     restart_node0_and_assert_converges(&mut cluster);
 }
 
+// ----------------------------------------------------- the ENOSPC trigger
+
+/// Free bytes the trigger ballast leaves behind on the fixture filesystem.
+///
+/// Sized from a MEASUREMENT, not from taste. The load these tests drive is a
+/// SINGLE SERIAL CAS writer (`drive_load_until` keeps exactly one op in
+/// flight and re-reads the register on every reconnect), which grows node 0's
+/// instance dir at ~15 KB/s — measured on a 4-core box, sampling the dir every
+/// 5 s across a 56 s window (851,968 B / 56 s). At that rate 256 KiB is
+/// exhausted in ~17 s: comfortably inside
+/// [`run_until_failstop_and_assert`]'s 60 s bound with >3x margin, while
+/// still leaving the daemon enough room that the squeeze itself does not
+/// starve it before the load resumes.
+///
+/// For contrast, this is why the trigger has to exist at all: the fixture's
+/// own ballast leaves `BALLAST_HEADROOM_MB` (default 8 MiB) free, which at
+/// the same measured rate takes ~550 s — nine minutes — to exhaust. The
+/// first CI run of this test failed exactly there, with "the fault was never
+/// induced" (gate doc `uc2-m11-gate-2026-08-20.md`, row 3b amendment).
+const TRIGGER_LEAVE_BYTES: u64 = 256 * 1024;
+
+/// The squeeze refuses to run on a filesystem larger than this.
+///
+/// A safety interlock, not a tuning knob: [`squeeze_free_space`] deliberately
+/// fills a filesystem until it is nearly full, and `UC2_ENOSPC_DIR` is
+/// operator-supplied. Pointed (by typo or by a stale env var) at a directory
+/// on a real volume, an unguarded squeeze would fill THAT volume instead. The
+/// fixture is a small loopback image — `scripts/enospc_fixture.sh create <dir>
+/// 64` makes 64 MiB — so anything above 1 GiB is definitionally not the
+/// fixture, and the test aborts naming the variable rather than writing a
+/// single byte.
+const SQUEEZE_MAX_FS_BYTES: u64 = 1024 * 1024 * 1024;
+
+const TRIGGER_NAME: &str = "uc2-enospc-trigger";
+
+/// One numeric column of `df -Pk <dir>`, in BYTES.
+///
+/// `-P` is the POSIX output format: exactly one data row, space-separated,
+/// `Filesystem 1024-blocks Used Available Capacity Mounted-on`. `-k` pins the
+/// unit to 1024-byte blocks regardless of the caller's `BLOCKSIZE`/`DF_BLOCK_SIZE`
+/// environment, so the multiply below is exact rather than best-effort.
+fn df_bytes(dir: &Path, col: usize) -> u64 {
+    let out = Command::new("df").arg("-Pk").arg(dir).output().expect("run `df -Pk`");
+    assert!(
+        out.status.success(),
+        "df -Pk {} failed: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    let row = text
+        .lines()
+        .nth(1)
+        .unwrap_or_else(|| panic!("df -Pk {} printed no data row:\n{text}", dir.display()));
+    let field = row
+        .split_whitespace()
+        .nth(col)
+        .unwrap_or_else(|| panic!("df -Pk row has no column {col}: {row:?}"));
+    let blocks: u64 = field
+        .parse()
+        .unwrap_or_else(|e| panic!("df -Pk column {col} ({field:?}) is not a number: {e}"));
+    blocks * 1024
+}
+
+fn fs_total_bytes(dir: &Path) -> u64 {
+    df_bytes(dir, 1)
+}
+
+fn fs_avail_bytes(dir: &Path) -> u64 {
+    df_bytes(dir, 3)
+}
+
+/// Squeeze `dir`'s filesystem down to ~`leave_bytes` free and return the path
+/// of the file holding the space, for the caller to delete when it wants the
+/// space back.
+///
+/// This is the test's EXPLICIT trigger, and it is explicit on purpose. The
+/// alternative — shrinking the fixture's own headroom until ordinary load
+/// happens to reach the wall — would have to leave so little room that the
+/// daemon might fail-stop during boot or warm-up instead of under load, which
+/// asserts something weaker (a node that cannot start is not a node that
+/// halts rather than acking writes it cannot persist). Squeezing AFTER
+/// warm-up keeps every byte that follows a genuine journal write to a
+/// genuinely full filesystem: nothing here fakes an errno or injects a fault
+/// into the product's path.
+fn squeeze_free_space(dir: &Path, leave_bytes: u64) -> PathBuf {
+    let total = fs_total_bytes(dir);
+    assert!(
+        total <= SQUEEZE_MAX_FS_BYTES,
+        "refusing to squeeze {}: its filesystem is {} MiB, over the {} MiB \
+         SQUEEZE_MAX_FS_BYTES interlock. UC2_ENOSPC_DIR must point at the small \
+         loopback fixture (scripts/enospc_fixture.sh create <dir> 64), NOT at a \
+         directory on a real volume -- this test fills the filesystem it is given.",
+        dir.display(),
+        total / (1024 * 1024),
+        SQUEEZE_MAX_FS_BYTES / (1024 * 1024),
+    );
+
+    let avail = fs_avail_bytes(dir);
+    assert!(
+        avail > leave_bytes,
+        "{} already has only {avail} B free, at or under the {leave_bytes} B the \
+         trigger means to leave -- the daemon would have hit the wall before the \
+         timed load began, so this run could not adjudicate anything",
+        dir.display()
+    );
+    let want = avail - leave_bytes;
+    let path = dir.join(TRIGGER_NAME);
+
+    // `fallocate` reserves real blocks (ext4 extents) without writing them, so
+    // the squeeze is near-instant on the fixture. It is not universal, so fall
+    // back to writing zeros -- the point is consumed blocks, not how.
+    let allocated = Command::new("fallocate")
+        .arg("-l")
+        .arg(want.to_string())
+        .arg(&path)
+        .status()
+        .is_ok_and(|st| st.success());
+    if !allocated {
+        let mut f = std::fs::File::create(&path)
+            .unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+        let chunk = vec![0u8; 64 * 1024];
+        let mut left = want;
+        while left > 0 {
+            let n = std::cmp::min(left, chunk.len() as u64) as usize;
+            // A short write here is ENOSPC arriving early, which is the very
+            // condition being set up -- stop and let the assertion below judge
+            // the resulting free space, rather than failing the run.
+            if f.write_all(&chunk[..n]).is_err() {
+                break;
+            }
+            left -= n as u64;
+        }
+        let _ = f.sync_all();
+    }
+
+    let after = fs_avail_bytes(dir);
+    assert!(
+        after < avail,
+        "the trigger consumed nothing: {} still reports {after} B free (was {avail} B)",
+        dir.display()
+    );
+    // One filesystem block of slack: `df` accounts in blocks, so landing
+    // exactly on `leave_bytes` is not something to require.
+    assert!(
+        after <= leave_bytes + 64 * 1024,
+        "the trigger left {after} B free, well over the {leave_bytes} B target -- \
+         ordinary load may not reach the wall inside the bound"
+    );
+    path
+}
+
 /// The real bar: genuine `ENOSPC` from a small loopback ext4 filesystem
 /// created by `scripts/enospc_fixture.sh`. Gated on `UC2_ENOSPC_DIR`
 /// (elle-style: unset = skip, not fail) because this box cannot mount
@@ -700,10 +852,12 @@ fn write_denied_drives_the_same_failstop_chain() {
 /// Contract with the fixture/CI step (`.github/workflows/nightly.yml`'s
 /// `survival` job): `UC2_ENOSPC_DIR` names a directory that is ALREADY a
 /// mounted loopback ext4 filesystem, pre-filled by the fixture's ballast
-/// file down to a small headroom margin. This test's own "space returned"
-/// step is `rm $UC2_ENOSPC_DIR/uc2-enospc-ballast` -- the fixture's
-/// `destroy` (unmount + remove the image) is a SEPARATE, later CI step, run
-/// unconditionally (`if: always()`), not part of this test.
+/// file down to a small headroom margin. That margin is far more than this
+/// test's load exhausts inside its bound, so the test squeezes the rest
+/// itself after warm-up ([`squeeze_free_space`]); its "space returned" step
+/// removes both holders (`uc2-enospc-trigger`, then `uc2-enospc-ballast`).
+/// The fixture's `destroy` (unmount + remove the image) is a SEPARATE, later
+/// CI step, run unconditionally (`if: always()`), not part of this test.
 #[test]
 fn enospc_fails_stops_asserted_and_the_cluster_survives() {
     let Ok(dir0_str) = std::env::var("UC2_ENOSPC_DIR") else {
@@ -731,9 +885,11 @@ fn enospc_fails_stops_asserted_and_the_cluster_survives() {
     warm_up(&cluster.dirs, 15);
 
     let mut acked: u64 = 0;
-    // No explicit trigger needed: the fixture's ballast already leaves only
-    // a small headroom margin, so ordinary load exhausts it within seconds
-    // as node 0's journal rolls new (small) segments.
+    // The trigger, and why it is not the fixture's own ballast: see
+    // [`TRIGGER_LEAVE_BYTES`]. Squeezing happens AFTER `warm_up` so the
+    // daemon boots and takes leadership with room to spare, and only the
+    // TIMED phase runs against a nearly-full filesystem.
+    let trigger = squeeze_free_space(&cluster.dirs[0], TRIGGER_LEAVE_BYTES);
     run_until_failstop_and_assert(&mut cluster, &mut acked, 60);
 
     // ENOSPC == errno 28, ErrorKind::StorageFull (verified on this
@@ -745,9 +901,12 @@ fn enospc_fails_stops_asserted_and_the_cluster_survives() {
 
     assert_survivors_keep_committing(&cluster, &mut acked, 10, 20);
 
-    // Space returned: delete the ballast on the SAME filesystem/instance
-    // dir -- no unmount/remount (the fixture's `destroy` is a separate,
-    // later step; see this test's own doc comment).
+    // Space returned: delete BOTH space holders on the SAME
+    // filesystem/instance dir -- no unmount/remount (the fixture's `destroy`
+    // is a separate, later step; see this test's own doc comment). The
+    // trigger goes first: it holds the larger share, and node 0 is restarted
+    // next, which needs room to replay and rejoin.
+    std::fs::remove_file(&trigger).expect("rm the trigger file (space returned)");
     std::fs::remove_file(&ballast).expect("rm the ballast file (space returned)");
 
     restart_node0_and_assert_converges(&mut cluster);
