@@ -89,7 +89,9 @@ startup refusal (same answer Aeron reaches via
 `ultima_journal`'s segment preallocator discarded the errno, so a full disk
 fail-stopped saying only "segment preallocation failed". Nightly
 32491691229 (all 9 jobs green, `survival` included) is the independent
-confirmation; `v2.5.0` is ready to tag**: offline
+confirmation. RELEASED as `v2.5.0` 2026-08-21; upgrade consequence worth
+knowing: instance dirs now reserve ~78 MiB at boot and a node that cannot
+reserve it refuses to start**: offline
 `uc2ctl backup / verify-backup / restore` (ordered-copy artifact, verify
 asserts the purge-straddle coverage invariant, under-load-safe incl. purge
 races, refuses a live instance dir) with the backed-up-under-load →

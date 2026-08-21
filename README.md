@@ -40,10 +40,12 @@ detection-timing confirmation is still outstanding.
 
 ---
 
-**Status: v2.4.0** — milestones M1–M10 complete: the consensus core and SDK
+**Status: v2.5.0** — milestones M1–M11 complete: the consensus core and SDK
 (M1–M6), live reconfiguration (M7), opt-in wire crypto (M8), the deployable
-`uc2-node` daemon (M9), and the observability layer (M10). What each release
-introduced, with links to the detailed docs: **[RELEASES.md](/RELEASES.md)**.
+`uc2-node` daemon (M9), the observability layer (M10), and backup/restore,
+quorum-loss recovery, full-disk fail-stop and measured flag-day upgrades
+(M11). What each release introduced, with links to the detailed docs:
+**[RELEASES.md](/RELEASES.md)**.
 
 | Gate | Result | Measured on |
 |---|---|---|
@@ -56,6 +58,7 @@ introduced, with links to the detailed docs: **[RELEASES.md](/RELEASES.md)**.
 | Opt-in wire crypto (M8) | **94.1 %** of cleartext throughput | 4-vCPU dev box; ratio only |
 | Planned leader restart (M9) | stop **0.042 s** under load, journal-tail rejoin (no snapshot), back at baseline ≤ 10.5 s | 3-host fleet |
 | Metrics scrape cost (M10) | median **0.983** scrape-on/off throughput ratio (≈1.7 % cost, bar ≥ 0.95), 1 s all-nodes scrape | 3-host fleet, interleaved A/B |
+| Flag-day upgrade downtime (M11) | **14.0 s / 14.7 s** across two runs (bar ≤ 60 s), equal durable on every stopped node, zero committed loss | 4-host fleet |
 | Alerts on a healthy cluster (M10) | **0** firing alerts over a 10-min real-Prometheus soak, 62/62 metric families from every node | 3-host fleet |
 | Readiness probe under leader kill (M10) | **0** ready-responses during the elected-not-serving window, 3 kills | 3-host fleet |
 

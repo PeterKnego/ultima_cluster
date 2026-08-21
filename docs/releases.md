@@ -1,5 +1,125 @@
 # ultima_cluster releases
 
+## v2.5.0 — 2026-08-21 — M11 survivable cluster
+
+**A cluster survives losing a host, losing quorum, filling its disk, and
+being upgraded — and each of those is asserted by a test that actually
+destroys something, not described in a runbook.** The milestone's own review
+loop and its final gate row turned up four pre-existing journal-layer defects
+and two IPC-layer ones; all six are fixed here.
+
+- **Offline `uc2ctl backup` / `verify-backup` / `restore`.** The artifact is
+  an ordered copy: state before journal before the log buffer, so a backup
+  taken while the node is running under load and racing its own purge can
+  still be proven complete. `verify-backup` asserts the purge-straddle
+  coverage invariant rather than trusting the copy — a deliberately
+  wrong-ordered artifact is reported as a `Hole`, which the gate's
+  anti-vacuity test pins. All three verbs refuse a live instance directory.
+  The acceptance case is a CI crashtest, not a procedure: a follower is
+  backed up under load, its host is destroyed (`rm -rf`), a new host is
+  restored from the artifact alone, and it rejoins and converges.
+- **`uc2ctl force-single-member` for quorum loss.** An offline, explicitly
+  non-persisting recovery wrapper: it states the data-loss window before
+  writing anything, and refuses the doubly-ahead crash window outright.
+  Dropped peers rejoin as fresh ids with fresh instance directories — the
+  runbook's fresh-id rule, enforced rather than documented.
+- **Full-disk fail-stop, asserted end to end**, plus a `free_disk_bytes` cnc
+  field (reserved band 3840) and the `Uc2DiskLow` alert for the warning
+  before the wall. This row is where the milestone earned its keep — see
+  "What the ENOSPC row found" below.
+- **`scripts/uc2_flag_day.sh`**: stop-all → verify every stopped node agrees
+  on `durable` → run the operator's upgrade hook on every host → start-all →
+  wait for one serving leader, with a measured downtime number and a
+  load-bearing abort path (any failure on the way back up restarts every node
+  on whatever binary is in place, so the cluster is never left down). Exit
+  codes 0/1/3.
+
+### What the ENOSPC row found
+
+The gate's true-`ENOSPC` row (3b) could not run on the dev box for lack of
+passwordless sudo and was carried as `SKIPPED-PENDING`. Its first real CI run
+failed — and the pending status turned out to have been concealing a test
+that could never have passed, followed by two genuine product defects:
+
+1. **The test could not induce the fault.** Its load is a single serial CAS
+   writer, measured at ~15.2 KB/s of instance-dir growth; the fixture left
+   8 MiB of headroom, which needs ~550 s to exhaust against a 60 s bound. The
+   test now squeezes the remaining space itself after warm-up
+   (`squeeze_free_space`, leaving 256 KiB — ~17 s at the measured rate), with
+   a 1 GiB interlock so an operator-supplied `UC2_ENOSPC_DIR` pointing at a
+   real volume aborts instead of filling it.
+2. **A full disk killed processes with `SIGBUS` instead of fail-stopping.**
+   `uc_protocol::ring::create_shared_backing_file` zeroed via
+   `FALLOC_FL_PUNCH_HOLE`, which keeps the mapped files sparse by design
+   (measured: `log.buf` 1 MiB apparent / 80 KiB allocated). A sparse mapping
+   has pages with no block behind them, so the first write to such a page
+   allocates at **page-fault time**; on a full filesystem that fails, and the
+   kernel raises `SIGBUS` — not an `io::Error`, so it cannot be returned,
+   matched, or handled. It kills whichever process touched the page — node,
+   service, *or* client, since all three map these files — and the documented
+   fail-stop chain (journal halt → `ArchiveError` → `agent_failstopped` →
+   exit 1) never runs. Observed directly: `code=None signal=Some(7)
+   core=true` with no `agent_failstopped` in stderr, and separately the test's
+   own client process taking the `SIGBUS` instead.
+   **Fixed** with `fallocate(FALLOC_FL_ZERO_RANGE)`, which zeroes *and*
+   reserves the blocks as unwritten extents — no zeroes are written, so
+   startup stays fast — moving the failure to `fallocate`'s return value,
+   where the daemon already refuses to start with a named error. Aeron
+   reaches the same answer from the same constraint: sparseness is a knob
+   there (`aeron.term.buffer.sparse.file`, "save space at the expense of
+   latency") and storage checks are on by default
+   (`FileStoreLogFactory.checkStorage`, *"insufficient usable storage for new
+   log of length="*). The `fallocate` form is stronger — Aeron's
+   `getUsableSpace()` check is look-then-leap and races; a reservation either
+   succeeds or reports `ENOSPC` atomically.
+   **Upgrade note:** these files are no longer sparse. A default instance
+   directory reserves ~78 MiB at startup (64 MiB log buffer + ~14 MiB rings),
+   and a node that cannot reserve it refuses to start.
+3. **Even a correct fail-stop did not say why.** `ultima_journal`'s segment
+   preallocator replaced the underlying `io::Error` with
+   `Error::other("segment preallocation failed")`, so a full disk halted the
+   node without ever naming `ENOSPC`. The failing error's kind and errno are
+   now captured and rebuilt for each waiter. This was latent for *every*
+   preallocation errno, not just this one.
+
+With all three fixed, row 3b passes as written — named `StorageFull` /
+`os error 28`, daemon exit 1, survivors committing throughout, and node 0
+rejoining and converging once space is returned — locally and in CI's
+`survival` job.
+
+### Journal-layer fixes from the review loop
+
+- **A crash-torn tail refused boot.** `Journal::open` now heals a torn tail on
+  the active segment instead of refusing, and zeros the healed span through
+  physical EOF so the residue cannot wedge the next truncate.
+- **A masked acked-durability hole at segment rolls**: a rolled-off segment is
+  now fsynced before its successor exists, making the acked-durability
+  guarantee real at the boundary.
+- **A latent writer panic**: the dirty flag survives truncation, so an emptied
+  segment list no longer panics.
+
+### Gate
+
+`docs/benchmarks/uc2-m11-gate-2026-08-20.md`. Six rows, bar pre-committed at
+plan commit `7ff6b4b` before implementation and never edited. Rows 1, 2, 3a,
+3b, 4 local/CI; row 5 fleet-only, measured at **14.007 s and 14.709 s**
+against a 60 s bar on a 4-host `c6id.xlarge` fleet in us-east-1, with equal
+durable positions across every stopped node, no committed-high-water loss,
+and 314 KB/s of new writes committed after the upgrade. Driver:
+`bench-infra/scripts/m11_fleet_gate.py` — a new one, because every earlier
+fleet gate launches nodes as transient `systemd-run` units, which cannot
+serve `uc2_flag_day.sh`'s `systemctl start` after its `systemctl stop`; the
+M11 fleet installs the shipped `packaging/systemd` unit instead. Three rows
+were recorded FAIL on the way and diagnosed before re-running, including one
+worth remembering: GNU `install` truncates its destination in place rather
+than unlinking it, so an inode-equality witness reports "never replaced" for
+a successful install.
+
+Two limits of the fleet row, stated rather than implied: it ran on 4 hosts,
+not 5 (the account's 32-vCPU cap, plus three instances that booted with no
+networking), and the upgrade installed a byte-identical binary, since there
+is one tree — so it measures downtime, not cross-version interoperation.
+
 ## v2.4.0 — 2026-08-20 — M10 observable cluster
 
 **A running cluster can now be watched, probed, and alerted on without

@@ -7,13 +7,15 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
-## Unreleased — v2.5.0 pending — survivable cluster (M11)
+## v2.5.0 — 2026-08-21 — survivable cluster (M11)
 
-Merged on `main`; **every gate row passes**, with the fleet flag-day row
-measured at 14.0 s and 14.7 s against a 60 s bar and the true-`ENOSPC` row
-confirmed independently by CI's sudo `survival` job against a real loopback
-fixture. Full record, including the honest FAILs on the way and what they
-exposed:
+**A cluster you can back up, restore onto a new host, force out of quorum
+loss, and upgrade on a measured schedule — each one proven by a test that
+destroys something real, not by a documented procedure.** Every gate row
+passes: the fleet flag day measured 14.0 s and 14.7 s of downtime against a
+60 s bar, and the full-disk row is confirmed independently by CI's sudo
+`survival` job against a real loopback filesystem. Full record, including
+the honest FAILs along the way and the two product defects they exposed:
 [gate record](docs/benchmarks/uc2-m11-gate-2026-08-20.md). Design deep-dive:
 [M11 explained](docs/notes/uc2-m11-survivable-cluster-explained.md).
 
@@ -42,6 +44,14 @@ exposed:
   that cannot reserve it refuses to start with a named error. →
   [Monitor a cluster](docs/how-to/monitor-a-cluster.md) ·
   [gate record, row 3b](docs/benchmarks/uc2-m11-gate-2026-08-20.md)
+- **Upgrading to this release needs free disk before the node boots.** The
+  memory-mapped files in an instance directory now reserve their blocks at
+  startup instead of filling in lazily, so a node needs `buffer_bytes` plus
+  ~14 MiB of rings free — about 78 MiB at the defaults — and refuses to start
+  with a named error if it is not there. Check free space on every host before
+  a rolling restart or a flag day. →
+  [Run a cluster](docs/how-to/run-a-cluster.md) ·
+  [Instance directory](docs/reference/instance-directory.md#on-disk-footprint)
 - **Measured flag-day upgrades** (`scripts/uc2_flag_day.sh`): the
   stop-all/upgrade/start-all procedure as a script with preflight refusals,
   an un-upgrade path, and a printed downtime number. →

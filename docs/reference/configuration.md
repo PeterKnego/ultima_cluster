@@ -136,7 +136,9 @@ must present the same value.
 ### Sizing
 
 **`buffer_bytes: usize`**
-Log ring buffer capacity. Must be a power of two.
+Log ring buffer capacity. Must be a power of two. This much disk is reserved
+at startup (see [Instance directory](instance-directory.md#on-disk-footprint));
+a node that cannot reserve it refuses to start.
 
 **`max_payload: usize`**
 Maximum payload size.

@@ -56,5 +56,20 @@ disk requires bind mounts.
 
 | Limit | Value |
 |---|---|
+| Free space needed before boot | `buffer_bytes` + ~14 MiB of rings (~78 MiB at the defaults), reserved at startup — see below |
 | Nodes per instance directory | 1, enforced by `instance.lock` |
 | Admin clients per instance directory | 1 at a time |
+
+## On-disk footprint
+
+`cnc2.dat`, `log.buf`, and every `*.ring`/`*.broadcast` file have their blocks
+**reserved when the node creates them**, not allocated lazily as they are
+written. They are memory-mapped, and a write to a page with no block behind it
+raises `SIGBUS` — a hard process kill that no error path can intercept, taking
+the node, a service, or a client with it. Reserving up front moves that
+failure to `fallocate`, where it is an ordinary `ENOSPC` the daemon reports as
+a startup refusal.
+
+The practical consequence: `du` on a fresh instance directory shows the full
+`buffer_bytes` plus ring sizes immediately, and the filesystem must have that
+much free before the node will boot.

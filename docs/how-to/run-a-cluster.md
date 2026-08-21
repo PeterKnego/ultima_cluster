@@ -92,6 +92,21 @@ are running in a container, check what the mount actually is rather than what
 the image implies. `uc2-node` refuses to start on a RAM-backed filesystem, and
 the test-only override never silences the warning.
 
+The directory also needs free space **before** the node starts, not as it
+fills: the node reserves its memory-mapped files on disk at boot — the log
+buffer (`buffer_bytes`, 64 MiB by default) plus about 14 MiB of IPC rings, so
+roughly 78 MiB at the defaults, and the journal grows on top of that. A node
+that cannot reserve it refuses to start and says so:
+
+```
+uc2-node: failed to start node 0: io: No space left on device (os error 28)
+```
+
+That refusal is deliberate. These files are mapped into memory, and a write to
+a page with no disk block behind it is a `SIGBUS`, which kills the process
+outright rather than letting it fail-stop cleanly — so the space is claimed up
+front, where the failure is a startup error you can act on.
+
 For which files must survive a power cut and which are rebuilt on boot, see
 [Instance directory](../reference/instance-directory.md).
 
