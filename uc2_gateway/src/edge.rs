@@ -65,12 +65,19 @@
 //! writer pool), so `poll` only ever enqueues and a slow peer is dropped by
 //! its own queue filling up rather than by stalling the shared drain.
 //!
-//! ## Not here yet
+//! ## Telling a client the cluster moved
 //!
-//! The leader **watch** (poll `can_serve`/`leader_hint`, push `LEADER_CHANGED`
-//! on a transition) is Task 9; the driver has a named hook where it goes.
-//! Task 8 still redirects correctly — it just does so reactively, off
-//! `!can_serve()` and `Outcome::NotLeader`, against the static member map.
+//! Two mechanisms, and they answer different questions.
+//!
+//! **Reactive** — a `SUBMIT` that arrives while `!can_serve()` (or completes
+//! `NotLeader`) is answered `REDIRECT` against the static member map. That
+//! covers every client with a request in flight.
+//!
+//! **Proactive** — the [`crate::watch::LeaderWatch`], polled by the driver,
+//! pushes `LEADER_CHANGED` to every ready connection when `can_serve` or
+//! `leader_hint` changes. That covers the client which has nothing in flight,
+//! or whose requests are all parked on a backoff, and which would otherwise
+//! learn nothing until it happened to try again.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -98,6 +105,7 @@ use uc_protocol::ring::RingWaitHandle;
 
 use crate::conn::{Conn, ConnTable};
 use crate::config::{ConfigError, EdgeConfig};
+use crate::watch::LeaderWatch;
 
 // ---------------------------------------------------------------- constants
 
@@ -313,6 +321,51 @@ impl Shared {
         }
     }
 
+    /// The `Leader` body a `REDIRECT`/`LEADER_CHANGED` carries: the hint's
+    /// gateway address when the static member map knows it, otherwise the
+    /// `unknown` sentinel.
+    ///
+    /// The `node_id` in the sentinel is ignored by the client — the EMPTY
+    /// ADDRESS is the signal ("leader unknown: reconnect and re-`HELLO`").
+    fn leader_body(&self, hint: Option<u32>) -> Vec<u8> {
+        let mut out = Vec::new();
+        match hint.and_then(|id| self.gateway_of(id).map(|a| (id, a))) {
+            Some((id, addr)) => Leader { node_id: id, addr }.encode(&mut out),
+            None => Leader { node_id: u32::MAX, addr: "" }.encode(&mut out),
+        }
+        out
+    }
+
+    /// Push `LEADER_CHANGED` to every connection whose handshake has
+    /// completed. Driven only by the leader watch, and only on a transition —
+    /// see `watch.rs` for why the trigger is edge- and not level-triggered.
+    ///
+    /// The body is built **once** and the table lock is not held across any
+    /// write (`for_each` hands out a snapshot); a connection whose write fails
+    /// is dropped afterwards, outside that snapshot walk, because `remove`
+    /// takes the table's write lock.
+    fn push_leader_changed(&self, hint: Option<u32>) {
+        let body = self.leader_body(hint);
+        let now = self.now_ns();
+        let mut dead: Vec<u32> = Vec::new();
+        self.table.for_each(|c| {
+            // Never on a still-dialing connection: its peer is waiting for
+            // `HELLO_OK` and would fail the dial on anything else (see
+            // `Conn::ready`). It loses nothing — its own `HELLO_OK` carries
+            // the leader that is current when the handshake completes.
+            if !c.is_ready() {
+                return;
+            }
+            self.stats.leader_changes.fetch_add(1, Ordering::Relaxed);
+            if !c.write(c.hdr(FrameType::LeaderChanged, 0, 0), &body, now) {
+                dead.push(c.idx);
+            }
+        });
+        for idx in dead {
+            self.table.remove(idx);
+        }
+    }
+
     fn write_retry(&self, conn: &Conn, seq: u64, reason: u8, after_us: u32) {
         let mut out = Vec::new();
         Retry { reason, retry_after_us: after_us }.encode(&mut out);
@@ -341,10 +394,9 @@ impl Shared {
         // Latch first: a connection accepted between here and the last close
         // must be refused at the handshake, not served into the same fault.
         self.faulted.store(true, Ordering::SeqCst);
-        let mut out = Vec::new();
-        // The `node_id` is a sentinel and is ignored by the client — the EMPTY
-        // ADDRESS is the signal ("leader unknown: reconnect and re-HELLO").
-        Leader { node_id: u32::MAX, addr: "" }.encode(&mut out);
+        // The `unknown` sentinel, deliberately: there is nothing this edge can
+        // still answer, so the client must reconnect and re-`HELLO` somewhere.
+        let out = self.leader_body(None);
         for c in self.table.take_all() {
             // A connection still mid-handshake gets no frame, only the close:
             // its peer is waiting for HELLO_OK and would reject anything else.
@@ -886,6 +938,9 @@ impl Drop for ArmGuard<'_> {
 
 fn driver(shared: Arc<Shared>, mut poll: PollHalf, send: SendHalf) {
     let wh = poll.wait_handle();
+    // Seeded from the state as it is now, so starting on a healthy leader is
+    // not itself reported as a leader change.
+    let mut watch = LeaderWatch::new(&send);
     let mut cycle: u64 = 0;
     let mut idle: u32 = 0;
     // The periodic work walks every connection, which means a table snapshot;
@@ -900,12 +955,21 @@ fn driver(shared: Arc<Shared>, mut poll: PollHalf, send: SendHalf) {
         let n = poll.poll(|c| complete(&shared, &send, c));
         if n > 0 {
             idle = 0;
+            // Under a stream of completions the driver may never take the idle
+            // path at all, so the watch gets its own cadence here: one sample
+            // (two atomic loads) per `DRIVER_PERIODIC_EVERY` completions.
             if cycle.is_multiple_of(DRIVER_PERIODIC_EVERY) {
-                maybe_periodic(&shared, &send, &mut last_periodic, periodic_every);
+                leader_tick(&shared, &send, &mut watch);
+                maybe_periodic(&shared, &mut last_periodic, periodic_every);
             }
             continue;
         }
-        maybe_periodic(&shared, &send, &mut last_periodic, periodic_every);
+        // Every idle iteration, ungated: the sample is two atomic loads, and
+        // the idle ladder's park is capped at `DRIVER_PARK`, so an idle edge
+        // notices a leader change within about a millisecond. (The STATUS
+        // timer below is gated instead — it walks the whole table.)
+        leader_tick(&shared, &send, &mut watch);
+        maybe_periodic(&shared, &mut last_periodic, periodic_every);
         if shared.stopping() {
             break;
         }
@@ -930,24 +994,31 @@ fn driver(shared: Arc<Shared>, mut poll: PollHalf, send: SendHalf) {
     poll.drain_abort(|_| {});
 }
 
-/// Run [`periodic`] at most once per `every`.
-fn maybe_periodic(
-    shared: &Arc<Shared>,
-    send: &SendHalf,
-    last: &mut Instant,
-    every: Duration,
-) {
-    let now = Instant::now();
-    if now.duration_since(*last) >= every {
-        *last = now;
-        periodic(shared, send);
+/// Sample the leader watch and, on a transition, tell every ready client.
+///
+/// Cheap by construction on the overwhelmingly common no-change path: two
+/// atomic loads and a comparison, no allocation and no table lock. Only a real
+/// transition reaches [`Shared::push_leader_changed`].
+fn leader_tick(shared: &Arc<Shared>, send: &SendHalf, watch: &mut LeaderWatch) {
+    if let Some((_can_serve, hint)) = watch.poll(send) {
+        // What goes on the wire is the CURRENT leader, not "we are not it":
+        // the client acts on the address, and the answer to "where do I go
+        // now" is the only useful thing to say.
+        shared.push_leader_changed(hint);
     }
 }
 
-/// The driver's between-polls work.
-fn periodic(shared: &Arc<Shared>, _send: &SendHalf) {
-    // Task 9: leader watch here — poll `can_serve()`/`leader_hint()` and push
-    // `LEADER_CHANGED` to every connection on a transition.
+/// Run [`periodic`] at most once per `every`.
+fn maybe_periodic(shared: &Arc<Shared>, last: &mut Instant, every: Duration) {
+    let now = Instant::now();
+    if now.duration_since(*last) >= every {
+        *last = now;
+        periodic(shared);
+    }
+}
+
+/// The driver's between-polls work: the standalone `STATUS` timer.
+fn periodic(shared: &Arc<Shared>) {
     let now = shared.now_ns();
     let interval = shared.cfg.status_interval.as_nanos() as u64;
     shared.table.for_each(|c| {

@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use uc2_remote::frame::HELLO_REFUSED_FAULTED;
 use uc2_remote::{RemoteClient, RemoteConfig, RemoteError};
 
 mod common;
@@ -175,6 +176,43 @@ fn hello_refused_is_reported_and_does_not_connect() {
         RemoteError::HelloRefused { reason, .. } => assert_eq!(reason, 1),
         other => panic!("got {other:?}"),
     }
+}
+
+/// A `FAULTED` refusal costs one member, not the whole dial.
+///
+/// The two refusals mean opposite things: `APP_ID`/`VERSION` say "you are
+/// dialling the wrong cluster" (every member would say the same), while
+/// `FAULTED` says "this edge is out of service, its node's shmem instance
+/// restarted under it" — which is exactly the situation a member list exists
+/// for. Treating them alike would take a whole cluster away from a client
+/// because one gateway process needed restarting.
+#[test]
+fn a_faulted_member_is_skipped_and_the_next_one_serves() {
+    let faulted =
+        FakeEdge::spawn(Behaviour { refuse_hello: Some(HELLO_REFUSED_FAULTED), ..Default::default() });
+    let healthy = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let client =
+        RemoteClient::connect(cfg(vec![faulted.addr.clone(), healthy.addr.clone()])).unwrap();
+
+    let r = client.submit(b"ok").unwrap().wait_timeout(WAIT).unwrap();
+    assert_eq!(&r.bytes[..], b"ko", "the healthy member served it");
+    let s = client.stats();
+    assert!(s.refused_members >= 1, "the faulted member was not counted: {s:?}");
+    assert_eq!(faulted.observed.hellos.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(healthy.observed.seq_order(), vec![1]);
+    client.shutdown();
+}
+
+/// ...but a faulted member is still a *failure*: if every member is faulted,
+/// the dial ends in `NoMembersReachable` rather than hanging or succeeding.
+#[test]
+fn a_cluster_of_faulted_edges_is_unreachable() {
+    let a =
+        FakeEdge::spawn(Behaviour { refuse_hello: Some(HELLO_REFUSED_FAULTED), ..Default::default() });
+    let b =
+        FakeEdge::spawn(Behaviour { refuse_hello: Some(HELLO_REFUSED_FAULTED), ..Default::default() });
+    let err = RemoteClient::connect(cfg(vec![a.addr.clone(), b.addr.clone()])).unwrap_err();
+    assert!(matches!(err, RemoteError::NoMembersReachable), "got {err:?}");
 }
 
 #[test]

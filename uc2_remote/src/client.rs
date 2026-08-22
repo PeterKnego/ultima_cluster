@@ -59,8 +59,8 @@ use crate::conn::FramedConn;
 use crate::error::RemoteError;
 use crate::frame::{
     FrameType, Header, Hello, HelloOk, HelloRefused, Leader, ResponseMeta, Retry, Status,
-    FLAG_EXPIRED, FLAG_LINEARIZABLE, FLAG_REPLAYED, HEADER_LEN, MAX_FRAME_LEN, PROTOCOL_VERSION,
-    RETRY_PAYLOAD_TOO_LARGE,
+    FLAG_EXPIRED, FLAG_LINEARIZABLE, FLAG_REPLAYED, HEADER_LEN, HELLO_REFUSED_FAULTED,
+    MAX_FRAME_LEN, PROTOCOL_VERSION, RETRY_PAYLOAD_TOO_LARGE,
 };
 
 /// The reader's tick: how often it times out stale requests, re-pumps requests
@@ -158,6 +158,11 @@ pub struct RemoteStats {
     pub expired: u64,
     /// The largest `credits` value any frame ever advertised.
     pub max_credits_seen: u32,
+    /// Members that refused the handshake with `HELLO_REFUSED{FAULTED}` and
+    /// were skipped. That refusal is about *that edge* (its node's shmem
+    /// instance restarted under it), not about this client, so it costs one
+    /// member rather than the whole dial.
+    pub refused_members: u64,
 }
 
 /// One completed request.
@@ -247,6 +252,7 @@ struct Stats {
     unknown: AtomicU64,
     expired: AtomicU64,
     max_credits_seen: AtomicU32,
+    refused_members: AtomicU64,
 }
 
 struct State {
@@ -303,21 +309,27 @@ pub struct RemoteClient {
 impl RemoteClient {
     /// Connect to the first reachable member, following a `REDIRECT` at `HELLO`.
     ///
-    /// Fails with [`RemoteError::HelloRefused`] if an edge answers the handshake
-    /// with a refusal (a wrong `app_id` or protocol version is not something
-    /// another member would answer differently), and with
-    /// [`RemoteError::NoMembersReachable`] only after a full pass over `members`.
+    /// Fails with [`RemoteError::HelloRefused`] if an edge refuses the
+    /// handshake for a reason no other member would answer differently — a
+    /// wrong `app_id` or protocol version. A `HELLO_REFUSED{FAULTED}` is the
+    /// *edge's* problem instead, so that member is counted
+    /// ([`RemoteStats::refused_members`]) and skipped. Fails with
+    /// [`RemoteError::NoMembersReachable`] only after a full pass over
+    /// `members`.
     pub fn connect(cfg: RemoteConfig) -> Result<Self, RemoteError> {
         if cfg.members.is_empty() {
             return Err(RemoteError::NoMembersReachable);
         }
         let client_id = cfg.client_id.unwrap_or_else(random_u64);
-        let (conn, info, idx, addr) = dial(&cfg, client_id, None, 0)?;
+        // The stats live longer than this call, and `dial` records the members
+        // it had to skip, so they are built before the first dial rather than
+        // after it.
+        let stats = Stats::default();
+        let (conn, info, idx, addr) = dial(&cfg, client_id, None, 0, &stats)?;
         let read_half = conn.try_clone()?;
         read_half.set_read_timeout(Some(SWEEP_INTERVAL))?;
         conn.set_write_timeout(Some(WRITE_TIMEOUT))?;
 
-        let stats = Stats::default();
         stats.max_credits_seen.store(info.credits, Ordering::Relaxed);
         let inner = Arc::new(Inner {
             client_id,
@@ -391,6 +403,7 @@ impl RemoteClient {
             unknown: s.unknown.load(Ordering::Relaxed),
             expired: s.expired.load(Ordering::Relaxed),
             max_credits_seen: s.max_credits_seen.load(Ordering::Relaxed),
+            refused_members: s.refused_members.load(Ordering::Relaxed),
         }
     }
 
@@ -806,7 +819,7 @@ impl Inner {
                 st.resend_from = st.pending.keys().next().copied().unwrap_or(u64::MAX);
                 st.member_idx + 1
             };
-            match dial(&self.cfg, self.client_id, preferred.as_deref(), start) {
+            match dial(&self.cfg, self.client_id, preferred.as_deref(), start, &self.stats) {
                 Ok((conn, info, idx, addr)) => {
                     let read_half = match conn
                         .try_clone()
@@ -1018,6 +1031,7 @@ fn dial(
     client_id: u64,
     preferred: Option<&str>,
     start_idx: usize,
+    stats: &Stats,
 ) -> Result<(FramedConn, HelloInfo, usize, String), RemoteError> {
     let n = cfg.members.len();
     if n == 0 {
@@ -1046,6 +1060,20 @@ fn dial(
                 }
                 i += 1;
             }
+            // `FAULTED` is the EDGE's problem, not the client's: that gateway
+            // has taken itself out of service (its node's shmem instance
+            // restarted under it) and a supervisor has to restart it. Every
+            // other member may be perfectly healthy, so this costs one member
+            // and the scan goes on — only a full pass of failures is
+            // `NoMembersReachable`.
+            Dialed::Refused { reason: HELLO_REFUSED_FAULTED, .. } => {
+                stats.refused_members.fetch_add(1, Ordering::Relaxed);
+                i += 1;
+            }
+            // `APP_ID` / `VERSION` are about US. No member would answer
+            // differently, so trying the rest would only turn one clear error
+            // into `NoMembersReachable` — the least useful thing to tell an
+            // operator who has mistyped a cluster name.
             Dialed::Refused { reason, detail } => {
                 return Err(RemoteError::HelloRefused { reason, detail })
             }

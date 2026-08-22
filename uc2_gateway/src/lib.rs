@@ -40,6 +40,7 @@
 mod config;
 mod conn;
 mod edge;
+mod watch;
 
 pub use config::{ConfigError, EdgeConfig, Member};
 pub use edge::{Edge, EdgeError, EdgeStats};
