@@ -784,6 +784,17 @@ fn run_remote_measurement(remote: &RemoteClient, secs: u64, payload_len: usize) 
         let idx = sent_idx;
         let slot = (idx as usize) & SLOT_MASK;
         send_ns[slot].store(t0.elapsed().as_nanos() as u64, Ordering::Release);
+        // `RemoteClient::submit`'s own doc (`uc2_remote/src/client.rs`) is
+        // explicit: it BLOCKS while the edge's credits (or the local
+        // `max_inflight` cap) are exhausted, pacing this loop itself —
+        // there is no transient "backpressure, retry" error to yield on
+        // here, unlike the direct arm's `SubmitError::Backpressure`
+        // (`Engine::try_submit` is non-blocking by design; `RemoteClient`
+        // is not). The only `Err` this can resolve to is `TimedOut`
+        // (credits never reopened within `request_timeout`) or `Closed`
+        // (the client shut down under us) — both are genuine harness
+        // failures for a healthy run, hence the `panic!` rather than a
+        // retry loop.
         match remote.submit(&cmd_bytes) {
             Ok(ticket) => {
                 let w = (idx as usize) % N_WAITERS;
