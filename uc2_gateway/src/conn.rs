@@ -74,6 +74,14 @@ pub(crate) struct Conn {
     /// The connection is finished: the socket has been shut down and the
     /// reader must stop.
     closed: AtomicBool,
+    /// The handshake completed and `HELLO_OK` is on the wire.
+    ///
+    /// Nothing the edge sends *on its own initiative* — the `STATUS` timer
+    /// above all — may go out before this is set. A client's dial requires the
+    /// first frame it reads to be `HELLO_OK`/`HELLO_REFUSED`/`REDIRECT`, so a
+    /// `STATUS` that beat the handshake (a slow WAN link plus a status
+    /// interval well under the handshake budget) would fail the dial outright.
+    ready: AtomicBool,
     /// Readers parked on the credit gate. Lets the driver skip the gate lock
     /// entirely on the (overwhelmingly common) uncontended path.
     gate_waiters: AtomicU32,
@@ -96,6 +104,7 @@ impl Conn {
             squeezed: AtomicBool::new(false),
             last_write_ns: AtomicU64::new(now_ns),
             closed: AtomicBool::new(false),
+            ready: AtomicBool::new(false),
             gate_waiters: AtomicU32::new(0),
             gate: (Mutex::new(()), Condvar::new()),
             logged_unexpected: AtomicBool::new(false),
@@ -123,6 +132,16 @@ impl Conn {
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// Call once, immediately after `HELLO_OK` is written. See [`Conn::ready`].
+    pub fn set_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
+
+    /// Whether the edge may write unsolicited frames on this connection.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
     }
 
     pub fn last_write_ns(&self) -> u64 {
@@ -392,6 +411,14 @@ mod tests {
         assert_eq!(c.inflight.load(Ordering::SeqCst), 0);
         assert!(!c.unreserve(8), "unreserving twice is a no-op");
         assert_eq!(c.acked_seq(), 42, "a query never advances acked_seq");
+    }
+
+    #[test]
+    fn a_fresh_connection_is_not_ready_for_unsolicited_frames() {
+        let c = a_conn(0, 4);
+        assert!(!c.is_ready(), "nothing may be written before HELLO_OK");
+        c.set_ready();
+        assert!(c.is_ready());
     }
 
     #[test]

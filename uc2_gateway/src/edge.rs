@@ -45,6 +45,26 @@
 //! designed (we stop reading a client that ignores its credits) and is woken
 //! by the driver, by `close`, and by a 20 ms backstop tick.
 //!
+//! ### Head-of-line blocking in the driver — a real, accepted cost
+//!
+//! The single driver writes each answer **inside** the `PollHalf::poll`
+//! callback. So a client whose socket send buffer is full stalls the driver in
+//! `write_frame` for up to [`WRITE_TIMEOUT`], and for that whole time the
+//! driver is *not draining the engine's egress broadcast*. That broadcast is a
+//! ring: records that are not read before the producer laps them are
+//! overwritten, and the engine reports an overwritten completion as
+//! `Outcome::TimedOut`. The consequence is therefore not merely "other clients
+//! wait" — it is that **other clients' already-computed responses can be lost
+//! and surface to them as `UNKNOWN`**, which they must resolve by re-sending
+//! (safe, and answered `replayed`, only when the session envelope is on).
+//!
+//! Two things bound it today: `WRITE_TIMEOUT` is 1 s, and a stalled write is
+//! fatal to that connection rather than retried. The real remedy — not
+//! implemented here — is to take the write off the driver entirely: a bounded
+//! outbound queue per connection with a per-connection writer thread (or one
+//! writer pool), so `poll` only ever enqueues and a slow peer is dropped by
+//! its own queue filling up rather than by stalling the shared drain.
+//!
 //! ## Not here yet
 //!
 //! The leader **watch** (poll `can_serve`/`leader_hint`, push `LEADER_CHANGED`
@@ -70,9 +90,9 @@ use uc2_log::cnc::CncPage;
 use uc2_remote::conn::FramedConn;
 use uc2_remote::frame::{
     FLAG_ENVELOPED, FLAG_EXPIRED, FLAG_IS_QUERY, FLAG_LINEARIZABLE, FLAG_REPLAYED, FrameType,
-    HELLO_REFUSED_APP_ID, HELLO_REFUSED_VERSION, Header, Hello, HelloOk, HelloRefused, Leader,
-    PROTOCOL_VERSION, RETRY_NOT_SERVING, RETRY_PAYLOAD_TOO_LARGE, RETRY_SERVICE_UNAVAILABLE,
-    ResponseMeta, Retry, Status,
+    HELLO_REFUSED_APP_ID, HELLO_REFUSED_FAULTED, HELLO_REFUSED_VERSION, Header, Hello, HelloOk,
+    HelloRefused, Leader, PROTOCOL_VERSION, RETRY_NOT_SERVING, RETRY_PAYLOAD_TOO_LARGE,
+    RETRY_SERVICE_UNAVAILABLE, ResponseMeta, Retry, Status,
 };
 use uc_protocol::ring::RingWaitHandle;
 
@@ -100,10 +120,16 @@ const TAG_EXPIRED: u8 = 2;
 /// `client_id ++ seq`, little-endian — `uc2_service::SESSION_HEADER_LEN`.
 const SESSION_HEADER_LEN: usize = 16;
 
-/// Socket write timeout. A write happens under the per-connection writer lock,
-/// so this is the hard bound on how long one slow client can hold it. Long
-/// enough that a briefly full socket buffer is not mistaken for a dead peer.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Socket write timeout — the hard bound on how long one client can stall the
+/// driver's drain of the engine broadcast (see "Head-of-line blocking" above),
+/// and on how long it can hold the per-connection writer lock.
+///
+/// One second, deliberately short. These are small frames on a `TCP_NODELAY`
+/// socket: a peer that cannot absorb one within a second is not "briefly
+/// busy", it is gone (or has stopped reading, which for a protocol with
+/// receiver-driven credits is the same thing). Dropping the connection is both
+/// cheaper and more honest than holding the shared drain hostage for longer.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Socket read timeout — the reader's tick, at which it notices the stop flag.
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
 /// Budget for a connection's `HELLO` to arrive.
@@ -115,6 +141,14 @@ const RETRY_BACKOFF_US: u32 = 1_000;
 /// `RETRY{not_serving}` backoff hint: about one election timeout, since that
 /// is how long the client would have to wait for a leader to exist.
 const NOT_SERVING_BACKOFF_US: u32 = 300_000;
+/// Backpressure ladder for a reader whose `try_submit` is being refused: this
+/// many `yield_now`s before it starts parking. A yield is right while the
+/// engine is merely momentarily full; parking is right once it is clear the
+/// node is not draining, so a wedged node cannot burn a core per connection.
+const BACKPRESSURE_YIELDS: u32 = 64;
+/// First park in the backpressure ladder, doubling to [`BACKPRESSURE_PARK_MAX`].
+const BACKPRESSURE_PARK_MIN: Duration = Duration::from_micros(10);
+const BACKPRESSURE_PARK_MAX: Duration = Duration::from_millis(1);
 /// Driver idle ladder, copied in shape from `uc2_client::pipelined`'s driver:
 /// spin, then yield, then park on the egress ring's wake word.
 const DRIVER_SPINS: u32 = 10;
@@ -152,6 +186,7 @@ struct StatCells {
     unknown: AtomicU64,
     backpressure_events: AtomicU64,
     leader_changes: AtomicU64,
+    status_frames: AtomicU64,
 }
 
 impl StatCells {
@@ -166,6 +201,7 @@ impl StatCells {
             unknown: self.unknown.load(Ordering::Relaxed),
             backpressure_events: self.backpressure_events.load(Ordering::Relaxed),
             leader_changes: self.leader_changes.load(Ordering::Relaxed),
+            status_frames: self.status_frames.load(Ordering::Relaxed),
         }
     }
 }
@@ -202,6 +238,9 @@ pub struct EdgeStats {
     pub backpressure_events: u64,
     /// `LEADER_CHANGED` frames written back.
     pub leader_changes: u64,
+    /// Standalone `STATUS` frames written back — the idle-liveness tick and
+    /// the credit-reopened announcement. Never counted before `HELLO_OK`.
+    pub status_frames: u64,
 }
 
 // ---------------------------------------------------------------- shared
@@ -225,6 +264,16 @@ struct Shared {
     /// the (already guarded) case of an index collision.
     next_corr: AtomicU32,
     readers: Mutex<Vec<JoinHandle<()>>>,
+    /// The edge has taken itself out of service: the node's shmem instance
+    /// restarted underneath it, so its `Engine` attach is void and every
+    /// request it could accept would fail the same way.
+    ///
+    /// Without this the edge livelocks a client: the handshake succeeds, the
+    /// first SUBMIT hits `InstanceRestart`, the client is told
+    /// `LEADER_CHANGED{unknown}`, it reconnects to the same address, and round
+    /// it goes. Refusing the *handshake* is what makes the failure visible and
+    /// terminal, and lets a multi-member client move on.
+    faulted: AtomicBool,
 }
 
 impl Shared {
@@ -271,9 +320,16 @@ impl Shared {
         conn.write(conn.hdr(FrameType::Retry, 0, seq), &out, self.now_ns());
     }
 
+    /// Write a standalone `STATUS`. Silently does nothing on a connection whose
+    /// handshake has not completed — an unsolicited frame before `HELLO_OK`
+    /// would fail the peer's dial (see `Conn::ready`).
     fn write_status(&self, conn: &Conn) {
+        if !conn.is_ready() {
+            return;
+        }
         let mut out = Vec::new();
         Status { acked_seq: conn.acked_seq(), credits: conn.credits() }.encode(&mut out);
+        self.stats.status_frames.fetch_add(1, Ordering::Relaxed);
         conn.write(conn.hdr(FrameType::Status, 0, 0), &out, self.now_ns());
     }
 
@@ -282,13 +338,26 @@ impl Shared {
     /// each client the leader is unknown (which makes `RemoteClient`
     /// reconnect and re-`HELLO`) and drop the lot.
     fn on_instance_restart(&self) {
+        // Latch first: a connection accepted between here and the last close
+        // must be refused at the handshake, not served into the same fault.
+        self.faulted.store(true, Ordering::SeqCst);
         let mut out = Vec::new();
+        // The `node_id` is a sentinel and is ignored by the client — the EMPTY
+        // ADDRESS is the signal ("leader unknown: reconnect and re-HELLO").
         Leader { node_id: u32::MAX, addr: "" }.encode(&mut out);
         for c in self.table.take_all() {
-            self.stats.leader_changes.fetch_add(1, Ordering::Relaxed);
-            c.write(c.hdr(FrameType::LeaderChanged, 0, 0), &out, self.now_ns());
+            // A connection still mid-handshake gets no frame, only the close:
+            // its peer is waiting for HELLO_OK and would reject anything else.
+            if c.is_ready() {
+                self.stats.leader_changes.fetch_add(1, Ordering::Relaxed);
+                c.write(c.hdr(FrameType::LeaderChanged, 0, 0), &out, self.now_ns());
+            }
             c.close();
         }
+    }
+
+    fn is_faulted(&self) -> bool {
+        self.faulted.load(Ordering::SeqCst)
     }
 }
 
@@ -355,6 +424,7 @@ impl Edge {
             max_payload,
             next_corr: AtomicU32::new(0),
             readers: Mutex::new(Vec::new()),
+            faulted: AtomicBool::new(false),
         });
 
         // The driver gets its own `SendHalf` clone: `SendHalf` is `Send` but
@@ -390,6 +460,27 @@ impl Edge {
 
     pub fn stats(&self) -> EdgeStats {
         self.shared.stats.snapshot()
+    }
+
+    /// The edge has taken itself out of service and will refuse every new
+    /// handshake with `HELLO_REFUSED{HELLO_REFUSED_FAULTED}` until the process
+    /// is restarted.
+    ///
+    /// Today the only way in is the node's shmem instance restarting under the
+    /// attached `Engine`. Re-attaching in place is deliberately not attempted:
+    /// `uc2_client` documents re-attach as a v2.0 decision, and a relay that
+    /// silently reconnected to a *different* node incarnation would be
+    /// answering with a session table the client never established. A
+    /// supervisor (systemd) restarting the gateway is the intended recovery.
+    pub fn is_faulted(&self) -> bool {
+        self.shared.is_faulted()
+    }
+
+    /// Force the faulted state, for tests that need to observe the refusal
+    /// without racing a real node restart. Not part of the public contract.
+    #[doc(hidden)]
+    pub fn fault_for_tests(&self) {
+        self.shared.on_instance_restart();
     }
 
     /// Stop serving and join every thread this edge started.
@@ -529,6 +620,17 @@ fn handshake(shared: &Arc<Shared>, conn: &Arc<Conn>, send: &SendHalf, fc: &mut F
         return false;
     }
     conn.set_client_id(h.client_id);
+    if shared.is_faulted() {
+        // Terminal for this edge, not for the cluster: a client with more than
+        // one member in its list should try the next one.
+        refuse_hello(
+            shared,
+            conn,
+            HELLO_REFUSED_FAULTED,
+            "edge faulted: node instance restarted; restart the gateway",
+        );
+        return false;
+    }
     if h.version != PROTOCOL_VERSION {
         let detail = format!("edge speaks remote protocol v{PROTOCOL_VERSION}");
         refuse_hello(shared, conn, HELLO_REFUSED_VERSION, &detail);
@@ -547,7 +649,12 @@ fn handshake(shared: &Arc<Shared>, conn: &Arc<Conn>, send: &SendHalf, fc: &mut F
     let leader_addr = leader.and_then(|id| shared.gateway_of(id)).unwrap_or("");
     let mut out = Vec::new();
     HelloOk { credits: shared.cfg.per_conn_inflight, leader, leader_addr }.encode(&mut out);
-    conn.write(conn.hdr(FrameType::HelloOk, 0, h.seq), &out, shared.now_ns())
+    if !conn.write(conn.hdr(FrameType::HelloOk, 0, h.seq), &out, shared.now_ns()) {
+        return false;
+    }
+    // Only now may the edge write on its own initiative (the STATUS timer).
+    conn.set_ready();
+    true
 }
 
 fn refuse_hello(shared: &Arc<Shared>, conn: &Arc<Conn>, reason: u8, detail: &str) {
@@ -607,6 +714,15 @@ fn dispatch(
     }
 
     // The envelope rides inside the node's payload budget, so it counts.
+    //
+    // This check is redundant by design: the `Engine` inherits the same bound
+    // from the cnc page and refuses an oversized payload itself
+    // (`uc2_client/src/engine.rs`, `SendHalf::send`), and the arm below handles
+    // that refusal identically. It is kept as belt-and-braces because the
+    // spec's wording is a *guarantee about the ring* ("payload > the node's
+    // max_payload → refused before touching the ring"), and a guarantee that
+    // holds only because some other crate's private ordering happens to check
+    // first is not one this edge can make. Both paths write the same frame.
     let envelope = shared.cfg.session_envelope && !is_query;
     let wire_len = payload.len() + if envelope { SESSION_HEADER_LEN } else { 0 };
     if wire_len > shared.max_payload {
@@ -645,7 +761,15 @@ fn dispatch(
 
     // Retry only against `Backpressure`, and only for as long as the request's
     // own budget: an engine that never drains must not spin a reader forever.
+    //
+    // The window is squeezed ONCE per request, not once per retry iteration:
+    // halving on every spin would drive a connection to 1 credit in six
+    // iterations of what is often a sub-microsecond hiccup, and would inflate
+    // `backpressure_events` into a count of loop turns rather than of episodes.
     let deadline = Instant::now() + shared.cfg.request_timeout;
+    let mut squeezed = false;
+    let mut spins: u32 = 0;
+    let mut park = BACKPRESSURE_PARK_MIN;
     loop {
         let res = if is_query {
             let c = if h.flags & FLAG_LINEARIZABLE != 0 {
@@ -664,8 +788,11 @@ fn dispatch(
                 return true;
             }
             Err(SubmitError::Backpressure) => {
-                shared.stats.backpressure_events.fetch_add(1, Ordering::Relaxed);
-                conn.squeeze();
+                if !squeezed {
+                    squeezed = true;
+                    shared.stats.backpressure_events.fetch_add(1, Ordering::Relaxed);
+                    conn.squeeze();
+                }
                 if shared.stopping() || conn.is_closed() {
                     conn.unreserve(corr);
                     return false;
@@ -681,9 +808,20 @@ fn dispatch(
                     }
                     return !conn.is_closed();
                 }
-                // Deliberately do NOT read the socket while squeezed: the TCP
+                // Deliberately do NOT read the socket while waiting: the TCP
                 // window closing is the backstop the credit scheme leans on.
-                std::thread::yield_now();
+                //
+                // Yield while the engine is plausibly just momentarily full,
+                // then park on a doubling ladder — a node that has stopped
+                // draining altogether must not cost one spinning core per
+                // connection while the request burns its timeout.
+                if spins < BACKPRESSURE_YIELDS {
+                    spins += 1;
+                    std::thread::yield_now();
+                } else {
+                    std::thread::park_timeout(park);
+                    park = (park * 2).min(BACKPRESSURE_PARK_MAX);
+                }
             }
             Err(SubmitError::NotServing) => {
                 // Unreachable with `serving_gate: false`, but the engine owns
@@ -738,17 +876,24 @@ fn driver(shared: Arc<Shared>, mut poll: PollHalf, send: SendHalf) {
     let wh = poll.wait_handle();
     let mut cycle: u64 = 0;
     let mut idle: u32 = 0;
+    // The periodic work walks every connection, which means a table snapshot;
+    // an idle driver spins its ladder thousands of times a second, so running
+    // it per idle iteration would allocate a `Vec` per turn to discover there
+    // is nothing to do. A quarter of `status_interval` keeps the STATUS timer
+    // accurate to well within its own tolerance at a fraction of the cost.
+    let periodic_every = (shared.cfg.status_interval / 4).max(Duration::from_millis(1));
+    let mut last_periodic = Instant::now();
     while !shared.stopping() {
         cycle += 1;
         let n = poll.poll(|c| complete(&shared, &send, c));
         if n > 0 {
             idle = 0;
             if cycle.is_multiple_of(DRIVER_PERIODIC_EVERY) {
-                periodic(&shared, &send);
+                maybe_periodic(&shared, &send, &mut last_periodic, periodic_every);
             }
             continue;
         }
-        periodic(&shared, &send);
+        maybe_periodic(&shared, &send, &mut last_periodic, periodic_every);
         if shared.stopping() {
             break;
         }
@@ -773,6 +918,20 @@ fn driver(shared: Arc<Shared>, mut poll: PollHalf, send: SendHalf) {
     poll.drain_abort(|_| {});
 }
 
+/// Run [`periodic`] at most once per `every`.
+fn maybe_periodic(
+    shared: &Arc<Shared>,
+    send: &SendHalf,
+    last: &mut Instant,
+    every: Duration,
+) {
+    let now = Instant::now();
+    if now.duration_since(*last) >= every {
+        *last = now;
+        periodic(shared, send);
+    }
+}
+
 /// The driver's between-polls work.
 fn periodic(shared: &Arc<Shared>, _send: &SendHalf) {
     // Task 9: leader watch here — poll `can_serve()`/`leader_hint()` and push
@@ -780,7 +939,11 @@ fn periodic(shared: &Arc<Shared>, _send: &SendHalf) {
     let now = shared.now_ns();
     let interval = shared.cfg.status_interval.as_nanos() as u64;
     shared.table.for_each(|c| {
-        if now.saturating_sub(c.last_write_ns()) >= interval {
+        // `is_ready` is checked here as well as inside `write_status` so a
+        // mid-handshake connection costs nothing at all: it is the common case
+        // on a slow link, and the whole point is that the STATUS timer must not
+        // race the handshake (see `Conn::ready`).
+        if c.is_ready() && now.saturating_sub(c.last_write_ns()) >= interval {
             // Doubles as edge→client liveness: a client that hears nothing at
             // all for its `dead_after` fails the connection over.
             shared.write_status(c);
@@ -797,12 +960,15 @@ fn complete(shared: &Arc<Shared>, send: &SendHalf, c: Completion<'_>) {
     let Some(conn) = shared.table.get(idx) else { return };
     let Some((seq, is_query)) = conn.claim(corr) else { return };
 
-    // Relaxing before the frame is built means the RESPONSE itself carries the
+    // Relaxing before the frame is built means a RESPONSE itself carries the
     // reopened window.
-    let mut credits_up = false;
-    if matches!(c.outcome, Outcome::Response(_)) {
-        credits_up = conn.relax(shared.cfg.per_conn_inflight);
-    }
+    //
+    // ANY completion relaxes, not just a `Response`: what a squeeze measures is
+    // the engine's inflight window being full, and every completion — a retry,
+    // a redirect, a timed-out slot — is that window giving a slot back. Gating
+    // the relax on `Response` would pin a connection at 1 credit for as long as
+    // the node was answering `NotLeader`, and then leave it there.
+    let credits_up = conn.relax(shared.cfg.per_conn_inflight);
     conn.notify_gate();
 
     let now = shared.now_ns();

@@ -102,6 +102,8 @@ fn write_cas_read_round_trip_through_the_edge() {
 
     client.shutdown();
     edge.stop();
+    // `Edge::stop` joins every thread it started — hold it to that.
+    common::assert_no_gateway_threads();
     node.stop();
     svc.stop();
 }
@@ -139,6 +141,8 @@ fn raw_pass_through_round_trips_with_the_envelope_off() {
 
     client.shutdown();
     edge.stop();
+    // `Edge::stop` joins every thread it started — hold it to that.
+    common::assert_no_gateway_threads();
     node.stop();
     svc.stop();
 }
@@ -179,6 +183,8 @@ fn an_oversized_submit_is_refused_with_payload_too_large() {
 
     client.shutdown();
     edge.stop();
+    // `Edge::stop` joins every thread it started — hold it to that.
+    common::assert_no_gateway_threads();
     node.stop();
     svc.stop();
 }

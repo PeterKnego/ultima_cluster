@@ -66,3 +66,38 @@ pub fn await_serving(node: &Node, secs: u64) {
         std::thread::sleep(Duration::from_millis(2));
     }
 }
+
+/// Names of this process's live threads that the gateway spawned.
+///
+/// `Edge::stop` promises to join every thread it started; this is how the
+/// tests hold it to that rather than taking its word. Linux exposes each
+/// thread's name at `/proc/self/task/<tid>/comm` (truncated to 15 bytes, which
+/// all the `uc2-gw-*` names fit inside).
+pub fn gateway_threads() -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else { return out };
+    for t in tasks.flatten() {
+        if let Ok(name) = std::fs::read_to_string(t.path().join("comm")) {
+            let name = name.trim().to_string();
+            if name.starts_with("uc2-gw-") {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Assert every gateway thread is gone. Joining is synchronous in
+/// `Edge::stop`, but a joined thread's `/proc` entry can linger for an instant,
+/// so allow a brief settle.
+pub fn assert_no_gateway_threads() {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let live = gateway_threads();
+        if live.is_empty() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "gateway threads outlived Edge::stop: {live:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

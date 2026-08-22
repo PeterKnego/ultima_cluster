@@ -5,6 +5,12 @@
 //! type-specific payload. All integers are little-endian; string fields are
 //! a `u16` length prefix followed by UTF-8 bytes. See
 //! `docs/reference/remote-protocol.md` and design spec §4.2.
+//!
+//! A handshake is refused with one of the `HELLO_REFUSED_*` reasons:
+//! [`HELLO_REFUSED_APP_ID`] and [`HELLO_REFUSED_VERSION`] are the client's
+//! problem (another member would answer the same way), while
+//! [`HELLO_REFUSED_FAULTED`] is the *edge's* — it has taken itself out of
+//! service and another member is worth trying.
 
 pub use crate::error::FrameError;
 
@@ -43,6 +49,11 @@ pub const RETRY_PAYLOAD_TOO_LARGE: u8 = 4;
 
 pub const HELLO_REFUSED_APP_ID: u8 = 1;
 pub const HELLO_REFUSED_VERSION: u8 = 2;
+/// The edge is faulted and will not serve again until it is restarted (today:
+/// the node's shmem instance restarted underneath it, so its `Engine` attach
+/// is void). Unlike the other two reasons this says nothing about the client's
+/// request — a *different* member's edge may well be healthy.
+pub const HELLO_REFUSED_FAULTED: u8 = 3;
 
 /// The frame's type byte, one per row of the design spec's frame table.
 #[repr(u8)]
@@ -388,6 +399,25 @@ mod tests {
         Leader { node_id: 7, addr: "" }.encode(&mut out);
         let l = Leader::decode(&out).unwrap();
         assert_eq!((l.node_id, l.addr), (7, ""));
+    }
+
+    #[test]
+    fn the_three_hello_refusal_reasons_are_distinct_and_round_trip() {
+        for r in [HELLO_REFUSED_APP_ID, HELLO_REFUSED_VERSION, HELLO_REFUSED_FAULTED] {
+            let mut out = Vec::new();
+            HelloRefused { reason: r, detail: "why" }.encode(&mut out);
+            assert_eq!(HelloRefused::decode(&out).unwrap().reason, r);
+        }
+        assert_eq!(
+            [HELLO_REFUSED_APP_ID, HELLO_REFUSED_VERSION, HELLO_REFUSED_FAULTED].len(),
+            std::collections::BTreeSet::from([
+                HELLO_REFUSED_APP_ID,
+                HELLO_REFUSED_VERSION,
+                HELLO_REFUSED_FAULTED
+            ])
+            .len(),
+            "reason codes must not collide"
+        );
     }
 
     #[test]
