@@ -61,7 +61,8 @@ use crate::snapshots::SnapshotStore;
 
 pub use crate::config::{ServiceConfig, ServiceError, SnapshotError, SnapshotPolicy};
 pub use crate::traits::{
-    NoopOutput, OutputError, OutputHandler, SnapshotStateMachine, StateMachine,
+    NoopOutput, OutputError, OutputHandler, RawOutputHandler, RawStateMachine,
+    SnapshotStateMachine, StateMachine, TypedOutput,
 };
 
 /// Default idle strategy for the apply thread: a short sleep between empty

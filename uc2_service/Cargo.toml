@@ -43,3 +43,4 @@ uc2_client = { path = "../uc2_client" }
 # full node + service + client stack rather than a local one-off test SM.
 uc-lincheck = { path = "../uc-lincheck", default-features = false, features = ["v2"] }
 tempfile = { workspace = true }
+serde = { workspace = true }

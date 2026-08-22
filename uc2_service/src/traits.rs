@@ -44,6 +44,47 @@ pub trait StateMachine: Send + 'static {
     fn last_applied(&self) -> Option<u64>;
 }
 
+/// The core state-machine contract: bytes in, bytes out. The framework hands
+/// `apply` the committed frame payload exactly as it sits in the log buffer
+/// and reuses `out` across calls — no decode, no allocation in steady state.
+/// Implement this directly for SBE / flatbuffers / hand-laid frames; or
+/// implement [`StateMachine`] (typed, serde + bincode) and get this for free
+/// via the blanket impl below. A type implements ONE of the two.
+pub trait RawStateMachine: Send + 'static {
+    /// Apply the committed command at `position` (the absolute log byte
+    /// offset, the idempotency key). Write the response bytes into `out`
+    /// (cleared by the caller). Deterministic, sync, no I/O.
+    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>);
+    /// Answer a read. `out` is cleared by the caller.
+    fn query(&self, q: &[u8], out: &mut Vec<u8>);
+    /// Highest position applied so far (`None` before the first).
+    fn last_applied(&self) -> Option<u64>;
+}
+
+/// Every typed state machine is a raw one: decode with bincode-standard,
+/// apply, encode the response with bincode-standard — exactly the codec the
+/// framework used through v2.5.0, so the wire is byte-identical.
+impl<S: StateMachine> RawStateMachine for S {
+    #[inline]
+    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
+        let (cmd, _) = bincode::serde::decode_from_slice::<S::Command, _>(cmd, bincode::config::standard())
+            .expect("corrupt committed frame (fail-stop)");
+        let resp = StateMachine::apply(self, position, cmd);
+        bincode::serde::encode_into_std_write(&resp, out, bincode::config::standard())
+            .expect("response bincode-encode (fail-stop)");
+    }
+    #[inline]
+    fn query(&self, q: &[u8], out: &mut Vec<u8>) {
+        let (q, _) = bincode::serde::decode_from_slice::<S::Query, _>(q, bincode::config::standard())
+            .expect("corrupt query frame (fail-stop)");
+        let qr = StateMachine::query(self, q);
+        bincode::serde::encode_into_std_write(&qr, out, bincode::config::standard())
+            .expect("query-response bincode-encode (fail-stop)");
+    }
+    #[inline]
+    fn last_applied(&self) -> Option<u64> { StateMachine::last_applied(self) }
+}
+
 /// Optional capability: state machines that can serialize their full state and
 /// restore it wholesale. This is what lets the framework **purge** the log — a
 /// deployment whose SM does not implement it never purges (M6; documented), and
@@ -123,6 +164,29 @@ impl<S: StateMachine> OutputHandler<S> for NoopOutput {
         _state: &S,
     ) -> Result<(), OutputError> {
         Ok(())
+    }
+}
+
+/// Raw-tier output handler: sees the committed command bytes. The typed
+/// [`OutputHandler`] is adapted onto this by [`TypedOutput`].
+#[allow(async_fn_in_trait)]
+pub trait RawOutputHandler<S: RawStateMachine>: Send + 'static {
+    async fn on_committed(&self, position: u64, cmd: &[u8], state: &S) -> Result<(), OutputError>;
+}
+
+impl<S: RawStateMachine> RawOutputHandler<S> for NoopOutput {
+    async fn on_committed(&self, _position: u64, _cmd: &[u8], _state: &S) -> Result<(), OutputError> { Ok(()) }
+}
+
+/// Adapts a typed [`OutputHandler`] to the raw tier (one bincode decode per
+/// committed command, as the output agent did through v2.5.0).
+pub struct TypedOutput<O>(pub O);
+
+impl<S: StateMachine, O: OutputHandler<S>> RawOutputHandler<S> for TypedOutput<O> {
+    async fn on_committed(&self, position: u64, cmd: &[u8], state: &S) -> Result<(), OutputError> {
+        let (cmd, _) = bincode::serde::decode_from_slice::<S::Command, _>(cmd, bincode::config::standard())
+            .expect("corrupt committed frame (fail-stop)");
+        self.0.on_committed(position, &cmd, state).await
     }
 }
 
