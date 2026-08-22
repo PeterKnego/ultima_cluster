@@ -37,6 +37,10 @@ pub struct Behaviour {
     pub refuse_hello: Option<u8>,
     /// Answer every SUBMIT/QUERY with `REDIRECT{node 2, addr}`.
     pub redirect_all_to: Option<String>,
+    /// Answer every SUBMIT/QUERY with a `REDIRECT` naming *this edge's own*
+    /// address — the "elected but not serving" hint an edge can legitimately
+    /// produce. The client must not chase it in a loop.
+    pub redirect_to_self: bool,
     /// Answer the first request on the first connection with
     /// `RETRY{NOT_SERVING, 1000}`, then behave normally.
     pub retry_once: bool,
@@ -49,6 +53,10 @@ pub struct Behaviour {
     pub drop_after_first_request: bool,
     /// Answer every request with `FLAG_EXPIRED | FLAG_ENVELOPED`.
     pub expired: bool,
+    /// Accept `HELLO`, answer `HELLO_OK`, then go silent: read every frame and
+    /// answer nothing (not even `PING`), keeping the socket open. The client
+    /// must notice via `dead_after`, not via an error.
+    pub hang: bool,
     /// Delay between a request arriving and its answer being written.
     pub delay: Duration,
 }
@@ -59,11 +67,13 @@ impl Default for Behaviour {
             credits: 2,
             refuse_hello: None,
             redirect_all_to: None,
+            redirect_to_self: false,
             retry_once: false,
             unknown_once: false,
             payload_too_large_once: false,
             drop_after_first_request: false,
             expired: false,
+            hang: false,
             delay: Duration::from_millis(1),
         }
     }
@@ -233,8 +243,13 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
             Ok(Some((h, payload))) => match h.ty {
                 FrameType::Submit | FrameType::Query => {
                     o.arrived(h.seq);
+                    if b.hang {
+                        continue;
+                    }
                     let once = is_first && !used_once;
-                    let action = if let Some(addr) = &b.redirect_all_to {
+                    let action = if b.redirect_to_self {
+                        Action::Redirect { seq: h.seq, addr: self_addr.clone() }
+                    } else if let Some(addr) = &b.redirect_all_to {
                         Action::Redirect { seq: h.seq, addr: addr.clone() }
                     } else if once && b.drop_after_first_request {
                         used_once = true;
@@ -264,6 +279,7 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
                         break;
                     }
                 }
+                FrameType::Ping if b.hang => {}
                 FrameType::Ping => {
                     q.0.lock().unwrap().push_back(Action::Pong);
                     q.1.notify_all();

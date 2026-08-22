@@ -63,14 +63,24 @@ use crate::frame::{
     RETRY_PAYLOAD_TOO_LARGE,
 };
 
-/// How often the reader wakes up when the socket is quiet, to time out
-/// requests and to notice `shutdown`.
+/// The reader's tick: how often it times out stale requests, re-pumps requests
+/// whose `RETRY` backoff has expired, sends `PING`, and notices `shutdown`.
+/// Also the socket read timeout, so an idle connection ticks at this rate.
+/// It is the granularity at which a `RETRY` hint is honoured.
 const SWEEP_INTERVAL: Duration = Duration::from_millis(25);
+/// Socket write timeout. Deliberately *not* `request_timeout`: a write happens
+/// under the state lock, so a stuck write freezes the whole client for this
+/// long. Short enough to fail over quickly, long enough that a briefly full
+/// socket buffer is not mistaken for a dead peer.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// A `RETRY` hint is honoured, but never for longer than this.
 const MAX_RETRY_SLEEP: Duration = Duration::from_secs(1);
 /// A `RETRY{retry_after_us: 0}` still backs off this much, so a retry loop can
 /// never become a spin.
 const MIN_RETRY_SLEEP: Duration = Duration::from_micros(100);
+/// Backoff applied to a request an edge redirected to *itself* — the edge is
+/// telling us it cannot serve and has no better hint, so slow down.
+const SELF_REDIRECT_BACKOFF: Duration = Duration::from_millis(10);
 /// Backoff after a full pass over `members` failed to connect.
 const RECONNECT_BACKOFF_START: Duration = Duration::from_millis(5);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
@@ -98,6 +108,13 @@ pub struct RemoteConfig {
     pub request_timeout: Duration,
     /// Per-address TCP connect + `HELLO` budget.
     pub connect_timeout: Duration,
+    /// Send a `PING` when nothing has been written for this long, so an idle
+    /// connection still proves itself. Must be well under `dead_after`.
+    pub ping_interval: Duration,
+    /// Treat the connection as dead when nothing at all has been *received* for
+    /// this long, and fail over. The edge's `STATUS` timer and the `PONG` to our
+    /// `PING` both count as traffic.
+    pub dead_after: Duration,
     /// `UNKNOWN` means "may or may not have committed". `true` (the default)
     /// re-sends — correct with the edge's session envelope on, and the only way
     /// to get a definite answer. `false` surfaces [`RemoteError::Unknown`].
@@ -113,6 +130,8 @@ impl Default for RemoteConfig {
             max_inflight: 1024,
             request_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(2),
+            ping_interval: Duration::from_secs(1),
+            dead_after: Duration::from_secs(3),
             resend_on_unknown: true,
         }
     }
@@ -206,6 +225,12 @@ struct Pending {
     payload: Bytes,
     tx: SyncSender<Result<RemoteResponse, RemoteError>>,
     created: Instant,
+    /// Earliest time this request may go on the wire again. A `RETRY` hint and
+    /// the self-`REDIRECT` backoff are expressed here rather than by sleeping:
+    /// the reader thread must never block, or one request's backoff would delay
+    /// every other request's response — and a queued `REDIRECT` past its
+    /// failover budget.
+    not_before: Instant,
     attempts: u32,
     /// `false` = written to no live connection yet (fresh, or invalidated by a
     /// reconnect / `RETRY` / `UNKNOWN`); the pump owns getting it onto the wire.
@@ -241,6 +266,9 @@ struct State {
     /// The address currently connected to (may be a redirect target that is not
     /// in `members`).
     current_addr: String,
+    /// When anything was last written to the current connection — drives `PING`.
+    /// Lives here (not in the reader thread) because submitting threads write too.
+    last_write: Instant,
     closed: bool,
 }
 
@@ -287,7 +315,7 @@ impl RemoteClient {
         let (conn, info, idx, addr) = dial(&cfg, client_id, None, 0)?;
         let read_half = conn.try_clone()?;
         read_half.set_read_timeout(Some(SWEEP_INTERVAL))?;
-        conn.set_write_timeout(Some(cfg.request_timeout))?;
+        conn.set_write_timeout(Some(WRITE_TIMEOUT))?;
 
         let stats = Stats::default();
         stats.max_credits_seen.store(info.credits, Ordering::Relaxed);
@@ -303,6 +331,7 @@ impl RemoteClient {
                 leader: info.leader,
                 member_idx: idx,
                 current_addr: addr,
+                last_write: Instant::now(),
                 closed: false,
             }),
             cv: Condvar::new(),
@@ -337,6 +366,13 @@ impl RemoteClient {
     /// session dedup is per.
     pub fn client_id(&self) -> u64 {
         self.inner.client_id
+    }
+
+    /// Whether a connection is currently established. A `false` here is not a
+    /// failure: the reader thread is reconnecting and outstanding requests will
+    /// be re-sent.
+    pub fn is_connected(&self) -> bool {
+        self.inner.state.lock().unwrap().conn.is_some()
     }
 
     /// The leader the current edge last told us about, if any.
@@ -421,6 +457,7 @@ impl RemoteClient {
                 payload: Bytes::copy_from_slice(payload),
                 tx,
                 created: Instant::now(),
+                not_before: Instant::now(),
                 attempts: 0,
                 sent: false,
             },
@@ -474,16 +511,26 @@ impl Inner {
         if st.conn.is_none() || st.resend_from == u64::MAX {
             return;
         }
-        let State { conn, pending, acked_seq, credits, resend_from, .. } = &mut *st;
+        let now = Instant::now();
+        let State { conn, pending, acked_seq, credits, resend_from, last_write, .. } = &mut *st;
         let window = acked_seq.saturating_add(*credits as u64);
         let c = conn.as_mut().expect("checked above");
         let mut broken = false;
+        let mut wrote = false;
         let mut next_from = u64::MAX;
         for (seq, p) in pending.range_mut(*resend_from..) {
             if p.sent {
                 continue;
             }
             if *seq > window {
+                next_from = *seq;
+                break;
+            }
+            if p.not_before > now {
+                // Still backing off (a RETRY hint, or a self-REDIRECT). Stop
+                // rather than skip: re-send order is part of the contract, so a
+                // later seq must not overtake an earlier one. The reader's tick
+                // pumps again once the backoff expires.
                 next_from = *seq;
                 break;
             }
@@ -498,6 +545,7 @@ impl Inner {
                 Ok(()) => {
                     p.sent = true;
                     p.attempts += 1;
+                    wrote = true;
                     if p.attempts > 1 {
                         self.stats.resends.fetch_add(1, Ordering::Relaxed);
                     }
@@ -510,6 +558,9 @@ impl Inner {
             }
         }
         *resend_from = next_from;
+        if wrote {
+            *last_write = now;
+        }
         if broken {
             // Wake the reader thread out of its blocking read; it reconnects.
             drop_conn(st);
@@ -554,12 +605,16 @@ impl Inner {
         }
     }
 
-    /// Mark a request for re-send. Returns `false` if it is no longer pending
-    /// (already resolved, or swept), in which case there is nothing to do.
-    fn mark_unsent(&self, st: &mut State, seq: u64) -> bool {
+    /// Mark a request for re-send, not before `delay` from now. Returns `false`
+    /// if it is no longer pending (already resolved, or swept), in which case
+    /// there is nothing to do.
+    fn mark_unsent(&self, st: &mut State, seq: u64, delay: Duration) -> bool {
         match st.pending.get_mut(&seq) {
             Some(p) => {
                 p.sent = false;
+                if !delay.is_zero() {
+                    p.not_before = Instant::now() + delay;
+                }
                 st.resend_from = st.resend_from.min(seq);
                 true
             }
@@ -606,22 +661,21 @@ impl Inner {
                     return Act::Continue;
                 }
                 self.stats.retries.fetch_add(1, Ordering::Relaxed);
-                {
-                    let mut st = self.state.lock().unwrap();
-                    if !self.mark_unsent(&mut st, h.seq) {
-                        return Act::Continue;
-                    }
-                }
-                thread::sleep(self.jittered(Duration::from_micros(r.retry_after_us as u64)));
+                let delay = self.jittered(Duration::from_micros(r.retry_after_us as u64));
                 let mut st = self.state.lock().unwrap();
-                self.pump(&mut st);
+                if self.mark_unsent(&mut st, h.seq, delay) {
+                    // Nothing to write yet — the reader's tick pumps it once the
+                    // backoff expires. Never sleep here: this thread also carries
+                    // every other request's response and the failover frames.
+                    self.pump(&mut st);
+                }
                 Act::Continue
             }
             FrameType::Unknown => {
                 self.stats.unknown.fetch_add(1, Ordering::Relaxed);
                 let mut st = self.state.lock().unwrap();
                 if self.cfg.resend_on_unknown {
-                    if self.mark_unsent(&mut st, h.seq) {
+                    if self.mark_unsent(&mut st, h.seq, Duration::ZERO) {
                         self.pump(&mut st);
                     }
                 } else {
@@ -636,20 +690,24 @@ impl Inner {
                 if !l.addr.is_empty() {
                     st.leader = Some((l.node_id, l.addr.to_string()));
                 }
-                // The request was refused, not answered: it must go out again.
-                self.mark_unsent(&mut st, h.seq);
                 if l.addr.is_empty() {
+                    // The request was refused, not answered: it must go out again
+                    // — the reconnect re-sends everything unanswered, in order.
+                    self.mark_unsent(&mut st, h.seq, Duration::ZERO);
                     return Act::Reconnect(None);
                 }
                 if l.addr == st.current_addr {
-                    // An edge redirecting to itself would spin; back off and
-                    // re-send here instead. `request_timeout` bounds it.
-                    drop(st);
-                    thread::sleep(self.jittered(Duration::ZERO));
-                    let mut st = self.state.lock().unwrap();
+                    // An edge can name its own node as the leader hint while not
+                    // yet serving ("elected but not serving"). Reconnecting to
+                    // ourselves would spin, so back off and re-send in place. The
+                    // reader's tick — not this frame's arrival — is what pumps it
+                    // again, and `sweep` on that same tick is what enforces
+                    // `request_timeout` even if the edge answers every re-send.
+                    self.mark_unsent(&mut st, h.seq, SELF_REDIRECT_BACKOFF);
                     self.pump(&mut st);
                     return Act::Continue;
                 }
+                self.mark_unsent(&mut st, h.seq, Duration::ZERO);
                 Act::Reconnect(Some(l.addr.to_string()))
             }
             FrameType::LeaderChanged => {
@@ -699,6 +757,9 @@ impl Inner {
                 }
                 Act::Continue
             }
+            // A PONG carries no state: simply having arrived is the point — the
+            // reader records every received frame against `dead_after`.
+            FrameType::Pong => Act::Continue,
             // HELLO_OK arrives only during a handshake; the rest are client→edge
             // types the edge must never send. Ignore rather than tear down.
             _ => Act::Continue,
@@ -724,6 +785,9 @@ impl Inner {
     /// Never gives up otherwise: a full failed pass over `members` backs off and
     /// tries again, while `sweep` keeps failing requests that run out of budget.
     fn reconnect(&self, preferred: Option<String>, rd: &mut FramedConn) -> bool {
+        if self.is_closed() {
+            return false;
+        }
         self.stats.reconnects.fetch_add(1, Ordering::Relaxed);
         let mut preferred = preferred;
         let mut backoff = RECONNECT_BACKOFF_START;
@@ -754,7 +818,7 @@ impl Inner {
                             continue;
                         }
                     };
-                    let _ = conn.set_write_timeout(Some(self.cfg.request_timeout));
+                    let _ = conn.set_write_timeout(Some(WRITE_TIMEOUT));
                     let mut st = self.state.lock().unwrap();
                     if st.closed {
                         conn.shutdown();
@@ -767,7 +831,13 @@ impl Inner {
                         st.leader = info.leader;
                     }
                     self.note_credits(info.credits);
+                    // `credits` resets from HELLO_OK, but `acked_seq` is carried
+                    // across: it only ever moves forward (every update is a
+                    // `max`), and every pending seq is strictly greater than it,
+                    // so the window `seq <= acked_seq + credits` stays correct
+                    // against an edge that has acknowledged nothing yet.
                     st.credits = info.credits;
+                    st.last_write = Instant::now();
                     self.pump(&mut st);
                     self.cv.notify_all();
                     *rd = read_half;
@@ -782,7 +852,10 @@ impl Inner {
                 }
                 Err(_) => {
                     // Nothing reachable this pass. Keep the promise anyway:
-                    // requests still time out on their own budget.
+                    // requests still time out on their own budget. This is the
+                    // one sleep the reader thread ever takes, and it is only
+                    // reached with no connection at all — no frame can be
+                    // waiting behind it.
                     self.sweep();
                     preferred = None;
                     thread::sleep(backoff);
@@ -792,8 +865,9 @@ impl Inner {
         }
     }
 
-    /// `base` plus up to 25% jitter, floored at [`MIN_RETRY_SLEEP`] and capped at
-    /// [`MAX_RETRY_SLEEP`].
+    /// A backoff of `base` plus up to 25% jitter, floored at [`MIN_RETRY_SLEEP`]
+    /// and capped at [`MAX_RETRY_SLEEP`]. Applied as a `not_before` deadline,
+    /// never as a sleep.
     fn jittered(&self, base: Duration) -> Duration {
         let base = base.clamp(MIN_RETRY_SLEEP, MAX_RETRY_SLEEP);
         let span = (base.as_micros() as u64 / 4).max(1);
@@ -822,27 +896,102 @@ fn drop_conn(st: &mut State) {
     }
 }
 
+/// What the periodic tick decided.
+enum Tick {
+    Ok,
+    /// Nothing has been received for `dead_after`: fail over.
+    Reconnect,
+}
+
+impl Inner {
+    /// The periodic tick, run by the reader thread every [`SWEEP_INTERVAL`]
+    /// **regardless of whether frames are arriving**.
+    ///
+    /// This is what enforces `request_timeout` (an edge that answers every
+    /// re-send with `RETRY` or a self-`REDIRECT` keeps the reader busy forever,
+    /// so an idle-only sweep would never run), what re-pumps requests whose
+    /// backoff has expired, and what keeps the connection proven live.
+    fn tick(&self, now: Instant, dead: bool) -> Tick {
+        self.sweep();
+        let mut st = self.state.lock().unwrap();
+        if st.closed {
+            return Tick::Ok;
+        }
+        if dead {
+            return Tick::Reconnect;
+        }
+        self.pump(&mut st);
+        if st.conn.is_some() && now.duration_since(st.last_write) >= self.cfg.ping_interval {
+            let ping = Header {
+                ty: FrameType::Ping,
+                flags: 0,
+                version: PROTOCOL_VERSION,
+                client_id: self.client_id,
+                seq: 0,
+            };
+            let failed = match st.conn.as_mut() {
+                Some(c) => c.write_frame(ping, &[]).is_err(),
+                None => false,
+            };
+            if failed {
+                drop_conn(&mut st);
+            } else {
+                st.last_write = now;
+            }
+        }
+        Tick::Ok
+    }
+}
+
 fn reader_loop(inner: Arc<Inner>, mut rd: FramedConn) {
+    let mut last_tick = Instant::now();
+    // Owned by this thread alone, so `dead_after` costs no lock.
+    let mut last_recv = last_tick;
     loop {
         if inner.is_closed() {
             return;
         }
-        match rd.read_frame() {
-            Ok(Some((h, payload))) => match inner.on_frame(h, payload) {
-                Act::Continue => {}
-                Act::Stop => return,
-                Act::Reconnect(preferred) => {
-                    if !inner.reconnect(preferred, &mut rd) {
-                        return;
+        let frame = rd.read_frame();
+        // One clock read per iteration serves the tick, the liveness check and
+        // the receive stamp.
+        let now = Instant::now();
+        match frame {
+            Ok(Some((h, payload))) => {
+                last_recv = now;
+                match inner.on_frame(h, payload) {
+                    Act::Continue => {}
+                    Act::Stop => return,
+                    Act::Reconnect(preferred) => {
+                        if !inner.reconnect(preferred, &mut rd) {
+                            return;
+                        }
+                        last_recv = Instant::now();
+                        last_tick = last_recv;
+                        continue;
                     }
                 }
-            },
-            // Idle at a frame boundary: time out whatever ran out of budget.
-            Ok(None) => inner.sweep(),
+            }
+            // Read timeout at a frame boundary: nothing to do here, the tick
+            // below does the periodic work.
+            Ok(None) => {}
             Err(_) => {
-                if inner.is_closed() || !inner.reconnect(None, &mut rd) {
+                if !inner.reconnect(None, &mut rd) {
                     return;
                 }
+                last_recv = Instant::now();
+                last_tick = last_recv;
+                continue;
+            }
+        }
+        if now.duration_since(last_tick) >= SWEEP_INTERVAL {
+            last_tick = now;
+            let dead = now.duration_since(last_recv) >= inner.cfg.dead_after;
+            if let Tick::Reconnect = inner.tick(now, dead) {
+                if !inner.reconnect(None, &mut rd) {
+                    return;
+                }
+                last_recv = Instant::now();
+                last_tick = last_recv;
             }
         }
     }
