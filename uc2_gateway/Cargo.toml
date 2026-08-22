@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Peter Knego
+[package]
+name = "uc2_gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+uc2_remote = { path = "../uc2_remote" }
