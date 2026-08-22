@@ -23,7 +23,7 @@ use ultima_journal::TailReader;
 
 use crate::apply::SnapshotRestore;
 use crate::config::ServiceError;
-use crate::traits::StateMachine;
+use crate::traits::RawStateMachine;
 
 /// Replay archived journal blocks into `sm`, returning the byte cursor after the
 /// last applied/skipped frame — the point at which the live [`LogFollower`] can
@@ -46,7 +46,7 @@ use crate::traits::StateMachine;
 ///   harmless (at-least-once) but noisy, so replay applies without publishing.
 ///
 /// [`LogFollower`]: uc2_log::reader::LogFollower
-pub(crate) fn replay_into<S: StateMachine>(
+pub(crate) fn replay_into<S: RawStateMachine>(
     sm: &Mutex<S>,
     cnc: &CncPage,
     journal_dir: &std::path::Path,
@@ -57,7 +57,9 @@ pub(crate) fn replay_into<S: StateMachine>(
     // The live rejoin point: advances over every frame walked (applied,
     // idempotently-skipped, or padding). Stays a frame boundary throughout.
     let mut cursor = 0u64;
-    let mut decode_error = false;
+    // Reused response scratch: replay never publishes (see the doc), so the
+    // response bytes are written and dropped — one buffer for the whole pass.
+    let mut scratch = Vec::with_capacity(256);
 
     // M6 Task 5 — the GAP GUARD. `needed` is the position tail replay would
     // start dispatching from; `first` is the journal's lowest replayable
@@ -152,23 +154,15 @@ pub(crate) fn replay_into<S: StateMachine>(
                 }
                 // Dispatch MESSAGE frames not already reflected in the SM. NEW_TERM
                 // / PADDING (and any future non-MESSAGE type) are not user data.
+                // Leader-publish suppressed: apply only (see the doc), so the
+                // response bytes land in the throwaway scratch. A typed SM
+                // decodes inside its blanket `RawStateMachine` impl and
+                // fail-stops there on a committed, archived frame that will not
+                // decode — unrecoverable corruption, never a silent skip of
+                // user data.
                 if hdr.frame_type == FRAME_TYPE_MESSAGE && Some(pos) > guard.last_applied() {
-                    match bincode::serde::decode_from_slice::<S::Command, _>(
-                        &payload[off + HEADER_LEN..off + total],
-                        bincode::config::standard(),
-                    ) {
-                        // Leader-publish suppressed: apply only (see the doc).
-                        Ok((cmd, _)) => {
-                            let _ = guard.apply(pos, cmd);
-                        }
-                        Err(_) => {
-                            // A committed, archived frame that will not decode is
-                            // unrecoverable corruption — surface it as fail-stop
-                            // rather than silently skipping user data.
-                            decode_error = true;
-                            return false;
-                        }
-                    }
+                    scratch.clear();
+                    guard.apply(pos, &payload[off + HEADER_LEN..off + total], &mut scratch);
                 }
                 cursor = end;
                 off += aligned;
@@ -177,10 +171,5 @@ pub(crate) fn replay_into<S: StateMachine>(
         })
         .map_err(|e| ServiceError::Replay(e.to_string()))?;
 
-    if decode_error {
-        return Err(ServiceError::Replay(
-            "corrupt archived MESSAGE frame (fail-stop)".to_string(),
-        ));
-    }
     Ok(cursor)
 }

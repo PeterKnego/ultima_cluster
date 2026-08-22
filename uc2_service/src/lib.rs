@@ -77,21 +77,34 @@ const OUTPUT_IDLE: IdleStrategy = IdleStrategy::Sleep(Duration::from_micros(50))
 
 /// Builds and starts a [`Service`]. `O` defaults to [`NoopOutput`]; call
 /// [`output_handler`](Self::output_handler) to install a real one (Task 12).
-pub struct ServiceBuilder<S: StateMachine, O: OutputHandler<S> = NoopOutput> {
+pub struct ServiceBuilder<S: RawStateMachine, O: RawOutputHandler<S> = NoopOutput> {
     cfg: ServiceConfig,
     sm: S,
     output: O,
 }
 
-impl<S: StateMachine> ServiceBuilder<S, NoopOutput> {
+impl<S: RawStateMachine> ServiceBuilder<S, NoopOutput> {
     pub fn new(cfg: ServiceConfig, sm: S) -> Self {
         Self { cfg, sm, output: NoopOutput }
     }
 }
 
-impl<S: StateMachine, O: OutputHandler<S>> ServiceBuilder<S, O> {
-    /// Install a leader-only output handler (Task 12 spawns its agent).
-    pub fn output_handler<O2: OutputHandler<S>>(self, h: O2) -> ServiceBuilder<S, O2> {
+impl<S: RawStateMachine, O: RawOutputHandler<S>> ServiceBuilder<S, O> {
+    /// Install a leader-only, typed output handler (Task 12 spawns its agent).
+    /// The handler is adapted onto the raw tier by [`TypedOutput`] — one
+    /// bincode decode per committed command, on the output thread, exactly as
+    /// before M12a. The user-facing API is unchanged.
+    pub fn output_handler<O2: OutputHandler<S>>(self, h: O2) -> ServiceBuilder<S, TypedOutput<O2>>
+    where
+        S: StateMachine,
+    {
+        ServiceBuilder { cfg: self.cfg, sm: self.sm, output: TypedOutput(h) }
+    }
+
+    /// Install a leader-only RAW output handler: it sees the committed command
+    /// bytes straight from the log, with no codec in the way (the raw tier's
+    /// counterpart to [`output_handler`](Self::output_handler)).
+    pub fn raw_output_handler<O2: RawOutputHandler<S>>(self, h: O2) -> ServiceBuilder<S, O2> {
         ServiceBuilder { cfg: self.cfg, sm: self.sm, output: h }
     }
 
@@ -123,9 +136,12 @@ impl<S: StateMachine, O: OutputHandler<S>> ServiceBuilder<S, O> {
         // CONCRETE type, not on how it reached the builder, so an explicit
         // `.output_handler(NoopOutput)` skips the spawn exactly like the
         // default (no `.output_handler` call) path — there is no way to force
-        // a pure no-op thread into existence.
+        // a pure no-op thread into existence. `TypedOutput<NoopOutput>` is
+        // named too, because M12a routes a typed handler through that adapter:
+        // without it the `.output_handler(NoopOutput)` case would start
+        // spawning a thread that can only ever run a no-op duty cycle.
         let mut agents = Vec::with_capacity(2);
-        if std::any::TypeId::of::<O>() != std::any::TypeId::of::<NoopOutput>() {
+        if !is_noop_output::<O>() {
             // Own cursor over the SAME log buffer, seeded from the node's
             // durable output-progress marker (Task 12 module doc).
             let start_pos = cnc.status().output_progress.load_acquire();
@@ -157,7 +173,7 @@ impl<S: StateMachine, O: OutputHandler<S>> ServiceBuilder<S, O> {
     /// **Controller-resolved deviation from the M6 Task 3 brief.** The brief's
     /// implicit shape was "spawn the builder whenever the SM is capable", but
     /// Rust cannot specialize a generic function's behavior on an *optional*
-    /// trait bound at runtime — `start`'s `S: StateMachine` bound alone gives
+    /// trait bound at runtime — `start`'s `S: RawStateMachine` bound alone gives
     /// the compiler no way to conditionally call `S::freeze` only "if `S`
     /// happens to also implement `SnapshotStateMachine`". The resolution
     /// mirrors the existing `.output_handler(..)` opt-in pattern: a caller
@@ -185,7 +201,7 @@ impl<S: StateMachine, O: OutputHandler<S>> ServiceBuilder<S, O> {
         let journal_dir = state.journal_dir.clone();
 
         let mut agents = Vec::with_capacity(3);
-        if std::any::TypeId::of::<O>() != std::any::TypeId::of::<NoopOutput>() {
+        if !is_noop_output::<O>() {
             let start_pos = cnc.status().output_progress.load_acquire();
             let output_follower = LogFollower::new(Arc::clone(&buffer), start_pos);
             let mut output_state = OutputState::new(
@@ -259,9 +275,18 @@ impl<S: StateMachine, O: OutputHandler<S>> ServiceBuilder<S, O> {
     }
 }
 
+/// Is `O` a handler that can only ever do nothing — [`NoopOutput`] itself, or
+/// the typed [`NoopOutput`] routed through the [`TypedOutput`] adapter? Both
+/// mean "do not spawn the output thread" (see the call sites).
+fn is_noop_output<O: 'static>() -> bool {
+    let id = std::any::TypeId::of::<O>();
+    id == std::any::TypeId::of::<NoopOutput>()
+        || id == std::any::TypeId::of::<TypedOutput<NoopOutput>>()
+}
+
 /// A running service: the agent thread(s) plus the handles that keep the
 /// shared-memory mappings alive.
-pub struct Service<S: StateMachine> {
+pub struct Service<S: RawStateMachine> {
     agents: Vec<AgentRunner>,
     /// Set when the apply thread poisons this incarnation (log rewound
     /// beneath the applied frontier). See [`Service::is_alive`].
@@ -274,7 +299,7 @@ pub struct Service<S: StateMachine> {
     epoch: u64,
 }
 
-impl<S: StateMachine> Service<S> {
+impl<S: RawStateMachine> Service<S> {
     /// The node instance this service attached to (a change means the node
     /// restarted since attach — a reconstruction trigger, Task 9).
     pub fn instance_id(&self) -> u128 {
@@ -287,13 +312,29 @@ impl<S: StateMachine> Service<S> {
         self.epoch
     }
 
-    /// Direct, synchronous query against the live state machine on the apply
-    /// thread. This is the test/embedded read path only — the real client query
-    /// path (linearizable barrier + egress answer) lands in Task 10/11. Hidden
-    /// from docs: not part of the public read contract.
+    /// Direct, synchronous raw query against the live state machine on the
+    /// apply thread — bytes in, bytes out, `out` cleared first. This is the
+    /// test/embedded read path only — the real client query path (linearizable
+    /// barrier + egress answer) lands in Task 10/11. Hidden from docs: not part
+    /// of the public read contract.
     #[doc(hidden)]
-    pub fn query(&self, q: S::Query) -> S::QueryResponse {
-        self.sm.lock().unwrap().query(q)
+    pub fn query_raw(&self, q: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        self.sm.lock().unwrap().query(q, out);
+    }
+
+    /// Typed convenience over [`query_raw`](Self::query_raw): encodes the query
+    /// and decodes the answer with the same bincode-standard codec the blanket
+    /// [`RawStateMachine`] impl uses. Hidden from docs, like `query_raw`.
+    #[doc(hidden)]
+    pub fn query(&self, q: S::Query) -> S::QueryResponse
+    where
+        S: StateMachine,
+    {
+        let q = bincode::serde::encode_to_vec(&q, bincode::config::standard()).expect("encode");
+        let mut out = Vec::new();
+        self.query_raw(&q, &mut out);
+        bincode::serde::decode_from_slice(&out, bincode::config::standard()).expect("decode").0
     }
 
     /// Are all of this incarnation's agents still running? `false` means one

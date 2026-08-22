@@ -91,9 +91,12 @@ impl<S: StateMachine> RawStateMachine for S {
 /// below-floor reconstruction (Task 5) installs a snapshot instead of replaying
 /// from the archive.
 ///
-/// It is a *separate* trait from [`StateMachine`] on purpose: v2's base trait
+/// It is a *separate* trait from [`RawStateMachine`] on purpose: v2's base trait
 /// carries no snapshot methods (M5 reconstruction replayed the log), so existing
 /// SMs are untouched — a snapshot-capable SM opts in by also implementing this.
+/// The supertrait is the CORE contract ([`RawStateMachine`]), so a raw-tier SM
+/// can be snapshot-capable too; a typed [`StateMachine`] satisfies it through
+/// the blanket impl above, so existing implementations are unchanged.
 ///
 /// ## Position-as-version
 ///
@@ -102,7 +105,7 @@ impl<S: StateMachine> RawStateMachine for S {
 /// artifact tags. `freeze` pins the current position; `install_snapshot` is told
 /// the position `S` the artifact was tagged with and must land the restored
 /// state exactly there.
-pub trait SnapshotStateMachine: StateMachine {
+pub trait SnapshotStateMachine: RawStateMachine {
     /// An opaque, consistent handle to the frozen state. `Send + 'static` so it
     /// can cross to the off-thread streaming step.
     type SnapshotHandle: Send + 'static;

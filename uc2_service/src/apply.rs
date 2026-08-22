@@ -25,21 +25,24 @@ use crate::builder_agent::BuildJob;
 use crate::config::SnapshotError;
 use crate::egress::Egress;
 use crate::replay::replay_into;
-use crate::traits::StateMachine;
+use crate::traits::RawStateMachine;
 
-/// Spike-only codec budget-share probes (feature `apply-profile`). All
-/// counters are process-global so the egress encode (a different module, same
-/// thread) can add to them; printed every `PRINT_EVERY` frames and at drop.
+/// Spike-only apply-budget probes (feature `apply-profile`). Counters are
+/// process-global; printed every `PRINT_EVERY` frames and at drop. Since M12a
+/// the codec lives INSIDE the state machine call (the blanket
+/// [`RawStateMachine`](crate::RawStateMachine) impl decodes the command and
+/// encodes the response), so `sm_apply` is "apply incl. codec" — there is no
+/// separate decode/encode column to report any more.
 #[cfg(feature = "apply-profile")]
 pub(crate) mod profile {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
     use std::time::Instant;
 
     pub static FRAMES: AtomicU64 = AtomicU64::new(0);
-    pub static DECODE: AtomicU64 = AtomicU64::new(0);
-    pub static APPLY: AtomicU64 = AtomicU64::new(0);
+    /// Whole `RawStateMachine::apply` call — for a typed SM that includes the
+    /// bincode decode of the command and the encode of the response.
+    pub static SM_APPLY: AtomicU64 = AtomicU64::new(0);
     pub static PUBLISH: AtomicU64 = AtomicU64::new(0);
-    pub static ENCODE: AtomicU64 = AtomicU64::new(0);
     pub static BATCH: AtomicU64 = AtomicU64::new(0);
     pub static CYCLE: AtomicU64 = AtomicU64::new(0);
     pub static CYCLES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -72,9 +75,8 @@ pub(crate) mod profile {
         })
     }
 
-    pub fn add(frames: u64, decode: u64, apply: u64, publish: u64, bytes: u64) {
-        DECODE.fetch_add(decode, Relaxed);
-        APPLY.fetch_add(apply, Relaxed);
+    pub fn add(frames: u64, sm_apply: u64, publish: u64, bytes: u64) {
+        SM_APPLY.fetch_add(sm_apply, Relaxed);
         PUBLISH.fetch_add(publish, Relaxed);
         PAYLOAD_BYTES.fetch_add(bytes, Relaxed);
         let before = FRAMES.fetch_add(frames, Relaxed);
@@ -86,28 +88,23 @@ pub(crate) mod profile {
     pub fn report(tag: &str) {
         let k = cyc_per_ns();
         let f = FRAMES.load(Relaxed).max(1) as f64;
-        let dec = DECODE.load(Relaxed) as f64;
-        let app = APPLY.load(Relaxed) as f64;
+        let app = SM_APPLY.load(Relaxed) as f64;
         let pubc = PUBLISH.load(Relaxed) as f64;
-        let enc = ENCODE.load(Relaxed) as f64;
         let batch = BATCH.load(Relaxed) as f64;
         let cycle = CYCLE.load(Relaxed) as f64;
         let bytes = PAYLOAD_BYTES.load(Relaxed) as f64;
         eprintln!(
             "apply-profile[{tag}] frames={} avg_payload={:.0}B \
-             per-frame: decode={:.0}ns apply={:.0}ns publish={:.0}ns (encode={:.0}ns) \
-             batch_arm={:.0}ns | codec(decode+encode)/batch_arm={:.1}% \
-             codec/apply_cycle_total={:.1}% batch_arm/apply_cycle_total={:.1}% \
-             apply_cycle_calls={}",
+             per-frame: sm_apply={:.0}ns publish={:.0}ns batch_arm={:.0}ns \
+             | sm_apply/batch_arm={:.1}% sm_apply/apply_cycle_total={:.1}% \
+             batch_arm/apply_cycle_total={:.1}% apply_cycle_calls={}",
             f as u64,
             bytes / f,
-            dec / f / k,
             app / f / k,
             pubc / f / k,
-            enc / f / k,
             batch / f / k,
-            100.0 * (dec + enc) / batch.max(1.0),
-            100.0 * (dec + enc) / cycle.max(1.0),
+            100.0 * app / batch.max(1.0),
+            100.0 * app / cycle.max(1.0),
             100.0 * batch / cycle.max(1.0),
             CYCLES_CALLS.load(Relaxed),
         );
@@ -117,7 +114,8 @@ pub(crate) mod profile {
 /// Boxed "freeze the current state and produce a streaming job" closure. Built
 /// once, in [`crate::ServiceBuilder::start_with_snapshots`], where the
 /// `S: SnapshotStateMachine` bound is available; stored here behind a plain
-/// `S: StateMachine`-bounded type so [`ApplyState`] itself needs no such bound.
+/// `S: RawStateMachine`-bounded type so [`ApplyState`] itself needs no such
+/// bound.
 pub(crate) type FreezeFn<S> = Box<dyn Fn(&S) -> Result<(BuildJob, u64), SnapshotError> + Send>;
 
 /// Boxed "install this snapshot stream into the SM" closure (M6 Task 5). Same
@@ -132,7 +130,7 @@ pub(crate) type InstallFn<S> =
 /// Present only for a snapshot-capable service (`start_with_snapshots`); its
 /// absence is what turns a below-floor gap into [`ServiceError::SnapshotRequired`]
 /// fail-stop instead of a covering install.
-pub(crate) struct SnapshotRestore<S: StateMachine> {
+pub(crate) struct SnapshotRestore<S: RawStateMachine> {
     pub(crate) store: crate::snapshots::SnapshotStore,
     pub(crate) install: InstallFn<S>,
 }
@@ -141,7 +139,7 @@ pub(crate) struct SnapshotRestore<S: StateMachine> {
 /// only when the service was started via `start_with_snapshots`; `None` for a
 /// plain `start()` (or an SM that never opted in) means [`maybe_build_snapshot`]
 /// is a no-op every cycle.
-pub(crate) struct SnapshotTrigger<S: StateMachine> {
+pub(crate) struct SnapshotTrigger<S: RawStateMachine> {
     pub(crate) policy: crate::config::SnapshotPolicy,
     /// The position basis for the next interval check: updated to the
     /// attempted position whenever a freeze is attempted (success OR failure)
@@ -161,13 +159,13 @@ pub(crate) struct SnapshotTrigger<S: StateMachine> {
 /// per-field disjoint borrows (`follower` iterated while `sm`/`egress`/`cnc`
 /// are touched).
 #[cfg(feature = "apply-profile")]
-impl<S: StateMachine> Drop for ApplyState<S> {
+impl<S: RawStateMachine> Drop for ApplyState<S> {
     fn drop(&mut self) {
         profile::report("final");
     }
 }
 
-pub(crate) struct ApplyState<S: StateMachine> {
+pub(crate) struct ApplyState<S: RawStateMachine> {
     /// **Poisoned incarnation** (2026-08-16 log-rewind contract). Set when the
     /// node truncates the log BENEATH what this SM already applied: our state
     /// belongs to a timeline that no longer exists. Once set, this incarnation
@@ -194,6 +192,9 @@ pub(crate) struct ApplyState<S: StateMachine> {
     pub(crate) sm: Arc<Mutex<S>>,
     pub(crate) cnc: Arc<CncPage>,
     pub(crate) egress: Egress,
+    /// Reused response scratch for `RawStateMachine::apply` / `query`. Cleared
+    /// before every call, so a steady-state response allocates nothing.
+    pub(crate) resp_buf: Vec<u8>,
     /// The node's journal directory — the archived-log source the replay path
     /// reconstructs from on `Overrun`.
     pub(crate) journal_dir: PathBuf,
@@ -238,7 +239,7 @@ pub(crate) struct ApplyState<S: StateMachine> {
 /// skip already-applied positions (idempotent re-entry) and non-`MESSAGE`
 /// frames; publish responses only while leader. On `Overrun`, reconstruct via
 /// journal replay and rejoin the live buffer.
-pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
+pub(crate) fn apply_cycle<S: RawStateMachine>(st: &mut ApplyState<S>) -> bool {
     #[cfg(feature = "apply-profile")]
     let _cycle_guard = {
         struct G(u64);
@@ -312,8 +313,8 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
                 #[cfg(feature = "apply-profile")]
                 let batch_t0 = profile::now();
                 #[cfg(feature = "apply-profile")]
-                let (mut pf_frames, mut pf_dec, mut pf_app, mut pf_pub, mut pf_bytes) =
-                    (0u64, 0u64, 0u64, 0u64, 0u64);
+                let (mut pf_frames, mut pf_sm, mut pf_pub, mut pf_bytes) =
+                    (0u64, 0u64, 0u64, 0u64);
                 let mut sm = st.sm.lock().unwrap();
                 for (pos, hdr, payload) in frames {
                     // NEW_TERM (and any future non-MESSAGE type) is not user data.
@@ -327,28 +328,24 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
                     }
                     #[cfg(feature = "apply-profile")]
                     let t0 = profile::now();
-                    // The ONE decode at the apply boundary. Committed bytes are
-                    // trusted; a decode failure is unrecoverable corruption.
-                    let (cmd, _) = bincode::serde::decode_from_slice::<S::Command, _>(
-                        payload,
-                        bincode::config::standard(),
-                    )
-                    .expect("corrupt committed frame (fail-stop)");
+                    // Bytes straight from the frame to the state machine. Typed
+                    // SMs decode (and encode the response) inside their blanket
+                    // `RawStateMachine` impl; raw SMs see the slice. Committed
+                    // bytes are trusted; a decode failure there is
+                    // unrecoverable corruption and fail-stops.
+                    st.resp_buf.clear();
+                    sm.apply(pos, payload, &mut st.resp_buf);
                     #[cfg(feature = "apply-profile")]
                     let t1 = profile::now();
-                    let resp = sm.apply(pos, cmd);
-                    #[cfg(feature = "apply-profile")]
-                    let t2 = profile::now();
                     if is_leader {
-                        st.egress.publish(hdr.session_id, hdr.correlation_id, pos, &resp);
+                        st.egress.publish(hdr.session_id, hdr.correlation_id, pos, &st.resp_buf);
                     }
                     #[cfg(feature = "apply-profile")]
                     {
-                        let t3 = profile::now();
+                        let t2 = profile::now();
                         pf_frames += 1;
-                        pf_dec += t1 - t0;
-                        pf_app += t2 - t1;
-                        pf_pub += t3 - t2;
+                        pf_sm += t1 - t0; // apply incl. codec
+                        pf_pub += t2 - t1;
                         pf_bytes += payload.len() as u64;
                     }
                 }
@@ -359,7 +356,7 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
                         profile::now() - batch_t0,
                         std::sync::atomic::Ordering::Relaxed,
                     );
-                    profile::add(pf_frames, pf_dec, pf_app, pf_pub, pf_bytes);
+                    profile::add(pf_frames, pf_sm, pf_pub, pf_bytes);
                 }
                 // Publish the new applied frontier for barrier readers / clients.
                 st.cnc.service().service_applied.store_release(st.follower.cursor);
@@ -432,7 +429,7 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
 /// `interval_bytes` worth of progress, same cadence as the happy path — a
 /// failed build looks, from the trigger's point of view, just like a
 /// successful one that produced nothing durable.
-fn maybe_build_snapshot<S: StateMachine>(st: &mut ApplyState<S>) {
+fn maybe_build_snapshot<S: RawStateMachine>(st: &mut ApplyState<S>) {
     let Some(trigger) = st.snapshot_trigger.as_mut() else { return };
     if trigger.policy.interval_bytes == 0 {
         return; // "never" (default policy)
@@ -479,7 +476,7 @@ fn maybe_build_snapshot<S: StateMachine>(st: &mut ApplyState<S>) {
 /// batch cap, so a burst of queries can never starve the apply loop.
 const QUERY_DRAIN_PER_CYCLE: usize = 64;
 
-/// Drain `svc_query.ring` (bounded): decode each read's `expected_epoch` prefix,
+/// Drain `svc_query.ring` (bounded): read each request's `expected_epoch` prefix,
 /// REFUSE any stamped for a superseded incarnation with `MSG_V2_RETRY`, and
 /// answer the rest by querying the SM and publishing `MSG_V2_RESPONSE`
 /// (`FLAG_V2_IS_QUERY`) onto the egress broadcast. Runs on the apply thread
@@ -496,7 +493,7 @@ const QUERY_DRAIN_PER_CYCLE: usize = 64;
 /// request with RETRY. Side-effect-free (the SM is never touched), so the
 /// cross-task "RETRY is side-effect-free" invariant holds here too. The client
 /// rotates to another node or retries after the supervisor respawns us.
-fn refuse_queries<S: StateMachine>(st: &mut ApplyState<S>) {
+fn refuse_queries<S: RawStateMachine>(st: &mut ApplyState<S>) {
     let mut buf = Vec::new();
     for _ in 0..QUERY_DRAIN_PER_CYCLE {
         match st.svc_query.try_read(&mut buf) {
@@ -506,7 +503,7 @@ fn refuse_queries<S: StateMachine>(st: &mut ApplyState<S>) {
     }
 }
 
-fn drain_queries<S: StateMachine>(st: &mut ApplyState<S>) {
+fn drain_queries<S: RawStateMachine>(st: &mut ApplyState<S>) {
     // This incarnation's epoch, CAPTURED AT ATTACH (M5 final review #5) — fixed
     // for this incarnation's life, NOT re-read live from the page. A newer
     // incarnation attaching to the same page bumps `service_epoch`; if we
@@ -536,13 +533,11 @@ fn drain_queries<S: StateMachine>(st: &mut ApplyState<S>) {
                     st.egress.publish_retry(rec.header_extra);
                     continue;
                 }
-                let (q, _) = bincode::serde::decode_from_slice::<S::Query, _>(
-                    &buf[8..],
-                    bincode::config::standard(),
-                )
-                .expect("corrupt query frame (fail-stop)");
-                let qr = st.sm.lock().unwrap().query(q);
-                st.egress.publish_query_answer(rec.header_extra, &qr);
+                // Bytes through: a typed SM decodes the query and encodes the
+                // answer inside its blanket `RawStateMachine` impl.
+                st.resp_buf.clear();
+                st.sm.lock().unwrap().query(&buf[8..], &mut st.resp_buf);
+                st.egress.publish_query_answer(rec.header_extra, &st.resp_buf);
             }
             Ok(None) => break,
             // Corrupt record (bad crc/magic): stop this cycle; the next retries

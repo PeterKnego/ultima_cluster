@@ -63,7 +63,7 @@ use uc_protocol::v2::cnc::NODE_FLAG_LEADER;
 use uc_protocol::v2::frame::{self, FRAME_TYPE_MESSAGE, HEADER_LEN, align_frame_len};
 use ultima_journal::TailReader;
 
-use crate::traits::{OutputError, OutputHandler, StateMachine};
+use crate::traits::{OutputError, RawOutputHandler, RawStateMachine};
 
 /// Retry backoff bounds for a `Retryable` `on_committed` (spec §7 / Task 12):
 /// start at 10 ms, double each attempt, cap at 500 ms.
@@ -75,7 +75,7 @@ const BACKOFF_MAX: Duration = Duration::from_millis(500);
 /// machine (so `state: &S` reflects whatever apply has applied so far — never
 /// less than `cmd`'s own effect, by the `target` bound below), and its own
 /// `current_thread` tokio runtime for `rt.block_on(handler.on_committed(..))`.
-pub(crate) struct OutputState<S: StateMachine, O: OutputHandler<S>> {
+pub(crate) struct OutputState<S: RawStateMachine, O: RawOutputHandler<S>> {
     pub(crate) follower: LogFollower,
     pub(crate) sm: Arc<Mutex<S>>,
     pub(crate) cnc: Arc<CncPage>,
@@ -96,7 +96,7 @@ pub(crate) struct OutputState<S: StateMachine, O: OutputHandler<S>> {
     pub(crate) instance_mismatch_streak: u8,
 }
 
-impl<S: StateMachine, O: OutputHandler<S>> OutputState<S, O> {
+impl<S: RawStateMachine, O: RawOutputHandler<S>> OutputState<S, O> {
     pub(crate) fn new(
         follower: LogFollower,
         sm: Arc<Mutex<S>>,
@@ -131,7 +131,7 @@ fn is_leader(cnc: &CncPage) -> bool {
 
 /// One output duty cycle. Returns `true` iff it made progress (drove the idle
 /// strategy). See the module doc for the full contract.
-pub(crate) fn output_cycle<S: StateMachine, O: OutputHandler<S>>(
+pub(crate) fn output_cycle<S: RawStateMachine, O: RawOutputHandler<S>>(
     st: &mut OutputState<S, O>,
 ) -> bool {
     // Node-restart fail-stop (M5 final review #2c), checked BEFORE the leader
@@ -180,16 +180,13 @@ pub(crate) fn output_cycle<S: StateMachine, O: OutputHandler<S>>(
                     // cursor is allowed to run ahead of what's actually been
                     // delivered.
                     let frame_end = pos + align_frame_len(hdr.length as usize) as u64;
-                    let (cmd, _) = bincode::serde::decode_from_slice::<S::Command, _>(
-                        payload,
-                        bincode::config::standard(),
-                    )
-                    .expect("corrupt committed frame (fail-stop)");
                     // Decomposed field args (not `&*st`): `frames` still holds a
                     // live `&mut` borrow of `st.follower.cursor` for the rest of
                     // this loop body, so touching only the OTHER fields keeps
-                    // the borrows disjoint (module doc).
-                    if !deliver(&st.sm, &st.cnc, &st.handler, &st.rt, pos, frame_end, &cmd) {
+                    // the borrows disjoint (module doc). The frame payload goes
+                    // through as bytes — a typed handler decodes it inside
+                    // `TypedOutput`'s `RawOutputHandler` impl.
+                    if !deliver(&st.sm, &st.cnc, &st.handler, &st.rt, pos, frame_end, payload) {
                         // Lost leadership mid-frame: abandon it (unpersisted —
                         // the next become-leader edge redelivers it) and stop
                         // touching the log this cycle.
@@ -236,6 +233,11 @@ pub(crate) fn output_cycle<S: StateMachine, O: OutputHandler<S>>(
 /// `true`. Returns `false` (frame NOT delivered, marker NOT advanced) iff
 /// leadership was lost before the frame resolved.
 ///
+/// `cmd` is the committed frame payload, passed through as bytes; a typed
+/// [`OutputHandler`](crate::traits::OutputHandler) decodes it inside
+/// [`TypedOutput`](crate::traits::TypedOutput)'s adapter — one bincode decode
+/// per committed command on THIS thread, exactly as before.
+///
 /// **SM lock across the handler call:** `on_committed` takes `&S`, so the
 /// `Mutex` guard is held for the duration of `rt.block_on(..)` — v1-verbatim
 /// semantics (the pre-M5 design held an `RwLock` read the same way). This
@@ -246,14 +248,14 @@ pub(crate) fn output_cycle<S: StateMachine, O: OutputHandler<S>>(
 /// slow handler stalls reads as well as applies. A real degradation for a
 /// slow/blocking handler, flagged in the task report as a concern for the
 /// controller rather than silently accepted.
-fn deliver<S: StateMachine, O: OutputHandler<S>>(
+fn deliver<S: RawStateMachine, O: RawOutputHandler<S>>(
     sm: &Arc<Mutex<S>>,
     cnc: &CncPage,
     handler: &O,
     rt: &tokio::runtime::Runtime,
     pos: u64,
     frame_end: u64,
-    cmd: &S::Command,
+    cmd: &[u8],
 ) -> bool {
     let mut backoff = BACKOFF_MIN;
     loop {
@@ -318,7 +320,7 @@ enum ReplayOutcome {
 /// re-read per block, since both counters can advance while this runs) to the
 /// SAME [`deliver`] leader-gated retry/persist path the live batch loop uses.
 /// Returns the byte cursor the live follower should rejoin from.
-fn output_replay_degrade<S: StateMachine, O: OutputHandler<S>>(
+fn output_replay_degrade<S: RawStateMachine, O: RawOutputHandler<S>>(
     sm: &Arc<Mutex<S>>,
     cnc: &CncPage,
     handler: &O,
@@ -359,12 +361,8 @@ fn output_replay_degrade<S: StateMachine, O: OutputHandler<S>>(
                         lost_leadership = true;
                         return false;
                     }
-                    let (cmd, _) = bincode::serde::decode_from_slice::<S::Command, _>(
-                        &payload[off + HEADER_LEN..off + total],
-                        bincode::config::standard(),
-                    )
-                    .expect("corrupt archived MESSAGE frame (fail-stop)");
-                    if !deliver(sm, cnc, handler, rt, pos, end, &cmd) {
+                    let cmd = &payload[off + HEADER_LEN..off + total];
+                    if !deliver(sm, cnc, handler, rt, pos, end, cmd) {
                         lost_leadership = true;
                         return false;
                     }

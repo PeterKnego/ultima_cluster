@@ -15,11 +15,11 @@ use uc_protocol::ring::{BroadcastRing, SpscRing};
 use crate::apply::ApplyState;
 use crate::config::{ServiceConfig, ServiceError};
 use crate::egress::Egress;
-use crate::traits::StateMachine;
+use crate::traits::RawStateMachine;
 
 /// The pieces the builder needs after a successful attach: the apply agent's
 /// state (moved into its thread) plus the handles the `Service` keeps.
-pub(crate) struct Attached<S: StateMachine> {
+pub(crate) struct Attached<S: RawStateMachine> {
     pub(crate) apply_state: ApplyState<S>,
     /// The log buffer, held separately (not just inside `apply_state.follower`)
     /// so the builder can hand the output agent (Task 12) its OWN independent
@@ -37,7 +37,7 @@ pub(crate) struct Attached<S: StateMachine> {
 
 /// Run the 6-step attach. Steps 1–5 here; step 6 (spawn the threads) is the
 /// builder's job, after this returns.
-pub(crate) fn attach<S: StateMachine>(
+pub(crate) fn attach<S: RawStateMachine>(
     cfg: &ServiceConfig,
     sm: S,
 ) -> Result<Attached<S>, ServiceError> {
@@ -113,6 +113,7 @@ pub(crate) fn attach<S: StateMachine>(
         sm: Arc::new(Mutex::new(sm)),
         cnc: Arc::clone(&cnc),
         egress,
+        resp_buf: Vec::with_capacity(256),
         journal_dir: dir.join("journal"),
         svc_query,
         needs_replay: false,
