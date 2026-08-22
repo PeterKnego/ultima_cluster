@@ -1370,7 +1370,21 @@ dependencies = [
 name = "uc2_gateway"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "bytes",
+ "parking_lot",
+ "rand",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "uc-lincheck",
+ "uc2_client",
+ "uc2_log",
+ "uc2_net",
+ "uc2_node",
  "uc2_remote",
+ "uc2_service",
+ "uc_protocol",
 ]
 
 [[package]]

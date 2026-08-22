@@ -6,6 +6,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+description = "ultima_cluster gateway edge: remote protocol v1 over a local node's shmem Engine"
 
 [dependencies]
+uc2_client = { path = "../uc2_client" }
+uc2_log = { path = "../uc2_log" }
 uc2_remote = { path = "../uc2_remote" }
+uc_protocol = { path = "../uc_protocol" }
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+uc2_net = { path = "../uc2_net" }
+uc2_node = { path = "../uc2_node" }
+uc2_service = { path = "../uc2_service" }
+uc-lincheck = { path = "../uc-lincheck", default-features = false, features = ["v2"] }
+bincode = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+tempfile = { workspace = true }
