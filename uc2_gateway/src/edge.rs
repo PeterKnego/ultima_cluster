@@ -75,9 +75,16 @@
 //!
 //! **Proactive** — the [`crate::watch::LeaderWatch`], polled by the driver,
 //! pushes `LEADER_CHANGED` to every ready connection when `can_serve` or
-//! `leader_hint` changes. That covers the client which has nothing in flight,
-//! or whose requests are all parked on a backoff, and which would otherwise
-//! learn nothing until it happened to try again.
+//! `leader_hint` changes *and the new hint names a member we have an address
+//! for*. That covers the client which has nothing in flight, or whose requests
+//! are all parked on a backoff, and which would otherwise learn nothing until
+//! it happened to try again.
+//!
+//! Both mechanisms share one rule: **never send a client somewhere it cannot
+//! go.** With no resolvable leader, the reactive path answers
+//! `RETRY{not_serving}` and the proactive path says nothing at all; the
+//! "leader unknown" sentinel is reserved for `on_instance_restart`, where the
+//! client genuinely has to go and look elsewhere.
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -194,6 +201,7 @@ struct StatCells {
     unknown: AtomicU64,
     backpressure_events: AtomicU64,
     leader_changes: AtomicU64,
+    leader_changed_frames: AtomicU64,
     status_frames: AtomicU64,
 }
 
@@ -209,6 +217,7 @@ impl StatCells {
             unknown: self.unknown.load(Ordering::Relaxed),
             backpressure_events: self.backpressure_events.load(Ordering::Relaxed),
             leader_changes: self.leader_changes.load(Ordering::Relaxed),
+            leader_changed_frames: self.leader_changed_frames.load(Ordering::Relaxed),
             status_frames: self.status_frames.load(Ordering::Relaxed),
         }
     }
@@ -223,6 +232,13 @@ impl StatCells {
 /// is that a frame whose write then died on a broken socket is still counted;
 /// these are "frames produced", not "frames delivered", and nothing downstream
 /// can promise delivery anyway.)
+///
+/// `leader_changed_frames` is the one exception, and deliberately: it counts
+/// frames that actually went out. Every other counter answers a request, so a
+/// failed write leaves a client that at least knows it asked; an unsolicited
+/// push at a socket that just died leaves nobody knowing anything, and the
+/// connection is dropped. Counting it would overstate how many clients were
+/// told — which is the only thing the number is for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EdgeStats {
     /// Connections accepted (including ones since closed).
@@ -244,8 +260,16 @@ pub struct EdgeStats {
     pub unknown: u64,
     /// Times the `Engine` reported `Backpressure` and credits were halved.
     pub backpressure_events: u64,
-    /// `LEADER_CHANGED` frames written back.
+    /// Leader **transitions** the watch observed: `can_serve` flipped, or
+    /// `leader_hint` changed. Counted whether or not any client was told —
+    /// including a transition to an unresolvable hint (mid-election), which is
+    /// deliberately not announced (see `watch.rs`).
     pub leader_changes: u64,
+    /// `LEADER_CHANGED` frames successfully written back — the watch's pushes
+    /// (one per ready connection per announced transition) plus the
+    /// instance-restart notice. See the type doc for why this one counts after
+    /// the write, not before.
+    pub leader_changed_frames: u64,
     /// Standalone `STATUS` frames written back — the idle-liveness tick and
     /// the credit-reopened announcement. Never counted before `HELLO_OK`.
     pub status_frames: u64,
@@ -299,15 +323,22 @@ impl Shared {
         self.members.get(&node_id).map(|s| s.as_str())
     }
 
+    /// A leader hint turned into something a client can act on: an id AND an
+    /// address. `None` — no hint, or a hint naming a node absent from the
+    /// static member map — is the whole reason `REDIRECT` has a `RETRY`
+    /// alternative and the watch has a "say nothing" case.
+    fn resolve_leader(&self, hint: Option<u32>) -> Option<(u32, &str)> {
+        hint.and_then(|id| self.gateway_of(id).map(|addr| (id, addr)))
+    }
+
     /// Answer a request this node cannot serve: `REDIRECT` to the leader's
     /// gateway when the hint resolves to a member, otherwise `RETRY` — there
     /// is no address to send the client to, and inventing one is worse than
     /// telling it to wait out the election.
     fn redirect_or_retry(&self, conn: &Conn, seq: u64, hint: Option<u32>) {
-        match hint.and_then(|id| self.gateway_of(id).map(|a| (id, a))) {
+        match self.resolve_leader(hint) {
             Some((id, addr)) => {
-                let mut out = Vec::new();
-                Leader { node_id: id, addr }.encode(&mut out);
+                let out = encode_leader(id, addr);
                 self.stats.redirects.fetch_add(1, Ordering::Relaxed);
                 conn.write(conn.hdr(FrameType::Redirect, 0, seq), &out, self.now_ns());
             }
@@ -321,31 +352,18 @@ impl Shared {
         }
     }
 
-    /// The `Leader` body a `REDIRECT`/`LEADER_CHANGED` carries: the hint's
-    /// gateway address when the static member map knows it, otherwise the
-    /// `unknown` sentinel.
-    ///
-    /// The `node_id` in the sentinel is ignored by the client — the EMPTY
-    /// ADDRESS is the signal ("leader unknown: reconnect and re-`HELLO`").
-    fn leader_body(&self, hint: Option<u32>) -> Vec<u8> {
-        let mut out = Vec::new();
-        match hint.and_then(|id| self.gateway_of(id).map(|a| (id, a))) {
-            Some((id, addr)) => Leader { node_id: id, addr }.encode(&mut out),
-            None => Leader { node_id: u32::MAX, addr: "" }.encode(&mut out),
-        }
-        out
-    }
-
-    /// Push `LEADER_CHANGED` to every connection whose handshake has
-    /// completed. Driven only by the leader watch, and only on a transition —
-    /// see `watch.rs` for why the trigger is edge- and not level-triggered.
+    /// Push `LEADER_CHANGED` naming a **resolved** leader to every connection
+    /// whose handshake has completed. Driven only by the leader watch, and
+    /// only on an announceable transition — see `watch.rs` for why the trigger
+    /// is edge-triggered, and why an unresolvable hint is silent rather than
+    /// pushed as the unknown sentinel.
     ///
     /// The body is built **once** and the table lock is not held across any
     /// write (`for_each` hands out a snapshot); a connection whose write fails
     /// is dropped afterwards, outside that snapshot walk, because `remove`
     /// takes the table's write lock.
-    fn push_leader_changed(&self, hint: Option<u32>) {
-        let body = self.leader_body(hint);
+    fn push_leader_changed(&self, node_id: u32, addr: &str) {
+        let body = encode_leader(node_id, addr);
         let now = self.now_ns();
         let mut dead: Vec<u32> = Vec::new();
         self.table.for_each(|c| {
@@ -356,8 +374,9 @@ impl Shared {
             if !c.is_ready() {
                 return;
             }
-            self.stats.leader_changes.fetch_add(1, Ordering::Relaxed);
-            if !c.write(c.hdr(FrameType::LeaderChanged, 0, 0), &body, now) {
+            if c.write(c.hdr(FrameType::LeaderChanged, 0, 0), &body, now) {
+                self.stats.leader_changed_frames.fetch_add(1, Ordering::Relaxed);
+            } else {
                 dead.push(c.idx);
             }
         });
@@ -394,15 +413,19 @@ impl Shared {
         // Latch first: a connection accepted between here and the last close
         // must be refused at the handshake, not served into the same fault.
         self.faulted.store(true, Ordering::SeqCst);
-        // The `unknown` sentinel, deliberately: there is nothing this edge can
-        // still answer, so the client must reconnect and re-`HELLO` somewhere.
-        let out = self.leader_body(None);
+        // The ONLY place the unknown-leader sentinel goes on the wire. Here it
+        // is exactly right — there is nothing this edge can still answer, so
+        // "reconnect and re-`HELLO` somewhere" is the true instruction. The
+        // watch deliberately never sends it (see `watch.rs`): mid-election it
+        // would scatter every client off a working connection.
+        let out = encode_leader(u32::MAX, "");
         for c in self.table.take_all() {
             // A connection still mid-handshake gets no frame, only the close:
             // its peer is waiting for HELLO_OK and would reject anything else.
-            if c.is_ready() {
-                self.stats.leader_changes.fetch_add(1, Ordering::Relaxed);
-                c.write(c.hdr(FrameType::LeaderChanged, 0, 0), &out, self.now_ns());
+            if c.is_ready()
+                && c.write(c.hdr(FrameType::LeaderChanged, 0, 0), &out, self.now_ns())
+            {
+                self.stats.leader_changed_frames.fetch_add(1, Ordering::Relaxed);
             }
             c.close();
         }
@@ -1000,11 +1023,18 @@ fn driver(shared: Arc<Shared>, mut poll: PollHalf, send: SendHalf) {
 /// atomic loads and a comparison, no allocation and no table lock. Only a real
 /// transition reaches [`Shared::push_leader_changed`].
 fn leader_tick(shared: &Arc<Shared>, send: &SendHalf, watch: &mut LeaderWatch) {
-    if let Some((_can_serve, hint)) = watch.poll(send) {
-        // What goes on the wire is the CURRENT leader, not "we are not it":
-        // the client acts on the address, and the answer to "where do I go
-        // now" is the only useful thing to say.
-        shared.push_leader_changed(hint);
+    let t = watch.poll(send, |id| shared.resolve_leader(Some(id)));
+    if t.changed {
+        // The cluster moved. Counted even when nobody is told — an operator
+        // watching an edge with no clients on it still wants to see elections.
+        shared.stats.leader_changes.fetch_add(1, Ordering::Relaxed);
+    }
+    // What goes on the wire is the CURRENT leader, and ONLY when there is one
+    // to name: the client acts on the address, so "where do I go now" is the
+    // only useful thing to say, and saying "I don't know" would scatter every
+    // connected client (see `watch.rs`).
+    if let Some((id, addr)) = t.announce {
+        shared.push_leader_changed(id, addr);
     }
 }
 
@@ -1094,6 +1124,14 @@ fn complete(shared: &Arc<Shared>, send: &SendHalf, c: Completion<'_>) {
         // to be announced on its own.
         shared.write_status(&conn);
     }
+}
+
+/// Encode a `Leader` body — the payload shared by `REDIRECT` and
+/// `LEADER_CHANGED`.
+fn encode_leader(node_id: u32, addr: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    Leader { node_id, addr }.encode(&mut out);
+    out
 }
 
 /// Split an engine response into `RESPONSE` flags and the body the client

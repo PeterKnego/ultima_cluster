@@ -14,7 +14,8 @@
 //!
 //! So the driver samples two words off the cnc page — `can_serve` and
 //! `leader_hint` — and pushes `LEADER_CHANGED` to every ready connection when
-//! either changes.
+//! the pair changes **and the new hint names a member we have an address
+//! for**.
 //!
 //! ## Why the transition, and not the state, is the trigger
 //!
@@ -25,17 +26,40 @@
 //! edge-triggered discipline in one place, with the state it needs (the last
 //! sample) and nothing else.
 //!
-//! ## What gets pushed
+//! ## Why an unresolvable hint says NOTHING
 //!
-//! The **current leader**, never "this node is not the leader". The frame the
-//! client acts on is `Leader { node_id, addr }`: an address it can reconnect
-//! to. When the hint names a member we know the gateway address of, that is
-//! what it gets; when the hint is unknown (mid-election, or a node id missing
-//! from the static member map) it gets the `Leader { u32::MAX, "" }` sentinel,
-//! which `RemoteClient` reads as "leader unknown: reconnect and re-`HELLO`" —
-//! the same sentinel the instance-restart path already uses.
+//! A transition can land on a hint that resolves to no gateway address:
+//! mid-election, when the node has adopted a new term and cleared its hint, or
+//! (misconfiguration) a node id absent from the static member map. There *is*
+//! a wire frame for "leader unknown" — `Leader { u32::MAX, "" }` — and pushing
+//! it here would be actively harmful: `RemoteClient` reads an empty address as
+//! "reconnect round-robin", so every election would make every connected
+//! client on every edge drop a working connection and replay its whole
+//! in-flight window at a member picked at random. That is precisely the churn
+//! [`crate::edge`]'s `redirect_or_retry` refuses to cause when it answers
+//! `RETRY{not_serving}` instead of inventing a target.
+//!
+//! So an unresolvable transition is **observed but not announced**: `last`
+//! moves, so the *next* transition — the one that resolves, a few hundred
+//! milliseconds later when the election settles — is what fires, and the idle
+//! client gets exactly one push, naming a leader it can actually reach. The
+//! unknown-leader sentinel survives in one place only, `on_instance_restart`,
+//! where the edge really is telling every client "not here, not any more, go
+//! and find out where".
 
 use uc2_client::SendHalf;
+
+/// What one poll of the watch found.
+pub(crate) struct Transition<T> {
+    /// The observed `(can_serve, leader_hint)` pair changed. Counted whether
+    /// or not anything was announced — it is a fact about the *cluster*, not
+    /// about this edge's clients.
+    pub changed: bool,
+    /// The leader to announce, as resolved by the caller's map. `None` means
+    /// say nothing: either nothing changed, or the new hint names nowhere we
+    /// can send a client (see the module doc).
+    pub announce: Option<T>,
+}
 
 /// The last `(can_serve, leader_hint)` the driver saw, so a change can be
 /// distinguished from a re-observation.
@@ -53,25 +77,42 @@ impl LeaderWatch {
         LeaderWatch { last: sample(send) }
     }
 
-    /// Sample the cnc page and report a transition, if there was one.
+    /// Sample the cnc page and report what changed, resolving any new hint
+    /// through `resolve` (the edge's static member map).
     ///
     /// Takes the `SendHalf` by reference because that is the type that owns
     /// the cnc mapping; the driver has its own clone (`SendHalf` is `Send` but
     /// not `Sync`), so this costs no coordination with the reader threads.
-    pub fn poll(&mut self, send: &SendHalf) -> Option<(bool, Option<u32>)> {
+    pub fn poll<T>(
+        &mut self,
+        send: &SendHalf,
+        resolve: impl FnOnce(u32) -> Option<T>,
+    ) -> Transition<T> {
         let (can_serve, hint) = sample(send);
-        self.observe(can_serve, hint)
+        self.observe(can_serve, hint, resolve)
     }
 
-    /// The pure core: the transition rule, with no cnc page and no cluster
-    /// behind it, so it can be tested for what it is.
-    pub fn observe(&mut self, can_serve: bool, hint: Option<u32>) -> Option<(bool, Option<u32>)> {
+    /// The pure core: the transition rule and the announce rule, with no cnc
+    /// page and no member map behind them, so they can be tested for what they
+    /// are.
+    ///
+    /// Note the ordering that matters: `last` is updated on **every** change,
+    /// including one that resolves to nothing. Skipping the update instead
+    /// would leave the watch comparing against a stale pair, and the eventual
+    /// resolvable state would then look like no change at all — the idle
+    /// client would never be told.
+    pub fn observe<T>(
+        &mut self,
+        can_serve: bool,
+        hint: Option<u32>,
+        resolve: impl FnOnce(u32) -> Option<T>,
+    ) -> Transition<T> {
         let now = (can_serve, hint);
         if now == self.last {
-            return None;
+            return Transition { changed: false, announce: None };
         }
         self.last = now;
-        Some(now)
+        Transition { changed: true, announce: hint.and_then(resolve) }
     }
 }
 
@@ -97,37 +138,97 @@ mod tests {
         LeaderWatch { last }
     }
 
+    /// A stand-in for the edge's static member map: nodes 1 and 2 have gateway
+    /// addresses, nothing else does.
+    fn known(id: u32) -> Option<&'static str> {
+        match id {
+            1 => Some("host1:9100"),
+            2 => Some("host2:9100"),
+            _ => None,
+        }
+    }
+
+    fn observe(
+        w: &mut LeaderWatch,
+        can_serve: bool,
+        hint: Option<u32>,
+    ) -> (bool, Option<&'static str>) {
+        let t = w.observe(can_serve, hint, known);
+        (t.changed, t.announce)
+    }
+
     #[test]
     fn an_unchanged_sample_is_not_a_transition() {
-        let mut w = watch((true, Some(3)));
-        assert_eq!(w.observe(true, Some(3)), None);
-        assert_eq!(w.observe(true, Some(3)), None, "still nothing, however often it is polled");
+        let mut w = watch((true, Some(1)));
+        assert_eq!(observe(&mut w, true, Some(1)), (false, None));
+        assert_eq!(
+            observe(&mut w, true, Some(1)),
+            (false, None),
+            "still nothing, however often it is polled"
+        );
     }
 
     #[test]
     fn a_can_serve_flip_is_a_transition() {
-        let mut w = watch((false, Some(3)));
-        assert_eq!(w.observe(true, Some(3)), Some((true, Some(3))), "this node started serving");
-        assert_eq!(w.observe(true, Some(3)), None, "and reports it exactly once");
-        assert_eq!(w.observe(false, Some(3)), Some((false, Some(3))), "and again when it stops");
+        let mut w = watch((false, Some(1)));
+        assert_eq!(
+            observe(&mut w, true, Some(1)),
+            (true, Some("host1:9100")),
+            "this node started serving"
+        );
+        assert_eq!(observe(&mut w, true, Some(1)), (false, None), "and reports it exactly once");
+        assert_eq!(
+            observe(&mut w, false, Some(1)),
+            (true, Some("host1:9100")),
+            "and again when it stops"
+        );
     }
 
     #[test]
-    fn a_hint_change_is_a_transition_including_to_and_from_unknown() {
+    fn a_hint_change_is_a_transition() {
         let mut w = watch((false, Some(1)));
-        // Mid-election: the node adopted a new term and cleared its hint.
-        assert_eq!(w.observe(false, None), Some((false, None)));
-        assert_eq!(w.observe(false, None), None);
-        // The election settled on a different member.
-        assert_eq!(w.observe(false, Some(2)), Some((false, Some(2))));
-        // Same hint, still not serving: nothing to say.
-        assert_eq!(w.observe(false, Some(2)), None);
+        assert_eq!(observe(&mut w, false, Some(2)), (true, Some("host2:9100")));
+        assert_eq!(observe(&mut w, false, Some(2)), (false, None));
     }
 
     #[test]
     fn both_words_changing_at_once_is_one_transition() {
         let mut w = watch((false, None));
-        assert_eq!(w.observe(true, Some(7)), Some((true, Some(7))));
-        assert_eq!(w.observe(true, Some(7)), None);
+        assert_eq!(observe(&mut w, true, Some(1)), (true, Some("host1:9100")));
+        assert_eq!(observe(&mut w, true, Some(1)), (false, None));
+    }
+
+    /// The rule the module doc argues for: an election is TWO transitions, and
+    /// only the second one — the one that names a reachable leader — puts a
+    /// frame on the wire.
+    #[test]
+    fn an_unresolvable_hint_is_observed_but_never_announced() {
+        let mut w = watch((true, Some(1)));
+        // Mid-election: the node adopted a new term and cleared its hint.
+        assert_eq!(
+            observe(&mut w, false, None),
+            (true, None),
+            "a change worth counting, and nowhere to send anyone"
+        );
+        // A member id we have no gateway address for — a misconfigured member
+        // map, and equally unusable as a redirect target.
+        assert_eq!(observe(&mut w, false, Some(7)), (true, None));
+        // The election settles on a member we can actually name.
+        assert_eq!(
+            observe(&mut w, false, Some(2)),
+            (true, Some("host2:9100")),
+            "the resolving transition is the one that fires"
+        );
+        assert_eq!(observe(&mut w, false, Some(2)), (false, None), "and only once");
+    }
+
+    /// The trap the `last`-always-moves rule avoids: if an unresolvable
+    /// transition did not update `last`, coming back to the PREVIOUS leader
+    /// would compare equal and announce nothing at all.
+    #[test]
+    fn returning_to_the_previous_leader_after_an_unresolvable_gap_still_fires() {
+        let mut w = watch((false, Some(1)));
+        assert_eq!(observe(&mut w, false, None), (true, None));
+        assert_eq!(observe(&mut w, false, Some(1)), (true, Some("host1:9100")));
     }
 }

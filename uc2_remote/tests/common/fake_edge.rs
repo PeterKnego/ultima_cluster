@@ -33,6 +33,11 @@ use uc2_remote::frame::*;
 pub struct Behaviour {
     /// Credits advertised in `HELLO_OK` and in every `RESPONSE`/`STATUS`.
     pub credits: u32,
+    /// Advertise THIS address as the leader in `HELLO_OK` instead of this
+    /// edge's own — an edge that knows a different member is leading. A client
+    /// should hop to it at the handshake rather than sending here and being
+    /// redirected request by request.
+    pub hello_ok_leader_addr: Option<String>,
     /// Refuse `HELLO` with this reason instead of accepting it.
     pub refuse_hello: Option<u8>,
     /// Answer every SUBMIT/QUERY with `REDIRECT{node 2, addr}`.
@@ -65,6 +70,7 @@ impl Default for Behaviour {
     fn default() -> Self {
         Behaviour {
             credits: 2,
+            hello_ok_leader_addr: None,
             refuse_hello: None,
             redirect_all_to: None,
             redirect_to_self: false,
@@ -225,7 +231,8 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
         return;
     }
     let self_addr = rd.local_addr().map(|a| a.to_string()).unwrap_or_default();
-    HelloOk { credits: b.credits, leader: Some(1), leader_addr: &self_addr }.encode(&mut out);
+    let advertised = b.hello_ok_leader_addr.clone().unwrap_or_else(|| self_addr.clone());
+    HelloOk { credits: b.credits, leader: Some(1), leader_addr: &advertised }.encode(&mut out);
     if wr.write_frame(hdr(FrameType::HelloOk, 0, client_id, 0), &out).is_err() {
         return;
     }

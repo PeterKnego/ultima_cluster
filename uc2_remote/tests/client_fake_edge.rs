@@ -178,6 +178,60 @@ fn hello_refused_is_reported_and_does_not_connect() {
     }
 }
 
+/// An edge whose `HELLO_OK` names a different leader is left at the handshake.
+///
+/// The alternative — adopt the connection and let the edge redirect — costs
+/// one `REDIRECT` frame per request in the pipelined window, because the whole
+/// window is flushed the moment the connection is adopted. Hopping at the
+/// handshake costs one extra `HELLO`.
+#[test]
+fn a_hello_ok_naming_another_leader_is_followed_before_anything_is_sent() {
+    let b = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let a = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        hello_ok_leader_addr: Some(b.addr.clone()),
+        ..Default::default()
+    });
+    let client = RemoteClient::connect(cfg(vec![a.addr.clone(), b.addr.clone()])).unwrap();
+
+    let tickets: Vec<_> = (0..3u8).map(|i| client.submit(&[i]).unwrap()).collect();
+    for (i, t) in tickets.into_iter().enumerate() {
+        assert_eq!(&t.wait_timeout(WAIT).unwrap().bytes[..], &[i as u8]);
+    }
+
+    assert_eq!(a.observed.hellos.load(std::sync::atomic::Ordering::SeqCst), 1, "A was dialled");
+    assert_eq!(a.observed.seq_count(), 0, "...and never sent a single request");
+    assert_eq!(b.observed.seq_order(), vec![1, 2, 3], "the leader got them, in order");
+    let s = client.stats();
+    assert_eq!((s.redirects, s.resends), (0, 0), "no request was ever bounced: {s:?}");
+    assert_eq!(client.leader().map(|(_, a)| a), Some(b.addr.clone()));
+    client.shutdown();
+}
+
+/// ...but the hop is bounded: two edges that name each other must not loop.
+#[test]
+fn edges_that_name_each_other_as_leader_do_not_ping_pong() {
+    let a = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let b = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        hello_ok_leader_addr: Some(a.addr.clone()),
+        ..Default::default()
+    });
+    // A names B, B names A. Whichever the client settles on, it must settle.
+    let a2 = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        hello_ok_leader_addr: Some(b.addr.clone()),
+        ..Default::default()
+    });
+    let started = std::time::Instant::now();
+    let client = RemoteClient::connect(cfg(vec![a2.addr.clone()])).unwrap();
+    let r = client.submit(b"hi").unwrap().wait_timeout(WAIT).unwrap();
+    assert_eq!(&r.bytes[..], b"ih");
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    let _ = a;
+    client.shutdown();
+}
+
 /// A `FAULTED` refusal costs one member, not the whole dial.
 ///
 /// The two refusals mean opposite things: `APP_ID`/`VERSION` say "you are

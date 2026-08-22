@@ -6,24 +6,27 @@
 //!
 //! Three real nodes, one `Sessioned<RegisterSm>` service each, one [`Edge`]
 //! each, and one `RemoteClient` pipelining through the framed TCP protocol.
-//! The client is deliberately pointed at a **follower's** edge first, so the
-//! very first write has to be redirected before it can commit; then the leader
-//! is crash-stopped under load and the surviving two (still a quorum) elect a
-//! new one.
+//! The client is deliberately pointed at a **follower's** edge first, so its
+//! very first write has to be routed off a member that cannot serve it; then
+//! the leader is crash-stopped under load and the surviving two (still a
+//! quorum) elect a new one.
 //!
 //! What is actually asserted:
 //!
-//! - a write submitted to a non-leader edge comes back as `REDIRECT`, not as
-//!   an error, and the client follows it;
+//! - a write aimed at a non-leader edge is never applied there and commits
+//!   anyway — by whichever of the two legal routes wins the race (the edge's
+//!   `HELLO_OK` names the leader and the client hops at the handshake, or the
+//!   write goes out and comes back as a `REDIRECT`);
 //! - every one of 200 pipelined writes resolves as `Ok` or `Err(Expired)` —
 //!   **never** `Unknown` or `TimedOut`. `UNKNOWN` is the edge saying "may or
 //!   may not have committed", and with `resend_on_unknown` (the default) the
 //!   client is obliged to turn it into a definite answer;
 //! - the register's final linearizable value is the highest `i` that was
 //!   acknowledged, i.e. no acknowledged write was lost across the failover;
-//! - the client saw at least one `LEADER_CHANGED` — the leader *watch*, not
-//!   a reactive redirect, is what tells an idle-but-connected client that the
-//!   cluster moved.
+//! - a second client that stays **idle** across the whole failover is told the
+//!   leader changed without ever asking — the watch's whole reason to exist —
+//!   and is told it exactly once, naming a leader it can reach;
+//! - a connection still mid-handshake is told nothing at all.
 //!
 //! ## Why the crashed member's edge is stopped too
 //!
@@ -119,30 +122,45 @@ fn leader_crash_redirects_and_resend_is_deduped() {
     })
     .unwrap();
 
-    // --- 1. The first write is redirected off the follower, then commits.
+    // --- 1. A write aimed at a follower's edge is never served there.
+    //
+    // There are two legal routes to that, and which one runs is a race the
+    // test has no business pinning: the client dials the follower, and either
+    // its `HELLO_OK` names the leader and the client hops before sending
+    // anything, or the write goes out and comes back as a `REDIRECT`. What
+    // must hold either way is that the follower's edge NEVER passes the write
+    // to its node — it cannot serve it — and that the write commits anyway.
     let r = client.submit(&enc(&Cmd::Write(0))).unwrap().wait().unwrap();
     assert_eq!(dec(&r.bytes), CmdResp::WriteAck);
     assert!(!r.replayed, "a first-time seq is FRESH");
-    let s = client.stats();
-    assert!(s.redirects >= 1, "a write to a follower must be REDIRECTed: {s:?}");
     assert_eq!(
         client.leader().map(|(id, _)| id),
         Some(leader_id),
-        "the REDIRECT (and the follower's HELLO_OK) name the leader"
+        "the follower's HELLO_OK (or its REDIRECT) names the leader"
     );
-    assert!(
-        edges[follower].as_ref().unwrap().stats().redirects >= 1,
-        "the follower's edge produced the REDIRECT: {:?}",
-        edges[follower].as_ref().unwrap().stats()
+    let fs = edges[follower].as_ref().unwrap().stats();
+    assert!(fs.connections >= 1, "the client really did dial the follower first: {fs:?}");
+    assert_eq!(fs.submits, 0, "a follower's edge must never accept a write: {fs:?}");
+    assert_eq!(
+        edges[leader].as_ref().unwrap().stats().submits,
+        1,
+        "...and the leader's edge is where it landed"
     );
 
-    // A second client that will do NOTHING for the whole failover, parked on
-    // the other survivor's edge. It is the watch's reason to exist: with no
-    // request in flight it can never earn a `REDIRECT`, so the only way it can
-    // learn the cluster moved is the edge telling it unprompted. Unlike the
-    // busy client above — which spends the election bouncing between edges as
-    // its re-sends are redirected — this one is provably connected at the
-    // moment its edge's `leader_hint` changes.
+    // A second client that will do NOTHING for the whole failover. It is the
+    // watch's reason to exist: with no request in flight it can never earn a
+    // `REDIRECT`, so the only way it can learn the cluster moved is the edge
+    // telling it unprompted.
+    //
+    // Its member list is the OTHER survivor's edge alone, so after the crash
+    // it has exactly one place to go and settles there within milliseconds —
+    // well inside the election window, and then it sits still. (Right now it
+    // starts out on the leader's edge, because that edge's `HELLO_OK` names
+    // the leader and the client hops; either way, what matters is that it is
+    // parked and quiet on a survivor before the hint moves.) Unlike the busy
+    // client above — which spends the election bouncing between edges as its
+    // re-sends are redirected — this one is provably connected when its edge's
+    // `leader_hint` resolves again.
     let other = (0..3).find(|&i| i != leader && i != follower).expect("a second follower");
     let idle = RemoteClient::connect(RemoteConfig {
         app_id: common::APP.into(),
@@ -195,6 +213,23 @@ fn leader_crash_redirects_and_resend_is_deduped() {
     }
     assert!(highest_ok > KILL_AFTER, "nothing committed after the crash (highest {highest_ok})");
 
+    // Checked HERE, as soon as the crash-and-elect window has closed, rather
+    // than at the end: the edge's handshake budget is a hard 5 s, so a slow
+    // runner would legitimately close this connection later and a check after
+    // the final read would then accuse the product of something it did not do.
+    //
+    // A CLOSE is likewise not a failure — that is the handshake timeout doing
+    // its job. Only a FRAME is: anything the edge wrote before closing would
+    // still be sitting in the socket buffer ahead of the EOF, so this keeps
+    // its teeth either way.
+    match silent.read_frame() {
+        Ok(None) | Err(_) => {}
+        Ok(Some((h, _))) => {
+            panic!("the edge wrote {:?} at a connection that has not handshaken", h.ty)
+        }
+    }
+    drop(silent);
+
     // --- 4. No acknowledged write was lost: the register holds the last one
     // that was acknowledged. (Writes are monotone, so "last acknowledged" and
     // "highest acknowledged" are the same value.)
@@ -209,9 +244,9 @@ fn leader_crash_redirects_and_resend_is_deduped() {
         // An EXPIRED write may or may not have been applied, so it is the one
         // thing that can legitimately sit above the highest acknowledged one.
         assert!(
-            v == highest_ok || expired.contains(&v),
+            v == highest_ok || (expired.contains(&v) && v > highest_ok),
             "final value {v} is neither the highest acked ({highest_ok}) nor an expired write \
-             ({expired:?})"
+             above it ({expired:?})"
         );
     }
 
@@ -231,26 +266,35 @@ fn leader_crash_redirects_and_resend_is_deduped() {
     let survivors: Vec<_> =
         (0..3).filter(|&i| i != leader).map(|i| edges[i].as_ref().unwrap().stats()).collect();
     assert!(
-        survivors.iter().any(|s| s.leader_changes >= 1),
+        survivors.iter().any(|s| s.leader_changed_frames >= 1),
         "no surviving edge pushed LEADER_CHANGED: {survivors:?}"
     );
-    // ...and NOT a storm. The watch is edge-triggered, so one failover is a
-    // handful of frames (a couple of transitions per edge — hint lost, hint
-    // regained, `can_serve` flipped — times the connections live at the time),
-    // not one per poll iteration. A level-triggered watch would produce
-    // thousands here.
-    let pushed: u64 = survivors.iter().map(|s| s.leader_changes).sum();
-    assert!(pushed <= 40, "LEADER_CHANGED storm: {pushed} frames for one failover ({survivors:?})");
-
-    // The still-dialing connection heard nothing at all.
-    match silent.read_frame() {
-        Ok(None) => {}
-        Ok(Some((h, _))) => {
-            panic!("the edge wrote {:?} at a connection that has not handshaken", h.ty)
-        }
-        Err(e) => panic!("the edge dropped a still-dialing connection: {e}"),
-    }
-    drop(silent);
+    // ...and NOT a storm, on either counter. The watch is edge-triggered, so
+    // one failover is a handful of TRANSITIONS per edge (hint lost, hint
+    // regained, `can_serve` flipped) and, per announced transition, at most
+    // one frame per connection live at that moment. A level-triggered watch
+    // would put thousands of both on the wire.
+    // Printed, not asserted: the cost of one failover in frames. `redirects`
+    // here is dominated by the client re-sending its whole in-flight window at
+    // each edge it lands on while the survivors' `leader_hint` still names the
+    // dead leader — see the task report; it is bounded and correct, but it is
+    // O(pending) per cycle and worth watching if these numbers move.
+    println!(
+        "failover cost: client={:?} edge_redirects={:?}",
+        client.stats(),
+        survivors.iter().map(|s| s.redirects).collect::<Vec<_>>()
+    );
+    let transitions: u64 = survivors.iter().map(|s| s.leader_changes).sum();
+    let frames: u64 = survivors.iter().map(|s| s.leader_changed_frames).sum();
+    assert!(
+        transitions <= 12,
+        "leader-transition storm: {transitions} for one failover ({survivors:?})"
+    );
+    assert!(frames <= 40, "LEADER_CHANGED storm: {frames} frames for one failover ({survivors:?})");
+    // Transitions are counted even when nothing is announced — mid-election
+    // the hint resolves to nowhere and the watch deliberately stays quiet — so
+    // an edge always counts at least as many transitions as it wrote frames.
+    assert!(transitions >= frames, "a frame without a transition: {survivors:?}");
 
     idle.shutdown();
     client.shutdown();

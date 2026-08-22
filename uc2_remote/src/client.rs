@@ -84,7 +84,8 @@ const SELF_REDIRECT_BACKOFF: Duration = Duration::from_millis(10);
 /// Backoff after a full pass over `members` failed to connect.
 const RECONNECT_BACKOFF_START: Duration = Duration::from_millis(5);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
-/// `REDIRECT` hops followed during one connect scan.
+/// Hops followed during one connect scan — a `REDIRECT` at the handshake, or
+/// a `HELLO_OK` that names a leader other than the edge that sent it.
 const MAX_REDIRECT_HOPS: usize = 8;
 
 // ---------------------------------------------------------------- config
@@ -307,7 +308,11 @@ pub struct RemoteClient {
 }
 
 impl RemoteClient {
-    /// Connect to the first reachable member, following a `REDIRECT` at `HELLO`.
+    /// Connect to the first reachable member, following a `REDIRECT` at
+    /// `HELLO` — and, when an edge's `HELLO_OK` names a *different* member as
+    /// leader, hopping to that one before adopting the connection, so a
+    /// pipelined window is flushed at the leader rather than redirected frame
+    /// by frame.
     ///
     /// Fails with [`RemoteError::HelloRefused`] if an edge refuses the
     /// handshake for a reason no other member would answer differently — a
@@ -1025,7 +1030,8 @@ enum Dialed {
 }
 
 /// Try `preferred` (if any) and then every member in round-robin order from
-/// `start_idx`, following `REDIRECT`s at the handshake.
+/// `start_idx`, following `REDIRECT`s at the handshake — and hopping to the
+/// leader a `HELLO_OK` names before adopting the connection that named it.
 fn dial(
     cfg: &RemoteConfig,
     client_id: u64,
@@ -1046,11 +1052,58 @@ fn dial(
     }
     let mut hops = 0usize;
     let mut i = 0usize;
+    // Every address actually dialed in this scan. It is what stops the
+    // leader-hop below from ping-ponging between two edges that name each
+    // other, without the `order`-membership test the REDIRECT path uses (every
+    // member is already in `order`, so that test would never let a hop happen).
+    let mut visited: Vec<String> = Vec::with_capacity(n + 1);
+    // A connection to an edge that named a leader elsewhere, held open while
+    // that leader is tried. If the hop fails — the named leader is the one
+    // that just died, which is exactly the case a failover puts us in — this
+    // is still a working connection to a live member, and adopting it beats
+    // returning `NoMembersReachable` and sitting disconnected through an
+    // election (the edge will redirect, which is slower but never stuck).
+    let mut fallback: Option<(FramedConn, HelloInfo, usize, String)> = None;
     while i < order.len() {
         let addr = order[i].clone();
+        visited.push(addr.clone());
         match dial_one(cfg, client_id, &addr) {
             Dialed::Ok(conn, info) => {
                 let idx = cfg.members.iter().position(|m| *m == addr).unwrap_or(start_idx % n);
+                // `HELLO_OK` named a leader that is not this edge. Hop to it
+                // BEFORE committing to this connection.
+                //
+                // This is a throughput property, not a correctness one — the
+                // edge would answer every write with a `REDIRECT` anyway — but
+                // the cost is not small: the pipelined window is flushed the
+                // moment a connection is adopted, so adopting a member that
+                // cannot serve costs one redirect frame PER PENDING REQUEST,
+                // and then a reconnect. Hopping here costs one extra
+                // handshake. Measured on the gateway failover capstone, a
+                // client that dials a follower now reaches the leader with
+                // zero redirects and zero re-sends, where before it paid one
+                // redirect, one reconnect and a full re-send of its window.
+                //
+                // `leader` is `None` when the edge named nobody, and carries
+                // the dialed address itself when `HELLO_OK` advertised no
+                // address or its own (`addr_or`), so `!= addr` is exactly "a
+                // usable address elsewhere".
+                if let Some((_, leader_addr)) = info.leader.as_ref()
+                    && *leader_addr != addr
+                    && hops < MAX_REDIRECT_HOPS
+                    && !visited.contains(leader_addr)
+                {
+                    hops += 1;
+                    order.insert(i + 1, leader_addr.clone());
+                    // Nothing has been written on it, so keeping it costs
+                    // nothing and no request can be left in doubt either way.
+                    match fallback {
+                        None => fallback = Some((conn, info, idx, addr)),
+                        Some(_) => conn.shutdown(),
+                    }
+                    i += 1;
+                    continue;
+                }
                 return Ok((conn, info, idx, addr));
             }
             Dialed::Redirect(to) => {
@@ -1079,6 +1132,10 @@ fn dial(
             }
             Dialed::Failed => i += 1,
         }
+    }
+    // Nothing better turned up: take the edge that redirects over no edge.
+    if let Some(f) = fallback {
+        return Ok(f);
     }
     Err(RemoteError::NoMembersReachable)
 }
