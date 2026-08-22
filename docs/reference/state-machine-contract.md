@@ -178,22 +178,47 @@ response bytes (`TAG_EXPIRED` carries none):
   the cached response is returned and the inner SM does **not** run again
   (this is what makes a non-idempotent inner op, e.g. a CAS, safe to retry).
 - `TAG_EXPIRED = 2` — `seq` is at or below the client's highest seen but has
-  already fallen out of the window (or the client itself was evicted), so no
-  cached response exists; the framework and the inner SM never see this
-  frame's effect.
+  already fallen out of the window, so no cached response exists; the
+  framework and the inner SM never see this frame's effect.
+
+**`SessionConfig` is part of the replicated contract.** `window`,
+`max_clients`, and `max_bytes` (below) all feed directly into the
+FRESH/REPLAYED/EXPIRED classification and into which clients get evicted, so
+**every replica must run identical `SessionConfig` values; changing it is a
+flag day**, the same as changing `apply` itself — never a rolling per-node
+tweak. `install_snapshot` enforces this at load time (see "Snapshot
+composition" below): a mismatched config is refused outright rather than
+silently retuning, or silently diverging, a running node.
 
 **Window and eviction — deterministic by construction**, because `apply` runs
 on every replica and must reach the same table everywhere: a `BTreeMap<u64,
 ClientState>` (never a `HashMap`, whose iteration order is not a replay
 guarantee), each client remembering up to `SessionConfig::window` responses
-(default 4096) as an oldest-first FIFO keyed by `seq`. When the number of
-tracked clients exceeds `SessionConfig::max_clients` (default 65536), the
-victim is the client with the smallest `(last_seen_pos, client_id)` —
-smallest log **position**, never wall-clock time, with the client id itself
-as the deterministic tiebreak. `last_seen_pos` advances on *every* frame for
-a client, including `REPLAYED` and `EXPIRED` ones, so eviction ranks strictly
-by log position. An evicted client's next frame is simply a fresh client
-starting over (`TAG_FRESH`), not an error.
+(default 4096) as an oldest-first FIFO keyed by `seq`. Two independent
+budgets can trigger eviction, both by the same deterministic victim order —
+smallest `(last_seen_pos, client_id)`: smallest log **position**, never
+wall-clock time, with the client id itself as the tiebreak:
+
+- **Client count** — when tracked clients exceed `SessionConfig::max_clients`
+  (default 65536), the oldest client is dropped.
+- **Cached-response bytes** — when the sum of all clients' cached response
+  bytes exceeds `SessionConfig::max_bytes` (default 256 MiB), whole clients
+  are dropped oldest-first, same order, **except** the client whose frame
+  just pushed the total over budget — evicting it would erase the very
+  response the caller is waiting on. If that client ends up the only one
+  left and the budget is still exceeded, its own window is trimmed from the
+  front (oldest response first) until back under budget or empty. Since
+  `max_clients * window * avg_response_size` alone can reach multi-GB at the
+  defaults, the real memory ceiling in practice is
+  `min(max_clients * window * avg_response_size, max_bytes)`.
+
+`last_seen_pos` advances on *every* frame for a client, including `REPLAYED`
+and `EXPIRED` ones, so eviction ranks strictly by log position. An evicted
+client's next frame is simply a fresh client starting over (`TAG_FRESH`), not
+an error — as is any client whose `seq` legitimately starts at `0`: a
+client's very first frame is always fresh regardless of which `seq` value it
+carries (`ClientState` tracks "never seen" as `Option::None`, not a `0`
+sentinel, precisely so a genuine first `seq` of `0` cannot collide with it).
 
 **`last_applied()` is deliberately not a bare passthrough to the inner SM.**
 The inner SM only advances on `TAG_FRESH` frames; a `REPLAYED`/`EXPIRED`
@@ -212,16 +237,30 @@ starts.
 
 **Snapshot composition.** `Sessioned<S>: SnapshotStateMachine` when
 `S: SnapshotStateMachine`. `freeze` pins the inner snapshot handle plus a
-bincode-encoded `TableImage { window, max_clients, clients }` of the current
-dedup table (built from the same `BTreeMap`, so encoding is deterministic);
-`stream_snapshot` writes a `u64` LE length prefix, the table blob, then the
-inner SM's own stream; `install_snapshot` reverses that, then restores
-`self.clients` from the decoded table (the snapshot's own recorded
-`window`/`max_clients` are diagnostic only — the *live* node's `SessionConfig`
-governs future behavior, so installing a snapshot taken under different
-tuning never silently retunes a running node). This is what lets a retry land
-correctly even immediately after a below-floor node installs a snapshot
-instead of replaying the journal.
+bincode-encoded `TableImage { window, max_clients, max_bytes, clients }` of
+the current dedup table (built from the same `BTreeMap`, so encoding is
+deterministic); `stream_snapshot` writes a `u64` LE length prefix (capped at
+a 1 GiB sanity bound on the read side — `install_snapshot` refuses a larger
+declared length before ever allocating a buffer for it), the table blob,
+then the inner SM's own stream. `install_snapshot` reverses that and, before
+touching the inner SM at all, **refuses the install** with
+`SnapshotError::Codec` if the decoded `window`/`max_clients`/`max_bytes`
+don't match the live node's `SessionConfig` exactly — the replicated-contract
+invariant above, enforced rather than merely documented. Only once the
+config matches does it install the inner snapshot and restore `self.clients`
+from the decoded table. This is what lets a retry land correctly even
+immediately after a below-floor node installs a snapshot instead of
+replaying the journal.
+
+**`freeze()`'s returned position can trail `Sessioned::last_applied()`.**
+`freeze` reports the *inner* SM's frozen position (`self.inner.freeze()`'s
+own `pos`), which only advances on `TAG_FRESH` frames. If the most recent
+frames before a freeze were `REPLAYED`/`EXPIRED`, that position sits below
+`Sessioned::last_applied()`. That is safe to round-trip: those trailing
+frames only ever bump a client's `last_seen_pos` and never evict or change
+window contents, so on restart the framework re-feeds the same trailing
+frames through `Sessioned::apply` again, reaching the identical branches and
+reproducing the exact pre-freeze table.
 
 ## Payload ceiling
 

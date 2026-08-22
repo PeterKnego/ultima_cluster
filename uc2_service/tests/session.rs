@@ -26,7 +26,7 @@ fn resp(out: &[u8]) -> (u8, Option<CmdResp>) {
     (tag, Some(r))
 }
 fn sm(window: usize, max_clients: usize) -> Sessioned<RegisterSm> {
-    Sessioned::new(RegisterSm::default(), SessionConfig { window, max_clients })
+    Sessioned::new(RegisterSm::default(), SessionConfig { window, max_clients, ..SessionConfig::default() })
 }
 
 #[test]
@@ -112,4 +112,116 @@ fn snapshot_round_trip_carries_the_dedup_table() {
     let (v, _): (Option<u64>, usize) =
         bincode::serde::decode_from_slice(&out, bincode::config::standard()).unwrap();
     assert_eq!(v, Some(43));
+}
+
+/// A client's genuine first `seq` can legitimately be 0. `ClientState` used
+/// to use a bare `u64` with `0` doubling as the "never seen" sentinel, so a
+/// client whose first seq was 0 got re-classified as FRESH on every retry —
+/// silently re-applying a non-idempotent command. Use a CAS as the seq-0
+/// command so a double-apply is visible (the second CAS would fail).
+#[test]
+fn seq_zero_is_deduplicated() {
+    let mut s = sm(4, 16);
+    let mut out = Vec::new();
+    // Seed the register via a different client so client 3's first-ever
+    // command can be a CAS that is expected to succeed exactly once.
+    s.apply(50, &env(99, 1, &Cmd::Write(10)), &mut out);
+    out.clear();
+    s.apply(100, &env(3, 0, &Cmd::Cas { old: 10, new: 11 }), &mut out);
+    assert_eq!(resp(&out), (TAG_FRESH, Some(CmdResp::CasResult(true))));
+    out.clear();
+    // Retry of seq 0: must be REPLAYED. Under the old bug this hits FRESH
+    // again, re-running CAS{old:10,new:11} against the now-11 register,
+    // which would return `CasResult(false)` — visibly wrong.
+    s.apply(200, &env(3, 0, &Cmd::Cas { old: 10, new: 11 }), &mut out);
+    assert_eq!(resp(&out), (TAG_REPLAYED, Some(CmdResp::CasResult(true))));
+}
+
+/// `SessionConfig` is part of the replicated contract (see `session.rs`'s
+/// module doc): a snapshot's embedded config must match the live node's
+/// exactly, or `install_snapshot` refuses it before touching the inner SM.
+#[test]
+fn install_refuses_mismatched_session_config() {
+    let mut s = sm(4, 16);
+    let mut out = Vec::new();
+    s.apply(100, &env(1, 1, &Cmd::Write(1)), &mut out);
+    let (handle, pos) = s.freeze().unwrap();
+    assert_eq!(pos, 100);
+    let mut img = Vec::new();
+    <Sessioned<RegisterSm> as SnapshotStateMachine>::stream_snapshot(handle, &mut img).unwrap();
+
+    // A node running a different `window` than the snapshot's origin.
+    let mut mismatched = Sessioned::new(
+        RegisterSm::default(),
+        SessionConfig { window: 8, max_clients: 16, ..SessionConfig::default() },
+    );
+    let err = mismatched.install_snapshot(100, &mut img.as_slice()).unwrap_err();
+    assert!(format!("{err}").contains("session config mismatch"), "unexpected error: {err}");
+    // The inner SM must be untouched — the check runs BEFORE the inner install.
+    assert_eq!(mismatched.inner().last_applied(), None);
+}
+
+/// The `max_bytes` budget evicts whole clients (oldest `last_seen_pos`
+/// first, the same deterministic order as `max_clients` eviction), and never
+/// evicts the client whose frame just pushed the total over budget.
+#[test]
+fn max_bytes_evicts_oldest_clients_deterministically() {
+    let resp_size =
+        bincode::serde::encode_to_vec(CmdResp::WriteAck, bincode::config::standard()).unwrap().len();
+    // Exactly one cached response fits under budget; a second tips it over.
+    let mut s = Sessioned::new(
+        RegisterSm::default(),
+        SessionConfig { window: 100, max_clients: 100, max_bytes: resp_size },
+    );
+    let mut out = Vec::new();
+    s.apply(10, &env(1, 1, &Cmd::Write(1)), &mut out);
+    out.clear();
+    // client 2's insert pushes total_bytes to 2*resp_size > max_bytes: client
+    // 1 (older last_seen_pos) is evicted, never client 2 (just written).
+    s.apply(20, &env(2, 1, &Cmd::Write(2)), &mut out);
+    out.clear();
+    // client 2 must have survived its own eviction pass.
+    s.apply(30, &env(2, 1, &Cmd::Write(2)), &mut out);
+    assert_eq!(resp(&out).0, TAG_REPLAYED, "the just-written client is never the byte-budget victim");
+    out.clear();
+    // client 1 was evicted by the byte budget; its retry starts over.
+    s.apply(40, &env(1, 1, &Cmd::Write(1)), &mut out);
+    assert_eq!(resp(&out).0, TAG_FRESH, "client 1 was evicted by the byte budget; its retry is applied fresh");
+}
+
+/// `freeze()` reports the INNER SM's position, which can sit strictly below
+/// `Sessioned::last_applied()` when the most recent frames were
+/// REPLAYED/EXPIRED. That is safe to round-trip through a snapshot: those
+/// trailing frames only ever bump `last_seen_pos` (never evict, never touch
+/// the window contents), so replaying the skew again after install
+/// reproduces the identical table.
+#[test]
+fn freeze_with_trailing_replayed_frames_round_trips() {
+    let mut s = sm(4, 16);
+    let mut out = Vec::new();
+    s.apply(100, &env(5, 1, &Cmd::Write(7)), &mut out);
+    out.clear();
+    s.apply(200, &env(5, 2, &Cmd::Cas { old: 7, new: 8 }), &mut out);
+    out.clear();
+    // A trailing REPLAYED frame at a position above the inner SM's last apply.
+    s.apply(300, &env(5, 2, &Cmd::Cas { old: 7, new: 8 }), &mut out);
+    assert_eq!(resp(&out).0, TAG_REPLAYED);
+
+    let (handle, pos) = s.freeze().unwrap();
+    assert_eq!(pos, 200, "freeze reports the inner SM's position, not Sessioned::last_applied()");
+    assert_eq!(s.last_applied(), Some(300));
+
+    let mut img = Vec::new();
+    <Sessioned<RegisterSm> as SnapshotStateMachine>::stream_snapshot(handle, &mut img).unwrap();
+    let mut fresh = sm(4, 16);
+    let got = fresh.install_snapshot(200, &mut img.as_slice()).unwrap();
+    assert_eq!(got, 200);
+
+    out.clear();
+    fresh.apply(400, &env(5, 2, &Cmd::Cas { old: 7, new: 8 }), &mut out);
+    assert_eq!(
+        resp(&out),
+        (TAG_REPLAYED, Some(CmdResp::CasResult(true))),
+        "the dedup table survived even though the pre-freeze snapshot carried a trailing replayed frame's last_seen_pos bump"
+    );
 }
