@@ -15,6 +15,11 @@ path is kept because other documents and tooling cite it.
   and restart cost. *Was §2, §4.*
 - [Keep the journal from growing without bound](../how-to/bound-journal-growth.md)
   — snapshots, then purging, and confirming it works. *Was §5.*
+- [Run a gateway](../how-to/run-a-gateway.md) — a TCP front door for clients
+  that can't attach to shmem: start/stop, the stats line, one edge per node
+  host, what a client sees on `REDIRECT`/`LEADER_CHANGED`/`RETRY`, and the
+  faulted-exit/restart contract when a node's instance restarts underneath a
+  running gateway.
 
 ## Observing a cluster
 
@@ -65,6 +70,13 @@ path is kept because other documents and tooling cite it.
   switches, crypto file formats, cluster limits.
 - [Linearizable read path](../reference/read-path.md) — how reads are certified
   and what their failure signatures mean. *Was §7.*
+- [`gateway.toml`](../reference/gateway-config.md) — every gateway key, default,
+  and named refusal.
+- [The remote protocol](../reference/remote-protocol.md) — the framed TCP
+  wire format a gateway client implements against.
+- [The state-machine contract](../reference/state-machine-contract.md) —
+  `RawStateMachine`/`StateMachine`, and `Sessioned<S>`'s exactly-once
+  semantics.
 
 ## The two rules worth knowing before anything else
 

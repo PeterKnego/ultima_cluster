@@ -258,6 +258,15 @@ off.
 - **[Run a cluster on real hosts](/docs/how-to/run-a-cluster.md)** — the same
   cluster you just ran, moved onto separate machines: per-host configs, the
   network path, where clients live, systemd supervision.
+- **Remote clients and raw state machines.** A client that can't attach to
+  shmem directly (a different host, a different language runtime) talks to a
+  `uc2-gateway` edge over plain TCP instead — see
+  [Run a gateway](/docs/how-to/run-a-gateway.md). On the service side, the
+  `StateMachine` trait you just implemented above is the typed convenience
+  tier; a `RawStateMachine` (bytes-in/bytes-out, no codec) is the other —
+  see [the state-machine contract](/docs/reference/state-machine-contract.md)
+  for both, plus `Sessioned<S>`, the exactly-once wrapper the gateway's
+  session envelope needs.
 - **[ARCHITECTURE.md](/docs/ARCHITECTURE.md)** — how it works, and why it is
   shaped this way.
 - **[VERIFICATION.md](/docs/VERIFICATION.md)** — what is proved, what is checked,

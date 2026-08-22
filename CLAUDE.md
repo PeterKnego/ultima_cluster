@@ -190,12 +190,26 @@ Workspace crates:
 - `uc2_node` — the node binary + library. Wires the **four single-writer polling
   agents** (consensus / sender / receiver / archive), the `cnc.dat` page, the
   ingress ring, and the linearizable-read barrier. Owns elections and truncation.
-- `uc2_service` — service-side SDK. User implements `StateMachine` (sync `apply`,
-  sync `query`) + optionally `SnapshotStateMachine` (M6 purge) + `OutputHandler`
-  (async, leader-only). The apply agent polls committed positions in the log
-  buffer; reconstruction replays the journal or installs a snapshot + tail-replays.
+- `uc2_service` — service-side SDK. **M12a: two tiers.** `RawStateMachine`
+  (bytes-in/bytes-out, the core contract) or the typed `StateMachine` (sync
+  `apply`/`query`), which gets `RawStateMachine` for free via a blanket impl —
+  a type implements exactly one of the two. Optionally `SnapshotStateMachine`
+  (M6 purge) + `RawOutputHandler`/`OutputHandler` (async, leader-only,
+  `TypedOutput` adapts the latter onto the former). `uc2_service::session::
+  Sessioned<S>` wraps either tier for exactly-once-over-a-remote-hop: a
+  16-byte `client_id ++ seq` envelope, a 1-byte FRESH/REPLAYED/EXPIRED tag,
+  replicated `SessionConfig` enforced at snapshot install. The apply agent
+  polls committed positions in the log buffer; reconstruction replays the
+  journal or installs a snapshot + tail-replays.
 - `uc2_client` — sync local-shmem input-client SDK. Small dep set (no transport,
   no consensus); matcher over the broadcast response ring.
+- `uc2_remote` — **M12a**: the remote wire protocol (protocol v1: framed TCP,
+  credit-gated flow control, `REDIRECT`/`LEADER_CHANGED`/`RETRY`) and
+  `RemoteClient`, the pipelined, redirect-following, re-sending Rust
+  implementation of it — for clients that cannot attach to shmem directly.
+- `uc2_gateway` — **M12a**: `Edge`, a per-node TCP front door that terminates
+  `uc2_remote` traffic and relays it over the local `uc2_client::Engine`;
+  ships as the `uc2-gateway` binary + `gateway.toml` + a systemd unit.
 - `uc-lincheck` — test/verification library: WGL linearizability `checker`, op
   `history` recorder, `model`, and the in-memory CAS-`register` SM
   (`Cmd`/`CmdResp`/`RegisterSm: uc2_service::StateMachine`). One source of truth

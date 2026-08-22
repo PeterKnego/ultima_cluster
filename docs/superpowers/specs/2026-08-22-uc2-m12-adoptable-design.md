@@ -64,6 +64,19 @@ on the remote client link** in this release.
 
 ### 3.1 The state-machine contract: two tiers
 
+> **Amendment (Task 13, as-built).** The plan below sketches a `Typed<S>`
+> wrapper (`impl<S: StateMachine> RawStateMachine for Typed<S>`). What
+> shipped is a **blanket impl directly on `S`** —
+> `impl<S: StateMachine> RawStateMachine for S`, `uc2_service/src/traits.rs`
+> — with no `Typed<S>` newtype at all: a typed `StateMachine` simply *is* a
+> `RawStateMachine`, not something wrapped into one. `ServiceBuilder::new`
+> therefore accepts either tier directly (no separate `::raw` constructor);
+> `.output_handler(typed)` installs a typed `OutputHandler` through the
+> `TypedOutput<O>` adapter, `.raw_output_handler(raw)` installs a
+> `RawOutputHandler` directly. Everything else below (the codec, the
+> byte-identity promise, the measured cost split) shipped as written. See
+> `docs/reference/state-machine-contract.md` for the as-built reference.
+
 Today `uc2_service::StateMachine` is typed (`Command/Response/Query/
 QueryResponse: Serialize + DeserializeOwned`) and the framework does one
 bincode-standard decode per command at the apply boundary
@@ -83,16 +96,19 @@ pub trait RawStateMachine: Send + 'static {
     fn last_applied(&self) -> Option<u64>;
 }
 
-/// Today's typed trait, signature unchanged. Blanket-adapted onto the core:
-/// `Typed<S>` does exactly today's bincode-standard encode/decode.
+/// Today's typed trait, signature unchanged. Blanket-adapted directly onto
+/// the core trait (as-built: no `Typed<S>` wrapper — see the amendment
+/// above) — does exactly today's bincode-standard encode/decode.
 pub trait StateMachine: Send + 'static { /* as today */ }
-impl<S: StateMachine> RawStateMachine for Typed<S> { /* bincode standard */ }
+impl<S: StateMachine> RawStateMachine for S { /* bincode standard */ }
 ```
 
 - `SnapshotStateMachine` is already byte streams; it gains a `Raw` bound
   variant only if the compiler needs it (plan decides).
-- `ServiceBuilder::new(cfg, sm)` (typed) is unchanged; `ServiceBuilder::raw(cfg,
-  sm)` takes a `RawStateMachine`. Every existing state machine (`counter`,
+- `ServiceBuilder::new(cfg, sm)` accepts either tier directly (`S:
+  RawStateMachine`; a typed `sm` satisfies this through the blanket impl
+  above, so there is no separate `::raw` constructor — as-built, see the
+  amendment above). Every existing state machine (`counter`,
   `RegisterSm`, `CountSm`, the `ultima_db` store adapter) compiles unchanged;
   a **wire byte-identity test** (old `StateMachine` encode == `Typed<S>`
   encode for the same value) guards `2.5.0` clients.
@@ -138,6 +154,12 @@ choices are written down. Test fixtures and gates choose explicitly.
 
 ## 4. M12a — Gateway kit and the state-machine contract
 
+> **As built (M12a).** M12a shipped as Tasks 1–12 on `uc2/m12-adoptable`;
+> `docs/benchmarks/uc2-m12-gate-2026-08-22.md` is the acceptance-gate record
+> (every §8 row, local smoke numbers, the facts a fleet re-run must state).
+> The amendments below this line correct this section's sketch against what
+> actually shipped; §4.1–§4.6's prose is otherwise as written.
+
 ### 4.1 Crates
 
 - **`uc2_remote`** — the remote wire protocol (codec, frame types, constants)
@@ -161,13 +183,19 @@ never interprets them (the raw tier makes this literally true).
 | `HELLO` / `HELLO_OK` | c→e / e→c | protocol version, `app_id` check, client's asserted `client_id`; `HELLO_OK{credits, leader_node_id, leader_addr}` |
 | `SUBMIT` | c→e | a write; `seq` monotonic per client |
 | `QUERY` | c→e | flag `linearizable` or `snapshot`; served locally on any member |
-| `RESPONSE` | e→c | flags `fresh` / `replayed` / `expired` (from the `Sessioned` tag); carries `credits` |
+| `RESPONSE` | e→c | flags `FLAG_IS_QUERY`/`FLAG_REPLAYED`/`FLAG_EXPIRED`/`FLAG_ENVELOPED` (`FLAG_REPLAYED`/`FLAG_EXPIRED` lifted off the `Sessioned` 1-byte tag); carries `credits` |
 | `STATUS{acked_seq, credits}` | e→c | standalone credit/liveness frame: on a timer when idle, immediately when credits reopen |
 | `REDIRECT{leader_node_id, addr}` | e→c | this edge's node is not serving writes; go there |
-| `RETRY{reason, retry_after_us}` | e→c | state signal, sent **before** `try_submit` only: `not_serving` (no leader hint yet), `instance_restart`, `service_unavailable` |
+| `RETRY{reason, retry_after_us}` | e→c | state signal: `RETRY_NOT_SERVING=1` (no leader hint yet), `RETRY_INSTANCE_RESTART=2` (reserved; the reference edge signals this via `LEADER_CHANGED{unknown}`+close instead), `RETRY_SERVICE_UNAVAILABLE=3` (the local `Engine` backpressured past the request's timeout), `RETRY_PAYLOAD_TOO_LARGE=4` (terminal — the client must not resend) |
 | `UNKNOWN` | e→c | the edge's `Engine` timed the slot out: may or may not have committed |
 | `LEADER_CHANGED{leader_node_id, addr}` | e→c | pushed to every connection on a leader-watch transition |
-| `PING` / `PONG` | c→e / e→c | client liveness |
+| `PING` / `PONG` | c→e / e→c | client liveness: the client pings when idle past `ping_interval` (default 1 s); it declares the connection dead and fails over after `dead_after` (default 3 s) with nothing received at all |
+
+`HELLO_REFUSED` carries `HELLO_REFUSED_APP_ID=1`, `HELLO_REFUSED_VERSION=2`
+(both the client's problem — every member answers the same way), or
+`HELLO_REFUSED_FAULTED=3` (the edge's own problem: its node's shmem instance
+restarted underneath it and it will never serve again — try a different
+member).
 
 `client_id` is a client-chosen random `u64`, stable for the client's
 lifetime (persisted by the client if it wants dedup to survive its own
@@ -203,9 +231,24 @@ the mechanism. No frame is ever accepted and then bounced for capacity.
 - Error handling: `app_id` mismatch → `HELLO` refused; payload > the node's
   `max_payload` → refused before touching the ring; `Backpressure` → credits
   shrink (no message); `InstanceRestart` → all connections get
-  `LEADER_CHANGED` and are closed (clients reconnect, re-`HELLO`);
+  `LEADER_CHANGED{unknown}` and are closed (clients reconnect, re-`HELLO`);
   edge death → clients reconnect per the member map. The edge holds no
   durable state.
+- **As built: the per-connection not-serving latch.** A connection that is
+  told once — `REDIRECT` or `RETRY{not_serving}` — that this node cannot
+  take writes is told the same thing for every later `SUBMIT` on that
+  connection, even if the node starts serving a microsecond later
+  (`Conn::latch_not_serving`). Invariant: **the set of `SUBMIT`s a
+  connection gets accepted is always a prefix of what it sent.** Without
+  this, `Sessioned`'s FRESH/REPLAYED/EXPIRED classification breaks — a
+  write accepted after an earlier one on the same connection was refused
+  would leave a gap the dedup table cannot classify.
+- **As built: the faulted-exit contract.** Once `InstanceRestart` fires, the
+  edge latches `faulted` permanently — new `HELLO`s get
+  `HELLO_REFUSED_FAULTED` — and the `uc2-gateway` daemon polls `is_faulted`
+  and exits `1`, so `Restart=on-failure` brings up a fresh gateway against
+  the new node instance rather than serve a permanently faulted edge
+  forever.
 - `gateway.toml`: `[local] instance_dir, app_id, listen`, `[[members]]`,
   `session_envelope`, `max_inflight`, `status_interval_ms`. Named startup
   refusals like `uc2-node`. `packaging/uc2-gateway.service` and
@@ -215,18 +258,27 @@ the mechanism. No frame is ever accepted and then bounced for capacity.
 
 `impl<S: RawStateMachine> RawStateMachine for Sessioned<S>`:
 - `apply`: peel the 16-byte header; if `seq` ≤ client's highest applied and
-  inside the window → write `replayed ‖ cached response`; if older than the
-  window → `expired`; else delegate, cache `(seq → response)`, write
-  `fresh ‖ response`. Per client: highest applied `seq` + a bounded window of
-  responses (default window = `max_inflight`, configurable); clients are
-  LRU-bounded (`max_clients`). A `seq` gap (client skipped numbers) is
-  applied as fresh — ordering within a session is the protocol's job.
+  inside the window → write a 1-byte `TAG_REPLAYED=1` ‖ cached response; if
+  older than the window → `TAG_EXPIRED=2` alone (no bytes follow); else
+  delegate, cache `(seq → response)`, write `TAG_FRESH=0` ‖ response. Per
+  client: highest applied `seq` + a bounded window of responses (**as
+  built**: `SessionConfig { window: usize (default 4096), max_clients: usize
+  (default 65536), max_bytes: usize (default 256 MiB) }` — not tied to
+  `max_inflight`); clients are evicted deterministically by
+  `(last_seen_pos, client_id)`, oldest first, on either budget. **As built:
+  `SessionConfig` is part of the replicated contract** — every replica must
+  run identical values, and `install_snapshot` refuses a snapshot whose
+  embedded config disagrees with the live node's rather than silently
+  retuning it. A `seq` gap (client skipped numbers) is applied as fresh —
+  ordering within a session is the protocol's job.
 - `query` and `last_applied` delegate.
 - Snapshot: `SnapshotHandle = (dedup blob, S::SnapshotHandle)`;
-  `stream_snapshot` writes a length-prefixed dedup blob then delegates;
-  `install_snapshot` reads it off the same `src` then delegates — one
-  artifact, one position tag.
-- Works over `Typed<S>` too, so typed users get it by wrapping.
+  `stream_snapshot` writes a length-prefixed dedup blob (config + table) then
+  delegates; `install_snapshot` reads it off the same `src`, refuses on a
+  config mismatch, then delegates — one artifact, one position tag.
+- Works over a typed `StateMachine` too (via the blanket impl onto
+  `RawStateMachine`, §3.1's amendment), so typed users get it by wrapping —
+  no separate typed `Sessioned` exists.
 
 ### 4.5 Failover promises (what `RemoteClient` guarantees)
 
@@ -238,6 +290,20 @@ With the envelope on, a re-send is safe by construction (`fresh` /
 "outcome unknowable" error). With it off, re-sent writes are reported as
 "possibly duplicated". `UNKNOWN` is resolved by the re-send. Nothing queues
 durably anywhere.
+
+**As built, two mechanisms not in the original sketch:**
+- **Probe-before-flush.** A freshly (re)connected client does not flush its
+  whole pending window immediately — it writes exactly one request and
+  waits for proof the far end will actually serve (a `RESPONSE`, or a
+  `STATUS` whose `acked_seq` covers it) before releasing the rest. Also
+  acts on `HELLO_OK`'s named leader before flushing, so a pipelined window
+  is flushed at the real leader rather than redirected frame by frame. See
+  `docs/notes/uc2-gateway-shapes-and-flow-control.md` for why this mattered.
+- **`PING`/`PONG` liveness.** `RemoteConfig::ping_interval` (default 1 s)
+  sends a `PING` when nothing has been written for that long;
+  `RemoteConfig::dead_after` (default 3 s, must exceed `ping_interval` —
+  not validated today) declares the connection dead and fails over when
+  nothing at all has been received in that window.
 
 ### 4.6 Tests and gate
 

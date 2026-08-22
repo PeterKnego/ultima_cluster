@@ -161,9 +161,10 @@ const SUPERVISE_TICK: Duration = Duration::from_millis(200);
 /// - **Why more than a handful.** At a cap of 4 the cap was hit 3-5 times in
 ///   every envelope-off run, and a hit is exactly the case that could turn a
 ///   sound cluster into a red test.
-/// - **Why not the raw delta.** The observed maximum delta is ~34 — but a
-///   re-send is not an apply. Most of those writes are refused by an edge that
-///   cannot serve (REDIRECT) or land on a node that dies before committing;
+/// - **Why not the raw delta.** The observed maximum delta is up to ~54
+///   measured — but a re-send is not an apply. Most of those writes are
+///   refused by an edge that cannot serve (REDIRECT) or land on a node that
+///   dies before committing;
 ///   an apply needs the frame to actually reach a leader that commits it, and
 ///   with 6 kills in a 20 s window an op cannot plausibly do that more than a
 ///   handful of times. Phantoms that model impossible applies are pure cost:

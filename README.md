@@ -150,6 +150,8 @@ including what is *not* verified and how to reproduce every layer.
 | `uc2_node` | The node: agents wired together, IPC surface, read barrier, gate harnesses |
 | `uc2_service` | Service SDK: `StateMachine` traits, apply agent, reconstruction; optional [`ultima-db`](https://crates.io/crates/ultima-db) store adapter (feature `ultima_db`) |
 | `uc2_client` | Client SDK in three tiers: the pipelined `Engine` (split send/poll halves, exactly-once slot correlation), `PipelinedClient` + `Ticket` (`wait()` or `.await`), and a blocking `Client` shim. Submit, linearizable/snapshot queries |
+| `uc2_remote` | The remote wire protocol (framed TCP, credit-gated flow control) and `RemoteClient`, its pipelined redirect-following Rust implementation — for clients that can't attach to shmem directly |
+| `uc2_gateway` | The `Edge`: a per-node TCP front door relaying `uc2_remote` traffic over the local `Engine`; ships as the `uc2-gateway` binary + `gateway.toml` |
 | `uc-lincheck` | WGL linearizability checker + history recorder + register model |
 | `ultima_journal` | Segmented append journal + atomic `StableValue`s |
 

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Peter Knego
 
-//! The service-side SDK traits (M5 spec §7). The user implements
-//! [`StateMachine`] (and optionally [`OutputHandler`]); the framework drives
-//! them off the committed log.
+//! The service-side SDK traits (M5 spec §7, M12a spec §3.1). The user
+//! implements [`StateMachine`] (typed) or [`RawStateMachine`] (bytes-in/
+//! bytes-out, the raw tier) — exactly one of the two — and optionally
+//! [`OutputHandler`] / [`RawOutputHandler`]; the framework drives them off
+//! the committed log.
 //!
 //! v2 differences from the v1 `uc_service` traits: apply is keyed by an
 //! absolute byte **`position`** (the v2 log_index analog and the idempotency

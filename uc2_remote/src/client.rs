@@ -114,7 +114,8 @@ pub struct RemoteConfig {
     pub ping_interval: Duration,
     /// Treat the connection as dead when nothing at all has been *received* for
     /// this long, and fail over. The edge's `STATUS` timer and the `PONG` to our
-    /// `PING` both count as traffic.
+    /// `PING` both count as traffic. `dead_after` must exceed `ping_interval`
+    /// (not validated).
     pub dead_after: Duration,
     /// `UNKNOWN` means "may or may not have committed". `true` (the default)
     /// re-sends — correct with the edge's session envelope on, and the only way

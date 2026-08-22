@@ -40,6 +40,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Clippy (uc2_service + ultima_db adapter)
         run: cargo clippy -p uc2_service --features ultima_db --all-targets -- -D warnings
+      - name: Clippy (uc2_service + apply-profile)
+        run: cargo clippy -p uc2_service --features apply-profile --all-targets -- -D warnings
+      - name: Clippy (uc2_gateway + test-util)
+        run: cargo clippy -p uc2_gateway --features test-util --all-targets -- -D warnings
       - name: Tests (workspace, minus slow capstones)
         run: cargo test --workspace --exclude uc2_node
       - name: Tests (uc2_service + ultima_db adapter)

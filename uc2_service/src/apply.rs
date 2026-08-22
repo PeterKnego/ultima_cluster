@@ -184,8 +184,8 @@ pub(crate) struct ApplyState<S: RawStateMachine> {
     /// The user state machine, behind `Arc<Mutex<S>>`. `Arc` (shared, not owned)
     /// so the `Service` handle can reach it for direct queries (the test/embedded
     /// query path until the client query ring lands in Task 10/11); `Mutex`
-    /// (not `RwLock`) so sharing needs only `S: Send` — the `StateMachine` bound
-    /// is `Send + 'static`, with no `Sync`. Task 11's `drain_queries` runs on
+    /// (not `RwLock`) so sharing needs only `S: Send` — the `RawStateMachine`
+    /// bound is `Send + 'static`, with no `Sync`. Task 11's `drain_queries` runs on
     /// THIS same apply thread right after the applies, taking the lock the same
     /// way the apply path does (single-threaded, so the read/write distinction a
     /// `RwLock` would give buys nothing here).
