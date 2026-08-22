@@ -9,8 +9,9 @@
 //! A handshake is refused with one of the `HELLO_REFUSED_*` reasons:
 //! [`HELLO_REFUSED_APP_ID`] and [`HELLO_REFUSED_VERSION`] are the client's
 //! problem (another member would answer the same way), while
-//! [`HELLO_REFUSED_FAULTED`] is the *edge's* — it has taken itself out of
-//! service and another member is worth trying.
+//! [`HELLO_REFUSED_FAULTED`] and [`HELLO_REFUSED_BUSY`] are the *edge's* — it
+//! has taken itself out of service, or is at its connection ceiling, and
+//! another member is worth trying.
 
 pub use crate::error::FrameError;
 
@@ -54,6 +55,12 @@ pub const HELLO_REFUSED_VERSION: u8 = 2;
 /// is void). Unlike the other two reasons this says nothing about the client's
 /// request — a *different* member's edge may well be healthy.
 pub const HELLO_REFUSED_FAULTED: u8 = 3;
+/// The edge is at its `max_connections` ceiling and will not accept another
+/// client right now. Like [`HELLO_REFUSED_FAULTED`] this is about the edge,
+/// not the client, so a client with more than one member should try the next
+/// one; unlike it, the condition is transient — this edge may well accept the
+/// same client a moment later, once a connection closes.
+pub const HELLO_REFUSED_BUSY: u8 = 4;
 
 /// The frame's type byte, one per row of the design spec's frame table.
 #[repr(u8)]
@@ -402,20 +409,21 @@ mod tests {
     }
 
     #[test]
-    fn the_three_hello_refusal_reasons_are_distinct_and_round_trip() {
-        for r in [HELLO_REFUSED_APP_ID, HELLO_REFUSED_VERSION, HELLO_REFUSED_FAULTED] {
+    fn the_four_hello_refusal_reasons_are_distinct_and_round_trip() {
+        const REASONS: [u8; 4] = [
+            HELLO_REFUSED_APP_ID,
+            HELLO_REFUSED_VERSION,
+            HELLO_REFUSED_FAULTED,
+            HELLO_REFUSED_BUSY,
+        ];
+        for r in REASONS {
             let mut out = Vec::new();
             HelloRefused { reason: r, detail: "why" }.encode(&mut out);
             assert_eq!(HelloRefused::decode(&out).unwrap().reason, r);
         }
         assert_eq!(
-            [HELLO_REFUSED_APP_ID, HELLO_REFUSED_VERSION, HELLO_REFUSED_FAULTED].len(),
-            std::collections::BTreeSet::from([
-                HELLO_REFUSED_APP_ID,
-                HELLO_REFUSED_VERSION,
-                HELLO_REFUSED_FAULTED
-            ])
-            .len(),
+            REASONS.len(),
+            std::collections::BTreeSet::from(REASONS).len(),
             "reason codes must not collide"
         );
     }

@@ -59,6 +59,8 @@ struct LimitsSection {
     request_timeout_ms: u64,
     #[serde(default = "default_status_interval_ms")]
     status_interval_ms: u64,
+    #[serde(default = "default_max_connections")]
+    max_connections: u32,
 }
 
 impl Default for LimitsSection {
@@ -68,6 +70,7 @@ impl Default for LimitsSection {
             per_conn_inflight: default_per_conn_inflight(),
             request_timeout_ms: default_request_timeout_ms(),
             status_interval_ms: default_status_interval_ms(),
+            max_connections: default_max_connections(),
         }
     }
 }
@@ -112,6 +115,9 @@ fn default_request_timeout_ms() -> u64 {
 fn default_status_interval_ms() -> u64 {
     200
 }
+fn default_max_connections() -> u32 {
+    1024
+}
 fn default_envelope() -> bool {
     true
 }
@@ -139,6 +145,7 @@ pub fn load_from_path(path: &Path) -> Result<EdgeConfig, ConfigFileError> {
         per_conn_inflight: limits.per_conn_inflight,
         status_interval: Duration::from_millis(limits.status_interval_ms),
         request_timeout: Duration::from_millis(limits.request_timeout_ms),
+        max_connections: limits.max_connections,
     };
     cfg.validate()?;
     Ok(cfg)

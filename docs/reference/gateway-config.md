@@ -44,8 +44,9 @@ some fields set takes the defaults for the rest.
 |---|---|---|---|---|
 | `max_inflight` | u32 | `4096` | the local `Engine`'s inflight window, shared across every connection on this edge | `0` → `ZeroMaxInflight` |
 | `per_conn_inflight` | u32 | `256` | initial credits granted to each connection in `HELLO_OK`; shrinks under backpressure, relaxes back up to this ceiling | `0` → `ZeroPerConnInflight`; greater than `max_inflight` → `PerConnExceedsMax { per_conn, max }` (one connection could exhaust the whole engine window) |
-| `request_timeout_ms` | u64 | `10000` | the `Engine`'s per-request deadline; a request that blows it completes `TimedOut` and the client is told `UNKNOWN` | `0` → `ZeroRequestTimeout` |
+| `request_timeout_ms` | u64 | `10000` | the `Engine`'s per-request deadline; a request that blows it completes `TimedOut` and the client is told `UNKNOWN`. **Also a client's exposure window when this host's node has died and the supervisor has not stopped the gateway yet** — consider `2000` for a gateway, see [the how-to](../how-to/run-a-gateway.md#when-the-node-underneath-dies) | `0` → `ZeroRequestTimeout` |
 | `status_interval_ms` | u64 | `200` | a connection with no write for this long gets a standalone `STATUS` — also the edge→client liveness tick, so it must stay well under a client's `dead_after` | `0` → `ZeroStatusInterval` |
+| `max_connections` | u32 | `1024` | hard ceiling on simultaneously-open client connections; each costs a reader thread and a socket. Over it, the acceptor answers `HELLO_REFUSED{BUSY}` (reason `4`) without spawning a reader, counted as `EdgeStats::refused_busy` — a conforming client treats `BUSY` like `FAULTED` and tries the next member | `0` → `ZeroMaxConnections` |
 
 ## `[session]` — optional; its one field is independently optional
 

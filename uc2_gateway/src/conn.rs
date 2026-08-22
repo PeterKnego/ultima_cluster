@@ -399,6 +399,16 @@ impl ConnTable {
         self.slots.write().insert(conn.idx, conn);
     }
 
+    /// How many connections are live right now.
+    ///
+    /// Only the single acceptor thread ever *adds* one, so an acceptor that
+    /// tests this and then inserts holds a hard ceiling without a lock spanning
+    /// both steps: concurrent `remove`s can only make the count smaller, never
+    /// larger, so the check can never be raced upward past the limit.
+    pub fn len(&self) -> usize {
+        self.slots.read().len()
+    }
+
     pub fn get(&self, idx: u32) -> Option<Arc<Conn>> {
         self.slots.read().get(&idx).cloned()
     }

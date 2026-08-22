@@ -99,6 +99,13 @@ cost of turning the envelope off.
 | `HELLO_REFUSED_APP_ID` | 1 | wrong `app_id` — the client's problem; every member answers the same way |
 | `HELLO_REFUSED_VERSION` | 2 | protocol version mismatch — the client's problem |
 | `HELLO_REFUSED_FAULTED` | 3 | this **edge's** problem: its node's shmem instance restarted underneath it and it will never serve again; try a different member |
+| `HELLO_REFUSED_BUSY` | 4 | this **edge's** problem, and a transient one: it is already serving `max_connections` clients. Written by the acceptor *before* the peer's `HELLO` is even read (so a client sees it as the answer to its dial), without spawning a reader thread; try a different member |
+
+`FAULTED` and `BUSY` are the two reasons that cost one *member* rather than
+the whole dial: a conforming client counts the member as out, skips it, and
+carries on down its list — mid-life on an established connection as well as
+at the handshake. `APP_ID`/`VERSION` are about the client, so no member would
+answer differently and the connect attempt aborts outright.
 
 ### `SUBMIT` (type 4), `QUERY` (type 5)
 
@@ -183,7 +190,9 @@ connection has been told `not_serving` for one `SUBMIT`, that connection is
 refused for every later `SUBMIT` too, even if this node wins an election a
 microsecond later. So `RemoteClient` does not resend on the same connection
 — it reconnects, preferring the `leader` address from the most recent
-`HELLO_OK`/`STATUS`/`LEADER_CHANGED` if that names somewhere else.
+`HELLO_OK`/`REDIRECT`/`LEADER_CHANGED` if that names somewhere else. (`STATUS`
+is not in that list: it carries only `acked_seq` and `credits`, no leader
+field.)
 
 ### `UNKNOWN` (type 10)
 
@@ -286,9 +295,10 @@ client absorbs them:
 - **Follows `REDIRECT` and `LEADER_CHANGED`.** Both trigger a reconnect to
   the named address (or round-robin over `members` if unresolvable),
   re-`HELLO`, and a fresh credit grant.
-- **`HELLO_REFUSED_FAULTED` moves to the next member**; `APP_ID`/`VERSION`
-  refusals abort the connect attempt outright — no other member would answer
-  differently.
+- **`HELLO_REFUSED_FAULTED` and `HELLO_REFUSED_BUSY` move to the next
+  member** — at the dial, and mid-life on an established connection alike;
+  `APP_ID`/`VERSION` refusals abort the connect attempt outright — no other
+  member would answer differently.
 - **Ordered re-send.** Every unanswered `seq` is re-sent, in `seq` order, on
   the new connection. With the envelope on this is safe by construction
   (`fresh`/`replayed`/`expired` are all well-defined outcomes); with it off,
@@ -303,8 +313,16 @@ client absorbs them:
   `ping_interval`; the client declares the connection dead and reconnects
   after `dead_after` with nothing received at all (a `PONG`, a `STATUS`, or
   any other frame all count as "received"). `dead_after` must exceed
-  `ping_interval` for this to mean anything (not enforced by
-  `RemoteConfig` today).
+  `ping_interval`, which `RemoteConfig::validate` enforces at
+  `RemoteClient::connect` (along with a non-empty `app_id` and `members`, and
+  a non-zero `max_inflight`) — a refusal there is `RemoteError::Config`,
+  raised before any socket is opened.
+- **A peer that stalls mid-frame is a dead peer.** A frame that is still
+  incomplete after the reader's stall budget (`dead_after` for
+  `RemoteClient`, `request_timeout` for the reference edge) fails the
+  connection rather than being waited on: half a header and then silence must
+  reach the same verdict as silence between frames, or the reader's own tick
+  never runs again.
 
 ## What this page does not cover
 

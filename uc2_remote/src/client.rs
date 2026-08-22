@@ -35,7 +35,8 @@
 //! `State` to release credits) can only be made deadlock-free by an ordering
 //! that also has to admit the reconnect path. One lock removes the question.
 //! The cost — a socket write happens under the lock — is bounded by a socket
-//! *write timeout*: a write that cannot complete within `request_timeout` fails,
+//! *write timeout*: a write that cannot complete within `WRITE_TIMEOUT`
+//! (2 s, deliberately not `request_timeout` — see the constant) fails,
 //! the connection is discarded, and the reader re-sends on a fresh one. That is
 //! what stops the one real cycle (peer stops reading → our writer blocks under
 //! the lock → our reader cannot drain responses → peer never resumes).
@@ -59,8 +60,9 @@ use crate::conn::FramedConn;
 use crate::error::RemoteError;
 use crate::frame::{
     FrameType, Header, Hello, HelloOk, HelloRefused, Leader, ResponseMeta, Retry, Status,
-    FLAG_EXPIRED, FLAG_LINEARIZABLE, FLAG_REPLAYED, HEADER_LEN, HELLO_REFUSED_FAULTED,
-    MAX_FRAME_LEN, PROTOCOL_VERSION, RETRY_NOT_SERVING, RETRY_PAYLOAD_TOO_LARGE,
+    FLAG_EXPIRED, FLAG_LINEARIZABLE, FLAG_REPLAYED, HEADER_LEN, HELLO_REFUSED_BUSY,
+    HELLO_REFUSED_FAULTED, MAX_FRAME_LEN, PROTOCOL_VERSION, RETRY_NOT_SERVING,
+    RETRY_PAYLOAD_TOO_LARGE,
 };
 
 /// The reader's tick: how often it times out stale requests, re-pumps requests
@@ -105,7 +107,10 @@ pub struct RemoteConfig {
     /// A local cap on unanswered requests, applied on top of the edge's credits.
     pub max_inflight: u32,
     /// End-to-end budget for one request, across re-sends and reconnects.
-    /// Also the socket write timeout.
+    ///
+    /// Note this is **not** the socket write timeout — that is the crate's own
+    /// `WRITE_TIMEOUT` constant (2 s), deliberately short because a write
+    /// happens under the client's state lock.
     pub request_timeout: Duration,
     /// Per-address TCP connect + `HELLO` budget.
     pub connect_timeout: Duration,
@@ -114,8 +119,9 @@ pub struct RemoteConfig {
     pub ping_interval: Duration,
     /// Treat the connection as dead when nothing at all has been *received* for
     /// this long, and fail over. The edge's `STATUS` timer and the `PONG` to our
-    /// `PING` both count as traffic. `dead_after` must exceed `ping_interval`
-    /// (not validated).
+    /// `PING` both count as traffic. Must exceed `ping_interval`, which
+    /// [`RemoteConfig::validate`] enforces. Doubles as the bound on a peer that
+    /// vanishes in the middle of a frame ([`crate::FramedConn::read_frame`]).
     pub dead_after: Duration,
     /// `UNKNOWN` means "may or may not have committed". `true` (the default)
     /// re-sends — correct with the edge's session envelope on, and the only way
@@ -136,6 +142,54 @@ impl Default for RemoteConfig {
             dead_after: Duration::from_secs(3),
             resend_on_unknown: true,
         }
+    }
+}
+
+impl RemoteConfig {
+    /// Refuse a configuration that cannot work, by name — the same posture
+    /// `uc2_gateway`'s `EdgeConfig::validate` takes on the other side of the
+    /// wire. Called at the top of [`RemoteClient::connect`], before any socket
+    /// is opened, so a mistake reads as a configuration error rather than as
+    /// "the cluster is unreachable".
+    ///
+    /// The rules, and why each one is a refusal rather than a silent
+    /// adjustment:
+    ///
+    /// - **`app_id` empty** — it is checked byte-for-byte by the edge, and an
+    ///   empty one is a legal-but-almost-certainly-unintended cluster name that
+    ///   every member would refuse with `HELLO_REFUSED_APP_ID`.
+    /// - **`members` empty** — there is nowhere to dial.
+    /// - **`max_inflight == 0`** — no request could ever be admitted; `submit`
+    ///   would block until `request_timeout` and then report `TimedOut`,
+    ///   forever.
+    /// - **`dead_after <= ping_interval`** — the liveness pair is then
+    ///   self-defeating: the connection is declared dead at or before the first
+    ///   `PING` could have been answered, so a perfectly healthy edge is
+    ///   churned on a timer.
+    pub fn validate(&self) -> Result<(), RemoteError> {
+        if self.app_id.is_empty() {
+            return Err(RemoteError::Config(
+                "app_id is empty: it must match the edge's app_id exactly".into(),
+            ));
+        }
+        if self.members.is_empty() {
+            return Err(RemoteError::Config(
+                "members is empty: at least one gateway address is needed to dial".into(),
+            ));
+        }
+        if self.max_inflight == 0 {
+            return Err(RemoteError::Config(
+                "max_inflight must be greater than zero: no request could ever be admitted".into(),
+            ));
+        }
+        if self.dead_after <= self.ping_interval {
+            return Err(RemoteError::Config(format!(
+                "dead_after ({:?}) must exceed ping_interval ({:?}): a healthy connection would \
+                 be declared dead before its own PING could be answered",
+                self.dead_after, self.ping_interval
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -160,10 +214,12 @@ pub struct RemoteStats {
     pub expired: u64,
     /// The largest `credits` value any frame ever advertised.
     pub max_credits_seen: u32,
-    /// Members that refused the handshake with `HELLO_REFUSED{FAULTED}` and
-    /// were skipped. That refusal is about *that edge* (its node's shmem
-    /// instance restarted under it), not about this client, so it costs one
-    /// member rather than the whole dial.
+    /// Members that refused with `HELLO_REFUSED{FAULTED}` or
+    /// `HELLO_REFUSED{BUSY}` and were skipped — at the dial, or mid-life on an
+    /// established connection. Both refusals are about *that edge* (its node's
+    /// shmem instance restarted under it; it is at its `max_connections`
+    /// ceiling), not about this client, so each costs one member rather than
+    /// the whole dial.
     pub refused_members: u64,
 }
 
@@ -322,17 +378,18 @@ impl RemoteClient {
     /// pipelined window is flushed at the leader rather than redirected frame
     /// by frame.
     ///
+    /// Fails with [`RemoteError::Config`] if [`RemoteConfig::validate`]
+    /// refuses the configuration, before any socket is opened.
+    ///
     /// Fails with [`RemoteError::HelloRefused`] if an edge refuses the
     /// handshake for a reason no other member would answer differently — a
-    /// wrong `app_id` or protocol version. A `HELLO_REFUSED{FAULTED}` is the
-    /// *edge's* problem instead, so that member is counted
+    /// wrong `app_id` or protocol version. A `HELLO_REFUSED{FAULTED}` or
+    /// `{BUSY}` is the *edge's* problem instead, so that member is counted
     /// ([`RemoteStats::refused_members`]) and skipped. Fails with
     /// [`RemoteError::NoMembersReachable`] only after a full pass over
     /// `members`.
     pub fn connect(cfg: RemoteConfig) -> Result<Self, RemoteError> {
-        if cfg.members.is_empty() {
-            return Err(RemoteError::NoMembersReachable);
-        }
+        cfg.validate()?;
         let client_id = cfg.client_id.unwrap_or_else(random_u64);
         // The stats live longer than this call, and `dial` records the members
         // it had to skip, so they are built before the first dial rather than
@@ -838,12 +895,25 @@ impl Inner {
                 Act::Reconnect(Some(l.addr.to_string()))
             }
             FrameType::HelloRefused => {
-                // Mid-life refusal: not something a re-send or another member
-                // fixes. Fail everything and stop.
                 let (reason, detail) = match HelloRefused::decode(&payload) {
                     Ok(r) => (r.reason, r.detail.to_string()),
                     Err(_) => (0, String::new()),
                 };
+                // Same split as the dial path, and for the same reason: what
+                // the refusal is ABOUT decides who it is terminal for.
+                // `FAULTED`/`BUSY` are statements about THIS EDGE — it has
+                // taken itself out of service, or is at its connection ceiling
+                // — so another member may well be healthy and this costs one
+                // member, not the client. Closing here instead would turn a
+                // single edge's local condition into a dead client, which is
+                // exactly what the multi-member list exists to prevent.
+                if reason == HELLO_REFUSED_FAULTED || reason == HELLO_REFUSED_BUSY {
+                    self.stats.refused_members.fetch_add(1, Ordering::Relaxed);
+                    return Act::Reconnect(None);
+                }
+                // `APP_ID`/`VERSION` are about US: no member would answer
+                // differently, so neither a re-send nor another member fixes
+                // it. Fail everything and stop.
                 self.fail_all_and_close(|| RemoteError::HelloRefused {
                     reason,
                     detail: detail.clone(),
@@ -1070,7 +1140,10 @@ fn reader_loop(inner: Arc<Inner>, mut rd: FramedConn) {
         if inner.is_closed() {
             return;
         }
-        let frame = rd.read_frame();
+        // `dead_after` is the mid-frame bound as well as the silence bound:
+        // a peer that vanishes half way through a frame must reach the same
+        // verdict, on the same clock, as one that vanishes between frames.
+        let frame = rd.read_frame(inner.cfg.dead_after);
         // One clock read per iteration serves the tick, the liveness check and
         // the receive stamp.
         let now = Instant::now();
@@ -1214,13 +1287,13 @@ fn dial(
                 }
                 i += 1;
             }
-            // `FAULTED` is the EDGE's problem, not the client's: that gateway
-            // has taken itself out of service (its node's shmem instance
-            // restarted under it) and a supervisor has to restart it. Every
-            // other member may be perfectly healthy, so this costs one member
-            // and the scan goes on — only a full pass of failures is
-            // `NoMembersReachable`.
-            Dialed::Refused { reason: HELLO_REFUSED_FAULTED, .. } => {
+            // `FAULTED` and `BUSY` are the EDGE's problem, not the client's:
+            // that gateway has taken itself out of service (its node's shmem
+            // instance restarted under it, and a supervisor has to restart it),
+            // or it is already serving `max_connections`. Every other member
+            // may be perfectly healthy, so this costs one member and the scan
+            // goes on — only a full pass of failures is `NoMembersReachable`.
+            Dialed::Refused { reason: HELLO_REFUSED_FAULTED | HELLO_REFUSED_BUSY, .. } => {
                 stats.refused_members.fetch_add(1, Ordering::Relaxed);
                 i += 1;
             }
@@ -1268,7 +1341,7 @@ fn dial_one(cfg: &RemoteConfig, client_id: u64, addr: &str) -> Dialed {
     }
     let deadline = Instant::now() + cfg.connect_timeout;
     loop {
-        match conn.read_frame() {
+        match conn.read_frame(cfg.connect_timeout) {
             Ok(Some((h, payload))) => {
                 return match h.ty {
                     FrameType::HelloOk => match HelloOk::decode(&payload) {

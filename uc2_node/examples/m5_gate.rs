@@ -13,8 +13,8 @@
 //!
 //! **M12a (`--raw-sm`)** swaps the gate's `CountSm` (typed `StateMachine`,
 //! bincode) for `RawCountSm` (`RawStateMachine`, bytes-in/bytes-out, no
-//! decode) — same increment-and-echo logic, same 8-byte response, only the
-//! codec differs. Paired with `--features uc2_service/apply-profile`, running
+//! decode) — same increment-and-echo logic, a `u64` response either way
+//! (raw: 8 LE bytes; typed: bincode varint, so 1-9), only the codec differs. Paired with `--features uc2_service/apply-profile`, running
 //! `all` with and without `--raw-sm` is the two-tier codec-share A/B; see
 //! `docs/notes/2026-08-22-codec-budget-spike.md` for the background numbers
 //! and its "Post-fix smoke" section for this harness's readings.
@@ -252,8 +252,10 @@ impl StateMachine for CountSm {
 }
 
 /// Raw-tier twin of [`CountSm`]: sees the frame bytes, decodes nothing. Same
-/// deterministic increment, same 8-byte response (a `u64`, little-endian) —
-/// the only difference from `CountSm` is which side of the `RawStateMachine`
+/// deterministic increment, and a `u64` response either way — but NOT the same
+/// bytes: this tier writes it as 8 little-endian bytes, while `CountSm`'s
+/// typed `u64` goes out bincode-varint-encoded (1-9 bytes for the same value).
+/// The only difference from `CountSm` is which side of the `RawStateMachine`
 /// boundary does the (de)coding, which is exactly what the `apply-profile`
 /// A/B (`--raw-sm`) measures. See `docs/notes/2026-08-22-codec-budget-spike.md`.
 #[derive(Default)]

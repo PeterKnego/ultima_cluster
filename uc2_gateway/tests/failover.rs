@@ -40,6 +40,10 @@
 //! the node is what keeps the client's failover bounded by an election rather
 //! than by a timeout ladder.
 
+/// Mid-frame stall budget for the one raw read in this file. Nothing here
+/// writes a partial frame, so it only bounds a wedged test.
+const READ_STALL: std::time::Duration = std::time::Duration::from_secs(10);
+
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
@@ -242,7 +246,7 @@ fn leader_crash_redirects_and_resend_is_deduped() {
     // its job. Only a FRAME is: anything the edge wrote before closing would
     // still be sitting in the socket buffer ahead of the EOF, so this keeps
     // its teeth either way.
-    match silent.read_frame() {
+    match silent.read_frame(READ_STALL) {
         Ok(None) | Err(_) => {}
         Ok(Some((h, _))) => {
             panic!("the edge wrote {:?} at a connection that has not handshaken", h.ty)

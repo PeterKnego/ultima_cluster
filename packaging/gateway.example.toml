@@ -53,11 +53,25 @@ max_inflight = 4096
 per_conn_inflight = 256
 # The Engine's per-request deadline, in milliseconds. A request that blows it
 # completes as TimedOut and the client is told UNKNOWN.
+#
+# It is ALSO a client's exposure window when this host's node has died but
+# systemd has not stopped the gateway yet: the cnc page stays frozen with
+# CAN_SERVE set, so the edge keeps accepting SUBMITs into a ring nobody drains
+# and can only answer them UNKNOWN this long later. 2000 is a better number
+# than the 10000 default for most gateways — it bounds how long a client is
+# pinned to a dead node before it can re-send somewhere useful, at the cost of
+# calling a genuinely slow (but live) request UNKNOWN sooner. See
+# docs/how-to/run-a-gateway.md, "When the node underneath dies".
 request_timeout_ms = 10000
 # A connection with no write for this long (ms) gets a standalone STATUS —
 # also the edge->client liveness tick, so keep it well under a client's
 # dead_after.
 status_interval_ms = 200
+# Hard ceiling on simultaneously-open client connections. Each one costs a
+# reader thread and a socket, so this is a real resource bound; over it, the
+# edge answers HELLO_REFUSED{BUSY} (reason 4) and the client tries the next
+# member rather than being silently starved here.
+max_connections = 1024
 
 [session]
 # true = prepend a 16-byte client_id/seq envelope to SUBMIT payloads and lift

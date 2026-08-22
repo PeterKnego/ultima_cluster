@@ -58,6 +58,9 @@ pub enum ConfigError {
     ZeroStatusInterval,
     #[error("request_timeout must be greater than zero")]
     ZeroRequestTimeout,
+    #[error("max_connections must be greater than zero: an edge that accepts nothing is not an \
+             edge")]
+    ZeroMaxConnections,
 }
 
 /// How one edge process is wired up.
@@ -89,7 +92,20 @@ pub struct EdgeConfig {
     pub status_interval: Duration,
     /// The `Engine`'s per-request deadline. A request that blows it completes
     /// as `TimedOut` and the client is told `UNKNOWN`.
+    ///
+    /// It is also the client's exposure window when this edge's node has died
+    /// without the supervisor noticing: the cnc page stays frozen with
+    /// `CAN_SERVE` set, so the edge keeps accepting SUBMITs into a ring nobody
+    /// drains and can only answer them `UNKNOWN` a `request_timeout` later.
+    /// Gateways are usually better off well under the 10 s default — see
+    /// `docs/how-to/run-a-gateway.md`, "When the node underneath dies".
     pub request_timeout: Duration,
+    /// Hard ceiling on simultaneously-open client connections. The acceptor
+    /// refuses the next one with `HELLO_REFUSED{BUSY}` rather than spawning an
+    /// unbounded number of reader threads — one thread and one socket per
+    /// connection is a real resource, and a client that hears `BUSY` can try
+    /// the next member instead of being silently starved here.
+    pub max_connections: u32,
 }
 
 impl EdgeConfig {
@@ -107,6 +123,7 @@ impl EdgeConfig {
             per_conn_inflight: 256,
             status_interval: Duration::from_millis(200),
             request_timeout: Duration::from_secs(10),
+            max_connections: 1024,
         }
     }
 
@@ -153,6 +170,9 @@ impl EdgeConfig {
         }
         if self.request_timeout.is_zero() {
             return Err(ConfigError::ZeroRequestTimeout);
+        }
+        if self.max_connections == 0 {
+            return Err(ConfigError::ZeroMaxConnections);
         }
         Ok(())
     }
@@ -226,5 +246,14 @@ mod tests {
         assert_eq!(c.validate(), Err(ConfigError::ZeroStatusInterval));
         let c = EdgeConfig { request_timeout: Duration::ZERO, ..ok() };
         assert_eq!(c.validate(), Err(ConfigError::ZeroRequestTimeout));
+    }
+
+    #[test]
+    fn a_zero_connection_ceiling_is_refused() {
+        assert_eq!(EdgeConfig::defaults().max_connections, 1024);
+        let c = EdgeConfig { max_connections: 0, ..ok() };
+        assert_eq!(c.validate(), Err(ConfigError::ZeroMaxConnections));
+        let c = EdgeConfig { max_connections: 1, ..ok() };
+        assert_eq!(c.validate(), Ok(()), "one connection is a legal, if lonely, ceiling");
     }
 }

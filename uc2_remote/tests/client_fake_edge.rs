@@ -336,8 +336,87 @@ fn no_reachable_member_is_reported() {
     // cannot collide with a port the OS handed to another test.
     let err = RemoteClient::connect(cfg(vec!["127.0.0.1:1".to_string()])).unwrap_err();
     assert!(matches!(err, RemoteError::NoMembersReachable), "got {err:?}");
+    // An EMPTY member list is a configuration mistake, not an unreachable
+    // cluster, and `RemoteConfig::validate` now says so before any socket is
+    // opened.
     let err = RemoteClient::connect(cfg(vec![])).unwrap_err();
-    assert!(matches!(err, RemoteError::NoMembersReachable), "got {err:?}");
+    assert!(matches!(err, RemoteError::Config(_)), "got {err:?}");
+}
+
+/// `RemoteConfig::validate` refuses, by name, the four settings that cannot
+/// work — before a socket is opened, so the error says what is wrong rather
+/// than "the cluster is unreachable".
+#[test]
+fn a_config_that_cannot_work_is_refused_by_name() {
+    let base = cfg(vec!["127.0.0.1:1".to_string()]);
+    assert!(base.validate().is_ok(), "the baseline test config must be valid");
+
+    let empty_app = RemoteConfig { app_id: String::new(), ..base.clone() };
+    assert!(matches!(empty_app.validate(), Err(RemoteError::Config(ref m)) if m.contains("app_id")));
+
+    let no_members = RemoteConfig { members: Vec::new(), ..base.clone() };
+    assert!(
+        matches!(no_members.validate(), Err(RemoteError::Config(ref m)) if m.contains("members"))
+    );
+
+    let no_window = RemoteConfig { max_inflight: 0, ..base.clone() };
+    assert!(
+        matches!(no_window.validate(), Err(RemoteError::Config(ref m)) if m.contains("max_inflight"))
+    );
+
+    // The liveness pair: `dead_after` at or below `ping_interval` declares a
+    // healthy connection dead before its own PING could be answered.
+    for dead in [Duration::from_secs(1), Duration::from_millis(500)] {
+        let bad = RemoteConfig {
+            ping_interval: Duration::from_secs(1),
+            dead_after: dead,
+            ..base.clone()
+        };
+        assert!(
+            matches!(bad.validate(), Err(RemoteError::Config(ref m)) if m.contains("dead_after")),
+            "dead_after {dead:?} vs ping_interval 1s must be refused"
+        );
+        // And `connect` refuses it too, without dialling anything.
+        assert!(matches!(RemoteClient::connect(bad).unwrap_err(), RemoteError::Config(_)));
+    }
+}
+
+/// An edge that goes silent in the MIDDLE of a frame is the same failure as
+/// one that goes silent between frames — and must reach the same verdict.
+///
+/// Before `FramedConn::read_frame` took a `max_stall`, it did not: the reader
+/// thread sat inside a half-read frame re-issuing its socket read timeout
+/// forever, so its tick never ran again. No sweep, no `dead_after`, no
+/// failover — every outstanding `Ticket` blocked until the process died.
+#[test]
+fn an_edge_that_stalls_mid_frame_is_declared_dead_and_the_request_fails_over() {
+    let stalled = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        partial_frame_then_hang: true,
+        ..Default::default()
+    });
+    let healthy = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let client = RemoteClient::connect(RemoteConfig {
+        ping_interval: Duration::from_millis(50),
+        dead_after: Duration::from_millis(250),
+        ..cfg(vec![stalled.addr.clone(), healthy.addr.clone()])
+    })
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let r = client.submit(b"lm").unwrap().wait_timeout(WAIT).unwrap();
+    assert_eq!(&r.bytes[..], b"ml", "re-sent to the healthy edge and answered");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the mid-frame stall was not bounded: took {:?}",
+        started.elapsed()
+    );
+
+    assert_eq!(healthy.observed.seq_order(), vec![1]);
+    let s = client.stats();
+    assert!(s.reconnects >= 1, "reconnects: {}", s.reconnects);
+    assert!(client.is_connected());
+    client.shutdown();
 }
 
 #[test]

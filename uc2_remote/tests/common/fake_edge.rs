@@ -28,6 +28,11 @@ use std::time::Duration;
 use uc2_remote::conn::FramedConn;
 use uc2_remote::frame::*;
 
+/// How long a half-read frame may stall before this fake edge gives up on the
+/// connection. Nothing here writes partial frames *at* the client, so this is
+/// only a backstop against a wedged test.
+const READ_STALL_BUDGET: Duration = Duration::from_secs(5);
+
 /// How the fake edge should answer.
 #[derive(Clone, Debug)]
 pub struct Behaviour {
@@ -67,6 +72,13 @@ pub struct Behaviour {
     /// answer nothing (not even `PING`), keeping the socket open. The client
     /// must notice via `dead_after`, not via an error.
     pub hang: bool,
+    /// Like [`Behaviour::hang`], but the silence starts in the MIDDLE of a
+    /// frame: right after `HELLO_OK` the edge writes a valid frame header
+    /// announcing a payload and then never writes the payload. A reader that
+    /// re-issues its read timeout forever mid-frame parks here permanently —
+    /// no tick, no sweep, no `dead_after` — so this is the wire shape that
+    /// `FramedConn::read_frame`'s `max_stall` bound exists for.
+    pub partial_frame_then_hang: bool,
     /// Delay between a request arriving and its answer being written.
     pub delay: Duration,
 }
@@ -86,6 +98,7 @@ impl Default for Behaviour {
             drop_after_first_request: false,
             expired: false,
             hang: false,
+            partial_frame_then_hang: false,
             delay: Duration::from_millis(1),
         }
     }
@@ -202,6 +215,10 @@ enum Action {
 type Queue = Arc<(Mutex<VecDeque<Action>>, Condvar)>;
 
 fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>, is_first: bool) {
+    // A raw duplicate of the socket, kept so `partial_frame_then_hang` can put
+    // a DELIBERATELY incomplete frame on the wire — `FramedConn` only ever
+    // writes whole ones, which is the point of it.
+    let raw = sock.try_clone().ok();
     let mut rd = match FramedConn::new(sock) {
         Ok(c) => c,
         Err(_) => return,
@@ -215,7 +232,7 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
     // --- HELLO / HELLO_OK, written inline so the responder thread is the only
     // other writer and never races with it.
     let (h, _payload) = loop {
-        match rd.read_frame() {
+        match rd.read_frame(READ_STALL_BUDGET) {
             Ok(Some(f)) => break f,
             Ok(None) => {
                 if stop.load(Ordering::SeqCst) {
@@ -243,6 +260,27 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
         return;
     }
 
+    // --- half a RESPONSE frame, then silence: header on the wire, payload
+    // never. Written raw, since a framed writer cannot express it.
+    if b.partial_frame_then_hang {
+        let Some(mut raw) = raw else { return };
+        let mut frame = Vec::new();
+        let mut body = Vec::new();
+        ResponseMeta { credits: b.credits, acked_seq: 0, position: 0 }.encode(&mut body);
+        encode_frame(&mut frame, hdr(FrameType::Response, 0, client_id, 1), &body);
+        // Header plus one payload byte: enough to leave the peer's parser
+        // committed to a frame it will never see the end of.
+        let cut = HEADER_LEN + 1;
+        if std::io::Write::write_all(&mut raw, &frame[..cut]).is_err() {
+            return;
+        }
+        // Hold the socket open, reading nothing, until the test tears down.
+        while !stop.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        return;
+    }
+
     // --- responder thread
     let q: Queue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
     let done = Arc::new(AtomicBool::new(false));
@@ -252,7 +290,7 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
     // --- request loop
     let mut used_once = false;
     loop {
-        match rd.read_frame() {
+        match rd.read_frame(READ_STALL_BUDGET) {
             Ok(Some((h, payload))) => match h.ty {
                 FrameType::Submit | FrameType::Query => {
                     o.arrived(h.seq);

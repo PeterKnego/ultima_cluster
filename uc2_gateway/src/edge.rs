@@ -116,9 +116,9 @@ use uc2_log::cnc::CncPage;
 use uc2_remote::conn::FramedConn;
 use uc2_remote::frame::{
     FLAG_ENVELOPED, FLAG_EXPIRED, FLAG_IS_QUERY, FLAG_LINEARIZABLE, FLAG_REPLAYED, FrameType,
-    HELLO_REFUSED_APP_ID, HELLO_REFUSED_FAULTED, HELLO_REFUSED_VERSION, Header, Hello, HelloOk,
-    HelloRefused, Leader, PROTOCOL_VERSION, RETRY_NOT_SERVING, RETRY_PAYLOAD_TOO_LARGE,
-    RETRY_SERVICE_UNAVAILABLE, ResponseMeta, Retry, Status,
+    HELLO_REFUSED_APP_ID, HELLO_REFUSED_BUSY, HELLO_REFUSED_FAULTED, HELLO_REFUSED_VERSION, Header,
+    Hello, HelloOk, HelloRefused, Leader, PROTOCOL_VERSION, RETRY_NOT_SERVING,
+    RETRY_PAYLOAD_TOO_LARGE, RETRY_SERVICE_UNAVAILABLE, ResponseMeta, Retry, Status,
 };
 use uc_protocol::ring::RingWaitHandle;
 
@@ -215,6 +215,7 @@ struct StatCells {
     leader_changes: AtomicU64,
     leader_changed_frames: AtomicU64,
     status_frames: AtomicU64,
+    refused_busy: AtomicU64,
 }
 
 impl StatCells {
@@ -231,6 +232,7 @@ impl StatCells {
             leader_changes: self.leader_changes.load(Ordering::Relaxed),
             leader_changed_frames: self.leader_changed_frames.load(Ordering::Relaxed),
             status_frames: self.status_frames.load(Ordering::Relaxed),
+            refused_busy: self.refused_busy.load(Ordering::Relaxed),
         }
     }
 }
@@ -285,6 +287,10 @@ pub struct EdgeStats {
     /// Standalone `STATUS` frames written back — the idle-liveness tick and
     /// the credit-reopened announcement. Never counted before `HELLO_OK`.
     pub status_frames: u64,
+    /// Connections refused at the door with `HELLO_REFUSED{BUSY}` because the
+    /// edge was already at `max_connections`. Not counted under `connections`,
+    /// which counts connections actually taken on.
+    pub refused_busy: u64,
 }
 
 // ---------------------------------------------------------------- shared
@@ -626,6 +632,16 @@ fn acceptor(shared: Arc<Shared>, listener: TcpListener, send: SendHalf) {
     while !shared.stopping() {
         match listener.accept() {
             Ok((stream, _peer)) => {
+                // The connection ceiling, enforced HERE rather than by letting
+                // the reader thread spawn and refuse: one thread and one socket
+                // per connection is the resource being capped, so the cap has
+                // to bite before either is committed. Only this thread inserts
+                // into the table, so the check-then-insert below is a hard
+                // bound even though it spans no lock (`ConnTable::len`).
+                if shared.table.len() >= shared.cfg.max_connections as usize {
+                    refuse_busy(&shared, stream);
+                    continue;
+                }
                 // A connection we could not set up is simply dropped: the
                 // client sees the socket close and reconnects.
                 let _ = spawn_conn(&shared, &send, stream);
@@ -637,6 +653,41 @@ fn acceptor(shared: Arc<Shared>, listener: TcpListener, send: SendHalf) {
             Err(_) => std::thread::sleep(ACCEPT_POLL),
         }
     }
+}
+
+/// Turn a connection away at the ceiling with `HELLO_REFUSED{BUSY}`, without
+/// spawning a reader for it.
+///
+/// The frame goes out *before* the peer's `HELLO` is read, which is exactly
+/// what the client's dial expects: it writes `HELLO` and then reads whatever
+/// comes back, so a refusal already in the socket buffer is read as the
+/// answer. A refusal frame rather than a bare close is what lets a client tell
+/// "this member is full, try the next one" from "the network ate my
+/// connection" — and `BUSY`, unlike `FAULTED`, says the condition is
+/// transient.
+fn refuse_busy(shared: &Arc<Shared>, stream: TcpStream) {
+    shared.stats.refused_busy.fetch_add(1, Ordering::Relaxed);
+    let Ok(mut fc) = FramedConn::new(stream) else { return };
+    // A bounded write: this runs on the acceptor thread, which must not be
+    // held hostage by a peer that never reads.
+    if fc.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
+        return;
+    }
+    let mut out = Vec::new();
+    HelloRefused {
+        reason: HELLO_REFUSED_BUSY,
+        detail: "edge at max_connections; try another member",
+    }
+    .encode(&mut out);
+    let h = Header {
+        ty: FrameType::HelloRefused,
+        flags: 0,
+        version: PROTOCOL_VERSION,
+        client_id: 0,
+        seq: 0,
+    };
+    let _ = fc.write_frame(h, &out);
+    fc.shutdown();
 }
 
 fn spawn_conn(shared: &Arc<Shared>, send: &SendHalf, stream: TcpStream) -> std::io::Result<()> {
@@ -680,7 +731,10 @@ fn spawn_conn(shared: &Arc<Shared>, send: &SendHalf, stream: TcpStream) -> std::
 fn reader(shared: Arc<Shared>, conn: Arc<Conn>, send: SendHalf, mut fc: FramedConn) {
     if handshake(&shared, &conn, &send, &mut fc) {
         while !shared.stopping() && !conn.is_closed() {
-            match fc.read_frame() {
+            // A peer that vanishes MID-FRAME must not pin this thread until
+            // the edge stops: `request_timeout` is the same budget the
+            // request behind that frame would have had anyway.
+            match fc.read_frame(shared.cfg.request_timeout) {
                 // Read timeout at a frame boundary: just re-check the flags.
                 Ok(None) => {}
                 Ok(Some((h, payload))) => {
@@ -703,7 +757,7 @@ fn handshake(shared: &Arc<Shared>, conn: &Arc<Conn>, send: &SendHalf, fc: &mut F
         if shared.stopping() || conn.is_closed() || Instant::now() >= deadline {
             return false;
         }
-        match fc.read_frame() {
+        match fc.read_frame(HANDSHAKE_TIMEOUT) {
             Ok(Some(f)) => break f,
             Ok(None) => continue,
             Err(_) => return false,
@@ -797,6 +851,66 @@ fn handle_frame(
     }
 }
 
+/// What the `Backpressure` ladder in [`dispatch`] should do next.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ladder {
+    /// Nothing has changed: hand the request to the `Engine` again.
+    Try,
+    /// The edge is stopping, or the connection died under us. Nobody is left
+    /// to answer.
+    Gone,
+    /// This connection was latched not-serving while the request was parked.
+    NotServing,
+    /// The request burned its whole `request_timeout` against a full engine.
+    OutOfBudget,
+}
+
+/// Decide what a parked request should do, from the state of the world at the
+/// top of one ladder iteration.
+///
+/// ## Why the not-serving latch is re-read HERE and not only at the door
+///
+/// The door check runs once, before the request is handed to the `Engine`. A
+/// SUBMIT that then parks on `Backpressure` can sit here for its whole
+/// `request_timeout` — and a connection's role is decided by the *driver*
+/// thread, which is meanwhile answering a completion for an EARLIER SUBMIT on
+/// this same connection. So:
+///
+/// 1. SUBMIT A is accepted by the engine; SUBMIT B parks here on backpressure.
+/// 2. A completes `NotLeader` → the driver answers `REDIRECT` and calls
+///    [`Conn::latch_not_serving`].
+/// 3. This node wins the election a moment later and the engine drains.
+/// 4. Without this check, B's next `try_submit` succeeds — the connection got
+///    B accepted after A was refused, so the accepted set is no longer a
+///    PREFIX of what was sent.
+/// 5. `Sessioned`'s `highest_seq` for that client is now B. The client, which
+///    acted on A's `REDIRECT` and reconnected, re-sends A — `seq <=
+///    highest_seq` with no cached response, which classifies as **EXPIRED**:
+///    "outcome unknowable" for a request that provably never committed.
+///
+/// The latch is exactly the state that says "this connection has been told
+/// no", so re-reading it before every attempt is what keeps the prefix
+/// invariant true for a parked request as well as a fresh one. A QUERY is
+/// answerable by any replica and never latches, so it is unaffected.
+fn ladder_step(
+    conn: &Conn,
+    is_query: bool,
+    stopping: bool,
+    now: Instant,
+    deadline: Instant,
+) -> Ladder {
+    if stopping || conn.is_closed() {
+        return Ladder::Gone;
+    }
+    if !is_query && conn.is_not_serving() {
+        return Ladder::NotServing;
+    }
+    if now >= deadline {
+        return Ladder::OutOfBudget;
+    }
+    Ladder::Try
+}
+
 /// The SUBMIT/QUERY path. Returns `false` to end the connection.
 fn dispatch(
     shared: &Arc<Shared>,
@@ -877,6 +991,29 @@ fn dispatch(
     let mut spins: u32 = 0;
     let mut park = BACKPRESSURE_PARK_MIN;
     loop {
+        // Re-checked at the TOP of every iteration, not just in the
+        // `Backpressure` arm — the world can change while a SUBMIT is parked
+        // here, and the next `try_submit` must not be allowed to succeed once
+        // it has. See `ladder_step`.
+        match ladder_step(conn, is_query, shared.stopping(), Instant::now(), deadline) {
+            Ladder::Try => {}
+            Ladder::Gone => {
+                conn.unreserve(corr);
+                return false;
+            }
+            Ladder::NotServing => {
+                if conn.unreserve(corr) {
+                    shared.redirect_or_retry(conn, h.seq, send.leader_hint());
+                }
+                return !conn.is_closed();
+            }
+            Ladder::OutOfBudget => {
+                if conn.unreserve(corr) {
+                    shared.write_retry(conn, h.seq, RETRY_SERVICE_UNAVAILABLE, RETRY_BACKOFF_US);
+                }
+                return !conn.is_closed();
+            }
+        }
         let res = if is_query {
             let c = if h.flags & FLAG_LINEARIZABLE != 0 {
                 Consistency::Linearizable
@@ -898,21 +1035,6 @@ fn dispatch(
                     squeezed = true;
                     shared.stats.backpressure_events.fetch_add(1, Ordering::Relaxed);
                     conn.squeeze();
-                }
-                if shared.stopping() || conn.is_closed() {
-                    conn.unreserve(corr);
-                    return false;
-                }
-                if Instant::now() >= deadline {
-                    if conn.unreserve(corr) {
-                        shared.write_retry(
-                            conn,
-                            h.seq,
-                            RETRY_SERVICE_UNAVAILABLE,
-                            RETRY_BACKOFF_US,
-                        );
-                    }
-                    return !conn.is_closed();
                 }
                 // Deliberately do NOT read the socket while waiting: the TCP
                 // window closing is the backstop the credit scheme leans on.
@@ -1188,6 +1310,78 @@ fn response_shape(envelope: bool, is_query: bool, bytes: &[u8]) -> (u8, &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+
+    /// A `Conn` over a real (connected, unused) socket — the accounting and
+    /// latch bits are all this module's tests touch, never the wire.
+    fn a_conn() -> Arc<Conn> {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let s = TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let _accepted = l.accept().unwrap();
+        Arc::new(Conn::new(0, FramedConn::new(s).unwrap(), 4, 0))
+    }
+
+    /// The fix for the parked-SUBMIT hole: a connection latched not-serving
+    /// while a SUBMIT sat in the backpressure ladder must NOT get that SUBMIT
+    /// accepted when the engine drains. See `ladder_step`'s doc for the
+    /// EXPIRED-from-a-never-committed-request chain this prevents.
+    ///
+    /// Tested at this level rather than on the wire deliberately. Driving it
+    /// end-to-end needs three things true at once — the engine full enough to
+    /// answer `Backpressure`, an EARLIER submit on the SAME connection
+    /// completing `NotLeader`, and this node then becoming servable — and the
+    /// only lever that produces the middle one is a real role change under a
+    /// full engine, which no in-process rig can schedule deterministically
+    /// (making the engine full means nothing is completing, and the latch
+    /// arrives on a completion). What IS deterministic is the decision itself,
+    /// which is why it lives in one pure function.
+    #[test]
+    fn a_submit_latched_while_parked_is_refused_rather_than_accepted() {
+        let conn = a_conn();
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(10);
+
+        assert_eq!(
+            ladder_step(&conn, false, false, now, deadline),
+            Ladder::Try,
+            "a fresh connection keeps trying"
+        );
+        conn.latch_not_serving();
+        assert_eq!(
+            ladder_step(&conn, false, false, now, deadline),
+            Ladder::NotServing,
+            "a SUBMIT must abandon the ladder the moment its connection is latched"
+        );
+        assert_eq!(
+            ladder_step(&conn, true, false, now, deadline),
+            Ladder::Try,
+            "a QUERY is answerable by any replica, so the latch does not touch it"
+        );
+    }
+
+    #[test]
+    fn the_ladder_gives_up_when_the_edge_stops_or_the_connection_dies() {
+        let conn = a_conn();
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(10);
+        assert_eq!(ladder_step(&conn, false, true, now, deadline), Ladder::Gone, "stopping");
+        // A dead connection outranks even the latch: nobody is left to answer.
+        conn.latch_not_serving();
+        conn.close();
+        assert_eq!(ladder_step(&conn, false, false, now, deadline), Ladder::Gone);
+    }
+
+    #[test]
+    fn the_ladder_gives_up_when_the_request_burns_its_budget() {
+        let conn = a_conn();
+        let now = Instant::now();
+        assert_eq!(ladder_step(&conn, false, false, now, now), Ladder::OutOfBudget);
+        assert_eq!(
+            ladder_step(&conn, true, false, now, now),
+            Ladder::OutOfBudget,
+            "a QUERY has the same budget"
+        );
+    }
 
     /// The envelope constants are duplicated, not imported (see their doc
     /// above). `uc2_service` is a dev-dependency, so this is the guard that

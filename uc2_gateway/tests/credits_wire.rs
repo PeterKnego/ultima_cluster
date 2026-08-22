@@ -18,6 +18,10 @@
 //!    `dead_after` fails the connection over.
 //! 3. **A faulted edge refuses new handshakes**, rather than accepting a client
 //!    into a loop of `LEADER_CHANGED` → reconnect → `LEADER_CHANGED`.
+//! 5. **The connection ceiling is refused, not silently dropped.** An edge at
+//!    `max_connections` answers the next dial `HELLO_REFUSED{BUSY}` so a
+//!    client can move to the next member, rather than closing the socket and
+//!    leaving it to guess.
 //! 4. **Accepted SUBMITs are a prefix of what a connection sent** — the
 //!    not-serving latch. A connection told "not here" once is told it forever,
 //!    even after this node wins the election; only a fresh connection is
@@ -31,8 +35,8 @@ use std::time::{Duration, Instant};
 use uc2_gateway::{Edge, EdgeConfig, Member};
 use uc2_remote::conn::FramedConn;
 use uc2_remote::frame::{
-    FrameType, HELLO_REFUSED_APP_ID, HELLO_REFUSED_FAULTED, Header, Hello, HelloRefused,
-    PROTOCOL_VERSION, RETRY_NOT_SERVING, Retry,
+    FrameType, HELLO_REFUSED_APP_ID, HELLO_REFUSED_BUSY, HELLO_REFUSED_FAULTED, Header, Hello,
+    HelloRefused, PROTOCOL_VERSION, RETRY_NOT_SERVING, Retry,
 };
 use uc2_remote::{RemoteClient, RemoteConfig, RemoteError};
 use uc2_service::{ServiceBuilder, ServiceConfig, SessionConfig, Sessioned};
@@ -41,6 +45,9 @@ use uc_lincheck::register::RegisterSm;
 mod common;
 
 const STATUS_INTERVAL: Duration = Duration::from_millis(50);
+/// Mid-frame stall budget for these raw reads. Nothing here writes a partial
+/// frame, so it only bounds a wedged test.
+const READ_STALL: Duration = Duration::from_secs(10);
 
 fn edge_config(dir: &std::path::Path) -> EdgeConfig {
     EdgeConfig {
@@ -80,7 +87,7 @@ fn send_hello(c: &mut FramedConn, client_id: u64, app_id: &str) {
 fn read_until(c: &mut FramedConn, want: FrameType, budget: Duration) -> Option<Header> {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
-        match c.read_frame() {
+        match c.read_frame(READ_STALL) {
             Ok(Some((h, _))) if h.ty == want => return Some(h),
             Ok(Some(_)) => {}
             Ok(None) => {}
@@ -109,7 +116,7 @@ fn no_frame_precedes_hello_ok_and_status_follows_it() {
     // that has not completed its handshake must receive NOTHING.
     let quiet_until = Instant::now() + STATUS_INTERVAL * 6;
     while Instant::now() < quiet_until {
-        match c.read_frame() {
+        match c.read_frame(READ_STALL) {
             Ok(None) => {}
             Ok(Some((h, _))) => {
                 panic!("the edge spoke before HELLO: {:?} (client_id {})", h.ty, h.client_id)
@@ -126,7 +133,7 @@ fn no_frame_precedes_hello_ok_and_status_follows_it() {
     // --- 2. Now handshake: the very first frame must be HELLO_OK.
     send_hello(&mut c, 0xABCD, common::APP);
     let first = loop {
-        match c.read_frame() {
+        match c.read_frame(READ_STALL) {
             Ok(Some(f)) => break f,
             Ok(None) => continue,
             Err(e) => panic!("read after HELLO: {e}"),
@@ -280,7 +287,7 @@ fn a_wrong_app_id_is_refused_as_app_id_even_when_the_edge_is_faulted() {
     let mut c = dial_raw(&edge);
     send_hello(&mut c, 1, "some-other-cluster");
     let (h, payload) = loop {
-        match c.read_frame() {
+        match c.read_frame(READ_STALL) {
             Ok(Some(f)) => break f,
             Ok(None) => continue,
             Err(e) => panic!("read after HELLO: {e}"),
@@ -346,7 +353,7 @@ fn a_connection_told_not_serving_is_never_served_later_on_the_same_socket() {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             assert!(Instant::now() < deadline, "no answer to the SUBMIT");
-            match c.read_frame() {
+            match c.read_frame(READ_STALL) {
                 // Unsolicited: the idle STATUS timer, and the leader watch's
                 // push when the node wins its election. Neither is an answer
                 // to the SUBMIT.
@@ -393,6 +400,87 @@ fn a_connection_told_not_serving_is_never_served_later_on_the_same_socket() {
 
     drop(early);
     drop(fresh);
+    edge.stop();
+    common::assert_no_gateway_threads();
+    node.stop();
+    svc.stop();
+}
+
+/// The connection ceiling: an edge already serving `max_connections` refuses
+/// the next dial with `HELLO_REFUSED{BUSY}` instead of accepting it and
+/// spawning another reader thread.
+///
+/// The refusal FRAME rather than a bare close is the point: `BUSY`, like
+/// `FAULTED`, tells a multi-member client "this member is out, try the next
+/// one" — a closed socket is indistinguishable from a network fault, and a
+/// client would keep coming back to the same address.
+#[test]
+fn an_edge_at_its_connection_ceiling_refuses_the_next_client_as_busy() {
+    let root = common::tempdir();
+    let (node, dir) = common::start_single_node(root.path());
+    let svc = ServiceBuilder::new(
+        ServiceConfig::new(&dir, common::APP),
+        Sessioned::new(RegisterSm::default(), SessionConfig::default()),
+    )
+    .start()
+    .unwrap();
+    common::await_serving(&node, 10);
+    let edge = Edge::start(EdgeConfig { max_connections: 1, ..edge_config(&dir) }).unwrap();
+
+    // The first client is served normally. Completing its handshake is also
+    // what proves it is in the edge's connection table, so the ceiling below
+    // is not a race against the acceptor.
+    let mut first = dial_raw(&edge);
+    send_hello(&mut first, 0x1111, common::APP);
+    assert!(read_until(&mut first, FrameType::HelloOk, Duration::from_secs(5)).is_some());
+
+    // The second is refused, by name, without a HELLO even being needed.
+    let mut second = dial_raw(&edge);
+    send_hello(&mut second, 0x2222, common::APP);
+    let (h, payload) = loop {
+        match second.read_frame(READ_STALL) {
+            Ok(Some(f)) => break f,
+            Ok(None) => continue,
+            Err(e) => panic!("the edge closed the socket instead of refusing it: {e}"),
+        }
+    };
+    assert_eq!(h.ty, FrameType::HelloRefused, "a connection over the ceiling must be REFUSED");
+    let r = HelloRefused::decode(&payload).unwrap();
+    assert_eq!(r.reason, HELLO_REFUSED_BUSY, "detail: {}", r.detail);
+    assert!(r.detail.contains("max_connections"), "the refusal must say why: {}", r.detail);
+    assert_eq!(edge.stats().refused_busy, 1, "stats: {:?}", edge.stats());
+    assert_eq!(edge.stats().connections, 1, "a refused connection is not a connection taken on");
+
+    // The first connection is untouched by any of it.
+    drop(second);
+    let mut out = Vec::new();
+    Hello { app_id: common::APP }.encode(&mut out);
+    first
+        .write_frame(
+            Header {
+                ty: FrameType::Ping,
+                flags: 0,
+                version: PROTOCOL_VERSION,
+                client_id: 0x1111,
+                seq: 9,
+            },
+            &[],
+        )
+        .expect("the served connection is still usable");
+    assert!(read_until(&mut first, FrameType::Pong, Duration::from_secs(5)).is_some());
+
+    // ...and once it goes away, the ceiling reopens.
+    drop(first);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut third = dial_raw(&edge);
+        send_hello(&mut third, 0x3333, common::APP);
+        if read_until(&mut third, FrameType::HelloOk, Duration::from_millis(500)).is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the ceiling never reopened after a connection closed");
+    }
+
     edge.stop();
     common::assert_no_gateway_threads();
     node.stop();

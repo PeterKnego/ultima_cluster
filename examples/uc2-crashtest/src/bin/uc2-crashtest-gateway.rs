@@ -62,6 +62,10 @@ struct Args {
 /// later. That timeout is how quickly a client pinned here gets to re-send
 /// somewhere useful, so in a test that kills a node every few seconds it has
 /// to be a fraction of the kill period, not twice it.
+///
+/// The same reasoning applies in production, where the supervisor closes the
+/// window instead of a test loop: see `docs/how-to/run-a-gateway.md`, "When
+/// the node underneath dies".
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// Also the edge→client liveness tick; well under `RemoteConfig::dead_after`.
 const STATUS_INTERVAL: Duration = Duration::from_millis(100);

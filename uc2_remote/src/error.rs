@@ -31,6 +31,11 @@ pub enum FrameError {
 /// loss are handled inside the client and are never surfaced as errors.
 #[derive(Debug, Error)]
 pub enum RemoteError {
+    /// [`crate::RemoteConfig::validate`] refused the configuration, by name.
+    /// Returned by [`crate::RemoteClient::connect`] before a socket is opened,
+    /// so it can never be confused with "the cluster is unreachable".
+    #[error("remote client configuration: {0}")]
+    Config(String),
     #[error(transparent)]
     Frame(#[from] FrameError),
     #[error(transparent)]

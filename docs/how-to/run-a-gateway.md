@@ -41,7 +41,9 @@ It attaches to the node's instance directory the way `uc2_client::Engine`
 would — start the node first. Under systemd,
 `packaging/systemd/uc2-gateway.service` already encodes this ordering
 (`After=uc2-node.service`, `BindsTo=uc2-node.service` — the gateway stops
-when its node does) plus the restart policy below:
+when its node does, which is the liveness mechanism described under
+[When the node underneath dies](#when-the-node-underneath-dies)) plus the
+restart policy below:
 
 ```bash
 sudo cp packaging/systemd/uc2-gateway.service /etc/systemd/system/
@@ -93,6 +95,90 @@ response, or a definite `Expired`/`Unknown`/`PayloadTooLarge`/`TimedOut`/
 None of this requires the client to poll cluster state itself — it's driven
 entirely by what the edge tells it.
 
+## When the node underneath dies
+
+A gateway is a relay with no state of its own, so the interesting failure is
+not the gateway crashing — it's the **node underneath it dying while the
+gateway keeps running**.
+
+The reason this needs saying: a dead node does not clear its control page. If
+the `uc2-node` process is SIGKILLed or wedges, its `cnc2.dat` page is left
+frozen exactly as it was — including `CAN_SERVE`. A co-located edge reads
+that page to decide whether to take writes, so it keeps saying yes: it
+accepts `SUBMIT`s into an ingress ring nobody is draining and can only answer
+them `UNKNOWN` once the request's own deadline expires.
+
+**What prevents that in the packaged deployment is
+`BindsTo=uc2-node.service`** in `packaging/systemd/uc2-gateway.service` —
+and it is worth being precise that this is the *liveness mechanism*, not just
+a startup ordering hint. `After=` only orders the two at boot; `BindsTo=`
+means the gateway unit is **stopped whenever the node unit stops**, however
+it stopped. So the moment systemd reaps a dead node, the gateway goes with
+it, its listener closes, and every client fails over to another member's
+gateway on its own member list. There is no window in which a live gateway
+fronts a reaped node.
+
+The second layer catches the node coming *back*: a restarted node gets a new
+shmem instance id, the edge's attached `Engine` reports `InstanceRestart`,
+the edge tells every connected client `LEADER_CHANGED{unknown}`, closes them,
+refuses all further handshakes with `HELLO_REFUSED_FAULTED`, and the
+`uc2-gateway` process exits `1` so `Restart=on-failure` brings up a fresh one
+against the new instance.
+
+### The residual window, and how to size it
+
+Between the two layers there is a gap: a node that is dead or wedged but
+**not yet noticed by systemd** (it is still in `D` state, or its unit has a
+`TimeoutStopSec` still running out). During that gap the edge is live, the
+page still says `CAN_SERVE`, and a client's write is accepted and never
+answered — until `request_timeout` expires and the edge answers `UNKNOWN`.
+
+`request_timeout_ms` is therefore *the client's exposure window* to a dead
+node, not merely an engine deadline. **Set it lower on a gateway than the
+10 s default — `2000` is a reasonable starting point:**
+
+```toml
+[limits]
+request_timeout_ms = 2000
+```
+
+The tradeoff is symmetric and shallow. Shorter means a client pinned to a
+dead node hears `UNKNOWN` sooner and re-sends somewhere useful sooner;
+`UNKNOWN` is not a lost write — with the session envelope on, the re-send
+comes back `replayed` or applies exactly once. Longer means a genuinely slow
+but *live* request is less likely to be called `UNKNOWN` prematurely. Since
+the resend is safe and the alternative is a stalled client, err short. (The
+same reasoning is why `examples/uc2-crashtest`'s gateway binary runs with a
+2 s deadline against a test that kills a node every few seconds.)
+
+A client sees this as: the request resolves `UNKNOWN` after
+`request_timeout`, and — because the connection itself is still open and the
+edge is still answering `STATUS` — it re-sends **on the same connection**
+rather than failing over. It only moves when systemd stops the gateway (the
+socket closes) or the node restarts (the faulted path above). That is why
+`request_timeout` is the number that bounds the stall, not `dead_after`.
+
+### The stronger fix, not implemented
+
+The edge could probe the node's liveness directly rather than trusting the
+frozen page: `uc2_service` already takes a **shared flock on the instance
+directory** as a liveness probe against the node's exclusive lock, and an
+edge doing the same could refuse writes the instant the node's lock became
+acquirable — no supervisor in the loop, and no residual window at all. That
+is a follow-up, deliberately not in M12a: it adds a per-instance-dir probe to
+the edge's periodic work and needs its own test for the case where the lock
+is momentarily free during a clean restart.
+
+## When an edge is full
+
+Each connection costs the edge one reader thread and one socket, so an edge
+accepts at most `[limits] max_connections` of them (default `1024`). Over
+that, the acceptor answers `HELLO_REFUSED{BUSY}` and closes, without spawning
+a reader — and a conforming client treats `BUSY` the same way it treats
+`FAULTED`: this member is out, try the next one. `EdgeStats::refused_busy`
+counts them, so a rising number is the signal to raise the ceiling or spread
+clients across members.
+
 ## The single-driver head-of-line caveat
 
 One edge process runs exactly one driver thread that writes every response
@@ -137,8 +223,9 @@ instead of a silent maybe.
 main loop's 100 ms polling interval), exactly these fields in order:
 `conns` (connections accepted), `submits`, `queries`, `responses`,
 `redirects`, `retries`, `unknown`, `backpressure` (squeeze events),
-`leader_changes` (observed leader-watch transitions), and `status`
-(standalone `STATUS` frames written). `EdgeStats` also tracks
+`leader_changes` (observed leader-watch transitions), `status`
+(standalone `STATUS` frames written), and `refused_busy` (dials turned away
+at the `max_connections` ceiling). `EdgeStats` also tracks
 `leader_changed_frames` (`LEADER_CHANGED` frames actually written, which can
 differ from `leader_changes` — a transition to an unresolvable leader hint
 is observed but not announced) but the reference binary does not print it;

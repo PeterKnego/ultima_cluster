@@ -668,6 +668,7 @@ where
             per_conn_inflight: inflight as u32,
             status_interval: Duration::from_millis(200),
             request_timeout: Duration::from_secs(30),
+            ..EdgeConfig::defaults()
         })
         .unwrap_or_else(|e| panic!("edge start n{i}: {e}"));
         edges.push(edge);

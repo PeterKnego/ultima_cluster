@@ -52,6 +52,7 @@ fn a_minimal_toml_parses_with_defaults_filled() {
     assert_eq!(cfg.per_conn_inflight, 256);
     assert_eq!(cfg.status_interval, Duration::from_millis(200));
     assert_eq!(cfg.request_timeout, Duration::from_secs(10));
+    assert_eq!(cfg.max_connections, 1024);
 }
 
 /// The shipped example must parse and validate — a packaged example that
@@ -86,6 +87,7 @@ max_inflight = 1024
 per_conn_inflight = 64
 request_timeout_ms = 5000
 status_interval_ms = 100
+max_connections = 32
 
 [session]
 envelope = false
@@ -98,6 +100,7 @@ envelope = false
     assert_eq!(cfg.per_conn_inflight, 64);
     assert_eq!(cfg.status_interval, Duration::from_millis(100));
     assert_eq!(cfg.request_timeout, Duration::from_millis(5000));
+    assert_eq!(cfg.max_connections, 32);
 }
 
 #[test]

@@ -92,7 +92,8 @@ fn main() -> ExitCode {
             let s = edge.stats();
             eprintln!(
                 "uc2-gateway: conns={} submits={} queries={} responses={} redirects={} \
-                 retries={} unknown={} backpressure={} leader_changes={} status={}",
+                 retries={} unknown={} backpressure={} leader_changes={} status={} \
+                 refused_busy={}",
                 s.connections,
                 s.submits,
                 s.queries,
@@ -103,6 +104,7 @@ fn main() -> ExitCode {
                 s.backpressure_events,
                 s.leader_changes,
                 s.status_frames,
+                s.refused_busy,
             );
         }
 
