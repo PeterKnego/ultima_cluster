@@ -126,7 +126,7 @@ ResponseMeta::LEN` of them; `FLAG_EXPIRED` responses carry zero):
 | Offset | Size | Field |
 |---|---|---|
 | 0 | u64 | `acked_seq` |
-| 4 | u32 | `credits` |
+| 8 | u32 | `credits` |
 
 `Status::LEN = 12`. Sent standalone (not piggybacked on a `RESPONSE`) in two
 cases: a connection that has gone `status_interval` since its last write
@@ -209,13 +209,16 @@ credits`. `HELLO_OK` grants the initial value; every `RESPONSE` and `STATUS`
 carries the current `(acked_seq, credits)` pair and can move either number.
 
 The edge sizes credits from its local `Engine`'s inflight window
-(`per_conn_inflight`, shared as a ceiling across every connection) and
-**halves** them the first time a request hits `SubmitError::Backpressure`
-within one request's retry loop (an AIMD-style additive-increase/
-multiplicative-decrease squeeze — see `Conn::squeeze`/`Conn::relax` in
-`uc2_gateway/src/conn.rs`); every completion that arrives while squeezed
-relaxes the ceiling back up by one step, and a standalone `STATUS` is sent
-the moment the ceiling widens so the client doesn't wait for the next
+(`per_conn_inflight`, the ceiling every connection relaxes back towards) and
+runs a **halve/double** scheme entirely on its own side — `RemoteClient`
+never adjusts its own window, it only obeys whatever `credits` the edge last
+sent. `Conn::squeeze` (`uc2_gateway/src/conn.rs`) **halves** the connection's
+credits (floor `1`) the first time one request's retry loop hits
+`SubmitError::Backpressure`; `Conn::relax` **doubles** them back on every
+completion that arrives while squeezed, capped at `per_conn_inflight` — this
+is multiplicative decrease *and* multiplicative increase, not AIMD (there is
+no additive step on either side). A standalone `STATUS` is sent the moment a
+`relax` widens the ceiling, so the client doesn't wait for the next
 `RESPONSE` to notice. A client that ignores its credits is stopped by the
 edge simply ceasing to read its socket — the TCP receive window filling is
 the backstop, not the mechanism; no frame is ever accepted and then bounced
@@ -223,10 +226,26 @@ for capacity.
 
 ## Payload ceiling
 
-A command's serialized bytes must fit in one UDP datagram on the node side:
-`MTU_DEFAULT = 1408` bytes (`uc_protocol::v2::datagram::MTU_DEFAULT`, not
-operator-configurable) minus datagram and frame headers leaves roughly
-**1.3 KB** for the payload. A `SUBMIT`/`QUERY` over that is refused with
+A command's serialized bytes must fit in one UDP datagram on the node side.
+The node's own startup preflight (`uc2_node::preflight`,
+`PreflightError::PayloadExceedsMtu`) refuses a configured `max_payload` that
+doesn't fit, with the arithmetic spelled out:
+
+```
+need = align_frame_len(max_payload + HEADER_LEN) + DATAGRAM_HEADER_LEN + crypto_overhead
+refused if need > MTU_DEFAULT
+```
+
+— `HEADER_LEN = 32` and `FRAME_ALIGNMENT = 32` (`uc_protocol::v2::frame`,
+`align_frame_len` rounds up to the next 32-byte multiple), `DATAGRAM_HEADER_LEN
+= 16` and `MTU_DEFAULT = 1408` (`uc_protocol::v2::datagram`, not
+operator-configurable), and `crypto_overhead` is `0` unless wire crypto (M8)
+is enabled. Solving that with crypto off gives a hard ceiling of
+**`max_payload <= 1344` bytes** (`1344 + 32 = 1376`, already 32-aligned;
+`1376 + 16 = 1392 <= 1408`; one byte more pushes the aligned frame to `1408`,
+for a `need` of `1424`) — the "roughly 1.3 KB" figure elsewhere on this page.
+A `SUBMIT`/`QUERY` whose enveloped body exceeds the node's actual configured
+`max_payload` (which may be set lower than this ceiling) is refused with
 `RETRY{PAYLOAD_TOO_LARGE, retry_after_us: 0}` before it ever reaches the
 ring — there is no chunking.
 

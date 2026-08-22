@@ -251,7 +251,7 @@ the mechanism. No frame is ever accepted and then bounced for capacity.
   forever.
 - `gateway.toml`: `[local] instance_dir, app_id, listen`, `[[members]]`,
   `session_envelope`, `max_inflight`, `status_interval_ms`. Named startup
-  refusals like `uc2-node`. `packaging/uc2-gateway.service` and
+  refusals like `uc2-node`. `packaging/systemd/uc2-gateway.service` and
   `gateway.example.toml`.
 
 ### 4.4 `Sessioned<S>` — exactly-once at the raw layer

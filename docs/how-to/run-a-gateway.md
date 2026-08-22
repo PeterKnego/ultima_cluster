@@ -134,13 +134,18 @@ instead of a silent maybe.
 ## Stats line
 
 `uc2-gateway` prints one stats line to stderr every 10 s (100 ticks of the
-main loop's 100 ms polling interval): connections accepted, submits,
-queries, responses, redirects, retries, unknowns, backpressure events,
-leader changes (observed transitions) and leader-changed frames (actually
-written), and standalone status frames. Use it as a coarse eyes-on-the-box
-signal; for anything durable, scrape metrics off the co-located node
-(`../how-to/monitor-a-cluster.md`) — the gateway itself exposes no
-`/metrics` endpoint.
+main loop's 100 ms polling interval), exactly these fields in order:
+`conns` (connections accepted), `submits`, `queries`, `responses`,
+`redirects`, `retries`, `unknown`, `backpressure` (squeeze events),
+`leader_changes` (observed leader-watch transitions), and `status`
+(standalone `STATUS` frames written). `EdgeStats` also tracks
+`leader_changed_frames` (`LEADER_CHANGED` frames actually written, which can
+differ from `leader_changes` — a transition to an unresolvable leader hint
+is observed but not announced) but the reference binary does not print it;
+read it via `Edge::stats()` if you embed the library yourself. Use the
+stats line as a coarse eyes-on-the-box signal; for anything durable, scrape
+metrics off the co-located node (`../how-to/monitor-a-cluster.md`) — the
+gateway itself exposes no `/metrics` endpoint.
 
 ## Related
 

@@ -10,45 +10,65 @@ Before M12a, reaching a UC cluster meant running in the same process (or at
 least the same host) as a node, attached to its shared memory directly
 (`uc2_client::Engine`) — fast, but it rules out a client on a different
 host, in a different language, or behind a network boundary shmem can't
-cross. Four shapes were on the table for closing that gap.
+cross. UC's rule that clients are co-located exists only because shmem is
+the node's *only* ingress today — not because remote ingress is impossible
+in general (see D). Four shapes were on the table for closing the gap.
 
-**A — status quo, no gateway.** Keep shmem attach as the only client path.
-Rejected as the *whole* answer (that's why M12a exists), but it stays: a
-gateway is an addition, not a replacement — a colocated client still attaches
-directly and pays none of the TCP/credit overhead.
+**A — the user wraps `uc2_client` themselves.** Status quo: nothing ships,
+and a user who needs a remote-reachable front door writes their own
+co-located edge process around `Engine`. Rejected as the *whole* answer:
+every single user ends up re-deriving the same hard parts from scratch —
+leader discovery (`Engine`'s `NotLeader{hint}` carries a node id, not an
+address, so even knowing *who* the leader is doesn't say how to reach it),
+redirect vs. forward, reconciling in-flight requests across a failover, and
+an exactly-once story for a remote hop. A weak turnkey story for anyone who
+isn't willing to build all of that first.
 
-**B — a dumb TCP-to-shmem proxy.** One process per node relays bytes between
-a TCP socket and the local `Engine`, with no leader-awareness, no session
-state, and no flow control beyond whatever TCP itself provides. Simplest to
-build. Rejected: a client wired to a follower's proxy gets nothing useful (no
-way to learn where the leader is except out-of-band polling), and every retry
-after any hiccup — a dropped connection, a timeout — has no exactly-once
-story. That pushes both problems onto every client implementation, forever,
-which is precisely the cost a shared protocol exists to avoid paying once.
+**B — a fixed `uc2-gateway` daemon speaking a UC-owned remote protocol,
+mandatory.** Ship one blessed edge binary and a wire protocol every remote
+client must speak. This forces one of two shapes, both bad: either UC gets
+into the client-library business — a protocol with N language bindings to
+build and maintain — or a user who wants their *own* wire format (say,
+FIX, or an existing internal RPC) wraps UC's mandatory protocol with their
+own edge anyway, giving a two-hop topology (their edge → `uc2-gateway` →
+node) for every request. Rejected on top of that because a fixed,
+mandatory ingress host contradicts M9's own "template, not host" decision:
+the service binary is a template the user instantiates and owns, and a
+fixed daemon standing in front of it on the ingress side breaks that same
+philosophy applied to the front door.
 
-**C — chosen. A purpose-built framed protocol, terminated by a per-node edge
-that redirects rather than forwards, with application-level credits and an
-opt-in exactly-once envelope.** This is `uc2_gateway::Edge` and
-`uc2_remote`: one edge co-located with each node, one framed TCP protocol
-([reference](../reference/remote-protocol.md)), a static node-id→address map
-for `REDIRECT`/`LEADER_CHANGED`, a credit-based flow-control frame layer
-independent of TCP's own windowing, and `Sessioned<S>` for services that want
-retries to be provably safe. It answers B's two problems directly: the
-protocol itself carries leader location and flow-control state, and the
-session envelope makes a re-send a well-defined outcome instead of a maybe.
+**C — chosen. A gateway *kit*: the reusable hard part as a library, a thin
+reference binary on top.** `uc2_gateway::Edge` packages exactly the pieces
+every remote-ingress user would otherwise re-derive under A — leader
+discovery, redirect (not forward), receiver-driven credits, and the
+exactly-once envelope (`Sessioned<S>`) — as a library written over the
+existing local `Engine`. `src/bin/uc2-gateway.rs` is a *thin* reference
+binary on top, driven by `gateway.toml`, meant for the quickstart and the
+gate — not the only legitimate deployment. A user who wants their own wire
+format still embeds `Edge` inside their own process, the same way A
+imagined building it, but without re-deriving any of the hard parts; a user
+who just wants a working front door runs the reference binary as-is. This
+keeps faith with M9's template philosophy (the *reusable logic* ships, not
+a mandatory host) while still giving B's turnkey story to anyone who wants
+it. It is also written transport-agnostic on purpose: nothing in `Edge`
+assumes TCP specifically, which is what lets it become D's client SDK later
+without a rewrite.
 
-**D — Aeron's shape, as the end-state this does not yet reach.** Aeron
-Cluster's own ingress is richer than C in ways worth naming as the direction,
-not the destination: ingress can fan out over multiple concurrent
-publications (MDC) rather than one TCP connection per client, egress runs on
-its own channel independent of the ingress socket (so a slow ingress write
-never contends with delivering a response), and session establishment is a
-protocol step in its own right rather than folded into the first frame. None
-of that is built here — `uc2_gateway` is deliberately the smaller, one-TCP-
-connection-per-client shape that gets a working front door in front of the
-existing shmem `Engine` without inventing a second transport. D is what a
-future gateway generation reaches for if the one-TCP-connection shape turns
-out to be the bottleneck; nothing in C forecloses it.
+**D — Aeron's own shape, the end-state this does not yet reach.** What
+Aeron Cluster actually does: ingress is a channel URI like any other Aeron
+channel (`aeron:udp` per member for a genuinely remote client, `aeron:ipc`
+when co-located — the same transport abstraction, IPC vs. UDP is just
+configuration). A connect to a non-leader member is answered with a
+redirect; a `NewLeaderEvent` on an established session makes the client SDK
+re-route; followers never forward on the client's behalf. There is no
+separate edge tier at all — "the gateway" is just the user's own code
+wrapping `AeronCluster` directly (Artio/FIX-over-Aeron-Cluster is the
+canonical example of exactly this). D removes the tier C still has, but it
+is consensus-agent work, not gateway-kit work: a second ingress path *into*
+`uc2_node` itself, a client-session/admission/auth story at that layer, and
+per-language client libraries if it's going to be genuinely polyglot — each
+its own later spec. C is what gets a working, template-shaped front door
+in front of the existing shmem `Engine` without first doing all of that.
 
 ## Why redirect, not forward
 
@@ -81,6 +101,13 @@ it's the backstop that stops a reader from having to buffer an unbounded
 amount from a client that ignores every signal the protocol sends. But it is
 not enough on its own, for three reasons:
 
+- **TCP's zero-window is implicit, coarse, and late.** The kernel's receive
+  buffers absorb hundreds of KB before the window even starts closing, so by
+  the time a client feels back-pressure the edge has already been behind for
+  a while — the opposite of Aeron's own Status Messages, which are explicit,
+  receiver-driven credit grants sent *before* the receiver is actually full.
+  The gateway's `credits`/`STATUS` scheme is that same explicit-and-early
+  shape, not TCP's implicit-and-late one.
 - **It's per-socket, and the resource it should be protecting is shared.**
   One edge's local `Engine` has one inflight window shared across every
   connection on that edge. A connection whose own TCP window happens to be
@@ -91,15 +118,25 @@ not enough on its own, for three reasons:
   distinguish "the network is momentarily congested" from "the shared
   `Engine` is backpressuring every connection" from "you personally have hit
   your fair share." The `credits`/`acked_seq` pair in every `RESPONSE` and
-  `STATUS` frame says exactly which is true, so a client's backoff decision
-  (and `RemoteClient`'s AIMD-style halve-on-backpressure, climb-back-on-
-  completion behaviour) is driven by the real signal, not an inference from
-  socket state.
+  `STATUS` frame says exactly which is true.
+- **The adjustment itself lives entirely on the edge, not the client.**
+  `Conn::squeeze`/`Conn::relax` (`uc2_gateway/src/conn.rs`) halve a
+  connection's credits (floor `1`) the first time a request hits
+  `SubmitError::Backpressure` and double them back (capped at
+  `per_conn_inflight`) on every completion while squeezed — multiplicative
+  both ways, not AIMD. `RemoteClient` does none of this arithmetic itself; it
+  only ever obeys whatever `credits` value the edge most recently sent.
 - **It still needs the backstop.** A client that ignores its credits and
-  keeps writing anyway is stopped the same way B would have stopped it: the
-  edge simply ceases reading that socket, and TCP's window closes under it.
-  Credits are the signal; TCP is still the enforcement of last resort — the
-  two are not competing designs, they're layered.
+  keeps writing anyway is stopped anyway: the edge simply ceases reading
+  that socket, and TCP's window closes under it. Credits are the signal;
+  TCP is still the enforcement of last resort — the two are not competing
+  designs, they're layered.
+- **`RETRY` is a state signal, never a load signal.** It answers "the world
+  changed — reconnect, wait `retry_after_us`, or give up," never "you're
+  sending too much." Load is what credits are for; `RETRY` exists
+  independently of how many credits a connection currently holds (see
+  [the protocol reference](../reference/remote-protocol.md) for the
+  reason-by-reason breakdown).
 
 ## Aeron parallels
 
