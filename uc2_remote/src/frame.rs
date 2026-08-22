@@ -95,8 +95,16 @@ pub struct Header {
 }
 
 /// Append one encoded frame (header + payload) to `out`.
+///
+/// Callers must reject an oversized payload (`HEADER_LEN + payload.len() >
+/// MAX_FRAME_LEN`) before calling this — the edge answers oversized SUBMITs
+/// with `RETRY_PAYLOAD_TOO_LARGE`, it does not truncate or split them here.
 pub fn encode_frame(out: &mut Vec<u8>, h: Header, payload: &[u8]) {
     let len = HEADER_LEN + payload.len();
+    debug_assert!(
+        len <= MAX_FRAME_LEN as usize,
+        "encode_frame: frame of {len} bytes exceeds MAX_FRAME_LEN ({MAX_FRAME_LEN}); caller must reject oversized payloads before calling encode_frame"
+    );
     out.reserve(len);
     out.extend_from_slice(&(len as u32).to_le_bytes());
     out.push(h.ty as u8);
