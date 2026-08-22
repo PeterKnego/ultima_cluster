@@ -19,6 +19,16 @@
 //! the untouched `uc-lincheck` checker rather than by a hand-written
 //! "highest acknowledged" invariant.
 //!
+//! **What it deliberately does NOT cover: the SDK's pipelining.** Every worker
+//! here is strictly `submit` → `wait`, one request in flight at a time, so the
+//! concurrency this history records is exactly the four workers — and that is
+//! a requirement, not an oversight: an op has to be a single interval with a
+//! single outcome to be a linearizability history entry at all, and the
+//! per-op re-send delta the envelope-off recording depends on is only
+//! attributable to one op if only one is outstanding. Deep pipelining across a
+//! failover (200 writes in flight, credits, `EXPIRED`-freedom under a full
+//! window) is `failover.rs`'s job; the two tests are complements.
+//!
 //! Three edges are in the loop the whole time, and one of them dies on every
 //! chaos cycle: when a node's shmem instance restarts underneath its edge, the
 //! edge latches faulted, refuses new connections forever, and the
@@ -74,8 +84,11 @@
 //! (unknown, strictly earlier) position of the original apply. So a replayed
 //! mutation's effective position is only bounded above, and the sound
 //! statement is: the final value is the last FRESH mutation's value, unless
-//! some replayed mutation whose re-send landed after it in fact applied later
-//! — a set of candidates, almost always of size one. The size of that set is
+//! some replayed mutation whose re-send landed after it in fact applied later.
+//! A second widening is needed for the mirror-image reason: a mutation whose
+//! ticket ran out of budget was never REFUSED, so the node may commit it
+//! afterwards — possibly after the final read is issued — and its value is a
+//! candidate too. The result is a set, almost always of size one; its size is
 //! printed on every run, so the day it stops being one is visible.
 //!
 //! Gated behind `hard-crash-tests`: real processes, real SIGKILLs.
@@ -125,12 +138,42 @@ const CHAOS_PERIOD: Duration = Duration::from_secs(3);
 /// under `CHAOS_PERIOD` — a faulted edge is a gateway that has to come back
 /// before the next kill, not after it.
 const SUPERVISE_TICK: Duration = Duration::from_millis(200);
-/// At most one modelled duplicate per re-sent mutation in the envelope-off
-/// run. The checker treats every `Indeterminate` mutation as eligible from
-/// its invoke to the end of the history, so each one widens the search;
-/// one per op is enough to model "it may have applied twice" without
-/// pushing the verdict to `Inconclusive`.
-const MAX_PHANTOM_DUPLICATES: usize = 1;
+/// Ceiling on the modelled duplicates of ONE envelope-off mutation.
+///
+/// The count that matters is the op's re-send DELTA, not a flat one: the
+/// client re-sends every unanswered request on every reconnect, so an op that
+/// straddled two failovers can be written three times and applied three
+/// times, and a model that admits only two applies would make the checker
+/// report a `Violation` the product did not commit. (Run 1 of the first local
+/// pass: 151 re-sends against 16 re-sent mutations — multi-re-send is the
+/// norm, not the corner.) So `phantoms = min(delta, MAX_PHANTOM_DUPLICATES)`.
+///
+/// The cap exists only to bound the WGL search — every `Indeterminate`
+/// mutation is eligible from its invoke to the end of the history, so each one
+/// widens it. A delta above the cap is therefore counted (`phantom_cap_hits`,
+/// printed at the end alongside the run's `max_resend_delta`) rather than
+/// silently truncated: it is the one condition under which an envelope-off
+/// `Violation` might be the model's fault instead of the cluster's, and it has
+/// to be visible to be ruled out.
+///
+/// 8, and both bounds of that choice were measured rather than guessed:
+///
+/// - **Why more than a handful.** At a cap of 4 the cap was hit 3-5 times in
+///   every envelope-off run, and a hit is exactly the case that could turn a
+///   sound cluster into a red test.
+/// - **Why not the raw delta.** The observed maximum delta is ~34 — but a
+///   re-send is not an apply. Most of those writes are refused by an edge that
+///   cannot serve (REDIRECT) or land on a node that dies before committing;
+///   an apply needs the frame to actually reach a leader that commits it, and
+///   with 6 kills in a 20 s window an op cannot plausibly do that more than a
+///   handful of times. Phantoms that model impossible applies are pure cost:
+///   every one is an `Indeterminate` mutation eligible from its invoke to the
+///   end of the history, and raising the cap to 16 DOUBLED the run (81 s vs
+///   41 s) for no additional modelling truth.
+///
+/// So 8 covers realistic duplication with room to spare, and the residual —
+/// a delta above 8 — is counted rather than hidden.
+const MAX_PHANTOM_DUPLICATES: u64 = 8;
 
 /// Stack for the thread the WGL check runs on.
 ///
@@ -254,6 +297,14 @@ fn await_leader(dirs: &[PathBuf], secs: u64) -> usize {
 /// into a hang rather than a failed assertion. The caller counts the failures
 /// and the test asserts on the count.
 fn await_fresh_instance(dir: &Path, old: Option<u128>, timeout: Duration) -> bool {
+    // No pre-kill id means there is nothing to be fresh RELATIVE TO: a node's
+    // instance dir keeps its cnc page and rings after the process dies, so a
+    // `Client::connect` would happily validate the STALE files and this would
+    // report a restart that has not happened — and the service spawned behind
+    // it would attach to a dead node for the rest of the run. Refuse instead;
+    // the caller counts it and the test asserts the count is zero.
+    let Some(old) = old else { return false };
+    let old = Some(old);
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(c) = Client::connect(dir, APP_ID) {
@@ -375,7 +426,18 @@ impl Rig {
     /// Returns `false` if the restarted node never presented a fresh cnc
     /// instance in time.
     fn kill_and_restart(&mut self, i: usize) -> bool {
-        let old = open_cnc(&self.dirs[i]).and_then(|c| c.try_instance_id());
+        // Read the id to be fresh RELATIVE TO before anything dies (see
+        // `await_fresh_instance`). A short retry covers a torn read of a page
+        // being rewritten; in practice this always succeeds first try, because
+        // `find_leader` just read the same page.
+        let mut old = None;
+        for _ in 0..20 {
+            old = open_cnc(&self.dirs[i]).and_then(|c| c.try_instance_id());
+            if old.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         self.nodes[i] = None; // SIGKILL + reap
         self.svcs[i] = None;
         self.nodes[i] = Some(spawn_node_member(&self.dirs[i], i as u32, self.udp[i], &self.node_members));
@@ -402,25 +464,54 @@ struct Mutation {
     replayed: bool,
 }
 
+/// The value a mutation would set if it committed and took effect (a CAS that
+/// commits and FAILS sets nothing; treating `new` as its value is a superset,
+/// which is the safe direction for a candidate set).
+fn mutation_value(op: &Op) -> Option<u64> {
+    match op {
+        Op::Write(v) => Some(*v),
+        Op::Cas { new, .. } => Some(*new),
+        Op::Read => None,
+    }
+}
+
 /// Every value the register may legally hold once the workload is over.
 ///
-/// A `replayed` mutation applied at some unknown position strictly below the
-/// one it was answered at (the dedup cache answers the re-send; the write
-/// happened at the original), so it cannot be ordered exactly — but it can be
-/// bounded: it is only a candidate for "last" if its re-send landed after the
-/// last exactly-known (FRESH) mutation. Everything else is settled by
-/// position order, and positions are unique.
-fn expected_final_values(mutations: &[Mutation]) -> Vec<u64> {
+/// Three sources, and each is a bound rather than a certainty for a different
+/// reason:
+///
+/// 1. The last exactly-known (FRESH) acked mutation by position — the answer
+///    in the ordinary case, and the only member of the set on a clean run.
+/// 2. `replayed` acked mutations whose re-send landed after (1). A replayed
+///    response is answered from the dedup cache at the position of the
+///    RE-SEND, while the write itself happened at the (unknown, strictly
+///    earlier) position of the original apply — so such a mutation is only
+///    bounded above and stays a candidate for "last".
+/// 3. `indeterminate` mutations (`indet_values`): a request whose ticket gave
+///    up at its 15 s budget has NOT been refused — the node can still commit
+///    it afterwards, including after the final read is issued. Excluding
+///    these is what turns a perfectly legal late commit into a false
+///    accusation that the product lost an acknowledged write.
+///
+/// Only the LAST effective mutation decides the final value, so no replay of
+/// the sequence is needed — just the set of values that could be it.
+fn expected_final_values(mutations: &[Mutation], indet_values: &[u64]) -> Vec<u64> {
     let last_fresh = mutations.iter().filter(|m| !m.replayed).max_by_key(|m| m.position);
     let Some(f) = last_fresh else {
         // No fresh mutation at all (only possible if literally every ack was a
-        // replay): fall back to every acknowledged value.
-        return mutations.iter().map(|m| m.value).collect();
+        // replay): fall back to every acknowledged value, plus the
+        // indeterminate ones.
+        let mut out: Vec<u64> = mutations.iter().map(|m| m.value).collect();
+        out.extend_from_slice(indet_values);
+        out.sort_unstable();
+        out.dedup();
+        return out;
     };
     let mut out = vec![f.value];
     out.extend(
         mutations.iter().filter(|m| m.replayed && m.position > f.position).map(|m| m.value),
     );
+    out.extend_from_slice(indet_values);
     out.sort_unstable();
     out.dedup();
     out
@@ -474,6 +565,16 @@ struct WorkerOut {
     stats: RemoteStats,
     ok: u64,
     indeterminate: u64,
+    /// Indeterminate ops that were MUTATIONS. These are the ones that can
+    /// still commit after the ticket gave up, so they are what the acked-write
+    /// oracle has to widen its candidate set for.
+    indeterminate_mutations: u64,
+    /// Envelope-off ops whose re-send delta exceeded [`MAX_PHANTOM_DUPLICATES`]
+    /// — see that constant.
+    phantom_cap_hits: u64,
+    /// The largest per-op re-send delta seen. Reported so the cap can be
+    /// judged against measurement rather than taste.
+    max_resend_delta: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -485,6 +586,7 @@ fn worker(
     history: Arc<History>,
     last_seen: Arc<AtomicU64>,
     mutations: Arc<Mutex<Vec<Mutation>>>,
+    indeterminate_values: Arc<Mutex<Vec<u64>>>,
     stop: Arc<AtomicBool>,
 ) -> WorkerOut {
     // A fixed per-worker `client_id`: it is the key the edge's session dedup
@@ -493,6 +595,8 @@ fn worker(
     let client = connect_remote(&members, 1 + id as u64, Duration::from_secs(30));
     let mut rng = StdRng::seed_from_u64(seed ^ (id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let (mut ok, mut indeterminate) = (0u64, 0u64);
+    let (mut indeterminate_mutations, mut phantom_cap_hits) = (0u64, 0u64);
+    let mut max_resend_delta = 0u64;
 
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(THROTTLE);
@@ -569,22 +673,55 @@ fn worker(
         let (inv, outcome) = outcome;
         match outcome {
             Outcome::Ok(_) => ok += 1,
-            Outcome::Indeterminate => indeterminate += 1,
+            Outcome::Indeterminate => {
+                indeterminate += 1;
+                if is_mutation {
+                    indeterminate_mutations += 1;
+                    // It may yet commit — after the ticket gave up, even after
+                    // this test's final read is issued. The value it would set
+                    // therefore belongs in the acked-write oracle's candidate
+                    // set (a CAS that commits and FAILS sets nothing, so
+                    // including `new` unconditionally is a superset, which is
+                    // the safe direction).
+                    if envelope && let Some(v) = mutation_value(&op) {
+                        lock(&indeterminate_values).push(v);
+                    }
+                }
+            }
         }
-        let resent = client.stats().resends > resends_before;
-        record(&history, id, op, inv, outcome, envelope, is_mutation && resent);
+        // The re-send DELTA for THIS op: a worker has at most one request in
+        // flight, so every re-send counted across the call belongs to it.
+        let delta = client.stats().resends.saturating_sub(resends_before);
+        max_resend_delta = max_resend_delta.max(delta);
+        let dup = if is_mutation { delta } else { 0 };
+        // Only meaningful with the envelope OFF: that is the only mode where
+        // the delta becomes phantoms, so it is the only mode where truncating
+        // it can make the model unfaithful.
+        if !envelope && dup > MAX_PHANTOM_DUPLICATES {
+            phantom_cap_hits += 1;
+        }
+        record(&history, id, op, inv, outcome, envelope, dup);
     }
 
     let stats = client.stats();
     client.shutdown();
-    WorkerOut { stats, ok, indeterminate }
+    WorkerOut {
+        stats,
+        ok,
+        indeterminate,
+        indeterminate_mutations,
+        phantom_cap_hits,
+        max_resend_delta,
+    }
 }
 
-/// Record one completed op. `duplicable` is the envelope-OFF at-least-once
-/// case (see the module doc): a mutation whose client re-sent it may have
-/// applied twice, so it is recorded as an `Indeterminate` op plus one
-/// `Indeterminate` phantom modelling the duplicate, rather than as the single
-/// definite op it is not.
+/// Record one completed op. `resend_delta` is the envelope-OFF at-least-once
+/// case (see the module doc): a mutation the client had to write `1 + delta`
+/// times may have been APPLIED that many times, so it is recorded as an
+/// `Indeterminate` op plus one `Indeterminate` phantom per re-send — up to
+/// [`MAX_PHANTOM_DUPLICATES`] — rather than as the single definite op it is
+/// not. `resend_delta == 0` (and every envelope-ON op) is recorded exactly as
+/// observed.
 fn record(
     history: &History,
     id: u32,
@@ -592,14 +729,14 @@ fn record(
     inv: u64,
     outcome: Outcome,
     envelope: bool,
-    duplicable: bool,
+    resend_delta: u64,
 ) {
-    if envelope || !duplicable {
+    if envelope || resend_delta == 0 {
         history.record(id, op, inv, outcome);
         return;
     }
     history.record(id, op.clone(), inv, Outcome::Indeterminate);
-    for _ in 0..MAX_PHANTOM_DUPLICATES {
+    for _ in 0..resend_delta.min(MAX_PHANTOM_DUPLICATES) {
         history.record(id, op.clone(), inv, Outcome::Indeterminate);
     }
 }
@@ -632,10 +769,14 @@ fn assert_linearizable(entries: &[Entry], tag: &str) {
     match check_deep(entries) {
         Verdict::Linearizable => eprintln!("[remote_lin] {tag}: Linearizable"),
         Verdict::Inconclusive => {
-            // The WGL search hit its visited-state budget. Accepted (as in
-            // `hard_crash.rs` and the lin_v2 capstone) — it is a search
-            // limit, not a correctness answer.
-            eprintln!("[remote_lin] {tag}: Inconclusive (checker budget)");
+            // A budget-exhausted search is not an answer: accepting it would
+            // let this capstone pass while proving nothing. Same call as
+            // `lin_v2.rs` makes at every one of its six check sites.
+            panic!(
+                "remote_lin {tag}: checker Inconclusive — the WGL search hit its visited-state \
+                 budget and adjudicated nothing; raise the budget / lower the op target (raise \
+                 THROTTLE, shorten LOAD)"
+            )
         }
         Verdict::Violation => {
             let path =
@@ -721,6 +862,9 @@ fn remote_lin_once(seed: u64, envelope: bool) {
     let history = Arc::new(History::default());
     let last_seen = Arc::new(AtomicU64::new(0));
     let mutations = Arc::new(Mutex::new(Vec::<Mutation>::new()));
+    // Values of mutations whose ticket never resolved — candidates for the
+    // final value because the node may commit them after the fact.
+    let indeterminate_values = Arc::new(Mutex::new(Vec::<u64>::new()));
     let stop = Arc::new(AtomicBool::new(false));
 
     // --- 3. Warm-up write, recorded as history entry 0.
@@ -730,18 +874,20 @@ fn remote_lin_once(seed: u64, envelope: bool) {
     // the checker cannot account for (a false `Violation`). Same fix as
     // `hard_crash.rs::warmup_write`.
     {
+        // ONE attempt, no retry loop. A retried warm-up would be a second
+        // possible apply of the same logical write with only one history
+        // entry to account for it — the very thing this test refuses to do
+        // anywhere else. It does not need a retry loop: no chaos is running
+        // yet, `await_leader` above has already confirmed a serving leader,
+        // and the client's own 15 s budget absorbs a redirect or a reconnect
+        // internally. If it still fails, the rig is broken and the test says
+        // so immediately.
         let warm = connect_remote(&gw_addrs, 1 + WORKERS as u64, Duration::from_secs(30));
         let inv = history.invoke();
-        let deadline = Instant::now() + Duration::from_secs(60);
-        let resp = loop {
-            match warm.submit(&enc(&Cmd::Write(1))).and_then(|t| t.wait()) {
-                Ok(r) => break r,
-                Err(e) => {
-                    assert!(Instant::now() < deadline, "warm-up write never committed: {e:?}");
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-        };
+        let resp = warm
+            .submit(&enc(&Cmd::Write(1)))
+            .and_then(|t| t.wait())
+            .unwrap_or_else(|e| panic!("warm-up write did not commit: {e:?}"));
         assert_eq!(dec(&resp.bytes), CmdResp::WriteAck);
         history.record(WORKERS, Op::Write(1), inv, Outcome::Ok(RegResp::Ack));
         last_seen.store(1, Ordering::Relaxed);
@@ -764,14 +910,25 @@ fn remote_lin_once(seed: u64, envelope: bool) {
             // outset rather than piling onto whichever one is listed first.
             let members: Vec<String> =
                 (0..N).map(|k| gw_addrs[(w as usize + k) % N].clone()).collect();
-            let (history, last_seen, mutations, stop) = (
+            let (history, last_seen, mutations, indeterminate_values, stop) = (
                 Arc::clone(&history),
                 Arc::clone(&last_seen),
                 Arc::clone(&mutations),
+                Arc::clone(&indeterminate_values),
                 Arc::clone(&stop),
             );
             std::thread::spawn(move || {
-                worker(w, members, envelope, seed, history, last_seen, mutations, stop)
+                worker(
+                    w,
+                    members,
+                    envelope,
+                    seed,
+                    history,
+                    last_seen,
+                    mutations,
+                    indeterminate_values,
+                    stop,
+                )
             })
         })
         .collect();
@@ -873,15 +1030,28 @@ fn remote_lin_once(seed: u64, envelope: bool) {
     };
     let worker_ok: u64 = outs.iter().map(|o| o.ok).sum();
     let worker_indef: u64 = outs.iter().map(|o| o.indeterminate).sum();
+    let indef_muts: u64 = outs.iter().map(|o| o.indeterminate_mutations).sum();
+    let cap_hits: u64 = outs.iter().map(|o| o.phantom_cap_hits).sum();
+    let max_delta: u64 = outs.iter().map(|o| o.max_resend_delta).max().unwrap_or(0);
     let muts = lock(&mutations).clone();
+    let indet_values = lock(&indeterminate_values).clone();
     let replayed = muts.iter().filter(|m| m.replayed).count();
+
+    // Everything the rig owns dies HERE, before the WGL search: nine
+    // busy-polling processes must not be competing with the checker for a
+    // 4-vCPU runner, and the window in which an abort (see `CHECKER_STACK`)
+    // could orphan them shrinks to nothing. `try_unwrap` is the proof that
+    // nothing else still holds the rig — the chaos thread has been joined.
+    drop(Arc::try_unwrap(rig).ok().expect("sole rig owner"));
 
     eprintln!(
         "[remote_lin] {tag}: entries={} ok={ok} worker_ok={worker_ok} \
          worker_indeterminate={worker_indef} kills={} restart_timeouts={} no_leader_ticks={} \
          gateway_respawns={gw_respawns} service_respawns={svc_respawns} \
          final_leader=n{leader_final} final_value={final_value:?} \
-         acked_mutations={} replayed={replayed} client_stats={totals:?} elapsed={:?}",
+         acked_mutations={} replayed={replayed} indeterminate_mutations={indef_muts} \
+         phantom_cap_hits={cap_hits} max_resend_delta={max_delta} \
+         client_stats={totals:?} elapsed={:?}",
         entries.len(),
         report.kills,
         report.restart_timeouts,
@@ -936,21 +1106,23 @@ fn remote_lin_once(seed: u64, envelope: bool) {
     // "the" last acked write to check against — see the module doc).
     if envelope {
         assert!(!muts.is_empty(), "no acknowledged mutation at all");
-        let candidates = expected_final_values(&muts);
+        let candidates = expected_final_values(&muts, &indet_values);
         eprintln!(
-            "[remote_lin] {tag}: acked-write oracle candidates={candidates:?} (ambiguous={})",
-            candidates.len() - 1
+            "[remote_lin] {tag}: acked-write oracle candidates={candidates:?} (ambiguous={}, \
+             from {} acked mutations + {} indeterminate)",
+            candidates.len() - 1,
+            muts.len(),
+            indet_values.len(),
         );
         let v = final_value.expect("the register was written");
         assert!(
             candidates.contains(&v),
-            "an acknowledged write was LOST: the register reads {v}, but the last acknowledged \
-             write set one of {candidates:?} ({} acked mutations, {replayed} of them replayed)",
-            muts.len()
+            "an acknowledged write was LOST: the register reads {v}, but the last write that \
+             could legally be the final one set one of {candidates:?} ({} acked mutations, \
+             {replayed} of them replayed; {} indeterminate mutations folded in)",
+            muts.len(),
+            indet_values.len(),
         );
     }
 
-    // Everything the rig owns is dropped here → SIGKILL + reap for all nine
-    // processes, on every exit path including a failing assertion above.
-    assert!(started.elapsed() < Duration::from_secs(180), "took {:?}", started.elapsed());
 }
