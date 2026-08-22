@@ -14,6 +14,16 @@ path = "src/bin/uc2-crashtest-node.rs"
 name = "uc2-crashtest-service"
 path = "src/bin/uc2-crashtest-service.rs"
 
+# M12a Task 11: the gateway half of the remote lincheck capstone. A thin
+# CLI-flag wrapper around `Edge::start` (the shipped `uc2-gateway` daemon takes
+# a TOML file; a test that has to respawn edges every few seconds wants
+# flags, not files) that exits 1 when the edge faults — the same
+# supervisor contract `packaging/systemd/uc2-gateway.service` relies on, here
+# honoured by the test's own supervisor loop.
+[[bin]]
+name = "uc2-crashtest-gateway"
+path = "src/bin/uc2-crashtest-gateway.rs"
+
 [features]
 hard-crash-tests = []
 # M11 Task 3: the survival crashtest (backup-under-load -> host-destroyed ->
@@ -40,6 +50,8 @@ uc2_crypto    = { path = "../../uc2_crypto" }
 # pulls in the `RegisterSm: uc2_service::StateMachine` impl (the `v2` feature is
 # now uc-lincheck's only SDK target).
 uc-lincheck   = { path = "../../uc-lincheck", default-features = false, features = ["v2"] }
+# M12a Task 11: the `uc2-crashtest-gateway` bin's `Edge`.
+uc2_gateway   = { path = "../../uc2_gateway" }
 clap          = { version = "4", features = ["derive"] }
 anyhow        = { workspace = true }
 
@@ -52,5 +64,10 @@ uc2_client = { path = "../../uc2_client" }
 # without going through a client.
 uc2_log      = { path = "../../uc2_log" }
 uc_protocol  = { path = "../../uc_protocol" } # NODE_FLAG_LEADER/CAN_SERVE constants
+# M12a Task 11: `tests/remote_lin.rs` drives the cluster through three real
+# gateway processes over the framed TCP remote protocol, so it needs the
+# remote SDK and the codec the gateway passes through opaquely.
+uc2_remote = { path = "../../uc2_remote" }
+bincode    = { workspace = true }
 tempfile   = { workspace = true }
 rand       = { workspace = true } # seeded op selection in hard_crash.rs

@@ -1316,6 +1316,7 @@ name = "uc2-crashtest"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "clap",
  "rand",
  "tempfile",
@@ -1323,9 +1324,11 @@ dependencies = [
  "uc2_client",
  "uc2_consensus",
  "uc2_crypto",
+ "uc2_gateway",
  "uc2_log",
  "uc2_net",
  "uc2_node",
+ "uc2_remote",
  "uc2_service",
  "uc_protocol",
 ]

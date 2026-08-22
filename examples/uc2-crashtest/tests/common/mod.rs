@@ -201,11 +201,20 @@ pub fn spawn_node_with(instance_dir: &Path, crypto: Option<(&Path, &Path)>) -> R
 
 /// Spawn the service-only binary (waits for cnc2.dat, attaches, runs the SM).
 pub fn spawn_service(instance_dir: &Path) -> Reap {
-    let child = Command::new(SERVICE_BIN)
-        .arg("--instance-dir")
-        .arg(instance_dir)
-        .arg("--app-id")
-        .arg(APP_ID)
+    spawn_service_with(instance_dir, false)
+}
+
+/// As [`spawn_service`], but optionally passing `--sessioned` so the service
+/// runs `Sessioned<RegisterSm>` (M12a Task 11). The flag must agree with the
+/// edge's `session_envelope` in front of it; `false` is byte-for-byte the
+/// pre-M12 [`spawn_service`] behavior.
+pub fn spawn_service_with(instance_dir: &Path, sessioned: bool) -> Reap {
+    let mut cmd = Command::new(SERVICE_BIN);
+    cmd.arg("--instance-dir").arg(instance_dir).arg("--app-id").arg(APP_ID);
+    if sessioned {
+        cmd.arg("--sessioned");
+    }
+    let child = cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
