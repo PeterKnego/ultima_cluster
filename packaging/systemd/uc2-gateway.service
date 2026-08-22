@@ -1,0 +1,17 @@
+[Unit]
+Description=ultima_cluster gateway
+After=uc2-node.service
+BindsTo=uc2-node.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/uc2-gateway --config /etc/uc2/gateway.toml
+Restart=on-failure
+RestartSec=1
+RestartPreventExitStatus=2
+TimeoutStopSec=5
+KillSignal=SIGTERM
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

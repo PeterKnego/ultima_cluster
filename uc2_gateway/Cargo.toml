@@ -15,6 +15,10 @@ description = "ultima_cluster gateway edge: remote protocol v1 over a local node
 # nothing outside a test has any business faulting a live edge.
 test-util = []
 
+[[bin]]
+name = "uc2-gateway"
+path = "src/bin/uc2-gateway.rs"
+
 [dependencies]
 uc2_client = { path = "../uc2_client" }
 uc2_log = { path = "../uc2_log" }
@@ -23,6 +27,15 @@ uc_protocol = { path = "../uc_protocol" }
 bytes = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
+# Bin-side only (the library itself stays dependency-light like uc2_remote's
+# hot path expects; uc2_gateway is not dependency-minimal-by-contract, so
+# these are fine as ordinary crate deps): the uc2-gateway daemon's config
+# loading, CLI parsing, and signal handling. Same versions uc2_node's bin uses.
+clap = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+signal-hook = { workspace = true }
 
 [dev-dependencies]
 # Self dev-dependency: the supported way to build this crate's own test targets

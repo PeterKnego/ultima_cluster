@@ -1,0 +1,67 @@
+# ultima_cluster gateway edge configuration.
+#
+# Install as /etc/uc2/gateway.toml and start with:
+#     uc2-gateway --config /etc/uc2/gateway.toml
+#
+# Unknown keys are a startup REFUSAL, not a warning — a typo can never be
+# silently ignored. Every optional field below shows its default, so a file
+# stating only the required fields behaves exactly as this one does.
+#
+# The gateway is meant to run co-located with a uc2-node on the same host
+# (packaging/systemd/uc2-gateway.service BindsTo=uc2-node.service) and
+# attaches to that node's instance directory over shmem — it holds no durable
+# state of its own. If the node's shmem instance restarts underneath a running
+# gateway (a crash-and-restart, an upgrade), the gateway notices, refuses new
+# connections, and exits 1 so the supervisor (systemd Restart=on-failure)
+# brings a fresh gateway up against the new node instance.
+
+# ---------------------------------------------------------------- required
+
+[local]
+# The co-located node's instance directory — the same instance_dir the
+# uc2-node.toml on this host points at.
+instance_dir = "/srv/uc2/n0"
+
+# Application identity. Must match the node's app_id exactly.
+app_id = "myapp"
+
+# Where remote clients connect. 0.0.0.0 accepts on every interface.
+listen = "0.0.0.0:9200"
+
+# Every cluster member's *gateway* address, keyed by its node id — how
+# REDIRECT and LEADER_CHANGED tell a client where the current leader is. The
+# cnc page carries node ids and roles but no addresses, so this map has to be
+# stated out of band, the same way Aeron states ingressEndpoints. Keep this
+# table IDENTICAL on every host's gateway.toml.
+[[members]]
+node_id = 0
+gateway = "10.0.0.10:9200"
+[[members]]
+node_id = 1
+gateway = "10.0.0.11:9200"
+[[members]]
+node_id = 2
+gateway = "10.0.0.12:9200"
+
+# ---------------------------------------------------------------- optional
+
+[limits]
+# The local Engine's inflight window, shared across every connection.
+max_inflight = 4096
+# Initial credits granted to each connection in HELLO_OK. Shrinks under
+# backpressure and relaxes back up to this ceiling.
+per_conn_inflight = 256
+# The Engine's per-request deadline, in milliseconds. A request that blows it
+# completes as TimedOut and the client is told UNKNOWN.
+request_timeout_ms = 10000
+# A connection with no write for this long (ms) gets a standalone STATUS —
+# also the edge->client liveness tick, so keep it well under a client's
+# dead_after.
+status_interval_ms = 200
+
+[session]
+# true = prepend a 16-byte client_id/seq envelope to SUBMIT payloads and lift
+# the Sessioned tag off the response into RESPONSE flags, so a re-sent write
+# is answered "replayed" instead of applied twice. false = raw pass-through
+# (Aeron parity; dedup becomes the application's problem).
+envelope = true

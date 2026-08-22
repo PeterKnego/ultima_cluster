@@ -38,6 +38,7 @@
 //! Spec: `docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md` §4.3.
 
 mod config;
+pub mod config_file;
 mod conn;
 mod edge;
 mod watch;
