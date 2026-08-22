@@ -34,6 +34,18 @@
 //! engine's own contract is exactly one completion per accepted request. The
 //! hand-off is the `corr` map entry: whoever removes it owns the answer.
 //!
+//! ## The other invariant: accepted SUBMITs are a PREFIX
+//!
+//! **The set of SUBMITs a connection gets accepted is always a prefix of what
+//! it sent.** A connection that is told once — `REDIRECT` or
+//! `RETRY{not_serving}` — that this node cannot take writes is told the same
+//! thing for every later SUBMIT on that connection, even if this node wins the
+//! election a microsecond later. [`Conn::latch_not_serving`] carries the full
+//! argument; the short version is that `Sessioned`'s FRESH/REPLAYED/EXPIRED
+//! classification assumes it, and without it a mid-window role change makes a
+//! client's re-sends read as `EXPIRED` — "outcome unknowable" — for requests
+//! that were never applied at all.
+//!
 //! ## Locks and blocking
 //!
 //! No lock is ever held across anything unbounded. The connection table's
@@ -822,7 +834,14 @@ fn dispatch(
     // Writes are leader-only; queries are answered by whichever replica this
     // edge sits on (snapshot locally, linearizable through the local node's
     // read barrier), so the serving check applies to SUBMIT alone.
-    if !is_query && !send.can_serve() {
+    //
+    // `is_not_serving()` is checked FIRST and is sticky: once this connection
+    // has been told "not here" for one SUBMIT, every later SUBMIT on it gets
+    // the same answer even if this node wins the election in between. That is
+    // the prefix invariant — see `Conn::latch_not_serving`, which explains why
+    // breaking it turns provably-uncommitted requests into `EXPIRED`.
+    if !is_query && (conn.is_not_serving() || !send.can_serve()) {
+        conn.latch_not_serving();
         shared.redirect_or_retry(conn, h.seq, send.leader_hint());
         return !conn.is_closed();
     }
@@ -913,6 +932,9 @@ fn dispatch(
             Err(SubmitError::NotServing) => {
                 // Unreachable with `serving_gate: false`, but the engine owns
                 // that flag, not us — answer it properly rather than assume.
+                if !is_query {
+                    conn.latch_not_serving();
+                }
                 if conn.unreserve(corr) {
                     shared.redirect_or_retry(conn, h.seq, send.leader_hint());
                 }
@@ -1103,6 +1125,13 @@ fn complete(shared: &Arc<Shared>, send: &SendHalf, c: Completion<'_>) {
             return;
         }
         Outcome::NotLeader { hint } => {
+            // Same latch as the door check: this SUBMIT was refused for the
+            // role, so nothing later on this connection may be accepted (see
+            // `Conn::latch_not_serving`). A QUERY is answerable by any
+            // replica, so it never latches.
+            if !is_query {
+                conn.latch_not_serving();
+            }
             shared.redirect_or_retry(&conn, seq, hint.or_else(|| send.leader_hint()));
         }
         Outcome::Retry => {

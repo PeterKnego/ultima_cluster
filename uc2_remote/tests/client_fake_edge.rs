@@ -74,6 +74,8 @@ fn redirect_is_followed_and_pending_resent_in_order() {
     client.shutdown();
 }
 
+/// `RETRY{service_unavailable}` — a transient resource condition — is honoured
+/// where we are: the same connection, after the hinted backoff.
 #[test]
 fn retry_is_honoured_with_hint() {
     let edge = FakeEdge::spawn(Behaviour { credits: 2, retry_once: true, ..Default::default() });
@@ -85,7 +87,32 @@ fn retry_is_honoured_with_hint() {
     assert_eq!(client.stats().retries, 1);
     assert_eq!(edge.observed.seq_count(), 2, "the same seq was sent twice");
     assert_eq!(edge.observed.seq_order(), vec![1]);
-    assert_eq!(client.stats().reconnects, 0, "a RETRY is not a reconnect");
+    assert_eq!(client.stats().reconnects, 0, "a transient RETRY is not a reconnect");
+    assert_eq!(edge.observed.conns.load(std::sync::atomic::Ordering::SeqCst), 1);
+    client.shutdown();
+}
+
+/// `RETRY{not_serving}` is the opposite: a statement about the edge's ROLE.
+///
+/// The edge latches a connection it has refused a write on — that is what
+/// keeps the SUBMITs it accepts a prefix of what was sent — so re-sending on
+/// the same connection would be refused for as long as the connection lived,
+/// however quickly that member became leader. The client must move.
+#[test]
+fn retry_not_serving_moves_the_client_rather_than_re_sending_in_place() {
+    let healthy = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let not_serving =
+        FakeEdge::spawn(Behaviour { credits: 2, not_serving_once: true, ..Default::default() });
+    let client =
+        RemoteClient::connect(cfg(vec![not_serving.addr.clone(), healthy.addr.clone()])).unwrap();
+
+    let r = client.submit(b"abc").unwrap().wait_timeout(WAIT).unwrap();
+    assert_eq!(&r.bytes[..], b"cba");
+
+    let s = client.stats();
+    assert_eq!(s.retries, 1);
+    assert!(s.reconnects >= 1, "a not-serving RETRY must move the client: {s:?}");
+    assert_eq!(healthy.observed.seq_order(), vec![1], "answered somewhere else");
     client.shutdown();
 }
 
@@ -176,6 +203,40 @@ fn hello_refused_is_reported_and_does_not_connect() {
         RemoteError::HelloRefused { reason, .. } => assert_eq!(reason, 1),
         other => panic!("got {other:?}"),
     }
+}
+
+/// A fresh connection is PROBED, not flooded: exactly one SUBMIT goes out
+/// until the edge answers something, however deep the pipeline behind it.
+///
+/// The cost model this defends: an edge that cannot serve answers EVERY submit
+/// with a `REDIRECT`, and the client uses the first and discards the rest when
+/// it reconnects. Flushing a 50-request window at the wrong member is 50
+/// wasted frames on the way out and 50 more on the way back — per member, per
+/// attempt. One probe answers the same question.
+#[test]
+fn a_fresh_connection_sends_one_probe_before_flushing_its_window() {
+    let good = FakeEdge::spawn(Behaviour { credits: 64, ..Default::default() });
+    let wrong = FakeEdge::spawn(Behaviour {
+        credits: 64,
+        redirect_all_to: Some(good.addr.clone()),
+        ..Default::default()
+    });
+    let client = RemoteClient::connect(cfg(vec![wrong.addr.clone()])).unwrap();
+
+    // 50 deep, all admissible under the granted credits, so nothing but the
+    // probe rule can be what holds them back.
+    let tickets: Vec<_> = (0..50u8).map(|i| client.submit(&[i]).unwrap()).collect();
+    for (i, t) in tickets.into_iter().enumerate() {
+        assert_eq!(&t.wait_timeout(WAIT).unwrap().bytes[..], &[i as u8]);
+    }
+
+    assert_eq!(
+        wrong.observed.seq_count(),
+        1,
+        "the wrong edge must see ONE submit, not the window"
+    );
+    assert_eq!(good.observed.seq_order(), (1..=50).collect::<Vec<u64>>(), "in order at the leader");
+    client.shutdown();
 }
 
 /// An edge whose `HELLO_OK` names a different leader is left at the handshake.
@@ -370,10 +431,15 @@ fn an_edge_that_redirects_to_itself_does_not_wedge_or_spin() {
     assert!(matches!(err, RemoteError::TimedOut), "got {err:?}");
     assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
     // Backed off rather than spun: a hot loop over a 300 ms budget would be
-    // thousands of frames.
+    // thousands of frames. Each attempt is a FRESH connection (the edge latches
+    // a connection it has refused a write on, so re-sending in place could
+    // never be served), but the request's backoff — not the frame rate — is
+    // what paces the loop, so the connections are counted in tens, not
+    // thousands.
     let seen = edge.observed.seq_count();
     assert!((1..200).contains(&seen), "redirect loop sent {seen} frames");
-    assert_eq!(client.stats().reconnects, 0, "a self-redirect must not reconnect");
+    let conns = edge.observed.conns.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(conns < 200, "self-redirect loop opened {conns} connections");
     client.shutdown();
 }
 

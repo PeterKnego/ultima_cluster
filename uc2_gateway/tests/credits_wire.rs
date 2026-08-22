@@ -18,6 +18,12 @@
 //!    `dead_after` fails the connection over.
 //! 3. **A faulted edge refuses new handshakes**, rather than accepting a client
 //!    into a loop of `LEADER_CHANGED` → reconnect → `LEADER_CHANGED`.
+//! 4. **Accepted SUBMITs are a prefix of what a connection sent** — the
+//!    not-serving latch. A connection told "not here" once is told it forever,
+//!    even after this node wins the election; only a fresh connection is
+//!    served. This one has to be driven raw: a `RemoteClient` would reconnect
+//!    on the first `REDIRECT` and there would be no "same socket, later
+//!    SUBMIT" to observe.
 
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
@@ -26,7 +32,7 @@ use uc2_gateway::{Edge, EdgeConfig, Member};
 use uc2_remote::conn::FramedConn;
 use uc2_remote::frame::{
     FrameType, HELLO_REFUSED_APP_ID, HELLO_REFUSED_FAULTED, Header, Hello, HelloRefused,
-    PROTOCOL_VERSION,
+    PROTOCOL_VERSION, RETRY_NOT_SERVING, Retry,
 };
 use uc2_remote::{RemoteClient, RemoteConfig, RemoteError};
 use uc2_service::{ServiceBuilder, ServiceConfig, SessionConfig, Sessioned};
@@ -292,6 +298,101 @@ fn a_wrong_app_id_is_refused_as_app_id_even_when_the_edge_is_faulted() {
     assert_ne!(r.reason, HELLO_REFUSED_FAULTED);
 
     drop(c);
+    edge.stop();
+    common::assert_no_gateway_threads();
+    node.stop();
+    svc.stop();
+}
+
+/// The prefix invariant (`Conn::latch_not_serving`): once a connection has
+/// been told this node cannot take writes, it is told that for every later
+/// SUBMIT on the same socket — even after the node becomes a serving leader.
+///
+/// Why it matters is a correctness argument, not a tidiness one: `Sessioned`
+/// classifies a re-sent `seq <= highest_seq` with no cached response as
+/// EXPIRED. If a mid-flush role change let frames K+1..N in while 1..K were
+/// refused, the client's re-send of 1..K would come back "outcome unknowable"
+/// for requests that were never applied at all.
+///
+/// The node is booted with a multi-second election timeout so "exists but
+/// cannot serve" is a window the test can walk into, not a ~50 ms race.
+#[test]
+fn a_connection_told_not_serving_is_never_served_later_on_the_same_socket() {
+    let root = common::tempdir();
+    let (node, dir) =
+        common::start_single_node_with_election(root.path(), 3_000_000_000, 4_000_000_000);
+    let svc = ServiceBuilder::new(
+        ServiceConfig::new(&dir, common::APP),
+        Sessioned::new(RegisterSm::default(), SessionConfig::default()),
+    )
+    .start()
+    .unwrap();
+    assert!(!node.can_serve(), "the long election timeout has not fired yet");
+    let edge = Edge::start(edge_config(&dir)).unwrap();
+
+    let write = bincode::serde::encode_to_vec(
+        uc_lincheck::register::Cmd::Write(7),
+        bincode::config::standard(),
+    )
+    .unwrap();
+    let submit = |c: &mut FramedConn, id: u64, seq: u64| {
+        c.write_frame(
+            Header { ty: FrameType::Submit, flags: 0, version: PROTOCOL_VERSION, client_id: id, seq },
+            &write,
+        )
+        .expect("write SUBMIT");
+    };
+    let answer = |c: &mut FramedConn| -> (FrameType, Vec<u8>) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(Instant::now() < deadline, "no answer to the SUBMIT");
+            match c.read_frame() {
+                // Unsolicited: the idle STATUS timer, and the leader watch's
+                // push when the node wins its election. Neither is an answer
+                // to the SUBMIT.
+                Ok(Some((h, _)))
+                    if h.ty == FrameType::Status || h.ty == FrameType::LeaderChanged =>
+                {
+                    continue;
+                }
+                Ok(Some((h, p))) => return (h.ty, p.to_vec()),
+                Ok(None) => continue,
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+    };
+
+    // --- 1. While the node cannot serve: refused, by name.
+    let mut early = dial_raw(&edge);
+    send_hello(&mut early, 0x1111, common::APP);
+    assert!(read_until(&mut early, FrameType::HelloOk, Duration::from_secs(5)).is_some());
+    submit(&mut early, 0x1111, 1);
+    let (ty, payload) = answer(&mut early);
+    assert_eq!(ty, FrameType::Retry, "one member, no leader hint yet: RETRY, not REDIRECT");
+    assert_eq!(Retry::decode(&payload).unwrap().reason, RETRY_NOT_SERVING);
+
+    // --- 2. The node becomes a serving leader.
+    common::await_serving(&node, 20);
+
+    // --- 3. The SAME socket is still refused. This is the invariant.
+    submit(&mut early, 0x1111, 2);
+    let (ty, _) = answer(&mut early);
+    assert!(
+        matches!(ty, FrameType::Retry | FrameType::Redirect),
+        "a latched connection must never have a later SUBMIT accepted, got {ty:?}"
+    );
+
+    // --- 4. ...and a FRESH connection is served, so the latch is per
+    // connection and the edge is not simply wedged.
+    let mut fresh = dial_raw(&edge);
+    send_hello(&mut fresh, 0x2222, common::APP);
+    assert!(read_until(&mut fresh, FrameType::HelloOk, Duration::from_secs(5)).is_some());
+    submit(&mut fresh, 0x2222, 1);
+    let (ty, _) = answer(&mut fresh);
+    assert_eq!(ty, FrameType::Response, "a new connection is served normally");
+
+    drop(early);
+    drop(fresh);
     edge.stop();
     common::assert_no_gateway_threads();
     node.stop();

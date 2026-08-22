@@ -60,7 +60,7 @@ use crate::error::RemoteError;
 use crate::frame::{
     FrameType, Header, Hello, HelloOk, HelloRefused, Leader, ResponseMeta, Retry, Status,
     FLAG_EXPIRED, FLAG_LINEARIZABLE, FLAG_REPLAYED, HEADER_LEN, HELLO_REFUSED_FAULTED,
-    MAX_FRAME_LEN, PROTOCOL_VERSION, RETRY_PAYLOAD_TOO_LARGE,
+    MAX_FRAME_LEN, PROTOCOL_VERSION, RETRY_NOT_SERVING, RETRY_PAYLOAD_TOO_LARGE,
 };
 
 /// The reader's tick: how often it times out stale requests, re-pumps requests
@@ -276,6 +276,13 @@ struct State {
     /// When anything was last written to the current connection — drives `PING`.
     /// Lives here (not in the reader thread) because submitting threads write too.
     last_write: Instant,
+    /// The current connection has answered something that only an edge willing
+    /// to serve us can answer (a `RESPONSE`, or a `STATUS` acknowledging the
+    /// probe). Until then the pump writes ONE request, not the window — see
+    /// [`Inner::pump`].
+    proven: bool,
+    /// The single request written while `!proven`, if one is outstanding.
+    probe_seq: Option<u64>,
     closed: bool,
 }
 
@@ -349,6 +356,8 @@ impl RemoteClient {
                 member_idx: idx,
                 current_addr: addr,
                 last_write: Instant::now(),
+                proven: false,
+                probe_seq: None,
                 closed: false,
             }),
             cv: Condvar::new(),
@@ -390,6 +399,13 @@ impl RemoteClient {
     /// be re-sent.
     pub fn is_connected(&self) -> bool {
         self.inner.state.lock().unwrap().conn.is_some()
+    }
+
+    /// The gateway address currently connected to, if any. Note this can be a
+    /// `REDIRECT`/`LEADER_CHANGED` target that is not in `members`.
+    pub fn connected_addr(&self) -> Option<String> {
+        let st = self.inner.state.lock().unwrap();
+        st.conn.as_ref().map(|_| st.current_addr.clone())
     }
 
     /// The leader the current edge last told us about, if any.
@@ -525,12 +541,45 @@ impl Inner {
     /// respects the window and preserves order. A write failure discards the
     /// connection (leaving the request unsent); the reader thread notices the
     /// dead socket and reconnects.
+    ///
+    /// ## Probe before flush
+    ///
+    /// On a connection that has not yet answered anything (`!proven`: freshly
+    /// connected, reconnected, or hopped) this writes exactly **one** request
+    /// and stops. Only when that probe is answered — a `RESPONSE`, or a
+    /// `STATUS` whose `acked_seq` covers it — does the window flush.
+    ///
+    /// The reason is not politeness, it is cost. An edge that cannot serve
+    /// answers **every** SUBMIT with a `REDIRECT`, so flushing a window of N
+    /// at the wrong member costs N redirect frames, of which the client uses
+    /// the first and discards the rest when it reconnects — and then does it
+    /// again at the next member. Measured across a leader failover with ~190
+    /// requests in flight, that was thousands of frames per election. Probing
+    /// costs one frame to find out, and one round-trip of latency on a
+    /// connection that is about to be replaced anyway.
     fn pump(&self, st: &mut State) {
         if st.conn.is_none() || st.resend_from == u64::MAX {
             return;
         }
         let now = Instant::now();
-        let State { conn, pending, acked_seq, credits, resend_from, last_write, .. } = &mut *st;
+        let probe_only = !st.proven;
+        let State {
+            conn,
+            pending,
+            acked_seq,
+            credits,
+            resend_from,
+            last_write,
+            probe_seq,
+            ..
+        } = &mut *st;
+        // A probe is outstanding only while it is still ON THE WIRE. A
+        // `RETRY`/`UNKNOWN` answer marks it unsent again, and that re-send is
+        // the next probe — testing `pending.contains_key` alone would wedge
+        // the connection there until the request timed out.
+        if probe_only && probe_seq.is_some_and(|p| pending.get(&p).is_some_and(|q| q.sent)) {
+            return;
+        }
         let window = acked_seq.saturating_add(*credits as u64);
         let c = conn.as_mut().expect("checked above");
         let mut broken = false;
@@ -566,6 +615,14 @@ impl Inner {
                     wrote = true;
                     if p.attempts > 1 {
                         self.stats.resends.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if probe_only {
+                        *probe_seq = Some(*seq);
+                        // `resend_from` is a lower bound, so naming a seq that
+                        // may not exist is fine — the next pump's `range`
+                        // starts at the first pending key at or above it.
+                        next_from = seq.saturating_add(1);
+                        break;
                     }
                 }
                 Err(_) => {
@@ -660,12 +717,22 @@ impl Inner {
                         }),
                     );
                 }
+                // Anything the edge answers with a RESPONSE proves it is
+                // serving us: the window may flush now.
+                st.proven = true;
                 self.credit_update(&mut st, meta.credits, meta.acked_seq);
                 Act::Continue
             }
             FrameType::Status => {
                 let Ok(s) = Status::decode(&payload) else { return Act::Continue };
                 let mut st = self.state.lock().unwrap();
+                // A STATUS that acknowledges the probe says the same thing a
+                // RESPONSE would: this edge took our write. (A bare idle
+                // STATUS, whose `acked_seq` is below the probe, proves only
+                // that the edge is alive — which is not the question.)
+                if !st.proven && st.probe_seq.is_some_and(|p| s.acked_seq >= p) {
+                    st.proven = true;
+                }
                 self.credit_update(&mut st, s.credits, s.acked_seq);
                 Act::Continue
             }
@@ -681,7 +748,26 @@ impl Inner {
                 self.stats.retries.fetch_add(1, Ordering::Relaxed);
                 let delay = self.jittered(Duration::from_micros(r.retry_after_us as u64));
                 let mut st = self.state.lock().unwrap();
-                if self.mark_unsent(&mut st, h.seq, delay) {
+                let still_pending = self.mark_unsent(&mut st, h.seq, delay);
+                if r.reason == RETRY_NOT_SERVING {
+                    // A statement about the edge's ROLE, not about a transient
+                    // resource shortage — and one that does not expire on this
+                    // connection. The edge latches a connection it has refused
+                    // a write on, so that the set of SUBMITs it accepts stays a
+                    // prefix of what was sent (`uc2_gateway`'s
+                    // `Conn::latch_not_serving`); re-sending here would be
+                    // refused for as long as the connection lived, however
+                    // quickly this member became the leader. So: go somewhere
+                    // else. The backoff set above still paces it — nothing is
+                    // written until it expires, wherever we land.
+                    let preferred = st
+                        .leader
+                        .as_ref()
+                        .map(|(_, a)| a.clone())
+                        .filter(|a| *a != st.current_addr);
+                    return Act::Reconnect(preferred);
+                }
+                if still_pending {
                     // Nothing to write yet — the reader's tick pumps it once the
                     // backoff expires. Never sleep here: this thread also carries
                     // every other request's response and the failover frames.
@@ -716,14 +802,20 @@ impl Inner {
                 }
                 if l.addr == st.current_addr {
                     // An edge can name its own node as the leader hint while not
-                    // yet serving ("elected but not serving"). Reconnecting to
-                    // ourselves would spin, so back off and re-send in place. The
-                    // reader's tick — not this frame's arrival — is what pumps it
-                    // again, and `sweep` on that same tick is what enforces
-                    // `request_timeout` even if the edge answers every re-send.
+                    // yet serving ("elected but not serving"), so it redirects us
+                    // to the address we are already on.
+                    //
+                    // Re-sending in place cannot work: the edge latches a
+                    // connection it has refused a write on (`uc2_gateway`'s
+                    // `Conn::latch_not_serving` — the prefix invariant), so this
+                    // connection will be refused for as long as it lives, even
+                    // once this member starts serving. A FRESH connection to the
+                    // same address is the thing that changes the answer. The
+                    // backoff below is what stops that becoming a spin: nothing
+                    // is written until it expires, so the loop runs at the
+                    // backoff's rate, not the frame rate.
                     self.mark_unsent(&mut st, h.seq, SELF_REDIRECT_BACKOFF);
-                    self.pump(&mut st);
-                    return Act::Continue;
+                    return Act::Reconnect(Some(l.addr.to_string()));
                 }
                 self.mark_unsent(&mut st, h.seq, Duration::ZERO);
                 Act::Reconnect(Some(l.addr.to_string()))
@@ -845,6 +937,11 @@ impl Inner {
                     st.conn = Some(conn);
                     st.member_idx = idx;
                     st.current_addr = addr;
+                    // Explicit, though `drop_conn` above already cleared it:
+                    // the new connection has answered nothing, so the pump
+                    // probes rather than flushing (see `pump`).
+                    st.proven = false;
+                    st.probe_seq = None;
                     if info.leader.is_some() {
                         st.leader = info.leader;
                     }
@@ -912,6 +1009,9 @@ fn drop_conn(st: &mut State) {
     if let Some(c) = st.conn.take() {
         c.shutdown();
     }
+    // Whatever the next connection is, it has proved nothing yet.
+    st.proven = false;
+    st.probe_seq = None;
 }
 
 /// What the periodic tick decided.

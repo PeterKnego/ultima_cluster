@@ -86,6 +86,9 @@ pub(crate) struct Conn {
     /// entirely on the (overwhelmingly common) uncontended path.
     gate_waiters: AtomicU32,
     gate: (Mutex<()>, Condvar),
+    /// This connection has already been told, for at least one SUBMIT, that
+    /// this node cannot serve writes. See [`Conn::latch_not_serving`].
+    not_serving: AtomicBool,
     /// An unexpected frame type has already been logged once for this
     /// connection; the rest are counted, not printed.
     logged_unexpected: AtomicBool,
@@ -107,6 +110,7 @@ impl Conn {
             ready: AtomicBool::new(false),
             gate_waiters: AtomicU32::new(0),
             gate: (Mutex::new(()), Condvar::new()),
+            not_serving: AtomicBool::new(false),
             logged_unexpected: AtomicBool::new(false),
         }
     }
@@ -327,6 +331,50 @@ impl Conn {
         }
     }
 
+    // ------------------------------------------------- the prefix invariant
+
+    /// Latch this connection as "cannot serve writes", the first time a SUBMIT
+    /// on it is answered `REDIRECT` or `RETRY{not_serving}`.
+    ///
+    /// ## The invariant this exists to hold
+    ///
+    /// **The set of SUBMITs a connection gets accepted is always a PREFIX of
+    /// what it sent.** Without the latch it is not, and the consequence is a
+    /// wrong answer, not just churn:
+    ///
+    /// A client flushes its pipelined window at this edge mid-election. The
+    /// first K frames are refused (`can_serve()` is false) and answered
+    /// `REDIRECT`. Then this node WINS the election, and frames K+1..N — the
+    /// same socket, the same flush — are accepted and applied. The session
+    /// table's `highest_seq` for that client jumps to N. The client, which
+    /// acted on the first `REDIRECT` and reconnected, re-sends 1..K; every one
+    /// of them is now `seq <= highest_seq` with no cached response, which
+    /// `Sessioned` classifies as **EXPIRED** — "outcome unknowable" — for
+    /// requests that provably never committed. It also masks real dedup bugs:
+    /// with a 4096-entry window against ~200 in flight, an expiry should be
+    /// structurally impossible.
+    ///
+    /// So a connection that has been told "not here" once is told it for
+    /// every later SUBMIT, whatever the node's role does next. It costs the
+    /// client one reconnect it was already committed to making, and it is what
+    /// keeps `EXPIRED` meaning what it says.
+    ///
+    /// Cleared only by a new connection — there is no unlatch, deliberately:
+    /// the client's next window belongs to a fresh session on a fresh socket.
+    ///
+    /// Not covered (and not a mode change, so not latched): a one-off
+    /// `RETRY{service_unavailable}`, which a request earns after burning its
+    /// whole `request_timeout` against a full engine. A re-send of that seq can
+    /// still land behind a later one and read as `EXPIRED`.
+    pub fn latch_not_serving(&self) {
+        self.not_serving.store(true, Ordering::Release);
+    }
+
+    /// Whether [`Conn::latch_not_serving`] has fired on this connection.
+    pub fn is_not_serving(&self) -> bool {
+        self.not_serving.load(Ordering::Acquire)
+    }
+
     /// `true` the first time an unexpected frame type is seen, so the log line
     /// is written once per connection rather than once per frame.
     pub fn first_unexpected(&self) -> bool {
@@ -428,6 +476,18 @@ mod tests {
         assert_eq!(c.inflight.load(Ordering::SeqCst), 0);
         assert!(!c.unreserve(8), "unreserving twice is a no-op");
         assert_eq!(c.acked_seq(), 42, "a query never advances acked_seq");
+    }
+
+    #[test]
+    fn the_not_serving_latch_is_sticky_and_per_connection() {
+        let c = a_conn(0, 4);
+        assert!(!c.is_not_serving(), "a fresh connection starts servable");
+        c.latch_not_serving();
+        assert!(c.is_not_serving());
+        c.latch_not_serving();
+        assert!(c.is_not_serving(), "there is no unlatch");
+        // Per connection, not per edge: a second client is unaffected.
+        assert!(!a_conn(1, 4).is_not_serving());
     }
 
     #[test]

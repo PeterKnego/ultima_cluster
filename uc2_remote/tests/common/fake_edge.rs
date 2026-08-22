@@ -47,8 +47,13 @@ pub struct Behaviour {
     /// produce. The client must not chase it in a loop.
     pub redirect_to_self: bool,
     /// Answer the first request on the first connection with
-    /// `RETRY{NOT_SERVING, 1000}`, then behave normally.
+    /// `RETRY{SERVICE_UNAVAILABLE, 1000}` — a transient resource condition,
+    /// which the client honours IN PLACE — then behave normally.
     pub retry_once: bool,
+    /// Answer the first request on the first connection with
+    /// `RETRY{NOT_SERVING, 1000}` — a statement about the edge's role, which
+    /// the client answers by going somewhere else.
+    pub not_serving_once: bool,
     /// Answer the first request on the first connection with `UNKNOWN`.
     pub unknown_once: bool,
     /// Answer the first request on the first connection with
@@ -75,6 +80,7 @@ impl Default for Behaviour {
             redirect_all_to: None,
             redirect_to_self: false,
             retry_once: false,
+            not_serving_once: false,
             unknown_once: false,
             payload_too_large_once: false,
             drop_after_first_request: false,
@@ -262,6 +268,13 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
                         used_once = true;
                         Action::DropConn
                     } else if once && b.retry_once {
+                        used_once = true;
+                        Action::Retry {
+                            seq: h.seq,
+                            reason: RETRY_SERVICE_UNAVAILABLE,
+                            after_us: 1000,
+                        }
+                    } else if once && b.not_serving_once {
                         used_once = true;
                         Action::Retry { seq: h.seq, reason: RETRY_NOT_SERVING, after_us: 1000 }
                     } else if once && b.unknown_once {

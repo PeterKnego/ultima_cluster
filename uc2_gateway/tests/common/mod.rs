@@ -40,8 +40,19 @@ pub fn tempdir() -> tempfile::TempDir {
 }
 
 /// Start a single-member node under `root/node0` and return it with its
-/// instance directory.
+/// instance directory. It elects itself within ~100 ms.
 pub fn start_single_node(root: &Path) -> (Node, PathBuf) {
+    start_single_node_with_election(root, 50_000_000, 100_000_000)
+}
+
+/// As [`start_single_node`], with the election timeout under the test's
+/// control — a long one gives a test a deterministic window in which the node
+/// exists but **cannot serve**, which is otherwise a ~50 ms race to hit.
+pub fn start_single_node_with_election(
+    root: &Path,
+    election_min_ns: u64,
+    election_max_ns: u64,
+) -> (Node, PathBuf) {
     let dir = root.join("node0");
     std::fs::create_dir_all(&dir).expect("instance dir");
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -54,8 +65,8 @@ pub fn start_single_node(root: &Path) -> (Node, PathBuf) {
         buffer_bytes: 1 << 22, // 4 MiB
         max_payload: 256,
         admission_bytes: 256 * 1024,
-        election_timeout_min_ns: 50_000_000,
-        election_timeout_max_ns: 100_000_000,
+        election_timeout_min_ns: election_min_ns,
+        election_timeout_max_ns: election_max_ns,
         seed: 1,
         faults: FaultConfig::default(),
         purge: uc2_node::PurgePolicy::Disabled,
