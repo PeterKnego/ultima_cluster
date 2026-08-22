@@ -2,8 +2,7 @@
 // Copyright 2026 Peter Knego
 
 //! Error types: the wire-level [`FrameError`] and the client-facing
-//! [`RemoteError`] (fully fleshed out in Task 7 — for now it only wraps
-//! [`FrameError`] and I/O errors).
+//! [`RemoteError`].
 
 use thiserror::Error;
 
@@ -22,11 +21,43 @@ pub enum FrameError {
     BadPayload(&'static str),
 }
 
-/// Client-facing error (Task 7 grows this further).
+/// Client-facing error.
+///
+/// The variants below `Io`/`Frame` are the *outcomes* of a request: a
+/// [`crate::Ticket`] resolves to exactly one of `Ok(RemoteResponse)`,
+/// [`RemoteError::Expired`], [`RemoteError::Unknown`],
+/// [`RemoteError::PayloadTooLarge`], [`RemoteError::TimedOut`] or
+/// [`RemoteError::Closed`]. Redirects, leader changes, retries and connection
+/// loss are handled inside the client and are never surfaced as errors.
 #[derive(Debug, Error)]
 pub enum RemoteError {
     #[error(transparent)]
     Frame(#[from] FrameError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// The edge refused the handshake: wrong `app_id`, or an unsupported
+    /// protocol version. Trying another member will not help.
+    #[error("hello refused (reason {reason}): {detail}")]
+    HelloRefused { reason: u8, detail: String },
+    /// The `Sessioned` dedup window had already moved past this `seq`: whether
+    /// the write committed is unknowable from here.
+    #[error("session entry expired: the outcome of this request is unknowable")]
+    Expired,
+    /// The edge's `Engine` timed the slot out and the client was told not to
+    /// re-send (`resend_on_unknown = false`): the write may or may not have
+    /// committed.
+    #[error("outcome unknown: the edge timed the request out")]
+    Unknown,
+    /// The payload exceeds what the node accepts. Never re-sent.
+    #[error("payload too large")]
+    PayloadTooLarge,
+    /// The request's `request_timeout` budget ran out.
+    #[error("request timed out")]
+    TimedOut,
+    /// No member could be reached — every address failed a full pass.
+    #[error("no cluster member could be reached")]
+    NoMembersReachable,
+    /// The client was shut down (or dropped) with the request outstanding.
+    #[error("client is closed")]
+    Closed,
 }

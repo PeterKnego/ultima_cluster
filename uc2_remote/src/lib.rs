@@ -6,7 +6,11 @@
 //! to re-implement in a non-Rust gateway port. See
 //! `docs/reference/remote-protocol.md` and design spec §4.2.
 
+pub mod client;
+pub mod conn;
 pub mod error;
 pub mod frame;
 
-pub use error::RemoteError;
+pub use client::{RemoteClient, RemoteConfig, RemoteResponse, RemoteStats, Ticket};
+pub use conn::FramedConn;
+pub use error::{FrameError, RemoteError};

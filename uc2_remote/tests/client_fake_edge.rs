@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+
+//! `RemoteClient` against an in-process fake edge that speaks the real wire
+//! protocol: pipelining under credits, redirect following with ordered
+//! re-send, `RETRY`, connection loss, and the `Sessioned` outcomes.
+
+use std::time::Duration;
+
+use uc2_remote::{RemoteClient, RemoteConfig, RemoteError};
+
+mod common;
+use common::fake_edge::{Behaviour, FakeEdge};
+
+const APP: &str = "fakeapp";
+const WAIT: Duration = Duration::from_secs(10);
+
+fn cfg(members: Vec<String>) -> RemoteConfig {
+    RemoteConfig { app_id: APP.into(), members, ..Default::default() }
+}
+
+#[test]
+fn submit_pipelined_under_credits() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let client = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap();
+
+    let tickets: Vec<_> = (0..6u8)
+        .map(|i| client.submit(&[i, i + 1, i + 2]).unwrap())
+        .collect();
+    for (i, t) in tickets.into_iter().enumerate() {
+        let r = t.wait_timeout(WAIT).unwrap();
+        let i = i as u8;
+        assert_eq!(&r.bytes[..], &[i + 2, i + 1, i], "response bytes are the command reversed");
+        assert_eq!(r.position, (i as u64 + 1) * 64);
+        assert!(!r.replayed);
+    }
+
+    // The edge counts unanswered requests: the client must never exceed the
+    // credits it was granted.
+    assert!(
+        edge.observed.max_unanswered.load(std::sync::atomic::Ordering::SeqCst) <= 2,
+        "client exceeded its credits: {} unanswered",
+        edge.observed.max_unanswered.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    // ...and it must actually have pipelined, not run one at a time.
+    assert_eq!(edge.observed.max_unanswered.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(edge.observed.seq_order(), (1..=6).collect::<Vec<u64>>());
+
+    let s = client.stats();
+    assert_eq!(s.max_credits_seen, 2);
+    assert_eq!((s.reconnects, s.resends, s.retries, s.redirects), (0, 0, 0, 0));
+    assert_eq!(client.leader(), Some((1, edge.addr.clone())));
+    client.shutdown();
+}
+
+#[test]
+fn redirect_is_followed_and_pending_resent_in_order() {
+    let b = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let a = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        redirect_all_to: Some(b.addr.clone()),
+        ..Default::default()
+    });
+    let client = RemoteClient::connect(cfg(vec![a.addr.clone()])).unwrap();
+
+    let tickets: Vec<_> = (0..3u8).map(|i| client.submit(&[i]).unwrap()).collect();
+    for (i, t) in tickets.into_iter().enumerate() {
+        let r = t.wait_timeout(WAIT).unwrap();
+        assert_eq!(&r.bytes[..], &[i as u8]);
+    }
+
+    assert_eq!(b.observed.seq_order(), vec![1, 2, 3], "re-sent in seq order at the new edge");
+    let s = client.stats();
+    assert!(s.redirects >= 1, "redirects: {}", s.redirects);
+    assert!(s.reconnects >= 1, "reconnects: {}", s.reconnects);
+    assert!(s.resends >= 1, "resends: {}", s.resends);
+    assert_eq!(client.leader().map(|(id, _)| id), Some(1), "leader from the new edge's HELLO_OK");
+    client.shutdown();
+}
+
+#[test]
+fn retry_is_honoured_with_hint() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, retry_once: true, ..Default::default() });
+    let client = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap();
+
+    let r = client.submit(b"abc").unwrap().wait_timeout(WAIT).unwrap();
+    assert_eq!(&r.bytes[..], b"cba");
+
+    assert_eq!(client.stats().retries, 1);
+    assert_eq!(edge.observed.seq_count(), 2, "the same seq was sent twice");
+    assert_eq!(edge.observed.seq_order(), vec![1]);
+    assert_eq!(client.stats().reconnects, 0, "a RETRY is not a reconnect");
+    client.shutdown();
+}
+
+#[test]
+fn connection_loss_resends_unanswered() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        drop_after_first_request: true,
+        ..Default::default()
+    });
+    let client = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap();
+
+    let r = client.submit(b"xy").unwrap().wait_timeout(WAIT).unwrap();
+    assert_eq!(&r.bytes[..], b"yx");
+
+    let s = client.stats();
+    assert_eq!(s.reconnects, 1);
+    assert!(s.resends >= 1, "resends: {}", s.resends);
+    assert_eq!(edge.observed.conns.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(edge.observed.seq_order(), vec![1]);
+    client.shutdown();
+}
+
+#[test]
+fn expired_surfaces_as_error() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, expired: true, ..Default::default() });
+    let client = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap();
+
+    let err = client.submit(b"q").unwrap().wait_timeout(WAIT).unwrap_err();
+    assert!(matches!(err, RemoteError::Expired), "got {err:?}");
+    assert_eq!(client.stats().expired, 1);
+    client.shutdown();
+}
+
+#[test]
+fn query_round_trips_and_carries_the_linearizable_flag() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let client = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap();
+
+    let r = client.query(b"rd", true).unwrap().wait_timeout(WAIT).unwrap();
+    assert_eq!(&r.bytes[..], b"dr");
+    let r = client.query(b"rd", false).unwrap().wait_timeout(WAIT).unwrap();
+    assert_eq!(&r.bytes[..], b"dr");
+    client.shutdown();
+}
+
+#[test]
+fn unknown_is_resolved_by_a_resend_or_surfaces_when_told_not_to() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, unknown_once: true, ..Default::default() });
+    let client = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    let r = client.submit(b"ab").unwrap().wait_timeout(WAIT).unwrap();
+    assert_eq!(&r.bytes[..], b"ba");
+    assert_eq!(client.stats().unknown, 1);
+    assert!(client.stats().resends >= 1);
+    client.shutdown();
+
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, unknown_once: true, ..Default::default() });
+    let client = RemoteClient::connect(RemoteConfig {
+        resend_on_unknown: false,
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+    let err = client.submit(b"ab").unwrap().wait_timeout(WAIT).unwrap_err();
+    assert!(matches!(err, RemoteError::Unknown), "got {err:?}");
+    client.shutdown();
+}
+
+#[test]
+fn payload_too_large_is_terminal_and_never_resent() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        payload_too_large_once: true,
+        ..Default::default()
+    });
+    let client = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    let err = client.submit(b"big").unwrap().wait_timeout(WAIT).unwrap_err();
+    assert!(matches!(err, RemoteError::PayloadTooLarge), "got {err:?}");
+    assert_eq!(edge.observed.seq_count(), 1, "never re-sent");
+    assert_eq!(client.stats().resends, 0);
+    client.shutdown();
+}
+
+#[test]
+fn hello_refused_is_reported_and_does_not_connect() {
+    let edge = FakeEdge::spawn(Behaviour { refuse_hello: Some(1), ..Default::default() });
+    let err = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap_err();
+    match err {
+        RemoteError::HelloRefused { reason, .. } => assert_eq!(reason, 1),
+        other => panic!("got {other:?}"),
+    }
+}
+
+#[test]
+fn no_reachable_member_is_reported() {
+    // Bind and drop, so the port is (almost certainly) closed.
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().to_string()
+    };
+    let err = RemoteClient::connect(cfg(vec![dead])).unwrap_err();
+    assert!(matches!(err, RemoteError::NoMembersReachable), "got {err:?}");
+    let err = RemoteClient::connect(cfg(vec![])).unwrap_err();
+    assert!(matches!(err, RemoteError::NoMembersReachable), "got {err:?}");
+}
+
+#[test]
+fn shutdown_fails_outstanding_tickets_with_closed() {
+    // A slow edge: the ticket is still outstanding when the client shuts down.
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        delay: Duration::from_secs(30),
+        ..Default::default()
+    });
+    let client = RemoteClient::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    let t = client.submit(b"z").unwrap();
+    client.shutdown();
+    let err = t.wait_timeout(WAIT).unwrap_err();
+    assert!(matches!(err, RemoteError::Closed), "got {err:?}");
+}
+
+#[test]
+fn a_request_that_is_never_answered_times_out() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        delay: Duration::from_secs(30),
+        ..Default::default()
+    });
+    let client = RemoteClient::connect(RemoteConfig {
+        request_timeout: Duration::from_millis(200),
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+    let err = client.submit(b"z").unwrap().wait_timeout(WAIT).unwrap_err();
+    assert!(matches!(err, RemoteError::TimedOut), "got {err:?}");
+    client.shutdown();
+}
