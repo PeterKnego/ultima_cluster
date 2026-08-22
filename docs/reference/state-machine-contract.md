@@ -155,15 +155,73 @@ not repeat cluster-wide the way `apply`'s does.
 
 ## `Sessioned<S>` wraps either tier
 
-*Forward pointer — not yet on this branch; lands with the gateway kit's
-`uc2_service::session` module (M12a spec §4.4).* `Sessioned<S>` is the
-exactly-once wrapper the gateway's session envelope needs, and it is
-specified to implement `RawStateMachine` for any `S: RawStateMachine` —
-peeling a fixed 16-byte `(client_id, seq)` header off the command bytes, then
-delegating. Because `StateMachine` blankets onto `RawStateMachine`, this
-wraps a typed state machine exactly as it wraps a raw one: no separate typed
-`Sessioned` is needed. Full session-envelope and dedup-window details belong
-in that module's own docs once it lands, not duplicated here.
+`uc2_service::session` (M12a spec §4.4) ships `Sessioned<S>`, the exactly-once
+wrapper the gateway's session envelope needs. It implements `RawStateMachine`
+for any `S: RawStateMachine`, and `SnapshotStateMachine` for any
+`S: SnapshotStateMachine` — because `StateMachine` blankets onto
+`RawStateMachine`, `Sessioned` wraps a typed state machine exactly as it
+wraps a raw one; no separate typed `Sessioned` exists.
+
+**Envelope.** Every command is expected to carry a fixed
+`SESSION_HEADER_LEN = 16`-byte header — `client_id: u64` LE, then `seq: u64`
+LE — ahead of the inner command bytes. A command shorter than 16 bytes is
+malformed and is treated as unanswerable (`TAG_EXPIRED`, no inner bytes),
+never a panic on the apply thread.
+
+**Response tag.** The response is `tag: u8` followed by the inner SM's
+response bytes (`TAG_EXPIRED` carries none):
+
+- `TAG_FRESH = 0` — `seq` is new for this client (including a gap: only a
+  `seq` at or below the client's highest seen is ever rejected as stale); the
+  inner SM ran and its response was cached.
+- `TAG_REPLAYED = 1` — a retry of a `seq` still inside this client's window;
+  the cached response is returned and the inner SM does **not** run again
+  (this is what makes a non-idempotent inner op, e.g. a CAS, safe to retry).
+- `TAG_EXPIRED = 2` — `seq` is at or below the client's highest seen but has
+  already fallen out of the window (or the client itself was evicted), so no
+  cached response exists; the framework and the inner SM never see this
+  frame's effect.
+
+**Window and eviction — deterministic by construction**, because `apply` runs
+on every replica and must reach the same table everywhere: a `BTreeMap<u64,
+ClientState>` (never a `HashMap`, whose iteration order is not a replay
+guarantee), each client remembering up to `SessionConfig::window` responses
+(default 4096) as an oldest-first FIFO keyed by `seq`. When the number of
+tracked clients exceeds `SessionConfig::max_clients` (default 65536), the
+victim is the client with the smallest `(last_seen_pos, client_id)` —
+smallest log **position**, never wall-clock time, with the client id itself
+as the deterministic tiebreak. `last_seen_pos` advances on *every* frame for
+a client, including `REPLAYED` and `EXPIRED` ones, so eviction ranks strictly
+by log position. An evicted client's next frame is simply a fresh client
+starting over (`TAG_FRESH`), not an error.
+
+**`last_applied()` is deliberately not a bare passthrough to the inner SM.**
+The inner SM only advances on `TAG_FRESH` frames; a `REPLAYED`/`EXPIRED`
+frame only touches the dedup table. `Sessioned` tracks its own
+`max_pos_seen` — the position of the last `apply`/`install_snapshot` call
+regardless of tag — and `last_applied()` returns
+`max_pos_seen.max(inner.last_applied())`. Reporting the inner's value alone
+would still be *safe* (the framework's contract only requires
+under-reporting, never over-reporting, and replaying a dedup-only frame
+through `Sessioned::apply` again is idempotent — it lands on the identical
+branch and produces the identical tagged output) but would make every
+restart redundantly re-run every skipped/replayed frame; `max_pos_seen` is
+the exact resume frontier instead. The dedup table itself is always a pure
+function of the applied prefix, so it is correct however far back a replay
+starts.
+
+**Snapshot composition.** `Sessioned<S>: SnapshotStateMachine` when
+`S: SnapshotStateMachine`. `freeze` pins the inner snapshot handle plus a
+bincode-encoded `TableImage { window, max_clients, clients }` of the current
+dedup table (built from the same `BTreeMap`, so encoding is deterministic);
+`stream_snapshot` writes a `u64` LE length prefix, the table blob, then the
+inner SM's own stream; `install_snapshot` reverses that, then restores
+`self.clients` from the decoded table (the snapshot's own recorded
+`window`/`max_clients` are diagnostic only — the *live* node's `SessionConfig`
+governs future behavior, so installing a snapshot taken under different
+tuning never silently retunes a running node). This is what lets a retry land
+correctly even immediately after a below-floor node installs a snapshot
+instead of replaying the journal.
 
 ## Payload ceiling
 

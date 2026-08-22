@@ -32,6 +32,7 @@ mod config;
 mod egress;
 mod output;
 mod replay;
+mod session;
 /// Position-tagged on-disk snapshot files (M6 Task 3) — `SnapshotStore`'s
 /// atomic-publish + keep-newest-2 retention. Public: tests and operational
 /// tooling read the snapshot directory directly (e.g. the M6 Task 3 e2e test
@@ -63,6 +64,9 @@ pub use crate::config::{ServiceConfig, ServiceError, SnapshotError, SnapshotPoli
 pub use crate::traits::{
     NoopOutput, OutputError, OutputHandler, RawOutputHandler, RawStateMachine,
     SnapshotStateMachine, StateMachine, TypedOutput,
+};
+pub use crate::session::{
+    SESSION_HEADER_LEN, SessionConfig, Sessioned, TAG_EXPIRED, TAG_FRESH, TAG_REPLAYED,
 };
 
 /// Default idle strategy for the apply thread: a short sleep between empty
