@@ -50,3 +50,5 @@ bincode = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 tempfile = { workspace = true }
+# m12_gate example only: latency histogram for the gateway-vs-direct A/B.
+hdrhistogram = { workspace = true }

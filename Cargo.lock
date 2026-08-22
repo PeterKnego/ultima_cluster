@@ -1377,6 +1377,7 @@ dependencies = [
  "bincode",
  "bytes",
  "clap",
+ "hdrhistogram",
  "parking_lot",
  "rand",
  "serde",
