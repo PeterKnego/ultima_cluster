@@ -477,8 +477,14 @@ impl Edge {
     }
 
     /// Force the faulted state, for tests that need to observe the refusal
-    /// without racing a real node restart. Not part of the public contract.
-    #[doc(hidden)]
+    /// without racing a real node restart.
+    ///
+    /// Behind the non-default `test-util` feature rather than merely
+    /// `#[doc(hidden)]`: hiding a method from rustdoc does not stop anything
+    /// from calling it, and this one takes a live edge permanently out of
+    /// service. Nothing outside a test has any business reaching it, so the
+    /// build — not the documentation — is what says so.
+    #[cfg(feature = "test-util")]
     pub fn fault_for_tests(&self) {
         self.shared.on_instance_restart();
     }
@@ -620,17 +626,12 @@ fn handshake(shared: &Arc<Shared>, conn: &Arc<Conn>, send: &SendHalf, fc: &mut F
         return false;
     }
     conn.set_client_id(h.client_id);
-    if shared.is_faulted() {
-        // Terminal for this edge, not for the cluster: a client with more than
-        // one member in its list should try the next one.
-        refuse_hello(
-            shared,
-            conn,
-            HELLO_REFUSED_FAULTED,
-            "edge faulted: node instance restarted; restart the gateway",
-        );
-        return false;
-    }
+
+    // Identity checks come FIRST, before the edge's own health. A client that
+    // dialled the wrong cluster or speaks the wrong protocol must hear that —
+    // `APP_ID`/`VERSION` are terminal everywhere, while `FAULTED` invites the
+    // client to try another member, which for a wrong-cluster dial would send
+    // it round the whole member list to be refused again at each one.
     if h.version != PROTOCOL_VERSION {
         let detail = format!("edge speaks remote protocol v{PROTOCOL_VERSION}");
         refuse_hello(shared, conn, HELLO_REFUSED_VERSION, &detail);
@@ -642,6 +643,17 @@ fn handshake(shared: &Arc<Shared>, conn: &Arc<Conn>, send: &SendHalf, fc: &mut F
     };
     if hello.app_id != shared.cfg.app_id {
         refuse_hello(shared, conn, HELLO_REFUSED_APP_ID, &shared.cfg.app_id);
+        return false;
+    }
+    if shared.is_faulted() {
+        // Terminal for this edge, not for the cluster: a client with more than
+        // one member in its list should try the next one.
+        refuse_hello(
+            shared,
+            conn,
+            HELLO_REFUSED_FAULTED,
+            "edge faulted: node instance restarted; restart the gateway",
+        );
         return false;
     }
 

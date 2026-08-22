@@ -282,32 +282,49 @@ impl Conn {
     /// Halve the credit grant (floor 1) after the `Engine` reported
     /// `Backpressure`. Pressure is signalled *before* frames leave the client,
     /// which is the whole point of a receiver-driven window.
+    ///
+    /// A CAS loop, not load-then-store: this runs on a reader thread while
+    /// [`Conn::relax`] runs on the driver, so a plain read-modify-write pair
+    /// can lose one side's update entirely — a squeeze silently reverted (the
+    /// window stays wide while the engine is full) or a relax silently
+    /// reverted (the connection stays pinned at 1 credit). Uncontended, this
+    /// is one `lock cmpxchg`.
     pub fn squeeze(&self) {
-        let c = self.credits();
-        self.credits.store((c / 2).max(1), Ordering::SeqCst);
+        let _ = self.credits.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+            Some((c / 2).max(1))
+        });
         self.squeezed.store(true, Ordering::Release);
     }
 
-    /// Double the grant back towards `ceiling` after a successful completion,
-    /// but only if it was ever squeezed. Returns `true` if credits increased,
-    /// which is what obliges the caller to tell the client promptly.
+    /// Double the grant back towards `ceiling` after a completion, but only if
+    /// it was ever squeezed. Returns `true` if credits increased, which is what
+    /// obliges the caller to tell the client promptly.
+    ///
+    /// Same CAS discipline as [`Conn::squeeze`], and for the same reason —
+    /// these two are the pair that races.
     pub fn relax(&self, ceiling: u32) -> bool {
         if !self.squeezed.load(Ordering::Acquire) {
             return false;
         }
-        let c = self.credits();
-        let next = c.saturating_mul(2).min(ceiling);
-        if next <= c {
-            // Back at the ceiling: stop paying for the check.
-            self.squeezed.store(false, Ordering::Release);
-            return false;
+        let bumped = self.credits.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+            let next = c.saturating_mul(2).min(ceiling);
+            if next > c { Some(next) } else { None }
+        });
+        match bumped {
+            Ok(prev) => {
+                if prev.saturating_mul(2) >= ceiling {
+                    // Back at the ceiling: stop paying for the check.
+                    self.squeezed.store(false, Ordering::Release);
+                }
+                self.notify_gate();
+                true
+            }
+            // Already at (or above) the ceiling — nothing to announce.
+            Err(_) => {
+                self.squeezed.store(false, Ordering::Release);
+                false
+            }
         }
-        self.credits.store(next, Ordering::SeqCst);
-        if next >= ceiling {
-            self.squeezed.store(false, Ordering::Release);
-        }
-        self.notify_gate();
-        true
     }
 
     /// `true` the first time an unexpected frame type is seen, so the log line

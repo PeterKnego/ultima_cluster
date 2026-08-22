@@ -24,7 +24,10 @@ use std::time::{Duration, Instant};
 
 use uc2_gateway::{Edge, EdgeConfig, Member};
 use uc2_remote::conn::FramedConn;
-use uc2_remote::frame::{FrameType, HELLO_REFUSED_FAULTED, Header, Hello, PROTOCOL_VERSION};
+use uc2_remote::frame::{
+    FrameType, HELLO_REFUSED_APP_ID, HELLO_REFUSED_FAULTED, Header, Hello, HelloRefused,
+    PROTOCOL_VERSION,
+};
 use uc2_remote::{RemoteClient, RemoteConfig, RemoteError};
 use uc2_service::{ServiceBuilder, ServiceConfig, SessionConfig, Sessioned};
 use uc_lincheck::register::RegisterSm;
@@ -239,6 +242,56 @@ fn a_faulted_edge_refuses_new_handshakes_instead_of_livelocking() {
     let _ = before.submit(&cmd).map(|t| t.wait());
     before.shutdown();
 
+    edge.stop();
+    common::assert_no_gateway_threads();
+    node.stop();
+    svc.stop();
+}
+
+/// A wrong-cluster client must hear `APP_ID`, even on a faulted edge.
+///
+/// The two refusals mean opposite things to a client with several members in
+/// its list: `APP_ID` is terminal everywhere (no member will answer
+/// differently), while `FAULTED` says "this edge is out of service, try
+/// another". Answering `FAULTED` first would send a misconfigured client round
+/// the entire member list to be refused at each one — so the identity checks
+/// come before the edge's own health.
+#[test]
+fn a_wrong_app_id_is_refused_as_app_id_even_when_the_edge_is_faulted() {
+    let root = common::tempdir();
+    let (node, dir) = common::start_single_node(root.path());
+    let svc = ServiceBuilder::new(
+        ServiceConfig::new(&dir, common::APP),
+        Sessioned::new(RegisterSm::default(), SessionConfig::default()),
+    )
+    .start()
+    .unwrap();
+    common::await_serving(&node, 10);
+    let edge = Edge::start(edge_config(&dir)).unwrap();
+    edge.fault_for_tests();
+    assert!(edge.is_faulted());
+
+    let mut c = dial_raw(&edge);
+    send_hello(&mut c, 1, "some-other-cluster");
+    let (h, payload) = loop {
+        match c.read_frame() {
+            Ok(Some(f)) => break f,
+            Ok(None) => continue,
+            Err(e) => panic!("read after HELLO: {e}"),
+        }
+    };
+    assert_eq!(h.ty, FrameType::HelloRefused);
+    let r = HelloRefused::decode(&payload).unwrap();
+    assert_eq!(
+        r.reason,
+        HELLO_REFUSED_APP_ID,
+        "cluster identity is checked before the edge's own health (got reason {}, detail {:?})",
+        r.reason,
+        r.detail
+    );
+    assert_ne!(r.reason, HELLO_REFUSED_FAULTED);
+
+    drop(c);
     edge.stop();
     common::assert_no_gateway_threads();
     node.stop();

@@ -8,6 +8,13 @@ license.workspace = true
 authors.workspace = true
 description = "ultima_cluster gateway edge: remote protocol v1 over a local node's shmem Engine"
 
+[features]
+# Exposes `Edge::fault_for_tests`, which forces the edge into its faulted
+# state. NOT default, and deliberately a feature rather than `#[doc(hidden)]`:
+# hiding a method from rustdoc does not stop a downstream crate calling it, and
+# nothing outside a test has any business faulting a live edge.
+test-util = []
+
 [dependencies]
 uc2_client = { path = "../uc2_client" }
 uc2_log = { path = "../uc2_log" }
@@ -18,6 +25,10 @@ parking_lot = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# Self dev-dependency: the supported way to build this crate's own test targets
+# with a non-default feature enabled. `cargo test -p uc2_gateway` gets
+# `test-util`; `cargo build -p uc2_gateway` does not.
+uc2_gateway = { path = ".", features = ["test-util"] }
 uc2_net = { path = "../uc2_net" }
 uc2_node = { path = "../uc2_node" }
 uc2_service = { path = "../uc2_service" }

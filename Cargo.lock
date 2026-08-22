@@ -1379,6 +1379,7 @@ dependencies = [
  "thiserror",
  "uc-lincheck",
  "uc2_client",
+ "uc2_gateway",
  "uc2_log",
  "uc2_net",
  "uc2_node",
