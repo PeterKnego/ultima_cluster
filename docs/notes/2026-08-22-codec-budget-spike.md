@@ -118,3 +118,40 @@ Dev box; in-process `all` mode; 3 services share one set of global counters
 preemption, so per-frame ns are upper bounds under oversubscription; the
 `Vec<u8>` arm and the `Bytes` arm were separate runs minutes apart. None of
 this is a gate number.
+
+## Post-fix smoke (Task 4)
+
+M12a Task 4 added `m5_gate`'s raw `CountSm` twin (`RawCountSm`, `--raw-sm`) —
+the typed/raw A/B this note called for. `cargo run -p uc2_node --release
+--example m5_gate --features uc2_service/apply-profile -- all --secs 6
+--payload 509`, with and without `--raw-sm` (`--payload 509` rather than the
+task's nominal 512: `NODE_MAX_PAYLOAD` in `m5_gate.rs` is a hard 512 B door
+enforced at `try_submit` and a 509 B raw command bincode-encodes to exactly
+512 B (`Vec<u8>`'s 3-byte length-varint overhead at this size) — `avg_payload`
+below reports the post-encode 512 B, matching this note's Part 2 table
+convention). Same dev box, same "3 services share one global counter set,
+report repeats 3x" caveat as Part 2 — **smoke (dev box, 4 vCPU), not a gate
+number**:
+
+```
+typed (CountSm, StateMachine + bincode):
+apply-profile[final] frames=1369266 avg_payload=512B per-frame: sm_apply=731ns publish=120ns batch_arm=864ns | sm_apply/batch_arm=84.7% sm_apply/apply_cycle_total=75.8% batch_arm/apply_cycle_total=89.5% apply_cycle_calls=160274
+
+raw (RawCountSm, --raw-sm):
+apply-profile[final] frames=1449796 avg_payload=512B per-frame: sm_apply=12ns publish=82ns batch_arm=107ns | sm_apply/batch_arm=11.3% sm_apply/apply_cycle_total=5.8% batch_arm/apply_cycle_total=51.1% apply_cycle_calls=173273
+```
+
+731 ns → 12 ns (61x) confirms the Part 2 prediction directionally (this note
+expected "a few ns" raw vs. "≈800 ns" typed at 512 B — 12 ns and 731 ns land
+in the same ranges) on a busier box than the original spike (this run carries
+the M12a raw/typed dispatch machinery and a slightly different payload
+convention, so the absolute ns are not directly comparable to Part 2's table
+row-for-row). `sm_apply/apply_cycle_total` drops 75.8% → 5.8%, the same shape
+as Part 2's `Bytes`-arm finding: removing the typed decode/encode does not
+move end-to-end `responses/s` on this box (73,847 → 79,874, both far below
+the 400k gate bar and both `RESULT: FAIL (honest)`, expected per the
+dev-box-is-not-a-bench rule) — the codec cost is real and now near-zero for
+the raw tier, but this box's bottleneck lives elsewhere, same conclusion as
+Part 2. The gate doc (Task 12) cites this section for the M12a spec §4.6
+item 5 codec-share smoke number, ahead of the fleet run that states the
+real one.

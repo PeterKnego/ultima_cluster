@@ -18,6 +18,10 @@ logic and nothing else — no consensus, no transport, no durability.
 Three obligations follow from that, and only the first is obvious:
 
 1. Implement `StateMachine` — `apply` is sync, deterministic, and does no I/O.
+   (`StateMachine` is the typed tier of the state-machine contract; see
+   [the reference page](../reference/state-machine-contract.md) if you want
+   the raw bytes-in/bytes-out tier instead — e.g. for a hand-laid or SBE wire
+   format, or to avoid paying a codec on every replica.)
 2. Stop on `SIGTERM`, explicitly.
 3. Exit when your apply agent dies, rather than staying up looking healthy.
 

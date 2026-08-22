@@ -282,7 +282,11 @@ oneshots — the client matcher correlates off the ring.
 
 - **`StateMachine`** — synchronous, deterministic `apply(position, cmd)` and
   `query`. No I/O, no clock, no ambient state. `AppCommand` is `Bytes`; reads are
-  typed rather than closures.
+  typed rather than closures. `StateMachine` is one of two tiers a service can
+  implement; see
+  [the state-machine contract reference](reference/state-machine-contract.md)
+  for the raw bytes-in/bytes-out tier underneath it and when to reach for it
+  directly.
 - **`SnapshotStateMachine`** *(optional)* — enables journal purge. A node below the
   purge floor (crashed service, fresh learner, cold start) converges by snapshot
   install plus tail replay, never by reading a purged prefix.

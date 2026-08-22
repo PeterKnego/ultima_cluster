@@ -6,10 +6,18 @@
 //!
 //! ```text
 //! cargo run -p uc2_node --release --example m5_gate -- node    --id N --bind A --members … --instance-dir D [--admission-kib K] [--crypto-key K --crypto-allowlist A]
-//! cargo run -p uc2_node --release --example m5_gate -- service --instance-dir D
+//! cargo run -p uc2_node --release --example m5_gate -- service --instance-dir D [--raw-sm]
 //! cargo run -p uc2_node --release --example m5_gate -- client  --instance-dir D --secs S [--payload 64] [--inflight 4096]
-//! cargo run -p uc2_node --release --example m5_gate -- all     --secs S [--crypto]   # local smoke, NOT the gate
+//! cargo run -p uc2_node --release --example m5_gate -- all     --secs S [--crypto] [--raw-sm]   # local smoke, NOT the gate
 //! ```
+//!
+//! **M12a (`--raw-sm`)** swaps the gate's `CountSm` (typed `StateMachine`,
+//! bincode) for `RawCountSm` (`RawStateMachine`, bytes-in/bytes-out, no
+//! decode) — same increment-and-echo logic, same 8-byte response, only the
+//! codec differs. Paired with `--features uc2_service/apply-profile`, running
+//! `all` with and without `--raw-sm` is the two-tier codec-share A/B; see
+//! `docs/notes/2026-08-22-codec-budget-spike.md` for the background numbers
+//! and its "Post-fix smoke" section for this harness's readings.
 //!
 //! **M8 (`--crypto`)** runs the SAME measurement with wire crypto ON, so the
 //! two arms differ in exactly one thing. `all --crypto` generates a fresh
@@ -82,7 +90,7 @@ use uc2_client::{Engine, EngineConfig, Outcome, SubmitError};
 use uc2_consensus::election::NodeId;
 use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig};
-use uc2_service::{ServiceBuilder, ServiceConfig, StateMachine};
+use uc2_service::{RawStateMachine, ServiceBuilder, ServiceConfig, StateMachine};
 
 // --------------------------------------------------------------- CLI shape
 
@@ -142,6 +150,11 @@ struct ServiceArgs {
     instance_dir: PathBuf,
     #[arg(long, default_value = "uc2-m5-gate")]
     app_id: String,
+    /// Run the RAW-tier twin state machine (`RawCountSm`, bytes-in/bytes-out,
+    /// no decode) instead of the typed `CountSm` — the apply-profile codec-
+    /// share A/B (`docs/notes/2026-08-22-codec-budget-spike.md`).
+    #[arg(long, default_value_t = false)]
+    raw_sm: bool,
 }
 
 #[derive(clap::Args)]
@@ -176,6 +189,11 @@ struct AllArgs {
     /// duration) is identical to the cleartext control.
     #[arg(long, default_value_t = false)]
     crypto: bool,
+    /// Run the RAW-tier twin state machine (`RawCountSm`, bytes-in/bytes-out,
+    /// no decode) instead of the typed `CountSm` — the apply-profile codec-
+    /// share A/B (`docs/notes/2026-08-22-codec-budget-spike.md`).
+    #[arg(long, default_value_t = false)]
+    raw_sm: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -233,6 +251,33 @@ impl StateMachine for CountSm {
     }
 }
 
+/// Raw-tier twin of [`CountSm`]: sees the frame bytes, decodes nothing. Same
+/// deterministic increment, same 8-byte response (a `u64`, little-endian) —
+/// the only difference from `CountSm` is which side of the `RawStateMachine`
+/// boundary does the (de)coding, which is exactly what the `apply-profile`
+/// A/B (`--raw-sm`) measures. See `docs/notes/2026-08-22-codec-budget-spike.md`.
+#[derive(Default)]
+struct RawCountSm {
+    count: u64,
+    last_applied: Option<u64>,
+}
+
+impl RawStateMachine for RawCountSm {
+    fn apply(&mut self, position: u64, _cmd: &[u8], out: &mut Vec<u8>) {
+        self.count += 1;
+        self.last_applied = Some(position);
+        out.extend_from_slice(&self.count.to_le_bytes());
+    }
+
+    fn query(&self, _q: &[u8], out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.count.to_le_bytes());
+    }
+
+    fn last_applied(&self) -> Option<u64> {
+        self.last_applied
+    }
+}
+
 // ------------------------------------------------------------ node role
 
 /// A distinct, index-derived election seed so each node's randomized timeout
@@ -266,6 +311,12 @@ const NODE_BUFFER_BYTES: usize = 256 << 20;
 /// sender's default MTU (`uc_protocol::v2::datagram::MTU_DEFAULT` = 1408 B) —
 /// a max-size frame must fit one datagram (`Sender::new`'s hard assert) — while
 /// comfortably above the gate's default 64 B payload.
+///
+/// Gotcha for `--payload`: this door is enforced on `try_submit`'s bincode-
+/// ENCODED `cmd_bytes` (`Vec<u8>` length-prefix + raw bytes), not on the
+/// `--payload` value itself. A `--payload 512` command becomes 515 B on the
+/// wire (the length varint's own 3 B) and is refused; `--payload 509` is the
+/// largest value that lands exactly at this cap.
 const NODE_MAX_PAYLOAD: usize = 512;
 const ELECTION_TIMEOUT_MIN_NS: u64 = 150_000_000;
 const ELECTION_TIMEOUT_MAX_NS: u64 = 300_000_000;
@@ -419,10 +470,20 @@ fn run_service(a: ServiceArgs) -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
     let cfg = ServiceConfig::new(a.instance_dir, a.app_id);
-    let _svc = ServiceBuilder::new(cfg, CountSm::default()).start()?;
-    println!("m5_gate service up; parking (killed externally by the harness)");
-    loop {
-        std::thread::park();
+    // Each arm diverges (parks forever), so the two `Service<_>` types (one
+    // per state-machine tier) never need to unify.
+    if a.raw_sm {
+        let _svc = ServiceBuilder::new(cfg, RawCountSm::default()).start()?;
+        println!("m5_gate service up (raw-tier RawCountSm); parking (killed externally by the harness)");
+        loop {
+            std::thread::park();
+        }
+    } else {
+        let _svc = ServiceBuilder::new(cfg, CountSm::default()).start()?;
+        println!("m5_gate service up (typed CountSm); parking (killed externally by the harness)");
+        loop {
+            std::thread::park();
+        }
     }
 }
 
@@ -856,7 +917,20 @@ fn await_single_leader(nodes: &[Node], secs: u64) -> usize {
 
 const ALL_APP_ID: &str = "uc2-m5-gate-smoke";
 
+/// Dispatches to the raw or typed state-machine tier. The two tiers are
+/// different `Service<S>` monomorphizations, so the run body is generic over
+/// `S` (`run_all_generic`) rather than trying to unify them at one call site
+/// (an enum / `Box<dyn Any>` would work too, but a static dispatch on `--raw-sm`
+/// is simpler and this harness never mixes tiers within one run).
 fn run_all(a: AllArgs) -> anyhow::Result<()> {
+    if a.raw_sm {
+        run_all_generic::<RawCountSm>(a, "raw (RawCountSm, bytes-in/bytes-out, no decode)")
+    } else {
+        run_all_generic::<CountSm>(a, "typed (CountSm, StateMachine + bincode)")
+    }
+}
+
+fn run_all_generic<S: RawStateMachine + Default>(a: AllArgs, sm_label: &str) -> anyhow::Result<()> {
     let root = a.root.unwrap_or_else(|| PathBuf::from("target/m5_gate_smoke"));
     // Guard off /tmp (m4_gate precedent): /tmp is RAM-backed tmpfs on this dev
     // box and a real filesystem root is required for the journal-bearing
@@ -878,6 +952,7 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
         "arm                   : {}",
         if a.crypto { "ENCRYPTED (M8 wire crypto ON)" } else { "cleartext control" }
     );
+    println!("state machine         : {sm_label}");
 
     const N: usize = 3;
     // Generated ONCE for the whole run, before any node boots — every node
@@ -916,7 +991,7 @@ fn run_all(a: AllArgs) -> anyhow::Result<()> {
             crypto,
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
-        let svc = ServiceBuilder::new(ServiceConfig::new(&instance_dir, ALL_APP_ID), CountSm::default())
+        let svc = ServiceBuilder::new(ServiceConfig::new(&instance_dir, ALL_APP_ID), S::default())
             .start()
             .expect("service start");
         nodes.push(node);

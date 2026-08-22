@@ -24,7 +24,7 @@ use uc2_client::Client;
 use uc2_log::cnc::CncPage;
 use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig};
-use uc2_service::{OutputError, OutputHandler, ServiceBuilder, ServiceConfig, StateMachine};
+use uc2_service::{NoopOutput, OutputError, OutputHandler, ServiceBuilder, ServiceConfig, StateMachine};
 use uc_protocol::v2::frame::{self, FRAME_TYPE_MESSAGE, HEADER_LEN, align_frame_len};
 use ultima_journal::TailReader;
 
@@ -193,6 +193,40 @@ fn output_thread_spawns_only_for_a_real_handler() {
     // hasn't named itself yet. Poll rather than check once immediately.
     wait_until(|| thread_names().iter().any(|n| n == "uc2-output"));
     svc_real.stop();
+
+    node.stop();
+}
+
+/// M12a Task 2+3 review carry-over: `is_noop_output` recognizes not just the
+/// bare `NoopOutput` (the builder's default, covered above) but ALSO
+/// `TypedOutput<NoopOutput>` — what `.output_handler(NoopOutput)` produces —
+/// so an EXPLICIT call installing the typed no-op handler must also skip the
+/// output thread spawn, not just the implicit default-builder path. Same
+/// thread-presence technique as `output_thread_spawns_only_for_a_real_handler`
+/// above, serialized on the same `TEST_SERIAL` lock.
+#[test]
+fn output_handler_explicit_noop_spawns_no_thread() {
+    let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let node = start_single_node(dir.path(), "explicit-noop");
+    wait_until(|| node.can_serve());
+
+    let before = thread_names();
+    assert!(
+        !before.iter().any(|n| n == "uc2-output"),
+        "no output thread before any service attaches: {before:?}"
+    );
+
+    let svc = ServiceBuilder::new(cfg(dir.path(), "explicit-noop"), CountSm::default())
+        .output_handler(NoopOutput)
+        .start()
+        .unwrap();
+    assert!(
+        !thread_names().iter().any(|n| n == "uc2-output"),
+        "explicit .output_handler(NoopOutput) (routed through TypedOutput<NoopOutput>) \
+         must not spawn the output thread"
+    );
+    svc.stop();
 
     node.stop();
 }

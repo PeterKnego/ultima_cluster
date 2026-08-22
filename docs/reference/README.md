@@ -22,6 +22,14 @@ What an operator touches directly.
 - [Configuration](configuration.md) — `NodeConfig` field by field, the
   environment switches, crypto key material, and the cluster limits.
 
+## SDK surfaces
+
+What a service binary is written against.
+
+- [The state-machine contract](state-machine-contract.md) — the two tiers
+  (`RawStateMachine`/`StateMachine`), their exact signatures, the
+  byte-identity promise, and the `out`-buffer discipline.
+
 ## Internal surfaces
 
 Formats you need when decoding a live system or reading the wire.
