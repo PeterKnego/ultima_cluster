@@ -27,6 +27,93 @@ use crate::egress::Egress;
 use crate::replay::replay_into;
 use crate::traits::StateMachine;
 
+/// Spike-only codec budget-share probes (feature `apply-profile`). All
+/// counters are process-global so the egress encode (a different module, same
+/// thread) can add to them; printed every `PRINT_EVERY` frames and at drop.
+#[cfg(feature = "apply-profile")]
+pub(crate) mod profile {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::Instant;
+
+    pub static FRAMES: AtomicU64 = AtomicU64::new(0);
+    pub static DECODE: AtomicU64 = AtomicU64::new(0);
+    pub static APPLY: AtomicU64 = AtomicU64::new(0);
+    pub static PUBLISH: AtomicU64 = AtomicU64::new(0);
+    pub static ENCODE: AtomicU64 = AtomicU64::new(0);
+    pub static BATCH: AtomicU64 = AtomicU64::new(0);
+    pub static CYCLE: AtomicU64 = AtomicU64::new(0);
+    pub static CYCLES_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static PAYLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+    const PRINT_EVERY: u64 = 1_000_000;
+
+    #[inline(always)]
+    pub fn now() -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: rdtsc has no preconditions.
+        unsafe {
+            core::arch::x86_64::_rdtsc()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+            START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+        }
+    }
+
+    /// Cycles per nanosecond, calibrated once against the wall clock.
+    fn cyc_per_ns() -> f64 {
+        static CAL: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+        *CAL.get_or_init(|| {
+            let t0 = Instant::now();
+            let c0 = now();
+            while t0.elapsed().as_millis() < 50 {}
+            let c1 = now();
+            (c1 - c0) as f64 / t0.elapsed().as_nanos() as f64
+        })
+    }
+
+    pub fn add(frames: u64, decode: u64, apply: u64, publish: u64, bytes: u64) {
+        DECODE.fetch_add(decode, Relaxed);
+        APPLY.fetch_add(apply, Relaxed);
+        PUBLISH.fetch_add(publish, Relaxed);
+        PAYLOAD_BYTES.fetch_add(bytes, Relaxed);
+        let before = FRAMES.fetch_add(frames, Relaxed);
+        if before / PRINT_EVERY != (before + frames) / PRINT_EVERY {
+            report("periodic");
+        }
+    }
+
+    pub fn report(tag: &str) {
+        let k = cyc_per_ns();
+        let f = FRAMES.load(Relaxed).max(1) as f64;
+        let dec = DECODE.load(Relaxed) as f64;
+        let app = APPLY.load(Relaxed) as f64;
+        let pubc = PUBLISH.load(Relaxed) as f64;
+        let enc = ENCODE.load(Relaxed) as f64;
+        let batch = BATCH.load(Relaxed) as f64;
+        let cycle = CYCLE.load(Relaxed) as f64;
+        let bytes = PAYLOAD_BYTES.load(Relaxed) as f64;
+        eprintln!(
+            "apply-profile[{tag}] frames={} avg_payload={:.0}B \
+             per-frame: decode={:.0}ns apply={:.0}ns publish={:.0}ns (encode={:.0}ns) \
+             batch_arm={:.0}ns | codec(decode+encode)/batch_arm={:.1}% \
+             codec/apply_cycle_total={:.1}% batch_arm/apply_cycle_total={:.1}% \
+             apply_cycle_calls={}",
+            f as u64,
+            bytes / f,
+            dec / f / k,
+            app / f / k,
+            pubc / f / k,
+            enc / f / k,
+            batch / f / k,
+            100.0 * (dec + enc) / batch.max(1.0),
+            100.0 * (dec + enc) / cycle.max(1.0),
+            100.0 * batch / cycle.max(1.0),
+            CYCLES_CALLS.load(Relaxed),
+        );
+    }
+}
+
 /// Boxed "freeze the current state and produce a streaming job" closure. Built
 /// once, in [`crate::ServiceBuilder::start_with_snapshots`], where the
 /// `S: SnapshotStateMachine` bound is available; stored here behind a plain
@@ -73,6 +160,13 @@ pub(crate) struct SnapshotTrigger<S: StateMachine> {
 /// `&self` methods) inside the frames loop so the borrow checker sees the
 /// per-field disjoint borrows (`follower` iterated while `sm`/`egress`/`cnc`
 /// are touched).
+#[cfg(feature = "apply-profile")]
+impl<S: StateMachine> Drop for ApplyState<S> {
+    fn drop(&mut self) {
+        profile::report("final");
+    }
+}
+
 pub(crate) struct ApplyState<S: StateMachine> {
     /// **Poisoned incarnation** (2026-08-16 log-rewind contract). Set when the
     /// node truncates the log BENEATH what this SM already applied: our state
@@ -145,6 +239,20 @@ pub(crate) struct ApplyState<S: StateMachine> {
 /// frames; publish responses only while leader. On `Overrun`, reconstruct via
 /// journal replay and rejoin the live buffer.
 pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
+    #[cfg(feature = "apply-profile")]
+    let _cycle_guard = {
+        struct G(u64);
+        impl Drop for G {
+            fn drop(&mut self) {
+                profile::CYCLE.fetch_add(
+                    profile::now() - self.0,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                profile::CYCLES_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        G(profile::now())
+    };
     // Node-restart fail-stop (M5 final review #2c, plan decision #9): a node
     // restart recreates the cnc page in place with a fresh random `instance_id`,
     // invalidating every attachment. Detect it before doing any work so this
@@ -201,6 +309,11 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
             // in the journal after a restart prime) — degrade to replay below.
             Batch::Overrun => true,
             Batch::Frames(frames) => {
+                #[cfg(feature = "apply-profile")]
+                let batch_t0 = profile::now();
+                #[cfg(feature = "apply-profile")]
+                let (mut pf_frames, mut pf_dec, mut pf_app, mut pf_pub, mut pf_bytes) =
+                    (0u64, 0u64, 0u64, 0u64, 0u64);
                 let mut sm = st.sm.lock().unwrap();
                 for (pos, hdr, payload) in frames {
                     // NEW_TERM (and any future non-MESSAGE type) is not user data.
@@ -212,6 +325,8 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
                     if Some(pos) <= sm.last_applied() {
                         continue;
                     }
+                    #[cfg(feature = "apply-profile")]
+                    let t0 = profile::now();
                     // The ONE decode at the apply boundary. Committed bytes are
                     // trusted; a decode failure is unrecoverable corruption.
                     let (cmd, _) = bincode::serde::decode_from_slice::<S::Command, _>(
@@ -219,12 +334,33 @@ pub(crate) fn apply_cycle<S: StateMachine>(st: &mut ApplyState<S>) -> bool {
                         bincode::config::standard(),
                     )
                     .expect("corrupt committed frame (fail-stop)");
+                    #[cfg(feature = "apply-profile")]
+                    let t1 = profile::now();
                     let resp = sm.apply(pos, cmd);
+                    #[cfg(feature = "apply-profile")]
+                    let t2 = profile::now();
                     if is_leader {
                         st.egress.publish(hdr.session_id, hdr.correlation_id, pos, &resp);
                     }
+                    #[cfg(feature = "apply-profile")]
+                    {
+                        let t3 = profile::now();
+                        pf_frames += 1;
+                        pf_dec += t1 - t0;
+                        pf_app += t2 - t1;
+                        pf_pub += t3 - t2;
+                        pf_bytes += payload.len() as u64;
+                    }
                 }
                 drop(sm);
+                #[cfg(feature = "apply-profile")]
+                {
+                    profile::BATCH.fetch_add(
+                        profile::now() - batch_t0,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    profile::add(pf_frames, pf_dec, pf_app, pf_pub, pf_bytes);
+                }
                 // Publish the new applied frontier for barrier readers / clients.
                 st.cnc.service().service_applied.store_release(st.follower.cursor);
                 if st.follower.cursor == cursor_before {

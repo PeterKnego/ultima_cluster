@@ -35,6 +35,8 @@ impl Egress {
         position: u64,
         resp: &R,
     ) {
+        #[cfg(feature = "apply-profile")]
+        let t0 = crate::apply::profile::now();
         let mut payload = Vec::with_capacity(8 + 32);
         payload.extend_from_slice(&position.to_le_bytes());
         // The response type is the user's; an encode failure here is a program
@@ -42,6 +44,11 @@ impl Egress {
         // practice), not a runtime condition to recover from — fail-stop.
         bincode::serde::encode_into_std_write(resp, &mut payload, bincode::config::standard())
             .expect("response bincode-encode (fail-stop)");
+        #[cfg(feature = "apply-profile")]
+        crate::apply::profile::ENCODE.fetch_add(
+            crate::apply::profile::now() - t0,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let extra = extra_client(session_id as u32, correlation_id as u32);
         // flags = 0: this is a submit response, not a query answer (FLAG_V2_IS_QUERY).
         let _ = self.producer.write(MSG_V2_RESPONSE, 0, extra, &payload);

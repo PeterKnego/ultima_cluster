@@ -12,6 +12,10 @@ authors.workspace = true
 # `SnapshotStateMachine` capability backed by `ultima_db::Store`). Off by
 # default so a service that supplies its own SM never builds the store.
 ultima_db = ["dep:ultima-db"]
+# Spike-only (2026-08-22 codec budget-share measurement): rdtsc probes around
+# decode / apply / response-encode on the apply thread, summary to stderr.
+# Never on by default; costs nothing when off.
+apply-profile = []
 
 [dependencies]
 uc_protocol = { path = "../uc_protocol" }
