@@ -292,10 +292,11 @@ class (`O_APPEND`, `fsync` per record, no rotation).
 ## Response statuses
 
 Mutating commands write an admin request and poll for the response line.
-The status below is a **printed value**, not the process exit code — see
+The status below is a **printed value**, not the process exit code.
 `uc2ctl` exits `0` on success and non-zero on failure: `1` for any runtime
 failure (the single `process::exit(1)`), `2` for a command-line usage error
-(clap), separately from the table's own `0`/`1`/`2`.
+(clap) — separately from the table's own `0`/`1`/`2` (see
+[`semver-policy.md`](semver-policy.md)).
 
 | Status | Printed as | Process outcome |
 |---|---|---|
