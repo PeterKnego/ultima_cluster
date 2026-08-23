@@ -236,8 +236,19 @@ jobs:
       - name: Checksum the artifact before trusting it
         run: ( cd dist && sha256sum -c "${TARBALL}.sha256" )
 
+      # --work is OUTSIDE the repository on purpose. The quickstart inside
+      # the container runs as root and leaves ~400 MB of instance state
+      # behind, including a mode-0600 admin key owned by root; the next step
+      # builds a docker image whose context is this directory tree, and a
+      # context containing a file the runner user cannot open fails while
+      # packing, three steps away from the cause. $RUNNER_TEMP is outside the
+      # context and is wiped between jobs. .dockerignore is the second half
+      # of the same defence.
       - name: Quickstart out of the tarball, in a bare container
-        run: scripts/release_smoke.sh "dist/${TARBALL}"
+        run: >
+          scripts/release_smoke.sh "dist/${TARBALL}"
+          --image "$SMOKE_BASE_IMAGE"
+          --work "${RUNNER_TEMP}/release-smoke"
 
       # ---- the compose smoke: the same binaries, as containers ----
       - name: Build the image from the tarball
@@ -252,6 +263,14 @@ jobs:
       # quickstart-local.sh uses it: services still have to attach and the
       # leader still has to commit its NewTerm frame. `reset` is idempotent,
       # so retrying it costs nothing.
+      #
+      # The retry loop is bounded by WALL CLOCK, not by an iteration count:
+      # each probe can itself block for its own --timeout-secs, so "N tries
+      # times a sleep" is not a bound on anything and a stack that never
+      # comes up would run past this job's timeout-minutes and report as an
+      # opaque cancellation instead of a named failure. Same shape as
+      # packaging/quickstart-local.sh's deadline loops. The probe timeout is
+      # short for the same reason; the real requests get a longer one.
       - name: Drive the cluster through a gateway
         env:
           UC2_IMAGE: uc2:smoke
@@ -259,21 +278,26 @@ jobs:
           set -euo pipefail
           NET=uc2-demo_uc2
           remote() {
+            local t="$1"; shift
             docker run --rm --network "$NET" \
               --entrypoint /usr/local/bin/counter-remote uc2:smoke \
               --gateways gw0:9200,gw1:9201,gw2:9202 --app-id quickstart \
-              --timeout-secs 30 "$@"
+              --timeout-secs "$t" "$@"
           }
           ok=0
-          for _ in $(seq 1 60); do
-            if out=$(remote reset 2>&1); then ok=1; break; fi
+          out="(never ran)"
+          deadline=$(( $(date +%s) + 180 ))
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            if out=$(remote 10 reset 2>&1); then ok=1; break; fi
             sleep 2
           done
-          [ "$ok" = 1 ] || { echo "the compose cluster never answered a reset: $out"; exit 1; }
+          [ "$ok" = 1 ] || { echo "the compose cluster never answered a reset in 180s; last: $out"; exit 1; }
           echo "reset -> $out"
-          echo "add 5 -> $(remote add 5)"
-          echo "add 5 -> $(remote add 5)"
-          got=$(remote get --linearizable)
+          # Assign, THEN echo: `echo "$(remote …)"` would swallow a non-zero
+          # exit into echo's own success and walk on to the assertion.
+          out=$(remote 30 add 5); echo "add 5 -> $out"
+          out=$(remote 30 add 5); echo "add 5 -> $out"
+          got=$(remote 30 get --linearizable)
           echo "get   -> $got"
           [ "$got" = "value=10" ] || { echo "expected value=10, got '$got'"; exit 1; }
           echo "compose smoke PASS"
@@ -341,6 +365,15 @@ jobs:
             dist/SHA256SUMS
             dist/SHA256SUMS.sigstore.json
           generate_release_notes: false
+          # A version with a hyphen in it is a prerelease — `2.6.0-rc.1`, and
+          # cut-a-release.md tells the maintainer to push exactly that FIRST.
+          # Without these two, the rc would take over the repository's
+          # "Latest release" pointer, which is what `/releases/latest` and
+          # most download scripts follow: everyone arriving for 2.6.0 would
+          # be handed the release candidate. `make_latest` is a string input
+          # ('true'/'false'/'legacy'), not a boolean, hence the quoted forms.
+          prerelease: ${{ contains(needs.version.outputs.version, '-') }}
+          make_latest: ${{ contains(needs.version.outputs.version, '-') && 'false' || 'true' }}
           body: |
             ## ultima_cluster ${{ env.VERSION }}
 
@@ -416,7 +449,11 @@ jobs:
           provenance: false
 
       - uses: sigstore/cosign-installer@v3
+      # --recursive signs the multi-arch index AND each per-platform manifest
+      # under it. Without it only the index carries a signature, so a client
+      # that pulls by platform digest (or any tool that resolves the index
+      # before verifying) finds nothing to check.
       - name: Sign the image by digest
-        run: cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+        run: cosign sign --yes --recursive "${IMAGE_NAME}@${DIGEST}"
         env:
           DIGEST: ${{ steps.push.outputs.digest }}

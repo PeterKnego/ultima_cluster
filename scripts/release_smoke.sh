@@ -29,7 +29,12 @@
 #     --image  base image to run in. Default ubuntu:24.04. Whatever you pass
 #              must have bash and coreutils and nothing else is assumed.
 #     --work   host directory to unpack into (it is DELETED and recreated).
-#              Default: <tarball's directory>/.release-smoke.
+#              Default: <tarball's directory>/.release-smoke. PUT IT OUTSIDE
+#              ANY DOCKER BUILD CONTEXT: the run below leaves hundreds of
+#              megabytes of cluster state here, including a mode-0600 admin
+#              key owned by root, and a later `docker build` whose context
+#              contains that key fails while packing it. release.yml passes
+#              $RUNNER_TEMP for exactly this reason.
 #
 #   Exit codes: 0 = PASS, 1 = the smoke run failed,
 #               3 = a precondition (no docker, no tarball, bad argument).

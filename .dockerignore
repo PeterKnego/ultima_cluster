@@ -1,12 +1,14 @@
 # The container image is built FROM A RELEASE TARBALL (see packaging/Dockerfile),
-# not from this source tree: the only thing the build context needs is `dist/`.
-# Sending the rest — .git, target/, proofs/, bench-infra/ — would cost minutes
-# per build for files no stage ever reads.
+# not from this source tree, and the ONLY thing any stage reads is
+# `dist/*.tar.gz`. Everything else — .git, target/, proofs/, bench-infra/ —
+# would cost minutes per build for files nothing opens.
 #
-# `packaging/` is kept in the context so a future stage can COPY from it
-# without this file turning that into a confusing "not found".
+# The narrowness is load-bearing, not tidiness. `release-smoke` runs a
+# container as root in a work directory and the quickstart leaves hundreds of
+# megabytes of instance state behind it, including a mode-0600 admin key owned
+# by root. If any of that were re-included here, the very next `docker build`
+# would fail on a permission-denied while packing the context, three steps
+# away from the cause. `!dist/*.tar.gz` selects the artifacts and nothing else,
+# whatever a smoke run leaves lying around.
 *
-!dist
-!dist/**
-!packaging
-!packaging/**
+!dist/*.tar.gz

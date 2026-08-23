@@ -67,6 +67,12 @@ services:
   # `bind` and this node's own [[members]] entry must be the identical
   # address, which is why the nodes get static IPs: a node refuses to start
   # if the two disagree, and it cannot state an address it does not yet know.
+  #
+  # The statics are .100-.102, high in the subnet on purpose. Docker hands
+  # out dynamic addresses from the bottom (.2 upwards), and `init`/`init-key`
+  # take two of those before any node starts — so statics down at .10-.12
+  # would be free only by accident of start order, and would collide the day
+  # a service is added or the stack is brought up in a different order.
   init:
     image: busybox:stable
     user: "0:0"
@@ -85,21 +91,21 @@ services:
         for i in 0 1 2; do
           cat >"/etc/uc2/n$${i}.toml" <<EOF
         id = $${i}
-        bind = "10.77.0.1$${i}:9100"
+        bind = "10.77.0.10$${i}:9100"
         instance_dir = "/srv/uc2/n$${i}"
         app_id = "quickstart"
 
         [[members]]
         id = 0
-        addr = "10.77.0.10:9100"
+        addr = "10.77.0.100:9100"
 
         [[members]]
         id = 1
-        addr = "10.77.0.11:9100"
+        addr = "10.77.0.101:9100"
 
         [[members]]
         id = 2
-        addr = "10.77.0.12:9100"
+        addr = "10.77.0.102:9100"
 
         # Cleartext node-to-node traffic. Both sections are REQUIRED since
         # v2.6.0: an absent one is a startup refusal naming it, never a
@@ -188,7 +194,7 @@ services:
     command: ["--config", "/etc/uc2/n0.toml"]
     networks:
       uc2:
-        ipv4_address: 10.77.0.10
+        ipv4_address: 10.77.0.100
     volumes:
       - n0:/srv/uc2/n0
       - conf:/etc/uc2:ro
@@ -208,7 +214,7 @@ services:
     command: ["--config", "/etc/uc2/n1.toml"]
     networks:
       uc2:
-        ipv4_address: 10.77.0.11
+        ipv4_address: 10.77.0.101
     volumes:
       - n1:/srv/uc2/n1
       - conf:/etc/uc2:ro
@@ -228,7 +234,7 @@ services:
     command: ["--config", "/etc/uc2/n2.toml"]
     networks:
       uc2:
-        ipv4_address: 10.77.0.12
+        ipv4_address: 10.77.0.102
     volumes:
       - n2:/srv/uc2/n2
       - conf:/etc/uc2:ro

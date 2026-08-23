@@ -58,8 +58,12 @@ stops. Nothing is published, nothing is signed, and the version is
 `0.0.0-dry`. Use this after any edit to `release.yml`, the `Dockerfile`,
 `compose.yml` or `quickstart-local.sh`.
 
-**A release candidate.** A dry run cannot exercise signing (no OIDC identity
-is minted for it), the GitHub Release, or the ghcr push. An `-rc` tag can:
+**A release candidate.** A dry run stops short of signing, the GitHub Release
+and the ghcr push — not because a dispatch run could not mint an OIDC identity
+(it could), but because the `release` and `image` jobs are guarded on
+`startsWith(github.ref, 'refs/tags/v') && !inputs.dry_run` and simply do not
+run. Those three are only ever exercised by a real tag. An `-rc` tag is a real
+tag:
 
 ```sh
 git tag -s v2.6.0-rc.1 -m "ultima_cluster 2.6.0-rc.1"
@@ -67,9 +71,11 @@ git push origin v2.6.0-rc.1
 ```
 
 It produces a real, verifiable, fully-signed release — of a version nobody
-will mistake for the final one. Do this **once per release**, verify it with
-step 5, then delete the tag and the release if you like. The rc is also the
-only way to test that `cosign verify-blob` works for someone who is not you.
+will mistake for the final one, and one the workflow marks `prerelease` so it
+cannot take over the repository's "Latest release" pointer. Do this **once per
+release**, verify it with step 5, then delete the tag and the release if you
+like. The rc is also the only way to test that `cosign verify-blob` works for
+someone who is not you.
 
 ## 4. Tag it
 
@@ -96,6 +102,14 @@ Then watch the run. Jobs, in order:
 Nothing is published unless `release-smoke` passes. If it fails, fix the
 cause, delete the tag (`git push --delete origin v2.6.0 && git tag -d v2.6.0`)
 and tag again — do not push a `v2.6.0.1`.
+
+**One gap to know about:** `release-smoke` runs the **x86_64** tarball only.
+The aarch64 binaries are compiled and packaged on native arm hardware and
+copied into the arm64 leg of the image, but nothing in CI ever *executes*
+them. The first aarch64 run happens on somebody's machine. If you have an arm
+host, unpack `uc2-<version>-aarch64-unknown-linux-gnu.tar.gz` on it and run
+`packaging/quickstart-local.sh` by hand as part of step 5 — the rc tag is the
+right place to spend that ten minutes.
 
 ## 5. Verify what was published, as a stranger would
 
