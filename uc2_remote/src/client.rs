@@ -1468,7 +1468,12 @@ fn dial_one(cfg: &RemoteConfig, client_id: u64, addr: &str) -> Dialed {
     }
     let deadline = Instant::now() + cfg.connect_timeout;
     loop {
-        match conn.read_frame(cfg.connect_timeout) {
+        // The REMAINING budget, not the constant: `read_frame` grants a fresh
+        // `max_stall` once a partial frame has started, so a peer dribbling
+        // bytes could otherwise stretch the handshake to ~2 x connect_timeout
+        // and one attempt to ~3 x — contradicting the bound documented on
+        // `RemoteConfig::request_timeout`.
+        match conn.read_frame(deadline.saturating_duration_since(Instant::now())) {
             Ok(Some((h, payload))) => {
                 return match h.ty {
                     FrameType::HelloOk => match HelloOk::decode(&payload) {
