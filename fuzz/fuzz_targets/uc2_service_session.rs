@@ -3,7 +3,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use uc2_fuzz::NoopSm;
+use uc2_fuzz::EchoSm;
 use uc2_service::RawStateMachine;
 use uc2_service::{SessionConfig, Sessioned};
 
@@ -18,6 +18,14 @@ use uc2_service::{SessionConfig, Sessioned};
 // would need tens of thousands of distinct clients in one iteration. Shrinking
 // the bounds to single digits makes all three fire constantly while testing
 // exactly the same code.
+//
+// The inner SM is `EchoSm`, NOT `NoopSm`, and that choice is load-bearing:
+// `Sessioned` accounts `total_bytes` from the length of each cached FRESH
+// response, so a zero-length-response SM pins `total_bytes` at 0 and
+// `evict_bytes_over_budget` is dead however small `max_bytes` gets. Echoing
+// the command body makes the response length fuzzer-controlled, which is what
+// actually reaches the budget path (Task 3 review: the first version of this
+// target claimed all three eviction paths and only had two).
 fuzz_target!(|data: &[u8]| {
     let Some((&sel, rest)) = data.split_first() else {
         return;
@@ -42,7 +50,7 @@ fuzz_target!(|data: &[u8]| {
     };
 
     let parts = uc2_fuzz::split(rest, 9);
-    let mut sm = Sessioned::new(NoopSm, cfg);
+    let mut sm = Sessioned::new(EchoSm::default(), cfg);
     let mut out = Vec::new();
 
     // Eight applies at increasing positions: enough distinct clients and

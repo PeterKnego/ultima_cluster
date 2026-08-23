@@ -433,13 +433,25 @@ pub fn uc2_crypto_group_key() -> Vec<Seed> {
 
     let mut seeds = Vec::new();
 
+    // The epoch `uc2_fuzz::group_plane_with_pending` actually mints. Taken
+    // from the real `GroupPlane` rather than pasted as a literal: an ack for
+    // any OTHER epoch folds into a no-op, which is how the first version of
+    // `02-ack-*` (hard-coded epoch 7 against a plane that mints 1) silently
+    // stopped testing `on_ack` at all. The KEY is random, the epoch NUMBER is
+    // a deterministic counter, so reading it here keeps the seeds fixed.
+    let pending_epoch = {
+        let mut probe = uc2_crypto::group::GroupPlane::new(crate::A_ID);
+        let (epoch, _acts) = probe.mint(&[crate::B_ID], 1_000_000);
+        epoch
+    };
+
     let mut key_msg = vec![MSG_KEY];
-    key_msg.extend_from_slice(&7u16.to_le_bytes());
+    key_msg.extend_from_slice(&pending_epoch.to_le_bytes());
     key_msg.extend_from_slice(&[0x5Au8; 32]);
     seeds.push(Seed::fixed("01-key-delivery", framed(crate::B_ID as u8, &key_msg)));
 
     let mut ack = vec![MSG_ACK];
-    ack.extend_from_slice(&7u16.to_le_bytes());
+    ack.extend_from_slice(&pending_epoch.to_le_bytes());
     // An ack from a peer the pending epoch DOES target, and one from a peer
     // it does not — `on_ack` ranks acks per peer.
     seeds.push(Seed::fixed("02-ack-from-target", framed(crate::B_ID as u8, &ack)));
@@ -693,15 +705,17 @@ pub fn uc2_service_session() -> Vec<Seed> {
 
     // A GENUINE snapshot: apply two clients through the real `Sessioned`, then
     // freeze and stream it exactly as the framework does. Deterministic —
-    // nothing here draws from a clock or an RNG.
-    let mut sm = Sessioned::new(crate::NoopSm, SessionConfig::default());
+    // nothing here draws from a clock or an RNG. Built over `EchoSm` because
+    // that is what the target wraps, so the artifact's trailing inner-SM bytes
+    // are the ones `install_snapshot` will actually try to read.
+    let mut sm = Sessioned::new(crate::EchoSm::default(), SessionConfig::default());
     let mut out = Vec::new();
     sm.apply(1, &envelope(1, 1, b"one"), &mut out);
     out.clear();
     sm.apply(2, &envelope(2, 1, b"two"), &mut out);
     let (handle, _pos) = sm.freeze().expect("freeze session table");
     let mut artifact = Vec::new();
-    <Sessioned<crate::NoopSm> as SnapshotStateMachine>::stream_snapshot(handle, &mut artifact)
+    <Sessioned<crate::EchoSm> as SnapshotStateMachine>::stream_snapshot(handle, &mut artifact)
         .expect("stream session snapshot");
 
     // Eight distinct clients: with `max_clients` of 1..4 under the tiny
@@ -713,7 +727,14 @@ pub fn uc2_service_session() -> Vec<Seed> {
     // per-client window trim on every apply after the first few.
     let rising: Vec<Vec<u8>> = (1..=8u64).map(|q| envelope(1, q, b"cmd")).collect();
     let rising_refs: Vec<&[u8]> = rising.iter().map(|v| v.as_slice()).collect();
-    // Fat responses under a small `max_bytes` — the byte-budget eviction.
+    // Eight clients whose command bodies are 24 bytes each. `EchoSm` echoes
+    // the body, so each CACHED response is 24 bytes and `Sessioned`'s
+    // `total_bytes` reaches 8 x 24 = 192 — well past the tiny config's
+    // `max_bytes` of 64 (`16 + (3 % 8) * 16`, from TINY_CFG's `b = 3`), and
+    // still past it after `max_clients = 4` has trimmed the table to 4 x 24 =
+    // 96. That is what makes `evict_bytes_over_budget` fire rather than merely
+    // be called: under `NoopSm` every response was zero-length, `total_bytes`
+    // stayed 0, and the budget branch was unreachable at ANY `max_bytes`.
     let fat: Vec<Vec<u8>> = (1..=8u64).map(|c| envelope(c, 1, &[0xEEu8; 24])).collect();
     let fat_refs: Vec<&[u8]> = fat.iter().map(|v| v.as_slice()).collect();
 
@@ -742,7 +763,8 @@ pub fn uc2_service_session() -> Vec<Seed> {
         Seed::fixed("06-many-clients-evict", seed(TINY_CFG, &many_refs, &artifact)),
         // Eight rising seqs under window 1..4: the per-client window trim.
         Seed::fixed("07-window-trim", seed(TINY_CFG, &rising_refs, &artifact)),
-        // Fat responses under a small max_bytes: byte-budget eviction.
+        // Echoed 24-byte responses x 8 clients = 192 cached bytes against a
+        // 64-byte budget: `evict_bytes_over_budget`.
         Seed::fixed("08-byte-budget-evict", seed(TINY_CFG, &fat_refs, &artifact)),
         // The tiny config against a DEFAULT-config snapshot: the
         // replicated-config mismatch branch, which must refuse, not panic.

@@ -72,6 +72,73 @@ impl uc2_service::SnapshotStateMachine for NoopSm {
     }
 }
 
+/// A state machine that ECHOES its command body back as the response.
+///
+/// Exists because [`NoopSm`] cannot exercise `Sessioned`'s byte budget:
+/// `Sessioned` accounts `total_bytes` from the length of each cached FRESH
+/// response, and `NoopSm` produces zero-length responses, so `total_bytes`
+/// stays 0 forever and `evict_bytes_over_budget` never fires no matter how
+/// small `SessionConfig::max_bytes` is set. Echoing the body makes the
+/// response length attacker-controlled, which is what puts the budget path in
+/// reach (M12d Task 3 review).
+///
+/// Deliberately APPENDS rather than clearing `out` — the opposite discipline
+/// to `NoopSm`, so the two together cover both readings of
+/// [`uc2_service::RawStateMachine::apply`]'s "cleared by the caller" contract
+/// (the reading that clears is what found M12d finding #1).
+#[derive(Default)]
+pub struct EchoSm {
+    applied: Option<u64>,
+}
+
+impl uc2_service::RawStateMachine for EchoSm {
+    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
+        self.applied = Some(position);
+        out.extend_from_slice(cmd);
+    }
+    fn query(&self, q: &[u8], out: &mut Vec<u8>) {
+        out.extend_from_slice(q);
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.applied
+    }
+}
+
+/// Snapshot capability for [`EchoSm`], so `Sessioned<EchoSm>` can be driven
+/// through the snapshot seam like `Sessioned<NoopSm>`. The state is a single
+/// `Option<u64>`, encoded as 8 bytes plus a presence byte.
+impl uc2_service::SnapshotStateMachine for EchoSm {
+    type SnapshotHandle = Option<u64>;
+
+    fn freeze(&self) -> Result<(Option<u64>, u64), uc2_service::SnapshotError> {
+        Ok((self.applied, self.applied.unwrap_or(0)))
+    }
+
+    fn stream_snapshot(
+        handle: Option<u64>,
+        dst: &mut dyn std::io::Write,
+    ) -> Result<(), uc2_service::SnapshotError> {
+        dst.write_all(&[u8::from(handle.is_some())])?;
+        dst.write_all(&handle.unwrap_or(0).to_le_bytes())?;
+        Ok(())
+    }
+
+    fn install_snapshot(
+        &mut self,
+        position: u64,
+        src: &mut dyn std::io::Read,
+    ) -> Result<u64, uc2_service::SnapshotError> {
+        let mut buf = [0u8; 9];
+        src.read_exact(&mut buf)?;
+        self.applied = if buf[0] == 0 {
+            None
+        } else {
+            Some(u64::from_le_bytes(buf[1..9].try_into().expect("9-byte buffer")))
+        };
+        Ok(position)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Crypto-plane constructors
 //
@@ -174,4 +241,68 @@ pub fn group_plane_with_pending() -> uc2_crypto::group::GroupPlane {
     let mut plane = uc2_crypto::group::GroupPlane::new(A_ID);
     let _ = plane.mint(&[B_ID, 3, 4], 1_000_000);
     plane
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uc2_service::{RawStateMachine, SessionConfig, Sessioned, SnapshotStateMachine};
+
+    fn envelope(client_id: u64, seq: u64, body: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&client_id.to_le_bytes());
+        v.extend_from_slice(&seq.to_le_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// Drive eight clients with 24-byte bodies through a `Sessioned<S>` at the
+    /// given `max_bytes`, and report how big the frozen dedup table is.
+    fn table_len<S>(inner: S, max_bytes: usize) -> usize
+    where
+        S: RawStateMachine + SnapshotStateMachine,
+    {
+        let cfg = SessionConfig { window: 4, max_clients: 4, max_bytes };
+        let mut sm = Sessioned::new(inner, cfg);
+        let mut out = Vec::new();
+        for c in 1..=8u64 {
+            out.clear();
+            sm.apply(c, &envelope(c, 1, &[0xEEu8; 24]), &mut out);
+        }
+        let (handle, _) = sm.freeze().expect("freeze");
+        let mut buf = Vec::new();
+        <Sessioned<S> as SnapshotStateMachine>::stream_snapshot(handle, &mut buf).expect("stream");
+        buf.len()
+    }
+
+    /// M12d Task 3 review: the session fuzz target claimed to exercise all
+    /// three of `Sessioned`'s eviction paths and actually reached two.
+    /// `Sessioned` accounts `total_bytes` from the length of each cached FRESH
+    /// response, so an inner SM that returns nothing pins it at 0 and
+    /// `evict_bytes_over_budget` is unreachable at ANY `max_bytes`.
+    ///
+    /// This is the reviewer's own experiment, kept as a guard: with `NoopSm`
+    /// the frozen table is identical whatever the budget; with `EchoSm` it is
+    /// not. If someone swaps the fuzz target back to a silent SM, this fails.
+    #[test]
+    fn only_a_response_producing_sm_can_reach_the_byte_budget() {
+        let noop_tight = table_len(NoopSm, 16);
+        let noop_loose = table_len(NoopSm, 64);
+        assert_eq!(
+            noop_tight, noop_loose,
+            "NoopSm produces zero-length responses, so total_bytes never moves \
+             and max_bytes cannot change the table — that is exactly why it \
+             cannot fuzz the byte budget"
+        );
+
+        let echo_tight = table_len(EchoSm::default(), 16);
+        let echo_loose = table_len(EchoSm::default(), 64);
+        assert_ne!(
+            echo_tight, echo_loose,
+            "EchoSm caches 24-byte responses, so a 16-byte budget must evict \
+             strictly more than a 64-byte one — if these match, the byte-budget \
+             path is not being exercised and the fuzz target is back to 2/3"
+        );
+        assert!(echo_tight < echo_loose, "a tighter budget must evict more");
+    }
 }

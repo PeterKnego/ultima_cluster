@@ -270,7 +270,7 @@ pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), Confi
     })
 }
 
-/// The path `[`ConfigError::Parse`]` carries when the text did not come from a
+/// The path [`ConfigError::Parse`] carries when the text did not come from a
 /// file — see [`parse_str`].
 pub const IN_MEMORY_CONFIG: &str = "<in-memory config>";
 

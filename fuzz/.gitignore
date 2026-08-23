@@ -3,8 +3,11 @@ artifacts/
 coverage/
 corpus/seed-corpus/
 .scratch/
-# libFuzzer writes artifacts to the CWD when a target binary is invoked
-# directly (no -artifact_prefix), which is what `cargo fuzz run` sets.
+# `cargo fuzz run` passes -artifact_prefix=fuzz/artifacts/<target>/, so its
+# artifacts land under artifacts/ (ignored above). These patterns catch the
+# other route: running a built target binary DIRECTLY out of the target dir,
+# which is what you do to reproduce or time a single input. libFuzzer then
+# defaults the prefix to the CWD and drops the artifact in fuzz/.
 crash-*
 leak-*
 timeout-*
