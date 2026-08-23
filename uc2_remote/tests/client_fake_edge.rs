@@ -545,3 +545,85 @@ fn ping_pong_keeps_an_idle_connection_alive() {
     assert_eq!(&r.bytes[..], b"qp");
     client.shutdown();
 }
+
+/// **Regression, M12c Task 3b.** `request_timeout` must be enforced while the
+/// client is reconnecting — including the case where every reconnect
+/// *succeeds*.
+///
+/// The shape: an edge that answers every request with a `REDIRECT` to an
+/// address that is down. The client marks the request unsent, reconnects
+/// (preferring the dead address, which refuses instantly; then the edge, which
+/// accepts), re-sends, is redirected again — forever, at localhost speed. Every
+/// cycle goes through `reconnect` and every cycle *works*, so the reader never
+/// returns to the read loop where its tick would fire, and its tick clock is
+/// reset each time round.
+///
+/// Before the fix the sweep only ran on the reader's tick and in the
+/// failed-dial arm, so this churn never timed anything out: observed in the
+/// M12c quickstart as a client hung past 200 s on a 10 s budget while the edge
+/// logged 37 000 redirects. `reconnect` now sweeps at the top of every
+/// iteration.
+#[test]
+fn request_timeout_is_enforced_through_an_endless_redirect_churn() {
+    // Port 1 is privileged and never listening — the same trick
+    // `no_reachable_member_is_reported` uses, so this cannot collide with a
+    // port the OS handed to another test.
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        redirect_all_to: Some("127.0.0.1:1".to_string()),
+        ..Default::default()
+    });
+    let client = RemoteClient::connect(RemoteConfig {
+        request_timeout: Duration::from_millis(500),
+        connect_timeout: Duration::from_secs(2),
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let err = client.submit(b"z").unwrap().wait_timeout(WAIT).unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(matches!(err, RemoteError::TimedOut), "got {err:?}");
+    assert!(elapsed < Duration::from_secs(2), "took {elapsed:?} on a 500ms budget");
+    assert!(client.stats().reconnects >= 1, "the churn did happen: {:?}", client.stats());
+    client.shutdown();
+}
+
+/// The other half of the invariant: every member unreachable, so every dial
+/// *fails* and the reader sleeps its backoff between passes. The backoff is
+/// slept in sweep-sized slices, so a 500 ms request cannot be held past its
+/// budget by a 500 ms sleep — and `shutdown` lands promptly rather than after
+/// the dial pass it interrupts.
+#[test]
+fn request_timeout_and_shutdown_are_prompt_while_every_member_is_unreachable() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let addr = edge.addr.clone();
+    let client = RemoteClient::connect(RemoteConfig {
+        request_timeout: Duration::from_millis(500),
+        connect_timeout: Duration::from_secs(2),
+        ping_interval: Duration::from_millis(50),
+        dead_after: Duration::from_millis(200),
+        ..cfg(vec![addr, "127.0.0.1:1".to_string()])
+    })
+    .unwrap();
+
+    // The whole cluster goes away underneath a connected client: dropping the
+    // edge stops its acceptor and joins its connection threads.
+    drop(edge);
+
+    let started = std::time::Instant::now();
+    let err = client.submit(b"z").unwrap().wait_timeout(WAIT).unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(matches!(err, RemoteError::TimedOut), "got {err:?}");
+    assert!(elapsed < Duration::from_secs(2), "took {elapsed:?} on a 500ms budget");
+
+    // The reader is now looping over dial-fail/backoff. `shutdown` joins it,
+    // so a reader that only noticed `closed` between passes would block here.
+    let t = client.submit(b"y").unwrap();
+    let started = std::time::Instant::now();
+    client.shutdown();
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(2), "shutdown took {elapsed:?} while dialing");
+    let err = t.wait_timeout(WAIT).unwrap_err();
+    assert!(matches!(err, RemoteError::Closed | RemoteError::TimedOut), "got {err:?}");
+}

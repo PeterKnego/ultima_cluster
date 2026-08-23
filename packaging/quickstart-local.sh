@@ -48,8 +48,8 @@
 # RESERVES its log buffer and IPC rings up front (~78 MiB), so budget ~250 MiB
 # under --root plus room for the journals.
 #
-# This script depends on bash and coreutils only — no curl, no jq, no ss — so
-# it runs in a bare `ubuntu:24.04` container with nothing else installed.
+# This script depends on bash, coreutils and sed only — no curl, no jq, no ss —
+# so it runs in a bare `ubuntu:24.04` container with nothing else installed.
 
 set -euo pipefail
 
@@ -70,24 +70,6 @@ NAMES=()
 usage() {
     sed -n '/^#   Usage:/,/^#               3 = a precondition/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
-
-# ---------------------------------------------------------------- arguments
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --bin-dir) BIN_DIR="${2:?--bin-dir needs a directory}"; shift 2 ;;
-        --root)    ROOT="${2:?--root needs a directory}"; shift 2 ;;
-        --secs)    SECS="${2:?--secs needs a number}"; shift 2 ;;
-        --keep)    KEEP=1; shift ;;
-        --full)    shift ;;
-        -h|--help) usage; exit 0 ;;
-        *) printf 'quickstart-local.sh: unknown argument %s\n\n' "$1" >&2; usage >&2; exit 3 ;;
-    esac
-done
-
-case "$ROOT" in /*) ;; *) ROOT="$PWD/$ROOT" ;; esac
-case "$BIN_DIR" in /*) ;; *) BIN_DIR="$PWD/$BIN_DIR" ;; esac
-LOGS="$ROOT/logs"
 
 # ---------------------------------------------------------------- helpers
 
@@ -166,6 +148,24 @@ cleanup() {
     exit "$rc"
 }
 trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------------- arguments
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --bin-dir) BIN_DIR="${2:?--bin-dir needs a directory}"; shift 2 ;;
+        --root)    ROOT="${2:?--root needs a directory}"; shift 2 ;;
+        --secs)    SECS="${2:?--secs needs a number}"; shift 2 ;;
+        --keep)    KEEP=1; shift ;;
+        --full)    say "note: --full is the default; flag accepted for compatibility"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf 'quickstart-local.sh: unknown argument %s\n\n' "$1" >&2; usage >&2; exit 3 ;;
+    esac
+done
+
+case "$ROOT" in /*) ;; *) ROOT="$PWD/$ROOT" ;; esac
+case "$BIN_DIR" in /*) ;; *) BIN_DIR="$PWD/$BIN_DIR" ;; esac
+LOGS="$ROOT/logs"
 
 # ---------------------------------------------------------------- 0. preconditions
 

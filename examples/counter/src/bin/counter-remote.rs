@@ -31,6 +31,9 @@
 //!    progress from `RemoteClient`'s point of view, and a one-shot CLI must
 //!    not wait for that forever.
 //!
+//! Because the counter has no dedup, this client sets
+//! `resend_on_unknown: false`: an UNKNOWN outcome is reported, never retried.
+//!
 //! Note that the gateway used by the quickstart runs with
 //! `[session] envelope = false`, because `counter-service` runs a plain
 //! `CounterSm`. A service that wraps its state machine in
@@ -58,8 +61,11 @@ struct Args {
     /// Application identity. Must match the gateway's (and the node's).
     #[arg(long, default_value = "counter")]
     app_id: String,
-    /// End-to-end budget for the request, across re-sends and reconnects.
-    /// Also bounds how long a cold cluster is waited for at connect.
+    /// Budget for the request, across re-sends and reconnects. Approximate:
+    /// it is applied twice — once to the connect retry loop, once to the wait
+    /// — so the worst case is ~2x this plus the one-second floor the wait
+    /// keeps, and `uc2_remote` itself enforces `request_timeout` only within
+    /// about a sweep interval plus a connect attempt.
     #[arg(long, default_value_t = 10)]
     timeout_secs: u64,
     #[command(subcommand)]
@@ -110,6 +116,14 @@ fn connect(args: &Args, deadline: Instant) -> Result<RemoteClient, Fail> {
         app_id: args.app_id.clone(),
         members: args.gateways.clone(),
         request_timeout: Duration::from_secs(args.timeout_secs),
+        // `CounterSm` is not wrapped in `uc2_service::Sessioned`, so nothing
+        // downstream can tell a re-send from a second command: re-sending an
+        // `Add(5)` whose outcome is UNKNOWN would risk applying it twice. Say
+        // "unknown" out loud instead — the honest answer for a state machine
+        // with no dedup. A service that wraps its SM in `Sessioned` (and an
+        // edge with the session envelope on) leaves this at its `true`
+        // default, because there the re-send is answered "replayed".
+        resend_on_unknown: false,
         ..Default::default()
     };
     loop {
