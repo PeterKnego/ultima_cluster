@@ -15,6 +15,14 @@
 //! stable contract rather than a cosmetic choice. Use [`crate::obs_event!`]
 //! at call sites rather than [`emit`] directly; it turns bare key = value
 //! pairs into [`Field`]s without an intermediate allocation.
+//!
+//! [`format_line_at`] is the formatter both this module and the M12b admin
+//! audit log ([`crate::audit`]) render through. `admin_op` — one record per
+//! admin request the node answers, carrying `actor`, `origin`, `op`,
+//! `op_name`, `id`, `addr`, `seq`, `nonce`, `outcome`, `reason` and
+//! `config_version` — is emitted here at `info` as the *mirror* of the line
+//! `<instance_dir>/audit.jsonl` already holds; the file, not this stream, is
+//! the record of record.
 
 use std::fmt;
 use std::io::Write;
@@ -87,6 +95,11 @@ pub enum FieldValue<'a> {
     U64(u64),
     I64(i64),
     Bool(bool),
+    /// JSON `null` — a field that is structurally present but has no value
+    /// for this record (the audit log's `addr` on an op that carries none).
+    /// Has no `From` impl on purpose: [`crate::obs_event!`] call sites pass
+    /// values, and a null is built explicitly.
+    Null,
     Str(&'a str),
 }
 
@@ -164,23 +177,29 @@ fn push_json_escaped(out: &mut String, s: &str) {
     }
 }
 
-/// Emit one structured log record, subject to the global [`level`] filter.
-/// Prefer [`crate::obs_event!`] at call sites over calling this directly.
-pub fn emit(level: LogLevel, event: &'static str, fields: &[Field<'_>]) {
-    if level > self::level() {
-        return;
-    }
-    let ts_ns = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-
+/// Format one record as its `\n`-terminated JSON line, without emitting it.
+/// `ts_ns` is the caller's timestamp and `level` is optional — a record with
+/// no level renders `{"ts_ns":…,"event":…}` with the level key absent
+/// entirely.
+///
+/// This is the one formatter in the crate: [`emit`] renders through it, and
+/// so does [`crate::audit::AuditLog::record`], so the JSON escaping and the
+/// key-order contract cannot drift between the log stream and the audit file.
+pub(crate) fn format_line_at(
+    ts_ns: u128,
+    level: Option<LogLevel>,
+    event: &'static str,
+    fields: &[Field<'_>],
+) -> String {
     let mut line = String::with_capacity(128);
     line.push_str(r#"{"ts_ns":"#);
     line.push_str(&ts_ns.to_string());
-    line.push_str(r#","level":""#);
-    line.push_str(level.as_json_str());
-    line.push_str(r#"","event":""#);
+    if let Some(level) = level {
+        line.push_str(r#","level":""#);
+        line.push_str(level.as_json_str());
+        line.push('"');
+    }
+    line.push_str(r#","event":""#);
     push_json_escaped(&mut line, event);
     line.push('"');
     for field in fields {
@@ -192,6 +211,7 @@ pub fn emit(level: LogLevel, event: &'static str, fields: &[Field<'_>]) {
             FieldValue::U64(v) => line.push_str(&v.to_string()),
             FieldValue::I64(v) => line.push_str(&v.to_string()),
             FieldValue::Bool(v) => line.push_str(if *v { "true" } else { "false" }),
+            FieldValue::Null => line.push_str("null"),
             FieldValue::Str(v) => {
                 line.push('"');
                 push_json_escaped(&mut line, v);
@@ -201,6 +221,20 @@ pub fn emit(level: LogLevel, event: &'static str, fields: &[Field<'_>]) {
     }
     line.push('}');
     line.push('\n');
+    line
+}
+
+/// Emit one structured log record, subject to the global [`level`] filter.
+/// Prefer [`crate::obs_event!`] at call sites over calling this directly.
+pub fn emit(level: LogLevel, event: &'static str, fields: &[Field<'_>]) {
+    if level > self::level() {
+        return;
+    }
+    let ts_ns = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let line = format_line_at(ts_ns, Some(level), event, fields);
 
     match &mut *sink().lock().unwrap() {
         Sink::Stderr => {

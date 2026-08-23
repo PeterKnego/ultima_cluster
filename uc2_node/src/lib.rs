@@ -29,6 +29,7 @@
 //! §3.2 / §6; plan `docs/superpowers/plans/2026-07-11-uc2-m4-elections.md`
 //! Task 8.
 
+pub mod audit;
 pub mod backup;
 pub mod config_file;
 pub mod ipc;
@@ -44,7 +45,8 @@ pub use config_file::load_from_path;
 pub use ipc::{InstanceDir, IpcError};
 pub use node::{
     DEFAULT_JOURNAL_SEGMENT_BYTES, DrainOutcome, Node, NodeConfig, PurgePolicy,
-    REASON_AUTH_BAD_TAG, REASON_AUTH_EXPIRED, REASON_AUTH_MISSING, REASON_AUTH_UNKNOWN_KEY,
+    REASON_AUDIT_FAILED, REASON_AUTH_BAD_TAG, REASON_AUTH_EXPIRED, REASON_AUTH_MISSING,
+    REASON_AUTH_UNKNOWN_KEY,
     StartOpts, SubmitError,
 };
 /// M12b: admin-request authentication, re-exported so a deployment that only

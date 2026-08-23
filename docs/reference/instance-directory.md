@@ -20,6 +20,7 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | `svc_query.ring` | node → service | Forwarded queries. |
 | `egress_service.broadcast` | node → service | Apply and output stream to the service. |
 | `egress_node.broadcast` | node → clients | Submit responses broadcast to clients. |
+| `audit.jsonl` | node | Append-only record of every admin request this node answered, one JSON line each, fsynced before the answer is published. Never rotated or truncated by the node. See [Change cluster membership](../how-to/change-cluster-membership.md). |
 
 Every IPC file lives directly under the instance directory. There is no
 `/dev/shm` discovery directory.
@@ -29,7 +30,18 @@ Every IPC file lives directly under the instance directory. There is no
 | Class | Paths | Requirement |
 |---|---|---|
 | Durable | `journal/`, `state/`, `snapshots/` | Must survive power loss. |
+| Durable, node-local | `audit.jsonl` | Must survive power loss; **not** replicated and not part of a backup's consistency story — each node records only what it itself answered. |
 | Volatile-safe | `cnc2.dat`, `log.buf`, all `*.ring` and `*.broadcast` files | Rebuilt or re-primed on boot. |
+
+`audit.jsonl` is opened `O_APPEND` at node start (a node that cannot open it
+refuses to start) and every record is `fsync`ed **before** the answer it
+describes is published, so an answer that reached an operator is always on
+disk here. There is no rotation: admin operations are operator-rate — tens a
+year on a busy cluster, ~200 bytes each — so the file does not grow without
+an operator's own actions. Truncating or archiving it is a deliberate,
+offline decision; the node never does it. The `fsync` is paid on the
+consensus thread, once per admin request, and nothing on the duty-cycle hot
+path touches the file.
 
 `state/` holds the vote and term map. It must never be discarded or reset
 while the node retains its id.

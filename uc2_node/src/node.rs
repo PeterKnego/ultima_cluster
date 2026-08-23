@@ -42,6 +42,7 @@ use uc_protocol::v2::ipc::{
     extra_client,
 };
 
+use crate::audit::{AuditLog, AuditOrigin, AuditOutcome, AuditRecord, op_name};
 use crate::ipc::InstanceDir;
 use crate::read_round::ProbeRound;
 use uc2_log::buffer::FrameRead;
@@ -328,6 +329,19 @@ pub const REASON_AUTH_EXPIRED: u32 = 22;
 /// The auth line's `key_name_hash` matches no key this node loaded — a
 /// revoked key, a key this node has not been given, or a typo'd key name.
 pub const REASON_AUTH_UNKNOWN_KEY: u32 = 23;
+/// M12b §5.3: the admin audit record for this request could not be written
+/// to `<instance_dir>/audit.jsonl` (a full or failing disk). Recording
+/// precedes responding, so a node that cannot record refuses rather than
+/// acting unaccountably. Unlike 20-23 this one is policy-independent — it can
+/// occur under `Filesystem` too.
+///
+/// **It does not mean "nothing happened."** On the leader's accepted path the
+/// config change has already been proposed and appended by the time the
+/// record is attempted, so 24 means "this node cannot account for the
+/// outcome" — check `uc2ctl status` for the live config version rather than
+/// assuming the change was rejected. The node also logs `admin_audit_failed`
+/// at `error` with the underlying io error.
+pub const REASON_AUDIT_FAILED: u32 = 24;
 
 /// Phase of an in-flight linearizable read (the ReadIndex barrier state
 /// machine, spec §7 / v1 task14).
@@ -516,6 +530,21 @@ impl Node {
         })?;
 
         let instance = InstanceDir::acquire(&cfg.instance_dir).map_err(to_io)?;
+
+        // M12b (spec §5.3): the admin audit file, opened for append BEFORE
+        // any agent runs — a node that cannot record what it was told to do
+        // does not start. Placed after the flock so the file belongs to the
+        // instance directory this node actually owns.
+        let audit = AuditLog::open(&instance.root).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "node {} refuses to start: cannot open the admin audit log {} ({e})",
+                    cfg.id,
+                    instance.root.join(crate::audit::AUDIT_FILE).display()
+                ),
+            )
+        })?;
 
         // Three clones of the one node socket: the receiver recvs (and sends
         // follower-role control), the sender streams, the consensus agent sends
@@ -1231,6 +1260,7 @@ impl Node {
             last_flags: 0,
             config_bytes: Arc::clone(&config_bytes),
             admin,
+            audit,
             last_admin_seq: 0,
             pending_admin_fwd: None,
             last_config_reply: None,
@@ -1569,6 +1599,59 @@ impl Node {
 
 // ------------------------------------------------------------- consensus agent
 
+/// M7: one in-flight admin request this (follower) node forwarded to the
+/// leader as a `ConfigProposal`, kept so the leader's kind-17 reply can be
+/// matched back to the response line that is waiting for it.
+///
+/// M12b carries the *whole* request rather than just `(seq, nonce)`: the
+/// audit record written when the answer is finally published names the op,
+/// the target and the operator (`actor`, verified on THIS node before the
+/// forward), none of which the reply datagram carries back.
+/// M12b: the actor recorded for a request that failed authentication — it
+/// is precisely the case where no key name was proven, so naming a key (or
+/// `"filesystem"`, which would claim the request was trusted on directory
+/// permissions) would be a lie. Only ever appears on a record whose outcome
+/// is `refused` with reason 20-23.
+const ACTOR_UNVERIFIED: &str = "unverified";
+
+/// M12b: the identifying fields of the admin request an audit record is
+/// about, gathered so the audit call sites all read the same way whether the
+/// request came off the cnc band, out of the pending-forward slot, or off the
+/// wire as a peer's proposal.
+#[derive(Debug, Clone, Copy)]
+struct AuditedReq {
+    op: u32,
+    id: u32,
+    ip: u32,
+    port: u16,
+    seq: u64,
+    nonce: u64,
+}
+
+impl From<&AdminReq> for AuditedReq {
+    fn from(r: &AdminReq) -> AuditedReq {
+        AuditedReq { op: r.op, id: r.id, ip: r.ip, port: r.port, seq: r.seq, nonce: r.nonce }
+    }
+}
+
+impl From<&PendingAdminFwd> for AuditedReq {
+    fn from(p: &PendingAdminFwd) -> AuditedReq {
+        AuditedReq { op: p.op, id: p.id, ip: p.ip, port: p.port, seq: p.seq, nonce: p.nonce }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingAdminFwd {
+    seq: u64,
+    nonce: u64,
+    /// The verified admin key name, or `None` under `AdminPolicy::Filesystem`.
+    actor: Option<String>,
+    op: u32,
+    id: u32,
+    ip: u32,
+    port: u16,
+}
+
 struct Consensus {
     id: NodeId,
     /// Mirror of `ElectionSm::reports_unattested` for `Node::reports_unattested`.
@@ -1766,13 +1849,20 @@ struct Consensus {
     /// TTL). Read ONLY inside `verify_admin`, i.e. only when an admin request
     /// actually arrived: nothing on the duty-cycle hot path touches it.
     admin: AdminPolicy,
+    /// M12b (spec §5.3): the append-only admin audit file, opened at node
+    /// start and written by this agent alone. Every answer this node gives to
+    /// an admin request is recorded here — with an fsync — BEFORE the answer
+    /// is published; a record that fails to write turns the request into a
+    /// [`REASON_AUDIT_FAILED`] refusal. Off every hot path: touched only when
+    /// an admin request or a forwarded proposal actually arrives.
+    audit: AuditLog,
     /// M7 Task 7: the last admin-request seq consumed off the cnc admin-req
     /// slot (`do_work` step 11's seqlock cursor into `read_admin_req`). `0` at
     /// boot — matches the freshly-zeroed cnc page (recreated every node boot),
     /// so an admin request from a prior life is never replayed.
     last_admin_seq: u64,
     /// M7 Task 7: this (follower) node's own in-flight forwarded proposal —
-    /// `(seq, nonce)` of the admin request we forwarded to the leader as a
+    /// the admin request we forwarded to the leader as a
     /// kind-16 `ConfigProposal`. A 1-slot pending map (one admin request in
     /// flight at a time, per the cnc admin band's own single-slot discipline):
     /// cleared once the matching-nonce `NetEvent::ConfigReply` (kind 17)
@@ -1783,7 +1873,7 @@ struct Consensus {
     /// request, `None` under `AdminPolicy::Filesystem`) alongside
     /// `(seq, nonce)`, so the audit record Task 4 writes when the leader's
     /// reply lands names the operator who asked, not just the change.
-    pending_admin_fwd: Option<(u64, u64, Option<String>)>,
+    pending_admin_fwd: Option<PendingAdminFwd>,
     /// M7 Task 7: leader-side nonce dedup — the last forwarded proposal's
     /// `(nonce, reply)` this node (as leader) answered. A repeat nonce (the
     /// follower's forward retried, or a genuine wire retry) gets the STORED
@@ -3515,9 +3605,9 @@ impl Consensus {
 
     /// M7 Task 7: `do_work` step 11's admin-slot dispatcher. Leader: propose +
     /// append locally and answer the response line directly. Follower: forward
-    /// to whoever the leader hint names (kind 16), remembering `(seq, nonce)`
-    /// so the eventual `NetEvent::ConfigReply` (kind 17) can be matched back to
-    /// this response line; no hint (or the hint resolves to no known address,
+    /// to whoever the leader hint names (kind 16), remembering the request in
+    /// `pending_admin_fwd` so the eventual `NetEvent::ConfigReply` (kind 17)
+    /// can be matched back to this response line (and audited); no hint (or the hint resolves to no known address,
     /// e.g. mid-election) -> reply `status=2` (retry) immediately — side-effect-
     /// free, `uc2ctl` just polls again.
     fn handle_admin(&mut self, req: AdminReq) {
@@ -3526,19 +3616,42 @@ impl Consensus {
         // request ever reaches `propose_config`. Under the default
         // `AdminPolicy::Filesystem` this is a match arm returning `Ok(None)`:
         // byte-for-byte the pre-M12b path.
+        let audited = AuditedReq::from(&req);
         let actor = match self.verify_admin(&req) {
             Ok(actor) => actor,
             Err(reason) => {
-                // Task 4: audit here
-                self.write_admin_reply(req.seq, 1, reason, self.cnc.config_version());
+                // M12b: record the refusal BEFORE publishing it. The actor is
+                // unknown by construction — this branch is only reachable
+                // under `Hmac`, and it is exactly the case where the request
+                // did not prove who it was.
+                let version = self.cnc.config_version();
+                let (status, reason) = self.audit_admin(
+                    Some(ACTOR_UNVERIFIED),
+                    AuditOrigin::Local,
+                    audited,
+                    1,
+                    reason,
+                    version,
+                );
+                self.write_admin_reply(req.seq, status, reason, version);
                 return;
             }
         };
         if matches!(self.sm.role(), Role::Leader) {
             let (status, reason, version) = self.propose_and_append(req.op, req.id, req.ip, req.port);
-            // Task 4: audit here — `actor` names the operator key that signed
-            // this request (`None` under `AdminPolicy::Filesystem`).
-            let _actor = actor;
+            // Record before responding. On the accepted path the change is
+            // already appended by now (see `crate::audit`'s module doc: the
+            // record precedes the commit, and "accepted" means proposed and
+            // appended) — what must not happen is an ANSWER that is not on
+            // disk here, and that is what this ordering buys.
+            let (status, reason) = self.audit_admin(
+                actor.as_deref(),
+                AuditOrigin::Local,
+                audited,
+                status,
+                reason,
+                version,
+            );
             self.write_admin_reply(req.seq, status, reason, version);
             return;
         }
@@ -3547,20 +3660,38 @@ impl Consensus {
             .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
             .flatten();
         let Some(leader_addr) = leader_addr else {
-            // Task 4: audit here
-            self.write_admin_reply(req.seq, 2, 0, self.cnc.config_version());
+            let version = self.cnc.config_version();
+            let (status, reason) =
+                self.audit_admin(actor.as_deref(), AuditOrigin::Local, audited, 2, 0, version);
+            self.write_admin_reply(req.seq, status, reason, version);
             return;
         };
         // T7 review finding 2: a still-outstanding forward would otherwise be
         // silently overwritten, leaving its caller with a bare timeout and no
         // answer at all. Answer the superseded request with status=2 (retry)
         // before replacing the pending slot.
-        if let Some((old_seq, _old_nonce, _old_actor)) = self.pending_admin_fwd.take() {
+        if let Some(old) = self.pending_admin_fwd.take() {
             eprintln!("uc2_node: admin forward superseded by newer request");
-            // Task 4: audit here
-            self.write_admin_reply(old_seq, 2, 0, self.cnc.config_version());
+            let version = self.cnc.config_version();
+            let (status, reason) = self.audit_admin(
+                old.actor.as_deref(),
+                AuditOrigin::Local,
+                AuditedReq::from(&old),
+                2,
+                0,
+                version,
+            );
+            self.write_admin_reply(old.seq, status, reason, version);
         }
-        self.pending_admin_fwd = Some((req.seq, req.nonce, actor));
+        self.pending_admin_fwd = Some(PendingAdminFwd {
+            seq: req.seq,
+            nonce: req.nonce,
+            actor,
+            op: req.op,
+            id: req.id,
+            ip: req.ip,
+            port: req.port,
+        });
         let body = ConfigProposalBody { nonce: req.nonce, op: req.op, id: req.id, ip: req.ip, port: req.port };
         let mut buf = [0u8; CONFIG_PROPOSAL_BODY_LEN];
         write_config_proposal_body(&mut buf, &body);
@@ -3676,16 +3807,54 @@ impl Consensus {
         if !matches!(self.sm.role(), Role::Leader) {
             return;
         }
+        // M12b: the forwarding peer authenticated the operator locally before
+        // it forwarded; what the leader can attest to is WHICH PEER asked, so
+        // that is the actor it records. `seq` is 0 in these records — the
+        // requesting node's admin-band sequence is local to it and the wire
+        // proposal does not carry it; `nonce` is the join key between the two
+        // nodes' records.
+        let actor = self.peer_actor(from);
+        let audited = AuditedReq {
+            op: body.op,
+            id: body.id,
+            ip: body.ip,
+            port: body.port,
+            seq: 0,
+            nonce: body.nonce,
+        };
         if let Some((nonce, reply)) = &self.last_config_reply
             && *nonce == body.nonce
         {
             let reply = *reply;
+            // A re-sent answer is a second answer: record it too, so the file
+            // accounts for every reply this node put on the wire.
+            let (status, reason) = self.audit_admin(
+                Some(&actor),
+                AuditOrigin::Forwarded,
+                audited,
+                reply.status,
+                reply.reason,
+                reply.version,
+            );
+            let reply = ConfigReplyBody { nonce: body.nonce, status, reason, version: reply.version };
             self.send_config_reply(from, &reply);
             return;
         }
         let (status, reason, version) = self.propose_and_append(body.op, body.id, body.ip, body.port);
+        // The dedup cache keeps the REAL answer, never an audit-failure one:
+        // a later retry of the same nonce must be able to re-learn what
+        // actually happened once the disk recovers.
         let reply = ConfigReplyBody { nonce: body.nonce, status, reason, version };
         self.last_config_reply = Some((body.nonce, reply));
+        let (status, reason) = self.audit_admin(
+            Some(&actor),
+            AuditOrigin::Forwarded,
+            audited,
+            status,
+            reason,
+            version,
+        );
+        let reply = ConfigReplyBody { nonce: body.nonce, status, reason, version };
         self.send_config_reply(from, &reply);
     }
 
@@ -3701,15 +3870,101 @@ impl Consensus {
     /// reply for any other nonce (stale, or a race with a since-superseded
     /// forward) is dropped rather than misattributed to the wrong response line.
     fn on_config_reply(&mut self, body: ConfigReplyBody) {
-        let Some((seq, nonce, _)) = &self.pending_admin_fwd else { return };
-        let (seq, nonce) = (*seq, *nonce);
-        if nonce != body.nonce {
+        let Some(pending) = &self.pending_admin_fwd else { return };
+        if pending.nonce != body.nonce {
             return;
         }
-        // Task 4: audit here — the actor carried across the forward, so the
-        // leader's answer is audited under the operator who asked for it.
-        let _actor = self.pending_admin_fwd.take().and_then(|(_, _, actor)| actor);
-        self.write_admin_reply(seq, body.status, body.reason, body.version);
+        // M12b: the actor rode across the forward, so this node's own record
+        // of the final answer names the operator who asked for it — `origin`
+        // is `local` (the request came in on THIS node's admin band); the
+        // leader wrote its own `forwarded` record under the same nonce.
+        let pending = self.pending_admin_fwd.take().expect("checked just above");
+        let (status, reason) = self.audit_admin(
+            pending.actor.as_deref(),
+            AuditOrigin::Local,
+            AuditedReq::from(&pending),
+            body.status,
+            body.reason,
+            body.version,
+        );
+        self.write_admin_reply(pending.seq, status, reason, body.version);
+    }
+
+    /// M12b: the actor a leader records for a peer-forwarded proposal. The
+    /// leader cannot re-check the operator's signature (the canonical message
+    /// is bound to the requesting node's own cnc band), so what it attests to
+    /// is the peer that vouched for it: `peer:<id>` when the source address
+    /// resolves to a member, `peer:<addr>` when it does not (a datagram from
+    /// outside the current config — recorded rather than dropped silently).
+    fn peer_actor(&self, from: SocketAddr) -> String {
+        match self.addr_to_id.get(&from) {
+            Some(id) => format!("peer:{id}"),
+            None => format!("peer:{from}"),
+        }
+    }
+
+    /// M12b (spec §5.3): record one admin decision, then hand back the
+    /// `(status, reason)` the caller must actually publish.
+    ///
+    /// **Record before respond.** Every site that answers an admin request —
+    /// the cnc response line and the kind-17 config reply alike — goes
+    /// through here first. If the record cannot be written, the answer
+    /// becomes `(1, REASON_AUDIT_FAILED)`: a node that cannot say what it did
+    /// refuses rather than acting unaccountably. On the leader's accepted
+    /// path the config change has already been appended when that happens, so
+    /// reason 24 means "the outcome is unrecorded, go look at `uc2ctl
+    /// status`", not "nothing happened" — which is why it is a loud `error`
+    /// event as well as a wire code.
+    ///
+    /// Cost: one `write` + one `sync_data` per admin request, on the
+    /// consensus thread. Admin requests are operator-rate (`read_admin_req`
+    /// only returns `Some` when a client actually wrote one), so the duty
+    /// cycle's steady state never touches this.
+    fn audit_admin(
+        &mut self,
+        actor: Option<&str>,
+        origin: AuditOrigin,
+        req: AuditedReq,
+        status: u32,
+        reason: u32,
+        version: u64,
+    ) -> (u32, u32) {
+        let rec = AuditRecord {
+            ts_ns: crate::obs::metrics::now_unix_ns(),
+            // `None` is exactly `AdminPolicy::Filesystem`: nothing was
+            // authenticated, the instance directory's permissions were the
+            // whole boundary, and the record says so.
+            actor: actor.unwrap_or("filesystem"),
+            origin,
+            op: req.op,
+            op_name: op_name(req.op),
+            id: req.id,
+            // Only `AddLearner` carries an address; the id-only ops leave the
+            // pair zeroed, which records as `null` rather than `0.0.0.0:0`.
+            addr: (req.ip != 0 || req.port != 0).then_some((req.ip, req.port)),
+            seq: req.seq,
+            nonce: req.nonce,
+            outcome: AuditOutcome::from_wire(status, reason),
+            reason,
+            config_version: version,
+        };
+        match self.audit.record(&rec) {
+            Ok(()) => (status, reason),
+            Err(e) => {
+                let err = e.to_string();
+                crate::obs_event!(
+                    Error,
+                    "admin_audit_failed",
+                    node = self.id as u64,
+                    seq = req.seq,
+                    nonce = req.nonce,
+                    op = req.op as u64,
+                    status = status as u64,
+                    err = err.as_str(),
+                );
+                (1, REASON_AUDIT_FAILED)
+            }
+        }
     }
 
     /// Write the admin response line (fields-then-seq/release; the T1 accessor
@@ -3728,9 +3983,19 @@ impl Consensus {
     /// leaving the caller to hang for the full timeout with no answer at all.
     fn invalidate_admin_caches(&mut self) {
         self.last_config_reply = None;
-        if let Some((seq, _nonce, _actor)) = self.pending_admin_fwd.take() {
-            // Task 4: audit here
-            self.write_admin_reply(seq, 2, 0, self.cnc.config_version());
+        if let Some(pending) = self.pending_admin_fwd.take() {
+            // M12b: this is an ANSWER (a retry), so it is recorded like any
+            // other — the operator's request ended here, in this node's life.
+            let version = self.cnc.config_version();
+            let (status, reason) = self.audit_admin(
+                pending.actor.as_deref(),
+                AuditOrigin::Local,
+                AuditedReq::from(&pending),
+                2,
+                0,
+                version,
+            );
+            self.write_admin_reply(pending.seq, status, reason, version);
         }
     }
 
@@ -5363,6 +5628,7 @@ mod tests {
             last_flags: 0,
             config_bytes: Arc::new(Mutex::new(Vec::new())),
             admin: AdminPolicy::Filesystem,
+            audit: AuditLog::open(dir.path()).unwrap(),
             last_admin_seq: 0,
             pending_admin_fwd: None,
             last_config_reply: None,
@@ -5458,7 +5724,15 @@ mod tests {
         let mut h = harness();
         h.cons.last_config_reply =
             Some((42, ConfigReplyBody { nonce: 42, status: 0, reason: 0, version: 5 }));
-        h.cons.pending_admin_fwd = Some((99, 42, None));
+        h.cons.pending_admin_fwd = Some(PendingAdminFwd {
+            seq: 99,
+            nonce: 42,
+            actor: None,
+            op: 1,
+            id: 7,
+            ip: 0,
+            port: 0,
+        });
 
         // Adopt a higher term as a follower -> Action::BecomeFollower.
         h.cons.feed(Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
