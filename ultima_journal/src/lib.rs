@@ -2,6 +2,10 @@
 // Copyright 2026 Peter Knego
 
 //! `ultima_journal` — segmented append journal + StableValue primitive.
+//!
+//! **Semver:** see `docs/reference/semver-policy.md`. Promised surface: **none** —
+//! this crate is published so the workspace can be, not offered as a
+//! general-purpose journal, and its API may change in any release.
 
 #[cfg(feature = "bench-support")]
 #[doc(hidden)]

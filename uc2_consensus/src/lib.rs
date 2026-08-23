@@ -14,6 +14,10 @@
 //! The kernels here — `CommitTracker`, `reconcile`, and vote freshness — are
 //! the ones carrying machine-checked proofs, replayed against their Lean model
 //! vector-by-vector by the conformance rig. See `docs/VERIFICATION.md`.
+//!
+//! **Semver:** see `docs/reference/semver-policy.md`. Promised surface: **none** —
+//! this is an internal safety core, public so the node, the simulator and
+//! the conformance rig can drive it; it may change in any release.
 
 pub mod commit;
 pub mod config;

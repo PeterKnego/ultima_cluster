@@ -58,6 +58,11 @@
 //! ```text
 //! cargo run -p uc2ctl -- status --instance-dir D --app-id A
 //! ```
+//!
+//! **Semver:** see `docs/reference/semver-policy.md`. Promised surface: this
+//! binary's verbs and its exit codes (`0` accepted, `1` refused, `2`
+//! retry) — see `docs/reference/uc2ctl.md`. Nothing in this crate is a
+//! Rust API; it publishes a binary, not a library.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;

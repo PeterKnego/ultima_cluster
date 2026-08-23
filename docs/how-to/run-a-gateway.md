@@ -29,6 +29,11 @@ node B doesn't recognize gets stuck. See
 
 ## Start it
 
+The release tarball ships `uc2-gateway` alongside `uc2-node` and `uc2ctl`, plus
+`counter-remote` — a worked remote client to point at it — so installing the
+binaries is the same step as
+[for a node](run-a-cluster.md#install-the-binaries-on-each-host).
+
 ```bash
 uc2-gateway --config /etc/uc2/gateway.toml
 ```

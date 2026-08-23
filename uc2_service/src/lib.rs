@@ -24,6 +24,11 @@
 //!
 //! Spec: `docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md`
 //! §7; plan `docs/superpowers/plans/2026-07-11-uc2-m5-sdk.md` Task 8.
+//!
+//! **Semver:** see `docs/reference/semver-policy.md`. Promised surface:
+//! [`RawStateMachine`], [`StateMachine`], [`SnapshotStateMachine`],
+//! [`OutputHandler`]/[`RawOutputHandler`], and
+//! [`Sessioned`]/[`SessionConfig`].
 
 mod apply;
 mod attach;

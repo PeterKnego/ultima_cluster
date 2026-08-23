@@ -11,6 +11,10 @@
 //! `fdatasync` per block; that is the only fsync site in the system.
 //!
 //! Spec: `docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md` §4.
+//!
+//! **Semver:** see `docs/reference/semver-policy.md`. Promised surface: **none** —
+//! every module here is public for the workspace's own use and may change
+//! in any release.
 
 pub mod agent;
 /// Re-export: `ArchiveConfig::durability`'s type, so archive callers can

@@ -32,6 +32,10 @@
 //! - `rotation` (T8): key-epoch rotation.
 //! - `transport` (T9): the facade — scope-by-kind, config, boot refusal,
 //!   the single `seal`/`open` entry point `uc2_net` (T10/T11) calls.
+//!
+//! **Semver:** see `docs/reference/semver-policy.md`. Promised surface: **none** —
+//! every module here is public for the workspace's own use and may change
+//! in any release.
 
 pub mod admin;
 pub mod group;

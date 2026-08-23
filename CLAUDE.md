@@ -159,6 +159,39 @@ only paired with `[crypto].enabled = true`. See the spec's §5 "As built"
 amendment for the full reason-code table (20–24) and every other as-built
 correction.
 
+**M12c (packaging, publishing, hygiene) is merged on `uc2/m12c-packaging`
+(gate doc rows 5/6/7 + added rows 11–13)**: lockstep `2.6.0` across
+`[workspace.package]`, the tag, the tarballs, the image and **12 publishable
+crates** (`ultima-journal`, `uc_protocol`, `uc2_crypto`, `uc2_log`,
+`uc2_consensus`, `uc2_net`, `uc2_client`, `uc2_node`, `uc2_service`,
+`uc2_remote`, `uc2_gateway`, `uc2ctl`); `uc2_sim`, `uc-lincheck` and the
+example crates are `publish = false`. **MSRV `1.89`** (real floor:
+`std::fs::File::try_lock_exclusive`) with `rust-toolchain.toml` pinned to
+1.96.0 and an `msrv` CI job running clippy on the floor; `deny.toml` + two
+`cargo-deny` passes (one documented ignore: RUSTSEC-2025-0141, `bincode`
+unmaintained, no patched version exists); `publish-check` CI job
+(`check_publish_metadata.sh` + `cargo package` for all 12 in ONE invocation
++ `cargo publish --dry-run` for the 4 dependency-free leaves only — a
+non-leaf dry run cannot resolve path deps that are not on crates.io yet).
+`.github/workflows/release.yml` builds native x86_64 + aarch64 tarballs,
+`SHA256SUMS`, a per-crate CycloneDX SBOM archive and a signed multi-arch
+`ghcr.io/peterknego/uc2` image, all cosign-keyless and all gated on
+`release-smoke` (the tarball's own `packaging/quickstart-local.sh` in a bare
+`ubuntu:24.04`, then the compose stack driven through a gateway by the new
+`counter-remote` example bin). **Docker/compose/ghcr/cosign-OIDC were never
+run locally — CI-only until the first `v2.6.0-rc.1` tag, which the user
+pushes as a deliberate step; aarch64 binaries are built but never executed
+in CI.** The publish itself is manual and ordered —
+`docs/how-to/cut-a-release.md` §6 has the sequence; the semver promise (what
+is API, what is not, why the wire protocol and cnc page are flag-day
+instead) is `docs/reference/semver-policy.md`. **`cargo fmt` is DEFERRED**
+per the spec's own condition: two long-lived worktrees are open
+(`fix/remaining-flakes`, `worktree-uc2-multi-service`) and a one-shot
+reformat measures ~2 731 hunks — re-run `cargo fmt --all` as a single
+mechanical commit and add `--check` to `ci.yml` once neither branch is
+outstanding. The `RELEASES.md`/`docs/releases.md` writeup covers all four
+sub-milestones and lands with the `v2.6.0` tag, not here.
+
 **The v1 stack (an `openraft`-based design) has been retired** and its crates
 deleted — v2 owns consensus, elections, and transport directly. Do not
 reintroduce `openraft`, `quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client`

@@ -28,6 +28,11 @@
 //! Spec: `docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md`
 //! §3.2 / §6; plan `docs/superpowers/plans/2026-07-11-uc2-m4-elections.md`
 //! Task 8.
+//!
+//! **Semver:** see `docs/reference/semver-policy.md`. Promised surface:
+//! [`NodeConfig`] and [`Node::start`]/[`Node::start_with`], plus the
+//! `node.toml` file `NodeConfig` mirrors. The other modules (`audit`,
+//! `backup`, `ipc`, `obs`, `preflight`, `recovery`) are internal.
 
 pub mod audit;
 pub mod backup;

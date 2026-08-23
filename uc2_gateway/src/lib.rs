@@ -36,6 +36,10 @@
 //! ```
 //!
 //! Spec: `docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md` §4.3.
+//!
+//! **Semver:** see `docs/reference/semver-policy.md`. Promised surface: the
+//! `gateway.toml` file and the [`EdgeConfig`]/[`Member`] types that mirror
+//! it. [`Edge`] itself is a reference implementation, not a stable API.
 
 mod config;
 pub mod config_file;

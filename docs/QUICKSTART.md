@@ -1,51 +1,277 @@
 # Quickstart
 
-From nothing to a running replicated cluster. Every command and every output
-below is real — copied from an actual run, not written from memory.
+From a download to a real three-node cluster, in two commands and about a
+minute. No Rust toolchain, no broker, no ZooKeeper, no container runtime.
 
-You need a Rust toolchain (the repo pins one in `rust-toolchain.toml`) and Linux
-or macOS. Nothing else — no broker, no ZooKeeper, no container.
+Every command and every output below is real — copied from an actual run, not
+written from memory.
+
+You need Linux (x86-64 or aarch64), `bash`, coreutils, and a directory on a
+real disk. That is the whole list.
 
 ---
 
-## 1. The whole thing in one command
+## 1. Download it, and verify it
+
+Releases live at
+[github.com/PeterKnego/ultima_cluster/releases](https://github.com/PeterKnego/ultima_cluster/releases).
+Pick your architecture and take the tarball, its checksum, `SHA256SUMS`, and
+the signature bundle:
 
 ```bash
-cargo run -p counter --bin counter-single
+VER=2.6.0
+TARGET=x86_64-unknown-linux-gnu        # or aarch64-unknown-linux-gnu
+BASE=https://github.com/PeterKnego/ultima_cluster/releases/download/v$VER
+
+curl -fLO $BASE/uc2-$VER-$TARGET.tar.gz
+curl -fLO $BASE/uc2-$VER-$TARGET.tar.gz.sha256
+curl -fLO $BASE/uc2-$VER-$TARGET.tar.gz.sigstore.json
+curl -fLO $BASE/SHA256SUMS
+```
+
+The cheap check, which catches a truncated download but not a hostile one:
+
+```bash
+sha256sum -c uc2-$VER-$TARGET.tar.gz.sha256
+```
+
+The real check. Every release file is signed **keylessly** by the GitHub
+Actions workflow that built it — there is no long-lived private key anywhere,
+and what you are verifying is *which workflow, in which repository, on what
+kind of ref* produced the file:
+
+```bash
+cosign verify-blob \
+  --bundle uc2-$VER-$TARGET.tar.gz.sigstore.json \
+  --certificate-identity-regexp \
+    'https://github.com/PeterKnego/ultima_cluster/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  uc2-$VER-$TARGET.tar.gz
+```
+
+The two `--certificate-*` flags are the whole point. Without them a signature
+proves only that *somebody* held a sigstore certificate, which is not a claim
+worth checking. `cosign verify-blob` without an identity pin is not
+verification.
+
+`SHA256SUMS` covers every artifact of the release and is signed the same way
+(`SHA256SUMS.sigstore.json`), so verifying it once and then
+`sha256sum -c SHA256SUMS --ignore-missing` is the equivalent path if you are
+fetching several files.
+
+> **Release candidates.** Tags with a suffix — `v2.6.0-rc.1` — are real,
+> fully signed releases marked **prerelease** on GitHub, and they never take
+> over the "Latest release" pointer. They exist so the publishing path itself
+> gets exercised before the version everyone downloads. Use the unsuffixed
+> tag unless you are deliberately testing one.
+
+Then unpack:
+
+```bash
+tar xzf uc2-$VER-$TARGET.tar.gz
+cd uc2-$VER-$TARGET
+```
+
+You now have `bin/` (five binaries), `packaging/` (example configs, the
+quickstart script, systemd units, Prometheus rules, a Grafana dashboard, a
+`Dockerfile` and a `compose.yml`), `LICENSE`, and `README-release.md`.
+
+## 2. Run the quickstart
+
+```bash
+packaging/quickstart-local.sh
 ```
 
 ```text
-instance dir: /tmp/.tmpkLWLAJ
-node is leader and serving
+ultima_cluster quickstart
+   binaries: /home/you/uc2-2.6.0-x86_64-unknown-linux-gnu/bin
+   root:     /home/you/uc2-quickstart
 
-Add(  1) -> value   1  @ log position 32
-Add(  2) -> value   3  @ log position 96
-Add(  3) -> value   6  @ log position 160
-Add( 10) -> value  16  @ log position 224
-Add( -6) -> value  10  @ log position 288
+1. writing configuration
+   3 node.toml + 3 gateway.toml under /home/you/uc2-quickstart
+2. starting three nodes
+   started node0 (pid 2213586)
+   started node1 (pid 2213587)
+   started node2 (pid 2213588)
+   waiting for a serving leader (up to 30s)
+   node 0 is the serving leader
+3. attaching a counter-service to each node
+   started service0 (pid 2213627)
+   started service1 (pid 2213628)
+   started service2 (pid 2213629)
+4. starting a gateway in front of each node
+   started gateway0 (pid 2213630)
+   started gateway1 (pid 2213631)
+   started gateway2 (pid 2213632)
+   waiting for the gateways to accept (up to 30s)
+   listening on 127.0.0.1:9200,127.0.0.1:9201,127.0.0.1:9202
+5. driving the cluster from outside, through the gateways
+   reset            -> value=0 position=32 replayed=false
+   add 5            -> value=5 position=96 replayed=false
+   add 5            -> value=10 position=160 replayed=false
+   get              -> value=10
 
-linearizable read -> 10
-snapshot read     -> 10
-
-Reset      -> value   0  @ log position 352
-
-Everything above went through consensus and was fsync'd before it was acked.
+PASS
 ```
 
-That is a real single-node cluster — same consensus code, same log, same
-durability. It elects itself, appends the NewTerm frame that Raft §5.4.2
-requires, commits as soon as its own fsync lands, and serves.
+Exit `0` is `PASS`, `1` is a named failure with the last twenty lines of every
+log, `3` is a precondition it refused to run past (a missing binary, a port
+already in use, a root on a RAM-backed filesystem).
 
-Two things worth noticing:
+Useful flags:
 
-- **The positions are byte offsets, not indices.** They step by 64 because that
-  is how large each frame is. There is no "entry 3" in this system; there is
-  "the frame at byte 160." See [ARCHITECTURE.md](/docs/ARCHITECTURE.md#positions-not-indices).
-- **The node, the service, and the client are all in this one process.** That is
-  a configuration choice, not a special mode — they coordinate through counters
-  in shared memory whether they share a process or not.
+| Flag | Effect |
+|---|---|
+| `--bin-dir DIR` | where the five binaries are. Defaults to the `bin` sibling of the script — i.e. the tarball layout — or `$UC2_BIN_DIR`. |
+| `--root DIR` | where cluster state goes. Default `$HOME/uc2-quickstart`. Every run starts a **fresh** cluster: `n0`/`n1`/`n2` under it are deleted first, but only if the script created that root (it leaves a marker file), so pointing it at a real instance directory is refused, not obeyed. A root under `/tmp` or `/dev/shm` is refused outright — those are usually RAM-backed, every `fsync` there is a silent no-op, and a node will not start on one. |
+| `--secs N` | hold the cluster up N more seconds after the demo. Default 0. |
+| `--keep` | leave it running and print the PIDs. Without this, everything the script started is killed on exit — including on failure and on `Ctrl-C`. |
+| `--full` | accepted and ignored; three gateways is the only mode. |
 
-## 2. The state machine you just ran
+Everything it wrote is under `--root`: `n0/`, `n1/`, `n2/` (the instance
+directories), `gw0.toml`–`gw2.toml`, `admin.key`, and `logs/` with one file
+per process it started. Budget about 250 MiB — each node **reserves** its log
+buffer and IPC rings up front (~78 MiB), so a full disk is a named startup
+refusal rather than a `SIGBUS` later.
+
+To poke at it yourself:
+
+```bash
+packaging/quickstart-local.sh --keep
+bin/counter-remote --gateways 127.0.0.1:9200,127.0.0.1:9201,127.0.0.1:9202 \
+  --app-id quickstart add 7
+```
+
+```text
+value=17 position=224 replayed=false
+```
+
+## 3. What just happened
+
+Twelve processes, in four roles:
+
+- **Three `uc2-node` daemons** — consensus, replication, durability. They
+  elected a leader among themselves (node 0 here; which one wins is genuinely
+  arbitrary, since each has a differently-seeded randomized election timeout).
+- **Three `counter-service` processes**, one attached to each node over shared
+  memory. This is where *your* state machine runs, in its own process. Every
+  replica runs its own copy and applies the same commands in the same order.
+- **Three `uc2-gateway` processes**, one per node — a TCP front door for
+  clients that cannot attach to shared memory. One per node is what makes
+  redirection work: a client that dials a follower's gateway is told where the
+  leader is.
+- **One `counter-remote`**, the client, driving the whole thing from outside
+  over plain TCP.
+
+Ask a node what it thinks:
+
+```bash
+bin/uc2ctl status --instance-dir ~/uc2-quickstart/n0 --app-id quickstart
+```
+
+```text
+config: version=0 pending=false
+role: leader=true can_serve=true term=1 leader_hint=0
+log: commit=224 durable=224 append=224
+members:
+  id=1 role=voter reported_durable=224
+  id=2 role=voter reported_durable=224
+```
+
+`commit`, `durable` and `append` are **byte positions**, not entry indices —
+the absolute offset of a place in the log stream. There is no "entry 3" in
+this system; there is "the frame at byte 160", which is why the writes above
+report `position=96`, `position=160`. That is what lets replication be a
+byte-stream fan-out. See
+[ARCHITECTURE.md](/docs/ARCHITECTURE.md#positions-not-indices).
+
+The two writes were acknowledged only after a **majority of the three nodes
+had `fsync`'d them**. That is what "committed" means here. The read went
+through the cluster's read barrier, from a gateway that may not have been the
+leader's.
+
+### The `node.toml` it wrote
+
+This is a real node config — the same shape you would install at
+`/etc/uc2/node.toml`. Node 0's, annotated:
+
+```toml
+id = 0                                       # this node's id, unique in the cluster
+bind = "127.0.0.1:9100"                      # the UDP socket peers reach it on
+instance_dir = "/home/you/uc2-quickstart/n0" # log buffer, journal, cnc page, audit log
+app_id = "quickstart"                        # cluster identity; a mismatch is a refusal
+
+[[members]]                                  # the FULL voting membership, byte-identical
+id = 0                                       # on every host — including this node's own
+addr = "127.0.0.1:9100"                      # entry, whose addr must equal `bind` exactly
+
+[[members]]
+id = 1
+addr = "127.0.0.1:9101"
+
+[[members]]
+id = 2
+addr = "127.0.0.1:9102"
+
+[crypto]
+enabled = false      # cleartext node-to-node traffic
+
+[admin]
+auth = "hmac"        # membership changes must be signed
+keys = [{ name = "admin", key_path = "/home/you/uc2-quickstart/admin.key" }]
+```
+
+Three rules are worth carrying away from that file:
+
+- **`bind` and this node's own `[[members]]` entry are the identical
+  address.** Not a coincidence — `uc2-node` refuses to start if they
+  disagree. It is the single most common misconfiguration.
+- **`[crypto]` and `[admin]` are required sections.** Since `v2.6.0` an
+  absent one is a startup refusal that names it, never a silent default. A
+  `node.toml` written for `v2.5.0` will not start until both choices are
+  written down — see
+  [Upgrade a cluster](/docs/how-to/upgrade-a-cluster.md).
+- **`enabled = false` is a *choice*, not "off".** It means cleartext between
+  nodes, which is fine on loopback and not fine across a network you do not
+  own. `auth = "hmac"` here means the quickstart generated a 32-byte key
+  (`uc2ctl gen-admin-key`) and membership changes must be signed with it; the
+  alternative, `auth = "none"`, makes filesystem permissions the only
+  boundary.
+
+### The `gateway.toml` it wrote
+
+```toml
+[local]
+instance_dir = "/home/you/uc2-quickstart/n0"  # the node this edge relays into
+app_id = "quickstart"                         # must match the node's exactly
+listen = "127.0.0.1:9200"                     # where remote clients connect
+
+[[members]]          # node id -> gateway address. This table must be
+node_id = 0          # byte-identical on every host: it is the ONLY place
+gateway = "127.0.0.1:9200"   # gateway addresses exist, and it is what
+                             # answers REDIRECT and LEADER_CHANGED.
+[[members]]
+node_id = 1
+gateway = "127.0.0.1:9201"
+
+[[members]]
+node_id = 2
+gateway = "127.0.0.1:9202"
+
+[session]
+envelope = false     # raw pass-through: see below
+```
+
+`[session] envelope = false` is the honest setting for this demo.
+`counter-service` runs a plain `CounterSm`, not a
+`uc2_service::Sessioned<CounterSm>`, so there is nothing on the far end to
+strip a session envelope. A production service wraps its state machine in
+`Sessioned` and turns the envelope on — that is what makes a re-sent write
+answer `replayed=true` ("already applied; not applied twice") instead of
+applying a second time. See
+[the state-machine contract](/docs/reference/state-machine-contract.md).
+
+## 4. The state machine you just ran
 
 All of it, from [`examples/counter/src/lib.rs`](/examples/counter/src/lib.rs):
 
@@ -87,206 +313,41 @@ overflow in debug while wrapping in release, so two replicas built differently
 would diverge. See
 [the apply contract](/docs/ARCHITECTURE.md#the-apply-path-and-the-sdk).
 
-## 3. A real three-node cluster
+`StateMachine` is the *typed* tier: the framework does one bincode decode per
+command and one encode per response for you. The other tier,
+`RawStateMachine`, is bytes-in/bytes-out with no codec at all — you pick your
+own framing, and the framework passes the payload straight through. A type
+implements exactly one of the two;
+[the state-machine contract](/docs/reference/state-machine-contract.md) has
+both signatures, the byte-identity promise between them, and when the raw tier
+is worth it.
 
-Now the interesting version. We will use five terminals: three nodes, three
-services, and one client.
+## 5. A real three-node cluster
 
-**Set up:**
+The quickstart is a demo: three nodes sharing one kernel and one disk are a
+majority of *processes*, not a majority of *failure domains*. Moving it onto
+real hosts is one node per machine, one config file per host, and a
+supervisor:
 
-```bash
-export BASE=~/.cache/counter-demo
-rm -rf $BASE && mkdir -p $BASE/{0,1,2}
-```
+- **[Run a cluster on real hosts](/docs/how-to/run-a-cluster.md)** — installing
+  the binaries, the per-host `node.toml`, the address rule, durable instance
+  directories, systemd units, and restart cost.
+- **[Run a gateway](/docs/how-to/run-a-gateway.md)** — one edge per node host,
+  the `[[members]]` map that must agree everywhere, and what a client sees on
+  `REDIRECT` / `LEADER_CHANGED` / `RETRY`.
+- **Containers.** The same demo, in containers, from the image the release
+  publishes:
 
-**Write a config file per node.** This is how a real node is configured — the
-same file shape you would install at `/etc/uc2/node.toml`:
+  ```bash
+  UC2_IMAGE=ghcr.io/peterknego/uc2:2.6.0 \
+    docker compose -f packaging/compose.yml up -d
+  ```
 
-```bash
-for i in 0 1 2; do
-  cat > $BASE/n$i.toml <<EOF
-id = $i
-bind = "127.0.0.1:1900$((i+1))"
-instance_dir = "$BASE/$i"
-app_id = "counter"
-
-[[members]]
-id = 0
-addr = "127.0.0.1:19001"
-
-[[members]]
-id = 1
-addr = "127.0.0.1:19002"
-
-[[members]]
-id = 2
-addr = "127.0.0.1:19003"
-
-[crypto]
-enabled = false
-
-[admin]
-auth = "none"
-EOF
-done
-```
-
-Note `bind` and this node's own `members` entry are the identical address. That
-is a rule, not a coincidence — `uc2-node` refuses to start if they disagree.
-
-`[crypto]` and `[admin]` are required sections — an absent one is a startup
-refusal naming it, not "off" by default. `enabled = false` / `auth = "none"`
-is cleartext node-to-node traffic and filesystem-boundary admin access: the
-same posture every release before `v2.6.0` had implicitly, and fine for this
-walkthrough. See [Run a cluster on real hosts](/docs/how-to/run-a-cluster.md)
-for what to change before a real deployment.
-
-**Start the three nodes**, one per terminal:
-
-```bash
-cargo run -p uc2_node --bin uc2-node -- --config $BASE/n0.toml
-cargo run -p uc2_node --bin uc2-node -- --config $BASE/n1.toml
-cargo run -p uc2_node --bin uc2-node -- --config $BASE/n2.toml
-```
-
-Within a second or so, one of them announces itself:
-
-```text
-uc2-node: node 0 listening on 127.0.0.1:19001
-uc2-node: node 0 is now follower (term 0)
-uc2-node: node 0 is now LEADER (term 1)
-```
-
-The other two stay followers. Which node wins is genuinely arbitrary — each has
-a differently-seeded randomized election timeout, precisely so they do not all
-stand for election at the same instant and split the vote forever.
-
-**Attach a service to each node.** Every replica runs its own copy of the state
-machine:
-
-```bash
-cargo run -p counter --bin counter-service -- --instance-dir $BASE/0
-cargo run -p counter --bin counter-service -- --instance-dir $BASE/1
-cargo run -p counter --bin counter-service -- --instance-dir $BASE/2
-```
-
-```text
-service attached at /home/you/.cache/counter-demo/0
-```
-
-**Write to the leader** — substitute whichever node won:
-
-```bash
-cargo run -p counter --bin counter-client -- --instance-dir $BASE/0 --add 7 --count 3
-```
-
-```text
-Add(7) -> value 7 @ position 32
-Add(7) -> value 14 @ position 96
-Add(7) -> value 21 @ position 160
-linearizable read -> 21
-```
-
-Each of those returned only after a **majority of nodes had fsync'd** the
-command. That is what "committed" means here.
-
-**Now read from a follower**, and watch replication prove itself:
-
-```bash
-cargo run -p counter --bin counter-client -- --instance-dir $BASE/1 --read-only --snapshot
-```
-
-```text
-snapshot read -> 21
-```
-
-Node 1 was never written to directly. It has the value because it applied the
-same commands, in the same order, from its own copy of the log.
-
-**Beyond one-shot CLI calls.** `counter-client` above uses `uc2_client::Client`
-— one blocking call per command, the simplest possible shape. A gateway
-process (REST, gRPC) juggling many outstanding requests wants
-`uc2_client::PipelinedClient` instead: `submit`/`query_*` hand a typed
-command/query to a driver thread and return immediately with a `Ticket`,
-which resolves later via a blocking `wait()` or as a `std::future::Future`
-you can `.await`:
-
-```rust
-use uc2_client::{PipelinedClient, PipelinedConfig};
-
-let client = PipelinedClient::connect(&instance_dir, "my-app", PipelinedConfig::default())?;
-
-// Fire off several requests without waiting on each one individually...
-let tickets: Vec<_> = (0..8).map(|n| client.submit::<Command, Applied>(&Command::Add(n))).collect::<Result<_, _>>()?;
-
-// ...then collect the results as they resolve.
-for ticket in tickets {
-    let applied: Applied = ticket.wait()?;
-    println!("-> {applied:?}");
-}
-```
-
-`Client` is now a thin shim over exactly this machinery (submit, then
-immediately `wait()`) — same correctness guarantees, different call shape.
-For a gateway chasing maximum single-process throughput (the shape the M5 gate
-measures), attach the lower-level `uc2_client::Engine` directly instead —
-see its module docs for the `try_submit`/`poll` API.
-
-## 4. Things worth trying
-
-**Point a write at a follower.** It refuses, and tells you who the leader is:
-
-```bash
-cargo run -p counter --bin counter-client -- --instance-dir $BASE/1 --read-only
-```
-
-```text
-Error: linearizable reads are leader-only and this node is a follower (node 0
-is the leader). Either point --instance-dir at the leader, or pass --snapshot
-to read this replica's own copy of the state.
-```
-
-Linearizable reads go through a quorum read barrier, which only a leader can
-run — that is what makes them immune to returning stale data from a node that
-was deposed a microsecond ago. Snapshot reads skip the barrier, are cheaper, and
-may lag slightly.
-
-**Kill the leader.** `Ctrl-C` the leader's terminal and watch a survivor promote
-itself within a few hundred milliseconds:
-
-```text
-node 1 is now LEADER (term 2)
-```
-
-Then write to the new leader and read back — the counter still holds 21. No
-acknowledged write was lost. Measured failover on real hardware is p50 202 ms;
-see the [M4 gate record](/docs/benchmarks/uc2-m4-gate-2026-07-11.md).
-
-**Restart a node.** Its state survives in `$BASE/<id>` — it rejoins as a
-follower, catches up from the log, and its service replays from where it left
-off.
-
-## 5. Where to go next
-
-- **[Run a cluster on real hosts](/docs/how-to/run-a-cluster.md)** — the same
-  cluster you just ran, moved onto separate machines: per-host configs, the
-  network path, where clients live, systemd supervision.
-- **Remote clients and raw state machines.** A client that can't attach to
-  shmem directly (a different host, a different language runtime) talks to a
-  `uc2-gateway` edge over plain TCP instead — see
-  [Run a gateway](/docs/how-to/run-a-gateway.md). On the service side, the
-  `StateMachine` trait you just implemented above is the typed convenience
-  tier; a `RawStateMachine` (bytes-in/bytes-out, no codec) is the other —
-  see [the state-machine contract](/docs/reference/state-machine-contract.md)
-  for both, plus `Sessioned<S>`, the exactly-once wrapper the gateway's
-  session envelope needs.
-- **[ARCHITECTURE.md](/docs/ARCHITECTURE.md)** — how it works, and why it is
-  shaped this way.
-- **[VERIFICATION.md](/docs/VERIFICATION.md)** — what is proved, what is checked,
-  and what is not.
-- **[The operations runbook](/docs/ops/uc2-runbook.md)** — instance directory
-  layout, durability requirements, purge, live reconfiguration, wire crypto.
-- **[`examples/counter/`](/examples/counter)** — everything you just ran.
+  The image is signed too — `cosign verify` with the same two `--certificate-*`
+  flags as above.
+- **[Monitor a cluster](/docs/how-to/monitor-a-cluster.md)** — `[metrics]`,
+  the `/healthz` and `/readyz` probes, and the alert rules and dashboard
+  shipped under `packaging/`.
 
 ### Before running this for real
 
@@ -296,10 +357,91 @@ ways the runbook covers in full, but at minimum:
 - **Instance directories must be on real durable storage**, not tmpfs. The
   archive agent's `fdatasync` is the entire durability story; on a RAM-backed
   filesystem it is a no-op and you have none.
-- **Size the log buffer for your throughput.** The example's 4 MiB ring is a toy;
-  the default is ~512 MiB. The appender may never overwrite bytes the archive has
-  not recorded, so an undersized ring turns into ingress backpressure.
-- **Implement `SnapshotStateMachine`** if you want the log purged. Without it the
-  journal grows forever.
+- **Size the log buffer for your throughput.** `buffer_bytes` defaults to
+  64 MiB in `node.toml` (the examples use 4 MiB, which is a toy). The appender
+  may never overwrite bytes the archive has not recorded, so an undersized ring
+  turns into ingress backpressure — and the whole of it is *reserved* on disk at
+  startup, so sizing it up is a disk decision too. See
+  [Configuration](/docs/reference/configuration.md).
+- **Implement `SnapshotStateMachine`** if you want the log purged. Without it
+  the journal grows forever.
 - **Enable wire crypto** if node-to-node traffic crosses anything you do not
-  trust. It is off by default.
+  trust. It is off by default, and `[admin] auth = "hmac"` only authenticates
+  cluster-wide when paired with it — see
+  [Encrypt traffic between nodes](/docs/how-to/encrypt-node-traffic.md).
+
+## 6. From source
+
+If you have a Rust toolchain (1.89 or newer; the repo pins a newer stable in
+`rust-toolchain.toml` for its own builds), everything above builds from the
+tree — and the smallest possible version of it is one process:
+
+```bash
+cargo run -p counter --bin counter-single
+```
+
+```text
+instance dir: /tmp/.tmpmVhdVb
+{"ts_ns":1787499054879647864,"level":"info","event":"became_leader","node":0,"term":1,"base":0}
+{"ts_ns":1787499054882003565,"level":"info","event":"serving_changed","node":0,"term":1,"can_serve":true}
+node is leader and serving
+
+Add(  1) -> value   1  @ log position 32
+Add(  2) -> value   3  @ log position 96
+Add(  3) -> value   6  @ log position 160
+Add( 10) -> value  16  @ log position 224
+Add( -6) -> value  10  @ log position 288
+
+linearizable read -> 10
+snapshot read     -> 10
+
+Reset      -> value   0  @ log position 352
+
+Everything above went through consensus and was fsync'd before it was acked.
+```
+
+That is a real single-node cluster — same consensus code, same log, same
+durability. It elects itself, appends the `NewTerm` frame that Raft §5.4.2
+requires, commits as soon as its own `fsync` lands, and serves. Node, service
+and client are all in this one process, which is a configuration choice rather
+than a special mode: they coordinate through counters in shared memory whether
+they share a process or not.
+
+To build the shipped binaries and run the same quickstart from a source tree:
+
+```bash
+cargo build --release --locked \
+  -p uc2_node --bin uc2-node \
+  -p uc2ctl --bin uc2ctl \
+  -p uc2_gateway --bin uc2-gateway \
+  -p counter --bin counter-service --bin counter-remote
+
+packaging/quickstart-local.sh --bin-dir target/release
+```
+
+(`target/release` unless you have set `CARGO_TARGET_DIR`.) This is what
+nightly CI's `quickstart` job runs; the release workflow runs the same script
+against the *tarball*, in a bare `ubuntu:24.04` container with no toolchain in
+it, and refuses to publish anything if it does not print `PASS`.
+
+## 7. Where to go next
+
+- **[ARCHITECTURE.md](/docs/ARCHITECTURE.md)** — how it works, and why it is
+  shaped this way: positions instead of indices, the four agents, the data and
+  control planes, the apply path.
+- **[VERIFICATION.md](/docs/VERIFICATION.md)** — what is proved, what is
+  checked, what is only bug-hunted, and what is not verified at all.
+- **[Write a service binary](/docs/how-to/write-a-service-binary.md)** — your
+  state machine, in its own process, attached to a node.
+- **[The state-machine contract](/docs/reference/state-machine-contract.md)** —
+  both tiers, `SnapshotStateMachine`, `OutputHandler`, and `Sessioned<S>`.
+- **[Client SDKs](/docs/reference/remote-protocol.md)** — the framed TCP
+  protocol a remote client speaks, and `RemoteClient`, the Rust
+  implementation of it. On-host clients use `uc2_client`'s three tiers
+  instead: `Engine`, `PipelinedClient` + `Ticket`, and the blocking `Client`
+  shim.
+- **[The operations runbook](/docs/ops/uc2-runbook.md)** — instance directory
+  layout, backups, membership changes, quorum-loss recovery, upgrades.
+- **[Versioning and the semver promise](/docs/reference/semver-policy.md)** —
+  what is API, what is not, and what a flag day means.
+- **[`examples/counter/`](/examples/counter)** — everything you just ran.

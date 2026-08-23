@@ -523,6 +523,91 @@ explicitly. Upgrade note with the two new startup refusals.
 
 ## 6. M12c — Packaging, publishing, hygiene
 
+> **As built (M12c).** M12c shipped as Tasks 1–5 on `uc2/m12c-packaging`;
+> `docs/benchmarks/uc2-m12-gate-2026-08-22.md` rows 5, 6, 7, the added rows
+> 11–13, and its "M12c facts" section are the acceptance-gate record. The
+> bullets below are otherwise as written; these are the corrections and the
+> ruled deviations.
+>
+> **Twelve crates, not eleven.** §3.2 counted eleven names; the shipped set
+> is twelve — `ultima-journal`, `uc_protocol`, `uc2_crypto`, `uc2_log`,
+> `uc2_consensus`, `uc2_net`, `uc2_client`, `uc2_node`, `uc2_service`,
+> `uc2_remote`, `uc2_gateway`, `uc2ctl`. **`uc2_sim` is `publish = false`**,
+> a plan addition ruled during Task 1 and consistent with §3.2's own
+> reasoning: it is the deterministic-simulation proof apparatus, not
+> product, and it sits beside `uc-lincheck` and the example crates rather
+> than beside the shipped libraries.
+>
+> **`publish-check` packages all twelve but dry-runs only the four leaves.**
+> The bullet asks for "`cargo publish --dry-run` of the whole DAG" as a CI
+> job. That is not achievable before the first publish and will not become
+> achievable later: `cargo package` rewrites every path dependency into a
+> registry dependency and then requires it to resolve, and a per-crate
+> invocation for a non-leaf crate therefore needs its dependencies to
+> already be on crates.io. It is also not merely a bootstrap gap —
+> `uc2_node`'s dev-dependency on `uc2_service` is a genuine dev-only cycle
+> no publish order avoids. What shipped instead: `cargo package --no-verify`
+> over all twelve **in one invocation** (cargo topo-sorts the selected set
+> and resolves cross-references locally), plus `cargo publish --dry-run` for
+> the four dependency-free leaves (`ultima-journal`, `uc_protocol`,
+> `uc2_remote`, `uc2_consensus`), plus a third step the bullet did not
+> anticipate: `scripts/check_publish_metadata.sh`, which checks the
+> crates.io-side metadata rules (keyword count and ≤ 20-char length,
+> category slugs) that neither `cargo package` nor `--dry-run` ever reaches.
+> It caught a real 25-character keyword.
+>
+> **`rust-version = "1.89"`, and the `msrv` job runs clippy.** §3.2 guessed
+> "≥ 1.88". The probed floor is 1.89.0
+> (`std::fs::File::try_lock_exclusive`/`unlock`, `uc2_node/src/backup.rs`).
+> The job runs `cargo +1.89.0 clippy --workspace --all-targets --locked --
+> -D warnings`, not `check`, with an explicit `+<version>` so
+> `rust-toolchain.toml`'s directory override cannot redirect it.
+>
+> **Native aarch64, not cross-compilation.** `release.yml`'s build matrix
+> uses `ubuntu-24.04-arm` — real arm hardware — so neither leg is
+> cross-compiled or emulated. **But `release-smoke` runs the x86_64 tarball
+> only**, so nothing in CI ever *executes* an aarch64 binary; that gap is
+> stated in gate row 5 and `cut-a-release.md` §4 asks for a manual arm run
+> at the rc tag.
+>
+> **The SBOM is an archive of per-crate documents, not one document.**
+> `cargo cyclonedx` has no workspace-wide single-document mode: it emits one
+> SBOM per workspace member. The release ships them as
+> `uc2-<ver>.cdx.tar.gz` rather than pretending one crate's graph is the
+> workspace's.
+>
+> **One quickstart script, and a new example binary to drive it.** The
+> bullet's "3 nodes + gateway + counter on one host, a remote client submit"
+> needed a remote client that ships in the tarball; there was none. Task 3
+> added **`counter-remote`** (`examples/counter/src/bin/counter-remote.rs`,
+> `--gateways host:port[,…] [--timeout-secs N] add N | get
+> [--linearizable] | reset`, exit 0/1/2) and
+> **`packaging/quickstart-local.sh`** — one script, used by three callers:
+> nightly CI's `quickstart` job (from a source build), `release-smoke` (from
+> the tarball, in a bare container), and a human with an unpacked tarball.
+> There is no second, separate "release quickstart".
+>
+> **A product fix rode along (Task 3b).** Driving the quickstart from
+> outside surfaced that `uc2_remote`'s `request_timeout` was not enforced
+> while the reader was reconnecting. Fixed — the client sweeps for expired
+> requests between every dial attempt and hop — with the resulting bound
+> (`request_timeout + 2 × connect_timeout + SWEEP_INTERVAL`) documented in
+> `docs/reference/remote-protocol.md`.
+>
+> **`cargo fmt`: DEFERRED**, per §1's own condition ("only if no long-lived
+> branch is open then; otherwise deferred and said so"). Two long-lived
+> worktrees are open (`fix/remaining-flakes`, `worktree-uc2-multi-service`)
+> and a one-shot reformat measures 2 731 hunks, every one a conflict in
+> both. Gate row 13 states the condition to re-run it.
+>
+> **The `RELEASES.md` / `docs/releases.md` writeup is not M12c's.** §8's
+> closing paragraph puts it before the `v2.6.0` tag, and it covers all four
+> sub-milestones — so it lands at the tag, per `docs/how-to/cut-a-release.md`
+> §1, not inside this sub-milestone. What M12c did write: the artifacts-first
+> `docs/QUICKSTART.md`, install-from-release in `run-a-cluster.md` and the
+> runbook, `docs/how-to/cut-a-release.md`, `packaging/README-release.md`, and
+> `docs/reference/semver-policy.md`.
+
 - **Supply chain**: `cargo-deny` (advisories, licenses, bans — incl. exactly
   one AES-GCM implementation in the graph) and a CycloneDX SBOM attached to
   releases; dead `quinn`/`rustls`/`rcgen`/`rustls-pemfile` workspace deps

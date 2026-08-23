@@ -161,7 +161,8 @@ single-writer rule is there to provide.
 
 ## The log buffer and durability
 
-**The buffer** is one mmap'd power-of-2 ring per node (default ~512 MiB) in the
+**The buffer** is one mmap'd power-of-2 ring per node (`node.toml`'s
+`buffer_bytes`, default 64 MiB) in the
 instance directory; the byte offset is `position & (size − 1)`. Exactly one writer
 per node depending on role — the consensus agent appends when leader, the receiver
 writes frames at their offsets when follower. Because writes are position-addressed,

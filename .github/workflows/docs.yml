@@ -1,9 +1,11 @@
 name: docs
 
 # Publishes rustdoc for the workspace's library crates to GitHub Pages on every
-# push to main. `ultima_cluster` is not on crates.io, so there is no docs.rs to
-# render its API — without this, reading the API means cloning and running
-# `cargo doc` yourself.
+# push to main. docs.rs renders each PUBLISHED crate separately, at whatever
+# version was last published; this renders the whole workspace together, at
+# `main`, behind one landing page — which is what you want when the question
+# spans crates ("how does uc2_service reach uc2_log?") or when main is ahead
+# of the last release.
 #
 # Deliberately NOT gated on rustdoc warnings: the tree carries pre-existing
 # intra-doc-link warnings, and a docs *deploy* is the wrong place to discover

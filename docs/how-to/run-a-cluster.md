@@ -10,24 +10,65 @@ and is a better place to meet the moving parts.
 
 ## Install the binaries on each host
 
-Three binaries go onto every host, built once on a machine of the same
-architecture:
+Three things go onto every host:
 
-```bash
-cargo build --release -p uc2_node -p uc2ctl --bins
-```
-
-Requires Rust 1.89 or newer (the workspace's `rust-version` floor;
-`rust-toolchain.toml` pins CI and this repo's own dev builds to a newer
-stable, but any toolchain at or above 1.89 builds it).
-
-- `target/release/uc2-node` — the node daemon.
-- `target/release/uc2ctl` — the admin CLI, for status and membership changes.
+- `uc2-node` — the node daemon.
+- `uc2ctl` — the admin CLI, for status and membership changes.
 - Your own service binary — the half that runs your state machine. See
   [Write a service binary](write-a-service-binary.md).
 
-Copy them to `/usr/local/bin` on each host; that is the path the packaged
-systemd units expect.
+### From a release tarball (no toolchain needed)
+
+Take the tarball for the host's architecture from
+[the releases page](https://github.com/PeterKnego/ultima_cluster/releases),
+**verify it**, then install:
+
+```bash
+VER=2.6.0
+TARGET=x86_64-unknown-linux-gnu        # or aarch64-unknown-linux-gnu
+BASE=https://github.com/PeterKnego/ultima_cluster/releases/download/v$VER
+
+curl -fLO $BASE/uc2-$VER-$TARGET.tar.gz
+curl -fLO $BASE/uc2-$VER-$TARGET.tar.gz.sigstore.json
+
+cosign verify-blob \
+  --bundle uc2-$VER-$TARGET.tar.gz.sigstore.json \
+  --certificate-identity-regexp \
+    'https://github.com/PeterKnego/ultima_cluster/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  uc2-$VER-$TARGET.tar.gz
+
+tar xzf uc2-$VER-$TARGET.tar.gz
+sudo install -m 0755 uc2-$VER-$TARGET/bin/* /usr/local/bin/
+```
+
+`/usr/local/bin` is the path the packaged systemd units expect. The tarball
+also carries `packaging/` — `node.example.toml`, the systemd units, the
+Prometheus rules and the Grafana dashboard referenced later in this guide.
+The identity pin on `cosign verify-blob` is not optional dressing; see
+[the quickstart's download section](../QUICKSTART.md#1-download-it-and-verify-it).
+
+### Or from the container image
+
+```bash
+ghcr.io/peterknego/uc2:2.6.0
+```
+
+Multi-architecture (amd64 + arm64), built from the same tarballs, signed by
+digest — `cosign verify` with the same two `--certificate-*` flags.
+`packaging/compose.yml` in the tarball is a worked single-host example.
+
+### Or from source
+
+```bash
+cargo build --release --locked -p uc2_node -p uc2ctl --bins
+```
+
+Requires Rust 1.89 or newer (the workspace's `rust-version` floor;
+`rust-toolchain.toml` pins CI, releases and this repo's own dev builds to a
+newer stable, but any toolchain at or above 1.89 builds it). The binaries land
+in `target/release/`; copy them to `/usr/local/bin` on each host. Build once
+per architecture, not once per host.
 
 ## Write one config file per host
 

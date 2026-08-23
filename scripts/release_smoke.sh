@@ -29,12 +29,16 @@
 #     --image  base image to run in. Default ubuntu:24.04. Whatever you pass
 #              must have bash and coreutils and nothing else is assumed.
 #     --work   host directory to unpack into (it is DELETED and recreated).
-#              Default: <tarball's directory>/.release-smoke. PUT IT OUTSIDE
-#              ANY DOCKER BUILD CONTEXT: the run below leaves hundreds of
-#              megabytes of cluster state here, including a mode-0600 admin
-#              key owned by root, and a later `docker build` whose context
-#              contains that key fails while packing it. release.yml passes
-#              $RUNNER_TEMP for exactly this reason.
+#              Default: $RUNNER_TEMP/.release-smoke under Actions, else
+#              ./.release-smoke. IT MUST BE OUTSIDE ANY DOCKER BUILD CONTEXT:
+#              the run below leaves hundreds of megabytes of cluster state
+#              here, including a mode-0600 admin key owned by root, and a
+#              later `docker build` whose context contains that key fails
+#              while packing it, three steps away from the cause. That is
+#              also why the default is NOT the tarball's own directory —
+#              `dist/` is exactly where release.yml builds the image from.
+#              (.dockerignore is the second half of the same defence: it
+#              admits `dist/*.tar.gz` and nothing else.)
 #
 #   Exit codes: 0 = PASS, 1 = the smoke run failed,
 #               3 = a precondition (no docker, no tarball, bad argument).
@@ -72,9 +76,8 @@ done
 [ -f "$TARBALL" ] || precond "no such tarball: $TARBALL"
 command -v docker >/dev/null 2>&1 || precond "docker is not on PATH — this test needs a container runtime"
 
-TARBALL_DIR="$(cd -- "$(dirname -- "$TARBALL")" && pwd)"
 TARBALL_NAME="$(basename -- "$TARBALL")"
-[ -n "$WORK" ] || WORK="$TARBALL_DIR/.release-smoke"
+[ -n "$WORK" ] || WORK="${RUNNER_TEMP:-$PWD}/.release-smoke"
 case "$WORK" in /*) ;; *) WORK="$PWD/$WORK" ;; esac
 
 # The previous run's files are root-owned (the container writes them), so the

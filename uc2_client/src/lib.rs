@@ -48,6 +48,9 @@
 //! Spec: `docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md`
 //! §7 (original SDK); `docs/superpowers/specs/2026-08-13-uc2-pipelined-client-design.md`
 //! (engine + ticket layers, this module's current shape).
+//!
+//! **Semver:** see `docs/reference/semver-policy.md`. Promised surface: the three
+//! client tiers — [`Engine`], [`PipelinedClient`] and [`Client`].
 
 mod client;
 mod engine;

@@ -8,6 +8,34 @@ questions: a guide tells you what to do about a goal you have, and reference
 tells you what a field or a flag *is* when you need to look it up mid-task. The
 path is kept because other documents and tooling cite it.
 
+## Getting the binaries
+
+Since `v2.6.0` there are release artifacts, so installing is a download and a
+verify rather than a build:
+
+- **Tarballs** — `uc2-<version>-{x86_64,aarch64}-unknown-linux-gnu.tar.gz`
+  from [the releases page](https://github.com/PeterKnego/ultima_cluster/releases),
+  each with a `.sha256`, a `.sigstore.json` bundle, a signed `SHA256SUMS` and
+  a CycloneDX SBOM (`uc2-<version>.cdx.tar.gz`). Inside: `bin/` (`uc2-node`,
+  `uc2ctl`, `uc2-gateway`, `counter-service`, `counter-remote`), `packaging/`
+  (example configs, systemd units, Prometheus rules, Grafana dashboard,
+  `Dockerfile`, `compose.yml`, `quickstart-local.sh`), `LICENSE` and
+  `README-release.md`.
+- **Container image** — `ghcr.io/peterknego/uc2:<version>`, multi-arch, built
+  from those same tarballs and signed by digest.
+- **Verify before you run it.** Signing is keyless; a signature only means
+  something when pinned to the workflow that produced it. The exact
+  `cosign verify-blob` / `cosign verify` invocations are in
+  [Install the binaries](../how-to/run-a-cluster.md#install-the-binaries-on-each-host)
+  and in the tarball's own `README-release.md`.
+- **Upgrading** an existing cluster from one of these is
+  [Upgrade a cluster](../how-to/upgrade-a-cluster.md) — the binaries change,
+  the flag-day rule does not.
+- **Which versions go together, and what may change under you:**
+  [the semver policy](../reference/semver-policy.md). One version number
+  covers the tag, all twelve crates, the tarballs and the image.
+- Cutting one of these releases (maintainers): [Cut a release](../how-to/cut-a-release.md).
+
 ## Running a cluster
 
 - [Run a cluster on real hosts](../how-to/run-a-cluster.md) — durable instance

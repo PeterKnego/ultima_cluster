@@ -198,5 +198,8 @@ a half-published version is recoverable; a wrong published version is not.
 - [Upgrade a cluster](upgrade-a-cluster.md) — what an operator has to do to
   *take* the release you just cut. Read it before writing the `RELEASES.md`
   section; if it needs a new step, this release is not done.
+- [Versioning and the semver promise](../reference/semver-policy.md) — what
+  the number you are about to bump promises, which items are covered, and
+  what makes a release major rather than minor.
 - `packaging/README-release.md` — the short README that ships inside the
   tarball, and the first thing a downloader reads.

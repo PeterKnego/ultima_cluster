@@ -10,6 +10,10 @@
 //! construction. Loss is repaired by NAK, served by re-reading the log buffer.
 //!
 //! Spec: `docs/superpowers/specs/2026-07-09-uc-v2-aeron-shaped-smr-design.md` §5.
+//!
+//! **Semver:** see `docs/reference/semver-policy.md`. Promised surface: **none** —
+//! every module here is public for the workspace's own use and may change
+//! in any release.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;

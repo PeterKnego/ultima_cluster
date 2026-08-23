@@ -5,6 +5,11 @@
 //! deliberately tiny wire codec (`bytes`, `thiserror` only) meant to be easy
 //! to re-implement in a non-Rust gateway port. See
 //! `docs/reference/remote-protocol.md` and design spec §4.2.
+//!
+//! **Semver:** see `docs/reference/semver-policy.md`. Promised surface: the
+//! **wire format** — remote protocol v1 ([`frame::PROTOCOL_VERSION`]) — and
+//! [`RemoteClient`]. The Rust items that encode the wire are not themselves
+//! promised; a port re-implements the format, not this API.
 
 pub mod client;
 pub mod conn;

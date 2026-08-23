@@ -8,6 +8,10 @@
 //! The pure data types in `version.rs`, `magic.rs`, and `error_codes.rs` remain
 //! `core`-only-compatible — they don't import anything outside `core`. The ring
 //! buffer primitives require `std::sync::atomic` and `memmap2`.
+//!
+//! **Semver:** see `docs/reference/semver-policy.md`. Promised surface: **none** as
+//! Rust API — this is the wire spec, governed by the flag-day rule
+//! (`version::CURRENT` and the cnc page version), not by semver.
 
 pub mod error_codes;
 pub mod magic;

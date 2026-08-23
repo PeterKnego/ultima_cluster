@@ -75,13 +75,30 @@ bar.
 
 ## Try it
 
+No toolchain required — download a signed release tarball and run its
+quickstart:
+
+```bash
+tar xzf uc2-2.6.0-x86_64-unknown-linux-gnu.tar.gz
+uc2-2.6.0-x86_64-unknown-linux-gnu/packaging/quickstart-local.sh
+```
+
+Three `uc2-node` daemons, three services and three gateways come up on this
+host, a real election happens, two writes are committed by a majority and a
+linearizable read comes back through a gateway from the outside. It prints
+`PASS` and cleans up after itself.
+
+Tarballs (x86-64 and aarch64), a `SHA256SUMS`, a CycloneDX SBOM and
+`ghcr.io/peterknego/uc2` are published per tag, all signed keylessly by the
+release workflow. **[`docs/QUICKSTART.md`](/docs/QUICKSTART.md)** has the
+download-and-`cosign verify-blob` step, the annotated configs, and the path
+onto real hosts.
+
+From source, the smallest version of the same thing is one process:
+
 ```bash
 cargo run -p counter --bin counter-single
 ```
-
-A replicated counter — node, service, and client in one process. For a real
-three-node cluster, a leader kill, and a follower read that proves replication
-happened, see **[`docs/QUICKSTART.md`](/docs/QUICKSTART.md)**.
 
 ## Shape
 
@@ -158,7 +175,21 @@ including what is *not* verified and how to reproduce every layer.
 Builds standalone — the only external storage dep, `ultima-db`, comes from
 crates.io.
 
+**On crates.io since `v2.6.0`:** twelve crates — the eleven libraries above
+minus `uc2_sim`/`uc-lincheck`, plus `uc2ctl` — published **in lockstep at one
+version**, which is also the git tag, the tarball name and the image tag.
+`uc2_sim`, `uc-lincheck` and the example crates are `publish = false`: proof
+and teaching apparatus, not product. What that version number promises, and
+what it deliberately does not, is
+[the semver policy](/docs/reference/semver-policy.md).
+
 ## Build & test
+
+**MSRV is Rust 1.89** (`rust-version` in `[workspace.package]`; the floor is
+`std::fs::File::try_lock_exclusive`). `rust-toolchain.toml` pins a newer
+stable — currently **1.96.0** — for this repository's own builds and for
+releases; rustup installs it on the first `cargo` invocation. CI's `msrv` job
+proves the floor separately by running clippy on a real 1.89.0 toolchain.
 
 ```bash
 cargo build --workspace
@@ -169,8 +200,11 @@ cargo test -p uc2-crashtest --features hard-crash-tests   # multi-process SIGKIL
 RUSTFLAGS="--cfg loom" cargo test -p uc2_log --test loom_frame --release
 ```
 
-`ci.yml` runs the fast gate on every PR; `nightly.yml` runs the full proof
-suite (capstones, sim-heavy, loom, crashtest).
+`ci.yml` runs the fast gate on every PR (plus `msrv`, `cargo-deny` and a
+`publish-check` that packages all twelve publishable crates); `nightly.yml`
+runs the full proof suite (capstones, sim-heavy, loom, crashtest, and the
+binary quickstart); `release.yml` builds, smoke-tests and signs the artifacts
+on a tag — see [Cut a release](/docs/how-to/cut-a-release.md).
 
 ## Documentation
 
