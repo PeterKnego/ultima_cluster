@@ -319,7 +319,7 @@ client absorbs them:
   raised before any socket is opened.
 - **`request_timeout` is enforced while reconnecting, not only while
   connected.** A pending request is failed with `TimedOut` no later than
-  `request_timeout + connect_timeout + SWEEP_INTERVAL` (25 ms), *including*
+  `request_timeout + 2 x connect_timeout + SWEEP_INTERVAL` (25 ms), *including*
   when the client is disconnected and scanning `members`. A conforming client
   therefore has to run its timeout sweep **between every dial attempt and
   every redirect hop** — not once per pass: one pass costs up to
@@ -329,8 +329,12 @@ client absorbs them:
   every dial *succeeding* — an edge pair that redirects each request to the
   other, or one edge redirecting to an address that is down — leaves the
   reader in a reconnect churn that never returns to its idle tick at all.
-  The `connect_timeout` term is the one attempt already in flight when the
-  budget expires; a sweep cannot interrupt a blocking connect. Do **not**
+  The `2 x connect_timeout` term is the one attempt already in flight when the
+  budget expires — a sweep cannot interrupt a blocking connect — and it is
+  doubled because one in-flight dial attempt bounds connect and the `HELLO`
+  reply separately, each by `connect_timeout`. That separation is deliberate:
+  a single combined per-attempt budget would starve the handshake on a link
+  whose connect is slow but healthy. Do **not**
   shorten a dial attempt's budget to what a pending request has left: under a
   steady stream of submits some request is always near expiry, the budget
   pins itself to its floor, and a healthy-but-slow cluster (a cross-region

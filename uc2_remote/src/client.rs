@@ -112,16 +112,18 @@ pub struct RemoteConfig {
     ///
     /// **The enforcement invariant**: a pending request is failed with
     /// [`RemoteError::TimedOut`] no later than
-    /// `request_timeout + connect_timeout + SWEEP_INTERVAL` — *including*
+    /// `request_timeout + 2 x connect_timeout + SWEEP_INTERVAL` — *including*
     /// while the client is disconnected and reconnecting. The sweep that
     /// enforces the budget runs on the reader's tick, **between every dial
     /// attempt and every redirect hop**, and in slices through the reconnect
     /// backoff, so neither an endless redirect chase (every dial succeeding,
     /// so the reader never returns to its tick) nor an unreachable cluster
     /// (every dial failing, so the reader sleeps and then scans) can starve
-    /// it. The `connect_timeout` term is the one dial attempt that may already
-    /// be in flight when the budget expires: a sweep cannot interrupt a
-    /// blocking connect.
+    /// it. The `2 x connect_timeout` term is the one dial attempt that may
+    /// already be in flight when the budget expires — a sweep cannot interrupt
+    /// a blocking connect — and it is doubled because **one in-flight dial
+    /// attempt bounds connect and the `HELLO` reply separately, each by
+    /// `connect_timeout`**.
     ///
     /// Two caveats, both bounded and both deliberate:
     ///
@@ -136,13 +138,11 @@ pub struct RemoteConfig {
     ///   long for the lock. Same trade as the one documented on the client's
     ///   single-lock design.
     ///
-    /// One further honest detail: one dial *attempt* bounds its TCP connect
-    /// and its `HELLO` handshake by `connect_timeout` **separately**, so an
-    /// attempt that stalls in both stalls for up to `2 x connect_timeout`.
-    /// A single combined per-attempt budget was deliberately NOT taken: it
-    /// would leave a slow-but-healthy link (a connect eating most of the
-    /// budget on a cross-region hop) too little to finish its handshake, which
-    /// is a worse failure than a bounded delay.
+    /// The separate bounding an attempt gives its connect and its handshake —
+    /// the reason for the `2 x` above — is deliberate. A single combined
+    /// per-attempt budget would leave a slow-but-healthy link (a connect
+    /// eating most of the budget on a cross-region hop) too little to finish
+    /// its handshake, which is a worse failure than a bounded delay.
     ///
     /// Note this is **not** the socket write timeout — that is the crate's own
     /// `WRITE_TIMEOUT` constant (2 s), deliberately short because a write
@@ -1439,7 +1439,8 @@ fn dial(
 /// combined one. See the note on [`RemoteConfig::request_timeout`]: a single
 /// budget would starve the handshake on a link whose connect is slow but
 /// healthy, and the cost of two is a bounded `2 x connect_timeout` worst case
-/// for one attempt, which the caller's between-attempt sweep already tolerates.
+/// for one attempt — the term that appears in the invariant documented on
+/// [`RemoteConfig::request_timeout`].
 fn dial_one(cfg: &RemoteConfig, client_id: u64, addr: &str) -> Dialed {
     let Some(sa) = addr.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
         return Dialed::Failed;
