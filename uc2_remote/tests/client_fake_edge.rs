@@ -627,3 +627,100 @@ fn request_timeout_and_shutdown_are_prompt_while_every_member_is_unreachable() {
     let err = t.wait_timeout(WAIT).unwrap_err();
     assert!(matches!(err, RemoteError::Closed | RemoteError::TimedOut), "got {err:?}");
 }
+
+/// A member that completes the TCP handshake and then says nothing at all —
+/// `accept()`s the connection and parks the socket. Dialling it therefore
+/// costs a full `connect_timeout` in the `HELLO` read, deterministically, with
+/// no dependence on how the CI network treats an unroutable address (a
+/// SYN-blackhole test is not portable: many networks answer with ICMP, which
+/// fails the connect instantly and proves nothing).
+struct ParkingMember {
+    addr: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    acceptor: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ParkingMember {
+    fn spawn() -> ParkingMember {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().unwrap().to_string();
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let s = stop.clone();
+        let acceptor = std::thread::spawn(move || {
+            // Held, never read from, never written to — and closed only when
+            // this thread returns, which is what makes the client's read
+            // block rather than fail.
+            let mut parked = Vec::new();
+            while !s.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((sock, _)) => parked.push(sock),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(2))
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        ParkingMember { addr, stop, acceptor: Some(acceptor) }
+    }
+}
+
+impl Drop for ParkingMember {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = self.acceptor.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// **Regression, M12c Task 3b fix round 1.** One dial *pass* is not a fine
+/// enough grain for either `request_timeout` or `shutdown`.
+///
+/// A pass costs up to `(members + 1 + MAX_REDIRECT_HOPS)` attempts, each of
+/// which can burn `connect_timeout`. With four members that accept and then
+/// never answer, a pass costs ~4 s — so a client that sweeps only *between*
+/// passes fails a 500 ms request after ~4 s, and a `shutdown` issued mid-pass
+/// blocks for the rest of it. Sweeping and re-checking `closed` between every
+/// attempt bounds both by one in-flight attempt instead.
+#[test]
+fn a_dial_pass_over_unanswering_members_is_swept_and_interruptible() {
+    let parked: Vec<ParkingMember> = (0..4).map(|_| ParkingMember::spawn()).collect();
+    let edge = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let mut members = vec![edge.addr.clone()];
+    members.extend(parked.iter().map(|p| p.addr.clone()));
+    let client = RemoteClient::connect(RemoteConfig {
+        request_timeout: Duration::from_millis(500),
+        connect_timeout: Duration::from_secs(1),
+        ping_interval: Duration::from_millis(50),
+        dead_after: Duration::from_millis(200),
+        ..cfg(members)
+    })
+    .unwrap();
+
+    // The only member that answers goes away; every reconnect from here on
+    // scans four members that accept and stall.
+    drop(edge);
+
+    let started = std::time::Instant::now();
+    let err = client.submit(b"z").unwrap().wait_timeout(WAIT).unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(matches!(err, RemoteError::TimedOut), "got {err:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "took {elapsed:?} on a 500ms budget: the bound is request_timeout + one in-flight \
+         attempt (1s), not a whole 4s pass"
+    );
+
+    // ...and `shutdown` lands within one in-flight attempt too, rather than
+    // waiting out the pass it interrupts.
+    let t = client.submit(b"y").unwrap();
+    let started = std::time::Instant::now();
+    client.shutdown();
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(2), "shutdown took {elapsed:?} mid-pass");
+    let err = t.wait_timeout(WAIT).unwrap_err();
+    assert!(matches!(err, RemoteError::Closed | RemoteError::TimedOut), "got {err:?}");
+}

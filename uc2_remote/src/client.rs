@@ -88,11 +88,6 @@ const SELF_REDIRECT_BACKOFF: Duration = Duration::from_millis(10);
 /// outlast a pending request's budget.
 const RECONNECT_BACKOFF_START: Duration = Duration::from_millis(5);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
-/// Floor on one dial attempt's connect+handshake budget when a nearly-expired
-/// request shortens it. A zero budget would fail every connect instantly and
-/// turn the reconnect loop into a spin, so the shortening stops here: the
-/// request is about to be swept anyway.
-const MIN_DIAL_BUDGET: Duration = Duration::from_millis(25);
 /// Hops followed during one connect scan — a `REDIRECT` at the handshake, or
 /// a `HELLO_OK` that names a leader other than the edge that sent it.
 const MAX_REDIRECT_HOPS: usize = 8;
@@ -115,16 +110,39 @@ pub struct RemoteConfig {
     pub max_inflight: u32,
     /// End-to-end budget for one request, across re-sends and reconnects.
     ///
-    /// **The enforcement invariant**: a request is resolved within
-    /// `request_timeout + ~(SWEEP_INTERVAL + connect_timeout)` — *including*
+    /// **The enforcement invariant**: a pending request is failed with
+    /// [`RemoteError::TimedOut`] no later than
+    /// `request_timeout + connect_timeout + SWEEP_INTERVAL` — *including*
     /// while the client is disconnected and reconnecting. The sweep that
-    /// enforces the budget runs on the reader's tick, between dial attempts,
-    /// and in slices through the reconnect backoff, so neither an endless
-    /// redirect chase (every dial succeeding, so the reader never returns to
-    /// its tick) nor an unreachable cluster (every dial failing, so the reader
-    /// sleeps) can starve it. The `connect_timeout` term is the one dial
-    /// attempt that may already be in flight when the budget expires — itself
-    /// shortened to what the oldest pending request has left.
+    /// enforces the budget runs on the reader's tick, **between every dial
+    /// attempt and every redirect hop**, and in slices through the reconnect
+    /// backoff, so neither an endless redirect chase (every dial succeeding,
+    /// so the reader never returns to its tick) nor an unreachable cluster
+    /// (every dial failing, so the reader sleeps and then scans) can starve
+    /// it. The `connect_timeout` term is the one dial attempt that may already
+    /// be in flight when the budget expires: a sweep cannot interrupt a
+    /// blocking connect.
+    ///
+    /// Two caveats, both bounded and both deliberate:
+    ///
+    /// - A peer that stalls **mid-frame** parks the reader inside
+    ///   `read_frame(dead_after)`, so the sweep can be delayed by up to
+    ///   `dead_after` instead of `SWEEP_INTERVAL`. That bound is what
+    ///   `dead_after` is for; shortening it here would mean re-issuing reads
+    ///   mid-frame, which is the wedge `FramedConn`'s `max_stall` exists to
+    ///   prevent.
+    /// - A **submitting thread's** `pump` write happens under the state lock
+    ///   and is bounded by `WRITE_TIMEOUT` (2 s), so a sweep can wait that
+    ///   long for the lock. Same trade as the one documented on the client's
+    ///   single-lock design.
+    ///
+    /// One further honest detail: one dial *attempt* bounds its TCP connect
+    /// and its `HELLO` handshake by `connect_timeout` **separately**, so an
+    /// attempt that stalls in both stalls for up to `2 x connect_timeout`.
+    /// A single combined per-attempt budget was deliberately NOT taken: it
+    /// would leave a slow-but-healthy link (a connect eating most of the
+    /// budget on a cross-region hop) too little to finish its handshake, which
+    /// is a worse failure than a bounded delay.
     ///
     /// Note this is **not** the socket write timeout — that is the crate's own
     /// `WRITE_TIMEOUT` constant (2 s), deliberately short because a write
@@ -413,9 +431,10 @@ impl RemoteClient {
         // it had to skip, so they are built before the first dial rather than
         // after it.
         let stats = Stats::default();
-        // Nothing is pending at connect: the full `connect_timeout` applies.
-        let (conn, info, idx, addr) =
-            dial(&cfg, client_id, None, 0, &stats, cfg.connect_timeout)?;
+        // No `Inner` exists yet, so there is nothing to sweep and no
+        // `closed` flag to watch: this scan is bounded by the caller's own
+        // patience, exactly as before.
+        let (conn, info, idx, addr) = dial(&cfg, client_id, None, 0, &stats, None)?;
         let read_half = conn.try_clone()?;
         read_half.set_read_timeout(Some(SWEEP_INTERVAL))?;
         conn.set_write_timeout(Some(WRITE_TIMEOUT))?;
@@ -455,6 +474,12 @@ impl RemoteClient {
     /// local `max_inflight` cap is reached), and gives up with
     /// [`RemoteError::TimedOut`] if credits never reopen within
     /// `request_timeout`.
+    ///
+    /// Note that credit wait is a **separate** `request_timeout` budget from
+    /// the one the returned [`Ticket`] then spends: a caller that blocks the
+    /// full wait here and then waits out the request's own budget can spend
+    /// ~2 x `request_timeout` in total. Size the value with that in mind, or
+    /// bound the whole thing caller-side with [`Ticket::wait_timeout`].
     pub fn submit(&self, cmd: &[u8]) -> Result<Ticket, RemoteError> {
         self.enqueue(Kind::Submit, cmd)
     }
@@ -741,17 +766,6 @@ impl Inner {
         self.cv.notify_all();
     }
 
-    /// What the oldest unanswered request has left of its budget, or `None`
-    /// when nothing is pending. Drives both the dial-attempt budget and the
-    /// invariant documented on [`RemoteConfig::request_timeout`].
-    fn oldest_pending_remaining(&self) -> Option<Duration> {
-        let st = self.state.lock().unwrap();
-        st.pending
-            .values()
-            .map(|p| self.cfg.request_timeout.saturating_sub(p.created.elapsed()))
-            .min()
-    }
-
     /// Sleep `total`, in [`SWEEP_INTERVAL`] slices, sweeping between them and
     /// giving up early on shutdown.
     ///
@@ -1021,15 +1035,21 @@ impl Inner {
     /// tries again, while `sweep` keeps failing requests that run out of budget.
     ///
     /// **`sweep` runs here, at the top of every iteration**, and that is not
-    /// belt-and-braces. The reader's tick — the other place it runs — is only
-    /// reached between reads on a live connection, and there are two ways to
-    /// never get back there: every dial *failing* (the loop sleeps its backoff
-    /// below), and every dial *succeeding* (an edge pair that redirects each
-    /// request to the other, or one edge redirecting to an address that is
-    /// down, puts the reader in a reconnect churn that resets its tick clock
-    /// every cycle). The second cost a real cluster its `request_timeout`
-    /// entirely: observed in the M12c quickstart as a client hung >200 s on a
-    /// 10 s budget while an edge logged 37 000 redirects.
+    /// belt-and-braces. The reader's tick — one of the other places it runs —
+    /// is only reached between reads on a live connection, and there are two
+    /// ways to never get back there: every dial *failing* (the loop sleeps its
+    /// backoff below, in sweeping slices), and every dial *succeeding* (an
+    /// edge pair that redirects each request to the other, or one edge
+    /// redirecting to an address that is down, puts the reader in a reconnect
+    /// churn that resets its tick clock every cycle). The second cost a real
+    /// cluster its `request_timeout` entirely: observed in the M12c quickstart
+    /// as a client hung >200 s on a 10 s budget while an edge logged 37 000
+    /// redirects.
+    ///
+    /// The sweep INSIDE one scan — between each `dial_one` and each redirect
+    /// hop — lives in [`dial`], which takes this `Inner` for exactly that:
+    /// a single pass can cost `(members + 1 + MAX_REDIRECT_HOPS)` attempts,
+    /// so "between passes" was never a fine enough grain.
     fn reconnect(&self, preferred: Option<String>, rd: &mut FramedConn) -> bool {
         if self.is_closed() {
             return false;
@@ -1053,12 +1073,21 @@ impl Inner {
                 st.resend_from = st.pending.keys().next().copied().unwrap_or(u64::MAX);
                 st.member_idx + 1
             };
-            // One dial attempt may not outlast the request it is dialling
-            // for: a pass over an unreachable member list otherwise costs
-            // `connect_timeout` per member before anything is swept.
-            let budget = attempt_budget(self.cfg.connect_timeout, self.oldest_pending_remaining());
-            match dial(&self.cfg, self.client_id, preferred.as_deref(), start, &self.stats, budget)
-            {
+            // `dial` sweeps and re-checks `closed` between every attempt and
+            // every redirect hop — passing `Some(self)` is what makes a scan
+            // over an unreachable member list interruptible. Each attempt
+            // still gets the FULL `connect_timeout`: timeliness comes from
+            // sweeping, never from short dials (a shortened budget pins
+            // itself under a steady stream of submits and can make a healthy
+            // but slow cluster permanently unreachable).
+            match dial(
+                &self.cfg,
+                self.client_id,
+                preferred.as_deref(),
+                start,
+                &self.stats,
+                Some(self),
+            ) {
                 Ok((conn, info, idx, addr)) => {
                     let read_half = match conn
                         .try_clone()
@@ -1100,6 +1129,9 @@ impl Inner {
                     *rd = read_half;
                     return true;
                 }
+                // The scan noticed `shutdown` between attempts and abandoned
+                // itself. Nothing to retry, nothing to sleep for.
+                Err(RemoteError::Closed) => return false,
                 Err(RemoteError::HelloRefused { reason, detail }) => {
                     self.fail_all_and_close(|| RemoteError::HelloRefused {
                         reason,
@@ -1280,7 +1312,7 @@ fn dial(
     preferred: Option<&str>,
     start_idx: usize,
     stats: &Stats,
-    budget: Duration,
+    between: Option<&Inner>,
 ) -> Result<(FramedConn, HelloInfo, usize, String), RemoteError> {
     let n = cfg.members.len();
     if n == 0 {
@@ -1308,9 +1340,25 @@ fn dial(
     // election (the edge will redirect, which is slower but never stuck).
     let mut fallback: Option<(FramedConn, HelloInfo, usize, String)> = None;
     while i < order.len() {
+        // BETWEEN EVERY ATTEMPT AND EVERY REDIRECT HOP (each is one iteration
+        // of this loop): fail whatever ran out of budget, and abandon the scan
+        // if the client was shut down. Without this, `request_timeout` and
+        // `shutdown` are both quantised to a whole pass —
+        // `(members + 1 + MAX_REDIRECT_HOPS)` attempts, each up to
+        // `connect_timeout`. Nothing here is held across the connect itself:
+        // `sweep`/`is_closed` take the state lock and give it back.
+        if let Some(inner) = between {
+            inner.sweep();
+            if inner.is_closed() {
+                if let Some((conn, ..)) = fallback {
+                    conn.shutdown();
+                }
+                return Err(RemoteError::Closed);
+            }
+        }
         let addr = order[i].clone();
         visited.push(addr.clone());
-        match dial_one(cfg, client_id, &addr, budget) {
+        match dial_one(cfg, client_id, &addr) {
             Dialed::Ok(conn, info) => {
                 let idx = cfg.members.iter().position(|m| *m == addr).unwrap_or(start_idx % n);
                 // `HELLO_OK` named a leader that is not this edge. Hop to it
@@ -1383,26 +1431,25 @@ fn dial(
     Err(RemoteError::NoMembersReachable)
 }
 
-/// One dial attempt's connect+handshake budget: [`RemoteConfig::connect_timeout`],
-/// shortened to whatever the oldest pending request has left (floored at
-/// [`MIN_DIAL_BUDGET`]) so a dial pass can never overrun a request's own
-/// deadline. `None` — nothing pending — leaves `connect_timeout` alone.
-fn attempt_budget(connect_timeout: Duration, oldest_remaining: Option<Duration>) -> Duration {
-    match oldest_remaining {
-        Some(r) => connect_timeout.min(r.max(MIN_DIAL_BUDGET)),
-        None => connect_timeout,
-    }
-}
-
-fn dial_one(cfg: &RemoteConfig, client_id: u64, addr: &str, budget: Duration) -> Dialed {
+/// One attempt: TCP connect, `HELLO`, and whatever the edge answers.
+///
+/// Both halves are bounded by [`RemoteConfig::connect_timeout`] — the connect
+/// by `connect_timeout` itself, the handshake by the read/write timeouts and
+/// the deadline below — deliberately as two separate budgets rather than one
+/// combined one. See the note on [`RemoteConfig::request_timeout`]: a single
+/// budget would starve the handshake on a link whose connect is slow but
+/// healthy, and the cost of two is a bounded `2 x connect_timeout` worst case
+/// for one attempt, which the caller's between-attempt sweep already tolerates.
+fn dial_one(cfg: &RemoteConfig, client_id: u64, addr: &str) -> Dialed {
     let Some(sa) = addr.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
         return Dialed::Failed;
     };
-    let Ok(sock) = TcpStream::connect_timeout(&sa, budget) else {
+    let Ok(sock) = TcpStream::connect_timeout(&sa, cfg.connect_timeout) else {
         return Dialed::Failed;
     };
     let Ok(mut conn) = FramedConn::new(sock) else { return Dialed::Failed };
-    if conn.set_read_timeout(Some(budget)).is_err() || conn.set_write_timeout(Some(budget)).is_err()
+    if conn.set_read_timeout(Some(cfg.connect_timeout)).is_err()
+        || conn.set_write_timeout(Some(cfg.connect_timeout)).is_err()
     {
         return Dialed::Failed;
     }
@@ -1418,9 +1465,9 @@ fn dial_one(cfg: &RemoteConfig, client_id: u64, addr: &str, budget: Duration) ->
     if conn.write_frame(hello, &out).is_err() {
         return Dialed::Failed;
     }
-    let deadline = Instant::now() + budget;
+    let deadline = Instant::now() + cfg.connect_timeout;
     loop {
-        match conn.read_frame(budget) {
+        match conn.read_frame(cfg.connect_timeout) {
             Ok(Some((h, payload))) => {
                 return match h.ty {
                     FrameType::HelloOk => match HelloOk::decode(&payload) {
@@ -1471,38 +1518,4 @@ fn random_u64() -> u64 {
     );
     let v = h.finish();
     if v == 0 { 0x5DEE_CE66_D1CE_4B1D } else { v }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The dial-attempt budget is the pair `(connect_timeout, what the oldest
-    /// pending request has left)` — smaller wins, floored so it can never
-    /// become a spin.
-    #[test]
-    fn a_dial_attempt_never_outlasts_the_request_it_is_dialing_for() {
-        let ct = Duration::from_secs(2);
-        assert_eq!(attempt_budget(ct, None), ct, "nothing pending: the full budget");
-        assert_eq!(
-            attempt_budget(ct, Some(Duration::from_millis(500))),
-            Duration::from_millis(500),
-            "a request with less left than connect_timeout shortens the attempt"
-        );
-        assert_eq!(
-            attempt_budget(ct, Some(Duration::from_secs(30))),
-            ct,
-            "a request with more left than connect_timeout does not lengthen it"
-        );
-        assert_eq!(
-            attempt_budget(ct, Some(Duration::ZERO)),
-            MIN_DIAL_BUDGET,
-            "an already-expired request floors the attempt rather than zeroing it"
-        );
-        assert_eq!(
-            attempt_budget(Duration::from_millis(10), Some(Duration::ZERO)),
-            Duration::from_millis(10),
-            "the floor never lengthens a deliberately short connect_timeout"
-        );
-    }
 }

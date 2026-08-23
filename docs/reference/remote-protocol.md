@@ -317,6 +317,30 @@ client absorbs them:
   `RemoteClient::connect` (along with a non-empty `app_id` and `members`, and
   a non-zero `max_inflight`) — a refusal there is `RemoteError::Config`,
   raised before any socket is opened.
+- **`request_timeout` is enforced while reconnecting, not only while
+  connected.** A pending request is failed with `TimedOut` no later than
+  `request_timeout + connect_timeout + SWEEP_INTERVAL` (25 ms), *including*
+  when the client is disconnected and scanning `members`. A conforming client
+  therefore has to run its timeout sweep **between every dial attempt and
+  every redirect hop** — not once per pass: one pass costs up to
+  `(members + 1 + max_redirect_hops)` attempts, and two shapes starve a
+  coarser sweep completely. Every dial *failing* leaves the reader sleeping
+  its reconnect backoff (so that sleep is taken in sweep-sized slices), and
+  every dial *succeeding* — an edge pair that redirects each request to the
+  other, or one edge redirecting to an address that is down — leaves the
+  reader in a reconnect churn that never returns to its idle tick at all.
+  The `connect_timeout` term is the one attempt already in flight when the
+  budget expires; a sweep cannot interrupt a blocking connect. Do **not**
+  shorten a dial attempt's budget to what a pending request has left: under a
+  steady stream of submits some request is always near expiry, the budget
+  pins itself to its floor, and a healthy-but-slow cluster (a cross-region
+  hop, or a gateway briefly saturated after a failover) becomes permanently
+  unreachable. Two bounded caveats on the same invariant: a peer stalling
+  mid-frame parks the reader for up to `dead_after` (next bullet), and a
+  submitting thread's write holds the client's state lock for up to its write
+  timeout. `RemoteClient::submit`'s credit wait is a *separate*
+  `request_timeout` budget from the one the returned ticket spends, so a
+  caller's worst case is about twice the configured value.
 - **A peer that stalls mid-frame is a dead peer.** A frame that is still
   incomplete after the reader's stall budget (`dead_after` for
   `RemoteClient`, `request_timeout` for the reference edge) fails the
