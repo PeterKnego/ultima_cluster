@@ -195,10 +195,23 @@ impl<S: RawStateMachine> RawStateMachine for Sessioned<S> {
         // Fresh: seq is new (including a gap — the Raft-paper session model
         // only rejects seqs at or below the highest seen, never gaps; and
         // `None` — no seq seen yet at all — always counts as fresh too).
+        // The inner SM is given its OWN buffer, not `out` with the tag byte
+        // already in it. `RawStateMachine::apply`'s contract says `out` is
+        // "cleared by the caller", and `Sessioned` is a caller: handing the
+        // inner a one-byte-long buffer and then recovering the response as
+        // `out[start..]` silently required the inner to APPEND. An inner SM
+        // that clears `out` first — which the contract invites — truncated
+        // the tag away and panicked the apply thread on the slice
+        // (M12d finding #1; regression test
+        // `an_inner_sm_that_clears_out_does_not_panic_the_apply_thread`).
+        //
+        // Cost-neutral: the old shape allocated once anyway, in `to_vec()`,
+        // to put the response in the dedup window. This allocates the same
+        // buffer up front and MOVES it into the window instead of copying.
+        let mut resp = Vec::new();
+        self.inner.apply(position, body, &mut resp);
         out.push(TAG_FRESH);
-        let start = out.len();
-        self.inner.apply(position, body, out);
-        let resp = out[start..].to_vec();
+        out.extend_from_slice(&resp);
         let resp_len = resp.len();
         let st = self.clients.get_mut(&client_id).expect("entry inserted above");
         st.highest_seq = Some(seq);
@@ -282,6 +295,7 @@ impl<S: SnapshotStateMachine> SnapshotStateMachine for Sessioned<S> {
     }
 
     fn install_snapshot(&mut self, position: u64, src: &mut dyn std::io::Read) -> Result<u64, SnapshotError> {
+        use std::io::Read as _;
         let mut len_buf = [0u8; 8];
         src.read_exact(&mut len_buf)?;
         let len = u64::from_le_bytes(len_buf);
@@ -290,8 +304,19 @@ impl<S: SnapshotStateMachine> SnapshotStateMachine for Sessioned<S> {
                 "session table blob length {len} exceeds the {MAX_TABLE_BLOB_LEN}-byte sanity bound"
             )));
         }
-        let mut blob = vec![0u8; len as usize];
-        src.read_exact(&mut blob)?;
+        // Grow to what the stream ACTUALLY supplies rather than pre-allocating
+        // `len` bytes on the strength of an 8-byte prefix nothing has
+        // validated yet. `MAX_TABLE_BLOB_LEN` above is still the hard ceiling;
+        // `take` makes it a ceiling rather than an instruction, so a stream
+        // that claims 1 GiB and supplies 40 bytes costs 40 bytes.
+        let mut blob = Vec::new();
+        src.take(len).read_to_end(&mut blob)?;
+        if blob.len() as u64 != len {
+            return Err(SnapshotError::Codec(format!(
+                "session table blob truncated: header claims {len} bytes, stream supplied {}",
+                blob.len()
+            )));
+        }
         let (img, _): (TableImage, _) = bincode::serde::decode_from_slice(&blob, bincode::config::standard())
             .map_err(|e| SnapshotError::Codec(format!("session table decode: {e}")))?;
 

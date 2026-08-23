@@ -261,6 +261,14 @@ pub fn read_cnc_header(page: &[u8]) -> Option<CncHeader> {
 /// (never panics — this reads bytes from a page potentially written by a
 /// mismatched/foreign process).
 pub fn read_cnc_app_id(page: &[u8]) -> &str {
+    // M12d: total on `&[u8]`. A page too short to contain the app_id field
+    // reads as the empty app_id, which no caller ever matches (an empty
+    // `app_id` is refused at every IPC entry), rather than panicking on the
+    // slice index. Callers still hand this a full 4 KiB mapped page; this is
+    // belt and braces for a truncated or corrupt `cnc.dat`.
+    if page.len() < CNC_OFF_APP_ID + 64 {
+        return "";
+    }
     let bytes = &page[CNC_OFF_APP_ID..CNC_OFF_APP_ID + 64];
     let nul = bytes.iter().position(|&b| b == 0).unwrap_or(64);
     core::str::from_utf8(&bytes[..nul]).unwrap_or("")
@@ -280,6 +288,23 @@ pub const fn version_compatible(local: u32, peer: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M12d: `read_cnc_app_id` is total on `&[u8]` — a page too short for the
+    /// app_id field returns `""`, never a slice-index panic. The one-byte
+    /// boundary either side of the field's end is pinned so the guard cannot
+    /// drift off by one, and the full-page case must still decode (so the
+    /// test cannot pass by always returning `""`).
+    #[test]
+    fn short_pages_read_an_empty_app_id_not_a_panic() {
+        for n in 0..CNC_OFF_APP_ID + 64 {
+            assert_eq!(read_cnc_app_id(&vec![0u8; n]), "", "page len {n}");
+        }
+        let mut page = vec![0u8; CNC_PAGE_LEN];
+        write_cnc_header(&mut page, &header(1), "fuzz");
+        assert_eq!(read_cnc_app_id(&page), "fuzz");
+        assert_eq!(read_cnc_app_id(&page[..CNC_OFF_APP_ID + 64]), "fuzz");
+        assert_eq!(read_cnc_app_id(&page[..CNC_OFF_APP_ID + 63]), "");
+    }
 
     fn header(node_id: u32) -> CncHeader {
         CncHeader {

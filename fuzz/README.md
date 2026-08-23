@@ -55,21 +55,37 @@ scripts/fuzz_smoke.sh 60 uc_protocol_datagram
 ```
 
 Runs each target for `SECS` seconds against the committed corpus and exits 1
-on the first crash, naming the artifact directory. This is the CI-shaped
+on the first crash, naming the artifact directory. With no target arguments it
+enumerates targets with `cargo fuzz list` and **skips the `seed-corpus`
+generator bin**, which is a `[[bin]]` in this manifest but not a fuzz target.
+
+Note that this repo sets a global `CARGO_TARGET_DIR`
+(`~/.cache/cargo-target`), so the sanitizer-instrumented fuzz builds land in
+that shared cache next to the ordinary workspace artifacts rather than under
+`fuzz/target/`. They are a separate target triple subdirectory, so they do not
+collide with or invalidate the normal `cargo build` cache — but they are not
+cleaned by removing `fuzz/target/` either. This is the CI-shaped
 invocation: short, deterministic-ish, and green means "no new crash from this
 corpus in that budget" — it is a regression gate, not a bug hunt. Real hunting
 is a long `cargo fuzz run` with a large `-max_total_time`.
 
 ## Regenerating the seed corpus
 
-Seeds are built from fixed literals with the real `uc_protocol` encoders — no
-clock, no randomness — so the generator is deterministic and idempotent:
+Seeds are built from fixed literals with the real encoders — no clock, no
+randomness — so the generator is deterministic and idempotent:
 
 ```bash
 cd fuzz && cargo +nightly run --bin seed-corpus
 ```
 
 Add or change a seed in `src/seeds.rs`, re-run, and commit the corpus files.
+
+Two seeds are the exception, marked `Regen::IfAbsent` in `src/seeds.rs`: a
+genuine Noise `IK` message 1 and a genuinely minted group key. Both come from
+real code paths that draw from the OS RNG, so their bytes cannot be
+reproduced — having them is worth more than regenerating them, so the
+generator writes those files only when they are absent and otherwise leaves
+the committed bytes alone. Delete the file and re-run to capture a fresh one.
 
 `cargo fuzz run` also writes its own coverage-expanding discoveries into the
 same directory (hash-named files). Those are a local working corpus, not repo
@@ -96,6 +112,16 @@ growth.
 | Target | What it parses |
 | --- | --- |
 | `uc_protocol_datagram` | `uc_protocol::v2::datagram` — the 16-byte header plus every body reader, i.e. the first code an unauthenticated UDP packet reaches. |
+| `uc2_remote_frame` | `uc2_remote::frame` — the gateway edge's 24-byte TCP frame header and every typed body decoder. |
+| `uc2_crypto_open` | `uc2_crypto::seal::{open_in_place, open_detached}` — the AEAD envelope's framing arithmetic on attacker-chosen bytes. |
+| `uc2_crypto_handshake` | `uc2_crypto::handshake::Peers::on_message` — the pre-auth Noise `IK` surface, the first thing in the process to see bytes from anyone who can reach the UDP port. |
+| `uc2_crypto_group_key` | `uc2_crypto::group::GroupPlane::on_key_message` — the two message shapes that share datagram kind 20. |
+| `uc2_crypto_admin` | `uc2_crypto::admin` — a PROPERTY target over the M12b signed-tag layout (canonical length, sign/verify, tag bit-flip, foreign key). |
+| `ultima_journal_record` | `ultima_journal`'s segment header and record decoder — what crash recovery meets in a torn or corrupt segment. |
+| `ultima_journal_stable_value` | `ultima_journal::stable_value` — the durable vote / term map / snapshot floor slots. |
+| `uc_protocol_cnc` | `uc_protocol::v2::cnc` — the 4 KiB control page every attaching process maps and parses. |
+| `uc_protocol_log_frame` | `uc_protocol::v2::frame::read_header` behind the real caller's `len >= HEADER_LEN` guard (that reader is deliberately caller-guarded — see its doc). |
+| `uc2_service_session` | `Sessioned<S>` — the exactly-once envelope and its snapshot install path. |
 
 ## Adding a target
 

@@ -23,6 +23,11 @@ uc2_service = { path = "../uc2_service" }
 uc2_node = { path = "../uc2_node" }
 uc2_gateway = { path = "../uc2_gateway" }
 ultima_journal = { path = "../ultima_journal", package = "ultima-journal" }
+# Only for the fuzz helpers that rebuild uc2_crypto's on-disk test fixtures
+# (an allowlist file is base64 public keys; Identity/Allowlist have no
+# from-bytes constructor by design). Same versions the workspace pins.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+base64 = "0.22"
 
 [[bin]]
 name = "uc_protocol_datagram"
@@ -38,6 +43,76 @@ test = false
 doc = false
 bench = false
 
-# one [[bin]] per target — Tasks 2 and 3 append theirs.
+[[bin]]
+name = "uc2_remote_frame"
+path = "fuzz_targets/uc2_remote_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uc2_crypto_open"
+path = "fuzz_targets/uc2_crypto_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uc2_crypto_handshake"
+path = "fuzz_targets/uc2_crypto_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uc2_crypto_group_key"
+path = "fuzz_targets/uc2_crypto_group_key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uc2_crypto_admin"
+path = "fuzz_targets/uc2_crypto_admin.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ultima_journal_record"
+path = "fuzz_targets/ultima_journal_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ultima_journal_stable_value"
+path = "fuzz_targets/ultima_journal_stable_value.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uc_protocol_cnc"
+path = "fuzz_targets/uc_protocol_cnc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uc_protocol_log_frame"
+path = "fuzz_targets/uc_protocol_log_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uc2_service_session"
+path = "fuzz_targets/uc2_service_session.rs"
+test = false
+doc = false
+bench = false
+
+# one [[bin]] per target — Task 3 appends theirs.
 
 [workspace]

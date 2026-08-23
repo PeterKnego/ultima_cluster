@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Peter Knego
+#![no_main]
+
+use libfuzzer_sys::fuzz_target;
+use std::sync::Mutex;
+use uc2_crypto::HandshakeAction;
+use uc2_crypto::handshake::Peers;
+
+// The pre-auth Noise `IK` surface: `Peers::on_message` is, in its own words,
+// "the first thing in the process to see bytes from anyone who can reach the
+// UDP port". The first fuzz byte picks the datagram kind (so HS_INIT, HS_RESP
+// and every non-handshake kind are all reachable), the rest is the body.
+static PEERS: Mutex<Option<Peers>> = Mutex::new(None);
+
+fuzz_target!(|data: &[u8]| {
+    let Some((&kind, body)) = data.split_first() else {
+        return;
+    };
+    let mut g = PEERS.lock().unwrap();
+    let peers = g.get_or_insert_with(uc2_fuzz::responder_peers);
+
+    let acts = peers.on_message(uc2_fuzz::B_ID, kind, body, 1_000_000);
+
+    // A genuine message 1 (the seed corpus carries one) ESTABLISHES a session,
+    // after which this `Peers` is no longer the never-seen-a-packet responder
+    // the target is meant to model — snow's handshake state has advanced and
+    // subsequent inputs would only exercise the transport path. Rebuild on
+    // success so the pre-auth surface stays the thing being fuzzed. Rare, so
+    // the per-iteration cost stays at one mutex lock.
+    if acts.iter().any(|a| matches!(a, HandshakeAction::Established { .. })) {
+        *g = None;
+    }
+});

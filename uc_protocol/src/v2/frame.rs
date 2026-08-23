@@ -70,6 +70,16 @@ pub fn write_header_except_length(buf: &mut [u8], h: &FrameHeader) {
 /// Parse a header from a committed frame. The caller must already have
 /// observed `length != 0` via an acquire load (or hold the buffer's
 /// single-writer/contiguity guarantees); this function does plain reads.
+///
+/// **Deliberately NOT total on `&[u8]`, unlike the `v2::datagram` readers**
+/// (M12d ruling). This is the apply thread's innermost hot path, called once
+/// per committed frame, and its input is never network bytes: the caller has
+/// already observed a non-zero length through an acquire load on a buffer it
+/// knows holds `HEADER_LEN` readable bytes, which is a stronger precondition
+/// than a length compare here could re-establish. `buf` shorter than
+/// [`HEADER_LEN`] is a caller bug, and panicking is the correct fail-stop.
+/// The `uc_protocol_log_frame` fuzz target reproduces the real caller's
+/// guard (`len >= HEADER_LEN`) rather than removing it.
 pub fn read_header(buf: &[u8]) -> FrameHeader {
     FrameHeader {
         length: u32::from_le_bytes(buf[OFF_LENGTH..OFF_LENGTH + 4].try_into().unwrap()),

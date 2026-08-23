@@ -225,3 +225,92 @@ fn freeze_with_trailing_replayed_frames_round_trips() {
         "the dedup table survived even though the pre-freeze snapshot carried a trailing replayed frame's last_seen_pos bump"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M12d finding #1 — the inner SM's `out` must arrive CLEARED.
+// ---------------------------------------------------------------------------
+
+/// A raw SM that clears `out` before writing, which is exactly what
+/// [`RawStateMachine::apply`]'s doc invites ("Write the response bytes into
+/// `out` (cleared by the caller)") and what a defensive implementation does.
+/// It also writes NOTHING for an empty command, so the response can be empty.
+struct ClearsOutSm {
+    applied: Option<u64>,
+}
+impl RawStateMachine for ClearsOutSm {
+    fn apply(&mut self, position: u64, cmd: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        self.applied = Some(position);
+        out.extend_from_slice(cmd);
+    }
+    fn query(&self, q: &[u8], out: &mut Vec<u8>) {
+        out.clear();
+        out.extend_from_slice(q);
+    }
+    fn last_applied(&self) -> Option<u64> {
+        self.applied
+    }
+}
+
+/// Found by the M12d `uc2_service_session` fuzz seed generator: `Sessioned`
+/// pushed its tag byte into `out` and THEN called the inner SM with that
+/// non-empty buffer, slicing `out[start..]` afterwards to recover the
+/// response. An inner SM that clears `out` first — permitted, indeed implied,
+/// by the trait's documented contract — left `out` shorter than `start` and
+/// panicked the apply thread with "range start index 1 out of range for slice
+/// of length 0". The fix builds the inner response in its own buffer, so the
+/// inner SM always receives a genuinely cleared `out`.
+#[test]
+fn an_inner_sm_that_clears_out_does_not_panic_the_apply_thread() {
+    let mut s = Sessioned::new(ClearsOutSm { applied: None }, SessionConfig::default());
+    let mut out = Vec::new();
+
+    // Empty body: the inner writes nothing at all, the hardest case.
+    s.apply(10, &env_raw(1, 1, b""), &mut out);
+    assert_eq!(out, vec![TAG_FRESH]);
+
+    // Non-empty body: tag then the inner's bytes, in that order.
+    out.clear();
+    s.apply(20, &env_raw(1, 2, b"hello"), &mut out);
+    assert_eq!(out[0], TAG_FRESH);
+    assert_eq!(&out[1..], b"hello");
+
+    // And the cached response is the inner's bytes, so a replay reproduces it.
+    out.clear();
+    s.apply(30, &env_raw(1, 2, b"hello"), &mut out);
+    assert_eq!(out[0], TAG_REPLAYED);
+    assert_eq!(&out[1..], b"hello");
+}
+
+fn env_raw(client: u64, seq: u64, body: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(SESSION_HEADER_LEN + body.len());
+    v.extend_from_slice(&client.to_le_bytes());
+    v.extend_from_slice(&seq.to_le_bytes());
+    v.extend_from_slice(body);
+    v
+}
+
+/// Found by the M12d `uc2_service_session` fuzz target as a 270x throughput
+/// collapse (20 000 executions went from 0.34 s to 91 s): `install_snapshot`
+/// pre-allocated `len` zeroed bytes — up to `MAX_TABLE_BLOB_LEN`, 1 GiB — on
+/// the strength of an 8-byte length prefix, before reading or validating a
+/// single blob byte. A stream that claims 1 GiB and supplies eight bytes cost
+/// a 1 GiB allocation per attempt. The bound is now a ceiling rather than an
+/// instruction: the read grows to what actually arrives, and a short stream
+/// is a named error instead of an opaque `UnexpectedEof`.
+#[test]
+fn a_snapshot_claiming_a_huge_blob_is_refused_without_allocating_it() {
+    let mut s = Sessioned::new(RegisterSm::default(), SessionConfig::default());
+
+    // Claims just under the 1 GiB sanity bound, supplies nothing.
+    let mut artifact = ((1u64 << 30) - 1).to_le_bytes().to_vec();
+    let err = SnapshotStateMachine::install_snapshot(&mut s, 1, &mut artifact.as_slice())
+        .expect_err("a blob shorter than its length prefix must be refused");
+    assert!(format!("{err}").contains("truncated"), "unexpected error: {err}");
+
+    // Over the bound: still refused, by the pre-existing sanity check.
+    artifact = (1u64 << 40).to_le_bytes().to_vec();
+    let err = SnapshotStateMachine::install_snapshot(&mut s, 1, &mut artifact.as_slice())
+        .expect_err("a blob length over the sanity bound must be refused");
+    assert!(format!("{err}").contains("sanity bound"), "unexpected error: {err}");
+}
