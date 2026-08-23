@@ -343,6 +343,16 @@ def render_config(node_id, bind, metrics_bind, instance_dir, members):
         "[metrics]",
         f'bind = "{metrics_bind}"',
         "",
+        # M12b: [crypto]/[admin] became required (explicit-choice config,
+        # spec §3.3) — a node.toml missing either is now a startup refusal.
+        # This gate exercises neither wire crypto nor admin auth, so both
+        # choose the cleartext/filesystem posture.
+        "[crypto]",
+        "enabled = false",
+        "",
+        "[admin]",
+        'auth = "none"',
+        "",
     ]
     for mid, maddr in members:
         lines += ["[[members]]", f"id = {mid}", f'addr = "{maddr}"', ""]

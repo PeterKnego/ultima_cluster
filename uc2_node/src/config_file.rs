@@ -7,14 +7,23 @@
 //! `deny_unknown_fields` so a typo is a startup refusal rather than a
 //! silently-ignored setting — the same posture as M8's crypto boot refusal.
 //! This module does deserialisation ONLY; every semantic rule lives in
-//! [`crate::preflight`].
+//! [`crate::preflight`] — with the same one exception `log.level` already
+//! carried pre-M12b: `[crypto]`/`[admin]` are EXPLICIT CHOICES (spec §3.3),
+//! and validating them (`enabled` vs. the paths it requires, `auth` vs. the
+//! keys it requires) is inseparable from turning the file's `Option`s into
+//! the `CryptoConfig`/[`AdminSection`] values this module already owns
+//! producing, so those checks live here too rather than splitting one
+//! section's rule across two modules.
 //!
 //! `[log]` and `[metrics]` are M10's observability sections. Both are
-//! optional and, like `[purge]`/`[crypto]`, ABSENT means the feature is off:
-//! no `[log]` means the default level (`info`); no `[metrics]` means no
-//! endpoint. `deny_unknown_fields` applies to their contents too — a typo
-//! inside either section is a startup refusal naming the key, not a
-//! silently-ignored setting.
+//! optional and, like `[purge]`, ABSENT means the feature is off: no `[log]`
+//! means the default level (`info`); no `[metrics]` means no endpoint.
+//! `deny_unknown_fields` applies to their contents too — a typo inside
+//! either section is a startup refusal naming the key, not a
+//! silently-ignored setting. `[crypto]` and `[admin]` (M12b) are NOT
+//! optional in this sense — ABSENT is itself a refusal
+//! ([`ConfigError::CryptoChoiceRequired`]/[`ConfigError::AdminChoiceRequired`]);
+//! see [`AdminSection`].
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -35,11 +44,28 @@ pub enum ConfigError {
     #[error("invalid config file {path}: {source}")]
     Parse { path: PathBuf, source: toml::de::Error },
     /// A field passed `deny_unknown_fields`/type-checking but failed its own
-    /// semantic parse (today: only `log.level`). `detail` already names the
-    /// field and echoes the bad value — see `LogLevel::from_str` — so this
-    /// variant must not repeat `field` into the message and double it up.
+    /// semantic parse (`log.level`; the M12b `crypto.*`/`admin.*`
+    /// cross-field rules below). `detail` already names the field and echoes
+    /// the bad value — see `LogLevel::from_str` — so this variant must not
+    /// repeat `field` into the message and double it up.
     #[error("{detail}")]
     Invalid { field: &'static str, detail: String },
+    /// M12b (spec §3.3): `[crypto]` is an explicit choice, not an
+    /// absent-means-off section like `[purge]` — a `node.toml` must say
+    /// `enabled = false` (cleartext) or `enabled = true` with the key paths.
+    #[error(
+        "[crypto] section is required: set enabled = false for cleartext (the default posture) \
+         or enabled = true with key_path/allowlist_path"
+    )]
+    CryptoChoiceRequired,
+    /// M12b (spec §3.3): `[admin]` is likewise an explicit choice — a
+    /// `node.toml` must say `auth = "hmac"` with `keys = [...]` or
+    /// `auth = "none"` (today's posture: filesystem access is the boundary).
+    #[error(
+        "[admin] section is required: auth = \"hmac\" with keys = [...] or auth = \"none\" \
+         (filesystem access is the boundary)"
+    )]
+    AdminChoiceRequired,
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,15 +81,81 @@ struct PurgeSection {
     below_snapshot_slack_bytes: u64,
 }
 
+/// M12b (spec §3.3, §5.4): `enabled` is now REQUIRED — no default — so a
+/// `[crypto]` section that forgot it is a parse error naming the field
+/// (`toml`'s own "missing field `enabled`" message), the same shape as any
+/// other missing-required-field refusal in this file. `key_path`/
+/// `allowlist_path` become optional at the TYPE level (so `enabled = false`
+/// can omit them) — `load_from_path` enforces the real rule: `enabled =
+/// true` requires both, `enabled = false` must not carry either.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CryptoSection {
-    key_path: PathBuf,
-    allowlist_path: PathBuf,
+    enabled: bool,
+    #[serde(default)]
+    key_path: Option<PathBuf>,
+    #[serde(default)]
+    allowlist_path: Option<PathBuf>,
     #[serde(default)]
     rotation_interval_ns: Option<u64>,
     #[serde(default)]
     rotation_bytes: Option<u64>,
+}
+
+/// M12b (spec §5.1): one named HMAC admin key, as it appears in
+/// `[admin].keys`. Not the loaded [`uc2_crypto::admin::AdminKey`] — this is
+/// only the file's `(name, key_path)` pointer; `uc2-node`'s `main` is what
+/// calls `AdminKey::load` on each entry once preflight has passed.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminKeyEntry {
+    pub name: String,
+    pub key_path: PathBuf,
+}
+
+/// M12b (spec §5.1): `[admin].auth`. `None` is today's pre-M12b posture
+/// (filesystem access on the instance directory is the whole boundary);
+/// `Hmac` opts into named, TTL-bounded request signatures — see
+/// [`uc2_crypto::admin::AdminPolicy`], which this maps onto in the daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdminAuthMode {
+    None,
+    Hmac,
+}
+
+/// M12b (spec §3.3, §5.1): `[admin]`, typed. REQUIRED — no default,
+/// [`ConfigError::AdminChoiceRequired`] on absence, mirroring `[crypto]`.
+/// `auth = "hmac"` requires at least one (uniquely-named) entry in `keys`;
+/// `auth = "none"` requires `keys` to be empty (a stray key list under
+/// `"none"` would just be silently ignored otherwise — refused by name
+/// instead). `request_ttl_ms` applies under either mode and must be
+/// `>= 1000` regardless — see `load_from_path`'s validation, not this
+/// struct's own (structural-only) deserialisation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminSection {
+    pub auth: AdminAuthMode,
+    #[serde(default)]
+    pub keys: Vec<AdminKeyEntry>,
+    #[serde(default = "default_admin_ttl_ms")]
+    pub request_ttl_ms: u64,
+}
+
+/// A hand-written [`Default`] (not derived: `AdminAuthMode` has no `Default`
+/// of its own, deliberately — a config file must always state `auth`
+/// explicitly). Used only by test/harness code that needs a valid
+/// [`crate::preflight::StartupOptions`] without going through
+/// [`load_from_path`]; the value matches this same module's `request_ttl_ms`
+/// default so it is never accidentally the thing a `< 1000` test is testing.
+impl Default for AdminSection {
+    fn default() -> Self {
+        AdminSection { auth: AdminAuthMode::None, keys: Vec::new(), request_ttl_ms: default_admin_ttl_ms() }
+    }
+}
+
+fn default_admin_ttl_ms() -> u64 {
+    30_000
 }
 
 #[derive(Debug, Deserialize)]
@@ -106,8 +198,13 @@ struct NodeConfigFile {
     journal_segment_bytes: u64,
     #[serde(default)]
     purge: Option<PurgeSection>,
+    /// M12b: no longer absent-means-off like `[purge]` — see
+    /// [`ConfigError::CryptoChoiceRequired`].
     #[serde(default)]
     crypto: Option<CryptoSection>,
+    /// M12b: required — see [`ConfigError::AdminChoiceRequired`].
+    #[serde(default)]
+    admin: Option<AdminSection>,
     /// TEST/DEV ONLY — see [`crate::preflight::StartupOptions`]. Never
     /// silences the startup warning.
     #[serde(default)]
@@ -169,20 +266,82 @@ pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), Confi
         Some(p) => PurgePolicy::BelowSnapshot { slack_bytes: p.below_snapshot_slack_bytes },
         None => PurgePolicy::Disabled,
     };
-    let crypto = match f.crypto {
-        Some(c) => {
-            let d = RotationPolicy::default();
-            CryptoConfig::Enabled {
-                key_path: c.key_path,
-                allowlist_path: c.allowlist_path,
-                rotation: RotationPolicy {
-                    interval_ns: c.rotation_interval_ns.unwrap_or(d.interval_ns),
-                    bytes: c.rotation_bytes.unwrap_or(d.bytes),
-                },
+    // M12b (spec §3.3, §5.4): explicit choice — absent `[crypto]` is itself
+    // a refusal, not "off".
+    let crypto_section = f.crypto.ok_or(ConfigError::CryptoChoiceRequired)?;
+    let crypto = if crypto_section.enabled {
+        let key_path = crypto_section.key_path.ok_or_else(|| ConfigError::Invalid {
+            field: "crypto.key_path",
+            detail: "crypto.enabled = true requires crypto.key_path".to_string(),
+        })?;
+        let allowlist_path = crypto_section.allowlist_path.ok_or_else(|| ConfigError::Invalid {
+            field: "crypto.allowlist_path",
+            detail: "crypto.enabled = true requires crypto.allowlist_path".to_string(),
+        })?;
+        let d = RotationPolicy::default();
+        CryptoConfig::Enabled {
+            key_path,
+            allowlist_path,
+            rotation: RotationPolicy {
+                interval_ns: crypto_section.rotation_interval_ns.unwrap_or(d.interval_ns),
+                bytes: crypto_section.rotation_bytes.unwrap_or(d.bytes),
+            },
+        }
+    } else {
+        // Ruling 1: `enabled = false` while still naming key material is
+        // refused rather than silently ignored — a config that LOOKS
+        // encrypted must not actually run cleartext.
+        if crypto_section.key_path.is_some() || crypto_section.allowlist_path.is_some() {
+            return Err(ConfigError::Invalid {
+                field: "crypto.enabled",
+                detail: "enabled = false but key_path/allowlist_path given — remove them or set \
+                         enabled = true"
+                    .to_string(),
+            });
+        }
+        CryptoConfig::Disabled
+    };
+    // M12b (spec §3.3, §5.1): same explicit-choice posture for `[admin]`.
+    let admin = f.admin.ok_or(ConfigError::AdminChoiceRequired)?;
+    if admin.request_ttl_ms < 1000 {
+        return Err(ConfigError::Invalid {
+            field: "admin.request_ttl_ms",
+            detail: format!("admin.request_ttl_ms must be >= 1000, got {}", admin.request_ttl_ms),
+        });
+    }
+    match admin.auth {
+        AdminAuthMode::None => {
+            if !admin.keys.is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "admin.keys",
+                    detail: "admin.auth = \"none\" but admin.keys is non-empty — remove the keys \
+                             or set auth = \"hmac\""
+                        .to_string(),
+                });
             }
         }
-        None => CryptoConfig::Disabled,
-    };
+        AdminAuthMode::Hmac => {
+            if admin.keys.is_empty() {
+                return Err(ConfigError::Invalid {
+                    field: "admin.keys",
+                    detail: "admin.auth = \"hmac\" requires at least one entry in admin.keys"
+                        .to_string(),
+                });
+            }
+            let mut seen = std::collections::HashSet::new();
+            for k in &admin.keys {
+                if !seen.insert(k.name.as_str()) {
+                    return Err(ConfigError::Invalid {
+                        field: "admin.keys",
+                        detail: format!(
+                            "duplicate name {:?} in admin.keys — key names must be unique",
+                            k.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
     let log_level = match f.log.and_then(|l| l.level) {
         None => LogLevel::default(),
         Some(s) => s
@@ -212,6 +371,7 @@ pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), Confi
     StartupOptions {
         allow_volatile_fs: f.allow_volatile_fs,
         obs: ObsOptions { log_level, metrics_bind },
+        admin,
     }))
 }
 
@@ -225,9 +385,32 @@ mod tests {
         p
     }
 
-    /// A single-voter config with none of the optional sections — the
-    /// minimal document every optional-section test appends to.
+    /// A single-voter config with none of the OPTIONAL sections — the
+    /// minimal document every optional-section test appends to. `[crypto]`
+    /// and `[admin]` are NOT optional (M12b, spec §3.3) so both are stated
+    /// here at their cleartext/filesystem defaults — the same posture every
+    /// pre-M12b fixture had implicitly.
     const MINIMAL: &str = r#"
+id = 1
+bind = "10.0.0.1:9100"
+instance_dir = "/srv/uc2/n1"
+app_id = "myapp"
+
+[[members]]
+id = 1
+addr = "10.0.0.1:9100"
+
+[crypto]
+enabled = false
+
+[admin]
+auth = "none"
+"#;
+
+    /// Like `MINIMAL` but WITHOUT `[crypto]`/`[admin]` — the base every
+    /// explicit-choice test below appends its own version of one or both
+    /// sections to, since `MINIMAL` itself already states them.
+    const MINIMAL_NO_CRYPTO_ADMIN: &str = r#"
 id = 1
 bind = "10.0.0.1:9100"
 instance_dir = "/srv/uc2/n1"
@@ -262,6 +445,12 @@ addr = "10.0.0.1:9100"
 [[members]]
 id = 2
 addr = "10.0.0.2:9100"
+
+[crypto]
+enabled = false
+
+[admin]
+auth = "none"
 "#,
         );
         let (cfg, opts) = load_from_path(&p).unwrap();
@@ -294,6 +483,12 @@ app_id = "myapp"
 [[members]]
 id = 1
 addr = "10.0.0.1:9100"
+
+[crypto]
+enabled = false
+
+[admin]
+auth = "none"
 "#,
         );
         let (cfg, _opts) = load_from_path(&p).unwrap();
@@ -351,8 +546,12 @@ addr = "10.0.0.1:9100"
 below_snapshot_slack_bytes = 1048576
 
 [crypto]
+enabled = true
 key_path = "/etc/uc2/node.key"
 allowlist_path = "/etc/uc2/allowlist.toml"
+
+[admin]
+auth = "none"
 "#,
         );
         let (cfg, _opts) = load_from_path(&p).unwrap();
@@ -380,13 +579,19 @@ app_id = "myapp"
 [[members]]
 id = 1
 addr = "10.0.0.1:9100"
+
+[crypto]
+enabled = false
+
+[admin]
+auth = "none"
 "#;
         let p = write(dir.path(), body);
         let (_cfg, opts) = load_from_path(&p).unwrap();
         assert!(!opts.allow_volatile_fs, "production default must be refuse");
 
-        // PREPENDED, not appended: `body` ends with a [[members]] table, so a
-        // key added after it belongs to that table, not to the document root.
+        // PREPENDED, not appended: `body` ends with a table ([admin]), so a
+        // key added after it would belong to that table, not the document root.
         let p2 = write(dir.path(), &format!("allow_volatile_fs = true\n{body}"));
         let (_cfg, opts2) = load_from_path(&p2).unwrap();
         assert!(opts2.allow_volatile_fs);
@@ -473,5 +678,150 @@ level = "info"
         // deny_unknown_fields applies.
         let e = load_str(&format!("{MINIMAL}\n[metrics]\nport = 9600\n")).unwrap_err();
         assert!(e.to_string().contains("port"), "{e}");
+    }
+
+    // ---- M12b (spec §3.3): [crypto]/[admin] are explicit choices ----
+
+    #[test]
+    fn absent_crypto_section_is_an_explicit_choice_refusal() {
+        let body = format!("{MINIMAL_NO_CRYPTO_ADMIN}\n[admin]\nauth = \"none\"\n");
+        let err = load_str(&body).unwrap_err();
+        assert!(matches!(err, ConfigError::CryptoChoiceRequired), "got: {err:?}");
+        assert!(err.to_string().contains("[crypto]"), "{err}");
+    }
+
+    #[test]
+    fn crypto_section_without_enabled_is_a_parse_error_naming_the_field() {
+        let body = format!(
+            "{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nkey_path = \"/etc/uc2/node.key\"\n\
+             allowlist_path = \"/etc/uc2/allowlist.toml\"\n[admin]\nauth = \"none\"\n"
+        );
+        let err = load_str(&body).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("enabled"), "must name the missing field, got: {msg}");
+    }
+
+    #[test]
+    fn crypto_enabled_without_key_path_names_it() {
+        let body =
+            format!("{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = true\n[admin]\nauth = \"none\"\n");
+        let err = load_str(&body).unwrap_err();
+        match err {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "crypto.key_path"),
+            other => panic!("expected Invalid{{field: \"crypto.key_path\"}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn crypto_enabled_without_allowlist_path_names_it() {
+        let body = format!(
+            "{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = true\nkey_path = \"/etc/uc2/node.key\"\n\
+             [admin]\nauth = \"none\"\n"
+        );
+        let err = load_str(&body).unwrap_err();
+        match err {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "crypto.allowlist_path"),
+            other => panic!("expected Invalid{{field: \"crypto.allowlist_path\"}}, got {other:?}"),
+        }
+    }
+
+    /// Ruling 1: `enabled = false` while still naming key material must be
+    /// refused, not silently ignored — a config that LOOKS encrypted must
+    /// never actually run cleartext.
+    #[test]
+    fn crypto_disabled_with_paths_given_is_refused() {
+        let body = format!(
+            "{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = false\n\
+             key_path = \"/etc/uc2/node.key\"\n[admin]\nauth = \"none\"\n"
+        );
+        let err = load_str(&body).unwrap_err();
+        match err {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "crypto.enabled"),
+            other => panic!("expected Invalid{{field: \"crypto.enabled\"}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn absent_admin_section_is_an_explicit_choice_refusal() {
+        let body = format!("{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = false\n");
+        let err = load_str(&body).unwrap_err();
+        assert!(matches!(err, ConfigError::AdminChoiceRequired), "got: {err:?}");
+        assert!(err.to_string().contains("[admin]"), "{err}");
+    }
+
+    #[test]
+    fn admin_hmac_with_no_keys_is_refused() {
+        let body =
+            format!("{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = false\n[admin]\nauth = \"hmac\"\n");
+        let err = load_str(&body).unwrap_err();
+        match err {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "admin.keys"),
+            other => panic!("expected Invalid{{field: \"admin.keys\"}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admin_hmac_duplicate_key_names_are_refused() {
+        let body = format!(
+            "{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = false\n[admin]\nauth = \"hmac\"\n\
+             keys = [{{ name = \"ops-alice\", key_path = \"/etc/uc2/admin/a.key\" }}, \
+             {{ name = \"ops-alice\", key_path = \"/etc/uc2/admin/b.key\" }}]\n"
+        );
+        let err = load_str(&body).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ops-alice"), "must name the duplicate key, got: {msg}");
+        match err {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "admin.keys"),
+            other => panic!("expected Invalid{{field: \"admin.keys\"}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_key_inside_admin_is_refused_by_name() {
+        let body = format!(
+            "{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = false\n[admin]\nauth = \"none\"\nbogus = 1\n"
+        );
+        let err = load_str(&body).unwrap_err();
+        assert!(err.to_string().contains("bogus"), "got: {err}");
+    }
+
+    #[test]
+    fn admin_none_with_keys_is_refused() {
+        let body = format!(
+            "{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = false\n[admin]\nauth = \"none\"\n\
+             keys = [{{ name = \"ops-alice\", key_path = \"/etc/uc2/admin/a.key\" }}]\n"
+        );
+        let err = load_str(&body).unwrap_err();
+        match err {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "admin.keys"),
+            other => panic!("expected Invalid{{field: \"admin.keys\"}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admin_ttl_below_1000_is_refused() {
+        let body = format!(
+            "{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = false\n[admin]\nauth = \"none\"\n\
+             request_ttl_ms = 999\n"
+        );
+        let err = load_str(&body).unwrap_err();
+        match err {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "admin.request_ttl_ms"),
+            other => panic!("expected Invalid{{field: \"admin.request_ttl_ms\"}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn admin_hmac_maps_into_startup_options() {
+        let body = format!(
+            "{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = false\n[admin]\nauth = \"hmac\"\n\
+             keys = [{{ name = \"ops-alice\", key_path = \"/etc/uc2/admin/alice.key\" }}]\n\
+             request_ttl_ms = 5000\n"
+        );
+        let (_cfg, opts) = load_str(&body).unwrap();
+        assert!(matches!(opts.admin.auth, AdminAuthMode::Hmac));
+        assert_eq!(opts.admin.keys.len(), 1);
+        assert_eq!(opts.admin.keys[0].name, "ops-alice");
+        assert_eq!(opts.admin.request_ttl_ms, 5000);
     }
 }

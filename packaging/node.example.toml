@@ -100,14 +100,20 @@ addr = "10.0.0.12:9100"
 # [purge]
 # below_snapshot_slack_bytes = 1048576
 
-# Node-to-node wire encryption. ABSENT means cleartext, which is the default.
+# Node-to-node wire encryption. REQUIRED (not absent-means-off): a node.toml
+# must say so explicitly, one way or the other.
 #
-# A FLAG DAY, not a rolling change: a cluster runs all-encrypted or
-# all-cleartext. Enabling it is a boot refusal if the key or allowlist is
-# missing, malformed, or group/world-readable. See
+# enabled = false is cleartext, the default posture, same as every UC v2
+# release before v2.6.0.
+#
+# enabled = true is a FLAG DAY, not a rolling change: a cluster runs
+# all-encrypted or all-cleartext. Enabling it is a boot refusal if the key or
+# allowlist is missing, malformed, or group/world-readable, or if either path
+# is given while enabled = false (a config that LOOKS encrypted but would
+# silently run cleartext is refused rather than honoured). See
 # docs/how-to/encrypt-node-traffic.md.
-#
-# [crypto]
+[crypto]
+enabled = false
 # key_path = "/etc/uc2/node.key"
 # allowlist_path = "/etc/uc2/allowlist.toml"
 # rotation_interval_ns = 3600000000000   # 1 h
@@ -129,3 +135,23 @@ addr = "10.0.0.12:9100"
 #
 # [metrics]
 # bind = "127.0.0.1:9600"
+
+# Admin authentication: who may change cluster membership (add/remove/
+# promote/demote) via uc2ctl. REQUIRED (not absent-means-off), like
+# [crypto].enabled above.
+#
+# auth = "hmac" requires named keys below. Generate one with
+# `uc2ctl gen-admin-key /etc/uc2/admin/alice.key` (writes 32 random bytes,
+# mode 0600 — a group/world-readable key file is a boot refusal, the same
+# rule as [crypto].key_path) and pass it to uc2ctl as
+# `--admin-key /etc/uc2/admin/alice.key`. app_id is a wrong-cluster guard,
+# NOT a credential — it is not a substitute for this section.
+#
+# auth = "none" is the pre-v2.6.0 posture: the instance directory's
+# filesystem permissions are the ONLY admin boundary, and anyone who can
+# write it can change cluster membership. The node prints a WARNING on every
+# boot when this is set.
+[admin]
+auth = "hmac"
+keys = [{ name = "ops-alice", key_path = "/etc/uc2/admin/alice.key" }]
+request_ttl_ms = 30000   # how long a signed request stays valid; must be >= 1000

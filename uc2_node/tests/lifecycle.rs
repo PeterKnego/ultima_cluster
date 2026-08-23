@@ -194,6 +194,13 @@ fn observability_reports_four_agents_alive_then_all_finished_after_stop() {
 // ------------------------------------------------------- the uc2-node daemon
 
 /// Write a single-voter config and return its path plus the instance dir.
+///
+/// M12b: `[crypto]`/`[admin]` are explicit choices (a `node.toml` missing
+/// either is refused before this file's own tests get to run) — every
+/// caller here gets both, at their cleartext/filesystem defaults, appended
+/// AFTER `[[members]]` for the same reason `a_daemon_with_metrics_...`
+/// appends `[log]`/`[metrics]` there: a table header any earlier would
+/// swallow the following bare keys into itself.
 fn daemon_config(dir: &Path, port: u16, bind: &str, extra: &str) -> (PathBuf, PathBuf) {
     let inst = dir.join("n1");
     std::fs::create_dir_all(&inst).unwrap();
@@ -210,6 +217,12 @@ app_id = "lifecycle"
 [[members]]
 id = 1
 addr = "127.0.0.1:{port}"
+
+[crypto]
+enabled = false
+
+[admin]
+auth = "none"
 "#,
             inst.display()
         ),
@@ -306,7 +319,8 @@ fn daemon_refuses_a_volatile_instance_dir_then_warns_when_overridden() {
             &cfg,
             format!(
                 "{extra}\nid = 1\nbind = \"127.0.0.1:19703\"\ninstance_dir = \"{}\"\n\
-                 app_id = \"lifecycle\"\n\n[[members]]\nid = 1\naddr = \"127.0.0.1:19703\"\n",
+                 app_id = \"lifecycle\"\n\n[[members]]\nid = 1\naddr = \"127.0.0.1:19703\"\n\n\
+                 [crypto]\nenabled = false\n\n[admin]\nauth = \"none\"\n",
                 inst.display()
             ),
         )
@@ -371,6 +385,12 @@ app_id = "lifecycle"
 [[members]]
 id = 1
 addr = "127.0.0.1:19704"
+
+[crypto]
+enabled = false
+
+[admin]
+auth = "none"
 
 [log]
 level = "info"
@@ -456,6 +476,12 @@ app_id = "lifecycle"
 [[members]]
 id = 1
 addr = "127.0.0.1:{port}"
+
+[crypto]
+enabled = false
+
+[admin]
+auth = "none"
 
 [metrics]
 bind = "127.0.0.1:{metrics_port}"

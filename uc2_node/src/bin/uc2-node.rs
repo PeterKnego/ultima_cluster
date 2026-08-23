@@ -7,6 +7,15 @@
 //! `SIGTERM`/`SIGINT` it drains the archive to a bounded deadline and stops
 //! the agents cleanly, so the restarted node rejoins from the journal instead
 //! of paying reconstruction.
+//!
+//! M12b: `[admin]` is a required, explicit choice (spec §3.3) — this is the
+//! one place that turns the config file's `[admin]` section into a live
+//! [`AdminPolicy`] and hands it to [`Node::start_with`]. `auth = "none"`
+//! loads no keys and prints a boot-time warning (filesystem access on the
+//! instance directory is the only admin boundary); `auth = "hmac"` loads
+//! every named key file via `AdminKey::load`, and a bad key file (missing,
+//! wrong length, group/world-readable) is a named startup refusal — exit 2,
+//! same family as every other config refusal this binary already makes.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -15,9 +24,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use uc2_node::config_file::AdminAuthMode;
 use uc2_node::obs::http::ObsServer;
 use uc2_node::preflight::FsVerdict;
-use uc2_node::{DrainOutcome, Node, config_file, preflight};
+use uc2_node::{AdminKey, AdminPolicy, DrainOutcome, Node, StartOpts, config_file, preflight};
 
 #[derive(Parser)]
 #[command(name = "uc2-node", about = "An ultima_cluster node")]
@@ -59,10 +69,41 @@ fn main() -> ExitCode {
     }
     uc2_node::obs::log::set_level(opts.obs.log_level);
 
+    // M12b: build the live AdminPolicy from `[admin]`. `auth = "none"` never
+    // reads a key file — it IS today's pre-M12b posture, and the WARNING
+    // fires on every boot (never silenced), same convention as the volatile-
+    // fs override above.
+    let admin = match opts.admin.auth {
+        AdminAuthMode::None => {
+            eprintln!(
+                "uc2-node: WARNING: [admin] auth = \"none\" — anyone who can write the \
+                 instance directory can change cluster membership"
+            );
+            AdminPolicy::Filesystem
+        }
+        AdminAuthMode::Hmac => {
+            let mut keys = Vec::with_capacity(opts.admin.keys.len());
+            for entry in &opts.admin.keys {
+                match AdminKey::load(&entry.name, &entry.key_path) {
+                    Ok(k) => keys.push(k),
+                    Err(e) => {
+                        eprintln!(
+                            "uc2-node: admin key {} at {}: {e}",
+                            entry.name,
+                            entry.key_path.display()
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            AdminPolicy::Hmac { keys: Arc::new(keys), ttl: Duration::from_millis(opts.admin.request_ttl_ms) }
+        }
+    };
+
     let id = cfg.id;
     let bind = cfg.bind;
     let instance_dir = cfg.instance_dir.clone();
-    let node = match Node::start(cfg) {
+    let node = match Node::start_with(cfg, StartOpts { socket: None, admin }) {
         Ok(n) => n,
         Err(e) => {
             eprintln!("uc2-node: failed to start node {id}: {e}");

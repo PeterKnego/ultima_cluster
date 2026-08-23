@@ -1264,6 +1264,7 @@ impl Node {
             last_admin_seq: 0,
             pending_admin_fwd: None,
             last_config_reply: None,
+            config_proposal_non_member: 0,
             crypto: crypto.clone(),
             crypto_hs_rx: Some(hs_rx),
             crypto_peer_ids,
@@ -1599,14 +1600,6 @@ impl Node {
 
 // ------------------------------------------------------------- consensus agent
 
-/// M7: one in-flight admin request this (follower) node forwarded to the
-/// leader as a `ConfigProposal`, kept so the leader's kind-17 reply can be
-/// matched back to the response line that is waiting for it.
-///
-/// M12b carries the *whole* request rather than just `(seq, nonce)`: the
-/// audit record written when the answer is finally published names the op,
-/// the target and the operator (`actor`, verified on THIS node before the
-/// forward), none of which the reply datagram carries back.
 /// M12b: the actor recorded for a request that failed authentication — it
 /// is precisely the case where no key name was proven, so naming a key (or
 /// `"filesystem"`, which would claim the request was trusted on directory
@@ -1640,6 +1633,14 @@ impl From<&PendingAdminFwd> for AuditedReq {
     }
 }
 
+/// M7: one in-flight admin request this (follower) node forwarded to the
+/// leader as a `ConfigProposal`, kept so the leader's kind-17 reply can be
+/// matched back to the response line that is waiting for it.
+///
+/// M12b carries the *whole* request rather than just `(seq, nonce)`: the
+/// audit record written when the answer is finally published names the op,
+/// the target and the operator (`actor`, verified on THIS node before the
+/// forward), none of which the reply datagram carries back.
 #[derive(Debug, Clone)]
 struct PendingAdminFwd {
     seq: u64,
@@ -1881,6 +1882,12 @@ struct Consensus {
     /// idempotent under retry without relying on `ChangePending` to happen to
     /// refuse the repeat. `None` until the first forwarded proposal is handled.
     last_config_reply: Option<(u64, ConfigReplyBody)>,
+    /// M12b review: count of `ConfigProposal` (kind 16) datagrams dropped by
+    /// `on_config_proposal`'s membership guard because their source address
+    /// resolves to no current member — see that function's doc comment. A
+    /// non-member datagram must never reach `peer_actor`/`audit_admin`, so
+    /// this is incremented and warned on BEFORE either is called.
+    config_proposal_non_member: u64,
 
     // ---- M8 (Task 12): the crypto plane -----------------------------------
     /// The process's shared handshake/group-key/rotation state. `None` =
@@ -3807,6 +3814,23 @@ impl Consensus {
         if !matches!(self.sm.role(), Role::Leader) {
             return;
         }
+        // M12b review: a source address that resolves to no current member
+        // is not a peer this leader can vouch for — `peer_actor` would have
+        // to fall back to `peer:<addr>`, and everything past that point
+        // (propose_config, an fsync'd audit record) runs on the consensus
+        // thread. Drop it here, before either runs, rather than let an
+        // unauthenticated/spoofed datagram drive real work off this thread.
+        if !self.addr_to_id.contains_key(&from) {
+            self.config_proposal_non_member += 1;
+            let from_s = from.to_string();
+            crate::obs_event!(
+                Warn,
+                "config_proposal_non_member",
+                node = self.id as u64,
+                from = from_s.as_str(),
+            );
+            return;
+        }
         // M12b: the forwarding peer authenticated the operator locally before
         // it forwarded; what the leader can attest to is WHICH PEER asked, so
         // that is the actor it records. `seq` is 0 in these records — the
@@ -3894,8 +3918,15 @@ impl Consensus {
     /// leader cannot re-check the operator's signature (the canonical message
     /// is bound to the requesting node's own cnc band), so what it attests to
     /// is the peer that vouched for it: `peer:<id>` when the source address
-    /// resolves to a member, `peer:<addr>` when it does not (a datagram from
-    /// outside the current config — recorded rather than dropped silently).
+    /// resolves to a member.
+    ///
+    /// M12b review: `on_config_proposal`'s membership guard now returns
+    /// before calling this for any `from` outside `addr_to_id`, making the
+    /// `peer:<addr>` fallback unreachable from that (its only) call site.
+    /// Kept as a defensive branch rather than removed — `peer_actor` is a
+    /// crisp, independently-correct "attest to what we can" function, and an
+    /// `unwrap`/`expect` here would turn a future second caller's oversight
+    /// into a panic on the consensus thread instead of a merely-untested path.
     fn peer_actor(&self, from: SocketAddr) -> String {
         match self.addr_to_id.get(&from) {
             Some(id) => format!("peer:{id}"),
@@ -5632,6 +5663,7 @@ mod tests {
             last_admin_seq: 0,
             pending_admin_fwd: None,
             last_config_reply: None,
+            config_proposal_non_member: 0,
             // M8 Task 12. `crypto_maint_ns: 0` makes ONE `do_work` a full
             // maintenance pass — the production 20 ms floor is a hot-path
             // concern, not a behavior under test, and rate-limiting here
@@ -6691,6 +6723,42 @@ mod tests {
             "a demote (unlike a remove) never tombstones"
         );
         assert!(!h.cons.halt_removed, "the wedge is silent: no halt/step-down fires");
+    }
+
+    // ---- M12b review carry: on_config_proposal's membership guard ----
+
+    /// A kind-16 `ConfigProposal` whose source address resolves to no
+    /// current member must be dropped and counted BEFORE `peer_actor` or
+    /// `audit_admin` ever runs — neither an attestation nor an fsync'd audit
+    /// record should be produced for a datagram this leader cannot vouch
+    /// for. Proven by the negative: `last_config_reply` (only ever set by
+    /// `propose_and_append`'s caller past the guard) stays `None`.
+    #[test]
+    fn on_config_proposal_drops_a_non_member_source_before_auditing() {
+        let mut h = harness();
+        // Drive to leader of term 3 (mirrors the sibling test above: election
+        // timeout, then a majority vote out of the 3-voter [0,1,2] cluster).
+        h.cons.feed(Event::Tick { now_ns: 301 });
+        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+        assert!(matches!(h.cons.sm.role(), Role::Leader), "majority vote elects");
+
+        let stranger: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        assert!(
+            !h.cons.addr_to_id.contains_key(&stranger),
+            "test setup: this address must actually be a non-member"
+        );
+
+        let body = ConfigProposalBody { nonce: 1, op: 1, id: 9, ip: 0, port: 0 };
+        h.cons.on_config_proposal(stranger, body);
+
+        assert_eq!(
+            h.cons.config_proposal_non_member, 1,
+            "the drop must be counted"
+        );
+        assert!(
+            h.cons.last_config_reply.is_none(),
+            "a dropped datagram must never reach propose_and_append, so no reply is ever recorded"
+        );
     }
 
     // ---- post-M7 follow-up (Task 10 fix): fiat install clears the pending mirror ----

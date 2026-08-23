@@ -20,6 +20,7 @@ use uc_protocol::v2::crypto::CRYPTO_OVERHEAD;
 use uc_protocol::v2::datagram::{DATAGRAM_HEADER_LEN, MTU_DEFAULT};
 use uc_protocol::v2::frame::{FRAME_ALIGNMENT, HEADER_LEN, align_frame_len};
 
+use crate::config_file::AdminSection;
 use crate::obs::log::LogLevel;
 use crate::{CryptoConfig, NodeConfig};
 
@@ -151,7 +152,10 @@ pub fn check_semantics(cfg: &NodeConfig) -> Result<(), PreflightError> {
 
 
 /// Startup policy that is NOT part of the node's runtime configuration.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// M12b: no longer `Copy` — [`AdminSection`] carries a `Vec`/`String`
+/// (`keys`), same reason [`crate::NodeConfig`] itself isn't `Copy`.
+#[derive(Debug, Clone, Default)]
 pub struct StartupOptions {
     /// Permit an instance directory on a RAM-backed filesystem.
     ///
@@ -162,6 +166,15 @@ pub struct StartupOptions {
     pub allow_volatile_fs: bool,
     /// M10's observability options — see [`ObsOptions`].
     pub obs: ObsOptions,
+    /// M12b (spec §3.3, §5.1): `[admin]` as loaded from the config file —
+    /// REQUIRED there ([`crate::config_file::ConfigError::AdminChoiceRequired`]
+    /// on absence), so this field's own [`Default`] (`auth = none`, no keys)
+    /// only ever shows up in test/harness code that builds a
+    /// `StartupOptions` by hand rather than through
+    /// [`crate::config_file::load_from_path`]. The daemon is what turns this
+    /// into a real [`uc2_crypto::admin::AdminPolicy`] — see
+    /// `uc2-node.rs::main`.
+    pub admin: AdminSection,
 }
 
 /// M10 observability options: `[log]`/`[metrics]` from the config file,

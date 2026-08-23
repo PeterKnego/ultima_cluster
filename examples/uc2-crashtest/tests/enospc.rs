@@ -202,6 +202,10 @@ fn write_node_toml(
     for (mid, maddr) in members {
         members_toml.push_str(&format!("[[members]]\nid = {mid}\naddr = \"{maddr}\"\n\n"));
     }
+    // M12b: [crypto]/[admin] became required (explicit-choice config, spec
+    // §3.3) — this test spawns the REAL uc2-node daemon off a TOML file, so
+    // it needs both now too. Neither wire crypto nor admin auth is what this
+    // test exercises, so both choose the cleartext/filesystem posture.
     let body = format!(
         "id = {id}\n\
          bind = \"{bind}\"\n\
@@ -210,7 +214,12 @@ fn write_node_toml(
          buffer_bytes = {}\n\
          journal_segment_bytes = {}\n\
          \n\
-         {members_toml}",
+         {members_toml}\n\
+         [crypto]\n\
+         enabled = false\n\
+         \n\
+         [admin]\n\
+         auth = \"none\"\n",
         instance_dir.display(),
         1u64 << 20,  // 1 MiB — power of two (preflight requires it), small.
         32 * 1024,   // 32 KiB — well inside the brief's 16-64 KiB guidance.
