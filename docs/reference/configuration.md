@@ -250,6 +250,27 @@ uc2ctl gen-admin-key /etc/uc2/admin/alice.key
 which writes 32 random bytes at mode `0600` from the moment the file is
 created (no world-readable window) and refuses to overwrite an existing file.
 
+### Request signature
+
+For a non-Rust tool that wants to sign admin requests itself rather than
+shelling out to `uc2ctl`: the tag is `HMAC-SHA256(key, canonical_bytes)`,
+where `canonical_bytes` is, **every integer little-endian**:
+
+```
+u16 LE len(app_id) ‖ app_id bytes ‖ instance_id u128 LE ‖ seq u64 LE
+‖ nonce u64 LE ‖ op u32 LE ‖ id u32 LE ‖ ip u32 LE ‖ port u16 LE
+‖ expiry_ns u64 LE
+```
+
+`app_id` is length-prefixed (not null-terminated or fixed-width) because it
+is operator-chosen and variable-length; every other field is fixed-width.
+`key_name_hash` — the field that names which key signed the request — is
+**not** part of the signed bytes; it is the standard 64-bit FNV-1a hash of
+the key's name, computed separately. Source of truth:
+`uc2_crypto::admin::AdminMessage::canonical_bytes` (fields), `sign`/`verify`
+(the HMAC), `fnv1a64` (the name hash) — pinned against a fixed test vector
+in `uc2_crypto/src/admin.rs`.
+
 **`app_id` is a wrong-cluster guard, not a credential.** `uc2ctl` (and every
 IPC attach) checks it against the running node's `app_id` so a request aimed
 at the wrong cluster reads as "wrong cluster" rather than a confusing

@@ -50,7 +50,11 @@ uc2ctl add-learner --instance-dir D --app-id A --id 4 --addr 10.0.0.14:9100 \
   --admin-key /etc/uc2/admin/alice.key
 ```
 
-Three admin flags, common to every mutating command:
+Three admin flags. They live in the shared `CommonArgs`, so `status` also
+accepts them on the command line — but `status` never reads or needs them
+(it writes no admin request). The offline verbs (`backup`, `verify-backup`,
+`restore`, `force-single-member`) don't reuse `CommonArgs` at all, so these
+flags are not valid there:
 
 | Flag | Default | Meaning |
 |---|---|---|

@@ -338,6 +338,26 @@ durably anywhere.
 > `ConfigError::{CryptoChoiceRequired, AdminChoiceRequired}`
 > (`uc2_node::config_file`).
 >
+> **§5.2 canonical message, corrected.** The line below in §5.2's own text
+> is the un-amended sketch and is missing two things the shipped code does:
+> a length prefix on `app_id`, and an explicit byte order. The actual bytes
+> `sign`/`verify` compute the tag over
+> (`uc2_crypto::admin::AdminMessage::canonical_bytes`, the one source of
+> truth both `uc2ctl` and `uc2_node` build independently from the same wire
+> fields) are, **all integers little-endian**:
+>
+> `u16 LE len(app_id) ‖ app_id bytes ‖ instance_id u128 LE ‖ seq u64 LE ‖
+> nonce u64 LE ‖ op u32 LE ‖ id u32 LE ‖ ip u32 LE ‖ port u16 LE ‖
+> expiry_ns u64 LE`
+>
+> — 61 bytes for a 5-byte `app_id` (`2 + 5 + 16 + 8 + 8 + 4 + 4 + 4 + 2 + 8`,
+> pinned by `uc2_crypto/src/admin.rs`'s
+> `sign_matches_hmac_over_canonical_bytes_and_layout_length` test). The tag
+> itself is `HMAC-SHA256(key, canonical_bytes)`. `key_name_hash` (the 64-bit
+> field alongside the tag on the cnc auth line) is the standard 64-bit
+> FNV-1a hash of the key's name (`uc2_crypto::admin::fnv1a64`), not part of
+> the signed bytes.
+>
 > **§5.2 deviation, ruled: no `(seq, nonce)` replay ring.** The sketch below
 > proposed one; the shipped design refuses it on the same grounds without
 > one. The 64-byte auth line's tag already covers `seq`
