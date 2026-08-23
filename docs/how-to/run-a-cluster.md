@@ -17,6 +17,10 @@ architecture:
 cargo build --release -p uc2_node -p uc2ctl --bins
 ```
 
+Requires Rust 1.89 or newer (the workspace's `rust-version` floor;
+`rust-toolchain.toml` pins CI and this repo's own dev builds to a newer
+stable, but any toolchain at or above 1.89 builds it).
+
 - `target/release/uc2-node` — the node daemon.
 - `target/release/uc2ctl` — the admin CLI, for status and membership changes.
 - Your own service binary — the half that runs your state machine. See

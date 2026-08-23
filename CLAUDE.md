@@ -184,6 +184,16 @@ Canonical documents, in order:
 
 ## Build & Test Commands
 
+MSRV is 1.89 (`rust-version` in the root `Cargo.toml`'s `[workspace.package]`
+— see that field's comment for how it was probed; CI's `msrv` job checks it
+directly against a 1.89.0 toolchain). Local dev, the rest of CI, and releases
+build on the newer stable pinned in `rust-toolchain.toml` (currently 1.96.0;
+rustup auto-installs it). To bump the pin: `rustup toolchain install <ver>
+--profile minimal --component rustfmt --component clippy`, update `channel`
+in `rust-toolchain.toml`, then run the full local proof stack before
+committing — the MSRV floor is a separate, deliberate decision, not moved by
+this.
+
 ```bash
 cargo build --workspace                          # build all workspace crates
 cargo test                                       # in-process integration + sim tests (default)
