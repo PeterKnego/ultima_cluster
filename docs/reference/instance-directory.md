@@ -20,7 +20,7 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | `svc_query.ring` | node → service | Forwarded queries. |
 | `egress_service.broadcast` | node → service | Apply and output stream to the service. |
 | `egress_node.broadcast` | node → clients | Submit responses broadcast to clients. |
-| `audit.jsonl` | node | Append-only record of every admin request this node answered, one JSON line each, fsynced before the answer is published. Never rotated or truncated by the node. See [Change cluster membership](../how-to/change-cluster-membership.md). |
+| `audit.jsonl` | node | Append-only record of every admin request this node answered, one JSON line each, fsynced before the answer is published. One exception: a byte-identical re-send of an already-answered, already-recorded proposal (same nonce) is counted, not re-recorded — it repeats an answer already in the file rather than being a new admin event. Never rotated or truncated by the node. See [Change cluster membership](../how-to/change-cluster-membership.md). |
 
 Every IPC file lives directly under the instance directory. There is no
 `/dev/shm` discovery directory.

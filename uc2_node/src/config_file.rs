@@ -342,7 +342,9 @@ pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), Confi
                 if k.name.is_empty() {
                     return Err(ConfigError::Invalid {
                         field: "admin.keys",
-                        detail: "an entry in admin.keys has an empty name — every admin key                                  needs a name (it is what uc2ctl passes as --admin-key-name                                  and what audit.jsonl records as the actor)"
+                        detail: "an entry in admin.keys has an empty name — every admin \
+                                 key needs a name (it is what uc2ctl passes as \
+                                 --admin-key-name and what audit.jsonl records as the actor)"
                             .to_string(),
                     });
                 }
@@ -360,7 +362,9 @@ pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), Confi
                     return Err(ConfigError::Invalid {
                         field: "admin.keys",
                         detail: format!(
-                            "admin.keys entries {prev:?} and {:?} collide in the 64-bit                              FNV-1a name hash ({h:#018x}) that identifies a key on the wire                              — rename one of them",
+                            "admin.keys entries {prev:?} and {:?} collide in the 64-bit \
+                             FNV-1a name hash ({h:#018x}) that identifies a key on the \
+                             wire — rename one of them",
                             k.name
                         ),
                     });
@@ -817,7 +821,16 @@ level = "info"
         );
         let err = load_str(&body).unwrap_err();
         match err {
-            ConfigError::Invalid { field, .. } => assert_eq!(field, "admin.keys"),
+            ConfigError::Invalid { field, ref detail } => {
+                assert_eq!(field, "admin.keys");
+                // A wrapped string literal without a `\` continuation keeps
+                // every leading space of the next source line, which reaches
+                // the operator's terminal as a long run of blanks mid-sentence.
+                assert!(
+                    !detail.contains("  "),
+                    "the refusal message carries source indentation: {detail:?}"
+                );
+            }
             other => panic!("expected Invalid{{field: \"admin.keys\"}}, got {other:?}"),
         }
     }

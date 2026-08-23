@@ -9,6 +9,15 @@
 //! it refused. One `\n`-terminated JSON object per line, `O_APPEND`, one
 //! `sync_data` per record:
 //!
+//! **The one exception** (M12b final review, I4): a byte-identical re-send of
+//! an already-answered, already-recorded forwarded proposal — same nonce,
+//! answered from the leader's dedup cache — is counted
+//! (`config_proposal_dedup_resend`), not re-recorded. It is a repeat of an
+//! answer this file already holds, not a new admin event; recording it would
+//! also let one captured datagram, re-sent in a loop, drive an unbounded
+//! stream of `fsync`s on the consensus thread. Every request that produces a
+//! *fresh* decision is recorded before that decision is published.
+//!
 //! ```json
 //! {"ts_ns":1755600000000000000,"event":"admin_op","actor":"ops-alice","origin":"local","op":1,"op_name":"add_learner","id":4,"addr":"10.0.0.4:9100","seq":12,"nonce":880,"outcome":"accepted","reason":0,"config_version":7}
 //! ```

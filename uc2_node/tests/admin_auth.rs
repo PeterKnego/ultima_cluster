@@ -702,6 +702,13 @@ fn a_capture_replayed_after_a_restart_is_refused() {
     let captured_instance_id = cnc.meta().instance_id;
 
     // 1. A real, accepted, signed request — the bytes the attacker captures.
+    //    The capture is signed with the rig's default TTL (`TTL`, 30 s), and
+    //    the restart below must finish inside it or the replay would be
+    //    refused 22 (`auth_expired`) instead of 21 and the test would prove
+    //    the wrong thing. A 1-node stop/rebind/start takes well under a
+    //    second here; if `TTL` is ever shortened to the point where that
+    //    stops holding, this test starts failing on the reason code rather
+    //    than passing vacuously.
     let (id, addr) = fresh_learner(1);
     let (req, resp, _line) = admin_request(
         &cnc,

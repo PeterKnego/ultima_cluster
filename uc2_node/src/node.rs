@@ -1876,11 +1876,15 @@ struct Consensus {
     /// than re-allocated out of `CncPage::meta()` on every request.
     admin_app_id: String,
     /// M12b (spec §5.3): the append-only admin audit file, opened at node
-    /// start and written by this agent alone. Every answer this node gives to
-    /// an admin request is recorded here — with an fsync — BEFORE the answer
-    /// is published; a record that fails to write turns the request into a
-    /// [`REASON_AUDIT_FAILED`] refusal. Off every hot path: touched only when
-    /// an admin request or a forwarded proposal actually arrives.
+    /// start and written by this agent alone. Every admin request's answer is
+    /// recorded here — with an fsync — BEFORE that answer is published; a
+    /// record that fails to write turns the request into a
+    /// [`REASON_AUDIT_FAILED`] refusal. The ONE exception is a byte-identical
+    /// re-send of an already-answered, already-recorded proposal (same
+    /// nonce, served from [`Self::last_config_reply`]): counted as
+    /// [`Self::config_proposal_dedup_resend`], not re-recorded, because it is
+    /// not a new admin event. Off every hot path: touched only when an admin
+    /// request or a forwarded proposal actually arrives.
     audit: AuditLog,
     /// M7 Task 7: the last admin-request seq consumed off the cnc admin-req
     /// slot (`do_work` step 11's seqlock cursor into `read_admin_req`). `0` at
@@ -3874,6 +3878,25 @@ impl Consensus {
             );
             return;
         }
+        // M12b final review (I4): the dedup re-answer is checked FIRST, ahead
+        // of `peer_actor`'s `format!` and the `AuditedReq` — this path
+        // records nothing, so building an actor string and an audit record
+        // for it would be a discarded allocation on every re-sent datagram.
+        // Re-send the cached reply WITHOUT a second audit record: the
+        // original answer was recorded; a byte-identical re-answer of the
+        // same nonce is not a new admin event, and recording one would let
+        // any member (or, with `[crypto].enabled = false`, anything that can
+        // spoof a member's source address) drive an unbounded stream of
+        // `fsync`s on the consensus thread by re-sending one captured
+        // datagram. A fresh-nonce proposal is still recorded — see below.
+        if let Some((nonce, reply)) = &self.last_config_reply
+            && *nonce == body.nonce
+        {
+            let reply = *reply;
+            self.config_proposal_dedup_resend += 1;
+            self.send_config_reply(from, &reply);
+            return;
+        }
         // M12b: the forwarding peer authenticated the operator locally before
         // it forwarded; what the leader can attest to is WHICH PEER asked, so
         // that is the actor it records. `seq` is 0 in these records — the
@@ -3889,22 +3912,6 @@ impl Consensus {
             seq: 0,
             nonce: body.nonce,
         };
-        if let Some((nonce, reply)) = &self.last_config_reply
-            && *nonce == body.nonce
-        {
-            let reply = *reply;
-            // M12b final review (I4): re-send the cached reply WITHOUT a
-            // second audit record. The original answer was recorded; a
-            // byte-identical re-answer of the same nonce is not a new admin
-            // event, and recording one would let any member (or, with
-            // `[crypto].enabled = false`, anything that can spoof a member's
-            // source address) drive an unbounded stream of `fsync`s on the
-            // consensus thread by re-sending one captured datagram. A
-            // fresh-nonce proposal is still recorded — see below.
-            self.config_proposal_dedup_resend += 1;
-            self.send_config_reply(from, &reply);
-            return;
-        }
         let (status, reason, version) = self.propose_and_append(body.op, body.id, body.ip, body.port);
         // The dedup cache keeps the REAL answer, never an audit-failure one:
         // a later retry of the same nonce must be able to re-learn what
