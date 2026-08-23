@@ -163,6 +163,7 @@ including what is *not* verified and how to reproduce every layer.
 | `uc2_log` | Shared log buffer + archive agent (journal recording, snapshots, purge floor) |
 | `uc2_net` | Reliable-UDP sender/receiver agents, NAK repair, flow control, snapshot sessions |
 | `uc2_consensus` | Pure-sync safety core: commit tracker, elections, term maps, truncation |
+| `uc2_crypto` | Opt-in node-to-node wire crypto (M8, off by default): Noise `IK` handshake, AES-256-GCM over the datagram envelope, rotating group key, anti-replay; plus the M12b admin-request HMAC |
 | `uc2_sim` | Deterministic simulation + invariants + fuzz |
 | `uc2_node` | The node: agents wired together, IPC surface, read barrier, gate harnesses |
 | `uc2_service` | Service SDK: `StateMachine` traits, apply agent, reconstruction; optional [`ultima-db`](https://crates.io/crates/ultima-db) store adapter (feature `ultima_db`) |
@@ -175,12 +176,13 @@ including what is *not* verified and how to reproduce every layer.
 Builds standalone — the only external storage dep, `ultima-db`, comes from
 crates.io.
 
-**On crates.io since `v2.6.0`:** twelve crates — the eleven libraries above
-minus `uc2_sim`/`uc-lincheck`, plus `uc2ctl` — published **in lockstep at one
-version**, which is also the git tag, the tarball name and the image tag.
-`uc2_sim`, `uc-lincheck` and the example crates are `publish = false`: proof
-and teaching apparatus, not product. What that version number promises, and
-what it deliberately does not, is
+**On crates.io since `v2.6.0`:** twelve crates, published **in lockstep at
+one version** — which is also the git tag, the tarball name and the image
+tag. That is the thirteen crates in the table above, minus `uc2_sim` and
+`uc-lincheck`, plus `uc2ctl` (the admin CLI: a binary crate, so it has no row
+here). `uc2_sim`, `uc-lincheck` and the two example crates are
+`publish = false`: proof and teaching apparatus, not product. What that
+version number promises, and what it deliberately does not, is
 [the semver policy](/docs/reference/semver-policy.md).
 
 ## Build & test

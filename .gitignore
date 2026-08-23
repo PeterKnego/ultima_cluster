@@ -42,3 +42,7 @@ auto-bench-runs/
 # python bytecode (bench-infra scripts)
 __pycache__/
 *.pyc
+
+# scripts/release_smoke.sh's default work directory (hundreds of MB of
+# root-owned cluster state; .dockerignore keeps it out of the build context).
+.release-smoke/

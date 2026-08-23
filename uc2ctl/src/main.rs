@@ -60,9 +60,12 @@
 //! ```
 //!
 //! **Semver:** see `docs/reference/semver-policy.md`. Promised surface: this
-//! binary's verbs and its exit codes (`0` accepted, `1` refused, `2`
-//! retry) — see `docs/reference/uc2ctl.md`. Nothing in this crate is a
-//! Rust API; it publishes a binary, not a library.
+//! binary's verbs and its exit codes. It **exits `0` on success and `1` on
+//! any failure**; the `0` accepted / `1` refused / `2` retry triple is the
+//! response status the node returns and this binary PRINTS — statuses 1 and
+//! 2 both exit 1. See `docs/reference/uc2ctl.md` ("Response statuses").
+//! Nothing in this crate is a Rust API; it publishes a binary, not a
+//! library.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;

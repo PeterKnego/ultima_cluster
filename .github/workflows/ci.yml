@@ -17,8 +17,11 @@ name: ci
 #     stated floor can't silently drift from what actually compiles/lints
 #     clean. See that field's comment.
 # Deliberately NOT run here:
-#   * cargo fmt --check — the codebase predates a fmt pass (~800 hunks of
-#     drift); clippy is the enforced style gate, per CLAUDE.md.
+#   * cargo fmt --check — the codebase predates a fmt pass (2 731 hunks of
+#     drift as of 2026-08-23) and two long-lived worktrees are open, so the
+#     one-shot reformat is DEFERRED with its re-run condition written down:
+#     see docs/benchmarks/uc2-m12-gate-2026-08-22.md row 13. clippy is the
+#     enforced style gate, per CLAUDE.md.
 #   * lin_v2 / lin_partition_v2 / sim-heavy / loom / hard-crash — nightly.yml.
 
 on:

@@ -51,12 +51,22 @@ The identity pin on `cosign verify-blob` is not optional dressing; see
 ### Or from the container image
 
 ```bash
-ghcr.io/peterknego/uc2:2.6.0
+docker pull ghcr.io/peterknego/uc2:2.6.0
+
+cosign verify \
+  --certificate-identity-regexp \
+    'https://github.com/PeterKnego/ultima_cluster/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/peterknego/uc2:2.6.0
+
+docker run --rm ghcr.io/peterknego/uc2:2.6.0 --version   # ENTRYPOINT is uc2-node
 ```
 
-Multi-architecture (amd64 + arm64), built from the same tarballs, signed by
-digest — `cosign verify` with the same two `--certificate-*` flags.
-`packaging/compose.yml` in the tarball is a worked single-host example.
+Multi-architecture (amd64 + arm64), built from the same tarballs the release
+publishes — `/usr/local/bin` in the image is byte-identical to what
+`SHA256SUMS` covers — and signed by digest with `--recursive`, so verifying by
+tag or by platform digest both work. `packaging/compose.yml` in the tarball is
+a worked single-host example.
 
 ### Or from source
 

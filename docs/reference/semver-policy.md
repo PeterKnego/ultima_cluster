@@ -26,10 +26,33 @@ major bump; additions are minor; everything else is a patch.
 | `OutputHandler` (and `RawOutputHandler`) | `uc2_service::traits` |
 | `Sessioned<S>` and `SessionConfig` | `uc2_service::session` |
 | `NodeConfig`, and the `node.toml` it mirrors | `uc2_node::node::NodeConfig`, `uc2_node::config_file` |
+| Starting a node: `Node::start`, `Node::start_with` | `uc2_node::node::Node` |
 | `gateway.toml` | `uc2_gateway::config` (`EdgeConfig`, `Member`) |
 | The three client tiers | `uc2_client::{Engine, PipelinedClient, Client}` |
 | The `uc2_remote` protocol, **v1** | `uc2_remote::frame::PROTOCOL_VERSION` |
+| `RemoteClient`, the Rust implementation of it | `uc2_remote::client::RemoteClient` |
 | `uc2ctl` verbs and exit codes | the `uc2ctl` binary |
+
+Promising an item promises **the types it unavoidably exposes to a caller**
+along with it — a signature you cannot name is not usable API. Concretely,
+and covered by this policy on the same terms as the rows above:
+
+- `uc2_service::{ServiceBuilder, Service, ServiceConfig, ServiceError,
+  SnapshotPolicy, SnapshotError, OutputError}` — `ServiceBuilder::new(cfg,
+  sm).start()` is how a state machine is attached at all, and it returns
+  `Result<Service<S>, ServiceError>`.
+- `uc2_client::{PipelinedConfig, Ticket, ClientError, WaitStrategy}` — the
+  configuration, the handle and the error type the `PipelinedClient`/`Client`
+  tiers hand back.
+- `uc2_node::{StartOpts, SubmitError}` — `Node::start_with` takes the first
+  and the node's submit path returns the second.
+- `uc2_remote::{RemoteConfig, RemoteResponse, RemoteError}` —
+  `RemoteClient::connect` takes the first and every request resolves into one
+  of the other two.
+
+`Engine`'s own send/poll halves and their outcome types
+(`uc2_client::{EngineConfig, SendHalf, PollHalf, Completion, Outcome,
+Consistency, SubmitError}`) are in the same position and are covered too.
 
 The normative descriptions live where the surface does:
 [the state-machine contract](state-machine-contract.md),
@@ -46,8 +69,13 @@ Two of those rows are not Rust API and deserve saying out loud:
   is breaking too — which is exactly what `v2.6.0` did to `[crypto]` and
   `[admin]`, and why the upgrade note exists
   ([Upgrade a cluster](../how-to/upgrade-a-cluster.md)).
-- **`uc2ctl`'s exit codes are API.** Scripts branch on them. `0` accepted,
-  `1` refused, `2` retry — see [`uc2ctl`](uc2ctl.md).
+- **`uc2ctl`'s exit codes are API.** Scripts branch on them. The binary
+  **exits `0` on success and `1` on any failure** — there is exactly one
+  `process::exit(1)` in it, and every failure path reaches it. The `0`
+  accepted / `1` refused / `2` retry triple is the **response status the node
+  returns and `uc2ctl` prints**, not a process exit code: statuses `1` and
+  `2` both exit `1`. See
+  [`uc2ctl`: Response statuses](uc2ctl.md#response-statuses).
 
 ## What is not promised
 

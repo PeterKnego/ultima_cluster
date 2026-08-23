@@ -7,7 +7,10 @@ Every command and every output below is real — copied from an actual run, not
 written from memory.
 
 You need Linux (x86-64 or aarch64), `bash`, coreutils, and a directory on a
-real disk. That is the whole list.
+real disk. That is the whole list for §2 onward — **running** the cluster
+needs nothing else. Step 1 also uses `curl` to fetch the release and
+[`cosign`](https://docs.sigstore.dev/cosign/installation/) to verify it; both
+are for getting the artifact, not for using it.
 
 ---
 
@@ -54,10 +57,13 @@ proves only that *somebody* held a sigstore certificate, which is not a claim
 worth checking. `cosign verify-blob` without an identity pin is not
 verification.
 
-`SHA256SUMS` covers every artifact of the release and is signed the same way
-(`SHA256SUMS.sigstore.json`), so verifying it once and then
-`sha256sum -c SHA256SUMS --ignore-missing` is the equivalent path if you are
-fetching several files.
+`SHA256SUMS` is the equivalent path if you are fetching several files: verify
+it once (it is signed the same way, `SHA256SUMS.sigstore.json`) and then
+`sha256sum -c SHA256SUMS --ignore-missing`. It lists **the `.tar.gz` files** —
+both architectures' tarballs and the SBOM archive — and nothing else; the
+`.sha256` sidecars and the `.sigstore.json` bundles are not in it, and do not
+need to be (a sidecar restates a hash you now have signed, and a bundle
+carries its own signature).
 
 > **Release candidates.** Tags with a suffix — `v2.6.0-rc.1` — are real,
 > fully signed releases marked **prerelease** on GitHub, and they never take
@@ -148,7 +154,7 @@ value=17 position=224 replayed=false
 
 ## 3. What just happened
 
-Twelve processes, in four roles:
+Ten processes, in four roles — nine daemons and the client that drove them:
 
 - **Three `uc2-node` daemons** — consensus, replication, durability. They
   elected a leader among themselves (node 0 here; which one wins is genuinely
