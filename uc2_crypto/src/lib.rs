@@ -33,6 +33,7 @@
 //! - `transport` (T9): the facade — scope-by-kind, config, boot refusal,
 //!   the single `seal`/`open` entry point `uc2_net` (T10/T11) calls.
 
+pub mod admin;
 pub mod group;
 pub mod handshake;
 pub mod identity;
@@ -147,4 +148,18 @@ pub enum CryptoError {
     /// [`CryptoError::MissingPeer`] is.
     #[error("seal_pairwise_control: kind {0} is Scope::Group — seal it on the fan-out path")]
     NotPairwiseKind(u8),
+    /// `admin::AdminKey::load` read a key file that is not exactly
+    /// [`admin::ADMIN_KEY_LEN`] bytes. Refused outright rather than
+    /// truncated or zero-padded — a short/long key file is almost always an
+    /// operator mistake (wrong file, partial write) and silently coercing
+    /// it to length would sign/verify under a key the operator didn't
+    /// intend.
+    #[error("admin key file {path} is {len} bytes, must be exactly {} bytes", admin::ADMIN_KEY_LEN)]
+    AdminKeyLength { path: String, len: usize },
+    /// `admin::generate_key_file` was asked to write to a path that already
+    /// exists. Never overwrites a key file — an operator regenerating by
+    /// accident could otherwise invalidate every client still holding the
+    /// old key with no warning.
+    #[error("admin key file {path} already exists; refusing to overwrite")]
+    AdminKeyExists { path: String },
 }

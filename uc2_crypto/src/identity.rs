@@ -34,18 +34,7 @@ impl Identity {
     /// misconfiguration here should fail loudly at startup, not degrade
     /// silently into "the handshake mysteriously doesn't trust anyone."
     pub fn load(key_path: &Path) -> Result<Identity, CryptoError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let meta = std::fs::metadata(key_path)?;
-            let mode = meta.mode() & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(CryptoError::KeyFilePermissions {
-                    path: key_path.display().to_string(),
-                    mode,
-                });
-            }
-        }
+        crate::admin::check_key_file_perms(key_path)?;
 
         // Read straight into an already-`Zeroizing`-wrapped buffer: a
         // `std::fs::read` into a plain `Vec<u8>`, or a `TryInto<[u8; 32]>`

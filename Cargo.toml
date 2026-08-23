@@ -81,6 +81,7 @@ aes-gcm = { version = "0.10", features = ["zeroize"] }
 aes = { version = "0.8", default-features = false, features = ["zeroize"] }
 hkdf = "0.12"
 sha2 = "0.10"
+hmac = "0.12"
 # `static_secrets` is required for `StaticSecret` — not in the 2.x default
 # feature set (which targets ephemeral-only Diffie-Hellman).
 x25519-dalek = { version = "2", features = ["static_secrets"] }
