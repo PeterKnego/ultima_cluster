@@ -59,13 +59,14 @@
 //! cargo run -p uc2ctl -- status --instance-dir D --app-id A
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 
-use uc2_log::cnc::{AdminReq, CncPage};
+use uc2_crypto::admin::{AdminKey, AdminMessage, generate_key_file, sign};
+use uc2_log::cnc::{AdminAuth, AdminReq, CncPage};
 use uc_protocol::v2::cnc::{
     CNC_MAX_PEER_SLOTS, CNC_PEER_ROLE_LEARNER, CNC_PEER_ROLE_VOTER, NODE_FLAG_CAN_SERVE,
     NODE_FLAG_LEADER,
@@ -94,6 +95,23 @@ struct CommonArgs {
     /// Application identity — must match the running node's `app_id`.
     #[arg(long)]
     app_id: String,
+    /// M12b: sign this request with a named admin HMAC key (a 32-byte,
+    /// mode-0600 key file — see `uc2ctl gen-admin-key`). Required whenever
+    /// the node's `[admin]` policy is `hmac`; omit to send an unsigned
+    /// request (the legacy `Filesystem` policy accepts it unconditionally,
+    /// same as before M12b).
+    #[arg(long)]
+    admin_key: Option<PathBuf>,
+    /// The key's name as loaded into the node's `[admin].keys` list.
+    /// Defaults to `--admin-key`'s file stem (so naming the file after the
+    /// key, e.g. `ops-alice.key`, needs no separate flag).
+    #[arg(long)]
+    admin_key_name: Option<String>,
+    /// How long the signature is valid for, counted from the moment
+    /// `uc2ctl` signs it. The node refuses a request outside its own
+    /// acceptance window (reason 22, `auth_expired`).
+    #[arg(long, default_value_t = 30)]
+    admin_ttl_secs: u64,
 }
 
 #[derive(clap::Args)]
@@ -196,6 +214,32 @@ struct ForceSingleMemberArgs {
     confirm_cluster: String,
 }
 
+// ---------------------------------------------------------------- M12b Task 6: admin auth
+
+#[derive(clap::Args)]
+struct GenAdminKeyArgs {
+    /// Destination path for the fresh 32-byte key file. Written mode 0600
+    /// from creation (no world-readable window); refuses to overwrite an
+    /// existing file.
+    path: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct AuditArgs {
+    /// The node's on-disk instance directory. OFFLINE: read directly off
+    /// disk, no cnc admin-band attach — works whether or not a node is
+    /// currently running in it.
+    #[arg(long)]
+    instance_dir: PathBuf,
+    /// Print only the last N records (default: the whole file).
+    #[arg(long)]
+    tail: Option<usize>,
+    /// Print each record's raw JSON line instead of the summarized,
+    /// human-readable form.
+    #[arg(long)]
+    json: bool,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Add a fresh learner (wire op 1).
@@ -236,6 +280,13 @@ enum Cmd {
     /// echo `--app-id`, if `--node-id` is tombstoned, or if it isn't a member
     /// of the recovered config. A one-way door — there is no "undo" verb.
     ForceSingleMember(ForceSingleMemberArgs),
+    /// M12b: generate a fresh named admin HMAC key file (`[admin].keys`
+    /// material) — 32 random bytes, mode 0600, refuses to overwrite.
+    GenAdminKey(GenAdminKeyArgs),
+    /// M12b: print a node's admin audit log
+    /// (`<instance_dir>/audit.jsonl`). OFFLINE — reads the file directly,
+    /// no cnc admin-band interaction.
+    Audit(AuditArgs),
 }
 
 fn main() {
@@ -251,6 +302,8 @@ fn main() {
         Cmd::VerifyBackup(a) => run_verify_backup(&a),
         Cmd::Restore(a) => run_restore(&a),
         Cmd::ForceSingleMember(a) => run_force_single_member(&a),
+        Cmd::GenAdminKey(a) => run_gen_admin_key(&a),
+        Cmd::Audit(a) => run_audit(&a),
     };
     if let Err(e) = r {
         eprintln!("uc2ctl error: {e}");
@@ -270,7 +323,9 @@ fn parse_addr(s: &str) -> (u32, u16) {
 /// Reason strings for the wire `reason` code (`uc2_consensus::config::ProposeError`'s
 /// discriminants — see that module for the authoritative table). `0` is not a
 /// real `ProposeError`; it is this CLI's own "malformed op" sentinel (the node
-/// never emits an op uc2ctl doesn't itself send).
+/// never emits an op uc2ctl doesn't itself send). 20-24 are M12b's admin-auth
+/// reasons (`uc2_node::REASON_AUTH_*` / `REASON_AUDIT_FAILED`) — distinct from
+/// the `ProposeError` band and only ever seen with `status == 1` (refused).
 fn reason_str(reason: u32) -> &'static str {
     match reason {
         1 => "NotLeader",
@@ -285,15 +340,57 @@ fn reason_str(reason: u32) -> &'static str {
         10 => "NotCaughtUp (learner is too far behind commit to promote safely)",
         11 => "malformed/unknown op (node didn't recognize the request — CLI/node version mismatch?)",
         12 => "SelfDemote (a leader cannot demote itself; RemoveVoter it and rejoin a fresh id as learner)",
+        20 => "auth_missing (the node requires a signed request: pass --admin-key)",
+        21 => "auth_bad_tag (wrong key, a stale auth line, or a tampered request)",
+        22 => "auth_expired (clock skew between uc2ctl and the node? retry)",
+        23 => "auth_unknown_key (this key name is not in the node's [admin].keys)",
+        24 => "audit_failed (the node could not record the request — check its audit.jsonl and disk)",
         _ => "unknown/malformed",
     }
 }
 
-/// Shared mutating-command flow: attach, write a fresh admin request (`seq =
-/// old_seq + 1`, a random nonce), poll the response line, print + exit.
+/// `SystemTime::now()` as Unix nanoseconds — `uc2_node::obs::metrics::now_unix_ns`
+/// exists but this CLI has no reason to depend on that module for one clock
+/// read, so it computes the identical thing directly.
+fn unix_ns() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+}
+
+/// The default admin key name when `--admin-key-name` is not given: the key
+/// file's stem (`"ops-alice.key"` -> `"ops-alice"`).
+fn key_name_from_path(path: &Path) -> String {
+    path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string())
+}
+
+/// Loads `--admin-key` (if given) into an `AdminKey`, under `--admin-key-name`
+/// or the file's stem. A load failure (bad permissions, wrong length, missing
+/// file) is turned into an anyhow error naming the path and pointing at
+/// `gen-admin-key`, and NOTHING is written to the cnc admin band on this path
+/// — `run_mutate` calls this before touching the page.
+fn load_admin_key(common: &CommonArgs) -> anyhow::Result<Option<AdminKey>> {
+    let Some(path) = &common.admin_key else {
+        return Ok(None);
+    };
+    let name = common.admin_key_name.clone().unwrap_or_else(|| key_name_from_path(path));
+    let key = AdminKey::load(&name, path).map_err(|e| {
+        anyhow::anyhow!(
+            "loading admin key {path:?}: {e} (a 0600 32-byte key file; generate with \
+             `uc2ctl gen-admin-key`)"
+        )
+    })?;
+    Ok(Some(key))
+}
+
+/// Shared mutating-command flow: attach, write the admin auth line (M12b —
+/// signed under `--admin-key`, or cleared for an unsigned request), write a
+/// fresh admin request (`seq = old_seq + 1`, a random nonce), poll the
+/// response line, print + exit.
 /// CONTRACT: one admin client (this CLI, m7_gate, or any direct write_admin_req caller) per instance dir at a time; concurrent invocations may produce a nonsense request.
 fn run_mutate(common: &CommonArgs, op: u32, id: u32, (ip, port): (u32, u16)) -> anyhow::Result<()> {
     let cnc = open(common)?;
+    // Load the key (if any) BEFORE writing anything to the admin band — a
+    // bad key file must fail cleanly without ever touching the page.
+    let key = load_admin_key(common)?;
 
     // The admin band is a single seqlock slot: the current occupant's `seq`
     // (0 if none has ever been written on this cnc-page generation) plus one
@@ -304,8 +401,45 @@ fn run_mutate(common: &CommonArgs, op: u32, id: u32, (ip, port): (u32, u16)) -> 
     let old_seq = cnc.read_admin_req(0).map(|r| r.seq).unwrap_or(0);
     let seq = old_seq + 1;
     let nonce = rand::random::<u64>();
+
+    // M12b: the auth line MUST be written before the request line — the
+    // node's consensus agent treats `write_admin_req`'s `seq` store as the
+    // release that publishes both (see `uc2_log::cnc::AdminAuth`'s doc).
+    match &key {
+        Some(key) => {
+            let expiry_ns = unix_ns().saturating_add(common.admin_ttl_secs.saturating_mul(1_000_000_000));
+            let meta = cnc.meta();
+            let msg = AdminMessage {
+                app_id: &meta.app_id,
+                instance_id: meta.instance_id,
+                seq,
+                nonce,
+                op,
+                id,
+                ip,
+                port,
+                expiry_ns,
+            };
+            let tag = sign(key, &msg);
+            cnc.write_admin_auth(&AdminAuth { tag, expiry_ns, key_name_hash: key.name_hash });
+        }
+        None => cnc.write_admin_auth(&AdminAuth::ZERO),
+    }
     cnc.write_admin_req(&AdminReq { seq, nonce, op, id, ip, port });
 
+    let result = poll_admin_response(&cnc, seq);
+    // Clear the auth line on EVERY exit path — accepted, refused, retry, or
+    // timeout. Left in place, a stale signed line would otherwise
+    // authenticate the NEXT (possibly unsigned) request under this key,
+    // turning what should be reason 20 (auth_missing) into reason 21
+    // (auth_bad_tag) for a request that never intended to be signed.
+    cnc.write_admin_auth(&AdminAuth::ZERO);
+    result
+}
+
+/// Poll the admin response line for `seq`, print the outcome, and return the
+/// verdict as a `Result` — `Ok` only for `status == 0` (accepted).
+fn poll_admin_response(cnc: &CncPage, seq: u64) -> anyhow::Result<()> {
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
         if let Some(resp) = cnc.read_admin_resp(seq) {
@@ -534,5 +668,94 @@ fn run_force_single_member(a: &ForceSingleMemberArgs) -> anyhow::Result<()> {
     println!("new_version={}", report.new_version);
     println!("durable={}", report.durable);
     println!("dropped_peers={:?}", report.dropped_peers);
+    Ok(())
+}
+
+// ---------------------------------------------------------------- M12b Task 6: admin auth
+
+fn run_gen_admin_key(a: &GenAdminKeyArgs) -> anyhow::Result<()> {
+    generate_key_file(&a.path).map_err(|e| anyhow::anyhow!("gen-admin-key: {e}"))?;
+    let abs = std::fs::canonicalize(&a.path).unwrap_or_else(|_| a.path.clone());
+    let name = key_name_from_path(&a.path);
+    println!("wrote {}", abs.display());
+    println!("paste into the node's config file:");
+    println!("[admin]");
+    println!("keys = [{{ name = \"{name}\", key_path = \"{}\" }}]", abs.display());
+    Ok(())
+}
+
+/// One field's value out of a flat, single-line JSON object, as raw text
+/// (`"ops-alice"` -> `ops-alice`, `20` -> `20`, `null` -> `null`). `None` on
+/// anything that doesn't look like `"key":value` — this is a deliberately
+/// small hand parser, not a JSON parser: it works because the audit line's
+/// shape is pinned (`uc2_node::obs::log::format_line_at`, one flat object,
+/// fixed key order — see `uc2_node/src/audit.rs`'s module doc), not because
+/// this function understands JSON in general. Never panics: every step is a
+/// checked lookup, so a garbled line simply yields `None` for the field(s)
+/// it broke.
+fn json_field(line: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":");
+    let start = line.find(&needle)? + needle.len();
+    let rest = line.get(start..)?;
+    if let Some(stripped) = rest.strip_prefix('"') {
+        let end = stripped.find('"')?;
+        Some(stripped[..end].to_string())
+    } else {
+        let end = rest.find([',', '}'])?;
+        Some(rest[..end].to_string())
+    }
+}
+
+/// Render one audit line in the summarized, human-readable form. `None` if
+/// any field this format needs is missing — the caller falls back to
+/// printing the raw line with a `?` marker rather than a partial/misleading
+/// summary.
+fn format_audit_line(line: &str) -> Option<String> {
+    let ts = json_field(line, "ts_ns")?;
+    let actor = json_field(line, "actor")?;
+    let origin = json_field(line, "origin")?;
+    let op_name = json_field(line, "op_name")?;
+    let id = json_field(line, "id")?;
+    // `addr` is either a quoted "ip:port" string or the literal JSON `null`
+    // (unquoted) — `json_field`'s unquoted branch already returns "null" as
+    // text for that case, which is exactly what should print.
+    let addr = json_field(line, "addr")?;
+    let outcome = json_field(line, "outcome")?;
+    let reason = json_field(line, "reason")?;
+    let cfg = json_field(line, "config_version")?;
+    Some(format!("{ts}  {actor}  {origin}  {op_name}  {id}  {addr}  {outcome}({reason})  cfg={cfg}"))
+}
+
+fn run_audit(a: &AuditArgs) -> anyhow::Result<()> {
+    let path = a.instance_dir.join("audit.jsonl");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("no audit log at {}", path.display());
+            return Ok(());
+        }
+        Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", path.display())),
+    };
+
+    let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if let Some(n) = a.tail {
+        let skip = lines.len().saturating_sub(n);
+        lines = lines[skip..].to_vec();
+    }
+
+    for line in lines {
+        if a.json {
+            println!("{line}");
+            continue;
+        }
+        match format_audit_line(line) {
+            Some(s) => println!("{s}"),
+            // A malformed line is printed as-is with a marker rather than
+            // dropped or panicked on — the audit log's whole point is never
+            // to lose a record silently, including one this parser can't
+            // fully make sense of.
+            None => println!("? {line}"),
+        }
+    }
     Ok(())
 }

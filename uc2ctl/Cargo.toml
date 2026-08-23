@@ -23,7 +23,18 @@ publish = false
 uc2_log = { path = "../uc2_log" }
 uc2_node = { path = "../uc2_node" }
 uc_protocol = { path = "../uc_protocol" }
+# M12b Task 6: `--admin-key` signing + `gen-admin-key` — the canonical
+# `AdminMessage`/`sign`/`AdminKey`/`generate_key_file` live here so this CLI
+# builds the exact same byte layout the node verifies, rather than
+# reimplementing it.
+uc2_crypto = { path = "../uc2_crypto" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 # A per-request nonce, so a response can never be mistaken for a stale one.
 rand = { workspace = true }
+
+[dev-dependencies]
+# admin_auth_bin.rs starts a real node IN-PROCESS (uc2_node is already a
+# regular dependency above) and needs `FaultConfig` for `NodeConfig`.
+uc2_net = { path = "../uc2_net" }
+tempfile = { workspace = true }

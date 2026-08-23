@@ -1498,7 +1498,10 @@ dependencies = [
  "anyhow",
  "clap",
  "rand",
+ "tempfile",
+ "uc2_crypto",
  "uc2_log",
+ "uc2_net",
  "uc2_node",
  "uc_protocol",
 ]
