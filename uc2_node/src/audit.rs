@@ -128,8 +128,13 @@ pub fn op_name(op: u32) -> &'static str {
 pub struct AuditRecord<'a> {
     /// Unix nanoseconds (`crate::obs::metrics::now_unix_ns`).
     pub ts_ns: u64,
-    /// The admin key name that signed the request under
-    /// [`uc2_crypto::admin::AdminPolicy::Hmac`]; `"filesystem"` under
+    /// Who the node can attest asked for this. One of exactly four shapes:
+    /// the admin key name that signed the request under
+    /// [`uc2_crypto::admin::AdminPolicy::Hmac`]; `"unverified"` when an
+    /// `Hmac` policy could NOT authenticate the request (missing, bad,
+    /// expired, or unknown-key auth line — the record never repeats a name
+    /// the node could not verify, or an audit reader could be steered by an
+    /// attacker's own choice of key name); `"filesystem"` under
     /// `Filesystem` (nothing was authenticated — the directory permissions
     /// were the boundary); `"peer:<id>"` for a proposal a peer forwarded.
     pub actor: &'a str,
@@ -171,6 +176,14 @@ impl AuditLog {
     pub fn open(instance_dir: &Path) -> std::io::Result<AuditLog> {
         let path = instance_dir.join(AUDIT_FILE);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        // M12b final review (M2): fsync the DIRECTORY once, so the newly
+        // created directory entry itself is durable. Without it a crash
+        // right after the first record's own `sync_data` could leave a file
+        // whose contents reached the platter but whose name never did — the
+        // record would be gone despite having been fsynced. Once per node
+        // start, never on the record path; a no-op cost on a directory whose
+        // entry already existed.
+        File::open(instance_dir)?.sync_all()?;
         Ok(AuditLog { file, path })
     }
 
@@ -241,12 +254,26 @@ fn fields<'a>(r: &'a AuditRecord<'a>, addr: Option<&'a str>) -> [Field<'a>; 11] 
 mod tests {
     use super::*;
 
-    /// `tempfile::tempdir()` (the in-crate unit-test convention;
-    /// `CARGO_TARGET_TMPDIR` exists only for integration tests). Safe against
-    /// the "no heavy artifacts on tmpfs" rule: every file here is a handful
-    /// of ~200-byte lines.
+    /// A scratch directory on REAL DISK, never `/tmp` (RAM-backed tmpfs with
+    /// no swap on the dev box — CLAUDE.md). `CARGO_TARGET_TMPDIR` is set only
+    /// for integration-test binaries, and these are inline `#[cfg(test)]`
+    /// unit tests in the lib target, so this falls back to a package-relative
+    /// `target/` directory — the same shape as `uc2_crypto/src/admin.rs`'s
+    /// own `scratch_root` helper, including its `/tmp` assert.
     fn tempdir() -> tempfile::TempDir {
-        tempfile::Builder::new().prefix("uc2-audit-").tempdir().expect("tempdir")
+        let root = std::env::var("CARGO_TARGET_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../target/uc2_node_tests")
+            });
+        assert!(
+            !root.starts_with("/tmp"),
+            "test scratch must not live on tmpfs: {}",
+            root.display()
+        );
+        std::fs::create_dir_all(&root).expect("scratch root");
+        tempfile::Builder::new().prefix("uc2-audit-").tempdir_in(&root).expect("tempdir")
     }
 
     fn rec(seq: u64) -> AuditRecord<'static> {

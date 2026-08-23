@@ -68,7 +68,12 @@ for the full `[admin]` key table.
 
 [`packaging/node.example.toml`](../../packaging/node.example.toml) is the
 annotated reference copy — every optional field with its default shown — and a
-test pins it against the loader, so it cannot drift. The full surface is in
+test pins it against the loader, so it cannot drift. Note it ships
+`[admin] auth = "hmac"` with an `ops-alice` key, so a verbatim copy does not
+start until that key file exists — run
+`uc2ctl gen-admin-key /etc/uc2/admin/alice.key` first, or set
+`auth = "none"` (with `keys = []`) for the pre-`v2.6.0` filesystem-boundary
+posture. The full surface is in
 [Configuration](../reference/configuration.md).
 
 Two properties of the file save you from whole classes of quiet failure: a

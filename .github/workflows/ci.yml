@@ -10,7 +10,8 @@ name: ci
 #     (lin_v2 / lin_partition_v2 spin multi-node clusters of busy-polling
 #     agents for minutes; nightly runs them). uc2_node's fast integration
 #     suites (smoke, failover, learner, purge_safety, query_barrier) DO run
-#     here — they're the election/truncation/reconstruction regression net.
+#     here — they're the election/truncation/reconstruction regression net,
+#     and (M12b) admin_auth / daemon_refusals, the admin authn+audit net.
 # Deliberately NOT run here:
 #   * cargo fmt --check — the codebase predates a fmt pass (~800 hunks of
 #     drift); clippy is the enforced style gate, per CLAUDE.md.
@@ -53,3 +54,4 @@ jobs:
           cargo test -p uc2_node --lib
           --test smoke --test failover --test learner
           --test purge_safety --test query_barrier
+          --test admin_auth --test daemon_refusals

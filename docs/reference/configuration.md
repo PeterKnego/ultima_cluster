@@ -236,7 +236,7 @@ posture, byte-for-byte, so in-process tests and harnesses that never touch
 |---|---|---|
 | `auth` | — (required) | `"hmac"` — every mutating admin request must carry a valid signature; or `"none"` — instance-directory file permissions are the only boundary, the pre-`v2.6.0` posture. |
 | `keys` | `[]` | `[{ name, key_path }]`, one entry per admin key this node accepts. Required (≥ 1, unique `name`s) under `auth = "hmac"`; must be empty under `auth = "none"`. |
-| `request_ttl_ms` | `30000` | How long a signed request's `expiry_ns` window may extend from the moment `uc2ctl` signs it. Must be `>= 1000` under either mode. |
+| `request_ttl_ms` | `30000` | How long a signed request's `expiry_ns` window may extend from the moment `uc2ctl` signs it. Must be `>= 1000` under either mode. This is a **node-side ceiling on the client**: a request's expiry must be `<= now + 2 × ttl` (the doubling absorbs ordinary clock skew), so a `uc2ctl --admin-ttl-secs` wider than that is refused `auth_expired` (22) on arrival, not honoured. |
 
 **Key file rule** (shared with `[crypto]`'s key material,
 `uc2_crypto::admin::check_key_file_perms`): exactly 32 bytes, mode `0600` —

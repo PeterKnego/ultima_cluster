@@ -16,7 +16,11 @@ before you decide which one you need.
 `journal/`, `state/`, `snapshots/` — into a fresh artifact directory. It never
 touches `cnc2.dat`, `log.buf`, the ring files, or `instance.lock`: those are
 volatile, and a node's next boot recreates them unconditionally regardless of
-what a backup or restore did. See
+what a backup or restore did. **`audit.jsonl` is not part of the artifact
+either** — the admin audit trail is node-local and append-only, it is not
+state a restore reconstructs from, and a restored node starts a fresh one.
+Copy it separately (a plain `cp`, any time — it is append-only) if you want
+to keep the trail. See
 [Instance directory](../reference/instance-directory.md#durability-classes)
 for the full durable/volatile split.
 

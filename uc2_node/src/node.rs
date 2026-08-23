@@ -1260,11 +1260,17 @@ impl Node {
             last_flags: 0,
             config_bytes: Arc::clone(&config_bytes),
             admin,
+            // C1: the SAME values written into `CncMeta` above — the tag is
+            // bound to this node's boot-time state, never to what the
+            // (writable) cnc page happens to say at request time.
+            admin_instance_id: instance_id,
+            admin_app_id: cfg.app_id.clone(),
             audit,
             last_admin_seq: 0,
             pending_admin_fwd: None,
             last_config_reply: None,
             config_proposal_non_member: 0,
+            config_proposal_dedup_resend: 0,
             crypto: crypto.clone(),
             crypto_hs_rx: Some(hs_rx),
             crypto_peer_ids,
@@ -1850,6 +1856,25 @@ struct Consensus {
     /// TTL). Read ONLY inside `verify_admin`, i.e. only when an admin request
     /// actually arrived: nothing on the duty-cycle hot path touches it.
     admin: AdminPolicy,
+    /// M12b final review (C1): the `instance_id` this node's admin HMAC tags
+    /// are bound to — captured from the value `start_with` generated and
+    /// wrote into [`CncMeta`], NOT re-read from the cnc page per request.
+    ///
+    /// The page is a file in the instance directory that an actor with write
+    /// access can edit, and `read_cnc_header` validates only the magic. Were
+    /// `verify_admin` to take the binding values off the page, that actor
+    /// could capture a signed `(auth, req)` pair, wait for (or induce) a
+    /// restart — which resets `last_admin_seq` to 0 — write the CAPTURED
+    /// `instance_id` back into `CNC_OFF_INSTANCE_LO/HI`, re-write the
+    /// captured lines, and have the change applied a second time. Holding
+    /// the value in the agent's own memory makes the page's copy purely
+    /// informational to attaching parties and un-forgeable as a credential.
+    admin_instance_id: u128,
+    /// M12b final review (C1): the `app_id` admin HMAC tags are bound to —
+    /// `NodeConfig::app_id`, this node's own boot-time state, for the same
+    /// reason as [`Self::admin_instance_id`]. Owned once at start rather
+    /// than re-allocated out of `CncPage::meta()` on every request.
+    admin_app_id: String,
     /// M12b (spec §5.3): the append-only admin audit file, opened at node
     /// start and written by this agent alone. Every answer this node gives to
     /// an admin request is recorded here — with an fsync — BEFORE the answer
@@ -1888,6 +1913,13 @@ struct Consensus {
     /// non-member datagram must never reach `peer_actor`/`audit_admin`, so
     /// this is incremented and warned on BEFORE either is called.
     config_proposal_non_member: u64,
+    /// M12b final review (I4): count of kind-16 `ConfigProposal` datagrams
+    /// answered from the nonce-dedup cache (`last_config_reply`) — a
+    /// byte-identical re-answer of a nonce this leader already recorded.
+    /// Those re-answers deliberately do NOT write a second audit record (and
+    /// so do NOT cost a second `fsync`), so this counter is what accounts for
+    /// them; see `on_config_proposal`.
+    config_proposal_dedup_resend: u64,
 
     // ---- M8 (Task 12): the crypto plane -----------------------------------
     /// The process's shared handshake/group-key/rotation state. `None` =
@@ -3725,6 +3757,14 @@ impl Consensus {
     /// would therefore never refuse anything these checks already refuse.
     /// `expiry_ns` still bounds the window in which a live, correctly
     /// sequenced request could be delayed and only then applied.
+    ///
+    /// **The binding values come from this node's own boot-time state**
+    /// ([`Self::admin_instance_id`] / [`Self::admin_app_id`]), never from
+    /// `CncPage::meta()`. That is what makes the restart half of the argument
+    /// above sound: the cnc page is a writable file, so an actor with
+    /// instance-dir write access could otherwise put a captured
+    /// `instance_id` back on the page after a restart and replay the capture
+    /// against it (M12b final review, C1).
     fn verify_admin(&self, req: &AdminReq) -> Result<Option<String>, u32> {
         let (keys, ttl) = match &self.admin {
             AdminPolicy::Filesystem => return Ok(None),
@@ -3751,10 +3791,9 @@ impl Consensus {
             .iter()
             .find(|k| k.name_hash == auth.key_name_hash)
             .ok_or(REASON_AUTH_UNKNOWN_KEY)?;
-        let meta = self.cnc.meta();
         let m = AdminMessage {
-            app_id: &meta.app_id,
-            instance_id: meta.instance_id,
+            app_id: &self.admin_app_id,
+            instance_id: self.admin_instance_id,
             seq: req.seq,
             nonce: req.nonce,
             op: req.op,
@@ -3809,7 +3848,11 @@ impl Consensus {
     /// follower's request times out and `uc2ctl` (or the follower's next admin
     /// cycle) re-learns the current leader hint and can re-forward. Nonce
     /// dedup: a repeat nonce gets the STORED reply re-sent rather than a fresh
-    /// `propose_config` call (retry-idempotent while the change is pending).
+    /// `propose_config` call (retry-idempotent while the change is pending) —
+    /// and, since M12b's final review (I4), without a second audit record:
+    /// the original answer was recorded, and a byte-identical re-answer of
+    /// the same nonce is not a new admin event (it is counted as
+    /// `config_proposal_dedup_resend` instead).
     fn on_config_proposal(&mut self, from: SocketAddr, body: ConfigProposalBody) {
         if !matches!(self.sm.role(), Role::Leader) {
             return;
@@ -3850,17 +3893,15 @@ impl Consensus {
             && *nonce == body.nonce
         {
             let reply = *reply;
-            // A re-sent answer is a second answer: record it too, so the file
-            // accounts for every reply this node put on the wire.
-            let (status, reason) = self.audit_admin(
-                Some(&actor),
-                AuditOrigin::Forwarded,
-                audited,
-                reply.status,
-                reply.reason,
-                reply.version,
-            );
-            let reply = ConfigReplyBody { nonce: body.nonce, status, reason, version: reply.version };
+            // M12b final review (I4): re-send the cached reply WITHOUT a
+            // second audit record. The original answer was recorded; a
+            // byte-identical re-answer of the same nonce is not a new admin
+            // event, and recording one would let any member (or, with
+            // `[crypto].enabled = false`, anything that can spoof a member's
+            // source address) drive an unbounded stream of `fsync`s on the
+            // consensus thread by re-sending one captured datagram. A
+            // fresh-nonce proposal is still recorded — see below.
+            self.config_proposal_dedup_resend += 1;
             self.send_config_reply(from, &reply);
             return;
         }
@@ -5659,11 +5700,16 @@ mod tests {
             last_flags: 0,
             config_bytes: Arc::new(Mutex::new(Vec::new())),
             admin: AdminPolicy::Filesystem,
+            // Inert under `Filesystem` (verify_admin returns before reading
+            // them), but set to plausible values rather than junk.
+            admin_instance_id: 0x1234_5678_9abc_def0_1234_5678_9abc_def0,
+            admin_app_id: "harness".to_string(),
             audit: AuditLog::open(dir.path()).unwrap(),
             last_admin_seq: 0,
             pending_admin_fwd: None,
             last_config_reply: None,
             config_proposal_non_member: 0,
+            config_proposal_dedup_resend: 0,
             // M8 Task 12. `crypto_maint_ns: 0` makes ONE `do_work` a full
             // maintenance pass — the production 20 ms floor is a hot-path
             // concern, not a behavior under test, and rate-limiting here
@@ -6758,6 +6804,50 @@ mod tests {
         assert!(
             h.cons.last_config_reply.is_none(),
             "a dropped datagram must never reach propose_and_append, so no reply is ever recorded"
+        );
+    }
+
+    /// M12b final review (I4): a repeat kind-16 nonce is answered from the
+    /// dedup cache and must NOT write a second audit record — the original
+    /// answer is already on disk, and re-recording would let one captured
+    /// datagram, re-sent in a loop, drive an unbounded stream of `fsync`s on
+    /// the consensus thread. The re-send is counted instead.
+    #[test]
+    fn a_dedup_re_send_is_counted_not_re_audited() {
+        let mut h = harness();
+        h.cons.feed(Event::Tick { now_ns: 301 });
+        h.cons.feed(Event::Vote { from: 0, term: 3, granted: true });
+        assert!(matches!(h.cons.sm.role(), Role::Leader), "majority vote elects");
+
+        let member = *h
+            .cons
+            .addr_to_id
+            .keys()
+            .next()
+            .expect("the harness cluster has members");
+        let body = ConfigProposalBody { nonce: 77, op: 1, id: 9, ip: 0, port: 0 };
+
+        // First presentation: a fresh nonce, recorded like any admin answer.
+        h.cons.on_config_proposal(member, body);
+        let after_first = std::fs::read_to_string(h.cons.audit.path()).unwrap();
+        assert_eq!(
+            after_first.lines().count(),
+            1,
+            "a fresh-nonce proposal is recorded: {after_first}"
+        );
+        assert_eq!(h.cons.config_proposal_dedup_resend, 0);
+        assert!(h.cons.last_config_reply.is_some(), "the answer was cached for dedup");
+
+        // Same nonce again, five times over: cached answer re-sent, nothing
+        // recorded, every re-send counted.
+        for _ in 0..5 {
+            h.cons.on_config_proposal(member, body);
+        }
+        assert_eq!(h.cons.config_proposal_dedup_resend, 5, "every re-send is counted");
+        assert_eq!(
+            std::fs::read_to_string(h.cons.audit.path()).unwrap(),
+            after_first,
+            "a byte-identical re-answer of the same nonce is not a new admin event"
         );
     }
 

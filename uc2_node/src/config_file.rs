@@ -329,12 +329,38 @@ pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), Confi
                 });
             }
             let mut seen = std::collections::HashSet::new();
+            // M12b final review (M5): also reject an empty name, and a
+            // collision in the FNV-1a-64 name hash. The hash — not the name —
+            // is what travels on the 64-byte cnc auth line and what
+            // `verify_admin` looks the key up by, so two distinct names that
+            // hash alike would make the node verify against whichever entry
+            // it found first. Vanishingly unlikely by accident; refused
+            // loudly at load rather than silently mis-attributed in
+            // `audit.jsonl` at 3 a.m.
+            let mut seen_hash = std::collections::HashMap::new();
             for k in &admin.keys {
+                if k.name.is_empty() {
+                    return Err(ConfigError::Invalid {
+                        field: "admin.keys",
+                        detail: "an entry in admin.keys has an empty name — every admin key                                  needs a name (it is what uc2ctl passes as --admin-key-name                                  and what audit.jsonl records as the actor)"
+                            .to_string(),
+                    });
+                }
                 if !seen.insert(k.name.as_str()) {
                     return Err(ConfigError::Invalid {
                         field: "admin.keys",
                         detail: format!(
                             "duplicate name {:?} in admin.keys — key names must be unique",
+                            k.name
+                        ),
+                    });
+                }
+                let h = uc2_crypto::admin::fnv1a64(&k.name);
+                if let Some(prev) = seen_hash.insert(h, k.name.as_str()) {
+                    return Err(ConfigError::Invalid {
+                        field: "admin.keys",
+                        detail: format!(
+                            "admin.keys entries {prev:?} and {:?} collide in the 64-bit                              FNV-1a name hash ({h:#018x}) that identifies a key on the wire                              — rename one of them",
                             k.name
                         ),
                     });
@@ -770,6 +796,26 @@ level = "info"
         let err = load_str(&body).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("ops-alice"), "must name the duplicate key, got: {msg}");
+        match err {
+            ConfigError::Invalid { field, .. } => assert_eq!(field, "admin.keys"),
+            other => panic!("expected Invalid{{field: \"admin.keys\"}}, got {other:?}"),
+        }
+    }
+
+    /// M12b final review (M5): a key with an empty name is refused. The name
+    /// is what `uc2ctl` passes as `--admin-key-name`, what the FNV-1a name
+    /// hash on the wire is derived from, and what `audit.jsonl` records as
+    /// the actor — an empty one makes all three meaningless. (The sibling
+    /// name-hash-collision refusal in the same loop has no test: exhibiting
+    /// a real 64-bit FNV-1a collision needs ~2^32 work, so the check is
+    /// carried on its argument, not on a fixture.)
+    #[test]
+    fn admin_hmac_empty_key_name_is_refused() {
+        let body = format!(
+            "{MINIMAL_NO_CRYPTO_ADMIN}\n[crypto]\nenabled = false\n[admin]\nauth = \"hmac\"\n\
+             keys = [{{ name = \"\", key_path = \"/etc/uc2/admin/a.key\" }}]\n"
+        );
+        let err = load_str(&body).unwrap_err();
         match err {
             ConfigError::Invalid { field, .. } => assert_eq!(field, "admin.keys"),
             other => panic!("expected Invalid{{field: \"admin.keys\"}}, got {other:?}"),

@@ -368,9 +368,21 @@ durably anywhere.
 > is never even read a second time — and re-presenting it at a higher `seq`
 > changes the canonical bytes the tag was computed over, which fails
 > `verify`. A node restart resets `last_admin_seq` to 0, which looks like it
-> reopens the window, but the tag also covers `instance_id`
-> (`CncPage::meta().instance_id`), which is re-randomized on every restart
-> — so a pre-restart capture cannot be replayed post-restart either. A ring
+> reopens the window, but the tag also covers `instance_id`, which is
+> re-randomized on every restart — so a pre-restart capture cannot be
+> replayed post-restart either. **That `instance_id` (and the `app_id`
+> beside it) is read from the node's own boot-time state —
+> `Consensus::admin_instance_id`/`admin_app_id`, captured in
+> `Node::start_with` from the same values it writes into `CncMeta` — and
+> NOT from `CncPage::meta()` per request.** The distinction is the whole
+> argument: the cnc page is a file in the instance directory whose header
+> `read_cnc_header` magic-checks but does not otherwise authenticate, so a
+> per-request read off the page would let an actor with directory write
+> access and no admin key write a captured `instance_id` back onto the page
+> after a restart and replay the capture against it. Found by the M12b
+> final review (C1) and fixed; regression test
+> `uc2_node/tests/admin_auth.rs::a_capture_replayed_after_a_restart_is_refused`.
+> A ring
 > would therefore never refuse anything these two checks (the seqlock
 > cursor, plus `instance_id` in the signed bytes) do not already refuse;
 > what remains genuinely unbounded without a ring is the *delay* window for

@@ -70,6 +70,15 @@ How long the signature is valid for, counted from the moment `uc2ctl` signs
 it. The node refuses a request outside its own acceptance window with reason
 `auth_expired` (22).
 
+**There is a ceiling, set by the node, not by this flag.** The node accepts
+an `expiry_ns` only in `(now, now + 2 × request_ttl_ms)` — its own
+`[admin].request_ttl_ms`, doubled to leave room for ordinary clock skew.
+Ask for more than that and every request is refused `auth_expired` (22)
+immediately, which looks exactly like clock skew: with the default
+`request_ttl_ms = 30000`, anything above `--admin-ttl-secs 60` is refused
+outright. Raise `request_ttl_ms` on the nodes if you genuinely need a longer
+window.
+
 ## Sub-commands
 
 Sub-commands are: `add-learner`, `promote`, `demote`, `remove-learner`,

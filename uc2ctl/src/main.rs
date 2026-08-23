@@ -342,7 +342,7 @@ fn reason_str(reason: u32) -> &'static str {
         12 => "SelfDemote (a leader cannot demote itself; RemoveVoter it and rejoin a fresh id as learner)",
         20 => "auth_missing (the node requires a signed request: pass --admin-key)",
         21 => "auth_bad_tag (wrong key, a stale auth line, or a tampered request)",
-        22 => "auth_expired (clock skew between uc2ctl and the node? retry)",
+        22 => "auth_expired (expired, clock skew between uc2ctl and the node, or --admin-ttl-secs wider than the node's 2×request_ttl_ms window)",
         23 => "auth_unknown_key (this key name is not in the node's [admin].keys)",
         24 => "audit_failed (the node could not record the request — check its audit.jsonl and disk)",
         _ => "unknown/malformed",
@@ -429,10 +429,12 @@ fn run_mutate(common: &CommonArgs, op: u32, id: u32, (ip, port): (u32, u16)) -> 
 
     let result = poll_admin_response(&cnc, seq);
     // Clear the auth line on EVERY exit path — accepted, refused, retry, or
-    // timeout. Left in place, a stale signed line would otherwise
-    // authenticate the NEXT (possibly unsigned) request under this key,
-    // turning what should be reason 20 (auth_missing) into reason 21
-    // (auth_bad_tag) for a request that never intended to be signed.
+    // timeout. This is tidiness, not a security control: a stale line CANNOT
+    // authenticate anything, because the tag covers `seq` and the next
+    // request carries a higher one. Left in place it would merely turn what
+    // should be reason 20 (auth_missing) into reason 21 (auth_bad_tag) for a
+    // following unsigned request — a confusing diagnostic, not an auth
+    // bypass. Clearing it keeps the reason code honest (defence in depth).
     cnc.write_admin_auth(&AdminAuth::ZERO);
     result
 }

@@ -140,7 +140,14 @@ and `audit --instance-dir D [--tail N] [--json]` (offline, reads
 consensus agent only ever acts on `seq > last_admin_seq`, and a restart
 resets that cursor but also re-randomizes `instance_id`, which the tag also
 covers, so a ring would never refuse anything those two checks do not
-already refuse (`expiry_ns` bounds the delay window instead). **Residual,
+already refuse (`expiry_ns` bounds the delay window instead). **The tag's
+`instance_id`/`app_id` binding is taken from the node's own boot-time state
+(`Consensus::admin_instance_id`/`admin_app_id`), never re-read from the cnc
+page** — the page is a writable file whose header is only magic-checked, so
+reading it per request would have let an actor with instance-dir write
+access (but no key) restore a captured `instance_id` after a restart and
+replay a captured request; regression test
+`uc2_node/tests/admin_auth.rs::a_capture_replayed_after_a_restart_is_refused`. **Residual,
 stated everywhere it matters** (`README.md`, `docs/reference/configuration.md`,
 `docs/how-to/change-cluster-membership.md`,
 `docs/how-to/encrypt-node-traffic.md`): a follower forwards an

@@ -70,7 +70,14 @@ fn hmac_policy() -> AdminPolicy {
 struct NodeH {
     id: NodeId,
     instance_dir: PathBuf,
-    node: Node,
+    /// This node's own bind address and the member map it booted with, so a
+    /// test can stop it and start it again on the same instance directory
+    /// (the `Filesystem`-vs-`Hmac` restart story — see
+    /// `a_capture_replayed_after_a_restart_is_refused`).
+    addr: SocketAddr,
+    members: Vec<(NodeId, SocketAddr)>,
+    seed: u64,
+    node: Option<Node>,
 }
 
 struct Cluster {
@@ -78,10 +85,49 @@ struct Cluster {
     nodes: Vec<NodeH>,
 }
 
+impl NodeH {
+    fn node(&self) -> &Node {
+        self.node.as_ref().expect("node is running")
+    }
+
+    /// Stop this node and start it again from the SAME instance directory on
+    /// the SAME port — a plain restart, the shape `failover.rs`'s harness
+    /// uses. Every restart re-creates the cnc page with a fresh random
+    /// `instance_id` and resets `last_admin_seq` to 0.
+    fn restart(&mut self, policy: AdminPolicy) {
+        if let Some(node) = self.node.take() {
+            node.stop();
+        }
+        // UDP rebinding on loopback succeeds immediately once the old socket
+        // is closed; the short loop absorbs any transient race.
+        let deadline = deadline_secs(5);
+        let sock = loop {
+            match UdpSocket::bind(self.addr) {
+                Ok(s) => break s,
+                Err(e) => {
+                    assert!(Instant::now() < deadline, "rebind {} failed: {e}", self.addr);
+                    std::thread::yield_now();
+                }
+            }
+        };
+        let cfg = make_config(
+            self.id,
+            self.members.clone(),
+            self.addr,
+            self.instance_dir.clone(),
+            self.seed,
+        );
+        let opts = StartOpts { socket: Some(sock), admin: policy };
+        self.node = Some(Node::start_with(cfg, opts).expect("restart"));
+    }
+}
+
 impl Cluster {
     fn stop(self) {
         for h in self.nodes {
-            h.node.stop();
+            if let Some(node) = h.node {
+                node.stop();
+            }
         }
     }
 }
@@ -137,7 +183,14 @@ fn spawn_cluster(n: usize, policy: AdminPolicy) -> Cluster {
         let cfg = make_config(i as NodeId, members.clone(), addr, instance_dir.clone(), seed_for(i));
         let opts = StartOpts { socket: Some(sock), admin: policy.clone() };
         let node = Node::start_with(cfg, opts).expect("start");
-        nodes.push(NodeH { id: i as NodeId, instance_dir, node });
+        nodes.push(NodeH {
+            id: i as NodeId,
+            instance_dir,
+            addr,
+            members: members.clone(),
+            seed: seed_for(i),
+            node: Some(node),
+        });
     }
     Cluster { _dir: dir, nodes }
 }
@@ -149,7 +202,7 @@ fn deadline_secs(secs: u64) -> Instant {
 fn await_single_leader(nodes: &[NodeH], secs: u64) -> usize {
     let deadline = deadline_secs(secs);
     loop {
-        let serving: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].node.can_serve()).collect();
+        let serving: Vec<usize> = (0..nodes.len()).filter(|&i| nodes[i].node().can_serve()).collect();
         assert!(serving.len() <= 1, "split-brain: {serving:?} all serve");
         if serving.len() == 1 {
             return serving[0];
@@ -377,7 +430,7 @@ fn hmac_policy_refuses_unsigned() {
     let dir = c.nodes[leader].instance_dir.clone();
     let cnc = open_cnc(&dir);
 
-    let version_before = c.nodes[leader].node.config_version();
+    let version_before = c.nodes[leader].node().config_version();
     let (id, addr) = fresh_learner(1);
     let (_, resp, line) = admin_request(&cnc, &dir, OP_ADD_LEARNER, id, addr, Auth::None);
     assert_eq!(resp.status, 1, "an unsigned request must be refused");
@@ -388,7 +441,7 @@ fn hmac_policy_refuses_unsigned() {
     assert_record(&line, "unverified", "refused", REASON_AUTH_MISSING);
     assert_eq!(field(&line, "config_version"), "0", "{line}");
     assert_eq!(
-        c.nodes[leader].node.config_version(),
+        c.nodes[leader].node().config_version(),
         version_before,
         "a refused request must never reach propose_config"
     );
@@ -457,7 +510,7 @@ fn bad_tag_is_refused() {
     assert_eq!(resp.status, 1);
     assert_eq!(resp.reason, REASON_AUTH_BAD_TAG);
     assert_record(&line, "unverified", "refused", REASON_AUTH_BAD_TAG);
-    assert_eq!(c.nodes[leader].node.config_version(), 0, "nothing was proposed");
+    assert_eq!(c.nodes[leader].node().config_version(), 0, "nothing was proposed");
 
     c.stop();
 }
@@ -516,7 +569,7 @@ fn expired_is_refused() {
     assert_record(&line, "unverified", "refused", REASON_AUTH_EXPIRED);
 
     assert_eq!(audit_lines(&dir).len(), 2, "both refusals are on disk");
-    assert_eq!(c.nodes[leader].node.config_version(), 0, "nothing was proposed");
+    assert_eq!(c.nodes[leader].node().config_version(), 0, "nothing was proposed");
     c.stop();
 }
 
@@ -550,7 +603,7 @@ fn unknown_key_is_refused() {
     // not verify, or an audit reader could be steered by an attacker's own
     // choice of key name.
     assert_record(&line, "unverified", "refused", REASON_AUTH_UNKNOWN_KEY);
-    assert_eq!(c.nodes[leader].node.config_version(), 0, "nothing was proposed");
+    assert_eq!(c.nodes[leader].node().config_version(), 0, "nothing was proposed");
 
     c.stop();
 }
@@ -587,7 +640,7 @@ fn a_replayed_request_cannot_be_re_presented() {
     );
     assert_eq!(resp.status, 0, "setup: the first presentation is accepted (reason {})", resp.reason);
     assert_record(&line, "ops-test", "accepted", 0);
-    let version_after = c.nodes[leader].node.config_version();
+    let version_after = c.nodes[leader].node().config_version();
     let audit_before = audit_lines(&dir);
     assert_eq!(audit_before.len(), 1);
     let auth_line = cnc.read_admin_auth();
@@ -602,7 +655,7 @@ fn a_replayed_request_cannot_be_re_presented() {
     }
 
     assert_eq!(
-        c.nodes[leader].node.config_version(),
+        c.nodes[leader].node().config_version(),
         version_after,
         "the replayed request must not have been applied a second time"
     );
@@ -613,6 +666,130 @@ fn a_replayed_request_cannot_be_re_presented() {
     assert_eq!(audit_lines(&dir), audit_before, "the replay produced a second audit record");
 
     c.stop();
+}
+
+/// M12b final review, C1: the HMAC tag's `instance_id` binding must come from
+/// the node's OWN boot-time state, never from the (writable) cnc page.
+///
+/// The attack this pins closed: an actor with write access to the instance
+/// directory but NO admin key captures a signed `(auth, req)` pair, waits for
+/// (or induces) a restart — which resets `last_admin_seq` to 0, so the
+/// captured `seq` is readable again — writes the CAPTURED `instance_id` back
+/// into the page's header, and re-presents the captured lines. If
+/// `verify_admin` read the binding values off the page, the tag would verify
+/// and the change would be applied a second time by someone who never held a
+/// key. Because the values live in the consensus agent's own memory, the
+/// forged page is irrelevant and the replay is a bad tag (reason 21).
+///
+/// The header forgery is a deliberate test-only raw write: 16 bytes at
+/// `CNC_OFF_INSTANCE_LO`/`CNC_OFF_INSTANCE_HI` (LE halves of the `u128`),
+/// `pwrite`n straight into `cnc2.dat`. That is exactly the write an attacker
+/// with directory access can make, and it is coherent with the node's
+/// `MAP_SHARED` mapping of the same file; the assertion right after it
+/// (`cnc.meta().instance_id`) proves the forgery actually landed, so a test
+/// that quietly failed to forge anything cannot pass by accident. No crc is
+/// recomputed — deliberately: `read_cnc_header` (what `meta()` uses) checks
+/// only the magic, which is the whole reason this was reachable.
+#[test]
+fn a_capture_replayed_after_a_restart_is_refused() {
+    let _g = serialize();
+    let mut c = spawn_cluster(1, hmac_policy());
+    let leader = await_single_leader(&c.nodes, 20);
+    let dir = c.nodes[leader].instance_dir.clone();
+    let key = test_key();
+
+    let cnc = open_cnc(&dir);
+    let captured_instance_id = cnc.meta().instance_id;
+
+    // 1. A real, accepted, signed request — the bytes the attacker captures.
+    let (id, addr) = fresh_learner(1);
+    let (req, resp, _line) = admin_request(
+        &cnc,
+        &dir,
+        OP_ADD_LEARNER,
+        id,
+        addr,
+        Auth::Signed { key: &key, ttl: TTL, corrupt_tag: false, expiry_override: None },
+    );
+    assert_eq!(resp.status, 0, "setup: the capture must be of an ACCEPTED request");
+    let captured_auth = cnc.read_admin_auth();
+    assert!(!captured_auth.is_zero(), "setup: a signed auth line was captured");
+    drop(cnc);
+
+    // 2. The restart. `last_admin_seq` goes back to 0 and the page is
+    //    re-created with a fresh random `instance_id`.
+    c.nodes[leader].restart(hmac_policy());
+    let leader = await_single_leader(&c.nodes, 20);
+    let cnc = open_cnc(&dir);
+    assert_ne!(
+        cnc.meta().instance_id,
+        captured_instance_id,
+        "setup: a restart must re-randomize instance_id"
+    );
+    let version_before = c.nodes[leader].node().config_version();
+
+    // 3. The forgery: put the CAPTURED instance_id back on the page.
+    forge_instance_id(&dir, captured_instance_id);
+    assert_eq!(
+        cnc.meta().instance_id,
+        captured_instance_id,
+        "the raw header write did not land — this test would prove nothing"
+    );
+
+    // 4. Replay the captured bytes verbatim against the forged page.
+    cnc.write_admin_auth(&captured_auth);
+    cnc.write_admin_req(&req);
+
+    let deadline = deadline_secs(10);
+    let replayed = loop {
+        if let Some(r) = cnc.read_admin_resp(req.seq) {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "the replayed request was never answered");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(replayed.status, 1, "the replay must be refused, not applied");
+    assert_eq!(
+        replayed.reason, REASON_AUTH_BAD_TAG,
+        "the tag is bound to the node's boot-time instance_id, so it cannot verify"
+    );
+    assert_eq!(
+        c.nodes[leader].node().config_version(),
+        version_before,
+        "a replayed capture must never reach propose_config"
+    );
+    // The refusal is audited like any other answer, and never under a name
+    // the node could not verify. The LAST record for this seq: `audit.jsonl`
+    // survives the restart, so the pre-restart `accepted` record for the same
+    // band seq is still sitting above it in the same file.
+    let want = format!("\"seq\":{},", req.seq);
+    let line = audit_lines(&dir)
+        .into_iter()
+        .rev()
+        .find(|l| l.contains(&want))
+        .expect("the refusal is recorded");
+    assert_record(&line, "unverified", "refused", REASON_AUTH_BAD_TAG);
+
+    c.stop();
+}
+
+/// Test-only: overwrite the cnc page header's `instance_id` (two LE `u64`
+/// halves at `CNC_OFF_INSTANCE_LO` / `CNC_OFF_INSTANCE_HI`) by `pwrite`ing
+/// into `cnc2.dat` directly. See
+/// `a_capture_replayed_after_a_restart_is_refused` for why this models a real
+/// attacker capability rather than a testing shortcut.
+fn forge_instance_id(instance_dir: &std::path::Path, instance_id: u128) {
+    use std::os::unix::fs::FileExt;
+    use uc_protocol::v2::cnc::{CNC_OFF_INSTANCE_HI, CNC_OFF_INSTANCE_LO};
+
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(instance_dir.join("cnc2.dat"))
+        .expect("open cnc2.dat for the forgery");
+    f.write_all_at(&(instance_id as u64).to_le_bytes(), CNC_OFF_INSTANCE_LO as u64)
+        .expect("write instance_id lo");
+    f.write_all_at(&((instance_id >> 64) as u64).to_le_bytes(), CNC_OFF_INSTANCE_HI as u64)
+        .expect("write instance_id hi");
 }
 
 /// The point of verifying FIRST: a follower must refuse an unauthenticated
@@ -626,7 +803,7 @@ fn follower_verifies_before_forwarding() {
     let leader = await_single_leader(&c.nodes, 20);
     let follower = (0..c.nodes.len()).find(|&i| i != leader).expect("a follower exists");
 
-    let leader_version_before = c.nodes[leader].node.config_version();
+    let leader_version_before = c.nodes[leader].node().config_version();
     let dir = c.nodes[follower].instance_dir.clone();
     let cnc = open_cnc(&dir);
     let (id, addr) = fresh_learner(1);
@@ -635,7 +812,7 @@ fn follower_verifies_before_forwarding() {
     assert_eq!(resp.status, 1, "the follower must refuse, not forward and not retry");
     assert_eq!(resp.reason, REASON_AUTH_MISSING);
     assert_eq!(
-        c.nodes[leader].node.config_version(),
+        c.nodes[leader].node().config_version(),
         leader_version_before,
         "an unauthenticated request must never reach the leader"
     );

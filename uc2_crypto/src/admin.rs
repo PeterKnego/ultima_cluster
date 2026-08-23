@@ -94,8 +94,11 @@ impl AdminKey {
 /// How a node/`uc2ctl` client authenticates admin requests. `Filesystem`
 /// (the `Default`) is today's posture: instance-dir file permissions are the
 /// only gate, unchanged by M12b. `Hmac` opts into named, TTL-bounded request
-/// signatures — `keys` is `Arc`-shared so hot-reload can swap the whole set
-/// in one atomic pointer store without a lock on the request path.
+/// signatures. `keys` is `Arc`-shared so the set is cloned by pointer rather
+/// than by value into every holder; the policy is built once at node start
+/// and never swapped — there is no hot-reload path today, and adding one
+/// would need more than this `Arc` (the node's copy lives inside the
+/// consensus agent's own state).
 #[derive(Clone, Default)]
 pub enum AdminPolicy {
     #[default]
@@ -237,11 +240,14 @@ pub fn generate_key_file(path: &Path) -> Result<(), CryptoError> {
         }
     })?;
 
-    let mut secret = [0u8; ADMIN_KEY_LEN];
+    // M12b final review (M4): the freshly generated secret is zeroized when
+    // this buffer drops, so a copy of a live admin key is not left sitting in
+    // the generating process's stack memory after `gen-admin-key` returns.
+    let mut secret = Zeroizing::new([0u8; ADMIN_KEY_LEN]);
     OsRng
-        .try_fill_bytes(&mut secret)
+        .try_fill_bytes(secret.as_mut())
         .expect("the OS RNG is unavailable");
-    file.write_all(&secret)?;
+    file.write_all(secret.as_ref())?;
     Ok(())
 }
 
