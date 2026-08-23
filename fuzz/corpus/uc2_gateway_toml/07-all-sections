@@ -1,0 +1,18 @@
+[local]
+instance_dir = "/srv/uc2/n0"
+app_id = "a"
+listen = "127.0.0.1:9500"
+
+[[members]]
+node_id = 1
+gateway = "127.0.0.1:9500"
+
+[limits]
+max_inflight = 64
+per_conn_inflight = 8
+request_timeout_ms = 500
+status_interval_ms = 50
+max_connections = 16
+
+[session]
+envelope = true

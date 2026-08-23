@@ -1,0 +1,19 @@
+[local]
+instance_dir = "/tmp/uc2-quickstart/n0"
+app_id = "counter"
+listen = "127.0.0.1:9500"
+
+[[members]]
+node_id = 0
+gateway = "127.0.0.1:9500"
+
+[[members]]
+node_id = 1
+gateway = "127.0.0.1:9501"
+
+[[members]]
+node_id = 2
+gateway = "127.0.0.1:9502"
+
+[session]
+envelope = false

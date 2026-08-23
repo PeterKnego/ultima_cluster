@@ -70,3 +70,11 @@ mutation-testing = ["uc2_consensus/mutation-testing"]
 [[example]]
 name = "read_profile"
 test = true
+
+# `cfg(fuzzing)` is set by cargo-fuzz for the whole dependency graph; it gates
+# the M12d `obs::http::route_raw` / `ObsSources::for_tests` seam (test-and-fuzz
+# only, never in a shipped build). Declaring it here keeps `unexpected_cfgs`
+# happy without turning the seam into a public Cargo feature, which would make
+# it part of the crate's API surface.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

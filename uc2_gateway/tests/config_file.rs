@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use uc2_gateway::config_file::{ConfigFileError, load_from_path};
+use uc2_gateway::config_file::{ConfigFileError, load_from_path, parse_str};
 use uc2_gateway::{ConfigError, Member};
 
 /// A temp dir on real disk — `CARGO_TARGET_TMPDIR` lives under `target/`
@@ -201,4 +201,51 @@ gateway = "10.0.0.10:9200"
 fn a_nonexistent_file_is_a_named_read_refusal() {
     let err = load_from_path(std::path::Path::new("/definitely/does/not/exist.toml")).unwrap_err();
     assert!(matches!(err, ConfigFileError::Read { .. }), "expected a Read error, got: {err}");
+}
+
+/// M12d: `parse_str` is `load_from_path` without the file — the shipped
+/// example must parse through it, and an unknown key must be refused exactly
+/// as the file loader refuses it. This is the seam the `uc2_gateway_toml`
+/// fuzz target drives; if it stopped being the same code the loader runs, the
+/// target would be fuzzing a fiction.
+#[test]
+fn parse_str_is_the_loader_without_the_file() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../packaging/gateway.example.toml"
+    ))
+    .expect("read packaging/gateway.example.toml");
+
+    let cfg = parse_str(&text).expect("the shipped example parses");
+    assert!(!cfg.members.is_empty(), "example must define members");
+
+    // The SAME answer the file loader gives.
+    let dir = tempdir();
+    let p = write(dir.path(), &text);
+    let from_file = load_from_path(&p).expect("example parses from file");
+    assert_eq!(cfg.app_id, from_file.app_id);
+    assert_eq!(cfg.listen, from_file.listen);
+    assert_eq!(cfg.members, from_file.members);
+    assert_eq!(cfg.max_inflight, from_file.max_inflight);
+
+    // An unknown key is refused, by the same variant either way.
+    let bad = "[local]\ninstance_dir = \"/srv/uc2/n0\"\napp_id = \"a\"\n\
+               listen = \"127.0.0.1:9500\"\nunknown_key = 1\n";
+    assert!(
+        matches!(parse_str(bad), Err(ConfigFileError::Parse { .. })),
+        "unknown key must be a Parse refusal"
+    );
+    let p = write(dir.path(), bad);
+    assert!(matches!(load_from_path(&p), Err(ConfigFileError::Parse { .. })));
+
+    // The file loader still names the real path.
+    let Err(ConfigFileError::Parse { path, .. }) = load_from_path(&p) else {
+        panic!("expected Parse")
+    };
+    assert_eq!(path, p, "load_from_path must still name the file it read");
+
+    // A semantic refusal (EdgeConfig::validate) comes through unchanged too.
+    let empty_app = "[local]\ninstance_dir = \"/srv/uc2/n0\"\napp_id = \"\"\n\
+                     listen = \"127.0.0.1:9500\"\n";
+    assert!(matches!(parse_str(empty_app), Err(ConfigFileError::Invalid(_))));
 }

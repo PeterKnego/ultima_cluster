@@ -121,7 +121,25 @@ growth.
 | `ultima_journal_stable_value` | `ultima_journal::stable_value` — the durable vote / term map / snapshot floor slots. |
 | `uc_protocol_cnc` | `uc_protocol::v2::cnc` — the 4 KiB control page every attaching process maps and parses. |
 | `uc_protocol_log_frame` | `uc_protocol::v2::frame::read_header` behind the real caller's `len >= HEADER_LEN` guard (that reader is deliberately caller-guarded — see its doc). |
-| `uc2_service_session` | `Sessioned<S>` — the exactly-once envelope and its snapshot install path. |
+| `uc2_service_session` | `Sessioned<S>` — the exactly-once envelope (under a fuzz-derived, deliberately tiny `SessionConfig`, so client/byte eviction and the window trim are reachable) and its snapshot install path. |
+| `uc2_node_toml` | `uc2_node::config_file::parse_str` — the `node.toml` parser behind every M9/M11/M12b named startup refusal. |
+| `uc2_gateway_toml` | `uc2_gateway::config_file::parse_str` — the gateway's whole named-refusal path (it runs `EdgeConfig::validate` itself). |
+| `uc2_node_http` | `uc2_node::obs::http::route_raw` — the unauthenticated `/metrics` + `/healthz` + `/readyz` request parser. |
+
+## `cfg(fuzzing)` seams
+
+`uc2_node_http` drives `obs::http::route_raw` and `ObsSources::for_tests`,
+which exist only under `#[cfg(any(test, fuzzing))]` — they are a test seam,
+not API, and are absent from a shipped build. `cargo fuzz` sets `--cfg
+fuzzing` across the whole dependency graph, so the target builds under `cargo
++nightly fuzz build/run` but **not** under a plain `cargo +nightly build` in
+this directory, which will fail to resolve `route_raw`. That is expected;
+`cargo fuzz` is the entry point. `cargo +nightly run --bin seed-corpus` is
+unaffected (it builds only the generator).
+
+`uc2_node/Cargo.toml` declares `unexpected_cfgs = { check-cfg =
+['cfg(fuzzing)'] }` so the workspace's `clippy -D warnings` stays clean
+without promoting the seam to a Cargo feature (which would make it API).
 
 ## Adding a target
 

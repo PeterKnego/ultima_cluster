@@ -1,0 +1,17 @@
+id = 1
+bind = "10.0.0.1:9100"
+instance_dir = "/srv/uc2/n1"
+app_id = "myapp"
+
+[[members]]
+id = 1
+addr = "10.0.0.1:9100"
+
+[purge]
+below_snapshot_slack_bytes = 1048576
+
+[crypto]
+enabled = false
+
+[log]
+level = "info"

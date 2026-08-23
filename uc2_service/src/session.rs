@@ -205,10 +205,17 @@ impl<S: RawStateMachine> RawStateMachine for Sessioned<S> {
         // (M12d finding #1; regression test
         // `an_inner_sm_that_clears_out_does_not_panic_the_apply_thread`).
         //
-        // Cost-neutral: the old shape allocated once anyway, in `to_vec()`,
-        // to put the response in the dedup window. This allocates the same
-        // buffer up front and MOVES it into the window instead of copying.
-        let mut resp = Vec::new();
+        // Allocation-neutral, near enough: the old shape allocated once
+        // anyway, in `to_vec()`, to put the response in the dedup window;
+        // this allocates that same buffer up front and MOVES it into the
+        // window instead of copying into it. The one thing that IS new is
+        // that a fresh `Vec` starts empty and grows, where the old code
+        // appended into `out`'s already-warm capacity — so the capacity is
+        // seeded from this client's previous response, which makes the
+        // steady state a single exact-size allocation for the overwhelmingly
+        // common case of a client whose responses are all about one size.
+        let hint = st.window.back().map_or(0, |(_, prev)| prev.len());
+        let mut resp = Vec::with_capacity(hint);
         self.inner.apply(position, body, &mut resp);
         out.push(TAG_FRESH);
         out.extend_from_slice(&resp);

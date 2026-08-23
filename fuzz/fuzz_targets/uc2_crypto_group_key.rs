@@ -13,7 +13,16 @@ use uc2_crypto::group::GroupPlane;
 static PLANE: Mutex<Option<GroupPlane>> = Mutex::new(None);
 
 fuzz_target!(|data: &[u8]| {
+    // byte 0 = the claimed sender id, so an ACK from a peer the pending epoch
+    // never targeted, an ACK from ourselves, and an ACK from an unknown node
+    // are all reachable — `on_ack` ranks acks per peer.
+    let Some((&from, body)) = data.split_first() else {
+        return;
+    };
     let mut g = PLANE.lock().unwrap();
-    let plane = g.get_or_insert_with(|| GroupPlane::new(uc2_fuzz::A_ID));
-    let _ = plane.on_key_message(uc2_fuzz::B_ID, data);
+    // Built with a PENDING epoch already minted and outstanding, so the
+    // `MSG_ACK` arm is not vacuous: with no pending epoch every ack folds
+    // into a no-op and the whole branch is dead weight in the corpus.
+    let plane = g.get_or_insert_with(uc2_fuzz::group_plane_with_pending);
+    let _ = plane.on_key_message(from as u32, body);
 });

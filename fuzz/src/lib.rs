@@ -164,3 +164,14 @@ pub fn initiator_peers() -> Peers {
     let allow = [(A_ID, public_of(PRIV_A)), (B_ID, public_of(PRIV_B))];
     build_peers("initiator", PRIV_B, B_ID, &allow, 0xB2)
 }
+
+/// A `GroupPlane` that has already MINTED an epoch and is waiting for acks —
+/// so `on_key_message`'s `MSG_ACK` arm actually has a pending epoch to fold
+/// an ack into. With a virgin plane every ack is a no-op and that branch is
+/// vacuous. `mint` draws its key from the OS RNG, which is fine here: this
+/// builds fuzz-time state, not a committed seed.
+pub fn group_plane_with_pending() -> uc2_crypto::group::GroupPlane {
+    let mut plane = uc2_crypto::group::GroupPlane::new(A_ID);
+    let _ = plane.mint(&[B_ID, 3, 4], 1_000_000);
+    plane
+}

@@ -10,7 +10,7 @@ use uc2_crypto::admin::{ADMIN_TAG_LEN, AdminKey, AdminMessage, sign, verify};
 // have the documented length, a tag over it must verify, and flipping any bit
 // of that tag must break verification.
 fuzz_target!(|data: &[u8]| {
-    let parts = uc2_fuzz::split(data, 9);
+    let parts = uc2_fuzz::split(data, 10);
     let app_id = String::from_utf8_lossy(parts[0]).into_owned();
     // `canonical_bytes` length-prefixes `app_id` as a `u16` and says so; an
     // app_id past 64 KiB is a config-time impossibility, not a wire input.
@@ -37,7 +37,7 @@ fuzz_target!(|data: &[u8]| {
         id: u32_of(parts[6]),
         ip: u32_of(parts[7]),
         port: u64_of(parts[8]) as u16,
-        expiry_ns: u64_of(parts[0]),
+        expiry_ns: u64_of(parts[9]),
     };
 
     // The layout the HMAC covers, pinned field by field.

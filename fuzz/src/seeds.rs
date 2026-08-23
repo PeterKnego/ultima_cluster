@@ -344,34 +344,70 @@ pub fn uc2_crypto_handshake() -> Vec<Seed> {
 
     let mut seeds = Vec::new();
 
+    // The target's framing: byte 0 = datagram kind, byte 1 = the CLAIMED
+    // sender id, bytes 2..10 = `now_ns` (LE), body from byte 10. Every seed
+    // must be laid out this way or the fuzzer starts from garbage — a real
+    // Noise message 1 shifted by nine bytes reaches snow as noise.
+    fn framed(kind: u8, from: u8, now_ns: u64, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![kind, from];
+        v.extend_from_slice(&now_ns.to_le_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
     // The real thing: drive an initiator-side `Peers` and capture what it
     // puts on the wire. Message 1 carries a fresh X25519 ephemeral from the
     // OS RNG, so this is a `captured` seed (see `Regen`).
     let mut initiator = crate::initiator_peers();
     for act in initiator.initiate(crate::A_ID, 1_000_000) {
         if let HandshakeAction::Send { kind, body, .. } = act {
-            let mut v = vec![kind];
-            v.extend_from_slice(&body);
-            seeds.push(Seed::captured("01-real-hs-init", v));
+            // `from` is B (the initiator's own id) — the id A's allowlist
+            // expects this key to be claiming.
+            seeds.push(Seed::captured(
+                "01-real-hs-init",
+                framed(kind, crate::B_ID as u8, 1_000_000, &body),
+            ));
             break;
         }
     }
 
     // Fixed shapes: the right kinds with empty and near-length bodies, and a
     // kind that is not a handshake kind at all (must be dropped silently).
-    seeds.push(Seed::fixed("02-hs-init-empty", vec![DGRAM_KIND_HS_INIT]));
-    seeds.push(Seed::fixed("03-hs-resp-empty", vec![DGRAM_KIND_HS_RESP]));
-    seeds.push(Seed::fixed("04-hs-key-kind", {
-        let mut v = vec![DGRAM_KIND_HS_KEY];
-        v.extend_from_slice(&[0u8; 35]);
-        v
-    }));
-    seeds.push(Seed::fixed("05-hs-init-zeros", {
-        let mut v = vec![DGRAM_KIND_HS_INIT];
-        v.extend_from_slice(&[0u8; 64]);
-        v
-    }));
-    seeds.push(Seed::fixed("06-not-a-handshake-kind", vec![1u8, 2, 3, 4]));
+    seeds.push(Seed::fixed(
+        "02-hs-init-empty",
+        framed(DGRAM_KIND_HS_INIT, crate::B_ID as u8, 1_000_000, &[]),
+    ));
+    seeds.push(Seed::fixed(
+        "03-hs-resp-empty",
+        framed(DGRAM_KIND_HS_RESP, crate::B_ID as u8, 1_000_000, &[]),
+    ));
+    seeds.push(Seed::fixed(
+        "04-hs-key-kind",
+        framed(DGRAM_KIND_HS_KEY, crate::B_ID as u8, 1_000_000, &[0u8; 35]),
+    ));
+    seeds.push(Seed::fixed(
+        "05-hs-init-zeros",
+        framed(DGRAM_KIND_HS_INIT, crate::B_ID as u8, 1_000_000, &[0u8; 64]),
+    ));
+    seeds.push(Seed::fixed("06-not-a-handshake-kind", framed(1, 2, 1_000_000, &[3, 4])));
+    // An id NOT in the allowlist, and our OWN id (an explicit early refusal).
+    seeds.push(Seed::fixed(
+        "07-unknown-peer-id",
+        framed(DGRAM_KIND_HS_INIT, 200, 1_000_000, &[0u8; 48]),
+    ));
+    seeds.push(Seed::fixed(
+        "08-claims-our-own-id",
+        framed(DGRAM_KIND_HS_INIT, crate::A_ID as u8, 1_000_000, &[0u8; 48]),
+    ));
+    // now_ns at both extremes — the expiry and reload-rate-limit comparisons.
+    seeds.push(Seed::fixed(
+        "09-now-zero",
+        framed(DGRAM_KIND_HS_INIT, crate::B_ID as u8, 0, &[0u8; 48]),
+    ));
+    seeds.push(Seed::fixed(
+        "10-now-max",
+        framed(DGRAM_KIND_HS_INIT, crate::B_ID as u8, u64::MAX, &[0u8; 48]),
+    ));
 
     seeds
 }
@@ -388,28 +424,38 @@ pub fn uc2_crypto_group_key() -> Vec<Seed> {
     const MSG_KEY: u8 = 0;
     const MSG_ACK: u8 = 1;
 
+    // The target's framing: byte 0 = the CLAIMED sender id, body from byte 1.
+    fn framed(from: u8, body: &[u8]) -> Vec<u8> {
+        let mut v = vec![from];
+        v.extend_from_slice(body);
+        v
+    }
+
     let mut seeds = Vec::new();
 
     let mut key_msg = vec![MSG_KEY];
     key_msg.extend_from_slice(&7u16.to_le_bytes());
     key_msg.extend_from_slice(&[0x5Au8; 32]);
-    seeds.push(Seed::fixed("01-key-delivery", key_msg.clone()));
+    seeds.push(Seed::fixed("01-key-delivery", framed(crate::B_ID as u8, &key_msg)));
 
     let mut ack = vec![MSG_ACK];
     ack.extend_from_slice(&7u16.to_le_bytes());
-    seeds.push(Seed::fixed("02-ack", ack.clone()));
+    // An ack from a peer the pending epoch DOES target, and one from a peer
+    // it does not — `on_ack` ranks acks per peer.
+    seeds.push(Seed::fixed("02-ack-from-target", framed(crate::B_ID as u8, &ack)));
+    seeds.push(Seed::fixed("02b-ack-from-stranger", framed(200, &ack)));
 
     // Length edges either side of both accepted lengths.
     let mut short = key_msg.clone();
     short.pop();
-    seeds.push(Seed::fixed("03-key-delivery-short", short));
+    seeds.push(Seed::fixed("03-key-delivery-short", framed(crate::B_ID as u8, &short)));
     let mut long = key_msg.clone();
     long.push(0);
-    seeds.push(Seed::fixed("04-key-delivery-long", long));
+    seeds.push(Seed::fixed("04-key-delivery-long", framed(crate::B_ID as u8, &long)));
     let mut ack_long = ack.clone();
     ack_long.push(0);
-    seeds.push(Seed::fixed("05-ack-long", ack_long));
-    seeds.push(Seed::fixed("06-unknown-tag", vec![9u8, 0, 0]));
+    seeds.push(Seed::fixed("05-ack-long", framed(crate::B_ID as u8, &ack_long)));
+    seeds.push(Seed::fixed("06-unknown-tag", framed(crate::B_ID as u8, &[9u8, 0, 0])));
     seeds.push(Seed::fixed("07-empty", Vec::new()));
 
     // A genuine kind-20 delivery straight off the real rotation path.
@@ -417,7 +463,7 @@ pub fn uc2_crypto_group_key() -> Vec<Seed> {
     let (_epoch, acts) = plane.mint(&[crate::B_ID], 1_000_000);
     for act in acts {
         if let uc2_crypto::HandshakeAction::Send { body, .. } = act {
-            seeds.push(Seed::captured("08-real-minted-key", body));
+            seeds.push(Seed::captured("08-real-minted-key", framed(crate::B_ID as u8, &body)));
             break;
         }
     }
@@ -618,15 +664,29 @@ pub fn uc2_service_session() -> Vec<Seed> {
         v
     }
 
-    // The target splits its input into three parts using leading length bytes,
-    // so a seed is `[len0, len1] ++ part0 ++ part1 ++ part2`.
-    fn three(a: &[u8], b: &[u8], c: &[u8]) -> Vec<u8> {
-        let mut v = vec![a.len() as u8, b.len() as u8];
-        v.extend_from_slice(a);
-        v.extend_from_slice(b);
-        v.extend_from_slice(c);
+    // The target consumes a leading SELECTOR byte (bit 0 picks the shipped
+    // default `SessionConfig` vs a tiny derived one), then splits the rest
+    // into nine parts by leading length bytes: eight commands and a snapshot.
+    // A seed is `[sel] ++ [len0..len7] ++ part0 ++ .. ++ part8`.
+    fn seed(sel: u8, cmds: &[&[u8]], snap: &[u8]) -> Vec<u8> {
+        let mut v = vec![sel];
+        let mut lens = [0u8; 8];
+        for (i, c) in cmds.iter().take(8).enumerate() {
+            lens[i] = c.len() as u8;
+        }
+        v.extend_from_slice(&lens);
+        for c in cmds.iter().take(8) {
+            v.extend_from_slice(c);
+        }
+        v.extend_from_slice(snap);
         v
     }
+    /// Shipped-default config (selector bit 0 clear) — the shape the genuine
+    /// frozen snapshot below was produced under, so it installs rather than
+    /// hitting the config-mismatch branch.
+    const DEFAULT_CFG: u8 = 0;
+    /// A tiny derived config (bit 0 set) — drives eviction and the window trim.
+    const TINY_CFG: u8 = 0b0000_0111;
 
     let fresh = envelope(1, 1, b"cmd");
     let short = vec![0u8; SESSION_HEADER_LEN - 1]; // shorter than the header: EXPIRED
@@ -644,21 +704,233 @@ pub fn uc2_service_session() -> Vec<Seed> {
     <Sessioned<crate::NoopSm> as SnapshotStateMachine>::stream_snapshot(handle, &mut artifact)
         .expect("stream session snapshot");
 
+    // Eight distinct clients: with `max_clients` of 1..4 under the tiny
+    // config this forces `evict_clients_over_capacity` repeatedly.
+    let many_clients: Vec<Vec<u8>> =
+        (1..=8u64).map(|c| envelope(c, 1, b"cmd")).collect();
+    let many_refs: Vec<&[u8]> = many_clients.iter().map(|v| v.as_slice()).collect();
+    // One client, eight rising seqs: with `window` of 1..4 this forces the
+    // per-client window trim on every apply after the first few.
+    let rising: Vec<Vec<u8>> = (1..=8u64).map(|q| envelope(1, q, b"cmd")).collect();
+    let rising_refs: Vec<&[u8]> = rising.iter().map(|v| v.as_slice()).collect();
+    // Fat responses under a small `max_bytes` — the byte-budget eviction.
+    let fat: Vec<Vec<u8>> = (1..=8u64).map(|c| envelope(c, 1, &[0xEEu8; 24])).collect();
+    let fat_refs: Vec<&[u8]> = fat.iter().map(|v| v.as_slice()).collect();
+
     vec![
-        // FRESH then a REPLAY of the same envelope, with a real snapshot.
-        Seed::fixed("01-fresh-then-replay", three(&fresh, &fresh, &artifact)),
-        // FRESH then a NEW seq.
-        Seed::fixed("02-fresh-then-next-seq", three(&fresh, &envelope(1, 2, b"cmd2"), &artifact)),
+        // FRESH then a REPLAY of the same envelope, with a real snapshot,
+        // under the DEFAULT config so the snapshot actually installs.
+        Seed::fixed(
+            "01-fresh-then-replay",
+            seed(DEFAULT_CFG, &[&fresh, &fresh, &envelope(1, 2, b"cmd2")], &artifact),
+        ),
         // An EXPIRED (too short to be an envelope at all) command.
-        Seed::fixed("03-short-envelope", three(&short, &fresh, &artifact)),
+        Seed::fixed("02-short-envelope", seed(DEFAULT_CFG, &[&short, &fresh], &artifact)),
         // A lower seq after a higher one — the EXPIRED-by-window path.
         Seed::fixed(
-            "04-out-of-window",
-            three(&envelope(1, 9_000, b"hi"), &envelope(1, 1, b"old"), &artifact),
+            "03-out-of-window",
+            seed(DEFAULT_CFG, &[&envelope(1, 9_000, b"hi"), &envelope(1, 1, b"old")], &artifact),
         ),
-        // The snapshot alone, with empty commands.
-        Seed::fixed("05-snapshot-only", three(&[], &[], &artifact)),
+        // The snapshot alone, no commands.
+        Seed::fixed("04-snapshot-only", seed(DEFAULT_CFG, &[], &artifact)),
         // A snapshot whose length prefix is intact but whose blob is truncated.
-        Seed::fixed("06-snapshot-truncated", three(&[], &[], &artifact[..artifact.len() / 2])),
+        Seed::fixed(
+            "05-snapshot-truncated",
+            seed(DEFAULT_CFG, &[], &artifact[..artifact.len() / 2]),
+        ),
+        // Eight clients under max_clients 1..4: client eviction.
+        Seed::fixed("06-many-clients-evict", seed(TINY_CFG, &many_refs, &artifact)),
+        // Eight rising seqs under window 1..4: the per-client window trim.
+        Seed::fixed("07-window-trim", seed(TINY_CFG, &rising_refs, &artifact)),
+        // Fat responses under a small max_bytes: byte-budget eviction.
+        Seed::fixed("08-byte-budget-evict", seed(TINY_CFG, &fat_refs, &artifact)),
+        // The tiny config against a DEFAULT-config snapshot: the
+        // replicated-config mismatch branch, which must refuse, not panic.
+        Seed::fixed("09-config-mismatch", seed(TINY_CFG, &[&fresh], &artifact)),
     ]
+}
+
+// ===========================================================================
+// Task 3 targets — TOML configs and the obs HTTP router
+// ===========================================================================
+
+/// The `node.toml` the quickstart renders (`packaging/quickstart-local.sh`'s
+/// heredoc, with the shell interpolations resolved to node 0's values). Kept
+/// verbatim in shape because it is the config a first-time user actually
+/// runs, and it exercises `[crypto] enabled = false` + `[admin] auth = "hmac"`
+/// together — the two M12b explicit-choice sections.
+const QUICKSTART_NODE_TOML: &str = r#"id = 0
+bind = "127.0.0.1:9100"
+instance_dir = "/tmp/uc2-quickstart/n0"
+app_id = "counter"
+
+[[members]]
+id = 0
+addr = "127.0.0.1:9100"
+
+[[members]]
+id = 1
+addr = "127.0.0.1:9101"
+
+[[members]]
+id = 2
+addr = "127.0.0.1:9102"
+
+[crypto]
+enabled = false
+
+[admin]
+auth = "hmac"
+keys = [{ name = "admin", key_path = "/tmp/uc2-quickstart/admin.key" }]
+"#;
+
+/// The `gateway.toml` the quickstart renders, same provenance.
+const QUICKSTART_GATEWAY_TOML: &str = r#"[local]
+instance_dir = "/tmp/uc2-quickstart/n0"
+app_id = "counter"
+listen = "127.0.0.1:9500"
+
+[[members]]
+node_id = 0
+gateway = "127.0.0.1:9500"
+
+[[members]]
+node_id = 1
+gateway = "127.0.0.1:9501"
+
+[[members]]
+node_id = 2
+gateway = "127.0.0.1:9502"
+
+[session]
+envelope = false
+"#;
+
+fn packaging(name: &str) -> String {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../packaging").join(name);
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+}
+
+/// `uc2_node_toml` — the shipped example, the quickstart's rendered file, and
+/// the shapes that must be REFUSED by name rather than accepted or panicked.
+pub fn uc2_node_toml() -> Vec<Seed> {
+    let example = packaging("node.example.toml");
+
+    // Every section present EXCEPT `[admin]` — the M12b
+    // `AdminChoiceRequired` refusal, and the exact shape a v2.5.0 config has
+    // when it meets a v2.6.0 binary.
+    let missing_admin = "id = 1\n\
+        bind = \"10.0.0.1:9100\"\n\
+        instance_dir = \"/srv/uc2/n1\"\n\
+        app_id = \"myapp\"\n\
+        \n[[members]]\nid = 1\naddr = \"10.0.0.1:9100\"\n\
+        \n[purge]\nbelow_snapshot_slack_bytes = 1048576\n\
+        \n[crypto]\nenabled = false\n\
+        \n[log]\nlevel = \"info\"\n";
+    // …and the mirror image: no `[crypto]`, which is `CryptoChoiceRequired`.
+    let missing_crypto = "id = 1\n\
+        bind = \"10.0.0.1:9100\"\n\
+        instance_dir = \"/srv/uc2/n1\"\n\
+        app_id = \"myapp\"\n\
+        \n[[members]]\nid = 1\naddr = \"10.0.0.1:9100\"\n\
+        \n[admin]\nauth = \"none\"\n";
+
+    vec![
+        Seed::fixed("01-packaging-example", example.into_bytes()),
+        Seed::fixed("02-quickstart-rendered", QUICKSTART_NODE_TOML.as_bytes().to_vec()),
+        Seed::fixed("03-empty", Vec::new()),
+        Seed::fixed("04-missing-admin-section", missing_admin.as_bytes().to_vec()),
+        Seed::fixed("05-missing-crypto-section", missing_crypto.as_bytes().to_vec()),
+        Seed::fixed("06-unknown-key", b"id = 1\nunknown_key = 1\n".to_vec()),
+        // crypto.enabled = true without the key paths: the cross-field rule.
+        Seed::fixed(
+            "07-crypto-on-no-keys",
+            b"id = 1\nbind = \"10.0.0.1:9100\"\ninstance_dir = \"/srv/uc2/n1\"\n\
+              app_id = \"a\"\n\n[[members]]\nid = 1\naddr = \"10.0.0.1:9100\"\n\
+              \n[crypto]\nenabled = true\n\n[admin]\nauth = \"none\"\n"
+                .to_vec(),
+        ),
+        // A bad enum value behind an otherwise valid file.
+        Seed::fixed(
+            "08-bad-log-level",
+            b"id = 1\nbind = \"10.0.0.1:9100\"\ninstance_dir = \"/srv/uc2/n1\"\n\
+              app_id = \"a\"\n\n[[members]]\nid = 1\naddr = \"10.0.0.1:9100\"\n\
+              \n[crypto]\nenabled = false\n\n[admin]\nauth = \"none\"\n\
+              \n[log]\nlevel = \"chatty\"\n"
+                .to_vec(),
+        ),
+        // Structurally broken TOML — the tokenizer's problem, not the schema's.
+        Seed::fixed("09-not-toml", b"[[[[\n\"unterminated".to_vec()),
+    ]
+}
+
+/// `uc2_gateway_toml` — same shape for the edge's config.
+pub fn uc2_gateway_toml() -> Vec<Seed> {
+    let example = packaging("gateway.example.toml");
+    vec![
+        Seed::fixed("01-packaging-example", example.into_bytes()),
+        Seed::fixed("02-quickstart-rendered", QUICKSTART_GATEWAY_TOML.as_bytes().to_vec()),
+        Seed::fixed("03-empty", Vec::new()),
+        // `[local]` is mandatory — absent is a named refusal.
+        Seed::fixed("04-no-local-section", b"[[members]]\nnode_id = 1\ngateway = \"127.0.0.1:9500\"\n".to_vec()),
+        Seed::fixed(
+            "05-unknown-key",
+            b"[local]\ninstance_dir = \"/srv/uc2/n0\"\napp_id = \"a\"\n\
+              listen = \"127.0.0.1:9500\"\nunknown_key = 1\n"
+                .to_vec(),
+        ),
+        // Passes deserialisation, fails `EdgeConfig::validate` (empty app_id).
+        Seed::fixed(
+            "06-empty-app-id",
+            b"[local]\ninstance_dir = \"/srv/uc2/n0\"\napp_id = \"\"\n\
+              listen = \"127.0.0.1:9500\"\n"
+                .to_vec(),
+        ),
+        // Every optional section present, at non-default values.
+        Seed::fixed(
+            "07-all-sections",
+            b"[local]\ninstance_dir = \"/srv/uc2/n0\"\napp_id = \"a\"\n\
+              listen = \"127.0.0.1:9500\"\n\n[[members]]\nnode_id = 1\n\
+              gateway = \"127.0.0.1:9500\"\n\n[limits]\nmax_inflight = 64\n\
+              per_conn_inflight = 8\nrequest_timeout_ms = 500\n\
+              status_interval_ms = 50\nmax_connections = 16\n\
+              \n[session]\nenvelope = true\n"
+                .to_vec(),
+        ),
+        Seed::fixed("08-not-toml", b"[local\n= = =\n".to_vec()),
+    ]
+}
+
+/// `uc2_node_http` — the request shapes an unauthenticated scraper can send.
+pub fn uc2_node_http() -> Vec<Seed> {
+    let mut seeds = vec![
+        Seed::fixed("01-get-metrics", b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()),
+        Seed::fixed("02-get-healthz", b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()),
+        Seed::fixed("03-get-readyz", b"GET /readyz HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()),
+        // A non-GET method: 404 by design, not 405.
+        Seed::fixed("04-post-metrics", b"POST /metrics HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()),
+        // An unknown path.
+        Seed::fixed("05-get-unknown", b"GET /nope HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()),
+        // A query string — the router splits it off before matching.
+        Seed::fixed("06-metrics-query", b"GET /metrics?x=1 HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()),
+        // No header terminator at all: `handle_conn` hands over what it read.
+        Seed::fixed("07-no-terminator", b"GET /metrics HTTP/1.1".to_vec()),
+        // Bare request line, no version, no CRLF.
+        Seed::fixed("08-bare-line", b"GET /healthz".to_vec()),
+        // Empty, and whitespace-only.
+        Seed::fixed("09-empty", Vec::new()),
+        Seed::fixed("10-whitespace", b"   \r\n\r\n".to_vec()),
+        // Invalid UTF-8 in the request line — `route` decodes lossily-or-not
+        // at all, and must still answer.
+        Seed::fixed("11-invalid-utf8", vec![0xFF, 0xFE, b' ', b'/', 0x80, b'\r', b'\n']),
+        // NUL bytes inside an otherwise valid line.
+        Seed::fixed("12-embedded-nul", b"GET /met\0rics HTTP/1.1\r\n\r\n".to_vec()),
+    ];
+    // A 5 KiB request line — past `REQUEST_CAP` (4096), which is where the
+    // server truncates, so this seeds the boundary the target clamps at.
+    let mut big = b"GET /".to_vec();
+    big.extend(std::iter::repeat_n(b'a', 5 * 1024));
+    big.extend_from_slice(b" HTTP/1.1\r\n\r\n");
+    seeds.push(Seed::fixed("13-oversized-request-line", big));
+    seeds
 }

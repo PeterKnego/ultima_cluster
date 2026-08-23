@@ -193,6 +193,20 @@ fn route(buf: &[u8], sources: &ObsSources) -> (u16, &'static str, String) {
     }
 }
 
+/// [`route`] exposed for tests and for the `uc2_node_http` fuzz target — the
+/// router with the socket taken away. **Not API**: `cfg(any(test, fuzzing))`
+/// only, so it does not exist in a shipped build.
+///
+/// `route` is where every byte an unauthenticated scrape client sends first
+/// lands (`handle_conn` reads into a [`REQUEST_CAP`]-bounded buffer and calls
+/// straight through), so it must be total on `&[u8]`. The status set it can
+/// return is exactly `200 | 404 | 503` — see [`write_response`]'s reason
+/// table, which is the other half of the same contract.
+#[cfg(any(test, fuzzing))]
+pub fn route_raw(buf: &[u8], sources: &ObsSources) -> (u16, &'static str, String) {
+    route(buf, sources)
+}
+
 fn not_found() -> (u16, &'static str, String) {
     (404, "text/plain", "not found\n".to_string())
 }

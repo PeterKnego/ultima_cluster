@@ -113,6 +113,27 @@ test = false
 doc = false
 bench = false
 
-# one [[bin]] per target — Task 3 appends theirs.
+[[bin]]
+name = "uc2_node_toml"
+path = "fuzz_targets/uc2_node_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uc2_gateway_toml"
+path = "fuzz_targets/uc2_gateway_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "uc2_node_http"
+path = "fuzz_targets/uc2_node_http.rs"
+test = false
+doc = false
+bench = false
+
+# one [[bin]] per target.
 
 [workspace]

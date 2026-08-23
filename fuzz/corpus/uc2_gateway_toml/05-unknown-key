@@ -1,0 +1,5 @@
+[local]
+instance_dir = "/srv/uc2/n0"
+app_id = "a"
+listen = "127.0.0.1:9500"
+unknown_key = 1

@@ -1,0 +1,23 @@
+id = 0
+bind = "127.0.0.1:9100"
+instance_dir = "/tmp/uc2-quickstart/n0"
+app_id = "counter"
+
+[[members]]
+id = 0
+addr = "127.0.0.1:9100"
+
+[[members]]
+id = 1
+addr = "127.0.0.1:9101"
+
+[[members]]
+id = 2
+addr = "127.0.0.1:9102"
+
+[crypto]
+enabled = false
+
+[admin]
+auth = "hmac"
+keys = [{ name = "admin", key_path = "/tmp/uc2-quickstart/admin.key" }]

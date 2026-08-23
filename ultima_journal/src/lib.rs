@@ -33,6 +33,7 @@ pub use stable_value::{StableValue, StableValueConfig};
 /// itself; it exists so a fuzz target can drive the on-disk record parser
 /// directly, which is the code that meets a torn or corrupt segment file
 /// after a crash.
+#[doc(hidden)]
 pub mod fuzz_seams {
     pub use crate::journal::segment::{
         DecodedRecord, SEGMENT_HEADER_SIZE, SegmentHeader, decode_header, decode_record,

@@ -27,7 +27,31 @@ fn write_target(root: &Path, target: &str, entries: Vec<seeds::Seed>) -> std::io
             std::fs::write(&path, &s.bytes)?;
         }
     }
-    println!("{target}: {} seeds in {}", entries.len(), dir.display());
+    // Prune anything the generator did not produce. This enforces the
+    // documented policy — "the committed corpus is exactly the generator's
+    // output" — and, more practically, removes seeds left behind when one is
+    // RENAMED (the writer alone would keep the old file forever) as well as
+    // libFuzzer's own hash-named discoveries from a local run. Delete a seed
+    // definition and the file goes with it.
+    let wanted: std::collections::HashSet<&str> = entries.iter().map(|s| s.name).collect();
+    let mut pruned = 0usize;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !wanted.contains(name) {
+            std::fs::remove_file(entry.path())?;
+            pruned += 1;
+        }
+    }
+    if pruned > 0 {
+        println!("{target}: {} seeds in {} ({pruned} pruned)", entries.len(), dir.display());
+    } else {
+        println!("{target}: {} seeds in {}", entries.len(), dir.display());
+    }
     Ok(())
 }
 
@@ -44,5 +68,8 @@ fn main() -> std::io::Result<()> {
     write_target(root, "uc_protocol_cnc", seeds::uc_protocol_cnc())?;
     write_target(root, "uc_protocol_log_frame", seeds::uc_protocol_log_frame())?;
     write_target(root, "uc2_service_session", seeds::uc2_service_session())?;
+    write_target(root, "uc2_node_toml", seeds::uc2_node_toml())?;
+    write_target(root, "uc2_gateway_toml", seeds::uc2_gateway_toml())?;
+    write_target(root, "uc2_node_http", seeds::uc2_node_http())?;
     Ok(())
 }

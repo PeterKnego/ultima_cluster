@@ -14,13 +14,23 @@ use uc2_crypto::handshake::Peers;
 static PEERS: Mutex<Option<Peers>> = Mutex::new(None);
 
 fuzz_target!(|data: &[u8]| {
-    let Some((&kind, body)) = data.split_first() else {
+    // byte 0 = datagram kind, byte 1 = the claimed sender id, bytes 2..10 =
+    // `now_ns`. `from` is a CLAIM the handshake has to check against the
+    // pattern and the allowlist, so letting the fuzzer choose it reaches the
+    // unknown-peer, self-id and not-in-allowlist branches; `now_ns` drives
+    // the allowlist-reload rate limit and every expiry comparison.
+    if data.len() < 10 {
         return;
-    };
+    }
+    let kind = data[0];
+    let from = data[1] as u32;
+    let now_ns = u64::from_le_bytes(data[2..10].try_into().unwrap());
+    let body = &data[10..];
+
     let mut g = PEERS.lock().unwrap();
     let peers = g.get_or_insert_with(uc2_fuzz::responder_peers);
 
-    let acts = peers.on_message(uc2_fuzz::B_ID, kind, body, 1_000_000);
+    let acts = peers.on_message(from, kind, body, now_ns);
 
     // A genuine message 1 (the seed corpus carries one) ESTABLISHES a session,
     // after which this `Peers` is no longer the never-seen-a-packet responder

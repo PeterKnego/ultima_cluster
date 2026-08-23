@@ -259,8 +259,35 @@ pub fn default_seed_for(id: NodeId) -> u64 {
 pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), ConfigError> {
     let text = std::fs::read_to_string(path)
         .map_err(|source| ConfigError::Read { path: path.to_path_buf(), source })?;
-    let f: NodeConfigFile = toml::from_str(&text)
-        .map_err(|source| ConfigError::Parse { path: path.to_path_buf(), source })?;
+    // `parse_str` has no path to name, so it stamps [`IN_MEMORY_CONFIG`];
+    // re-stamp the real one here so a refusal still tells the operator which
+    // file to edit.
+    parse_str(&text).map_err(|e| match e {
+        ConfigError::Parse { source, .. } => {
+            ConfigError::Parse { path: path.to_path_buf(), source }
+        }
+        other => other,
+    })
+}
+
+/// The path `[`ConfigError::Parse`]` carries when the text did not come from a
+/// file — see [`parse_str`].
+pub const IN_MEMORY_CONFIG: &str = "<in-memory config>";
+
+/// The file loader's pure inner: turn `node.toml` **text** into the same
+/// `(NodeConfig, StartupOptions)` pair, with the same validation and the same
+/// [`ConfigError`] variants, minus the file read.
+///
+/// This is what [`load_from_path`] runs, not a parallel implementation — the
+/// only difference is that a [`ConfigError::Parse`] from here names
+/// [`IN_MEMORY_CONFIG`] instead of a real path, which `load_from_path`
+/// re-stamps. Public so a caller holding config text (a test, an embedder, or
+/// the `uc2_node_toml` fuzz target) can reach the parser without staging a
+/// temporary file; performs NO validation beyond what `load_from_path` does,
+/// so [`crate::preflight::check`] is still the next step.
+pub fn parse_str(text: &str) -> Result<(NodeConfig, StartupOptions), ConfigError> {
+    let f: NodeConfigFile = toml::from_str(text)
+        .map_err(|source| ConfigError::Parse { path: PathBuf::from(IN_MEMORY_CONFIG), source })?;
 
     let purge = match f.purge {
         Some(p) => PurgePolicy::BelowSnapshot { slack_bytes: p.below_snapshot_slack_bytes },
@@ -408,6 +435,50 @@ pub fn load_from_path(path: &Path) -> Result<(NodeConfig, StartupOptions), Confi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M12d: `parse_str` is `load_from_path` without the file — the shipped
+    /// example must parse through it, and an unknown key must be refused
+    /// exactly as the file loader refuses it. This is the seam the
+    /// `uc2_node_toml` fuzz target drives; if it ever stopped being the same
+    /// code the loader runs, the target would be fuzzing a fiction.
+    #[test]
+    fn parse_str_is_the_loader_without_the_file() {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../packaging/node.example.toml"
+        ))
+        .expect("read packaging/node.example.toml");
+
+        let (cfg, opts) = parse_str(&text).expect("the shipped example parses");
+        assert!(!cfg.members.is_empty(), "example must define members");
+        assert_eq!(cfg.id, 0);
+
+        // And it is the SAME answer the file loader gives.
+        let dir = tempfile::tempdir().unwrap();
+        let p = write(dir.path(), &text);
+        let (from_file, opts_from_file) = load_from_path(&p).expect("example parses from file");
+        assert_eq!(cfg.id, from_file.id);
+        assert_eq!(cfg.members, from_file.members);
+        assert_eq!(opts.allow_volatile_fs, opts_from_file.allow_volatile_fs);
+
+        // An unknown key is refused, and by the same variant either way.
+        let bad = "id = 1
+unknown_key = 1
+";
+        assert!(
+            matches!(parse_str(bad), Err(ConfigError::Parse { .. })),
+            "unknown key must be a Parse refusal"
+        );
+        let p = write(dir.path(), bad);
+        assert!(matches!(load_from_path(&p), Err(ConfigError::Parse { .. })));
+
+        // The file loader still names the real path in its error; `parse_str`
+        // has no path to name and says so.
+        let Err(ConfigError::Parse { path, .. }) = load_from_path(&p) else {
+            panic!("expected Parse")
+        };
+        assert_eq!(path, p, "load_from_path must still name the file it read");
+    }
 
     fn write(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
         let p = dir.join("node.toml");

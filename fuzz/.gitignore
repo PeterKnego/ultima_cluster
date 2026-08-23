@@ -3,3 +3,9 @@ artifacts/
 coverage/
 corpus/seed-corpus/
 .scratch/
+# libFuzzer writes artifacts to the CWD when a target binary is invoked
+# directly (no -artifact_prefix), which is what `cargo fuzz run` sets.
+crash-*
+leak-*
+timeout-*
+oom-*
