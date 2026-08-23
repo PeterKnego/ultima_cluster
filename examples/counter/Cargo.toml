@@ -30,13 +30,28 @@ path = "src/bin/counter-service.rs"
 name = "counter-client"
 path = "src/bin/counter-client.rs"
 
+# The remote twin of counter-client: talks TCP to a uc2-gateway instead of
+# shared memory to a co-located node. Also the binary packaging/
+# quickstart-local.sh drives.
+[[bin]]
+name = "counter-remote"
+path = "src/bin/counter-remote.rs"
+
+[features]
+# packaging/quickstart-local.sh, run for real: eleven processes and two
+# elections' worth of wall clock, so it is opt-in and lives in nightly.yml's
+# `quickstart` job rather than in the default `cargo test`.
+quickstart-tests = []
+
 [dependencies]
 uc2_node      = { path = "../../uc2_node", version = "2.6.0" }
 uc2_service   = { path = "../../uc2_service", version = "2.6.0" }
 uc2_client    = { path = "../../uc2_client", version = "2.6.0" }
 uc2_net       = { path = "../../uc2_net", version = "2.6.0" }
 uc2_consensus = { path = "../../uc2_consensus", version = "2.6.0" }
+uc2_remote    = { path = "../../uc2_remote", version = "2.6.0" }
 serde         = { workspace = true }
+bincode       = { workspace = true }
 clap          = { version = "4", features = ["derive"] }
 anyhow        = { workspace = true }
 tempfile      = { workspace = true }

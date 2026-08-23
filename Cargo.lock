@@ -280,6 +280,7 @@ name = "counter"
 version = "2.6.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "clap",
  "libc",
  "serde",
@@ -289,6 +290,7 @@ dependencies = [
  "uc2_consensus",
  "uc2_net",
  "uc2_node",
+ "uc2_remote",
  "uc2_service",
 ]
 

@@ -12,6 +12,12 @@ name: nightly
 #                  interleaving exploration; needs `--cfg loom` + release).
 #   * crashtest  — multi-process SIGKILL-mid-load linearizability
 #                  (uc2-crashtest bins spawned via CARGO_BIN_EXE_*).
+#   * quickstart — packaging/quickstart-local.sh run for real: three nodes,
+#                  three services, three gateways and a remote client, driven
+#                  from a bin dir that holds nothing but the five shipped
+#                  binaries. The "no toolchain" adoption path (M12c), which
+#                  release.yml's release-smoke job runs against the actual
+#                  tarball — this job keeps it honest between tags.
 #   * crashtest-crypto / elle-crypto — M8 Task 15: the crashtest and elle
 #                  clean tiers re-run with UC2_CRYPTO=1 (wire crypto Enabled
 #                  on every spawned node). The lincheck crypto variants
@@ -82,6 +88,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Multi-process SIGKILL linearizability
         run: cargo test -p uc2-crashtest --features hard-crash-tests
+
+  # M12c: the binary quickstart. Feature-gated out of the default `cargo test`
+  # because it starts eleven processes and waits on an election; fixed ports
+  # (UDP 9100-9102, TCP 9200-9202) mean it wants a runner to itself, which is
+  # what a separate job gives it.
+  quickstart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      - name: packaging/quickstart-local.sh, end to end
+        run: cargo test -p counter --features quickstart-tests --test quickstart_local -- --nocapture
 
   # M8 Task 15: the same suite with wire crypto Enabled on every node the
   # crashtest bins spawn (UC2_CRYPTO=1 — see examples/uc2-crashtest/tests/
