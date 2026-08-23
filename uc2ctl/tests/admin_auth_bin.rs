@@ -145,6 +145,24 @@ fn hmac_signing_audit_and_gen_key_end_to_end() {
     assert_eq!(r.status, 0, "a validly signed add-learner must succeed: {r:?}");
     assert!(r.stdout.contains("accepted"), "stdout={}", r.stdout);
 
+    // Fix round 1, minor 1: "accepted" alone doesn't prove the change
+    // actually landed — cross-check with a real `status` read that the new
+    // learner (id 102) is now a member and the config version advanced to 1
+    // (this is the FIRST accepted change on this cluster: step 1 was
+    // refused before ever reaching propose_config).
+    let r_status = run_ctl(&["status", "--instance-dir", dir_s, "--app-id", APP]);
+    assert_eq!(r_status.status, 0, "status must succeed: {r_status:?}");
+    assert!(
+        r_status.stdout.contains("config: version=1"),
+        "config version did not advance: {}",
+        r_status.stdout
+    );
+    assert!(
+        r_status.stdout.contains("id=102 role=learner"),
+        "learner 102 missing from status:\n{}",
+        r_status.stdout
+    );
+
     // Step 3: --admin-key ops-other.key (a real signature under a key name
     // the node's policy never loaded) -> reason 23 auth_unknown_key.
     let r = run_ctl(&[
@@ -193,6 +211,35 @@ fn hmac_signing_audit_and_gen_key_end_to_end() {
     assert_eq!(tail_lines.len(), 1, "stdout={}", r_tail.stdout);
     assert!(tail_lines[0].contains("refused"));
 
+    // Fix round 1, minor 3: a garbage (non-JSON) line appended to
+    // audit.jsonl by hand must not crash the printer — `format_audit_line`
+    // returns `None` on it, `run_audit` falls back to printing it verbatim
+    // with a `?` marker, and the command still exits 0.
+    {
+        use std::io::Write;
+        let audit_path = instance_dir.join("audit.jsonl");
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&audit_path)
+            .expect("open audit.jsonl to append garbage");
+        writeln!(f, "not even remotely json").expect("append garbage line");
+    }
+    let r_garbage = run_ctl(&["audit", "--instance-dir", dir_s]);
+    assert_eq!(r_garbage.status, 0, "a garbage audit line must not crash uc2ctl: {r_garbage:?}");
+    let garbage_lines: Vec<&str> = r_garbage.stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        garbage_lines.len(),
+        4,
+        "expected the 3 real records plus the garbage line:\n{}",
+        r_garbage.stdout
+    );
+    assert!(
+        garbage_lines[3].starts_with("? "),
+        "the garbage line should carry the ? marker: {}",
+        garbage_lines[3]
+    );
+    assert!(garbage_lines[3].contains("not even remotely json"), "{}", garbage_lines[3]);
+
     // Step 5: gen-admin-key -> 32 bytes, 0600; second run refuses to
     // overwrite with a named error.
     let gen_path = root.path().join("generated.key");
@@ -205,6 +252,21 @@ fn hmac_signing_audit_and_gen_key_end_to_end() {
         use std::os::unix::fs::MetadataExt;
         assert_eq!(meta.mode() & 0o777, 0o600, "generated key must be mode 0600");
     }
+    // Fix round 1, minor 2: the printed snippet must name the key file's
+    // stem ("generated") and the file's own absolute path — not just SOME
+    // output.
+    let gen_abs = std::fs::canonicalize(&gen_path).expect("generated key file exists");
+    assert!(
+        r.stdout.contains("name = \"generated\""),
+        "snippet missing the key name:\n{}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains(gen_abs.to_str().expect("utf8 path")),
+        "snippet missing the absolute key_path:\n{}",
+        r.stdout
+    );
+
     let r2 = run_ctl(&["gen-admin-key", gen_path.to_str().unwrap()]);
     assert_ne!(r2.status, 0, "gen-admin-key must refuse to overwrite an existing file");
     assert!(

@@ -684,25 +684,64 @@ fn run_gen_admin_key(a: &GenAdminKeyArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One field's value out of a flat, single-line JSON object, as raw text
-/// (`"ops-alice"` -> `ops-alice`, `20` -> `20`, `null` -> `null`). `None` on
-/// anything that doesn't look like `"key":value` — this is a deliberately
-/// small hand parser, not a JSON parser: it works because the audit line's
-/// shape is pinned (`uc2_node::obs::log::format_line_at`, one flat object,
-/// fixed key order — see `uc2_node/src/audit.rs`'s module doc), not because
-/// this function understands JSON in general. Never panics: every step is a
-/// checked lookup, so a garbled line simply yields `None` for the field(s)
-/// it broke.
+/// One field's value out of a flat, single-line JSON object, as decoded
+/// text (`"ops-alice"` -> `ops-alice`, `20` -> `20`, `null` -> `null`).
+/// `None` on anything that doesn't look like `"key":value` — this is a
+/// deliberately small hand parser, not a JSON parser: it works because the
+/// audit line's shape is pinned (`uc2_node::obs::log::format_line_at`, one
+/// flat object, fixed key order — see `uc2_node/src/audit.rs`'s module
+/// doc), not because this function understands JSON in general.
+///
+/// **Escape-aware, deliberately conservative** (fix round 1, Important 1):
+/// a string value is decoded through [`decode_json_string`], which returns
+/// `None` on any escape it does not recognize or an unterminated string —
+/// so an admin key named `ops"alice` (which `format_line_at` renders as
+/// `ops\"alice` per its own `push_json_escaped`) is either decoded back to
+/// `ops"alice` correctly or, on anything this parser cannot make sense of,
+/// yields `None` for the WHOLE line (via `format_audit_line`'s `?`), never
+/// a silently truncated value. Never panics: every step is a checked
+/// lookup, so a garbled line simply yields `None`.
 fn json_field(line: &str, key: &str) -> Option<String> {
     let needle = format!("\"{key}\":");
     let start = line.find(&needle)? + needle.len();
     let rest = line.get(start..)?;
     if let Some(stripped) = rest.strip_prefix('"') {
-        let end = stripped.find('"')?;
-        Some(stripped[..end].to_string())
+        decode_json_string(stripped)
     } else {
         let end = rest.find([',', '}'])?;
         Some(rest[..end].to_string())
+    }
+}
+
+/// Decode a JSON string body — the characters immediately AFTER the opening
+/// `"`, up to and including its closing `"` — into the field's text value.
+/// Handles exactly the escapes `push_json_escaped`
+/// (`uc2_node/src/obs/log.rs`) can emit (`\"`, `\\`, `\u00XX` for control
+/// bytes) plus the standard `\n`/`\r`/`\t` shorthands for generality; any
+/// other escape, or running out of input before a closing `"`, returns
+/// `None` rather than guess.
+fn decode_json_string(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    loop {
+        match chars.next()? {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    let hex: String = (0..4).map(|_| chars.next()).collect::<Option<String>>()?;
+                    let code_point = u32::from_str_radix(&hex, 16).ok()?;
+                    out.push(char::from_u32(code_point)?);
+                }
+                _ => return None,
+            },
+            c => out.push(c),
+        }
     }
 }
 
@@ -758,4 +797,85 @@ fn run_audit(a: &AuditArgs) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Fix round 1, Important 1: json_field must be escape-aware, not stop
+    // at the first raw `"` — a value containing an escaped quote or
+    // backslash must decode correctly, and anything this small parser
+    // cannot make sense of must come back `None` (so the caller falls back
+    // to printing the raw line with a `?` marker) rather than a silently
+    // truncated value.
+
+    #[test]
+    fn json_field_reads_a_plain_string_value() {
+        let line = r#"{"ts_ns":1,"actor":"ops-alice","outcome":"accepted"}"#;
+        assert_eq!(json_field(line, "actor").as_deref(), Some("ops-alice"));
+        assert_eq!(json_field(line, "outcome").as_deref(), Some("accepted"));
+    }
+
+    #[test]
+    fn json_field_decodes_escaped_quote_and_backslash() {
+        // What `push_json_escaped` (uc2_node/src/obs/log.rs) emits for an
+        // admin key literally named `ops"alice\bob`.
+        let line = r#"{"actor":"ops\"alice\\bob","outcome":"accepted"}"#;
+        assert_eq!(json_field(line, "actor").as_deref(), Some(r#"ops"alice\bob"#));
+    }
+
+    #[test]
+    fn json_field_decodes_a_unicode_escape() {
+        // \u0041 is "A" — exercises the `\u00XX` branch `push_json_escaped`
+        // uses for control bytes, at a codepoint that's easy to eyeball.
+        // `"\\u0041"` in this ordinary Rust string literal decodes to the
+        // literal six characters `\u0041`, so `json_field` receives a real
+        // backslash-escape to decode, not an already-resolved "A".
+        let line = "{\"actor\":\"\\u0041\"}";
+        assert_eq!(json_field(line, "actor").as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn json_field_returns_none_on_an_unterminated_string() {
+        let line = r#"{"actor":"ops-alice"#; // no closing quote
+        assert_eq!(json_field(line, "actor"), None);
+    }
+
+    #[test]
+    fn json_field_returns_none_on_an_unterminated_escape() {
+        let line = r#"{"actor":"ops-alice\"#; // trailing backslash, nothing after it
+        assert_eq!(json_field(line, "actor"), None);
+    }
+
+    #[test]
+    fn json_field_returns_none_on_an_unrecognized_escape() {
+        let line = r#"{"actor":"ops\qalice"}"#; // \q is not an escape this parser knows
+        assert_eq!(json_field(line, "actor"), None);
+    }
+
+    #[test]
+    fn json_field_reads_a_numeric_field() {
+        let line = r#"{"ts_ns":1755600000000000000,"reason":20,"config_version":7}"#;
+        assert_eq!(json_field(line, "ts_ns").as_deref(), Some("1755600000000000000"));
+        assert_eq!(json_field(line, "reason").as_deref(), Some("20"));
+        assert_eq!(json_field(line, "config_version").as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn json_field_reads_the_literal_null() {
+        let line = r#"{"addr":null,"id":4}"#;
+        assert_eq!(json_field(line, "addr").as_deref(), Some("null"));
+    }
+
+    #[test]
+    fn format_audit_line_falls_back_to_none_when_a_field_cannot_be_decoded() {
+        // `\q` is not an escape this parser knows — a single bad escape in
+        // ONE field (here `actor`) must fail the WHOLE line via
+        // `format_audit_line`'s `?` chain, so the caller prints `? <line>`
+        // instead of a record with every other field intact but `actor`
+        // silently wrong.
+        let line = r#"{"ts_ns":1,"actor":"ops\qalice","origin":"local","op_name":"add_learner","id":4,"addr":null,"outcome":"accepted","reason":0,"config_version":1}"#;
+        assert_eq!(format_audit_line(line), None);
+    }
 }
