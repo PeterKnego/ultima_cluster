@@ -5,16 +5,7 @@ all-features = false
 version = 2
 yanked = "deny"
 ignore = [
-  # 2026-08-23 (M12c Task 1): bincode 2.0.1 is flagged "unmaintained" — the
-  # bincode team stopped development after a doxxing/harassment incident, not
-  # for a security defect in the crate itself ("Solution: No safe upgrade is
-  # available!" — there is no patched version to move to). bincode is the
-  # wire codec for the cnc page, log records, and the remote protocol
-  # throughout the workspace; replacing it is a real migration, out of scope
-  # for M12c Task 1. Tracked as a residual risk to revisit in a later
-  # milestone, not silently dropped: re-check this ignore whenever `cargo
-  # deny check` is re-run and a maintained fork/successor exists.
-  "RUSTSEC-2025-0141",
+  { id = "RUSTSEC-2025-0141", reason = "bincode 2.0.1 is flagged \"unmaintained\" — the bincode team stopped development after a doxxing/harassment incident, not for a security defect in the crate itself (\"Solution: No safe upgrade is available!\" — there is no patched version to move to). bincode is the wire codec for the cnc page, log records, and the remote protocol throughout the workspace; replacing it is a real migration, out of scope for M12c Task 1. Tracked as a residual risk to revisit in a later milestone, not silently dropped: re-check this ignore whenever `cargo deny check` is re-run and a maintained fork/successor exists. Dated 2026-08-23 (M12c Task 1)." },
 ]
 
 [licenses]

@@ -55,7 +55,7 @@ uc2_consensus = { path = "../../uc2_consensus", version = "2.6.0" }
 uc2_crypto    = { path = "../../uc2_crypto", version = "2.6.0" }
 # pulls in the `RegisterSm: uc2_service::StateMachine` impl (the `v2` feature is
 # now uc-lincheck's only SDK target).
-uc-lincheck   = { path = "../../uc-lincheck", version = "2.6.0", default-features = false, features = ["v2"] }
+uc-lincheck   = { path = "../../uc-lincheck", default-features = false, features = ["v2"] }
 # M12a Task 11: the `uc2-crashtest-gateway` bin's `Edge`.
 uc2_gateway   = { path = "../../uc2_gateway", version = "2.6.0" }
 clap          = { version = "4", features = ["derive"] }

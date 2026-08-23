@@ -1,13 +1,6 @@
 [workspace]
 resolver = "2"
-# Member order matches the publish DAG (docs/how-to/cut-a-release.md): each
-# crate's path dependencies are declared before it. This isn't just cosmetic
-# — `cargo package -p A -p B -p C ...` resolves cross-references among the
-# selected packages using this declaration order (a forward reference fails
-# even inside one batched invocation, pre-first-publish when nothing is on
-# crates.io yet to fall back on). Unpublished crates (uc2_sim, uc-lincheck,
-# examples/*) are slotted in right after the last dependency they need.
-members = ["ultima_journal", "uc_protocol", "uc2_crypto", "uc2_log", "uc2_consensus", "uc2_sim", "uc2_net", "uc2_client", "uc2_node", "uc2_service", "uc-lincheck", "uc2_remote", "uc2_gateway", "uc2ctl", "examples/uc2-crashtest", "examples/counter"]
+members = ["uc_protocol", "uc2_log", "uc2_net", "uc2_consensus", "uc2_sim", "uc2_node", "uc2ctl", "uc2_service", "uc2_client", "uc2_crypto", "uc-lincheck", "ultima_journal", "examples/uc2-crashtest", "examples/counter", "uc2_remote", "uc2_gateway"]
 
 [workspace.package]
 edition = "2024"
@@ -22,7 +15,7 @@ homepage = "https://github.com/PeterKnego/ultima_cluster"
 # caught a real `clippy::incompatible_msrv` violation at 1.88:
 # `std::fs::File::unlock` (uc2_node/src/backup.rs) only stabilized in 1.89.0.
 rust-version = "1.89"
-keywords = ["consensus", "raft", "state-machine-replication", "aeron", "low-latency"]
+keywords = ["consensus", "raft", "replication", "aeron", "low-latency"]
 categories = ["network-programming", "database-implementations"]
 
 [workspace.dependencies]

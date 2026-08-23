@@ -61,20 +61,48 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # NOTE: `arguments` maps to cargo-deny's own TOP-LEVEL flags (before
+      # `check`), and the action's default `arguments` value is actually
+      # `--all-features` — so this first pass is pinned to `arguments: ""`
+      # to genuinely get the plain default-feature-set graph (matching
+      # deny.toml's `[graph] all-features = false`), distinct from the
+      # second pass below.
+      - name: cargo deny (default features)
+        uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories licenses bans sources
+          arguments: ""
+      # Second pass with every feature on, so e.g. uc2_service's non-default
+      # `ultima_db` adapter (crossbeam-utils, hashbrown, dashmap, ultima-db
+      # itself) is actually in the resolved graph. Verified locally
+      # (`cargo deny --all-features check`, M12c Task 1 fix round): those
+      # extra crates are all Apache-2.0/MIT, already in the allowlist — no
+      # new license needed today, but this step exists so a future one is
+      # caught here instead of only at release time.
+      - name: cargo deny (--all-features)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+          arguments: --all-features
 
   # M12c Task 1: smoke-tests that the 12 publishable crates (see deny.toml's
-  # workspace-order comment in root Cargo.toml) actually package/publish, so
-  # a manifest regression (a path dep missing `version =`, a stray
-  # `publish = false`, ...) is caught here instead of at release time.
+  # bans comment in root Cargo.toml) actually package/publish, so a manifest
+  # regression (a path dep missing `version =`, a stray `publish = false`,
+  # a keyword crates.io would reject, ...) is caught here instead of at
+  # release time.
   publish-check:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
+      # crates.io rejects publish-time metadata (keyword length/count,
+      # unknown category slugs, ...) that neither `cargo package` nor
+      # `cargo publish --dry-run` ever checks (dry-run stops before the
+      # server-side validation). Catch it here, not at the real `cargo
+      # publish`.
+      - name: Publish metadata guard (keywords/categories)
+        run: ./scripts/check_publish_metadata.sh
       # `cargo package` rewrites every path dependency into a registry
       # dependency and then requires it to actually resolve — even with
       # --no-verify (which only skips the build step, not this metadata
@@ -84,15 +112,16 @@ jobs:
       # a temporary bootstrap gap: uc2_node's dev-dependency on uc2_service,
       # for one example, is a genuine dev-only cycle no publish order can
       # fully avoid — see the `allow-wildcard-paths` note in deny.toml and
-      # the per-crate "deliberately unversioned" Cargo.toml comments).
-      # Cargo DOES resolve cross-references among packages selected in the
-      # SAME `-p ... -p ...` invocation against each other locally instead of
-      # hitting the registry, provided they're listed in dependency order —
-      # which is exactly the root Cargo.toml `members` order. So: one batched
-      # command for all 12 crates, not 12 separate ones.
-      - name: cargo package (all 12 publishable crates, DAG order)
+      # the per-crate "deliberately unversioned" Cargo.toml comments). Cargo
+      # DOES resolve cross-references among packages selected in the SAME
+      # `-p ... -p ...` invocation against each other locally instead of
+      # hitting the registry — it topo-sorts the selected set itself, so
+      # neither the `-p` flag order nor the workspace `members` order
+      # matters here. So: one batched command for all 12 crates, not 12
+      # separate ones (which would each fail — see above).
+      - name: cargo package (all 12 publishable crates)
         run: >
-          cargo package --no-verify --allow-dirty
+          cargo package --no-verify
           -p ultima-journal -p uc_protocol -p uc2_crypto -p uc2_log
           -p uc2_consensus -p uc2_net -p uc2_client -p uc2_node
           -p uc2_service -p uc2_remote -p uc2_gateway -p uc2ctl
@@ -105,7 +134,7 @@ jobs:
       # only smoke-tests that packaging itself still works.
       - name: cargo publish --dry-run (the 4 dependency-free leaves)
         run: |
-          cargo publish --dry-run --allow-dirty -p ultima-journal
-          cargo publish --dry-run --allow-dirty -p uc_protocol
-          cargo publish --dry-run --allow-dirty -p uc2_remote
-          cargo publish --dry-run --allow-dirty -p uc2_consensus
+          cargo publish --dry-run -p ultima-journal
+          cargo publish --dry-run -p uc_protocol
+          cargo publish --dry-run -p uc2_remote
+          cargo publish --dry-run -p uc2_consensus

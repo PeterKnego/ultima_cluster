@@ -30,7 +30,7 @@ use uc2_node::preflight::FsVerdict;
 use uc2_node::{AdminKey, AdminPolicy, DrainOutcome, Node, StartOpts, config_file, preflight};
 
 #[derive(Parser)]
-#[command(name = "uc2-node", about = "An ultima_cluster node")]
+#[command(name = "uc2-node", about = "An ultima_cluster node", version)]
 struct Args {
     /// Path to the node's TOML configuration file.
     #[arg(long)]
