@@ -43,8 +43,16 @@ pub mod recovery;
 pub use config_file::load_from_path;
 pub use ipc::{InstanceDir, IpcError};
 pub use node::{
-    DEFAULT_JOURNAL_SEGMENT_BYTES, DrainOutcome, Node, NodeConfig, PurgePolicy, SubmitError,
+    DEFAULT_JOURNAL_SEGMENT_BYTES, DrainOutcome, Node, NodeConfig, PurgePolicy,
+    REASON_AUTH_BAD_TAG, REASON_AUTH_EXPIRED, REASON_AUTH_MISSING, REASON_AUTH_UNKNOWN_KEY,
+    StartOpts, SubmitError,
 };
+/// M12b: admin-request authentication, re-exported so a deployment that only
+/// depends on `uc2_node` can build a [`StartOpts`] without naming
+/// `uc2_crypto` directly. [`AdminPolicy::Filesystem`] (the `Default`) is
+/// exactly the pre-M12b posture: the instance directory's permissions are the
+/// admin boundary and the cnc auth line is ignored.
+pub use uc2_crypto::admin::{AdminKey, AdminPolicy};
 /// M8: node-to-node wire crypto configuration, re-exported so a deployment
 /// that only depends on `uc2_node` can build a [`NodeConfig`] without naming
 /// `uc2_crypto` directly. `CryptoConfig::Disabled` (the `Default`) is exactly

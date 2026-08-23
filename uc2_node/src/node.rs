@@ -16,7 +16,7 @@ use uc2_consensus::election::{Action, ElectionConfig, ElectionSm, Event, NodeId,
 use uc2_log::agent::{AgentRunner, IdleStrategy};
 use uc2_log::archive::{Archive, ArchiveConfig};
 use uc2_log::buffer::{AppendError, Appender, LogBuffer};
-use uc2_log::cnc::{AdminReq, AdminResp, CncMeta, CncPage};
+use uc2_log::cnc::{AdminAuth, AdminReq, AdminResp, CncMeta, CncPage};
 use uc2_log::counters::LogCounters;
 use uc2_log::state::{ConfigRecord, NodeState, StoredConfig, StoredMember, TermMap, TermMapEntry, VoteRecord};
 use uc2_net::TermHandle;
@@ -25,6 +25,7 @@ use uc2_net::receiver::{
     CryptoIntake, FollowerConfig, FollowerReceiver, HandshakeDatagram, NetEvent, PeerIds,
 };
 use uc2_net::sender::{CtrlMsg, Sender, SenderConfig, SenderCrypto};
+use uc2_crypto::admin::{AdminMessage, AdminPolicy};
 use uc2_crypto::{CryptoConfig, HandshakeAction, Scope, SharedTransport, Transport};
 use uc_protocol::v2::crypto::DGRAM_KIND_HS_KEY;
 use uc_protocol::ring::{
@@ -234,6 +235,27 @@ pub enum SubmitError {
     Full,
 }
 
+/// Process-level start options — the knobs that are NOT configuration data.
+/// Split out from [`NodeConfig`] in M12b because both of these are live
+/// process resources (a bound socket; loaded admin key material), not values
+/// an operator writes into a TOML file and a harness clones around.
+///
+/// `Default` is exactly the pre-M12b behavior: bind a fresh socket at
+/// `cfg.bind`, and authenticate admin requests by filesystem permissions
+/// alone.
+#[derive(Debug, Default)]
+pub struct StartOpts {
+    /// A pre-bound UDP socket to run the node on. `None` binds `cfg.bind`.
+    /// The multi-node in-process harnesses bind every socket first so peers
+    /// know all addresses before any agent runs.
+    pub socket: Option<UdpSocket>,
+    /// How this node authenticates admin requests arriving on the cnc admin
+    /// band. [`AdminPolicy::Filesystem`] (the default) is the legacy posture:
+    /// the instance directory's permissions ARE the admin boundary, and the
+    /// cnc auth line is ignored entirely.
+    pub admin: AdminPolicy,
+}
+
 /// Ingress queue depth (M5 replaces this with the client submit ring).
 const INGRESS_CAPACITY: usize = 8192;
 /// Consensus events drained per duty cycle (bounded work).
@@ -283,6 +305,29 @@ const OUTPUT_PROGRESS_FLOOR_NS: u64 = 100_000_000;
 /// codes 1-10 and 12 are the SM's; 11 is the node's own defensive catch-all,
 /// previously a deliberate reuse of 6/NotFound).
 const REASON_MALFORMED_OP: u32 = 11;
+
+// ---- M12b: admin-authentication refusal reasons (spec §5.2) --------------
+// Wire `reason` codes on an admin response whose `status` is 1 (refused).
+// Disjoint from both the SM's `ProposeError` codes (1-10, 12) and the node's
+// own `REASON_MALFORMED_OP` (11): a caller can tell "the cluster refused
+// this change" from "the cluster refused to believe this was you" without
+// consulting the policy. Only ever produced under `AdminPolicy::Hmac` —
+// under `Filesystem` (the default) the auth line is not even read.
+/// The policy is `Hmac` but the request carried no auth line at all
+/// (`AdminAuth::ZERO`) — an unsigned client against a signed cluster.
+pub const REASON_AUTH_MISSING: u32 = 20;
+/// The auth line named a known key, but the HMAC tag does not verify over
+/// this request's canonical bytes — a forged, tampered, or mis-signed
+/// request (including one re-presented at a different `seq`).
+pub const REASON_AUTH_BAD_TAG: u32 = 21;
+/// The auth line's `expiry_ns` is outside the acceptance window: already
+/// past (`expiry_ns <= now`), or implausibly far in the future
+/// (`> now + 2 * ttl`) — a signed request whose validity window was stretched
+/// by a clock game is refused just as hard as a stale one.
+pub const REASON_AUTH_EXPIRED: u32 = 22;
+/// The auth line's `key_name_hash` matches no key this node loaded — a
+/// revoked key, a key this node has not been given, or a typo'd key name.
+pub const REASON_AUTH_UNKNOWN_KEY: u32 = 23;
 
 /// Phase of an in-flight linearizable read (the ReadIndex barrier state
 /// machine, spec §7 / v1 task14).
@@ -422,17 +467,31 @@ pub struct Node {
 impl Node {
     /// Recover state, prime counters, and spawn the four agents. Every node
     /// boots a FOLLOWER — leadership only ever comes from an election. Binds a
-    /// fresh socket at `cfg.bind`; the harness variant is
-    /// [`start_with_socket`](Self::start_with_socket).
+    /// fresh socket at `cfg.bind` and takes the default [`StartOpts`]
+    /// (filesystem admin policy — the pre-M12b posture).
     pub fn start(cfg: NodeConfig) -> io::Result<Node> {
-        let sock = UdpSocket::bind(cfg.bind)?;
-        Self::start_with_socket(cfg, sock)
+        Self::start_with(cfg, StartOpts::default())
     }
 
     /// As [`start`](Self::start) but over a pre-bound socket (the 3-node harness
     /// binds every node's socket first, then hands each in — so peers know all
     /// addresses before any agent runs).
     pub fn start_with_socket(cfg: NodeConfig, sock: UdpSocket) -> io::Result<Node> {
+        Self::start_with(cfg, StartOpts { socket: Some(sock), ..Default::default() })
+    }
+
+    /// The one real constructor: [`start`](Self::start) and
+    /// [`start_with_socket`](Self::start_with_socket) are thin wrappers over
+    /// it. M12b added [`StartOpts::admin`] here rather than to [`NodeConfig`]
+    /// deliberately — an [`AdminPolicy`] holds live key material, which has no
+    /// business in a `Clone`-able, config-file-shaped struct that tests and
+    /// harnesses copy around.
+    pub fn start_with(cfg: NodeConfig, opts: StartOpts) -> io::Result<Node> {
+        let StartOpts { socket, admin } = opts;
+        let sock = match socket {
+            Some(sock) => sock,
+            None => UdpSocket::bind(cfg.bind)?,
+        };
         let self_addr = sock.local_addr()?;
 
         // 1. flock FIRST — one node per instance dir. A contended lock (a live
@@ -1171,6 +1230,7 @@ impl Node {
             halt_removed: false,
             last_flags: 0,
             config_bytes: Arc::clone(&config_bytes),
+            admin,
             last_admin_seq: 0,
             pending_admin_fwd: None,
             last_config_reply: None,
@@ -1700,6 +1760,12 @@ struct Consensus {
     /// read by the sender's `SnapshotSource` closure (a separate `Arc` clone) so
     /// every SNAP_BEGIN ships whatever config is CURRENT at ship time.
     config_bytes: Arc<Mutex<Vec<u8>>>,
+    /// M12b: how this node authenticates admin requests off the cnc admin
+    /// band — `Filesystem` (the default: the instance dir's permissions are
+    /// the boundary, and the auth line is never read) or `Hmac` (named keys +
+    /// TTL). Read ONLY inside `verify_admin`, i.e. only when an admin request
+    /// actually arrived: nothing on the duty-cycle hot path touches it.
+    admin: AdminPolicy,
     /// M7 Task 7: the last admin-request seq consumed off the cnc admin-req
     /// slot (`do_work` step 11's seqlock cursor into `read_admin_req`). `0` at
     /// boot — matches the freshly-zeroed cnc page (recreated every node boot),
@@ -1712,7 +1778,12 @@ struct Consensus {
     /// cleared once the matching-nonce `NetEvent::ConfigReply` (kind 17)
     /// arrives and its status/reason/version is written back to the response
     /// line. `None` = no forward outstanding.
-    pending_admin_fwd: Option<(u64, u64)>,
+    ///
+    /// M12b: carries the verified actor (the admin key name that signed the
+    /// request, `None` under `AdminPolicy::Filesystem`) alongside
+    /// `(seq, nonce)`, so the audit record Task 4 writes when the leader's
+    /// reply lands names the operator who asked, not just the change.
+    pending_admin_fwd: Option<(u64, u64, Option<String>)>,
     /// M7 Task 7: leader-side nonce dedup — the last forwarded proposal's
     /// `(nonce, reply)` this node (as leader) answered. A repeat nonce (the
     /// follower's forward retried, or a genuine wire retry) gets the STORED
@@ -3450,8 +3521,24 @@ impl Consensus {
     /// e.g. mid-election) -> reply `status=2` (retry) immediately — side-effect-
     /// free, `uc2ctl` just polls again.
     fn handle_admin(&mut self, req: AdminReq) {
+        // M12b: authenticate FIRST — leader and follower alike — so a follower
+        // never forwards an unauthenticated proposal, and no unauthenticated
+        // request ever reaches `propose_config`. Under the default
+        // `AdminPolicy::Filesystem` this is a match arm returning `Ok(None)`:
+        // byte-for-byte the pre-M12b path.
+        let actor = match self.verify_admin(&req) {
+            Ok(actor) => actor,
+            Err(reason) => {
+                // Task 4: audit here
+                self.write_admin_reply(req.seq, 1, reason, self.cnc.config_version());
+                return;
+            }
+        };
         if matches!(self.sm.role(), Role::Leader) {
             let (status, reason, version) = self.propose_and_append(req.op, req.id, req.ip, req.port);
+            // Task 4: audit here — `actor` names the operator key that signed
+            // this request (`None` under `AdminPolicy::Filesystem`).
+            let _actor = actor;
             self.write_admin_reply(req.seq, status, reason, version);
             return;
         }
@@ -3460,6 +3547,7 @@ impl Consensus {
             .then(|| self.id_to_addr.get(&(hint as NodeId)).copied())
             .flatten();
         let Some(leader_addr) = leader_addr else {
+            // Task 4: audit here
             self.write_admin_reply(req.seq, 2, 0, self.cnc.config_version());
             return;
         };
@@ -3467,16 +3555,80 @@ impl Consensus {
         // silently overwritten, leaving its caller with a bare timeout and no
         // answer at all. Answer the superseded request with status=2 (retry)
         // before replacing the pending slot.
-        if let Some((old_seq, _old_nonce)) = self.pending_admin_fwd.take() {
+        if let Some((old_seq, _old_nonce, _old_actor)) = self.pending_admin_fwd.take() {
             eprintln!("uc2_node: admin forward superseded by newer request");
+            // Task 4: audit here
             self.write_admin_reply(old_seq, 2, 0, self.cnc.config_version());
         }
-        self.pending_admin_fwd = Some((req.seq, req.nonce));
+        self.pending_admin_fwd = Some((req.seq, req.nonce, actor));
         let body = ConfigProposalBody { nonce: req.nonce, op: req.op, id: req.id, ip: req.ip, port: req.port };
         let mut buf = [0u8; CONFIG_PROPOSAL_BODY_LEN];
         write_config_proposal_body(&mut buf, &body);
         let term = self.sm.current_term();
         self.send(leader_addr, DGRAM_KIND_CONFIG_PROPOSAL, 0, term, &buf);
+    }
+
+    /// M12b: authenticate one admin request. Returns the verified actor (the
+    /// admin key name that signed it; `None` when the policy does not
+    /// authenticate) or the wire `reason` code to refuse it with.
+    ///
+    /// Under [`AdminPolicy::Filesystem`] — the default, and the pre-M12b
+    /// posture — this reads NOTHING: the instance directory's file
+    /// permissions are the admin boundary, and a request carrying a stale or
+    /// garbage auth line behaves exactly as it did before M12b.
+    ///
+    /// **Why there is no `(seq, nonce)` replay ring** (a ruled deviation from
+    /// spec §5.2): the tag covers `seq`, and the consensus agent only ever
+    /// acts on `seq > last_admin_seq` (`read_admin_req(self.last_admin_seq)`),
+    /// so a captured request cannot be re-presented at its original `seq` —
+    /// it is never even read — and re-presenting it at a higher `seq`
+    /// invalidates the tag. Across a node restart `last_admin_seq` resets to
+    /// 0, but `instance_id` changes, and the tag covers that too. A ring
+    /// would therefore never refuse anything these checks already refuse.
+    /// `expiry_ns` still bounds the window in which a live, correctly
+    /// sequenced request could be delayed and only then applied.
+    fn verify_admin(&self, req: &AdminReq) -> Result<Option<String>, u32> {
+        let (keys, ttl) = match &self.admin {
+            AdminPolicy::Filesystem => return Ok(None),
+            AdminPolicy::Hmac { keys, ttl } => (keys, ttl),
+        };
+        // Safe to read only here: `read_admin_req` returned `Some` for this
+        // request, and its `seq` acquire-load is what publishes these bytes
+        // (the auth line rides the admin-req seqlock — `CncPage`'s contract).
+        let auth: AdminAuth = self.cnc.read_admin_auth();
+        if auth.is_zero() {
+            return Err(REASON_AUTH_MISSING);
+        }
+        // Expiry before key lookup and before the tag: a signed request whose
+        // window is in the past — or stretched implausibly far into the
+        // future, which is the same attack with the clock turned the other
+        // way — is refused on the window alone.
+        let now = crate::obs::metrics::now_unix_ns();
+        let ttl_ns = u64::try_from(ttl.as_nanos()).unwrap_or(u64::MAX);
+        let max_expiry = now.saturating_add(ttl_ns.saturating_mul(2));
+        if auth.expiry_ns <= now || auth.expiry_ns > max_expiry {
+            return Err(REASON_AUTH_EXPIRED);
+        }
+        let key = keys
+            .iter()
+            .find(|k| k.name_hash == auth.key_name_hash)
+            .ok_or(REASON_AUTH_UNKNOWN_KEY)?;
+        let meta = self.cnc.meta();
+        let m = AdminMessage {
+            app_id: &meta.app_id,
+            instance_id: meta.instance_id,
+            seq: req.seq,
+            nonce: req.nonce,
+            op: req.op,
+            id: req.id,
+            ip: req.ip,
+            port: req.port,
+            expiry_ns: auth.expiry_ns,
+        };
+        if !uc2_crypto::admin::verify(key, &m, &auth.tag) {
+            return Err(REASON_AUTH_BAD_TAG);
+        }
+        Ok(Some(key.name.clone()))
     }
 
     /// M7 Task 7: leader-only — decode the wire op fields, `propose_config`,
@@ -3549,11 +3701,14 @@ impl Consensus {
     /// reply for any other nonce (stale, or a race with a since-superseded
     /// forward) is dropped rather than misattributed to the wrong response line.
     fn on_config_reply(&mut self, body: ConfigReplyBody) {
-        let Some((seq, nonce)) = self.pending_admin_fwd else { return };
+        let Some((seq, nonce, _)) = &self.pending_admin_fwd else { return };
+        let (seq, nonce) = (*seq, *nonce);
         if nonce != body.nonce {
             return;
         }
-        self.pending_admin_fwd = None;
+        // Task 4: audit here — the actor carried across the forward, so the
+        // leader's answer is audited under the operator who asked for it.
+        let _actor = self.pending_admin_fwd.take().and_then(|(_, _, actor)| actor);
         self.write_admin_reply(seq, body.status, body.reason, body.version);
     }
 
@@ -3573,7 +3728,8 @@ impl Consensus {
     /// leaving the caller to hang for the full timeout with no answer at all.
     fn invalidate_admin_caches(&mut self) {
         self.last_config_reply = None;
-        if let Some((seq, _nonce)) = self.pending_admin_fwd.take() {
+        if let Some((seq, _nonce, _actor)) = self.pending_admin_fwd.take() {
+            // Task 4: audit here
             self.write_admin_reply(seq, 2, 0, self.cnc.config_version());
         }
     }
@@ -5206,6 +5362,7 @@ mod tests {
             halt_removed: false,
             last_flags: 0,
             config_bytes: Arc::new(Mutex::new(Vec::new())),
+            admin: AdminPolicy::Filesystem,
             last_admin_seq: 0,
             pending_admin_fwd: None,
             last_config_reply: None,
@@ -5301,7 +5458,7 @@ mod tests {
         let mut h = harness();
         h.cons.last_config_reply =
             Some((42, ConfigReplyBody { nonce: 42, status: 0, reason: 0, version: 5 }));
-        h.cons.pending_admin_fwd = Some((99, 42));
+        h.cons.pending_admin_fwd = Some((99, 42, None));
 
         // Adopt a higher term as a follower -> Action::BecomeFollower.
         h.cons.feed(Event::RequestVote { from: 0, new_term: 3, last_term: 1, last_durable: 7000 });
