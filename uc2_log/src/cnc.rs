@@ -20,11 +20,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 use uc_protocol::v2::cnc::{
-    self, CNC_MAX_PEER_SLOTS, CNC_OFF_ADMIN_REQ, CNC_OFF_ADMIN_RESP, CNC_OFF_ADMISSION_BYTES,
-    CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE, CNC_OFF_CONFIG_PENDING, CNC_OFF_CONFIG_VERSION,
-    CNC_OFF_FREE_DISK_BYTES, CNC_OFF_HEADER_CRC, CNC_OFF_PEER_SLOTS, CNC_OFF_SEAL_FAILURES,
-    CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_TERM, CNC_PAGE_LEN,
-    CNC_PEER_SLOT_STRIDE, CNC_V2_VERSION, CncHeader,
+    self, CNC_MAX_PEER_SLOTS, CNC_OFF_ADMIN_AUTH, CNC_OFF_ADMIN_REQ, CNC_OFF_ADMIN_RESP,
+    CNC_OFF_ADMISSION_BYTES, CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE, CNC_OFF_CONFIG_PENDING,
+    CNC_OFF_CONFIG_VERSION, CNC_OFF_FREE_DISK_BYTES, CNC_OFF_HEADER_CRC, CNC_OFF_PEER_SLOTS,
+    CNC_OFF_SEAL_FAILURES, CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_TERM,
+    CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_V2_VERSION, CncHeader,
 };
 
 use crate::counters::{LogCounters, PaddedAtomicU64};
@@ -177,6 +177,26 @@ pub struct AdminResp {
     pub status: u32,
     pub reason: u32,
     pub version: u64,
+}
+
+/// M12b admin-request authentication line (`CNC_OFF_ADMIN_AUTH`). Not a
+/// seqlock of its own — it rides the `AdminReq` seqlock: the writer stores
+/// this BEFORE `req.seq`'s release, and the reader loads this only AFTER
+/// `read_admin_req` returned `Some` (whose `seq` load is the acquire that
+/// orders it). All-zero means no auth attached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminAuth {
+    pub tag: [u8; 32],
+    pub expiry_ns: u64,
+    pub key_name_hash: u64,
+}
+
+impl AdminAuth {
+    pub const ZERO: AdminAuth = AdminAuth { tag: [0u8; 32], expiry_ns: 0, key_name_hash: 0 };
+
+    pub fn is_zero(&self) -> bool {
+        *self == AdminAuth::ZERO
+    }
 }
 
 /// The mmap'd (or heap) cnc v2 page. `Region` is `Send + Sync`, so this is
@@ -593,6 +613,37 @@ impl CncPage {
         // Write seq last with release
         // SAFETY: ptr_seq is valid (cast from self.region.ptr_at); it's a PaddedAtomicU64.
         unsafe { (*ptr_seq).store_release(resp.seq) };
+    }
+
+    /// M12b: read the admin-auth line. Plain (non-atomic) loads — ordering
+    /// comes from the caller's discipline, not a seq word of its own: call
+    /// this ONLY after `read_admin_req` has returned `Some` for the request
+    /// being verified (its `seq` acquire-load is what makes these bytes
+    /// visible). See `CNC_OFF_ADMIN_AUTH`'s doc for the writer-side half of
+    /// the discipline and the byte layout.
+    pub fn read_admin_auth(&self) -> AdminAuth {
+        let off = CNC_OFF_ADMIN_AUTH;
+        let page = self.page();
+        let tag: [u8; 32] = page[off..off + 32].try_into().unwrap();
+        let expiry_ns = u64::from_le_bytes(page[off + 32..off + 40].try_into().unwrap());
+        let key_name_hash = u64::from_le_bytes(page[off + 40..off + 48].try_into().unwrap());
+        AdminAuth { tag, expiry_ns, key_name_hash }
+    }
+
+    /// M12b: write the admin-auth line. Plain (non-atomic) stores — the
+    /// caller MUST call this BEFORE `write_admin_req` (whose `seq` store is
+    /// the seqlock's release), so a reader that observes the new `seq` also
+    /// observes these bytes. `write_admin_auth(&AdminAuth::ZERO)` clears the
+    /// line — the writer clears it after the response is read, so a later
+    /// filesystem-policy (`auth = "none"`) request never carries a stale tag.
+    pub fn write_admin_auth(&self, a: &AdminAuth) {
+        let off = CNC_OFF_ADMIN_AUTH;
+        // SAFETY: off is CNC_OFF_ADMIN_AUTH; we write a 64-byte line at that offset.
+        let page_mut = unsafe { std::slice::from_raw_parts_mut(self.region.ptr_at(off), 64) };
+        page_mut[0..32].copy_from_slice(&a.tag);
+        page_mut[32..40].copy_from_slice(&a.expiry_ns.to_le_bytes());
+        page_mut[40..48].copy_from_slice(&a.key_name_hash.to_le_bytes());
+        page_mut[48..64].fill(0);
     }
 
     /// Decode the header + app_id back into an owned `CncMeta`.
@@ -1053,6 +1104,25 @@ mod tests {
             123_456_789,
             "offset pin: the value must live at 3840 exactly"
         );
+    }
+
+    #[test]
+    fn admin_auth_roundtrip_and_offset_pin() {
+        let page = CncPage::heap(&test_meta());
+        let a = AdminAuth {
+            tag: [0xA5; 32],
+            expiry_ns: 0x1122_3344_5566_7788,
+            key_name_hash: 0xDEAD_BEEF_CAFE_F00D,
+        };
+        page.write_admin_auth(&a);
+        assert_eq!(page.read_admin_auth(), a);
+        let raw = page.page();
+        assert_eq!(&raw[3904..3936], &[0xA5u8; 32]);
+        assert_eq!(&raw[3936..3944], &0x1122_3344_5566_7788u64.to_le_bytes());
+        assert_eq!(&raw[3944..3952], &0xDEAD_BEEF_CAFE_F00Du64.to_le_bytes());
+        assert!(raw[3952..3968].iter().all(|&b| b == 0), "16 reserved bytes must be zero");
+        page.write_admin_auth(&AdminAuth::ZERO);
+        assert!(page.read_admin_auth().is_zero());
     }
 
     #[test]

@@ -161,6 +161,20 @@ const _: () = assert!(CNC_OFF_SEAL_FAILURES + 64 <= CNC_PAGE_LEN);
 pub const CNC_OFF_FREE_DISK_BYTES: usize = 3840;
 const _: () = assert!(CNC_OFF_FREE_DISK_BYTES + 64 <= CNC_PAGE_LEN);
 
+/// M12b: admin-request authentication line. Writer: `uc2ctl` (same-host,
+/// same discipline as `CNC_OFF_ADMIN_REQ` — this line is written BEFORE
+/// `req.seq`'s release store, so a reader that observed a fresh `req.seq`
+/// via acquire has also observed a fresh auth line). Reader: the consensus
+/// agent, only after `read_admin_req` has returned `Some` for that seq.
+/// Layout: `tag[32] @+0` = `HMAC-SHA256(key, app_id ‖ instance_id ‖ seq ‖
+/// nonce ‖ op ‖ id ‖ ip ‖ port ‖ expiry_ns)`; `expiry_ns u64 @+32` (LE);
+/// `key_name_hash u64 @+40` (LE, FNV-1a 64 of the admin key's name); 16
+/// bytes reserved @+48. All-zero = no auth attached (an `auth = "none"`
+/// deployment, or a pre-M12b `uc2ctl`). Next free reserved-band offset
+/// after this line: 3968.
+pub const CNC_OFF_ADMIN_AUTH: usize = 3904;
+const _: () = assert!(CNC_OFF_ADMIN_AUTH + 64 <= CNC_PAGE_LEN);
+
 pub const NODE_FLAG_LEADER: u64 = 1;
 pub const NODE_FLAG_CAN_SERVE: u64 = 2;
 
@@ -459,5 +473,7 @@ mod tests {
         assert_eq!(CNC_OFF_SEAL_FAILURES, 3776);
         // M11 (Task 5): free_disk_bytes.
         assert_eq!(CNC_OFF_FREE_DISK_BYTES, 3840);
+        // M12b: admin_auth.
+        assert_eq!(CNC_OFF_ADMIN_AUTH, 3904);
     }
 }
