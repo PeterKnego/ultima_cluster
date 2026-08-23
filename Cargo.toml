@@ -9,20 +9,24 @@ license = "Apache-2.0"
 authors = ["Peter Knego"]
 repository = "https://github.com/PeterKnego/ultima_cluster"
 homepage = "https://github.com/PeterKnego/ultima_cluster"
-# FINAL (M12c Task 2, probed 2026-08-23): floor = std::fs::File::try_lock_exclusive
-# / unlock (uc2_node/src/backup.rs), stable since 1.89.0. Probed with the
-# already-installed 1.89.0 toolchain: `cargo +1.89.0 check --workspace
-# --all-targets --locked` (green), `cargo +1.89.0 test -p uc2_crypto
-# -p uc_protocol --locked` (green, 132 + 71 passed). `cargo +1.89.0 clippy
-# --workspace --all-targets --locked -- -D warnings` is RED: clippy::ptr_arg
-# fires on uc2_node/src/node.rs's `exec(&mut self, act: Action, _work: &mut
-# Vec<Event>)` on 1.89's clippy but not on the pinned 1.96's — `_work` is
-# deliberately `Vec` (not `[Event]`) as a reserved re-entrant push queue
-# (see the doc comment above `exec`), so narrowing it to a slice to satisfy
-# the older lint would defeat that design intent. This is exactly the
-# divergence the CI `msrv` job is built to route around: it runs `cargo
-# check`, never `clippy`, on this toolchain. Clippy-clean is enforced only
-# on the pinned stable (`rust-toolchain.toml`) in the `test` job.
+# FINAL (M12c Task 2, probed 2026-08-23; clippy fix round same day): floor =
+# std::fs::File::try_lock_exclusive/unlock (uc2_node/src/backup.rs), stable
+# since 1.89.0. Probed with the already-installed 1.89.0 toolchain: `cargo
+# +1.89.0 check --workspace --all-targets --locked` (green), `cargo +1.89.0
+# test -p uc2_crypto -p uc_protocol --locked` (green, 132 + 71 passed).
+# `cargo +1.89.0 clippy --workspace --all-targets --locked -- -D warnings`
+# was RED on two 1.89-only lints, both now silenced with a targeted
+# `#[allow(..., reason = "...")]` rather than a portability-losing rewrite:
+# clippy::ptr_arg on uc2_node/src/node.rs's `exec(&mut self, act: Action,
+# _work: &mut Vec<Event>)` (`_work` is deliberately `Vec`, not `[Event]`, as
+# a reserved re-entrant push queue — see the doc comment above `exec`), and
+# clippy::unnecessary_cast on uc2_node/src/bin/uc2-node.rs's
+# `free_disk_bytes` (`buf.f_bavail as u64 * buf.f_frsize as u64` normalizes
+# `libc::statvfs` field widths that vary by target — a no-op cast only on
+# this specific build target). Neither lint fires on the pinned 1.96's
+# clippy. With both allows in place, `cargo +1.89.0 clippy --workspace
+# --all-targets --locked -- -D warnings` is GREEN, so the CI `msrv` job runs
+# `clippy`, not just `check`.
 rust-version = "1.89"
 keywords = ["consensus", "raft", "replication", "aeron", "low-latency"]
 categories = ["network-programming", "database-implementations"]

@@ -12,9 +12,10 @@ name: ci
 #     suites (smoke, failover, learner, purge_safety, query_barrier) DO run
 #     here — they're the election/truncation/reconstruction regression net,
 #     and (M12b) admin_auth / daemon_refusals, the admin authn+audit net.
-#   * msrv — `cargo check` (not clippy) on the MSRV floor toolchain read
-#     from Cargo.toml's `rust-version`, so the stated floor can't silently
-#     drift from what actually compiles. See that field's comment.
+#   * msrv — `cargo clippy -D warnings` (check is implicit in clippy) on the
+#     MSRV floor toolchain read from Cargo.toml's `rust-version`, so the
+#     stated floor can't silently drift from what actually compiles/lints
+#     clean. See that field's comment.
 # Deliberately NOT run here:
 #   * cargo fmt --check — the codebase predates a fmt pass (~800 hunks of
 #     drift); clippy is the enforced style gate, per CLAUDE.md.
@@ -62,20 +63,26 @@ jobs:
   # MSRV floor gate. Reads the floor from Cargo.toml's `rust-version`
   # (`[workspace.package]`, single source of truth — see that field's
   # comment for how it was probed) via `cargo metadata`, so this job can't
-  # silently drift out of sync with the manifest. Runs `cargo check` only,
-  # NOT clippy: clippy lints can differ across toolchain versions (a
-  # concrete instance is recorded in the `rust-version` comment —
-  # clippy::ptr_arg fires on 1.89's clippy but not the pinned 1.96's, over a
-  # deliberately-`Vec`-typed re-entrant queue param). `check` is what MSRV
-  # actually promises: the workspace at least compiles on the floor
-  # toolchain. Clippy-clean is enforced only on the pinned stable
-  # (`rust-toolchain.toml`), in the `test` job above.
+  # silently drift out of sync with the manifest. Runs `cargo clippy -D
+  # warnings` (check is implicit in clippy) so the floor toolchain is both
+  # compile-clean and lint-clean, matching the pinned-stable `test` job's
+  # bar. Clippy lints can differ across toolchain versions — where 1.89's
+  # clippy flags something the pinned 1.96's doesn't (clippy::ptr_arg on
+  # uc2_node's deliberately-`Vec`-typed re-entrant queue param;
+  # clippy::unnecessary_cast on a cross-platform `libc::statvfs` field-width
+  # normalization in uc2-node.rs), the code carries a targeted
+  # `#[allow(..., reason = "...")]` rather than a portability-losing rewrite
+  # — see those two call sites.
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - name: Resolve MSRV from Cargo.toml
+        # Runs on whatever toolchain rust-toolchain.toml pins (currently
+        # 1.96.0) — the MSRV toolchain isn't installed yet at this point.
+        # Harmless: cargo metadata only reads the manifest, it compiles
+        # nothing.
         id: msrv
         run: |
           MSRV=$(cargo metadata --no-deps --format-version 1 \
@@ -86,14 +93,15 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv-${{ steps.msrv.outputs.version }}
-      - name: cargo check --workspace --all-targets (MSRV floor)
+      - name: cargo clippy --workspace --all-targets (MSRV floor)
         # Explicit `+<version>` (not plain `cargo`) so this genuinely runs
         # on the MSRV toolchain rather than being redirected by the
         # checked-out rust-toolchain.toml's directory override.
-        run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-targets --locked
+        run: cargo +${{ steps.msrv.outputs.version }} clippy --workspace --all-targets --locked -- -D warnings
 
   deny:
     runs-on: ubuntu-latest

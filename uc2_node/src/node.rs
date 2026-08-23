@@ -4149,6 +4149,10 @@ impl Consensus {
     /// `on_collapsed`, which runs from the duty cycle rather than from inside a
     /// `feed` and so feeds directly. Kept because it is the arms' only way to
     /// chain an event without re-entering the SM mid-batch.
+    #[allow(
+        clippy::ptr_arg,
+        reason = "reserved re-entrant push target for future Action arms — a slice cannot .push(); 1.89 clippy flags it, 1.96 does not"
+    )]
     fn exec(&mut self, act: Action, _work: &mut Vec<Event>) {
         match act {
             Action::PersistAndSendVote { to, vote } => {

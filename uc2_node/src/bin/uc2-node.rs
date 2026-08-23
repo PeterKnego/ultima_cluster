@@ -292,6 +292,12 @@ fn main() -> ExitCode {
 /// syscall error) — the caller leaves the cnc field at its last value rather
 /// than writing a stale-but-plausible 0. Same `CString`/`statfs`-family idiom
 /// as `preflight::fs_kind`, just the `statvfs` sibling call.
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "libc::statvfs's f_bavail/f_frsize field types vary by target (not \
+              always u64) — the cast is a portability normalization, a no-op only \
+              on this specific build target; 1.89 clippy flags it, 1.96 does not"
+)]
 fn free_disk_bytes(path: &std::path::Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
