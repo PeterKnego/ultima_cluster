@@ -2,10 +2,16 @@
 # Copyright 2026 Peter Knego
 [package]
 name = "uc2_service"
+description = "Service-side SDK: RawStateMachine / StateMachine, Sessioned, snapshots, the apply agent"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [features]
 # `ultima_db` pulls in the reference `StoreStateMachine` adapter (the
@@ -18,9 +24,9 @@ ultima_db = ["dep:ultima-db"]
 apply-profile = []
 
 [dependencies]
-uc_protocol = { path = "../uc_protocol" }
-uc2_log = { path = "../uc2_log" }
-ultima-journal = { path = "../ultima_journal" }
+uc_protocol = { path = "../uc_protocol", version = "2.6.0" }
+uc2_log = { path = "../uc2_log", version = "2.6.0" }
+ultima-journal = { path = "../ultima_journal", version = "2.6.0" }
 # Optional: the `ultima_db` adapter. The workspace dep already carries
 # features = ["persistence"] (required for snapshot_stream / install).
 ultima-db = { workspace = true, optional = true }
@@ -34,13 +40,15 @@ thiserror = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["rt", "time"] }
 
 [dev-dependencies]
-uc2_node = { path = "../uc2_node" }
-uc2_net = { path = "../uc2_net" }
-uc2_client = { path = "../uc2_client" }
+uc2_node = { path = "../uc2_node", version = "2.6.0" }
+uc2_net = { path = "../uc2_net", version = "2.6.0" }
+uc2_client = { path = "../uc2_client", version = "2.6.0" }
 # Dev-only cycle (permitted: the cyclic edge is a dev-dependency, same pattern
 # as uc2_node's own `uc-lincheck` dev-dep) — the M6 Task 3 e2e test drives the
 # real RegisterSm (SnapshotStateMachine capability, feature `v2`) through a
 # full node + service + client stack rather than a local one-off test SM.
+# NOTE: deliberately no `version =` — see uc2_node/Cargo.toml's comment on
+# this same dev-dep (uc-lincheck is publish = false, never on crates.io).
 uc-lincheck = { path = "../uc-lincheck", default-features = false, features = ["v2"] }
 tempfile = { workspace = true }
 serde = { workspace = true }

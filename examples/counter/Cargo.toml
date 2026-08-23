@@ -1,9 +1,15 @@
 [package]
 name = "counter"
+description = "The counter-service tutorial app: single-process and multi-process (node/service/client) binaries built on the ultima_cluster SDK"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 publish = false
 
 # The whole cluster in one process — the hello-world.
@@ -25,11 +31,11 @@ name = "counter-client"
 path = "src/bin/counter-client.rs"
 
 [dependencies]
-uc2_node      = { path = "../../uc2_node" }
-uc2_service   = { path = "../../uc2_service" }
-uc2_client    = { path = "../../uc2_client" }
-uc2_net       = { path = "../../uc2_net" }
-uc2_consensus = { path = "../../uc2_consensus" }
+uc2_node      = { path = "../../uc2_node", version = "2.6.0" }
+uc2_service   = { path = "../../uc2_service", version = "2.6.0" }
+uc2_client    = { path = "../../uc2_client", version = "2.6.0" }
+uc2_net       = { path = "../../uc2_net", version = "2.6.0" }
+uc2_consensus = { path = "../../uc2_consensus", version = "2.6.0" }
 serde         = { workspace = true }
 clap          = { version = "4", features = ["derive"] }
 anyhow        = { workspace = true }

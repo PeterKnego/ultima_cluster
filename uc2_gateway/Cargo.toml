@@ -6,6 +6,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "ultima_cluster gateway edge: remote protocol v1 over a local node's shmem Engine"
 
 [features]
@@ -20,10 +25,10 @@ name = "uc2-gateway"
 path = "src/bin/uc2-gateway.rs"
 
 [dependencies]
-uc2_client = { path = "../uc2_client" }
-uc2_log = { path = "../uc2_log" }
-uc2_remote = { path = "../uc2_remote" }
-uc_protocol = { path = "../uc_protocol" }
+uc2_client = { path = "../uc2_client", version = "2.6.0" }
+uc2_log = { path = "../uc2_log", version = "2.6.0" }
+uc2_remote = { path = "../uc2_remote", version = "2.6.0" }
+uc_protocol = { path = "../uc_protocol", version = "2.6.0" }
 bytes = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
@@ -41,10 +46,16 @@ signal-hook = { workspace = true }
 # Self dev-dependency: the supported way to build this crate's own test targets
 # with a non-default feature enabled. `cargo test -p uc2_gateway` gets
 # `test-util`; `cargo build -p uc2_gateway` does not.
+# Deliberately unversioned: a crate publishing itself can never resolve a
+# versioned dependency on itself (it isn't on the registry yet mid-publish),
+# so `cargo package`/`cargo publish` would fail forever otherwise. Cargo
+# silently strips the unversioned self dev-dep from the published manifest.
 uc2_gateway = { path = ".", features = ["test-util"] }
-uc2_net = { path = "../uc2_net" }
-uc2_node = { path = "../uc2_node" }
-uc2_service = { path = "../uc2_service" }
+uc2_net = { path = "../uc2_net", version = "2.6.0" }
+uc2_node = { path = "../uc2_node", version = "2.6.0" }
+uc2_service = { path = "../uc2_service", version = "2.6.0" }
+# NOTE: deliberately no `version =` — see uc2_node/Cargo.toml's comment on
+# this same dev-dep (uc-lincheck is publish = false, never on crates.io).
 uc-lincheck = { path = "../uc-lincheck", default-features = false, features = ["v2"] }
 bincode = { workspace = true }
 rand = { workspace = true }

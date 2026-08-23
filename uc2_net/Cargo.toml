@@ -5,11 +5,16 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-uc_protocol = { path = "../uc_protocol" }
-uc2_log = { path = "../uc2_log" }
-uc2_crypto = { path = "../uc2_crypto" }
+uc_protocol = { path = "../uc_protocol", version = "2.6.0" }
+uc2_log = { path = "../uc2_log", version = "2.6.0" }
+uc2_crypto = { path = "../uc2_crypto", version = "2.6.0" }
 ultima-journal = { workspace = true }
 
 [dev-dependencies]

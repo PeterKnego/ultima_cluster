@@ -1,12 +1,29 @@
 [workspace]
 resolver = "2"
-members = ["uc_protocol", "uc2_log", "uc2_net", "uc2_consensus", "uc2_sim", "uc2_node", "uc2ctl", "uc2_service", "uc2_client", "uc2_crypto", "uc-lincheck", "ultima_journal", "examples/uc2-crashtest", "examples/counter", "uc2_remote", "uc2_gateway"]
+# Member order matches the publish DAG (docs/how-to/cut-a-release.md): each
+# crate's path dependencies are declared before it. This isn't just cosmetic
+# — `cargo package -p A -p B -p C ...` resolves cross-references among the
+# selected packages using this declaration order (a forward reference fails
+# even inside one batched invocation, pre-first-publish when nothing is on
+# crates.io yet to fall back on). Unpublished crates (uc2_sim, uc-lincheck,
+# examples/*) are slotted in right after the last dependency they need.
+members = ["ultima_journal", "uc_protocol", "uc2_crypto", "uc2_log", "uc2_consensus", "uc2_sim", "uc2_net", "uc2_client", "uc2_node", "uc2_service", "uc-lincheck", "uc2_remote", "uc2_gateway", "uc2ctl", "examples/uc2-crashtest", "examples/counter"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "2.6.0"
 license = "Apache-2.0"
 authors = ["Peter Knego"]
+repository = "https://github.com/PeterKnego/ultima_cluster"
+homepage = "https://github.com/PeterKnego/ultima_cluster"
+# PROVISIONAL (M12c Task 1): not yet probed against a toolchain matrix (that's
+# Task 2, which may raise this further). Bumped from the brief's starting
+# value of 1.88 to 1.89 here because `cargo clippy -D warnings` immediately
+# caught a real `clippy::incompatible_msrv` violation at 1.88:
+# `std::fs::File::unlock` (uc2_node/src/backup.rs) only stabilized in 1.89.0.
+rust-version = "1.89"
+keywords = ["consensus", "raft", "state-machine-replication", "aeron", "low-latency"]
+categories = ["network-programming", "database-implementations"]
 
 [workspace.dependencies]
 # core
@@ -16,23 +33,13 @@ bytes = { version = "1", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
 
-# async
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "signal", "time", "fs", "io-util"] }
-futures = "0.3"
-
 # storage
-ultima-journal = { path = "ultima_journal" }
+ultima-journal = { path = "ultima_journal", version = "2.6.0" }
 # crates.io dep (published 0.1.1) — the workspace builds standalone, no sibling
 # checkout needed. `persistence` is required for snapshot_stream /
 # install_snapshot_stream. For lockstep local development against a checkout,
 # temporarily add: [patch.crates-io] ultima-db = { path = "../ultima_db" }
 ultima-db = { version = "0.1.1", features = ["persistence"] }
-
-# QUIC + TLS (M2)
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
-rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
-rustls-pemfile = "2"
 
 # M3 — shmem IPC
 memmap2 = "0.9"
@@ -71,7 +78,19 @@ hdrhistogram = "7"
 # caller then owns nonce management — which this design does deliberately and
 # structurally, per-sender-per-boot, in `uc2_crypto::schedule::derive_send_key`.
 # Pure feature flag: no new crates, no version movement.
-snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-aes-gcm", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom", "std", "risky-raw-split"] }
+#
+# M12c Task 1 (dead-dep sweep, 2026-08-23): deliberately NOT requesting snow's
+# `std` feature. `std` looks free (this crate always builds against std
+# anyway) but snow's own feature table defines `std = [..., "ring/std", ...]`,
+# which implicitly activates snow's *optional* `ring` dependency even though
+# the resolver actually in use here is `default-resolver` (RustCrypto), never
+# `ring-resolver`. That silently violated the "ONE AES-GCM implementation"
+# claim two paragraphs up — `cargo tree -i ring` showed `ring` pulled in
+# solely through this feature, not through the since-removed quinn/rustls
+# deps as originally assumed. Verified: dropping `std` still builds the full
+# workspace and `cargo test -p uc2_crypto` (132/132) is unaffected; `ring`
+# disappears from `cargo tree -i ring` entirely.
+snow = { version = "0.10", default-features = false, features = ["default-resolver", "use-aes-gcm", "use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom", "risky-raw-split"] }
 # `zeroize` scrubs the GHASH subkey; the paired `aes` feature below scrubs the
 # AES round keys (T5 review remedy — AES round keys are invertible back to the
 # 32-byte key, so a core dump / swap read could otherwise recover a live

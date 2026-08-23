@@ -1,0 +1,63 @@
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  # 2026-08-23 (M12c Task 1): bincode 2.0.1 is flagged "unmaintained" — the
+  # bincode team stopped development after a doxxing/harassment incident, not
+  # for a security defect in the crate itself ("Solution: No safe upgrade is
+  # available!" — there is no patched version to move to). bincode is the
+  # wire codec for the cnc page, log records, and the remote protocol
+  # throughout the workspace; replacing it is a real migration, out of scope
+  # for M12c Task 1. Tracked as a residual risk to revisit in a later
+  # milestone, not silently dropped: re-check this ignore whenever `cargo
+  # deny check` is re-run and a maintained fork/successor exists.
+  "RUSTSEC-2025-0141",
+]
+
+[licenses]
+version = 2
+# Derived 2026-08-23 from `cargo deny list` against the real graph (see M12c
+# Task 1 report) — every entry justified by an actual crate below. Several
+# crates offer a license choice (e.g. `fiat-crypto` = "MIT OR Apache-2.0 OR
+# BSD-1-Clause", `r-efi` = "MIT OR Apache-2.0 OR LGPL-2.1-or-later", `rustix`/
+# `linux-raw-sys`/the `wasi*`/`wit-bindgen*` crates = "Apache-2.0 WITH
+# LLVM-exception OR Apache-2.0 OR MIT"): cargo-deny is satisfied once ANY one
+# licence in an OR expression is allowed, so those are covered by plain
+# Apache-2.0/MIT below without adding BSD-1-Clause, LGPL-2.1-or-later, or
+# "Apache-2.0 WITH LLVM-exception" to the allowlist.
+allow = [
+  "Apache-2.0",   # the great majority of the graph, incl. every uc2_*/ultima-journal workspace crate
+  "MIT",          # the other majority share (serde, tokio, bincode, rand, clap, thiserror, snow, aes-gcm family, ...)
+  "BSD-2-Clause", # zerocopy
+  "BSD-3-Clause", # curve25519-dalek, subtle, x25519-dalek
+  "Unicode-3.0",  # unicode-ident
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Several dev-dependencies within this workspace are deliberately
+# unversioned path deps (uc-lincheck, and a few self-referential /
+# forward-in-the-publish-DAG dev-deps — see the per-crate Cargo.toml
+# comments added in M12c Task 1): cargo silently strips an unversioned path
+# dev-dependency from a published manifest instead of erroring, which is the
+# only way to package a crate whose dev-dep is unpublished or comes later in
+# the publish order. `wildcards = "deny"` would otherwise flag those exact,
+# intentional path deps as if they were reckless `foo = "*"` registry
+# dependencies; this flag scopes the check to real wildcard version
+# *requirements* and stops flagging bare local path dependencies.
+allow-wildcard-paths = true
+deny = [
+  { crate = "ring",        reason = "one AES-GCM implementation in the binary: RustCrypto aes-gcm (see Cargo.toml crypto comment). Was pulled in incidentally by snow's `std` feature (ring/std) despite the resolver actually in use being RustCrypto-based; fixed in M12c Task 1 by dropping `std` from the workspace's snow feature list (see Cargo.toml comment) — ring no longer appears in `cargo tree` at all." },
+  { crate = "openssl",     reason = "no C TLS stack; UC seals its own transport" },
+  { crate = "openssl-sys", reason = "same" },
+  { crate = "quinn",       reason = "QUIC retired with v1 (CLAUDE.md); do not reintroduce" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

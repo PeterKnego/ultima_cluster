@@ -55,3 +55,57 @@ jobs:
           --test smoke --test failover --test learner
           --test purge_safety --test query_barrier
           --test admin_auth --test daemon_refusals
+
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+  # M12c Task 1: smoke-tests that the 12 publishable crates (see deny.toml's
+  # workspace-order comment in root Cargo.toml) actually package/publish, so
+  # a manifest regression (a path dep missing `version =`, a stray
+  # `publish = false`, ...) is caught here instead of at release time.
+  publish-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+      # `cargo package` rewrites every path dependency into a registry
+      # dependency and then requires it to actually resolve — even with
+      # --no-verify (which only skips the build step, not this metadata
+      # check). Pre-first-publish, NOTHING in this DAG is on crates.io yet,
+      # so packaging each of the 12 crates in its OWN `cargo package`
+      # invocation would fail forever for every non-leaf crate (this is not
+      # a temporary bootstrap gap: uc2_node's dev-dependency on uc2_service,
+      # for one example, is a genuine dev-only cycle no publish order can
+      # fully avoid — see the `allow-wildcard-paths` note in deny.toml and
+      # the per-crate "deliberately unversioned" Cargo.toml comments).
+      # Cargo DOES resolve cross-references among packages selected in the
+      # SAME `-p ... -p ...` invocation against each other locally instead of
+      # hitting the registry, provided they're listed in dependency order —
+      # which is exactly the root Cargo.toml `members` order. So: one batched
+      # command for all 12 crates, not 12 separate ones.
+      - name: cargo package (all 12 publishable crates, DAG order)
+        run: >
+          cargo package --no-verify --allow-dirty
+          -p ultima-journal -p uc_protocol -p uc2_crypto -p uc2_log
+          -p uc2_consensus -p uc2_net -p uc2_client -p uc2_node
+          -p uc2_service -p uc2_remote -p uc2_gateway -p uc2ctl
+      # The 4 leaves (no path dependencies of their own: ultima-journal,
+      # uc_protocol, uc2_remote, uc2_consensus) are the only crates that can
+      # be `cargo publish --dry-run`'d before anything is actually on
+      # crates.io — every other crate's path deps can't resolve from the
+      # real registry yet. The real, sequential, manual publish order for a
+      # release is `docs/how-to/cut-a-release.md` (M12c Task 4); this job
+      # only smoke-tests that packaging itself still works.
+      - name: cargo publish --dry-run (the 4 dependency-free leaves)
+        run: |
+          cargo publish --dry-run --allow-dirty -p ultima-journal
+          cargo publish --dry-run --allow-dirty -p uc_protocol
+          cargo publish --dry-run --allow-dirty -p uc2_remote
+          cargo publish --dry-run --allow-dirty -p uc2_consensus

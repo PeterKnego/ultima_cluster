@@ -5,9 +5,14 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
-uc_protocol = { path = "../uc_protocol" }
+uc_protocol = { path = "../uc_protocol", version = "2.6.0" }
 snow = { workspace = true }
 aes-gcm = { workspace = true }
 # Declared only to force `zeroize` on the `aes` copy `aes-gcm` already links,

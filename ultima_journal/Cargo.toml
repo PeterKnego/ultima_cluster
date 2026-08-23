@@ -1,10 +1,15 @@
 [package]
 name = "ultima-journal"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Runtime-agnostic segmented append journal + durable atomic-value primitive"
-authors = ["Peter Knego"]
-license = "Apache-2.0"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 crc32fast = "1"

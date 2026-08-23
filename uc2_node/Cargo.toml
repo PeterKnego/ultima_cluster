@@ -2,21 +2,27 @@
 # Copyright 2026 Peter Knego
 [package]
 name = "uc2_node"
+description = "The ultima_cluster node: four single-writer polling agents, the cnc page, elections, and the uc2-node daemon"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [[bin]]
 name = "uc2-node"
 path = "src/bin/uc2-node.rs"
 
 [dependencies]
-uc_protocol = { path = "../uc_protocol" }
-uc2_log = { path = "../uc2_log" }
-uc2_net = { path = "../uc2_net" }
-uc2_consensus = { path = "../uc2_consensus" }
-uc2_crypto = { path = "../uc2_crypto" }
+uc_protocol = { path = "../uc_protocol", version = "2.6.0" }
+uc2_log = { path = "../uc2_log", version = "2.6.0" }
+uc2_net = { path = "../uc2_net", version = "2.6.0" }
+uc2_consensus = { path = "../uc2_consensus", version = "2.6.0" }
+uc2_crypto = { path = "../uc2_crypto", version = "2.6.0" }
 ultima-journal = { workspace = true }
 thiserror = { workspace = true }
 fs2 = { workspace = true }
@@ -30,10 +36,19 @@ clap = { workspace = true }
 [dev-dependencies]
 # Dev-only cycle (permitted: every edge is a dev-dependency) — the Task 11
 # barrier test drives the full read path with a real service + client.
+# uc2_service is deliberately unversioned: it comes AFTER uc2_node in the
+# publish DAG order (docs/how-to/cut-a-release.md), so a version here would
+# make `cargo package`/`cargo publish` require an unresolvable forward
+# reference. Cargo silently strips an unversioned path dev-dependency from
+# the published manifest instead (standard idiom for a dev-only test cycle).
 uc2_service = { path = "../uc2_service" }
-uc2_client = { path = "../uc2_client" }
+uc2_client = { path = "../uc2_client", version = "2.6.0" }
 # L3 lincheck port (Task 13): the WGL checker/history/model + CAS-register SM,
 # built for the v2 SDK trait only (v1 `uc_service` is not pulled in here).
+# NOTE: deliberately no `version =` — uc-lincheck is `publish = false` (never
+# on crates.io); a versioned path dev-dep would make `cargo package` require
+# it to resolve from the registry and fail forever. Cargo silently strips a
+# path dev-dependency with no version from the packaged manifest instead.
 uc-lincheck = { path = "../uc-lincheck", default-features = false, features = ["v2"] }
 serde = { workspace = true }
 bincode = { workspace = true }

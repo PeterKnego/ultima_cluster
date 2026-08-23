@@ -8,6 +8,13 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
+# Simulation harness, not part of the published DAG (M12c ruling).
+publish = false
 
 [features]
 # Heavy fuzz tier (1000 seeds, 5-node mix): a CI knob, run in --release.
@@ -19,14 +26,14 @@ sim-heavy = []
 test-support = []
 
 [dependencies]
-uc2_consensus = { path = "../uc2_consensus" }
+uc2_consensus = { path = "../uc2_consensus", version = "2.6.0" }
 # T13: crypto-plane sim coverage (Peers/GroupPlane are pure (input, now_ns) ->
 # Vec<Action> transition functions with no sockets/clock reads, so the world
 # can drive them exactly like ElectionSm). uc_protocol/base64 are only needed
 # to name the handshake datagram kinds and format the sim's own on-disk
 # allowlist fixture.
-uc2_crypto = { path = "../uc2_crypto" }
-uc_protocol = { path = "../uc_protocol" }
+uc2_crypto = { path = "../uc2_crypto", version = "2.6.0" }
+uc_protocol = { path = "../uc_protocol", version = "2.6.0" }
 base64 = { workspace = true }
 
 [dev-dependencies]
