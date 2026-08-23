@@ -70,11 +70,13 @@ Two of those rows are not Rust API and deserve saying out loud:
   `[admin]`, and why the upgrade note exists
   ([Upgrade a cluster](../how-to/upgrade-a-cluster.md)).
 - **`uc2ctl`'s exit codes are API.** Scripts branch on them. The binary
-  **exits `0` on success and `1` on any failure** — there is exactly one
-  `process::exit(1)` in it, and every failure path reaches it. The `0`
-  accepted / `1` refused / `2` retry triple is the **response status the node
-  returns and `uc2ctl` prints**, not a process exit code: statuses `1` and
-  `2` both exit `1`. See
+  exits `0` on success and non-zero on failure: `1` for any runtime
+  failure (the single `process::exit(1)` in it, reached by every runtime
+  failure path), `2` for a command-line usage error (clap — an unknown
+  flag, a missing `--instance-dir`, a bad subcommand). The `0` accepted /
+  `1` refused / `2` retry triple is a **printed value, not an exit code** —
+  it is the response status the node returns and `uc2ctl` prints; statuses
+  `1` and `2` both exit `1`. See
   [`uc2ctl`: Response statuses](uc2ctl.md#response-statuses).
 
 ## What is not promised
@@ -86,7 +88,7 @@ API for downstream code. They may change in any release:
 
 | Crate | Not promised |
 |---|---|
-| `uc_protocol` | all of it — `ring`, `v2`, `magic`, `error_codes`, `version`. It is the wire spec, governed by the flag-day rule below, not by semver. |
+| `uc_protocol` | all of it — `ring` (the lock-free ring buffers — not the `ring` crypto crate that `deny.toml` bans), `v2`, `magic`, `error_codes`, `version`. It is the wire spec, governed by the flag-day rule below, not by semver. |
 | `uc2_log` | `agent`, `archive`, `buffer`, `cnc`, `counters`, `reader`, `region`, `state`, `writer` |
 | `uc2_consensus` | `commit`, `config`, `election`, `reconcile` |
 | `uc2_net` | `fault`, `flow`, `rebuild`, `receiver`, `sender` |

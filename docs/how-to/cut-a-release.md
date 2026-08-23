@@ -31,6 +31,17 @@ documentation for what it changes, because the tag is what people read.
       every intra-workspace `version = "…"` dependency pin with it. They move
       in lockstep; `cargo package` is what catches a straggler, and CI's
       `publish-check` job runs it on every push.
+- [ ] The literal version string also appears outside the manifest, where
+      `cargo package` cannot see it: `packaging/compose.yml`
+      (`${UC2_IMAGE:-ghcr.io/peterknego/uc2:2.6.0}`), comments in
+      `packaging/Dockerfile`, and worked examples in `docs/QUICKSTART.md` and
+      `docs/how-to/run-a-cluster.md`. Find every straggler with:
+
+      ```sh
+      grep -rn "$OLD" packaging/ docs/
+      ```
+
+      where `$OLD` is the version being replaced, and update each hit.
 
 ## 2. Check the version the way the workflow will
 

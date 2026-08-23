@@ -60,10 +60,13 @@
 //! ```
 //!
 //! **Semver:** see `docs/reference/semver-policy.md`. Promised surface: this
-//! binary's verbs and its exit codes. It **exits `0` on success and `1` on
-//! any failure**; the `0` accepted / `1` refused / `2` retry triple is the
-//! response status the node returns and this binary PRINTS — statuses 1 and
-//! 2 both exit 1. See `docs/reference/uc2ctl.md` ("Response statuses").
+//! binary's verbs and its exit codes. It exits `0` on success and non-zero
+//! on failure: `1` for any runtime failure (the single `process::exit(1)`
+//! in it), `2` for a command-line usage error (clap). The `0` accepted /
+//! `1` refused / `2` retry triple is a printed value, not an exit code — it
+//! is the response status the node returns and this binary PRINTS —
+//! statuses 1 and 2 both exit 1. See `docs/reference/uc2ctl.md` ("Response
+//! statuses").
 //! Nothing in this crate is a Rust API; it publishes a binary, not a
 //! library.
 

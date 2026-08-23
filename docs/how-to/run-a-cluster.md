@@ -10,12 +10,16 @@ and is a better place to meet the moving parts.
 
 ## Install the binaries on each host
 
-Three things go onto every host:
+These go onto every host:
 
 - `uc2-node` — the node daemon.
 - `uc2ctl` — the admin CLI, for status and membership changes.
+- `uc2-gateway` — the reference TCP front door, if this host runs one (the
+  typical topology runs one per node host; see
+  [Run a gateway](run-a-gateway.md)).
 - Your own service binary — the half that runs your state machine. See
-  [Write a service binary](write-a-service-binary.md).
+  [Write a service binary](write-a-service-binary.md). Not part of the
+  release tarball; you build and ship it yourself.
 
 ### From a release tarball (no toolchain needed)
 
@@ -39,11 +43,18 @@ cosign verify-blob \
   uc2-$VER-$TARGET.tar.gz
 
 tar xzf uc2-$VER-$TARGET.tar.gz
-sudo install -m 0755 uc2-$VER-$TARGET/bin/* /usr/local/bin/
+sudo install -m 0755 \
+  uc2-$VER-$TARGET/bin/uc2-node \
+  uc2-$VER-$TARGET/bin/uc2ctl \
+  uc2-$VER-$TARGET/bin/uc2-gateway \
+  /usr/local/bin/
 ```
 
-`/usr/local/bin` is the path the packaged systemd units expect. The tarball
-also carries `packaging/` — `node.example.toml`, the systemd units, the
+`/usr/local/bin` is the path the packaged systemd units expect. Only install
+what a production host runs — skip `uc2-gateway` if this host runs no
+gateway, and skip `counter-service`/`counter-remote` entirely: those two are
+the quickstart's worked example, not production binaries. The tarball also
+carries `packaging/` — `node.example.toml`, the systemd units, the
 Prometheus rules and the Grafana dashboard referenced later in this guide.
 The identity pin on `cosign verify-blob` is not optional dressing; see
 [the quickstart's download section](../QUICKSTART.md#1-download-it-and-verify-it).

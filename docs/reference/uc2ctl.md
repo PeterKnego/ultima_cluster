@@ -292,12 +292,16 @@ class (`O_APPEND`, `fsync` per record, no rotation).
 ## Response statuses
 
 Mutating commands write an admin request and poll for the response line.
+The status below is a **printed value**, not the process exit code — see
+`uc2ctl` exits `0` on success and non-zero on failure: `1` for any runtime
+failure (the single `process::exit(1)`), `2` for a command-line usage error
+(clap), separately from the table's own `0`/`1`/`2`.
 
 | Status | Printed as | Process outcome |
 |---|---|---|
 | `0` | `accepted: config version now <N>` | exit 0 |
-| `1` | `refused: <reason>` | error exit |
-| `2` | `retry: leader unknown or the append ring was momentarily full` | error exit |
+| `1` | `refused: <reason>` | exit 1 (runtime failure) |
+| `2` | `retry: leader unknown or the append ring was momentarily full` | exit 1 (runtime failure) |
 
 ## Refusal reasons
 

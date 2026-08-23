@@ -183,7 +183,8 @@ jobs:
         with:
           key: sbom
       - name: Install cargo-cyclonedx
-        run: cargo install cargo-cyclonedx --locked
+        # pinned: the sbom job must not break on a tag because a new cyclonedx renamed a flag
+        run: cargo install cargo-cyclonedx --locked --version 0.5.9
       # Default feature set on purpose: it is what the shipped binaries are
       # built with, and an SBOM that lists dependencies nothing in the tarball
       # links against is a worse answer, not a safer one.
@@ -194,7 +195,7 @@ jobs:
           set -euo pipefail
           OUT="uc2-${VERSION}-sbom"
           mkdir -p "dist/${OUT}"
-          find . -name '*.cdx.json' -exec cp {} "dist/${OUT}/" \;
+          find . -path ./dist -prune -o -name '*.cdx.json' -exec cp {} "dist/${OUT}/" \;
           ls -l "dist/${OUT}"
           tar czf "dist/uc2-${VERSION}.cdx.tar.gz" -C dist "${OUT}"
           rm -rf "dist/${OUT}"
@@ -248,7 +249,7 @@ jobs:
         run: >
           scripts/release_smoke.sh "dist/${TARBALL}"
           --image "$SMOKE_BASE_IMAGE"
-          --work "${RUNNER_TEMP}/release-smoke"
+          --work "${RUNNER_TEMP}/.release-smoke"
 
       # ---- the compose smoke: the same binaries, as containers ----
       - name: Build the image from the tarball

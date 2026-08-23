@@ -37,8 +37,8 @@
 #              while packing it, three steps away from the cause. That is
 #              also why the default is NOT the tarball's own directory —
 #              `dist/` is exactly where release.yml builds the image from.
-#              Note that run from the repository root with no $RUNNER_TEMP,
-#              the default `./.release-smoke` IS inside the image build
+#              Note that, when run from the repository root with no
+#              $RUNNER_TEMP, the default `./.release-smoke` IS inside the image build
 #              context; it is safe only because .dockerignore excludes it
 #              (`*` then `!dist/*.tar.gz`, i.e. admit the artifacts and
 #              nothing else). If your build context differs, pass --work
