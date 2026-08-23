@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: Apache-2.0
+# cargo-fuzz crate — deliberately OUTSIDE the root workspace (root Cargo.toml's
+# `exclude = ["fuzz"]` plus the empty `[workspace]` table at the bottom of this
+# file). It builds only on nightly (libfuzzer-sys needs `-Z sanitizer`), while
+# the workspace pins stable 1.96.0 with an MSRV floor of 1.89 — nothing here
+# may ever leak into a workspace build, a `cargo test`, or the lockfile.
+[package]
+name = "uc2-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+uc_protocol = { path = "../uc_protocol" }
+uc2_remote = { path = "../uc2_remote" }
+uc2_crypto = { path = "../uc2_crypto" }
+uc2_service = { path = "../uc2_service" }
+uc2_node = { path = "../uc2_node" }
+uc2_gateway = { path = "../uc2_gateway" }
+ultima_journal = { path = "../ultima_journal", package = "ultima-journal" }
+
+[[bin]]
+name = "uc_protocol_datagram"
+path = "fuzz_targets/uc_protocol_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seed-corpus"
+path = "src/bin/seed_corpus.rs"
+test = false
+doc = false
+bench = false
+
+# one [[bin]] per target — Tasks 2 and 3 append theirs.
+
+[workspace]

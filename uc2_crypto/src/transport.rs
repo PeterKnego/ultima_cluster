@@ -471,7 +471,11 @@ impl Transport {
         if buf.len() < DATAGRAM_HEADER_LEN {
             return Err(CryptoError::TooShort);
         }
-        let header = read_datagram_header(buf);
+        // The pre-guard above already refused a short buffer; the reader is
+        // total on `&[u8]` (M12d), so the `else` arm is belt and braces.
+        let Some(header) = read_datagram_header(buf) else {
+            return Err(CryptoError::TooShort);
+        };
         match Self::scope_of(header.kind) {
             Scope::Group => self.open_group(from, header.key_epoch, buf),
             Scope::Pairwise => self.peers.open_pairwise(from, buf).map(|_counter| ()),
@@ -1392,7 +1396,9 @@ impl ReceiveHalf {
         if buf.len() < DATAGRAM_HEADER_LEN {
             return Err(CryptoError::TooShort);
         }
-        let header = read_datagram_header(buf);
+        let Some(header) = read_datagram_header(buf) else {
+            return Err(CryptoError::TooShort);
+        };
         match Transport::scope_of(header.kind) {
             Scope::Group => self.open_group(from, header.key_epoch, buf),
             Scope::Pairwise => self.key.lock().unwrap().peers.open_pairwise(from, buf).map(|_counter| ()),
@@ -1515,7 +1521,9 @@ impl ReceiveHalf {
         if n < DATAGRAM_HEADER_LEN {
             return Err(CryptoError::TooShort);
         }
-        let header = read_datagram_header(&buf[..n]);
+        let Some(header) = read_datagram_header(&buf[..n]) else {
+            return Err(CryptoError::TooShort);
+        };
         match Transport::scope_of(header.kind) {
             Scope::Group => {
                 let range = self.open_group_detached(from, header.key_epoch, &mut buf[..n])?;
@@ -2227,7 +2235,7 @@ mod tests {
         // trap by accident; assert the epoch explicitly rather than lean on
         // it staying that way.
         assert_eq!(
-            read_datagram_header(&d).key_epoch,
+            read_datagram_header(&d).unwrap().key_epoch,
             epoch,
             "the header keeps the REAL epoch after open, not whatever was staged before seal"
         );
@@ -2644,7 +2652,7 @@ mod tests {
         // second (non-zero) epoch first. Check the epoch explicitly, then
         // the rest of the buffer.
         assert_eq!(
-            read_datagram_header(&d).key_epoch,
+            read_datagram_header(&d).unwrap().key_epoch,
             epoch,
             "the header keeps the REAL epoch after open, not whatever was staged before seal"
         );
@@ -3076,7 +3084,7 @@ mod tests {
             "the body must not be readable on the wire"
         );
         assert_eq!(
-            read_datagram_header(&d).key_epoch,
+            read_datagram_header(&d).unwrap().key_epoch,
             epoch,
             "the group branch must stamp the sealing epoch into the header"
         );
@@ -3153,8 +3161,8 @@ mod tests {
         a.seal_control(DGRAM_KIND_READ_PROBE, Some(2), &mut with_peer, a.now_ns()).unwrap();
         a.seal_control(DGRAM_KIND_READ_PROBE, Some(9), &mut without, a.now_ns()).unwrap();
         assert_eq!(
-            read_datagram_header(&with_peer).key_epoch,
-            read_datagram_header(&without).key_epoch,
+            read_datagram_header(&with_peer).unwrap().key_epoch,
+            read_datagram_header(&without).unwrap().key_epoch,
             "a group seal must not vary with the destination"
         );
         // Node 9 does not exist; a pairwise seal would have failed `NoSession`.

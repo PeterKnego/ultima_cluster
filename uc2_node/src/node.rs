@@ -7443,7 +7443,7 @@ mod tests {
         /// checking the stash first and stashing anything else it reads.
         fn recv_kind_raw(&mut self, want: u8) -> Option<Vec<u8>> {
             if let Some(i) = self.stash.iter().position(|d| {
-                d.len() >= DATAGRAM_HEADER_LEN && read_datagram_header(d).kind == want
+                d.len() >= DATAGRAM_HEADER_LEN && read_datagram_header(d).unwrap().kind == want
             }) {
                 return Some(self.stash.remove(i));
             }
@@ -7458,7 +7458,7 @@ mod tests {
                 if n < DATAGRAM_HEADER_LEN {
                     continue;
                 }
-                if read_datagram_header(&buf[..n]).kind == want {
+                if read_datagram_header(&buf[..n]).unwrap().kind == want {
                     return Some(buf[..n].to_vec());
                 }
                 self.stash.push(buf[..n].to_vec());
@@ -7829,7 +7829,7 @@ mod tests {
         let mut probe = [0u8; 2048];
         while let Ok((n, _)) = h.peer2_sock.recv_from(&mut probe) {
             assert_ne!(
-                read_datagram_header(&probe[..n]).kind,
+                read_datagram_header(&probe[..n]).unwrap().kind,
                 DGRAM_KIND_HS_INIT,
                 "an unauthorized peer must not be handshaked with"
             );
@@ -7846,7 +7846,7 @@ mod tests {
             h.h.cons.do_work();
             if let Ok((n, _)) = h.peer2_sock.recv_from(&mut probe)
                 && n >= DATAGRAM_HEADER_LEN
-                && read_datagram_header(&probe[..n]).kind == DGRAM_KIND_HS_INIT
+                && read_datagram_header(&probe[..n]).unwrap().kind == DGRAM_KIND_HS_INIT
             {
                 break;
             }
@@ -7960,7 +7960,7 @@ mod tests {
         h.h.cons.exec(Action::GossipCommit { commit: 6016 }, &mut Vec::new());
         let commit_raw = h.recv_kind_raw(DGRAM_KIND_COMMIT_POSITION).expect("commit gossip");
         assert_ne!(
-            read_datagram_header(&commit_raw).key_epoch,
+            read_datagram_header(&commit_raw).unwrap().key_epoch,
             0,
             "a group-scope seal stamps the real epoch into the header"
         );
@@ -8043,8 +8043,8 @@ mod tests {
         );
         let mut buf = [0u8; 2048];
         let (n, _) = sink.recv_from(&mut buf).expect("the RESOLVABLE target still got its datagram");
-        assert_eq!(read_datagram_header(&buf[..n]).kind, DGRAM_KIND_COMMIT_POSITION);
-        assert_eq!(read_datagram_header(&buf[..n]).position, 4096);
+        assert_eq!(read_datagram_header(&buf[..n]).unwrap().kind, DGRAM_KIND_COMMIT_POSITION);
+        assert_eq!(read_datagram_header(&buf[..n]).unwrap().position, 4096);
     }
 
     /// A group-scope kind is sealed ONCE and the identical bytes go to every
@@ -8072,7 +8072,7 @@ mod tests {
         while Instant::now() < deadline && b.is_none() {
             if let Ok((n, _)) = h.peer2_sock.recv_from(&mut sink)
                 && n >= DATAGRAM_HEADER_LEN
-                && read_datagram_header(&sink[..n]).kind == DGRAM_KIND_COMMIT_POSITION
+                && read_datagram_header(&sink[..n]).unwrap().kind == DGRAM_KIND_COMMIT_POSITION
             {
                 b = Some(sink[..n].to_vec());
             }
@@ -8099,7 +8099,7 @@ mod tests {
         );
         let mut buf = [0u8; 4096];
         while let Ok((n, _)) = h.peer_sock.recv_from(&mut buf) {
-            let kind = read_datagram_header(&buf[..n]).kind;
+            let kind = read_datagram_header(&buf[..n]).unwrap().kind;
             assert!(
                 matches!(Transport::scope_of(kind), Scope::Unsealed),
                 "only the handshake bootstrap kinds may leave this node unsealed, saw kind {kind}"

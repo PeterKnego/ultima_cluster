@@ -311,12 +311,19 @@ pub fn write_request_vote_body(buf: &mut [u8], b: &RequestVoteBody) {
     buf[8..16].copy_from_slice(&b.last_durable.to_le_bytes());
 }
 
-pub fn read_request_vote_body(buf: &[u8]) -> RequestVoteBody {
-    RequestVoteBody {
+/// Decode a request-vote body, or `None` if the buffer is shorter than
+/// [`REQUEST_VOTE_BODY_LEN`]. The receiver still guards the length before
+/// calling (belt and braces); the reader is total so that no datagram, however
+/// truncated, can panic a node.
+pub fn read_request_vote_body(buf: &[u8]) -> Option<RequestVoteBody> {
+    if buf.len() < REQUEST_VOTE_BODY_LEN {
+        return None;
+    }
+    Some(RequestVoteBody {
         new_term: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
         last_term: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
         last_durable: u64::from_le_bytes(buf[8..16].try_into().unwrap()),
-    }
+    })
 }
 
 pub const VOTE_BODY_LEN: usize = 16;
@@ -333,11 +340,18 @@ pub fn write_vote_body(buf: &mut [u8], b: &VoteBody) {
     buf[5..16].fill(0);
 }
 
-pub fn read_vote_body(buf: &[u8]) -> VoteBody {
-    VoteBody {
+/// Decode a vote body, or `None` if the buffer is shorter than
+/// [`VOTE_BODY_LEN`]. The receiver still guards the length before calling
+/// (belt and braces); the reader is total so that no datagram, however
+/// truncated, can panic a node.
+pub fn read_vote_body(buf: &[u8]) -> Option<VoteBody> {
+    if buf.len() < VOTE_BODY_LEN {
+        return None;
+    }
+    Some(VoteBody {
         term: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
         granted: buf[4] != 0,
-    }
+    })
 }
 
 pub const TERM_MAP_HEADER_LEN: usize = 8;
@@ -410,9 +424,16 @@ pub fn write_datagram_header(buf: &mut [u8], h: &DatagramHeader) {
     buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2].copy_from_slice(&h.key_epoch.to_le_bytes());
 }
 
-/// `buf` must be at least `DATAGRAM_HEADER_LEN` bytes.
-pub fn read_datagram_header(buf: &[u8]) -> DatagramHeader {
-    DatagramHeader {
+/// Decode a datagram header, or `None` if the buffer is shorter than
+/// [`DATAGRAM_HEADER_LEN`]. Every receiver still guards the length before
+/// calling (belt and braces); the reader is total so that no datagram, however
+/// truncated, can panic a node — this is the pre-auth parse an unauthenticated
+/// network path reaches first.
+pub fn read_datagram_header(buf: &[u8]) -> Option<DatagramHeader> {
+    if buf.len() < DATAGRAM_HEADER_LEN {
+        return None;
+    }
+    Some(DatagramHeader {
         position: u64::from_le_bytes(buf[OFF_DGRAM_POSITION..OFF_DGRAM_POSITION + 8].try_into().unwrap()),
         leadership_term_id: u32::from_le_bytes(
             buf[OFF_DGRAM_TERM_ID..OFF_DGRAM_TERM_ID + 4].try_into().unwrap(),
@@ -422,7 +443,7 @@ pub fn read_datagram_header(buf: &[u8]) -> DatagramHeader {
         key_epoch: u16::from_le_bytes(
             buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2].try_into().unwrap(),
         ),
-    }
+    })
 }
 
 /// NAK: "retransmit `length` bytes from `position`" (position is the
@@ -441,11 +462,18 @@ pub fn write_nak_body(buf: &mut [u8], b: &NakBody) {
     buf[12..16].copy_from_slice(&0u32.to_le_bytes());
 }
 
-pub fn read_nak_body(buf: &[u8]) -> NakBody {
-    NakBody {
+/// Decode a NAK body, or `None` if the buffer is shorter than
+/// [`NAK_BODY_LEN`]. The receiver still guards the length before calling
+/// (belt and braces); the reader is total so that no datagram, however
+/// truncated, can panic a node.
+pub fn read_nak_body(buf: &[u8]) -> Option<NakBody> {
+    if buf.len() < NAK_BODY_LEN {
+        return None;
+    }
+    Some(NakBody {
         position: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
         length: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-    }
+    })
 }
 
 /// Status: flow-control advert (spec §5) — contiguous-rebuilt position +
@@ -466,16 +494,51 @@ pub fn write_status_body(buf: &mut [u8], b: &StatusBody) {
     buf[12..16].copy_from_slice(&0u32.to_le_bytes());
 }
 
-pub fn read_status_body(buf: &[u8]) -> StatusBody {
-    StatusBody {
+/// Decode a status body, or `None` if the buffer is shorter than
+/// [`STATUS_BODY_LEN`]. The receiver still guards the length before calling
+/// (belt and braces); the reader is total so that no datagram, however
+/// truncated, can panic a node.
+pub fn read_status_body(buf: &[u8]) -> Option<StatusBody> {
+    if buf.len() < STATUS_BODY_LEN {
+        return None;
+    }
+    Some(StatusBody {
         contiguous_position: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
         receive_window: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M12d: every datagram reader is TOTAL on `&[u8]` — a short buffer is
+    /// `None`, never a slice-index panic. The receivers still pre-guard the
+    /// length (belt and braces), so this pins the readers themselves, which
+    /// is what the `uc_protocol_datagram` fuzz target hammers directly.
+    #[test]
+    fn short_inputs_are_none_not_panics() {
+        for n in 0..DATAGRAM_HEADER_LEN {
+            assert!(read_datagram_header(&vec![0u8; n]).is_none(), "header len {n}");
+        }
+        assert!(read_datagram_header(&[0u8; DATAGRAM_HEADER_LEN]).is_some());
+        for n in 0..REQUEST_VOTE_BODY_LEN {
+            assert!(read_request_vote_body(&vec![0u8; n]).is_none(), "request_vote len {n}");
+        }
+        for n in 0..VOTE_BODY_LEN {
+            assert!(read_vote_body(&vec![0u8; n]).is_none(), "vote len {n}");
+        }
+        for n in 0..NAK_BODY_LEN {
+            assert!(read_nak_body(&vec![0u8; n]).is_none(), "nak len {n}");
+        }
+        for n in 0..STATUS_BODY_LEN {
+            assert!(read_status_body(&vec![0u8; n]).is_none(), "status len {n}");
+        }
+        assert!(read_request_vote_body(&[0u8; 3]).is_none());
+        assert!(read_vote_body(&[0u8; 3]).is_none());
+        assert!(read_nak_body(&[0u8; 3]).is_none());
+        assert!(read_status_body(&[0u8; 3]).is_none());
+    }
 
     #[test]
     fn header_roundtrip_and_offsets() {
@@ -488,7 +551,7 @@ mod tests {
         };
         let mut buf = [0u8; DATAGRAM_HEADER_LEN];
         write_datagram_header(&mut buf, &h);
-        assert_eq!(read_datagram_header(&buf), h);
+        assert_eq!(read_datagram_header(&buf).unwrap(), h);
         // Pin the ABSOLUTE wire layout with a literal LE byte array — this
         // module is frozen once M3 peers speak it, so a write/read round
         // trip alone isn't enough (both sides could agree on a wrong
@@ -524,7 +587,7 @@ mod tests {
         // Pinned at the old reserved offset — the slot the v2 spec set aside.
         assert_eq!(&buf[OFF_DGRAM_KEY_EPOCH..OFF_DGRAM_KEY_EPOCH + 2], &0xBEEFu16.to_le_bytes());
         assert_eq!(OFF_DGRAM_KEY_EPOCH, 14);
-        assert_eq!(read_datagram_header(&buf), h);
+        assert_eq!(read_datagram_header(&buf).unwrap(), h);
     }
 
     #[test]
@@ -547,7 +610,7 @@ mod tests {
         let n = NakBody { position: 4096, length: 65536 };
         let mut buf = [0u8; NAK_BODY_LEN];
         write_nak_body(&mut buf, &n);
-        assert_eq!(read_nak_body(&buf), n);
+        assert_eq!(read_nak_body(&buf).unwrap(), n);
         // Absolute wire pin, not just internal write/read consistency:
         // position=4096=0x1000 -> LE [0,16,0,0,0,0,0,0];
         // length=65536=0x10000 -> LE [0,0,1,0]; reserved=[0,0,0,0].
@@ -556,7 +619,7 @@ mod tests {
         let s = StatusBody { contiguous_position: 1 << 33, receive_window: 1 << 28 };
         let mut buf = [0u8; STATUS_BODY_LEN];
         write_status_body(&mut buf, &s);
-        assert_eq!(read_status_body(&buf), s);
+        assert_eq!(read_status_body(&buf).unwrap(), s);
         // Absolute wire pin: contiguous_position=1<<33=0x2_0000_0000 -> LE
         // [0,0,0,0,2,0,0,0]; receive_window=1<<28=0x1000_0000 -> LE
         // [0,0,0,16]; reserved=[0,0,0,0].
@@ -648,14 +711,14 @@ mod tests {
         let rv = RequestVoteBody { new_term: 7, last_term: 6, last_durable: 0x0000_0001_0000_0040 };
         let mut buf = [0u8; REQUEST_VOTE_BODY_LEN];
         write_request_vote_body(&mut buf, &rv);
-        assert_eq!(read_request_vote_body(&buf), rv);
+        assert_eq!(read_request_vote_body(&buf).unwrap(), rv);
         // literal LE pin: new_term 7, last_term 6, last_durable 2^32+64
         assert_eq!(buf, [7, 0, 0, 0, 6, 0, 0, 0, 0x40, 0, 0, 0, 1, 0, 0, 0]);
 
         let v = VoteBody { term: 7, granted: true };
         let mut buf = [0u8; VOTE_BODY_LEN];
         write_vote_body(&mut buf, &v);
-        assert_eq!(read_vote_body(&buf), v);
+        assert_eq!(read_vote_body(&buf).unwrap(), v);
         assert_eq!(buf, [7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         let v = VoteBody { term: 7, granted: false };
         write_vote_body(&mut buf, &v);

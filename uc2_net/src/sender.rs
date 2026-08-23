@@ -1368,7 +1368,7 @@ mod tests {
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
                 if let Some((n, _)) = self.sock.recv_from(&mut buf).unwrap() {
-                    let h = read_datagram_header(&buf);
+                    let h = read_datagram_header(&buf).unwrap();
                     return Some((h, buf[DATAGRAM_HEADER_LEN..n].to_vec()));
                 }
                 std::thread::yield_now();
@@ -2143,7 +2143,7 @@ mod tests {
             &plain_d[DATAGRAM_HEADER_LEN..],
             "payload is not cleartext"
         );
-        assert_ne!(read_datagram_header(&d1).key_epoch, 0, "stamped with the epoch");
+        assert_ne!(read_datagram_header(&d1).unwrap().key_epoch, 0, "stamped with the epoch");
     }
 
     #[test]
@@ -2214,10 +2214,10 @@ mod tests {
         let (mut s, f) = sender_with_crypto_to_one_follower();
         append_and_flush(&mut s, b"payload");
         let first = f.recv_raw().unwrap();
-        s.on_nak(f.addr(), read_datagram_header(&first).position, 7);
+        s.on_nak(f.addr(), read_datagram_header(&first).unwrap().position, 7);
         s.do_work();
         let retx = f.recv_raw().unwrap();
-        assert_eq!(read_datagram_header(&retx).position, read_datagram_header(&first).position);
+        assert_eq!(read_datagram_header(&retx).unwrap().position, read_datagram_header(&first).unwrap().position);
         assert_ne!(
             read_counter(&retx[DATAGRAM_HEADER_LEN..]),
             read_counter(&first[DATAGRAM_HEADER_LEN..]),
@@ -2243,7 +2243,7 @@ mod tests {
             &d[DATAGRAM_HEADER_LEN + HEADER_LEN..DATAGRAM_HEADER_LEN + HEADER_LEN + 5],
             b"hello"
         );
-        assert_eq!(read_datagram_header(&d).key_epoch, 0);
+        assert_eq!(read_datagram_header(&d).unwrap().key_epoch, 0);
     }
 
     // ---- Mutation-testing companions (task instructions: "write two or
@@ -2263,8 +2263,8 @@ mod tests {
         s.cfg.heartbeat_ns = 1; // fire on the very next do_work
         s.do_work();
         let d = f.recv_raw().expect("heartbeat datagram");
-        assert_eq!(read_datagram_header(&d).kind, DGRAM_KIND_HEARTBEAT);
-        assert_ne!(read_datagram_header(&d).key_epoch, 0, "heartbeat must be sealed too");
+        assert_eq!(read_datagram_header(&d).unwrap().kind, DGRAM_KIND_HEARTBEAT);
+        assert_ne!(read_datagram_header(&d).unwrap().key_epoch, 0, "heartbeat must be sealed too");
         assert_eq!(
             d.len(),
             DATAGRAM_HEADER_LEN + CRYPTO_OVERHEAD,
@@ -2331,7 +2331,7 @@ mod tests {
         s.on_nak(f1.addr(), 0, 4096);
         s.do_work();
         let d = f1.recv_raw().expect("replayed datagram");
-        let h = read_datagram_header(&d);
+        let h = read_datagram_header(&d).unwrap();
         assert_eq!(h.kind, DGRAM_KIND_DATA);
         assert_eq!(h.position, 0);
         assert_ne!(h.key_epoch, 0, "journal-replayed DATA must be sealed too");
@@ -2656,7 +2656,7 @@ mod tests {
         for _ in 0..4 {
             s.do_work();
             while let Some(d) = f.recv_raw() {
-                if d.len() >= DATAGRAM_HEADER_LEN && read_datagram_header(&d).kind == kind {
+                if d.len() >= DATAGRAM_HEADER_LEN && read_datagram_header(&d).unwrap().kind == kind {
                     out.push(d);
                 }
             }
@@ -2695,7 +2695,7 @@ mod tests {
         let mut recv = peer.receive_half();
         let mut d = chunks[0].clone();
         let n = d.len();
-        let off = read_datagram_header(&d).position as usize;
+        let off = read_datagram_header(&d).unwrap().position as usize;
         let len = recv
             .open_slice(T17_LEADER_ID, &mut d, n)
             .expect("the peer must open the sealed chunk under the pairwise session");
@@ -2744,7 +2744,7 @@ mod tests {
         assert!(!chunks.is_empty(), "fixture must produce cleartext chunks");
         let raw = t17_snapshot_bytes();
         let d = &chunks[0];
-        let off = read_datagram_header(d).position as usize;
+        let off = read_datagram_header(d).unwrap().position as usize;
         assert_eq!(
             &d[DATAGRAM_HEADER_LEN..],
             &raw[off..off + (d.len() - DATAGRAM_HEADER_LEN)],

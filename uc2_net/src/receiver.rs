@@ -247,10 +247,10 @@ fn consensus_event(h: &DatagramHeader, d: &[u8], from: SocketAddr) -> Option<Net
             Some(NetEvent::CommitGossip { from, term: h.leadership_term_id, commit: h.position })
         }
         DGRAM_KIND_REQUEST_VOTE if body.len() >= REQUEST_VOTE_BODY_LEN => {
-            Some(NetEvent::RequestVote { from, body: read_request_vote_body(body) })
+            Some(NetEvent::RequestVote { from, body: read_request_vote_body(body)? })
         }
         DGRAM_KIND_VOTE if body.len() >= VOTE_BODY_LEN => {
-            Some(NetEvent::Vote { from, body: read_vote_body(body) })
+            Some(NetEvent::Vote { from, body: read_vote_body(body)? })
         }
         DGRAM_KIND_TERM_MAP => {
             let mut out = [TermMapEntryWire { term: 0, base: 0 }; MAX_TERM_MAP_WIRE_ENTRIES];
@@ -1063,7 +1063,13 @@ impl FollowerReceiver {
             // whether crypto is on or off — no need to duplicate it here.
             return Some(n);
         }
-        let h = read_datagram_header(&buf[..n]);
+        // The `n < DATAGRAM_HEADER_LEN` pre-guard above already returned; the
+        // reader is total on `&[u8]` (M12d), so the `else` arm is belt and
+        // braces — a truncated datagram is admitted unchanged and dropped by
+        // `on_datagram`'s own malformed check, exactly as before.
+        let Some(h) = read_datagram_header(&buf[..n]) else {
+            return Some(n);
+        };
 
         // T11's temporary cleartext-SNAP allowance USED TO SIT HERE and was
         // DELETED by T17 (2026-07-29), which is what makes this comment worth
@@ -1232,7 +1238,12 @@ impl FollowerReceiver {
             self.stats.dropped_malformed.fetch_add(1, Relaxed);
             return;
         }
-        let h = read_datagram_header(d);
+        // The `d.len() < DATAGRAM_HEADER_LEN` pre-guard above already
+        // returned; belt and braces (M12d: the reader is total on `&[u8]`).
+        let Some(h) = read_datagram_header(d) else {
+            self.stats.dropped_malformed.fetch_add(1, Relaxed);
+            return;
+        };
         // Consensus kinds (5–11) are forwarded RAW to the consensus agent — no
         // data-plane term filter, since a higher-term RequestVote MUST reach
         // the SM. `DGRAM_KIND_COMMIT_POSITION` routes as `CommitGossip`; the
@@ -1409,8 +1420,8 @@ impl FollowerReceiver {
                 let body = &d[DATAGRAM_HEADER_LEN..];
                 if body.len() >= NAK_BODY_LEN
                     && let Some(route) = &self.sender_route
+                    && let Some(b) = read_nak_body(body)
                 {
-                    let b = read_nak_body(body);
                     let _ = route.try_send(CtrlMsg::Nak { from, position: b.position, length: b.length });
                 }
             }
@@ -1420,8 +1431,8 @@ impl FollowerReceiver {
                 let body = &d[DATAGRAM_HEADER_LEN..];
                 if body.len() >= STATUS_BODY_LEN
                     && let Some(route) = &self.sender_route
+                    && let Some(b) = read_status_body(body)
                 {
-                    let b = read_status_body(body);
                     let _ = route.try_send(CtrlMsg::Status {
                         from,
                         contiguous: b.contiguous_position,
@@ -1886,7 +1897,7 @@ mod tests {
             while Instant::now() < deadline {
                 if let Some((n, _)) = self.sock.recv_from(&mut buf).unwrap() {
                     return Some((
-                        read_datagram_header(&buf),
+                        read_datagram_header(&buf).unwrap(),
                         buf[DATAGRAM_HEADER_LEN..n].to_vec(),
                     ));
                 }
@@ -2023,7 +2034,7 @@ mod tests {
             if let Some((h, body)) = leader.recv()
                 && h.kind == DGRAM_KIND_NAK
             {
-                got_nak = Some(read_nak_body(&body));
+                got_nak = Some(read_nak_body(&body).unwrap());
             }
         }
         let nak = got_nak.unwrap();
@@ -2051,7 +2062,7 @@ mod tests {
             if let Some((h, body)) = leader.recv()
                 && h.kind == DGRAM_KIND_NAK
             {
-                let nak = read_nak_body(&body);
+                let nak = read_nak_body(&body).unwrap();
                 assert_eq!((nak.position, nak.length), (0, 192));
                 break;
             }
@@ -2110,7 +2121,7 @@ mod tests {
             if let Some((h, body)) = leader.recv()
                 && h.kind == DGRAM_KIND_STATUS
             {
-                let s = read_status_body(&body);
+                let s = read_status_body(&body).unwrap();
                 assert_eq!(s.contiguous_position, 96);
                 // durable 0 + capacity 65536 - contiguous 96
                 assert_eq!(s.receive_window, 65536 - 96);
@@ -2253,7 +2264,7 @@ mod tests {
             if let Some((h, body)) = leader_ep.recv()
                 && h.kind == DGRAM_KIND_STATUS
             {
-                let s = read_status_body(&body);
+                let s = read_status_body(&body).unwrap();
                 if s.contiguous_position == 8128 {
                     assert_eq!(s.receive_window, 32);
                     break;
@@ -3822,7 +3833,7 @@ mod tests {
         /// an order the test does not control, and dropping the ones that
         /// arrive early would make the test flaky rather than discriminating.
         fn await_raw(&mut self, r: &mut FollowerReceiver, kind: u8) -> Option<Vec<u8>> {
-            if let Some(i) = self.stash.iter().position(|d| read_datagram_header(d).kind == kind) {
+            if let Some(i) = self.stash.iter().position(|d| read_datagram_header(d).unwrap().kind == kind) {
                 return Some(self.stash.remove(i));
             }
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -3833,7 +3844,7 @@ mod tests {
                     if n < DATAGRAM_HEADER_LEN {
                         continue;
                     }
-                    if read_datagram_header(&buf[..n]).kind == kind {
+                    if read_datagram_header(&buf[..n]).unwrap().kind == kind {
                         return Some(buf[..n].to_vec());
                     }
                     self.stash.push(buf[..n].to_vec());
@@ -3888,7 +3899,7 @@ mod tests {
         peer.send_sealed_data(to, runs[1].0, &runs[1].1);
 
         let (nak_wire, nak_body) = peer.await_sealed(&mut r, DGRAM_KIND_NAK);
-        let nak = read_nak_body(&nak_body);
+        let nak = read_nak_body(&nak_body).unwrap();
         assert_eq!(nak.position, 0, "the follower NAKs from its contiguous frontier");
         let mut expect = vec![0u8; NAK_BODY_LEN];
         write_nak_body(&mut expect, &NakBody { position: nak.position, length: nak.length });
@@ -3903,7 +3914,7 @@ mod tests {
         );
 
         let (st_wire, st_body) = peer.await_sealed(&mut r, DGRAM_KIND_STATUS);
-        let status = read_status_body(&st_body);
+        let status = read_status_body(&st_body).unwrap();
         let mut expect = vec![0u8; STATUS_BODY_LEN];
         write_status_body(&mut expect, &status);
         assert!(

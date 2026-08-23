@@ -284,7 +284,7 @@ impl FakePeer {
     /// returned raw, or stashed if it is not `want`).
     fn poll_one(&mut self, want: Option<u8>, deadline: Instant) -> Option<Vec<u8>> {
         if let Some(w) = want
-            && let Some(i) = self.stash.iter().position(|d| read_datagram_header(d).kind == w)
+            && let Some(i) = self.stash.iter().position(|d| read_datagram_header(d).unwrap().kind == w)
         {
             return Some(self.stash.remove(i));
         }
@@ -295,7 +295,7 @@ impl FakePeer {
                     if n < DATAGRAM_HEADER_LEN {
                         continue;
                     }
-                    let h = read_datagram_header(&buf[..n]);
+                    let h = read_datagram_header(&buf[..n]).unwrap();
                     if matches!(h.kind, DGRAM_KIND_HS_INIT | DGRAM_KIND_HS_RESP) {
                         let now = self.transport.now_ns();
                         let acts = self.transport.on_handshake_message(
@@ -342,7 +342,7 @@ impl FakePeer {
         let mut d = self.poll_one(Some(DGRAM_KIND_REQUEST_VOTE), deadline)?;
         let n = d.len();
         let len = self.recv.open_slice(self.victim_id, &mut d, n).ok()?;
-        Some(read_request_vote_body(&d[DATAGRAM_HEADER_LEN..len]))
+        Some(read_request_vote_body(&d[DATAGRAM_HEADER_LEN..len]).unwrap())
     }
 
     /// Seal and send a genuine `VOTE` grant, returning the exact wire bytes
