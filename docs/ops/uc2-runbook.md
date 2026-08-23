@@ -32,12 +32,18 @@ path is kept because other documents and tooling cite it.
 
 - [Change cluster membership without downtime](../how-to/change-cluster-membership.md)
   — add, promote, demote, remove; resize; retire a leader; decommission and
-  replace hardware. *Was §6.*
+  replace hardware; **signed admin requests** (`--admin-key`,
+  `gen-admin-key`, the `auth_*`/`audit_failed` reason codes) and reading
+  `uc2ctl audit` (M12b, `v2.6.0`). *Was §6.*
 - [Encrypt traffic between nodes](../how-to/encrypt-node-traffic.md) — key
-  material, the flag-day rollout, health counters, and rotation. *Was §11.*
+  material, the flag-day rollout, health counters, and rotation; pair with
+  `[admin] auth = "hmac"` — see its "Known interaction with admin
+  authentication" section. *Was §11.*
 - [Upgrade a cluster](../how-to/upgrade-a-cluster.md) — a scripted flag-day
   binary upgrade (`scripts/uc2_flag_day.sh`), the traffic-stop prerequisite,
-  and a measured downtime number.
+  a measured downtime number, and (M12b) the `[crypto].enabled`/`[admin]`
+  config-choice note every M9–M11 `node.toml` needs before it starts on
+  `v2.6.0`+.
 
 ## Surviving failures
 
@@ -52,6 +58,11 @@ path is kept because other documents and tooling cite it.
 
 - [Diagnose a node that is not serving](../how-to/diagnose-a-node.md) — reading
   a live node's control page. *Was §3's procedural half.*
+- [Change cluster membership: read the audit log](../how-to/change-cluster-membership.md#read-the-audit-log)
+  — `uc2ctl audit --instance-dir D [--tail N] [--json]`, offline, works on a
+  stopped node too. Every admin decision (accepted, refused, retried) is
+  recorded here before its answer is published, including which key signed
+  it or `"filesystem"`/`"unverified"` when nothing did.
 - [Investigate a failed correctness run](../how-to/investigate-a-failed-run.md)
   — elle's two tiers, why their assertions invert, and the checklist after
   changing a proved kernel. *Was §9, §10.*

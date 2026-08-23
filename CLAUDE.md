@@ -108,6 +108,50 @@ acked-durability hole (fsync-on-seal) — see the gate doc
 `docs/how-to/back-up-a-cluster.md`, `recover-from-quorum-loss.md`,
 `upgrade-a-cluster.md`.
 
+**M12 ("adoptable cluster") is an umbrella of four sub-milestones — M12a
+gateway kit, M12b admin authn/audit, M12c packaging/publishing, M12d
+security posture — that tag together as `v2.6.0` once all four land** (spec
+`docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md`; gate doc
+`docs/benchmarks/uc2-m12-gate-2026-08-22.md`, filled in row by row as each
+sub-milestone lands, per the honest-failure protocol every prior milestone
+used). **M12a (gateway kit)** shipped the two-tier `RawStateMachine`/
+`StateMachine` contract, `Sessioned<S>` (exactly-once at the raw layer), and
+`uc2_gateway`/`uc2_remote` — a TCP edge (`Edge`) terminating a framed remote
+protocol on a node's host, relayed over the existing shmem `Engine`, plus a
+pipelined `RemoteClient`. None of it touches consensus, the wire protocol
+between nodes, or the cnc page.
+
+**M12b (admin authentication + audit) is merged on `uc2/m12b-admin-auth`
+(HEAD `cca681d`; gate doc row 4 PASS)**: HMAC-SHA256-signed admin requests
+(a new 64-byte cnc line, `CNC_OFF_ADMIN_AUTH = 3904`, within the existing
+reserved band — no wire-protocol bump), an append-only, `fsync`-per-record
+audit log (`<instance_dir>/audit.jsonl`, recorded before every admin
+answer), and two now-**explicit-choice** config sections: `[crypto].enabled`
+and `[admin]`. **Two new named startup refusals**: an absent `[crypto]`
+section (`ConfigError::CryptoChoiceRequired`) and an absent `[admin]`
+section (`ConfigError::AdminChoiceRequired`) — a `node.toml` from M9–M11
+refuses to start on `v2.6.0`+ until both are written (a per-host config
+edit, not a wire flag day; see `docs/how-to/upgrade-a-cluster.md`).
+`uc2ctl` gains `--admin-key/--admin-key-name/--admin-ttl-secs` on every
+mutating verb, plus `gen-admin-key PATH` (writes a fresh 0600, 32-byte key)
+and `audit --instance-dir D [--tail N] [--json]` (offline, reads
+`audit.jsonl` directly). Ruled deviation from the design sketch: **no
+`(seq, nonce)` replay ring** — the signed tag already covers `seq`, the
+consensus agent only ever acts on `seq > last_admin_seq`, and a restart
+resets that cursor but also re-randomizes `instance_id`, which the tag also
+covers, so a ring would never refuse anything those two checks do not
+already refuse (`expiry_ns` bounds the delay window instead). **Residual,
+stated everywhere it matters** (`README.md`, `docs/reference/configuration.md`,
+`docs/how-to/change-cluster-membership.md`,
+`docs/how-to/encrypt-node-traffic.md`): a follower forwards an
+authenticated admin request to the leader as a `ConfigProposal` (wire kind
+16) over the node-to-node UDP socket, not the admin band — with
+`[crypto].enabled = false` that plane is only membership-address-filtered,
+not authenticated, so `[admin] auth = "hmac"` authenticates cluster-wide
+only paired with `[crypto].enabled = true`. See the spec's §5 "As built"
+amendment for the full reason-code table (20–24) and every other as-built
+correction.
+
 **The v1 stack (an `openraft`-based design) has been retired** and its crates
 deleted — v2 owns consensus, elections, and transport directly. Do not
 reintroduce `openraft`, `quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client`

@@ -17,16 +17,19 @@ Every command in [Sub-commands](#sub-commands) below (`add-learner` through
 purely through the cnc page's admin request/response slots, and both
 `--instance-dir` and `--app-id` are checked against that live node.
 
-The four commands under [Offline commands](#offline-commands) are different in
+The six commands under [Offline commands](#offline-commands) are different in
 kind, not just in name: `backup`, `verify-backup`, and `restore` are
 filesystem-only and never touch a running node's cnc admin band at all (the
 node may be running throughout a `backup`, since it never talks to it);
 `force-single-member` takes the instance directory's exclusive `flock`
-directly and **refuses if a node is running**. None of the four accept
-`--app-id` in the same sense as the admin-band commands — `backup`/`restore`
-don't take it at all (there is nothing on disk to check it against),
-and `force-single-member` takes it purely as a typed confirmation guard, not
-as anything validated against a live node.
+directly and **refuses if a node is running**; `gen-admin-key` and `audit`
+(M12b, `v2.6.0`) are filesystem-only in the same sense as `backup` — `audit`
+even works against an instance directory that has never had a node in it
+yet, and `gen-admin-key` doesn't take `--instance-dir` at all, only a
+destination path. None of the six accept `--app-id` in the same sense as the
+admin-band commands — most don't take it at all (there is nothing on disk to
+check it against), and `force-single-member` takes it purely as a typed
+confirmation guard, not as anything validated against a live node.
 
 ## Synopsis
 
@@ -36,7 +39,7 @@ uc2ctl <COMMAND> --instance-dir <DIR> --app-id <ID> [command options]
 
 ## Common arguments
 
-Every sub-command takes both.
+Every admin-band sub-command takes both.
 
 **`--instance-dir <DIR>`**
 The node's on-disk instance directory — the same path passed to `Node::start`.
@@ -44,7 +47,28 @@ The node's on-disk instance directory — the same path passed to `Node::start`.
 
 **`--app-id <ID>`**
 Application identity. Must match the running node's `app_id`; the page open
-fails otherwise.
+fails otherwise. This is a wrong-cluster guard, not a credential — it is
+checked, but it proves nothing about who is asking.
+
+Every **mutating** admin-band command (`add-learner`, `promote`, `demote`,
+`remove-learner`, `remove-voter`) additionally takes (M12b, `v2.6.0`):
+
+**`--admin-key <PATH>`**
+Sign this request with a named admin HMAC key — a 32-byte, mode-`0600` key
+file (see [`gen-admin-key`](#gen-admin-key)). Required whenever the node's
+`[admin]` policy is `hmac`; omit to send an unsigned request (accepted
+unconditionally under the legacy `Filesystem`/`auth = "none"` policy, same as
+before M12b). See [Configuration](configuration.md#admin-authentication).
+
+**`--admin-key-name <NAME>`**
+The key's name as loaded into the node's `[admin].keys` list. Defaults to
+`--admin-key`'s file stem, so naming the file after the key (e.g.
+`ops-alice.key`) needs no separate flag.
+
+**`--admin-ttl-secs <N>`** (default `30`)
+How long the signature is valid for, counted from the moment `uc2ctl` signs
+it. The node refuses a request outside its own acceptance window with reason
+`auth_expired` (22).
 
 ## Sub-commands
 
@@ -109,10 +133,12 @@ Output fields:
 
 ## Offline commands
 
-`backup`, `verify-backup`, `restore` (M11 Task 2) and `force-single-member`
-(M11 Task 4). See [the offline-vs-admin-band distinction](#admin-band-commands-vs-offline-commands)
+`backup`, `verify-backup`, `restore` (M11 Task 2), `force-single-member`
+(M11 Task 4), and `gen-admin-key`/`audit` (M12b, `v2.6.0`). See
+[the offline-vs-admin-band distinction](#admin-band-commands-vs-offline-commands)
 above. Task walkthroughs: [Back up a cluster](../how-to/back-up-a-cluster.md),
-[Recover from quorum loss](../how-to/recover-from-quorum-loss.md).
+[Recover from quorum loss](../how-to/recover-from-quorum-loss.md),
+[Change cluster membership](../how-to/change-cluster-membership.md#if-the-cluster-requires-signed-admin-requests).
 
 ### `backup`
 
@@ -210,6 +236,50 @@ wipe-and-rejoin later as fresh learners; see
 [Recover from quorum loss](../how-to/recover-from-quorum-loss.md). A one-way
 door: there is no "undo" verb.
 
+### `gen-admin-key`
+
+M12b (`v2.6.0`): generate a fresh named admin HMAC key file — 32 random
+bytes, mode `0600` from the moment the file is created (no world-readable
+window), refuses to overwrite an existing file. OFFLINE — writes only the
+named file, no cnc admin-band interaction.
+
+```
+uc2ctl gen-admin-key <PATH>
+```
+
+Prints the `[admin]` snippet to paste into a node's config, naming the key
+after `<PATH>`'s file stem:
+
+```
+wrote /etc/uc2/admin/alice.key
+paste into the node's config file:
+[admin]
+keys = [{ name = "alice", key_path = "/etc/uc2/admin/alice.key" }]
+```
+
+### `audit`
+
+M12b (`v2.6.0`): print a node's admin audit log
+(`<instance_dir>/audit.jsonl`). OFFLINE — reads the file directly, no cnc
+admin-band interaction; works whether or not a node is currently running.
+
+```
+uc2ctl audit --instance-dir <DIR> [--tail <N>] [--json]
+```
+
+- `--tail <N>` — print only the last `N` records (default: the whole file).
+- `--json` — print each record's raw JSON line instead of the summarized,
+  human-readable form (`<ts>  <actor>  <origin>  <op_name>  <id>  <addr>
+  <outcome>(<reason>)  cfg=<version>`).
+
+A line the summarizer cannot make sense of — a torn write from a crash
+mid-record, or a hand-edited file — prints as-is prefixed `? ` rather than
+being dropped or panicking; the whole point of this file is to never lose a
+record silently. See
+[Change cluster membership](../how-to/change-cluster-membership.md#read-the-audit-log)
+and [Instance directory](instance-directory.md) for the file's durability
+class (`O_APPEND`, `fsync` per record, no rotation).
+
 ## Response statuses
 
 Mutating commands write an admin request and poll for the response line.
@@ -222,8 +292,13 @@ Mutating commands write an admin request and poll for the response line.
 
 ## Refusal reasons
 
-The `reason` field of a status-`1` response. These are the discriminants of
-`uc2_consensus::config::ProposeError`, which is the authoritative table.
+The `reason` field of a status-`1` response. Codes 1–10 and 12 are the
+discriminants of `uc2_consensus::config::ProposeError`; 11 is the node's own
+defensive catch-all; 20–24 (M12b, `v2.6.0`) are admin-authentication
+refusals (`uc2_node::REASON_AUTH_*` / `REASON_AUDIT_FAILED`) — produced only
+under `[admin] auth = "hmac"`, and disjoint from the `ProposeError` band so a
+caller can tell "the cluster refused this change" from "the cluster refused
+to believe this was you" without consulting the policy.
 
 | Code | Reason |
 |---|---|
@@ -239,6 +314,11 @@ The `reason` field of a status-`1` response. These are the discriminants of
 | 10 | `NotCaughtUp` — the learner is too far behind commit to promote safely |
 | 11 | malformed or unknown op — the node did not recognise the request |
 | 12 | `SelfDemote` — a leader cannot demote itself |
+| 20 | `auth_missing` — the node requires a signed request: pass `--admin-key` |
+| 21 | `auth_bad_tag` — wrong key, a stale auth line, or a tampered request |
+| 22 | `auth_expired` — the signature's window is past, or stretched implausibly far into the future; check clock skew |
+| 23 | `auth_unknown_key` — this key name is not in the node's `[admin].keys` |
+| 24 | `audit_failed` — the node could not record the request (a full or failing disk) and refused rather than act unaccountably; **not** "nothing happened" — check `uc2ctl status` |
 
 Code `0` is not a `ProposeError`. It is the CLI's own malformed-op sentinel.
 

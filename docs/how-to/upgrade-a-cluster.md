@@ -141,8 +141,56 @@ A number from a dev box or a small local run is a smoke test, not a bar — see
 The fleet-measured downtime bar for this script is a separate, pre-committed,
 user-approved step; this page states no number.
 
+## Config choices added in v2.6.0: `[crypto].enabled` and `[admin]`
+
+`v2.6.0` (M12b) made two sections of `node.toml` **explicit choices**
+(spec §3.3): `[crypto]` gained a required `enabled` key, and `[admin]`
+became a new required section. Absent means neither "off" nor "unchanged" —
+it is a named startup refusal:
+
+```
+uc2-node: [crypto] section is required: set enabled = false for cleartext (the default posture) or enabled = true with key_path/allowlist_path
+uc2-node: [admin] section is required: auth = "hmac" with keys = [...] or auth = "none" (filesystem access is the boundary)
+```
+
+**A `node.toml` written for M9–M11 refuses to start on `v2.6.0`+ until both
+are added.** This is not a wire flag day — it changes nothing about the wire
+protocol, the cnc page, or what any *other* node sees — so it does not by
+itself need the whole cluster stopped together the way
+[wire crypto](encrypt-node-traffic.md) or a
+[binary upgrade past 0.5.0](#why-this-is-a-flag-day-not-a-rolling-restart)
+does. It is a **per-host config edit**, done once before that host's binary
+swap. In practice, run it during the same maintenance window as
+`scripts/uc2_flag_day.sh` anyway — you are already touching every
+`node.toml` to install the new binary, and there is no reason to make two
+separate passes over the fleet.
+
+Paste this into every `node.toml` to keep today's posture unchanged (the
+same posture every pre-`v2.6.0` `node.toml` had implicitly):
+
+```toml
+[crypto]
+enabled = false
+
+[admin]
+auth = "none"
+```
+
+If you want the new HMAC admin authentication instead of the `auth = "none"`
+boot warning, see
+[Change cluster membership: if the cluster requires signed admin requests](change-cluster-membership.md#if-the-cluster-requires-signed-admin-requests) —
+generate a key with `uc2ctl gen-admin-key` first, since the config needs the
+key's path before the node will start with `auth = "hmac"`.
+
+`packaging/node.example.toml` ships both sections uncommented, annotated
+with the posture each choice implies — diff your fleet's config against it
+to confirm nothing was missed.
+
 ## Where to go next
 
+- [Configuration: Admin authentication](../reference/configuration.md#admin-authentication)
+  — the full `[admin]` key table and the `[crypto]` pairing this section's
+  config choices depend on.
 - [Run a cluster on real hosts](run-a-cluster.md#what-a-planned-restart-costs)
   — what an ordinary single-node planned restart costs, for context against a
   whole-cluster flag day.

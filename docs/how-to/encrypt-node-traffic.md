@@ -52,8 +52,20 @@ For the file formats, see [Configuration](../reference/configuration.md#crypto-m
 1. Distribute the allowlist to every node, and each private key to its own node.
 2. Stop the cluster. A rolling flip runs split-brain until the last node flips,
    so a coordinated restart is the simpler and supported path.
-3. Restart every node with `crypto: CryptoConfig::Enabled { key_path,
-   allowlist_path, rotation: RotationPolicy::default() }`.
+3. Restart every node with crypto turned on. In `node.toml` (since `v2.6.0`,
+   `[crypto].enabled` is a required, explicit choice — see
+   [Configuration](../reference/configuration.md#startup-refusals)):
+
+   ```toml
+   [crypto]
+   enabled = true
+   key_path = "/etc/uc2/node.key"
+   allowlist_path = "/etc/uc2/allowlist.toml"
+   ```
+
+   Building a `NodeConfig` directly (library callers, tests): `crypto:
+   CryptoConfig::Enabled { key_path, allowlist_path, rotation:
+   RotationPolicy::default() }`.
 4. Confirm the leader minted a group epoch, and that the drop counters are
    quiet.
 
@@ -103,6 +115,18 @@ accordingly.
 
 The cnc page version is unchanged, so service and client IPC compatibility is
 unaffected.
+
+## Known interaction with admin authentication
+
+If the cluster also uses `[admin] auth = "hmac"` (M12b, `v2.6.0` — see
+[Change cluster membership](change-cluster-membership.md#if-the-cluster-requires-signed-admin-requests)),
+turn wire crypto on too. A follower forwards an authenticated admin request
+to the leader as a `ConfigProposal` datagram (wire kind 16) over this same
+node-to-node UDP socket, not the admin band — with crypto off, that plane
+trusts whichever address a datagram claims to be from (the leader drops
+datagrams from addresses outside the current membership, but does not
+authenticate the sender). Signed admin requests only authenticate
+cluster-wide once `[crypto].enabled = true` is also set.
 
 ## Known interaction with reconfiguration
 

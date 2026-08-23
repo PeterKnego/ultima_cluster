@@ -218,7 +218,13 @@ RAM-backed filesystems).
 What is shipped, release by release — each feature with a link to its
 detailed doc — lives in **[RELEASES.md](/RELEASES.md)**. Standing limits:
 hard cap **8 total members** (voters + learners); one node per instance
-directory; wire crypto and journal purge are **off by default**.
+directory; wire crypto and journal purge are **off by default**. Since
+`v2.6.0`, admin operations (add/remove/promote/demote membership) require a
+signed HMAC request unless `[admin] auth = "none"` — and that signature only
+authenticates cluster-wide when paired with `[crypto].enabled = true` (a
+follower forwards an authenticated request to the leader over the same
+node-to-node UDP socket wire crypto protects); see
+[Configuration: Admin authentication](/docs/reference/configuration.md#admin-authentication).
 
 ## License
 

@@ -22,6 +22,88 @@ cargo install --path uc2ctl
 For every sub-command, argument and refusal code, see
 [`uc2ctl`](../reference/uc2ctl.md).
 
+## If the cluster requires signed admin requests
+
+Since `v2.6.0` a node's `[admin]` section (see
+[Configuration](../reference/configuration.md#admin-authentication)) says
+whether it accepts unsigned requests at all. Under `auth = "hmac"`, every
+mutating verb (`add-learner`, `promote`, `demote`, `remove-learner`,
+`remove-voter`) needs a signed request or the node refuses it with
+`auth_missing`; `status` and the offline verbs (`backup`, `verify-backup`,
+`restore`, `force-single-member`) never need a key.
+
+Generate a key once per operator:
+
+```bash
+uc2ctl gen-admin-key /etc/uc2/admin/alice.key
+```
+
+This writes 32 random bytes at mode `0600` (refuses to overwrite an existing
+file) and prints the exact `[admin]` snippet to paste into every node's
+config that should accept it — the key name defaults to the file's stem
+(`alice`), and it must match across every node that should honor this key.
+
+Pass it on every mutating command:
+
+```bash
+uc2ctl add-learner --instance-dir D --app-id A --id 4 --addr 10.0.0.14:9100 \
+  --admin-key /etc/uc2/admin/alice.key
+```
+
+Three admin flags, common to every mutating command:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--admin-key PATH` | none (unsigned request) | sign this request under the named key |
+| `--admin-key-name NAME` | `--admin-key`'s file stem | the key's name as loaded into the node's `[admin].keys` |
+| `--admin-ttl-secs N` | `30` | how long the signature stays valid, counted from the moment `uc2ctl` signs it |
+
+A bad key file (missing, wrong length, group/world-readable) is caught
+before anything is written to the node's admin band — nothing is sent, and
+the error names the path and points back at `gen-admin-key`.
+
+**Pair `[admin] auth = "hmac"` with `[crypto].enabled = true`.** A follower
+that authenticates a request locally forwards it to the leader over the
+node-to-node UDP socket (wire kind 16, `ConfigProposal`), not the admin
+band — with `[crypto].enabled = false` that plane trusts whichever address
+a datagram claims to be from (the leader drops datagrams from addresses
+outside the current membership, but a network-path adversary can spoof a
+member's address). Signed admin requests only authenticate cluster-wide once
+wire crypto is also on; see [Encrypt traffic between nodes](encrypt-node-traffic.md).
+
+If a request is refused for an auth reason, `uc2ctl` prints one of:
+
+| Reason | What it means |
+|---|---|
+| `auth_missing` (20) | the node requires a signed request; pass `--admin-key` |
+| `auth_bad_tag` (21) | wrong key, a stale/cleared auth line, or a tampered request |
+| `auth_expired` (22) | the signature's window has passed, or was stretched implausibly far into the future — check clock skew between `uc2ctl` and the node |
+| `auth_unknown_key` (23) | this key name is not in the node's `[admin].keys` |
+| `audit_failed` (24) | the node could not record the request to `audit.jsonl` (a full or failing disk) and refused rather than act unaccountably — **this does not mean nothing happened**: on the leader's accepted path the change may already be appended; check `uc2ctl status` |
+
+## Read the audit log
+
+Every admin request a node answers — accepted, refused, or retried — is
+recorded to `<instance_dir>/audit.jsonl` before the answer is published, so
+the log is never behind what an operator actually saw:
+
+```bash
+uc2ctl audit --instance-dir D
+```
+
+```
+1755600000000000000  ops-alice  local  add_learner  4  10.0.0.14:9100  accepted(0)  cfg=7
+```
+
+`--tail N` shows only the last `N` records; `--json` prints the raw line
+instead of the summarized form. `audit` is offline — it reads the file
+directly, works whether or not a node is running, and needs no `--app-id` or
+key. A line this small parser cannot make sense of (a torn write from a
+crash mid-record, say) prints as-is with a leading `?` rather than being
+dropped. See [Instance directory](../reference/instance-directory.md) for
+the file's durability class and [Monitor a cluster](monitor-a-cluster.md)
+for the same event mirrored to the structured-log sink.
+
 ## Before you start: pair with snapshots if you write continuously
 
 A fresh learner catching up purely by log replay can be outrun indefinitely by

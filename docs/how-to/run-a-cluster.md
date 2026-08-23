@@ -48,7 +48,23 @@ addr = "10.0.0.11:9100"
 [[members]]
 id = 2
 addr = "10.0.0.12:9100"
+
+[crypto]
+enabled = false
+
+[admin]
+auth = "none"
 ```
+
+`[crypto]` and `[admin]` are required sections since `v2.6.0` — an absent
+one is a named startup refusal, not "off" by omission. The values above are
+the cleartext / filesystem-boundary posture every release before `v2.6.0`
+had implicitly; see
+[Encrypt traffic between nodes](encrypt-node-traffic.md) and
+[Change cluster membership](change-cluster-membership.md#if-the-cluster-requires-signed-admin-requests)
+to turn either on, and
+[Configuration: Admin authentication](../reference/configuration.md#admin-authentication)
+for the full `[admin]` key table.
 
 [`packaging/node.example.toml`](../../packaging/node.example.toml) is the
 annotated reference copy — every optional field with its default shown — and a

@@ -325,6 +325,107 @@ durably anywhere.
 
 ## 5. M12b — Admin authentication, audit, explicit-choice config
 
+> **As built (M12b).** M12b shipped as Tasks 1–7 on `uc2/m12b-admin-auth`
+> (HEAD `cca681d`); `docs/benchmarks/uc2-m12-gate-2026-08-22.md` row 4 and
+> its "M12b facts" section are the acceptance-gate record. The amendments
+> below correct this section's sketch against what actually shipped;
+> §5.1/§5.3/§5.4's prose is otherwise as written. Names below match code
+> exactly: `AdminAuth`, `AdminKey`, `AdminPolicy`, `AdminMessage`, `sign`/
+> `verify` (`uc2_crypto::admin`); `StartOpts`, `Node::start_with`,
+> `REASON_AUTH_*`/`REASON_AUDIT_FAILED`, `verify_admin`, `handle_admin`
+> (`uc2_node::node`); `AuditLog`/`AuditRecord`/`AuditOutcome`/`AuditOrigin`
+> (`uc2_node::audit`); `AdminSection`/`AdminKeyEntry`/`AdminAuthMode`,
+> `ConfigError::{CryptoChoiceRequired, AdminChoiceRequired}`
+> (`uc2_node::config_file`).
+>
+> **§5.2 deviation, ruled: no `(seq, nonce)` replay ring.** The sketch below
+> proposed one; the shipped design refuses it on the same grounds without
+> one. The 64-byte auth line's tag already covers `seq`
+> (`AdminMessage::canonical_bytes`), and the consensus agent's
+> `handle_admin` only ever reads the admin-req slot when its `seq` is
+> greater than `last_admin_seq` (`read_admin_req(self.last_admin_seq)`), so
+> a captured request can never be re-presented at its original `seq` — it
+> is never even read a second time — and re-presenting it at a higher `seq`
+> changes the canonical bytes the tag was computed over, which fails
+> `verify`. A node restart resets `last_admin_seq` to 0, which looks like it
+> reopens the window, but the tag also covers `instance_id`
+> (`CncPage::meta().instance_id`), which is re-randomized on every restart
+> — so a pre-restart capture cannot be replayed post-restart either. A ring
+> would therefore never refuse anything these two checks (the seqlock
+> cursor, plus `instance_id` in the signed bytes) do not already refuse;
+> what remains genuinely unbounded without a ring is the *delay* window for
+> a live, correctly-sequenced, never-yet-applied request, and `expiry_ns`
+> (checked against `now` with a `2 * ttl` upper bound too, so a
+> forward-dated expiry cannot extend the window either) is what bounds
+> that. Test: `uc2_node/tests/admin_auth.rs::a_replayed_request_cannot_be_re_presented`
+> captures a signed request's exact bytes, replays them verbatim after a
+> subsequent request has advanced `seq`, and asserts no second effect and
+> no second audit record.
+>
+> **§5.2 reason codes, as shipped** (`uc2_node::node`, disjoint from
+> `uc2_consensus::config::ProposeError`'s 1–10/12 and the node's own
+> `REASON_MALFORMED_OP = 11`): `REASON_AUTH_MISSING = 20` (the auth line was
+> all-zero — an unsigned request against an `Hmac` policy), `REASON_AUTH_BAD_TAG
+> = 21` (a known key, but the HMAC does not verify — wrong key, tampering,
+> or a stale auth line uc2ctl failed to clear), `REASON_AUTH_EXPIRED = 22`
+> (`expiry_ns <= now`, or `expiry_ns > now + 2 * ttl`), `REASON_AUTH_UNKNOWN_KEY
+> = 23` (`key_name_hash` matches no loaded key). The sketch's
+> `auth_replay`/`auth_unconfigured` names do not exist — replay is refused
+> by the no-ring argument above (folding into `auth_bad_tag`/`auth_missing`
+> depending on what changed), and there is no "unconfigured" case distinct
+> from `Filesystem` (which reads the auth line at all only under `Hmac`).
+> One further code the sketch did not anticipate: `REASON_AUDIT_FAILED = 24`
+> — the audit record could not be written (a full or failing disk), so the
+> request is refused rather than answered unrecorded, even on the accepted
+> path where the config change may already be appended (`uc2_node::audit`'s
+> module doc: "accepted" means proposed and appended, not committed;
+> "recorded" means "the record reached disk before the answer did," and 24
+> is what happens when it cannot).
+>
+> **§5.2, verify-first on leader AND follower; the kind-16 residual.**
+> `handle_admin` calls `verify_admin` before any role check — a follower
+> never forwards an unauthenticated proposal, matching the sketch. What the
+> sketch's "the peer plane's trust is whatever `[crypto]` says, as today"
+> undersold: the forwarded `ConfigProposal` (kind 16) rides that peer plane
+> by wire, not the admin band, so the leader cannot re-verify the
+> operator's HMAC tag against it — it can only attest to which peer
+> forwarded it (`peer:<id>`, from `addr_to_id`). `on_config_proposal`'s
+> membership guard drops a kind-16 datagram whose source address resolves
+> to no current member before any work runs (mitigation shipped, M12b
+> review), but with `[crypto].enabled = false` a network-path adversary
+> able to spoof a member's UDP source address can still inject a proposal.
+> **`[admin] auth = "hmac"` authenticates cluster-wide only paired with
+> `[crypto].enabled = true`** — stated in
+> `docs/reference/configuration.md#admin-authentication`,
+> `docs/how-to/change-cluster-membership.md`, and
+> `docs/how-to/encrypt-node-traffic.md`.
+>
+> **§5.3, the shipped record shape** differs from the sketch's `args{id,
+> addr}` — the actual fields are flat, matching `uc2_node::audit::AuditRecord`:
+> `{ts_ns, event:"admin_op", actor, origin, op, op_name, id, addr, seq,
+> nonce, outcome, reason, config_version}`. `addr` is `null` for ops that
+> carry no address (`promote`/`demote`/`remove-*`); `actor` is the signing
+> key's name under `Hmac`, `"filesystem"` under `Filesystem`
+> (`ACTOR_UNVERIFIED = "unverified"` — not `"filesystem"` — when
+> authentication itself failed, since neither the claimed key name nor
+> `"filesystem"` would be honest there), or `"peer:<id>"` for a leader
+> recording a peer-forwarded proposal. `seq` is `0` on a leader's
+> `forwarded`-origin record (the requesting node's admin-band `seq` is
+> local to it and the wire proposal does not carry it; `nonce` is the join
+> key between the two nodes' records for the same change).
+>
+> **`AdminPolicy` is not a `NodeConfig` field.** It lives on a new
+> `StartOpts { socket: Option<UdpSocket>, admin: AdminPolicy }`, passed to
+> the one real constructor `Node::start_with(cfg, opts)` — both fields are
+> live process resources (a bound socket; loaded key material), not values
+> a `Clone`-able, TOML-mirroring config struct should carry. `Node::start`
+> and `Node::start_with_socket` are thin wrappers that pass
+> `StartOpts::default()`, whose `admin` is `AdminPolicy::Filesystem` — the
+> pre-M12b posture, unchanged for every library caller (in-process tests,
+> gates, harnesses). Only the `uc2-node` daemon binary
+> (`uc2_node/src/bin/uc2-node.rs`) builds a live `AdminPolicy` from
+> `[admin]` and calls `Node::start_with` directly.
+
 ### 5.1 Credential
 
 ```toml

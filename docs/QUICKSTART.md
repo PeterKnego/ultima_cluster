@@ -121,12 +121,25 @@ addr = "127.0.0.1:19002"
 [[members]]
 id = 2
 addr = "127.0.0.1:19003"
+
+[crypto]
+enabled = false
+
+[admin]
+auth = "none"
 EOF
 done
 ```
 
 Note `bind` and this node's own `members` entry are the identical address. That
 is a rule, not a coincidence — `uc2-node` refuses to start if they disagree.
+
+`[crypto]` and `[admin]` are required sections — an absent one is a startup
+refusal naming it, not "off" by default. `enabled = false` / `auth = "none"`
+is cleartext node-to-node traffic and filesystem-boundary admin access: the
+same posture every release before `v2.6.0` had implicitly, and fine for this
+walkthrough. See [Run a cluster on real hosts](/docs/how-to/run-a-cluster.md)
+for what to change before a real deployment.
 
 **Start the three nodes**, one per terminal:
 

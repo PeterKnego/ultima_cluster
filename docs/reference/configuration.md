@@ -29,7 +29,7 @@ Field names match the `NodeConfig` fields below. Three differ in shape:
 |---|---|
 | `[[members]]` / `[[learners]]` tables of `id` + `addr` | `Vec<(NodeId, SocketAddr)>` |
 | `[purge]` with `below_snapshot_slack_bytes` — absent means disabled | `PurgePolicy` |
-| `[crypto]` with `key_path`, `allowlist_path`, optional `rotation_interval_ns` / `rotation_bytes` — absent means cleartext | `CryptoConfig` |
+| `[crypto]` with `enabled` (required), `key_path`, `allowlist_path`, optional `rotation_interval_ns` / `rotation_bytes` | `CryptoConfig` |
 
 Two keys exist only in the file and have no `NodeConfig` field:
 
@@ -38,6 +38,10 @@ across nodes make every member time out at the same instant and split the vote.
 
 **`allow_volatile_fs`** — optional, default `false`. Test and development only;
 see [startup refusals](#startup-refusals).
+
+**`[admin]`** has no `NodeConfig` field at all — see
+[Admin authentication](#admin-authentication) below for why it lives on
+`StartOpts` instead.
 
 ### `[log]` and `[metrics]`
 
@@ -89,6 +93,8 @@ replaces:
 | `election_timeout_min_ns` < `election_timeout_max_ns` | An empty randomisation window. |
 | `log.level` must be `"error"`, `"warn"`, or `"info"` | A silently-ignored typo picking the wrong verbosity. |
 | unknown keys inside `[log]`/`[metrics]` are refused, by name, like every other section | M9 accepted anything inside these two sections unvalidated; M10 defines their schema, so a typo there is now caught the same way as everywhere else. |
+| `[crypto]` section must be present | M12b (spec §3.3): `enabled` is an **explicit choice**, not absent-means-off like `[purge]` — an absent section is `ConfigError::CryptoChoiceRequired`, so a `node.toml` cannot silently run cleartext by omission. `enabled = false` must not also carry `key_path`/`allowlist_path`; `enabled = true` requires both. |
+| `[admin]` section must be present | M12b (spec §3.3, §5.1): `auth` is likewise an explicit choice — an absent section is `ConfigError::AdminChoiceRequired`. `auth = "hmac"` requires at least one uniquely-named entry in `keys`; `auth = "none"` requires `keys` to be empty; `request_ttl_ms` (default 30000) must be `>= 1000` under either mode. |
 
 The RAM-backed-filesystem refusal has two override channels, and **neither is
 silent** — the override suppresses the refusal, never the notice, and the
@@ -166,8 +172,13 @@ Journal purge policy. Default `PurgePolicy::Disabled`. The enabled form is
 To turn it on, see [Keep the journal from growing without bound](../how-to/bound-journal-growth.md).
 
 **`crypto: CryptoConfig`**
-Node-to-node wire crypto. Default `CryptoConfig::Disabled`. The enabled form
-carries the private key path and the allowlist path.
+Node-to-node wire crypto. `NodeConfig`'s own default is `CryptoConfig::Disabled`
+(library callers who build a `NodeConfig` directly, e.g. tests and harnesses,
+still get this), but the TOML loader has no default of its own — `[crypto]`
+is a required section (see [startup refusals](#startup-refusals) above) — and
+the daemon prints nothing extra either way, unlike `[admin]`'s `auth = "none"`
+boot warning. The enabled form carries the private key path and the allowlist
+path.
 To turn it on, see [Encrypt traffic between nodes](../how-to/encrypt-node-traffic.md).
 
 **`faults: FaultConfig`**
@@ -202,6 +213,68 @@ With `CryptoConfig` enabled, a node reads two files:
 
 The allowlist is re-read at runtime, rate-limited to once per second, so a
 joining member's key can be added without a restart.
+
+## Admin authentication
+
+M12b (`v2.6.0`): who may change cluster membership through `uc2ctl`. Full
+walkthrough: [Change cluster membership](../how-to/change-cluster-membership.md).
+Wire layout and reason-code table: `docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md`
+§5's "As built" amendment.
+
+`[admin]` is required, like `[crypto]` — an absent section refuses to start.
+It has no `NodeConfig` field: `uc2-node`'s `main` (`uc2_node/src/bin/uc2-node.rs`)
+is the one place that turns `[admin]` into a live `AdminPolicy` and hands it
+to `Node::start_with(cfg, StartOpts { socket: None, admin })`. `StartOpts`
+carries `admin: AdminPolicy` and (separately) an optional pre-bound `socket`
+— both are live process resources, not values a `Clone`-able config struct
+should carry around. Library callers (`Node::start`, `Node::start_with_socket`)
+get `StartOpts::default()`, which is `AdminPolicy::Filesystem` — the pre-M12b
+posture, byte-for-byte, so in-process tests and harnesses that never touch
+`[admin]` are unaffected.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `auth` | — (required) | `"hmac"` — every mutating admin request must carry a valid signature; or `"none"` — instance-directory file permissions are the only boundary, the pre-`v2.6.0` posture. |
+| `keys` | `[]` | `[{ name, key_path }]`, one entry per admin key this node accepts. Required (≥ 1, unique `name`s) under `auth = "hmac"`; must be empty under `auth = "none"`. |
+| `request_ttl_ms` | `30000` | How long a signed request's `expiry_ns` window may extend from the moment `uc2ctl` signs it. Must be `>= 1000` under either mode. |
+
+**Key file rule** (shared with `[crypto]`'s key material,
+`uc2_crypto::admin::check_key_file_perms`): exactly 32 bytes, mode `0600` —
+any group or world permission bit is a startup refusal (`uc2-node`) or a
+command refusal (`uc2ctl`) naming the path. Generate one with:
+
+```bash
+uc2ctl gen-admin-key /etc/uc2/admin/alice.key
+```
+
+which writes 32 random bytes at mode `0600` from the moment the file is
+created (no world-readable window) and refuses to overwrite an existing file.
+
+**`app_id` is a wrong-cluster guard, not a credential.** `uc2ctl` (and every
+IPC attach) checks it against the running node's `app_id` so a request aimed
+at the wrong cluster reads as "wrong cluster" rather than a confusing
+mid-protocol error — it proves nothing about who is asking, and it is not a
+substitute for `[admin]`.
+
+**`auth = "none"` prints a boot-time warning on every start** (never
+silenced, same convention as the volatile-filesystem override):
+
+```
+uc2-node: WARNING: [admin] auth = "none" — anyone who can write the instance directory can change cluster membership
+```
+
+**Residual: the kind-16 peer plane is trusted to `[crypto]`.** A follower
+that authenticates an admin request locally forwards it to the leader as a
+`ConfigProposal` (wire kind 16) over the node-to-node UDP socket, not the
+admin band — the leader cannot re-verify the operator's HMAC signature
+against that datagram (the canonical message is bound to the *requesting*
+node's cnc page), so what it records is which peer vouched for the change
+(`peer:<id>`). The leader drops a kind-16 datagram whose source address
+resolves to no current member (`on_config_proposal`'s membership guard,
+`uc2_node::node`) before any work runs, but with `[crypto].enabled = false`
+a network-path adversary who can spoof a member's UDP source address can
+still inject a proposal onto that plane. **`[admin] auth = "hmac"` only
+authenticates cluster-wide when paired with `[crypto].enabled = true`.**
 
 ## Cluster limits
 
