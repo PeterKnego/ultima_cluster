@@ -1,0 +1,567 @@
+# M12d — Security Posture and the Review-Ready Package: Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Make UC v2 *disclosable*: every place untrusted bytes are parsed is fuzzed nightly and total on `&[u8]`; the threat model, attack surface and a self-assessment live in the tree; the README states the security posture and the product limits in its own words; and the `v2.6.0` release writeup is prepared (tag and push stay user steps).
+
+**Architecture:** A `fuzz/` crate (`cargo-fuzz`, libFuzzer, nightly, excluded from the workspace) with one target per decoder family, each seeded from the real encoders, with the corpus committed. Product code changes are confined to (a) making the caller-guarded `uc_protocol::v2` readers total (`Option`), (b) exposing three pure seams that were only reachable through I/O (`parse_str` for both TOML configs, `obs::http::route`), and (c) nothing else on any hot path. Docs are the deliverable of the milestone; the external review is a separate, user-scheduled step.
+
+**Tech Stack:** Rust 1.96.0 stable (pinned) for the workspace; `cargo-fuzz 0.13.2` + `libfuzzer-sys` on the rustup `nightly` toolchain for `fuzz/`; Miri (nightly) attempted; GitHub Actions (`nightly.yml`).
+
+**Spec:** `docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md` §7 (M12d), §8 (gate rows 8–10), §2 (non-goals), and production-readiness `docs/superpowers/specs/2026-08-19-uc2-production-readiness-design.md` §7 ("The security posture moves into the README's own words") + §9 (product limits).
+
+## Global Constraints
+
+- **No consensus change; no wire-protocol change; no cnc layout change outside the reserved band `3904..4096`; no new remote-admin surface; no TLS on the remote link; no remote ingress in the node** (spec §2). M12d adds no feature — it adds totality, tests, and words.
+- **Hot paths untouched in cost**: a reader that becomes total (`Option`) may add one length compare, nothing else; no allocation, no copying. `uc2_net`/`uc2_log`/`uc2_service` callers keep their existing guards (belt and braces) — do not remove a caller's guard because the callee is now total.
+- **`fuzz/` is outside the workspace** (`[workspace] exclude = ["fuzz"]`) — the workspace stays on stable 1.96.0 and MSRV 1.89; `fuzz/` builds only with `cargo +nightly fuzz`. Nothing under `fuzz/` is published; `fuzz/Cargo.toml` has `publish = false`.
+- **Nightly job budget**: ~10 min per target (`-max_total_time=600`), targets grouped into matrix jobs of ≤4, each job `timeout-minutes: 60`; the **corpus is committed** under `fuzz/corpus/<target>/`; a crash artifact is uploaded with `actions/upload-artifact@v4` and fails the job.
+- **Miri is attempted, not promised** (spec §7): the rings are file-`mmap`-backed and Miri cannot map them (probed 2026-08-23: `open` unsupported under isolation; file-backed `mmap` unsupported regardless) — the job runs Miri over the pure `uc_protocol::v2` decoders and `cnc` accessors, and the record says exactly what was and was not run.
+- **Honest gate rows**: row 8 PASS only on a green nightly `fuzz` job; row 9 PASS when the three docs exist and the README section is in; row 10 stays **pending** (user-scheduled external review) — never written as PASS by this plan.
+- **Conventions**: SPDX header on every new Rust file and script; `#!/usr/bin/env bash` + `set -euo pipefail`; never write under `/tmp` (RAM tmpfs) — fuzz artifacts/corpora live under the repo (`fuzz/corpus`, `fuzz/artifacts` git-ignored); plan-wide commit prefix `m12d`.
+- **Naming**: fuzz targets are named `<crate>_<seam>` (`uc_protocol_datagram`, `uc_protocol_log_frame`, `uc_protocol_cnc`, `uc2_remote_frame`, `uc2_crypto_open`, `uc2_crypto_handshake`, `uc2_crypto_group_key`, `uc2_crypto_admin`, `ultima_journal_record`, `ultima_journal_stable_value`, `uc2_service_session`, `uc2_node_toml`, `uc2_gateway_toml`, `uc2_node_http`); the nightly job is `fuzz`; the docs are `docs/security/threat-model.md`, `docs/security/attack-surface.md`, `docs/security/self-assessment.md`, `SECURITY.md` (repo root).
+- **Release docs rule** (CLAUDE.md): the `v2.6.0` writeup — new section atop `RELEASES.md`, `docs/releases.md` entry, QUICKSTART/how-to/reference sweep, explainer notes — is prepared in Task 6 **before** any tag; the tag and push are the user's.
+
+---
+
+## File structure
+
+| Path | Responsibility |
+|---|---|
+| `Cargo.toml` (root) | `[workspace] exclude = ["fuzz"]` |
+| `fuzz/Cargo.toml`, `fuzz/README.md`, `fuzz/.gitignore` | the cargo-fuzz crate (`publish = false`), its own `[workspace]`, path deps on the workspace crates; README = how to run/seed/minimise; ignore `artifacts/`, `target/` |
+| `fuzz/fuzz_targets/*.rs` | one file per target (names above) |
+| `fuzz/corpus/<target>/` | committed seed corpora, generated by `fuzz/src/seeds.rs` (`cargo +nightly run -p uc2-fuzz --bin seed-corpus`) |
+| `fuzz/src/lib.rs`, `fuzz/src/seeds.rs`, `fuzz/src/bin/seed_corpus.rs` | shared helpers (a no-op `RawStateMachine`, byte-splitting helpers) and the deterministic seed generator |
+| `scripts/fuzz_smoke.sh` | runs every target for `N` seconds (default 30) on the committed corpus; exit non-zero on any crash; used locally and by the job's "corpus replay" step |
+| `uc_protocol/src/v2/datagram.rs`, `frame.rs`, `cnc.rs` | readers made total (`Option`) — see Task 1 table |
+| `uc2_net/src/receiver.rs` (+ any other caller) | adapt to the `Option` readers (keep the existing length guards) |
+| `uc2_node/src/config_file.rs`, `uc2_gateway/src/config_file.rs` | `pub fn parse_str(text: &str) -> Result<…>` (the pure inner of `load_from_path`) |
+| `uc2_node/src/obs/http.rs` | `#[cfg(any(test, fuzzing))] pub fn route_raw(buf: &[u8], sources: &ObsSources) -> (u16, &'static str, String)` (thin pub wrapper over the private `route`) + `ObsSources` constructible from test values (check what it holds; if it already is, nothing to add) |
+| `.github/workflows/nightly.yml` | new `fuzz` job (matrix groups) + a `miri` step/job |
+| `docs/security/threat-model.md`, `attack-surface.md`, `self-assessment.md`, `SECURITY.md` | the review-ready package |
+| `README.md` | new **Security posture** section; **Scope** rewritten as Scope/limits |
+| `docs/VERIFICATION.md` | new "§7b Fuzzing" (or renumbered) section + §10 updated |
+| `docs/benchmarks/uc2-m12-gate-2026-08-22.md` | rows 8/9/10 + facts |
+| `docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md` | "As built (M12d)" amendment |
+| `CLAUDE.md` | M12d paragraph; `fuzz/` mentioned in Build & Test |
+| `RELEASES.md`, `docs/releases.md`, `docs/notes/*.md` | Task 6 — the `v2.6.0` writeup, prepared |
+
+---
+
+### Task 1: `fuzz/` crate scaffold + `uc_protocol` datagram readers made total + first target
+
+**Files:**
+- Modify: `Cargo.toml` (root `[workspace]`: add `exclude = ["fuzz"]`)
+- Create: `fuzz/Cargo.toml`, `fuzz/.gitignore`, `fuzz/README.md`, `fuzz/src/lib.rs`, `fuzz/src/seeds.rs`, `fuzz/src/bin/seed_corpus.rs`, `fuzz/fuzz_targets/uc_protocol_datagram.rs`, `fuzz/corpus/uc_protocol_datagram/*`
+- Create: `scripts/fuzz_smoke.sh`
+- Modify: `uc_protocol/src/v2/datagram.rs` — `read_datagram_header`, `read_request_vote_body`, `read_vote_body`, `read_nak_body`, `read_status_body` return `Option<…>`; `uc2_net/src/receiver.rs` (+ any other caller found by `cargo build --workspace`) adapt
+- Test: `uc_protocol/src/v2/datagram.rs` unit tests (short-input → `None`), the fuzz target itself
+
+**Interfaces:**
+- Produces: `fuzz` crate named `uc2-fuzz` with `[[bin]]` per target; `uc2_fuzz::NoopSm` (a `uc2_service::RawStateMachine` that ignores input) and `uc2_fuzz::split(data: &[u8], n: usize) -> Vec<&[u8]>` helper; `scripts/fuzz_smoke.sh [SECS] [TARGET…]`.
+- Produces: total readers — `pub fn read_datagram_header(buf: &[u8]) -> Option<DatagramHeader>` etc.
+
+- [ ] **Step 1: Root workspace excludes `fuzz/`**
+
+```toml
+[workspace]
+resolver = "2"
+members = [ … unchanged … ]
+exclude = ["fuzz"]   # cargo-fuzz crate: nightly-only, its own [workspace]; see fuzz/README.md
+```
+
+- [ ] **Step 2: `cargo +nightly fuzz init` shape, written by hand**
+
+`fuzz/Cargo.toml`:
+
+```toml
+[package]
+name = "uc2-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"   # match the workspace licence field
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+uc_protocol = { path = "../uc_protocol" }
+uc2_remote = { path = "../uc2_remote" }
+uc2_crypto = { path = "../uc2_crypto" }
+uc2_service = { path = "../uc2_service" }
+uc2_node = { path = "../uc2_node" }
+uc2_gateway = { path = "../uc2_gateway" }
+ultima_journal = { path = "../ultima_journal", package = "ultima-journal" }  # check the real package name in ultima_journal/Cargo.toml
+
+[[bin]]
+name = "uc_protocol_datagram"
+path = "fuzz_targets/uc_protocol_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seed-corpus"
+path = "src/bin/seed_corpus.rs"
+test = false
+doc = false
+bench = false
+
+# one [[bin]] per target — Tasks 2 and 3 append theirs.
+
+[workspace]
+```
+
+`fuzz/.gitignore`: `target/` and `artifacts/`. `fuzz/README.md`: how to run one target (`cargo +nightly fuzz run uc_protocol_datagram -- -max_total_time=60`), how to regenerate seeds (`cargo +nightly run --bin seed-corpus`), how to minimise (`cargo +nightly fuzz tmin`/`cmin`), what `scripts/fuzz_smoke.sh` does, and why the crate is outside the workspace.
+
+- [ ] **Step 3: Shared helpers**
+
+`fuzz/src/lib.rs`:
+
+```rust
+// SPDX-License-Identifier: Apache-2.0
+//! Shared helpers for the uc2 fuzz targets. Nothing here is shipped.
+
+/// Split `data` into `n` slices at lengths taken from its own leading bytes
+/// (so the fuzzer controls the split points). Always returns exactly `n`
+/// slices; trailing ones may be empty.
+pub fn split(data: &[u8], n: usize) -> Vec<&[u8]> {
+    let mut out = Vec::with_capacity(n);
+    let (lens, mut rest) = data.split_at(data.len().min(n.saturating_sub(1)));
+    for &l in lens {
+        let take = (l as usize).min(rest.len());
+        let (a, b) = rest.split_at(take);
+        out.push(a);
+        rest = b;
+    }
+    while out.len() < n { out.push(rest); rest = &[]; }
+    out
+}
+
+/// A state machine that ignores its input — for fuzzing adapters that wrap
+/// one (`Sessioned<S>`) without caring what `S` does.
+pub struct NoopSm;
+impl uc2_service::RawStateMachine for NoopSm {
+    fn apply(&mut self, _position: u64, _cmd: &[u8], out: &mut Vec<u8>) { out.clear(); }
+    fn query(&self, _q: &[u8], out: &mut Vec<u8>) { out.clear(); }
+    fn last_applied(&self) -> u64 { 0 }
+}
+```
+
+(Check `RawStateMachine`'s exact method set in `uc2_service/src/traits.rs` and implement every required method; `SnapshotStateMachine` is a separate trait and is not needed unless Task 2's `install_snapshot` target requires `Sessioned<S>: SnapshotStateMachine` — read `session.rs` and add a no-op `SnapshotStateMachine` impl for `NoopSm` if so.)
+
+- [ ] **Step 4: Make the caller-guarded datagram readers total — write the failing unit tests first**
+
+In `uc_protocol/src/v2/datagram.rs` tests:
+
+```rust
+#[test]
+fn short_inputs_are_none_not_panics() {
+    for n in 0..DATAGRAM_HEADER_LEN { assert!(read_datagram_header(&vec![0u8; n]).is_none()); }
+    assert!(read_request_vote_body(&[0u8; 3]).is_none());
+    assert!(read_vote_body(&[0u8; 3]).is_none());
+    assert!(read_nak_body(&[0u8; 3]).is_none());
+    assert!(read_status_body(&[0u8; 3]).is_none());
+}
+```
+
+Run: `cargo test -p uc_protocol short_inputs_are_none_not_panics` — expected: **compile error** (the functions return values, not `Option`).
+
+- [ ] **Step 5: Change the five signatures**
+
+```rust
+pub fn read_datagram_header(buf: &[u8]) -> Option<DatagramHeader> {
+    if buf.len() < DATAGRAM_HEADER_LEN { return None; }
+    Some(DatagramHeader { /* existing field reads, unchanged */ })
+}
+// same shape for read_request_vote_body / read_vote_body / read_nak_body /
+// read_status_body, each against its own fixed body length constant
+// (define `pub const REQUEST_VOTE_BODY_LEN: usize = …` etc. if not present,
+// taken from the existing write_* functions' sizes).
+```
+
+Keep the doc comment honest: "Returns `None` on a short buffer; the receiver still guards the length before calling (belt and braces)". Then `cargo build --workspace --all-targets` and fix every caller — in `uc2_net/src/receiver.rs` the pattern is:
+
+```rust
+let Some(h) = read_datagram_header(&buf[..n]) else { return None; }; // the existing len<16 guard stays above it
+```
+
+(`uc2_sim`, `uc2_node`, tests and examples may call these too — let the compiler list them.)
+
+- [ ] **Step 6: Run tests** — `cargo test -p uc_protocol -p uc2_net -p uc2_sim` and `cargo clippy --workspace --all-targets -- -D warnings` — expected: all pass, zero warnings.
+
+- [ ] **Step 7: The first fuzz target**
+
+`fuzz/fuzz_targets/uc_protocol_datagram.rs`:
+
+```rust
+// SPDX-License-Identifier: Apache-2.0
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+use uc_protocol::v2::datagram::*;
+
+// Models the receiver's pre-auth path: a datagram of any length arrives; the
+// header is read if ≥16 bytes; every body reader is then offered the rest.
+// None of this may panic for ANY input.
+fuzz_target!(|data: &[u8]| {
+    let Some(h) = read_datagram_header(data) else { return; };
+    let body = &data[DATAGRAM_HEADER_LEN..];
+    let _ = h.kind; // dispatch by kind like the receiver does, but ALSO try every
+                    // reader on every body — a reader must be total regardless.
+    let _ = read_append_position_body(body);
+    let _ = read_read_probe_body(body);
+    let _ = read_config_proposal_body(body);
+    let _ = read_config_reply_body(body);
+    let _ = read_snap_begin_body(body);
+    let _ = read_snap_nak_body(body);
+    let _ = read_request_vote_body(body);
+    let _ = read_vote_body(body);
+    let _ = read_nak_body(body);
+    let _ = read_status_body(body);
+    let mut entries = [TermMapEntryWire::default(); MAX_TERM_MAP_WIRE_ENTRIES];
+    let _ = read_term_map_body(body, &mut entries);
+});
+```
+
+(If `TermMapEntryWire` has no `Default`, build the array with the struct's zero value; if `MAX_TERM_MAP_WIRE_ENTRIES` is private, make it `pub` — it is a wire constant.)
+
+- [ ] **Step 8: Seeds** — `fuzz/src/seeds.rs` + `fuzz/src/bin/seed_corpus.rs`: for each target, write a few valid encodings into `fuzz/corpus/<target>/NN-<name>` using the real encoders (`write_datagram_header` + each `write_*_body` with representative values; at least: one DATA-kind datagram, one AppendPosition (wire 0.5.0 8-byte body), one SNAP_BEGIN with a non-empty config, one TermMap with 3 entries, one ConfigProposal kind 16). The generator is deterministic (no randomness, no clock) and overwrites files idempotently. Run it: `cd fuzz && cargo +nightly run --bin seed-corpus`. Commit the corpus files.
+
+- [ ] **Step 9: `scripts/fuzz_smoke.sh`**
+
+```bash
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Run every fuzz target (or the named ones) for SECS seconds each on the
+# committed corpus. Exit 1 on the first crash. Needs: rustup nightly + cargo-fuzz.
+set -euo pipefail
+SECS="${1:-30}"; shift || true
+cd "$(dirname "$0")/../fuzz"
+if [ $# -gt 0 ]; then TARGETS=("$@"); else mapfile -t TARGETS < <(cargo +nightly fuzz list); fi
+for t in "${TARGETS[@]}"; do
+  echo "== fuzz $t (${SECS}s) =="
+  cargo +nightly fuzz run "$t" -- -max_total_time="$SECS" -timeout=10 -rss_limit_mb=2048 || { echo "CRASH in $t (see fuzz/artifacts/$t/)"; exit 1; }
+done
+echo "fuzz smoke: all targets clean"
+```
+
+- [ ] **Step 10: Run it** — `scripts/fuzz_smoke.sh 60 uc_protocol_datagram` — expected: `all targets clean`. (Before Step 5 landed, the same target would have crashed within seconds on a 3-byte input — note that red/green pair in the report.)
+
+- [ ] **Step 11: Commit** — `git add -A fuzz scripts/fuzz_smoke.sh Cargo.toml uc_protocol uc2_net <other callers>` ; `git commit -m "m12d: fuzz crate scaffold; uc_protocol datagram readers total on &[u8]; first target + seeds + fuzz_smoke.sh"`.
+
+---
+
+### Task 2: The pure-seam targets (remote frame, crypto, journal, cnc, session, admin)
+
+**Files:**
+- Create: `fuzz/fuzz_targets/{uc2_remote_frame,uc2_crypto_open,uc2_crypto_handshake,uc2_crypto_group_key,uc2_crypto_admin,ultima_journal_record,ultima_journal_stable_value,uc_protocol_cnc,uc_protocol_log_frame,uc2_service_session}.rs`; `fuzz/corpus/<each>/*`
+- Modify: `fuzz/Cargo.toml` (`[[bin]]` per target), `fuzz/src/seeds.rs` (seeds per target)
+- Modify (only if needed): `uc_protocol/src/v2/cnc.rs` — `read_cnc_app_id` returns `""` on a page shorter than 96 bytes (one length check) instead of panicking; `uc_protocol/src/v2/frame.rs` — `read_header` documented caller-guarded (do NOT change its signature: it is the apply-thread hot path; the target guards `len ≥ 32` like the real reader's acquire-load-of-length does)
+
+**Interfaces:**
+- Consumes: `uc2_fuzz::{split, NoopSm}` from Task 1.
+- Produces: nothing new for other tasks beyond the targets and corpora.
+
+- [ ] **Step 1: `uc2_remote_frame`**
+
+```rust
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+use uc2_remote::frame::*;
+fuzz_target!(|data: &[u8]| {
+    let Ok((h, used)) = decode_header(data) else { return; };
+    let body = &data[used.min(data.len())..];
+    // every body decoder must be total; try them all regardless of h.frame_type
+    let _ = Hello::decode(body); let _ = HelloOk::decode(body); let _ = HelloRefused::decode(body);
+    let _ = ResponseMeta::decode(body); let _ = Status::decode(body); let _ = Leader::decode(body); let _ = Retry::decode(body);
+    let _ = h;
+});
+```
+
+Seeds: `encode_frame` of each frame type with its `encode()`d body (HELLO, HELLO_OK with credits, HELLO_REFUSED each reason, RESPONSE meta, STATUS, LEADER, RETRY each reason), plus one frame whose header `len` = `MAX_FRAME_LEN` and one with `len` = `MAX_FRAME_LEN + 1`.
+
+- [ ] **Step 2: `uc2_crypto_open`**
+
+```rust
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+const KEY: [u8; 32] = [7u8; 32];
+fuzz_target!(|data: &[u8]| {
+    let mut v = data.to_vec();
+    let _ = uc2_crypto::seal::open_in_place(&mut v, &KEY);
+    let mut s = data.to_vec();
+    let n = s.len();
+    let _ = uc2_crypto::seal::open_detached(&mut s[..], &KEY);
+    let _ = n;
+});
+```
+
+Seeds: a few `seal_in_place(&mut plaintext, &KEY, counter)` outputs (counters 0, 1, u64::MAX) and their 1-byte-truncated/flipped variants. (If `seal::open_*` are not `pub` at the crate root, use the real path — `uc2_crypto::seal` — and make the module `pub` if it is `pub(crate)`; it is already "fed raw bytes off the network" by design per its own doc.)
+
+- [ ] **Step 3: `uc2_crypto_handshake` and `uc2_crypto_group_key`**
+
+Read `uc2_crypto/src/handshake.rs::Peers::new` (line ~292) for the constructor's arguments (local static key, allowlist, config) and build a `Peers` with two generated X25519 keys (deterministic: derive from fixed bytes via the same key-gen helper the tests use) at target start (a `static` via `std::sync::OnceLock` is fine — the target must be cheap per iteration):
+
+```rust
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+use std::sync::Mutex;
+use uc2_crypto::handshake::Peers;
+static PEERS: Mutex<Option<Peers>> = Mutex::new(None);
+fuzz_target!(|data: &[u8]| {
+    if data.is_empty() { return; }
+    let kind = data[0]; let body = &data[1..];
+    let mut g = PEERS.lock().unwrap();
+    let peers = g.get_or_insert_with(|| /* build as in uc2_crypto's handshake tests */ todo_build_peers());
+    let _ = peers.on_message(uc2_crypto::NodeId(1), kind, body, 1_000_000);
+});
+```
+
+(Replace `todo_build_peers()` with the real construction copied from `uc2_crypto`'s tests — the plan cannot see the private test helpers; the implementer copies them into `fuzz/src/lib.rs`.) `uc2_crypto_group_key` does the same for `GroupPlane::on_key_message(from, body)` / `SharedTransport`'s `on_group_key_message`. Seeds: one genuine first handshake message produced by a second `Peers` (the initiator side), one kind-20 group-key message produced by the real rotation path, captured via the same test helpers.
+
+- [ ] **Step 4: `uc2_crypto_admin`** — round-trips `AdminMessage` canonical bytes and `verify`: split `data` into `app_id`, `instance_id`, `seq`, `nonce`, `op`, `id`, `ip`, `port`, `expiry_ns` with `uc2_fuzz::split`, build an `AdminMessage`, compute `canonical_bytes()`, sign with a fixed `AdminKey` (use `AdminKey::from_bytes([9u8;32])` or whatever constructor exists — read `uc2_crypto/src/admin.rs`), assert `verify(&key, &m, &tag) == true` and `verify` with a flipped tag byte `== false`. Assert `canonical_bytes().len() == 2 + app_id.len() + 16 + 8 + 8 + 4 + 4 + 4 + 2 + 8`. (This is a property target, not a parser — it guards the signed-tag layout against silent drift.)
+
+- [ ] **Step 5: `ultima_journal_record` and `ultima_journal_stable_value`**
+
+```rust
+// ultima_journal_record
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+use ultima_journal::journal::segment::{decode_header, decode_record};
+fuzz_target!(|data: &[u8]| {
+    let _ = decode_header(data);
+    let _ = decode_record(data, "fuzz-seg", 0);
+});
+// ultima_journal_stable_value
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+use ultima_journal::stable_value::{decode_header, decode_slot};
+fuzz_target!(|data: &[u8]| { let _ = decode_header(data); let _ = decode_slot(data); });
+```
+
+(Check the module paths are `pub`; if `segment`/`stable_value` are private modules, re-export the four functions under `pub mod fuzz_seams` in `ultima_journal/src/lib.rs` — no behaviour change.) Seeds: `encode_header`, `encode_record(seq, meta, payload)` for three payload sizes, `encode_slot` for two slot sizes; plus a torn tail (a valid record truncated mid-body) so the `Ok(None)` path is seeded.
+
+- [ ] **Step 6: `uc_protocol_cnc` and `uc_protocol_log_frame`**
+
+```rust
+// uc_protocol_cnc
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+use uc_protocol::v2::cnc::*;
+fuzz_target!(|data: &[u8]| {
+    let _ = read_cnc_header(data);
+    let _ = read_cnc_app_id(data); // total after the one-line fix in this task
+});
+// uc_protocol_log_frame
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+use uc_protocol::v2::frame::*;
+fuzz_target!(|data: &[u8]| {
+    if data.len() < FRAME_HEADER_LEN { return; } // the real reader only runs after observing length != 0 on a full header
+    let h = read_header(data);
+    let _ = (h.length, h.frame_type);
+});
+```
+
+Make `read_cnc_app_id` total: `if page.len() < 96 { return ""; }`. Seeds: a 4 KiB page with a valid header (magic, version = `CNC_V2_VERSION`, app_id "fuzz"), one with a bad magic, one 95 bytes long; a valid MESSAGE frame header, a PADDING header, a CONFIG(4) header.
+
+- [ ] **Step 7: `uc2_service_session`**
+
+```rust
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+use uc2_fuzz::NoopSm;
+use uc2_service::session::{Sessioned, SessionConfig};
+use uc2_service::RawStateMachine;
+fuzz_target!(|data: &[u8]| {
+    let parts = uc2_fuzz::split(data, 3);
+    let mut sm = Sessioned::new(NoopSm, SessionConfig::default());
+    let mut out = Vec::new();
+    sm.apply(1, parts[0], &mut out);
+    sm.apply(2, parts[1], &mut out);
+    // install_snapshot over a Cursor — the replicated-config check must refuse, not panic
+    let mut cur = std::io::Cursor::new(parts[2]);
+    let _ = uc2_service::SnapshotStateMachine::install_snapshot(&mut sm, 3, &mut cur);
+});
+```
+
+(Adapt the constructor name/`SessionConfig` defaults to `session.rs`; if `Sessioned<NoopSm>` does not implement `SnapshotStateMachine` without `NoopSm: SnapshotStateMachine`, add the no-op impl in `fuzz/src/lib.rs`.) Seeds: a FRESH envelope (`client_id=1, seq=1`), a replay of it, an `EXPIRED` (short) command, and a genuine `freeze`d snapshot of a 2-client table produced by the real `Sessioned` freeze path.
+
+- [ ] **Step 8: Register all `[[bin]]`s, regenerate seeds, run** — `cargo +nightly run --bin seed-corpus`; `scripts/fuzz_smoke.sh 60` (all targets; ~11 minutes) — expected: clean. Any crash found here is a **real finding**: minimise it (`cargo +nightly fuzz tmin`), fix the product code in the smallest correct way, add the minimised input to the corpus, and record the finding in the report (file, input, fix) — it goes into `self-assessment.md` in Task 5.
+
+- [ ] **Step 9: Commit** — `git commit -am "m12d: fuzz targets for remote frame, crypto open/handshake/group-key/admin, journal record + stable value, cnc header, log frame header, session envelope (+ seeds)"` (use `git add -A fuzz` for the new files).
+
+---
+
+### Task 3: Seams that needed exposing — TOML configs and the obs HTTP router
+
+**Files:**
+- Modify: `uc2_node/src/config_file.rs` (`pub fn parse_str(text: &str) -> Result<(NodeConfig, StartupOptions), ConfigError>`; `load_from_path` = read file + `parse_str`; the `#[cfg(test)] load_str` helper becomes a thin alias or is deleted), `uc2_gateway/src/config_file.rs` (`pub fn parse_str(text: &str) -> Result<EdgeConfig, ConfigFileError>`), `uc2_node/src/obs/http.rs` (`#[cfg(any(test, fuzzing))] pub fn route_raw(buf: &[u8], sources: &ObsSources) -> (u16, &'static str, String)` + make `ObsSources` constructible from plain values under the same cfg if it is not already; `pub mod obs`/`pub mod http` visibility as needed — `cfg(fuzzing)` only)
+- Create: `fuzz/fuzz_targets/{uc2_node_toml,uc2_gateway_toml,uc2_node_http}.rs`, corpora
+- Test: `uc2_node/tests/daemon_refusals.rs` or `config_file.rs` unit tests — `parse_str` rejects an unknown key with the same `ConfigError` as `load_from_path` (one test each crate)
+
+**Interfaces:**
+- Produces: `uc2_node::config_file::parse_str`, `uc2_gateway::config_file::parse_str` (public, stable-ish: document "the file loader's pure inner; same errors"), `uc2_node::obs::http::route_raw` (cfg-gated, not API).
+
+- [ ] **Step 1: Failing tests**
+
+```rust
+// uc2_node/src/config_file.rs tests
+#[test]
+fn parse_str_is_the_loader_without_the_file() {
+    let text = std::fs::read_to_string("../packaging/node.example.toml").unwrap();
+    let (cfg, _) = parse_str(&text).expect("example parses");
+    assert!(!cfg.members.is_empty());
+    assert!(matches!(parse_str("[node]\nunknown = 1\n"), Err(ConfigError::Parse(_)) | Err(_)));
+}
+```
+
+(Use the real variant names; the point is: the example file parses and an unknown key is refused.) Same shape in `uc2_gateway` against `packaging/gateway.example.toml`. Run: expected compile failure (no `parse_str`).
+
+- [ ] **Step 2: Implement** — move the `toml::from_str` + conversion/validation body out of `load_from_path` into `parse_str`; `load_from_path` becomes `let text = std::fs::read_to_string(path).map_err(…)?; parse_str(&text)` (keep the existing error mapping that names the path). Run the two tests + `cargo test -p uc2_node --test daemon_refusals` + `cargo test -p uc2_gateway` — expected pass.
+
+- [ ] **Step 3: `route_raw`** — in `obs/http.rs`: `#[cfg(any(test, fuzzing))] pub fn route_raw(buf: &[u8], sources: &ObsSources) -> (u16, &'static str, String) { route(buf, sources) }`; ensure `ObsSources` can be built in a fuzz target without a live node (read what it holds — likely `Arc`s/closures over the cnc page; if it needs a `CncPage`, add under the same cfg a `ObsSources::for_tests()` that serves fixed values). Make the module path reachable: `uc2_node::obs::http` must be `pub` under `cfg(fuzzing)` (or add `#[cfg(fuzzing)] pub mod fuzz_seams { pub use crate::obs::http::{route_raw, ObsSources}; }` in `uc2_node/src/lib.rs`).
+
+- [ ] **Step 4: Targets**
+
+```rust
+// uc2_node_toml
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+fuzz_target!(|data: &[u8]| { if let Ok(s) = std::str::from_utf8(data) { let _ = uc2_node::config_file::parse_str(s); } });
+// uc2_gateway_toml — same with uc2_gateway::config_file::parse_str
+// uc2_node_http
+#![no_main]
+use libfuzzer_sys::fuzz_target;
+use std::sync::OnceLock;
+use uc2_node::fuzz_seams::{route_raw, ObsSources};
+static SRC: OnceLock<ObsSources> = OnceLock::new();
+fuzz_target!(|data: &[u8]| {
+    let src = SRC.get_or_init(ObsSources::for_tests);
+    let (code, _ctype, _body) = route_raw(&data[..data.len().min(4096)], src);
+    assert!(matches!(code, 200 | 400 | 404 | 405 | 503 | 500 | 413 | 414)); // the router's documented status set — adapt to the real set
+});
+```
+
+Seeds: `packaging/node.example.toml`, `packaging/gateway.example.toml`, the quickstart's rendered TOMLs (copy from `packaging/quickstart-local.sh`'s heredocs), an empty file, a file with every section but `[admin]`; for HTTP: `GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n`, `/healthz`, `/readyz`, `POST /metrics`, a 5 KiB request line, a request with no `\r\n\r\n`.
+
+- [ ] **Step 5: Run** — `scripts/fuzz_smoke.sh 60 uc2_node_toml uc2_gateway_toml uc2_node_http` — clean; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test -p uc2_node --lib` (obs tests).
+- [ ] **Step 6: Commit** — `git commit -m "m12d: parse_str for node/gateway TOML, cfg(fuzzing) obs router seam, three targets + seeds"`.
+
+---
+
+### Task 4: Nightly `fuzz` job + Miri attempt
+
+**Files:**
+- Modify: `.github/workflows/nightly.yml` (header comment: add `fuzz` and `miri` bullets; new jobs), `fuzz/README.md` (how CI runs it), `docs/VERIFICATION.md` (new section "Fuzzing" + a "Miri" paragraph; §9 CI list; §10 bullet updated — written here as the *record*, Task 5 links to it)
+
+**Interfaces:** Consumes every target from Tasks 1–3 (`cargo +nightly fuzz list` is the source of truth — the job does NOT hardcode the target list except for the matrix grouping, which is validated against `fuzz list` in a step that fails if a target is in neither group).
+
+- [ ] **Step 1: The job**
+
+```yaml
+  fuzz:
+    # M12d: coverage-guided fuzzing of every decoder that sees untrusted bytes
+    # (fuzz/README.md lists them). ~10 min per target on the committed corpus;
+    # a crash uploads fuzz/artifacts and fails the job. nightly toolchain —
+    # the workspace itself stays on the pinned stable.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        group:
+          - "uc_protocol_datagram uc_protocol_log_frame uc_protocol_cnc uc2_remote_frame"
+          - "uc2_crypto_open uc2_crypto_handshake uc2_crypto_group_key uc2_crypto_admin"
+          - "ultima_journal_record ultima_journal_stable_value uc2_service_session"
+          - "uc2_node_toml uc2_gateway_toml uc2_node_http"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with: { toolchain: nightly }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: fuzz, key: fuzz }
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Every target is in exactly one group
+        run: |
+          set -euo pipefail
+          cd fuzz
+          cargo +nightly fuzz list | sort > /tmp/all.txt   # CI runner, not the dev box — /tmp is fine here
+          printf '%s\n' ${{ join(matrix.group, ' ') }} ALL_GROUPS_PLACEHOLDER | tr ' ' '\n' | sort > /tmp/grouped.txt
+          # (implementer: replace the placeholder with the literal union of the four groups, kept in one env var at job level so the check is real)
+          comm -3 /tmp/all.txt /tmp/grouped.txt | { ! grep .; }
+      - name: Fuzz (600 s per target)
+        run: scripts/fuzz_smoke.sh 600 ${{ matrix.group }}
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: fuzz-artifacts-${{ strategy.job-index }}, path: fuzz/artifacts, if-no-files-found: ignore }
+```
+
+Write the group-completeness check so it genuinely compares `fuzz list` against a single `env: FUZZ_GROUPS` string declared once at the job level and reused by both the matrix and the check (the matrix can't read env; so declare the four group strings in the matrix AND a job-level `FUZZ_ALL` env listing all 14 targets, and assert `fuzz list == FUZZ_ALL`; a new target without a group fails the job with a named message).
+
+- [ ] **Step 2: Miri** — a separate job `miri` (`timeout-minutes: 45`): `dtolnay/rust-toolchain@master` with `toolchain: nightly, components: miri`; `cargo +nightly miri setup`; then **only the pure surfaces**: `cargo +nightly miri test -p uc_protocol --lib -- v2::` (the datagram/frame/cnc decoders' unit tests) and `cargo +nightly miri test -p ultima-journal --lib -- segment:: stable_value::` (adapt filters to real test module paths; pick tests that touch no files). **Do not** run the ring tests (file-backed mmap; Miri refuses) — state that in the job comment and in VERIFICATION.md with the exact error observed locally (`unsupported operation: open not available when isolation is enabled`; file-backed `mmap` unsupported even with `-Zmiri-disable-isolation`). If any chosen test turns out to touch the filesystem, exclude it by name rather than disabling isolation. Locally: run the same two commands once (`cargo +nightly miri test …`, several minutes) and paste the pass lines into the report.
+
+- [ ] **Step 3: VERIFICATION.md** — new section **"§7b Fuzzing — decoders total on untrusted bytes"** (or renumber to keep the doc's scheme consistent): what is fuzzed (the 14 targets, one line each with the seam and why it is untrusted), how (libFuzzer, 600 s/target nightly, corpus committed, `scripts/fuzz_smoke.sh`), what it found (Task 1's short-input panics in the five readers — found by construction and fixed; anything Task 2/3 found), what it does **not** cover (`FramedConn::read_frame`'s accumulate loop, `CncPage` over real mmap, the receiver's stateful dispatch, bincode itself); a **Miri** paragraph (ran over pure decoders; rings blocked by file-backed mmap; Vec-backed ring variant = the stated fallback, not built). §9 CI table gets `fuzz`/`miri`; §10 gets "the rings are not Miri-checked" and keeps the wire-crypto posture bullet.
+
+- [ ] **Step 4: Validate** — `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/nightly.yml'))"`; extract the new `run:` blocks and `bash -n` them; run `scripts/fuzz_smoke.sh 20` locally once more (all targets) and the local Miri commands.
+- [ ] **Step 5: Commit** — `git commit -am "m12d: nightly fuzz job (4 matrix groups, 600 s/target, corpus replay, crash artifacts) + miri over pure decoders; VERIFICATION fuzzing section"`.
+
+---
+
+### Task 5: The security package — threat model, attack surface, self-assessment, SECURITY.md, README posture + limits, gate rows, spec amendment
+
+**Files:**
+- Create: `docs/security/threat-model.md`, `docs/security/attack-surface.md`, `docs/security/self-assessment.md`, `SECURITY.md`
+- Modify: `README.md` (new `## Security posture` before `## Scope`; `## Scope` → `## Scope and limits`; `## Documentation` gains a Security line), `docs/how-to/README.md` "Related" (link the security docs), `docs/reference/README.md` if it exists (same), `CLAUDE.md` (M12d paragraph; `scripts/fuzz_smoke.sh` in Build & Test), `docs/benchmarks/uc2-m12-gate-2026-08-22.md` (rows 8, 9, 10 + facts), `docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md` ("As built (M12d)"), `docs/ops/uc2-runbook.md` §11 (pointer to the threat model — do not duplicate it)
+
+**Interfaces:** Consumes Task 4's VERIFICATION.md section (link, don't repeat) and Tasks 1–3's findings (from the reports/ledger — the controller passes them in the dispatch).
+
+- [ ] **Step 1: `docs/security/threat-model.md`** — sections: **Assets** (committed log bytes and their order; the leader's identity; the admin control plane; the operator's keys — X25519 statics, admin HMAC keys; audit log integrity; availability); **Actors** (network-path adversary on the node↔node path; a remote client on the gateway TCP port; a local process on a node host — same uid / other uid; a cluster member; the operator); **Trust boundaries** with one ASCII diagram (client ⟶ TCP ⟶ gateway ⟶ shmem ⟶ node ⟷ UDP ⟷ node; service ⟷ shmem ⟷ node; uc2ctl ⟶ cnc admin slot); **What is defended, by what** — a table: wire crypto ON (Noise IK allowlist, AES-256-GCM with header AAD, RFC-6479 anti-replay, group key rotation) / OFF (membership-address filter only; every `uc_protocol::v2` decoder total on untrusted bytes — fuzzed — is the *only* defence); admin authn (HMAC-SHA256 signed requests, expiry, instance-binding from boot-time state, audit before answer); IPC (`app_id`/`instance_id`/version checks, flock, per-record atomic length); gateway (frame length caps `MAX_FRAME_LEN`, credits, `max_connections`, write timeout); **Out of model** (compromised host; malicious member — group key symmetric → forge fan-out as any node; metadata leak; removed node decrypts until rotation; client authentication on the TCP link — none; `app_id` is not a credential; DoS beyond the stated caps; side channels); **Residuals stated elsewhere** (link: M8 spec §7, `configuration.md` kind-16 residual, `remote-protocol.md` plain TCP). Copy the four M8 residuals verbatim (they are the canonical text) and cite them.
+
+- [ ] **Step 2: `docs/security/attack-surface.md`** — one table, one row per parser/entry point, columns: surface | entry (file:function) | reachable by | authenticated? | length/shape guards | fuzz target | notes. Rows: UDP datagram header + every body reader (kind list); `AppendPositionBody` (0.5.0 content attestation); snapshot-session framing (`SNAP_BEGIN`/`SNAP_NAK`); handshake messages (kinds 18–20, pre-auth); AEAD envelope (`open_*`); group-key message; cnc admin slot + `CNC_OFF_ADMIN_AUTH` line (local writers only, instance-dir permissions); `audit.jsonl` (append-only, fsync; operators' `uc2ctl audit`); gateway TCP frames (`decode_header` + 7 body decoders; HELLO pre-credit); `gateway.toml`/`node.toml` (operator-supplied, `deny_unknown_fields`); `/metrics`/`/healthz`/`/readyz` HTTP (request line parser, 4 KiB cap, GET only, unauthenticated — bind address is the control); journal segment/record + `StableValue` (disk, recovery path — local attacker with disk access ≡ host compromise; CRC is integrity not authenticity); session envelope (`Sessioned`, 16-byte, replicated `SessionConfig`); typed tier (bincode — not fuzzed here; bincode's `standard()` config with limits as used in `traits.rs` — state the limit or its absence honestly after reading the code). Include the **bind-address guidance**: UDP node port, gateway TCP port, metrics port — what to expose and to whom.
+
+- [ ] **Step 3: `docs/security/self-assessment.md`** — in the shape an external reviewer expects: scope of this assessment (what was looked at, by whom — "the maintainers, 2026-08-23", method: code reading + fuzzing + the existing proof/sim/lincheck tiers); **findings** (numbered; each with severity, status, commit — at minimum: F1 the five caller-guarded readers panicked on short slices — never reachable through the receiver's guard, fixed to be total (Task 1); F2 M12b C1 — instance_id from the page (fixed, `cca681d`-era, regression test named); F3 the `uc2_remote` reconnect budget pinning (fixed M12c `fc27536`); any fuzz finding from Tasks 2–3); **known weaknesses not fixed** (the out-of-model list, with the *why*); **what an external review should focus on** (the pre-auth UDP path with crypto OFF, the `snow` handshake state machine under malformed messages, the admin canonical-bytes layout, the gateway's credit/backpressure ladder under a malicious client, `Sessioned` eviction under adversarial client_ids); **verification inventory** (link VERIFICATION.md); **dependency posture** (`deny.toml`, SBOM per release, `bincode` RUSTSEC-2025-0141 residual); **release integrity** (cosign keyless, identity regexp). End with a "Status: package prepared 2026-08-23; external review pending (gate row 10)".
+
+- [ ] **Step 4: `SECURITY.md`** (repo root) — supported versions (latest minor only: `2.6.x`); how to report (GitHub private vulnerability reporting on the repo, or email the maintainer address already used in `Cargo.toml` `authors`/README — do not invent an address; if none exists, say "open a private security advisory on GitHub"); what to expect (acknowledge within N days — pick 7; coordinated disclosure); pointer to `docs/security/`.
+
+- [ ] **Step 5: README** — `## Security posture` (≤ 200 words, the spec's own bullets, verbatim in spirit): cleartext by default ⇒ the `uc_protocol::v2` decoders parse untrusted bytes with nothing in front of them (fuzzed nightly, total on `&[u8]`); wire crypto ON: network-path adversary model, **a malicious member can forge fan-out traffic (symmetric group key)**; the remote client link is **plain TCP, no authentication in this release**; `app_id` is not a credential; admin needs an HMAC key unless the operator chose `"none"`, and cluster-wide only with `[crypto].enabled = true`; link the three docs + `SECURITY.md`. `## Scope and limits`: keep the RELEASES.md pointer, then the limits as a list: **8 members max** (voters + learners); **one node per instance dir**; **one state machine per cluster** (one leader, one apply thread); **all fleet measurements single-AZ**; **command payload ≤ ~1.3 KB** — one datagram, `MTU_DEFAULT = 1408`, not configurable (state the exact max body: `MTU_DEFAULT − DATAGRAM_HEADER_LEN − frame header − crypto overhead` — compute from the constants and say which number applies with crypto ON/OFF); clients attach via shmem on a node host or via a gateway (the old "co-located until M12" sentence is gone); wire crypto and purge off by default; admin authn as today. `## Documentation`: add `docs/security/`.
+
+- [ ] **Step 6: Gate doc, spec, CLAUDE.md, runbook, indexes** — row 8: PASS/pending per the real nightly run (the first nightly after merge is the proof; until then "BUILT, local `fuzz_smoke.sh 60` clean on all 14, nightly run pending" — honest); row 9 PASS with the four file paths; row 10 **pending** (user-scheduled) — unchanged wording; facts list: what Miri ran / did not; findings count. Spec "As built (M12d)": 14 targets (names), the readers made total, the three exposed seams, Miri outcome, `SECURITY.md` added (not in the spec), the external review pending. CLAUDE.md: M12d paragraph in house style + `scripts/fuzz_smoke.sh` and `cargo +nightly fuzz` lines in Build & Test (`fuzz/` outside the workspace). Runbook §11 → pointer. `docs/how-to/README.md` Related → `../security/`.
+
+- [ ] **Step 7: Validate** — link check over every touched/new markdown file (relative links + anchors); `cargo doc --workspace --no-deps --lib` as `docs.yml` runs it (README is the landing page — its guard must still pass); `cargo clippy --workspace --all-targets -- -D warnings` (CLAUDE.md/README only — still run it).
+- [ ] **Step 8: Commit** — `git commit -m "m12d: security package — threat model, attack surface, self-assessment, SECURITY.md; README posture + limits; gate rows 8-10; spec As built (M12d)"`.
+
+---
+
+### Task 6: The `v2.6.0` release writeup (prepared; tag and push are user steps)
+
+**Files:**
+- Modify: `RELEASES.md` (new top section `## v2.6.0 — adoptable cluster (M12)`), `docs/releases.md` (engineering entry), `README.md` (`Status:` line → `v2.6.0`; Try-it already points at the artifacts), `docs/QUICKSTART.md`/how-to/reference sweep for anything the four sub-milestones invalidated and M12c/M12d did not already fix
+- Create (only if missing — check first): `docs/notes/uc2-two-tier-state-machine-contract.md` (explainer: why bytes-in/bytes-out is the core, the codec-spike numbers, the one-way door), `docs/notes/uc2-admin-authentication.md` (explainer: what the HMAC tag covers, why no replay ring, the boot-time `instance_id` binding, the kind-16 residual); `docs/notes/uc2-gateway-shapes-and-flow-control.md` already exists (M12a) — link it
+
+**Interfaces:** Consumes every M12 doc: `docs/reference/{state-machine-contract,remote-protocol,gateway-config,semver-policy,configuration}.md`, `docs/how-to/{run-a-gateway,cut-a-release,change-cluster-membership,upgrade-a-cluster}.md`, `docs/security/*`, the M12 gate doc, the spec's four "As built" amendments.
+
+- [ ] **Step 1: `RELEASES.md` section** in the house structure (read the `v2.5.0` section first and match it): one bullet per **feature** with its doc link — two-tier state-machine contract (`RawStateMachine`/`StateMachine`, `Sessioned<S>`) → reference + note; remote protocol v1 + `RemoteClient` → `remote-protocol.md`; `uc2-gateway` edge + `gateway.toml` → `run-a-gateway.md`, `gateway-config.md`, the shapes note; admin authentication + audit log + `uc2ctl gen-admin-key/audit` → `configuration.md#admin-authentication`, the authn note, `change-cluster-membership.md`; explicit-choice config (`[crypto]`, `[admin]` required — **upgrade consequence**) → `upgrade-a-cluster.md`; release artifacts + image + cosign + SBOM + no-toolchain quickstart → `QUICKSTART.md`, `cut-a-release.md`, `packaging/README-release.md`; lockstep `2.6.0` + crates.io + semver policy + MSRV 1.89 → `semver-policy.md`; security package + fuzzing + README posture → `docs/security/`, `VERIFICATION.md` fuzzing section. **Fixed bugs** bullet: the M12b C1 replay-after-restart (found in review, never shipped), the `uc2_remote` request_timeout-during-reconnect fix, the five caller-guarded readers made total, the 64 MiB log-buffer doc default, and anything else the four gate docs list. **Performance** bullet: gate rows 1–3 honestly — remote lincheck PASS; gateway throughput ratio and codec share are **fleet-only, no fleet run yet** (local smoke numbers are *not* the result), link the gate doc. **Upgrade notes**: the config edit (`[crypto]`/`[admin]`), the ~78 MiB reserve carried from 2.5.0, no wire flag day in 2.6.0.
+
+- [ ] **Step 2: `docs/releases.md` entry** — the deeper record: commits/merges per sub-milestone (M12a `185783e`, M12b `9897219`, M12c `e571c27`, M12d = this branch's merge), the review findings that mattered, the rulings (no replay ring; redirect not forward; leaves-only dry-run; fmt deferred; Miri blocked), fleet rows pending, external review pending.
+- [ ] **Step 3: Explainer notes** (if missing) — each ≤ 1 page, plain language, in the style of `docs/notes/uc2-the-mute-leader.md`.
+- [ ] **Step 4: Sweep** — grep the docs for `v2.5.0` statements that are now wrong (README `Status:` line), "not yet implemented" M12 placeholders, "until M12" phrasing; fix.
+- [ ] **Step 5: Validate** — link check on all touched files; `cargo doc` landing-page guard; nothing else changes code.
+- [ ] **Step 6: Commit** — `git commit -m "docs(release): v2.6.0 writeup prepared — RELEASES.md section, docs/releases.md entry, explainer notes, sweep (tag is a separate user step)"`.
+
+**Not in this task (user steps, stated in the finishing report):** `git tag -s v2.6.0`, `git push`, the `v2.6.0-rc.1` rehearsal, the fleet runs for gate rows 2–3 (or the user's explicit decision to tag with those rows fleet-pending), and scheduling the external review (row 10).
+
+---
+
+## Self-review against spec §7 / §8
+
+- §7 README Security posture (five bullets) → Task 5 Step 5 ✔. README Scope/limits (8 members, one node/dir, one SM/cluster, single-AZ, payload ≤ ~1.3 KB / `MTU_DEFAULT = 1408` not configurable) → Task 5 Step 5 ✔ (plus the corrected "clients via gateway" sentence).
+- §7 `threat-model.md`, `attack-surface.md` (every listed surface: UDP header + frame decoders ✔ Task 1/2, `AppendPositionBody` ✔, snapshot-session framing ✔ `read_snap_begin_body`/`snap_nak`, cnc admin slot + auth line ✔ (cnc header/app_id target + `CncPage` mmap limitation stated), gateway frame decoder ✔, TOML config ✔ Task 3, `/metrics` HTTP ✔ Task 3), `self-assessment.md` → Task 5 ✔.
+- §7 fuzz targets for each decoder + nightly `fuzz` job (~10 min/target, corpus committed) → Tasks 1–4 ✔. Miri attempted, blocked-with-reason + fallback stated → Task 4 ✔ (probe done 2026-08-23).
+- §7 external review = package is the deliverable; row 10 "pending" → Task 5 ✔ (never PASS).
+- §8 release documentation before the tag → Task 6 ✔ (prepared; tag = user).
+- Placeholders: the two `todo_build_peers()`/`ALL_GROUPS_PLACEHOLDER` markers are explicit implementer instructions with the source named (copy the crate's own test helpers; declare `FUZZ_ALL` once) — not unresolved design. Type names in fuzz targets follow the inventory of 2026-08-23 (`read_*_body`, `decode_header`, `Hello::decode`…, `open_in_place`/`open_detached`, `Peers::on_message`, `decode_record`/`decode_slot`, `read_cnc_header`/`read_cnc_app_id`, `Sessioned`/`SessionConfig`, `parse_str`, `route_raw`); implementers adapt field/constructor names to the real code and say so in the report.
+- Consistency: target names identical in Global Constraints, Task 4's matrix, and Task 5's docs; `scripts/fuzz_smoke.sh [SECS] [TARGET…]` signature identical in Tasks 1 and 4; `parse_str` name identical in Tasks 3 and 5.
