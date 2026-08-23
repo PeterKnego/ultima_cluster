@@ -56,6 +56,9 @@ something is wrong" below.
 - [Write a service binary](write-a-service-binary.md) — the lifecycle template
   for the half that runs your state machine: signal handling, apply-agent
   supervision, and why leaving either out fails quietly.
+- [Cut a release](cut-a-release.md) — for maintainers: the tag, what the
+  release workflow proves before it publishes anything, how to verify the
+  signed artifacts as a stranger would, and the manual crates.io order.
 
 ## When something is wrong
 

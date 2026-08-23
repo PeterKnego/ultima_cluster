@@ -1,0 +1,12 @@
+# The container image is built FROM A RELEASE TARBALL (see packaging/Dockerfile),
+# not from this source tree: the only thing the build context needs is `dist/`.
+# Sending the rest — .git, target/, proofs/, bench-infra/ — would cost minutes
+# per build for files no stage ever reads.
+#
+# `packaging/` is kept in the context so a future stage can COPY from it
+# without this file turning that into a confusing "not found".
+*
+!dist
+!dist/**
+!packaging
+!packaging/**

@@ -1,0 +1,422 @@
+name: release
+
+# Everything a tag has to produce, and nothing a tag should not.
+#
+# Push `vX.Y.Z` and this builds the two native tarballs (x86_64 and aarch64,
+# each on its own architecture's runner — no cross-compilation, no qemu for
+# the binaries themselves), an SBOM, then PROVES the artifact before
+# publishing anything: `release-smoke` unpacks the x86_64 tarball in a bare
+# `ubuntu:24.04` container with no Rust toolchain in it and runs the
+# quickstart out of it — three nodes, three services, three gateways, a real
+# election, two committed writes and a linearizable read — and then brings
+# the same binaries up as containers through packaging/compose.yml and drives
+# them through a gateway. Only if that passes does `release` publish the
+# GitHub Release and `image` push to ghcr.
+#
+# Signing is keyless (sigstore/cosign against this workflow's GitHub OIDC
+# identity): there is no long-lived private key anywhere, and what a verifier
+# checks is "this repository's release.yml, running on a v* tag, made this
+# file" — see the `--certificate-identity-regexp` in
+# docs/how-to/cut-a-release.md and packaging/README-release.md.
+#
+# `workflow_dispatch` with `dry_run: true` (the default) runs everything up to
+# and including both smokes and leaves the artifacts on the run, but publishes
+# nothing and signs nothing — the way to exercise a change to this file
+# without burning a tag. The other way is a real `-rc.N` tag; the how-to
+# recommends doing that once before every release.
+#
+# NOT here, on purpose: the crates.io publish. It is a manual, ordered,
+# irreversible-per-version sequence (twelve crates, each waiting for the
+# previous to index) and it is written down in docs/how-to/cut-a-release.md
+# rather than automated. CI's `publish-check` job smoke-tests that the
+# manifests still package.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build and smoke only — no GitHub Release, no image push, no signing'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The image the release-smoke job unpacks the tarball into. Deliberately
+  # stock: whatever the tarball needs and does not ship has to fail here.
+  SMOKE_BASE_IMAGE: ubuntu:24.04
+  IMAGE_NAME: ghcr.io/peterknego/uc2
+
+jobs:
+  # ---------------------------------------------------------------- version
+  # Resolved once and passed to every other job, so the tarball names, the
+  # image tag and the SBOM name cannot disagree with each other.
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve VERSION and check it against the workspace manifest
+        id: v
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            # A dispatch dry run has no tag to take a version from, and must
+            # not be able to produce something that looks like a real one.
+            VERSION="0.0.0-dry"
+          fi
+          CRATE=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="uc2_node") | .version')
+          echo "tag version:   $VERSION"
+          echo "crate version: $CRATE"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # The tag may carry a prerelease suffix the manifest does not
+            # (`v2.6.0-rc.1` against a `2.6.0` workspace) — that is the rc
+            # pattern in docs/how-to/cut-a-release.md. Anything else is a
+            # mismatch, and a mismatch is a wrong release, so fail now
+            # rather than ship tarballs named after a version nothing in
+            # them reports.
+            BASE="${VERSION%%-*}"
+            if [ "$VERSION" != "$CRATE" ] && [ "$BASE" != "$CRATE" ]; then
+              echo "::error::tag v$VERSION does not match the workspace version $CRATE" >&2
+              exit 1
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- build
+  # One job per architecture, each on a NATIVE runner: `ubuntu-24.04-arm` is
+  # real aarch64 hardware, so nothing here is cross-compiled or emulated and
+  # the test surface of the shipped binary is the same on both legs.
+  build:
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      # No toolchain action: rust-toolchain.toml pins the stable used for
+      # releases and rustup installs it on first `cargo` invocation, exactly
+      # as in ci.yml's jobs.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Show the toolchain actually in use
+        run: rustc -vV && cargo -vV
+
+      # `--locked`: a release is built from the committed Cargo.lock or not
+      # at all. The five binaries are named explicitly because `-p counter`
+      # would otherwise also build counter-single/counter-node/counter-client,
+      # which are teaching material, not shipped artifacts.
+      - name: Build the five shipped binaries
+        run: >
+          cargo build --release --locked --target ${{ matrix.target }}
+          -p uc2_node --bin uc2-node
+          -p uc2ctl --bin uc2ctl
+          -p uc2_gateway --bin uc2-gateway
+          -p counter --bin counter-service --bin counter-remote
+
+      - name: Assemble the tarball
+        run: |
+          set -euo pipefail
+          DIR="uc2-${VERSION}-${{ matrix.target }}"
+          BIN="target/${{ matrix.target }}/release"
+          mkdir -p "dist/${DIR}/bin"
+          for b in uc2-node uc2ctl uc2-gateway counter-service counter-remote; do
+            cp "$BIN/$b" "dist/${DIR}/bin/$b"
+            strip "dist/${DIR}/bin/$b"
+            chmod 0755 "dist/${DIR}/bin/$b"
+          done
+          mkdir -p "dist/${DIR}/packaging"
+          cp packaging/node.example.toml packaging/gateway.example.toml \
+             packaging/quickstart-local.sh packaging/compose.yml packaging/Dockerfile \
+             "dist/${DIR}/packaging/"
+          chmod 0755 "dist/${DIR}/packaging/quickstart-local.sh"
+          cp -r packaging/systemd packaging/prometheus packaging/grafana "dist/${DIR}/packaging/"
+          cp LICENSE "dist/${DIR}/LICENSE"
+          cp packaging/README-release.md "dist/${DIR}/README-release.md"
+          tar czf "dist/${DIR}.tar.gz" -C dist "${DIR}"
+          rm -rf "dist/${DIR}"
+          ( cd dist && sha256sum "${DIR}.tar.gz" > "${DIR}.tar.gz.sha256" )
+          ls -l dist
+          cat "dist/${DIR}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.target }}
+          path: dist/uc2-*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------- sbom
+  # cargo-cyclonedx has no workspace-wide single-document mode: it emits ONE
+  # SBOM per workspace member, into that member's directory. So the release
+  # ships the whole set as one archive rather than pretending a single crate's
+  # graph is the workspace's.
+  sbom:
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sbom
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      # Default feature set on purpose: it is what the shipped binaries are
+      # built with, and an SBOM that lists dependencies nothing in the tarball
+      # links against is a worse answer, not a safer one.
+      - name: Generate the SBOMs
+        run: cargo cyclonedx --format json --spec-version 1.5 --all
+      - name: Collect them into one archive
+        run: |
+          set -euo pipefail
+          OUT="uc2-${VERSION}-sbom"
+          mkdir -p "dist/${OUT}"
+          find . -name '*.cdx.json' -exec cp {} "dist/${OUT}/" \;
+          ls -l "dist/${OUT}"
+          tar czf "dist/uc2-${VERSION}.cdx.tar.gz" -C dist "${OUT}"
+          rm -rf "dist/${OUT}"
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: dist/uc2-*.cdx.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # ------------------------------------------------------------ release-smoke
+  # The gate. Nothing is published unless this passes.
+  #
+  # Two independent proofs of the same artifact:
+  #   1. the tarball, unpacked in a bare ubuntu:24.04 with no toolchain and no
+  #      source tree, running its own quickstart to PASS;
+  #   2. the container image built FROM that tarball, brought up as a
+  #      three-node cluster by packaging/compose.yml and driven through a
+  #      gateway by counter-remote.
+  #
+  # nightly.yml's `quickstart` job runs the same script from a source build
+  # between tags; this one runs it against the actual artifact.
+  release-smoke:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      TARBALL: uc2-${{ needs.version.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: tarball-x86_64-unknown-linux-gnu
+          path: dist
+      - run: ls -l dist
+
+      - name: Checksum the artifact before trusting it
+        run: ( cd dist && sha256sum -c "${TARBALL}.sha256" )
+
+      - name: Quickstart out of the tarball, in a bare container
+        run: scripts/release_smoke.sh "dist/${TARBALL}"
+
+      # ---- the compose smoke: the same binaries, as containers ----
+      - name: Build the image from the tarball
+        run: docker build -f packaging/Dockerfile --build-arg "TARBALL=${TARBALL}" --build-arg "VERSION=${VERSION}" -t uc2:smoke .
+
+      - name: Bring up the three-node compose stack
+        env:
+          UC2_IMAGE: uc2:smoke
+        run: docker compose -f packaging/compose.yml up -d
+
+      # The first request doubles as the readiness probe, the same way
+      # quickstart-local.sh uses it: services still have to attach and the
+      # leader still has to commit its NewTerm frame. `reset` is idempotent,
+      # so retrying it costs nothing.
+      - name: Drive the cluster through a gateway
+        env:
+          UC2_IMAGE: uc2:smoke
+        run: |
+          set -euo pipefail
+          NET=uc2-demo_uc2
+          remote() {
+            docker run --rm --network "$NET" \
+              --entrypoint /usr/local/bin/counter-remote uc2:smoke \
+              --gateways gw0:9200,gw1:9201,gw2:9202 --app-id quickstart \
+              --timeout-secs 30 "$@"
+          }
+          ok=0
+          for _ in $(seq 1 60); do
+            if out=$(remote reset 2>&1); then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo "the compose cluster never answered a reset: $out"; exit 1; }
+          echo "reset -> $out"
+          echo "add 5 -> $(remote add 5)"
+          echo "add 5 -> $(remote add 5)"
+          got=$(remote get --linearizable)
+          echo "get   -> $got"
+          [ "$got" = "value=10" ] || { echo "expected value=10, got '$got'"; exit 1; }
+          echo "compose smoke PASS"
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -f packaging/compose.yml logs --tail 200 || true
+
+      - name: Tear the stack down
+        if: always()
+        run: docker compose -f packaging/compose.yml down -v || true
+
+  # ---------------------------------------------------------------- release
+  # Publishes only on a real v* tag, and only when this is not a dispatch dry
+  # run. `id-token: write` is what makes keyless signing possible and is
+  # scoped to this job (and `image`) alone.
+  release:
+    needs: [version, build, sbom, release-smoke]
+    if: startsWith(github.ref, 'refs/tags/v') && !inputs.dry_run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist
+
+      - name: SHA256SUMS over every artifact
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum uc2-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+
+      - uses: sigstore/cosign-installer@v3
+
+      # Keyless: cosign gets a short-lived certificate bound to this
+      # workflow's OIDC identity, signs, and throws the key away. The bundle
+      # next to each file carries the signature, the certificate and the
+      # transparency-log entry, so verification needs nothing but the file,
+      # the bundle and the identity you expect.
+      - name: Sign every artifact as a blob
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in uc2-*.tar.gz SHA256SUMS; do
+            echo "signing $f"
+            cosign sign-blob --yes --bundle "${f}.sigstore.json" "$f"
+          done
+          ls -l
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/uc2-*.tar.gz
+            dist/uc2-*.tar.gz.sha256
+            dist/uc2-*.sigstore.json
+            dist/SHA256SUMS
+            dist/SHA256SUMS.sigstore.json
+          generate_release_notes: false
+          body: |
+            ## ultima_cluster ${{ env.VERSION }}
+
+            What changed, and what it obliges you to do when upgrading, is in
+            [RELEASES.md](https://github.com/PeterKnego/ultima_cluster/blob/v${{ env.VERSION }}/RELEASES.md).
+            The engineering-level record is in
+            [docs/releases.md](https://github.com/PeterKnego/ultima_cluster/blob/v${{ env.VERSION }}/docs/releases.md).
+
+            **Verify before you run it.** Every file below is signed keylessly
+            by this repository's `release.yml`; there is no long-lived key:
+
+            ```sh
+            sha256sum -c SHA256SUMS --ignore-missing
+            cosign verify-blob \
+              --bundle uc2-${{ env.VERSION }}-x86_64-unknown-linux-gnu.tar.gz.sigstore.json \
+              --certificate-identity-regexp \
+                'https://github.com/PeterKnego/ultima_cluster/.github/workflows/release.yml@refs/tags/v.*' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              uc2-${{ env.VERSION }}-x86_64-unknown-linux-gnu.tar.gz
+            ```
+
+            Container image: `ghcr.io/peterknego/uc2:${{ env.VERSION }}`
+            (also signed — `cosign verify` with the same two flags).
+
+            Unpack and run `packaging/quickstart-local.sh` for a real
+            three-node cluster on one host; see `README-release.md` inside the
+            tarball.
+
+  # ---------------------------------------------------------------- image
+  # Multi-architecture image, built from the SAME tarballs the release ships:
+  # `/usr/local/bin` in the image is byte-identical to what SHA256SUMS covers,
+  # not a second build that merely claims the same version.
+  image:
+    needs: [version, build, release-smoke]
+    if: startsWith(github.ref, 'refs/tags/v') && !inputs.dry_run
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: tarball-*
+          merge-multiple: true
+      - run: ls -l dist
+
+      # qemu is only for the unpack stage's `tar` on the arm64 leg — the
+      # binaries themselves were built natively in the `build` job.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: packaging/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=${{ env.VERSION }}
+          tags: ${{ env.IMAGE_NAME }}:${{ env.VERSION }}
+          push: true
+          provenance: false
+
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the image by digest
+        run: cosign sign --yes "${IMAGE_NAME}@${DIGEST}"
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}

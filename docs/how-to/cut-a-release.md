@@ -1,0 +1,188 @@
+# Cut a release
+
+You are shipping a version of `ultima_cluster` to people who did not build it.
+That means three separate publications, in a fixed order: the **tagged
+artifacts** (tarballs, checksums, SBOM, signatures) and the **container
+image**, both produced by `.github/workflows/release.yml` when you push a tag;
+and the **crates.io publish**, which is manual, sequential, and permanent.
+
+The first two are reversible — delete a release, delete a tag. The third is
+not: a version published to crates.io can be yanked but never replaced. So the
+order below is deliberate. Publish to crates.io last, after the tag has built
+and the artifacts have been verified.
+
+Everything here assumes you are on `main`, with the work merged and CI green.
+
+## 1. Before the tag: the writeup is part of the release
+
+CLAUDE.md's rule, and it is not ceremony — the tag must *contain* the
+documentation for what it changes, because the tag is what people read.
+
+- [ ] A new section at the top of `RELEASES.md` (latest first): one bullet per
+      feature, each linking to a how-to/reference/explainer that **exists**;
+      an optional bullet for fixed bugs; an optional bullet for performance,
+      linking the gate doc.
+- [ ] The matching per-release entry in `docs/releases.md`.
+- [ ] A sweep of `QUICKSTART.md`, `docs/how-to/`, `docs/reference/` for
+      statements this release invalidated. Upgrade consequences that refuse to
+      start an old config (v2.6.0's `[crypto]`/`[admin]` sections, for
+      instance) belong in `docs/how-to/upgrade-a-cluster.md`, in the imperative.
+- [ ] The version bumped in the root `Cargo.toml`'s `[workspace.package]`, and
+      every intra-workspace `version = "…"` dependency pin with it. They move
+      in lockstep; `cargo package` is what catches a straggler, and CI's
+      `publish-check` job runs it on every push.
+
+## 2. Check the version the way the workflow will
+
+`release.yml` refuses to build a tag whose version disagrees with the
+manifest, so find out before you tag:
+
+```sh
+cargo metadata --no-deps --format-version 1 \
+  | jq -r '.packages[] | select(.name=="uc2_node") | .version'
+```
+
+The tag is that string with a `v` in front: `2.6.0` → `v2.6.0`. A release
+candidate may add a prerelease suffix the manifest does not carry — `v2.6.0-rc.1`
+against a `2.6.0` workspace is accepted, and is the pattern in step 3.
+
+## 3. Exercise the workflow before you spend the real tag
+
+Two ways, cheapest first.
+
+**A dispatch dry run.** Actions → *release* → *Run workflow*, leaving
+`dry_run` ticked. It builds both tarballs, generates the SBOM, and runs the
+full `release-smoke` job — the tarball unpacked in a bare `ubuntu:24.04` with
+no toolchain in it, plus the compose stack driven through a gateway — then
+stops. Nothing is published, nothing is signed, and the version is
+`0.0.0-dry`. Use this after any edit to `release.yml`, the `Dockerfile`,
+`compose.yml` or `quickstart-local.sh`.
+
+**A release candidate.** A dry run cannot exercise signing (no OIDC identity
+is minted for it), the GitHub Release, or the ghcr push. An `-rc` tag can:
+
+```sh
+git tag -s v2.6.0-rc.1 -m "ultima_cluster 2.6.0-rc.1"
+git push origin v2.6.0-rc.1
+```
+
+It produces a real, verifiable, fully-signed release — of a version nobody
+will mistake for the final one. Do this **once per release**, verify it with
+step 5, then delete the tag and the release if you like. The rc is also the
+only way to test that `cosign verify-blob` works for someone who is not you.
+
+## 4. Tag it
+
+```sh
+git tag -s v2.6.0 -m "ultima_cluster 2.6.0"
+git push origin v2.6.0
+```
+
+`-s` signs the tag with your GPG key — a different signature from cosign's,
+covering a different thing (that *you* made this commit a release, rather than
+that *this workflow* made those files).
+
+Then watch the run. Jobs, in order:
+
+| job | what it proves |
+| --- | --- |
+| `version` | the tag and the manifest agree |
+| `build` (×2) | the five binaries compile `--locked` on native x86_64 and native aarch64 hardware, and tar up with the packaging assets |
+| `sbom` | a CycloneDX document per workspace crate |
+| `release-smoke` | **the gate.** The x86_64 tarball, unpacked in a bare container with no Rust in it, runs its own quickstart to `PASS`; then the same binaries, as containers, form a three-node cluster and answer a linearizable read through a gateway |
+| `release` | tarballs + `SHA256SUMS` + SBOM signed keylessly, GitHub Release published |
+| `image` | `ghcr.io/peterknego/uc2:<version>` pushed for amd64 + arm64, signed by digest |
+
+Nothing is published unless `release-smoke` passes. If it fails, fix the
+cause, delete the tag (`git push --delete origin v2.6.0 && git tag -d v2.6.0`)
+and tag again — do not push a `v2.6.0.1`.
+
+## 5. Verify what was published, as a stranger would
+
+Do this from a clean directory, downloading from the release page. You are
+checking the thing users will download, not the thing your runner produced.
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+
+cosign verify-blob \
+  --bundle uc2-2.6.0-x86_64-unknown-linux-gnu.tar.gz.sigstore.json \
+  --certificate-identity-regexp \
+    'https://github.com/PeterKnego/ultima_cluster/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  uc2-2.6.0-x86_64-unknown-linux-gnu.tar.gz
+
+cosign verify \
+  --certificate-identity-regexp \
+    'https://github.com/PeterKnego/ultima_cluster/.github/workflows/release.yml@refs/tags/v.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  ghcr.io/peterknego/uc2:2.6.0
+```
+
+The `--certificate-identity-regexp` is the whole point. Signing is keyless:
+there is no private key, and a signature on its own proves nothing except that
+*somebody* had a sigstore certificate. What makes it meaningful is pinning
+**which workflow, in which repository, on what kind of ref** was allowed to
+produce it. Verifying without those two flags is not verification.
+
+Then run the artifact:
+
+```sh
+tar xzf uc2-2.6.0-x86_64-unknown-linux-gnu.tar.gz
+uc2-2.6.0-x86_64-unknown-linux-gnu/packaging/quickstart-local.sh
+```
+
+It should print `PASS` on a machine that has never had a Rust toolchain on it.
+
+## 6. Publish to crates.io — manually, in this order
+
+This is not in the workflow, on purpose. Twelve crates, each of which must be
+*indexed* by the registry before the next one can resolve it, and every
+version is permanent. An automated retry loop against an irreversible
+operation is a bad trade; a person watching each one is not.
+
+Order is dependency order — it is the only order that resolves:
+
+```sh
+cargo publish -p ultima-journal
+cargo publish -p uc_protocol
+cargo publish -p uc2_crypto
+cargo publish -p uc2_log
+cargo publish -p uc2_consensus
+cargo publish -p uc2_net
+cargo publish -p uc2_client
+cargo publish -p uc2_node
+cargo publish -p uc2_service
+cargo publish -p uc2_remote
+cargo publish -p uc2_gateway
+cargo publish -p uc2ctl
+```
+
+Wait for each to appear on crates.io before starting the next — `cargo
+publish` returns before the index has caught up, and the next crate's
+dependency resolution reads the index. Modern cargo blocks on this for you;
+if a publish fails with "no matching package named …", the previous one has
+not indexed yet, so wait and re-run just that one.
+
+`uc2_sim`, `uc-lincheck`, `counter` and `uc2-crashtest` are `publish = false`:
+they are the proof and teaching apparatus, not the product.
+
+If a crate fails partway through the list, the ones before it are already
+public. Fix the failure, bump nothing, and re-run from the crate that failed —
+a half-published version is recoverable; a wrong published version is not.
+
+## 7. After
+
+- [ ] The release page renders, and its links into `RELEASES.md` resolve at
+      the tag (not at `main` — that is why the body pins `v<version>`).
+- [ ] `docker run --rm ghcr.io/peterknego/uc2:2.6.0 --help` works.
+- [ ] The gate doc for the milestone records the release, per the honest-failure
+      protocol every milestone has used.
+
+## Related
+
+- [Upgrade a cluster](upgrade-a-cluster.md) — what an operator has to do to
+  *take* the release you just cut. Read it before writing the `RELEASES.md`
+  section; if it needs a new step, this release is not done.
+- `packaging/README-release.md` — the short README that ships inside the
+  tarball, and the first thing a downloader reads.
