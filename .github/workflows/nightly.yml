@@ -18,6 +18,16 @@ name: nightly
 #                  binaries. The "no toolchain" adoption path (M12c), which
 #                  release.yml's release-smoke job runs against the actual
 #                  tarball — this job keeps it honest between tags.
+#   * fuzz       — M12d: libFuzzer over every decoder that sees bytes it did
+#                  not write (fuzz/README.md's target table), 600 s per
+#                  target, four matrix legs gated by `fuzz-groups` so a new
+#                  target can never be silently left unfuzzed. Nightly
+#                  toolchain; the fuzz crate is outside the workspace.
+#   * miri       — M12d: UB detection over the PURE decoders only
+#                  (uc_protocol's v2 wire/cnc/ipc layer, ultima_journal's
+#                  record/stable_value decoders). The IPC rings are excluded
+#                  and cannot be included — Miri does not support file-backed
+#                  memory mappings; see the job comment and VERIFICATION.md.
 #   * crashtest-crypto / elle-crypto — M8 Task 15: the crashtest and elle
 #                  clean tiers re-run with UC2_CRYPTO=1 (wire crypto Enabled
 #                  on every spawned node). The lincheck crypto variants
@@ -231,3 +241,178 @@ jobs:
           cargo run -p uc2_consensus --release --example conform_gen -- \
             --out "$HOME/.cache/uc2-conform/vectors.jsonl" --count 100000 --seed "$(date +%Y%m%d)"
           cd proofs && lake exe conform "$HOME/.cache/uc2-conform/vectors.jsonl"
+
+  # M12d: the four fuzz matrix legs are declared HERE, once, and this job
+  # asserts their union is exactly the set of fuzz targets declared in
+  # fuzz/Cargo.toml. Adding a 15th [[bin]] without assigning it to a group
+  # fails the workflow here, in ~10 seconds, before any sanitizer build —
+  # which is the only way "every target is fuzzed nightly" stays true. No
+  # toolchain needed: it reads the manifest, it does not build it.
+  fuzz-groups:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      groups: ${{ steps.groups.outputs.groups }}
+      all: ${{ steps.groups.outputs.all }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Declare the groups and check them against fuzz/Cargo.toml
+        id: groups
+        env:
+          # One line per matrix leg. Budget: 600 s per target, so keep legs
+          # at four targets or fewer to stay inside the 60-minute job timeout.
+          FUZZ_GROUPS: |
+            uc_protocol_datagram uc_protocol_log_frame uc_protocol_cnc uc2_remote_frame
+            uc2_crypto_open uc2_crypto_handshake uc2_crypto_group_key uc2_crypto_admin
+            ultima_journal_record ultima_journal_stable_value uc2_service_session
+            uc2_node_toml uc2_gateway_toml uc2_node_http
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, sys
+
+          groups = [ln.split() for ln in os.environ["FUZZ_GROUPS"].splitlines() if ln.strip()]
+          flat = [t for g in groups for t in g]
+
+          # `seed-corpus` is the corpus GENERATOR bin, not a fuzz target
+          # (scripts/fuzz_smoke.sh skips it too).
+          manifest = open("fuzz/Cargo.toml").read()
+          targets = [n for n in re.findall(r'^name = "(.+)"$', manifest, re.M)
+                     if n not in ("uc2-fuzz", "seed-corpus")]
+
+          dupes = sorted({t for t in flat if flat.count(t) > 1})
+          if dupes:
+              sys.exit(f"FUZZ GROUPING: target(s) in more than one group: {dupes}")
+
+          ungrouped = sorted(set(targets) - set(flat))
+          if ungrouped:
+              sys.exit("FUZZ GROUPING: fuzz/Cargo.toml declares target(s) that no matrix "
+                       f"group runs: {ungrouped}. Add them to FUZZ_GROUPS in nightly.yml.")
+
+          stale = sorted(set(flat) - set(targets))
+          if stale:
+              sys.exit("FUZZ GROUPING: a matrix group names target(s) that fuzz/Cargo.toml "
+                       f"does not declare: {stale}.")
+
+          print(f"{len(targets)} targets in {len(groups)} groups", file=sys.stderr)
+          print("groups=" + json.dumps([" ".join(g) for g in groups]))
+          print("all=" + " ".join(sorted(targets)))
+          PY
+
+  # M12d: coverage-guided fuzzing of every decoder that sees bytes it did not
+  # write — the pre-auth UDP datagram path, the crypto handshake/AEAD framing,
+  # the remote/gateway TCP frame, the on-disk journal artifacts, the config
+  # parsers and the unauthenticated /metrics HTTP request line. fuzz/README.md
+  # is the target table. Runs on nightly (libfuzzer-sys needs -Z sanitizer);
+  # the fuzz crate is deliberately outside the workspace, so the workspace
+  # itself stays on the pinned stable. A crash uploads fuzz/artifacts and
+  # fails the leg. 600 s per target on the committed corpus: this is a
+  # regression gate ("no new crash from this corpus in that budget"), not a
+  # bug hunt — real hunting is a long local `cargo fuzz run`.
+  fuzz:
+    needs: fuzz-groups
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        group: ${{ fromJSON(needs.fuzz-groups.outputs.groups) }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          key: fuzz
+      - name: Install cargo-fuzz
+        # Explicit `+nightly`: rust-toolchain.toml pins stable 1.96.0 for this
+        # directory, and without the override rustup would download that whole
+        # toolchain just to build a host tool this job never uses it for.
+        run: cargo +nightly install cargo-fuzz --locked --version 0.13.2
+      - name: cargo fuzz list agrees with the declared groups
+        # fuzz-groups checked the manifest; this checks what cargo-fuzz
+        # actually enumerates, which is the list the smoke script would use
+        # with no target arguments. Belt and braces, ~1 s.
+        env:
+          FUZZ_ALL: ${{ needs.fuzz-groups.outputs.all }}
+        run: |
+          set -euo pipefail
+          cd fuzz
+          cargo +nightly fuzz list | grep -v '^seed-corpus$' | sort > "$RUNNER_TEMP/listed.txt"
+          printf '%s\n' $FUZZ_ALL | sort > "$RUNNER_TEMP/grouped.txt"
+          if ! diff -u "$RUNNER_TEMP/grouped.txt" "$RUNNER_TEMP/listed.txt"; then
+            echo "FUZZ GROUPING: 'cargo fuzz list' and nightly.yml's FUZZ_GROUPS disagree (diff above)."
+            exit 1
+          fi
+      - name: Fuzz (600 s per target, >=10 000 runs each)
+        # --min-runs is not paranoia. A target can build, run, print a clean
+        # line and exit 0 having executed ~16 inputs: llvm-symbolizer stalling
+        # on 27 MB of debug info did exactly that to four of these targets
+        # (fixed with -print_funcs=0, see scripts/fuzz_smoke.sh). 10 000 is
+        # three to five orders of magnitude below what a healthy target does
+        # in 600 s, so it flags a stalled run without flaking on a slow runner.
+        env:
+          FUZZ_GROUP: ${{ matrix.group }}
+        run: scripts/fuzz_smoke.sh --min-runs 10000 600 $FUZZ_GROUP
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts-${{ strategy.job-index }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  # M12d: Miri (UB detection under a symbolic interpreter) over the PURE
+  # decoders only — uc_protocol's v2 wire/cnc/ipc layer and version packing,
+  # and ultima_journal's segment/stable_value record decoders. These are the
+  # surfaces the fuzz targets drive, so Miri and libFuzzer cover the same
+  # code from two directions: libFuzzer finds inputs that panic, Miri finds
+  # UB on inputs that do not.
+  #
+  # The IPC ring buffers are deliberately NOT here. They are file-backed
+  # shared memory, and Miri cannot model that at any setting:
+  #   * with isolation on (the default):
+  #       unsupported operation: `open` not available when isolation is enabled
+  #   * with -Zmiri-disable-isolation, it gets one step further and stops on
+  #       unsupported operation: unsupported flags for `fallocate` in `mode`
+  #       argument: 16                                 (FALLOC_FL_ZERO_RANGE)
+  #   * and past that it would stop regardless, on
+  #       unsupported operation: Miri does not support file-backed memory
+  #       mappings
+  # A Vec-backed ring variant built purely for Miri is the stated fallback;
+  # it is NOT built, because it would check a different object than the one
+  # that ships. The rings' concurrency is covered by loom instead (see the
+  # `loom` job) and their layout by offset-pin tests. docs/VERIFICATION.md
+  # says this out loud rather than implying the rings are Miri-clean.
+  #
+  # Test selection is by filter, and every selected test was run locally
+  # under Miri first: all 43 + 19 pass with isolation ON, so nothing here
+  # needed excluding and isolation is never disabled.
+  miri:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri
+      - name: cargo miri setup
+        run: cargo +nightly miri setup
+      # Explicit `+nightly` (not plain `cargo`) so this genuinely runs on
+      # nightly rather than being redirected by rust-toolchain.toml's
+      # directory override — same reason ci.yml's msrv job spells it out.
+      - name: Miri — uc_protocol wire/cnc/ipc decoders (43 tests)
+        run: |
+          cargo +nightly miri test -p uc_protocol --lib -- v2:: version::
+      - name: Miri — ultima_journal record/stable_value decoders (19 tests)
+        run: |
+          cargo +nightly miri test -p ultima-journal --lib -- \
+            stable_value::tests:: error::tests:: \
+            journal::segment::tests::header_ \
+            journal::segment::tests::record_ \
+            journal::segment::tests::decode_

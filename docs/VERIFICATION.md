@@ -9,9 +9,10 @@ verification, and they carry very different weight. Everything below is sorted b
 the strength of the evidence, and the boundaries between tiers are stated
 explicitly rather than blurred.
 
-**Status of this document:** current as of the M8 gate (2026-07-29). Each section
-cites the dated record it summarizes; where the two disagree, the dated record
-wins.
+**Status of this document:** current as of the M12d security-posture pass
+(2026-08-23), which added §7; the proof, simulation and capstone tiers are as of
+the M8 gate (2026-07-29). Each section cites the dated record it summarizes;
+where the two disagree, the dated record wins.
 
 ---
 
@@ -26,6 +27,8 @@ wins.
 | **Elle** | Checked on real processes | Transactional safety (serializable and strict) — plus a mutation tier proving the harness has teeth |
 | **Multi-process crashtest** | Checked on real processes | Recovery correctness under `SIGKILL` mid-load |
 | **loom** | Exhaustive over interleavings | The frame-visibility memory protocol |
+| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the fourteen decoders that see bytes the process did not write |
+| **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders (**not** the file-backed rings) |
 | **Veil** | Bug-hunting only — **never the record** | Bounded model checking of the election and reconfiguration planes |
 
 ### The headline result
@@ -125,7 +128,7 @@ Every theorem passes `#print axioms` with only the standard Lean/mathlib trio �
 - No `sorry`, anywhere in the chain.
 - No `native_decide` (which would place the Lean compiler in the trusted base).
 - No project-local axiom escape hatches.
-- **No SMT.** Nothing in `proofs/` calls a solver; see §7 on Veil.
+- **No SMT.** Nothing in `proofs/` calls a solver; see §8 on Veil.
 
 ### The model-versus-code gap, and the rig that closes it
 
@@ -314,7 +317,151 @@ layout change cannot pass silently.
 
 ---
 
-## 7. Veil — bug-hunting only, never the record
+## 7. Fuzzing — decoders total on untrusted bytes
+
+**Location:** [`fuzz/`](/fuzz) · **Runner:** [`scripts/fuzz_smoke.sh`](/scripts/fuzz_smoke.sh)
+· **CI:** `nightly.yml`'s `fuzz-groups` + `fuzz` jobs
+
+Every place ultima_cluster parses bytes it did not write has a
+structure-unaware [libFuzzer](https://llvm.org/docs/LibFuzzer.html) target
+behind it. The property under test is **totality**: for any input, the decoder
+returns a value or an error — it does not panic, does not index out of bounds,
+and does not allocate a size an attacker chose. Panicking is not a memory-safety
+failure in Rust, but on a node it is a fail-stop: the datagram path runs on the
+receiver agent and `apply` runs on the service's apply thread, so a panic there
+takes the process down. Availability is the thing being defended here.
+
+### The fourteen targets
+
+| Target | Seam, and why its input is untrusted |
+|---|---|
+| `uc_protocol_datagram` | `uc_protocol::v2::datagram` — the 16-byte header and every body reader. The **first code an unauthenticated UDP packet reaches**; with `[crypto].enabled = false` it is reached before any authentication at all. |
+| `uc_protocol_log_frame` | `uc_protocol::v2::frame::read_header`, driven behind the real caller's `len >= HEADER_LEN` guard. Deliberately caller-guarded, so the target pins the guard's contract rather than pretending it is absent. |
+| `uc_protocol_cnc` | `uc_protocol::v2::cnc` — the 4 KiB control page every attaching process maps and parses. A file on disk any local process with write access can corrupt. |
+| `uc2_remote_frame` | `uc2_remote::frame` — the gateway edge's 24-byte TCP frame header and every typed body decoder. Input from any client that can open a socket to the gateway. |
+| `uc2_crypto_open` | `uc2_crypto::seal::{open_in_place, open_detached}` — the AEAD envelope's framing arithmetic, which runs on attacker-chosen bytes *before* the tag has been verified. |
+| `uc2_crypto_handshake` | `uc2_crypto::handshake::Peers::on_message` — the pre-auth Noise `IK` surface. With crypto enabled this is the first thing in the process to see bytes from anyone who can reach the UDP port. |
+| `uc2_crypto_group_key` | `uc2_crypto::group::GroupPlane::on_key_message` — the two distinct message shapes that share datagram kind 20, i.e. a decoder that must disambiguate hostile input. |
+| `uc2_crypto_admin` | `uc2_crypto::admin` — a **property** target over the M12b signed-tag layout: canonical-length agreement, sign/verify round-trip, tag bit-flips rejected, foreign key rejected. |
+| `ultima_journal_record` | `ultima_journal`'s segment header and record decoder — what crash recovery meets in a torn or corrupt segment after a power loss or a full disk. |
+| `ultima_journal_stable_value` | `ultima_journal::stable_value` — the durable vote / term map / snapshot floor slots. Corruption here is a consensus-safety input, not merely a data-loss one. |
+| `uc2_service_session` | `Sessioned<S>` — the exactly-once envelope under a fuzz-derived, deliberately tiny `SessionConfig` so client eviction, byte eviction and window trim are all reachable, plus its snapshot install path. |
+| `uc2_node_toml` | `uc2_node::config_file::parse_str` — the `node.toml` parser behind every M9/M11/M12b named startup refusal. |
+| `uc2_gateway_toml` | `uc2_gateway::config_file::parse_str` — the gateway's whole named-refusal path, including its own `EdgeConfig::validate`. |
+| `uc2_node_http` | `uc2_node::obs::http::route_raw` — the **unauthenticated** `/metrics` + `/healthz` + `/readyz` request parser. |
+
+### Method
+
+Seeds are generated from fixed literals by the real encoders (`cargo +nightly
+run --bin seed-corpus`), so the committed corpus is deterministic and a corpus
+change is reviewable in a diff. Nightly CI runs every target for **600 seconds**
+on that corpus across four matrix legs; a crash fails the leg and uploads the
+artifact. The `fuzz-groups` job asserts the legs' union is exactly the set of
+declared targets, so a new target cannot be silently left unfuzzed.
+
+Two honest limits on what a green run means. First, this is a **regression
+gate** — "no new crash from this corpus in that budget" — not a bug hunt; real
+hunting is a long local `cargo fuzz run`. Second, a fuzz job can be green while
+fuzzing almost nothing, so the runner asserts a floor on libFuzzer's reported
+execution count (`--min-runs 10000` against 600 s). That assertion exists
+because it happened: see the harness finding below.
+
+### What it found
+
+- **Five caller-guarded datagram readers panicked on short slices.**
+  `read_datagram_header`, `read_request_vote_body`, `read_vote_body`,
+  `read_nak_body` and `read_status_body` sliced fixed offsets out of their
+  input, relying entirely on every caller's length pre-guard. Every caller did
+  in fact guard, so this was never reachable through the receiver — but a
+  totality property that holds only by the discipline of five call sites is a
+  property waiting to be broken by the sixth. All five now return `Option` and
+  are total; the pre-guards were kept, so behaviour on the real path is byte for
+  byte unchanged.
+- **`Sessioned::apply` violated the contract it was itself a caller of** —
+  user-reachable, and a fail-stop. `RawStateMachine::apply` documents `out` as
+  *cleared by the caller*; `Sessioned` pushed its one-byte FRESH tag into `out`
+  first and then recovered the response as `out[1..]`. An inner state machine
+  that starts with `out.clear()` — which the contract invites — truncated the
+  tag away and the slice panicked **on the apply thread**, killing the service on
+  its first command. Found by the session target's seed generator before the
+  target had been fuzzed once. Fixed by giving the inner machine a genuinely
+  cleared buffer; the regression test asserts the response **bytes**, and the
+  fuzz target's inner machine deliberately keeps its `out.clear()` so the fix
+  stays guarded.
+- **`Sessioned::install_snapshot` pre-allocated up to 1 GiB from an unvalidated
+  length.** It read an 8-byte length, bounds-checked it against a 1 GiB ceiling,
+  and then `vec![0u8; len]` before reading a single blob byte — using the sanity
+  bound as an instruction rather than a ceiling. A truncated or corrupt snapshot
+  artifact therefore cost a 1 GiB zeroing and an RSS spike per attempt, on the
+  apply thread. Now bounded with `take(len)` plus a named truncation error.
+  Found not as a crash but as a **throughput collapse** — ten executions in
+  ninety seconds where every other target did millions; 20 000 executions went
+  91.8 s → 0.34 s after the fix.
+- **A harness finding worth recording, because it nearly invalidated the
+  tier.** Four of the fourteen targets were executing roughly *sixteen inputs
+  per sixty-second run* while printing a perfectly clean line. libFuzzer
+  symbolizes each newly discovered function to print a `NEW_FUNC` line, and the
+  release profile keeps `debug = 1`, so `llvm-symbolizer` needed about ninety
+  seconds to index one binary for a single address — longer than the whole
+  budget. `-print_funcs=0` fixed it (400 runs: 90,180 ms → 57 ms). The lesson is
+  not the flag; it is that **a fuzz tier can be green and vacuous**, which is why
+  the run-count floor is now asserted in the script and in CI.
+
+### What fuzzing here does *not* cover
+
+- **`FramedConn::read_frame`'s accumulate loop.** The targets drive the frame
+  *decoder*; the socket-side loop that assembles partial reads into a frame is
+  covered by the gateway's own tests, not by libFuzzer.
+- **`CncPage` over a real mmap.** The cnc target parses a byte slice. The real
+  page is a shared, concurrently written memory map; its layout is pinned by
+  offset-assertion tests and its concurrency is not a fuzzing question.
+- **The receiver's stateful dispatch.** Each target is one decoder on one input.
+  Sequences of datagrams that drive the receiver's state machine across terms,
+  epochs and sessions are the simulation's and the capstones' job (§2, §3).
+- **`bincode` itself, and the `ultima-db` `snapshot_stream` adapter.** Both are
+  external crates reached through these seams; they are dependency-posture
+  questions (`deny.toml`, SBOM), not targets here.
+
+### Miri — UB detection over the pure decoders
+
+The same decoders are run under [Miri](https://github.com/rust-lang/miri) in
+nightly CI (`miri` job): `uc_protocol`'s `v2::` wire/cnc/ipc layer and `version`
+packing (43 tests), and `ultima_journal`'s segment and `stable_value` record
+decoders (19 tests). libFuzzer finds inputs that panic; Miri finds undefined
+behaviour on inputs that do not. Every selected test passes with Miri's
+**isolation left on** — nothing needed excluding, and isolation is never
+disabled.
+
+**The IPC ring buffers are not Miri-checked, and cannot be.** They are
+file-backed shared memory, and Miri stops on them at three separate points:
+with isolation on it stops at
+
+```text
+unsupported operation: `open` not available when isolation is enabled
+```
+
+with `-Zmiri-disable-isolation` it gets one step further and stops at
+
+```text
+unsupported operation: unsupported flags for `fallocate` in `mode` argument: 16
+```
+
+(mode 16 is `FALLOC_FL_ZERO_RANGE`, the M11 block-reservation fix), and past
+that it would stop regardless, on
+
+```text
+unsupported operation: Miri does not support file-backed memory mappings
+```
+
+A Vec-backed ring variant built purely so Miri could run it is
+the stated fallback and **has not been built**, because it would check a
+different object than the one that ships. The rings' concurrency is covered by
+loom (§6) and their layout by offset-pin tests; their `unsafe` mmap code is
+covered by neither, which is stated again in §11.
+
+---
+
+## 8. Veil — bug-hunting only, never the record
 
 **Location:** [`proofs-veil/`](/proofs-veil) (archive) · **Record:**
 [`docs/benchmarks/uc2-veil-commit-plane-checkpoint-2026-07-26.md`](/docs/benchmarks/uc2-veil-commit-plane-checkpoint-2026-07-26.md)
@@ -343,7 +490,7 @@ made its strongest claims unfalsifiable. The distinction is the point.
 
 ---
 
-## 8. Benchmark methodology
+## 9. Benchmark methodology
 
 Verification claims and performance claims fail the same way — by choosing the
 bar after seeing the number. Every milestone gate in
@@ -363,17 +510,17 @@ result are separate commits, in that order.
 
 ---
 
-## 9. Continuous integration
+## 10. Continuous integration
 
 | Workflow | Contents |
 |---|---|
 | `ci.yml` | Fast gate on every PR: workspace build, tests, clippy `-D warnings` |
-| `nightly.yml` | Full proof suite — lincheck capstones, `sim-heavy`, loom, crashtest, Elle clean tier, `lean-proofs` conformance replay with a date-rotated seed |
+| `nightly.yml` | Full proof suite — lincheck capstones, `sim-heavy`, loom, crashtest, Elle clean tier, `lean-proofs` conformance replay with a date-rotated seed, `fuzz` (four legs, 600 s per target, with an asserted run-count floor) and `miri` (pure decoders) |
 | `elle-weekly.yml` | Elle mutation tier |
 
 ---
 
-## 10. What is *not* verified
+## 11. What is *not* verified
 
 The most important section, and the one most projects omit.
 
@@ -398,7 +545,19 @@ The most important section, and the one most projects omit.
   Nondeterminism in `apply` — clocks, iteration order, floats, ambient state —
   produces divergence that no layer here can catch.
 - **Bounded model checks are bounded.** Veil's clean runs are exhaustive to a
-  depth, not to all executions (§7).
+  depth, not to all executions (§8).
+- **The IPC rings are not Miri-checked** (§7). Miri does not support file-backed
+  memory mappings, so the `unsafe` shared-memory code — the one place in the
+  system where a Rust memory-safety bug is most plausible — is covered by loom
+  for its interleavings and by offset-pin tests for its layout, and by neither
+  for undefined behaviour. A Vec-backed ring variant would let Miri run, and
+  would be checking a different object than the one that ships; it has not been
+  built, and that trade-off is recorded rather than resolved.
+- **Fuzzing is a regression gate, not a proof of totality** (§7). Green means no
+  new crash from the committed corpus inside the budget. It does not mean the
+  decoders are total for all inputs, and it says nothing about stateful
+  sequences across the receiver's dispatch or about the external crates
+  (`bincode`, the `ultima-db` snapshot adapter) reached through those seams.
 - **The published gate numbers are fleet measurements**, on the hardware and
   configuration each record names. They are reproducible, not universal.
 - **Wire crypto is opt-in and off by default.** With it disabled the posture is a
@@ -431,6 +590,16 @@ cargo test -p uc2-crashtest --features hard-crash-tests
 
 # Memory model
 RUSTFLAGS="--cfg loom" cargo test -p uc2_log --test loom_frame --release
+
+# Fuzzing — needs nightly + cargo-fuzz; CI uses 600 with --min-runs 10000
+scripts/fuzz_smoke.sh 30                                    # every target
+scripts/fuzz_smoke.sh --min-runs 10000 600 uc2_node_toml    # one, at CI budget
+
+# Miri — the pure decoders (needs the miri component on nightly)
+cargo +nightly miri test -p uc_protocol --lib -- v2:: version::
+cargo +nightly miri test -p ultima-journal --lib -- \
+  stable_value::tests:: error::tests:: journal::segment::tests::header_ \
+  journal::segment::tests::record_ journal::segment::tests::decode_
 ```
 
 Elle histories must not be written to `/tmp` on a RAM-backed box; both scripts

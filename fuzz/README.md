@@ -50,14 +50,25 @@ somewhere and attach it to the issue.
 ## The smoke run
 
 ```bash
-scripts/fuzz_smoke.sh              # 30 s per target, every target
+scripts/fuzz_smoke.sh                                  # 30 s per target, every target
 scripts/fuzz_smoke.sh 60 uc_protocol_datagram
+scripts/fuzz_smoke.sh --min-runs 10000 600 uc2_node_toml
 ```
 
 Runs each target for `SECS` seconds against the committed corpus and exits 1
 on the first crash, naming the artifact directory. With no target arguments it
 enumerates targets with `cargo fuzz list` and **skips the `seed-corpus`
 generator bin**, which is a `[[bin]]` in this manifest but not a fuzz target.
+
+`--min-runs N` makes the script assert, after each target, that libFuzzer's
+`Done <N> runs` line reports at least `N` executions. This is not decoration:
+a target can build, run for its full budget, print a clean line and exit 0
+having executed about sixteen inputs. That is exactly what an `llvm-symbolizer`
+stall did to four of these targets before `-print_funcs=0` was added, and the
+smoke run reported "all targets clean" throughout. Without a floor, green does
+not mean *fuzzed*. CI passes `--min-runs 10000` against a 600 s budget — three
+to five orders of magnitude below what a healthy target does, so it catches a
+stall without flaking on a slow runner.
 
 Note that this repo sets a global `CARGO_TARGET_DIR`
 (`~/.cache/cargo-target`), so the sanitizer-instrumented fuzz builds land in
@@ -68,6 +79,35 @@ cleaned by removing `fuzz/target/` either. This is the CI-shaped
 invocation: short, deterministic-ish, and green means "no new crash from this
 corpus in that budget" — it is a regression gate, not a bug hunt. Real hunting
 is a long `cargo fuzz run` with a large `-max_total_time`.
+
+## How CI runs this
+
+`nightly.yml` has two jobs (`.github/workflows/nightly.yml`):
+
+* **`fuzz-groups`** — the four matrix legs are declared once, in that job's
+  `FUZZ_GROUPS` env, and a ~10-second Python step asserts their union is
+  **exactly** the set of `[[bin]]` targets in `fuzz/Cargo.toml` (minus the
+  `seed-corpus` generator), with no target in two legs and no leg naming a
+  target that no longer exists. Adding a fifteenth target without assigning it
+  to a group fails the workflow here, before any sanitizer build. This is the
+  mechanism that keeps "every target is fuzzed nightly" a fact rather than an
+  intention — so when you add a target (see below), add it to a group.
+* **`fuzz`** — four parallel legs, `600` seconds per target on the committed
+  corpus, `--min-runs 10000`, `fail-fast: false`. A crash fails the leg and
+  uploads `fuzz/artifacts` as a workflow artifact. A second cheap step
+  re-checks the declared list against what `cargo fuzz list` actually
+  enumerates, so the manifest parse and cargo-fuzz can never quietly diverge.
+
+Both run on the `nightly` toolchain via `dtolnay/rust-toolchain@master`; the
+workspace's own jobs stay on the pinned stable. The build cache is
+`Swatinem/rust-cache@v2` with `workspaces: fuzz` — a cold sanitizer build is
+two to three minutes. (The global `CARGO_TARGET_DIR` caveat below is a
+property of this dev box, not of CI: runners have no such setting, so the
+fuzz builds land under `fuzz/target/` there and the cache action finds them.)
+
+Budget arithmetic, for whoever adds target fifteen: 600 s per target against a
+60-minute job timeout means **four targets per leg is the ceiling**, minus the
+build. Add a fifth leg rather than a fifth target.
 
 ## Regenerating the seed corpus
 
@@ -147,4 +187,8 @@ without promoting the seam to a Cargo feature (which would make it API).
 2. Append a `[[bin]]` block for it to `fuzz/Cargo.toml` (`test`/`doc`/`bench = false`).
 3. Add a `seeds::<name>()` function and a `write_target` call in
    `src/bin/seed_corpus.rs`; run the generator and commit the corpus.
-4. Shared helpers (`uc2_fuzz::split`, `uc2_fuzz::NoopSm`) live in `src/lib.rs`.
+4. **Assign it to a matrix group** in `nightly.yml`'s `fuzz-groups` job. The
+   workflow fails until you do — deliberately.
+5. Add a row to the target table above and a line to `docs/VERIFICATION.md`'s
+   fuzzing section.
+6. Shared helpers (`uc2_fuzz::split`, `uc2_fuzz::NoopSm`) live in `src/lib.rs`.
