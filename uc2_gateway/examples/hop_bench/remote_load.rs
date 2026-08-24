@@ -50,6 +50,13 @@ pub struct Args {
     pub inflight: u64,
     #[arg(long, default_value_t = 1)]
     pub conns: usize,
+    /// Submitter threads per connection, all calling `submit` on the SAME
+    /// `RemoteClient`. `1` is the `m12_gate` shape (one caller thread, which
+    /// leaves the credit window open and so writes one frame per submit);
+    /// more callers keep the window closed so the client's own batching
+    /// engages — at the price of contending its state lock.
+    #[arg(long, default_value_t = 1)]
+    pub senders: usize,
 }
 
 pub fn run(a: Args) -> anyhow::Result<()> {
@@ -81,13 +88,34 @@ pub fn run(a: Args) -> anyhow::Result<()> {
             ..RemoteConfig::default()
         };
         let payload = payload.clone();
+        let senders = a.senders.max(1);
         handles.push(
             std::thread::Builder::new()
                 .name(format!("hb-remote-{i}"))
                 .spawn(move || -> anyhow::Result<StreamStats> {
                     let remote = RemoteClient::connect(cfg)
                         .map_err(|e| anyhow::anyhow!("conn {i}: connect: {e}"))?;
-                    let s = measure(&remote, &payload, t0, deadline);
+                    let s = if senders == 1 {
+                        measure(&remote, &payload, t0, deadline)
+                    } else {
+                        // N caller threads on ONE client: each owns its clock
+                        // and histogram (seqs are per caller, so the slot
+                        // arrays never collide); merged below.
+                        let remote = &remote;
+                        let payload = &payload;
+                        std::thread::scope(|sc| {
+                            let hs: Vec<_> = (0..senders)
+                                .map(|_| sc.spawn(move || measure(remote, payload, t0, deadline)))
+                                .collect();
+                            let mut m = StreamStats::new();
+                            for h in hs {
+                                if let Ok(s) = h.join() {
+                                    m.merge(&s);
+                                }
+                            }
+                            m
+                        })
+                    };
                     let st = remote.stats();
                     println!(
                         "   conn {i}: retries={} redirects={} leader_changes={} reconnects={} \
@@ -126,7 +154,7 @@ pub fn run(a: Args) -> anyhow::Result<()> {
         a.secs,
         a.payload,
         a.inflight,
-        &[("conns", a.conns.to_string())],
+        &[("conns", a.conns.to_string()), ("senders", a.senders.max(1).to_string())],
     );
     Ok(())
 }
