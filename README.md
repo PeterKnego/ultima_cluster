@@ -40,12 +40,14 @@ detection-timing confirmation is still outstanding.
 
 ---
 
-**Status: v2.5.0** — milestones M1–M11 complete: the consensus core and SDK
-(M1–M6), live reconfiguration (M7), opt-in wire crypto (M8), the deployable
-`uc2-node` daemon (M9), the observability layer (M10), and backup/restore,
-quorum-loss recovery, full-disk fail-stop and measured flag-day upgrades
-(M11). What each release introduced, with links to the detailed docs:
-**[RELEASES.md](/RELEASES.md)**.
+**Status: `v2.5.0` released; `v2.6.0` (M12) complete on `main`, tag pending** —
+milestones M1–M12: the consensus core and SDK (M1–M6), live reconfiguration
+(M7), opt-in wire crypto (M8), the deployable `uc2-node` daemon (M9), the
+observability layer (M10), backup/restore, quorum-loss recovery, full-disk
+fail-stop and measured flag-day upgrades (M11), and — merged, written up, and
+awaiting its tag — the gateway kit, admin authentication and audit, signed
+release artifacts, and the security posture package (M12). What each release
+introduced, with links to the detailed docs: **[RELEASES.md](/RELEASES.md)**.
 
 | Gate | Result | Measured on |
 |---|---|---|
@@ -93,6 +95,10 @@ Tarballs (x86-64 and aarch64), a `SHA256SUMS`, a CycloneDX SBOM and
 release workflow. **[`docs/QUICKSTART.md`](/docs/QUICKSTART.md)** has the
 download-and-`cosign verify-blob` step, the annotated configs, and the path
 onto real hosts.
+
+*(The release workflow is built and gated but **`v2.6.0` is not tagged yet** —
+until it is, there is nothing at that download URL and the source paths below
+are the way in.)*
 
 From source, the smallest version of the same thing is one process:
 
@@ -176,7 +182,8 @@ including what is *not* verified and how to reproduce every layer.
 Builds standalone — the only external storage dep, `ultima-db`, comes from
 crates.io.
 
-**On crates.io since `v2.6.0`:** twelve crates, published **in lockstep at
+**To crates.io with `v2.6.0`** (prepared and gated in CI; first published by
+that tag, which is not cut yet)**:** twelve crates, published **in lockstep at
 one version** — which is also the git tag, the tarball name and the image
 tag. That is the thirteen crates in the table above, minus `uc2_sim` and
 `uc-lincheck`, plus `uc2ctl` (the admin CLI: a binary crate, so it has no row

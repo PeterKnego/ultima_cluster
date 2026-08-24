@@ -1,5 +1,331 @@
 # ultima_cluster releases
 
+## v2.6.0 — M12 adoptable cluster — *prepared, not yet tagged*
+
+**Four sub-milestones, one tag.** M12a (gateway kit) merged at `185783e`,
+M12b (admin authn + audit) at `9897219`, M12c (packaging + publishing) at
+`e571c27`, M12d (security posture) on `uc2/m12d-security-posture`. They tag
+together as `v2.6.0`; the tag, the `v2.6.0-rc.1` rehearsal that exercises the
+release workflow for the first time, the two fleet rows, and the external
+review are all separate, user-owned steps. Gate record:
+`docs/benchmarks/uc2-m12-gate-2026-08-22.md`. Spec:
+`docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md`, whose four
+"As built" amendments are the authoritative correction of the sketch against
+what shipped.
+
+**Nothing in this release touches consensus, the node-to-node wire protocol,
+or the cnc page layout.** `uc_protocol::version::CURRENT` stays `0.5.0`. The
+one cnc change is M12b's 64-byte admin-auth line at `CNC_OFF_ADMIN_AUTH =
+3904`, inside the existing reserved band — no version bump, no flag day.
+
+### M12a — the gateway kit (`185783e`)
+
+- **The two-tier state-machine contract.** `RawStateMachine` (`apply(&mut
+  self, position, cmd: &[u8], out: &mut Vec<u8>)`) is the core trait;
+  `ServiceBuilder` takes `S: RawStateMachine`; the typed `StateMachine` is a
+  blanket impl onto it. The decision record is
+  `docs/notes/2026-08-22-codec-budget-spike.md`: an isolated codec ladder
+  measured serde+bincode's `Vec<u8>` handling at 24–40× a hand-laid frame on
+  encode and up to 21× on decode — *not* the format's fault, but serde typing
+  a byte vector as a sequence of `u8` and walking it element-wise — and a
+  **dev-box** `m5_gate` `apply-profile` run put the typed `CountSm` at
+  `sm_apply = 731 ns` per frame (75.8 % of the apply cycle) against the raw
+  `RawCountSm`'s 12 ns (5.8 %). Those are shares from a box that is not a
+  bench; the fleet number is gate row 3 and has not been run.
+  Byte-identity with `v2.5.0` is asserted, not assumed
+  (`uc2_service/tests/raw_contract.rs`). A cheaper intermediate exists and is
+  documented: typing a blob field as `bytes::Bytes`/`serde_bytes` gives the
+  identical wire at 1.2–1.9× raw.
+- **`Sessioned<S>`** — a 16-byte `client_id ++ seq` envelope, a one-byte
+  FRESH/REPLAYED/EXPIRED tag, an LRU dedup table that rides snapshots, and a
+  replicated `SessionConfig` that `install_snapshot` refuses to silently
+  retune.
+- **`uc2_remote` protocol v1 and `RemoteClient`** — framed TCP, per-connection
+  credits, `REDIRECT`/`LEADER_CHANGED`/`RETRY`/`UNKNOWN`, pipelined submit and
+  query, ordered re-send after failover.
+- **`uc2_gateway::Edge` + the `uc2-gateway` binary + `gateway.toml`** — a
+  per-node TCP front door over `uc2_client::Engine`, static `node_id → address`
+  member map (Aeron's `ingressEndpoints` shape), leader watch off the cnc page.
+
+**Rulings and mechanisms worth remembering.**
+
+- **Redirect, not forward.** A `SUBMIT` that arrives at an edge whose node is
+  not serving gets a `REDIRECT` to the leader's gateway address — the edge
+  never relays it onward. Queries are answered locally regardless of role.
+  This keeps the edge stateless and keeps the leader from having to trust
+  another node's framing.
+- **The per-connection not-serving latch.** A connection told once that this
+  node cannot take writes is told the same thing for every later `SUBMIT` on
+  that connection, even if the node starts serving immediately after. The
+  invariant it buys: *the set of `SUBMIT`s a connection gets accepted is
+  always a prefix of what it sent*. Without it, `Sessioned`'s
+  FRESH/REPLAYED/EXPIRED classification breaks on a gap the dedup table cannot
+  classify.
+- **Probe-before-flush.** A freshly (re)connected client writes exactly one
+  request and waits for proof the far end will serve it before releasing the
+  rest of its window — and acts on `HELLO_OK`'s named leader first, so a
+  pipelined window is flushed *at* the leader instead of being redirected
+  frame by frame. `docs/notes/uc2-gateway-shapes-and-flow-control.md` is the
+  writeup.
+- **The faulted-exit contract.** `InstanceRestart` latches the edge `faulted`
+  permanently; the daemon polls `is_faulted` and exits 1, so `Restart=on-failure`
+  brings up a fresh edge against the new node instance.
+- **Head-of-line blocking is documented, not tuned away.** One driver thread
+  per edge serializes outbound writes, so a stalled client's write (up to the
+  1 s `WRITE_TIMEOUT`) can delay other clients on that edge. Any fleet cost
+  number for gate row 2 includes it.
+- **What the capstone does and does not cover.** The remote
+  lincheck capstone is `submit` → `wait` at concurrency 4 (an op must be a
+  single interval to be a linearizability history entry at all). Pipelining is
+  exercised by `failover.rs` and the `m12_gate` harness, not by the capstone.
+
+### M12b — admin authentication and audit (`9897219`)
+
+- **Signed admin requests.** `HMAC-SHA256` over
+  `len(app_id) ‖ app_id ‖ instance_id ‖ seq ‖ nonce ‖ op ‖ id ‖ ip ‖ port ‖
+  expiry_ns`, every integer little-endian, under a named 32-byte key
+  (`uc2_crypto::admin`). New reason codes 20 `auth_missing`, 21 `auth_bad_tag`,
+  22 `auth_expired`, 23 `auth_unknown_key`, 24 `audit_failed`. `uc2ctl` gains
+  `--admin-key`/`--admin-key-name`/`--admin-ttl-secs` on every mutating verb,
+  plus `gen-admin-key` and offline `audit`.
+- **`audit.jsonl`** — append-only, one `write_all` + `sync_data` per record,
+  written *before* the answer is published at every answer site. A failed
+  record refuses the request (24) rather than answering it unrecorded.
+- **Explicit-choice config.** `[crypto]` and `[admin]` are required sections;
+  absence is a named startup refusal (`ConfigError::CryptoChoiceRequired` /
+  `AdminChoiceRequired`).
+
+**Rulings.**
+
+- **No `(seq, nonce)` replay ring** — a deliberate deviation from spec §5.2's
+  sketch. The tag covers `seq`; the consensus agent only acts on
+  `seq > last_admin_seq`, so a capture cannot be re-presented at its original
+  `seq` and re-presenting it higher invalidates the tag. A restart resets
+  `last_admin_seq` but re-randomizes `instance_id`, which the tag also covers.
+  `expiry_ns` bounds the one remaining case (a live, correctly-sequenced
+  request delayed in flight). A ring would refuse nothing these two checks do
+  not already refuse.
+- **`AdminPolicy` is not a `NodeConfig` field.** It lives on `StartOpts`
+  beside the optional pre-bound socket — both live process resources, not
+  values a `Clone`-able TOML mirror should carry. Library callers get
+  `AdminPolicy::Filesystem`, the pre-M12b posture byte-for-byte; only the
+  `uc2-node` daemon builds a policy from `[admin]`.
+- **The dedup-re-send carve-out.** A byte-identical re-send of an
+  already-answered proposal is served from the leader's cache and *counted*
+  (`config_proposal_dedup_resend`), not re-recorded — it repeats an answer the
+  file already holds. Without this, one captured kind-16 datagram re-sent in a
+  loop drove one `fsync` per packet on the consensus thread.
+
+**The review finding that mattered (C1, fixed pre-merge in `50473d5`).**
+`verify_admin` originally read `instance_id`/`app_id` from `self.cnc.meta()`
+*per request*. The cnc page is a file in the instance directory whose header
+is only magic-checked, so an actor with directory write access and **no admin
+key** could capture a signed `(auth, req)` pair, await or induce a restart
+(resetting `last_admin_seq` to 0), `pwrite` the captured `instance_id` back
+into `CNC_OFF_INSTANCE_LO/HI`, re-present the captured lines, and have the
+change applied a second time — which also falsified the restart half of the
+no-replay-ring argument above. The binding now comes from
+`Consensus::admin_instance_id`/`admin_app_id`, set once in `Node::start_with`.
+Pinned by `uc2_node/tests/admin_auth.rs::a_capture_replayed_after_a_restart_is_refused`,
+with anti-vacuity confirmed: reverting the binding makes that replay verify and
+reach `propose_config`.
+
+**The residual, stated in four places rather than one.** A follower forwards an
+authenticated request to the leader as a `ConfigProposal` (wire kind 16) over
+the node-to-node UDP socket. The leader cannot re-verify the operator's HMAC
+there — the canonical message is bound to the *requesting* node's identity — so
+it records which peer vouched (`peer:<id>`). `on_config_proposal`'s membership
+guard drops a datagram whose source address resolves to no current member, but
+an address filter is not authentication: with `[crypto].enabled = false`, a
+spoofing network-path adversary can inject a proposal. **`[admin] auth = "hmac"`
+authenticates cluster-wide only paired with `[crypto].enabled = true`**, and a
+flood of *fresh* nonces from a member still costs one `fsync` each.
+
+### M12c — packaging and publishing (`e571c27`)
+
+- **Version identity.** Lockstep `2.6.0` across the workspace, publish metadata
+  and path-dep version pins for all 12 publishable crates, `rust-version =
+  "1.89"` (probed to `File::try_lock_exclusive`, not guessed) with the pinned
+  stable at 1.96.0, and `docs/reference/semver-policy.md`.
+- **Supply chain.** `deny.toml` plus two `cargo-deny` passes (default graph and
+  `--all-features`, so `uc2_service`'s non-default `ultima_db` adapter is
+  actually resolved), a CycloneDX SBOM, and CI `deny` / `publish-check` / `msrv`
+  jobs. Dropping `snow`'s `std` feature removed `ring` and made the spec's
+  "exactly one AES-GCM implementation in the graph" rule true. Dead workspace
+  deps (`quinn`, `rustls`, `tokio`, `futures`) removed.
+- **`release.yml`** — native x86_64 and aarch64 builds, tarballs +
+  `SHA256SUMS` + SBOM, keyless cosign signatures (`--recursive` on the image,
+  so a client pulling by platform digest still finds one), a distroless ghcr
+  image, and a `release-smoke` publish gate that unpacks the tarball in a bare
+  `ubuntu:24.04` with no toolchain and runs `packaging/quickstart-local.sh`
+  out of it, then brings up `packaging/compose.yml` as three nodes + three
+  services + three gateways and drives `counter-remote` to `value=10`.
+- **Docs.** Artifacts-first `docs/QUICKSTART.md`, `docs/how-to/cut-a-release.md`,
+  `packaging/README-release.md`.
+
+**Rulings and honest caveats.**
+
+- **Leaves-only `cargo publish --dry-run`.** `publish-check` runs
+  `cargo package --no-verify` over **all 12** crates in one invocation (which
+  is what forces every path dep to carry a resolvable `version =`), but the
+  per-crate `--dry-run` covers only the **4 dependency-free leaves**
+  (`ultima-journal`, `uc_protocol`, `uc2_remote`, `uc2_consensus`). A non-leaf
+  crate's dry run cannot pass before the first publish — its path deps must
+  resolve against the real registry — and this is not only a bootstrap gap:
+  `uc2_node`'s dev-dependency on `uc2_service` is a genuine dev-only cycle no
+  publish order avoids. Row 7 therefore claims *packaging* for 12 and
+  *publishing* for 4; the full sequence is first exercised by the manual
+  ordered publish in `cut-a-release.md` §6.
+- **`cargo fmt --check` deferred, per the spec's own condition.** Spec §1 made
+  the one-shot reformat conditional on no long-lived branch being open. Two
+  worktrees are open (`fix/remaining-flakes`, `worktree-uc2-multi-service`) and
+  the reformat measures **2 731 hunks**, every one of which would become a
+  conflict in both. The re-run condition is written verbatim in gate row 13.
+  `clippy -D warnings` — the gate that catches defects rather than whitespace —
+  is enforced on both the pinned stable and the MSRV floor.
+- **What CI cannot prove locally, said as such.** Docker, buildx and ghcr do
+  not exist on the dev box, so the bare-container run, the image build and the
+  compose stack are CI-only; keyless signing needs a GitHub OIDC identity the
+  box does not have (a local `cosign sign-blob` would either fail or, worse,
+  sign under some *other* identity). Both are first exercised by the
+  `v2.6.0-rc.1` tag. And one gap CI does not close at all: `release-smoke`
+  runs the **x86_64** tarball only — the aarch64 binaries are built and
+  packaged but never executed anywhere, so that half is unclaimed until
+  somebody runs the arm tarball on arm hardware.
+- **One accepted advisory, written into `deny.toml` with its reasoning:**
+  RUSTSEC-2025-0141, `bincode 2.0.1` *unmaintained* — a maintenance-status
+  advisory with no patched version to move to. bincode is the wire codec for
+  the cnc page, log records and the remote protocol, and the typed tier's
+  byte-identity promise is defined against it, so replacing it is a wire-format
+  migration, not a hygiene fix.
+
+**Fixed on the way:** `uc2_remote`'s `request_timeout` was not enforced while
+reconnecting — the sweep now runs between every dial attempt, the per-attempt
+connect-shortening (which pinned the dial budget under load) is gone, and the
+`HELLO` read is capped at the attempt deadline so the documented
+`2 × connect_timeout` bound is literal (`ae0f245`, `fc27536`, `b4b3b0c`). The
+architecture doc's log-buffer default was also corrected from a stale
+"~512 MiB" to `buffer_bytes`' real 64 MiB.
+
+### M12d — security posture (this branch)
+
+- **A `cargo-fuzz` crate outside the workspace** (`exclude = ["fuzz"]` plus its
+  own empty `[workspace]`, because `libfuzzer-sys` needs nightly and the
+  workspace pins stable at an MSRV floor), **14 targets** across the datagram,
+  log-frame, cnc, remote-frame, crypto (open/handshake/group-key/admin),
+  journal (record/stable-value), session-envelope, node/gateway TOML and
+  observability-HTTP decoders, a committed seed corpus, `scripts/fuzz_smoke.sh`,
+  and two nightly jobs — `fuzz-groups` (asserts the four matrix legs' union is
+  *exactly* the manifest's target set, and emits the matrix, so the checked
+  list and the matrix are one object) and `fuzz` (600 s per target,
+  `--min-runs 10000`, crash artifacts uploaded).
+- **Five `uc_protocol` datagram readers made total** — they return `Option`
+  instead of relying on caller guards.
+- **The security package**: `docs/security/threat-model.md`,
+  `attack-surface.md` (19 parser rows), `self-assessment.md`, plus
+  `SECURITY.md` and a README **Security posture** / **Scope and limits**
+  section. `docs/VERIFICATION.md` gains §7 Fuzzing.
+
+**What the fuzzing found** (numbering matches the self-assessment):
+
+1. **F1** — five caller-guarded readers panicked on short slices. Never
+   reachable through the receiver, but the totality of the first code an
+   unauthenticated UDP packet reaches held only by the discipline of five call
+   sites. Pre-guards kept, hot path byte-for-byte unchanged (`112b81f`).
+2. **F2** — `Sessioned::apply` violated the `out`-is-cleared contract it was
+   itself a caller of: a contract-abiding inner state machine starting with
+   `out.clear()` truncated the session tag away and the slice panicked **on the
+   apply thread**, killing the service on its first command. User-reachable
+   (`7c908b1`).
+3. **F3** — `Sessioned::install_snapshot` pre-allocated up to 1 GiB from an
+   unvalidated 8-byte length, using a sanity bound as an instruction. Bounded
+   with `take()`; 20 000 executions went 91.8 s → 0.34 s (`7c908b1`).
+4. **The harness finding.** Four of fourteen targets were executing ~16 inputs
+   per 60 s run while printing a clean line — `llvm-symbolizer` needed ~90 s to
+   index a 27 MB sanitizer binary for one address. `-print_funcs=0` fixed it
+   (400 runs: 90 180 ms → 57 ms). **A fuzz tier can be green and vacuous**,
+   which is why `--min-runs` exists and why CI asserts it (`736c1f3`).
+
+**Rulings.**
+
+- **Corpus is deterministic seeds only.** Every seed is generated by the real
+  encoders in `fuzz/src/seeds.rs` — no captured traffic, no accumulated
+  coverage corpus in the tree — so the corpus is reproducible from source and
+  reviewable as code.
+- **Miri is blocked on the rings, and each blocker was reproduced, not
+  assumed.** Miri runs the *pure* decoders (`uc_protocol`'s `v2::` wire/cnc/ipc
+  layer and `version` packing, 43 tests; `ultima_journal`'s segment and
+  `stable_value` decoders, 19 tests) — 62 tests, all passing **with isolation
+  left on**. The IPC rings cannot be checked: isolation on gives
+  ``unsupported operation: `open` not available``; isolation off gives
+  ``unsupported flags for `fallocate` … 16`` (`FALLOC_FL_ZERO_RANGE`, the M11
+  block-reservation fix); past both, ``Miri does not support file-backed memory
+  mappings``. The spec's fallback — a `Vec`-backed ring variant — was
+  **deliberately not built**: it would check a different object than the one
+  that ships. The gap is restated in `docs/VERIFICATION.md` §11.
+- **Two seams exposed for fuzzing, with their posture stated.**
+  `uc2_node::config_file::parse_str` and `uc2_gateway::config_file::parse_str`
+  are ordinary public API (the loaders' pure inner half).
+  `uc2_node::obs::http::route_raw` and `ObsSources::for_tests` are
+  `#[cfg(any(test, fuzzing))]` and absent from a shipped build, with
+  `check-cfg = ['cfg(fuzzing)']` declared so `clippy -D warnings` stays clean
+  without promoting the seam to a Cargo feature (which would have made it API).
+  `ultima_journal::fuzz_seams` is `pub` (a separate compilation unit cannot see
+  `pub(crate)`) but `#[doc(hidden)]`.
+- **`--min-runs 10000` is a stall floor, not a coverage bar.** It catches a
+  symbolizer-class stall; it does not catch a target that has merely become
+  100× slower. A tighter per-target bar needs per-target numbers from a runner,
+  which do not exist yet.
+
+**Two things documented rather than fixed.** (i) A malformed **query** frame
+fail-stops a *typed* state machine pre-commit, from an unauthenticated client:
+the blanket `RawStateMachine` impl decodes with `.expect("corrupt query frame
+(fail-stop)")` and `apply.rs`'s query branch calls it while holding the SM
+mutex, so one bad `QUERY` body panics the apply thread and poisons the lock —
+no quorum, no leadership, no commit involved. The same `.expect` guards the
+post-commit apply path, where fail-stop *is* right, so changing its error
+semantics is a design decision; parked as a follow-up, with the raw tier as
+the workaround. (ii) The `uc_protocol::ring` buffers have **no interleaving or
+UB coverage at all** — an earlier draft's claim that loom covered them was
+wrong and was corrected everywhere; the tree's one loom model
+(`uc2_log/tests/loom_frame.rs`) checks the *log buffer's* frame-visibility
+protocol, and nothing checks the MPSC claim-then-commit sequence or the
+broadcast seqlock.
+
+### Gate status at writeup time
+
+| Row | Status |
+|---|---|
+| 1 remote lincheck capstone | green 3× locally under `hard-crash-tests`; **CI adjudication pending the next nightly** |
+| 2 gateway throughput vs direct `Engine` (bar ≥ 0.8×) | **fleet-only, no fleet run yet** — the gate doc's local smoke ratios are labelled not-the-number |
+| 3 codec share on the apply thread | **fleet-only, no fleet run yet** |
+| 4 admin authn + audit + replay | **PASS**, per-PR CI |
+| 5 quickstart from artifacts, no toolchain | **BUILT, partially proven** — container half is CI-only until the first `-rc` tag; aarch64 unclaimed |
+| 6 artifacts and image verifiable | **BUILT, unproven** until the first `-rc` tag |
+| 7 crates publishable | **PASS** for packaging (12) and publishing (4 leaves), with the stated dry-run caveat |
+| 8 decoder fuzz job green | **BUILT, first nightly run pending** |
+| 9 security package present | **PASS** — it claims the package exists and is honest, not that the system is secure |
+| 10 external review | **pending**, user-scheduled |
+| 11 MSRV floor real and enforced | **PASS** |
+| 12 supply chain (advisories/licenses/bans) | **PASS**, one documented ignore |
+| 13 `cargo fmt --check` gate | **DEFERRED** — the spec's own condition is not met (2 731 hunks, two open worktrees) |
+
+### Upgrade
+
+- **Per-host config edit, before the binary swap:** add `[crypto]` (with
+  `enabled`) and `[admin]` (with `auth`) to every `node.toml`. Absence is a
+  named startup refusal. `packaging/node.example.toml` ships both sections
+  uncommented and annotated. Full remedy, including the paste that keeps
+  today's posture unchanged: `docs/how-to/upgrade-a-cluster.md`.
+- **No wire flag day.** `uc_protocol::version::CURRENT` is unchanged at
+  `0.5.0`; the cnc page layout is unchanged (M12b's admin line sits in the
+  existing reserved band at 3904). The binary swap is still run the way every
+  upgrade in this system is run — everyone stopped together, per the how-to —
+  but nothing in `2.6.0` *adds* a wire reason for it.
+- **The `v2.5.0` instance-directory reservation is unchanged**: ~78 MiB at the
+  defaults (`buffer_bytes` + ~14 MiB of rings), reserved at startup, refused
+  loudly if unavailable.
+
 ## v2.5.0 — 2026-08-21 — M11 survivable cluster
 
 **A cluster survives losing a host, losing quorum, filling its disk, and

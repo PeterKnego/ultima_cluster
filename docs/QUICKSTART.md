@@ -16,6 +16,14 @@ are for getting the artifact, not for using it.
 
 ## 1. Download it, and verify it
 
+> **Not published yet.** `v2.6.0` is written up but not tagged, so nothing is
+> at these URLs today — the release workflow that produces and signs the
+> artifacts is built and gated but has not run for a real tag. This section is
+> the procedure for the first release; until it lands, build from source
+> (`cargo build --workspace --release`) and use §2 onward against
+> `target/release`, or run `packaging/quickstart-local.sh --bin-dir
+> target/release`.
+
 Releases live at
 [github.com/PeterKnego/ultima_cluster/releases](https://github.com/PeterKnego/ultima_cluster/releases).
 Pick your architecture and take the tarball, its checksum, `SHA256SUMS`, and

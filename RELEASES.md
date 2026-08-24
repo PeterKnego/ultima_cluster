@@ -7,6 +7,170 @@ analyses, wire-version mechanics, upgrade remedies — is
 (pre-committed bars, fleet runs) are in
 [`docs/benchmarks/`](docs/benchmarks).
 
+## v2.6.0 — adoptable cluster (M12) — *prepared, not yet tagged*
+
+**Written before the tag, as every release here is.** All four M12
+sub-milestones are merged — M12a gateway kit, M12b admin authentication and
+audit, M12c packaging and publishing, M12d security posture — and they tag
+together as `v2.6.0`. **The tag itself is a separate maintainer step**, taken
+after deciding what to do about the two gate rows that are fleet-only and have
+no fleet run yet (see *Gates* below); `v2.6.0-rc.1` goes first, because the
+release workflow has never been run for real and a release candidate is the
+right place to find that out. Running record, row by row:
+[M12 gate record](docs/benchmarks/uc2-m12-gate-2026-08-22.md).
+
+**This release is what makes the cluster adoptable by someone who is not
+its author**: clients that do not live on a node's host can reach it, admin
+operations have a credential and a paper trail, the software installs from a
+signed artifact with no toolchain, and what is defended — and what is not — is
+written down.
+
+- **A two-tier state-machine contract**: `RawStateMachine` (bytes in, bytes
+  out) is now the core trait, and the typed `StateMachine` you already write
+  is a blanket adapter on top of it. Existing services change **nothing** —
+  the adapter is the same bincode call, so a typed state machine's frames are
+  byte-identical to `v2.5.0`'s. What is new is the escape hatch: a service
+  with hot or large commands can own its own framing and skip the codec
+  entirely. The dev-box spike that motivated this measured the typed tier at
+  **75.8 %** of the apply cycle against the raw tier's **5.8 %** at a 509 B
+  payload — a share, on a box that is not a bench; the fleet number for it is
+  gate row 3 and is still outstanding. →
+  [State-machine contract](docs/reference/state-machine-contract.md) ·
+  [Two tiers, one contract](docs/notes/uc2-two-tier-state-machine-contract.md) ·
+  [the codec budget spike](docs/notes/2026-08-22-codec-budget-spike.md)
+- **Exactly-once over a remote hop** (`uc2_service::session::Sessioned<S>`):
+  wrap either tier and a re-sent request after a failover is classified
+  `FRESH` / `REPLAYED` / `EXPIRED` instead of silently applied twice. The
+  dedup table is replicated state — it rides snapshots, and
+  `install_snapshot` refuses one whose embedded `SessionConfig` disagrees with
+  the live node rather than silently retuning it. →
+  [State-machine contract](docs/reference/state-machine-contract.md)
+- **A remote protocol and client** (`uc2_remote`, protocol v1): framed TCP,
+  credit-gated flow control, pipelined submit/query, and a `RemoteClient` that
+  follows `REDIRECT`/`LEADER_CHANGED` across an election and re-sends
+  unanswered requests in order. Written to be re-implemented in another
+  language — the frame layout and every state transition are specified. →
+  [Remote protocol](docs/reference/remote-protocol.md)
+- **A gateway** (`uc2-gateway` + `gateway.toml`): a per-node TCP front door
+  that terminates the remote protocol on a node's host and relays over the
+  existing shared-memory `Engine`. Clients no longer have to share a host with
+  a node to talk to the cluster. It touches no consensus code, no wire
+  protocol between nodes and no cnc field. →
+  [Run a gateway](docs/how-to/run-a-gateway.md) ·
+  [Gateway configuration](docs/reference/gateway-config.md) ·
+  [gateway shapes and flow control](docs/notes/uc2-gateway-shapes-and-flow-control.md)
+- **Admin authentication and an audit log**: mutating `uc2ctl` verbs are
+  signed with a named HMAC-SHA256 key (`--admin-key`/`--admin-key-name`/
+  `--admin-ttl-secs`; `uc2ctl gen-admin-key PATH` writes one), every admin
+  request is recorded — accepted *or* refused, with the signing key's name —
+  in an append-only, `fsync`-per-record `<instance_dir>/audit.jsonl`, and
+  `uc2ctl audit` reads it back offline. A request that cannot be recorded is
+  refused rather than answered unrecorded. **Residual, stated wherever it
+  matters:** a follower forwards an authenticated request to the leader over
+  the node-to-node UDP plane, which is only address-filtered unless wire
+  crypto is on — so `[admin] auth = "hmac"` authenticates cluster-wide only
+  paired with `[crypto].enabled = true`. →
+  [Configuration § admin authentication](docs/reference/configuration.md#admin-authentication) ·
+  [Who may change the cluster](docs/notes/uc2-admin-authentication.md) ·
+  [Change cluster membership](docs/how-to/change-cluster-membership.md)
+- **Two config choices are now explicit, and an old `node.toml` will not
+  start without them.** `[crypto]` and `[admin]` are both required sections:
+  a config written for `v2.3.0`–`v2.5.0` refuses to start with a named error
+  (`CryptoChoiceRequired` / `AdminChoiceRequired`) until each host's file says
+  which posture it wants. This is a per-host config edit, not a wire flag day
+  — nodes on either side of it interoperate. →
+  [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md) ·
+  [Configuration](docs/reference/configuration.md)
+- **Install without a toolchain**: signed tarballs for x86-64 and aarch64, a
+  `SHA256SUMS`, a CycloneDX SBOM and a distroless `ghcr.io/peterknego/uc2`
+  image are published per tag, all signed keylessly (cosign, identity-pinned
+  verification written out), and a `quickstart-local.sh` inside the tarball
+  brings up three nodes, three services and three gateways on one host and
+  prints `PASS`. The publish gate is a smoke run in a bare container with no
+  Rust installed — nothing is released unless it passes. →
+  [QUICKSTART](docs/QUICKSTART.md) ·
+  [Cut a release](docs/how-to/cut-a-release.md) ·
+  [`packaging/README-release.md`](packaging/README-release.md)
+- **A version identity and a compatibility promise**: all 12 publishable
+  crates move in lockstep at `2.6.0`, with the metadata crates.io needs, a
+  written semver policy that says what is public API and what is not, an MSRV
+  floor of **1.89** enforced by a CI job that runs `clippy` on that exact
+  toolchain, and supply-chain gates (`cargo-deny` advisories/licenses/bans, on
+  both the default and `--all-features` graphs). →
+  [Semver policy](docs/reference/semver-policy.md)
+- **A security package, and a fuzz tier that found real defects**: a threat
+  model, a per-parser attack surface (19 rows), a self-assessment with its
+  findings and its *accepted* weaknesses, and a `SECURITY.md` with a reporting
+  channel. Alongside it, 14 `cargo-fuzz` targets over every decoder that
+  touches untrusted bytes, run nightly at 600 s per target with a minimum-runs
+  floor (because a fuzz tier can be green and vacuous — one was, and that is
+  written up too), plus Miri over the pure decoders. The README now states the
+  posture and the scope limits up front. →
+  [`docs/security/`](docs/security) ·
+  [Verification § fuzzing](docs/VERIFICATION.md) ·
+  [SECURITY.md](SECURITY.md)
+- **Fixed bugs** — all four found in the sub-milestones' own review and fuzz
+  loops, none of them ever in a released tag:
+  - **A captured admin request could be replayed after a restart** by an actor
+    with instance-directory write access and no key at all: the HMAC was
+    verified against an `instance_id` re-read from the cnc page — a file whose
+    header is only magic-checked — so the captured value could simply be
+    written back. The tag is now bound to the node's boot-time state, pinned
+    by a regression test that performs the forgery (fixed pre-merge,
+    `50473d5`). →
+    [Who may change the cluster](docs/notes/uc2-admin-authentication.md)
+  - **`Sessioned::apply` violated the buffer contract it was itself a caller
+    of** — a contract-abiding inner state machine that cleared `out` truncated
+    the session tag away and panicked **on the apply thread**, killing the
+    service on its first command. Found by fuzzing (`7c908b1`).
+  - **`Sessioned::install_snapshot` pre-allocated up to 1 GiB** from an
+    unvalidated 8-byte length before reading a byte of the blob. Bounded;
+    20 000 executions went 91.8 s → 0.34 s. Found by fuzzing (`7c908b1`).
+  - **Five UDP datagram readers could panic on a short slice.** Never
+    reachable — every caller guarded — but the first code an unauthenticated
+    packet reaches should not depend on five call sites remembering. All five
+    now return `Option`, pre-guards kept, hot path byte-identical (`112b81f`).
+  - Also: `uc2_remote`'s `request_timeout` is now enforced *while
+    reconnecting* (it could be outlived by a reconnect loop), and the
+    architecture doc's log-buffer default is corrected to `buffer_bytes`'
+    real 64 MiB.
+- **Gates** — [M12 gate record](docs/benchmarks/uc2-m12-gate-2026-08-22.md),
+  reported the way this project reports: what ran, and what did not.
+  - **PASS**: admin authentication, audit and refusal behaviour end to end
+    (row 4, per-PR CI); crates package and the leaf crates publish (row 7);
+    the MSRV floor (row 11); the supply-chain gates (row 12).
+  - **Pending its first nightly**: the remote lincheck capstone — three
+    gateways in the loop, repeated leader SIGKILLs, zero acked writes lost —
+    is green three consecutive local runs and awaits CI adjudication (row 1);
+    the fuzz job is built and locally proven across ~118 M executions but has
+    never run on a GitHub runner (row 8).
+  - **Fleet-only, no fleet run yet**: gateway throughput cost versus the
+    direct `Engine` (bar ≥ 0.8×) and the codec share on the apply thread
+    (rows 2 and 3). **The local smoke numbers in the gate doc are not these
+    results** and are labelled as such — a dev box is not a bench.
+  - **Built but unexercised**: the release workflow, its signing and its
+    container smoke run first execute for real at the `v2.6.0-rc.1` tag
+    (rows 5 and 6).
+  - **Pending**: the external security review (row 10), which is
+    user-scheduled. Row 9 claims that the security package exists and is
+    honest — not that the system is secure.
+- **Upgrade notes.**
+  - **Edit every host's `node.toml` before starting a `2.6.0` node**: add a
+    `[crypto]` section (`enabled = true|false`) and an `[admin]` section
+    (`auth = "hmac"|"none"`). Without them the daemon refuses to start, by
+    name. **The config edit is per-host, not a wire flag day** — the
+    node-to-node protocol is unchanged at **0.5.0**
+    (`uc_protocol::version::CURRENT`), and nothing about the cnc page or what
+    another node sees moves. (The binary swap itself is still run the way
+    every upgrade in this system is run: everyone stopped together, per the
+    how-to. Do the config edit in that same window — you are touching every
+    `node.toml` anyway.) →
+    [Upgrade a cluster](docs/how-to/upgrade-a-cluster.md)
+  - **The ~78 MiB instance-directory reservation from `v2.5.0` is
+    unchanged**: a node still reserves `buffer_bytes` plus ~14 MiB of rings at
+    startup and refuses to start if it cannot. →
+    [Instance directory](docs/reference/instance-directory.md#on-disk-footprint)
+
 ## v2.5.0 — 2026-08-21 — survivable cluster (M11)
 
 **A cluster you can back up, restore onto a new host, force out of quorum
