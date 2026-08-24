@@ -540,6 +540,7 @@ struct ClientStats {
     elapsed: Duration,
     p50_ms: f64,
     p90_ms: f64,
+    p95_ms: f64,
     p99_ms: f64,
     max_ms: f64,
     responses_per_sec: f64,
@@ -563,6 +564,7 @@ fn print_report(label: &str, s: &ClientStats) {
     println!("responses/s           : {:.0}", s.responses_per_sec);
     println!("p50                   : {:.3} ms", s.p50_ms);
     println!("p90                   : {:.3} ms", s.p90_ms);
+    println!("p95                   : {:.3} ms", s.p95_ms);
     println!("p99                   : {:.3} ms", s.p99_ms);
     println!("max                   : {:.3} ms", s.max_ms);
     println!(
@@ -769,12 +771,13 @@ fn run_client_measurement(
         0.0
     };
 
-    let (p50_ms, p90_ms, p99_ms, max_ms) = {
+    let (p50_ms, p90_ms, p95_ms, p99_ms, max_ms) = {
         let h = hist.lock().unwrap();
         let ms = |ns: u64| ns as f64 / 1e6;
         (
             ms(h.value_at_quantile(0.50)),
             ms(h.value_at_quantile(0.90)),
+            ms(h.value_at_quantile(0.95)),
             ms(h.value_at_quantile(0.99)),
             ms(h.max()),
         )
@@ -800,6 +803,7 @@ fn run_client_measurement(
         elapsed,
         p50_ms,
         p90_ms,
+        p95_ms,
         p99_ms,
         max_ms,
         responses_per_sec,
@@ -1032,11 +1036,12 @@ fn run_remote_measurement(remote: &RemoteClient, secs: u64, payload_len: usize) 
         0.0
     };
 
-    let (p50_ms, p90_ms, p99_ms, max_ms) = {
+    let (p50_ms, p90_ms, p95_ms, p99_ms, max_ms) = {
         let ms = |ns: u64| ns as f64 / 1e6;
         (
             ms(hist.value_at_quantile(0.50)),
             ms(hist.value_at_quantile(0.90)),
+            ms(hist.value_at_quantile(0.95)),
             ms(hist.value_at_quantile(0.99)),
             ms(hist.max()),
         )
@@ -1066,6 +1071,7 @@ fn run_remote_measurement(remote: &RemoteClient, secs: u64, payload_len: usize) 
         elapsed,
         p50_ms,
         p90_ms,
+        p95_ms,
         p99_ms,
         max_ms,
         responses_per_sec,
@@ -1305,7 +1311,7 @@ fn print_result_json(arm: &str, s: &ClientStats, secs: u64, payload: usize, infl
         "RESULT {{\"arm\":\"{arm}\",\"responses_per_sec\":{:.1},\"payload\":{payload},\
          \"inflight\":{inflight},\"secs\":{secs},\"sends\":{},\"responses\":{},\
          \"lost\":{},\"not_fresh\":{},\"inflight_at_end\":{},\"p50_ms\":{:.3},\
-         \"p90_ms\":{:.3},\"p99_ms\":{:.3},\"max_ms\":{:.3},\"elapsed_secs\":{:.3}}}",
+         \"p90_ms\":{:.3},\"p95_ms\":{:.3},\"p99_ms\":{:.3},\"max_ms\":{:.3},\"elapsed_secs\":{:.3}}}",
         s.responses_per_sec,
         s.sends,
         s.responses,
@@ -1314,6 +1320,7 @@ fn print_result_json(arm: &str, s: &ClientStats, secs: u64, payload: usize, infl
         s.inflight_at_end,
         s.p50_ms,
         s.p90_ms,
+        s.p95_ms,
         s.p99_ms,
         s.max_ms,
         s.elapsed.as_secs_f64(),
