@@ -185,6 +185,11 @@ Also stated, in the documents that own them:
   `[crypto].enabled = true`.**
 - **The remote link is plain TCP** —
   [The remote protocol (v1)](/docs/reference/remote-protocol.md).
+- **An unauthenticated remote client on a gateway can fail-stop a typed-tier
+  service pre-commit with one malformed query frame** (the blanket impl's
+  decode `.expect`); the raw tier is the workaround — [attack
+  surface](attack-surface.md#1-the-inventory) (typed-tier row) and
+  [self-assessment §3](self-assessment.md#3-known-weaknesses-not-fixed).
 - **What is not verified at all** —
   [VERIFICATION §11](/docs/VERIFICATION.md#11-what-is-not-verified): the open
   `leader_completeness` theorem, the durable dual-reader model gap, and the IPC

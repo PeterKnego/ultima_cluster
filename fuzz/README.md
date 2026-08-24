@@ -70,12 +70,13 @@ not mean *fuzzed*. CI passes `--min-runs 10000` against a 600 s budget — three
 to five orders of magnitude below what a healthy target does, so it catches a
 stall without flaking on a slow runner.
 
-Note that this repo sets a global `CARGO_TARGET_DIR`
-(`~/.cache/cargo-target`), so the sanitizer-instrumented fuzz builds land in
-that shared cache next to the ordinary workspace artifacts rather than under
-`fuzz/target/`. They are a separate target triple subdirectory, so they do not
-collide with or invalidate the normal `cargo build` cache — but they are not
-cleaned by removing `fuzz/target/` either. This is the CI-shaped
+Note that if your environment sets a global `build.target-dir` (this dev box
+does, via `~/.cargo/config.toml`), sanitizer builds land there and share the
+cache; otherwise they land in `fuzz/target/`. When it is set, the
+sanitizer-instrumented fuzz builds land in that shared cache next to the
+ordinary workspace artifacts. They are a separate target triple subdirectory,
+so they do not collide with or invalidate the normal `cargo build` cache —
+but they are not cleaned by removing `fuzz/target/` either. This is the CI-shaped
 invocation: short, deterministic-ish, and green means "no new crash from this
 corpus in that budget" — it is a regression gate, not a bug hunt. Real hunting
 is a long `cargo fuzz run` with a large `-max_total_time`.

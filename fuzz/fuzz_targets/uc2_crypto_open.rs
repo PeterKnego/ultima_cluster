@@ -14,7 +14,5 @@ fuzz_target!(|data: &[u8]| {
     let _ = uc2_crypto::seal::open_in_place(&mut v, &KEY);
 
     let mut s = data.to_vec();
-    let n = s.len();
     let _ = uc2_crypto::seal::open_detached(&mut s[..], &KEY);
-    let _ = n;
 });

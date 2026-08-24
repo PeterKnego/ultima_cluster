@@ -638,7 +638,7 @@ explicitly. Upgrade note with the two new startup refusals.
 
 ## 7. M12d — Security posture and the review-ready package
 
-> **As built (M12d).** M12d shipped as Tasks 1–5 on
+> **As built (M12d).** M12d shipped as Tasks 1–6 on
 > `uc2/m12d-security-posture`; `docs/benchmarks/uc2-m12-gate-2026-08-22.md`
 > rows 8, 9, 10 and its "M12d facts" section are the acceptance-gate record.
 > The bullets below are otherwise as written; these are the corrections, the

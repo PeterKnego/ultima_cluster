@@ -31,7 +31,7 @@ cd "$(dirname "$0")/../fuzz"
 # the committed corpus mid-run, and print a meaningless "clean" line. Skip it.
 if [ $# -gt 0 ]; then TARGETS=("$@"); else mapfile -t TARGETS < <(cargo +nightly fuzz list | grep -v '^seed-corpus$'); fi
 
-LOG="$(mktemp -t fuzz_smoke.XXXXXX)"
+LOG="$(mktemp -p "${TMPDIR:-$PWD}" fuzz_smoke.XXXXXX)"
 trap 'rm -f "$LOG"' EXIT
 
 for t in "${TARGETS[@]}"; do

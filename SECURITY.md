@@ -4,15 +4,17 @@
 ## Supported versions
 
 The **latest minor release** is the only supported line. Today that is
-**`2.6.x`**: fixes land on the newest patch of the newest minor, and there are
-no backports to earlier minors. Versions move in lockstep across every crate,
-the tag, the tarballs and the image — see
+**`2.6.x`** (the forthcoming release; until it is tagged, `2.5.x` is the
+latest published line): fixes land on the newest patch of the newest minor,
+and there are no backports to earlier minors. Versions move in lockstep
+across every crate, the tag, the tarballs and the image — see
 [the semver policy](docs/reference/semver-policy.md).
 
 | Version | Supported |
 |---|---|
-| `2.6.x` | yes |
-| `< 2.6` | no — upgrade |
+| `2.6.x` | yes (once tagged) |
+| `2.5.x` | yes, until `2.6.x` tags |
+| `< 2.5` | no — upgrade |
 
 ## Reporting a vulnerability
 

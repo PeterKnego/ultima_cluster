@@ -288,8 +288,8 @@ cargo run -p uc2_consensus --release --example conform_gen -- --out $HOME/.cache
 `fuzz/` is a `cargo-fuzz` crate **outside the workspace** (the root manifest
 excludes it; it has its own `[workspace]` and lockfile), so `cargo
 build/test/clippy --workspace` never sees it and it needs the nightly
-toolchain plus `cargo install cargo-fuzz`. `scripts/fuzz_smoke.sh [SECS]
-[--min-runs N] [TARGET…]` is the regression gate CI runs (`--min-runs 10000`
+toolchain plus `cargo install cargo-fuzz`. `scripts/fuzz_smoke.sh [--min-runs
+N] [SECS] [TARGET…]` is the regression gate CI runs (`--min-runs 10000`
 against 600 s per target); `fuzz/README.md` covers adding a target,
 regenerating the corpus, and `tmin`/`cmin`.
 

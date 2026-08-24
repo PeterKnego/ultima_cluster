@@ -50,7 +50,8 @@ documentation for what it changes, because the tag is what people read.
       `RELEASES.md` and `docs/releases.md` and drop their "prepared, not yet
       tagged" qualifiers (`v2.5.0`'s headings are the model); replace
       `docs/releases.md`'s "M12d — security posture (this branch)" with the
-      merge sha; and prune the fuzz corpus back to its committed seeds, so a
+      merge sha; confirm `SECURITY.md`'s supported-versions table names the
+      new line; and prune the fuzz corpus back to its committed seeds, so a
       `git add -A` cannot smuggle libFuzzer discoveries into the tag —
 
       ```sh

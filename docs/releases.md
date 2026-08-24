@@ -240,7 +240,7 @@ architecture doc's log-buffer default was also corrected from a stale
 3. **F3** — `Sessioned::install_snapshot` pre-allocated up to 1 GiB from an
    unvalidated 8-byte length, using a sanity bound as an instruction. Bounded
    with `take()`; 20 000 executions went 91.8 s → 0.34 s (`7c908b1`).
-4. **The harness finding.** Four of fourteen targets were executing ~16 inputs
+4. **F6 (the harness finding).** Four of fourteen targets were executing ~16 inputs
    per 60 s run while printing a clean line — `llvm-symbolizer` needed ~90 s to
    index a 27 MB sanitizer binary for one address. `-print_funcs=0` fixed it
    (400 runs: 90 180 ms → 57 ms). **A fuzz tier can be green and vacuous**,

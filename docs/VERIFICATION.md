@@ -459,7 +459,7 @@ A Vec-backed ring variant built purely so Miri could run it is
 the stated fallback and **has not been built**, because it would check a
 different object than the one that ships. And loom does not close the gap
 either: §6's model is of the **log buffer's** frame-visibility protocol, not of
-`uc_protocol::src::ring`. So the rings' layout is frozen by offset-pin tests
+`uc_protocol::ring`. So the rings' layout is frozen by offset-pin tests
 and their interleavings and UB are covered by **nothing** — stated again in
 §11.
 
