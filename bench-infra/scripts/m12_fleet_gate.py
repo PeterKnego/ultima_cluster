@@ -16,6 +16,15 @@ docs/benchmarks/uc2-m12-gate-2026-08-22.md.
     row 3  codec share on the apply thread at the M5 ladder, typed vs raw
            state-machine tier.  MEASUREMENT ROW — no bar; it states two
            numbers.                                               FLEET ONLY
+    edgesat  N-CLIENT EDGE SATURATION: aggregate gateway throughput as
+           CONCURRENT client connections scale (1,2,4,8,16 by default), all
+           into the leader's edge, with CPU attribution per rung — the edge
+           process (in percent of ONE core), the leader host and every client
+           host — so the flattening can be blamed on the right stage. Reports
+           the knee, the attributed ceiling, and aggregate-at-ceiling over the
+           measured direct-arm peak ("edge saturation ratio"). Grounds a
+           re-spec of row 2, whose ratio is per-CONNECTION rather than
+           aggregate. MEASUREMENT ROW — no bar.                   FLEET ONLY
 
 ROW 1 (path 1 of the network-budget investigation) answers: at ~1.5M/s, can a
 network fluke break p99 < 1 ms, and is there NIC headroom for a co-located TCP
@@ -165,6 +174,20 @@ def unit_log(host, unit):
     return f"/opt/bench/{UNIT_PREFIX}-{unit}.log"
 
 
+def unit_start_cmd(host, unit, args, nofile=False):
+    """The `systemd-run` command line for one unit (no ssh — see `start_unit`
+    for the single-unit path and `start_units_batch` for the N-at-once one)."""
+    quoted = " ".join(shlex.quote(a) for a in args)
+    limit = "-p LimitNOFILE=65536 " if nofile else ""
+    return (
+        f"sudo systemd-run --unit={UNIT_PREFIX}-{unit} --collect -p TimeoutStopSec=1 "
+        f"{limit}"
+        f"-p StandardOutput=append:{unit_log(host, unit)} "
+        f"-p StandardError=append:{unit_log(host, unit)} "
+        f"{host.gate} {quoted}"
+    )
+
+
 def start_unit(host, unit, args, nofile=False):
     """A transient `systemd-run --collect` unit running the m12_gate binary.
 
@@ -174,20 +197,45 @@ def start_unit(host, unit, args, nofile=False):
     segments into EMFILE fail-stops (m10_fleet_gate's comment on the same
     line)."""
     kill_unit(host, unit)
-    quoted = " ".join(shlex.quote(a) for a in args)
-    limit = "-p LimitNOFILE=65536 " if nofile else ""
-    cmd = (
-        f"sudo systemd-run --unit={UNIT_PREFIX}-{unit} --collect -p TimeoutStopSec=1 "
-        f"{limit}"
-        f"-p StandardOutput=append:{unit_log(host, unit)} "
-        f"-p StandardError=append:{unit_log(host, unit)} "
-        f"{host.gate} {quoted}"
-    )
+    cmd = unit_start_cmd(host, unit, args, nofile=nofile)
     r = ssh(host, cmd, label="systemd-run")
     if r.returncode != 0:
         raise RuntimeError(
             f"start {UNIT_PREFIX}-{unit} on {host.public_ip}: {r.stderr or r.stdout}"
         )
+
+
+def start_units_batch(host, specs):
+    """Start several units on ONE host in ONE ssh round trip.
+
+    The edge-saturation row starts N client units that must all be loading the
+    same edge at the same time; N separate ssh invocations would stagger their
+    starts by N x (ssh handshake + systemd-run), which at N=16 is seconds of
+    skew against a 15 s window. `systemd-run` returns as soon as the transient
+    unit is queued, so issuing all N from a single remote shell puts the skew
+    in the tens of milliseconds instead.
+
+    Each unit's log file is removed first: the units write with
+    `StandardOutput=append:`, and a leftover log from an earlier ladder point
+    would let that point's RESULT line be re-read as this one's.
+
+    Returns the list of units that reported STARTED."""
+    parts = []
+    for unit, args in specs:
+        parts.append(f"sudo systemctl reset-failed {UNIT_PREFIX}-{unit} 2>/dev/null; true")
+        parts.append(f"sudo rm -f {unit_log(host, unit)}")
+        parts.append(
+            f"{unit_start_cmd(host, unit, args)} "
+            f"&& echo STARTED:{unit} || echo FAILED:{unit}"
+        )
+    r = ssh(host, "; ".join(parts), label="systemd-run")
+    out = (r.stdout or "") + (r.stderr or "")
+    started = [u for u, _ in specs if f"STARTED:{u}" in out]
+    failed = [u for u, _ in specs if u not in started]
+    if failed:
+        print(f"INFO [{host.public_ip}] units failed to start: {failed}\n{out}",
+              flush=True)
+    return started
 
 
 def kill_unit(host, unit):
@@ -198,6 +246,20 @@ def kill_unit(host, unit):
         f"sudo systemctl reset-failed {UNIT_PREFIX}-{unit} 2>/dev/null; true",
         label="systemctl",
     )
+
+
+def kill_units_batch(host, units):
+    """`kill_unit` for several units on one host in ONE ssh round trip — the
+    edge-saturation row tears down up to 16 client units per rung."""
+    parts = []
+    for u in units:
+        parts.append(
+            f"sudo systemctl kill --signal=SIGKILL {UNIT_PREFIX}-{u} 2>/dev/null; "
+            f"sudo systemctl stop {UNIT_PREFIX}-{u} 2>/dev/null; "
+            f"sudo systemctl reset-failed {UNIT_PREFIX}-{u} 2>/dev/null; true"
+        )
+    if parts:
+        ssh(host, "; ".join(parts), label="systemctl")
 
 
 def truncate_log(host, unit):
@@ -310,14 +372,19 @@ def stop_cluster(node_hosts):
             kill_unit(h, u)
 
 
-def start_edges(node_hosts, a, envelope):
+def start_edges(node_hosts, a, envelope, inflight=None):
+    """`inflight` overrides `a.inflight` for the edge's `max_inflight` /
+    `per_conn_inflight` pair. Rows 1-3 leave it None (the whole point of row 2
+    is EQUAL inflight on both arms); the edge-saturation row overrides it, for
+    the reason spelled out on `--edgesat-edge-inflight`."""
     em = edge_members_str(node_hosts)
+    infl = a.inflight if inflight is None else inflight
     for i, h in enumerate(node_hosts):
         start_unit(h, "edge", [
             "edge", "--instance-dir", h.dir, "--app-id", APP,
             "--listen", f"{h.private_ip}:{EDGE_PORT}",
             "--members", em, "--envelope", envelope,
-            "--inflight", str(a.inflight),
+            "--inflight", str(infl),
         ])
     time.sleep(EDGE_SETTLE_SECS)
 
@@ -902,6 +969,633 @@ def _fmt(x, d=1):
     return f"{x:.{d}f}" if isinstance(x, (int, float)) else "—"
 
 
+# -------------------------------------------- row `edgesat` (N-client edge saturation)
+#
+# WHAT THIS ROW ANSWERS, and why it is not row 2.
+#
+#   Row 2 drives ONE `RemoteClient` over ONE TCP connection into ONE edge and
+#   divides by the direct shmem client: on the fleet that is ~140k resp/s
+#   against ~1.42M resp/s. That is a PER-CONNECTION number, and per-connection
+#   is not the question an operator asks of a gateway. The operator's question
+#   is AGGREGATE: with K client connections open at once, what does the edge
+#   deliver in total, and WHICH stage stops the total climbing?
+#
+#   This row answers it by walking a ladder of concurrent client connections
+#   (default 1,2,4,8,16) into the LEADER's edge, all clients started as close
+#   to simultaneously as ssh allows, and reporting the summed responses/s at
+#   each rung together with the CPU of every stage that could be the limiter.
+#
+# THE THREE CANDIDATE CEILINGS, and how each is made visible:
+#
+#   (a) THE EDGE ITSELF. `Edge` serialises every outbound write through a
+#       single driver thread (a documented single-writer constraint of the
+#       shipped design, not an artifact). If that thread is the ceiling, the
+#       edge PROCESS's CPU pins near one core's worth — so this row samples
+#       /proc/<edge pid>/stat and reports `edge_proc_cpu_pct`, where ~100%
+#       means "one core, saturated" and 250% would mean "two and a half cores
+#       busy, the driver thread is not alone in the picture".
+#   (b) THE CLIENT HOSTS. Every `client-remote` process spends a sender thread
+#       plus eight waiter threads, so 16 of them on one 8-vCPU box is heavily
+#       oversubscribed. If the client host runs out of CPU the aggregate stops
+#       climbing for a reason that has nothing to do with the gateway — this
+#       is THE way this measurement can lie, so `EDGESAT-SUMMARY` refuses to
+#       call a knee once the client hosts are saturated and the edge process
+#       is not (see `classify_edgesat`).
+#   (c) THE BACKEND. The node + service under the edge. Visible as the leader
+#       host's overall CPU with the edge process's share already broken out.
+#
+# WHY ENVELOPE OFF. The session table in `Sessioned<S>` grows one entry per
+# distinct `client_id`, and every rung of this ladder introduces N fresh ones.
+# Row 2 needs the envelope for frame-identical arms; this row wants a clean
+# throughput curve, so the services, the edges and therefore the clients all
+# run raw pass-through.
+#
+# Everything below the ssh helpers is pure, so the aggregation, the CPU deltas,
+# the knee and the client-bound labelling are unit-testable off-fleet.
+
+DEFAULT_EDGESAT_CLIENTS = "1,2,4,8,16"
+
+# The direct-arm peak measured by row 1 on the fleet (responses/s, one direct
+# shmem client on the leader's own host). The saturation ratio below divides
+# the aggregate at the ceiling by this, which is the candidate re-specced
+# row-2 metric: "what fraction of the box's own commit rate can the gateway
+# hand to remote clients". Update this only alongside a new row-1 measurement.
+DIRECT_ARM_PEAK_RPS = 1_424_941.0
+
+# Knee: the first rung whose aggregate gains less than this over the previous.
+EDGESAT_KNEE_GAIN = 0.15
+# "This host has no CPU left" and "this process is holding down ~a core".
+HOST_SAT_PCT = 85.0
+EDGE_CORE_SAT_PCT = 90.0
+
+EDGESAT_RAMP_SECS = 3.0     # let every client connect + reach steady state
+EDGESAT_DRAIN_SECS = 5.0    # slack after --edgesat-secs before we start polling
+
+
+def cpu_window_cmd(secs, edge_unit=None):
+    """A ONE-ROUND-TRIP CPU sample over a `secs` window on one host.
+
+    Takes /proc/stat (and, when `edge_unit` is given, /proc/<MainPID>/stat)
+    before and after the window, and runs `mpstat 1 <secs>` inside the window
+    when sysstat is installed — sysstat is NOT assumed, and the /proc/stat
+    delta is what the number falls back to. Both are parsed by
+    `parse_cpu_window`; `getconf CLK_TCK` comes back in the same payload so the
+    process-CPU maths never hardcodes 100 Hz.
+
+    One round trip matters: the leader and every client host must be sampled
+    over the SAME window while the clients are running, so the caller issues
+    these concurrently and cannot afford a multi-step conversation with each
+    host."""
+    pid = (
+        f"PID=$(systemctl show -p MainPID --value {UNIT_PREFIX}-{edge_unit} "
+        f"2>/dev/null || true); [ \"$PID\" = 0 ] && PID=; "
+    ) if edge_unit else "PID=; "
+    return (
+        pid
+        + "HZ=$(getconf CLK_TCK); "
+        "T0=$(date +%s.%N); S0=$(grep '^cpu ' /proc/stat); "
+        "P0=; [ -n \"$PID\" ] && P0=$(cat /proc/$PID/stat 2>/dev/null); "
+        f"if command -v mpstat >/dev/null 2>&1; then MP=$(mpstat 1 {secs} 2>/dev/null); "
+        f"else sleep {secs}; MP=; fi; "
+        "T1=$(date +%s.%N); S1=$(grep '^cpu ' /proc/stat); "
+        "P1=; [ -n \"$PID\" ] && P1=$(cat /proc/$PID/stat 2>/dev/null); "
+        "printf '===HZ\\n%s\\n===T0\\n%s\\n===S0\\n%s\\n===P0\\n%s\\n"
+        "===T1\\n%s\\n===S1\\n%s\\n===P1\\n%s\\n===MP\\n%s\\n===END\\n' "
+        "\"$HZ\" \"$T0\" \"$S0\" \"$P0\" \"$T1\" \"$S1\" \"$P1\" \"$MP\""
+    )
+
+
+def _split_sections(text):
+    """Split a `===KEY` / value payload. No content this driver asks for (a
+    /proc line, an mpstat table, a timestamp) can begin with `===`."""
+    out, key = {}, None
+    for line in text.splitlines():
+        if line.startswith("==="):
+            key = line[3:].strip()
+            out[key] = []
+        elif key is not None:
+            out[key].append(line)
+    return {k: "\n".join(v).strip() for k, v in out.items()}
+
+
+def proc_stat_busy_idle(line):
+    """(busy_ticks, idle_ticks) from a `cpu ` aggregate line of /proc/stat.
+
+    Fields after the label: user nice system idle iowait irq softirq steal
+    [guest guest_nice]. `guest`/`guest_nice` are ALREADY counted inside
+    user/nice, so summing them again would double-count — only the first eight
+    are used. iowait counts as idle: the CPU was available."""
+    f = line.split()
+    if not f or not f[0].startswith("cpu"):
+        raise ValueError(f"not a /proc/stat cpu line: {line!r}")
+    v = [int(x) for x in f[1:9]]
+    if len(v) < 8:
+        raise ValueError(f"short /proc/stat cpu line: {line!r}")
+    idle = v[3] + v[4]
+    return sum(v) - idle, idle
+
+
+def cpu_pct_from_proc_stat(s0, s1):
+    """Overall utilisation pct across the whole box between two `cpu ` lines."""
+    b0, i0 = proc_stat_busy_idle(s0)
+    b1, i1 = proc_stat_busy_idle(s1)
+    db, di = b1 - b0, i1 - i0
+    if db + di <= 0:
+        return None
+    return 100.0 * db / (db + di)
+
+
+def parse_mpstat_idle(text):
+    """%idle off `mpstat 1 N`'s Average row (the `all` line). None if absent."""
+    for line in text.splitlines():
+        if not line.lower().startswith("average"):
+            continue
+        f = line.split()
+        if len(f) < 3 or f[1] != "all":
+            continue
+        try:
+            return float(f[-1].replace(",", "."))
+        except ValueError:
+            return None
+    return None
+
+
+def pid_stat_ticks(line):
+    """utime+stime (ticks) out of a raw /proc/<pid>/stat line.
+
+    The comm field is parenthesised and may itself contain spaces AND close
+    parens, so the split is on the LAST ')': everything after it starts at
+    field 3 (state), which puts utime at offset 11 and stime at 12."""
+    if ")" not in line:
+        raise ValueError(f"not a /proc/pid/stat line: {line!r}")
+    rest = line.rsplit(")", 1)[1].split()
+    if len(rest) < 13:
+        raise ValueError(f"short /proc/pid/stat line: {line!r}")
+    return int(rest[11]) + int(rest[12])
+
+
+def parse_cpu_window(text):
+    """Turn one `cpu_window_cmd` payload into
+    {host_cpu_pct, source, proc_cpu_pct, window_secs, hz}.
+
+    `proc_cpu_pct` is in "percent of ONE core" units — 100.0 means the process
+    burned a full core over the window, 300.0 means three. That is the unit in
+    which "the edge's single driver thread is saturated" is directly readable."""
+    s = _split_sections(text)
+    out = {"host_cpu_pct": None, "source": None, "proc_cpu_pct": None,
+           "window_secs": None, "hz": None}
+    if "END" not in s:
+        return out
+    try:
+        out["hz"] = int(s.get("HZ", "") or 0) or None
+    except ValueError:
+        pass
+    try:
+        t0, t1 = float(s.get("T0", "")), float(s.get("T1", ""))
+        if t1 > t0:
+            out["window_secs"] = t1 - t0
+    except ValueError:
+        pass
+    idle = parse_mpstat_idle(s.get("MP", ""))
+    if idle is not None:
+        out["host_cpu_pct"], out["source"] = 100.0 - idle, "mpstat"
+    else:
+        try:
+            pct = cpu_pct_from_proc_stat(s.get("S0", ""), s.get("S1", ""))
+            if pct is not None:
+                out["host_cpu_pct"], out["source"] = pct, "proc_stat"
+        except ValueError:
+            pass
+    if s.get("P0") and s.get("P1") and out["window_secs"] and out["hz"]:
+        try:
+            dticks = pid_stat_ticks(s["P1"]) - pid_stat_ticks(s["P0"])
+            out["proc_cpu_pct"] = 100.0 * (dticks / out["hz"]) / out["window_secs"]
+        except ValueError:
+            pass
+    return out
+
+
+def sample_cpu_concurrently(targets, secs):
+    """Sample every (label, host, edge_unit) target over the SAME window.
+
+    Sequential sampling would need len(targets) x secs and would fall outside
+    the clients' run window; these are issued from a thread each (the work is
+    an ssh subprocess, so the GIL is irrelevant)."""
+    import concurrent.futures as cf
+
+    def one(t):
+        label, host, edge_unit = t
+        cmd = cpu_window_cmd(secs, edge_unit=edge_unit)
+        try:
+            r = ssh(host, cmd, timeout=secs + 60, label=f"cpu {label}")
+            return label, parse_cpu_window((r.stdout or "") + (r.stderr or ""))
+        except Exception as e:  # a lost CPU sample must not lose the rung
+            print(f"INFO CPU sample on {label} failed (continuing): {e}", flush=True)
+            return label, parse_cpu_window("")
+
+    with cf.ThreadPoolExecutor(max_workers=max(1, len(targets))) as ex:
+        return dict(ex.map(one, targets))
+
+
+def units_still_active(host, units):
+    """The subset of `units` systemd still calls active, in ONE ssh call."""
+    names = " ".join(f"{UNIT_PREFIX}-{u}" for u in units)
+    r = ssh(host, f"systemctl is-active {names} 2>/dev/null; true", label="systemctl")
+    states = (r.stdout or "").split()
+    return [u for u, st in zip(units, states) if st == "active"]
+
+
+def wait_units_done(by_host, deadline_ts, poll_secs=3.0):
+    """Poll until no client unit is active, or the deadline passes. Bounded by
+    construction — `deadline_ts` is an absolute wall-clock time."""
+    while time.time() < deadline_ts:
+        active = 0
+        for host, units in by_host:
+            active += len(units_still_active(host, units))
+        if active == 0:
+            return True
+        time.sleep(poll_secs)
+    print("INFO client units still active at the deadline; reading what they "
+          "have written and killing the rest", flush=True)
+    return False
+
+
+def _median_client(results, key):
+    """The MIDDLE client by responses/s, and one of its latency percentiles.
+
+    A percentile cannot be averaged across clients, so "the median client's
+    p99" has to name an actual client: rank the clients by responses/s and take
+    index (n-1)//2 (the lower middle for an even count)."""
+    if not results:
+        return None
+    ordered = sorted(results, key=lambda d: d.get("responses_per_sec") or 0.0)
+    return ordered[(len(ordered) - 1) // 2].get(key)
+
+
+def aggregate_edgesat(n, inflight, results, cpu, clients_started, reference=False):
+    """One ladder rung's EDGESAT-JSON dict from the clients' RESULT dicts plus
+    the CPU samples. Pure — `cpu` is {"leader": {...}, "clients": [{...}, ...]}."""
+    rps = [r.get("responses_per_sec") or 0.0 for r in results]
+    p99s = [r.get("p99_ms") for r in results if r.get("p99_ms") is not None]
+    leader = cpu.get("leader") or {}
+    return {
+        "n": n,
+        "inflight_per_client": inflight,
+        "reference": reference,
+        "agg_resp_per_sec": sum(rps),
+        "per_client_min": min(rps) if rps else None,
+        "per_client_med": statistics.median(rps) if rps else None,
+        "per_client_max": max(rps) if rps else None,
+        "p50_med_ms": _median_client(results, "p50_ms"),
+        "p95_med_ms": _median_client(results, "p95_ms"),
+        "p99_med_ms": _median_client(results, "p99_ms"),
+        "p99_worst_ms": max(p99s) if p99s else None,
+        "lost": sum(r.get("lost") or 0 for r in results),
+        "leader_cpu_pct": leader.get("host_cpu_pct"),
+        "edge_proc_cpu_pct": leader.get("proc_cpu_pct"),
+        "client_hosts_cpu_pct": [c.get("host_cpu_pct") for c in cpu.get("clients", [])],
+        "cpu_source": leader.get("source"),
+        "clients_started": clients_started,
+        "clients_reported": len(results),
+        "per_client_rps": rps,
+    }
+
+
+def _client_saturated(p):
+    vals = [c for c in (p.get("client_hosts_cpu_pct") or []) if c is not None]
+    return bool(vals) and max(vals) >= HOST_SAT_PCT
+
+
+def _edge_saturated(p):
+    v = p.get("edge_proc_cpu_pct")
+    return v is not None and v >= EDGE_CORE_SAT_PCT
+
+
+def select_knee(points, gain=EDGESAT_KNEE_GAIN):
+    """The first rung whose aggregate gains less than `gain` over the previous
+    one. Returns (knee_point, prev_point, measured_gain) or (None, None, None)
+    when every rung kept climbing."""
+    usable = [p for p in points if p.get("agg_resp_per_sec")]
+    for prev, cur in zip(usable, usable[1:]):
+        g = (cur["agg_resp_per_sec"] - prev["agg_resp_per_sec"]) / prev["agg_resp_per_sec"]
+        if g < gain:
+            return cur, prev, g
+    return None, None, None
+
+
+def classify_edgesat(points):
+    """Decide what the ladder actually showed, and REFUSE to call a knee that
+    the client hosts manufactured.
+
+    The failure mode this exists to prevent: at the top rungs the client host
+    runs out of CPU (16 `client-remote` processes x ~9 threads on one box), the
+    aggregate flattens, and a naive reader records "the edge saturates at
+    N=8" when the edge process was sitting at 60% of one core. So: any rung
+    where a client host is >= HOST_SAT_PCT while the edge process is NOT
+    >= EDGE_CORE_SAT_PCT is CLIENT-TAINTED. If the tainted rungs form the tail
+    of the ladder, the verdict is `client_bound` — the honest statement is a
+    LOWER BOUND on the edge ("edge ceiling >= the highest clean aggregate"),
+    not a knee.
+
+    Returns a dict describing the verdict, the clean prefix, the knee (computed
+    over clean rungs only) and the attributed ceiling."""
+    ladder = [p for p in points if not p.get("reference")]
+    tainted = [p["n"] for p in ladder if _client_saturated(p) and not _edge_saturated(p)]
+    client_bound_from = min(tainted) if tainted else None
+    clean = [p for p in ladder if client_bound_from is None or p["n"] < client_bound_from]
+    knee, prev, gain = select_knee(clean)
+    best_clean = max((p for p in clean if p.get("agg_resp_per_sec")),
+                     key=lambda p: p["agg_resp_per_sec"], default=None)
+    best_any = max((p for p in ladder if p.get("agg_resp_per_sec")),
+                   key=lambda p: p["agg_resp_per_sec"], default=None)
+
+    if client_bound_from is not None:
+        verdict = "client_bound"
+        # The RATIO is quoted off the highest CLEAN rung — a lower bound on the
+        # edge. The ATTRIBUTION is quoted off the first tainted rung, because
+        # that is where the ladder actually stopped and the honest sentence is
+        # "the load generator ran out", not "nothing was saturated at N=4".
+        ceiling_point = best_clean
+        attribution_point = next(p for p in ladder if p["n"] == client_bound_from)
+    elif knee is not None:
+        verdict = "knee"
+        ceiling_point = attribution_point = knee
+    else:
+        verdict = "no_knee"
+        ceiling_point = attribution_point = best_any
+    return {
+        "verdict": verdict,
+        "client_bound_from": client_bound_from,
+        "knee": knee, "knee_prev": prev, "knee_gain": gain,
+        "clean_points": [p["n"] for p in clean],
+        "highest_clean_agg": (best_clean or {}).get("agg_resp_per_sec"),
+        "highest_agg": (best_any or {}).get("agg_resp_per_sec"),
+        "ceiling_point": ceiling_point,
+        "attribution": attribute_ceiling(attribution_point),
+        "ratio_is_lower_bound": verdict != "knee",
+        "saturation_ratio": ((ceiling_point or {}).get("agg_resp_per_sec") or 0.0)
+        / DIRECT_ARM_PEAK_RPS if ceiling_point else None,
+    }
+
+
+def attribute_ceiling(p):
+    """Which stage is saturated at this rung — the sentence that makes the
+    curve interpretable. Ordered most-specific first."""
+    if p is None:
+        return "no usable rung — nothing to attribute"
+    edge = p.get("edge_proc_cpu_pct")
+    lead = p.get("leader_cpu_pct")
+    cli = [c for c in (p.get("client_hosts_cpu_pct") or []) if c is not None]
+    worst_cli = max(cli) if cli else None
+    if _edge_saturated(p):
+        return (f"EDGE PROCESS — the edge burned {edge:.0f}% of one core "
+                f"(~{edge / 100.0:.1f} cores); its single driver thread is the "
+                f"binding constraint")
+    if worst_cli is not None and worst_cli >= HOST_SAT_PCT:
+        return (f"CLIENT HOSTS — worst client host at {worst_cli:.0f}% CPU while "
+                f"the edge process held only {_fmt(edge)}% of one core: the "
+                f"load generator ran out, not the gateway")
+    if lead is not None and lead >= HOST_SAT_PCT:
+        return (f"LEADER HOST (backend) — leader box at {lead:.0f}% CPU with the "
+                f"edge process at {_fmt(edge)}% of one core: node + service, not "
+                f"the edge, own the ceiling")
+    return (f"UNSATURATED — edge {_fmt(edge)}% of one core, leader host "
+            f"{_fmt(lead)}%, worst client host {_fmt(worst_cli)}%: no sampled "
+            f"stage is at its limit, so the ceiling is a serialisation "
+            f"(per-connection credit, the client's Mutex<State>) rather than CPU")
+
+
+def edgesat_point(node_hosts, leader, client_hosts, a, n, inflight, reference=False):
+    """One rung: N concurrent `client-remote` units into the LEADER's edge,
+    round-robined over the client hosts, with every stage's CPU sampled inside
+    the run window. Returns the EDGESAT-JSON dict (never None — a rung where no
+    client reported is reported as such, not silently dropped)."""
+    secs = a.edgesat_secs
+    edge_addr = f"{node_hosts[leader].private_ip}:{EDGE_PORT}"
+    print(f"\nINFO --- edgesat rung N={n}, inflight/client={inflight}, "
+          f"secs={secs}{' (REFERENCE point)' if reference else ''} ---", flush=True)
+
+    # Round-robin the N clients over the client hosts, then group by host so
+    # each host's units go out in ONE ssh call (see `start_units_batch`).
+    grouped, order = {}, []
+    for i in range(n):
+        h = client_hosts[i % len(client_hosts)]
+        if id(h) not in grouped:
+            grouped[id(h)] = (h, [])
+            order.append(id(h))
+        grouped[id(h)][1].append(f"esat-c{n}-{i}")
+    by_host = [grouped[k] for k in order]   # [(host, [unit, ...])]
+
+    started = []
+    try:
+        t_start = time.time()
+        for h, units in by_host:
+            specs = [(u, ["client-remote", "--gateways", edge_addr,
+                          "--app-id", APP, "--secs", str(secs),
+                          "--payload", str(a.payload),
+                          "--inflight", str(inflight)]) for u in units]
+            started += start_units_batch(h, specs)
+        print(f"INFO started {len(started)}/{n} client unit(s) in "
+              f"{time.time() - t_start:.2f}s of wall skew", flush=True)
+
+        # CPU is sampled INSIDE the run: ramp first, then a window that must fit
+        # under --edgesat-secs with room for the clients' own drain.
+        window = max(3, min(a.edgesat_cpu_window_secs,
+                            int(secs - EDGESAT_RAMP_SECS - 2)))
+        time.sleep(EDGESAT_RAMP_SECS)
+        targets = [("leader", node_hosts[leader], "edge")]
+        targets += [(f"client{i}", h, None) for i, h in enumerate(client_hosts)]
+        print(f"INFO sampling CPU on {len(targets)} host(s) over a {window}s "
+              f"window while the rung runs", flush=True)
+        samples = sample_cpu_concurrently(targets, window)
+        cpu = {"leader": samples.get("leader", {}),
+               "clients": [samples.get(f"client{i}", {})
+                           for i in range(len(client_hosts))]}
+
+        deadline = t_start + secs + EDGESAT_DRAIN_SECS + CLIENT_SLACK_SECS
+        wait_units_done(by_host, deadline)
+
+        results = []
+        for h, units in by_host:
+            for u in units:
+                out = tail_log(h, u, lines=200)
+                d = parse_result(out, "gateway")
+                if d is None:
+                    print(f"INFO unit {UNIT_PREFIX}-{u} on {h.public_ip} produced "
+                          f"no RESULT line — not counted (a missing client is "
+                          f"missing, not a zero)", flush=True)
+                    echo(u, out, lines=8)
+                else:
+                    results.append(d)
+    finally:
+        for h, units in by_host:
+            kill_units_batch(h, units)
+
+    point = aggregate_edgesat(n, inflight, results, cpu, len(started),
+                              reference=reference)
+    print("EDGESAT-JSON " + json.dumps(point), flush=True)
+    return point
+
+
+def edgesat(node_hosts, client_hosts, a):
+    ladder = [int(x) for x in a.edgesat_clients.split(",") if x.strip()]
+    print(f"INFO ROW EDGESAT: ladder N={ladder}, inflight/client="
+          f"{a.edgesat_inflight}, secs={a.edgesat_secs}, payload={a.payload}, "
+          f"envelope=off, edge inflight={a.edgesat_edge_inflight}, "
+          f"{len(node_hosts)} node host(s), {len(client_hosts)} client host(s)",
+          flush=True)
+    wipe_dirs(node_hosts)
+    start_cluster(node_hosts, a, "off")
+
+    points = []
+    try:
+        leader = wait_leader(node_hosts, list(range(len(node_hosts))),
+                             LEADER_WAIT_SECS)
+        if leader is None:
+            return Verdict("edgesat N-client edge saturation (measurement, no bar)",
+                           False,
+                           f"no single serving leader within {LEADER_WAIT_SECS}s — "
+                           f"nothing measured (infrastructure failure)")
+        print(f"INFO leader is n{leader} ({node_hosts[leader].public_ip}); edges "
+              f"on all {len(node_hosts)} node hosts so REDIRECTs resolve, every "
+              f"client dials the LEADER's edge", flush=True)
+        start_edges(node_hosts, a, "off", inflight=a.edgesat_edge_inflight)
+
+        for n in ladder:
+            l2 = wait_leader(node_hosts, list(range(len(node_hosts))),
+                             LEADER_WAIT_SECS)
+            if l2 is None:
+                print(f"INFO leader lost before N={n}; skipping this rung",
+                      flush=True)
+                continue
+            if l2 != leader:
+                print(f"INFO leadership moved n{leader} -> n{l2}; re-targeting the "
+                      f"clients and the CPU sampler at the new leader", flush=True)
+                leader = l2
+            points.append(edgesat_point(node_hosts, leader, client_hosts, a, n,
+                                        a.edgesat_inflight))
+
+        # The reference rung, LAST and deliberately outside the ladder: one
+        # client at the row-2 inflight, so this row's curve can be tied back to
+        # the ~140k/s single-connection number row 2 reports.
+        if a.edgesat_ref:
+            l2 = wait_leader(node_hosts, list(range(len(node_hosts))),
+                             LEADER_WAIT_SECS)
+            if l2 is not None:
+                leader = l2
+                points.append(edgesat_point(node_hosts, leader, client_hosts, a,
+                                            1, a.edgesat_ref_inflight,
+                                            reference=True))
+            else:
+                print("INFO leader lost before the reference rung; skipping it",
+                      flush=True)
+    finally:
+        stop_edges(node_hosts)
+        stop_cluster(node_hosts)
+
+    return edgesat_report(points, a)
+
+
+def edgesat_report(points, a):
+    """Pure: the table, the EDGESAT-SUMMARY block and the Verdict."""
+    print("\nEDGESAT — aggregate gateway throughput vs concurrent client connections")
+    print(f"  {'N':>4} {'if/cl':>6} {'agg resp/s':>12} {'min':>10} {'med':>10} "
+          f"{'max':>10} {'p50':>7} {'p95':>7} {'p99':>7} {'p99w':>7} {'lost':>5} "
+          f"{'edge%core':>10} {'lead%':>6} {'client%':>9}")
+    for p in points:
+        def f(x, w, d=3):
+            return f"{x:>{w}.{d}f}" if isinstance(x, (int, float)) else f"{'—':>{w}}"
+        cli = [c for c in (p["client_hosts_cpu_pct"] or []) if c is not None]
+        tag = "1*" if p["reference"] else str(p["n"])
+        print(f"  {tag:>4} {p['inflight_per_client']:>6} "
+              f"{f(p['agg_resp_per_sec'],12,0)} {f(p['per_client_min'],10,0)} "
+              f"{f(p['per_client_med'],10,0)} {f(p['per_client_max'],10,0)} "
+              f"{f(p['p50_med_ms'],7)} {f(p['p95_med_ms'],7)} {f(p['p99_med_ms'],7)} "
+              f"{f(p['p99_worst_ms'],7)} {p['lost']:>5} "
+              f"{f(p['edge_proc_cpu_pct'],10,0)} {f(p['leader_cpu_pct'],6,0)} "
+              f"{f(max(cli) if cli else None,9,0)}")
+    print("  (1* = the reference rung: one client at the row-2 inflight)")
+    print("  EDGESAT-POINTS-JSON " + json.dumps(points))
+
+    c = classify_edgesat(points)
+    print("\nEDGESAT-SUMMARY")
+    if not points:
+        print("  no rung produced a measurement")
+    if c["verdict"] == "client_bound":
+        hi = c["highest_clean_agg"]
+        print(f"  CLIENT-BOUND above N={c['client_bound_from']} — at and above that "
+              f"rung a client host sat at >= {HOST_SAT_PCT:.0f}% CPU while the "
+              f"edge process stayed under {EDGE_CORE_SAT_PCT:.0f}% of one core, so "
+              f"the flattening is the LOAD GENERATOR, not the gateway.")
+        if hi is None:
+            print("  No knee is reported, and NO LOWER BOUND EITHER: not one rung "
+                  "was free of client-host saturation, so this ladder measured "
+                  "the load generator end to end. Re-run with more client hosts "
+                  "(hosts[3..]) or a smaller ladder before quoting any number "
+                  "from it.")
+        else:
+            print(f"  No knee is reported. The honest statement is a lower bound: "
+                  f"edge ceiling >= {_fmt(hi, 0)} resp/s "
+                  f"(highest clean aggregate, at N in {c['clean_points']}).")
+    elif c["verdict"] == "knee":
+        k, prev, g = c["knee"], c["knee_prev"], c["knee_gain"]
+        print(f"  KNEE at N={k['n']}: aggregate {k['agg_resp_per_sec']:.0f} resp/s, "
+              f"only {g * 100:.1f}% over N={prev['n']}'s "
+              f"{prev['agg_resp_per_sec']:.0f} resp/s "
+              f"(< {EDGESAT_KNEE_GAIN * 100:.0f}% = the knee rule).")
+    else:
+        print("  NO KNEE — the aggregate was still gaining >= "
+              f"{EDGESAT_KNEE_GAIN * 100:.0f}% at the top of the ladder; the edge "
+              f"ceiling is above {_fmt(c['highest_agg'], 0)} resp/s and this "
+              f"ladder did not reach it.")
+    print(f"  ATTRIBUTED CEILING: {c['attribution']}")
+    if c["saturation_ratio"] is not None:
+        cp = c["ceiling_point"]
+        bound = ">= " if c["ratio_is_lower_bound"] else ""
+        print(f"  EDGE SATURATION RATIO: {bound}{cp['agg_resp_per_sec']:.0f} / "
+              f"{DIRECT_ARM_PEAK_RPS:.0f} = {bound}{c['saturation_ratio']:.3f} "
+              f"(aggregate at the ceiling rung N={cp['n']} over the measured "
+              f"direct-arm peak — the candidate re-specced row-2 metric"
+              + ("; a LOWER BOUND, since the ladder did not reach a clean "
+                 "ceiling)" if c["ratio_is_lower_bound"] else ")"))
+    lost = sum(p["lost"] for p in points)
+    missing = [(p["n"], p["clients_started"], p["clients_reported"]) for p in points
+               if p["clients_reported"] != p["clients_started"]]
+    if lost:
+        print(f"  WARNING: {lost} lost response(s) across the ladder (bar 0 for a "
+              f"clean curve)")
+    if missing:
+        print(f"  WARNING: rungs where not every started client reported "
+              f"(N, started, reported): {missing}")
+    # The rung dicts themselves are already in EDGESAT-POINTS-JSON; the summary
+    # names them by N so it stays one readable line.
+    print("  EDGESAT-SUMMARY-JSON " + json.dumps(
+        {k: v for k, v in c.items()
+         if k not in ("ceiling_point", "knee", "knee_prev")}
+        | {"ceiling_n": (c["ceiling_point"] or {}).get("n"),
+           "knee_n": (c["knee"] or {}).get("n"),
+           "knee_prev_n": (c["knee_prev"] or {}).get("n"),
+           "direct_arm_peak_rps": DIRECT_ARM_PEAK_RPS,
+           "lost_total": lost}))
+
+    detail = (f"{len(points)} rung(s); verdict={c['verdict']}; "
+              + ((f"client-bound above N={c['client_bound_from']}, edge ceiling >= "
+                  f"{_fmt(c['highest_clean_agg'], 0)} resp/s; "
+                  if c["highest_clean_agg"] is not None else
+                  f"client-bound from the first rung (N={c['client_bound_from']}) "
+                  f"— no clean rung, so no bound on the edge; ")
+                 if c["verdict"] == "client_bound" else
+                 (f"knee at N={c['knee']['n']} ({c['knee']['agg_resp_per_sec']:.0f} "
+                  f"resp/s); " if c["verdict"] == "knee" else
+                  f"no knee, top aggregate {_fmt(c['highest_agg'], 0)} resp/s; "))
+              + (f"saturation ratio {c['saturation_ratio']:.3f}"
+                 if c["saturation_ratio"] is not None else "no saturation ratio"))
+    # MEASUREMENT row: it states numbers. It only goes red on an infrastructure
+    # failure (no leader, no rung at all), never on the shape of the curve.
+    return Verdict("edgesat N-client edge saturation (measurement, no bar)",
+                   len(points) > 0, detail)
+
+
 # --------------------------------------------------------------------- setup
 
 def setup_fleet(a):
@@ -913,15 +1607,39 @@ def setup_fleet(a):
         prepare_host(h, apply_profile=False)
         for u in ("node", "service", "edge"):
             kill_unit(h, u)
-    node_hosts = hosts[: a.nodes - 1]
-    client_host = hosts[a.nodes - 1]
+    if a.row == "edgesat":
+        # The edge-saturation topology is FIXED at three cluster hosts, so that
+        # every remaining host is a client host: the row scales CLIENTS, and a
+        # fourth voter would only move hardware from the load generator into
+        # the consensus plane. hosts[3..] stays a list — the proven fleet shape
+        # is 4 hosts (one client host), but 5+ works unchanged if a vCPU quota
+        # ever allows it.
+        node_hosts = hosts[:3]
+        client_hosts = hosts[3:]
+    else:
+        node_hosts = hosts[: a.nodes - 1]
+        client_hosts = [hosts[a.nodes - 1]]
     print(f"INFO topology: {len(node_hosts)} cluster host(s) "
-          f"{[h.public_ip for h in node_hosts]}, measurement host "
-          f"{client_host.public_ip}", flush=True)
-    return node_hosts, client_host
+          f"{[h.public_ip for h in node_hosts]}, "
+          f"{len(client_hosts)} client host(s) "
+          f"{[h.public_ip for h in client_hosts]}", flush=True)
+    return node_hosts, client_hosts
 
 
 def print_bar(a):
+    if a.row == "edgesat":
+        print("M12 EDGESAT — N-client edge saturation (MEASUREMENT, no bar):")
+        print("  Aggregate gateway throughput as concurrent client connections")
+        print("  scale, with the CPU of every candidate ceiling sampled inside")
+        print("  each rung's window: the edge process (percent of ONE core, so")
+        print("  a saturated single driver thread is directly readable), the")
+        print("  leader host, and every client host. The summary refuses to")
+        print("  call a knee that the client hosts manufactured.")
+        print("  Grounds a re-spec of gate row 2: today's row-2 ratio is a")
+        print("  PER-CONNECTION number; the deployment-relevant one is the")
+        print("  aggregate at the edge's ceiling over the direct-arm peak.")
+        print()
+        return
     print("M12 gate rows 2-3 — the pre-committed bars:")
     print(f"  row 2  gateway (Edge + RemoteClient) responses/s >= {BAR_RATIO} x direct")
     print("         `Engine` responses/s at EQUAL inflight, on a real fleet,")
@@ -944,10 +1662,13 @@ def main():
     ap.add_argument("--hosts", default="",
                     help="pub/priv,... (else `terraform output -json nodes`)")
     ap.add_argument("--nodes", type=int, default=4,
-                    help="TOTAL hosts: the first N-1 run one node + one service "
-                         "(+ an edge during the gateway arm), the last runs the "
-                         "remote client and nothing else (default 4 = a 3-node "
-                         "cluster + 1 measurement host)")
+                    help="TOTAL hosts. Rows 1-3: the first N-1 run one node + one "
+                         "service (+ an edge during the gateway arm), the last "
+                         "runs the remote client and nothing else (default 4 = a "
+                         "3-node cluster + 1 measurement host). `--row edgesat` "
+                         "fixes the cluster at THREE hosts and turns every "
+                         "remaining host into a client host, so 4 gives the "
+                         "proven shape (3 + 1) and 5 would give 3 + 2")
     ap.add_argument("--ssh-user", default="ubuntu")
     ap.add_argument("--ssh-key", default="/home/claude/.ssh/id_ed25519")
     ap.add_argument("--secs", type=int, default=10)
@@ -964,9 +1685,12 @@ def main():
                     help="row 3 load duration; the apply-profile counters print "
                          "every 1,000,000 applied frames, so this must be long "
                          "enough to reach one million")
-    ap.add_argument("--row", choices=("1", "2", "3", "both"), default="both",
+    ap.add_argument("--row", choices=("1", "2", "3", "both", "edgesat"),
+                    default="both",
                     help="`both` = rows 2 and 3 (the pass/measurement pair); "
-                         "`1` = the network-budget measurement (run on its own)")
+                         "`1` = the network-budget measurement (run on its own); "
+                         "`edgesat` = the N-client edge-saturation ladder (run on "
+                         "its own — `both` deliberately does NOT include it)")
     ap.add_argument("--netbudget-inflights", default=DEFAULT_NETBUDGET_INFLIGHTS,
                     help="row 1 only: comma-separated inflight ladder driven on "
                          "the leader (default %(default)s)")
@@ -978,19 +1702,71 @@ def main():
                     help="row 1 only (default on): after the ladder, add a "
                          "concurrent TCP client-remote on the measurement host and "
                          "re-measure the p99<1ms point to see if the box tips over")
+    ap.add_argument("--edgesat-clients", default=DEFAULT_EDGESAT_CLIENTS,
+                    help="edgesat only: comma-separated ladder of CONCURRENT "
+                         "client connections, one systemd unit each, all into "
+                         "the leader's edge (default %(default)s). The proven "
+                         "fleet shape has ONE client host, and each "
+                         "`client-remote` costs a sender thread plus eight "
+                         "waiters — past 16 the rungs measure the load "
+                         "generator, which is why the default stops there")
+    ap.add_argument("--edgesat-inflight", type=int, default=1024,
+                    help="edgesat only: per-client inflight window (default "
+                         "%(default)s)")
+    ap.add_argument("--edgesat-secs", type=int, default=15,
+                    help="edgesat only: per-rung load duration (default "
+                         "%(default)s)")
+    ap.add_argument("--edgesat-edge-inflight", type=int, default=65536,
+                    help="edgesat only: the EDGE's max_inflight/per_conn_inflight "
+                         "(default %(default)s). Deliberately oversized: row 2 "
+                         "keeps the edge window equal to the client's because it "
+                         "measures a ratio at equal inflight, but here a shared "
+                         "engine window smaller than N x --edgesat-inflight would "
+                         "make the ladder measure the edge's ADMISSION WINDOW "
+                         "instead of its service rate. Each client's own "
+                         "--edgesat-inflight stays the binding per-connection cap")
+    ap.add_argument("--edgesat-cpu-window-secs", type=int, default=6,
+                    help="edgesat only: CPU sampling window inside each rung "
+                         "(default %(default)s; clamped to fit --edgesat-secs "
+                         "after the ramp)")
+    ap.add_argument("--edgesat-ref", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="edgesat only (default on): one extra rung at the END, "
+                         "N=1 at --edgesat-ref-inflight, tying this curve back to "
+                         "the single-connection number row 2 reports")
+    ap.add_argument("--edgesat-ref-inflight", type=int, default=4096,
+                    help="edgesat only: the reference rung's inflight (default "
+                         "%(default)s = row 2's --inflight)")
     a = ap.parse_args()
 
     if a.nodes < 4:
         raise SystemExit("--nodes must be at least 4 (3 cluster hosts + 1 "
                          "measurement host); a 2-node cluster has no quorum "
                          "story worth measuring")
+    if a.row == "edgesat":
+        try:
+            ladder = [int(x) for x in a.edgesat_clients.split(",") if x.strip()]
+        except ValueError:
+            raise SystemExit("--edgesat-clients must be a comma-separated list of "
+                             "integers")
+        if not ladder or any(n < 1 for n in ladder):
+            raise SystemExit("--edgesat-clients must name at least one rung and "
+                             "every rung must be >= 1")
+        if a.edgesat_cpu_window_secs + EDGESAT_RAMP_SECS >= a.edgesat_secs:
+            print(f"INFO --edgesat-cpu-window-secs {a.edgesat_cpu_window_secs} does "
+                  f"not fit inside --edgesat-secs {a.edgesat_secs} after the "
+                  f"{EDGESAT_RAMP_SECS:.0f}s ramp; it will be clamped per rung",
+                  flush=True)
 
     print_bar(a)
-    node_hosts, client_host = setup_fleet(a)
+    node_hosts, client_hosts = setup_fleet(a)
+    client_host = client_hosts[0]
     verdicts = []
     try:
         if a.row == "1":
             verdicts.append(row1(node_hosts, client_host, a))
+        if a.row == "edgesat":
+            verdicts.append(edgesat(node_hosts, client_hosts, a))
         if a.row in ("2", "both"):
             verdicts.append(row2(node_hosts, client_host, a))
         if a.row in ("3", "both"):
@@ -1006,6 +1782,13 @@ def main():
     # reported honestly above but does not turn the run red.
     row2_v = next((v for v in verdicts if v.row.startswith("2 ")), None)
     if row2_v is None:
+        # The edge-saturation row is a measurement too, but "no leader" or "no
+        # rung at all" is an INFRASTRUCTURE failure, not a measurement — that
+        # must not exit green.
+        esat_v = next((v for v in verdicts if v.row.startswith("edgesat")), None)
+        if esat_v is not None and not esat_v.passed:
+            print(f"RESULT: FAIL (infrastructure) — {esat_v.detail}")
+            sys.exit(1)
         print("RESULT: PASS (measurement rows only — no bar was adjudicated)")
         sys.exit(0)
     if row2_v.passed:
