@@ -59,8 +59,8 @@ use bytes::Bytes;
 use crate::conn::FramedConn;
 use crate::error::RemoteError;
 use crate::frame::{
-    FrameType, Header, Hello, HelloOk, HelloRefused, Leader, ResponseMeta, Retry, Status,
-    FLAG_EXPIRED, FLAG_LINEARIZABLE, FLAG_REPLAYED, HEADER_LEN, HELLO_REFUSED_BUSY,
+    encode_frame, FrameType, Header, Hello, HelloOk, HelloRefused, Leader, ResponseMeta, Retry,
+    Status, FLAG_EXPIRED, FLAG_LINEARIZABLE, FLAG_REPLAYED, HEADER_LEN, HELLO_REFUSED_BUSY,
     HELLO_REFUSED_FAULTED, MAX_FRAME_LEN, PROTOCOL_VERSION, RETRY_NOT_SERVING,
     RETRY_PAYLOAD_TOO_LARGE,
 };
@@ -685,9 +685,15 @@ impl Inner {
         }
         let window = acked_seq.saturating_add(*credits as u64);
         let c = conn.as_mut().expect("checked above");
-        let mut broken = false;
-        let mut wrote = false;
         let mut next_from = u64::MAX;
+        // Drain every admissible unsent frame into ONE buffer under the lock,
+        // then flush it with a SINGLE `write_all` below — instead of a syscall
+        // per frame. Frames are length-prefixed, so the concatenation parses
+        // back to whole frames on the edge however TCP segments it. The flush
+        // happens when the drain is empty (flush-on-empty); there is no batch
+        // timer, so this never adds a latency cadence at low inflight.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut min_batch_seq: Option<u64> = None;
         for (seq, p) in pending.range_mut(*resend_from..) {
             if p.sent {
                 continue;
@@ -711,34 +717,44 @@ impl Inner {
                 client_id: self.client_id,
                 seq: *seq,
             };
-            match c.write_frame(h, &p.payload) {
-                Ok(()) => {
-                    p.sent = true;
-                    p.attempts += 1;
-                    wrote = true;
-                    if p.attempts > 1 {
-                        self.stats.resends.fetch_add(1, Ordering::Relaxed);
-                    }
-                    if probe_only {
-                        *probe_seq = Some(*seq);
-                        // `resend_from` is a lower bound, so naming a seq that
-                        // may not exist is fine — the next pump's `range`
-                        // starts at the first pending key at or above it.
-                        next_from = seq.saturating_add(1);
-                        break;
-                    }
-                }
-                Err(_) => {
-                    next_from = *seq;
-                    broken = true;
-                    break;
-                }
+            encode_frame(&mut buf, h, &p.payload);
+            if min_batch_seq.is_none() {
+                min_batch_seq = Some(*seq);
+            }
+            p.sent = true;
+            p.attempts += 1;
+            if p.attempts > 1 {
+                self.stats.resends.fetch_add(1, Ordering::Relaxed);
+            }
+            if probe_only {
+                *probe_seq = Some(*seq);
+                // `resend_from` is a lower bound, so naming a seq that may not
+                // exist is fine — the next pump's `range` starts at the first
+                // pending key at or above it.
+                next_from = seq.saturating_add(1);
+                break;
             }
         }
+        let broken = if buf.is_empty() {
+            false
+        } else {
+            match c.write_all_bytes(&buf) {
+                Ok(()) => {
+                    *last_write = now;
+                    false
+                }
+                Err(_) => {
+                    // The whole batch failed to reach the peer: `resend_from`
+                    // must not advance past it. `drop_conn` + the reader's
+                    // reconnect (which resets every `sent` flag and rewinds
+                    // `resend_from` to the first pending key) re-send it in
+                    // order — the same recovery a per-frame write failure took.
+                    next_from = min_batch_seq.unwrap_or(*resend_from);
+                    true
+                }
+            }
+        };
         *resend_from = next_from;
-        if wrote {
-            *last_write = now;
-        }
         if broken {
             // Wake the reader thread out of its blocking read; it reconnects.
             drop_conn(st);

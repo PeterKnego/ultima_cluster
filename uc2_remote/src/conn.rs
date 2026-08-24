@@ -162,6 +162,22 @@ impl FramedConn {
         encode_frame(&mut self.out, h, payload);
         self.stream.write_all(&self.out).map_err(RemoteError::Io)
     }
+
+    /// Write a buffer of one-or-more **already-encoded** frames in a single
+    /// `write_all` (one syscall for the whole batch). The caller is responsible
+    /// for the framing — each frame in `buf` must be a complete
+    /// [`encode_frame`] product, so the peer's length-prefixed parser sees whole
+    /// frames however the concatenation is split across TCP segments.
+    ///
+    /// Same failure contract as [`FramedConn::write_frame`]: a partial write may
+    /// have left the peer's parser mid-frame, so the caller must discard the
+    /// connection on `Err`.
+    pub fn write_all_bytes(&mut self, buf: &[u8]) -> Result<(), RemoteError> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.stream.write_all(buf).map_err(RemoteError::Io)
+    }
 }
 
 fn eof() -> io::Error {
