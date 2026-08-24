@@ -372,7 +372,30 @@ grows it; the two-client backpressure test keeps passing with
   client SDK.
 - Multi-service = **M14**.
 
-## 9. Risks
+## 9. Implementation plans
+
+Three plans, one per independent track, executed in this order (A unblocks
+row d and retires the yield mitigation; B is the largest; C's gate rows
+a–c need B's client and row d needs A):
+
+1. `docs/superpowers/plans/2026-08-24-uc2-m13a-mpsc-ring.md` — §4 (+ the
+   cnc field and `/metrics` line of §4.2), 9 tasks.
+2. `docs/superpowers/plans/2026-08-24-uc2-m13b-remote-client.md` — §3, §6
+   and every caller migration, 16 tasks.
+3. `docs/superpowers/plans/2026-08-24-uc2-m13c-edge-budget-and-gate.md` —
+   §5, the §2 gate artefacts (`--arms gate`, the gate doc skeleton) and
+   the §7 release checklist, 9 tasks.
+
+Cross-track contracts pinned in all three: the `Engine` API is unchanged
+(A); `RemoteClient::{connect, submit, query(&[u8], Consistency), stats,
+shutdown}` + `Ticket::{wait, wait_timeout}` + `RemoteStats.max_credits_seen`
+stay (B, used by C's tests); `hop_bench remote-load` keeps `--gateways
+--secs --payload --inflight --conns` and its `RESULT {"arm":"remote",…}`
+line (B, consumed by C's gate arm); `hop_bench edge` defaults
+`per_conn_inflight` to 1024 so the new budget refusal does not reject the
+harness (C).
+
+## 10. Risks
 
 - The ring change touches the one component every process shares; the
   loom model and the preemption test are the mitigation, and the dev-box
