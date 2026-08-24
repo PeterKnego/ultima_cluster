@@ -331,6 +331,68 @@ def arm_full(m12hosts, hophosts, a, points):
         m12.stop_cluster(node_hosts)
 
 
+def arm_diag(S, C, a, points):
+    """Collapse diagnosis: blaster → edge → dummy-node at the rungs around the
+    knee, with the EDGE's per-thread CPU + current syscall sampled mid-rung
+    and its own per-second stats (backpressure / retries / responses)
+    echoed. Separates "number of connections (reader threads)" from "number
+    of outstanding requests" as the trigger."""
+    sampler_local = str(Path(__file__).resolve().parent / "thread_sample.sh")
+    r = subprocess.run(["scp", "-o", "StrictHostKeyChecking=accept-new", "-i", a.ssh_key,
+                        sampler_local, f"{S.target}:/tmp/thread_sample.sh"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"scp sampler: {r.stderr}")
+    rungs = [(int(n), int(i)) for n, i in
+             (x.split("x") for x in a.diag_rungs.split(",") if x.strip())]
+    start_dummy_node(S, a)
+    gw = f"{S.private_ip}:{EDGE_PORT}"
+    try:
+        start_hop_edge(S, hop_dir(S), HOP_APP, a.edge_unbounded, a.edge_per_conn)
+        for n, infl in rungs:
+            label = f"X diag blaster→edge(unbounded)→dummy-node conns={n} inflight={infl}"
+            unit = "hb-client"
+            ssh(C, f"sudo rm -f {unit_log(C, unit)}", label="ssh")
+            print(f"\nINFO --- {label} ---", flush=True)
+            t_start = time.time()
+            start_unit(C, unit, ["blaster", "--gateway", gw, "--app-id", HOP_APP,
+                                 "--secs", str(a.secs), "--payload", str(a.payload),
+                                 "--inflight", str(infl), "--conns", str(n)])
+            time.sleep(RAMP_SECS)
+            r = ssh(S, f"PID=$(systemctl show -p MainPID --value {m12.UNIT_PREFIX}-hb-edge); "
+                       f"sudo bash /tmp/thread_sample.sh $PID 3", timeout=60, label="threads")
+            print(f"THREADS {label}\n{r.stdout}", flush=True)
+            deadline = t_start + a.secs + DRAIN_SECS + SLACK_SECS
+            wait_units_done([(C, [unit])], deadline)
+            out = tail_log(C, unit, lines=400)
+            d = parse_result(out, "blaster")
+            kill_unit(C, unit)
+            edge_log = tail_log(S, "hb-edge", lines=a.secs + 8)
+            print(f"EDGE-STATS {label}", flush=True)
+            for l in edge_log.splitlines():
+                if l.startswith("edge:"):
+                    print(f"  {l}", flush=True)
+            point = {"label": label, "arm": "blaster", "ok": d is not None,
+                     "rps": d.get("responses_per_sec") if d else None,
+                     "p50_ms": d.get("p50_ms") if d else None,
+                     "p95_ms": d.get("p95_ms") if d else None,
+                     "p99_ms": d.get("p99_ms") if d else None,
+                     "lost": d.get("lost") if d else None,
+                     "retried": d.get("retried") if d else None,
+                     "sends": d.get("sends") if d else None,
+                     "server_host_cpu_pct": None, "server_proc_cpu_pct": None,
+                     "client_host_cpu_pct": None, "client_proc_cpu_pct": None,
+                     "hop": "diag", "inflight": infl, "n": n, "driver": "blaster"}
+            print("HOP-JSON " + json.dumps(point), flush=True)
+            points.append(point)
+            # Fresh edge per rung so a collapsed rung's residue cannot leak.
+            kill_unit(S, "hb-edge")
+            start_hop_edge(S, hop_dir(S), HOP_APP, a.edge_unbounded, a.edge_per_conn)
+    finally:
+        kill_unit(S, "hb-edge")
+        kill_unit(S, "hb-dnode")
+
+
 # ------------------------------------------------------------------- table
 
 def table(points):
@@ -358,6 +420,9 @@ def main():
     ap.add_argument("--local-tree", default=str(Path(__file__).resolve().parent.parent.parent),
                     help="tree to rsync to the hosts before building (default: this checkout)")
     ap.add_argument("--no-sync", action="store_true", help="skip the rsync + build")
+    ap.add_argument("--prepare-hosts", default="",
+                    help="comma-separated host indices to rsync+build (default all); "
+                         "the diag arm only needs 0 and 3")
     ap.add_argument("--secs", type=int, default=10)
     ap.add_argument("--payload", type=int, default=64)
     ap.add_argument("--inflight", type=int, default=4096, help="deep single-stream inflight")
@@ -371,7 +436,9 @@ def main():
     ap.add_argument("--full-inflights", default="256,1024")
     ap.add_argument("--admission-kib", type=int, default=256)
     ap.add_argument("--cpu-window-secs", type=int, default=5)
-    ap.add_argument("--arms", default="1,3,2,full", help="subset of: 1,3,2,full")
+    ap.add_argument("--arms", default="1,3,2,full", help="subset of: 1,3,2,full,diag")
+    ap.add_argument("--diag-rungs", default="4x1024,6x1024,8x128,8x1024",
+                    help="diag arm: comma-separated <conns>x<inflight> rungs")
     a = ap.parse_args()
 
     hop_hosts = m6.build_fleet_hosts(HOP_BIN, a.ssh_user, a.ssh_key, a.hosts, count=a.nodes,
@@ -380,10 +447,13 @@ def main():
     m12_hosts = m6.build_fleet_hosts(m12.BUILT_GATE, a.ssh_user, a.ssh_key, a.hosts, count=a.nodes,
                                      unit_prefix=m12.UNIT_PREFIX, remote_root=m12.REMOTE_ROOT,
                                      probe_bin=m12.BUILT_PROBE)
+    prep_idx = [int(x) for x in a.prepare_hosts.split(",")] if a.prepare_hosts else list(range(len(hop_hosts)))
+    prep = [hop_hosts[i] for i in prep_idx]
     if not a.no_sync:
-        sync_tree(hop_hosts, a.local_tree)
-    for h in hop_hosts:
+        sync_tree(prep, a.local_tree)
+    for h in prep:
         prepare_host(h)
+    for h in hop_hosts:
         for u in ("hb-dnode", "hb-dedge", "hb-edge", "hb-client", "node", "service", "edge"):
             kill_unit(h, u)
     S, C = hop_hosts[0], hop_hosts[3]
@@ -400,6 +470,8 @@ def main():
             arm_hop2(S, C, a, points)
         if "full" in arms:
             arm_full(m12_hosts, hop_hosts, a, points)
+        if "diag" in arms:
+            arm_diag(S, C, a, points)
     finally:
         table(points)
         for h in hop_hosts:

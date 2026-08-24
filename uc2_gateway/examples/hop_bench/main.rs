@@ -113,8 +113,24 @@ fn run_edge(a: EdgeArgs) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("edge start: {e}"))?;
     println!("hop_bench edge up on {}; parking (killed externally)", edge.local_addr());
     println!("READY");
+    // One stats line per second, deltas, so a collapse rung shows WHAT the
+    // edge is doing (backpressure events, retries, responses) not just that
+    // it is busy.
+    let mut last = edge.stats();
     loop {
-        std::thread::park();
+        std::thread::sleep(Duration::from_secs(1));
+        let s = edge.stats();
+        println!(
+            "edge: conns={} submits/s={} responses/s={} backpressure/s={} retries/s={} unknown/s={} status/s={}",
+            s.connections,
+            s.submits - last.submits,
+            s.responses - last.responses,
+            s.backpressure_events - last.backpressure_events,
+            s.retries - last.retries,
+            s.unknown - last.unknown,
+            s.status_frames - last.status_frames,
+        );
+        last = s;
     }
 }
 
