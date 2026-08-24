@@ -1259,7 +1259,7 @@ fn reader_loop(inner: Arc<Inner>, mut rd: FramedConn) {
         // `dead_after` is the mid-frame bound as well as the silence bound:
         // a peer that vanishes half way through a frame must reach the same
         // verdict, on the same clock, as one that vanishes between frames.
-        let frame = rd.read_frame(inner.cfg.dead_after);
+        let frame = rd.read_frame_buffered(inner.cfg.dead_after);
         // One clock read per iteration serves the tick, the liveness check and
         // the receive stamp.
         let now = Instant::now();

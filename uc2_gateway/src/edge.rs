@@ -778,7 +778,7 @@ fn reader(shared: Arc<Shared>, conn: Arc<Conn>, send: SendHalf, mut fc: FramedCo
             // A peer that vanishes MID-FRAME must not pin this thread until
             // the edge stops: `request_timeout` is the same budget the
             // request behind that frame would have had anyway.
-            match fc.read_frame(shared.cfg.request_timeout) {
+            match fc.read_frame_buffered(shared.cfg.request_timeout) {
                 // Read timeout at a frame boundary: just re-check the flags.
                 Ok(None) => {}
                 Ok(Some((h, payload))) => {
