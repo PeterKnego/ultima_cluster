@@ -6,10 +6,24 @@
 //! item 5, §8 row 2).
 //!
 //! ```text
+//! # local smoke — both arms in-process, one after the other (NOT the gate)
 //! cargo run -p uc2_gateway --release --example m12_gate -- \
 //!     [--arm direct|gateway|both] [--secs 6] [--payload 64] [--inflight 4096] \
 //!     [--envelope on|off] [--root DIR]
+//!
+//! # fleet roles — one process per role per host, driven by
+//! # bench-infra/scripts/m12_fleet_gate.py (gate rows 2 and 3)
+//! m12_gate node          --id N --bind A --instance-dir D --members id@addr,… [--admission-kib K]
+//! m12_gate service       --instance-dir D [--envelope on|off] [--raw-sm]
+//! m12_gate edge          --instance-dir D --listen A --members id@gw_addr,… [--envelope on|off] [--inflight N]
+//! m12_gate client-direct --instance-dir D --secs S [--payload P] [--inflight N] [--envelope on|off]
+//! m12_gate client-remote --gateways A,… --secs S [--payload P] [--inflight N]
 //! ```
+//!
+//! The two client roles each print ONE machine-readable
+//! `RESULT {"arm":…,"responses_per_sec":…,…}` line, which is all the fleet
+//! driver parses. Everything else they print is for a human reading the unit
+//! log.
 //!
 //! **`direct`** is `m5_gate`'s measuring client (`uc2_node/examples/m5_gate.rs`)
 //! copied verbatim: three in-process nodes + three typed [`CountSm`] services,
@@ -48,7 +62,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use hdrhistogram::Histogram;
 
 use uc2_client::{Engine, EngineConfig, Outcome, SubmitError};
@@ -57,7 +71,8 @@ use uc2_net::fault::FaultConfig;
 use uc2_node::{Node, NodeConfig};
 use uc2_remote::{RemoteClient, RemoteConfig};
 use uc2_service::{
-    RawStateMachine, Service, ServiceBuilder, ServiceConfig, SessionConfig, Sessioned, StateMachine,
+    RawStateMachine, SESSION_HEADER_LEN, Service, ServiceBuilder, ServiceConfig, SessionConfig,
+    Sessioned, StateMachine, TAG_FRESH,
 };
 
 // --------------------------------------------------------------- CLI shape
@@ -68,6 +83,10 @@ use uc2_service::{
     about = "uc2 M12a gate: gateway (Edge + RemoteClient) vs direct Engine throughput (spec §8 row 2)"
 )]
 struct Cli {
+    /// Fleet per-role subcommand. Omitted = the in-process local smoke below
+    /// (`--arm both` and friends), byte-for-byte the pre-M12-fleet behaviour.
+    #[command(subcommand)]
+    role: Option<Role>,
     /// Which arm(s) to run.
     #[arg(long, value_enum, default_value_t = Arm::Both)]
     arm: Arm,
@@ -102,8 +121,140 @@ enum Envelope {
     Off,
 }
 
+// ------------------------------------------------- fleet per-role subcommands
+//
+// The in-process arms above build BOTH clusters on loopback inside one
+// process, which is what makes the local smoke's ratio uninterpretable (the
+// gate doc's "Local smoke numbers" section says so at length: one 4-vCPU box,
+// every role oversubscribed). The roles below are the fleet shape — one
+// process per role per host, dedicated cores — driven by
+// `bench-infra/scripts/m12_fleet_gate.py`. They deliberately reuse the SAME
+// `CountSm`/`RawCountSm` pair, the same `Edge`, the same `RemoteClient` and
+// the same two measurement cores as the in-process arms, so the only thing
+// that changes between smoke and fleet is where the processes run.
+
+#[derive(Subcommand)]
+enum Role {
+    /// Cluster-member node (one process per host). Parks until killed.
+    Node(NodeArgs),
+    /// State-machine service attached to this host's node. Parks until killed.
+    Service(ServiceArgs),
+    /// Gateway edge over this host's node. Parks until killed.
+    Edge(EdgeArgs),
+    /// Measuring client over the LOCAL shmem `Engine` — must run on the
+    /// leader's host (the direct arm of row 2, and row 3's load generator).
+    ClientDirect(ClientDirectArgs),
+    /// Measuring client over the framed remote protocol — runs on a host with
+    /// no node of its own (the gateway arm of row 2).
+    ClientRemote(ClientRemoteArgs),
+}
+
+#[derive(clap::Args)]
+struct NodeArgs {
+    #[arg(long)]
+    id: u32,
+    #[arg(long)]
+    bind: SocketAddr,
+    #[arg(long)]
+    instance_dir: PathBuf,
+    /// Comma-separated `id@addr` member list (every member INCLUDING self).
+    #[arg(long)]
+    members: String,
+    #[arg(long, default_value = "m12-gate")]
+    app_id: String,
+    /// Ingress admission window in KiB (`append - commit` backpressure gate).
+    #[arg(long, default_value_t = 256)]
+    admission_kib: u64,
+}
+
+#[derive(clap::Args)]
+struct ServiceArgs {
+    #[arg(long)]
+    instance_dir: PathBuf,
+    #[arg(long, default_value = "m12-gate")]
+    app_id: String,
+    /// `on` wraps the state machine in `Sessioned<_>` (exactly-once over the
+    /// remote hop). MUST match the edge's `--envelope` and the direct
+    /// client's: with `on`, every submitted frame carries the 16-byte
+    /// `client_id ++ seq` header, whoever put it there.
+    #[arg(long, value_enum, default_value_t = Envelope::On)]
+    envelope: Envelope,
+    /// Row 3: run the RAW-tier twin (`RawCountSm`, bytes-in/bytes-out, no
+    /// decode) instead of the typed `CountSm`. Paired with
+    /// `--features uc2_service/apply-profile` this is the codec-share A/B.
+    #[arg(long, default_value_t = false)]
+    raw_sm: bool,
+}
+
+#[derive(clap::Args)]
+struct EdgeArgs {
+    #[arg(long)]
+    instance_dir: PathBuf,
+    #[arg(long, default_value = "m12-gate")]
+    app_id: String,
+    /// TCP address this edge accepts remote clients on.
+    #[arg(long)]
+    listen: SocketAddr,
+    /// Comma-separated `id@gateway_addr` map — every member's EDGE address
+    /// (not its UDP `bind`), used for `REDIRECT`/`LEADER_CHANGED`.
+    #[arg(long)]
+    members: String,
+    #[arg(long, value_enum, default_value_t = Envelope::On)]
+    envelope: Envelope,
+    /// Engine window and per-connection credit ceiling (kept equal, as the
+    /// in-process arm does, so the two arms' inflight really is equal).
+    #[arg(long, default_value_t = 4096)]
+    inflight: u64,
+}
+
+#[derive(clap::Args)]
+struct ClientDirectArgs {
+    #[arg(long)]
+    instance_dir: PathBuf,
+    #[arg(long, default_value = "m12-gate")]
+    app_id: String,
+    #[arg(long, default_value_t = 10)]
+    secs: u64,
+    #[arg(long, default_value_t = 64)]
+    payload: usize,
+    #[arg(long, default_value_t = 4096)]
+    inflight: u64,
+    /// Must match the service's. With `on` this client prepends the SAME
+    /// 16-byte `client_id ++ seq` envelope the edge would have prepended, so
+    /// the two arms submit byte-identical frames to an identical service.
+    #[arg(long, value_enum, default_value_t = Envelope::On)]
+    envelope: Envelope,
+}
+
+#[derive(clap::Args)]
+struct ClientRemoteArgs {
+    /// Comma-separated gateway addresses; the first is dialled first.
+    #[arg(long)]
+    gateways: String,
+    #[arg(long, default_value = "m12-gate")]
+    app_id: String,
+    #[arg(long, default_value_t = 10)]
+    secs: u64,
+    #[arg(long, default_value_t = 64)]
+    payload: usize,
+    #[arg(long, default_value_t = 4096)]
+    inflight: u64,
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // A fleet role short-circuits everything below: no in-process cluster, no
+    // smoke banner, no ratio — one process, one job.
+    if let Some(role) = cli.role {
+        return match role {
+            Role::Node(a) => run_node_role(a),
+            Role::Service(a) => run_service_role(a),
+            Role::Edge(a) => run_edge_role(a),
+            Role::ClientDirect(a) => run_client_direct_role(a),
+            Role::ClientRemote(a) => run_client_remote_role(a),
+        };
+    }
 
     let fleet = std::env::var("UC2_GATE_FLEET").as_deref() == Ok("1");
     if !fleet {
@@ -232,6 +383,13 @@ const NODE_BUFFER_BYTES: usize = 64 << 20;
 /// See `m5_gate`'s identical constant doc: this door is enforced on
 /// `try_submit`'s bincode-ENCODED bytes, not on `--payload` itself.
 const NODE_MAX_PAYLOAD: usize = 512;
+/// The in-process arms' admission window, unchanged (the fleet `node` role
+/// takes `--admission-kib` instead).
+const DEFAULT_ADMISSION_BYTES: u64 = 256 * 1024;
+/// Log-buffer ring capacity for a FLEET node — the hot window the archive
+/// drains, sized like `m5_gate`'s (256 MiB) rather than the in-process smoke's
+/// 64 MiB, because a fleet host really does push M5-ladder rates through it.
+const FLEET_BUFFER_BYTES: usize = 256 << 20;
 const ELECTION_TIMEOUT_MIN_NS: u64 = 150_000_000;
 const ELECTION_TIMEOUT_MAX_NS: u64 = 300_000_000;
 
@@ -247,6 +405,8 @@ fn node_config(
     bind: SocketAddr,
     instance_dir: PathBuf,
     app_id: &str,
+    buffer_bytes: usize,
+    admission_bytes: u64,
 ) -> NodeConfig {
     NodeConfig {
         id,
@@ -254,9 +414,9 @@ fn node_config(
         bind,
         instance_dir,
         app_id: app_id.to_string(),
-        buffer_bytes: NODE_BUFFER_BYTES,
+        buffer_bytes,
         max_payload: NODE_MAX_PAYLOAD,
-        admission_bytes: 256 * 1024,
+        admission_bytes,
         election_timeout_min_ns: ELECTION_TIMEOUT_MIN_NS,
         election_timeout_max_ns: ELECTION_TIMEOUT_MAX_NS,
         seed: seed_for(id),
@@ -327,6 +487,8 @@ where
             addr,
             instance_dir.clone(),
             app_id,
+            NODE_BUFFER_BYTES,
+            DEFAULT_ADMISSION_BYTES,
         );
         let node = Node::start_with_socket(cfg, sock).expect("node start");
         let svc = ServiceBuilder::new(ServiceConfig::new(&instance_dir, app_id), make_sm())
@@ -365,6 +527,10 @@ const P50_MS_BAR: f64 = 1.0;
 struct ClientStats {
     sends: u64,
     responses: u64,
+    /// Direct arm with the session envelope on: responses NOT tagged
+    /// `TAG_FRESH` (see the counter's comment in `run_client_measurement`).
+    /// Always 0 for the gateway arm and for the in-process direct arm.
+    not_fresh: u64,
     not_leader: u64,
     retried: u64,
     duplicates: u64,
@@ -385,6 +551,7 @@ fn print_report(label: &str, s: &ClientStats) {
     println!("================ uc2 M12a gate: {label} ================");
     println!("sends                 : {}", s.sends);
     println!("responses             : {}", s.responses);
+    println!("not FRESH (envelope)  : {}", s.not_fresh);
     println!("not_leader / retried  : {} / {}", s.not_leader, s.retried);
     println!(
         "dup / overwritten     : {} / {}",
@@ -421,7 +588,7 @@ fn run_direct_arm(root: &std::path::Path, secs: u64, payload: usize, inflight: u
     let leader = await_single_leader(&nodes, 30);
     println!("[direct] leader elected: n{leader}");
 
-    let stats = run_client_measurement(&dirs[leader], APP_ID, secs, payload, inflight);
+    let stats = run_client_measurement(&dirs[leader], APP_ID, secs, payload, inflight, None);
 
     for node in nodes {
         node.stop();
@@ -443,6 +610,7 @@ fn run_client_measurement(
     secs: u64,
     payload_len: usize,
     inflight_cap: u64,
+    session_client_id: Option<u64>,
 ) -> ClientStats {
     let (send, mut poll) = Engine::attach(
         instance_dir,
@@ -482,6 +650,13 @@ fn run_client_measurement(
     let not_leader = Arc::new(AtomicU64::new(0));
     let retried = Arc::new(AtomicU64::new(0));
     let lost = Arc::new(AtomicU64::new(0));
+    // Anti-vacuity for the session envelope (fleet `client-direct` only). A
+    // frame whose 16-byte header this client got WRONG does not fail: it comes
+    // back tagged `TAG_EXPIRED`, having never reached the inner state machine
+    // at all — i.e. a broken envelope would read as a FASTER direct arm. So
+    // every response is checked to carry `TAG_FRESH`, and a nonzero count here
+    // fails the role rather than being reported as throughput.
+    let not_fresh = Arc::new(AtomicU64::new(0));
     let last_response_ns = Arc::new(AtomicU64::new(0));
     let hist: Arc<Mutex<Histogram<u64>>> = Arc::new(Mutex::new(
         Histogram::new_with_bounds(1, HIST_MAX_NS, 3).expect("histogram"),
@@ -498,6 +673,7 @@ fn run_client_measurement(
             let not_leader = Arc::clone(&not_leader);
             let retried = Arc::clone(&retried);
             let lost = Arc::clone(&lost);
+            let not_fresh = Arc::clone(&not_fresh);
             let last_response_ns = Arc::clone(&last_response_ns);
             let hist = Arc::clone(&hist);
             let stop = Arc::clone(&stop);
@@ -505,7 +681,12 @@ fn run_client_measurement(
                 while !stop.load(Ordering::Relaxed) {
                     let n = poll.poll(|c| {
                         match c.outcome {
-                            Outcome::Response(_) => {
+                            Outcome::Response(body) => {
+                                if session_client_id.is_some()
+                                    && body.first() != Some(&TAG_FRESH)
+                                {
+                                    not_fresh.fetch_add(1, Ordering::Relaxed);
+                                }
                                 let idx = (c.user_data as usize) & SLOT_MASK;
                                 let now = t0.elapsed().as_nanos() as u64;
                                 let lat = now
@@ -535,12 +716,30 @@ fn run_client_measurement(
         })
         .expect("spawn poll thread");
 
+    // `session_client_id` is `Some` only for the fleet `client-direct` role
+    // running against a `Sessioned<_>` service: it prepends the SAME 16-byte
+    // `client_id ++ seq` header the EDGE prepends for the gateway arm, so both
+    // arms hand the service byte-identical frames and the ratio is not
+    // measuring one arm paying for an envelope the other skipped. `sent_idx`
+    // is the seq — strictly increasing, so every frame classifies FRESH.
+    // The in-process direct arm passes `None` (unchanged behaviour).
+    let mut frame: Vec<u8> = Vec::with_capacity(SESSION_HEADER_LEN + cmd_bytes.len());
     let mut sent_idx: u64 = 0;
     let deadline = t0 + Duration::from_secs(secs);
     while Instant::now() < deadline {
         let idx = (sent_idx as usize) & SLOT_MASK;
         send_ns[idx].store(t0.elapsed().as_nanos() as u64, Ordering::Release);
-        match send.try_submit(sent_idx, &cmd_bytes) {
+        let submit_bytes: &[u8] = match session_client_id {
+            Some(cid) => {
+                frame.clear();
+                frame.extend_from_slice(&cid.to_le_bytes());
+                frame.extend_from_slice(&sent_idx.to_le_bytes());
+                frame.extend_from_slice(&cmd_bytes);
+                &frame
+            }
+            None => &cmd_bytes,
+        };
+        match send.try_submit(sent_idx, submit_bytes) {
             Ok(()) => sent_idx += 1,
             Err(SubmitError::Backpressure) => thread::yield_now(),
             Err(SubmitError::NotServing) => thread::sleep(Duration::from_millis(1)),
@@ -591,6 +790,7 @@ fn run_client_measurement(
     ClientStats {
         sends,
         responses: resp,
+        not_fresh: not_fresh.load(Ordering::Relaxed),
         not_leader: not_leader.load(Ordering::Relaxed),
         retried: retried.load(Ordering::Relaxed),
         duplicates: engine_stats.duplicates,
@@ -853,6 +1053,7 @@ fn run_remote_measurement(remote: &RemoteClient, secs: u64, payload_len: usize) 
     ClientStats {
         sends,
         responses: resp,
+        not_fresh: 0, // the EDGE owns the envelope on this arm, not the client
         // Mapped from `RemoteStats` (there is no Engine-side "not_leader" /
         // "retried" concept over the remote protocol): see
         // `print_remote_stats` for the full breakdown.
@@ -891,4 +1092,317 @@ fn print_remote_stats(remote: &RemoteClient) {
         s.max_credits_seen
     );
     println!("============================================================================");
+}
+
+// ======================================================================
+// Fleet roles (rows 2 and 3)
+// ======================================================================
+//
+// Everything below runs ONE role in ONE process. The orchestrator is
+// `bench-infra/scripts/m12_fleet_gate.py`; see that file's module doc for the
+// topology and for why the two row-2 arms are measured against the SAME
+// cluster generation (holding hardware AND leadership constant is exactly
+// what the in-process smoke could not do).
+
+/// Raw-tier twin of [`CountSm`], copied from `m5_gate`: sees the frame bytes,
+/// decodes nothing. Same deterministic increment and a `u64` response either
+/// way — but not the same bytes (8 LE here, bincode varint through the typed
+/// tier). Which side of the [`RawStateMachine`] boundary does the (de)coding
+/// is precisely what row 3's `apply-profile` A/B measures.
+#[derive(Default)]
+struct RawCountSm {
+    count: u64,
+    last_applied: Option<u64>,
+}
+
+impl RawStateMachine for RawCountSm {
+    fn apply(&mut self, position: u64, _cmd: &[u8], out: &mut Vec<u8>) {
+        self.count += 1;
+        self.last_applied = Some(position);
+        out.extend_from_slice(&self.count.to_le_bytes());
+    }
+
+    fn query(&self, _q: &[u8], out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.count.to_le_bytes());
+    }
+
+    fn last_applied(&self) -> Option<u64> {
+        self.last_applied
+    }
+}
+
+/// `id@addr,...` — used for both the node role's UDP member list and the edge
+/// role's node-id -> gateway-address map (the two are different addresses for
+/// the same ids, which is why the edge takes its own flag).
+fn parse_id_addr_list(s: &str) -> Vec<(u32, String)> {
+    s.split(',')
+        .filter(|p| !p.trim().is_empty())
+        .map(|part| {
+            let (id, addr) = part
+                .trim()
+                .split_once('@')
+                .unwrap_or_else(|| panic!("bad entry {part:?}, expected id@addr"));
+            let id: u32 = id
+                .parse()
+                .unwrap_or_else(|e| panic!("bad member id {id:?}: {e}"));
+            (id, addr.to_string())
+        })
+        .collect()
+}
+
+/// A per-process session identity for the direct arm. Random enough that two
+/// successive `client-direct` runs against the same long-lived service do NOT
+/// collide on `(client_id, seq)` — a collision would make the second run's
+/// frames REPLAYED (served from the dedup cache, never reaching `apply`),
+/// which would silently inflate the direct arm's throughput.
+fn fresh_client_id() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
+fn assert_durable_dir(dir: &std::path::Path) {
+    assert!(
+        !dir.starts_with("/tmp"),
+        "instance_dir must be on a real filesystem (never /tmp — RAM tmpfs, and \
+         fsync there is fiction); got {dir:?}"
+    );
+}
+
+// ------------------------------------------------------------- node role
+
+fn run_node_role(a: NodeArgs) -> anyhow::Result<()> {
+    assert_durable_dir(&a.instance_dir);
+    let members: Vec<(u32, SocketAddr)> = parse_id_addr_list(&a.members)
+        .into_iter()
+        .map(|(id, addr)| {
+            (
+                id,
+                addr.parse()
+                    .unwrap_or_else(|e| panic!("bad member addr {addr:?}: {e}")),
+            )
+        })
+        .collect();
+    let id = a.id;
+    let cfg = node_config(
+        id,
+        members,
+        a.bind,
+        a.instance_dir,
+        &a.app_id,
+        FLEET_BUFFER_BYTES,
+        a.admission_kib * 1024,
+    );
+    let node = Node::start(cfg)?;
+    println!("m12_gate node {id} up; parking (killed externally by the harness)");
+    // Protocol 0.5.0 observability, same as `m5_gate`'s node role: the
+    // attestation counter is process-local, so it cannot come out through the
+    // cnc page. On a healthy throughput run it must stay 0.
+    let mut last = u64::MAX;
+    loop {
+        let now = node.reports_unattested();
+        if now != last {
+            println!("m12_gate node {id} stats: reports_unattested={now}");
+            last = now;
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+// ---------------------------------------------------------- service role
+
+fn run_service_role(a: ServiceArgs) -> anyhow::Result<()> {
+    let cnc = a.instance_dir.join("cnc2.dat");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !cnc.exists() {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for cnc2.dat at {cnc:?}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let cfg = ServiceConfig::new(&a.instance_dir, &a.app_id);
+    let envelope = a.envelope == Envelope::On;
+    // Each arm diverges (parks forever), so the four `Service<_>` types never
+    // need to unify — `m5_gate`'s service role does the same.
+    match (envelope, a.raw_sm) {
+        (true, false) => {
+            let _svc = ServiceBuilder::new(
+                cfg,
+                Sessioned::new(CountSm::default(), SessionConfig::default()),
+            )
+            .start()?;
+            park_service("Sessioned<CountSm> (typed tier, envelope on)")
+        }
+        (false, false) => {
+            let _svc = ServiceBuilder::new(cfg, CountSm::default()).start()?;
+            park_service("CountSm (typed tier, envelope off)")
+        }
+        (true, true) => {
+            let _svc = ServiceBuilder::new(
+                cfg,
+                Sessioned::new(RawCountSm::default(), SessionConfig::default()),
+            )
+            .start()?;
+            park_service("Sessioned<RawCountSm> (raw tier, envelope on)")
+        }
+        (false, true) => {
+            let _svc = ServiceBuilder::new(cfg, RawCountSm::default()).start()?;
+            park_service("RawCountSm (raw tier, envelope off)")
+        }
+    }
+}
+
+fn park_service(what: &str) -> ! {
+    println!("m12_gate service up ({what}); parking (killed externally by the harness)");
+    loop {
+        thread::park();
+    }
+}
+
+// ------------------------------------------------------------- edge role
+
+fn run_edge_role(a: EdgeArgs) -> anyhow::Result<()> {
+    let members: Vec<Member> = parse_id_addr_list(&a.members)
+        .into_iter()
+        .map(|(node_id, gateway)| Member { node_id, gateway })
+        .collect();
+    anyhow::ensure!(!members.is_empty(), "--members must name at least one edge");
+    let edge = Edge::start(EdgeConfig {
+        instance_dir: a.instance_dir,
+        app_id: a.app_id,
+        listen: a.listen,
+        members,
+        session_envelope: a.envelope == Envelope::On,
+        // Kept equal to each other and to the client's `--inflight`, exactly
+        // as the in-process gateway arm does: the whole point of row 2 is a
+        // ratio "at equal inflight".
+        max_inflight: a.inflight as u32,
+        per_conn_inflight: a.inflight as u32,
+        status_interval: Duration::from_millis(200),
+        request_timeout: Duration::from_secs(30),
+        ..EdgeConfig::defaults()
+    })
+    .map_err(|e| anyhow::anyhow!("edge start: {e}"))?;
+    println!(
+        "m12_gate edge up on {}; parking (killed externally by the harness)",
+        edge.local_addr()
+    );
+    loop {
+        thread::park();
+    }
+}
+
+// --------------------------------------------------------- client roles
+
+/// One machine-readable line per measured arm. The orchestrator parses ONLY
+/// this line (`RESULT ` + JSON); everything else a client role prints is for
+/// a human reading the unit log.
+fn print_result_json(arm: &str, s: &ClientStats, secs: u64, payload: usize, inflight: u64) {
+    println!(
+        "RESULT {{\"arm\":\"{arm}\",\"responses_per_sec\":{:.1},\"payload\":{payload},\
+         \"inflight\":{inflight},\"secs\":{secs},\"sends\":{},\"responses\":{},\
+         \"lost\":{},\"not_fresh\":{},\"inflight_at_end\":{},\"p50_ms\":{:.3},\
+         \"p90_ms\":{:.3},\"p99_ms\":{:.3},\"max_ms\":{:.3},\"elapsed_secs\":{:.3}}}",
+        s.responses_per_sec,
+        s.sends,
+        s.responses,
+        s.lost,
+        s.not_fresh,
+        s.inflight_at_end,
+        s.p50_ms,
+        s.p90_ms,
+        s.p99_ms,
+        s.max_ms,
+        s.elapsed.as_secs_f64(),
+    );
+}
+
+fn run_client_direct_role(a: ClientDirectArgs) -> anyhow::Result<()> {
+    assert_durable_dir(&a.instance_dir);
+    let envelope_on = a.envelope == Envelope::On;
+    // `--payload` is a RAW length; the frame is its bincode encoding (length
+    // varint + bytes) plus, with the envelope on, 16 more. The node's
+    // `max_payload` door is enforced on the whole frame — refuse up front with
+    // the arithmetic rather than letting `try_submit` panic mid-run.
+    let encoded_len =
+        bincode::serde::encode_to_vec(vec![0xABu8; a.payload], bincode::config::standard())
+            .expect("encode fixed payload")
+            .len()
+        + if envelope_on { SESSION_HEADER_LEN } else { 0 };
+    anyhow::ensure!(
+        encoded_len <= NODE_MAX_PAYLOAD,
+        "--payload {} encodes to {} B{} which exceeds the node's max_payload of {} B",
+        a.payload,
+        encoded_len,
+        if envelope_on {
+            " (incl. the 16-byte session envelope)"
+        } else {
+            ""
+        },
+        NODE_MAX_PAYLOAD
+    );
+
+    let session_client_id = envelope_on.then(fresh_client_id);
+    println!(
+        "m12_gate client-direct: {} s, payload {}, inflight {}, envelope {}",
+        a.secs,
+        a.payload,
+        a.inflight,
+        if envelope_on { "on" } else { "off" }
+    );
+    let stats = run_client_measurement(
+        &a.instance_dir,
+        &a.app_id,
+        a.secs,
+        a.payload,
+        a.inflight,
+        session_client_id,
+    );
+    print_report("direct (Engine)", &stats);
+    print_result_json("direct", &stats, a.secs, a.payload, a.inflight);
+    anyhow::ensure!(
+        stats.not_fresh == 0,
+        "{} of {} responses were not TAG_FRESH — this client's session envelope \
+         did not reach the inner state machine, so the measured rate is not a \
+         rate for the work the gateway arm does",
+        stats.not_fresh,
+        stats.responses
+    );
+    Ok(())
+}
+
+fn run_client_remote_role(a: ClientRemoteArgs) -> anyhow::Result<()> {
+    let gateways: Vec<String> = a
+        .gateways
+        .split(',')
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+        .collect();
+    anyhow::ensure!(
+        !gateways.is_empty(),
+        "--gateways must name at least one edge address"
+    );
+    println!(
+        "m12_gate client-remote: {} s, payload {}, inflight {}, gateways {:?}",
+        a.secs, a.payload, a.inflight, gateways
+    );
+    let remote = RemoteClient::connect(RemoteConfig {
+        app_id: a.app_id,
+        members: gateways,
+        client_id: None,
+        max_inflight: a.inflight as u32,
+        request_timeout: Duration::from_secs(30),
+        ..RemoteConfig::default()
+    })
+    .map_err(|e| anyhow::anyhow!("remote connect: {e}"))?;
+
+    let stats = run_remote_measurement(&remote, a.secs, a.payload);
+    print_remote_stats(&remote);
+    remote.shutdown();
+    print_report("gateway (Edge + RemoteClient)", &stats);
+    print_result_json("gateway", &stats, a.secs, a.payload, a.inflight);
+    Ok(())
 }
