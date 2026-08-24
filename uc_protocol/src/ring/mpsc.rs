@@ -31,6 +31,12 @@ use crate::ring::common::{
     validate_ring_header, write_padding_marker_at, write_record_at,
 };
 
+/// Spins a producer burns waiting for its predecessor to publish before it
+/// starts yielding its core (see the comment at the wait site). ~100 spins
+/// is a few hundred nanoseconds — longer than a predecessor that is merely
+/// finishing its record write, far shorter than a scheduler quantum.
+const PUBLISH_SPINS_BEFORE_YIELD: u32 = 128;
+
 pub struct MpscInner {
     _mmap: MmapMut,
     base: *mut u8,
@@ -212,8 +218,26 @@ impl MpscProducer {
             // advanced `publish_position` up to our slot start, then bump
             // it to cover our claimed range. Consumers only read records
             // whose bytes are below `publish_position`.
+            //
+            // M13 hop-bench finding (2026-08-24): a pure spin here CONVOYS as
+            // soon as producer threads outnumber free cores. A producer
+            // preempted between its CAS and this store stalls every
+            // producer behind it, and those spinning at 100% are what keep
+            // the preempted one off a core — on the fleet, 8 gateway
+            // connections on an 8-vCPU host dropped the ring from 1.9 M/s
+            // to ~5 k/s with every core busy. Bounded spin, then yield: the
+            // fast path (predecessor already published) is unchanged, and
+            // under oversubscription a waiter gives its core to the
+            // predecessor instead of fighting it. The structural fix —
+            // per-record commit with no cross-producer wait — is M13 work.
+            let mut spins: u32 = 0;
             while header.publish_position.load(Ordering::Acquire) != claim_pos {
-                std::hint::spin_loop();
+                if spins < PUBLISH_SPINS_BEFORE_YIELD {
+                    spins += 1;
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
             }
             header.publish_position.store(target_pos, Ordering::Release);
 
