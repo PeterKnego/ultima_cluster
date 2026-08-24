@@ -310,6 +310,14 @@ detailed doc — lives in **[RELEASES.md](/RELEASES.md)**. The standing limits:
   and `MTU_DEFAULT = 1408` is not configurable.[^mtu]
 - **Clients attach over shmem on a node host, or over TCP through a
   `uc2-gateway`** on a node host. There is no remote ingress inside the node.
+- **A gateway's flow control is per-connection only.** Credits are granted and
+  shrunk per connection; nothing bounds the *sum* across connections against
+  the node's ingress admission window (`admission_bytes`), and past that sum
+  the edge collapses rather than degrading — a confirmed defect, fix planned.
+  Until then, keep total client inflight per edge under the admission window
+  and bound the co-located gateway's CPU:
+  [Operating envelope](/docs/how-to/run-a-gateway.md#operating-envelope-260) ·
+  [gate record](/docs/benchmarks/uc2-m12-gate-2026-08-22.md#clean-discipline-re-run-same-day-the-collapse-is-a-product-defect-not-a-harness-artifact).
 - **Wire crypto and journal purge are off by default**; `[crypto]` and
   `[admin]` are explicit choices a `node.toml` must make or the node refuses to
   start. Admin operations require a signed HMAC request unless

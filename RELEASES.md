@@ -13,8 +13,9 @@ analyses, wire-version mechanics, upgrade remedies — is
 sub-milestones — M12a gateway kit, M12b admin authentication and audit, M12c
 packaging and publishing, M12d security posture — land together as `v2.6.0`.
 **The tag itself is a separate maintainer step**, taken after deciding what to
-do about the two gate rows that are fleet-only and have no fleet run yet (see
-*Gates* below); `v2.6.0-rc.1` goes first, because the
+do about gate row 2 — which has now been run on a fleet twice and, in the
+process, showed its own bar to be mis-specified (see *Gates* below);
+`v2.6.0-rc.1` goes first, because the
 release workflow has never been run for real and a release candidate is the
 right place to find that out. Running record, row by row:
 [M12 gate record](docs/benchmarks/uc2-m12-gate-2026-08-22.md).
@@ -33,8 +34,10 @@ written down.
   with hot or large commands can own its own framing and skip the codec
   entirely. The dev-box spike that motivated this measured the typed tier at
   **75.8 %** of the apply cycle against the raw tier's **5.8 %** at a 509 B
-  payload — a share, on a box that is not a bench; the fleet number for it is
-  gate row 3 and is still outstanding. →
+  payload — a share, on a box that is not a bench. The fleet run (gate row 3)
+  has since confirmed it on real hardware at the same 509 B payload: typed
+  `sm_apply` 1173 ns/frame (**87.7 %** of the apply cycle) against raw's 14 ns
+  (**8.0 %**), an ~84× per-frame drop. →
   [State-machine contract](docs/reference/state-machine-contract.md) ·
   [Two tiers, one contract](docs/notes/uc2-two-tier-state-machine-contract.md) ·
   [the codec budget spike](docs/notes/2026-08-22-codec-budget-spike.md)
@@ -145,6 +148,46 @@ written down.
     reconnecting* (it could be outlived by a reconnect loop — F5,
     `ae0f245`/`fc27536`/`b4b3b0c`), and the architecture doc's log-buffer
     default is corrected to `buffer_bytes`' real 64 MiB.
+- **Performance — a remote-path batching fix, and the network budget
+  measured.** The remote path now batches on every hop: a `RemoteClient`
+  writes its pending frames in a single `write_all` (flushing when the queue
+  drains), the edge driver batches its writes per drain, both sides parse
+  multiple frames out of one `recv`, and admission notifications are coalesced
+  to one per read batch — with `request_timeout`/deadline semantics and the
+  exactly-once and credit-flow-control invariants unchanged (reviewed, not
+  assumed). On the fleet the single-connection gateway/direct ratio moved
+  **0.072 → 0.098** with the session envelope on and **0.064 → 0.101** with it
+  off, ~+40 % throughput; on the dev box — a smoke observation, not a bench —
+  p50 fell from ~112 ms to ~10 ms at 4096 inflight. Separately, a
+  network-budget characterization settled whether a leader box is near its NIC
+  limit at peak: **it is not.** The 1,424,941 resp/s peak drives ~3.21 Gbps
+  and ~392k pkt/s — about a quarter of the instance's ~12.5 Gbps ceiling —
+  because replication is batched to ~0.28 packets and ~281 bytes per committed
+  command, and **p99 < 1 ms holds to 518,287 resp/s** (inflight 256: p50 0.472
+  / p90 0.568 / p95 0.611 / p99 0.660 ms, NIC ~1.14 Gbps). There is ample
+  headroom for a co-located gateway client; the ~1.4M/s ceiling is software,
+  not the network. →
+  [M12 gate record § network budget](docs/benchmarks/uc2-m12-gate-2026-08-22.md#network-budget-characterization-2026-08-24-path-1) ·
+  [Remote protocol](docs/reference/remote-protocol.md)
+- **Known limits — a gateway's flow control is per-connection only, and past
+  the node's admission window the edge collapses rather than degrading.**
+  Every connection is granted `per_conn_inflight` credits in full at
+  `HELLO_OK` and the halve/relax ladder runs per connection; **nothing bounds
+  the sum across connections** against the co-located node's ingress admission
+  window (`admission_bytes`, default 256 KiB ≈ 4–6k frames). Inside that
+  envelope the edge aggregates near-linearly — 451k resp/s across 4
+  connections, 0.32× the backend's peak. Outside it, the 2026-08-24 fleet
+  ladder measured a ~30× aggregate collapse at 8 connections (p95 4.3 s) and
+  9,126 lost responses at 16, with the edge burning ~7 of the host's 8 cores
+  and starving the node beside it — reproduced with the edge's protective
+  per-connection cap active, so it is a product defect, not a
+  misconfiguration. The fix (a global, admission-aware outstanding-grant
+  budget at the edge) is planned as the next milestone. **Until then**: keep
+  total client inflight across all connections to one edge under the node's
+  admission window, and bound a co-located gateway's CPU (`CPUQuota=`, shipped
+  commented in the unit file). →
+  [Operating envelope](docs/how-to/run-a-gateway.md#operating-envelope-260) ·
+  [gate record § the confirmed defect](docs/benchmarks/uc2-m12-gate-2026-08-22.md#clean-discipline-re-run-same-day-the-collapse-is-a-product-defect-not-a-harness-artifact)
 - **Gates** — [M12 gate record](docs/benchmarks/uc2-m12-gate-2026-08-22.md),
   reported the way this project reports: what ran, and what did not.
   - **PASS**: admin authentication, audit and refusal behaviour end to end
@@ -155,10 +198,22 @@ written down.
     is green three consecutive local runs and awaits CI adjudication (row 1);
     the fuzz job is built and locally proven across ~118 M executions but has
     never run on a GitHub runner (row 8).
-  - **Fleet-only, no fleet run yet**: gateway throughput cost versus the
-    direct `Engine` (bar ≥ 0.8×) and the codec share on the apply thread
-    (rows 2 and 3). **The local smoke numbers in the gate doc are not these
-    results** and are labelled as such — a dev box is not a bench.
+  - **Fleet-run, and reported the way the run came out**: the codec share on
+    the apply thread (row 3) **PASSES** as a measurement row — the fleet put
+    the typed `CountSm` at `sm_apply` 1173 ns/frame (87.7 % of the apply
+    cycle) against the raw `RawCountSm`'s 14 ns (8.0 %), an ~84× per-frame
+    drop that confirms on real hardware the spike finding behind the two-tier
+    contract. Gateway throughput versus the direct `Engine` (row 2) **fails
+    its ≥ 0.8× bar — and the bar is the part that is wrong**: it compares one
+    `RemoteClient` on one TCP connection to one shmem client, and no single
+    TCP request/response connection matches shared memory at any batching
+    level (Little's Law fits both arms with no residual). The honest numbers
+    are **~0.1× per connection** (0.098 envelope on / 0.101 off, after the
+    batching fix above) and **451k resp/s aggregate across 4 connections —
+    0.32× the backend's measured 1.42M/s peak**, the edge scaling
+    near-linearly to that point. Re-specifying row 2 as an N-connection
+    edge-saturation ratio is recommended and **not yet done**; the
+    single-connection number stands recorded meanwhile.
   - **Built, and partly proven**: the artifact quickstart (row 5) has its
     tarball assembly, layout and rendered configs proven locally, but its
     bare-container run, image build and compose stack are CI-only until the

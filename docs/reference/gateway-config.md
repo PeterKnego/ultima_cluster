@@ -43,10 +43,32 @@ some fields set takes the defaults for the rest.
 | Key | Type | Default | Meaning | Refusal |
 |---|---|---|---|---|
 | `max_inflight` | u32 | `4096` | the local `Engine`'s inflight window, shared across every connection on this edge | `0` → `ZeroMaxInflight` |
-| `per_conn_inflight` | u32 | `256` | initial credits granted to each connection in `HELLO_OK`; shrinks under backpressure, relaxes back up to this ceiling | `0` → `ZeroPerConnInflight`; greater than `max_inflight` → `PerConnExceedsMax { per_conn, max }` (one connection could exhaust the whole engine window) |
+| `per_conn_inflight` | u32 | `256` | initial credits granted to each connection in `HELLO_OK`; shrinks under backpressure, relaxes back up to this ceiling. **Per connection, and only per connection** — see the sizing warning below | `0` → `ZeroPerConnInflight`; greater than `max_inflight` → `PerConnExceedsMax { per_conn, max }` (one connection could exhaust the whole engine window) |
 | `request_timeout_ms` | u64 | `10000` | the `Engine`'s per-request deadline; a request that blows it completes `TimedOut` and the client is told `UNKNOWN`. **Also a client's exposure window when this host's node has died and the supervisor has not stopped the gateway yet** — consider `2000` for a gateway, see [the how-to](../how-to/run-a-gateway.md#when-the-node-underneath-dies) | `0` → `ZeroRequestTimeout` |
 | `status_interval_ms` | u64 | `200` | a connection with no write for this long gets a standalone `STATUS` — also the edge→client liveness tick, so it must stay well under a client's `dead_after` | `0` → `ZeroStatusInterval` |
 | `max_connections` | u32 | `1024` | hard ceiling on simultaneously-open client connections; each costs a reader thread and a socket. Over it, the acceptor answers `HELLO_REFUSED{BUSY}` (reason `4`) without spawning a reader, counted as `EdgeStats::refused_busy` — a conforming client treats `BUSY` like `FAULTED` and tries the next member | `0` → `ZeroMaxConnections` |
+
+### Sizing `per_conn_inflight` and `max_connections` (2.6.0)
+
+`per_conn_inflight` is granted **in full to every connection** at `HELLO_OK`,
+and the halve/relax ladder that follows is per-connection as well. **In
+`2.6.0` there is no global budget across connections**, and neither
+`max_inflight` nor `max_connections` bounds the *sum* of outstanding client
+requests against what the co-located node can admit. When that sum exceeds
+the node's ingress admission window (`[node] admission_bytes`, default
+`262144`), the edge does not shed load gracefully — the 2026-08-24 fleet
+ladder measured a ~30× throughput collapse, second-scale p95 and lost
+responses, with the edge burning ~7 of 8 cores and starving the node beside
+it ([gate record][edgesat]; a
+[confirmed defect][cleanrun], fix planned for the next milestone).
+
+Size it so that `connections × per_conn_inflight` stays **below** the node's
+admission window in frames (≈ 4–6k at the 256 KiB default), and bound the
+gateway's CPU when it is co-located. The how-to states the full envelope:
+[Operating envelope (2.6.0)](../how-to/run-a-gateway.md#operating-envelope-260).
+
+[edgesat]: ../benchmarks/uc2-m12-gate-2026-08-22.md#edge-saturation-ladder-2026-08-24-n-client-aggregate
+[cleanrun]: ../benchmarks/uc2-m12-gate-2026-08-22.md#clean-discipline-re-run-same-day-the-collapse-is-a-product-defect-not-a-harness-artifact
 
 ## `[session]` — optional; its one field is independently optional
 

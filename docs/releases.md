@@ -6,8 +6,10 @@
 M12b (admin authn + audit) at `9897219`, M12c (packaging + publishing) at
 `e571c27`, M12d (security posture) on `uc2/m12d-security-posture`. They tag
 together as `v2.6.0`; the tag, the `v2.6.0-rc.1` rehearsal that exercises the
-release workflow for the first time, the two fleet rows, and the external
-review are all separate, user-owned steps. Gate record:
+release workflow for the first time, and the external review are all separate,
+user-owned steps. The two fleet rows have since been run — see *The 2026-08-24
+fleet trips* below; row 3 passes, row 2 fails a bar the run showed to be
+mis-specified. Gate record:
 `docs/benchmarks/uc2-m12-gate-2026-08-22.md`. Spec:
 `docs/superpowers/specs/2026-08-22-uc2-m12-adoptable-design.md`, whose four
 "As built" amendments are the authoritative correction of the sketch against
@@ -31,7 +33,9 @@ one cnc change is M12b's 64-byte admin-auth line at `CNC_OFF_ADMIN_AUTH =
   **dev-box** `m5_gate` `apply-profile` run put the typed `CountSm` at
   `sm_apply = 731 ns` per frame (75.8 % of the apply cycle) against the raw
   `RawCountSm`'s 12 ns (5.8 %). Those are shares from a box that is not a
-  bench; the fleet number is gate row 3 and has not been run.
+  bench; the fleet run (row 3, 2026-08-24) reproduced the effect on real
+  hardware at a 509 B payload — typed `sm_apply` 1173 ns/frame (87.7 % of the
+  apply cycle) vs raw 14 ns (8.0 %), ~84×.
   Byte-identity with `v2.5.0` is asserted, not assumed
   (`uc2_service/tests/raw_contract.rs`). A cheaper intermediate exists and is
   documented: typing a blob field as `bytes::Bytes`/`serde_bytes` gives the
@@ -292,13 +296,114 @@ wrong and was corrected everywhere; the tree's one loom model
 protocol, and nothing checks the MPSC claim-then-commit sequence or the
 broadcast seqlock.
 
+### The 2026-08-24 fleet trips: the batching fix, the network budget, and a
+confirmed gateway defect
+
+Rows 2 and 3 were run on a fleet (4 × `c6id.2xlarge`, us-east-1 cluster
+placement group; driver `bench-infra/scripts/m12_fleet_gate.py`) after the
+sub-milestones merged. Two trips, plus two follow-up investigations, on branch
+`uc2/m12-remote-batching`. All numbers below are copied from
+`docs/benchmarks/uc2-m12-gate-2026-08-22.md`, which stays the authoritative
+record.
+
+**The remote-path batching fix** (`74cf53b`, `10132b3`, `f8b4540`, `59db7da`).
+The first fleet trip put the single-connection gateway/direct ratio at
+**0.072** (session envelope on) / **0.064** (off) — enough of an outlier
+against the local smoke picture to look at the write path rather than accept
+the number. Four changes, all on the remote hop and none in consensus:
+
+1. `RemoteClient` frame writes are batched into one `write_all` per flush,
+   with the flush triggered on the queue emptying rather than per frame
+   (`74cf53b`).
+2. The edge driver batches the frames it writes per drain of the completion
+   ring instead of writing them one at a time (`10132b3`).
+3. Both sides do coalesced buffered reads — one `recv` can yield several
+   frames, parsed without re-entering the syscall — with `request_timeout`
+   and the reader's deadline semantics preserved exactly (`f8b4540`).
+4. Admission notifications are coalesced to one per read batch instead of one
+   per frame (`59db7da`).
+
+The second trip measured **0.098** (on) / **0.101** (off) — +36 % / +58 %,
+~+40 % throughput, 0 lost in both arms of both runs; on the dev box p50 at
+4096 inflight fell from ~112 ms to ~10 ms. **The exactly-once and
+credit-flow-control invariants are preserved by construction and were
+reviewed for it**: batching changes when bytes leave, never which frames or in
+what order, and the credit accounting is untouched.
+
+**What the row-2 bar turned out to be.** The residual ~0.1× is architectural,
+not a defect and not removable by more batching: it is ONE pipelined
+`RemoteClient` over ONE TCP connection (a kernel crossing per operation, and
+an edge that relays a connection single-threaded) measured against ONE shmem
+`Engine` client at ~1.5M/s with no syscall at all. Little's Law fits both arms
+with no residual. The ≥ 0.8× bar therefore compares the wrong two things; the
+gate doc records the number honestly and **recommends re-specifying row 2** as
+an N-connection edge-saturation ratio (or a per-connection cost plus a
+max-connections-per-edge figure). That re-spec has not been done.
+
+**Path 1 — the network budget** (`ba6cad5`, `6fde3d3`, `d6b7750`). One
+hypothesis for the ceiling was that the box was already near its NIC limit at
+~1.5M/s, which would have made a co-located TCP client a bad idea on its face.
+The measurement refutes it: at peak (inflight 4096) 1,424,941 resp/s drives
+401.0 MB/s (**3.21 Gbps**) and 392,556 pkt/s — roughly a quarter of the
+instance's ~12.5 Gbps burst ceiling — because replication is batched to
+~0.28 packets / ~281 bytes per committed command rather than a datagram per
+command per follower. **p99 < 1 ms holds to 518,287 resp/s** (inflight 256:
+p50 0.472 / p90 0.568 / p95 0.611 / p99 0.660 ms) at ~1.14 Gbps and 157,421
+pkt/s, under 10 % of the bandwidth ceiling. A co-located gateway client at
+~140k/s adds ~0.3 Gbps and ~40k pps: ample headroom. The ~1.4M/s ceiling is
+software (the single apply thread / consensus), not the network — consistent
+with every other measurement in this milestone.
+
+**Edge saturation, and the falsification chain that ended in a product
+defect** (`1cc0162`, `a7137f5`, `ef6c48c`). Because the single-connection
+ratio is a per-connection fact, the interesting question is the edge's
+aggregate. A new `m12_fleet_gate.py --row edgesat` ladder scales concurrent
+`RemoteClient` connections against one leader edge.
+
+- **First ladder**, run with the edge's own inflight cap deliberately lifted
+  to 65536 so the ladder would measure the edge's service rate: near-linear to
+  N = 4 (145,600 → 225,166 → **407,722** resp/s aggregate, ~102k/s per
+  client, 0 lost), then **collapse** — N = 8 fell 30× to 12,775 resp/s with
+  p95 5.8 s, and N = 16 lost 7,960 responses, while the edge process burned
+  6.7–7.9 of the host's 8 cores and the client host sat idle at 3 %. The
+  harness's automatic "knee" and "saturation ratio 0.009" are artifacts of the
+  collapse rung and are disclaimed in the gate doc as such.
+- **The obvious hypothesis was that lifting the cap disabled the
+  protection**, i.e. a harness artifact. The **clean-discipline re-run** —
+  edge inflight back at its row-2 value of 4096, credit ladder active —
+  reproduced the collapse almost identically: N = 1/2/4 = 141k / 217k /
+  **451k** aggregate (per client ~108–113k, clean), then N = 8 = **10,774**
+  (p95 4.3 s) and N = 16 = **3,840** with **9,126 lost**. **The hypothesis is
+  falsified.**
+- **Confirmed defect** (`uc2_gateway/src/edge.rs:753,848,1328`): credits are
+  **per-connection**. Every connection is granted `per_conn_inflight` in full
+  at `HELLO_OK`, halved reactively on Engine `Backpressure` and relaxed back
+  toward the cap when clear. **There is no global budget across connections**
+  tied to the node's admission capacity, so 8 clients each asking for 1024 —
+  below either cap tested — total 8192 grants against a ~4–6k-frame admission
+  window, and the reactive halve/relax ladder oscillates instead of converging
+  to a bounded queue. The churn burns most of the shared host's cores, which
+  starves the co-located node and service and amplifies the collapse.
+- **Fix direction, planned as the next milestone**: a global outstanding-grant
+  budget at the edge, sized from (or adaptively probed against) the node's
+  admission window and distributed across connections, plus CPU containment
+  guidance. **Until then the documented operating envelope is**: total client
+  inflight across all connections to one edge stays under the node's
+  admission window (`admission_bytes`), and a co-located gateway gets a
+  `CPUQuota=`. Within that envelope the edge aggregates cleanly — 451k resp/s
+  at N = 4, 0.32× the backend peak. Written up for operators in
+  `docs/how-to/run-a-gateway.md` (*Operating envelope (2.6.0)*),
+  `docs/reference/gateway-config.md`, `docs/reference/remote-protocol.md`,
+  README *Scope and limits*, and a commented `CPUQuota=` line in
+  `packaging/systemd/uc2-gateway.service`.
+
 ### Gate status at writeup time
 
 | Row | Status |
 |---|---|
 | 1 remote lincheck capstone | green 3× locally under `hard-crash-tests`; **CI adjudication pending the next nightly** |
-| 2 gateway throughput vs direct `Engine` (bar ≥ 0.8×) | **fleet-only, no fleet run yet** — the gate doc's local smoke ratios are labelled not-the-number |
-| 3 codec share on the apply thread | **fleet-only, no fleet run yet** |
+| 2 gateway throughput vs direct `Engine` (bar ≥ 0.8×) | **FAIL vs the bar, bar mis-specified** — fleet-run twice; single-connection 0.098 (envelope on) / 0.101 (off) after the batching fix, 4-connection aggregate 451k resp/s = 0.32× the backend peak; re-spec recommended, not done |
+| 3 codec share on the apply thread | **PASS** (measurement row, no bar) — fleet 2026-08-24: typed 1173 ns/frame (87.7 %) vs raw 14 ns (8.0 %), ~84× |
 | 4 admin authn + audit + replay | **PASS**, per-PR CI |
 | 5 quickstart from artifacts, no toolchain | **BUILT, partially proven** — container half is CI-only until the first `-rc` tag; aarch64 unclaimed |
 | 6 artifacts and image verifiable | **BUILT, unproven** until the first `-rc` tag |

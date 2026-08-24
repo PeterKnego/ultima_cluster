@@ -233,6 +233,15 @@ edge simply ceasing to read its socket — the TCP receive window filling is
 the backstop, not the mechanism; no frame is ever accepted and then bounced
 for capacity.
 
+**Credits are per-connection, and in v1 that is the whole of the mechanism:**
+the reference edge grants and adjusts each connection's window independently
+and holds no global budget across connections, so the protocol offers a
+client no signal that the *cluster* — as opposed to its own connection — is
+out of room. Sizing the total across connections is an operator
+responsibility until that budget exists; see
+[Operating envelope](../how-to/run-a-gateway.md#operating-envelope-260) and
+the [gate record](../benchmarks/uc2-m12-gate-2026-08-22.md#clean-discipline-re-run-same-day-the-collapse-is-a-product-defect-not-a-harness-artifact).
+
 ## Payload ceiling
 
 A command's serialized bytes must fit in one UDP datagram on the node side.

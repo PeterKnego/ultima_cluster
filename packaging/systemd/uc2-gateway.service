@@ -13,5 +13,12 @@ TimeoutStopSec=5
 KillSignal=SIGTERM
 LimitNOFILE=65536
 
+# Bound the gateway's CPU when it shares a host with its node (the supported
+# topology): under cross-connection overload the edge can burn nearly every
+# core and starve the node's busy-spin agents. Uncomment and size it to leave
+# the node and service their cores — see
+# docs/how-to/run-a-gateway.md#operating-envelope-260
+# CPUQuota=200%
+
 [Install]
 WantedBy=multi-user.target

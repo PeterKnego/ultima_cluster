@@ -27,6 +27,56 @@ node-id → gateway-address table that answers `REDIRECT` and `LEADER_CHANGED`
 node B doesn't recognize gets stuck. See
 [the config reference](../reference/gateway-config.md) for every key.
 
+## Operating envelope (2.6.0)
+
+**Size total client inflight against the node's admission window, not against
+the gateway's own limits.** The edge grants credits **per connection** — each
+connection is handed `[limits] per_conn_inflight` in full at `HELLO_OK`, and
+the halve-on-backpressure / relax-back ladder runs per connection too. There
+is **no global budget across connections** tied to the co-located node's
+ingress admission window, so nothing stops N connections from collectively
+asking for far more than the node can admit.
+
+Inside its envelope the edge aggregates well. The 2026-08-24 fleet ladder
+([gate record][edgesat], 4 × `c6id.2xlarge`) measured **451k resp/s aggregate
+at N = 4 connections** — 0.32× the backend's measured 1.42M/s peak — each
+connection holding ~108–113k/s, 0 lost. Past the envelope the edge does
+**not** degrade gracefully; it collapses: at N = 8 (1024 inflight each) the
+aggregate fell to **10,774 resp/s** (a ~30× drop) with p95 4.3 s, and N = 16
+**lost 9,126 responses**, while the edge process burned ~7 of the host's 8
+cores and starved the co-located node and service. That run had the edge's
+protective per-connection cap active at its row-2 value, so this is a
+[confirmed product defect][cleanrun], not a misconfiguration — the fix (a
+global, admission-aware outstanding-grant budget at the edge) is planned as
+the next milestone.
+
+**Until it lands, operate inside two rules:**
+
+1. **Total client inflight across every connection to one edge must stay
+   below the node's admission window.** That window is `[node]
+   admission_bytes` (default `262144` — 256 KiB, ≈ 4–6k in-flight frames at
+   small payloads; see [the node config
+   reference](../reference/configuration.md)). With the default
+   `per_conn_inflight = 256` that is roughly 16 fully-loaded connections per
+   edge; raise `per_conn_inflight` and divide accordingly. Count the clients,
+   multiply by the window each actually keeps open, and compare — the edge
+   will not do this arithmetic for you, and `max_connections` (default
+   `1024`) is far above it.
+2. **Bound the gateway's CPU when it is co-located with a node** — which is
+   the supported topology. The edge has no CPU limit of its own, and the
+   node's busy-spin agents have no protection from an edge that starts
+   churning. `packaging/systemd/uc2-gateway.service` carries a commented
+   `CPUQuota=` line for exactly this; uncomment and size it to leave the node
+   and service their cores.
+
+Nothing warns you before you cross the line. The leading signals are the
+gateway stats line's `backpressure` and `retries` counters climbing together
+(see [Stats line](#stats-line)) and the node's `Uc2AdmissionSaturated` alert
+([Monitor a cluster](monitor-a-cluster.md)).
+
+[edgesat]: ../benchmarks/uc2-m12-gate-2026-08-22.md#edge-saturation-ladder-2026-08-24-n-client-aggregate
+[cleanrun]: ../benchmarks/uc2-m12-gate-2026-08-22.md#clean-discipline-re-run-same-day-the-collapse-is-a-product-defect-not-a-harness-artifact
+
 ## Start it
 
 The release tarball ships `uc2-gateway` alongside `uc2-node` and `uc2ctl`, plus
@@ -184,6 +234,11 @@ a reader — and a conforming client treats `BUSY` the same way it treats
 counts them, so a rising number is the signal to raise the ceiling or spread
 clients across members.
 
+**`max_connections` is not a capacity number.** It bounds threads and
+sockets, not inflight work: the edge collapses well below `1024` connections
+if their combined inflight exceeds the node's admission window. Size that
+first — see [Operating envelope (2.6.0)](#operating-envelope-260).
+
 ## The single-driver head-of-line caveat
 
 One edge process runs exactly one driver thread that writes every response
@@ -250,3 +305,6 @@ gateway itself exposes no `/metrics` endpoint.
   alone, and the two lessons the failover work found.
 - [Run a cluster on real hosts](run-a-cluster.md) — the node side of this
   same host.
+- [M12 gate record](../benchmarks/uc2-m12-gate-2026-08-22.md) — the measured
+  per-connection cost, the N-connection aggregate ladder, and the
+  cross-connection flow-control defect behind the operating envelope above.
