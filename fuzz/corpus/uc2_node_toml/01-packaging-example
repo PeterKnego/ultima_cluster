@@ -19,6 +19,14 @@ id = 0
 # concrete address, not a wildcard, not 0.0.0.0. A mismatch used to elect a
 # leader whose followers never advanced commit, because datagrams arrived from
 # a source address matching no member. The node now refuses to start instead.
+#
+# EXPOSURE: reachable to the other members and to nothing else. With
+# [crypto].enabled = false this port TRUSTS THE NETWORK — nothing authenticates
+# a datagram's source, and the one filter that does exist (the leader's
+# membership check on a forwarded admin proposal, wire kind 16) matches on
+# source ADDRESS, which is spoofable. Put this on a private subnet or a
+# security group that admits only the member addresses, and/or turn on
+# [crypto]. See docs/security/attack-surface.md.
 bind = "10.0.0.10:9100"
 
 # Where this node's control page, log buffer, journal, and state live.

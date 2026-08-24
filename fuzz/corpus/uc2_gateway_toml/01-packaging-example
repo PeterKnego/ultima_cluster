@@ -26,6 +26,14 @@ instance_dir = "/srv/uc2/n0"
 app_id = "myapp"
 
 # Where remote clients connect. 0.0.0.0 accepts on every interface.
+#
+# EXPOSURE: this is the most exposed surface in the system and it is
+# UNAUTHENTICATED. The remote protocol is plain TCP — no client credential, no
+# TLS in this release — so reachability IS authorization: anyone who can open a
+# socket here can submit commands and run queries. Bind it to a private or
+# loopback interface your application tier can reach, or front it with your own
+# TLS/authentication proxy. Do not put 0.0.0.0 on a host with a public
+# interface. See docs/security/attack-surface.md.
 listen = "0.0.0.0:9200"
 
 # Every cluster member's *gateway* address, keyed by its node id — how
