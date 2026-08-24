@@ -38,7 +38,7 @@ Zero-copy *view* decode (raw or SBE): 16 ns @64 B … 143 ns @8 KiB, 0 alloc.
 
 Findings: **SBE costs nothing over a hand-laid frame (0.98–1.14×) and saves
 nothing** — its case would be schema evolution, not speed. **bincode as UC
-calls it is 24–40× raw on encode and up to 21× on decode, and none of that is
+calls it is 25–42× raw on encode and up to 21× on decode, and none of that is
 the format**: serde types `Vec<u8>` as a *sequence of u8* so bincode walks the
 payload element-wise, and `encode_to_vec` allocates per frame. `bytes::Bytes`
 (or `serde_bytes`) fields give the identical wire at 1.2–1.9× raw. Above

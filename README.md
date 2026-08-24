@@ -40,14 +40,15 @@ detection-timing confirmation is still outstanding.
 
 ---
 
-**Status: `v2.5.0` released; `v2.6.0` (M12) complete on `main`, tag pending** —
+**Status: `v2.5.0` released; `v2.6.0` (M12) prepared, tag pending** —
 milestones M1–M12: the consensus core and SDK (M1–M6), live reconfiguration
 (M7), opt-in wire crypto (M8), the deployable `uc2-node` daemon (M9), the
 observability layer (M10), backup/restore, quorum-loss recovery, full-disk
-fail-stop and measured flag-day upgrades (M11), and — merged, written up, and
-awaiting its tag — the gateway kit, admin authentication and audit, signed
-release artifacts, and the security posture package (M12). What each release
-introduced, with links to the detailed docs: **[RELEASES.md](/RELEASES.md)**.
+fail-stop and measured flag-day upgrades (M11), and — the gateway kit, admin
+authentication and audit, signed release artifacts and the security posture
+package (M12), of which M12a–c are on `main` and M12d completes the milestone
+with this writeup. What each release introduced, with links to the detailed
+docs: **[RELEASES.md](/RELEASES.md)**.
 
 | Gate | Result | Measured on |
 |---|---|---|
@@ -80,6 +81,11 @@ bar.
 No toolchain required — download a signed release tarball and run its
 quickstart:
 
+> **Not published yet.** `v2.6.0` is written up but not tagged, so there is
+> nothing at the download URL today. Until it lands, build from source and use
+> `packaging/quickstart-local.sh --bin-dir target/release`, or take the
+> one-process version further down.
+
 ```bash
 tar xzf uc2-2.6.0-x86_64-unknown-linux-gnu.tar.gz
 uc2-2.6.0-x86_64-unknown-linux-gnu/packaging/quickstart-local.sh
@@ -95,10 +101,6 @@ Tarballs (x86-64 and aarch64), a `SHA256SUMS`, a CycloneDX SBOM and
 release workflow. **[`docs/QUICKSTART.md`](/docs/QUICKSTART.md)** has the
 download-and-`cosign verify-blob` step, the annotated configs, and the path
 onto real hosts.
-
-*(The release workflow is built and gated but **`v2.6.0` is not tagged yet** —
-until it is, there is nothing at that download URL and the source paths below
-are the way in.)*
 
 From source, the smallest version of the same thing is one process:
 
@@ -182,9 +184,8 @@ including what is *not* verified and how to reproduce every layer.
 Builds standalone — the only external storage dep, `ultima-db`, comes from
 crates.io.
 
-**To crates.io with `v2.6.0`** (prepared and gated in CI; first published by
-that tag, which is not cut yet)**:** twelve crates, published **in lockstep at
-one version** — which is also the git tag, the tarball name and the image
+**To crates.io, first published by the `v2.6.0` tag:** twelve crates,
+prepared and gated in CI, published **in lockstep at one version** — which is also the git tag, the tarball name and the image
 tag. That is the thirteen crates in the table above, minus `uc2_sim` and
 `uc-lincheck`, plus `uc2ctl` (the admin CLI: a binary crate, so it has no row
 here). `uc2_sim`, `uc-lincheck` and the two example crates are

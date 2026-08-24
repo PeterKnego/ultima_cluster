@@ -25,7 +25,7 @@ one cnc change is M12b's 64-byte admin-auth line at `CNC_OFF_ADMIN_AUTH =
   `ServiceBuilder` takes `S: RawStateMachine`; the typed `StateMachine` is a
   blanket impl onto it. The decision record is
   `docs/notes/2026-08-22-codec-budget-spike.md`: an isolated codec ladder
-  measured serde+bincode's `Vec<u8>` handling at 24–40× a hand-laid frame on
+  measured serde+bincode's `Vec<u8>` handling at 25–42× a hand-laid frame on
   encode and up to 21× on decode — *not* the format's fault, but serde typing
   a byte vector as a sequence of `u8` and walking it element-wise — and a
   **dev-box** `m5_gate` `apply-profile` run put the typed `CountSm` at

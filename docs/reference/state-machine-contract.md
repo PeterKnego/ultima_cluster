@@ -88,7 +88,7 @@ than propagating a decode error — committed bytes are trusted.
 
 If your typed `Command` or `Response` carries a blob field, type it as
 `Vec<u8>` and bincode decodes it **element-wise** — the codec ladder in the
-spike note measured this at 24–40× a hand-laid frame's encode cost and up to
+spike note measured this at 25–42× a hand-laid frame's encode cost and up to
 21× its decode cost, dominated entirely by that element-wise walk, not by the
 bincode format. Typing the same field as `bytes::Bytes` (or `Vec<u8>` tagged
 `#[serde(with = "serde_bytes")]`) gives the **identical wire bytes** — this

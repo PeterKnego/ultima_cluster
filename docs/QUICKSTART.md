@@ -3,8 +3,9 @@
 From a download to a real three-node cluster, in two commands and about a
 minute. No Rust toolchain, no broker, no ZooKeeper, no container runtime.
 
-Every command and every output below is real — copied from an actual run, not
-written from memory.
+Every command and every output from §2 onward is real — copied from an actual
+run, not written from memory. §1 is the download procedure for the first
+release, which has not been cut yet (see its note).
 
 You need Linux (x86-64 or aarch64), `bash`, coreutils, and a directory on a
 real disk. That is the whole list for §2 onward — **running** the cluster

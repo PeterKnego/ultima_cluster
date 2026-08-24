@@ -9,12 +9,12 @@ analyses, wire-version mechanics, upgrade remedies — is
 
 ## v2.6.0 — adoptable cluster (M12) — *prepared, not yet tagged*
 
-**Written before the tag, as every release here is.** All four M12
-sub-milestones are merged — M12a gateway kit, M12b admin authentication and
-audit, M12c packaging and publishing, M12d security posture — and they tag
-together as `v2.6.0`. **The tag itself is a separate maintainer step**, taken
-after deciding what to do about the two gate rows that are fleet-only and have
-no fleet run yet (see *Gates* below); `v2.6.0-rc.1` goes first, because the
+**Written before the tag, as every release here is.** The four M12
+sub-milestones — M12a gateway kit, M12b admin authentication and audit, M12c
+packaging and publishing, M12d security posture — land together as `v2.6.0`.
+**The tag itself is a separate maintainer step**, taken after deciding what to
+do about the two gate rows that are fleet-only and have no fleet run yet (see
+*Gates* below); `v2.6.0-rc.1` goes first, because the
 release workflow has never been run for real and a release candidate is the
 right place to find that out. Running record, row by row:
 [M12 gate record](docs/benchmarks/uc2-m12-gate-2026-08-22.md).
@@ -109,31 +109,42 @@ written down.
   [`docs/security/`](docs/security) ·
   [Verification § fuzzing](docs/VERIFICATION.md) ·
   [SECURITY.md](SECURITY.md)
-- **Fixed bugs** — all four found in the sub-milestones' own review and fuzz
-  loops, none of them ever in a released tag:
+- **Fixed bugs** — every one of them found by the sub-milestones' own review
+  and fuzz loops rather than by a user. Three are in code that never shipped
+  in any tag; the fourth is older, and what was never true of it in a released
+  tag is *reachability* — every caller guarded it. Full findings, with
+  severity and status:
+  [security self-assessment §2](docs/security/self-assessment.md#2-findings).
   - **A captured admin request could be replayed after a restart** by an actor
     with instance-directory write access and no key at all: the HMAC was
     verified against an `instance_id` re-read from the cnc page — a file whose
     header is only magic-checked — so the captured value could simply be
     written back. The tag is now bound to the node's boot-time state, pinned
-    by a regression test that performs the forgery (fixed pre-merge,
+    by a regression test that performs the forgery (F4, fixed pre-merge,
     `50473d5`). →
-    [Who may change the cluster](docs/notes/uc2-admin-authentication.md)
+    [Who may change the cluster](docs/notes/uc2-admin-authentication.md) ·
+    [self-assessment §2](docs/security/self-assessment.md#2-findings)
   - **`Sessioned::apply` violated the buffer contract it was itself a caller
     of** — a contract-abiding inner state machine that cleared `out` truncated
     the session tag away and panicked **on the apply thread**, killing the
-    service on its first command. Found by fuzzing (`7c908b1`).
+    service on its first command. Found by fuzzing (F2, `7c908b1`). →
+    [Verification § fuzzing](docs/VERIFICATION.md#7-fuzzing--decoders-total-on-untrusted-bytes)
   - **`Sessioned::install_snapshot` pre-allocated up to 1 GiB** from an
     unvalidated 8-byte length before reading a byte of the blob. Bounded;
-    20 000 executions went 91.8 s → 0.34 s. Found by fuzzing (`7c908b1`).
-  - **Five UDP datagram readers could panic on a short slice.** Never
-    reachable — every caller guarded — but the first code an unauthenticated
-    packet reaches should not depend on five call sites remembering. All five
-    now return `Option`, pre-guards kept, hot path byte-identical (`112b81f`).
+    20 000 executions went 91.8 s → 0.34 s. Found by fuzzing (F3,
+    `7c908b1`). →
+    [self-assessment §2](docs/security/self-assessment.md#2-findings)
+  - **Five UDP datagram readers could panic on a short slice.** This code
+    shipped in every tag through `v2.5.0`, and in none of them was the panic
+    reachable — every caller guarded it — but the totality of the first code
+    an unauthenticated packet reaches should not rest on five call sites
+    remembering. All five now return `Option`, the pre-guards are kept, and
+    the hot path is byte-identical (F1, `112b81f`). →
+    [Verification § fuzzing](docs/VERIFICATION.md#7-fuzzing--decoders-total-on-untrusted-bytes)
   - Also: `uc2_remote`'s `request_timeout` is now enforced *while
-    reconnecting* (it could be outlived by a reconnect loop), and the
-    architecture doc's log-buffer default is corrected to `buffer_bytes`'
-    real 64 MiB.
+    reconnecting* (it could be outlived by a reconnect loop — F5,
+    `ae0f245`/`fc27536`/`b4b3b0c`), and the architecture doc's log-buffer
+    default is corrected to `buffer_bytes`' real 64 MiB.
 - **Gates** — [M12 gate record](docs/benchmarks/uc2-m12-gate-2026-08-22.md),
   reported the way this project reports: what ran, and what did not.
   - **PASS**: admin authentication, audit and refusal behaviour end to end
@@ -148,9 +159,19 @@ written down.
     direct `Engine` (bar ≥ 0.8×) and the codec share on the apply thread
     (rows 2 and 3). **The local smoke numbers in the gate doc are not these
     results** and are labelled as such — a dev box is not a bench.
-  - **Built but unexercised**: the release workflow, its signing and its
-    container smoke run first execute for real at the `v2.6.0-rc.1` tag
-    (rows 5 and 6).
+  - **Built, and partly proven**: the artifact quickstart (row 5) has its
+    tarball assembly, layout and rendered configs proven locally, but its
+    bare-container run, image build and compose stack are CI-only until the
+    first `-rc` tag — and `release-smoke` runs the **x86_64** tarball only, so
+    the aarch64 binaries are built and packaged but executed nowhere until
+    somebody runs them on arm hardware. Signing and verification (row 6) are
+    written out and identity-pinned but unproven until that same tag: keyless
+    signing needs a GitHub OIDC identity the dev box does not have.
+  - **Deferred, on the spec's own condition**: the `cargo fmt --check` gate
+    (row 13) — two long-lived worktrees are open and the one-shot reformat
+    measures 2 731 hunks, every one a conflict in both; the re-run condition
+    is written verbatim in the gate doc. `clippy -D warnings` is enforced on
+    both the pinned stable and the MSRV floor regardless.
   - **Pending**: the external security review (row 10), which is
     user-scheduled. Row 9 claims that the security package exists and is
     honest — not that the system is secure.

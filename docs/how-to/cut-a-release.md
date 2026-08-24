@@ -42,6 +42,23 @@ documentation for what it changes, because the tag is what people read.
       ```
 
       where `$OLD` is the version being replaced, and update each hit.
+- [ ] **Retire the pre-tag scaffolding the writeup left behind**, because the
+      tag freezes whatever is there. For `v2.6.0` that is: delete the
+      not-published-yet notes (`README.md`'s "Try it" blockquote and
+      `docs/QUICKSTART.md` §1's, plus §1's caveat clause in the
+      "every output is real" paragraph); date the `v2.6.0` headings in
+      `RELEASES.md` and `docs/releases.md` and drop their "prepared, not yet
+      tagged" qualifiers (`v2.5.0`'s headings are the model); replace
+      `docs/releases.md`'s "M12d — security posture (this branch)" with the
+      merge sha; and prune the fuzz corpus back to its committed seeds, so a
+      `git add -A` cannot smuggle libFuzzer discoveries into the tag —
+
+      ```sh
+      cd fuzz && cargo +nightly run --bin seed-corpus
+      ```
+
+      which regenerates the deterministic `NN-name` seeds; those are the only
+      corpus files that belong in git.
 
 ## 2. Check the version the way the workflow will
 
