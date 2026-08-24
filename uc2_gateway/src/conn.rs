@@ -181,6 +181,34 @@ impl Conn {
         }
     }
 
+    /// Write a buffer of one-or-more **already-encoded** frames in a single
+    /// `write_all` (one syscall for the whole batch), holding the writer lock
+    /// once. Used by the driver to flush all of a connection's answers for one
+    /// completion drain at once instead of a syscall per completion. Same
+    /// failure contract as [`Conn::write`]: a partial write desynchronises the
+    /// peer's parser, so it takes the connection down.
+    ///
+    /// An empty buffer is a no-op that neither writes nor touches
+    /// `last_write_ns` (nothing went on the wire).
+    pub fn write_batch(&self, buf: &[u8], now_ns: u64) -> bool {
+        if buf.is_empty() {
+            return !self.is_closed();
+        }
+        let mut w = self.writer.lock();
+        match w.write_all_bytes(buf) {
+            Ok(()) => {
+                self.last_write_ns.store(now_ns, Ordering::Relaxed);
+                true
+            }
+            Err(_) => {
+                w.shutdown();
+                drop(w);
+                self.close();
+                false
+            }
+        }
+    }
+
     /// Mark closed and shut the socket down in both directions, waking the
     /// reader thread and any parked credit-gate waiter.
     pub fn close(&self) {

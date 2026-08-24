@@ -115,10 +115,11 @@ use uc2_client::{
 use uc2_log::cnc::CncPage;
 use uc2_remote::conn::FramedConn;
 use uc2_remote::frame::{
-    FLAG_ENVELOPED, FLAG_EXPIRED, FLAG_IS_QUERY, FLAG_LINEARIZABLE, FLAG_REPLAYED, FrameType,
-    HELLO_REFUSED_APP_ID, HELLO_REFUSED_BUSY, HELLO_REFUSED_FAULTED, HELLO_REFUSED_VERSION, Header,
-    Hello, HelloOk, HelloRefused, Leader, PROTOCOL_VERSION, RETRY_NOT_SERVING,
-    RETRY_PAYLOAD_TOO_LARGE, RETRY_SERVICE_UNAVAILABLE, ResponseMeta, Retry, Status,
+    encode_frame, FLAG_ENVELOPED, FLAG_EXPIRED, FLAG_IS_QUERY, FLAG_LINEARIZABLE, FLAG_REPLAYED,
+    FrameType, HELLO_REFUSED_APP_ID, HELLO_REFUSED_BUSY, HELLO_REFUSED_FAULTED,
+    HELLO_REFUSED_VERSION, Header, Hello, HelloOk, HelloRefused, Leader, PROTOCOL_VERSION,
+    RETRY_NOT_SERVING, RETRY_PAYLOAD_TOO_LARGE, RETRY_SERVICE_UNAVAILABLE, ResponseMeta, Retry,
+    Status,
 };
 use uc_protocol::ring::RingWaitHandle;
 
@@ -421,6 +422,49 @@ impl Shared {
         Status { acked_seq: conn.acked_seq(), credits: conn.credits() }.encode(&mut out);
         self.stats.status_frames.fetch_add(1, Ordering::Relaxed);
         conn.write(conn.hdr(FrameType::Status, 0, 0), &out, self.now_ns());
+    }
+
+    /// Batch variants of the three answer helpers above: they encode the frame
+    /// into `buf` (bumping the same counters) instead of writing it
+    /// immediately. The driver funnels a whole completion drain's answers for
+    /// one connection into one `buf` and flushes it in a single `write_all`
+    /// (see [`driver`]). Bytes are length-prefixed, so the concatenation parses
+    /// back to whole frames on the client. `_into` never touches the socket, so
+    /// it cannot fail here — a flush failure is handled once, at flush time.
+    fn redirect_or_retry_into(&self, buf: &mut Vec<u8>, conn: &Conn, seq: u64, hint: Option<u32>) {
+        match self.resolve_leader(hint) {
+            Some((id, addr)) => {
+                let body = encode_leader(id, addr);
+                self.stats.redirects.fetch_add(1, Ordering::Relaxed);
+                encode_frame(buf, conn.hdr(FrameType::Redirect, 0, seq), &body);
+            }
+            None => {
+                let mut out = Vec::new();
+                Retry { reason: RETRY_NOT_SERVING, retry_after_us: NOT_SERVING_BACKOFF_US }
+                    .encode(&mut out);
+                self.stats.retries.fetch_add(1, Ordering::Relaxed);
+                encode_frame(buf, conn.hdr(FrameType::Retry, 0, seq), &out);
+            }
+        }
+    }
+
+    fn write_retry_into(&self, buf: &mut Vec<u8>, conn: &Conn, seq: u64, reason: u8, after_us: u32) {
+        let mut out = Vec::new();
+        Retry { reason, retry_after_us: after_us }.encode(&mut out);
+        self.stats.retries.fetch_add(1, Ordering::Relaxed);
+        encode_frame(buf, conn.hdr(FrameType::Retry, 0, seq), &out);
+    }
+
+    /// Like [`Shared::write_status`], but appends to `buf`. Still silent on a
+    /// connection whose handshake has not completed.
+    fn write_status_into(&self, buf: &mut Vec<u8>, conn: &Conn) {
+        if !conn.is_ready() {
+            return;
+        }
+        let mut out = Vec::new();
+        Status { acked_seq: conn.acked_seq(), credits: conn.credits() }.encode(&mut out);
+        self.stats.status_frames.fetch_add(1, Ordering::Relaxed);
+        encode_frame(buf, conn.hdr(FrameType::Status, 0, 0), &out);
     }
 
     /// The node's shmem identity changed underneath us: every request in
@@ -1119,7 +1163,7 @@ fn driver(shared: Arc<Shared>, mut poll: PollHalf, send: SendHalf) {
     let mut last_periodic = Instant::now();
     while !shared.stopping() {
         cycle += 1;
-        let n = poll.poll(|c| complete(&shared, &send, c));
+        let n = drain_once(&shared, &send, &mut poll);
         if n > 0 {
             idle = 0;
             // Under a stream of completions the driver may never take the idle
@@ -1151,7 +1195,7 @@ fn driver(shared: Arc<Shared>, mut poll: PollHalf, send: SendHalf) {
         } else {
             let seq = wh.current_seq();
             let _arm = ArmGuard::new(&wh); // disarms on drop, including on unwind
-            if poll.poll(|c| complete(&shared, &send, c)) == 0 && !shared.stopping() {
+            if drain_once(&shared, &send, &mut poll) == 0 && !shared.stopping() {
                 wh.park(seq, DRIVER_PARK);
             }
         }
@@ -1208,8 +1252,64 @@ fn periodic(shared: &Arc<Shared>) {
     });
 }
 
-/// Resolve one `Engine` completion into exactly one frame (or a drop).
-fn complete(shared: &Arc<Shared>, send: &SendHalf, c: Completion<'_>) {
+/// A completion drain's answers, grouped by connection so each connection's
+/// frames flush in one `write_all`. Keyed by `conn.idx`; the value carries the
+/// `Arc<Conn>` (so it survives the drain even if the table drops it) and the
+/// concatenated, already-encoded frame bytes, appended in completion order.
+type DriverBatch = HashMap<u32, (Arc<Conn>, Vec<u8>)>;
+
+/// Append an already-formed frame to a connection's slot in the drain batch,
+/// keeping the `Arc<Conn>` alive for the flush.
+fn push_frame(batch: &mut DriverBatch, conn: &Arc<Conn>, h: Header, payload: &[u8]) {
+    let e = batch.entry(conn.idx).or_insert_with(|| (Arc::clone(conn), Vec::new()));
+    encode_frame(&mut e.1, h, payload);
+}
+
+/// Drain one wave of `Engine` completions, accumulating each connection's
+/// answers, then flush every touched connection in a single `write_all`
+/// (flush-on-empty: the flush is per drain, on no timer). Returns the number of
+/// completions handled, so the driver's idle ladder is unchanged.
+///
+/// The batching is invisible to the exactly-once and prefix invariants: it
+/// changes only how a connection's answer bytes reach the socket, never which
+/// requests are accepted (that is the reader's job) nor which answer each
+/// completion earns (decided per completion below, exactly as before). Frames
+/// for one connection keep their completion order; order across connections
+/// never mattered (a client resolves by `seq`).
+fn drain_once(shared: &Arc<Shared>, send: &SendHalf, poll: &mut PollHalf) -> usize {
+    let mut batch: DriverBatch = HashMap::new();
+    let mut restart = false;
+    let n = poll.poll(|c| complete(shared, send, c, &mut batch, &mut restart));
+    // Flush the answers computed BEFORE any instance-restart completion — they
+    // are real answers a live instance produced and are owed to their clients —
+    // then take the whole edge out of service.
+    let now = shared.now_ns();
+    for (_, (conn, buf)) in batch.drain() {
+        conn.write_batch(&buf, now);
+    }
+    if restart {
+        shared.on_instance_restart();
+    }
+    n
+}
+
+/// Resolve one `Engine` completion into exactly one frame appended to `batch`
+/// (or a drop). The frame is not written here — [`drain_once`] flushes the
+/// whole drain per connection.
+fn complete(
+    shared: &Arc<Shared>,
+    send: &SendHalf,
+    c: Completion<'_>,
+    batch: &mut DriverBatch,
+    restart: &mut bool,
+) {
+    // Once a completion has reported the node's shmem instance restarted,
+    // everything else in this drain is answering from a dead instance: stop
+    // producing frames and let `drain_once` flush what came before and fault
+    // the edge.
+    if *restart {
+        return;
+    }
     let idx = (c.user_data >> 32) as u32;
     let corr = c.user_data as u32;
     // A completion for a connection that has since gone is dropped: nobody is
@@ -1228,7 +1328,6 @@ fn complete(shared: &Arc<Shared>, send: &SendHalf, c: Completion<'_>) {
     let credits_up = conn.relax(shared.cfg.per_conn_inflight);
     conn.notify_gate();
 
-    let now = shared.now_ns();
     match c.outcome {
         Outcome::Response(bytes) => {
             let (flags, body) = response_shape(shared.cfg.session_envelope, is_query, bytes);
@@ -1241,7 +1340,7 @@ fn complete(shared: &Arc<Shared>, send: &SendHalf, c: Completion<'_>) {
             meta.encode(&mut out);
             out.extend_from_slice(body);
             shared.stats.responses.fetch_add(1, Ordering::Relaxed);
-            conn.write(conn.hdr(FrameType::Response, flags, seq), &out, now);
+            push_frame(batch, &conn, conn.hdr(FrameType::Response, flags, seq), &out);
             // The RESPONSE above already carried the new credits, so no
             // separate STATUS is owed here.
             return;
@@ -1254,26 +1353,31 @@ fn complete(shared: &Arc<Shared>, send: &SendHalf, c: Completion<'_>) {
             if !is_query {
                 conn.latch_not_serving();
             }
-            shared.redirect_or_retry(&conn, seq, hint.or_else(|| send.leader_hint()));
+            let (_, buf) =
+                batch.entry(conn.idx).or_insert_with(|| (Arc::clone(&conn), Vec::new()));
+            shared.redirect_or_retry_into(buf, &conn, seq, hint.or_else(|| send.leader_hint()));
         }
         Outcome::Retry => {
-            shared.write_retry(&conn, seq, RETRY_SERVICE_UNAVAILABLE, RETRY_BACKOFF_US);
+            let (_, buf) =
+                batch.entry(conn.idx).or_insert_with(|| (Arc::clone(&conn), Vec::new()));
+            shared.write_retry_into(buf, &conn, seq, RETRY_SERVICE_UNAVAILABLE, RETRY_BACKOFF_US);
         }
         Outcome::TimedOut => {
             // "May or may not have committed" — the client re-sends, and with
             // the session envelope on the re-send is answered `replayed`.
             shared.stats.unknown.fetch_add(1, Ordering::Relaxed);
-            conn.write(conn.hdr(FrameType::Unknown, 0, seq), &[], now);
+            push_frame(batch, &conn, conn.hdr(FrameType::Unknown, 0, seq), &[]);
         }
         Outcome::InstanceRestart { .. } => {
-            shared.on_instance_restart();
+            *restart = true;
             return;
         }
     }
     if credits_up {
         // None of the frames above carries a credit field, so an increase has
         // to be announced on its own.
-        shared.write_status(&conn);
+        let (_, buf) = batch.entry(conn.idx).or_insert_with(|| (Arc::clone(&conn), Vec::new()));
+        shared.write_status_into(buf, &conn);
     }
 }
 
