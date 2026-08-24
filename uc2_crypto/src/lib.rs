@@ -8,7 +8,7 @@
 //! byte-identical fan-out traffic so the leader seals once and sends N times.
 //! The threat model is a network-path adversary; a compromised host and a
 //! malicious cluster member are explicitly out of model — see
-//! `docs/VERIFICATION.md` §10 and runbook §11.
+//! `docs/VERIFICATION.md` §11 and `docs/security/threat-model.md`.
 //!
 //! Pure-sync, like `uc2_consensus`: no `async`, no sockets, no clock reads —
 //! time enters as an explicit `now_ns: u64` so the deterministic simulator

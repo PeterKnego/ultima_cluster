@@ -638,6 +638,98 @@ explicitly. Upgrade note with the two new startup refusals.
 
 ## 7. M12d — Security posture and the review-ready package
 
+> **As built (M12d).** M12d shipped as Tasks 1–5 on
+> `uc2/m12d-security-posture`; `docs/benchmarks/uc2-m12-gate-2026-08-22.md`
+> rows 8, 9, 10 and its "M12d facts" section are the acceptance-gate record.
+> The bullets below are otherwise as written; these are the corrections, the
+> additions, and the one thing that was attempted and not delivered.
+>
+> **Fourteen fuzz targets, not one per decoder in the bullet's list.** The
+> bullet named the UDP header and frame decoders, `AppendPositionBody`,
+> snapshot-session framing, the cnc admin slot and auth line, the gateway
+> frame decoder, TOML config and the `/metrics` HTTP surface. What shipped
+> covers those and more, as fourteen targets: `uc_protocol_datagram`,
+> `uc_protocol_log_frame`, `uc_protocol_cnc`, `uc2_remote_frame`,
+> `uc2_crypto_open`, `uc2_crypto_handshake`, `uc2_crypto_group_key`,
+> `uc2_crypto_admin`, `ultima_journal_record`,
+> `ultima_journal_stable_value`, `uc2_service_session`, `uc2_node_toml`,
+> `uc2_gateway_toml`, `uc2_node_http`. The additions the bullet did not
+> anticipate are the crypto plane (the pre-auth Noise `IK` handshake is the
+> single most valuable target in the set), the on-disk journal and
+> `StableValue` records, and the `Sessioned` envelope.
+>
+> **`fuzz/` lives OUTSIDE the workspace.** `libfuzzer-sys` needs nightly and
+> `-Z sanitizer=address`; the workspace pins stable with an MSRV floor of
+> 1.89 and runs `--locked` CI jobs. So the root manifest carries
+> `exclude = ["fuzz"]` and the crate declares its own empty `[workspace]`
+> table. `cargo build --workspace`, `cargo test`, `cargo clippy --workspace`
+> and every `--locked` job are unaffected, and the workspace's package count
+> is unchanged.
+>
+> **Five `uc_protocol::v2::datagram` readers were made total** —
+> `read_datagram_header`, `read_request_vote_body`, `read_vote_body`,
+> `read_nak_body`, `read_status_body` now return `Option` instead of slicing
+> fixed offsets behind their callers' guards. The caller pre-guards were
+> kept, so the real path is byte-for-byte unchanged. Two further product
+> fixes came out of the tier, both in `Sessioned` and both user-reachable:
+> the `out`-is-cleared contract violation that panicked the apply thread, and
+> the 1 GiB pre-allocation from an unvalidated snapshot length. Gate doc
+> "M12d facts" (a)–(d) is the list.
+>
+> **`uc2_service_session` fuzzes an `EchoSm`, not a no-op.** A no-op inner
+> state machine emits zero response bytes, so the byte-budget eviction path
+> is unreachable and a target that claimed to cover it would be vacuous. The
+> target drives a response-producing inner SM under a fuzz-derived,
+> deliberately tiny `SessionConfig`, which makes client eviction, byte
+> eviction and the window trim all reachable; a unit test pins the
+> distinction by comparing the frozen table at two budgets with the inner SM
+> as the only variable.
+>
+> **Three seams were exposed, with deliberately different postures.**
+> `uc2_node::config_file::parse_str` and `uc2_gateway::config_file::parse_str`
+> are ordinary public API — the file loaders' pure inner half.
+> `uc2_node::obs::http::route_raw` (with `ObsSources::for_tests`) is
+> `#[cfg(any(test, fuzzing))]` and absent from a shipped build;
+> `uc2_node/Cargo.toml` declares `check-cfg = ['cfg(fuzzing)']` so
+> `clippy -D warnings` stays clean without promoting the seam to a Cargo
+> feature, which would have made it API. `ultima_journal::fuzz_seams` stays
+> `pub` (a separate compilation unit cannot see `pub(crate)`) but is
+> `#[doc(hidden)]`.
+>
+> **A run-count floor, because green did not mean fuzzed.** Four targets were
+> executing ~16 inputs per 60-second run while printing a clean line — an
+> `llvm-symbolizer` stall. `scripts/fuzz_smoke.sh` now takes `--min-runs N`
+> and asserts libFuzzer's reported execution count (and fails if the line is
+> absent at all); CI passes `--min-runs 10000` against 600 s. The matrix legs
+> are declared once and a `fuzz-groups` job asserts their union is exactly
+> the manifest's target set, so a fifteenth target cannot be silently left
+> unfuzzed.
+>
+> **Miri: attempted, partially delivered, exactly as the bullet allowed.** It
+> runs over the pure decoders — `uc_protocol`'s `v2::` layer and `version`
+> packing (43 tests) and `ultima_journal`'s segment and `stable_value`
+> decoders (19 tests) — all 62 passing with isolation ON, nothing excluded.
+> It does **not** run over the rings, and cannot: `open` is unsupported under
+> isolation; with isolation disabled it stops on `fallocate` mode 16
+> (`FALLOC_FL_ZERO_RANGE`, the M11 block-reservation fix); and past both, on
+> "Miri does not support file-backed memory mappings" (proved with a
+> throwaway crate, not assumed). **The stated `Vec`-backed ring fallback was
+> deliberately NOT built** — it would check a different object than the one
+> that ships. Recorded in `docs/VERIFICATION.md` §7 and again in §11.
+>
+> **`SECURITY.md` was added, and is not in this spec.** The bullet asked for
+> three documents under `docs/security/`; a repository with a security
+> package and no reporting channel is incomplete, so a root `SECURITY.md`
+> (supported = latest minor, GitHub private vulnerability reporting, 7-day
+> acknowledgement, coordinated disclosure, and a "what is already known" list
+> so a documented residual is not re-reported as a defect) ships with them.
+>
+> **The external review is still pending.** The package is the deliverable and
+> it is in tree (row 9, PASS); the review is the separate, user-scheduled step
+> the bullet describes, and row 10 reads "pending" until it happens. Row 8 is
+> BUILT with its first nightly run pending — no nightly has yet executed the
+> `fuzz` or `miri` job on a runner.
+
 - README **Security posture** section, in its own words: cleartext by
   default means the `uc_protocol::v2` decoders parse untrusted bytes with
   nothing in front of them; a malicious member can forge fan-out traffic

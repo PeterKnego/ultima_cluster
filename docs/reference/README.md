@@ -47,3 +47,11 @@ Formats you need when decoding a live system or reading the wire.
   sealing scope, the log frame types, alignment, and the version gates.
 - [Linearizable read path](read-path.md) — how a read is certified, the
   constants that govern it, and what its failure signatures mean.
+
+## Related
+
+- [Security](../security/) — which of these surfaces is authenticated and which
+  is not: the [threat model](../security/threat-model.md), the
+  [attack surface](../security/attack-surface.md) (one row per parser, plus
+  bind-address guidance), and the
+  [self-assessment](../security/self-assessment.md).

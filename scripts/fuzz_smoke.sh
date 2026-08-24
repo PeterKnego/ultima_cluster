@@ -37,8 +37,10 @@ trap 'rm -f "$LOG"' EXIT
 for t in "${TARGETS[@]}"; do
   echo "== fuzz $t (${SECS}s) =="
   # -print_funcs=0 is NOT cosmetic. libFuzzer symbolizes every newly-discovered
-  # function to print a NEW_FUNC line, and the workspace release profile keeps
-  # `debug = 1`, so the larger targets are ~27 MB of debug info. llvm-symbolizer
+  # function to print a NEW_FUNC line, and cargo-fuzz builds with its own
+  # `--config profile.release.debug="line-tables-only"` (the root workspace's
+  # [profile.release] does not apply here — fuzz/ is an excluded, separate
+  # workspace), so the larger targets are ~27 MB of debug info. llvm-symbolizer
   # needs ~90 s to index one of those for a SINGLE address — more than the whole
   # fuzz budget. Measured on uc2_node_toml: 400 runs took 90,180 ms with
   # symbolization and 57 ms without. Four of the fourteen targets were getting

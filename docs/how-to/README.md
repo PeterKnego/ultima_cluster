@@ -74,6 +74,10 @@ something is wrong" below.
 
 - [Reference](../reference/) states the surfaces these guides drive: the CLI,
   the control page, configuration, the wire.
+- [Security](../security/) states what is defended and what is not: the
+  [threat model](../security/threat-model.md), the
+  [attack surface](../security/attack-surface.md) (including which port to
+  expose to whom), and the [self-assessment](../security/self-assessment.md).
 - [Architecture](../ARCHITECTURE.md) explains why the system is shaped this way.
 - [Operations runbook](../ops/uc2-runbook.md) is the historical home of this
   material and now points here.

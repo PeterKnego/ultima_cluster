@@ -400,10 +400,12 @@ because it happened: see the harness finding below.
 - **A harness finding worth recording, because it nearly invalidated the
   tier.** Four of the fourteen targets were executing roughly *sixteen inputs
   per sixty-second run* while printing a perfectly clean line. libFuzzer
-  symbolizes each newly discovered function to print a `NEW_FUNC` line, and the
-  release profile keeps `debug = 1`, so `llvm-symbolizer` needed about ninety
-  seconds to index one binary for a single address — longer than the whole
-  budget. `-print_funcs=0` fixed it (400 runs: 90,180 ms → 57 ms). The lesson is
+  symbolizes each newly discovered function to print a `NEW_FUNC` line, and
+  `cargo fuzz` builds with its own `--config profile.release.debug=
+  "line-tables-only"` (the root workspace's release profile does not reach the
+  excluded `fuzz/` workspace at all), so each sanitizer binary carries ~27 MB of
+  debug info and `llvm-symbolizer` needed about ninety seconds to index one for
+  a single address — longer than the whole budget. `-print_funcs=0` fixed it (400 runs: 90,180 ms → 57 ms). The lesson is
   not the flag; it is that **a fuzz tier can be green and vacuous**, which is why
   the run-count floor is now asserted in the script and in CI.
 
@@ -564,7 +566,8 @@ The most important section, and the one most projects omit.
   trusted network. With it enabled, the threat model is a network-path adversary;
   a compromised host and a malicious cluster member are explicitly **out of
   model** — the group key is symmetric, so any holder can forge fan-out traffic
-  as any node. See the M8 gate record and runbook §11.
+  as any node. See the M8 gate record and
+  [`docs/security/threat-model.md`](/docs/security/threat-model.md).
 
 ---
 

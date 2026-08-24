@@ -325,7 +325,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
-          key: fuzz
+          # `shared-key`, not `key`: all four matrix legs build the SAME
+          # sanitizer artifacts, so they share one ~500 MB cache entry instead
+          # of writing four and LRU-evicting the other nightly jobs' caches.
+          shared-key: fuzz
       - name: Install cargo-fuzz
         # Explicit `+nightly`: rust-toolchain.toml pins stable 1.96.0 for this
         # directory, and without the override rustup would download that whole
@@ -397,7 +400,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly
-          components: miri
+          # rust-src: Miri needs a source-built std (`cargo miri setup`).
+          components: miri, rust-src
       - uses: Swatinem/rust-cache@v2
         with:
           key: miri

@@ -234,6 +234,14 @@ Start here:
   `uc2ctl`, the instance directory, the cnc control page, configuration and
   environment switches, the wire protocol, the linearizable read path. The
   library API is the rustdoc above, not here.
+- **[`docs/security/`](/docs/security)** — the review-ready security package:
+  the [threat model](/docs/security/threat-model.md) (assets, actors, trust
+  boundaries, what is out of model), the
+  [attack surface](/docs/security/attack-surface.md) (every parser, its guards,
+  its fuzz target, bind-address guidance), and the
+  [self-assessment](/docs/security/self-assessment.md) (what was found, what is
+  accepted, where an external reviewer should look). Reporting:
+  [`SECURITY.md`](/SECURITY.md).
 - **[`docs/ops/uc2-runbook.md`](/docs/ops/uc2-runbook.md)** — the operations
   landing page; indexes the two directories above.
 
@@ -249,18 +257,64 @@ Bench/fleet tooling lives under [`bench-infra/`](/bench-infra) (terraform +
 ansible + the fleet-gate orchestrator; refuses to run journal-bearing gates on
 RAM-backed filesystems).
 
-## Scope
+## Security posture
+
+**Wire crypto is opt-in and off by default.** With `[crypto].enabled = false`,
+node-to-node UDP is cleartext and its source is unauthenticated: the
+`uc_protocol::v2` decoders parse untrusted bytes with nothing in front of them.
+That is why they are total on `&[u8]` and fuzzed nightly — fourteen
+`cargo-fuzz` targets, 600 s each, with an asserted execution floor
+([VERIFICATION §7](/docs/VERIFICATION.md#7-fuzzing--decoders-total-on-untrusted-bytes)).
+
+With crypto **on**, the threat model is a network-path adversary: Noise `IK`
+over an allowlist of X25519 statics, AES-256-GCM with the 16-byte header
+authenticated as AAD, RFC-6479 anti-replay. **Out of model:** a compromised
+host, and a malicious cluster member — the group key is symmetric, so any
+holder can forge fan-out traffic as any node.
+
+Also true, and stated rather than implied:
+
+- the remote client link is **plain TCP with no client authentication** in this
+  release, and `/metrics`, `/healthz`, `/readyz` are unauthenticated — the bind
+  address is the control;
+- **`app_id` is a wrong-cluster guard, not a credential**;
+- admin operations need an HMAC key unless the operator chose
+  `[admin] auth = "none"`, and that signature authenticates cluster-wide only
+  when paired with `[crypto].enabled = true`.
+
+[Threat model](/docs/security/threat-model.md) ·
+[attack surface](/docs/security/attack-surface.md) ·
+[self-assessment](/docs/security/self-assessment.md) ·
+[reporting a vulnerability](/SECURITY.md).
+
+## Scope and limits
 
 What is shipped, release by release — each feature with a link to its
-detailed doc — lives in **[RELEASES.md](/RELEASES.md)**. Standing limits:
-hard cap **8 total members** (voters + learners); one node per instance
-directory; wire crypto and journal purge are **off by default**. Since
-`v2.6.0`, admin operations (add/remove/promote/demote membership) require a
-signed HMAC request unless `[admin] auth = "none"` — and that signature only
-authenticates cluster-wide when paired with `[crypto].enabled = true` (a
-follower forwards an authenticated request to the leader over the same
-node-to-node UDP socket wire crypto protects); see
-[Configuration: Admin authentication](/docs/reference/configuration.md#admin-authentication).
+detailed doc — lives in **[RELEASES.md](/RELEASES.md)**. The standing limits:
+
+- **8 total members**, a hard cap (voters + learners share the eight cnc peer
+  slots).
+- **One node per instance directory**, enforced by an exclusive flock.
+- **One state machine per cluster** — one leader, one apply thread. No
+  sharding, no dynamic loading.
+- **Command payload ≤ 1344 bytes** (crypto off) or **≤ 1312 bytes** (crypto
+  on). A command travels in one datagram; the node does not fragment frames,
+  and `MTU_DEFAULT = 1408` is not configurable.[^mtu]
+- **Clients attach over shmem on a node host, or over TCP through a
+  `uc2-gateway`** on a node host. There is no remote ingress inside the node.
+- **Wire crypto and journal purge are off by default**; `[crypto]` and
+  `[admin]` are explicit choices a `node.toml` must make or the node refuses to
+  start. Admin operations require a signed HMAC request unless
+  `[admin] auth = "none"` — see
+  [Configuration: Admin authentication](/docs/reference/configuration.md#admin-authentication).
+- **All published fleet measurements are single-AZ.** They are reproducible on
+  the hardware each record names, not universal.
+
+[^mtu]: `uc2_node::preflight::check_semantics` computes the ceiling and refuses
+    to start with `PayloadExceedsMtu` above it:
+    `align32(max_payload + HEADER_LEN) + DATAGRAM_HEADER_LEN + crypto ≤ MTU_DEFAULT`,
+    i.e. `align32(p + 32) + 16 [+ 24] ≤ 1408`. The 32-byte frame alignment is
+    what makes the answer 1344 rather than 1360, and 1312 rather than 1336.
 
 ## License
 

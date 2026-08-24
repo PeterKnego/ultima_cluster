@@ -129,6 +129,10 @@ sent.
 ## Related
 
 - [Architecture](../ARCHITECTURE.md) — why the system is shaped this way.
+- [Threat model](../security/threat-model.md) — what is defended and what is
+  out of model, with [the attack surface](../security/attack-surface.md)'s
+  bind-address guidance for the three listening ports. *Was §11's posture
+  half.*
 - [Verification](../VERIFICATION.md) — what is proved, checked, and merely
   bug-hunted.
 - [Benchmarks](../BENCHMARKS.md) — every measured result and what it ran on.

@@ -192,6 +192,43 @@ mechanical commit and add `--check` to `ci.yml` once neither branch is
 outstanding. The `RELEASES.md`/`docs/releases.md` writeup covers all four
 sub-milestones and lands with the `v2.6.0` tag, not here.
 
+**M12d (security posture + the review-ready package) is merged on
+`uc2/m12d-security-posture` (gate doc row 9 PASS, row 8 BUILT with its first
+nightly run pending, row 10 external review still pending)**: a **fuzzing
+tier** — `fuzz/`, a `cargo-fuzz` crate deliberately **outside the workspace**
+(`exclude = ["fuzz"]` + its own empty `[workspace]`, because `libfuzzer-sys`
+needs nightly and the workspace pins stable at an MSRV floor of 1.89) with
+**14 targets** over every parser that sees bytes it did not write
+(`uc_protocol_datagram`, `uc_protocol_log_frame`, `uc_protocol_cnc`,
+`uc2_remote_frame`, `uc2_crypto_open`, `uc2_crypto_handshake`,
+`uc2_crypto_group_key`, `uc2_crypto_admin`, `ultima_journal_record`,
+`ultima_journal_stable_value`, `uc2_service_session`, `uc2_node_toml`,
+`uc2_gateway_toml`, `uc2_node_http`), a deterministic committed seed corpus
+(the generator's output, exactly — `cargo +nightly run --bin seed-corpus`),
+`scripts/fuzz_smoke.sh`, and `fuzz-groups` + `fuzz` + `miri` jobs in
+`nightly.yml`. **Three real product defects came out of it**: five
+`uc_protocol::v2::datagram` readers made total (never reachable through the
+receiver's guards — defence in depth), `Sessioned::apply` handing the inner SM
+a non-empty `out` (user-reachable apply-thread panic), and
+`Sessioned::install_snapshot` pre-allocating up to 1 GiB from an unvalidated
+length. **Plus one about the harness: a fuzz tier can be green and vacuous** —
+an `llvm-symbolizer` stall had four targets executing ~16 inputs per 60 s run
+while printing clean, so `fuzz_smoke.sh --min-runs N` asserts libFuzzer's
+execution count and CI passes `--min-runs 10000` against 600 s. **Miri runs
+over the pure decoders only** (62 tests, isolation ON, nothing excluded); the
+mmap'd IPC rings are out of reach (three reproduced blockers, ending at "Miri
+does not support file-backed memory mappings") and the `Vec`-backed ring
+fallback was deliberately NOT built. The **security package** is
+`docs/security/{threat-model,attack-surface,self-assessment}.md` + root
+`SECURITY.md` (supported = latest minor `2.6.x`, GitHub private vulnerability
+reporting, 7-day acknowledgement) + README **Security posture** and **Scope
+and limits** sections. Standing facts worth knowing: the command payload
+ceiling is **≤ 1344 B crypto off / ≤ 1312 B crypto on** (one datagram,
+`MTU_DEFAULT = 1408`, not configurable — `preflight` refuses above it), and
+`bincode::config::standard()` is `NoLimit`, so the typed tier's decode is
+bounded by the payload cap and serde's 1 MiB pre-allocation cap, not by the
+codec. No consensus, wire-protocol or cnc change.
+
 **The v1 stack (an `openraft`-based design) has been retired** and its crates
 deleted — v2 owns consensus, elections, and transport directly. Do not
 reintroduce `openraft`, `quinn`/QUIC, or the `uc_node`/`uc_service`/`uc_client`
@@ -240,11 +277,21 @@ cargo run -p uc2_node --release --example m5_gate # throughput gate harness (see
 cargo run -p uc2_node --release --example m6_gate -- all --secs 6 --cycles 5   # snapshots/learners/purge gate
 cargo run -p uc2_node --release --example m7_gate -- all --secs 6             # live reconfig gate (replace/resize/self-removal)
 cargo run -p uc2ctl -- status --instance-dir D --app-id A  # M7 admin CLI: add/promote/demote/remove/status
+scripts/fuzz_smoke.sh 60 --min-runs 10000         # fuzz regression gate: every target, 60s each (needs nightly + cargo-fuzz)
+(cd fuzz && cargo +nightly fuzz run uc_protocol_datagram -- -max_total_time=600)  # hunt one target
 scripts/elle_check.sh                            # elle consistency tier: 5 list-append passes, both models (needs java+jq)
 scripts/elle_mutation.sh                         # elle mutation testing: control clean + 3 injected consensus bugs caught
 (cd proofs && lake exe cache get && lake build)   # Lean proofs: model + theorems + conform checker (needs elan)
 cargo run -p uc2_consensus --release --example conform_gen -- --out $HOME/.cache/uc2-conform/vectors.jsonl --count 100000 --seed 1 && (cd proofs && lake exe conform $HOME/.cache/uc2-conform/vectors.jsonl)  # model<->Rust conformance
 ```
+
+`fuzz/` is a `cargo-fuzz` crate **outside the workspace** (the root manifest
+excludes it; it has its own `[workspace]` and lockfile), so `cargo
+build/test/clippy --workspace` never sees it and it needs the nightly
+toolchain plus `cargo install cargo-fuzz`. `scripts/fuzz_smoke.sh [SECS]
+[--min-runs N] [TARGET…]` is the regression gate CI runs (`--min-runs 10000`
+against 600 s per target); `fuzz/README.md` covers adding a target,
+regenerating the corpus, and `tmin`/`cmin`.
 
 The elle scripts write histories to `$HOME/.cache/uc2-elle*` (disk) — never
 override `ELLE_DIR`/`ELLE_MUT_DIR` to `/tmp` (RAM tmpfs, no swap → OOM; see
@@ -473,8 +520,9 @@ new section at the top of `RELEASES.md`** (latest first), structured as:
 
 Do this — plus the matching `docs/releases.md` entry and a sweep of
 QUICKSTART / how-to / reference for statements the release invalidated —
-**before tagging**, so the tag contains the writeup. README's Scope section
-stays a pointer to `RELEASES.md`, not a parallel prose copy.
+**before tagging**, so the tag contains the writeup. README's "Scope and
+limits" section stays a pointer to `RELEASES.md` plus the standing limits, not
+a parallel prose copy of the release history.
 
 ## Pointers to dependent crates
 
