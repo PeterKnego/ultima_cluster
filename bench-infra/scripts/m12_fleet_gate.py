@@ -2,14 +2,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Peter Knego
 """
-M12 fleet-gate driver — rows 2 and 3 of
+M12 fleet-gate driver — rows 1, 2 and 3 of
 docs/benchmarks/uc2-m12-gate-2026-08-22.md.
 
+    row 1  NETWORK-BUDGET: how much of a fleet box's NIC the consensus
+           (inter-node UDP replication) plane taxes while the DIRECT shmem
+           client drives the leader up an inflight ladder — with full latency
+           percentiles and the NIC bytes/pkts spent PER COMMAND. Reports two
+           operating points: the highest inflight that still holds p99 < 1 ms,
+           and the peak responses/s point. MEASUREMENT ROW — no bar.  FLEET ONLY
     row 2  gateway (Edge + RemoteClient) throughput vs direct `Engine`
            throughput at EQUAL inflight.  BAR: ratio >= 0.8.       FLEET ONLY
     row 3  codec share on the apply thread at the M5 ladder, typed vs raw
            state-machine tier.  MEASUREMENT ROW — no bar; it states two
            numbers.                                               FLEET ONLY
+
+ROW 1 (path 1 of the network-budget investigation) answers: at ~1.5M/s, can a
+network fluke break p99 < 1 ms, and is there NIC headroom for a co-located TCP
+client? It reuses row 2's cluster bring-up verbatim (three hosts = node +
+service, typed CountSm, NO edge for the baseline sweep), drives
+`m12_gate client-direct --envelope off` on the LEADER host over shmem at each
+inflight in a ladder (default 1,16,64,256,1024,4096), and while each point
+runs it samples the leader's primary-ENI `/proc/net/dev` counters (~1 Hz) to
+derive steady-state rx/tx bytes/s and pkts/s. Dividing the tx rate by
+responses/s gives the replication cost PER COMMAND — the headline number. The
+optional `--with-remote-load` tail (default on) then adds a concurrent TCP
+`client-remote` on the fourth host and re-measures the p99<1ms point to see
+whether the extra client pushes the box's NIC over.
 
 WHY A FLEET RUN AT ALL (i.e. what the local smoke could not do):
 
@@ -79,6 +98,7 @@ import json
 import re
 import shlex
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -530,6 +550,358 @@ def row3(node_hosts, client_host, a):
                    ok, detail)
 
 
+# --------------------------------------------------------------- row 1 (netbudget)
+#
+# Everything below is pure where it can be (parse_proc_net_dev, nic_rate,
+# steady_rates, select_operating_points) so the parsing and the p99<1ms
+# selection are unit-testable off-fleet; only the sampler and the row driver
+# touch ssh.
+
+DEFAULT_NETBUDGET_INFLIGHTS = "1,16,64,256,1024,4096"
+P99_MS_BUDGET = 1.0   # the "network-budget" operating point: highest inflight with p99 below this
+
+
+def detect_iface(host):
+    """The host's primary ENI: the interface the default route uses (what
+    node<->node UDP replication egresses on). Falls back to the first non-lo
+    interface in operstate `up`. Never hardcoded — a fleet box may be ens5,
+    eth0, enp… ."""
+    cmd = (
+        "IFACE=$(ip -o route get 8.8.8.8 2>/dev/null | "
+        "sed -n 's/.* dev \\([^ ]*\\).*/\\1/p' | head -n1); "
+        "if [ -z \"$IFACE\" ]; then "
+        "for i in $(ls /sys/class/net 2>/dev/null | grep -v '^lo$'); do "
+        "st=$(cat /sys/class/net/$i/operstate 2>/dev/null); "
+        "if [ \"$st\" = up ]; then IFACE=$i; break; fi; done; fi; "
+        "echo IFACE=$IFACE"
+    )
+    r = ssh(host, cmd, label="iface")
+    out = r.stdout or ""
+    for l in out.splitlines():
+        if l.startswith("IFACE=") and len(l.strip()) > len("IFACE="):
+            return l.strip()[len("IFACE="):]
+    raise RuntimeError(f"could not detect a primary NIC on {host.public_ip}: {out!r}")
+
+
+def parse_proc_net_dev(text, iface):
+    """Pull (rx_bytes, rx_pkts, tx_bytes, tx_pkts) for `iface` out of a raw
+    /proc/net/dev dump. Field order (kernel-stable): after the `iface:` label
+    come rx_bytes rx_packets rx_errs rx_drop rx_fifo rx_frame rx_compressed
+    rx_multicast tx_bytes tx_packets … so rx_bytes=f[0], rx_packets=f[1],
+    tx_bytes=f[8], tx_packets=f[9]."""
+    for line in text.splitlines():
+        line = line.strip()
+        if ":" not in line:
+            continue
+        name, rest = line.split(":", 1)
+        if name.strip() != iface:
+            continue
+        f = rest.split()
+        if len(f) < 10:
+            raise ValueError(f"short /proc/net/dev line for {iface}: {line!r}")
+        return {
+            "rx_bytes": int(f[0]), "rx_pkts": int(f[1]),
+            "tx_bytes": int(f[8]), "tx_pkts": int(f[9]),
+        }
+    raise ValueError(f"interface {iface!r} not found in /proc/net/dev")
+
+
+def nic_rate(sample_a, sample_b):
+    """Per-second deltas between two (timestamp, counters) samples. None if the
+    clock did not advance (or went backwards) between them."""
+    ta, ca = sample_a
+    tb, cb = sample_b
+    dt = tb - ta
+    if dt <= 0:
+        return None
+    return {
+        "rx_bytes_per_sec": (cb["rx_bytes"] - ca["rx_bytes"]) / dt,
+        "tx_bytes_per_sec": (cb["tx_bytes"] - ca["tx_bytes"]) / dt,
+        "rx_pkts_per_sec": (cb["rx_pkts"] - ca["rx_pkts"]) / dt,
+        "tx_pkts_per_sec": (cb["tx_pkts"] - ca["tx_pkts"]) / dt,
+    }
+
+
+def steady_rates(samples):
+    """Median per-second rate across the consecutive-sample intervals. When
+    there are >= 4 intervals the first and last are trimmed to drop the client
+    ramp-up and drain edges (the sends do not start the instant the ssh lands).
+    Returns None if fewer than two usable samples."""
+    if len(samples) < 2:
+        return None
+    intervals = [nic_rate(samples[i], samples[i + 1]) for i in range(len(samples) - 1)]
+    intervals = [r for r in intervals if r is not None]
+    if not intervals:
+        return None
+    if len(intervals) >= 4:
+        intervals = intervals[1:-1]
+    keys = ("rx_bytes_per_sec", "tx_bytes_per_sec", "rx_pkts_per_sec", "tx_pkts_per_sec")
+    return {k: statistics.median(r[k] for r in intervals) for k in keys}
+
+
+def select_operating_points(points):
+    """(a) the highest-inflight point that still holds p99 < 1 ms, and
+    (b) the peak responses/s point. Either may be None if no point qualifies."""
+    valid = [p for p in points
+             if p.get("resp_per_sec") and p.get("p99_ms") is not None]
+    p99ok = [p for p in valid if p["p99_ms"] < P99_MS_BUDGET]
+    budget = max(p99ok, key=lambda p: p["inflight"]) if p99ok else None
+    peak = max(valid, key=lambda p: p["resp_per_sec"]) if valid else None
+    return budget, peak
+
+
+def run_client_sampled(host, argv, timeout, iface):
+    """Run `m12_gate <argv>` on `host` (blocking, its stdout is the RESULT) while
+    sampling that host's NIC counters ~1 Hz over a SECOND ssh channel. Returns
+    (rc, combined_output, samples) where each sample is (timestamp, counters)."""
+    quoted = " ".join(shlex.quote(a) for a in argv)
+    cmd = f"sudo {host.gate} {quoted}"
+    print(f"INFO [ssh {host.public_ip}] {cmd}", flush=True)
+    snap = f"cat /proc/net/dev  # NIC sample for {iface}, ~1 Hz while the client runs"
+    print(f"INFO [ssh {host.public_ip}] {snap}", flush=True)
+    proc = subprocess.Popen(host.ssh + [host.target, cmd], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    samples = []
+    deadline = time.time() + timeout
+    try:
+        while True:
+            if proc.poll() is not None:
+                break
+            if time.time() > deadline:
+                print(f"INFO NIC-sampled client exceeded {timeout}s; killing", flush=True)
+                proc.kill()
+                break
+            try:
+                r = subprocess.run(host.ssh + [host.target, "cat /proc/net/dev"],
+                                   text=True, capture_output=True, timeout=15)
+                samples.append((time.time(), parse_proc_net_dev(r.stdout or "", iface)))
+            except Exception as e:
+                print(f"INFO NIC sample skipped (continuing): {e}", flush=True)
+            time.sleep(1.0)
+        out, _ = proc.communicate(timeout=60)
+    except Exception:
+        proc.kill()
+        out, _ = proc.communicate()
+    return proc.returncode, out or "", samples
+
+
+def netbudget_point(host, a, iface, inflight, secs):
+    """One ladder point: the direct client at `inflight`, envelope off, with the
+    NIC sampled underneath it. Emits and returns the NETBUDGET-JSON dict, or
+    None if the client printed no RESULT (it died — not a zero)."""
+    argv = ["client-direct", "--instance-dir", host.dir, "--app-id", APP,
+            "--secs", str(secs), "--payload", str(a.payload),
+            "--inflight", str(inflight), "--envelope", "off"]
+    rc, out, samples = run_client_sampled(host, argv, secs + CLIENT_SLACK_SECS, iface)
+    echo(f"netbudget if={inflight}", out)
+    d = parse_result(out, "direct")
+    if d is None:
+        print(f"INFO netbudget inflight={inflight} produced no RESULT line "
+              f"(rc={rc}) — treated as not-measured, not zero", flush=True)
+        return None
+    rates = steady_rates(samples)
+    if rates is None:
+        print(f"INFO netbudget inflight={inflight}: only {len(samples)} NIC "
+              f"sample(s), cannot form a rate", flush=True)
+        rates = {"rx_bytes_per_sec": None, "tx_bytes_per_sec": None,
+                 "rx_pkts_per_sec": None, "tx_pkts_per_sec": None}
+    rps = d.get("responses_per_sec") or 0.0
+
+    def per_cmd(x):
+        # NIC tx delta per second / commands committed per second == tx delta
+        # per command committed (the replication cost of one command).
+        return (x / rps) if (x is not None and rps > 0) else None
+
+    point = {
+        "inflight": inflight,
+        "resp_per_sec": d.get("responses_per_sec"),
+        "responses": d.get("responses"),
+        "p50_ms": d.get("p50_ms"), "p90_ms": d.get("p90_ms"),
+        "p95_ms": d.get("p95_ms"), "p99_ms": d.get("p99_ms"),
+        "max_ms": d.get("max_ms"), "lost": d.get("lost"),
+        "nic_tx_bytes_per_sec": rates["tx_bytes_per_sec"],
+        "nic_rx_bytes_per_sec": rates["rx_bytes_per_sec"],
+        "nic_tx_pkts_per_sec": rates["tx_pkts_per_sec"],
+        "nic_rx_pkts_per_sec": rates["rx_pkts_per_sec"],
+        "bytes_per_command": per_cmd(rates["tx_bytes_per_sec"]),
+        "pkts_per_command": per_cmd(rates["tx_pkts_per_sec"]),
+        "nic_samples": len(samples),
+    }
+    print("NETBUDGET-JSON " + json.dumps(point), flush=True)
+    return point
+
+
+def run_with_remote_load(node_hosts, client_host, leader, lh, iface, a, budget):
+    """Optional tail: with the cluster still up, start edges + a concurrent TCP
+    client-remote on the measurement host, then re-run the direct client at the
+    p99<1ms inflight and report whether p99 degrades / NIC pkts/s climbs."""
+    infl = budget["inflight"]
+    print(f"\nINFO ROW 1 optional (--with-remote-load): concurrent TCP load while "
+          f"re-measuring the p99<1ms point (inflight={infl})", flush=True)
+    start_edges(node_hosts, a, "off")
+    l2 = wait_leader(node_hosts, list(range(len(node_hosts))), LEADER_WAIT_SECS)
+    if l2 is None or l2 != leader:
+        print("INFO leader moved/lost after starting edges; skipping remote-load step",
+              flush=True)
+        stop_edges(node_hosts)
+        return None
+    dur = a.netbudget_secs
+    rargv = ["client-remote", "--gateways", f"{lh.private_ip}:{EDGE_PORT}",
+             "--app-id", APP, "--secs", str(dur + 30), "--payload", str(a.payload),
+             "--inflight", str(a.inflight)]
+    rquoted = " ".join(shlex.quote(x) for x in rargv)
+    rcmd = f"sudo {client_host.gate} {rquoted}"
+    print(f"INFO [ssh {client_host.public_ip}] {rcmd}   (background TCP load)", flush=True)
+    rproc = subprocess.Popen(client_host.ssh + [client_host.target, rcmd], text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    result = None
+    try:
+        time.sleep(EDGE_SETTLE_SECS + 2.0)  # let the TCP client ramp before we sample
+        p = netbudget_point(lh, a, iface, infl, dur)
+        if p is not None:
+            result = {
+                "inflight": infl,
+                "baseline_p99_ms": budget["p99_ms"],
+                "under_tcp_load_p99_ms": p["p99_ms"],
+                "baseline_resp_per_sec": budget["resp_per_sec"],
+                "under_tcp_load_resp_per_sec": p["resp_per_sec"],
+                "baseline_nic_tx_pkts_per_sec": budget["nic_tx_pkts_per_sec"],
+                "under_tcp_load_nic_tx_pkts_per_sec": p["nic_tx_pkts_per_sec"],
+                "baseline_nic_tx_bytes_per_sec": budget["nic_tx_bytes_per_sec"],
+                "under_tcp_load_nic_tx_bytes_per_sec": p["nic_tx_bytes_per_sec"],
+                "p99_still_under_1ms": (p["p99_ms"] is not None
+                                        and p["p99_ms"] < P99_MS_BUDGET),
+            }
+            print("NETBUDGET-REMOTELOAD-JSON " + json.dumps(result), flush=True)
+        else:
+            print("INFO remote-load re-measure produced no RESULT", flush=True)
+    finally:
+        for fn in (rproc.terminate, rproc.kill):
+            try:
+                fn()
+                rproc.communicate(timeout=15)
+                break
+            except Exception:
+                continue
+        stop_edges(node_hosts)
+    return result
+
+
+def row1(node_hosts, client_host, a):
+    ladder = [int(x) for x in a.netbudget_inflights.split(",") if x.strip()]
+    secs = a.netbudget_secs
+    print(f"INFO ROW 1: NETWORK-BUDGET, ladder={ladder}, secs={secs}, "
+          f"payload={a.payload}, envelope=off, with_remote_load={a.with_remote_load}",
+          flush=True)
+    wipe_dirs(node_hosts)
+    start_cluster(node_hosts, a, "off")
+
+    points = []
+    remote = None
+    try:
+        leader = wait_leader(node_hosts, list(range(len(node_hosts))), LEADER_WAIT_SECS)
+        if leader is None:
+            print(f"INFO no single serving leader within {LEADER_WAIT_SECS}s", flush=True)
+            return Verdict("1 network-budget (measurement, no bar)", False,
+                           "no leader — nothing measured")
+        lh = node_hosts[leader]
+        iface = detect_iface(lh)
+        print(f"INFO leader is n{leader} ({lh.public_ip}), primary NIC {iface}",
+              flush=True)
+
+        for k in ladder:
+            print(f"\nINFO --- netbudget ladder point inflight={k} ---", flush=True)
+            l2 = wait_leader(node_hosts, list(range(len(node_hosts))), LEADER_WAIT_SECS)
+            if l2 is None:
+                print(f"INFO leader lost before inflight={k}; skipping this point",
+                      flush=True)
+                continue
+            if l2 != leader:
+                print(f"INFO leadership moved n{leader} -> n{l2}; re-targeting the "
+                      f"direct client and NIC sampler at the new leader host",
+                      flush=True)
+                leader, lh = l2, node_hosts[l2]
+                iface = detect_iface(lh)
+            p = netbudget_point(lh, a, iface, k, secs)
+            if p is not None:
+                points.append(p)
+
+        budget, peak = select_operating_points(points)
+
+        if a.with_remote_load and budget is not None:
+            remote = run_with_remote_load(node_hosts, client_host, leader, lh,
+                                          iface, a, budget)
+        elif a.with_remote_load:
+            print("INFO --with-remote-load set but no p99<1ms point to re-measure; "
+                  "skipping the remote-load step", flush=True)
+    finally:
+        stop_edges(node_hosts)
+        stop_cluster(node_hosts)
+
+    # ----- report
+    budget, peak = select_operating_points(points)
+    print("\nROW 1 — network budget: direct shmem client vs consensus NIC cost")
+    print(f"  {'inflight':>8} {'resp/s':>12} {'p50':>7} {'p90':>7} {'p95':>7} "
+          f"{'p99':>7} {'lost':>6} {'tx MB/s':>9} {'tx kpps':>8} "
+          f"{'B/cmd':>8} {'pkt/cmd':>8}")
+    for p in points:
+        def f(x, w, d=3):
+            return f"{x:>{w}.{d}f}" if isinstance(x, (int, float)) else f"{'—':>{w}}"
+        txmb = (p["nic_tx_bytes_per_sec"] / 1e6) if p["nic_tx_bytes_per_sec"] else None
+        txk = (p["nic_tx_pkts_per_sec"] / 1e3) if p["nic_tx_pkts_per_sec"] else None
+        print(f"  {p['inflight']:>8} {f(p['resp_per_sec'],12,0)} "
+              f"{f(p['p50_ms'],7)} {f(p['p90_ms'],7)} {f(p['p95_ms'],7)} "
+              f"{f(p['p99_ms'],7)} {p.get('lost','—'):>6} "
+              f"{f(txmb,9,2)} {f(txk,8,1)} "
+              f"{f(p['bytes_per_command'],8,1)} {f(p['pkts_per_command'],8,3)}")
+    print("  NETBUDGET-POINTS-JSON " + json.dumps(points))
+
+    print("\nNETBUDGET-SUMMARY")
+    if budget is not None:
+        print(f"  (a) p99<1ms budget: inflight={budget['inflight']}, "
+              f"resp/s={budget['resp_per_sec']:.0f}, p99={budget['p99_ms']:.3f} ms, "
+              f"NIC tx={_fmt(budget['nic_tx_bytes_per_sec'])} B/s "
+              f"({_fmt(budget['nic_tx_pkts_per_sec'])} pkt/s), "
+              f"{_fmt(budget['bytes_per_command'])} B/cmd "
+              f"{_fmt(budget['pkts_per_command'])} pkt/cmd")
+    else:
+        print("  (a) p99<1ms budget: NONE — no ladder point held p99 below 1 ms")
+    if peak is not None:
+        print(f"  (b) peak throughput: inflight={peak['inflight']}, "
+              f"resp/s={peak['resp_per_sec']:.0f}, p99={_fmt(peak['p99_ms'])} ms, "
+              f"NIC tx={_fmt(peak['nic_tx_bytes_per_sec'])} B/s "
+              f"({_fmt(peak['nic_tx_pkts_per_sec'])} pkt/s), "
+              f"{_fmt(peak['bytes_per_command'])} B/cmd "
+              f"{_fmt(peak['pkts_per_command'])} pkt/cmd")
+    else:
+        print("  (b) peak throughput: NONE — no usable ladder point")
+    print("  NETBUDGET-SUMMARY-JSON " + json.dumps({"budget": budget, "peak": peak}))
+
+    if remote is not None:
+        verdict = ("p99 held" if remote["p99_still_under_1ms"] else "p99 BROKE")
+        print("\nNETBUDGET-REMOTE-LOAD (concurrent TCP client on the measurement host)")
+        print(f"  inflight={remote['inflight']}: p99 "
+              f"{_fmt(remote['baseline_p99_ms'])} -> "
+              f"{_fmt(remote['under_tcp_load_p99_ms'])} ms ({verdict} the 1 ms bar); "
+              f"NIC tx pkts/s {_fmt(remote['baseline_nic_tx_pkts_per_sec'])} -> "
+              f"{_fmt(remote['under_tcp_load_nic_tx_pkts_per_sec'])}")
+    elif a.with_remote_load:
+        print("\nNETBUDGET-REMOTE-LOAD: SKIPPED (no p99<1ms point, or the step could "
+              "not run) — the ladder above is the measurement")
+
+    ok = len(points) > 0
+    detail = (f"measured {len(points)} ladder point(s); "
+              + (f"p99<1ms at inflight={budget['inflight']} "
+                 f"({budget['resp_per_sec']:.0f}/s); " if budget else "no p99<1ms point; ")
+              + (f"peak {peak['resp_per_sec']:.0f}/s at inflight={peak['inflight']}"
+                 if peak else "no peak point"))
+    return Verdict("1 network-budget (measurement, no bar)", ok, detail)
+
+
+def _fmt(x, d=1):
+    return f"{x:.{d}f}" if isinstance(x, (int, float)) else "—"
+
+
 # --------------------------------------------------------------------- setup
 
 def setup_fleet(a):
@@ -564,7 +936,7 @@ def print_bar(a):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="UC v2 M12 fleet-gate driver (rows 2 and 3)")
+        description="UC v2 M12 fleet-gate driver (rows 1, 2 and 3)")
     ap.add_argument("--fleet", action="store_true", required=True,
                     help="remote hosts over ssh (there is no local mode: both "
                          "rows are fleet-only, and the local smoke lives in "
@@ -592,7 +964,20 @@ def main():
                     help="row 3 load duration; the apply-profile counters print "
                          "every 1,000,000 applied frames, so this must be long "
                          "enough to reach one million")
-    ap.add_argument("--row", choices=("2", "3", "both"), default="both")
+    ap.add_argument("--row", choices=("1", "2", "3", "both"), default="both",
+                    help="`both` = rows 2 and 3 (the pass/measurement pair); "
+                         "`1` = the network-budget measurement (run on its own)")
+    ap.add_argument("--netbudget-inflights", default=DEFAULT_NETBUDGET_INFLIGHTS,
+                    help="row 1 only: comma-separated inflight ladder driven on "
+                         "the leader (default %(default)s)")
+    ap.add_argument("--netbudget-secs", type=int, default=20,
+                    help="row 1 only: per-ladder-point client-direct duration "
+                         "(default 20)")
+    ap.add_argument("--with-remote-load", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="row 1 only (default on): after the ladder, add a "
+                         "concurrent TCP client-remote on the measurement host and "
+                         "re-measure the p99<1ms point to see if the box tips over")
     a = ap.parse_args()
 
     if a.nodes < 4:
@@ -604,6 +989,8 @@ def main():
     node_hosts, client_host = setup_fleet(a)
     verdicts = []
     try:
+        if a.row == "1":
+            verdicts.append(row1(node_hosts, client_host, a))
         if a.row in ("2", "both"):
             verdicts.append(row2(node_hosts, client_host, a))
         if a.row in ("3", "both"):
@@ -619,7 +1006,7 @@ def main():
     # reported honestly above but does not turn the run red.
     row2_v = next((v for v in verdicts if v.row.startswith("2 ")), None)
     if row2_v is None:
-        print("RESULT: PASS (row 3 only — no bar was adjudicated)")
+        print("RESULT: PASS (measurement rows only — no bar was adjudicated)")
         sys.exit(0)
     if row2_v.passed:
         print(f"RESULT: PASS bar={BAR_RATIO} — {row2_v.detail}")
