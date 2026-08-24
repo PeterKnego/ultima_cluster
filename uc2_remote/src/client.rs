@@ -812,13 +812,20 @@ impl Inner {
         st.credits = credits;
         st.acked_seq = st.acked_seq.max(acked_seq);
         self.pump(st);
-        self.cv.notify_all();
+        // The admission wake is deliberately NOT here: `credit_update` runs once
+        // per received frame, and waking every blocked submitter on each frame
+        // was a thundering herd. The reader loop issues ONE `cv.notify_all`
+        // after it finishes a whole read-batch, by which point the credit
+        // window reflects every frame in the batch. See `reader_loop`.
     }
 
     fn resolve(&self, st: &mut State, seq: u64, res: Result<RemoteResponse, RemoteError>) {
         if let Some(p) = st.pending.remove(&seq) {
             let _ = p.tx.send(res);
-            self.cv.notify_all();
+            // The `Ticket`'s answer travels on `p.tx` (its own channel), so the
+            // caller is already woken. The admission `cv` — which only paces
+            // submitters waiting for credit — is notified once per read-batch by
+            // the reader loop, not per resolved request.
         }
     }
 
@@ -1266,7 +1273,30 @@ fn reader_loop(inner: Arc<Inner>, mut rd: FramedConn) {
         match frame {
             Ok(Some((h, payload))) => {
                 last_recv = now;
-                match inner.on_frame(h, payload) {
+                let mut act = inner.on_frame(h, payload);
+                // Drain every frame this coalesced read already delivered,
+                // processing the whole burst before touching the admission
+                // condvar. `on_frame`'s credit/resolve updates all land under
+                // the state lock as they are processed; only the wake is
+                // deferred to the end of the batch.
+                while matches!(act, Act::Continue) {
+                    match rd.next_buffered() {
+                        Ok(Some((h2, payload2))) => act = inner.on_frame(h2, payload2),
+                        Ok(None) => break,
+                        // A malformed frame in the buffered bytes is the same
+                        // verdict a bad socket read would earn: reconnect.
+                        Err(_) => {
+                            act = Act::Reconnect(None);
+                            break;
+                        }
+                    }
+                }
+                // ONE admission wake for the whole read-batch. `notify_all`, not
+                // `notify_one`: a batch can free several credit slots at once
+                // with several submitters blocked in `enqueue`, and `notify_one`
+                // would leave the rest stalled until the next frame.
+                inner.cv.notify_all();
+                match act {
                     Act::Continue => {}
                     Act::Stop => return,
                     Act::Reconnect(preferred) => {
