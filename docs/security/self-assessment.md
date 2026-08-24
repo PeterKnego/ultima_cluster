@@ -104,7 +104,7 @@ millions; 20 000 executions went 91.8 s → 0.34 s after the fix (~157–270×).
 ### F4 — admin verification read its identity binding from the writable cnc page
 
 **Severity:** high (authentication bypass) · **Status:** fixed before merge,
-M12b (`cca681d`-era) · **Found by:** code review, pre-merge.
+M12b `50473d5` · **Found by:** code review, pre-merge.
 
 The signed admin tag binds `instance_id` and `app_id`. The first implementation
 re-read them **from the cnc page** per request. The page is a writable file
@@ -157,8 +157,9 @@ the ones a reviewer should weigh.
 | **A malicious cluster member can forge fan-out traffic as any node.** | The group key is symmetric; this is inherent to seal-once-send-to-many. The alternative is N seals per fan-out, which the M8 design rejected on cost. Verbatim residual 3 in [threat model §6](threat-model.md#6-residuals-stated-elsewhere-and-where). |
 | **No client authentication or TLS on the remote link.** | An explicit M12 non-goal ("no TLS on the remote client link in this release"). Reachability is authorization; the guidance is to keep the port private or front it with a proxy. |
 | **`[admin] auth = "hmac"` is only cluster-wide when paired with `[crypto].enabled = true`.** | A follower forwards an authenticated request to the leader over the node-to-node socket as wire kind 16, which the leader cannot re-verify. Stated in four places, including the README. Fixing it properly means an admin credential the *leader* can check, i.e. a wire change — deliberately not smuggled into M12b. |
-| **The IPC rings' `unsafe` code is neither Miri- nor fuzz-checked.** | Miri does not support file-backed memory mappings (three distinct blockers, each reproduced — VERIFICATION §7). A `Vec`-backed variant would let Miri run and would be checking a different object than the one that ships; the trade-off is recorded rather than resolved. loom covers the interleavings; offset-pin tests cover the layout. |
+| **The IPC rings' `unsafe` code is checked for layout and nothing else.** | `uc_protocol/src/ring/{spsc,mpsc,broadcast,common,futex}.rs` has **no interleaving coverage and no UB coverage**. Miri does not support file-backed memory mappings (three distinct blockers, each reproduced — VERIFICATION §7), and a `Vec`-backed variant would check a different object than the one that ships. The tree's only loom model (`uc2_log/tests/loom_frame.rs`) covers the **log buffer's** frame-visibility protocol — a hand-written model of that handshake — not the rings. Offset-pin tests freeze the layout. This is the least-covered `unsafe` code in the system and it is stated as such, here and in VERIFICATION §11. |
 | **`leader_completeness` is not proved**, and the Lean model collapses the durable counter's two readers into one. | Open, and stated: [VERIFICATION §11](/docs/VERIFICATION.md#11-what-is-not-verified). A real acked-write-loss bug once lived in exactly that model gap and was found from the Rust side. |
+| **A malformed query frame fail-stops a typed state machine, pre-commit, from an unauthenticated client.** | `uc2_service/src/traits.rs`'s blanket `RawStateMachine` impl decodes a query with `.expect("corrupt query frame (fail-stop)")`, and `uc2_service/src/apply.rs`'s query branch calls it **while holding the state machine's `Mutex`** — so a single malformed `QUERY` body arriving through a gateway (`SendHalf::try_query`) panics the apply thread and poisons the lock, with no quorum, no leadership and no commit involved. It is a one-frame remote kill switch for any deployment that pairs the typed tier with untrusted clients. **Documented rather than fixed in M12d on purpose:** turning a decode error into a refusal changes the tier's error semantics (today, undecodable bytes are treated as corruption, and corruption is a fail-stop by design — the same `.expect` guards the post-commit apply path, where fail-stop *is* the right answer because every replica sees the same committed bytes). Choosing the new contract is a design decision, parked as a follow-up. **The workaround today is the raw tier**, which hands you the bytes and lets you reject them; the other mitigation is not exposing a gateway to untrusted clients. |
 | **`bincode` is unmaintained (RUSTSEC-2025-0141).** | A maintenance-status advisory with no patched version ("No safe upgrade is available!"). It is the wire codec for the cnc page, log records and the remote protocol, and the typed tier's byte-identity promise is defined against it, so replacing it is a wire-format migration. Ignored on purpose in `deny.toml`, with the reasoning, the date, and an instruction to re-check when a maintained successor appears. |
 | **The typed state-machine tier decodes with no configured byte limit.** | `bincode::config::standard()` is `NoLimit`. The bounds that exist are the ≤ 1344-byte payload cap, serde's 1 MiB pre-allocation cap, and fail-stop on a decode error. The documented stance is "committed bytes are trusted"; the answer for untrusted input is the raw tier. Stated rather than papered over — see [attack surface §1](attack-surface.md#1-the-inventory). |
 
@@ -169,16 +170,21 @@ Ranked by where we think the residual risk actually is:
 1. **The pre-auth UDP path with crypto OFF.** This is the default posture, and
    the decoders are the only thing in front of the node's state. Fuzzing is a
    regression gate, not a proof of totality. Worth a fresh pair of eyes on
-   `uc2_net::receiver`'s dispatch — in particular the consensus kinds (5–11),
-   which are forwarded **raw** to the consensus agent with no term filter,
-   because a higher-term `RequestVote` must reach the state machine.
+   `uc2_net::receiver`'s dispatch — in particular the consensus plane (kinds
+   5–11 plus the admin-forward kinds 16 and 17), which is forwarded **raw** to
+   the consensus agent with no term filter, because a higher-term
+   `RequestVote` must reach the state machine.
 2. **The `snow` handshake state machine under malformed messages.** Turning
    crypto on *adds* a pre-auth parser (kinds 18/19) that anyone who can reach
    the UDP port can drive. Our target fuzzes `Peers::on_message` with the
    claimed sender id and `now_ns` taken from the input; nobody has reviewed the
    state machine's behaviour under interleaved, out-of-order or replayed
    handshake messages from multiple claimed identities.
-3. **The admin canonical-bytes layout.** `AdminMessage::canonical_bytes` is
+3. **The typed tier's pre-commit query decode.** We have documented it (§3) and
+   deliberately not changed it. A reviewer's judgement on whether fail-stop is
+   defensible for an *uncommitted, unauthenticated* input — and on whether
+   anything else in the SDK shares that shape — is worth more than ours here.
+4. **The admin canonical-bytes layout.** `AdminMessage::canonical_bytes` is
    what the HMAC covers, and every property of M12b's authentication reduces to
    "does this byte string uniquely determine the request". It is pinned against
    a fixed test vector; it has not been reviewed for ambiguity (field framing,
@@ -186,12 +192,18 @@ Ranked by where we think the residual risk actually is:
    The ruled decision to omit a `(seq, nonce)` replay ring rests on that layout
    plus the boot-time `instance_id` binding (F4) — if the layout is ambiguous,
    that reasoning weakens.
-4. **The gateway's credit / backpressure ladder under a malicious client.** The
+5. **The `uc_protocol::ring` buffers' `unsafe` mmap code.** Five files —
+   `spsc`, `mpsc`, `broadcast`, `common`, `futex` — whose layout is frozen by
+   offset-pin tests and whose *interleavings and UB are covered by nothing*.
+   The tree's one loom model checks the log buffer's frame-visibility protocol,
+   not these; Miri cannot map a file-backed region. The MPSC claim-then-commit
+   sequence and the broadcast seqlock are the two we would look at first.
+6. **The gateway's credit / backpressure ladder under a malicious client.** The
    caps (`MAX_FRAME_LEN`, `max_connections`, credits, write timeout) are
    designed against an over-eager client, not a hostile one. Behaviour under a
    client that opens the maximum connections, sends `HELLO` and then stalls, or
    that never reads its socket while pipelining, deserves adversarial attention.
-5. **`Sessioned` eviction under adversarial `client_id`s.** `client_id` is
+7. **`Sessioned` eviction under adversarial `client_id`s.** `client_id` is
    client-chosen. A client that churns fresh ids evicts other clients' dedup
    state (LRU, by `(last_seen_pos, client_id)`, on either the client-count or
    byte budget). We believe the consequence is confined to *liveness of
@@ -211,7 +223,7 @@ The short form:
 | WGL linearizability capstones | failover, purge/snapshot churn, partition/quorum loss |
 | Elle | transactional safety, plus a mutation tier that proves the harness can fail |
 | Multi-process SIGKILL | real processes, real reconstruction |
-| loom | the ring buffers' interleavings |
+| loom | the **log buffer's** frame-visibility protocol, exhaustively — a hand-written model (`uc2_log/tests/loom_frame.rs`); **not** the `uc_protocol::ring` rings |
 | **Fuzzing (§7)** | **fourteen decoder targets, nightly, with an execution floor** |
 | **Miri (§7)** | **the pure decoders — 62 tests, isolation on, no exclusions; the mmap rings are out of reach** |
 

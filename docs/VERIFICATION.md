@@ -457,9 +457,11 @@ unsupported operation: Miri does not support file-backed memory mappings
 
 A Vec-backed ring variant built purely so Miri could run it is
 the stated fallback and **has not been built**, because it would check a
-different object than the one that ships. The rings' concurrency is covered by
-loom (§6) and their layout by offset-pin tests; their `unsafe` mmap code is
-covered by neither, which is stated again in §11.
+different object than the one that ships. And loom does not close the gap
+either: §6's model is of the **log buffer's** frame-visibility protocol, not of
+`uc_protocol::src::ring`. So the rings' layout is frozen by offset-pin tests
+and their interleavings and UB are covered by **nothing** — stated again in
+§11.
 
 ---
 
@@ -548,13 +550,17 @@ The most important section, and the one most projects omit.
   produces divergence that no layer here can catch.
 - **Bounded model checks are bounded.** Veil's clean runs are exhaustive to a
   depth, not to all executions (§8).
-- **The IPC rings are not Miri-checked** (§7). Miri does not support file-backed
-  memory mappings, so the `unsafe` shared-memory code — the one place in the
-  system where a Rust memory-safety bug is most plausible — is covered by loom
-  for its interleavings and by offset-pin tests for its layout, and by neither
-  for undefined behaviour. A Vec-backed ring variant would let Miri run, and
-  would be checking a different object than the one that ships; it has not been
-  built, and that trade-off is recorded rather than resolved.
+- **The IPC rings' interleavings and UB are covered by nothing** (§6, §7).
+  `uc_protocol/src/ring/{spsc,mpsc,broadcast,common,futex}.rs` — the one place
+  in the system where a Rust memory-safety bug is most plausible — has its
+  **layout** frozen by offset-pin tests and no other coverage. Miri does not
+  support file-backed memory mappings, and §6's loom model is of the **log
+  buffer's** frame-visibility protocol (a hand-written model of that atomic
+  handshake), not of the ring code: the MPSC claim-then-commit sequence and the
+  broadcast seqlock have never been model-checked. A Vec-backed ring variant
+  would let Miri run and would be checking a different object than the one that
+  ships; it has not been built, and that trade-off is recorded rather than
+  resolved.
 - **Fuzzing is a regression gate, not a proof of totality** (§7). Green means no
   new crash from the committed corpus inside the budget. It does not mean the
   decoders are total for all inputs, and it says nothing about stateful
