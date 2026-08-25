@@ -552,19 +552,35 @@ fn a_survivor_forced_single_after_quorum_loss_recovers_and_repairs() {
     // post-force read HIGHER than whatever was captured pre-force. Polling
     // to `commit == durable == service_applied` here makes the later
     // `assert_eq!` provably sound instead of merely the race's usual winner.
+    //
+    // Fix round 3 (nightly 2026-08-23, this exact race: pre-force read 42,
+    // post-force read 50 of 50 acked): that pin is a point-in-time check of
+    // the survivor's OWN counters, and it is silent about bytes the leader has
+    // appended that the survivor has not yet fsynced — in flight on the wire,
+    // or already received into its log buffer (`append > durable`) with the
+    // archive's fsync still pending. Both keep flowing for the few ms between
+    // the pin passing and the SIGKILL landing (and the archive finishes its
+    // fsync even after the leader is dead), so the survivor could still freeze
+    // with `durable > commit` exactly as described above. Closing it: pin the
+    // survivor to the LEADER's append frontier too — every byte the leader ever
+    // appended is durable, committed and applied at the survivor. The leader
+    // appends nothing further here (its client is shut down, no config change
+    // in flight), so once this holds nothing can move after the kill.
     let survivor_cnc_pre_kill = open_cnc(&dirs[survivor_idx]).expect("survivor cnc before the kill");
+    let leader_cnc_pre_kill = open_cnc(&dirs[leader_idx]).expect("leader cnc before the kill");
     let pin_deadline = Instant::now() + Duration::from_secs(10);
     loop {
+        let leader_append = leader_cnc_pre_kill.counters().append.load_acquire();
         let commit = survivor_cnc_pre_kill.counters().commit.load_acquire();
         let durable = survivor_cnc_pre_kill.counters().durable.load_acquire();
         let applied = survivor_cnc_pre_kill.service().service_applied.load_acquire();
-        if commit >= durable && applied == durable {
+        if durable == leader_append && commit >= durable && applied == durable {
             break;
         }
         assert!(
             Instant::now() < pin_deadline,
-            "survivor never caught commit up to durable before the kill \
-             (commit={commit} durable={durable} applied={applied})"
+            "survivor never caught up to the leader's frontier before the kill \
+             (leader_append={leader_append} commit={commit} durable={durable} applied={applied})"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
