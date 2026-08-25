@@ -67,14 +67,18 @@ pub struct Args {
     /// Park budget for `--idle park`, in microseconds.
     #[arg(long, default_value_t = 50)]
     pub park_us: u64,
-    /// Report per-second MPSC hole telemetry alongside the pop rate:
-    /// `holes` (cumulative `MpscConsumer::holes_skipped`), `hol` (polls that
-    /// returned `Ok(None)` with `claim_position > consumer_position` — the
-    /// consumer head-of-line behind exactly one claimed-but-uncommitted slot)
-    /// and `empty` (polls that returned `Ok(None)` on a genuinely empty ring).
-    /// OFF by default: the two extra Acquire loads sit on the `Ok(None)` path,
-    /// which is hot when the ring is starved, so leaving it on would perturb
-    /// the very number the ladder reports.
+    /// Report the extra per-second MPSC poll telemetry alongside the pop
+    /// rate: `hol` (polls that returned `Ok(None)` with `claim_position >
+    /// consumer_position` — the consumer head-of-line behind exactly one
+    /// claimed-but-uncommitted slot) and `empty` (polls that returned
+    /// `Ok(None)` on a genuinely empty ring). OFF by default: the two extra
+    /// Acquire loads sit on the `Ok(None)` path, which is hot when the ring
+    /// is starved, so leaving it on would perturb the very number the ladder
+    /// reports.
+    ///
+    /// The cumulative per-ring hole counters (`holes_in` / `holes_q`, from
+    /// each `MpscConsumer::holes_skipped`) are printed unconditionally — they
+    /// are read once per second, off the poll path.
     #[arg(long, default_value_t = false)]
     pub hole_stats: bool,
 }
@@ -219,7 +223,8 @@ pub fn run(a: Args) -> anyhow::Result<()> {
     let mut hol_polls: u64 = 0;
     let mut empty_polls: u64 = 0;
     let (mut hol_at_last, mut empty_at_last) = (0u64, 0u64);
-    let mut holes_at_last: u64 = 0;
+    let mut holes_in_at_last: u64 = 0;
+    let mut holes_q_at_last: u64 = 0;
 
     // `--idle park` parks on the ingress ring's wake word: an MPSC producer
     // bumps the commit count and `signal()`s once per commit, and only
@@ -322,13 +327,22 @@ pub fn run(a: Args) -> anyhow::Result<()> {
         if last_report.elapsed() >= Duration::from_secs(1) {
             let elapsed = last_report.elapsed().as_secs_f64();
             let rate = (popped - popped_at_last_report) as f64 / elapsed;
-            let holes = ingress.holes_skipped() + query.holes_skipped();
+            // Final review, Important 2: per-ring, never summed — the last
+            // summing site in the tree. Which ring is losing records is the
+            // whole diagnostic value (`ingress.ring` = submits, `query.ring`
+            // = reads), and it matches the two `/metrics` series the node
+            // exports.
+            let holes_in = ingress.holes_skipped();
+            let holes_q = query.holes_skipped();
             let mut line = format!(
-                "dummy-node: popped={popped} resp/s={rate:.0} holes={holes} \
-                 holes/s={:.0}",
-                (holes - holes_at_last) as f64 / elapsed
+                "dummy-node: popped={popped} resp/s={rate:.0} \
+                 holes_in={holes_in} holes_in/s={:.0} \
+                 holes_q={holes_q} holes_q/s={:.0}",
+                (holes_in - holes_in_at_last) as f64 / elapsed,
+                (holes_q - holes_q_at_last) as f64 / elapsed
             );
-            holes_at_last = holes;
+            holes_in_at_last = holes_in;
+            holes_q_at_last = holes_q;
             if a.hole_stats {
                 line.push_str(&format!(
                     " hol/s={:.0} empty/s={:.0}",

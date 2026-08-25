@@ -19,6 +19,14 @@
 //! the production `encode_commit_word` / `classify_commit_word` / `lap_of`
 //! directly, so a change to the word layout changes the model with it.
 //!
+//! **Kept in step with the M13a final review's Minor 1**: both
+//! `compare_exchange` sites take `Relaxed` on FAILURE, not `Acquire`, because
+//! neither reads anything on that path (the producer discards the returned
+//! word and reports `Skipped`; the consumer `continue`s and re-Acquire-loads
+//! the word at the top of its loop). Production made that change to avoid a
+//! needless `ldaxr` on aarch64; the model follows it exactly, so the weaker
+//! failure edge is what loom actually explores.
+//!
 //! Line-by-line correspondence to `uc_protocol/src/ring/mpsc.rs`:
 //!
 //! | model                         | production                              |
@@ -28,11 +36,11 @@
 //! | `Ring::claim` CAS             | `claim`, `claim_position.compare_exchange_weak(AcqRel/Relaxed)` |
 //! | `Ring::claim` claim stamp     | `claim`, `store_commit_word(.., CLAIMED\|LAP\|advance, Relaxed)` |
 //! | `Ring::claim` body store      | `claim`, `write_record_body_at` (plain stores; modeled Relaxed) |
-//! | `Ring::commit` CAS            | `commit`, `cas_commit_word(expected = own claim word, Release/Acquire)` |
+//! | `Ring::commit` CAS            | `commit`, `cas_commit_word(expected = own claim word, Release/Relaxed)` |
 //! | `Ring::commit` count bump     | `commit`, `publish_position.fetch_add(1, Release)` (the futex wake word) |
 //! | `Ring::try_read` pos load     | `try_read`, `consumer_position.load(Relaxed)` (single reader) |
 //! | `Ring::try_read` word load    | `try_read`, `load_commit_word` (Acquire)  |
-//! | `Ring::try_read` skip CAS     | `try_read`, `cas_commit_word(word -> CLAIMED\|LAP\|0, AcqRel/Acquire)` |
+//! | `Ring::try_read` skip CAS     | `try_read`, `cas_commit_word(word -> CLAIMED\|LAP\|0, AcqRel/Relaxed)` |
 //! | `Ring::try_read` advance      | `try_read`, `consumer_position.store(.., Release)` |
 //!
 //! Deliberately NOT modeled: the tail-straddle padding path (the model's
@@ -370,15 +378,17 @@ impl Ring {
 
     /// `MpscProducer::commit`: `compare_exchange` the slot's word from our
     /// OWN claim word to the committed word. Release on success (this is the
-    /// edge that publishes the body), Acquire on failure. A failure means the
-    /// consumer marked us skipped, or a later claimant owns these bytes now —
-    /// either way we touch nothing and report `Skipped`.
+    /// edge that publishes the body), `Relaxed` on failure — nothing is read
+    /// on the failure path, so there is nothing for an `Acquire` to order
+    /// (final review, Minor 1). A failure means the consumer marked us
+    /// skipped, or a later claimant owns these bytes now — either way we
+    /// touch nothing and report `Skipped`.
     fn commit(&self, claim: Claim) -> Result<(), ModelError> {
         let slot = self.slot_of(claim.pos);
         let expected = encode_commit_word(claim.lap, ADVANCE as u32, true);
         let committed = encode_commit_word(claim.lap, ADVANCE as u32, false);
         if self.words[slot]
-            .compare_exchange(expected, committed, COMMIT_SUCCESS, Ordering::Acquire)
+            .compare_exchange(expected, committed, COMMIT_SUCCESS, Ordering::Relaxed)
             .is_err()
         {
             return Err(ModelError::Skipped);
@@ -436,7 +446,7 @@ impl Ring {
                         "the skip marker must never collide with a real claim word"
                     );
                     if self.words[slot]
-                        .compare_exchange(word, marker, Ordering::AcqRel, Ordering::Acquire)
+                        .compare_exchange(word, marker, Ordering::AcqRel, Ordering::Relaxed)
                         .is_err()
                     {
                         continue;
