@@ -419,18 +419,11 @@ fn a_silent_edge_is_noticed_and_the_link_is_re_established() {
 /// submitted: the edge reads one SUBMIT and closes the connection without
 /// answering.
 ///
-/// **What this task can guarantee, and what it deliberately cannot.** The
-/// writer re-dials (`reconnects`, a second connection at the edge) and the
-/// request's completion is still delivered **exactly once** — but as
-/// [`RemoteOutcome::TimedOut`], because the ordered re-send of the live
-/// window onto the fresh connection is TASK 8's (`link.rs`'s `redial` says so
-/// at the seam). So the promise pinned here is the one M13b actually makes at
-/// this point: an accepted request always resolves, never silently vanishes.
-///
-/// TASK 8: when the window re-send lands, this expectation becomes
-/// `RemoteOutcome::Response` with body `b"yx"`, `resends >= 1`, and
-/// `request_timeout` can go back to the default — it is short here only so
-/// the sweep fires inside the test.
+/// The promise is **exactly one** completion for the accepted request — and,
+/// since the ordered re-send of the live window landed (task 8), that
+/// completion is the real answer rather than a timeout: the request survives
+/// the connection that swallowed it. `request_timeout` is the default here on
+/// purpose, so nothing in the test depends on the sweep firing.
 #[test]
 fn a_dropped_connection_is_re_dialled_and_the_request_still_resolves_once() {
     let edge = FakeEdge::spawn(Behaviour {
@@ -438,11 +431,7 @@ fn a_dropped_connection_is_re_dialled_and_the_request_still_resolves_once() {
         drop_after_first_request: true,
         ..Default::default()
     });
-    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
-        request_timeout: Duration::from_millis(500),
-        ..cfg(vec![edge.addr.clone()])
-    })
-    .unwrap();
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
     send.try_submit(42, b"xy").expect("the first submit fits any window");
 
     let mut got: Vec<(u64, String)> = Vec::new();
@@ -453,7 +442,12 @@ fn a_dropped_connection_is_re_dialled_and_the_request_still_resolves_once() {
     }
     assert_eq!(got.len(), 1, "the accepted request must resolve exactly once: {got:?}");
     assert_eq!(got[0].0, 42);
-    assert!(got[0].1.starts_with("TimedOut"), "outcome was {:?}", got[0].1);
+    assert!(
+        got[0].1.starts_with("Response { body: [121, 120]"),
+        "the re-send must carry the answer, not a timeout: {:?}",
+        got[0].1
+    );
+    assert!(send.stats().resends >= 1, "{:?}", send.stats());
 
     // The link itself recovered from the drop, whatever became of the request.
     assert!(until(|| send.stats().reconnects >= 1), "the drop must force a redial");
@@ -592,4 +586,188 @@ fn halves_have_the_documented_thread_bounds() {
     // stable Rust, and a test that "checks" it would only ever be a comment.
     // The compile-time proof is that `assert_send_sync::<RemoteSendHalf>()`
     // does not compile; adding it here is how you verify that by hand.
+}
+
+// ----------------------------------------------------------------- failover
+
+#[test]
+fn redirect_is_followed_and_the_window_is_resent_in_order() {
+    let b = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let a = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        redirect_all_to: Some(b.addr.clone()),
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![a.addr.clone()])).unwrap();
+    let got = run_submits(&send, &mut poll, 3, |i| vec![i as u8]);
+    assert_eq!(got.len(), 3);
+    for (i, (ud, _, body, _)) in got.iter().enumerate() {
+        assert_eq!(*ud, i as u64);
+        assert_eq!(body.as_slice(), &[i as u8]);
+    }
+    assert_eq!(b.observed.seq_order(), vec![1, 2, 3], "re-sent in seq order at the new edge");
+    let s = send.stats();
+    assert!(s.redirects >= 1, "redirects: {}", s.redirects);
+    assert!(s.reconnects >= 1, "reconnects: {}", s.reconnects);
+    assert!(s.resends >= 1, "resends: {}", s.resends);
+    assert_eq!(send.leader().map(|(id, _)| id), Some(1), "leader from the new edge's HELLO_OK");
+    send.shutdown();
+}
+
+#[test]
+fn retry_is_honoured_in_place_after_its_hint() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, retry_once: true, ..Default::default() });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    let got = run_submits(&send, &mut poll, 1, |_| b"abc".to_vec());
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].2.as_slice(), b"cba");
+    let s = send.stats();
+    assert_eq!(s.retries, 1, "one RETRY honoured");
+    assert_eq!(s.reconnects, 0, "a transient RETRY is re-sent in place, not failed over");
+    assert_eq!(edge.observed.conns.load(AtomicOrdering::SeqCst), 1, "same connection");
+    send.shutdown();
+}
+
+#[test]
+fn retry_not_serving_moves_the_link_rather_than_re_sending_in_place() {
+    let good = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let bad =
+        FakeEdge::spawn(Behaviour { credits: 2, not_serving_once: true, ..Default::default() });
+    let (send, mut poll) =
+        RemoteEngine::connect(cfg(vec![bad.addr.clone(), good.addr.clone()])).unwrap();
+    let got = run_submits(&send, &mut poll, 1, |_| b"abc".to_vec());
+    assert_eq!(got.len(), 1);
+    let s = send.stats();
+    assert_eq!(s.retries, 1);
+    assert!(s.reconnects >= 1, "NOT_SERVING is a role statement: go somewhere else");
+    send.shutdown();
+}
+
+#[test]
+fn connection_loss_resends_the_unanswered_window() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        drop_after_first_request: true,
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    let got = run_submits(&send, &mut poll, 1, |_| b"abc".to_vec());
+    assert_eq!(got.len(), 1, "the request survives the connection that dropped it");
+    assert_eq!(got[0].2.as_slice(), b"cba");
+    assert_eq!(edge.observed.conns.load(AtomicOrdering::SeqCst), 2, "exactly one reconnect");
+    assert_eq!(edge.observed.seq_order(), vec![1], "one logical request, re-sent");
+    let s = send.stats();
+    assert!(s.reconnects >= 1 && s.resends >= 1, "{s:?}");
+    send.shutdown();
+}
+
+#[test]
+fn a_fresh_connection_sends_one_probe_before_flushing_its_window() {
+    let leader = FakeEdge::spawn(Behaviour { credits: 64, ..Default::default() });
+    let wrong = FakeEdge::spawn(Behaviour {
+        credits: 64,
+        redirect_all_to: Some(leader.addr.clone()),
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        max_inflight: 64,
+        ..cfg(vec![wrong.addr.clone()])
+    })
+    .unwrap();
+    let got = run_submits(&send, &mut poll, 50, |i| vec![i as u8]);
+    assert_eq!(got.len(), 50);
+    assert_eq!(
+        wrong.observed.seq_count(),
+        1,
+        "an edge that cannot serve costs ONE frame, not the whole window"
+    );
+    assert_eq!(
+        leader.observed.seq_order(),
+        (1..=50).collect::<Vec<u64>>(),
+        "the window lands at the leader, in order"
+    );
+    send.shutdown();
+}
+
+#[test]
+fn a_hello_ok_naming_another_leader_is_followed_before_anything_is_sent() {
+    let leader = FakeEdge::spawn(Behaviour { credits: 8, ..Default::default() });
+    let follower = FakeEdge::spawn(Behaviour {
+        credits: 8,
+        hello_ok_leader_addr: Some(leader.addr.clone()),
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![follower.addr.clone()])).unwrap();
+    let got = run_submits(&send, &mut poll, 3, |i| vec![i as u8]);
+    assert_eq!(got.len(), 3);
+    assert_eq!(follower.observed.hellos.load(AtomicOrdering::SeqCst), 1, "dialled once");
+    assert_eq!(follower.observed.seq_count(), 0, "and never sent a request");
+    assert_eq!(leader.observed.seq_order(), vec![1, 2, 3]);
+    let s = send.stats();
+    assert_eq!(s.redirects, 0, "the hop happens at the handshake, not by REDIRECT");
+    assert_eq!(s.resends, 0, "nothing was ever sent to the wrong edge");
+    send.shutdown();
+}
+
+#[test]
+fn edges_that_name_each_other_as_leader_do_not_ping_pong() {
+    let a = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let b = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        hello_ok_leader_addr: Some(a.addr.clone()),
+        ..Default::default()
+    });
+    // `a` names `b`, `b` names `a`: the hop budget must settle it.
+    let t = Instant::now();
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![b.addr.clone()])).unwrap();
+    let got = run_submits(&send, &mut poll, 1, |_| b"abc".to_vec());
+    assert_eq!(got.len(), 1);
+    assert!(t.elapsed() < Duration::from_secs(5), "the handshake hop must be bounded");
+    send.shutdown();
+}
+
+#[test]
+fn payload_too_large_is_terminal_and_never_resent() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        payload_too_large_once: true,
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    send.try_submit(7, b"abc").unwrap();
+    let mut outcome = None;
+    let deadline = Instant::now() + WAIT;
+    while outcome.is_none() && Instant::now() < deadline {
+        poll.poll(|c| {
+            assert_eq!(c.user_data, 7);
+            outcome = Some(matches!(c.outcome, RemoteOutcome::PayloadTooLarge));
+        });
+    }
+    assert_eq!(outcome, Some(true), "RETRY{{PAYLOAD_TOO_LARGE}} is a terminal outcome");
+    assert_eq!(edge.observed.seq_count(), 1, "seen exactly once on the wire");
+    assert_eq!(send.stats().resends, 0);
+    send.shutdown();
+}
+
+#[test]
+fn an_edge_that_redirects_to_itself_does_not_wedge_or_spin() {
+    let edge =
+        FakeEdge::spawn(Behaviour { credits: 4, redirect_to_self: true, ..Default::default() });
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        request_timeout: Duration::from_millis(500),
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+    send.try_submit(1, b"abc").unwrap();
+    let t = Instant::now();
+    let mut timed_out = false;
+    while !timed_out && t.elapsed() < Duration::from_secs(3) {
+        poll.poll(|c| timed_out = matches!(c.outcome, RemoteOutcome::TimedOut));
+    }
+    assert!(timed_out, "an elected-but-not-serving self-redirect must still time out");
+    let frames = edge.observed.seq_count();
+    assert!((1..200).contains(&frames), "backed off, not spun: {frames} frames");
+    let conns = edge.observed.conns.load(AtomicOrdering::SeqCst);
+    assert!(conns < 200, "backed off, not spun: {conns} connections");
+    send.shutdown();
 }

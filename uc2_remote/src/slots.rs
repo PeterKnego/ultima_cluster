@@ -185,7 +185,7 @@ impl SlotTable {
         self.take(seq)
     }
 
-    #[allow(dead_code, reason = "task 8/9 abort a slot the edge answered finally")]
+    #[allow(dead_code, reason = "task 9 aborts a slot the edge answered finally")]
     pub(crate) fn abort(&self, seq: u64) -> Resolve {
         self.take(seq)
     }
@@ -271,7 +271,12 @@ impl SlotTable {
         Some((off, len))
     }
 
-    #[allow(dead_code, reason = "task 8's re-send needs SUBMIT vs QUERY for the stats split")]
+    /// What the slot recorded at `claim`. Asserted by this module's own tests;
+    /// nothing on the hot path reads it, because task 8's re-send turned out to
+    /// be **positional** — a frame is copied back out of the outgoing ring
+    /// exactly as it was staged, so the re-send never has to know which of the
+    /// two kinds it is carrying.
+    #[allow(dead_code, reason = "recorded at claim; read only by this module's tests")]
     pub(crate) fn kind(&self, seq: u64) -> ReqKind {
         if self.slot(seq).kind.load(Ordering::Relaxed) == ReqKind::Query as u8 {
             ReqKind::Query
@@ -303,16 +308,29 @@ impl SlotTable {
         true
     }
 
-    #[allow(dead_code, reason = "task 8's re-send skips what is already on the wire")]
     pub(crate) fn is_sent(&self, seq: u64) -> bool {
         self.slot(seq).sent_seq.load(Ordering::Relaxed) == seq + 1
     }
 
-    pub(crate) fn set_not_before(&self, seq: u64, ns: u64) {
-        self.slot(seq).not_before_ns.store(ns, Ordering::Relaxed);
+    /// Hold `seq`'s frame back until `ns` — **only while the slot still
+    /// belongs to `seq`**. `false` = it does not any more, and nothing was
+    /// written.
+    ///
+    /// Gated for the same reason as [`SlotTable::mark_sent_if`], with a
+    /// different failure mode: an ungated store lands on whichever request has
+    /// since re-claimed the INDEX (every `slot_count()` seqs), and a backoff of
+    /// up to `MAX_RETRY_SLEEP` inherited by a brand-new request is a latency
+    /// defect nothing later corrects — the writer simply will not write it
+    /// until a delay somebody else was told to take has expired.
+    pub(crate) fn set_not_before_if(&self, seq: u64, ns: u64) -> bool {
+        let s = self.slot(seq);
+        if s.owner.load(Ordering::Acquire) != seq + 1 {
+            return false;
+        }
+        s.not_before_ns.store(ns, Ordering::Relaxed);
+        true
     }
 
-    #[allow(dead_code, reason = "task 8 honours a RETRY backoff through this")]
     pub(crate) fn not_before(&self, seq: u64) -> u64 {
         self.slot(seq).not_before_ns.load(Ordering::Relaxed)
     }
@@ -451,7 +469,7 @@ mod tests {
         assert!(t.is_sent(1));
         assert!(t.mark_sent_if(1, false));
         assert!(!t.is_sent(1), "a RETRY marks a slot unsent again");
-        t.set_not_before(1, 12_345);
+        assert!(t.set_not_before_if(1, 12_345), "a live slot takes the backoff");
         assert_eq!(t.not_before(1), 12_345);
         assert_eq!(t.bump_attempts_if(1), Some(1));
         assert_eq!(t.bump_attempts_if(1), Some(2));

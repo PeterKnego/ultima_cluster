@@ -74,8 +74,8 @@ use crate::conn::FramedConn;
 use crate::engine::{outcome_of, RemoteCompletion, RemoteConfig, RemoteStats};
 use crate::error::RemoteError;
 use crate::frame::{
-    encode_frame, FrameType, Header, Hello, HelloOk, HelloRefused, Leader, HELLO_REFUSED_BUSY,
-    HELLO_REFUSED_FAULTED, PROTOCOL_VERSION,
+    decode_header, encode_frame, FrameType, Header, Hello, HelloOk, HelloRefused, Leader,
+    HEADER_LEN, HELLO_REFUSED_BUSY, HELLO_REFUSED_FAULTED, PROTOCOL_VERSION,
 };
 use crate::outgoing::OutRing;
 use crate::slots::SlotTable;
@@ -94,12 +94,9 @@ const MAX_RETRY_SLEEP: Duration = Duration::from_secs(1);
 /// A `RETRY{retry_after_us: 0}` still backs off this much.
 const MIN_RETRY_SLEEP: Duration = Duration::from_micros(100);
 /// Backoff for a request an edge redirected to itself.
-#[allow(
-    dead_code,
-    reason = "task 8 applies this to a self-REDIRECT; the reader does not \
-              understand REDIRECT yet"
-)]
 const SELF_REDIRECT_BACKOFF: Duration = Duration::from_millis(10);
+/// The most bytes one re-send batch puts into a single `write_all_bytes`.
+const RESEND_BATCH_BYTES: usize = 64 * 1024;
 const RECONNECT_BACKOFF_START: Duration = Duration::from_millis(5);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
 /// Hops followed during one connect scan.
@@ -165,13 +162,10 @@ impl FlowWord {
 
 #[derive(Default)]
 pub(crate) struct StatCells {
-    #[allow(dead_code, reason = "task 8 counts REDIRECT frames here")]
     pub(crate) redirects: AtomicU64,
-    #[allow(dead_code, reason = "task 8 counts LEADER_CHANGED frames here")]
     pub(crate) leader_changes: AtomicU64,
     pub(crate) reconnects: AtomicU64,
     pub(crate) resends: AtomicU64,
-    #[allow(dead_code, reason = "task 8 counts honoured RETRY frames here")]
     pub(crate) retries: AtomicU64,
     #[allow(dead_code, reason = "task 9 counts UNKNOWN frames here")]
     pub(crate) unknown: AtomicU64,
@@ -250,15 +244,16 @@ pub(crate) struct Link {
     acked_seq: AtomicU64,
     /// The current connection has answered something only a serving edge can
     /// answer. Until then the writer sends ONE frame (probe-before-flush).
-    #[allow(
-        dead_code,
-        reason = "task 6's RESPONSE handler SETS this; task 8 is what reads it \
-                  (the probe-before-flush limit)"
-    )]
     proven: AtomicBool,
     /// The single seq written while unproven; `0` = none.
-    #[allow(dead_code, reason = "task 8 gates the flush on this")]
     probe_seq: AtomicU64,
+    /// **The writer's re-send scan starts here**: the lowest seq whose frame
+    /// bytes are still in the outgoing ring, published by the submitter's
+    /// `reclaim` (`engine.rs`). Everything below it has been released, so its
+    /// bytes may already have been overwritten and it can never be re-sent —
+    /// which is sound because `reclaim` stops at the oldest LIVE slot, so no
+    /// live request is ever below this floor. Monotone.
+    pub(crate) oldest_unreclaimed: AtomicU64,
     stats: StatCells,
     t0: Instant,
     closed: AtomicBool,
@@ -304,6 +299,7 @@ impl Link {
             acked_seq: AtomicU64::new(0),
             proven: AtomicBool::new(false),
             probe_seq: AtomicU64::new(0),
+            oldest_unreclaimed: AtomicU64::new(1),
             stats,
             t0: Instant::now(),
             closed: AtomicBool::new(false),
@@ -384,9 +380,10 @@ impl Link {
     /// atomic step because the two facts are one fact.
     #[allow(
         dead_code,
-        reason = "the redial gate reads `Reconnect::epoch` under the lock and each thread \
-                  carries its own stamp; this lock-free mirror is what the tests read, and \
-                  what task 8's window re-send stamps its frames against"
+        reason = "both threads carry their OWN stamp, taken under the `reconnect` lock at the \
+                  instant they were handed their half of the connection — task 8's re-send and \
+                  redial paths stamp their complaints with that, not with this. The lock-free \
+                  mirror is what the tests read"
     )]
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
@@ -584,20 +581,23 @@ impl Link {
         self.out.wake().signal();
     }
 
-    /// Ask the writer to write `seq`'s frame again, not before `delay`.
-    #[allow(
-        dead_code,
-        reason = "task 8's RETRY / self-REDIRECT handling is the caller; the \
-                  reader does not understand those frames yet"
-    )]
+    /// Ask the writer to write `seq`'s frame again **on this connection**, not
+    /// before `delay`. The transient-`RETRY` path, and the only one that
+    /// re-sends in place.
+    ///
+    /// Generation-gated at both stamps: a request answered (or swept) between
+    /// the frame that asked for the retransmit and this call must not have its
+    /// successor at the same index un-marked or held back. A refusal means
+    /// there is nothing left to re-send, and nothing is queued.
+    ///
+    /// Un-marking `sent` is also what re-opens the probe gate, so the re-send
+    /// this queues IS the next probe on an unproven connection — see
+    /// [`probe_gate_open`].
     pub(crate) fn queue_retransmit(&self, seq: u64, delay: Duration) {
-        // Generation-gated: a request answered (or swept) between the frame
-        // that asked for the retransmit and this call must not have its
-        // successor at the same index un-marked. `false` = there is nothing
-        // left to re-send, so the queue entry below is a no-op the writer
-        // skips.
-        self.slots.mark_sent_if(seq, false);
-        self.slots.set_not_before(seq, self.now_ns() + delay.as_nanos() as u64);
+        if !self.slots.mark_sent_if(seq, false) {
+            return;
+        }
+        self.slots.set_not_before_if(seq, self.now_ns() + delay.as_nanos() as u64);
         let mut g = self.retransmit.lock().unwrap();
         if !g.contains(&seq) {
             g.push(seq);
@@ -606,8 +606,31 @@ impl Link {
         self.out.wake().signal();
     }
 
+    /// Hold `seq` back for `delay` **without re-opening the probe gate and
+    /// without queueing anything** — the failover paths' half of
+    /// [`Link::queue_retransmit`].
+    ///
+    /// The difference is not a detail; it is what keeps a doomed connection
+    /// quiet. A `REDIRECT` or a `RETRY{NOT_SERVING}` says "this edge cannot
+    /// serve you", and the reader answers it by asking for a redial. If it
+    /// also cleared the `sent` stamp here, the probe gate would swing open for
+    /// the few microseconds before that request lands, and the writer — which
+    /// wakes on its own `WRITER_PARK` timer as well as on signals — could put
+    /// ANOTHER frame on the connection that just refused one. The frame the
+    /// redirect refused is un-marked by [`Writer::redial`]'s scan instead,
+    /// once there is a fresh connection to put it on; only the backoff is
+    /// recorded here, and it survives that scan because it lives in the slot.
+    fn hold_off(&self, seq: u64, delay: Duration) {
+        self.slots.set_not_before_if(seq, self.now_ns() + delay.as_nanos() as u64);
+    }
+
+    /// The leader the edge last named. `None` clears it (a `LEADER_CHANGED`
+    /// with no address: the cluster is mid-election and nobody is claiming it).
+    fn set_leader(&self, l: Option<(u32, String)>) {
+        *self.leader.lock().unwrap() = l;
+    }
+
     /// A backoff of `base` plus up to 25% jitter, floored and capped.
-    #[allow(dead_code, reason = "task 8 jitters the RETRY backoff with this")]
     pub(crate) fn jittered(&self, base: Duration) -> Duration {
         let base = base.clamp(MIN_RETRY_SLEEP, MAX_RETRY_SLEEP);
         let span = (base.as_micros() as u64 / 4).max(1);
@@ -758,9 +781,28 @@ impl Writer {
                     self.last_write = Instant::now();
                 }
             }
-            // 2) the ring drain: everything admissible in ONE write per
+            // 2) re-sends: frames that have been past `send_pos` once already
+            //    — a transient `RETRY`, or the whole live window a redial
+            //    rebuilt. Their bytes sit BELOW the ring's send cursor, so
+            //    they go out BEFORE the drain does: re-send order is part of
+            //    the contract (the edge's session dedup accepts a prefix), and
+            //    draining first would let a later seq overtake an earlier one
+            //    on the wire.
+            let (resent, still_queued) = self.write_resends();
+            if resent {
+                did_work = true;
+                self.last_write = Instant::now();
+            }
+            if self.link.redial_needed() {
+                continue;
+            }
+            // 3) the ring drain: everything admissible in ONE write per
             //    contiguous run (two only when a frame straddles the wrap).
-            if self.drain_ring() {
+            //    Held back entirely while ANY re-send is still queued — even
+            //    one that is only waiting out its backoff — for the ordering
+            //    reason above. That is the old `RemoteClient::pump`'s rule
+            //    ("stop rather than skip") expressed on the byte stream.
+            if !still_queued && self.drain_ring() {
                 did_work = true;
                 self.last_write = Instant::now();
             }
@@ -786,21 +828,124 @@ impl Writer {
             // 4) nothing to do: park on the ring's wake word. Read the seq
             //    BEFORE re-checking for work, so a signal that lands in
             //    between is not slept through.
+            //
+            // "Bytes are pending" is NOT on its own a reason to loop any
+            // more, and getting that wrong is a busy spin rather than a
+            // slowdown: while the probe gate is shut, or while a re-send is
+            // waiting out its backoff, the drain is deliberately writing
+            // nothing, so a loop that re-checked only `write_pos > send_pos`
+            // would burn a core until the answer arrived. Both conditions are
+            // resolved by another thread or by the clock, which is exactly
+            // what `WRITER_PARK` is sized for.
             let observed = self.link.out.wake().seq();
-            if self.link.out.write_pos() > self.link.out.send_pos()
-                || self.link.redial_needed()
-                || self.link.closed()
-            {
+            let drainable = self.link.out.write_pos() > self.link.out.send_pos()
+                && !still_queued
+                && probe_gate_open(&self.link);
+            if drainable || self.link.redial_needed() || self.link.closed() {
                 continue;
             }
             self.link.out.wake().park(observed, WRITER_PARK);
         }
     }
 
-    /// Write whatever the ring holds, one `write_all_bytes` per contiguous run
-    /// (two only when a frame straddles the wrap). Returns whether anything
-    /// went out. TASK 8 extends this with the probe-before-flush limit and the
-    /// retransmit queue; at this task it drains unconditionally.
+    /// Write the queued re-sends, in seq order. Returns
+    /// `(wrote anything, anything still queued)` — the second half is what
+    /// holds the byte drain back (see [`Writer::run`]).
+    ///
+    /// A re-send is a frame the ring has already streamed past, so it is
+    /// copied back out by extent rather than drained. Three rules, all of them
+    /// load-bearing:
+    ///
+    /// - **Only a LIVE slot is re-sent.** The extent words are advisory and a
+    ///   later occupant of the same INDEX overwrites them, so the offset is
+    ///   read through [`crate::slots::SlotTable::live_extent`], and liveness is
+    ///   re-checked AFTER the copy. That second check is not belt-and-braces:
+    ///   a seq is resolved at most once, so observing the SAME owner before
+    ///   and after proves the slot was never freed in between — and therefore
+    ///   that the submitter's `reclaim` (which stops at the oldest live slot)
+    ///   cannot have released those bytes for re-use under the copy.
+    /// - **A stamp that is refused skips the frame.** `mark_sent_if` answering
+    ///   `false` means the request was answered or swept under us; writing it
+    ///   anyway would be a re-send of something already resolved, and counting
+    ///   it would drift `resends` from what actually went out.
+    /// - **One frame while unproven.** The probe rule applies to a re-send
+    ///   exactly as it does to a first transmission — after a redial, every
+    ///   frame in the queue is a frame for an edge that has answered nothing
+    ///   yet.
+    ///
+    /// CONSUMER ROLE: `copy_range` is reachable only from here.
+    fn write_resends(&mut self) -> (bool, bool) {
+        let link = Arc::clone(&self.link);
+        let (due, mut still_queued) = take_due_resends(&link, link.now_ns());
+        if due.is_empty() {
+            return (false, still_queued);
+        }
+        let mut one = Vec::new();
+        self.scratch.clear();
+        let mut i = 0usize;
+        while i < due.len() {
+            let seq = due[i];
+            if !probe_gate_open(&link) {
+                // The probe is on the wire and unanswered: the rest of the
+                // queue waits for it.
+                break;
+            }
+            i += 1;
+            let Some((off, len)) = link.slots.live_extent(seq) else { continue };
+            link.out.copy_range(off, len, &mut one);
+            if !link.slots.is_live(seq) || !link.slots.mark_sent_if(seq, true) {
+                // Resolved under us between the extent read and here: the
+                // bytes just copied may already belong to a later request.
+                continue;
+            }
+            self.scratch.extend_from_slice(&one);
+            if link.slots.bump_attempts_if(seq).is_some_and(|n| n > 1) {
+                link.stats.resends.fetch_add(1, Ordering::Relaxed);
+            }
+            link.stats.frames_written.fetch_add(1, Ordering::Relaxed);
+            if !link.proven.load(Ordering::Acquire) {
+                link.probe_seq.store(seq, Ordering::Release);
+                break;
+            }
+            if self.scratch.len() >= RESEND_BATCH_BYTES {
+                break;
+            }
+        }
+        if i < due.len() {
+            // Whatever was not reached goes back. Dropping it would strand a
+            // live request until its deadline. The membership test is not
+            // decoration: the reader may have queued one of these very seqs
+            // (a RETRY answering the frame just written) while this batch was
+            // being built, and a duplicate would be written — and counted —
+            // twice. `take_due_resends` re-sorts, so order is restored there.
+            let mut g = link.retransmit.lock().unwrap();
+            for seq in &due[i..] {
+                if !g.contains(seq) {
+                    g.push(*seq);
+                }
+            }
+            still_queued = true;
+        }
+        if self.scratch.is_empty() {
+            return (false, still_queued);
+        }
+        if self.conn.write_all_bytes(&self.scratch).is_err() {
+            // The batch never reached the peer. The frames are marked sent,
+            // which would be a lie — but the redial this asks for re-scans
+            // every live slot and un-marks it, so the correction is exactly
+            // where the re-send order is rebuilt anyway.
+            self.link.request_redial(self.generation, None);
+            return (false, still_queued);
+        }
+        link.stats.socket_writes.fetch_add(1, Ordering::Relaxed);
+        (true, still_queued)
+    }
+
+    /// Write whatever the ring holds up to [`flush_limit`] — which is
+    /// everything on a proven connection and exactly ONE frame on an unproven
+    /// one (probe-before-flush) — with one `write_all_bytes` per contiguous
+    /// run (two only when a frame straddles the wrap). Returns whether
+    /// anything went out.
     ///
     /// CONSUMER ROLE: `peek_upto`/`consume` are reachable only from here.
     fn drain_ring(&mut self) -> bool {
@@ -964,13 +1109,69 @@ impl Writer {
                     link.probe_seq.store(0, Ordering::Release);
                     self.conn = fresh;
                     self.generation = generation;
-                    // The frame cursor is deliberately NOT reset: `send_pos`
-                    // never moves backwards, so it still names the first frame
-                    // this thread has not written, and every frame below it
-                    // has already been counted. TASK 8 inserts the ordered
-                    // resend of the live window here — it re-sends by extent
-                    // and then jumps `send_pos` forward, and it owns
-                    // re-pointing this cursor at the frame that follows.
+                    // THE ORDERED RE-SEND OF THE LIVE WINDOW.
+                    //
+                    // The slot table IS the unacked window: every seq that is
+                    // still live and whose bytes are still in the ring goes
+                    // out again, in seq order, through the same probe-gated
+                    // queue a `RETRY` uses — so a reconnect flushes ONE frame
+                    // first and waits for it, exactly as the old
+                    // `RemoteClient::pump` did.
+                    //
+                    // The scan keys on slot LIVENESS, never on `acked_seq`.
+                    // `acked_seq` is a `fetch_max` of what the edge last
+                    // advertised, and the edge advances it on SUBMIT only, so
+                    // "everything above `acked_seq`" would silently drop an
+                    // unanswered LOWER seq that an out-of-order completion had
+                    // jumped over — a lost request, reported as nothing at
+                    // all. A slot, by contrast, is live exactly while the
+                    // request it holds is unanswered. Re-sending one the edge
+                    // did answer is harmless by comparison: the edge's session
+                    // dedup (`Sessioned`) answers it REPLAYED.
+                    //
+                    // `next_seq` is read BEFORE `write_pos` because the
+                    // submitter publishes them in that order (`engine.rs`'s
+                    // `send`): a seq that appears below `last` but whose bytes
+                    // are not committed yet is left to the byte drain, which
+                    // is what the `off + len > snapshot` break marks. `commit`
+                    // publishes a whole frame at a time, so a frame is either
+                    // entirely below the snapshot or entirely above it.
+                    let last = link.slots.next_seq();
+                    let snapshot = link.out.write_pos();
+                    let mut requeue = Vec::new();
+                    // The first seq whose frame the byte drain still owns.
+                    let mut boundary = last;
+                    for seq in link.oldest_unreclaimed.load(Ordering::Acquire).max(1)..last {
+                        let Some((off, len)) = link.slots.live_extent(seq) else {
+                            // Answered, swept or aborted — nothing to re-send.
+                            // Its bytes (wherever they are) are the drain's
+                            // problem, not ours.
+                            continue;
+                        };
+                        if off + len as u64 > snapshot {
+                            boundary = seq;
+                            break;
+                        }
+                        link.slots.mark_sent_if(seq, false);
+                        requeue.push(seq);
+                    }
+                    {
+                        // A wholesale replacement, not an append: whatever the
+                        // dead connection had queued is a subset of this scan
+                        // (every entry was a live slot) and re-adding it would
+                        // only duplicate. The per-slot `not_before` a RETRY or
+                        // a self-REDIRECT set is untouched by this — it lives
+                        // in the slot, so the backoff survives the redial that
+                        // the very same frame asked for.
+                        let mut g = link.retransmit.lock().unwrap();
+                        g.clear();
+                        g.extend_from_slice(&requeue);
+                    }
+                    // Everything below the snapshot is now the queue's job, so
+                    // the byte drain resumes above it — and the frame cursor
+                    // moves with it, to the first frame the drain still owns.
+                    link.out.set_send_pos(snapshot);
+                    self.cursor = self.cursor.max(boundary);
                     g.read_half = Some((generation, read_half));
                     drop(g);
                     link.connected.store(true, Ordering::Release);
@@ -996,14 +1197,102 @@ impl Writer {
     }
 }
 
-/// How far into the ring the writer may flush, given the frame it is at.
+/// **May the writer send MORE than the single probe frame?**
 ///
-/// TASK 8 replaces the body with the probe-before-flush rule (while the
-/// connection is unproven, only ONE frame may go out, so a whole pipelined
-/// window is not spent on an edge that turns out to be redirecting). Here it
-/// is everything the submitter has committed.
-fn flush_limit(link: &Arc<Link>, _cursor: u64) -> u64 {
-    link.out.write_pos()
+/// On a connection that has answered nothing (`!proven`: fresh, reconnected or
+/// hopped) the writer puts exactly ONE request on the wire and waits. The
+/// reason is cost, not politeness: an edge that cannot serve answers EVERY
+/// submit with a `REDIRECT`, so flushing a window of N at the wrong member
+/// costs N redirect frames the client then throws away — thousands per
+/// election, measured in the M12c quickstart. A probe costs one frame and one
+/// round trip on a connection that is about to be replaced anyway.
+///
+/// A probe counts as outstanding only while it is **on the wire**: a
+/// `RETRY`/`UNKNOWN` answer marks its slot unsent again, and that re-send is
+/// the next probe. Testing "is there a probe seq" alone would wedge the
+/// connection there until the request timed out.
+fn probe_gate_open(link: &Arc<Link>) -> bool {
+    if link.proven.load(Ordering::Acquire) {
+        return true;
+    }
+    let p = link.probe_seq.load(Ordering::Acquire);
+    p == 0 || !(link.slots.is_live(p) && link.slots.is_sent(p))
+}
+
+/// How far into the ring the writer may flush, given the frame it is at.
+/// Everything committed on a proven connection; exactly one frame on an
+/// unproven one, and nothing at all while that one frame is unanswered (see
+/// [`probe_gate_open`]).
+///
+/// The one frame is measured from the **ring's own length prefix**, not from
+/// `cursor`'s slot extent. A request that was answered or swept while its
+/// bytes were still queued has no readable extent at all
+/// ([`crate::slots::SlotTable::live_extent`] answers `None` rather than a
+/// later occupant's offset), and the drain must still be able to step over its
+/// bytes — keying the limit on the slot would stall the writer for good on a
+/// frame nobody is waiting for. The header is copied out through `copy_range`
+/// so a frame straddling the wrap is read correctly.
+fn flush_limit(link: &Arc<Link>, cursor: u64) -> u64 {
+    let write_pos = link.out.write_pos();
+    if link.proven.load(Ordering::Acquire) {
+        return write_pos;
+    }
+    let send = link.out.send_pos();
+    if !probe_gate_open(link) {
+        return send;
+    }
+    if write_pos - send < HEADER_LEN as u64 {
+        // Not even a header committed yet: nothing to measure, nothing to send.
+        return send;
+    }
+    let mut hdr = Vec::with_capacity(HEADER_LEN);
+    link.out.copy_range(send, HEADER_LEN as u32, &mut hdr);
+    let Ok((_, payload_len)) = decode_header(&hdr) else {
+        // Unreachable: these are the bytes this client encoded itself. If it
+        // ever happens, the frame stream is corrupt and holding the drain
+        // back is the safest answer.
+        debug_assert!(false, "the outgoing ring holds a frame this client cannot decode");
+        return send;
+    };
+    if link.slots.is_live(cursor) {
+        // The frame at `send_pos` is `cursor`'s by construction (the writer's
+        // cursor is the first frame at or after it), so this names the request
+        // whose answer opens the gate again.
+        link.probe_seq.store(cursor, Ordering::Release);
+    }
+    (send + (HEADER_LEN + payload_len) as u64).min(write_pos)
+}
+
+/// Seqs due for a re-write, in seq order, plus whether anything is still
+/// queued behind them.
+///
+/// An entry whose backoff has not expired **stops the walk** rather than being
+/// skipped: re-send order is part of the contract, so a later seq must not
+/// overtake an earlier one. An entry whose slot is no longer live is dropped —
+/// it was answered, swept or aborted while it waited.
+fn take_due_resends(link: &Arc<Link>, now_ns: u64) -> (Vec<u64>, bool) {
+    let mut g = link.retransmit.lock().unwrap();
+    if g.is_empty() {
+        return (Vec::new(), false);
+    }
+    g.sort_unstable();
+    let mut due = Vec::new();
+    let mut taken = 0usize;
+    while taken < g.len() {
+        let seq = g[taken];
+        if link.slots.not_before(seq) > now_ns && link.slots.is_live(seq) {
+            break;
+        }
+        taken += 1;
+        // A dead slot is dropped rather than returned: answered, swept or
+        // aborted while it waited.
+        if link.slots.is_live(seq) {
+            due.push(seq);
+        }
+    }
+    g.drain(..taken);
+    let still_queued = !g.is_empty();
+    (due, still_queued)
 }
 
 /// Sleep `total` in [`SWEEP_INTERVAL`] slices so `close` is noticed promptly.
@@ -1150,9 +1439,10 @@ impl Reader {
         }
     }
 
-    /// TASK 8 adds REDIRECT / LEADER_CHANGED / RETRY, TASK 9 UNKNOWN and
-    /// HELLO_REFUSED. At this task the reader understands liveness, STATUS and
-    /// RESPONSE.
+    /// TASK 9 adds UNKNOWN and the mid-life HELLO_REFUSED. Everything else the
+    /// edge can say is here: liveness (PING/PONG), flow control (STATUS), the
+    /// one frame that resolves a request (RESPONSE), and the four failover
+    /// answers (RETRY, REDIRECT, LEADER_CHANGED).
     fn on_frame(&mut self, h: Header, payload: bytes::Bytes) -> Act {
         match h.ty {
             // The one frame that resolves a request. Order inside this arm is
@@ -1200,10 +1490,98 @@ impl Reader {
                 Act::Continue
             }
             FrameType::Status => {
-                if let Ok(s) = crate::frame::Status::decode(&payload) {
-                    credit_update(&self.link, self.generation, s.credits, s.acked_seq);
+                let Ok(s) = crate::frame::Status::decode(&payload) else { return Act::Continue };
+                // A STATUS that acknowledges the probe says what a RESPONSE
+                // would: this edge took our write. A bare idle STATUS, whose
+                // `acked_seq` is still below the probe, proves only that the
+                // edge is alive — which is not the question the probe asks.
+                let p = self.link.probe_seq.load(Ordering::Acquire);
+                if p != 0 && s.acked_seq >= p {
+                    self.link.proven.store(true, Ordering::Release);
                 }
+                credit_update(&self.link, self.generation, s.credits, s.acked_seq);
                 Act::Continue
+            }
+            FrameType::Retry => {
+                let Ok(r) = crate::frame::Retry::decode(&payload) else { return Act::Continue };
+                if r.reason == crate::frame::RETRY_PAYLOAD_TOO_LARGE {
+                    // Terminal: the payload will not get smaller by being sent
+                    // again, and no other member would take it either.
+                    if let crate::slots::Resolve::Won { user_data } = self.link.slots.resolve(h.seq)
+                    {
+                        let _ = self
+                            .link
+                            .complete(Record::simple(user_data, OutcomeTag::PayloadTooLarge), &[]);
+                    }
+                    return Act::Continue;
+                }
+                self.link.stats.retries.fetch_add(1, Ordering::Relaxed);
+                let delay = self.link.jittered(Duration::from_micros(r.retry_after_us as u64));
+                if r.reason == crate::frame::RETRY_NOT_SERVING {
+                    // A statement about the edge's ROLE, not a transient
+                    // shortage — and one that does not expire on this
+                    // connection: the edge LATCHES a connection it has refused
+                    // a write on (`uc2_gateway`'s `Conn::latch_not_serving`,
+                    // which is how the SUBMITs it accepts stay a prefix of
+                    // what was sent), so re-sending here would be refused for
+                    // as long as this socket lived, however quickly this
+                    // member became the leader. Go somewhere else; the backoff
+                    // still paces it, wherever we land.
+                    self.link.hold_off(h.seq, delay);
+                    let preferred = self
+                        .link
+                        .leader()
+                        .map(|(_, a)| a)
+                        .filter(|a| Some(a.as_str()) != self.link.connected_addr().as_deref());
+                    return Act::Reconnect(preferred);
+                }
+                // Transient (`SERVICE_UNAVAILABLE` / `INSTANCE_RESTART`): this
+                // edge is the right one, it is just not ready. Re-send in
+                // place once the hint has expired.
+                self.link.queue_retransmit(h.seq, delay);
+                Act::Continue
+            }
+            FrameType::Redirect => {
+                self.link.stats.redirects.fetch_add(1, Ordering::Relaxed);
+                let Ok(l) = Leader::decode(&payload) else { return Act::Continue };
+                if l.addr.is_empty() {
+                    // Refused, not answered, and no hint where to go. The
+                    // redial's own scan is what puts it back on the wire.
+                    self.link.hold_off(h.seq, Duration::ZERO);
+                    return Act::Reconnect(None);
+                }
+                self.link.set_leader(Some((l.node_id, l.addr.to_string())));
+                if Some(l.addr) == self.link.connected_addr().as_deref() {
+                    // "Elected but not serving": the edge redirects us to the
+                    // address we are already on. Re-sending in place cannot
+                    // work (the not-serving latch again), and a FRESH
+                    // connection to the same address is the thing that changes
+                    // the answer. The backoff is what stops that becoming a
+                    // spin: the loop then runs at the backoff's rate, not at
+                    // the frame rate.
+                    self.link.hold_off(h.seq, SELF_REDIRECT_BACKOFF);
+                    return Act::Reconnect(Some(l.addr.to_string()));
+                }
+                self.link.hold_off(h.seq, Duration::ZERO);
+                Act::Reconnect(Some(l.addr.to_string()))
+            }
+            FrameType::LeaderChanged => {
+                self.link.stats.leader_changes.fetch_add(1, Ordering::Relaxed);
+                let Ok(l) = Leader::decode(&payload) else { return Act::Continue };
+                if l.addr.is_empty() {
+                    // Mid-election: nobody is claiming it. Move, and let the
+                    // dial scan find whoever answers.
+                    self.link.set_leader(None);
+                    return Act::Reconnect(None);
+                }
+                self.link.set_leader(Some((l.node_id, l.addr.to_string())));
+                if Some(l.addr) == self.link.connected_addr().as_deref() {
+                    // Already on the new leader's edge: reconnecting would
+                    // only churn the in-flight window. This frame answers no
+                    // request, so nothing is held back either.
+                    return Act::Continue;
+                }
+                Act::Reconnect(Some(l.addr.to_string()))
             }
             FrameType::Ping => {
                 self.link.queue_control(

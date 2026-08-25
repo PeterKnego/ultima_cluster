@@ -599,6 +599,12 @@ impl RemoteSendHalf {
             seq += 1;
         }
         self.reclaim_seq.set(seq);
+        // The writer thread's re-send scan starts here: the oldest seq whose
+        // frame bytes are still in the ring. Below it there is nothing to
+        // re-send — a released byte may already have been overwritten — and
+        // nothing that NEEDS re-sending either, because this walk stopped at
+        // the oldest LIVE slot.
+        link.oldest_unreclaimed.store(seq, std::sync::atomic::Ordering::Release);
         let pos = if seq < next {
             // Everything below the oldest live request may go. A `None` here
             // means it resolved between the two reads — keep the previous
