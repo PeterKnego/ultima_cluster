@@ -40,19 +40,27 @@
 //! §4.2).
 //!
 //! A producer that only STALLED (not died) past `hole_timeout` can resume
-//! after its hole was skipped. Commit is a `compare_exchange` on the claim
-//! word, not an unconditional store, so if the ring has since lapped back
-//! around and a later claimant re-stamped that exact slot, the resumed
-//! producer's CAS fails and it gets [`RingError::Skipped`] rather than
-//! overwriting the later claimant's record. The one thing that CAS cannot
-//! catch: a resurrection mid-body-write, after the slot has moved on to a
-//! yet-later claimant without its commit word changing again in between —
-//! `decode_record_slice`'s crc32 surfaces that as a bad read, not a silent
-//! corruption, but does not prevent the write. See `MpscProducer::commit`'s
-//! doc for the full residual.
+//! after its hole was skipped. The consumer marks a skip with a
+//! `compare_exchange` from the exact claim word it observed to the skip
+//! marker `CLAIMED | LAP | 0` — the one write the otherwise read-only
+//! consumer ever makes into the slot region — instead of trusting its own
+//! bookkeeping; if the producer committed in the window between the
+//! consumer's timeout check and that CAS, the CAS fails harmlessly and the
+//! record is delivered normally, `holes_skipped` uncounted. If the marker
+//! lands first, the resumed producer's own commit CAS (expecting its claim
+//! word, not the marker) fails immediately and it gets
+//! [`RingError::Skipped`] — no lap required. The marker also closes the
+//! window a bare "later claimant re-stamped the slot" check would leave
+//! open across a lap; loss is signalled either way a resurrection can be
+//! caught. The one thing this does NOT catch: a resurrection mid-body-write,
+//! after the slot has moved on to a yet-later claimant without its commit
+//! word changing again in between — `decode_record_slice`'s crc32 surfaces
+//! that as a bad read, not a silent corruption, but does not prevent the
+//! write. See `MpscProducer::commit`'s doc for the full residual.
 //!
 //! The consumer reads with Relaxed loads on its own `consumer_position`
-//! (single reader) and never writes into the slot region at all.
+//! (single reader) and, other than the one skip-marker CAS above, never
+//! writes into the slot region at all.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -351,7 +359,13 @@ impl MpscProducer {
     /// Expecting our own claim word means: if it's still there, we own the
     /// slot and the commit lands normally; if it's gone, someone else now
     /// owns these bytes and we back off with `RingError::Skipped` instead of
-    /// touching them.
+    /// touching them. "Gone" covers two cases the consumer can leave behind:
+    /// the skip marker `CLAIMED | LAP | 0` (the consumer decided we timed
+    /// out and marked us BEFORE any lap), or a later claimant's own claim/
+    /// commit word (the consumer's marker CAS raced our resurrection and
+    /// lost, and the ring has since lapped back to this exact slot) — either
+    /// way the CAS fails and we learn `Skipped` rather than touching bytes
+    /// we no longer own.
     ///
     /// Residual that survives even this: the CAS only guards the FIRST word
     /// of the slot. A producer that resumes mid-body-write — after losing
@@ -436,24 +450,87 @@ impl MpscConsumer {
                         // spin, no burn — the caller polls or parks.
                         return Ok(None);
                     }
+                    // `advance` is data written by another process (spec
+                    // §4.2's whole premise), and the sibling `Committed` arm
+                    // below validates its own length field for exactly the
+                    // same reason: an unvalidated `advance` here could push
+                    // `consumer_position` past `claim_position` (a silently
+                    // dead ring reporting `Ok(None)` forever instead of
+                    // `Wedged`), misalign it (violating `load_commit_word`'s
+                    // documented alignment SAFETY contract on the very next
+                    // slot), or stall forever at `advance == 0`. The
+                    // `advance == 0` case is also the skip marker's own
+                    // shape (see below) — a marker word is only ever written
+                    // BEHIND `consumer_position`, so observing one AT
+                    // `consumer_position` is impossible by construction; this
+                    // same bounds check catches it as `Corrupt` too, in
+                    // defence of that invariant rather than trusting it.
+                    let bytes_to_tail = capacity - slot_offset;
+                    let max_record = align_record_size(self.inner.max_msg_size())
+                        .min(MPSC_MAX_RECORD_BYTES) as u32;
+                    if advance == 0
+                        || align_record_size(advance as usize) != advance as usize
+                        || advance as usize > bytes_to_tail
+                        || advance > max_record
+                    {
+                        return Err(RingError::Corrupt(format!(
+                            "claim word advance {advance} out of range at position \
+                             {consumer_pos} (tail {bytes_to_tail}, max {max_record})"
+                        )));
+                    }
+
                     // A claim not committed within `hole_timeout` is treated
                     // as abandoned — its producer is assumed dead (spec
-                    // §4.2) — and its sized range is skipped and released for
-                    // reuse. This is an assumption, not a certainty: a
+                    // §4.2). This is an assumption, not a certainty: a
                     // producer that was merely stalled (a major fault on the
-                    // mmap'd ring under memory pressure, VM steal, SIGSTOP,
-                    // a debugger) can resume after being skipped. Its commit
-                    // is a `compare_exchange` on the claim word (see
-                    // `MpscProducer::commit`), so once this slot has been
-                    // reclaimed and re-stamped by a later claimant — which
-                    // requires the ring to have lapped back around to this
-                    // exact offset — the resumed producer's CAS fails and it
-                    // gets `RingError::Skipped` instead of overwriting the
-                    // later claimant's bytes. The commit-word CAS does not
-                    // protect a mid-body-write resurrection past that point
-                    // (see `commit`'s doc for that residual).
-                    self.holes_skipped += 1;
+                    // mmap'd ring under memory pressure, VM steal, SIGSTOP, a
+                    // debugger) can resume anywhere from right now to well
+                    // after this. So skipping is not an unconditional store:
+                    // it's a `compare_exchange` from the EXACT word we just
+                    // observed to the skip marker `CLAIMED | LAP | 0` (spec
+                    // §4.1 amendment — the one write the otherwise
+                    // read-only consumer ever makes into the slot region).
+                    // If the producer committed in the window between our
+                    // timeout check and this CAS, the word has already
+                    // changed underneath us and the CAS fails harmlessly:
+                    // we do NOT skip, do NOT count it, and loop to
+                    // re-classify whatever is there now (normally
+                    // `Committed`, delivered like any other record). If the
+                    // CAS succeeds, the marker is what the producer's own
+                    // commit CAS (`MpscProducer::commit`) will find instead
+                    // of its claim word if it resumes later — so a
+                    // resurrection is refused (`RingError::Skipped`)
+                    // immediately, with no lap required, closing the window
+                    // the pre-marker design left open (only a LATER
+                    // claimant re-stamping the slot, which needs a full lap,
+                    // could detect it). This is deliberately NOT "CAS the
+                    // commit succeeded, then compare `consumer_position >
+                    // claim.pos`" — the consumer may have already delivered
+                    // this exact record, and reporting `Skipped` for a
+                    // DELIVERED record would let a caller retry and
+                    // double-apply it (controller ruling, fix round 1).
+                    let lap = lap_of(consumer_pos, capacity);
+                    let marker = encode_commit_word(lap, 0, true);
+                    // SAFETY: `slot_offset` is a mapped, 4-byte-aligned
+                    // address inside the slot region (validated above); the
+                    // CAS's `current` is the exact word we just Acquire-
+                    // loaded, so a losing CAS only means the word changed
+                    // concurrently, never that we mis-targeted memory.
+                    let cas = unsafe {
+                        cas_commit_word(
+                            self.inner.slot_region_mut(),
+                            slot_offset,
+                            word,
+                            marker,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                    };
                     self.hole = None;
+                    if cas.is_err() {
+                        continue;
+                    }
+                    self.holes_skipped += 1;
                     // Re-derive the header reference rather than reusing the
                     // outer `header` binding: `hole_elapsed` above takes
                     // `&mut self`, which the outer binding (borrowed from
@@ -1053,6 +1130,148 @@ mod tests {
         let rec = consumer.try_read(&mut buf).expect("read").expect("record");
         assert_eq!(rec.msg_type, 3);
         assert_eq!(&buf[..], b"still fine");
+    }
+
+    /// Fix round 1, finding 1: `advance` in a `Claimed` word is data written
+    /// by another process (spec §4.2's whole premise), and the skip path
+    /// must not act on it unvalidated: an oversized value would push
+    /// `consumer_position` past `claim_position` (a silently dead ring
+    /// reporting `Ok(None)` forever, no `Wedged`), and either an oversized
+    /// or misaligned value would misalign the NEXT `load_commit_word`,
+    /// violating its documented alignment SAFETY contract. Hand-plants a
+    /// claim word whose advance exceeds the ring's own capacity — the same
+    /// header-poking technique
+    /// `free_space_computation_does_not_underflow_on_stale_claim_snapshot`
+    /// and `an_unsized_hole_wedges_after_the_timeout` use.
+    #[test]
+    fn an_oversized_claim_advance_is_refused_not_desynced() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = MpscRing::create(tmp.path(), 128, 64).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+        consumer.set_hole_timeout(std::time::Duration::from_millis(0));
+
+        // SAFETY: exclusive access to a freshly created, unshared ring.
+        unsafe {
+            store_commit_word(
+                producer.inner.slot_region_mut(),
+                0,
+                encode_commit_word(0, 128 + 8, true), // advance > capacity
+                Ordering::Release,
+            );
+        }
+
+        let mut buf = Vec::new();
+        assert!(matches!(consumer.try_read(&mut buf), Ok(None)), "first poll starts the timer");
+        assert!(
+            matches!(consumer.try_read(&mut buf), Err(RingError::Corrupt(_))),
+            "an oversized advance is refused, not trusted"
+        );
+        assert_eq!(consumer.holes_skipped(), 0, "a refused corrupt word is not counted as skipped");
+        assert_eq!(
+            producer.inner.header().consumer_position.load(Ordering::Acquire),
+            0,
+            "consumer_position must not have moved past an unvalidated advance"
+        );
+    }
+
+    /// Fix round 1, finding 1 (second case): a claim word whose `advance` is
+    /// not a multiple of `RECORD_ALIGN` is refused for the same reason —
+    /// acting on it would misalign every subsequent `load_commit_word`.
+    #[test]
+    fn an_unaligned_claim_advance_is_refused_not_desynced() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = MpscRing::create(tmp.path(), 128, 64).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+        consumer.set_hole_timeout(std::time::Duration::from_millis(0));
+
+        // SAFETY: exclusive access to a freshly created, unshared ring.
+        unsafe {
+            store_commit_word(
+                producer.inner.slot_region_mut(),
+                0,
+                encode_commit_word(0, 13, true), // 13 is not a multiple of 8
+                Ordering::Release,
+            );
+        }
+
+        let mut buf = Vec::new();
+        assert!(matches!(consumer.try_read(&mut buf), Ok(None)));
+        assert!(matches!(consumer.try_read(&mut buf), Err(RingError::Corrupt(_))));
+        assert_eq!(consumer.holes_skipped(), 0);
+    }
+
+    /// Fix round 1, finding 2, race (i): the pre-lap case. A claims and
+    /// stalls; the consumer times out and skips the hole (marking the slot
+    /// with the skip marker `CLAIMED|LAP|0` via a CAS, not by trusting its
+    /// own bookkeeping) WITHOUT any lap ever happening. When A resumes and
+    /// tries to commit, its CAS finds the marker instead of its own claim
+    /// word and fails immediately — no lap required to detect the
+    /// resurrection, unlike the original (pre-fix-round-1) design where only
+    /// a later claimant re-stamping the slot could reveal it.
+    #[test]
+    fn a_skipped_producer_is_told_skipped_via_the_marker_before_any_lap() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = MpscRing::create(tmp.path(), 4096, 1024).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+        consumer.set_hole_timeout(std::time::Duration::from_millis(0));
+
+        let a = producer.claim_without_commit(1, 0, [0; 8], b"A").expect("A claims");
+
+        let mut buf = Vec::new();
+        assert!(matches!(consumer.try_read(&mut buf), Ok(None)), "starts the timer");
+        assert!(matches!(consumer.try_read(&mut buf), Ok(None)), "skips + marks the hole");
+        assert_eq!(consumer.holes_skipped(), 1);
+
+        // A resumes and tries to commit into a slot the consumer has already
+        // marked skipped. No lap has happened — this is the marker CAS
+        // catching it directly.
+        assert!(matches!(
+            producer.commit_claim(a),
+            Err(RingError::Skipped { position: 0 })
+        ));
+        assert_eq!(consumer.holes_skipped(), 1, "a refused resurrection is not a new hole");
+
+        // The ring keeps working: a fresh write lands past A's old slot and
+        // round-trips normally.
+        producer.try_write(2, 0, [0; 8], b"fine").expect("write");
+        let rec = consumer.try_read(&mut buf).expect("read").expect("record");
+        assert_eq!(rec.msg_type, 2);
+        assert_eq!(&buf[..], b"fine");
+    }
+
+    /// Fix round 1, finding 2, race (ii): the controller's ruling explicitly
+    /// forbids resolving the "did the consumer already pass this record"
+    /// question by comparing `claim.pos` against `consumer_position` after a
+    /// successful commit CAS — the consumer may have delivered A's own
+    /// record already, and reporting `Skipped` for a DELIVERED record would
+    /// let a caller retry and double-apply it. This test proves the actual
+    /// design doesn't do that: if A commits between the consumer's polls
+    /// (deterministically constructed: `commit_claim` is called after the
+    /// hole timeout has elapsed but before the consumer's next `try_read`),
+    /// the slot is simply `Committed` by the time the consumer looks again —
+    /// the `Claimed`/skip path is never entered, A is delivered normally,
+    /// and `holes_skipped` stays 0.
+    #[test]
+    fn a_producer_that_commits_between_polls_is_never_told_skipped() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = MpscRing::create(tmp.path(), 4096, 1024).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+        consumer.set_hole_timeout(std::time::Duration::from_millis(0));
+
+        let a = producer.claim_without_commit(1, 0, [0; 8], b"A").expect("A claims");
+
+        let mut buf = Vec::new();
+        // First poll starts (and, with a zero timeout, immediately elapses)
+        // the hole timer, but does not act yet.
+        assert!(matches!(consumer.try_read(&mut buf), Ok(None)));
+
+        // A wins the race: it commits before the consumer polls again.
+        producer.commit_claim(a).expect("A's commit is not refused");
+
+        let rec = consumer.try_read(&mut buf).expect("read").expect("A's record, delivered normally");
+        assert_eq!(rec.msg_type, 1);
+        assert_eq!(&buf[..], b"A");
+        assert_eq!(consumer.holes_skipped(), 0, "A was not skipped — it won the race");
     }
 
     #[test]
