@@ -353,6 +353,16 @@ pub enum RingError {
     /// the same death wedged every producer and the consumer silently.
     #[error("ingress ring wedged at position {position}: an unsized claim hole outlived the hole timeout")]
     Wedged { position: u64 },
+    /// Task 4's controller ruling on spec §4.2's residual: a producer that
+    /// merely STALLED past `hole_timeout` (rather than dying) can resume
+    /// after the consumer has already skipped its hole. Because commit is a
+    /// `compare_exchange` on the claim word (not an unconditional store), a
+    /// slot the consumer released and a later claimant re-stamped fails the
+    /// CAS instead of being silently overwritten out from under that later
+    /// claimant. `position` is the claim's start position — the caller has
+    /// nothing durable to retry; the record is simply lost.
+    #[error("producer at position {position} was skipped by the consumer before it could commit")]
+    Skipped { position: u64 },
 }
 
 /// Create — or RECREATE IN PLACE — the backing file for an mmap-shared IPC
@@ -860,6 +870,35 @@ pub unsafe fn store_commit_word(
 ) {
     let p = unsafe { slot_region.add(slot_offset) }.cast::<AtomicU32>();
     unsafe { (*p).store(word, ord) }
+}
+
+/// Compare-and-swap a slot's commit word: publish `new` only if the word is
+/// still `current`.
+///
+/// The producer's commit uses this — instead of an unconditional
+/// [`store_commit_word`] — to close the residual described on
+/// [`RingError::Skipped`]: if the consumer has timed out this claim's hole
+/// (spec §4.2) and a later producer has already re-stamped the slot with its
+/// own claim, `current` (the resurrected producer's OWN claim word) no
+/// longer matches what's there, the CAS fails, and the caller learns
+/// `Skipped` instead of overwriting the later claimant's in-flight record.
+///
+/// # Safety
+///
+/// Same as [`load_commit_word`]/[`store_commit_word`]: `slot_region +
+/// slot_offset` must be a mapped, 4-byte-aligned address inside the slot
+/// region, and the caller must (still, or formerly) own the claimed range.
+#[inline]
+pub unsafe fn cas_commit_word(
+    slot_region: *mut u8,
+    slot_offset: usize,
+    current: u32,
+    new: u32,
+    success: Ordering,
+    failure: Ordering,
+) -> Result<u32, u32> {
+    let p = unsafe { slot_region.add(slot_offset) }.cast::<AtomicU32>();
+    unsafe { (*p).compare_exchange(current, new, success, failure) }
 }
 
 /// Decode one record from `slot` — exactly the record's own bytes, commit
