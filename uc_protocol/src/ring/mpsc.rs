@@ -1,22 +1,46 @@
 //! Many-producer single-consumer ring buffer.
 //!
-//! Producers claim a slot range via `compare_exchange_weak` on
-//! `claim_position`, write the record bytes, then publish in claim order by
-//! spinning until `publish_position == my_slot_start` before advancing
-//! `publish_position` (Release). Consumers load `publish_position` with
-//! Acquire and read only fully-published records, so the post-wrap
-//! torn-record race the M3 design documented is eliminated.
+//! # Per-record commit (M13a, spec §4.1)
+//!
+//! A producer claims a byte range with `compare_exchange_weak` on
+//! `claim_position` (bounded by an Acquire load of `consumer_position`, so a
+//! claim only ever lands on a slot the consumer has finished with), stamps
+//! the slot's first word `CLAIMED | LAP | advance`, writes the record, then
+//! Release-stores `LAP | total`. **It waits for no other producer at any
+//! step.** The single consumer walks records in claim order and decides each
+//! slot from that one word: a foreign lap means nothing of ours is here yet,
+//! `CLAIMED` means head-of-line behind exactly that producer (no spin, no
+//! burn), and a committed word means read it.
+//!
+//! This replaces the pre-M13a protocol, where publication was serialized in
+//! claim order by an unbounded spin on `publish_position`. That convoyed as
+//! soon as producer threads outnumbered free cores: a producer preempted
+//! between its CAS and its publish stalled every producer behind it, and the
+//! spinners were what kept it off a core. Measured on the fleet: 1.9 M/s to
+//! ~5 k/s at 8 gateway connections on 8 vCPU, every core busy
+//! (`docs/notes/uc2-m13-mpsc-publish-convoy-explained.md`).
+//!
+//! `publish_position` keeps its name in [`RingHeader`] (SPSC and Broadcast
+//! still use it as a byte position) but on an MPSC file it is a
+//! **`commit_count`**: a monotonically increasing count of committed
+//! records, bumped once per commit purely so the futex wake word changes.
+//! Nothing reads it as a position. The MPSC file magic is
+//! [`RING_MPSC_MAGIC`](crate::magic::RING_MPSC_MAGIC) so an old-format file
+//! cannot be mapped by mistake.
+//!
+//! ## Producer death
+//!
+//! A producer that dies between claim and commit leaves a hole. It is no
+//! longer fatal to everyone else: the consumer stops at that one record,
+//! and after `hole_timeout` (default 1 s) it skips the claimed range,
+//! counts it in [`MpscConsumer::holes_skipped`] and carries on. The one
+//! unrecoverable case is a death inside the nanoseconds between the CAS and
+//! the claim-word store — the hole's length is then unknowable, and
+//! `try_read` returns [`RingError::Wedged`] rather than guessing (spec
+//! §4.2).
 //!
 //! The consumer reads with Relaxed loads on its own `consumer_position`
-//! (single reader).
-//!
-//! ## Producer-panic invariant
-//!
-//! Producers must not panic between claim and publish: a panicking
-//! producer leaves a claimed-but-unpublished slot, and every subsequent
-//! producer will spin forever waiting for that slot to publish. In our
-//! deployment model an in-process panic implies an unrecoverable node
-//! state and process restart; ride along with that assumption.
+//! (single reader) and never writes into the slot region at all.
 
 use std::cell::Cell;
 use std::path::Path;
@@ -26,16 +50,12 @@ use std::sync::atomic::Ordering;
 use memmap2::MmapMut;
 
 use crate::ring::common::{
-    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, ParkMode, RING_HEADER_LEN, RecordHeader,
-    RingError, RingHeader, RingWaitHandle, align_record_size, init_ring_header, try_read_record_at,
-    validate_ring_header, write_padding_marker_at, write_record_at,
+    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, MPSC_MAX_RECORD_BYTES, PADDING_MSG_TYPE, ParkMode,
+    RING_HEADER_LEN, RecordHeader, RingError, RingHeader, RingWaitHandle, SlotState,
+    align_record_size, classify_commit_word, decode_record_slice, encode_commit_word,
+    init_ring_header_with_magic, lap_of, load_commit_word, store_commit_word,
+    validate_ring_header_with_magic, write_padding_body_at, write_record_body_at,
 };
-
-/// Spins a producer burns waiting for its predecessor to publish before it
-/// starts yielding its core (see the comment at the wait site). ~100 spins
-/// is a few hundred nanoseconds — longer than a predecessor that is merely
-/// finishing its record write, far shorter than a scheduler quantum.
-const PUBLISH_SPINS_BEFORE_YIELD: u32 = 128;
 
 pub struct MpscInner {
     _mmap: MmapMut,
@@ -101,6 +121,36 @@ pub struct MpscConsumer {
     inner: Arc<MpscInner>,
     /// Wakeup mechanism; must match the producer's `mode` (see `MpscProducer::mode`).
     pub mode: ParkMode,
+    /// The position of the hole currently being timed, and when it was first
+    /// observed. `None` when the consumer is not stalled behind one.
+    hole: Option<(u64, std::time::Instant)>,
+    /// How long a hole must persist before the consumer skips it (or, for an
+    /// unsized hole, fail-stops). Spec §4.2's `hole_timeout`.
+    hole_timeout: std::time::Duration,
+    /// Cumulative count of dead-producer holes skipped.
+    holes_skipped: u64,
+}
+
+/// Default `hole_timeout` (spec §4.2). The slowest legitimate claim-to-commit
+/// is microseconds; a second is four orders of magnitude of headroom.
+pub const DEFAULT_HOLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A claimed, written, not-yet-committed record. Produced by
+/// [`MpscProducer::claim_without_commit`], consumed by
+/// [`MpscProducer::commit_claim`].
+///
+/// **Not API** (`#[doc(hidden)]`): it exists so tests and harnesses can
+/// reproduce a preempted or dead producer without killing a process — the
+/// state a `SIGKILL` between claim and commit leaves behind. `try_write` is
+/// exactly `claim` followed by `commit`, so the hook drives the production
+/// path, not a copy of it.
+#[doc(hidden)]
+#[derive(Debug)]
+#[must_use = "a claim that is never committed is a hole the consumer must time out"]
+pub struct PendingClaim {
+    pos: u64,
+    total: usize,
+    lap: u32,
 }
 
 impl MpscProducer {
@@ -111,12 +161,41 @@ impl MpscProducer {
         header_extra: [u8; 8],
         payload: &[u8],
     ) -> Result<(), RingError> {
+        let claim = self.claim(msg_type, flags, header_extra, payload)?;
+        self.commit(claim);
+        Ok(())
+    }
+
+    /// See [`PendingClaim`]. Test/harness hook.
+    #[doc(hidden)]
+    pub fn claim_without_commit(
+        &self,
+        msg_type: u16,
+        flags: u16,
+        header_extra: [u8; 8],
+        payload: &[u8],
+    ) -> Result<PendingClaim, RingError> {
+        self.claim(msg_type, flags, header_extra, payload)
+    }
+
+    /// See [`PendingClaim`]. Test/harness hook.
+    #[doc(hidden)]
+    pub fn commit_claim(&self, claim: PendingClaim) {
+        self.commit(claim)
+    }
+
+    /// Claim a slot and write the record into it, leaving the slot's word
+    /// CLAIMED. Returns without waiting for any other producer.
+    fn claim(
+        &self,
+        msg_type: u16,
+        flags: u16,
+        header_extra: [u8; 8],
+        payload: &[u8],
+    ) -> Result<PendingClaim, RingError> {
         let total = FRAME_HEADER_LEN + payload.len() + FRAME_TRAILER_LEN;
         if total > self.inner.max_msg_size() {
-            return Err(RingError::TooLarge {
-                len: total,
-                max: self.inner.max_msg_size(),
-            });
+            return Err(RingError::TooLarge { len: total, max: self.inner.max_msg_size() });
         }
         // Positions advance in RECORD_ALIGN-sized steps; the length field still
         // stores the unaligned `total` so the consumer can decode payload_len.
@@ -135,11 +214,7 @@ impl MpscProducer {
             // Total contiguous bytes this iteration must reserve: `advance`, or
             // — if the record straddles the tail — a padding marker filling
             // `bytes_to_tail` plus `advance` after the wrap.
-            let needed = if bytes_to_tail < advance {
-                bytes_to_tail + advance
-            } else {
-                advance
-            };
+            let needed = if bytes_to_tail < advance { bytes_to_tail + advance } else { advance };
 
             // Free space from the cached consumer position (a lower bound, so
             // `free` is under-estimated — safe). Only when the cache reports
@@ -177,12 +252,7 @@ impl MpscProducer {
 
             // If straddling tail, claim only the tail-bytes for a padding
             // marker this iteration, then retry the real record claim.
-            let claim_size = if bytes_to_tail < advance {
-                bytes_to_tail
-            } else {
-                advance
-            };
-
+            let claim_size = if bytes_to_tail < advance { bytes_to_tail } else { advance };
             let target_pos = claim_pos + claim_size as u64;
             if header
                 .claim_position
@@ -193,61 +263,83 @@ impl MpscProducer {
             }
 
             // CAS succeeded: we own `[slot_offset, slot_offset + claim_size)`.
+            let lap = lap_of(claim_pos, capacity);
+
             if claim_size != advance {
+                // Tail straddle. The padding marker has no body to write, so
+                // it is claimed, written and committed in one go; then loop
+                // to claim the real record after the wrap. No commit_count
+                // bump and no `signal`: padding carries nothing a parked
+                // consumer needs to wake for, and the real record's commit
+                // (one iteration later) does both.
+                //
                 // SAFETY: exclusive ownership of the claimed range;
                 // claim_size == bytes_to_tail >= RECORD_ALIGN >= 6.
                 unsafe {
-                    write_padding_marker_at(self.inner.slot_region_mut(), slot_offset, claim_size);
-                }
-            } else {
-                // SAFETY: exclusive ownership of the claimed range.
-                unsafe {
-                    write_record_at(
+                    store_commit_word(
                         self.inner.slot_region_mut(),
                         slot_offset,
-                        msg_type,
-                        flags,
-                        header_extra,
-                        payload,
-                        total,
+                        encode_commit_word(lap, claim_size as u32, true),
+                        Ordering::Relaxed,
+                    );
+                    write_padding_body_at(self.inner.slot_region_mut(), slot_offset);
+                    store_commit_word(
+                        self.inner.slot_region_mut(),
+                        slot_offset,
+                        encode_commit_word(lap, claim_size as u32, false),
+                        Ordering::Release,
                     );
                 }
-            }
-
-            // Publish in claim order: wait until our predecessor has
-            // advanced `publish_position` up to our slot start, then bump
-            // it to cover our claimed range. Consumers only read records
-            // whose bytes are below `publish_position`.
-            //
-            // M13 hop-bench finding (2026-08-24): a pure spin here CONVOYS as
-            // soon as producer threads outnumber free cores. A producer
-            // preempted between its CAS and this store stalls every
-            // producer behind it, and those spinning at 100% are what keep
-            // the preempted one off a core — on the fleet, 8 gateway
-            // connections on an 8-vCPU host dropped the ring from 1.9 M/s
-            // to ~5 k/s with every core busy. Bounded spin, then yield: the
-            // fast path (predecessor already published) is unchanged, and
-            // under oversubscription a waiter gives its core to the
-            // predecessor instead of fighting it. The structural fix —
-            // per-record commit with no cross-producer wait — is M13 work.
-            let mut spins: u32 = 0;
-            while header.publish_position.load(Ordering::Acquire) != claim_pos {
-                if spins < PUBLISH_SPINS_BEFORE_YIELD {
-                    spins += 1;
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-            }
-            header.publish_position.store(target_pos, Ordering::Release);
-
-            if claim_size != advance {
-                // Padding marker published; loop to claim the real record.
                 continue;
             }
-            header.signal(self.mode, false); // MPSC: single consumer -> wake one
-            return Ok(());
+
+            // Stamp the claim BEFORE writing the body: it is what lets a dead
+            // producer's hole be sized (spec §4.2). Relaxed is enough — the
+            // consumer that observes it only ever decides "not yet", and the
+            // commit's Release is what orders the body.
+            //
+            // SAFETY: exclusive ownership of the claimed range.
+            unsafe {
+                store_commit_word(
+                    self.inner.slot_region_mut(),
+                    slot_offset,
+                    encode_commit_word(lap, advance as u32, true),
+                    Ordering::Relaxed,
+                );
+                write_record_body_at(
+                    self.inner.slot_region_mut(),
+                    slot_offset,
+                    msg_type,
+                    flags,
+                    header_extra,
+                    payload,
+                );
+            }
+            return Ok(PendingClaim { pos: claim_pos, total, lap });
         }
+    }
+
+    /// Publish a claimed record: Release-store the commit word (which
+    /// synchronizes-with the consumer's Acquire load and makes every byte of
+    /// the record visible), bump the commit count (the futex wake word), and
+    /// wake a parked consumer. No producer is waited on.
+    fn commit(&self, claim: PendingClaim) {
+        let header = self.inner.header();
+        let slot_offset = (claim.pos as usize) & (self.inner.capacity() - 1);
+        // SAFETY: we have owned this range since the CAS; this store hands it
+        // to the consumer.
+        unsafe {
+            store_commit_word(
+                self.inner.slot_region_mut(),
+                slot_offset,
+                encode_commit_word(claim.lap, claim.total as u32, false),
+                Ordering::Release,
+            );
+        }
+        // `publish_position` reinterpreted as `commit_count` (module doc):
+        // the wake word must change on every commit.
+        header.publish_position.fetch_add(1, Ordering::Release);
+        header.signal(self.mode, false); // MPSC: single consumer -> wake one
     }
 }
 
@@ -264,30 +356,100 @@ impl MpscConsumer {
         loop {
             let header = self.inner.header();
             let capacity = self.inner.capacity();
-            let producer_pos = header.publish_position.load(Ordering::Acquire);
             let consumer_pos = header.consumer_position.load(Ordering::Relaxed);
-            if producer_pos == consumer_pos {
-                return Ok(None);
-            }
-
             let slot_offset = (consumer_pos as usize) & (capacity - 1);
-            // SAFETY: same as SPSC — slot offset within `[0, capacity)`, mmap
-            // outlives the borrow. `publish_position` advances only after
-            // record bytes are committed, so no torn-read on wrap.
-            let read =
-                unsafe { try_read_record_at(self.inner.slot_region(), slot_offset, payload_buf) }?;
-            let Some((rec, total_size)) = read else {
-                return Ok(None);
-            };
 
-            header
-                .consumer_position
-                .store(consumer_pos + total_size as u64, Ordering::Release);
+            // SAFETY: `slot_offset < capacity` and is RECORD_ALIGN-aligned, so
+            // the address is inside the mapping and 4-byte aligned.
+            let word = unsafe { load_commit_word(self.inner.slot_region(), slot_offset) };
 
-            if rec.msg_type == PADDING_MSG_TYPE {
-                continue;
+            match classify_commit_word(word, lap_of(consumer_pos, capacity)) {
+                SlotState::Empty => {
+                    // Nothing of ours here. Either the ring is genuinely
+                    // empty, or a producer has CAS-claimed this range and its
+                    // claim word has not landed yet (nanoseconds), or — the
+                    // §4.2 residual — it died in exactly that window.
+                    if header.claim_position.load(Ordering::Acquire) <= consumer_pos {
+                        self.hole = None;
+                        return Ok(None);
+                    }
+                    // NOTE: the clock is read only on this path and the
+                    // Claimed path. An empty ring (claim == consumer) is the
+                    // hot idle poll and never touches it.
+                    if self.hole_elapsed(consumer_pos) {
+                        return Err(RingError::Wedged { position: consumer_pos });
+                    }
+                    return Ok(None);
+                }
+                SlotState::Claimed { advance } => {
+                    if !self.hole_elapsed(consumer_pos) {
+                        // Head-of-line behind exactly this one producer. No
+                        // spin, no burn — the caller polls or parks.
+                        return Ok(None);
+                    }
+                    // Dead producer (spec §4.2): its claim is sized, so skip
+                    // it. The client that died never gets an answer — correct,
+                    // it is dead.
+                    self.holes_skipped += 1;
+                    self.hole = None;
+                    // Re-derive the header reference rather than reusing the
+                    // outer `header` binding: `hole_elapsed` above takes
+                    // `&mut self`, which the outer binding (borrowed from
+                    // `self.inner`) cannot stay live across.
+                    self.inner
+                        .header()
+                        .consumer_position
+                        .store(consumer_pos + advance as u64, Ordering::Release);
+                    continue;
+                }
+                SlotState::Committed { length } => {
+                    self.hole = None;
+                    let len = length as usize;
+                    let bytes_to_tail = capacity - slot_offset;
+                    let max_record = align_record_size(self.inner.max_msg_size())
+                        .min(MPSC_MAX_RECORD_BYTES);
+                    if len < 6 || len > bytes_to_tail || len > max_record {
+                        return Err(RingError::Corrupt(format!(
+                            "commit word length {len} out of range at position {consumer_pos} \
+                             (tail {bytes_to_tail}, max {max_record})"
+                        )));
+                    }
+                    // SAFETY: `[slot_offset, slot_offset + len)` is inside the
+                    // slot region (len <= bytes_to_tail) and is fully written
+                    // and stable: the Acquire load of the commit word above
+                    // synchronizes-with the producer's Release commit store,
+                    // made after the record bytes, and the bounded claim means
+                    // no producer can reclaim this range until we advance
+                    // `consumer_position` below.
+                    let slot = unsafe {
+                        std::slice::from_raw_parts(
+                            self.inner.slot_region().add(slot_offset),
+                            len,
+                        )
+                    };
+                    let (rec, advance) = decode_record_slice(slot, payload_buf)?;
+                    header
+                        .consumer_position
+                        .store(consumer_pos + advance as u64, Ordering::Release);
+                    if rec.msg_type == PADDING_MSG_TYPE {
+                        continue;
+                    }
+                    return Ok(Some(rec));
+                }
             }
-            return Ok(Some(rec));
+        }
+    }
+
+    /// First observation of a hole at `pos` starts its timer and reports
+    /// `false`; a later observation of the SAME position reports whether
+    /// `hole_timeout` has elapsed. Moving on clears the timer.
+    fn hole_elapsed(&mut self, pos: u64) -> bool {
+        match self.hole {
+            Some((p, since)) if p == pos => since.elapsed() >= self.hole_timeout,
+            _ => {
+                self.hole = Some((pos, std::time::Instant::now()));
+                false
+            }
         }
     }
 }
@@ -303,12 +465,23 @@ impl MpscRing {
                 "capacity_bytes must be power of two, got {capacity_bytes}"
             )));
         }
+        if align_record_size(max_msg_size as usize) > MPSC_MAX_RECORD_BYTES {
+            return Err(RingError::Corrupt(format!(
+                "max_msg_size {max_msg_size} exceeds the commit word's {MPSC_MAX_RECORD_BYTES}-byte length field"
+            )));
+        }
         let file_len = RING_HEADER_LEN + capacity_bytes as usize;
         // In-place recreate safe: never shrinks, zeros via punch-hole — see
         // `create_shared_backing_file` (the SIGBUS contract).
         let file = super::common::create_shared_backing_file(path, file_len as u64)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-        init_ring_header(&mut mmap[..], capacity_bytes, max_msg_size, 0)?;
+        init_ring_header_with_magic(
+            &mut mmap[..],
+            capacity_bytes,
+            max_msg_size,
+            0,
+            crate::magic::RING_MPSC_MAGIC,
+        )?;
         let base = mmap.as_mut_ptr();
         let inner = Arc::new(MpscInner {
             _mmap: mmap,
@@ -324,7 +497,7 @@ impl MpscRing {
             .write(true)
             .open(path)?;
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-        validate_ring_header(&mmap[..])?;
+        validate_ring_header_with_magic(&mmap[..], crate::magic::RING_MPSC_MAGIC)?;
         let file_len = mmap.len();
         let base = mmap.as_mut_ptr();
         let inner = Arc::new(MpscInner {
@@ -347,6 +520,9 @@ impl MpscRing {
             MpscConsumer {
                 inner: self.inner,
                 mode: ParkMode::default(),
+                hole: None,
+                hole_timeout: DEFAULT_HOLE_TIMEOUT,
+                holes_skipped: 0,
             },
         )
     }
@@ -355,9 +531,65 @@ impl MpscRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::common::MPSC_MAX_RECORD_BYTES;
+    use memmap2::MmapMut;
     use std::collections::HashSet;
     use std::thread;
     use tempfile::NamedTempFile;
+
+    /// M13a: an MPSC ring file written by a pre-M13a binary carries
+    /// `RING_MAGIC`, and its slots use the old "length, 0 = uncommitted"
+    /// word with publication ordered by `publish_position`. A new binary
+    /// that mapped it would misread every slot, so the attach is refused.
+    /// This is the whole reason the magic was bumped — the operator-visible
+    /// consequence is "restart node, service, gateway and clients on a host
+    /// together" (docs/how-to/upgrade-a-cluster.md).
+    #[test]
+    fn an_old_format_ring_file_is_refused_on_open() {
+        let tmp = NamedTempFile::new().unwrap();
+        // Build a file with the OLD magic, exactly as a pre-M13a
+        // `MpscRing::create` would have.
+        let file = crate::ring::common::create_shared_backing_file(
+            tmp.path(),
+            (RING_HEADER_LEN + 4096) as u64,
+        )
+        .unwrap();
+        let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+        crate::ring::common::init_ring_header_with_magic(
+            &mut mmap[..],
+            4096,
+            1024,
+            0,
+            crate::magic::RING_MAGIC,
+        )
+        .unwrap();
+        drop(mmap);
+
+        assert!(matches!(MpscRing::open(tmp.path()), Err(RingError::MagicMismatch)));
+
+        // And the reverse direction is covered too: a file this binary
+        // creates carries the new magic.
+        let fresh = NamedTempFile::new().unwrap();
+        MpscRing::create(fresh.path(), 4096, 1024).expect("create");
+        let bytes = std::fs::read(fresh.path()).unwrap();
+        assert_eq!(&bytes[..8], &crate::magic::RING_MPSC_MAGIC[..]);
+    }
+
+    /// M13a: the commit word's LENGTH field is 18 bits, so a ring whose
+    /// `max_msg_size` cannot be expressed is refused at creation rather than
+    /// silently truncating a length at runtime.
+    #[test]
+    fn create_refuses_a_max_msg_size_the_commit_word_cannot_hold() {
+        let tmp = NamedTempFile::new().unwrap();
+        let too_big = (MPSC_MAX_RECORD_BYTES + 1) as u32;
+        assert!(matches!(
+            MpscRing::create(tmp.path(), 1 << 20, too_big),
+            Err(RingError::Corrupt(_))
+        ));
+        // The real node's 64 KiB is comfortably inside the field.
+        let ok = NamedTempFile::new().unwrap();
+        MpscRing::create(ok.path(), 1 << 20, 64 << 10).expect("64 KiB max_msg_size is legal");
+    }
 
     #[test]
     fn single_producer_round_trip() {
@@ -519,10 +751,9 @@ mod tests {
         let (producer, _consumer) = ring.into_split();
 
         let header = producer.inner.header();
-        // "Claimed up to 120, all of it already published" — an
-        // invariant-respecting state on its own (publish == claim == 120).
         header.claim_position.store(120, Ordering::Release);
-        header.publish_position.store(120, Ordering::Release);
+        // `publish_position` is the commit COUNT on an MPSC file (M13a); the
+        // free-space arithmetic under test never reads it. Left at 0.
         // Force the shape the fix guards against: the (about to be
         // reloaded) real `consumer_position` sits AHEAD of the claim
         // snapshot this call will read. This is the deterministic proxy
