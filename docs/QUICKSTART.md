@@ -451,7 +451,7 @@ it, and refuses to publish anything if it does not print `PASS`.
 - **[The state-machine contract](/docs/reference/state-machine-contract.md)** —
   both tiers, `SnapshotStateMachine`, `OutputHandler`, and `Sessioned<S>`.
 - **[Client SDKs](/docs/reference/remote-protocol.md)** — the framed TCP
-  protocol a remote client speaks, and `RemoteClient`, the Rust
+  protocol a remote client speaks, and `RemoteEngine`/`RemoteClient`, the Rust
   implementation of it. On-host clients use `uc2_client`'s three tiers
   instead: `Engine`, `PipelinedClient` + `Ticket`, and the blocking `Client`
   shim.
