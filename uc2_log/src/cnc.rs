@@ -17,6 +17,7 @@
 //! crate boundary.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use uc_protocol::v2::cnc::{
@@ -518,38 +519,53 @@ impl CncPage {
     /// ring — see `CNC_OFF_INGRESS_HOLES_SKIPPED`'s doc. The query ring is
     /// counted separately by [`Self::query_holes_skipped`]; the two are not
     /// summed.
+    ///
+    /// # Why a bare `AtomicU64` and not `PaddedAtomicU64`
+    ///
+    /// These two counters SHARE one 64-byte line (3968 and 3976) — legitimate
+    /// because they have the same single writer, the consensus agent's
+    /// `publish_ring_holes`. `PaddedAtomicU64` cannot express that: it is
+    /// `repr(C, align(64))` and 64 bytes wide, so a reference to one at 3976
+    /// would be MISALIGNED (3976 % 64 == 8, instant UB), and a reference to
+    /// one at 3968 would span the query counter as its non-atomic `_pad`
+    /// bytes — making every concurrent store to 3976 a data race on that
+    /// padding in the abstract machine. A bare `AtomicU64` at each 8-byte-
+    /// aligned offset has neither problem, and the cache-line isolation from
+    /// every OTHER field is still provided by the offsets themselves.
     pub fn ingress_holes_skipped(&self) -> u64 {
-        // SAFETY: offset 3968, size 8.
+        // SAFETY: offset 3968, size 8, 8-byte aligned (3968 % 8 == 0) inside
+        // the mapped page; the page base is at least 64-byte aligned.
         let ptr =
-            unsafe { self.region.ptr_at(CNC_OFF_INGRESS_HOLES_SKIPPED) as *const PaddedAtomicU64 };
-        unsafe { (*ptr).load_acquire() }
+            unsafe { self.region.ptr_at(CNC_OFF_INGRESS_HOLES_SKIPPED) as *const AtomicU64 };
+        unsafe { (*ptr).load(Ordering::Acquire) }
     }
 
     /// M13a: store the ingress ring's skipped-hole count. Writer: the
     /// consensus agent, on change only.
     pub fn store_ingress_holes_skipped(&self, v: u64) {
-        // SAFETY: offset 3968, size 8.
+        // SAFETY: offset 3968, size 8, 8-byte aligned. See the getter.
         let ptr =
-            unsafe { self.region.ptr_at(CNC_OFF_INGRESS_HOLES_SKIPPED) as *const PaddedAtomicU64 };
-        unsafe { (*ptr).store_release(v) }
+            unsafe { self.region.ptr_at(CNC_OFF_INGRESS_HOLES_SKIPPED) as *const AtomicU64 };
+        unsafe { (*ptr).store(v, Ordering::Release) }
     }
 
     /// M13a (final review): cumulative abandoned-claim holes skipped on the
-    /// **query** ring — see `CNC_OFF_QUERY_HOLES_SKIPPED`'s doc.
+    /// **query** ring — see `CNC_OFF_QUERY_HOLES_SKIPPED`'s doc. Shares the
+    /// ingress counter's 64-byte line as its second u64; see
+    /// [`Self::ingress_holes_skipped`] for why that is sound and why neither
+    /// uses `PaddedAtomicU64`.
     pub fn query_holes_skipped(&self) -> u64 {
-        // SAFETY: offset 4032, size 8.
-        let ptr =
-            unsafe { self.region.ptr_at(CNC_OFF_QUERY_HOLES_SKIPPED) as *const PaddedAtomicU64 };
-        unsafe { (*ptr).load_acquire() }
+        // SAFETY: offset 3976, size 8, 8-byte aligned (3976 % 8 == 0).
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_QUERY_HOLES_SKIPPED) as *const AtomicU64 };
+        unsafe { (*ptr).load(Ordering::Acquire) }
     }
 
     /// M13a (final review): store the query ring's skipped-hole count.
     /// Writer: the consensus agent, on change only.
     pub fn store_query_holes_skipped(&self, v: u64) {
-        // SAFETY: offset 4032, size 8.
-        let ptr =
-            unsafe { self.region.ptr_at(CNC_OFF_QUERY_HOLES_SKIPPED) as *const PaddedAtomicU64 };
-        unsafe { (*ptr).store_release(v) }
+        // SAFETY: offset 3976, size 8, 8-byte aligned. See the getter.
+        let ptr = unsafe { self.region.ptr_at(CNC_OFF_QUERY_HOLES_SKIPPED) as *const AtomicU64 };
+        unsafe { (*ptr).store(v, Ordering::Release) }
     }
 
     /// M7: config pending (1 = uncommitted, 0 = stable).
@@ -871,9 +887,12 @@ mod tests {
         assert_eq!(CNC_OFF_FREE_DISK_BYTES, 3840);
         // M13a: ingress_holes_skipped.
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED, 3968);
-        // M13a (final review): query_holes_skipped — the page's last line.
-        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED, 4032);
-        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED + 64, CNC_PAGE_LEN);
+        // M13a (final review): query_holes_skipped is the SECOND u64 of
+        // ingress's line (one writer for both), so 4032..4096 stays free.
+        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED, 3976);
+        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED - CNC_OFF_INGRESS_HOLES_SKIPPED, 8);
+        assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64, 4032);
+        const { assert!(CNC_OFF_INGRESS_HOLES_SKIPPED + 64 <= CNC_PAGE_LEN) };
     }
 
     #[test]
@@ -1178,9 +1197,9 @@ mod tests {
         assert_eq!(page.query_holes_skipped(), 7, "the query line is untouched");
         let raw = page.page();
         assert_eq!(
-            u64::from_le_bytes(raw[4032..4040].try_into().unwrap()),
+            u64::from_le_bytes(raw[3976..3984].try_into().unwrap()),
             7,
-            "offset pin: the value must live at 4032 exactly"
+            "offset pin: the value must live at 3976 exactly"
         );
     }
 
