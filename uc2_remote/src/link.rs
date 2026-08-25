@@ -520,7 +520,12 @@ impl Link {
                   reader does not understand those frames yet"
     )]
     pub(crate) fn queue_retransmit(&self, seq: u64, delay: Duration) {
-        self.slots.mark_sent(seq, false);
+        // Generation-gated: a request answered (or swept) between the frame
+        // that asked for the retransmit and this call must not have its
+        // successor at the same index un-marked. `false` = there is nothing
+        // left to re-send, so the queue entry below is a no-op the writer
+        // skips.
+        self.slots.mark_sent_if(seq, false);
         self.slots.set_not_before(seq, self.now_ns() + delay.as_nanos() as u64);
         let mut g = self.retransmit.lock().unwrap();
         if !g.contains(&seq) {
@@ -779,11 +784,18 @@ impl Writer {
                 if off + len as u64 > sent_to {
                     break;
                 }
-                self.link.slots.mark_sent(self.cursor, true);
+                // Both stamps are generation-gated (and generation-tagged) —
+                // the request can be answered and its index re-claimed by
+                // `cursor + slot_count()` between the `live_extent` above and
+                // these two calls, and stamping "sent" onto a fresh request
+                // that has NOT been written is exactly what task 8's re-send
+                // would then skip. A refusal here means the request resolved
+                // under us, which needs no bookkeeping at all.
+                self.link.slots.mark_sent_if(self.cursor, true);
                 // A frame written more than once is a re-send by definition;
                 // TASK 8 is what creates them, and this is where they are
                 // counted so the counter cannot drift from what was written.
-                if self.link.slots.bump_attempts(self.cursor) > 1 {
+                if self.link.slots.bump_attempts_if(self.cursor).is_some_and(|n| n > 1) {
                     self.link.stats.resends.fetch_add(1, Ordering::Relaxed);
                 }
             }

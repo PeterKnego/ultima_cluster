@@ -19,17 +19,22 @@
 //! 4. The seq is assigned by the submitter (gap-free, from 1) and is a full
 //!    `u64` on this wire, so a stale generation is caught by the exact
 //!    `owner == seq + 1` test — no truncation argument needed.
-//! 5. `off`/`len`, `kind`, `sent`, `not_before_ns` and `attempts` are written
-//!    by the submitter before publish and thereafter by the writer/reader
-//!    threads; they are advisory (they steer the writer), never the
-//!    completion protocol, so `Relaxed` is correct for them.
-//! 6. **Advisory does not mean readable at any time.** Those words belong to
-//!    the generation that wrote them, and the next occupant of the same INDEX
-//!    overwrites them — so reading them for a seq that has been resolved
-//!    yields a different request's values. [`SlotTable::live_extent`] is
-//!    therefore generation-gated and answers `None` rather than stale; every
-//!    other advisory reader is called only for a seq the caller is holding
-//!    live.
+//! 5. `off`/`len`, `kind`, `sent_seq`, `not_before_ns` and `attempts` are
+//!    written by the submitter before publish and thereafter by the
+//!    writer/reader threads; they are advisory (they steer the writer), never
+//!    the completion protocol, so `Relaxed` is correct for them.
+//! 6. **Advisory does not mean reachable at any time, in either direction.**
+//!    Those words belong to the generation that wrote them and the next
+//!    occupant of the same INDEX reuses them, so a seq that has been resolved
+//!    must neither be read from nor written to. Nobody outside this file
+//!    "holds a seq live": a caller can only ever have *observed* it live a
+//!    moment ago, and be preempted before it acts. So the accessors carry the
+//!    check themselves — [`SlotTable::live_extent`] answers `None` rather than
+//!    stale, and [`SlotTable::mark_sent_if`] / [`SlotTable::bump_attempts_if`]
+//!    refuse rather than stamp. Both stamps additionally tag their VALUE with
+//!    the generation, so even a store that slips through the gate's own
+//!    window is read as "not mine" by the next occupant instead of being
+//!    inherited.
 //!
 //! Task 5 gave this table its first real callers — the link's deadline sweep,
 //! its shutdown drain and its retransmit bookkeeping. Task 6 gave it the
@@ -62,9 +67,14 @@ struct Slot {
     not_before_ns: AtomicU64,
     off: AtomicU64,
     len: AtomicU32,
-    attempts: AtomicU32,
+    /// Generation-tagged attempt counter: `(seq + 1) << 32 | count`, `0` when
+    /// it belongs to nobody. See the note on [`SlotTable::bump_attempts_if`]
+    /// for why the tag is part of the value rather than a separate check.
+    attempts: AtomicU64,
     kind: AtomicU8,
-    sent: AtomicU8,
+    /// `seq + 1` once this request's frame has been written, `0` otherwise —
+    /// a generation tag rather than a flag, for the same reason.
+    sent_seq: AtomicU64,
 }
 
 pub(crate) struct SlotTable {
@@ -90,9 +100,9 @@ impl SlotTable {
                 not_before_ns: AtomicU64::new(0),
                 off: AtomicU64::new(0),
                 len: AtomicU32::new(0),
-                attempts: AtomicU32::new(0),
+                attempts: AtomicU64::new(0),
                 kind: AtomicU8::new(0),
-                sent: AtomicU8::new(0),
+                sent_seq: AtomicU64::new(0),
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -140,7 +150,7 @@ impl SlotTable {
         s.len.store(len, Ordering::Relaxed);
         s.attempts.store(0, Ordering::Relaxed);
         s.kind.store(kind as u8, Ordering::Relaxed);
-        s.sent.store(0, Ordering::Relaxed);
+        s.sent_seq.store(0, Ordering::Relaxed);
         s.owner.store(seq + 1, Ordering::Release);
         true
     }
@@ -270,13 +280,32 @@ impl SlotTable {
         }
     }
 
-    pub(crate) fn mark_sent(&self, seq: u64, sent: bool) {
-        self.slot(seq).sent.store(u8::from(sent), Ordering::Relaxed);
+    /// Record whether `seq`'s frame is on the wire — **only while the slot
+    /// still belongs to `seq`**. `false` = it does not any more, and nothing
+    /// was written.
+    ///
+    /// Two layers, because one is not enough. The gate refuses the common
+    /// case (the caller is stamping a seq that has since been answered), but
+    /// a caller that observed the slot live a moment ago can still be
+    /// preempted between the check and the store, and by the time it lands
+    /// the index may belong to `seq + slot_count()`. So the VALUE carries the
+    /// generation too: a stray store writes the OLD `seq + 1`, and
+    /// [`SlotTable::is_sent`] compares against the CURRENT seq, so the new
+    /// occupant reads `false`. The dangerous direction — a never-written
+    /// frame that task 8's re-send skips as "already on the wire" — is
+    /// therefore closed by construction, not by timing.
+    pub(crate) fn mark_sent_if(&self, seq: u64, sent: bool) -> bool {
+        let s = self.slot(seq);
+        if s.owner.load(Ordering::Acquire) != seq + 1 {
+            return false;
+        }
+        s.sent_seq.store(if sent { seq + 1 } else { 0 }, Ordering::Relaxed);
+        true
     }
 
     #[allow(dead_code, reason = "task 8's re-send skips what is already on the wire")]
     pub(crate) fn is_sent(&self, seq: u64) -> bool {
-        self.slot(seq).sent.load(Ordering::Relaxed) != 0
+        self.slot(seq).sent_seq.load(Ordering::Relaxed) == seq + 1
     }
 
     pub(crate) fn set_not_before(&self, seq: u64, ns: u64) {
@@ -288,8 +317,43 @@ impl SlotTable {
         self.slot(seq).not_before_ns.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn bump_attempts(&self, seq: u64) -> u32 {
-        self.slot(seq).attempts.fetch_add(1, Ordering::Relaxed) + 1
+    /// Count one write of `seq`'s frame and report the new total — **only
+    /// while the slot still belongs to `seq`**. `None` = it does not any
+    /// more, and nothing was counted.
+    ///
+    /// Same two layers as [`SlotTable::mark_sent_if`], and the counter is
+    /// tagged for the same reason: `(seq + 1) << 32 | count`. A stray bump
+    /// that lands after the index has been re-claimed writes the OLD tag, and
+    /// the new occupant's first real bump sees a tag that is not its own and
+    /// starts from 1 — so an inherited count can never make a first
+    /// transmission look like a re-send.
+    pub(crate) fn bump_attempts_if(&self, seq: u64) -> Option<u32> {
+        let s = self.slot(seq);
+        if s.owner.load(Ordering::Acquire) != seq + 1 {
+            return None;
+        }
+        // The tag is the low 32 bits of the generation. Two seqs can only
+        // share a tag AND an index if they are 2^32 apart, and the window a
+        // stray bump has to survive is the few instructions between the gate
+        // above and the store below — not 2^32 requests. The full-width check
+        // is the `owner` gate; this is only what makes a LOST race harmless.
+        let tag = ((seq + 1) & 0xFFFF_FFFF) << 32;
+        let mut cur = s.attempts.load(Ordering::Relaxed);
+        loop {
+            // A value carrying anyone else's tag (or none) counts as zero for
+            // this generation.
+            let count = if cur & 0xFFFF_FFFF_0000_0000 == tag { cur & 0xFFFF_FFFF } else { 0 };
+            let next = tag | (count + 1).min(0xFFFF_FFFF);
+            match s.attempts.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some((next & 0xFFFF_FFFF) as u32),
+                Err(actual) => cur = actual,
+            }
+        }
     }
 
     pub(crate) fn inflight(&self) -> u64 {
@@ -383,14 +447,77 @@ mod tests {
         assert_eq!(t.live_extent(1), Some((4096, 120)));
         assert_eq!(t.kind(1), ReqKind::Query);
         assert!(!t.is_sent(1), "a fresh slot has not been written yet");
-        t.mark_sent(1, true);
+        assert!(t.mark_sent_if(1, true), "a live slot takes the stamp");
         assert!(t.is_sent(1));
-        t.mark_sent(1, false);
+        assert!(t.mark_sent_if(1, false));
         assert!(!t.is_sent(1), "a RETRY marks a slot unsent again");
         t.set_not_before(1, 12_345);
         assert_eq!(t.not_before(1), 12_345);
-        assert_eq!(t.bump_attempts(1), 1);
-        assert_eq!(t.bump_attempts(1), 2);
+        assert_eq!(t.bump_attempts_if(1), Some(1));
+        assert_eq!(t.bump_attempts_if(1), Some(2));
+    }
+
+    /// The hazard `live_extent` closed for READS, closed for WRITES: the
+    /// writer thread observes a slot live, is preempted, and by the time it
+    /// stamps `sent`/`attempts` the request has been answered and the INDEX
+    /// re-claimed by a seq a table-length later. Stamping the old seq must
+    /// leave the new occupant completely alone — otherwise task 8's re-send
+    /// skips a frame that was never written ("already on the wire") and the
+    /// request is lost.
+    #[test]
+    fn a_stamp_for_a_resolved_seq_never_touches_the_slots_new_occupant() {
+        let t = table();
+        let old = 1u64;
+        let new = old + t.slot_count() as u64; // same physical index
+
+        assert!(t.claim(old, 0xA1, ReqKind::Submit, u64::MAX, 0, 64));
+        assert!(t.mark_sent_if(old, true));
+        assert_eq!(t.bump_attempts_if(old), Some(1));
+        assert_eq!(t.resolve(old), Resolve::Won { user_data: 0xA1 });
+        assert!(t.claim(new, 0xA2, ReqKind::Submit, u64::MAX, 4096, 64));
+
+        // The gate: a stamp naming the resolved seq is refused outright.
+        assert!(!t.mark_sent_if(old, true), "a resolved seq must not take a stamp");
+        assert!(!t.mark_sent_if(old, false), "…in either direction");
+        assert_eq!(t.bump_attempts_if(old), None, "a resolved seq must not be counted");
+
+        // The new occupant is untouched: not sent, and its first real write is
+        // attempt 1 — never an inherited count that would read as a re-send.
+        assert!(!t.is_sent(new), "the new occupant must not inherit `sent`");
+        assert_eq!(t.bump_attempts_if(new), Some(1), "the new occupant starts at 1");
+        assert_eq!(t.live_extent(new), Some((4096, 64)), "and its extent is its own");
+    }
+
+    /// The residual race the gate alone cannot close: a stamp passes the gate
+    /// while the slot is live, is preempted, and its store lands only after
+    /// the request was answered and the index re-claimed. No API can express
+    /// that ordering from outside, so the stray store is written directly —
+    /// which is precisely the state such a thread leaves behind.
+    ///
+    /// The value is generation-tagged, so the new occupant reads "not mine":
+    /// not sent, and its first real write is attempt 1.
+    #[test]
+    fn a_stamp_that_lands_after_a_re_claim_is_read_as_not_mine() {
+        let t = table();
+        let old = 1u64;
+        let new = old + t.slot_count() as u64;
+
+        assert!(t.claim(old, 0xB1, ReqKind::Submit, u64::MAX, 0, 64));
+        assert_eq!(t.resolve(old), Resolve::Won { user_data: 0xB1 });
+        assert!(t.claim(new, 0xB2, ReqKind::Submit, u64::MAX, 4096, 64));
+
+        // A writer thread that observed `old` live, then stalled: its stores
+        // land here, on a slot that now belongs to `new`.
+        let s = t.slot(old);
+        s.sent_seq.store(old + 1, Ordering::Relaxed);
+        s.attempts.store((((old + 1) & 0xFFFF_FFFF) << 32) | 7, Ordering::Relaxed);
+
+        assert!(!t.is_sent(new), "a stray stamp must not read as sent for the new occupant");
+        assert_eq!(t.bump_attempts_if(new), Some(1), "nor may its count be inherited");
+        // …and the new occupant's own stamps still work, over the top of it.
+        assert!(t.mark_sent_if(new, true));
+        assert!(t.is_sent(new));
+        assert_eq!(t.bump_attempts_if(new), Some(2));
     }
 
     #[test]
