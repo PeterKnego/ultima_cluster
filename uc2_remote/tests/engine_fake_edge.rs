@@ -9,16 +9,53 @@
 
 mod common;
 
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::{Duration, Instant};
 
 use common::fake_edge::{Behaviour, FakeEdge};
-use uc2_remote::{RemoteConfig, RemoteEngine};
+use uc2_remote::{Consistency, RemoteConfig, RemoteEngine, RemoteOutcome, SubmitError};
 
 const APP: &str = "fakeapp";
 const WAIT: Duration = Duration::from_secs(10);
 
 fn cfg(members: Vec<String>) -> RemoteConfig {
     RemoteConfig { app_id: APP.into(), members, ..Default::default() }
+}
+
+/// Drive `n` requests through the halves, returning `(user_data, position,
+/// body, replayed)` in completion order. Panics on any non-`Response`
+/// outcome, so a test that expects responses says so once, here.
+///
+/// The `Backpressure` arm is the wait strategy this crate's contract asks
+/// for: a refusal is not an error, it is "the window is full — come back".
+/// A caller with nothing else to do yields (here) or parks on
+/// [`uc2_remote::RemoteWaitHandle`]; a bare spin is never right.
+fn run_submits(
+    send: &uc2_remote::RemoteSendHalf,
+    poll: &mut uc2_remote::RemotePollHalf,
+    n: u64,
+    payload: impl Fn(u64) -> Vec<u8>,
+) -> Vec<(u64, u64, Vec<u8>, bool)> {
+    let mut got = Vec::new();
+    let mut issued = 0u64;
+    let deadline = Instant::now() + WAIT;
+    while (got.len() as u64) < n && Instant::now() < deadline {
+        if issued < n {
+            match send.try_submit(issued, &payload(issued)) {
+                Ok(()) => issued += 1,
+                Err(SubmitError::Backpressure) => std::thread::yield_now(),
+                Err(e) => panic!("try_submit({issued}): {e}"),
+            }
+        }
+        poll.poll(|c| match c.outcome {
+            RemoteOutcome::Response { body, replayed, expired } => {
+                assert!(!expired, "unexpected EXPIRED for {}", c.user_data);
+                got.push((c.user_data, c.position.unwrap_or(0), body.to_vec(), replayed));
+            }
+            other => panic!("unexpected outcome for {}: {other:?}", c.user_data),
+        });
+    }
+    got
 }
 
 /// Poll until `pred` holds or `WAIT` elapses, so a test never hangs.
@@ -63,15 +100,154 @@ fn an_idle_status_updates_the_window_without_any_traffic_from_us() {
     send.shutdown();
 }
 
+/// The port of `client_fake_edge.rs`'s `submit_pipelined_under_credits`
+/// (23–50) onto the halves.
+#[test]
+fn try_submit_pipelines_under_credits() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    let got = run_submits(&send, &mut poll, 6, |i| vec![i as u8]);
+    assert_eq!(got.len(), 6, "every accepted request must complete exactly once");
+    for (i, (ud, pos, body, replayed)) in got.iter().enumerate() {
+        let i = i as u64;
+        assert_eq!(*ud, i, "completions arrive in issue order under one connection");
+        assert_eq!(*pos, (i + 1) * 64, "the edge's position rides the completion");
+        assert_eq!(body.as_slice(), &[i as u8], "the fake edge reverses the payload");
+        assert!(!replayed, "a first-time seq is FRESH");
+    }
+    let peak = edge.observed.max_unanswered.load(AtomicOrdering::SeqCst);
+    assert!((1..=2).contains(&peak), "the credit window must pace the pipeline: peak {peak}");
+    assert_eq!(edge.observed.seq_order(), vec![1, 2, 3, 4, 5, 6], "seqs start at 1, gap-free");
+    assert_eq!(send.inflight(), 0, "the window is empty once everything completed");
+    // The whole point of M13b: many frames per socket write once the window is
+    // wide enough to hold more than one. A grant of 2 cannot prove the ratio,
+    // so what is pinned here is that the numerator is now counted at all —
+    // task 7's window scenarios are where the batching factor is asserted.
+    let s = send.stats();
+    assert_eq!(
+        s.frames_written,
+        edge.observed.seq_count() as u64,
+        "the frame counter must match what the edge actually received: {s:?}"
+    );
+    assert!(s.frames_written >= 6, "every frame written must be counted: {s:?}");
+    assert_eq!((s.reconnects, s.resends, s.retries, s.redirects), (0, 0, 0, 0), "{s:?}");
+    send.shutdown();
+}
+
+/// The port of `query_round_trips_and_carries_the_linearizable_flag`
+/// (150–160). Both consistencies ride the same frame type and differ only in
+/// `FLAG_LINEARIZABLE`, which the edge echoes by answering identically — so
+/// what this pins is that neither flag path drops the completion.
+#[test]
+fn try_query_round_trips_both_consistencies() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    for (i, c) in [Consistency::Linearizable, Consistency::Snapshot].into_iter().enumerate() {
+        send.try_query(i as u64, c, b"abc").unwrap();
+        let mut body = None;
+        let deadline = Instant::now() + WAIT;
+        while body.is_none() && Instant::now() < deadline {
+            poll.poll(|comp| {
+                if let RemoteOutcome::Response { body: b, .. } = comp.outcome {
+                    assert_eq!(comp.user_data, i as u64);
+                    body = Some(b.to_vec());
+                }
+            });
+        }
+        assert_eq!(body.expect("query answered").as_slice(), b"cba", "{c:?}");
+    }
+    send.shutdown();
+}
+
+#[test]
+fn a_payload_larger_than_the_ring_is_refused_at_the_door() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let (send, _poll) = RemoteEngine::connect(RemoteConfig {
+        out_ring_bytes: Some(8192),
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+    let too_big = vec![0u8; 16 * 1024];
+    assert_eq!(send.try_submit(1, &too_big), Err(SubmitError::PayloadTooLarge));
+    // ... and a merely large one still goes on the wire: the node, not the
+    // client, is the authority on `max_payload` (see roundtrip.rs).
+    assert!(send.try_submit(2, &vec![0u8; 4096]).is_ok());
+    send.shutdown();
+}
+
+/// The reclaim path, which nothing else here reaches: a ring far too small to
+/// hold the run forces it to wrap many times, so every accepted request
+/// depends on the submitter having released the bytes of the completed ones.
+/// A reclaim that under-releases wedges (the run never finishes inside
+/// `WAIT`); one that over-releases corrupts a frame the writer has not sent
+/// yet, and the edge's decoder — a real one — is what catches that.
+///
+/// `max_inflight: 8` also puts the run through the slot table's 64-index
+/// floor several times over, so every seq here lands on an index a much
+/// earlier seq used: the case where reading a resolved slot's extent would
+/// hand back a *different* frame's offset.
+#[test]
+fn a_ring_far_smaller_than_the_run_wraps_and_reclaims() {
+    const N: u64 = 200;
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 4,
+        delay: Duration::from_micros(50),
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        out_ring_bytes: Some(4096),
+        max_inflight: 8,
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+    let got = run_submits(&send, &mut poll, N, |i| vec![(i % 251) as u8; 200]);
+    assert_eq!(got.len() as u64, N, "the run must not wedge on reclaim");
+    for (i, (ud, _, body, _)) in got.iter().enumerate() {
+        let i = i as u64;
+        assert_eq!(*ud, i);
+        assert_eq!(body.as_slice(), &vec![(i % 251) as u8; 200], "frame {i} came back corrupt");
+    }
+    assert_eq!(
+        edge.observed.seq_order(),
+        (1..=N).collect::<Vec<u64>>(),
+        "every seq must arrive exactly once, in order"
+    );
+    assert_eq!(send.inflight(), 0);
+    send.shutdown();
+}
+
+/// A refused request must consume nothing: no seq, no slot, no ring bytes.
+/// If it did, the next accepted request would land on a seq the edge never
+/// sees a frame for and the window would wedge behind the gap.
+#[test]
+fn a_refused_request_consumes_no_seq() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        out_ring_bytes: Some(8192),
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+    assert_eq!(send.try_submit(99, &vec![0u8; 16 * 1024]), Err(SubmitError::PayloadTooLarge));
+    let got = run_submits(&send, &mut poll, 2, |i| vec![i as u8]);
+    assert_eq!(got.len(), 2);
+    assert_eq!(edge.observed.seq_order(), vec![1, 2], "the refusal must not have burnt seq 1");
+    send.shutdown();
+}
+
+/// A submit after `shutdown` is refused by name rather than accepted into a
+/// link that can never complete it.
+#[test]
+fn a_submit_after_shutdown_is_refused() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 4, ..Default::default() });
+    let (send, _poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    send.shutdown();
+    assert_eq!(send.try_submit(1, b"x"), Err(SubmitError::Closed));
+    assert_eq!(send.try_query(2, Consistency::Snapshot, b"x"), Err(SubmitError::Closed));
+}
+
 /// What this pins is the LIVENESS clock, not a dropped socket: `hang` keeps
 /// the connection open and silent, so the reader's `dead_after` is the only
-/// thing that can notice it. A real dropped-connection test needs
-/// `drop_after_first_request`, which only fires on a SUBMIT — and nothing is
-/// submitted until task 6.
-///
-// TASK 6: add the real drop test here — `drop_after_first_request: true`, one
-// `try_submit`, assert the request survives the drop and is re-sent on the
-// fresh connection.
+/// thing that can notice it. The dropped-socket case is the test below.
 #[test]
 fn a_silent_edge_is_noticed_and_the_link_is_re_established() {
     let edge = FakeEdge::spawn(Behaviour { credits: 2, hang: true, ..Default::default() });
@@ -86,6 +262,62 @@ fn a_silent_edge_is_noticed_and_the_link_is_re_established() {
     let ok = until(|| send.stats().reconnects >= 1);
     assert!(ok, "dead_after must force a redial: {:?}", send.stats());
     assert!(until(|| send.is_connected()), "the writer thread must re-establish the link");
+    send.shutdown();
+}
+
+/// The real dropped-socket case, which only fires once something is actually
+/// submitted: the edge reads one SUBMIT and closes the connection without
+/// answering.
+///
+/// **What this task can guarantee, and what it deliberately cannot.** The
+/// writer re-dials (`reconnects`, a second connection at the edge) and the
+/// request's completion is still delivered **exactly once** — but as
+/// [`RemoteOutcome::TimedOut`], because the ordered re-send of the live
+/// window onto the fresh connection is TASK 8's (`link.rs`'s `redial` says so
+/// at the seam). So the promise pinned here is the one M13b actually makes at
+/// this point: an accepted request always resolves, never silently vanishes.
+///
+/// TASK 8: when the window re-send lands, this expectation becomes
+/// `RemoteOutcome::Response` with body `b"yx"`, `resends >= 1`, and
+/// `request_timeout` can go back to the default — it is short here only so
+/// the sweep fires inside the test.
+#[test]
+fn a_dropped_connection_is_re_dialled_and_the_request_still_resolves_once() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        drop_after_first_request: true,
+        ..Default::default()
+    });
+    let (send, mut poll) = RemoteEngine::connect(RemoteConfig {
+        request_timeout: Duration::from_millis(500),
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+    send.try_submit(42, b"xy").expect("the first submit fits any window");
+
+    let mut got: Vec<(u64, String)> = Vec::new();
+    let deadline = Instant::now() + WAIT;
+    while got.is_empty() && Instant::now() < deadline {
+        poll.poll(|c| got.push((c.user_data, format!("{:?}", c.outcome))));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(got.len(), 1, "the accepted request must resolve exactly once: {got:?}");
+    assert_eq!(got[0].0, 42);
+    assert!(got[0].1.starts_with("TimedOut"), "outcome was {:?}", got[0].1);
+
+    // The link itself recovered from the drop, whatever became of the request.
+    assert!(until(|| send.stats().reconnects >= 1), "the drop must force a redial");
+    assert!(until(|| edge.observed.conns.load(AtomicOrdering::SeqCst) >= 2), "a fresh connection");
+    assert!(until(|| send.is_connected()), "the writer must re-establish the link");
+    assert_eq!(send.inflight(), 0, "nothing is left outstanding");
+
+    // And exactly once means exactly once: no second completion follows.
+    let mut extra = 0usize;
+    for _ in 0..50 {
+        extra += poll.poll(|c| panic!("a second completion for {}", c.user_data));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(extra, 0);
     send.shutdown();
 }
 

@@ -9,10 +9,14 @@
 //!
 //! An `Ok(())` from `RemoteSendHalf::try_submit` obligates the engine to
 //! deliver **exactly one** [`RemoteCompletion`] for that `user_data` through
-//! [`RemotePollHalf::poll`]. [`SubmitError::Backpressure`] means the request
-//! was never accepted — retry it. Redirects, leader changes, retries and
-//! connection loss are absorbed by the link's own threads and are never
-//! completions.
+//! [`RemotePollHalf::poll`] — unless the poller has abandoned the queue.
+//! (Once the link is closed, the poll half is being dropped or has stopped
+//! draining, and an outcome that does not fit the queue is given up on rather
+//! than parked on forever; parking there would wedge the very drop that would
+//! have received it. See `link::Link::complete`.)
+//! [`SubmitError::Backpressure`] means the request was never accepted — retry
+//! it. Redirects, leader changes, retries and connection loss are absorbed by
+//! the link's own threads and are never completions.
 //!
 //! # Thread roles
 //!
@@ -354,25 +358,10 @@ impl RemoteEngine {
 pub struct RemoteSendHalf {
     pub(crate) link: Arc<Link>,
     /// The next seq to issue. Submitter-local: gap-free, from 1.
-    #[allow(
-        dead_code,
-        reason = "task 6's `try_submit` issues from this cursor; task 5 only \
-                  establishes the link"
-    )]
     pub(crate) next_seq: Cell<u64>,
     /// The lowest seq whose ring bytes have not been reclaimed yet.
-    #[allow(
-        dead_code,
-        reason = "task 6's `try_submit` walks this cursor forward to call \
-                  `OutRing::release_to`, which is PRODUCER ONLY"
-    )]
     pub(crate) reclaim_seq: Cell<u64>,
     /// The ring offset that cursor sits at.
-    #[allow(
-        dead_code,
-        reason = "task 6's `try_submit` walks this cursor forward to call \
-                  `OutRing::release_to`, which is PRODUCER ONLY"
-    )]
     pub(crate) reclaim_pos: Cell<u64>,
     pub(crate) _not_sync: PhantomData<Cell<()>>,
 }
@@ -383,6 +372,182 @@ pub struct RemotePollHalf {
 }
 
 impl RemoteSendHalf {
+    /// Submit a command. Nonblocking: no syscall, no allocation, no lock — the
+    /// frame is encoded straight into the outgoing ring and the writer thread
+    /// takes it from there.
+    ///
+    /// `Ok(())` obligates the engine to deliver **exactly one**
+    /// [`RemoteCompletion`] carrying this `user_data`. An `Err` means the
+    /// request was never accepted: no seq was consumed, nothing will complete.
+    ///
+    /// [`SubmitError::Backpressure`] is the normal, expected refusal — the
+    /// credit window, the local `max_inflight` cap or the ring is full. **The
+    /// wait strategy is the caller's**, deliberately: this crate never sleeps
+    /// on the submitting thread. Yield (`std::thread::yield_now`) if the
+    /// caller has other work, or park on
+    /// [`RemotePollHalf::wait_handle`]'s [`RemoteWaitHandle::park`] — which
+    /// wakes on the completion that frees the window. A bare spin is never
+    /// right: the thing that opens the window is another thread, and burning
+    /// a core is how it is starved.
+    pub fn try_submit(&self, user_data: u64, cmd: &[u8]) -> Result<(), SubmitError> {
+        self.send(
+            crate::frame::FrameType::Submit,
+            0,
+            crate::slots::ReqKind::Submit,
+            user_data,
+            cmd,
+        )
+    }
+
+    /// Issue a read. Same contract, same nonblocking shape and same wait
+    /// strategy as [`RemoteSendHalf::try_submit`].
+    ///
+    /// [`Consistency::Linearizable`] goes through the node's quorum read
+    /// barrier; [`Consistency::Snapshot`] is answered from the replica the
+    /// edge sits on.
+    pub fn try_query(
+        &self,
+        user_data: u64,
+        consistency: Consistency,
+        q: &[u8],
+    ) -> Result<(), SubmitError> {
+        let flags = match consistency {
+            Consistency::Linearizable => crate::frame::FLAG_LINEARIZABLE,
+            Consistency::Snapshot => 0,
+        };
+        self.send(
+            crate::frame::FrameType::Query,
+            flags,
+            crate::slots::ReqKind::Query,
+            user_data,
+            q,
+        )
+    }
+
+    /// Encode one request into the ring and record its slot. The whole submit
+    /// path, shared by [`RemoteSendHalf::try_submit`] and
+    /// [`RemoteSendHalf::try_query`].
+    ///
+    /// **Every refusal happens before anything is consumed.** The seq, the
+    /// slot and the ring bytes are only committed once all four checks pass —
+    /// closed, size, window, slot — so a `Backpressure` leaves no gap in the
+    /// seq stream (which the edge's session dedup would stall behind) and no
+    /// orphan bytes in the ring. That is sound because the submitter is the
+    /// only producer: nothing else can invalidate a check under it, and the
+    /// other threads can only ever move the checks in the permissive
+    /// direction (free a slot, widen the window, drain the ring).
+    fn send(
+        &self,
+        ty: crate::frame::FrameType,
+        flags: u8,
+        kind: crate::slots::ReqKind,
+        user_data: u64,
+        bytes: &[u8],
+    ) -> Result<(), SubmitError> {
+        use crate::frame::{Header, HEADER_LEN, MAX_FRAME_LEN, PROTOCOL_VERSION};
+
+        let link = &self.link;
+        if link.closed() {
+            return Err(SubmitError::Closed);
+        }
+        // Give back whatever the completed prefix is holding before deciding
+        // the ring is full.
+        self.reclaim();
+        let out = link.out_producer();
+        let need = HEADER_LEN + bytes.len();
+        // A frame that could never fit — this wire's ceiling, or this ring's —
+        // is a permanent error, not backpressure: retrying it would spin
+        // forever. A frame that merely does not fit the FREE space right now
+        // is backpressure, and `stage_frame` is what tells the two apart.
+        if need > MAX_FRAME_LEN as usize || need > out.capacity() {
+            return Err(SubmitError::PayloadTooLarge);
+        }
+        let seq = self.next_seq.get();
+        // The credit rule, checked before the seq is consumed: a seq may go
+        // only while `seq <= acked_seq + credits`. Both are absolute counts
+        // the edge advertises, so a shrinking grant closes the window for new
+        // seqs at once without invalidating what is already in flight.
+        let window = link.acked_seq().saturating_add(u64::from(link.credits()));
+        if seq > window {
+            return Err(SubmitError::Backpressure);
+        }
+        // The local cap, and the slot this seq lands on. `claim` re-checks
+        // both, but checking here is what keeps a refusal free of side
+        // effects: `claim` runs only after the bytes are staged.
+        let slots = link.slots();
+        if slots.inflight() >= u64::from(link.cfg.max_inflight) || !slots.is_free(seq) {
+            return Err(SubmitError::Backpressure);
+        }
+        let h = Header { ty, flags, version: PROTOCOL_VERSION, client_id: link.client_id, seq };
+        let Some((off, len)) = out.stage_frame(h, bytes) else {
+            return Err(SubmitError::Backpressure);
+        };
+        let deadline_ns = link.now_ns() + link.cfg.request_timeout.as_nanos() as u64;
+        // PUBLISH THE SLOT BEFORE THE BYTES. The writer thread may put the
+        // frame on the wire the instant `commit` lands and the edge may answer
+        // it immediately; a RESPONSE for a slot that does not exist yet
+        // resolves nothing, and the completion this call just promised would
+        // be lost. `stage_frame` exists precisely so these two can be ordered.
+        let claimed = slots.claim(seq, user_data, kind, deadline_ns, off, len);
+        debug_assert!(
+            claimed,
+            "the window and the slot were both checked free above, and only this thread claims"
+        );
+        self.next_seq.set(seq + 1);
+        slots.publish_next_seq(seq + 1);
+        out.commit(len);
+        Ok(())
+    }
+
+    /// Release the ring bytes below the oldest still-live request, so the
+    /// space can be reused.
+    ///
+    /// Keyed on **slot liveness**, not on `acked_seq`: the edge advances
+    /// `acked_seq` on SUBMIT only (`uc2_gateway/src/conn.rs`), so it is not a
+    /// contiguous prefix of everything issued and cannot drive reclaim. A
+    /// slot, by contrast, is live exactly while its bytes may still be needed
+    /// — for a re-send after a redial (task 8) as much as for a completion.
+    ///
+    /// The frontier is read off the oldest LIVE slot rather than accumulated
+    /// from the dead ones it walked past, and that is deliberate: a resolved
+    /// slot's `off`/`len` belong to whichever later seq has re-claimed that
+    /// index (every `slot_count()` seqs), so summing dead extents would
+    /// happily release ring bytes still holding live requests. `live_extent`
+    /// answers `None` instead of stale, and the oldest live request's own
+    /// offset is exactly the frontier that must be preserved.
+    ///
+    /// The walk stops at the first still-live seq, so the reclaimed region is
+    /// always a prefix, which is what the ring's single `ack` cursor can
+    /// express. `release_to` clamps to `send_pos` on top of that, so a
+    /// completed-but-unsent frame (swept past its deadline before the writer
+    /// got to it) cannot be overwritten either.
+    fn reclaim(&self) {
+        let link = &self.link;
+        let next = self.next_seq.get();
+        let mut seq = self.reclaim_seq.get();
+        while seq < next && !link.slots().is_live(seq) {
+            seq += 1;
+        }
+        self.reclaim_seq.set(seq);
+        let pos = if seq < next {
+            // Everything below the oldest live request may go. A `None` here
+            // means it resolved between the two reads — keep the previous
+            // frontier and let the next call move it; never guess.
+            match link.slots().live_extent(seq) {
+                Some((off, _)) => off,
+                None => self.reclaim_pos.get(),
+            }
+        } else {
+            // Nothing is live, so every committed byte may go. The clamp to
+            // `send_pos` inside `release_to` is what keeps a frame the writer
+            // has not put on the wire yet from being overwritten.
+            link.out_producer().write_pos()
+        };
+        let pos = pos.max(self.reclaim_pos.get());
+        self.reclaim_pos.set(pos);
+        link.out_producer().release_to(pos);
+    }
+
     /// The last absolute grant the edge advertised.
     pub fn credits(&self) -> u32 {
         self.link.credits()
@@ -423,8 +588,10 @@ impl RemoteSendHalf {
     }
 
     /// Close the link and complete every outstanding request with
-    /// [`RemoteOutcome::Closed`]. Idempotent; dropping both halves does the
-    /// same.
+    /// [`RemoteOutcome::Closed`] — unless the poller has abandoned the queue,
+    /// in which case the outcomes it can no longer take are dropped rather
+    /// than parked on (see the module header). Idempotent; dropping both
+    /// halves does the same.
     pub fn shutdown(&self) {
         self.link.close();
     }
@@ -434,6 +601,16 @@ impl RemotePollHalf {
     /// Drain up to `POLL_BATCH` completions, invoking `cb` for each; returns
     /// the count. Nonblocking — see [`RemotePollHalf::wait_handle`] to park
     /// between batches.
+    ///
+    /// Each [`RemoteOutcome::Response`] body is borrowed from the queue's
+    /// arena and is valid only for that call of `cb`; copy what you need to
+    /// keep.
+    ///
+    /// **Do not call [`RemoteSendHalf::shutdown`] (or drop either half) from
+    /// inside `cb`.** The drain holds the consumer's cursors unpublished until
+    /// it returns — a drop guard republishes them even if `cb` panics — and
+    /// `shutdown` joins the link's threads, one of which may be parked waiting
+    /// for exactly that space. Set a flag and shut down after `poll` returns.
     pub fn poll(&mut self, cb: impl FnMut(RemoteCompletion<'_>)) -> usize {
         crate::link::drain_completions(&self.link, cb)
     }

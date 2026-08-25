@@ -19,15 +19,24 @@
 //! 4. The seq is assigned by the submitter (gap-free, from 1) and is a full
 //!    `u64` on this wire, so a stale generation is caught by the exact
 //!    `owner == seq + 1` test — no truncation argument needed.
-//! 5. `extent`, `kind`, `sent`, `not_before_ns` and `attempts` are written by
-//!    the submitter before publish and thereafter by the writer/reader
+//! 5. `off`/`len`, `kind`, `sent`, `not_before_ns` and `attempts` are written
+//!    by the submitter before publish and thereafter by the writer/reader
 //!    threads; they are advisory (they steer the writer), never the
 //!    completion protocol, so `Relaxed` is correct for them.
+//! 6. **Advisory does not mean readable at any time.** Those words belong to
+//!    the generation that wrote them, and the next occupant of the same INDEX
+//!    overwrites them — so reading them for a seq that has been resolved
+//!    yields a different request's values. [`SlotTable::live_extent`] is
+//!    therefore generation-gated and answers `None` rather than stale; every
+//!    other advisory reader is called only for a seq the caller is holding
+//!    live.
 //!
 //! Task 5 gave this table its first real callers — the link's deadline sweep,
-//! its shutdown drain and its retransmit bookkeeping. The claim/resolve
-//! protocol itself waits for task 6's `try_submit` and the reader's frame
-//! handlers, and each still-unused item carries a narrow `allow` until then.
+//! its shutdown drain and its retransmit bookkeeping. Task 6 gave it the
+//! claim/resolve protocol itself: `RemoteSendHalf::try_submit` claims, the
+//! reader's `RESPONSE` handler resolves, and the writer's frame cursor marks
+//! what it has put on the wire. What is still unused is task 8's re-send
+//! bookkeeping, which carries a narrow per-item `allow` until then.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -103,7 +112,6 @@ impl SlotTable {
     /// SUBMITTER ONLY. `false` = the window is full or the slot's previous
     /// occupant is still live; either way the caller reports backpressure and
     /// does NOT consume the seq.
-    #[allow(dead_code, reason = "task 6's `try_submit` claims the slot")]
     pub(crate) fn claim(
         &self,
         seq: u64,
@@ -137,6 +145,15 @@ impl SlotTable {
         true
     }
 
+    /// SUBMITTER ONLY: is the index this seq lands on unoccupied? Checked
+    /// before the outgoing ring is touched, so a refusal never consumes a seq
+    /// and never leaves staged bytes behind a slot that was never claimed.
+    /// Only the submitter claims and every other thread can only ever FREE a
+    /// slot, so a `true` here cannot go stale under the caller.
+    pub(crate) fn is_free(&self, seq: u64) -> bool {
+        self.slot(seq).owner.load(Ordering::Acquire) == FREE
+    }
+
     fn take(&self, seq: u64) -> Resolve {
         let s = self.slot(seq);
         let owner = s.owner.load(Ordering::Acquire);
@@ -154,7 +171,6 @@ impl SlotTable {
         Resolve::Won { user_data }
     }
 
-    #[allow(dead_code, reason = "task 6's RESPONSE handler resolves the slot")]
     pub(crate) fn resolve(&self, seq: u64) -> Resolve {
         self.take(seq)
     }
@@ -207,15 +223,42 @@ impl SlotTable {
         n
     }
 
-    #[allow(dead_code, reason = "task 8's ordered window re-send skips dead slots")]
     pub(crate) fn is_live(&self, seq: u64) -> bool {
         self.slot(seq).owner.load(Ordering::Acquire) == seq + 1
     }
 
-    #[allow(dead_code, reason = "task 8's re-send copies the frame out of the ring by extent")]
-    pub(crate) fn extent(&self, seq: u64) -> (u64, u32) {
+    /// Where `seq`'s frame sits in the outgoing ring — **only while the slot
+    /// still belongs to `seq`**. `None` once it has been resolved.
+    ///
+    /// The generation check is not a nicety. `off`/`len` are advisory words
+    /// that a later occupant of the same INDEX overwrites, and an index is
+    /// re-claimed every `slot_count()` seqs, so a caller that reads the extent
+    /// of a resolved seq gets a **different frame's** offset — a much larger
+    /// one. Both callers would be wrong in a way that is silent: the writer's
+    /// frame cursor would never reach it and would stop advancing for good,
+    /// and the submitter's reclaim would free ring bytes that still belong to
+    /// live requests. So the extent is readable only through the generation
+    /// that owns it, and "resolved" is `None` rather than a stale answer.
+    ///
+    /// Seqlock-shaped: check the generation, read the words, check again. The
+    /// second check is what closes a resolve-and-re-claim that lands between
+    /// the first check and the reads — the re-claim must pass through
+    /// `RESERVED` and publish `seq' + 1 != seq + 1`, so a matching second read
+    /// proves nothing moved.
+    pub(crate) fn live_extent(&self, seq: u64) -> Option<(u64, u32)> {
         let s = self.slot(seq);
-        (s.off.load(Ordering::Relaxed), s.len.load(Ordering::Relaxed))
+        if s.owner.load(Ordering::Acquire) != seq + 1 {
+            return None;
+        }
+        let off = s.off.load(Ordering::Relaxed);
+        let len = s.len.load(Ordering::Relaxed);
+        // Keeps the two advisory loads above from being ordered after the
+        // re-check below (an `Acquire` load orders only what FOLLOWS it).
+        std::sync::atomic::fence(Ordering::Acquire);
+        if s.owner.load(Ordering::Relaxed) != seq + 1 {
+            return None;
+        }
+        Some((off, len))
     }
 
     #[allow(dead_code, reason = "task 8's re-send needs SUBMIT vs QUERY for the stats split")]
@@ -245,7 +288,6 @@ impl SlotTable {
         self.slot(seq).not_before_ns.load(Ordering::Relaxed)
     }
 
-    #[allow(dead_code, reason = "task 8 counts a request's re-sends")]
     pub(crate) fn bump_attempts(&self, seq: u64) -> u32 {
         self.slot(seq).attempts.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -255,12 +297,10 @@ impl SlotTable {
     }
 
     /// The lowest seq never yet issued. SUBMITTER publishes, writer reads.
-    #[allow(dead_code, reason = "task 8's re-send walks the submitter's published seq range")]
     pub(crate) fn next_seq(&self) -> u64 {
         self.next_seq.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code, reason = "task 6's `try_submit` publishes the cursor the writer reads")]
     pub(crate) fn publish_next_seq(&self, seq: u64) {
         self.next_seq.store(seq, Ordering::Release);
     }
@@ -340,7 +380,7 @@ mod tests {
     fn the_ring_extent_and_the_sent_flag_round_trip() {
         let t = table();
         assert!(t.claim(1, 0xAA, ReqKind::Query, 1_000, 4096, 120));
-        assert_eq!(t.extent(1), (4096, 120));
+        assert_eq!(t.live_extent(1), Some((4096, 120)));
         assert_eq!(t.kind(1), ReqKind::Query);
         assert!(!t.is_sent(1), "a fresh slot has not been written yet");
         t.mark_sent(1, true);
@@ -357,12 +397,88 @@ mod tests {
     fn is_live_tracks_the_slot_and_next_seq_is_published() {
         let t = table();
         assert!(!t.is_live(1));
+        assert!(t.is_free(1), "an unclaimed index is free");
         assert!(t.claim(1, 1, ReqKind::Submit, 1_000, 0, 88));
         assert!(t.is_live(1));
+        assert!(!t.is_free(1), "a claimed index is not free");
+        assert!(
+            !t.is_free(1 + t.slot_count() as u64),
+            "`is_free` is about the INDEX: a later generation of an occupied index is not free"
+        );
         t.publish_next_seq(2);
         assert_eq!(t.next_seq(), 2);
         assert_eq!(t.abort(1), Resolve::Won { user_data: 1 });
         assert!(!t.is_live(1));
+    }
+
+    /// The table's first REAL concurrent exercise — task 6 gives it its two
+    /// live callers (a submitter claiming, a reader resolving), and every
+    /// earlier test in this file drives both from one thread.
+    ///
+    /// What it pins is the single-CAS protocol under a genuine race: every
+    /// `user_data` is resolved EXACTLY once (no loss, no double completion),
+    /// a losing `resolve` says `Miss`, and `inflight` returns to zero — the
+    /// accounting that the credit window and `reclaim` both key off. The
+    /// submitter's refusals (window full, or the index's previous occupant
+    /// still live) are the same backpressure `try_submit` reports, so the
+    /// retry loop here is the shape the engine's caller runs.
+    ///
+    /// This is also one of the three modules the Miri run covers: the CAS
+    /// orderings are what make the claim's metadata writes visible to the
+    /// resolver, and a race there would be UB, not a flake.
+    #[test]
+    fn a_submitter_and_a_resolver_race_without_losing_or_duplicating_a_completion() {
+        use std::sync::Arc;
+        use std::thread;
+
+        // Keep it modest: Miri interprets every access, and 200 seqs through
+        // the 64-slot floor is already three laps of generation reuse — every
+        // index is re-claimed under a later seq while the resolver races it.
+        const N: u64 = 200;
+        let t = Arc::new(SlotTable::new(8));
+        assert_eq!(t.slot_count(), 64, "the sizing floor, so N must exceed it to reuse an index");
+
+        let resolver_t = Arc::clone(&t);
+        let resolver = thread::spawn(move || {
+            let mut won = Vec::with_capacity(N as usize);
+            for seq in 1..=N {
+                loop {
+                    match resolver_t.resolve(seq) {
+                        Resolve::Won { user_data } => {
+                            // The loser of the race must say so, every time.
+                            assert_eq!(
+                                resolver_t.resolve(seq),
+                                Resolve::Miss,
+                                "seq {seq} resolved twice"
+                            );
+                            won.push(user_data);
+                            break;
+                        }
+                        // Not claimed yet: the submitter is behind us.
+                        Resolve::Miss => thread::yield_now(),
+                    }
+                }
+            }
+            won
+        });
+
+        for seq in 1..=N {
+            // The submitter's own retry loop: `claim` refuses on a full window
+            // or a still-live occupant of the index this seq lands on, and a
+            // refusal must never consume the seq.
+            while !t.claim(seq, seq * 7, ReqKind::Submit, u64::MAX, seq * 128, 64) {
+                thread::yield_now();
+            }
+        }
+
+        let won = resolver.join().unwrap();
+        assert_eq!(
+            won,
+            (1..=N).map(|s| s * 7).collect::<Vec<u64>>(),
+            "every claim must be resolved exactly once, in seq order"
+        );
+        assert_eq!(t.inflight(), 0, "inflight must return to zero");
+        assert!(!t.is_live(N), "nothing is left live");
     }
 
     #[test]
@@ -382,8 +498,8 @@ mod tests {
             "the occupant's metadata must be untouched by the failed claim"
         );
         assert_eq!(
-            t.extent(1),
-            (4096, 64),
+            t.live_extent(1),
+            Some((4096, 64)),
             "the occupant's extent must be untouched by the failed claim"
         );
         assert_eq!(

@@ -24,9 +24,12 @@
 //! frame).
 //!
 //! Task 5 gave this ring its real consumer: `link::Writer`, the writer
-//! thread's role token, is the only holder of the CONSUMER methods. The
-//! PRODUCER methods wait for task 6's `try_submit` and task 8's re-send path,
-//! and carry a narrow per-item `allow` until then.
+//! thread's role token, is the only holder of the CONSUMER methods. Task 6
+//! gave it its real producer: `RemoteSendHalf::try_submit` stages a frame,
+//! publishes the request's correlation slot, and only then commits the bytes
+//! (see [`OutRing::stage_frame`] for why those are two calls). What is still
+//! unused is task 8's re-send path, which carries a narrow per-item `allow`
+//! until then.
 
 use std::ptr;
 use std::slice;
@@ -115,14 +118,27 @@ impl OutRing {
         self.capacity() - (w - a) as usize
     }
 
-    /// Encode one frame at the write cursor. `None` = no room (the caller
+    /// Encode one frame at the write cursor **without publishing it**, and
+    /// report the `(offset, len)` it occupies. `None` = no room (the caller
     /// reports `Backpressure`) or a frame larger than the whole ring (the
     /// caller reports `PayloadTooLarge`; the two are told apart by comparing
     /// the need against [`OutRing::capacity`]).
     ///
+    /// The copy and the publish are separable for one reason, and it is a
+    /// correctness reason rather than a performance one: the submitter must
+    /// claim the correlation slot for this seq BEFORE the bytes become
+    /// visible to the writer thread. The writer may put the frame on the wire
+    /// the instant `write` moves, and the edge may answer it before the
+    /// submitter's next instruction retires — so a response for a seq whose
+    /// slot does not exist yet would resolve nothing and the completion would
+    /// be lost. [`OutRing::commit`] is the publish.
+    ///
+    /// An abandoned stage costs nothing and leaves no residue: `write` has
+    /// not moved, so the bytes are invisible to the consumer and the next
+    /// stage writes over them.
+    ///
     /// PRODUCER ONLY.
-    #[allow(dead_code, reason = "task 6's `try_submit` is the producer; this ring has no submitter yet")]
-    pub(crate) fn push_frame(&self, h: Header, payload: &[u8]) -> Option<(u64, u32)> {
+    pub(crate) fn stage_frame(&self, h: Header, payload: &[u8]) -> Option<(u64, u32)> {
         let need = HEADER_LEN + payload.len();
         if need > self.capacity() || need > self.free() {
             return None;
@@ -150,9 +166,33 @@ impl OutRing {
                 pos += n as u64;
             }
         }
-        self.write.store(start + need as u64, Ordering::Release);
-        self.wake.signal();
         Some((start, need as u32))
+    }
+
+    /// Publish `len` staged bytes — the `Release` store that hands them to the
+    /// writer thread — and wake it. `len` MUST be what the matching
+    /// [`OutRing::stage_frame`] returned, and nothing may have been staged in
+    /// between (there is one producer, so that is the caller's own program
+    /// order). PRODUCER ONLY.
+    pub(crate) fn commit(&self, len: u32) {
+        let w = self.write.load(Ordering::Relaxed);
+        debug_assert!(
+            w + len as u64 <= self.ack.load(Ordering::Relaxed) + self.capacity() as u64,
+            "commit: publishing past the reclaim frontier — `len` is not what `stage_frame` returned"
+        );
+        self.write.store(w + len as u64, Ordering::Release);
+        self.wake.signal();
+    }
+
+    /// Stage + commit in one call. The production submit path does NOT use
+    /// this — it has a slot to publish between the two halves (see
+    /// [`OutRing::stage_frame`]) — so this exists for the ring's own tests,
+    /// which have no correlation state to interleave.
+    #[cfg(test)]
+    pub(crate) fn push_frame(&self, h: Header, payload: &[u8]) -> Option<(u64, u32)> {
+        let (off, len) = self.stage_frame(h, payload)?;
+        self.commit(len);
+        Some((off, len))
     }
 
     /// Move the reclaim frontier up to `pos`, clamped to `send` (bytes that
@@ -162,7 +202,6 @@ impl OutRing {
     /// (e.g. releasing up to `write_pos()` right after a push, before the
     /// writer has drained anything) and this must be a no-op rather than
     /// letting `ack` run ahead of `send`. PRODUCER ONLY.
-    #[allow(dead_code, reason = "task 6's `try_submit` reclaims here once a seq is acked")]
     pub(crate) fn release_to(&self, pos: u64) {
         let send = self.send.load(Ordering::Acquire);
         let target = pos.min(send);
@@ -279,6 +318,42 @@ mod tests {
             client_id: 7,
             seq,
         }
+    }
+
+    /// The split exists for one reason: the submitter must publish the
+    /// correlation slot BEFORE the bytes become visible to the writer thread,
+    /// or a response can arrive for a seq whose slot does not exist yet and
+    /// the completion is lost. That is only expressible if the copy and the
+    /// publish are separable — which is what this asserts.
+    #[test]
+    fn staged_bytes_are_invisible_until_commit() {
+        let r = OutRing::new(4096);
+        let (off, len) = r.stage_frame(hdr(1), b"abcd").expect("room");
+        assert_eq!(off, 0);
+        assert_eq!(r.write_pos(), 0, "a staged frame must not be visible to the writer");
+        assert!(r.peek_upto(u64::MAX).is_empty());
+        r.commit(len);
+        assert_eq!(r.write_pos(), len as u64);
+        assert_eq!(r.peek_upto(u64::MAX).len(), len as usize);
+    }
+
+    /// A staged-but-abandoned frame (the submitter refused the request after
+    /// the copy) leaves no residue: `write` never moved, so the next stage
+    /// writes over exactly the same bytes and the writer sees only the frame
+    /// that was actually committed.
+    #[test]
+    fn an_abandoned_stage_is_overwritten_by_the_next_one() {
+        let r = OutRing::new(4096);
+        let (off, _) = r.stage_frame(hdr(7), b"ghost").expect("room");
+        assert_eq!(off, 0);
+        let (off2, len2) = r.stage_frame(hdr(8), b"real").expect("room");
+        assert_eq!(off2, 0, "an uncommitted stage does not consume ring space");
+        r.commit(len2);
+        let chunk = r.peek_upto(r.write_pos());
+        assert_eq!(chunk.len(), len2 as usize, "only the committed frame is visible");
+        let (h, plen) = decode_header(chunk).expect("header");
+        assert_eq!(h.seq, 8);
+        assert_eq!(&chunk[HEADER_LEN..HEADER_LEN + plen], b"real");
     }
 
     #[test]
