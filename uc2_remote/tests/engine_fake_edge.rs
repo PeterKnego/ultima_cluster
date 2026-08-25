@@ -123,13 +123,23 @@ fn try_submit_pipelines_under_credits() {
     // wide enough to hold more than one. A grant of 2 cannot prove the ratio,
     // so what is pinned here is that the numerator is now counted at all —
     // task 7's window scenarios are where the batching factor is asserted.
+    // `frames_written` is stamped by the writer thread AFTER the socket write
+    // and the `consume` that the response (and therefore the completion this
+    // loop just observed) rides on — so the main thread can legitimately read
+    // the stats while the writer is still inside that window. Wait for the
+    // counter rather than racing it; the wait is what makes the equality
+    // below a statement about accounting instead of about scheduling.
+    assert!(
+        until(|| send.stats().frames_written >= 6),
+        "every frame written must be counted: {:?}",
+        send.stats()
+    );
     let s = send.stats();
     assert_eq!(
         s.frames_written,
         edge.observed.seq_count() as u64,
         "the frame counter must match what the edge actually received: {s:?}"
     );
-    assert!(s.frames_written >= 6, "every frame written must be counted: {s:?}");
     assert_eq!((s.reconnects, s.resends, s.retries, s.redirects), (0, 0, 0, 0), "{s:?}");
     send.shutdown();
 }

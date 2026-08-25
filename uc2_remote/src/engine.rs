@@ -488,11 +488,21 @@ impl RemoteSendHalf {
         // it immediately; a RESPONSE for a slot that does not exist yet
         // resolves nothing, and the completion this call just promised would
         // be lost. `stage_frame` exists precisely so these two can be ordered.
+        // A refusal here is unreachable by the argument above — but the whole
+        // point of that argument is the promise this call is making, so the
+        // release path refuses too rather than trusting it. Committing after
+        // a failed claim would put a frame on the wire with no slot behind
+        // it: a request that can never complete, against an `Ok(())` that
+        // says it must. The staged bytes are not published, so they leave no
+        // residue (see `OutRing::stage_frame`).
         let claimed = slots.claim(seq, user_data, kind, deadline_ns, off, len);
         debug_assert!(
             claimed,
             "the window and the slot were both checked free above, and only this thread claims"
         );
+        if !claimed {
+            return Err(SubmitError::Backpressure);
+        }
         self.next_seq.set(seq + 1);
         slots.publish_next_seq(seq + 1);
         out.commit(len);
