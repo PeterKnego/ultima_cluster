@@ -56,9 +56,25 @@ pub(crate) struct Conn {
     /// The `client_id` the peer asserted in `HELLO`; echoed in every frame we
     /// write and used as the session-envelope identity.
     client_id: AtomicU64,
-    /// Credits currently granted to this connection (the peer may have at most
-    /// this many unanswered `seq`s beyond `acked_seq`).
+    /// Credits currently granted to this connection: the peer may have at most
+    /// this many requests — SUBMITs and queries alike — outstanding at once.
+    /// A COUNT bound, not a `seq` window: a query never advances `acked_seq`, so
+    /// phrasing it as "unanswered seqs beyond acked_seq" would starve a client
+    /// after `credits` queries (uc2_remote's window is the count-based
+    /// `admissible`, not a seq comparison).
     credits: AtomicU32,
+    /// The ceiling `credits` may climb back to — the connection's current
+    /// share of the edge's global budget, **not** the config constant.
+    /// Rewritten by the driver on every connect and disconnect
+    /// ([`Conn::set_ceiling`]); `relax` aims at whatever it says now.
+    ceiling: AtomicU32,
+    /// This connection is counted in `Shared::live` — set once, when its
+    /// handshake joins it to the budget, cleared once, when it leaves. The
+    /// flag is what makes `join`/`leave` idempotent: a connection can be
+    /// dropped by its own reader, by a failed unsolicited push, by
+    /// `on_instance_restart` and by `stop`, and only the first of those may
+    /// move the counter.
+    counted: AtomicBool,
     /// Requests handed to the `Engine` and not yet completed.
     inflight: AtomicU32,
     /// Highest SUBMIT `seq` this edge has answered.
@@ -94,6 +110,20 @@ pub(crate) struct Conn {
     logged_unexpected: AtomicBool,
 }
 
+/// What [`Conn::set_ceiling`] did — the driver needs to know whether a client
+/// is owed a frame about it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CeilingChange {
+    /// The share is unchanged; nothing to say.
+    Same,
+    /// The share grew. The client learns it from the next `RESPONSE` or the
+    /// idle `STATUS` timer — a wider window costs nothing to learn late.
+    Raised,
+    /// The share shrank. The client MUST be told before it sends into the
+    /// window the edge no longer has.
+    Lowered,
+}
+
 impl Conn {
     pub fn new(idx: u32, writer: FramedConn, credits: u32, now_ns: u64) -> Self {
         Conn {
@@ -101,6 +131,8 @@ impl Conn {
             writer: Mutex::new(writer),
             client_id: AtomicU64::new(0),
             credits: AtomicU32::new(credits),
+            ceiling: AtomicU32::new(credits),
+            counted: AtomicBool::new(false),
             inflight: AtomicU32::new(0),
             acked_seq: AtomicU64::new(0),
             corr_to_seq: Mutex::new(HashMap::new()),
@@ -328,16 +360,22 @@ impl Conn {
         self.squeezed.store(true, Ordering::Release);
     }
 
-    /// Double the grant back towards `ceiling` after a completion, but only if
-    /// it was ever squeezed. Returns `true` if credits increased, which is what
-    /// obliges the caller to tell the client promptly.
+    /// Double the grant back towards the connection's current ceiling after a
+    /// completion, but only if it was ever squeezed. Returns `true` if credits
+    /// increased, which is what obliges the caller to tell the client promptly.
+    ///
+    /// The ceiling is the connection's live share of the edge's budget
+    /// ([`Conn::set_ceiling`]), not the config constant: a connection that
+    /// relaxes while five others are connected must not climb past the share
+    /// those five leave it.
     ///
     /// Same CAS discipline as [`Conn::squeeze`], and for the same reason —
     /// these two are the pair that races.
-    pub fn relax(&self, ceiling: u32) -> bool {
+    pub fn relax(&self) -> bool {
         if !self.squeezed.load(Ordering::Acquire) {
             return false;
         }
+        let ceiling = self.ceiling();
         let bumped = self.credits.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
             let next = c.saturating_mul(2).min(ceiling);
             if next > c { Some(next) } else { None }
@@ -357,6 +395,55 @@ impl Conn {
                 false
             }
         }
+    }
+
+    // ---------------------------------------------------------- the budget
+
+    pub fn ceiling(&self) -> u32 {
+        self.ceiling.load(Ordering::Acquire)
+    }
+
+    /// Set this connection's share of the edge's budget.
+    ///
+    /// A **reduction** clamps the live grant down immediately — the whole
+    /// point is that the edge stops admitting into a window it cannot honour
+    /// at the same moment the client is told about it, not one round trip
+    /// later. An **increase** is applied to the live grant only when the
+    /// connection is not squeezed; a squeezed connection climbs back through
+    /// [`Conn::relax`], which now aims at this ceiling on its own, so a
+    /// backpressure episode is not erased by an unrelated disconnect.
+    pub fn set_ceiling(&self, ceiling: u32) -> CeilingChange {
+        let ceiling = ceiling.max(1);
+        let prev = self.ceiling.swap(ceiling, Ordering::AcqRel);
+        if ceiling == prev {
+            return CeilingChange::Same;
+        }
+        if ceiling < prev {
+            let _ = self.credits.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                if c > ceiling { Some(ceiling) } else { None }
+            });
+            CeilingChange::Lowered
+        } else {
+            if !self.squeezed.load(Ordering::Acquire) {
+                let _ = self.credits.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                    if c < ceiling { Some(ceiling) } else { None }
+                });
+                self.notify_gate();
+            }
+            CeilingChange::Raised
+        }
+    }
+
+    /// `true` exactly once: the first call marks this connection as counted in
+    /// the edge's `live` tally.
+    pub fn mark_counted(&self) -> bool {
+        !self.counted.swap(true, Ordering::AcqRel)
+    }
+
+    /// `true` exactly once: the first call after [`Conn::mark_counted`] takes
+    /// it back out.
+    pub fn clear_counted(&self) -> bool {
+        self.counted.swap(false, Ordering::AcqRel)
     }
 
     // ------------------------------------------------- the prefix invariant
@@ -539,15 +626,45 @@ mod tests {
     #[test]
     fn credits_halve_under_pressure_and_climb_back_to_the_ceiling() {
         let c = a_conn(0, 8);
-        assert!(!c.relax(8), "never squeezed: nothing to relax");
+        assert!(!c.relax(), "never squeezed: nothing to relax");
         c.squeeze();
         c.squeeze();
         assert_eq!(c.credits(), 2);
-        assert!(c.relax(8));
+        assert!(c.relax());
         assert_eq!(c.credits(), 4);
-        assert!(c.relax(8));
+        assert!(c.relax());
         assert_eq!(c.credits(), 8);
-        assert!(!c.relax(8), "at the ceiling the squeeze flag clears");
+        assert!(!c.relax(), "at the ceiling the squeeze flag clears");
+    }
+
+    #[test]
+    fn a_lowered_ceiling_clamps_the_live_grant_at_once() {
+        let c = a_conn(0, 32);
+        assert_eq!(c.set_ceiling(32), CeilingChange::Same);
+        assert_eq!(c.set_ceiling(28), CeilingChange::Lowered);
+        assert_eq!(c.credits(), 28, "the edge stops admitting the moment the share shrinks");
+        assert_eq!(c.set_ceiling(32), CeilingChange::Raised);
+        assert_eq!(c.credits(), 32, "an unsqueezed connection takes its share back at once");
+    }
+
+    #[test]
+    fn a_raised_ceiling_does_not_erase_a_squeeze() {
+        let c = a_conn(0, 8);
+        c.squeeze();
+        assert_eq!(c.credits(), 4);
+        assert_eq!(c.set_ceiling(16), CeilingChange::Raised);
+        assert_eq!(c.credits(), 4, "a squeezed connection climbs back through relax, not here");
+        assert!(c.relax());
+        assert_eq!(c.credits(), 8, "…and relax now aims at the NEW ceiling");
+    }
+
+    #[test]
+    fn a_connection_is_counted_into_the_budget_exactly_once() {
+        let c = a_conn(0, 4);
+        assert!(c.mark_counted());
+        assert!(!c.mark_counted(), "joining twice must not double-count");
+        assert!(c.clear_counted());
+        assert!(!c.clear_counted(), "leaving twice must not double-discount");
     }
 
     #[test]

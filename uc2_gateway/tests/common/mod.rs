@@ -248,3 +248,56 @@ pub fn assert_no_gateway_threads() {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+
+// ------------------------------------------------------ raw framed client
+//
+// A `FramedConn` driven by hand, for the properties a `RemoteClient` cannot
+// report: what is on the wire, in what order. Shared by `credits_wire.rs`
+// (frame ordering) and `credits.rs` (the grant budget).
+
+use uc2_remote::conn::FramedConn;
+use uc2_remote::frame::{FrameType, Header, Hello, PROTOCOL_VERSION};
+
+/// Mid-frame stall budget for the raw reads below. Nothing in these tests
+/// writes a partial frame, so it only bounds a wedged test.
+pub const READ_STALL: Duration = Duration::from_secs(10);
+
+/// Open a raw framed connection, with a short read timeout so a silent edge
+/// shows up as `Ok(None)` rather than a hang.
+pub fn dial_raw(addr: std::net::SocketAddr) -> FramedConn {
+    let s = std::net::TcpStream::connect(addr).expect("connect");
+    let c = FramedConn::new(s).unwrap();
+    c.set_read_timeout(Some(Duration::from_millis(10))).unwrap();
+    c.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+    c
+}
+
+pub fn send_hello(c: &mut FramedConn, client_id: u64, app_id: &str) {
+    let mut out = Vec::new();
+    Hello { app_id }.encode(&mut out);
+    let h = Header { ty: FrameType::Hello, flags: 0, version: PROTOCOL_VERSION, client_id, seq: 0 };
+    c.write_frame(h, &out).expect("write HELLO");
+}
+
+/// Read frames until `want` arrives or `budget` runs out, returning its
+/// header and payload.
+pub fn read_until_frame(
+    c: &mut FramedConn,
+    want: FrameType,
+    budget: Duration,
+) -> Option<(Header, Vec<u8>)> {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        match c.read_frame(READ_STALL) {
+            Ok(Some((h, p))) if h.ty == want => return Some((h, p.to_vec())),
+            Ok(Some(_)) | Ok(None) => {}
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// [`read_until_frame`] when only the header matters.
+pub fn read_until(c: &mut FramedConn, want: FrameType, budget: Duration) -> Option<Header> {
+    read_until_frame(c, want, budget).map(|(h, _)| h)
+}
