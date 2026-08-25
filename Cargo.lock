@@ -1411,6 +1411,7 @@ dependencies = [
  "fs2",
  "hdrhistogram",
  "libc",
+ "memmap2",
  "rand",
  "serde",
  "signal-hook",
