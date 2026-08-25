@@ -54,10 +54,17 @@ gateway = "10.0.0.12:9200"
 # ---------------------------------------------------------------- optional
 
 [limits]
-# The local Engine's inflight window, shared across every connection.
+# The local Engine's inflight window, shared across every connection. The edge
+# holds back 1/8 of it as headroom and divides the rest — the "grant budget" —
+# equally across its live connections.
 max_inflight = 4096
-# Initial credits granted to each connection in HELLO_OK. Shrinks under
-# backpressure and relaxes back up to this ceiling.
+# CEILING on one connection's credits. The actual grant is
+# clamp(budget / live_connections, 1, per_conn_inflight), where budget is
+# max_inflight less its 1/8 headroom (3584 at the default above), so this
+# value binds only while few connections are attached. A value above the
+# budget is a startup REFUSAL (PerConnExceedsBudget); max_connections above
+# the budget is a startup WARNING (every connection past it floors at 1
+# credit). See docs/reference/gateway-config.md, "The grant budget".
 per_conn_inflight = 256
 # The Engine's per-request deadline, in milliseconds. A request that blows it
 # completes as TimedOut and the client is told UNKNOWN.

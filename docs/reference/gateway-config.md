@@ -43,32 +43,43 @@ some fields set takes the defaults for the rest.
 | Key | Type | Default | Meaning | Refusal |
 |---|---|---|---|---|
 | `max_inflight` | u32 | `4096` | the local `Engine`'s inflight window, shared across every connection on this edge | `0` → `ZeroMaxInflight` |
-| `per_conn_inflight` | u32 | `256` | initial credits granted to each connection in `HELLO_OK`; shrinks under backpressure, relaxes back up to this ceiling. **Per connection, and only per connection** — see the sizing warning below | `0` → `ZeroPerConnInflight`; greater than `max_inflight` → `PerConnExceedsMax { per_conn, max }` (one connection could exhaust the whole engine window) |
+| `per_conn_inflight` | u32 | `256` | credits granted to each connection at `HELLO_OK` — **an equal share of the edge's budget**, capped at this value; shrinks under backpressure and relaxes back up to the current share | `0` → `ZeroPerConnInflight`; greater than `max_inflight` → `PerConnExceedsMax { per_conn, max }`; greater than the **grant budget** (`max_inflight` less its 1/8 headroom) → `PerConnExceedsBudget { per_conn, budget, max_inflight }` |
 | `request_timeout_ms` | u64 | `10000` | the `Engine`'s per-request deadline; a request that blows it completes `TimedOut` and the client is told `UNKNOWN`. **Also a client's exposure window when this host's node has died and the supervisor has not stopped the gateway yet** — consider `2000` for a gateway, see [the how-to](../how-to/run-a-gateway.md#when-the-node-underneath-dies) | `0` → `ZeroRequestTimeout` |
 | `status_interval_ms` | u64 | `200` | a connection with no write for this long gets a standalone `STATUS` — also the edge→client liveness tick, so it must stay well under a client's `dead_after` | `0` → `ZeroStatusInterval` |
 | `max_connections` | u32 | `1024` | hard ceiling on simultaneously-open client connections; each costs a reader thread and a socket. Over it, the acceptor answers `HELLO_REFUSED{BUSY}` (reason `4`) without spawning a reader, counted as `EdgeStats::refused_busy` — a conforming client treats `BUSY` like `FAULTED` and tries the next member | `0` → `ZeroMaxConnections` |
 
-### Sizing `per_conn_inflight` and `max_connections` (2.6.0)
+### The grant budget (2.7.0)
 
-`per_conn_inflight` is granted **in full to every connection** at `HELLO_OK`,
-and the halve/relax ladder that follows is per-connection as well. **In
-`2.6.0` there is no global budget across connections**, and neither
-`max_inflight` nor `max_connections` bounds the *sum* of outstanding client
-requests against what the co-located node can admit. When that sum exceeds
-the node's ingress admission window (`[node] admission_bytes`, default
-`262144`), the edge does not shed load gracefully — the 2026-08-24 fleet
-ladder measured a ~30× throughput collapse, second-scale p95 and lost
-responses, with the edge burning ~7 of 8 cores and starving the node beside
-it ([gate record][edgesat]; a
-[confirmed defect][cleanrun], fix planned for the next milestone).
+The edge holds **one** `Engine` inflight window (`max_inflight`) and divides
+it across its connections instead of promising each one the same constant.
+Two derived numbers:
 
-Size it so that `connections × per_conn_inflight` stays **below** the node's
-admission window in frames (≈ 4–6k at the 256 KiB default), and bound the
-gateway's CPU when it is co-located. The how-to states the full envelope:
-[Operating envelope (2.6.0)](../how-to/run-a-gateway.md#operating-envelope-260).
+- **budget** = `max_inflight` − `max_inflight / 8`. The 1/8 headroom is not a
+  tuning dial and is not configurable: it is the slack that absorbs frames
+  already on the wire when a grant shrinks.
+- **grant** = `clamp(budget / live_connections, 1, per_conn_inflight)`, where
+  `live_connections` counts the handshaken connections on this edge.
 
-[edgesat]: ../benchmarks/uc2-m12-gate-2026-08-22.md#edge-saturation-ladder-2026-08-24-n-client-aggregate
-[cleanrun]: ../benchmarks/uc2-m12-gate-2026-08-22.md#clean-discipline-re-run-same-day-the-collapse-is-a-product-defect-not-a-harness-artifact
+At the defaults that is a budget of `3584` and a grant of `256` (the cap)
+for the first fourteen connections, `255` at fifteen, and so on down. A
+connection is told its grant in `HELLO_OK`, and every later change reaches
+it as an absolute `credits` value: a **reduction** is pushed as a standalone
+`STATUS` before it can send into the smaller window, an **increase** rides
+the next `RESPONSE` or the idle `STATUS` tick. `uc2_gateway::budget_for` and
+`uc2_gateway::grant_for` are public if you would rather compute than read.
+
+**What this replaces.** In `2.6.0` every connection was granted
+`per_conn_inflight` in full and nothing counted the sum, so N connections
+could promise N × 256 against a 4096-slot window and the only arbiter was
+the `Engine` refusing submits — the reactive halve/relax ladder, per
+connection, uncoordinated. That gap is closed; see
+[the correction note](../notes/uc2-m12a-edge-flow-control-gap.md).
+
+**The one case the budget does not cover:** past `live > budget` every grant
+floors at `1` and the sum exceeds the budget again. `validate` **warns**
+(it does not refuse — a floor of 1 still works, it is just miserable) when
+`max_connections > budget`; the binary prints the warning at startup. Size
+`max_connections` at or under the budget, or raise `max_inflight`.
 
 ## `[session]` — optional; its one field is independently optional
 

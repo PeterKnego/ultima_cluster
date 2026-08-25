@@ -55,6 +55,10 @@ fn main() -> ExitCode {
         }
     };
 
+    for w in cfg.warnings() {
+        eprintln!("uc2-gateway: warning: {w}");
+    }
+
     let edge = match Edge::start(cfg) {
         Ok(e) => e,
         Err(e) => {

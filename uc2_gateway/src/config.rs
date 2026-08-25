@@ -54,6 +54,10 @@ pub enum ConfigError {
     #[error("per_conn_inflight ({per_conn}) exceeds max_inflight ({max}): one connection could \
              exhaust the whole engine window")]
     PerConnExceedsMax { per_conn: u32, max: u32 },
+    #[error("per_conn_inflight ({per_conn}) exceeds the edge's grant budget ({budget} = \
+             max_inflight {max_inflight} less its 1/8 headroom): a single connection could \
+             promise more than the Engine window can honour")]
+    PerConnExceedsBudget { per_conn: u32, budget: u32, max_inflight: u32 },
     #[error("status_interval must be greater than zero: it is also the edge->client liveness tick")]
     ZeroStatusInterval,
     #[error("request_timeout must be greater than zero")]
@@ -165,6 +169,14 @@ impl EdgeConfig {
                 max: self.max_inflight,
             });
         }
+        let budget = crate::budget_for(self.max_inflight);
+        if self.per_conn_inflight > budget {
+            return Err(ConfigError::PerConnExceedsBudget {
+                per_conn: self.per_conn_inflight,
+                budget,
+                max_inflight: self.max_inflight,
+            });
+        }
         if self.status_interval.is_zero() {
             return Err(ConfigError::ZeroStatusInterval);
         }
@@ -175,6 +187,24 @@ impl EdgeConfig {
             return Err(ConfigError::ZeroMaxConnections);
         }
         Ok(())
+    }
+
+    /// Configuration that is legal but probably not what was meant. Unlike
+    /// [`EdgeConfig::validate`] these never refuse a start — they are printed
+    /// once by the `uc2-gateway` binary and are otherwise inert.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let budget = crate::budget_for(self.max_inflight);
+        if self.max_connections > budget {
+            out.push(format!(
+                "max_connections ({}) is above the edge's grant budget ({budget} = max_inflight \
+                 {} less its 1/8 headroom): past {budget} simultaneous connections each one is \
+                 granted the floor of 1 credit and the sum stops fitting the Engine window. \
+                 Raise max_inflight or lower max_connections.",
+                self.max_connections, self.max_inflight
+            ));
+        }
+        out
     }
 }
 
@@ -255,5 +285,43 @@ mod tests {
         assert_eq!(c.validate(), Err(ConfigError::ZeroMaxConnections));
         let c = EdgeConfig { max_connections: 1, ..ok() };
         assert_eq!(c.validate(), Ok(()), "one connection is a legal, if lonely, ceiling");
+    }
+
+    #[test]
+    fn per_conn_credits_may_not_exceed_the_grant_budget() {
+        // The budget is the Engine window less its 1/8 headroom, so a
+        // per-connection cap between the two is refused BY NAME rather than
+        // silently over-promising the window on the very first connection.
+        let c = EdgeConfig { max_inflight: 4096, per_conn_inflight: 4096, ..ok() };
+        assert_eq!(
+            c.validate(),
+            Err(ConfigError::PerConnExceedsBudget {
+                per_conn: 4096,
+                budget: 3584,
+                max_inflight: 4096
+            })
+        );
+        let c = EdgeConfig { max_inflight: 4096, per_conn_inflight: 3584, ..ok() };
+        assert_eq!(c.validate(), Ok(()), "exactly the budget is grantable");
+        // The pre-existing, coarser check still fires first for a value over
+        // the window itself.
+        let c = EdgeConfig { max_inflight: 8, per_conn_inflight: 9, ..ok() };
+        assert_eq!(c.validate(), Err(ConfigError::PerConnExceedsMax { per_conn: 9, max: 8 }));
+    }
+
+    #[test]
+    fn a_connection_ceiling_above_the_budget_is_warned_about_not_refused() {
+        // Legal — the grant simply floors at 1 for the connections past the
+        // budget — but almost certainly not what the operator meant.
+        let c = EdgeConfig { max_inflight: 64, per_conn_inflight: 8, max_connections: 4096, ..ok() };
+        assert_eq!(c.validate(), Ok(()));
+        let w = c.warnings();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("max_connections"), "{}", w[0]);
+        assert!(w[0].contains("56"), "the warning must state the budget: {}", w[0]);
+
+        let quiet = EdgeConfig { max_connections: 16, ..c };
+        assert!(quiet.warnings().is_empty());
+        assert!(ok().warnings().is_empty(), "the defaults must not warn");
     }
 }
