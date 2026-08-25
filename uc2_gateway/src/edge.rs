@@ -1873,4 +1873,15 @@ mod tests {
             }
         }
     }
+
+    /// `grant_changes` counts redivisions, in both directions, per connection.
+    /// A stat nobody can reach from `EdgeStats` is a stat nobody will read.
+    #[test]
+    fn the_stats_snapshot_exposes_grant_changes() {
+        let s = EdgeStats::default();
+        assert_eq!(s.grant_changes, 0);
+        let cells = StatCells::default();
+        cells.grant_changes.fetch_add(3, Ordering::Relaxed);
+        assert_eq!(cells.snapshot().grant_changes, 3);
+    }
 }
