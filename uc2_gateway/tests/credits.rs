@@ -162,3 +162,78 @@ fn a_squeezed_window_still_resolves_every_request() {
     node.stop();
     svc.stop();
 }
+
+/// (spec §5.4, i) Whatever the edge has promised across every connection, the
+/// SUM of it stays inside the budget — at every observed moment, not merely
+/// once the dust settles. Sampled by a watchdog thread while connections
+/// arrive, so a transient over-promise between "this connection is ready" and
+/// "everyone else has been told their share shrank" is caught.
+#[test]
+fn the_sum_of_grants_never_exceeds_the_edges_budget() {
+    let root = common::tempdir();
+    let (node, dir) = common::start_single_node(root.path());
+    let svc = uc2_service::ServiceBuilder::new(
+        uc2_service::ServiceConfig::new(&dir, common::APP),
+        uc2_service::Sessioned::new(
+            uc_lincheck::register::RegisterSm::default(),
+            uc2_service::SessionConfig::default(),
+        ),
+    )
+    .start()
+    .unwrap();
+    common::await_serving(&node, 10);
+
+    // budget = 64 - 64/8 = 56; per-connection cap 32. Six connections is
+    // well inside `live <= budget`, so the floor-at-1 exception cannot apply.
+    let edge = std::sync::Arc::new(Edge::start(edge_config(&dir, 64, 32)).unwrap());
+    let budget = uc2_gateway::budget_for(64);
+    assert_eq!(budget, 56);
+
+    let worst = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (e2, w2, s2) =
+        (std::sync::Arc::clone(&edge), std::sync::Arc::clone(&worst), std::sync::Arc::clone(&stop));
+    let sampler = std::thread::spawn(move || {
+        while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+            let sum: u32 = e2.grants_for_tests().iter().map(|(_, g)| *g).sum();
+            w2.fetch_max(sum, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    });
+
+    let mut conns = Vec::new();
+    for i in 0..6u64 {
+        let mut c = common::dial_raw(edge.local_addr());
+        common::send_hello(&mut c, 0x100 + i, common::APP);
+        let ok = common::read_until(&mut c, uc2_remote::frame::FrameType::HelloOk,
+                                    Duration::from_secs(5));
+        assert!(ok.is_some(), "connection {i} never got HELLO_OK");
+        let live = (i + 1) as u32;
+        let want = uc2_gateway::grant_for(live, budget, 32);
+        // Settled state: everyone holds the same share.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let g = edge.grants_for_tests();
+            if g.len() == live as usize && g.iter().all(|(_, x)| *x == want) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline,
+                    "grants never settled to {want} at live={live}: {g:?}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        conns.push(c);
+    }
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    sampler.join().unwrap();
+    let worst = worst.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(worst <= budget,
+            "the edge promised {worst} credits at once against a budget of {budget}");
+    assert!(worst > 0, "the sampler never saw a grant at all — vacuous");
+
+    drop(conns);
+    std::sync::Arc::try_unwrap(edge).ok().unwrap().stop();
+    common::assert_no_gateway_threads();
+    node.stop();
+    svc.stop();
+}

@@ -123,7 +123,7 @@ use uc2_remote::frame::{
 };
 use uc_protocol::ring::RingWaitHandle;
 
-use crate::conn::{Conn, ConnTable};
+use crate::conn::{CeilingChange, Conn, ConnTable};
 use crate::config::{ConfigError, EdgeConfig};
 use crate::watch::LeaderWatch;
 
@@ -185,6 +185,16 @@ const DRIVER_PARK: Duration = Duration::from_millis(1);
 /// How often the driver runs its periodic work (status timer, leader watch)
 /// while completions are streaming in without a break.
 const DRIVER_PERIODIC_EVERY: u64 = 64;
+
+/// How long a handshaking reader waits for the driver to publish the smaller
+/// share to the connections already here, before granting its own connection
+/// anything.
+///
+/// Bounded, and short: the driver's idle park is capped at [`DRIVER_PARK`]
+/// (1 ms), so this is normally microseconds. On the timeout path the new
+/// connection is granted its share anyway and the momentary over-promise
+/// lands in the budget's headroom — which is what the headroom is for.
+const GRANT_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// The fraction of the `Engine` window the edge keeps out of the grant
 /// budget: `1/8`.
@@ -251,6 +261,7 @@ struct StatCells {
     leader_changed_frames: AtomicU64,
     status_frames: AtomicU64,
     refused_busy: AtomicU64,
+    grant_changes: AtomicU64,
 }
 
 impl StatCells {
@@ -268,6 +279,7 @@ impl StatCells {
             leader_changed_frames: self.leader_changed_frames.load(Ordering::Relaxed),
             status_frames: self.status_frames.load(Ordering::Relaxed),
             refused_busy: self.refused_busy.load(Ordering::Relaxed),
+            grant_changes: self.grant_changes.load(Ordering::Relaxed),
         }
     }
 }
@@ -326,6 +338,10 @@ pub struct EdgeStats {
     /// edge was already at `max_connections`. Not counted under `connections`,
     /// which counts connections actually taken on.
     pub refused_busy: u64,
+    /// Times a connection's grant was recomputed to a **different** value —
+    /// the edge redividing its budget as connections come and go. Counted per
+    /// connection per change, both directions.
+    pub grant_changes: u64,
 }
 
 // ---------------------------------------------------------------- shared
@@ -344,6 +360,23 @@ struct Shared {
     /// The node's own payload bound, read off the cnc page. Enforced here,
     /// before `try_submit`, so an oversized frame never touches the ring.
     max_payload: usize,
+    /// The total outstanding grant this edge will hand out across every
+    /// connection — [`budget_for`] of the `Engine` window. Fixed at start;
+    /// what moves is how it is divided.
+    budget: u32,
+    /// Connections counted into the budget: handshaken, not yet departed.
+    live: AtomicU32,
+    /// A connect or a disconnect has changed the share; the driver's next
+    /// pass republishes it. A flag rather than a queue because the work is
+    /// idempotent — recompute every connection's share from `live` — so
+    /// coalescing two triggers into one pass is correct, not a shortcut.
+    regrant: AtomicBool,
+    /// Bumped by the driver after each pass that has published the current
+    /// share to every ready connection. A handshaking reader waits for it to
+    /// move before granting its own connection anything, which is what makes
+    /// "the sum of grants is at most the budget" true at every instant rather
+    /// than eventually. See [`Shared::await_settled`].
+    grant_gen: AtomicU64,
     /// Correlation ids, edge-wide rather than per connection: a stale
     /// completion then cannot collide with a fresh request's `corr` even in
     /// the (already guarded) case of an index collision.
@@ -447,15 +480,16 @@ impl Shared {
 
     /// Write a standalone `STATUS`. Silently does nothing on a connection whose
     /// handshake has not completed — an unsolicited frame before `HELLO_OK`
-    /// would fail the peer's dial (see `Conn::ready`).
-    fn write_status(&self, conn: &Conn) {
+    /// would fail the peer's dial (see `Conn::ready`). Returns `false` if the
+    /// connection died on the write.
+    fn write_status(&self, conn: &Conn) -> bool {
         if !conn.is_ready() {
-            return;
+            return true;
         }
         let mut out = Vec::new();
         Status { acked_seq: conn.acked_seq(), credits: conn.credits() }.encode(&mut out);
         self.stats.status_frames.fetch_add(1, Ordering::Relaxed);
-        conn.write(conn.hdr(FrameType::Status, 0, 0), &out, self.now_ns());
+        conn.write(conn.hdr(FrameType::Status, 0, 0), &out, self.now_ns())
     }
 
     /// Batch variants of the three answer helpers above: they encode the frame
@@ -530,6 +564,79 @@ impl Shared {
     fn is_faulted(&self) -> bool {
         self.faulted.load(Ordering::SeqCst)
     }
+
+    // ---------------------------------------------------------- the budget
+
+    /// Every ready connection's current share.
+    fn current_grant(&self) -> u32 {
+        grant_for(self.live.load(Ordering::Acquire), self.budget, self.cfg.per_conn_inflight)
+    }
+
+    /// Ask the driver to republish the share. Idempotent and free.
+    fn request_regrant(&self) {
+        self.regrant.store(true, Ordering::Release);
+    }
+
+    /// Count a handshaken connection into the budget and ask for a
+    /// republication, so the connections already here give up their part of
+    /// its share.
+    fn join(&self, conn: &Conn) {
+        if conn.mark_counted() {
+            self.live.fetch_add(1, Ordering::AcqRel);
+            self.request_regrant();
+        }
+    }
+
+    /// Take a departed connection back out. Its share is freed, so the
+    /// remaining connections are owed a bigger one — an increase, which rides
+    /// their next `RESPONSE` or the idle `STATUS` timer rather than a push.
+    fn leave(&self, conn: &Conn) {
+        if conn.clear_counted() {
+            self.live.fetch_sub(1, Ordering::AcqRel);
+            self.request_regrant();
+        }
+    }
+
+    /// Wait (briefly, boundedly) until the driver has published a share at
+    /// least as new as `from_gen`.
+    fn await_settled(&self, from_gen: u64) {
+        let deadline = Instant::now() + GRANT_SETTLE_TIMEOUT;
+        while self.grant_gen.load(Ordering::Acquire) == from_gen {
+            if self.stopping() || Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    }
+
+    /// Recompute every ready connection's share and tell the ones whose window
+    /// SHRANK, right away. Driver thread only — it is the only thread that may
+    /// write on a connection other than its own.
+    fn push_grants(&self) {
+        let grant = self.current_grant();
+        let mut dead: Vec<u32> = Vec::new();
+        self.table.for_each(|c| {
+            if !c.is_ready() {
+                return;
+            }
+            match c.set_ceiling(grant) {
+                CeilingChange::Same => {}
+                CeilingChange::Raised => {
+                    self.stats.grant_changes.fetch_add(1, Ordering::Relaxed);
+                }
+                CeilingChange::Lowered => {
+                    self.stats.grant_changes.fetch_add(1, Ordering::Relaxed);
+                    if !self.write_status(c) {
+                        dead.push(c.idx);
+                    }
+                }
+            }
+        });
+        for idx in dead {
+            self.table.remove(idx);
+        }
+        self.grant_gen.fetch_add(1, Ordering::Release);
+    }
 }
 
 // ---------------------------------------------------------------- edge
@@ -582,6 +689,7 @@ impl Edge {
         // to break the acceptor out of `accept`.
         listener.set_nonblocking(true).map_err(EdgeError::Bind)?;
 
+        let budget = budget_for(cfg.max_inflight);
         let members =
             cfg.members.iter().map(|m| (m.node_id, m.gateway.clone())).collect::<HashMap<_, _>>();
         let wake = poll.wait_handle();
@@ -593,6 +701,10 @@ impl Edge {
             stop: AtomicBool::new(false),
             t0: Instant::now(),
             max_payload,
+            budget,
+            live: AtomicU32::new(0),
+            regrant: AtomicBool::new(false),
+            grant_gen: AtomicU64::new(0),
             next_corr: AtomicU32::new(0),
             readers: Mutex::new(Vec::new()),
             faulted: AtomicBool::new(false),
@@ -658,6 +770,28 @@ impl Edge {
     #[cfg(feature = "test-util")]
     pub fn fault_for_tests(&self) {
         self.shared.on_instance_restart();
+    }
+
+    /// Every **ready** connection's `(idx, grant)` right now, sorted by index.
+    ///
+    /// "Grant" is the connection's live credit figure — what the client is
+    /// actually allowed to have outstanding — not its ceiling, so a squeezed
+    /// connection reports the smaller number. The sum of these is the quantity
+    /// the budget bounds.
+    ///
+    /// Behind `test-util` for the same reason as [`Edge::fault_for_tests`]:
+    /// hiding a method from rustdoc does not stop anything calling it, and the
+    /// build, not the documentation, is what says who may.
+    #[cfg(feature = "test-util")]
+    pub fn grants_for_tests(&self) -> Vec<(u32, u32)> {
+        let mut v = Vec::new();
+        self.shared.table.for_each(|c| {
+            if c.is_ready() {
+                v.push((c.idx, c.credits()));
+            }
+        });
+        v.sort_unstable();
+        v
     }
 
     /// Stop serving and join every thread this edge started.
@@ -824,7 +958,12 @@ fn reader(shared: Arc<Shared>, conn: Arc<Conn>, send: SendHalf, mut fc: FramedCo
             }
         }
     }
+    // Order matters: out of the table FIRST, so this connection's grant is
+    // invisible before `leave` lets the survivors grow into its share — the
+    // reverse order would over-promise the budget for as long as the driver's
+    // republication took.
     shared.table.remove(conn.idx);
+    shared.leave(&conn);
 }
 
 /// Read the client's `HELLO`, check it, and answer. Returns `false` if the
@@ -876,14 +1015,27 @@ fn handshake(shared: &Arc<Shared>, conn: &Arc<Conn>, send: &SendHalf, fc: &mut F
         return false;
     }
 
+    // Join the budget BEFORE granting anything, and wait for the driver to
+    // have taken this connection's share back off the connections already
+    // here. Only then is a grant computed and put on the wire — so a client
+    // is never told a number the edge has not already made room for, and the
+    // sum of outstanding grants never exceeds the budget even for an instant.
+    let start_gen = shared.grant_gen.load(Ordering::Acquire);
+    shared.join(conn);
+    shared.await_settled(start_gen);
+    let grant = shared.current_grant();
+    conn.set_ceiling(grant);
+
     let leader = send.leader_hint();
     let leader_addr = leader.and_then(|id| shared.gateway_of(id)).unwrap_or("");
     let mut out = Vec::new();
-    HelloOk { credits: shared.cfg.per_conn_inflight, leader, leader_addr }.encode(&mut out);
+    HelloOk { credits: grant, leader, leader_addr }.encode(&mut out);
     if !conn.write(conn.hdr(FrameType::HelloOk, 0, h.seq), &out, shared.now_ns()) {
         return false;
     }
-    // Only now may the edge write on its own initiative (the STATUS timer).
+    // Only now may the edge write on its own initiative (the STATUS timer),
+    // and only now does this connection's grant count towards the budget as
+    // far as `grants_for_tests` and `push_grants` are concerned.
     conn.set_ready();
     true
 }
@@ -1200,6 +1352,7 @@ fn driver(shared: Arc<Shared>, mut poll: PollHalf, send: SendHalf) {
         let n = drain_once(&shared, &send, &mut poll);
         if n > 0 {
             idle = 0;
+            regrant_tick(&shared);
             // Under a stream of completions the driver may never take the idle
             // path at all, so the watch gets its own cadence here: one sample
             // (two atomic loads) per `DRIVER_PERIODIC_EVERY` completions.
@@ -1214,6 +1367,7 @@ fn driver(shared: Arc<Shared>, mut poll: PollHalf, send: SendHalf) {
         // notices a leader change within about a millisecond. (The STATUS
         // timer below is gated instead — it walks the whole table.)
         leader_tick(&shared, &send, &mut watch);
+        regrant_tick(&shared);
         maybe_periodic(&shared, &mut last_periodic, periodic_every);
         if shared.stopping() {
             break;
@@ -1260,6 +1414,18 @@ fn leader_tick(shared: &Arc<Shared>, send: &SendHalf, watch: &mut LeaderWatch) {
     }
 }
 
+/// Republish the grant share if a connect or a disconnect has changed it.
+///
+/// Cheap by construction on the no-change path — one atomic swap — which is
+/// every pass but the ones right after a connection arrives or leaves. Runs
+/// ungated on both the busy and the idle path so a waiting handshake is
+/// released within one driver iteration (bounded by [`DRIVER_PARK`]).
+fn regrant_tick(shared: &Arc<Shared>) {
+    if shared.regrant.swap(false, Ordering::AcqRel) {
+        shared.push_grants();
+    }
+}
+
 /// Run [`periodic`] at most once per `every`.
 fn maybe_periodic(shared: &Arc<Shared>, last: &mut Instant, every: Duration) {
     let now = Instant::now();
@@ -1281,7 +1447,7 @@ fn periodic(shared: &Arc<Shared>) {
         if c.is_ready() && now.saturating_sub(c.last_write_ns()) >= interval {
             // Doubles as edge→client liveness: a client that hears nothing at
             // all for its `dead_after` fails the connection over.
-            shared.write_status(c);
+            let _ = shared.write_status(c);
         }
     });
 }
@@ -1359,7 +1525,7 @@ fn complete(
     // a redirect, a timed-out slot — is that window giving a slot back. Gating
     // the relax on `Response` would pin a connection at 1 credit for as long as
     // the node was answering `NotLeader`, and then leave it there.
-    let credits_up = conn.relax(shared.cfg.per_conn_inflight);
+    let credits_up = conn.relax();
     conn.notify_gate();
 
     match c.outcome {
