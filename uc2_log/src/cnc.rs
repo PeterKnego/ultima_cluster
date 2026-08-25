@@ -23,7 +23,7 @@ use uc_protocol::v2::cnc::{
     self, CNC_MAX_PEER_SLOTS, CNC_OFF_ADMIN_AUTH, CNC_OFF_ADMIN_REQ, CNC_OFF_ADMIN_RESP,
     CNC_OFF_ADMISSION_BYTES, CNC_OFF_APPEND, CNC_OFF_ARCHIVE_FIRST_BASE, CNC_OFF_CONFIG_PENDING,
     CNC_OFF_CONFIG_VERSION, CNC_OFF_FREE_DISK_BYTES, CNC_OFF_HEADER_CRC,
-    CNC_OFF_INGRESS_HOLES_SKIPPED, CNC_OFF_PEER_SLOTS,
+    CNC_OFF_INGRESS_HOLES_SKIPPED, CNC_OFF_PEER_SLOTS, CNC_OFF_QUERY_HOLES_SKIPPED,
     CNC_OFF_SEAL_FAILURES, CNC_OFF_SERVICE_APPLIED, CNC_OFF_SERVICE_SNAPSHOT_POS, CNC_OFF_TERM,
     CNC_PAGE_LEN, CNC_PEER_SLOT_STRIDE, CNC_V2_VERSION, CncHeader,
 };
@@ -514,8 +514,10 @@ impl CncPage {
         unsafe { (*ptr).store_release(v) }
     }
 
-    /// M13a: cumulative dead-producer ring holes skipped — see
-    /// `CNC_OFF_INGRESS_HOLES_SKIPPED`'s doc.
+    /// M13a: cumulative abandoned-claim holes skipped on the **ingress**
+    /// ring — see `CNC_OFF_INGRESS_HOLES_SKIPPED`'s doc. The query ring is
+    /// counted separately by [`Self::query_holes_skipped`]; the two are not
+    /// summed.
     pub fn ingress_holes_skipped(&self) -> u64 {
         // SAFETY: offset 3968, size 8.
         let ptr =
@@ -523,12 +525,30 @@ impl CncPage {
         unsafe { (*ptr).load_acquire() }
     }
 
-    /// M13a: store the cumulative skipped-hole count. Writer: the consensus
-    /// agent, on change only.
+    /// M13a: store the ingress ring's skipped-hole count. Writer: the
+    /// consensus agent, on change only.
     pub fn store_ingress_holes_skipped(&self, v: u64) {
         // SAFETY: offset 3968, size 8.
         let ptr =
             unsafe { self.region.ptr_at(CNC_OFF_INGRESS_HOLES_SKIPPED) as *const PaddedAtomicU64 };
+        unsafe { (*ptr).store_release(v) }
+    }
+
+    /// M13a (final review): cumulative abandoned-claim holes skipped on the
+    /// **query** ring — see `CNC_OFF_QUERY_HOLES_SKIPPED`'s doc.
+    pub fn query_holes_skipped(&self) -> u64 {
+        // SAFETY: offset 4032, size 8.
+        let ptr =
+            unsafe { self.region.ptr_at(CNC_OFF_QUERY_HOLES_SKIPPED) as *const PaddedAtomicU64 };
+        unsafe { (*ptr).load_acquire() }
+    }
+
+    /// M13a (final review): store the query ring's skipped-hole count.
+    /// Writer: the consensus agent, on change only.
+    pub fn store_query_holes_skipped(&self, v: u64) {
+        // SAFETY: offset 4032, size 8.
+        let ptr =
+            unsafe { self.region.ptr_at(CNC_OFF_QUERY_HOLES_SKIPPED) as *const PaddedAtomicU64 };
         unsafe { (*ptr).store_release(v) }
     }
 
@@ -851,6 +871,9 @@ mod tests {
         assert_eq!(CNC_OFF_FREE_DISK_BYTES, 3840);
         // M13a: ingress_holes_skipped.
         assert_eq!(CNC_OFF_INGRESS_HOLES_SKIPPED, 3968);
+        // M13a (final review): query_holes_skipped — the page's last line.
+        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED, 4032);
+        assert_eq!(CNC_OFF_QUERY_HOLES_SKIPPED + 64, CNC_PAGE_LEN);
     }
 
     #[test]
@@ -1138,6 +1161,26 @@ mod tests {
             u64::from_le_bytes(raw[3968..3976].try_into().unwrap()),
             3,
             "offset pin: the value must live at 3968 exactly"
+        );
+    }
+
+    /// M13a (final review): the query ring gets its OWN line — the two
+    /// counters are independent, so a reader can tell a losing submit path
+    /// from a losing read path. Pins the offset and the independence.
+    #[test]
+    fn query_holes_skipped_roundtrip_and_offset_pin() {
+        let page = CncPage::heap(&test_meta());
+        assert_eq!(page.query_holes_skipped(), 0, "fresh page reads 0 (no holes)");
+        page.store_query_holes_skipped(7);
+        assert_eq!(page.query_holes_skipped(), 7);
+        assert_eq!(page.ingress_holes_skipped(), 0, "the ingress line is untouched");
+        page.store_ingress_holes_skipped(3);
+        assert_eq!(page.query_holes_skipped(), 7, "the query line is untouched");
+        let raw = page.page();
+        assert_eq!(
+            u64::from_le_bytes(raw[4032..4040].try_into().unwrap()),
+            7,
+            "offset pin: the value must live at 4032 exactly"
         );
     }
 

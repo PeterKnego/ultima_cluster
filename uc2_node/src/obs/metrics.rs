@@ -69,6 +69,7 @@ pub const CONTRACT_SERIES: &[&str] = &[
     "uc2_truncations_total",
     "uc2_wipes_total",
     "uc2_ingress_holes_skipped_total",
+    "uc2_query_holes_skipped_total",
     "uc2_reports_unattested_total",
     "uc2_reports_implausible_total",
     "uc2_crypto_handshake_failures_total",
@@ -419,8 +420,14 @@ pub fn render_prometheus(s: &ObsSources) -> String {
     push_counter(
         &mut out,
         "uc2_ingress_holes_skipped_total",
-        "Client ring records skipped because the producing process died between its claim and its commit.",
+        "Claims abandoned on the client INGRESS ring (submits): a producer that died or stalled past the hole timeout between its claim and its commit.",
         s.cnc.ingress_holes_skipped(),
+    );
+    push_counter(
+        &mut out,
+        "uc2_query_holes_skipped_total",
+        "Claims abandoned on the client QUERY ring (reads): a producer that died or stalled past the hole timeout between its claim and its commit.",
+        s.cnc.query_holes_skipped(),
     );
     push_counter(
         &mut out,
@@ -692,12 +699,19 @@ mod tests {
             || text.contains(&format!("\n# TYPE {name} "))
     }
 
+    /// Final review, Important 2: TWO series, one per client-facing ring —
+    /// not one aggregate. The independence is the point: an operator must be
+    /// able to tell a losing submit path from a losing read path.
     #[test]
-    fn ingress_holes_skipped_is_exported() {
+    fn ingress_and_query_holes_skipped_are_two_independent_series() {
         let s = synthetic_sources();
         assert!(render_prometheus(&s).contains("uc2_ingress_holes_skipped_total 0"));
+        assert!(render_prometheus(&s).contains("uc2_query_holes_skipped_total 0"));
         s.cnc.store_ingress_holes_skipped(2);
-        assert!(render_prometheus(&s).contains("uc2_ingress_holes_skipped_total 2"));
+        s.cnc.store_query_holes_skipped(5);
+        let text = render_prometheus(&s);
+        assert!(text.contains("uc2_ingress_holes_skipped_total 2"), "{text}");
+        assert!(text.contains("uc2_query_holes_skipped_total 5"), "{text}");
     }
 
     #[test]
