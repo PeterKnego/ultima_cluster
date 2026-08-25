@@ -112,6 +112,22 @@ pub struct Header {
     pub seq: u64,
 }
 
+/// The 24 header bytes for a frame of `payload_len` bytes, as a stack array —
+/// so a caller can copy the header and the payload into a ring (or an
+/// `iovec`) without an intermediate `Vec`. `encode_frame` is this plus the
+/// payload.
+pub fn encode_header_into(h: Header, payload_len: usize) -> [u8; HEADER_LEN] {
+    let len = (HEADER_LEN + payload_len) as u32;
+    let mut out = [0u8; HEADER_LEN];
+    out[0..4].copy_from_slice(&len.to_le_bytes());
+    out[4] = h.ty as u8;
+    out[5] = h.flags;
+    out[6..8].copy_from_slice(&h.version.to_le_bytes());
+    out[8..16].copy_from_slice(&h.client_id.to_le_bytes());
+    out[16..24].copy_from_slice(&h.seq.to_le_bytes());
+    out
+}
+
 /// Append one encoded frame (header + payload) to `out`.
 ///
 /// Callers must reject an oversized payload (`HEADER_LEN + payload.len() >
@@ -124,12 +140,7 @@ pub fn encode_frame(out: &mut Vec<u8>, h: Header, payload: &[u8]) {
         "encode_frame: frame of {len} bytes exceeds MAX_FRAME_LEN ({MAX_FRAME_LEN}); caller must reject oversized payloads before calling encode_frame"
     );
     out.reserve(len);
-    out.extend_from_slice(&(len as u32).to_le_bytes());
-    out.push(h.ty as u8);
-    out.push(h.flags);
-    out.extend_from_slice(&h.version.to_le_bytes());
-    out.extend_from_slice(&h.client_id.to_le_bytes());
-    out.extend_from_slice(&h.seq.to_le_bytes());
+    out.extend_from_slice(&encode_header_into(h, payload.len()));
     out.extend_from_slice(payload);
 }
 
@@ -450,5 +461,27 @@ mod tests {
         // len=1, one invalid UTF-8 byte.
         let buf: [u8; 3] = [1, 0, 0xFF];
         assert!(matches!(Hello::decode(&buf), Err(FrameError::BadPayload("utf8"))));
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[test]
+    fn encode_header_into_matches_encode_frame() {
+        let h = Header {
+            ty: FrameType::Submit,
+            flags: 0,
+            version: PROTOCOL_VERSION,
+            client_id: 0x0102_0304_0506_0708,
+            seq: 42,
+        };
+        let payload = b"hello";
+        let mut whole = Vec::new();
+        encode_frame(&mut whole, h, payload);
+        let hdr = encode_header_into(h, payload.len());
+        assert_eq!(&whole[..HEADER_LEN], &hdr[..], "the two encoders must agree byte for byte");
+        assert_eq!(&whole[HEADER_LEN..], payload);
     }
 }
