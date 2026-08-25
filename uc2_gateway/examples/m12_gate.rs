@@ -965,9 +965,17 @@ fn run_remote_measurement(
     }
     let send_window_end_ns = t0.elapsed().as_nanos() as u64;
 
+    // Nothing else drives `poll` here (single thread, no poll thread — see
+    // the function doc): an empty drain means genuinely nothing is ready yet,
+    // so park on the link's wait handle instead of bare-spinning a core for
+    // up to `DRAIN_GRACE` on a degraded run (`RemotePollHalf::poll`'s own doc;
+    // the same pattern as `run_client_measurement`'s poll thread and
+    // `hop_bench/remote_load.rs`'s poller). The main submit loop above is
+    // unaffected — `try_submit` + drain is its own pacing.
+    let wait = poll.wait_handle();
     let drain_deadline = Instant::now() + DRAIN_GRACE;
     while resolved.load(Ordering::Relaxed) < sent_idx && Instant::now() < drain_deadline {
-        drain_remote(
+        let n = drain_remote(
             poll,
             &send_ns,
             &mut hist,
@@ -977,6 +985,9 @@ fn run_remote_measurement(
             &lost,
             &last_response_ns,
         );
+        if n == 0 {
+            wait.park(Duration::from_micros(200));
+        }
     }
 
     let sends = sent_idx;
@@ -1038,9 +1049,11 @@ fn run_remote_measurement(
 }
 
 /// One nonblocking drain of `poll`, folded into the counters
-/// [`run_remote_measurement`] reports from. `expired` responses (the edge's
-/// dedup window moved past this seq before the answer arrived) carry no body
-/// and count as lost, same as `Unknown`/`TimedOut`/`Closed`/`PayloadTooLarge`.
+/// [`run_remote_measurement`] reports from, returning the number of
+/// completions drained (0 tells the tail-drain loop it is safe to park).
+/// `expired` responses (the edge's dedup window moved past this seq before
+/// the answer arrived) carry no body and count as lost, same as
+/// `Unknown`/`TimedOut`/`Closed`/`PayloadTooLarge`.
 #[allow(clippy::too_many_arguments)]
 fn drain_remote(
     poll: &mut RemotePollHalf,
@@ -1051,7 +1064,7 @@ fn drain_remote(
     resolved: &AtomicU64,
     lost: &AtomicU64,
     last_response_ns: &AtomicU64,
-) {
+) -> usize {
     poll.poll(|c| {
         resolved.fetch_add(1, Ordering::Relaxed);
         match c.outcome {
@@ -1069,7 +1082,7 @@ fn drain_remote(
                 lost.fetch_add(1, Ordering::Relaxed);
             }
         }
-    });
+    })
 }
 
 /// The gateway arm's own stats the direct arm has no analog for — printed
