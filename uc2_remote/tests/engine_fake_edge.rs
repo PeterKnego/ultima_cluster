@@ -156,17 +156,48 @@ fn a_run_of_queries_never_closes_the_window() {
 
 /// A `STATUS` may carry a LOWER absolute grant at any time, and it binds new
 /// admissions immediately — the wire's §6 clarification.
+///
+/// Measured in two phases, because the edge's `max_unanswered` is a LIFETIME
+/// high-water mark: once the connection has run under a grant of 8, `peak <=
+/// 8` is true however the client behaves afterwards, so asserting it proves
+/// nothing about the shrink. `reset_peak` on a drained pipeline is what makes
+/// phase two a statement about the NEW grant — and `credits() == 1` on its own
+/// would only prove the word was updated, not that admission tightened.
 #[test]
 fn a_status_carrying_a_lower_grant_is_honoured_for_new_seqs() {
-    let edge =
-        FakeEdge::spawn(Behaviour { credits: 8, shrink_credits_to: Some(1), ..Default::default() });
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 8,
+        shrink_credits_to: Some(1),
+        // Long enough that the submitter is always ahead of the answers, so
+        // phase one's depth is about the grant and not about scheduling.
+        delay: Duration::from_millis(5),
+        ..Default::default()
+    });
     let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
-    let got = run_submits(&send, &mut poll, 12, |i| vec![i as u8]);
-    assert_eq!(got.len(), 12);
-    // The edge's own high-water mark is the assertion: the client never had
-    // more unanswered than the grant in force.
-    let peak = edge.observed.max_unanswered.load(AtomicOrdering::SeqCst);
-    assert!(peak <= 8, "the client must never exceed the grant it was given: {peak}");
+
+    // --- phase one: the initial grant of 8, and a pipeline that uses it.
+    let got = run_submits(&send, &mut poll, 8, |i| vec![i as u8]);
+    assert_eq!(got.len(), 8);
+    let pre = edge.observed.max_unanswered.load(AtomicOrdering::SeqCst);
+    assert!(pre > 1, "a grant of 8 must pipeline, or phase two proves nothing: peak {pre}");
+    assert!(pre <= 8, "and it must never exceed the grant it was given: peak {pre}");
+
+    // --- the shrink lands, and the pipeline drains under it.
+    assert!(
+        until(|| send.credits() == 1 && send.inflight() == 0),
+        "the STATUS must be applied and the window drained: credits {}, inflight {}",
+        send.credits(),
+        send.inflight()
+    );
+    // Nothing is outstanding at either end, so the next peak is entirely
+    // about what the reduced grant admits.
+    edge.observed.reset_peak();
+
+    // --- phase two: the SAME submitter loop, now under a grant of one.
+    let got = run_submits(&send, &mut poll, 6, |i| vec![i as u8]);
+    assert_eq!(got.len(), 6, "the burst must still complete, one at a time, as completions drain");
+    let post = edge.observed.max_unanswered.load(AtomicOrdering::SeqCst);
+    assert_eq!(post, 1, "a reduced grant must bind admission, not just the reported window");
     assert_eq!(send.credits(), 1, "the last absolute grant seen is the window");
     assert_eq!(send.stats().max_credits_seen, 8, "max_credits_seen is a high-water mark");
     send.shutdown();

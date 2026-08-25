@@ -132,6 +132,9 @@ pub struct Observed {
     /// Every SUBMIT/QUERY `seq`, in arrival order, across all connections.
     pub seqs: Mutex<Vec<u64>>,
     /// The high-water mark of unanswered requests (the credit assertion).
+    /// **Lifetime-scoped** unless a test narrows it with
+    /// [`Observed::reset_peak`], so on its own it can only ever prove the
+    /// widest grant the connection ever had.
     pub max_unanswered: AtomicU32,
     unanswered: AtomicU32,
 }
@@ -145,6 +148,25 @@ impl Observed {
 
     fn answering(&self) {
         self.unanswered.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Start a fresh measurement phase: `max_unanswered` is dropped back to
+    /// what is unanswered right now.
+    ///
+    /// This is what makes a grant CHANGE assertable. The high-water mark is
+    /// otherwise for the whole connection, so after an 8-credit phase every
+    /// `peak <= 8` holds whatever the client does next — a vacuous assertion
+    /// dressed as a credit check. Call this from the test once the pipeline
+    /// has drained (client `inflight() == 0`, which implies this edge has
+    /// nothing unanswered, since `answering` decrements BEFORE the write),
+    /// and the next peak is a statement about the new grant alone.
+    #[allow(
+        dead_code,
+        reason = "this module is compiled into BOTH test binaries and only the \
+                  engine suite measures a grant change"
+    )]
+    pub fn reset_peak(&self) {
+        self.max_unanswered.store(self.unanswered.load(Ordering::SeqCst), Ordering::SeqCst);
     }
 
     /// The observed seqs with consecutive duplicates collapsed — a re-send after
