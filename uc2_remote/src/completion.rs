@@ -214,6 +214,10 @@ impl CompletionQueue {
             done += n;
         }
         r.body_off = ah;
+        debug_assert!(
+            body.len() <= u32::MAX as usize,
+            "push: a body length must fit Record::body_len"
+        );
         r.body_len = body.len() as u32;
         let slot = (h as usize) & self.slot_mask;
         // SAFETY: slot `head & slot_mask` is producer-owned until `head` is
@@ -550,6 +554,7 @@ mod tests {
             seen
         });
 
+        let mut refusals = 0u64;
         for (user_data, position, tag, body) in &expected {
             let mut r = Record::simple(*user_data, *tag);
             r.position = *position;
@@ -560,6 +565,7 @@ mod tests {
                 if q.push(r, body) {
                     break;
                 }
+                refusals += 1;
                 q.publish(); // let the consumer see what is already queued
                 q.drained().park(observed, Duration::from_millis(20));
             }
@@ -573,6 +579,11 @@ mod tests {
         assert!(
             seen == expected,
             "the consumer's drained stream must equal the exact push order, records and bodies"
+        );
+        assert!(
+            refusals > 0,
+            "the producer never hit a full queue — the backpressure path, and the \
+             producer-writes-while-the-callback-reads overlap it creates, went untested"
         );
         let (h, t, ah, at) = q.cursors();
         assert_eq!(h, t, "every slot was released");
