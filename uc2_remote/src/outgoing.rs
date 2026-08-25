@@ -247,7 +247,6 @@ impl OutRing {
     /// CONSUMER ONLY: used by the redial path, which re-sends the live window
     /// by hand and then jumps the cursor to the snapshot it worked against.
     /// Forward-only, so it can never expose bytes the producer has reclaimed.
-    #[allow(dead_code, reason = "task 8's redial re-sends the live window by hand and then jumps the cursor")]
     pub(crate) fn set_send_pos(&self, pos: u64) {
         debug_assert!(
             pos <= self.write_pos(),
@@ -261,7 +260,6 @@ impl OutRing {
 
     /// CONSUMER ONLY: copy one frame's bytes out (the RETRY / redial paths,
     /// which re-send a frame that is behind `send`). `out` is cleared first.
-    #[allow(dead_code, reason = "task 8's RETRY / redial paths copy a frame out to re-send it")]
     pub(crate) fn copy_range(&self, off: u64, len: u32, out: &mut Vec<u8>) {
         debug_assert!(
             off >= self.ack_pos() && off + len as u64 <= self.write_pos(),
