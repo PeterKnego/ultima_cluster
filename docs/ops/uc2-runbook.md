@@ -41,6 +41,9 @@ verify rather than a build:
 - [Run a cluster on real hosts](../how-to/run-a-cluster.md) — durable instance
   directories, the bind-address rule, client placement, process supervision,
   and restart cost. *Was §2, §4.*
+- [Upgrade a cluster](../how-to/upgrade-a-cluster.md) — the flag day, and (as
+  of 2.7.0) the rule that a host's node, service, gateway and shmem clients
+  restart *together*, because the ring file format changed.
 - [Keep the journal from growing without bound](../how-to/bound-journal-growth.md)
   — snapshots, then purging, and confirming it works. *Was §5.*
 - [Run a gateway](../how-to/run-a-gateway.md) — a TCP front door for clients
