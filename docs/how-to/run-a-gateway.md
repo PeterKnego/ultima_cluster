@@ -116,7 +116,8 @@ another edge the same way a mid-request node crash would.
 
 ## What a client sees on failover
 
-A conforming client (`uc2_remote::RemoteClient`, or a port that implements
+A conforming client (`uc2_remote`'s `RemoteEngine` halves or the `RemoteClient`
+convenience over them, or a port that implements
 [the protocol reference](../reference/remote-protocol.md)) never surfaces
 `REDIRECT`, `LEADER_CHANGED`, `RETRY`, or a dropped connection to its
 caller — it absorbs all four and resolves every request to exactly one of a

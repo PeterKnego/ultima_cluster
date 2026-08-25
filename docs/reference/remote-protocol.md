@@ -212,10 +212,34 @@ neither carries credits or session state.
 
 ## Flow control — credits
 
-**Credit rule:** the client may have at most `credits` unanswered `seq`s
-beyond `acked_seq` — i.e. it may write `seq` only while `seq <= acked_seq +
-credits`. `HELLO_OK` grants the initial value; every `RESPONSE` and `STATUS`
-carries the current `(acked_seq, credits)` pair and can move either number.
+**Credit rule:** the client may have at most `credits` **unanswered
+requests** outstanding at once — submits and queries both — i.e. it may
+issue a new request only while the count of requests already accepted and
+not yet answered is `< credits` (and, locally, `< max_inflight`). `HELLO_OK`
+grants the initial value; every `RESPONSE` and `STATUS` carries the current
+`(acked_seq, credits)` pair and can move either number. **The window is a
+count, not a `seq` range**: `acked_seq` advances on a `SUBMIT`'s completion
+only — a `QUERY` never moves it — so `seq <= acked_seq + credits` is not the
+rule (a run of queries alone would starve a client under that reading, since
+nothing would ever raise `acked_seq`). `acked_seq` is a resend/staleness
+hint, not an admission input.
+
+**`credits` is an absolute grant, and it MAY decrease.** Every `HELLO_OK`,
+`RESPONSE` and `STATUS` carries the grant the edge is willing to honour *from
+now on* — it is not a delta and not a ceiling that only rises. A client that
+sees a lower value honours it immediately for its next admission decision;
+the requests already on the wire under the older, wider grant are not
+recalled (that is what the edge's headroom is for). `uc2_remote`'s client has
+always behaved this way — it stores whatever the last frame said and gates
+the next admission on the unanswered-request count against it, not on
+`seq` — and this paragraph makes the requirement explicit for a port.
+
+**`STATUS` MAY be sent at any time.** The reference edge sends one on its
+idle timer and when a `relax` widens the window, and it MAY send one the
+moment it *reduces* a grant, so a client learns about a narrower window
+before its next `RESPONSE` rather than after it. A conforming client
+therefore treats `STATUS` as "apply this `(acked_seq, credits)` pair now",
+never as an idle-only keepalive.
 
 The edge sizes credits from its local `Engine`'s inflight window
 (`per_conn_inflight`, the ceiling every connection relaxes back towards) and
@@ -348,18 +372,43 @@ client absorbs them:
   steady stream of submits some request is always near expiry, the budget
   pins itself to its floor, and a healthy-but-slow cluster (a cross-region
   hop, or a gateway briefly saturated after a failover) becomes permanently
-  unreachable. Two bounded caveats on the same invariant: a peer stalling
-  mid-frame parks the reader for up to `dead_after` (next bullet), and a
-  submitting thread's write holds the client's state lock for up to its write
-  timeout. `RemoteClient::submit`'s credit wait is a *separate*
-  `request_timeout` budget from the one the returned ticket spends, so a
-  caller's worst case is about twice the configured value.
+  unreachable. One bounded caveat on the same invariant: a peer stalling
+  mid-frame parks the reader for up to `dead_after` (next bullet). Submitting
+  a request does **not** add to this budget — on the split engine a submit
+  takes no lock and makes no syscall, it only encodes into the outgoing ring,
+  and the socket is owned by the writer thread alone (this replaces an
+  earlier, single-lock client's third caveat, where a submitting thread's
+  write held a shared state lock for up to its write timeout).
+  `RemoteClient::submit`'s credit wait is a *separate* `request_timeout`
+  budget from the one the returned ticket spends, so a caller's worst case is
+  about twice the configured value.
 - **A peer that stalls mid-frame is a dead peer.** A frame that is still
   incomplete after the reader's stall budget (`dead_after` for
   `RemoteClient`, `request_timeout` for the reference edge) fails the
   connection rather than being waited on: half a header and then silence must
   reach the same verdict as silence between frames, or the reader's own tick
   never runs again.
+
+### How the reference client is built (informative)
+
+`uc2_remote` implements the promises above with **two threads per connection
+and no lock on the request path**, which a port may but need not copy:
+
+- the **submitter** (the caller's own thread) checks the window from two
+  atomics (`acked_seq`, `credits`), assigns the next `seq`, encodes the frame
+  into a preallocated ring and records the request in a slot table — no
+  syscall, no allocation;
+- the **writer** thread drains that ring into ONE `write` per drain
+  (flush-on-empty, no batch timer), owns the socket for dial/redial, and
+  re-sends the live window in `seq` order after a reconnect;
+- the **reader** thread reads 64 KiB at a time, applies `(acked_seq,
+  credits)`, resolves slots, and hands completions to the caller's poller in
+  one batch per read.
+
+The blocking `RemoteClient`/`Ticket` API is a thin convenience over that pair
+of halves ([`RemoteEngine::connect`]), not a separate implementation. What the
+wire requires of any client is only what the sections above say: the credit
+rule, the ordered re-send, the probe before flush, and the liveness clocks.
 
 ## What this page does not cover
 
