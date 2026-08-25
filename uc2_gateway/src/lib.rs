@@ -48,4 +48,4 @@ mod edge;
 mod watch;
 
 pub use config::{ConfigError, EdgeConfig, Member};
-pub use edge::{Edge, EdgeError, EdgeStats};
+pub use edge::{BUDGET_HEADROOM_DIV, Edge, EdgeError, EdgeStats, budget_for, grant_for};

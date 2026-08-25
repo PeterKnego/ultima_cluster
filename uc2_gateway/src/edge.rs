@@ -186,6 +186,40 @@ const DRIVER_PARK: Duration = Duration::from_millis(1);
 /// while completions are streaming in without a break.
 const DRIVER_PERIODIC_EVERY: u64 = 64;
 
+/// The fraction of the `Engine` window the edge keeps out of the grant
+/// budget: `1/8`.
+///
+/// Deliberately a constant and **not** a config key. It is not a tuning
+/// dial — it is the slack that makes a *shrinking* grant safe: a client that
+/// is told a smaller absolute number honours it for new seqs, but the frames
+/// it already put on the wire are still owed `Engine` slots, and the
+/// handshake's grant-settle wait ([`Shared::await_settled`]) falls back to
+/// granting a share when the driver has not published in time. Both cases
+/// land in this headroom. An operator who wants a smaller sum lowers
+/// `per_conn_inflight`; one who wants a bigger one raises `max_inflight`.
+pub const BUDGET_HEADROOM_DIV: u32 = 8;
+
+/// The edge's **total** outstanding-grant budget: the `Engine` window less
+/// the headroom above. The sum of what every connection has been granted
+/// stays at or under this (see [`grant_for`] for the one documented
+/// exception).
+pub fn budget_for(max_inflight: u32) -> u32 {
+    max_inflight.saturating_sub(max_inflight / BUDGET_HEADROOM_DIV).max(1)
+}
+
+/// One connection's share of the budget: an equal split, capped by the
+/// operator's `per_conn_inflight` and floored at 1.
+///
+/// The floor is the documented exception to "the sum is at most the budget":
+/// once `live > budget` every connection would be entitled to zero, and a
+/// zero grant wedges a connection forever (the same reason
+/// [`crate::conn::Conn::squeeze`] floors at 1). `EdgeConfig::validate` warns
+/// when `max_connections > budget_for(max_inflight)`, which is exactly the
+/// configuration in which that can happen.
+pub fn grant_for(live: u32, budget: u32, per_conn: u32) -> u32 {
+    (budget / live.max(1)).clamp(1, per_conn.max(1))
+}
+
 // ---------------------------------------------------------------- errors
 
 /// Why an [`Edge`] could not start.
@@ -1528,5 +1562,45 @@ mod tests {
     #[test]
     fn with_the_envelope_off_bytes_pass_through_untouched() {
         assert_eq!(response_shape(false, false, &[0, 1, 2]), (0, &[0u8, 1, 2][..]));
+    }
+
+    #[test]
+    fn the_budget_holds_back_an_eighth_of_the_engine_window() {
+        assert_eq!(budget_for(4096), 3584, "4096 - 4096/8");
+        assert_eq!(budget_for(8), 7);
+        // Below the divisor the headroom rounds to nothing; the budget is then
+        // the whole window, which is still a bound, just a tight one.
+        assert_eq!(budget_for(4), 4);
+        assert_eq!(budget_for(1), 1);
+        assert_eq!(budget_for(0), 1, "a zero budget would wedge every connection");
+    }
+
+    #[test]
+    fn a_grant_is_an_equal_share_capped_by_the_config_and_floored_at_one() {
+        // One connection takes the whole budget, but never more than the
+        // operator allowed it.
+        assert_eq!(grant_for(1, 3584, 256), 256);
+        assert_eq!(grant_for(1, 200, 256), 200, "the budget binds below the cap");
+        // Equal shares.
+        assert_eq!(grant_for(2, 56, 32), 28);
+        assert_eq!(grant_for(4, 56, 32), 14);
+        // The floor: past `live > budget` a share would round to zero, which
+        // would wedge a connection forever. It is also the point past which
+        // the sum can exceed the budget — `validate` warns about it.
+        assert_eq!(grant_for(100, 56, 32), 1);
+        assert_eq!(grant_for(0, 56, 32), 32, "no live connections reads as one");
+    }
+
+    #[test]
+    fn grants_sum_within_the_budget_while_live_is_within_it() {
+        for budget in [7u32, 56, 3584, 57344] {
+            for live in 1..=budget.min(64) {
+                let g = grant_for(live, budget, u32::MAX);
+                assert!(
+                    g * live <= budget,
+                    "live={live} budget={budget} grant={g}: the sum over-promises"
+                );
+            }
+        }
     }
 }
