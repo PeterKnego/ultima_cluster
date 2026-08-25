@@ -131,6 +131,7 @@ impl Observed {
 
     /// The observed seqs with consecutive duplicates collapsed — a re-send after
     /// a redirect or a drop legitimately repeats a seq.
+    #[allow(dead_code, reason = "this module is compiled separately into EVERY test binary, and `engine_fake_edge` does not reach the seq assertions until task 6 starts submitting requests; `client_fake_edge` uses both today")]
     pub fn seq_order(&self) -> Vec<u64> {
         let mut out: Vec<u64> = Vec::new();
         for s in self.seqs.lock().unwrap().iter() {
@@ -141,6 +142,7 @@ impl Observed {
         out
     }
 
+    #[allow(dead_code, reason = "this module is compiled separately into EVERY test binary, and `engine_fake_edge` does not reach the seq assertions until task 6 starts submitting requests; `client_fake_edge` uses both today")]
     pub fn seq_count(&self) -> usize {
         self.seqs.lock().unwrap().len()
     }

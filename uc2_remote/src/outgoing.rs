@@ -23,13 +23,10 @@
 //! writer comes back for the tail (two `write_all_bytes` once per lap, not per
 //! frame).
 //!
-//! This is task 2 of the M13b split-client build (design spec §3): the
-//! writer thread and the submitter's `try_submit` that will drive this ring
-//! land in later tasks, so until then the only caller is this module's own
-//! test suite — same reasoning [`crate::park::WaitCell`] carried after task
-//! 1, and lifted the same way once this ring gets its first real caller.
-
-#![allow(dead_code)]
+//! Task 5 gave this ring its real consumer: `link::Writer`, the writer
+//! thread's role token, is the only holder of the CONSUMER methods. The
+//! PRODUCER methods wait for task 6's `try_submit` and task 8's re-send path,
+//! and carry a narrow per-item `allow` until then.
 
 use std::ptr;
 use std::slice;
@@ -124,6 +121,7 @@ impl OutRing {
     /// the need against [`OutRing::capacity`]).
     ///
     /// PRODUCER ONLY.
+    #[allow(dead_code, reason = "task 6's `try_submit` is the producer; this ring has no submitter yet")]
     pub(crate) fn push_frame(&self, h: Header, payload: &[u8]) -> Option<(u64, u32)> {
         let need = HEADER_LEN + payload.len();
         if need > self.capacity() || need > self.free() {
@@ -164,6 +162,7 @@ impl OutRing {
     /// (e.g. releasing up to `write_pos()` right after a push, before the
     /// writer has drained anything) and this must be a no-op rather than
     /// letting `ack` run ahead of `send`. PRODUCER ONLY.
+    #[allow(dead_code, reason = "task 6's `try_submit` reclaims here once a seq is acked")]
     pub(crate) fn release_to(&self, pos: u64) {
         let send = self.send.load(Ordering::Acquire);
         let target = pos.min(send);
@@ -209,6 +208,7 @@ impl OutRing {
     /// CONSUMER ONLY: used by the redial path, which re-sends the live window
     /// by hand and then jumps the cursor to the snapshot it worked against.
     /// Forward-only, so it can never expose bytes the producer has reclaimed.
+    #[allow(dead_code, reason = "task 8's redial re-sends the live window by hand and then jumps the cursor")]
     pub(crate) fn set_send_pos(&self, pos: u64) {
         debug_assert!(
             pos <= self.write_pos(),
@@ -222,6 +222,7 @@ impl OutRing {
 
     /// CONSUMER ONLY: copy one frame's bytes out (the RETRY / redial paths,
     /// which re-send a frame that is behind `send`). `out` is cleared first.
+    #[allow(dead_code, reason = "task 8's RETRY / redial paths copy a frame out to re-send it")]
     pub(crate) fn copy_range(&self, off: u64, len: u32, out: &mut Vec<u8>) {
         debug_assert!(
             off >= self.ack_pos() && off + len as u64 <= self.write_pos(),

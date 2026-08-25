@@ -14,12 +14,18 @@
 pub mod client;
 pub(crate) mod completion;
 pub mod conn;
+pub mod engine;
 pub mod error;
 pub mod frame;
+pub(crate) mod link;
 pub(crate) mod outgoing;
 pub(crate) mod park;
 pub(crate) mod slots;
 
-pub use client::{RemoteClient, RemoteConfig, RemoteResponse, RemoteStats, Ticket};
+pub use client::{RemoteClient, Ticket};
 pub use conn::FramedConn;
+pub use engine::{
+    Consistency, RemoteCompletion, RemoteConfig, RemoteEngine, RemoteOutcome, RemotePollHalf,
+    RemoteResponse, RemoteSendHalf, RemoteStats, RemoteWaitHandle, SubmitError,
+};
 pub use error::{FrameError, RemoteError};

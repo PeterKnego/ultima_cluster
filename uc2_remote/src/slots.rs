@@ -24,15 +24,10 @@
 //!    threads; they are advisory (they steer the writer), never the
 //!    completion protocol, so `Relaxed` is correct for them.
 //!
-//! This is task 4 of the M13b split-client build (design spec §3): the
-//! submitter's `try_submit` and the writer/reader threads that claim/resolve
-//! against this table land in later tasks, so until then the only caller is
-//! this module's own test suite — same reasoning [`crate::park::WaitCell`],
-//! [`crate::outgoing::OutRing`] and [`crate::completion::CompletionQueue`]
-//! carried, and lifted the same way once this table gets its first real
-//! caller.
-
-#![allow(dead_code)]
+//! Task 5 gave this table its first real callers — the link's deadline sweep,
+//! its shutdown drain and its retransmit bookkeeping. The claim/resolve
+//! protocol itself waits for task 6's `try_submit` and the reader's frame
+//! handlers, and each still-unused item carries a narrow `allow` until then.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -108,6 +103,7 @@ impl SlotTable {
     /// SUBMITTER ONLY. `false` = the window is full or the slot's previous
     /// occupant is still live; either way the caller reports backpressure and
     /// does NOT consume the seq.
+    #[allow(dead_code, reason = "task 6's `try_submit` claims the slot")]
     pub(crate) fn claim(
         &self,
         seq: u64,
@@ -158,10 +154,12 @@ impl SlotTable {
         Resolve::Won { user_data }
     }
 
+    #[allow(dead_code, reason = "task 6's RESPONSE handler resolves the slot")]
     pub(crate) fn resolve(&self, seq: u64) -> Resolve {
         self.take(seq)
     }
 
+    #[allow(dead_code, reason = "task 8/9 abort a slot the edge answered finally")]
     pub(crate) fn abort(&self, seq: u64) -> Resolve {
         self.take(seq)
     }
@@ -209,15 +207,18 @@ impl SlotTable {
         n
     }
 
+    #[allow(dead_code, reason = "task 8's ordered window re-send skips dead slots")]
     pub(crate) fn is_live(&self, seq: u64) -> bool {
         self.slot(seq).owner.load(Ordering::Acquire) == seq + 1
     }
 
+    #[allow(dead_code, reason = "task 8's re-send copies the frame out of the ring by extent")]
     pub(crate) fn extent(&self, seq: u64) -> (u64, u32) {
         let s = self.slot(seq);
         (s.off.load(Ordering::Relaxed), s.len.load(Ordering::Relaxed))
     }
 
+    #[allow(dead_code, reason = "task 8's re-send needs SUBMIT vs QUERY for the stats split")]
     pub(crate) fn kind(&self, seq: u64) -> ReqKind {
         if self.slot(seq).kind.load(Ordering::Relaxed) == ReqKind::Query as u8 {
             ReqKind::Query
@@ -230,6 +231,7 @@ impl SlotTable {
         self.slot(seq).sent.store(u8::from(sent), Ordering::Relaxed);
     }
 
+    #[allow(dead_code, reason = "task 8's re-send skips what is already on the wire")]
     pub(crate) fn is_sent(&self, seq: u64) -> bool {
         self.slot(seq).sent.load(Ordering::Relaxed) != 0
     }
@@ -238,10 +240,12 @@ impl SlotTable {
         self.slot(seq).not_before_ns.store(ns, Ordering::Relaxed);
     }
 
+    #[allow(dead_code, reason = "task 8 honours a RETRY backoff through this")]
     pub(crate) fn not_before(&self, seq: u64) -> u64 {
         self.slot(seq).not_before_ns.load(Ordering::Relaxed)
     }
 
+    #[allow(dead_code, reason = "task 8 counts a request's re-sends")]
     pub(crate) fn bump_attempts(&self, seq: u64) -> u32 {
         self.slot(seq).attempts.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -251,10 +255,12 @@ impl SlotTable {
     }
 
     /// The lowest seq never yet issued. SUBMITTER publishes, writer reads.
+    #[allow(dead_code, reason = "task 8's re-send walks the submitter's published seq range")]
     pub(crate) fn next_seq(&self) -> u64 {
         self.next_seq.load(Ordering::Acquire)
     }
 
+    #[allow(dead_code, reason = "task 6's `try_submit` publishes the cursor the writer reads")]
     pub(crate) fn publish_next_seq(&self, seq: u64) {
         self.next_seq.store(seq, Ordering::Release);
     }

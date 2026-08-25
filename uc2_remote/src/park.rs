@@ -13,12 +13,10 @@
 //! check and the park bumps the seq, so the park returns immediately instead
 //! of sleeping through the wake it was told about.
 //!
-//! This is task 1 of the M13b split-client build (design spec §3): the
-//! outgoing ring (task 2) is the first non-test caller, and it only reaches
-//! [`WaitCell::new`] and [`WaitCell::signal`] — the completion queue and the
-//! writer/reader threads that `seq`/`park` a "check, then park" loop against
-//! land in later tasks. Those two methods keep a narrow `allow` below until
-//! then.
+//! Task 5 wired the last of it up: the writer thread parks on the outgoing
+//! ring's cell, the poller on the completion queue's `ready` cell and the
+//! reader on its `drained` cell, all through the seq-observed pattern above.
+//! Nothing here is unused any more.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -41,11 +39,6 @@ impl WaitCell {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "task 3's completion-queue tests park against these; the first \
-                  non-test caller is the reader/poll pair, task 4"
-    )]
     pub(crate) fn seq(&self) -> u64 {
         self.seq.load(Ordering::Acquire)
     }
@@ -62,11 +55,6 @@ impl WaitCell {
     }
 
     /// Park until the seq moves past `observed`, or `timeout` elapses.
-    #[allow(
-        dead_code,
-        reason = "task 3's completion-queue tests park against these; the first \
-                  non-test caller is the reader/poll pair, task 4"
-    )]
     pub(crate) fn park(&self, observed: u64, timeout: Duration) {
         self.waiters.fetch_add(1, Ordering::SeqCst);
         let g = self.lock.lock().unwrap();
