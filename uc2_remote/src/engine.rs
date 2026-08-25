@@ -239,6 +239,13 @@ pub struct RemoteStats {
     /// ceiling), not about this client, so each costs one member rather than
     /// the whole dial.
     pub refused_members: u64,
+    /// Redial requests ignored because they named a connection that had
+    /// already been replaced. Both link threads can notice the same
+    /// connection dying; only the first complaint costs a reconnect, and this
+    /// counts the ones that would otherwise have torn down the fresh
+    /// connection behind it. Steady state is a small number next to
+    /// `reconnects`, not zero.
+    pub stale_redials: u64,
     /// `write_all_bytes` calls the writer thread made. `frames_written /
     /// socket_writes` is the batching factor — 1.0 is the old client's
     /// one-write-per-submit behaviour, which is what M13b exists to fix.

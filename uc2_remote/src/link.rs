@@ -117,6 +117,7 @@ pub(crate) struct StatCells {
     pub(crate) expired: AtomicU64,
     pub(crate) max_credits_seen: AtomicU32,
     pub(crate) refused_members: AtomicU64,
+    pub(crate) stale_redials: AtomicU64,
     pub(crate) socket_writes: AtomicU64,
     #[allow(
         dead_code,
@@ -138,6 +139,7 @@ impl StatCells {
             expired: self.expired.load(Ordering::Relaxed),
             max_credits_seen: self.max_credits_seen.load(Ordering::Relaxed),
             refused_members: self.refused_members.load(Ordering::Relaxed),
+            stale_redials: self.stale_redials.load(Ordering::Relaxed),
             socket_writes: self.socket_writes.load(Ordering::Relaxed),
             frames_written: self.frames_written.load(Ordering::Relaxed),
         }
@@ -148,11 +150,13 @@ impl StatCells {
 struct Reconnect {
     needed: bool,
     preferred: Option<String>,
-    /// The read half of the connection the writer just dialled, waiting to be
-    /// picked up by the reader.
-    read_half: Option<FramedConn>,
-    /// Bumped on every successful dial, so the reader can tell a fresh half
-    /// from the one it already took.
+    /// The read half of the connection the writer just dialled, tagged with
+    /// its generation, waiting to be picked up by the reader.
+    read_half: Option<(u64, FramedConn)>,
+    /// **The connection generation, and its authority.** Bumped by exactly one
+    /// writer (the writer thread), under this mutex, at the instant a new
+    /// socket is installed. [`Link::generation`] mirrors it for lock-free
+    /// readers; this field is what that mirror is derived from.
     epoch: u64,
 }
 
@@ -172,6 +176,18 @@ pub(crate) struct Link {
     /// [`drain_completions`]. Private for the same reason.
     completions: CompletionQueue,
     credits: AtomicU32,
+    /// The current connection's generation — the lock-free mirror of
+    /// `Reconnect::epoch`, published with `Release` inside the same critical
+    /// section that bumps it.
+    ///
+    /// It exists because both threads can notice the *same* dead connection
+    /// independently, and the second one to notice would otherwise tear down
+    /// the connection the first one already replaced (and, worse, overwrite
+    /// its `HELLO_OK` grant with a stale absolute credit count still sitting
+    /// in a `next_buffered` batch). Every complaint therefore names the
+    /// connection it is about: see [`Link::request_redial`] and
+    /// [`credit_update`].
+    generation: AtomicU64,
     /// The highest `acked_seq` any frame advertised. Monotone.
     #[allow(
         dead_code,
@@ -227,6 +243,7 @@ impl Link {
                 cfg.arena_bytes_resolved(),
             ),
             credits: AtomicU32::new(info.credits),
+            generation: AtomicU64::new(0),
             acked_seq: AtomicU64::new(0),
             proven: AtomicBool::new(false),
             probe_seq: AtomicU64::new(0),
@@ -298,6 +315,13 @@ impl Link {
         self.credits.load(Ordering::Acquire)
     }
 
+    /// The generation of the connection currently installed. A thread that
+    /// holds a socket compares its own stamp against this before complaining
+    /// about it or applying a grant read from it.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
     pub(crate) fn inflight(&self) -> u64 {
         self.slots.inflight()
     }
@@ -350,23 +374,44 @@ impl Link {
 
     /// COMPLETION-QUEUE PRODUCER ONLY — the reader thread, or a [`Link::close`]
     /// that has already joined it. Push one completion, parking (never
-    /// dropping) while the poller is behind.
+    /// dropping) while the poller is behind. `false` = the link is closed and
+    /// the queue is full, so this outcome was dropped.
     ///
-    /// The park terminates: a request is either a live slot or a queued
-    /// record, never both, so `live_slots + queued <= max_inflight <=
-    /// CompletionQueue::entries()` — the slot side can always take one more.
-    fn complete(&self, r: Record, body: &[u8]) {
+    /// **While the link is open the park terminates and nothing is dropped.**
+    /// The slot side can always take one more (a request is either a live slot
+    /// or a queued record, never both, so `live_slots + queued <=
+    /// max_inflight <= CompletionQueue::entries()`), and the arena side is
+    /// floored at `MAX_FRAME_LEN`, so the poller draining even one record
+    /// frees room for any body this wire admits.
+    ///
+    /// **After `close` the loop gives up instead.** The slot bound does not
+    /// cover the arena: `push` also refuses a body that does not fit the free
+    /// arena bytes, and after a close there is provably no consumer left to
+    /// free any — the poll half is being dropped, or the caller has shut the
+    /// link down and is inside `close`'s join. Parking there would wedge that
+    /// join forever (`RemotePollHalf::drop -> close -> join(reader)` with the
+    /// reader parked here). Exactly-once is a promise about a LIVE link; once
+    /// the link is closed the caller has abandoned the outcomes, so dropping
+    /// them is the only termination that exists — and it is strictly better
+    /// than deadlocking the drop of the very half that would have received
+    /// them. `close_common` signals BOTH cells precisely so a producer already
+    /// parked here wakes up to observe `closed()`.
+    fn complete(&self, r: Record, body: &[u8]) -> bool {
         loop {
             if self.completions.push(r, body) {
-                return;
+                return true;
             }
             // The poller is behind. Publish what is queued so it has something
-            // to do, then park on its drain signal. Dropping is not an option:
-            // every accepted request owes exactly one completion.
+            // to do, then park on its drain signal. While the link is open,
+            // dropping is not an option: every accepted request owes exactly
+            // one completion.
             let observed = self.completions.drained().seq();
             self.completions.publish();
             if self.completions.push(r, body) {
-                return;
+                return true;
+            }
+            if self.closed() {
+                return false;
             }
             self.completions.drained().park(observed, Duration::from_millis(1));
         }
@@ -381,7 +426,9 @@ impl Link {
         let mut fired = Vec::new();
         let n = self.slots.sweep(now, |ud| fired.push(ud));
         for ud in fired {
-            self.complete(Record::simple(ud, OutcomeTag::TimedOut), &[]);
+            // A `false` here means the link closed under us with a full queue
+            // and no consumer; see `complete`.
+            let _ = self.complete(Record::simple(ud, OutcomeTag::TimedOut), &[]);
         }
         if n > 0 {
             self.completions.publish();
@@ -392,28 +439,47 @@ impl Link {
     /// COMPLETION-QUEUE PRODUCER ONLY. Fail every still-live request with
     /// `Closed`. Idempotent — the slot table's single-CAS protocol makes a
     /// second pass a no-op.
+    ///
+    /// A `Closed` that does not fit an already-full queue is dropped rather
+    /// than parked on (see [`Link::complete`]): this runs with `closed` set,
+    /// so there is no consumer that could make room, and parking would wedge
+    /// the join this is called from.
     fn abort_outstanding(&self) {
         let mut aborted = Vec::new();
         self.slots.drain_abort(|ud| aborted.push(ud));
         for ud in aborted {
-            self.complete(Record::simple(ud, OutcomeTag::Closed), &[]);
+            let _ = self.complete(Record::simple(ud, OutcomeTag::Closed), &[]);
         }
         self.completions.publish();
     }
 
-    /// Ask the writer thread for a fresh connection. Idempotent.
-    pub(crate) fn request_redial(&self, preferred: Option<String>) {
-        // Shut the doomed socket down FIRST, while `needed` is still unset. If
-        // the flag went up first, the writer could complete a fresh dial and
-        // install its socket before this line ran, and we would tear down the
-        // NEW connection instead of the old one. With this order the writer
-        // cannot have dialled yet (it only dials when `needed` is set), and a
-        // shutdown that beats the flag simply makes the writer's next write
-        // fail — which lands here again.
+    /// Ask the writer thread for a fresh connection, complaining about
+    /// `generation` — the connection the caller was holding. Idempotent.
+    ///
+    /// A request whose generation is not the current one is **ignored**, and
+    /// counted as [`RemoteStats::stale_redials`]. Both threads can notice the
+    /// same connection dying, and the loser's complaint arrives after the
+    /// winner has already been served: without this gate it would shut down
+    /// the brand-new socket, the reader would then take that socket's read
+    /// half and immediately fail on it, and the link would churn one
+    /// reconnect per lap instead of one per real failure.
+    ///
+    /// The whole check-and-shutdown runs under the `reconnect` lock, which is
+    /// what makes it atomic against the writer's install (`redial` takes the
+    /// same lock to bump the generation and publish the socket). Lock order is
+    /// always `reconnect` -> `sock`, never the reverse.
+    pub(crate) fn request_redial(&self, generation: u64, preferred: Option<String>) {
+        let mut g = self.reconnect.lock().unwrap();
+        if generation != g.epoch {
+            self.stats.stale_redials.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // Shut the doomed socket down here, still holding the lock: it is the
+        // connection named by `generation`, and no dial can install another
+        // one until this critical section ends.
         if let Some(c) = self.sock.lock().unwrap().as_ref() {
             c.shutdown();
         }
-        let mut g = self.reconnect.lock().unwrap();
         g.needed = true;
         if preferred.is_some() {
             g.preferred = preferred;
@@ -485,6 +551,10 @@ impl Link {
             c.shutdown();
         }
         self.out.wake().signal();
+        // BOTH completion cells: `ready` so a parked poller wakes and sees the
+        // link is closed, `drained` so a producer parked in `complete` wakes
+        // and observes `closed()` instead of waiting for a consumer that will
+        // never come.
         self.completions.publish();
         self.completions.drained().signal();
         self.reconnect_cv.notify_all();
@@ -540,6 +610,10 @@ pub(crate) fn drain_completions(
 struct Writer {
     link: Arc<Link>,
     conn: FramedConn,
+    /// The generation of the connection in `conn`. Every complaint this
+    /// thread makes names it, so a complaint about a connection the reader
+    /// already replaced is ignored rather than tearing down the fresh one.
+    generation: u64,
     scratch: Vec<u8>,
     last_write: Instant,
     _not_sync: PhantomData<Cell<()>>,
@@ -550,6 +624,7 @@ impl Writer {
         Writer {
             link,
             conn,
+            generation: 0,
             scratch: Vec::with_capacity(64 * 1024),
             last_write: Instant::now(),
             _not_sync: PhantomData,
@@ -577,7 +652,7 @@ impl Writer {
                     std::mem::swap(&mut self.scratch, &mut g);
                     drop(g);
                     if self.conn.write_all_bytes(&self.scratch).is_err() {
-                        self.link.request_redial(None);
+                        self.link.request_redial(self.generation, None);
                         continue;
                     }
                     self.link.stats.socket_writes.fetch_add(1, Ordering::Relaxed);
@@ -604,7 +679,7 @@ impl Writer {
                     seq: 0,
                 };
                 if self.conn.write_frame(ping, &[]).is_err() {
-                    self.link.request_redial(None);
+                    self.link.request_redial(self.generation, None);
                     continue;
                 }
                 self.last_write = Instant::now();
@@ -639,7 +714,7 @@ impl Writer {
                     break;
                 }
                 if self.conn.write_all_bytes(chunk).is_err() {
-                    self.link.request_redial(None);
+                    self.link.request_redial(self.generation, None);
                     return wrote;
                 }
                 chunk.len()
@@ -695,18 +770,50 @@ impl Writer {
                         *link.leader.lock().unwrap() = info.leader;
                     }
                     link.stats.max_credits_seen.fetch_max(info.credits, Ordering::Relaxed);
+                    // ONE critical section installs the connection: bump the
+                    // generation, publish the socket, reset the
+                    // per-connection flow-control state, hand the read half
+                    // over. Everything in here is what "the current
+                    // connection" means, so a `request_redial` or a
+                    // `credit_update` naming the OLD generation can neither
+                    // interleave with it nor land after it.
+                    //
+                    // Order matters inside it too: the generation is bumped
+                    // BEFORE the fresh `HELLO_OK` grant is stored, so a
+                    // reader still draining the old connection's buffered
+                    // frames is already out of date when it tries to apply a
+                    // stale absolute credit count; and the read half is
+                    // published LAST, so nobody can be at the new generation
+                    // before the grant that belongs to it is visible.
+                    let mut g = link.reconnect.lock().unwrap();
+                    *link.sock.lock().unwrap() = Some(watch);
+                    // Installing generation N+1 SATISFIES every outstanding
+                    // complaint, because every one of them is about a
+                    // generation <= N. Without this the second thread to
+                    // notice the same dead connection leaves `needed` set
+                    // behind a redial that already answered it, and the writer
+                    // dials again the moment it returns — the churn the
+                    // generation stamp exists to stop, arriving through the
+                    // flag instead of through the shutdown. A complaint that
+                    // lands AFTER this section names <= N and is refused by
+                    // `request_redial`'s gate, so the two together leave no
+                    // window. `preferred` goes with it: it was a hint about
+                    // the connection just replaced.
+                    g.needed = false;
+                    g.preferred = None;
+                    g.epoch += 1;
+                    let generation = g.epoch;
+                    link.generation.store(generation, Ordering::Release);
                     // `credits` resets from HELLO_OK; `acked_seq` is carried
                     // across — it only ever moves forward and every live seq
                     // is strictly greater than it.
                     link.credits.store(info.credits, Ordering::Release);
                     link.proven.store(false, Ordering::Release);
                     link.probe_seq.store(0, Ordering::Release);
-                    *link.sock.lock().unwrap() = Some(watch);
                     self.conn = fresh;
+                    self.generation = generation;
                     // TASK 8 inserts the ordered resend of the live window here.
-                    let mut g = link.reconnect.lock().unwrap();
-                    g.read_half = Some(read_half);
-                    g.epoch += 1;
+                    g.read_half = Some((generation, read_half));
                     drop(g);
                     link.connected.store(true, Ordering::Release);
                     link.reconnect_cv.notify_all();
@@ -757,6 +864,10 @@ fn sleep_watching(link: &Arc<Link>, total: Duration) {
 struct Reader {
     link: Arc<Link>,
     rd: FramedConn,
+    /// The generation of the connection in `rd`. Every complaint this thread
+    /// makes names it, and every grant it reads off that connection is
+    /// applied only while it is still current.
+    generation: u64,
     last_recv: Instant,
     last_sweep: Instant,
     _not_sync: PhantomData<Cell<()>>,
@@ -765,7 +876,7 @@ struct Reader {
 impl Reader {
     fn new(link: Arc<Link>, rd: FramedConn) -> Reader {
         let now = Instant::now();
-        Reader { link, rd, last_recv: now, last_sweep: now, _not_sync: PhantomData }
+        Reader { link, rd, generation: 0, last_recv: now, last_sweep: now, _not_sync: PhantomData }
     }
 
     fn run(mut self) {
@@ -813,7 +924,7 @@ impl Reader {
                             return;
                         }
                         Act::Reconnect(preferred) => {
-                            self.link.request_redial(preferred);
+                            self.link.request_redial(self.generation, preferred);
                             if !self.await_read_half() {
                                 return;
                             }
@@ -823,7 +934,7 @@ impl Reader {
                 }
                 Ok(None) => {}
                 Err(_) => {
-                    self.link.request_redial(None);
+                    self.link.request_redial(self.generation, None);
                     if !self.await_read_half() {
                         return;
                     }
@@ -836,7 +947,7 @@ impl Reader {
                 self.link.sweep_deadlines();
             }
             if now.duration_since(self.last_recv) >= self.link.cfg.dead_after {
-                self.link.request_redial(None);
+                self.link.request_redial(self.generation, None);
                 if !self.await_read_half() {
                     return;
                 }
@@ -853,8 +964,9 @@ impl Reader {
             if link.closed() {
                 return false;
             }
-            if let Some(fresh) = g.read_half.take() {
+            if let Some((generation, fresh)) = g.read_half.take() {
                 self.rd = fresh;
+                self.generation = generation;
                 let now = Instant::now();
                 self.last_recv = now;
                 self.last_sweep = now;
@@ -877,7 +989,7 @@ impl Reader {
         match h.ty {
             FrameType::Status => {
                 if let Ok(s) = crate::frame::Status::decode(&payload) {
-                    credit_update(&self.link, s.credits, s.acked_seq);
+                    credit_update(&self.link, self.generation, s.credits, s.acked_seq);
                 }
                 Act::Continue
             }
@@ -912,8 +1024,20 @@ pub(crate) enum Act {
     Stop,
 }
 
-/// Apply an absolute grant. `credits` MAY decrease; `acked_seq` is monotone.
-pub(crate) fn credit_update(link: &Arc<Link>, credits: u32, acked_seq: u64) {
+/// Apply an absolute grant read off the connection `generation`. `credits`
+/// MAY decrease; `acked_seq` is monotone.
+///
+/// A grant from a superseded connection is **dropped**. It is an ABSOLUTE
+/// count, so applying one that was still sitting in a `next_buffered` batch
+/// when the connection was replaced would silently overwrite the new
+/// connection's `HELLO_OK` window with the old edge's — which, once task 7
+/// gates admission on it, is over-admission against an edge that never
+/// granted it. `acked_seq` is dropped with it rather than kept: it is
+/// per-connection state on the same frame.
+pub(crate) fn credit_update(link: &Arc<Link>, generation: u64, credits: u32, acked_seq: u64) {
+    if generation != link.generation() {
+        return;
+    }
     link.stats.max_credits_seen.fetch_max(credits, Ordering::Relaxed);
     link.credits.store(credits, Ordering::Release);
     link.acked_seq.fetch_max(acked_seq, Ordering::AcqRel);
@@ -1152,4 +1276,188 @@ fn random_u64() -> u64 {
     h.write_u128(SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
     let v = h.finish();
     if v == 0 { 0x5DEE_CE66_D1CE_4B1D } else { v }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::HelloOk;
+    use std::net::TcpListener;
+
+    /// Just enough edge for the two properties this module owns on its own —
+    /// the connection-generation gate and the after-close completion
+    /// bail-out. It answers `HELLO` with `HELLO_OK{credits}` and `PING` with
+    /// `PONG`, so a `Link` against it stays connected and neither property is
+    /// confounded by a reconnect. (The scripted `FakeEdge` under `tests/`
+    /// belongs to the test targets and cannot be reached from a unit test.)
+    struct StubEdge {
+        addr: String,
+        stop: Arc<AtomicBool>,
+        acceptor: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StubEdge {
+        fn spawn(credits: u32) -> StubEdge {
+            let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = l.local_addr().unwrap().to_string();
+            l.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let s = Arc::clone(&stop);
+            let acceptor = std::thread::spawn(move || {
+                let mut conns: Vec<std::thread::JoinHandle<()>> = Vec::new();
+                while !s.load(Ordering::SeqCst) {
+                    match l.accept() {
+                        Ok((sock, _)) => {
+                            sock.set_nonblocking(false).unwrap();
+                            let s2 = Arc::clone(&s);
+                            conns.push(std::thread::spawn(move || serve_stub(sock, credits, s2)));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for c in conns {
+                    let _ = c.join();
+                }
+            });
+            StubEdge { addr, stop, acceptor: Some(acceptor) }
+        }
+    }
+
+    impl Drop for StubEdge {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(h) = self.acceptor.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    fn serve_stub(sock: TcpStream, credits: u32, stop: Arc<AtomicBool>) {
+        let Ok(mut c) = FramedConn::new(sock) else { return };
+        if c.set_read_timeout(Some(Duration::from_millis(20))).is_err() {
+            return;
+        }
+        loop {
+            match c.read_frame(Duration::from_secs(5)) {
+                Ok(Some((h, _))) => {
+                    let wrote = match h.ty {
+                        FrameType::Hello => {
+                            let mut out = Vec::new();
+                            // An empty `leader_addr` resolves to the dialed
+                            // address (`addr_or`), so the dial never hops.
+                            HelloOk { credits, leader: Some(1), leader_addr: "" }.encode(&mut out);
+                            c.write_frame(stub_hdr(FrameType::HelloOk, h.client_id, 0), &out)
+                        }
+                        FrameType::Ping => {
+                            c.write_frame(stub_hdr(FrameType::Pong, h.client_id, h.seq), &[])
+                        }
+                        _ => Ok(()),
+                    };
+                    if wrote.is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn stub_hdr(ty: FrameType, client_id: u64, seq: u64) -> Header {
+        Header { ty, flags: 0, version: PROTOCOL_VERSION, client_id, seq }
+    }
+
+    fn stub_cfg(addr: &str, max_inflight: u32) -> RemoteConfig {
+        RemoteConfig {
+            app_id: "stub".into(),
+            members: vec![addr.to_string()],
+            max_inflight,
+            ping_interval: Duration::from_millis(50),
+            dead_after: Duration::from_millis(500),
+            ..Default::default()
+        }
+    }
+
+    /// The generation gate, in isolation: a complaint that names a connection
+    /// other than the current one must be ignored outright — not shut the live
+    /// socket down, not cost a reconnect. This is the half of the race that
+    /// cannot be scheduled from outside (both threads noticing the same dead
+    /// connection is a timing accident), so it is asserted directly.
+    #[test]
+    fn a_redial_request_that_does_not_name_the_current_connection_is_ignored() {
+        let edge = StubEdge::spawn(5);
+        let link = Link::start(stub_cfg(&edge.addr, 8)).expect("connect");
+        assert!(link.is_connected());
+        assert_eq!(link.credits(), 5);
+        let generation = link.generation();
+
+        link.request_redial(generation.wrapping_add(1), None);
+        std::thread::sleep(Duration::from_millis(150));
+
+        assert!(link.is_connected(), "a stale redial tore down a healthy connection");
+        assert_eq!(link.stats().reconnects, 0, "a stale redial cost a reconnect");
+        assert_eq!(link.stats().stale_redials, 1);
+        assert_eq!(link.credits(), 5, "the live connection's grant must survive");
+
+        // The gate is a filter, not a mute: a complaint that DOES name the
+        // current connection still works.
+        link.request_redial(link.generation(), None);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while link.stats().reconnects == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(link.stats().reconnects, 1, "a current-generation redial must be honoured");
+        link.close();
+    }
+
+    /// A generation bump makes the previous generation's grant unapplicable —
+    /// the absolute credit count from a connection that has been replaced must
+    /// never overwrite the new connection's `HELLO_OK` window.
+    #[test]
+    fn a_grant_from_a_superseded_generation_is_dropped() {
+        let edge = StubEdge::spawn(5);
+        let link = Link::start(stub_cfg(&edge.addr, 8)).expect("connect");
+        let generation = link.generation();
+        credit_update(&link, generation, 9, 3);
+        assert_eq!(link.credits(), 9, "a current-generation grant applies");
+        credit_update(&link, generation.wrapping_sub(1), 4096, 0);
+        assert_eq!(link.credits(), 9, "a superseded grant must not overwrite the live window");
+        link.close();
+    }
+
+    /// After `close` there is no consumer left, so a completion that does not
+    /// fit must be given up on rather than parked on: parking there wedges the
+    /// join inside `close` itself. Nothing has ever drained this queue, so it
+    /// fills and then has to refuse.
+    #[test]
+    fn a_completion_into_a_full_queue_after_close_gives_up_instead_of_parking() {
+        let edge = StubEdge::spawn(2);
+        // `max_inflight = 1` gives the completion queue its 16-slot floor —
+        // small enough to fill by hand.
+        let link = Link::start(stub_cfg(&edge.addr, 1)).expect("connect");
+        link.close();
+        assert!(link.closed());
+
+        let t = Instant::now();
+        let mut n = 0u64;
+        while link.complete(Record::simple(n, OutcomeTag::Closed), &[]) {
+            n += 1;
+            assert!(n < 10_000, "the queue never filled");
+        }
+        assert!(n >= 16, "the queue should have taken at least its slot floor, took {n}");
+        assert!(t.elapsed() < Duration::from_secs(5), "complete parked on a full queue after close");
+
+        // And the close path itself: a second `close` runs `abort_outstanding`
+        // against that same full queue and must still return.
+        let t = Instant::now();
+        link.close();
+        assert!(t.elapsed() < Duration::from_secs(5), "close wedged on a full completion queue");
+    }
 }

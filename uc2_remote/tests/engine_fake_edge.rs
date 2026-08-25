@@ -63,13 +63,17 @@ fn an_idle_status_updates_the_window_without_any_traffic_from_us() {
     send.shutdown();
 }
 
+/// What this pins is the LIVENESS clock, not a dropped socket: `hang` keeps
+/// the connection open and silent, so the reader's `dead_after` is the only
+/// thing that can notice it. A real dropped-connection test needs
+/// `drop_after_first_request`, which only fires on a SUBMIT — and nothing is
+/// submitted until task 6.
+///
+// TASK 6: add the real drop test here — `drop_after_first_request: true`, one
+// `try_submit`, assert the request survives the drop and is re-sent on the
+// fresh connection.
 #[test]
-fn a_dropped_connection_is_re_established_by_the_writer_thread() {
-    // `hang` is the silent edge: it answers HELLO, then never writes again —
-    // not even a PONG. `drop_after_first_request` (the shape this scenario has
-    // in `client_fake_edge.rs`) cannot be used here, because it only fires on a
-    // SUBMIT and no request is sent at this task; the edge would keep PONGing
-    // and the connection would never look dead.
+fn a_silent_edge_is_noticed_and_the_link_is_re_established() {
     let edge = FakeEdge::spawn(Behaviour { credits: 2, hang: true, ..Default::default() });
     let (send, _poll) = RemoteEngine::connect(RemoteConfig {
         ping_interval: Duration::from_millis(30),
@@ -82,6 +86,43 @@ fn a_dropped_connection_is_re_established_by_the_writer_thread() {
     let ok = until(|| send.stats().reconnects >= 1);
     assert!(ok, "dead_after must force a redial: {:?}", send.stats());
     assert!(until(|| send.is_connected()), "the writer thread must re-establish the link");
+    send.shutdown();
+}
+
+/// Both link threads notice the same connection dying — the reader on its
+/// `dead_after` clock, the writer on the next `PING` write that fails. Only
+/// the first complaint may cost a reconnect: the second names a connection
+/// that has already been replaced, and honouring it would shut the fresh
+/// socket down and churn one reconnect per lap.
+#[test]
+fn a_stale_redial_does_not_churn_the_connection_that_replaced_it() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 2,
+        hang_first: true,
+        second_credits: Some(7),
+        ..Default::default()
+    });
+    let (send, _poll) = RemoteEngine::connect(RemoteConfig {
+        ping_interval: Duration::from_millis(30),
+        dead_after: Duration::from_millis(200),
+        ..cfg(vec![edge.addr.clone()])
+    })
+    .unwrap();
+    assert_eq!(send.credits(), 2, "the first connection's grant");
+
+    assert!(until(|| send.stats().reconnects >= 1), "the silent edge must force a redial");
+    assert!(
+        until(|| send.credits() == 7),
+        "the grant in effect must be the second connection's: {:?}",
+        send.stats()
+    );
+
+    // Long enough for a churn loop (one lap per `dead_after`) to show up.
+    std::thread::sleep(Duration::from_millis(600));
+    let s = send.stats();
+    assert_eq!(s.reconnects, 1, "a stale redial churned the fresh connection: {s:?}");
+    assert!(send.is_connected(), "the second connection must stay up: {s:?}");
+    assert_eq!(send.credits(), 7, "the fresh grant must not be overwritten: {s:?}");
     send.shutdown();
 }
 
