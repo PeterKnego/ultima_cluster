@@ -44,6 +44,33 @@ pub struct Args {
     /// Independent engines (each one attach, one sender + one poll thread).
     #[arg(long, default_value_t = 1)]
     pub engines: usize,
+    /// What a driver thread does when it has nothing to do — the sender on
+    /// `SubmitError::Backpressure`, the poller on `poll() == 0`. `yield`
+    /// (default, and what the smoke ladder measures) = `thread::yield_now`;
+    /// `spin` = a `spin_loop` hint and straight back round; `park` = give the
+    /// core up for `--park-us` (the sender via `park_timeout`, the poller via
+    /// the egress ring's futex wake word). This exists to attribute a
+    /// collapse to the CALLERS' wait strategy: the real edge parks after 64
+    /// yields, the real node busy-spins by design, and neither is `yield`.
+    #[arg(long, default_value = "yield")]
+    pub wait: WaitPolicy,
+    /// Park budget for `--wait park`, in microseconds.
+    #[arg(long, default_value_t = 50)]
+    pub park_us: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum WaitPolicy {
+    Spin,
+    Yield,
+    Park,
+}
+
+/// `--wait` and `--park-us` travel together into `drive_one`, as one argument.
+#[derive(Clone, Copy)]
+struct Wait {
+    policy: WaitPolicy,
+    budget: Duration,
 }
 
 pub fn run(a: Args) -> anyhow::Result<()> {
@@ -57,11 +84,12 @@ pub fn run(a: Args) -> anyhow::Result<()> {
         let instance_dir = Arc::clone(&instance_dir);
         let app_id = Arc::clone(&app_id);
         let (secs, payload, inflight) = (a.secs, a.payload, a.inflight);
+        let wait = Wait { policy: a.wait, budget: Duration::from_micros(a.park_us) };
         handles.push(
             thread::Builder::new()
                 .name(format!("hop-engine-{i}"))
                 .spawn(move || {
-                    drive_one(&instance_dir, &app_id, t0, secs, payload, inflight)
+                    drive_one(&instance_dir, &app_id, t0, secs, payload, inflight, wait)
                 })
                 .expect("spawn engine driver thread"),
         );
@@ -100,6 +128,7 @@ fn drive_one(
     secs: u64,
     payload: usize,
     inflight: u64,
+    wait: Wait,
 ) -> anyhow::Result<StreamStats> {
     let (send, mut poll) = Engine::attach(
         instance_dir,
@@ -127,6 +156,8 @@ fn drive_one(
     let stop = Arc::new(AtomicBool::new(false));
     let resolved = Arc::new(AtomicU64::new(0));
 
+    let park_budget = wait.budget;
+    let egress_wait = poll.wait_handle();
     let poller = thread::Builder::new()
         .name("hop-engine-poll".into())
         .spawn({
@@ -152,7 +183,22 @@ fn drive_one(
                         resolved.fetch_add(1, Ordering::Relaxed);
                     });
                     if n == 0 {
-                        thread::yield_now();
+                        match wait.policy {
+                            WaitPolicy::Spin => std::hint::spin_loop(),
+                            WaitPolicy::Yield => thread::yield_now(),
+                            WaitPolicy::Park => {
+                                // Arm, re-check the wake word, then block: a
+                                // response published between the last `poll()`
+                                // and `arm()` would otherwise wait out the
+                                // whole budget.
+                                let seq = egress_wait.current_seq();
+                                egress_wait.arm();
+                                if egress_wait.current_seq() == seq {
+                                    egress_wait.park(seq, park_budget);
+                                }
+                                egress_wait.disarm();
+                            }
+                        }
                     }
                 }
                 s
@@ -167,7 +213,15 @@ fn drive_one(
         clock.stamp(sent);
         match send.try_submit(sent, &cmd_bytes) {
             Ok(()) => sent += 1,
-            Err(SubmitError::Backpressure) => thread::yield_now(),
+            Err(SubmitError::Backpressure) => match wait.policy {
+                // Backpressure here is the engine's inflight WINDOW, not a
+                // full ring (64 MiB of ingress against 256 inflight): the
+                // sender is waiting on its own poller, so `park` gives that
+                // poller the core rather than fighting it for one.
+                WaitPolicy::Spin => std::hint::spin_loop(),
+                WaitPolicy::Yield => thread::yield_now(),
+                WaitPolicy::Park => thread::park_timeout(wait.budget),
+            },
             Err(SubmitError::NotServing) => thread::sleep(Duration::from_millis(1)),
             Err(e) => panic!("try_submit: {e}"),
         }

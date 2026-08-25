@@ -21,7 +21,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
 use uc2_log::cnc::{CncMeta, CncPage};
-use uc_protocol::ring::{BroadcastRing, MpscConsumer, MpscRing, RingError};
+use uc_protocol::ring::{
+    BroadcastRing, MpscConsumer, MpscRing, RingError, RingHeader, RingWaitHandle,
+};
 use uc_protocol::v2::cnc::{NODE_FLAG_CAN_SERVE, NODE_FLAG_LEADER};
 use uc_protocol::v2::frame::{HEADER_LEN, align_frame_len};
 use uc_protocol::v2::ipc::{FLAG_V2_IS_QUERY, MSG_V2_RESPONSE};
@@ -54,6 +56,67 @@ pub struct Args {
     /// Response body length, after the mandatory 8-byte LE position prefix.
     #[arg(long, default_value_t = 8)]
     pub response_body: usize,
+    /// What the single drain thread does when both rings came up empty.
+    /// `yield` (default, and what the smoke ladder measures) = 64 spins then
+    /// `yield_now`; `spin` = never leave the core; `park` = 64 spins then
+    /// arm + futex-park on the ingress ring's wake word for `--park-us`.
+    /// The REAL node busy-spins by design — this knob exists to attribute a
+    /// collapse to the sink's idle policy, not to propose one.
+    #[arg(long, default_value = "yield")]
+    pub idle: IdlePolicy,
+    /// Park budget for `--idle park`, in microseconds.
+    #[arg(long, default_value_t = 50)]
+    pub park_us: u64,
+    /// Report per-second MPSC hole telemetry alongside the pop rate:
+    /// `holes` (cumulative `MpscConsumer::holes_skipped`), `hol` (polls that
+    /// returned `Ok(None)` with `claim_position > consumer_position` — the
+    /// consumer head-of-line behind exactly one claimed-but-uncommitted slot)
+    /// and `empty` (polls that returned `Ok(None)` on a genuinely empty ring).
+    /// OFF by default: the two extra Acquire loads sit on the `Ok(None)` path,
+    /// which is hot when the ring is starved, so leaving it on would perturb
+    /// the very number the ladder reports.
+    #[arg(long, default_value_t = false)]
+    pub hole_stats: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum IdlePolicy {
+    Spin,
+    Yield,
+    Park,
+}
+
+/// Read-only view of a ring file's [`RingHeader`], for the `--hole-stats`
+/// observer. `uc_protocol` exposes `RingHeader` with public atomics but no
+/// position accessor on `MpscConsumer`; rather than add one to production ring
+/// code for a bench, the sink maps the same file a second time, read-only, and
+/// reads the two counters it needs.
+struct HeaderView {
+    _mmap: memmap2::Mmap,
+    header: *const RingHeader,
+}
+
+impl HeaderView {
+    fn open(path: &std::path::Path) -> anyhow::Result<Self> {
+        let f = std::fs::File::open(path)?;
+        // SAFETY: the ring file is a fixed-layout shared mapping whose first
+        // `size_of::<RingHeader>()` bytes are exactly that struct; this second
+        // mapping is read-only and only ever loads its atomics.
+        let mmap = unsafe { memmap2::Mmap::map(&f)? };
+        anyhow::ensure!(mmap.len() >= std::mem::size_of::<RingHeader>(), "ring file too short");
+        let header = mmap.as_ptr().cast::<RingHeader>();
+        Ok(Self { _mmap: mmap, header })
+    }
+
+    /// `true` when `claim_position > consumer_position` — i.e. an `Ok(None)`
+    /// observed right now is head-of-line behind a claimed slot, not an empty
+    /// ring.
+    fn head_of_line(&self) -> bool {
+        // SAFETY: `header` points into `_mmap`, alive for `self`'s lifetime.
+        let h = unsafe { &*self.header };
+        h.claim_position.load(std::sync::atomic::Ordering::Acquire)
+            > h.consumer_position.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// "Random enough" instance id — a fresh one per boot invalidates any stale
@@ -144,10 +207,33 @@ pub fn run(a: Args) -> anyhow::Result<()> {
     let mut last_report = Instant::now();
     let mut last_heartbeat = Instant::now();
 
+    // `--hole-stats` observers (one per MPSC ring) and their counters.
+    let views: Option<[HeaderView; 2]> = if a.hole_stats {
+        Some([
+            HeaderView::open(&a.instance_dir.join("ingress.ring"))?,
+            HeaderView::open(&a.instance_dir.join("query.ring"))?,
+        ])
+    } else {
+        None
+    };
+    let mut hol_polls: u64 = 0;
+    let mut empty_polls: u64 = 0;
+    let (mut hol_at_last, mut empty_at_last) = (0u64, 0u64);
+    let mut holes_at_last: u64 = 0;
+
+    // `--idle park` parks on the ingress ring's wake word: an MPSC producer
+    // bumps the commit count and `signal()`s once per commit, and only
+    // syscalls when `waiters > 0`.
+    let park_handle: Option<RingWaitHandle> =
+        if a.idle == IdlePolicy::Park { Some(ingress.wait_handle()) } else { None };
+    let park_budget = Duration::from_micros(a.park_us);
+
     loop {
         let mut did = false;
-        for (ring, is_query) in
+        for (idx, (ring, is_query)) in
             [(&mut ingress as &mut MpscConsumer, false), (&mut query as &mut MpscConsumer, true)]
+                .into_iter()
+                .enumerate()
         {
             // Bounded batch per ring so neither starves the other.
             for _ in 0..256 {
@@ -171,7 +257,20 @@ pub fn run(a: Args) -> anyhow::Result<()> {
                             }
                         }
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        // The one place the two `Ok(None)` causes can be told
+                        // apart: `try_read` collapses "ring empty" and "head
+                        // of line behind exactly one claimed slot" into the
+                        // same return, so the observer re-reads the header.
+                        if let Some(v) = views.as_ref() {
+                            if v[idx].head_of_line() {
+                                hol_polls += 1;
+                            } else {
+                                empty_polls += 1;
+                            }
+                        }
+                        break;
+                    }
                     Err(e) => {
                         // A torn/oversized record is a bug in the driver, not
                         // something this sink can repair — but do not die on
@@ -187,9 +286,31 @@ pub fn run(a: Args) -> anyhow::Result<()> {
             idle = 0;
         } else {
             idle += 1;
-            if idle > 64 {
-                std::thread::yield_now();
-                idle = 0;
+            match a.idle {
+                IdlePolicy::Spin => std::hint::spin_loop(),
+                IdlePolicy::Yield => {
+                    if idle > 64 {
+                        std::thread::yield_now();
+                        idle = 0;
+                    }
+                }
+                IdlePolicy::Park => {
+                    if idle > 64 {
+                        if let Some(h) = park_handle.as_ref() {
+                            let seq = h.current_seq();
+                            h.arm();
+                            // Re-check after arming: a commit between the last
+                            // `try_read` and `arm()` would otherwise be a lost
+                            // wakeup (the `PARK_CEIL` backstop bounds it, but
+                            // at 2 ms that IS the result on this bench).
+                            if h.current_seq() == seq {
+                                h.park(seq, park_budget);
+                            }
+                            h.disarm();
+                        }
+                        idle = 0;
+                    }
+                }
             }
         }
 
@@ -201,7 +322,23 @@ pub fn run(a: Args) -> anyhow::Result<()> {
         if last_report.elapsed() >= Duration::from_secs(1) {
             let elapsed = last_report.elapsed().as_secs_f64();
             let rate = (popped - popped_at_last_report) as f64 / elapsed;
-            println!("dummy-node: popped={popped} resp/s={rate:.0}");
+            let holes = ingress.holes_skipped() + query.holes_skipped();
+            let mut line = format!(
+                "dummy-node: popped={popped} resp/s={rate:.0} holes={holes} \
+                 holes/s={:.0}",
+                (holes - holes_at_last) as f64 / elapsed
+            );
+            holes_at_last = holes;
+            if a.hole_stats {
+                line.push_str(&format!(
+                    " hol/s={:.0} empty/s={:.0}",
+                    (hol_polls - hol_at_last) as f64 / elapsed,
+                    (empty_polls - empty_at_last) as f64 / elapsed,
+                ));
+                hol_at_last = hol_polls;
+                empty_at_last = empty_polls;
+            }
+            println!("{line}");
             let _ = std::io::stdout().flush();
             popped_at_last_report = popped;
             last_report = Instant::now();

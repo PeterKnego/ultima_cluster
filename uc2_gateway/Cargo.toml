@@ -63,3 +63,8 @@ serde = { workspace = true }
 tempfile = { workspace = true }
 # m12_gate example only: latency histogram for the gateway-vs-direct A/B.
 hdrhistogram = { workspace = true }
+# hop_bench example only: the `--hole-stats` observer maps a ring file
+# read-only and reads `RingHeader`'s claim/consumer positions directly, so the
+# sink can tell "ring empty" from "head-of-line behind a claimed slot" without
+# any accessor being added to `uc_protocol`'s production ring code.
+memmap2 = { workspace = true }

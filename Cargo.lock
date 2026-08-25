@@ -1357,6 +1357,7 @@ dependencies = [
  "bytes",
  "clap",
  "hdrhistogram",
+ "memmap2",
  "parking_lot",
  "rand",
  "serde",
