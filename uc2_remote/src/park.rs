@@ -14,11 +14,11 @@
 //! of sleeping through the wake it was told about.
 //!
 //! This is task 1 of the M13b split-client build (design spec §3): the
-//! outgoing ring and completion queue that will drive this cell land in
-//! later tasks, so until then the only caller is this module's own test
-//! suite — hence the crate-wide-lint-clean `allow` below.
-
-#![allow(dead_code)]
+//! outgoing ring (task 2) is the first non-test caller, and it only reaches
+//! [`WaitCell::new`] and [`WaitCell::signal`] — the completion queue and the
+//! writer/reader threads that `seq`/`park` a "check, then park" loop against
+//! land in later tasks. Those two methods keep a narrow `allow` below until
+//! then.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -41,6 +41,7 @@ impl WaitCell {
         }
     }
 
+    #[allow(dead_code, reason = "first caller lands with the completion queue, task 3")]
     pub(crate) fn seq(&self) -> u64 {
         self.seq.load(Ordering::Acquire)
     }
@@ -57,6 +58,7 @@ impl WaitCell {
     }
 
     /// Park until the seq moves past `observed`, or `timeout` elapses.
+    #[allow(dead_code, reason = "first caller lands with the completion queue, task 3")]
     pub(crate) fn park(&self, observed: u64, timeout: Duration) {
         self.waiters.fetch_add(1, Ordering::SeqCst);
         let g = self.lock.lock().unwrap();
