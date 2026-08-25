@@ -58,6 +58,18 @@
 //! that as a bad read, not a silent corruption, but does not prevent the
 //! write. See `MpscProducer::commit`'s doc for the full residual.
 //!
+//! **The tail-straddle padding marker is published the same way** — the same
+//! `compare_exchange` from its own claim word, not an unconditional store.
+//! Its producer is preemptible between the padding stamp and the padding
+//! publication exactly as a record's is, and the consumer cannot tell the two
+//! apart: a padding claim reads as `Claimed { advance: bytes_to_tail }` and
+//! passes every bound, so past `hole_timeout` it is skip-marked like any
+//! other hole and the consumer advances over the tail — which is precisely
+//! what the padding would have told it anyway. A losing padding CAS therefore
+//! needs no handling at all: `claim` loops and claims the real record at
+//! whatever `claim_position` is now, nothing lost and nothing retried.
+//! Padding never bumps the commit count and never signals, on either outcome.
+//!
 //! The consumer reads with Relaxed loads on its own `consumer_position`
 //! (single reader) and, other than the one skip-marker CAS above, never
 //! writes into the slot region at all.
@@ -174,6 +186,26 @@ pub struct PendingClaim {
     lap: u32,
 }
 
+/// A claimed, stamped, not-yet-published tail-straddle padding marker — the
+/// padding analogue of [`PendingClaim`]. Produced by
+/// [`MpscProducer::claim_padding_without_commit`], consumed by
+/// [`MpscProducer::commit_padding_claim`].
+///
+/// **Not API** (`#[doc(hidden)]`): like [`PendingClaim`] it exists so tests
+/// can reproduce a producer preempted inside the padding path — the state a
+/// preemption between the padding stamp and the padding publication leaves
+/// behind — without killing a process. `claim`'s straddle branch is exactly
+/// `stamp_padding` followed by `commit_padding`, so the hooks drive the
+/// production path, not a copy of it.
+#[doc(hidden)]
+#[derive(Debug)]
+#[must_use = "a padding claim that is never committed is a hole the consumer must time out"]
+pub struct PendingPadding {
+    pos: u64,
+    claim_size: usize,
+    lap: u32,
+}
+
 impl MpscProducer {
     pub fn try_write(
         &self,
@@ -202,6 +234,124 @@ impl MpscProducer {
     #[doc(hidden)]
     pub fn commit_claim(&self, claim: PendingClaim) -> Result<(), RingError> {
         self.commit(claim)
+    }
+
+    /// See [`PendingPadding`]. Test/harness hook: claim the tail remnant for
+    /// a padding marker and stamp it, stopping before the publication —
+    /// reproducing a producer preempted inside `claim`'s straddle branch.
+    ///
+    /// The bounded CAS below is `claim`'s, narrowed to the one case that
+    /// reaches padding (`claim_size == bytes_to_tail`); the stamp itself is
+    /// the production [`Self::stamp_padding`]. Returns
+    /// [`RingError::Corrupt`] if `claim_position` is at the start of the slot
+    /// region, where no padding is possible.
+    #[doc(hidden)]
+    pub fn claim_padding_without_commit(&self) -> Result<PendingPadding, RingError> {
+        let header = self.inner.header();
+        let capacity = self.inner.capacity();
+        loop {
+            let claim_pos = header.claim_position.load(Ordering::Acquire);
+            let slot_offset = (claim_pos as usize) & (capacity - 1);
+            let bytes_to_tail = capacity - slot_offset;
+            if bytes_to_tail == capacity {
+                return Err(RingError::Corrupt(
+                    "claim_position is at the start of the slot region: no tail to pad"
+                        .to_string(),
+                ));
+            }
+            let consumer_pos = header.consumer_position.load(Ordering::Acquire);
+            let free = capacity.saturating_sub(claim_pos.saturating_sub(consumer_pos) as usize);
+            if free < bytes_to_tail {
+                return Err(RingError::Full);
+            }
+            if header
+                .claim_position
+                .compare_exchange_weak(
+                    claim_pos,
+                    claim_pos + bytes_to_tail as u64,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let pad = PendingPadding {
+                pos: claim_pos,
+                claim_size: bytes_to_tail,
+                lap: lap_of(claim_pos, capacity),
+            };
+            // SAFETY: exclusive ownership of the claimed range;
+            // bytes_to_tail >= RECORD_ALIGN >= 6.
+            unsafe { self.stamp_padding(slot_offset, &pad) };
+            return Ok(pad);
+        }
+    }
+
+    /// See [`PendingPadding`]. Test/harness hook for the production
+    /// [`Self::commit_padding`].
+    #[doc(hidden)]
+    pub fn commit_padding_claim(&self, pad: PendingPadding) -> Result<(), RingError> {
+        self.commit_padding(pad)
+    }
+
+    /// Stamp a claimed tail remnant as padding: the claim word (Relaxed),
+    /// then the padding body. Stamp-before-body, exactly as the record path
+    /// does it — the claim word is what SIZES this hole if the producer never
+    /// gets to publish.
+    ///
+    /// # Safety
+    ///
+    /// The caller owns `[slot_offset, slot_offset + pad.claim_size)` and
+    /// `pad.claim_size >= 6` (the padding marker's own write).
+    unsafe fn stamp_padding(&self, slot_offset: usize, pad: &PendingPadding) {
+        unsafe {
+            store_commit_word(
+                self.inner.slot_region_mut(),
+                slot_offset,
+                encode_commit_word(pad.lap, pad.claim_size as u32, true),
+                Ordering::Relaxed,
+            );
+            write_padding_body_at(self.inner.slot_region_mut(), slot_offset);
+        }
+    }
+
+    /// Publish a stamped padding marker with the SAME `compare_exchange`
+    /// [`Self::commit`] uses on a record, and for the same reason: a producer
+    /// preempted between the stamp and this call can have its padding claim
+    /// timed out and skip-marked by the consumer (`try_read`'s `Claimed`
+    /// arm treats a padding claim like any other — it is `Claimed { advance:
+    /// bytes_to_tail }`, and passes every bound), after which these bytes
+    /// belong to whoever claims them next. Expecting our own claim word means
+    /// a resumed producer touches nothing it no longer owns.
+    ///
+    /// Never bumps `publish_position` and never signals, on either outcome:
+    /// padding carries nothing a parked consumer needs to wake for.
+    ///
+    /// `Err(RingError::Skipped)` is returned for symmetry with [`Self::commit`],
+    /// but `claim`'s straddle branch deliberately ignores it — see the comment
+    /// there.
+    fn commit_padding(&self, pad: PendingPadding) -> Result<(), RingError> {
+        let slot_offset = (pad.pos as usize) & (self.inner.capacity() - 1);
+        let expected = encode_commit_word(pad.lap, pad.claim_size as u32, true);
+        let committed = encode_commit_word(pad.lap, pad.claim_size as u32, false);
+        // SAFETY: `slot_offset` is inside the mapped slot region and
+        // RECORD_ALIGN-aligned; the CAS only succeeds if the word is still
+        // exactly our own padding claim word, i.e. we still own the range.
+        let result = unsafe {
+            cas_commit_word(
+                self.inner.slot_region_mut(),
+                slot_offset,
+                expected,
+                committed,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+        };
+        if result.is_err() {
+            return Err(RingError::Skipped { position: pad.pos });
+        }
+        Ok(())
     }
 
     /// Claim a slot and write the record into it, leaving the slot's word
@@ -289,30 +439,32 @@ impl MpscProducer {
             let lap = lap_of(claim_pos, capacity);
 
             if claim_size != advance {
-                // Tail straddle. The padding marker has no body to write, so
-                // it is claimed, written and committed in one go; then loop
-                // to claim the real record after the wrap. No commit_count
-                // bump and no `signal`: padding carries nothing a parked
-                // consumer needs to wake for, and the real record's commit
-                // (one iteration later) does both.
-                //
+                // Tail straddle: fill the remnant with a padding marker, then
+                // loop to claim the real record after the wrap. No
+                // commit_count bump and no `signal` either way: padding
+                // carries nothing a parked consumer needs to wake for, and
+                // the real record's commit (one iteration later) does both.
+                let pad = PendingPadding { pos: claim_pos, claim_size, lap };
                 // SAFETY: exclusive ownership of the claimed range;
                 // claim_size == bytes_to_tail >= RECORD_ALIGN >= 6.
-                unsafe {
-                    store_commit_word(
-                        self.inner.slot_region_mut(),
-                        slot_offset,
-                        encode_commit_word(lap, claim_size as u32, true),
-                        Ordering::Relaxed,
-                    );
-                    write_padding_body_at(self.inner.slot_region_mut(), slot_offset);
-                    store_commit_word(
-                        self.inner.slot_region_mut(),
-                        slot_offset,
-                        encode_commit_word(lap, claim_size as u32, false),
-                        Ordering::Release,
-                    );
-                }
+                unsafe { self.stamp_padding(slot_offset, &pad) };
+                // The publication is the SAME `compare_exchange` a record's
+                // is, for the same reason (`commit`'s doc): this producer is
+                // preemptible between the stamp above and the line below, and
+                // a preemption past `hole_timeout` lets the consumer classify
+                // the padding claim as `Claimed { advance: bytes_to_tail }`,
+                // skip-mark it and advance past the tail — after which these
+                // bytes belong to whoever claims them on the next lap. An
+                // unconditional store here would stomp that later claimant
+                // with nothing reported, which is exactly the shape the
+                // record path's CAS exists to prevent.
+                //
+                // A losing CAS needs no handling: the consumer already
+                // advanced by `bytes_to_tail`, which is precisely what this
+                // padding would have told it, so nothing is lost and nothing
+                // is retried. Either way we loop and claim the real record at
+                // whatever `claim_position` is now.
+                let _ = self.commit_padding(pad);
                 continue;
             }
 
@@ -1237,6 +1389,83 @@ mod tests {
         let rec = consumer.try_read(&mut buf).expect("read").expect("record");
         assert_eq!(rec.msg_type, 2);
         assert_eq!(&buf[..], b"fine");
+    }
+
+    /// Fix round 2, finding 2: the tail-straddle PADDING marker is published
+    /// by the same commit `compare_exchange` a record is, not by an
+    /// unconditional store.
+    ///
+    /// The padding path (`claim`'s straddle branch) stamps
+    /// `CLAIMED | LAP | bytes_to_tail`, writes the padding body, then
+    /// publishes — and a producer is preemptible in that window exactly like
+    /// it is in the record window. The consumer cannot tell a padding claim
+    /// from a record claim: it is `Claimed { advance: bytes_to_tail }` and
+    /// passes every bound, so past `hole_timeout` it skip-marks it and
+    /// advances over the tail, handing those bytes to whoever claims them on
+    /// the next lap. With an unconditional store the resumed padding producer
+    /// would stomp that later claimant's slot with nothing reported —
+    /// precisely the shape `a_resurrected_producer_is_told_it_was_skipped_
+    /// once_the_ring_laps` proves unsafe for records.
+    ///
+    /// Drives the production path via the `claim_padding_without_commit` /
+    /// `commit_padding_claim` hooks (`stamp_padding` + `commit_padding` are
+    /// the same two calls `claim`'s straddle branch makes).
+    #[test]
+    fn a_skipped_padding_marker_is_refused_not_stomped() {
+        let tmp = NamedTempFile::new().unwrap();
+        // 128-byte ring; a 1-byte payload is a 21-byte record, aligned to 24.
+        let ring = MpscRing::create(tmp.path(), 128, 64).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+        consumer.set_hole_timeout(std::time::Duration::from_millis(0));
+
+        // Walk both positions to 120 (5 × 24), leaving an 8-byte tail remnant
+        // — the next real record would straddle, so the next claim is padding.
+        let mut buf = Vec::new();
+        for i in 0u8..5 {
+            producer.try_write(1, 0, [0; 8], &[b'0' + i]).expect("write");
+            assert!(consumer.try_read(&mut buf).expect("read").is_some());
+        }
+        let header = producer.inner.header();
+        assert_eq!(header.claim_position.load(Ordering::Acquire), 120);
+        assert_eq!(header.consumer_position.load(Ordering::Acquire), 120);
+
+        // A producer enters the straddle branch and is preempted between the
+        // padding stamp and the padding publication.
+        let pad = producer.claim_padding_without_commit().expect("padding claim");
+        assert_eq!(header.claim_position.load(Ordering::Acquire), 128, "the tail is claimed");
+
+        // The consumer cannot tell this from a record hole: first poll starts
+        // the timer, second poll skips and MARKS it, advancing over the tail.
+        assert!(matches!(consumer.try_read(&mut buf), Ok(None)), "starts the timer");
+        assert!(matches!(consumer.try_read(&mut buf), Ok(None)), "skips + marks the padding");
+        assert_eq!(consumer.holes_skipped(), 1, "a padding hole is a hole");
+        assert_eq!(
+            header.consumer_position.load(Ordering::Acquire),
+            128,
+            "the consumer advanced over the tail by exactly bytes_to_tail"
+        );
+
+        // A later claimant takes the wrap, at offset 0 of lap 1.
+        producer.try_write(2, 0, [0; 8], b"y").expect("write after the wrap");
+
+        // The preempted padding producer resumes. Its CAS finds the skip
+        // marker, not its own claim word: refused, nothing touched.
+        assert!(matches!(
+            producer.commit_padding_claim(pad),
+            Err(RingError::Skipped { position: 120 })
+        ));
+        assert_eq!(consumer.holes_skipped(), 1, "a refused padding commit is not a new hole");
+
+        // The ring is intact: the later claimant's record round-trips, and
+        // the ring keeps working afterwards.
+        let rec = consumer.try_read(&mut buf).expect("read").expect("the record after the wrap");
+        assert_eq!(rec.msg_type, 2);
+        assert_eq!(&buf[..], b"y");
+        producer.try_write(3, 0, [0; 8], b"still fine").expect("write");
+        let rec = consumer.try_read(&mut buf).expect("read").expect("record");
+        assert_eq!(rec.msg_type, 3);
+        assert_eq!(&buf[..], b"still fine");
+        assert_eq!(consumer.holes_skipped(), 1);
     }
 
     /// Fix round 1, finding 2, race (ii): the controller's ruling explicitly
