@@ -25,6 +25,14 @@
 
 ---
 
+## Execution errata
+
+- **Task 2, `handshake`:** the drafted `let gen = shared.grant_gen.load(...)` does
+  not compile — `gen` is a **reserved keyword under Rust edition 2024** (this
+  workspace's edition). Use a different local name (implemented as `start_gen`);
+  the `Shared::grant_gen` field name is fine (not a keyword). Applies to any later
+  code that copies the handshake settle-wait.
+
 ## File Structure
 
 ```
