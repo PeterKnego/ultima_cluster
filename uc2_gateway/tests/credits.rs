@@ -123,6 +123,61 @@ fn two_clients_stay_inside_the_credits_the_edge_grants() {
     svc.stop();
 }
 
+/// (spec §5.4, ii) A connect shrinks everyone's grant, and the client learns
+/// the smaller number from a standalone `STATUS` — **before** any `RESPONSE`
+/// would have carried it. Driven raw because the property is about which
+/// frame arrives when, on a connection that is deliberately idle: a
+/// `RemoteClient` would only report "my window changed", never "it changed
+/// without me asking anything".
+#[test]
+fn a_new_connection_shrinks_the_grant_and_status_says_so_unprompted() {
+    use uc2_remote::frame::{FrameType, Status};
+
+    let root = common::tempdir();
+    let (node, dir) = common::start_single_node(root.path());
+    let svc = uc2_service::ServiceBuilder::new(
+        uc2_service::ServiceConfig::new(&dir, common::APP),
+        uc2_service::Sessioned::new(
+            uc_lincheck::register::RegisterSm::default(),
+            uc2_service::SessionConfig::default(),
+        ),
+    )
+    .start()
+    .unwrap();
+    common::await_serving(&node, 10);
+
+    // budget 56, cap 32: alone the first connection holds 32, with a second
+    // one 28 each.
+    let edge = Edge::start(edge_config(&dir, 64, 32)).unwrap();
+
+    let mut first = common::dial_raw(edge.local_addr());
+    common::send_hello(&mut first, 0xAAAA, common::APP);
+    let (_, hello_ok) = common::read_until_frame(&mut first, FrameType::HelloOk,
+                                                 Duration::from_secs(5))
+        .expect("HELLO_OK");
+    let granted = uc2_remote::frame::HelloOk::decode(&hello_ok).unwrap().credits;
+    assert_eq!(granted, 32, "the only connection gets the whole budget, capped at per_conn");
+
+    // The first connection sends NOTHING from here on. Whatever it hears next
+    // is unprompted.
+    let mut second = common::dial_raw(edge.local_addr());
+    common::send_hello(&mut second, 0xBBBB, common::APP);
+    assert!(common::read_until(&mut second, FrameType::HelloOk, Duration::from_secs(5)).is_some());
+    let (_, body) = common::read_until_frame(&mut first, FrameType::Status,
+                                             Duration::from_secs(5))
+        .expect("no STATUS reached the idle client after its share shrank");
+    let st = Status::decode(&body).unwrap();
+    assert_eq!(st.credits, 28, "the STATUS must carry the SMALLER absolute grant");
+    assert!(edge.stats().grant_changes >= 1, "stats: {:?}", edge.stats());
+
+    drop(first);
+    drop(second);
+    edge.stop();
+    common::assert_no_gateway_threads();
+    node.stop();
+    svc.stop();
+}
+
 /// The same two clients against an engine window that is *smaller* than the
 /// credits handed out (4 shared, 4 each), so `try_submit` really does hit
 /// `Backpressure` and the AIMD squeeze runs under load. Every request must
@@ -159,6 +214,15 @@ fn a_squeezed_window_still_resolves_every_request() {
     let es = edge.stats();
     assert_eq!(es.responses, 2 * PER_CLIENT, "every request resolved: {es:?}");
     assert_eq!(es.retries, 0, "backpressure is absorbed by credits, never bounced: {es:?}");
+    // Not asserted as > 0 — whether the shared window actually fills is a
+    // scheduling race (see the sibling test). What IS asserted: if it fired,
+    // the client was told, unprompted.
+    if es.backpressure_events > 0 {
+        assert!(
+            es.status_frames >= es.backpressure_events,
+            "every squeeze owes the client a STATUS: {es:?}"
+        );
+    }
 
     edge.stop();
     common::assert_no_gateway_threads();
