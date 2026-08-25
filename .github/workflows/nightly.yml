@@ -8,7 +8,9 @@ name: nightly
 #                  linearizability; lin_partition_v2: partition / quorum-loss)
 #                  plus the uc2_service ultima_db-adapter pass.
 #   * sim-heavy  — uc2_sim's 1000-seed election/truncation fuzz tier.
-#   * loom       — the uc2_log frame-visibility memory model (exhaustive
+#   * loom       — the uc2_log frame-visibility memory model AND the
+#                  uc_protocol MPSC ring commit protocol (M13a: claim/commit
+#                  CAS, skip-marker race, head-of-line at a hole; exhaustive
 #                  interleaving exploration; needs `--cfg loom` + release).
 #   * crashtest  — multi-process SIGKILL-mid-load linearizability
 #                  (uc2-crashtest bins spawned via CARGO_BIN_EXE_*).
@@ -87,6 +89,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Frame-visibility loom model
         run: cargo test -p uc2_log --test loom_frame --release
+        env:
+          RUSTFLAGS: --cfg loom
+      - name: MPSC ring commit-protocol loom model
+        run: cargo test -p uc_protocol --test loom_mpsc --release
         env:
           RUSTFLAGS: --cfg loom
 

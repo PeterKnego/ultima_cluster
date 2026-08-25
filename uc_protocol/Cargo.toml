@@ -11,6 +11,12 @@ keywords.workspace = true
 categories.workspace = true
 description = "ultima_cluster wire protocol — shared-memory layouts, frames, versions"
 
+[lints.rust]
+# `cfg(loom)` is set by hand (RUSTFLAGS="--cfg loom") for tests/loom_mpsc.rs,
+# never by a feature, so check-cfg has to be told about it. Mirrors
+# uc2_log/Cargo.toml.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [dependencies]
 # M3: ring buffer primitives need std (atomics + mmap). Pure data types
 # (version, magic, error_codes) remain core-only-compatible.
@@ -32,3 +38,9 @@ uc-bench-probes = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
+
+# M13a Task 5: the MPSC commit-protocol loom model (tests/loom_mpsc.rs). Only
+# ever built under `RUSTFLAGS="--cfg loom"`, so a normal `cargo test` never
+# resolves it.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
