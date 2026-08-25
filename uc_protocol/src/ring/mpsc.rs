@@ -221,9 +221,12 @@ impl MpscProducer {
             // too little room do we pay the `Acquire` load of the real
             // `consumer_position` and re-check.
             //
-            // Invariant: consumer <= publish <= claim (in real time, on the
-            // shared header). But the LOCAL `claim_pos`/`consumer_pos`
-            // snapshots below can violate that ordering — see next paragraph.
+            // Invariant: consumer <= claim (in real time, on the shared
+            // header) — `publish_position` is a commit count on an MPSC
+            // file (module doc), not a position, so it plays no part in
+            // this ordering. But the LOCAL `claim_pos`/`consumer_pos`
+            // snapshots below can violate `consumer <= claim` — see next
+            // paragraph.
             //
             // `claim_pos - consumer_pos` uses `saturating_sub`, not plain `-`:
             // under concurrent producers, `claim_pos` (loaded once at the top
@@ -387,9 +390,21 @@ impl MpscConsumer {
                         // spin, no burn — the caller polls or parks.
                         return Ok(None);
                     }
-                    // Dead producer (spec §4.2): its claim is sized, so skip
-                    // it. The client that died never gets an answer — correct,
-                    // it is dead.
+                    // A claim not committed within `hole_timeout` is treated
+                    // as abandoned — its producer is assumed dead (spec
+                    // §4.2) — and its sized range is skipped and released for
+                    // reuse. This is an assumption, not a certainty: a
+                    // producer that was merely stalled (a major fault on the
+                    // mmap'd ring under memory pressure, VM steal, SIGSTOP,
+                    // a debugger) and resumes after being skipped can then
+                    // write into bytes a later claimant already owns, once
+                    // the ring has lapped back around — a real data race.
+                    // `decode_record_slice`'s crc surfaces the payload case
+                    // as `Corrupt` rather than silently corrupting the read.
+                    // Task 4 turns the commit store into a
+                    // `compare_exchange` on the claim word so a
+                    // merely-stalled producer that resumes learns it was
+                    // skipped (`RingError::Skipped`) instead of overwriting.
                     self.holes_skipped += 1;
                     self.hole = None;
                     // Re-derive the header reference rather than reusing the

@@ -32,19 +32,27 @@
 //!   1. Claim — bump `claim_position` to reserve a slot range. MPSC uses
 //!      `compare_exchange_weak` so producers can claim in parallel; SPSC
 //!      and Broadcast use a single `store` (single producer per ring).
-//!   2. Publish — write the record bytes, then `publish_position.store(…,
-//!      Release)` (MPSC spins until `publish_position == my_slot_start` so
-//!      the publication order matches the claim order).
-//!
-//! Consumers load `publish_position` with Acquire and read only records
-//! whose `[slot, slot+size)` is fully below `publish_position`. This
-//! eliminates the post-wrap torn-record race documented as an M3
-//! limitation: a consumer can never see a slot offset whose bytes are
-//! still being written.
+//!   2. Publish — write the record bytes, then make the write visible.
+//!      **SPSC and Broadcast** do this with `publish_position.store(…,
+//!      Release)`: consumers load `publish_position` with Acquire and read
+//!      only records whose `[slot, slot+size)` is fully below it, which
+//!      eliminates the post-wrap torn-record race documented as an M3
+//!      limitation — a consumer can never see a slot offset whose bytes are
+//!      still being written. **MPSC** (M13a, `ring::mpsc` module doc) does
+//!      not use `publish_position` as a position at all: each record
+//!      commits independently via a per-slot commit word
+//!      (`encode_commit_word`/`classify_commit_word`), Release-stored after
+//!      the body is written, and `publish_position` is reused as a
+//!      **commit count** — bumped once per commit purely so the futex wake
+//!      word changes. The torn-record guard on MPSC is therefore the commit
+//!      word's Release → the consumer's Acquire load of that same word, not
+//!      `publish_position`.
 //!
 //! The length-last-Release commit inside `write_record_at` remains as
-//! defense-in-depth; the primary torn-record guard is now the
-//! `publish_position` Release → consumer Acquire edge.
+//! defense-in-depth on SPSC/Broadcast; the primary torn-record guard there
+//! is the `publish_position` Release → consumer Acquire edge. MPSC does not
+//! call `write_record_at` (it uses the split `write_record_body_at` +
+//! commit-word helpers instead — see `ring::mpsc`).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -81,9 +89,15 @@ pub const PADDING_MSG_TYPE: u16 = 0xffff;
 ///
 /// * `claim_position` — producers atomically claim slot ranges here
 ///   (CAS for MPSC; single producer for SPSC/Broadcast).
-/// * `publish_position` — producer advances this only after the record's
-///   bytes are visible. Consumers read records up to this position.
-///   Eliminates the post-wrap torn-record race that plagued M3.
+/// * `publish_position` — meaning is ring-kind-dependent (see the
+///   "Torn-record protection" section of the module doc). On
+///   **SPSC/Broadcast** it is a byte position: the producer advances it
+///   only after the record's bytes are visible, and consumers read
+///   records up to it — eliminates the post-wrap torn-record race that
+///   plagued M3. On **MPSC** (M13a) it is not a position at all —
+///   per-record commit uses a per-slot commit word instead, and
+///   `publish_position` is reused as a commit count, bumped once per
+///   commit to change the futex wake word.
 /// * `consumer_position` — single reader's progress marker (unused on
 ///   Broadcast; each consumer keeps its own in-memory `head`).
 #[repr(C, align(64))]
