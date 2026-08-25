@@ -1359,6 +1359,16 @@ fn dispatch(
                     squeezed = true;
                     shared.stats.backpressure_events.fetch_add(1, Ordering::Relaxed);
                     conn.squeeze();
+                    // Tell the client its window just halved, rather than
+                    // letting it find out from the next RESPONSE — by which
+                    // point it has already sent into a window the edge cannot
+                    // honour. This is the reader writing on its OWN
+                    // connection, so it can neither stall the driver nor
+                    // touch anyone else's socket. Once per request, not once
+                    // per ladder turn: `squeezed` gates both.
+                    if !shared.write_status(conn) {
+                        return false;
+                    }
                 }
                 // Deliberately do NOT read the socket while waiting: the TCP
                 // window closing is the backstop the credit scheme leans on.
