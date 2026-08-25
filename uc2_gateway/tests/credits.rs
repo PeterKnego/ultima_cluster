@@ -98,9 +98,12 @@ fn two_clients_stay_inside_the_credits_the_edge_grants() {
     });
 
     for (who, s) in [("a", a), ("b", b)] {
+        // budget = 8 - 8/8 = 7; a lone first connection legitimately peaks at
+        // per_conn (4) before the second joins and both settle to 3 — so the
+        // credit PEAK is bounded by the cap, not by the settled share.
         assert!(
             (1..=4).contains(&s.max_credits_seen),
-            "client {who} was advertised {} credits, ceiling is 4",
+            "client {who} was advertised {} credits; ceiling is per_conn=4",
             s.max_credits_seen
         );
         assert_eq!(s.reconnects, 0, "client {who} should not have had to fail over: {s:?}");
@@ -112,10 +115,15 @@ fn two_clients_stay_inside_the_credits_the_edge_grants() {
     assert_eq!(es.submits, 2 * PER_CLIENT, "every write reached the ring exactly once: {es:?}");
     assert_eq!(es.responses, 2 * PER_CLIENT, "one RESPONSE each: {es:?}");
     assert_eq!((es.redirects, es.unknown), (0, 0), "a healthy single-node leader: {es:?}");
-    // Not asserted as > 0: whether the shared window actually fills is a
-    // scheduling race, and forcing it would be testing the test. The
-    // assertion is that correctness does not depend on which way it went.
-    println!("backpressure_events = {} (informational)", es.backpressure_events);
+    // THE POINT OF THE BUDGET. Before it, two connections were each granted
+    // the full `per_conn_inflight` against a window that could not hold both,
+    // and the reactive halve/relax ladder was the only thing keeping them
+    // apart. With grants summing to 6 against a window of 8, the ladder is the
+    // exception path and never runs at all here.
+    assert_eq!(
+        es.backpressure_events, 0,
+        "grants sum inside the Engine window, so nothing may hit Backpressure: {es:?}"
+    );
 
     edge.stop();
     common::assert_no_gateway_threads();
@@ -475,6 +483,87 @@ fn the_sum_of_grants_never_exceeds_the_edges_budget_under_a_connect_disconnect_r
 
     drop(conns);
     Arc::try_unwrap(edge).ok().unwrap().stop();
+    common::assert_no_gateway_threads();
+    node.stop();
+    svc.stop();
+}
+
+/// (spec §5.4, iii) A disconnect gives its share back to the survivors, and
+/// `HELLO_OK` on a later dial carries the *current* division of the budget,
+/// never the config constant.
+#[test]
+fn a_disconnect_gives_its_share_back_and_hello_ok_carries_the_live_grant() {
+    use uc2_remote::frame::{FrameType, HelloOk};
+
+    let root = common::tempdir();
+    let (node, dir) = common::start_single_node(root.path());
+    let svc = uc2_service::ServiceBuilder::new(
+        uc2_service::ServiceConfig::new(&dir, common::APP),
+        uc2_service::Sessioned::new(
+            uc_lincheck::register::RegisterSm::default(),
+            uc2_service::SessionConfig::default(),
+        ),
+    )
+    .start()
+    .unwrap();
+    common::await_serving(&node, 10);
+
+    // budget 56, cap 32: 1 -> 32, 2 -> 28, 4 -> 14.
+    let edge = Edge::start(edge_config(&dir, 64, 32)).unwrap();
+    let budget = uc2_gateway::budget_for(64);
+
+    let mut held = Vec::new();
+    for i in 0..3u64 {
+        let mut c = common::dial_raw(edge.local_addr());
+        common::send_hello(&mut c, 0xC000 + i, common::APP);
+        assert!(common::read_until(&mut c, FrameType::HelloOk, Duration::from_secs(5)).is_some());
+        held.push(c);
+    }
+    // The FOURTH dial must be told 14, not the 32 the config would grant.
+    let mut fourth = common::dial_raw(edge.local_addr());
+    common::send_hello(&mut fourth, 0xC0FF, common::APP);
+    let (_, body) =
+        common::read_until_frame(&mut fourth, FrameType::HelloOk, Duration::from_secs(5))
+            .expect("HELLO_OK");
+    let credits = HelloOk::decode(&body).unwrap().credits;
+    assert_eq!(credits, uc2_gateway::grant_for(4, budget, 32), "HELLO_OK must carry the live share");
+    assert_eq!(credits, 14);
+
+    // Three of them go away; the survivor must climb back to the whole cap.
+    drop(fourth);
+    held.truncate(1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let g = edge.grants_for_tests();
+        if g.len() == 1 && g[0].1 == 32 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the survivor never got its share back: {g:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // …and the increase reaches the (idle) client on the STATUS timer, with no
+    // request of its own. The idle survivor has stale shrink-STATUSes (28, 18,
+    // …) buffered from the setup phase, and a *raised* share is not queued for
+    // proactive STATUS (only lowered shares are — growth is the safe direction,
+    // deferred to the periodic timer), so drain STATUS frames until the widened
+    // value arrives rather than trusting the first buffered one.
+    let status_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let (_, body) = common::read_until_frame(&mut held[0], FrameType::Status,
+                                                 Duration::from_secs(5))
+            .expect("no STATUS carried the widened window");
+        let c = uc2_remote::frame::Status::decode(&body).unwrap().credits;
+        if c == 32 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < status_deadline,
+            "STATUS never widened to 32; last saw {c}"
+        );
+    }
+
+    drop(held);
+    edge.stop();
     common::assert_no_gateway_threads();
     node.stop();
     svc.stop();
