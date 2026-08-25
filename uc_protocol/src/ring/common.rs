@@ -368,14 +368,62 @@ pub enum RingError {
     /// via the marker (no lap needed) if the CAS-skip landed before the
     /// resumed commit, or via a later claimant's re-stamped word if the
     /// resurrection raced the marker CAS itself and the ring has since
-    /// lapped back to this exact slot. The one thing this does NOT catch:
-    /// a resurrection that resumes mid-body-write, after the slot has moved
+    /// lapped back to this exact slot.
+    ///
+    /// # What this does NOT catch, stated precisely
+    ///
+    /// A resurrection that resumes mid-BODY-write, after the slot has moved
     /// on to a yet-later claimant without its commit word changing again in
-    /// the meantime — `decode_record_slice`'s crc32 surfaces that as a bad
-    /// read, not a silent corruption, but does not prevent the write (see
-    /// `mpsc::MpscProducer::commit`'s doc for the full residual).
+    /// the meantime. The commit CAS guards the slot's first word only; the
+    /// body bytes are unguarded, and there are three shapes, only one of
+    /// which the crc32 catches:
+    ///
+    /// 1. **Partial stomp (crc-caught).** The resurrected producer writes
+    ///    some of its body over a later claimant's differently-sized record.
+    ///    The bytes no longer agree with the later claimant's trailer, so
+    ///    `decode_record_slice` returns [`Self::BadCrc`] (or
+    ///    [`Self::Corrupt`]). Surfaced as a bad read — never a silent
+    ///    misread — but not prevented.
+    /// 2. **Complete same-length stomp (NOT crc-caught).** If the later
+    ///    claimant's record is the same length, the resurrected producer
+    ///    writes a fully self-consistent record — its own header_extra, its
+    ///    own payload, its own crc — over it. The crc MATCHES, and the
+    ///    consumer delivers the RESURRECTED producer's record at the later
+    ///    claimant's position. The later claimant's submit is silently lost:
+    ///    its client sees no response and retries on timeout, and the
+    ///    resurrected record may be delivered twice (once at its original
+    ///    position if it was ever read there, once here). Exactly-once
+    ///    therefore holds only for callers that ride
+    ///    `uc2_service::session::Sessioned` — the `(client_id, seq)` envelope
+    ///    is what turns the duplicate into a REPLAYED tag and the loss into
+    ///    a client-side retry.
+    /// 3. **Padding stomp (NOT crc-covered at all).** A producer preempted
+    ///    between its tail-padding claim-word store and its padding BODY
+    ///    write writes `PADDING_MSG_TYPE` into bytes 4..6 of a later
+    ///    claimant's slot. `decode_record_slice` short-circuits on
+    ///    `msg_type == PADDING_MSG_TYPE` BEFORE computing any crc, so
+    ///    nothing about that record is checked. The MPSC consumer therefore
+    ///    does not use that short-circuit blindly: padding is by
+    ///    construction exactly the tail remnant, so
+    ///    [`mpsc::MpscConsumer::try_read`] accepts `PADDING_MSG_TYPE` only
+    ///    when the committed length is exactly `bytes_to_tail`, and
+    ///    otherwise decodes through the normal record path (see
+    ///    [`decode_record_slice_no_padding`]) so the stomp surfaces as
+    ///    `BadCrc`/`Corrupt`. Residual: a real record that ends EXACTLY at
+    ///    the tail is indistinguishable from padding by that test, so a
+    ///    padding stomp on such a record is still swallowed silently.
+    ///
+    /// [`mpsc::MpscConsumer::try_read`]: crate::ring::mpsc::MpscConsumer::try_read
     #[error("producer at position {position} was skipped by the consumer before it could commit")]
     Skipped { position: u64 },
+    /// A caller asked to write a record whose `msg_type` is
+    /// [`PADDING_MSG_TYPE`], the reserved tail-remnant marker. Accepting it
+    /// would let a caller manufacture something the consumer must decide
+    /// between "record" and "ring padding" on length alone — see
+    /// [`Self::Skipped`]'s padding-stomp case. A caller error, refused at
+    /// the door.
+    #[error("msg_type {msg_type:#06x} is reserved for ring padding")]
+    ReservedMsgType { msg_type: u16 },
 }
 
 /// Create — or RECREATE IN PLACE — the backing file for an mmap-shared IPC
@@ -925,11 +973,42 @@ pub fn decode_record_slice(
     slot: &[u8],
     payload_buf: &mut Vec<u8>,
 ) -> Result<(RecordHeader, usize), RingError> {
+    decode_record_slice_inner(slot, payload_buf, true)
+}
+
+/// [`decode_record_slice`] with the `PADDING_MSG_TYPE` short-circuit
+/// DISABLED: a slot whose `msg_type` bytes read `0xffff` is decoded as an
+/// ordinary record, crc32 and all.
+///
+/// The MPSC consumer uses this for every slot it does not independently
+/// believe is padding (padding is exactly the tail remnant, so `length ==
+/// bytes_to_tail` is the test). Without it, the padding short-circuit is a
+/// crc-free hole: a producer preempted between its padding claim-word store
+/// and its padding BODY write can resurrect a lap later and stamp
+/// `PADDING_MSG_TYPE` into bytes 4..6 of a LATER claimant's slot, and that
+/// claimant's perfectly valid record would be swallowed silently rather than
+/// delivered. See [`RingError::Skipped`]'s padding-stomp case.
+///
+/// SPSC and Broadcast keep the plain [`decode_record_slice`]: they have a
+/// single producer that cannot be raced into a foreign slot, so their
+/// padding is never in doubt.
+pub fn decode_record_slice_no_padding(
+    slot: &[u8],
+    payload_buf: &mut Vec<u8>,
+) -> Result<(RecordHeader, usize), RingError> {
+    decode_record_slice_inner(slot, payload_buf, false)
+}
+
+fn decode_record_slice_inner(
+    slot: &[u8],
+    payload_buf: &mut Vec<u8>,
+    allow_padding: bool,
+) -> Result<(RecordHeader, usize), RingError> {
     if slot.len() < 6 {
         return Err(RingError::Corrupt(format!("record slice too short: {}", slot.len())));
     }
     let msg_type = u16::from_le_bytes([slot[4], slot[5]]);
-    if msg_type == PADDING_MSG_TYPE {
+    if allow_padding && msg_type == PADDING_MSG_TYPE {
         // Padding length is a multiple of RECORD_ALIGN by construction — but
         // `slot.len()` (== the commit word's LENGTH field) is data that
         // arrived from another process, and an unaligned value here would

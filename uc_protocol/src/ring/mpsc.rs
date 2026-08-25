@@ -54,9 +54,14 @@
 //! open across a lap; loss is signalled either way a resurrection can be
 //! caught. The one thing this does NOT catch: a resurrection mid-body-write,
 //! after the slot has moved on to a yet-later claimant without its commit
-//! word changing again in between — `decode_record_slice`'s crc32 surfaces
-//! that as a bad read, not a silent corruption, but does not prevent the
-//! write. See `MpscProducer::commit`'s doc for the full residual.
+//! word changing again in between. The crc32 catches only a PARTIAL stomp; a
+//! COMPLETE same-length stomp is a self-consistent record and is delivered as
+//! the resurrected producer's record at the later claimant's position (that
+//! claimant's submit is lost and retried by its client's timeout —
+//! exactly-once survives only under `Sessioned`). A PADDING stomp is not
+//! crc-covered at all, which is why the consumer accepts `PADDING_MSG_TYPE`
+//! only at exactly the tail remnant (see `MpscConsumer::try_read`). See
+//! `RingError::Skipped`'s doc for the full, per-shape residual.
 //!
 //! **The tail-straddle padding marker is published the same way** — the same
 //! `compare_exchange` from its own claim word, not an unconditional store.
@@ -85,7 +90,8 @@ use crate::ring::common::{
     FRAME_HEADER_LEN, FRAME_TRAILER_LEN, MPSC_MAX_RECORD_BYTES, PADDING_MSG_TYPE, ParkMode,
     RING_HEADER_LEN, RecordHeader, RingError, RingHeader, RingWaitHandle, SlotState,
     align_record_size, cas_commit_word, classify_commit_word, decode_record_slice,
-    encode_commit_word, init_ring_header_with_magic, lap_of, load_commit_word,
+    decode_record_slice_no_padding, encode_commit_word, init_ring_header_with_magic, lap_of,
+    load_commit_word,
     store_commit_word, validate_ring_header_with_magic, write_padding_body_at,
     write_record_body_at,
 };
@@ -207,6 +213,24 @@ pub struct PendingPadding {
 }
 
 impl MpscProducer {
+    /// Claim a slot, write the record into it, and commit it. Never waits for
+    /// another producer at any step.
+    ///
+    /// # Errors
+    ///
+    /// | error | meaning | retry? |
+    /// |-------|---------|--------|
+    /// | [`RingError::TooLarge`] | `FRAME_HEADER_LEN + payload + FRAME_TRAILER_LEN` exceeds the ring's `max_msg_size` | never — a caller contract violation |
+    /// | [`RingError::ReservedMsgType`] | `msg_type == PADDING_MSG_TYPE` (`0xffff`), reserved for the tail-remnant marker | never — a caller contract violation |
+    /// | [`RingError::Full`] | not enough free space right now (the consumer has not caught up) | yes — this is backpressure; nothing was claimed |
+    /// | [`RingError::Skipped`] | this producer stalled past the consumer's `hole_timeout`, the consumer skipped and skip-marked the claim, and the commit CAS was refused | **yes — the record was NOT delivered and the slot has been released; a retry is a fresh claim, not a duplicate** |
+    ///
+    /// `Skipped` is the only error that can be returned AFTER bytes were
+    /// written into the ring, and it is still safe to retry: the consumer
+    /// advanced past the claimed range before the CAS could fail, so nothing
+    /// of this record was ever handed to the caller's peer. Callers that need
+    /// exactly-once across such a retry ride
+    /// `uc2_service::session::Sessioned` like any other retry.
     pub fn try_write(
         &self,
         msg_type: u16,
@@ -338,6 +362,12 @@ impl MpscProducer {
         // SAFETY: `slot_offset` is inside the mapped slot region and
         // RECORD_ALIGN-aligned; the CAS only succeeds if the word is still
         // exactly our own padding claim word, i.e. we still own the range.
+        //
+        // FAILURE ordering is `Relaxed`, not `Acquire`: on failure we read
+        // nothing — not the returned word, not the slot's bytes — we just
+        // return `Skipped`. `Acquire` on the failure path is not free on
+        // aarch64: it makes the whole loop `ldaxr`/`stlxr` instead of
+        // `ldxr`/`stlxr`, which costs on a hot path taken once per record.
         let result = unsafe {
             cas_commit_word(
                 self.inner.slot_region_mut(),
@@ -345,7 +375,7 @@ impl MpscProducer {
                 expected,
                 committed,
                 Ordering::Release,
-                Ordering::Acquire,
+                Ordering::Relaxed,
             )
         };
         if result.is_err() {
@@ -363,6 +393,15 @@ impl MpscProducer {
         header_extra: [u8; 8],
         payload: &[u8],
     ) -> Result<PendingClaim, RingError> {
+        // `PADDING_MSG_TYPE` is the ring's own tail-remnant marker. A caller
+        // that could write it would manufacture a record the consumer must
+        // tell apart from padding on LENGTH alone (`try_read`'s discriminator
+        // below), which is exactly the ambiguity the padding-stomp residual
+        // (`RingError::Skipped`) is about. Refused at the door — this is a
+        // caller contract violation, not backpressure.
+        if msg_type == PADDING_MSG_TYPE {
+            return Err(RingError::ReservedMsgType { msg_type });
+        }
         let total = FRAME_HEADER_LEN + payload.len() + FRAME_TRAILER_LEN;
         if total > self.inner.max_msg_size() {
             return Err(RingError::TooLarge { len: total, max: self.inner.max_msg_size() });
@@ -524,10 +563,27 @@ impl MpscProducer {
     /// the slot to a later claimant that has since committed and even been
     /// read — can still stomp payload bytes the consumer already delivered,
     /// or ones a still-later claimant is about to write, without the commit
-    /// word itself ever changing again in the meantime. The record's crc32
-    /// (`decode_record_slice`) surfaces that case as `RingError::BadCrc` or
-    /// `Corrupt` rather than a silent misread, but it does not prevent the
-    /// write. This is spec §4.2's documented residual, not new to this CAS.
+    /// word itself ever changing again in the meantime. The crc32 is only a
+    /// PARTIAL backstop, and the earlier wording here overstated it:
+    ///
+    /// * a **partial** stomp disagrees with the victim's own trailer, so
+    ///   `decode_record_slice` returns `BadCrc`/`Corrupt` — surfaced, not
+    ///   silent, but not prevented;
+    /// * a **complete same-length** stomp writes a self-consistent record
+    ///   (its own header_extra, payload and crc), so the crc MATCHES and the
+    ///   consumer delivers the RESURRECTED producer's record at the later
+    ///   claimant's position. The later claimant's submit is silently lost
+    ///   (its client times out and retries) and the resurrected record can
+    ///   appear twice. Exactly-once across that is `Sessioned`'s job, not
+    ///   the ring's;
+    /// * a **padding** stomp (a producer resurrecting inside the padding
+    ///   path) is not crc-covered AT ALL, because `decode_record_slice`
+    ///   short-circuits on `msg_type == PADDING_MSG_TYPE` before hashing
+    ///   anything. `MpscConsumer::try_read` therefore accepts padding only
+    ///   at exactly the tail remnant.
+    ///
+    /// See `RingError::Skipped`'s doc for the canonical statement. This is
+    /// spec §4.2's documented residual, corrected — not new to this CAS.
     fn commit(&self, claim: PendingClaim) -> Result<(), RingError> {
         let header = self.inner.header();
         let slot_offset = (claim.pos as usize) & (self.inner.capacity() - 1);
@@ -537,6 +593,12 @@ impl MpscProducer {
         // SAFETY: `slot_offset` is inside the mapped slot region (bounded by
         // `claim`'s own bookkeeping); the CAS only ever succeeds if the word
         // is still exactly our own claim word, i.e. we still own the range.
+        //
+        // FAILURE ordering is `Relaxed`, not `Acquire`: nothing is read on
+        // the failure path — the returned word is discarded and we return
+        // `Skipped` without touching the slot. `Acquire` would be dead
+        // weight with a real cost on aarch64, where it turns this
+        // once-per-record CAS from `ldxr`/`stlxr` into `ldaxr`/`stlxr`.
         let result = unsafe {
             cas_commit_word(
                 self.inner.slot_region_mut(),
@@ -544,7 +606,7 @@ impl MpscProducer {
                 expected,
                 committed,
                 Ordering::Release,
-                Ordering::Acquire,
+                Ordering::Relaxed,
             )
         };
         if result.is_err() {
@@ -590,7 +652,14 @@ impl MpscConsumer {
                     }
                     // NOTE: the clock is read only on this path and the
                     // Claimed path. An empty ring (claim == consumer) is the
-                    // hot idle poll and never touches it.
+                    // hot idle poll and never touches it. A BUSY ring is not
+                    // free, though: every time the consumer catches the
+                    // frontier mid-claim at a NEW position, `hole_elapsed`
+                    // takes the `_ =>` arm and pays one `Instant::now()` (a
+                    // `clock_gettime` vDSO call) to arm the timer for that
+                    // position. That is once per caught-up poll, not once
+                    // per record — the price of being able to time a hole
+                    // at all.
                     if self.hole_elapsed(consumer_pos) {
                         return Err(RingError::Wedged { position: consumer_pos });
                     }
@@ -661,6 +730,28 @@ impl MpscConsumer {
                     // this exact record, and reporting `Skipped` for a
                     // DELIVERED record would let a caller retry and
                     // double-apply it (controller ruling, fix round 1).
+                    // Minor 4 (final review): the bounds above constrain
+                    // `advance` in isolation; this constrains it against the
+                    // ring's own frontier. A corrupt-but-in-range advance
+                    // could still carry `consumer_position` PAST
+                    // `claim_position` — which no producer can ever do — and
+                    // a consumer ahead of the frontier reads `Ok(None)`
+                    // forever, with no `Wedged` and no counter moving: a
+                    // silently dead ring. This is the COLD path (a hole that
+                    // already outlived `hole_timeout`), so one extra Acquire
+                    // load costs nothing measurable. The sibling `Committed`
+                    // arm deliberately does NOT do this: it is the hot path,
+                    // taken once per record, and its length is already
+                    // bounded by `bytes_to_tail`/`max_record` with a crc32
+                    // behind it.
+                    let frontier = self.inner.header().claim_position.load(Ordering::Acquire);
+                    if consumer_pos + advance as u64 > frontier {
+                        return Err(RingError::Corrupt(format!(
+                            "claim word advance {advance} at position {consumer_pos} would carry \
+                             the consumer past claim_position {frontier}"
+                        )));
+                    }
+
                     let lap = lap_of(consumer_pos, capacity);
                     let marker = encode_commit_word(lap, 0, true);
                     // SAFETY: `slot_offset` is a mapped, 4-byte-aligned
@@ -668,6 +759,11 @@ impl MpscConsumer {
                     // CAS's `current` is the exact word we just Acquire-
                     // loaded, so a losing CAS only means the word changed
                     // concurrently, never that we mis-targeted memory.
+                    //
+                    // FAILURE ordering `Relaxed`: the returned word is
+                    // discarded — a losing CAS just `continue`s and
+                    // re-Acquire-loads the word at the top of the loop, so
+                    // there is nothing for an `Acquire` here to order.
                     let cas = unsafe {
                         cas_commit_word(
                             self.inner.slot_region_mut(),
@@ -675,7 +771,7 @@ impl MpscConsumer {
                             word,
                             marker,
                             Ordering::AcqRel,
-                            Ordering::Acquire,
+                            Ordering::Relaxed,
                         )
                     };
                     self.hole = None;
@@ -718,13 +814,45 @@ impl MpscConsumer {
                             len,
                         )
                     };
-                    let (rec, advance) = decode_record_slice(slot, payload_buf)?;
+                    // Critical 1 (final review): `decode_record_slice`
+                    // short-circuits on `msg_type == PADDING_MSG_TYPE`
+                    // BEFORE computing any crc, so the padding path is a
+                    // crc-free hole in the record format — and on an MPSC
+                    // ring a producer CAN put those two bytes into a slot it
+                    // no longer owns (a producer preempted between its
+                    // padding claim-word store and its padding BODY write,
+                    // timed out, skip-marked, resurrecting a lap later:
+                    // `RingError::Skipped`'s padding-stomp case). Taken
+                    // blindly, that swallows a later claimant's perfectly
+                    // valid record in silence.
+                    //
+                    // Padding is by construction EXACTLY the tail remnant —
+                    // `claim`'s straddle branch claims `bytes_to_tail` and
+                    // nothing else — so that is the discriminator. Anything
+                    // else claiming to be padding goes down the ordinary
+                    // record path and meets the crc32, surfacing the stomp
+                    // as `BadCrc`/`Corrupt` instead of a silent swallow.
+                    //
+                    // RESIDUAL, stated: a real record whose committed length
+                    // is exactly `bytes_to_tail` (one that ends flush with
+                    // the tail) is indistinguishable from padding by this
+                    // test, so a padding stomp on THAT record is still
+                    // swallowed silently. `claim` refusing
+                    // `PADDING_MSG_TYPE` from callers shuts the reverse
+                    // direction.
+                    let claims_padding =
+                        u16::from_le_bytes([slot[4], slot[5]]) == PADDING_MSG_TYPE;
+                    if claims_padding && len == bytes_to_tail {
+                        let (_pad, advance) = decode_record_slice(slot, payload_buf)?;
+                        header
+                            .consumer_position
+                            .store(consumer_pos + advance as u64, Ordering::Release);
+                        continue;
+                    }
+                    let (rec, advance) = decode_record_slice_no_padding(slot, payload_buf)?;
                     header
                         .consumer_position
                         .store(consumer_pos + advance as u64, Ordering::Release);
-                    if rec.msg_type == PADDING_MSG_TYPE {
-                        continue;
-                    }
                     return Ok(Some(rec));
                 }
             }
@@ -1501,6 +1629,137 @@ mod tests {
         assert_eq!(rec.msg_type, 1);
         assert_eq!(&buf[..], b"A");
         assert_eq!(consumer.holes_skipped(), 0, "A was not skipped — it won the race");
+    }
+
+    /// Final review, Critical 1(2): the padding stomp. `decode_record_slice`
+    /// short-circuits on `msg_type == PADDING_MSG_TYPE` before computing any
+    /// crc, so a producer that resurrects inside the PADDING path and writes
+    /// `0xffff` into bytes 4..6 of a later claimant's slot would have that
+    /// claimant's valid record silently swallowed as "ring padding".
+    ///
+    /// The consumer's discriminator is that padding is by construction
+    /// exactly the tail remnant. Here the planted word's length (24) is not
+    /// `bytes_to_tail` (128), so the slot must go down the ordinary record
+    /// path and be refused by the crc — never consumed in silence.
+    #[test]
+    fn a_padding_shaped_record_of_the_wrong_length_is_refused_not_swallowed() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = MpscRing::create(tmp.path(), 128, 64).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+
+        // SAFETY: exclusive access to a freshly created, unshared ring.
+        // Plant the stomp: PADDING_MSG_TYPE in the msg_type bytes of a
+        // COMMITTED word whose length is a plausible record length, not the
+        // tail remnant.
+        unsafe {
+            let region = producer.inner.slot_region_mut();
+            std::ptr::copy_nonoverlapping(
+                PADDING_MSG_TYPE.to_le_bytes().as_ptr(),
+                region.add(4),
+                2,
+            );
+            store_commit_word(region, 0, encode_commit_word(0, 24, false), Ordering::Release);
+        }
+
+        let mut buf = Vec::new();
+        let got = consumer.try_read(&mut buf);
+        assert!(
+            matches!(got, Err(RingError::BadCrc) | Err(RingError::Corrupt(_))),
+            "a padding-shaped word that is not the tail remnant must meet the crc, got {got:?}"
+        );
+        assert_eq!(
+            producer.inner.header().consumer_position.load(Ordering::Acquire),
+            0,
+            "nothing was consumed"
+        );
+    }
+
+    /// The other half of Critical 1(2): a GENUINE tail-remnant padding marker
+    /// — length exactly `bytes_to_tail` — is still recognised and skipped
+    /// without a crc, so the tightening did not break the real padding path.
+    /// (`wrap_under_many_producers_no_torn_read` exercises it under load;
+    /// this pins the discriminator itself.)
+    #[test]
+    fn a_genuine_tail_padding_marker_is_still_skipped() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = MpscRing::create(tmp.path(), 128, 64).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+
+        // Walk both positions to 120 (5 × 24), leaving an 8-byte tail.
+        let mut buf = Vec::new();
+        for i in 0u8..5 {
+            producer.try_write(1, 0, [0; 8], &[b'0' + i]).expect("write");
+            assert!(consumer.try_read(&mut buf).expect("read").is_some());
+        }
+        // The next record straddles: `claim` writes real padding at 120..128
+        // and the record at offset 0 of lap 1.
+        producer.try_write(2, 0, [0; 8], b"z").expect("write across the tail");
+        let rec = consumer
+            .try_read(&mut buf)
+            .expect("the padding is skipped, not refused")
+            .expect("the record after the wrap");
+        assert_eq!(rec.msg_type, 2);
+        assert_eq!(&buf[..], b"z");
+    }
+
+    /// Final review, Minor 5: `PADDING_MSG_TYPE` is the ring's own marker.
+    /// A caller that could write it would manufacture exactly the ambiguity
+    /// the discriminator above has to resolve, so `claim` refuses it — and
+    /// with its own variant, not the misleading `TooLarge`.
+    #[test]
+    fn a_caller_cannot_write_the_reserved_padding_msg_type() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = MpscRing::create(tmp.path(), 4096, 1024).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+
+        assert!(matches!(
+            producer.try_write(PADDING_MSG_TYPE, 0, [0; 8], b"nope"),
+            Err(RingError::ReservedMsgType { msg_type: PADDING_MSG_TYPE })
+        ));
+        // Nothing was claimed: the ring is untouched and still works.
+        assert_eq!(producer.inner.header().claim_position.load(Ordering::Acquire), 0);
+        producer.try_write(1, 0, [0; 8], b"ok").expect("write");
+        let mut buf = Vec::new();
+        let rec = consumer.try_read(&mut buf).expect("read").expect("record");
+        assert_eq!(rec.msg_type, 1);
+    }
+
+    /// Final review, Minor 4: on the COLD skip path an in-range but corrupt
+    /// `advance` must not carry `consumer_position` past `claim_position` —
+    /// a consumer ahead of the frontier reads `Ok(None)` forever with no
+    /// `Wedged` and no counter moving (a silently dead ring). Planted here
+    /// with a legal-looking 24-byte claim against a frontier of 8.
+    #[test]
+    fn a_cold_skip_that_would_pass_the_claim_frontier_is_refused() {
+        let tmp = NamedTempFile::new().unwrap();
+        let ring = MpscRing::create(tmp.path(), 128, 64).expect("create");
+        let (producer, mut consumer) = ring.into_split();
+        consumer.set_hole_timeout(std::time::Duration::from_millis(0));
+
+        // SAFETY: exclusive access to a freshly created, unshared ring.
+        unsafe {
+            store_commit_word(
+                producer.inner.slot_region_mut(),
+                0,
+                encode_commit_word(0, 24, true), // aligned, in range, plausible
+                Ordering::Release,
+            );
+        }
+        // ...but the ring's own frontier says only 8 bytes were ever claimed.
+        producer.inner.header().claim_position.store(8, Ordering::Release);
+
+        let mut buf = Vec::new();
+        assert!(matches!(consumer.try_read(&mut buf), Ok(None)), "first poll starts the timer");
+        assert!(
+            matches!(consumer.try_read(&mut buf), Err(RingError::Corrupt(_))),
+            "an advance past claim_position is refused, not acted on"
+        );
+        assert_eq!(consumer.holes_skipped(), 0);
+        assert_eq!(
+            producer.inner.header().consumer_position.load(Ordering::Acquire),
+            0,
+            "consumer_position must not have moved past the frontier"
+        );
     }
 
     #[test]
