@@ -395,8 +395,15 @@ jobs:
   # `loom` job) and their layout by offset-pin tests. docs/VERIFICATION.md
   # says this out loud rather than implying the rings are Miri-clean.
   #
+  # uc2_remote's outgoing/completion/slots ARE here: those SPSC structures
+  # are raw pointers over a heap Vec (not file-backed), so Miri models them
+  # fully — and it found a real Stacked-Borrows aliasing bug in them during
+  # M13b (a whole-buffer &mut retagging the allocation). This is the
+  # Vec-backed case the note above leaves unbuilt for the IPC rings; for the
+  # remote client it exists for free, so it is checked.
+  #
   # Test selection is by filter, and every selected test was run locally
-  # under Miri first: all 43 + 19 pass with isolation ON, so nothing here
+  # under Miri first: all 43 + 19 + 29 pass with isolation ON, so nothing here
   # needed excluding and isolation is never disabled.
   miri:
     runs-on: ubuntu-latest
@@ -426,3 +433,7 @@ jobs:
             journal::segment::tests::header_ \
             journal::segment::tests::record_ \
             journal::segment::tests::decode_
+      - name: Miri — uc2_remote SPSC structures (outgoing/completion/slots, 29 tests)
+        run: |
+          cargo +nightly miri test -p uc2_remote --lib -- \
+            outgoing:: completion:: slots::

@@ -19,14 +19,43 @@ had.
 
 ### The client (`uc2_remote`)
 
-*Filled in by track B at merge: the split halves, what moved from the old
-client unchanged, and the ported `client_fake_edge` scenarios.*
+`RemoteEngine::connect` returns `(RemoteSendHalf, RemotePollHalf)`; the old
+single-lock `RemoteClient` is now a thin blocking layer over them. Each
+connection is three lock-free SPSC structures — an outgoing byte ring (the
+writer drains it in batches, one `write_all` per drain), a bounded completion
+queue with a body arena (a drop-guard publishes so a panicking drain callback
+never re-delivers), and a generation-tagged slot table (owner-CAS gives
+exactly-once). The admission window is **count-based**
+(`inflight < credits && inflight < max_inflight`, credits bounding unanswered
+requests of *both* kinds), not the seq-based rule the old client used — which
+starved after `credits` queries because a gateway only advances `acked_seq`
+on SUBMITs. A connection *generation* (an `epoch` plus a `FlowWord` packing
+generation and credits in one word) gates redial and credit updates, so a
+stale redial cannot tear down a fresh connection and a stale grant cannot
+overwrite a fresh one. Failover — `REDIRECT` / `LEADER_CHANGED` / `RETRY`, a
+not-serving latch, probe-before-flush, resend every live slot on redial — is
+generation-gated throughout. `query` now takes a `Consistency`. What moved
+from the old client unchanged: the frame codec and the session envelope. The
+`engine_fake_edge` / `client_fake_edge` scenarios were ported onto the halves.
 
 ### The ring (`uc_protocol::ring::mpsc`)
 
-*Filled in by track A at merge: per-record commit, the lap-stamped commit
-word, the dead-producer hole and its `IngressRingWedged` residual, the loom
-model, and the ring-magic bump.*
+The MPSC ingress ring moves from publish-in-claim-order to **per-record
+commit**. A producer CAS-claims a slot, stamps a LAP-tagged commit word with
+the length written *last*, copies the body, then Release-commits; the consumer
+reads the commit word and stops at the first record not yet committed. No
+producer ever spins on its predecessor, which is what removes the convoy the
+`2.6.0` collapse was made of. A producer that dies mid-record leaves a hole
+the consumer CAS-marks (so `RingError::Skipped` is exact, never raised for a
+delivered record); a torn or impossible word fail-stops the node as
+`IngressRingWedged` / `IngressRingCorrupt`, with per-ring `holes_skipped`
+counters on the cnc page. A loom model checks four properties (every committed
+record delivered exactly once in claim order; a stalled producer never blocks
+another's commit; a skip-and-commit race has exactly one winner; a later
+claimant overwrites the marker and is still delivered), and a preemption test
+reproduces the old convoy's trigger. The ring magic is bumped (`ULTRNG2`), so
+a same-host restart re-initialises the ring rather than reading an old-format
+buffer.
 
 ### The edge budget (`uc2_gateway`)
 
@@ -40,12 +69,18 @@ backpressure episode cannot climb past the share its neighbours leave it.
 Two ordering decisions carry the invariant "the sum of grants never exceeds
 the budget", and they are the whole of the design:
 
-- **On connect**, a handshake counts itself into `live`, asks for a
-  republication, and **waits** (bounded, `GRANT_SETTLE_TIMEOUT` = 250 ms,
-  normally microseconds) for the driver to have pushed the smaller share to
-  every connection already attached — *then* computes its own grant and puts
-  it in `HELLO_OK`. Granting first and shrinking the others afterwards would
-  over-promise the window for as long as the republication took.
+- **On connect**, a handshake takes a `grant_lock` and, in one critical
+  section, counts itself into `live`, recomputes every already-attached
+  connection's ceiling to the new smaller share, sets its own ceiling, and
+  marks itself ready — *then* releases the lock and writes its grant into
+  `HELLO_OK`. Doing the whole recompute-and-admit under one lock is what makes
+  the invariant hold at *every instant*: an earlier design let the newcomer
+  wait for a separate driver pass and publish before that pass had counted it,
+  so two concurrent connects could each admit against a stale, smaller `live`
+  and over-promise the window (found in review, replaced by the lock — see the
+  spec's §5 as-built erratum). The handshake also holds the connection's
+  writer across the lock and the `HELLO_OK` write, so a driver `STATUS` can
+  never reach the socket before `HELLO_OK`.
 - **On disconnect**, the connection leaves the table *before* it leaves the
   budget. The reverse order would let the survivors grow into a share the
   departing connection still nominally held.

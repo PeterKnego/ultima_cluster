@@ -150,10 +150,13 @@ protocol v1 already carries everything needed (`HELLO_OK{credits}`,
 **As built** (`uc2_gateway/src/edge.rs`, `conn.rs`): `Shared` carries
 `budget = max_inflight − max_inflight/8` and a `live` count;
 `grant_for(live, budget, per_conn)` is the share; `Conn::ceiling` is dynamic
-and `relax` climbs to it; a handshake joins the budget and waits for the
-driver to publish the smaller share to everyone already attached **before**
+and `relax` climbs to it; under a `grant_lock`, a handshake counts itself in and
+recomputes every already-attached connection's smaller share, sets its own
+ceiling, and marks itself ready — all **before** it releases the lock and
 `HELLO_OK` names a grant, which is what makes "the sum never exceeds the
-budget" true at every instant and not merely eventually; a reduction is
+budget" true at every instant and not merely eventually (an earlier
+settle-wait design admitted against a stale `live` under concurrent connects;
+see the spec §5 erratum); a reduction is
 pushed as `STATUS`, including on `Conn::squeeze`, which had no call site at
 all in `2.6.0`. `SendHalf::inflight()` is still not read — the budget is
 sized from the window, not sampled from it, which needs no per-request
