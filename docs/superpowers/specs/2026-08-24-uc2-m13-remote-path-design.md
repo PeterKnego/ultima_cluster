@@ -442,3 +442,16 @@ harness (C).
 - Bar a assumes the edge's driver can feed one connection at ≥ 0.95 M/s;
   the raw client already showed 1.14 M/s, so the risk is in the client, not
   the edge.
+
+
+> **As-built erratum (2026-08-25, Task 2 review):** the §5 grant-settle mechanism
+> as drafted — a handshaking reader sampling `grant_gen` and waiting via
+> `await_settled` for it to advance — does **not** hold the instant-invariant
+> under concurrent connects: `grant_gen` is coalesced and cannot prove that the
+> push which advanced it observed this connection's `live++`, so a newcomer can go
+> ready against a stale `live` and the sum of granted ceilings can transiently
+> exceed `budget`. The invariant (sum ≤ budget at every instant) is unchanged and
+> still the goal; the mechanism is replaced by **serializing `{join, recompute all
+> ready ceilings, set own ceiling, set_ready}` under a single `Shared::grant_lock`**
+> (the driver's recompute and the leave path take the same lock). See the M13 gate
+> doc and `.superpowers/sdd/.../task-2-fix-ruling.md`.
