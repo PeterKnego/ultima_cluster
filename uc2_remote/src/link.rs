@@ -107,6 +107,62 @@ const MAX_REDIRECT_HOPS: usize = 8;
 /// Completions handed out per `poll` call — a bounded duty cycle.
 const POLL_BATCH: usize = 256;
 
+/// **The connection generation and its credit grant, in ONE word.**
+///
+/// The grant is per-connection state, so applying one is really "set the
+/// credits *of this connection*" — two facts that have to move together. Held
+/// apart (read the generation, then store the credits) they are a TOCTOU a
+/// few instructions wide: the writer thread can install a fresh connection in
+/// between, and a grant read off the connection that was just replaced then
+/// overwrites the new one's `HELLO_OK` window. It is an ABSOLUTE count, so
+/// that is not a stale-by-a-little value — it is the old edge's window
+/// asserted over an edge that never granted it, which
+/// [`crate::engine::admissible`] turns into over-admission.
+///
+/// Packed as `generation_low_32 << 32 | credits`, updated by a CAS that fails
+/// if the generation half moved. Only the LOW 32 bits of the generation
+/// identify a connection: a grant would have to survive exactly 2^32 redials
+/// to alias, which is not a window any buffered frame lives in.
+struct FlowWord(AtomicU64);
+
+impl FlowWord {
+    fn new(generation: u64, credits: u32) -> FlowWord {
+        FlowWord(AtomicU64::new(Self::pack(generation, credits)))
+    }
+
+    const fn pack(generation: u64, credits: u32) -> u64 {
+        ((generation as u32 as u64) << 32) | credits as u64
+    }
+
+    fn credits(&self) -> u32 {
+        self.0.load(Ordering::Acquire) as u32
+    }
+
+    /// WRITER THREAD ONLY, inside the critical section that installs a
+    /// connection: the new generation and the grant it arrived with, together.
+    /// Unconditional — installing a connection supersedes whatever the
+    /// previous one had to say.
+    fn install(&self, generation: u64, credits: u32) {
+        self.0.store(Self::pack(generation, credits), Ordering::Release);
+    }
+
+    /// Apply a grant read off connection `generation`. `false` = that
+    /// connection has been replaced and the grant was dropped.
+    fn try_update(&self, generation: u64, credits: u32) -> bool {
+        let want = Self::pack(generation, credits);
+        let mut cur = self.0.load(Ordering::Acquire);
+        loop {
+            if (cur >> 32) != (want >> 32) {
+                return false;
+            }
+            match self.0.compare_exchange_weak(cur, want, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return true,
+                Err(now) => cur = now,
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct StatCells {
     #[allow(dead_code, reason = "task 8 counts REDIRECT frames here")]
@@ -175,7 +231,9 @@ pub(crate) struct Link {
     /// joined the reader). Consumer role: `RemotePollHalf::poll`, via
     /// [`drain_completions`]. Private for the same reason.
     completions: CompletionQueue,
-    credits: AtomicU32,
+    /// The credit grant AND the generation of the connection that granted it,
+    /// in one word — see [`FlowWord`].
+    flow: FlowWord,
     /// The current connection's generation — the lock-free mirror of
     /// `Reconnect::epoch`, published with `Release` inside the same critical
     /// section that bumps it.
@@ -241,7 +299,7 @@ impl Link {
                 cfg.max_inflight as usize,
                 cfg.arena_bytes_resolved(),
             ),
-            credits: AtomicU32::new(info.credits),
+            flow: FlowWord::new(0, info.credits),
             generation: AtomicU64::new(0),
             acked_seq: AtomicU64::new(0),
             proven: AtomicBool::new(false),
@@ -310,13 +368,26 @@ impl Link {
         self.connected.load(Ordering::Acquire) && !self.closed()
     }
 
+    /// The current connection's absolute grant — the ceiling
+    /// [`crate::engine::admissible`] applies to unanswered requests of both
+    /// kinds.
     pub(crate) fn credits(&self) -> u32 {
-        self.credits.load(Ordering::Acquire)
+        self.flow.credits()
     }
 
     /// The generation of the connection currently installed. A thread that
     /// holds a socket compares its own stamp against this before complaining
-    /// about it or applying a grant read from it.
+    /// about it.
+    ///
+    /// **Not** the gate on a credit grant any more: a grant is applied
+    /// through [`FlowWord::try_update`], which compares and stores in one
+    /// atomic step because the two facts are one fact.
+    #[allow(
+        dead_code,
+        reason = "the redial gate reads `Reconnect::epoch` under the lock and each thread \
+                  carries its own stamp; this lock-free mirror is what the tests read, and \
+                  what task 8's window re-send stamps its frames against"
+    )]
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -882,10 +953,13 @@ impl Writer {
                     g.epoch += 1;
                     let generation = g.epoch;
                     link.generation.store(generation, Ordering::Release);
-                    // `credits` resets from HELLO_OK; `acked_seq` is carried
+                    // `credits` resets from HELLO_OK, stamped with the
+                    // generation it belongs to in the SAME word, so a grant
+                    // still in flight from the connection just replaced cannot
+                    // land on top of it (`FlowWord`); `acked_seq` is carried
                     // across — it only ever moves forward and every live seq
                     // is strictly greater than it.
-                    link.credits.store(info.credits, Ordering::Release);
+                    link.flow.install(generation, info.credits);
                     link.proven.store(false, Ordering::Release);
                     link.probe_seq.store(0, Ordering::Release);
                     self.conn = fresh;
@@ -1163,21 +1237,25 @@ pub(crate) enum Act {
 }
 
 /// Apply an absolute grant read off the connection `generation`. `credits`
-/// MAY decrease; `acked_seq` is monotone.
+/// MAY decrease (and binds the next admission when it does); `acked_seq` is
+/// monotone and is a statistic plus a re-send hint, never the window itself —
+/// see [`crate::engine::admissible`].
 ///
 /// A grant from a superseded connection is **dropped**. It is an ABSOLUTE
 /// count, so applying one that was still sitting in a `next_buffered` batch
 /// when the connection was replaced would silently overwrite the new
-/// connection's `HELLO_OK` window with the old edge's — which, once task 7
-/// gates admission on it, is over-admission against an edge that never
-/// granted it. `acked_seq` is dropped with it rather than kept: it is
-/// per-connection state on the same frame.
+/// connection's `HELLO_OK` window with the old edge's — over-admission
+/// against an edge that never granted it. The check and the store are ONE
+/// CAS on [`FlowWord`], not a load-then-store pair: the pair leaves a
+/// few-instruction window in which the writer thread installs the fresh
+/// connection between the two, which is exactly the case being refused.
+/// `acked_seq` is applied only when that CAS won, and is dropped with the
+/// grant otherwise: it is per-connection state riding the same frame.
 pub(crate) fn credit_update(link: &Arc<Link>, generation: u64, credits: u32, acked_seq: u64) {
-    if generation != link.generation() {
+    if !link.flow.try_update(generation, credits) {
         return;
     }
     link.stats.max_credits_seen.fetch_max(credits, Ordering::Relaxed);
-    link.credits.store(credits, Ordering::Release);
     link.acked_seq.fetch_max(acked_seq, Ordering::AcqRel);
     // A wider window may have unblocked the writer.
     link.out.wake().signal();
@@ -1557,7 +1635,8 @@ mod tests {
 
     /// A generation bump makes the previous generation's grant unapplicable —
     /// the absolute credit count from a connection that has been replaced must
-    /// never overwrite the new connection's `HELLO_OK` window.
+    /// never overwrite the new connection's `HELLO_OK` window. `acked_seq`
+    /// rides the same frame and is dropped with it.
     #[test]
     fn a_grant_from_a_superseded_generation_is_dropped() {
         let edge = StubEdge::spawn(5);
@@ -1565,9 +1644,47 @@ mod tests {
         let generation = link.generation();
         credit_update(&link, generation, 9, 3);
         assert_eq!(link.credits(), 9, "a current-generation grant applies");
-        credit_update(&link, generation.wrapping_sub(1), 4096, 0);
+        assert_eq!(link.acked_seq(), 3, "and so does the acked_seq riding it");
+        credit_update(&link, generation.wrapping_sub(1), 4096, 99);
         assert_eq!(link.credits(), 9, "a superseded grant must not overwrite the live window");
+        assert_eq!(link.acked_seq(), 3, "nor may its acked_seq be applied on its own");
         link.close();
+    }
+
+    /// The word itself, without a socket in the way: the generation and the
+    /// grant move together or not at all. This is the half of the race that
+    /// cannot be scheduled from outside — the writer installing a fresh
+    /// connection between a reader's load and its store — so the primitive
+    /// that closes it is asserted directly.
+    #[test]
+    fn the_flow_word_refuses_a_grant_from_a_replaced_connection() {
+        let f = FlowWord::new(7, 4);
+        assert_eq!(f.credits(), 4);
+        assert!(f.try_update(7, 9), "a current-generation grant lands");
+        assert_eq!(f.credits(), 9);
+        assert!(!f.try_update(6, 4096), "a stale generation is refused");
+        assert_eq!(f.credits(), 9);
+
+        // The connection is replaced: the new grant is in force at once, and
+        // the old connection's — arriving late out of a buffered batch — is
+        // refused however large it is.
+        f.install(8, 2);
+        assert_eq!(f.credits(), 2);
+        assert!(!f.try_update(7, 4096));
+        assert_eq!(f.credits(), 2, "the fresh HELLO_OK window must survive");
+        assert!(f.try_update(8, 3), "the new connection's own grant still applies");
+        assert_eq!(f.credits(), 3);
+
+        // A grant MAY decrease, and zero is a legal grant (the edge is asking
+        // for silence, not reporting an error).
+        assert!(f.try_update(8, 0));
+        assert_eq!(f.credits(), 0);
+
+        // Only the low 32 bits identify a connection. Asserted rather than
+        // hidden: a grant would have to outlive 2^32 redials to alias, which
+        // no buffered frame does.
+        assert!(f.try_update(8 + (1u64 << 32), 5), "the generation tag is the low 32 bits");
+        assert_eq!(f.credits(), 5);
     }
 
     /// After `close` there is no consumer left, so a completion that does not

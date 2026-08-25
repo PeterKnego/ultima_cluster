@@ -89,6 +89,13 @@ pub struct Behaviour {
     pub partial_frame_then_hang: bool,
     /// Delay between a request arriving and its answer being written.
     pub delay: Duration,
+    /// Send a standalone `STATUS` carrying this (lower) absolute grant, once:
+    /// after the FIRST request is answered, or — if nothing is ever submitted
+    /// — after the first `PING`. This is the wire's §6 clarification:
+    /// `credits` MAY decrease, and a `STATUS` MAY be sent at any time, not
+    /// only on the idle timer. Every later `RESPONSE` carries the reduced
+    /// grant too, exactly as a real edge's `Conn::credits()` would.
+    pub shrink_credits_to: Option<u32>,
 }
 
 impl Default for Behaviour {
@@ -110,6 +117,7 @@ impl Default for Behaviour {
             second_credits: None,
             partial_frame_then_hang: false,
             delay: Duration::from_millis(1),
+            shrink_credits_to: None,
         }
     }
 }
@@ -218,6 +226,10 @@ enum Action {
     Redirect { seq: u64, addr: String },
     Retry { seq: u64, reason: u8, after_us: u32 },
     Unknown { seq: u64 },
+    /// A standalone `STATUS` frame carrying a fresh absolute grant. The
+    /// responder fills in `acked_seq` from its own running high-water mark —
+    /// the same per-connection accounting a real edge does.
+    Status { credits: u32 },
     Pong,
     DropConn,
 }
@@ -302,6 +314,7 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
 
     // --- request loop
     let mut used_once = false;
+    let mut shrunk = false;
     loop {
         match rd.read_frame(READ_STALL_BUDGET) {
             Ok(Some((h, payload))) => match h.ty {
@@ -345,6 +358,12 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
                     };
                     let stop_after = matches!(action, Action::DropConn);
                     q.0.lock().unwrap().push_back(action);
+                    if let Some(c) = b.shrink_credits_to
+                        && !shrunk
+                    {
+                        shrunk = true;
+                        q.0.lock().unwrap().push_back(Action::Status { credits: c });
+                    }
                     q.1.notify_all();
                     if stop_after {
                         break;
@@ -353,6 +372,14 @@ fn serve(sock: TcpStream, b: Behaviour, o: Arc<Observed>, stop: Arc<AtomicBool>,
                 FrameType::Ping if hang => {}
                 FrameType::Ping => {
                     q.0.lock().unwrap().push_back(Action::Pong);
+                    // An idle connection is the other way a real edge sends a
+                    // STATUS: its own timer, no request of ours involved.
+                    if let Some(c) = b.shrink_credits_to
+                        && !shrunk
+                    {
+                        shrunk = true;
+                        q.0.lock().unwrap().push_back(Action::Status { credits: c });
+                    }
                     q.1.notify_all();
                 }
                 _ => {}
@@ -380,9 +407,14 @@ fn respond(
     done: Arc<AtomicBool>,
     b: Behaviour,
     client_id: u64,
-    credits: u32,
+    mut credits: u32,
 ) {
     let mut out = Vec::new();
+    // The connection's own flow-control state, exactly as `uc2_gateway`'s
+    // `Conn` keeps it: an absolute grant that MAY change mid-stream, and an
+    // `acked_seq` that a SUBMIT advances and a QUERY never does
+    // (`Conn::claim`, `uc2_gateway/src/conn.rs`).
+    let mut acked_seq = 0u64;
     loop {
         let action = {
             let mut g = q.0.lock().unwrap();
@@ -423,7 +455,14 @@ fn respond(
                 if b.expired {
                     flags |= FLAG_EXPIRED | FLAG_ENVELOPED;
                 }
-                ResponseMeta { credits, acked_seq: seq, position: seq * 64 }.encode(&mut out);
+                // A QUERY is answered without moving `acked_seq`: it is not a
+                // write, so the edge's session dedup never advances past it.
+                // A client whose admission window keyed on `acked_seq` would
+                // wedge here, which is the point of getting this right.
+                if !is_query {
+                    acked_seq = acked_seq.max(seq);
+                }
+                ResponseMeta { credits, acked_seq, position: seq * 64 }.encode(&mut out);
                 out.extend_from_slice(&payload);
                 o.answering();
                 wr.write_frame(hdr(FrameType::Response, flags, client_id, seq), &out)
@@ -439,6 +478,11 @@ fn respond(
                 wr.write_frame(hdr(FrameType::Retry, 0, client_id, seq), &out)
             }
             Action::Pong => wr.write_frame(hdr(FrameType::Pong, 0, client_id, 0), &[]),
+            Action::Status { credits: c } => {
+                credits = c;
+                Status { acked_seq, credits }.encode(&mut out);
+                wr.write_frame(hdr(FrameType::Status, 0, client_id, 0), &out)
+            }
             Action::Unknown { seq } => {
                 o.answering();
                 wr.write_frame(hdr(FrameType::Unknown, 0, client_id, seq), &[])

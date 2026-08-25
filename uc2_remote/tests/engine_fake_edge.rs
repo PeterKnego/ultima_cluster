@@ -85,18 +85,127 @@ fn connect_completes_the_handshake_and_adopts_the_granted_credits() {
 
 #[test]
 fn an_idle_status_updates_the_window_without_any_traffic_from_us() {
-    // The fake edge answers PING with PONG; a STATUS carrying a new grant is
-    // what this asserts the reader thread applies.
-    let edge = FakeEdge::spawn(Behaviour { credits: 3, ..Default::default() });
+    // Nothing is submitted here at all: the edge answers PING with PONG and,
+    // on its own timer, sends a standalone STATUS carrying a NEW absolute
+    // grant. What this pins is that the reader thread applies an unsolicited
+    // STATUS — the window moving with no request of ours involved.
+    let edge =
+        FakeEdge::spawn(Behaviour { credits: 3, shrink_credits_to: Some(1), ..Default::default() });
     let (send, _poll) = RemoteEngine::connect(RemoteConfig {
         ping_interval: Duration::from_millis(50),
         dead_after: Duration::from_millis(400),
         ..cfg(vec![edge.addr.clone()])
     })
     .unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(send.credits(), 3, "HELLO_OK's grant, before any STATUS");
+    assert!(
+        until(|| send.credits() == 1),
+        "an unsolicited STATUS must move the window: credits {} {:?}",
+        send.credits(),
+        send.stats()
+    );
     assert!(send.is_connected(), "PING/PONG must keep an idle connection alive");
     assert_eq!(send.stats().reconnects, 0);
+    assert_eq!(send.stats().max_credits_seen, 3, "max_credits_seen is a high-water mark");
+    send.shutdown();
+}
+
+/// **The window is a count, not a seq range.** The edge advances `acked_seq`
+/// on SUBMIT only (`Conn::claim`, `uc2_gateway/src/conn.rs`, pinned by that
+/// module's own "a query never advances acked_seq" test), so a client that
+/// admitted while `seq <= acked_seq + credits` would wedge permanently after
+/// `credits` queries: its seqs keep climbing while the left edge never moves.
+/// The real rule is the edge's own — unanswered requests of BOTH kinds must be
+/// under the grant — so an unbounded run of queries flows.
+#[test]
+fn a_run_of_queries_never_closes_the_window() {
+    const N: u64 = 6;
+    let edge = FakeEdge::spawn(Behaviour { credits: 2, ..Default::default() });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    let mut issued = 0u64;
+    let mut done = 0u64;
+    let deadline = Instant::now() + WAIT;
+    while done < N && Instant::now() < deadline {
+        if issued < N {
+            match send.try_query(issued, Consistency::Snapshot, b"rd") {
+                Ok(()) => issued += 1,
+                Err(SubmitError::Backpressure) => std::thread::yield_now(),
+                Err(e) => panic!("try_query({issued}): {e}"),
+            }
+        }
+        poll.poll(|c| match c.outcome {
+            RemoteOutcome::Response { body, .. } => {
+                assert_eq!(body, b"dr", "the fake edge reverses the payload");
+                done += 1;
+            }
+            other => panic!("unexpected outcome for {}: {other:?}", c.user_data),
+        });
+    }
+    assert_eq!(done, N, "a run of queries must not close the window");
+    assert_eq!(send.acked_seq(), 0, "the edge never acks a query, and it does not have to");
+    let peak = edge.observed.max_unanswered.load(AtomicOrdering::SeqCst);
+    assert!((1..=2).contains(&peak), "the grant must still pace the pipeline: peak {peak}");
+
+    // ... and a SUBMIT after that run is admitted on the same count rule, and
+    // is what finally moves `acked_seq`.
+    let got = run_submits(&send, &mut poll, 1, |_| b"xy".to_vec());
+    assert_eq!(got.len(), 1, "a submit after a run of queries must still be admitted");
+    assert!(until(|| send.acked_seq() == N + 1), "a SUBMIT is what advances acked_seq");
+    send.shutdown();
+}
+
+/// A `STATUS` may carry a LOWER absolute grant at any time, and it binds new
+/// admissions immediately — the wire's §6 clarification.
+#[test]
+fn a_status_carrying_a_lower_grant_is_honoured_for_new_seqs() {
+    let edge =
+        FakeEdge::spawn(Behaviour { credits: 8, shrink_credits_to: Some(1), ..Default::default() });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    let got = run_submits(&send, &mut poll, 12, |i| vec![i as u8]);
+    assert_eq!(got.len(), 12);
+    // The edge's own high-water mark is the assertion: the client never had
+    // more unanswered than the grant in force.
+    let peak = edge.observed.max_unanswered.load(AtomicOrdering::SeqCst);
+    assert!(peak <= 8, "the client must never exceed the grant it was given: {peak}");
+    assert_eq!(send.credits(), 1, "the last absolute grant seen is the window");
+    assert_eq!(send.stats().max_credits_seen, 8, "max_credits_seen is a high-water mark");
+    send.shutdown();
+}
+
+/// A grant of one is a serial pipeline: exactly one unanswered request at a
+/// time, however fast the submitter offers work.
+#[test]
+fn a_window_of_one_serializes_the_pipeline() {
+    let edge = FakeEdge::spawn(Behaviour { credits: 1, ..Default::default() });
+    let (send, mut poll) = RemoteEngine::connect(cfg(vec![edge.addr.clone()])).unwrap();
+    let got = run_submits(&send, &mut poll, 5, |i| vec![i as u8]);
+    assert_eq!(got.len(), 5);
+    assert_eq!(
+        edge.observed.max_unanswered.load(AtomicOrdering::SeqCst),
+        1,
+        "credits: 1 means exactly one unanswered request"
+    );
+    send.shutdown();
+}
+
+/// `max_inflight` is the caller's own cap, applied on top of whatever the edge
+/// grants — a client that wants a shallower pipeline than the edge offers gets
+/// one.
+#[test]
+fn the_local_inflight_cap_binds_below_the_edges_grant() {
+    let edge = FakeEdge::spawn(Behaviour {
+        credits: 64,
+        delay: Duration::from_millis(50),
+        ..Default::default()
+    });
+    let (send, _poll) =
+        RemoteEngine::connect(RemoteConfig { max_inflight: 3, ..cfg(vec![edge.addr.clone()]) })
+            .unwrap();
+    for i in 0..3u64 {
+        assert!(send.try_submit(i, b"x").is_ok(), "request {i} fits the local cap");
+    }
+    assert_eq!(send.try_submit(3, b"x"), Err(SubmitError::Backpressure));
+    assert_eq!(send.inflight(), 3);
     send.shutdown();
 }
 
