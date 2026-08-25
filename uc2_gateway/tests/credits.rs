@@ -13,9 +13,12 @@
 //! frames stays inside it, and every request still resolves when the window
 //! is squeezed underneath it.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use uc2_gateway::{Edge, EdgeConfig, Member};
+use uc2_remote::frame::FrameType;
 use uc2_remote::{RemoteClient, RemoteConfig, RemoteStats};
 use uc_lincheck::register::{Cmd, CmdResp};
 
@@ -165,11 +168,28 @@ fn a_squeezed_window_still_resolves_every_request() {
 
 /// (spec §5.4, i) Whatever the edge has promised across every connection, the
 /// SUM of it stays inside the budget — at every observed moment, not merely
-/// once the dust settles. Sampled by a watchdog thread while connections
-/// arrive, so a transient over-promise between "this connection is ready" and
-/// "everyone else has been told their share shrank" is caught.
+/// once the dust settles.
+///
+/// This dials every connection CONCURRENTLY, with no inter-thread settle
+/// barrier — an earlier version of this test settled connection `i` fully
+/// (polling `grants_for_tests()` until it matched) before dialing `i + 1`,
+/// which serializes every join through the test's own polling loop and so
+/// can never observe two connects racing each other. That version could not
+/// see the m13 §5 as-built erratum: `await_settled`'s generation counter
+/// cannot distinguish "a driver pass that already accounts for MY `live++`"
+/// from "a pass that ran just before it", so two connections joining at once
+/// could both read a stale, smaller `live` and both go ready over-granted
+/// (observed concretely: 3 racing connects at budget 56 produced a sum of
+/// 74). A sampler thread polls the sum continuously through the whole dial.
+///
+/// This also checks a stricter, adjacent property while it is already
+/// dialing concurrently: the FIRST frame every connection reads back must be
+/// `HELLO_OK` — `Conn::set_ready` now happens inside `grant_lock`, before
+/// this connection's own `HELLO_OK` is written, so it is worth confirming
+/// concurrent joins never let the driver's own `STATUS` push win the race to
+/// a connection's socket ahead of its own handshake reply.
 #[test]
-fn the_sum_of_grants_never_exceeds_the_edges_budget() {
+fn the_sum_of_grants_never_exceeds_the_edges_budget_under_concurrent_connects() {
     let root = common::tempdir();
     let (node, dir) = common::start_single_node(root.path());
     let svc = uc2_service::ServiceBuilder::new(
@@ -183,56 +203,214 @@ fn the_sum_of_grants_never_exceeds_the_edges_budget() {
     .unwrap();
     common::await_serving(&node, 10);
 
-    // budget = 64 - 64/8 = 56; per-connection cap 32. Six connections is
-    // well inside `live <= budget`, so the floor-at-1 exception cannot apply.
-    let edge = std::sync::Arc::new(Edge::start(edge_config(&dir, 64, 32)).unwrap());
+    // budget = 64 - 64/8 = 56; per-connection cap 32. N=8 concurrent connects
+    // is well inside `live <= budget`, so the floor-at-1 exception cannot
+    // apply, and gives the race more simultaneous joiners than the minimal
+    // repro (3) needs.
+    const N: u64 = 8;
+    let edge = Arc::new(Edge::start(edge_config(&dir, 64, 32)).unwrap());
     let budget = uc2_gateway::budget_for(64);
     assert_eq!(budget, 56);
 
-    let worst = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (e2, w2, s2) =
-        (std::sync::Arc::clone(&edge), std::sync::Arc::clone(&worst), std::sync::Arc::clone(&stop));
+    let worst = Arc::new(AtomicU32::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (e2, w2, s2) = (Arc::clone(&edge), Arc::clone(&worst), Arc::clone(&stop));
+    // Sample first, THEN check `stop` — not the reverse — so a sampler thread
+    // that is scheduled out until after the main thread has already set
+    // `stop` still takes at least one reading, instead of exiting having
+    // seen nothing (which the vacuity check below would otherwise wrongly
+    // read as "the edge never granted anything" rather than "the sampler
+    // never ran in time to look").
     let sampler = std::thread::spawn(move || {
-        while !s2.load(std::sync::atomic::Ordering::Relaxed) {
+        loop {
             let sum: u32 = e2.grants_for_tests().iter().map(|(_, g)| *g).sum();
-            w2.fetch_max(sum, std::sync::atomic::Ordering::Relaxed);
-            std::thread::sleep(Duration::from_micros(200));
+            w2.fetch_max(sum, Ordering::Relaxed);
+            if s2.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(50));
         }
     });
 
-    let mut conns = Vec::new();
-    for i in 0..6u64 {
-        let mut c = common::dial_raw(edge.local_addr());
-        common::send_hello(&mut c, 0x100 + i, common::APP);
-        let ok = common::read_until(&mut c, uc2_remote::frame::FrameType::HelloOk,
-                                    Duration::from_secs(5));
-        assert!(ok.is_some(), "connection {i} never got HELLO_OK");
-        let live = (i + 1) as u32;
-        let want = uc2_gateway::grant_for(live, budget, 32);
-        // Settled state: everyone holds the same share.
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let g = edge.grants_for_tests();
-            if g.len() == live as usize && g.iter().all(|(_, x)| *x == want) {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline,
-                    "grants never settled to {want} at live={live}: {g:?}");
-            std::thread::sleep(Duration::from_millis(2));
+    let conns: Vec<_> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let addr = edge.local_addr();
+                s.spawn(move || {
+                    let mut c = common::dial_raw(addr);
+                    common::send_hello(&mut c, 0x200 + i, common::APP);
+                    let (h, _) = loop {
+                        match c.read_frame(common::READ_STALL) {
+                            Ok(Some(f)) => break f,
+                            Ok(None) => continue,
+                            Err(e) => panic!("connection {i}: read after HELLO: {e}"),
+                        }
+                    };
+                    assert_eq!(
+                        h.ty,
+                        FrameType::HelloOk,
+                        "connection {i}: first frame after HELLO must be HELLO_OK, got {:?}",
+                        h.ty
+                    );
+                    c
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(conns.len(), N as usize);
+
+    // Settled state: everyone ends up on the same share.
+    let want = uc2_gateway::grant_for(N as u32, budget, 32);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let g = edge.grants_for_tests();
+        if g.len() == N as usize && g.iter().all(|(_, x)| *x == want) {
+            break;
         }
-        conns.push(c);
+        assert!(
+            Instant::now() < deadline,
+            "grants never settled to {want} at live={N}: {g:?}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
     }
 
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
     sampler.join().unwrap();
-    let worst = worst.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(worst <= budget,
-            "the edge promised {worst} credits at once against a budget of {budget}");
+    let worst = worst.load(Ordering::Relaxed);
+    assert!(
+        worst <= budget,
+        "the edge promised {worst} credits at once against a budget of {budget} \
+         (concurrent connects)"
+    );
     assert!(worst > 0, "the sampler never saw a grant at all — vacuous");
 
     drop(conns);
-    std::sync::Arc::try_unwrap(edge).ok().unwrap().stop();
+    Arc::try_unwrap(edge).ok().unwrap().stop();
+    common::assert_no_gateway_threads();
+    node.stop();
+    svc.stop();
+}
+
+/// As above, but racing connects against disconnects: `Shared::leave` takes
+/// the same `grant_lock` as `join_and_grant`, and a departure must never let
+/// the sum climb past budget either — a leave only ever GROWS the survivors'
+/// share (the safe direction, deferred to the driver's next `push_grants` per
+/// the m13 §5 as-built ruling), so this exists to catch a regression that
+/// raced the two paths incorrectly, not because growth itself is suspect.
+#[test]
+fn the_sum_of_grants_never_exceeds_the_edges_budget_under_a_connect_disconnect_race() {
+    let root = common::tempdir();
+    let (node, dir) = common::start_single_node(root.path());
+    let svc = uc2_service::ServiceBuilder::new(
+        uc2_service::ServiceConfig::new(&dir, common::APP),
+        uc2_service::Sessioned::new(
+            uc_lincheck::register::RegisterSm::default(),
+            uc2_service::SessionConfig::default(),
+        ),
+    )
+    .start()
+    .unwrap();
+    common::await_serving(&node, 10);
+
+    let edge = Arc::new(Edge::start(edge_config(&dir, 64, 32)).unwrap());
+    let budget = uc2_gateway::budget_for(64);
+    assert_eq!(budget, 56);
+
+    // Four connections, settled: grant_for(4, 56, 32) = 14 each, sum 56 —
+    // exactly the budget, the tightest starting point available.
+    let want4 = uc2_gateway::grant_for(4, budget, 32);
+    assert_eq!(want4, 14);
+    let mut conns = Vec::new();
+    for i in 0..4u64 {
+        let mut c = common::dial_raw(edge.local_addr());
+        common::send_hello(&mut c, 0x300 + i, common::APP);
+        let ok = common::read_until(&mut c, FrameType::HelloOk, Duration::from_secs(5));
+        assert!(ok.is_some(), "setup connection {i} never got HELLO_OK");
+        conns.push(c);
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let g = edge.grants_for_tests();
+        if g.len() == 4 && g.iter().all(|(_, x)| *x == want4) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "initial 4 never settled: {:?}", edge.grants_for_tests());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let worst = Arc::new(AtomicU32::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (e2, w2, s2) = (Arc::clone(&edge), Arc::clone(&worst), Arc::clone(&stop));
+    // Sample first, THEN check `stop` — not the reverse — so a sampler thread
+    // that is scheduled out until after the main thread has already set
+    // `stop` still takes at least one reading, instead of exiting having
+    // seen nothing (which the vacuity check below would otherwise wrongly
+    // read as "the edge never granted anything" rather than "the sampler
+    // never ran in time to look").
+    let sampler = std::thread::spawn(move || {
+        loop {
+            let sum: u32 = e2.grants_for_tests().iter().map(|(_, g)| *g).sum();
+            w2.fetch_max(sum, Ordering::Relaxed);
+            if s2.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+    });
+
+    // Race: drop 2 of the 4 while dialing 2 new ones, all at once, no barrier
+    // between the drops and the dials.
+    let dropped: Vec<_> = conns.drain(0..2).collect();
+    let new_conns: Vec<_> = std::thread::scope(|s| {
+        let drop_handles: Vec<_> = dropped.into_iter().map(|c| s.spawn(move || drop(c))).collect();
+        let dial_handles: Vec<_> = (0..2u64)
+            .map(|i| {
+                let addr = edge.local_addr();
+                s.spawn(move || {
+                    let mut c = common::dial_raw(addr);
+                    common::send_hello(&mut c, 0x400 + i, common::APP);
+                    let ok = common::read_until(&mut c, FrameType::HelloOk, Duration::from_secs(5));
+                    assert!(ok.is_some(), "race dial {i} never got HELLO_OK");
+                    c
+                })
+            })
+            .collect();
+        for h in drop_handles {
+            h.join().unwrap();
+        }
+        dial_handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    conns.extend(new_conns);
+    assert_eq!(conns.len(), 4);
+
+    // Settled state: back to 4 live, back to grant_for(4).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let g = edge.grants_for_tests();
+        if g.len() == 4 && g.iter().all(|(_, x)| *x == want4) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "post-race grants never resettled to {want4}: {:?}",
+            edge.grants_for_tests()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    sampler.join().unwrap();
+    let worst = worst.load(Ordering::Relaxed);
+    assert!(
+        worst <= budget,
+        "the edge promised {worst} credits at once against a budget of {budget} \
+         (connect/disconnect race)"
+    );
+    assert!(worst > 0, "the sampler never saw a grant at all — vacuous");
+
+    drop(conns);
+    Arc::try_unwrap(edge).ok().unwrap().stop();
     common::assert_no_gateway_threads();
     node.stop();
     svc.stop();

@@ -186,27 +186,18 @@ const DRIVER_PARK: Duration = Duration::from_millis(1);
 /// while completions are streaming in without a break.
 const DRIVER_PERIODIC_EVERY: u64 = 64;
 
-/// How long a handshaking reader waits for the driver to publish the smaller
-/// share to the connections already here, before granting its own connection
-/// anything.
-///
-/// Bounded, and short: the driver's idle park is capped at [`DRIVER_PARK`]
-/// (1 ms), so this is normally microseconds. On the timeout path the new
-/// connection is granted its share anyway and the momentary over-promise
-/// lands in the budget's headroom — which is what the headroom is for.
-const GRANT_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
-
 /// The fraction of the `Engine` window the edge keeps out of the grant
 /// budget: `1/8`.
 ///
 /// Deliberately a constant and **not** a config key. It is not a tuning
 /// dial — it is the slack that makes a *shrinking* grant safe: a client that
 /// is told a smaller absolute number honours it for new seqs, but the frames
-/// it already put on the wire are still owed `Engine` slots, and the
-/// handshake's grant-settle wait ([`Shared::await_settled`]) falls back to
-/// granting a share when the driver has not published in time. Both cases
-/// land in this headroom. An operator who wants a smaller sum lowers
-/// `per_conn_inflight`; one who wants a bigger one raises `max_inflight`.
+/// it already put on the wire are still owed `Engine` slots. It also covers
+/// the brief lag between a connection's own `HELLO_OK` (written outside
+/// `Shared::grant_lock`, so it can carry a number a concurrent join has
+/// since lowered) and the `STATUS` that corrects it. An operator who wants a
+/// smaller sum lowers `per_conn_inflight`; one who wants a bigger one raises
+/// `max_inflight`.
 pub const BUDGET_HEADROOM_DIV: u32 = 8;
 
 /// The edge's **total** outstanding-grant budget: the `Engine` window less
@@ -371,12 +362,19 @@ struct Shared {
     /// idempotent — recompute every connection's share from `live` — so
     /// coalescing two triggers into one pass is correct, not a shortcut.
     regrant: AtomicBool,
-    /// Bumped by the driver after each pass that has published the current
-    /// share to every ready connection. A handshaking reader waits for it to
-    /// move before granting its own connection anything, which is what makes
-    /// "the sum of grants is at most the budget" true at every instant rather
-    /// than eventually. See [`Shared::await_settled`].
-    grant_gen: AtomicU64,
+    /// Serializes `live`, every connection's `ceiling`, and a joining
+    /// connection's transition to `ready` into ONE critical section — see
+    /// [`Shared::join_and_grant`] for why the ready-transition has to be
+    /// inside it too. No socket I/O ever happens while this is held: the
+    /// critical section is atomic swaps and a table walk, so it never blocks
+    /// on a peer.
+    grant_lock: Mutex<()>,
+    /// Ready connections a [`Shared::push_grants`] pass owes a `STATUS`
+    /// about a share that just SHRANK. Appended only under `grant_lock` (by
+    /// [`Shared::recompute_locked`], which both a joining handshake and the
+    /// driver call under it), drained only by the driver's `push_grants` —
+    /// the only thread that may write to a connection other than its own.
+    owed_status: Mutex<Vec<u32>>,
     /// Correlation ids, edge-wide rather than per connection: a stale
     /// completion then cannot collide with a fresh request's `corr` even in
     /// the (already guarded) case of an index collision.
@@ -566,8 +564,20 @@ impl Shared {
     }
 
     // ---------------------------------------------------------- the budget
+    //
+    // `grant_lock` is the whole fix (m13 §5 as-built erratum): the ORIGINAL
+    // mechanism sampled a generation counter, called `join`, and polled for
+    // the counter to move (`await_settled`) — which cannot tell "a push that
+    // already accounts for MY `live++`" from "a push that ran just before
+    // it", so two connections racing to join could both read a driver pass
+    // that saw a stale, smaller `live` and both go ready over-granted. The
+    // fix serializes the WHOLE sequence — count this connection in, recompute
+    // every OTHER ready connection, compute this connection's own share, and
+    // mark it ready — as one critical section, so "every `is_ready`
+    // connection" a concurrent pass sees is always "every connection this
+    // pass must account for". See `join_and_grant`.
 
-    /// Every ready connection's current share.
+    /// Every ready connection's current share, from the current `live`.
     fn current_grant(&self) -> u32 {
         grant_for(self.live.load(Ordering::Acquire), self.budget, self.cfg.per_conn_inflight)
     }
@@ -577,44 +587,18 @@ impl Shared {
         self.regrant.store(true, Ordering::Release);
     }
 
-    /// Count a handshaken connection into the budget and ask for a
-    /// republication, so the connections already here give up their part of
-    /// its share.
-    fn join(&self, conn: &Conn) {
-        if conn.mark_counted() {
-            self.live.fetch_add(1, Ordering::AcqRel);
-            self.request_regrant();
-        }
-    }
-
-    /// Take a departed connection back out. Its share is freed, so the
-    /// remaining connections are owed a bigger one — an increase, which rides
-    /// their next `RESPONSE` or the idle `STATUS` timer rather than a push.
-    fn leave(&self, conn: &Conn) {
-        if conn.clear_counted() {
-            self.live.fetch_sub(1, Ordering::AcqRel);
-            self.request_regrant();
-        }
-    }
-
-    /// Wait (briefly, boundedly) until the driver has published a share at
-    /// least as new as `from_gen`.
-    fn await_settled(&self, from_gen: u64) {
-        let deadline = Instant::now() + GRANT_SETTLE_TIMEOUT;
-        while self.grant_gen.load(Ordering::Acquire) == from_gen {
-            if self.stopping() || Instant::now() >= deadline {
-                return;
-            }
-            std::thread::sleep(Duration::from_micros(50));
-        }
-    }
-
-    /// Recompute every ready connection's share and tell the ones whose window
-    /// SHRANK, right away. Driver thread only — it is the only thread that may
-    /// write on a connection other than its own.
-    fn push_grants(&self) {
+    /// Recompute every **ready** connection's ceiling from the current
+    /// `live`, queuing a `STATUS` for any whose share just SHRANK.
+    ///
+    /// Caller must hold `grant_lock`. Pure atomic work and one table walk —
+    /// no socket I/O — which is what makes it safe to call from a
+    /// handshaking reader thread ([`Shared::join_and_grant`]) as well as the
+    /// driver ([`Shared::push_grants`]): neither may block on a peer's
+    /// socket while holding the lock that every OTHER connect/disconnect is
+    /// waiting on.
+    fn recompute_locked(&self) {
         let grant = self.current_grant();
-        let mut dead: Vec<u32> = Vec::new();
+        let mut owed = self.owed_status.lock();
         self.table.for_each(|c| {
             if !c.is_ready() {
                 return;
@@ -626,16 +610,109 @@ impl Shared {
                 }
                 CeilingChange::Lowered => {
                     self.stats.grant_changes.fetch_add(1, Ordering::Relaxed);
-                    if !self.write_status(c) {
-                        dead.push(c.idx);
-                    }
+                    owed.push(c.idx);
                 }
             }
         });
+    }
+
+    /// Count a handshaken connection into the budget, recompute every OTHER
+    /// ready connection's share to match, and mark THIS connection ready —
+    /// all inside one `grant_lock` critical section. Returns the grant this
+    /// connection's own `HELLO_OK` should carry; the caller writes that frame
+    /// itself, on its own socket, AFTER this returns (never under the lock —
+    /// a socket write can block for up to `WRITE_TIMEOUT`, and holding
+    /// `grant_lock` across that would stall every other connect, disconnect,
+    /// and the driver).
+    ///
+    /// ## Why `Conn::set_ready` has to happen INSIDE the lock
+    ///
+    /// `recompute_locked` (both here and in the driver's `push_grants`) treats
+    /// "every `is_ready` connection" as "every connection this pass must
+    /// account for". For the whole of this method, THIS connection is
+    /// mid-handshake — the exact state the old mechanism could leave visible
+    /// to nobody (counted in `live`, but not yet reflected in anyone's
+    /// recompute, and not holding anything that would stop a concurrent pass
+    /// from proceeding without it). Doing `join` and `set_ready` in the SAME
+    /// critical section closes that: a third connection's concurrent
+    /// `join_and_grant` cannot even START its own `recompute_locked` until
+    /// this one releases the lock, by which point this connection is either
+    /// not yet counted (not joined) or fully counted AND ready (so the third
+    /// connection's recompute sees and lowers it like any other survivor).
+    /// There is no window in between that a lock-holder can observe.
+    ///
+    /// This connection's own `HELLO_OK`, written after the lock is released,
+    /// can still race a LATER join that lowers this connection's share again
+    /// before the frame goes out — the grant it carries can be stale-high by
+    /// the time the client reads it. That is the one place lag survives, and
+    /// it is exactly what [`BUDGET_HEADROOM_DIV`]'s slack is for: the
+    /// connection's ATOMIC `ceiling`/`credits` (what `wait_for_credit`
+    /// actually enforces, and what [`Edge::grants_for_tests`] samples) are
+    /// already correct the instant the lock is released; only the client's
+    /// *belief*, from a HELLO_OK in flight, can lag — and the driver's
+    /// `push_grants` corrects it with a `STATUS` shortly after.
+    fn join_and_grant(&self, conn: &Conn) -> u32 {
+        let _guard = self.grant_lock.lock();
+        if conn.mark_counted() {
+            self.live.fetch_add(1, Ordering::AcqRel);
+        }
+        // Other ready connections first: `conn` itself is not yet ready, so
+        // this cannot touch (or double-count) it.
+        self.recompute_locked();
+        let grant = self.current_grant();
+        conn.set_ceiling(grant);
+        // MUST be inside the lock — see the doc above.
+        conn.set_ready();
+        drop(_guard);
+        // Never from this reader thread: `push_grants` is the only thread
+        // allowed to write to a connection other than its own.
+        self.request_regrant();
+        grant
+    }
+
+    /// Take a departed connection back out. Its share is freed, so the
+    /// remaining connections are owed a bigger one — but raising them is NOT
+    /// done here: an over-counted `live` only ever makes grants too SMALL,
+    /// never lets the sum exceed the budget, so the safe direction is left to
+    /// the driver's next `push_grants` rather than run under this reader
+    /// thread's exit.
+    fn leave(&self, conn: &Conn) {
+        {
+            let _guard = self.grant_lock.lock();
+            if conn.clear_counted() {
+                self.live.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.request_regrant();
+    }
+
+    /// Recompute every ready connection's share and flush every `STATUS` a
+    /// shrunk share is owed. Driver thread only — it is the only thread that
+    /// may write on a connection other than its own.
+    ///
+    /// Unconditional about what to send, not "whatever changed in THIS
+    /// call": a joining connection's own `join_and_grant` may already have
+    /// applied a reduction to another connection's ceiling (queuing it in
+    /// `owed_status`) before this ever runs, in which case this call's own
+    /// `recompute_locked` sees no further change on that connection — the
+    /// queue, not the recompute's return, is what this drains and sends.
+    fn push_grants(&self) {
+        {
+            let _guard = self.grant_lock.lock();
+            self.recompute_locked();
+        }
+        let owed: Vec<u32> = std::mem::take(&mut *self.owed_status.lock());
+        let mut dead: Vec<u32> = Vec::new();
+        for idx in owed {
+            if let Some(c) = self.table.get(idx)
+                && !self.write_status(&c)
+            {
+                dead.push(idx);
+            }
+        }
         for idx in dead {
             self.table.remove(idx);
         }
-        self.grant_gen.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -704,7 +781,8 @@ impl Edge {
             budget,
             live: AtomicU32::new(0),
             regrant: AtomicBool::new(false),
-            grant_gen: AtomicU64::new(0),
+            grant_lock: Mutex::new(()),
+            owed_status: Mutex::new(Vec::new()),
             next_corr: AtomicU32::new(0),
             readers: Mutex::new(Vec::new()),
             faulted: AtomicBool::new(false),
@@ -1015,29 +1093,20 @@ fn handshake(shared: &Arc<Shared>, conn: &Arc<Conn>, send: &SendHalf, fc: &mut F
         return false;
     }
 
-    // Join the budget BEFORE granting anything, and wait for the driver to
-    // have taken this connection's share back off the connections already
-    // here. Only then is a grant computed and put on the wire — so a client
-    // is never told a number the edge has not already made room for, and the
-    // sum of outstanding grants never exceeds the budget even for an instant.
-    let start_gen = shared.grant_gen.load(Ordering::Acquire);
-    shared.join(conn);
-    shared.await_settled(start_gen);
-    let grant = shared.current_grant();
-    conn.set_ceiling(grant);
+    // Join the budget and recompute every other connection's share, THIS
+    // connection's own share, and its ready-transition, all as one atomic
+    // step under `grant_lock` — see `Shared::join_and_grant` for why the
+    // ready-transition has to be inside that same critical section. The
+    // returned grant is what HELLO_OK carries; the write itself happens
+    // after, off the lock (see the doc there for the one place lag can
+    // still reach the wire, and why the headroom absorbs it).
+    let grant = shared.join_and_grant(conn);
 
     let leader = send.leader_hint();
     let leader_addr = leader.and_then(|id| shared.gateway_of(id)).unwrap_or("");
     let mut out = Vec::new();
     HelloOk { credits: grant, leader, leader_addr }.encode(&mut out);
-    if !conn.write(conn.hdr(FrameType::HelloOk, 0, h.seq), &out, shared.now_ns()) {
-        return false;
-    }
-    // Only now may the edge write on its own initiative (the STATUS timer),
-    // and only now does this connection's grant count towards the budget as
-    // far as `grants_for_tests` and `push_grants` are concerned.
-    conn.set_ready();
-    true
+    conn.write(conn.hdr(FrameType::HelloOk, 0, h.seq), &out, shared.now_ns())
 }
 
 fn refuse_hello(shared: &Arc<Shared>, conn: &Arc<Conn>, reason: u8, detail: &str) {
