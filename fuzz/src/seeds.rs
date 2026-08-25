@@ -627,6 +627,86 @@ pub fn uc_protocol_cnc() -> Vec<Seed> {
     seeds
 }
 
+/// `ring_mpsc_record` — the MPSC slot decision + decode path. Every seed is
+/// built with the REAL record writer (`write_record_body_at`) and the real
+/// commit-word encoder, so the "valid" seeds are byte-exact what a producer
+/// writes.
+pub fn ring_mpsc_record() -> Vec<Seed> {
+    use uc_protocol::ring::common::{
+        FRAME_HEADER_LEN, FRAME_TRAILER_LEN, PADDING_MSG_TYPE, encode_commit_word,
+        write_padding_body_at, write_record_body_at,
+    };
+
+    /// One fuzz input: commit word, expected lap, then the slot bytes.
+    fn input(word: u32, expected_lap: u32, slot: &[u8]) -> Vec<u8> {
+        let mut out = word.to_le_bytes().to_vec();
+        out.extend_from_slice(&expected_lap.to_le_bytes());
+        out.extend_from_slice(slot);
+        out
+    }
+
+    fn record(msg_type: u16, flags: u16, extra: [u8; 8], payload: &[u8]) -> Vec<u8> {
+        let total = FRAME_HEADER_LEN + payload.len() + FRAME_TRAILER_LEN;
+        let mut slot = vec![0u8; total];
+        // SAFETY: `slot` is exactly `total` bytes and exclusively owned here;
+        // `write_record_body_at` writes bytes 4..total.
+        unsafe { write_record_body_at(slot.as_mut_ptr(), 0, msg_type, flags, extra, payload) };
+        slot
+    }
+
+    let mut seeds = Vec::new();
+
+    // A committed record, lap 3, decoding cleanly.
+    let r = record(1, 0, [7; 8], b"submit-payload");
+    seeds.push(Seed::fixed(
+        "01-committed-record",
+        input(encode_commit_word(3, r.len() as u32, false), 3, &r),
+    ));
+
+    // The same record with a CLAIMED word: the consumer stops, decodes nothing.
+    seeds.push(Seed::fixed(
+        "02-claimed",
+        input(encode_commit_word(3, r.len() as u32, true), 3, &r),
+    ));
+
+    // The same record under the WRONG lap: reads as Empty.
+    seeds.push(Seed::fixed(
+        "03-foreign-lap",
+        input(encode_commit_word(2, r.len() as u32, false), 3, &r),
+    ));
+
+    // A tail-wrap padding marker.
+    let mut pad = vec![0u8; 24];
+    // SAFETY: 24 bytes >= the 6 the padding body writes.
+    unsafe { write_padding_body_at(pad.as_mut_ptr(), 0) };
+    seeds.push(Seed::fixed("04-padding", input(encode_commit_word(0, 24, false), 0, &pad)));
+
+    // A length far beyond the bytes present.
+    seeds.push(Seed::fixed("05-overlong-length", input(encode_commit_word(3, 0x3FFFF, false), 3, &r)));
+
+    // A record whose crc has been flipped.
+    let mut bad = r.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 0xFF;
+    seeds.push(Seed::fixed(
+        "06-bad-crc",
+        input(encode_commit_word(3, bad.len() as u32, false), 3, &bad),
+    ));
+
+    // A record header claiming a payload shorter than the frame header.
+    seeds.push(Seed::fixed("07-truncated", input(encode_commit_word(3, 8, false), 3, &r[..8])));
+
+    // An all-zero slot: the fresh-ring state.
+    seeds.push(Seed::fixed("08-zero", input(0, 0, &[0u8; 24])));
+
+    // A padding msg_type in a slot too short to hold one.
+    let mut tiny = vec![0u8; 6];
+    tiny[4..6].copy_from_slice(&PADDING_MSG_TYPE.to_le_bytes());
+    seeds.push(Seed::fixed("09-min-padding", input(encode_commit_word(0, 6, false), 0, &tiny)));
+
+    seeds
+}
+
 /// `uc_protocol_log_frame` — one header per frame type the log buffer carries.
 pub fn uc_protocol_log_frame() -> Vec<Seed> {
     use uc_protocol::v2::frame::*;

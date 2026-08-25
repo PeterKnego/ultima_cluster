@@ -134,6 +134,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ring_mpsc_record"
+path = "fuzz_targets/ring_mpsc_record.rs"
+test = false
+doc = false
+bench = false
+
 # one [[bin]] per target.
 
 [workspace]

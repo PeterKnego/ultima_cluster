@@ -66,6 +66,7 @@ fn main() -> std::io::Result<()> {
     write_target(root, "ultima_journal_record", seeds::ultima_journal_record())?;
     write_target(root, "ultima_journal_stable_value", seeds::ultima_journal_stable_value())?;
     write_target(root, "uc_protocol_cnc", seeds::uc_protocol_cnc())?;
+    write_target(root, "ring_mpsc_record", seeds::ring_mpsc_record())?;
     write_target(root, "uc_protocol_log_frame", seeds::uc_protocol_log_frame())?;
     write_target(root, "uc2_service_session", seeds::uc2_service_session())?;
     write_target(root, "uc2_node_toml", seeds::uc2_node_toml())?;
