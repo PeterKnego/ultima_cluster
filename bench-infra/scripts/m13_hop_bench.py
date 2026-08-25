@@ -419,6 +419,7 @@ def arm_gate(m12hosts, hophosts, a, points, verdicts):
     finally:
         kill_unit(S, "hb-dnode")
 
+    verdicts.append(verdict_row_missing(points))
     verdicts.append(verdict_row_a(points, direct_rps))
     verdicts.append(verdict_row_b(points, direct_rps))
     verdicts.append(verdict_row_c(points))
@@ -620,6 +621,22 @@ def verdict_row_d(points, cores):
     return Verdict(row, not bad, detail)
 
 
+def verdict_row_missing(points):
+    """A gate point (hop tag starting "gate-") that crashed or hung and
+    produced no RESULT line (`ok` False) must FAIL the gate outright, never
+    be silently dropped by `_ladder`'s ok/rps filter — a hung/crashed client
+    IS the collapse this gate exists to catch."""
+    row = "gate rungs completed (no crash/hang)"
+    missing = [p for p in points
+               if str(p.get("hop", "")).startswith("gate-") and not p.get("ok")]
+    if missing:
+        detail = "; ".join(
+            f"[FAIL] {p.get('label', p.get('hop'))} — client produced no RESULT "
+            f"(crash/hang)" for p in missing)
+        return Verdict(row, False, detail)
+    return Verdict(row, True, "every gate-tagged point produced a RESULT line")
+
+
 # ---------------------------------------------------------------- selftest
 
 def _pt(hop, n, rps, p99=1.0, lost=0, ok=True):
@@ -676,6 +693,32 @@ def selftest():
     check("d floor", verdict_row_d(d_floor, cores=8).passed, False)
     check("d no base", verdict_row_d(d_ok[1:], cores=8).passed, False)
     check("busy", busy_threads(4), 9)
+
+    # --- integrity: a crashed/hung gate rung (ok=False, no RESULT line) must
+    # FAIL the gate outright — never be silently dropped by _ladder's ok/rps
+    # filter. This IS the collapse the gate exists to catch.
+    check("missing none", verdict_row_missing(ladder_ok).passed, True)
+    crashed_c = ladder_ok[:-1] + [_pt("gate-c", 16, 0.0, ok=False)]
+    check("missing gate-c", verdict_row_missing(crashed_c).passed, False)
+    crashed_d = d_ok[:-1] + [_pt("gate-d", 8, 0.0, ok=False)]
+    check("missing gate-d", verdict_row_missing(crashed_d).passed, False)
+    # a non-gate point (from another arm sharing the same `points` list) with
+    # ok=False must NOT trip this row — only gate-tagged points count.
+    check("missing ignores non-gate",
+          verdict_row_missing([_pt("hop1", 1, 0.0, ok=False)]).passed, True)
+
+    # --- the full adjudication, assembled the way arm_gate does and gated
+    # the way main() does (`any(not v.passed for v in verdicts)`): a crashed
+    # rung must flip the WHOLE gate to FAIL even though rows a/b/c, computed
+    # only over the surviving rungs, might otherwise all pass on their own.
+    verdicts_crashed = [verdict_row_missing(crashed_c), verdict_row_a(crashed_c, direct),
+                        verdict_row_b(crashed_c, direct), verdict_row_c(crashed_c)]
+    check("adjudication FAILs on a crashed rung",
+          any(not v.passed for v in verdicts_crashed), True)
+    verdicts_healthy = [verdict_row_missing(ladder_ok), verdict_row_a(ladder_ok, direct),
+                        verdict_row_b(ladder_ok, direct), verdict_row_c(ladder_ok)]
+    check("adjudication PASSes on a healthy ladder",
+          any(not v.passed for v in verdicts_healthy), False)
 
     for f in fails:
         print(f"SELFTEST FAIL {f}")
