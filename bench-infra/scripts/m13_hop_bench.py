@@ -429,10 +429,10 @@ def arm_gate(m12hosts, hophosts, a, points, verdicts):
             {"row": v.row, "passed": v.passed, "detail": v.detail}), flush=True)
     print("\nGATE rows e and f are local/CI — run them where the code is:", flush=True)
     for c in ("cargo test -p uc_protocol",
-              'RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --release loom_',
+              'RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --release --test loom_mpsc',
               "cargo test -p uc2_remote",
               "cargo test -p uc2_gateway",
-              "cargo test -p uc2_node --test remote_lin"):
+              "cargo test -p uc2-crashtest --features hard-crash-tests --test remote_lin"):
         print(f"  {c}", flush=True)
 
 
