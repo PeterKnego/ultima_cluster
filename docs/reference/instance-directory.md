@@ -15,8 +15,8 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 | `journal/` | node | Segmented durable log (`ultima_journal`). Survives restarts; the source for replay and purge. |
 | `state/` | node | Raft durables, held as `StableValue`s: vote, term map, output progress, snapshot floor, and the config record. |
 | `snapshots/` | service and node | `snap-<pos>.ultsnap` artifacts. The service builds them; the node ships and installs them. `<pos>` is the absolute log byte position the snapshot represents. |
-| `ingress.ring` | clients → node | MPSC submit ring. |
-| `query.ring` | clients → node | Query submissions, both linearizable and snapshot reads. |
+| `ingress.ring` | clients → node | MPSC submit ring. Per-record commit format (`ULTRNG2` magic) since 2.7.0. |
+| `query.ring` | clients → node | Query submissions, both linearizable and snapshot reads. Same format as `ingress.ring`. |
 | `svc_query.ring` | node → service | Forwarded queries. |
 | `egress_service.broadcast` | node → service | Apply and output stream to the service. |
 | `egress_node.broadcast` | node → clients | Submit responses broadcast to clients. |
@@ -24,6 +24,19 @@ The directory path is passed to `Node::start` and to every `uc2ctl` invocation.
 
 Every IPC file lives directly under the instance directory. There is no
 `/dev/shm` discovery directory.
+
+**Ring file format (2.7.0).** The two client-facing MPSC rings changed
+format: each record now carries its own commit word (a lap stamp plus a
+length) instead of being published in claim order through a shared cursor,
+which is what removed the producer convoy documented in
+[the convoy explainer](../notes/uc2-m13-mpsc-publish-convoy-explained.md).
+The file magic changed with it (`ULTRNG2`), so a process built before 2.7.0
+and one built after **cannot share an instance directory**: the older one's
+ring file is refused with a magic mismatch rather than misread. The node,
+the service, the gateway and every shmem client on a host therefore restart
+together on this upgrade — see
+[Upgrade a cluster](../how-to/upgrade-a-cluster.md). The rings are volatile
+(recreated on boot), so there is nothing to migrate.
 
 ## Durability classes
 

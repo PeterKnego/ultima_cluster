@@ -26,8 +26,8 @@ where the two disagree, the dated record wins.
 | **WGL lincheck capstones** | Checked on real processes | Linearizability of a register under leader kills, crashes, partitions, purge |
 | **Elle** | Checked on real processes | Transactional safety (serializable and strict) — plus a mutation tier proving the harness has teeth |
 | **Multi-process crashtest** | Checked on real processes | Recovery correctness under `SIGKILL` mid-load |
-| **loom** | Exhaustive over interleavings | The frame-visibility memory protocol |
-| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the fourteen decoders that see bytes the process did not write |
+| **loom** | Exhaustive over interleavings | The frame-visibility memory protocol **and the MPSC ring's per-record commit protocol** |
+| **Fuzzing (libFuzzer)** | Checked under coverage-guided input search | Totality of the fifteen decoders that see bytes the process did not write |
 | **Miri** | Checked under a symbolic interpreter | Undefined behaviour in the pure wire/journal decoders (**not** the file-backed rings) |
 | **Veil** | Bug-hunting only — **never the record** | Bounded model checking of the election and reconfiguration planes |
 
@@ -310,7 +310,14 @@ handshake by which a reader observes a fully-written frame and never a torn one.
 
 ```bash
 RUSTFLAGS="--cfg loom" cargo test -p uc2_log --test loom_frame --release
+RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --test loom_mpsc --release
 ```
+
+The second model is the MPSC ring's per-record commit protocol (M13a):
+disjoint concurrent claims, the commit word's Release/Acquire visibility
+pair, and head-of-line behaviour at a claimed slot. Both models are of
+protocols, not of mappings — loom cannot see an mmap, so the ring's
+*layout* stays frozen by offset-pin tests.
 
 Offset-pin tests additionally freeze the wire and `cnc` page layouts, so a
 layout change cannot pass silently.
@@ -331,13 +338,14 @@ failure in Rust, but on a node it is a fail-stop: the datagram path runs on the
 receiver agent and `apply` runs on the service's apply thread, so a panic there
 takes the process down. Availability is the thing being defended here.
 
-### The fourteen targets
+### The fifteen targets
 
 | Target | Seam, and why its input is untrusted |
 |---|---|
 | `uc_protocol_datagram` | `uc_protocol::v2::datagram` — the 16-byte header and every body reader. The **first code an unauthenticated UDP packet reaches**; with `[crypto].enabled = false` it is reached before any authentication at all. |
 | `uc_protocol_log_frame` | `uc_protocol::v2::frame::read_header`, driven behind the real caller's `len >= HEADER_LEN` guard. Deliberately caller-guarded, so the target pins the guard's contract rather than pretending it is absent. |
 | `uc_protocol_cnc` | `uc_protocol::v2::cnc` — the 4 KiB control page every attaching process maps and parses. A file on disk any local process with write access can corrupt. |
+| `ring_mpsc_record` | `uc_protocol::ring::common`'s MPSC slot decision (`classify_commit_word`) and record decoder (`decode_record_slice`) — what the node's consensus agent meets in a shared-memory ring any local process can write. |
 | `uc2_remote_frame` | `uc2_remote::frame` — the gateway edge's 24-byte TCP frame header and every typed body decoder. Input from any client that can open a socket to the gateway. |
 | `uc2_crypto_open` | `uc2_crypto::seal::{open_in_place, open_detached}` — the AEAD envelope's framing arithmetic, which runs on attacker-chosen bytes *before* the tag has been verified. |
 | `uc2_crypto_handshake` | `uc2_crypto::handshake::Peers::on_message` — the pre-auth Noise `IK` surface. With crypto enabled this is the first thing in the process to see bytes from anyone who can reach the UDP port. |
@@ -457,11 +465,15 @@ unsupported operation: Miri does not support file-backed memory mappings
 
 A Vec-backed ring variant built purely so Miri could run it is
 the stated fallback and **has not been built**, because it would check a
-different object than the one that ships. And loom does not close the gap
-either: §6's model is of the **log buffer's** frame-visibility protocol, not of
-`uc_protocol::ring`. So the rings' layout is frozen by offset-pin tests
-and their interleavings and UB are covered by **nothing** — stated again in
-§11.
+different object than the one that ships. §6's loom coverage is partial: one
+model is of the **log buffer's** frame-visibility protocol, a second is of
+the **MPSC ring's** per-record commit protocol (M13a) — but neither is of
+`uc_protocol::ring` as a whole. So the rings' layout is frozen by
+offset-pin tests, and their interleavings and UB are covered by **nothing**
+— except the MPSC ring, whose commit protocol has had a loom model and
+whose slot decoder has had a fuzz target (`ring_mpsc_record`) since 2.7.0.
+SPSC, Broadcast, the futex layer and the mapping itself remain uncovered —
+stated again in §11.
 
 ---
 
@@ -550,17 +562,20 @@ The most important section, and the one most projects omit.
   produces divergence that no layer here can catch.
 - **Bounded model checks are bounded.** Veil's clean runs are exhaustive to a
   depth, not to all executions (§8).
-- **The IPC rings' interleavings and UB are covered by nothing** (§6, §7).
+- **The IPC rings' interleavings and UB are covered by nothing — except the
+  MPSC ring, whose commit protocol has had a loom model and whose slot
+  decoder has had a fuzz target (`ring_mpsc_record`) since 2.7.0** (§6, §7).
   `uc_protocol/src/ring/{spsc,mpsc,broadcast,common,futex}.rs` — the one place
   in the system where a Rust memory-safety bug is most plausible — has its
-  **layout** frozen by offset-pin tests and no other coverage. Miri does not
-  support file-backed memory mappings, and §6's loom model is of the **log
-  buffer's** frame-visibility protocol (a hand-written model of that atomic
-  handshake), not of the ring code: the MPSC claim-then-commit sequence and the
-  broadcast seqlock have never been model-checked. A Vec-backed ring variant
-  would let Miri run and would be checking a different object than the one that
-  ships; it has not been built, and that trade-off is recorded rather than
-  resolved.
+  **layout** frozen by offset-pin tests for all four ring kinds, plus the two
+  MPSC-specific checks above. SPSC, Broadcast, the futex layer and the
+  mapping itself remain uncovered. Miri does not support file-backed memory
+  mappings, and §6's loom models are of the **log buffer's** frame-visibility
+  protocol (a hand-written model of that atomic handshake) and, separately,
+  of the **MPSC ring's** claim-then-commit sequence — the broadcast seqlock
+  has never been model-checked. A Vec-backed ring variant would let Miri run
+  and would be checking a different object than the one that ships; it has
+  not been built, and that trade-off is recorded rather than resolved.
 - **Fuzzing is a regression gate, not a proof of totality** (§7). Green means no
   new crash from the committed corpus inside the budget. It does not mean the
   decoders are total for all inputs, and it says nothing about stateful
@@ -599,6 +614,7 @@ cargo test -p uc2-crashtest --features hard-crash-tests
 
 # Memory model
 RUSTFLAGS="--cfg loom" cargo test -p uc2_log --test loom_frame --release
+RUSTFLAGS="--cfg loom" cargo test -p uc_protocol --test loom_mpsc --release
 
 # Fuzzing — needs nightly + cargo-fuzz; CI uses 600 with --min-runs 10000
 scripts/fuzz_smoke.sh 30                                    # every target

@@ -105,6 +105,52 @@ replaying its journal, the same as any other clean restart.
 Purging is the durable fix, not a one-time cleanup: see
 [Keep the journal from growing without bound](bound-journal-growth.md).
 
+## My node just fail-stopped with `IngressRingWedged`
+
+Since 2.7.0, the two client-facing MPSC rings (`ingress.ring`,
+`query.ring`) commit per record. A client claims a slot, stamps a claim
+word, writes its body, then commits — and if it dies in the nanosecond
+window between the CAS that claims the slot and the store of that claim
+word, the consumer can never learn how long the hole is. Rather than
+guess, the consensus agent panics:
+
+```
+consensus fatal (fail-stop): IngressRingWedged ring=<ingress|query> position=<n>
+— a producer died between its claim and its claim word; the hole's length
+is unknowable. Restart the node; every attached client must reattach.
+```
+
+"A client died" is not the whole story, and worth knowing before you go
+looking for a crashed process: **a client that only stalled** — `SIGSTOP`,
+a debugger breakpoint, heavy hypervisor CPU steal — in that same
+claim-to-stamp window is indistinguishable from a dead one, and produces
+the identical fail-stop even though the client is about to resume. This
+is the one place in the ring protocol where a merely slow client can take
+the node down, possibly the leader, and it is why the window is a few
+atomic instructions wide rather than a network round trip.
+
+Contrast the much larger, and safe, window: a client stalled *after*
+stamping its claim word (the ordinary case — writing a large record body,
+or paused anywhere from there to its commit) is handled by the hole timer
+instead. The consumer waits `hole_timeout` (default 1 s), skips the
+claimed range, and counts it in the aggregate
+`uc2_ingress_holes_skipped_total` counter on `/metrics` (summed across
+*both* rings — it does not tell you which one). If that client then
+resumes and tries to commit, its commit CAS fails against the skip
+marker and it gets back `Skipped`, not silence. The one residual case —
+a client so stalled it resumes and writes its body a full ring lap
+later, into a slot some later claimant now owns — is not a hole at all
+by the time it is observed; the record's CRC catches it as a `Corrupt`
+read, not a silent mix of two clients' bytes.
+
+Recovery from `IngressRingWedged` is the same as any other fail-stop:
+`agent_failstopped` is logged, the daemon exits 1, and systemd restarts
+it. The rings are volatile, so the restarted node starts clean — but
+because the ring file format changed in 2.7.0 too, every process
+attached to this host's instance directory (service, gateway, any shmem
+client) needs the node to be back up before it can reattach; see
+[the same-host restart rule](upgrade-a-cluster.md#ring-format-change-in-270-restart-a-hosts-processes-together).
+
 ## Is a joiner recovering by snapshot?
 
 Watch `incoming_snapshot_pos` (1280) on the joining node. It advances when a

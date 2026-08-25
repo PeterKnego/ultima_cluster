@@ -186,6 +186,32 @@ key's path before the node will start with `auth = "hmac"`.
 with the posture each choice implies — diff your fleet's config against it
 to confirm nothing was missed.
 
+## Ring format change in 2.7.0: restart a host's processes together
+
+2.7.0 changes the format of the two client-facing shared-memory rings
+(`ingress.ring`, `query.ring`) — per-record commit, new file magic
+`ULTRNG2`. This is **not** a wire flag day: nothing about node-to-node
+traffic, the cnc page layout or the journal changes, and a 2.7.0 node
+replicates with a 2.7.0 peer exactly as before.
+
+What it does change is the *same-host* contract. A pre-2.7.0 service,
+gateway or client that attaches to a 2.7.0 node's instance directory is
+refused with a ring magic mismatch (and the reverse), because the two
+binaries disagree about what a slot's first word means. So on each host,
+stop and restart **all** of them together:
+
+```bash
+sudo systemctl stop uc2-gateway uc2-service uc2-node
+# swap binaries
+sudo systemctl start uc2-node uc2-service uc2-gateway
+```
+
+`scripts/uc2_flag_day.sh` already stops and starts whole hosts, so a flag
+day run covers this by construction — the rule matters for anything that
+attaches *outside* those units, most often a long-lived embedded client.
+The rings are volatile (recreated at boot), so there is nothing to migrate
+and no rollback step beyond restarting the old binaries together.
+
 ## Where to go next
 
 - [Configuration: Admin authentication](../reference/configuration.md#admin-authentication)

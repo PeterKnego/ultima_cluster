@@ -285,6 +285,24 @@ yielding producers does that (§4.1, ultima_rings' own oversubscription
 ladder). Sharded per-client ingress is the follow-on (§8) with a named
 trigger: row d failing, or the node's ceiling rising past the ring's.
 
+### As built (Task 4/5 review)
+
+Two details of the implemented protocol read differently from §4.1's and
+§4.2's prose above. First, "commit" (step 4 of §4.1) is not an
+unconditional store: it is a `compare_exchange` expecting the producer's
+own claim word, so a producer whose hole was skipped meanwhile learns that
+immediately as `RingError::Skipped { position }` rather than silently
+overwriting a slot it no longer owns — and the tail-straddle padding
+marker publishes through the same CAS, not a bare store. Second, §4.1's
+"read-only on the ring — it never writes a slot" holds everywhere except
+the skip path itself: marking a timed-out hole (§4.2) is one
+`compare_exchange` from the exact claim word the consumer observed to the
+skip marker `CLAIMED | LAP | 0`, so a producer that only stalled (not
+died) and commits in the same window loses that race harmlessly and is
+delivered normally, uncounted. See `uc_protocol/src/ring/mpsc.rs`'s module
+doc for the full as-built description, including the crc-caught residual
+of a resurrection a full lap late.
+
 ## 5. The edge: global outstanding-grant budget
 
 ### 5.1 Rule

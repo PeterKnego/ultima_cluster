@@ -55,7 +55,7 @@ scrape_configs:
 ```
 
 `/metrics` serves `text/plain; version=0.0.4` — standard Prometheus text
-exposition. The full series contract — 62 families — is the
+exposition. The full series contract — 64 families — is the
 `CONTRACT_SERIES` array in
 [`uc2_node/src/obs/metrics.rs`](../../uc2_node/src/obs/metrics.rs); a test
 pins every family in that array against what the renderer actually emits, so
@@ -65,6 +65,17 @@ the alert rules below key on, plus the counters they watch for edges. For
 everything else — snapshot/session counters, sender/receiver datagram and
 byte totals, resync counters — read the source array; each family carries
 its own one-line doc comment there.
+
+One family worth calling out because its shape is easy to misread:
+`uc2_ingress_holes_skipped_total` (since 2.7.0) is a **single counter that
+sums skipped holes across both client-facing rings**, `ingress.ring` and
+`query.ring` — it does not tell you which ring hit the hole, and there is
+no per-ring alert on it. It counts only the *recoverable* case, a stalled
+or dead producer skipped after `hole_timeout` (default 1 s). The
+unrecoverable case — a producer that dies in the few instructions between
+claiming a slot and stamping its claim word — is not a counter at all; it
+is the `IngressRingWedged` fail-stop. See
+[Diagnose a node: my node just fail-stopped with `IngressRingWedged`](diagnose-a-node.md#my-node-just-fail-stopped-with-ingressringwedged).
 
 ## Install the alert rules
 
