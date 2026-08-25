@@ -18,6 +18,7 @@ pub mod error;
 pub mod frame;
 pub(crate) mod outgoing;
 pub(crate) mod park;
+pub(crate) mod slots;
 
 pub use client::{RemoteClient, RemoteConfig, RemoteResponse, RemoteStats, Ticket};
 pub use conn::FramedConn;
