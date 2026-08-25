@@ -20,7 +20,7 @@
 //! | `engine-load` | N independent `uc2_client::Engine`s driving the local instance dir | hop 1 driver |
 //! | `edge` | the real `uc2_gateway::Edge` (same config the M12 fleet edge uses) | hop 2 |
 //! | `blaster` | a raw remote-protocol v1 client: HELLO, pre-encoded SUBMITs, credit tracking, RESPONSE parsing — none of `RemoteClient`'s state machine | hop 2 driver / TCP floor |
-//! | `remote-load` | N real `RemoteClient`s | hop 3 driver |
+//! | `remote-load` | N real remote clients on the `RemoteEngine` halves | hop 3 driver |
 //! | `dummy-edge` | a TCP server that answers HELLO_OK and one RESPONSE per SUBMIT immediately | hop 3 sink |
 //! | `local` | dev-box smoke: spawns the roles above as subprocesses and runs the composition matrix | — |
 //!
@@ -57,7 +57,7 @@ enum Role {
     Edge(EdgeArgs),
     /// Hop-2 driver / TCP floor: raw remote-protocol client, N connections.
     Blaster(blaster::Args),
-    /// Hop-3 driver: N real `RemoteClient`s.
+    /// Hop-3 driver: N real remote clients on the `RemoteEngine` halves.
     RemoteLoad(remote_load::Args),
     /// Hop-3 sink: TCP server answering every SUBMIT immediately. Parks until killed.
     DummyEdge(dummy_edge::Args),
