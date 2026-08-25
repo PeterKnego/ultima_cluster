@@ -19,8 +19,10 @@ pub mod spsc;
 
 pub use broadcast::{BroadcastConsumer, BroadcastProducer, BroadcastRing};
 pub use common::{
-    BUSY_SPIN_CHUNK, FrameHeader, PARK_CEIL, ParkMode, RecordHeader, RingError, RingHeader,
-    RingWaitHandle, SPIN_TRIES, create_shared_backing_file,
+    BUSY_SPIN_CHUNK, COMMIT_CLAIMED, COMMIT_LAP_MASK, COMMIT_LAP_SHIFT, COMMIT_LEN_MASK,
+    FrameHeader, MPSC_MAX_RECORD_BYTES, PARK_CEIL, ParkMode, RecordHeader, RingError, RingHeader,
+    RingWaitHandle, SPIN_TRIES, SlotState, classify_commit_word, create_shared_backing_file,
+    decode_record_slice, encode_commit_word, lap_of,
 };
 pub use mpsc::{MpscConsumer, MpscProducer, MpscRing};
 pub use spsc::{SpscConsumer, SpscProducer, SpscRing};
