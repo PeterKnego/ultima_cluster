@@ -326,11 +326,19 @@ pub enum RingError {
     #[error("corrupt: {0}")]
     Corrupt(String),
     #[error("magic mismatch")]
-    BadMagic,
+    MagicMismatch,
     #[error("crc mismatch")]
     BadCrc,
     #[error("consumer fell behind; producer overwrote unread records")]
     Overwritten,
+    /// The consumer is head-of-line behind a claim whose claim word never
+    /// appeared (spec §4.2: a producer killed between its CAS on
+    /// `claim_position` and its claim-word store — a window of nanoseconds).
+    /// The hole's length is unknowable, so the ring refuses to guess: the
+    /// caller fail-stops. Strictly better than the pre-M13a behaviour, where
+    /// the same death wedged every producer and the consumer silently.
+    #[error("ingress ring wedged at position {position}: an unsized claim hole outlived the hole timeout")]
+    Wedged { position: u64 },
 }
 
 /// Create — or RECREATE IN PLACE — the backing file for an mmap-shared IPC
@@ -430,6 +438,27 @@ pub fn init_ring_header(
     max_msg_size: u32,
     msg_kind_filter: u32,
 ) -> Result<(), RingError> {
+    init_ring_header_with_magic(
+        buf,
+        capacity_bytes,
+        max_msg_size,
+        msg_kind_filter,
+        crate::magic::RING_MAGIC,
+    )
+}
+
+/// As [`init_ring_header`], with the file magic chosen by the caller.
+/// SPSC/Broadcast pass `RING_MAGIC`; MPSC passes `RING_MPSC_MAGIC` (M13a).
+///
+/// Safe iff the caller holds exclusive access to `buf` (typical: just-created
+/// mmap'd file before any concurrent access).
+pub fn init_ring_header_with_magic(
+    buf: &mut [u8],
+    capacity_bytes: u64,
+    max_msg_size: u32,
+    msg_kind_filter: u32,
+    magic: [u8; 8],
+) -> Result<(), RingError> {
     if buf.len() < RING_HEADER_LEN {
         return Err(RingError::Corrupt(format!(
             "buffer too small for ring header: {} < {RING_HEADER_LEN}",
@@ -455,7 +484,7 @@ pub fn init_ring_header(
         std::ptr::write(
             header_ptr,
             RingHeader {
-                magic: crate::magic::RING_MAGIC,
+                magic,
                 capacity_bytes,
                 max_msg_size,
                 msg_kind_filter,
@@ -476,6 +505,11 @@ pub fn init_ring_header(
 /// Validate an existing ring file's header (e.g., on attach). Returns a
 /// shared reference into `buf`.
 pub fn validate_ring_header(buf: &[u8]) -> Result<&RingHeader, RingError> {
+    validate_ring_header_with_magic(buf, crate::magic::RING_MAGIC)
+}
+
+/// As [`validate_ring_header`], with the expected magic chosen by the caller.
+pub fn validate_ring_header_with_magic(buf: &[u8], magic: [u8; 8]) -> Result<&RingHeader, RingError> {
     if buf.len() < RING_HEADER_LEN {
         return Err(RingError::Corrupt(format!(
             "buffer too small: {} < {RING_HEADER_LEN}",
@@ -484,10 +518,49 @@ pub fn validate_ring_header(buf: &[u8]) -> Result<&RingHeader, RingError> {
     }
     // SAFETY: buf is at least RING_HEADER_LEN bytes; mmap is properly aligned.
     let header = unsafe { &*buf.as_ptr().cast::<RingHeader>() };
-    if header.magic != crate::magic::RING_MAGIC {
-        return Err(RingError::BadMagic);
+    if header.magic != magic {
+        return Err(RingError::MagicMismatch);
     }
     Ok(header)
+}
+
+/// Write everything in a record EXCEPT its first 4-byte word: `msg_type`,
+/// `flags`, `header_extra`, the payload and the crc32 trailer. The caller
+/// publishes the record by writing that word (a plain length for
+/// SPSC/Broadcast, a commit word for MPSC).
+///
+/// # Safety
+///
+/// Same contract as [`write_record_at`].
+pub unsafe fn write_record_body_at(
+    slot_region: *mut u8,
+    slot_offset: usize,
+    msg_type: u16,
+    flags: u16,
+    header_extra: [u8; 8],
+    payload: &[u8],
+) {
+    let dst = unsafe { slot_region.add(slot_offset) };
+    unsafe {
+        // bytes 4..6 — msg_type
+        std::ptr::copy_nonoverlapping((&msg_type as *const u16).cast::<u8>(), dst.add(4), 2);
+        // bytes 6..8 — flags
+        std::ptr::copy_nonoverlapping((&flags as *const u16).cast::<u8>(), dst.add(6), 2);
+        // bytes 8..16 — header_extra
+        std::ptr::copy_nonoverlapping(header_extra.as_ptr(), dst.add(8), 8);
+        // payload
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), dst.add(FRAME_HEADER_LEN), payload.len());
+        // crc32 over (msg_type..end-of-payload)
+        let crc_input =
+            std::slice::from_raw_parts(dst.add(4), FRAME_HEADER_LEN - 4 + payload.len());
+        let crc = crc32fast::hash(crc_input);
+        let crc_bytes = crc.to_le_bytes();
+        std::ptr::copy_nonoverlapping(
+            crc_bytes.as_ptr(),
+            dst.add(FRAME_HEADER_LEN + payload.len()),
+            4,
+        );
+    }
 }
 
 /// Write a complete record (header + payload + crc32) at `slot_offset` within
@@ -512,34 +585,34 @@ pub unsafe fn write_record_at(
     payload: &[u8],
     total_record_size: usize,
 ) {
-    let dst = unsafe { slot_region.add(slot_offset) };
     unsafe {
-        // bytes 4..6 — msg_type
-        std::ptr::copy_nonoverlapping((&msg_type as *const u16).cast::<u8>(), dst.add(4), 2);
-        // bytes 6..8 — flags
-        std::ptr::copy_nonoverlapping((&flags as *const u16).cast::<u8>(), dst.add(6), 2);
-        // bytes 8..16 — header_extra
-        std::ptr::copy_nonoverlapping(header_extra.as_ptr(), dst.add(8), 8);
-        // payload
-        std::ptr::copy_nonoverlapping(payload.as_ptr(), dst.add(FRAME_HEADER_LEN), payload.len());
-        // crc32 over (msg_type..end-of-payload)
-        let crc_input =
-            std::slice::from_raw_parts(dst.add(4), FRAME_HEADER_LEN - 4 + payload.len());
-        let crc = crc32fast::hash(crc_input);
-        let crc_bytes = crc.to_le_bytes();
-        std::ptr::copy_nonoverlapping(
-            crc_bytes.as_ptr(),
-            dst.add(FRAME_HEADER_LEN + payload.len()),
-            4,
-        );
+        write_record_body_at(slot_region, slot_offset, msg_type, flags, header_extra, payload);
         // Write length last (legacy "length != 0 means committed" guard). No
         // Release fence is needed here: the caller advances `publish_position`
         // with a Release store after this function returns, which orders ALL of
         // these slot writes before any reader can observe the slot (readers
         // only touch slots below `publish_position`, loaded with Acquire). On
         // arm64 the removed fence was a per-write `dmb ish`.
+        // (SPSC/Broadcast only — MPSC publishes with a commit word instead.)
         let len_bytes = (total_record_size as u32).to_le_bytes();
-        std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), dst, 4);
+        std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), slot_region.add(slot_offset), 4);
+    }
+}
+
+/// Write a tail-wrap padding marker's `msg_type` only (bytes 4..6). The
+/// caller writes the first word.
+///
+/// # Safety
+///
+/// Same as [`write_record_at`]; the slot must have at least 6 bytes.
+pub unsafe fn write_padding_body_at(slot_region: *mut u8, slot_offset: usize) {
+    let dst = unsafe { slot_region.add(slot_offset) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (&PADDING_MSG_TYPE as *const u16).cast::<u8>(),
+            dst.add(4),
+            2,
+        );
     }
 }
 
@@ -555,19 +628,13 @@ pub unsafe fn write_padding_marker_at(
     slot_offset: usize,
     padding_bytes: usize,
 ) {
-    let dst = unsafe { slot_region.add(slot_offset) };
     unsafe {
-        // bytes 4..6 — msg_type = PADDING_MSG_TYPE
-        std::ptr::copy_nonoverlapping(
-            (&PADDING_MSG_TYPE as *const u16).cast::<u8>(),
-            dst.add(4),
-            2,
-        );
+        write_padding_body_at(slot_region, slot_offset);
         // No Release fence (see `write_record_at`): the caller's subsequent
         // `publish_position` Release store orders this write before any reader
         // can observe the padding slot.
         let len_bytes = (padding_bytes as u32).to_le_bytes();
-        std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), dst, 4);
+        std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), slot_region.add(slot_offset), 4);
     }
 }
 
@@ -677,6 +744,153 @@ pub unsafe fn try_read_record_at(
     )))
 }
 
+// ---- MPSC per-record commit word (M13a; spec §4.1) ------------------------
+//
+// The first word of every MPSC slot. It replaces the pre-M13a "length, 0 =
+// uncommitted" convention and carries three fields:
+//
+//   bit 31      CLAIMED   set between claim and commit
+//   bits 18-30  LAP       (record_start_pos / capacity) & 0x1FFF
+//   bits 0-17   LENGTH    total record bytes (claim word: the claimed advance)
+//
+// The lap is what makes the consumer's read of a stale slot unambiguous
+// WITHOUT the consumer ever writing into the ring: the bounded claim means a
+// producer only overwrites a slot the consumer has already consumed, so the
+// only stale value the consumer can meet is an OLDER lap's committed word,
+// which fails lap equality. 13 bits is unambiguous because the consumer can
+// never be 8192 laps behind a claim — the bound is one lap.
+
+/// Bit 31: the slot is claimed by a producer that has not committed yet.
+pub const COMMIT_CLAIMED: u32 = 1 << 31;
+/// Bits 18-30 hold the lap.
+pub const COMMIT_LAP_SHIFT: u32 = 18;
+/// 13-bit lap field.
+pub const COMMIT_LAP_MASK: u32 = 0x1FFF;
+/// 18-bit length field.
+pub const COMMIT_LEN_MASK: u32 = 0x3_FFFF;
+/// Largest record an MPSC ring can carry: the length field's ceiling.
+/// `MpscRing::create` refuses a `max_msg_size` whose aligned size exceeds it.
+pub const MPSC_MAX_RECORD_BYTES: usize = COMMIT_LEN_MASK as usize;
+
+/// What the consumer found in a slot's commit word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotState {
+    /// Nothing of ours here: an untouched slot, an older lap's leftovers, or
+    /// a claim whose word has not landed yet.
+    Empty,
+    /// A producer claimed `advance` bytes here and has not committed.
+    Claimed { advance: u32 },
+    /// A committed record of `length` bytes (unaligned; advance by
+    /// [`align_record_size`]).
+    Committed { length: u32 },
+}
+
+/// The lap a byte position belongs to.
+#[inline]
+pub const fn lap_of(pos: u64, capacity: usize) -> u32 {
+    ((pos / capacity as u64) as u32) & COMMIT_LAP_MASK
+}
+
+/// Pack a commit word.
+#[inline]
+pub const fn encode_commit_word(lap: u32, len: u32, claimed: bool) -> u32 {
+    let base = ((lap & COMMIT_LAP_MASK) << COMMIT_LAP_SHIFT) | (len & COMMIT_LEN_MASK);
+    if claimed { base | COMMIT_CLAIMED } else { base }
+}
+
+/// Decide what a slot holds. Total on every `u32`.
+#[inline]
+pub const fn classify_commit_word(word: u32, expected_lap: u32) -> SlotState {
+    if word == 0 {
+        return SlotState::Empty;
+    }
+    if (word >> COMMIT_LAP_SHIFT) & COMMIT_LAP_MASK != expected_lap & COMMIT_LAP_MASK {
+        return SlotState::Empty;
+    }
+    let len = word & COMMIT_LEN_MASK;
+    if word & COMMIT_CLAIMED != 0 {
+        SlotState::Claimed { advance: len }
+    } else if len == 0 {
+        // No producer can write this (a commit always carries a length).
+        SlotState::Empty
+    } else {
+        SlotState::Committed { length: len }
+    }
+}
+
+/// Acquire-load a slot's commit word.
+///
+/// # Safety
+///
+/// `slot_region + slot_offset` must be a mapped, 4-byte-aligned address
+/// inside the slot region. Both hold by construction: the region is
+/// page-aligned and every position advances in [`RECORD_ALIGN`] steps.
+#[inline]
+pub unsafe fn load_commit_word(slot_region: *const u8, slot_offset: usize) -> u32 {
+    let p = unsafe { slot_region.add(slot_offset) }.cast::<AtomicU32>();
+    unsafe { (*p).load(Ordering::Acquire) }
+}
+
+/// Store a slot's commit word. `Release` publishes the record; `Relaxed` is
+/// for the claim stamp (nothing depends on it being ordered).
+///
+/// # Safety
+///
+/// Same as [`load_commit_word`], plus: the caller owns the claimed range.
+#[inline]
+pub unsafe fn store_commit_word(
+    slot_region: *mut u8,
+    slot_offset: usize,
+    word: u32,
+    ord: Ordering,
+) {
+    let p = unsafe { slot_region.add(slot_offset) }.cast::<AtomicU32>();
+    unsafe { (*p).store(word, ord) }
+}
+
+/// Decode one record from `slot` — exactly the record's own bytes, commit
+/// word included at `slot[0..4]`. Total on any input: every access is
+/// bounds-checked and the crc32 is verified. Returns the header and the
+/// number of bytes to advance the consumer position by.
+///
+/// Safe by construction (a slice, not a pointer), which is what makes the
+/// `ring_mpsc_record` fuzz target possible.
+pub fn decode_record_slice(
+    slot: &[u8],
+    payload_buf: &mut Vec<u8>,
+) -> Result<(RecordHeader, usize), RingError> {
+    if slot.len() < 6 {
+        return Err(RingError::Corrupt(format!("record slice too short: {}", slot.len())));
+    }
+    let msg_type = u16::from_le_bytes([slot[4], slot[5]]);
+    if msg_type == PADDING_MSG_TYPE {
+        // Padding length is a multiple of RECORD_ALIGN by construction.
+        return Ok((
+            RecordHeader { msg_type, flags: 0, header_extra: [0; 8] },
+            slot.len(),
+        ));
+    }
+    if slot.len() < FRAME_HEADER_LEN + FRAME_TRAILER_LEN {
+        return Err(RingError::Corrupt(format!("record length {} too small", slot.len())));
+    }
+    let flags = u16::from_le_bytes([slot[6], slot[7]]);
+    let mut header_extra = [0u8; 8];
+    header_extra.copy_from_slice(&slot[8..FRAME_HEADER_LEN]);
+    let payload_end = slot.len() - FRAME_TRAILER_LEN;
+    let crc_actual = u32::from_le_bytes(
+        slot[payload_end..].try_into().expect("FRAME_TRAILER_LEN bytes remain"),
+    );
+    if crc32fast::hash(&slot[4..payload_end]) != crc_actual {
+        return Err(RingError::BadCrc);
+    }
+    payload_buf.clear();
+    payload_buf.extend_from_slice(&slot[FRAME_HEADER_LEN..payload_end]);
+    Ok((
+        RecordHeader { msg_type, flags, header_extra },
+        align_record_size(slot.len()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -718,7 +932,7 @@ mod tests {
     fn validate_rejects_bad_magic() {
         let (mmap, _tmp) = mmap_buf(RING_HEADER_LEN);
         let result = validate_ring_header(&mmap[..]);
-        assert!(matches!(result, Err(RingError::BadMagic)));
+        assert!(matches!(result, Err(RingError::MagicMismatch)));
     }
 
     #[test]
@@ -733,5 +947,117 @@ mod tests {
         let (mut mmap, _tmp) = mmap_buf(4096);
         let r = init_ring_header(&mut mmap[..10], 65536, 4096, 0);
         assert!(matches!(r, Err(RingError::Corrupt(_))));
+    }
+
+    // ---- M13a: the MPSC commit word (spec §4.1) ---------------------------
+
+    #[test]
+    fn commit_word_round_trips_every_field() {
+        // Max legal values in each field, so a shift/mask error cannot hide.
+        let w = encode_commit_word(COMMIT_LAP_MASK, COMMIT_LEN_MASK, false);
+        assert_eq!(classify_commit_word(w, COMMIT_LAP_MASK), SlotState::Committed {
+            length: COMMIT_LEN_MASK
+        });
+        let c = encode_commit_word(COMMIT_LAP_MASK, COMMIT_LEN_MASK, true);
+        assert_eq!(classify_commit_word(c, COMMIT_LAP_MASK), SlotState::Claimed {
+            advance: COMMIT_LEN_MASK
+        });
+        // The claimed bit is bit 31 and nothing else.
+        assert_eq!(c ^ w, COMMIT_CLAIMED);
+        // A 64 KiB record — the real `max_msg_size` — fits the length field.
+        assert_eq!(classify_commit_word(encode_commit_word(3, 65536, false), 3), SlotState::Committed {
+            length: 65536
+        });
+    }
+
+    #[test]
+    fn a_zero_word_and_a_foreign_lap_both_read_as_empty() {
+        // A freshly zeroed ring: every slot reads Empty at lap 0.
+        assert_eq!(classify_commit_word(0, 0), SlotState::Empty);
+        // The previous lap's COMMITTED record still sitting in the slot.
+        let prev = encode_commit_word(4, 40, false);
+        assert_eq!(classify_commit_word(prev, 5), SlotState::Empty);
+        // The previous lap's CLAIMED word — also not ours.
+        let prev_claim = encode_commit_word(4, 40, true);
+        assert_eq!(classify_commit_word(prev_claim, 5), SlotState::Empty);
+        // Lap matches but length is zero and nothing is claimed: impossible
+        // from any producer, so the total classifier reads it as Empty
+        // (the consumer then waits, and §4.2's wedge timer adjudicates).
+        assert_eq!(classify_commit_word(encode_commit_word(5, 0, false), 5), SlotState::Empty);
+    }
+
+    #[test]
+    fn lap_is_the_position_divided_by_capacity() {
+        assert_eq!(lap_of(0, 4096), 0);
+        assert_eq!(lap_of(4095, 4096), 0);
+        assert_eq!(lap_of(4096, 4096), 1);
+        assert_eq!(lap_of(4096 * 8192, 4096), 0, "13 bits wrap at 8192 laps");
+        assert_eq!(lap_of(4096 * 8193, 4096), 1);
+    }
+
+    #[test]
+    fn decode_record_slice_round_trips_the_real_writer() {
+        let payload = b"hello ring";
+        let total = FRAME_HEADER_LEN + payload.len() + FRAME_TRAILER_LEN;
+        let mut slot = vec![0u8; total];
+        // SAFETY: `slot` is exactly `total` bytes, exclusively owned here.
+        unsafe { write_record_body_at(slot.as_mut_ptr(), 0, 7, 3, [1; 8], payload) };
+        slot[..4].copy_from_slice(&encode_commit_word(2, total as u32, false).to_le_bytes());
+
+        let mut buf = Vec::new();
+        let (rec, advance) = decode_record_slice(&slot, &mut buf).expect("decodes");
+        assert_eq!(rec.msg_type, 7);
+        assert_eq!(rec.flags, 3);
+        assert_eq!(rec.header_extra, [1; 8]);
+        assert_eq!(&buf[..], payload);
+        assert_eq!(advance, align_record_size(total));
+    }
+
+    #[test]
+    fn decode_record_slice_is_total_on_junk() {
+        let mut buf = Vec::new();
+        // Too short for even a msg_type.
+        for n in 0..6usize {
+            assert!(decode_record_slice(&vec![0xABu8; n], &mut buf).is_err(), "len {n}");
+        }
+        // Long enough for a padding marker but not a record: a non-padding
+        // msg_type in a 6..20-byte slice is Corrupt, never a panic.
+        let mut short = vec![0u8; 8];
+        short[4..6].copy_from_slice(&9u16.to_le_bytes());
+        assert!(matches!(decode_record_slice(&short, &mut buf), Err(RingError::Corrupt(_))));
+        // A corrupt crc is BadCrc, not a panic.
+        let payload = b"x";
+        let total = FRAME_HEADER_LEN + payload.len() + FRAME_TRAILER_LEN;
+        let mut slot = vec![0u8; total];
+        // SAFETY: `slot` is exactly `total` bytes, exclusively owned here.
+        unsafe { write_record_body_at(slot.as_mut_ptr(), 0, 1, 0, [0; 8], payload) };
+        slot[total - 1] ^= 0xFF;
+        assert!(matches!(decode_record_slice(&slot, &mut buf), Err(RingError::BadCrc)));
+    }
+
+    #[test]
+    fn decode_record_slice_reads_a_padding_marker() {
+        let mut slot = vec![0u8; 24];
+        // SAFETY: `slot` is 24 bytes >= the 6 the padding body writes.
+        unsafe { write_padding_body_at(slot.as_mut_ptr(), 0) };
+        slot[..4].copy_from_slice(&encode_commit_word(0, 24, false).to_le_bytes());
+        let mut buf = Vec::new();
+        let (rec, advance) = decode_record_slice(&slot, &mut buf).expect("padding decodes");
+        assert_eq!(rec.msg_type, PADDING_MSG_TYPE);
+        assert_eq!(advance, 24, "padding advances by its whole length");
+    }
+
+    #[test]
+    fn a_ring_header_written_with_one_magic_is_refused_by_the_other() {
+        let (mut mmap, _tmp) = mmap_buf(RING_HEADER_LEN * 2);
+        init_ring_header_with_magic(&mut mmap[..], 4096, 1024, 0, crate::magic::RING_MPSC_MAGIC)
+            .expect("init");
+        assert!(matches!(
+            validate_ring_header_with_magic(&mmap[..], crate::magic::RING_MAGIC),
+            Err(RingError::MagicMismatch)
+        ));
+        assert!(
+            validate_ring_header_with_magic(&mmap[..], crate::magic::RING_MPSC_MAGIC).is_ok()
+        );
     }
 }
