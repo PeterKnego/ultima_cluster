@@ -353,14 +353,27 @@ pub enum RingError {
     /// the same death wedged every producer and the consumer silently.
     #[error("ingress ring wedged at position {position}: an unsized claim hole outlived the hole timeout")]
     Wedged { position: u64 },
-    /// Task 4's controller ruling on spec §4.2's residual: a producer that
-    /// merely STALLED past `hole_timeout` (rather than dying) can resume
-    /// after the consumer has already skipped its hole. Because commit is a
-    /// `compare_exchange` on the claim word (not an unconditional store), a
-    /// slot the consumer released and a later claimant re-stamped fails the
-    /// CAS instead of being silently overwritten out from under that later
-    /// claimant. `position` is the claim's start position — the caller has
-    /// nothing durable to retry; the record is simply lost.
+    /// Task 4's controller ruling on spec §4.2's residual, tightened by fix
+    /// round 1's finding 2: a producer that merely STALLED past
+    /// `hole_timeout` (rather than dying) can resume after the consumer has
+    /// already skipped its hole. The consumer marks a skipped claim with a
+    /// `compare_exchange` from the exact claim word it observed to a skip
+    /// marker (`CLAIMED | LAP | 0`, spec §4.1 amendment) rather than trusting
+    /// its own bookkeeping, and the producer's commit is itself a
+    /// `compare_exchange` on the claim word (not an unconditional store), so
+    /// a resurrection is refused the moment it tries to commit: `position`
+    /// is the claim's start position, and the caller has nothing durable to
+    /// retry — the record is simply lost. Loss is now ALWAYS signalled this
+    /// way, in both directions the resurrection can be caught: immediately
+    /// via the marker (no lap needed) if the CAS-skip landed before the
+    /// resumed commit, or via a later claimant's re-stamped word if the
+    /// resurrection raced the marker CAS itself and the ring has since
+    /// lapped back to this exact slot. The one thing this does NOT catch:
+    /// a resurrection that resumes mid-body-write, after the slot has moved
+    /// on to a yet-later claimant without its commit word changing again in
+    /// the meantime — `decode_record_slice`'s crc32 surfaces that as a bad
+    /// read, not a silent corruption, but does not prevent the write (see
+    /// `mpsc::MpscProducer::commit`'s doc for the full residual).
     #[error("producer at position {position} was skipped by the consumer before it could commit")]
     Skipped { position: u64 },
 }
@@ -917,7 +930,18 @@ pub fn decode_record_slice(
     }
     let msg_type = u16::from_le_bytes([slot[4], slot[5]]);
     if msg_type == PADDING_MSG_TYPE {
-        // Padding length is a multiple of RECORD_ALIGN by construction.
+        // Padding length is a multiple of RECORD_ALIGN by construction — but
+        // `slot.len()` (== the commit word's LENGTH field) is data that
+        // arrived from another process, and an unaligned value here would
+        // advance `consumer_position` off the RECORD_ALIGN grid, violating
+        // `load_commit_word`'s documented alignment SAFETY contract on the
+        // very next slot. Verified, not assumed.
+        if !slot.len().is_multiple_of(RECORD_ALIGN) {
+            return Err(RingError::Corrupt(format!(
+                "padding length {} is not RECORD_ALIGN-aligned",
+                slot.len()
+            )));
+        }
         return Ok((
             RecordHeader { msg_type, flags: 0, header_extra: [0; 8] },
             slot.len(),
