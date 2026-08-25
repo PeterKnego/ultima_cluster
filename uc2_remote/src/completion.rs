@@ -19,14 +19,11 @@
 //! could arrive on this wire fits in an empty arena — which is what makes
 //! "park until there is room" terminate rather than deadlock.
 //!
-//! This is task 3 of the M13b split-client build (design spec §3.2): the
-//! reader thread that fills this queue and the poll half that drains it land
-//! in later tasks, so until then the only caller is this module's own test
-//! suite — same reasoning [`crate::park::WaitCell`] and
-//! [`crate::outgoing::OutRing`] carried, and lifted the same way once this
-//! queue gets its first real caller.
-
-#![allow(dead_code)]
+//! Task 5 gave this queue its real ends: `link::Reader` (the reader thread's
+//! role token, plus a `Link::close` that has already joined it) is the
+//! producer, and `RemotePollHalf::poll` — through `link::drain_completions` —
+//! is the consumer. Only the outcome tags no frame handler produces yet carry
+//! a narrow `allow`.
 
 use std::ptr;
 use std::slice;
@@ -36,8 +33,11 @@ use crate::park::WaitCell;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum OutcomeTag {
+    #[allow(dead_code, reason = "task 6 tags a RESPONSE frame with this")]
     Response,
+    #[allow(dead_code, reason = "task 9 tags an UNKNOWN frame with this")]
     Unknown,
+    #[allow(dead_code, reason = "task 8 tags a RETRY{PAYLOAD_TOO_LARGE} with this")]
     PayloadTooLarge,
     TimedOut,
     Closed,
