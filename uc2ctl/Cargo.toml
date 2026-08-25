@@ -24,14 +24,14 @@ description = "Admin CLI for live ultima_cluster reconfiguration"
 # rather than reimplementing them here, so `uc2_node` becomes a dependency
 # for THOSE three verbs specifically.
 [dependencies]
-uc2_log = { path = "../uc2_log", version = "2.6.0" }
-uc2_node = { path = "../uc2_node", version = "2.6.0" }
-uc_protocol = { path = "../uc_protocol", version = "2.6.0" }
+uc2_log = { path = "../uc2_log", version = "2.7.0" }
+uc2_node = { path = "../uc2_node", version = "2.7.0" }
+uc_protocol = { path = "../uc_protocol", version = "2.7.0" }
 # M12b Task 6: `--admin-key` signing + `gen-admin-key` — the canonical
 # `AdminMessage`/`sign`/`AdminKey`/`generate_key_file` live here so this CLI
 # builds the exact same byte layout the node verifies, rather than
 # reimplementing it.
-uc2_crypto = { path = "../uc2_crypto", version = "2.6.0" }
+uc2_crypto = { path = "../uc2_crypto", version = "2.7.0" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 # A per-request nonce, so a response can never be mistaken for a stale one.
@@ -40,5 +40,5 @@ rand = { workspace = true }
 [dev-dependencies]
 # admin_auth_bin.rs starts a real node IN-PROCESS (uc2_node is already a
 # regular dependency above) and needs `FaultConfig` for `NodeConfig`.
-uc2_net = { path = "../uc2_net", version = "2.6.0" }
+uc2_net = { path = "../uc2_net", version = "2.7.0" }
 tempfile = { workspace = true }

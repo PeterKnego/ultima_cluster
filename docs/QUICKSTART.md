@@ -17,7 +17,7 @@ are for getting the artifact, not for using it.
 
 ## 1. Download it, and verify it
 
-> **Not published yet.** `v2.6.0` is written up but not tagged, so nothing is
+> **Not published yet.** `v2.7.0` is written up but not tagged, so nothing is
 > at these URLs today — the release workflow that produces and signs the
 > artifacts is built and gated but has not run for a real tag. This section is
 > the procedure for the first release; until it lands, build from source
@@ -31,7 +31,7 @@ Pick your architecture and take the tarball, its checksum, `SHA256SUMS`, and
 the signature bundle:
 
 ```bash
-VER=2.6.0
+VER=2.7.0
 TARGET=x86_64-unknown-linux-gnu        # or aarch64-unknown-linux-gnu
 BASE=https://github.com/PeterKnego/ultima_cluster/releases/download/v$VER
 
@@ -99,7 +99,7 @@ packaging/quickstart-local.sh
 
 ```text
 ultima_cluster quickstart
-   binaries: /home/you/uc2-2.6.0-x86_64-unknown-linux-gnu/bin
+   binaries: /home/you/uc2-2.7.0-x86_64-unknown-linux-gnu/bin
    root:     /home/you/uc2-quickstart
 
 1. writing configuration
@@ -354,7 +354,7 @@ supervisor:
   publishes:
 
   ```bash
-  UC2_IMAGE=ghcr.io/peterknego/uc2:2.6.0 \
+  UC2_IMAGE=ghcr.io/peterknego/uc2:2.7.0 \
     docker compose -f packaging/compose.yml up -d
   ```
 
