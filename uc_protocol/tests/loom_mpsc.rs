@@ -42,6 +42,20 @@
 //! parameter, not an `Instant`, so the model stays deterministic: loom
 //! explores interleavings, not schedules.
 //!
+//! **The padding omission had teeth, once.** Writing this model is what
+//! surfaced it: the padding marker was a second publication path, and until
+//! the fix that landed with this file it published with an unconditional
+//! `store_commit_word` rather than a commit CAS — so it sat OUTSIDE P4's and
+//! P5's exactly-one-winner guarantee, in exactly the shape mutation M3 below
+//! proves unsafe (a producer preempted in its claim→publish window, its hole
+//! skip-marked, resuming to stomp a later claimant with nothing reported).
+//! `MpscProducer::commit_padding` now uses the same CAS as
+//! `MpscProducer::commit`, and `mpsc.rs`'s
+//! `a_skipped_padding_marker_is_refused_not_stomped` pins it. Modelling the
+//! padding path in loom stays out of scope — it would need a ring whose
+//! records do not tile it, doubling P1's already-678k state space — but the
+//! two publication paths now share one discipline, so P4/P5 speak for both.
+//!
 //! # Properties
 //!
 //! * **P1** `every_committed_record_is_delivered_exactly_once_in_claim_order`
@@ -71,7 +85,7 @@
 //! # Mutation checks (performed, not assumed)
 //!
 //! A model that passes proves nothing until it is shown to fail on a wrong
-//! protocol. Four mutations and two coverage probes were run against exactly
+//! protocol. Five mutations and two coverage probes were run against exactly
 //! this file; each was reverted afterwards.
 //!
 //! **1. Commit ordering.** Relaxing the commit CAS's success ordering
@@ -127,6 +141,35 @@
 //! ```
 //!
 //! — a resurrected producer stomps a later claimant's slot and is never told.
+//!
+//! **4. The pre-M13a publication order** — the one mutation that targets P2,
+//! whose headline claim ("blocks nobody") is otherwise unfalsifiable in a
+//! model containing no wait construct. Reinstate the serialization M13a
+//! removed: make `Ring::commit` wait until every earlier claim has published
+//! before publishing its own. As a plain spin
+//! (`while commit_count.load(Acquire) != claim.pos / ADVANCE { yield_now() }`)
+//! loom reports the starvation:
+//!
+//! ```text
+//! Model exceeded maximum number of branches. This is often caused by an
+//! algorithm requiring the processor to make progress, e.g. spin locks.
+//! ```
+//!
+//! Modelled instead as a `loom::sync::Mutex` + `Condvar` turnstile that each
+//! commit hands on (`*turn += 1; notify_all()`), loom reports the deadlock
+//! unambiguously, with A stalled and B, C and the main thread all blocked:
+//!
+//! ```text
+//! deadlock; threads = [(Id(0), Blocked(Location(None))),
+//!                      (Id(1), Blocked(Location(None))),
+//!                      (Id(2), Blocked(Location(None)))]
+//! ```
+//!
+//! P5 deadlocks under M4 too (its record behind the skipped hole can never
+//! take its turn); P1 and P4 still pass, since every claim in them does
+//! eventually commit. This is the convoy
+//! `docs/notes/uc2-m13-mpsc-publish-convoy-explained.md` measured on the
+//! fleet, reproduced as a memory-model fact.
 //!
 //! **Branch coverage of P4.** A two-outcome property is vacuous if only one
 //! outcome is ever reached, so both were probed: asserting
@@ -514,8 +557,15 @@ fn every_committed_record_is_delivered_exactly_once_in_claim_order() {
 /// with each other on `claim_position`, so loom has real interleavings to
 /// explore rather than two disjoint slots DPOR can collapse into one — must
 /// each complete their claim AND their commit in every one of them. The joins
-/// are the assertion: against the pre-M13a protocol (publication serialized by
-/// an unbounded spin on `publish_position`) both threads spin forever here.
+/// are the assertion: a thread that could not finish would leave this model
+/// unable to make progress, which loom reports rather than hanging.
+///
+/// That the joins CAN fail is not taken on faith: mutation M4 in the module
+/// doc reinstates the pre-M13a publication order and loom then reports
+/// `deadlock; threads = [(Id(0), Blocked), (Id(1), Blocked), (Id(2),
+/// Blocked)]` for this exact test. The model as committed contains no
+/// wait/park construct anywhere, which is itself the point — the shipped
+/// protocol has no step at which one producer waits for another.
 ///
 /// Meanwhile the consumer is head-of-line behind A: it must report nothing at
 /// all, however far B and C have got. When A finally commits, everything
