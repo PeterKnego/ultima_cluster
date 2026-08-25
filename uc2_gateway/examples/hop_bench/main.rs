@@ -123,7 +123,8 @@ fn run_edge(a: EdgeArgs) -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_secs(1));
         let s = edge.stats();
         println!(
-            "edge: conns={} submits/s={} responses/s={} backpressure/s={} retries/s={} unknown/s={} status/s={}",
+            "edge: conns={} submits/s={} responses/s={} backpressure/s={} retries/s={} \
+             unknown/s={} status/s={} grants/s={}",
             s.connections,
             s.submits - last.submits,
             s.responses - last.responses,
@@ -131,6 +132,7 @@ fn run_edge(a: EdgeArgs) -> anyhow::Result<()> {
             s.retries - last.retries,
             s.unknown - last.unknown,
             s.status_frames - last.status_frames,
+            s.grant_changes - last.grant_changes,
         );
         last = s;
     }
