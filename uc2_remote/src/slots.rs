@@ -358,4 +358,36 @@ mod tests {
         assert_eq!(t.abort(1), Resolve::Won { user_data: 1 });
         assert!(!t.is_live(1));
     }
+
+    #[test]
+    fn a_live_occupant_a_table_length_later_refuses_the_claim_without_corruption() {
+        let t = table(); // max_inflight = 8, slot_count = 16
+        assert!(t.claim(1, 0xC1, ReqKind::Query, u64::MAX, 4096, 64));
+        let collide = 1 + t.slot_count() as u64; // same physical index, later generation
+        let before = t.inflight();
+        assert!(
+            !t.claim(collide, 0xC2, ReqKind::Submit, u64::MAX, 0, 88),
+            "a live occupant must refuse a same-index claim from a later generation"
+        );
+        assert_eq!(t.inflight(), before, "a refused claim must not change inflight");
+        assert_eq!(
+            t.kind(1),
+            ReqKind::Query,
+            "the occupant's metadata must be untouched by the failed claim"
+        );
+        assert_eq!(
+            t.extent(1),
+            (4096, 64),
+            "the occupant's extent must be untouched by the failed claim"
+        );
+        assert_eq!(
+            t.resolve(1),
+            Resolve::Won { user_data: 0xC1 },
+            "the original occupant resolves cleanly, unharmed by the refused collision"
+        );
+        assert!(
+            t.claim(collide, 0xC2, ReqKind::Submit, u64::MAX, 0, 88),
+            "the slot is free now and admits the next claim"
+        );
+    }
 }
