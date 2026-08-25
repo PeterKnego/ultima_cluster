@@ -34,8 +34,15 @@ use uc2_node::backup::{backup_instance, restore_artifact, verify_artifact, Backu
 use uc2_node::{InstanceDir, Node, NodeConfig, PurgePolicy};
 use uc2_service::snapshots::SnapshotStore;
 use uc2_service::{ServiceBuilder, ServiceConfig, StateMachine};
+use uc_protocol::v2::frame::{align_frame_len, HEADER_LEN};
 
 const SEG_BYTES: u64 = 64 * 1024;
+
+/// Payload of every `drive_and_quiesce` submit.
+const PAYLOAD_BYTES: usize = 64;
+/// One such submit as it lands in the log: header + payload rounded up to the
+/// 32-byte frame slot (`uc_protocol::v2::frame`) — 96 bytes.
+const FRAME_BYTES: u64 = align_frame_len(HEADER_LEN + PAYLOAD_BYTES) as u64;
 
 fn config(dir: &Path, app: &str, purge: PurgePolicy) -> NodeConfig {
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -100,20 +107,39 @@ fn drive_and_quiesce(node: &Node, n: usize) {
     // Fix round 1 (M11 Task 2 review): widened alongside `wait_until`'s
     // deadline, same load-margin rationale (that function's doc).
     let deadline = Instant::now() + Duration::from_secs(90);
+    // Nightly flake 2026-08-23 + 2026-08-25 (`backup.rs`'s
+    // `ordered_backup_never_produces_a_hole_under_purge_churn`: "purge advanced
+    // the floor" stalled the FULL 120s deadline with zero progress, cycle 0,
+    // one serialized cluster on an otherwise idle 4-vCPU runner — so not
+    // starvation). `Node::submit` only enqueues into the ingress channel
+    // (`INGRESS_CAPACITY` 8192 > n); the append happens later, on the
+    // consensus agent. The old quiescence test — `append == commit == durable`,
+    // unchanged across two back-to-back polls — is trivially true whenever
+    // that agent simply has not run yet (the leader's 32-byte term-start frame
+    // already satisfies `append > 0`), so on an oversubscribed box a whole
+    // round of submits was declared quiescent with NONE of them appended. The
+    // caller then read a tiny `durable`, published its snapshot at pos 1, and
+    // `Archive::purge_below(1)` is a permanent no-op (block 0 is both the first
+    // and the covering block) — a state no deadline can wait out. Reproduced
+    // deterministically under `taskset -c 0,1` (2 of 6 runs). Quiescence now
+    // also requires this round's bytes to have landed: `append` must have
+    // advanced by at least `sent` frames of `PAYLOAD_BYTES`.
+    let append0 = node.counters().append.load_acquire();
     let mut sent = 0usize;
     while sent < n {
         assert!(Instant::now() < deadline, "submits stalled at {sent}/{n}");
-        match node.submit(vec![0xAB; 64]) {
+        match node.submit(vec![0xAB; PAYLOAD_BYTES]) {
             Ok(()) => sent += 1,
-            Err(_) => std::thread::yield_now(),
+            Err(_) => std::thread::yield_now(), // admission window closed / draining
         }
     }
+    let expected_append = append0 + sent as u64 * FRAME_BYTES;
     let mut last = u64::MAX;
     wait_until("log quiescent", || {
         let c = node.counters();
         let (a, cm, d) =
             (c.append.load_acquire(), c.commit.load_acquire(), c.durable.load_acquire());
-        let quiescent = a > 0 && a == cm && cm == d && a == last;
+        let quiescent = a >= expected_append && a == cm && cm == d && a == last;
         last = a;
         quiescent
     });
@@ -162,8 +188,18 @@ fn publish_snapshot_and_wait_for_purge(dir: &Path, app: &str, node: &Node, pos: 
     let store = SnapshotStore::open(dir).expect("open snapshot store");
     store.publish(pos, |w| Ok(w.write_all(b"fake-snapshot-bytes")?)).expect("publish snapshot");
     let cnc = open_cnc(dir, app);
-    cnc.snapshots().service_snapshot_pos.store_release(pos);
     let before = node.archive_first_base();
+    // Setup precondition, same shape as `purge_safety.rs`'s "need >1 segment
+    // below the marker": `Archive::purge_below` is segment-granular and keeps
+    // the block covering `pos`, so the floor can only advance if `pos` lies
+    // beyond the first surviving segment. Assert it here so a too-small `pos`
+    // is a named setup failure, never a silent 120s hang.
+    assert!(
+        pos > before + SEG_BYTES,
+        "test setup: snapshot pos {pos} is within one segment of the floor {before} — \
+         nothing below it is purgeable"
+    );
+    cnc.snapshots().service_snapshot_pos.store_release(pos);
     wait_until("purge advanced the floor", || node.archive_first_base() > before || pos == 0);
 }
 
